@@ -1,0 +1,12 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "AGPL-3.0-or-later"
+publish = false
+description = "workspace task runner (gen-proto, check-proto, release helpers)"
+
+[dependencies]

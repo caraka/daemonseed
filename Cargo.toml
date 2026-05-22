@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/daemonseed-core",
+    "crates/daemonseed-proto",
+    "crates/daemonseed-server",
+    "crates/daemonseed-cli",
+    "crates/daemonseed-tui",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.83"
+authors = ["caraka <3311120+caraka@users.noreply.github.com>"]
+repository = "https://github.com/caraka/daemonseed"
+
+[workspace.dependencies]
+# Populated as crates take dependencies.

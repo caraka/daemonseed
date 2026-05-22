@@ -1,0 +1,40 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Cargo.lock IS committed in this workspace (binary crates present).
+# Do not add it here.
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor junk
+*.swp
+*.swo
+*~
+\#*\#
+.\#*
+.idea/
+.vscode/
+*.iml
+
+# direnv
+.direnv/
+
+# Git worktrees (per the worktree placement rule)
+.worktrees/
+
+# daemonseed runtime artifacts — appear in CWD when running binaries from the
+# repo for testing (per ISC-C35 CWD-based config discovery). Stray test-profile
+# data must not be committed.
+daemonseed-secret.bin
+identity.dseed
+*.dseed
+daemonseed.redb
+daemonseed.toml
+/chunks/
+
+# Convention: place isolated test profiles here (ISC-C35 multi-instance via cd)
+/.test-profiles/
