@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bootstrap;
 pub mod handle;
 pub mod identity;
 pub mod kdf;

@@ -1,0 +1,18 @@
+# Daemonseed bootstrap anchor — bundled with the release binary, bound to
+# the release signature (ISC-C37 / ISC-A-C19 / ISC-A-C11).
+#
+# At M2 the project does not yet operate a canonical relay; the
+# `canonical` table is intentionally omitted. First-start surfaces the
+# "canonical relay not yet available — use manual-paste" path when this
+# table is absent.
+#
+# When the project stands up a relay, populate this file with:
+#
+#   [canonical]
+#   server_id = "<server-name>#<12-hex-prefix>"
+#   address   = "<hostname-or-ip>"
+#
+# and ship a fresh signed release. Clients pick up the new default on
+# binary upgrade; existing profiles keep the relay they enrolled against.
+
+version = 1
