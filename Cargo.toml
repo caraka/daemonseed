@@ -44,6 +44,7 @@ ratatui = "0.29"
 # version. The path is `../oxicrypt/crates/...` because the worktree itself
 # sits at `<vault>/.worktrees/<branch>/` and the symlink is at
 # `<vault>/.worktrees/oxicrypt`.
+oxicrypt-module = { path = "../oxicrypt/crates/oxicrypt-module" }
 oxicrypt-ml-dsa = { path = "../oxicrypt/crates/oxicrypt-ml-dsa" }
 oxicrypt-ml-kem = { path = "../oxicrypt/crates/oxicrypt-ml-kem" }
 oxicrypt-aes = { path = "../oxicrypt/crates/oxicrypt-aes" }
