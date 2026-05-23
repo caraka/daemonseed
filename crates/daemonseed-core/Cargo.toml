@@ -12,6 +12,7 @@ description = "daemonseed protocol library"
 oxicrypt-module = { workspace = true }
 oxicrypt-sha = { workspace = true }
 oxicrypt-kdf = { workspace = true }
+oxicrypt-aes = { workspace = true }
 oxicrypt-ml-dsa = { workspace = true }
 oxicrypt-ml-kem = { workspace = true }
 bip39 = { workspace = true }
@@ -23,3 +24,4 @@ zxcvbn.workspace = true
 unicode-normalization.workspace = true
 toml = { workspace = true }
 serde = { workspace = true }
+argon2.workspace = true
