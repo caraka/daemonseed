@@ -5,4 +5,5 @@
 //! keypairs and the `Identity` enum land in commit 5 (the kdf::info module
 //! pins the load-bearing info strings first).
 
+pub mod keys;
 pub mod mnemonic;

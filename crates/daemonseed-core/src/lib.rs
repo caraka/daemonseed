@@ -9,3 +9,4 @@
 
 pub mod handle;
 pub mod identity;
+pub mod kdf;
