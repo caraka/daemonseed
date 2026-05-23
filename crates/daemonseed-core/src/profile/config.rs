@@ -39,7 +39,6 @@ impl ArgonParams {
             parallelism: 1,
         }
     }
-
 }
 
 impl Default for ArgonParams {
@@ -117,9 +116,7 @@ impl ProfileConfig {
         // error variants. serde's default behaviour would collapse both
         // into a generic Toml error.
         let raw: toml::Value = toml::from_str(body).map_err(ProfileConfigError::Toml)?;
-        let table = raw
-            .as_table()
-            .ok_or(ProfileConfigError::MissingProfileId)?;
+        let table = raw.as_table().ok_or(ProfileConfigError::MissingProfileId)?;
 
         let profile_id_raw = table
             .get("profile_id")
