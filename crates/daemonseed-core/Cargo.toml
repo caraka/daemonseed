@@ -12,3 +12,4 @@ description = "daemonseed protocol library"
 oxicrypt-module = { workspace = true }
 oxicrypt-sha = { workspace = true }
 hex = { workspace = true }
+getrandom.workspace = true
