@@ -84,19 +84,25 @@ fn main() -> Result<()> {
 /// transitively. Bump both when the ISC list changes.
 const TOTAL_ISCS: u32 = 93;
 
-/// M0 baseline coverage. M1+ replaces this with a real query against the live
-/// registry — either by linking `daemonseed-integration-tests` directly or by
-/// shelling out to `cargo test -p daemonseed-integration-tests --
-/// --report-coverage` and parsing the output. Today's purpose is to give CI a
-/// gate command that prints a real number.
+/// Static lower-bound coverage count. Bumped each milestone as ISCs gain
+/// exercised tests. M1 lifts the floor from 0 → 17 via the end-to-end
+/// `m1_isc_coverage` integration test in `daemonseed-integration-tests`.
+/// Replacing this constant with a live query against the registered
+/// registry remains a later-milestone task (M11 ties this to the CI gate).
+const COVERED_ISCS: u32 = 17;
+
+/// Reports the static lower-bound coverage. The live registry-driven count
+/// (which walks the per-milestone integration tests and tallies actual
+/// `Coverage::register` calls) is M11 scope — at that point this constant
+/// goes away.
 fn isc_coverage(min: Option<u8>) -> Result<()> {
-    let covered: u32 = 0; // M0 baseline — no tests registered yet
+    let covered: u32 = COVERED_ISCS;
     let pct = if TOTAL_ISCS == 0 {
         0.0
     } else {
         (covered as f64) * 100.0 / (TOTAL_ISCS as f64)
     };
-    println!("ISC coverage (M0 baseline): {covered}/{TOTAL_ISCS} = {pct:.1}%");
+    println!("ISC coverage: {covered}/{TOTAL_ISCS} = {pct:.1}% (static M1 floor)");
     if let Some(m) = min
         && (pct as u32) < (m as u32)
     {

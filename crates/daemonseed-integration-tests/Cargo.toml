@@ -27,3 +27,10 @@ daemonseed-proto = { path = "../daemonseed-proto" }
 tonic = { workspace = true }
 tokio = { workspace = true }
 tower = { workspace = true }
+
+# M1 — end-to-end ISC coverage exercise needs the same primitives the core
+# crate uses to compose its surface (UUIDs for profile-ids, the oxicrypt
+# module power-on shim, and zeroize for hand-rolled secret buffers in the
+# test scaffolding).
+oxicrypt-module = { workspace = true }
+uuid = { workspace = true }
