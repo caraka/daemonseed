@@ -6,6 +6,7 @@ members = [
     "crates/daemonseed-server",
     "crates/daemonseed-cli",
     "crates/daemonseed-tui",
+    "crates/daemonseed-integration-tests",
     "xtask",
 ]
 

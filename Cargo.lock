@@ -200,6 +200,14 @@ name = "daemonseed-core"
 version = "0.1.0"
 
 [[package]]
+name = "daemonseed-integration-tests"
+version = "0.1.0"
+dependencies = [
+ "daemonseed-core",
+ "daemonseed-proto",
+]
+
+[[package]]
 name = "daemonseed-proto"
 version = "0.1.0"
 dependencies = [

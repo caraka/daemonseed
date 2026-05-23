@@ -6,6 +6,10 @@
 //!   editing any .proto.
 //! - `check-proto` — regenerate to a temporary directory and diff against the
 //!   committed snapshot. Non-zero exit on drift. CI gate.
+//! - `isc-coverage` — report the percentage of ISCs covered by registered
+//!   tests in `daemonseed-integration-tests::isc_coverage`. M0 reports the
+//!   0/93 baseline; later milestones surface the live registry count and
+//!   gate CI at `--min 95`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -27,13 +31,54 @@ enum Cmd {
     GenProto,
     /// Verify that the committed snapshot matches what tonic-build emits.
     CheckProto,
+    /// Report ISC coverage from `daemonseed-integration-tests`. Exits non-zero
+    /// if the covered percentage is below `--min` (when supplied).
+    IscCoverage {
+        /// Minimum coverage percentage required for a zero exit code. CI gate
+        /// will eventually set this to `95`. Omit at M0 to inspect the
+        /// baseline without gating.
+        #[arg(long)]
+        min: Option<u8>,
+    },
 }
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::GenProto => gen_proto(),
         Cmd::CheckProto => check_proto(),
+        Cmd::IscCoverage { min } => isc_coverage(min),
     }
+}
+
+/// Total ISC count, kept in sync with `daemonseed-integration-tests::isc_coverage::TOTAL`.
+/// Source of truth for the count check is the integration-tests crate's own
+/// unit tests (`registry_count_matches_total`); xtask only needs the constant
+/// to report the M0 baseline without taking a heavy path-dep on core+proto
+/// transitively. Bump both when the ISC list changes.
+const TOTAL_ISCS: u32 = 93;
+
+/// M0 baseline coverage. M1+ replaces this with a real query against the live
+/// registry — either by linking `daemonseed-integration-tests` directly or by
+/// shelling out to `cargo test -p daemonseed-integration-tests --
+/// --report-coverage` and parsing the output. Today's purpose is to give CI a
+/// gate command that prints a real number.
+fn isc_coverage(min: Option<u8>) -> Result<()> {
+    let covered: u32 = 0; // M0 baseline — no tests registered yet
+    let pct = if TOTAL_ISCS == 0 {
+        0.0
+    } else {
+        (covered as f64) * 100.0 / (TOTAL_ISCS as f64)
+    };
+    println!("ISC coverage (M0 baseline): {covered}/{TOTAL_ISCS} = {pct:.1}%");
+    if let Some(m) = min
+        && (pct as u32) < (m as u32)
+    {
+        bail!(
+            "ISC coverage {pct:.1}% below required minimum {m}%. \
+             Register tests against entries in daemonseed-integration-tests::isc_coverage."
+        );
+    }
+    Ok(())
 }
 
 /// Resolve `<repo>/crates/daemonseed-proto`.
