@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# daemonseed pre-push hook — local CI gate for the private phase.
+#
+# Installed by `cargo xtask install-hooks`. Mirrors oxicrypt's pattern:
+# GitHub-hosted CI minutes are reserved for the public phase; today the
+# developer's machine is the gate. Four checks must pass before push
+# succeeds. To skip on a doc-only push: `git push --no-verify`. Skipping
+# must be justified in the commit body — not the merge fast path.
+
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+echo "pre-push (1/4): cargo fmt --all --check"
+cargo fmt --all --check
+
+echo "pre-push (2/4): cargo clippy --workspace --all-targets -- -D warnings"
+cargo clippy --workspace --all-targets -- -D warnings
+
+# Debug mode + single-threaded matches oxicrypt's discipline: bug-surfacing
+# beats wall-clock minutes on a developer machine. Budget is 30-60 min for
+# a clean workspace push; release-bound pushes always run the full hook.
+echo "pre-push (3/4): cargo test --workspace -- --test-threads=1 (DEBUG)"
+cargo test --workspace -- --test-threads=1
+
+echo "pre-push (4/4): cargo xtask check-proto"
+cargo xtask check-proto
+
+echo "pre-push: all 4 gates green; push proceeding."
