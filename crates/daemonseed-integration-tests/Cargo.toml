@@ -1,0 +1,22 @@
+[package]
+name = "daemonseed-integration-tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "AGPL-3.0-or-later"
+publish = false
+description = "daemonseed cross-crate integration tests + ISC coverage registry (M0 scaffold; never published)"
+
+[lib]
+# Library target so `cargo xtask isc-coverage` can read the registry without
+# spawning a binary. Tests live under `tests/` (per Rust convention) and pull
+# the registry via this lib.
+
+[dependencies]
+# M0 minimal path-deps: library crates only. server/cli/tui are binary-only
+# today; when M4a / M11 need in-process test access, those crates gain a
+# `[lib]` target and a corresponding path-dep lands here.
+daemonseed-core = { path = "../daemonseed-core" }
+daemonseed-proto = { path = "../daemonseed-proto" }
