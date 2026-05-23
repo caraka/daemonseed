@@ -9,3 +9,6 @@ license = "AGPL-3.0-or-later"
 description = "daemonseed protocol library"
 
 [dependencies]
+oxicrypt-module = { workspace = true }
+oxicrypt-sha = { workspace = true }
+hex = { workspace = true }
