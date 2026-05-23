@@ -11,5 +11,7 @@ description = "daemonseed protocol library"
 [dependencies]
 oxicrypt-module = { workspace = true }
 oxicrypt-sha = { workspace = true }
+bip39 = { workspace = true }
+zeroize = { workspace = true }
 hex = { workspace = true }
 getrandom.workspace = true
