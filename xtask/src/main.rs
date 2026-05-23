@@ -10,6 +10,13 @@
 //!   tests in `daemonseed-integration-tests::isc_coverage`. M0 reports the
 //!   0/93 baseline; later milestones surface the live registry count and
 //!   gate CI at `--min 95`.
+//! - `findings-resolved` — grep-assert that the M0 cross-ISC findings
+//!   (F14 / F18 / F19 / F21) are still resolved in `ds-isc-draft.md`. Closes
+//!   redteam reservation R4: the text fixes have a runtime gate, not just
+//!   a memory.
+//! - `install-hooks` — install the workspace's git pre-push hook into the
+//!   active checkout's `.git/hooks/` (or into a `--target` directory).
+//!   Idempotent; overwrites a previously-installed hook in-place.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -40,6 +47,24 @@ enum Cmd {
         #[arg(long)]
         min: Option<u8>,
     },
+    /// Grep-assert that the M0 cross-ISC findings (F14 / F18 / F19 / F21) are
+    /// still resolved in `ds-isc-draft.md`. Exits non-zero on the first
+    /// missing marker. Closes redteam reservation R4.
+    FindingsResolved {
+        /// Path to the working ISC draft. Defaults to the vault location used
+        /// during the private phase. Override for CI on a forked checkout or
+        /// after the draft is promoted in-repo.
+        #[arg(long)]
+        draft: Option<PathBuf>,
+    },
+    /// Install the workspace's git pre-push hook into the active checkout.
+    /// Idempotent — overwrites an existing hook in-place.
+    InstallHooks {
+        /// Target hook directory. Defaults to `<repo>/.git/hooks/` resolved
+        /// via `git rev-parse --git-dir` so the install works inside worktrees.
+        #[arg(long)]
+        target: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -47,6 +72,8 @@ fn main() -> Result<()> {
         Cmd::GenProto => gen_proto(),
         Cmd::CheckProto => check_proto(),
         Cmd::IscCoverage { min } => isc_coverage(min),
+        Cmd::FindingsResolved { draft } => findings_resolved(draft),
+        Cmd::InstallHooks { target } => install_hooks(target),
     }
 }
 
@@ -79,6 +106,117 @@ fn isc_coverage(min: Option<u8>) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// M0 cross-ISC findings whose ISC-draft text fixes are runtime-asserted by
+/// `findings-resolved`. Each marker is the literal substring that must appear
+/// in `ds-isc-draft.md`; the in-draft edit phrases the marker so re-wording
+/// the surrounding prose doesn't accidentally trip the gate.
+const FINDING_MARKERS: &[&str] = &["per F14", "per F18", "per F19", "per F21"];
+
+/// Default path to the working ISC draft during the private phase. Outside
+/// the repo (`~/carakastan/Projects/DaemonSeed/`). Override via `--draft`.
+fn default_draft_path() -> PathBuf {
+    if let Some(home) = std::env::var_os("HOME") {
+        PathBuf::from(home)
+            .join("carakastan")
+            .join("Projects")
+            .join("DaemonSeed")
+            .join("ds-isc-draft.md")
+    } else {
+        PathBuf::from("ds-isc-draft.md")
+    }
+}
+
+fn findings_resolved(draft: Option<PathBuf>) -> Result<()> {
+    let path = draft.unwrap_or_else(default_draft_path);
+    let body = fs::read_to_string(&path)
+        .with_context(|| format!("read ISC draft at {}", path.display()))?;
+
+    let mut missing = Vec::new();
+    for marker in FINDING_MARKERS {
+        let n = body.matches(marker).count();
+        if n == 0 {
+            missing.push(*marker);
+        } else {
+            println!("findings-resolved: `{marker}` ✓  ({n} occurrence(s))");
+        }
+    }
+    if missing.is_empty() {
+        println!(
+            "findings-resolved: all 4 markers present in {}",
+            path.display()
+        );
+        Ok(())
+    } else {
+        bail!(
+            "findings-resolved: {} marker(s) missing in {}: {}",
+            missing.len(),
+            path.display(),
+            missing.join(", ")
+        )
+    }
+}
+
+fn install_hooks(target: Option<PathBuf>) -> Result<()> {
+    let xtask_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = xtask_dir
+        .parent()
+        .context("xtask manifest dir has no parent")?;
+    let src = repo_root.join("scripts").join("git-hooks").join("pre-push");
+    if !src.exists() {
+        bail!("source hook missing at {}", src.display());
+    }
+
+    let target_dir = match target {
+        Some(p) => p,
+        None => resolve_git_hooks_dir(repo_root)?,
+    };
+    fs::create_dir_all(&target_dir).with_context(|| format!("create {}", target_dir.display()))?;
+    let dst = target_dir.join("pre-push");
+
+    fs::copy(&src, &dst).with_context(|| format!("copy {} -> {}", src.display(), dst.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&dst)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&dst, perms).with_context(|| format!("chmod +x {}", dst.display()))?;
+    }
+
+    println!("install-hooks: installed pre-push -> {}", dst.display());
+    Ok(())
+}
+
+/// Resolve `.git/hooks/` for a checkout. Works inside worktrees: `git
+/// rev-parse --git-dir` returns the worktree's hooks dir, not the common
+/// `.git/` of the source repo (where the hook would be shared with all
+/// worktrees — which is usually the wrong sharing default).
+fn resolve_git_hooks_dir(repo_root: &Path) -> Result<PathBuf> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .arg("rev-parse")
+        .arg("--git-dir")
+        .output()
+        .context("invoke git rev-parse --git-dir")?;
+    if !out.status.success() {
+        bail!(
+            "git rev-parse --git-dir failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let git_dir = String::from_utf8(out.stdout)
+        .context("git output is not utf-8")?
+        .trim()
+        .to_string();
+    let git_dir_path = if Path::new(&git_dir).is_absolute() {
+        PathBuf::from(git_dir)
+    } else {
+        repo_root.join(git_dir)
+    };
+    Ok(git_dir_path.join("hooks"))
 }
 
 /// Resolve `<repo>/crates/daemonseed-proto`.
