@@ -57,8 +57,13 @@ oxicrypt-zeroize = { path = "../oxicrypt/crates/oxicrypt-zeroize" }
 # carry it. RustCrypto's argon2 crate is the canonical pure-Rust impl.
 argon2 = "0.5"
 # BIP-39 is a wallet-ecosystem standard; the canonical Rust impl ships the
-# 2048-word English wordlist + checksum logic. ~200 LOC saved.
-bip39 = "2"
+# 2048-word English wordlist + checksum logic. ~200 LOC saved. The `zeroize`
+# feature enables `ZeroizeOnDrop` on `bip39::Mnemonic`.
+bip39 = { version = "2", features = ["zeroize"] }
+# RustCrypto `zeroize` crate (bip39 already pulls it transitively via the
+# feature above; this declares the direct trait dep so daemonseed-core code
+# can `use zeroize::Zeroize`).
+zeroize = { version = "1", features = ["zeroize_derive"] }
 # zxcvbn estimates passphrase entropy for the ISC-C12 strength meter and
 # ISC-C9 circle-of-trust threshold.
 zxcvbn = "3"
