@@ -21,6 +21,8 @@
 //! foundation. Per ISC-C4, this is "tunable per-server via operator config";
 //! the runtime-tunable path lands in M4a alongside server-config plumbing.
 
+pub mod display_name;
+
 use core::fmt;
 use core::str::FromStr;
 
