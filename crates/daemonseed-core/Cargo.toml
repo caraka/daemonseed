@@ -19,3 +19,5 @@ zeroize = { workspace = true }
 uuid = { workspace = true }
 hex = { workspace = true }
 getrandom.workspace = true
+zxcvbn.workspace = true
+unicode-normalization.workspace = true
