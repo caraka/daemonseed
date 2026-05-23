@@ -9,3 +9,4 @@ license = "AGPL-3.0-or-later"
 description = "daemonseed interactive terminal client"
 
 [dependencies]
+ratatui = { workspace = true }

@@ -27,3 +27,8 @@ tonic-build = { version = "=0.12.3", default-features = false, features = ["pros
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 walkdir = "2.5"
+
+# TUI framework (MIT or Apache-2.0). daemonseed-tui (AGPL-3.0-or-later) consumes
+# ratatui under its permissive license — FSF-compatible combined-work shape.
+# Pinned at workspace level so future M11 TUI integration uses a single version.
+ratatui = "0.29"
