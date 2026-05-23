@@ -10,3 +10,4 @@
 pub mod handle;
 pub mod identity;
 pub mod kdf;
+pub mod passphrase;
