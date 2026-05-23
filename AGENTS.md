@@ -17,7 +17,7 @@ Daemonseed is a federated, end-to-end-encrypted communication and file-sharing p
 At the start of every session — or after a context reset — read these in order before doing anything else:
 
 1. **`~/carakastan/Projects/DaemonSeed/llm-project-manifest.yaml`** — current state of the world. What exists, what's complete vs partial vs stub. No plans, no priorities; just facts. Outside this repo because it references internal paths.
-2. **`~/carakastan/Projects/DaemonSeed/ds-isc-draft.md`** — the working Ideal State Criteria document. Authoritative design source during the private phase. Each ISC is a verifiable end-state; each ISC-A is a forbidden state. Currently 96 ISCs (60 server-side + 36 client-side).
+2. **`~/carakastan/Projects/DaemonSeed/ds-isc-draft.md`** — the working Ideal State Criteria document. Authoritative design source during the private phase. Each ISC is a verifiable end-state; each ISC-A is a forbidden state. Currently 93 ISCs (36 server-side + 57 client-side, as of 2026-05-22 — recount and update this line whenever ISCs are added or removed). The client surface is intentionally the larger side because daemonseed's complexity lives at the client (identity, federation trust, suite agility, first-start, multi-instance, trust-event taxonomy).
 3. **`~/carakastan/Projects/DaemonSeed/ds-suite-registry.md`** — current and deprecated cryptographic suite definitions. Companion to ISC-S15 / S16 / A-S10 / A-S11 / C24 / C25 / A-C8 / A-C9.
 4. **`docs/llm-api-manifest/` in this repo** — LAMA manifests describing the public API surfaces of each crate. AI agents helping cross-language client implementers consume these. Stubbed at repo creation; grows as the API grows.
 
@@ -73,6 +73,17 @@ Insights surface during code work, not during doc work. A manifest-only commit o
 - **Schema crate** (`daemonseed-proto`): **Apache-2.0 OR MIT dual** (Rust-ecosystem default).
 
 When adding a new crate, set its `Cargo.toml` `license` field per this split. The schema carve-out exists so cross-language client implementations can exist freely without copyleft viral concerns. Repo root carries three LICENSE files (`LICENSE-AGPL`, `LICENSE-APACHE`, `LICENSE-MIT`); per-crate `license` fields select the correct one(s) for each crate.
+
+## Workspace hygiene — worktree placement
+
+When creating a git worktree (`git worktree add` or any tool that initiates one), place it inside **the directory the current session was launched from** (the session's CWD), not unconditionally inside this repo. Worktree path: `<session-cwd>/.worktrees/<branch-name>/`.
+
+- **Bare-repo case** — session launched in this repo (e.g. `cd ~/repos/daemonseed && claude`). CWD == repo root. Worktree at `~/repos/daemonseed/.worktrees/<branch-name>/`. `.worktrees/` is already in `.gitignore`.
+- **Meta-project case** — session launched in the project folder (`~/carakastan/Projects/DaemonSeed/`) while doing work on this repo. CWD != repo root. Worktree at `~/carakastan/Projects/DaemonSeed/.worktrees/<branch-name>/`. The project folder is the vault — not a git repo — and is already excluded from version control by being outside this repo, so no gitignore entry is required there.
+
+**Why:** Claude Code (and equivalent assistants) scope filesystem permissions to the session's CWD. Worktrees inside that directory get implicit Read / Write / Edit / Bash access without per-operation permission prompts. Worktrees outside it require explicit allowlisting per access pattern, which does not scale across subagent dispatches. The rule is permission-driven, not repo-location-driven — "put it where the session is rooted" beats the naive "put it where the source repo lives".
+
+For Rust workspace path-dependencies that expect a sibling crate (notably `daemonseed`'s dependency on `oxicrypt`), create a symlink inside the worktree's parent pointing at the source repo: `ln -s ~/repos/oxicrypt <worktree-parent>/oxicrypt`. Worktrees are ephemeral — created for the feature, removed after merge. Branches and commits persist in the source repo's `.git/`.
 
 ## Working style — check in at batch boundaries
 
