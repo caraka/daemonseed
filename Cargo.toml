@@ -36,3 +36,40 @@ walkdir = "2.5"
 # ratatui under its permissive license — FSF-compatible combined-work shape.
 # Pinned at workspace level so future M11 TUI integration uses a single version.
 ratatui = "0.29"
+
+# ── Crypto stack (oxicrypt path-deps via the worktree-parent symlink) ────────
+# During the private phase, daemonseed consumes oxicrypt as a path-dependency
+# through `<worktree-parent>/oxicrypt` (a symlink to `~/repos/oxicrypt`). Once
+# oxicrypt opens publicly, these become registry-deps pinned to the published
+# version. The path is `../oxicrypt/crates/...` because the worktree itself
+# sits at `<vault>/.worktrees/<branch>/` and the symlink is at
+# `<vault>/.worktrees/oxicrypt`.
+oxicrypt-ml-dsa = { path = "../oxicrypt/crates/oxicrypt-ml-dsa" }
+oxicrypt-ml-kem = { path = "../oxicrypt/crates/oxicrypt-ml-kem" }
+oxicrypt-aes = { path = "../oxicrypt/crates/oxicrypt-aes" }
+oxicrypt-kdf = { path = "../oxicrypt/crates/oxicrypt-kdf" }
+oxicrypt-sha = { path = "../oxicrypt/crates/oxicrypt-sha" }
+oxicrypt-zeroize = { path = "../oxicrypt/crates/oxicrypt-zeroize" }
+
+# ── External crypto + identity deps not covered by oxicrypt ──────────────────
+# Argon2id is RFC 9106 (not NIST), so oxicrypt's NIST-only KDF crate doesn't
+# carry it. RustCrypto's argon2 crate is the canonical pure-Rust impl.
+argon2 = "0.5"
+# BIP-39 is a wallet-ecosystem standard; the canonical Rust impl ships the
+# 2048-word English wordlist + checksum logic. ~200 LOC saved.
+bip39 = "2"
+# zxcvbn estimates passphrase entropy for the ISC-C12 strength meter and
+# ISC-C9 circle-of-trust threshold.
+zxcvbn = "3"
+# UUID v4 from cryptographic randomness for profile-id (ISC-C36) and the
+# per-device identity discriminator (ISC-C1).
+uuid = { version = "1", features = ["v4"] }
+# Profile config persistence — `daemonseed.toml` per ISC-C35 / C36 / C14.
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+# NFKC canonicalization for circle-of-trust entropy (ISC-C9).
+unicode-normalization = "0.1"
+# Hex codec for the 12-char hash prefix in the handle format (ISC-C4).
+hex = "0.4"
+# CSPRNG entry point for mnemonic entropy and profile-id generation.
+getrandom = "0.3"
