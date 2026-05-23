@@ -462,9 +462,11 @@ version = "0.1.0"
 dependencies = [
  "daemonseed-core",
  "daemonseed-proto",
+ "oxicrypt-module",
  "tokio",
  "tonic",
  "tower 0.5.3",
+ "uuid",
 ]
 
 [[package]]
