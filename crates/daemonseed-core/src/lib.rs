@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bootstrap;
+pub mod first_start;
 pub mod handle;
 pub mod identity;
 pub mod kdf;
