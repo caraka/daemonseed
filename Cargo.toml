@@ -68,8 +68,9 @@ zeroize = { version = "1", features = ["zeroize_derive"] }
 # ISC-C9 circle-of-trust threshold.
 zxcvbn = "3"
 # UUID v4 from cryptographic randomness for profile-id (ISC-C36) and the
-# per-device identity discriminator (ISC-C1).
-uuid = { version = "1", features = ["v4"] }
+# per-device identity discriminator (ISC-C1). `serde` feature lets the
+# profile config (de)serialize Uuid as a string.
+uuid = { version = "1", features = ["v4", "serde"] }
 # Profile config persistence — `daemonseed.toml` per ISC-C35 / C36 / C14.
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }

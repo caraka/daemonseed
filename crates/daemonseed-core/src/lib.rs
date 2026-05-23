@@ -11,3 +11,4 @@ pub mod handle;
 pub mod identity;
 pub mod kdf;
 pub mod passphrase;
+pub mod profile;
