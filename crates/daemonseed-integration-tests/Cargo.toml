@@ -20,3 +20,10 @@ description = "daemonseed cross-crate integration tests + ISC coverage registry 
 # `[lib]` target and a corresponding path-dep lands here.
 daemonseed-core = { path = "../daemonseed-core" }
 daemonseed-proto = { path = "../daemonseed-proto" }
+
+[dev-dependencies]
+# M0 type-state ↔ tonic spike (closes R2 — see tests/spike_type_state.rs).
+# Throwaway compile-prove only; not used at M0 by integration code.
+tonic = { workspace = true }
+tokio = { workspace = true }
+tower = { workspace = true }
