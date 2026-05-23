@@ -9,3 +9,8 @@ license = "Apache-2.0 OR MIT"
 description = "daemonseed protocol schema (gRPC / protobuf)"
 
 [dependencies]
+prost = { workspace = true }
+prost-types = { workspace = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }

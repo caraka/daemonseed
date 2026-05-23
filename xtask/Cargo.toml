@@ -10,3 +10,7 @@ publish = false
 description = "workspace task runner (gen-proto, check-proto, release helpers)"
 
 [dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+tonic-build = { workspace = true }
+walkdir = { workspace = true }
