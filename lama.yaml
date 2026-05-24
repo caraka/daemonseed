@@ -323,8 +323,8 @@ external_dependencies:
 #
 # The Ideal State Criteria (ISC) document and the suite-registry doc
 # are the authoritative spec sources during the private phase. They
-# live OUTSIDE this repository (in the maintainer's private vault)
-# and are referenced by ISC number throughout the LAMA manifests.
+# live OUTSIDE this repository during the private phase and are
+# referenced by ISC number throughout the LAMA manifests.
 # Selected content will be promoted to `docs/` in this repo at the
 # MVP gate (M11). Until then, ISC numbers are the spec breadcrumbs.
 
