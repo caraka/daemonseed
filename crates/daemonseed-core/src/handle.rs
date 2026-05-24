@@ -1,11 +1,18 @@
 //! Daemonseed wire/storage handle.
 //!
 //! Per ISC-C4: every daemon's handle is `<display-name>#<first-12-hex-of-
-//! SHA256(primary-identity-pubkey)>`. The hash prefix is stable for the life
+//! SHA-384(primary-identity-pubkey)>`. The hash prefix is stable for the life
 //! of the daemon's primary identity (ISC-C1) and identical across every
 //! presentation the daemon makes (handle-only, primary, fully anonymous per
 //! ISC-C13). 12 hex chars = 48 bits, chosen so prefix-grinding attacks are
 //! economically unattractive at federation scale.
+//!
+//! The hash family is SHA-384, not SHA-256: CNSA 2.0 mandates a hash with
+//! ≥192-bit security level (SHA-384 / SHA-512 / SHA3-384 / SHA3-512), and
+//! oxicrypt-module's `AlgorithmProfile::Cnsa2` enforces that at the gate.
+//! The 12-hex prefix selects 48 bits regardless of the underlying digest
+//! length, so handle identification strength is unchanged from the pre-bump
+//! shape; the change is about compliance, not strength.
 //!
 //! Display behavior follows ISC-C4a:
 //! - `Default` — `<display-name>` only; hash hidden in normal chat / presence /
@@ -27,7 +34,7 @@ use core::fmt;
 use core::str::FromStr;
 
 use oxicrypt_module::Error as OxicryptError;
-use oxicrypt_sha::sha256;
+use oxicrypt_sha::sha384;
 
 /// Hash-prefix length in bytes (6 bytes = 12 hex chars = 48 bits).
 ///
@@ -101,14 +108,14 @@ impl fmt::Display for HandleParseError {
 impl std::error::Error for HandleParseError {}
 
 impl Handle {
-    /// Construct a handle by computing `SHA-256(pubkey)[:12]` and pairing it
+    /// Construct a handle by computing `SHA-384(pubkey)[:12]` and pairing it
     /// with the supplied display name.
     ///
-    /// Returns the underlying oxicrypt error if SHA-256's power-up self-test
+    /// Returns the underlying oxicrypt error if SHA-384's power-up self-test
     /// has not yet passed; in normal operation this surfaces only on the
     /// first call in a fresh process.
     pub fn from_pubkey(display_name: Option<String>, pubkey: &[u8]) -> Result<Self, OxicryptError> {
-        let digest = sha256(pubkey)?;
+        let digest = sha384(pubkey)?;
         let mut hash_prefix = [0u8; HASH_PREFIX_BYTES];
         hash_prefix.copy_from_slice(&digest[..HASH_PREFIX_BYTES]);
         Ok(Self {
@@ -219,7 +226,7 @@ mod tests {
     const PREFIX_HEX: &str = "aabbccddeeff";
     const PREFIX_BYTES: [u8; 6] = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
 
-    /// Bootstrap oxicrypt's FIPS module for tests that exercise SHA-256.
+    /// Bootstrap oxicrypt's FIPS module for tests that exercise SHA-384.
     /// `initialize` is idempotent — after the first call it returns
     /// `AlreadyInitialized`, which we deliberately ignore.
     fn ensure_oxicrypt_initialized() {
@@ -243,13 +250,13 @@ mod tests {
     // ── from_pubkey ────────────────────────────────────────────────────────
 
     #[test]
-    fn from_pubkey_uses_sha256_first_12_hex() {
+    fn from_pubkey_uses_sha384_first_12_hex() {
         ensure_oxicrypt_initialized();
         let pubkey = b"deterministic input";
         let h = Handle::from_pubkey(Some("alice".to_string()), pubkey).unwrap();
 
         // Recompute the expected prefix the same way Handle::from_pubkey does.
-        let expected = sha256(pubkey).unwrap();
+        let expected = sha384(pubkey).unwrap();
         assert_eq!(h.hash_prefix(), &expected[..6]);
     }
 

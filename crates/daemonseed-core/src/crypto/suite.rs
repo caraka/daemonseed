@@ -109,15 +109,18 @@ pub enum Sig {
 /// Hash primitive in a [`Suite`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hash {
-    /// SHA-256 per FIPS 180-4.
-    Sha256,
+    /// SHA-384 per FIPS 180-4. CNSA 2.0 mandates ≥192-bit hash security
+    /// (SHA-384 / SHA-512); SHA-256 is below the floor and intentionally
+    /// not represented in the registry.
+    Sha384,
 }
 
 /// KDF primitive in a [`Suite`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kdf {
-    /// HKDF-SHA-256 per RFC 5869.
-    HkdfSha256,
+    /// HKDF-SHA-384 per RFC 5869. Pairs with [`Hash::Sha384`] for the CNSA
+    /// 2.0 family.
+    HkdfSha384,
 }
 
 /// Memory-hard function in a [`Suite`].
@@ -186,8 +189,8 @@ impl Suite {
         // through the derived impl, so the discriminants are compared by
         // primitive name. Both enums currently have a single variant; the
         // shape generalizes once additional KDFs / hashes land.
-        matches!((self.kdf, other.kdf), (Kdf::HkdfSha256, Kdf::HkdfSha256))
-            && matches!((self.hash, other.hash), (Hash::Sha256, Hash::Sha256))
+        matches!((self.kdf, other.kdf), (Kdf::HkdfSha384, Kdf::HkdfSha384))
+            && matches!((self.hash, other.hash), (Hash::Sha384, Hash::Sha384))
     }
 }
 
@@ -208,8 +211,8 @@ pub const CNSA_2_0: Suite = Suite {
     aead: Aead::Aes256Gcm,
     kem: Kem::MlKem1024,
     sig: Sig::MlDsa87,
-    hash: Hash::Sha256,
-    kdf: Kdf::HkdfSha256,
+    hash: Hash::Sha384,
+    kdf: Kdf::HkdfSha384,
     memory_hard: MemoryHard::Argon2id,
     state: LifecycleState::ActiveWrite,
 };
@@ -349,8 +352,8 @@ mod tests {
         assert_eq!(CNSA_2_0.aead, Aead::Aes256Gcm);
         assert_eq!(CNSA_2_0.kem, Kem::MlKem1024);
         assert_eq!(CNSA_2_0.sig, Sig::MlDsa87);
-        assert_eq!(CNSA_2_0.hash, Hash::Sha256);
-        assert_eq!(CNSA_2_0.kdf, Kdf::HkdfSha256);
+        assert_eq!(CNSA_2_0.hash, Hash::Sha384);
+        assert_eq!(CNSA_2_0.kdf, Kdf::HkdfSha384);
         assert_eq!(CNSA_2_0.memory_hard, MemoryHard::Argon2id);
         assert_eq!(CNSA_2_0.state, LifecycleState::ActiveWrite);
     }

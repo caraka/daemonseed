@@ -56,7 +56,7 @@
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use oxicrypt_aes::{Aes256Key, gcm_decrypt, gcm_encrypt};
-use oxicrypt_kdf::HkdfSha256;
+use oxicrypt_kdf::HkdfSha384;
 use uuid::Uuid;
 use zeroize::Zeroize;
 
@@ -90,7 +90,7 @@ pub const NONCE_LEN: usize = 12;
 pub const TAG_LEN: usize = 16;
 
 /// Argon2id intermediate output length (= AEAD key length = HKDF PRK len).
-pub const ARGON2_OUTPUT_LEN: usize = 32;
+pub const ARGON2_OUTPUT_LEN: usize = 48;
 
 /// AEAD key length (AES-256 → 32 bytes).
 pub const AEAD_KEY_LEN: usize = 32;
@@ -426,7 +426,7 @@ fn derive_aead_key(
     // Stage 2: HKDF-Expand only (intermediate is already a high-entropy
     // 32-byte secret — no extract needed; that's what `from_prk` is for).
     let info_str = info::at_rest(&profile_id.to_string());
-    let hkdf = HkdfSha256::from_prk(&intermediate).map_err(BlobError::Hkdf)?;
+    let hkdf = HkdfSha384::from_prk(&intermediate).map_err(BlobError::Hkdf)?;
     intermediate.zeroize();
 
     let mut key = [0u8; AEAD_KEY_LEN];

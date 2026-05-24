@@ -7,7 +7,7 @@
 //! ```text
 //! BIP-39 mnemonic
 //!   → bip39::to_seed("")                                    // 64-byte seed
-//!   → HkdfSha256::extract(salt=IDENTITY_ROOT_SALT, ikm=seed)// PRK
+//!   → HkdfSha384::extract(salt=IDENTITY_ROOT_SALT, ikm=seed)// PRK
 //!   → expand(info=primary("sign"))   → ml_dsa_seed  → keygen(ml_dsa_seed)
 //!   → expand(info=primary("kem-d"))  → kem_d
 //!   → expand(info=primary("kem-z"))  → kem_z         → keygen(kem_d, kem_z)
@@ -17,7 +17,7 @@
 //! That deterministic property is what makes recovery-from-mnemonic work
 //! across devices (ISC-C32 round-trip).
 
-use oxicrypt_kdf::HkdfSha256;
+use oxicrypt_kdf::HkdfSha384;
 use oxicrypt_ml_dsa as ml_dsa;
 use oxicrypt_ml_kem as ml_kem;
 use uuid::Uuid;
@@ -161,7 +161,7 @@ pub fn derive_identity_keys(
 
     // HKDF-Extract pins the daemonseed identity-root salt so this BIP-39
     // seed cannot collide with any other consumer's HKDF context.
-    let hkdf = HkdfSha256::extract(Some(info::IDENTITY_ROOT_SALT), &*bip39_seed)
+    let hkdf = HkdfSha384::extract(Some(info::IDENTITY_ROOT_SALT), &*bip39_seed)
         .map_err(KeyDerivationError::Hkdf)?;
     bip39_seed.zeroize();
 

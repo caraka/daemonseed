@@ -27,7 +27,7 @@ When the repo opens publicly, caraka will promote sanitized versions of the ISC 
 
 ## Standards target
 
-- **Crypto bundle:** CNSA 2.0 (ML-DSA-87 + ML-KEM-1024 + AES-256-GCM + SHA-256). The suite registry tracks current + deprecated suites. CNSA 2.1 is anticipated within ~12 months; the architecture is designed to absorb it via additive MINOR bumps — see ISC-S14 wire-protocol versioning and the BIP-39 + HKDF root-of-derivation rationale (ISC-C1 / ISC-C2).
+- **Crypto bundle:** CNSA 2.0 (ML-DSA-87 + ML-KEM-1024 + AES-256-GCM + SHA-384). The suite registry tracks current + deprecated suites. CNSA 2.1 is anticipated within ~12 months; the architecture is designed to absorb it via additive MINOR bumps — see ISC-S14 wire-protocol versioning and the BIP-39 + HKDF root-of-derivation rationale (ISC-C1 / ISC-C2).
 - **Censorship-survivability bar:** Wu et al., USENIX Security 2023 (negative-allowlist GFW detection). ALPN is set to a generic value (`h2`); application-protocol identification happens after TLS handshake; first TLS record on :443 satisfies GFW Ex5 by construction.
 - **Wire protocol versioning:** SemVer 2.0. MINOR bumps MUST be additive-only (per ISC-S14 / A-S9 / C23). MAJOR bumps may break wire compatibility but are the last resort.
 
