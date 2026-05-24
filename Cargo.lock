@@ -440,6 +440,7 @@ version = "0.1.0"
 dependencies = [
  "argon2",
  "bip39",
+ "daemonseed-proto",
  "getrandom 0.3.4",
  "hex",
  "oxicrypt-aes",
@@ -449,6 +450,7 @@ dependencies = [
  "oxicrypt-module",
  "oxicrypt-sha",
  "serde",
+ "tokio",
  "toml",
  "unicode-normalization",
  "uuid",
