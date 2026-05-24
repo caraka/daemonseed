@@ -1,16 +1,16 @@
 # ─────────────────────────────────────────────────────────────────────
-# daemonseed-server — LAMA API Manifest (placeholder at v0.4.0)
+# daemonseed-server — LAMA API Manifest (M4a commit 3 in flight)
 #
-# The server crate ships as a placeholder `fn main() {}` through M3.
-# Substantive code lands at M4a (TLS skeleton + APP_HELLO + the
-# Versioned type-state) and grows through M5 (federation trust slider
-# + introducer + S2S peering), M6 (public-space relay), M8 (CoT-asset
-# relay), and M9 (rate limits + backoff).
+# The server crate gained config / identity / TLS modules at M4a commit 3
+# on top of the v0.4.0 placeholder. The TCP listener + APP_HELLO frame
+# I/O + Versioned-state handoff land in commit 4; the CLI initiator in
+# commit 5; integration tests + Wu et al. fixture in commit 6.
 #
 # Cross-references:
 # - Repository root: ../../lama.yaml
 # - Core crate: ./daemonseed-core-api.yaml
 # - Wire schema: ./daemonseed-proto-protocol.yaml
+# - oxitls TLS provider: external sibling crate (private during pre-public phase)
 # ─────────────────────────────────────────────────────────────────────
 
 lama: "0.1"
@@ -18,20 +18,76 @@ lama: "0.1"
 library:
   name: daemonseed-server
   version: "0.1.0"
-  description: "Relay daemon binary. Placeholder at v0.4.0 (M3)."
+  description: "Relay daemon binary. M4a commit 3 lands operator-facing modules; runtime + listener lands in commit 4."
   license: "AGPL-3.0-or-later"
   manifest_for: "crates/daemonseed-server"
-  status: placeholder
+  status: "M4a commit 3 in flight"
 
 # ─────────────────────────────────────────────────────────────────────
-# Current surface (placeholder)
+# Modules landed at M4a commit 3
 # ─────────────────────────────────────────────────────────────────────
+
+modules:
+  - path: daemonseed_server::config
+    purpose: >-
+      TOML config loader + path resolution. Per ISC-S3 / ISC-C35:
+      `--config <path>` (explicit) → XDG_CONFIG_HOME/daemonseed/
+      daemonseed.toml → ./daemonseed.toml. NotFound error carries the
+      full search list so operators see what was looked at.
+    iscs: [S3, C35]
+    added_in: "M4a commit 3"
+    public:
+      - { kind: struct, name: ServerConfig, fields: "{listen_addr: String (default 0.0.0.0:443), key_path: PathBuf (required), display_name: Option<String>}", note: "Minimal M4a field set; later milestones extend." }
+      - { kind: enum, name: ConfigError, variants: "{NotFound { searched }, Read { path, source }, Parse(toml::de::Error)}" }
+    key_functions:
+      - { sig: "ServerConfig::from_toml(toml_src: &str) -> Result<Self, ConfigError>" }
+      - { sig: "ServerConfig::from_path(path: &Path) -> Result<Self, ConfigError>" }
+      - { sig: "resolve_config_path(explicit, xdg_config_home, home, cwd) -> Result<PathBuf, ConfigError>", note: "Pure function with injected env so it's deterministic + testable." }
+
+  - path: daemonseed_server::identity
+    purpose: >-
+      Long-term ML-DSA-87 server identity per ISC-S11. The on-disk
+      shape is a 32-byte seed (FIPS 204 §5.1) with a 4-byte magic
+      prefix `dsv1`; pubkey + private signing material are
+      re-derived on every boot via `oxicrypt_ml_dsa::keygen(&seed)`.
+      ServerId follows ISC-C4 / ISC-S11 — `<name>#<12hex>` with the
+      hash prefix being the first 6 bytes of SHA-384(pubkey).
+    iscs: [S11, C4, C4b]
+    added_in: "M4a commit 3"
+    public:
+      - { kind: const, name: SEED_LEN, value: 32 }
+      - { kind: const, name: HASH_PREFIX_BYTES, value: 6, note: "Re-export of daemonseed_core::handle::HASH_PREFIX_BYTES." }
+      - { kind: struct, name: Seed, note: "Owns the 32-byte seed; zeroized on drop; Debug redacts the bytes." }
+      - { kind: type, name: "ServerId = daemonseed_core::handle::Handle", note: "Same format as client handles (ISC-C4); type alias so server and client code share construction logic." }
+      - { kind: enum, name: IdentityError, variants: "{NotFound, EntropyFailure(String), ReadFailed, WriteFailed, MalformedSeedFile, UnknownSeedFileMagic, Keygen, HandleConstruct}" }
+    key_functions:
+      - { sig: "generate_seed() -> Result<Seed, IdentityError>", note: "Uses getrandom 0.3 (OS entropy). Pre-module-init; not gated." }
+      - { sig: "load_or_generate(path: &Path) -> Result<Seed, IdentityError>", note: "Idempotent — first boot generates + persists with mode 0o600 on unix; subsequent boots load." }
+      - { sig: "derive_server_id(seed: &Seed, display_name: Option<String>) -> Result<ServerId, IdentityError>", note: "Module-gate precondition: `oxicrypt_module::initialize_with_profile(.., Cnsa2)` must already have run." }
+
+  - path: daemonseed_server::tls
+    purpose: >-
+      rustls ServerConfig assembly with the CNSA 2.0 hybrid posture.
+      Registers `oxitls_rustls_provider::cnsa_2_0_hybrid_provider`
+      as the process-wide default `CryptoProvider` (idempotent via
+      OnceLock); builds a self-signed ML-DSA-87 cert + matching
+      PKCS#8 key via oxitls v0.1.1 helpers; pins TLS 1.3 only,
+      ALPN `[b"h2"]`, `max_early_data_size = 0`.
+    iscs: [S2a, S2b, S5, A-S9, A-S6]
+    added_in: "M4a commit 3"
+    public:
+      - { kind: const, name: DEFAULT_CERT_VALIDITY, value: "90 days", note: "Cert rotation cadence; operationally visible without being annoying." }
+      - { kind: struct, name: TlsError }
+      - { kind: enum, name: TlsErrorKind, variants: "{Provider(String), ProviderAlreadyInstalled, CertBuilder(CertBuilderError), Rustls(String), ValidityOverflow}" }
+    key_functions:
+      - { sig: "install_provider() -> Result<(), TlsError>", note: "Idempotent via OnceLock — safe from concurrent tests. Err on first call is fatal per ISC-A6 (no silent fallback to aws_lc_rs)." }
+      - { sig: "build_server_config(seed: &Seed, server_id: &ServerId, valid_for: Duration) -> Result<ServerConfig, TlsError>", note: "Caller-contract: install_provider() must have returned Ok before this. ServerConfig::builder() uses the process-wide default — the CNSA 2.0 cipher suite + hybrid kx-group + ML-DSA-87 sigscheme arrive automatically." }
 
 binaries:
   - name: daemonseed-server
     entry_point: "fn main()"
-    status: placeholder
-    note: "Empty main — does nothing. M4a stands up the real entry point."
+    status: "stub until commit 4"
+    note: "Modules declared; main() body lands in M4a commit 4 (KATS init → config load → install_provider → build_server_config → TCP listen + accept loop + APP_HELLO frame I/O → Versioned-state handoff → SIGTERM)."
 
 # ─────────────────────────────────────────────────────────────────────
 # Anti-criteria (regression anchors that hold today)
@@ -70,13 +126,11 @@ anti_criteria:
 # ─────────────────────────────────────────────────────────────────────
 
 planned:
-  - milestone: M4a
+  - milestone: M4a (remaining commits)
     surface:
-      - "TLS 1.3 listener on :443 with ALPN h2 (rustls + oxicrypt provider)"
-      - "APP_HELLO + APP_HELLO_ACK + APP_HELLO_REJECT handlers per ISC-S14"
-      - "Connection<Negotiating → Versioned> type-state (or tower::Layer runtime equivalent)"
-      - "Wire-shape regression fixture + Wu et al. GFW classifier fixture"
-      - "Server-wide-keyed identity material tagged with suite_id (ISC-S15)"
+      - "commit 4: TCP listener on :443 + tokio_rustls TlsAcceptor + length-prefixed APP_HELLO frame I/O + Versioned-state handoff via daemonseed_core::connection::Connection<Negotiating>::advance_to_versioned()"
+      - "commit 5: daemonseed-cli `connect <server-id>` subcommand reaches Versioned state end-to-end"
+      - "commit 6: m4a_isc_coverage + wire-shape regression snapshot + Wu et al. GFW classifier fixture + end-to-end TLS handshake test"
 
   - milestone: M4b
     surface:
@@ -118,10 +172,18 @@ planned:
 
 operator_config:
   format: "TOML"
-  status: planned
-  iscs: [S13, S16, S17]
-  expected_sections:
-    - "[server] server-id, address, signing key paths"
-    - "[federation] trust-mode defaults, introduce-to-clients, S2S peering list"
+  status: "M4a commit 3 (minimal); grows per-milestone"
+  iscs: [S3, S11, S13, S16, S17, C35]
+  resolution_order:
+    - "--config <path> (explicit CLI flag)"
+    - "$XDG_CONFIG_HOME/daemonseed/daemonseed.toml (or $HOME/.config/daemonseed/daemonseed.toml if XDG unset)"
+    - "./daemonseed.toml (current working directory)"
+  m4a_fields:
+    - "listen_addr (string, default '0.0.0.0:443')"
+    - "key_path (path, required) — ML-DSA-87 seed file location"
+    - "display_name (string, optional) — empty surfaces floor `#<12hex>` per ISC-C4b"
+  planned_sections:
+    - "[federation] trust-mode defaults, introduce-to-clients, S2S peering list (M5)"
+    - "[signers] whitelist of authorized signer pubkeys (M6)"
     - "[suite_policy] per-suite cutoff dates (M7)"
     - "[rate_limits] per-conn / per-key / per-IP thresholds (M9)"
