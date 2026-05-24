@@ -1,0 +1,88 @@
+// daemonseed wire protocol — APP_HELLO post-handshake negotiation.
+//
+// Anchors ISC-S14 / ISC-A-S9 / ISC-C23. After the TLS 1.3 handshake completes,
+// peers exchange one round of AppHello / AppHelloAck (or AppHelloReject) on
+// the encrypted channel before any application data flows. The negotiation
+// pins the wire-protocol version (MAJOR.MINOR; PATCH is a release-artifact
+// concern and never appears on the wire) and declares transport capabilities.
+//
+// The frame is **uniform across client-to-server and server-to-server peering
+// connections** — role disambiguation happens in the later identity-proof
+// phase (ISC-S19, M4b), not here. This is load-bearing for ISC-A-S6 (server
+// cannot enumerate trust-mode-paranoid clients via handshake shape).
+//
+// MINOR bumps to this schema MUST be additive-only (ISC-S14). Never reuse
+// field numbers, never repurpose enum values, never tighten validation after
+// the field has shipped. MAJOR bumps create a new `vN` proto module.
+//
+// Framing on the wire: each frame is a length-prefixed (u32 big-endian)
+// prost-encoded message. Length prefix is the daemonseed-server's choice, not
+// part of the proto schema — see `daemonseed-server::hello` for the framing
+// implementation.
+
+syntax = "proto3";
+
+package daemonseed.v1;
+
+// Wire-protocol version. SemVer 2.0 MAJOR.MINOR only — PATCH is a release
+// artifact and never appears on the wire (ISC-S14). Two implementations
+// sharing MAJOR.MINOR are wire-compatible regardless of PATCH.
+message ProtocolVersion {
+  // SemVer MAJOR. Bumping breaks wire compatibility.
+  uint32 major = 1;
+
+  // SemVer MINOR. Additive-only bumps per ISC-S14.
+  uint32 minor = 2;
+}
+
+// Initiating peer's offer. Sent first on every daemonseed connection (both
+// client-to-server and server-to-server peering), post-TLS-handshake, never
+// as TLS 1.3 early data (0-RTT is structurally excluded — see ISC-A-S9).
+message AppHello {
+  // Versions the initiator can speak, in preference order (highest first).
+  // The responder picks the highest mutual entry.
+  repeated ProtocolVersion versions = 1;
+
+  // Transports the initiator can speak. MVP populates exactly
+  // `["tcp-tls13"]`. Closes finding F29 — the QUIC-ready transport-
+  // pluggability Reservation depends on this field existing from day one
+  // so adding `quic-v1` later is not a wire-protocol-version bump.
+  repeated string transport_capabilities = 2;
+
+  // AGPL §13 advertisement surface (finding F32). Optional URL where the
+  // operator publishes the source distribution matching this running
+  // binary. M4a defines the field; server-side population lands in M6.
+  // Empty/unset means "operator has not yet declared a source URL" — that
+  // surfaces the `ServerSourceUnverified` LogOnly trust event (M7).
+  optional string server_source = 3;
+}
+
+// Responder's acknowledgement carrying the selected version. The version
+// MUST be one the initiator offered in the corresponding AppHello.versions
+// list — clients enforce this per ISC-C23, servers MUST NOT respond
+// out-of-set per ISC-A-S9.
+message AppHelloAck {
+  // The single negotiated version, drawn from the initiator's offer.
+  ProtocolVersion version = 1;
+}
+
+// Responder's refusal, carrying the responder's full supported-version list
+// so the initiator can surface an actionable upgrade message.
+//
+// Reject codes (additive only — never reuse numbers, never reorder, never
+// repurpose):
+//   1 = NO_COMMON_VERSION
+//
+// New codes append as additive MINOR bumps per ISC-S14. The numeric value is
+// declared `int32` rather than enum so unrecognized future codes parse
+// successfully on older implementations (the surface gets a generic
+// `unrecognized reject code` user message rather than failing closed at the
+// proto-decode layer).
+message AppHelloReject {
+  // Reject code. See the doc-comment above for the registry.
+  int32 code = 1;
+
+  // The responder's complete supported-version list, so the initiator can
+  // show the user which version to upgrade (or downgrade) to.
+  repeated ProtocolVersion server_supported = 2;
+}
