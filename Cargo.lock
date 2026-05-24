@@ -439,6 +439,19 @@ dependencies = [
 [[package]]
 name = "daemonseed-cli"
 version = "0.1.0"
+dependencies = [
+ "clap",
+ "daemonseed-core",
+ "daemonseed-proto",
+ "daemonseed-server",
+ "oxicrypt-module",
+ "oxitls-rustls-provider",
+ "prost",
+ "rustls",
+ "rustls-pki-types",
+ "tokio",
+ "tokio-rustls",
+]
 
 [[package]]
 name = "daemonseed-core"

@@ -9,3 +9,31 @@ license = "AGPL-3.0-or-later"
 description = "daemonseed scriptable client"
 
 [dependencies]
+# Sibling crates — bootstrap anchor + version policy live in core;
+# AppHello prost types in proto; HELLO framing + KATS in server.
+daemonseed-core = { path = "../daemonseed-core" }
+daemonseed-proto = { path = "../daemonseed-proto" }
+daemonseed-server = { path = "../daemonseed-server" }
+prost = { workspace = true }
+
+# oxicrypt + oxitls — the CLI installs the same process-wide
+# CryptoProvider as the server so a single binary can act as
+# either side without re-installing.
+oxicrypt-module = { workspace = true }
+oxitls-rustls-provider = { workspace = true }
+
+# TLS stack — client-side ClientConfig is built against the same
+# provider; tokio-rustls drives the handshake.
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+tokio-rustls = { workspace = true }
+
+# Runtime — multi-thread isn't needed for a one-shot CLI; the
+# workspace base (rt, macros, io-util, net) plus `time` is plenty.
+tokio = { workspace = true, features = ["time"] }
+
+# Argument parsing.
+clap = { workspace = true }
+
+[dev-dependencies]
+oxitls-rustls-provider = { workspace = true, features = ["testing"] }
