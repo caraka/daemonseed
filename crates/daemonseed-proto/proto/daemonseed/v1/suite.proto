@@ -1,0 +1,39 @@
+// daemonseed wire protocol — suite_id tagging.
+//
+// Anchors ISC-C24 / ISC-S15 / ISC-A-C8: every cryptographic artifact carries
+// a `suite_id` identifying the algorithm bundle in use. The bundle resolves
+// through the in-repo registry (`daemonseed_core::crypto::suite::Registry`)
+// to (AEAD, KEM, signature, hash, KDF, memory-hard) primitives.
+//
+// Wire encoding: `value` is `uint32` (proto3 has no `uint16`). Receivers MUST
+// reject values outside `0x0001..=0xFFFE` per the ds-suite-registry.md
+// reserved-ranges table.
+//
+// Family relationship between two SuiteIds is **implicit in the registry**
+// per ISC-S15 — there is intentionally no `family_id` wire field. Encoding
+// family-id on the wire would permanently constrain the registry topology
+// and is a deliberate non-feature.
+
+syntax = "proto3";
+
+package daemonseed.v1;
+
+// Wire-tagged identifier for a registry entry. Carried on every
+// cryptographic artifact (at-rest blob header, recovery file header,
+// CoT-asset payload, identity-proof signature, server-wide signed material).
+message SuiteId {
+  // Registry id. Receivers MUST validate `0x0001 <= value <= 0xFFFE` and
+  // reject the reserved sentinels `0x0000` and `0xFFFF` at parse time.
+  uint32 value = 1;
+}
+
+// Per-circle minimum-suite floor (ISC-C24 circle-level minimum-suite
+// policy). Read-only after circle creation in MVP; ratcheting up an
+// existing circle's minimum is post-MVP (see ds-suite-registry.md "Not in
+// MVP").
+message CircleMin {
+  // Minimum acceptable `suite_id` for content posted under this circle.
+  // Sub-minimum content surfaces the ISC-A-C8 render-time warning at the
+  // client.
+  SuiteId min_suite_id = 1;
+}
