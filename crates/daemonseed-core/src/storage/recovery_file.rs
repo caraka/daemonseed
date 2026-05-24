@@ -54,7 +54,7 @@
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use oxicrypt_aes::{Aes256Key, gcm_decrypt, gcm_encrypt};
-use oxicrypt_kdf::HkdfSha256;
+use oxicrypt_kdf::HkdfSha384;
 use uuid::Uuid;
 use zeroize::Zeroize;
 
@@ -88,7 +88,7 @@ const HEADER_LEN_V2: usize = MAGIC.len() + SUITE_ID_LEN + PROFILE_ID_LEN + ARGON
 const HEADER_LEN_V1: usize = MAGIC_V1.len() + PROFILE_ID_LEN + ARGON_PARAM_LEN;
 const NONCE_LEN: usize = 12;
 const TAG_LEN: usize = 16;
-const ARGON2_OUTPUT_LEN: usize = 32;
+const ARGON2_OUTPUT_LEN: usize = 48;
 const AEAD_KEY_LEN: usize = 32;
 
 /// Decrypted recovery-file contents. Caller persists `profile_id` + `argon2`
@@ -410,7 +410,7 @@ fn derive_aead_key(
         .map_err(RecoveryFileError::Argon2)?;
 
     let info_str = info::recovery_file(&profile_id.to_string());
-    let hkdf = HkdfSha256::from_prk(&intermediate).map_err(RecoveryFileError::Hkdf)?;
+    let hkdf = HkdfSha384::from_prk(&intermediate).map_err(RecoveryFileError::Hkdf)?;
     intermediate.zeroize();
 
     let mut key = [0u8; AEAD_KEY_LEN];
