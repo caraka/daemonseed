@@ -81,11 +81,37 @@ modules:
     public:
       - { kind: enum, name: Identity, note: "Primary | Device(Uuid) — selects which HKDF info-string prefix is used." }
       - { kind: enum, name: KeyDerivationError, note: "HKDF / oxicrypt-module / KEM keygen failure modes." }
-      - { kind: struct, name: SignKeypair, note: "ML-DSA-87 keypair. Drop zeroizes private key." }
+      - { kind: struct, name: SignKeypair, note: "ML-DSA-87 keypair. Drop zeroizes private key. Exposes detached `sign`." }
       - { kind: struct, name: KemKeypair, note: "ML-KEM-1024 keypair. Drop zeroizes private key." }
       - { kind: struct, name: IdentityKeys, note: "Bundle of SignKeypair + KemKeypair for one Identity branch." }
+      - { kind: enum, name: SignatureError, note: "Module(oxicrypt_module::Error) | BadSignature. BadSignature is uniform across tampered-message / wrong-key / forged-sig (ISC-A-S12 / A-C18 — verifier cannot distinguish the sub-cause)." }
     key_functions:
       - { sig: "derive_identity_keys(mnemonic: &Mnemonic, identity: Identity) -> Result<IdentityKeys, KeyDerivationError>", note: "End-to-end derivation. Each call regenerates from the seed — keys are not cached, so the caller manages lifetime." }
+      - { sig: "SignKeypair::sign(&self, message: &[u8]) -> Result<[u8; SIG_LEN], SignatureError>", note: "Detached ML-DSA-87 signature, empty FIPS-204 ctx (daemonseed domain-separates inside the signed bytes via the channel-binding prefix). Requires oxicrypt module operational." }
+      - { sig: "verify_signature(public_key: &[u8; PK_LEN], message: &[u8], signature: &[u8; SIG_LEN]) -> Result<(), SignatureError>", note: "Ok only on a valid signature; all failure modes collapse to BadSignature." }
+
+  - path: daemonseed_core::identity_proof
+    purpose: >-
+      Post-HELLO identity-proof envelope construction + channel binding
+      (ISC-S19, A-S14, A-C18). Owns the construction half: derive the
+      32-byte TLS-exporter channel binding (label tied to
+      `kdf::info::IDENTITY_PROOF_V1`, context = negotiated APP_HELLO
+      version), build the canonical signed input, and sign the envelope.
+      The exporter call is injected via `ChannelBindingSource` so core
+      stays rustls-free; the label + context byte-layout live HERE (one
+      definition, both peers) to defeat the channel-binding asymmetry bug.
+      Verification + the Versioned->Authenticated type-state land in the
+      next commit.
+    iscs: [S19, A-S14, A-C18, S15, C4]
+    public:
+      - { kind: const, name: CHANNEL_BINDING_LABEL, value: '"daemonseed/identity-proof/v1" (= kdf::info::IDENTITY_PROOF_V1.as_bytes())', note: "TLS 1.3 exporter label. Single source of truth in the kdf-info registry." }
+      - { kind: const, name: CHANNEL_BINDING_LEN, value: 32 }
+      - { kind: trait, name: ChannelBindingSource, note: "export_keying_material(label, context, out). Implemented by the TLS-holding layer (server/cli) over rustls; MUST NOT substitute a constant (A-S14/A-C18)." }
+      - { kind: enum, name: ChannelBindingError, note: "Export(String) — exporter call failed (e.g. handshake incomplete)." }
+    key_functions:
+      - { sig: "derive_channel_binding(source: &impl ChannelBindingSource, negotiated_version: ProtocolVersion) -> Result<[u8; 32], ChannelBindingError>", note: "Fixed label + version-context exporter call." }
+      - { sig: "signing_input(channel_binding, claimed_handle, claimed_pubkey, negotiated_version, signed_at_unix_ms, counter) -> Vec<u8>", note: "Canonical signed bytes (decision D3 — extends ISC-S19's 4 fields to cover timestamp+counter). Variable-length fields are u16-BE length-delimited to prevent field-confusion." }
+      - { sig: "build_envelope(signing, channel_binding, claimed_handle, role, suite_id, negotiated_version, signed_at_unix_ms, counter) -> Result<IdentityProof, SignatureError>", note: "Constructs + signs the wire envelope. counter/timestamp supplied by caller; counter state is sourced from the seeds blob by the orchestration layer (later commit)." }
 
   - path: daemonseed_core::handle
     purpose: >-

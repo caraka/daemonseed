@@ -16,6 +16,7 @@ pub mod crypto;
 pub mod first_start;
 pub mod handle;
 pub mod identity;
+pub mod identity_proof;
 pub mod kdf;
 pub mod passphrase;
 pub mod profile;

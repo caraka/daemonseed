@@ -259,9 +259,10 @@ protocol_rules:
       Identity-proof envelope binds to the TLS channel (RFC 8446 §7.5
       exporter, label "daemonseed/identity-proof/v1", context = negotiated
       APP_HELLO version) and includes a per-key monotonic counter for
-      replay protection plus a timestamp with a skew window (window value
-      pending design decision D1 — 120s per impl plan vs ±15min per
-      project_clocks_freshness). Counter state lives in the seeds blob.
+      replay protection plus a timestamp with a ±5-minute skew window
+      (Matrix-style, decided by caraka 2026-05-24; supersedes the
+      impl-plan's 120s and the memory's ±15min). Counter state lives in
+      the seeds blob.
       Uniform non-informative close-shape for all auth failures (ISC-A-S12 /
       A-C18). Signature input extends ISC-S19's literal concatenation to
       cover signed_at_unix_ms + counter (freshness formalization, decision D3).
