@@ -88,3 +88,91 @@ pub struct CircleMin {
     #[prost(message, optional, tag = "1")]
     pub min_suite_id: ::core::option::Option<SuiteId>,
 }
+/// A peer's proof that it controls the long-term key behind its claimed handle,
+/// bound to the current TLS session.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct IdentityProof {
+    /// Signature-algorithm identifier (ISC-S15). Resolves through the in-repo
+    /// registry to the verification algorithm. An unsupported suite_id closes the
+    /// connection and surfaces the `unsupported-identity-proof-suite` trust event
+    /// (ISC-C28). MVP default: 1 (CNSA 2.0). Not part of the signed input —
+    /// a flipped suite_id simply fails signature verification under the named
+    /// algorithm.
+    #[prost(message, optional, tag = "1")]
+    pub suite_id: ::core::option::Option<SuiteId>,
+    /// Bookkeeping role declaration (see `Role`). Not an authentication boundary.
+    #[prost(enumeration = "Role", tag = "2")]
+    pub role: i32,
+    /// The peer's wire handle — `<name>#<12hex>` (ISC-C4 client / ISC-S11 server)
+    /// or the floor `#<12hex>` form. The receiver verifies that the 12-hex hash
+    /// component equals SHA-384(claimed_pubkey)\[:12\] (ISC-A-S14 / ISC-A-C18),
+    /// anchoring ISC-C4's self-verifying-handle property.
+    #[prost(string, tag = "3")]
+    pub claimed_handle: ::prost::alloc::string::String,
+    /// The peer's long-term ML-DSA-87 public key.
+    #[prost(bytes = "vec", tag = "4")]
+    pub claimed_pubkey: ::prost::alloc::vec::Vec<u8>,
+    /// OS wall-clock time at envelope construction, milliseconds since the Unix
+    /// epoch. Inside the signed input (tamper-evident, per project_clocks_freshness).
+    /// Verifiers enforce a skew window; outside-window envelopes fail closed.
+    #[prost(uint64, tag = "5")]
+    pub signed_at_unix_ms: u64,
+    /// Per-signing-key monotonic counter (project_clocks_freshness). Inside the
+    /// signed input. Verifiers track highest-seen per (signer-key, target-server)
+    /// and reject any value <= highest-seen (replay / rollback). A gap (skipped
+    /// numbers) means missed messages — logged, not rejected.
+    #[prost(uint64, tag = "6")]
+    pub counter: u64,
+    /// ML-DSA-87 signature over the canonical concatenation:
+    ///    channel_binding || claimed_handle || claimed_pubkey
+    ///      || negotiated_version || signed_at_unix_ms || counter
+    /// computed with the long-term private key matching `claimed_pubkey`.
+    /// The channel_binding and negotiated_version terms are NOT carried on the
+    /// wire — both peers recompute them locally from the shared TLS session and
+    /// the APP_HELLO negotiation result, so a captured envelope cannot be
+    /// replayed into a different session (the recomputed binding won't match).
+    #[prost(bytes = "vec", tag = "7")]
+    pub signature: ::prost::alloc::vec::Vec<u8>,
+}
+/// Which side of the connection built this envelope.
+///
+/// **Bookkeeping only — NOT an authentication boundary (ISC-S19).** The
+/// receiver uses `role` to decide which policy table applies (per-client rate
+/// limits per ISC-S17 vs per-peer federation policy per ISC-S12), never to
+/// decide whether the peer is authentic. Verification logic MUST NOT branch on
+/// `role` as a trust decision (ISC-A-S8). The actual security comes from the
+/// signature plus the trust-mode pin (ISC-C22 / ISC-S12).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum Role {
+    /// proto3 zero-value default. A received envelope with ROLE_UNSPECIFIED is
+    /// malformed — the receiver treats it as a verification failure.
+    Unspecified = 0,
+    /// The initiating client (ISC-C4 handle).
+    Client = 1,
+    /// A server, in either client-facing or server-to-server peering role
+    /// (ISC-S11 server-id).
+    Server = 2,
+}
+impl Role {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "ROLE_UNSPECIFIED",
+            Self::Client => "ROLE_CLIENT",
+            Self::Server => "ROLE_SERVER",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "ROLE_UNSPECIFIED" => Some(Self::Unspecified),
+            "ROLE_CLIENT" => Some(Self::Client),
+            "ROLE_SERVER" => Some(Self::Server),
+            _ => None,
+        }
+    }
+}

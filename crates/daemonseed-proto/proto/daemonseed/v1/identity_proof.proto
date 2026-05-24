@@ -1,0 +1,100 @@
+// daemonseed wire protocol — post-HELLO identity-proof envelope.
+//
+// Anchors ISC-S19 (identity-proof sequence), ISC-A-S14 (server channel-binding
+// + replay refusal), ISC-A-C18 (client verification), and the freshness
+// formalization (hybrid timestamp + per-key monotonic counter). Runs once,
+// immediately after APP_HELLO_ACK (app_hello.proto), on every daemonseed
+// connection — client-to-server and server-to-server peering, uniformly.
+//
+// Sequence (ISC-S19):
+//   1. Both peers derive a 32-byte channel-binding value from the TLS 1.3
+//      exporter (RFC 8446 §7.5), label "daemonseed/identity-proof/v1",
+//      exporter context = the negotiated APP_HELLO version.
+//   2. Each peer builds an IdentityProof and signs it (see `signature` below).
+//   3. Both peers send their envelope on the bidi-stream — no leader/follower.
+//   4. Each peer verifies the incoming envelope (handle↔pubkey hash binding,
+//      suite support, signature, trust-mode, freshness).
+//   5. Success → the connection's Authenticated type-state; failure → uniform
+//      non-informative close (ISC-A-S12 / ISC-A-C18).
+//
+// Channel binding closes the offline-key-theft replay vector: an envelope
+// captured in one TLS session cannot be replayed in another, because the
+// signed channel-binding value is session-unique.
+//
+// MINOR bumps to this schema MUST be additive-only (ISC-S14). Never reuse
+// field numbers, never repurpose enum values.
+//
+// Framing on the wire: length-prefixed (u32 big-endian) prost-encoded message,
+// same convention as app_hello (see `daemonseed-server::hello`).
+
+syntax = "proto3";
+
+package daemonseed.v1;
+
+import "daemonseed/v1/suite.proto";
+
+// Which side of the connection built this envelope.
+//
+// **Bookkeeping only — NOT an authentication boundary (ISC-S19).** The
+// receiver uses `role` to decide which policy table applies (per-client rate
+// limits per ISC-S17 vs per-peer federation policy per ISC-S12), never to
+// decide whether the peer is authentic. Verification logic MUST NOT branch on
+// `role` as a trust decision (ISC-A-S8). The actual security comes from the
+// signature plus the trust-mode pin (ISC-C22 / ISC-S12).
+enum Role {
+  // proto3 zero-value default. A received envelope with ROLE_UNSPECIFIED is
+  // malformed — the receiver treats it as a verification failure.
+  ROLE_UNSPECIFIED = 0;
+
+  // The initiating client (ISC-C4 handle).
+  ROLE_CLIENT = 1;
+
+  // A server, in either client-facing or server-to-server peering role
+  // (ISC-S11 server-id).
+  ROLE_SERVER = 2;
+}
+
+// A peer's proof that it controls the long-term key behind its claimed handle,
+// bound to the current TLS session.
+message IdentityProof {
+  // Signature-algorithm identifier (ISC-S15). Resolves through the in-repo
+  // registry to the verification algorithm. An unsupported suite_id closes the
+  // connection and surfaces the `unsupported-identity-proof-suite` trust event
+  // (ISC-C28). MVP default: 1 (CNSA 2.0). Not part of the signed input —
+  // a flipped suite_id simply fails signature verification under the named
+  // algorithm.
+  SuiteId suite_id = 1;
+
+  // Bookkeeping role declaration (see `Role`). Not an authentication boundary.
+  Role role = 2;
+
+  // The peer's wire handle — `<name>#<12hex>` (ISC-C4 client / ISC-S11 server)
+  // or the floor `#<12hex>` form. The receiver verifies that the 12-hex hash
+  // component equals SHA-384(claimed_pubkey)[:12] (ISC-A-S14 / ISC-A-C18),
+  // anchoring ISC-C4's self-verifying-handle property.
+  string claimed_handle = 3;
+
+  // The peer's long-term ML-DSA-87 public key.
+  bytes claimed_pubkey = 4;
+
+  // OS wall-clock time at envelope construction, milliseconds since the Unix
+  // epoch. Inside the signed input (tamper-evident, per project_clocks_freshness).
+  // Verifiers enforce a skew window; outside-window envelopes fail closed.
+  uint64 signed_at_unix_ms = 5;
+
+  // Per-signing-key monotonic counter (project_clocks_freshness). Inside the
+  // signed input. Verifiers track highest-seen per (signer-key, target-server)
+  // and reject any value <= highest-seen (replay / rollback). A gap (skipped
+  // numbers) means missed messages — logged, not rejected.
+  uint64 counter = 6;
+
+  // ML-DSA-87 signature over the canonical concatenation:
+  //   channel_binding || claimed_handle || claimed_pubkey
+  //     || negotiated_version || signed_at_unix_ms || counter
+  // computed with the long-term private key matching `claimed_pubkey`.
+  // The channel_binding and negotiated_version terms are NOT carried on the
+  // wire — both peers recompute them locally from the shared TLS session and
+  // the APP_HELLO negotiation result, so a captured envelope cannot be
+  // replayed into a different session (the recomputed binding won't match).
+  bytes signature = 7;
+}

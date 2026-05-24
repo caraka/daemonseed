@@ -82,6 +82,7 @@ packages:
     proto_files:
       - "proto/daemonseed/v1/app_hello.proto"
       - "proto/daemonseed/v1/suite.proto"
+      - "proto/daemonseed/v1/identity_proof.proto"
     status: active
     messages:
       - name: ProtocolVersion
@@ -162,6 +163,43 @@ packages:
               app-layer SuiteId::try_new enforces the constraint.
         iscs: [C24, S15]
 
+      - name: IdentityProof
+        defined_in: "proto/daemonseed/v1/identity_proof.proto"
+        added_in: "v0.6.0-pre (M4b commit 1)"
+        purpose: >-
+          Post-HELLO identity-proof envelope (ISC-S19). A peer's proof
+          that it controls the long-term ML-DSA-87 key behind its
+          claimed handle, bound to the current TLS session via the
+          channel-binding value. Closes the offline-key-theft replay
+          vector (a captured envelope fails in any other session) and
+          carries the freshness pair (timestamp + per-key counter) per
+          project_clocks_freshness. Verified uniformly client→server and
+          server→server. Companion enum: `Role`.
+        fields:
+          - { name: suite_id, type: SuiteId, tag: 1, note: "Signature-algorithm identifier (ISC-S15). NOT in the signed input — a flipped suite_id fails verification under the named algorithm. MVP default 1 (CNSA 2.0)." }
+          - { name: role, type: Role, tag: 2, note: "Bookkeeping only — NOT an authentication boundary (ISC-S19 / A-S8). Selects the receiver's policy table (rate-limit vs federation), never the trust decision." }
+          - { name: claimed_handle, type: string, tag: 3, note: "Wire handle. Receiver verifies the 12-hex hash component == SHA-384(claimed_pubkey)[:12] (ISC-A-S14 / A-C18), anchoring ISC-C4's self-verifying-handle property." }
+          - { name: claimed_pubkey, type: bytes, tag: 4, note: "Long-term ML-DSA-87 public key." }
+          - { name: signed_at_unix_ms, type: uint64, tag: 5, note: "OS wall-clock at construction (ms since epoch). Inside the signed input. Skew-window enforced by verifiers (see protocol rule)." }
+          - { name: counter, type: uint64, tag: 6, note: "Per-signing-key monotonic counter. Inside the signed input. Verifiers reject <= highest-seen per (signer-key, target-server); a gap is logged not rejected." }
+          - { name: signature, type: bytes, tag: 7, note: "ML-DSA-87 over channel_binding || claimed_handle || claimed_pubkey || negotiated_version || signed_at_unix_ms || counter. channel_binding + negotiated_version are recomputed locally, never on the wire." }
+        iscs: [S19, A-S1, A-S2, A-S14, A-C18, S15, C4, C22]
+
+      - name: Role
+        kind: enum
+        defined_in: "proto/daemonseed/v1/identity_proof.proto"
+        added_in: "v0.6.0-pre (M4b commit 1)"
+        purpose: >-
+          Which side built an IdentityProof. Bookkeeping for the
+          receiver's policy table only — NEVER an authentication
+          boundary (ISC-S19 role-uniformity / ISC-A-S8). A received
+          ROLE_UNSPECIFIED is malformed and fails verification.
+        values:
+          - { name: ROLE_UNSPECIFIED, number: 0, note: "proto3 zero default; malformed if received." }
+          - { name: ROLE_CLIENT, number: 1, note: "Initiating client (ISC-C4 handle)." }
+          - { name: ROLE_SERVER, number: 2, note: "Server, client-facing or S2S peering (ISC-S11 server-id)." }
+        iscs: [S19, A-S8]
+
       - name: CircleMin
         defined_in: "proto/daemonseed/v1/suite.proto"
         added_in: "v0.4.0 (M3)"
@@ -216,14 +254,18 @@ protocol_rules:
     iscs: [S14, A-S9, C23]
 
   - name: "Identity-proof + channel binding (M4b)"
-    status: "Lands at M4b"
+    status: "Schema active (M4b commit 1 — IdentityProof + Role); channel-binding, verification, type-state Authenticated, and orchestration land in M4b commits 2-7"
     summary: >-
-      Identity-proof envelope binds to the TLS channel and includes
-      a per-key monotonic counter for replay protection plus a
-      timestamp with a 120-second skew window. Counter state lives
-      in the seeds blob. Constant-time close-shape for all auth
-      failures.
-    iscs: [S19, A-S1, A-S2, A-S14]
+      Identity-proof envelope binds to the TLS channel (RFC 8446 §7.5
+      exporter, label "daemonseed/identity-proof/v1", context = negotiated
+      APP_HELLO version) and includes a per-key monotonic counter for
+      replay protection plus a timestamp with a skew window (window value
+      pending design decision D1 — 120s per impl plan vs ±15min per
+      project_clocks_freshness). Counter state lives in the seeds blob.
+      Uniform non-informative close-shape for all auth failures (ISC-A-S12 /
+      A-C18). Signature input extends ISC-S19's literal concatenation to
+      cover signed_at_unix_ms + counter (freshness formalization, decision D3).
+    iscs: [S19, A-S1, A-S2, A-S14, A-C18]
 
   - name: "Suite-id validation contract"
     status: active
@@ -239,7 +281,6 @@ protocol_rules:
 # ─────────────────────────────────────────────────────────────────────
 
 planned:
-  - "IdentityProof envelope (M4b — channel-bound auth)"
   - "FederationIntroducer (M5 — introducer responses, no keys per ISC-A-S6)"
   - "CoTAssetPayload (M8 — server-opaque circle-of-trust asset relay)"
   - "Post / Mention / Rating (M6 — public-space messages)"
