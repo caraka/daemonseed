@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bootstrap;
+pub mod circle;
 pub mod crypto;
 pub mod first_start;
 pub mod handle;

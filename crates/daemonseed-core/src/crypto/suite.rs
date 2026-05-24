@@ -231,16 +231,32 @@ impl Registry {
         REGISTRY.iter().find(|s| s.id == id)
     }
 
-    /// Resolve a suite for *writing* a new artifact. Per ISC-A-C8 the
-    /// client MUST refuse to write under any suite whose state is
-    /// `ReadOnlyDeprecated` or `Removed`; `ActiveReadOnly` and `Proposed`
-    /// are also write-refused (active-read-only by definition no longer
-    /// writes; proposed has no implementation yet).
+    /// Resolve a suite for *writing* a new artifact under the default
+    /// client policy ([`crate::crypto::policy::WritePolicy::RefuseDeprecated`]).
+    /// Per ISC-A-C8 the client MUST refuse to write under any suite whose
+    /// state is `ReadOnlyDeprecated` or `Removed`; `ActiveReadOnly` and
+    /// `Proposed` are also write-refused (active-read-only by definition
+    /// no longer writes; proposed has no implementation yet).
     ///
     /// The compose-time semantics live here so the policy is enforced at
     /// one bottleneck rather than at every artifact-writer call site.
     pub fn resolve_for_write(id: SuiteId) -> Result<&'static Suite, WriteRefusal> {
+        Self::resolve_for_write_with(id, crate::crypto::policy::WritePolicy::RefuseDeprecated)
+    }
+
+    /// Resolve a suite for *writing* a new artifact under an explicit
+    /// [`crate::crypto::policy::WritePolicy`]. The policy decides which
+    /// lifecycle states are permitted; the dispatch into a specific
+    /// [`WriteRefusal`] variant still mirrors the suite's actual state so
+    /// callers see *why* a write was refused.
+    pub fn resolve_for_write_with(
+        id: SuiteId,
+        policy: crate::crypto::policy::WritePolicy,
+    ) -> Result<&'static Suite, WriteRefusal> {
         let suite = Self::lookup(id).ok_or(WriteRefusal::Unknown(id))?;
+        if policy.permits(suite.state) {
+            return Ok(suite);
+        }
         match suite.state {
             LifecycleState::ActiveWrite => Ok(suite),
             LifecycleState::ActiveReadOnly => Err(WriteRefusal::ActiveReadOnly(id)),
