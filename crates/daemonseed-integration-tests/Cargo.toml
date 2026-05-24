@@ -34,3 +34,12 @@ tower = { workspace = true }
 # test scaffolding).
 oxicrypt-module = { workspace = true }
 uuid = { workspace = true }
+
+# M4a commit 6 — full end-to-end TCP + TLS + APP_HELLO round-trip between
+# the real server runtime and the real CLI connect path. Both crates gain
+# `[lib]` targets in commits 4 and 5 so the harness drives them in-process.
+daemonseed-server = { path = "../daemonseed-server" }
+daemonseed-cli = { path = "../daemonseed-cli" }
+oxitls-rustls-provider = { workspace = true, features = ["testing"] }
+prost = { workspace = true }
+tempfile = { workspace = true }

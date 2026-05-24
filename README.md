@@ -16,8 +16,8 @@ daemonseed/
 │   ├── daemonseed-core/                    protocol library — identity, storage, crypto-agility,
 │   │                                       first-start orchestrator, bootstrap, circle metadata
 │   ├── daemonseed-proto/                   wire schema (Protocol Buffers, prost + tonic)
-│   ├── daemonseed-server/                  relay daemon binary (placeholder until M4a)
-│   ├── daemonseed-cli/                     non-interactive scriptable client (placeholder until M4b+)
+│   ├── daemonseed-server/                  relay daemon: TLS 1.3 termination + APP_HELLO + SIGTERM (M4a)
+│   ├── daemonseed-cli/                     scriptable client: `connect <server-id>` subcommand (M4a)
 │   ├── daemonseed-tui/                     interactive ratatui client (placeholder until M11)
 │   └── daemonseed-integration-tests/       cross-crate integration tests + ISC coverage registry
 │
@@ -32,11 +32,11 @@ daemonseed/
                                             isc-coverage, findings-resolved, install-hooks
 ```
 
-Substantive code lives in `daemonseed-core` and `daemonseed-proto` today. The `server`, `cli`, and `tui` crates are placeholders; they fill in over M4a through M11.
+Substantive code lives in `daemonseed-core`, `daemonseed-proto`, `daemonseed-server`, and `daemonseed-cli` as of M4a. The `tui` crate is still a placeholder; it fills in at M11.
 
 ## Status
 
-Current release: **v0.4.0** (M3 closed — suite registry + crypto-agility primitives). ISC coverage 34/93 (36.6% of MVP). Promotion to a public repository is gated on the `oxicrypt` sibling crate going public.
+Current release: **v0.4.0** (M3 closed); v0.5.0 cuts at M4a close. ISC coverage 43/93 (46.2% of MVP) after M4a. Promotion to a public repository is gated on the `oxicrypt` sibling crate going public.
 
 ## License
 
