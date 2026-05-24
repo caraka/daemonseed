@@ -1,0 +1,343 @@
+# ─────────────────────────────────────────────────────────────────────
+# daemonseed — LAMA discovery file
+#
+# Repository-root entry point for AI coding agents. Quick-evaluation
+# summary of what daemonseed is, what's implemented today, and where
+# to find the per-crate API manifests.
+#
+# Specification: https://github.com/lamaspec/lama
+# ─────────────────────────────────────────────────────────────────────
+
+lama: "0.1"
+
+project:
+  name: daemonseed
+  version: "0.4.0"
+  description: >-
+    Federated end-to-end-encrypted communication and file-sharing
+    protocol. Pure-Rust backend, CNSA 2.0 baseline crypto via the
+    oxicrypt sibling crate, gRPC-over-HTTP/2 wire (prost + tonic),
+    AGPL-3.0 code with Apache-2.0/MIT dual-licensed schema. Designed
+    against the GFW-survivable bar per Wu et al., USENIX Security 2023.
+  repository: "https://github.com/caraka/daemonseed"
+  license:
+    code: "AGPL-3.0-or-later"
+    schema: "Apache-2.0 OR MIT"
+  minimum_toolchain: "rust 1.95"
+  edition: "2024"
+  phase: private
+
+# ─────────────────────────────────────────────────────────────────────
+# Implementation status at v0.4.0 (M3 closed)
+# ─────────────────────────────────────────────────────────────────────
+
+milestones_complete:
+  - id: M0
+    tag: v0.1.0
+    summary: "Pre-implementation findings, scaffolding, proto-codegen pipeline."
+  - id: M1
+    tag: v0.2.0
+    summary: "Identity primitives (BIP-39 mnemonic, HKDF-derived ML-DSA-87 / ML-KEM-1024 keypairs), profile substrate, at-rest seeds blob, handle format (adj-noun + 12-hex fingerprint)."
+  - id: M2
+    tag: v0.3.0
+    summary: "First-start type-state orchestrator, encrypted recovery file (.dseed), bootstrap-anchor selection (canonical / manual-paste)."
+  - id: M3
+    tag: v0.4.0
+    summary: "Suite registry (CNSA 2.0 baseline), suite_id wire-tagging on at-rest artifacts, read-old-write-new migration on touch, circle-metadata min_suite_id slot."
+
+milestones_planned:
+  - id: M4a
+    summary: "Server skeleton + TLS 1.3 on :443 with ALPN h2 + APP_HELLO + type-state Connection<Negotiating → Versioned>."
+  - id: M4b
+    summary: "Identity-proof + channel-binding + replay protection."
+  - id: M5
+    summary: "Federation trust slider + introducer + S2S peering."
+  - id: M6
+    summary: "Public space: posts, MOTD, taxonomy, ratings, federation-side isolation."
+  - id: M7
+    summary: "Suite deprecation policy + trust-event taxonomy."
+  - id: M8
+    summary: "CoT subscriptions, chunks, share indexer."
+  - id: M9
+    summary: "Rate limits, backoff, mute/hide, mentions."
+  - id: M10
+    summary: "Release distribution + update lifecycle + platform."
+  - id: M11
+    summary: "TUI integration + MVP gate (4-daemon end-to-end)."
+
+# ─────────────────────────────────────────────────────────────────────
+# Workspace layout
+# ─────────────────────────────────────────────────────────────────────
+
+crates:
+  - name: daemonseed-core
+    purpose: >-
+      Protocol library — identity, storage, bootstrap, first-start
+      orchestration, crypto-agility primitives, circle metadata.
+      Pure library (no_std-compatible where the underlying primitives
+      allow; currently uses std for I/O).
+    license: AGPL-3.0-or-later
+    status: active
+    manifest: "docs/llm-api-manifest/daemonseed-core-api.yaml"
+
+  - name: daemonseed-proto
+    purpose: >-
+      Wire schema — `.proto` definitions for the daemonseed protocol,
+      compiled via tonic-build. Pure schema; no protocol behavior.
+      Schema crate is dual-licensed to remove copyleft drag from
+      cross-language client implementations.
+    license: "Apache-2.0 OR MIT"
+    status: active
+    manifest: "docs/llm-api-manifest/daemonseed-proto-protocol.yaml"
+
+  - name: daemonseed-server
+    purpose: "Relay daemon binary. Federation-aware. Substantive code lands at M4a."
+    license: AGPL-3.0-or-later
+    status: placeholder
+    manifest: "docs/llm-api-manifest/daemonseed-server-api.yaml"
+
+  - name: daemonseed-cli
+    purpose: "Non-interactive scriptable client binary. Substantive code lands post-M4b."
+    license: AGPL-3.0-or-later
+    status: placeholder
+    manifest: "docs/llm-api-manifest/daemonseed-cli-api.yaml"
+
+  - name: daemonseed-tui
+    purpose: "Interactive ratatui client. Primary testing surface during the private phase. Substantive code lands at M11."
+    license: AGPL-3.0-or-later
+    status: placeholder
+    manifest: null
+
+  - name: daemonseed-integration-tests
+    purpose: "Cross-crate integration tests + ISC coverage registry. Per-milestone exercise files under tests/m{N}_isc_coverage.rs."
+    license: AGPL-3.0-or-later
+    status: active
+    manifest: null
+
+  - name: xtask
+    purpose: "Workspace task runner. Subcommands: gen-proto, check-proto, isc-coverage, findings-resolved, install-hooks."
+    license: AGPL-3.0-or-later
+    status: active
+    manifest: null
+
+# ─────────────────────────────────────────────────────────────────────
+# Capability quick-reference
+# ─────────────────────────────────────────────────────────────────────
+
+capabilities:
+  - category: "Identity & enrollment"
+    summary: >-
+      BIP-39 24-word mnemonic generation via the `bip39` crate; HKDF-SHA-256
+      derives separate ML-DSA-87 (signing) and ML-KEM-1024 (KEM) seeds
+      using domain-separated info strings; primary identity + per-device
+      identity branches; passphrase strength gate via `zxcvbn`. Handle
+      format = adjective-noun display name + 12-hex-character fingerprint
+      of the identity public key.
+    crate: daemonseed-core
+    modules:
+      - daemonseed_core::identity::mnemonic
+      - daemonseed_core::identity::keys
+      - daemonseed_core::handle
+      - daemonseed_core::handle::display_name
+      - daemonseed_core::kdf::info
+      - daemonseed_core::passphrase
+    iscs: [C1, C2, C4, C4a, C4b, C9, C12, C13]
+
+  - category: "Profile substrate"
+    summary: >-
+      Per-profile UUID-v4 profile-id (ISC-C36), Argon2id params (ISC-C14)
+      persisted in `daemonseed.toml`, profile-root discovery via CWD /
+      `--config <path>` / XDG fallback (ISC-C35). UUID double-duty: HKDF
+      info-string substitution + Argon2 salt (cryptographically independent
+      uses, both non-secret).
+    crate: daemonseed-core
+    modules:
+      - daemonseed_core::profile::config
+      - daemonseed_core::profile::resolve
+    iscs: [C14, C35, C36]
+
+  - category: "At-rest storage"
+    summary: >-
+      Two-layer encrypted on-disk artifacts. The at-rest seeds blob
+      (ISC-C3) holds the user's mnemonic + future profile state; the
+      recovery file `.dseed` (ISC-C32) is the air-gap-paper replacement
+      for recovery on a clean device. Both formats are v2 as of M3 with
+      a 2-byte suite_id slot after the magic prefix. v1 reads accepted
+      under implicit suite_id=0x0001 for M1/M2 enrollment compatibility.
+      v2 binds suite_id into the AEAD AAD; touch_reseal migrates v1 → v2
+      on next save (read-old-write-new per ISC-C24).
+    crate: daemonseed-core
+    modules:
+      - daemonseed_core::storage::seeds
+      - daemonseed_core::storage::recovery_file
+    iscs: [C3, C24, C30, C32, A-C9]
+
+  - category: "First-start type-state orchestrator"
+    summary: >-
+      Cold-enrollment flow as a compile-time-gated state machine —
+      Welcome → Sealed → BackupVerified → Ready. Each transition
+      consumes the prior state; identity-recoverable-before-network is
+      a type-system guarantee (A-C15 enforced via the type signature
+      of Ready::into_session_materials).
+    crate: daemonseed-core
+    modules:
+      - daemonseed_core::first_start
+      - daemonseed_core::first_start::orchestrator
+      - daemonseed_core::first_start::verify
+    iscs: [C29, C30, C31, C33, C34, A-C13, A-C14, A-C15, A-C19]
+
+  - category: "Bootstrap-anchor selection"
+    summary: >-
+      Two bootstrap paths exposed at first-start (ISC-C37): a bundled
+      canonical relay (currently a placeholder until the project stands
+      up its public daemonseed network) and a manual-paste
+      out-of-band-supplied server-id + address. No third path
+      (no mDNS, no DHT, no auto-discovery).
+    crate: daemonseed-core
+    modules:
+      - daemonseed_core::bootstrap
+      - daemonseed_core::bootstrap::anchor
+    iscs: [C22, C37]
+
+  - category: "Crypto-agility (suite registry)"
+    summary: >-
+      Registry of (AEAD, KEM, signature, hash, KDF, memory-hard) bundles
+      identified by a u16 SuiteId. Single entry at M3: CNSA 2.0 (0x0001).
+      Family discriminator = (KDF, hash) equivalence; cross-family
+      migration is post-MVP (treated as a new-circle event per ISC-A-C8).
+      Compose-time write-policy gate (WritePolicy enum) refuses
+      Read-only-deprecated and Removed states by default.
+    crate: daemonseed-core
+    modules:
+      - daemonseed_core::crypto::suite
+      - daemonseed_core::crypto::policy
+    iscs: [S15, C24, A-S10, A-C8, A-C9]
+
+  - category: "Circle-of-trust metadata (client-only)"
+    summary: >-
+      Per-circle local state, holding the founder-declared min_suite_id.
+      The struct is client-local — circles are anonymous to the server
+      per ISC-A-S2, and Metadata never crosses the trust boundary.
+      `accepts(suite)` enforces same-family + at-or-above-floor at
+      render time per ISC-A-C8. Circle creation lands in M6.
+    crate: daemonseed-core
+    modules:
+      - daemonseed_core::circle::metadata
+    iscs: [C8, A-C8]
+
+  - category: "Wire schema (proto)"
+    summary: >-
+      Protocol Buffers schema for the `daemonseed.v1` package. Messages
+      so far: Version (M0; for HELLO once it lands), SuiteId (M3; wire
+      tag for cryptographic artifacts), CircleMin (M3; inner-payload
+      shape for client-to-client circle metadata exchange). Schema is
+      version-stable per ISC-S14: MINOR bumps are additive-only;
+      MAJOR bumps create a new `vN` module.
+    crate: daemonseed-proto
+    modules:
+      - daemonseed_proto::v1
+    iscs: [S14, A-S9, C23, C24, A-C8]
+
+# ─────────────────────────────────────────────────────────────────────
+# Cross-cutting properties (system-wide invariants)
+# ─────────────────────────────────────────────────────────────────────
+
+properties:
+  - id: "no-client-history"
+    summary: >-
+      Clients persist identity + federation state + ephemeral caches
+      only. No message archive, no post archive, no file-content
+      archive. Total wipe = start over with a fresh identity, not data
+      loss. Load-bearing for the .dseed backup design.
+    enforcement: convention (no archival API exists)
+
+  - id: "server-payload-opacity"
+    summary: >-
+      The server never decrypts circle-of-trust payloads, never links
+      a payload to a specific circle, never profiles per-pubkey traffic
+      patterns. Asserted at M3 via grep-anchor in m3_isc_coverage
+      (zero Registry::lookup references in daemonseed-server/src/).
+    enforcement: |
+      Convention + grep-asserted regression anchor (m3_iscs::server_suite_transparency).
+      Compile-time strengthening lands at M5/M6 via separated CoT-relay
+      types that don't depend on the suite registry.
+    iscs: [A-S1, A-S2, A-S10]
+
+  - id: "type-state-protocol-gating"
+    summary: >-
+      Protocol-level invariants (no traffic before APP_HELLO; no
+      identity-proof before HELLO_ACK; no AsyncRead/AsyncWrite before
+      authentication) are enforced via Rust's type system where
+      possible. Reference: Connection<Negotiating → Versioned → Authenticated>
+      pattern lands at M4a.
+    enforcement: compile-time (lands at M4a)
+    iscs: [C23, S14, A-S14]
+
+  - id: "censorship-survivability-baseline"
+    summary: >-
+      First TLS record on :443 satisfies Wu et al. (USENIX Security
+      2023) GFW Ex5 negative-allowlist by construction. ALPN is set
+      to generic `h2`; application-protocol identification happens
+      after TLS handshake. Lands at M4a.
+    enforcement: wire-shape (lands at M4a)
+    iscs: [S5]
+
+# ─────────────────────────────────────────────────────────────────────
+# External dependencies
+# ─────────────────────────────────────────────────────────────────────
+
+external_dependencies:
+  crypto_foundation:
+    name: oxicrypt
+    relationship: path-dependency (private phase) / registry-dependency (post-public)
+    purpose: "CNSA 2.0 primitives (AES-256-GCM, ML-DSA-87, ML-KEM-1024, SHA-256, HKDF), TLS 1.3 glue. Pure-Rust FIPS 140-3 Level 1 module."
+    visibility: "private during the private phase; goes public before daemonseed does"
+
+  wire:
+    - { name: prost, version: "=0.13.4", purpose: "Protocol Buffers encoding for Rust" }
+    - { name: tonic, version: "=0.12.3", purpose: "gRPC-over-HTTP/2 server + client" }
+    - { name: tonic-build, version: "=0.12.3", purpose: "tonic codegen from .proto" }
+
+  runtime_and_glue:
+    - { name: tokio, version: "1.43", purpose: "async runtime (rt + macros + io-util + net)" }
+    - { name: tower, version: "0.5", purpose: "Service abstraction for tonic" }
+    - { name: ratatui, version: "0.29", purpose: "TUI framework for daemonseed-tui (M11)" }
+
+  identity_and_crypto_aux:
+    - { name: argon2, version: "0.5", purpose: "Argon2id KDF (ISC-C14, ISC-C30) — RFC 9106, not NIST so out of oxicrypt scope" }
+    - { name: bip39, version: "2", purpose: "BIP-39 mnemonic + 2048-word English wordlist (ISC-C2)" }
+    - { name: zeroize, version: "1", purpose: "ZeroizeOnDrop derive for secret-bearing types" }
+    - { name: zxcvbn, version: "3", purpose: "Passphrase strength estimation (ISC-C12, ISC-C9)" }
+    - { name: uuid, version: "1", purpose: "UUID v4 from cryptographic randomness (ISC-C36, ISC-C1)" }
+    - { name: unicode-normalization, version: "0.1", purpose: "NFKC for circle-of-trust entropy (ISC-C9)" }
+
+  config_and_glue:
+    - { name: toml, version: "0.8", purpose: "Profile config persistence — daemonseed.toml (ISC-C35)" }
+    - { name: serde, version: "1", purpose: "(De)serialization for daemonseed.toml" }
+    - { name: hex, version: "0.4", purpose: "12-char hash-prefix codec in handle format (ISC-C4)" }
+    - { name: getrandom, version: "fallback to oxicrypt-managed entropy", purpose: "Direct CSPRNG access for nonces and salts" }
+
+# ─────────────────────────────────────────────────────────────────────
+# Design-document references
+# ─────────────────────────────────────────────────────────────────────
+#
+# The Ideal State Criteria (ISC) document and the suite-registry doc
+# are the authoritative spec sources during the private phase. They
+# live OUTSIDE this repository (in the maintainer's private vault)
+# and are referenced by ISC number throughout the LAMA manifests.
+# Selected content will be promoted to `docs/` in this repo at the
+# MVP gate (M11). Until then, ISC numbers are the spec breadcrumbs.
+
+isc_reference:
+  current_count: 93
+  numbering:
+    server_positive: "ISC-S1 .. ISC-S19"
+    server_negative: "ISC-A-S1 .. ISC-A-S14"
+    client_positive: "ISC-C1 .. ISC-C37 (C5 intentionally vacant)"
+    client_negative: "ISC-A-C1 .. ISC-A-C19"
+
+# ─────────────────────────────────────────────────────────────────────
+# Where the rich detail lives
+# ─────────────────────────────────────────────────────────────────────
+
+manifest_directory: "docs/llm-api-manifest/"

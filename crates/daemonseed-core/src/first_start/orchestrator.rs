@@ -20,7 +20,7 @@ use crate::storage::seeds::{self, BlobError, Seeds};
 // ── Phase markers ────────────────────────────────────────────────────────
 
 /// Initial phase — caller can drive [`FirstStart::new`] but cannot extract
-/// anything until [`Welcome::initialize`] runs.
+/// anything until `FirstStart::<Welcome>::initialize` runs.
 pub enum Welcome {}
 
 /// Phase after passphrase + mnemonic + blob + recovery-file are all

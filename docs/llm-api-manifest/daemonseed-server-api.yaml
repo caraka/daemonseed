@@ -1,0 +1,127 @@
+# ─────────────────────────────────────────────────────────────────────
+# daemonseed-server — LAMA API Manifest (placeholder at v0.4.0)
+#
+# The server crate ships as a placeholder `fn main() {}` through M3.
+# Substantive code lands at M4a (TLS skeleton + APP_HELLO + the
+# Versioned type-state) and grows through M5 (federation trust slider
+# + introducer + S2S peering), M6 (public-space relay), M8 (CoT-asset
+# relay), and M9 (rate limits + backoff).
+#
+# Cross-references:
+# - Repository root: ../../lama.yaml
+# - Core crate: ./daemonseed-core-api.yaml
+# - Wire schema: ./daemonseed-proto-protocol.yaml
+# ─────────────────────────────────────────────────────────────────────
+
+lama: "0.1"
+
+library:
+  name: daemonseed-server
+  version: "0.1.0"
+  description: "Relay daemon binary. Placeholder at v0.4.0 (M3)."
+  license: "AGPL-3.0-or-later"
+  manifest_for: "crates/daemonseed-server"
+  status: placeholder
+
+# ─────────────────────────────────────────────────────────────────────
+# Current surface (placeholder)
+# ─────────────────────────────────────────────────────────────────────
+
+binaries:
+  - name: daemonseed-server
+    entry_point: "fn main()"
+    status: placeholder
+    note: "Empty main — does nothing. M4a stands up the real entry point."
+
+# ─────────────────────────────────────────────────────────────────────
+# Anti-criteria (regression anchors that hold today)
+# ─────────────────────────────────────────────────────────────────────
+
+anti_criteria:
+  - id: "ISC-A-S10 suite-transparency"
+    summary: >-
+      The server crate MUST NOT call `Registry::lookup`,
+      `Registry::resolve_for_write`, or `Suite::same_family` on any
+      CoT-relay path. CoT crypto is end-to-end and opaque to the
+      server, including the suite tag. Server is permitted to consume
+      `SuiteId` opaquely for its own identity material (ISC-S15
+      server-wide-keyed handshakes) when M4a lands, but the registry-
+      lookup boundary stays client-side.
+    enforcement: >-
+      Grep-asserted by
+      `daemonseed-integration-tests::tests::m3_isc_coverage::m3_iscs_exercise_end_to_end`
+      (server_suite_transparency block). The assertion is vacuously
+      true at M3 (placeholder main) and becomes a real regression
+      anchor when M5/M6 add CoT-relay code.
+    iscs: [A-S10]
+
+  - id: "ISC-A-S1 / A-S2 server payload opacity"
+    summary: >-
+      Server cannot decrypt CoT payloads, cannot link a payload to a
+      specific circle, cannot profile per-pubkey traffic patterns.
+      Will be enforced architecturally at M4b+ via the type
+      separation between OpaquePayload<C> and decrypted client-side
+      types.
+    enforcement: "Lands at M4b+; placeholder until then."
+    iscs: [A-S1, A-S2]
+
+# ─────────────────────────────────────────────────────────────────────
+# Planned surface (forward-looking, not yet implemented)
+# ─────────────────────────────────────────────────────────────────────
+
+planned:
+  - milestone: M4a
+    surface:
+      - "TLS 1.3 listener on :443 with ALPN h2 (rustls + oxicrypt provider)"
+      - "APP_HELLO + APP_HELLO_ACK + APP_HELLO_REJECT handlers per ISC-S14"
+      - "Connection<Negotiating → Versioned> type-state (or tower::Layer runtime equivalent)"
+      - "Wire-shape regression fixture + Wu et al. GFW classifier fixture"
+      - "Server-wide-keyed identity material tagged with suite_id (ISC-S15)"
+
+  - milestone: M4b
+    surface:
+      - "Identity-proof verification (consults daemonseed_core::crypto::suite::Registry::lookup for the signer's suite_id → signature algorithm mapping)"
+      - "Channel-bound envelope + per-key monotonic counter + 120s skew window"
+      - "Constant-time close-shape for all auth failures"
+
+  - milestone: M5
+    surface:
+      - "Federation trust slider (per-server trusted/untrusted) — `daemonseed_server::federation::trust`"
+      - "Introducer endpoint (returns server-id + address, NEVER public keys per ISC-A-S6)"
+      - "S2S peering — `daemonseed_server::federation::peer`"
+      - "introduce-to-clients toggle (S13) suppresses introductions symmetrically across client AND s2s queries"
+
+  - milestone: M6
+    surface:
+      - "Public-space post / MOTD / rating handlers"
+      - "Server-side taxonomy enforcement (no metadata leak per ISC-A-S3 / A-S4)"
+
+  - milestone: M7
+    surface:
+      - "Suite-deprecation policy publish endpoint (ISC-S16)"
+      - "Per-suite cutoff enforcement at identity-proof (SUITE_DEPRECATED_PAST_CUTOFF response)"
+
+  - milestone: M8
+    surface:
+      - "CoT-asset relay (server reads suite_id only as opaque bytes; never consults Registry::lookup on this path — regression anchor in m3_isc_coverage stays live)"
+      - "Chunk store + content-addressed fetch"
+      - "Subscription dispatch"
+
+  - milestone: M9
+    surface:
+      - "Per-connection / per-key / per-IP rate limits (ISC-S17 silent constant-time close)"
+      - "Operator-tunable thresholds with Pi-4 defaults"
+
+# ─────────────────────────────────────────────────────────────────────
+# Operator config surface (planned — not implemented at M3)
+# ─────────────────────────────────────────────────────────────────────
+
+operator_config:
+  format: "TOML"
+  status: planned
+  iscs: [S13, S16, S17]
+  expected_sections:
+    - "[server] server-id, address, signing key paths"
+    - "[federation] trust-mode defaults, introduce-to-clients, S2S peering list"
+    - "[suite_policy] per-suite cutoff dates (M7)"
+    - "[rate_limits] per-conn / per-key / per-IP thresholds (M9)"

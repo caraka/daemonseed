@@ -1,0 +1,207 @@
+# ─────────────────────────────────────────────────────────────────────
+# daemonseed-proto — LAMA Protocol Manifest
+#
+# Wire schema + protocol-level conventions for daemonseed. The .proto
+# files themselves serve as the message/service manifest; this LAMA
+# layer covers what proto3 syntax can't express — HELLO sequencing,
+# version negotiation, replay-protection rules, signed-payload
+# envelopes, the suite_id validation contract, and the family-id
+# non-feature.
+#
+# Cross-references:
+# - Repository root: ../../lama.yaml
+# - Core crate: ./daemonseed-core-api.yaml
+# ─────────────────────────────────────────────────────────────────────
+
+lama: "0.1"
+
+library:
+  name: daemonseed-proto
+  version: "0.1.0"
+  description: >-
+    Wire-protocol schema. All public Rust types are generated from
+    `proto/*.proto` files via `build.rs` (tonic-build) on every cargo
+    build; a committed snapshot under `src/generated/` mirrors the
+    output for inspection (`cargo xtask gen-proto` refreshes;
+    `cargo xtask check-proto` enforces no drift in CI).
+  license: "Apache-2.0 OR MIT"
+  manifest_for: "crates/daemonseed-proto"
+
+# ─────────────────────────────────────────────────────────────────────
+# Schema-level constraints
+# ─────────────────────────────────────────────────────────────────────
+
+constraints:
+  - description: >-
+      MINOR version bumps are additive-only per ISC-S14. Never reuse
+      field numbers, never repurpose enum values, never tighten
+      validation after a field has shipped. MAJOR bumps create a new
+      `vN` module — the existing `v1` module stays compilable for as
+      long as anything depends on it.
+    enforcement: convention (no automated drift detection yet)
+    severity: error
+    iscs: [S14, A-S9, C23]
+
+  - description: >-
+      The committed snapshot under `src/generated/` is *for inspection
+      only* — it is NOT what gets compiled. Cargo's build.rs writes
+      fresh codegen into OUT_DIR on every build. `cargo xtask check-proto`
+      regenerates to a temp directory and diffs against the committed
+      snapshot; non-zero exit blocks the doc-sync gate.
+    enforcement: CI (xtask check-proto)
+    severity: error
+
+  - description: >-
+      proto3 has no native u16 type. Wire fields that semantically
+      carry u16 values (currently just `SuiteId.value`) are encoded
+      as `uint32` and validated at the application layer (via
+      `daemonseed_core::crypto::suite::SuiteId::try_new`).
+      Receivers MUST reject `0x0000` and `0xFFFF` (reserved
+      sentinels per `ds-suite-registry.md`).
+    enforcement: app-layer validation (SuiteId::try_new)
+    severity: error
+
+  - description: >-
+      No `family_id` wire field exists. Per ISC-S15 the family
+      relationship between two SuiteIds is **implicit in the
+      registry** and exposed via `Suite::same_family` on the core
+      crate side. Adding a family-id field to the wire would
+      permanently constrain registry topology and is a deliberate
+      non-feature.
+    enforcement: convention + this manifest
+    severity: error
+    iscs: [S15]
+
+# ─────────────────────────────────────────────────────────────────────
+# Packages
+# ─────────────────────────────────────────────────────────────────────
+
+packages:
+  - name: "daemonseed.v1"
+    rust_module: "daemonseed_proto::v1"
+    proto_files:
+      - "proto/daemonseed/v1/version.proto"
+      - "proto/daemonseed/v1/suite.proto"
+    status: active
+    messages:
+      - name: Version
+        defined_in: "proto/daemonseed/v1/version.proto"
+        added_in: "v0.1.0 (M0)"
+        purpose: >-
+          Advertised wire-protocol version. Sent inside HELLO once
+          HELLO lands (M4a); at M0–M3 it stands alone so the codegen
+          pipeline has a non-trivial message to generate.
+        fields:
+          - { name: major, type: uint32, tag: 1, note: "Breaking-change bumps only." }
+          - { name: minor, type: uint32, tag: 2, note: "Additive-only per ISC-S14." }
+          - { name: patch, type: uint32, tag: 3, note: "Bug-fix bumps; no wire-surface change." }
+          - { name: pre_release, type: string, tag: 4, note: "Optional human-readable suffix (e.g. 'alpha.1', 'rc.2'). Empty for stable releases." }
+
+      - name: SuiteId
+        defined_in: "proto/daemonseed/v1/suite.proto"
+        added_in: "v0.4.0 (M3)"
+        purpose: >-
+          Wire-tagged identifier for one entry in the daemonseed
+          suite registry. Carried on every cryptographic artifact —
+          at-rest blob header (ISC-C3), recovery file header
+          (ISC-C32), CoT-asset payload (ISC-S4 / ISC-C8), identity-
+          proof signature (ISC-C1 / ISC-C22), and server-wide signed
+          material (ISC-S15). Resolves through
+          `daemonseed_core::crypto::suite::Registry` to a concrete
+          (AEAD, KEM, signature, hash, KDF, memory-hard) bundle.
+        fields:
+          - name: value
+            type: uint32
+            tag: 1
+            note: >-
+              Registry id. Receivers MUST validate
+              `0x0001 <= value <= 0xFFFE`; the reserved sentinels
+              `0x0000` and `0xFFFF` MUST be rejected at parse time.
+              proto3 uses uint32 because uint16 doesn't exist; the
+              app-layer SuiteId::try_new enforces the constraint.
+        iscs: [C24, S15]
+
+      - name: CircleMin
+        defined_in: "proto/daemonseed/v1/suite.proto"
+        added_in: "v0.4.0 (M3)"
+        purpose: >-
+          Per-circle minimum-suite floor (ISC-C24 circle-level
+          minimum-suite policy). **Client-only payload shape** —
+          per ISC-A-S2 the server never sees decrypted CircleMin
+          values; this message is the inner-payload structure that
+          rides inside encrypted CoT-asset ciphertext or
+          member-to-member key-exchange envelopes that the server
+          relays opaquely. Read-only after circle creation in MVP
+          (ratcheting up an existing circle's minimum is post-MVP).
+        fields:
+          - { name: min_suite_id, type: SuiteId, tag: 1, note: "Optional in wire encoding (proto3 message default), but app-layer constructors always supply a value. A deserialized None MUST be rejected at the application boundary." }
+        iscs: [C24, A-C8]
+
+# ─────────────────────────────────────────────────────────────────────
+# Codegen pipeline
+# ─────────────────────────────────────────────────────────────────────
+
+codegen:
+  driver: "build.rs"
+  toolchain:
+    prost: "=0.13.4"
+    prost-types: "=0.13.4"
+    tonic-build: "=0.12.3 (default-features = false, features = ['prost'])"
+  output: "OUT_DIR (regenerated on every cargo build)"
+  committed_snapshot:
+    path: "src/generated/"
+    purpose: "Inspection only — not compiled into the binary. Maintained by `cargo xtask gen-proto`; drift detected by `cargo xtask check-proto`."
+  why_two_outputs: >-
+    `build.rs` keeps the compiled binary in lock-step with the .proto
+    files (no stale generated source possible). The committed snapshot
+    is for human + AI review during PR diff, and for offline
+    inspection without cargo. The snapshot is enforced byte-identical
+    to fresh tonic-build output via the xtask gate.
+
+# ─────────────────────────────────────────────────────────────────────
+# Protocol-level rules atop the schema
+# ─────────────────────────────────────────────────────────────────────
+
+protocol_rules:
+  - name: "Application-protocol negotiation (APP_HELLO)"
+    status: "Lands at M4a"
+    summary: >-
+      After TLS handshake completes on :443 with ALPN `h2`, the
+      first application-layer message exchanged is APP_HELLO. Until
+      APP_HELLO_ACK is received, no other application traffic flows.
+      Type-state pattern (Connection<Negotiating → Versioned>)
+      enforces this at compile time in the reference Rust
+      implementation per ISC-C23.
+    iscs: [S14, A-S9, C23]
+
+  - name: "Identity-proof + channel binding (M4b)"
+    status: "Lands at M4b"
+    summary: >-
+      Identity-proof envelope binds to the TLS channel and includes
+      a per-key monotonic counter for replay protection plus a
+      timestamp with a 120-second skew window. Counter state lives
+      in the seeds blob. Constant-time close-shape for all auth
+      failures.
+    iscs: [S19, A-S1, A-S2, A-S14]
+
+  - name: "Suite-id validation contract"
+    status: active
+    summary: >-
+      Every consumer of `daemonseed.v1::SuiteId.value` MUST route
+      through `daemonseed_core::crypto::suite::SuiteId::try_new`
+      to enforce the sentinel rejection. Bypassing the app-layer
+      constructor is a protocol violation.
+    iscs: [C24, S15]
+
+# ─────────────────────────────────────────────────────────────────────
+# Future packages (not yet defined)
+# ─────────────────────────────────────────────────────────────────────
+
+planned:
+  - "AppHello / AppHelloAck / AppHelloReject (M4a — wire-protocol version negotiation)"
+  - "IdentityProof envelope (M4b — channel-bound auth)"
+  - "FederationIntroducer (M5 — introducer responses, no keys per ISC-A-S6)"
+  - "CoTAssetPayload (M8 — server-opaque circle-of-trust asset relay)"
+  - "Post / Mention / Rating (M6 — public-space messages)"
+  - "SuiteDeprecationPolicy (M7 — operator-signed cutoff dates per ISC-S16)"
+  - "UpdateManifest / CriticalUpdate (M10 — signed release distribution per ISC-C27 / S18)"

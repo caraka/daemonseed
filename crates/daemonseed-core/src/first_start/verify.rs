@@ -23,8 +23,8 @@ pub const TYPE_BACK_MAX_RETRIES: usize = 3;
 
 /// A type-back challenge. Carries the positions in the mnemonic the user
 /// must reproduce and the expected words (kept private — only equality
-/// checks are exposed). Construct via
-/// [`Sealed::issue_type_back_challenge`](crate::first_start::Sealed::issue_type_back_challenge).
+/// checks are exposed). Construct via `Sealed::issue_type_back_challenge`
+/// (see [`crate::first_start::Sealed`]).
 pub struct TypeBackChallenge {
     /// 0-based positions into the 24-word mnemonic.
     positions: Vec<usize>,
@@ -43,7 +43,7 @@ impl core::fmt::Debug for TypeBackChallenge {
 }
 
 impl TypeBackChallenge {
-    /// Build a challenge by sampling [`TYPE_BACK_WORD_COUNT`] unique
+    /// Build a challenge by sampling `TYPE_BACK_WORD_COUNT` (= 3) unique
     /// positions from the supplied 24-word phrase via the caller's RNG.
     /// `phrase` is the space-separated mnemonic (the 24 BIP-39 words).
     ///
