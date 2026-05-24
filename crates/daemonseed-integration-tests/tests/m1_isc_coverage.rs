@@ -143,7 +143,7 @@ fn m1_iscs_exercise_end_to_end() {
     let blob = seeds::seal(&seeds, "passphrase-x", config.profile_id, test_params()).expect("seal");
     let recovered =
         seeds::open(&blob, "passphrase-x", config.profile_id, test_params()).expect("open");
-    assert_eq!(recovered.mnemonic.to_phrase(), orig_phrase);
+    assert_eq!(recovered.seeds.mnemonic.to_phrase(), orig_phrase);
     // Pin the HKDF info string for the at-rest blob — load-bearing contract.
     assert!(info::at_rest(&config.profile_id.to_string()).starts_with("daemonseed/at-rest/"));
     coverage.register("ISC-C3", "m1_iscs::at_rest_blob_round_trip");

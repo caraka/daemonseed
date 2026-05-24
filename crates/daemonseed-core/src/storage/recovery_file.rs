@@ -1,4 +1,5 @@
-//! Encrypted recovery file — `.dseed` (ISC-C32 / ISC-C30 / ISC-A-C17).
+//! Encrypted recovery file — `.dseed` (ISC-C32 / ISC-C30 / ISC-A-C17 /
+//! ISC-C24).
 //!
 //! The recovery file is the air-gap-paper replacement for restoring an
 //! identity on a clean device. Same passphrase as the at-rest blob (ISC-C30),
@@ -7,10 +8,11 @@
 //! `daemonseed/recovery-file/<profile-id>` — so the two artifacts decrypt
 //! under independent keys even though they share an expensive Argon2id pass.
 //!
-//! ## Layout
+//! ## Format v2 (M3+)
 //!
 //! ```text
-//!   [MAGIC          (20 bytes: b"daemonseed/dseed/v1\0")]
+//!   [MAGIC          (20 bytes: b"daemonseed/dseed/v2\0")]
+//!   [SUITE_ID       ( 2 bytes: u16 big-endian, per ds-suite-registry.md)]
 //!   [PROFILE_ID     (16 bytes — uuid v4)]
 //!   [MEMORY_KIB     (4 bytes  — u32 LE)]
 //!   [ITERATIONS     (4 bytes  — u32 LE)]
@@ -20,11 +22,30 @@
 //!   [TAG            (16 bytes — AES-GCM authenticator)]
 //! ```
 //!
-//! Per ISC-C32 the **header is unauthenticated by design**. An attacker
-//! who flips any header byte changes the derived key — wrong salt, wrong
-//! params, or wrong HKDF info all produce a wrong key — and the AEAD
-//! fails to verify. No AAD is needed for header integrity; the KDF chain
-//! IS the integrity check.
+//! ## Format v1 (M2 — read-only since M3)
+//!
+//! ```text
+//!   [MAGIC          (20 bytes: b"daemonseed/dseed/v1\0")]
+//!   [PROFILE_ID     (16 bytes)]
+//!   [MEMORY_KIB     (4 bytes  — u32 LE)]
+//!   [ITERATIONS     (4 bytes  — u32 LE)]
+//!   [PARALLELISM    (4 bytes  — u32 LE)]
+//!   [NONCE          (12 bytes)]
+//!   [CIPHERTEXT     (mnemonic-phrase UTF-8 bytes)]
+//!   [TAG            (16 bytes)]
+//! ```
+//!
+//! v1 files are accepted by [`open`] under the implicit assumption that
+//! `suite_id = 0x0001` (CNSA 2.0) — the only suite that existed at M2.
+//! [`seal`] always writes v2.
+//!
+//! Per ISC-C32 the **header outside the suite_id is unauthenticated by
+//! design**. An attacker who flips any header byte (profile_id, argon2
+//! params) changes the derived key — wrong salt, wrong params, or wrong
+//! HKDF info all produce a wrong key — and the AEAD fails to verify. The
+//! suite_id byte pair *is* covered as AAD in v2 so a tamper-swap of the
+//! suite tag fails authentication directly rather than via the
+//! derived-key-mismatch path.
 //!
 //! Recovery on a clean device per ISC-C36: read header → prompt for
 //! passphrase → derive key (from header's salt + params) → decrypt → on
@@ -37,28 +58,50 @@ use oxicrypt_kdf::HkdfSha256;
 use uuid::Uuid;
 use zeroize::Zeroize;
 
+use crate::crypto::suite::{Registry, SuiteId, SuiteIdError, WriteRefusal};
 use crate::identity::mnemonic::{Mnemonic, MnemonicError};
 use crate::kdf::info;
 use crate::profile::config::ArgonParams;
 
-/// Magic prefix for the v1 `.dseed` format. Bump the `v1` tag on any
-/// incompatible layout change.
-pub const MAGIC: &[u8; 20] = b"daemonseed/dseed/v1\0";
+/// Magic prefix for the **current** (v2) `.dseed` format. M3+ writes this
+/// magic on every [`seal`] call. Bump the `v2` tag on any incompatible
+/// layout change.
+pub const MAGIC: &[u8; 20] = b"daemonseed/dseed/v2\0";
+
+/// Magic prefix for the **legacy** v1 `.dseed` format (M2). [`open`]
+/// accepts files prefixed with this value and treats them as carrying the
+/// implicit `suite_id = 0x0001` (CNSA 2.0). [`seal`] never writes this
+/// magic.
+pub const MAGIC_V1: &[u8; 20] = b"daemonseed/dseed/v1\0";
+
+/// Implicit suite id assumed when reading a v1 `.dseed`. v1 predates the
+/// registry; only CNSA 2.0 existed when v1 files were written.
+const V1_IMPLICIT_SUITE_RAW: u16 = 0x0001;
 
 const PROFILE_ID_LEN: usize = 16;
 const ARGON_PARAM_LEN: usize = 4 + 4 + 4; // memory_kib + iterations + parallelism
-const HEADER_LEN: usize = MAGIC.len() + PROFILE_ID_LEN + ARGON_PARAM_LEN;
+
+/// Width of the suite_id field on the v2 wire layout (big-endian u16).
+pub const SUITE_ID_LEN: usize = 2;
+
+const HEADER_LEN_V2: usize = MAGIC.len() + SUITE_ID_LEN + PROFILE_ID_LEN + ARGON_PARAM_LEN;
+const HEADER_LEN_V1: usize = MAGIC_V1.len() + PROFILE_ID_LEN + ARGON_PARAM_LEN;
 const NONCE_LEN: usize = 12;
 const TAG_LEN: usize = 16;
 const ARGON2_OUTPUT_LEN: usize = 32;
 const AEAD_KEY_LEN: usize = 32;
 
 /// Decrypted recovery-file contents. Caller persists `profile_id` + `argon2`
-/// into a fresh `daemonseed.toml` on recovery.
+/// into a fresh `daemonseed.toml` on recovery. `suite_id` indicates which
+/// registry entry the file was sealed under (ISC-C24); `legacy_v1` is true
+/// when the file was a v1 `.dseed` and the consumer should consider
+/// re-sealing on next save (ISC-C24 read-old-write-new).
 pub struct RecoveryFileContents {
     pub mnemonic: Mnemonic,
     pub profile_id: Uuid,
     pub argon2: ArgonParams,
+    pub suite_id: SuiteId,
+    pub legacy_v1: bool,
 }
 
 impl core::fmt::Debug for RecoveryFileContents {
@@ -67,6 +110,8 @@ impl core::fmt::Debug for RecoveryFileContents {
             .field("mnemonic", &"<redacted>")
             .field("profile_id", &self.profile_id)
             .field("argon2", &self.argon2)
+            .field("suite_id", &self.suite_id)
+            .field("legacy_v1", &self.legacy_v1)
             .finish()
     }
 }
@@ -82,6 +127,15 @@ pub enum RecoveryFileError {
     EntropySource(getrandom::Error),
     Malformed(&'static str),
     AuthenticationFailed,
+    /// v2 file carried a `suite_id` whose raw value is one of the reserved
+    /// sentinels (`0x0000` / `0xFFFF`).
+    SuiteIdSentinel(SuiteIdError),
+    /// v2 file carried a `suite_id` not present in this build's registry.
+    UnknownSuite(SuiteId),
+    /// Active write-suite refused by the registry (e.g. all suites
+    /// deprecated). Returned by [`seal`] when no write-eligible suite
+    /// exists.
+    WriteRefused(WriteRefusal),
     Utf8(core::str::Utf8Error),
     Mnemonic(MnemonicError),
 }
@@ -99,6 +153,11 @@ impl core::fmt::Display for RecoveryFileError {
                 f,
                 ".dseed: authentication failed (wrong passphrase or tampered file)"
             ),
+            RecoveryFileError::SuiteIdSentinel(e) => write!(f, ".dseed suite_id: {e}"),
+            RecoveryFileError::UnknownSuite(id) => {
+                write!(f, ".dseed references unknown suite {id}")
+            }
+            RecoveryFileError::WriteRefused(r) => write!(f, ".dseed write refused: {r}"),
             RecoveryFileError::Utf8(e) => write!(f, ".dseed plaintext is not UTF-8: {e}"),
             RecoveryFileError::Mnemonic(e) => write!(f, "mnemonic in .dseed: {e}"),
         }
@@ -107,15 +166,32 @@ impl core::fmt::Display for RecoveryFileError {
 
 impl std::error::Error for RecoveryFileError {}
 
-/// Encrypt a mnemonic into the canonical v1 `.dseed` layout. The
-/// `profile_id` and `argon2` params land in the cleartext header so a
-/// clean-device recovery can derive the same key from passphrase alone.
+/// Encrypt a mnemonic into the canonical v2 `.dseed` layout under the
+/// active write-suite. The `profile_id` and `argon2` params land in the
+/// cleartext header so a clean-device recovery can derive the same key
+/// from passphrase alone.
 pub fn seal(
     mnemonic: &Mnemonic,
     passphrase: &str,
     profile_id: Uuid,
     argon2: ArgonParams,
 ) -> Result<Vec<u8>, RecoveryFileError> {
+    let suite_id = Registry::default_write_suite();
+    seal_under(mnemonic, passphrase, profile_id, argon2, suite_id)
+}
+
+/// Encrypt a mnemonic into the v2 `.dseed` layout under an explicit
+/// `suite_id`. Used by tests that need to write a non-default suite. The
+/// registry MUST contain `suite_id` and it MUST be write-eligible.
+pub fn seal_under(
+    mnemonic: &Mnemonic,
+    passphrase: &str,
+    profile_id: Uuid,
+    argon2: ArgonParams,
+    suite_id: SuiteId,
+) -> Result<Vec<u8>, RecoveryFileError> {
+    Registry::resolve_for_write(suite_id).map_err(RecoveryFileError::WriteRefused)?;
+
     let mut key = derive_aead_key(passphrase, profile_id, argon2)?;
 
     let mut nonce = [0u8; NONCE_LEN];
@@ -126,13 +202,22 @@ pub fn seal(
 
     let phrase = mnemonic.to_phrase();
     let plaintext = phrase.as_bytes();
+    let suite_bytes = suite_id.get().to_be_bytes();
     let mut ciphertext = vec![0u8; plaintext.len()];
     let mut tag = [0u8; TAG_LEN];
-    gcm_encrypt(&aes, &nonce, b"", plaintext, &mut ciphertext, &mut tag)
-        .map_err(RecoveryFileError::AesMode)?;
+    gcm_encrypt(
+        &aes,
+        &nonce,
+        &suite_bytes,
+        plaintext,
+        &mut ciphertext,
+        &mut tag,
+    )
+    .map_err(RecoveryFileError::AesMode)?;
 
-    let mut out = Vec::with_capacity(HEADER_LEN + NONCE_LEN + ciphertext.len() + TAG_LEN);
+    let mut out = Vec::with_capacity(HEADER_LEN_V2 + NONCE_LEN + ciphertext.len() + TAG_LEN);
     out.extend_from_slice(MAGIC);
+    out.extend_from_slice(&suite_bytes);
     out.extend_from_slice(profile_id.as_bytes());
     out.extend_from_slice(&argon2.memory_kib.to_le_bytes());
     out.extend_from_slice(&argon2.iterations.to_le_bytes());
@@ -143,57 +228,55 @@ pub fn seal(
     Ok(out)
 }
 
-/// Decrypt a v1 `.dseed`. The profile_id and argon2 params are read from
-/// the cleartext header (per ISC-C36 recovery-on-clean-device); the caller
-/// supplies only the file bytes and the passphrase.
+/// Decrypt a v2 (or legacy v1) `.dseed`. The profile_id and argon2 params
+/// are read from the cleartext header (per ISC-C36 recovery-on-clean-
+/// device); the caller supplies only the file bytes and the passphrase.
 pub fn open(bytes: &[u8], passphrase: &str) -> Result<RecoveryFileContents, RecoveryFileError> {
-    if bytes.len() < HEADER_LEN + NONCE_LEN + TAG_LEN {
-        return Err(RecoveryFileError::Malformed(
-            "file shorter than minimum header",
-        ));
+    if bytes.len() < MAGIC.len() {
+        return Err(RecoveryFileError::Malformed("file shorter than magic"));
     }
-    if &bytes[..MAGIC.len()] != MAGIC {
-        return Err(RecoveryFileError::Malformed("magic prefix mismatch"));
+    let magic = &bytes[..MAGIC.len()];
+    if magic == MAGIC {
+        open_v2(bytes, passphrase)
+    } else if magic == MAGIC_V1 {
+        open_v1(bytes, passphrase)
+    } else {
+        Err(RecoveryFileError::Malformed("magic prefix mismatch"))
+    }
+}
+
+fn open_v2(bytes: &[u8], passphrase: &str) -> Result<RecoveryFileContents, RecoveryFileError> {
+    if bytes.len() < HEADER_LEN_V2 + NONCE_LEN + TAG_LEN {
+        return Err(RecoveryFileError::Malformed(
+            "v2 file shorter than minimum header",
+        ));
     }
 
     let mut cursor = MAGIC.len();
 
-    let profile_id_bytes: [u8; PROFILE_ID_LEN] =
-        bytes[cursor..cursor + PROFILE_ID_LEN].try_into().unwrap();
-    let profile_id = Uuid::from_bytes(profile_id_bytes);
-    cursor += PROFILE_ID_LEN;
+    let suite_bytes: [u8; SUITE_ID_LEN] = bytes[cursor..cursor + SUITE_ID_LEN].try_into().unwrap();
+    cursor += SUITE_ID_LEN;
+    let suite_raw = u16::from_be_bytes(suite_bytes);
+    let suite_id = SuiteId::try_new(suite_raw).map_err(RecoveryFileError::SuiteIdSentinel)?;
+    if Registry::lookup(suite_id).is_none() {
+        return Err(RecoveryFileError::UnknownSuite(suite_id));
+    }
 
-    let memory_kib = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
-    cursor += 4;
-    let iterations = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
-    cursor += 4;
-    let parallelism = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
-    cursor += 4;
-    let argon2 = ArgonParams {
-        memory_kib,
-        iterations,
-        parallelism,
-    };
+    let (profile_id, argon2, after_header) = parse_post_suite_header(bytes, cursor)?;
 
-    let nonce: &[u8; NONCE_LEN] = bytes[cursor..cursor + NONCE_LEN].try_into().unwrap();
-    cursor += NONCE_LEN;
-
-    let after_nonce = &bytes[cursor..];
-    let ciphertext_len = after_nonce.len() - TAG_LEN;
-    let ciphertext = &after_nonce[..ciphertext_len];
-    let tag: &[u8; TAG_LEN] = after_nonce[ciphertext_len..].try_into().unwrap();
+    let (nonce, ciphertext, tag) = split_body(after_header)?;
 
     let mut key = derive_aead_key(passphrase, profile_id, argon2)?;
     let aes = Aes256Key::new(&key).map_err(RecoveryFileError::AesKeyInit)?;
     key.zeroize();
 
     let mut plaintext = vec![0u8; ciphertext.len()];
-    gcm_decrypt(&aes, nonce, b"", ciphertext, tag, &mut plaintext).map_err(|e| match e {
-        // Uniform AuthenticationFailed — caller can't distinguish wrong
-        // passphrase from tampered header or tampered ciphertext.
-        oxicrypt_aes::ModeError::TagMismatch => RecoveryFileError::AuthenticationFailed,
-        other => RecoveryFileError::AesMode(other),
-    })?;
+    gcm_decrypt(&aes, nonce, &suite_bytes, ciphertext, tag, &mut plaintext).map_err(
+        |e| match e {
+            oxicrypt_aes::ModeError::TagMismatch => RecoveryFileError::AuthenticationFailed,
+            other => RecoveryFileError::AesMode(other),
+        },
+    )?;
 
     let phrase = core::str::from_utf8(&plaintext).map_err(RecoveryFileError::Utf8)?;
     let mnemonic = Mnemonic::from_phrase(phrase).map_err(RecoveryFileError::Mnemonic);
@@ -204,7 +287,102 @@ pub fn open(bytes: &[u8], passphrase: &str) -> Result<RecoveryFileContents, Reco
         mnemonic,
         profile_id,
         argon2,
+        suite_id,
+        legacy_v1: false,
     })
+}
+
+fn open_v1(bytes: &[u8], passphrase: &str) -> Result<RecoveryFileContents, RecoveryFileError> {
+    if bytes.len() < HEADER_LEN_V1 + NONCE_LEN + TAG_LEN {
+        return Err(RecoveryFileError::Malformed(
+            "v1 file shorter than minimum header",
+        ));
+    }
+
+    let (profile_id, argon2, after_header) = parse_post_suite_header(bytes, MAGIC_V1.len())?;
+
+    let (nonce, ciphertext, tag) = split_body(after_header)?;
+
+    let mut key = derive_aead_key(passphrase, profile_id, argon2)?;
+    let aes = Aes256Key::new(&key).map_err(RecoveryFileError::AesKeyInit)?;
+    key.zeroize();
+
+    let mut plaintext = vec![0u8; ciphertext.len()];
+    // v1 used empty AAD — preserve that contract or M2 .dseed fails to open.
+    gcm_decrypt(&aes, nonce, b"", ciphertext, tag, &mut plaintext).map_err(|e| match e {
+        oxicrypt_aes::ModeError::TagMismatch => RecoveryFileError::AuthenticationFailed,
+        other => RecoveryFileError::AesMode(other),
+    })?;
+
+    let phrase = core::str::from_utf8(&plaintext).map_err(RecoveryFileError::Utf8)?;
+    let mnemonic = Mnemonic::from_phrase(phrase).map_err(RecoveryFileError::Mnemonic);
+    plaintext.zeroize();
+    let mnemonic = mnemonic?;
+
+    let implicit = SuiteId::try_new(V1_IMPLICIT_SUITE_RAW)
+        .expect("V1_IMPLICIT_SUITE_RAW is a valid non-sentinel id");
+    Ok(RecoveryFileContents {
+        mnemonic,
+        profile_id,
+        argon2,
+        suite_id: implicit,
+        legacy_v1: true,
+    })
+}
+
+/// Decode the (profile_id, argon2 params, remaining-bytes) tuple starting
+/// at `cursor`. Shared between v1 and v2 paths because the field layout
+/// after the magic + (v2-only) suite_id is identical.
+fn parse_post_suite_header(
+    bytes: &[u8],
+    mut cursor: usize,
+) -> Result<(Uuid, ArgonParams, &[u8]), RecoveryFileError> {
+    let profile_id_bytes: [u8; PROFILE_ID_LEN] = bytes[cursor..cursor + PROFILE_ID_LEN]
+        .try_into()
+        .map_err(|_| RecoveryFileError::Malformed("profile_id slice"))?;
+    let profile_id = Uuid::from_bytes(profile_id_bytes);
+    cursor += PROFILE_ID_LEN;
+
+    let memory_kib = u32::from_le_bytes(
+        bytes[cursor..cursor + 4]
+            .try_into()
+            .map_err(|_| RecoveryFileError::Malformed("memory_kib slice"))?,
+    );
+    cursor += 4;
+    let iterations = u32::from_le_bytes(
+        bytes[cursor..cursor + 4]
+            .try_into()
+            .map_err(|_| RecoveryFileError::Malformed("iterations slice"))?,
+    );
+    cursor += 4;
+    let parallelism = u32::from_le_bytes(
+        bytes[cursor..cursor + 4]
+            .try_into()
+            .map_err(|_| RecoveryFileError::Malformed("parallelism slice"))?,
+    );
+    cursor += 4;
+    let argon2 = ArgonParams {
+        memory_kib,
+        iterations,
+        parallelism,
+    };
+
+    Ok((profile_id, argon2, &bytes[cursor..]))
+}
+
+/// Tuple of (nonce, ciphertext, tag) borrowed out of the post-header body.
+type BodyParts<'a> = (&'a [u8; NONCE_LEN], &'a [u8], &'a [u8; TAG_LEN]);
+
+fn split_body(after_header: &[u8]) -> Result<BodyParts<'_>, RecoveryFileError> {
+    if after_header.len() < NONCE_LEN + TAG_LEN {
+        return Err(RecoveryFileError::Malformed("body shorter than nonce+tag"));
+    }
+    let nonce: &[u8; NONCE_LEN] = after_header[..NONCE_LEN].try_into().unwrap();
+    let after_nonce = &after_header[NONCE_LEN..];
+    let ciphertext_len = after_nonce.len() - TAG_LEN;
+    let ciphertext = &after_nonce[..ciphertext_len];
+    let tag: &[u8; TAG_LEN] = after_nonce[ciphertext_len..].try_into().unwrap();
+    Ok((nonce, ciphertext, tag))
 }
 
 /// Two-stage Argon2id + HKDF KDF — identical to the at-rest blob's stage
@@ -275,6 +453,8 @@ mod tests {
         assert_eq!(recovered.mnemonic.to_phrase(), orig);
         assert_eq!(recovered.profile_id, pid);
         assert_eq!(recovered.argon2, fast_params());
+        assert_eq!(recovered.suite_id.get(), 0x0001);
+        assert!(!recovered.legacy_v1);
     }
 
     #[test]
@@ -314,9 +494,10 @@ mod tests {
         let pid = Uuid::new_v4();
         let pp = "passphrase x";
         let mut file = seal(&fresh_mnemonic(), pp, pid, fast_params()).unwrap();
-        // Flip a byte inside the profile_id range — derived HKDF info will
-        // be wrong → wrong key → AEAD fails to verify.
-        file[MAGIC.len()] ^= 0x01;
+        // Flip a byte inside the profile_id range (which sits after MAGIC
+        // and the v2 suite_id) — derived HKDF info will be wrong → wrong
+        // key → AEAD fails to verify.
+        file[MAGIC.len() + SUITE_ID_LEN] ^= 0x01;
         match open(&file, pp) {
             Err(RecoveryFileError::AuthenticationFailed) => {}
             other => panic!("expected AuthenticationFailed, got {other:?}"),
@@ -330,7 +511,7 @@ mod tests {
         let pp = "passphrase x";
         let mut file = seal(&fresh_mnemonic(), pp, pid, fast_params()).unwrap();
         // Flip a byte in the memory_kib LE bytes.
-        let mem_kib_offset = MAGIC.len() + PROFILE_ID_LEN;
+        let mem_kib_offset = MAGIC.len() + SUITE_ID_LEN + PROFILE_ID_LEN;
         file[mem_kib_offset] ^= 0x01;
         match open(&file, pp) {
             Err(RecoveryFileError::AuthenticationFailed) => {}
@@ -362,7 +543,7 @@ mod tests {
             fast_params(),
         )
         .unwrap();
-        let too_short = &file[..HEADER_LEN + 1];
+        let too_short = &file[..HEADER_LEN_V2 + 1];
         match open(too_short, "passphrase x") {
             Err(RecoveryFileError::Malformed(_)) => {}
             other => panic!("expected Malformed, got {other:?}"),
@@ -387,8 +568,14 @@ mod tests {
     }
 
     #[test]
-    fn magic_v1_is_pinned() {
-        assert_eq!(MAGIC, b"daemonseed/dseed/v1\0");
+    fn magic_v2_is_pinned() {
+        // Spec contract — bumping this is a format-incompatible change.
+        assert_eq!(MAGIC, b"daemonseed/dseed/v2\0");
+    }
+
+    #[test]
+    fn magic_v1_legacy_is_pinned() {
+        assert_eq!(MAGIC_V1, b"daemonseed/dseed/v1\0");
     }
 
     #[test]
@@ -438,6 +625,86 @@ mod tests {
         match open(&at_rest_blob, pp) {
             Err(RecoveryFileError::Malformed(_)) => {}
             other => panic!("expected Malformed (different magic), got {other:?}"),
+        }
+    }
+
+    /// Hand-build a v1 `.dseed` (M2 wire shape) and confirm `open` recovers
+    /// it under the implicit `suite_id = 0x0001`. Without this test the
+    /// v1→v2 migration claim is just words.
+    #[test]
+    fn open_accepts_legacy_v1_file() {
+        init_oxicrypt();
+        let pid = Uuid::new_v4();
+        let pp = "correct horse battery staple table mountain";
+        let m = fresh_mnemonic();
+        let orig_phrase = m.to_phrase();
+        let params = fast_params();
+
+        // Construct a v1 file by hand using the same KDF chain seal() uses
+        // but with the v1 layout (no suite_id; AAD=b"").
+        let mut key = derive_aead_key(pp, pid, params).unwrap();
+        let mut nonce = [0u8; NONCE_LEN];
+        getrandom::fill(&mut nonce).unwrap();
+        let aes = Aes256Key::new(&key).unwrap();
+        key.zeroize();
+        let pt = orig_phrase.as_bytes();
+        let mut ct = vec![0u8; pt.len()];
+        let mut tag = [0u8; TAG_LEN];
+        gcm_encrypt(&aes, &nonce, b"", pt, &mut ct, &mut tag).unwrap();
+
+        let mut v1_file = Vec::with_capacity(HEADER_LEN_V1 + NONCE_LEN + ct.len() + TAG_LEN);
+        v1_file.extend_from_slice(MAGIC_V1);
+        v1_file.extend_from_slice(pid.as_bytes());
+        v1_file.extend_from_slice(&params.memory_kib.to_le_bytes());
+        v1_file.extend_from_slice(&params.iterations.to_le_bytes());
+        v1_file.extend_from_slice(&params.parallelism.to_le_bytes());
+        v1_file.extend_from_slice(&nonce);
+        v1_file.extend_from_slice(&ct);
+        v1_file.extend_from_slice(&tag);
+
+        let opened = open(&v1_file, pp).unwrap();
+        assert_eq!(opened.mnemonic.to_phrase(), orig_phrase);
+        assert_eq!(opened.profile_id, pid);
+        assert_eq!(opened.argon2, params);
+        assert_eq!(opened.suite_id.get(), 0x0001);
+        assert!(opened.legacy_v1);
+    }
+
+    /// AAD binding: flipping the suite_id byte in a v2 `.dseed` must fail
+    /// authentication, because the suite_id is part of the AAD covered by
+    /// the AEAD tag.
+    #[test]
+    fn v2_suite_id_tamper_fails_auth() {
+        init_oxicrypt();
+        let pid = Uuid::new_v4();
+        let pp = "passphrase x";
+        let mut file = seal(&fresh_mnemonic(), pp, pid, fast_params()).unwrap();
+        // Tamper the low byte of suite_id from 0x01 → 0x02 (still
+        // non-sentinel, but not in the registry).
+        let suite_lo = MAGIC.len() + 1;
+        assert_eq!(file[suite_lo], 0x01);
+        file[suite_lo] = 0x02;
+        match open(&file, pp) {
+            Err(RecoveryFileError::UnknownSuite(id)) => assert_eq!(id.get(), 0x0002),
+            other => panic!("expected UnknownSuite, got {other:?}"),
+        }
+    }
+
+    /// A v2 `.dseed` whose suite_id field encodes a reserved sentinel is
+    /// rejected before any AEAD work.
+    #[test]
+    fn v2_suite_id_sentinel_rejected() {
+        init_oxicrypt();
+        let pid = Uuid::new_v4();
+        let pp = "passphrase x";
+        let mut file = seal(&fresh_mnemonic(), pp, pid, fast_params()).unwrap();
+        let suite_hi = MAGIC.len();
+        let suite_lo = MAGIC.len() + 1;
+        file[suite_hi] = 0xFF;
+        file[suite_lo] = 0xFF;
+        match open(&file, pp) {
+            Err(RecoveryFileError::SuiteIdSentinel(_)) => {}
+            other => panic!("expected SuiteIdSentinel, got {other:?}"),
         }
     }
 }

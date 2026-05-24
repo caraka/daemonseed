@@ -1,14 +1,37 @@
-//! Encrypted at-rest seeds blob (ISC-C3).
+//! Encrypted at-rest seeds blob (ISC-C3, ISC-C24).
 //!
-//! Layout:
+//! ## Format v2 (M3+)
+//!
 //! ```text
-//!   [MAGIC (19 bytes: b"daemonseed/blob/v1\0")]
-//!   [NONCE (12 bytes — CSPRNG-generated)]
+//!   [MAGIC      (19 bytes: b"daemonseed/blob/v2\0")]
+//!   [SUITE_ID   ( 2 bytes: u16 big-endian, per ds-suite-registry.md)]
+//!   [NONCE      (12 bytes: CSPRNG-generated)]
 //!   [CIPHERTEXT (plaintext_len bytes)]
-//!   [TAG (16 bytes — AES-GCM authenticator)]
+//!   [TAG        (16 bytes: AES-GCM authenticator)]
 //! ```
 //!
-//! KDF chain per ISC-C3 (the "daemonseed two-stage passphrase KDF"):
+//! The `suite_id` resolves through [`crate::crypto::suite::Registry`] to the
+//! concrete AEAD / KDF used for this blob. Per ISC-C24 every cryptographic
+//! artifact the client authors carries a `suite_id`; the at-rest blob is the
+//! first such artifact in M3.
+//!
+//! ## Format v1 (M1 / M2 — read-only since M3)
+//!
+//! ```text
+//!   [MAGIC      (19 bytes: b"daemonseed/blob/v1\0")]
+//!   [NONCE      (12 bytes)]
+//!   [CIPHERTEXT (plaintext_len bytes)]
+//!   [TAG        (16 bytes)]
+//! ```
+//!
+//! v1 blobs are accepted by [`open`] under the implicit assumption that
+//! `suite_id = 0x0001` (CNSA 2.0) — the only suite that existed at M1/M2.
+//! [`seal`] always writes v2. [`touch_reseal`] is the on-touch migration
+//! path per ISC-C24: decrypt under the stored suite, re-encrypt as v2
+//! under the active write-suite. Read-old / write-new without a flag-day.
+//!
+//! ## KDF chain (unchanged from M1)
+//!
 //! ```text
 //!   intermediate = Argon2id(
 //!       passphrase = utf8(passphrase),
@@ -21,14 +44,15 @@
 //!       info = "daemonseed/at-rest/<profile-id>",
 //!       length = 32,
 //!   )
-//!   ciphertext, tag = AES-256-GCM-seal(aead_key, nonce, plaintext, aad="")
+//!   ciphertext, tag = AES-256-GCM-seal(aead_key, nonce, plaintext, aad)
 //! ```
 //!
-//! The plaintext at M1 is the BIP-39 phrase UTF-8 bytes; M2+ extends the
-//! [`Seeds`] type with additional fields and the plaintext gains a
-//! length-prefixed structure. The MAGIC's `/v1\0` tag is the migration
-//! anchor — bumping it allows incompatible format changes without
-//! silently corrupting decryption.
+//! ## AAD binding
+//!
+//! v1 blobs use empty AAD (M1 / M2 contract). v2 blobs bind the `suite_id`
+//! bytes into the AAD so a tamper-swap of the suite tag fails AEAD auth —
+//! the receiver cannot be tricked into running a v2 blob under the wrong
+//! suite's primitives without the AEAD detecting it.
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use oxicrypt_aes::{Aes256Key, gcm_decrypt, gcm_encrypt};
@@ -36,13 +60,28 @@ use oxicrypt_kdf::HkdfSha256;
 use uuid::Uuid;
 use zeroize::Zeroize;
 
+use crate::crypto::suite::{Registry, SuiteId, SuiteIdError, WriteRefusal};
 use crate::identity::mnemonic::{Mnemonic, MnemonicError};
 use crate::kdf::info;
 use crate::profile::config::ArgonParams;
 
-/// Magic prefix for the v1 blob format. Bump the `v1` tag on any
-/// incompatible layout change.
-pub const MAGIC: &[u8; 19] = b"daemonseed/blob/v1\0";
+/// Magic prefix for the **current** (v2) blob format. M3+ writes this magic
+/// on every [`seal`] call. Bump the `v2` tag on any incompatible layout
+/// change.
+pub const MAGIC: &[u8; 19] = b"daemonseed/blob/v2\0";
+
+/// Magic prefix for the **legacy** v1 blob format (M1 / M2). [`open`]
+/// accepts blobs prefixed with this value and treats them as carrying the
+/// implicit `suite_id = 0x0001` (CNSA 2.0). [`seal`] never writes this
+/// magic.
+pub const MAGIC_V1: &[u8; 19] = b"daemonseed/blob/v1\0";
+
+/// Implicit suite id assumed when reading a v1 blob. v1 predates the
+/// registry; only CNSA 2.0 existed when v1 blobs were written.
+const V1_IMPLICIT_SUITE_RAW: u16 = 0x0001;
+
+/// Width of the suite_id field on the v2 wire layout (big-endian u16).
+pub const SUITE_ID_LEN: usize = 2;
 
 /// AES-256-GCM nonce length (per NIST SP 800-38D §8.2.1).
 pub const NONCE_LEN: usize = 12;
@@ -83,7 +122,20 @@ impl Seeds {
     }
 }
 
-/// Errors from [`seal`] / [`open`].
+/// Outcome of [`open`] — carries the recovered seeds plus the suite_id the
+/// blob was sealed under. Callers (e.g. the orchestrator) use the
+/// `suite_id` to decide whether [`touch_reseal`] is needed on the next save.
+#[derive(Debug)]
+pub struct Opened {
+    pub seeds: Seeds,
+    pub suite_id: SuiteId,
+    /// `true` iff the blob was the legacy v1 format; consumers should
+    /// schedule a [`touch_reseal`] on the next write to migrate the blob
+    /// to v2 (ISC-C24 read-old-write-new).
+    pub legacy_v1: bool,
+}
+
+/// Errors from [`seal`] / [`open`] / [`touch_reseal`].
 #[derive(Debug)]
 pub enum BlobError {
     /// Argon2 KDF returned an error (bad params, etc.).
@@ -101,6 +153,15 @@ pub enum BlobError {
     /// AEAD authenticator did not verify — wrong passphrase, tampered blob,
     /// or wrong KDF inputs (profile_id / argon2 params).
     AuthenticationFailed,
+    /// v2 blob carried a `suite_id` whose raw value is one of the reserved
+    /// sentinels (`0x0000` / `0xFFFF`).
+    SuiteIdSentinel(SuiteIdError),
+    /// v2 blob carried a `suite_id` not present in this build's registry.
+    UnknownSuite(SuiteId),
+    /// Active write-suite refused by the registry (e.g. all suites
+    /// deprecated). Returned by [`seal`] and [`touch_reseal`] when no
+    /// write-eligible suite exists.
+    WriteRefused(WriteRefusal),
     /// Plaintext was decrypted but isn't a valid mnemonic (different blob
     /// version, corrupt content despite valid AEAD — should be impossible
     /// if MAGIC matches and AEAD passed; surfaced here for safety).
@@ -128,6 +189,11 @@ impl core::fmt::Display for BlobError {
                     "at-rest blob: authentication failed (wrong passphrase or tampered blob)"
                 )
             }
+            BlobError::SuiteIdSentinel(e) => write!(f, "at-rest blob suite_id: {e}"),
+            BlobError::UnknownSuite(id) => {
+                write!(f, "at-rest blob references unknown suite {id}")
+            }
+            BlobError::WriteRefused(r) => write!(f, "at-rest blob write refused: {r}"),
             BlobError::InvalidPlaintext => write!(f, "at-rest blob: plaintext failed schema check"),
             BlobError::Utf8(e) => write!(f, "at-rest blob plaintext is not UTF-8: {e}"),
             BlobError::Mnemonic(e) => write!(f, "mnemonic in at-rest blob: {e}"),
@@ -137,13 +203,33 @@ impl core::fmt::Display for BlobError {
 
 impl std::error::Error for BlobError {}
 
-/// Encrypt a [`Seeds`] payload into the canonical v1 blob layout.
+/// Encrypt a [`Seeds`] payload into the canonical v2 blob layout under the
+/// active write-suite resolved from [`Registry::default_write_suite`].
+///
+/// The suite_id is embedded in the v2 header **and** bound into the AEAD
+/// AAD so a tamper-swap of the suite tag fails authentication.
 pub fn seal(
     seeds: &Seeds,
     passphrase: &str,
     profile_id: Uuid,
     params: ArgonParams,
 ) -> Result<Vec<u8>, BlobError> {
+    let suite_id = Registry::default_write_suite();
+    seal_under(seeds, passphrase, profile_id, params, suite_id)
+}
+
+/// Encrypt a [`Seeds`] payload under an explicit `suite_id`. Used by
+/// [`touch_reseal`] and by tests that need to write a non-default suite.
+/// The registry MUST contain `suite_id` and it MUST be write-eligible.
+pub fn seal_under(
+    seeds: &Seeds,
+    passphrase: &str,
+    profile_id: Uuid,
+    params: ArgonParams,
+    suite_id: SuiteId,
+) -> Result<Vec<u8>, BlobError> {
+    Registry::resolve_for_write(suite_id).map_err(BlobError::WriteRefused)?;
+
     let mut key = derive_aead_key(passphrase, profile_id, params)?;
 
     let mut nonce = [0u8; NONCE_LEN];
@@ -155,35 +241,114 @@ pub fn seal(
     let plaintext_str = seeds.to_plaintext();
     let plaintext = plaintext_str.as_bytes();
 
+    let suite_bytes = suite_id.get().to_be_bytes();
+
     let mut ciphertext = vec![0u8; plaintext.len()];
     let mut tag = [0u8; TAG_LEN];
-    gcm_encrypt(&aes, &nonce, b"", plaintext, &mut ciphertext, &mut tag)
-        .map_err(BlobError::AesMode)?;
+    gcm_encrypt(
+        &aes,
+        &nonce,
+        &suite_bytes,
+        plaintext,
+        &mut ciphertext,
+        &mut tag,
+    )
+    .map_err(BlobError::AesMode)?;
 
-    let mut blob = Vec::with_capacity(MAGIC.len() + NONCE_LEN + ciphertext.len() + TAG_LEN);
+    let mut blob =
+        Vec::with_capacity(MAGIC.len() + SUITE_ID_LEN + NONCE_LEN + ciphertext.len() + TAG_LEN);
     blob.extend_from_slice(MAGIC);
+    blob.extend_from_slice(&suite_bytes);
     blob.extend_from_slice(&nonce);
     blob.extend_from_slice(&ciphertext);
     blob.extend_from_slice(&tag);
     Ok(blob)
 }
 
-/// Decrypt a v1 blob. Fails closed on wrong passphrase / tampered blob /
-/// schema mismatch — no information leaks about which check failed.
+/// Decrypt a v2 (or legacy v1) blob. Fails closed on wrong passphrase /
+/// tampered blob / schema mismatch / unknown suite — no information leaks
+/// about which check failed beyond the variant boundary.
+///
+/// Returns an [`Opened`] carrying both the recovered [`Seeds`] and the
+/// `suite_id` the blob was sealed under, plus a `legacy_v1` flag so the
+/// caller can schedule a [`touch_reseal`] on the next write.
 pub fn open(
     blob: &[u8],
     passphrase: &str,
     profile_id: Uuid,
     params: ArgonParams,
-) -> Result<Seeds, BlobError> {
-    if blob.len() < MAGIC.len() + NONCE_LEN + TAG_LEN {
-        return Err(BlobError::Malformed("blob shorter than minimum header+tag"));
+) -> Result<Opened, BlobError> {
+    if blob.len() < MAGIC.len() {
+        return Err(BlobError::Malformed("blob shorter than magic prefix"));
     }
-    if &blob[..MAGIC.len()] != MAGIC {
-        return Err(BlobError::Malformed("magic prefix mismatch"));
+    let magic = &blob[..MAGIC.len()];
+    if magic == MAGIC {
+        open_v2(&blob[MAGIC.len()..], passphrase, profile_id, params)
+    } else if magic == MAGIC_V1 {
+        open_v1(&blob[MAGIC_V1.len()..], passphrase, profile_id, params)
+    } else {
+        Err(BlobError::Malformed("magic prefix mismatch"))
+    }
+}
+
+fn open_v2(
+    rest: &[u8],
+    passphrase: &str,
+    profile_id: Uuid,
+    params: ArgonParams,
+) -> Result<Opened, BlobError> {
+    if rest.len() < SUITE_ID_LEN + NONCE_LEN + TAG_LEN {
+        return Err(BlobError::Malformed(
+            "v2 blob shorter than minimum header+tag",
+        ));
+    }
+    let suite_bytes: [u8; SUITE_ID_LEN] = rest[..SUITE_ID_LEN].try_into().unwrap();
+    let suite_raw = u16::from_be_bytes(suite_bytes);
+    let suite_id = SuiteId::try_new(suite_raw).map_err(BlobError::SuiteIdSentinel)?;
+    if Registry::lookup(suite_id).is_none() {
+        return Err(BlobError::UnknownSuite(suite_id));
     }
 
-    let rest = &blob[MAGIC.len()..];
+    let after_suite = &rest[SUITE_ID_LEN..];
+    let nonce: &[u8; NONCE_LEN] = after_suite[..NONCE_LEN].try_into().unwrap();
+    let after_nonce = &after_suite[NONCE_LEN..];
+    let ciphertext_len = after_nonce.len() - TAG_LEN;
+    let ciphertext = &after_nonce[..ciphertext_len];
+    let tag: &[u8; TAG_LEN] = after_nonce[ciphertext_len..].try_into().unwrap();
+
+    let mut key = derive_aead_key(passphrase, profile_id, params)?;
+    let aes = Aes256Key::new(&key).map_err(BlobError::AesKeyInit)?;
+    key.zeroize();
+
+    let mut plaintext = vec![0u8; ciphertext.len()];
+    gcm_decrypt(&aes, nonce, &suite_bytes, ciphertext, tag, &mut plaintext).map_err(
+        |e| match e {
+            oxicrypt_aes::ModeError::TagMismatch => BlobError::AuthenticationFailed,
+            other => BlobError::AesMode(other),
+        },
+    )?;
+
+    let plaintext_str = core::str::from_utf8(&plaintext).map_err(BlobError::Utf8)?;
+    let seeds = Seeds::from_plaintext(plaintext_str)?;
+    plaintext.zeroize();
+    Ok(Opened {
+        seeds,
+        suite_id,
+        legacy_v1: false,
+    })
+}
+
+fn open_v1(
+    rest: &[u8],
+    passphrase: &str,
+    profile_id: Uuid,
+    params: ArgonParams,
+) -> Result<Opened, BlobError> {
+    if rest.len() < NONCE_LEN + TAG_LEN {
+        return Err(BlobError::Malformed(
+            "v1 blob shorter than minimum header+tag",
+        ));
+    }
     let nonce: &[u8; NONCE_LEN] = rest[..NONCE_LEN].try_into().unwrap();
     let after_nonce = &rest[NONCE_LEN..];
     let ciphertext_len = after_nonce.len() - TAG_LEN;
@@ -195,17 +360,43 @@ pub fn open(
     key.zeroize();
 
     let mut plaintext = vec![0u8; ciphertext.len()];
+    // v1 used empty AAD — preserve that contract or M2 blobs fail to open.
     gcm_decrypt(&aes, nonce, b"", ciphertext, tag, &mut plaintext).map_err(|e| match e {
-        // Treat authentication failures as a single uniform error so the
-        // caller can't distinguish "wrong passphrase" from "tampered blob".
         oxicrypt_aes::ModeError::TagMismatch => BlobError::AuthenticationFailed,
         other => BlobError::AesMode(other),
     })?;
 
     let plaintext_str = core::str::from_utf8(&plaintext).map_err(BlobError::Utf8)?;
-    let result = Seeds::from_plaintext(plaintext_str);
+    let seeds = Seeds::from_plaintext(plaintext_str)?;
     plaintext.zeroize();
-    result
+    // V1 predates the registry; the only suite that existed is 0x0001.
+    let implicit = SuiteId::try_new(V1_IMPLICIT_SUITE_RAW)
+        .expect("V1_IMPLICIT_SUITE_RAW is a valid non-sentinel id");
+    Ok(Opened {
+        seeds,
+        suite_id: implicit,
+        legacy_v1: true,
+    })
+}
+
+/// Decrypt under the stored suite, re-encrypt as v2 under the active
+/// write-suite. ISC-C24 "read-old, write-new on touch" — every save migrates
+/// the blob to the current write-suite without flag-day coordination.
+///
+/// If the blob is already at the active write-suite, the function still
+/// returns a re-sealed v2 blob (new nonce, same payload); callers may
+/// short-circuit if `Opened::legacy_v1 == false` and `Opened::suite_id ==
+/// Registry::default_write_suite()`. The function intentionally does no
+/// short-circuit itself so the caller decides the policy.
+pub fn touch_reseal(
+    blob: &[u8],
+    passphrase: &str,
+    profile_id: Uuid,
+    params: ArgonParams,
+) -> Result<Vec<u8>, BlobError> {
+    let opened = open(blob, passphrase, profile_id, params)?;
+    let write_suite = Registry::default_write_suite();
+    seal_under(&opened.seeds, passphrase, profile_id, params, write_suite)
 }
 
 /// Run the two-stage Argon2id + HKDF KDF and produce the 32-byte AEAD key.
@@ -278,7 +469,9 @@ mod tests {
 
         let blob = seal(&seeds, pp, pid, test_params()).unwrap();
         let recovered = open(&blob, pp, pid, test_params()).unwrap();
-        assert_eq!(recovered.mnemonic.to_phrase(), original_phrase);
+        assert_eq!(recovered.seeds.mnemonic.to_phrase(), original_phrase);
+        assert_eq!(recovered.suite_id.get(), 0x0001);
+        assert!(!recovered.legacy_v1);
     }
 
     #[test]
@@ -338,7 +531,7 @@ mod tests {
         ensure_oxicrypt_initialized();
         let pid = Uuid::new_v4();
         let blob = seal(&fresh_seeds(), "passphrase x", pid, test_params()).unwrap();
-        let truncated = &blob[..MAGIC.len() + NONCE_LEN + 1];
+        let truncated = &blob[..MAGIC.len() + SUITE_ID_LEN + NONCE_LEN + 1];
         match open(truncated, "passphrase x", pid, test_params()) {
             Err(BlobError::Malformed(_)) | Err(BlobError::AuthenticationFailed) => {}
             other => panic!("expected Malformed or AuthenticationFailed, got {other:?}"),
@@ -374,9 +567,16 @@ mod tests {
     }
 
     #[test]
-    fn blob_magic_v1_is_pinned() {
+    fn blob_magic_v2_is_pinned() {
         // Spec contract — bumping this is a format-incompatible change.
-        assert_eq!(MAGIC, b"daemonseed/blob/v1\0");
+        assert_eq!(MAGIC, b"daemonseed/blob/v2\0");
+    }
+
+    #[test]
+    fn blob_magic_v1_legacy_is_pinned() {
+        // The v1 magic is the read-fallback anchor and must stay byte-stable
+        // for as long as we ship code that accepts M1/M2 enrollments.
+        assert_eq!(MAGIC_V1, b"daemonseed/blob/v1\0");
     }
 
     #[test]
@@ -396,5 +596,119 @@ mod tests {
         let b = seal(&seeds, pp, pid, test_params()).unwrap();
         // Distinct nonces → distinct ciphertexts despite identical inputs.
         assert_ne!(a, b);
+    }
+
+    /// Hand-build a v1 blob (M2 wire shape) and confirm `open` recovers
+    /// it under the implicit `suite_id = 0x0001`. Without this test the
+    /// v1→v2 migration claim is just words.
+    #[test]
+    fn open_accepts_legacy_v1_blob() {
+        ensure_oxicrypt_initialized();
+        let pid = Uuid::new_v4();
+        let pp = "correct horse battery staple table mountain";
+        let seeds = fresh_seeds();
+        let phrase = seeds.mnemonic.to_phrase();
+
+        // Construct a v1 blob by hand using the same KDF chain seal() uses
+        // but with the v1 layout: magic | nonce | ct | tag, AAD=b"".
+        let mut key = derive_aead_key(pp, pid, test_params()).unwrap();
+        let mut nonce = [0u8; NONCE_LEN];
+        getrandom::fill(&mut nonce).unwrap();
+        let aes = Aes256Key::new(&key).unwrap();
+        key.zeroize();
+        let pt = phrase.as_bytes();
+        let mut ct = vec![0u8; pt.len()];
+        let mut tag = [0u8; TAG_LEN];
+        gcm_encrypt(&aes, &nonce, b"", pt, &mut ct, &mut tag).unwrap();
+        let mut v1_blob = Vec::with_capacity(MAGIC_V1.len() + NONCE_LEN + ct.len() + TAG_LEN);
+        v1_blob.extend_from_slice(MAGIC_V1);
+        v1_blob.extend_from_slice(&nonce);
+        v1_blob.extend_from_slice(&ct);
+        v1_blob.extend_from_slice(&tag);
+
+        let opened = open(&v1_blob, pp, pid, test_params()).unwrap();
+        assert_eq!(opened.seeds.mnemonic.to_phrase(), phrase);
+        assert_eq!(opened.suite_id.get(), 0x0001);
+        assert!(opened.legacy_v1);
+    }
+
+    /// touch_reseal migrates a v1 blob to v2 preserving payload — the
+    /// ISC-C24 read-old / write-new property end-to-end.
+    #[test]
+    fn touch_reseal_migrates_v1_to_v2() {
+        ensure_oxicrypt_initialized();
+        let pid = Uuid::new_v4();
+        let pp = "correct horse battery staple table mountain";
+        let seeds = fresh_seeds();
+        let phrase = seeds.mnemonic.to_phrase();
+
+        // Forge a v1 blob the same way as the prior test.
+        let mut key = derive_aead_key(pp, pid, test_params()).unwrap();
+        let mut nonce = [0u8; NONCE_LEN];
+        getrandom::fill(&mut nonce).unwrap();
+        let aes = Aes256Key::new(&key).unwrap();
+        key.zeroize();
+        let pt = phrase.as_bytes();
+        let mut ct = vec![0u8; pt.len()];
+        let mut tag = [0u8; TAG_LEN];
+        gcm_encrypt(&aes, &nonce, b"", pt, &mut ct, &mut tag).unwrap();
+        let mut v1_blob = Vec::with_capacity(MAGIC_V1.len() + NONCE_LEN + ct.len() + TAG_LEN);
+        v1_blob.extend_from_slice(MAGIC_V1);
+        v1_blob.extend_from_slice(&nonce);
+        v1_blob.extend_from_slice(&ct);
+        v1_blob.extend_from_slice(&tag);
+
+        // Migrate.
+        let v2_blob = touch_reseal(&v1_blob, pp, pid, test_params()).unwrap();
+        assert_eq!(&v2_blob[..MAGIC.len()], MAGIC);
+        assert_eq!(
+            &v2_blob[MAGIC.len()..MAGIC.len() + SUITE_ID_LEN],
+            &0x0001u16.to_be_bytes()
+        );
+
+        // Round-trip the migrated blob.
+        let recovered = open(&v2_blob, pp, pid, test_params()).unwrap();
+        assert_eq!(recovered.seeds.mnemonic.to_phrase(), phrase);
+        assert_eq!(recovered.suite_id.get(), 0x0001);
+        assert!(!recovered.legacy_v1);
+    }
+
+    /// AAD binding: flipping the suite_id byte in a v2 blob must fail
+    /// authentication, because the suite_id is part of the AAD covered by
+    /// the AEAD tag.
+    #[test]
+    fn v2_suite_id_tamper_fails_auth() {
+        ensure_oxicrypt_initialized();
+        let pid = Uuid::new_v4();
+        let pp = "passphrase x";
+        let mut blob = seal(&fresh_seeds(), pp, pid, test_params()).unwrap();
+        // Tamper a suite_id byte while keeping the value within the
+        // non-sentinel range — flip the low byte from 0x01 → 0x02.
+        let suite_lo = MAGIC.len() + 1;
+        assert_eq!(blob[suite_lo], 0x01);
+        blob[suite_lo] = 0x02;
+        match open(&blob, pp, pid, test_params()) {
+            Err(BlobError::UnknownSuite(id)) => assert_eq!(id.get(), 0x0002),
+            other => panic!("expected UnknownSuite, got {other:?}"),
+        }
+    }
+
+    /// A v2 blob whose suite_id field encodes a reserved sentinel
+    /// (`0x0000` / `0xFFFF`) is rejected as malformed before any AEAD work.
+    #[test]
+    fn v2_suite_id_sentinel_rejected() {
+        ensure_oxicrypt_initialized();
+        let pid = Uuid::new_v4();
+        let pp = "passphrase x";
+        let mut blob = seal(&fresh_seeds(), pp, pid, test_params()).unwrap();
+        let suite_hi = MAGIC.len();
+        let suite_lo = MAGIC.len() + 1;
+        // Force the suite bytes to 0x0000 (invalid sentinel).
+        blob[suite_hi] = 0x00;
+        blob[suite_lo] = 0x00;
+        match open(&blob, pp, pid, test_params()) {
+            Err(BlobError::SuiteIdSentinel(_)) => {}
+            other => panic!("expected SuiteIdSentinel, got {other:?}"),
+        }
     }
 }

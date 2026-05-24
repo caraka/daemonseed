@@ -568,7 +568,7 @@ mod tests {
         let argon = verified.inner.profile_config.argon2;
         let blob = verified.at_rest_blob_bytes().to_vec();
         let opened = seeds::open(&blob, STRONG_PASSPHRASE, pid, argon).unwrap();
-        assert_eq!(opened.mnemonic.to_phrase(), phrase);
+        assert_eq!(opened.seeds.mnemonic.to_phrase(), phrase);
     }
 
     #[test]
