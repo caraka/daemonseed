@@ -89,10 +89,12 @@ const TOTAL_ISCS: u32 = 93;
 /// - M1: 0 → 17 via `m1_isc_coverage`
 /// - M2: 17 → 29 via `m2_isc_coverage` (12 new — C29-C34, C37, A-C2,
 ///   A-C13, A-C14, A-C15, A-C19)
+/// - M3: 29 → 34 via `m3_isc_coverage` (5 new — C24, S15, A-C8, A-S10,
+///   A-C9)
 ///
 /// Replacing this constant with a live query against the registered
 /// registry remains a later-milestone task (M11 ties this to the CI gate).
-const COVERED_ISCS: u32 = 29;
+const COVERED_ISCS: u32 = 34;
 
 /// Reports the static lower-bound coverage. The live registry-driven count
 /// (which walks the per-milestone integration tests and tallies actual
@@ -105,7 +107,7 @@ fn isc_coverage(min: Option<u8>) -> Result<()> {
     } else {
         (covered as f64) * 100.0 / (TOTAL_ISCS as f64)
     };
-    println!("ISC coverage: {covered}/{TOTAL_ISCS} = {pct:.1}% (static M2 floor)");
+    println!("ISC coverage: {covered}/{TOTAL_ISCS} = {pct:.1}% (static M3 floor)");
     if let Some(m) = min
         && (pct as u32) < (m as u32)
     {
