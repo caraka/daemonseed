@@ -9,3 +9,49 @@ license = "AGPL-3.0-or-later"
 description = "daemonseed relay daemon"
 
 [dependencies]
+# Daemonseed siblings.
+daemonseed-core = { path = "../daemonseed-core" }
+
+# oxicrypt primitives + module gate (KATS for production module init).
+oxicrypt-module = { workspace = true }
+oxicrypt-sha = { workspace = true }
+oxicrypt-kdf = { workspace = true }
+oxicrypt-aes = { workspace = true }
+oxicrypt-ml-dsa = { workspace = true }
+oxicrypt-ml-kem = { workspace = true }
+
+# oxicrypt primitives the v0.1.1 TLS provider exercises but daemonseed-server
+# doesn't call directly — declared so we can assemble the complete KATS slice
+# for `oxicrypt_module::initialize_with_profile` in commit-4's main().
+oxicrypt-hmac = { workspace = true }
+oxicrypt-drbg = { workspace = true }
+oxicrypt-ecdh = { workspace = true }
+
+# TLS stack — oxitls v0.1.1. rustls is pinned at workspace level.
+oxitls-rustls-provider = { workspace = true }
+oxitls-webpki-mldsa = { workspace = true, features = ["cert-builder"] }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+
+# Config + CLI surface.
+clap = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+
+# OS entropy for first-boot seed generation. The seed itself is module-gate-
+# independent (it's just 32 bytes of high-quality entropy); subsequent uses
+# of that seed through oxicrypt go through the module gate.
+getrandom = { workspace = true }
+
+# Zeroize for the seed in memory (drop-on-out-of-scope; matches the in-tree
+# at-rest blob pattern from M1/M3 storage).
+zeroize = { workspace = true }
+
+# Hex for ServerId hash prefix (mirrors daemonseed-core::handle).
+hex = { workspace = true }
+
+[dev-dependencies]
+# Test-only: oxitls's module-init shim. Per-module unit tests + commit-6
+# integration tests use this rather than the heavyweight production-KATS init.
+oxitls-rustls-provider = { workspace = true, features = ["testing"] }
+tempfile = { workspace = true }

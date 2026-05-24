@@ -51,6 +51,20 @@ oxicrypt-aes = { path = "../oxicrypt/crates/oxicrypt-aes" }
 oxicrypt-kdf = { path = "../oxicrypt/crates/oxicrypt-kdf" }
 oxicrypt-sha = { path = "../oxicrypt/crates/oxicrypt-sha" }
 oxicrypt-zeroize = { path = "../oxicrypt/crates/oxicrypt-zeroize" }
+# Additional oxicrypt primitives reached by daemonseed-server in M4a for
+# assembling the production KATS slice that drives
+# `oxicrypt_module::initialize_with_profile`.
+oxicrypt-hmac = { path = "../oxicrypt/crates/oxicrypt-hmac" }
+oxicrypt-drbg = { path = "../oxicrypt/crates/oxicrypt-drbg" }
+oxicrypt-ecdh = { path = "../oxicrypt/crates/oxicrypt-ecdh" }
+# oxitls TLS-stack glue. Consumed by daemonseed-server in M4a commit 3+.
+oxitls-rustls-provider = { path = "../oxitls/crates/oxitls-rustls-provider" }
+oxitls-webpki-mldsa = { path = "../oxitls/crates/oxitls-webpki-mldsa" }
+# rustls — exact-pinned to match oxitls's lock at `=0.23.37`.
+rustls = { version = "=0.23.37", default-features = false, features = ["std", "logging"] }
+rustls-pki-types = { version = "1.14", default-features = false, features = ["std"] }
+# Filesystem fixtures for test scaffolding.
+tempfile = "3"
 
 # ── External crypto + identity deps not covered by oxicrypt ──────────────────
 # Argon2id is RFC 9106 (not NIST), so oxicrypt's NIST-only KDF crate doesn't
