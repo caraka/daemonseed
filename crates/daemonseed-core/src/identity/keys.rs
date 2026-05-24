@@ -93,6 +93,58 @@ impl SignKeypair {
     pub fn secret_key(&self) -> &[u8; ml_dsa::SK_LEN] {
         &self.secret_key
     }
+
+    /// Produce a detached ML-DSA-87 signature over `message`.
+    ///
+    /// Uses an empty FIPS-204 context string: daemonseed performs its own
+    /// domain separation inside the signed bytes (the identity-proof envelope
+    /// prepends the TLS channel-binding value, which already carries the
+    /// `"daemonseed/identity-proof/v1"` exporter label — see
+    /// [`crate::connection`]). Requires the oxicrypt module to be operational.
+    pub fn sign(&self, message: &[u8]) -> Result<[u8; ml_dsa::SIG_LEN], SignatureError> {
+        ml_dsa::sign(&self.secret_key, message, &[]).map_err(SignatureError::Module)
+    }
+}
+
+/// Failure verifying a detached ML-DSA-87 signature.
+#[derive(Debug)]
+pub enum SignatureError {
+    /// The oxicrypt module was not operational, or its active profile
+    /// disallows the ML-DSA sign/verify service.
+    Module(oxicrypt_module::Error),
+    /// The signature did not verify under the supplied public key. This is the
+    /// uniform failure for a tampered message, a wrong key, or a forged
+    /// signature — verifiers MUST NOT distinguish the sub-cause (ISC-A-S12 /
+    /// ISC-A-C18 uniform close-shape).
+    BadSignature,
+}
+
+impl core::fmt::Display for SignatureError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            SignatureError::Module(e) => write!(f, "oxicrypt module unavailable: {e:?}"),
+            SignatureError::BadSignature => write!(f, "signature verification failed"),
+        }
+    }
+}
+
+impl std::error::Error for SignatureError {}
+
+/// Verify a detached ML-DSA-87 `signature` over `message` under `public_key`.
+///
+/// Returns `Ok(())` only on a valid signature. A bad signature, a wrong key,
+/// and a tampered message all collapse to `Err(SignatureError::BadSignature)`
+/// — the caller cannot tell which, by design (ISC-A-S12 / ISC-A-C18). Uses an
+/// empty FIPS-204 context to match [`SignKeypair::sign`].
+pub fn verify_signature(
+    public_key: &[u8; ml_dsa::PK_LEN],
+    message: &[u8],
+    signature: &[u8; ml_dsa::SIG_LEN],
+) -> Result<(), SignatureError> {
+    match ml_dsa::verify(public_key, message, &[], signature) {
+        Ok(()) => Ok(()),
+        Err(_) => Err(SignatureError::BadSignature),
+    }
 }
 
 impl core::fmt::Debug for SignKeypair {
@@ -320,6 +372,36 @@ mod tests {
         let keys = derive_identity_keys(&m, Identity::Primary).unwrap();
         assert_eq!(keys.kem.encapsulation_key().len(), ml_kem::EK_LEN);
         assert_eq!(keys.kem.decapsulation_key().len(), ml_kem::DK_LEN);
+    }
+
+    #[test]
+    fn sign_then_verify_round_trips() {
+        ensure_oxicrypt_initialized();
+        let m = Mnemonic::from_phrase(ALL_ZEROS_PHRASE).unwrap();
+        let keys = derive_identity_keys(&m, Identity::Primary).unwrap();
+        let msg = b"daemonseed identity-proof envelope bytes";
+        let sig = keys.signing.sign(msg).unwrap();
+        verify_signature(keys.signing.public_key(), msg, &sig).unwrap();
+    }
+
+    #[test]
+    fn verify_rejects_tampered_message() {
+        ensure_oxicrypt_initialized();
+        let m = Mnemonic::from_phrase(ALL_ZEROS_PHRASE).unwrap();
+        let keys = derive_identity_keys(&m, Identity::Primary).unwrap();
+        let sig = keys.signing.sign(b"original message").unwrap();
+        assert!(verify_signature(keys.signing.public_key(), b"tampered message", &sig).is_err());
+    }
+
+    #[test]
+    fn verify_rejects_wrong_public_key() {
+        ensure_oxicrypt_initialized();
+        let m = Mnemonic::from_phrase(ALL_ZEROS_PHRASE).unwrap();
+        let a = derive_identity_keys(&m, Identity::Primary).unwrap();
+        let b = derive_identity_keys(&m, Identity::Device { uuid: Uuid::nil() }).unwrap();
+        let msg = b"signed by a, verified against b";
+        let sig = a.signing.sign(msg).unwrap();
+        assert!(verify_signature(b.signing.public_key(), msg, &sig).is_err());
     }
 
     #[test]
