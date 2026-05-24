@@ -492,6 +492,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "daemonseed-core",
+ "daemonseed-proto",
  "getrandom 0.3.4",
  "hex",
  "oxicrypt-aes",
@@ -505,10 +506,13 @@ dependencies = [
  "oxicrypt-sha",
  "oxitls-rustls-provider",
  "oxitls-webpki-mldsa",
+ "prost",
  "rustls",
  "rustls-pki-types",
  "serde",
  "tempfile",
+ "tokio",
+ "tokio-rustls",
  "toml",
  "zeroize",
 ]
@@ -2052,6 +2056,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2 0.6.3",
  "tokio-macros",
  "windows-sys 0.61.2",
@@ -2066,6 +2071,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "tokio-rustls"
+version = "0.26.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61"
+dependencies = [
+ "rustls",
+ "tokio",
 ]
 
 [[package]]

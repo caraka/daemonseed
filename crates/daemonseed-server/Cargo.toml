@@ -33,6 +33,17 @@ oxitls-webpki-mldsa = { workspace = true, features = ["cert-builder"] }
 rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
 
+# Wire schema — APP_HELLO/Ack/Reject prost types live in daemonseed-proto;
+# prost provides the encode/decode trait the framing layer calls.
+daemonseed-proto = { path = "../daemonseed-proto" }
+prost = { workspace = true }
+
+# Runtime — `signal` / `time` / `rt-multi-thread` / `sync` augment the
+# workspace base (`rt`, `macros`, `io-util`, `net`). Cargo unions feature sets
+# across the workspace + per-crate declarations.
+tokio = { workspace = true, features = ["signal", "rt-multi-thread", "time", "sync"] }
+tokio-rustls = { workspace = true }
+
 # Config + CLI surface.
 clap = { workspace = true }
 serde = { workspace = true }
