@@ -321,6 +321,58 @@ modules:
     key_functions:
       - { sig: "WritePolicy::permits(self, state: LifecycleState) -> bool", note: "const fn. Drives the WriteRefusal dispatch." }
 
+  - path: daemonseed_core::version
+    purpose: >-
+      Wire-protocol version negotiation policy (Invariant 2 in the
+      implementation plan). The wire shape lives in
+      daemonseed_proto::v1::ProtocolVersion (proto3 uint32); this
+      module's in-memory ProtocolVersion is `u16` because real-world
+      protocol-version counts never exceed 65535. Conversions go
+      through ProtocolVersion::try_from_wire (narrowing, fallible)
+      and ProtocolVersion::to_wire (widening, infallible).
+    iscs: [S14, A-S9, C23]
+    added_in: "v0.5.0 (M4a)"
+    submodules: []
+    public:
+      - { kind: struct, name: ProtocolVersion, fields: "{major: u16, minor: u16}", note: "PATCH deliberately absent per ISC-S14." }
+      - { kind: const, name: SUPPORTED, type: "&[ProtocolVersion]", note: "MVP ships exactly [ProtocolVersion::new(1, 0)]. Future MINOR bumps append additively." }
+      - { kind: enum, name: NegotiationError, variants: "{NoCommonVersion { peer_supported }, OutOfSetAck { claimed }, ZeroRttForbidden, MalformedPeerOffer(VersionError)}" }
+      - { kind: enum, name: VersionError, variants: "{OutOfRange { field, value }}", note: "Surfaces inside MalformedPeerOffer when wire u32 exceeds u16::MAX." }
+      - { kind: trait, name: VersionNegotiator, note: "Sealed at the daemonseed level — implementations live here. `select` and `verify_ack` have default impls." }
+      - { kind: struct, name: DefaultNegotiator, note: "Unit struct; offers exactly SUPPORTED. Used by both client and server in MVP." }
+    key_functions:
+      - { sig: "ProtocolVersion::new(major: u16, minor: u16) -> Self", note: "const fn." }
+      - { sig: "ProtocolVersion::try_from_wire(w: &wire::ProtocolVersion) -> Result<Self, VersionError>" }
+      - { sig: "ProtocolVersion::to_wire(self) -> wire::ProtocolVersion", note: "const fn; widening can't fail." }
+      - { sig: "VersionNegotiator::select(&self, peer_offer: &[ProtocolVersion]) -> Result<ProtocolVersion, NegotiationError>", note: "Highest mutual wins; preference follows self.offer() order." }
+      - { sig: "VersionNegotiator::verify_ack(&self, ack: ProtocolVersion) -> Result<(), NegotiationError>", note: "ISC-C23 client-side enforcement: ACK out-of-set is a hard close." }
+
+  - path: daemonseed_core::connection
+    purpose: >-
+      Type-state Connection<S, T> machine (Invariant 3). ISC-C23
+      mandates compile-time prevention of pre-APP_HELLO application
+      traffic; this module's marker types + consuming transitions
+      enforce that without runtime checks. Concrete TLS streams plug
+      in via the Transport trait's blanket impl over
+      `AsyncRead + AsyncWrite + Send + Unpin + 'static`.
+      M4a ships Negotiating → Versioned. M4b adds Versioned →
+      Authenticated plus the I/O exposure on Authenticated.
+    iscs: [C23, S14, S19]
+    added_in: "v0.5.0 (M4a)"
+    submodules:
+      - daemonseed_core::connection::state
+    public:
+      - { kind: struct, name: "Connection<S: ConnState, T: Transport>", fields: "{transport: T, _state: PhantomData<fn() -> S>}", note: "All state transitions consume `self`; prior-state values drop at the type level." }
+      - { kind: trait, name: Transport, note: "Marker trait. Blanket impl for any T: AsyncRead + AsyncWrite + Send + Unpin + 'static. No daemonseed-side glue needed for concrete TLS streams." }
+      - { kind: trait, name: "state::ConnState (sealed)", note: "Sealed via private::Sealed — third parties cannot introduce new states." }
+      - { kind: enum, name: "state::Negotiating (never)", note: "Marker. Pre-APP_HELLO state; no I/O exposed." }
+      - { kind: enum, name: "state::Versioned (never)", note: "Marker. Post-APP_HELLO_ACK state; exposes transport_mut() for M4b's identity-proof envelope I/O." }
+      - { kind: enum, name: "state::Authenticated (never)", note: "Marker. M4b adds the AsyncRead/AsyncWrite surface here." }
+    key_functions:
+      - { sig: "Connection::<Negotiating, T>::from_handshaked_transport(transport: T) -> Self", note: "Wraps a freshly-TLS-handshaked transport. Constructor does not drive the TLS handshake itself." }
+      - { sig: "Connection::<Negotiating, T>::advance_to_versioned(self) -> Connection<Versioned, T>", note: "Consuming transition. Caller drives APP_HELLO frame I/O against the transport via daemonseed_server::hello helpers before calling this." }
+      - { sig: "Connection::<Versioned, T>::transport_mut(&mut self) -> &mut T", note: "M4b uses this to drive identity-proof envelope I/O. Deliberately NOT an AsyncRead/AsyncWrite impl on the Connection wrapper." }
+
   - path: daemonseed_core::circle
     purpose: >-
       Circle-of-trust types. **Client-only scope** — per ISC-A-S2 the
@@ -384,11 +436,12 @@ gotchas:
 # ─────────────────────────────────────────────────────────────────────
 
 testing:
-  inline_tests: 147
+  inline_tests: 165
   integration_test_crate: "daemonseed-integration-tests"
   per_milestone_coverage_files:
     - tests/m1_isc_coverage.rs (17 ISCs)
     - tests/m2_isc_coverage.rs (12 ISCs, cumulative 29)
     - tests/m3_isc_coverage.rs (5 ISCs, cumulative 34)
+    - tests/m4a_isc_coverage.rs (lands in M4a commit 6)
   coverage_command: "cargo xtask isc-coverage"
-  coverage_target: "static M3 floor = 34/93 = 36.6%"
+  coverage_target: "static M3 floor = 34/93 = 36.6% (M4a will bump to 43/93)"
