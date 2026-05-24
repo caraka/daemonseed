@@ -2,7 +2,7 @@
 //! ISC-C35 profile-root resolution rules.
 //!
 //! Every daemonseed install ("profile") has:
-//! - A stable UUID v4 [`profile_id`](Profile::profile_id) drawn at
+//! - A stable UUID v4 [`profile_id`](ProfileConfig::profile_id) drawn at
 //!   first-start from cryptographic randomness (ISC-C36, ISC-A-C16).
 //! - Per-profile [Argon2 params](ArgonParams) chosen at first-start,
 //!   persisted in `daemonseed.toml`, never silently changed (ISC-C14,

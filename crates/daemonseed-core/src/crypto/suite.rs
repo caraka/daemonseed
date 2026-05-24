@@ -194,8 +194,10 @@ impl Suite {
 // ── Concrete registry entries ─────────────────────────────────────────────
 
 /// The CNSA 2.0 suite — daemonseed's MVP baseline. Bundle matches the
-/// `0x0001` row of `ds-suite-registry.md`. Pinned by [`tests::cnsa_2_0_matches_registry_doc`]
-/// so the design doc and the code cannot quietly diverge.
+/// `0x0001` row of `ds-suite-registry.md`. Pinned by the
+/// `cnsa_2_0_matches_registry_doc` unit test (see the `tests` submodule
+/// at the bottom of this file) so the design doc and the code cannot
+/// quietly diverge.
 pub const CNSA_2_0: Suite = Suite {
     id: match SuiteId::try_new(0x0001) {
         Ok(id) => id,

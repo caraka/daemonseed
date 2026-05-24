@@ -5,8 +5,9 @@
 //! override, or leave the name empty (floor-handle presentation).
 //!
 //! Wordlist source: Glitch's `friendly-words` project (MIT-licensed). The
-//! original files live under [`wordlists/`] beside this module, embedded into
-//! the binary at compile time via `include_str!`. Combined namespace size:
+//! original files live in the `wordlists/` directory beside this module,
+//! embedded into the binary at compile time via `include_str!`. Combined
+//! namespace size:
 //! `1450 predicates × 3062 objects = 4,439,900` — comfortably above the
 //! ISC-C4b ≥2M target so organic display-name collisions are rare without
 //! deliberate effort.

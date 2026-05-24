@@ -1,0 +1,83 @@
+# ─────────────────────────────────────────────────────────────────────
+# daemonseed-cli — LAMA API Manifest (placeholder at v0.4.0)
+#
+# The CLI crate ships as a placeholder `fn main() {}` through M3.
+# Substantive subcommands land alongside M4b (post-identity-proof
+# the CLI can authenticate as a client) and grow through M11.
+#
+# Cross-references:
+# - Repository root: ../../lama.yaml
+# - Core crate: ./daemonseed-core-api.yaml
+# ─────────────────────────────────────────────────────────────────────
+
+lama: "0.1"
+
+library:
+  name: daemonseed-cli
+  version: "0.1.0"
+  description: "Non-interactive scriptable client binary. Placeholder at v0.4.0 (M3)."
+  license: "AGPL-3.0-or-later"
+  manifest_for: "crates/daemonseed-cli"
+  status: placeholder
+
+binaries:
+  - name: daemonseed-cli
+    entry_point: "fn main()"
+    status: placeholder
+    note: "Empty main — does nothing. Real subcommands land post-M4b."
+
+# ─────────────────────────────────────────────────────────────────────
+# Planned subcommands (forward-looking, not yet implemented)
+# ─────────────────────────────────────────────────────────────────────
+
+planned_subcommands:
+  - milestone: M4b
+    commands:
+      - { name: "first-start", purpose: "Run the daemonseed-core first_start orchestrator end-to-end. Equivalent to the TUI's enrollment flow but scriptable (passphrase via stdin or env-var)." }
+      - { name: "ping <server-id>", purpose: "Establish a TLS+APP_HELLO+identity-proof connection to verify reachability and trust state." }
+
+  - milestone: M5
+    commands:
+      - { name: "trust set <server-id> {trusted|untrusted}", purpose: "Flip the federation trust slider for a server per ISC-C22." }
+      - { name: "introducer query <server-id>", purpose: "Fetch the introducer's known-server list. Does NOT auto-add — output is for user inspection per the no-keys-in-introducer invariant." }
+
+  - milestone: M6
+    commands:
+      - { name: "post <text>", purpose: "Post to the public space." }
+      - { name: "motd set <text>", purpose: "Set the daemon's MOTD." }
+
+  - milestone: M7
+    commands:
+      - { name: "suite status", purpose: "List local registry + per-server deprecation policy state." }
+      - { name: "suite migrate", purpose: "Explicit user-triggered migration to a newer suite. Never automatic per ISC-A-C9." }
+
+  - milestone: M8
+    commands:
+      - { name: "share add <path>", purpose: "Add a file or directory to the share index." }
+      - { name: "share list", purpose: "List indexed shares." }
+      - { name: "fetch <hash>", purpose: "Fetch a content-addressed chunk." }
+
+# ─────────────────────────────────────────────────────────────────────
+# Discovery semantics
+# ─────────────────────────────────────────────────────────────────────
+
+profile_discovery:
+  status: "Will use daemonseed_core::profile::resolve at first real subcommand."
+  priority:
+    - "--config <path> CLI flag"
+    - "CWD-discovery (daemonseed.toml in current directory)"
+    - "XDG fallback ($XDG_CONFIG_HOME/daemonseed/daemonseed.toml)"
+  iscs: [C35]
+
+# ─────────────────────────────────────────────────────────────────────
+# Output conventions (planned)
+# ─────────────────────────────────────────────────────────────────────
+
+output_conventions:
+  status: planned
+  rules:
+    - "All commands MUST be scriptable — no required interactive prompts."
+    - "Passphrase input via stdin (line-buffered) or DAEMONSEED_PASSPHRASE env var. Never via argv (would leak via /proc)."
+    - "Default output is human-readable plain text. `--json` switches to structured JSON for scripting."
+    - "No emoji in output (compatibility with non-Unicode terminals)."
+    - "Exit codes: 0 success, 1 user error, 2 config error, 3 network error, 4 protocol error."
