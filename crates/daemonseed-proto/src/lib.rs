@@ -29,7 +29,7 @@ pub mod v1 {
 mod tests {
     use prost::Message;
 
-    use crate::v1::{CircleMin, SuiteId, Version};
+    use crate::v1::{AppHello, AppHelloAck, AppHelloReject, CircleMin, ProtocolVersion, SuiteId};
 
     /// `SuiteId` round-trips through prost encode/decode preserving the
     /// `value` field. M3 adds `SuiteId` to the v1 module; this test exists
@@ -58,18 +58,85 @@ mod tests {
         assert_eq!(decoded.min_suite_id.as_ref().unwrap().value, 0x0001);
     }
 
-    /// The pre-existing `Version` message still encodes; M3's additions
-    /// to the schema do not regress earlier work.
+    /// `ProtocolVersion` is the wire-shape for SemVer MAJOR.MINOR. PATCH is
+    /// deliberately absent from the wire per ISC-S14 — two implementations
+    /// sharing MAJOR.MINOR are wire-compatible regardless of PATCH.
     #[test]
-    fn version_message_still_round_trips() {
-        let v = Version {
-            major: 1,
-            minor: 0,
-            patch: 0,
-            pre_release: String::new(),
+    fn protocol_version_round_trips() {
+        let original = ProtocolVersion { major: 1, minor: 0 };
+        let bytes = original.encode_to_vec();
+        let decoded = ProtocolVersion::decode(bytes.as_slice()).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    /// `AppHello` round-trips the MVP offer shape: one supported version,
+    /// `tcp-tls13` as the sole transport capability (F29 anchor), and an
+    /// unset `server_source` (F32 placeholder; population deferred to M6).
+    #[test]
+    fn app_hello_round_trips_mvp_offer() {
+        let original = AppHello {
+            versions: vec![ProtocolVersion { major: 1, minor: 0 }],
+            transport_capabilities: vec!["tcp-tls13".to_string()],
+            server_source: None,
         };
-        let bytes = v.encode_to_vec();
-        let decoded = Version::decode(bytes.as_slice()).unwrap();
-        assert_eq!(decoded, v);
+        let bytes = original.encode_to_vec();
+        let decoded = AppHello::decode(bytes.as_slice()).unwrap();
+        assert_eq!(decoded, original);
+        assert_eq!(decoded.versions.len(), 1);
+        assert_eq!(decoded.transport_capabilities, vec!["tcp-tls13"]);
+        assert!(decoded.server_source.is_none());
+    }
+
+    /// `AppHello.server_source` round-trips when populated. This is the
+    /// shape M6 will use once operators declare an AGPL §13 source URL.
+    #[test]
+    fn app_hello_round_trips_with_server_source() {
+        let original = AppHello {
+            versions: vec![ProtocolVersion { major: 1, minor: 0 }],
+            transport_capabilities: vec!["tcp-tls13".to_string()],
+            server_source: Some("https://example.invalid/daemonseed-source.tar.gz".to_string()),
+        };
+        let bytes = original.encode_to_vec();
+        let decoded = AppHello::decode(bytes.as_slice()).unwrap();
+        assert_eq!(decoded, original);
+        assert!(decoded.server_source.is_some());
+    }
+
+    /// `AppHelloAck` carries the single negotiated version. The version is
+    /// `Option<ProtocolVersion>` on the generated type because proto3
+    /// nested messages are nullable by default; the responder always
+    /// supplies it (verified at the policy layer by M4a commit 2's
+    /// `daemonseed_core::version::VersionNegotiator::verify_ack`).
+    #[test]
+    fn app_hello_ack_round_trips() {
+        let original = AppHelloAck {
+            version: Some(ProtocolVersion { major: 1, minor: 0 }),
+        };
+        let bytes = original.encode_to_vec();
+        let decoded = AppHelloAck::decode(bytes.as_slice()).unwrap();
+        assert_eq!(decoded, original);
+        assert_eq!(decoded.version.unwrap().major, 1);
+    }
+
+    /// `AppHelloReject` with `code = 1` (NO_COMMON_VERSION) carries the
+    /// responder's full supported-version list. The integer code (rather
+    /// than enum) gives forward compatibility: future additive reject
+    /// codes from a newer responder still parse cleanly at an older
+    /// initiator, which can render a generic "unrecognized reject code"
+    /// message instead of failing at the proto-decode layer.
+    #[test]
+    fn app_hello_reject_round_trips_no_common_version() {
+        let original = AppHelloReject {
+            code: 1,
+            server_supported: vec![
+                ProtocolVersion { major: 2, minor: 0 },
+                ProtocolVersion { major: 2, minor: 1 },
+            ],
+        };
+        let bytes = original.encode_to_vec();
+        let decoded = AppHelloReject::decode(bytes.as_slice()).unwrap();
+        assert_eq!(decoded, original);
+        assert_eq!(decoded.code, 1);
+        assert_eq!(decoded.server_supported.len(), 2);
     }
 }
