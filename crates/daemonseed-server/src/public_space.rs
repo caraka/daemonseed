@@ -352,8 +352,10 @@ impl PublicSpaceState {
             return Err(UploadError::BadTopic);
         }
 
-        // Persist the signed bytes verbatim (D-M6-7), then hold in RAM.
-        std::fs::create_dir_all(posts_dir).map_err(UploadError::Io)?;
+        // Persist the signed bytes verbatim (D-M6-7), then hold in RAM. The
+        // posts dir is the server's ONLY runtime write surface (ISC-34); it is
+        // created group-writable so authorized signers share it (ISC-35).
+        ensure_posts_dir(posts_dir).map_err(UploadError::Io)?;
         std::fs::write(posts_dir.join(hex::encode(addr)), artifact.encode_to_vec())
             .map_err(UploadError::Io)?;
 
@@ -433,6 +435,24 @@ fn delete_artifact_err(e: ArtifactError) -> DeleteError {
         ArtifactError::UnknownSigner | ArtifactError::BadSignature => DeleteError::Unauthorized,
         ArtifactError::Module(m) => DeleteError::Module(m),
     }
+}
+
+/// Create the posts dir, group-writable so authorized signers share it
+/// (ISC-35: posts dir 0770). The mode is forced explicitly (not left to the
+/// process umask) so the group-writable bit is deterministic. The operator's
+/// private files (TOML 0600, whitelist) live elsewhere and the server never
+/// writes them (ISC-33) — that separation is the operator's deployment
+/// responsibility to lock down; the server only ever writes here (ISC-34).
+#[cfg(unix)]
+fn ensure_posts_dir(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o770))
+}
+
+#[cfg(not(unix))]
+fn ensure_posts_dir(dir: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(dir)
 }
 
 /// Failure of [`PublicSpaceState::upload_post`].
@@ -1180,6 +1200,64 @@ mod tests {
 
         let result = state.delete_post(delete_artifact(&signer, &[0x11u8; CONTENT_ADDRESS_LEN]));
         assert!(matches!(result, Err(DeleteError::NotFound)));
+    }
+
+    // ── Filesystem isolation (ISC-33/34/35/36) ───────────────────────────
+
+    /// ISC-33/34/36: handling an upload writes ONLY inside posts_dir — the
+    /// operator's TOML + whitelist are byte-for-byte unchanged. ISC-35: the
+    /// posts dir is group-writable (Unix). A robust behavioral check, not a
+    /// fragile two-user permission fixture.
+    #[test]
+    fn upload_writes_only_posts_dir_never_operator_files() {
+        let signer = keypair(60);
+        let topics = vec!["announcements".to_owned()];
+        let dir = TempDir::new().unwrap();
+
+        // Operator's private files alongside the public posts dir.
+        let toml_path = dir.path().join("daemonseed.toml");
+        std::fs::write(&toml_path, b"key_path = \"/srv/seed\"\n").unwrap();
+        let wl_path = dir.path().join("signers.txt");
+        write_signer_file(&wl_path, &signer);
+        let toml_before = std::fs::read(&toml_path).unwrap();
+        let wl_before = std::fs::read(&wl_path).unwrap();
+
+        let posts_dir = dir.path().join("posts");
+        let cfg = PublicSpaceConfig {
+            posts_dir: Some(&posts_dir),
+            motd_path: None,
+            whitelist_path: Some(&wl_path),
+            taxonomy: &[],
+            topics: &topics,
+        };
+        let state = PublicSpaceState::load(&cfg, keypair(99).public_key()).unwrap();
+
+        let (art, addr) = post_artifact(&signer, "announcements", "hello", 1);
+        state.upload_post(art).unwrap();
+
+        // The server never wrote the operator's private files (ISC-33).
+        assert_eq!(
+            std::fs::read(&toml_path).unwrap(),
+            toml_before,
+            "TOML untouched"
+        );
+        assert_eq!(
+            std::fs::read(&wl_path).unwrap(),
+            wl_before,
+            "whitelist untouched"
+        );
+        // The post landed in the posts dir — the server's only write surface (ISC-34).
+        assert!(
+            posts_dir.join(hex::encode(addr)).exists(),
+            "post in posts_dir"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&posts_dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o770, "posts dir is group-writable (ISC-35)");
+        }
     }
 
     /// ISC-2 end-to-end: tonic serves the real PublicSpace service over ONE

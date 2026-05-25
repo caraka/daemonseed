@@ -80,12 +80,16 @@ pub async fn run<F>(
     tls_config: ServerConfig,
     identity: Arc<ServerIdentity>,
     public_space: Arc<PublicSpaceState>,
+    server_source: Option<String>,
     shutdown: F,
     observer: ConnectionObserver,
 ) -> io::Result<()>
 where
     F: Future<Output = ()>,
 {
+    // AGPL-§13 source URL advertised in each connection's APP_HELLO_ACK
+    // (ISC-9). Shared read-only across per-connection tasks.
+    let server_source = Arc::new(server_source);
     let listener = TcpListener::bind(addr).await?;
     let acceptor = TlsAcceptor::from(Arc::new(tls_config));
 
@@ -119,10 +123,20 @@ where
                 let observer = observer.clone();
                 let identity = identity.clone();
                 let public_space = public_space.clone();
+                let server_source = server_source.clone();
                 let seen = seen.clone();
                 tokio::spawn(async move {
                     let _ = peer_addr;
-                    serve_connection(acceptor, stream, identity, public_space, seen, observer).await;
+                    serve_connection(
+                        acceptor,
+                        stream,
+                        identity,
+                        public_space,
+                        server_source,
+                        seen,
+                        observer,
+                    )
+                    .await;
                 });
             }
         }
@@ -144,6 +158,7 @@ async fn serve_connection(
     stream: TcpStream,
     identity: Arc<ServerIdentity>,
     public_space: Arc<PublicSpaceState>,
+    server_source: Arc<Option<String>>,
     seen: SeenMap,
     observer: ConnectionObserver,
 ) {
@@ -160,7 +175,7 @@ async fn serve_connection(
     // HELLO — negotiate the wire version. A frame I/O / decode failure or a
     // no-overlap reject both close silently (the reject frame, if any, was
     // already written by serve_hello).
-    let outcome = match serve_hello(&mut tls_stream).await {
+    let outcome = match serve_hello(&mut tls_stream, server_source.as_deref()).await {
         Ok(o) => o,
         Err(_e) => return,
     };
@@ -231,7 +246,7 @@ pub async fn drive_negotiated_connection<S>(mut stream: S, observer: ConnectionO
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
 {
-    let outcome = match serve_hello(&mut stream).await {
+    let outcome = match serve_hello(&mut stream, None).await {
         Ok(o) => o,
         Err(_e) => {
             // Frame I/O or decode failure — close silently for the

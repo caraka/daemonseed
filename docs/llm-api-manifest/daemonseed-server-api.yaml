@@ -133,7 +133,7 @@ modules:
     key_functions:
       - { sig: "read_frame<R, M>(stream: &mut R) -> Result<M, HelloError>", note: "Generic over any prost Message; enforces MAX_FRAME_BYTES at the prefix step before allocating the body buffer." }
       - { sig: "write_frame<W, M>(stream: &mut W, msg: &M) -> Result<(), HelloError>" }
-      - { sig: "serve_hello<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) -> Result<HelloOutcome, HelloError>", note: "Zero branches on intended peer role per ISC-A-S6; no per-pubkey state per ISC-A-S9." }
+      - { sig: "serve_hello<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S, server_source: Option<&str>) -> Result<HelloOutcome, HelloError>", note: "Zero branches on intended peer role per ISC-A-S6; no per-pubkey state per ISC-A-S9. M6 added server_source — when Some, it is advertised in the AppHelloAck (ISC-9 / F32)." }
 
   - path: daemonseed_server::identity_proof
     purpose: >-
@@ -187,7 +187,7 @@ modules:
     public:
       - { kind: type, name: "ConnectionObserver = Arc<dyn Fn(HelloOutcome) + Send + Sync>", note: "Integration-test seam; production uses noop_observer(). Reports the HELLO negotiation outcome (fired before the identity-proof phase)." }
     key_functions:
-      - { sig: "run<F: Future<Output = ()>>(addr: SocketAddr, tls_config: ServerConfig, identity: Arc<ServerIdentity>, public_space: Arc<PublicSpaceState>, shutdown: F, observer: ConnectionObserver) -> io::Result<()>", note: "Accept loop; biased select! prefers shutdown over a new connection. Creates the process-wide RAM SeenMap and clones it + the shared public_space state into each connection task. M6 added the public_space parameter." }
+      - { sig: "run<F: Future<Output = ()>>(addr: SocketAddr, tls_config: ServerConfig, identity: Arc<ServerIdentity>, public_space: Arc<PublicSpaceState>, server_source: Option<String>, shutdown: F, observer: ConnectionObserver) -> io::Result<()>", note: "Accept loop; biased select! prefers shutdown over a new connection. Creates the process-wide RAM SeenMap and clones it + the shared public_space state into each connection task. M6 added the public_space + server_source (ISC-9 AGPL-§13 URL, advertised in each AppHelloAck) parameters." }
       - { sig: "drive_negotiated_connection<S>(stream: S, observer: ConnectionObserver)", note: "HELLO-only driver retained as an in-memory-duplex test seam; the production path is serve_connection (private), which also runs identity-proof off the concrete TLS stream." }
       - { sig: "shutdown_signal() -> impl Future<Output = ()>", note: "Composes ctrl_c + SIGTERM on unix; ctrl_c only on non-unix." }
       - { sig: "parse_listen_addr(s: &str) -> io::Result<SocketAddr>" }
