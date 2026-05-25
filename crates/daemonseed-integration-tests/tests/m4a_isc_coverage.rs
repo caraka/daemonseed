@@ -168,11 +168,23 @@ async fn m4a_iscs_exercise_end_to_end() {
     let client_identity =
         daemonseed_cli::identity_proof::ClientIdentity::ephemeral().expect("ephemeral client");
     let mut counters = daemonseed_core::storage::seeds::CounterState::default();
+    // M5: connect now runs the C22 trust slider after the proof, so it needs a
+    // trust store with an entry for the dialed server. Seed a trusted entry —
+    // first-contact TOFU pins the server's key.
+    let mut trust = daemonseed_core::federation::store::InMemoryTrustStore::new();
+    daemonseed_core::federation::store::TrustStore::upsert(
+        &mut trust,
+        daemonseed_core::federation::store::ServerEntry::new_trusted(
+            <daemonseed_core::handle::Handle as core::str::FromStr>::from_str(&id_string).unwrap(),
+            bound_addr.to_string(),
+        ),
+    );
     let outcome = daemonseed_cli::connect::connect(
         &id_string,
         &bound_addr.to_string(),
         &client_identity,
         &mut counters,
+        &mut trust,
     )
     .await
     .expect("client connects, negotiates 1.0, and authenticates");

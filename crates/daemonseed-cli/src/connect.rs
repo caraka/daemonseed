@@ -13,7 +13,12 @@ use std::error::Error;
 use std::io;
 use std::sync::Arc;
 
+use core::str::FromStr;
+
 use daemonseed_core::bootstrap::bundled;
+use daemonseed_core::federation::store::{TrustStore, apply_trust};
+use daemonseed_core::federation::trust::TrustDecision;
+use daemonseed_core::handle::Handle;
 use daemonseed_core::identity_proof::{ChannelBindingError, derive_channel_binding};
 use daemonseed_core::storage::seeds::CounterState;
 use daemonseed_core::version::{
@@ -36,6 +41,17 @@ use crate::tofu_stub::AcceptAnyServerCert;
 /// Default port the M4a server binds (per ISC-S5).
 pub const DEFAULT_PORT: u16 = 443;
 
+/// Reference-client per-server concurrent-connection cap (ISC-A-C10).
+///
+/// A conformant client opens at most this many simultaneous connections to a
+/// single server, so a well-meaning client doesn't look like an attack pattern
+/// to a Pi-4-class operator. This is a reference-client commitment, not a
+/// protocol-enforced limit: it is not enforceable against a hostile
+/// non-conformant client, and Sybil resistance proper is deferred to post-MVP.
+/// The M5 CLI opens exactly one connection per invocation, so it honours the
+/// cap trivially; a multi-connection client (TUI, M11) consults this constant.
+pub const MAX_CONCURRENT_CONNECTIONS_PER_SERVER: usize = 4;
+
 /// Outcome of a successful `connect`. Reaching this value means the
 /// connection completed the full identity-proof exchange and is
 /// `Authenticated` — there is no "negotiated but unauthenticated" success
@@ -50,6 +66,10 @@ pub struct ConnectOutcome {
     /// `claimed_handle`, proven self-consistent and equal to the dialed
     /// server-id).
     pub server_handle: String,
+    /// A non-blocking key-rotation notice (ISC-C22): `Some(fingerprint)` when a
+    /// trusted-mode server presented a new key that wasn't dismissed. The
+    /// connection still succeeded; the caller surfaces this to the user.
+    pub rotation_notice: Option<String>,
 }
 
 /// Resolve `<server-id>` to a dial address.
@@ -117,6 +137,7 @@ pub async fn connect(
     address: &str,
     identity: &ClientIdentity,
     counters: &mut CounterState,
+    store: &mut dyn TrustStore,
 ) -> Result<ConnectOutcome, ConnectError> {
     let client_cfg = build_client_config().map_err(|e| ConnectError::Rustls(e.to_string()))?;
     let connector = TlsConnector::from(Arc::new(client_cfg));
@@ -194,10 +215,30 @@ pub async fn connect(
     // failed. The typed cause is dropped here on purpose.
     .map_err(|_cause| ConnectError::IdentityProofRefused)?;
 
+    // C22 trust slider: the identity-proof above already proved the server's
+    // key is self-consistent and its hash-prefix is the dialed server-id
+    // (A-C18). This layer adds the full-key trust decision: trusted-mode TOFU
+    // pinning + rotation detection, or untrusted-mode byte-exact match. The
+    // store must hold an entry for the dialed server (the user added it before
+    // connecting); an unknown server fails closed.
+    let server_handle = Handle::from_str(server_id).map_err(|_| ConnectError::BadServerId)?;
+    let presented_prefix = *Handle::from_pubkey(None, verified.pubkey())
+        // Crypto module is operational by here (the proof just verified), so
+        // this is unreachable in practice; fail closed if it ever isn't.
+        .map_err(|_| ConnectError::TrustRefused)?
+        .hash_prefix();
+    let rotation_notice =
+        match apply_trust(store, &server_handle, verified.pubkey(), &presented_prefix) {
+            TrustDecision::Accept => None,
+            TrustDecision::AcceptWithRotation { fingerprint } => Some(fingerprint),
+            TrustDecision::Refuse => return Err(ConnectError::TrustRefused),
+        };
+
     Ok(ConnectOutcome {
         version,
         dialled: address.to_owned(),
         server_handle: verified.handle().to_owned(),
+        rotation_notice,
     })
 }
 
@@ -310,6 +351,15 @@ pub enum ConnectError {
     /// collapse to this single opaque outcome (ISC-46 / ISC-A-C18). The
     /// client fails closed with no partial-trust continuation (ISC-45).
     IdentityProofRefused,
+    /// `<server-id>` could not be parsed as a `<name>#<12hex>` handle.
+    BadServerId,
+    /// The C22 trust slider refused the server's key: a trusted-mode
+    /// first-contact hash mismatch (wrong server-id or a MITM with a
+    /// non-grinded key), an untrusted-mode key mismatch (including a
+    /// legitimate rotation the user must re-import), or an unknown server.
+    /// Distinct from `IdentityProofRefused`: this is actionable (check the
+    /// server-id / re-import the key), not deliberately opaque.
+    TrustRefused,
 }
 
 impl fmt::Display for ConnectError {
@@ -346,6 +396,15 @@ impl fmt::Display for ConnectError {
                 "server refused the connection during identity-proof \
                  (the cause is deliberately not disclosed)"
             ),
+            Self::BadServerId => {
+                write!(f, "server-id is not a valid <name>#<12hex> handle")
+            }
+            Self::TrustRefused => write!(
+                f,
+                "server key rejected by the trust slider: wrong server-id, a \
+                 MITM, or a key that changed in untrusted mode — verify the \
+                 server-id or re-import the operator's current key"
+            ),
         }
     }
 }
@@ -370,6 +429,12 @@ mod tests {
     fn resolve_address_uses_explicit_override() {
         let addr = resolve_address("anything", Some("127.0.0.1:8443")).unwrap();
         assert_eq!(addr, "127.0.0.1:8443");
+    }
+
+    #[test]
+    fn concurrent_connection_cap_default_is_four() {
+        // ISC-A-C10: reference-client per-server concurrent-connection cap.
+        assert_eq!(MAX_CONCURRENT_CONNECTIONS_PER_SERVER, 4);
     }
 
     #[test]

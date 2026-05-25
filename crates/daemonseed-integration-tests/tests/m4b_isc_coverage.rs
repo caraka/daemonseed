@@ -133,11 +133,21 @@ async fn m4b_iscs_exercise_end_to_end() {
     // Authenticated (ISC-S19 / ISC-53).
     let client = ClientIdentity::ephemeral().expect("ephemeral client");
     let mut counters = CounterState::default();
+    // M5: seed the C22 trust store with a trusted entry for the dialed server.
+    let mut trust = daemonseed_core::federation::store::InMemoryTrustStore::new();
+    daemonseed_core::federation::store::TrustStore::upsert(
+        &mut trust,
+        daemonseed_core::federation::store::ServerEntry::new_trusted(
+            <daemonseed_core::handle::Handle as core::str::FromStr>::from_str(&id_string).unwrap(),
+            bound_addr.to_string(),
+        ),
+    );
     let outcome = daemonseed_cli::connect::connect(
         &id_string,
         &bound_addr.to_string(),
         &client,
         &mut counters,
+        &mut trust,
     )
     .await
     .expect("client + server both reach Authenticated");

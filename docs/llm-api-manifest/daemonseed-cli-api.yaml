@@ -70,12 +70,13 @@ modules:
     added_in: "M4a commit 5; identity-proof wiring M4b commit 6"
     public:
       - { kind: const, name: DEFAULT_PORT, value: 443 }
-      - { kind: struct, name: ConnectOutcome, fields: "{version: ProtocolVersion, dialled: String, server_handle: String}", note: "Reaching this value means Authenticated; server_handle is the verified, dialed server-id." }
-      - { kind: enum, name: ConnectError, variants: "{NoAddress, Tcp, Rustls, TlsHandshake, HelloWrite, HelloDecode, OutOfSetAck, NoCommonVersion, UnknownRejectCode, WireOutOfRange, ChannelBinding, IdentityProofRefused}", note: "IdentityProofRefused carries NO sub-cause — uniform 'server refused' per ISC-46 / A-C18." }
+      - { kind: const, name: MAX_CONCURRENT_CONNECTIONS_PER_SERVER, value: 4, note: "ISC-A-C10 reference-client per-server concurrent-connection cap. A commitment, not protocol-enforced; not enforceable against a hostile client (Sybil resistance is post-MVP)." }
+      - { kind: struct, name: ConnectOutcome, fields: "{version: ProtocolVersion, dialled: String, server_handle: String, rotation_notice: Option<String>}", note: "Authenticated outcome. rotation_notice is Some(fingerprint) when a trusted-mode server presented a new, undismissed key (ISC-C22) — the connection still succeeded." }
+      - { kind: enum, name: ConnectError, variants: "{NoAddress, Tcp, Rustls, TlsHandshake, HelloWrite, HelloDecode, OutOfSetAck, NoCommonVersion, UnknownRejectCode, WireOutOfRange, ChannelBinding, IdentityProofRefused, BadServerId, TrustRefused}", note: "IdentityProofRefused is opaque (ISC-46). TrustRefused is the C22 slider refusal (wrong server-id / MITM / untrusted key change / unknown server) — deliberately actionable, not opaque." }
     key_functions:
       - { sig: "resolve_address(server_id: &str, address_override: Option<&str>) -> Result<String, ConnectError>", note: "Override wins; bundled-anchor server-id match is the fallback; empty anchor + no override surfaces ConnectError::NoAddress." }
       - { sig: "build_client_config() -> Result<rustls::ClientConfig, rustls::Error>", note: "Caller-contract: install_provider() must have returned Ok before this." }
-      - { sig: "connect(server_id: &str, address: &str, identity: &ClientIdentity, counters: &mut CounterState) -> Result<ConnectOutcome, ConnectError>", note: "Caller-contract: install_provider() AND oxicrypt_module::initialize_with_profile(.., Cnsa2) must both have returned Ok. Returns Ok only after the full identity-proof reaches Authenticated." }
+      - { sig: "connect(server_id: &str, address: &str, identity: &ClientIdentity, counters: &mut CounterState, store: &mut dyn TrustStore) -> Result<ConnectOutcome, ConnectError>", note: "M5: after the identity-proof reaches Authenticated, runs the C22 trust slider against `store` (which must hold an entry for the dialed server) — trusted-mode TOFU-pins, untrusted-mode requires byte-exact key, rotation surfaces via ConnectOutcome.rotation_notice, refusal → TrustRefused. Caller-contract: install_provider() + oxicrypt_module::initialize_with_profile(.., Cnsa2) both Ok." }
 
   - path: daemonseed_cli::tofu_stub
     purpose: >-
@@ -106,9 +107,13 @@ binaries:
           3. resolve_address(server_id, --address)
           4. ClientIdentity::ephemeral() + CounterState::default()  (D8)
           5. tokio::runtime::Runtime::new()
-          6. connect::connect(server_id, dial, &identity, &mut counters)
-             (TCP → TLS → AppHello → AppHelloAck → channel binding → identity-proof → Authenticated)
-          7. println! the authenticated server-id + version + exit 0
+          6. InMemoryTrustStore::new() + upsert a trusted ServerEntry for the
+             dialed server-id (M5/C22; the CLI's store is ephemeral until
+             persisted client identity lands)
+          7. connect::connect(server_id, dial, &identity, &mut counters, &mut trust)
+             (TCP → TLS → AppHello → AppHelloAck → channel binding → identity-proof
+             → Authenticated → C22 trust slider TOFU-pins the server key)
+          8. println! the authenticated server-id + version (+ rotation notice) + exit 0
 
 # ─────────────────────────────────────────────────────────────────────
 # Planned subcommands (forward-looking)
