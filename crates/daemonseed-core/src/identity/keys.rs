@@ -26,7 +26,10 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 use crate::identity::mnemonic::Mnemonic;
 use crate::kdf::info;
 
-const ML_DSA_SEED_LEN: usize = 32;
+/// ML-DSA-87 seed length in bytes (FIPS 204 §5.1). The raw seed a server
+/// persists (see `daemonseed-server::identity`) is exactly this long, which
+/// is why [`SignKeypair::from_ml_dsa_seed`] takes a `&[u8; ML_DSA_SEED_LEN]`.
+pub const ML_DSA_SEED_LEN: usize = 32;
 const ML_KEM_SEED_LEN: usize = 32;
 
 /// Identity context the user is presenting in (ISC-C1, ISC-C13).
@@ -92,6 +95,26 @@ impl SignKeypair {
     /// it zeroes when this struct drops.
     pub fn secret_key(&self) -> &[u8; ml_dsa::SK_LEN] {
         &self.secret_key
+    }
+
+    /// Build a `SignKeypair` directly from a raw 32-byte ML-DSA-87 seed
+    /// (FIPS 204 §5.1) via `oxicrypt_ml_dsa::keygen`.
+    ///
+    /// Clients derive their keypair from a BIP-39 mnemonic through
+    /// [`derive_identity_keys`]; a relay **server**, by contrast, persists a
+    /// bare 32-byte seed (`daemonseed-server::identity`) and re-derives its
+    /// long-term keypair on every boot. This constructor is that path — it
+    /// lets the server mint the `SignKeypair` its identity-proof envelope is
+    /// signed with (ISC-S11 / ISC-S19) without routing through the mnemonic
+    /// machinery. The derivation is deterministic: the same seed always
+    /// yields the same keypair. Requires the oxicrypt module to be
+    /// operational.
+    pub fn from_ml_dsa_seed(seed: &[u8; ML_DSA_SEED_LEN]) -> Result<Self, KeyDerivationError> {
+        let (pk_arr, sk_arr) = ml_dsa::keygen(seed).map_err(KeyDerivationError::MlDsa)?;
+        Ok(Self {
+            public_key: Box::new(pk_arr),
+            secret_key: Box::new(sk_arr),
+        })
     }
 
     /// Produce a detached ML-DSA-87 signature over `message`.
@@ -382,6 +405,32 @@ mod tests {
         let msg = b"daemonseed identity-proof envelope bytes";
         let sig = keys.signing.sign(msg).unwrap();
         verify_signature(keys.signing.public_key(), msg, &sig).unwrap();
+    }
+
+    #[test]
+    fn from_ml_dsa_seed_matches_keygen_and_round_trips() {
+        // The server's identity is a raw 32-byte ML-DSA-87 seed (not a
+        // BIP-39 mnemonic), so it builds its SignKeypair via this
+        // constructor. The pubkey MUST match a direct `keygen` of the same
+        // seed, and the keypair must sign+verify.
+        ensure_oxicrypt_initialized();
+        let seed = [7u8; ML_DSA_SEED_LEN];
+        let kp = SignKeypair::from_ml_dsa_seed(&seed).unwrap();
+        let (expected_pk, _expected_sk) = ml_dsa::keygen(&seed).unwrap();
+        assert_eq!(kp.public_key(), &expected_pk);
+        let msg = b"server identity-proof envelope";
+        let sig = kp.sign(msg).unwrap();
+        verify_signature(kp.public_key(), msg, &sig).unwrap();
+    }
+
+    #[test]
+    fn from_ml_dsa_seed_is_deterministic() {
+        ensure_oxicrypt_initialized();
+        let seed = [42u8; ML_DSA_SEED_LEN];
+        let a = SignKeypair::from_ml_dsa_seed(&seed).unwrap();
+        let b = SignKeypair::from_ml_dsa_seed(&seed).unwrap();
+        assert_eq!(a.public_key(), b.public_key());
+        assert_eq!(a.secret_key(), b.secret_key());
     }
 
     #[test]

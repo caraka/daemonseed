@@ -42,6 +42,7 @@ use daemonseed_proto::v1 as wire;
 use daemonseed_server::config::ServerConfig as DseedConfig;
 use daemonseed_server::hello::HelloOutcome;
 use daemonseed_server::identity::{Seed, derive_server_id, generate_seed};
+use daemonseed_server::identity_proof::ServerIdentity;
 use daemonseed_server::runtime;
 use daemonseed_server::tls::{DEFAULT_CERT_VALIDITY, build_server_config, install_provider};
 use prost::Message;
@@ -134,10 +135,19 @@ async fn m4a_iscs_exercise_end_to_end() {
         observed_clone.lock().unwrap().push(o);
     });
 
+    // M4b: the runtime now runs the identity-proof phase after HELLO, so it
+    // needs the server's signing identity. The M4a client `connect` path
+    // doesn't send an identity-proof envelope yet (that's M4b commit 6), so
+    // the server's proof step fails closed after the observer has already
+    // recorded the negotiated outcome — which is all this M4a test asserts.
+    let identity =
+        Arc::new(ServerIdentity::from_seed(&seed, &server_id).expect("server identity builds"));
+
     let server_handle = tokio::spawn(async move {
         runtime::run(
             bound_addr,
             tls_cfg,
+            identity,
             async move {
                 let _ = shutdown_rx.await;
             },

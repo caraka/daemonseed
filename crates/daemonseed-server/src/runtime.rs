@@ -4,18 +4,19 @@
 //! It binds a [`tokio::net::TcpListener`] to the configured address, wraps
 //! each accepted connection in a [`tokio_rustls::TlsAcceptor`], drives the
 //! post-TLS-handshake `APP_HELLO` exchange via [`crate::hello::serve_hello`],
-//! and advances the type-state [`daemonseed_core::connection::Connection`]
-//! to `Versioned` on success.
+//! then runs the identity-proof exchange
+//! ([`crate::identity_proof::run_server_identity_proof`]) and advances the
+//! type-state [`daemonseed_core::connection::Connection`] through `Versioned`
+//! to `Authenticated` on success (ISC-S19).
 //!
 //! ## Graceful shutdown (ISC-9)
 //!
 //! `run` accepts a `shutdown` future. When that future completes the
 //! accept loop exits cleanly — no abort, no panic. In-flight per-
-//! connection tasks are not actively drained in M4a (the type-state
-//! machine has no `Authenticated → Closed` ceremony yet); they
-//! terminate naturally when their `TcpStream` is closed by the OS as
-//! the runtime drops. Full connection drain lands with the M4b
-//! identity-proof / Authenticated state machinery.
+//! connection tasks are not actively drained (the type-state machine has
+//! no `Authenticated → Closed` ceremony yet); they terminate naturally
+//! when their `TcpStream` is closed by the OS as the runtime drops. Full
+//! connection drain lands with the M5+ application-stream machinery.
 //!
 //! The binary's wiring drives `shutdown` from `tokio::signal::ctrl_c()`
 //! plus the unix SIGTERM signal so the daemon stops cleanly on both
@@ -38,12 +39,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use daemonseed_core::connection::{Connection, Versioned};
+use daemonseed_core::identity_proof::derive_channel_binding;
 use rustls::ServerConfig;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
 
 use crate::hello::{HelloOutcome, serve_hello};
+use crate::identity_proof::{
+    RustlsServerExporter, SeenMap, ServerIdentity, now_unix_ms, run_server_identity_proof,
+};
 
 /// Hand the per-connection HELLO outcome up via this callback. Used by
 /// the integration-test harness in commit 6 to observe a real
@@ -72,6 +77,7 @@ pub fn noop_observer() -> ConnectionObserver {
 pub async fn run<F>(
     addr: SocketAddr,
     tls_config: ServerConfig,
+    identity: Arc<ServerIdentity>,
     shutdown: F,
     observer: ConnectionObserver,
 ) -> io::Result<()>
@@ -80,6 +86,10 @@ where
 {
     let listener = TcpListener::bind(addr).await?;
     let acceptor = TlsAcceptor::from(Arc::new(tls_config));
+
+    // Process-lifetime, RAM-only replay-counter map shared across every
+    // per-connection task (ISC-34 / ISC-A-S1). Cloning shares the inner Arc.
+    let seen = SeenMap::new();
 
     tokio::pin!(shutdown);
 
@@ -105,20 +115,35 @@ where
                 };
                 let acceptor = acceptor.clone();
                 let observer = observer.clone();
+                let identity = identity.clone();
+                let seen = seen.clone();
                 tokio::spawn(async move {
                     let _ = peer_addr;
-                    serve_connection(acceptor, stream, observer).await;
+                    serve_connection(acceptor, stream, identity, seen, observer).await;
                 });
             }
         }
     }
 }
 
-/// Per-connection driver. Performs the TLS handshake, runs HELLO,
-/// constructs the `Versioned` connection on success, and drops it
-/// (M4a does not yet exercise the post-Versioned surface).
-async fn serve_connection(acceptor: TlsAcceptor, stream: TcpStream, observer: ConnectionObserver) {
-    let tls_stream: TlsStream<TcpStream> = match acceptor.accept(stream).await {
+/// Per-connection driver. Performs the TLS handshake, runs HELLO, derives
+/// the identity-proof channel binding from the live TLS session, runs the
+/// identity-proof exchange, and advances the type-state to `Authenticated`
+/// on success (ISC-S19). M4b drops the `Authenticated` connection after a
+/// successful proof — serving the application stream on it is M5+.
+///
+/// Every failure mode — bad TLS handshake, HELLO frame error, no-overlap
+/// reject, channel-binding failure, identity-proof rejection — closes the
+/// connection silently. The peer gets only an OS-level reset and cannot
+/// distinguish which stage or check failed (ISC-A-S9 / ISC-40 / ISC-A-S12).
+async fn serve_connection(
+    acceptor: TlsAcceptor,
+    stream: TcpStream,
+    identity: Arc<ServerIdentity>,
+    seen: SeenMap,
+    observer: ConnectionObserver,
+) {
+    let mut tls_stream: TlsStream<TcpStream> = match acceptor.accept(stream).await {
         Ok(s) => s,
         Err(_e) => {
             // Bad TLS handshake — close silently. ISC-A-S9 is satisfied
@@ -128,7 +153,63 @@ async fn serve_connection(acceptor: TlsAcceptor, stream: TcpStream, observer: Co
         }
     };
 
-    drive_negotiated_connection(tls_stream, observer).await;
+    // HELLO — negotiate the wire version. A frame I/O / decode failure or a
+    // no-overlap reject both close silently (the reject frame, if any, was
+    // already written by serve_hello).
+    let outcome = match serve_hello(&mut tls_stream).await {
+        Ok(o) => o,
+        Err(_e) => return,
+    };
+    let version = match &outcome {
+        HelloOutcome::Negotiated(v) => *v,
+        HelloOutcome::Rejected { .. } => {
+            observer(outcome);
+            return;
+        }
+    };
+    observer(outcome);
+
+    // Channel binding from THIS TLS session's exporter (ISC-37 / ISC-A-S14):
+    // a constant is structurally impossible here — RustlsServerExporter only
+    // wraps a live connection. The immutable borrow of the rustls connection
+    // ends with this block, before the stream is moved into the type-state
+    // machine for the (mutable) envelope I/O.
+    let wire_version = version.to_wire();
+    let channel_binding = {
+        let (_io, conn) = tls_stream.get_ref();
+        match derive_channel_binding(&RustlsServerExporter::new(conn), wire_version) {
+            Ok(cb) => cb,
+            Err(_e) => return,
+        }
+    };
+
+    // Advance the type-state and run the identity-proof exchange on the raw
+    // stream. The server's outbound counter is wall-clock ms (decision D7),
+    // sourced once alongside the freshness timestamp.
+    let mut versioned: Connection<Versioned, _> =
+        Connection::from_handshaked_transport(tls_stream).advance_to_versioned();
+    let now = now_unix_ms();
+    match run_server_identity_proof(
+        versioned.transport_mut(),
+        channel_binding,
+        wire_version,
+        &identity,
+        now,
+        now,
+        &seen,
+    )
+    .await
+    {
+        Ok(verified) => {
+            // ISC-S19 step 5: the VerifiedPeer token is the only key to the
+            // Authenticated state. M5+ serves the application stream on it;
+            // M4b drops it, closing the connection after a successful proof.
+            let _authenticated = versioned.into_authenticated(verified);
+        }
+        Err(_e) => {
+            // Uniform silent close — see the function-level note.
+        }
+    }
 }
 
 /// Run HELLO on an already-TLS-handshaked stream, advance the type-
