@@ -17,7 +17,19 @@
 //!   ISC-A-C5), applied both when rendering a listing and when fetching it
 //!   (same predicate, two call sites). Share *content* arrives at M8; M6 wires
 //!   the selection/filter surface only.
+//! - [`verify_served_post`] / [`verify_served_motd`] — the client half of
+//!   verify-and-serve (ISC-A-S3): re-run the *same* `verify_artifact` the
+//!   server did against the published whitelist ([`whitelist_from_wire`]) and
+//!   re-derive the content address, trusting nothing the server asserts. The
+//!   live fetch loop that calls these lands with the CLI's gRPC transport;
+//!   the verification itself is wired and tested here.
 
+use core::str::FromStr;
+
+use daemonseed_core::handle::{Handle, HandleParseError};
+use daemonseed_core::public_space::{
+    ArtifactError, Whitelist, WhitelistEntry, WhitelistParseError, verify_artifact,
+};
 use daemonseed_proto::v1 as wire;
 use prost::Message;
 
@@ -79,6 +91,101 @@ pub fn filter_shares_by_rating<'a>(
         .iter()
         .filter(|s| rating.is_none_or(|r| s.rating == r))
         .collect()
+}
+
+// ── Client re-verification (ISC-A-S3 client half) ────────────────────────
+
+/// Why converting the published wire whitelist failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WhitelistConvertError {
+    /// A `SignerWhitelistEntry` had no `entry` oneof set.
+    EmptyEntry,
+    /// A full-key entry was the wrong length.
+    BadKey(WhitelistParseError),
+    /// A handle entry didn't parse as `<name>#<hash>`.
+    BadHandle(HandleParseError),
+}
+
+/// Build a [`Whitelist`] from the wire entries a client fetched via
+/// `GetSignerWhitelist` (ISC-S8 / ISC-6), optionally augmented with the
+/// server's own key for MOTD verification (ISC-26 — pass the server pubkey the
+/// client authenticated during identity-proof; `None` for the post whitelist).
+pub fn whitelist_from_wire(
+    entries: &[wire::SignerWhitelistEntry],
+    server_pubkey: Option<&[u8]>,
+) -> Result<Whitelist, WhitelistConvertError> {
+    use wire::signer_whitelist_entry::Entry;
+    let mut out = Vec::with_capacity(entries.len());
+    for e in entries {
+        match e.entry.as_ref() {
+            Some(Entry::FullPubkey(bytes)) => {
+                out.push(
+                    WhitelistEntry::from_full_key_bytes(bytes)
+                        .map_err(WhitelistConvertError::BadKey)?,
+                );
+            }
+            Some(Entry::Handle(h)) => {
+                out.push(WhitelistEntry::Handle(
+                    Handle::from_str(h).map_err(WhitelistConvertError::BadHandle)?,
+                ));
+            }
+            None => return Err(WhitelistConvertError::EmptyEntry),
+        }
+    }
+    if let Some(pk) = server_pubkey {
+        out.push(WhitelistEntry::from_full_key_bytes(pk).map_err(WhitelistConvertError::BadKey)?);
+    }
+    Ok(Whitelist::from_entries(out))
+}
+
+/// Why a server-served artifact failed client re-verification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServedVerifyError {
+    /// A `Post` carried no `artifact`.
+    Missing,
+    /// Signature / whitelist verification failed.
+    Verify(ArtifactError),
+    /// The server-asserted content address didn't match the client-derived one.
+    AddressMismatch,
+}
+
+/// Re-verify a post the server served (ISC-A-S3 client half): the client
+/// trusts NOTHING the server asserts. It re-runs the same `verify_artifact` the
+/// server did AND re-derives the content address, rejecting any mismatch — so a
+/// server that substitutes or mutates a post is detected client-side.
+pub fn verify_served_post(
+    post: &wire::Post,
+    whitelist: &Whitelist,
+) -> Result<(), ServedVerifyError> {
+    let artifact = post.artifact.as_ref().ok_or(ServedVerifyError::Missing)?;
+    let derived = verify_artifact(
+        &artifact.signed_payload,
+        &artifact.signer_pubkey,
+        &artifact.signature,
+        whitelist,
+    )
+    .map_err(ServedVerifyError::Verify)?;
+    if derived.as_bytes().as_slice() != post.content_address.as_slice() {
+        return Err(ServedVerifyError::AddressMismatch);
+    }
+    Ok(())
+}
+
+/// Re-verify a server-served MOTD (ISC-A-S3 client half / ISC-26). `whitelist`
+/// must include the server's own key (build it via [`whitelist_from_wire`] with
+/// `server_pubkey = Some(..)`), since a MOTD may be server-signed.
+pub fn verify_served_motd(
+    motd: &wire::SignedArtifact,
+    whitelist: &Whitelist,
+) -> Result<(), ServedVerifyError> {
+    verify_artifact(
+        &motd.signed_payload,
+        &motd.signer_pubkey,
+        &motd.signature,
+        whitelist,
+    )
+    .map(|_| ())
+    .map_err(ServedVerifyError::Verify)
 }
 
 #[cfg(test)]
@@ -160,5 +267,107 @@ mod tests {
         let filtered = filter_shares_by_rating(&shares, Some("PG13"));
         assert_eq!(filtered.len(), 2);
         assert!(filtered.iter().all(|s| s.rating == "PG13"));
+    }
+
+    // ── Client re-verification (ISC-A-S3 client half) ────────────────────
+
+    use daemonseed_core::identity::keys::SignKeypair;
+
+    fn keypair(seed: u8) -> SignKeypair {
+        let _ = oxicrypt_module::initialize();
+        SignKeypair::from_ml_dsa_seed(&[seed; 32]).unwrap()
+    }
+
+    fn wire_full_key(signer: &SignKeypair) -> wire::SignerWhitelistEntry {
+        wire::SignerWhitelistEntry {
+            entry: Some(wire::signer_whitelist_entry::Entry::FullPubkey(
+                signer.public_key().to_vec(),
+            )),
+        }
+    }
+
+    /// A signed Post with a correctly-derived server-asserted content address.
+    fn served_post(signer: &SignKeypair, body: &str) -> wire::Post {
+        let payload = wire::PostPayload {
+            topic: "announcements".to_owned(),
+            body: body.to_owned(),
+            signed_timestamp_ms: 1,
+        };
+        let signed_payload = payload.encode_to_vec();
+        let signature = signer.sign(&signed_payload).unwrap().to_vec();
+        let address = daemonseed_core::public_space::content_address(&signed_payload).unwrap();
+        wire::Post {
+            artifact: Some(wire::SignedArtifact {
+                signed_payload,
+                signer_pubkey: signer.public_key().to_vec(),
+                signature,
+            }),
+            content_address: address.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn whitelist_from_wire_handles_full_key_and_handle() {
+        let signer = keypair(70);
+        let handle_entry = wire::SignerWhitelistEntry {
+            entry: Some(wire::signer_whitelist_entry::Entry::Handle(
+                "relay-bear#aabbccddeeff".to_owned(),
+            )),
+        };
+        let wl = whitelist_from_wire(&[wire_full_key(&signer), handle_entry], None).unwrap();
+        assert!(wl.authorizes(signer.public_key()).unwrap());
+    }
+
+    #[test]
+    fn verify_served_post_accepts_correct_artifact() {
+        let signer = keypair(71);
+        let wl = whitelist_from_wire(&[wire_full_key(&signer)], None).unwrap();
+        let post = served_post(&signer, "hello");
+        assert_eq!(verify_served_post(&post, &wl), Ok(()));
+    }
+
+    #[test]
+    fn verify_served_post_rejects_address_mismatch() {
+        // A server that serves a real post under a lying content address.
+        let signer = keypair(72);
+        let wl = whitelist_from_wire(&[wire_full_key(&signer)], None).unwrap();
+        let mut post = served_post(&signer, "hello");
+        post.content_address = vec![0u8; 48];
+        assert_eq!(
+            verify_served_post(&post, &wl),
+            Err(ServedVerifyError::AddressMismatch)
+        );
+    }
+
+    #[test]
+    fn verify_served_post_rejects_unknown_signer() {
+        let signer = keypair(73);
+        let stranger = keypair(74);
+        let wl = whitelist_from_wire(&[wire_full_key(&stranger)], None).unwrap();
+        let post = served_post(&signer, "forged-by-relay");
+        assert_eq!(
+            verify_served_post(&post, &wl),
+            Err(ServedVerifyError::Verify(ArtifactError::UnknownSigner))
+        );
+    }
+
+    #[test]
+    fn verify_served_motd_accepts_server_signed() {
+        // MOTD signed by the server key, which is NOT an operator whitelist
+        // entry — the client adds it via server_pubkey (ISC-26).
+        let server = keypair(75);
+        let wl = whitelist_from_wire(&[], Some(server.public_key())).unwrap();
+        let payload = wire::MotdPayload {
+            text: "welcome".to_owned(),
+            signed_timestamp_ms: 1,
+        };
+        let signed_payload = payload.encode_to_vec();
+        let signature = server.sign(&signed_payload).unwrap().to_vec();
+        let motd = wire::SignedArtifact {
+            signed_payload,
+            signer_pubkey: server.public_key().to_vec(),
+            signature,
+        };
+        assert_eq!(verify_served_motd(&motd, &wl), Ok(()));
     }
 }

@@ -236,13 +236,16 @@ impl PublicSpaceState {
             None => Vec::new(),
         };
 
-        let post_whitelist = Whitelist::from_entries(operator_entries.clone());
+        // Published wire entries + the MOTD whitelist (operator + server key,
+        // ISC-26) are derived first (borrow / clone-once); the post whitelist
+        // takes ownership of `operator_entries` last.
+        let published_entries = operator_entries.iter().map(entry_to_wire).collect();
 
         let mut motd_entries = operator_entries.clone();
         motd_entries.push(WhitelistEntry::FullKey(Box::new(*server_pubkey)));
         let motd_whitelist = Whitelist::from_entries(motd_entries);
 
-        let published_entries = operator_entries.iter().map(entry_to_wire).collect();
+        let post_whitelist = Whitelist::from_entries(operator_entries);
 
         let posts = match cfg.posts_dir {
             Some(dir) => load_posts(dir, &post_whitelist)?,
@@ -352,9 +355,12 @@ impl PublicSpaceState {
             return Err(UploadError::BadTopic);
         }
 
-        // Persist the signed bytes verbatim (D-M6-7), then hold in RAM. The
-        // posts dir is the server's ONLY runtime write surface (ISC-34); it is
-        // created group-writable so authorized signers share it (ISC-35).
+        // Persist the artifact. The inner `signed_payload` — the bytes the
+        // signature and content-address cover (D-M6-7) — is preserved verbatim
+        // (it rides as an opaque `bytes` field through the prost re-encode);
+        // reload re-verifies it. The posts dir is the server's ONLY runtime
+        // write surface (ISC-34), created group-writable so authorized signers
+        // share it (ISC-35).
         ensure_posts_dir(posts_dir).map_err(UploadError::Io)?;
         std::fs::write(posts_dir.join(hex::encode(addr)), artifact.encode_to_vec())
             .map_err(UploadError::Io)?;

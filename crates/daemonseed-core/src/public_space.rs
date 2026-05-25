@@ -132,6 +132,24 @@ impl fmt::Display for WhitelistParseError {
 
 impl std::error::Error for WhitelistParseError {}
 
+impl WhitelistEntry {
+    /// Build a `FullKey` entry from raw ML-DSA-87 public-key bytes — e.g. a
+    /// wire `SignerWhitelistEntry::FullPubkey` a client fetched via
+    /// `GetSignerWhitelist`. Errors on the wrong length.
+    pub fn from_full_key_bytes(bytes: &[u8]) -> Result<Self, WhitelistParseError> {
+        let key: Box<[u8; ml_dsa::PK_LEN]> =
+            bytes
+                .to_vec()
+                .into_boxed_slice()
+                .try_into()
+                .map_err(|v: Box<[u8]>| WhitelistParseError::WrongPubkeyLength {
+                    found: v.len(),
+                    expected: ml_dsa::PK_LEN,
+                })?;
+        Ok(WhitelistEntry::FullKey(key))
+    }
+}
+
 impl FromStr for WhitelistEntry {
     type Err = WhitelistParseError;
 
@@ -144,15 +162,7 @@ impl FromStr for WhitelistEntry {
         }
 
         let bytes = hex::decode(s).map_err(|_| WhitelistParseError::InvalidPubkeyHex)?;
-        if bytes.len() != ml_dsa::PK_LEN {
-            return Err(WhitelistParseError::WrongPubkeyLength {
-                found: bytes.len(),
-                expected: ml_dsa::PK_LEN,
-            });
-        }
-        let mut key = Box::new([0u8; ml_dsa::PK_LEN]);
-        key.copy_from_slice(&bytes);
-        Ok(WhitelistEntry::FullKey(key))
+        Self::from_full_key_bytes(&bytes)
     }
 }
 
