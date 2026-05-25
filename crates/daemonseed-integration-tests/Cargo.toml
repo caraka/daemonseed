@@ -43,3 +43,5 @@ daemonseed-cli = { path = "../daemonseed-cli" }
 oxitls-rustls-provider = { workspace = true, features = ["testing"] }
 prost = { workspace = true }
 tempfile = { workspace = true }
+# M6 — content-address hex for post-file names in the public-space coverage test.
+hex = { workspace = true }

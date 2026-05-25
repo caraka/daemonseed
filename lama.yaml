@@ -12,7 +12,7 @@ lama: "0.1"
 
 project:
   name: daemonseed
-  version: "0.7.0-pre"
+  version: "0.8.0-pre"
   description: >-
     Federated end-to-end-encrypted communication and file-sharing
     protocol. Pure-Rust backend, CNSA 2.0 baseline crypto via the
@@ -28,8 +28,8 @@ project:
   phase: private
 
 # ─────────────────────────────────────────────────────────────────────
-# Implementation status: v0.6.0 (M4b closed); v0.7.0-pre cuts at M5 close
-# ISC coverage 55/93 (59.1% of MVP).
+# Implementation status: v0.7.0 (M5 closed); v0.8.0-pre cuts at M6 close
+# ISC coverage 67/93 (72.0% of MVP).
 # ─────────────────────────────────────────────────────────────────────
 
 milestones_complete:
@@ -52,12 +52,13 @@ milestones_complete:
     tag: v0.6.0
     summary: "Post-HELLO identity-proof: mutual ML-DSA-87 envelopes bound to the TLS exporter channel binding, ±5min freshness + per-key replay counters, Versioned → Authenticated type-state gate, uniform close on failure. Closes spec-ISCs S19, A-S14, A-C18, A-S12, A-S1."
   - id: M5
-    tag: "v0.7.0-pre (v0.7.0 cuts on merge)"
+    tag: v0.7.0
     summary: "Federation: per-server trusted/untrusted trust slider with TOFU pinning + rotation notices (C22), introducer responses that never carry public keys (S6), server-to-server peering reusing the same slider (S12) with introduce-to-clients suppression (S13) and active-attacker-resistant don't-introduce (A-S7), reference-client connection cap (A-C10). Closes 7 of its 8 ISCs (A-S4b forward-referenced to M6)."
+  - id: M6
+    tag: "v0.8.0-pre (v0.8.0 cuts on merge)"
+    summary: "Public space: the first post-Authenticated application service (PublicSpace gRPC over the authenticated stream). Verify-and-serve signed announcement posts (S7) + MOTD (S9) against an operator signer whitelist (S8) with a non-removable project-release entry (F17); operator rating taxonomy published, never enforced (S10/A-S5b); public-share listing surface defined (S4/F25); client rating selection + filter plumbing (C19/A-C5); AGPL-§13 source URL advertised in the handshake ack (ISC-9); filesystem isolation — server writes only the group-writable posts dir, never operator config (A-S8). Closes 12 ISCs (55→67)."
 
 milestones_planned:
-  - id: M6
-    summary: "Public space: posts, MOTD, taxonomy, ratings, federation-side isolation."
   - id: M7
     summary: "Suite deprecation policy + trust-event taxonomy."
   - id: M8
