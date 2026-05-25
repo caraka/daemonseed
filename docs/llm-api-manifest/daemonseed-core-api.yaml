@@ -474,6 +474,35 @@ modules:
       - { sig: "Metadata::min_suite_id(&self) -> SuiteId" }
       - { sig: "Metadata::accepts(&self, suite: SuiteId) -> bool", note: "ISC-A-C8 render-time gate. True iff (a) suite resolves in registry, (b) same-family with floor, (c) numerically at or above floor. Cross-family is a new-circle event, not acceptance." }
 
+  - path: daemonseed_core::public_space
+    purpose: >-
+      Signed-artifact model for the public-space service (M6), shared
+      byte-for-byte by the server (verify-and-serve, ISC-A-S3) and every
+      client (independent re-verification of what the server served). One
+      implementation of "is this artifact trustworthy" — content-address
+      derivation, signer-whitelist authorization, ML-DSA-87 signature
+      verification — so the server can never serve content a client would
+      reject. Proto-agnostic: operates on &[u8] payloads / keys / signatures
+      (no daemonseed-proto dependency), so the wire crate adapts its types
+      into these calls.
+    iscs: [S7, S8, A-S3]
+    added_in: "v0.8.0 (M6)"
+    public:
+      - { kind: const, name: CONTENT_ADDRESS_LEN, value: 48, note: "SHA-384 content-address length in bytes." }
+      - { kind: struct, name: ContentAddress, note: "SHA-384(signed_payload) (ISC-17). Derived, never trusted off the wire (ISC-A-S3). Display/Debug are lowercase hex; as_bytes() -> &[u8;48]." }
+      - { kind: enum, name: WhitelistEntry, variants: "{FullKey(Box<[u8; PK_LEN]>), Handle(Handle)}", note: "Operator signer-whitelist entry (ISC-S8). FromStr parses one line: a `#` => handle form (ISC-11), else hex full key (ISC-10). Debug redacts the key bytes." }
+      - { kind: enum, name: WhitelistParseError, variants: "{Handle(HandleParseError), InvalidPubkeyHex, WrongPubkeyLength{found,expected}}", note: "A malformed line is a hard error — never silently dropped, so an operator typo cannot quietly de-authorize a signer." }
+      - { kind: struct, name: Whitelist, note: "Operator entries plus the always-present, file-non-removable project-release entry (F17). authorizes() is the cheap gate before any signature work." }
+      - { kind: enum, name: ArtifactError, variants: "{UnknownSigner, BadSignature, Module(oxicrypt_module::Error)}", note: "verify_artifact failure modes. The server maps UnknownSigner + BadSignature to one opaque gRPC reject (no which-check oracle)." }
+    key_functions:
+      - { sig: "content_address(signed_payload: &[u8]) -> Result<ContentAddress, oxicrypt_module::Error>", note: "SHA-384(signed_payload) (ISC-17). Requires oxicrypt module operational." }
+      - { sig: "project_release_pubkey() -> &'static [u8; PK_LEN]", note: "F17 project-release signer key (ISC-15). DEV PLACEHOLDER derived once from an in-source seed during the private phase; replaced by a baked-in real release pubkey (secret offline) before public launch. Always authorized; operators cannot remove it." }
+      - { sig: "WhitelistEntry::from_str(s: &str) -> Result<WhitelistEntry, WhitelistParseError>", note: "Parse one whitelist-file line (ISC-10 / ISC-11)." }
+      - { sig: "Whitelist::from_entries(entries: Vec<WhitelistEntry>) -> Whitelist", note: "Build from parsed operator entries; F17 is checked unconditionally by authorizes(), not stored in entries()." }
+      - { sig: "Whitelist::entries(&self) -> &[WhitelistEntry]", note: "Operator entries, for publishing to clients via GetSignerWhitelist (ISC-S8 / ISC-6)." }
+      - { sig: "Whitelist::authorizes(&self, pubkey: &[u8]) -> Result<bool, oxicrypt_module::Error>", note: "ISC-12 gate: project-release always authorized; FullKey by exact bytes; Handle by SHA-384 hash-prefix match computed without touching the signature." }
+      - { sig: "verify_artifact(signed_payload: &[u8], signer_pubkey: &[u8], signature: &[u8], whitelist: &Whitelist) -> Result<ContentAddress, ArtifactError>", note: "ISC-A-S3 pipeline, in order (ISC-12): authorize -> ML-DSA-87 verify over the exact signed bytes (D-M6-7) -> SHA-384 content-address. The single shared server+client trust decision." }
+
 # ─────────────────────────────────────────────────────────────────────
 # Common gotchas across modules
 # ─────────────────────────────────────────────────────────────────────

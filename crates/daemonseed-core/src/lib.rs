@@ -5,7 +5,10 @@
 //! format, BIP-39 mnemonic, HKDF-derived ML-DSA-87 / ML-KEM-1024 keypairs,
 //! at-rest blob storage. M4a adds the wire-protocol negotiation policy
 //! ([`version`]) and the type-state [`connection::Connection`] machine
-//! that gates pre-auth traffic at compile time per ISC-C23.
+//! that gates pre-auth traffic at compile time per ISC-C23. M6 adds
+//! [`public_space`] — the signed-artifact model (content-address,
+//! signer whitelist, ML-DSA-87 verification) the server and clients share
+//! for the post-Authenticated public-space service.
 
 #![forbid(unsafe_code)]
 
@@ -21,5 +24,6 @@ pub mod identity_proof;
 pub mod kdf;
 pub mod passphrase;
 pub mod profile;
+pub mod public_space;
 pub mod storage;
 pub mod version;
