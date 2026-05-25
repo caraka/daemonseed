@@ -38,6 +38,13 @@ rustls-pki-types = { workspace = true }
 daemonseed-proto = { path = "../daemonseed-proto" }
 prost = { workspace = true }
 
+# tonic runtime — serves the post-Authenticated PublicSpace application service
+# (M6, the first application-stream service) as gRPC-over-h2 over the single
+# already-established TLS connection. tokio-stream wraps that one connection as
+# a one-element incoming stream for `Server::serve_with_incoming`.
+tonic = { workspace = true }
+tokio-stream = { workspace = true }
+
 # Runtime — `signal` / `time` / `rt-multi-thread` / `sync` augment the
 # workspace base (`rt`, `macros`, `io-util`, `net`). Cargo unions feature sets
 # across the workspace + per-crate declarations.
@@ -66,3 +73,9 @@ hex = { workspace = true }
 # integration tests use this rather than the heavyweight production-KATS init.
 oxitls-rustls-provider = { workspace = true, features = ["testing"] }
 tempfile = { workspace = true }
+# Test-only: in-memory tonic round-trip for the public-space handoff. TokioIo
+# bridges a tokio duplex half into hyper 1.0's IO traits for the client
+# connector; tower::service_fn builds the one-shot connector. Pinned to the
+# version tonic 0.12.3 already pulls.
+hyper-util = "=0.1.20"
+tower = { workspace = true }

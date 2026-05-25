@@ -221,3 +221,980 @@ impl Role {
         }
     }
 }
+/// A detached ML-DSA-87 signature over an opaque inner payload, plus the
+/// signer's full public key. Used for announcement posts (ISC-S7), post-delete
+/// requests, and the MOTD (ISC-S9). The enclosed `signed_payload` is the
+/// canonical prost encoding of the corresponding `*Payload` message; the
+/// signature is computed over exactly those bytes, and the post/MOTD content-
+/// address is `SHA-384(signed_payload)`.
+///
+/// `signer_pubkey` is the FULL key even when the whitelist entry is a
+/// `<name>#<hash>` handle: the server verifies the key against the handle's
+/// hash-prefix BEFORE verifying the signature (ISC-S8 / ISC-C4 hash semantics).
+///
+/// CONTRACT — `signed_payload` bytes are authoritative (decided 2026-05-25).
+/// The ML-DSA-87 signature and the SHA-384 content-address both cover
+/// `signed_payload` VERBATIM. protobuf is not canonical across
+/// implementations, so the signer's exact serialized bytes ARE the artifact:
+/// every party (server and clients) stores and forwards `signed_payload`
+/// byte-for-byte and MUST NOT re-encode the inner payload. Re-encoding would
+/// change the content-address and invalidate the signature. Decode for display
+/// only; never round-trip-then-rehash.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SignedArtifact {
+    /// Canonical prost encoding of the inner payload (PostPayload,
+    /// PostDeletePayload, or MotdPayload). Opaque at this layer.
+    #[prost(bytes = "vec", tag = "1")]
+    pub signed_payload: ::prost::alloc::vec::Vec<u8>,
+    /// Full ML-DSA-87 public key of the signer. Verified against the current
+    /// signer whitelist (ISC-S8) before the signature is checked.
+    #[prost(bytes = "vec", tag = "2")]
+    pub signer_pubkey: ::prost::alloc::vec::Vec<u8>,
+    /// ML-DSA-87 signature over `signed_payload`.
+    #[prost(bytes = "vec", tag = "3")]
+    pub signature: ::prost::alloc::vec::Vec<u8>,
+}
+/// Inner signed payload of an announcement post. Signed bytes = prost encoding
+/// of this message; the enclosing SignedArtifact carries the signature.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PostPayload {
+    /// Operator-defined topic id (ISC-S7). The topic SET is operator-only server
+    /// config; signers may post into existing topics but cannot create/modify the
+    /// topic set itself.
+    #[prost(string, tag = "1")]
+    pub topic: ::prost::alloc::string::String,
+    /// Post body. Rendering policy is a client concern.
+    #[prost(string, tag = "2")]
+    pub body: ::prost::alloc::string::String,
+    /// Signer's wall-clock milliseconds. Orders posts within a topic (ISC-S7).
+    #[prost(int64, tag = "3")]
+    pub signed_timestamp_ms: i64,
+}
+/// Inner signed payload of a post deletion. A signer may delete only their own
+/// previously-signed post, matched by content-address (ISC-S7).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PostDeletePayload {
+    /// SHA-384(signed_payload) of the post being deleted.
+    #[prost(bytes = "vec", tag = "1")]
+    pub content_address: ::prost::alloc::vec::Vec<u8>,
+    /// Signer's wall-clock milliseconds (freshness; not for ordering).
+    #[prost(int64, tag = "2")]
+    pub signed_timestamp_ms: i64,
+}
+/// A stored post as served to clients: the signer's artifact plus the server-
+/// computed content-address. The client MUST re-derive SHA-384(artifact.
+/// signed_payload) and reject mismatches — the server is untrusted to assert
+/// the address (ISC-A-S3: verify-and-serve, never originate).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Post {
+    #[prost(message, optional, tag = "1")]
+    pub artifact: ::core::option::Option<SignedArtifact>,
+    /// SHA-384(artifact.signed_payload). Server-asserted; client re-verifies.
+    #[prost(bytes = "vec", tag = "2")]
+    pub content_address: ::prost::alloc::vec::Vec<u8>,
+}
+/// Inner signed payload of the message-of-the-day. Plaintext only — the client
+/// renders `text` with no markdown, HTML, or link parsing (anti-injection,
+/// ISC-S9). Single-slot: the latest validated MOTD replaces the previous one.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MotdPayload {
+    /// Plaintext MOTD. Client renders verbatim, no markup interpretation.
+    #[prost(string, tag = "1")]
+    pub text: ::prost::alloc::string::String,
+    /// Signer's wall-clock milliseconds. Latest validated update wins.
+    #[prost(int64, tag = "2")]
+    pub signed_timestamp_ms: i64,
+}
+/// One published signer-whitelist entry. The whitelist is published so clients
+/// can independently verify post/MOTD provenance against the same list the
+/// server uses. An entry is EITHER a full public key (verbose, self-contained)
+/// OR a `<name>#<hash-prefix>` handle (compact; the full key arrives with each
+/// signed artifact and is verified against the hash before signature check).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SignerWhitelistEntry {
+    #[prost(oneof = "signer_whitelist_entry::Entry", tags = "1, 2")]
+    pub entry: ::core::option::Option<signer_whitelist_entry::Entry>,
+}
+/// Nested message and enum types in `SignerWhitelistEntry`.
+pub mod signer_whitelist_entry {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Entry {
+        /// Full ML-DSA-87 public key.
+        #[prost(bytes, tag = "1")]
+        FullPubkey(::prost::alloc::vec::Vec<u8>),
+        /// `<name>#<hash-prefix>` handle form (ISC-C4 / ISC-S11 hash semantics).
+        #[prost(string, tag = "2")]
+        Handle(::prost::alloc::string::String),
+    }
+}
+/// Operator-defined content-rating labels. Purely declarative: the server
+/// publishes the taxonomy and propagates sharer-assigned tags but never
+/// enforces, filters, or moderates by rating (ISC-A-S5b). Clients consume this
+/// to render rating filters (ISC-C19 / ISC-A-C5).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RatingTaxonomy {
+    /// Operator-chosen labels in operator-chosen order (e.g. \["PG13","R","X"\]).
+    #[prost(string, repeated, tag = "1")]
+    pub labels: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// A single public-space share as it appears in the listing. The rating tag is
+/// the SHARER's self-classification drawn from the active taxonomy (ISC-C19);
+/// it is advisory, not server-verified (ISC-A-S5b). The server returns the full
+/// listing; rating filtering is entirely client-side, at render AND fetch time
+/// (ISC-A-C5). M6 defines this surface (F25); the share CONTENT/transfer path
+/// lands at M8.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PublicShareListing {
+    /// Opaque server-scoped identifier for the share.
+    #[prost(string, tag = "1")]
+    pub share_id: ::prost::alloc::string::String,
+    /// Display name of the shared folder.
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+    /// Sharer-assigned rating label from the active taxonomy. Advisory only.
+    #[prost(string, tag = "3")]
+    pub rating: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct GetMotdRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetMotdResponse {
+    /// The current signed MOTD. Absent (proto3 message nullability) when no MOTD
+    /// is set or the file is empty/missing (ISC-S9: hide the MOTD area).
+    #[prost(message, optional, tag = "1")]
+    pub motd: ::core::option::Option<SignedArtifact>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListPostsRequest {
+    /// Optional topic filter. Unset = all topics.
+    #[prost(string, optional, tag = "1")]
+    pub topic: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListPostsResponse {
+    /// Posts ordered by `signed_timestamp_ms` within each topic (ISC-S7).
+    #[prost(message, repeated, tag = "1")]
+    pub posts: ::prost::alloc::vec::Vec<Post>,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct GetTaxonomyRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetTaxonomyResponse {
+    #[prost(message, optional, tag = "1")]
+    pub taxonomy: ::core::option::Option<RatingTaxonomy>,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct GetSignerWhitelistRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetSignerWhitelistResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub entries: ::prost::alloc::vec::Vec<SignerWhitelistEntry>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UploadPostRequest {
+    /// Signed PostPayload (signature in the envelope).
+    #[prost(message, optional, tag = "1")]
+    pub artifact: ::core::option::Option<SignedArtifact>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UploadPostResponse {
+    /// SHA-384(artifact.signed_payload) under which the server stored the post.
+    #[prost(bytes = "vec", tag = "1")]
+    pub content_address: ::prost::alloc::vec::Vec<u8>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DeletePostRequest {
+    /// Signed PostDeletePayload (signature in the envelope).
+    #[prost(message, optional, tag = "1")]
+    pub delete_artifact: ::core::option::Option<SignedArtifact>,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct DeletePostResponse {}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct ListPublicSharesRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListPublicSharesResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub shares: ::prost::alloc::vec::Vec<PublicShareListing>,
+}
+/// Generated client implementations.
+pub mod public_space_client {
+    #![allow(
+        unused_variables,
+        dead_code,
+        missing_docs,
+        clippy::wildcard_imports,
+        clippy::let_unit_value,
+    )]
+    use tonic::codegen::*;
+    use tonic::codegen::http::Uri;
+    /// The public-space application service, served over the post-Authenticated
+    /// TLS stream. All RPCs are unary (snapshot reads + signed writes); the
+    /// streaming CoT subscription surface is a separate M8 service, not this one.
+    #[derive(Debug, Clone)]
+    pub struct PublicSpaceClient<T> {
+        inner: tonic::client::Grpc<T>,
+    }
+    impl<T> PublicSpaceClient<T>
+    where
+        T: tonic::client::GrpcService<tonic::body::BoxBody>,
+        T::Error: Into<StdError>,
+        T::ResponseBody: Body<Data = Bytes> + std::marker::Send + 'static,
+        <T::ResponseBody as Body>::Error: Into<StdError> + std::marker::Send,
+    {
+        pub fn new(inner: T) -> Self {
+            let inner = tonic::client::Grpc::new(inner);
+            Self { inner }
+        }
+        pub fn with_origin(inner: T, origin: Uri) -> Self {
+            let inner = tonic::client::Grpc::with_origin(inner, origin);
+            Self { inner }
+        }
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> PublicSpaceClient<InterceptedService<T, F>>
+        where
+            F: tonic::service::Interceptor,
+            T::ResponseBody: Default,
+            T: tonic::codegen::Service<
+                http::Request<tonic::body::BoxBody>,
+                Response = http::Response<
+                    <T as tonic::client::GrpcService<tonic::body::BoxBody>>::ResponseBody,
+                >,
+            >,
+            <T as tonic::codegen::Service<
+                http::Request<tonic::body::BoxBody>,
+            >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
+        {
+            PublicSpaceClient::new(InterceptedService::new(inner, interceptor))
+        }
+        /// Compress requests with the given encoding.
+        ///
+        /// This requires the server to support it otherwise it might respond with an
+        /// error.
+        #[must_use]
+        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.inner = self.inner.send_compressed(encoding);
+            self
+        }
+        /// Enable decompressing responses.
+        #[must_use]
+        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.inner = self.inner.accept_compressed(encoding);
+            self
+        }
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.inner = self.inner.max_decoding_message_size(limit);
+            self
+        }
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.inner = self.inner.max_encoding_message_size(limit);
+            self
+        }
+        /// Fetch the current MOTD, or empty if none is set (ISC-S9).
+        pub async fn get_motd(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetMotdRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetMotdResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/daemonseed.v1.PublicSpace/GetMotd",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("daemonseed.v1.PublicSpace", "GetMotd"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// List announcement posts, ordered by signed timestamp within each topic
+        /// (ISC-S7). An unset topic filter returns posts across all topics.
+        pub async fn list_posts(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ListPostsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListPostsResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/daemonseed.v1.PublicSpace/ListPosts",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("daemonseed.v1.PublicSpace", "ListPosts"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Fetch the operator-defined rating taxonomy (ISC-S10).
+        pub async fn get_taxonomy(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetTaxonomyRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetTaxonomyResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/daemonseed.v1.PublicSpace/GetTaxonomy",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("daemonseed.v1.PublicSpace", "GetTaxonomy"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Fetch the published signer whitelist so the client can independently
+        /// verify provenance (ISC-S8).
+        pub async fn get_signer_whitelist(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetSignerWhitelistRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetSignerWhitelistResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/daemonseed.v1.PublicSpace/GetSignerWhitelist",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("daemonseed.v1.PublicSpace", "GetSignerWhitelist"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// Upload a signed announcement post. The server verifies the signature
+        /// against the current whitelist and stores the post; it never originates or
+        /// mutates post content (ISC-A-S3). Rejects (gRPC status) on an unknown
+        /// signer or bad signature.
+        pub async fn upload_post(
+            &mut self,
+            request: impl tonic::IntoRequest<super::UploadPostRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::UploadPostResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/daemonseed.v1.PublicSpace/UploadPost",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("daemonseed.v1.PublicSpace", "UploadPost"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Delete a post the caller previously signed, matched by content-address
+        /// (ISC-S7). Verified against the current whitelist.
+        pub async fn delete_post(
+            &mut self,
+            request: impl tonic::IntoRequest<super::DeletePostRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::DeletePostResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/daemonseed.v1.PublicSpace/DeletePost",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("daemonseed.v1.PublicSpace", "DeletePost"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// List public-space shares with their advisory rating tags (ISC-C19 / F25).
+        /// The server returns the complete listing; the client filters by rating
+        /// locally (ISC-A-C5). Share content transfer is M8.
+        pub async fn list_public_shares(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ListPublicSharesRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListPublicSharesResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/daemonseed.v1.PublicSpace/ListPublicShares",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("daemonseed.v1.PublicSpace", "ListPublicShares"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+    }
+}
+/// Generated server implementations.
+pub mod public_space_server {
+    #![allow(
+        unused_variables,
+        dead_code,
+        missing_docs,
+        clippy::wildcard_imports,
+        clippy::let_unit_value,
+    )]
+    use tonic::codegen::*;
+    /// Generated trait containing gRPC methods that should be implemented for use with PublicSpaceServer.
+    #[async_trait]
+    pub trait PublicSpace: std::marker::Send + std::marker::Sync + 'static {
+        /// Fetch the current MOTD, or empty if none is set (ISC-S9).
+        async fn get_motd(
+            &self,
+            request: tonic::Request<super::GetMotdRequest>,
+        ) -> std::result::Result<tonic::Response<super::GetMotdResponse>, tonic::Status>;
+        /// List announcement posts, ordered by signed timestamp within each topic
+        /// (ISC-S7). An unset topic filter returns posts across all topics.
+        async fn list_posts(
+            &self,
+            request: tonic::Request<super::ListPostsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListPostsResponse>,
+            tonic::Status,
+        >;
+        /// Fetch the operator-defined rating taxonomy (ISC-S10).
+        async fn get_taxonomy(
+            &self,
+            request: tonic::Request<super::GetTaxonomyRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetTaxonomyResponse>,
+            tonic::Status,
+        >;
+        /// Fetch the published signer whitelist so the client can independently
+        /// verify provenance (ISC-S8).
+        async fn get_signer_whitelist(
+            &self,
+            request: tonic::Request<super::GetSignerWhitelistRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetSignerWhitelistResponse>,
+            tonic::Status,
+        >;
+        /// Upload a signed announcement post. The server verifies the signature
+        /// against the current whitelist and stores the post; it never originates or
+        /// mutates post content (ISC-A-S3). Rejects (gRPC status) on an unknown
+        /// signer or bad signature.
+        async fn upload_post(
+            &self,
+            request: tonic::Request<super::UploadPostRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::UploadPostResponse>,
+            tonic::Status,
+        >;
+        /// Delete a post the caller previously signed, matched by content-address
+        /// (ISC-S7). Verified against the current whitelist.
+        async fn delete_post(
+            &self,
+            request: tonic::Request<super::DeletePostRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::DeletePostResponse>,
+            tonic::Status,
+        >;
+        /// List public-space shares with their advisory rating tags (ISC-C19 / F25).
+        /// The server returns the complete listing; the client filters by rating
+        /// locally (ISC-A-C5). Share content transfer is M8.
+        async fn list_public_shares(
+            &self,
+            request: tonic::Request<super::ListPublicSharesRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListPublicSharesResponse>,
+            tonic::Status,
+        >;
+    }
+    /// The public-space application service, served over the post-Authenticated
+    /// TLS stream. All RPCs are unary (snapshot reads + signed writes); the
+    /// streaming CoT subscription surface is a separate M8 service, not this one.
+    #[derive(Debug)]
+    pub struct PublicSpaceServer<T> {
+        inner: Arc<T>,
+        accept_compression_encodings: EnabledCompressionEncodings,
+        send_compression_encodings: EnabledCompressionEncodings,
+        max_decoding_message_size: Option<usize>,
+        max_encoding_message_size: Option<usize>,
+    }
+    impl<T> PublicSpaceServer<T> {
+        pub fn new(inner: T) -> Self {
+            Self::from_arc(Arc::new(inner))
+        }
+        pub fn from_arc(inner: Arc<T>) -> Self {
+            Self {
+                inner,
+                accept_compression_encodings: Default::default(),
+                send_compression_encodings: Default::default(),
+                max_decoding_message_size: None,
+                max_encoding_message_size: None,
+            }
+        }
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> InterceptedService<Self, F>
+        where
+            F: tonic::service::Interceptor,
+        {
+            InterceptedService::new(Self::new(inner), interceptor)
+        }
+        /// Enable decompressing requests with the given encoding.
+        #[must_use]
+        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.accept_compression_encodings.enable(encoding);
+            self
+        }
+        /// Compress responses with the given encoding, if the client supports it.
+        #[must_use]
+        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.send_compression_encodings.enable(encoding);
+            self
+        }
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.max_decoding_message_size = Some(limit);
+            self
+        }
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.max_encoding_message_size = Some(limit);
+            self
+        }
+    }
+    impl<T, B> tonic::codegen::Service<http::Request<B>> for PublicSpaceServer<T>
+    where
+        T: PublicSpace,
+        B: Body + std::marker::Send + 'static,
+        B::Error: Into<StdError> + std::marker::Send + 'static,
+    {
+        type Response = http::Response<tonic::body::BoxBody>;
+        type Error = std::convert::Infallible;
+        type Future = BoxFuture<Self::Response, Self::Error>;
+        fn poll_ready(
+            &mut self,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn call(&mut self, req: http::Request<B>) -> Self::Future {
+            match req.uri().path() {
+                "/daemonseed.v1.PublicSpace/GetMotd" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetMotdSvc<T: PublicSpace>(pub Arc<T>);
+                    impl<
+                        T: PublicSpace,
+                    > tonic::server::UnaryService<super::GetMotdRequest>
+                    for GetMotdSvc<T> {
+                        type Response = super::GetMotdResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetMotdRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as PublicSpace>::get_motd(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetMotdSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/daemonseed.v1.PublicSpace/ListPosts" => {
+                    #[allow(non_camel_case_types)]
+                    struct ListPostsSvc<T: PublicSpace>(pub Arc<T>);
+                    impl<
+                        T: PublicSpace,
+                    > tonic::server::UnaryService<super::ListPostsRequest>
+                    for ListPostsSvc<T> {
+                        type Response = super::ListPostsResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ListPostsRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as PublicSpace>::list_posts(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ListPostsSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/daemonseed.v1.PublicSpace/GetTaxonomy" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetTaxonomySvc<T: PublicSpace>(pub Arc<T>);
+                    impl<
+                        T: PublicSpace,
+                    > tonic::server::UnaryService<super::GetTaxonomyRequest>
+                    for GetTaxonomySvc<T> {
+                        type Response = super::GetTaxonomyResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetTaxonomyRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as PublicSpace>::get_taxonomy(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetTaxonomySvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/daemonseed.v1.PublicSpace/GetSignerWhitelist" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetSignerWhitelistSvc<T: PublicSpace>(pub Arc<T>);
+                    impl<
+                        T: PublicSpace,
+                    > tonic::server::UnaryService<super::GetSignerWhitelistRequest>
+                    for GetSignerWhitelistSvc<T> {
+                        type Response = super::GetSignerWhitelistResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetSignerWhitelistRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as PublicSpace>::get_signer_whitelist(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetSignerWhitelistSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/daemonseed.v1.PublicSpace/UploadPost" => {
+                    #[allow(non_camel_case_types)]
+                    struct UploadPostSvc<T: PublicSpace>(pub Arc<T>);
+                    impl<
+                        T: PublicSpace,
+                    > tonic::server::UnaryService<super::UploadPostRequest>
+                    for UploadPostSvc<T> {
+                        type Response = super::UploadPostResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::UploadPostRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as PublicSpace>::upload_post(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = UploadPostSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/daemonseed.v1.PublicSpace/DeletePost" => {
+                    #[allow(non_camel_case_types)]
+                    struct DeletePostSvc<T: PublicSpace>(pub Arc<T>);
+                    impl<
+                        T: PublicSpace,
+                    > tonic::server::UnaryService<super::DeletePostRequest>
+                    for DeletePostSvc<T> {
+                        type Response = super::DeletePostResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::DeletePostRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as PublicSpace>::delete_post(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DeletePostSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/daemonseed.v1.PublicSpace/ListPublicShares" => {
+                    #[allow(non_camel_case_types)]
+                    struct ListPublicSharesSvc<T: PublicSpace>(pub Arc<T>);
+                    impl<
+                        T: PublicSpace,
+                    > tonic::server::UnaryService<super::ListPublicSharesRequest>
+                    for ListPublicSharesSvc<T> {
+                        type Response = super::ListPublicSharesResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ListPublicSharesRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as PublicSpace>::list_public_shares(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ListPublicSharesSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                _ => {
+                    Box::pin(async move {
+                        let mut response = http::Response::new(empty_body());
+                        let headers = response.headers_mut();
+                        headers
+                            .insert(
+                                tonic::Status::GRPC_STATUS,
+                                (tonic::Code::Unimplemented as i32).into(),
+                            );
+                        headers
+                            .insert(
+                                http::header::CONTENT_TYPE,
+                                tonic::metadata::GRPC_CONTENT_TYPE,
+                            );
+                        Ok(response)
+                    })
+                }
+            }
+        }
+    }
+    impl<T> Clone for PublicSpaceServer<T> {
+        fn clone(&self) -> Self {
+            let inner = self.inner.clone();
+            Self {
+                inner,
+                accept_compression_encodings: self.accept_compression_encodings,
+                send_compression_encodings: self.send_compression_encodings,
+                max_decoding_message_size: self.max_decoding_message_size,
+                max_encoding_message_size: self.max_encoding_message_size,
+            }
+        }
+    }
+    /// Generated gRPC service name
+    pub const SERVICE_NAME: &str = "daemonseed.v1.PublicSpace";
+    impl<T> tonic::server::NamedService for PublicSpaceServer<T> {
+        const NAME: &'static str = SERVICE_NAME;
+    }
+}

@@ -35,5 +35,6 @@ pub mod hello;
 pub mod identity;
 pub mod identity_proof;
 pub mod kats;
+pub mod public_space;
 pub mod runtime;
 pub mod tls;
