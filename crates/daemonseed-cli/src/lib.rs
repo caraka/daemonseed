@@ -37,4 +37,5 @@
 #![forbid(unsafe_code)]
 
 pub mod connect;
+pub mod identity_proof;
 pub mod tofu_stub;

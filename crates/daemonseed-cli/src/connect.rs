@@ -14,12 +14,15 @@ use std::io;
 use std::sync::Arc;
 
 use daemonseed_core::bootstrap::bundled;
+use daemonseed_core::identity_proof::{ChannelBindingError, derive_channel_binding};
+use daemonseed_core::storage::seeds::CounterState;
 use daemonseed_core::version::{
     DefaultNegotiator, NegotiationError, ProtocolVersion, SUPPORTED, VersionError,
     VersionNegotiator,
 };
 use daemonseed_proto::v1 as wire;
 use daemonseed_server::hello::{HelloError, write_frame};
+use daemonseed_server::identity_proof::now_unix_ms;
 use prost::Message;
 use rustls::version::TLS13;
 use rustls::{ClientConfig, RootCertStore};
@@ -27,18 +30,26 @@ use rustls_pki_types::ServerName;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
+use crate::identity_proof::{ClientIdentity, RustlsClientExporter, run_client_identity_proof};
 use crate::tofu_stub::AcceptAnyServerCert;
 
 /// Default port the M4a server binds (per ISC-S5).
 pub const DEFAULT_PORT: u16 = 443;
 
-/// Outcome of a successful `connect`.
+/// Outcome of a successful `connect`. Reaching this value means the
+/// connection completed the full identity-proof exchange and is
+/// `Authenticated` — there is no "negotiated but unauthenticated" success
+/// (ISC-47).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectOutcome {
     /// The version both sides agreed to use.
     pub version: ProtocolVersion,
     /// The address actually dialled — useful for log lines.
     pub dialled: String,
+    /// The verified server handle (its identity-proof envelope's
+    /// `claimed_handle`, proven self-consistent and equal to the dialed
+    /// server-id).
+    pub server_handle: String,
 }
 
 /// Resolve `<server-id>` to a dial address.
@@ -89,13 +100,24 @@ pub fn build_client_config() -> Result<ClientConfig, rustls::Error> {
     Ok(cfg)
 }
 
-/// Run the end-to-end connect: TCP → TLS → AppHello → AppHelloAck.
+/// Run the end-to-end connect: TCP → TLS → AppHello → AppHelloAck →
+/// identity-proof → `Authenticated`.
+///
+/// `identity` is the client's signing identity (D8: the binary injects an
+/// ephemeral one); `counters` carries the monotonic send counter (ISC-19)
+/// and the per-server highest-seen counter (ISC-34). Returns Ok only after
+/// the connection reaches `Authenticated` (ISC-47).
 ///
 /// Caller-contract: `install_provider()` AND
 /// `oxicrypt_module::initialize_with_profile(.., Cnsa2)` must have
 /// returned `Ok(())` before invoking this. The integration test
 /// harness drives both; the binary's `main()` does the same.
-pub async fn connect(server_id: &str, address: &str) -> Result<ConnectOutcome, ConnectError> {
+pub async fn connect(
+    server_id: &str,
+    address: &str,
+    identity: &ClientIdentity,
+    counters: &mut CounterState,
+) -> Result<ConnectOutcome, ConnectError> {
     let client_cfg = build_client_config().map_err(|e| ConnectError::Rustls(e.to_string()))?;
     let connector = TlsConnector::from(Arc::new(client_cfg));
 
@@ -108,8 +130,8 @@ pub async fn connect(server_id: &str, address: &str) -> Result<ConnectOutcome, C
 
     // SNI: the cert is self-signed so the name doesn't gate verification
     // (AcceptAny bypasses chain), but rustls still requires *some*
-    // valid `ServerName`. Use a constant placeholder string; the M4b
-    // identity-proof path makes the wire-vs-name binding via the
+    // valid `ServerName`. Use a constant placeholder string; the
+    // identity-proof path below makes the wire-vs-name binding via the
     // server-id pubkey-hash anyway.
     let server_name =
         ServerName::try_from("daemonseed.invalid").expect("static placeholder ServerName parses");
@@ -144,9 +166,38 @@ pub async fn connect(server_id: &str, address: &str) -> Result<ConnectOutcome, C
     // the raw bytes as a Reject. To avoid double-reading we capture
     // the bytes once.
     let bytes = read_response_frame(&mut tls).await?;
-    parse_response(&bytes, server_id).map(|v| ConnectOutcome {
-        version: v,
+    let version = parse_response(&bytes, server_id)?;
+
+    // Identity-proof (ISC-S19): derive the channel binding from THIS client
+    // TLS session, then prove identity mutually. The immutable borrow of the
+    // rustls connection ends with this block, before the envelope I/O takes
+    // `&mut tls`.
+    let wire_version = version.to_wire();
+    let channel_binding = {
+        let (_io, conn) = tls.get_ref();
+        derive_channel_binding(&RustlsClientExporter::new(conn), wire_version)
+            .map_err(ConnectError::ChannelBinding)?
+    };
+    let now = now_unix_ms();
+    let verified = run_client_identity_proof(
+        &mut tls,
+        channel_binding,
+        wire_version,
+        identity,
+        now,
+        counters,
+        server_id,
+    )
+    .await
+    // ISC-46 / A-C18: collapse every identity-proof failure cause to one
+    // opaque "refused" outcome — the user is told nothing about which check
+    // failed. The typed cause is dropped here on purpose.
+    .map_err(|_cause| ConnectError::IdentityProofRefused)?;
+
+    Ok(ConnectOutcome {
+        version,
         dialled: address.to_owned(),
+        server_handle: verified.handle().to_owned(),
     })
 }
 
@@ -250,6 +301,15 @@ pub enum ConnectError {
     /// Responder's wire-shape `ProtocolVersion` had a `u32` field
     /// out of `u16` range.
     WireOutOfRange(VersionError),
+    /// Deriving the identity-proof channel binding from the client TLS
+    /// session failed.
+    ChannelBinding(ChannelBindingError),
+    /// The post-HELLO identity-proof exchange failed. Deliberately carries
+    /// no sub-cause: a bad server signature, a stale timestamp, a counter
+    /// replay, a channel-binding mismatch, and a wrong-server-identity all
+    /// collapse to this single opaque outcome (ISC-46 / ISC-A-C18). The
+    /// client fails closed with no partial-trust continuation (ISC-45).
+    IdentityProofRefused,
 }
 
 impl fmt::Display for ConnectError {
@@ -280,6 +340,12 @@ impl fmt::Display for ConnectError {
                 write!(f, "server sent AppHelloReject with unknown code {code}")
             }
             Self::WireOutOfRange(e) => write!(f, "server wire shape out of range: {e}"),
+            Self::ChannelBinding(e) => write!(f, "channel-binding derivation failed: {e}"),
+            Self::IdentityProofRefused => write!(
+                f,
+                "server refused the connection during identity-proof \
+                 (the cause is deliberately not disclosed)"
+            ),
         }
     }
 }
