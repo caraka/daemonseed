@@ -94,6 +94,23 @@ modules:
     key_functions:
       - { sig: "AcceptAnyServerCert::from_installed_provider() -> Arc<Self>" }
 
+  - path: daemonseed_cli::public_space
+    purpose: >-
+      Client-side public-space data plumbing (M6, "plumbing only" per D-M6-1).
+      Transport (opening a PublicSpaceClient over the post-Authenticated
+      connection) is the thin layer the server crate's duplex round-trip test
+      already validates; this module is the transport-independent data handling:
+      render a signed MOTD as inert plaintext, choose a rating from the active
+      server's taxonomy, and the rating-filter predicate.
+    iscs: [C19, "25", "30", "31", "32", A-C5]
+    added_in: "v0.8.0 (M6)"
+    public:
+      - { kind: enum, name: RatingError, variants: "{NotInTaxonomy}", note: "select_rating failure — choice not in the active server's taxonomy." }
+    key_functions:
+      - { sig: "render_motd(motd: &wire::SignedArtifact) -> String", note: "ISC-25: decode the MotdPayload and return its text with terminal control sequences (ESC / other C0-C1, keeping \\n and \\t) stripped, so a signed MOTD can't inject ANSI escapes. No markup/link interpretation." }
+      - { sig: "select_rating(taxonomy: &[String], choice: &str) -> Result<String, RatingError>", note: "ISC-30 / ISC-31: choose a rating only from the active (connected-host) taxonomy; out-of-taxonomy is rejected — the public-space half of active-server scoping." }
+      - { sig: "filter_shares_by_rating<'a>(shares: &'a [wire::PublicShareListing], rating: Option<&str>) -> Vec<&'a wire::PublicShareListing>", note: "ISC-32 / ISC-A-C5: the client's rating filter, applied at render AND fetch time (server never filters, ISC-A-S5b). None = all. Share content is M8." }
+
 binaries:
   - name: daemonseed-cli
     entry_point: "fn main() -> ExitCode"
