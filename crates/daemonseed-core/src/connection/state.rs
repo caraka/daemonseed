@@ -38,10 +38,11 @@ pub enum Versioned {}
 impl ConnState for Versioned {}
 impl private::Sealed for Versioned {}
 
-/// Post-identity-proof state. M4b adds the consuming transition
-/// `Versioned → Authenticated` plus the `AsyncRead` / `AsyncWrite`
-/// surface that exposes application I/O. M4a defines the type so the
-/// machine is shape-complete from day one.
+/// Post-identity-proof state. Reached via the consuming transition
+/// `Connection::<Versioned>::into_authenticated`, which consumes a
+/// [`crate::identity_proof::VerifiedPeer`] token. This is the only
+/// state whose `Connection` impls `AsyncRead` / `AsyncWrite`, so
+/// application traffic can flow only after a passed identity-proof.
 #[derive(Debug)]
 pub enum Authenticated {}
 
