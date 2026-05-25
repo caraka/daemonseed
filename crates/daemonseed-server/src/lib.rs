@@ -7,7 +7,12 @@
 //!
 //! Public module map:
 //!
-//! - [`config`] — TOML config + path resolution (ISC-S3 / ISC-C35)
+//! - [`config`] — TOML config + path resolution (ISC-S3 / ISC-C35),
+//!   including the federation `[[peer]]` table (ISC-S12 / ISC-S13)
+//! - [`federation`] — introducer-response construction with the
+//!   no-keys-in-introducer invariant (ISC-S6), introduce-to-clients
+//!   suppression (ISC-S13), and don't-introduce indistinguishability
+//!   (ISC-A-S7)
 //! - [`identity`] — long-term ML-DSA-87 server keypair + server-id
 //!   construction (ISC-S11)
 //! - [`kats`] — assembled CNSA 2.0 KATS slice for production
@@ -25,6 +30,7 @@
 #![forbid(unsafe_code)]
 
 pub mod config;
+pub mod federation;
 pub mod hello;
 pub mod identity;
 pub mod identity_proof;

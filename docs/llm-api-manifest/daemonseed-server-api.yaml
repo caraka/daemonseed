@@ -34,15 +34,30 @@ modules:
       `--config <path>` (explicit) → XDG_CONFIG_HOME/daemonseed/
       daemonseed.toml → ./daemonseed.toml. NotFound error carries the
       full search list so operators see what was looked at.
-    iscs: [S3, C35]
-    added_in: "M4a commit 3"
+    iscs: [S3, C35, S12, S13]
+    added_in: "M4a commit 3; federation peer table M5"
     public:
-      - { kind: struct, name: ServerConfig, fields: "{listen_addr: String (default 0.0.0.0:443), key_path: PathBuf (required), display_name: Option<String>}", note: "Minimal M4a field set; later milestones extend." }
+      - { kind: struct, name: ServerConfig, fields: "{listen_addr: String (default 0.0.0.0:443), key_path: PathBuf (required), display_name: Option<String>, peers: Vec<PeerConfig> (TOML key `[[peer]]`, default empty)}", note: "Federation peer table added in M5 (ISC-S12)." }
+      - { kind: struct, name: PeerConfig, fields: "{server_id: String, address: String, trust_mode: TrustMode (default trusted), introduce_to_clients: bool (default true), key_hex: Option<String>}", note: "One `[[peer]]`. trust_mode reuses the client slider (ISC-S12/C22); introduce_to_clients=false suppresses introductions (ISC-S13); key_hex pre-loads an untrusted peer's key." }
       - { kind: enum, name: ConfigError, variants: "{NotFound { searched }, Read { path, source }, Parse(toml::de::Error)}" }
     key_functions:
       - { sig: "ServerConfig::from_toml(toml_src: &str) -> Result<Self, ConfigError>" }
       - { sig: "ServerConfig::from_path(path: &Path) -> Result<Self, ConfigError>" }
       - { sig: "resolve_config_path(explicit, xdg_config_home, home, cwd) -> Result<PathBuf, ConfigError>", note: "Pure function with injected env so it's deterministic + testable." }
+
+  - path: daemonseed_server::federation
+    purpose: >-
+      Introducer-response construction (ISC-S6 / ISC-S13 / ISC-A-S7). Turns the
+      operator's `[[peer]]` table into an IntroducerResponse for a client or a
+      peering server (same function for both). Enforces: no public key ever
+      (ISC-S6, structural — PeerTriple has no key field); introduce-to-clients
+      suppression (ISC-S13); and don't-introduce indistinguishability (ISC-A-S7)
+      — a by-id query for a suppressed peer returns the same empty response as
+      for a genuinely-unknown peer.
+    iscs: [S6, S13, A-S7]
+    added_in: "M5"
+    key_functions:
+      - { sig: "introducer_response(peers: &[PeerConfig], query: &IntroducerQuery) -> IntroducerResponse", note: "Empty target → full introduce-to-clients-filtered list; populated target → that one peer if introducible, else empty (A-S7). last_known_availability left unset at MVP (finding F15)." }
 
   - path: daemonseed_server::identity
     purpose: >-

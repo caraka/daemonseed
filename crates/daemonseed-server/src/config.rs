@@ -17,6 +17,7 @@ use core::fmt;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 
+use daemonseed_core::federation::trust::TrustMode;
 use serde::{Deserialize, Serialize};
 
 // ── Config struct ────────────────────────────────────────────────
@@ -45,10 +46,58 @@ pub struct ServerConfig {
     /// Empty / unset surfaces the floor `#<12hex>` form (ISC-C4b).
     #[serde(default)]
     pub display_name: Option<String>,
+
+    /// Federation peers (ISC-S12). Each `[[peer]]` table entry carries the
+    /// peer's server-id, address, trust mode (the same slider as the client's
+    /// ISC-C22), and the `introduce-to-clients` flag (ISC-S13). Empty by
+    /// default — a server federates with no peers until the operator adds them.
+    ///
+    /// The TOML key is the conventional singular `[[peer]]`; the Rust field is
+    /// the idiomatic plural, bridged by `rename`.
+    #[serde(rename = "peer", default)]
+    pub peers: Vec<PeerConfig>,
+}
+
+/// One federation peer in the server's TOML (`[[peer]]`).
+///
+/// The trust model is identical to the client's per-server slider (ISC-S12
+/// reuses ISC-C22): a `trusted` peer is hash-verified then TOFU-pinned on first
+/// contact; an `untrusted` peer must carry a pre-loaded `key_hex` matched
+/// byte-for-byte. `introduce_to_clients = false` (ISC-S13) keeps the peer out
+/// of every introducer response while still federating its traffic normally.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerConfig {
+    /// The peer's server-id, `<name>#<12hex>` (ISC-S11 / ISC-C4).
+    pub server_id: String,
+
+    /// Reachable address: hostname or raw IP literal, optional `:port`
+    /// (default 443 per ISC-S5).
+    pub address: String,
+
+    /// Trust slider position for this peer. Defaults to `trusted` (ISC-C22
+    /// default), matching the client-side default for newly-added servers.
+    #[serde(default)]
+    pub trust_mode: TrustMode,
+
+    /// Whether this peer appears in introducer responses (ISC-S13). Default
+    /// `true`; `false` suppresses introductions (client AND server-to-server)
+    /// without stopping traffic.
+    #[serde(default = "default_true")]
+    pub introduce_to_clients: bool,
+
+    /// Hex-encoded pre-loaded full public key, required for `untrusted` peers
+    /// (ISC-C22 untrusted / ISC-S12-5). Ignored for `trusted` peers, which
+    /// TOFU-pin on first contact.
+    #[serde(default)]
+    pub key_hex: Option<String>,
 }
 
 fn default_listen_addr() -> String {
     "0.0.0.0:443".to_owned()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl ServerConfig {
@@ -190,6 +239,71 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.listen_addr, "127.0.0.1:8443");
         assert_eq!(cfg.display_name.as_deref(), Some("happy-bear"));
+    }
+
+    #[test]
+    fn peers_default_to_empty() {
+        let cfg = ServerConfig::from_toml(r#"key_path = "/k""#).unwrap();
+        assert!(cfg.peers.is_empty(), "no [[peer]] tables → no peers");
+    }
+
+    #[test]
+    fn peer_parses_all_fields() {
+        let cfg = ServerConfig::from_toml(
+            r#"
+            key_path = "/k"
+            [[peer]]
+            server_id = "relay-bear#0123456789ab"
+            address = "relay.example:8443"
+            trust_mode = "untrusted"
+            introduce_to_clients = false
+            key_hex = "aabb"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.peers.len(), 1);
+        let p = &cfg.peers[0];
+        assert_eq!(p.server_id, "relay-bear#0123456789ab");
+        assert_eq!(p.address, "relay.example:8443");
+        assert_eq!(p.trust_mode, TrustMode::Untrusted);
+        assert!(!p.introduce_to_clients);
+        assert_eq!(p.key_hex.as_deref(), Some("aabb"));
+    }
+
+    #[test]
+    fn peer_trust_mode_defaults_trusted_and_introduce_defaults_true() {
+        let cfg = ServerConfig::from_toml(
+            r#"
+            key_path = "/k"
+            [[peer]]
+            server_id = "x#0123456789ab"
+            address = "x.example"
+            "#,
+        )
+        .unwrap();
+        let p = &cfg.peers[0];
+        assert_eq!(p.trust_mode, TrustMode::Trusted, "ISC-C22 default");
+        assert!(p.introduce_to_clients, "ISC-S13 default true");
+        assert_eq!(p.key_hex, None);
+    }
+
+    #[test]
+    fn multiple_peers_parse_in_order() {
+        let cfg = ServerConfig::from_toml(
+            r#"
+            key_path = "/k"
+            [[peer]]
+            server_id = "a#0123456789ab"
+            address = "a.example"
+            [[peer]]
+            server_id = "b#0123456789ab"
+            address = "b.example"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.peers.len(), 2);
+        assert_eq!(cfg.peers[0].server_id, "a#0123456789ab");
+        assert_eq!(cfg.peers[1].server_id, "b#0123456789ab");
     }
 
     #[test]
