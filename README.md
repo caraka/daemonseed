@@ -16,8 +16,8 @@ daemonseed/
 │   ├── daemonseed-core/                    protocol library — identity, storage, crypto-agility,
 │   │                                       first-start orchestrator, bootstrap, circle metadata
 │   ├── daemonseed-proto/                   wire schema (Protocol Buffers, prost + tonic)
-│   ├── daemonseed-server/                  relay daemon: TLS 1.3 termination + APP_HELLO + SIGTERM (M4a)
-│   ├── daemonseed-cli/                     scriptable client: `connect <server-id>` subcommand (M4a)
+│   ├── daemonseed-server/                  relay daemon: TLS 1.3 + APP_HELLO + identity-proof → Authenticated (M4b)
+│   ├── daemonseed-cli/                     scriptable client: `connect <server-id>` with identity-proof (M4b)
 │   ├── daemonseed-tui/                     interactive ratatui client (placeholder until M11)
 │   └── daemonseed-integration-tests/       cross-crate integration tests + ISC coverage registry
 │
@@ -32,11 +32,11 @@ daemonseed/
                                             isc-coverage, findings-resolved, install-hooks
 ```
 
-Substantive code lives in `daemonseed-core`, `daemonseed-proto`, `daemonseed-server`, and `daemonseed-cli` as of M4a. The `tui` crate is still a placeholder; it fills in at M11.
+Substantive code lives in `daemonseed-core`, `daemonseed-proto`, `daemonseed-server`, and `daemonseed-cli` as of M4b. The `tui` crate is still a placeholder; it fills in at M11.
 
 ## Status
 
-Current release: **v0.4.0** (M3 closed); v0.5.0 cuts at M4a close. ISC coverage 43/93 (46.2% of MVP) after M4a. Promotion to a public repository is gated on the `oxicrypt` sibling crate going public.
+Current release: **v0.5.0** (M4a closed); **v0.6.0-pre** cuts at M4b close — the post-HELLO identity-proof exchange now lands a connection at `Authenticated` (mutual ML-DSA-87 envelopes, TLS channel binding, ±5min freshness, per-key replay counters). ISC coverage 48/93 (51.6% of MVP) after M4b. Promotion to a public repository is gated on the `oxicrypt` sibling crate going public.
 
 ## License
 
