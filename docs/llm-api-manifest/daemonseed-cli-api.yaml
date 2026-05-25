@@ -106,10 +106,15 @@ modules:
     added_in: "v0.8.0 (M6)"
     public:
       - { kind: enum, name: RatingError, variants: "{NotInTaxonomy}", note: "select_rating failure — choice not in the active server's taxonomy." }
+      - { kind: enum, name: WhitelistConvertError, variants: "{EmptyEntry, BadKey(WhitelistParseError), BadHandle(HandleParseError)}", note: "whitelist_from_wire failure converting fetched SignerWhitelistEntry wire entries to a core Whitelist." }
+      - { kind: enum, name: ServedVerifyError, variants: "{Missing, Verify(ArtifactError), AddressMismatch}", note: "Client re-verification failure for a server-served post/MOTD." }
     key_functions:
       - { sig: "render_motd(motd: &wire::SignedArtifact) -> String", note: "ISC-25: decode the MotdPayload and return its text with terminal control sequences (ESC / other C0-C1, keeping \\n and \\t) stripped, so a signed MOTD can't inject ANSI escapes. No markup/link interpretation." }
       - { sig: "select_rating(taxonomy: &[String], choice: &str) -> Result<String, RatingError>", note: "ISC-30 / ISC-31: choose a rating only from the active (connected-host) taxonomy; out-of-taxonomy is rejected — the public-space half of active-server scoping." }
       - { sig: "filter_shares_by_rating<'a>(shares: &'a [wire::PublicShareListing], rating: Option<&str>) -> Vec<&'a wire::PublicShareListing>", note: "ISC-32 / ISC-A-C5: the client's rating filter, applied at render AND fetch time (server never filters, ISC-A-S5b). None = all. Share content is M8." }
+      - { sig: "whitelist_from_wire(entries: &[wire::SignerWhitelistEntry], server_pubkey: Option<&[u8]>) -> Result<Whitelist, WhitelistConvertError>", note: "Rebuild a core Whitelist from the fetched published entries (ISC-S8/ISC-6). server_pubkey=Some(..) adds the server's own key for MOTD verification (ISC-26); None for the post whitelist." }
+      - { sig: "verify_served_post(post: &wire::Post, whitelist: &Whitelist) -> Result<(), ServedVerifyError>", note: "ISC-A-S3 client half: re-run verify_artifact against the published whitelist AND re-derive the content address, rejecting any server-asserted-address mismatch. Trusts nothing the server asserts." }
+      - { sig: "verify_served_motd(motd: &wire::SignedArtifact, whitelist: &Whitelist) -> Result<(), ServedVerifyError>", note: "ISC-A-S3 client half / ISC-26: re-verify a served MOTD against a whitelist that includes the server key. The live fetch loop calling these lands with the CLI gRPC transport." }
 
 binaries:
   - name: daemonseed-cli
