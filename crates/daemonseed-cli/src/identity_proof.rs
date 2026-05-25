@@ -25,7 +25,6 @@
 //! passphrase-encrypted seeds blob across runs is a later client-identity
 //! commit, not part of this orchestration.
 
-use core::str::FromStr;
 use std::error::Error;
 use std::fmt;
 
@@ -123,10 +122,20 @@ impl ClientIdentity {
 ///
 /// Sends the client's signed envelope, then reads + verifies the server's
 /// against the locally-recomputed `channel_binding` + `negotiated_version`.
-/// On success returns the [`VerifiedPeer`] for the server; on **any**
-/// failure returns a [`ClientProofError`] and the caller closes — there is
-/// no partial-trust branch (ISC-45). `expected_server_id` is the server-id
-/// the client dialed; the verified server handle must equal it (A-C18).
+/// On success returns the [`VerifiedPeer`] — a server whose envelope is
+/// **self-consistent** (its claimed handle hashes to its claimed pubkey, the
+/// channel binding matches, the signature verifies, the freshness/counter
+/// checks pass). On **any** of those failures returns a [`ClientProofError`]
+/// and the caller closes — no partial-trust branch (ISC-45).
+///
+/// **Dialed-identity is NOT decided here.** Whether this self-consistent server
+/// is the one the caller meant to reach — and whether a changed key is an
+/// acceptable trusted-mode rotation or an untrusted-mode mismatch — is the C22
+/// trust layer's job (`daemonseed_core::federation::apply_trust`, run by
+/// `connect`). Keeping the binding in one place (the pin store) is what lets
+/// trusted-mode key rotation surface a notice instead of being refused here.
+/// `expected_server_id` is used only to key the per-server replay counter
+/// (ISC-34), not as an identity gate.
 ///
 /// `now_unix_ms` supplies the client envelope's timestamp (ISC-18) and the
 /// server-envelope skew check; `counters` provides the monotonic send
@@ -177,21 +186,15 @@ where
     )
     .map_err(ClientProofError::Verify)?;
 
-    // A-C18 dialed-identity pin: verify_envelope proved the server handle is
-    // self-consistent with its pubkey; this proves it's the server we meant
-    // to reach. Without it, any server with a self-consistent envelope would
-    // pass — TOFU/identity would be meaningless.
-    if !Handle::from_str(verified.handle())
-        .ok()
-        .zip(Handle::from_str(expected_server_id).ok())
-        .map(|(got, want)| got.hash_prefix() == want.hash_prefix())
-        .unwrap_or(false)
-    {
-        return Err(ClientProofError::WrongServer);
-    }
+    // Dialed-identity (A-C18) is decided by the C22 trust layer, not here — see
+    // the function docs. verify_envelope already proved the envelope is
+    // self-consistent (handle hashes to pubkey); `apply_trust` in `connect`
+    // then decides whether this is the dialed server (first-contact hash match)
+    // or an accepted rotation of the pinned key. Deciding it here would refuse
+    // a rotated key before the trust layer could surface a notice.
 
     // Record the server's counter as highest-seen for this server-id
-    // (ISC-34 mechanism). Only reached on a fully-verified server.
+    // (ISC-34 mechanism). Only reached on a fully-verified envelope.
     counters.record_seen(expected_server_id, verified.counter());
     Ok(verified)
 }
@@ -225,9 +228,6 @@ pub enum ClientProofError {
     /// The server's envelope failed verification (uniform — sub-cause is
     /// deliberately opaque).
     Verify(VerifyRejection),
-    /// The server's envelope was self-consistent but its handle is not the
-    /// server-id we dialed (A-C18 dialed-identity pin).
-    WrongServer,
 }
 
 impl fmt::Display for ClientProofError {
@@ -236,7 +236,6 @@ impl fmt::Display for ClientProofError {
             Self::Sign(e) => write!(f, "client envelope signing failed: {e}"),
             Self::Frame(e) => write!(f, "identity-proof frame I/O failed: {e}"),
             Self::Verify(e) => write!(f, "server identity-proof rejected: {e}"),
-            Self::WrongServer => write!(f, "server proved a different identity than dialed"),
         }
     }
 }
@@ -247,7 +246,6 @@ impl Error for ClientProofError {
             Self::Sign(e) => Some(e),
             Self::Frame(e) => Some(e),
             Self::Verify(e) => Some(e),
-            Self::WrongServer => None,
         }
     }
 }
@@ -258,6 +256,7 @@ impl Error for ClientProofError {
 mod tests {
     use super::*;
 
+    use core::str::FromStr;
     use daemonseed_core::identity::keys::IdentityKeys;
     use daemonseed_server::identity::{Seed, ServerId, derive_server_id};
     use daemonseed_server::identity_proof::{
@@ -409,57 +408,54 @@ mod tests {
         assert!(matches!(out, Err(ClientProofError::Verify(_))));
     }
 
-    /// ISC-A-C18 dialed-identity pin: a self-consistent server envelope whose
-    /// handle is NOT the dialed server-id fails closed as WrongServer.
+    /// Dialed-identity moved to the trust layer (M5): a self-consistent server
+    /// envelope now COMPLETES the proof even when its handle differs from the
+    /// dialed server-id. `run_client_identity_proof` proves self-consistency
+    /// only; `connect`'s `apply_trust` is what refuses a wrong/unknown server
+    /// (first-contact hash mismatch → Refuse) or accepts a trusted-mode
+    /// rotation. This is the change that makes ISC-C22 key rotation reachable.
     #[tokio::test]
-    async fn client_rejects_self_consistent_but_wrong_server() {
+    async fn proof_completes_for_any_self_consistent_server_dialed_id_is_trust_layer() {
         ensure_module();
-        let impostor =
+        let server_keys =
             derive_identity_keys(&Mnemonic::generate().unwrap(), Identity::Primary).unwrap();
-        let impostor_handle = Handle::from_pubkey(None, impostor.signing.public_key())
+        let server_handle = Handle::from_pubkey(None, server_keys.signing.public_key())
             .unwrap()
             .format(DisplayMode::Verify);
-        // The client dialed a DIFFERENT server-id.
-        let dialed = Handle::from_pubkey(None, ephemeral_client_pubkey().as_slice())
-            .unwrap()
-            .format(DisplayMode::Verify);
+        // The client dialed a DIFFERENT server-id — yet the proof still
+        // completes, because the dialed-identity decision is no longer here.
+        let dialed = "someone-else#000000000000";
         let client = ephemeral_client();
         let cb = [9u8; CHANNEL_BINDING_LEN];
         let mut counters = CounterState::default();
 
         let (client_end_raw, server_end_raw) = duplex(64 * 1024);
         let scripted = {
+            let server_handle = server_handle.clone();
             tokio::spawn(async move {
                 let mut server_end = server_end_raw;
                 let _client_env: wire::IdentityProof = read_frame(&mut server_end).await.unwrap();
-                // Self-consistent (handle matches impostor's own pubkey) but
-                // not the server-id the client dialed.
-                let env = server_envelope(&impostor, &impostor_handle, &cb);
+                let env = server_envelope(&server_keys, &server_handle, &cb);
                 write_frame(&mut server_end, &env).await.unwrap();
             })
         };
 
         let mut client_end = client_end_raw;
-        let out = run_client_identity_proof(
+        let verified = run_client_identity_proof(
             &mut client_end,
             cb,
             ver(),
             &client,
             NOW,
             &mut counters,
-            &dialed,
+            dialed,
         )
-        .await;
+        .await
+        .expect("self-consistent server completes the proof regardless of dialed-id");
         scripted.await.unwrap();
-        assert!(matches!(out, Err(ClientProofError::WrongServer)));
-    }
-
-    /// Helper: a throwaway pubkey to stand in as a "dialed" server-id distinct
-    /// from the impostor's.
-    fn ephemeral_client_pubkey() -> Vec<u8> {
-        ensure_module();
-        let keys = derive_identity_keys(&Mnemonic::generate().unwrap(), Identity::Primary).unwrap();
-        keys.signing.public_key().to_vec()
+        // The proof returns the server's own (self-consistent) identity; the
+        // trust layer would refuse it against the dialed `someone-else` id.
+        assert_eq!(verified.handle(), server_handle);
     }
 
     #[test]

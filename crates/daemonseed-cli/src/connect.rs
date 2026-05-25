@@ -215,22 +215,21 @@ pub async fn connect(
     // failed. The typed cause is dropped here on purpose.
     .map_err(|_cause| ConnectError::IdentityProofRefused)?;
 
-    // C22 trust slider: the identity-proof above already proved the server's
-    // key is self-consistent and its hash-prefix is the dialed server-id
-    // (A-C18). This layer adds the full-key trust decision: trusted-mode TOFU
-    // pinning + rotation detection, or untrusted-mode byte-exact match. The
-    // store must hold an entry for the dialed server (the user added it before
-    // connecting); an unknown server fails closed.
-    //
-    // KNOWN LIMITATION (flagged for the M5 review): the A-C18 check above
-    // re-binds to the dialed server-id hash on EVERY connection, so a rotated
-    // server key (whose hash differs from the configured server-id) is refused
-    // as WrongServer before this point — the C22 `AcceptWithRotation` path is
-    // therefore unreachable through `connect` today. C22's spec says "the pin
-    // is what the protocol checks after first-contact", so full rotation
-    // support requires conditioning the A-C18 check on pin-presence — a
-    // deliberate change to the M4b identity-proof security path, deferred for a
-    // decision rather than made here. Current behaviour fails closed (safe).
+    // C22 trust slider — the SINGLE dialed-identity authority (A-C18). The
+    // identity-proof above proved only that the server's envelope is
+    // self-consistent (handle hashes to pubkey); it deliberately does NOT gate
+    // on the dialed server-id, so this layer owns that decision:
+    //   - first contact (no pin): trusted mode requires presented hash-prefix
+    //     == the configured server-id (a wrong server / non-grinded MITM is
+    //     refused here); untrusted mode requires the pre-configured key.
+    //   - established pin: trusted mode accepts the pin, or surfaces a notice
+    //     and re-pins on an operator rotation (a different key — different
+    //     hash); untrusted mode refuses any change.
+    //   - unknown server: fail closed.
+    // Keeping the binding here (where the pin lives) is exactly what lets a
+    // trusted-mode key rotation surface a notice instead of being refused
+    // upstream. The store must hold an entry for the dialed server (the user
+    // added it before connecting).
     let server_handle = Handle::from_str(server_id).map_err(|_| ConnectError::BadServerId)?;
     let presented_prefix = *Handle::from_pubkey(None, verified.pubkey())
         // Crypto module is operational by here (the proof just verified), so

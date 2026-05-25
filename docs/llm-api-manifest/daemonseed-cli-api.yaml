@@ -34,11 +34,12 @@ modules:
       adapts the live `rustls::ClientConnection` to core's
       `ChannelBindingSource` (no constant path). `run_client_identity_proof`
       sends the client's signed envelope, reads + verifies the server's via
-      core `verify_envelope`, then pins the verified server handle to the
-      dialed server-id (A-C18 — self-consistency is necessary but not
-      sufficient). Fails closed with no partial trust (ISC-45). Counter via
-      `CounterState::next_send` (ISC-19 mechanism); ephemeral identity for
-      now (D8 — persistence deferred).
+      core `verify_envelope` (self-consistency only). M5: the dialed-identity
+      decision (A-C18) moved OUT to the C22 trust layer (`connect` →
+      `apply_trust`) so a trusted-mode key rotation surfaces a notice instead
+      of being refused here. Fails closed with no partial trust (ISC-45).
+      Counter via `CounterState::next_send` (ISC-19 mechanism); ephemeral
+      identity for now (D8 — persistence deferred).
     iscs: [S19, "43", "44", "45", "46", "47", "17", "18", "19", A-C18]
     added_in: "M4b commit 6"
     decisions:
@@ -48,11 +49,11 @@ modules:
       - { kind: struct, name: "RustlsClientExporter<'a>", note: "Wraps &rustls::ClientConnection; impls core ChannelBindingSource. No constant constructor." }
       - { kind: struct, name: ClientIdentity, note: "Client's ML-DSA-87 SignKeypair + verify-form handle. ::ephemeral() generates a throwaway identity (D8); ::new(signing, handle) for an injected one." }
       - { kind: struct, name: ClientIdentityError, note: "Stringified failure constructing an ephemeral identity (bridges mnemonic / key-derivation / handle errors)." }
-      - { kind: enum, name: ClientProofError, variants: "{Sign(SignatureError), Frame(HelloError), Verify(VerifyRejection), WrongServer}", note: "Diagnostic only — connect collapses every variant to ConnectError::IdentityProofRefused so the user learns nothing about the sub-cause (ISC-46)." }
+      - { kind: enum, name: ClientProofError, variants: "{Sign(SignatureError), Frame(HelloError), Verify(VerifyRejection)}", note: "Diagnostic only — connect collapses every variant to ConnectError::IdentityProofRefused (ISC-46). M5 removed WrongServer: dialed-identity is now decided by the C22 trust layer (connect → apply_trust), not here." }
     key_functions:
       - { sig: "ClientIdentity::ephemeral() -> Result<Self, ClientIdentityError>", note: "Fresh mnemonic → Primary keypair → floor-form handle. Requires the oxicrypt module operational." }
       - { sig: "ClientIdentity::new(signing: SignKeypair, handle: String) -> Self" }
-      - { sig: "run_client_identity_proof<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S, channel_binding: [u8; 32], negotiated_version: wire::ProtocolVersion, identity: &ClientIdentity, now_unix_ms: u64, counters: &mut CounterState, expected_server_id: &str) -> Result<VerifiedPeer, ClientProofError>", note: "Sends client envelope, verifies the server's, pins handle==dialed server-id, records the server counter as highest-seen." }
+      - { sig: "run_client_identity_proof<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S, channel_binding: [u8; 32], negotiated_version: wire::ProtocolVersion, identity: &ClientIdentity, now_unix_ms: u64, counters: &mut CounterState, expected_server_id: &str) -> Result<VerifiedPeer, ClientProofError>", note: "Sends client envelope, verifies the server's envelope is self-consistent, records the server counter as highest-seen. M5: does NOT gate on dialed-identity — that moved to the C22 trust layer (apply_trust) so trusted-mode rotation is reachable. expected_server_id keys the replay counter only." }
 
   - path: daemonseed_cli::connect
     purpose: >-

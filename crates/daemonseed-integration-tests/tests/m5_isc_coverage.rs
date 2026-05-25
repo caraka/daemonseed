@@ -281,6 +281,112 @@ fn federation_trust_model_is_per_server_tofu_slider() {
     );
 }
 
+// ── ISC-C22 rotation reachability (end-to-end) ────────────────────────────
+
+/// The reconciliation test: a trusted-mode operator key rotation must reach the
+/// C22 `AcceptWithRotation` notice path through the *real* identity-proof
+/// exchange — not be refused upstream. Drives run_server/run_client over an
+/// in-memory duplex for two rounds: first contact pins the original key; a
+/// second round where the server presents a NEW key (the client still dialing
+/// the original server-id) must surface a rotation notice and re-pin.
+#[tokio::test]
+async fn trusted_key_rotation_reaches_the_notice_path_end_to_end() {
+    use core::str::FromStr;
+    use daemonseed_cli::identity_proof::{ClientIdentity, run_client_identity_proof};
+    use daemonseed_core::identity_proof::CHANNEL_BINDING_LEN;
+    use daemonseed_core::storage::seeds::CounterState;
+    use daemonseed_proto::v1 as wire;
+    use daemonseed_server::identity::{Seed, derive_server_id};
+    use daemonseed_server::identity_proof::{SeenMap, ServerIdentity, run_server_identity_proof};
+    use tokio::io::duplex;
+
+    ensure_module();
+    let cb = [9u8; CHANNEL_BINDING_LEN];
+    let ver = wire::ProtocolVersion { major: 1, minor: 0 };
+    const NOW: u64 = 1_700_000_000_000;
+
+    // The dialed/config server-id is derived from the server's ORIGINAL key.
+    let seed1 = Seed([1u8; 32]);
+    let sid1 = derive_server_id(&seed1, Some("relay".to_owned())).unwrap();
+    let dialed = ServerIdentity::from_seed(&seed1, &sid1)
+        .unwrap()
+        .handle()
+        .to_owned();
+    let dialed_handle = Handle::from_str(&dialed).unwrap();
+
+    let client = ClientIdentity::ephemeral().expect("client");
+    let mut counters = CounterState::default();
+    let mut store = InMemoryTrustStore::new();
+    store.upsert(ServerEntry::new_trusted(
+        dialed_handle.clone(),
+        "relay:443".into(),
+    ));
+
+    // Round 1 — first contact with the original key → TOFU-pin.
+    let vp1 = {
+        let id1 = ServerIdentity::from_seed(&seed1, &sid1).unwrap();
+        let (c_end, s_end) = duplex(64 * 1024);
+        let srv = tokio::spawn(async move {
+            let mut s = s_end;
+            let seen = SeenMap::new();
+            let _ = run_server_identity_proof(&mut s, cb, ver, &id1, NOW, 1000, &seen).await;
+        });
+        let mut c = c_end;
+        let vp = run_client_identity_proof(&mut c, cb, ver, &client, NOW, &mut counters, &dialed)
+            .await
+            .expect("first contact completes");
+        srv.await.unwrap();
+        vp
+    };
+    let prefix1 = *Handle::from_pubkey(None, vp1.pubkey())
+        .unwrap()
+        .hash_prefix();
+    assert_eq!(
+        apply_trust(&mut store, &dialed_handle, vp1.pubkey(), &prefix1),
+        TrustDecision::Accept
+    );
+
+    // Round 2 — operator rotated to a NEW key. The client still dials the
+    // original server-id; the rotated key has a different hash. This must NOT
+    // be refused upstream — it must reach the C22 rotation-notice path.
+    let seed2 = Seed([2u8; 32]);
+    let sid2 = derive_server_id(&seed2, Some("relay".to_owned())).unwrap();
+    let id2 = ServerIdentity::from_seed(&seed2, &sid2).unwrap();
+    assert_ne!(
+        id2.handle(),
+        dialed.as_str(),
+        "a rotated key yields a different server handle"
+    );
+    let vp2 = {
+        let (c_end, s_end) = duplex(64 * 1024);
+        let srv = tokio::spawn(async move {
+            let mut s = s_end;
+            let seen = SeenMap::new();
+            let _ = run_server_identity_proof(&mut s, cb, ver, &id2, NOW, 2000, &seen).await;
+        });
+        let mut c = c_end;
+        let vp = run_client_identity_proof(&mut c, cb, ver, &client, NOW, &mut counters, &dialed)
+            .await
+            .expect("rotated server still completes the proof — dialed-identity is the trust layer's job");
+        srv.await.unwrap();
+        vp
+    };
+    let prefix2 = *Handle::from_pubkey(None, vp2.pubkey())
+        .unwrap()
+        .hash_prefix();
+    match apply_trust(&mut store, &dialed_handle, vp2.pubkey(), &prefix2) {
+        TrustDecision::AcceptWithRotation { fingerprint } => {
+            assert!(fingerprint.starts_with('#') && fingerprint.len() == 13);
+        }
+        other => panic!("expected AcceptWithRotation on key rotation, got {other:?}"),
+    }
+    assert_eq!(
+        store.get(&dialed_handle).unwrap().pinned_key.as_deref(),
+        Some(vp2.pubkey()),
+        "the pin followed the rotation to the new key"
+    );
+}
+
 // ── ISC coverage tally ─────────────────────────────────────────────────────
 
 #[test]
