@@ -100,18 +100,24 @@ modules:
       The exporter call is injected via `ChannelBindingSource` so core
       stays rustls-free; the label + context byte-layout live HERE (one
       definition, both peers) to defeat the channel-binding asymmetry bug.
-      Verification + the Versioned->Authenticated type-state land in the
-      next commit.
-    iscs: [S19, A-S14, A-C18, S15, C4]
+      Verification (`verify_envelope`) runs every check and collapses all
+      failures to one opaque `VerifyRejection` (uniform close-shape,
+      A-S12/A-C18); success yields a `VerifiedPeer` token that gates the
+      Versioned->Authenticated transition.
+    iscs: [S19, A-S14, A-C18, S15, C4, C22]
     public:
       - { kind: const, name: CHANNEL_BINDING_LABEL, value: '"daemonseed/identity-proof/v1" (= kdf::info::IDENTITY_PROOF_V1.as_bytes())', note: "TLS 1.3 exporter label. Single source of truth in the kdf-info registry." }
       - { kind: const, name: CHANNEL_BINDING_LEN, value: 32 }
+      - { kind: const, name: SKEW_WINDOW_MS, value: 300000, note: "±5min freshness window (decision D1). Hosts MUST run NTP — drift beyond this fails identity-proof." }
       - { kind: trait, name: ChannelBindingSource, note: "export_keying_material(label, context, out). Implemented by the TLS-holding layer (server/cli) over rustls; MUST NOT substitute a constant (A-S14/A-C18)." }
       - { kind: enum, name: ChannelBindingError, note: "Export(String) — exporter call failed (e.g. handshake incomplete)." }
+      - { kind: struct, name: VerifiedPeer, note: "Opaque proof-of-verification token. Constructible ONLY by verify_envelope returning Ok. Accessors: handle(), pubkey(), counter(), counter_gap(). Gates Connection::into_authenticated." }
+      - { kind: struct, name: VerifyRejection, note: "Zero-field, no-discriminator rejection — bad-sig / wrong-key / stale-ts / replayed-counter / unsupported-suite / handle-mismatch all collapse here so neither caller nor peer can tell which check failed (A-S12 / A-C18)." }
     key_functions:
       - { sig: "derive_channel_binding(source: &impl ChannelBindingSource, negotiated_version: ProtocolVersion) -> Result<[u8; 32], ChannelBindingError>", note: "Fixed label + version-context exporter call." }
       - { sig: "signing_input(channel_binding, claimed_handle, claimed_pubkey, negotiated_version, signed_at_unix_ms, counter) -> Vec<u8>", note: "Canonical signed bytes (decision D3 — extends ISC-S19's 4 fields to cover timestamp+counter). Variable-length fields are u16-BE length-delimited to prevent field-confusion." }
       - { sig: "build_envelope(signing, channel_binding, claimed_handle, role, suite_id, negotiated_version, signed_at_unix_ms, counter) -> Result<IdentityProof, SignatureError>", note: "Constructs + signs the wire envelope. counter/timestamp supplied by caller; counter state is sourced from the seeds blob by the orchestration layer (later commit)." }
+      - { sig: "verify_envelope(envelope: &IdentityProof, channel_binding: &[u8;32], negotiated_version: ProtocolVersion, now_unix_ms: u64, highest_seen_counter: Option<u64>) -> Result<VerifiedPeer, VerifyRejection>", note: "ISC-S19 step 4. Checks suite-support, role well-formedness, handle↔pubkey hash binding, signature over the local channel-binding+version (cross-session replay fails here), ±5min skew, and counter monotonicity (gap allowed+flagged, <=highest-seen rejected). Identical path for client and server (role is never an auth branch, A-S8)." }
 
   - path: daemonseed_core::handle
     purpose: >-
@@ -381,8 +387,11 @@ modules:
       enforce that without runtime checks. Concrete TLS streams plug
       in via the Transport trait's blanket impl over
       `AsyncRead + AsyncWrite + Send + Unpin + 'static`.
-      M4a ships Negotiating → Versioned. M4b adds Versioned →
-      Authenticated plus the I/O exposure on Authenticated.
+      Negotiating → Versioned (M4a) → Authenticated (M4b). Only
+      Authenticated impls AsyncRead/AsyncWrite, so application traffic
+      is a compile error pre-auth. The Versioned → Authenticated step
+      consumes a VerifiedPeer token (mintable only by a passed
+      identity_proof::verify_envelope), so the gate cannot be skipped.
     iscs: [C23, S14, S19]
     added_in: "v0.5.0 (M4a)"
     submodules:
@@ -392,12 +401,15 @@ modules:
       - { kind: trait, name: Transport, note: "Marker trait. Blanket impl for any T: AsyncRead + AsyncWrite + Send + Unpin + 'static. No daemonseed-side glue needed for concrete TLS streams." }
       - { kind: trait, name: "state::ConnState (sealed)", note: "Sealed via private::Sealed — third parties cannot introduce new states." }
       - { kind: enum, name: "state::Negotiating (never)", note: "Marker. Pre-APP_HELLO state; no I/O exposed." }
-      - { kind: enum, name: "state::Versioned (never)", note: "Marker. Post-APP_HELLO_ACK state; exposes transport_mut() for M4b's identity-proof envelope I/O." }
-      - { kind: enum, name: "state::Authenticated (never)", note: "Marker. M4b adds the AsyncRead/AsyncWrite surface here." }
+      - { kind: enum, name: "state::Versioned (never)", note: "Marker. Post-APP_HELLO_ACK state; exposes transport_mut() for identity-proof envelope I/O. Does NOT impl AsyncRead/AsyncWrite." }
+      - { kind: enum, name: "state::Authenticated (never)", note: "Marker. Connection<Authenticated, T> impls AsyncRead + AsyncWrite (delegating to the transport) — the only state that exposes application I/O." }
     key_functions:
       - { sig: "Connection::<Negotiating, T>::from_handshaked_transport(transport: T) -> Self", note: "Wraps a freshly-TLS-handshaked transport. Constructor does not drive the TLS handshake itself." }
       - { sig: "Connection::<Negotiating, T>::advance_to_versioned(self) -> Connection<Versioned, T>", note: "Consuming transition. Caller drives APP_HELLO frame I/O against the transport via daemonseed_server::hello helpers before calling this." }
-      - { sig: "Connection::<Versioned, T>::transport_mut(&mut self) -> &mut T", note: "M4b uses this to drive identity-proof envelope I/O. Deliberately NOT an AsyncRead/AsyncWrite impl on the Connection wrapper." }
+      - { sig: "Connection::<Versioned, T>::transport_mut(&mut self) -> &mut T", note: "Drives identity-proof envelope I/O. Deliberately NOT an AsyncRead/AsyncWrite impl on the Connection wrapper." }
+      - { sig: "Connection::<Versioned, T>::into_authenticated(self, verified: VerifiedPeer) -> Connection<Authenticated, T>", note: "ISC-S19 step 5 / ISC-C23. Consumes a VerifiedPeer token (only verify_envelope can mint one), so Authenticated is unreachable without a passed verification." }
+      - { sig: "Connection::<Authenticated, T>::into_inner(self) -> T", note: "Unwraps the raw authenticated transport — e.g. to hand to tonic for the post-auth application stream (M5+)." }
+      - { sig: "impl AsyncRead + AsyncWrite for Connection<Authenticated, T>", note: "Delegates to the inner transport. This impl exists ONLY for the Authenticated state." }
 
   - path: daemonseed_core::circle
     purpose: >-
