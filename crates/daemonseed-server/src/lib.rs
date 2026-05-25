@@ -16,14 +16,18 @@
 //!   (ISC-S2a / S2b / S5 / A-S9 / A6)
 //! - [`hello`] — length-prefixed prost framing for `APP_HELLO` /
 //!   `APP_HELLO_ACK` / `APP_HELLO_REJECT` (ISC-S14)
-//! - [`runtime`] — TCP listener + TlsAcceptor + per-connection HELLO
-//!   handler + SIGTERM-driven graceful shutdown (ISC-9 / S5)
+//! - [`identity_proof`] — post-HELLO identity-proof orchestration:
+//!   channel binding off the live TLS session, signed-envelope exchange,
+//!   and the `Versioned → Authenticated` gate (ISC-S19 / A-S14 / A-S12)
+//! - [`runtime`] — TCP listener + TlsAcceptor + per-connection HELLO +
+//!   identity-proof handler + SIGTERM-driven graceful shutdown (ISC-9 / S5)
 
 #![forbid(unsafe_code)]
 
 pub mod config;
 pub mod hello;
 pub mod identity;
+pub mod identity_proof;
 pub mod kats;
 pub mod runtime;
 pub mod tls;

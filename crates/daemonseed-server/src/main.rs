@@ -25,11 +25,13 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use clap::Parser;
 use daemonseed_server::{
     config::{ConfigError, ServerConfig as DseedConfig, resolve_config_path},
     identity::{IdentityError, derive_server_id, load_or_generate},
+    identity_proof::{IdentityProofError, ServerIdentity},
     kats::CNSA_2_0_KATS,
     runtime::{noop_observer, parse_listen_addr, run, shutdown_signal},
     tls::{DEFAULT_CERT_VALIDITY, TlsError, build_server_config, install_provider},
@@ -88,6 +90,12 @@ fn run_server(cli: Cli) -> Result<(), BootError> {
     let tls_config =
         build_server_config(&seed, &server_id, DEFAULT_CERT_VALIDITY).map_err(BootError::Tls)?;
 
+    // Long-term signing identity for the post-HELLO identity-proof envelope
+    // (ISC-S19). Re-derived from the same seed; shared read-only across all
+    // per-connection tasks.
+    let identity =
+        Arc::new(ServerIdentity::from_seed(&seed, &server_id).map_err(BootError::IdentityProof)?);
+
     let addr = parse_listen_addr(&config.listen_addr).map_err(BootError::ListenAddr)?;
 
     // Step 8 — runtime. The multi-thread builder is used so the accept
@@ -98,7 +106,13 @@ fn run_server(cli: Cli) -> Result<(), BootError> {
         .build()
         .map_err(BootError::Runtime)?;
     runtime
-        .block_on(run(addr, tls_config, shutdown_signal(), noop_observer()))
+        .block_on(run(
+            addr,
+            tls_config,
+            identity,
+            shutdown_signal(),
+            noop_observer(),
+        ))
         .map_err(BootError::Accept)
 }
 
@@ -112,6 +126,7 @@ enum BootError {
     Config(ConfigError),
     Tls(TlsError),
     Identity(IdentityError),
+    IdentityProof(IdentityProofError),
     ListenAddr(std::io::Error),
     Runtime(std::io::Error),
     Accept(std::io::Error),
@@ -125,6 +140,7 @@ impl std::fmt::Display for BootError {
             Self::Config(e) => write!(f, "{e}"),
             Self::Tls(e) => write!(f, "{e}"),
             Self::Identity(e) => write!(f, "{e}"),
+            Self::IdentityProof(e) => write!(f, "server identity setup failed: {e}"),
             Self::ListenAddr(e) => write!(f, "listen_addr parse failed: {e}"),
             Self::Runtime(e) => write!(f, "tokio runtime build failed: {e}"),
             Self::Accept(e) => write!(f, "accept loop failed: {e}"),

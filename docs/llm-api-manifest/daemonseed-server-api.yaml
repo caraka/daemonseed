@@ -18,10 +18,10 @@ lama: "0.1"
 library:
   name: daemonseed-server
   version: "0.1.0"
-  description: "Relay daemon binary + library. M4a commit 4 lands the TCP runtime + APP_HELLO frame I/O + SIGTERM graceful shutdown."
+  description: "Relay daemon binary + library. M4a landed the TCP runtime + APP_HELLO frame I/O + SIGTERM shutdown; M4b commit 5 adds the post-HELLO identity-proof exchange and the Versioned → Authenticated gate."
   license: "AGPL-3.0-or-later"
   manifest_for: "crates/daemonseed-server"
-  status: "M4a commit 4 in flight"
+  status: "M4b commit 5 (server identity-proof orchestration)"
 
 # ─────────────────────────────────────────────────────────────────────
 # Modules landed at M4a commit 3
@@ -120,23 +120,58 @@ modules:
       - { sig: "write_frame<W, M>(stream: &mut W, msg: &M) -> Result<(), HelloError>" }
       - { sig: "serve_hello<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) -> Result<HelloOutcome, HelloError>", note: "Zero branches on intended peer role per ISC-A-S6; no per-pubkey state per ISC-A-S9." }
 
+  - path: daemonseed_server::identity_proof
+    purpose: >-
+      Server-side post-HELLO identity-proof orchestration (ISC-S19).
+      `RustlsServerExporter` adapts the live rustls ServerConnection to
+      core's `ChannelBindingSource` so the 32-byte binding is derived
+      from THIS TLS session (ISC-37 / A-S14 / A1 — no constant path
+      exists). `run_server_identity_proof` builds + sends the server's
+      signed envelope, reads + verifies the client's via core's
+      `verify_envelope`, and on success returns the `VerifiedPeer` token
+      that gates `Connection::into_authenticated`. Any failure closes
+      uniformly — no per-check reason frame (ISC-40 / A-S12). The
+      `SeenMap` is a process-lifetime RAM-only highest-counter-per-key
+      map (ISC-34); it persists/logs no client identity (A-S1 / ISC-42 /
+      A5). Envelope frames reuse `hello::{read_frame, write_frame}`.
+    iscs: [S19, "37", "38", "39", "40", "41", "42", "34", A-S14, A-S12, A-S1, A1]
+    added_in: "M4b commit 5"
+    decisions:
+      - "D7: server outbound counter = wall-clock unix-ms (no persistent counter store; monotonic across restarts via the NTP requirement the ±5min skew gate already imposes — a restarted server is never rejected as a replay by returning clients)."
+    public:
+      - { kind: const, name: MVP_SUITE_ID, value: 1, note: "CNSA 2.0; carried on the server envelope. Widens to real suite negotiation post-MVP (S15/S16)." }
+      - { kind: struct, name: "RustlsServerExporter<'a>", note: "Wraps &rustls::ServerConnection; impls core ChannelBindingSource. No constructor fabricates a constant (A1)." }
+      - { kind: struct, name: ServerIdentity, note: "Server's ML-DSA-87 SignKeypair + verify-form handle + suite_id. Built via from_seed." }
+      - { kind: struct, name: SeenMap, note: "Clone-able Arc<Mutex<HashMap<pubkey,u64>>>; RAM-only replay-counter map shared across connection tasks." }
+      - { kind: enum, name: IdentityProofError, variants: "{Key(KeyDerivationError), Sign(SignatureError), Frame(HelloError), ChannelBinding(ChannelBindingError), Verify(VerifyRejection)}", note: "Diagnostic only — every variant maps to the same uniform close on the wire (A-S12)." }
+    key_functions:
+      - { sig: "now_unix_ms() -> u64", note: "Wall-clock ms; the freshness timestamp AND the D7 server counter source." }
+      - { sig: "RustlsServerExporter::new(conn: &rustls::ServerConnection) -> Self" }
+      - { sig: "ServerIdentity::from_seed(seed: &Seed, server_id: &ServerId) -> Result<Self, IdentityProofError>", note: "Re-derives the signing keypair from the raw seed via SignKeypair::from_ml_dsa_seed." }
+      - { sig: "ServerIdentity::handle(&self) -> &str" }
+      - { sig: "SeenMap::new() -> Self" }
+      - { sig: "run_server_identity_proof<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S, channel_binding: [u8; 32], negotiated_version: wire::ProtocolVersion, identity: &ServerIdentity, now_unix_ms: u64, send_counter: u64, seen: &SeenMap) -> Result<VerifiedPeer, IdentityProofError>", note: "Counter-agnostic (caller passes send_counter); verify path does not branch on role (A-S8)." }
+
   - path: daemonseed_server::runtime
     purpose: >-
-      TCP listener + tokio-rustls TlsAcceptor + per-connection HELLO
-      handler. `run(addr, tls_config, shutdown, observer)` binds,
-      accepts in a `tokio::select!` against the shutdown future,
-      spawns per-connection tasks. Each task drives TLS handshake →
-      HELLO → `Connection<Negotiating>::advance_to_versioned`. The
-      shutdown future is composed from `tokio::signal::ctrl_c()` plus
-      the unix SIGTERM stream via `shutdown_signal()`. Errors at any
-      per-connection phase close silently per ISC-A-S9.
-    iscs: [S5, ISC-9, A-S9]
-    added_in: "M4a commit 4"
+      TCP listener + tokio-rustls TlsAcceptor + per-connection HELLO +
+      identity-proof handler. `run(addr, tls_config, identity, shutdown,
+      observer)` binds, accepts in a `tokio::select!` against the
+      shutdown future, spawns per-connection tasks sharing one RAM
+      `SeenMap`. Each task drives TLS handshake → HELLO → channel
+      binding off the live TLS session → identity-proof exchange →
+      `Connection` advanced through `Versioned` to `Authenticated` on
+      success (ISC-S19). The shutdown future is composed from
+      `tokio::signal::ctrl_c()` plus the unix SIGTERM stream via
+      `shutdown_signal()`. Errors at any per-connection phase close
+      silently per ISC-A-S9 / ISC-40.
+    iscs: [S5, ISC-9, A-S9, S19, "36"]
+    added_in: "M4a commit 4; identity-proof wiring M4b commit 5"
     public:
-      - { kind: type, name: "ConnectionObserver = Arc<dyn Fn(HelloOutcome) + Send + Sync>", note: "Integration-test seam; production uses noop_observer()." }
+      - { kind: type, name: "ConnectionObserver = Arc<dyn Fn(HelloOutcome) + Send + Sync>", note: "Integration-test seam; production uses noop_observer(). Reports the HELLO negotiation outcome (fired before the identity-proof phase)." }
     key_functions:
-      - { sig: "run<F: Future<Output = ()>>(addr: SocketAddr, tls_config: ServerConfig, shutdown: F, observer: ConnectionObserver) -> io::Result<()>", note: "Accept loop; biased select! prefers shutdown over a new connection." }
-      - { sig: "drive_negotiated_connection<S>(stream: S, observer: ConnectionObserver)", note: "Public so integration tests can feed an in-memory duplex stream rather than real TCP + TLS." }
+      - { sig: "run<F: Future<Output = ()>>(addr: SocketAddr, tls_config: ServerConfig, identity: Arc<ServerIdentity>, shutdown: F, observer: ConnectionObserver) -> io::Result<()>", note: "Accept loop; biased select! prefers shutdown over a new connection. Creates the process-wide RAM SeenMap and clones it into each connection task." }
+      - { sig: "drive_negotiated_connection<S>(stream: S, observer: ConnectionObserver)", note: "HELLO-only driver retained as an in-memory-duplex test seam; the production path is serve_connection (private), which also runs identity-proof off the concrete TLS stream." }
       - { sig: "shutdown_signal() -> impl Future<Output = ()>", note: "Composes ctrl_c + SIGTERM on unix; ctrl_c only on non-unix." }
       - { sig: "parse_listen_addr(s: &str) -> io::Result<SocketAddr>" }
       - { sig: "noop_observer() -> ConnectionObserver" }
@@ -190,11 +225,14 @@ planned:
       - "commit 5: daemonseed-cli `connect <server-id>` subcommand reaches Versioned state end-to-end"
       - "commit 6: m4a_isc_coverage + wire-shape regression snapshot + Wu et al. GFW classifier fixture + end-to-end TLS handshake test"
 
-  - milestone: M4b
+  - milestone: M4b (remaining)
     surface:
-      - "Identity-proof verification (consults daemonseed_core::crypto::suite::Registry::lookup for the signer's suite_id → signature algorithm mapping)"
-      - "Channel-bound envelope + per-key monotonic counter + 120s skew window"
-      - "Constant-time close-shape for all auth failures"
+      - "commit 6: daemonseed-cli client-side identity-proof orchestration (A-C18)"
+      - "commit 7: end-to-end TLS identity-proof test (client + server both reach Authenticated) + uniform-close / replay / skew fixtures + v0.6.0-pre"
+    landed_commit_5:
+      - "Server identity-proof orchestration: channel binding off the live TLS session, signed-envelope exchange, Versioned → Authenticated gate"
+      - "Channel-bound envelope + per-key monotonic counter + ±5min skew window (D1); server outbound counter = wall-clock ms (D7)"
+      - "Uniform close-shape (shape, not timing) for all auth failures (A-S12); timing constant-ness is best-effort per the core module note"
 
   - milestone: M5
     surface:

@@ -77,16 +77,18 @@ modules:
       a BIP-39 seed via HKDF-SHA-384 with domain-separated info strings.
       Distinguishes "primary" (cross-device root) from "per-device" (UUID-
       keyed) identity branches per ISC-C1 / C13.
-    iscs: [C1, C13]
+    iscs: [C1, C13, S11]
     public:
+      - { kind: const, name: ML_DSA_SEED_LEN, value: 32, note: "ML-DSA-87 seed length (FIPS 204 §5.1); the raw seed a server persists." }
       - { kind: enum, name: Identity, note: "Primary | Device(Uuid) — selects which HKDF info-string prefix is used." }
       - { kind: enum, name: KeyDerivationError, note: "HKDF / oxicrypt-module / KEM keygen failure modes." }
-      - { kind: struct, name: SignKeypair, note: "ML-DSA-87 keypair. Drop zeroizes private key. Exposes detached `sign`." }
+      - { kind: struct, name: SignKeypair, note: "ML-DSA-87 keypair. Drop zeroizes private key. Exposes detached `sign`. Built from a mnemonic (via derive_identity_keys) or directly from a raw seed (from_ml_dsa_seed, server path)." }
       - { kind: struct, name: KemKeypair, note: "ML-KEM-1024 keypair. Drop zeroizes private key." }
       - { kind: struct, name: IdentityKeys, note: "Bundle of SignKeypair + KemKeypair for one Identity branch." }
       - { kind: enum, name: SignatureError, note: "Module(oxicrypt_module::Error) | BadSignature. BadSignature is uniform across tampered-message / wrong-key / forged-sig (ISC-A-S12 / A-C18 — verifier cannot distinguish the sub-cause)." }
     key_functions:
       - { sig: "derive_identity_keys(mnemonic: &Mnemonic, identity: Identity) -> Result<IdentityKeys, KeyDerivationError>", note: "End-to-end derivation. Each call regenerates from the seed — keys are not cached, so the caller manages lifetime." }
+      - { sig: "SignKeypair::from_ml_dsa_seed(seed: &[u8; ML_DSA_SEED_LEN]) -> Result<Self, KeyDerivationError>", note: "Builds a SignKeypair directly from a raw 32-byte ML-DSA-87 seed via oxicrypt_ml_dsa::keygen. The server path (server identity is a bare seed, not a mnemonic); deterministic. Requires oxicrypt module operational." }
       - { sig: "SignKeypair::sign(&self, message: &[u8]) -> Result<[u8; SIG_LEN], SignatureError>", note: "Detached ML-DSA-87 signature, empty FIPS-204 ctx (daemonseed domain-separates inside the signed bytes via the channel-binding prefix). Requires oxicrypt module operational." }
       - { sig: "verify_signature(public_key: &[u8; PK_LEN], message: &[u8], signature: &[u8; SIG_LEN]) -> Result<(), SignatureError>", note: "Ok only on a valid signature; all failure modes collapse to BadSignature." }
 
