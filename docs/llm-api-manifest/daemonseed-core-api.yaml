@@ -221,17 +221,20 @@ modules:
       compatibility). KDF chain (unchanged from M1):
       Argon2id(passphrase, salt=profile_id) → HKDF-SHA384-Expand →
       AES-256-GCM. v2 binds suite_id into AEAD AAD so tamper-swap
-      fails authentication.
-    iscs: [C3, C24, A-C9]
+      fails authentication. M4b extends the *plaintext payload* (not the
+      blob format) with replay-protection counters via a backward-
+      compatible directive-line schema — see CounterState + Seeds.
+    iscs: [C3, C24, A-C9, S19, A-S1]
     public:
-      - { kind: const, name: MAGIC, value: 'b"daemonseed/blob/v2\\0"', note: "Current 19-byte v2 magic. seal() always writes this." }
+      - { kind: const, name: MAGIC, value: 'b"daemonseed/blob/v2\\0"', note: "Current 19-byte v2 magic. seal() always writes this. NOT bumped by M4b — counters are a payload-schema extension, not a blob-format change." }
       - { kind: const, name: MAGIC_V1, value: 'b"daemonseed/blob/v1\\0"', note: "Legacy v1 magic accepted by open() for read-fallback." }
       - { kind: const, name: SUITE_ID_LEN, value: 2 }
       - { kind: const, name: NONCE_LEN, value: 12 }
       - { kind: const, name: TAG_LEN, value: 16 }
-      - { kind: const, name: ARGON2_OUTPUT_LEN, value: 32 }
+      - { kind: const, name: ARGON2_OUTPUT_LEN, value: 48, note: "48 since D5 (HKDF-SHA-384 PRK length; was 32 under SHA-256)." }
       - { kind: const, name: AEAD_KEY_LEN, value: 32 }
-      - { kind: struct, name: Seeds, fields: "{mnemonic: Mnemonic}", note: "Plaintext payload. Will grow with circle seeds, mute/hide lists, settings in later milestones." }
+      - { kind: struct, name: CounterState, fields: "{send_counter: u64 (private), seen: BTreeMap<String,u64> (private)}", note: "Replay-protection state (project_clocks_freshness). Methods: next_send()->u64 (pre-increment, first=1), current_send(), highest_seen(target)->Option<u64>, record_seen(target, counter) (keeps max). send_counter MUST persist (ISC-33); server MUST NOT persist its per-client seen map (A-S1/A-S12, RAM-only)." }
+      - { kind: struct, name: Seeds, fields: "{mnemonic: Mnemonic, counters: CounterState}", note: "Plaintext payload. Construct via Seeds::new(mnemonic) (default counters). Plaintext is line-based: line 0 = phrase, then `send-counter <n>` / `seen <target> <n>` directives. Bare-phrase (legacy M1/M2/M3) payloads parse with default counters — no re-enrollment. Directive scheme is additive for future fields." }
       - { kind: struct, name: Opened, fields: "{seeds: Seeds, suite_id: SuiteId, legacy_v1: bool}", note: "Output of open(). legacy_v1=true signals the caller should run touch_reseal on next save." }
       - { kind: enum, name: BlobError, note: "13 variants. AuthenticationFailed is uniform across wrong-passphrase / wrong-profile-id / wrong-argon-params / ciphertext-tamper (constant-time-friendly). UnknownSuite, SuiteIdSentinel, WriteRefused are M3 additions." }
     key_functions:

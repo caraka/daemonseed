@@ -136,9 +136,7 @@ fn m1_iscs_exercise_end_to_end() {
     coverage.register("ISC-C36", "m1_iscs::profile_id_uuid_v4");
 
     // ── ISC-C3: Argon2id+HKDF → AES-256-GCM at-rest blob, round-trip ────
-    let seeds = Seeds {
-        mnemonic: Mnemonic::generate().expect("mnemonic"),
-    };
+    let seeds = Seeds::new(Mnemonic::generate().expect("mnemonic"));
     let orig_phrase = seeds.mnemonic.to_phrase();
     let blob = seeds::seal(&seeds, "passphrase-x", config.profile_id, test_params()).expect("seal");
     let recovered =
