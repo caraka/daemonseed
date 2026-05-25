@@ -11,6 +11,12 @@ description = "daemonseed protocol schema (gRPC / protobuf)"
 [dependencies]
 prost = { workspace = true }
 prost-types = { workspace = true }
+# tonic runtime: the generated PublicSpace service stubs (M6, the first
+# application-stream service) reference `tonic::` for the client/server traits.
+# Messages-only milestones did not need it. Features are inherited from the
+# workspace pin (transport/codegen/prost); the schema crate uses only the
+# codegen-emitted traits — daemonseed supplies its own TLS via oxitls.
+tonic = { workspace = true }
 
 [build-dependencies]
 tonic-build = { workspace = true }

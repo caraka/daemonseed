@@ -192,6 +192,26 @@ modules:
       - { sig: "noop_observer() -> ConnectionObserver" }
       - { sig: "shutdown_after(dur: Duration)", note: "Deterministic test shutdown — sleep-then-resolve." }
 
+  - path: daemonseed_server::public_space
+    purpose: >-
+      The FIRST post-Authenticated application-stream service (M6). Serves the
+      `daemonseed.v1.PublicSpace` gRPC service (MOTD, posts, taxonomy, signer
+      whitelist, public-share listing) over the single already-Authenticated
+      TLS connection. `serve_public_space` hands the connection to a tonic
+      `Server` via `serve_with_incoming` over a one-element stream; `ServedConn`
+      supplies tonic's foreign `Connected` trait (orphan rule) with
+      `ConnectInfo = ()` since the peer is already proven. SPIKE STATUS: every
+      RPC returns `unimplemented`; real posts/MOTD/whitelist/taxonomy logic
+      (ISC-S7/S8/S9/S10/C19) lands in the M6 server build-out, and runtime.rs is
+      not yet rewired to call serve_public_space (still drops Authenticated).
+    iscs: [S4, S7, S8, S9, S10, A-S3, C19, C23]
+    added_in: "v0.8.0 (M6 commit 1 — spike: service skeleton + handoff)"
+    public:
+      - { kind: struct, name: PublicSpaceService, note: "Service state. Spike: empty; M6 build-out adds posts store / MOTD slot / whitelist / taxonomy / share index. Impls the generated public_space_server::PublicSpace trait." }
+      - { kind: struct, name: "ServedConn<S>", note: "Newtype adapting a single already-authenticated transport into tonic-servable IO. Impls Connected (ConnectInfo = ()) + delegates AsyncRead/AsyncWrite." }
+    key_functions:
+      - { sig: "serve_public_space<S: AsyncRead + AsyncWrite + Send + Unpin + 'static>(stream: S, service: PublicSpaceService) -> Result<(), tonic::transport::Error>", note: "Serves PublicSpace over one Authenticated transport until the peer closes. In production S is Connection<Authenticated, TlsStream<TcpStream>>." }
+
 binaries:
   - name: daemonseed-server
     entry_point: "fn main() -> ExitCode"

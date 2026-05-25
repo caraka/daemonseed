@@ -1,0 +1,250 @@
+// daemonseed wire protocol — public-space application service (M6).
+//
+// This is the FIRST application-stream service in the protocol. Everything up
+// to and including the identity-proof exchange (APP_HELLO + ISC-S19) runs as
+// length-prefixed prost frames on the raw TLS stream; once the connection
+// reaches the `Authenticated` type-state (daemonseed-core
+// `Connection<Authenticated, T>`), application traffic is gRPC-over-h2 served
+// by this `PublicSpace` service. The earlier milestones deliberately deferred
+// this layer ("M5+ serves the application stream"); M6 introduces it.
+//
+// Anchors: ISC-S4 (public-vs-CoT asset bifurcation — this service is the
+// public side), ISC-S7 (announcement posts), ISC-S8 (signer whitelist
+// published to clients), ISC-S9 (MOTD), ISC-S10 (rating taxonomy), ISC-A-S3
+// (server is verify-and-serve, never originates posts), ISC-A-S5b (server
+// publishes the taxonomy but does NOT enforce ratings), ISC-C19 (sharer-
+// assigned rating tag travels in the public listing), and finding F25
+// (public-share-listing surface defined as an extension of the S4 API).
+//
+// MINOR bumps to this schema MUST be additive-only (ISC-S14): never reuse a
+// field number, never repurpose an enum value, never tighten validation after
+// a field has shipped. MAJOR bumps create a new `vN` proto module.
+//
+// Wire transport: gRPC-over-h2 over the post-Authenticated TLS stream. No
+// length-prefix framing here — that belonged to the pre-auth HELLO/proof
+// phase (see daemonseed-server::hello); h2 owns its own framing.
+
+syntax = "proto3";
+
+package daemonseed.v1;
+
+// ── Common signed-artifact envelope ──────────────────────────────────────
+
+// A detached ML-DSA-87 signature over an opaque inner payload, plus the
+// signer's full public key. Used for announcement posts (ISC-S7), post-delete
+// requests, and the MOTD (ISC-S9). The enclosed `signed_payload` is the
+// canonical prost encoding of the corresponding `*Payload` message; the
+// signature is computed over exactly those bytes, and the post/MOTD content-
+// address is `SHA-384(signed_payload)`.
+//
+// `signer_pubkey` is the FULL key even when the whitelist entry is a
+// `<name>#<hash>` handle: the server verifies the key against the handle's
+// hash-prefix BEFORE verifying the signature (ISC-S8 / ISC-C4 hash semantics).
+//
+// CONTRACT — `signed_payload` bytes are authoritative (decided 2026-05-25).
+// The ML-DSA-87 signature and the SHA-384 content-address both cover
+// `signed_payload` VERBATIM. protobuf is not canonical across
+// implementations, so the signer's exact serialized bytes ARE the artifact:
+// every party (server and clients) stores and forwards `signed_payload`
+// byte-for-byte and MUST NOT re-encode the inner payload. Re-encoding would
+// change the content-address and invalidate the signature. Decode for display
+// only; never round-trip-then-rehash.
+message SignedArtifact {
+  // Canonical prost encoding of the inner payload (PostPayload,
+  // PostDeletePayload, or MotdPayload). Opaque at this layer.
+  bytes signed_payload = 1;
+
+  // Full ML-DSA-87 public key of the signer. Verified against the current
+  // signer whitelist (ISC-S8) before the signature is checked.
+  bytes signer_pubkey = 2;
+
+  // ML-DSA-87 signature over `signed_payload`.
+  bytes signature = 3;
+}
+
+// ── Announcement posts (ISC-S7) ──────────────────────────────────────────
+
+// Inner signed payload of an announcement post. Signed bytes = prost encoding
+// of this message; the enclosing SignedArtifact carries the signature.
+message PostPayload {
+  // Operator-defined topic id (ISC-S7). The topic SET is operator-only server
+  // config; signers may post into existing topics but cannot create/modify the
+  // topic set itself.
+  string topic = 1;
+
+  // Post body. Rendering policy is a client concern.
+  string body = 2;
+
+  // Signer's wall-clock milliseconds. Orders posts within a topic (ISC-S7).
+  int64 signed_timestamp_ms = 3;
+}
+
+// Inner signed payload of a post deletion. A signer may delete only their own
+// previously-signed post, matched by content-address (ISC-S7).
+message PostDeletePayload {
+  // SHA-384(signed_payload) of the post being deleted.
+  bytes content_address = 1;
+
+  // Signer's wall-clock milliseconds (freshness; not for ordering).
+  int64 signed_timestamp_ms = 2;
+}
+
+// A stored post as served to clients: the signer's artifact plus the server-
+// computed content-address. The client MUST re-derive SHA-384(artifact.
+// signed_payload) and reject mismatches — the server is untrusted to assert
+// the address (ISC-A-S3: verify-and-serve, never originate).
+message Post {
+  SignedArtifact artifact = 1;
+
+  // SHA-384(artifact.signed_payload). Server-asserted; client re-verifies.
+  bytes content_address = 2;
+}
+
+// ── MOTD (ISC-S9) ─────────────────────────────────────────────────────────
+
+// Inner signed payload of the message-of-the-day. Plaintext only — the client
+// renders `text` with no markdown, HTML, or link parsing (anti-injection,
+// ISC-S9). Single-slot: the latest validated MOTD replaces the previous one.
+message MotdPayload {
+  // Plaintext MOTD. Client renders verbatim, no markup interpretation.
+  string text = 1;
+
+  // Signer's wall-clock milliseconds. Latest validated update wins.
+  int64 signed_timestamp_ms = 2;
+}
+
+// ── Signer whitelist (ISC-S8) ───────────────────────────────────────────
+
+// One published signer-whitelist entry. The whitelist is published so clients
+// can independently verify post/MOTD provenance against the same list the
+// server uses. An entry is EITHER a full public key (verbose, self-contained)
+// OR a `<name>#<hash-prefix>` handle (compact; the full key arrives with each
+// signed artifact and is verified against the hash before signature check).
+message SignerWhitelistEntry {
+  oneof entry {
+    // Full ML-DSA-87 public key.
+    bytes full_pubkey = 1;
+
+    // `<name>#<hash-prefix>` handle form (ISC-C4 / ISC-S11 hash semantics).
+    string handle = 2;
+  }
+}
+
+// ── Rating taxonomy (ISC-S10) ────────────────────────────────────────────
+
+// Operator-defined content-rating labels. Purely declarative: the server
+// publishes the taxonomy and propagates sharer-assigned tags but never
+// enforces, filters, or moderates by rating (ISC-A-S5b). Clients consume this
+// to render rating filters (ISC-C19 / ISC-A-C5).
+message RatingTaxonomy {
+  // Operator-chosen labels in operator-chosen order (e.g. ["PG13","R","X"]).
+  repeated string labels = 1;
+}
+
+// ── Public share listing (ISC-C19 / finding F25) ─────────────────────────
+
+// A single public-space share as it appears in the listing. The rating tag is
+// the SHARER's self-classification drawn from the active taxonomy (ISC-C19);
+// it is advisory, not server-verified (ISC-A-S5b). The server returns the full
+// listing; rating filtering is entirely client-side, at render AND fetch time
+// (ISC-A-C5). M6 defines this surface (F25); the share CONTENT/transfer path
+// lands at M8.
+message PublicShareListing {
+  // Opaque server-scoped identifier for the share.
+  string share_id = 1;
+
+  // Display name of the shared folder.
+  string name = 2;
+
+  // Sharer-assigned rating label from the active taxonomy. Advisory only.
+  string rating = 3;
+}
+
+// ── Service ──────────────────────────────────────────────────────────────
+
+// The public-space application service, served over the post-Authenticated
+// TLS stream. All RPCs are unary (snapshot reads + signed writes); the
+// streaming CoT subscription surface is a separate M8 service, not this one.
+service PublicSpace {
+  // Fetch the current MOTD, or empty if none is set (ISC-S9).
+  rpc GetMotd(GetMotdRequest) returns (GetMotdResponse);
+
+  // List announcement posts, ordered by signed timestamp within each topic
+  // (ISC-S7). An unset topic filter returns posts across all topics.
+  rpc ListPosts(ListPostsRequest) returns (ListPostsResponse);
+
+  // Fetch the operator-defined rating taxonomy (ISC-S10).
+  rpc GetTaxonomy(GetTaxonomyRequest) returns (GetTaxonomyResponse);
+
+  // Fetch the published signer whitelist so the client can independently
+  // verify provenance (ISC-S8).
+  rpc GetSignerWhitelist(GetSignerWhitelistRequest) returns (GetSignerWhitelistResponse);
+
+  // Upload a signed announcement post. The server verifies the signature
+  // against the current whitelist and stores the post; it never originates or
+  // mutates post content (ISC-A-S3). Rejects (gRPC status) on an unknown
+  // signer or bad signature.
+  rpc UploadPost(UploadPostRequest) returns (UploadPostResponse);
+
+  // Delete a post the caller previously signed, matched by content-address
+  // (ISC-S7). Verified against the current whitelist.
+  rpc DeletePost(DeletePostRequest) returns (DeletePostResponse);
+
+  // List public-space shares with their advisory rating tags (ISC-C19 / F25).
+  // The server returns the complete listing; the client filters by rating
+  // locally (ISC-A-C5). Share content transfer is M8.
+  rpc ListPublicShares(ListPublicSharesRequest) returns (ListPublicSharesResponse);
+}
+
+message GetMotdRequest {}
+
+message GetMotdResponse {
+  // The current signed MOTD. Absent (proto3 message nullability) when no MOTD
+  // is set or the file is empty/missing (ISC-S9: hide the MOTD area).
+  SignedArtifact motd = 1;
+}
+
+message ListPostsRequest {
+  // Optional topic filter. Unset = all topics.
+  optional string topic = 1;
+}
+
+message ListPostsResponse {
+  // Posts ordered by `signed_timestamp_ms` within each topic (ISC-S7).
+  repeated Post posts = 1;
+}
+
+message GetTaxonomyRequest {}
+
+message GetTaxonomyResponse {
+  RatingTaxonomy taxonomy = 1;
+}
+
+message GetSignerWhitelistRequest {}
+
+message GetSignerWhitelistResponse {
+  repeated SignerWhitelistEntry entries = 1;
+}
+
+message UploadPostRequest {
+  // Signed PostPayload (signature in the envelope).
+  SignedArtifact artifact = 1;
+}
+
+message UploadPostResponse {
+  // SHA-384(artifact.signed_payload) under which the server stored the post.
+  bytes content_address = 1;
+}
+
+message DeletePostRequest {
+  // Signed PostDeletePayload (signature in the envelope).
+  SignedArtifact delete_artifact = 1;
+}
+
+message DeletePostResponse {}
+
+message ListPublicSharesRequest {}
+
+message ListPublicSharesResponse {
+  repeated PublicShareListing shares = 1;
+}

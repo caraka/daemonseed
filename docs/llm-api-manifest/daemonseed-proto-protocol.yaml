@@ -257,6 +257,153 @@ packages:
           - { name: peers, type: "repeated PeerTriple", tag: 1, note: "Revealed peers, already filtered by introduce-to-clients." }
         iscs: [S6, S13, A-S7]
 
+      # ── public-space service messages (M6, public_space.proto) ──
+      - name: SignedArtifact
+        defined_in: "proto/daemonseed/v1/public_space.proto"
+        added_in: "v0.8.0 (M6)"
+        purpose: >-
+          Detached ML-DSA-87 signature envelope for announcement posts (ISC-S7),
+          post-deletes, and the MOTD (ISC-S9). The signature covers
+          `signed_payload` verbatim and the content-address is
+          SHA-384(signed_payload). CONTRACT (decided 2026-05-25): the signer's
+          exact `signed_payload` bytes are authoritative — clients store and
+          forward them verbatim and MUST NOT re-encode. protobuf is not
+          canonical across implementations; re-encoding would break both the
+          signature and the content-address. `signer_pubkey` is the FULL key
+          even when the whitelist entry is a `<name>#<hash>` handle; the receiver
+          verifies the key against the handle hash-prefix before the signature.
+        fields:
+          - { name: signed_payload, type: bytes, tag: 1, note: "Canonical prost encoding of the inner *Payload. Authoritative bytes; never re-encoded downstream." }
+          - { name: signer_pubkey, type: bytes, tag: 2, note: "Full ML-DSA-87 public key; verified against whitelist + handle hash-prefix before signature check." }
+          - { name: signature, type: bytes, tag: 3, note: "ML-DSA-87 over signed_payload." }
+        iscs: [S7, S8, S9, A-S3]
+
+      - name: PostPayload
+        defined_in: "proto/daemonseed/v1/public_space.proto"
+        added_in: "v0.8.0 (M6)"
+        purpose: >-
+          Inner signed payload of an announcement post (ISC-S7). Encoded into a
+          SignedArtifact.signed_payload. Topic must be an existing operator-
+          defined topic; signers cannot create topics.
+        fields:
+          - { name: topic, type: string, tag: 1, note: "Operator-defined topic id. Topic set is operator-only server config." }
+          - { name: body, type: string, tag: 2, note: "Post content; rendering policy is a client concern." }
+          - { name: signed_timestamp_ms, type: int64, tag: 3, note: "Signer wall-clock ms; orders posts within a topic." }
+        iscs: [S7]
+
+      - name: PostDeletePayload
+        defined_in: "proto/daemonseed/v1/public_space.proto"
+        added_in: "v0.8.0 (M6)"
+        purpose: >-
+          Inner signed payload of a post deletion (ISC-S7). A signer may delete
+          only their own previously-signed post, matched by content-address.
+        fields:
+          - { name: content_address, type: bytes, tag: 1, note: "SHA-384(signed_payload) of the post being deleted." }
+          - { name: signed_timestamp_ms, type: int64, tag: 2, note: "Signer wall-clock ms (freshness; not for ordering)." }
+        iscs: [S7]
+
+      - name: Post
+        defined_in: "proto/daemonseed/v1/public_space.proto"
+        added_in: "v0.8.0 (M6)"
+        purpose: >-
+          A stored post as served to clients: the signer's artifact plus the
+          server-computed content-address. The client MUST re-derive
+          SHA-384(artifact.signed_payload) and reject mismatches — the server is
+          untrusted to assert the address (ISC-A-S3: verify-and-serve).
+        fields:
+          - { name: artifact, type: SignedArtifact, tag: 1, note: "Signer's signed PostPayload." }
+          - { name: content_address, type: bytes, tag: 2, note: "SHA-384(artifact.signed_payload). Server-asserted; client re-verifies." }
+        iscs: [S7, A-S3]
+
+      - name: MotdPayload
+        defined_in: "proto/daemonseed/v1/public_space.proto"
+        added_in: "v0.8.0 (M6)"
+        purpose: >-
+          Inner signed payload of the message-of-the-day (ISC-S9). Plaintext
+          only — the client renders `text` with no markdown/HTML/link parsing
+          (anti-injection). Single-slot: the latest validated MOTD wins.
+        fields:
+          - { name: text, type: string, tag: 1, note: "Plaintext MOTD. Client renders verbatim, no markup interpretation (anti-injection)." }
+          - { name: signed_timestamp_ms, type: int64, tag: 2, note: "Signer wall-clock ms; latest validated update wins." }
+        iscs: [S9]
+
+      - name: SignerWhitelistEntry
+        defined_in: "proto/daemonseed/v1/public_space.proto"
+        added_in: "v0.8.0 (M6)"
+        purpose: >-
+          One published signer-whitelist entry (ISC-S8). Published so clients can
+          independently verify provenance against the same list the server uses.
+          Either a full public key OR a `<name>#<hash-prefix>` handle.
+        fields:
+          - { name: full_pubkey, type: bytes, tag: 1, note: "oneof entry: full ML-DSA-87 public key." }
+          - { name: handle, type: string, tag: 2, note: "oneof entry: `<name>#<hash-prefix>` handle (ISC-C4/S11 hash semantics)." }
+        iscs: [S8]
+
+      - name: RatingTaxonomy
+        defined_in: "proto/daemonseed/v1/public_space.proto"
+        added_in: "v0.8.0 (M6)"
+        purpose: >-
+          Operator-defined content-rating labels (ISC-S10). Purely declarative:
+          the server publishes the taxonomy and propagates sharer-assigned tags
+          but never enforces or filters by rating (ISC-A-S5b).
+        fields:
+          - { name: labels, type: "repeated string", tag: 1, note: "Operator-chosen labels in operator-chosen order, e.g. ['PG13','R','X']." }
+        iscs: [S10, A-S5b]
+
+      - name: PublicShareListing
+        defined_in: "proto/daemonseed/v1/public_space.proto"
+        added_in: "v0.8.0 (M6)"
+        purpose: >-
+          A single public-space share in the listing (ISC-C19 / finding F25). The
+          rating tag is the sharer's self-classification (advisory, not server-
+          verified per ISC-A-S5b). M6 defines this surface; share content
+          transfer is M8.
+        fields:
+          - { name: share_id, type: string, tag: 1, note: "Opaque server-scoped share identifier." }
+          - { name: name, type: string, tag: 2, note: "Display name of the shared folder." }
+          - { name: rating, type: string, tag: 3, note: "Sharer-assigned label from the active taxonomy. Advisory only." }
+        iscs: [C19, A-S5b]
+
+      # Request/response wrappers for the PublicSpace service (M6,
+      # public_space.proto). Thin envelopes; see `services:` below for the RPC
+      # mapping. GetMotdRequest, GetTaxonomyRequest, GetSignerWhitelistRequest,
+      # ListPublicSharesRequest, DeletePostResponse are empty messages.
+      # GetMotdResponse{ motd: SignedArtifact }, ListPostsRequest{ topic:
+      # optional string }, ListPostsResponse{ posts: repeated Post },
+      # GetTaxonomyResponse{ taxonomy: RatingTaxonomy }, GetSignerWhitelist-
+      # Response{ entries: repeated SignerWhitelistEntry }, UploadPostRequest{
+      # artifact: SignedArtifact }, UploadPostResponse{ content_address: bytes },
+      # DeletePostRequest{ delete_artifact: SignedArtifact },
+      # ListPublicSharesResponse{ shares: repeated PublicShareListing }.
+
+# ─────────────────────────────────────────────────────────────────────
+# Services
+# ─────────────────────────────────────────────────────────────────────
+
+services:
+  - name: PublicSpace
+    defined_in: "proto/daemonseed/v1/public_space.proto"
+    added_in: "v0.8.0 (M6)"
+    transport: >-
+      gRPC-over-h2 over the post-Authenticated TLS stream. This is the FIRST
+      application-stream service in the protocol — everything up to and
+      including the identity-proof exchange runs as length-prefixed prost frames
+      on the raw TLS stream; once the connection reaches the `Authenticated`
+      type-state it is served here. Reference impl:
+      `daemonseed_server::public_space::serve_public_space`.
+    purpose: >-
+      Public-space reads (MOTD, posts, taxonomy, whitelist, share listing) and
+      signed writes (post upload/delete). All RPCs unary; the streaming CoT
+      subscription surface is a separate M8 service.
+    rpcs:
+      - { name: GetMotd, request: GetMotdRequest, response: GetMotdResponse, iscs: [S9], note: "Current signed MOTD or empty." }
+      - { name: ListPosts, request: ListPostsRequest, response: ListPostsResponse, iscs: [S7], note: "Posts ordered by signed-ts per topic; unset topic = all." }
+      - { name: GetTaxonomy, request: GetTaxonomyRequest, response: GetTaxonomyResponse, iscs: [S10], note: "Operator rating labels." }
+      - { name: GetSignerWhitelist, request: GetSignerWhitelistRequest, response: GetSignerWhitelistResponse, iscs: [S8], note: "Published whitelist for independent provenance verification." }
+      - { name: UploadPost, request: UploadPostRequest, response: UploadPostResponse, iscs: [S7, A-S3], note: "Verifies signature vs current whitelist; never originates content. Rejects via gRPC status on unknown signer / bad signature." }
+      - { name: DeletePost, request: DeletePostRequest, response: DeletePostResponse, iscs: [S7], note: "Signer deletes own post, matched by content-address." }
+      - { name: ListPublicShares, request: ListPublicSharesRequest, response: ListPublicSharesResponse, iscs: [C19, A-S5b], note: "Full listing with advisory rating tags; client filters locally (no server-side filter). Share content transfer is M8." }
+
 # ─────────────────────────────────────────────────────────────────────
 # Codegen pipeline
 # ─────────────────────────────────────────────────────────────────────
@@ -267,6 +414,7 @@ codegen:
     prost: "=0.13.4"
     prost-types: "=0.13.4"
     tonic-build: "=0.12.3 (default-features = false, features = ['prost'])"
+    tonic: "=0.12.3 (runtime dep, added v0.8.0/M6 — the first `service` block makes the generated client/server stubs reference `tonic::`; messages-only milestones did not need it)"
   output: "OUT_DIR (regenerated on every cargo build)"
   committed_snapshot:
     path: "src/generated/"
@@ -318,12 +466,37 @@ protocol_rules:
       constructor is a protocol violation.
     iscs: [C24, S15]
 
+  - name: "Application-stream layer (PublicSpace, M6)"
+    status: "Schema active (v0.8.0 / M6 commit 1); server handoff via daemonseed_server::public_space::serve_public_space"
+    summary: >-
+      The post-Authenticated application stream is gRPC-over-h2 served by the
+      PublicSpace service (and, later, an M8 CoT service). The reference server
+      hands the single already-Authenticated TLS connection to a tonic Server
+      via `serve_with_incoming` over a one-element stream; the connection IO
+      gets tonic's `Connected` via a local newtype with `ConnectInfo = ()`
+      (peer identity already established by the identity-proof phase). Reaching
+      this layer without a verified peer is a compile error upstream (ISC-C23
+      type-state).
+    iscs: [S4, C23]
+
+  - name: "Signed-artifact content-address contract"
+    status: "active (decided 2026-05-25)"
+    summary: >-
+      Posts (ISC-S7) and the MOTD (ISC-S9) are signed via SignedArtifact, where
+      the ML-DSA-87 signature and the SHA-384 content-address both cover
+      `signed_payload` VERBATIM. protobuf is not canonical across
+      implementations, so the signer's exact serialized bytes are the
+      authoritative artifact: clients and servers store and forward
+      `signed_payload` byte-for-byte and MUST NOT re-encode the inner *Payload.
+      Re-encoding would change the content-address and invalidate the signature.
+    iscs: [S7, S9, A-S3]
+
 # ─────────────────────────────────────────────────────────────────────
 # Future packages (not yet defined)
 # ─────────────────────────────────────────────────────────────────────
 
 planned:
   - "CoTAssetPayload (M8 — server-opaque circle-of-trust asset relay)"
-  - "Post / Mention / Rating (M6 — public-space messages)"
+  - "Mention (M9 — @mention with no server-visible distinction per ISC-C17/A-C4)"
   - "SuiteDeprecationPolicy (M7 — operator-signed cutoff dates per ISC-S16)"
   - "UpdateManifest / CriticalUpdate (M10 — signed release distribution per ISC-C27 / S18)"
