@@ -39,7 +39,7 @@
 //!       params     = persisted [argon2] table (ISC-C14),
 //!       length     = 32,
 //!   )
-//!   aead_key     = HKDF-SHA256-Expand(
+//!   aead_key     = HKDF-SHA384-Expand(
 //!       prk  = intermediate,
 //!       info = "daemonseed/at-rest/<profile-id>",
 //!       length = 32,
@@ -53,6 +53,8 @@
 //! bytes into the AAD so a tamper-swap of the suite tag fails AEAD auth —
 //! the receiver cannot be tricked into running a v2 blob under the wrong
 //! suite's primitives without the AEAD detecting it.
+
+use std::collections::BTreeMap;
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use oxicrypt_aes::{Aes256Key, gcm_decrypt, gcm_encrypt};
@@ -95,30 +97,127 @@ pub const ARGON2_OUTPUT_LEN: usize = 48;
 /// AEAD key length (AES-256 → 32 bytes).
 pub const AEAD_KEY_LEN: usize = 32;
 
-/// Plaintext payload of the at-rest blob. M1 carries only the mnemonic;
-/// M2+ extends this struct with circle-of-trust seed material, mute/hide
-/// lists, and settings.
+/// Replay-protection counter state persisted alongside the mnemonic
+/// (`project_clocks_freshness`).
+///
+/// - `send_counter` is this identity's own monotonic counter. The
+///   orchestration layer calls [`next_send`](CounterState::next_send) for each
+///   identity-proof envelope it builds; persisting it is what stops a restarted
+///   client from re-emitting a counter value a peer has already recorded
+///   (which the peer would reject as a replay). **This is the load-bearing
+///   field** — ISC-33.
+/// - `seen` is the highest counter accepted per target `(signer-key /
+///   server-id)` — ISC-34. The verifier ([`crate::identity_proof::verify_envelope`])
+///   consumes this via its `highest_seen_counter` argument. Persisting it is
+///   defense-in-depth: channel binding already defeats cross-session replay,
+///   so a forgotten `seen` map across restart is not a vulnerability. **A
+///   *server* MUST NOT persist its per-client `seen` map** (ISC-A-S1 / A-S12,
+///   RAM-only) — that is the server orchestration's responsibility; this type
+///   merely makes persistence *possible* for the client's per-server map.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CounterState {
+    send_counter: u64,
+    seen: BTreeMap<String, u64>,
+}
+
+impl CounterState {
+    /// Increment and return the next send counter (first call returns 1).
+    pub fn next_send(&mut self) -> u64 {
+        self.send_counter += 1;
+        self.send_counter
+    }
+
+    /// The current send counter without advancing it (0 if nothing sent).
+    pub fn current_send(&self) -> u64 {
+        self.send_counter
+    }
+
+    /// Highest counter accepted from `target`, or `None` if never seen.
+    pub fn highest_seen(&self, target: &str) -> Option<u64> {
+        self.seen.get(target).copied()
+    }
+
+    /// Record `counter` as seen from `target`, keeping the maximum. Call after
+    /// a successful [`verify_envelope`](crate::identity_proof::verify_envelope).
+    pub fn record_seen(&mut self, target: &str, counter: u64) {
+        let entry = self.seen.entry(target.to_string()).or_insert(0);
+        if counter > *entry {
+            *entry = counter;
+        }
+    }
+}
+
+/// Plaintext payload of the at-rest blob. M1 carried only the mnemonic; M4b
+/// adds replay-protection [`CounterState`]. M5+ extends it further with
+/// circle-of-trust seed material, mute/hide lists, and settings.
+///
+/// ## Plaintext schema (directive lines)
+///
+/// The decrypted payload is line-based and **backward-compatible**: line 0 is
+/// always the 24-word mnemonic phrase (the entire M1/M2/M3 payload), and any
+/// following lines are `directive` entries — `send-counter <n>` and
+/// `seen <target> <n>`. A bare-phrase payload (no extra lines, the legacy
+/// form) parses with default counters, so existing blobs open without
+/// re-enrollment. Default-counter seeds serialize back to the bare phrase, so
+/// nothing changes on the wire until a counter is actually used. The
+/// directive scheme is additive — future fields append new directive kinds
+/// without a blob-format (magic) bump.
 pub struct Seeds {
     pub mnemonic: Mnemonic,
+    pub counters: CounterState,
 }
 
 impl core::fmt::Debug for Seeds {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Seeds")
             .field("mnemonic", &"<redacted>")
+            .field("counters", &self.counters)
             .finish()
     }
 }
 
 impl Seeds {
+    /// A fresh payload wrapping `mnemonic` with empty counter state.
+    pub fn new(mnemonic: Mnemonic) -> Self {
+        Self {
+            mnemonic,
+            counters: CounterState::default(),
+        }
+    }
+
     fn to_plaintext(&self) -> String {
-        self.mnemonic.to_phrase()
+        let mut s = self.mnemonic.to_phrase();
+        if self.counters.send_counter != 0 {
+            s.push_str(&format!("\nsend-counter {}", self.counters.send_counter));
+        }
+        for (target, counter) in &self.counters.seen {
+            s.push_str(&format!("\nseen {target} {counter}"));
+        }
+        s
     }
 
     fn from_plaintext(s: &str) -> Result<Self, BlobError> {
-        Mnemonic::from_phrase(s)
-            .map(|mnemonic| Self { mnemonic })
-            .map_err(BlobError::Mnemonic)
+        let mut lines = s.lines();
+        let phrase = lines.next().ok_or(BlobError::InvalidPlaintext)?;
+        let mnemonic = Mnemonic::from_phrase(phrase).map_err(BlobError::Mnemonic)?;
+        let mut counters = CounterState::default();
+        for line in lines {
+            let mut parts = line.splitn(3, ' ');
+            match parts.next() {
+                Some("send-counter") => {
+                    let n = parts.next().ok_or(BlobError::InvalidPlaintext)?;
+                    counters.send_counter = n.parse().map_err(|_| BlobError::InvalidPlaintext)?;
+                }
+                Some("seen") => {
+                    let target = parts.next().ok_or(BlobError::InvalidPlaintext)?;
+                    let n = parts.next().ok_or(BlobError::InvalidPlaintext)?;
+                    let counter = n.parse().map_err(|_| BlobError::InvalidPlaintext)?;
+                    counters.seen.insert(target.to_string(), counter);
+                }
+                _ => return Err(BlobError::InvalidPlaintext),
+            }
+        }
+        Ok(Self { mnemonic, counters })
     }
 }
 
@@ -454,9 +553,60 @@ mod tests {
     }
 
     fn fresh_seeds() -> Seeds {
-        Seeds {
-            mnemonic: Mnemonic::generate().unwrap(),
-        }
+        Seeds::new(Mnemonic::generate().unwrap())
+    }
+
+    #[test]
+    fn fresh_seeds_have_default_counters() {
+        let seeds = Seeds::new(Mnemonic::generate().unwrap());
+        assert_eq!(seeds.counters.current_send(), 0);
+        assert_eq!(seeds.counters.highest_seen("anything"), None);
+    }
+
+    #[test]
+    fn counter_state_round_trips_through_blob() {
+        ensure_oxicrypt_initialized();
+        let pid = Uuid::new_v4();
+        let pp = "correct horse battery staple table mountain";
+        let mut seeds = Seeds::new(Mnemonic::generate().unwrap());
+        assert_eq!(seeds.counters.next_send(), 1);
+        assert_eq!(seeds.counters.next_send(), 2);
+        seeds.counters.record_seen("srv#aabbccddeeff", 7);
+        seeds.counters.record_seen("peer#001122334455", 3);
+
+        let blob = seal(&seeds, pp, pid, test_params()).unwrap();
+        let recovered = open(&blob, pp, pid, test_params()).unwrap().seeds;
+        assert_eq!(recovered.counters.current_send(), 2);
+        assert_eq!(recovered.counters.highest_seen("srv#aabbccddeeff"), Some(7));
+        assert_eq!(
+            recovered.counters.highest_seen("peer#001122334455"),
+            Some(3)
+        );
+        assert_eq!(recovered.counters.highest_seen("unknown"), None);
+    }
+
+    #[test]
+    fn legacy_bare_phrase_blob_opens_with_default_counters() {
+        // Default-counter seeds serialize to the bare-phrase plaintext (the
+        // M1/M2/M3 form), so this exercises the backward-compatible read path:
+        // an existing test-group blob must still open with no re-enrollment.
+        ensure_oxicrypt_initialized();
+        let pid = Uuid::new_v4();
+        let pp = "correct horse battery staple table mountain";
+        let seeds = Seeds::new(Mnemonic::generate().unwrap());
+        let blob = seal(&seeds, pp, pid, test_params()).unwrap();
+        let recovered = open(&blob, pp, pid, test_params()).unwrap().seeds;
+        assert_eq!(recovered.counters.current_send(), 0);
+    }
+
+    #[test]
+    fn record_seen_keeps_the_highest() {
+        let mut cs = CounterState::default();
+        cs.record_seen("t", 5);
+        cs.record_seen("t", 3); // lower — must be ignored
+        assert_eq!(cs.highest_seen("t"), Some(5));
+        cs.record_seen("t", 8);
+        assert_eq!(cs.highest_seen("t"), Some(8));
     }
 
     #[test]

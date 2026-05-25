@@ -616,9 +616,7 @@ mod tests {
         let pid = Uuid::new_v4();
         let pp = "passphrase x";
         let m = fresh_mnemonic();
-        let seeds_payload = seeds::Seeds {
-            mnemonic: m.clone(),
-        };
+        let seeds_payload = seeds::Seeds::new(m.clone());
         let at_rest_blob = seeds::seal(&seeds_payload, pp, pid, fast_params()).unwrap();
         // Try to open the at-rest blob as a recovery file. Magic prefix
         // differs — recovery-file should reject it as Malformed.

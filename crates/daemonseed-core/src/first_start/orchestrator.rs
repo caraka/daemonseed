@@ -170,9 +170,7 @@ impl FirstStart<Welcome> {
         let profile_config = ProfileConfig::new_for_first_start(argon2_params);
 
         // (C3) at-rest blob.
-        let seeds = Seeds {
-            mnemonic: mnemonic.clone(),
-        };
+        let seeds = Seeds::new(mnemonic.clone());
         let blob_bytes = seeds::seal(
             &seeds,
             passphrase,

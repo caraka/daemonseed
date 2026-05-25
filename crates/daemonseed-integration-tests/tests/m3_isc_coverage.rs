@@ -50,9 +50,7 @@ fn m3_iscs_exercise_end_to_end() {
     let pid = Uuid::new_v4();
     let mnemonic = daemonseed_core::identity::mnemonic::Mnemonic::generate().unwrap();
     let phrase = mnemonic.to_phrase();
-    let payload = seeds::Seeds {
-        mnemonic: mnemonic.clone(),
-    };
+    let payload = seeds::Seeds::new(mnemonic.clone());
 
     let v2_blob = seeds::seal(&payload, STRONG_PASSPHRASE, pid, fast_params()).unwrap();
     let opened = seeds::open(&v2_blob, STRONG_PASSPHRASE, pid, fast_params()).unwrap();
