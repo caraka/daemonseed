@@ -33,6 +33,7 @@ use daemonseed_server::{
     identity::{IdentityError, derive_server_id, load_or_generate},
     identity_proof::{IdentityProofError, ServerIdentity},
     kats::CNSA_2_0_KATS,
+    public_space::{LoadError, PublicSpaceConfig, PublicSpaceState},
     runtime::{noop_observer, parse_listen_addr, run, shutdown_signal},
     tls::{DEFAULT_CERT_VALIDITY, TlsError, build_server_config, install_provider},
 };
@@ -96,6 +97,23 @@ fn run_server(cli: Cli) -> Result<(), BootError> {
     let identity =
         Arc::new(ServerIdentity::from_seed(&seed, &server_id).map_err(BootError::IdentityProof)?);
 
+    // Public-space state (M6): load + verify the signer whitelist, posts, and
+    // MOTD from disk. The server's own key is accepted as a MOTD signer
+    // (ISC-26). Verify-and-serve — invalid artifacts are skipped, not served.
+    let public_space = Arc::new(
+        PublicSpaceState::load(
+            &PublicSpaceConfig {
+                posts_dir: config.posts_dir.as_deref(),
+                motd_path: config.motd_path.as_deref(),
+                whitelist_path: config.signer_whitelist_path.as_deref(),
+                taxonomy: &config.rating_taxonomy,
+                topics: &config.topics,
+            },
+            identity.public_key(),
+        )
+        .map_err(BootError::PublicSpace)?,
+    );
+
     let addr = parse_listen_addr(&config.listen_addr).map_err(BootError::ListenAddr)?;
 
     // Step 8 — runtime. The multi-thread builder is used so the accept
@@ -110,6 +128,7 @@ fn run_server(cli: Cli) -> Result<(), BootError> {
             addr,
             tls_config,
             identity,
+            public_space,
             shutdown_signal(),
             noop_observer(),
         ))
@@ -127,6 +146,7 @@ enum BootError {
     Tls(TlsError),
     Identity(IdentityError),
     IdentityProof(IdentityProofError),
+    PublicSpace(LoadError),
     ListenAddr(std::io::Error),
     Runtime(std::io::Error),
     Accept(std::io::Error),
@@ -141,6 +161,7 @@ impl std::fmt::Display for BootError {
             Self::Tls(e) => write!(f, "{e}"),
             Self::Identity(e) => write!(f, "{e}"),
             Self::IdentityProof(e) => write!(f, "server identity setup failed: {e}"),
+            Self::PublicSpace(e) => write!(f, "public-space load failed: {e}"),
             Self::ListenAddr(e) => write!(f, "listen_addr parse failed: {e}"),
             Self::Runtime(e) => write!(f, "tokio runtime build failed: {e}"),
             Self::Accept(e) => write!(f, "accept loop failed: {e}"),

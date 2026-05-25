@@ -4,7 +4,7 @@
 //! The relay is verify-and-serve only (ISC-A-S3): it never originates a post
 //! or MOTD, and a client never trusts the server's assertions about a post's
 //! provenance or address. Both sides therefore run the *same* three checks
-//! against an arriving [`SignedArtifact`]:
+//! against an arriving `SignedArtifact`:
 //!
 //! 1. **Content-address** — `SHA-384(signed_payload)` (ISC-17 / ISC-S7). The
 //!    address is derived, never asserted; a server-supplied address is
@@ -173,7 +173,7 @@ const PROJECT_RELEASE_SEED: [u8; 32] = [0x5d; 32];
 /// whitelist file, and there is no file syntax that removes it — that
 /// non-removability is the whole point of F17 (a self-host operator cannot
 /// silence project release announcements). Derived once per process from
-/// [`PROJECT_RELEASE_SEED`]; requires the oxicrypt module to be operational.
+/// `PROJECT_RELEASE_SEED`; requires the oxicrypt module to be operational.
 pub fn project_release_pubkey() -> &'static [u8; ml_dsa::PK_LEN] {
     static KEY: OnceLock<Box<[u8; ml_dsa::PK_LEN]>> = OnceLock::new();
     KEY.get_or_init(|| {
@@ -245,7 +245,7 @@ impl Whitelist {
 
 // ── Artifact verification (ISC-A-S3 / ISC-7 / ISC-17) ────────────────────
 
-/// Why a [`SignedArtifact`] failed verification. The server's `UploadPost`
+/// Why a `SignedArtifact` failed verification. The server's `UploadPost`
 /// maps both `UnknownSigner` and `BadSignature` to the same opaque gRPC
 /// rejection (no oracle for which check failed); a client uses the distinction
 /// to decide whether to drop a server-served artifact.

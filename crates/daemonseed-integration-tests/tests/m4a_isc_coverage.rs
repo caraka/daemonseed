@@ -43,6 +43,7 @@ use daemonseed_server::config::ServerConfig as DseedConfig;
 use daemonseed_server::hello::HelloOutcome;
 use daemonseed_server::identity::{Seed, derive_server_id, generate_seed};
 use daemonseed_server::identity_proof::ServerIdentity;
+use daemonseed_server::public_space::PublicSpaceState;
 use daemonseed_server::runtime;
 use daemonseed_server::tls::{DEFAULT_CERT_VALIDITY, build_server_config, install_provider};
 use prost::Message;
@@ -148,6 +149,7 @@ async fn m4a_iscs_exercise_end_to_end() {
             bound_addr,
             tls_cfg,
             identity,
+            Arc::new(PublicSpaceState::empty()),
             async move {
                 let _ = shutdown_rx.await;
             },

@@ -49,6 +49,7 @@ use crate::hello::{HelloOutcome, serve_hello};
 use crate::identity_proof::{
     RustlsServerExporter, SeenMap, ServerIdentity, now_unix_ms, run_server_identity_proof,
 };
+use crate::public_space::{PublicSpaceService, PublicSpaceState, serve_public_space};
 
 /// Hand the per-connection HELLO outcome up via this callback. Used by
 /// the integration-test harness in commit 6 to observe a real
@@ -78,6 +79,7 @@ pub async fn run<F>(
     addr: SocketAddr,
     tls_config: ServerConfig,
     identity: Arc<ServerIdentity>,
+    public_space: Arc<PublicSpaceState>,
     shutdown: F,
     observer: ConnectionObserver,
 ) -> io::Result<()>
@@ -116,10 +118,11 @@ where
                 let acceptor = acceptor.clone();
                 let observer = observer.clone();
                 let identity = identity.clone();
+                let public_space = public_space.clone();
                 let seen = seen.clone();
                 tokio::spawn(async move {
                     let _ = peer_addr;
-                    serve_connection(acceptor, stream, identity, seen, observer).await;
+                    serve_connection(acceptor, stream, identity, public_space, seen, observer).await;
                 });
             }
         }
@@ -129,8 +132,8 @@ where
 /// Per-connection driver. Performs the TLS handshake, runs HELLO, derives
 /// the identity-proof channel binding from the live TLS session, runs the
 /// identity-proof exchange, and advances the type-state to `Authenticated`
-/// on success (ISC-S19). M4b drops the `Authenticated` connection after a
-/// successful proof — serving the application stream on it is M5+.
+/// on success (ISC-S19). M6 serves the public-space application service over
+/// the now-`Authenticated` stream (ISC-2).
 ///
 /// Every failure mode — bad TLS handshake, HELLO frame error, no-overlap
 /// reject, channel-binding failure, identity-proof rejection — closes the
@@ -140,6 +143,7 @@ async fn serve_connection(
     acceptor: TlsAcceptor,
     stream: TcpStream,
     identity: Arc<ServerIdentity>,
+    public_space: Arc<PublicSpaceState>,
     seen: SeenMap,
     observer: ConnectionObserver,
 ) {
@@ -202,9 +206,14 @@ async fn serve_connection(
     {
         Ok(verified) => {
             // ISC-S19 step 5: the VerifiedPeer token is the only key to the
-            // Authenticated state. M5+ serves the application stream on it;
-            // M4b drops it, closing the connection after a successful proof.
-            let _authenticated = versioned.into_authenticated(verified);
+            // Authenticated state. Reaching here therefore guarantees a
+            // verified peer — so the public-space service is structurally
+            // unreachable before identity-proof (ISC-2 / ISC-C23). M6 serves
+            // it over the raw authenticated stream; the service future ends
+            // when the peer closes the connection.
+            let authenticated = versioned.into_authenticated(verified);
+            let service = PublicSpaceService::new(public_space);
+            let _ = serve_public_space(authenticated.into_inner(), service).await;
         }
         Err(_e) => {
             // Uniform silent close — see the function-level note.

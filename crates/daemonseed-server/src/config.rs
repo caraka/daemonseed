@@ -56,6 +56,43 @@ pub struct ServerConfig {
     /// the idiomatic plural, bridged by `rename`.
     #[serde(rename = "peer", default)]
     pub peers: Vec<PeerConfig>,
+
+    // ── Public space (M6) ────────────────────────────────────────────
+    //
+    // All optional / defaulted so a pre-M6 minimal config still parses. A
+    // relay with no `posts_dir` / `motd_path` simply serves an empty
+    // public space.
+    /// Directory holding signer-written announcement posts (ISC-S7 / ISC-16).
+    /// The server loads every file here into RAM on startup and is the only
+    /// runtime-writable path besides `motd_path` (ISC-A-S8).
+    #[serde(default)]
+    pub posts_dir: Option<PathBuf>,
+
+    /// Path to the single-slot signed MOTD file `motd.signed` (ISC-S9 /
+    /// ISC-22). Absent / missing → no MOTD area.
+    #[serde(default)]
+    pub motd_path: Option<PathBuf>,
+
+    /// Path to the plaintext signer-whitelist file (ISC-S8). One entry per
+    /// line: a hex full ML-DSA-87 key or a `<name>#<hash>` handle. The file is
+    /// operator-owned and never written by the server (ISC-A-S8 / ISC-13).
+    #[serde(default)]
+    pub signer_whitelist_path: Option<PathBuf>,
+
+    /// Operator-defined content-rating labels published to clients (ISC-S10 /
+    /// ISC-27). The server publishes but never enforces these (ISC-A-S5b).
+    #[serde(default)]
+    pub rating_taxonomy: Vec<String>,
+
+    /// Operator-defined announcement topic set (ISC-S7 / ISC-19). Signers may
+    /// post into these topics but cannot create or modify the set.
+    #[serde(default)]
+    pub topics: Vec<String>,
+
+    /// Source-code location advertised in the APP_HELLO `server_source` field
+    /// (ISC-9 / finding F32) — the AGPL "corresponding source" pointer.
+    #[serde(default)]
+    pub server_source: Option<String>,
 }
 
 /// One federation peer in the server's TOML (`[[peer]]`).
@@ -245,6 +282,47 @@ mod tests {
     fn peers_default_to_empty() {
         let cfg = ServerConfig::from_toml(r#"key_path = "/k""#).unwrap();
         assert!(cfg.peers.is_empty(), "no [[peer]] tables → no peers");
+    }
+
+    #[test]
+    fn public_space_fields_default_when_absent() {
+        // A minimal pre-M6 config must still parse — every public-space field
+        // is optional / defaulted so existing relays don't need rewriting.
+        let cfg = ServerConfig::from_toml(r#"key_path = "/k""#).unwrap();
+        assert_eq!(cfg.posts_dir, None);
+        assert_eq!(cfg.motd_path, None);
+        assert_eq!(cfg.signer_whitelist_path, None);
+        assert!(cfg.rating_taxonomy.is_empty());
+        assert!(cfg.topics.is_empty());
+        assert_eq!(cfg.server_source, None);
+    }
+
+    #[test]
+    fn public_space_fields_parse_when_present() {
+        let cfg = ServerConfig::from_toml(
+            r#"
+            key_path = "/k"
+            posts_dir = "/srv/ds/posts"
+            motd_path = "/srv/ds/motd.signed"
+            signer_whitelist_path = "/srv/ds/signers.txt"
+            rating_taxonomy = ["PG13", "R", "X"]
+            topics = ["announcements", "downtime"]
+            server_source = "https://relay.example/source"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.posts_dir, Some(PathBuf::from("/srv/ds/posts")));
+        assert_eq!(cfg.motd_path, Some(PathBuf::from("/srv/ds/motd.signed")));
+        assert_eq!(
+            cfg.signer_whitelist_path,
+            Some(PathBuf::from("/srv/ds/signers.txt"))
+        );
+        assert_eq!(cfg.rating_taxonomy, vec!["PG13", "R", "X"]);
+        assert_eq!(cfg.topics, vec!["announcements", "downtime"]);
+        assert_eq!(
+            cfg.server_source.as_deref(),
+            Some("https://relay.example/source")
+        );
     }
 
     #[test]
