@@ -66,6 +66,51 @@ pub struct AppHelloReject {
     #[prost(message, repeated, tag = "2")]
     pub server_supported: ::prost::alloc::vec::Vec<ProtocolVersion>,
 }
+/// A request for federation peers. An empty `target_server_id` requests the
+/// introducer's full (filtered) peer list; a populated `target_server_id`
+/// requests just that one peer's triple. Per ISC-A-S7 a by-id query for an
+/// unknown OR don't-introduce peer yields an empty `IntroducerResponse` — the
+/// two cases are indistinguishable on the wire.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct IntroducerQuery {
+    /// Optional exact server-id (`<name>#<12hex>`) to look up. Unset/empty means
+    /// "return the full filtered peer list".
+    #[prost(string, optional, tag = "1")]
+    pub target_server_id: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// A single federation peer the introducer is willing to reveal.
+///
+/// There is deliberately NO public-key field, and there must never be one
+/// (ISC-S6). See the file header for why this is load-bearing.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PeerTriple {
+    /// The peer's server-id (`<name>#<12hex>` per ISC-S11 / ISC-C4). The 12-hex
+    /// suffix is a hash fingerprint, NOT the key itself — the client/peer must
+    /// still acquire the full key through its own trust mode (ISC-C22).
+    #[prost(string, tag = "1")]
+    pub server_id: ::prost::alloc::string::String,
+    /// Reachable address: a hostname OR a raw IP literal (IPv4 or IPv6) per
+    /// ISC-S6. Community operators without DNS are first-class. A non-default
+    /// port is appended `address:port`; the default 443 (ISC-S5) is omitted.
+    #[prost(string, tag = "2")]
+    pub address: ::prost::alloc::string::String,
+    /// Best-effort last-known-availability, unix milliseconds. Optional: the
+    /// RAM-only availability-observation producer is deferred past MVP (finding
+    /// F15), so MVP introducers leave this unset. Kept in the schema now so
+    /// populating it later is an additive change, not a wire bump.
+    #[prost(uint64, optional, tag = "3")]
+    pub last_known_availability_unix_ms: ::core::option::Option<u64>,
+}
+/// The introducer's reply: zero or more peer triples, never any public keys.
+/// An empty list is a valid response and is what a by-id query returns for an
+/// unknown or don't-introduce peer (ISC-A-S7).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct IntroducerResponse {
+    /// The revealed peers. Excludes every `introduce-to-clients=false` peer
+    /// (ISC-S13) regardless of whether the query was a list or a by-id lookup.
+    #[prost(message, repeated, tag = "1")]
+    pub peers: ::prost::alloc::vec::Vec<PeerTriple>,
+}
 /// Wire-tagged identifier for a registry entry. Carried on every
 /// cryptographic artifact (at-rest blob header, recovery file header,
 /// CoT-asset payload, identity-proof signature, server-wide signed material).

@@ -216,6 +216,47 @@ packages:
           - { name: min_suite_id, type: SuiteId, tag: 1, note: "Optional in wire encoding (proto3 message default), but app-layer constructors always supply a value. A deserialized None MUST be rejected at the application boundary." }
         iscs: [C24, A-C8]
 
+      - name: IntroducerQuery
+        defined_in: "proto/daemonseed/v1/federation.proto"
+        added_in: "v0.7.0 (M5)"
+        purpose: >-
+          A request for federation peers (ISC-S6). An empty target returns the
+          full introduce-to-clients-filtered peer list; a populated target asks
+          for one peer. Per ISC-A-S7 a by-id query for an unknown OR a
+          don't-introduce peer yields an empty response — the two are
+          indistinguishable on the wire.
+        fields:
+          - { name: target_server_id, type: "optional string", tag: 1, note: "Exact server-id to look up; unset/empty means the full filtered list." }
+        iscs: [S6, S13, A-S7]
+
+      - name: PeerTriple
+        defined_in: "proto/daemonseed/v1/federation.proto"
+        added_in: "v0.7.0 (M5)"
+        purpose: >-
+          One revealed federation peer. THE INVARIANT (ISC-S6): there is no
+          public-key field and there must never be one — discovery is decoupled
+          from trust, so a client/peer must still acquire the full key through
+          its own ISC-C22 trust mode (TOFU in trusted, out-of-band in
+          untrusted). This makes transitive-trust collapse impossible by
+          construction.
+        fields:
+          - { name: server_id, type: string, tag: 1, note: "Peer server-id `<name>#<12hex>`. The 12-hex suffix is a hash fingerprint, NOT the key." }
+          - { name: address, type: string, tag: 2, note: "Hostname OR raw IPv4/IPv6 literal (ISC-S6); non-default port appended `:port`, default 443 omitted." }
+          - { name: last_known_availability_unix_ms, type: "optional uint64", tag: 3, note: "Best-effort availability. Unset at MVP — the RAM-only producer is deferred (finding F15); kept in schema so populating it later is additive." }
+        iscs: [S6]
+
+      - name: IntroducerResponse
+        defined_in: "proto/daemonseed/v1/federation.proto"
+        added_in: "v0.7.0 (M5)"
+        purpose: >-
+          The introducer's reply: zero or more peer triples, never any keys.
+          Excludes every introduce-to-clients=false peer (ISC-S13). An empty
+          list is valid and is what a by-id query returns for an unknown or
+          don't-introduce peer (ISC-A-S7).
+        fields:
+          - { name: peers, type: "repeated PeerTriple", tag: 1, note: "Revealed peers, already filtered by introduce-to-clients." }
+        iscs: [S6, S13, A-S7]
+
 # ─────────────────────────────────────────────────────────────────────
 # Codegen pipeline
 # ─────────────────────────────────────────────────────────────────────
@@ -282,7 +323,6 @@ protocol_rules:
 # ─────────────────────────────────────────────────────────────────────
 
 planned:
-  - "FederationIntroducer (M5 — introducer responses, no keys per ISC-A-S6)"
   - "CoTAssetPayload (M8 — server-opaque circle-of-trust asset relay)"
   - "Post / Mention / Rating (M6 — public-space messages)"
   - "SuiteDeprecationPolicy (M7 — operator-signed cutoff dates per ISC-S16)"

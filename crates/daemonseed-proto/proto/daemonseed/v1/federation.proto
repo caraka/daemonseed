@@ -1,0 +1,78 @@
+// daemonseed wire protocol — federation introducer (M5).
+//
+// Anchors ISC-S6 / ISC-S12 / ISC-S13 / ISC-A-S7. A server may act as an
+// introducer: on request it returns the federation peers it knows about as
+// `(server-id, address, last-known-availability)` triples so a client (or a
+// peering server) can discover other relays.
+//
+// THE HARD INVARIANT (ISC-S6): an introducer response NEVER carries a public
+// key. This is enforced structurally — `PeerTriple` has no key field and must
+// never gain one. Discovery is decoupled from trust establishment: a client
+// that learns about a server here MUST still obtain that server's key through
+// its own configured trust mode (ISC-C22) — TOFU-on-first-contact in trusted
+// mode, or an out-of-band key in untrusted mode. A permissive introducer
+// therefore cannot weaken a downstream untrusted-mode client's protection
+// (transitive-trust collapse is impossible by construction). The same
+// invariant governs server-to-server introductions (ISC-S12): server A
+// learning about server C via server B does NOT auto-trust C's key.
+//
+// `introduce-to-clients=false` peers (ISC-S13) are excluded from every
+// introducer response — both client-facing and server-to-server — and a
+// by-id query for such a peer returns the SAME empty response as a query for
+// a genuinely-unknown peer (ISC-A-S7), so an active attacker cannot confirm a
+// suspected don't-introduce peer's existence by asking for it.
+//
+// MINOR bumps to this schema MUST be additive-only (ISC-S14). Never reuse
+// field numbers, never repurpose enum values, never tighten validation after
+// the field has shipped. Adding this message set is itself additive — it
+// introduces no change to the APP_HELLO handshake, so the wire-protocol
+// version stays 1.0.
+//
+// Framing on the wire: each frame is a length-prefixed (u32 big-endian)
+// prost-encoded message — see `daemonseed-server::hello` for the framing.
+
+syntax = "proto3";
+
+package daemonseed.v1;
+
+// A request for federation peers. An empty `target_server_id` requests the
+// introducer's full (filtered) peer list; a populated `target_server_id`
+// requests just that one peer's triple. Per ISC-A-S7 a by-id query for an
+// unknown OR don't-introduce peer yields an empty `IntroducerResponse` — the
+// two cases are indistinguishable on the wire.
+message IntroducerQuery {
+  // Optional exact server-id (`<name>#<12hex>`) to look up. Unset/empty means
+  // "return the full filtered peer list".
+  optional string target_server_id = 1;
+}
+
+// A single federation peer the introducer is willing to reveal.
+//
+// There is deliberately NO public-key field, and there must never be one
+// (ISC-S6). See the file header for why this is load-bearing.
+message PeerTriple {
+  // The peer's server-id (`<name>#<12hex>` per ISC-S11 / ISC-C4). The 12-hex
+  // suffix is a hash fingerprint, NOT the key itself — the client/peer must
+  // still acquire the full key through its own trust mode (ISC-C22).
+  string server_id = 1;
+
+  // Reachable address: a hostname OR a raw IP literal (IPv4 or IPv6) per
+  // ISC-S6. Community operators without DNS are first-class. A non-default
+  // port is appended `address:port`; the default 443 (ISC-S5) is omitted.
+  string address = 2;
+
+  // Best-effort last-known-availability, unix milliseconds. Optional: the
+  // RAM-only availability-observation producer is deferred past MVP (finding
+  // F15), so MVP introducers leave this unset. Kept in the schema now so
+  // populating it later is an additive change, not a wire bump.
+  optional uint64 last_known_availability_unix_ms = 3;
+}
+
+// The introducer's reply: zero or more peer triples, never any public keys.
+// An empty list is a valid response and is what a by-id query returns for an
+// unknown or don't-introduce peer (ISC-A-S7).
+message IntroducerResponse {
+  // The revealed peers. Excludes every `introduce-to-clients=false` peer
+  // (ISC-S13) regardless of whether the query was a list or a by-id lookup.
+  repeated PeerTriple peers = 1;
+}
