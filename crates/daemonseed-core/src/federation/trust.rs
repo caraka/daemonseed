@@ -84,6 +84,18 @@ pub struct TrustQuery<'a> {
 
 /// Decide whether to trust a peer presenting `presented_pubkey`, per ISC-C22 /
 /// ISC-S12. Pure and total — see the module docs.
+///
+/// **Caller-contract for the established-pin (`pinned_key.is_some()`) branch:**
+/// this branch decides identity *continuity* by comparing against the pin and
+/// does NOT re-bind to `expected_prefix`. That is correct for the TOFU model
+/// (the pin is the authority after first contact), but it means the caller is
+/// responsible for any dialed-identity binding it wants on rotation. The client
+/// path (`daemonseed-cli::connect`) currently runs M4b's A-C18 check
+/// (`presented hash-prefix == dialed server-id`) inside the identity-proof
+/// *before* this function — which, by design, also makes a rotated key (new
+/// hash) fail closed there. A future server-to-server caller MUST decide its
+/// own dialed-identity binding before relying on this branch; do not assume
+/// `evaluate_trust` alone proves "this is the peer I meant to reach".
 pub fn evaluate_trust(q: &TrustQuery) -> TrustDecision {
     match q.mode {
         // Untrusted: the pre-configured key must match byte-for-byte. Any

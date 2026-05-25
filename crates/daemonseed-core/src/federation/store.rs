@@ -68,6 +68,13 @@ pub trait TrustStore {
     /// Set/update the TOFU pin for `server_id` (no-op if unknown).
     fn set_pin(&mut self, server_id: &Handle, key: Vec<u8>);
     /// Mark rotation notices dismissed for `server_id` (no-op if unknown).
+    ///
+    /// **Contract:** call this ONLY in response to a rotation notice that was
+    /// actually surfaced to the user (ISC-C22 "the first rotation always
+    /// surfaces"). Once set, the dismissal makes every subsequent key change
+    /// for this server accept silently, so setting it without a surfaced notice
+    /// — or carrying it across rotations as a sticky flag — would turn the
+    /// trusted-mode pin into "accept any A-C18-passing key" permanently.
     fn dismiss_rotation(&mut self, server_id: &Handle);
 }
 

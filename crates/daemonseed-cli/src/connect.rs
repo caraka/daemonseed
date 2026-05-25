@@ -221,6 +221,16 @@ pub async fn connect(
     // pinning + rotation detection, or untrusted-mode byte-exact match. The
     // store must hold an entry for the dialed server (the user added it before
     // connecting); an unknown server fails closed.
+    //
+    // KNOWN LIMITATION (flagged for the M5 review): the A-C18 check above
+    // re-binds to the dialed server-id hash on EVERY connection, so a rotated
+    // server key (whose hash differs from the configured server-id) is refused
+    // as WrongServer before this point — the C22 `AcceptWithRotation` path is
+    // therefore unreachable through `connect` today. C22's spec says "the pin
+    // is what the protocol checks after first-contact", so full rotation
+    // support requires conditioning the A-C18 check on pin-presence — a
+    // deliberate change to the M4b identity-proof security path, deferred for a
+    // decision rather than made here. Current behaviour fails closed (safe).
     let server_handle = Handle::from_str(server_id).map_err(|_| ConnectError::BadServerId)?;
     let presented_prefix = *Handle::from_pubkey(None, verified.pubkey())
         // Crypto module is operational by here (the proof just verified), so
