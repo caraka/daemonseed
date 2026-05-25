@@ -112,19 +112,20 @@ packages:
         fields:
           - { name: versions, type: "repeated ProtocolVersion", tag: 1, note: "Versions the initiator can speak, preference order (highest first)." }
           - { name: transport_capabilities, type: "repeated string", tag: 2, note: "MVP populates exactly ['tcp-tls13']. Closes finding F29 — QUIC-ready transport-pluggability seam without future protocol-version bump." }
-          - { name: server_source, type: "optional string", tag: 3, note: "AGPL §13 source-URL advertisement (finding F32). M4a defines the field; population deferred to M6." }
+          - { name: server_source, type: "optional string", tag: 3, note: "AGPL §13 source-URL advertisement (finding F32). Set by a connection *initiator* — i.e. a server-to-server peering dialer. The client-facing case (a relay advertising to a connecting client) uses AppHelloAck.server_source instead, since a relay only ever sends the Ack (ISC-9, M6)." }
         iscs: [S14, A-S9, C23]
 
       - name: AppHelloAck
         defined_in: "proto/daemonseed/v1/app_hello.proto"
-        added_in: "v0.5.0 (M4a)"
+        added_in: "v0.5.0 (M4a); server_source field v0.8.0 (M6)"
         purpose: >-
           Responder's selection of one of the initiator's offered
           versions. Out-of-set ACK is a protocol violation
           (ISC-A-S9 server-side; ISC-C23 client verification).
         fields:
           - { name: version, type: ProtocolVersion, tag: 1, note: "Optional in wire encoding (proto3 message default); the responder always supplies it. Verified at the policy layer by `daemonseed_core::version::VersionNegotiator::verify_ack`." }
-        iscs: [S14, A-S9, C23]
+          - { name: server_source, type: "optional string", tag: 2, note: "AGPL §13 source-URL the relay advertises to a connecting client (ISC-9 / finding F32). Additive MINOR field (ISC-S14) — old clients ignore it. The server populates it from config.server_source; unset means no URL declared (M7 ServerSourceUnverified trust event)." }
+        iscs: [S14, A-S9, C23, "9"]
 
       - name: AppHelloReject
         defined_in: "proto/daemonseed/v1/app_hello.proto"

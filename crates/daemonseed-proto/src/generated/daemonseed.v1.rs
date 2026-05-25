@@ -38,11 +38,21 @@ pub struct AppHello {
 /// MUST be one the initiator offered in the corresponding AppHello.versions
 /// list — clients enforce this per ISC-C23, servers MUST NOT respond
 /// out-of-set per ISC-A-S9.
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AppHelloAck {
     /// The single negotiated version, drawn from the initiator's offer.
     #[prost(message, optional, tag = "1")]
     pub version: ::core::option::Option<ProtocolVersion>,
+    /// AGPL §13 advertisement surface (finding F32 / ISC-9). Optional URL where
+    /// the relay operator publishes the source distribution matching this running
+    /// binary. The client-facing companion to AppHello.server_source (which only
+    /// a connection *initiator* sends): a relay only ever responds with this Ack,
+    /// so this is where it advertises its source to connecting clients. Empty/
+    /// unset means "operator has not declared a source URL" — surfacing the
+    /// `ServerSourceUnverified` LogOnly trust event (M7). Additive MINOR field
+    /// (ISC-S14): older clients ignore it.
+    #[prost(string, optional, tag = "2")]
+    pub server_source: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// Responder's refusal, carrying the responder's full supported-version list
 /// so the initiator can surface an actionable upgrade message.

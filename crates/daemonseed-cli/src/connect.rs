@@ -473,6 +473,7 @@ mod tests {
         use prost::Message;
         let ack = wire::AppHelloAck {
             version: Some(wire::ProtocolVersion { major: 1, minor: 0 }),
+            server_source: None,
         };
         let bytes = ack.encode_to_vec();
         let v = parse_response(&bytes, "test#000000000000").unwrap();
@@ -484,6 +485,7 @@ mod tests {
         use prost::Message;
         let ack = wire::AppHelloAck {
             version: Some(wire::ProtocolVersion { major: 2, minor: 0 }),
+            server_source: None,
         };
         let bytes = ack.encode_to_vec();
         let err = parse_response(&bytes, "test#000000000000")

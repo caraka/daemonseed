@@ -64,6 +64,16 @@ message AppHello {
 message AppHelloAck {
   // The single negotiated version, drawn from the initiator's offer.
   ProtocolVersion version = 1;
+
+  // AGPL §13 advertisement surface (finding F32 / ISC-9). Optional URL where
+  // the relay operator publishes the source distribution matching this running
+  // binary. The client-facing companion to AppHello.server_source (which only
+  // a connection *initiator* sends): a relay only ever responds with this Ack,
+  // so this is where it advertises its source to connecting clients. Empty/
+  // unset means "operator has not declared a source URL" — surfacing the
+  // `ServerSourceUnverified` LogOnly trust event (M7). Additive MINOR field
+  // (ISC-S14): older clients ignore it.
+  optional string server_source = 2;
 }
 
 // Responder's refusal, carrying the responder's full supported-version list

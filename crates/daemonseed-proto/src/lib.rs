@@ -111,6 +111,7 @@ mod tests {
     fn app_hello_ack_round_trips() {
         let original = AppHelloAck {
             version: Some(ProtocolVersion { major: 1, minor: 0 }),
+            server_source: None,
         };
         let bytes = original.encode_to_vec();
         let decoded = AppHelloAck::decode(bytes.as_slice()).unwrap();

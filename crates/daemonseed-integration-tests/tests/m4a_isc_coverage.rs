@@ -150,6 +150,7 @@ async fn m4a_iscs_exercise_end_to_end() {
             tls_cfg,
             identity,
             Arc::new(PublicSpaceState::empty()),
+            None,
             async move {
                 let _ = shutdown_rx.await;
             },

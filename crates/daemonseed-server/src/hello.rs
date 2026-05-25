@@ -151,7 +151,10 @@ pub enum HelloOutcome {
 /// **Anti-criterion enforcement** (ISC-A3): no per-pubkey state is
 /// persisted. The `peer_offer` is held in a stack `Vec` for the
 /// duration of the call and dropped on return.
-pub async fn serve_hello<S>(stream: &mut S) -> Result<HelloOutcome, HelloError>
+pub async fn serve_hello<S>(
+    stream: &mut S,
+    server_source: Option<&str>,
+) -> Result<HelloOutcome, HelloError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -169,6 +172,9 @@ where
         Ok(selected) => {
             let ack = wire::AppHelloAck {
                 version: Some(selected.to_wire()),
+                // ISC-9 / F32: advertise the operator's AGPL-§13 source URL to
+                // the connecting client. `None` leaves it unset (no URL declared).
+                server_source: server_source.map(str::to_owned),
             };
             write_frame(stream, &ack).await?;
             Ok(HelloOutcome::Negotiated(selected))
@@ -285,7 +291,7 @@ mod tests {
             ack
         });
 
-        let outcome = serve_hello(&mut server_end).await.unwrap();
+        let outcome = serve_hello(&mut server_end, None).await.unwrap();
         assert_eq!(
             outcome,
             HelloOutcome::Negotiated(ProtocolVersion::new(1, 0))
@@ -296,6 +302,30 @@ mod tests {
             ack.version.unwrap(),
             wire::ProtocolVersion { major: 1, minor: 0 }
         );
+        assert_eq!(
+            ack.server_source, None,
+            "no source advertised when not configured"
+        );
+    }
+
+    /// ISC-9 / F32: when the operator configures a source URL, the server
+    /// advertises it in the AppHelloAck so the connecting client learns it.
+    #[tokio::test]
+    async fn serve_hello_advertises_server_source() {
+        let (mut client_end, mut server_end) = duplex(64 * 1024);
+        let url = "https://relay.example/daemonseed-src.tar.gz";
+
+        let hello = mvp_hello(&[(1, 0)]);
+        let client_handle = tokio::spawn(async move {
+            write_frame(&mut client_end, &hello).await.unwrap();
+            let ack: wire::AppHelloAck = read_frame(&mut client_end).await.unwrap();
+            ack
+        });
+
+        serve_hello(&mut server_end, Some(url)).await.unwrap();
+
+        let ack = client_handle.await.unwrap();
+        assert_eq!(ack.server_source.as_deref(), Some(url));
     }
 
     /// Server rejects when there's no MAJOR.MINOR overlap. The reject
@@ -312,7 +342,7 @@ mod tests {
             reject
         });
 
-        let outcome = serve_hello(&mut server_end).await.unwrap();
+        let outcome = serve_hello(&mut server_end, None).await.unwrap();
         match outcome {
             HelloOutcome::Rejected { peer_offer } => {
                 assert_eq!(
@@ -391,7 +421,7 @@ mod tests {
             write_frame(&mut client_end, &hello).await.unwrap();
         });
 
-        let err = serve_hello(&mut server_end)
+        let err = serve_hello(&mut server_end, None)
             .await
             .expect_err("major out of u16 range");
         assert!(matches!(err, HelloError::WireOutOfRange(_)));

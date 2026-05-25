@@ -129,6 +129,7 @@ fn run_server(cli: Cli) -> Result<(), BootError> {
             tls_config,
             identity,
             public_space,
+            config.server_source.clone(),
             shutdown_signal(),
             noop_observer(),
         ))
