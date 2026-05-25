@@ -142,6 +142,12 @@ impl ServerIdentity {
     pub fn handle(&self) -> &str {
         &self.handle
     }
+
+    /// The server's full ML-DSA-87 public key. Accepted as a MOTD signer in
+    /// addition to the operator whitelist (ISC-26).
+    pub fn public_key(&self) -> &[u8; oxicrypt_ml_dsa::PK_LEN] {
+        self.signing.public_key()
+    }
 }
 
 // ── RAM-only replay-counter map (ISC-34 / ISC-A-S1) ───────────────

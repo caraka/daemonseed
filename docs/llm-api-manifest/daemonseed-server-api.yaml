@@ -18,10 +18,10 @@ lama: "0.1"
 library:
   name: daemonseed-server
   version: "0.1.0"
-  description: "Relay daemon binary + library. M4a landed the TCP runtime + APP_HELLO frame I/O + SIGTERM shutdown; M4b commit 5 adds the post-HELLO identity-proof exchange and the Versioned → Authenticated gate."
+  description: "Relay daemon binary + library. M4a landed the TCP runtime + APP_HELLO frame I/O + SIGTERM shutdown; M4b added the post-HELLO identity-proof exchange and the Versioned → Authenticated gate; M5 added federation; M6 serves the post-Authenticated public-space application service (posts, MOTD, taxonomy, signer whitelist)."
   license: "AGPL-3.0-or-later"
   manifest_for: "crates/daemonseed-server"
-  status: "M4b commit 5 (server identity-proof orchestration)"
+  status: "M6 (public-space service: state, storage, signer-whitelist loading, runtime serve)"
 
 # ─────────────────────────────────────────────────────────────────────
 # Modules landed at M4a commit 3
@@ -34,10 +34,10 @@ modules:
       `--config <path>` (explicit) → XDG_CONFIG_HOME/daemonseed/
       daemonseed.toml → ./daemonseed.toml. NotFound error carries the
       full search list so operators see what was looked at.
-    iscs: [S3, C35, S12, S13]
-    added_in: "M4a commit 3; federation peer table M5"
+    iscs: [S3, C35, S12, S13, S7, S8, S9, S10, "9", "27"]
+    added_in: "M4a commit 3; federation peer table M5; public-space fields M6"
     public:
-      - { kind: struct, name: ServerConfig, fields: "{listen_addr: String (default 0.0.0.0:443), key_path: PathBuf (required), display_name: Option<String>, peers: Vec<PeerConfig> (TOML key `[[peer]]`, default empty)}", note: "Federation peer table added in M5 (ISC-S12)." }
+      - { kind: struct, name: ServerConfig, fields: "{listen_addr: String (default 0.0.0.0:443), key_path: PathBuf (required), display_name: Option<String>, peers: Vec<PeerConfig> (TOML key `[[peer]]`, default empty), posts_dir: Option<PathBuf>, motd_path: Option<PathBuf>, signer_whitelist_path: Option<PathBuf>, rating_taxonomy: Vec<String>, topics: Vec<String>, server_source: Option<String>}", note: "Federation peer table added in M5 (ISC-S12). M6 added the public-space fields — all optional/defaulted so a pre-M6 minimal config still parses: posts_dir/motd_path/signer_whitelist_path (ISC-S7/S9/S8), rating_taxonomy (ISC-S10/27), topics (ISC-S7/19), server_source (ISC-9/F32)." }
       - { kind: struct, name: PeerConfig, fields: "{server_id: String, address: String, trust_mode: TrustMode (default trusted), introduce_to_clients: bool (default true), key_hex: Option<String>}", note: "One `[[peer]]`. trust_mode reuses the client slider (ISC-S12/C22); introduce_to_clients=false suppresses introductions (ISC-S13); key_hex pre-loads an untrusted peer's key." }
       - { kind: enum, name: ConfigError, variants: "{NotFound { searched }, Read { path, source }, Parse(toml::de::Error)}" }
     key_functions:
@@ -176,16 +176,18 @@ modules:
       `SeenMap`. Each task drives TLS handshake → HELLO → channel
       binding off the live TLS session → identity-proof exchange →
       `Connection` advanced through `Versioned` to `Authenticated` on
-      success (ISC-S19). The shutdown future is composed from
-      `tokio::signal::ctrl_c()` plus the unix SIGTERM stream via
+      success (ISC-S19), then M6 serves the public-space application service
+      over the raw authenticated stream (ISC-2 — unreachable pre-auth because
+      reaching it consumes the VerifiedPeer token). The shutdown future is
+      composed from `tokio::signal::ctrl_c()` plus the unix SIGTERM stream via
       `shutdown_signal()`. Errors at any per-connection phase close
       silently per ISC-A-S9 / ISC-40.
-    iscs: [S5, ISC-9, A-S9, S19, "36"]
-    added_in: "M4a commit 4; identity-proof wiring M4b commit 5"
+    iscs: [S5, A-S9, S19, "2", "36"]
+    added_in: "M4a commit 4; identity-proof wiring M4b commit 5; public-space serve M6"
     public:
       - { kind: type, name: "ConnectionObserver = Arc<dyn Fn(HelloOutcome) + Send + Sync>", note: "Integration-test seam; production uses noop_observer(). Reports the HELLO negotiation outcome (fired before the identity-proof phase)." }
     key_functions:
-      - { sig: "run<F: Future<Output = ()>>(addr: SocketAddr, tls_config: ServerConfig, identity: Arc<ServerIdentity>, shutdown: F, observer: ConnectionObserver) -> io::Result<()>", note: "Accept loop; biased select! prefers shutdown over a new connection. Creates the process-wide RAM SeenMap and clones it into each connection task." }
+      - { sig: "run<F: Future<Output = ()>>(addr: SocketAddr, tls_config: ServerConfig, identity: Arc<ServerIdentity>, public_space: Arc<PublicSpaceState>, shutdown: F, observer: ConnectionObserver) -> io::Result<()>", note: "Accept loop; biased select! prefers shutdown over a new connection. Creates the process-wide RAM SeenMap and clones it + the shared public_space state into each connection task. M6 added the public_space parameter." }
       - { sig: "drive_negotiated_connection<S>(stream: S, observer: ConnectionObserver)", note: "HELLO-only driver retained as an in-memory-duplex test seam; the production path is serve_connection (private), which also runs identity-proof off the concrete TLS stream." }
       - { sig: "shutdown_signal() -> impl Future<Output = ()>", note: "Composes ctrl_c + SIGTERM on unix; ctrl_c only on non-unix." }
       - { sig: "parse_listen_addr(s: &str) -> io::Result<SocketAddr>" }
@@ -197,20 +199,34 @@ modules:
       The FIRST post-Authenticated application-stream service (M6). Serves the
       `daemonseed.v1.PublicSpace` gRPC service (MOTD, posts, taxonomy, signer
       whitelist, public-share listing) over the single already-Authenticated
-      TLS connection. `serve_public_space` hands the connection to a tonic
-      `Server` via `serve_with_incoming` over a one-element stream; `ServedConn`
-      supplies tonic's foreign `Connected` trait (orphan rule) with
-      `ConnectInfo = ()` since the peer is already proven. SPIKE STATUS: every
-      RPC returns `unimplemented`; real posts/MOTD/whitelist/taxonomy logic
-      (ISC-S7/S8/S9/S10/C19) lands in the M6 server build-out, and runtime.rs is
-      not yet rewired to call serve_public_space (still drops Authenticated).
-    iscs: [S4, S7, S8, S9, S10, A-S3, C19, C23]
-    added_in: "v0.8.0 (M6 commit 1 — spike: service skeleton + handoff)"
+      TLS connection. The relay is verify-and-serve only (ISC-A-S3): posts and
+      the MOTD load into RAM only after verifying against the signer whitelist
+      (ISC-S8) via `daemonseed_core::public_space::verify_artifact` — the same
+      check clients run, so the server can never serve content a client would
+      reject. `PublicSpaceService` is a thin tonic adapter over the shared
+      `Arc<PublicSpaceState>`; `serve_public_space` hands the connection to a
+      tonic `Server` via `serve_with_incoming` over a one-element stream, and
+      `ServedConn` supplies tonic's foreign `Connected` trait (orphan rule) with
+      `ConnectInfo = ()` since the peer is already proven. runtime.rs serves this
+      off the `Authenticated` type-state, so it is unreachable pre-auth (ISC-2).
+    iscs: [S4, S7, S8, S9, S10, A-S3, C19, C23, "2", "3", "4", "5", "6", "7", "8", "13", "14", "16", "17", "18", "19", "20", "22", "24", "26", "27", "28", "29"]
+    added_in: "v0.8.0 (M6)"
     public:
-      - { kind: struct, name: PublicSpaceService, note: "Service state. Spike: empty; M6 build-out adds posts store / MOTD slot / whitelist / taxonomy / share index. Impls the generated public_space_server::PublicSpace trait." }
+      - { kind: struct, name: PublicSpaceState, note: "Server-wide state shared via Arc: post_whitelist (operator + F17), published wire entries, taxonomy, topics, RwLock posts map keyed by content-address, RwLock single-slot MOTD, posts_dir, empty M6 share listing. Methods: get_motd / list_posts(topic) / taxonomy / signer_whitelist / public_shares / upload_post / delete_post; load(cfg, server_pubkey) and empty()." }
+      - { kind: struct, name: "PublicSpaceConfig<'a>", fields: "{posts_dir, motd_path, whitelist_path: Option<&Path>, taxonomy, topics: &[String]}", note: "Borrowed slice of ServerConfig passed to PublicSpaceState::load." }
+      - { kind: struct, name: PublicSpaceService, note: "tonic adapter holding Arc<PublicSpaceState>. Impls the generated public_space_server::PublicSpace trait; reads return snapshots, writes delegate + map typed errors to gRPC Status." }
       - { kind: struct, name: "ServedConn<S>", note: "Newtype adapting a single already-authenticated transport into tonic-servable IO. Impls Connected (ConnectInfo = ()) + delegates AsyncRead/AsyncWrite." }
+      - { kind: enum, name: WhitelistLoadError, variants: "{Read { path, source }, Parse { line, source }}", note: "Whitelist file load failure; Parse carries the 1-based line number (a malformed line is hard-fail, never silently skipped)." }
+      - { kind: enum, name: LoadError, variants: "{Whitelist(WhitelistLoadError), PostsDir { path, source }}", note: "PublicSpaceState::load failure. Invalid post files + invalid/missing MOTD are skipped, not errors (verify-and-serve)." }
+      - { kind: enum, name: UploadError, variants: "{Unauthorized, BadTopic, Malformed, StorageDisabled, Io, Module}", note: "upload_post failure → gRPC PermissionDenied / InvalidArgument / FailedPrecondition / Internal." }
+      - { kind: enum, name: DeleteError, variants: "{Unauthorized, Malformed, NotFound, StorageDisabled, Io, Module}", note: "delete_post failure → gRPC statuses; Unauthorized covers not-whitelisted, bad-sig, and not-the-author." }
     key_functions:
-      - { sig: "serve_public_space<S: AsyncRead + AsyncWrite + Send + Unpin + 'static>(stream: S, service: PublicSpaceService) -> Result<(), tonic::transport::Error>", note: "Serves PublicSpace over one Authenticated transport until the peer closes. In production S is Connection<Authenticated, TlsStream<TcpStream>>." }
+      - { sig: "load_whitelist(path: &Path) -> Result<Whitelist, WhitelistLoadError>", note: "One entry per line (hex full key or name#hash handle); blank lines ignored; malformed line is a hard error (ISC-S8). Reload reflects edits (ISC-13/14)." }
+      - { sig: "PublicSpaceState::load(cfg: &PublicSpaceConfig, server_pubkey: &[u8; PK_LEN]) -> Result<Self, LoadError>", note: "Loads + verifies whitelist, posts, MOTD. server_pubkey is accepted as a MOTD signer in addition to the whitelist (ISC-26)." }
+      - { sig: "PublicSpaceState::upload_post(&self, artifact: SignedArtifact) -> Result<[u8;48], UploadError>", note: "Verify vs whitelist (ISC-7) → topic must be in operator set (ISC-19) → persist verbatim under content-address (D-M6-7) + hold in RAM; returns the address." }
+      - { sig: "PublicSpaceState::delete_post(&self, delete_artifact: SignedArtifact) -> Result<(), DeleteError>", note: "Signed delete; signer must be whitelisted AND the post's original author (ISC-8 / ISC-20)." }
+      - { sig: "PublicSpaceService::new(state: Arc<PublicSpaceState>) -> Self" }
+      - { sig: "serve_public_space<S: AsyncRead + AsyncWrite + Send + Unpin + 'static>(stream: S, service: PublicSpaceService) -> Result<(), tonic::transport::Error>", note: "Serves PublicSpace over one Authenticated transport until the peer closes. In production S is the raw transport from Connection<Authenticated, TlsStream<TcpStream>>::into_inner()." }
 
 binaries:
   - name: daemonseed-server
