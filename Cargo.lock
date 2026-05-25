@@ -485,6 +485,7 @@ dependencies = [
  "daemonseed-core",
  "daemonseed-proto",
  "daemonseed-server",
+ "hex",
  "oxicrypt-module",
  "oxitls-rustls-provider",
  "prost",
