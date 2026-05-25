@@ -12,7 +12,7 @@ lama: "0.1"
 
 project:
   name: daemonseed
-  version: "0.4.0"
+  version: "0.6.0-pre"
   description: >-
     Federated end-to-end-encrypted communication and file-sharing
     protocol. Pure-Rust backend, CNSA 2.0 baseline crypto via the
@@ -28,7 +28,8 @@ project:
   phase: private
 
 # ─────────────────────────────────────────────────────────────────────
-# Implementation status at v0.4.0 (M3 closed)
+# Implementation status: v0.5.0 (M4a closed); v0.6.0-pre cuts at M4b close
+# ISC coverage 48/93 (51.6% of MVP).
 # ─────────────────────────────────────────────────────────────────────
 
 milestones_complete:
@@ -44,12 +45,14 @@ milestones_complete:
   - id: M3
     tag: v0.4.0
     summary: "Suite registry (CNSA 2.0 baseline), suite_id wire-tagging on at-rest artifacts, read-old-write-new migration on touch, circle-metadata min_suite_id slot."
+  - id: M4a
+    tag: v0.5.0
+    summary: "Server skeleton + TLS 1.3 on :443 with ALPN h2 + APP_HELLO + type-state Connection<Negotiating → Versioned>; CLI connect initiator."
+  - id: M4b
+    tag: "v0.6.0-pre (v0.6.0 cuts on merge)"
+    summary: "Post-HELLO identity-proof: mutual ML-DSA-87 envelopes bound to the TLS exporter channel binding, ±5min freshness + per-key replay counters, Versioned → Authenticated type-state gate, uniform close on failure. Closes spec-ISCs S19, A-S14, A-C18, A-S12, A-S1."
 
 milestones_planned:
-  - id: M4a
-    summary: "Server skeleton + TLS 1.3 on :443 with ALPN h2 + APP_HELLO + type-state Connection<Negotiating → Versioned>."
-  - id: M4b
-    summary: "Identity-proof + channel-binding + replay protection."
   - id: M5
     summary: "Federation trust slider + introducer + S2S peering."
   - id: M6
@@ -91,15 +94,15 @@ crates:
     manifest: "docs/llm-api-manifest/daemonseed-proto-protocol.yaml"
 
   - name: daemonseed-server
-    purpose: "Relay daemon binary. Federation-aware. Substantive code lands at M4a."
+    purpose: "Relay daemon binary + library. TLS 1.3 termination, APP_HELLO negotiation, and (M4b) the post-HELLO identity-proof exchange that lands a connection at Authenticated. Federation-aware surfaces land M5+."
     license: AGPL-3.0-or-later
-    status: placeholder
+    status: active
     manifest: "docs/llm-api-manifest/daemonseed-server-api.yaml"
 
   - name: daemonseed-cli
-    purpose: "Non-interactive scriptable client binary. Substantive code lands post-M4b."
+    purpose: "Non-interactive scriptable client binary + library. `connect <server-id>` does TLS-1.3 + APP_HELLO + (M4b) client-side identity-proof, returning only after Authenticated. Profile/messaging subcommands land M5+."
     license: AGPL-3.0-or-later
-    status: placeholder
+    status: active
     manifest: "docs/llm-api-manifest/daemonseed-cli-api.yaml"
 
   - name: daemonseed-tui
@@ -267,19 +270,22 @@ properties:
     summary: >-
       Protocol-level invariants (no traffic before APP_HELLO; no
       identity-proof before HELLO_ACK; no AsyncRead/AsyncWrite before
-      authentication) are enforced via Rust's type system where
-      possible. Reference: Connection<Negotiating → Versioned → Authenticated>
-      pattern lands at M4a.
-    enforcement: compile-time (lands at M4a)
-    iscs: [C23, S14, A-S14]
+      authentication) are enforced via Rust's type system. The
+      Connection<Negotiating → Versioned → Authenticated> machine landed
+      across M4a (Negotiating → Versioned) and M4b (Versioned →
+      Authenticated, gated by a VerifiedPeer token only verify_envelope can
+      mint). Only Authenticated impls AsyncRead/AsyncWrite, so pre-auth
+      application I/O is a compile error (ISC-A6).
+    enforcement: compile-time (M4a + M4b, shipped)
+    iscs: [C23, S14, S19, A-S14, A-C18]
 
   - id: "censorship-survivability-baseline"
     summary: >-
       First TLS record on :443 satisfies Wu et al. (USENIX Security
       2023) GFW Ex5 negative-allowlist by construction. ALPN is set
       to generic `h2`; application-protocol identification happens
-      after TLS handshake. Lands at M4a.
-    enforcement: wire-shape (lands at M4a)
+      after TLS handshake. Shipped at M4a.
+    enforcement: wire-shape (M4a, shipped)
     iscs: [S5]
 
 # ─────────────────────────────────────────────────────────────────────
