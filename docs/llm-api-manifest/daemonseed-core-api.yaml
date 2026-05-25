@@ -416,6 +416,45 @@ modules:
       - { sig: "Connection::<Authenticated, T>::into_inner(self) -> T", note: "Unwraps the raw authenticated transport — e.g. to hand to tonic for the post-auth application stream (M5+)." }
       - { sig: "impl AsyncRead + AsyncWrite for Connection<Authenticated, T>", note: "Delegates to the inner transport. This impl exists ONLY for the Authenticated state." }
 
+  - path: daemonseed_core::federation::trust
+    purpose: >-
+      The federation trust slider (ISC-C22 / ISC-S12) — a pure, total,
+      side-effect-free decision function shared by the client and
+      server-to-server peering. Given a server's configured trust mode and the
+      key it presented (already proven self-consistent by the M4b
+      identity-proof), it returns accept / accept-with-rotation-notice / refuse.
+      Does no crypto: the caller computes the SHA-384 prefix and passes it in.
+    iscs: [C22, S12, S1]
+    public:
+      - { kind: enum, name: TrustMode, note: "Trusted | Untrusted. Serde lowercase. Default = Trusted (ISC-C22 default for new servers). Local config — never on the wire (ISC-A-S6)." }
+      - { kind: enum, name: TrustDecision, note: "Accept | AcceptWithRotation{fingerprint: String} | Refuse. Refuse is fail-closed (ISC-45)." }
+      - { kind: struct, name: "TrustQuery<'a>", note: "Inputs: mode, expected_prefix, presented_pubkey, presented_prefix, pinned_key, configured_key, rotation_dismissed." }
+    key_functions:
+      - { sig: "evaluate_trust(q: &TrustQuery) -> TrustDecision", note: "Trusted: TOFU hash-match on first contact, pin-compare after, rotation surfaces unless dismissed. Untrusted: byte-exact pre-configured key, refuse any mismatch incl. rotation." }
+
+  - path: daemonseed_core::federation::store
+    purpose: >-
+      Per-server federation trust state and the evaluate-then-record step. The
+      TrustStore trait + in-memory implementation hold the trust mode, the TOFU
+      pin, and the rotation-dismissal flag. Disk persistence is deferred to the
+      client-identity work (mirrors M4b decision D8); M5 ships the state machine.
+    iscs: [C22, S12]
+    public:
+      - { kind: struct, name: ServerEntry, note: "{server_id: Handle, address, mode, pinned_key: Option<Vec<u8>>, configured_key: Option<Vec<u8>>, rotation_dismissed}. Constructors new_trusted / new_untrusted." }
+      - { kind: trait, name: TrustStore, note: "get / upsert / set_pin / dismiss_rotation." }
+      - { kind: struct, name: InMemoryTrustStore, note: "HashMap-backed, keyed by server-id string. M5 default; not persisted." }
+    key_functions:
+      - { sig: "apply_trust(store: &mut dyn TrustStore, server_id: &Handle, presented_pubkey: &[u8], presented_prefix: &[u8; 6]) -> TrustDecision", note: "Looks up the entry, runs evaluate_trust, and on a trusted-mode accept pins the presented key. Unknown server → Refuse." }
+
+  - path: daemonseed_core::federation::peering
+    purpose: >-
+      Server-to-server peering helper (ISC-S12). The trust decision itself is
+      shared via federation::trust; this holds the F31 concurrent-TOFU
+      tiebreaker.
+    iscs: [S12]
+    key_functions:
+      - { sig: "initiates_peer_tofu(own_prefix: &[u8; 6], peer_prefix: &[u8; 6]) -> bool", note: "F31 tiebreaker (ISC-S12-8): the lower server-id hash-prefix initiates TOFU, the other observes-and-confirms. Antisymmetric → no split-brain double-pin." }
+
   - path: daemonseed_core::circle
     purpose: >-
       Circle-of-trust types. **Client-only scope** — per ISC-A-S2 the

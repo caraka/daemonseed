@@ -13,6 +13,7 @@ pub mod bootstrap;
 pub mod circle;
 pub mod connection;
 pub mod crypto;
+pub mod federation;
 pub mod first_start;
 pub mod handle;
 pub mod identity;
