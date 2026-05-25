@@ -95,10 +95,12 @@ const TOTAL_ISCS: u32 = 93;
 ///   S11, S14, A-S9, C23, A-S6)
 /// - M4b: 43 → 48 via `m4b_isc_coverage` (5 new — S19, A-S14, A-C18,
 ///   A-S12, A-S1)
+/// - M5: 48 → 55 via `m5_isc_coverage` (7 new — S1, S6, S12, S13, C22,
+///   A-S7, A-C10; A-S4b forward-referenced to M6)
 ///
 /// Replacing this constant with a live query against the registered
 /// registry remains a later-milestone task (M11 ties this to the CI gate).
-const COVERED_ISCS: u32 = 48;
+const COVERED_ISCS: u32 = 55;
 
 /// Reports the static lower-bound coverage. The live registry-driven count
 /// (which walks the per-milestone integration tests and tallies actual

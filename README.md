@@ -16,8 +16,8 @@ daemonseed/
 │   ├── daemonseed-core/                    protocol library — identity, storage, crypto-agility,
 │   │                                       first-start orchestrator, bootstrap, circle metadata
 │   ├── daemonseed-proto/                   wire schema (Protocol Buffers, prost + tonic)
-│   ├── daemonseed-server/                  relay daemon: TLS 1.3 + APP_HELLO + identity-proof → Authenticated (M4b)
-│   ├── daemonseed-cli/                     scriptable client: `connect <server-id>` with identity-proof (M4b)
+│   ├── daemonseed-server/                  relay daemon: TLS 1.3 + APP_HELLO + identity-proof → Authenticated (M4b); federation peer table + introducer (M5)
+│   ├── daemonseed-cli/                     scriptable client: `connect <server-id>` with identity-proof (M4b) + C22 trust slider (M5)
 │   ├── daemonseed-tui/                     interactive ratatui client (placeholder until M11)
 │   └── daemonseed-integration-tests/       cross-crate integration tests + ISC coverage registry
 │
@@ -32,11 +32,11 @@ daemonseed/
                                             isc-coverage, findings-resolved, install-hooks
 ```
 
-Substantive code lives in `daemonseed-core`, `daemonseed-proto`, `daemonseed-server`, and `daemonseed-cli` as of M4b. The `tui` crate is still a placeholder; it fills in at M11.
+Substantive code lives in `daemonseed-core`, `daemonseed-proto`, `daemonseed-server`, and `daemonseed-cli` as of M5. The `tui` crate is still a placeholder; it fills in at M11.
 
 ## Status
 
-Current release: **v0.5.0** (M4a closed); **v0.6.0-pre** cuts at M4b close — the post-HELLO identity-proof exchange now lands a connection at `Authenticated` (mutual ML-DSA-87 envelopes, TLS channel binding, ±5min freshness, per-key replay counters). ISC coverage 48/93 (51.6% of MVP) after M4b. Promotion to a public repository is gated on the `oxicrypt` sibling crate going public.
+Current release: **v0.6.0** (M4b closed); **v0.7.0-pre** cuts at M5 close — federation: a per-server trusted/untrusted trust slider with TOFU pinning and non-blocking rotation notices, an introducer that never hands out public keys, server-to-server peering reusing the same slider, and active-attacker-resistant don't-introduce suppression. ISC coverage 55/93 (59.1% of MVP) after M5. Promotion to a public repository is gated on the `oxicrypt` sibling crate going public.
 
 ## License
 
