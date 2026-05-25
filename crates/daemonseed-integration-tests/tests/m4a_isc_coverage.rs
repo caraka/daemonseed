@@ -160,14 +160,30 @@ async fn m4a_iscs_exercise_end_to_end() {
     // Give the server a few millis to bind.
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    // Drive the real CLI connect path against it.
-    let outcome = daemonseed_cli::connect::connect(&id_string, &bound_addr.to_string())
-        .await
-        .expect("client connects, negotiates 1.0");
+    // Drive the real CLI connect path against it. M4b: connect now runs the
+    // full identity-proof exchange, so it needs a client identity + counter
+    // state. An ephemeral client (D8) suffices; the dialed server-id matches
+    // the server's real handle, so the proof completes and both sides reach
+    // Authenticated end-to-end.
+    let client_identity =
+        daemonseed_cli::identity_proof::ClientIdentity::ephemeral().expect("ephemeral client");
+    let mut counters = daemonseed_core::storage::seeds::CounterState::default();
+    let outcome = daemonseed_cli::connect::connect(
+        &id_string,
+        &bound_addr.to_string(),
+        &client_identity,
+        &mut counters,
+    )
+    .await
+    .expect("client connects, negotiates 1.0, and authenticates");
     assert_eq!(
         outcome.version,
         ProtocolVersion::new(1, 0),
         "ISC-S14 — MVP wire version is 1.0"
+    );
+    assert_eq!(
+        outcome.server_handle, id_string,
+        "client authenticated the server-id it dialed (A-C18)"
     );
 
     // Verify the observer saw the same outcome on the server side —

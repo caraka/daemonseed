@@ -15,6 +15,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use daemonseed_cli::connect::{ConnectError, connect, resolve_address};
+use daemonseed_cli::identity_proof::{ClientIdentity, ClientIdentityError};
+use daemonseed_core::storage::seeds::CounterState;
 use daemonseed_server::kats::CNSA_2_0_KATS;
 use daemonseed_server::tls::install_provider;
 use oxicrypt_module::{AlgorithmProfile, initialize_with_profile};
@@ -72,12 +74,19 @@ fn run(cli: Cli) -> Result<(), CliError> {
         Cmd::Connect { server_id, address } => {
             let dial =
                 resolve_address(&server_id, address.as_deref()).map_err(CliError::Connect)?;
+            // D8: ephemeral client identity + in-memory counter for the MVP
+            // CLI. The module gate is already Operational (initialized above),
+            // which `ephemeral()` requires for keygen.
+            let identity = ClientIdentity::ephemeral().map_err(CliError::Identity)?;
+            let mut counters = CounterState::default();
             let outcome = rt
-                .block_on(connect(&server_id, &dial))
+                .block_on(connect(&server_id, &dial, &identity, &mut counters))
                 .map_err(CliError::Connect)?;
+            // ISC-47: an authenticated-success line, printed only after the
+            // connection reached `Authenticated` (connect returns Ok only then).
             println!(
-                "connected to {server_id} at {dialled}; wire version {version}",
-                server_id = server_id,
+                "authenticated {server} at {dialled}; wire version {version}",
+                server = outcome.server_handle,
                 dialled = outcome.dialled,
                 version = outcome.version,
             );
@@ -93,6 +102,7 @@ enum CliError {
     ModuleInit(oxicrypt_module::Error),
     ProviderInstall(daemonseed_server::tls::TlsError),
     Runtime(std::io::Error),
+    Identity(ClientIdentityError),
     Connect(ConnectError),
 }
 
@@ -102,6 +112,7 @@ impl std::fmt::Display for CliError {
             Self::ModuleInit(e) => write!(f, "oxicrypt module init failed: {e}"),
             Self::ProviderInstall(e) => write!(f, "{e}"),
             Self::Runtime(e) => write!(f, "tokio runtime build failed: {e}"),
+            Self::Identity(e) => write!(f, "{e}"),
             Self::Connect(e) => write!(f, "{e}"),
         }
     }

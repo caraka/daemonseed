@@ -17,35 +17,65 @@ lama: "0.1"
 library:
   name: daemonseed-cli
   version: "0.1.0"
-  description: "Non-interactive scriptable client. M4a commit 5 lands the `connect <server-id>` subcommand: TLS-1.3 handshake + APP_HELLO exchange + Versioned-state advance."
+  description: "Non-interactive scriptable client. `connect <server-id>` does TLS-1.3 + APP_HELLO (M4a) and, as of M4b commit 6, the full client-side identity-proof exchange — returning only after the connection reaches Authenticated."
   license: "AGPL-3.0-or-later"
   manifest_for: "crates/daemonseed-cli"
-  status: "M4a commit 5"
+  status: "M4b commit 6 (client identity-proof orchestration)"
 
 # ─────────────────────────────────────────────────────────────────────
 # Modules landed at M4a commit 5
 # ─────────────────────────────────────────────────────────────────────
 
 modules:
+  - path: daemonseed_cli::identity_proof
+    purpose: >-
+      Client-side identity-proof orchestration (ISC-S19 / A-C18), the
+      mirror of `daemonseed_server::identity_proof`. `RustlsClientExporter`
+      adapts the live `rustls::ClientConnection` to core's
+      `ChannelBindingSource` (no constant path). `run_client_identity_proof`
+      sends the client's signed envelope, reads + verifies the server's via
+      core `verify_envelope`, then pins the verified server handle to the
+      dialed server-id (A-C18 — self-consistency is necessary but not
+      sufficient). Fails closed with no partial trust (ISC-45). Counter via
+      `CounterState::next_send` (ISC-19 mechanism); ephemeral identity for
+      now (D8 — persistence deferred).
+    iscs: [S19, "43", "44", "45", "46", "47", "17", "18", "19", A-C18]
+    added_in: "M4b commit 6"
+    decisions:
+      - "D8: connect takes an injected ClientIdentity; the binary builds an ephemeral one (fresh mnemonic, in-memory CounterState). ISC-19's counter mechanism is exercised; persisting it to a sealed seeds blob is a later commit."
+    public:
+      - { kind: const, name: MVP_SUITE_ID, value: 1 }
+      - { kind: struct, name: "RustlsClientExporter<'a>", note: "Wraps &rustls::ClientConnection; impls core ChannelBindingSource. No constant constructor." }
+      - { kind: struct, name: ClientIdentity, note: "Client's ML-DSA-87 SignKeypair + verify-form handle. ::ephemeral() generates a throwaway identity (D8); ::new(signing, handle) for an injected one." }
+      - { kind: struct, name: ClientIdentityError, note: "Stringified failure constructing an ephemeral identity (bridges mnemonic / key-derivation / handle errors)." }
+      - { kind: enum, name: ClientProofError, variants: "{Sign(SignatureError), Frame(HelloError), Verify(VerifyRejection), WrongServer}", note: "Diagnostic only — connect collapses every variant to ConnectError::IdentityProofRefused so the user learns nothing about the sub-cause (ISC-46)." }
+    key_functions:
+      - { sig: "ClientIdentity::ephemeral() -> Result<Self, ClientIdentityError>", note: "Fresh mnemonic → Primary keypair → floor-form handle. Requires the oxicrypt module operational." }
+      - { sig: "ClientIdentity::new(signing: SignKeypair, handle: String) -> Self" }
+      - { sig: "run_client_identity_proof<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S, channel_binding: [u8; 32], negotiated_version: wire::ProtocolVersion, identity: &ClientIdentity, now_unix_ms: u64, counters: &mut CounterState, expected_server_id: &str) -> Result<VerifiedPeer, ClientProofError>", note: "Sends client envelope, verifies the server's, pins handle==dialed server-id, records the server counter as highest-seen." }
+
   - path: daemonseed_cli::connect
     purpose: >-
       End-to-end client-side connect path. `resolve_address` picks the
       dial address from the bundled bootstrap anchor or an explicit
       `--address` override (ISC-C37). `build_client_config` constructs
       the rustls `ClientConfig` with TLS 1.3 only, ALPN `h2`, and the
-      M4a `AcceptAnyServerCert` verifier. `connect` performs TCP +
-      TLS + AppHello write + Ack/Reject read, applies `DefaultNegotiator::verify_ack`
-      to enforce ISC-C23 client-side, returns the negotiated version.
-    iscs: [C23, C37, S14, A-S9]
-    added_in: "M4a commit 5"
+      `AcceptAnyServerCert` verifier (TLS-chain trust is bypassed; the
+      application-layer identity-proof is the real authentication
+      boundary). `connect` does TCP + TLS + AppHello + Ack/Reject
+      (ISC-C23 client-side via `verify_ack`), then derives the channel
+      binding off the live TLS session and runs the identity-proof
+      exchange, returning only after reaching Authenticated (ISC-47).
+    iscs: [C23, C37, S14, A-S9, S19, "47", A-C18]
+    added_in: "M4a commit 5; identity-proof wiring M4b commit 6"
     public:
       - { kind: const, name: DEFAULT_PORT, value: 443 }
-      - { kind: struct, name: ConnectOutcome, fields: "{version: ProtocolVersion, dialled: String}" }
-      - { kind: enum, name: ConnectError, variants: "{NoAddress, Tcp, Rustls, TlsHandshake, HelloWrite, HelloDecode, OutOfSetAck, NoCommonVersion, UnknownRejectCode, WireOutOfRange}" }
+      - { kind: struct, name: ConnectOutcome, fields: "{version: ProtocolVersion, dialled: String, server_handle: String}", note: "Reaching this value means Authenticated; server_handle is the verified, dialed server-id." }
+      - { kind: enum, name: ConnectError, variants: "{NoAddress, Tcp, Rustls, TlsHandshake, HelloWrite, HelloDecode, OutOfSetAck, NoCommonVersion, UnknownRejectCode, WireOutOfRange, ChannelBinding, IdentityProofRefused}", note: "IdentityProofRefused carries NO sub-cause — uniform 'server refused' per ISC-46 / A-C18." }
     key_functions:
       - { sig: "resolve_address(server_id: &str, address_override: Option<&str>) -> Result<String, ConnectError>", note: "Override wins; bundled-anchor server-id match is the fallback; empty anchor + no override surfaces ConnectError::NoAddress." }
       - { sig: "build_client_config() -> Result<rustls::ClientConfig, rustls::Error>", note: "Caller-contract: install_provider() must have returned Ok before this." }
-      - { sig: "connect(server_id: &str, address: &str) -> Result<ConnectOutcome, ConnectError>", note: "Caller-contract: install_provider() AND oxicrypt_module::initialize_with_profile(.., Cnsa2) must both have returned Ok before this." }
+      - { sig: "connect(server_id: &str, address: &str, identity: &ClientIdentity, counters: &mut CounterState) -> Result<ConnectOutcome, ConnectError>", note: "Caller-contract: install_provider() AND oxicrypt_module::initialize_with_profile(.., Cnsa2) must both have returned Ok. Returns Ok only after the full identity-proof reaches Authenticated." }
 
   - path: daemonseed_cli::tofu_stub
     purpose: >-
@@ -68,25 +98,28 @@ binaries:
     status: "live"
     subcommands:
       - name: "connect <server-id> [--address HOST:PORT]"
-        purpose: "Open a TLS-1.3 connection to <server-id>, exchange APP_HELLO, print the negotiated MAJOR.MINOR wire version, exit 0 on success."
-        added_in: "M4a commit 5"
+        purpose: "Open a TLS-1.3 connection to <server-id>, exchange APP_HELLO, run the identity-proof exchange, print an authenticated-success line, exit 0 only after reaching Authenticated (ISC-47)."
+        added_in: "M4a commit 5; identity-proof M4b commit 6"
         boot_sequence: |
           1. oxicrypt_module::initialize_with_profile(CNSA_2_0_KATS, Cnsa2)
           2. daemonseed_server::tls::install_provider()
           3. resolve_address(server_id, --address)
-          4. tokio::runtime::Runtime::new()
-          5. connect::connect(server_id, dial_address) (TCP → TLS → AppHello → AppHelloAck)
-          6. println! the negotiated version + exit 0
+          4. ClientIdentity::ephemeral() + CounterState::default()  (D8)
+          5. tokio::runtime::Runtime::new()
+          6. connect::connect(server_id, dial, &identity, &mut counters)
+             (TCP → TLS → AppHello → AppHelloAck → channel binding → identity-proof → Authenticated)
+          7. println! the authenticated server-id + version + exit 0
 
 # ─────────────────────────────────────────────────────────────────────
 # Planned subcommands (forward-looking)
 # ─────────────────────────────────────────────────────────────────────
 
 planned_subcommands:
-  - milestone: M4b
+  - milestone: "M4b commit 6 (landed)"
+    note: "`connect` now runs the full client-side identity-proof; it returns only after Authenticated. The dedicated real-TLS e2e test (ISC-53) + replay/skew/uniform-close fixtures land at commit 7. Persisted client identity (passphrase + sealed seeds blob, replacing the ephemeral D8 identity) is a later commit."
+  - milestone: "M4b/M5 (remaining)"
     commands:
-      - { name: "first-start", purpose: "Run the daemonseed-core first_start orchestrator end-to-end. Equivalent to the TUI's enrollment flow but scriptable (passphrase via stdin or env-var)." }
-      - { name: "ping <server-id>", purpose: "Like `connect` but adds the identity-proof envelope verification to confirm trust state, not just reachability." }
+      - { name: "first-start", purpose: "Run the daemonseed-core first_start orchestrator end-to-end — scriptable enrollment (passphrase via stdin or env-var). Replaces the ephemeral D8 client identity with a persisted, passphrase-sealed one." }
 
   - milestone: M5
     commands:
