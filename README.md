@@ -13,10 +13,11 @@ daemonseed/
 ├── AGENTS.md                               canonical working rules (referenced by CLAUDE.md)
 │
 ├── crates/
-│   ├── daemonseed-core/                    protocol library — identity, storage, crypto-agility,
-│   │                                       first-start orchestrator, bootstrap, circle metadata
+│   ├── daemonseed-core/                    protocol library — identity, 3-layer storage (seeds /
+│   │                                       redb share index / chunk CAS), crypto-agility, first-start,
+│   │                                       bootstrap, flat circle-of-trust keys, rendezvous addressing, indexer
 │   ├── daemonseed-proto/                   wire schema (Protocol Buffers, prost + tonic)
-│   ├── daemonseed-server/                  relay daemon: TLS 1.3 + APP_HELLO + identity-proof → Authenticated (M4b); federation peer table + introducer (M5)
+│   ├── daemonseed-server/                  relay daemon: TLS 1.3 + APP_HELLO + identity-proof → Authenticated (M4b); federation peer table + introducer (M5); public-space service (M6); circle-of-trust live relay (M8)
 │   ├── daemonseed-cli/                     scriptable client: `connect <server-id>` with identity-proof (M4b) + C22 trust slider (M5)
 │   ├── daemonseed-tui/                     interactive ratatui client (placeholder until M11)
 │   └── daemonseed-integration-tests/       cross-crate integration tests + ISC coverage registry
@@ -32,11 +33,11 @@ daemonseed/
                                             isc-coverage, findings-resolved, install-hooks
 ```
 
-Substantive code lives in `daemonseed-core`, `daemonseed-proto`, `daemonseed-server`, and `daemonseed-cli` as of M5. The `tui` crate is still a placeholder; it fills in at M11.
+Substantive code lives in `daemonseed-core`, `daemonseed-proto`, `daemonseed-server`, and `daemonseed-cli` as of M8. The `tui` crate is still a placeholder; it fills in at M11.
 
 ## Status
 
-Current release: **v0.6.0** (M4b closed); **v0.7.0-pre** cuts at M5 close — federation: a per-server trusted/untrusted trust slider with TOFU pinning and non-blocking rotation notices, an introducer that never hands out public keys, server-to-server peering reusing the same slider, and active-attacker-resistant don't-introduce suppression. ISC coverage 55/93 (59.1% of MVP) after M5. Promotion to a public repository is gated on the `oxicrypt` sibling crate going public.
+Current release: **v0.9.0** (M7 closed); **v0.10.0-pre** cuts at M8 close — the circle-of-trust path: shared-entropy circle key derivation (flat, metadata-free), per-relay rendezvous addressing (`SHA-384(cot_key, server_id)`), the protocol's first streaming RPC (`CircleOfTrust.Subscribe`, a refcounted bidirectional relay reaped at zero subscribers), a content-addressed chunk store, and an encrypted incremental share indexer (redb-backed, keyed opaque keys + padded values, inotify-driven with an mtime-walk fallback, scanned on an isolated background thread for Pi-class civility). ISC coverage expands through M8; the precise tally is refreshed at the next coverage-registry pass. Promotion to a public repository is gated on the `oxicrypt` sibling crate going public.
 
 ## License
 

@@ -244,7 +244,7 @@ modules:
       rather than stalling the asset. `CotRegistry` is the one shared, RAM-only
       asset table (cloned per connection in runtime.rs); served by
       `serve_application` alongside public-space.
-    iscs: [S4, A-S2, A-S5, "5", "7", "9", "10", "11"]
+    iscs: [S4, S20, A-S2, A-S5, "5", "7", "9", "10", "11"]
     added_in: "v0.10.0 (M8)"
     public:
       - { kind: struct, name: CotRegistry, note: "Shared refcounted fan-out table keyed by [u8;48] rendezvous address; one broadcast::Sender per live asset. Clone shares the inner Arc. new() / Default / live_assets() -> usize (metrics/tests, never a wire query). subscribe/publish/release are private — driven only by the Subscribe handler." }

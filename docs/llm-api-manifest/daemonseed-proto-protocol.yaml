@@ -366,7 +366,7 @@ packages:
         fields:
           - { name: asset_address, type: bytes, tag: 1, note: "Rendezvous address SHA-384(cot_key, server_id) (ISC-8). Set on every frame; the relay binds a stream to the asset named by its first frame and rejects later frames naming a different asset." }
           - { name: payload, type: bytes, tag: 2, note: "Opaque end-to-end-encrypted application bytes. Relay never decrypts or interprets." }
-        iscs: [S4, A-S2, A-S5]
+        iscs: [S4, S20, A-S2, A-S5]
 
       # Request/response wrappers for the PublicSpace service (M6,
       # public_space.proto). Thin envelopes; see `services:` below for the RPC
@@ -422,7 +422,7 @@ services:
       to every other current subscriber of the same asset. Refcounted, no
       persistence (ISC-A-S5); blind forwarder (ISC-A-S2).
     rpcs:
-      - { name: Subscribe, request: "stream CotFrame", response: "stream CotFrame", iscs: [S4, A-S2, A-S5], note: "Bidirectional. First client frame names the asset_address; stream lifetime IS the member's presence — open takes a reference, close (or h2-keepalive death) releases it, asset reaped at refcount zero." }
+      - { name: Subscribe, request: "stream CotFrame", response: "stream CotFrame", iscs: [S4, S20, A-S2, A-S5], note: "Bidirectional. First client frame names the asset_address; stream lifetime IS the member's presence — open takes a reference, close (or h2-keepalive death) releases it, asset reaped at refcount zero (ISC-S20)." }
 
 # ─────────────────────────────────────────────────────────────────────
 # Codegen pipeline
