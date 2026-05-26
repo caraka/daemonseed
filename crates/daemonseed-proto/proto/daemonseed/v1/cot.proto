@@ -1,0 +1,59 @@
+// daemonseed wire protocol — circle-of-trust live relay service (M8, F23).
+//
+// The protocol's FIRST streaming RPC. Like PublicSpace (M6) it runs as
+// gRPC-over-h2 over the post-Authenticated TLS stream (daemonseed-core
+// Connection<Authenticated, T>); h2 owns its own framing, so there is no
+// length-prefix framing here (that belonged to the pre-auth HELLO/proof phase).
+//
+// A circle's members meet at a rendezvous address — SHA-384(cot_key, server_id),
+// derived client-side (daemonseed-core cot::asset_address) and opaque to the
+// relay. Subscribe is a single bidirectional stream per member per asset: the
+// stream's lifetime IS the member's presence (the "presence = subscription
+// stream" decision). Opening the stream takes a reference to the asset; the
+// stream closing — gracefully or via h2-keepalive detecting its death —
+// releases it; the relay reaps the asset and its routing entry at refcount zero
+// (ISC-A-S5). The relay forwards opaque ciphertext only: it never decrypts a
+// payload, never learns the circle, its membership, or any notion of "joining"
+// (ISC-A-S2). Nothing is persisted — an offline circle leaves no trace.
+//
+// Anchors: ISC-S4 (CoT side of the public-vs-CoT bifurcation), ISC-8 / ISC-S4
+// (asset addressing), ISC-A-S2 (relay opacity), ISC-A-S5 (refcounted, no
+// persistent CoT state), F23 (subscription lifecycle).
+//
+// MINOR bumps to this schema MUST be additive-only (ISC-S14): never reuse a
+// field number, never repurpose an enum value, never tighten validation after
+// a field has shipped. MAJOR bumps create a new `vN` proto module.
+
+syntax = "proto3";
+
+package daemonseed.v1;
+
+// Circle-of-trust live relay (M8). The protocol's only bidirectional-streaming
+// service. A member opens one Subscribe stream per circle-asset it participates
+// in; the relay fans each inbound frame out to every *other* current subscriber
+// of the same asset.
+service CircleOfTrust {
+  // Join a circle-asset's live relay. The client's FIRST frame names the
+  // asset_address it is subscribing to (its payload, if any, is relayed like
+  // any other frame). The stream stays open for the member's whole presence:
+  // inbound frames are fanned out to co-subscribers, and frames from
+  // co-subscribers arrive on the response stream. Closing the stream — or
+  // h2-keepalive detecting its death — releases the member's reference, and the
+  // asset is reaped at refcount zero (ISC-A-S5).
+  rpc Subscribe(stream CotFrame) returns (stream CotFrame);
+}
+
+// One frame on a circle-asset's live relay. The relay routes by asset_address
+// and forwards `payload` verbatim.
+message CotFrame {
+  // The rendezvous address SHA-384(cot_key, server_id) (ISC-8). Set on every
+  // frame; the relay binds a stream to the asset named by that stream's first
+  // frame and rejects any later frame naming a different asset, so a member
+  // cannot inject into an asset it did not subscribe to.
+  bytes asset_address = 1;
+
+  // Opaque end-to-end-encrypted application bytes (a chat message, a share
+  // announcement, and so on). The relay never decrypts or interprets these —
+  // it is structurally a blind forwarder (ISC-A-S2).
+  bytes payload = 2;
+}

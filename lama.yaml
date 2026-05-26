@@ -253,10 +253,12 @@ capabilities:
       ISC-S14: MINOR bumps are additive-only; MAJOR bumps create a new
       `vN` module. (CircleMin, added M3, was retired at M8 per F16 —
       flat metadata-free circles — before it was ever sent on the wire.)
+      M8 adds the CircleOfTrust service (CotFrame) — the protocol's first
+      streaming RPC, a bidirectional Subscribe carrying opaque CoT frames.
     crate: daemonseed-proto
     modules:
       - daemonseed_proto::v1
-    iscs: [S14, A-S9, C23, C24]
+    iscs: [S14, A-S9, C23, C24, S4, A-S2]
 
 # ─────────────────────────────────────────────────────────────────────
 # Cross-cutting properties (system-wide invariants)

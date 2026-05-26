@@ -29,7 +29,7 @@ pub mod v1 {
 mod tests {
     use prost::Message;
 
-    use crate::v1::{AppHello, AppHelloAck, AppHelloReject, ProtocolVersion, SuiteId};
+    use crate::v1::{AppHello, AppHelloAck, AppHelloReject, CotFrame, ProtocolVersion, SuiteId};
 
     /// `SuiteId` round-trips through prost encode/decode preserving the
     /// `value` field. M3 adds `SuiteId` to the v1 module; this test exists
@@ -123,5 +123,23 @@ mod tests {
         assert_eq!(decoded, original);
         assert_eq!(decoded.code, 1);
         assert_eq!(decoded.server_supported.len(), 2);
+    }
+
+    /// `CotFrame` round-trips the circle-of-trust relay frame: a 48-byte
+    /// asset address (`SHA-384(cot_key, server_id)`, ISC-8) and an opaque
+    /// ciphertext payload the relay forwards verbatim. M8 adds the protocol's
+    /// first streaming RPC (`CircleOfTrust.Subscribe`); this exercises its
+    /// message type at the proto-crate boundary.
+    #[test]
+    fn cot_frame_round_trips() {
+        let original = CotFrame {
+            asset_address: vec![0xab; 48],
+            payload: b"opaque-ciphertext".to_vec(),
+        };
+        let bytes = original.encode_to_vec();
+        let decoded = CotFrame::decode(bytes.as_slice()).unwrap();
+        assert_eq!(decoded, original);
+        assert_eq!(decoded.asset_address.len(), 48);
+        assert_eq!(decoded.payload, b"opaque-ciphertext");
     }
 }

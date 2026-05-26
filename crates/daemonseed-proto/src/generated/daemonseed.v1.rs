@@ -76,6 +76,334 @@ pub struct AppHelloReject {
     #[prost(message, repeated, tag = "2")]
     pub server_supported: ::prost::alloc::vec::Vec<ProtocolVersion>,
 }
+/// One frame on a circle-asset's live relay. The relay routes by asset_address
+/// and forwards `payload` verbatim.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CotFrame {
+    /// The rendezvous address SHA-384(cot_key, server_id) (ISC-8). Set on every
+    /// frame; the relay binds a stream to the asset named by that stream's first
+    /// frame and rejects any later frame naming a different asset, so a member
+    /// cannot inject into an asset it did not subscribe to.
+    #[prost(bytes = "vec", tag = "1")]
+    pub asset_address: ::prost::alloc::vec::Vec<u8>,
+    /// Opaque end-to-end-encrypted application bytes (a chat message, a share
+    /// announcement, and so on). The relay never decrypts or interprets these —
+    /// it is structurally a blind forwarder (ISC-A-S2).
+    #[prost(bytes = "vec", tag = "2")]
+    pub payload: ::prost::alloc::vec::Vec<u8>,
+}
+/// Generated client implementations.
+pub mod circle_of_trust_client {
+    #![allow(
+        unused_variables,
+        dead_code,
+        missing_docs,
+        clippy::wildcard_imports,
+        clippy::let_unit_value,
+    )]
+    use tonic::codegen::*;
+    use tonic::codegen::http::Uri;
+    /// Circle-of-trust live relay (M8). The protocol's only bidirectional-streaming
+    /// service. A member opens one Subscribe stream per circle-asset it participates
+    /// in; the relay fans each inbound frame out to every *other* current subscriber
+    /// of the same asset.
+    #[derive(Debug, Clone)]
+    pub struct CircleOfTrustClient<T> {
+        inner: tonic::client::Grpc<T>,
+    }
+    impl<T> CircleOfTrustClient<T>
+    where
+        T: tonic::client::GrpcService<tonic::body::BoxBody>,
+        T::Error: Into<StdError>,
+        T::ResponseBody: Body<Data = Bytes> + std::marker::Send + 'static,
+        <T::ResponseBody as Body>::Error: Into<StdError> + std::marker::Send,
+    {
+        pub fn new(inner: T) -> Self {
+            let inner = tonic::client::Grpc::new(inner);
+            Self { inner }
+        }
+        pub fn with_origin(inner: T, origin: Uri) -> Self {
+            let inner = tonic::client::Grpc::with_origin(inner, origin);
+            Self { inner }
+        }
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> CircleOfTrustClient<InterceptedService<T, F>>
+        where
+            F: tonic::service::Interceptor,
+            T::ResponseBody: Default,
+            T: tonic::codegen::Service<
+                http::Request<tonic::body::BoxBody>,
+                Response = http::Response<
+                    <T as tonic::client::GrpcService<tonic::body::BoxBody>>::ResponseBody,
+                >,
+            >,
+            <T as tonic::codegen::Service<
+                http::Request<tonic::body::BoxBody>,
+            >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
+        {
+            CircleOfTrustClient::new(InterceptedService::new(inner, interceptor))
+        }
+        /// Compress requests with the given encoding.
+        ///
+        /// This requires the server to support it otherwise it might respond with an
+        /// error.
+        #[must_use]
+        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.inner = self.inner.send_compressed(encoding);
+            self
+        }
+        /// Enable decompressing responses.
+        #[must_use]
+        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.inner = self.inner.accept_compressed(encoding);
+            self
+        }
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.inner = self.inner.max_decoding_message_size(limit);
+            self
+        }
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.inner = self.inner.max_encoding_message_size(limit);
+            self
+        }
+        /// Join a circle-asset's live relay. The client's FIRST frame names the
+        /// asset_address it is subscribing to (its payload, if any, is relayed like
+        /// any other frame). The stream stays open for the member's whole presence:
+        /// inbound frames are fanned out to co-subscribers, and frames from
+        /// co-subscribers arrive on the response stream. Closing the stream — or
+        /// h2-keepalive detecting its death — releases the member's reference, and the
+        /// asset is reaped at refcount zero (ISC-A-S5).
+        pub async fn subscribe(
+            &mut self,
+            request: impl tonic::IntoStreamingRequest<Message = super::CotFrame>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::CotFrame>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/daemonseed.v1.CircleOfTrust/Subscribe",
+            );
+            let mut req = request.into_streaming_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("daemonseed.v1.CircleOfTrust", "Subscribe"));
+            self.inner.streaming(req, path, codec).await
+        }
+    }
+}
+/// Generated server implementations.
+pub mod circle_of_trust_server {
+    #![allow(
+        unused_variables,
+        dead_code,
+        missing_docs,
+        clippy::wildcard_imports,
+        clippy::let_unit_value,
+    )]
+    use tonic::codegen::*;
+    /// Generated trait containing gRPC methods that should be implemented for use with CircleOfTrustServer.
+    #[async_trait]
+    pub trait CircleOfTrust: std::marker::Send + std::marker::Sync + 'static {
+        /// Server streaming response type for the Subscribe method.
+        type SubscribeStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::CotFrame, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        /// Join a circle-asset's live relay. The client's FIRST frame names the
+        /// asset_address it is subscribing to (its payload, if any, is relayed like
+        /// any other frame). The stream stays open for the member's whole presence:
+        /// inbound frames are fanned out to co-subscribers, and frames from
+        /// co-subscribers arrive on the response stream. Closing the stream — or
+        /// h2-keepalive detecting its death — releases the member's reference, and the
+        /// asset is reaped at refcount zero (ISC-A-S5).
+        async fn subscribe(
+            &self,
+            request: tonic::Request<tonic::Streaming<super::CotFrame>>,
+        ) -> std::result::Result<tonic::Response<Self::SubscribeStream>, tonic::Status>;
+    }
+    /// Circle-of-trust live relay (M8). The protocol's only bidirectional-streaming
+    /// service. A member opens one Subscribe stream per circle-asset it participates
+    /// in; the relay fans each inbound frame out to every *other* current subscriber
+    /// of the same asset.
+    #[derive(Debug)]
+    pub struct CircleOfTrustServer<T> {
+        inner: Arc<T>,
+        accept_compression_encodings: EnabledCompressionEncodings,
+        send_compression_encodings: EnabledCompressionEncodings,
+        max_decoding_message_size: Option<usize>,
+        max_encoding_message_size: Option<usize>,
+    }
+    impl<T> CircleOfTrustServer<T> {
+        pub fn new(inner: T) -> Self {
+            Self::from_arc(Arc::new(inner))
+        }
+        pub fn from_arc(inner: Arc<T>) -> Self {
+            Self {
+                inner,
+                accept_compression_encodings: Default::default(),
+                send_compression_encodings: Default::default(),
+                max_decoding_message_size: None,
+                max_encoding_message_size: None,
+            }
+        }
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> InterceptedService<Self, F>
+        where
+            F: tonic::service::Interceptor,
+        {
+            InterceptedService::new(Self::new(inner), interceptor)
+        }
+        /// Enable decompressing requests with the given encoding.
+        #[must_use]
+        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.accept_compression_encodings.enable(encoding);
+            self
+        }
+        /// Compress responses with the given encoding, if the client supports it.
+        #[must_use]
+        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.send_compression_encodings.enable(encoding);
+            self
+        }
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.max_decoding_message_size = Some(limit);
+            self
+        }
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.max_encoding_message_size = Some(limit);
+            self
+        }
+    }
+    impl<T, B> tonic::codegen::Service<http::Request<B>> for CircleOfTrustServer<T>
+    where
+        T: CircleOfTrust,
+        B: Body + std::marker::Send + 'static,
+        B::Error: Into<StdError> + std::marker::Send + 'static,
+    {
+        type Response = http::Response<tonic::body::BoxBody>;
+        type Error = std::convert::Infallible;
+        type Future = BoxFuture<Self::Response, Self::Error>;
+        fn poll_ready(
+            &mut self,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn call(&mut self, req: http::Request<B>) -> Self::Future {
+            match req.uri().path() {
+                "/daemonseed.v1.CircleOfTrust/Subscribe" => {
+                    #[allow(non_camel_case_types)]
+                    struct SubscribeSvc<T: CircleOfTrust>(pub Arc<T>);
+                    impl<
+                        T: CircleOfTrust,
+                    > tonic::server::StreamingService<super::CotFrame>
+                    for SubscribeSvc<T> {
+                        type Response = super::CotFrame;
+                        type ResponseStream = T::SubscribeStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<tonic::Streaming<super::CotFrame>>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as CircleOfTrust>::subscribe(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = SubscribeSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                _ => {
+                    Box::pin(async move {
+                        let mut response = http::Response::new(empty_body());
+                        let headers = response.headers_mut();
+                        headers
+                            .insert(
+                                tonic::Status::GRPC_STATUS,
+                                (tonic::Code::Unimplemented as i32).into(),
+                            );
+                        headers
+                            .insert(
+                                http::header::CONTENT_TYPE,
+                                tonic::metadata::GRPC_CONTENT_TYPE,
+                            );
+                        Ok(response)
+                    })
+                }
+            }
+        }
+    }
+    impl<T> Clone for CircleOfTrustServer<T> {
+        fn clone(&self) -> Self {
+            let inner = self.inner.clone();
+            Self {
+                inner,
+                accept_compression_encodings: self.accept_compression_encodings,
+                send_compression_encodings: self.send_compression_encodings,
+                max_decoding_message_size: self.max_decoding_message_size,
+                max_encoding_message_size: self.max_encoding_message_size,
+            }
+        }
+    }
+    /// Generated gRPC service name
+    pub const SERVICE_NAME: &str = "daemonseed.v1.CircleOfTrust";
+    impl<T> tonic::server::NamedService for CircleOfTrustServer<T> {
+        const NAME: &'static str = SERVICE_NAME;
+    }
+}
 /// A request for federation peers. An empty `target_server_id` requests the
 /// introducer's full (filtered) peer list; a populated `target_server_id`
 /// requests just that one peer's triple. Per ISC-A-S7 a by-id query for an

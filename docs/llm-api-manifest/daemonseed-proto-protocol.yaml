@@ -356,6 +356,18 @@ packages:
           - { name: rating, type: string, tag: 3, note: "Sharer-assigned label from the active taxonomy. Advisory only." }
         iscs: [C19, A-S5b]
 
+      - name: CotFrame
+        defined_in: "proto/daemonseed/v1/cot.proto"
+        added_in: "v0.10.0 (M8)"
+        purpose: >-
+          One frame on a circle-of-trust live relay (F23). The relay routes by
+          asset_address and forwards payload verbatim — payload is opaque E2EE
+          ciphertext the relay can neither read nor produce (ISC-A-S2).
+        fields:
+          - { name: asset_address, type: bytes, tag: 1, note: "Rendezvous address SHA-384(cot_key, server_id) (ISC-8). Set on every frame; the relay binds a stream to the asset named by its first frame and rejects later frames naming a different asset." }
+          - { name: payload, type: bytes, tag: 2, note: "Opaque end-to-end-encrypted application bytes. Relay never decrypts or interprets." }
+        iscs: [S4, A-S2, A-S5]
+
       # Request/response wrappers for the PublicSpace service (M6,
       # public_space.proto). Thin envelopes; see `services:` below for the RPC
       # mapping. GetMotdRequest, GetTaxonomyRequest, GetSignerWhitelistRequest,
@@ -395,6 +407,22 @@ services:
       - { name: UploadPost, request: UploadPostRequest, response: UploadPostResponse, iscs: [S7, A-S3], note: "Verifies signature vs current whitelist; never originates content. Rejects via gRPC status on unknown signer / bad signature." }
       - { name: DeletePost, request: DeletePostRequest, response: DeletePostResponse, iscs: [S7], note: "Signer deletes own post, matched by content-address." }
       - { name: ListPublicShares, request: ListPublicSharesRequest, response: ListPublicSharesResponse, iscs: [C19, A-S5b], note: "Full listing with advisory rating tags; client filters locally (no server-side filter). Share content transfer is M8." }
+
+  - name: CircleOfTrust
+    defined_in: "proto/daemonseed/v1/cot.proto"
+    added_in: "v0.10.0 (M8)"
+    transport: >-
+      gRPC-over-h2 over the post-Authenticated TLS stream, alongside PublicSpace
+      on the same connection. The protocol's FIRST streaming RPC. Reference impl
+      lands in `daemonseed_server` (CoT service) wired into the same one-stream
+      tonic Server as PublicSpace, with h2 keepalive driving liveness reaping.
+    purpose: >-
+      Circle-of-trust live relay (F23). A member opens one bidirectional
+      Subscribe stream per circle-asset; the relay fans each inbound frame out
+      to every other current subscriber of the same asset. Refcounted, no
+      persistence (ISC-A-S5); blind forwarder (ISC-A-S2).
+    rpcs:
+      - { name: Subscribe, request: "stream CotFrame", response: "stream CotFrame", iscs: [S4, A-S2, A-S5], note: "Bidirectional. First client frame names the asset_address; stream lifetime IS the member's presence — open takes a reference, close (or h2-keepalive death) releases it, asset reaped at refcount zero." }
 
 # ─────────────────────────────────────────────────────────────────────
 # Codegen pipeline
