@@ -187,7 +187,7 @@ modules:
     public:
       - { kind: type, name: "ConnectionObserver = Arc<dyn Fn(HelloOutcome) + Send + Sync>", note: "Integration-test seam; production uses noop_observer(). Reports the HELLO negotiation outcome (fired before the identity-proof phase)." }
     key_functions:
-      - { sig: "run<F: Future<Output = ()>>(addr: SocketAddr, tls_config: ServerConfig, identity: Arc<ServerIdentity>, public_space: Arc<PublicSpaceState>, server_source: Option<String>, shutdown: F, observer: ConnectionObserver) -> io::Result<()>", note: "Accept loop; biased select! prefers shutdown over a new connection. Creates the process-wide RAM SeenMap and clones it + the shared public_space state into each connection task. M6 added the public_space + server_source (ISC-9 AGPL-§13 URL, advertised in each AppHelloAck) parameters." }
+      - { sig: "run<F: Future<Output = ()>>(addr: SocketAddr, tls_config: ServerConfig, identity: Arc<ServerIdentity>, public_space: Arc<PublicSpaceState>, server_source: Option<String>, shutdown: F, observer: ConnectionObserver) -> io::Result<()>", note: "Accept loop; biased select! prefers shutdown over a new connection. M6 added the public_space + server_source (ISC-9 AGPL-§13 URL) parameters. M8: the process-wide shared state (identity, public_space, server_source, RAM SeenMap, and the new RAM CotRegistry) is bundled into an internal ServerContext built once and cloned per connection; the CotRegistry is shared so members on different connections meet at the same rendezvous (ISC-A-S5)." }
       - { sig: "drive_negotiated_connection<S>(stream: S, observer: ConnectionObserver)", note: "HELLO-only driver retained as an in-memory-duplex test seam; the production path is serve_connection (private), which also runs identity-proof off the concrete TLS stream." }
       - { sig: "shutdown_signal() -> impl Future<Output = ()>", note: "Composes ctrl_c + SIGTERM on unix; ctrl_c only on non-unix." }
       - { sig: "parse_listen_addr(s: &str) -> io::Result<SocketAddr>" }
@@ -204,9 +204,11 @@ modules:
       (ISC-S8) via `daemonseed_core::public_space::verify_artifact` — the same
       check clients run, so the server can never serve content a client would
       reject. `PublicSpaceService` is a thin tonic adapter over the shared
-      `Arc<PublicSpaceState>`; `serve_public_space` hands the connection to a
-      tonic `Server` via `serve_with_incoming` over a one-element stream, and
-      `ServedConn` supplies tonic's foreign `Connected` trait (orphan rule) with
+      `Arc<PublicSpaceState>`; `serve_application` hands the connection to a
+      tonic `Server` via `serve_with_incoming` over a one-element stream —
+      serving BOTH this service and the M8 `CircleOfTrust` relay (see the `cot`
+      module), with h2 keepalive enabling CoT liveness reaping. `ServedConn`
+      supplies tonic's foreign `Connected` trait (orphan rule) with
       `ConnectInfo = ()` since the peer is already proven. runtime.rs serves this
       off the `Authenticated` type-state, so it is unreachable pre-auth (ISC-2).
     iscs: [S4, S7, S8, S9, S10, A-S3, C19, C23, "2", "3", "4", "5", "6", "7", "8", "13", "14", "16", "17", "18", "19", "20", "22", "24", "26", "27", "28", "29"]
@@ -226,7 +228,30 @@ modules:
       - { sig: "PublicSpaceState::upload_post(&self, artifact: SignedArtifact) -> Result<[u8;48], UploadError>", note: "Verify vs whitelist (ISC-7) → topic must be in operator set (ISC-19) → persist verbatim under content-address (D-M6-7) + hold in RAM; returns the address." }
       - { sig: "PublicSpaceState::delete_post(&self, delete_artifact: SignedArtifact) -> Result<(), DeleteError>", note: "Signed delete; signer must be whitelisted AND the post's original author (ISC-8 / ISC-20)." }
       - { sig: "PublicSpaceService::new(state: Arc<PublicSpaceState>) -> Self" }
-      - { sig: "serve_public_space<S: AsyncRead + AsyncWrite + Send + Unpin + 'static>(stream: S, service: PublicSpaceService) -> Result<(), tonic::transport::Error>", note: "Serves PublicSpace over one Authenticated transport until the peer closes. In production S is the raw transport from Connection<Authenticated, TlsStream<TcpStream>>::into_inner()." }
+      - { sig: "serve_application<S: AsyncRead + AsyncWrite + Send + Unpin + 'static>(stream: S, public_space: PublicSpaceService, cot: CotRegistry) -> Result<(), tonic::transport::Error>", note: "Serves BOTH the PublicSpace service and the CircleOfTrust relay over one Authenticated transport (h2 keepalive on; ~10s/20s MVP defaults drive CoT reaping) until the peer closes. In production S is the raw transport from Connection<Authenticated, TlsStream<TcpStream>>::into_inner(). Renamed from serve_public_space at M8." }
+
+  - path: daemonseed_server::cot
+    purpose: >-
+      Circle-of-trust live relay service (M8, F23) — the protocol's first
+      streaming RPC, the server side of `daemonseed.v1.CircleOfTrust`. A blind
+      forwarder: routes by the opaque rendezvous address, fans each inbound
+      CotFrame out to every OTHER current subscriber of the same asset, never
+      decrypts payloads, persists nothing (ISC-A-S2). Presence IS the
+      subscription stream — opening one refs the asset, the stream ending
+      (graceful close or h2-keepalive death) releases it via a Drop guard, and
+      the asset is reaped at refcount zero (ISC-5/7/9/10/11 / ISC-A-S5). Live-
+      only: no reconnect/multiplex state; a lagging subscriber misses frames
+      rather than stalling the asset. `CotRegistry` is the one shared, RAM-only
+      asset table (cloned per connection in runtime.rs); served by
+      `serve_application` alongside public-space.
+    iscs: [S4, A-S2, A-S5, "5", "7", "9", "10", "11"]
+    added_in: "v0.10.0 (M8)"
+    public:
+      - { kind: struct, name: CotRegistry, note: "Shared refcounted fan-out table keyed by [u8;48] rendezvous address; one broadcast::Sender per live asset. Clone shares the inner Arc. new() / Default / live_assets() -> usize (metrics/tests, never a wire query). subscribe/publish/release are private — driven only by the Subscribe handler." }
+      - { kind: struct, name: CotService, note: "Thin tonic adapter over CotRegistry. Impls the generated circle_of_trust_server::CircleOfTrust trait. new(registry: CotRegistry) -> Self." }
+      - { kind: struct, name: CotSubscribeStream, note: "Outbound half of a subscription (Self::SubscribeStream): yields co-subscribers' frames, skips the member's own (per-subscription u64 tag), and holds a Drop guard that releases the asset reference on disconnect/keepalive-death." }
+    key_functions:
+      - { sig: "CotService::subscribe(&self, Request<Streaming<CotFrame>>) -> Result<Response<CotSubscribeStream>, Status>", note: "Bidi handler. First inbound frame names the asset (48-byte address, else InvalidArgument) and refs it; an inbound pump task relays subsequent frames (dropping any that name a different asset — no cross-asset injection); the returned stream fans co-subscribers' frames back and reaps on drop." }
 
 binaries:
   - name: daemonseed-server

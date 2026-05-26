@@ -45,11 +45,12 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
 
+use crate::cot::CotRegistry;
 use crate::hello::{HelloOutcome, serve_hello};
 use crate::identity_proof::{
     RustlsServerExporter, SeenMap, ServerIdentity, now_unix_ms, run_server_identity_proof,
 };
-use crate::public_space::{PublicSpaceService, PublicSpaceState, serve_public_space};
+use crate::public_space::{PublicSpaceService, PublicSpaceState, serve_application};
 
 /// Hand the per-connection HELLO outcome up via this callback. Used by
 /// the integration-test harness in commit 6 to observe a real
@@ -61,6 +62,21 @@ pub type ConnectionObserver = Arc<dyn Fn(HelloOutcome) + Send + Sync>;
 /// this; tests substitute a channel sender.
 pub fn noop_observer() -> ConnectionObserver {
     Arc::new(|_outcome: HelloOutcome| {})
+}
+
+/// Process-lifetime shared state handed to every per-connection task. Each
+/// field is cheap to clone (an `Arc` or an inner-`Arc` handle); one instance is
+/// built in [`run`] and cloned per accepted connection. Bundling it keeps the
+/// per-connection driver's signature small as the shared surface grows
+/// (identity, public-space state, AGPL source URL, replay-counter map, and the
+/// circle-of-trust asset table).
+#[derive(Clone)]
+struct ServerContext {
+    identity: Arc<ServerIdentity>,
+    public_space: Arc<PublicSpaceState>,
+    server_source: Arc<Option<String>>,
+    seen: SeenMap,
+    cot: CotRegistry,
 }
 
 /// Bind to `addr`, accept connections, terminate TLS via `tls_config`,
@@ -97,6 +113,21 @@ where
     // per-connection task (ISC-34 / ISC-A-S1). Cloning shares the inner Arc.
     let seen = SeenMap::new();
 
+    // The relay's circle-of-trust asset table — ONE instance shared across
+    // every connection so members on different connections meet at the same
+    // rendezvous address (M8 / ISC-A-S5). RAM-only; nothing survives the
+    // process. Cloning shares the inner Arc.
+    let cot = CotRegistry::new();
+
+    // Bundle the shared, process-lifetime state once; clone it per connection.
+    let ctx = ServerContext {
+        identity,
+        public_space,
+        server_source,
+        seen,
+        cot,
+    };
+
     tokio::pin!(shutdown);
 
     loop {
@@ -121,22 +152,10 @@ where
                 };
                 let acceptor = acceptor.clone();
                 let observer = observer.clone();
-                let identity = identity.clone();
-                let public_space = public_space.clone();
-                let server_source = server_source.clone();
-                let seen = seen.clone();
+                let ctx = ctx.clone();
                 tokio::spawn(async move {
                     let _ = peer_addr;
-                    serve_connection(
-                        acceptor,
-                        stream,
-                        identity,
-                        public_space,
-                        server_source,
-                        seen,
-                        observer,
-                    )
-                    .await;
+                    serve_connection(acceptor, stream, ctx, observer).await;
                 });
             }
         }
@@ -156,12 +175,17 @@ where
 async fn serve_connection(
     acceptor: TlsAcceptor,
     stream: TcpStream,
-    identity: Arc<ServerIdentity>,
-    public_space: Arc<PublicSpaceState>,
-    server_source: Arc<Option<String>>,
-    seen: SeenMap,
+    ctx: ServerContext,
     observer: ConnectionObserver,
 ) {
+    let ServerContext {
+        identity,
+        public_space,
+        server_source,
+        seen,
+        cot,
+    } = ctx;
+
     let mut tls_stream: TlsStream<TcpStream> = match acceptor.accept(stream).await {
         Ok(s) => s,
         Err(_e) => {
@@ -227,13 +251,15 @@ async fn serve_connection(
         Ok(verified) => {
             // ISC-S19 step 5: the VerifiedPeer token is the only key to the
             // Authenticated state. Reaching here therefore guarantees a
-            // verified peer — so the public-space service is structurally
-            // unreachable before identity-proof (ISC-2 / ISC-C23). M6 serves
-            // it over the raw authenticated stream; the service future ends
-            // when the peer closes the connection.
+            // verified peer — so the application services are structurally
+            // unreachable before identity-proof (ISC-2 / ISC-C23). The single
+            // tonic server over this stream serves both the public-space
+            // service (M6) and the circle-of-trust live relay (M8); the future
+            // ends when the peer closes the connection (which also reaps any
+            // CoT asset references this connection held, ISC-10).
             let authenticated = versioned.into_authenticated(verified);
             let service = PublicSpaceService::new(public_space);
-            let _ = serve_public_space(authenticated.into_inner(), service).await;
+            let _ = serve_application(authenticated.into_inner(), service, cot).await;
         }
         Err(_e) => {
             // Uniform silent close — see the function-level note.

@@ -43,7 +43,8 @@ prost = { workspace = true }
 # already-established TLS connection. tokio-stream wraps that one connection as
 # a one-element incoming stream for `Server::serve_with_incoming`.
 tonic = { workspace = true }
-tokio-stream = { workspace = true }
+# `sync` adds BroadcastStream — the per-asset CoT fan-out wrapper (M8 cot.rs).
+tokio-stream = { workspace = true, features = ["sync"] }
 
 # Runtime — `signal` / `time` / `rt-multi-thread` / `sync` augment the
 # workspace base (`rt`, `macros`, `io-util`, `net`). Cargo unions feature sets

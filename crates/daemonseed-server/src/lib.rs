@@ -26,10 +26,14 @@
 //!   and the `Versioned → Authenticated` gate (ISC-S19 / A-S14 / A-S12)
 //! - [`runtime`] — TCP listener + TlsAcceptor + per-connection HELLO +
 //!   identity-proof handler + SIGTERM-driven graceful shutdown (ISC-9 / S5)
+//! - [`cot`] — circle-of-trust live relay: refcounted, reap-at-zero
+//!   bidirectional `Subscribe` fan-out keyed by rendezvous address, served
+//!   over the post-Authenticated stream alongside public-space (M8, F23)
 
 #![forbid(unsafe_code)]
 
 pub mod config;
+pub mod cot;
 pub mod deprecation;
 pub mod federation;
 pub mod hello;

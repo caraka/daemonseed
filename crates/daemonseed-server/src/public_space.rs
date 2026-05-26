@@ -17,7 +17,7 @@
 //!
 //! tonic's [`Server`](tonic::transport::Server) is normally driven by a TCP
 //! listener. Here there is exactly one, already-TLS-terminated, already-
-//! identity-proven connection. [`serve_public_space`] adapts it via
+//! identity-proven connection. [`serve_application`] adapts it via
 //! tonic's `serve_with_incoming` fed a one-element stream
 //! ([`tokio_stream::once`]). The connection IO must
 //! impl [`tonic::transport::server::Connected`]; that trait and the concrete
@@ -46,6 +46,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use daemonseed_core::crypto::deprecation::DeprecationPolicy;
 use daemonseed_core::public_space::{
@@ -53,7 +54,10 @@ use daemonseed_core::public_space::{
     verify_artifact,
 };
 use daemonseed_proto::v1 as wire;
+use daemonseed_proto::v1::circle_of_trust_server::CircleOfTrustServer;
 use daemonseed_proto::v1::public_space_server::{PublicSpace, PublicSpaceServer};
+
+use crate::cot::{CotRegistry, CotService};
 use oxicrypt_ml_dsa as ml_dsa;
 use prost::Message;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -823,16 +827,25 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ServedConn<S> {
 /// (ISC-C23). `S` is any authenticated transport: in production a
 /// `Connection<Authenticated, TlsStream<TcpStream>>`; in tests an in-memory
 /// duplex half.
-pub async fn serve_public_space<S>(
+pub async fn serve_application<S>(
     stream: S,
-    service: PublicSpaceService,
+    public_space: PublicSpaceService,
+    cot: CotRegistry,
 ) -> Result<(), tonic::transport::Error>
 where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
     let incoming = tokio_stream::once(Ok::<_, io::Error>(ServedConn(stream)));
     tonic::transport::Server::builder()
-        .add_service(PublicSpaceServer::new(service))
+        // h2 keepalive drives circle-of-trust liveness reaping (F23): a dead
+        // member's subscription stream is detected and torn down within
+        // ~interval + timeout, dropping its CotSubscribeStream and releasing
+        // its asset reference (ISC-10). These are MVP defaults; operator-tunable
+        // knobs arrive with the ISC-S17 rate-limit work.
+        .http2_keepalive_interval(Some(Duration::from_secs(10)))
+        .http2_keepalive_timeout(Some(Duration::from_secs(20)))
+        .add_service(PublicSpaceServer::new(public_space))
+        .add_service(CircleOfTrustServer::new(CotService::new(cot)))
         .serve_with_incoming(incoming)
         .await
 }
@@ -1404,9 +1417,10 @@ mod tests {
         state.upload_post(art).unwrap();
 
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-        let server = tokio::spawn(serve_public_space(
+        let server = tokio::spawn(serve_application(
             server_io,
             PublicSpaceService::new(state),
+            CotRegistry::new(),
         ));
 
         // One-shot connector hands the client-side duplex half to tonic.
@@ -1477,9 +1491,10 @@ mod tests {
         assert!(state.set_deprecation(artifact, policy));
 
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-        let server = tokio::spawn(serve_public_space(
+        let server = tokio::spawn(serve_application(
             server_io,
             PublicSpaceService::new(state),
+            CotRegistry::new(),
         ));
 
         let mut client_io = Some(client_io);

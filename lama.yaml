@@ -98,7 +98,7 @@ crates:
     manifest: "docs/llm-api-manifest/daemonseed-proto-protocol.yaml"
 
   - name: daemonseed-server
-    purpose: "Relay daemon binary + library. TLS 1.3 termination, APP_HELLO negotiation, the post-HELLO identity-proof exchange that lands a connection at Authenticated (M4b), federation introducer/peering (M5), and the post-Authenticated PublicSpace application-stream service (M6, gRPC-over-h2 via daemonseed_server::public_space)."
+    purpose: "Relay daemon binary + library. TLS 1.3 termination, APP_HELLO negotiation, the post-HELLO identity-proof exchange that lands a connection at Authenticated (M4b), federation introducer/peering (M5), the post-Authenticated PublicSpace application-stream service (M6, gRPC-over-h2 via daemonseed_server::public_space), and the M8 CircleOfTrust live relay (daemonseed_server::cot) — refcounted bidirectional Subscribe fan-out keyed by rendezvous address, served alongside public-space with h2 keepalive driving reap-at-zero."
     license: AGPL-3.0-or-later
     status: active
     manifest: "docs/llm-api-manifest/daemonseed-server-api.yaml"
