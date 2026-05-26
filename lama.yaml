@@ -171,16 +171,20 @@ capabilities:
       device — both v2 as of M3 with a 2-byte suite_id slot after the
       magic prefix (v1 reads accepted under implicit suite_id=0x0001 for
       M1/M2 compatibility; v2 binds suite_id into the AEAD AAD; touch_reseal
-      migrates v1 → v2 on next save per ISC-C24). The chunk CAS (M8) is the
+      migrates v1 → v2 on next save per ISC-C24). The chunk CAS (M8) is a
       third layer: opaque encrypted chunks named by SHA-384, reference-
       counted, with an ephemeral in-memory relay backing (constant-time
       presence per A-S2/A-S12) and a persistent client-cache on disk (ISC-6).
+      The share index (M8) is the redb-backed indexed-state layer: a
+      persistent, incremental, per-value-encrypted index of a shared folder
+      (keyed opaque keys + AES-256-GCM padded values; ISC-C21 / A-C6 / A-C7).
     crate: daemonseed-core
     modules:
       - daemonseed_core::storage::seeds
       - daemonseed_core::storage::recovery_file
       - daemonseed_core::storage::cas
-    iscs: [C3, C24, C30, C32, A-C9]
+      - daemonseed_core::storage::share_index
+    iscs: [C3, C24, C30, C32, A-C9, C21, A-C6, A-C7]
 
   - category: "First-start type-state orchestrator"
     summary: >-

@@ -104,3 +104,8 @@ unicode-normalization = "0.1"
 hex = "0.4"
 # CSPRNG entry point for mnemonic entropy and profile-id generation.
 getrandom = "0.3"
+# Embedded pure-Rust KV store — the redb-backed indexed-state layer of the
+# three-layer storage split (M8 share index, ISC-C21). daemonseed encrypts each
+# value (AES-256-GCM) before storing it (ISC-A-C6); redb itself holds opaque
+# bytes. Pure Rust, no C — preserves the no-C-dependencies constraint.
+redb = "2"

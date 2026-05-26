@@ -302,6 +302,31 @@ modules:
     key_functions:
       - { sig: "asset_address(cot_key: &circle::key::CotKey, server_id: &[u8]) -> Result<AssetAddr, oxicrypt_module::Error>", note: "SHA-384(cot_key.as_bytes() || server_id) (ISC-8). Transient key||id buffer is zeroed after hashing. server_id must be the same stable wire server-id representation on member + relay." }
 
+  - path: daemonseed_core::storage::share_index
+    purpose: >-
+      Encrypted, incremental redb-backed share index (M8, ISC-C21 / A-C6 / A-C7)
+      — the indexed-state layer of the three-layer storage split. One ShareEntry
+      per shared file (rel_path, size, mtime). Incremental: put/remove rewrite ONE
+      entry, never the whole index (A-C7, the Pi-4 civility floor); persisted, so
+      reopening reuses rather than cold-rescans (C21). Per entry the redb KEY is
+      SHA-384(index_key||rel_path)[:32] (keyed → not reversible OR confirmable
+      without the key; deterministic) and the VALUE is AES-256-GCM(index_key,
+      nonce, padded-metadata). Values padded to 256-byte buckets so ciphertext
+      length can't leak path length (forward-composes with future at-rest folder
+      encryption). Index records the LOGICAL view (decrypted names).
+    iscs: [C21, A-C6, A-C7]
+    public:
+      - { kind: const, name: INDEX_KEY_LEN, value: 32 }
+      - { kind: const, name: BUCKET_STEP, value: 256, note: "Value padding granularity." }
+      - { kind: struct, name: ShareEntry, fields: "{rel_path: String, size: u64, mtime_unix_ms: u64}" }
+      - { kind: struct, name: ShareIndex, note: "Open encrypted index over a redb file; holds a Zeroizing<[u8;32]> index key. open(path, key) creates/reopens. Incremental ops: put / get(rel_path) / remove(rel_path) / len / is_empty / entries() (decrypts all, paths come from values not keys)." }
+      - { kind: enum, name: IndexError, variants: "{Db(Box<redb::Error>), Crypto, Corrupt, Entropy}", note: "Crypto = AES-GCM init/seal/open failure incl. tamper auth-fail (fails closed, never garbage). A wrong key can't even locate entries (keyed opaque key) → get returns Ok(None)." }
+    key_functions:
+      - { sig: "ShareIndex::open(path: impl AsRef<Path>, index_key: [u8; 32]) -> Result<ShareIndex, IndexError>", note: "index_key derived Argon2id(passphrase, salt=profile_id)→HKDF-SHA384(info=kdf::info::share_index(profile_id)) by the caller (seeds-blob chain, distinct info)." }
+      - { sig: "ShareIndex::put(&self, entry: &ShareEntry) -> Result<(), IndexError>", note: "Single-entry encrypted write (A-C7)." }
+      - { sig: "ShareIndex::get(&self, rel_path: &str) -> Result<Option<ShareEntry>, IndexError>" }
+      - { sig: "ShareIndex::entries(&self) -> Result<Vec<ShareEntry>, IndexError>" }
+
   - path: daemonseed_core::first_start
     purpose: >-
       Type-state orchestrator for cold-enrollment per ISC-C29 step
