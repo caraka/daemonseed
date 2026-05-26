@@ -266,6 +266,27 @@ modules:
       - { sig: "seal_under(mnemonic, passphrase, profile_id, argon2, suite_id: SuiteId) -> Result<Vec<u8>, RecoveryFileError>" }
       - { sig: "open(bytes: &[u8], passphrase: &str) -> Result<RecoveryFileContents, RecoveryFileError>", note: "Recovery-on-clean-device: takes only the file bytes + passphrase; profile_id + argon2 come from the file's cleartext header." }
 
+  - path: daemonseed_core::storage::cas
+    purpose: >-
+      Content-addressed chunk store — the third storage layer (M8). Opaque
+      already-encrypted chunks named by SHA-384(chunk); the address both
+      locates and authenticates a chunk (a re-hash mismatch = corrupt or
+      substituted, caller drops it). Reference-counted dedup: put inserts-
+      or-increments, unref decrements and drops the bytes at zero (the
+      server-blind CoT lifecycle of A-S5). Per-chunk hash = SHA-384 (F23,
+      one hash primitive across the protocol). Two impls below.
+    iscs: [A-S2, A-S5, A-S12, S17]
+    public:
+      - { kind: const, name: CHUNK_ADDR_LEN, value: 48 }
+      - { kind: struct, name: ChunkAddr, note: "SHA-384(chunk) content address. Display/Debug lowercase hex; as_bytes() -> &[u8;48]; from_bytes([u8;48]) names a fetch target (bytes not re-validated — auth is on re-hash of the fetched chunk)." }
+      - { kind: enum, name: Unref, note: "Outcome of releasing one ref: StillReferenced{remaining: u32} or Dropped (last ref released, bytes gone)." }
+      - { kind: enum, name: CasError, note: "Hash(oxicrypt_module::Error) | Io(std::io::Error) | CorruptRefcount. MemoryChunkStore raises only Hash (on put); FileChunkStore adds Io/CorruptRefcount." }
+      - { kind: trait, name: ChunkStore, note: "put(&[u8])->ChunkAddr (insert-or-increment) | get(&ChunkAddr)->Option<Vec<u8>> | has(&ChunkAddr)->bool | unref(&ChunkAddr)->Unref. All return Result<_, CasError>." }
+      - { kind: struct, name: MemoryChunkStore, note: "Ephemeral refcounted in-memory store — the relay backing (A-S5, leaves no trace). has() compares every stored addr with constant-time ct_eq, no early return, closing the timing side-channel (A-S2/A-S12). new() / Default." }
+      - { kind: struct, name: FileChunkStore, note: "Persistent on-disk store — the client chunk cache (ISC-6, survives restart). open(root) creates/reopens; chunk bytes at <root>/<hex-addr>, refcount in adjacent <hex-addr>.rc ASCII sidecar. has() is best-effort only (no constant-time claim — A-S2 is a relay threat and the relay runs MemoryChunkStore)." }
+    key_functions:
+      - { sig: "chunk_addr(chunk: &[u8]) -> Result<ChunkAddr, oxicrypt_module::Error>", note: "SHA-384(chunk) (ISC-2 / F23). Requires the oxicrypt module operational (power-up self-test passed)." }
+
   - path: daemonseed_core::first_start
     purpose: >-
       Type-state orchestrator for cold-enrollment per ISC-C29 step

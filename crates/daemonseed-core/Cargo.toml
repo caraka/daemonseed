@@ -28,3 +28,6 @@ argon2.workspace = true
 tokio = { workspace = true }
 prost = { workspace = true }
 daemonseed-proto = { path = "../daemonseed-proto" }
+
+[dev-dependencies]
+tempfile = { workspace = true }

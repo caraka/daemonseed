@@ -165,18 +165,21 @@ capabilities:
 
   - category: "At-rest storage"
     summary: >-
-      Two-layer encrypted on-disk artifacts. The at-rest seeds blob
-      (ISC-C3) holds the user's mnemonic + future profile state; the
-      recovery file `.dseed` (ISC-C32) is the air-gap-paper replacement
-      for recovery on a clean device. Both formats are v2 as of M3 with
-      a 2-byte suite_id slot after the magic prefix. v1 reads accepted
-      under implicit suite_id=0x0001 for M1/M2 enrollment compatibility.
-      v2 binds suite_id into the AEAD AAD; touch_reseal migrates v1 → v2
-      on next save (read-old-write-new per ISC-C24).
+      Three-layer storage. The at-rest seeds blob (ISC-C3) holds the
+      user's mnemonic + future profile state; the recovery file `.dseed`
+      (ISC-C32) is the air-gap-paper replacement for recovery on a clean
+      device — both v2 as of M3 with a 2-byte suite_id slot after the
+      magic prefix (v1 reads accepted under implicit suite_id=0x0001 for
+      M1/M2 compatibility; v2 binds suite_id into the AEAD AAD; touch_reseal
+      migrates v1 → v2 on next save per ISC-C24). The chunk CAS (M8) is the
+      third layer: opaque encrypted chunks named by SHA-384, reference-
+      counted, with an ephemeral in-memory relay backing (constant-time
+      presence per A-S2/A-S12) and a persistent client-cache on disk (ISC-6).
     crate: daemonseed-core
     modules:
       - daemonseed_core::storage::seeds
       - daemonseed_core::storage::recovery_file
+      - daemonseed_core::storage::cas
     iscs: [C3, C24, C30, C32, A-C9]
 
   - category: "First-start type-state orchestrator"

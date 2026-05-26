@@ -470,6 +470,7 @@ dependencies = [
  "oxicrypt-sha",
  "prost",
  "serde",
+ "tempfile",
  "tokio",
  "toml",
  "unicode-normalization",
