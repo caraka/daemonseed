@@ -315,6 +315,48 @@ pub struct MotdPayload {
     #[prost(int64, tag = "2")]
     pub signed_timestamp_ms: i64,
 }
+/// One operator-configured suite-deprecation cutoff. The operator declares that
+/// `suite_id` is being retired: peers may keep signing under it until
+/// `cutoff_unix_ms`, after which the server refuses identity-proofs signed under
+/// it (ISC-S16). `recommended_suite_id` is the successor the operator points
+/// migrating peers at — it is the value clients surface in the migration prompt.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct SuiteDeprecationEntry {
+    /// Deprecated suite (u16 SuiteId range; the registry rejects the reserved
+    /// sentinels 0x0000 / 0xFFFF at parse time).
+    #[prost(uint32, tag = "1")]
+    pub suite_id: u32,
+    /// UTC cutoff in wall-clock milliseconds. At or after this instant the server
+    /// refuses identity-proofs under `suite_id`.
+    #[prost(int64, tag = "2")]
+    pub cutoff_unix_ms: i64,
+    /// Operator-recommended successor suite. Surfaced verbatim in the client's
+    /// migration prompt (ISC-C25). u16 SuiteId range.
+    #[prost(uint32, tag = "3")]
+    pub recommended_suite_id: u32,
+}
+/// Inner signed payload of the suite-deprecation policy. Signed bytes = prost
+/// encoding of this message; the enclosing SignedArtifact carries the signature
+/// (signed under the server-WIDE key, ISC-A-S11). `policy_version` is
+/// monotonic: the server never serves a version below one it has already served
+/// (rollback protection, ISC-A-S11), and clients reject a version below their
+/// cached value for that server-id (ISC-C25). Changing any cutoff requires
+/// re-signing with an incremented version — a coerced operator cannot silently
+/// extend a cutoff without producing a fresh signed artifact (ISC-A-S11).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DeprecationPolicyPayload {
+    /// Monotonic policy version. Replay / rollback anchor (ISC-A-S11 / ISC-C25).
+    #[prost(uint64, tag = "1")]
+    pub policy_version: u64,
+    /// The operator's per-suite cutoffs. An empty list is a valid signed policy
+    /// meaning "no suites currently deprecated".
+    #[prost(message, repeated, tag = "2")]
+    pub entries: ::prost::alloc::vec::Vec<SuiteDeprecationEntry>,
+    /// Signer's wall-clock milliseconds at signing time (freshness; mirrors the
+    /// other public-space payloads). Not the rollback anchor — `policy_version` is.
+    #[prost(int64, tag = "3")]
+    pub signed_timestamp_ms: i64,
+}
 /// One published signer-whitelist entry. The whitelist is published so clients
 /// can independently verify post/MOTD provenance against the same list the
 /// server uses. An entry is EITHER a full public key (verbose, self-contained)
@@ -426,6 +468,16 @@ pub struct ListPublicSharesRequest {}
 pub struct ListPublicSharesResponse {
     #[prost(message, repeated, tag = "1")]
     pub shares: ::prost::alloc::vec::Vec<PublicShareListing>,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct GetDeprecationPolicyRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetDeprecationPolicyResponse {
+    /// The current signed deprecation policy (signed_payload = DeprecationPolicyPayload,
+    /// signed under the server-wide key). Absent (proto3 message nullability) when
+    /// the operator has configured no deprecation policy.
+    #[prost(message, optional, tag = "1")]
+    pub policy: ::core::option::Option<SignedArtifact>,
 }
 /// Generated client implementations.
 pub mod public_space_client {
@@ -697,6 +749,36 @@ pub mod public_space_client {
                 );
             self.inner.unary(req, path, codec).await
         }
+        /// Fetch the operator's signed suite-deprecation policy, or empty if none is
+        /// configured (ISC-S16 / ISC-C25, M7). The server returns the same signed
+        /// artifact to every fetcher (ISC-A-S11); the client verifies the signature
+        /// against the server-wide key and replay-protects on `policy_version`.
+        pub async fn get_deprecation_policy(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetDeprecationPolicyRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetDeprecationPolicyResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/daemonseed.v1.PublicSpace/GetDeprecationPolicy",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("daemonseed.v1.PublicSpace", "GetDeprecationPolicy"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -771,6 +853,17 @@ pub mod public_space_server {
             request: tonic::Request<super::ListPublicSharesRequest>,
         ) -> std::result::Result<
             tonic::Response<super::ListPublicSharesResponse>,
+            tonic::Status,
+        >;
+        /// Fetch the operator's signed suite-deprecation policy, or empty if none is
+        /// configured (ISC-S16 / ISC-C25, M7). The server returns the same signed
+        /// artifact to every fetcher (ISC-A-S11); the client verifies the signature
+        /// against the server-wide key and replay-protects on `policy_version`.
+        async fn get_deprecation_policy(
+            &self,
+            request: tonic::Request<super::GetDeprecationPolicyRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetDeprecationPolicyResponse>,
             tonic::Status,
         >;
     }
@@ -1155,6 +1248,52 @@ pub mod public_space_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = ListPublicSharesSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/daemonseed.v1.PublicSpace/GetDeprecationPolicy" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetDeprecationPolicySvc<T: PublicSpace>(pub Arc<T>);
+                    impl<
+                        T: PublicSpace,
+                    > tonic::server::UnaryService<super::GetDeprecationPolicyRequest>
+                    for GetDeprecationPolicySvc<T> {
+                        type Response = super::GetDeprecationPolicyResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetDeprecationPolicyRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as PublicSpace>::get_deprecation_policy(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetDeprecationPolicySvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

@@ -26,4 +26,5 @@ pub mod passphrase;
 pub mod profile;
 pub mod public_space;
 pub mod storage;
+pub mod trust_events;
 pub mod version;

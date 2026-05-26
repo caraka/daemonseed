@@ -468,6 +468,7 @@ dependencies = [
  "oxicrypt-ml-kem",
  "oxicrypt-module",
  "oxicrypt-sha",
+ "prost",
  "serde",
  "tokio",
  "toml",

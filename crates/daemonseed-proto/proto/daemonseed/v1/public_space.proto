@@ -113,6 +113,48 @@ message MotdPayload {
   int64 signed_timestamp_ms = 2;
 }
 
+// ── Suite-deprecation policy (ISC-S16 / A-S11 / C25, M7) ─────────────────
+
+// One operator-configured suite-deprecation cutoff. The operator declares that
+// `suite_id` is being retired: peers may keep signing under it until
+// `cutoff_unix_ms`, after which the server refuses identity-proofs signed under
+// it (ISC-S16). `recommended_suite_id` is the successor the operator points
+// migrating peers at — it is the value clients surface in the migration prompt.
+message SuiteDeprecationEntry {
+  // Deprecated suite (u16 SuiteId range; the registry rejects the reserved
+  // sentinels 0x0000 / 0xFFFF at parse time).
+  uint32 suite_id = 1;
+
+  // UTC cutoff in wall-clock milliseconds. At or after this instant the server
+  // refuses identity-proofs under `suite_id`.
+  int64 cutoff_unix_ms = 2;
+
+  // Operator-recommended successor suite. Surfaced verbatim in the client's
+  // migration prompt (ISC-C25). u16 SuiteId range.
+  uint32 recommended_suite_id = 3;
+}
+
+// Inner signed payload of the suite-deprecation policy. Signed bytes = prost
+// encoding of this message; the enclosing SignedArtifact carries the signature
+// (signed under the server-WIDE key, ISC-A-S11). `policy_version` is
+// monotonic: the server never serves a version below one it has already served
+// (rollback protection, ISC-A-S11), and clients reject a version below their
+// cached value for that server-id (ISC-C25). Changing any cutoff requires
+// re-signing with an incremented version — a coerced operator cannot silently
+// extend a cutoff without producing a fresh signed artifact (ISC-A-S11).
+message DeprecationPolicyPayload {
+  // Monotonic policy version. Replay / rollback anchor (ISC-A-S11 / ISC-C25).
+  uint64 policy_version = 1;
+
+  // The operator's per-suite cutoffs. An empty list is a valid signed policy
+  // meaning "no suites currently deprecated".
+  repeated SuiteDeprecationEntry entries = 2;
+
+  // Signer's wall-clock milliseconds at signing time (freshness; mirrors the
+  // other public-space payloads). Not the rollback anchor — `policy_version` is.
+  int64 signed_timestamp_ms = 3;
+}
+
 // ── Signer whitelist (ISC-S8) ───────────────────────────────────────────
 
 // One published signer-whitelist entry. The whitelist is published so clients
@@ -194,6 +236,12 @@ service PublicSpace {
   // The server returns the complete listing; the client filters by rating
   // locally (ISC-A-C5). Share content transfer is M8.
   rpc ListPublicShares(ListPublicSharesRequest) returns (ListPublicSharesResponse);
+
+  // Fetch the operator's signed suite-deprecation policy, or empty if none is
+  // configured (ISC-S16 / ISC-C25, M7). The server returns the same signed
+  // artifact to every fetcher (ISC-A-S11); the client verifies the signature
+  // against the server-wide key and replay-protects on `policy_version`.
+  rpc GetDeprecationPolicy(GetDeprecationPolicyRequest) returns (GetDeprecationPolicyResponse);
 }
 
 message GetMotdRequest {}
@@ -247,4 +295,13 @@ message ListPublicSharesRequest {}
 
 message ListPublicSharesResponse {
   repeated PublicShareListing shares = 1;
+}
+
+message GetDeprecationPolicyRequest {}
+
+message GetDeprecationPolicyResponse {
+  // The current signed deprecation policy (signed_payload = DeprecationPolicyPayload,
+  // signed under the server-wide key). Absent (proto3 message nullability) when
+  // the operator has configured no deprecation policy.
+  SignedArtifact policy = 1;
 }

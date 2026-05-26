@@ -8,5 +8,6 @@
 //! (encoded via [`suite::Suite::same_family`]) rather than a wire field, so
 //! the registry topology can grow without a MAJOR-version bump.
 
+pub mod deprecation;
 pub mod policy;
 pub mod suite;
