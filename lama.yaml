@@ -223,7 +223,7 @@ capabilities:
       - daemonseed_core::crypto::policy
     iscs: [S15, C24, A-S10, A-C8, A-C9]
 
-  - category: "Circle-of-trust key derivation (client-only)"
+  - category: "Circle-of-trust key derivation & rendezvous addressing"
     summary: >-
       Circles are flat and metadata-free (F16): a circle is defined
       solely by its shared entropy — no founder, no metadata record, no
@@ -233,11 +233,17 @@ capabilities:
       stable; a cross-family change re-derives (new-circle event per
       ISC-A-C8). Suite floor lives in the server S16 policy + client
       registry, not at circle level. CotKey is ZeroizeOnDrop with
-      redacted Debug.
+      redacted Debug. `cot::asset_address(cot_key, server_id)` =
+      SHA-384(cot_key||server_id) is the per-relay rendezvous point a
+      circle meets at — member-only-computable (relay never learns the
+      circle, A-S2), namespaced per relay for cross-server unlinkability.
+      Key derivation is client-only; addressing is shared (client derives
+      to subscribe, server keys its registry by it).
     crate: daemonseed-core
     modules:
       - daemonseed_core::circle::key
-    iscs: [C8, C9, A-C8]
+      - daemonseed_core::cot
+    iscs: [C8, C9, A-C8, S4, A-S2]
 
   - category: "Wire schema (proto)"
     summary: >-

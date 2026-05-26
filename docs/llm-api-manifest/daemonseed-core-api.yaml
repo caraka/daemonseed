@@ -287,6 +287,21 @@ modules:
     key_functions:
       - { sig: "chunk_addr(chunk: &[u8]) -> Result<ChunkAddr, oxicrypt_module::Error>", note: "SHA-384(chunk) (ISC-2 / F23). Requires the oxicrypt module operational (power-up self-test passed)." }
 
+  - path: daemonseed_core::cot
+    purpose: >-
+      Circle-of-trust rendezvous addressing (M8, ISC-8 / S4). asset_address =
+      SHA-384(cot_key || server_id): the opaque 48-byte point a relay routes a
+      circle's traffic through. Only a member can compute it (needs cot_key →
+      relay never learns the circle, ISC-A-S2); server_id namespaces it per
+      relay (same circle on two relays = two unlinkable addresses) without
+      tying the circle to any relay (cot_key is server-independent).
+    iscs: [C8, A-S2, S4]
+    public:
+      - { kind: const, name: ASSET_ADDR_LEN, value: 48 }
+      - { kind: struct, name: AssetAddr, note: "SHA-384(cot_key||server_id) rendezvous address. Display/Debug lowercase hex; as_bytes() -> &[u8;48]; from_bytes([u8;48]) names a subscribe target (opaque, unvalidatable by the relay)." }
+    key_functions:
+      - { sig: "asset_address(cot_key: &circle::key::CotKey, server_id: &[u8]) -> Result<AssetAddr, oxicrypt_module::Error>", note: "SHA-384(cot_key.as_bytes() || server_id) (ISC-8). Transient key||id buffer is zeroed after hashing. server_id must be the same stable wire server-id representation on member + relay." }
+
   - path: daemonseed_core::first_start
     purpose: >-
       Type-state orchestrator for cold-enrollment per ISC-C29 step

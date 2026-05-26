@@ -8,13 +8,16 @@
 //! that gates pre-auth traffic at compile time per ISC-C23. M6 adds
 //! [`public_space`] — the signed-artifact model (content-address,
 //! signer whitelist, ML-DSA-87 verification) the server and clients share
-//! for the post-Authenticated public-space service.
+//! for the post-Authenticated public-space service. M8 adds the circle path:
+//! [`circle::key`] (shared-entropy key derivation), [`cot`] (rendezvous
+//! addressing), and [`storage::cas`] (the content-addressed chunk store).
 
 #![forbid(unsafe_code)]
 
 pub mod bootstrap;
 pub mod circle;
 pub mod connection;
+pub mod cot;
 pub mod crypto;
 pub mod federation;
 pub mod first_start;
