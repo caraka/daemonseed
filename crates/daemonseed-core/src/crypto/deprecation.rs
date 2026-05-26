@@ -130,7 +130,10 @@ impl DeprecationPolicy {
     ) -> Result<Self, PolicyError> {
         let min_lead = MIN_CUTOFF_LEAD.as_millis() as i64;
         for e in &entries {
-            let lead = e.cutoff_unix_ms - now_ms;
+            // Saturating: a pathological operator-config cutoff (e.g. i64::MIN)
+            // must fail the F30 guard cleanly, never panic or wrap to a bogus
+            // positive lead.
+            let lead = e.cutoff_unix_ms.saturating_sub(now_ms);
             if lead < min_lead {
                 return Err(PolicyError::CutoffTooSoon {
                     suite_id: e.suite_id,
@@ -421,6 +424,20 @@ mod tests {
             PolicyError::CutoffTooSoon { lead_ms, .. } => assert!(lead_ms < 0),
             other => panic!("expected CutoffTooSoon, got {other:?}"),
         }
+    }
+
+    /// F30 guard must not panic or wrap on a pathological extreme cutoff —
+    /// `i64::MIN` saturates to a hugely-negative lead and is refused cleanly.
+    #[test]
+    fn build_handles_extreme_cutoff_without_overflow() {
+        let now = 1_000_000_000_000;
+        let entries = vec![DeprecationEntry {
+            suite_id: deprecated(),
+            cutoff_unix_ms: i64::MIN,
+            recommended_suite_id: successor(),
+        }];
+        let err = DeprecationPolicy::build(1, now, entries, now).unwrap_err();
+        assert!(matches!(err, PolicyError::CutoffTooSoon { .. }));
     }
 
     /// A signed policy round-trips through sign → verify → decode.
