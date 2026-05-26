@@ -346,11 +346,13 @@ modules:
       - { kind: struct, name: Indexer, note: "ShareIndex + share root. new(index, root); index() borrows for queries." }
       - { kind: struct, name: ShareWatcher, note: "Live recursive filesystem watch (notify RecommendedWatcher). watch(root) -> (ShareWatcher, Receiver<FsEvent>); holds the watcher alive (drop = stop); events feed apply_event (ISC-20)." }
       - { kind: enum, name: WatchError, variants: "{Limit, Io(notify::Error)}", note: "Limit = OS watch limit exceeded (fs.inotify.max_user_watches) — surfaced (ISC-21); caller falls back to mtime_rescan." }
+      - { kind: struct, name: ScanHandle, note: "Handle to a running background cold-scan. join() -> Result<usize, IndexError> waits + returns the count; drop detaches." }
     key_functions:
       - { sig: "Indexer::cold_scan(&self) -> Result<usize, IndexError>", note: "Walk the root, upsert every regular file, return count. Unreadable entries skipped (robust). Run on a niced bg thread (ISC-A-C7 no-fate-sharing)." }
       - { sig: "Indexer::apply_event(&self, event: &FsEvent) -> Result<(), IndexError>", note: "Single-entry write (ISC-C21/A-C7 no rewalk). Upsert→put (or remove if vanished); transient stat error leaves entry as-is; paths outside root ignored." }
       - { sig: "Indexer::mtime_rescan(&self, since_unix_ms: u64) -> Result<usize, IndexError>", note: "Fallback (ISC-21): walk root, upsert only files newer than the cutoff (visits all, writes only changed). Driven periodically with the last pass's timestamp when watching is unavailable." }
       - { sig: "ShareWatcher::watch(root: impl AsRef<Path>) -> Result<(ShareWatcher, Receiver<FsEvent>), WatchError>", note: "Begin recursive watching; WatchError::Limit → caller uses mtime_rescan." }
+      - { sig: "Indexer::spawn_background_scan(self: Arc<Self>) -> ScanHandle", note: "Run cold_scan on a dedicated thread (ISC-19/A-C7 no-fate-sharing). Returns immediately; index stays queryable from redb (MVCC) during the scan (ISC-23 no-startup-blockade). OS nice/ionice is a best-effort platform refinement on top." }
 
   - path: daemonseed_core::first_start
     purpose: >-

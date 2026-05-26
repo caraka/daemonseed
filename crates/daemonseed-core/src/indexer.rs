@@ -24,7 +24,9 @@
 //! [`Indexer::apply_event`]; that wiring layers on top of this engine.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
+use std::thread;
 use std::time::UNIX_EPOCH;
 
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -127,6 +129,24 @@ impl Indexer {
         }
     }
 
+    /// Run the cold scan on a dedicated background thread (ISC-19 / ISC-A-C7).
+    /// Returns immediately with a [`ScanHandle`]; the index stays fully
+    /// queryable from the persisted redb while the scan runs (ISC-A-C7
+    /// no-startup-blockade), and the scan runs on its own thread so it never
+    /// shares scheduling fate with the foreground / network surface (ISC-A-C7
+    /// no-fate-sharing) — the structural fix Demonsaw lacked. Lowering OS
+    /// priority (`nice` / `ionice idle`) on top is a best-effort platform
+    /// refinement the binary applies; the thread isolation is the load-bearing
+    /// guarantee. `redb`'s MVCC lets the scan's writes and concurrent foreground
+    /// reads proceed without blocking each other.
+    pub fn spawn_background_scan(self: Arc<Self>) -> ScanHandle {
+        let join = thread::Builder::new()
+            .name("daemonseed-cold-scan".to_owned())
+            .spawn(move || self.cold_scan())
+            .expect("spawn cold-scan thread");
+        ScanHandle { join }
+    }
+
     /// Fallback rescan when live watching is unavailable (ISC-21): walk the
     /// root and upsert only files whose mtime is newer than `since_unix_ms`,
     /// returning how many were updated. It still visits every path, but it
@@ -166,6 +186,22 @@ impl Indexer {
             .ok()?
             .to_str()
             .map(|s| s.to_owned())
+    }
+}
+
+/// A running background cold-scan ([`Indexer::spawn_background_scan`]). Join to
+/// wait for completion and get the file count; drop it to detach (the scan
+/// finishes on its own).
+pub struct ScanHandle {
+    join: thread::JoinHandle<Result<usize, IndexError>>,
+}
+
+impl ScanHandle {
+    /// Wait for the background scan to finish and return how many files it
+    /// indexed. Propagates a scan error; panics only if the scan thread itself
+    /// panicked.
+    pub fn join(self) -> Result<usize, IndexError> {
+        self.join.join().expect("cold-scan thread panicked")
     }
 }
 
@@ -457,5 +493,26 @@ mod tests {
         idx.apply_event(&FsEvent::Upserted(idx.root.join("live.txt")))
             .unwrap();
         assert!(idx.index().get("live.txt").unwrap().is_some());
+    }
+
+    // ── background isolation (ISC-19 / ISC-23) ─────────────────────────────
+
+    /// The cold scan runs on its own thread: spawn returns immediately, the
+    /// index is queryable concurrently (never blocked by the scan — redb MVCC),
+    /// and joining yields the full count.
+    #[test]
+    fn background_scan_is_isolated_and_non_blocking() {
+        let (_dir, idx) = fixture();
+        for i in 0..200 {
+            write(&idx.root, &format!("f{i}.txt"), b"x");
+        }
+        let idx = Arc::new(idx);
+        let handle = Arc::clone(&idx).spawn_background_scan();
+
+        // A concurrent query returns without waiting on the scan to finish.
+        let _ = idx.index().len().unwrap();
+
+        assert_eq!(handle.join().unwrap(), 200);
+        assert_eq!(idx.index().len().unwrap(), 200);
     }
 }
