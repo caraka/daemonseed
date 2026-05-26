@@ -30,6 +30,7 @@ prost = { workspace = true }
 daemonseed-proto = { path = "../daemonseed-proto" }
 redb = { workspace = true }
 walkdir = { workspace = true }
+notify = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

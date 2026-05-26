@@ -336,15 +336,21 @@ modules:
       index stays queryable meanwhile → startup never blocks) and apply_event
       (one FsEvent → exactly one index write; a single file change never triggers
       a share-wide rewalk). Synchronous + runtime-free by design so the caller
-      owns task isolation/priority. The live inotify/FSEvents source (notify
-      crate) + watch-limit fallback feed FsEvents in — that wiring layers on top.
+      owns task isolation/priority. The live inotify/FSEvents source is
+      ShareWatcher (notify crate); when the OS watch limit is exceeded it
+      surfaces WatchError::Limit and the caller drops to the periodic
+      mtime_rescan fallback (ISC-21).
     iscs: [C21, A-C7]
     public:
       - { kind: enum, name: FsEvent, variants: "{Upserted(PathBuf), Removed(PathBuf)}", note: "Unit of incremental update. An Upserted for a vanished path folds to a removal (watchers don't guarantee ordering)." }
       - { kind: struct, name: Indexer, note: "ShareIndex + share root. new(index, root); index() borrows for queries." }
+      - { kind: struct, name: ShareWatcher, note: "Live recursive filesystem watch (notify RecommendedWatcher). watch(root) -> (ShareWatcher, Receiver<FsEvent>); holds the watcher alive (drop = stop); events feed apply_event (ISC-20)." }
+      - { kind: enum, name: WatchError, variants: "{Limit, Io(notify::Error)}", note: "Limit = OS watch limit exceeded (fs.inotify.max_user_watches) — surfaced (ISC-21); caller falls back to mtime_rescan." }
     key_functions:
       - { sig: "Indexer::cold_scan(&self) -> Result<usize, IndexError>", note: "Walk the root, upsert every regular file, return count. Unreadable entries skipped (robust). Run on a niced bg thread (ISC-A-C7 no-fate-sharing)." }
       - { sig: "Indexer::apply_event(&self, event: &FsEvent) -> Result<(), IndexError>", note: "Single-entry write (ISC-C21/A-C7 no rewalk). Upsert→put (or remove if vanished); transient stat error leaves entry as-is; paths outside root ignored." }
+      - { sig: "Indexer::mtime_rescan(&self, since_unix_ms: u64) -> Result<usize, IndexError>", note: "Fallback (ISC-21): walk root, upsert only files newer than the cutoff (visits all, writes only changed). Driven periodically with the last pass's timestamp when watching is unavailable." }
+      - { sig: "ShareWatcher::watch(root: impl AsRef<Path>) -> Result<(ShareWatcher, Receiver<FsEvent>), WatchError>", note: "Begin recursive watching; WatchError::Limit → caller uses mtime_rescan." }
 
   - path: daemonseed_core::first_start
     purpose: >-

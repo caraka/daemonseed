@@ -194,8 +194,10 @@ capabilities:
       index stays queryable, so startup never blocks); apply_event folds one
       filesystem change into exactly one index write — a single file change
       never triggers a share-wide rewalk. Synchronous + runtime-free so the
-      caller owns task isolation. The live inotify watcher + watch-limit
-      fallback (notify crate) and the Pi civility benchmark layer on top.
+      caller owns task isolation. The live recursive inotify/FSEvents watcher
+      (ShareWatcher, notify crate) feeds events in; when the OS watch limit is
+      exceeded it surfaces WatchError::Limit and the caller drops to the
+      periodic mtime_rescan fallback. The Pi civility benchmark layers on top.
     crate: daemonseed-core
     modules:
       - daemonseed_core::indexer

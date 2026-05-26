@@ -109,3 +109,7 @@ getrandom = "0.3"
 # value (AES-256-GCM) before storing it (ISC-A-C6); redb itself holds opaque
 # bytes. Pure Rust, no C — preserves the no-C-dependencies constraint.
 redb = "2"
+# Cross-platform filesystem-event watcher (inotify / FSEvents /
+# ReadDirectoryChangesW) for the live share indexer (M8, ISC-C21 / ISC-20).
+# Pure Rust (the platform backends are syscall bindings, no bundled C).
+notify = "6"
