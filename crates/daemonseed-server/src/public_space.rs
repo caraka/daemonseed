@@ -47,6 +47,7 @@ use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 
+use daemonseed_core::crypto::deprecation::DeprecationPolicy;
 use daemonseed_core::public_space::{
     ArtifactError, CONTENT_ADDRESS_LEN, Whitelist, WhitelistEntry, WhitelistParseError,
     verify_artifact,
@@ -215,6 +216,20 @@ pub struct PublicSpaceState {
     posts_dir: Option<PathBuf>,
     /// F25 public-share listing (content/transfer is M8; empty for M6).
     public_shares: Vec<wire::PublicShareListing>,
+    /// Operator suite-deprecation policy (ISC-S16 / A-S11, M7): the signed
+    /// artifact served to every fetcher plus its decoded form for cutoff
+    /// enforcement. `None` until the operator configures one. Behind a lock so
+    /// a future reload can replace it (with monotonic-version protection).
+    deprecation: RwLock<Option<DeprecationState>>,
+}
+
+/// The installed deprecation policy: the signed artifact served verbatim to
+/// every fetcher (ISC-A-S11 byte-identical) plus its decoded form for the
+/// identity-proof cutoff check (ISC-S16).
+#[derive(Clone)]
+struct DeprecationState {
+    artifact: wire::SignedArtifact,
+    policy: DeprecationPolicy,
 }
 
 impl PublicSpaceState {
@@ -263,6 +278,7 @@ impl PublicSpaceState {
             motd: RwLock::new(motd),
             posts_dir: cfg.posts_dir.map(Path::to_path_buf),
             public_shares: Vec::new(),
+            deprecation: RwLock::new(None),
         })
     }
 
@@ -278,7 +294,52 @@ impl PublicSpaceState {
             motd: RwLock::new(None),
             posts_dir: None,
             public_shares: Vec::new(),
+            deprecation: RwLock::new(None),
         }
+    }
+
+    /// Install (or replace) the signed deprecation policy (ISC-S16 / A-S11).
+    /// Refuses a policy whose version is **below** the currently-installed one
+    /// — the server MUST NOT regress to an older version a client may already
+    /// have seen (ISC-A-S11 rollback protection). `policy` is the decoded form
+    /// of `artifact`; the caller verifies they match.
+    ///
+    /// Returns `false` if the install was refused (lower version), `true` if
+    /// installed.
+    pub fn set_deprecation(
+        &self,
+        artifact: wire::SignedArtifact,
+        policy: DeprecationPolicy,
+    ) -> bool {
+        let mut slot = self.deprecation.write().expect("deprecation lock poisoned");
+        if let Some(current) = slot.as_ref()
+            && policy.policy_version() < current.policy.policy_version()
+        {
+            return false;
+        }
+        *slot = Some(DeprecationState { artifact, policy });
+        true
+    }
+
+    /// The signed deprecation-policy artifact served to every fetcher
+    /// (ISC-S16). Byte-identical regardless of caller (ISC-A-S11): this takes
+    /// no peer argument. `None` when the operator configured no policy.
+    pub fn get_deprecation_policy(&self) -> Option<wire::SignedArtifact> {
+        self.deprecation
+            .read()
+            .expect("deprecation lock poisoned")
+            .as_ref()
+            .map(|d| d.artifact.clone())
+    }
+
+    /// A decoded copy of the installed policy for the identity-proof cutoff
+    /// check (ISC-S16), or `None` if no policy is installed.
+    pub fn deprecation_policy_decoded(&self) -> Option<DeprecationPolicy> {
+        self.deprecation
+            .read()
+            .expect("deprecation lock poisoned")
+            .as_ref()
+            .map(|d| d.policy.clone())
     }
 
     /// The current validated MOTD, or `None` (ISC-S9 / ISC-3).
@@ -673,6 +734,17 @@ impl PublicSpace for PublicSpaceService {
             shares: self.state.public_shares(),
         }))
     }
+
+    async fn get_deprecation_policy(
+        &self,
+        _request: Request<wire::GetDeprecationPolicyRequest>,
+    ) -> Result<Response<wire::GetDeprecationPolicyResponse>, Status> {
+        // Same signed artifact to every fetcher — the request carries no peer
+        // discriminant and none is consulted (ISC-A-S11: no per-peer variation).
+        Ok(Response::new(wire::GetDeprecationPolicyResponse {
+            policy: self.state.get_deprecation_policy(),
+        }))
+    }
 }
 
 /// Map an [`UploadError`] to a gRPC status. `Io` / `Module` collapse to
@@ -768,12 +840,62 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use daemonseed_core::crypto::deprecation::{DeprecationEntry, sign_policy, verify_policy};
+    use daemonseed_core::crypto::suite::SuiteId;
     use daemonseed_core::identity::keys::SignKeypair;
     use daemonseed_core::public_space::content_address;
+    use daemonseed_core::trust_events::{TrustEventKey, assess_deprecation};
     use daemonseed_proto::v1::public_space_client::PublicSpaceClient;
     use hyper_util::rt::TokioIo;
     use tempfile::TempDir;
     use tonic::transport::Endpoint;
+
+    /// ISC-A-S11 / ISC-10 / ISC-11: the server serves a byte-identical policy
+    /// to every fetcher, installs a higher version, and refuses a rollback to a
+    /// lower version.
+    #[test]
+    fn deprecation_policy_serving_and_rollback() {
+        let _ = oxicrypt_module::initialize();
+        let kp = SignKeypair::from_ml_dsa_seed(&[8u8; 32]).unwrap();
+        let now = 1_000_000_000_000;
+        let make = |ver: u64| {
+            let policy = DeprecationPolicy::build(ver, now, Vec::new(), now).unwrap();
+            let artifact = sign_policy(&policy, &kp).unwrap();
+            (artifact, policy)
+        };
+
+        let state = PublicSpaceState::empty();
+        assert!(
+            state.get_deprecation_policy().is_none(),
+            "none until installed"
+        );
+
+        let (a3, p3) = make(3);
+        assert!(state.set_deprecation(a3.clone(), p3));
+        // Byte-identical to every fetcher (ISC-A-S11 / ISC-A5).
+        assert_eq!(state.get_deprecation_policy(), Some(a3.clone()));
+        assert_eq!(
+            state.get_deprecation_policy(),
+            state.get_deprecation_policy()
+        );
+
+        // A higher version installs (ISC-A-S11 monotonic).
+        let (a5, p5) = make(5);
+        assert!(state.set_deprecation(a5, p5));
+        assert_eq!(
+            state.deprecation_policy_decoded().unwrap().policy_version(),
+            5
+        );
+
+        // A lower version is refused — no rollback (ISC-11 / ISC-A-S11).
+        let (a2, p2) = make(2);
+        assert!(!state.set_deprecation(a2, p2));
+        assert_eq!(
+            state.deprecation_policy_decoded().unwrap().policy_version(),
+            5,
+            "rollback must not regress the served version"
+        );
+    }
 
     fn ensure_module() {
         oxitls_rustls_provider::testing::ensure_module_operational();
@@ -1323,6 +1445,73 @@ mod tests {
 
         // Dropping the client closes the connection; the single-connection
         // server future then resolves.
+        drop(client);
+        let _ = server.await;
+    }
+
+    /// ISC-S16 / ISC-C25 / ISC-20 / ISC-41 end-to-end over the wire: a client
+    /// fetches the signed deprecation policy via `GetDeprecationPolicy`,
+    /// verifies it against the server-wide key, and derives the correct
+    /// trust-event signal for its in-use suite.
+    #[tokio::test]
+    async fn fetches_and_assesses_deprecation_policy_over_wire() {
+        let _ = oxicrypt_module::initialize();
+        let server_key = keypair(60);
+        let now = 1_000_000_000_000;
+        let three_h = 3 * 3_600_000;
+        let suite1 = SuiteId::try_new(1).unwrap();
+        let policy = DeprecationPolicy::build(
+            2,
+            now,
+            vec![DeprecationEntry {
+                suite_id: suite1,
+                cutoff_unix_ms: now + three_h,
+                recommended_suite_id: SuiteId::try_new(2).unwrap(),
+            }],
+            now,
+        )
+        .unwrap();
+        let artifact = sign_policy(&policy, &server_key).unwrap();
+
+        let state = Arc::new(PublicSpaceState::empty());
+        assert!(state.set_deprecation(artifact, policy));
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(serve_public_space(
+            server_io,
+            PublicSpaceService::new(state),
+        ));
+
+        let mut client_io = Some(client_io);
+        let channel = Endpoint::try_from("http://[::1]:50051")
+            .unwrap()
+            .connect_with_connector(tower::service_fn(move |_| {
+                let io = client_io.take().expect("connector invoked once");
+                async move { Ok::<_, io::Error>(TokioIo::new(io)) }
+            }))
+            .await
+            .expect("in-memory connect over duplex");
+        let mut client = PublicSpaceClient::new(channel);
+
+        let fetched = client
+            .get_deprecation_policy(wire::GetDeprecationPolicyRequest {})
+            .await
+            .expect("GetDeprecationPolicy routes")
+            .into_inner()
+            .policy
+            .expect("policy served");
+
+        // Client verifies against the server-wide key and derives the signal.
+        let verified = verify_policy(&fetched, server_key.public_key(), None)
+            .expect("policy verifies under server-wide key");
+        let signals = assess_deprecation(&verified, &[suite1], now);
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].key, TrustEventKey::SuiteDeprecationPending);
+        assert_eq!(
+            signals[0].recommended_suite_id,
+            SuiteId::try_new(2).unwrap()
+        );
+
         drop(client);
         let _ = server.await;
     }

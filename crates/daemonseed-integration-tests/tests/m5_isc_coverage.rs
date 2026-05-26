@@ -329,7 +329,7 @@ async fn trusted_key_rotation_reaches_the_notice_path_end_to_end() {
         let srv = tokio::spawn(async move {
             let mut s = s_end;
             let seen = SeenMap::new();
-            let _ = run_server_identity_proof(&mut s, cb, ver, &id1, NOW, 1000, &seen).await;
+            let _ = run_server_identity_proof(&mut s, cb, ver, &id1, NOW, 1000, &seen, None).await;
         });
         let mut c = c_end;
         let vp = run_client_identity_proof(&mut c, cb, ver, &client, NOW, &mut counters, &dialed)
@@ -362,7 +362,7 @@ async fn trusted_key_rotation_reaches_the_notice_path_end_to_end() {
         let srv = tokio::spawn(async move {
             let mut s = s_end;
             let seen = SeenMap::new();
-            let _ = run_server_identity_proof(&mut s, cb, ver, &id2, NOW, 2000, &seen).await;
+            let _ = run_server_identity_proof(&mut s, cb, ver, &id2, NOW, 2000, &seen, None).await;
         });
         let mut c = c_end;
         let vp = run_client_identity_proof(&mut c, cb, ver, &client, NOW, &mut counters, &dialed)

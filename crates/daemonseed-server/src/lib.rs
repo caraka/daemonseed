@@ -30,6 +30,7 @@
 #![forbid(unsafe_code)]
 
 pub mod config;
+pub mod deprecation;
 pub mod federation;
 pub mod hello;
 pub mod identity;

@@ -30,8 +30,9 @@ use std::sync::Arc;
 use clap::Parser;
 use daemonseed_server::{
     config::{ConfigError, ServerConfig as DseedConfig, resolve_config_path},
+    deprecation::{DeprecationBuildError, build_signed_deprecation_policy},
     identity::{IdentityError, derive_server_id, load_or_generate},
-    identity_proof::{IdentityProofError, ServerIdentity},
+    identity_proof::{IdentityProofError, ServerIdentity, now_unix_ms},
     kats::CNSA_2_0_KATS,
     public_space::{LoadError, PublicSpaceConfig, PublicSpaceState},
     runtime::{noop_observer, parse_listen_addr, run, shutdown_signal},
@@ -114,6 +115,16 @@ fn run_server(cli: Cli) -> Result<(), BootError> {
         .map_err(BootError::PublicSpace)?,
     );
 
+    // M7: build + sign the operator's suite-deprecation policy from config and
+    // install it on the public-space state. A misconfigured policy (e.g. an F30
+    // cutoff-too-soon) fails the boot rather than silently shipping nothing.
+    if let Some((artifact, policy)) =
+        build_signed_deprecation_policy(&config, &identity, now_unix_ms() as i64)
+            .map_err(BootError::Deprecation)?
+    {
+        public_space.set_deprecation(artifact, policy);
+    }
+
     let addr = parse_listen_addr(&config.listen_addr).map_err(BootError::ListenAddr)?;
 
     // Step 8 — runtime. The multi-thread builder is used so the accept
@@ -148,6 +159,7 @@ enum BootError {
     Identity(IdentityError),
     IdentityProof(IdentityProofError),
     PublicSpace(LoadError),
+    Deprecation(DeprecationBuildError),
     ListenAddr(std::io::Error),
     Runtime(std::io::Error),
     Accept(std::io::Error),
@@ -163,6 +175,7 @@ impl std::fmt::Display for BootError {
             Self::Identity(e) => write!(f, "{e}"),
             Self::IdentityProof(e) => write!(f, "server identity setup failed: {e}"),
             Self::PublicSpace(e) => write!(f, "public-space load failed: {e}"),
+            Self::Deprecation(e) => write!(f, "deprecation policy build failed: {e}"),
             Self::ListenAddr(e) => write!(f, "listen_addr parse failed: {e}"),
             Self::Runtime(e) => write!(f, "tokio runtime build failed: {e}"),
             Self::Accept(e) => write!(f, "accept loop failed: {e}"),
