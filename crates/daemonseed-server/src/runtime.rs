@@ -208,6 +208,10 @@ async fn serve_connection(
     let mut versioned: Connection<Versioned, _> =
         Connection::from_handshaked_transport(tls_stream).advance_to_versioned();
     let now = now_unix_ms();
+    // M7: the operator's suite-deprecation policy gates the proof — a client
+    // signing under a past-cutoff suite is refused (ISC-S16). `None` when no
+    // policy is configured (the common case).
+    let deprecation = public_space.deprecation_policy_decoded();
     match run_server_identity_proof(
         versioned.transport_mut(),
         channel_binding,
@@ -216,6 +220,7 @@ async fn serve_connection(
         now,
         now,
         &seen,
+        deprecation.as_ref(),
     )
     .await
     {

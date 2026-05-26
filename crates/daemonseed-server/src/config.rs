@@ -93,6 +93,58 @@ pub struct ServerConfig {
     /// (ISC-9 / finding F32) — the AGPL "corresponding source" pointer.
     #[serde(default)]
     pub server_source: Option<String>,
+
+    /// Crypto-agility operator policy (M7): suite-deprecation cutoffs (ISC-S16).
+    /// Absent / default → no deprecation policy published.
+    #[serde(default)]
+    pub crypto: CryptoConfig,
+}
+
+/// Operator crypto-agility configuration (ISC-S16 / ISC-A-S11, M7).
+///
+/// The operator declares per-suite deprecation cutoffs plus a monotonic
+/// `deprecation_policy_version`. The server builds a signed policy from this
+/// table at startup and publishes it through the public-space service. Changing
+/// any cutoff **requires** bumping `deprecation_policy_version` — the server
+/// re-signs and clients replay-protect on the version (ISC-A-S11 / ISC-C25).
+///
+/// TOML shape:
+/// ```toml
+/// [crypto]
+/// deprecation_policy_version = 3
+/// [[crypto.deprecation]]
+/// suite_id = 1
+/// cutoff_unix_ms = 1893456000000
+/// recommended_suite_id = 2
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CryptoConfig {
+    /// Monotonic policy version. `0` (the default) means "no policy
+    /// configured" and nothing is published. The operator increments this on
+    /// every cutoff change (ISC-A-S11 / ISC-16).
+    #[serde(default)]
+    pub deprecation_policy_version: u64,
+
+    /// Per-suite deprecation cutoffs. The TOML key is the singular
+    /// `[[crypto.deprecation]]`; the Rust field is the idiomatic plural.
+    #[serde(rename = "deprecation", default)]
+    pub deprecations: Vec<DeprecationConfigEntry>,
+}
+
+/// One operator-declared deprecation cutoff (`[[crypto.deprecation]]`).
+///
+/// `cutoff_unix_ms` is wall-clock milliseconds UTC — the codebase's uniform
+/// time representation (matching every other signed timestamp). ISC-S16 frames
+/// this as ISO-8601; the unix-ms form is the M7 ergonomics choice to avoid a
+/// date-parser dependency and stay consistent with the wire payloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeprecationConfigEntry {
+    /// The suite being retired (u16 SuiteId range).
+    pub suite_id: u32,
+    /// UTC cutoff in wall-clock milliseconds.
+    pub cutoff_unix_ms: i64,
+    /// Operator-recommended successor suite (u16 SuiteId range).
+    pub recommended_suite_id: u32,
 }
 
 /// One federation peer in the server's TOML (`[[peer]]`).

@@ -46,6 +46,8 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use daemonseed_core::crypto::deprecation::DeprecationPolicy;
+use daemonseed_core::crypto::suite::SuiteId;
 use daemonseed_core::handle::DisplayMode;
 use daemonseed_core::identity::keys::{KeyDerivationError, SignKeypair};
 use daemonseed_core::identity_proof::{
@@ -148,6 +150,13 @@ impl ServerIdentity {
     pub fn public_key(&self) -> &[u8; oxicrypt_ml_dsa::PK_LEN] {
         self.signing.public_key()
     }
+
+    /// The server's long-term signing keypair, used to sign the suite-
+    /// deprecation policy under the **server-wide key** (ISC-A-S11, M7). Kept
+    /// `pub(crate)` so policy signing stays inside the server crate.
+    pub(crate) fn signing_key(&self) -> &SignKeypair {
+        &self.signing
+    }
 }
 
 // ── RAM-only replay-counter map (ISC-34 / ISC-A-S1) ───────────────
@@ -208,6 +217,9 @@ impl SeenMap {
 /// (ISC-18) and the client-envelope skew check; `send_counter` is the
 /// server's monotonic counter (decision D7 — wall-clock ms). `seen` is the
 /// RAM-only replay map (ISC-34).
+// Eight orchestration inputs, each a distinct connection-scoped value with no
+// natural grouping; a params struct would add indirection without clarity.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_server_identity_proof<S>(
     stream: &mut S,
     channel_binding: [u8; daemonseed_core::identity_proof::CHANNEL_BINDING_LEN],
@@ -216,6 +228,7 @@ pub async fn run_server_identity_proof<S>(
     now_unix_ms: u64,
     send_counter: u64,
     seen: &SeenMap,
+    deprecation: Option<&DeprecationPolicy>,
 ) -> Result<VerifiedPeer, IdentityProofError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -245,6 +258,21 @@ where
     let client_envelope: wire::IdentityProof = read_frame(stream)
         .await
         .map_err(IdentityProofError::Frame)?;
+
+    // M7 — suite-deprecation cutoff enforcement (ISC-S16). Runs BEFORE the
+    // crypto verify: the client's suite_id is cleartext in the envelope, and a
+    // suite past its operator-declared cutoff is refused regardless of whether
+    // its signature is valid. The cutoff is *public signed policy*, so the
+    // refusal leaks nothing the client could not learn by fetching the policy —
+    // the uniform-close invariant (ISC-40 / A-S12 / A-C18) protects *crypto*
+    // sub-causes, not this. The connecting peer derives the actionable
+    // `SUITE_DEPRECATED_PAST_CUTOFF` reason from the policy it already holds.
+    if let Some(policy) = deprecation
+        && let Some(suite) = client_envelope_suite(&client_envelope)
+        && policy.is_past_cutoff(suite, now_unix_ms as i64)
+    {
+        return Err(IdentityProofError::SuiteDeprecatedPastCutoff);
+    }
 
     let highest_seen = seen.highest_seen(&client_envelope.claimed_pubkey);
     let verified = verify_envelope(
@@ -286,6 +314,11 @@ pub enum IdentityProofError {
     /// The client's envelope failed verification (uniform — sub-cause is
     /// deliberately opaque).
     Verify(VerifyRejection),
+    /// The client signed under a suite at/past its operator-declared
+    /// deprecation cutoff (ISC-S16, M7). Like every other variant the caller's
+    /// response is a uniform close; the connecting peer derives the actionable
+    /// `SUITE_DEPRECATED_PAST_CUTOFF` reason from the signed policy it holds.
+    SuiteDeprecatedPastCutoff,
 }
 
 impl fmt::Display for IdentityProofError {
@@ -296,6 +329,9 @@ impl fmt::Display for IdentityProofError {
             Self::Frame(e) => write!(f, "identity-proof frame I/O failed: {e}"),
             Self::ChannelBinding(e) => write!(f, "channel-binding derivation failed: {e}"),
             Self::Verify(e) => write!(f, "client identity-proof rejected: {e}"),
+            Self::SuiteDeprecatedPastCutoff => {
+                write!(f, "client suite is past its deprecation cutoff")
+            }
         }
     }
 }
@@ -308,8 +344,17 @@ impl Error for IdentityProofError {
             Self::Frame(e) => Some(e),
             Self::ChannelBinding(e) => Some(e),
             Self::Verify(e) => Some(e),
+            Self::SuiteDeprecatedPastCutoff => None,
         }
     }
+}
+
+/// Extract the client envelope's `suite_id` as a [`SuiteId`], or `None` if it
+/// is absent / out of range. Used for the cutoff check; an unparseable suite is
+/// left to the crypto verify path (which fails closed).
+fn client_envelope_suite(envelope: &wire::IdentityProof) -> Option<SuiteId> {
+    let raw = envelope.suite_id.as_ref()?.value;
+    SuiteId::try_new(u16::try_from(raw).ok()?).ok()
 }
 
 // ── Tests ────────────────────────────────────────────────────────
@@ -413,6 +458,7 @@ mod tests {
             NOW,
             now_unix_ms(),
             &seen,
+            None,
         )
         .await
         .expect("valid client must be accepted");
@@ -422,6 +468,97 @@ mod tests {
         assert_eq!(verified.handle(), client_h);
         // Counter recorded as highest-seen (ISC-34).
         assert_eq!(seen.highest_seen(&client_pubkey), Some(1));
+    }
+
+    /// Build a policy with an arbitrary (possibly past) cutoff, bypassing the
+    /// F30 construction guard via the decode path — for exercising the
+    /// at-proof-time cutoff enforcement.
+    fn policy_with_cutoff(suite: u16, cutoff_ms: i64) -> DeprecationPolicy {
+        use prost::Message;
+        let payload = wire::DeprecationPolicyPayload {
+            policy_version: 1,
+            signed_timestamp_ms: 0,
+            entries: vec![wire::SuiteDeprecationEntry {
+                suite_id: u32::from(suite),
+                cutoff_unix_ms: cutoff_ms,
+                recommended_suite_id: 2,
+            }],
+        };
+        DeprecationPolicy::from_signed_payload(&payload.encode_to_vec()).unwrap()
+    }
+
+    /// ISC-S16: a client signing under a suite at/past its cutoff is refused
+    /// with `SuiteDeprecatedPastCutoff` (a uniform close — the reason is the
+    /// server's diagnostic, not a wire surface).
+    #[tokio::test]
+    async fn server_refuses_client_past_deprecation_cutoff() {
+        let identity = test_server_identity();
+        let keys = client_keys();
+        let cb = [9u8; CHANNEL_BINDING_LEN];
+        let seen = SeenMap::new();
+        // Suite 1 (the client's MVP suite) cutoff is 1h BEFORE now → past.
+        let policy = policy_with_cutoff(MVP_SUITE_ID as u16, NOW as i64 - 3_600_000);
+
+        let (mut client_end, mut server_end) = duplex(64 * 1024);
+        let client = tokio::spawn(async move {
+            let _server_env: wire::IdentityProof = read_frame(&mut client_end).await.unwrap();
+            let env = good_client_envelope(&keys, &cb, 1, NOW);
+            write_frame(&mut client_end, &env).await.unwrap();
+        });
+
+        let out = run_server_identity_proof(
+            &mut server_end,
+            cb,
+            ver(),
+            &identity,
+            NOW,
+            now_unix_ms(),
+            &seen,
+            Some(&policy),
+        )
+        .await;
+        client.await.unwrap();
+        assert!(matches!(
+            out,
+            Err(IdentityProofError::SuiteDeprecatedPastCutoff)
+        ));
+    }
+
+    /// ISC-S16: a client signing under a deprecated suite that is still BEFORE
+    /// its cutoff is accepted normally (the deprecation only bites at cutoff).
+    #[tokio::test]
+    async fn server_accepts_deprecated_suite_before_cutoff() {
+        let identity = test_server_identity();
+        let keys = client_keys();
+        let cb = [9u8; CHANNEL_BINDING_LEN];
+        let seen = SeenMap::new();
+        // Suite 1 cutoff is 1h AFTER now → not yet past.
+        let policy = policy_with_cutoff(MVP_SUITE_ID as u16, NOW as i64 + 3_600_000);
+
+        let (mut client_end, mut server_end) = duplex(64 * 1024);
+        let client = tokio::spawn(async move {
+            let server_env: wire::IdentityProof = read_frame(&mut client_end).await.unwrap();
+            verify_envelope(&server_env, &cb, ver(), NOW, None).expect("server envelope verifies");
+            let env = good_client_envelope(&keys, &cb, 1, NOW);
+            write_frame(&mut client_end, &env).await.unwrap();
+        });
+
+        let verified = run_server_identity_proof(
+            &mut server_end,
+            cb,
+            ver(),
+            &identity,
+            NOW,
+            now_unix_ms(),
+            &seen,
+            Some(&policy),
+        )
+        .await;
+        client.await.unwrap();
+        assert!(
+            verified.is_ok(),
+            "before cutoff the deprecated suite is still accepted"
+        );
     }
 
     /// ISC-40 / ISC-A-S12: a tampered-signature client envelope is rejected,
@@ -454,6 +591,7 @@ mod tests {
                 NOW,
                 now_unix_ms(),
                 &seen,
+                None,
             )
             .await;
             client.await.unwrap();
@@ -494,6 +632,7 @@ mod tests {
                 NOW,
                 now_unix_ms(),
                 &seen,
+                None,
             )
             .await
             .expect("first envelope accepted");
@@ -516,6 +655,7 @@ mod tests {
             NOW,
             now_unix_ms(),
             &seen,
+            None,
         )
         .await;
         client.await.unwrap();
@@ -549,7 +689,8 @@ mod tests {
         });
 
         let _ =
-            run_server_identity_proof(&mut server_end, cb, ver(), &identity, NOW, 7, &seen).await;
+            run_server_identity_proof(&mut server_end, cb, ver(), &identity, NOW, 7, &seen, None)
+                .await;
         let server_env = captured.await.unwrap();
         assert_eq!(server_env.role, wire::Role::Server as i32);
         assert_eq!(server_env.claimed_handle, server_handle);

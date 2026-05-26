@@ -331,6 +331,7 @@ mod tests {
                     NOW,
                     now_unix_ms(),
                     &seen,
+                    None,
                 )
                 .await
                 .map(|p| p.handle().to_owned())
