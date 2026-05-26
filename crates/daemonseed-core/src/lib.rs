@@ -10,7 +10,9 @@
 //! signer whitelist, ML-DSA-87 verification) the server and clients share
 //! for the post-Authenticated public-space service. M8 adds the circle path:
 //! [`circle::key`] (shared-entropy key derivation), [`cot`] (rendezvous
-//! addressing), and [`storage::cas`] (the content-addressed chunk store).
+//! addressing), [`storage::cas`] (the content-addressed chunk store),
+//! [`storage::share_index`] (the encrypted redb share index), and [`indexer`]
+//! (the share-folder indexer engine driving that index).
 
 #![forbid(unsafe_code)]
 
@@ -24,6 +26,7 @@ pub mod first_start;
 pub mod handle;
 pub mod identity;
 pub mod identity_proof;
+pub mod indexer;
 pub mod kdf;
 pub mod passphrase;
 pub mod profile;

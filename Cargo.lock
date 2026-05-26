@@ -476,6 +476,7 @@ dependencies = [
  "toml",
  "unicode-normalization",
  "uuid",
+ "walkdir",
  "zeroize",
  "zxcvbn",
 ]

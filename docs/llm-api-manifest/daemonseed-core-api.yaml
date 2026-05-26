@@ -327,6 +327,25 @@ modules:
       - { sig: "ShareIndex::get(&self, rel_path: &str) -> Result<Option<ShareEntry>, IndexError>" }
       - { sig: "ShareIndex::entries(&self) -> Result<Vec<ShareEntry>, IndexError>" }
 
+  - path: daemonseed_core::indexer
+    purpose: >-
+      Share-folder indexer engine (M8, ISC-C21 / A-C7) — drives a ShareIndex from
+      the filesystem, designed against Demonsaw's cold-rescan thrash. Two modes:
+      cold_scan (one-time walkdir → upsert every file; caller runs it on a niced
+      background thread so it never starves a foreground task, and the persisted
+      index stays queryable meanwhile → startup never blocks) and apply_event
+      (one FsEvent → exactly one index write; a single file change never triggers
+      a share-wide rewalk). Synchronous + runtime-free by design so the caller
+      owns task isolation/priority. The live inotify/FSEvents source (notify
+      crate) + watch-limit fallback feed FsEvents in — that wiring layers on top.
+    iscs: [C21, A-C7]
+    public:
+      - { kind: enum, name: FsEvent, variants: "{Upserted(PathBuf), Removed(PathBuf)}", note: "Unit of incremental update. An Upserted for a vanished path folds to a removal (watchers don't guarantee ordering)." }
+      - { kind: struct, name: Indexer, note: "ShareIndex + share root. new(index, root); index() borrows for queries." }
+    key_functions:
+      - { sig: "Indexer::cold_scan(&self) -> Result<usize, IndexError>", note: "Walk the root, upsert every regular file, return count. Unreadable entries skipped (robust). Run on a niced bg thread (ISC-A-C7 no-fate-sharing)." }
+      - { sig: "Indexer::apply_event(&self, event: &FsEvent) -> Result<(), IndexError>", note: "Single-entry write (ISC-C21/A-C7 no rewalk). Upsert→put (or remove if vanished); transient stat error leaves entry as-is; paths outside root ignored." }
+
   - path: daemonseed_core::first_start
     purpose: >-
       Type-state orchestrator for cold-enrollment per ISC-C29 step
