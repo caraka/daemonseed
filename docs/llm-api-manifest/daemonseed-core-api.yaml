@@ -20,7 +20,7 @@ library:
     Protocol library. Identity primitives, profile substrate, at-rest
     storage, first-start orchestration, bootstrap-anchor selection,
     crypto-agility primitives (suite registry + policy gate), and
-    circle metadata. Wire-protocol surface (server skeleton, TLS,
+    circle-of-trust key derivation. Wire-protocol surface (server skeleton, TLS,
     APP_HELLO, identity-proof) lands in M4a+ on top of these
     foundations.
   license: "AGPL-3.0-or-later"
@@ -459,20 +459,25 @@ modules:
     purpose: >-
       Circle-of-trust types. **Client-only scope** — per ISC-A-S2 the
       server is never aware of which circles exist or who is in them.
-      Metadata never crosses the trust boundary; the companion
-      daemonseed.v1::CircleMin proto message is the inner-payload
-      shape for member-to-member exchange inside CoT-asset ciphertext
-      that the server relays opaquely. Circle creation lands in M6.
-    iscs: [C8, A-C8, A-S2]
+      Circles are flat and metadata-free (F16): a circle is defined
+      solely by its shared entropy — no founder, no signed metadata
+      record, no per-circle minimum-suite policy. The shared phrase is
+      both the sole circle secret and the sole distinguisher. Suite
+      floor is enforced at the server (S16 deprecation policy) plus the
+      client-local registry; a cross-family crypto change is the
+      circle-rekey/new-circle event of ISC-A-C8, expressed structurally
+      by family-anchored derivation rather than a stored record.
+    iscs: [C8, C9, A-C8, A-S2]
     submodules:
-      - daemonseed_core::circle::metadata
+      - daemonseed_core::circle::key
     public:
-      - { kind: struct, name: Metadata, fields: "{min_suite_id: SuiteId (private, read-only after construction)}", note: "Ratcheting up min_suite_id on an existing circle is post-MVP per ISC-A-C8 — enforced as a compile-time guarantee (no setter exists)." }
-      - { kind: struct, name: UnknownSuite, fields: "(pub SuiteId)", note: "Error from Metadata::new when the floor suite isn't in the registry." }
+      - { kind: const, name: COT_KEY_LEN, type: usize, note: "32 — circle-of-trust symmetric key length for AES-256-GCM (ISC-C8)." }
+      - { kind: const, name: EXAMPLE_ENTROPY, type: "&str", note: "Public teaching passphrase (xkcd-936). Pre-filled as the circle-creation placeholder so a user watches entropy → key derive locally; never auto-joined to a relay, so nothing reaches the network until the user types their own secret." }
+      - { kind: struct, name: CotKey, note: "Derived 32-byte symmetric key. ZeroizeOnDrop; Debug is redacted to `CotKey(<redacted>)` per ISC-A-C1." }
+      - { kind: enum, name: CircleKeyError, variants: "{Hkdf(oxicrypt_kdf::KdfError)}", note: "Failure modes for derive_cot_key." }
     key_functions:
-      - { sig: "Metadata::new(min_suite_id: SuiteId) -> Result<Metadata, UnknownSuite>", note: "Refuses unknown suites — a circle is never created under a suite the build doesn't ship." }
-      - { sig: "Metadata::min_suite_id(&self) -> SuiteId" }
-      - { sig: "Metadata::accepts(&self, suite: SuiteId) -> bool", note: "ISC-A-C8 render-time gate. True iff (a) suite resolves in registry, (b) same-family with floor, (c) numerically at or above floor. Cross-family is a new-circle event, not acceptance." }
+      - { sig: "derive_cot_key(entropy: &str, suite: &Suite) -> Result<CotKey, CircleKeyError>", note: "ISC-C8/C9. Canonicalizes entropy (NFKC + whitespace) then HKDF-SHA-384(salt=CIRCLE_KEY_SALT, ikm=canonical) → expand(info=\"daemonseed/circle/<family>\"). Family-anchored on Suite::family_token, so within-family suite ratchets leave the key unchanged; only a cross-family change re-derives (ISC-A-C8 new-circle event). Strength gating (≥128-bit) is the caller's responsibility via passphrase::strength." }
+      - { sig: "CotKey::as_bytes(&self) -> &[u8; COT_KEY_LEN]", note: "Borrow raw key bytes for AEAD use; callers must not copy into a non-zeroizing buffer." }
 
   - path: daemonseed_core::public_space
     purpose: >-

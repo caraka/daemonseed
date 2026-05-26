@@ -131,18 +131,6 @@ pub struct SuiteId {
     #[prost(uint32, tag = "1")]
     pub value: u32,
 }
-/// Per-circle minimum-suite floor (ISC-C24 circle-level minimum-suite
-/// policy). Read-only after circle creation in MVP; ratcheting up an
-/// existing circle's minimum is post-MVP (see ds-suite-registry.md "Not in
-/// MVP").
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
-pub struct CircleMin {
-    /// Minimum acceptable `suite_id` for content posted under this circle.
-    /// Sub-minimum content surfaces the ISC-A-C8 render-time warning at the
-    /// client.
-    #[prost(message, optional, tag = "1")]
-    pub min_suite_id: ::core::option::Option<SuiteId>,
-}
 /// A peer's proof that it controls the long-term key behind its claimed handle,
 /// bound to the current TLS session.
 #[derive(Clone, PartialEq, ::prost::Message)]

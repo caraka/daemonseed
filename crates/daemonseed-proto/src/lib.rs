@@ -29,7 +29,7 @@ pub mod v1 {
 mod tests {
     use prost::Message;
 
-    use crate::v1::{AppHello, AppHelloAck, AppHelloReject, CircleMin, ProtocolVersion, SuiteId};
+    use crate::v1::{AppHello, AppHelloAck, AppHelloReject, ProtocolVersion, SuiteId};
 
     /// `SuiteId` round-trips through prost encode/decode preserving the
     /// `value` field. M3 adds `SuiteId` to the v1 module; this test exists
@@ -40,22 +40,6 @@ mod tests {
         let bytes = original.encode_to_vec();
         let decoded = SuiteId::decode(bytes.as_slice()).unwrap();
         assert_eq!(decoded, original);
-    }
-
-    /// `CircleMin` round-trips with a populated `min_suite_id`. The optional
-    /// field arrives because proto3 messages are nullable by default; the
-    /// app-layer constructor (in M6 when circle creation lands) always
-    /// supplies a value, and a deserialized `None` MUST be rejected at the
-    /// application boundary.
-    #[test]
-    fn circle_min_round_trips_with_suite_id() {
-        let original = CircleMin {
-            min_suite_id: Some(SuiteId { value: 0x0001 }),
-        };
-        let bytes = original.encode_to_vec();
-        let decoded = CircleMin::decode(bytes.as_slice()).unwrap();
-        assert_eq!(decoded, original);
-        assert_eq!(decoded.min_suite_id.as_ref().unwrap().value, 0x0001);
     }
 
     /// `ProtocolVersion` is the wire-shape for SemVer MAJOR.MINOR. PATCH is

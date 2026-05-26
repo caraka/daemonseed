@@ -8,13 +8,12 @@
 
 use std::path::{Path, PathBuf};
 
-use daemonseed_core::circle::metadata::Metadata;
 use daemonseed_core::crypto::policy::WritePolicy;
 use daemonseed_core::crypto::suite::{CNSA_2_0, LifecycleState, Registry, SuiteId, WriteRefusal};
 use daemonseed_core::profile::config::ArgonParams;
 use daemonseed_core::storage::{recovery_file, seeds};
 use daemonseed_integration_tests::isc_coverage::Coverage;
-use daemonseed_proto::v1::{CircleMin, SuiteId as WireSuiteId};
+use daemonseed_proto::v1::SuiteId as WireSuiteId;
 use uuid::Uuid;
 
 fn init_oxicrypt() {
@@ -84,40 +83,41 @@ fn m3_iscs_exercise_end_to_end() {
     // suite_id per the registry; the suite-transparency clause is covered
     // by ISC-A-S10 below. Structural verification at M3: the registry
     // exposes a default write-suite the server consumes for its own
-    // material, the wire shape exists for transit through HELLO (M4a),
-    // and identity-proof verification at M4b consults Registry::lookup
-    // to map the signer's suite_id to a signature algorithm. Until the
-    // server crate gains real handshake code the test pins what M3 ships:
-    // the API the server *will* call exists, is in-tree, and round-trips.
+    // material, and identity-proof verification at M4b consults
+    // Registry::lookup to map the signer's suite_id to a signature
+    // algorithm. Until the server crate gains real handshake code the test
+    // pins what M3 ships: the suite the server authors material under
+    // resolves in-build. (The M7 deprecation policy that governs server
+    // suite lifecycle keys its entries by this same SuiteId.)
     // ─────────────────────────────────────────────────────────────────────
     assert!(Registry::lookup(Registry::default_write_suite()).is_some());
-    let circle_min = CircleMin {
-        min_suite_id: Some(WireSuiteId { value: 0x0001 }),
-    };
-    assert_eq!(circle_min.min_suite_id.unwrap().value, 0x0001);
     coverage.register("ISC-S15", "m3_iscs::server_suite_id_tagging_surface");
 
     // ── ISC-A-C8: client refuses to write under a deprecated suite at
-    // compose time (per ISC-A-C8 write-suite-policy). Exercised via the
-    // WritePolicy gate. Cross-family / sub-minimum render-time refusal
-    // is covered by Metadata::accepts; reflexive acceptance proves the
-    // gate works in the only direction the M3 single-entry registry
-    // permits (synthetic deprecated-state coverage lives in the
-    // crypto::suite::tests::resolve_for_write_branches unit test).
+    // compose time (per ISC-A-C8 write-suite-policy). In the flat,
+    // metadata-free circle model (F16) there is no per-circle min-suite
+    // record, so the policy is enforced two ways:
+    //   (a) the WritePolicy gate refuses any non-Active-write lifecycle
+    //       state under the default (sub-minimum / deprecated suites), and
+    //   (b) the circle key is *family-anchored* (Suite::family_token), so a
+    //       cross-family suite derives a different cot_key — i.e. cross-
+    //       family migration is structurally a new-circle event, never an
+    //       in-place acceptance. `same_family` is the load-bearing
+    //       discriminator. Sub-minimum *render-time* gating now lives in the
+    //       server S16 deprecation policy + the client-local registry, not
+    //       in a circle-level record.
+    // (Synthetic deprecated-state coverage lives in the
+    // crypto::suite::tests::resolve_for_write_branches unit test.)
     // ─────────────────────────────────────────────────────────────────────
-    let meta = Metadata::new(CNSA_2_0.id).unwrap();
-    assert!(meta.accepts(CNSA_2_0.id));
-    assert!(!meta.accepts(SuiteId::try_new(0x0042).unwrap())); // unknown ≈ cross-family
-
-    // The WritePolicy gate refuses any non-Active-write state under the
-    // default. The single-entry registry makes the synthetic branches the
-    // only way to show this externally; the policy enum's `permits` table
-    // is the test surface.
+    assert!(CNSA_2_0.same_family(&CNSA_2_0)); // within-family stable → same circle
     assert!(WritePolicy::default().permits(LifecycleState::ActiveWrite));
     assert!(!WritePolicy::default().permits(LifecycleState::ReadOnlyDeprecated));
     assert!(!WritePolicy::default().permits(LifecycleState::Removed));
 
-    coverage.register("ISC-A-C8", "m3_iscs::sub_min_and_deprecated_write_refused");
+    coverage.register(
+        "ISC-A-C8",
+        "m3_iscs::flat_circle_write_policy_and_family_anchor",
+    );
 
     // ── ISC-A-S10: server is suite-transparent on CoT relay. Negative
     // structural anchor: daemonseed-server (and its only file at M3,

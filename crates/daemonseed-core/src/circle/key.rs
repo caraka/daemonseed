@@ -1,0 +1,165 @@
+//! Circle-of-trust key derivation (ISC-C8 / ISC-C9).
+//!
+//! A circle is born from shared entropy (a passphrase/sentence agreed among
+//! members out-of-band). The entropy is the **sole** circle secret and the
+//! **sole** distinguisher — there is no circle name, no per-circle salt, no
+//! founder, and no signed metadata record (F16, resolved 2026-05-26). Two
+//! circles differ iff their entropy differs; a collision requires
+//! deliberately sharing the same phrase, which in the seed-key model *is*
+//! being the same circle.
+//!
+//! ```text
+//! entropy (raw text)
+//!   → circle_canonicalize::canonicalize   (NFKC + whitespace, ISC-C9)
+//!   → HkdfSha384::extract(salt = CIRCLE_KEY_SALT, ikm = canonical)   // PRK
+//!   → expand(info = "daemonseed/circle/<family>")  → 32-byte cot_key
+//! ```
+//!
+//! **Family-anchored, not suite-anchored.** The derivation is keyed on the
+//! crypto *family* (KDF+hash, [`Suite::family_token`]), never the volatile
+//! `suite_id`. Within-family server suite ratchets (which add/remove
+//! asymmetric algos) leave `cot_key` unchanged, so every member connecting
+//! under any same-family suite derives the byte-identical key. Only a
+//! cross-family change re-derives — the circle-rekey/new-circle event of
+//! ISC-A-C8.
+//!
+//! Strength gating (≥128-bit, ISC-C9) is the caller's responsibility via
+//! [`crate::passphrase::strength`]; this function derives unconditionally.
+
+use oxicrypt_kdf::HkdfSha384;
+use zeroize::Zeroize;
+
+use crate::crypto::suite::Suite;
+use crate::kdf::info;
+use crate::passphrase::circle_canonicalize;
+
+/// Length of a circle-of-trust key — 32 bytes for AES-256-GCM (ISC-C8).
+pub const COT_KEY_LEN: usize = 32;
+
+/// A public, illustrative circle entropy — the xkcd-936 passphrase.
+///
+/// **Not for real use.** It is published here as a *teaching example*, so the
+/// `cot_key` it derives is public knowledge and any circle built from it is
+/// public by construction. The client pre-fills it as the circle-creation
+/// placeholder (M11 surface) so a user can watch entropy → key derive locally,
+/// edit it, and see the key change — then clear it and type their own secret.
+/// It is **never auto-joined to a relay**: nothing is private, and nothing
+/// reaches the network, until the user supplies their own phrase. This is the
+/// pedagogy of the seed-key model without the footgun of a live shared circle.
+///
+/// ```no_run
+/// use daemonseed_core::circle::key::{derive_cot_key, EXAMPLE_ENTROPY};
+/// use daemonseed_core::crypto::suite::CNSA_2_0;
+/// // Every member who types this same phrase derives the identical key.
+/// let key = derive_cot_key(EXAMPLE_ENTROPY, &CNSA_2_0).unwrap();
+/// let _ = key;
+/// ```
+pub const EXAMPLE_ENTROPY: &str = "correct horse battery staple";
+
+/// A derived circle-of-trust symmetric key. Zeroes on drop; `Debug` is
+/// redacted so it never lands in a log surface (ISC-A-C1).
+#[derive(zeroize::ZeroizeOnDrop)]
+pub struct CotKey(Box<[u8; COT_KEY_LEN]>);
+
+impl CotKey {
+    /// Borrow the raw key bytes for AEAD use. Callers must not copy these
+    /// into a non-zeroizing buffer.
+    pub fn as_bytes(&self) -> &[u8; COT_KEY_LEN] {
+        &self.0
+    }
+}
+
+impl core::fmt::Debug for CotKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("CotKey(<redacted>)")
+    }
+}
+
+/// Failure modes for [`derive_cot_key`].
+#[derive(Debug)]
+pub enum CircleKeyError {
+    /// The HKDF extract/expand step failed (e.g. invalid output length).
+    Hkdf(oxicrypt_kdf::KdfError),
+}
+
+impl core::fmt::Display for CircleKeyError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            CircleKeyError::Hkdf(e) => write!(f, "circle-key HKDF failed: {e:?}"),
+        }
+    }
+}
+
+impl core::error::Error for CircleKeyError {}
+
+/// Derive the circle-of-trust key from shared entropy under a crypto family
+/// (ISC-C8). `entropy` is raw text; it is canonicalized (ISC-C9) internally
+/// so every member who agrees on the same phrase — regardless of incidental
+/// whitespace or Unicode form — derives the byte-identical key.
+pub fn derive_cot_key(entropy: &str, suite: &Suite) -> Result<CotKey, CircleKeyError> {
+    // ISC-C9: canonicalize so members agreeing on the same phrase — modulo
+    // incidental whitespace / Unicode form — derive the identical key. The
+    // canonical form is secret-adjacent, so zero it the moment HKDF-Extract
+    // has consumed it (mirrors the identity-derivation hygiene).
+    let mut canonical = circle_canonicalize::canonicalize(entropy);
+    let extract = HkdfSha384::extract(Some(info::CIRCLE_KEY_SALT), canonical.as_bytes());
+    canonical.zeroize();
+    let hkdf = extract.map_err(CircleKeyError::Hkdf)?;
+
+    // ISC-C8: family-anchored info string. `family_token` swaps only on a
+    // cross-family change, so within-family suite ratchets are transparent.
+    let info_str = info::circle(suite.family_token());
+
+    let mut key = [0u8; COT_KEY_LEN];
+    if let Err(e) = hkdf.expand(info_str.as_bytes(), &mut key) {
+        key.zeroize();
+        return Err(CircleKeyError::Hkdf(e));
+    }
+    let boxed = Box::new(key);
+    key.zeroize();
+    Ok(CotKey(boxed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::suite::CNSA_2_0;
+
+    /// ISC-C8 — derivation is deterministic: the same phrase yields the
+    /// byte-identical key on every call (and so on every member's machine).
+    #[test]
+    fn derivation_is_deterministic() {
+        let _ = oxicrypt_module::initialize();
+        let a = derive_cot_key(EXAMPLE_ENTROPY, &CNSA_2_0).unwrap();
+        let b = derive_cot_key(EXAMPLE_ENTROPY, &CNSA_2_0).unwrap();
+        assert_eq!(a.as_bytes(), b.as_bytes());
+    }
+
+    /// ISC-C9 — entropy is canonicalized before derivation, so incidental
+    /// whitespace / form differences between members collapse to the same key.
+    #[test]
+    fn canonicalizes_entropy_before_derivation() {
+        let _ = oxicrypt_module::initialize();
+        let plain = derive_cot_key(EXAMPLE_ENTROPY, &CNSA_2_0).unwrap();
+        let messy = derive_cot_key("  correct   horse battery staple  ", &CNSA_2_0).unwrap();
+        assert_eq!(plain.as_bytes(), messy.as_bytes());
+    }
+
+    /// ISC-C8 — distinct phrases yield distinct keys (the phrase is the sole
+    /// distinguisher).
+    #[test]
+    fn distinct_entropy_yields_distinct_keys() {
+        let _ = oxicrypt_module::initialize();
+        let a = derive_cot_key("phrase alpha", &CNSA_2_0).unwrap();
+        let b = derive_cot_key("phrase bravo", &CNSA_2_0).unwrap();
+        assert_ne!(a.as_bytes(), b.as_bytes());
+    }
+
+    /// `Debug` never leaks key bytes (ISC-A-C1 log-surface hygiene).
+    #[test]
+    fn debug_is_redacted() {
+        let _ = oxicrypt_module::initialize();
+        let k = derive_cot_key("some entropy phrase here", &CNSA_2_0).unwrap();
+        assert_eq!(format!("{k:?}"), "CotKey(<redacted>)");
+    }
+}

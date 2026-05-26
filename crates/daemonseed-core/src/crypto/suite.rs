@@ -192,6 +192,19 @@ impl Suite {
         matches!((self.kdf, other.kdf), (Kdf::HkdfSha384, Kdf::HkdfSha384))
             && matches!((self.hash, other.hash), (Hash::Sha384, Hash::Sha384))
     }
+
+    /// Stable token identifying this suite's crypto **family** (KDF + hash),
+    /// used as the HKDF `info` discriminator for family-anchored derivations
+    /// (the ISC-C8 circle key). Deliberately **not** a wire field — exposing
+    /// a `family_id` on the wire would freeze registry topology (see module
+    /// docs). Two suites share a token iff [`Suite::same_family`] holds; a
+    /// new `(Kdf, Hash)` pair forces a new arm here, so cross-family changes
+    /// cannot silently reuse another family's key.
+    pub const fn family_token(&self) -> &'static str {
+        match (self.kdf, self.hash) {
+            (Kdf::HkdfSha384, Hash::Sha384) => "hkdf-sha384",
+        }
+    }
 }
 
 // ── Concrete registry entries ─────────────────────────────────────────────

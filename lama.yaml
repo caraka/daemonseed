@@ -78,7 +78,7 @@ crates:
   - name: daemonseed-core
     purpose: >-
       Protocol library — identity, storage, bootstrap, first-start
-      orchestration, crypto-agility primitives, circle metadata.
+      orchestration, crypto-agility primitives, circle-of-trust key derivation.
       Pure library (no_std-compatible where the underlying primitives
       allow; currently uses std for I/O).
     license: AGPL-3.0-or-later
@@ -220,30 +220,34 @@ capabilities:
       - daemonseed_core::crypto::policy
     iscs: [S15, C24, A-S10, A-C8, A-C9]
 
-  - category: "Circle-of-trust metadata (client-only)"
+  - category: "Circle-of-trust key derivation (client-only)"
     summary: >-
-      Per-circle local state, holding the founder-declared min_suite_id.
-      The struct is client-local — circles are anonymous to the server
-      per ISC-A-S2, and Metadata never crosses the trust boundary.
-      `accepts(suite)` enforces same-family + at-or-above-floor at
-      render time per ISC-A-C8. Circle creation lands in M6.
+      Circles are flat and metadata-free (F16): a circle is defined
+      solely by its shared entropy — no founder, no metadata record, no
+      per-circle min-suite policy. `derive_cot_key(entropy, suite)`
+      canonicalizes the phrase (NFKC) then HKDF-SHA-384, family-anchored
+      on Suite::family_token so within-family suite ratchets keep the key
+      stable; a cross-family change re-derives (new-circle event per
+      ISC-A-C8). Suite floor lives in the server S16 policy + client
+      registry, not at circle level. CotKey is ZeroizeOnDrop with
+      redacted Debug.
     crate: daemonseed-core
     modules:
-      - daemonseed_core::circle::metadata
-    iscs: [C8, A-C8]
+      - daemonseed_core::circle::key
+    iscs: [C8, C9, A-C8]
 
   - category: "Wire schema (proto)"
     summary: >-
       Protocol Buffers schema for the `daemonseed.v1` package. Messages
       so far: Version (M0; for HELLO once it lands), SuiteId (M3; wire
-      tag for cryptographic artifacts), CircleMin (M3; inner-payload
-      shape for client-to-client circle metadata exchange). Schema is
-      version-stable per ISC-S14: MINOR bumps are additive-only;
-      MAJOR bumps create a new `vN` module.
+      tag for cryptographic artifacts). Schema is version-stable per
+      ISC-S14: MINOR bumps are additive-only; MAJOR bumps create a new
+      `vN` module. (CircleMin, added M3, was retired at M8 per F16 —
+      flat metadata-free circles — before it was ever sent on the wire.)
     crate: daemonseed-proto
     modules:
       - daemonseed_proto::v1
-    iscs: [S14, A-S9, C23, C24, A-C8]
+    iscs: [S14, A-S9, C23, C24]
 
 # ─────────────────────────────────────────────────────────────────────
 # Cross-cutting properties (system-wide invariants)

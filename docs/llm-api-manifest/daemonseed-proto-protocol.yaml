@@ -201,21 +201,12 @@ packages:
           - { name: ROLE_SERVER, number: 2, note: "Server, client-facing or S2S peering (ISC-S11 server-id)." }
         iscs: [S19, A-S8]
 
-      - name: CircleMin
-        defined_in: "proto/daemonseed/v1/suite.proto"
-        added_in: "v0.4.0 (M3)"
-        purpose: >-
-          Per-circle minimum-suite floor (ISC-C24 circle-level
-          minimum-suite policy). **Client-only payload shape** —
-          per ISC-A-S2 the server never sees decrypted CircleMin
-          values; this message is the inner-payload structure that
-          rides inside encrypted CoT-asset ciphertext or
-          member-to-member key-exchange envelopes that the server
-          relays opaquely. Read-only after circle creation in MVP
-          (ratcheting up an existing circle's minimum is post-MVP).
-        fields:
-          - { name: min_suite_id, type: SuiteId, tag: 1, note: "Optional in wire encoding (proto3 message default), but app-layer constructors always supply a value. A deserialized None MUST be rejected at the application boundary." }
-        iscs: [C24, A-C8]
+      # CircleMin (v0.4.0/M3) retired at M8 (F16, 2026-05-26): circles are flat
+      # and metadata-free, so there is no per-circle minimum-suite record. The
+      # suite floor lives in the server S16 deprecation policy + the client-local
+      # registry. The message was never sent on any wire path (circle creation
+      # had not shipped), so removal is wire-compatible; the name is retired and
+      # MUST NOT be reintroduced with different semantics.
 
       - name: IntroducerQuery
         defined_in: "proto/daemonseed/v1/federation.proto"

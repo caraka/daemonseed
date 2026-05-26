@@ -98,6 +98,25 @@ pub fn trust_events(profile_id: &str) -> String {
 /// ISC-A-S14) at use-site in M4b; this constant alone is the static half.
 pub const IDENTITY_PROOF_V1: &str = "daemonseed/identity-proof/v1";
 
+// ── Circle-of-trust key (ISC-C8) ──────────────────────────────────────────
+
+/// HKDF salt for the circle-of-trust key derivation (ISC-C8). A **fixed
+/// protocol constant**, never a per-circle value — per-circle uniqueness
+/// comes entirely from the shared entropy (the IKM), so two circles differ
+/// iff their entropy differs (F16: no per-circle salt, no circle name).
+pub const CIRCLE_KEY_SALT: &[u8] = b"daemonseed/v1/circle-key";
+
+/// HKDF info-string template for the circle-of-trust key (ISC-C8). The
+/// `<family>` token (per `crypto::suite::Suite::family_token`) anchors the
+/// derivation on the crypto family, so within-family suite ratchets leave the
+/// key unchanged and a cross-family change yields a cleanly distinct key.
+const CIRCLE_TEMPLATE: &str = "daemonseed/circle/{family}";
+
+/// Build the circle-of-trust HKDF info string for a crypto-family token.
+pub fn circle(family: &str) -> String {
+    CIRCLE_TEMPLATE.replace("{family}", family)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,5 +162,14 @@ mod tests {
     fn salt_and_identity_proof_constants() {
         assert_eq!(IDENTITY_ROOT_SALT, b"daemonseed/v1/identity-root");
         assert_eq!(IDENTITY_PROOF_V1, "daemonseed/identity-proof/v1");
+    }
+
+    /// **Spec contract (ISC-C8)** — the circle-key salt + info string are
+    /// protocol-visible: every member derives the same `cot_key` only if
+    /// these bytes match across builds. Drift here silently splits a circle.
+    #[test]
+    fn circle_info_string_is_pinned() {
+        assert_eq!(CIRCLE_KEY_SALT, b"daemonseed/v1/circle-key");
+        assert_eq!(circle("hkdf-sha384"), "daemonseed/circle/hkdf-sha384");
     }
 }

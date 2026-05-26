@@ -27,13 +27,9 @@ message SuiteId {
   uint32 value = 1;
 }
 
-// Per-circle minimum-suite floor (ISC-C24 circle-level minimum-suite
-// policy). Read-only after circle creation in MVP; ratcheting up an
-// existing circle's minimum is post-MVP (see ds-suite-registry.md "Not in
-// MVP").
-message CircleMin {
-  // Minimum acceptable `suite_id` for content posted under this circle.
-  // Sub-minimum content surfaces the ISC-A-C8 render-time warning at the
-  // client.
-  SuiteId min_suite_id = 1;
-}
+// `CircleMin` retired (F16, 2026-05-26). Circles are flat and metadata-free:
+// no per-circle minimum-suite record. The suite floor is enforced at the
+// server (S16 deprecation policy) plus the client-local registry, never at
+// circle level. The message was never sent on any wire path (circle creation
+// had not shipped), so removal is wire-compatible. Do not reintroduce the
+// `CircleMin` name with different semantics.
