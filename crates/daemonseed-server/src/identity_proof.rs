@@ -267,6 +267,19 @@ where
     // the uniform-close invariant (ISC-40 / A-S12 / A-C18) protects *crypto*
     // sub-causes, not this. The connecting peer derives the actionable
     // `SUITE_DEPRECATED_PAST_CUTOFF` reason from the policy it already holds.
+    //
+    // KNOWN LIMITATION (latent; tracked for the multi-suite milestone): the
+    // envelope's `suite_id` is NOT part of the signed input (see core
+    // `signing_input`) and does not select the proof's signature algorithm
+    // (ML-DSA-87 is fixed). So this gate is effective against HONEST clients
+    // (which report their true suite) but a malicious client can claim a
+    // non-deprecated *registered* suite to dodge the cutoff. This is harmless
+    // today (the registry holds exactly one suite) and the cutoff is a soft
+    // migration deadline, not a hard crypto boundary — but before a second
+    // suite is registered, `suite_id` must be bound into the identity-proof
+    // signed input (a proof-envelope wire change) for this gate to be
+    // load-bearing against an adversary. The client-side C25 enforcement is
+    // unaffected.
     if let Some(policy) = deprecation
         && let Some(suite) = client_envelope_suite(&client_envelope)
         && policy.is_past_cutoff(suite, now_unix_ms as i64)
