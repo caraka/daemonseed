@@ -46,8 +46,54 @@ fn render_main(app: &App, frame: &mut Frame) {
         .split(frame.area());
 
     render_status_bar(app, frame, chunks[0]);
-    render_chat_transcript(app, frame, chunks[1]);
+    // The main area shows the server-management list while that screen has
+    // focus, otherwise the chat transcript.
+    match app.main_focus() {
+        MainFocus::Servers => render_server_list(app, frame, chunks[1]),
+        _ => render_chat_transcript(app, frame, chunks[1]),
+    }
     render_main_input(app, frame, chunks[2]);
+}
+
+/// The server-management list (F22 / C22): each managed server with its
+/// trusted/untrusted slider position; the selected row is highlighted (ISC-21).
+fn render_server_list(app: &App, frame: &mut Frame, area: Rect) {
+    let lines: Vec<Line> = if app.servers().is_empty() {
+        vec![
+            Line::from(
+                "no servers — type <server-id>@<host:port> below and Enter to add".to_owned(),
+            )
+            .style(Style::default().fg(Color::DarkGray)),
+        ]
+    } else {
+        app.servers()
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                // The slider: ◄trusted● / ●untrusted► style two-position toggle.
+                let slider = if s.trusted {
+                    "[ untrusted  ◄●  TRUSTED ]"
+                } else {
+                    "[ UNTRUSTED  ●►  trusted ]"
+                };
+                let marker = if i == app.server_sel() { "▶ " } else { "  " };
+                let line = format!("{marker}{slider}  {} ({})", s.server_id, s.address);
+                let style = if i == app.server_sel() {
+                    Style::default().fg(Color::Cyan).bold()
+                } else {
+                    Style::default()
+                };
+                Line::from(line).style(style)
+            })
+            .collect()
+    };
+    let body = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" servers ")
+            .title_alignment(Alignment::Left),
+    );
+    frame.render_widget(body, area);
 }
 
 /// Top bar: connection state on the left, circle state on the right.
@@ -169,10 +215,14 @@ fn render_main_input(app: &App, frame: &mut Frame, area: Rect) {
                 format!("   muted: {}", muted.join(", "))
             };
             (
-                "mute handle  [Enter] toggle  [Tab] chat  [Esc] back",
+                "mute handle  [Enter] toggle  [Tab] servers  [Esc] back",
                 format!("{}{suffix}", app.mute_input()),
             )
         }
+        MainFocus::Servers => (
+            "add server-id@host:port  [Enter] add / connect-selected  [←/→] trust  [↑/↓] select  [Tab] chat",
+            app.server_input().to_owned(),
+        ),
     };
     // A status/error line (e.g. a failed send) is appended briefly when present.
     let shown = match app.status() {

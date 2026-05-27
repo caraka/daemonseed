@@ -36,11 +36,14 @@ modules:
       Windows Release/Repeat events do not double-fire transitions. The Main view
       holds circle-chat state: a message transcript (ISC-10), a compose buffer
       that queues a SendChat + locally echoes (ISC-14), a circle-join phrase
-      buffer that queues a JoinCircle (ISC-15/16), and a Tab-toggled focus.
+      buffer that queues a JoinCircle (ISC-15/16), a client-local mute set
+      (ISC-13), a mention autocomplete (ISC-12), and a server-management screen
+      (F22: add server, trusted/untrusted slider, connect-selected — ISC-21/26/27).
+      Tab cycles focus Chat → JoinCircle → Mute → Servers.
     no_std: false
     depends_on: [daemonseed-core, "daemonseed_tui::screens::first_start"]
-    iscs: ["1", "10", "14", "15", "16"]
-    added_in: "M11 scaffold + chat workstream"
+    iscs: ["1", "10", "11", "12", "13", "14", "15", "16", "21", "26", "27"]
+    added_in: "M11 scaffold + chat + trust/server workstream"
 
   - name: daemonseed_tui::net
     description: >-
@@ -118,6 +121,9 @@ public_types:
       - "fn mute_input(&self) -> &str"
       - "fn muted(&self) -> impl Iterator<Item = &str>"
       - "fn mention_autocomplete(&self) -> Vec<String>  # ISC-12 candidates from seen senders"
+      - "fn servers(&self) -> &[ManagedServer]           # F22 server list (ISC-21/26/27)"
+      - "fn server_input(&self) -> &str"
+      - "fn server_sel(&self) -> usize"
       - "fn on_net_event(&mut self, event: NetEvent)"
       - "fn on_key(&mut self, key: KeyEvent)"
   - name: daemonseed_tui::app::Screen
@@ -129,8 +135,11 @@ public_types:
     description: "One rendered chat line: sender (self-asserted handle), body, sent_unix_ms (0 for a local echo of a just-sent message, which the relay never reflects to its sender). ISC-10."
   - name: daemonseed_tui::app::MainFocus
     kind: enum
-    description: "Which Main-view input has keyboard focus (Tab cycles): Chat (compose, Enter sends, ISC-14), JoinCircle (phrase, Enter joins, ISC-15/16), Mute (full handle, Enter toggles the client-local mute set, ISC-13 / A-C3)."
-    variants: [Chat, JoinCircle, Mute]
+    description: "Which Main-view input has keyboard focus (Tab cycles): Chat (compose, Enter sends, ISC-14), JoinCircle (phrase, Enter joins, ISC-15/16), Mute (full handle, Enter toggles the client-local mute set, ISC-13 / A-C3), Servers (F22 server-management — the main area shows the server list; Enter adds or connects-selected, Left/Right slides trust, Up/Down selects, ISC-21/26/27)."
+    variants: [Chat, JoinCircle, Mute, Servers]
+  - name: daemonseed_tui::app::ManagedServer
+    kind: struct
+    description: "One managed federation server (F22 / C22): server_id, address, trusted (slider position — trusted = TOFU-pin on first contact, untrusted = require a pre-imported operator key)."
   - name: daemonseed_tui::app::CircleStatus
     kind: enum
     description: "Circle subscription state shown on the main view: NotJoined, Joining, Joined (ISC-16), Failed(String)."

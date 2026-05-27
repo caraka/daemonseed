@@ -65,7 +65,7 @@ pub struct ChatLine {
 }
 
 /// Which input on the [`Screen::Main`] view has keyboard focus. `Tab` cycles
-/// Chat → JoinCircle → Mute → Chat.
+/// Chat → JoinCircle → Mute → Servers → Chat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MainFocus {
     /// The chat compose box (default): typing composes, Enter sends (ISC-14).
@@ -77,6 +77,20 @@ pub enum MainFocus {
     /// client-local mute set (ISC-13 / C15). The set never leaves this client
     /// (ISC-A-C3).
     Mute,
+    /// The server-management screen (F22): add servers, set per-server trust
+    /// mode with the trusted/untrusted slider (C22), and connect to a selected
+    /// one (ISC-21/26/27). The main area shows the server list instead of chat.
+    Servers,
+}
+
+/// One managed federation server in the server-management screen (F22 / C22).
+/// `trusted` is the slider position: trusted = TOFU-pin on first contact,
+/// untrusted = require a pre-imported operator key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedServer {
+    pub server_id: String,
+    pub address: String,
+    pub trusted: bool,
 }
 
 /// State of the circle subscription shown on the main view.
@@ -137,6 +151,12 @@ pub struct App {
     /// Client-local muted full wire handles (ISC-13 / C15). Never leaves the
     /// client (ISC-A-C3); applied as a render-time suppression filter.
     muted: std::collections::BTreeSet<String>,
+    /// Managed federation servers shown on the server-management screen (F22).
+    servers: Vec<ManagedServer>,
+    /// The add-server input buffer (`server-id@host:port`) (ISC-26).
+    server_input: String,
+    /// Index of the selected server in [`Self::servers`] (Up/Down moves it).
+    server_sel: usize,
     /// A circle-join the binary should forward to the net actor (drained once).
     pending_join: Option<String>,
     /// A chat send the binary should forward to the net actor (drained once).
@@ -175,6 +195,9 @@ impl App {
             status: None,
             mute_input: String::new(),
             muted: std::collections::BTreeSet::new(),
+            servers: Vec::new(),
+            server_input: String::new(),
+            server_sel: 0,
             pending_join: None,
             pending_chat: None,
         }
@@ -319,6 +342,21 @@ impl App {
         self.muted.iter().map(String::as_str)
     }
 
+    /// The managed servers, for rendering the server-management screen (F22).
+    pub fn servers(&self) -> &[ManagedServer] {
+        &self.servers
+    }
+
+    /// The add-server input buffer, for rendering.
+    pub fn server_input(&self) -> &str {
+        &self.server_input
+    }
+
+    /// The selected server index, for highlighting in the server list.
+    pub fn server_sel(&self) -> usize {
+        self.server_sel
+    }
+
     /// @-mention autocomplete candidates for the current compose buffer
     /// (ISC-12 / C18). When composing and the buffer ends with a partial
     /// `@token` (no whitespace after the last `@`), returns the full wire
@@ -416,13 +454,15 @@ impl App {
                 self.main_focus = match self.main_focus {
                     MainFocus::Chat => MainFocus::JoinCircle,
                     MainFocus::JoinCircle => MainFocus::Mute,
-                    MainFocus::Mute => MainFocus::Chat,
+                    MainFocus::Mute => MainFocus::Servers,
+                    MainFocus::Servers => MainFocus::Chat,
                 };
             }
             _ => match self.main_focus {
                 MainFocus::Chat => self.on_key_chat(key),
                 MainFocus::JoinCircle => self.on_key_join(key),
                 MainFocus::Mute => self.on_key_mute(key),
+                MainFocus::Servers => self.on_key_servers(key),
             },
         }
     }
@@ -488,6 +528,67 @@ impl App {
                 // Toggle: a second Enter on the same handle unmutes it.
                 if !self.muted.remove(&handle) {
                     self.muted.insert(handle);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Server-management screen (F22 / C22): printable chars build the
+    /// add-server input; Enter either adds a server (when the input is
+    /// non-empty, ISC-26) or connects to the selected one (when the input is
+    /// empty); Up/Down moves the selection; Left/Right slides the selected
+    /// server's trust mode (ISC-21/27). The trusted/untrusted slider and the
+    /// connect both reuse the existing trust + connect plumbing.
+    fn on_key_servers(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char(c) => self.server_input.push(c),
+            KeyCode::Backspace => {
+                self.server_input.pop();
+            }
+            KeyCode::Up => self.server_sel = self.server_sel.saturating_sub(1),
+            KeyCode::Down if !self.servers.is_empty() => {
+                self.server_sel = (self.server_sel + 1).min(self.servers.len() - 1);
+            }
+            // The trust slider (ISC-21/27): Left = untrusted, Right = trusted.
+            KeyCode::Left => {
+                if let Some(s) = self.servers.get_mut(self.server_sel) {
+                    s.trusted = false;
+                }
+            }
+            KeyCode::Right => {
+                if let Some(s) = self.servers.get_mut(self.server_sel) {
+                    s.trusted = true;
+                }
+            }
+            KeyCode::Enter if !self.server_input.is_empty() => {
+                // Add a server (ISC-26): `server-id@host:port`.
+                let raw = std::mem::take(&mut self.server_input);
+                match raw.split_once('@') {
+                    Some((id, addr)) if !id.is_empty() && !addr.is_empty() => {
+                        self.servers.push(ManagedServer {
+                            server_id: id.to_owned(),
+                            address: addr.to_owned(),
+                            trusted: true, // default to trusted (TOFU); slider adjusts
+                        });
+                        self.server_sel = self.servers.len() - 1;
+                    }
+                    _ => {
+                        self.status = Some("server format: <server-id>@<host:port>".to_owned());
+                        self.server_input = raw; // keep what they typed to fix
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                // Empty input + a selected server → connect to it, reusing the
+                // existing pending-connect path with the slider's trust mode.
+                if let Some(s) = self.servers.get(self.server_sel) {
+                    self.pending_connect = Some(ConnectRequest {
+                        server_id: s.server_id.clone(),
+                        address: s.address.clone(),
+                        trusted: s.trusted,
+                    });
+                    self.connection = ConnectionStatus::Connecting;
                 }
             }
             _ => {}
@@ -718,6 +819,8 @@ mod tests {
         app.on_key(press(KeyCode::Tab));
         assert_eq!(app.main_focus(), MainFocus::Mute);
         app.on_key(press(KeyCode::Tab));
+        assert_eq!(app.main_focus(), MainFocus::Servers);
+        app.on_key(press(KeyCode::Tab));
         assert_eq!(app.main_focus(), MainFocus::Chat);
     }
 
@@ -913,6 +1016,114 @@ mod tests {
             yellow_cells(&app) > baseline,
             "a self-mention highlights its span yellow (ISC-11)"
         );
+    }
+
+    // ── server management + trust slider (ISC-21/26/27) ─────────────────
+
+    /// Navigate to the Servers screen via the Tab cycle.
+    fn to_servers(app: &mut App) {
+        app.on_key(press(KeyCode::Tab)); // Chat → JoinCircle
+        app.on_key(press(KeyCode::Tab)); // → Mute
+        app.on_key(press(KeyCode::Tab)); // → Servers
+        assert_eq!(app.main_focus(), MainFocus::Servers);
+    }
+
+    #[test]
+    fn adding_a_server_appends_trusted_by_default() {
+        let mut app = drive_to_main();
+        to_servers(&mut app);
+        for ch in "relay#aabbccddeeff@10.0.0.5:443".chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        app.on_key(press(KeyCode::Enter)); // add (ISC-26)
+        assert_eq!(app.servers().len(), 1);
+        assert_eq!(app.servers()[0].server_id, "relay#aabbccddeeff");
+        assert_eq!(app.servers()[0].address, "10.0.0.5:443");
+        assert!(app.servers()[0].trusted, "new server defaults to trusted");
+        assert_eq!(app.server_input(), "", "input cleared after add");
+    }
+
+    #[test]
+    fn malformed_server_input_is_rejected_with_status() {
+        let mut app = drive_to_main();
+        to_servers(&mut app);
+        for ch in "no-at-sign".chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        app.on_key(press(KeyCode::Enter));
+        assert!(app.servers().is_empty(), "malformed entry not added");
+        assert!(app.status().is_some(), "error surfaced");
+        assert_eq!(app.server_input(), "no-at-sign", "input kept to fix");
+    }
+
+    #[test]
+    fn left_right_slider_sets_per_server_trust_mode() {
+        let mut app = drive_to_main();
+        to_servers(&mut app);
+        for ch in "relay#aabbccddeeff@host:443".chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        app.on_key(press(KeyCode::Enter)); // add (trusted by default)
+        assert!(app.servers()[0].trusted);
+        app.on_key(press(KeyCode::Left)); // slide → untrusted (ISC-21/27)
+        assert!(!app.servers()[0].trusted);
+        app.on_key(press(KeyCode::Right)); // slide → trusted
+        assert!(app.servers()[0].trusted);
+    }
+
+    #[test]
+    fn up_down_moves_server_selection() {
+        let mut app = drive_to_main();
+        to_servers(&mut app);
+        for id in ["a#aabbccddeeff@h:1", "b#ccddeeff0011@h:2"] {
+            for ch in id.chars() {
+                app.on_key(press(KeyCode::Char(ch)));
+            }
+            app.on_key(press(KeyCode::Enter));
+        }
+        assert_eq!(app.server_sel(), 1, "selection follows the last-added");
+        app.on_key(press(KeyCode::Up));
+        assert_eq!(app.server_sel(), 0);
+        app.on_key(press(KeyCode::Up)); // saturates
+        assert_eq!(app.server_sel(), 0);
+        app.on_key(press(KeyCode::Down));
+        assert_eq!(app.server_sel(), 1);
+    }
+
+    #[test]
+    fn enter_on_selected_server_with_empty_input_connects() {
+        let mut app = drive_to_main();
+        to_servers(&mut app);
+        for ch in "relay#aabbccddeeff@10.0.0.5:443".chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        app.on_key(press(KeyCode::Enter)); // add (input now empty)
+        let _ = app.take_pending_connect(); // ignore any prior
+        app.on_key(press(KeyCode::Enter)); // empty input + selected → connect
+        assert_eq!(app.connection(), &ConnectionStatus::Connecting);
+        let req = app.take_pending_connect().expect("connect queued");
+        assert_eq!(req.server_id, "relay#aabbccddeeff");
+        assert_eq!(req.address, "10.0.0.5:443");
+        assert!(req.trusted);
+    }
+
+    #[test]
+    fn server_list_renders_with_slider_and_selection() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = drive_to_main();
+        to_servers(&mut app);
+        for ch in "relay#aabbccddeeff@10.0.0.5:443".chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        app.on_key(press(KeyCode::Enter));
+
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        term.draw(|f| crate::ui::render(&app, f)).unwrap();
+        let text = buffer_text(&term);
+        assert!(text.contains("relay#aabbccddeeff"), "server id rendered");
+        assert!(text.contains("TRUSTED"), "trust slider rendered");
     }
 
     #[test]
