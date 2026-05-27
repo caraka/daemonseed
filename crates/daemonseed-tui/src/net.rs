@@ -27,9 +27,10 @@
 
 use std::rc::Rc;
 
-use daemonseed_cli::connect::connect_session;
+use daemonseed_cli::connect::{ConnectError, connect_session};
 use daemonseed_cli::identity_proof::ClientIdentity;
 use daemonseed_cli::session::AppSession;
+use daemonseed_core::backoff::{Backoff, CloseCause};
 use daemonseed_core::circle::key::{CotKey, derive_cot_key};
 use daemonseed_core::circle::message::{open_message, seal_message};
 use daemonseed_core::cot::{AssetAddr, asset_address};
@@ -37,6 +38,7 @@ use daemonseed_core::crypto::suite::CNSA_2_0;
 use daemonseed_core::federation::store::{InMemoryTrustStore, ServerEntry, TrustStore};
 use daemonseed_core::handle::Handle;
 use daemonseed_core::storage::seeds::CounterState;
+use daemonseed_core::trust_events::TrustEventKey;
 use daemonseed_proto::v1 as wire;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -92,6 +94,17 @@ pub enum NetEvent {
     },
     /// A chat send failed (no joined circle, seal, or publish error).
     ChatError { message: String },
+    /// A trust-state event to surface per its ISC-C28 affordance class. The key
+    /// determines the class via `class_of`; the UI routes it (Blocking modal,
+    /// Persistent status badge, Transient toast, or LogOnly history).
+    TrustEvent {
+        key: TrustEventKey,
+        /// The server-id the event concerns, for per-scope dismissal (A-C12).
+        server_id: Option<String>,
+    },
+    /// The connection closed at an observable layer (ISC-C26). Categorized by the
+    /// layer reached, never by a guessed server-side cause (ISC-A-S12).
+    ConnectionClosed { cause: CloseCause },
 }
 
 /// Owns the network thread and the command/event channels. Held by the binary
@@ -168,6 +181,11 @@ struct Actor {
     server_id: Option<String>,
     /// The currently-joined circle, if any.
     circle: Option<Circle>,
+    /// Per-session reconnect-refusal budget (ISC-C26). Consecutive refused
+    /// connects advance it so the surfaced trust event escalates
+    /// `ConnectionRateLimited` (Transient) → `ConnectionRateLimitedExhausted`
+    /// (PersistentNonBlocking); a successful connect resets it.
+    backoff: Backoff,
 }
 
 /// The actor loop: receive commands and drive each on the current-thread
@@ -182,6 +200,7 @@ async fn net_actor(
         session: None,
         server_id: None,
         circle: None,
+        backoff: Backoff::new(),
     };
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
@@ -243,19 +262,67 @@ impl Actor {
                 Ok(session) => {
                     self.session = Some(session);
                     self.server_id = Some(server_id.to_owned());
+                    self.backoff.reset();
+                    // A trusted-mode key rotation is a PersistentNonBlocking
+                    // trust event (ISC-C22/C28): the connect succeeded, but the
+                    // user should know the key changed.
+                    if outcome.rotation_notice.is_some() {
+                        self.emit(NetEvent::TrustEvent {
+                            key: TrustEventKey::ServerKeyRotated,
+                            server_id: Some(outcome.server_handle.clone()),
+                        });
+                    }
                     self.emit(NetEvent::Connected {
                         server: outcome.server_handle,
                         version: outcome.version.to_string(),
                         rotation_notice: outcome.rotation_notice,
                     });
                 }
-                Err(e) => self.emit(NetEvent::ConnectFailed {
-                    message: format!("application session setup failed: {e}"),
-                }),
+                // The handshake succeeded but the application session failed to
+                // open — an after-auth close (ISC-C26).
+                Err(e) => {
+                    self.emit(NetEvent::ConnectFailed {
+                        message: format!("application session setup failed: {e}"),
+                    });
+                    self.emit_close(server_id, CloseCause::ClosedAfterAuth, None);
+                }
             },
-            Err(e) => self.emit(NetEvent::ConnectFailed {
-                message: e.to_string(),
+            Err(e) => {
+                let (cause, specific) = classify_failure(&e);
+                self.emit(NetEvent::ConnectFailed {
+                    message: e.to_string(),
+                });
+                self.emit_close(server_id, cause, specific);
+            }
+        }
+    }
+
+    /// Emit a connection-close event and the trust event it warrants (ISC-C26 /
+    /// ISC-C28). An actionable `specific` key (key mismatch, no-common-version)
+    /// surfaces directly; otherwise an app-level close flows through the uniform
+    /// rate-limit refusal path (ISC-A-S12) — the client cannot tell a refusal
+    /// from a rate-limit, so it escalates the bounded refusal event and advances
+    /// the backoff budget. A pure network failure carries no trust event.
+    fn emit_close(&mut self, server_id: &str, cause: CloseCause, specific: Option<TrustEventKey>) {
+        self.emit(NetEvent::ConnectionClosed { cause });
+        match specific {
+            Some(key) => self.emit(NetEvent::TrustEvent {
+                key,
+                server_id: Some(server_id.to_owned()),
             }),
+            None => {
+                if matches!(
+                    cause,
+                    CloseCause::RefusedBeforeHelloAck | CloseCause::ClosedAfterAuth
+                ) {
+                    let key = self.backoff.refusal_event();
+                    let _ = self.backoff.next_jittered(); // advance the budget
+                    self.emit(NetEvent::TrustEvent {
+                        key,
+                        server_id: Some(server_id.to_owned()),
+                    });
+                }
+            }
         }
     }
 
@@ -392,6 +459,43 @@ async fn read_inbound(
     }
 }
 
+/// Categorize a connect failure into its observable close layer (ISC-C26) and,
+/// when the error maps to a *specific actionable* trust event (ISC-C28), that
+/// key. Network-layer failures and the deliberately-opaque app-layer closes
+/// carry no specific key — they flow through the uniform rate-limit refusal path
+/// instead (ISC-A-S12), so the client never claims to know a server-side cause
+/// it cannot observe.
+fn classify_failure(e: &ConnectError) -> (CloseCause, Option<TrustEventKey>) {
+    match e {
+        // Never reached the application: DNS / TCP / TLS, or a local config
+        // failure that meant no server was ever contacted.
+        ConnectError::Tcp { .. }
+        | ConnectError::TlsHandshake(_)
+        | ConnectError::Rustls(_)
+        | ConnectError::NoAddress { .. }
+        | ConnectError::BadServerId => (CloseCause::NetworkFailure, None),
+        // Actionable, non-opaque: the C22 trust slider refused the presented key.
+        ConnectError::TrustRefused => (
+            CloseCause::RefusedBeforeHelloAck,
+            Some(TrustEventKey::ServerKeyMismatch),
+        ),
+        // Actionable: no protocol version in common (ISC-C23).
+        ConnectError::NoCommonVersion { .. } => (
+            CloseCause::RefusedBeforeHelloAck,
+            Some(TrustEventKey::NoCommonVersion),
+        ),
+        // App-level close at/around APP_HELLO, or the deliberately-opaque
+        // identity-proof refusal (ISC-46) — no specific key.
+        ConnectError::HelloWrite(_)
+        | ConnectError::HelloDecode(_)
+        | ConnectError::OutOfSetAck { .. }
+        | ConnectError::UnknownRejectCode { .. }
+        | ConnectError::WireOutOfRange(_)
+        | ConnectError::ChannelBinding(_)
+        | ConnectError::IdentityProofRefused => (CloseCause::RefusedBeforeHelloAck, None),
+    }
+}
+
 /// Wall-clock now in unix milliseconds (advisory message timestamp).
 fn now_unix_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -451,6 +555,7 @@ mod tests {
                 session: None,
                 server_id: None,
                 circle: None,
+                backoff: Backoff::new(),
             };
             actor.handle_join_circle("some circle phrase").await;
             match evt_rx.try_recv() {
@@ -460,6 +565,132 @@ mod tests {
                 other => panic!("expected CircleJoinFailed, got {other:?}"),
             }
         });
+    }
+
+    /// `classify_failure` maps each error to the right close layer (ISC-C26) and
+    /// only the two actionable errors carry a specific trust-event key (ISC-C28).
+    #[test]
+    fn classify_failure_maps_layers_and_specific_keys() {
+        assert_eq!(
+            classify_failure(&ConnectError::BadServerId),
+            (CloseCause::NetworkFailure, None)
+        );
+        assert_eq!(
+            classify_failure(&ConnectError::TrustRefused),
+            (
+                CloseCause::RefusedBeforeHelloAck,
+                Some(TrustEventKey::ServerKeyMismatch)
+            )
+        );
+        assert_eq!(
+            classify_failure(&ConnectError::NoCommonVersion {
+                server_supported: Vec::new()
+            }),
+            (
+                CloseCause::RefusedBeforeHelloAck,
+                Some(TrustEventKey::NoCommonVersion)
+            )
+        );
+        // The opaque identity-proof refusal carries no specific key (ISC-46).
+        assert_eq!(
+            classify_failure(&ConnectError::IdentityProofRefused),
+            (CloseCause::RefusedBeforeHelloAck, None)
+        );
+    }
+
+    fn bare_actor(evt_tx: mpsc::UnboundedSender<NetEvent>) -> Actor {
+        Actor {
+            evt_tx,
+            session: None,
+            server_id: None,
+            circle: None,
+            backoff: Backoff::new(),
+        }
+    }
+
+    /// An actionable failure emits the close event plus its specific trust event
+    /// (ISC-C28), and does not consume the refusal budget.
+    #[test]
+    fn emit_close_surfaces_specific_trust_event() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut actor = bare_actor(tx);
+        actor.emit_close(
+            "relay#aabbccddeeff",
+            CloseCause::RefusedBeforeHelloAck,
+            Some(TrustEventKey::ServerKeyMismatch),
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            NetEvent::ConnectionClosed {
+                cause: CloseCause::RefusedBeforeHelloAck
+            }
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            NetEvent::TrustEvent {
+                key: TrustEventKey::ServerKeyMismatch,
+                server_id: Some("relay#aabbccddeeff".to_owned())
+            }
+        );
+    }
+
+    /// A network-layer failure emits only the close event — no trust event, since
+    /// the client never reached the application (ISC-A-S12).
+    #[test]
+    fn emit_close_network_failure_has_no_trust_event() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut actor = bare_actor(tx);
+        actor.emit_close("relay#aabbccddeeff", CloseCause::NetworkFailure, None);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            NetEvent::ConnectionClosed {
+                cause: CloseCause::NetworkFailure
+            }
+        );
+        assert!(rx.try_recv().is_err(), "no trust event on network failure");
+    }
+
+    /// Repeated opaque app-level refusals escalate the uniform refusal event from
+    /// Transient (`ConnectionRateLimited`) to PersistentNonBlocking
+    /// (`ConnectionRateLimitedExhausted`) once the budget is spent (ISC-C26/C28).
+    #[test]
+    fn emit_close_escalates_refusal_after_budget() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut actor = bare_actor(tx);
+        let refusal_key = |rx: &mut mpsc::UnboundedReceiver<NetEvent>| {
+            // Drain the ConnectionClosed, return the trust-event key.
+            let _ = rx.try_recv();
+            match rx.try_recv().unwrap() {
+                NetEvent::TrustEvent { key, .. } => key,
+                other => panic!("expected TrustEvent, got {other:?}"),
+            }
+        };
+        // First refusal is Transient.
+        actor.emit_close(
+            "relay#aabbccddeeff",
+            CloseCause::RefusedBeforeHelloAck,
+            None,
+        );
+        assert_eq!(refusal_key(&mut rx), TrustEventKey::ConnectionRateLimited);
+        // Spend the rest of the 8-retry budget.
+        for _ in 0..8 {
+            actor.emit_close(
+                "relay#aabbccddeeff",
+                CloseCause::RefusedBeforeHelloAck,
+                None,
+            );
+            let _ = refusal_key(&mut rx);
+        }
+        // Now the budget is exhausted → PersistentNonBlocking.
+        actor.emit_close(
+            "relay#aabbccddeeff",
+            CloseCause::RefusedBeforeHelloAck,
+            None,
+        );
+        assert_eq!(
+            refusal_key(&mut rx),
+            TrustEventKey::ConnectionRateLimitedExhausted
+        );
     }
 
     /// Sending chat before joining a circle emits ChatError, not a panic.
@@ -477,6 +708,7 @@ mod tests {
                 session: None,
                 server_id: None,
                 circle: None,
+                backoff: Backoff::new(),
             };
             actor.handle_send_chat("hello", "me#000000000000").await;
             match evt_rx.try_recv() {

@@ -13,11 +13,13 @@ use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph, Wrap};
 
+use daemonseed_core::backoff::CloseCause;
 use daemonseed_core::handle::{DisplayMode, Handle};
 use daemonseed_core::mention::find_self_mentions;
 use daemonseed_core::passphrase::strength::SESSION_PASSPHRASE_MIN_BITS;
+use daemonseed_core::trust_events::{TrustEventKey, event_key_string};
 
-use crate::app::{App, ChatLine, CircleStatus, ConnectionStatus, MainFocus, Screen};
+use crate::app::{App, ChatLine, CircleStatus, ConnectionStatus, MainFocus, Screen, TrustItem};
 use crate::screens::first_start::{FirstStartUi, FsStep};
 
 /// Draw the current screen.
@@ -46,13 +48,157 @@ fn render_main(app: &App, frame: &mut Frame) {
         .split(frame.area());
 
     render_status_bar(app, frame, chunks[0]);
-    // The main area shows the server-management list while that screen has
-    // focus, otherwise the chat transcript.
+    // The main area shows the server-management list or Trust History while those
+    // screens have focus, otherwise the chat transcript.
     match app.main_focus() {
         MainFocus::Servers => render_server_list(app, frame, chunks[1]),
+        MainFocus::TrustHistory => render_trust_history(app, frame, chunks[1]),
         _ => render_chat_transcript(app, frame, chunks[1]),
     }
     render_main_input(app, frame, chunks[2]);
+
+    // C28 overlays, drawn last so they sit on top: a Transient toast (ISC-24),
+    // then a Blocking modal (ISC-22) which takes visual precedence.
+    if let Some(item) = app.transient_trust() {
+        render_transient_toast(item, frame, frame.area());
+    }
+    if let Some(item) = app.blocking_trust() {
+        render_blocking_modal(item, frame, frame.area());
+    }
+}
+
+/// The Trust History view (ISC-25 / C28 LogOnly surface): every recorded trust
+/// event, newest first, with its stable key, scope, and dismissed/resolved
+/// markers. The selected row is highlighted; Enter dismisses it.
+fn render_trust_history(app: &App, frame: &mut Frame, area: Rect) {
+    let entries = app.trust_log().entries();
+    let lines: Vec<Line> = if entries.is_empty() {
+        vec![
+            Line::from("no trust events recorded".to_owned())
+                .style(Style::default().fg(Color::DarkGray)),
+        ]
+    } else {
+        // Newest first; the selection index is over this reversed view.
+        entries
+            .iter()
+            .rev()
+            .enumerate()
+            .map(|(i, e)| {
+                let marker = if i == app.history_sel() { "▶ " } else { "  " };
+                let scope = e.server_id.as_deref().unwrap_or("-");
+                let dismissed = if e.dismissed_at_unix_ms.is_some() {
+                    "  [dismissed]"
+                } else {
+                    ""
+                };
+                let line = format!("{marker}{}  @{scope}{dismissed}", event_key_string(e.key));
+                let style = if i == app.history_sel() {
+                    Style::default().fg(Color::Cyan).bold()
+                } else {
+                    Style::default()
+                };
+                Line::from(line).style(style)
+            })
+            .collect()
+    };
+    let body = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" trust history ")
+            .title_alignment(Alignment::Left),
+    );
+    frame.render_widget(body, area);
+}
+
+/// A Transient trust toast (ISC-24): a small box at the top-right that the next
+/// key press dismisses. Informational; never blocks.
+fn render_transient_toast(item: &TrustItem, frame: &mut Frame, area: Rect) {
+    let text = trust_toast_text(item.key);
+    let width = (text.len() as u16 + 4).min(area.width);
+    let toast = Rect {
+        x: area.x + area.width.saturating_sub(width),
+        y: area.y,
+        width,
+        height: 3.min(area.height),
+    };
+    if toast.height < 3 {
+        return;
+    }
+    let widget = Paragraph::new(text).style(Style::default().fg(Color::Black).bg(Color::Yellow));
+    frame.render_widget(Clear, toast);
+    frame.render_widget(widget, toast);
+}
+
+/// A Blocking trust modal (ISC-22): a centered box that captures input until the
+/// user acknowledges. Reserved for security decisions the user MUST make.
+fn render_blocking_modal(item: &TrustItem, frame: &mut Frame, area: Rect) {
+    let popup = centered_rect(60, 30, area);
+    let scope = item.server_id.as_deref().unwrap_or("this connection");
+    let body = format!(
+        "{}\n\nserver: {scope}\n\n[Enter] acknowledge   [Esc] dismiss",
+        trust_blocking_message(item.key)
+    );
+    let widget = Paragraph::new(body)
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true })
+        .style(Style::default().fg(Color::White).bg(Color::Red).bold())
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::White))
+                .title(" ⚠ security warning "),
+        );
+    frame.render_widget(Clear, popup);
+    frame.render_widget(widget, popup);
+}
+
+/// A short toast string for a Transient trust key (ISC-24).
+fn trust_toast_text(key: TrustEventKey) -> String {
+    match key {
+        TrustEventKey::ConnectionRateLimited => "server busy — backing off".to_owned(),
+        TrustEventKey::UpdateRelayFallbackUsed => "update via fallback relay".to_owned(),
+        other => event_key_string(other).to_owned(),
+    }
+}
+
+/// A one-line modal headline for a Blocking trust key (ISC-22). MUST NOT
+/// speculate about server-side causes (ISC-A-S12).
+fn trust_blocking_message(key: TrustEventKey) -> &'static str {
+    match key {
+        TrustEventKey::ServerKeyMismatch => "Server key does not match — possible impersonation.",
+        TrustEventKey::NoCommonVersion => "No common protocol version with this server.",
+        TrustEventKey::SuiteDeprecationCutoffHit => "A cipher suite in use is past its cutoff.",
+        TrustEventKey::CircleContentBelowMinSuite => "Circle content is below its minimum suite.",
+        TrustEventKey::UpdateVerificationFailed => "An update failed signature verification.",
+        TrustEventKey::EmergencySecurityUpdateAvailable => {
+            "An emergency security update is available."
+        }
+        TrustEventKey::UnsupportedIdentityProofSuite => "Peer identity-proof suite is unsupported.",
+        TrustEventKey::ServerDeprecationPolicyRollback => {
+            "Server served an older deprecation policy."
+        }
+        other => event_key_string(other),
+    }
+}
+
+/// A centered rectangle `pct_x`%×`pct_y`% of `area`, for modal overlays.
+fn centered_rect(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
+    let vert = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - pct_y) / 2),
+            Constraint::Percentage(pct_y),
+            Constraint::Percentage((100 - pct_y) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - pct_x) / 2),
+            Constraint::Percentage(pct_x),
+            Constraint::Percentage((100 - pct_x) / 2),
+        ])
+        .split(vert[1])[1]
 }
 
 /// The server-management list (F22 / C22): each managed server with its
@@ -96,7 +242,8 @@ fn render_server_list(app: &App, frame: &mut Frame, area: Rect) {
     frame.render_widget(body, area);
 }
 
-/// Top bar: connection state on the left, circle state on the right.
+/// Top bar: connection state, circle state, persistent trust badges (ISC-23),
+/// and — when a close was observed — a distinct close-cause segment (ISC-28).
 fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
     let (conn, color) = match app.connection() {
         ConnectionStatus::Disconnected => ("disconnected".to_owned(), Color::Gray),
@@ -120,15 +267,59 @@ fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
         CircleStatus::Joined => "circle joined".to_owned(),
         CircleStatus::Failed(m) => format!("circle join failed: {m}"),
     };
-    let body = Paragraph::new(format!("{conn}    │    {circle}"))
-        .style(Style::default().fg(color))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" daemonseed ")
-                .title_alignment(Alignment::Center),
-        );
+
+    let mut spans = vec![
+        Span::styled(conn, Style::default().fg(color)),
+        Span::raw("    │    "),
+        Span::raw(circle),
+    ];
+
+    // PersistentNonBlocking trust badges (ISC-23): one ⚠ chip per undismissed
+    // event, surfaced until the user dismisses it from Trust History.
+    for item in app.persistent_trust() {
+        spans.push(Span::raw("   "));
+        spans.push(Span::styled(
+            format!("⚠ {}", event_key_string(item.key)),
+            Style::default().fg(Color::Yellow).bold(),
+        ));
+    }
+
+    // The distinct close-cause segment (ISC-28 / C26): each of the three
+    // observable layers gets its own glyph, message, and colour.
+    if let Some(cause) = app.close_cause() {
+        spans.push(Span::raw("   "));
+        spans.push(Span::styled(
+            format!("{} {}", close_cause_glyph(cause), cause.user_message()),
+            Style::default().fg(close_cause_color(cause)).bold(),
+        ));
+    }
+
+    let body = Paragraph::new(Line::from(spans)).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" daemonseed ")
+            .title_alignment(Alignment::Center),
+    );
     frame.render_widget(body, area);
+}
+
+/// A distinct glyph per close-cause layer (ISC-28), so the three states are
+/// visually distinguishable at a glance.
+fn close_cause_glyph(cause: CloseCause) -> &'static str {
+    match cause {
+        CloseCause::NetworkFailure => "⚡",
+        CloseCause::RefusedBeforeHelloAck => "⛔",
+        CloseCause::ClosedAfterAuth => "✕",
+    }
+}
+
+/// A distinct colour per close-cause layer (ISC-28).
+fn close_cause_color(cause: CloseCause) -> Color {
+    match cause {
+        CloseCause::NetworkFailure => Color::Magenta,
+        CloseCause::RefusedBeforeHelloAck => Color::Red,
+        CloseCause::ClosedAfterAuth => Color::LightRed,
+    }
 }
 
 /// The circle chat transcript, oldest at the top (ISC-10). Muted senders are
@@ -220,8 +411,12 @@ fn render_main_input(app: &App, frame: &mut Frame, area: Rect) {
             )
         }
         MainFocus::Servers => (
-            "add server-id@host:port  [Enter] add / connect-selected  [←/→] trust  [↑/↓] select  [Tab] chat",
+            "add server-id@host:port  [Enter] add / connect-selected  [←/→] trust  [↑/↓] select  [Tab] trust-history",
             app.server_input().to_owned(),
+        ),
+        MainFocus::TrustHistory => (
+            "trust history  [↑/↓] select  [Enter] dismiss selected  [Tab] chat  [Esc] back",
+            String::new(),
         ),
     };
     // A status/error line (e.g. a failed send) is appended briefly when present.

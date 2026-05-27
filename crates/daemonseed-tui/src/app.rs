@@ -4,9 +4,13 @@
 //! [`App::on_key`]. It performs no terminal I/O, so it is fully unit-testable
 //! and deterministically driveable by the PTY gate harness.
 
+use daemonseed_core::backoff::CloseCause;
 use daemonseed_core::first_start::SessionMaterials;
 use daemonseed_core::handle::{DisplayMode, Handle};
 use daemonseed_core::profile::config::ArgonParams;
+use daemonseed_core::trust_events::{
+    DismissalScope, TrustEvent, TrustEventClass, TrustEventKey, TrustEventLog, class_of,
+};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 
 use crate::net::NetEvent;
@@ -65,7 +69,7 @@ pub struct ChatLine {
 }
 
 /// Which input on the [`Screen::Main`] view has keyboard focus. `Tab` cycles
-/// Chat → JoinCircle → Mute → Servers → Chat.
+/// Chat → JoinCircle → Mute → Servers → TrustHistory → Chat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MainFocus {
     /// The chat compose box (default): typing composes, Enter sends (ISC-14).
@@ -81,6 +85,19 @@ pub enum MainFocus {
     /// mode with the trusted/untrusted slider (C22), and connect to a selected
     /// one (ISC-21/26/27). The main area shows the server list instead of chat.
     Servers,
+    /// The Trust History view (ISC-C28 LogOnly surface, ISC-25): a scrollable
+    /// list of every recorded trust event. Up/Down select, Enter dismisses the
+    /// selected event's affordance per `(key, scope)` (ISC-A-C12 — no global
+    /// dismissal). The main area shows the history instead of chat.
+    TrustHistory,
+}
+
+/// A surfaced trust event awaiting user attention (ISC-C28). The `key` selects
+/// the affordance class via [`class_of`]; `server_id` scopes dismissal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustItem {
+    pub key: TrustEventKey,
+    pub server_id: Option<String>,
 }
 
 /// One managed federation server in the server-management screen (F22 / C22).
@@ -161,6 +178,24 @@ pub struct App {
     pending_join: Option<String>,
     /// A chat send the binary should forward to the net actor (drained once).
     pending_chat: Option<ChatSend>,
+    /// The bounded, per-session trust-event audit log (ISC-C28). Every recorded
+    /// event surfaces in the Trust History view; Transient events are dropped by
+    /// [`TrustEventLog::append`] (the ISC-A-C12 asymmetry).
+    trust_log: TrustEventLog,
+    /// The active Blocking trust event, shown as a modal that captures input
+    /// until acknowledged (ISC-22 / C28 Blocking class).
+    blocking: Option<TrustItem>,
+    /// Undismissed PersistentNonBlocking trust events, shown as status-bar badges
+    /// (ISC-23 / C28 Persistent class).
+    persistent: Vec<TrustItem>,
+    /// The most recent Transient trust event, shown as a toast until the next key
+    /// press (ISC-24 / C28 Transient class).
+    transient: Option<TrustItem>,
+    /// The last observed connection close layer (ISC-28 / C26), for the distinct
+    /// close-cause status rendering.
+    close_cause: Option<CloseCause>,
+    /// Selected row in the Trust History view (Up/Down moves it).
+    history_sel: usize,
 }
 
 impl Default for App {
@@ -200,6 +235,12 @@ impl App {
             server_sel: 0,
             pending_join: None,
             pending_chat: None,
+            trust_log: TrustEventLog::default(),
+            blocking: None,
+            persistent: Vec::new(),
+            transient: None,
+            close_cause: None,
+            history_sel: 0,
         }
     }
 
@@ -307,6 +348,32 @@ impl App {
                 sent_unix_ms,
             }),
             NetEvent::ChatError { message } => self.status = Some(message),
+            NetEvent::TrustEvent { key, server_id } => self.fold_trust_event(key, server_id),
+            NetEvent::ConnectionClosed { cause } => self.close_cause = Some(cause),
+        }
+    }
+
+    /// Route a trust event to its ISC-C28 affordance class and record it
+    /// (Transient events are dropped from the log by [`TrustEventLog::append`] —
+    /// the intentional A-C12 asymmetry — but still drive the toast slot).
+    fn fold_trust_event(&mut self, key: TrustEventKey, server_id: Option<String>) {
+        self.trust_log.append(TrustEvent::observed(
+            now_unix_ms(),
+            key,
+            server_id.clone(),
+            None,
+        ));
+        let item = TrustItem { key, server_id };
+        match class_of(key) {
+            TrustEventClass::Blocking => self.blocking = Some(item),
+            TrustEventClass::PersistentNonBlocking => {
+                if !self.persistent.contains(&item) {
+                    self.persistent.push(item);
+                }
+            }
+            TrustEventClass::Transient => self.transient = Some(item),
+            // LogOnly surfaces only in the Trust History view (already logged).
+            TrustEventClass::LogOnly => {}
         }
     }
 
@@ -357,6 +424,38 @@ impl App {
         self.server_sel
     }
 
+    /// The active Blocking trust event, for rendering the modal (ISC-22).
+    pub fn blocking_trust(&self) -> Option<&TrustItem> {
+        self.blocking.as_ref()
+    }
+
+    /// Undismissed PersistentNonBlocking trust events, for the status-bar badges
+    /// (ISC-23).
+    pub fn persistent_trust(&self) -> &[TrustItem] {
+        &self.persistent
+    }
+
+    /// The current Transient trust toast, if any (ISC-24).
+    pub fn transient_trust(&self) -> Option<&TrustItem> {
+        self.transient.as_ref()
+    }
+
+    /// The trust-event audit log, for the Trust History view (ISC-25).
+    pub fn trust_log(&self) -> &TrustEventLog {
+        &self.trust_log
+    }
+
+    /// The last observed connection-close layer, for the distinct close-cause
+    /// status rendering (ISC-28).
+    pub fn close_cause(&self) -> Option<CloseCause> {
+        self.close_cause
+    }
+
+    /// The selected row in the Trust History view (newest-first index).
+    pub fn history_sel(&self) -> usize {
+        self.history_sel
+    }
+
     /// @-mention autocomplete candidates for the current compose buffer
     /// (ISC-12 / C18). When composing and the buffer ends with a partial
     /// `@token` (no whitespace after the last `@`), returns the full wire
@@ -401,6 +500,27 @@ impl App {
     /// transition.
     pub fn on_key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press {
+            return;
+        }
+        // A Transient trust toast auto-dismisses on the next interaction
+        // (ISC-24 / C28 Transient class).
+        self.transient = None;
+        // A Blocking trust event captures all input on the main view until the
+        // user acknowledges it (ISC-22 / C28 Blocking class — "prevents the
+        // affected functional path until the user acts"). Acknowledgement
+        // records a per-`(key, scope)` dismissal (ISC-A-C12).
+        if self.screen == Screen::Main && self.blocking.is_some() {
+            if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
+                let item = self.blocking.take().expect("checked is_some");
+                self.trust_log.dismiss(
+                    item.key,
+                    &DismissalScope {
+                        server_id: item.server_id,
+                        suite_id: None,
+                    },
+                    now_unix_ms(),
+                );
+            }
             return;
         }
         match self.screen {
@@ -455,7 +575,8 @@ impl App {
                     MainFocus::Chat => MainFocus::JoinCircle,
                     MainFocus::JoinCircle => MainFocus::Mute,
                     MainFocus::Mute => MainFocus::Servers,
-                    MainFocus::Servers => MainFocus::Chat,
+                    MainFocus::Servers => MainFocus::TrustHistory,
+                    MainFocus::TrustHistory => MainFocus::Chat,
                 };
             }
             _ => match self.main_focus {
@@ -463,6 +584,7 @@ impl App {
                 MainFocus::JoinCircle => self.on_key_join(key),
                 MainFocus::Mute => self.on_key_mute(key),
                 MainFocus::Servers => self.on_key_servers(key),
+                MainFocus::TrustHistory => self.on_key_history(key),
             },
         }
     }
@@ -594,6 +716,51 @@ impl App {
             _ => {}
         }
     }
+
+    /// Trust History view (ISC-25 / C28): Up/Down move the selection (rows render
+    /// newest-first), Enter dismisses the selected event's affordance per
+    /// `(key, scope)` (ISC-A-C12 — dismissal is scoped, never global, and never
+    /// removes the log entry).
+    fn on_key_history(&mut self, key: KeyEvent) {
+        let rows = self.trust_log.len();
+        match key.code {
+            KeyCode::Up => self.history_sel = self.history_sel.saturating_sub(1),
+            KeyCode::Down if rows > 0 => {
+                self.history_sel = (self.history_sel + 1).min(rows - 1);
+            }
+            KeyCode::Enter if rows > 0 => {
+                // Map the newest-first selection back to the log entry, then
+                // release the immutable borrow before the mutable dismiss.
+                let (dkey, scope) = {
+                    let entries = self.trust_log.entries();
+                    let idx = rows - 1 - self.history_sel.min(rows - 1);
+                    let e = &entries[idx];
+                    (
+                        e.key,
+                        DismissalScope {
+                            server_id: e.server_id.clone(),
+                            suite_id: e.suite_id,
+                        },
+                    )
+                };
+                self.trust_log.dismiss(dkey, &scope, now_unix_ms());
+                self.persistent
+                    .retain(|it| !(it.key == dkey && it.server_id == scope.server_id));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Wall-clock now in unix milliseconds, for trust-event log timestamps. The
+/// Trust History view renders stable key strings, not raw timestamps, so this
+/// does not affect render determinism.
+fn now_unix_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -821,7 +988,225 @@ mod tests {
         app.on_key(press(KeyCode::Tab));
         assert_eq!(app.main_focus(), MainFocus::Servers);
         app.on_key(press(KeyCode::Tab));
+        assert_eq!(app.main_focus(), MainFocus::TrustHistory);
+        app.on_key(press(KeyCode::Tab));
         assert_eq!(app.main_focus(), MainFocus::Chat);
+    }
+
+    // ── C28 trust-event affordance routing (ISC-22..25 / 28) ─────────────
+
+    /// A Blocking trust event populates the modal slot, captures input until
+    /// acknowledged, and Enter records a dismissal without removing the log
+    /// entry (ISC-22 / A-C12).
+    #[test]
+    fn blocking_trust_event_modal_captures_then_dismisses() {
+        let mut app = drive_to_main();
+        app.on_net_event(NetEvent::TrustEvent {
+            key: TrustEventKey::ServerKeyMismatch,
+            server_id: Some("relay#aabbccddeeff".to_owned()),
+        });
+        assert!(
+            app.blocking_trust().is_some(),
+            "blocking modal set (ISC-22)"
+        );
+        // While the modal is up, a chat keystroke must NOT compose.
+        app.on_key(press(KeyCode::Char('x')));
+        assert_eq!(app.compose(), "", "modal captures input until acknowledged");
+        assert!(app.blocking_trust().is_some(), "non-ack key keeps modal up");
+        // Enter acknowledges and clears the modal; the log entry survives.
+        app.on_key(press(KeyCode::Enter));
+        assert!(app.blocking_trust().is_none(), "Enter dismisses the modal");
+        assert_eq!(app.trust_log().len(), 1, "dismissal keeps the log entry");
+        assert!(
+            app.trust_log().entries()[0].dismissed_at_unix_ms.is_some(),
+            "entry marked dismissed"
+        );
+    }
+
+    /// A PersistentNonBlocking event appears as a status badge and is logged
+    /// (ISC-23).
+    #[test]
+    fn persistent_trust_event_badges_and_logs() {
+        let mut app = drive_to_main();
+        app.on_net_event(NetEvent::TrustEvent {
+            key: TrustEventKey::ServerKeyRotated,
+            server_id: Some("relay#aabbccddeeff".to_owned()),
+        });
+        assert_eq!(app.persistent_trust().len(), 1, "badge surfaced (ISC-23)");
+        assert_eq!(app.trust_log().len(), 1, "persistent event is logged");
+        // The same event again does not duplicate the badge.
+        app.on_net_event(NetEvent::TrustEvent {
+            key: TrustEventKey::ServerKeyRotated,
+            server_id: Some("relay#aabbccddeeff".to_owned()),
+        });
+        assert_eq!(app.persistent_trust().len(), 1, "no duplicate badge");
+    }
+
+    /// A Transient event is a toast that is NOT logged (the A-C12 asymmetry) and
+    /// auto-dismisses on the next key press (ISC-24).
+    #[test]
+    fn transient_trust_event_toasts_then_clears_and_is_not_logged() {
+        let mut app = drive_to_main();
+        app.on_net_event(NetEvent::TrustEvent {
+            key: TrustEventKey::ConnectionRateLimited,
+            server_id: Some("relay#aabbccddeeff".to_owned()),
+        });
+        assert!(app.transient_trust().is_some(), "toast surfaced (ISC-24)");
+        assert_eq!(app.trust_log().len(), 0, "transient is not logged (A-C12)");
+        app.on_key(press(KeyCode::Char('a')));
+        assert!(
+            app.transient_trust().is_none(),
+            "toast auto-dismisses on key"
+        );
+    }
+
+    /// A LogOnly event surfaces only in the audit log — no modal, badge, or toast
+    /// (ISC-25, the Trust History surface).
+    #[test]
+    fn logonly_trust_event_only_in_history() {
+        let mut app = drive_to_main();
+        app.on_net_event(NetEvent::TrustEvent {
+            key: TrustEventKey::ServerSourceUnverified,
+            server_id: Some("relay#aabbccddeeff".to_owned()),
+        });
+        assert!(app.blocking_trust().is_none());
+        assert!(app.persistent_trust().is_empty());
+        assert!(app.transient_trust().is_none());
+        assert_eq!(
+            app.trust_log().len(),
+            1,
+            "recorded in Trust History (ISC-25)"
+        );
+    }
+
+    /// A ConnectionClosed event records its observable close layer (ISC-28).
+    #[test]
+    fn connection_closed_sets_close_cause() {
+        let mut app = App::new();
+        app.on_net_event(NetEvent::ConnectionClosed {
+            cause: CloseCause::RefusedBeforeHelloAck,
+        });
+        assert_eq!(app.close_cause(), Some(CloseCause::RefusedBeforeHelloAck));
+    }
+
+    /// Trust History selection moves with Up/Down and Enter dismisses the
+    /// selected event's persistent badge per scope (ISC-25 / A-C12).
+    #[test]
+    fn trust_history_enter_dismisses_selected_persistent_badge() {
+        let mut app = drive_to_main();
+        app.on_net_event(NetEvent::TrustEvent {
+            key: TrustEventKey::ServerKeyRotated,
+            server_id: Some("relay#aabbccddeeff".to_owned()),
+        });
+        assert_eq!(app.persistent_trust().len(), 1);
+        // Tab to the Trust History view and dismiss the selected (only) row.
+        app.on_key(press(KeyCode::Tab)); // → JoinCircle
+        app.on_key(press(KeyCode::Tab)); // → Mute
+        app.on_key(press(KeyCode::Tab)); // → Servers
+        app.on_key(press(KeyCode::Tab)); // → TrustHistory
+        assert_eq!(app.main_focus(), MainFocus::TrustHistory);
+        app.on_key(press(KeyCode::Enter));
+        assert!(
+            app.persistent_trust().is_empty(),
+            "dismissing clears the badge"
+        );
+        assert_eq!(app.trust_log().len(), 1, "log entry survives dismissal");
+    }
+
+    // ── C28 render paths (ISC-22..25 / 28), real ui::render via TestBackend ──
+
+    fn render_text(app: &App, w: u16, h: u16) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| crate::ui::render(app, f)).unwrap();
+        buffer_text(&term)
+    }
+
+    /// ISC-22: a Blocking trust event renders as a modal overlay.
+    #[test]
+    fn blocking_trust_renders_modal() {
+        let mut app = drive_to_main();
+        app.on_net_event(NetEvent::TrustEvent {
+            key: TrustEventKey::ServerKeyMismatch,
+            server_id: Some("relay#aabbccddeeff".to_owned()),
+        });
+        let text = render_text(&app, 80, 24);
+        assert!(text.contains("security warning"), "modal title rendered");
+        assert!(
+            text.contains("Server key does not match"),
+            "modal body rendered"
+        );
+    }
+
+    /// ISC-23: a PersistentNonBlocking event renders as a status-bar badge.
+    #[test]
+    fn persistent_trust_renders_status_badge() {
+        let mut app = drive_to_main();
+        app.on_net_event(NetEvent::TrustEvent {
+            key: TrustEventKey::ServerKeyRotated,
+            server_id: Some("relay#aabbccddeeff".to_owned()),
+        });
+        let text = render_text(&app, 120, 24);
+        assert!(
+            text.contains("server-key-rotated"),
+            "badge rendered in status"
+        );
+    }
+
+    /// ISC-24: a Transient event renders as a toast.
+    #[test]
+    fn transient_trust_renders_toast() {
+        let mut app = drive_to_main();
+        app.on_net_event(NetEvent::TrustEvent {
+            key: TrustEventKey::ConnectionRateLimited,
+            server_id: Some("relay#aabbccddeeff".to_owned()),
+        });
+        let text = render_text(&app, 80, 24);
+        assert!(text.contains("backing off"), "toast rendered");
+    }
+
+    /// ISC-25: a LogOnly event renders in the scrollable Trust History view.
+    #[test]
+    fn logonly_trust_renders_in_history_view() {
+        let mut app = drive_to_main();
+        app.on_net_event(NetEvent::TrustEvent {
+            key: TrustEventKey::ServerSourceUnverified,
+            server_id: Some("relay#aabbccddeeff".to_owned()),
+        });
+        // Tab to the Trust History view.
+        for _ in 0..4 {
+            app.on_key(press(KeyCode::Tab));
+        }
+        assert_eq!(app.main_focus(), MainFocus::TrustHistory);
+        let text = render_text(&app, 80, 24);
+        assert!(text.contains("trust history"), "history view titled");
+        assert!(
+            text.contains("server-source-unverified"),
+            "LogOnly event listed (ISC-25)"
+        );
+    }
+
+    /// ISC-28: each of the three close-cause layers renders a distinct message.
+    #[test]
+    fn close_cause_renders_three_distinct_states() {
+        let causes = [
+            (CloseCause::NetworkFailure, "Unable to reach server"),
+            (
+                CloseCause::RefusedBeforeHelloAck,
+                "Server refused the connection",
+            ),
+            (
+                CloseCause::ClosedAfterAuth,
+                "Server closed the connection unexpectedly",
+            ),
+        ];
+        for (cause, msg) in causes {
+            let mut app = drive_to_main();
+            app.on_net_event(NetEvent::ConnectionClosed { cause });
+            let text = render_text(&app, 120, 24);
+            assert!(text.contains(msg), "{cause:?} renders its distinct message");
+        }
     }
 
     #[test]
