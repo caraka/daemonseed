@@ -20,6 +20,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod backoff;
 pub mod bootstrap;
 pub mod circle;
 pub mod connection;
