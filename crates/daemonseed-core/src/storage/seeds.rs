@@ -54,7 +54,7 @@
 //! the receiver cannot be tricked into running a v2 blob under the wrong
 //! suite's primitives without the AEAD detecting it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use oxicrypt_aes::{Aes256Key, gcm_decrypt, gcm_encrypt};
@@ -148,41 +148,93 @@ impl CounterState {
 }
 
 /// Plaintext payload of the at-rest blob. M1 carried only the mnemonic; M4b
-/// adds replay-protection [`CounterState`]. M5+ extends it further with
-/// circle-of-trust seed material, mute/hide lists, and settings.
+/// adds replay-protection [`CounterState`]; M9 adds the client-local mute and
+/// hide-shares lists (ISC-C15 / C16). M5+ may extend it further with
+/// circle-of-trust seed material and settings.
 ///
 /// ## Plaintext schema (directive lines)
 ///
 /// The decrypted payload is line-based and **backward-compatible**: line 0 is
 /// always the 24-word mnemonic phrase (the entire M1/M2/M3 payload), and any
-/// following lines are `directive` entries — `send-counter <n>` and
-/// `seen <target> <n>`. A bare-phrase payload (no extra lines, the legacy
-/// form) parses with default counters, so existing blobs open without
-/// re-enrollment. Default-counter seeds serialize back to the bare phrase, so
-/// nothing changes on the wire until a counter is actually used. The
-/// directive scheme is additive — future fields append new directive kinds
-/// without a blob-format (magic) bump.
+/// following lines are `directive` entries:
+/// - `send-counter <n>` — the monotonic send counter (ISC-33).
+/// - `seen <target> <n>` — highest accepted counter per peer (ISC-34).
+/// - `mute <handle>` — a muted full wire handle (ISC-C15). The handle is the
+///   entire rest of the line, so display names containing spaces survive.
+/// - `hide <handle>` — a hidden-shares full wire handle (ISC-C16), same shape.
+///
+/// A bare-phrase payload (no extra lines, the legacy form) parses with default
+/// counters and empty lists, so existing blobs open without re-enrollment.
+/// Default state serializes back to the bare phrase, so nothing changes until
+/// a counter is used or a handle is muted/hidden. The directive scheme is
+/// additive — future fields append new directive kinds without a blob-format
+/// (magic) bump. Mute/hide lists are **client-local only** and never leave the
+/// at-rest blob; no wire message carries them (ISC-A-C3).
 pub struct Seeds {
     pub mnemonic: Mnemonic,
     pub counters: CounterState,
+    /// Full wire handles whose chat the user has muted (ISC-C15). Unilateral
+    /// and silent — the muted party is never signalled.
+    pub muted: BTreeSet<String>,
+    /// Full wire handles whose file shares the user has hidden (ISC-C16).
+    /// Independent of [`Self::muted`].
+    pub hidden_shares: BTreeSet<String>,
 }
 
 impl core::fmt::Debug for Seeds {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Mute/hide contents are a social graph — surface only counts so a
+        // stray Debug log or panic message never dumps who the user muted.
         f.debug_struct("Seeds")
             .field("mnemonic", &"<redacted>")
             .field("counters", &self.counters)
+            .field("muted", &self.muted.len())
+            .field("hidden_shares", &self.hidden_shares.len())
             .finish()
     }
 }
 
 impl Seeds {
-    /// A fresh payload wrapping `mnemonic` with empty counter state.
+    /// A fresh payload wrapping `mnemonic` with empty counter state and empty
+    /// mute / hide-shares lists.
     pub fn new(mnemonic: Mnemonic) -> Self {
         Self {
             mnemonic,
             counters: CounterState::default(),
+            muted: BTreeSet::new(),
+            hidden_shares: BTreeSet::new(),
         }
+    }
+
+    /// Mute a full wire handle (ISC-C15). Returns `true` if newly added,
+    /// `false` if already muted — idempotent.
+    pub fn add_mute(&mut self, handle: impl Into<String>) -> bool {
+        self.muted.insert(handle.into())
+    }
+
+    /// Unmute a handle. Returns `true` if it was muted, `false` otherwise.
+    pub fn remove_mute(&mut self, handle: &str) -> bool {
+        self.muted.remove(handle)
+    }
+
+    /// Whether `handle` is on the mute list.
+    pub fn is_muted(&self, handle: &str) -> bool {
+        self.muted.contains(handle)
+    }
+
+    /// Hide a handle's file shares (ISC-C16). Returns `true` if newly added.
+    pub fn add_hidden_share(&mut self, handle: impl Into<String>) -> bool {
+        self.hidden_shares.insert(handle.into())
+    }
+
+    /// Un-hide a handle's shares. Returns `true` if it was hidden.
+    pub fn remove_hidden_share(&mut self, handle: &str) -> bool {
+        self.hidden_shares.remove(handle)
+    }
+
+    /// Whether `handle`'s shares are hidden.
+    pub fn is_share_hidden(&self, handle: &str) -> bool {
+        self.hidden_shares.contains(handle)
     }
 
     fn to_plaintext(&self) -> String {
@@ -193,6 +245,12 @@ impl Seeds {
         for (target, counter) in &self.counters.seen {
             s.push_str(&format!("\nseen {target} {counter}"));
         }
+        for handle in &self.muted {
+            s.push_str(&format!("\nmute {handle}"));
+        }
+        for handle in &self.hidden_shares {
+            s.push_str(&format!("\nhide {handle}"));
+        }
         s
     }
 
@@ -201,7 +259,19 @@ impl Seeds {
         let phrase = lines.next().ok_or(BlobError::InvalidPlaintext)?;
         let mnemonic = Mnemonic::from_phrase(phrase).map_err(BlobError::Mnemonic)?;
         let mut counters = CounterState::default();
+        let mut muted = BTreeSet::new();
+        let mut hidden_shares = BTreeSet::new();
         for line in lines {
+            // Mute / hide directives take the entire rest of the line as the
+            // handle so a display name containing spaces is never truncated.
+            if let Some(handle) = line.strip_prefix("mute ") {
+                muted.insert(handle.to_string());
+                continue;
+            }
+            if let Some(handle) = line.strip_prefix("hide ") {
+                hidden_shares.insert(handle.to_string());
+                continue;
+            }
             let mut parts = line.splitn(3, ' ');
             match parts.next() {
                 Some("send-counter") => {
@@ -217,7 +287,12 @@ impl Seeds {
                 _ => return Err(BlobError::InvalidPlaintext),
             }
         }
-        Ok(Self { mnemonic, counters })
+        Ok(Self {
+            mnemonic,
+            counters,
+            muted,
+            hidden_shares,
+        })
     }
 }
 
@@ -607,6 +682,89 @@ mod tests {
         assert_eq!(cs.highest_seen("t"), Some(5));
         cs.record_seen("t", 8);
         assert_eq!(cs.highest_seen("t"), Some(8));
+    }
+
+    // ── mute / hide-shares lists (ISC-C15 / C16 / A-C3) ────────────────────
+
+    #[test]
+    fn mute_list_round_trips_through_blob() {
+        ensure_oxicrypt_initialized();
+        let pid = Uuid::new_v4();
+        let pp = "correct horse battery staple table mountain";
+        let mut seeds = fresh_seeds();
+        assert!(seeds.add_mute("brave-otter#aabbccddeeff"));
+        assert!(seeds.add_mute("#001122334455")); // floor handle
+        let blob = seal(&seeds, pp, pid, test_params()).unwrap();
+        let recovered = open(&blob, pp, pid, test_params()).unwrap().seeds;
+        assert!(recovered.is_muted("brave-otter#aabbccddeeff"));
+        assert!(recovered.is_muted("#001122334455"));
+        assert!(!recovered.is_muted("someone-else#ffffffffffff"));
+    }
+
+    #[test]
+    fn hide_shares_list_round_trips_through_blob() {
+        ensure_oxicrypt_initialized();
+        let pid = Uuid::new_v4();
+        let pp = "correct horse battery staple table mountain";
+        let mut seeds = fresh_seeds();
+        assert!(seeds.add_hidden_share("noisy-sharer#0a0b0c0d0e0f"));
+        let blob = seal(&seeds, pp, pid, test_params()).unwrap();
+        let recovered = open(&blob, pp, pid, test_params()).unwrap().seeds;
+        assert!(recovered.is_share_hidden("noisy-sharer#0a0b0c0d0e0f"));
+        assert!(!recovered.is_share_hidden("brave-otter#aabbccddeeff"));
+    }
+
+    #[test]
+    fn mute_add_is_idempotent() {
+        let mut seeds = fresh_seeds();
+        assert!(seeds.add_mute("x#aabbccddeeff")); // newly inserted → true
+        assert!(!seeds.add_mute("x#aabbccddeeff")); // already present → false
+        assert_eq!(seeds.muted.len(), 1);
+    }
+
+    #[test]
+    fn mute_remove_works_and_reports() {
+        let mut seeds = fresh_seeds();
+        seeds.add_mute("x#aabbccddeeff");
+        assert!(seeds.remove_mute("x#aabbccddeeff")); // was present → true
+        assert!(!seeds.is_muted("x#aabbccddeeff"));
+        assert!(!seeds.remove_mute("x#aabbccddeeff")); // already gone → false
+    }
+
+    #[test]
+    fn mute_and_hide_are_independent() {
+        // ISC-C16: a user may mute someone's chat but still see their shares,
+        // or hide shares while still reading chat. The two lists never alias.
+        let mut seeds = fresh_seeds();
+        seeds.add_mute("a#aabbccddeeff");
+        seeds.add_hidden_share("b#001122334455");
+        assert!(seeds.is_muted("a#aabbccddeeff"));
+        assert!(!seeds.is_share_hidden("a#aabbccddeeff"));
+        assert!(seeds.is_share_hidden("b#001122334455"));
+        assert!(!seeds.is_muted("b#001122334455"));
+    }
+
+    #[test]
+    fn mute_handle_with_space_round_trips() {
+        // Defensive: today's display names are adjective-noun (no spaces), but
+        // a mute key stores whatever wire handle was observed. The directive
+        // serialization parses the handle as rest-of-line, so a space-bearing
+        // display name must survive a seal/open round-trip without truncation.
+        ensure_oxicrypt_initialized();
+        let pid = Uuid::new_v4();
+        let pp = "correct horse battery staple table mountain";
+        let mut seeds = fresh_seeds();
+        seeds.add_mute("two words#aabbccddeeff");
+        let blob = seal(&seeds, pp, pid, test_params()).unwrap();
+        let recovered = open(&blob, pp, pid, test_params()).unwrap().seeds;
+        assert!(recovered.is_muted("two words#aabbccddeeff"));
+    }
+
+    #[test]
+    fn fresh_seeds_have_empty_mute_and_hide_lists() {
+        let seeds = fresh_seeds();
+        assert!(seeds.muted.is_empty());
+        assert!(seeds.hidden_shares.is_empty());
     }
 
     #[test]
