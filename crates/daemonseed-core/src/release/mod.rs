@@ -19,7 +19,12 @@
 //! [`anchor`]'s pre-public-phase note).
 
 mod anchor;
+mod update;
 mod verify;
 
 pub use anchor::{AnchorError, BundledReleaseAnchor, ReleaseAnchor, ReleaseKey, bundled};
+pub use update::{
+    ConfirmError, FailureLogEntry, ReleaseVersion, UpdateChannel, UpdateLifecycle, UpdateRecord,
+    UpdateState,
+};
 pub use verify::{ReleaseVerifyError, verify_multisig};
