@@ -120,8 +120,26 @@ pub fn build_client_config() -> Result<ClientConfig, rustls::Error> {
     Ok(cfg)
 }
 
-/// Run the end-to-end connect: TCP → TLS → AppHello → AppHelloAck →
-/// identity-proof → `Authenticated`.
+/// The live, post-`Authenticated` TLS stream returned by [`connect_session`].
+///
+/// This is the exact stream type [`serve_application`] consumes on the server
+/// side; the M11 TUI builds a tonic client channel over it (via
+/// `Endpoint::connect_with_connector` + `hyper_util::rt::TokioIo`) to reach the
+/// `PublicSpace` and `CircleOfTrust` services on the one already-authenticated
+/// connection.
+///
+/// [`serve_application`]: daemonseed_server::public_space::serve_application
+pub type AppStream = tokio_rustls::client::TlsStream<TcpStream>;
+
+/// Run the end-to-end connect and **keep** the live stream: TCP → TLS →
+/// AppHello → AppHelloAck → identity-proof → `Authenticated`, returning both
+/// the [`ConnectOutcome`] and the post-`Authenticated` [`AppStream`].
+///
+/// This is the substrate for any client that runs application traffic (the
+/// M11 TUI's chat / circle / share / public-space). [`connect`] is the thin
+/// fire-and-forget wrapper that drops the stream after reaching
+/// `Authenticated` — used by the M4a/M4b/M5 round-trip paths and their tests,
+/// which only assert the handshake outcome.
 ///
 /// `identity` is the client's signing identity (D8: the binary injects an
 /// ephemeral one); `counters` carries the monotonic send counter (ISC-19)
@@ -132,13 +150,13 @@ pub fn build_client_config() -> Result<ClientConfig, rustls::Error> {
 /// `oxicrypt_module::initialize_with_profile(.., Cnsa2)` must have
 /// returned `Ok(())` before invoking this. The integration test
 /// harness drives both; the binary's `main()` does the same.
-pub async fn connect(
+pub async fn connect_session(
     server_id: &str,
     address: &str,
     identity: &ClientIdentity,
     counters: &mut CounterState,
     store: &mut dyn TrustStore,
-) -> Result<ConnectOutcome, ConnectError> {
+) -> Result<(ConnectOutcome, AppStream), ConnectError> {
     let client_cfg = build_client_config().map_err(|e| ConnectError::Rustls(e.to_string()))?;
     let connector = TlsConnector::from(Arc::new(client_cfg));
 
@@ -243,12 +261,37 @@ pub async fn connect(
             TrustDecision::Refuse => return Err(ConnectError::TrustRefused),
         };
 
-    Ok(ConnectOutcome {
+    let outcome = ConnectOutcome {
         version,
         dialled: address.to_owned(),
         server_handle: verified.handle().to_owned(),
         rotation_notice,
-    })
+    };
+    Ok((outcome, tls))
+}
+
+/// Run the end-to-end connect and **drop** the live stream once
+/// `Authenticated` is reached: TCP → TLS → AppHello → AppHelloAck →
+/// identity-proof → `Authenticated`, returning the [`ConnectOutcome`].
+///
+/// This is the handshake-only entry point: it delegates to
+/// [`connect_session`] and discards the returned [`AppStream`], closing the
+/// connection. The M4a/M4b/M5 round-trip paths and their tests use it because
+/// they only assert that the handshake reached `Authenticated` (ISC-47); a
+/// client that needs to run application traffic calls [`connect_session`]
+/// instead and keeps the stream.
+///
+/// Same caller-contract as [`connect_session`] (crypto module + provider
+/// installed first).
+pub async fn connect(
+    server_id: &str,
+    address: &str,
+    identity: &ClientIdentity,
+    counters: &mut CounterState,
+    store: &mut dyn TrustStore,
+) -> Result<ConnectOutcome, ConnectError> {
+    let (outcome, _tls) = connect_session(server_id, address, identity, counters, store).await?;
+    Ok(outcome)
 }
 
 /// Read one length-prefixed frame body into a `Vec<u8>` so we can

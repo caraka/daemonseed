@@ -489,6 +489,27 @@ modules:
       - A-C8
       - A-S2
 
+  - name: daemonseed_core::circle::message
+    description: >-
+      Circle chat-message sealing — the boundary where a plaintext
+      daemonseed_proto CircleMessage becomes the opaque bytes carried in a
+      CotFrame.payload and back. seal_message prost-encodes then AES-256-GCM
+      seals under the 32-byte cot_key (AAD = MESSAGE_AAD domain tag); the
+      envelope is nonce(12)||ciphertext||tag(16). open_message fails closed
+      (Authentication) on a wrong key or any tamper — the position a
+      content-blind relay is structurally in (ISC-A-S2). The sender_handle in
+      the message is self-asserted: membership is the trust boundary, and that
+      handle is used client-side only for @mention (C17) and mute (C15).
+    no_std: false
+    depends_on:
+      - daemonseed_core::circle::key
+    iscs:
+      - C15
+      - C17
+      - A-S2
+      - A-C3
+      - A-C4
+
   - name: daemonseed_core::public_space
     description: >-
       Signed-artifact model for the public-space service (M6), shared
@@ -1445,6 +1466,26 @@ types:
     variants:
       - name: Hkdf
         description: "Hkdf(oxicrypt_kdf::KdfError) — HKDF derivation failed."
+
+  - name: MessageError
+    module: daemonseed_core::circle::message
+    kind: enum
+    description: >-
+      Failure modes for seal_message / open_message. Authentication (wrong
+      cot_key or tamper) carries no sub-cause — fail closed.
+    variants:
+      - name: KeyInit
+        description: "KeyInit(oxicrypt_module::Error) — AES-256 key schedule init failed."
+      - name: EntropySource
+        description: "EntropySource(getrandom::Error) — OS entropy failed drawing the nonce."
+      - name: Aead
+        description: "Aead(oxicrypt_aes::ModeError) — non-TagMismatch AEAD error."
+      - name: Authentication
+        description: "Wrong cot_key, tampered ciphertext, swapped nonce, or wrong AAD."
+      - name: Truncated
+        description: "Sealed buffer shorter than nonce||tag."
+      - name: Decode
+        description: "Decode(prost::DecodeError) — decrypted bytes are not a CircleMessage."
 
   # ── public_space ────────────────────────────────────────────────────
   - name: ContentAddress
@@ -2669,6 +2710,60 @@ functions:
       error_variants:
         - name: NotOperational
           condition: The oxicrypt module power-up self-test has not passed.
+    preconditions:
+      - description: The oxicrypt module must be operational.
+
+  # ── circle::message ─────────────────────────────────────────────────
+  - name: seal_message
+    module: daemonseed_core::circle::message
+    description: >-
+      Seal a plaintext CircleMessage under cot_key into an opaque
+      nonce(12)||ciphertext||tag(16) envelope for a CotFrame.payload. Fresh
+      random nonce per call; AAD = MESSAGE_AAD; prost plaintext zeroed after
+      GCM consumes it.
+    signature: "pub fn seal_message(cot_key: &circle::key::CotKey, message: &daemonseed_proto::v1::CircleMessage) -> Result<Vec<u8>, MessageError>"
+    parameters:
+      - name: cot_key
+        type: "&circle::key::CotKey"
+        direction: in
+        description: The circle-of-trust symmetric key (the AES-256-GCM key).
+      - name: message
+        type: "&daemonseed_proto::v1::CircleMessage"
+        direction: in
+        description: The plaintext chat message to seal.
+    returns:
+      type: "Result<Vec<u8>, MessageError>"
+      description: The opaque sealed envelope.
+    preconditions:
+      - description: The oxicrypt module must be operational.
+
+  - name: open_message
+    module: daemonseed_core::circle::message
+    description: >-
+      Open an envelope produced by seal_message back into a CircleMessage.
+      Fails closed (Authentication) on a wrong cot_key or any tamper — the
+      position a content-blind relay is in (ISC-A-S2). Recovered plaintext
+      zeroed before returning.
+    signature: "pub fn open_message(cot_key: &circle::key::CotKey, sealed: &[u8]) -> Result<daemonseed_proto::v1::CircleMessage, MessageError>"
+    parameters:
+      - name: cot_key
+        type: "&circle::key::CotKey"
+        direction: in
+        description: The circle-of-trust symmetric key.
+      - name: sealed
+        type: "&[u8]"
+        direction: in
+        description: The nonce||ciphertext||tag envelope.
+    returns:
+      type: "Result<daemonseed_proto::v1::CircleMessage, MessageError>"
+      description: The decoded plaintext message.
+      error_variants:
+        - name: Authentication
+          condition: Wrong cot_key, tampered ciphertext/nonce, or wrong AAD.
+        - name: Truncated
+          condition: Buffer shorter than nonce||tag.
+        - name: Decode
+          condition: Decrypted bytes are not a valid CircleMessage.
     preconditions:
       - description: The oxicrypt module must be operational.
 

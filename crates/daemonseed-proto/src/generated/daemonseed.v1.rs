@@ -92,6 +92,36 @@ pub struct CotFrame {
     #[prost(bytes = "vec", tag = "2")]
     pub payload: ::prost::alloc::vec::Vec<u8>,
 }
+/// A circle chat message — the FIRST application payload type carried inside a
+/// CotFrame (ISC-10..14 / ISC-C15 / ISC-C17). This is the *plaintext* shape:
+/// it is prost-encoded, then AES-256-GCM-sealed under the circle's cot_key
+/// (daemonseed-core circle::message), and ONLY the resulting ciphertext rides
+/// in CotFrame.payload. It is NEVER sent on any wire path in the clear — the
+/// relay is content-blind by construction (ISC-A-S2), so this message exists
+/// purely as the encode boundary between the chat UI and the AEAD seal.
+///
+/// `sender_handle` is set by the sender and is therefore self-asserted: a
+/// circle member could spoof another member's handle. That is an accepted
+/// property of the seed-key trust model — circle membership is the security
+/// boundary, not per-message authorship — and is the same plaintext the
+/// recipient uses CLIENT-SIDE for @mention detection (ISC-C17) and mute
+/// filtering (ISC-C15), neither of which the relay can see (ISC-A-C3 / A-C4).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CircleMessage {
+    /// The sender's full wire handle (`<name>#<12hex>`), self-asserted. Used by
+    /// recipients client-side for @mention highlighting and mute suppression.
+    #[prost(string, tag = "1")]
+    pub sender_handle: ::prost::alloc::string::String,
+    /// The message body as typed. Rendered as inert plaintext by the client
+    /// (terminal control sequences stripped at the UI boundary).
+    #[prost(string, tag = "2")]
+    pub body: ::prost::alloc::string::String,
+    /// Sender wall-clock at compose time, unix milliseconds. Advisory ordering
+    /// only — there is no global clock and no relay timestamp (the relay sees
+    /// ciphertext). Recipients display it; they do not trust it for security.
+    #[prost(int64, tag = "3")]
+    pub sent_unix_ms: i64,
+}
 /// Generated client implementations.
 pub mod circle_of_trust_client {
     #![allow(

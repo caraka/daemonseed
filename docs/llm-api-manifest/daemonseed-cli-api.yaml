@@ -157,6 +157,16 @@ types:
           The server's envelope failed verification (uniform — sub-cause is
           deliberately opaque).
 
+  - name: AppStream
+    module: daemonseed_cli::connect
+    kind: type-alias
+    description: >-
+      The live post-Authenticated TLS stream returned by connect_session
+      (tokio_rustls::client::TlsStream<TcpStream>). The exact stream type
+      daemonseed_server::public_space::serve_application consumes on the server
+      side; the client builds a tonic channel over it to reach PublicSpace +
+      CircleOfTrust on the one already-authenticated connection.
+
   - name: ConnectOutcome
     module: daemonseed_cli::connect
     kind: struct
@@ -538,6 +548,49 @@ functions:
       - description: The trust store must already hold an entry for the dialed server-id.
         check: "store.get(&server_handle).is_some()"
     iscs: [C23, C37, S14, A-S9, S19, "47", A-C18, C22]
+
+  - name: connect_session
+    module: daemonseed_cli::connect
+    description: >-
+      Like connect, but KEEPS the live post-Authenticated stream: returns
+      (ConnectOutcome, AppStream) instead of dropping the connection. The
+      substrate for any client that runs application traffic (the M11 TUI's
+      chat / circle / share / public-space) — build a tonic client channel
+      over the returned AppStream via Endpoint::connect_with_connector +
+      hyper_util TokioIo. `connect` is the thin wrapper that delegates here and
+      drops the stream. Same parameters and error variants as connect.
+    signature: "pub async fn connect_session(server_id: &str, address: &str, identity: &ClientIdentity, counters: &mut CounterState, store: &mut dyn TrustStore) -> Result<(ConnectOutcome, AppStream), ConnectError>"
+    parameters:
+      - name: server_id
+        type: "&str"
+        direction: in
+        description: Target server-id in canonical "<name>#<12hex>" form.
+      - name: address
+        type: "&str"
+        direction: in
+        description: The resolved "host:port" dial address.
+      - name: identity
+        type: "&ClientIdentity"
+        direction: in
+        description: The client's signing identity.
+      - name: counters
+        type: "&mut CounterState"
+        direction: in-out
+        description: Monotonic send + per-server highest-seen counters.
+      - name: store
+        type: "&mut dyn TrustStore"
+        direction: in-out
+        description: Must hold an entry for the dialed server; C22 runs against it.
+    returns:
+      type: "Result<(ConnectOutcome, AppStream), ConnectError>"
+      description: The Authenticated outcome paired with the live TLS stream.
+    preconditions:
+      - description: >-
+          install_provider() and initialize_with_profile(.., Cnsa2) must both
+          have returned Ok before this call.
+        check: "CryptoProvider::get_default().is_some() && oxicrypt_module::state() == State::Operational"
+      - description: The trust store must already hold an entry for the dialed server-id.
+    iscs: [C23, C37, S19, "47", A-C18, C22, "10"]
 
   # ── daemonseed_cli::tofu_stub ─────────────────────────────────────
 

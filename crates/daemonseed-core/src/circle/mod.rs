@@ -16,3 +16,4 @@
 //! names are client-local labels only.
 
 pub mod key;
+pub mod message;

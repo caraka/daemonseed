@@ -874,6 +874,36 @@ types:
           Opaque end-to-end-encrypted application bytes. The relay never
           decrypts or interprets them.
 
+  - name: CircleMessage
+    module: cot
+    kind: message
+    description: >-
+      A circle chat message — the first application payload type carried
+      inside a CotFrame. This is the PLAINTEXT shape: it is prost-encoded then
+      AES-256-GCM-sealed under the circle's cot_key (daemonseed-core
+      circle::message) and ONLY the ciphertext rides in CotFrame.payload. It
+      is never sent in the clear on any wire path — the relay is content-blind
+      (ISC-A-S2). sender_handle is self-asserted (membership is the trust
+      boundary) and used client-side only for @mention (C17) and mute (C15).
+    iscs: [A-S2, C15, C17, A-C3, A-C4]
+    fields:
+      - name: sender_handle
+        type: string
+        tag: 1
+        description: >-
+          Sender's full wire handle (<name>#<12hex>), self-asserted. Used by
+          recipients client-side for @mention highlight and mute suppression.
+      - name: body
+        type: string
+        tag: 2
+        description: The message body, rendered as inert plaintext by the client.
+      - name: sent_unix_ms
+        type: int64
+        tag: 3
+        description: >-
+          Sender wall-clock at compose, unix ms. Advisory ordering only — no
+          global clock, no relay timestamp; not trusted for security.
+
 # ─────────────────────────────────────────────────────────────────────
 # Functions — gRPC service RPC methods, served over the post-Authenticated
 # TLS stream as gRPC-over-h2. Everything up to and including the identity-
