@@ -113,6 +113,11 @@ public_types:
       - "fn messages(&self) -> &[ChatLine]"
       - "fn circle_status(&self) -> &CircleStatus"
       - "fn status(&self) -> Option<&str>"
+      - "fn own_chat_handle(&self) -> Option<Handle>   # own full handle, for self-@mention (ISC-11)"
+      - "fn is_muted(&self, sender: &str) -> bool       # ISC-13 render suppression"
+      - "fn mute_input(&self) -> &str"
+      - "fn muted(&self) -> impl Iterator<Item = &str>"
+      - "fn mention_autocomplete(&self) -> Vec<String>  # ISC-12 candidates from seen senders"
       - "fn on_net_event(&mut self, event: NetEvent)"
       - "fn on_key(&mut self, key: KeyEvent)"
   - name: daemonseed_tui::app::Screen
@@ -124,8 +129,8 @@ public_types:
     description: "One rendered chat line: sender (self-asserted handle), body, sent_unix_ms (0 for a local echo of a just-sent message, which the relay never reflects to its sender). ISC-10."
   - name: daemonseed_tui::app::MainFocus
     kind: enum
-    description: "Which Main-view input has keyboard focus (Tab toggles): Chat (compose, Enter sends, ISC-14) or JoinCircle (phrase, Enter joins, ISC-15/16)."
-    variants: [Chat, JoinCircle]
+    description: "Which Main-view input has keyboard focus (Tab cycles): Chat (compose, Enter sends, ISC-14), JoinCircle (phrase, Enter joins, ISC-15/16), Mute (full handle, Enter toggles the client-local mute set, ISC-13 / A-C3)."
+    variants: [Chat, JoinCircle, Mute]
   - name: daemonseed_tui::app::CircleStatus
     kind: enum
     description: "Circle subscription state shown on the main view: NotJoined, Joining, Joined (ISC-16), Failed(String)."

@@ -10,7 +10,9 @@ use uuid::Uuid;
 
 use crate::bootstrap::BootstrapAnchor;
 use crate::first_start::verify::TypeBackChallenge;
+use crate::handle::Handle;
 use crate::handle::display_name::{DisplayNameRng, is_valid_display_name};
+use crate::identity::keys::{Identity, derive_identity_keys};
 use crate::identity::mnemonic::{Mnemonic, MnemonicError};
 use crate::passphrase::strength::{Strength, estimate};
 use crate::profile::config::{ArgonParams, ProfileConfig, ProfileConfigError};
@@ -52,6 +54,11 @@ pub enum FirstStartError {
     BlobSeal(BlobError),
     /// Recovery file seal/open failed.
     RecoveryFile(RecoveryFileError),
+    /// Deriving the identity keypair / handle from the fresh mnemonic failed.
+    /// Unreachable in practice — the crypto module is operational by this point
+    /// (the at-rest blob seal above already exercised it) — but the derivation
+    /// returns a `Result`, so the failure is surfaced rather than unwrapped.
+    IdentityDerivation(String),
     /// Round-trip backup verification (C33) failed: the saved phrase the
     /// user supplied does not match the just-generated mnemonic.
     BackupRoundTripMismatch,
@@ -88,6 +95,9 @@ impl core::fmt::Display for FirstStartError {
                 )
             }
             FirstStartError::Config(e) => write!(f, "profile config: {e}"),
+            FirstStartError::IdentityDerivation(e) => {
+                write!(f, "identity derivation: {e}")
+            }
         }
     }
 }
@@ -106,6 +116,12 @@ struct Inner {
     recovery_file_bytes: Vec<u8>,
     display_name: Option<String>,
     bootstrap: Option<BootstrapAnchor>,
+    // Floor handle (no display name yet) derived from the identity key during
+    // `initialize`, while the mnemonic is still present. None until then. The
+    // chosen display name is attached at `into_session_materials` (the mnemonic
+    // is already zeroed by that phase, so the handle cannot be re-derived later
+    // — it must be computed and stashed up front).
+    identity_handle: Option<Handle>,
 }
 
 /// Type-state first-start state machine. `S` is the phase marker.
@@ -134,6 +150,7 @@ impl FirstStart<Welcome> {
                 recovery_file_bytes: Vec::new(),
                 display_name: None,
                 bootstrap: None,
+                identity_handle: None,
             },
             _state: PhantomData,
         }
@@ -166,6 +183,19 @@ impl FirstStart<Welcome> {
         // (C2) fresh mnemonic.
         let mnemonic = Mnemonic::generate().map_err(FirstStartError::Mnemonic)?;
 
+        // (C4 / C2) derive the identity's floor handle now, while the mnemonic
+        // is present — it is zeroed after backup verification, so the handle
+        // (SHA-384 of the ML-DSA-87 public key) cannot be re-derived later. The
+        // chosen display name is attached at `into_session_materials`. Uses the
+        // canonical `derive_identity_keys` path so the handle matches the one
+        // the rest of the system derives from the same mnemonic.
+        let identity_handle = {
+            let keys = derive_identity_keys(&mnemonic, Identity::Primary)
+                .map_err(|e| FirstStartError::IdentityDerivation(e.to_string()))?;
+            Handle::from_pubkey(None, keys.signing.public_key())
+                .map_err(|e| FirstStartError::IdentityDerivation(e.to_string()))?
+        };
+
         // (C36 / C14) fresh profile config.
         let profile_config = ProfileConfig::new_for_first_start(argon2_params);
 
@@ -197,6 +227,7 @@ impl FirstStart<Welcome> {
                 recovery_file_bytes,
                 display_name: None,
                 bootstrap: None,
+                identity_handle: Some(identity_handle),
             },
             _state: PhantomData,
         })
@@ -347,11 +378,21 @@ impl FirstStart<Ready> {
 
     /// Consume self into the materials the wire layer (M4a+) opens with.
     pub fn into_session_materials(self) -> SessionMaterials {
+        // Attach the chosen display name to the handle derived during
+        // `initialize` (the mnemonic is gone by now, so the hash prefix comes
+        // from the stashed floor handle, never re-derived).
+        let display_name = self.inner.display_name;
+        let handle = self
+            .inner
+            .identity_handle
+            .expect("initialize always derives the identity handle")
+            .with_display_name(display_name.clone());
         SessionMaterials {
             profile_config: self.inner.profile_config,
             at_rest_blob_bytes: self.inner.blob_bytes,
             recovery_file_bytes: self.inner.recovery_file_bytes,
-            display_name: self.inner.display_name,
+            display_name,
+            handle,
             bootstrap: self
                 .inner
                 .bootstrap
@@ -370,6 +411,11 @@ pub struct SessionMaterials {
     pub at_rest_blob_bytes: Vec<u8>,
     pub recovery_file_bytes: Vec<u8>,
     pub display_name: Option<String>,
+    /// The daemon's own handle (`name#hash`), with the chosen display name
+    /// attached to the hash derived from the identity key. The full handle the
+    /// client uses for self-@mention detection (ISC-C17) and as its chat sender
+    /// identity — distinct from `display_name`, which is just the name part.
+    pub handle: Handle,
     pub bootstrap: BootstrapAnchor,
 }
 
@@ -583,5 +629,54 @@ mod tests {
             .unwrap();
         let m = ready.into_session_materials();
         assert_eq!(m.bootstrap, anchor);
+    }
+
+    /// The materials carry the daemon's own handle: the chosen display name is
+    /// attached, and the hash prefix is a real (non-zero) identity-key hash
+    /// derived from the mnemonic — the full `name#hash` the client uses as its
+    /// chat sender identity and for self-@mention detection (ISC-C4 / C17).
+    #[test]
+    fn materials_carry_identity_handle_with_display_name() {
+        init_oxicrypt();
+        let sealed = FirstStart::<Welcome>::new()
+            .initialize(STRONG_PASSPHRASE, fast_params())
+            .unwrap();
+        let phrase = sealed.display_phrase();
+        let verified = sealed.verify_round_trip(&phrase).unwrap();
+        let ready = verified
+            .finalize(Some("alice".to_string()), placeholder_anchor())
+            .unwrap();
+        let m = ready.into_session_materials();
+
+        assert_eq!(m.handle.display_name(), Some("alice"));
+        assert!(!m.handle.is_floor(), "handle has a display name");
+        // The hash prefix is a real SHA-384 of the identity pubkey, not zeros.
+        assert_ne!(
+            m.handle.hash_prefix(),
+            &[0u8; crate::handle::HASH_PREFIX_BYTES]
+        );
+        // The wire form is `alice#<12hex>`.
+        let wire = m.handle.to_string();
+        assert!(wire.starts_with("alice#"), "wire form: {wire}");
+        assert_eq!(
+            wire.len(),
+            "alice#".len() + crate::handle::HASH_PREFIX_HEX_CHARS
+        );
+    }
+
+    /// An empty display name yields a floor handle (`#<hash>`) but still carries
+    /// the real identity-key hash (ISC-C4b floor case).
+    #[test]
+    fn materials_floor_handle_when_no_display_name() {
+        init_oxicrypt();
+        let sealed = FirstStart::<Welcome>::new()
+            .initialize(STRONG_PASSPHRASE, fast_params())
+            .unwrap();
+        let phrase = sealed.display_phrase();
+        let verified = sealed.verify_round_trip(&phrase).unwrap();
+        let ready = verified.finalize(None, placeholder_anchor()).unwrap();
+        let m = ready.into_session_materials();
+        assert!(m.handle.is_floor());
+        assert!(m.handle.to_string().starts_with('#'));
     }
 }

@@ -5,6 +5,7 @@
 //! and deterministically driveable by the PTY gate harness.
 
 use daemonseed_core::first_start::SessionMaterials;
+use daemonseed_core::handle::{DisplayMode, Handle};
 use daemonseed_core::profile::config::ArgonParams;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 
@@ -63,7 +64,8 @@ pub struct ChatLine {
     pub sent_unix_ms: i64,
 }
 
-/// Which input on the [`Screen::Main`] view has keyboard focus. `Tab` toggles.
+/// Which input on the [`Screen::Main`] view has keyboard focus. `Tab` cycles
+/// Chat → JoinCircle → Mute → Chat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MainFocus {
     /// The chat compose box (default): typing composes, Enter sends (ISC-14).
@@ -71,6 +73,10 @@ pub enum MainFocus {
     /// The circle-join phrase box: typing builds the phrase, Enter joins
     /// (ISC-15/16).
     JoinCircle,
+    /// The mute box: type a full `name#hash` handle, Enter toggles it in the
+    /// client-local mute set (ISC-13 / C15). The set never leaves this client
+    /// (ISC-A-C3).
+    Mute,
 }
 
 /// State of the circle subscription shown on the main view.
@@ -126,6 +132,11 @@ pub struct App {
     circle_status: CircleStatus,
     /// A transient status/error line (e.g. a failed send).
     status: Option<String>,
+    /// The mute-box input buffer (ISC-13).
+    mute_input: String,
+    /// Client-local muted full wire handles (ISC-13 / C15). Never leaves the
+    /// client (ISC-A-C3); applied as a render-time suppression filter.
+    muted: std::collections::BTreeSet<String>,
     /// A circle-join the binary should forward to the net actor (drained once).
     pending_join: Option<String>,
     /// A chat send the binary should forward to the net actor (drained once).
@@ -162,6 +173,8 @@ impl App {
             messages: Vec::new(),
             circle_status: CircleStatus::NotJoined,
             status: None,
+            mute_input: String::new(),
+            muted: std::collections::BTreeSet::new(),
             pending_join: None,
             pending_chat: None,
         }
@@ -274,15 +287,73 @@ impl App {
         }
     }
 
-    /// The user's own display handle, used as the chat sender label and sealed
-    /// into outgoing messages. Falls back to `"anon"` when first-start did not
-    /// set a display name (the floor-handle case; the full `name#hash` handle is
-    /// future identity-plumbing work).
+    /// The user's own full wire handle (`name#hash`), sealed into outgoing chat
+    /// as the sender so recipients can @mention / mute it (ISC-C17/C15). Falls
+    /// back to `"anon"` only if there is no session (pre-first-start).
     fn own_handle(&self) -> String {
         self.session
             .as_ref()
-            .and_then(|s| s.display_name.clone())
+            .map(|s| s.handle.to_string())
             .unwrap_or_else(|| "anon".to_owned())
+    }
+
+    /// The user's own handle as a typed [`Handle`], for self-@mention detection
+    /// at render (ISC-C17). `None` before first-start completes.
+    pub fn own_chat_handle(&self) -> Option<Handle> {
+        self.session.as_ref().map(|s| s.handle.clone())
+    }
+
+    /// Whether `sender` (a full wire handle) is in the client-local mute set
+    /// (ISC-13). The render layer suppresses muted senders.
+    pub fn is_muted(&self, sender: &str) -> bool {
+        self.muted.contains(sender)
+    }
+
+    /// The current mute-box input buffer, for rendering.
+    pub fn mute_input(&self) -> &str {
+        &self.mute_input
+    }
+
+    /// The muted handles, for rendering the mute-box list.
+    pub fn muted(&self) -> impl Iterator<Item = &str> {
+        self.muted.iter().map(String::as_str)
+    }
+
+    /// @-mention autocomplete candidates for the current compose buffer
+    /// (ISC-12 / C18). When composing and the buffer ends with a partial
+    /// `@token` (no whitespace after the last `@`), returns the full wire
+    /// handles of in-scope members whose friendly form prefix-matches the
+    /// token — a bare `@` lists everyone in scope. Scope is the set of handles
+    /// seen as chat senders (the relay never exposes a roster — ISC-A-S2), so
+    /// autocomplete only knows who has spoken. Excludes the user's own handle
+    /// and muted handles. Empty unless focus is Chat with a live `@token`.
+    pub fn mention_autocomplete(&self) -> Vec<String> {
+        if self.main_focus != MainFocus::Chat {
+            return Vec::new();
+        }
+        let Some(at) = self.compose.rfind('@') else {
+            return Vec::new();
+        };
+        let token = &self.compose[at + 1..];
+        if token.contains(char::is_whitespace) {
+            return Vec::new();
+        }
+        let own = self.own_handle();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut out = Vec::new();
+        for m in &self.messages {
+            if m.sender == own || self.muted.contains(&m.sender) || !seen.insert(&m.sender) {
+                continue;
+            }
+            let Ok(handle) = m.sender.parse::<Handle>() else {
+                continue;
+            };
+            let friendly = handle.format(DisplayMode::Default);
+            if token.is_empty() || friendly.starts_with(token) {
+                out.push(handle.to_string());
+            }
+        }
+        out
     }
 
     /// Advance state in response to a key press.
@@ -344,12 +415,14 @@ impl App {
             KeyCode::Tab => {
                 self.main_focus = match self.main_focus {
                     MainFocus::Chat => MainFocus::JoinCircle,
-                    MainFocus::JoinCircle => MainFocus::Chat,
+                    MainFocus::JoinCircle => MainFocus::Mute,
+                    MainFocus::Mute => MainFocus::Chat,
                 };
             }
             _ => match self.main_focus {
                 MainFocus::Chat => self.on_key_chat(key),
                 MainFocus::JoinCircle => self.on_key_join(key),
+                MainFocus::Mute => self.on_key_mute(key),
             },
         }
     }
@@ -396,6 +469,26 @@ impl App {
                 self.pending_join = Some(phrase);
                 self.circle_status = CircleStatus::Joining;
                 self.main_focus = MainFocus::Chat;
+            }
+            _ => {}
+        }
+    }
+
+    /// Mute input: printable chars append, Backspace deletes, Enter toggles the
+    /// typed full wire handle in the client-local mute set (ISC-13). Muting is
+    /// unilateral and silent — nothing is sent to the peer or relay (A-C3).
+    fn on_key_mute(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char(c) => self.mute_input.push(c),
+            KeyCode::Backspace => {
+                self.mute_input.pop();
+            }
+            KeyCode::Enter if !self.mute_input.is_empty() => {
+                let handle = std::mem::take(&mut self.mute_input);
+                // Toggle: a second Enter on the same handle unmutes it.
+                if !self.muted.remove(&handle) {
+                    self.muted.insert(handle);
+                }
             }
             _ => {}
         }
@@ -617,11 +710,13 @@ mod tests {
     }
 
     #[test]
-    fn tab_toggles_main_focus() {
+    fn tab_cycles_main_focus() {
         let mut app = drive_to_main();
         assert_eq!(app.main_focus(), MainFocus::Chat);
         app.on_key(press(KeyCode::Tab));
         assert_eq!(app.main_focus(), MainFocus::JoinCircle);
+        app.on_key(press(KeyCode::Tab));
+        assert_eq!(app.main_focus(), MainFocus::Mute);
         app.on_key(press(KeyCode::Tab));
         assert_eq!(app.main_focus(), MainFocus::Chat);
     }
@@ -716,5 +811,135 @@ mod tests {
         assert!(text.contains("otter: ping"), "transcript line rendered");
         assert!(text.contains("circle joined"), "circle status shown");
         assert!(text.contains("compose"), "compose footer shown");
+    }
+
+    // ── @mention (ISC-11/12) + mute (ISC-13) ─────────────────────────────
+
+    #[test]
+    fn muting_a_handle_toggles() {
+        let mut app = drive_to_main();
+        app.on_key(press(KeyCode::Tab)); // Chat → JoinCircle
+        app.on_key(press(KeyCode::Tab)); // JoinCircle → Mute
+        assert_eq!(app.main_focus(), MainFocus::Mute);
+        for ch in "spammer#aabbccddeeff".chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        app.on_key(press(KeyCode::Enter));
+        assert!(app.is_muted("spammer#aabbccddeeff"), "muted after toggle");
+        // Re-typing the same handle and Enter unmutes (toggle).
+        for ch in "spammer#aabbccddeeff".chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        app.on_key(press(KeyCode::Enter));
+        assert!(
+            !app.is_muted("spammer#aabbccddeeff"),
+            "unmuted on re-toggle"
+        );
+    }
+
+    #[test]
+    fn muted_sender_suppressed_in_transcript() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = drive_to_main();
+        app.on_net_event(NetEvent::ChatMessage {
+            sender: "spammer#aabbccddeeff".to_owned(),
+            body: "BUYNOW spam".to_owned(),
+            sent_unix_ms: 1,
+        });
+        app.on_net_event(NetEvent::ChatMessage {
+            sender: "friend#ccddeeff0011".to_owned(),
+            body: "genuine hello".to_owned(),
+            sent_unix_ms: 2,
+        });
+        // Mute the spammer.
+        app.on_key(press(KeyCode::Tab));
+        app.on_key(press(KeyCode::Tab)); // → Mute focus
+        for ch in "spammer#aabbccddeeff".chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        app.on_key(press(KeyCode::Enter));
+
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| crate::ui::render(&app, f)).unwrap();
+        let text = buffer_text(&term);
+        assert!(
+            !text.contains("BUYNOW spam"),
+            "muted sender suppressed (ISC-13)"
+        );
+        assert!(text.contains("genuine hello"), "non-muted message kept");
+    }
+
+    #[test]
+    fn self_mention_is_highlighted() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::style::Color;
+
+        // One app / one identity throughout (separate drive_to_main calls each
+        // generate a different mnemonic → different handle, which would not
+        // match the mention).
+        let mut app = drive_to_main();
+        let own = app.own_chat_handle().expect("session handle").to_string();
+
+        let yellow_cells = |app: &App| -> usize {
+            let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            term.draw(|f| crate::ui::render(app, f)).unwrap();
+            term.backend()
+                .buffer()
+                .content()
+                .iter()
+                .filter(|c| c.fg == Color::Yellow)
+                .count()
+        };
+
+        // Baseline: a message that does NOT mention us (the connecting-status
+        // line may already be yellow — we measure the delta, not absolute).
+        app.on_net_event(NetEvent::ChatMessage {
+            sender: "friend#ccddeeff0011".to_owned(),
+            body: "nothing to see".to_owned(),
+            sent_unix_ms: 1,
+        });
+        let baseline = yellow_cells(&app);
+
+        // Now a message that mentions our own full handle.
+        app.on_net_event(NetEvent::ChatMessage {
+            sender: "friend#ccddeeff0011".to_owned(),
+            body: format!("hey @{own} look here"),
+            sent_unix_ms: 2,
+        });
+        assert!(
+            yellow_cells(&app) > baseline,
+            "a self-mention highlights its span yellow (ISC-11)"
+        );
+    }
+
+    #[test]
+    fn mention_autocomplete_prefix_matches_seen_senders() {
+        let mut app = drive_to_main();
+        app.on_net_event(NetEvent::ChatMessage {
+            sender: "alice#aabbccddeeff".to_owned(),
+            body: "hi".to_owned(),
+            sent_unix_ms: 1,
+        });
+        app.on_net_event(NetEvent::ChatMessage {
+            sender: "bob#ccddeeff0011".to_owned(),
+            body: "yo".to_owned(),
+            sent_unix_ms: 2,
+        });
+        // Compose a partial mention "@al".
+        for ch in "@al".chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        let suggestions = app.mention_autocomplete();
+        assert!(
+            suggestions.contains(&"alice#aabbccddeeff".to_owned()),
+            "alice prefix-matches @al; got {suggestions:?}"
+        );
+        assert!(
+            !suggestions.contains(&"bob#ccddeeff0011".to_owned()),
+            "bob does not prefix-match @al"
+        );
     }
 }

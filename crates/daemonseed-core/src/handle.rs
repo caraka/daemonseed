@@ -129,6 +129,21 @@ impl Handle {
         &self.hash_prefix
     }
 
+    /// Return a copy of this handle with its display name replaced, keeping the
+    /// same hash prefix.
+    ///
+    /// This does NOT violate the ISC-C4 identity binding: the hash prefix is
+    /// preserved exactly as derived from the pubkey (it is never set
+    /// independently). The use case is first-start, where the handle is derived
+    /// from the identity key *before* the user has chosen a display name, then
+    /// the chosen name is attached once finalize validates it (ISC-C4b).
+    pub fn with_display_name(&self, display_name: Option<String>) -> Handle {
+        Handle {
+            display_name,
+            hash_prefix: self.hash_prefix,
+        }
+    }
+
     /// Returns the display name, if set. `None` indicates floor presentation
     /// (`#<12hex>`).
     pub fn display_name(&self) -> Option<&str> {

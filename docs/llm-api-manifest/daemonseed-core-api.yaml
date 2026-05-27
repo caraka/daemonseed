@@ -1092,18 +1092,26 @@ types:
       What Ready::into_session_materials() yields — caller persists these and
       hands off to the wire layer (M4a+).
     fields:
-      - name: toml
-        type: String
-        description: The daemonseed.toml body to persist.
-      - name: at_rest_blob
+      - name: profile_config
+        type: ProfileConfig
+        description: The fresh profile config (profile_id, argon2 params, feature flags).
+      - name: at_rest_blob_bytes
         type: "Vec<u8>"
-        description: The sealed at-rest seeds blob.
-      - name: recovery_file
+        description: The sealed at-rest seeds blob (write to seeds.blob).
+      - name: recovery_file_bytes
         type: "Vec<u8>"
-        description: The sealed .dseed recovery file.
+        description: The sealed .dseed recovery file (write to identity.dseed).
       - name: display_name
-        type: String
-        description: The chosen or generated display name.
+        type: "Option<String>"
+        description: The chosen display name (None → floor handle).
+      - name: handle
+        type: Handle
+        description: >-
+          The daemon's own handle (name#hash) — the chosen display name attached
+          to the SHA-384 of the identity ML-DSA-87 pubkey (derived during
+          initialize, while the mnemonic was present). The full handle the
+          client uses as its chat sender identity and for self-@mention
+          detection (ISC-C4 / C17), distinct from display_name (name part only).
       - name: bootstrap
         type: BootstrapAnchor
         description: The selected initial federation peer.
@@ -2196,6 +2204,24 @@ functions:
     returns:
       type: String
       description: The combined `name#fingerprint` handle.
+
+  - name: "Handle::with_display_name"
+    module: daemonseed_core::handle
+    description: >-
+      Return a copy of this handle with its display name replaced, keeping the
+      SAME hash prefix. Does NOT violate the ISC-C4 identity binding — the hash
+      is never set independently. Used at first-start: the handle is derived
+      from the identity key before the user picks a name, then the name is
+      attached once finalize validates it (ISC-C4b).
+    signature: "pub fn with_display_name(&self, display_name: Option<String>) -> Handle"
+    parameters:
+      - name: display_name
+        type: "Option<String>"
+        direction: in
+        description: The display name to attach (None → floor handle).
+    returns:
+      type: Handle
+      description: A handle with the same hash prefix and the new display name.
 
   # ── handle::display_name ────────────────────────────────────────────
   - name: generate

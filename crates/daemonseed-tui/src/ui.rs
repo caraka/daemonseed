@@ -5,15 +5,19 @@
 //! pure function of `App`, which is what makes the PTY gate harness'
 //! screen-scraping assertions deterministic.
 
+use core::str::FromStr;
+
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style, Stylize};
-use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Gauge, Paragraph, Wrap};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph, Wrap};
 
+use daemonseed_core::handle::{DisplayMode, Handle};
+use daemonseed_core::mention::find_self_mentions;
 use daemonseed_core::passphrase::strength::SESSION_PASSPHRASE_MIN_BITS;
 
-use crate::app::{App, CircleStatus, ConnectionStatus, MainFocus, Screen};
+use crate::app::{App, ChatLine, CircleStatus, ConnectionStatus, MainFocus, Screen};
 use crate::screens::first_start::{FirstStartUi, FsStep};
 
 /// Draw the current screen.
@@ -81,19 +85,23 @@ fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
     frame.render_widget(body, area);
 }
 
-/// The circle chat transcript, oldest at the top (ISC-10). Each line is
-/// `sender: body`; a just-sent local echo carries the user's own handle.
+/// The circle chat transcript, oldest at the top (ISC-10). Muted senders are
+/// suppressed (ISC-13); the sender shows as its friendly handle form; mentions
+/// of the user's own handle are highlighted (ISC-11).
 fn render_chat_transcript(app: &App, frame: &mut Frame, area: Rect) {
-    let lines: Vec<Line> = if app.messages().is_empty() {
+    let own = app.own_chat_handle();
+    let visible: Vec<&ChatLine> = app
+        .messages()
+        .iter()
+        .filter(|m| !app.is_muted(&m.sender)) // ISC-13
+        .collect();
+    let lines: Vec<Line> = if visible.is_empty() {
         vec![
             Line::from("no messages yet — Tab to join a circle, then type to chat".to_owned())
                 .style(Style::default().fg(Color::DarkGray)),
         ]
     } else {
-        app.messages()
-            .iter()
-            .map(|m| Line::from(format!("{}: {}", m.sender, m.body)))
-            .collect()
+        visible.iter().map(|m| chat_line(m, own.as_ref())).collect()
     };
     let body = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
         Block::default()
@@ -104,39 +112,120 @@ fn render_chat_transcript(app: &App, frame: &mut Frame, area: Rect) {
     frame.render_widget(body, area);
 }
 
-/// The bottom input line: the chat compose box or the circle-join box,
-/// depending on focus (Tab toggles). A focused box is highlighted.
+/// Build one transcript line: a friendly `sender:` prefix plus the body, with
+/// any `@own-handle` mention spans highlighted (ISC-11/C17). An unparseable
+/// sender renders raw.
+fn chat_line(m: &ChatLine, own: Option<&Handle>) -> Line<'static> {
+    let sender_label = Handle::from_str(&m.sender)
+        .map(|h| h.format(DisplayMode::Default))
+        .unwrap_or_else(|_| m.sender.clone());
+    let mut spans = vec![Span::styled(
+        format!("{sender_label}: "),
+        Style::default().fg(Color::Cyan),
+    )];
+
+    let mentions = own
+        .map(|h| find_self_mentions(&m.body, h))
+        .unwrap_or_default();
+    if mentions.is_empty() {
+        spans.push(Span::raw(m.body.clone()));
+    } else {
+        let mut idx = 0;
+        for span in mentions {
+            if span.start > idx {
+                spans.push(Span::raw(m.body[idx..span.start].to_string()));
+            }
+            spans.push(Span::styled(
+                m.body[span.clone()].to_string(),
+                Style::default().fg(Color::Yellow).bold(),
+            ));
+            idx = span.end;
+        }
+        if idx < m.body.len() {
+            spans.push(Span::raw(m.body[idx..].to_string()));
+        }
+    }
+    Line::from(spans)
+}
+
+/// The bottom input line: the chat compose box, circle-join box, or mute box,
+/// depending on focus (Tab cycles Chat → JoinCircle → Mute). When composing a
+/// partial `@token`, a mention-autocomplete popup floats above (ISC-12).
 fn render_main_input(app: &App, frame: &mut Frame, area: Rect) {
-    let (title, text, focused) = match app.main_focus() {
+    let (title, text): (&str, String) = match app.main_focus() {
         MainFocus::Chat => (
             "compose  [Enter] send  [Tab] join-circle  [Esc] back",
-            app.compose(),
-            true,
+            app.compose().to_owned(),
         ),
         MainFocus::JoinCircle => (
-            "circle phrase  [Enter] join  [Tab] chat  [Esc] back",
-            app.circle_phrase(),
-            true,
+            "circle phrase  [Enter] join  [Tab] mute  [Esc] back",
+            app.circle_phrase().to_owned(),
         ),
+        MainFocus::Mute => {
+            let muted: Vec<&str> = app.muted().collect();
+            let suffix = if muted.is_empty() {
+                String::new()
+            } else {
+                format!("   muted: {}", muted.join(", "))
+            };
+            (
+                "mute handle  [Enter] toggle  [Tab] chat  [Esc] back",
+                format!("{}{suffix}", app.mute_input()),
+            )
+        }
     };
-    let style = if focused {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default()
-    };
-    // A status/error line (e.g. a failed send) replaces the input text briefly
-    // when present, so the user sees why nothing happened.
+    // A status/error line (e.g. a failed send) is appended briefly when present.
     let shown = match app.status() {
-        Some(s) => format!("{text}    ⚠ {s}"),
-        None => text.to_owned(),
+        Some(s) => format!("{text}    ! {s}"),
+        None => text,
     };
     let body = Paragraph::new(shown).block(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(style)
+            .border_style(Style::default().fg(Color::Cyan))
             .title(title),
     );
     frame.render_widget(body, area);
+
+    render_mention_popup(app, frame, area);
+}
+
+/// A mention-autocomplete popup floating just above the compose box (ISC-12).
+/// Shown only while composing a partial `@token` with in-scope candidates.
+fn render_mention_popup(app: &App, frame: &mut Frame, input_area: Rect) {
+    let candidates = app.mention_autocomplete();
+    if candidates.is_empty() {
+        return;
+    }
+    let shown: Vec<&String> = candidates.iter().take(5).collect();
+    let height = (shown.len() as u16) + 2; // + borders
+    let width = shown
+        .iter()
+        .map(|c| c.len() as u16)
+        .max()
+        .unwrap_or(10)
+        .clamp(10, input_area.width.saturating_sub(2))
+        + 2;
+    // Anchor the popup directly above the input box.
+    let y = input_area.y.saturating_sub(height);
+    let popup = Rect {
+        x: input_area.x,
+        y,
+        width: width.min(input_area.width),
+        height: height.min(input_area.y),
+    };
+    if popup.height < 3 {
+        return; // no room
+    }
+    let lines: Vec<Line> = shown.iter().map(|c| Line::from((*c).clone())).collect();
+    let widget = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .title("@mention"),
+    );
+    frame.render_widget(Clear, popup);
+    frame.render_widget(widget, popup);
 }
 
 fn render_welcome(frame: &mut Frame) {
