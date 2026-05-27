@@ -27,5 +27,6 @@
 #![forbid(unsafe_code)]
 
 pub mod app;
+pub mod net;
 pub mod screens;
 pub mod ui;

@@ -8,7 +8,34 @@ use daemonseed_core::first_start::SessionMaterials;
 use daemonseed_core::profile::config::ArgonParams;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 
+use crate::net::NetEvent;
 use crate::screens::first_start::{FirstStartOutcome, FirstStartUi};
+
+/// Live connection state shown in the main view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectionStatus {
+    /// No connection attempted yet.
+    Disconnected,
+    /// A connect is in flight (the net actor is working).
+    Connecting,
+    /// Reached Authenticated (ISC-47).
+    Connected {
+        server: String,
+        version: String,
+        rotation_notice: Option<String>,
+    },
+    /// The connect attempt failed; carries a human-readable cause.
+    Failed(String),
+}
+
+/// A queued request for the binary to hand to the network actor. Returned by
+/// [`App::take_pending_connect`] so `App` itself never touches the runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectRequest {
+    pub server_id: String,
+    pub address: String,
+    pub trusted: bool,
+}
 
 /// The top-level screen the TUI is currently showing.
 ///
@@ -40,6 +67,10 @@ pub struct App {
     first_start: Option<FirstStartUi>,
     /// Materials produced by a completed first-start, awaiting the connect path.
     session: Option<SessionMaterials>,
+    /// Live connection state shown on the main view.
+    connection: ConnectionStatus,
+    /// A connect the binary should hand to the network actor (drained once).
+    pending_connect: Option<ConnectRequest>,
 }
 
 impl Default for App {
@@ -64,6 +95,8 @@ impl App {
             argon,
             first_start: None,
             session: None,
+            connection: ConnectionStatus::Disconnected,
+            pending_connect: None,
         }
     }
 
@@ -89,6 +122,33 @@ impl App {
         self.session.is_some()
     }
 
+    /// The live connection status, for rendering the main view.
+    pub fn connection(&self) -> &ConnectionStatus {
+        &self.connection
+    }
+
+    /// Take a queued connect request, if any — the binary forwards it to the
+    /// network actor. Clears the slot so it is handed off exactly once.
+    pub fn take_pending_connect(&mut self) -> Option<ConnectRequest> {
+        self.pending_connect.take()
+    }
+
+    /// Fold a network-actor event into UI state.
+    pub fn on_net_event(&mut self, event: NetEvent) {
+        self.connection = match event {
+            NetEvent::Connected {
+                server,
+                version,
+                rotation_notice,
+            } => ConnectionStatus::Connected {
+                server,
+                version,
+                rotation_notice,
+            },
+            NetEvent::ConnectFailed { message } => ConnectionStatus::Failed(message),
+        };
+    }
+
     /// Advance state in response to a key press.
     ///
     /// Only [`KeyEventKind::Press`] events drive state — `crossterm` on Windows
@@ -111,7 +171,19 @@ impl App {
                 if let Some(fs) = self.first_start.as_mut() {
                     match fs.on_key(key) {
                         Some(FirstStartOutcome::Completed) => {
-                            self.session = fs.take_completed();
+                            let session = fs.take_completed();
+                            // Queue a trusted-mode connect to the chosen bootstrap
+                            // relay (C37 + C22 default-trusted for the canonical
+                            // anchor). The binary drains this and drives the net actor.
+                            if let Some(s) = session.as_ref() {
+                                self.pending_connect = Some(ConnectRequest {
+                                    server_id: s.bootstrap.server_id.clone(),
+                                    address: s.bootstrap.address.clone(),
+                                    trusted: true,
+                                });
+                                self.connection = ConnectionStatus::Connecting;
+                            }
+                            self.session = session;
                             self.first_start = None;
                             self.screen = Screen::Main;
                         }
@@ -224,6 +296,50 @@ mod tests {
         assert!(
             app.first_start().is_none(),
             "first-start component cleared on completion"
+        );
+
+        // Completing first-start queues a trusted-mode connect to the bootstrap
+        // relay and shows Connecting until the net actor reports back.
+        assert_eq!(app.connection(), &ConnectionStatus::Connecting);
+        let req = app
+            .take_pending_connect()
+            .expect("connect queued on completion");
+        assert_eq!(req.server_id, "relay#aabbccddeeff");
+        assert_eq!(req.address, "127.0.0.1:443");
+        assert!(req.trusted);
+        assert!(
+            app.take_pending_connect().is_none(),
+            "connect handed off exactly once"
+        );
+    }
+
+    #[test]
+    fn net_event_connected_sets_connected_status() {
+        let mut app = App::new();
+        app.on_net_event(NetEvent::Connected {
+            server: "relay#aabbccddeeff".to_owned(),
+            version: "1.0".to_owned(),
+            rotation_notice: None,
+        });
+        assert_eq!(
+            app.connection(),
+            &ConnectionStatus::Connected {
+                server: "relay#aabbccddeeff".to_owned(),
+                version: "1.0".to_owned(),
+                rotation_notice: None,
+            }
+        );
+    }
+
+    #[test]
+    fn net_event_failed_sets_failed_status() {
+        let mut app = App::new();
+        app.on_net_event(NetEvent::ConnectFailed {
+            message: "tcp connect refused".to_owned(),
+        });
+        assert_eq!(
+            app.connection(),
+            &ConnectionStatus::Failed("tcp connect refused".to_owned())
         );
     }
 

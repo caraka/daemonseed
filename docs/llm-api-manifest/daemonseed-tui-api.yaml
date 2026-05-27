@@ -39,6 +39,23 @@ modules:
     iscs: ["1"]
     added_in: "M11 scaffold"
 
+  - name: daemonseed_tui::net
+    description: >-
+      Network actor — the async side of the TUI. The binary owns a NetHandle
+      holding a dedicated network thread (current-thread tokio runtime) and two
+      channels: NetCommand flows in, NetEvent flows out; the render thread sends
+      commands and drains events with non-blocking try_recv so a slow connect
+      never blocks the UI (ISC-A-C7 substrate). A current-thread runtime is
+      required because daemonseed_cli::connect takes &mut dyn TrustStore (not
+      Send) and so cannot be tokio::spawn'd onto a multi-thread runtime. Connect
+      uses an ephemeral client identity (D8) + a trust store seeded for the
+      dialed server in the requested C22 mode (trusted = TOFU-pin; untrusted
+      needs a pre-imported key, reported until the server-management import UX).
+    no_std: false
+    depends_on: [daemonseed-cli, daemonseed-core]
+    iscs: ["47", C22, C37]
+    added_in: "M11 connect workstream"
+
   - name: daemonseed_tui::screens::first_start
     description: >-
       First-start flow component (ISC-C29 family). Drives the core
@@ -78,6 +95,9 @@ public_types:
       - "fn should_quit(&self) -> bool"
       - "fn first_start(&self) -> Option<&FirstStartUi>"
       - "fn has_session(&self) -> bool"
+      - "fn connection(&self) -> &ConnectionStatus"
+      - "fn take_pending_connect(&mut self) -> Option<ConnectRequest>"
+      - "fn on_net_event(&mut self, event: NetEvent)"
       - "fn on_key(&mut self, key: KeyEvent)"
   - name: daemonseed_tui::app::Screen
     kind: enum

@@ -13,6 +13,7 @@ use std::time::Duration;
 use daemonseed_server::kats::CNSA_2_0_KATS;
 use daemonseed_server::tls::install_provider;
 use daemonseed_tui::app::App;
+use daemonseed_tui::net::{NetCommand, NetHandle};
 use daemonseed_tui::ui;
 use oxicrypt_module::{AlgorithmProfile, initialize_with_profile};
 use ratatui::crossterm::event::{self, Event};
@@ -35,20 +36,45 @@ fn main() -> io::Result<()> {
         return Err(io::Error::other(e.to_string()));
     }
 
+    // The network actor (tokio runtime + connect driver) is built before raw
+    // mode so a runtime-build failure prints plainly.
+    let net = match NetHandle::new() {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("daemonseed-tui: network runtime build failed: {e}");
+            return Err(e);
+        }
+    };
+
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal);
+    let result = run(&mut terminal, net);
     ratatui::restore();
     result
 }
 
-fn run(terminal: &mut ratatui::DefaultTerminal) -> io::Result<()> {
+fn run(terminal: &mut ratatui::DefaultTerminal, mut net: NetHandle) -> io::Result<()> {
     let mut app = App::new();
     while !app.should_quit() {
         terminal.draw(|frame| ui::render(&app, frame))?;
+
+        // Drain network events into UI state (non-blocking).
+        for event in net.drain_events() {
+            app.on_net_event(event);
+        }
+
         if event::poll(TICK)?
             && let Event::Key(key) = event::read()?
         {
             app.on_key(key);
+        }
+
+        // Hand any queued connect to the network actor.
+        if let Some(req) = app.take_pending_connect() {
+            let _ = net.send(NetCommand::Connect {
+                server_id: req.server_id,
+                address: req.address,
+                trusted: req.trusted,
+            });
         }
     }
     Ok(())

@@ -13,7 +13,7 @@ use ratatui::widgets::{Block, Borders, Gauge, Paragraph, Wrap};
 
 use daemonseed_core::passphrase::strength::SESSION_PASSPHRASE_MIN_BITS;
 
-use crate::app::{App, Screen};
+use crate::app::{App, ConnectionStatus, Screen};
 use crate::screens::first_start::{FirstStartUi, FsStep};
 
 /// Draw the current screen.
@@ -24,8 +24,42 @@ pub fn render(app: &App, frame: &mut Frame) {
             Some(fs) => render_first_start(fs, frame),
             None => render_placeholder(frame, "First start"),
         },
-        Screen::Main => render_placeholder(frame, "Connected — main view (next workstream)"),
+        Screen::Main => render_main(app, frame),
     }
+}
+
+/// The post-first-start main view. For now it surfaces the live connection
+/// status; chat / circle / share / trust tabs grow here in the next workstreams.
+fn render_main(app: &App, frame: &mut Frame) {
+    let (line, color) = match app.connection() {
+        ConnectionStatus::Disconnected => ("disconnected".to_owned(), Color::Gray),
+        ConnectionStatus::Connecting => ("connecting…".to_owned(), Color::Yellow),
+        ConnectionStatus::Connected {
+            server,
+            version,
+            rotation_notice,
+        } => {
+            let mut s = format!("connected to {server}  (wire {version})");
+            if let Some(fp) = rotation_notice {
+                s.push_str(&format!(
+                    "\nnotice: server key rotated; new fingerprint {fp}"
+                ));
+            }
+            (s, Color::Green)
+        }
+        ConnectionStatus::Failed(msg) => (format!("connection failed: {msg}"), Color::Red),
+    };
+    let body = Paragraph::new(line)
+        .style(Style::default().fg(color))
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" daemonseed ")
+                .title_alignment(Alignment::Center),
+        );
+    frame.render_widget(body, frame.area());
 }
 
 fn render_welcome(frame: &mut Frame) {
