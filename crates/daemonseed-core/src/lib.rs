@@ -12,7 +12,11 @@
 //! [`circle::key`] (shared-entropy key derivation), [`cot`] (rendezvous
 //! addressing), [`storage::cas`] (the content-addressed chunk store),
 //! [`storage::share_index`] (the encrypted redb share index), and [`indexer`]
-//! (the share-folder indexer engine driving that index).
+//! (the share-folder indexer engine driving that index). M9 adds client-side
+//! abuse-resilience and chat affordances: [`backoff`] (reconnect curve +
+//! close-cause categorization, ISC-C26), [`mention`] (@-mention recognition +
+//! resolution, ISC-C17/C18), and the mute / hide-shares lists on
+//! [`storage::seeds::Seeds`] (ISC-C15/C16).
 
 #![forbid(unsafe_code)]
 
@@ -28,6 +32,7 @@ pub mod identity;
 pub mod identity_proof;
 pub mod indexer;
 pub mod kdf;
+pub mod mention;
 pub mod passphrase;
 pub mod profile;
 pub mod public_space;
