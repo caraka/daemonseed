@@ -1,0 +1,14 @@
+# Daemonseed release-signing trust anchor — bundled with the release binary,
+# binding the set of release-signing ML-DSA-87 public keys and the N-of-M
+# threshold to the signed binary (ISC-S18 / ISC-A-C11 / ISC-A-C19). Operators
+# (or a tampering attacker) cannot alter this at runtime; the binary's own
+# release signature is what attests this file.
+#
+# Pre-public phase: no real release key exists yet — `keys` is empty and the
+# real key lands via a signing-key ceremony (deferred M10-infra) by adding its
+# hex-encoded ML-DSA-87 public key here and shipping a signed release. The shape
+# ships 1-of-1 (`threshold = 1`); it ratchets to N-of-M by adding keys and
+# raising `threshold`.
+version = 1
+threshold = 1
+keys = []
