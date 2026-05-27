@@ -207,9 +207,18 @@ impl Seeds {
     }
 
     /// Mute a full wire handle (ISC-C15). Returns `true` if newly added,
-    /// `false` if already muted — idempotent.
+    /// `false` if already muted (idempotent) or rejected.
+    ///
+    /// Refuses any handle containing a line break: the at-rest blob plaintext
+    /// is line-based, so a `\n`/`\r` in a (peer-controlled, self-asserted)
+    /// handle would inject a spurious directive line and corrupt the blob on
+    /// the next open. A well-formed wire handle never contains one.
     pub fn add_mute(&mut self, handle: impl Into<String>) -> bool {
-        self.muted.insert(handle.into())
+        let handle = handle.into();
+        if handle.contains(['\n', '\r']) {
+            return false;
+        }
+        self.muted.insert(handle)
     }
 
     /// Unmute a handle. Returns `true` if it was muted, `false` otherwise.
@@ -222,9 +231,15 @@ impl Seeds {
         self.muted.contains(handle)
     }
 
-    /// Hide a handle's file shares (ISC-C16). Returns `true` if newly added.
+    /// Hide a handle's file shares (ISC-C16). Returns `true` if newly added,
+    /// `false` if already hidden or rejected. Refuses line-break handles for
+    /// the same blob-integrity reason as [`Self::add_mute`].
     pub fn add_hidden_share(&mut self, handle: impl Into<String>) -> bool {
-        self.hidden_shares.insert(handle.into())
+        let handle = handle.into();
+        if handle.contains(['\n', '\r']) {
+            return false;
+        }
+        self.hidden_shares.insert(handle)
     }
 
     /// Un-hide a handle's shares. Returns `true` if it was hidden.
@@ -758,6 +773,27 @@ mod tests {
         let blob = seal(&seeds, pp, pid, test_params()).unwrap();
         let recovered = open(&blob, pp, pid, test_params()).unwrap().seeds;
         assert!(recovered.is_muted("two words#aabbccddeeff"));
+    }
+
+    #[test]
+    fn mute_rejects_handles_with_line_breaks_to_protect_blob_integrity() {
+        // A wire handle never contains a line break, but a *malicious peer*
+        // controls its own self-asserted display name. If a crafted handle
+        // carrying an embedded newline were stored, it would inject a second
+        // directive line into the line-based blob plaintext and corrupt the
+        // blob on the next open — locking the victim out of their own identity.
+        // add_mute / add_hidden_share must refuse such handles.
+        ensure_oxicrypt_initialized();
+        let pid = Uuid::new_v4();
+        let pp = "correct horse battery staple table mountain";
+        let mut seeds = fresh_seeds();
+        assert!(!seeds.add_mute("evil\nsend-counter 999#aabbccddeeff"));
+        assert!(!seeds.add_hidden_share("x\rmore#aabbccddeeff"));
+        assert!(seeds.muted.is_empty());
+        assert!(seeds.hidden_shares.is_empty());
+        // The blob still round-trips cleanly — no injected directive line.
+        let blob = seal(&seeds, pp, pid, test_params()).unwrap();
+        assert!(open(&blob, pp, pid, test_params()).is_ok());
     }
 
     #[test]
