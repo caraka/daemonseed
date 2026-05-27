@@ -7,9 +7,9 @@
 //! Count invariants (must stay aligned with AGENTS.md "Standards target"
 //! section and the project manifest):
 //!
-//! - 36 server-side: 20 positive (`ISC-S*`) + 16 negative (`ISC-A-S*`)
+//! - 37 server-side: 21 positive (`ISC-S*`) + 16 negative (`ISC-A-S*`)
 //! - 57 client-side: 38 positive (`ISC-C*`) + 19 negative (`ISC-A-C*`)
-//! - 93 total
+//! - 94 total
 //!
 //! `C5` is intentionally vacant (parking-lot reservation R5, folder
 //! encryption — post-MVP).
@@ -34,7 +34,7 @@ pub enum IscClass {
 /// Every ISC known to this MVP, in declaration order from `ds-isc-draft.md`.
 /// Length is [`TOTAL`].
 pub const ISCS: &[(&str, IscClass)] = &[
-    // ── server positive (20) ────────────────────────────────────────────
+    // ── server positive (21) ────────────────────────────────────────────
     ("ISC-S1", IscClass::Positive),
     ("ISC-S2a", IscClass::Positive),
     ("ISC-S2b", IscClass::Positive),
@@ -55,6 +55,7 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-S17", IscClass::Positive),
     ("ISC-S18", IscClass::Positive),
     ("ISC-S19", IscClass::Positive),
+    ("ISC-S20", IscClass::Positive),
     // ── server negative (16) ────────────────────────────────────────────
     ("ISC-A-S1", IscClass::Negative),
     ("ISC-A-S2", IscClass::Negative),
@@ -134,7 +135,7 @@ pub const ISCS: &[(&str, IscClass)] = &[
 ];
 
 /// Total ISCs tracked by this registry. Recount on every ISC add/remove.
-pub const TOTAL: usize = 93;
+pub const TOTAL: usize = 94;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -214,6 +215,14 @@ mod tests {
     }
 
     #[test]
+    fn isc_s20_is_registered_server_positive() {
+        // ISC-S20 (circle-of-trust live relay) was formalized at M8 (F23) and
+        // AGENTS.md tracks 94 ISCs, but this registry lagged at 93 — the M8
+        // milestone never backfilled the entry. It is a server-positive ISC.
+        assert_eq!(lookup_class("ISC-S20"), Some(IscClass::Positive));
+    }
+
+    #[test]
     fn registry_has_no_duplicates() {
         let mut seen = std::collections::BTreeSet::new();
         for (id, _) in ISCS.iter() {
@@ -230,11 +239,11 @@ mod tests {
                 IscClass::Negative => neg += 1,
             }
         }
-        // AGENTS.md: 36 server-side + 57 client-side = 93. Split:
-        //   server  20 pos + 16 neg = 36
+        // AGENTS.md: 37 server-side + 57 client-side = 94. Split:
+        //   server  21 pos + 16 neg = 37  (ISC-S20 backfilled, M8/F23)
         //   client  38 pos + 19 neg = 57
-        //   total   58 pos + 35 neg = 93
-        assert_eq!(pos, 58, "positive count drift");
+        //   total   59 pos + 35 neg = 94
+        assert_eq!(pos, 59, "positive count drift");
         assert_eq!(neg, 35, "negative count drift");
     }
 
