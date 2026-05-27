@@ -16,11 +16,18 @@
 //! abuse-resilience and chat affordances: [`backoff`] (reconnect curve +
 //! close-cause categorization, ISC-C26), [`mention`] (@-mention recognition +
 //! resolution, ISC-C17/C18), and the mute / hide-shares lists on
-//! [`storage::seeds::Seeds`] (ISC-C15/C16).
+//! [`storage::seeds::Seeds`] (ISC-C15/C16). M10-completion adds the two
+//! platform-feature *scaffolds*: [`biometric`] (the `BiometricStore` trait for
+//! secure-enclave session-passphrase unlock, ISC-C7) and [`autostart`] (the
+//! pure OS-autostart descriptor generator + `AutostartManager` trait,
+//! ISC-C20) — abstraction + opt-in flags + warnings only; the platform halves
+//! are reserved to the future GUI/mobile client.
 
 #![forbid(unsafe_code)]
 
+pub mod autostart;
 pub mod backoff;
+pub mod biometric;
 pub mod bootstrap;
 pub mod circle;
 pub mod connection;

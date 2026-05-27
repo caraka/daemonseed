@@ -94,6 +94,20 @@ pub struct ProfileConfig {
     /// changed (ISC-A-C17). Re-key flows must run an explicit migration.
     #[serde(default = "ArgonParams::desktop_default")]
     pub argon2: ArgonParams,
+
+    /// Opt-in biometric / secure-enclave session-passphrase unlock (ISC-C7).
+    /// Default off. When enabled, a platform-holding client stores the
+    /// session passphrase (never the mnemonic) via [`crate::biometric`];
+    /// the user must first acknowledge [`crate::biometric::RECOVERY_RISK_WARNING`].
+    #[serde(default)]
+    pub biometric_unlock: bool,
+
+    /// Opt-in OS-native autostart (ISC-C20). Default off. When enabled, a
+    /// client installs a [`crate::autostart`] unit launching this profile
+    /// headless on boot; the user must first acknowledge
+    /// [`crate::autostart::PRESENCE_SIDE_CHANNEL_WARNING`].
+    #[serde(default)]
+    pub autostart: bool,
 }
 
 impl ProfileConfig {
@@ -104,6 +118,8 @@ impl ProfileConfig {
         Self {
             profile_id: Uuid::new_v4(),
             argon2,
+            biometric_unlock: false,
+            autostart: false,
         }
     }
 
@@ -204,6 +220,35 @@ mod tests {
             Err(ProfileConfigError::InvalidProfileId(_)) => {}
             other => panic!("expected InvalidProfileId, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn optional_features_default_off_at_first_start() {
+        // ISC-C7 / ISC-C20: biometric unlock and autostart are opt-in; a
+        // freshly enrolled profile has both disabled.
+        let c = ProfileConfig::new_for_first_start(ArgonParams::desktop_default());
+        assert!(!c.biometric_unlock);
+        assert!(!c.autostart);
+    }
+
+    #[test]
+    fn optional_features_default_off_when_absent_from_toml() {
+        // Existing M1–M10 profiles have neither field; they must still parse
+        // and read as disabled (serde default), not fail.
+        let body = r#"profile_id = "123e4567-e89b-12d3-a456-426614174000""#;
+        let c = ProfileConfig::from_toml(body).unwrap();
+        assert!(!c.biometric_unlock);
+        assert!(!c.autostart);
+    }
+
+    #[test]
+    fn optional_features_round_trip_when_enabled() {
+        let mut c = ProfileConfig::new_for_first_start(ArgonParams::desktop_default());
+        c.biometric_unlock = true;
+        c.autostart = true;
+        let parsed = ProfileConfig::from_toml(&c.to_toml().unwrap()).unwrap();
+        assert!(parsed.biometric_unlock);
+        assert!(parsed.autostart);
     }
 
     #[test]
