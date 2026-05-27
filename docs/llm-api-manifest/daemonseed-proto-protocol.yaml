@@ -1,11 +1,13 @@
 # ─────────────────────────────────────────────────────────────────────
 # daemonseed-proto — LAMA Protocol Manifest
 #
-# Wire schema + protocol-level conventions for daemonseed. The .proto
-# files themselves serve as the message/service manifest; this LAMA
-# layer covers what proto3 syntax can't express — HELLO sequencing,
-# version negotiation, replay-protection rules, signed-payload
-# envelopes, the suite_id validation contract, and the family-id
+# Wire schema + protocol-level conventions for daemonseed. All public
+# Rust types are generated from the proto3 files under
+# proto/daemonseed/v1/ via build.rs (tonic-build) on every cargo build.
+# This LAMA manifest documents the protobuf message types, gRPC service
+# methods, and the schema-level rules proto3 syntax cannot express:
+# HELLO sequencing, version negotiation, replay-protection, signed-
+# payload envelopes, the suite_id validation contract, and the family-id
 # non-feature.
 #
 # Cross-references:
@@ -19,13 +21,14 @@ library:
   name: daemonseed-proto
   version: "0.1.0"
   description: >-
-    Wire-protocol schema. All public Rust types are generated from
-    `proto/*.proto` files via `build.rs` (tonic-build) on every cargo
-    build; a committed snapshot under `src/generated/` mirrors the
-    output for inspection (`cargo xtask gen-proto` refreshes;
-    `cargo xtask check-proto` enforces no drift in CI).
+    Wire-protocol schema for daemonseed. All public Rust types are
+    generated from proto/*.proto via build.rs (tonic-build) on every
+    cargo build; a committed snapshot under src/generated/ mirrors the
+    output for inspection (cargo xtask gen-proto refreshes; cargo xtask
+    check-proto enforces no drift in CI).
   license: "Apache-2.0 OR MIT"
-  manifest_for: "crates/daemonseed-proto"
+
+manifest_for: "crates/daemonseed-proto"
 
 # ─────────────────────────────────────────────────────────────────────
 # Schema-level constraints
@@ -36,487 +39,1002 @@ constraints:
       MINOR version bumps are additive-only per ISC-S14. Never reuse
       field numbers, never repurpose enum values, never tighten
       validation after a field has shipped. MAJOR bumps create a new
-      `vN` module — the existing `v1` module stays compilable for as
-      long as anything depends on it.
-    enforcement: convention (no automated drift detection yet)
+      vN module — the existing v1 module stays compilable for as long
+      as anything depends on it.
+    enforcement: convention
     severity: error
     iscs: [S14, A-S9, C23]
 
   - description: >-
-      The committed snapshot under `src/generated/` is *for inspection
-      only* — it is NOT what gets compiled. Cargo's build.rs writes
-      fresh codegen into OUT_DIR on every build. `cargo xtask check-proto`
-      regenerates to a temp directory and diffs against the committed
-      snapshot; non-zero exit blocks the doc-sync gate.
-    enforcement: CI (xtask check-proto)
+      The committed snapshot under src/generated/ is for inspection
+      only — it is NOT what gets compiled. Cargo's build.rs writes
+      fresh codegen into OUT_DIR on every build. cargo xtask
+      check-proto regenerates to a temp directory and diffs against the
+      committed snapshot; non-zero exit blocks the doc-sync gate.
+    enforcement: runtime
     severity: error
 
   - description: >-
       proto3 has no native u16 type. Wire fields that semantically
-      carry u16 values (currently just `SuiteId.value`) are encoded
-      as `uint32` and validated at the application layer (via
-      `daemonseed_core::crypto::suite::SuiteId::try_new`).
-      Receivers MUST reject `0x0000` and `0xFFFF` (reserved
-      sentinels per `ds-suite-registry.md`).
-    enforcement: app-layer validation (SuiteId::try_new)
+      carry u16 values (SuiteId.value, SuiteDeprecationEntry.suite_id,
+      SuiteDeprecationEntry.recommended_suite_id) are encoded as uint32
+      and validated at the application layer via
+      daemonseed_core::crypto::suite::SuiteId::try_new. Receivers MUST
+      reject 0x0000 and 0xFFFF (reserved sentinels per
+      ds-suite-registry.md).
+    enforcement: runtime
     severity: error
+    iscs: [C24, S15]
 
   - description: >-
-      No `family_id` wire field exists. Per ISC-S15 the family
-      relationship between two SuiteIds is **implicit in the
-      registry** and exposed via `Suite::same_family` on the core
-      crate side. Adding a family-id field to the wire would
-      permanently constrain registry topology and is a deliberate
-      non-feature.
-    enforcement: convention + this manifest
+      No family_id wire field exists. Per ISC-S15 the family
+      relationship between two SuiteIds is implicit in the registry and
+      exposed via Suite::same_family on the core crate side. Adding a
+      family-id field to the wire would permanently constrain registry
+      topology and is a deliberate non-feature.
+    enforcement: convention
     severity: error
     iscs: [S15]
 
 # ─────────────────────────────────────────────────────────────────────
-# Packages
+# Modules — one per proto file in the daemonseed.v1 package
 # ─────────────────────────────────────────────────────────────────────
 
-packages:
-  - name: "daemonseed.v1"
-    rust_module: "daemonseed_proto::v1"
-    proto_files:
-      - "proto/daemonseed/v1/app_hello.proto"
-      - "proto/daemonseed/v1/suite.proto"
-      - "proto/daemonseed/v1/identity_proof.proto"
-    status: active
-    messages:
-      - name: ProtocolVersion
-        defined_in: "proto/daemonseed/v1/app_hello.proto"
-        added_in: "v0.5.0 (M4a)"
-        purpose: >-
-          SemVer MAJOR.MINOR wire shape. PATCH is deliberately absent
-          per ISC-S14 — release-artifact concern, not a wire-surface
-          concern. Supersedes the M0 placeholder `Version` message,
-          which carried `patch` + `pre_release` and was retired before
-          ever shipping on a deployed peer.
-        fields:
-          - { name: major, type: uint32, tag: 1, note: "Breaking-change bumps only." }
-          - { name: minor, type: uint32, tag: 2, note: "Additive-only per ISC-S14." }
-        iscs: [S14, A-S9, C23]
-
-      - name: AppHello
-        defined_in: "proto/daemonseed/v1/app_hello.proto"
-        added_in: "v0.5.0 (M4a)"
-        purpose: >-
-          Initiating peer's offer in the post-TLS-handshake
-          negotiation. Uniform across client-to-server and server-to-
-          server peering connections per ISC-S14 / A-S6. Never sent as
-          TLS 1.3 early data — 0-RTT is structurally excluded per
-          ISC-A-S9 (`max_early_data_size = 0` enforced at the rustls
-          ServerConfig layer).
-        fields:
-          - { name: versions, type: "repeated ProtocolVersion", tag: 1, note: "Versions the initiator can speak, preference order (highest first)." }
-          - { name: transport_capabilities, type: "repeated string", tag: 2, note: "MVP populates exactly ['tcp-tls13']. Closes finding F29 — QUIC-ready transport-pluggability seam without future protocol-version bump." }
-          - { name: server_source, type: "optional string", tag: 3, note: "AGPL §13 source-URL advertisement (finding F32). Set by a connection *initiator* — i.e. a server-to-server peering dialer. The client-facing case (a relay advertising to a connecting client) uses AppHelloAck.server_source instead, since a relay only ever sends the Ack (ISC-9, M6)." }
-        iscs: [S14, A-S9, C23]
-
-      - name: AppHelloAck
-        defined_in: "proto/daemonseed/v1/app_hello.proto"
-        added_in: "v0.5.0 (M4a); server_source field v0.8.0 (M6)"
-        purpose: >-
-          Responder's selection of one of the initiator's offered
-          versions. Out-of-set ACK is a protocol violation
-          (ISC-A-S9 server-side; ISC-C23 client verification).
-        fields:
-          - { name: version, type: ProtocolVersion, tag: 1, note: "Optional in wire encoding (proto3 message default); the responder always supplies it. Verified at the policy layer by `daemonseed_core::version::VersionNegotiator::verify_ack`." }
-          - { name: server_source, type: "optional string", tag: 2, note: "AGPL §13 source-URL the relay advertises to a connecting client (ISC-9 / finding F32). Additive MINOR field (ISC-S14) — old clients ignore it. The server populates it from config.server_source; unset means no URL declared (M7 ServerSourceUnverified trust event)." }
-        iscs: [S14, A-S9, C23, "9"]
-
-      - name: AppHelloReject
-        defined_in: "proto/daemonseed/v1/app_hello.proto"
-        added_in: "v0.5.0 (M4a)"
-        purpose: >-
-          Responder's refusal. Carries the responder's full supported-
-          version list so the initiator can surface an actionable
-          upgrade/downgrade message. Reject codes are int32 (not enum)
-          so future additive codes parse cleanly on older initiators.
-        fields:
-          - { name: code, type: int32, tag: 1, note: "1 = NO_COMMON_VERSION (M4a). New codes append additively per ISC-S14." }
-          - { name: server_supported, type: "repeated ProtocolVersion", tag: 2, note: "The responder's complete supported-version list." }
-        iscs: [S14, A-S9, C23]
-
-      - name: SuiteId
-        defined_in: "proto/daemonseed/v1/suite.proto"
-        added_in: "v0.4.0 (M3)"
-        purpose: >-
-          Wire-tagged identifier for one entry in the daemonseed
-          suite registry. Carried on every cryptographic artifact —
-          at-rest blob header (ISC-C3), recovery file header
-          (ISC-C32), CoT-asset payload (ISC-S4 / ISC-C8), identity-
-          proof signature (ISC-C1 / ISC-C22), and server-wide signed
-          material (ISC-S15). Resolves through
-          `daemonseed_core::crypto::suite::Registry` to a concrete
-          (AEAD, KEM, signature, hash, KDF, memory-hard) bundle.
-        fields:
-          - name: value
-            type: uint32
-            tag: 1
-            note: >-
-              Registry id. Receivers MUST validate
-              `0x0001 <= value <= 0xFFFE`; the reserved sentinels
-              `0x0000` and `0xFFFF` MUST be rejected at parse time.
-              proto3 uses uint32 because uint16 doesn't exist; the
-              app-layer SuiteId::try_new enforces the constraint.
-        iscs: [C24, S15]
-
-      - name: IdentityProof
-        defined_in: "proto/daemonseed/v1/identity_proof.proto"
-        added_in: "v0.6.0-pre (M4b commit 1)"
-        purpose: >-
-          Post-HELLO identity-proof envelope (ISC-S19). A peer's proof
-          that it controls the long-term ML-DSA-87 key behind its
-          claimed handle, bound to the current TLS session via the
-          channel-binding value. Closes the offline-key-theft replay
-          vector (a captured envelope fails in any other session) and
-          carries the freshness pair (timestamp + per-key counter) per
-          project_clocks_freshness. Verified uniformly client→server and
-          server→server. Companion enum: `Role`.
-        fields:
-          - { name: suite_id, type: SuiteId, tag: 1, note: "Signature-algorithm identifier (ISC-S15). NOT in the signed input — a flipped suite_id fails verification under the named algorithm. MVP default 1 (CNSA 2.0)." }
-          - { name: role, type: Role, tag: 2, note: "Bookkeeping only — NOT an authentication boundary (ISC-S19 / A-S8). Selects the receiver's policy table (rate-limit vs federation), never the trust decision." }
-          - { name: claimed_handle, type: string, tag: 3, note: "Wire handle. Receiver verifies the 12-hex hash component == SHA-384(claimed_pubkey)[:12] (ISC-A-S14 / A-C18), anchoring ISC-C4's self-verifying-handle property." }
-          - { name: claimed_pubkey, type: bytes, tag: 4, note: "Long-term ML-DSA-87 public key." }
-          - { name: signed_at_unix_ms, type: uint64, tag: 5, note: "OS wall-clock at construction (ms since epoch). Inside the signed input. Skew-window enforced by verifiers (see protocol rule)." }
-          - { name: counter, type: uint64, tag: 6, note: "Per-signing-key monotonic counter. Inside the signed input. Verifiers reject <= highest-seen per (signer-key, target-server); a gap is logged not rejected." }
-          - { name: signature, type: bytes, tag: 7, note: "ML-DSA-87 over channel_binding || claimed_handle || claimed_pubkey || negotiated_version || signed_at_unix_ms || counter. channel_binding + negotiated_version are recomputed locally, never on the wire." }
-        iscs: [S19, A-S1, A-S2, A-S14, A-C18, S15, C4, C22]
-
-      - name: Role
-        kind: enum
-        defined_in: "proto/daemonseed/v1/identity_proof.proto"
-        added_in: "v0.6.0-pre (M4b commit 1)"
-        purpose: >-
-          Which side built an IdentityProof. Bookkeeping for the
-          receiver's policy table only — NEVER an authentication
-          boundary (ISC-S19 role-uniformity / ISC-A-S8). A received
-          ROLE_UNSPECIFIED is malformed and fails verification.
-        values:
-          - { name: ROLE_UNSPECIFIED, number: 0, note: "proto3 zero default; malformed if received." }
-          - { name: ROLE_CLIENT, number: 1, note: "Initiating client (ISC-C4 handle)." }
-          - { name: ROLE_SERVER, number: 2, note: "Server, client-facing or S2S peering (ISC-S11 server-id)." }
-        iscs: [S19, A-S8]
-
-      # CircleMin (v0.4.0/M3) retired at M8 (F16, 2026-05-26): circles are flat
-      # and metadata-free, so there is no per-circle minimum-suite record. The
-      # suite floor lives in the server S16 deprecation policy + the client-local
-      # registry. The message was never sent on any wire path (circle creation
-      # had not shipped), so removal is wire-compatible; the name is retired and
-      # MUST NOT be reintroduced with different semantics.
-
-      - name: IntroducerQuery
-        defined_in: "proto/daemonseed/v1/federation.proto"
-        added_in: "v0.7.0 (M5)"
-        purpose: >-
-          A request for federation peers (ISC-S6). An empty target returns the
-          full introduce-to-clients-filtered peer list; a populated target asks
-          for one peer. Per ISC-A-S7 a by-id query for an unknown OR a
-          don't-introduce peer yields an empty response — the two are
-          indistinguishable on the wire.
-        fields:
-          - { name: target_server_id, type: "optional string", tag: 1, note: "Exact server-id to look up; unset/empty means the full filtered list." }
-        iscs: [S6, S13, A-S7]
-
-      - name: PeerTriple
-        defined_in: "proto/daemonseed/v1/federation.proto"
-        added_in: "v0.7.0 (M5)"
-        purpose: >-
-          One revealed federation peer. THE INVARIANT (ISC-S6): there is no
-          public-key field and there must never be one — discovery is decoupled
-          from trust, so a client/peer must still acquire the full key through
-          its own ISC-C22 trust mode (TOFU in trusted, out-of-band in
-          untrusted). This makes transitive-trust collapse impossible by
-          construction.
-        fields:
-          - { name: server_id, type: string, tag: 1, note: "Peer server-id `<name>#<12hex>`. The 12-hex suffix is a hash fingerprint, NOT the key." }
-          - { name: address, type: string, tag: 2, note: "Hostname OR raw IPv4/IPv6 literal (ISC-S6); non-default port appended `:port`, default 443 omitted." }
-          - { name: last_known_availability_unix_ms, type: "optional uint64", tag: 3, note: "Best-effort availability. Unset at MVP — the RAM-only producer is deferred (finding F15); kept in schema so populating it later is additive." }
-        iscs: [S6]
-
-      - name: IntroducerResponse
-        defined_in: "proto/daemonseed/v1/federation.proto"
-        added_in: "v0.7.0 (M5)"
-        purpose: >-
-          The introducer's reply: zero or more peer triples, never any keys.
-          Excludes every introduce-to-clients=false peer (ISC-S13). An empty
-          list is valid and is what a by-id query returns for an unknown or
-          don't-introduce peer (ISC-A-S7).
-        fields:
-          - { name: peers, type: "repeated PeerTriple", tag: 1, note: "Revealed peers, already filtered by introduce-to-clients." }
-        iscs: [S6, S13, A-S7]
-
-      # ── public-space service messages (M6, public_space.proto) ──
-      - name: SignedArtifact
-        defined_in: "proto/daemonseed/v1/public_space.proto"
-        added_in: "v0.8.0 (M6)"
-        purpose: >-
-          Detached ML-DSA-87 signature envelope for announcement posts (ISC-S7),
-          post-deletes, and the MOTD (ISC-S9). The signature covers
-          `signed_payload` verbatim and the content-address is
-          SHA-384(signed_payload). CONTRACT (decided 2026-05-25): the signer's
-          exact `signed_payload` bytes are authoritative — clients store and
-          forward them verbatim and MUST NOT re-encode. protobuf is not
-          canonical across implementations; re-encoding would break both the
-          signature and the content-address. `signer_pubkey` is the FULL key
-          even when the whitelist entry is a `<name>#<hash>` handle; the receiver
-          verifies the key against the handle hash-prefix before the signature.
-        fields:
-          - { name: signed_payload, type: bytes, tag: 1, note: "Canonical prost encoding of the inner *Payload. Authoritative bytes; never re-encoded downstream." }
-          - { name: signer_pubkey, type: bytes, tag: 2, note: "Full ML-DSA-87 public key; verified against whitelist + handle hash-prefix before signature check." }
-          - { name: signature, type: bytes, tag: 3, note: "ML-DSA-87 over signed_payload." }
-        iscs: [S7, S8, S9, A-S3]
-
-      - name: PostPayload
-        defined_in: "proto/daemonseed/v1/public_space.proto"
-        added_in: "v0.8.0 (M6)"
-        purpose: >-
-          Inner signed payload of an announcement post (ISC-S7). Encoded into a
-          SignedArtifact.signed_payload. Topic must be an existing operator-
-          defined topic; signers cannot create topics.
-        fields:
-          - { name: topic, type: string, tag: 1, note: "Operator-defined topic id. Topic set is operator-only server config." }
-          - { name: body, type: string, tag: 2, note: "Post content; rendering policy is a client concern." }
-          - { name: signed_timestamp_ms, type: int64, tag: 3, note: "Signer wall-clock ms; orders posts within a topic." }
-        iscs: [S7]
-
-      - name: PostDeletePayload
-        defined_in: "proto/daemonseed/v1/public_space.proto"
-        added_in: "v0.8.0 (M6)"
-        purpose: >-
-          Inner signed payload of a post deletion (ISC-S7). A signer may delete
-          only their own previously-signed post, matched by content-address.
-        fields:
-          - { name: content_address, type: bytes, tag: 1, note: "SHA-384(signed_payload) of the post being deleted." }
-          - { name: signed_timestamp_ms, type: int64, tag: 2, note: "Signer wall-clock ms (freshness; not for ordering)." }
-        iscs: [S7]
-
-      - name: Post
-        defined_in: "proto/daemonseed/v1/public_space.proto"
-        added_in: "v0.8.0 (M6)"
-        purpose: >-
-          A stored post as served to clients: the signer's artifact plus the
-          server-computed content-address. The client MUST re-derive
-          SHA-384(artifact.signed_payload) and reject mismatches — the server is
-          untrusted to assert the address (ISC-A-S3: verify-and-serve).
-        fields:
-          - { name: artifact, type: SignedArtifact, tag: 1, note: "Signer's signed PostPayload." }
-          - { name: content_address, type: bytes, tag: 2, note: "SHA-384(artifact.signed_payload). Server-asserted; client re-verifies." }
-        iscs: [S7, A-S3]
-
-      - name: MotdPayload
-        defined_in: "proto/daemonseed/v1/public_space.proto"
-        added_in: "v0.8.0 (M6)"
-        purpose: >-
-          Inner signed payload of the message-of-the-day (ISC-S9). Plaintext
-          only — the client renders `text` with no markdown/HTML/link parsing
-          (anti-injection). Single-slot: the latest validated MOTD wins.
-        fields:
-          - { name: text, type: string, tag: 1, note: "Plaintext MOTD. Client renders verbatim, no markup interpretation (anti-injection)." }
-          - { name: signed_timestamp_ms, type: int64, tag: 2, note: "Signer wall-clock ms; latest validated update wins." }
-        iscs: [S9]
-
-      - name: SignerWhitelistEntry
-        defined_in: "proto/daemonseed/v1/public_space.proto"
-        added_in: "v0.8.0 (M6)"
-        purpose: >-
-          One published signer-whitelist entry (ISC-S8). Published so clients can
-          independently verify provenance against the same list the server uses.
-          Either a full public key OR a `<name>#<hash-prefix>` handle.
-        fields:
-          - { name: full_pubkey, type: bytes, tag: 1, note: "oneof entry: full ML-DSA-87 public key." }
-          - { name: handle, type: string, tag: 2, note: "oneof entry: `<name>#<hash-prefix>` handle (ISC-C4/S11 hash semantics)." }
-        iscs: [S8]
-
-      - name: RatingTaxonomy
-        defined_in: "proto/daemonseed/v1/public_space.proto"
-        added_in: "v0.8.0 (M6)"
-        purpose: >-
-          Operator-defined content-rating labels (ISC-S10). Purely declarative:
-          the server publishes the taxonomy and propagates sharer-assigned tags
-          but never enforces or filters by rating (ISC-A-S5b).
-        fields:
-          - { name: labels, type: "repeated string", tag: 1, note: "Operator-chosen labels in operator-chosen order, e.g. ['PG13','R','X']." }
-        iscs: [S10, A-S5b]
-
-      - name: PublicShareListing
-        defined_in: "proto/daemonseed/v1/public_space.proto"
-        added_in: "v0.8.0 (M6)"
-        purpose: >-
-          A single public-space share in the listing (ISC-C19 / finding F25). The
-          rating tag is the sharer's self-classification (advisory, not server-
-          verified per ISC-A-S5b). M6 defines this surface; share content
-          transfer is M8.
-        fields:
-          - { name: share_id, type: string, tag: 1, note: "Opaque server-scoped share identifier." }
-          - { name: name, type: string, tag: 2, note: "Display name of the shared folder." }
-          - { name: rating, type: string, tag: 3, note: "Sharer-assigned label from the active taxonomy. Advisory only." }
-        iscs: [C19, A-S5b]
-
-      - name: CotFrame
-        defined_in: "proto/daemonseed/v1/cot.proto"
-        added_in: "v0.10.0 (M8)"
-        purpose: >-
-          One frame on a circle-of-trust live relay (F23). The relay routes by
-          asset_address and forwards payload verbatim — payload is opaque E2EE
-          ciphertext the relay can neither read nor produce (ISC-A-S2).
-        fields:
-          - { name: asset_address, type: bytes, tag: 1, note: "Rendezvous address SHA-384(cot_key, server_id) (ISC-8). Set on every frame; the relay binds a stream to the asset named by its first frame and rejects later frames naming a different asset." }
-          - { name: payload, type: bytes, tag: 2, note: "Opaque end-to-end-encrypted application bytes. Relay never decrypts or interprets." }
-        iscs: [S4, S20, A-S2, A-S5]
-
-      # Request/response wrappers for the PublicSpace service (M6,
-      # public_space.proto). Thin envelopes; see `services:` below for the RPC
-      # mapping. GetMotdRequest, GetTaxonomyRequest, GetSignerWhitelistRequest,
-      # ListPublicSharesRequest, DeletePostResponse are empty messages.
-      # GetMotdResponse{ motd: SignedArtifact }, ListPostsRequest{ topic:
-      # optional string }, ListPostsResponse{ posts: repeated Post },
-      # GetTaxonomyResponse{ taxonomy: RatingTaxonomy }, GetSignerWhitelist-
-      # Response{ entries: repeated SignerWhitelistEntry }, UploadPostRequest{
-      # artifact: SignedArtifact }, UploadPostResponse{ content_address: bytes },
-      # DeletePostRequest{ delete_artifact: SignedArtifact },
-      # ListPublicSharesResponse{ shares: repeated PublicShareListing }.
-
-# ─────────────────────────────────────────────────────────────────────
-# Services
-# ─────────────────────────────────────────────────────────────────────
-
-services:
-  - name: PublicSpace
-    defined_in: "proto/daemonseed/v1/public_space.proto"
-    added_in: "v0.8.0 (M6)"
-    transport: >-
-      gRPC-over-h2 over the post-Authenticated TLS stream. This is the FIRST
-      application-stream service in the protocol — everything up to and
-      including the identity-proof exchange runs as length-prefixed prost frames
-      on the raw TLS stream; once the connection reaches the `Authenticated`
-      type-state it is served here. Reference impl:
-      `daemonseed_server::public_space::serve_public_space`.
-    purpose: >-
-      Public-space reads (MOTD, posts, taxonomy, whitelist, share listing) and
-      signed writes (post upload/delete). All RPCs unary; the streaming CoT
-      subscription surface is a separate M8 service.
-    rpcs:
-      - { name: GetMotd, request: GetMotdRequest, response: GetMotdResponse, iscs: [S9], note: "Current signed MOTD or empty." }
-      - { name: ListPosts, request: ListPostsRequest, response: ListPostsResponse, iscs: [S7], note: "Posts ordered by signed-ts per topic; unset topic = all." }
-      - { name: GetTaxonomy, request: GetTaxonomyRequest, response: GetTaxonomyResponse, iscs: [S10], note: "Operator rating labels." }
-      - { name: GetSignerWhitelist, request: GetSignerWhitelistRequest, response: GetSignerWhitelistResponse, iscs: [S8], note: "Published whitelist for independent provenance verification." }
-      - { name: UploadPost, request: UploadPostRequest, response: UploadPostResponse, iscs: [S7, A-S3], note: "Verifies signature vs current whitelist; never originates content. Rejects via gRPC status on unknown signer / bad signature." }
-      - { name: DeletePost, request: DeletePostRequest, response: DeletePostResponse, iscs: [S7], note: "Signer deletes own post, matched by content-address." }
-      - { name: ListPublicShares, request: ListPublicSharesRequest, response: ListPublicSharesResponse, iscs: [C19, A-S5b], note: "Full listing with advisory rating tags; client filters locally (no server-side filter). Share content transfer is M8." }
-
-  - name: CircleOfTrust
-    defined_in: "proto/daemonseed/v1/cot.proto"
-    added_in: "v0.10.0 (M8)"
-    transport: >-
-      gRPC-over-h2 over the post-Authenticated TLS stream, alongside PublicSpace
-      on the same connection. The protocol's FIRST streaming RPC. Reference impl
-      lands in `daemonseed_server` (CoT service) wired into the same one-stream
-      tonic Server as PublicSpace, with h2 keepalive driving liveness reaping.
-    purpose: >-
-      Circle-of-trust live relay (F23). A member opens one bidirectional
-      Subscribe stream per circle-asset; the relay fans each inbound frame out
-      to every other current subscriber of the same asset. Refcounted, no
-      persistence (ISC-A-S5); blind forwarder (ISC-A-S2).
-    rpcs:
-      - { name: Subscribe, request: "stream CotFrame", response: "stream CotFrame", iscs: [S4, S20, A-S2, A-S5], note: "Bidirectional. First client frame names the asset_address; stream lifetime IS the member's presence — open takes a reference, close (or h2-keepalive death) releases it, asset reaped at refcount zero (ISC-S20)." }
-
-# ─────────────────────────────────────────────────────────────────────
-# Codegen pipeline
-# ─────────────────────────────────────────────────────────────────────
-
-codegen:
-  driver: "build.rs"
-  toolchain:
-    prost: "=0.13.4"
-    prost-types: "=0.13.4"
-    tonic-build: "=0.12.3 (default-features = false, features = ['prost'])"
-    tonic: "=0.12.3 (runtime dep, added v0.8.0/M6 — the first `service` block makes the generated client/server stubs reference `tonic::`; messages-only milestones did not need it)"
-  output: "OUT_DIR (regenerated on every cargo build)"
-  committed_snapshot:
-    path: "src/generated/"
-    purpose: "Inspection only — not compiled into the binary. Maintained by `cargo xtask gen-proto`; drift detected by `cargo xtask check-proto`."
-  why_two_outputs: >-
-    `build.rs` keeps the compiled binary in lock-step with the .proto
-    files (no stale generated source possible). The committed snapshot
-    is for human + AI review during PR diff, and for offline
-    inspection without cargo. The snapshot is enforced byte-identical
-    to fresh tonic-build output via the xtask gate.
-
-# ─────────────────────────────────────────────────────────────────────
-# Protocol-level rules atop the schema
-# ─────────────────────────────────────────────────────────────────────
-
-protocol_rules:
-  - name: "Application-protocol negotiation (APP_HELLO)"
-    status: "Schema active (M4a commit 1); runtime + type-state Connection land later in M4a"
-    summary: >-
-      After TLS handshake completes on :443 with ALPN `h2`, the
-      first application-layer message exchanged is APP_HELLO. Until
-      APP_HELLO_ACK is received, no other application traffic flows.
-      Type-state pattern (Connection<Negotiating → Versioned>)
-      enforces this at compile time in the reference Rust
-      implementation per ISC-C23.
+modules:
+  - name: app_hello
+    description: >-
+      APP_HELLO post-handshake negotiation. After the TLS 1.3 handshake
+      completes on :443 with ALPN h2, peers exchange one round of
+      AppHello / AppHelloAck (or AppHelloReject) before any application
+      data flows. Pins the wire-protocol version (MAJOR.MINOR) and
+      declares transport capabilities. Uniform across client-to-server
+      and server-to-server peering. Generated into daemonseed_proto::v1.
+    no_std: false
+    depends_on: []
     iscs: [S14, A-S9, C23]
 
-  - name: "Identity-proof + channel binding (M4b)"
-    status: "Schema active (M4b commit 1 — IdentityProof + Role); channel-binding, verification, type-state Authenticated, and orchestration land in M4b commits 2-7"
-    summary: >-
-      Identity-proof envelope binds to the TLS channel (RFC 8446 §7.5
-      exporter, label "daemonseed/identity-proof/v1", context = negotiated
-      APP_HELLO version) and includes a per-key monotonic counter for
-      replay protection plus a timestamp with a ±5-minute skew window
-      (Matrix-style, decided by caraka 2026-05-24; supersedes the
-      impl-plan's 120s and the memory's ±15min). Counter state lives in
-      the seeds blob.
-      Uniform non-informative close-shape for all auth failures (ISC-A-S12 /
-      A-C18). Signature input extends ISC-S19's literal concatenation to
-      cover signed_at_unix_ms + counter (freshness formalization, decision D3).
-    iscs: [S19, A-S1, A-S2, A-S14, A-C18]
+  - name: suite
+    description: >-
+      suite_id tagging. Every cryptographic artifact carries a SuiteId
+      identifying the algorithm bundle in use, resolved through the
+      in-repo registry. Generated into daemonseed_proto::v1.
+    no_std: false
+    depends_on: []
+    iscs: [C24, S15, A-C8]
 
-  - name: "Suite-id validation contract"
-    status: active
-    summary: >-
-      Every consumer of `daemonseed.v1::SuiteId.value` MUST route
-      through `daemonseed_core::crypto::suite::SuiteId::try_new`
-      to enforce the sentinel rejection. Bypassing the app-layer
-      constructor is a protocol violation.
+  - name: identity_proof
+    description: >-
+      Post-HELLO identity-proof envelope. A peer's proof that it
+      controls the long-term ML-DSA-87 key behind its claimed handle,
+      bound to the current TLS session via channel binding. Runs once,
+      immediately after APP_HELLO_ACK, uniformly client-to-server and
+      server-to-server. Generated into daemonseed_proto::v1.
+    no_std: false
+    depends_on: [suite]
+    iscs: [S19, A-S14, A-C18, S15]
+
+  - name: federation
+    description: >-
+      Federation introducer. A server may act as an introducer: on
+      request it returns the federation peers it knows about as
+      (server-id, address, last-known-availability) triples. The hard
+      invariant (ISC-S6): an introducer response NEVER carries a public
+      key. Generated into daemonseed_proto::v1.
+    no_std: false
+    depends_on: []
+    iscs: [S6, S12, S13, A-S7]
+
+  - name: public_space
+    description: >-
+      Public-space application service (M6). The first application-
+      stream service in the protocol: served over the post-Authenticated
+      TLS stream as gRPC-over-h2. Covers signed announcement posts,
+      MOTD, rating taxonomy, signer whitelist, public-share listing, and
+      the operator-signed suite-deprecation policy. Generated into
+      daemonseed_proto::v1.
+    no_std: false
+    depends_on: [suite]
+    iscs: [S4, S7, S8, S9, S10, S16, A-S3, A-S5b, C19, C25]
+
+  - name: cot
+    description: >-
+      Circle-of-trust live relay service (M8, F23). The protocol's first
+      streaming RPC, served as gRPC-over-h2 over the post-Authenticated
+      TLS stream. The relay routes opaque ciphertext frames by rendezvous
+      address and forwards them verbatim; it never decrypts. Generated
+      into daemonseed_proto::v1.
+    no_std: false
+    depends_on: []
+    iscs: [S4, S20, A-S2, A-S5]
+
+# ─────────────────────────────────────────────────────────────────────
+# Types — protobuf messages and enums (all in package daemonseed.v1)
+# ─────────────────────────────────────────────────────────────────────
+
+types:
+
+  # ── app_hello.proto ────────────────────────────────────────────────
+
+  - name: ProtocolVersion
+    module: app_hello
+    kind: message
+    description: >-
+      SemVer MAJOR.MINOR wire shape. PATCH is deliberately absent per
+      ISC-S14 — a release-artifact concern, not a wire-surface concern.
+      Two implementations sharing MAJOR.MINOR are wire-compatible
+      regardless of PATCH.
+    iscs: [S14, A-S9, C23]
+    fields:
+      - name: major
+        type: uint32
+        tag: 1
+        description: SemVer MAJOR. Breaking-change bumps only.
+      - name: minor
+        type: uint32
+        tag: 2
+        description: SemVer MINOR. Additive-only bumps per ISC-S14.
+
+  - name: AppHello
+    module: app_hello
+    kind: message
+    description: >-
+      Initiating peer's offer in the post-TLS-handshake negotiation.
+      Sent first on every connection (client-to-server and server-to-
+      server), uniform per ISC-S14 / A-S6. Never sent as TLS 1.3 early
+      data — 0-RTT is structurally excluded per ISC-A-S9.
+    iscs: [S14, A-S9, C23]
+    fields:
+      - name: versions
+        type: "repeated ProtocolVersion"
+        tag: 1
+        description: >-
+          Versions the initiator can speak, preference order (highest
+          first). The responder picks the highest mutual entry.
+      - name: transport_capabilities
+        type: "repeated string"
+        tag: 2
+        description: >-
+          Transports the initiator can speak. MVP populates exactly
+          ['tcp-tls13']. Closes finding F29 — a QUIC-ready transport-
+          pluggability seam without a future protocol-version bump.
+      - name: server_source
+        type: "optional string"
+        tag: 3
+        description: >-
+          AGPL section 13 source-URL advertisement (finding F32). Set by
+          a connection initiator (a server-to-server peering dialer). The
+          client-facing case uses AppHelloAck.server_source instead,
+          since a relay only ever sends the Ack (ISC-9, M6).
+
+  - name: AppHelloAck
+    module: app_hello
+    kind: message
+    description: >-
+      Responder's selection of one of the initiator's offered versions.
+      An out-of-set ACK is a protocol violation (ISC-A-S9 server-side;
+      ISC-C23 client verification).
+    iscs: [S14, A-S9, C23, "9"]
+    fields:
+      - name: version
+        type: ProtocolVersion
+        tag: 1
+        description: >-
+          The single negotiated version, drawn from the initiator's
+          offer. Optional in wire encoding (proto3 nested-message
+          default); the responder always supplies it. Verified at the
+          policy layer by
+          daemonseed_core::version::VersionNegotiator::verify_ack.
+      - name: server_source
+        type: "optional string"
+        tag: 2
+        description: >-
+          AGPL section 13 source-URL the relay advertises to a connecting
+          client (ISC-9 / finding F32). Additive MINOR field (ISC-S14) —
+          old clients ignore it. Unset means no URL declared (M7
+          ServerSourceUnverified trust event).
+
+  - name: AppHelloReject
+    module: app_hello
+    kind: message
+    description: >-
+      Responder's refusal. Carries the responder's full supported-version
+      list so the initiator can surface an actionable upgrade/downgrade
+      message. Reject codes are int32 (not enum) so future additive codes
+      parse cleanly on older initiators.
+    iscs: [S14, A-S9, C23]
+    fields:
+      - name: code
+        type: int32
+        tag: 1
+        description: >-
+          Reject code. 1 = NO_COMMON_VERSION (M4a). New codes append
+          additively per ISC-S14.
+      - name: server_supported
+        type: "repeated ProtocolVersion"
+        tag: 2
+        description: The responder's complete supported-version list.
+
+  # ── suite.proto ────────────────────────────────────────────────────
+
+  - name: SuiteId
+    module: suite
+    kind: message
+    description: >-
+      Wire-tagged identifier for one entry in the daemonseed suite
+      registry. Carried on every cryptographic artifact — at-rest blob
+      header (ISC-C3), recovery file header (ISC-C32), CoT-asset payload
+      (ISC-S4 / ISC-C8), identity-proof signature (ISC-C1 / ISC-C22), and
+      server-wide signed material (ISC-S15). Resolves through
+      daemonseed_core::crypto::suite::Registry to a concrete (AEAD, KEM,
+      signature, hash, KDF, memory-hard) bundle.
     iscs: [C24, S15]
+    fields:
+      - name: value
+        type: uint32
+        tag: 1
+        description: >-
+          Registry id. Receivers MUST validate 0x0001 <= value <= 0xFFFE;
+          the reserved sentinels 0x0000 and 0xFFFF MUST be rejected at
+          parse time. proto3 uses uint32 because uint16 does not exist;
+          the app-layer SuiteId::try_new enforces the constraint.
 
-  - name: "Application-stream layer (PublicSpace, M6)"
-    status: "Schema active (v0.8.0 / M6 commit 1); server handoff via daemonseed_server::public_space::serve_public_space"
-    summary: >-
-      The post-Authenticated application stream is gRPC-over-h2 served by the
-      PublicSpace service (and, later, an M8 CoT service). The reference server
-      hands the single already-Authenticated TLS connection to a tonic Server
-      via `serve_with_incoming` over a one-element stream; the connection IO
-      gets tonic's `Connected` via a local newtype with `ConnectInfo = ()`
-      (peer identity already established by the identity-proof phase). Reaching
-      this layer without a verified peer is a compile error upstream (ISC-C23
-      type-state).
-    iscs: [S4, C23]
+  # ── identity_proof.proto ───────────────────────────────────────────
 
-  - name: "Signed-artifact content-address contract"
-    status: "active (decided 2026-05-25)"
-    summary: >-
-      Posts (ISC-S7) and the MOTD (ISC-S9) are signed via SignedArtifact, where
-      the ML-DSA-87 signature and the SHA-384 content-address both cover
-      `signed_payload` VERBATIM. protobuf is not canonical across
-      implementations, so the signer's exact serialized bytes are the
-      authoritative artifact: clients and servers store and forward
-      `signed_payload` byte-for-byte and MUST NOT re-encode the inner *Payload.
-      Re-encoding would change the content-address and invalidate the signature.
-    iscs: [S7, S9, A-S3]
+  - name: Role
+    module: identity_proof
+    kind: enum
+    description: >-
+      Which side of the connection built an IdentityProof. Bookkeeping
+      for the receiver's policy table only — NEVER an authentication
+      boundary (ISC-S19 role-uniformity / ISC-A-S8). A received
+      ROLE_UNSPECIFIED is malformed and fails verification.
+    iscs: [S19, A-S8]
+    variants:
+      - name: ROLE_UNSPECIFIED
+        number: 0
+        description: proto3 zero default; malformed if received.
+      - name: ROLE_CLIENT
+        number: 1
+        description: The initiating client (ISC-C4 handle).
+      - name: ROLE_SERVER
+        number: 2
+        description: >-
+          A server, client-facing or server-to-server peering (ISC-S11
+          server-id).
+
+  - name: IdentityProof
+    module: identity_proof
+    kind: message
+    description: >-
+      Post-HELLO identity-proof envelope (ISC-S19). A peer's proof that
+      it controls the long-term ML-DSA-87 key behind its claimed handle,
+      bound to the current TLS session via the channel-binding value.
+      Closes the offline-key-theft replay vector (a captured envelope
+      fails in any other session) and carries the freshness pair
+      (timestamp + per-key counter). Verified uniformly client-to-server
+      and server-to-server.
+    iscs: [S19, A-S1, A-S2, A-S14, A-C18, S15, C4, C22]
+    fields:
+      - name: suite_id
+        type: SuiteId
+        tag: 1
+        description: >-
+          Signature-algorithm identifier (ISC-S15). NOT in the signed
+          input — a flipped suite_id fails verification under the named
+          algorithm. MVP default 1 (CNSA 2.0). An unsupported suite_id
+          closes the connection (ISC-C28).
+      - name: role
+        type: Role
+        tag: 2
+        description: >-
+          Bookkeeping only — NOT an authentication boundary (ISC-S19 /
+          A-S8). Selects the receiver's policy table (rate-limit vs
+          federation), never the trust decision.
+      - name: claimed_handle
+        type: string
+        tag: 3
+        description: >-
+          Wire handle <name>#<12hex>. Receiver verifies the 12-hex hash
+          component equals SHA-384(claimed_pubkey)[:12] (ISC-A-S14 /
+          A-C18), anchoring ISC-C4's self-verifying-handle property.
+      - name: claimed_pubkey
+        type: bytes
+        tag: 4
+        description: The peer's long-term ML-DSA-87 public key.
+      - name: signed_at_unix_ms
+        type: uint64
+        tag: 5
+        description: >-
+          OS wall-clock at construction (ms since epoch). Inside the
+          signed input. Skew-window enforced by verifiers; outside-window
+          envelopes fail closed.
+      - name: counter
+        type: uint64
+        tag: 6
+        description: >-
+          Per-signing-key monotonic counter. Inside the signed input.
+          Verifiers reject any value <= highest-seen per (signer-key,
+          target-server); a gap is logged, not rejected.
+      - name: signature
+        type: bytes
+        tag: 7
+        description: >-
+          ML-DSA-87 over channel_binding || claimed_handle ||
+          claimed_pubkey || negotiated_version || signed_at_unix_ms ||
+          counter. channel_binding and negotiated_version are recomputed
+          locally, never carried on the wire.
+
+  # ── federation.proto ───────────────────────────────────────────────
+
+  - name: IntroducerQuery
+    module: federation
+    kind: message
+    description: >-
+      A request for federation peers (ISC-S6). An empty target returns
+      the full introduce-to-clients-filtered peer list; a populated
+      target asks for one peer. Per ISC-A-S7 a by-id query for an unknown
+      OR a don't-introduce peer yields an empty response — the two are
+      indistinguishable on the wire.
+    iscs: [S6, S13, A-S7]
+    fields:
+      - name: target_server_id
+        type: "optional string"
+        tag: 1
+        description: >-
+          Exact server-id <name>#<12hex> to look up; unset/empty means
+          the full filtered list.
+
+  - name: PeerTriple
+    module: federation
+    kind: message
+    description: >-
+      One revealed federation peer. THE INVARIANT (ISC-S6): there is no
+      public-key field and there must never be one — discovery is
+      decoupled from trust, so a client/peer must still acquire the full
+      key through its own ISC-C22 trust mode (TOFU in trusted, out-of-band
+      in untrusted). This makes transitive-trust collapse impossible by
+      construction.
+    iscs: [S6]
+    fields:
+      - name: server_id
+        type: string
+        tag: 1
+        description: >-
+          Peer server-id <name>#<12hex>. The 12-hex suffix is a hash
+          fingerprint, NOT the key.
+      - name: address
+        type: string
+        tag: 2
+        description: >-
+          Hostname OR raw IPv4/IPv6 literal (ISC-S6); a non-default port
+          is appended :port, the default 443 is omitted.
+      - name: last_known_availability_unix_ms
+        type: "optional uint64"
+        tag: 3
+        description: >-
+          Best-effort availability. Unset at MVP — the RAM-only producer
+          is deferred (finding F15); kept in schema so populating it later
+          is additive.
+
+  - name: IntroducerResponse
+    module: federation
+    kind: message
+    description: >-
+      The introducer's reply: zero or more peer triples, never any keys.
+      Excludes every introduce-to-clients=false peer (ISC-S13). An empty
+      list is valid and is what a by-id query returns for an unknown or
+      don't-introduce peer (ISC-A-S7).
+    iscs: [S6, S13, A-S7]
+    fields:
+      - name: peers
+        type: "repeated PeerTriple"
+        tag: 1
+        description: >-
+          Revealed peers, already filtered by introduce-to-clients.
+
+  # ── public_space.proto: signed-artifact + payloads ─────────────────
+
+  - name: SignedArtifact
+    module: public_space
+    kind: message
+    description: >-
+      Detached ML-DSA-87 signature envelope for announcement posts
+      (ISC-S7), post-deletes, the MOTD (ISC-S9), and the suite-deprecation
+      policy (ISC-S16). The signature covers signed_payload verbatim and
+      the content-address is SHA-384(signed_payload). CONTRACT (decided
+      2026-05-25): the signer's exact signed_payload bytes are
+      authoritative — clients store and forward them verbatim and MUST NOT
+      re-encode. protobuf is not canonical across implementations;
+      re-encoding would break both the signature and the content-address.
+      signer_pubkey is the FULL key even when the whitelist entry is a
+      <name>#<hash> handle; the receiver verifies the key against the
+      handle hash-prefix before the signature.
+    iscs: [S7, S8, S9, S16, A-S3]
+    fields:
+      - name: signed_payload
+        type: bytes
+        tag: 1
+        description: >-
+          Canonical prost encoding of the inner Payload (PostPayload,
+          PostDeletePayload, MotdPayload, or DeprecationPolicyPayload).
+          Authoritative bytes; never re-encoded downstream.
+      - name: signer_pubkey
+        type: bytes
+        tag: 2
+        description: >-
+          Full ML-DSA-87 public key; verified against whitelist + handle
+          hash-prefix before signature check.
+      - name: signature
+        type: bytes
+        tag: 3
+        description: ML-DSA-87 signature over signed_payload.
+
+  - name: PostPayload
+    module: public_space
+    kind: message
+    description: >-
+      Inner signed payload of an announcement post (ISC-S7). Encoded into
+      a SignedArtifact.signed_payload. Topic must be an existing operator-
+      defined topic; signers cannot create topics.
+    iscs: [S7]
+    fields:
+      - name: topic
+        type: string
+        tag: 1
+        description: >-
+          Operator-defined topic id. The topic set is operator-only server
+          config.
+      - name: body
+        type: string
+        tag: 2
+        description: Post content; rendering policy is a client concern.
+      - name: signed_timestamp_ms
+        type: int64
+        tag: 3
+        description: Signer wall-clock ms; orders posts within a topic.
+
+  - name: PostDeletePayload
+    module: public_space
+    kind: message
+    description: >-
+      Inner signed payload of a post deletion (ISC-S7). A signer may
+      delete only their own previously-signed post, matched by
+      content-address.
+    iscs: [S7]
+    fields:
+      - name: content_address
+        type: bytes
+        tag: 1
+        description: SHA-384(signed_payload) of the post being deleted.
+      - name: signed_timestamp_ms
+        type: int64
+        tag: 2
+        description: Signer wall-clock ms (freshness; not for ordering).
+
+  - name: Post
+    module: public_space
+    kind: message
+    description: >-
+      A stored post as served to clients: the signer's artifact plus the
+      server-computed content-address. The client MUST re-derive
+      SHA-384(artifact.signed_payload) and reject mismatches — the server
+      is untrusted to assert the address (ISC-A-S3: verify-and-serve).
+    iscs: [S7, A-S3]
+    fields:
+      - name: artifact
+        type: SignedArtifact
+        tag: 1
+        description: The signer's signed PostPayload.
+      - name: content_address
+        type: bytes
+        tag: 2
+        description: >-
+          SHA-384(artifact.signed_payload). Server-asserted; client
+          re-verifies.
+
+  - name: MotdPayload
+    module: public_space
+    kind: message
+    description: >-
+      Inner signed payload of the message-of-the-day (ISC-S9). Plaintext
+      only — the client renders text with no markdown/HTML/link parsing
+      (anti-injection). Single-slot: the latest validated MOTD wins.
+    iscs: [S9]
+    fields:
+      - name: text
+        type: string
+        tag: 1
+        description: >-
+          Plaintext MOTD. Client renders verbatim, no markup
+          interpretation (anti-injection).
+      - name: signed_timestamp_ms
+        type: int64
+        tag: 2
+        description: Signer wall-clock ms; latest validated update wins.
+
+  - name: SuiteDeprecationEntry
+    module: public_space
+    kind: message
+    description: >-
+      One operator-configured suite-deprecation cutoff (ISC-S16 / A-S11 /
+      C25, M7). The operator declares that suite_id is being retired:
+      peers may keep signing under it until cutoff_unix_ms, after which
+      the server refuses identity-proofs signed under it.
+      recommended_suite_id is the successor the operator points migrating
+      peers at.
+    iscs: [S16, A-S11, C25]
+    fields:
+      - name: suite_id
+        type: uint32
+        tag: 1
+        description: >-
+          Deprecated suite (u16 SuiteId range; the registry rejects the
+          reserved sentinels 0x0000 / 0xFFFF at parse time).
+      - name: cutoff_unix_ms
+        type: int64
+        tag: 2
+        description: >-
+          UTC cutoff in wall-clock ms. At or after this instant the server
+          refuses identity-proofs under suite_id.
+      - name: recommended_suite_id
+        type: uint32
+        tag: 3
+        description: >-
+          Operator-recommended successor suite. Surfaced verbatim in the
+          client's migration prompt (ISC-C25). u16 SuiteId range.
+
+  - name: DeprecationPolicyPayload
+    module: public_space
+    kind: message
+    description: >-
+      Inner signed payload of the suite-deprecation policy (ISC-S16).
+      Encoded into a SignedArtifact.signed_payload, signed under the
+      server-wide key (ISC-A-S11). policy_version is monotonic: the server
+      never serves a version below one it already served (rollback
+      protection), and clients reject a version below their cached value.
+      Changing any cutoff requires re-signing with an incremented version.
+    iscs: [S16, A-S11, C25]
+    fields:
+      - name: policy_version
+        type: uint64
+        tag: 1
+        description: >-
+          Monotonic policy version. Replay / rollback anchor (ISC-A-S11 /
+          ISC-C25).
+      - name: entries
+        type: "repeated SuiteDeprecationEntry"
+        tag: 2
+        description: >-
+          The operator's per-suite cutoffs. An empty list is a valid
+          signed policy meaning no suites currently deprecated.
+      - name: signed_timestamp_ms
+        type: int64
+        tag: 3
+        description: >-
+          Signer wall-clock ms at signing time (freshness). Not the
+          rollback anchor — policy_version is.
+
+  - name: SignerWhitelistEntry
+    module: public_space
+    kind: message
+    description: >-
+      One published signer-whitelist entry (ISC-S8). Published so clients
+      can independently verify provenance against the same list the server
+      uses. A oneof of either a full public key OR a <name>#<hash-prefix>
+      handle.
+    iscs: [S8]
+    fields:
+      - name: full_pubkey
+        type: bytes
+        tag: 1
+        description: "oneof entry option: full ML-DSA-87 public key."
+      - name: handle
+        type: string
+        tag: 2
+        description: >-
+          oneof entry option: <name>#<hash-prefix> handle (ISC-C4/S11 hash
+          semantics).
+
+  - name: RatingTaxonomy
+    module: public_space
+    kind: message
+    description: >-
+      Operator-defined content-rating labels (ISC-S10). Purely
+      declarative: the server publishes the taxonomy and propagates
+      sharer-assigned tags but never enforces or filters by rating
+      (ISC-A-S5b).
+    iscs: [S10, A-S5b]
+    fields:
+      - name: labels
+        type: "repeated string"
+        tag: 1
+        description: >-
+          Operator-chosen labels in operator-chosen order, e.g.
+          ['PG13','R','X'].
+
+  - name: PublicShareListing
+    module: public_space
+    kind: message
+    description: >-
+      A single public-space share in the listing (ISC-C19 / finding F25).
+      The rating tag is the sharer's self-classification (advisory, not
+      server-verified per ISC-A-S5b). M6 defines this surface; share
+      content transfer is M8.
+    iscs: [C19, A-S5b]
+    fields:
+      - name: share_id
+        type: string
+        tag: 1
+        description: Opaque server-scoped share identifier.
+      - name: name
+        type: string
+        tag: 2
+        description: Display name of the shared folder.
+      - name: rating
+        type: string
+        tag: 3
+        description: >-
+          Sharer-assigned label from the active taxonomy. Advisory only.
+
+  # ── public_space.proto: RPC request/response wrappers ──────────────
+
+  - name: GetMotdRequest
+    module: public_space
+    kind: message
+    description: Empty request for the current MOTD (ISC-S9).
+    iscs: [S9]
+    fields: []
+
+  - name: GetMotdResponse
+    module: public_space
+    kind: message
+    description: >-
+      The current signed MOTD, or absent (proto3 message nullability) when
+      no MOTD is set (ISC-S9: hide the MOTD area).
+    iscs: [S9]
+    fields:
+      - name: motd
+        type: SignedArtifact
+        tag: 1
+        description: The current signed MOTD; absent when none is set.
+
+  - name: ListPostsRequest
+    module: public_space
+    kind: message
+    description: >-
+      Request to list announcement posts, with an optional topic filter
+      (ISC-S7).
+    iscs: [S7]
+    fields:
+      - name: topic
+        type: "optional string"
+        tag: 1
+        description: Optional topic filter. Unset = all topics.
+
+  - name: ListPostsResponse
+    module: public_space
+    kind: message
+    description: >-
+      Posts ordered by signed_timestamp_ms within each topic (ISC-S7).
+    iscs: [S7]
+    fields:
+      - name: posts
+        type: "repeated Post"
+        tag: 1
+        description: Posts ordered by signed timestamp within each topic.
+
+  - name: GetTaxonomyRequest
+    module: public_space
+    kind: message
+    description: Empty request for the operator rating taxonomy (ISC-S10).
+    iscs: [S10]
+    fields: []
+
+  - name: GetTaxonomyResponse
+    module: public_space
+    kind: message
+    description: The operator-defined rating taxonomy (ISC-S10).
+    iscs: [S10]
+    fields:
+      - name: taxonomy
+        type: RatingTaxonomy
+        tag: 1
+        description: The operator-defined rating taxonomy.
+
+  - name: GetSignerWhitelistRequest
+    module: public_space
+    kind: message
+    description: Empty request for the published signer whitelist (ISC-S8).
+    iscs: [S8]
+    fields: []
+
+  - name: GetSignerWhitelistResponse
+    module: public_space
+    kind: message
+    description: >-
+      The published signer whitelist for independent provenance
+      verification (ISC-S8).
+    iscs: [S8]
+    fields:
+      - name: entries
+        type: "repeated SignerWhitelistEntry"
+        tag: 1
+        description: The published whitelist entries.
+
+  - name: UploadPostRequest
+    module: public_space
+    kind: message
+    description: A signed announcement-post upload (ISC-S7).
+    iscs: [S7]
+    fields:
+      - name: artifact
+        type: SignedArtifact
+        tag: 1
+        description: Signed PostPayload (signature in the envelope).
+
+  - name: UploadPostResponse
+    module: public_space
+    kind: message
+    description: >-
+      The content-address under which the server stored the post (ISC-S7).
+    iscs: [S7]
+    fields:
+      - name: content_address
+        type: bytes
+        tag: 1
+        description: >-
+          SHA-384(artifact.signed_payload) under which the server stored
+          the post.
+
+  - name: DeletePostRequest
+    module: public_space
+    kind: message
+    description: A signed post-deletion request (ISC-S7).
+    iscs: [S7]
+    fields:
+      - name: delete_artifact
+        type: SignedArtifact
+        tag: 1
+        description: Signed PostDeletePayload (signature in the envelope).
+
+  - name: DeletePostResponse
+    module: public_space
+    kind: message
+    description: Empty response confirming a post deletion (ISC-S7).
+    iscs: [S7]
+    fields: []
+
+  - name: ListPublicSharesRequest
+    module: public_space
+    kind: message
+    description: Empty request for the public-share listing (ISC-C19).
+    iscs: [C19]
+    fields: []
+
+  - name: ListPublicSharesResponse
+    module: public_space
+    kind: message
+    description: >-
+      The full public-share listing with advisory rating tags; the client
+      filters locally, no server-side filter (ISC-C19 / A-S5b).
+    iscs: [C19, A-S5b]
+    fields:
+      - name: shares
+        type: "repeated PublicShareListing"
+        tag: 1
+        description: The full listing of public-space shares.
+
+  - name: GetDeprecationPolicyRequest
+    module: public_space
+    kind: message
+    description: >-
+      Empty request for the operator's signed suite-deprecation policy
+      (ISC-S16 / C25, M7).
+    iscs: [S16, C25]
+    fields: []
+
+  - name: GetDeprecationPolicyResponse
+    module: public_space
+    kind: message
+    description: >-
+      The current signed deprecation policy (signed_payload =
+      DeprecationPolicyPayload, signed under the server-wide key), or
+      absent when the operator has configured no policy (ISC-S16 / C25).
+    iscs: [S16, C25, A-S11]
+    fields:
+      - name: policy
+        type: SignedArtifact
+        tag: 1
+        description: >-
+          The current signed deprecation policy; absent when none is
+          configured.
+
+  # ── cot.proto ──────────────────────────────────────────────────────
+
+  - name: CotFrame
+    module: cot
+    kind: message
+    description: >-
+      One frame on a circle-of-trust live relay (F23). The relay routes by
+      asset_address and forwards payload verbatim — payload is opaque
+      E2EE ciphertext the relay can neither read nor produce (ISC-A-S2).
+    iscs: [S4, S20, A-S2, A-S5]
+    fields:
+      - name: asset_address
+        type: bytes
+        tag: 1
+        description: >-
+          Rendezvous address SHA-384(cot_key, server_id) (ISC-8). Set on
+          every frame; the relay binds a stream to the asset named by its
+          first frame and rejects later frames naming a different asset.
+      - name: payload
+        type: bytes
+        tag: 2
+        description: >-
+          Opaque end-to-end-encrypted application bytes. The relay never
+          decrypts or interprets them.
 
 # ─────────────────────────────────────────────────────────────────────
-# Future packages (not yet defined)
+# Functions — gRPC service RPC methods, served over the post-Authenticated
+# TLS stream as gRPC-over-h2. Everything up to and including the identity-
+# proof exchange runs as length-prefixed prost frames on the raw TLS
+# stream; once the connection reaches the Authenticated type-state these
+# RPCs are served (ISC-C23 enforces this at compile time).
 # ─────────────────────────────────────────────────────────────────────
 
-planned:
-  - "CoTAssetPayload (M8 — server-opaque circle-of-trust asset relay)"
-  - "Mention (M9 — @mention with no server-visible distinction per ISC-C17/A-C4)"
-  - "SuiteDeprecationPolicy (M7 — operator-signed cutoff dates per ISC-S16)"
-  - "UpdateManifest / CriticalUpdate (M10 — signed release distribution per ISC-C27 / S18)"
+functions:
+
+  # ── service PublicSpace (public_space.proto, M6) ───────────────────
+
+  - name: PublicSpace.GetMotd
+    module: public_space
+    description: Fetch the current signed MOTD, or empty if none is set.
+    signature: "rpc GetMotd(GetMotdRequest) returns (GetMotdResponse)"
+    iscs: [S9]
+    parameters:
+      - name: request
+        type: GetMotdRequest
+        description: Empty request.
+    returns:
+      type: GetMotdResponse
+      description: The current signed MOTD or an empty response.
+
+  - name: PublicSpace.ListPosts
+    module: public_space
+    description: >-
+      List announcement posts, ordered by signed timestamp within each
+      topic. An unset topic filter returns posts across all topics.
+    signature: "rpc ListPosts(ListPostsRequest) returns (ListPostsResponse)"
+    iscs: [S7]
+    parameters:
+      - name: request
+        type: ListPostsRequest
+        description: Optional topic filter; unset = all topics.
+    returns:
+      type: ListPostsResponse
+      description: Posts ordered by signed timestamp per topic.
+
+  - name: PublicSpace.GetTaxonomy
+    module: public_space
+    description: Fetch the operator-defined rating taxonomy.
+    signature: "rpc GetTaxonomy(GetTaxonomyRequest) returns (GetTaxonomyResponse)"
+    iscs: [S10]
+    parameters:
+      - name: request
+        type: GetTaxonomyRequest
+        description: Empty request.
+    returns:
+      type: GetTaxonomyResponse
+      description: The operator rating labels.
+
+  - name: PublicSpace.GetSignerWhitelist
+    module: public_space
+    description: >-
+      Fetch the published signer whitelist so the client can independently
+      verify post/MOTD provenance.
+    signature: "rpc GetSignerWhitelist(GetSignerWhitelistRequest) returns (GetSignerWhitelistResponse)"
+    iscs: [S8]
+    parameters:
+      - name: request
+        type: GetSignerWhitelistRequest
+        description: Empty request.
+    returns:
+      type: GetSignerWhitelistResponse
+      description: The published whitelist for independent verification.
+
+  - name: PublicSpace.UploadPost
+    module: public_space
+    description: >-
+      Upload a signed announcement post. The server verifies the signature
+      against the current whitelist and stores the post; it never
+      originates or mutates post content (ISC-A-S3).
+    signature: "rpc UploadPost(UploadPostRequest) returns (UploadPostResponse)"
+    iscs: [S7, A-S3]
+    parameters:
+      - name: request
+        type: UploadPostRequest
+        description: Signed PostPayload artifact.
+    returns:
+      type: UploadPostResponse
+      description: >-
+        The content-address under which the post was stored. Rejects via
+        gRPC status on an unknown signer or bad signature.
+    preconditions:
+      - description: >-
+          The signer's public key must be on the current published
+          whitelist (ISC-S8) and the signature must verify over
+          signed_payload.
+
+  - name: PublicSpace.DeletePost
+    module: public_space
+    description: >-
+      Delete a post the caller previously signed, matched by
+      content-address. Verified against the current whitelist.
+    signature: "rpc DeletePost(DeletePostRequest) returns (DeletePostResponse)"
+    iscs: [S7]
+    parameters:
+      - name: request
+        type: DeletePostRequest
+        description: Signed PostDeletePayload artifact.
+    returns:
+      type: DeletePostResponse
+      description: Empty response on a successful delete.
+
+  - name: PublicSpace.ListPublicShares
+    module: public_space
+    description: >-
+      List public-space shares with their advisory rating tags. The server
+      returns the complete listing; the client filters by rating locally
+      (no server-side filter). Share content transfer is M8.
+    signature: "rpc ListPublicShares(ListPublicSharesRequest) returns (ListPublicSharesResponse)"
+    iscs: [C19, A-S5b]
+    parameters:
+      - name: request
+        type: ListPublicSharesRequest
+        description: Empty request.
+    returns:
+      type: ListPublicSharesResponse
+      description: The full listing with advisory rating tags.
+
+  - name: PublicSpace.GetDeprecationPolicy
+    module: public_space
+    description: >-
+      Fetch the operator's signed suite-deprecation policy, or empty if
+      none is configured (M7). The server returns the same signed artifact
+      to every fetcher (ISC-A-S11); the client verifies the signature
+      against the server-wide key and replay-protects on policy_version.
+    signature: "rpc GetDeprecationPolicy(GetDeprecationPolicyRequest) returns (GetDeprecationPolicyResponse)"
+    iscs: [S16, C25, A-S11]
+    parameters:
+      - name: request
+        type: GetDeprecationPolicyRequest
+        description: Empty request.
+    returns:
+      type: GetDeprecationPolicyResponse
+      description: The current signed deprecation policy or an empty response.
+
+  # ── service CircleOfTrust (cot.proto, M8) ──────────────────────────
+
+  - name: CircleOfTrust.Subscribe
+    module: cot
+    description: >-
+      Join a circle-asset's live relay. The protocol's first streaming
+      RPC: bidirectional. The client's first frame names the asset_address
+      it is subscribing to; the relay fans each inbound frame out to every
+      other current subscriber of the same asset. The stream lifetime IS
+      the member's presence — open takes a reference, close (or
+      h2-keepalive death) releases it, the asset is reaped at refcount
+      zero (ISC-S20). The relay is a blind forwarder (ISC-A-S2).
+    signature: "rpc Subscribe(stream CotFrame) returns (stream CotFrame)"
+    iscs: [S4, S20, A-S2, A-S5]
+    parameters:
+      - name: request
+        type: "stream CotFrame"
+        description: >-
+          Inbound frame stream. The first frame names the asset_address;
+          later frames naming a different asset are rejected.
+    returns:
+      type: "stream CotFrame"
+      description: >-
+        Outbound frame stream carrying frames from co-subscribers of the
+        same asset.

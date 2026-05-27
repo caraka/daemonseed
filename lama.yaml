@@ -10,9 +10,9 @@
 
 lama: "0.1"
 
-project:
+library:
   name: daemonseed
-  version: "0.12.0-pre"
+  version: "0.12.1-pre"
   description: >-
     Federated end-to-end-encrypted communication and file-sharing
     protocol. Pure-Rust backend, CNSA 2.0 baseline crypto via the
@@ -20,23 +20,27 @@ project:
     AGPL-3.0 code with Apache-2.0/MIT dual-licensed schema. Designed
     against the GFW-survivable bar per Wu et al., USENIX Security 2023.
   repository: "https://github.com/caraka/daemonseed"
-  license:
-    code: "AGPL-3.0-or-later"
-    schema: "Apache-2.0 OR MIT"
+  languages:
+    - rust
+  # Dual-license expressed as a single LAMA `license` string (the spec field is
+  # a string; "custom" is permitted). Code crates are AGPL-3.0-or-later; the
+  # daemonseed-proto schema crate is Apache-2.0 OR MIT. Precise per-crate
+  # licenses live in `crates[].license` below.
+  license: "AGPL-3.0-or-later (code); Apache-2.0 OR MIT (schema)"
   minimum_toolchain: "rust 1.95"
   edition: "2024"
   phase: private
 
 # ─────────────────────────────────────────────────────────────────────
-# Implementation status: M9 closed at v0.11.0; v0.12.0-pre cuts at the M10
-# verifiable-core close. M10-core closes S18/A-S13/C27/A-C11 (release-signing
-# verify, boot-gate, update-lifecycle FSM) and backfills ISC-S20 into the
-# coverage registry (the M7–M8 m{N}_isc_coverage.rs convention lapse had left
-# it unregistered). The M10 release-signing INFRASTRUCTURE (real keys, Sigstore,
-# reproducible build, update-relay role) and platform features (C7 biometric,
-# C20 autostart) are deferred to M10-infra. NOTE: these manifests are a
-# project-local dialect; bringing them to canonical LAMA 0.1 (matching oxicrypt)
-# is tracked as a separate conformance PR.
+# Implementation status: M9 closed at v0.11.0; M10 verifiable-core closed at
+# v0.12.0 (PR #14). v0.12.1-pre is M10-completion: it scaffolds the two
+# platform-gated M10 ISCs — C7 (biometric/secure-enclave session-passphrase
+# unlock) and C20 (OS-native autostart) — as abstraction-only traits + a pure
+# descriptor generator + opt-in flags + warnings (platform halves reserved),
+# and brings these LAMA manifests from the former project-local dialect to
+# canonical LAMA 0.1 matching the oxicrypt reference. The M10 release-signing
+# INFRASTRUCTURE (real keys, Sigstore, reproducible build, update-relay role)
+# and the C7/C20 platform halves remain deferred to M10-infra.
 # ─────────────────────────────────────────────────────────────────────
 
 milestones_complete:
@@ -74,8 +78,11 @@ milestones_complete:
     tag: v0.11.0
     summary: "Abuse-resilience + chat affordances. Server: multi-granularity RAM-only rate limits — per-connection token bucket + subscription/verify caps, per-identity-key connection table GC'd on disconnect, uniform silent close (S17/A-S12). Client: exponential+jitter reconnect backoff with an 8-retry budget and layer-based close-cause categorization (C26); mute + hide-shares lists persisted in the seeds blob, never leaked (C15/C16/A-C3); @-mention recognition + resolution as pure post-decrypt/pre-send functions with no new server-visible distinction (C17/C18/A-C4). TUI rendering of these surfaces lands at M11. Closes 9 ISCs."
   - id: M10-core
-    tag: "v0.12.0 (cuts on merge)"
+    tag: v0.12.0
     summary: "M10 verifiable-core (the pure-Rust, TDD-able half). Release trust anchor + N-of-M ML-DSA-87 multi-sig verify (daemonseed_core::release), the server boot-gate that refuses to boot on failed verify with no boot-with-warning path (daemonseed_server::boot_gate), and the client update-lifecycle FSM enforcing verify-before-apply / never-auto-install / no-silent-downgrade / wipe-and-log-on-failure (daemonseed_core::release::update). Plus the M9 per-key rate-limit slot RAII drop-guard and the ISC-S20 coverage backfill. Closes S18/A-S13/C27/A-C11. The release-signing infrastructure and C7/C20 platform features are deferred to M10-infra."
+  - id: M10-completion
+    tag: "v0.12.1 (cuts on merge)"
+    summary: "M10 completion. Scaffolds the two platform-gated M10 ISCs as abstraction-only: C7 biometric/secure-enclave session-passphrase unlock (daemonseed_core::biometric — BiometricStore trait + SessionPassphrase + RECOVERY_RISK_WARNING) and C20 OS-native autostart (daemonseed_core::autostart — pure unit_descriptor generator + AutostartManager trait + PRESENCE_SIDE_CHANNEL_WARNING), with opt-in ProfileConfig flags (default off) and post-MVP Reservations; the platform halves stay in M10-infra. Also brings every LAMA manifest (root + 4 per-crate) from the former project-local dialect to canonical LAMA 0.1 matching the oxicrypt reference."
 
 milestones_planned:
   - id: M10-infra
@@ -358,6 +365,26 @@ capabilities:
       - daemonseed_server::boot_gate
     iscs: [S18, A-S13, C27, A-C11]
 
+  - category: "Platform-feature scaffolds — biometric unlock + autostart (M10-completion)"
+    summary: >-
+      Abstraction-only scaffolds for the two platform-gated M10 ISCs; opt-in,
+      off by default, platform halves reserved. daemonseed_core::biometric: the
+      BiometricStore trait over a zeroizing SessionPassphrase newtype (never the
+      mnemonic — a type-level guarantee), the RECOVERY_RISK_WARNING constant, and
+      the opt-in ProfileConfig::biometric_unlock flag; no platform secure-enclave
+      backend ships (ISC-C7). daemonseed_core::autostart: the pure unit_descriptor
+      generator emitting systemd-user-unit / launchd-plist / Windows-Startup text
+      for a profile (headless by default, never installs/enables/runs), the
+      AutostartManager trait, the PRESENCE_SIDE_CHANNEL_WARNING constant, and the
+      opt-in ProfileConfig::autostart flag; no OS install ships (ISC-C20). The
+      platform backends + OS install + the session-holding GUI/mobile client that
+      gives them meaning are reserved (see the C7/C20 Reservations).
+    crate: daemonseed-core
+    modules:
+      - daemonseed_core::biometric
+      - daemonseed_core::autostart
+    iscs: [C7, C20]
+
 # ─────────────────────────────────────────────────────────────────────
 # Cross-cutting properties (system-wide invariants)
 # ─────────────────────────────────────────────────────────────────────
@@ -462,5 +489,9 @@ isc_reference:
 # ─────────────────────────────────────────────────────────────────────
 # Where the rich detail lives
 # ─────────────────────────────────────────────────────────────────────
+#
+# Canonical LAMA root carries a single `manifest:` pointer to the primary full
+# manifest (daemonseed-core, the protocol library). The per-crate manifests for
+# the proto / server / cli crates are enumerated above under `crates[].manifest`.
 
-manifest_directory: "docs/llm-api-manifest/"
+manifest: "docs/llm-api-manifest/daemonseed-core-api.yaml"

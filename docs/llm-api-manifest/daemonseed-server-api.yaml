@@ -5,8 +5,8 @@
 # M4a, identity-proof at M4b, federation at M5, the public-space service at M6,
 # deprecation-policy publishing at M7, the CoT live relay at M8, RAM-only rate
 # limiting at M9, and the release boot-gate (ISC-A-S13) at M10. The M10
-# release-signing *infrastructure* (real keys, Sigstore, reproducible build,
-# the optional update-relay role) is deferred — see the `planned:` section.
+# release-signing infrastructure (real keys, Sigstore, reproducible build, the
+# optional update-relay role) is deferred to M10-infra.
 #
 # Cross-references:
 # - Repository root: ../../lama.yaml
@@ -20,35 +20,39 @@ lama: "0.1"
 library:
   name: daemonseed-server
   version: "0.1.0"
-  description: "Relay daemon binary + library. M4a landed the TCP runtime + APP_HELLO frame I/O + SIGTERM shutdown; M4b added the post-HELLO identity-proof exchange and the Versioned → Authenticated gate; M5 added federation; M6 serves the post-Authenticated public-space application service (posts, MOTD, taxonomy, signer whitelist); M7 added deprecation-policy publishing; M8 added the circle-of-trust live relay; M9 added RAM-only rate limiting; M10 added the release boot-gate (ISC-A-S13)."
+  description: >-
+    Relay daemon binary + library. M4a landed the TCP runtime + APP_HELLO frame
+    I/O + SIGTERM shutdown; M4b added the post-HELLO identity-proof exchange and
+    the Versioned to Authenticated gate; M5 added federation; M6 serves the
+    post-Authenticated public-space application service (posts, MOTD, taxonomy,
+    signer whitelist); M7 added deprecation-policy publishing; M8 added the
+    circle-of-trust live relay; M9 added RAM-only rate limiting; M10 added the
+    release boot-gate (ISC-A-S13).
   license: "AGPL-3.0-or-later"
   manifest_for: "crates/daemonseed-server"
-  status: "M10 verifiable-core (boot-gate landed; release-signing infrastructure — real keys / Sigstore / reproducible build / update-relay role — deferred to M10-infra)"
+  status: >-
+    M10 verifiable-core (boot-gate landed; release-signing infrastructure — real
+    keys / Sigstore / reproducible build / update-relay role — deferred to
+    M10-infra)
 
 # ─────────────────────────────────────────────────────────────────────
-# Modules landed at M4a commit 3
+# Modules
 # ─────────────────────────────────────────────────────────────────────
 
 modules:
-  - path: daemonseed_server::config
-    purpose: >-
+  - name: daemonseed_server::config
+    description: >-
       TOML config loader + path resolution. Per ISC-S3 / ISC-C35:
-      `--config <path>` (explicit) → XDG_CONFIG_HOME/daemonseed/
-      daemonseed.toml → ./daemonseed.toml. NotFound error carries the
-      full search list so operators see what was looked at.
+      `--config <path>` (explicit) then XDG_CONFIG_HOME/daemonseed/
+      daemonseed.toml then ./daemonseed.toml. NotFound error carries the full
+      search list so operators see what was looked at.
+    no_std: false
+    depends_on: [daemonseed_core]
     iscs: [S3, C35, S12, S13, S7, S8, S9, S10, "9", "27"]
     added_in: "M4a commit 3; federation peer table M5; public-space fields M6"
-    public:
-      - { kind: struct, name: ServerConfig, fields: "{listen_addr: String (default 0.0.0.0:443), key_path: PathBuf (required), display_name: Option<String>, peers: Vec<PeerConfig> (TOML key `[[peer]]`, default empty), posts_dir: Option<PathBuf>, motd_path: Option<PathBuf>, signer_whitelist_path: Option<PathBuf>, rating_taxonomy: Vec<String>, topics: Vec<String>, server_source: Option<String>}", note: "Federation peer table added in M5 (ISC-S12). M6 added the public-space fields — all optional/defaulted so a pre-M6 minimal config still parses: posts_dir/motd_path/signer_whitelist_path (ISC-S7/S9/S8), rating_taxonomy (ISC-S10/27), topics (ISC-S7/19), server_source (ISC-9/F32)." }
-      - { kind: struct, name: PeerConfig, fields: "{server_id: String, address: String, trust_mode: TrustMode (default trusted), introduce_to_clients: bool (default true), key_hex: Option<String>}", note: "One `[[peer]]`. trust_mode reuses the client slider (ISC-S12/C22); introduce_to_clients=false suppresses introductions (ISC-S13); key_hex pre-loads an untrusted peer's key." }
-      - { kind: enum, name: ConfigError, variants: "{NotFound { searched }, Read { path, source }, Parse(toml::de::Error)}" }
-    key_functions:
-      - { sig: "ServerConfig::from_toml(toml_src: &str) -> Result<Self, ConfigError>" }
-      - { sig: "ServerConfig::from_path(path: &Path) -> Result<Self, ConfigError>" }
-      - { sig: "resolve_config_path(explicit, xdg_config_home, home, cwd) -> Result<PathBuf, ConfigError>", note: "Pure function with injected env so it's deterministic + testable." }
 
-  - path: daemonseed_server::federation
-    purpose: >-
+  - name: daemonseed_server::federation
+    description: >-
       Introducer-response construction (ISC-S6 / ISC-S13 / ISC-A-S7). Turns the
       operator's `[[peer]]` table into an IntroducerResponse for a client or a
       peering server (same function for both). Enforces: no public key ever
@@ -56,153 +60,121 @@ modules:
       suppression (ISC-S13); and don't-introduce indistinguishability (ISC-A-S7)
       — a by-id query for a suppressed peer returns the same empty response as
       for a genuinely-unknown peer.
+    no_std: false
+    depends_on: [daemonseed_core, daemonseed_server::config]
     iscs: [S6, S13, A-S7]
     added_in: "M5"
-    key_functions:
-      - { sig: "introducer_response(peers: &[PeerConfig], query: &IntroducerQuery) -> IntroducerResponse", note: "Empty target → full introduce-to-clients-filtered list; populated target → that one peer if introducible, else empty (A-S7). last_known_availability left unset at MVP (finding F15)." }
 
-  - path: daemonseed_server::identity
-    purpose: >-
-      Long-term ML-DSA-87 server identity per ISC-S11. The on-disk
-      shape is a 32-byte seed (FIPS 204 §5.1) with a 4-byte magic
-      prefix `dsv1`; pubkey + private signing material are
-      re-derived on every boot via `oxicrypt_ml_dsa::keygen(&seed)`.
-      ServerId follows ISC-C4 / ISC-S11 — `<name>#<12hex>` with the
-      hash prefix being the first 6 bytes of SHA-384(pubkey).
+  - name: daemonseed_server::identity
+    description: >-
+      Long-term ML-DSA-87 server identity per ISC-S11. The on-disk shape is a
+      32-byte seed (FIPS 204 §5.1) with a 4-byte magic prefix `dsv1`; pubkey +
+      private signing material are re-derived on every boot via
+      `oxicrypt_ml_dsa::keygen(&seed)`. ServerId follows ISC-C4 / ISC-S11 —
+      `<name>#<12hex>` with the hash prefix being the first 6 bytes of
+      SHA-384(pubkey).
+    no_std: false
+    depends_on: [daemonseed_core, oxicrypt_ml_dsa]
     iscs: [S11, C4, C4b]
     added_in: "M4a commit 3"
-    public:
-      - { kind: const, name: SEED_LEN, value: 32 }
-      - { kind: const, name: HASH_PREFIX_BYTES, value: 6, note: "Re-export of daemonseed_core::handle::HASH_PREFIX_BYTES." }
-      - { kind: struct, name: Seed, note: "Owns the 32-byte seed; zeroized on drop; Debug redacts the bytes." }
-      - { kind: type, name: "ServerId = daemonseed_core::handle::Handle", note: "Same format as client handles (ISC-C4); type alias so server and client code share construction logic." }
-      - { kind: enum, name: IdentityError, variants: "{NotFound, EntropyFailure(String), ReadFailed, WriteFailed, MalformedSeedFile, UnknownSeedFileMagic, Keygen, HandleConstruct}" }
-    key_functions:
-      - { sig: "generate_seed() -> Result<Seed, IdentityError>", note: "Uses getrandom 0.3 (OS entropy). Pre-module-init; not gated." }
-      - { sig: "load_or_generate(path: &Path) -> Result<Seed, IdentityError>", note: "Idempotent — first boot generates + persists with mode 0o600 on unix; subsequent boots load." }
-      - { sig: "derive_server_id(seed: &Seed, display_name: Option<String>) -> Result<ServerId, IdentityError>", note: "Module-gate precondition: `oxicrypt_module::initialize_with_profile(.., Cnsa2)` must already have run." }
 
-  - path: daemonseed_server::tls
-    purpose: >-
-      rustls ServerConfig assembly with the CNSA 2.0 hybrid posture.
-      Registers `oxitls_rustls_provider::cnsa_2_0_hybrid_provider`
-      as the process-wide default `CryptoProvider` (idempotent via
-      OnceLock); builds a self-signed ML-DSA-87 cert + matching
-      PKCS#8 key via oxitls v0.1.1 helpers; pins TLS 1.3 only,
-      ALPN `[b"h2"]`, `max_early_data_size = 0`.
+  - name: daemonseed_server::tls
+    description: >-
+      rustls ServerConfig assembly with the CNSA 2.0 hybrid posture. Registers
+      `oxitls_rustls_provider::cnsa_2_0_hybrid_provider` as the process-wide
+      default `CryptoProvider` (idempotent via OnceLock); builds a self-signed
+      ML-DSA-87 cert + matching PKCS#8 key via oxitls v0.1.1 helpers; pins TLS
+      1.3 only, ALPN `[b"h2"]`, `max_early_data_size = 0`.
+    no_std: false
+    depends_on: [daemonseed_server::identity, oxitls_rustls_provider, rustls]
     iscs: [S2a, S2b, S5, A-S9, A-S6]
     added_in: "M4a commit 3"
-    public:
-      - { kind: const, name: DEFAULT_CERT_VALIDITY, value: "90 days", note: "Cert rotation cadence; operationally visible without being annoying." }
-      - { kind: struct, name: TlsError }
-      - { kind: enum, name: TlsErrorKind, variants: "{Provider(String), ProviderAlreadyInstalled, CertBuilder(CertBuilderError), Rustls(String), ValidityOverflow}" }
-    key_functions:
-      - { sig: "install_provider() -> Result<(), TlsError>", note: "Idempotent via OnceLock — safe from concurrent tests. Err on first call is fatal per ISC-A6 (no silent fallback to aws_lc_rs)." }
-      - { sig: "build_server_config(seed: &Seed, server_id: &ServerId, valid_for: Duration) -> Result<ServerConfig, TlsError>", note: "Caller-contract: install_provider() must have returned Ok before this. ServerConfig::builder() uses the process-wide default — the CNSA 2.0 cipher suite + hybrid kx-group + ML-DSA-87 sigscheme arrive automatically." }
 
-  - path: daemonseed_server::kats
-    purpose: >-
-      Union-assembled CNSA 2.0 KATS slice for production module
-      initialization. `oxitls_rustls_provider::cnsa_2_0_hybrid_provider`
-      requires `oxicrypt-module` in the Operational state; the
-      production binary drives that with
-      `oxicrypt_module::initialize_with_profile(CNSA_2_0_KATS, AlgorithmProfile::Cnsa2)`
-      exactly once at boot. Tests use the lighter-weight
-      `oxitls_rustls_provider::testing::ensure_module_operational()`
+  - name: daemonseed_server::kats
+    description: >-
+      Union-assembled CNSA 2.0 KATS slice for production module initialization.
+      `oxitls_rustls_provider::cnsa_2_0_hybrid_provider` requires
+      `oxicrypt-module` in the Operational state; the production binary drives
+      that with `oxicrypt_module::initialize_with_profile(CNSA_2_0_KATS,
+      AlgorithmProfile::Cnsa2)` exactly once at boot. Tests use the
+      lighter-weight `oxitls_rustls_provider::testing::ensure_module_operational()`
       shim (DRBG-only KATs) instead.
+    no_std: false
+    depends_on: [oxicrypt_module, oxitls_rustls_provider]
     iscs: [A6, S5]
     added_in: "M4a commit 4"
-    public:
-      - { kind: const, name: CNSA_2_0_KATS, type: "&[oxicrypt_module::KatEntry]", note: "Concatenates SHA + HMAC + AES + KDF + DRBG + ECDH + ML-KEM + ML-DSA per-crate KATS in roughly call-order." }
 
-  - path: daemonseed_server::hello
-    purpose: >-
-      Length-prefixed prost framing (`u32` BE prefix + encoded bytes)
-      for `APP_HELLO` / `APP_HELLO_ACK` / `APP_HELLO_REJECT`. Server-
-      side orchestration via `serve_hello` reads the initiator's offer,
-      applies `daemonseed_core::version::DefaultNegotiator`'s highest-
-      mutual selection, writes either Ack or Reject with
-      `REJECT_NO_COMMON_VERSION`, returns the outcome to the caller.
-      Frame size capped at `MAX_FRAME_BYTES` (64 KiB) to close the
-      single-frame amplification DoS (ISC-A-S3).
+  - name: daemonseed_server::hello
+    description: >-
+      Length-prefixed prost framing (`u32` BE prefix + encoded bytes) for
+      `APP_HELLO` / `APP_HELLO_ACK` / `APP_HELLO_REJECT`. Server-side
+      orchestration via `serve_hello` reads the initiator's offer, applies
+      `daemonseed_core::version::DefaultNegotiator`'s highest-mutual selection,
+      writes either Ack or Reject with `REJECT_NO_COMMON_VERSION`, returns the
+      outcome to the caller. Frame size capped at `MAX_FRAME_BYTES` (64 KiB) to
+      close the single-frame amplification DoS (ISC-A-S3).
+    no_std: false
+    depends_on: [daemonseed_core, prost]
     iscs: [S14, A-S9, A-S6, C23, A-S3]
     added_in: "M4a commit 4"
-    public:
-      - { kind: const, name: REJECT_NO_COMMON_VERSION, value: 1, note: "Mirrors the canonical proto-file reject-code registry." }
-      - { kind: const, name: MAX_FRAME_BYTES, value: 65_536 }
-      - { kind: enum, name: HelloOutcome, variants: "{Negotiated(ProtocolVersion), Rejected { peer_offer: Vec<ProtocolVersion> }}" }
-      - { kind: enum, name: HelloError, variants: "{Io(io::Error), Decode(prost::DecodeError), FrameTooLarge, WireOutOfRange(VersionError)}" }
-    key_functions:
-      - { sig: "read_frame<R, M>(stream: &mut R) -> Result<M, HelloError>", note: "Generic over any prost Message; enforces MAX_FRAME_BYTES at the prefix step before allocating the body buffer." }
-      - { sig: "write_frame<W, M>(stream: &mut W, msg: &M) -> Result<(), HelloError>" }
-      - { sig: "serve_hello<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S, server_source: Option<&str>) -> Result<HelloOutcome, HelloError>", note: "Zero branches on intended peer role per ISC-A-S6; no per-pubkey state per ISC-A-S9. M6 added server_source — when Some, it is advertised in the AppHelloAck (ISC-9 / F32)." }
 
-  - path: daemonseed_server::identity_proof
-    purpose: >-
+  - name: daemonseed_server::identity_proof
+    description: >-
       Server-side post-HELLO identity-proof orchestration (ISC-S19).
-      `RustlsServerExporter` adapts the live rustls ServerConnection to
-      core's `ChannelBindingSource` so the 32-byte binding is derived
-      from THIS TLS session (ISC-37 / A-S14 / A1 — no constant path
-      exists). `run_server_identity_proof` builds + sends the server's
-      signed envelope, reads + verifies the client's via core's
-      `verify_envelope`, and on success returns the `VerifiedPeer` token
-      that gates `Connection::into_authenticated`. Any failure closes
-      uniformly — no per-check reason frame (ISC-40 / A-S12). The
-      `SeenMap` is a process-lifetime RAM-only highest-counter-per-key
-      map (ISC-34); it persists/logs no client identity (A-S1 / ISC-42 /
-      A5). Envelope frames reuse `hello::{read_frame, write_frame}`.
+      `RustlsServerExporter` adapts the live rustls ServerConnection to core's
+      `ChannelBindingSource` so the 32-byte binding is derived from THIS TLS
+      session (ISC-37 / A-S14 / A1 — no constant path exists).
+      `run_server_identity_proof` builds + sends the server's signed envelope,
+      reads + verifies the client's via core's `verify_envelope`, and on success
+      returns the `VerifiedPeer` token that gates
+      `Connection::into_authenticated`. Any failure closes uniformly — no
+      per-check reason frame (ISC-40 / A-S12). The `SeenMap` is a
+      process-lifetime RAM-only highest-counter-per-key map (ISC-34); it
+      persists/logs no client identity (A-S1 / ISC-42 / A5). Envelope frames
+      reuse `hello::{read_frame, write_frame}`.
+    no_std: false
+    depends_on: [daemonseed_core, daemonseed_server::identity, daemonseed_server::hello, rustls]
     iscs: [S19, "37", "38", "39", "40", "41", "42", "34", A-S14, A-S12, A-S1, A1]
     added_in: "M4b commit 5"
     decisions:
-      - "D7: server outbound counter = wall-clock unix-ms (no persistent counter store; monotonic across restarts via the NTP requirement the ±5min skew gate already imposes — a restarted server is never rejected as a replay by returning clients)."
-    public:
-      - { kind: const, name: MVP_SUITE_ID, value: 1, note: "CNSA 2.0; carried on the server envelope. Widens to real suite negotiation post-MVP (S15/S16)." }
-      - { kind: struct, name: "RustlsServerExporter<'a>", note: "Wraps &rustls::ServerConnection; impls core ChannelBindingSource. No constructor fabricates a constant (A1)." }
-      - { kind: struct, name: ServerIdentity, note: "Server's ML-DSA-87 SignKeypair + verify-form handle + suite_id. Built via from_seed." }
-      - { kind: struct, name: SeenMap, note: "Clone-able Arc<Mutex<HashMap<pubkey,u64>>>; RAM-only replay-counter map shared across connection tasks." }
-      - { kind: enum, name: IdentityProofError, variants: "{Key(KeyDerivationError), Sign(SignatureError), Frame(HelloError), ChannelBinding(ChannelBindingError), Verify(VerifyRejection)}", note: "Diagnostic only — every variant maps to the same uniform close on the wire (A-S12)." }
-    key_functions:
-      - { sig: "now_unix_ms() -> u64", note: "Wall-clock ms; the freshness timestamp AND the D7 server counter source." }
-      - { sig: "RustlsServerExporter::new(conn: &rustls::ServerConnection) -> Self" }
-      - { sig: "ServerIdentity::from_seed(seed: &Seed, server_id: &ServerId) -> Result<Self, IdentityProofError>", note: "Re-derives the signing keypair from the raw seed via SignKeypair::from_ml_dsa_seed." }
-      - { sig: "ServerIdentity::handle(&self) -> &str" }
-      - { sig: "SeenMap::new() -> Self" }
-      - { sig: "run_server_identity_proof<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S, channel_binding: [u8; 32], negotiated_version: wire::ProtocolVersion, identity: &ServerIdentity, now_unix_ms: u64, send_counter: u64, seen: &SeenMap) -> Result<VerifiedPeer, IdentityProofError>", note: "Counter-agnostic (caller passes send_counter); verify path does not branch on role (A-S8)." }
+      - >-
+        D7: server outbound counter = wall-clock unix-ms (no persistent counter
+        store; monotonic across restarts via the NTP requirement the ±5min skew
+        gate already imposes — a restarted server is never rejected as a replay
+        by returning clients).
 
-  - path: daemonseed_server::runtime
-    purpose: >-
+  - name: daemonseed_server::runtime
+    description: >-
       TCP listener + tokio-rustls TlsAcceptor + per-connection HELLO +
       identity-proof handler. `run(addr, tls_config, identity, shutdown,
-      observer)` binds, accepts in a `tokio::select!` against the
-      shutdown future, spawns per-connection tasks sharing one RAM
-      `SeenMap`. Each task drives TLS handshake → HELLO → channel
-      binding off the live TLS session → identity-proof exchange →
-      `Connection` advanced through `Versioned` to `Authenticated` on
-      success (ISC-S19), then M6 serves the public-space application service
-      over the raw authenticated stream (ISC-2 — unreachable pre-auth because
-      reaching it consumes the VerifiedPeer token). The shutdown future is
-      composed from `tokio::signal::ctrl_c()` plus the unix SIGTERM stream via
-      `shutdown_signal()`. Errors at any per-connection phase close
-      silently per ISC-A-S9 / ISC-40.
+      observer)` binds, accepts in a `tokio::select!` against the shutdown
+      future, spawns per-connection tasks sharing one RAM `SeenMap`. Each task
+      drives TLS handshake then HELLO then channel binding off the live TLS
+      session then identity-proof exchange then `Connection` advanced through
+      `Versioned` to `Authenticated` on success (ISC-S19), then M6 serves the
+      public-space application service over the raw authenticated stream (ISC-2 —
+      unreachable pre-auth because reaching it consumes the VerifiedPeer token).
+      The shutdown future is composed from `tokio::signal::ctrl_c()` plus the
+      unix SIGTERM stream via `shutdown_signal()`. Errors at any per-connection
+      phase close silently per ISC-A-S9 / ISC-40.
+    no_std: false
+    depends_on:
+      - daemonseed_server::tls
+      - daemonseed_server::hello
+      - daemonseed_server::identity_proof
+      - daemonseed_server::public_space
+      - daemonseed_server::cot
+      - tokio
     iscs: [S5, A-S9, S19, "2", "36"]
     added_in: "M4a commit 4; identity-proof wiring M4b commit 5; public-space serve M6"
-    public:
-      - { kind: type, name: "ConnectionObserver = Arc<dyn Fn(HelloOutcome) + Send + Sync>", note: "Integration-test seam; production uses noop_observer(). Reports the HELLO negotiation outcome (fired before the identity-proof phase)." }
-    key_functions:
-      - { sig: "run<F: Future<Output = ()>>(addr: SocketAddr, tls_config: ServerConfig, identity: Arc<ServerIdentity>, public_space: Arc<PublicSpaceState>, server_source: Option<String>, shutdown: F, observer: ConnectionObserver) -> io::Result<()>", note: "Accept loop; biased select! prefers shutdown over a new connection. M6 added the public_space + server_source (ISC-9 AGPL-§13 URL) parameters. M8: the process-wide shared state (identity, public_space, server_source, RAM SeenMap, and the new RAM CotRegistry) is bundled into an internal ServerContext built once and cloned per connection; the CotRegistry is shared so members on different connections meet at the same rendezvous (ISC-A-S5)." }
-      - { sig: "drive_negotiated_connection<S>(stream: S, observer: ConnectionObserver)", note: "HELLO-only driver retained as an in-memory-duplex test seam; the production path is serve_connection (private), which also runs identity-proof off the concrete TLS stream." }
-      - { sig: "shutdown_signal() -> impl Future<Output = ()>", note: "Composes ctrl_c + SIGTERM on unix; ctrl_c only on non-unix." }
-      - { sig: "parse_listen_addr(s: &str) -> io::Result<SocketAddr>" }
-      - { sig: "noop_observer() -> ConnectionObserver" }
-      - { sig: "shutdown_after(dur: Duration)", note: "Deterministic test shutdown — sleep-then-resolve." }
 
-  - path: daemonseed_server::public_space
-    purpose: >-
+  - name: daemonseed_server::public_space
+    description: >-
       The FIRST post-Authenticated application-stream service (M6). Serves the
       `daemonseed.v1.PublicSpace` gRPC service (MOTD, posts, taxonomy, signer
-      whitelist, public-share listing) over the single already-Authenticated
-      TLS connection. The relay is verify-and-serve only (ISC-A-S3): posts and
-      the MOTD load into RAM only after verifying against the signer whitelist
+      whitelist, public-share listing) over the single already-Authenticated TLS
+      connection. The relay is verify-and-serve only (ISC-A-S3): posts and the
+      MOTD load into RAM only after verifying against the signer whitelist
       (ISC-S8) via `daemonseed_core::public_space::verify_artifact` — the same
       check clients run, so the server can never serve content a client would
       reject. `PublicSpaceService` is a thin tonic adapter over the shared
@@ -213,27 +185,41 @@ modules:
       supplies tonic's foreign `Connected` trait (orphan rule) with
       `ConnectInfo = ()` since the peer is already proven. runtime.rs serves this
       off the `Authenticated` type-state, so it is unreachable pre-auth (ISC-2).
-    iscs: [S4, S7, S8, S9, S10, A-S3, C19, C23, "2", "3", "4", "5", "6", "7", "8", "13", "14", "16", "17", "18", "19", "20", "22", "24", "26", "27", "28", "29"]
+    no_std: false
+    depends_on: [daemonseed_core, daemonseed_server::cot, tonic]
+    iscs:
+      - S4
+      - S7
+      - S8
+      - S9
+      - S10
+      - A-S3
+      - C19
+      - C23
+      - "2"
+      - "3"
+      - "4"
+      - "5"
+      - "6"
+      - "7"
+      - "8"
+      - "13"
+      - "14"
+      - "16"
+      - "17"
+      - "18"
+      - "19"
+      - "20"
+      - "22"
+      - "24"
+      - "26"
+      - "27"
+      - "28"
+      - "29"
     added_in: "v0.8.0 (M6)"
-    public:
-      - { kind: struct, name: PublicSpaceState, note: "Server-wide state shared via Arc: post_whitelist (operator + F17), published wire entries, taxonomy, topics, RwLock posts map keyed by content-address, RwLock single-slot MOTD, posts_dir, empty M6 share listing. Methods: get_motd / list_posts(topic) / taxonomy / signer_whitelist / public_shares / upload_post / delete_post; load(cfg, server_pubkey) and empty()." }
-      - { kind: struct, name: "PublicSpaceConfig<'a>", fields: "{posts_dir, motd_path, whitelist_path: Option<&Path>, taxonomy, topics: &[String]}", note: "Borrowed slice of ServerConfig passed to PublicSpaceState::load." }
-      - { kind: struct, name: PublicSpaceService, note: "tonic adapter holding Arc<PublicSpaceState>. Impls the generated public_space_server::PublicSpace trait; reads return snapshots, writes delegate + map typed errors to gRPC Status." }
-      - { kind: struct, name: "ServedConn<S>", note: "Newtype adapting a single already-authenticated transport into tonic-servable IO. Impls Connected (ConnectInfo = ()) + delegates AsyncRead/AsyncWrite." }
-      - { kind: enum, name: WhitelistLoadError, variants: "{Read { path, source }, Parse { line, source }}", note: "Whitelist file load failure; Parse carries the 1-based line number (a malformed line is hard-fail, never silently skipped)." }
-      - { kind: enum, name: LoadError, variants: "{Whitelist(WhitelistLoadError), PostsDir { path, source }}", note: "PublicSpaceState::load failure. Invalid post files + invalid/missing MOTD are skipped, not errors (verify-and-serve)." }
-      - { kind: enum, name: UploadError, variants: "{Unauthorized, BadTopic, Malformed, StorageDisabled, Io, Module}", note: "upload_post failure → gRPC PermissionDenied / InvalidArgument / FailedPrecondition / Internal." }
-      - { kind: enum, name: DeleteError, variants: "{Unauthorized, Malformed, NotFound, StorageDisabled, Io, Module}", note: "delete_post failure → gRPC statuses; Unauthorized covers not-whitelisted, bad-sig, and not-the-author." }
-    key_functions:
-      - { sig: "load_whitelist(path: &Path) -> Result<Whitelist, WhitelistLoadError>", note: "One entry per line (hex full key or name#hash handle); blank lines ignored; malformed line is a hard error (ISC-S8). Reload reflects edits (ISC-13/14)." }
-      - { sig: "PublicSpaceState::load(cfg: &PublicSpaceConfig, server_pubkey: &[u8; PK_LEN]) -> Result<Self, LoadError>", note: "Loads + verifies whitelist, posts, MOTD. server_pubkey is accepted as a MOTD signer in addition to the whitelist (ISC-26)." }
-      - { sig: "PublicSpaceState::upload_post(&self, artifact: SignedArtifact) -> Result<[u8;48], UploadError>", note: "Verify vs whitelist (ISC-7) → topic must be in operator set (ISC-19) → persist verbatim under content-address (D-M6-7) + hold in RAM; returns the address." }
-      - { sig: "PublicSpaceState::delete_post(&self, delete_artifact: SignedArtifact) -> Result<(), DeleteError>", note: "Signed delete; signer must be whitelisted AND the post's original author (ISC-8 / ISC-20)." }
-      - { sig: "PublicSpaceService::new(state: Arc<PublicSpaceState>) -> Self" }
-      - { sig: "serve_application<S: AsyncRead + AsyncWrite + Send + Unpin + 'static>(stream: S, public_space: PublicSpaceService, cot: CotRegistry) -> Result<(), tonic::transport::Error>", note: "Serves BOTH the PublicSpace service and the CircleOfTrust relay over one Authenticated transport (h2 keepalive on; ~10s/20s MVP defaults drive CoT reaping) until the peer closes. In production S is the raw transport from Connection<Authenticated, TlsStream<TcpStream>>::into_inner(). Renamed from serve_public_space at M8." }
 
-  - path: daemonseed_server::cot
-    purpose: >-
+  - name: daemonseed_server::cot
+    description: >-
       Circle-of-trust live relay service (M8, F23) — the protocol's first
       streaming RPC, the server side of `daemonseed.v1.CircleOfTrust`. A blind
       forwarder: routes by the opaque rendezvous address, fans each inbound
@@ -241,22 +227,18 @@ modules:
       decrypts payloads, persists nothing (ISC-A-S2). Presence IS the
       subscription stream — opening one refs the asset, the stream ending
       (graceful close or h2-keepalive death) releases it via a Drop guard, and
-      the asset is reaped at refcount zero (ISC-5/7/9/10/11 / ISC-A-S5). Live-
-      only: no reconnect/multiplex state; a lagging subscriber misses frames
+      the asset is reaped at refcount zero (ISC-5/7/9/10/11 / ISC-A-S5).
+      Live-only: no reconnect/multiplex state; a lagging subscriber misses frames
       rather than stalling the asset. `CotRegistry` is the one shared, RAM-only
       asset table (cloned per connection in runtime.rs); served by
       `serve_application` alongside public-space.
+    no_std: false
+    depends_on: [daemonseed_core, tonic, tokio]
     iscs: [S4, S20, A-S2, A-S5, "5", "7", "9", "10", "11"]
     added_in: "v0.10.0 (M8)"
-    public:
-      - { kind: struct, name: CotRegistry, note: "Shared refcounted fan-out table keyed by [u8;48] rendezvous address; one broadcast::Sender per live asset. Clone shares the inner Arc. new() / Default / live_assets() -> usize (metrics/tests, never a wire query). subscribe/publish/release are private — driven only by the Subscribe handler." }
-      - { kind: struct, name: CotService, note: "Thin tonic adapter over CotRegistry. Impls the generated circle_of_trust_server::CircleOfTrust trait. new(registry: CotRegistry) -> Self." }
-      - { kind: struct, name: CotSubscribeStream, note: "Outbound half of a subscription (Self::SubscribeStream): yields co-subscribers' frames, skips the member's own (per-subscription u64 tag), and holds a Drop guard that releases the asset reference on disconnect/keepalive-death." }
-    key_functions:
-      - { sig: "CotService::subscribe(&self, Request<Streaming<CotFrame>>) -> Result<Response<CotSubscribeStream>, Status>", note: "Bidi handler. First inbound frame names the asset (48-byte address, else InvalidArgument) and refs it; an inbound pump task relays subsequent frames (dropping any that name a different asset — no cross-asset injection); the returned stream fans co-subscribers' frames back and reaps on drop." }
 
-  - path: daemonseed_server::rate_limit
-    purpose: >-
+  - name: daemonseed_server::rate_limit
+    description: >-
       Multi-granularity, RAM-only abuse/DoS rate limiting (M9, ISC-S17 /
       ISC-A-S12). Per-connection limits (request token bucket, subscription cap,
       verify cap) plus a process-lifetime per-identity-key concurrent-connection
@@ -264,18 +246,13 @@ modules:
       wiped on restart by construction. Every trip maps to the same uniform
       silent close (no wire reason). Per-source-IP stays operator-owned (OS
       firewall, A-S1 carve-out).
+    no_std: false
+    depends_on: []
     iscs: [S17, A-S12]
     added_in: "v0.11.0 (M9); KeySlotGuard/admit_guard v0.12.0 (M10)"
-    public:
-      - { kind: struct, name: RateLimitConfig, note: "Pi-4 civility-floor thresholds: req_burst, req_per_sec, max_subscriptions, max_verifies, max_conns_per_key. Default impl. max_conns_per_key=4 matches the client A-C10 self-cap." }
-      - { kind: enum, name: RateLimitTrip, variants: "{RequestRate, SubscriptionCap, VerifyCap, PerKeyConnCap}", note: "Server-side diagnostic ONLY — no wire form, no serialization; every variant maps to the same uniform drop (A-S12)." }
-      - { kind: struct, name: TokenBucket, note: "Leaky/token bucket. new/new_at(capacity, refill_per_sec[, now]); try_take/try_take_at(now) -> bool." }
-      - { kind: struct, name: ConnectionLimiter, note: "Per-connection limiter. new/new_at(config[, now]); try_request_at, try_subscribe/end_subscribe, try_verify, active_subscriptions. Owned by the per-connection task; dropped with it." }
-      - { kind: struct, name: PerKeyRateTable, note: "RAM-only Arc<Mutex<HashMap<pubkey, count>>> capping concurrent connections per signing key. Clone shares the inner Arc. new(max); admit(key)/release(key)/active_for/tracked_keys; admit_guard(key) -> Result<KeySlotGuard, RateLimitTrip> is the preferred panic-safe acquisition." }
-      - { kind: struct, name: KeySlotGuard, note: "RAII guard (M10) returned by admit_guard; releases the per-key slot in Drop so the count is freed even if the serving task unwinds (panic). Replaces the manual post-serve release in runtime::serve_connection." }
 
-  - path: daemonseed_server::boot_gate
-    purpose: >-
+  - name: daemonseed_server::boot_gate
+    description: >-
       Server release boot-gate (M10, ISC-A-S13). Maps the result of verifying the
       running binary's release signatures (against the bundled trust anchor, via
       daemonseed_core::release::verify_multisig) to a boot decision. A failed
@@ -283,92 +260,1331 @@ modules:
       optional update-relay role (which MUST stay opacity-only) and self-install
       are deliberately absent. Wiring into real startup is deferred to M10-infra
       (needs the binary's embedded signature + a populated anchor).
+    no_std: false
+    depends_on: [daemonseed_core]
     iscs: [S18, A-S13]
     added_in: "v0.12.0 (M10)"
-    public:
-      - { kind: enum, name: BootDecision, variants: "{Boot, RefuseToBoot(ReleaseVerifyError)}", note: "No third variant by construction — A-S13's never-boot-with-warning is enforced by the type's shape. RefuseToBoot carries the local failure reason for operator logs only." }
-    key_functions:
-      - { sig: "gate_boot(verify_result: Result<(), ReleaseVerifyError>) -> BootDecision", note: "Ok → Boot; any Err → RefuseToBoot. The pure decision." }
-      - { sig: "gate_boot_with(anchor: &ReleaseAnchor, message: &[u8], signatures: &[&[u8]]) -> BootDecision", note: "Composes core::release::verify_multisig with gate_boot. The digest computation + binary-embedded signatures are M10-infra." }
-
-binaries:
-  - name: daemonseed-server
-    entry_point: "fn main() -> ExitCode"
-    status: "live"
-    note: "Boot sequence: clap parse → oxicrypt_module::initialize_with_profile(CNSA_2_0_KATS, Cnsa2) → resolve_config_path → install_provider → load_or_generate seed → derive_server_id → build_server_config → tokio multi-thread runtime → daemonseed_server::runtime::run with shutdown_signal()."
 
 # ─────────────────────────────────────────────────────────────────────
-# Anti-criteria (regression anchors that hold today)
+# Types
 # ─────────────────────────────────────────────────────────────────────
 
-anti_criteria:
-  - id: "ISC-A-S10 suite-transparency"
-    summary: >-
-      The server crate MUST NOT call `Registry::lookup`,
-      `Registry::resolve_for_write`, or `Suite::same_family` on any
-      CoT-relay path. CoT crypto is end-to-end and opaque to the
-      server, including the suite tag. Server is permitted to consume
-      `SuiteId` opaquely for its own identity material (ISC-S15
-      server-wide-keyed handshakes) when M4a lands, but the registry-
-      lookup boundary stays client-side.
-    enforcement: >-
-      Grep-asserted by
-      `daemonseed-integration-tests::tests::m3_isc_coverage::m3_iscs_exercise_end_to_end`
-      (server_suite_transparency block). Now a live regression anchor: the M8
-      CoT relay routes by opaque rendezvous address and never consults the
-      registry on the relay path.
-    iscs: [A-S10]
+types:
+  # ── config ───────────────────────────────────────────────────────
+  - name: ServerConfig
+    module: daemonseed_server::config
+    kind: struct
+    description: >-
+      Parsed `daemonseed.toml` contents. Federation peer table added in M5
+      (ISC-S12). M6 added the public-space fields — all optional/defaulted so a
+      pre-M6 minimal config still parses: posts_dir/motd_path/
+      signer_whitelist_path (ISC-S7/S9/S8), rating_taxonomy (ISC-S10/27), topics
+      (ISC-S7/19), server_source (ISC-9/F32).
+    fields:
+      - name: listen_addr
+        type: String
+        description: "TCP listen address; default `0.0.0.0:443` per ISC-S5."
+      - name: key_path
+        type: PathBuf
+        description: "Required path to the operator-managed ML-DSA-87 seed file."
+      - name: display_name
+        type: "Option<String>"
+        description: "Optional display name; empty surfaces the floor `#<12hex>` form (ISC-C4b)."
+      - name: peers
+        type: "Vec<PeerConfig>"
+        description: "Federation peers (TOML key `[[peer]]`); default empty."
+      - name: posts_dir
+        type: "Option<PathBuf>"
+        description: "Directory of signer-written announcement posts (ISC-S7 / ISC-16)."
+      - name: motd_path
+        type: "Option<PathBuf>"
+        description: "Single-slot signed MOTD file `motd.signed` (ISC-S9 / ISC-22)."
+      - name: signer_whitelist_path
+        type: "Option<PathBuf>"
+        description: "Plaintext signer-whitelist file (ISC-S8); operator-owned, never server-written."
+      - name: rating_taxonomy
+        type: "Vec<String>"
+        description: "Operator content-rating labels published to clients (ISC-S10 / ISC-27)."
+      - name: topics
+        type: "Vec<String>"
+        description: "Operator announcement topic set (ISC-S7 / ISC-19)."
+      - name: server_source
+        type: "Option<String>"
+        description: "Source-code location advertised in APP_HELLO `server_source` (ISC-9 / F32)."
+    iscs: [S3, C35, S12, S13, S7, S8, S9, S10, "9", "27"]
 
-  - id: "ISC-A-S1 / A-S2 server payload opacity"
-    summary: >-
-      Server cannot decrypt CoT payloads, cannot link a payload to a
-      specific circle, cannot profile per-pubkey traffic patterns.
-      Enforced architecturally from M4b via the type separation between
-      OpaquePayload<C> and decrypted client-side types, and held by the M8 CoT
-      relay (blind fan-out by opaque address; persists nothing).
-    enforcement: "Live since M4b (type separation) + M8 (blind CoT relay)."
-    iscs: [A-S1, A-S2]
+  - name: PeerConfig
+    module: daemonseed_server::config
+    kind: struct
+    description: >-
+      One `[[peer]]` federation entry. trust_mode reuses the client slider
+      (ISC-S12/C22); introduce_to_clients=false suppresses introductions
+      (ISC-S13); key_hex pre-loads an untrusted peer's key.
+    fields:
+      - name: server_id
+        type: String
+        description: "Peer server-id, `<name>#<12hex>` (ISC-S11 / ISC-C4)."
+      - name: address
+        type: String
+        description: "Reachable hostname or IP literal, optional `:port` (default 443)."
+      - name: trust_mode
+        type: TrustMode
+        description: "Trust slider position; default `trusted` (ISC-C22 default)."
+      - name: introduce_to_clients
+        type: bool
+        description: "Whether the peer appears in introducer responses; default true (ISC-S13)."
+      - name: key_hex
+        type: "Option<String>"
+        description: "Hex pre-loaded full public key; required for `untrusted` peers."
+    iscs: [S12, S13, C22]
+
+  # ── identity ─────────────────────────────────────────────────────
+  - name: Seed
+    module: daemonseed_server::identity
+    kind: struct
+    description: "Owns the 32-byte ML-DSA-87 seed; Debug redacts the bytes."
+    security:
+      contains_secret: true
+      zeroize_on_drop: true
+    iscs: [S11]
+
+  - name: ServerId
+    module: daemonseed_server::identity
+    kind: alias
+    description: >-
+      `ServerId = daemonseed_core::handle::Handle`. Same format as client handles
+      (ISC-C4); type alias so server and client code share construction logic.
+    iscs: [S11, C4]
+
+  # ── tls ──────────────────────────────────────────────────────────
+  - name: TlsError
+    module: daemonseed_server::tls
+    kind: struct
+    description: "Error wrapper for rustls ServerConfig assembly and provider install."
+
+  # ── hello ────────────────────────────────────────────────────────
+  - name: HelloOutcome
+    module: daemonseed_server::hello
+    kind: enum
+    description: "Result of server-side HELLO negotiation."
+    variants:
+      - name: Negotiated
+        description: "Highest-mutual version selected; carries the ProtocolVersion."
+      - name: Rejected
+        description: "No common version; carries the peer's offered versions."
+    iscs: [S14]
+
+  # ── identity_proof ───────────────────────────────────────────────
+  - name: "RustlsServerExporter<'a>"
+    module: daemonseed_server::identity_proof
+    kind: struct
+    description: >-
+      Wraps &rustls::ServerConnection; impls core ChannelBindingSource. No
+      constructor fabricates a constant (A1).
+    iscs: ["37", A-S14, A1]
+
+  - name: ServerIdentity
+    module: daemonseed_server::identity_proof
+    kind: struct
+    description: >-
+      Server's ML-DSA-87 SignKeypair + verify-form handle + suite_id. Built via
+      from_seed.
+    security:
+      contains_secret: true
+      zeroize_on_drop: true
+    iscs: [S19]
+
+  - name: SeenMap
+    module: daemonseed_server::identity_proof
+    kind: struct
+    description: >-
+      Clone-able Arc<Mutex<HashMap<pubkey,u64>>>; RAM-only replay-counter map
+      shared across connection tasks.
+    iscs: ["34", A-S1]
+
+  # ── runtime ──────────────────────────────────────────────────────
+  - name: ConnectionObserver
+    module: daemonseed_server::runtime
+    kind: alias
+    description: >-
+      `ConnectionObserver = Arc<dyn Fn(HelloOutcome) + Send + Sync>`.
+      Integration-test seam; production uses noop_observer(). Reports the HELLO
+      negotiation outcome (fired before the identity-proof phase).
+    iscs: ["36"]
+
+  # ── public_space ─────────────────────────────────────────────────
+  - name: PublicSpaceState
+    module: daemonseed_server::public_space
+    kind: struct
+    description: >-
+      Server-wide state shared via Arc: post_whitelist (operator + F17),
+      published wire entries, taxonomy, topics, RwLock posts map keyed by
+      content-address, RwLock single-slot MOTD, posts_dir, empty M6 share
+      listing. Methods: get_motd / list_posts(topic) / taxonomy /
+      signer_whitelist / public_shares / upload_post / delete_post;
+      load(cfg, server_pubkey) and empty().
+    iscs: [S4, S7, S8, S9, S10]
+
+  - name: "PublicSpaceConfig<'a>"
+    module: daemonseed_server::public_space
+    kind: struct
+    description: "Borrowed slice of ServerConfig passed to PublicSpaceState::load."
+    fields:
+      - name: posts_dir
+        type: "Option<&Path>"
+        description: "Directory of announcement posts."
+      - name: motd_path
+        type: "Option<&Path>"
+        description: "Single-slot signed MOTD file."
+      - name: whitelist_path
+        type: "Option<&Path>"
+        description: "Signer-whitelist file path."
+      - name: taxonomy
+        type: "&[String]"
+        description: "Content-rating labels."
+      - name: topics
+        type: "&[String]"
+        description: "Announcement topic set."
+
+  - name: PublicSpaceService
+    module: daemonseed_server::public_space
+    kind: struct
+    description: >-
+      tonic adapter holding Arc<PublicSpaceState>. Impls the generated
+      public_space_server::PublicSpace trait; reads return snapshots, writes
+      delegate + map typed errors to gRPC Status.
+
+  - name: "ServedConn<S>"
+    module: daemonseed_server::public_space
+    kind: struct
+    description: >-
+      Newtype adapting a single already-authenticated transport into
+      tonic-servable IO. Impls Connected (ConnectInfo = ()) + delegates
+      AsyncRead/AsyncWrite.
+
+  # ── cot ──────────────────────────────────────────────────────────
+  - name: CotRegistry
+    module: daemonseed_server::cot
+    kind: struct
+    description: >-
+      Shared refcounted fan-out table keyed by [u8;48] rendezvous address; one
+      broadcast::Sender per live asset. Clone shares the inner Arc. new() /
+      Default / live_assets() -> usize (metrics/tests, never a wire query).
+      subscribe/publish/release are private — driven only by the Subscribe
+      handler.
+    iscs: [S4, A-S2, A-S5]
+
+  - name: CotService
+    module: daemonseed_server::cot
+    kind: struct
+    description: >-
+      Thin tonic adapter over CotRegistry. Impls the generated
+      circle_of_trust_server::CircleOfTrust trait. new(registry: CotRegistry) ->
+      Self.
+
+  - name: CotSubscribeStream
+    module: daemonseed_server::cot
+    kind: struct
+    description: >-
+      Outbound half of a subscription (Self::SubscribeStream): yields
+      co-subscribers' frames, skips the member's own (per-subscription u64 tag),
+      and holds a Drop guard that releases the asset reference on
+      disconnect/keepalive-death.
+
+  # ── rate_limit ───────────────────────────────────────────────────
+  - name: RateLimitConfig
+    module: daemonseed_server::rate_limit
+    kind: struct
+    description: >-
+      Pi-4 civility-floor thresholds: req_burst, req_per_sec, max_subscriptions,
+      max_verifies, max_conns_per_key. Default impl. max_conns_per_key=4 matches
+      the client A-C10 self-cap.
+    iscs: [S17]
+
+  - name: TokenBucket
+    module: daemonseed_server::rate_limit
+    kind: struct
+    description: >-
+      Leaky/token bucket. new/new_at(capacity, refill_per_sec[, now]);
+      try_take/try_take_at(now) -> bool.
+
+  - name: ConnectionLimiter
+    module: daemonseed_server::rate_limit
+    kind: struct
+    description: >-
+      Per-connection limiter. new/new_at(config[, now]); try_request_at,
+      try_subscribe/end_subscribe, try_verify, active_subscriptions. Owned by the
+      per-connection task; dropped with it.
+
+  - name: PerKeyRateTable
+    module: daemonseed_server::rate_limit
+    kind: struct
+    description: >-
+      RAM-only Arc<Mutex<HashMap<pubkey, count>>> capping concurrent connections
+      per signing key. Clone shares the inner Arc. new(max);
+      admit(key)/release(key)/active_for/tracked_keys; admit_guard(key) ->
+      Result<KeySlotGuard, RateLimitTrip> is the preferred panic-safe
+      acquisition.
+
+  - name: KeySlotGuard
+    module: daemonseed_server::rate_limit
+    kind: struct
+    description: >-
+      RAII guard (M10) returned by admit_guard; releases the per-key slot in Drop
+      so the count is freed even if the serving task unwinds (panic). Replaces the
+      manual post-serve release in runtime::serve_connection.
+
+  # ── boot_gate ────────────────────────────────────────────────────
+  - name: BootDecision
+    module: daemonseed_server::boot_gate
+    kind: enum
+    description: >-
+      The startup decision for the server's own release binary. No third variant
+      by construction — A-S13's never-boot-with-warning is enforced by the type's
+      shape.
+    variants:
+      - name: Boot
+        description: "Signatures met the anchor threshold — boot."
+      - name: RefuseToBoot
+        description: "Verification failed; carries the local ReleaseVerifyError for operator logs only."
+    iscs: [S18, A-S13]
 
 # ─────────────────────────────────────────────────────────────────────
-# Planned surface (forward-looking, not yet implemented)
-#
-# M4a–M9 are landed (tags v0.5.0–v0.11.0) and described in the modules above;
-# they no longer appear here. Only genuinely-future surface remains.
+# Functions
 # ─────────────────────────────────────────────────────────────────────
 
-planned:
-  - milestone: M9 (deferred to M11)
-    deferred:
-      - "Per-source-IP layer stays operator-owned (OS firewall, A-S1 carve-out) — not in the binary"
-      - "Operator-tunable thresholds via [rate_limits] TOML section + wiring the per-connection token bucket / subscription cap into the live app stream (cot/public_space): M11 integration"
+functions:
+  # ── config ───────────────────────────────────────────────────────
+  - name: "ServerConfig::from_toml"
+    module: daemonseed_server::config
+    description: "Parse the TOML contents of a config file."
+    signature: "pub fn from_toml(toml_src: &str) -> Result<Self, ConfigError>"
+    parameters:
+      - name: toml_src
+        type: "&str"
+        direction: in
+        description: "Raw TOML config-file contents."
+    returns:
+      type: "Result<ServerConfig, ConfigError>"
+      description: "Parsed config or a parse error."
+      error_variants:
+        - name: Parse
+          condition: "The TOML failed to deserialize into ServerConfig (e.g., missing required key_path)."
+    iscs: [S3, C35]
 
-  - milestone: M10-infra (deferred — needs a signing-key ceremony, accounts, build pipeline)
-    landed_m10_core:
-      - "daemonseed_server::boot_gate — gate_boot / gate_boot_with map a release-signature verify result to BootDecision::{Boot, RefuseToBoot}; no boot-with-warning variant exists (ISC-A-S13). Consumes daemonseed_core::release::verify_multisig."
-    deferred:
-      - "Real release-signing keys + N-of-M governance key-holder identities; Sigstore co-signature; reproducible-build pipeline (ISC-S18 infrastructure)"
-      - "Wiring gate_boot into actual startup — needs the binary's embedded release signature + a populated release anchor (both land with the key ceremony)"
-      - "Optional update-relay role hosting read-only signed artifacts as public-space data (ISC-S18); when built it MUST stay opacity-only — no server-side signature validation (ISC-A-S13)"
-      - "OS-package-manager + container distribution channels signed under the release key chain"
+  - name: "ServerConfig::from_path"
+    module: daemonseed_server::config
+    description: "Read + parse a TOML config file at `path`."
+    signature: "pub fn from_path(path: &Path) -> Result<Self, ConfigError>"
+    parameters:
+      - name: path
+        type: "&Path"
+        direction: in
+        description: "Filesystem path to the config file."
+    returns:
+      type: "Result<ServerConfig, ConfigError>"
+      description: "Parsed config or a read/parse error."
+      error_variants:
+        - name: Read
+          condition: "Reading the file from disk failed; carries the path and io::Error source."
+        - name: Parse
+          condition: "The file contents failed to deserialize."
+    iscs: [S3, C35]
+
+  - name: resolve_config_path
+    module: daemonseed_server::config
+    description: >-
+      Resolve a config-file location by precedence order. Pure function with
+      injected env so it is deterministic + testable.
+    signature: "pub fn resolve_config_path(explicit: Option<&Path>, xdg_config_home: Option<&Path>, home: Option<&Path>, cwd: &Path) -> Result<PathBuf, ConfigError>"
+    parameters:
+      - name: explicit
+        type: "Option<&Path>"
+        direction: in
+        description: "Explicit `--config <path>` flag value (highest precedence)."
+      - name: xdg_config_home
+        type: "Option<&Path>"
+        direction: in
+        description: "$XDG_CONFIG_HOME base, if set."
+      - name: home
+        type: "Option<&Path>"
+        direction: in
+        description: "$HOME, used to fall back to $HOME/.config when XDG is unset."
+      - name: cwd
+        type: "&Path"
+        direction: in
+        description: "Current working directory (lowest precedence)."
+    returns:
+      type: "Result<PathBuf, ConfigError>"
+      description: "First existing path in the resolution order."
+      error_variants:
+        - name: NotFound
+          condition: "No file exists at any path in the order; carries the full searched list."
+    iscs: [S3, C35]
+
+  # ── federation ───────────────────────────────────────────────────
+  - name: introducer_response
+    module: daemonseed_server::federation
+    description: >-
+      Build an IntroducerResponse from the operator's peer table for a client or
+      a peering server (same function for both).
+    signature: "pub fn introducer_response(peers: &[PeerConfig], query: &IntroducerQuery) -> IntroducerResponse"
+    parameters:
+      - name: peers
+        type: "&[PeerConfig]"
+        direction: in
+        description: "The operator's `[[peer]]` table."
+      - name: query
+        type: "&IntroducerQuery"
+        direction: in
+        description: "Empty target → full introduce-to-clients-filtered list; populated target → that one peer."
+    returns:
+      type: IntroducerResponse
+      description: >-
+        Populated-target query returns that peer if introducible, else the same
+        empty response as for a genuinely-unknown peer (A-S7).
+        last_known_availability is left unset at MVP (finding F15).
+    postconditions:
+      - description: "No public key ever appears in the response (ISC-S6, structural — PeerTriple has no key field)."
+      - description: "A suppressed peer is indistinguishable from an unknown one (ISC-A-S7)."
+    iscs: [S6, S13, A-S7]
+
+  # ── identity ─────────────────────────────────────────────────────
+  - name: generate_seed
+    module: daemonseed_server::identity
+    description: "Generate 32 bytes of OS entropy for a fresh ML-DSA-87 seed. Pre-module-init; not gated."
+    signature: "pub fn generate_seed() -> Result<Seed, IdentityError>"
+    parameters: []
+    returns:
+      type: "Result<Seed, IdentityError>"
+      description: "A freshly-generated zeroize-on-drop seed."
+      error_variants:
+        - name: EntropyFailure
+          condition: "getrandom 0.3 (`getrandom::fill`) failed to supply OS entropy; carries the error string."
+    security:
+      handles_secrets: true
+    iscs: [S11]
+
+  - name: load_or_generate
+    module: daemonseed_server::identity
+    description: >-
+      Load a seed from disk, or generate + persist one if the file does not
+      exist. Idempotent — first boot generates + persists with mode 0o600 on
+      unix; subsequent boots load.
+    signature: "pub fn load_or_generate(path: &Path) -> Result<Seed, IdentityError>"
+    parameters:
+      - name: path
+        type: "&Path"
+        direction: in
+        description: "Operator-managed seed-file path."
+    returns:
+      type: "Result<Seed, IdentityError>"
+      description: "The loaded or newly-generated seed."
+      error_variants:
+        - name: EntropyFailure
+          condition: "First-boot generation failed to supply OS entropy."
+        - name: ReadFailed
+          condition: "Reading the existing seed file from disk failed."
+        - name: WriteFailed
+          condition: "Persisting a freshly-generated seed file failed."
+        - name: MalformedSeedFile
+          condition: "The seed file exists but its contents are the wrong shape."
+        - name: UnknownSeedFileMagic
+          condition: "The seed file's 4-byte magic prefix is not `dsv1`."
+    security:
+      handles_secrets: true
+    iscs: [S11]
+
+  - name: derive_server_id
+    module: daemonseed_server::identity
+    description: "Derive the `<name>#<12hex>` server-id from the seed and an optional display name."
+    signature: "pub fn derive_server_id(seed: &Seed, display_name: Option<String>) -> Result<ServerId, IdentityError>"
+    parameters:
+      - name: seed
+        type: "&Seed"
+        direction: in
+        description: "The long-term ML-DSA-87 seed."
+      - name: display_name
+        type: "Option<String>"
+        direction: in
+        description: "Optional display name; empty surfaces the floor `#<12hex>` form (ISC-C4b)."
+    returns:
+      type: "Result<ServerId, IdentityError>"
+      description: "The constructed server-id handle."
+      error_variants:
+        - name: Keygen
+          condition: "Re-deriving the ML-DSA-87 keypair from the seed failed."
+        - name: HandleConstruct
+          condition: "Building the `<name>#<hash>` handle from the derived pubkey failed."
+    preconditions:
+      - description: "Module gate: `oxicrypt_module::initialize_with_profile(.., Cnsa2)` must already have run."
+    iscs: [S11, C4, C4b]
+
+  # ── tls ──────────────────────────────────────────────────────────
+  - name: install_provider
+    module: daemonseed_server::tls
+    description: >-
+      Install the CNSA 2.0 hybrid provider as the process-wide default
+      CryptoProvider. Idempotent via OnceLock — safe from concurrent tests.
+    signature: "pub fn install_provider() -> Result<(), TlsError>"
+    parameters: []
+    returns:
+      type: "Result<(), TlsError>"
+      description: "Ok on success or no-op re-install."
+      error_variants:
+        - name: Provider
+          condition: "Provider construction/registration failed; carries a diagnostic string."
+        - name: ProviderAlreadyInstalled
+          condition: "A different process-wide provider was already installed."
+    postconditions:
+      - description: "On first-call Err the failure is fatal per ISC-A6 (no silent fallback to aws_lc_rs)."
+    iscs: [S5, A-S9, A-S6]
+
+  - name: build_server_config
+    module: daemonseed_server::tls
+    description: >-
+      Build the rustls ServerConfig (TLS 1.3 only, ALPN h2, self-signed ML-DSA-87
+      cert) using the process-wide default provider.
+    signature: "pub fn build_server_config(seed: &Seed, server_id: &ServerId, valid_for: Duration) -> Result<ServerConfig, TlsError>"
+    parameters:
+      - name: seed
+        type: "&Seed"
+        direction: in
+        description: "The long-term seed used to build the cert + matching PKCS#8 key."
+      - name: server_id
+        type: "&ServerId"
+        direction: in
+        description: "The server-id woven into the self-signed cert."
+      - name: valid_for
+        type: Duration
+        direction: in
+        description: "Cert validity window; default cadence is 90 days."
+    returns:
+      type: "Result<ServerConfig, TlsError>"
+      description: "An assembled rustls ServerConfig."
+      error_variants:
+        - name: CertBuilder
+          condition: "Self-signed ML-DSA-87 cert construction failed; wraps CertBuilderError."
+        - name: Rustls
+          condition: "rustls ServerConfig assembly failed; carries a diagnostic string."
+        - name: ValidityOverflow
+          condition: "The validity window overflowed the cert time representation."
+    preconditions:
+      - description: "install_provider() must have returned Ok before this call."
+    iscs: [S2a, S2b, S5]
+
+  # ── hello ────────────────────────────────────────────────────────
+  - name: read_frame
+    module: daemonseed_server::hello
+    description: >-
+      Read one length-prefixed prost frame. Generic over any prost Message;
+      enforces MAX_FRAME_BYTES at the prefix step before allocating the body
+      buffer.
+    signature: "pub async fn read_frame<R, M>(stream: &mut R) -> Result<M, HelloError>"
+    parameters:
+      - name: stream
+        type: "&mut R"
+        direction: in-out
+        description: "An async-readable transport."
+    returns:
+      type: "Result<M, HelloError>"
+      description: "The decoded message."
+      error_variants:
+        - name: Io
+          condition: "An underlying read failed."
+        - name: Decode
+          condition: "prost failed to decode the body bytes."
+        - name: FrameTooLarge
+          condition: "The length prefix exceeds MAX_FRAME_BYTES (64 KiB) — closes the amplification DoS (ISC-A-S3)."
+    iscs: [S14, A-S3, C23]
+
+  - name: write_frame
+    module: daemonseed_server::hello
+    description: "Write one length-prefixed prost frame."
+    signature: "pub async fn write_frame<W, M>(stream: &mut W, msg: &M) -> Result<(), HelloError>"
+    parameters:
+      - name: stream
+        type: "&mut W"
+        direction: in-out
+        description: "An async-writable transport."
+      - name: msg
+        type: "&M"
+        direction: in
+        description: "The prost message to encode and frame."
+    returns:
+      type: "Result<(), HelloError>"
+      description: "Ok on a fully-written frame."
+      error_variants:
+        - name: Io
+          condition: "An underlying write failed."
+    iscs: [S14, C23]
+
+  - name: serve_hello
+    module: daemonseed_server::hello
+    description: >-
+      Server-side HELLO orchestration: read the offer, select the highest-mutual
+      version, write Ack or Reject. Zero branches on intended peer role (A-S6); no
+      per-pubkey state (A-S9).
+    signature: "pub async fn serve_hello<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S, server_source: Option<&str>) -> Result<HelloOutcome, HelloError>"
+    parameters:
+      - name: stream
+        type: "&mut S"
+        direction: in-out
+        description: "The async transport carrying the HELLO exchange."
+      - name: server_source
+        type: "Option<&str>"
+        direction: in
+        description: "When Some, advertised in the AppHelloAck (ISC-9 / F32 AGPL source pointer)."
+    returns:
+      type: "Result<HelloOutcome, HelloError>"
+      description: "Negotiated(version) or Rejected{peer_offer}."
+      error_variants:
+        - name: Io
+          condition: "A read or write failed during the exchange."
+        - name: Decode
+          condition: "The peer's offer frame failed to decode."
+        - name: FrameTooLarge
+          condition: "An incoming frame exceeded MAX_FRAME_BYTES."
+        - name: WireOutOfRange
+          condition: "A wire protocol-version value was out of range; wraps VersionError."
+    iscs: [S14, A-S9, A-S6]
+
+  # ── identity_proof ───────────────────────────────────────────────
+  - name: now_unix_ms
+    module: daemonseed_server::identity_proof
+    description: "Wall-clock ms; the freshness timestamp AND the D7 server counter source."
+    signature: "pub fn now_unix_ms() -> u64"
+    parameters: []
+    returns:
+      type: u64
+      description: "Current wall-clock unix time in milliseconds."
+    iscs: ["38"]
+
+  - name: "RustlsServerExporter::new"
+    module: daemonseed_server::identity_proof
+    description: "Wrap a live rustls ServerConnection as a ChannelBindingSource."
+    signature: "pub fn new(conn: &rustls::ServerConnection) -> Self"
+    parameters:
+      - name: conn
+        type: "&rustls::ServerConnection"
+        direction: in
+        description: "The live server-side TLS connection THIS binding is derived from."
+    returns:
+      type: "RustlsServerExporter"
+      description: "An exporter bound to this TLS session; never fabricates a constant (A1)."
+    iscs: ["37", A1]
+
+  - name: "ServerIdentity::from_seed"
+    module: daemonseed_server::identity_proof
+    description: "Re-derive the signing keypair from the raw seed via SignKeypair::from_ml_dsa_seed."
+    signature: "pub fn from_seed(seed: &Seed, server_id: &ServerId) -> Result<Self, IdentityProofError>"
+    parameters:
+      - name: seed
+        type: "&Seed"
+        direction: in
+        description: "The long-term ML-DSA-87 seed."
+      - name: server_id
+        type: "&ServerId"
+        direction: in
+        description: "The derived server-id handle."
+    returns:
+      type: "Result<ServerIdentity, IdentityProofError>"
+      description: "The assembled server identity (keypair + handle + suite_id)."
+      error_variants:
+        - name: Key
+          condition: "Re-deriving the signing keypair from the seed failed; wraps KeyDerivationError."
+    security:
+      handles_secrets: true
+    iscs: [S19]
+
+  - name: "ServerIdentity::handle"
+    module: daemonseed_server::identity_proof
+    description: "Borrow the server identity's handle string."
+    signature: "pub fn handle(&self) -> &str"
+    parameters: []
+    returns:
+      type: "&str"
+      description: "The `<name>#<12hex>` handle."
+    iscs: [S19]
+
+  - name: "SeenMap::new"
+    module: daemonseed_server::identity_proof
+    description: "Construct an empty RAM-only highest-counter-per-key replay map."
+    signature: "pub fn new() -> Self"
+    parameters: []
+    returns:
+      type: SeenMap
+      description: "A clone-able shared map; persists/logs no client identity (A-S1)."
+    iscs: ["34", A-S1]
+
+  - name: run_server_identity_proof
+    module: daemonseed_server::identity_proof
+    description: >-
+      Send the server's signed envelope, verify the client's, and on success
+      return the VerifiedPeer token that gates Connection::into_authenticated.
+      Counter-agnostic (caller passes send_counter); the verify path does not
+      branch on role (A-S8). Any failure closes uniformly (A-S12).
+    signature: "pub async fn run_server_identity_proof<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S, channel_binding: [u8; 32], negotiated_version: wire::ProtocolVersion, identity: &ServerIdentity, now_unix_ms: u64, send_counter: u64, seen: &SeenMap) -> Result<VerifiedPeer, IdentityProofError>"
+    parameters:
+      - name: stream
+        type: "&mut S"
+        direction: in-out
+        description: "The Authenticated-bound async transport."
+      - name: channel_binding
+        type: "[u8; 32]"
+        direction: in
+        description: "32-byte binding derived from THIS TLS session (ISC-37)."
+      - name: negotiated_version
+        type: "wire::ProtocolVersion"
+        direction: in
+        description: "The HELLO-negotiated protocol version."
+      - name: identity
+        type: "&ServerIdentity"
+        direction: in
+        description: "The server's signing identity."
+      - name: now_unix_ms
+        type: u64
+        direction: in
+        description: "Freshness timestamp for the server envelope."
+      - name: send_counter
+        type: u64
+        direction: in
+        description: "Server outbound replay counter (D7: wall-clock unix-ms)."
+      - name: seen
+        type: "&SeenMap"
+        direction: in
+        description: "Shared RAM-only highest-counter-per-key replay map."
+    returns:
+      type: "Result<VerifiedPeer, IdentityProofError>"
+      description: "The VerifiedPeer token on success."
+      error_variants:
+        - name: Sign
+          condition: "Signing the server envelope failed; wraps SignatureError."
+        - name: Frame
+          condition: "Reading/writing an envelope frame failed; wraps HelloError."
+        - name: ChannelBinding
+          condition: "Deriving the channel binding failed; wraps ChannelBindingError."
+        - name: Verify
+          condition: "The client envelope failed verification (bad sig, stale, replayed); wraps VerifyRejection."
+    postconditions:
+      - description: "Every error variant maps to the same uniform wire close (A-S12) — no per-check reason frame."
+    security:
+      handles_secrets: true
+    iscs: [S19, "40", "42", A-S12, A-S1]
+
+  # ── runtime ──────────────────────────────────────────────────────
+  - name: run
+    module: daemonseed_server::runtime
+    description: >-
+      Accept loop: bind, accept in a biased tokio::select! that prefers shutdown,
+      spawn per-connection tasks sharing one ServerContext (identity, public_space,
+      server_source, RAM SeenMap, RAM CotRegistry — so members on different
+      connections meet at the same rendezvous, ISC-A-S5).
+    signature: "pub async fn run<F: Future<Output = ()>>(addr: SocketAddr, tls_config: ServerConfig, identity: Arc<ServerIdentity>, public_space: Arc<PublicSpaceState>, server_source: Option<String>, shutdown: F, observer: ConnectionObserver) -> io::Result<()>"
+    parameters:
+      - name: addr
+        type: SocketAddr
+        direction: in
+        description: "Bind address."
+      - name: tls_config
+        type: ServerConfig
+        direction: in
+        description: "The assembled rustls ServerConfig."
+      - name: identity
+        type: "Arc<ServerIdentity>"
+        direction: in
+        description: "Shared server signing identity."
+      - name: public_space
+        type: "Arc<PublicSpaceState>"
+        direction: in
+        description: "Shared public-space state served post-auth (M6)."
+      - name: server_source
+        type: "Option<String>"
+        direction: in
+        description: "AGPL §13 corresponding-source URL advertised in HELLO (ISC-9)."
+      - name: shutdown
+        type: F
+        direction: in
+        description: "Future that resolves to trigger graceful shutdown."
+      - name: observer
+        type: ConnectionObserver
+        direction: in
+        description: "Integration-test seam; production uses noop_observer()."
+    returns:
+      type: "io::Result<()>"
+      description: "Ok on graceful shutdown; Err on a fatal bind/accept failure."
+      error_variants:
+        - name: Io
+          condition: "Binding the listener or a fatal accept-loop error."
+    iscs: [S5, A-S9, S19, "2"]
+
+  - name: drive_negotiated_connection
+    module: daemonseed_server::runtime
+    description: >-
+      HELLO-only driver retained as an in-memory-duplex test seam; the production
+      path is serve_connection (private), which also runs identity-proof off the
+      concrete TLS stream.
+    signature: "pub async fn drive_negotiated_connection<S>(stream: S, observer: ConnectionObserver)"
+    parameters:
+      - name: stream
+        type: S
+        direction: in-out
+        description: "An async transport (typically an in-memory duplex for tests)."
+      - name: observer
+        type: ConnectionObserver
+        direction: in
+        description: "Reports the HELLO negotiation outcome."
+    returns:
+      type: "()"
+      description: "No return; drives the connection to completion."
+    iscs: ["36"]
+
+  - name: shutdown_signal
+    module: daemonseed_server::runtime
+    description: "Composes ctrl_c + SIGTERM on unix; ctrl_c only on non-unix."
+    signature: "pub fn shutdown_signal() -> impl Future<Output = ()>"
+    parameters: []
+    returns:
+      type: "impl Future<Output = ()>"
+      description: "A future that resolves on the first received shutdown signal."
+    iscs: ["9"]
+
+  - name: parse_listen_addr
+    module: daemonseed_server::runtime
+    description: "Parse a listen-address string into a SocketAddr."
+    signature: "pub fn parse_listen_addr(s: &str) -> io::Result<SocketAddr>"
+    parameters:
+      - name: s
+        type: "&str"
+        direction: in
+        description: "The listen-address string from config."
+    returns:
+      type: "io::Result<SocketAddr>"
+      description: "The parsed socket address."
+      error_variants:
+        - name: Io
+          condition: "The string did not parse as a SocketAddr."
+    iscs: [S5]
+
+  - name: noop_observer
+    module: daemonseed_server::runtime
+    description: "The production no-op ConnectionObserver."
+    signature: "pub fn noop_observer() -> ConnectionObserver"
+    parameters: []
+    returns:
+      type: ConnectionObserver
+      description: "An observer that ignores every outcome."
+
+  - name: shutdown_after
+    module: daemonseed_server::runtime
+    description: "Deterministic test shutdown — sleep-then-resolve."
+    signature: "pub async fn shutdown_after(dur: Duration)"
+    parameters:
+      - name: dur
+        type: Duration
+        direction: in
+        description: "Delay before the shutdown future resolves."
+    returns:
+      type: "()"
+      description: "Resolves after `dur` elapses."
+
+  # ── public_space ─────────────────────────────────────────────────
+  - name: load_whitelist
+    module: daemonseed_server::public_space
+    description: >-
+      Load the signer whitelist. One entry per line (hex full key or name#hash
+      handle); blank lines ignored; a malformed line is a hard error (ISC-S8).
+      Reload reflects edits (ISC-13/14).
+    signature: "pub fn load_whitelist(path: &Path) -> Result<Whitelist, WhitelistLoadError>"
+    parameters:
+      - name: path
+        type: "&Path"
+        direction: in
+        description: "Plaintext whitelist file path."
+    returns:
+      type: "Result<Whitelist, WhitelistLoadError>"
+      description: "The parsed whitelist."
+      error_variants:
+        - name: Read
+          condition: "Reading the whitelist file failed; carries path + io source."
+        - name: Parse
+          condition: "A line is malformed; carries the 1-based line number (never silently skipped)."
+    iscs: [S8, "13", "14"]
+
+  - name: "PublicSpaceState::load"
+    module: daemonseed_server::public_space
+    description: >-
+      Load + verify whitelist, posts, and MOTD. server_pubkey is accepted as a
+      MOTD signer in addition to the whitelist (ISC-26). Invalid post files +
+      invalid/missing MOTD are skipped, not errors (verify-and-serve).
+    signature: "pub fn load(cfg: &PublicSpaceConfig, server_pubkey: &[u8; PK_LEN]) -> Result<Self, LoadError>"
+    parameters:
+      - name: cfg
+        type: "&PublicSpaceConfig"
+        direction: in
+        description: "Borrowed slice of ServerConfig fields."
+      - name: server_pubkey
+        type: "&[u8; PK_LEN]"
+        direction: in
+        description: "Server pubkey, accepted as an additional MOTD signer (ISC-26)."
+    returns:
+      type: "Result<PublicSpaceState, LoadError>"
+      description: "The loaded public-space state."
+      error_variants:
+        - name: Whitelist
+          condition: "Whitelist loading failed; wraps WhitelistLoadError."
+        - name: PostsDir
+          condition: "The posts directory could not be read; carries path + io source."
+    iscs: [S7, S8, S9, S10, "26"]
+
+  - name: "PublicSpaceState::upload_post"
+    module: daemonseed_server::public_space
+    description: >-
+      Verify vs whitelist (ISC-7), require the topic be in the operator set
+      (ISC-19), persist verbatim under content-address (D-M6-7) + hold in RAM;
+      returns the 48-byte address.
+    signature: "pub fn upload_post(&self, artifact: SignedArtifact) -> Result<[u8; 48], UploadError>"
+    parameters:
+      - name: artifact
+        type: SignedArtifact
+        direction: in
+        description: "The signed post artifact."
+    returns:
+      type: "Result<[u8; 48], UploadError>"
+      description: "The content-address of the stored post."
+      error_variants:
+        - name: Unauthorized
+          condition: "Signer is not whitelisted or the signature failed (gRPC PermissionDenied)."
+        - name: BadTopic
+          condition: "The post's topic is not in the operator set (gRPC InvalidArgument)."
+        - name: Malformed
+          condition: "The artifact is structurally invalid (gRPC InvalidArgument)."
+        - name: StorageDisabled
+          condition: "No posts_dir is configured (gRPC FailedPrecondition)."
+        - name: Io
+          condition: "Persisting the post to disk failed (gRPC Internal)."
+        - name: Module
+          condition: "A crypto-module error occurred during verification (gRPC Internal)."
+    iscs: [S7, S8, "7", "19"]
+
+  - name: "PublicSpaceState::delete_post"
+    module: daemonseed_server::public_space
+    description: >-
+      Signed delete; the signer must be whitelisted AND the post's original
+      author (ISC-8 / ISC-20).
+    signature: "pub fn delete_post(&self, delete_artifact: SignedArtifact) -> Result<(), DeleteError>"
+    parameters:
+      - name: delete_artifact
+        type: SignedArtifact
+        direction: in
+        description: "The signed delete request."
+    returns:
+      type: "Result<(), DeleteError>"
+      description: "Ok if the post was deleted."
+      error_variants:
+        - name: Unauthorized
+          condition: "Not whitelisted, bad signature, or not the original author (gRPC PermissionDenied)."
+        - name: Malformed
+          condition: "The delete artifact is structurally invalid (gRPC InvalidArgument)."
+        - name: NotFound
+          condition: "No post exists at the named address (gRPC NotFound)."
+        - name: StorageDisabled
+          condition: "No posts_dir is configured (gRPC FailedPrecondition)."
+        - name: Io
+          condition: "Removing the post from disk failed (gRPC Internal)."
+        - name: Module
+          condition: "A crypto-module error occurred during verification (gRPC Internal)."
+    iscs: [S8, "8", "20"]
+
+  - name: "PublicSpaceService::new"
+    module: daemonseed_server::public_space
+    description: "Construct the tonic adapter over shared public-space state."
+    signature: "pub fn new(state: Arc<PublicSpaceState>) -> Self"
+    parameters:
+      - name: state
+        type: "Arc<PublicSpaceState>"
+        direction: in
+        description: "Shared public-space state."
+    returns:
+      type: PublicSpaceService
+      description: "A tonic service implementing the generated PublicSpace trait."
+    iscs: [S4]
+
+  - name: serve_application
+    module: daemonseed_server::public_space
+    description: >-
+      Serve BOTH the PublicSpace service and the CircleOfTrust relay over one
+      Authenticated transport (h2 keepalive on; ~10s/20s MVP defaults drive CoT
+      reaping) until the peer closes. In production S is the raw transport from
+      Connection<Authenticated, TlsStream<TcpStream>>::into_inner(). Renamed from
+      serve_public_space at M8.
+    signature: "pub async fn serve_application<S: AsyncRead + AsyncWrite + Send + Unpin + 'static>(stream: S, public_space: PublicSpaceService, cot: CotRegistry) -> Result<(), tonic::transport::Error>"
+    parameters:
+      - name: stream
+        type: S
+        direction: in-out
+        description: "The single already-Authenticated transport."
+      - name: public_space
+        type: PublicSpaceService
+        direction: in
+        description: "The public-space tonic service."
+      - name: cot
+        type: CotRegistry
+        direction: in
+        description: "The shared circle-of-trust fan-out registry."
+    returns:
+      type: "Result<(), tonic::transport::Error>"
+      description: "Ok when the peer closes the connection."
+      error_variants:
+        - name: Transport
+          condition: "The tonic transport failed serving the connection."
+    preconditions:
+      - description: "The connection must already be Authenticated (served off the Authenticated type-state; unreachable pre-auth, ISC-2)."
+    iscs: [S4, "2", "3", "4"]
+
+  # ── cot ──────────────────────────────────────────────────────────
+  - name: "CotService::subscribe"
+    module: daemonseed_server::cot
+    description: >-
+      Bidi handler. First inbound frame names the asset (48-byte address, else
+      InvalidArgument) and refs it; an inbound pump task relays subsequent frames
+      (dropping any that name a different asset — no cross-asset injection); the
+      returned stream fans co-subscribers' frames back and reaps on drop.
+    signature: "async fn subscribe(&self, request: Request<Streaming<CotFrame>>) -> Result<Response<CotSubscribeStream>, Status>"
+    parameters:
+      - name: request
+        type: "Request<Streaming<CotFrame>>"
+        direction: in
+        description: "The inbound subscription stream; first frame names the asset."
+    returns:
+      type: "Result<Response<CotSubscribeStream>, Status>"
+      description: "The outbound co-subscriber fan-out stream."
+      error_variants:
+        - name: InvalidArgument
+          condition: "The first inbound frame did not carry a 48-byte rendezvous address."
+    postconditions:
+      - description: "The server never decrypts payloads and persists nothing (ISC-A-S2)."
+      - description: "The asset is reaped at refcount zero when the stream drops (ISC-A-S5)."
+    iscs: [S4, A-S2, A-S5, "5", "7", "9", "10", "11"]
+
+  # ── boot_gate ────────────────────────────────────────────────────
+  - name: gate_boot
+    module: daemonseed_server::boot_gate
+    description: "Map a release-signature verify result to a boot decision. Ok boots; any Err refuses. The pure decision."
+    signature: "pub fn gate_boot(verify_result: Result<(), ReleaseVerifyError>) -> BootDecision"
+    parameters:
+      - name: verify_result
+        type: "Result<(), ReleaseVerifyError>"
+        direction: in
+        description: "The outcome of verifying the binary's release signatures."
+    returns:
+      type: BootDecision
+      description: "Boot on Ok; RefuseToBoot(reason) on any Err — no boot-with-warning (ISC-A-S13)."
+    iscs: [S18, A-S13]
+
+  - name: gate_boot_with
+    module: daemonseed_server::boot_gate
+    description: >-
+      Compose core::release::verify_multisig with gate_boot. The digest
+      computation + binary-embedded signatures are M10-infra.
+    signature: "pub fn gate_boot_with(anchor: &ReleaseAnchor, message: &[u8], signatures: &[&[u8]]) -> BootDecision"
+    parameters:
+      - name: anchor
+        type: "&ReleaseAnchor"
+        direction: in
+        description: "The bundled release trust anchor."
+      - name: message
+        type: "&[u8]"
+        direction: in
+        description: "The signed-bytes message (the binary digest, M10-infra)."
+      - name: signatures
+        type: "&[&[u8]]"
+        direction: in
+        description: "The candidate release signatures over `message`."
+    returns:
+      type: BootDecision
+      description: "Boot if the signatures meet the anchor threshold; RefuseToBoot otherwise."
+      error_variants:
+        - name: BelowThreshold
+          condition: "Fewer valid signatures than the anchor requires (carried inside RefuseToBoot)."
+        - name: UnrecognizedSignature
+          condition: "A signature does not match any anchor key (carried inside RefuseToBoot)."
+        - name: MalformedSignature
+          condition: "A signature is structurally invalid (carried inside RefuseToBoot)."
+        - name: Module
+          condition: "A crypto-module error occurred during verify (carried inside RefuseToBoot)."
+    iscs: [S18, A-S13]
 
 # ─────────────────────────────────────────────────────────────────────
-# Operator config surface (planned — not implemented at M3)
+# Error types
 # ─────────────────────────────────────────────────────────────────────
 
-operator_config:
-  format: "TOML"
-  status: "M4a commit 3 (minimal); grows per-milestone"
-  iscs: [S3, S11, S13, S16, S17, C35]
-  resolution_order:
-    - "--config <path> (explicit CLI flag)"
-    - "$XDG_CONFIG_HOME/daemonseed/daemonseed.toml (or $HOME/.config/daemonseed/daemonseed.toml if XDG unset)"
-    - "./daemonseed.toml (current working directory)"
-  m4a_fields:
-    - "listen_addr (string, default '0.0.0.0:443')"
-    - "key_path (path, required) — ML-DSA-87 seed file location"
-    - "display_name (string, optional) — empty surfaces floor `#<12hex>` per ISC-C4b"
-  planned_sections:
-    - "[federation] trust-mode defaults, introduce-to-clients, S2S peering list (M5)"
-    - "[signers] whitelist of authorized signer pubkeys (M6)"
-    - "[suite_policy] per-suite cutoff dates (M7)"
-    - "[rate_limits] per-conn / per-key / per-IP thresholds (M9)"
+error_types:
+  - name: ConfigError
+    module: daemonseed_server::config
+    variants:
+      - name: NotFound
+        description: "No config file was found at any path in the resolution order; carries the searched list."
+        recoverable: true
+        user_action: "Create daemonseed.toml at one of the listed paths, or pass --config <path>."
+      - name: Read
+        description: "Reading the config file from disk failed; carries the path and io::Error source."
+        recoverable: true
+        user_action: "Check the file exists and is readable, then retry."
+      - name: Parse
+        description: "Parsing the TOML failed (e.g., missing required key_path)."
+        recoverable: true
+        user_action: "Fix the TOML; key_path is required and has no default."
+
+  - name: IdentityError
+    module: daemonseed_server::identity
+    variants:
+      - name: NotFound
+        description: "The seed file was not found."
+        recoverable: true
+        user_action: "Use load_or_generate to create one on first boot."
+      - name: EntropyFailure
+        description: "The OS RNG failed to supply seed entropy; carries the error string."
+        recoverable: true
+        user_action: "Ensure the OS RNG is available, then retry."
+      - name: ReadFailed
+        description: "Reading the seed file from disk failed."
+        recoverable: true
+        user_action: "Check the seed-file path and permissions."
+      - name: WriteFailed
+        description: "Persisting a freshly-generated seed file failed."
+        recoverable: true
+        user_action: "Check the directory is writable, then retry."
+      - name: MalformedSeedFile
+        description: "The seed file exists but its contents are the wrong shape."
+        recoverable: false
+        user_action: "Restore a valid seed file or regenerate identity."
+      - name: UnknownSeedFileMagic
+        description: "The seed file's 4-byte magic prefix is not `dsv1`."
+        recoverable: false
+        user_action: "The file is not a daemonseed seed; supply the correct key_path."
+      - name: Keygen
+        description: "Re-deriving the ML-DSA-87 keypair from the seed failed."
+        recoverable: false
+        user_action: "Confirm the crypto module is initialized (Cnsa2 profile)."
+      - name: HandleConstruct
+        description: "Building the `<name>#<hash>` handle from the derived pubkey failed."
+        recoverable: false
+        user_action: "Confirm the display name and derived pubkey are valid."
+
+  - name: TlsError
+    module: daemonseed_server::tls
+    variants:
+      - name: Provider
+        description: "Provider construction/registration failed; carries a diagnostic string."
+        recoverable: false
+        user_action: "First-call failure is fatal (no fallback to aws_lc_rs); investigate the provider build."
+      - name: ProviderAlreadyInstalled
+        description: "A different process-wide CryptoProvider was already installed."
+        recoverable: false
+        user_action: "Ensure only the CNSA 2.0 hybrid provider is installed process-wide."
+      - name: CertBuilder
+        description: "Self-signed ML-DSA-87 cert construction failed; wraps CertBuilderError."
+        recoverable: false
+        user_action: "Verify the seed + server-id are valid inputs to the cert builder."
+      - name: Rustls
+        description: "rustls ServerConfig assembly failed; carries a diagnostic string."
+        recoverable: false
+        user_action: "Confirm the provider is installed before build_server_config."
+      - name: ValidityOverflow
+        description: "The validity window overflowed the cert time representation."
+        recoverable: true
+        user_action: "Pass a smaller valid_for Duration."
+
+  - name: HelloError
+    module: daemonseed_server::hello
+    variants:
+      - name: Io
+        description: "An underlying read or write failed."
+        recoverable: false
+        user_action: "The connection is closing; abandon the exchange."
+      - name: Decode
+        description: "prost failed to decode a frame body."
+        recoverable: false
+        user_action: "The peer sent a malformed frame; close the connection."
+      - name: FrameTooLarge
+        description: "A length prefix exceeded MAX_FRAME_BYTES (64 KiB) — amplification DoS guard (ISC-A-S3)."
+        recoverable: false
+        user_action: "Reject the peer; do not allocate the oversized body."
+      - name: WireOutOfRange
+        description: "A wire protocol-version value was out of range; wraps VersionError."
+        recoverable: false
+        user_action: "The peer offered an invalid version; close the connection."
+
+  - name: IdentityProofError
+    module: daemonseed_server::identity_proof
+    variants:
+      - name: Key
+        description: "Re-deriving the signing keypair from the seed failed; wraps KeyDerivationError."
+        recoverable: false
+        user_action: "Confirm the crypto module is initialized and the seed is valid."
+      - name: Sign
+        description: "Signing the server envelope failed; wraps SignatureError."
+        recoverable: false
+        user_action: "Confirm the signing keypair is valid; this is diagnostic-only on the wire (A-S12)."
+      - name: Frame
+        description: "Reading/writing an envelope frame failed; wraps HelloError."
+        recoverable: false
+        user_action: "The connection is closing; abandon the proof."
+      - name: ChannelBinding
+        description: "Deriving the channel binding failed; wraps ChannelBindingError."
+        recoverable: false
+        user_action: "The TLS session could not export a binding; close the connection."
+      - name: Verify
+        description: "The client envelope failed verification (bad sig, stale, replayed); wraps VerifyRejection."
+        recoverable: false
+        user_action: "Close uniformly — every variant maps to the same wire close (A-S12)."
+
+  - name: WhitelistLoadError
+    module: daemonseed_server::public_space
+    variants:
+      - name: Read
+        description: "Reading the whitelist file failed; carries the path and io source."
+        recoverable: true
+        user_action: "Check the whitelist path and permissions, then reload."
+      - name: Parse
+        description: "A whitelist line is malformed; carries the 1-based line number."
+        recoverable: true
+        user_action: "Fix the malformed line; a bad line is never silently skipped (ISC-S8)."
+
+  - name: LoadError
+    module: daemonseed_server::public_space
+    variants:
+      - name: Whitelist
+        description: "Whitelist loading failed; wraps WhitelistLoadError."
+        recoverable: true
+        user_action: "Fix the whitelist file per the wrapped error, then reload."
+      - name: PostsDir
+        description: "The posts directory could not be read; carries path + io source."
+        recoverable: true
+        user_action: "Check the posts_dir path and permissions."
+
+  - name: UploadError
+    module: daemonseed_server::public_space
+    variants:
+      - name: Unauthorized
+        description: "Signer not whitelisted or signature failed (gRPC PermissionDenied)."
+        recoverable: true
+        user_action: "Sign with a whitelisted key."
+      - name: BadTopic
+        description: "Topic not in the operator set (gRPC InvalidArgument)."
+        recoverable: true
+        user_action: "Post into an operator-defined topic."
+      - name: Malformed
+        description: "The artifact is structurally invalid (gRPC InvalidArgument)."
+        recoverable: true
+        user_action: "Re-encode the signed artifact correctly."
+      - name: StorageDisabled
+        description: "No posts_dir is configured (gRPC FailedPrecondition)."
+        recoverable: false
+        user_action: "Configure posts_dir in the server TOML."
+      - name: Io
+        description: "Persisting the post failed (gRPC Internal)."
+        recoverable: true
+        user_action: "Check disk space/permissions, then retry."
+      - name: Module
+        description: "A crypto-module error occurred during verification (gRPC Internal)."
+        recoverable: false
+        user_action: "Confirm the crypto module is initialized."
+
+  - name: DeleteError
+    module: daemonseed_server::public_space
+    variants:
+      - name: Unauthorized
+        description: "Not whitelisted, bad signature, or not the original author (gRPC PermissionDenied)."
+        recoverable: true
+        user_action: "Delete as the original whitelisted author."
+      - name: Malformed
+        description: "The delete artifact is structurally invalid (gRPC InvalidArgument)."
+        recoverable: true
+        user_action: "Re-encode the signed delete correctly."
+      - name: NotFound
+        description: "No post exists at the named address (gRPC NotFound)."
+        recoverable: false
+        user_action: "Confirm the content-address of an existing post."
+      - name: StorageDisabled
+        description: "No posts_dir is configured (gRPC FailedPrecondition)."
+        recoverable: false
+        user_action: "Configure posts_dir in the server TOML."
+      - name: Io
+        description: "Removing the post from disk failed (gRPC Internal)."
+        recoverable: true
+        user_action: "Check disk permissions, then retry."
+      - name: Module
+        description: "A crypto-module error occurred during verification (gRPC Internal)."
+        recoverable: false
+        user_action: "Confirm the crypto module is initialized."
+
+  - name: RateLimitTrip
+    module: daemonseed_server::rate_limit
+    variants:
+      - name: RequestRate
+        description: "The per-connection request token bucket was exhausted."
+        recoverable: true
+        user_action: "Server-side diagnostic only; maps to a uniform silent drop (A-S12)."
+      - name: SubscriptionCap
+        description: "The per-connection subscription cap was reached."
+        recoverable: true
+        user_action: "Server-side diagnostic only; maps to a uniform silent drop (A-S12)."
+      - name: VerifyCap
+        description: "The per-connection verify cap was reached."
+        recoverable: true
+        user_action: "Server-side diagnostic only; maps to a uniform silent drop (A-S12)."
+      - name: PerKeyConnCap
+        description: "The per-identity-key concurrent-connection cap was reached."
+        recoverable: true
+        user_action: "Server-side diagnostic only; maps to a uniform silent drop (A-S12)."
+
+# ─────────────────────────────────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────────────────────────────────
+
+constants:
+  - name: SEED_LEN
+    module: daemonseed_server::identity
+    type: usize
+    value: "32"
+    description: "Length of an ML-DSA-87 seed in bytes per FIPS 204 §5.1."
+
+  - name: HASH_PREFIX_BYTES
+    module: daemonseed_server::identity
+    type: usize
+    value: "6"
+    description: "Re-export of daemonseed_core::handle::HASH_PREFIX_BYTES (12 hex chars)."
+
+  - name: DEFAULT_CERT_VALIDITY
+    module: daemonseed_server::tls
+    type: Duration
+    value: "90 days"
+    description: "Cert rotation cadence; operationally visible without being annoying."
+
+  - name: CNSA_2_0_KATS
+    module: daemonseed_server::kats
+    type: "&[oxicrypt_module::KatEntry]"
+    value: "union-assembled slice"
+    description: >-
+      Concatenates SHA + HMAC + AES + KDF + DRBG + ECDH + ML-KEM + ML-DSA
+      per-crate KATS in roughly call-order.
+
+  - name: REJECT_NO_COMMON_VERSION
+    module: daemonseed_server::hello
+    type: u32
+    value: "1"
+    description: "HELLO reject code; mirrors the canonical proto-file reject-code registry."
+
+  - name: MAX_FRAME_BYTES
+    module: daemonseed_server::hello
+    type: usize
+    value: "65536"
+    description: "Maximum length-prefixed frame size (64 KiB); closes the single-frame amplification DoS (ISC-A-S3)."
+
+  - name: MVP_SUITE_ID
+    module: daemonseed_server::identity_proof
+    type: u32
+    value: "1"
+    description: "CNSA 2.0 suite tag carried on the server envelope; widens to real suite negotiation post-MVP (S15/S16)."
