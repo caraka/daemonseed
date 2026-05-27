@@ -465,6 +465,7 @@ dependencies = [
  "daemonseed-core",
  "daemonseed-proto",
  "daemonseed-server",
+ "hyper-util",
  "oxicrypt-module",
  "oxitls-rustls-provider",
  "prost",
@@ -472,6 +473,9 @@ dependencies = [
  "rustls-pki-types",
  "tokio",
  "tokio-rustls",
+ "tokio-stream",
+ "tonic",
+ "tower 0.5.3",
 ]
 
 [[package]]

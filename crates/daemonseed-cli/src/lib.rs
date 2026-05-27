@@ -39,4 +39,5 @@
 pub mod connect;
 pub mod identity_proof;
 pub mod public_space;
+pub mod session;
 pub mod tofu_stub;

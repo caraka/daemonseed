@@ -92,6 +92,22 @@ modules:
     iscs: [C19, "25", "30", "31", "32", A-C5, A-S3]
     added_in: "v0.8.0 (M6)"
 
+  - name: daemonseed_cli::session
+    description: >-
+      Live application session over a post-Authenticated stream (M11). The
+      client mirror of daemonseed_server::public_space::serve_application:
+      AppSession::open builds ONE tonic Channel over the single
+      already-established AppStream (Endpoint::connect_with_connector +
+      hyper_util TokioIo; connector invoked once, no second dial), then mints
+      PublicSpaceClient / CircleOfTrustClient on demand. HTTP/2 multiplexes
+      every RPC and the long-lived Subscribe stream over that one connection.
+      Generic over the stream type so production (AppStream) and tests
+      (tokio::io::duplex) share the path.
+    no_std: false
+    depends_on: [daemonseed-proto, daemonseed-server, daemonseed_cli::connect]
+    iscs: ["10", "36"]
+    added_in: "v0.13.0 (M11)"
+
 # ─────────────────────────────────────────────────────────────────────
 # Types — every struct/enum/trait/alias the crate exposes, hoisted out of
 # the dialect's per-module `public:` lists.
@@ -298,6 +314,22 @@ types:
         description: Signature / whitelist verification failed.
       - name: AddressMismatch
         description: The server-asserted content address didn't match the client-derived one.
+
+  - name: AppSession
+    module: daemonseed_cli::session
+    kind: struct
+    description: >-
+      A live application session: one tonic Channel multiplexed over a single
+      post-Authenticated stream. Clone (Channel is reference-counted);
+      public_space() / circle_of_trust() mint generated service clients.
+
+  - name: SessionError
+    module: daemonseed_cli::session
+    kind: enum
+    description: AppSession::open failure.
+    variants:
+      - name: "Transport(tonic::transport::Error)"
+        description: The tonic channel failed to come up over the stream.
 
 # ─────────────────────────────────────────────────────────────────────
 # Functions — every public function plus the binary's `connect` subcommand
@@ -882,6 +914,48 @@ profile_discovery:
     - "CWD-discovery (daemonseed.toml in current directory)"
     - "XDG fallback ($XDG_CONFIG_HOME/daemonseed/daemonseed.toml)"
   iscs: [C35]
+
+  # ── daemonseed_cli::session ───────────────────────────────────────
+  - name: "AppSession::open"
+    module: daemonseed_cli::session
+    description: >-
+      Build a session over an already-Authenticated stream. The stream is
+      consumed once by the tonic connector; the placeholder authority is never
+      resolved (no dial happens). Generic over the stream so production
+      (AppStream) and tests (tokio::io::duplex) share the path.
+    signature: "pub async fn open<S>(stream: S) -> Result<AppSession, SessionError> where S: AsyncRead + AsyncWrite + Send + Unpin + 'static"
+    parameters:
+      - name: stream
+        type: S
+        direction: in
+        description: The post-Authenticated stream (production AppStream, or a test duplex half).
+    returns:
+      type: "Result<AppSession, SessionError>"
+      description: A live session whose channel rides the supplied stream.
+      error_variants:
+        - name: Transport
+          condition: The tonic channel failed to come up over the stream.
+    iscs: ["10", "36"]
+
+  - name: "AppSession::public_space"
+    module: daemonseed_cli::session
+    description: A PublicSpaceClient over this session (MOTD, posts, taxonomy, whitelist, shares, deprecation).
+    signature: "pub fn public_space(&self) -> PublicSpaceClient<tonic::transport::Channel>"
+    parameters: []
+    returns:
+      type: "PublicSpaceClient<Channel>"
+      description: A public-space client sharing the session channel.
+    iscs: ["36"]
+
+  - name: "AppSession::circle_of_trust"
+    module: daemonseed_cli::session
+    description: A CircleOfTrustClient over this session (the bidirectional Subscribe live relay).
+    signature: "pub fn circle_of_trust(&self) -> CircleOfTrustClient<tonic::transport::Channel>"
+    parameters: []
+    returns:
+      type: "CircleOfTrustClient<Channel>"
+      description: A circle-of-trust client sharing the session channel.
+    iscs: ["10", S20]
 
 # ─────────────────────────────────────────────────────────────────────
 # Output conventions — extra, non-canonical breadcrumb section.
