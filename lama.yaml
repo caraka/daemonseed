@@ -12,7 +12,7 @@ lama: "0.1"
 
 project:
   name: daemonseed
-  version: "0.11.0-pre"
+  version: "0.12.0-pre"
   description: >-
     Federated end-to-end-encrypted communication and file-sharing
     protocol. Pure-Rust backend, CNSA 2.0 baseline crypto via the
@@ -28,11 +28,15 @@ project:
   phase: private
 
 # ─────────────────────────────────────────────────────────────────────
-# Implementation status: M8 closed at v0.10.0; v0.11.0-pre cuts at M9 close.
-# M9 closes 9 ISCs (S17, C15, C16, C17, C18, C26, A-S12, A-C3, A-C4).
-# NOTE: the per-milestone tests/m{N}_isc_coverage.rs convention lapsed across
-# M7–M8 (re-instated at M9), so the coverage registry currently undercounts;
-# a cumulative ISC recount is a tracked manifest cleanup, not an M9 deliverable.
+# Implementation status: M9 closed at v0.11.0; v0.12.0-pre cuts at the M10
+# verifiable-core close. M10-core closes S18/A-S13/C27/A-C11 (release-signing
+# verify, boot-gate, update-lifecycle FSM) and backfills ISC-S20 into the
+# coverage registry (the M7–M8 m{N}_isc_coverage.rs convention lapse had left
+# it unregistered). The M10 release-signing INFRASTRUCTURE (real keys, Sigstore,
+# reproducible build, update-relay role) and platform features (C7 biometric,
+# C20 autostart) are deferred to M10-infra. NOTE: these manifests are a
+# project-local dialect; bringing them to canonical LAMA 0.1 (matching oxicrypt)
+# is tracked as a separate conformance PR.
 # ─────────────────────────────────────────────────────────────────────
 
 milestones_complete:
@@ -67,12 +71,15 @@ milestones_complete:
     tag: v0.10.0
     summary: "Circle-of-trust live relay (refcounted bidi Subscribe, reap-at-zero), flat metadata-free circle key derivation, per-relay rendezvous addressing, content-addressed chunk store, and the encrypted incremental redb share indexer with Pi-civility background scanning. Added ISC-S20."
   - id: M9
-    tag: "v0.11.0 (cuts on merge)"
+    tag: v0.11.0
     summary: "Abuse-resilience + chat affordances. Server: multi-granularity RAM-only rate limits — per-connection token bucket + subscription/verify caps, per-identity-key connection table GC'd on disconnect, uniform silent close (S17/A-S12). Client: exponential+jitter reconnect backoff with an 8-retry budget and layer-based close-cause categorization (C26); mute + hide-shares lists persisted in the seeds blob, never leaked (C15/C16/A-C3); @-mention recognition + resolution as pure post-decrypt/pre-send functions with no new server-visible distinction (C17/C18/A-C4). TUI rendering of these surfaces lands at M11. Closes 9 ISCs."
+  - id: M10-core
+    tag: "v0.12.0 (cuts on merge)"
+    summary: "M10 verifiable-core (the pure-Rust, TDD-able half). Release trust anchor + N-of-M ML-DSA-87 multi-sig verify (daemonseed_core::release), the server boot-gate that refuses to boot on failed verify with no boot-with-warning path (daemonseed_server::boot_gate), and the client update-lifecycle FSM enforcing verify-before-apply / never-auto-install / no-silent-downgrade / wipe-and-log-on-failure (daemonseed_core::release::update). Plus the M9 per-key rate-limit slot RAII drop-guard and the ISC-S20 coverage backfill. Closes S18/A-S13/C27/A-C11. The release-signing infrastructure and C7/C20 platform features are deferred to M10-infra."
 
 milestones_planned:
-  - id: M10
-    summary: "Release distribution + update lifecycle + platform."
+  - id: M10-infra
+    summary: "M10 deferred half: real release-signing keys + N-of-M governance identities, Sigstore co-signature, reproducible build, store/F-Droid/OS-packager channels, the optional update-relay role, C7 biometric/secure-enclave login, C20 OS-native autostart, and live update fetch."
   - id: M11
     summary: "TUI integration + MVP gate (4-daemon end-to-end)."
 
@@ -85,9 +92,11 @@ crates:
     purpose: >-
       Protocol library — identity, storage, bootstrap, first-start
       orchestration, crypto-agility primitives, circle-of-trust key derivation,
-      and the M9 client surfaces: reconnect backoff, mute / hide-shares lists,
-      and @-mention recognition/resolution. Pure library (no_std-compatible
-      where the underlying primitives allow; currently uses std for I/O).
+      the M9 client surfaces (reconnect backoff, mute / hide-shares lists,
+      @-mention recognition/resolution), and the M10 release surface
+      (daemonseed_core::release: release trust anchor + N-of-M multi-sig verify +
+      update-lifecycle FSM). Pure library (no_std-compatible where the underlying
+      primitives allow; currently uses std for I/O).
     license: AGPL-3.0-or-later
     status: active
     manifest: "docs/llm-api-manifest/daemonseed-core-api.yaml"
@@ -105,7 +114,7 @@ crates:
     manifest: "docs/llm-api-manifest/daemonseed-proto-protocol.yaml"
 
   - name: daemonseed-server
-    purpose: "Relay daemon binary + library. TLS 1.3 termination, APP_HELLO negotiation, the post-HELLO identity-proof exchange that lands a connection at Authenticated (M4b), federation introducer/peering (M5), the post-Authenticated PublicSpace application-stream service (M6, gRPC-over-h2 via daemonseed_server::public_space), and the M8 CircleOfTrust live relay (daemonseed_server::cot) — refcounted bidirectional Subscribe fan-out keyed by rendezvous address, served alongside public-space with h2 keepalive driving reap-at-zero — and the M9 RAM-only rate limiter (daemonseed_server::rate_limit) wired into the per-connection path with per-identity-key admission GC'd on disconnect."
+    purpose: "Relay daemon binary + library. TLS 1.3 termination, APP_HELLO negotiation, the post-HELLO identity-proof exchange that lands a connection at Authenticated (M4b), federation introducer/peering (M5), the post-Authenticated PublicSpace application-stream service (M6, gRPC-over-h2 via daemonseed_server::public_space), and the M8 CircleOfTrust live relay (daemonseed_server::cot) — refcounted bidirectional Subscribe fan-out keyed by rendezvous address, served alongside public-space with h2 keepalive driving reap-at-zero — the M9 RAM-only rate limiter (daemonseed_server::rate_limit) wired into the per-connection path with per-identity-key admission released via an RAII drop-guard on disconnect, and the M10 release boot-gate (daemonseed_server::boot_gate) that refuses to boot on failed release-signature verify (wiring into real startup deferred to M10-infra)."
     license: AGPL-3.0-or-later
     status: active
     manifest: "docs/llm-api-manifest/daemonseed-server-api.yaml"
@@ -326,6 +335,28 @@ capabilities:
       - daemonseed_core::mention
       - daemonseed_core::storage::seeds
     iscs: [C15, C16, C17, C18, C26, A-C3, A-C4]
+
+  - category: "Release-signing verify + update lifecycle (M10 verifiable-core)"
+    summary: >-
+      The pure-Rust half of M10's release/update story. daemonseed_core::release
+      holds the binary-bound release trust anchor (an N-of-M ML-DSA-87 key set,
+      shipping its 1-of-1 shape with the key array empty until the signing-key
+      ceremony) and verify_multisig, which accepts iff >= threshold DISTINCT
+      anchor keys each signed validly — no verify-bypass, each key counted once,
+      a non-anchor signature is a hard refusal, a wrong-length blob is rejected
+      without panic (S18/A-C11). daemonseed_server::boot_gate maps that verify to
+      Boot / RefuseToBoot with no boot-with-warning variant (A-S13).
+      daemonseed_core::release::update is the client update-lifecycle FSM that
+      verifies before applying, never auto-installs (even emergencies), refuses
+      silent downgrades, and wipes+logs on failure — emitting the existing M7
+      update trust-event keys (no new wire surface). Real signing keys, Sigstore,
+      reproducible build, the update-relay role, live fetch, and C7/C20 platform
+      features are deferred to M10-infra.
+    crate: daemonseed-core
+    modules:
+      - daemonseed_core::release
+      - daemonseed_server::boot_gate
+    iscs: [S18, A-S13, C27, A-C11]
 
 # ─────────────────────────────────────────────────────────────────────
 # Cross-cutting properties (system-wide invariants)

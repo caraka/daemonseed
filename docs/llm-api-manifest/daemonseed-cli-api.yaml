@@ -1,10 +1,12 @@
 # ─────────────────────────────────────────────────────────────────────
-# daemonseed-cli — LAMA API Manifest (M4a commit 5)
+# daemonseed-cli — LAMA API Manifest (CLI surface current through M6)
 #
-# The CLI crate gained its first real subcommand (`connect`) at M4a
-# commit 5, replacing the placeholder `fn main() {}`. Substantive
-# additional subcommands land alongside M4b (post-identity-proof
-# the CLI can authenticate as a client) and grow through M11.
+# The CLI crate's only binary subcommand is still `connect`: TLS-1.3 +
+# APP_HELLO (M4a), the full client identity-proof exchange to Authenticated
+# (M4b), then the C22 trust slider (M5). Its library surface also carries M6
+# public-space client plumbing. M7–M10 added no CLI surface. The additional
+# subcommands in `planned_subcommands` are genuinely not yet built (they grow
+# toward M11 / the TUI).
 #
 # Cross-references:
 # - Repository root: ../../lama.yaml
@@ -20,7 +22,7 @@ library:
   description: "Non-interactive scriptable client. `connect <server-id>` does TLS-1.3 + APP_HELLO (M4a) and, as of M4b commit 6, the full client-side identity-proof exchange — returning only after the connection reaches Authenticated."
   license: "AGPL-3.0-or-later"
   manifest_for: "crates/daemonseed-cli"
-  status: "M4b commit 6 (client identity-proof orchestration)"
+  status: "CLI surface current through M6 (connect: identity-proof + C22 trust slider + public-space plumbing); M7–M10 added no CLI surface"
 
 # ─────────────────────────────────────────────────────────────────────
 # Modules landed at M4a commit 5

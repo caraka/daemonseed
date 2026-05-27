@@ -1,10 +1,12 @@
 # ─────────────────────────────────────────────────────────────────────
-# daemonseed-server — LAMA API Manifest (M4a commit 4 in flight)
+# daemonseed-server — LAMA API Manifest (M10 verifiable-core in flight)
 #
-# The server crate gained config / identity / TLS modules at M4a commit 3
-# and the runtime / HELLO frame I/O / KATS modules at M4a commit 4 on
-# top of the v0.4.0 placeholder. The CLI initiator lands in commit 5;
-# integration tests + Wu et al. fixture in commit 6.
+# The server crate landed config / identity / TLS / runtime / HELLO / KATS at
+# M4a, identity-proof at M4b, federation at M5, the public-space service at M6,
+# deprecation-policy publishing at M7, the CoT live relay at M8, RAM-only rate
+# limiting at M9, and the release boot-gate (ISC-A-S13) at M10. The M10
+# release-signing *infrastructure* (real keys, Sigstore, reproducible build,
+# the optional update-relay role) is deferred — see the `planned:` section.
 #
 # Cross-references:
 # - Repository root: ../../lama.yaml
@@ -18,10 +20,10 @@ lama: "0.1"
 library:
   name: daemonseed-server
   version: "0.1.0"
-  description: "Relay daemon binary + library. M4a landed the TCP runtime + APP_HELLO frame I/O + SIGTERM shutdown; M4b added the post-HELLO identity-proof exchange and the Versioned → Authenticated gate; M5 added federation; M6 serves the post-Authenticated public-space application service (posts, MOTD, taxonomy, signer whitelist)."
+  description: "Relay daemon binary + library. M4a landed the TCP runtime + APP_HELLO frame I/O + SIGTERM shutdown; M4b added the post-HELLO identity-proof exchange and the Versioned → Authenticated gate; M5 added federation; M6 serves the post-Authenticated public-space application service (posts, MOTD, taxonomy, signer whitelist); M7 added deprecation-policy publishing; M8 added the circle-of-trust live relay; M9 added RAM-only rate limiting; M10 added the release boot-gate (ISC-A-S13)."
   license: "AGPL-3.0-or-later"
   manifest_for: "crates/daemonseed-server"
-  status: "M6 (public-space service: state, storage, signer-whitelist loading, runtime serve)"
+  status: "M10 verifiable-core (boot-gate landed; release-signing infrastructure — real keys / Sigstore / reproducible build / update-relay role — deferred to M10-infra)"
 
 # ─────────────────────────────────────────────────────────────────────
 # Modules landed at M4a commit 3
@@ -253,6 +255,42 @@ modules:
     key_functions:
       - { sig: "CotService::subscribe(&self, Request<Streaming<CotFrame>>) -> Result<Response<CotSubscribeStream>, Status>", note: "Bidi handler. First inbound frame names the asset (48-byte address, else InvalidArgument) and refs it; an inbound pump task relays subsequent frames (dropping any that name a different asset — no cross-asset injection); the returned stream fans co-subscribers' frames back and reaps on drop." }
 
+  - path: daemonseed_server::rate_limit
+    purpose: >-
+      Multi-granularity, RAM-only abuse/DoS rate limiting (M9, ISC-S17 /
+      ISC-A-S12). Per-connection limits (request token bucket, subscription cap,
+      verify cap) plus a process-lifetime per-identity-key concurrent-connection
+      table, GC'd to empty as connections close. Nothing serializes — state is
+      wiped on restart by construction. Every trip maps to the same uniform
+      silent close (no wire reason). Per-source-IP stays operator-owned (OS
+      firewall, A-S1 carve-out).
+    iscs: [S17, A-S12]
+    added_in: "v0.11.0 (M9); KeySlotGuard/admit_guard v0.12.0 (M10)"
+    public:
+      - { kind: struct, name: RateLimitConfig, note: "Pi-4 civility-floor thresholds: req_burst, req_per_sec, max_subscriptions, max_verifies, max_conns_per_key. Default impl. max_conns_per_key=4 matches the client A-C10 self-cap." }
+      - { kind: enum, name: RateLimitTrip, variants: "{RequestRate, SubscriptionCap, VerifyCap, PerKeyConnCap}", note: "Server-side diagnostic ONLY — no wire form, no serialization; every variant maps to the same uniform drop (A-S12)." }
+      - { kind: struct, name: TokenBucket, note: "Leaky/token bucket. new/new_at(capacity, refill_per_sec[, now]); try_take/try_take_at(now) -> bool." }
+      - { kind: struct, name: ConnectionLimiter, note: "Per-connection limiter. new/new_at(config[, now]); try_request_at, try_subscribe/end_subscribe, try_verify, active_subscriptions. Owned by the per-connection task; dropped with it." }
+      - { kind: struct, name: PerKeyRateTable, note: "RAM-only Arc<Mutex<HashMap<pubkey, count>>> capping concurrent connections per signing key. Clone shares the inner Arc. new(max); admit(key)/release(key)/active_for/tracked_keys; admit_guard(key) -> Result<KeySlotGuard, RateLimitTrip> is the preferred panic-safe acquisition." }
+      - { kind: struct, name: KeySlotGuard, note: "RAII guard (M10) returned by admit_guard; releases the per-key slot in Drop so the count is freed even if the serving task unwinds (panic). Replaces the manual post-serve release in runtime::serve_connection." }
+
+  - path: daemonseed_server::boot_gate
+    purpose: >-
+      Server release boot-gate (M10, ISC-A-S13). Maps the result of verifying the
+      running binary's release signatures (against the bundled trust anchor, via
+      daemonseed_core::release::verify_multisig) to a boot decision. A failed
+      verify is ALWAYS refuse — there is no boot-with-warning variant. The
+      optional update-relay role (which MUST stay opacity-only) and self-install
+      are deliberately absent. Wiring into real startup is deferred to M10-infra
+      (needs the binary's embedded signature + a populated anchor).
+    iscs: [S18, A-S13]
+    added_in: "v0.12.0 (M10)"
+    public:
+      - { kind: enum, name: BootDecision, variants: "{Boot, RefuseToBoot(ReleaseVerifyError)}", note: "No third variant by construction — A-S13's never-boot-with-warning is enforced by the type's shape. RefuseToBoot carries the local failure reason for operator logs only." }
+    key_functions:
+      - { sig: "gate_boot(verify_result: Result<(), ReleaseVerifyError>) -> BootDecision", note: "Ok → Boot; any Err → RefuseToBoot. The pure decision." }
+      - { sig: "gate_boot_with(anchor: &ReleaseAnchor, message: &[u8], signatures: &[&[u8]]) -> BootDecision", note: "Composes core::release::verify_multisig with gate_boot. The digest computation + binary-embedded signatures are M10-infra." }
+
 binaries:
   - name: daemonseed-server
     entry_point: "fn main() -> ExitCode"
@@ -276,71 +314,42 @@ anti_criteria:
     enforcement: >-
       Grep-asserted by
       `daemonseed-integration-tests::tests::m3_isc_coverage::m3_iscs_exercise_end_to_end`
-      (server_suite_transparency block). The assertion is vacuously
-      true at M3 (placeholder main) and becomes a real regression
-      anchor when M5/M6 add CoT-relay code.
+      (server_suite_transparency block). Now a live regression anchor: the M8
+      CoT relay routes by opaque rendezvous address and never consults the
+      registry on the relay path.
     iscs: [A-S10]
 
   - id: "ISC-A-S1 / A-S2 server payload opacity"
     summary: >-
       Server cannot decrypt CoT payloads, cannot link a payload to a
       specific circle, cannot profile per-pubkey traffic patterns.
-      Will be enforced architecturally at M4b+ via the type
-      separation between OpaquePayload<C> and decrypted client-side
-      types.
-    enforcement: "Lands at M4b+; placeholder until then."
+      Enforced architecturally from M4b via the type separation between
+      OpaquePayload<C> and decrypted client-side types, and held by the M8 CoT
+      relay (blind fan-out by opaque address; persists nothing).
+    enforcement: "Live since M4b (type separation) + M8 (blind CoT relay)."
     iscs: [A-S1, A-S2]
 
 # ─────────────────────────────────────────────────────────────────────
 # Planned surface (forward-looking, not yet implemented)
+#
+# M4a–M9 are landed (tags v0.5.0–v0.11.0) and described in the modules above;
+# they no longer appear here. Only genuinely-future surface remains.
 # ─────────────────────────────────────────────────────────────────────
 
 planned:
-  - milestone: M4a (remaining commits)
-    surface:
-      - "commit 5: daemonseed-cli `connect <server-id>` subcommand reaches Versioned state end-to-end"
-      - "commit 6: m4a_isc_coverage + wire-shape regression snapshot + Wu et al. GFW classifier fixture + end-to-end TLS handshake test"
-
-  - milestone: M4b (remaining)
-    surface:
-      - "commit 6: daemonseed-cli client-side identity-proof orchestration (A-C18)"
-      - "commit 7: end-to-end TLS identity-proof test (client + server both reach Authenticated) + uniform-close / replay / skew fixtures + v0.6.0-pre"
-    landed_commit_5:
-      - "Server identity-proof orchestration: channel binding off the live TLS session, signed-envelope exchange, Versioned → Authenticated gate"
-      - "Channel-bound envelope + per-key monotonic counter + ±5min skew window (D1); server outbound counter = wall-clock ms (D7)"
-      - "Uniform close-shape (shape, not timing) for all auth failures (A-S12); timing constant-ness is best-effort per the core module note"
-
-  - milestone: M5
-    surface:
-      - "Federation trust slider (per-server trusted/untrusted) — `daemonseed_server::federation::trust`"
-      - "Introducer endpoint (returns server-id + address, NEVER public keys per ISC-A-S6)"
-      - "S2S peering — `daemonseed_server::federation::peer`"
-      - "introduce-to-clients toggle (S13) suppresses introductions symmetrically across client AND s2s queries"
-
-  - milestone: M6
-    surface:
-      - "Public-space post / MOTD / rating handlers"
-      - "Server-side taxonomy enforcement (no metadata leak per ISC-A-S3 / A-S4)"
-
-  - milestone: M7
-    surface:
-      - "Suite-deprecation policy publish endpoint (ISC-S16)"
-      - "Per-suite cutoff enforcement at identity-proof (SUITE_DEPRECATED_PAST_CUTOFF response)"
-
-  - milestone: M8
-    surface:
-      - "CoT-asset relay (server reads suite_id only as opaque bytes; never consults Registry::lookup on this path — regression anchor in m3_isc_coverage stays live)"
-      - "Chunk store + content-addressed fetch"
-      - "Subscription dispatch"
-
-  - milestone: M9
-    landed:
-      - "daemonseed_server::rate_limit — RAM-only multi-granularity limits (S17/A-S12)"
-      - "ConnectionLimiter (per-connection token bucket + subscription/verify caps); PerKeyRateTable (per-identity-key concurrent-connection cap, GC'd on disconnect); RateLimitConfig (Pi-4 floor defaults); RateLimitTrip (opaque, no wire form)"
-      - "Wired into runtime::serve_connection: per-key admission after identity-proof, released on disconnect; trip → same uniform silent close as auth failure"
+  - milestone: M9 (deferred to M11)
     deferred:
       - "Per-source-IP layer stays operator-owned (OS firewall, A-S1 carve-out) — not in the binary"
       - "Operator-tunable thresholds via [rate_limits] TOML section + wiring the per-connection token bucket / subscription cap into the live app stream (cot/public_space): M11 integration"
+
+  - milestone: M10-infra (deferred — needs a signing-key ceremony, accounts, build pipeline)
+    landed_m10_core:
+      - "daemonseed_server::boot_gate — gate_boot / gate_boot_with map a release-signature verify result to BootDecision::{Boot, RefuseToBoot}; no boot-with-warning variant exists (ISC-A-S13). Consumes daemonseed_core::release::verify_multisig."
+    deferred:
+      - "Real release-signing keys + N-of-M governance key-holder identities; Sigstore co-signature; reproducible-build pipeline (ISC-S18 infrastructure)"
+      - "Wiring gate_boot into actual startup — needs the binary's embedded release signature + a populated release anchor (both land with the key ceremony)"
+      - "Optional update-relay role hosting read-only signed artifacts as public-space data (ISC-S18); when built it MUST stay opacity-only — no server-side signature validation (ISC-A-S13)"
+      - "OS-package-manager + container distribution channels signed under the release key chain"
 
 # ─────────────────────────────────────────────────────────────────────
 # Operator config surface (planned — not implemented at M3)

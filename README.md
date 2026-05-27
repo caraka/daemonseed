@@ -16,9 +16,10 @@ daemonseed/
 │   ├── daemonseed-core/                    protocol library — identity, 3-layer storage (seeds /
 │   │                                       redb share index / chunk CAS), crypto-agility, first-start,
 │   │                                       bootstrap, flat circle-of-trust keys, rendezvous addressing, indexer,
-│   │                                       reconnect backoff, mute/hide lists, @-mention logic (M9)
+│   │                                       reconnect backoff, mute/hide lists, @-mention logic (M9),
+│   │                                       release trust anchor + multi-sig verify + update-lifecycle FSM (M10)
 │   ├── daemonseed-proto/                   wire schema (Protocol Buffers, prost + tonic)
-│   ├── daemonseed-server/                  relay daemon: TLS 1.3 + APP_HELLO + identity-proof → Authenticated (M4b); federation peer table + introducer (M5); public-space service (M6); circle-of-trust live relay (M8); RAM-only rate limiting (M9)
+│   ├── daemonseed-server/                  relay daemon: TLS 1.3 + APP_HELLO + identity-proof → Authenticated (M4b); federation peer table + introducer (M5); public-space service (M6); circle-of-trust live relay (M8); RAM-only rate limiting (M9); release boot-gate (M10)
 │   ├── daemonseed-cli/                     scriptable client: `connect <server-id>` with identity-proof (M4b) + C22 trust slider (M5)
 │   ├── daemonseed-tui/                     interactive ratatui client (placeholder until M11)
 │   └── daemonseed-integration-tests/       cross-crate integration tests + ISC coverage registry
@@ -34,11 +35,11 @@ daemonseed/
                                             isc-coverage, findings-resolved, install-hooks
 ```
 
-Substantive code lives in `daemonseed-core`, `daemonseed-proto`, `daemonseed-server`, and `daemonseed-cli` as of M9. The `tui` crate is still a placeholder; it fills in at M11.
+Substantive code lives in `daemonseed-core`, `daemonseed-proto`, `daemonseed-server`, and `daemonseed-cli` as of M10. The `tui` crate is still a placeholder; it fills in at M11.
 
 ## Status
 
-Current release: **v0.10.0** (M8 closed); **v0.11.0-pre** cuts at M9 close — abuse-resilience and chat affordances. Server: multi-granularity, RAM-only rate limits — a per-connection request token bucket plus subscription/verify caps, and a per-identity-key connection table GC'd on disconnect, all enforced through the same uniform silent close as an identity-proof failure (no wire reason). Client: an exponential+jitter reconnect backoff with an 8-retry budget and layer-based close-cause messages that never speculate about which limit was hit; mute and hide-shares lists persisted in the encrypted seeds blob and never sent on the wire; and @-mention recognition + autocomplete resolution as pure post-decrypt/pre-send functions that add no new server-visible distinction. TUI rendering of mute/mention lands at M11. The per-milestone ISC-coverage convention, dormant across M7–M8, is re-instated this milestone. Promotion to a public repository is gated on the `oxicrypt` sibling crate going public.
+Current release: **v0.11.0** (M9 closed); **v0.12.0-pre** cuts at the **M10 verifiable-core** close — the pure-Rust, test-driven half of release distribution. `daemonseed-core::release` adds a binary-bound release trust anchor (an N-of-M ML-DSA-87 key set) and an N-of-M multi-sig verify that accepts only when enough *distinct* anchor keys have signed; `daemonseed-server::boot_gate` refuses to boot on a failed release-signature verify, with no "boot anyway with a warning" path; and the client update-lifecycle state machine verifies before applying, never auto-installs (even for emergency updates), refuses silent downgrades, and wipes-and-logs on verification failure. This milestone ships the **verifiable core only** — the release-signing *infrastructure* (real signing keys, Sigstore co-signature, reproducible builds, store / F-Droid / package-manager channels, the optional update-relay role) and the platform features (biometric login, OS-native autostart) are deferred to a follow-up "M10-infra" track that needs a key ceremony, accounts, and platform integration rather than pure logic. Promotion to a public repository is gated on the `oxicrypt` sibling crate going public.
 
 ## License
 

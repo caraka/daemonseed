@@ -1,10 +1,14 @@
 # ─────────────────────────────────────────────────────────────────────
 # daemonseed-core — LAMA API Manifest
 #
-# Public API surface of the daemonseed-core crate as of v0.4.0 (M3
-# closed). Designed for AI coding agents that need to discover what
-# the protocol library exposes, what the preconditions are, and where
-# each piece anchors in the ISC spec.
+# Public API surface of the daemonseed-core crate through M10 verifiable-core
+# (v0.12.0-pre). M3 closed the crypto-agility primitives; M4a/M4b added the
+# connection type-state + identity-proof; M5 federation; M6 public-space client
+# plumbing; M7 the deprecation policy + trust-event taxonomy; M8 the CoT/chunk/
+# indexer client surface; M9 backoff + mention + mute/hide; M10 the release
+# trust anchor + multi-sig verify + update-lifecycle FSM. Designed for AI
+# coding agents that need to discover what the protocol library exposes, what
+# the preconditions are, and where each piece anchors in the ISC spec.
 #
 # Cross-references:
 # - Repository root: ../../lama.yaml
@@ -19,10 +23,11 @@ library:
   description: >-
     Protocol library. Identity primitives, profile substrate, at-rest
     storage, first-start orchestration, bootstrap-anchor selection,
-    crypto-agility primitives (suite registry + policy gate), and
-    circle-of-trust key derivation. Wire-protocol surface (server skeleton, TLS,
-    APP_HELLO, identity-proof) lands in M4a+ on top of these
-    foundations.
+    crypto-agility primitives (suite registry + policy gate + deprecation),
+    circle-of-trust key derivation, the connection type-state + identity-proof,
+    federation trust, the trust-event taxonomy, reconnect backoff, @-mention
+    logic, and the release trust anchor + multi-sig verify + update-lifecycle
+    FSM (M10 verifiable-core). The wire-protocol surface landed from M4a.
   license: "AGPL-3.0-or-later"
   manifest_for: "crates/daemonseed-core"
 
@@ -596,6 +601,102 @@ modules:
       - { sig: "Whitelist::entries(&self) -> &[WhitelistEntry]", note: "Operator entries, for publishing to clients via GetSignerWhitelist (ISC-S8 / ISC-6)." }
       - { sig: "Whitelist::authorizes(&self, pubkey: &[u8]) -> Result<bool, oxicrypt_module::Error>", note: "ISC-12 gate: project-release always authorized; FullKey by exact bytes; Handle by SHA-384 hash-prefix match computed without touching the signature." }
       - { sig: "verify_artifact(signed_payload: &[u8], signer_pubkey: &[u8], signature: &[u8], whitelist: &Whitelist) -> Result<ContentAddress, ArtifactError>", note: "ISC-A-S3 pipeline, in order (ISC-12): authorize -> ML-DSA-87 verify over the exact signed bytes (D-M6-7) -> SHA-384 content-address. The single shared server+client trust decision." }
+
+  - path: daemonseed_core::crypto::deprecation
+    purpose: >-
+      Operator-configured suite-deprecation policy (M7, ISC-S16 / A-S11 / C25 /
+      A-C9). A signed, monotonically-versioned policy listing per-suite cutoffs
+      and recommended migration targets; clients fetch + verify it and surface
+      trust events (never silently downgrade). Includes a TTL'd per-server cache
+      with rollback detection (older policy-version than already seen = attack
+      signal).
+    iscs: [S16, A-S11, C25, A-C9]
+    added_in: "v0.9.0 (M7)"
+    public:
+      - { kind: const, name: CACHE_TTL, value: "3600s", note: "Cached-policy freshness window." }
+      - { kind: const, name: MIN_CUTOFF_LEAD, value: "2h", note: "Minimum lead time a cutoff must sit in the future at signing." }
+      - { kind: struct, name: DeprecationEntry, note: "{ suite_id, cutoff_unix_ms, recommended_suite_id }." }
+      - { kind: struct, name: DeprecationPolicy, note: "Monotonic policy_version + signed_timestamp + entries. build/from_signed_payload/to_signed_payload; entry_for / is_past_cutoff(now) / affected(in_use)." }
+      - { kind: enum, name: PolicyError, note: "Build/parse/verify failure modes (malformed, cutoff-lead too short, bad signature, rollback)." }
+      - { kind: struct, name: PolicyCache, note: "Per-server TTL'd cache. insert / cached_version / fresh(now) / is_stale(now) / earliest_cutoff(suite). Rollback to an older version is rejected." }
+    key_functions:
+      - { sig: "sign_policy(policy: &DeprecationPolicy, signing: &SignKeypair) -> Result<Vec<u8>, PolicyError>", note: "Sign the canonical policy payload (ML-DSA-87)." }
+      - { sig: "verify_policy(bytes: &[u8], pubkey: &[u8; PK_LEN]) -> Result<DeprecationPolicy, PolicyError>", note: "Verify + parse a signed policy. The only trusted ingestion path." }
+
+  - path: daemonseed_core::trust_events
+    purpose: >-
+      Trust-event taxonomy + bounded encrypted audit log (M7, ISC-C28 / A-C12).
+      A closed, append-only TrustEventKey enum mapped to a four-class affordance
+      taxonomy (Blocking / PersistentNonBlocking / Transient / LogOnly), with a
+      frozen stable string form persisted in the log and consumed by third-party
+      clients. Keys may be added, never renamed/removed.
+    iscs: [C28, A-C12]
+    added_in: "v0.9.0 (M7)"
+    public:
+      - { kind: enum, name: TrustEventClass, variants: "{Blocking, PersistentNonBlocking, Transient, LogOnly}", note: "Implementations MUST NOT invent sub-classes." }
+      - { kind: enum, name: TrustEventKey, note: "Closed wire-stability surface (append-only). Includes the M10 update keys UpdateVerificationFailed (Blocking), EmergencySecurityUpdateAvailable (Blocking), UpdateRelayFallbackUsed (Transient) — added at M7, consumed by the M10 update FSM." }
+      - { kind: struct, name: TrustEvent, note: "One log tuple: timestamp, key, optional server_id, optional suite_id, resolution, dismissed_at. observed() builder." }
+      - { kind: struct, name: TrustEventLog, note: "Bounded (DEFAULT_LOG_CAP) in-memory log. append (drops Transient — the A-C12 asymmetry), entries, prune_to, dismiss (per (key, scope), never global)." }
+    key_functions:
+      - { sig: "class_of(key: TrustEventKey) -> TrustEventClass", note: "Total, pure, no override (A-C12 no-class-degradation)." }
+      - { sig: "event_key_string(key) -> &'static str / event_key_from_str(s) -> Option<TrustEventKey>", note: "Frozen-forever stable string form (closes R9)." }
+      - { sig: "seal_log(&TrustEventLog, passphrase, profile_id, ArgonParams) -> Result<Vec<u8>, AuditLogError> / open_log(bytes, passphrase)", note: "Argon2id+HKDF-SHA-384 key independent of the at-rest blob; AES-256-GCM with the header as AAD." }
+      - { sig: "assess_deprecation(&DeprecationPolicy, in_use: &[SuiteId], now_ms) -> Vec<DeprecationSignal>", note: "Derive client trust signals from a verified policy; reports only — never mutates suite/identity." }
+
+  - path: daemonseed_core::backoff
+    purpose: >-
+      Client reconnect backoff curve + close-cause categorization (M9, ISC-C26).
+      Exponential 1s→60s ×2 with ±25% jitter and an 8-retry per-server-id budget;
+      a uniform close-cause layering that never names which rate-limit was hit
+      (A-S12).
+    iscs: [C26, A-S12]
+    added_in: "v0.11.0 (M9)"
+    public:
+      - { kind: const, name: "DEFAULT_BASE / DEFAULT_CAP / DEFAULT_MAX_RETRIES / DEFAULT_JITTER_FRAC", value: "1s / 60s / 8 / 0.25", note: "Default policy constants." }
+      - { kind: struct, name: BackoffPolicy, note: "delay_for_attempt(attempt) (saturating, no overflow); jitter(delay, unit)." }
+      - { kind: struct, name: Backoff, note: "Stateful driver. new/with_policy; next(unit)/next_jittered() consume one retry, None once the budget is exhausted; attempts/exhausted/reset; refusal_event() -> TrustEventKey (ConnectionRateLimited → …Exhausted)." }
+      - { kind: enum, name: CloseCause, note: "Network / pre-HELLO_ACK / post-auth layering. user_message() never speculates which budget tripped (A-S12)." }
+
+  - path: daemonseed_core::mention
+    purpose: >-
+      @-mention recognition + resolution over decrypted chat plaintext (M9,
+      ISC-C17 / C18 / A-C4). Pure client-side functions that add no server-
+      visible distinction over plain chat (no daemonseed-proto dependency).
+    iscs: [C17, C18, A-C4]
+    added_in: "v0.11.0 (M9)"
+    public:
+      - { kind: enum, name: MentionResolution, variants: "{Resolved(Handle), Ambiguous(Vec<Handle>), NotFound}", note: "Result of resolving a typed token; an explicit full handle bypasses autocomplete." }
+    key_functions:
+      - { sig: "find_self_mentions(plaintext: &str, own_handle: &Handle) -> Vec<MentionSpan>", note: "Read-only scan keyed on the full wire handle, with word-boundary + trailing-hex guards. Does not mutate the plaintext." }
+      - { sig: "resolve_mention(typed: &str, scope: &[Handle]) -> MentionResolution", note: "Bare display name resolves by exact scope match — one match resolves, several are Ambiguous, none is NotFound." }
+
+  - path: daemonseed_core::release
+    purpose: >-
+      Release-signing trust anchor, N-of-M multi-sig verify, and the client
+      update-lifecycle FSM (M10 verifiable-core, ISC-S18 / A-S13 / C27 / A-C11).
+      The anchor is binary-bound (include_str!'d TOML, mirrors bootstrap::anchor)
+      and ships its 1-of-1 shape with the key array empty (real key deferred to
+      M10-infra). The FSM enforces verify-before-apply, never-auto-install,
+      no-silent-downgrade, and wipe-and-log-on-failure by its shape, emitting the
+      existing M7 update trust-event keys (no new wire surface).
+    iscs: [S18, A-S13, C27, A-C11]
+    added_in: "v0.12.0 (M10)"
+    deferred: "Real signing keys / Sigstore / reproducible build / live fetch / binary swap (M10-infra)."
+    public:
+      - { kind: struct, name: ReleaseAnchor, note: "Ordered ML-DSA-87 release-signing key set + N-of-M threshold. new(keys, threshold) rejects a degenerate anchor (AnchorError::{NoKeys, ThresholdOutOfRange}); threshold()/keys()." }
+      - { kind: struct, name: ReleaseKey, note: "Wraps a boxed [u8; PK_LEN] release-signing pubkey. new(pubkey)/public_key(). Debug shows a 4-byte prefix only." }
+      - { kind: struct, name: BundledReleaseAnchor, note: "Schema for the include_str!'d release_anchor.toml: version, threshold, hex keys (empty pre-public). to_anchor() -> Option<ReleaseAnchor> (None until a real key is bundled). bundled() -> &'static." }
+      - { kind: enum, name: ReleaseVerifyError, variants: "{BelowThreshold{required,valid}, UnrecognizedSignature, MalformedSignature, Module}", note: "Local diagnostic only — feeds the A-C11 failure log, never on the wire." }
+      - { kind: enum, name: UpdateChannel, variants: "{Primary, RelayFallback}", note: "RelayFallback is no more trusted than Primary — verify is anchor-based regardless." }
+      - { kind: struct, name: ReleaseVersion, note: "Binary SemVer {major, minor, patch} with Ord (distinct from the wire ProtocolVersion). new()." }
+      - { kind: struct, name: UpdateRecord, note: "{ version, channel, emergency } — discovered update metadata." }
+      - { kind: struct, name: FailureLogEntry, note: "A-C11 tuple: {timestamp_unix_ms, channel, version_attempted, reason}. No payload retained." }
+      - { kind: enum, name: UpdateState, variants: "{Idle, Available(UpdateRecord), Verified{record,is_downgrade}, ConfirmedReadyToInstall(UpdateRecord), Failed(FailureLogEntry)}", note: "ConfirmedReadyToInstall reachable ONLY via confirm() — never auto-reached." }
+      - { kind: enum, name: ConfirmError, variants: "{NotVerified, DowngradeNotAcknowledged}", note: "confirm() refuses outside Verified, or a downgrade without explicit acknowledgement." }
+      - { kind: struct, name: UpdateLifecycle, note: "The FSM driver. new(current_version); discover(record, artifact); verify(anchor, message, signatures, now_ms); confirm(acknowledge_downgrade); state/failure_log/has_artifact/take_pending_events." }
+    key_functions:
+      - { sig: "verify_multisig(anchor: &ReleaseAnchor, message: &[u8], signatures: &[&[u8]]) -> Result<(), ReleaseVerifyError>", note: "Accepts iff >= threshold DISTINCT anchor keys each signed validly. No verify-bypass; each key counted once; a non-anchor signature is a hard refusal; a wrong-length blob is rejected without panic." }
+      - { sig: "bundled() -> &'static BundledReleaseAnchor", note: "The compile-time release anchor. to_anchor() is None during the pre-public phase (no real key yet)." }
 
 # ─────────────────────────────────────────────────────────────────────
 # Common gotchas across modules
