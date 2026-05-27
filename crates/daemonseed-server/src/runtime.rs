@@ -263,10 +263,15 @@ async fn serve_connection(
             // reason on the wire. The cap is enforced only once the key is
             // known (post-verify); the pre-identity flood is the OS/per-IP
             // layer's job (ISC-A-S1 carve-out).
-            if key_table.admit(verified.pubkey()).is_err() {
-                return;
-            }
-            let pubkey = verified.pubkey().to_vec();
+            // The guard takes the per-key slot and releases it in its Drop
+            // (GC-on-disconnect, ISC-S17 / ISC-A-S12) — including if the
+            // serving future below panics, which a manual post-serve release
+            // would skip (M9-review slot-leak fix). A key already at its cap
+            // yields `Err` and is closed silently here.
+            let _slot = match key_table.admit_guard(verified.pubkey()) {
+                Ok(slot) => slot,
+                Err(_) => return,
+            };
 
             // ISC-S19 step 5: the VerifiedPeer token is the only key to the
             // Authenticated state. Reaching here therefore guarantees a
@@ -279,11 +284,7 @@ async fn serve_connection(
             let authenticated = versioned.into_authenticated(verified);
             let service = PublicSpaceService::new(public_space);
             let _ = serve_application(authenticated.into_inner(), service, cot).await;
-
-            // GC-on-disconnect (ISC-S17 / ISC-A-S12): free the per-key slot the
-            // instant this connection ends, so a quiet server holds no per-key
-            // rate-limit state across restart or idle.
-            key_table.release(&pubkey);
+            // `_slot` drops here (and on unwind), releasing the per-key slot.
         }
         Err(_e) => {
             // Uniform silent close — see the function-level note.

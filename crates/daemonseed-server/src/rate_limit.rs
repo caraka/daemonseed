@@ -225,6 +225,20 @@ impl PerKeyRateTable {
         Ok(())
     }
 
+    /// Admit a connection for `key`, returning an RAII [`KeySlotGuard`] that
+    /// releases the slot on drop. Prefer this over [`admit`](Self::admit) +
+    /// a manual [`release`](Self::release): the guard frees the slot even if
+    /// the holding task unwinds (panic), closing the slot-leak gap flagged in
+    /// the M9 review. `Err(PerKeyConnCap)` at the cap — and a refused
+    /// acquisition does not increment the count.
+    pub fn admit_guard(&self, key: &[u8]) -> Result<KeySlotGuard, RateLimitTrip> {
+        self.admit(key)?;
+        Ok(KeySlotGuard {
+            table: self.clone(),
+            key: key.to_vec(),
+        })
+    }
+
     /// Release a connection for `key` (GC-on-disconnect): decrement and remove
     /// the key entirely at zero, so a quiet server holds no per-key state.
     pub fn release(&self, key: &[u8]) {
@@ -254,6 +268,23 @@ impl PerKeyRateTable {
             .lock()
             .expect("PerKeyRateTable mutex poisoned")
             .len()
+    }
+}
+
+/// RAII guard for a per-identity-key connection slot, returned by
+/// [`PerKeyRateTable::admit_guard`]. Releasing the slot in `Drop` rather than
+/// via an explicit call is the defense-in-depth fix for the M9-review slot
+/// leak: a panic in the per-connection serving task unwinds through this
+/// guard's frame, so the slot is freed during the unwind, whereas a manual
+/// post-serve `release` line is simply skipped when the future panics.
+pub struct KeySlotGuard {
+    table: PerKeyRateTable,
+    key: Vec<u8>,
+}
+
+impl Drop for KeySlotGuard {
+    fn drop(&mut self) {
+        self.table.release(&self.key);
     }
 }
 
@@ -419,5 +450,58 @@ mod tests {
     fn fresh_table_has_no_state() {
         // RAM-only by construction: a new table (≈ a restarted server) is empty.
         assert_eq!(PerKeyRateTable::new(4).tracked_keys(), 0);
+    }
+
+    // ── RAII slot guard (M10: defense-in-depth over the manual release) ─────
+
+    #[test]
+    fn admit_guard_releases_slot_on_drop() {
+        let table = PerKeyRateTable::new(2);
+        let key = b"guarded";
+        {
+            let _g = table.admit_guard(key).unwrap();
+            assert_eq!(table.active_for(key), 1);
+        }
+        // Guard dropped at scope end → slot freed, key GC'd to empty.
+        assert_eq!(table.active_for(key), 0);
+        assert_eq!(table.tracked_keys(), 0);
+    }
+
+    #[test]
+    fn admit_guard_trips_at_cap_without_acquiring() {
+        let table = PerKeyRateTable::new(1);
+        let key = b"capped";
+        let _g = table.admit_guard(key).unwrap();
+        assert_eq!(
+            table.admit_guard(key).err(),
+            Some(RateLimitTrip::PerKeyConnCap)
+        );
+        // The refused acquisition must not have incremented the count.
+        assert_eq!(table.active_for(key), 1);
+    }
+
+    #[test]
+    fn admit_guard_releases_slot_on_panic() {
+        // The slot leak the M9 review flagged: a manual post-serve release is
+        // skipped when the serving task panics. The RAII guard's Drop runs
+        // during unwind, so the slot is freed even then.
+        let table = PerKeyRateTable::new(2);
+        let key = b"panicky";
+        let t = table.clone();
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // silence the expected panic
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = t.admit_guard(key).unwrap();
+            assert_eq!(t.active_for(key), 1);
+            panic!("serving task blew up while holding the slot");
+        }));
+        std::panic::set_hook(prev);
+        assert!(result.is_err(), "the closure must have panicked");
+        assert_eq!(
+            table.active_for(key),
+            0,
+            "Drop must release the slot during unwind"
+        );
+        assert_eq!(table.tracked_keys(), 0);
     }
 }
