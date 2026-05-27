@@ -51,6 +51,7 @@ use crate::identity_proof::{
     RustlsServerExporter, SeenMap, ServerIdentity, now_unix_ms, run_server_identity_proof,
 };
 use crate::public_space::{PublicSpaceService, PublicSpaceState, serve_application};
+use crate::rate_limit::{PerKeyRateTable, RateLimitConfig};
 
 /// Hand the per-connection HELLO outcome up via this callback. Used by
 /// the integration-test harness in commit 6 to observe a real
@@ -69,7 +70,7 @@ pub fn noop_observer() -> ConnectionObserver {
 /// built in [`run`] and cloned per accepted connection. Bundling it keeps the
 /// per-connection driver's signature small as the shared surface grows
 /// (identity, public-space state, AGPL source URL, replay-counter map, and the
-/// circle-of-trust asset table).
+/// circle-of-trust asset table, and the per-identity-key rate-limit table).
 #[derive(Clone)]
 struct ServerContext {
     identity: Arc<ServerIdentity>,
@@ -77,6 +78,7 @@ struct ServerContext {
     server_source: Arc<Option<String>>,
     seen: SeenMap,
     cot: CotRegistry,
+    key_table: PerKeyRateTable,
 }
 
 /// Bind to `addr`, accept connections, terminate TLS via `tls_config`,
@@ -119,6 +121,10 @@ where
     // process. Cloning shares the inner Arc.
     let cot = CotRegistry::new();
 
+    // Per-identity-key connection table (M9 / ISC-S17). RAM-only, shared across
+    // connections, GC'd as connections close. Pi-4-floor cap default.
+    let key_table = PerKeyRateTable::new(RateLimitConfig::default().max_conns_per_key);
+
     // Bundle the shared, process-lifetime state once; clone it per connection.
     let ctx = ServerContext {
         identity,
@@ -126,6 +132,7 @@ where
         server_source,
         seen,
         cot,
+        key_table,
     };
 
     tokio::pin!(shutdown);
@@ -184,6 +191,7 @@ async fn serve_connection(
         server_source,
         seen,
         cot,
+        key_table,
     } = ctx;
 
     let mut tls_stream: TlsStream<TcpStream> = match acceptor.accept(stream).await {
@@ -249,6 +257,17 @@ async fn serve_connection(
     .await
     {
         Ok(verified) => {
+            // M9 (ISC-S17): per-identity-key concurrent-connection admission.
+            // A key already at its cap is closed silently — the SAME uniform
+            // close-shape as an identity-proof failure (ISC-A-S12), with no
+            // reason on the wire. The cap is enforced only once the key is
+            // known (post-verify); the pre-identity flood is the OS/per-IP
+            // layer's job (ISC-A-S1 carve-out).
+            if key_table.admit(verified.pubkey()).is_err() {
+                return;
+            }
+            let pubkey = verified.pubkey().to_vec();
+
             // ISC-S19 step 5: the VerifiedPeer token is the only key to the
             // Authenticated state. Reaching here therefore guarantees a
             // verified peer — so the application services are structurally
@@ -260,6 +279,11 @@ async fn serve_connection(
             let authenticated = versioned.into_authenticated(verified);
             let service = PublicSpaceService::new(public_space);
             let _ = serve_application(authenticated.into_inner(), service, cot).await;
+
+            // GC-on-disconnect (ISC-S17 / ISC-A-S12): free the per-key slot the
+            // instant this connection ends, so a quiet server holds no per-key
+            // rate-limit state across restart or idle.
+            key_table.release(&pubkey);
         }
         Err(_e) => {
             // Uniform silent close — see the function-level note.

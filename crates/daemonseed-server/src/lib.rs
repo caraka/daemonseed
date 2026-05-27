@@ -29,6 +29,9 @@
 //! - [`cot`] — circle-of-trust live relay: refcounted, reap-at-zero
 //!   bidirectional `Subscribe` fan-out keyed by rendezvous address, served
 //!   over the post-Authenticated stream alongside public-space (M8, F23)
+//! - [`rate_limit`] — multi-granularity, RAM-only abuse/DoS rate limits:
+//!   per-connection token bucket + subscription / verify caps, and a
+//!   per-identity-key connection table GC'd on disconnect (M9, ISC-S17/A-S12)
 
 #![forbid(unsafe_code)]
 
@@ -41,5 +44,6 @@ pub mod identity;
 pub mod identity_proof;
 pub mod kats;
 pub mod public_space;
+pub mod rate_limit;
 pub mod runtime;
 pub mod tls;
