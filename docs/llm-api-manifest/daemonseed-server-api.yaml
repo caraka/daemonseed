@@ -334,9 +334,13 @@ planned:
       - "Subscription dispatch"
 
   - milestone: M9
-    surface:
-      - "Per-connection / per-key / per-IP rate limits (ISC-S17 silent constant-time close)"
-      - "Operator-tunable thresholds with Pi-4 defaults"
+    landed:
+      - "daemonseed_server::rate_limit — RAM-only multi-granularity limits (S17/A-S12)"
+      - "ConnectionLimiter (per-connection token bucket + subscription/verify caps); PerKeyRateTable (per-identity-key concurrent-connection cap, GC'd on disconnect); RateLimitConfig (Pi-4 floor defaults); RateLimitTrip (opaque, no wire form)"
+      - "Wired into runtime::serve_connection: per-key admission after identity-proof, released on disconnect; trip → same uniform silent close as auth failure"
+    deferred:
+      - "Per-source-IP layer stays operator-owned (OS firewall, A-S1 carve-out) — not in the binary"
+      - "Operator-tunable thresholds via [rate_limits] TOML section + wiring the per-connection token bucket / subscription cap into the live app stream (cot/public_space): M11 integration"
 
 # ─────────────────────────────────────────────────────────────────────
 # Operator config surface (planned — not implemented at M3)

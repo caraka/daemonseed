@@ -12,7 +12,7 @@ lama: "0.1"
 
 project:
   name: daemonseed
-  version: "0.8.0-pre"
+  version: "0.11.0-pre"
   description: >-
     Federated end-to-end-encrypted communication and file-sharing
     protocol. Pure-Rust backend, CNSA 2.0 baseline crypto via the
@@ -28,8 +28,11 @@ project:
   phase: private
 
 # ─────────────────────────────────────────────────────────────────────
-# Implementation status: v0.7.0 (M5 closed); v0.8.0-pre cuts at M6 close
-# ISC coverage 67/93 (72.0% of MVP).
+# Implementation status: M8 closed at v0.10.0; v0.11.0-pre cuts at M9 close.
+# M9 closes 9 ISCs (S17, C15, C16, C17, C18, C26, A-S12, A-C3, A-C4).
+# NOTE: the per-milestone tests/m{N}_isc_coverage.rs convention lapsed across
+# M7–M8 (re-instated at M9), so the coverage registry currently undercounts;
+# a cumulative ISC recount is a tracked manifest cleanup, not an M9 deliverable.
 # ─────────────────────────────────────────────────────────────────────
 
 milestones_complete:
@@ -55,16 +58,19 @@ milestones_complete:
     tag: v0.7.0
     summary: "Federation: per-server trusted/untrusted trust slider with TOFU pinning + rotation notices (C22), introducer responses that never carry public keys (S6), server-to-server peering reusing the same slider (S12) with introduce-to-clients suppression (S13) and active-attacker-resistant don't-introduce (A-S7), reference-client connection cap (A-C10). Closes 7 of its 8 ISCs (A-S4b forward-referenced to M6)."
   - id: M6
-    tag: "v0.8.0-pre (v0.8.0 cuts on merge)"
+    tag: v0.8.0
     summary: "Public space: the first post-Authenticated application service (PublicSpace gRPC over the authenticated stream). Verify-and-serve signed announcement posts (S7) + MOTD (S9) against an operator signer whitelist (S8) with a non-removable project-release entry (F17); operator rating taxonomy published, never enforced (S10/A-S5b); public-share listing surface defined (S4/F25); client rating selection + filter plumbing (C19/A-C5); AGPL-§13 source URL advertised in the handshake ack (ISC-9); filesystem isolation — server writes only the group-writable posts dir, never operator config (A-S8). Closes 12 ISCs (55→67)."
+  - id: M7
+    tag: v0.9.0
+    summary: "Suite deprecation policy (operator-signed, replay-protected cutoffs) + the trust-event taxonomy (four affordance classes, closed TrustEventKey enum, bounded encrypted audit log)."
+  - id: M8
+    tag: v0.10.0
+    summary: "Circle-of-trust live relay (refcounted bidi Subscribe, reap-at-zero), flat metadata-free circle key derivation, per-relay rendezvous addressing, content-addressed chunk store, and the encrypted incremental redb share indexer with Pi-civility background scanning. Added ISC-S20."
+  - id: M9
+    tag: "v0.11.0 (cuts on merge)"
+    summary: "Abuse-resilience + chat affordances. Server: multi-granularity RAM-only rate limits — per-connection token bucket + subscription/verify caps, per-identity-key connection table GC'd on disconnect, uniform silent close (S17/A-S12). Client: exponential+jitter reconnect backoff with an 8-retry budget and layer-based close-cause categorization (C26); mute + hide-shares lists persisted in the seeds blob, never leaked (C15/C16/A-C3); @-mention recognition + resolution as pure post-decrypt/pre-send functions with no new server-visible distinction (C17/C18/A-C4). TUI rendering of these surfaces lands at M11. Closes 9 ISCs."
 
 milestones_planned:
-  - id: M7
-    summary: "Suite deprecation policy + trust-event taxonomy."
-  - id: M8
-    summary: "CoT subscriptions, chunks, share indexer."
-  - id: M9
-    summary: "Rate limits, backoff, mute/hide, mentions."
   - id: M10
     summary: "Release distribution + update lifecycle + platform."
   - id: M11
@@ -78,9 +84,10 @@ crates:
   - name: daemonseed-core
     purpose: >-
       Protocol library — identity, storage, bootstrap, first-start
-      orchestration, crypto-agility primitives, circle-of-trust key derivation.
-      Pure library (no_std-compatible where the underlying primitives
-      allow; currently uses std for I/O).
+      orchestration, crypto-agility primitives, circle-of-trust key derivation,
+      and the M9 client surfaces: reconnect backoff, mute / hide-shares lists,
+      and @-mention recognition/resolution. Pure library (no_std-compatible
+      where the underlying primitives allow; currently uses std for I/O).
     license: AGPL-3.0-or-later
     status: active
     manifest: "docs/llm-api-manifest/daemonseed-core-api.yaml"
@@ -98,7 +105,7 @@ crates:
     manifest: "docs/llm-api-manifest/daemonseed-proto-protocol.yaml"
 
   - name: daemonseed-server
-    purpose: "Relay daemon binary + library. TLS 1.3 termination, APP_HELLO negotiation, the post-HELLO identity-proof exchange that lands a connection at Authenticated (M4b), federation introducer/peering (M5), the post-Authenticated PublicSpace application-stream service (M6, gRPC-over-h2 via daemonseed_server::public_space), and the M8 CircleOfTrust live relay (daemonseed_server::cot) — refcounted bidirectional Subscribe fan-out keyed by rendezvous address, served alongside public-space with h2 keepalive driving reap-at-zero."
+    purpose: "Relay daemon binary + library. TLS 1.3 termination, APP_HELLO negotiation, the post-HELLO identity-proof exchange that lands a connection at Authenticated (M4b), federation introducer/peering (M5), the post-Authenticated PublicSpace application-stream service (M6, gRPC-over-h2 via daemonseed_server::public_space), and the M8 CircleOfTrust live relay (daemonseed_server::cot) — refcounted bidirectional Subscribe fan-out keyed by rendezvous address, served alongside public-space with h2 keepalive driving reap-at-zero — and the M9 RAM-only rate limiter (daemonseed_server::rate_limit) wired into the per-connection path with per-identity-key admission GC'd on disconnect."
     license: AGPL-3.0-or-later
     status: active
     manifest: "docs/llm-api-manifest/daemonseed-server-api.yaml"
@@ -280,6 +287,45 @@ capabilities:
     modules:
       - daemonseed_proto::v1
     iscs: [S14, A-S9, C23, C24, S4, A-S2]
+
+  - category: "Abuse / DoS rate limiting (server, M9)"
+    summary: >-
+      Multi-granularity, RAM-only rate limits (S17). Per-connection
+      ConnectionLimiter: a request token bucket (capacity + refill) plus
+      concurrent-subscription and signature-verify caps. Per-identity-key
+      PerKeyRateTable: an Arc<Mutex<HashMap<pubkey,count>>> (same shape as
+      the M4b SeenMap) capping concurrent connections per signing key, wired
+      into runtime::serve_connection — admitted after identity-proof, GC'd to
+      empty on disconnect. RateLimitConfig defaults are the Pi-4 civility
+      floor (per-key cap 4 matches the client A-C10 self-cap). No state is
+      serialized (A-S12); RateLimitTrip is a server-side diagnostic with no
+      wire form — every trip maps to the same uniform silent close as an
+      identity-proof failure. The OS/per-IP layer stays operator-owned outside
+      the binary (A-S1 carve-out).
+    crate: daemonseed-server
+    modules:
+      - daemonseed_server::rate_limit
+    iscs: [S17, A-S12, A-S1]
+
+  - category: "Chat affordances: backoff, mute/hide, mentions (client, M9)"
+    summary: >-
+      Client-side abuse-resilience + chat surfaces, all pure/local. backoff:
+      an exponential+jitter reconnect curve (1s→60s, ±25%) with an 8-retry
+      per-server-id budget and CloseCause categorization by observable layer,
+      mapping refusals to the M7 ConnectionRateLimited trust events without
+      speculating which limit was hit (C26). storage::seeds gains mute +
+      hide-shares handle lists, persisted as additive directive lines in the
+      sealed at-rest blob and never sent on the wire (C15/C16/A-C3). mention:
+      find_self_mentions (read-only scan keyed on the full wire handle) and
+      resolve_mention (autocomplete → full handle / candidates), adding no
+      new server-visible distinction over plain chat (C17/C18/A-C4). TUI
+      rendering of all three lands at M11.
+    crate: daemonseed-core
+    modules:
+      - daemonseed_core::backoff
+      - daemonseed_core::mention
+      - daemonseed_core::storage::seeds
+    iscs: [C15, C16, C17, C18, C26, A-C3, A-C4]
 
 # ─────────────────────────────────────────────────────────────────────
 # Cross-cutting properties (system-wide invariants)
