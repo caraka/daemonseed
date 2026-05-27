@@ -521,6 +521,7 @@ dependencies = [
  "prost",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tower 0.5.3",
  "uuid",

@@ -45,3 +45,6 @@ prost = { workspace = true }
 tempfile = { workspace = true }
 # M6 — content-address hex for post-file names in the public-space coverage test.
 hex = { workspace = true }
+# M11 — CoT chat round-trip e2e wraps the client's outbound subscribe mpsc as a
+# Stream for the bidirectional Subscribe RPC.
+tokio-stream = { workspace = true }
