@@ -44,7 +44,7 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -57,7 +57,9 @@ use daemonseed_proto::v1 as wire;
 use daemonseed_proto::v1::circle_of_trust_server::CircleOfTrustServer;
 use daemonseed_proto::v1::public_space_server::{PublicSpace, PublicSpaceServer};
 
+use crate::app_limit::RequestRateLayer;
 use crate::cot::{CotRegistry, CotService};
+use crate::rate_limit::{ConnectionLimiter, RateLimitConfig};
 use oxicrypt_ml_dsa as ml_dsa;
 use prost::Message;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -835,8 +837,19 @@ pub async fn serve_application<S>(
 where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
+    // One per-connection rate limiter (ISC-S17 / M9), owned by this single-
+    // connection server. The request-rate token bucket is charged per RPC by
+    // the RequestRateLayer (ISC-29); the concurrent-subscription cap is charged
+    // by the CoT subscribe handler (ISC-30). Both trip to a uniform connection
+    // drop with no wire reason (ISC-A-S12). Defaults are Pi-4-sized; the
+    // operator-tunable knobs are a later config surface.
+    let limiter = Arc::new(Mutex::new(ConnectionLimiter::new(
+        RateLimitConfig::default(),
+    )));
     let incoming = tokio_stream::once(Ok::<_, io::Error>(ServedConn(stream)));
     tonic::transport::Server::builder()
+        // Per-RPC request-rate budget, applied to both services (ISC-29).
+        .layer(RequestRateLayer::new(Arc::clone(&limiter)))
         // h2 keepalive drives circle-of-trust liveness reaping (F23): a dead
         // member's subscription stream is detected and torn down within
         // ~interval + timeout, dropping its CotSubscribeStream and releasing
@@ -845,7 +858,7 @@ where
         .http2_keepalive_interval(Some(Duration::from_secs(10)))
         .http2_keepalive_timeout(Some(Duration::from_secs(20)))
         .add_service(PublicSpaceServer::new(public_space))
-        .add_service(CircleOfTrustServer::new(CotService::new(cot)))
+        .add_service(CircleOfTrustServer::new(CotService::new(cot, limiter)))
         .serve_with_incoming(incoming)
         .await
 }

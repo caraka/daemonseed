@@ -231,11 +231,33 @@ modules:
       Live-only: no reconnect/multiplex state; a lagging subscriber misses frames
       rather than stalling the asset. `CotRegistry` is the one shared, RAM-only
       asset table (cloned per connection in runtime.rs); served by
-      `serve_application` alongside public-space.
+      `serve_application` alongside public-space. `CotService::new` now also takes
+      the connection's `Arc<Mutex<ConnectionLimiter>>`; subscribe charges the
+      per-connection concurrent-subscription cap (ISC-30 / S17) and the Drop guard
+      decrements it, so the count tracks live subscriptions on every close path.
+      Over-cap subscribe is refused with a status that names no budget (A-S12).
     no_std: false
     depends_on: [daemonseed_core, tonic, tokio]
-    iscs: [S4, S20, A-S2, A-S5, "5", "7", "9", "10", "11"]
-    added_in: "v0.10.0 (M8)"
+    iscs: [S4, S17, S20, A-S2, A-S5, A-S12, "5", "7", "9", "10", "11", "30"]
+    added_in: "v0.10.0 (M8); subscription-cap wiring M11 (ISC-30)"
+
+  - name: daemonseed_server::app_limit
+    description: >-
+      Per-connection request rate limiting as a tower middleware (M11, ISC-29 /
+      ISC-S17). `RequestRateLayer` wraps the application service `serve_application`
+      serves over one Authenticated connection and charges one
+      `ConnectionLimiter` request token per inbound RPC. An empty bucket does NOT
+      return a status — the service resolves to an error, which the h2 server
+      treats as a connection-level failure and drops the connection (uniform
+      close, ISC-A-S12: identical to an identity-proof failure or a per-key cap
+      trip; the peer cannot tell which budget tripped or whether a limiter was
+      involved). Request-agnostic (generic over the request type) so it composes
+      over tonic's routed service without depending on HTTP/body types. The
+      limiter is owned per-connection and shared with the CoT subscribe handler.
+    no_std: false
+    depends_on: [tower]
+    iscs: [S17, A-S12, "29"]
+    added_in: "M11 (ISC-29)"
 
   - name: daemonseed_server::rate_limit
     description: >-
@@ -1217,7 +1239,11 @@ functions:
       Authenticated transport (h2 keepalive on; ~10s/20s MVP defaults drive CoT
       reaping) until the peer closes. In production S is the raw transport from
       Connection<Authenticated, TlsStream<TcpStream>>::into_inner(). Renamed from
-      serve_public_space at M8.
+      serve_public_space at M8. M11: constructs one per-connection
+      ConnectionLimiter (RateLimitConfig::default, Pi-4-sized) shared between a
+      RequestRateLayer (per-RPC request-rate budget, ISC-29) applied to both
+      services and the CoT subscribe handler (subscription cap, ISC-30); both trip
+      to a uniform connection drop with no wire reason (ISC-A-S12).
     signature: "pub async fn serve_application<S: AsyncRead + AsyncWrite + Send + Unpin + 'static>(stream: S, public_space: PublicSpaceService, cot: CotRegistry) -> Result<(), tonic::transport::Error>"
     parameters:
       - name: stream

@@ -35,6 +35,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod app_limit;
 pub mod boot_gate;
 pub mod config;
 pub mod cot;

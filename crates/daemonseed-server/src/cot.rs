@@ -37,6 +37,8 @@ use std::task::{Context, Poll};
 use daemonseed_core::cot::ASSET_ADDR_LEN;
 use daemonseed_proto::v1::CotFrame;
 use daemonseed_proto::v1::circle_of_trust_server::CircleOfTrust;
+
+use crate::rate_limit::ConnectionLimiter;
 use tokio::sync::broadcast;
 use tokio_stream::Stream;
 use tokio_stream::wrappers::BroadcastStream;
@@ -148,11 +150,18 @@ impl CotRegistry {
 struct ReleaseGuard {
     registry: CotRegistry,
     addr: [u8; ASSET_ADDR_LEN],
+    /// The connection's rate limiter — its concurrent-subscription count is
+    /// decremented here so the count tracks live subscriptions on every
+    /// disconnect path (ISC-30 / ISC-S17), mirroring the registry release.
+    limiter: Arc<Mutex<ConnectionLimiter>>,
 }
 
 impl Drop for ReleaseGuard {
     fn drop(&mut self) {
         self.registry.release(&self.addr);
+        if let Ok(mut l) = self.limiter.lock() {
+            l.end_subscribe();
+        }
     }
 }
 
@@ -192,12 +201,16 @@ impl Stream for CotSubscribeStream {
 #[derive(Clone)]
 pub struct CotService {
     registry: CotRegistry,
+    /// The per-connection rate limiter shared with the request-rate layer. The
+    /// subscribe handler charges its concurrent-subscription cap (ISC-30).
+    limiter: Arc<Mutex<ConnectionLimiter>>,
 }
 
 impl CotService {
-    /// Build a service over the relay's shared registry.
-    pub fn new(registry: CotRegistry) -> Self {
-        Self { registry }
+    /// Build a service over the relay's shared registry and the connection's
+    /// rate limiter (for the ISC-30 concurrent-subscription cap).
+    pub fn new(registry: CotRegistry, limiter: Arc<Mutex<ConnectionLimiter>>) -> Self {
+        Self { registry, limiter }
     }
 }
 
@@ -221,6 +234,21 @@ impl CircleOfTrust for CotService {
             .as_slice()
             .try_into()
             .map_err(|_| Status::invalid_argument("asset_address must be 48 bytes"))?;
+
+        // Charge the per-connection concurrent-subscription cap (ISC-30 / S17).
+        // Over the cap, refuse this one subscribe with a non-descriptive status
+        // (the connection stays up; its existing subscriptions are legitimate).
+        // The message names no budget, so the peer cannot tell a cap from any
+        // other unavailability (ISC-A-S12). The count is decremented in
+        // ReleaseGuard::drop, so it tracks live subscriptions on every close path.
+        if self
+            .limiter
+            .lock()
+            .map(|mut l| l.try_subscribe().is_err())
+            .unwrap_or(true)
+        {
+            return Err(Status::unavailable(""));
+        }
 
         let (my_id, rx) = self.registry.subscribe(&addr);
 
@@ -250,6 +278,7 @@ impl CircleOfTrust for CotService {
             _guard: ReleaseGuard {
                 registry: self.registry.clone(),
                 addr,
+                limiter: Arc::clone(&self.limiter),
             },
         }))
     }
@@ -261,6 +290,16 @@ mod tests {
 
     const ADDR_A: [u8; ASSET_ADDR_LEN] = [0xa1; ASSET_ADDR_LEN];
     const ADDR_B: [u8; ASSET_ADDR_LEN] = [0xb2; ASSET_ADDR_LEN];
+
+    use crate::rate_limit::RateLimitConfig;
+
+    /// A permissive per-connection limiter for tests that aren't exercising the
+    /// subscription cap.
+    fn test_limiter() -> Arc<Mutex<ConnectionLimiter>> {
+        Arc::new(Mutex::new(ConnectionLimiter::new(
+            RateLimitConfig::default(),
+        )))
+    }
 
     fn frame(addr: [u8; ASSET_ADDR_LEN], payload: &[u8]) -> Arc<CotFrame> {
         Arc::new(CotFrame {
@@ -358,6 +397,7 @@ mod tests {
             let _guard = ReleaseGuard {
                 registry: reg.clone(),
                 addr: ADDR_A,
+                limiter: test_limiter(),
             };
             // _guard drops at end of scope → release → refs 1→0 → reaped.
         }
@@ -392,7 +432,10 @@ mod tests {
         let server = tokio::spawn(async move {
             let incoming = tokio_stream::once(Ok::<_, std::io::Error>(ServedConn(server_io)));
             Server::builder()
-                .add_service(CircleOfTrustServer::new(CotService::new(server_registry)))
+                .add_service(CircleOfTrustServer::new(CotService::new(
+                    server_registry,
+                    test_limiter(),
+                )))
                 .serve_with_incoming(incoming)
                 .await
         });
@@ -473,6 +516,93 @@ mod tests {
         }
         assert!(reaped, "asset reaped once both members disconnect (ISC-10)");
 
+        server.abort();
+    }
+
+    /// ISC-30 / ISC-S17: the per-connection concurrent-subscription cap refuses
+    /// a subscribe past the limit. A's subscription takes the only slot; B's is
+    /// refused with a status that names no budget (ISC-A-S12).
+    #[tokio::test]
+    async fn subscription_cap_refuses_over_limit() {
+        use crate::public_space::ServedConn;
+        use crate::rate_limit::RateLimitConfig;
+        use daemonseed_proto::v1::circle_of_trust_client::CircleOfTrustClient;
+        use daemonseed_proto::v1::circle_of_trust_server::CircleOfTrustServer;
+        use hyper_util::rt::TokioIo;
+        use tokio::sync::mpsc;
+        use tokio_stream::wrappers::ReceiverStream;
+        use tonic::transport::{Endpoint, Server};
+
+        // A per-connection limiter allowing exactly one concurrent subscription.
+        let limiter = Arc::new(Mutex::new(ConnectionLimiter::new(RateLimitConfig {
+            max_subscriptions: 1,
+            ..RateLimitConfig::default()
+        })));
+        let registry = CotRegistry::new();
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server_registry = registry.clone();
+        let server_limiter = Arc::clone(&limiter);
+        let server = tokio::spawn(async move {
+            let incoming = tokio_stream::once(Ok::<_, std::io::Error>(ServedConn(server_io)));
+            Server::builder()
+                .add_service(CircleOfTrustServer::new(CotService::new(
+                    server_registry,
+                    server_limiter,
+                )))
+                .serve_with_incoming(incoming)
+                .await
+        });
+
+        let mut client_io = Some(client_io);
+        let channel = Endpoint::try_from("http://[::1]:50051")
+            .unwrap()
+            .connect_with_connector(tower::service_fn(move |_| {
+                let io = client_io.take().expect("connector invoked exactly once");
+                async move { Ok::<_, std::io::Error>(TokioIo::new(io)) }
+            }))
+            .await
+            .expect("in-memory connect over duplex");
+
+        let mut client_a = CircleOfTrustClient::new(channel.clone());
+        let mut client_b = CircleOfTrustClient::new(channel);
+        let addr = vec![0xccu8; ASSET_ADDR_LEN];
+
+        // A subscribes (takes the only slot). Hold a_tx and the response stream
+        // so the subscription — and thus the slot — stays live.
+        let (a_tx, a_rx) = mpsc::channel::<CotFrame>(8);
+        a_tx.send(CotFrame {
+            asset_address: addr.clone(),
+            payload: Vec::new(),
+        })
+        .await
+        .unwrap();
+        let _a_in = client_a
+            .subscribe(ReceiverStream::new(a_rx))
+            .await
+            .expect("A subscribes within the cap")
+            .into_inner();
+
+        // B's subscribe exceeds the cap → refused. Sequential await guarantees
+        // A's slot is already charged.
+        let (b_tx, b_rx) = mpsc::channel::<CotFrame>(8);
+        b_tx.send(CotFrame {
+            asset_address: addr.clone(),
+            payload: Vec::new(),
+        })
+        .await
+        .unwrap();
+        let err = client_b
+            .subscribe(ReceiverStream::new(b_rx))
+            .await
+            .expect_err("B exceeds the per-connection subscription cap (ISC-30)");
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert!(
+            err.message().is_empty(),
+            "refusal names no budget (ISC-A-S12); got {:?}",
+            err.message()
+        );
+
+        drop(a_tx);
         server.abort();
     }
 }
