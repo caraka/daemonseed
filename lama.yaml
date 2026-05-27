@@ -133,10 +133,10 @@ crates:
     manifest: "docs/llm-api-manifest/daemonseed-cli-api.yaml"
 
   - name: daemonseed-tui
-    purpose: "Interactive ratatui client. Primary testing surface during the private phase. Substantive code lands at M11."
+    purpose: "Interactive ratatui client — the MVP product surface. A terminal-free screen state machine (daemonseed_tui::app) rendered by pure functions (daemonseed_tui::ui), driven by a thin binary (terminal lifecycle + event loop) that reuses daemonseed-cli's connect / identity-proof / C22-trust client stack. M11 grows it through first-start, chat, circle, share/fetch, the C22 trust slider, the C28 trust-event taxonomy, and the F22 server-management screen."
     license: AGPL-3.0-or-later
-    status: placeholder
-    manifest: null
+    status: active
+    manifest: "docs/llm-api-manifest/daemonseed-tui-api.yaml"
 
   - name: daemonseed-integration-tests
     purpose: "Cross-crate integration tests + ISC coverage registry. Per-milestone exercise files under tests/m{N}_isc_coverage.rs."

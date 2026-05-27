@@ -21,7 +21,7 @@ daemonseed/
 │   ├── daemonseed-proto/                   wire schema (Protocol Buffers, prost + tonic)
 │   ├── daemonseed-server/                  relay daemon: TLS 1.3 + APP_HELLO + identity-proof → Authenticated (M4b); federation peer table + introducer (M5); public-space service (M6); circle-of-trust live relay (M8); RAM-only rate limiting (M9); release boot-gate (M10)
 │   ├── daemonseed-cli/                     scriptable client: `connect <server-id>` with identity-proof (M4b) + C22 trust slider (M5)
-│   ├── daemonseed-tui/                     interactive ratatui client (placeholder until M11)
+│   ├── daemonseed-tui/                     interactive ratatui client — the MVP product surface (M11)
 │   └── daemonseed-integration-tests/       cross-crate integration tests + ISC coverage registry
 │
 ├── docs/
@@ -29,13 +29,14 @@ daemonseed/
 │       ├── daemonseed-core-api.yaml
 │       ├── daemonseed-proto-protocol.yaml
 │       ├── daemonseed-server-api.yaml
-│       └── daemonseed-cli-api.yaml
+│       ├── daemonseed-cli-api.yaml
+│       └── daemonseed-tui-api.yaml
 │
 └── xtask/                                  workspace task runner: gen-proto, check-proto,
                                             isc-coverage, findings-resolved, install-hooks
 ```
 
-Substantive code lives in `daemonseed-core`, `daemonseed-proto`, `daemonseed-server`, and `daemonseed-cli` as of M10. The `tui` crate is still a placeholder; it fills in at M11.
+Substantive code lives in `daemonseed-core`, `daemonseed-proto`, `daemonseed-server`, and `daemonseed-cli` as of M10. The `tui` crate begins filling in at M11 (the MVP gate): a ratatui client whose interactive logic is a terminal-free, unit-testable screen state machine reused over the proven cli client stack.
 
 ## Status
 

@@ -571,7 +571,15 @@ dependencies = [
 name = "daemonseed-tui"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "daemonseed-cli",
+ "daemonseed-core",
+ "daemonseed-proto",
+ "daemonseed-server",
+ "oxicrypt-module",
+ "oxitls-rustls-provider",
  "ratatui",
+ "tokio",
 ]
 
 [[package]]

@@ -8,5 +8,42 @@ repository.workspace = true
 license = "AGPL-3.0-or-later"
 description = "daemonseed interactive terminal client"
 
+[lib]
+# The interactive surface lives in the library so the M11 gate harness and
+# unit tests can drive the screen state machine without a real terminal.
+name = "daemonseed_tui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "daemonseed-tui"
+path = "src/main.rs"
+
 [dependencies]
+# UI framework (MIT/Apache-2.0). ratatui 0.29 bundles crossterm under its
+# default features and re-exports it as `ratatui::crossterm`, so the TUI needs
+# no separate backend dep and no version-skew risk.
 ratatui = { workspace = true }
+
+# Domain logic + reused client stack. The TUI depends on daemonseed-cli to
+# reuse the proven connect / identity-proof / C22-trust client flow rather than
+# duplicating security-critical code (see PRD D4). cli pulls core/proto/server
+# transitively; tui also names core + proto directly for the types it renders.
+daemonseed-cli = { path = "../daemonseed-cli" }
+daemonseed-core = { path = "../daemonseed-core" }
+daemonseed-proto = { path = "../daemonseed-proto" }
+daemonseed-server = { path = "../daemonseed-server" }
+
+# Process-wide CryptoProvider install — symmetric with cli/server. The TUI
+# initializes the same oxicrypt module + rustls provider before connecting.
+oxicrypt-module = { workspace = true }
+oxitls-rustls-provider = { workspace = true }
+
+# Async runtime for the network side. The render loop stays on the main thread
+# (blocking crossterm event poll); network operations run on this runtime and
+# post results back over an mpsc channel.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync", "io-util", "net"] }
+
+anyhow = { workspace = true }
+
+[dev-dependencies]
+oxitls-rustls-provider = { workspace = true, features = ["testing"] }

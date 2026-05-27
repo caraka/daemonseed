@@ -1,0 +1,70 @@
+# ─────────────────────────────────────────────────────────────────────
+# daemonseed-tui — LAMA API Manifest (interactive client; M11 MVP gate)
+#
+# The TUI is the product surface for the MVP. M11 grows it from a placeholder
+# into a ratatui client that drives the full transaction. This manifest tracks
+# the library surface (the terminal-free screen state machine + render
+# functions) that the binary and the gate harness drive. The binary itself
+# (terminal lifecycle + event loop) carries no library API.
+#
+# Cross-references:
+# - Repository root: ../../lama.yaml
+# - Core crate: ./daemonseed-core-api.yaml
+# - CLI crate (reused client stack): ./daemonseed-cli-api.yaml
+# ─────────────────────────────────────────────────────────────────────
+
+lama: "0.1"
+
+library:
+  name: daemonseed-tui
+  version: "0.1.0"
+  description: "Interactive ratatui client — the MVP product surface. The interactive logic is a terminal-free screen state machine (daemonseed_tui::app) rendered by pure functions (daemonseed_tui::ui), so it is unit-testable and PTY-driveable without a terminal. The binary owns terminal lifecycle + event loop and reuses daemonseed-cli's connect / identity-proof / C22-trust client stack for the network side."
+  license: "AGPL-3.0-or-later"
+  manifest_for: "crates/daemonseed-tui"
+  status: "M11 scaffold — app state machine + render loop live; first-start / chat / circle / share / trust / server-management screens grow across the M11 workstreams"
+
+modules:
+  - name: daemonseed_tui::app
+    description: >-
+      The screen state machine. App holds all interactive state and advances
+      only through App::on_key (and, later, network-result messages); it
+      performs no terminal I/O, so every navigation and input transition is
+      unit-testable and deterministically driveable by the M11 gate harness.
+      Screen is the top-level screen enum (Welcome / FirstStart / Main);
+      sub-screens are modelled by the later M11 workstreams. on_key ignores
+      non-Press key kinds so Windows Release/Repeat events do not double-fire
+      transitions.
+    no_std: false
+    depends_on: []
+    iscs: ["1"]
+    added_in: "M11 scaffold"
+
+  - name: daemonseed_tui::ui
+    description: >-
+      Pure render functions over a ratatui Frame, dispatched on the current
+      Screen. No state mutation happens here — rendering is a pure function of
+      App, which is what makes the PTY gate harness' screen-scraping assertions
+      deterministic.
+    no_std: false
+    depends_on: [daemonseed_tui::app]
+    iscs: ["1"]
+    added_in: "M11 scaffold"
+
+public_types:
+  - name: daemonseed_tui::app::App
+    kind: struct
+    description: "Interactive application state. Construct with App::new, feed key events with on_key, render from ui::render; the event loop stops when should_quit is true."
+    methods:
+      - "fn new() -> App"
+      - "fn screen(&self) -> &Screen"
+      - "fn should_quit(&self) -> bool"
+      - "fn on_key(&mut self, key: KeyEvent)"
+  - name: daemonseed_tui::app::Screen
+    kind: enum
+    description: "Top-level screen: Welcome (landing), FirstStart (cold first-start flow), Main (post-first-start view). Sub-screens added by later M11 workstreams."
+    variants: [Welcome, FirstStart, Main]
+
+public_functions:
+  - name: daemonseed_tui::ui::render
+    signature: "fn render(app: &App, frame: &mut Frame)"
+    description: "Draw the current screen as a pure function of App state."
