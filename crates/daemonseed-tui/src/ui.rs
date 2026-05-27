@@ -13,7 +13,7 @@ use ratatui::widgets::{Block, Borders, Gauge, Paragraph, Wrap};
 
 use daemonseed_core::passphrase::strength::SESSION_PASSPHRASE_MIN_BITS;
 
-use crate::app::{App, ConnectionStatus, Screen};
+use crate::app::{App, CircleStatus, ConnectionStatus, MainFocus, Screen};
 use crate::screens::first_start::{FirstStartUi, FsStep};
 
 /// Draw the current screen.
@@ -28,10 +28,27 @@ pub fn render(app: &App, frame: &mut Frame) {
     }
 }
 
-/// The post-first-start main view. For now it surfaces the live connection
-/// status; chat / circle / share / trust tabs grow here in the next workstreams.
+/// The post-first-start main view: a connection/circle status bar, the circle
+/// chat transcript, and the focused input (chat compose or circle-join). Trust /
+/// share / server tabs grow here in the later workstreams.
 fn render_main(app: &App, frame: &mut Frame) {
-    let (line, color) = match app.connection() {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // status bar
+            Constraint::Min(3),    // chat transcript
+            Constraint::Length(3), // focused input
+        ])
+        .split(frame.area());
+
+    render_status_bar(app, frame, chunks[0]);
+    render_chat_transcript(app, frame, chunks[1]);
+    render_main_input(app, frame, chunks[2]);
+}
+
+/// Top bar: connection state on the left, circle state on the right.
+fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
+    let (conn, color) = match app.connection() {
         ConnectionStatus::Disconnected => ("disconnected".to_owned(), Color::Gray),
         ConnectionStatus::Connecting => ("connecting…".to_owned(), Color::Yellow),
         ConnectionStatus::Connected {
@@ -39,27 +56,87 @@ fn render_main(app: &App, frame: &mut Frame) {
             version,
             rotation_notice,
         } => {
-            let mut s = format!("connected to {server}  (wire {version})");
+            let mut s = format!("connected to {server} (wire {version})");
             if let Some(fp) = rotation_notice {
-                s.push_str(&format!(
-                    "\nnotice: server key rotated; new fingerprint {fp}"
-                ));
+                s.push_str(&format!("  [key rotated: {fp}]"));
             }
             (s, Color::Green)
         }
         ConnectionStatus::Failed(msg) => (format!("connection failed: {msg}"), Color::Red),
     };
-    let body = Paragraph::new(line)
+    let circle = match app.circle_status() {
+        CircleStatus::NotJoined => "no circle".to_owned(),
+        CircleStatus::Joining => "joining circle…".to_owned(),
+        CircleStatus::Joined => "circle joined".to_owned(),
+        CircleStatus::Failed(m) => format!("circle join failed: {m}"),
+    };
+    let body = Paragraph::new(format!("{conn}    │    {circle}"))
         .style(Style::default().fg(color))
-        .alignment(Alignment::Center)
-        .wrap(Wrap { trim: true })
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(" daemonseed ")
                 .title_alignment(Alignment::Center),
         );
-    frame.render_widget(body, frame.area());
+    frame.render_widget(body, area);
+}
+
+/// The circle chat transcript, oldest at the top (ISC-10). Each line is
+/// `sender: body`; a just-sent local echo carries the user's own handle.
+fn render_chat_transcript(app: &App, frame: &mut Frame, area: Rect) {
+    let lines: Vec<Line> = if app.messages().is_empty() {
+        vec![
+            Line::from("no messages yet — Tab to join a circle, then type to chat".to_owned())
+                .style(Style::default().fg(Color::DarkGray)),
+        ]
+    } else {
+        app.messages()
+            .iter()
+            .map(|m| Line::from(format!("{}: {}", m.sender, m.body)))
+            .collect()
+    };
+    let body = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" chat ")
+            .title_alignment(Alignment::Left),
+    );
+    frame.render_widget(body, area);
+}
+
+/// The bottom input line: the chat compose box or the circle-join box,
+/// depending on focus (Tab toggles). A focused box is highlighted.
+fn render_main_input(app: &App, frame: &mut Frame, area: Rect) {
+    let (title, text, focused) = match app.main_focus() {
+        MainFocus::Chat => (
+            "compose  [Enter] send  [Tab] join-circle  [Esc] back",
+            app.compose(),
+            true,
+        ),
+        MainFocus::JoinCircle => (
+            "circle phrase  [Enter] join  [Tab] chat  [Esc] back",
+            app.circle_phrase(),
+            true,
+        ),
+    };
+    let style = if focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default()
+    };
+    // A status/error line (e.g. a failed send) replaces the input text briefly
+    // when present, so the user sees why nothing happened.
+    let shown = match app.status() {
+        Some(s) => format!("{text}    ⚠ {s}"),
+        None => text.to_owned(),
+    };
+    let body = Paragraph::new(shown).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(style)
+            .title(title),
+    );
+    frame.render_widget(body, area);
 }
 
 fn render_welcome(frame: &mut Frame) {

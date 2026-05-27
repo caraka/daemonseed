@@ -585,6 +585,8 @@ dependencies = [
  "oxitls-rustls-provider",
  "ratatui",
  "tokio",
+ "tokio-stream",
+ "tonic",
 ]
 
 [[package]]

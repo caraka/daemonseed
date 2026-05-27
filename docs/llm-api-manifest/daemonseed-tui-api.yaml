@@ -33,28 +33,36 @@ modules:
       Screen is the top-level screen enum (Welcome / FirstStart / Main); App
       owns the active first-start component and stashes the SessionMaterials a
       completed first-start produces. on_key ignores non-Press key kinds so
-      Windows Release/Repeat events do not double-fire transitions.
+      Windows Release/Repeat events do not double-fire transitions. The Main view
+      holds circle-chat state: a message transcript (ISC-10), a compose buffer
+      that queues a SendChat + locally echoes (ISC-14), a circle-join phrase
+      buffer that queues a JoinCircle (ISC-15/16), and a Tab-toggled focus.
     no_std: false
     depends_on: [daemonseed-core, "daemonseed_tui::screens::first_start"]
-    iscs: ["1"]
-    added_in: "M11 scaffold"
+    iscs: ["1", "10", "14", "15", "16"]
+    added_in: "M11 scaffold + chat workstream"
 
   - name: daemonseed_tui::net
     description: >-
       Network actor — the async side of the TUI. The binary owns a NetHandle
-      holding a dedicated network thread (current-thread tokio runtime) and two
-      channels: NetCommand flows in, NetEvent flows out; the render thread sends
-      commands and drains events with non-blocking try_recv so a slow connect
-      never blocks the UI (ISC-A-C7 substrate). A current-thread runtime is
-      required because daemonseed_cli::connect takes &mut dyn TrustStore (not
-      Send) and so cannot be tokio::spawn'd onto a multi-thread runtime. Connect
-      uses an ephemeral client identity (D8) + a trust store seeded for the
-      dialed server in the requested C22 mode (trusted = TOFU-pin; untrusted
-      needs a pre-imported key, reported until the server-management import UX).
+      holding a dedicated network thread (current-thread tokio runtime inside a
+      LocalSet) and two channels: NetCommand flows in, NetEvent flows out; the
+      render thread sends commands and drains events with non-blocking try_recv
+      so a slow connect or cold index never blocks the UI (ISC-A-C7 substrate).
+      Current-thread + LocalSet is required because connect_session takes
+      &mut dyn TrustStore (not Send) and the circle inbound-reader holds an
+      Rc<CotKey> — neither can be tokio::spawn'd onto a multi-thread runtime.
+      Commands: Connect (keeps the live AppSession, ephemeral identity D8 +
+      trust store seeded for the dialed server in the requested C22 mode),
+      JoinCircle (derive_cot_key + asset_address → subscribe; spawn_local an
+      inbound reader that open_messages each frame → ChatMessage event),
+      SendChat (seal_message → publish a CotFrame on the held subscribe stream).
+      Events: Connected/ConnectFailed, CircleJoined/CircleJoinFailed,
+      ChatMessage, ChatError. Foreign/undecryptable inbound frames are skipped.
     no_std: false
-    depends_on: [daemonseed-cli, daemonseed-core]
-    iscs: ["47", C22, C37]
-    added_in: "M11 connect workstream"
+    depends_on: [daemonseed-cli, daemonseed-core, daemonseed-proto]
+    iscs: ["10", "14", "16", "47", C15, C17, C22, C37, A-S2]
+    added_in: "M11 connect + chat workstream"
 
   - name: daemonseed_tui::screens::first_start
     description: >-
@@ -97,12 +105,34 @@ public_types:
       - "fn has_session(&self) -> bool"
       - "fn connection(&self) -> &ConnectionStatus"
       - "fn take_pending_connect(&mut self) -> Option<ConnectRequest>"
+      - "fn take_pending_join(&mut self) -> Option<String>"
+      - "fn take_pending_chat(&mut self) -> Option<ChatSend>"
+      - "fn main_focus(&self) -> MainFocus"
+      - "fn compose(&self) -> &str"
+      - "fn circle_phrase(&self) -> &str"
+      - "fn messages(&self) -> &[ChatLine]"
+      - "fn circle_status(&self) -> &CircleStatus"
+      - "fn status(&self) -> Option<&str>"
       - "fn on_net_event(&mut self, event: NetEvent)"
       - "fn on_key(&mut self, key: KeyEvent)"
   - name: daemonseed_tui::app::Screen
     kind: enum
-    description: "Top-level screen: Welcome (landing), FirstStart (cold first-start flow), Main (post-first-start view). Sub-screens added by later M11 workstreams."
+    description: "Top-level screen: Welcome (landing), FirstStart (cold first-start flow), Main (post-first-start chat/circle view). Sub-screens added by later M11 workstreams."
     variants: [Welcome, FirstStart, Main]
+  - name: daemonseed_tui::app::ChatLine
+    kind: struct
+    description: "One rendered chat line: sender (self-asserted handle), body, sent_unix_ms (0 for a local echo of a just-sent message, which the relay never reflects to its sender). ISC-10."
+  - name: daemonseed_tui::app::MainFocus
+    kind: enum
+    description: "Which Main-view input has keyboard focus (Tab toggles): Chat (compose, Enter sends, ISC-14) or JoinCircle (phrase, Enter joins, ISC-15/16)."
+    variants: [Chat, JoinCircle]
+  - name: daemonseed_tui::app::CircleStatus
+    kind: enum
+    description: "Circle subscription state shown on the main view: NotJoined, Joining, Joined (ISC-16), Failed(String)."
+    variants: [NotJoined, Joining, Joined, "Failed(String)"]
+  - name: daemonseed_tui::app::ChatSend
+    kind: struct
+    description: "A queued chat send the binary forwards to the net actor: body + sender_handle (the user's own display handle, sealed into the message; never seen by the relay)."
   - name: daemonseed_tui::screens::first_start::FirstStartUi
     kind: struct
     description: "Interactive first-start state, advanced through on_key; produces SessionMaterials on completion."

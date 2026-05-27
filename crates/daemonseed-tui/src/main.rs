@@ -68,12 +68,21 @@ fn run(terminal: &mut ratatui::DefaultTerminal, mut net: NetHandle) -> io::Resul
             app.on_key(key);
         }
 
-        // Hand any queued connect to the network actor.
+        // Hand any queued commands to the network actor.
         if let Some(req) = app.take_pending_connect() {
             let _ = net.send(NetCommand::Connect {
                 server_id: req.server_id,
                 address: req.address,
                 trusted: req.trusted,
+            });
+        }
+        if let Some(phrase) = app.take_pending_join() {
+            let _ = net.send(NetCommand::JoinCircle { phrase });
+        }
+        if let Some(chat) = app.take_pending_chat() {
+            let _ = net.send(NetCommand::SendChat {
+                body: chat.body,
+                sender_handle: chat.sender_handle,
             });
         }
     }

@@ -43,6 +43,13 @@ oxitls-rustls-provider = { workspace = true }
 # post results back over an mpsc channel.
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync", "io-util", "net"] }
 
+# Circle chat rides the CircleOfTrust bidirectional Subscribe stream: tokio-stream
+# wraps the outbound mpsc as a Stream; tonic::Streaming is the inbound type the
+# reader task drains. AppSession (cli) builds the channel; these are the stream
+# adapters the actor drives directly.
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+
 anyhow = { workspace = true }
 
 [dev-dependencies]
