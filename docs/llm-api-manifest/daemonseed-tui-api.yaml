@@ -21,7 +21,7 @@ library:
   description: "Interactive ratatui client — the MVP product surface. The interactive logic is a terminal-free screen state machine (daemonseed_tui::app) rendered by pure functions (daemonseed_tui::ui), so it is unit-testable and PTY-driveable without a terminal. The binary owns terminal lifecycle + event loop and reuses daemonseed-cli's connect / identity-proof / C22-trust client stack for the network side."
   license: "AGPL-3.0-or-later"
   manifest_for: "crates/daemonseed-tui"
-  status: "M11 scaffold — app state machine + render loop live; first-start / chat / circle / share / trust / server-management screens grow across the M11 workstreams"
+  status: "M11 in progress — app state machine + render loop + first-start flow live; chat / circle / share / trust / server-management screens grow across the remaining M11 workstreams"
 
 modules:
   - name: daemonseed_tui::app
@@ -30,14 +30,31 @@ modules:
       only through App::on_key (and, later, network-result messages); it
       performs no terminal I/O, so every navigation and input transition is
       unit-testable and deterministically driveable by the M11 gate harness.
-      Screen is the top-level screen enum (Welcome / FirstStart / Main);
-      sub-screens are modelled by the later M11 workstreams. on_key ignores
-      non-Press key kinds so Windows Release/Repeat events do not double-fire
-      transitions.
+      Screen is the top-level screen enum (Welcome / FirstStart / Main); App
+      owns the active first-start component and stashes the SessionMaterials a
+      completed first-start produces. on_key ignores non-Press key kinds so
+      Windows Release/Repeat events do not double-fire transitions.
     no_std: false
-    depends_on: []
+    depends_on: [daemonseed-core, "daemonseed_tui::screens::first_start"]
     iscs: ["1"]
     added_in: "M11 scaffold"
+
+  - name: daemonseed_tui::screens::first_start
+    description: >-
+      First-start flow component (ISC-C29 family). Drives the core
+      FirstStart type-state machine through passphrase (live C12 strength
+      meter, 60-bit session floor) → 24-word mnemonic display → backup verify
+      (re-type round-trip C33, or 3-word type-back fallback C34) → adj-noun
+      display name (C4b) → bootstrap relay (C37) → SessionMaterials. A-C15 is
+      structural: SessionMaterials (the only thing the connect path accepts)
+      are produced only on completion. The core verify methods CONSUME the
+      Sealed state, so the component locally pre-validates against the held
+      mnemonic and only invokes the consuming verify when it will succeed —
+      a mistyped phrase stays on the step instead of destroying the session.
+    no_std: false
+    depends_on: [daemonseed-core]
+    iscs: ["2", "3", "4", "5", "6", "7", "8", "9", C2, C4b, C12, C29, C31, C32, C33, C34, C37, A-C15]
+    added_in: "M11 first-start workstream"
 
   - name: daemonseed_tui::ui
     description: >-
@@ -53,16 +70,42 @@ modules:
 public_types:
   - name: daemonseed_tui::app::App
     kind: struct
-    description: "Interactive application state. Construct with App::new, feed key events with on_key, render from ui::render; the event loop stops when should_quit is true."
+    description: "Interactive application state. Construct with App::new (production Argon2) or App::with_argon (fast params for tests/gate); feed key events with on_key, render from ui::render. Owns the active first-start component and stashes the SessionMaterials a completed first-start produces."
     methods:
       - "fn new() -> App"
+      - "fn with_argon(argon: ArgonParams) -> App"
       - "fn screen(&self) -> &Screen"
       - "fn should_quit(&self) -> bool"
+      - "fn first_start(&self) -> Option<&FirstStartUi>"
+      - "fn has_session(&self) -> bool"
       - "fn on_key(&mut self, key: KeyEvent)"
   - name: daemonseed_tui::app::Screen
     kind: enum
     description: "Top-level screen: Welcome (landing), FirstStart (cold first-start flow), Main (post-first-start view). Sub-screens added by later M11 workstreams."
     variants: [Welcome, FirstStart, Main]
+  - name: daemonseed_tui::screens::first_start::FirstStartUi
+    kind: struct
+    description: "Interactive first-start state, advanced through on_key; produces SessionMaterials on completion."
+    methods:
+      - "fn new(argon: ArgonParams) -> FirstStartUi"
+      - "fn step(&self) -> FsStep"
+      - "fn input(&self) -> &str"
+      - "fn strength(&self) -> Option<&Strength>"
+      - "fn passphrase_is_green(&self) -> bool"
+      - "fn mnemonic(&self) -> Option<&str>"
+      - "fn challenge_positions(&self) -> Option<Vec<usize>>"
+      - "fn name_default(&self) -> &str"
+      - "fn error(&self) -> Option<&str>"
+      - "fn on_key(&mut self, key: KeyEvent) -> Option<FirstStartOutcome>"
+      - "fn take_completed(&mut self) -> Option<SessionMaterials>"
+  - name: daemonseed_tui::screens::first_start::FsStep
+    kind: enum
+    description: "First-start step: Passphrase, ShowMnemonic, VerifyRoundTrip, VerifyTypeBack, DisplayName, Bootstrap, Complete."
+    variants: [Passphrase, ShowMnemonic, VerifyRoundTrip, VerifyTypeBack, DisplayName, Bootstrap, Complete]
+  - name: daemonseed_tui::screens::first_start::FirstStartOutcome
+    kind: enum
+    description: "Terminal outcome of the first-start flow: Completed (materials ready) or Cancelled (user backed out)."
+    variants: [Completed, Cancelled]
 
 public_functions:
   - name: daemonseed_tui::ui::render
