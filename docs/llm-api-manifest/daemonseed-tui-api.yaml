@@ -48,8 +48,8 @@ modules:
       Mute → Servers → TrustHistory.
     no_std: false
     depends_on: [daemonseed-core, "daemonseed_tui::screens::first_start"]
-    iscs: ["1", "10", "11", "12", "13", "14", "15", "16", "21", "22", "23", "24", "25", "26", "27", "28", C28, C26, A-C12]
-    added_in: "M11 scaffold + chat + trust/server + C28 workstream"
+    iscs: ["1", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", C16, C26, C28, A-C3, A-C7, A-C12, F23]
+    added_in: "M11 scaffold + chat + trust/server + C28 + shares + fetch workstream"
 
   - name: daemonseed_tui::net
     description: >-
@@ -67,13 +67,22 @@ modules:
       inbound reader that open_messages each frame → ChatMessage event),
       SendChat (seal_message → publish a CotFrame on the held subscribe stream),
       RefreshShares (read the held ShareIndex.entries() and the relay's
-      ListPublicShares snapshot, emit a SharesSnapshot event; pure read-path).
+      ListPublicShares snapshot, emit a SharesSnapshot event; pure read-path),
+      FetchShare (ISC-19, F23 unified mechanism — derives the public-share
+      asset address from share_id + connected server-id, opens a new bidi
+      CircleOfTrust.Subscribe stream over the existing AppSession, sends a
+      ManifestRequest, reads a ManifestResponse, then issues one ChunkRequest
+      per entry, verifies SHA-384 over each ChunkResponse, and emits progress
+      events; fail-closed on any hash mismatch).
       Events: Connected/ConnectFailed, CircleJoined/CircleJoinFailed,
       ChatMessage, ChatError, TrustEvent (a C28 trust-event key + scope, routed
       by the UI per its affordance class), ConnectionClosed (a C26 close-cause
       layer), SharesSnapshot ({ local: Vec<LocalShareRow>, remote:
       Vec<PublicShareListing>, indexer_status: IndexerStatus } — ISC-17/20),
-      SharesError (RPC or storage failure surfaced on the status line).
+      SharesError (RPC or storage failure surfaced on the status line),
+      FetchProgress ({ total_chunks: Option<u32>, chunks_received, bytes_received
+      } — first event after manifest arrives), FetchComplete ({ share_id,
+      files_written, bytes_written }), FetchError ({ message } — terminal).
       On connect failure the actor categorizes the error into a CloseCause
       and emits the warranted trust event: an actionable key directly
       (ServerKeyMismatch / NoCommonVersion, Blocking), else the uniform rate-limit
@@ -82,8 +91,8 @@ modules:
       Foreign/undecryptable inbound frames are skipped.
     no_std: false
     depends_on: [daemonseed-cli, daemonseed-core, daemonseed-proto]
-    iscs: ["10", "14", "16", "17", "20", "22", "23", "24", "28", "47", C15, C17, C21, C22, C26, C28, C37, A-S2, A-C7, A-S12]
-    added_in: "M11 connect + chat + C28 + shares workstream"
+    iscs: ["10", "14", "16", "17", "19", "20", "22", "23", "24", "28", "47", C15, C17, C21, C22, C26, C28, C37, A-S2, A-C7, A-S12, F23]
+    added_in: "M11 connect + chat + C28 + shares + fetch workstream"
 
   - name: daemonseed_tui::screens::first_start
     description: >-
@@ -157,6 +166,8 @@ public_types:
       - "fn hidden_shares(&self) -> impl Iterator<Item = &str>"
       - "fn share_sel(&self) -> usize                    # Public-shares row selection"
       - "fn take_pending_share_refresh(&mut self) -> bool  # drained into NetCommand::RefreshShares"
+      - "fn fetch(&self) -> Option<&FetchUi>               # ISC-19 active fetch overlay"
+      - "fn take_pending_share_fetch(&mut self) -> Option<(String, String)>  # drained into NetCommand::FetchShare"
       - "fn on_net_event(&mut self, event: NetEvent)"
       - "fn on_key(&mut self, key: KeyEvent)"
   - name: daemonseed_tui::app::Screen
@@ -177,6 +188,13 @@ public_types:
     kind: enum
     description: "Indexer state as seen by the TUI (ISC-20 / A-C7): Idle (no share root configured), Indexing { seen, total: Option<u64> } (cold/incremental scan running), Ready { entries }. The status line at the top of the My-shares pane reflects this; transitions never gate user input."
     variants: [Idle, "Indexing { seen, total }", "Ready { entries }"]
+  - name: daemonseed_tui::app::FetchUi
+    kind: struct
+    description: "Active share-fetch state (ISC-19, F23 unified mechanism). Constructed when the user presses f on a selected Public-shares row; folded by App::on_net_event as FetchProgress/Complete/Error arrive. Surfaced as a centered overlay; key handling routes through App::on_key while up (Esc cancels in-flight; Enter on a terminal state dismisses)."
+  - name: daemonseed_tui::app::FetchStatus
+    kind: enum
+    description: "Phase of an active FetchUi (ISC-19): RequestingManifest (ManifestRequest is out), Receiving (manifest arrived, chunks flowing), Complete (all chunks verified + accounted), Failed(String) (aborted or error)."
+    variants: [RequestingManifest, Receiving, Complete, "Failed(String)"]
   - name: daemonseed_tui::app::TrustItem
     kind: struct
     description: "A surfaced C28 trust event awaiting user attention: key (selects the affordance class via core class_of) + server_id (scopes per-(key,scope) dismissal, ISC-A-C12). ISC-22/23/24."

@@ -20,7 +20,8 @@ use daemonseed_core::passphrase::strength::SESSION_PASSPHRASE_MIN_BITS;
 use daemonseed_core::trust_events::{TrustEventKey, event_key_string};
 
 use crate::app::{
-    App, ChatLine, CircleStatus, ConnectionStatus, IndexerStatus, MainFocus, Screen, TrustItem,
+    App, ChatLine, CircleStatus, ConnectionStatus, FetchStatus, FetchUi, IndexerStatus, MainFocus,
+    Screen, TrustItem,
 };
 use crate::screens::first_start::{FirstStartUi, FsStep};
 
@@ -61,13 +62,63 @@ fn render_main(app: &App, frame: &mut Frame) {
     render_main_input(app, frame, chunks[2]);
 
     // C28 overlays, drawn last so they sit on top: a Transient toast (ISC-24),
-    // then a Blocking modal (ISC-22) which takes visual precedence.
+    // then a Blocking modal (ISC-22) which takes visual precedence. The fetch
+    // overlay (ISC-19) sits between them — above the chat/shares view but
+    // below a security event.
     if let Some(item) = app.transient_trust() {
         render_transient_toast(item, frame, frame.area());
+    }
+    if let Some(f) = app.fetch() {
+        render_fetch_overlay(f, frame, frame.area());
     }
     if let Some(item) = app.blocking_trust() {
         render_blocking_modal(item, frame, frame.area());
     }
+}
+
+/// The active share-fetch overlay (ISC-19, F23 unified mechanism): a centered
+/// box showing the share id, sharer handle, current phase, and N-of-M chunk
+/// progress. While present, [`App::on_key`] routes input here (Esc cancels;
+/// Enter on a terminal state dismisses).
+fn render_fetch_overlay(f: &FetchUi, frame: &mut Frame, area: Rect) {
+    let popup = centered_rect(60, 28, area);
+    let (phase, color) = match &f.status {
+        FetchStatus::RequestingManifest => ("requesting manifest…".to_owned(), Color::Yellow),
+        FetchStatus::Receiving => ("receiving chunks…".to_owned(), Color::Cyan),
+        FetchStatus::Complete => ("complete".to_owned(), Color::Green),
+        FetchStatus::Failed(m) => (format!("failed: {m}"), Color::Red),
+    };
+    let total = match f.total_chunks {
+        Some(n) => n.to_string(),
+        None => "?".to_owned(),
+    };
+    let sharer = if f.sharer_handle.is_empty() {
+        "(operator)".to_owned()
+    } else {
+        f.sharer_handle.clone()
+    };
+    let body = format!(
+        "share: {}\nby: {sharer}\n\nphase: {phase}\nchunks: {}/{total}\nbytes:  {}\n\n{}",
+        f.share_id,
+        f.chunks_received,
+        f.bytes_received,
+        match f.status {
+            FetchStatus::Complete | FetchStatus::Failed(_) => "[Enter] dismiss   [Esc] dismiss",
+            _ => "[Esc] cancel",
+        }
+    );
+    let widget = Paragraph::new(body)
+        .alignment(Alignment::Left)
+        .wrap(Wrap { trim: false })
+        .style(Style::default().fg(color))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(color))
+                .title(" share fetch "),
+        );
+    frame.render_widget(Clear, popup);
+    frame.render_widget(widget, popup);
 }
 
 /// The Trust History view (ISC-25 / C28 LogOnly surface): every recorded trust

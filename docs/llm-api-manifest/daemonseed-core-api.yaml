@@ -267,19 +267,53 @@ modules:
 
   - name: daemonseed_core::cot
     description: >-
-      Circle-of-trust rendezvous addressing (M8, ISC-8 / S4). asset_address =
-      SHA-384(cot_key || server_id): the opaque 48-byte point a relay routes a
-      circle's traffic through. Only a member can compute it (needs cot_key ->
-      relay never learns the circle, ISC-A-S2); server_id namespaces it per
-      relay (same circle on two relays = two unlinkable addresses) without
-      tying the circle to any relay (cot_key is server-independent).
+      Circle-of-trust + public-share rendezvous addressing (M8/M11). For chat
+      circles: asset_address = SHA-384(cot_key || server_id) (ISC-8 / S4) —
+      the opaque 48-byte point a relay routes a circle's traffic through;
+      only a member can compute it (needs cot_key, so the relay never learns
+      the circle, ISC-A-S2). For public shares: public_share_asset_address =
+      SHA-384(share_id || 0x00 || server_id) (ISC-19 / F23 unified mechanism)
+      — same digest, same 48-byte address surface, with the circle secret
+      replaced by the public share_id (nothing to hide; ISC-C19 makes
+      public-share content server-visible by design). server_id namespaces
+      both addresses per relay (cross-relay unlinkability) without tying the
+      asset to any relay.
     no_std: false
     depends_on:
       - daemonseed_core::circle
     iscs:
       - C8
+      - "19"
       - A-S2
       - S4
+      - F23
+
+  - name: daemonseed_core::share_envelope
+    description: >-
+      Share-fetch envelope (M11 — ISC-19, F23 unified mechanism). Public and
+      CoT shares ride the same CircleOfTrust.Subscribe bidi stream as chat
+      circles. What rides inside CotFrame.payload differs per asset kind:
+      chat circles carry a prost-encoded CircleMessage sealed with AES-256-GCM
+      under cot_key (`circle::message`); public shares carry a `ShareFrame`
+      encoded by `ShareFrame::encode`, plain (ISC-C19 makes public-share
+      content server-visible); CoT shares (post-MVP) will carry the same
+      `ShareFrame::encode` output further sealed under a share-CoT key (same
+      `seal_message`/`open_message` pair). Keeping the envelope as a Vec<u8>
+      codec rather than a new proto message keeps the relay's wire surface
+      minimal — A-S2 structural opacity holds for share traffic the same way
+      it holds for chat — and stays inside §M11 'no new ISCs' (the envelope
+      is a daemonseed-core detail, documented in LAMA, not new wire schema).
+      Discriminator: 0x00=ManifestRequest, 0x01=ManifestResponse,
+      0x02=ChunkRequest, 0x03=ChunkResponse. Decode fails closed on any
+      malformed input.
+    no_std: false
+    depends_on:
+      - daemonseed_core::storage::cas
+    iscs:
+      - "19"
+      - F23
+      - A-S2
+      - A-S5b
 
   - name: daemonseed_core::storage::share_index
     description: >-
@@ -2738,6 +2772,70 @@ functions:
           condition: The oxicrypt module power-up self-test has not passed.
     preconditions:
       - description: The oxicrypt module must be operational.
+
+  - name: public_share_asset_address
+    module: daemonseed_core::cot
+    description: >-
+      Derive a public share's rendezvous address on a given relay (ISC-19,
+      F23 unified mechanism): SHA-384(share_id || 0x00 || server_id). Shape
+      mirrors asset_address with the circle secret replaced by the public
+      share_id (nothing to hide in a public share's address; ISC-C19 makes
+      public-share content server-visible by design). The 0x00 separator
+      makes the share_id/server_id boundary unambiguous. The CoT-share
+      variant (post-MVP) will derive an analogous address keyed by a
+      share-CoT key and wrap each ShareFrame in an AEAD seal — same wire
+      mechanism, additional secret + encryption layer.
+    signature: "pub fn public_share_asset_address(share_id: &[u8], server_id: &[u8]) -> Result<AssetAddr, oxicrypt_module::Error>"
+    parameters:
+      - name: share_id
+        type: "&[u8]"
+        direction: in
+        description: The public share identifier (from PublicShareListing.share_id).
+      - name: server_id
+        type: "&[u8]"
+        direction: in
+        description: The stable wire server-id, namespacing the address per relay.
+    returns:
+      type: "Result<AssetAddr, oxicrypt_module::Error>"
+      description: The public-share rendezvous asset address.
+    iscs: ["19", F23]
+
+  # ── share_envelope ──────────────────────────────────────────────────
+  - name: ShareFrame::encode
+    module: daemonseed_core::share_envelope
+    description: >-
+      Serialize a ShareFrame to its on-wire bytes (the payload of a
+      CircleOfTrust.Subscribe CotFrame on the share-fetch path, ISC-19).
+      One-byte discriminator (0..3) then big-endian fields per the wire
+      shape documented at the module level. Stays inside CotFrame.payload
+      so the relay's wire surface (cot.proto) does not gain new schema —
+      A-S2 structural opacity holds for share traffic the same way it does
+      for chat. Each frame fits inside a single CotFrame.payload; the
+      largest realistic frame is a ChunkResponse whose data bytes are
+      bounded by the file-relay chunk-size policy (single-chunk-per-file
+      alpha; tunable, post-MVP).
+    signature: "pub fn encode(&self) -> Vec<u8>"
+    iscs: ["19", F23, A-S2]
+
+  - name: ShareFrame::decode
+    module: daemonseed_core::share_envelope
+    description: >-
+      Parse a CotFrame.payload into a ShareFrame. Fail-closed on any
+      malformed input (unknown discriminator, truncated buffer, invalid
+      UTF-8 in a rel_path); the caller treats decode failure as foreign
+      noise (same posture chat already takes per open_message returning
+      Err).
+    signature: "pub fn decode(bytes: &[u8]) -> Result<ShareFrame, DecodeError>"
+    returns:
+      type: "Result<ShareFrame, DecodeError>"
+      error_variants:
+        - name: UnknownKind
+          condition: Discriminator byte did not match a known frame kind.
+        - name: Truncated
+          condition: Buffer ended before parser expected, or a length prefix overruns.
+        - name: BadUtf8
+          condition: A manifest entry's rel_path bytes are not valid UTF-8.
+    iscs: ["19", F23]
 
   # ── circle::message ─────────────────────────────────────────────────
   - name: seal_message

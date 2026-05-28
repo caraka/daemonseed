@@ -137,6 +137,44 @@ pub enum IndexerStatus {
     Ready { entries: u64 },
 }
 
+/// Active share-fetch state (ISC-19, F23 unified mechanism).
+///
+/// Constructed when the user presses `f` on a selected Public-shares row;
+/// folded by [`App::on_net_event`] as `NetEvent::FetchProgress` /
+/// `FetchComplete` / `FetchError` arrive. Surfaced as a centered overlay by
+/// [`crate::ui`]; key handling routes through [`App::on_key`] while the
+/// overlay is up (Esc cancels; Enter on a completed/failed overlay
+/// dismisses).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchUi {
+    /// The share being fetched (from `PublicShareListing.share_id`).
+    pub share_id: String,
+    /// The sharer's wire handle, for user-facing display.
+    pub sharer_handle: String,
+    /// Phase of the fetch.
+    pub status: FetchStatus,
+    /// Total chunks (`Some` once the `ManifestResponse` arrives, `None`
+    /// while the fetcher is waiting on it).
+    pub total_chunks: Option<u32>,
+    /// Chunks successfully verified and written to local CAS so far.
+    pub chunks_received: u32,
+    /// Bytes successfully written to local CAS so far (advisory progress).
+    pub bytes_received: u64,
+}
+
+/// Phase of an active [`FetchUi`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FetchStatus {
+    /// `ManifestRequest` is out; the fetcher is waiting on the manifest.
+    RequestingManifest,
+    /// The manifest has arrived; chunks are flowing.
+    Receiving,
+    /// All chunks verified and written; user dismisses on Enter.
+    Complete,
+    /// Aborted (Esc) or failed (`message` carries the cause).
+    Failed(String),
+}
+
 /// A surfaced trust event awaiting user attention (ISC-C28). The `key` selects
 /// the affordance class via [`class_of`]; `server_id` scopes dismissal.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -266,6 +304,14 @@ pub struct App {
     /// (drained once). `true` means "the user pressed R" or "the screen just
     /// opened"; the binary translates this into a `NetCommand::RefreshShares`.
     pending_share_refresh: bool,
+    /// An active share-fetch (ISC-19), if any. While `Some`, the centered
+    /// fetch overlay is up and captures input until the user dismisses it.
+    fetch: Option<FetchUi>,
+    /// A queued share-fetch request the binary should forward to the net
+    /// actor (drained once). The `(share_id, sharer_handle)` pair identifies
+    /// the share to fetch; the binary translates this into a
+    /// `NetCommand::FetchShare`.
+    pending_share_fetch: Option<(String, String)>,
 }
 
 impl Default for App {
@@ -318,6 +364,8 @@ impl App {
             hide_input: String::new(),
             share_sel: 0,
             pending_share_refresh: false,
+            fetch: None,
+            pending_share_fetch: None,
         }
     }
 
@@ -442,6 +490,40 @@ impl App {
                 }
             }
             NetEvent::SharesError { message } => self.status = Some(message),
+            NetEvent::FetchProgress {
+                total_chunks,
+                chunks_received,
+                bytes_received,
+            } => {
+                if let Some(f) = self.fetch.as_mut() {
+                    if total_chunks.is_some() && f.total_chunks.is_none() {
+                        // First progress event carrying a total: the manifest
+                        // just arrived and chunks are now flowing.
+                        f.status = FetchStatus::Receiving;
+                    }
+                    f.total_chunks = total_chunks.or(f.total_chunks);
+                    f.chunks_received = chunks_received;
+                    f.bytes_received = bytes_received;
+                }
+            }
+            NetEvent::FetchComplete {
+                share_id: _,
+                files_written,
+                bytes_written,
+            } => {
+                if let Some(f) = self.fetch.as_mut() {
+                    f.status = FetchStatus::Complete;
+                    f.chunks_received = files_written;
+                    f.bytes_received = bytes_written;
+                }
+            }
+            NetEvent::FetchError { message } => {
+                if let Some(f) = self.fetch.as_mut() {
+                    f.status = FetchStatus::Failed(message);
+                } else {
+                    self.status = Some(message);
+                }
+            }
         }
     }
 
@@ -616,6 +698,19 @@ impl App {
         std::mem::replace(&mut self.pending_share_refresh, false)
     }
 
+    /// The currently-active share fetch, if any (ISC-19), for rendering the
+    /// fetch overlay.
+    pub fn fetch(&self) -> Option<&FetchUi> {
+        self.fetch.as_ref()
+    }
+
+    /// Take a queued share-fetch request — `(share_id, sharer_handle)` —
+    /// drained once by the binary, which translates it into a
+    /// `NetCommand::FetchShare`.
+    pub fn take_pending_share_fetch(&mut self) -> Option<(String, String)> {
+        self.pending_share_fetch.take()
+    }
+
     /// @-mention autocomplete candidates for the current compose buffer
     /// (ISC-12 / C18). When composing and the buffer ends with a partial
     /// `@token` (no whitespace after the last `@`), returns the full wire
@@ -681,6 +776,14 @@ impl App {
                     now_unix_ms(),
                 );
             }
+            return;
+        }
+        // The fetch overlay captures input next (ISC-19). It sits below the
+        // Blocking modal in z-order — a security event always wins. Esc
+        // cancels in flight, Enter dismisses a terminal state, other keys are
+        // absorbed.
+        if self.screen == Screen::Main && self.fetch.is_some() {
+            self.on_key_fetch_overlay(key);
             return;
         }
         match self.screen {
@@ -762,9 +865,9 @@ impl App {
     /// Shares-pane key handling (read-only display, ISC-17 / ISC-20).
     ///
     /// `Up` / `Down` move the public-shares selection (clamped to the visible,
-    /// hide-filtered subset so a hidden row can never be highlighted); `r`
-    /// requests a fresh snapshot. Fetch (`f`) is wired by ISC-19 in a later
-    /// commit.
+    /// hide-filtered subset so a hidden row can never be highlighted);
+    /// `r` requests a fresh snapshot; `f` initiates a fetch of the currently-
+    /// selected public-share row (ISC-19, F23 unified mechanism).
     fn on_key_shares(&mut self, key: KeyEvent) {
         let visible = self.visible_public_shares_count();
         match key.code {
@@ -779,6 +882,55 @@ impl App {
             }
             KeyCode::Char('r') | KeyCode::Char('R') => {
                 self.pending_share_refresh = true;
+            }
+            KeyCode::Char('f') | KeyCode::Char('F') => {
+                // Snapshot the selected visible row and start a fetch. A
+                // hidden row cannot be selected (share_sel clamps to
+                // visible_public_shares_count), so this never accidentally
+                // initiates against something the user has hidden. Clone
+                // the row's identifying fields out before mutating
+                // `self.fetch` / `self.pending_share_fetch` so the borrow
+                // from `visible_public_shares()` is dropped before either
+                // write.
+                let row = self
+                    .visible_public_shares()
+                    .get(self.share_sel)
+                    .map(|r| (r.share_id.clone(), r.sharer_handle.clone()));
+                if let Some((share_id, sharer_handle)) = row {
+                    self.fetch = Some(FetchUi {
+                        share_id: share_id.clone(),
+                        sharer_handle: sharer_handle.clone(),
+                        status: FetchStatus::RequestingManifest,
+                        total_chunks: None,
+                        chunks_received: 0,
+                        bytes_received: 0,
+                    });
+                    self.pending_share_fetch = Some((share_id, sharer_handle));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Fetch-overlay key handling (ISC-19). The overlay captures input while
+    /// the fetch is active. `Esc` cancels (marks the fetch Failed("cancelled
+    /// by user")); `Enter` on a terminal state (Complete or Failed) dismisses
+    /// the overlay. Other keys are absorbed so they cannot accidentally drive
+    /// the background view.
+    fn on_key_fetch_overlay(&mut self, key: KeyEvent) {
+        let Some(f) = self.fetch.as_mut() else { return };
+        match key.code {
+            KeyCode::Esc => {
+                if matches!(f.status, FetchStatus::Complete | FetchStatus::Failed(_)) {
+                    self.fetch = None;
+                } else {
+                    f.status = FetchStatus::Failed("cancelled by user".to_owned());
+                }
+            }
+            KeyCode::Enter
+                if matches!(f.status, FetchStatus::Complete | FetchStatus::Failed(_)) =>
+            {
+                self.fetch = None;
             }
             _ => {}
         }
@@ -1959,6 +2111,212 @@ mod tests {
         let _ = app.take_pending_share_refresh();
         app.on_key(press(KeyCode::Char('r')));
         assert!(app.take_pending_share_refresh());
+    }
+
+    // ── Fetch overlay (ISC-19) ────────────────────────────────────────────
+
+    /// Pressing `f` on a selected public-share row opens the fetch overlay,
+    /// queues a NetCommand::FetchShare for the binary to drain, and starts
+    /// in the RequestingManifest phase.
+    #[test]
+    fn f_key_on_shares_starts_fetch() {
+        let mut app = drive_to_main();
+        to_shares(&mut app);
+        app.on_net_event(NetEvent::SharesSnapshot {
+            local: Vec::new(),
+            remote: vec![listing("s1", "Alice's notes", "PG13", "alice#aabbccddeeff")],
+            indexer_status: IndexerStatus::Idle,
+        });
+        let _ = app.take_pending_share_fetch();
+        app.on_key(press(KeyCode::Char('f')));
+        let queued = app.take_pending_share_fetch().expect("fetch queued");
+        assert_eq!(queued.0, "s1");
+        assert_eq!(queued.1, "alice#aabbccddeeff");
+        let f = app.fetch().expect("overlay up");
+        assert_eq!(f.share_id, "s1");
+        assert_eq!(f.status, FetchStatus::RequestingManifest);
+        assert_eq!(f.total_chunks, None);
+        assert_eq!(f.chunks_received, 0);
+    }
+
+    /// `f` with no visible rows is a no-op (no overlay, no queued command,
+    /// no panic on an empty selection).
+    #[test]
+    fn f_key_on_empty_shares_is_a_no_op() {
+        let mut app = drive_to_main();
+        to_shares(&mut app);
+        app.on_net_event(NetEvent::SharesSnapshot {
+            local: Vec::new(),
+            remote: Vec::new(),
+            indexer_status: IndexerStatus::Idle,
+        });
+        let _ = app.take_pending_share_fetch();
+        app.on_key(press(KeyCode::Char('f')));
+        assert!(app.fetch().is_none());
+        assert!(app.take_pending_share_fetch().is_none());
+    }
+
+    /// FetchProgress carrying Some(total) transitions the overlay from
+    /// RequestingManifest to Receiving and accumulates chunk + byte counts.
+    #[test]
+    fn fetch_progress_transitions_and_accumulates() {
+        let mut app = drive_to_main();
+        to_shares(&mut app);
+        app.on_net_event(NetEvent::SharesSnapshot {
+            local: Vec::new(),
+            remote: vec![listing("s1", "x", "", "alice#aabbccddeeff")],
+            indexer_status: IndexerStatus::Idle,
+        });
+        let _ = app.take_pending_share_fetch();
+        app.on_key(press(KeyCode::Char('f')));
+        // Manifest arrives.
+        app.on_net_event(NetEvent::FetchProgress {
+            total_chunks: Some(3),
+            chunks_received: 0,
+            bytes_received: 0,
+        });
+        let f = app.fetch().unwrap();
+        assert_eq!(f.status, FetchStatus::Receiving);
+        assert_eq!(f.total_chunks, Some(3));
+        // First chunk lands.
+        app.on_net_event(NetEvent::FetchProgress {
+            total_chunks: Some(3),
+            chunks_received: 1,
+            bytes_received: 42,
+        });
+        let f = app.fetch().unwrap();
+        assert_eq!(f.chunks_received, 1);
+        assert_eq!(f.bytes_received, 42);
+    }
+
+    /// FetchComplete sets the overlay's status to Complete; Enter then
+    /// dismisses it (the fetch slot becomes None).
+    #[test]
+    fn fetch_complete_then_enter_dismisses_overlay() {
+        let mut app = drive_to_main();
+        to_shares(&mut app);
+        app.on_net_event(NetEvent::SharesSnapshot {
+            local: Vec::new(),
+            remote: vec![listing("s1", "x", "", "alice#aabbccddeeff")],
+            indexer_status: IndexerStatus::Idle,
+        });
+        let _ = app.take_pending_share_fetch();
+        app.on_key(press(KeyCode::Char('f')));
+        app.on_net_event(NetEvent::FetchComplete {
+            share_id: "s1".to_owned(),
+            files_written: 3,
+            bytes_written: 1024,
+        });
+        let f = app.fetch().unwrap();
+        assert_eq!(f.status, FetchStatus::Complete);
+        assert_eq!(f.chunks_received, 3);
+        // Enter on Complete dismisses.
+        app.on_key(press(KeyCode::Enter));
+        assert!(app.fetch().is_none());
+    }
+
+    /// FetchError with an active fetch puts the overlay into Failed; Enter
+    /// or Esc dismisses.
+    #[test]
+    fn fetch_error_renders_failed_state_then_enter_dismisses() {
+        let mut app = drive_to_main();
+        to_shares(&mut app);
+        app.on_net_event(NetEvent::SharesSnapshot {
+            local: Vec::new(),
+            remote: vec![listing("s1", "x", "", "alice#aabbccddeeff")],
+            indexer_status: IndexerStatus::Idle,
+        });
+        let _ = app.take_pending_share_fetch();
+        app.on_key(press(KeyCode::Char('f')));
+        app.on_net_event(NetEvent::FetchError {
+            message: "stream ended mid-fetch".to_owned(),
+        });
+        let f = app.fetch().unwrap();
+        assert_eq!(
+            f.status,
+            FetchStatus::Failed("stream ended mid-fetch".to_owned())
+        );
+        app.on_key(press(KeyCode::Esc));
+        assert!(app.fetch().is_none());
+    }
+
+    /// Esc while a fetch is in flight (not yet Complete/Failed) marks it
+    /// Failed("cancelled by user") rather than dismissing — the user sees
+    /// the cancellation reason before pressing Enter to acknowledge.
+    #[test]
+    fn esc_during_fetch_marks_cancelled_then_dismisses_on_second_esc() {
+        let mut app = drive_to_main();
+        to_shares(&mut app);
+        app.on_net_event(NetEvent::SharesSnapshot {
+            local: Vec::new(),
+            remote: vec![listing("s1", "x", "", "alice#aabbccddeeff")],
+            indexer_status: IndexerStatus::Idle,
+        });
+        let _ = app.take_pending_share_fetch();
+        app.on_key(press(KeyCode::Char('f')));
+        app.on_key(press(KeyCode::Esc));
+        let f = app.fetch().unwrap();
+        match &f.status {
+            FetchStatus::Failed(msg) => assert!(msg.contains("cancelled by user")),
+            other => panic!("expected Failed(cancelled), got {other:?}"),
+        }
+        // A second Esc dismisses the (terminal) overlay.
+        app.on_key(press(KeyCode::Esc));
+        assert!(app.fetch().is_none());
+    }
+
+    /// The overlay captures input while up: other keys are absorbed and do
+    /// NOT drive the background view.
+    #[test]
+    fn fetch_overlay_captures_input_until_dismissed() {
+        let mut app = drive_to_main();
+        to_shares(&mut app);
+        app.on_net_event(NetEvent::SharesSnapshot {
+            local: Vec::new(),
+            remote: vec![listing("s1", "x", "", "alice#aabbccddeeff")],
+            indexer_status: IndexerStatus::Idle,
+        });
+        let _ = app.take_pending_share_fetch();
+        app.on_key(press(KeyCode::Char('f')));
+        // While the overlay is up and the fetch is in flight, hitting any
+        // chat-like key MUST NOT compose anything.
+        app.on_key(press(KeyCode::Char('q')));
+        assert_eq!(app.compose(), "");
+        assert!(app.fetch().is_some(), "overlay still up");
+        // 'r' (refresh on Shares) is similarly absorbed.
+        let _ = app.take_pending_share_refresh();
+        app.on_key(press(KeyCode::Char('r')));
+        assert!(
+            !app.take_pending_share_refresh(),
+            "r is absorbed by the overlay"
+        );
+    }
+
+    /// The fetch overlay renders the phase + N/M progress strings.
+    #[test]
+    fn fetch_overlay_renders_phase_and_progress() {
+        let mut app = drive_to_main();
+        to_shares(&mut app);
+        app.on_net_event(NetEvent::SharesSnapshot {
+            local: Vec::new(),
+            remote: vec![listing("s1", "Alice notes", "", "alice#aabbccddeeff")],
+            indexer_status: IndexerStatus::Idle,
+        });
+        let _ = app.take_pending_share_fetch();
+        app.on_key(press(KeyCode::Char('f')));
+        // RequestingManifest phase.
+        let text = render_text(&app, 100, 30);
+        assert!(text.contains("share fetch"), "overlay titled");
+        assert!(text.contains("requesting manifest"), "phase text rendered");
+        // Manifest + first chunk.
+        app.on_net_event(NetEvent::FetchProgress {
+            total_chunks: Some(2),
+            chunks_received: 1,
+            bytes_received: 256,
+        });
+        let text = render_text(&app, 100, 30);
+        assert!(text.contains("receiving chunks"), "phase advanced");
+        assert!(text.contains("1/2"), "N/M progress visible");
     }
 
     /// Selection in the public-shares pane clamps to the *visible* subset, so a

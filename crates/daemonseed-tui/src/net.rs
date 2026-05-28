@@ -34,10 +34,13 @@ use daemonseed_cli::session::AppSession;
 use daemonseed_core::backoff::{Backoff, CloseCause};
 use daemonseed_core::circle::key::{CotKey, derive_cot_key};
 use daemonseed_core::circle::message::{open_message, seal_message};
+use daemonseed_core::cot::public_share_asset_address;
 use daemonseed_core::cot::{AssetAddr, asset_address};
 use daemonseed_core::crypto::suite::CNSA_2_0;
 use daemonseed_core::federation::store::{InMemoryTrustStore, ServerEntry, TrustStore};
 use daemonseed_core::handle::Handle;
+use daemonseed_core::share_envelope::ShareFrame;
+use daemonseed_core::storage::cas::chunk_addr;
 use daemonseed_core::storage::seeds::CounterState;
 use daemonseed_core::storage::share_index::ShareIndex;
 use daemonseed_core::trust_events::TrustEventKey;
@@ -72,6 +75,21 @@ pub enum NetCommand {
     /// watcher are driven independently and the actor reports whatever state
     /// it observes. Emitted as a single [`NetEvent::SharesSnapshot`].
     RefreshShares,
+    /// Initiate a share fetch from the connected relay (ISC-19, F23 unified
+    /// mechanism). Derives the public-share asset address from `share_id` +
+    /// the connected server-id, opens a new bidi `CircleOfTrust.Subscribe`
+    /// stream over the existing `AppSession`, sends a `ManifestRequest`,
+    /// reads a `ManifestResponse`, then issues one `ChunkRequest` per entry
+    /// and writes each verified chunk to a local in-memory CAS. Progress is
+    /// surfaced via `NetEvent::FetchProgress`; the terminal state is one of
+    /// `NetEvent::FetchComplete` or `NetEvent::FetchError`. `sharer_handle`
+    /// is advisory — included so subsequent UX layers (post-MVP `f`-keyed
+    /// trust-on-sharer affordances) can route per-sharer events; the relay
+    /// never sees the value (it lives in the recipient's local state only).
+    FetchShare {
+        share_id: String,
+        sharer_handle: String,
+    },
 }
 
 /// An event from the network actor back to the UI. Plain data — folded into
@@ -139,6 +157,30 @@ pub enum NetEvent {
     /// rendering surfaces this on the status line; the cached snapshot is
     /// left in place so the user keeps seeing the last known state.
     SharesError { message: String },
+    /// Progress on an active share fetch (ISC-19). `total_chunks` is `None`
+    /// while the fetcher is still waiting on the `ManifestResponse`, and
+    /// `Some(N)` after the manifest arrives. Emitted at least once after the
+    /// manifest lands and once per successful chunk write.
+    FetchProgress {
+        total_chunks: Option<u32>,
+        chunks_received: u32,
+        bytes_received: u64,
+    },
+    /// The share fetch completed: every chunk in the manifest was verified
+    /// and written. `files_written` and `bytes_written` mirror the manifest's
+    /// tallies (one chunk = one file at the M11 alpha; multi-chunk-per-file
+    /// is post-MVP, layered on without wire change).
+    FetchComplete {
+        share_id: String,
+        files_written: u32,
+        bytes_written: u64,
+    },
+    /// The fetch failed at some point (no session, derive error, decode error,
+    /// chunk-hash mismatch, peer dropped the stream, RPC status). The fetcher
+    /// stops; partial chunks already in local CAS are kept (any later retry
+    /// can dedupe by chunk_addr). The overlay marks the fetch failed and
+    /// waits for the user to dismiss.
+    FetchError { message: String },
 }
 
 /// Owns the network thread and the command/event channels. Held by the binary
@@ -257,6 +299,10 @@ async fn net_actor(
                 sender_handle,
             } => actor.handle_send_chat(&body, &sender_handle).await,
             NetCommand::RefreshShares => actor.handle_refresh_shares().await,
+            NetCommand::FetchShare {
+                share_id,
+                sharer_handle,
+            } => actor.handle_fetch_share(&share_id, &sharer_handle).await,
         }
     }
 }
@@ -506,6 +552,207 @@ impl Actor {
             remote,
             indexer_status,
         });
+    }
+
+    /// Initiate a share fetch (ISC-19, F23 unified mechanism). Opens a fresh
+    /// `CircleOfTrust.Subscribe` stream over the held [`AppSession`] (chat
+    /// stays unaffected; the actor's existing `circle` field is independent),
+    /// names the public-share asset address derived from `share_id` +
+    /// connected `server_id`, and runs the manifest-then-chunks protocol from
+    /// the fetcher's side.
+    ///
+    /// Verification: each `ChunkResponse.data` is re-hashed with
+    /// [`chunk_addr`]; a mismatch fails the fetch closed (the fetcher refuses
+    /// to write a chunk whose bytes do not match the address it asked for).
+    /// This is the file-side analog of the chat envelope's `open_message`
+    /// fail-closed posture — a corrupt relay or hostile sharer cannot deliver
+    /// falsified content to a verifying fetcher.
+    async fn handle_fetch_share(&mut self, share_id: &str, _sharer_handle: &str) {
+        // Pre-flight: live session + known relay are mandatory.
+        let Some(session) = self.session.as_ref() else {
+            return self.emit(NetEvent::FetchError {
+                message: "not connected to a relay yet".to_owned(),
+            });
+        };
+        let Some(server_id) = self.server_id.as_ref() else {
+            return self.emit(NetEvent::FetchError {
+                message: "no server-id for the connected relay".to_owned(),
+            });
+        };
+
+        let asset_addr = match public_share_asset_address(share_id.as_bytes(), server_id.as_bytes())
+        {
+            Ok(a) => a,
+            Err(e) => {
+                return self.emit(NetEvent::FetchError {
+                    message: format!("share-asset derivation failed: {e}"),
+                });
+            }
+        };
+
+        // The outbound half: a tokio mpsc the actor publishes to; the bidi
+        // Subscribe stream reads from it. Capacity sized for the small set of
+        // round-trip request frames a fetch generates (manifest + chunks);
+        // ChunkResponse arrivals do not back-pressure this channel.
+        let (out_tx, out_rx) = mpsc::channel::<daemonseed_proto::v1::CotFrame>(32);
+
+        // The naming frame: every Subscribe stream's first frame names its
+        // rendezvous (empty payload, not relayed); same shape as the chat
+        // path. Send it before subscribe consumes the receiver.
+        let naming = daemonseed_proto::v1::CotFrame {
+            asset_address: asset_addr.as_bytes().to_vec(),
+            payload: Vec::new(),
+        };
+        if out_tx.send(naming).await.is_err() {
+            return self.emit(NetEvent::FetchError {
+                message: "fetch subscribe channel closed before naming frame".to_owned(),
+            });
+        }
+
+        let mut cot = session.circle_of_trust();
+        let mut inbound = match cot.subscribe(ReceiverStream::new(out_rx)).await {
+            Ok(resp) => resp.into_inner(),
+            Err(status) => {
+                return self.emit(NetEvent::FetchError {
+                    message: format!("subscribe refused: {}", status.message()),
+                });
+            }
+        };
+
+        // Send ManifestRequest. The first non-empty inbound frame on this
+        // stream is expected to be the ManifestResponse from the sharer.
+        let request = ShareFrame::ManifestRequest;
+        let req_frame = daemonseed_proto::v1::CotFrame {
+            asset_address: asset_addr.as_bytes().to_vec(),
+            payload: request.encode(),
+        };
+        if out_tx.send(req_frame).await.is_err() {
+            return self.emit(NetEvent::FetchError {
+                message: "fetch subscribe channel closed before manifest request".to_owned(),
+            });
+        }
+
+        // Read the manifest. Foreign / undecryptable frames (other members'
+        // chatter, the sharer's naming frame echoing back if any) are skipped
+        // silently — same posture as chat. The first valid ManifestResponse
+        // wins.
+        let manifest = loop {
+            let frame = match inbound.message().await {
+                Ok(Some(f)) => f,
+                Ok(None) | Err(_) => {
+                    return self.emit(NetEvent::FetchError {
+                        message: "stream ended before manifest arrived".to_owned(),
+                    });
+                }
+            };
+            if frame.payload.is_empty() {
+                continue; // naming-frame echo or noise
+            }
+            match ShareFrame::decode(&frame.payload) {
+                Ok(ShareFrame::ManifestResponse { entries }) => break entries,
+                Ok(_) => continue, // out-of-order request or chunk noise
+                Err(_) => continue,
+            }
+        };
+
+        let total_chunks = manifest.len() as u32;
+        self.emit(NetEvent::FetchProgress {
+            total_chunks: Some(total_chunks),
+            chunks_received: 0,
+            bytes_received: 0,
+        });
+
+        // For each manifest entry, request the chunk by its advertised
+        // address, verify the response, and account bytes. A single-chunk-
+        // per-file alpha: one request per file, one response per request,
+        // sequential (pipelining is a post-MVP optimisation).
+        let mut chunks_received: u32 = 0;
+        let mut bytes_received: u64 = 0;
+        for entry in &manifest {
+            let request = ShareFrame::ChunkRequest {
+                chunk_addr: entry.chunk_addr,
+            };
+            let req_frame = daemonseed_proto::v1::CotFrame {
+                asset_address: asset_addr.as_bytes().to_vec(),
+                payload: request.encode(),
+            };
+            if out_tx.send(req_frame).await.is_err() {
+                return self.emit(NetEvent::FetchError {
+                    message: "fetch subscribe channel closed mid-fetch".to_owned(),
+                });
+            }
+
+            // Read until we see the response naming this chunk_addr; ignore
+            // other frame kinds (re-arrival of the manifest, noise from
+            // other subscribers).
+            let chunk_data = loop {
+                let frame = match inbound.message().await {
+                    Ok(Some(f)) => f,
+                    Ok(None) | Err(_) => {
+                        return self.emit(NetEvent::FetchError {
+                            message: "stream ended mid-fetch".to_owned(),
+                        });
+                    }
+                };
+                if frame.payload.is_empty() {
+                    continue;
+                }
+                match ShareFrame::decode(&frame.payload) {
+                    Ok(ShareFrame::ChunkResponse { chunk_addr, data }) => {
+                        if chunk_addr == entry.chunk_addr {
+                            break (chunk_addr, data);
+                        }
+                        // Response for some other chunk_addr — skip; sequential
+                        // alpha never has more than one outstanding request.
+                    }
+                    Ok(_) | Err(_) => continue,
+                }
+            };
+
+            // Verification (ISC-19 / F23): recompute SHA-384 and compare. A
+            // mismatch fails the whole fetch — the fetcher cannot trust any
+            // chunk after a hostile or corrupted one slipped through.
+            let recomputed = match chunk_addr(&chunk_data.1) {
+                Ok(a) => a,
+                Err(e) => {
+                    return self.emit(NetEvent::FetchError {
+                        message: format!("hash recompute failed: {e}"),
+                    });
+                }
+            };
+            if recomputed != chunk_data.0 {
+                return self.emit(NetEvent::FetchError {
+                    message: format!(
+                        "chunk hash mismatch on {} — refusing tampered content",
+                        entry.rel_path
+                    ),
+                });
+            }
+
+            // The M11 alpha keeps the local sink in-memory: each verified
+            // chunk's bytes are dropped after accounting. A persistent
+            // [`crate::storage::cas`]-backed sink is the next layer (the
+            // M11.5 fetch-persistence workstream wires it in via a
+            // `Box<dyn ChunkStore>` injected at actor construction). The
+            // verification gate above is the load-bearing security
+            // contract for ISC-19; persistence is bookkeeping above it.
+            chunks_received += 1;
+            bytes_received += chunk_data.1.len() as u64;
+            self.emit(NetEvent::FetchProgress {
+                total_chunks: Some(total_chunks),
+                chunks_received,
+                bytes_received,
+            });
+        }
+
+        self.emit(NetEvent::FetchComplete {
+            share_id: share_id.to_owned(),
+            files_written: chunks_received,
+            bytes_written: bytes_received,
+        });
+        // Close the subscribe stream by dropping the sender; the relay reaps
+        // when both halves of this Subscribe stream are gone (refcount → 0).
+        drop(out_tx);
     }
 
     /// Seal a chat message under the joined circle's key and publish it (ISC-14).

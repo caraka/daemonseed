@@ -94,6 +94,43 @@ pub fn asset_address(cot_key: &CotKey, server_id: &[u8]) -> Result<AssetAddr, Ox
     Ok(AssetAddr(out))
 }
 
+/// Derive a public share's rendezvous address on a given relay (ISC-19, F23
+/// unified mechanism):
+///
+/// ```text
+///   share_asset_address = SHA-384(share_id || 0x00 || server_id)
+/// ```
+///
+/// The shape mirrors [`asset_address`] for chat circles — same digest, same
+/// 48-byte address, same `CircleOfTrust.Subscribe` rendezvous surface — with
+/// the **circle secret replaced by the public `share_id`**. There is nothing
+/// to hide in a public share's address: the `share_id` is already published
+/// in [`ListPublicShares`][`crate::wire`-like response] and the relay sees
+/// chunks travel through the asset anyway (ISC-C19 makes public-share content
+/// server-visible by design). The CoT-share variant (post-MVP) will derive
+/// `SHA-384(share_cot_key || share_id || 0x00 || server_id)` and wrap each
+/// `ShareFrame` payload in an AEAD seal — same wire mechanism, additional
+/// secret + encryption layer (the unified-design property F23 pins).
+///
+/// The `0x00` separator byte makes the `share_id` / `server_id` boundary
+/// unambiguous: without it, `share_id="foo", server_id="bar"` would collide
+/// with `share_id="fo", server_id="obar"`. SHA-384 is not length-extendable
+/// and the result is a public identifier (not a MAC), so a plain hash over
+/// the framed concatenation suffices.
+pub fn public_share_asset_address(
+    share_id: &[u8],
+    server_id: &[u8],
+) -> Result<AssetAddr, OxicryptError> {
+    let mut input = Vec::with_capacity(share_id.len() + 1 + server_id.len());
+    input.extend_from_slice(share_id);
+    input.push(0u8);
+    input.extend_from_slice(server_id);
+    let digest = sha384(&input)?;
+    let mut out = [0u8; ASSET_ADDR_LEN];
+    out.copy_from_slice(&digest[..ASSET_ADDR_LEN]);
+    Ok(AssetAddr(out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,5 +182,65 @@ mod tests {
     fn asset_address_bytes_roundtrip() {
         let addr = asset_address(&example_key(), RELAY_A).unwrap();
         assert_eq!(AssetAddr::from_bytes(*addr.as_bytes()), addr);
+    }
+
+    // ── Public-share asset address (ISC-19 / F23 unified mechanism) ──
+
+    /// Determinism: same (share_id, server_id) → byte-identical address, so a
+    /// fetcher and the sharer meet at the same point on the relay.
+    #[test]
+    fn public_share_asset_address_is_deterministic() {
+        let _ = oxicrypt_module::initialize();
+        let a = public_share_asset_address(b"share-alice-1", RELAY_A).unwrap();
+        let b = public_share_asset_address(b"share-alice-1", RELAY_A).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(ASSET_ADDR_LEN, 48);
+    }
+
+    /// Cross-server unlinkability: the same share on two relays presents two
+    /// distinct addresses (server_id namespacing).
+    #[test]
+    fn public_share_asset_address_namespaced_per_relay() {
+        let _ = oxicrypt_module::initialize();
+        let on_a = public_share_asset_address(b"share-1", RELAY_A).unwrap();
+        let on_b = public_share_asset_address(b"share-1", RELAY_B).unwrap();
+        assert_ne!(on_a, on_b);
+    }
+
+    /// Different shares on the same relay get different addresses.
+    #[test]
+    fn public_share_asset_address_keyed_by_share_id() {
+        let _ = oxicrypt_module::initialize();
+        let s1 = public_share_asset_address(b"share-1", RELAY_A).unwrap();
+        let s2 = public_share_asset_address(b"share-2", RELAY_A).unwrap();
+        assert_ne!(s1, s2);
+    }
+
+    /// The 0x00 separator prevents the (share_id || server_id) boundary
+    /// ambiguity: a `(share_id="fo", server_id="obar")` pair must not collide
+    /// with `(share_id="foo", server_id="bar")`. Without the separator the
+    /// concatenations would be identical; with it the digests diverge.
+    #[test]
+    fn public_share_asset_address_separator_prevents_boundary_collision() {
+        let _ = oxicrypt_module::initialize();
+        let a = public_share_asset_address(b"foo", b"bar").unwrap();
+        let b = public_share_asset_address(b"fo", b"obar").unwrap();
+        assert_ne!(
+            a, b,
+            "0x00 separator disambiguates the share_id/server_id boundary"
+        );
+    }
+
+    /// The chat-circle and public-share derivations produce different
+    /// addresses for input that would otherwise collide as raw bytes — both
+    /// digest schemes are namespaced (cot_key length is fixed, public-share
+    /// shape carries a 0x00 separator) so cross-domain confusion is excluded
+    /// by construction.
+    #[test]
+    fn public_share_does_not_collide_with_chat_address_scheme() {
+        let _ = oxicrypt_module::initialize();
+        let circle = public_share_asset_address(b"any-share-id", RELAY_A).unwrap();
+        let chat = asset_address(&example_key(), RELAY_A).unwrap();
+        assert_ne!(circle, chat);
     }
 }
