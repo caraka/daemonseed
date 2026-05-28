@@ -593,10 +593,25 @@ impl Gate {
             d.send("\r")?;
         }
 
-        // FsStep::DisplayName — accept the adj-noun prefilled default.
-        // argon-once again on Enter (passphrase re-derive for the
-        // verified seed materials), so cap at 30s per daemon.
+        // FsStep::DisplayName — clear the adj-noun prefill and submit
+        // empty. The empty branch in `on_display_name` produces
+        // `chosen = None`, which makes the daemon's wire handle the
+        // floor form `#<12hex>`. The hex prefix is then literally
+        // present in any chat transcript that renders this daemon's
+        // messages (the chat line uses `DisplayMode::Default`, which
+        // for the None-display-name branch returns `#<hex>`) — the
+        // harness extracts it from a peer's screen for the @mention
+        // and mute drivers in C4a. argon-once again on Enter
+        // (passphrase re-derive for the verified seed materials), so
+        // cap at 30s per daemon.
         self.wait_for_all_visible("display name", Duration::from_secs(30))?;
+        let mut backspaces = String::with_capacity(64);
+        for _ in 0..64 {
+            backspaces.push('\x7f');
+        }
+        for d in &mut self.daemons {
+            d.send(&backspaces)?;
+        }
         self.broadcast_keys("\r")?;
 
         // FsStep::Bootstrap — clear the bundled-canonical prefill, type
@@ -687,6 +702,97 @@ impl Gate {
                 continue;
             }
             d.wait_for_visible(body, timeout)?;
+        }
+        Ok(())
+    }
+
+    /// Extract every `#<12hex>` floor-form handle that appears as a
+    /// chat-line sender prefix (`#<12hex>:` at the start of a line,
+    /// possibly after a leading `│` border cell) in `peer_idx`'s
+    /// rendered screen. Deduplicated, returned in order of first
+    /// appearance.
+    ///
+    /// Scoping to the chat-line shape is load-bearing: the status
+    /// bar advertises the server's `<name>#<12hex>` id, so a naive
+    /// "first `#<12hex>` on screen" would map every daemon's view
+    /// of the relay to the server's handle, breaking the
+    /// daemon-handle map-back the mute / @mention drivers rely on.
+    /// The `:` immediately after the hash prefix is what the chat
+    /// renderer emits and the status bar / footer never do.
+    pub fn extract_handles(&self, peer_idx: usize) -> Result<Vec<String>> {
+        let peer = self
+            .daemons
+            .get(peer_idx)
+            .ok_or_else(|| anyhow!("no daemon at index {peer_idx}"))?;
+        let screen = peer.screen_text();
+        let mut seen: Vec<String> = Vec::new();
+        for line in screen.lines() {
+            // Skip the leading box-border cell if present, then look
+            // for `#<12hex>:` at the line head.
+            let trimmed = line.trim_start_matches('│').trim_start();
+            if let Some(rest) = trimmed.strip_prefix('#') {
+                if rest.len() < 13 {
+                    continue;
+                }
+                let (hex, after) = rest.split_at(12);
+                if !after.starts_with(':') {
+                    continue;
+                }
+                if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                    continue;
+                }
+                let candidate = format!("#{hex}");
+                if !seen.iter().any(|s| s == &candidate) {
+                    seen.push(candidate);
+                }
+            }
+        }
+        Ok(seen)
+    }
+
+    /// Daemon at `idx` enters Mute focus and toggles mute for `target`
+    /// (the full `#<12hex>` handle). The TUI's Tab cycle from Chat is
+    /// Chat→JoinCircle→Mute→Shares→Hide→Servers→TrustHistory, so two
+    /// Tabs land on Mute. Enter on a non-empty handle toggles the
+    /// session-scoped mute list; subsequent message renders strip
+    /// matching senders (A-C3 — silent / unilateral, never leaks to
+    /// peers).
+    pub fn daemon_mute(&mut self, idx: usize, target: &str) -> Result<()> {
+        let daemon = self
+            .daemons
+            .get_mut(idx)
+            .ok_or_else(|| anyhow!("no daemon at index {idx}"))?;
+        daemon.send("\t\t")?; // Chat → JoinCircle → Mute
+        daemon.send(target)?;
+        daemon.send("\r")?;
+        // Hop back to Chat focus so the next chat sends/observations
+        // run in the same starting state every other helper assumes.
+        // Tab cycle from Mute: Mute→Shares→Hide→Servers→TrustHistory→Chat
+        // → JoinCircle → Mute (8 steps full loop), so 5 Tabs land back
+        // on Chat.
+        daemon.send("\t\t\t\t\t")?;
+        Ok(())
+    }
+
+    /// Block the calling thread for `wait` to let any in-flight relay
+    /// fan-out settle, then assert that `peer_idx`'s rendered screen
+    /// does NOT contain `body`. Used by the mute test to prove
+    /// suppression — absence is unobservable instantly, so the settle
+    /// delay matches the relay's worst-case fan-out latency under the
+    /// gate's loopback load.
+    pub fn assert_chat_absent_on(&self, peer_idx: usize, body: &str, wait: Duration) -> Result<()> {
+        thread::sleep(wait);
+        let peer = self
+            .daemons
+            .get(peer_idx)
+            .ok_or_else(|| anyhow!("no daemon at index {peer_idx}"))?;
+        let screen = peer.screen_text();
+        if screen.contains(body) {
+            bail!(
+                "{}: expected NO occurrence of {:?} in screen but found one:\n{screen}",
+                peer.tag,
+                body
+            );
         }
         Ok(())
     }

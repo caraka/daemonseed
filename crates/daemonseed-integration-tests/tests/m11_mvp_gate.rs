@@ -249,3 +249,134 @@ fn mvp_gate_step4_circle_chat_round_trip() {
         panic!("chat fan-out failed — at least one peer never saw the message: {e}");
     }
 }
+
+/// **Gate step 4 (complete) — circle + chat + @mention + mute.**
+///
+/// Closes ISC-37 in full. Extends `mvp_gate_step4_circle_chat_round_trip`
+/// with the two M9 affordance properties:
+///   - **@mention** (ISC-C17 / C18): D2 publishes `@<D1-handle> ping`;
+///     D1 receives + renders the mention. The unit test
+///     `self_mention_is_highlighted` in `daemonseed-tui` pins the
+///     yellow-span render — at the gate we only confirm the body
+///     reached D1 via the relay's fan-out, which proves the mention
+///     code path was exercised end-to-end on real binaries.
+///   - **mute** (ISC-C15 / A-C3): D2 toggles mute on D1's handle;
+///     D1 publishes a uniquely-identifiable canary; D2's transcript
+///     does NOT render it after a 2-second relay-settle window.
+///     A-C3's silent / unilateral / no-leak guarantee is structural
+///     in the seeds blob (covered by core unit tests); the gate
+///     proves the rendering suppression path holds against the real
+///     subprocess client.
+///
+/// The harness reads each daemon's floor-form `#<12hex>` wire handle
+/// out of a peer's chat transcript — `all_complete_first_start` leaves
+/// the display name empty so chat lines render as `#<hex>:`. With
+/// controlled chat ordering ("D1 chats → D2 sees only D1's handle in
+/// its screen", then "D2 chats → D1 sees D1's own (local echo) + D2's
+/// (fan-out) → D2's handle is the one ≠ D1's") this map-back is
+/// unambiguous.
+#[test]
+#[ignore = "spawns real binaries; entry point is `cargo xtask mvp-gate`"]
+fn mvp_gate_step4_full_mention_and_mute() {
+    let server = ServerProcess::spawn(Some("relay-mvp"))
+        .expect("server subprocess spawns + binds to its ephemeral port");
+    let bootstrap = server.bootstrap_handle();
+    let mut gate = Gate::with_daemons(server, 4).expect("four PTY-attached daemons spawn");
+
+    let passphrase = "correct horse battery staple table mountain";
+    gate.all_complete_first_start(passphrase, &bootstrap)
+        .unwrap_or_else(|e| {
+            eprintln!("{}", gate.failure_report(&format!("step-1: {e}")));
+            panic!("first-start failed: {e}");
+        });
+    gate.wait_all_authenticated(Duration::from_secs(15))
+        .unwrap_or_else(|e| {
+            eprintln!("{}", gate.failure_report(&format!("step-2: {e}")));
+            panic!("authenticate failed: {e}");
+        });
+
+    let phrase = "circle-mvp-gate-very-strong-phrase-for-step-4-2026-05-28";
+    gate.all_join_circle(phrase, Duration::from_secs(10))
+        .unwrap_or_else(|e| {
+            eprintln!("{}", gate.failure_report(&format!("step-4-join: {e}")));
+            panic!("circle join failed: {e}");
+        });
+
+    // D1 publishes the first canary; D2/D3/D4 each receive it.
+    gate.daemon_send_chat(0, "canary-from-d1").unwrap();
+    gate.wait_for_chat_on_others(0, "canary-from-d1", Duration::from_secs(10))
+        .unwrap_or_else(|e| {
+            eprintln!("{}", gate.failure_report(&format!("d1-fanout: {e}")));
+            panic!("d1 fanout failed: {e}");
+        });
+
+    // After D1's chat: D2's screen contains exactly D1's handle.
+    let d2_handles = gate.extract_handles(1).expect("extract D2 screen handles");
+    let d1_handle = d2_handles
+        .first()
+        .expect("D1's handle visible in D2's transcript after D1's chat fan-out")
+        .clone();
+
+    // D2 publishes the second canary; D1/D3/D4 receive it.
+    gate.daemon_send_chat(1, "canary-from-d2").unwrap();
+    gate.wait_for_chat_on_others(1, "canary-from-d2", Duration::from_secs(10))
+        .unwrap_or_else(|e| {
+            eprintln!("{}", gate.failure_report(&format!("d2-fanout: {e}")));
+            panic!("d2 fanout failed: {e}");
+        });
+
+    // D1's screen now has its own (local echo) + D2's (fan-out).
+    // D2's handle is the one that isn't D1's known handle.
+    let d1_handles = gate.extract_handles(0).expect("extract D1 screen handles");
+    let d2_handle = d1_handles
+        .into_iter()
+        .find(|h| h != &d1_handle)
+        .expect("D2's handle present in D1's transcript after D2's chat fan-out");
+
+    // @mention: D2 publishes a message containing @<D1-handle>; D1
+    // receives the body. find_self_mentions on D1's side runs against
+    // D1's own `Handle`, recognising the @<#hex> token. Body uniqueness
+    // keeps the screen-match clean.
+    let mention_body = format!("@{d1_handle} ping-mention");
+    gate.daemon_send_chat(1, &mention_body).unwrap();
+    if let Err(e) = gate
+        .daemons
+        .first()
+        .unwrap()
+        .wait_for_visible("ping-mention", Duration::from_secs(10))
+    {
+        eprintln!("{}", gate.failure_report(&format!("mention-fanout: {e}")));
+        panic!("D1 never rendered the @mention: {e}");
+    }
+
+    // mute: D2 toggles mute on D1's handle (Tab Tab from Chat → Mute
+    // focus → handle → Enter). D2's transcript should suppress every
+    // subsequent message from D1 (A-C3 silent unilateral suppression).
+    gate.daemon_mute(1, &d1_handle).unwrap();
+    let muted_canary = "canary-muted-d1-after-d2-mute";
+    gate.daemon_send_chat(0, muted_canary).unwrap();
+    // Wait 2s for the relay to fan out (D3/D4 will see it; D2 won't).
+    // 2s is comfortably above the loopback relay round-trip we've seen
+    // in earlier steps (sub-200ms typical).
+    if let Err(e) = gate.assert_chat_absent_on(1, muted_canary, Duration::from_secs(2)) {
+        eprintln!("{}", gate.failure_report(&format!("mute-suppression: {e}")));
+        panic!("mute did NOT suppress D1's canary on D2: {e}");
+    }
+    // Sanity: D3 must still receive it — proves the muted_canary
+    // actually reached the relay and was fanned out (D2's absence
+    // alone could mean "the message was lost", not "suppressed").
+    gate.daemons
+        .get(2)
+        .unwrap()
+        .wait_for_visible(muted_canary, Duration::from_secs(3))
+        .unwrap_or_else(|e| {
+            eprintln!("{}", gate.failure_report(&format!("mute-sanity: {e}")));
+            panic!("D3 didn't receive the muted canary — message lost: {e}");
+        });
+
+    // Expose D2's handle so the compiler doesn't flag it as unused
+    // until step-8 (C5) extracts the same handles for the recovery
+    // assertion. The assertion itself is just structural — d2_handle
+    // must be #<12hex> shape (the extractor guarantees it).
+    assert!(d2_handle.starts_with('#') && d2_handle.len() == 13);
+}
