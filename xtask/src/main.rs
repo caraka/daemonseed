@@ -17,9 +17,14 @@
 //! - `install-hooks` — install the workspace's git pre-push hook into the
 //!   active checkout's `.git/hooks/` (or into a `--target` directory).
 //!   Idempotent; overwrites a previously-installed hook in-place.
+//! - `mvp-gate` — run the M11 MVP-gate scenario end-to-end. Builds the
+//!   server + TUI binaries in release mode, then drives the 4-daemon PTY
+//!   harness in `daemonseed-integration-tests::tests::m11_mvp_gate` and
+//!   propagates its pass/fail bit as the xtask exit code (ISC-42, 44).
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -65,6 +70,17 @@ enum Cmd {
         #[arg(long)]
         target: Option<PathBuf>,
     },
+    /// Run the M11 MVP-gate scenario. Builds `daemonseed-server` and
+    /// `daemonseed-tui` in release mode, then runs the 4-daemon PTY
+    /// harness `m11_mvp_gate` (an `#[ignore]`-gated integration test).
+    /// Exit code propagates the gate's pass/fail bit (ISC-42 / 44).
+    MvpGate {
+        /// Skip the release build step and assume the binaries are already
+        /// built. Useful when iterating on the harness itself; the harness
+        /// surfaces a friendly error if the binaries are missing.
+        #[arg(long)]
+        skip_build: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -74,6 +90,7 @@ fn main() -> Result<()> {
         Cmd::IscCoverage { min } => isc_coverage(min),
         Cmd::FindingsResolved { draft } => findings_resolved(draft),
         Cmd::InstallHooks { target } => install_hooks(target),
+        Cmd::MvpGate { skip_build } => mvp_gate(skip_build),
     }
 }
 
@@ -445,4 +462,72 @@ fn diff_generated_dirs(snapshot: &Path, fresh: &Path) -> Result<Vec<String>> {
         }
     }
     Ok(diffs)
+}
+
+// ── mvp-gate ────────────────────────────────────────────────────────
+
+/// Locate the workspace root from xtask's own manifest dir. xtask lives
+/// at `<repo>/xtask/`, so the repo root is `parent()` — kept local
+/// rather than going through `cargo metadata` to keep xtask deps minimal.
+fn workspace_root_from_xtask() -> Result<PathBuf> {
+    let xtask_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    xtask_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .context("xtask manifest dir has no parent")
+}
+
+/// Cargo binary the operator's `cargo xtask mvp-gate` invocation ran
+/// through. Cargo sets `CARGO` for subcommands; falling back to plain
+/// `"cargo"` keeps the path manual-invoke-friendly.
+fn cargo_bin() -> std::ffi::OsString {
+    std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into())
+}
+
+fn mvp_gate(skip_build: bool) -> Result<()> {
+    let repo = workspace_root_from_xtask()?;
+    let cargo = cargo_bin();
+
+    if !skip_build {
+        println!("mvp-gate: building release binaries (server + tui)…");
+        let status = Command::new(&cargo)
+            .current_dir(&repo)
+            .args([
+                "build",
+                "--release",
+                "--bin",
+                "daemonseed-server",
+                "--bin",
+                "daemonseed-tui",
+            ])
+            .status()
+            .context("spawn cargo build")?;
+        if !status.success() {
+            bail!("mvp-gate: release build failed (exit {status})");
+        }
+    } else {
+        println!("mvp-gate: --skip-build set, assuming binaries already exist");
+    }
+
+    println!("mvp-gate: running m11_mvp_gate harness (4 daemons × 1 server)…");
+    let status = Command::new(&cargo)
+        .current_dir(&repo)
+        .args([
+            "test",
+            "--release",
+            "-p",
+            "daemonseed-integration-tests",
+            "--test",
+            "m11_mvp_gate",
+            "--",
+            "--ignored",
+            "--nocapture",
+        ])
+        .status()
+        .context("spawn cargo test for m11_mvp_gate")?;
+    if !status.success() {
+        bail!("mvp-gate: FAIL (exit {status}) — see structured report above");
+    }
+    println!("mvp-gate: PASS");
+    Ok(())
 }

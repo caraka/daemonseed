@@ -48,3 +48,12 @@ hex = { workspace = true }
 # M11 — CoT chat round-trip e2e wraps the client's outbound subscribe mpsc as a
 # Stream for the bidirectional Subscribe RPC.
 tokio-stream = { workspace = true }
+
+# M11 — MVP-gate PTY harness (tests/common/gate.rs). Drives 4 real
+# `daemonseed-tui` subprocesses through PTY pairs + 1 plain
+# `daemonseed-server` subprocess. portable-pty is the only PTY-touching dep
+# anywhere in the workspace; it's confined to `[dev-dependencies]` so no
+# shipping crate compiles it — ISC-A1 (no test-only surface in ship
+# binaries) survives at the dependency layer too.
+portable-pty = { workspace = true }
+anyhow = { workspace = true }

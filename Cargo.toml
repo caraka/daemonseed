@@ -113,3 +113,11 @@ redb = "2"
 # ReadDirectoryChangesW) for the live share indexer (M8, ISC-C21 / ISC-20).
 # Pure Rust (the platform backends are syscall bindings, no bundled C).
 notify = "6"
+# PTY-backed subprocess control for the M11 MVP-gate harness — the only thing
+# under `dev-dependencies` of `daemonseed-integration-tests` that touches a real
+# terminal. portable-pty is the MIT-licensed cross-platform PTY layer used by
+# wezterm; we only ever construct PTY pairs and drive `daemonseed-tui` through
+# them, never reach for the platform internals. Pinned at the workspace level
+# so the gate harness, future xtask helpers, and any later parallel harness
+# share one version.
+portable-pty = "0.9"

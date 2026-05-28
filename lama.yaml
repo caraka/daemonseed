@@ -139,13 +139,13 @@ crates:
     manifest: "docs/llm-api-manifest/daemonseed-tui-api.yaml"
 
   - name: daemonseed-integration-tests
-    purpose: "Cross-crate integration tests + ISC coverage registry. Per-milestone exercise files under tests/m{N}_isc_coverage.rs."
+    purpose: "Cross-crate integration tests + ISC coverage registry. Per-milestone exercise files under tests/m{N}_isc_coverage.rs. M11 adds the MVP-gate harness: tests/common/gate.rs (ServerProcess + PtyTui + Gate driver) consumed by tests/m11_mvp_gate.rs, the 4-daemon end-to-end scenario gated by `cargo xtask mvp-gate`."
     license: AGPL-3.0-or-later
     status: active
     manifest: null
 
   - name: xtask
-    purpose: "Workspace task runner. Subcommands: gen-proto, check-proto, isc-coverage, findings-resolved, install-hooks."
+    purpose: "Workspace task runner. Subcommands: gen-proto, check-proto, isc-coverage, findings-resolved, install-hooks, mvp-gate (M11 — builds release server+tui binaries then runs the 4-daemon PTY harness, propagating its pass/fail bit)."
     license: AGPL-3.0-or-later
     status: active
     manifest: null
