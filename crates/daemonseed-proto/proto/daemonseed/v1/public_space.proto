@@ -200,6 +200,17 @@ message PublicShareListing {
 
   // Sharer-assigned rating label from the active taxonomy. Advisory only.
   string rating = 3;
+
+  // Sharer's self-asserted full wire handle (`name#hash`, ISC-C4). Used by
+  // recipient clients to apply the local hidden-shares filter (ISC-C16 /
+  // ISC-A-C3 / ISC-A-S5b) — never enforced or interpreted by the relay, and
+  // never compared against authenticated identity (membership/identity are
+  // not the relay's trust boundary for this listing). Mirrors the same
+  // self-asserted shape used by `CircleMessage.sender_handle` for
+  // client-side @mention / mute. May be empty for legacy / operator-published
+  // listings that predate this field; an empty handle bypasses the hidden-
+  // shares filter (no handle to match against → render).
+  string sharer_handle = 4;
 }
 
 // ── Service ──────────────────────────────────────────────────────────────

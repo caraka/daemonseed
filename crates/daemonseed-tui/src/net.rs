@@ -26,6 +26,7 @@
 //! `Send` bound.
 
 use std::rc::Rc;
+use std::sync::Arc;
 
 use daemonseed_cli::connect::{ConnectError, connect_session};
 use daemonseed_cli::identity_proof::ClientIdentity;
@@ -38,10 +39,13 @@ use daemonseed_core::crypto::suite::CNSA_2_0;
 use daemonseed_core::federation::store::{InMemoryTrustStore, ServerEntry, TrustStore};
 use daemonseed_core::handle::Handle;
 use daemonseed_core::storage::seeds::CounterState;
+use daemonseed_core::storage::share_index::ShareIndex;
 use daemonseed_core::trust_events::TrustEventKey;
 use daemonseed_proto::v1 as wire;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+
+use crate::app::{IndexerStatus, LocalShareRow};
 
 /// A command from the UI to the network actor.
 #[derive(Debug, Clone)]
@@ -61,11 +65,25 @@ pub enum NetCommand {
     /// user's own display handle, sealed into the message for the recipient's
     /// client-side @mention (C17) / mute (C15) — never seen by the relay.
     SendChat { body: String, sender_handle: String },
+    /// Refresh the Shares-pane snapshot (ISC-17 / ISC-20). Returns the current
+    /// `ShareIndex` entries (My shares), the latest `ListPublicShares` from
+    /// the connected relay (Public shares), and the current indexer status.
+    /// A read-only operation — no scan kicks off here; the cold-scan / live
+    /// watcher are driven independently and the actor reports whatever state
+    /// it observes. Emitted as a single [`NetEvent::SharesSnapshot`].
+    RefreshShares,
 }
 
 /// An event from the network actor back to the UI. Plain data — folded into
 /// [`crate::app::App`] by `on_net_event` with no runtime dependency.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Eq` is intentionally NOT derived: `SharesSnapshot` carries a
+/// `Vec<wire::PublicShareListing>` and the prost-generated message type only
+/// implements `PartialEq`. Tests use `assert_eq!` (which only needs PartialEq);
+/// equality on raw wire types is well-defined for the strings/integers they
+/// carry but not for arbitrary embedded prost values, so `PartialEq` is the
+/// correct ceiling.
+#[derive(Debug, Clone, PartialEq)]
 pub enum NetEvent {
     /// The connection reached Authenticated (ISC-47).
     Connected {
@@ -105,6 +123,22 @@ pub enum NetEvent {
     /// The connection closed at an observable layer (ISC-C26). Categorized by the
     /// layer reached, never by a guessed server-side cause (ISC-A-S12).
     ConnectionClosed { cause: CloseCause },
+    /// A fresh Shares-pane snapshot (ISC-17 / ISC-20). `local` is the user's
+    /// own indexed files; `remote` is the full pre-filter listing from the
+    /// connected relay (the recipient applies its private hide set at render,
+    /// ISC-A-C3); `indexer_status` is the observed indexer state for the
+    /// non-blocking status line (ISC-A-C7). Either pane can be empty —
+    /// "no share root configured" and "no public listings" are normal states.
+    SharesSnapshot {
+        local: Vec<LocalShareRow>,
+        remote: Vec<wire::PublicShareListing>,
+        indexer_status: IndexerStatus,
+    },
+    /// A `RefreshShares` command could not complete (e.g., no live session,
+    /// or `ListPublicShares` returned an RPC status). The user-facing
+    /// rendering surfaces this on the status line; the cached snapshot is
+    /// left in place so the user keeps seeing the last known state.
+    SharesError { message: String },
 }
 
 /// Owns the network thread and the command/event channels. Held by the binary
@@ -186,6 +220,13 @@ struct Actor {
     /// `ConnectionRateLimited` (Transient) → `ConnectionRateLimitedExhausted`
     /// (PersistentNonBlocking); a successful connect resets it.
     backoff: Backoff,
+    /// The user's own share-index, if a share root has been configured
+    /// (ISC-17 / ISC-C21). `None` for the M11 alpha default — the screen
+    /// shows "no share root configured" until a config / setup flow lands.
+    /// The redb handle is held behind `Arc` so the actor can hand a borrow
+    /// to a background cold scan in a future commit without giving up the
+    /// foreground query path.
+    share_index: Option<Arc<ShareIndex>>,
 }
 
 /// The actor loop: receive commands and drive each on the current-thread
@@ -201,6 +242,7 @@ async fn net_actor(
         server_id: None,
         circle: None,
         backoff: Backoff::new(),
+        share_index: None,
     };
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
@@ -214,6 +256,7 @@ async fn net_actor(
                 body,
                 sender_handle,
             } => actor.handle_send_chat(&body, &sender_handle).await,
+            NetCommand::RefreshShares => actor.handle_refresh_shares().await,
         }
     }
 }
@@ -396,6 +439,75 @@ impl Actor {
         self.emit(NetEvent::CircleJoined);
     }
 
+    /// Read the My-shares ([`ShareIndex::entries`]) + Public-shares
+    /// (`ListPublicShares` over the held [`AppSession`]) snapshots and emit
+    /// them as a single [`NetEvent::SharesSnapshot`] (ISC-17 / ISC-20).
+    ///
+    /// Pure read-path — no scan kicks off here. The indexer status reported
+    /// is whatever the actor has observed; for the M11 alpha default (no
+    /// configured share root) it is [`IndexerStatus::Idle`] and the local
+    /// pane is empty. When a share root is configured in a future commit, a
+    /// background `Indexer::spawn_background_scan` will publish updated
+    /// states to the actor — this method just reports them.
+    async fn handle_refresh_shares(&mut self) {
+        // My shares: best-effort read of the persisted index. A redb error is
+        // surfaced via `SharesError` and the local list reverts to empty so
+        // the UI never blocks on a transient storage hiccup (ISC-A-C7).
+        let (local, indexer_status) = match self.share_index.as_ref() {
+            Some(index) => {
+                let entries = index.entries();
+                match entries {
+                    Ok(rows) => {
+                        let count = rows.len() as u64;
+                        let local: Vec<LocalShareRow> = rows
+                            .into_iter()
+                            .map(|e| LocalShareRow {
+                                rel_path: e.rel_path,
+                                size: e.size,
+                                mtime_unix_ms: e.mtime_unix_ms,
+                            })
+                            .collect();
+                        (local, IndexerStatus::Ready { entries: count })
+                    }
+                    Err(e) => {
+                        self.emit(NetEvent::SharesError {
+                            message: format!("share-index read failed: {e}"),
+                        });
+                        (Vec::new(), IndexerStatus::Idle)
+                    }
+                }
+            }
+            None => (Vec::new(), IndexerStatus::Idle),
+        };
+
+        // Public shares: requires a live session. Missing session is not an
+        // error per se — the user has not yet connected — so we emit a
+        // snapshot with empty `remote` rather than an error.
+        let remote = if let Some(session) = self.session.as_ref() {
+            let mut ps = session.public_space();
+            match ps
+                .list_public_shares(wire::ListPublicSharesRequest {})
+                .await
+            {
+                Ok(resp) => resp.into_inner().shares,
+                Err(status) => {
+                    self.emit(NetEvent::SharesError {
+                        message: format!("list-public-shares refused: {}", status.message()),
+                    });
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
+        self.emit(NetEvent::SharesSnapshot {
+            local,
+            remote,
+            indexer_status,
+        });
+    }
+
     /// Seal a chat message under the joined circle's key and publish it (ISC-14).
     async fn handle_send_chat(&mut self, body: &str, sender_handle: &str) {
         let Some(circle) = self.circle.as_ref() else {
@@ -556,6 +668,7 @@ mod tests {
                 server_id: None,
                 circle: None,
                 backoff: Backoff::new(),
+                share_index: None,
             };
             actor.handle_join_circle("some circle phrase").await;
             match evt_rx.try_recv() {
@@ -605,6 +718,7 @@ mod tests {
             server_id: None,
             circle: None,
             backoff: Backoff::new(),
+            share_index: None,
         }
     }
 
@@ -709,6 +823,7 @@ mod tests {
                 server_id: None,
                 circle: None,
                 backoff: Backoff::new(),
+                share_index: None,
             };
             actor.handle_send_chat("hello", "me#000000000000").await;
             match evt_rx.try_recv() {

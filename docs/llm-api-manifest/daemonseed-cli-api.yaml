@@ -715,6 +715,32 @@ functions:
       description: The borrowed subset of shares matching the filter.
     iscs: ["32", A-C5]
 
+  - name: filter_shares_excluding_hidden
+    module: daemonseed_cli::public_space
+    description: >-
+      The client's hidden-shares filter (ISC-C16 / ISC-A-C3): drop listings
+      whose sharer_handle is in the recipient's BTreeSet<String> hide set.
+      Mirrors filter_shares_by_rating in shape but reads the recipient-
+      private hide set rather than an operator-published taxonomy. Listings
+      with an empty sharer_handle are always kept (legacy / operator-pinned
+      entries predate the additive-MINOR sharer_handle field). The set is
+      Seeds::hidden_shares; nothing leaves the client (no wire field carries
+      it).
+    signature: "pub fn filter_shares_excluding_hidden<'a>(shares: &'a [wire::PublicShareListing], hidden: &std::collections::BTreeSet<String>) -> Vec<&'a wire::PublicShareListing>"
+    parameters:
+      - name: shares
+        type: "&'a [wire::PublicShareListing]"
+        direction: in
+        description: The listing to filter.
+      - name: hidden
+        type: "&std::collections::BTreeSet<String>"
+        direction: in
+        description: Full wire handles whose listings to suppress.
+    returns:
+      type: "Vec<&'a wire::PublicShareListing>"
+      description: The borrowed subset minus hidden-sharer rows.
+    iscs: [C16, A-C3]
+
   - name: whitelist_from_wire
     module: daemonseed_cli::public_space
     description: >-

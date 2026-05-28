@@ -19,7 +19,9 @@ use daemonseed_core::mention::find_self_mentions;
 use daemonseed_core::passphrase::strength::SESSION_PASSPHRASE_MIN_BITS;
 use daemonseed_core::trust_events::{TrustEventKey, event_key_string};
 
-use crate::app::{App, ChatLine, CircleStatus, ConnectionStatus, MainFocus, Screen, TrustItem};
+use crate::app::{
+    App, ChatLine, CircleStatus, ConnectionStatus, IndexerStatus, MainFocus, Screen, TrustItem,
+};
 use crate::screens::first_start::{FirstStartUi, FsStep};
 
 /// Draw the current screen.
@@ -48,11 +50,12 @@ fn render_main(app: &App, frame: &mut Frame) {
         .split(frame.area());
 
     render_status_bar(app, frame, chunks[0]);
-    // The main area shows the server-management list or Trust History while those
-    // screens have focus, otherwise the chat transcript.
+    // The main area shows the server-management list, Trust History, or Shares
+    // pane while those screens have focus, otherwise the chat transcript.
     match app.main_focus() {
         MainFocus::Servers => render_server_list(app, frame, chunks[1]),
         MainFocus::TrustHistory => render_trust_history(app, frame, chunks[1]),
+        MainFocus::Shares | MainFocus::Hide => render_shares(app, frame, chunks[1]),
         _ => render_chat_transcript(app, frame, chunks[1]),
     }
     render_main_input(app, frame, chunks[2]);
@@ -242,6 +245,116 @@ fn render_server_list(app: &App, frame: &mut Frame, area: Rect) {
     frame.render_widget(body, area);
 }
 
+/// The Shares pane (ISC-17 / ISC-18 / ISC-20): two stacked sub-panes —
+/// My-shares (the user's own indexed files, with the non-blocking indexer
+/// status line) and Public-shares (the connected relay's `ListPublicShares`
+/// snapshot, after the client-local hidden-shares filter is applied).
+///
+/// The Public-shares pane is **post-filter**: rows whose `sharer_handle` is
+/// in `app.hidden_shares()` never appear. The hide set is client-private
+/// (ISC-A-C3) — there is no wire field for it — so suppression is purely a
+/// render concern.
+fn render_shares(app: &App, frame: &mut Frame, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+
+    render_my_shares_pane(app, frame, chunks[0]);
+    render_public_shares_pane(app, frame, chunks[1]);
+}
+
+/// My-shares: the user's own [`daemonseed_core::storage::share_index::ShareIndex`]
+/// entries, preceded by the indexer status line. The status line is
+/// information-only and never blocks input (ISC-A-C7) — even mid-cold-scan,
+/// the user can press Tab to leave the pane.
+fn render_my_shares_pane(app: &App, frame: &mut Frame, area: Rect) {
+    let status = match app.indexer_status() {
+        IndexerStatus::Idle => "indexer: idle (no share root configured)".to_owned(),
+        IndexerStatus::Indexing { seen, total } => match total {
+            Some(t) => format!("indexer: indexing {seen}/{t} files…"),
+            None => format!("indexer: indexing {seen} files…"),
+        },
+        IndexerStatus::Ready { entries } => format!("indexer: ready ({entries} entries)"),
+    };
+    let status_color = match app.indexer_status() {
+        IndexerStatus::Idle => Color::DarkGray,
+        IndexerStatus::Indexing { .. } => Color::Yellow,
+        IndexerStatus::Ready { .. } => Color::Green,
+    };
+
+    let mut lines: Vec<Line> = Vec::with_capacity(1 + app.local_shares().len());
+    lines.push(Line::from(status).style(Style::default().fg(status_color)));
+
+    if app.local_shares().is_empty() {
+        lines.push(
+            Line::from("(no local shares)".to_owned()).style(Style::default().fg(Color::DarkGray)),
+        );
+    } else {
+        for entry in app.local_shares() {
+            lines.push(Line::from(format!(
+                "  {}   {} bytes",
+                entry.rel_path, entry.size
+            )));
+        }
+    }
+    let body = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" my shares ")
+            .title_alignment(Alignment::Left),
+    );
+    frame.render_widget(body, area);
+}
+
+/// Public-shares: the relay-published listing after the client-local
+/// hidden-shares filter (ISC-18 / C16). Selected row highlighted; rows whose
+/// `sharer_handle` is in the hide set are absent (ISC-A-C3 by construction
+/// — no wire field carries the hide set).
+fn render_public_shares_pane(app: &App, frame: &mut Frame, area: Rect) {
+    let visible = app.visible_public_shares();
+    let lines: Vec<Line> = if visible.is_empty() {
+        let msg = if app.public_shares_raw().is_empty() {
+            "(no public shares published by this relay)"
+        } else {
+            "(all public shares filtered by your hide list)"
+        };
+        vec![Line::from(msg.to_owned()).style(Style::default().fg(Color::DarkGray))]
+    } else {
+        visible
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let marker = if i == app.share_sel() { "▶ " } else { "  " };
+                let sharer = if s.sharer_handle.is_empty() {
+                    "(operator)".to_owned()
+                } else {
+                    s.sharer_handle.clone()
+                };
+                let rating = if s.rating.is_empty() {
+                    String::new()
+                } else {
+                    format!("  [{}]", s.rating)
+                };
+                let line = format!("{marker}{}{rating}    by {sharer}", s.name);
+                let style = if i == app.share_sel() {
+                    Style::default().fg(Color::Cyan).bold()
+                } else {
+                    Style::default()
+                };
+                Line::from(line).style(style)
+            })
+            .collect()
+    };
+    let body = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" public shares ")
+            .title_alignment(Alignment::Left),
+    );
+    frame.render_widget(body, area);
+}
+
 /// Top bar: connection state, circle state, persistent trust badges (ISC-23),
 /// and — when a close was observed — a distinct close-cause segment (ISC-28).
 fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
@@ -385,9 +498,11 @@ fn chat_line(m: &ChatLine, own: Option<&Handle>) -> Line<'static> {
     Line::from(spans)
 }
 
-/// The bottom input line: the chat compose box, circle-join box, or mute box,
-/// depending on focus (Tab cycles Chat → JoinCircle → Mute). When composing a
-/// partial `@token`, a mention-autocomplete popup floats above (ISC-12).
+/// The bottom input line: the chat compose box, circle-join box, mute box,
+/// shares status, hide box, or server-management input, depending on focus
+/// (Tab cycles Chat → JoinCircle → Mute → Shares → Hide → Servers →
+/// TrustHistory). When composing a partial `@token`, a mention-autocomplete
+/// popup floats above (ISC-12).
 fn render_main_input(app: &App, frame: &mut Frame, area: Rect) {
     let (title, text): (&str, String) = match app.main_focus() {
         MainFocus::Chat => (
@@ -406,8 +521,24 @@ fn render_main_input(app: &App, frame: &mut Frame, area: Rect) {
                 format!("   muted: {}", muted.join(", "))
             };
             (
-                "mute handle  [Enter] toggle  [Tab] servers  [Esc] back",
+                "mute handle  [Enter] toggle  [Tab] shares  [Esc] back",
                 format!("{}{suffix}", app.mute_input()),
+            )
+        }
+        MainFocus::Shares => (
+            "shares  [↑/↓] select  [r] refresh  [Tab] hide  [Esc] back",
+            String::new(),
+        ),
+        MainFocus::Hide => {
+            let hidden: Vec<&str> = app.hidden_shares().collect();
+            let suffix = if hidden.is_empty() {
+                String::new()
+            } else {
+                format!("   hidden: {}", hidden.join(", "))
+            };
+            (
+                "hide sharer-handle  [Enter] toggle  [Tab] servers  [Esc] back",
+                format!("{}{suffix}", app.hide_input()),
             )
         }
         MainFocus::Servers => (

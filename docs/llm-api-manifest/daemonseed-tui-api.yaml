@@ -65,11 +65,16 @@ modules:
       trust store seeded for the dialed server in the requested C22 mode),
       JoinCircle (derive_cot_key + asset_address → subscribe; spawn_local an
       inbound reader that open_messages each frame → ChatMessage event),
-      SendChat (seal_message → publish a CotFrame on the held subscribe stream).
+      SendChat (seal_message → publish a CotFrame on the held subscribe stream),
+      RefreshShares (read the held ShareIndex.entries() and the relay's
+      ListPublicShares snapshot, emit a SharesSnapshot event; pure read-path).
       Events: Connected/ConnectFailed, CircleJoined/CircleJoinFailed,
       ChatMessage, ChatError, TrustEvent (a C28 trust-event key + scope, routed
-      by the UI per its affordance class) and ConnectionClosed (a C26 close-cause
-      layer). On connect failure the actor categorizes the error into a CloseCause
+      by the UI per its affordance class), ConnectionClosed (a C26 close-cause
+      layer), SharesSnapshot ({ local: Vec<LocalShareRow>, remote:
+      Vec<PublicShareListing>, indexer_status: IndexerStatus } — ISC-17/20),
+      SharesError (RPC or storage failure surfaced on the status line).
+      On connect failure the actor categorizes the error into a CloseCause
       and emits the warranted trust event: an actionable key directly
       (ServerKeyMismatch / NoCommonVersion, Blocking), else the uniform rate-limit
       refusal escalated via a per-session Backoff (Transient → PersistentNonBlocking,
@@ -77,8 +82,8 @@ modules:
       Foreign/undecryptable inbound frames are skipped.
     no_std: false
     depends_on: [daemonseed-cli, daemonseed-core, daemonseed-proto]
-    iscs: ["10", "14", "16", "22", "23", "24", "28", "47", C15, C17, C22, C26, C28, C37, A-S2, A-S12]
-    added_in: "M11 connect + chat + C28 workstream"
+    iscs: ["10", "14", "16", "17", "20", "22", "23", "24", "28", "47", C15, C17, C21, C22, C26, C28, C37, A-S2, A-C7, A-S12]
+    added_in: "M11 connect + chat + C28 + shares workstream"
 
   - name: daemonseed_tui::screens::first_start
     description: >-
@@ -143,6 +148,15 @@ public_types:
       - "fn trust_log(&self) -> &TrustEventLog           # Trust History audit log (ISC-25)"
       - "fn close_cause(&self) -> Option<CloseCause>     # last close layer (ISC-28)"
       - "fn history_sel(&self) -> usize                  # Trust History selection (newest-first)"
+      - "fn local_shares(&self) -> &[LocalShareRow]      # ISC-17 My-shares pane"
+      - "fn visible_public_shares(&self) -> Vec<&wire::PublicShareListing>  # ISC-17/18 post-filter"
+      - "fn public_shares_raw(&self) -> &[wire::PublicShareListing]  # pre-filter snapshot"
+      - "fn indexer_status(&self) -> &IndexerStatus      # ISC-20 status line"
+      - "fn is_share_hidden(&self, sharer: &str) -> bool # ISC-18 / C16"
+      - "fn hide_input(&self) -> &str"
+      - "fn hidden_shares(&self) -> impl Iterator<Item = &str>"
+      - "fn share_sel(&self) -> usize                    # Public-shares row selection"
+      - "fn take_pending_share_refresh(&mut self) -> bool  # drained into NetCommand::RefreshShares"
       - "fn on_net_event(&mut self, event: NetEvent)"
       - "fn on_key(&mut self, key: KeyEvent)"
   - name: daemonseed_tui::app::Screen
@@ -154,8 +168,15 @@ public_types:
     description: "One rendered chat line: sender (self-asserted handle), body, sent_unix_ms (0 for a local echo of a just-sent message, which the relay never reflects to its sender). ISC-10."
   - name: daemonseed_tui::app::MainFocus
     kind: enum
-    description: "Which Main-view input has keyboard focus (Tab cycles): Chat (compose, Enter sends, ISC-14), JoinCircle (phrase, Enter joins, ISC-15/16), Mute (full handle, Enter toggles the client-local mute set, ISC-13 / A-C3), Servers (F22 server-management — the main area shows the server list; Enter adds or connects-selected, Left/Right slides trust, Up/Down selects, ISC-21/26/27), TrustHistory (the main area shows the C28 trust-event audit log; Up/Down select, Enter dismisses the selected event per (key, scope), ISC-25 / A-C12)."
-    variants: [Chat, JoinCircle, Mute, Servers, TrustHistory]
+    description: "Which Main-view input has keyboard focus (Tab cycles Chat → JoinCircle → Mute → Shares → Hide → Servers → TrustHistory). Chat (compose, Enter sends, ISC-14); JoinCircle (phrase, Enter joins, ISC-15/16); Mute (full handle, Enter toggles the client-local mute set, ISC-13 / A-C3); Shares (two-pane My/Public shares view; Up/Down selects, r refreshes, ISC-17/20); Hide (full sharer-handle, Enter toggles the client-local hidden-shares set, ISC-18 / C16 / A-C3 — Shares view stays visible); Servers (F22 server-management — main area shows the server list; Enter adds or connects-selected, Left/Right slides trust, Up/Down selects, ISC-21/26/27); TrustHistory (main area shows the C28 trust-event audit log; Up/Down select, Enter dismisses per (key, scope), ISC-25 / A-C12)."
+    variants: [Chat, JoinCircle, Mute, Shares, Hide, Servers, TrustHistory]
+  - name: daemonseed_tui::app::LocalShareRow
+    kind: struct
+    description: "One indexed file in the user's own share, as rendered in the My-shares pane (ISC-17 / C21). A render-only projection of daemonseed_core::storage::share_index::ShareEntry: rel_path, size, mtime_unix_ms."
+  - name: daemonseed_tui::app::IndexerStatus
+    kind: enum
+    description: "Indexer state as seen by the TUI (ISC-20 / A-C7): Idle (no share root configured), Indexing { seen, total: Option<u64> } (cold/incremental scan running), Ready { entries }. The status line at the top of the My-shares pane reflects this; transitions never gate user input."
+    variants: [Idle, "Indexing { seen, total }", "Ready { entries }"]
   - name: daemonseed_tui::app::TrustItem
     kind: struct
     description: "A surfaced C28 trust event awaiting user attention: key (selects the affordance class via core class_of) + server_id (scopes per-(key,scope) dismissal, ISC-A-C12). ISC-22/23/24."

@@ -659,8 +659,9 @@ types:
       A single public-space share in the listing (ISC-C19 / finding F25).
       The rating tag is the sharer's self-classification (advisory, not
       server-verified per ISC-A-S5b). M6 defines this surface; share
-      content transfer is M8.
-    iscs: [C19, A-S5b]
+      content transfer is M8; M11 added the sharer_handle field for
+      client-local hidden-shares filtering (ISC-C16 / ISC-A-C3).
+    iscs: [C19, A-S5b, C16, A-C3]
     fields:
       - name: share_id
         type: string
@@ -675,6 +676,16 @@ types:
         tag: 3
         description: >-
           Sharer-assigned label from the active taxonomy. Advisory only.
+      - name: sharer_handle
+        type: string
+        tag: 4
+        description: >-
+          Sharer's self-asserted full wire handle (`name#hash`).
+          Recipient clients use it to apply the local hidden-shares
+          filter (ISC-C16 / ISC-A-C3); the relay never enforces it
+          (ISC-A-S5b). Mirrors CircleMessage.sender_handle. May be
+          empty for legacy / operator-pinned listings predating the
+          additive-MINOR bump that introduced this field (M11).
 
   # ── public_space.proto: RPC request/response wrappers ──────────────
 

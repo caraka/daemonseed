@@ -1222,6 +1222,48 @@ mod tests {
         );
     }
 
+    /// ISC-A-S5b / ISC-C16: the relay returns each `PublicShareListing`
+    /// byte-identical to what it was given, including the sharer's
+    /// self-asserted `sharer_handle`. The handle is the recipient client's
+    /// only key into its local hidden-shares set; if the relay ever rewrote,
+    /// normalised, validated, or stripped it, the client-side filter would
+    /// silently lose entries (false negatives, leaking handles the user has
+    /// hidden) or gain entries (false positives, hiding handles the user
+    /// hasn't). The architectural property is "verbatim passthrough"; this
+    /// test pins it.
+    #[test]
+    fn public_shares_listing_roundtrips_sharer_handle_verbatim() {
+        let mut state = PublicSpaceState::empty();
+        state.public_shares.push(wire::PublicShareListing {
+            share_id: "share-alice-1".to_owned(),
+            name: "Alice's recipes".to_owned(),
+            rating: "PG13".to_owned(),
+            sharer_handle: "brave-otter#aabbccddeeff".to_owned(),
+        });
+        // Operator-published entry that predates the field — empty handle
+        // must survive too (legacy compatibility, additive-MINOR contract).
+        state.public_shares.push(wire::PublicShareListing {
+            share_id: "share-operator-1".to_owned(),
+            name: "Operator pinned".to_owned(),
+            rating: String::new(),
+            sharer_handle: String::new(),
+        });
+
+        let returned = state.public_shares();
+        assert_eq!(returned.len(), 2, "passthrough preserves count");
+        assert_eq!(
+            returned[0].sharer_handle, "brave-otter#aabbccddeeff",
+            "sharer_handle returned verbatim (ISC-A-S5b)"
+        );
+        assert_eq!(returned[0].share_id, "share-alice-1");
+        assert_eq!(returned[0].name, "Alice's recipes");
+        assert_eq!(returned[0].rating, "PG13");
+        assert!(
+            returned[1].sharer_handle.is_empty(),
+            "empty handle passes through (legacy compat)"
+        );
+    }
+
     // ── Upload / delete (ISC-7/8/19/20 / A-S3) ───────────────────────────
 
     /// Build a loaded state with `posts_dir`, the given whitelisted signers,

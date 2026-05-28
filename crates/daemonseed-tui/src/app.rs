@@ -11,6 +11,7 @@ use daemonseed_core::profile::config::ArgonParams;
 use daemonseed_core::trust_events::{
     DismissalScope, TrustEvent, TrustEventClass, TrustEventKey, TrustEventLog, class_of,
 };
+use daemonseed_proto::v1 as wire;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 
 use crate::net::NetEvent;
@@ -69,7 +70,7 @@ pub struct ChatLine {
 }
 
 /// Which input on the [`Screen::Main`] view has keyboard focus. `Tab` cycles
-/// Chat → JoinCircle → Mute → Servers → TrustHistory → Chat.
+/// Chat → JoinCircle → Mute → Shares → Hide → Servers → TrustHistory → Chat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MainFocus {
     /// The chat compose box (default): typing composes, Enter sends (ISC-14).
@@ -81,6 +82,20 @@ pub enum MainFocus {
     /// client-local mute set (ISC-13 / C15). The set never leaves this client
     /// (ISC-A-C3).
     Mute,
+    /// The Shares view (ISC-17 / ISC-20): two panes — local files indexed by
+    /// the user's own [`daemonseed_core::indexer::Indexer`] (My shares), and
+    /// the remote [`wire::PublicShareListing`] snapshot fetched from the
+    /// connected relay (Public shares). Up/Down navigates the public-shares
+    /// rows, `r` requests a fresh snapshot, `f` (later) initiates a fetch
+    /// (ISC-19). The indexer status line at the top of My-shares stays
+    /// non-blocking during a cold scan (ISC-A-C7).
+    Shares,
+    /// The Hide box: type a full `name#hash` handle, Enter toggles it in the
+    /// client-local hidden-shares set (ISC-18 / C16). The set never leaves
+    /// this client (ISC-A-C3) — there is no wire field carrying it — and is
+    /// applied as a render-time filter to the Public shares pane. Main area
+    /// stays on the Shares view.
+    Hide,
     /// The server-management screen (F22): add servers, set per-server trust
     /// mode with the trusted/untrusted slider (C22), and connect to a selected
     /// one (ISC-21/26/27). The main area shows the server list instead of chat.
@@ -90,6 +105,36 @@ pub enum MainFocus {
     /// selected event's affordance per `(key, scope)` (ISC-A-C12 — no global
     /// dismissal). The main area shows the history instead of chat.
     TrustHistory,
+}
+
+/// One indexed file in the user's own share, as rendered in the My-shares
+/// pane (ISC-17 / ISC-C21). A render-only projection of
+/// [`daemonseed_core::storage::share_index::ShareEntry`] kept local to the
+/// TUI so [`App`] does not depend on the redb-backed concrete type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalShareRow {
+    /// Path relative to the share root.
+    pub rel_path: String,
+    /// File size in bytes.
+    pub size: u64,
+    /// Last-modified time, milliseconds since the Unix epoch.
+    pub mtime_unix_ms: u64,
+}
+
+/// Indexer state as seen by the TUI (ISC-20 / ISC-A-C7). The line at the top
+/// of the My-shares pane reflects whichever state the net actor last emitted;
+/// transitions never gate user input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexerStatus {
+    /// No share root configured, or the indexer has not started yet.
+    Idle,
+    /// A cold or incremental scan is in flight. `seen` is the running file
+    /// count; `total` is `None` while the walk has not finished — the cold
+    /// scan does not know the total ahead of time, by design (single-pass).
+    Indexing { seen: u64, total: Option<u64> },
+    /// The indexer is up-to-date with the last scan; `entries` is the size
+    /// of the persisted index (ISC-C21 cross-launch persistence).
+    Ready { entries: u64 },
 }
 
 /// A surfaced trust event awaiting user attention (ISC-C28). The `key` selects
@@ -196,6 +241,31 @@ pub struct App {
     close_cause: Option<CloseCause>,
     /// Selected row in the Trust History view (Up/Down moves it).
     history_sel: usize,
+    /// Latest My-shares snapshot from the net actor (ISC-17).
+    local_shares: Vec<LocalShareRow>,
+    /// Latest Public-shares snapshot from the net actor (ISC-17 / ISC-18).
+    /// Pre-filter; the hide set is applied at render time (ISC-A-C3 keeps the
+    /// hide set off the wire — there is nothing for the relay to know).
+    public_shares: Vec<wire::PublicShareListing>,
+    /// Current indexer status, surfaced non-blocking at the top of the
+    /// My-shares pane (ISC-20 / ISC-A-C7).
+    indexer_status: IndexerStatus,
+    /// Client-local hidden-share full wire handles (ISC-18 / C16). Applied as
+    /// a render-time filter on [`Self::public_shares`] via
+    /// [`daemonseed_cli::public_space::filter_shares_excluding_hidden`]. Never
+    /// leaves the client (ISC-A-C3): no wire field carries it. The persisted
+    /// home for this set is [`daemonseed_core::storage::seeds::Seeds::hidden_shares`];
+    /// session-scoped here pending the .dseed write-through path (ISC-5 partial).
+    hidden_shares: std::collections::BTreeSet<String>,
+    /// The hide-box input buffer (ISC-18).
+    hide_input: String,
+    /// Selected row index in the Public-shares pane (Up/Down moves it). Will
+    /// be the fetch target once ISC-19 lands.
+    share_sel: usize,
+    /// A queued shares-refresh the binary should forward to the net actor
+    /// (drained once). `true` means "the user pressed R" or "the screen just
+    /// opened"; the binary translates this into a `NetCommand::RefreshShares`.
+    pending_share_refresh: bool,
 }
 
 impl Default for App {
@@ -241,6 +311,13 @@ impl App {
             transient: None,
             close_cause: None,
             history_sel: 0,
+            local_shares: Vec::new(),
+            public_shares: Vec::new(),
+            indexer_status: IndexerStatus::Idle,
+            hidden_shares: std::collections::BTreeSet::new(),
+            hide_input: String::new(),
+            share_sel: 0,
+            pending_share_refresh: false,
         }
     }
 
@@ -350,6 +427,21 @@ impl App {
             NetEvent::ChatError { message } => self.status = Some(message),
             NetEvent::TrustEvent { key, server_id } => self.fold_trust_event(key, server_id),
             NetEvent::ConnectionClosed { cause } => self.close_cause = Some(cause),
+            NetEvent::SharesSnapshot {
+                local,
+                remote,
+                indexer_status,
+            } => {
+                self.local_shares = local;
+                self.public_shares = remote;
+                self.indexer_status = indexer_status;
+                // Clamp the selection so it never points past the new list.
+                let max_idx = self.public_shares.len().saturating_sub(1);
+                if self.share_sel > max_idx {
+                    self.share_sel = max_idx;
+                }
+            }
+            NetEvent::SharesError { message } => self.status = Some(message),
         }
     }
 
@@ -454,6 +546,74 @@ impl App {
     /// The selected row in the Trust History view (newest-first index).
     pub fn history_sel(&self) -> usize {
         self.history_sel
+    }
+
+    /// Latest My-shares snapshot (ISC-17), oldest first.
+    pub fn local_shares(&self) -> &[LocalShareRow] {
+        &self.local_shares
+    }
+
+    /// Public-share rows after the hidden-shares filter (ISC-17 / ISC-18).
+    /// Mirrors [`daemonseed_cli::public_space::filter_shares_excluding_hidden`]
+    /// in the cli crate; duplicated here as a thin borrow-respecting helper so
+    /// `App` does not depend on cli's public surface from its own renderer.
+    /// Listings with an empty `sharer_handle` (legacy / operator-pinned) are
+    /// always kept (no handle to filter against).
+    pub fn visible_public_shares(&self) -> Vec<&wire::PublicShareListing> {
+        self.public_shares
+            .iter()
+            .filter(|s| {
+                s.sharer_handle.is_empty() || !self.hidden_shares.contains(&s.sharer_handle)
+            })
+            .collect()
+    }
+
+    /// Size of [`Self::visible_public_shares`] without materialising the Vec.
+    fn visible_public_shares_count(&self) -> usize {
+        self.public_shares
+            .iter()
+            .filter(|s| {
+                s.sharer_handle.is_empty() || !self.hidden_shares.contains(&s.sharer_handle)
+            })
+            .count()
+    }
+
+    /// Raw public-share snapshot, pre-filter, for tests that need to assert on
+    /// what arrived from the relay vs what renders.
+    pub fn public_shares_raw(&self) -> &[wire::PublicShareListing] {
+        &self.public_shares
+    }
+
+    /// Current indexer status (ISC-20), for the My-shares pane's status line.
+    pub fn indexer_status(&self) -> &IndexerStatus {
+        &self.indexer_status
+    }
+
+    /// Whether `sharer` (a full wire handle) is on the client-local hide set
+    /// (ISC-18 / C16).
+    pub fn is_share_hidden(&self, sharer: &str) -> bool {
+        self.hidden_shares.contains(sharer)
+    }
+
+    /// The hide-box input buffer, for rendering.
+    pub fn hide_input(&self) -> &str {
+        &self.hide_input
+    }
+
+    /// The hidden-share handles, for rendering the hide-box list.
+    pub fn hidden_shares(&self) -> impl Iterator<Item = &str> {
+        self.hidden_shares.iter().map(String::as_str)
+    }
+
+    /// The selected public-share row index, for highlighting.
+    pub fn share_sel(&self) -> usize {
+        self.share_sel
+    }
+
+    /// Take a queued shares-refresh request (drained once by the binary, which
+    /// translates it into a `NetCommand::RefreshShares`).
+    pub fn take_pending_share_refresh(&mut self) -> bool {
+        std::mem::replace(&mut self.pending_share_refresh, false)
     }
 
     /// @-mention autocomplete candidates for the current compose buffer
@@ -574,18 +734,89 @@ impl App {
                 self.main_focus = match self.main_focus {
                     MainFocus::Chat => MainFocus::JoinCircle,
                     MainFocus::JoinCircle => MainFocus::Mute,
-                    MainFocus::Mute => MainFocus::Servers,
+                    MainFocus::Mute => MainFocus::Shares,
+                    MainFocus::Shares => MainFocus::Hide,
+                    MainFocus::Hide => MainFocus::Servers,
                     MainFocus::Servers => MainFocus::TrustHistory,
                     MainFocus::TrustHistory => MainFocus::Chat,
                 };
+                // Opening the Shares pane requests a fresh snapshot — the
+                // alpha gate harness drives this through `RefreshShares` so
+                // the screen is never accidentally empty on first view.
+                if matches!(self.main_focus, MainFocus::Shares | MainFocus::Hide) {
+                    self.pending_share_refresh = true;
+                }
             }
             _ => match self.main_focus {
                 MainFocus::Chat => self.on_key_chat(key),
                 MainFocus::JoinCircle => self.on_key_join(key),
                 MainFocus::Mute => self.on_key_mute(key),
+                MainFocus::Shares => self.on_key_shares(key),
+                MainFocus::Hide => self.on_key_hide(key),
                 MainFocus::Servers => self.on_key_servers(key),
                 MainFocus::TrustHistory => self.on_key_history(key),
             },
+        }
+    }
+
+    /// Shares-pane key handling (read-only display, ISC-17 / ISC-20).
+    ///
+    /// `Up` / `Down` move the public-shares selection (clamped to the visible,
+    /// hide-filtered subset so a hidden row can never be highlighted); `r`
+    /// requests a fresh snapshot. Fetch (`f`) is wired by ISC-19 in a later
+    /// commit.
+    fn on_key_shares(&mut self, key: KeyEvent) {
+        let visible = self.visible_public_shares_count();
+        match key.code {
+            KeyCode::Up => {
+                self.share_sel = self.share_sel.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                let max = visible.saturating_sub(1);
+                if self.share_sel < max {
+                    self.share_sel += 1;
+                }
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                self.pending_share_refresh = true;
+            }
+            _ => {}
+        }
+    }
+
+    /// Hide-box key handling (ISC-18 / C16). Typing edits [`Self::hide_input`];
+    /// Enter on a non-empty buffer toggles the handle in
+    /// [`Self::hidden_shares`] (set membership), then clears the input. The
+    /// set is session-scoped here pending the .dseed write-through (ISC-5
+    /// partial); on toggle, render-time filtering picks the change up
+    /// immediately because [`Self::visible_public_shares`] reads
+    /// [`Self::hidden_shares`] each time.
+    fn on_key_hide(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char(c) => self.hide_input.push(c),
+            KeyCode::Backspace => {
+                self.hide_input.pop();
+            }
+            KeyCode::Enter if !self.hide_input.is_empty() => {
+                let handle = std::mem::take(&mut self.hide_input);
+                // Reject line-breaks for parity with `Seeds::add_hidden_share`
+                // (blob-integrity guard); a well-formed wire handle never has
+                // one, but a paste of "garbage\nmore" must not corrupt the
+                // future seeds-blob round-trip.
+                if handle.contains(['\n', '\r']) {
+                    self.status = Some("hide handle rejected: line break".to_owned());
+                    return;
+                }
+                if !self.hidden_shares.remove(&handle) {
+                    self.hidden_shares.insert(handle);
+                }
+                // Re-clamp selection — the visible subset may have shrunk.
+                let max = self.visible_public_shares_count().saturating_sub(1);
+                if self.share_sel > max {
+                    self.share_sel = max;
+                }
+            }
+            _ => {}
         }
     }
 
@@ -986,6 +1217,10 @@ mod tests {
         app.on_key(press(KeyCode::Tab));
         assert_eq!(app.main_focus(), MainFocus::Mute);
         app.on_key(press(KeyCode::Tab));
+        assert_eq!(app.main_focus(), MainFocus::Shares);
+        app.on_key(press(KeyCode::Tab));
+        assert_eq!(app.main_focus(), MainFocus::Hide);
+        app.on_key(press(KeyCode::Tab));
         assert_eq!(app.main_focus(), MainFocus::Servers);
         app.on_key(press(KeyCode::Tab));
         assert_eq!(app.main_focus(), MainFocus::TrustHistory);
@@ -1102,6 +1337,8 @@ mod tests {
         // Tab to the Trust History view and dismiss the selected (only) row.
         app.on_key(press(KeyCode::Tab)); // → JoinCircle
         app.on_key(press(KeyCode::Tab)); // → Mute
+        app.on_key(press(KeyCode::Tab)); // → Shares
+        app.on_key(press(KeyCode::Tab)); // → Hide
         app.on_key(press(KeyCode::Tab)); // → Servers
         app.on_key(press(KeyCode::Tab)); // → TrustHistory
         assert_eq!(app.main_focus(), MainFocus::TrustHistory);
@@ -1174,8 +1411,8 @@ mod tests {
             key: TrustEventKey::ServerSourceUnverified,
             server_id: Some("relay#aabbccddeeff".to_owned()),
         });
-        // Tab to the Trust History view.
-        for _ in 0..4 {
+        // Tab to the Trust History view (6 hops past Chat → … → TrustHistory).
+        for _ in 0..6 {
             app.on_key(press(KeyCode::Tab));
         }
         assert_eq!(app.main_focus(), MainFocus::TrustHistory);
@@ -1409,6 +1646,8 @@ mod tests {
     fn to_servers(app: &mut App) {
         app.on_key(press(KeyCode::Tab)); // Chat → JoinCircle
         app.on_key(press(KeyCode::Tab)); // → Mute
+        app.on_key(press(KeyCode::Tab)); // → Shares
+        app.on_key(press(KeyCode::Tab)); // → Hide
         app.on_key(press(KeyCode::Tab)); // → Servers
         assert_eq!(app.main_focus(), MainFocus::Servers);
     }
@@ -1537,5 +1776,214 @@ mod tests {
             !suggestions.contains(&"bob#ccddeeff0011".to_owned()),
             "bob does not prefix-match @al"
         );
+    }
+
+    // ── Shares pane (ISC-17 / ISC-18 / ISC-20) ─────────────────────────────
+
+    fn listing(share_id: &str, name: &str, rating: &str, sharer: &str) -> wire::PublicShareListing {
+        wire::PublicShareListing {
+            share_id: share_id.to_owned(),
+            name: name.to_owned(),
+            rating: rating.to_owned(),
+            sharer_handle: sharer.to_owned(),
+        }
+    }
+
+    fn to_shares(app: &mut App) {
+        app.on_key(press(KeyCode::Tab)); // Chat → JoinCircle
+        app.on_key(press(KeyCode::Tab)); // → Mute
+        app.on_key(press(KeyCode::Tab)); // → Shares
+        assert_eq!(app.main_focus(), MainFocus::Shares);
+    }
+
+    /// ISC-17: a `SharesSnapshot` lands in App state, both panes are queryable,
+    /// and the render shows the local entry + the indexer status line.
+    #[test]
+    fn shares_snapshot_lands_and_renders_both_panes() {
+        let mut app = drive_to_main();
+        to_shares(&mut app);
+        app.on_net_event(NetEvent::SharesSnapshot {
+            local: vec![LocalShareRow {
+                rel_path: "notes/recipe.md".to_owned(),
+                size: 4096,
+                mtime_unix_ms: 1,
+            }],
+            remote: vec![listing("s1", "Alice's notes", "PG13", "alice#aabbccddeeff")],
+            indexer_status: IndexerStatus::Ready { entries: 1 },
+        });
+        assert_eq!(app.local_shares().len(), 1);
+        assert_eq!(app.public_shares_raw().len(), 1);
+        assert_eq!(app.visible_public_shares().len(), 1);
+        let text = render_text(&app, 120, 28);
+        assert!(text.contains("my shares"), "My shares pane titled");
+        assert!(text.contains("public shares"), "Public shares pane titled");
+        assert!(text.contains("notes/recipe.md"), "local entry rendered");
+        assert!(text.contains("Alice's notes"), "remote listing rendered");
+        assert!(text.contains("indexer: ready"), "indexer status line shown");
+    }
+
+    /// ISC-20: indexer status surfaces in distinct strings per state (Idle /
+    /// Indexing / Ready). The line is purely informational — no state machinery
+    /// gates user input on it (ISC-A-C7).
+    #[test]
+    fn indexer_status_renders_three_distinct_states() {
+        let mut app = drive_to_main();
+        to_shares(&mut app);
+
+        app.on_net_event(NetEvent::SharesSnapshot {
+            local: Vec::new(),
+            remote: Vec::new(),
+            indexer_status: IndexerStatus::Idle,
+        });
+        assert!(render_text(&app, 100, 24).contains("indexer: idle"));
+
+        app.on_net_event(NetEvent::SharesSnapshot {
+            local: Vec::new(),
+            remote: Vec::new(),
+            indexer_status: IndexerStatus::Indexing {
+                seen: 17,
+                total: None,
+            },
+        });
+        assert!(render_text(&app, 100, 24).contains("indexer: indexing 17"));
+
+        app.on_net_event(NetEvent::SharesSnapshot {
+            local: Vec::new(),
+            remote: Vec::new(),
+            indexer_status: IndexerStatus::Ready { entries: 42 },
+        });
+        assert!(render_text(&app, 100, 24).contains("indexer: ready (42 entries)"));
+    }
+
+    /// ISC-18 / C16: a `SharesSnapshot` carrying a `sharer_handle` matching an
+    /// entry in `hidden_shares` does NOT render that row. The raw snapshot still
+    /// holds the row (the relay sent it); only the visible projection drops it.
+    #[test]
+    fn hide_toggle_filters_public_shares_render() {
+        let mut app = drive_to_main();
+        to_shares(&mut app);
+        app.on_net_event(NetEvent::SharesSnapshot {
+            local: Vec::new(),
+            remote: vec![
+                listing("s1", "Alice notes", "", "alice#aabbccddeeff"),
+                listing("s2", "Bob notes", "", "bob#001122334455"),
+            ],
+            indexer_status: IndexerStatus::Idle,
+        });
+        assert!(render_text(&app, 120, 24).contains("Alice notes"));
+
+        // Move to the Hide box and toggle alice's handle into the hide set.
+        app.on_key(press(KeyCode::Tab)); // → Hide
+        assert_eq!(app.main_focus(), MainFocus::Hide);
+        for ch in "alice#aabbccddeeff".chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        app.on_key(press(KeyCode::Enter));
+        assert!(app.is_share_hidden("alice#aabbccddeeff"));
+
+        let after = render_text(&app, 120, 24);
+        assert!(
+            !after.contains("Alice notes"),
+            "alice's listing suppressed (ISC-18)"
+        );
+        assert!(after.contains("Bob notes"), "bob's listing still shown");
+        // The raw snapshot is unchanged: the filter is purely render-time.
+        assert_eq!(app.public_shares_raw().len(), 2);
+    }
+
+    /// ISC-18: the Enter-on-input toggle is idempotent (Enter again on the same
+    /// handle removes it) — same shape as the chat-mute toggle. Mirrors the
+    /// semantics of `Seeds::add_hidden_share` / `remove_hidden_share`.
+    #[test]
+    fn hide_toggle_is_idempotent() {
+        let mut app = drive_to_main();
+        to_shares(&mut app);
+        app.on_key(press(KeyCode::Tab)); // → Hide
+        for ch in "alice#aabbccddeeff".chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        app.on_key(press(KeyCode::Enter));
+        assert!(app.is_share_hidden("alice#aabbccddeeff"));
+        // Re-type the same handle and toggle off.
+        for ch in "alice#aabbccddeeff".chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        app.on_key(press(KeyCode::Enter));
+        assert!(!app.is_share_hidden("alice#aabbccddeeff"));
+    }
+
+    /// Blob-integrity parity with `Seeds::add_hidden_share`: a paste containing
+    /// `\n` or `\r` is refused so the future at-rest blob stays line-safe.
+    #[test]
+    fn hide_toggle_refuses_line_break_handle() {
+        let mut app = drive_to_main();
+        to_shares(&mut app);
+        app.on_key(press(KeyCode::Tab)); // → Hide
+        for ch in "garbage\nmore".chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        app.on_key(press(KeyCode::Enter));
+        assert!(!app.is_share_hidden("garbage\nmore"), "rejected");
+        assert!(
+            app.status().is_some(),
+            "status surfaces the rejection cause"
+        );
+    }
+
+    /// Tabbing into the Shares (or Hide) focus drains a pending share refresh
+    /// so the screen is never silently empty on first view. The binary turns
+    /// this into a `NetCommand::RefreshShares`.
+    #[test]
+    fn tab_to_shares_or_hide_queues_a_refresh() {
+        let mut app = drive_to_main();
+        // Pre-condition: nothing queued from a fresh drive_to_main.
+        let _ = app.take_pending_share_refresh();
+        to_shares(&mut app); // Tab → … → Shares
+        assert!(
+            app.take_pending_share_refresh(),
+            "tabbing into Shares queues a refresh"
+        );
+        app.on_key(press(KeyCode::Tab)); // → Hide
+        assert!(
+            app.take_pending_share_refresh(),
+            "tabbing into Hide queues a refresh"
+        );
+    }
+
+    /// `r` on the Shares pane queues a fresh refresh (the user-facing
+    /// counterpart to the auto-queue on entry).
+    #[test]
+    fn r_key_on_shares_queues_a_refresh() {
+        let mut app = drive_to_main();
+        to_shares(&mut app);
+        let _ = app.take_pending_share_refresh();
+        app.on_key(press(KeyCode::Char('r')));
+        assert!(app.take_pending_share_refresh());
+    }
+
+    /// Selection in the public-shares pane clamps to the *visible* subset, so a
+    /// hidden row can never be silently highlighted.
+    #[test]
+    fn share_selection_clamps_to_visible_subset_after_hide() {
+        let mut app = drive_to_main();
+        to_shares(&mut app);
+        app.on_net_event(NetEvent::SharesSnapshot {
+            local: Vec::new(),
+            remote: vec![
+                listing("s1", "Alice notes", "", "alice#aabbccddeeff"),
+                listing("s2", "Bob notes", "", "bob#001122334455"),
+            ],
+            indexer_status: IndexerStatus::Idle,
+        });
+        // Move selection to the second row.
+        app.on_key(press(KeyCode::Down));
+        assert_eq!(app.share_sel(), 1);
+        // Hide bob — the visible subset shrinks to 1, so the sel must clamp.
+        app.on_key(press(KeyCode::Tab)); // → Hide
+        for ch in "bob#001122334455".chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        app.on_key(press(KeyCode::Enter));
+        assert_eq!(app.share_sel(), 0, "clamped after hide");
     }
 }

@@ -93,6 +93,32 @@ pub fn filter_shares_by_rating<'a>(
         .collect()
 }
 
+/// Drop any [`wire::PublicShareListing`] whose sharer wire handle is in
+/// `hidden` (ISC-C16 / ISC-A-C3).
+///
+/// Pairs with [`filter_shares_by_rating`]: the rating filter is operator-
+/// taxonomy-scoped, this one is recipient-private-scoped. Both are applied
+/// client-side; neither leaves the client (no wire field carries either set —
+/// the relay must not know who a recipient hides). `hidden` is the
+/// [`Seeds::hidden_shares`] set or a clone of it.
+///
+/// A listing with an empty `sharer_handle` is always kept: legacy /
+/// operator-pinned listings predate the additive-MINOR field, and an empty
+/// handle cannot meaningfully match any concrete hidden-handle entry. This
+/// behaviour mirrors `is_share_hidden`'s point-query semantics, just lifted
+/// to a list-filter shape.
+///
+/// [`Seeds::hidden_shares`]: daemonseed_core::storage::seeds::Seeds::hidden_shares
+pub fn filter_shares_excluding_hidden<'a>(
+    shares: &'a [wire::PublicShareListing],
+    hidden: &std::collections::BTreeSet<String>,
+) -> Vec<&'a wire::PublicShareListing> {
+    shares
+        .iter()
+        .filter(|s| s.sharer_handle.is_empty() || !hidden.contains(&s.sharer_handle))
+        .collect()
+}
+
 // ── Client re-verification (ISC-A-S3 client half) ────────────────────────
 
 /// Why converting the published wire whitelist failed.
@@ -205,10 +231,15 @@ mod tests {
     }
 
     fn share(id: &str, rating: &str) -> wire::PublicShareListing {
+        share_with_handle(id, rating, "")
+    }
+
+    fn share_with_handle(id: &str, rating: &str, sharer_handle: &str) -> wire::PublicShareListing {
         wire::PublicShareListing {
             share_id: id.to_owned(),
             name: format!("share-{id}"),
             rating: rating.to_owned(),
+            sharer_handle: sharer_handle.to_owned(),
         }
     }
 
@@ -267,6 +298,74 @@ mod tests {
         let filtered = filter_shares_by_rating(&shares, Some("PG13"));
         assert_eq!(filtered.len(), 2);
         assert!(filtered.iter().all(|s| s.rating == "PG13"));
+    }
+
+    // ── filter_shares_excluding_hidden (ISC-C16 / ISC-A-C3) ──────────────
+
+    #[test]
+    fn filter_hidden_empty_set_returns_all() {
+        let shares = vec![
+            share_with_handle("a", "PG13", "alice#aabbccddeeff"),
+            share_with_handle("b", "R", "bob#001122334455"),
+        ];
+        let hidden = std::collections::BTreeSet::new();
+        assert_eq!(
+            filter_shares_excluding_hidden(&shares, &hidden).len(),
+            2,
+            "empty hide set: nothing filtered"
+        );
+    }
+
+    #[test]
+    fn filter_hidden_drops_listed_sharer() {
+        let shares = vec![
+            share_with_handle("a", "PG13", "alice#aabbccddeeff"),
+            share_with_handle("b", "R", "bob#001122334455"),
+            share_with_handle("c", "PG13", "alice#aabbccddeeff"),
+        ];
+        let mut hidden = std::collections::BTreeSet::new();
+        hidden.insert("alice#aabbccddeeff".to_owned());
+        let filtered = filter_shares_excluding_hidden(&shares, &hidden);
+        assert_eq!(filtered.len(), 1, "only Bob's listing survives");
+        assert_eq!(filtered[0].sharer_handle, "bob#001122334455");
+    }
+
+    #[test]
+    fn filter_hidden_keeps_empty_sharer_handle() {
+        // Legacy / operator-pinned listings predate the additive-MINOR
+        // sharer_handle field. An empty handle can't match a concrete entry
+        // in the hide set and must always render.
+        let shares = vec![
+            share_with_handle("operator-pin", "", ""),
+            share_with_handle("alice-1", "PG13", "alice#aabbccddeeff"),
+        ];
+        let mut hidden = std::collections::BTreeSet::new();
+        hidden.insert("alice#aabbccddeeff".to_owned());
+        let filtered = filter_shares_excluding_hidden(&shares, &hidden);
+        assert_eq!(filtered.len(), 1, "operator-pinned listing kept");
+        assert_eq!(filtered[0].share_id, "operator-pin");
+    }
+
+    #[test]
+    fn filter_hidden_composes_with_rating_filter() {
+        // Both filters are client-side, neither leaves the client; they
+        // compose as set-intersections regardless of order.
+        let shares = vec![
+            share_with_handle("a", "PG13", "alice#aabbccddeeff"),
+            share_with_handle("b", "R", "alice#aabbccddeeff"),
+            share_with_handle("c", "PG13", "bob#001122334455"),
+        ];
+        let mut hidden = std::collections::BTreeSet::new();
+        hidden.insert("alice#aabbccddeeff".to_owned());
+        let after_hide = filter_shares_excluding_hidden(&shares, &hidden);
+        assert_eq!(after_hide.len(), 1);
+        // Re-collect references through the rating predicate on the same
+        // borrowed slice — establishes the order-independence.
+        let after_hide_owned: Vec<wire::PublicShareListing> =
+            after_hide.into_iter().cloned().collect();
+        let after_both = filter_shares_by_rating(&after_hide_owned, Some("PG13"));
+        assert_eq!(after_both.len(), 1);
+        assert_eq!(after_both[0].share_id, "c");
     }
 
     // ── Client re-verification (ISC-A-S3 client half) ────────────────────
