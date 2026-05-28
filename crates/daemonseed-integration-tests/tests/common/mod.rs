@@ -4,3 +4,4 @@
 //! dependency-graph layer.
 
 pub mod gate;
+pub mod wire_shape;

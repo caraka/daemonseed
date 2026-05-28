@@ -528,6 +528,8 @@ dependencies = [
  "oxitls-rustls-provider",
  "portable-pty",
  "prost",
+ "rustls",
+ "rustls-pki-types",
  "tempfile",
  "tokio",
  "tokio-stream",

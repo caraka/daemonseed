@@ -14,7 +14,7 @@
 //! built on; the actor's [`crate::net::Actor::handle_fetch_share`] is
 //! unit-tested via its `NetEvent` emissions in `daemonseed-tui::app`. Here
 //! we exercise the same wire shape directly on two `AppSession`s sharing one
-//! `CotRegistry`, the way `m11_cot_chat` does for chat.
+//! `CotRegistry`, the way `cot_chat_e2e` does for chat.
 
 use std::sync::Arc;
 use std::time::Duration;

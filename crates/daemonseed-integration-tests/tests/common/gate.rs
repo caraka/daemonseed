@@ -95,7 +95,7 @@ pub fn target_bin(profile: &str, name: &str) -> PathBuf {
 /// `target_bin` plus a precondition assertion. Surfaces a friendly error
 /// pointing the operator at the build command if the binary is missing —
 /// the xtask wrapper builds first, but a developer running the integration
-/// test directly with `cargo test --test m11_mvp_gate -- --ignored` will
+/// test directly with `cargo test --test subprocess_gate -- --ignored` will
 /// hit this if they skip the build step.
 pub fn require_release_bin(name: &str) -> Result<PathBuf> {
     let path = target_bin("release", name);
