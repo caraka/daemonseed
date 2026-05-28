@@ -54,6 +54,17 @@ tokio-stream = { workspace = true }
 # `daemonseed-server` subprocess. portable-pty is the only PTY-touching dep
 # anywhere in the workspace; it's confined to `[dev-dependencies]` so no
 # shipping crate compiles it — ISC-A1 (no test-only surface in ship
-# binaries) survives at the dependency layer too.
+# binaries) survives at the dependency layer too. vt100 wraps the raw PTY
+# byte stream into a terminal-emulated screen model so the gate's
+# assertions can match multi-word strings (mnemonic re-type, bootstrap
+# address, etc.) that ratatui's per-word cursor-positioning interleaves
+# with control sequences.
 portable-pty = { workspace = true }
+vt100 = { workspace = true }
 anyhow = { workspace = true }
+# BIP-39 wordlist for the gate's mnemonic-extractor — validates that
+# words pulled from the rendered ShowMnemonic body are real BIP-39
+# entries before the harness types them back at VerifyRoundTrip. The
+# shipping crates already pull this version through `daemonseed-core`,
+# so no new lockfile entry.
+bip39 = { workspace = true }

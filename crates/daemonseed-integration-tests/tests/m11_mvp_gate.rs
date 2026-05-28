@@ -93,3 +93,66 @@ fn mvp_gate_smoke_brings_up_four_daemons() {
     // server (kills the server child). Both are RAII; nothing else to
     // do here — a clean exit is the C1 deliverable.
 }
+
+/// **Gate step 1 — cold first-start on all four daemons.**
+///
+/// Closes ISC-33 (the scripted-keystroke fixture pattern) and ISC-34
+/// (gate step 1: cold first-start on D4 — the cold path runs on every
+/// daemon in this gate because step 5 / 6 / 7 need three other
+/// post-first-start identities anyway; ISC-41's recovery-vs-cold
+/// byte-identical check focuses on D4 specifically in step 8).
+///
+/// The driver runs the same scripted ritual on every daemon in
+/// lockstep — Welcome → Enter → strong passphrase → Enter (argon) →
+/// the displayed mnemonic re-typed for round-trip verify → Enter →
+/// accept the adj-noun default name → Enter (argon again) → clear
+/// the bundled-canonical prefill from the bootstrap field and type
+/// the test server's `<server-id>@<host:port>` → Enter → Main.
+///
+/// Each daemon's captured 24-word mnemonic is returned via
+/// `FirstStartCapture` so step-8's recovery-flow driver (C5) can
+/// drive the exact same materials through the recovery path and
+/// assert byte-identical handle / cot-key derivation (ISC-41 /
+/// A-C17). For C2 the captures are only sanity-checked (every
+/// daemon's mnemonic is exactly 24 BIP-39 words, and the four
+/// mnemonics are mutually distinct — proof the RNG is alive and the
+/// extractor isn't returning a constant).
+#[test]
+#[ignore = "spawns real binaries; entry point is `cargo xtask mvp-gate`"]
+fn mvp_gate_step1_all_daemons_finish_first_start() {
+    let server = ServerProcess::spawn(Some("relay-mvp"))
+        .expect("server subprocess spawns + binds to its ephemeral port");
+    let bootstrap = server.bootstrap_handle();
+    let mut gate = Gate::with_daemons(server, 4).expect("four PTY-attached daemons spawn");
+
+    // Known-green for the C12 strength meter — pinned in the TUI's
+    // own first_start unit tests as the canonical passing passphrase.
+    let passphrase = "correct horse battery staple table mountain";
+
+    let captures = match gate.all_complete_first_start(passphrase, &bootstrap) {
+        Ok(caps) => caps,
+        Err(e) => {
+            eprintln!("{}", gate.failure_report(&format!("step-1: {e}")));
+            panic!("first-start failed on at least one daemon: {e}");
+        }
+    };
+
+    assert_eq!(captures.len(), 4, "expected one capture per daemon");
+    for cap in &captures {
+        let n = cap.mnemonic.split_whitespace().count();
+        assert_eq!(n, 24, "{}: mnemonic has {n} words, expected 24", cap.tag);
+    }
+
+    // Four independent first-starts must produce four distinct
+    // mnemonics — if any two collide, either the harness is reading
+    // the same daemon's screen twice or the per-process getrandom
+    // state isn't independent (a real bring-up bug worth catching).
+    use std::collections::BTreeSet;
+    let unique: BTreeSet<&str> = captures.iter().map(|c| c.mnemonic.as_str()).collect();
+    assert_eq!(
+        unique.len(),
+        4,
+        "expected four distinct mnemonics across daemons; got {} unique",
+        unique.len()
+    );
+}

@@ -45,6 +45,18 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
+use vt100::Parser as VtParser;
+
+/// PTY rows the harness opens its emulator with. Wide enough for the
+/// trust-history list + share two-pane + the 24-word mnemonic body
+/// without ratatui's `Wrap { trim: true }` collapsing words across
+/// lines in a way that breaks our row-aware extraction.
+const PTY_ROWS: u16 = 40;
+/// PTY columns. 120 fits every M11 screen's footer line without
+/// truncation and gives the mnemonic body enough room for ~10 words
+/// per line (≈ 60 chars typical), which keeps the extraction logic
+/// simple.
+const PTY_COLS: u16 = 120;
 
 // ── Workspace discovery ─────────────────────────────────────────────
 
@@ -293,8 +305,8 @@ impl PtyTui {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
-                rows: 40,
-                cols: 120,
+                rows: PTY_ROWS,
+                cols: PTY_COLS,
                 pixel_width: 0,
                 pixel_height: 0,
             })
@@ -412,6 +424,70 @@ impl PtyTui {
             snap[snap.len() - bytes..].to_owned()
         }
     }
+
+    /// Replay every captured PTY byte through a fresh VT100 parser and
+    /// return the resulting screen-text — one line per terminal row,
+    /// trailing whitespace trimmed, joined with `\n`. ratatui paints
+    /// each Span via an ANSI cursor-position escape followed by the
+    /// visible glyphs, so the raw byte stream interleaves content and
+    /// control sequences; the parser folds both into a 2D cell grid we
+    /// can read like a real terminal. Used by [`Self::screen_text`],
+    /// [`Self::wait_for_visible`], and the mnemonic extractor.
+    fn rendered_screen(&self) -> String {
+        let mut parser = VtParser::new(PTY_ROWS, PTY_COLS, 0);
+        let guard = self.buffer.lock().unwrap();
+        parser.process(&guard);
+        let screen = parser.screen();
+        let mut out = String::with_capacity(usize::from(PTY_ROWS) * usize::from(PTY_COLS));
+        for row in 0..PTY_ROWS {
+            let line = screen.contents_between(row, 0, row, PTY_COLS);
+            // Strip trailing spaces left by empty cells.
+            let trimmed = line.trim_end();
+            out.push_str(trimmed);
+            out.push('\n');
+        }
+        out
+    }
+
+    /// The currently-visible terminal contents as plain text. Word
+    /// separators are real spaces (vt100 reconstructs them from cell
+    /// positions), so multi-word substring assertions work the way a
+    /// human would expect — "First start — choose a passphrase" is
+    /// one contiguous match.
+    pub fn screen_text(&self) -> String {
+        self.rendered_screen()
+    }
+
+    /// Like [`Self::wait_for`] but matches against the vt100-rendered
+    /// screen rather than the raw byte stream. Use this for any
+    /// multi-word assertion or anything that would otherwise have
+    /// ANSI escapes interleaved through it.
+    pub fn wait_for_visible(&self, needle: &str, timeout: Duration) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if self.screen_text().contains(needle) {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        let screen = self.screen_text();
+        bail!(
+            "{}: did not see {:?} in rendered screen within {:?}; last screen:\n{screen}",
+            self.tag,
+            needle,
+            timeout
+        );
+    }
+
+    /// Reset the captured PTY byte buffer to empty. Used by the gate's
+    /// step driver between scripted screens when a needle from the
+    /// previous step would otherwise mask the transition (e.g. two
+    /// adjacent first-start screens that share a footer phrase).
+    pub fn reset_buffer(&self) {
+        if let Ok(mut g) = self.buffer.lock() {
+            g.clear();
+        }
+    }
 }
 
 impl Drop for PtyTui {
@@ -440,6 +516,109 @@ impl Gate {
         Ok(Self { server, daemons })
     }
 
+    /// Send the same keystroke sequence to every daemon sequentially.
+    /// Used by the gate's scripted-transaction driver — every step
+    /// advances all four daemons in lockstep.
+    pub fn broadcast_keys(&mut self, keys: &str) -> Result<()> {
+        for d in &mut self.daemons {
+            d.send(keys)?;
+        }
+        Ok(())
+    }
+
+    /// Block until every daemon's rendered screen contains `needle`.
+    /// Each daemon's wait_for_visible runs sequentially against its own
+    /// deadline (each daemon has the full `timeout` budget), so a slow
+    /// argon run on one daemon doesn't compete with another's deadline.
+    pub fn wait_for_all_visible(&self, needle: &str, timeout: Duration) -> Result<()> {
+        for d in &self.daemons {
+            d.wait_for_visible(needle, timeout)?;
+        }
+        Ok(())
+    }
+
+    /// Run the cold first-start ritual on every daemon end-to-end:
+    /// Welcome → Passphrase → ShowMnemonic → VerifyRoundTrip →
+    /// DisplayName → Bootstrap → Main. Returns each daemon's captured
+    /// 24-word mnemonic in tag order so step 8 can drive the recovery
+    /// path with the exact materials the cold path produced.
+    ///
+    /// The bootstrap string overrides whatever bundled-canonical anchor
+    /// the TUI prefills (200 backspaces are sent before typing so any
+    /// prefill is cleared — `200 ≫ max bundled length`). Default
+    /// display name (the adj-noun prefill) is accepted on every daemon
+    /// — the gate identifies daemons by their tag, not by handle.
+    pub fn all_complete_first_start(
+        &mut self,
+        passphrase: &str,
+        bootstrap: &str,
+    ) -> Result<Vec<FirstStartCapture>> {
+        // Welcome → press Enter to enter first-start.
+        self.wait_for_all_visible("begin first-start", Duration::from_secs(10))?;
+        self.broadcast_keys("\r")?;
+
+        // FsStep::Passphrase — type the passphrase, advance.
+        self.wait_for_all_visible("choose a passphrase", Duration::from_secs(5))?;
+        for d in &mut self.daemons {
+            d.send(passphrase)?;
+        }
+        // Argon2id runs on Enter; cap at 30s per daemon for the
+        // OWASP 2024 desktop defaults the binary uses
+        // (`ArgonParams::desktop_default()` = 19 MiB / t=2 / p=1 —
+        // sub-second on a modern host, but the cap covers slow CI rigs).
+        self.broadcast_keys("\r")?;
+
+        // FsStep::ShowMnemonic — capture the mnemonic before advancing.
+        self.wait_for_all_visible("write these 24 words down", Duration::from_secs(30))?;
+        let mut captures: Vec<FirstStartCapture> = Vec::with_capacity(self.daemons.len());
+        for d in &self.daemons {
+            let words = extract_mnemonic(&d.screen_text()).with_context(|| {
+                format!(
+                    "{}: failed to extract mnemonic from ShowMnemonic screen:\n{}",
+                    d.tag,
+                    d.screen_text()
+                )
+            })?;
+            captures.push(FirstStartCapture {
+                tag: d.tag.clone(),
+                mnemonic: words,
+            });
+        }
+        self.broadcast_keys("\r")?;
+
+        // FsStep::VerifyRoundTrip — re-type each daemon's own 24 words.
+        self.wait_for_all_visible("re-type all 24 words", Duration::from_secs(5))?;
+        for (d, cap) in self.daemons.iter_mut().zip(&captures) {
+            d.send(&cap.mnemonic)?;
+            d.send("\r")?;
+        }
+
+        // FsStep::DisplayName — accept the adj-noun prefilled default.
+        // argon-once again on Enter (passphrase re-derive for the
+        // verified seed materials), so cap at 30s per daemon.
+        self.wait_for_all_visible("display name", Duration::from_secs(30))?;
+        self.broadcast_keys("\r")?;
+
+        // FsStep::Bootstrap — clear the bundled-canonical prefill, type
+        // the test server's <server-id>@<host:port>, advance.
+        self.wait_for_all_visible("bootstrap relay", Duration::from_secs(5))?;
+        let mut backspaces = String::with_capacity(200);
+        for _ in 0..200 {
+            backspaces.push('\x7f');
+        }
+        for d in &mut self.daemons {
+            d.send(&backspaces)?;
+            d.send(bootstrap)?;
+            d.send("\r")?;
+        }
+
+        // Main reached — the default focus is Chat, whose footer line
+        // contains "compose" (unique to the Main view's Chat focus).
+        self.wait_for_all_visible("compose", Duration::from_secs(10))?;
+
+        Ok(captures)
+    }
+
     /// Render a structured failure report — server log tails + each
     /// daemon's screen tail — for the assertion-failure path. The xtask
     /// wrapper surfaces this to stdout so a failed gate run is
@@ -455,12 +634,81 @@ impl Gate {
         out.push_str("\n----- server stdout (tail) -----\n");
         out.push_str(&self.server.tail(WhichLog::Stdout, 40));
         for daemon in &self.daemons {
-            out.push_str(&format!("\n----- {} screen tail -----\n", daemon.tag));
-            out.push_str(&daemon.tail_screen(4_000));
+            out.push_str(&format!("\n----- {} rendered screen -----\n", daemon.tag));
+            out.push_str(&daemon.screen_text());
         }
         out.push_str("\n===== end failure report =====\n");
         out
     }
+}
+
+/// What a daemon's cold-first-start ritual produced: the tag (D1..Dn)
+/// and the captured 24-word recovery mnemonic. The recovery path
+/// (step 8 / ISC-41) re-uses the same mnemonic against a fresh
+/// install of the same daemon to prove byte-identical key derivation.
+#[derive(Debug, Clone)]
+pub struct FirstStartCapture {
+    pub tag: String,
+    /// 24-word BIP-39 mnemonic, single-space-separated (the canonical
+    /// form daemonseed_core's mnemonic-display + round-trip verify use).
+    pub mnemonic: String,
+}
+
+// ── Mnemonic extraction from a rendered ShowMnemonic screen ──────────
+
+/// Pull the 24-word mnemonic out of a vt100-rendered ShowMnemonic
+/// screen.
+///
+/// Strategy:
+/// 1. Find the body block's title `"write these 24 words down"` and
+///    start scanning the rendered text right after it.
+/// 2. Stop the scan the moment the footer marker `"["` (the first
+///    bracket of `[Enter] I've written it down ...`) is reached — the
+///    footer contains real BIP-39 words like `"down"`, `"skip"`, and
+///    `"cancel"` that would otherwise contaminate the mnemonic.
+/// 3. Within that window, accept only tokens that are members of the
+///    BIP-39 English wordlist. The lowercase + length filter alone is
+///    not enough — box-drawing characters fail it anyway, but
+///    incidental words like `"these"` would slip through; BIP-39
+///    membership is the tight upper bound.
+fn extract_mnemonic(rendered: &str) -> Result<String> {
+    let body_marker = "write these 24 words down";
+    let start = rendered
+        .find(body_marker)
+        .map(|i| i + body_marker.len())
+        .ok_or_else(|| anyhow!("ShowMnemonic title not found in rendered screen"))?;
+    let after = &rendered[start..];
+
+    // Stop at the footer marker to keep footer BIP-39 words out.
+    let stop = after.find('[').unwrap_or(after.len());
+    let body = &after[..stop];
+
+    // ratatui paints box-drawing borders flush against the body cells
+    // (`│mango ...`), so the first word of each wrapped row is glued
+    // to a `│`. Trim any leading/trailing non-lowercase-ASCII chars
+    // before checking BIP-39 membership.
+    let wordlist = bip39::Language::English.word_list();
+    let mut words: Vec<String> = Vec::with_capacity(24);
+    for raw in body.split_whitespace() {
+        let token = raw.trim_matches(|c: char| !c.is_ascii_lowercase());
+        if !(3..=8).contains(&token.len()) {
+            continue;
+        }
+        if wordlist.contains(&token) {
+            words.push(token.to_owned());
+            if words.len() == 24 {
+                break;
+            }
+        }
+    }
+    if words.len() != 24 {
+        bail!(
+            "extracted {} BIP-39 words from ShowMnemonic body, expected 24; got: {:?}",
+            words.len(),
+            words
+        );
+    }
+    Ok(words.join(" "))
 }
 
 // ── Module-init helper ───────────────────────────────────────────────
@@ -487,4 +735,35 @@ fn pick_ephemeral_port() -> Result<u16> {
     let port = l.local_addr().context("local_addr")?.port();
     drop(l);
     Ok(port)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mnemonic_extractor_handles_simple_screen() {
+        // Minimal stand-in for a rendered ShowMnemonic screen: the
+        // title marker, the 24 words wrapped across a few lines (no
+        // box drawing — the real renderer's borders are non-alphabetic
+        // so they're transparent to the extractor anyway), and a
+        // footer line that includes phrases the extractor must reject.
+        let body = "│ write these 24 words down                                                  │\n\
+             │ abandon ability able about above absent absorb abstract absurd abuse access │\n\
+             │ accident account accuse achieve acid acoustic acquire across act action add │\n\
+             │ address adjust                                                              │\n\
+             │ [Enter] I've written it down   [s] skip (type-back)   [Esc] cancel         │\n";
+        let got = extract_mnemonic(body).expect("extracts 24 words");
+        assert_eq!(got.split_whitespace().count(), 24);
+        assert!(got.starts_with("abandon ability able"));
+        assert!(got.ends_with("address adjust"));
+    }
+
+    #[test]
+    fn mnemonic_extractor_rejects_short_screen() {
+        let body = "│ write these 24 words down │\n│ only three words here │\n";
+        let err = extract_mnemonic(body).expect_err("must reject < 24 words");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("expected 24"), "got: {msg}");
+    }
 }

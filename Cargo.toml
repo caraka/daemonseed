@@ -121,3 +121,12 @@ notify = "6"
 # so the gate harness, future xtask helpers, and any later parallel harness
 # share one version.
 portable-pty = "0.9"
+# Terminal emulator for the gate harness's screen-content assertions. The
+# raw PTY byte stream interleaves ratatui's per-word ANSI cursor-positioning
+# with content, so substring matching only works on hyphenated single spans;
+# anything multi-word (the 24-word mnemonic, the bootstrap-relay address
+# field, multi-line bodies) needs a real terminal model. vt100 is a small
+# pure-Rust VT100 parser maintained by doy@cpan; the gate harness wraps it
+# behind `PtyTui::screen_text()`. Confined to the integration-tests crate's
+# dev-deps via the same workspace declaration pattern as portable-pty.
+vt100 = "0.15"
