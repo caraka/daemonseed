@@ -619,6 +619,78 @@ impl Gate {
         Ok(captures)
     }
 
+    /// Block until every daemon's status bar shows "connected to" —
+    /// the green Connected state rendered by `ui::render_status_bar`
+    /// once the per-connection identity-proof exchange has driven the
+    /// `Connection<Versioned>` → `Connection<Authenticated>` type-state
+    /// transition (ISC-S5/S14/S19/A-C18). The TUI binary's main-loop
+    /// drains `App::take_pending_connect` straight after first-start
+    /// completes, so by the time this is called the dial is already
+    /// in flight; the handshake (TLS 1.3 + APP_HELLO + identity-proof
+    /// envelopes) settles in under a second on loopback.
+    pub fn wait_all_authenticated(&self, timeout: Duration) -> Result<()> {
+        self.wait_for_all_visible("connected to", timeout)
+    }
+
+    /// Drive every daemon into JoinCircle focus, type the same phrase,
+    /// send Enter; wait until every status bar shows "circle joined".
+    /// Both `on_key_join` and the underlying core derive the same
+    /// cot_key from the same phrase, so all four daemons rendezvous
+    /// at the same `asset_address` on the server (ISC-S20 / S17 /
+    /// A-S2 — the relay sees opaque CotFrame ciphertext).
+    ///
+    /// After join completes, every daemon's `main_focus` is reset
+    /// back to Chat (`on_key_join` does this on Enter), which is the
+    /// state `daemon_send_chat` assumes.
+    pub fn all_join_circle(&mut self, phrase: &str, timeout: Duration) -> Result<()> {
+        // From Chat focus → Tab → JoinCircle focus.
+        self.broadcast_keys("\t")?;
+        self.wait_for_all_visible("circle phrase", Duration::from_secs(3))?;
+        for d in &mut self.daemons {
+            d.send(phrase)?;
+            d.send("\r")?;
+        }
+        self.wait_for_all_visible("circle joined", timeout)?;
+        Ok(())
+    }
+
+    /// Have the daemon at `idx` type `body` on its Chat compose box
+    /// and press Enter. The TUI binary's main-loop drains
+    /// `App::take_pending_chat` into a NetCommand::SendChat, which
+    /// the net actor seals (AES-256-GCM under cot_key) and publishes
+    /// over the held CoT subscribe stream — exactly the M8 send path.
+    /// Local echo lands the message in the sender's own transcript;
+    /// the relay fans it out to every other subscriber.
+    pub fn daemon_send_chat(&mut self, idx: usize, body: &str) -> Result<()> {
+        let daemon = self
+            .daemons
+            .get_mut(idx)
+            .ok_or_else(|| anyhow!("no daemon at index {idx}"))?;
+        daemon.send(body)?;
+        daemon.send("\r")?;
+        Ok(())
+    }
+
+    /// Wait until every daemon's rendered screen contains `body` (a
+    /// substring of the chat message body, NOT the wire handle prefix).
+    /// Skips the daemon at `sender_idx` because its own local echo is
+    /// not load-bearing for the relay-fan-out assertion (and exercising
+    /// it conflates the local-echo and relay-relay paths).
+    pub fn wait_for_chat_on_others(
+        &self,
+        sender_idx: usize,
+        body: &str,
+        timeout: Duration,
+    ) -> Result<()> {
+        for (i, d) in self.daemons.iter().enumerate() {
+            if i == sender_idx {
+                continue;
+            }
+            d.wait_for_visible(body, timeout)?;
+        }
+        Ok(())
+    }
+
     /// Render a structured failure report — server log tails + each
     /// daemon's screen tail — for the assertion-failure path. The xtask
     /// wrapper surfaces this to stdout so a failed gate run is

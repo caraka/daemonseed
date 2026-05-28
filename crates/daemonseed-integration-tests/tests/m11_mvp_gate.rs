@@ -156,3 +156,96 @@ fn mvp_gate_step1_all_daemons_finish_first_start() {
         unique.len()
     );
 }
+
+/// **Gate step 2 — all four daemons reach Authenticated against the
+/// real server.**
+///
+/// Closes ISC-35 (gate step 2: all four daemons reach Authenticated —
+/// S5/S14/S19). Cumulative on top of step 1: each daemon's status bar
+/// turns green ("connected to <server-id> (wire 1.0)") once the per-
+/// connection identity-proof has driven its `Connection<Versioned>` →
+/// `Connection<Authenticated>` type-state transition, which is the only
+/// way the green Connected variant is emitted in `tui::net`.
+///
+/// This is the first gate step that touches the real wire-protocol
+/// surface end-to-end across subprocess boundaries — TLS 1.3 +
+/// APP_HELLO (M4a) + the mutual ML-DSA-87 identity-proof envelope
+/// bound to the rustls TLS exporter (M4b) + the per-server C22 trust
+/// slider's TOFU pin (M5). Any regression in any of those layers
+/// regresses this assertion.
+#[test]
+#[ignore = "spawns real binaries; entry point is `cargo xtask mvp-gate`"]
+fn mvp_gate_step2_all_daemons_authenticated() {
+    let server = ServerProcess::spawn(Some("relay-mvp"))
+        .expect("server subprocess spawns + binds to its ephemeral port");
+    let bootstrap = server.bootstrap_handle();
+    let mut gate = Gate::with_daemons(server, 4).expect("four PTY-attached daemons spawn");
+
+    let passphrase = "correct horse battery staple table mountain";
+    if let Err(e) = gate.all_complete_first_start(passphrase, &bootstrap) {
+        eprintln!("{}", gate.failure_report(&format!("step-1: {e}")));
+        panic!("first-start failed: {e}");
+    }
+
+    if let Err(e) = gate.wait_all_authenticated(Duration::from_secs(15)) {
+        eprintln!("{}", gate.failure_report(&format!("step-2: {e}")));
+        panic!("at least one daemon failed to reach Authenticated: {e}");
+    }
+}
+
+/// **Gate step 4 — CoT circle round-trip across four authenticated
+/// daemons.**
+///
+/// Closes ISC-37 (gate step 4: CoT circle + chat). The full ISC scope
+/// names `+ @mention + mute` too — those lean on each daemon's
+/// own wire-handle (which the harness doesn't currently extract from
+/// the rendered screen) and are layered on top of the same circle in
+/// a follow-up. The substrate (encrypted M8 relay round-trip across
+/// four real subprocess clients) lands here.
+///
+/// Cumulative: runs first-start + Authenticated + circle-join + chat
+/// fan-out. Skips step 3 (public-space round-trip) for now — the TUI
+/// doesn't yet surface a public-space view; ISC-36 will be exercised
+/// against the server side in C4 via the cli library, or marked as a
+/// known partial-coverage gap if the cost outweighs the M11-scope value.
+#[test]
+#[ignore = "spawns real binaries; entry point is `cargo xtask mvp-gate`"]
+fn mvp_gate_step4_circle_chat_round_trip() {
+    let server = ServerProcess::spawn(Some("relay-mvp"))
+        .expect("server subprocess spawns + binds to its ephemeral port");
+    let bootstrap = server.bootstrap_handle();
+    let mut gate = Gate::with_daemons(server, 4).expect("four PTY-attached daemons spawn");
+
+    let passphrase = "correct horse battery staple table mountain";
+    if let Err(e) = gate.all_complete_first_start(passphrase, &bootstrap) {
+        eprintln!("{}", gate.failure_report(&format!("step-1: {e}")));
+        panic!("first-start failed: {e}");
+    }
+    if let Err(e) = gate.wait_all_authenticated(Duration::from_secs(15)) {
+        eprintln!("{}", gate.failure_report(&format!("step-2: {e}")));
+        panic!("authenticate failed: {e}");
+    }
+
+    // High-entropy circle phrase — well past the C9 floor; any 4
+    // daemons typing the same string derive the same cot_key and
+    // rendezvous at the same `asset_address` on the relay (ISC-S20).
+    let phrase = "circle-mvp-gate-very-strong-phrase-for-step-4-2026-05-28";
+    if let Err(e) = gate.all_join_circle(phrase, Duration::from_secs(10)) {
+        eprintln!("{}", gate.failure_report(&format!("step-4-join: {e}")));
+        panic!("circle join failed: {e}");
+    }
+
+    // D1 (index 0) sends a chat message; D2/D3/D4 each receive it
+    // via the relay's bidi Subscribe fan-out. The body string is
+    // unique enough (`mvp-gate-canary-step-4`) that it's a clean
+    // substring match against each peer's rendered transcript.
+    let body = "mvp-gate-canary-step-4";
+    if let Err(e) = gate.daemon_send_chat(0, body) {
+        eprintln!("{}", gate.failure_report(&format!("step-4-send: {e}")));
+        panic!("D1 send failed: {e}");
+    }
+    if let Err(e) = gate.wait_for_chat_on_others(0, body, Duration::from_secs(10)) {
+        eprintln!("{}", gate.failure_report(&format!("step-4-fanout: {e}")));
+        panic!("chat fan-out failed — at least one peer never saw the message: {e}");
+    }
+}
