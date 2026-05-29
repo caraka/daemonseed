@@ -1,5 +1,12 @@
 # CLAUDE.md — daemonseed
 
-This repository uses **`AGENTS.md`** as the canonical, model-agnostic source of session rules. Claude Code: read `AGENTS.md` in this directory before doing anything else in this repository. Everything you would expect in a `CLAUDE.md` — project context, key paths, session bootstrap, standards target, definition of done, doc-sync discipline, insight capture, license posture, worktree placement, batch-boundary check-ins — lives there.
+> **`AGENTS.md` is the canonical, model-agnostic source of session rules** for this repository
+> (the cross-tool standard read natively by Codex, Cursor, Gemini CLI, and others). Everything —
+> project context, key paths, session bootstrap, standards target, definition of done, doc-sync
+> discipline, license posture, worktree placement — lives there, not here.
+>
+> This file exists only because **Claude Code auto-loads `CLAUDE.md`, not `AGENTS.md`.** The import
+> below pulls the canonical rules in at session start, so AGENTS.md stays the single source of truth
+> and Claude Code contributors still arrive fully briefed. Do not duplicate content here — edit `AGENTS.md`.
 
-This file exists so older Claude Code versions that auto-load `CLAUDE.md` but not `AGENTS.md` still find a pointer. If you are reading this and have not yet read `AGENTS.md`, read it now.
+@AGENTS.md
