@@ -82,7 +82,7 @@ fn main() -> Result<()> {
 /// unit tests (`registry_count_matches_total`); xtask only needs the constant
 /// to report the M0 baseline without taking a heavy path-dep on core+proto
 /// transitively. Bump both when the ISC list changes.
-const TOTAL_ISCS: u32 = 93;
+const TOTAL_ISCS: u32 = 94;
 
 /// Static lower-bound coverage count. Bumped each milestone as ISCs gain
 /// exercised tests:
