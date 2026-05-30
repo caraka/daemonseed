@@ -32,7 +32,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::gate::{Gate, ServerProcess};
+use common::gate::{Gate, PublicSpaceSeed, ServerProcess};
 
 /// Bring-up smoke. Spawns the harness, waits for every daemon to paint
 /// its initial Welcome frame, tears down cleanly. Closes the
@@ -107,6 +107,83 @@ fn four_daemons_complete_cold_first_start() {
         4,
         "expected four distinct mnemonics across daemons; got {} unique",
         unique.len()
+    );
+}
+
+/// Gate step 3 — public-space round-trip (MOTD + announcement + provenance).
+///
+/// A relay is seeded with a signed MOTD and a signed announcement post (both
+/// under one operator key whose pubkey is the lone signer-whitelist entry).
+/// A single daemon completes first-start, authenticates, then opens its Public
+/// Space pane — which fetches the MOTD, posts, and signer whitelist over the
+/// post-Authenticated `PublicSpace` RPCs and re-verifies each post client-side
+/// (ISC-A-S3). The test asserts the daemon renders the MOTD text and the
+/// announcement body, and that the post shows as provenance-verified — the
+/// render layer's "unverified" flag (a failed client-side verdict) must be
+/// absent. Exercises the M11 public-space client surface end-to-end against a
+/// real subprocess server, over already-shipped APIs (no new wire protocol).
+#[test]
+#[ignore = "spawns real binaries; entry point is `cargo xtask mvp-gate`"]
+fn daemon_sees_seeded_public_space_motd_and_verified_announcement() {
+    let motd = "welcome to the mvp-gate relay";
+    let announcement = "scheduled maintenance window at 0200 UTC";
+    let seed = PublicSpaceSeed::build(Some(motd), &[("announcements", announcement)])
+        .expect("build signed public-space seed");
+
+    let server = ServerProcess::spawn_seeded(Some("relay-mvp"), &seed)
+        .expect("seeded server subprocess spawns + binds to its ephemeral port");
+    let bootstrap = server.bootstrap_handle();
+    let mut gate = Gate::with_daemons(server, 1).expect("one PTY-attached daemon spawns");
+
+    let passphrase = "correct horse battery staple table mountain";
+    if let Err(e) = gate.all_complete_first_start(passphrase, &bootstrap) {
+        eprintln!("{}", gate.failure_report(&format!("first-start: {e}")));
+        panic!("first-start failed: {e}");
+    }
+    if let Err(e) = gate.wait_all_authenticated(Duration::from_secs(15)) {
+        eprintln!("{}", gate.failure_report(&format!("authenticate: {e}")));
+        panic!("daemon failed to reach Authenticated: {e}");
+    }
+
+    // Open the Public Space pane — this queues the RefreshPublicSpace fetch.
+    if let Err(e) = gate.daemon_open_public_space(0) {
+        eprintln!(
+            "{}",
+            gate.failure_report(&format!("open-public-space: {e}"))
+        );
+        panic!("could not open the Public Space pane: {e}");
+    }
+
+    // The MOTD area renders the seeded (inert) text.
+    if let Err(e) = gate
+        .daemons
+        .first()
+        .unwrap()
+        .wait_for_visible(motd, Duration::from_secs(10))
+    {
+        eprintln!("{}", gate.failure_report(&format!("motd-render: {e}")));
+        panic!("daemon never rendered the seeded MOTD: {e}");
+    }
+    // The announcement post renders its body.
+    if let Err(e) = gate
+        .daemons
+        .first()
+        .unwrap()
+        .wait_for_visible(announcement, Duration::from_secs(10))
+    {
+        eprintln!(
+            "{}",
+            gate.failure_report(&format!("announcement-render: {e}"))
+        );
+        panic!("daemon never rendered the seeded announcement: {e}");
+    }
+    // The post is signed by a whitelisted operator key, so the client's
+    // re-verification (ISC-A-S3) passes — the screen must NOT carry the
+    // "unverified" flag the render layer attaches to a failed verdict.
+    let screen = gate.daemons.first().unwrap().screen_text();
+    assert!(
+        !screen.contains("unverified"),
+        "a whitelist-signed post must verify client-side; screen:\n{screen}"
     );
 }
 

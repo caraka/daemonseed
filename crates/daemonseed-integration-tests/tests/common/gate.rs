@@ -37,14 +37,18 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow, bail};
+use daemonseed_core::identity::keys::SignKeypair;
+use daemonseed_core::public_space::content_address;
+use daemonseed_proto::v1 as wire;
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
+use prost::Message as _;
 use vt100::Parser as VtParser;
 
 /// PTY rows the harness opens its emulator with. Wide enough for the
@@ -110,6 +114,136 @@ pub fn require_release_bin(name: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+// ── Public-space seed (ISC-S7 / S8 / S9 / A-S3) ──────────────────────
+
+/// A signed public-space dataset for seeding a [`ServerProcess`] — the
+/// operator artifacts a relay would normally load from disk (ISC-S7/S8/S9).
+///
+/// Built by [`PublicSpaceSeed::build`], which mints one operator ML-DSA-87
+/// signing key, signs the MOTD and each announcement post under it, and emits
+/// the exact on-disk forms the server's `PublicSpaceState::load` consumes: a
+/// plaintext signer-whitelist (one hex full pubkey per line), an encoded
+/// `SignedArtifact` for the MOTD, and one encoded `SignedArtifact` per post.
+/// Because the same operator key signs everything and its pubkey is the sole
+/// whitelist entry, every artifact verifies server-side at load AND client-side
+/// at fetch (ISC-A-S3) — so a daemon's public-space view shows them as
+/// provenance-verified.
+pub struct PublicSpaceSeed {
+    /// Lines for the signer-whitelist file (hex-encoded full ML-DSA-87 keys).
+    whitelist_lines: Vec<String>,
+    /// Encoded `SignedArtifact` bytes for the MOTD, if any.
+    motd_bytes: Option<Vec<u8>>,
+    /// `(filename, encoded SignedArtifact bytes)` per post. The filename is
+    /// `hex(content_address)`, matching the server's own `UploadPost` persist
+    /// shape; `load_posts` reads every file in the dir regardless of name.
+    posts: Vec<(String, Vec<u8>)>,
+    /// Operator-defined topic set the posts belong to (ISC-S7).
+    topics: Vec<String>,
+}
+
+impl PublicSpaceSeed {
+    /// Build a seed: one operator signer, an optional MOTD, and N posts given
+    /// as `(topic, body)` pairs. All artifacts are signed under the same
+    /// freshly-derived operator key whose public key becomes the lone
+    /// whitelist entry.
+    pub fn build(motd_text: Option<&str>, posts: &[(&str, &str)]) -> Result<Self> {
+        ensure_module_operational();
+        // Deterministic operator key — the gate is reproducible, and the key
+        // never leaves the test process.
+        let operator = SignKeypair::from_ml_dsa_seed(&[0x5A; 32])
+            .map_err(|e| anyhow!("derive operator signing key: {e:?}"))?;
+        let pubkey = operator.public_key().to_vec();
+        let whitelist_lines = vec![hex::encode(&pubkey)];
+
+        let sign_artifact = |signed_payload: Vec<u8>| -> Result<wire::SignedArtifact> {
+            let signature = operator
+                .sign(&signed_payload)
+                .map_err(|e| anyhow!("sign public-space payload: {e:?}"))?
+                .to_vec();
+            Ok(wire::SignedArtifact {
+                signed_payload,
+                signer_pubkey: pubkey.clone(),
+                signature,
+            })
+        };
+
+        let motd_bytes = match motd_text {
+            Some(text) => {
+                let payload = wire::MotdPayload {
+                    text: text.to_owned(),
+                    signed_timestamp_ms: 1,
+                };
+                Some(sign_artifact(payload.encode_to_vec())?.encode_to_vec())
+            }
+            None => None,
+        };
+
+        let mut post_files = Vec::with_capacity(posts.len());
+        let mut topics: Vec<String> = Vec::new();
+        for (i, (topic, body)) in posts.iter().enumerate() {
+            let payload = wire::PostPayload {
+                topic: (*topic).to_owned(),
+                body: (*body).to_owned(),
+                // Distinct ascending timestamps so server-side ordering is
+                // well-defined (ISC-S7); value is otherwise advisory.
+                signed_timestamp_ms: (i as i64) + 1,
+            };
+            let signed_payload = payload.encode_to_vec();
+            let addr = content_address(&signed_payload)
+                .map_err(|e| anyhow!("derive post content address: {e:?}"))?;
+            let filename = hex::encode(addr.as_bytes());
+            post_files.push((filename, sign_artifact(signed_payload)?.encode_to_vec()));
+            if !topics.iter().any(|t| t == topic) {
+                topics.push((*topic).to_owned());
+            }
+        }
+
+        Ok(Self {
+            whitelist_lines,
+            motd_bytes,
+            posts: post_files,
+            topics,
+        })
+    }
+
+    /// Write the seed's files under `dir` and return the TOML config lines
+    /// (with absolute paths) the server needs to load them. Called from
+    /// [`ServerProcess::spawn_inner`] with the server's own data tempdir.
+    fn materialize(&self, dir: &Path) -> Result<String> {
+        let whitelist_path = dir.join("signers.txt");
+        std::fs::write(
+            &whitelist_path,
+            format!("{}\n", self.whitelist_lines.join("\n")),
+        )
+        .context("write signer whitelist")?;
+
+        let mut lines = format!("signer_whitelist_path = {whitelist_path:?}\n");
+
+        if let Some(motd) = &self.motd_bytes {
+            let motd_path = dir.join("motd.signed");
+            std::fs::write(&motd_path, motd).context("write motd")?;
+            lines.push_str(&format!("motd_path = {motd_path:?}\n"));
+        }
+
+        if !self.posts.is_empty() {
+            let posts_dir = dir.join("posts");
+            std::fs::create_dir_all(&posts_dir).context("mkdir posts dir")?;
+            for (name, bytes) in &self.posts {
+                std::fs::write(posts_dir.join(name), bytes)
+                    .with_context(|| format!("write post {name}"))?;
+            }
+            lines.push_str(&format!("posts_dir = {posts_dir:?}\n"));
+        }
+
+        if !self.topics.is_empty() {
+            let quoted: Vec<String> = self.topics.iter().map(|t| format!("{t:?}")).collect();
+            lines.push_str(&format!("topics = [{}]\n", quoted.join(", ")));
+        }
+
+        Ok(lines)
+    }
+}
+
 // ── ServerProcess ────────────────────────────────────────────────────
 
 /// A live `daemonseed-server` subprocess plus the temp data dir its
@@ -146,6 +280,18 @@ impl ServerProcess {
     /// spawned binary repeats the same init in its own process — two
     /// independent processes, no shared state.
     pub fn spawn(display_name: Option<&str>) -> Result<Self> {
+        Self::spawn_inner(display_name, None)
+    }
+
+    /// Like [`Self::spawn`] but seeds the relay's public space (ISC-S7/S8/S9)
+    /// from `seed`: the signed MOTD, announcement posts, and signer whitelist
+    /// are written into the server's data tempdir and referenced from its TOML
+    /// config, so the booted relay verify-and-serves them (ISC-A-S3).
+    pub fn spawn_seeded(display_name: Option<&str>, seed: &PublicSpaceSeed) -> Result<Self> {
+        Self::spawn_inner(display_name, Some(seed))
+    }
+
+    fn spawn_inner(display_name: Option<&str>, ps_seed: Option<&PublicSpaceSeed>) -> Result<Self> {
         ensure_module_operational();
 
         let port = pick_ephemeral_port()?;
@@ -169,8 +315,14 @@ impl ServerProcess {
         let display_line = display_name
             .map(|n| format!("display_name = \"{n}\"\n"))
             .unwrap_or_default();
+        // Public-space seed (optional): write the operator artifacts into the
+        // data tempdir and fold the path-bearing config lines into the TOML.
+        let public_space_lines = match ps_seed {
+            Some(s) => s.materialize(data_dir.path())?,
+            None => String::new(),
+        };
         let toml_text = format!(
-            "listen_addr = \"{addr}\"\nkey_path = {key:?}\n{display_line}",
+            "listen_addr = \"{addr}\"\nkey_path = {key:?}\n{display_line}{public_space_lines}",
             key = key_path,
         );
         std::fs::write(&config_path, toml_text).context("write server config")?;
@@ -795,6 +947,21 @@ impl Gate {
             );
         }
         Ok(())
+    }
+
+    /// Drive the daemon at `idx` from Chat focus into the Public Space pane
+    /// (7 Tabs: Chat→JoinCircle→Mute→Shares→Hide→Servers→TrustHistory→
+    /// PublicSpace). Opening the pane queues a `RefreshPublicSpace`, so the
+    /// MOTD + announcements fetch over the live `AppSession` begins
+    /// immediately; the caller then asserts on the rendered content. Returns
+    /// once the pane's footer ("public space") is on screen.
+    pub fn daemon_open_public_space(&mut self, idx: usize) -> Result<()> {
+        let daemon = self
+            .daemons
+            .get_mut(idx)
+            .ok_or_else(|| anyhow!("no daemon at index {idx}"))?;
+        daemon.send("\t\t\t\t\t\t\t")?; // 7 Tabs: Chat → … → PublicSpace
+        daemon.wait_for_visible("public space", Duration::from_secs(5))
     }
 
     /// Render a structured failure report — server log tails + each
