@@ -164,6 +164,20 @@ pub fn whitelist_from_wire(
     Ok(Whitelist::from_entries(out))
 }
 
+/// Decode a served post's inner payload into `(topic, body, signed_timestamp_ms)`
+/// for client rendering (ISC-S7). A payload that fails to decode renders as
+/// empty — the server validated it as a `PostPayload` at upload time
+/// (ISC-A-S3); this is belt-and-suspenders so a malformed post can never panic
+/// a rendering client. Provenance is a separate concern: pair this with
+/// [`verify_served_post`] to learn whether the post is whitelist-authorized.
+pub fn post_render_fields(post: &wire::Post) -> (String, String, i64) {
+    post.artifact
+        .as_ref()
+        .and_then(|a| wire::PostPayload::decode(a.signed_payload.as_slice()).ok())
+        .map(|p| (p.topic, p.body, p.signed_timestamp_ms))
+        .unwrap_or_default()
+}
+
 /// Why a server-served artifact failed client re-verification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServedVerifyError {

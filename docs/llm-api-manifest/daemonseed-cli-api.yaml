@@ -670,6 +670,24 @@ functions:
       description: The sanitized plaintext; a payload that fails to decode renders as empty.
     iscs: ["25"]
 
+  - name: post_render_fields
+    module: daemonseed_cli::public_space
+    description: >-
+      Decode a served post's inner payload into (topic, body, signed_timestamp_ms)
+      for client rendering (ISC-S7). A payload that fails to decode renders as
+      empty so a malformed post can never panic a rendering client; provenance
+      is a separate concern (pair with verify_served_post).
+    signature: "pub fn post_render_fields(post: &wire::Post) -> (String, String, i64)"
+    parameters:
+      - name: post
+        type: "&wire::Post"
+        direction: in
+        description: The served announcement post whose payload is decoded for display.
+    returns:
+      type: "(String, String, i64)"
+      description: "(topic, body, signed_timestamp_ms); empty strings / 0 on decode failure."
+    iscs: ["S7"]
+
   - name: select_rating
     module: daemonseed_cli::public_space
     description: >-

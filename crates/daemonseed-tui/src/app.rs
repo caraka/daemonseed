@@ -105,6 +105,13 @@ pub enum MainFocus {
     /// selected event's affordance per `(key, scope)` (ISC-A-C12 — no global
     /// dismissal). The main area shows the history instead of chat.
     TrustHistory,
+    /// The Public Space view (ISC-25 / ISC-S7 / ISC-A-S3): the connected relay's
+    /// MOTD (rendered inert) plus its announcement posts, each carrying a
+    /// client-side whitelist-verification verdict. Up/Down navigate the posts,
+    /// `r` requests a fresh snapshot. A read-only surface over already-shipped
+    /// server APIs (no new wire protocol). The main area shows the public space
+    /// instead of chat.
+    PublicSpace,
 }
 
 /// One indexed file in the user's own share, as rendered in the My-shares
@@ -119,6 +126,25 @@ pub struct LocalShareRow {
     pub size: u64,
     /// Last-modified time, milliseconds since the Unix epoch.
     pub mtime_unix_ms: u64,
+}
+
+/// One announcement post in the public-space view (ISC-S7), as a render-only
+/// projection kept local to the TUI so [`App`] does not depend on the wire
+/// `Post` type. `verified` is the client-side provenance verdict: the net actor
+/// re-ran `verify_served_post` against the relay's published signer whitelist
+/// (ISC-A-S3). A `false` verdict means the post failed signature /
+/// content-address verification and the render layer flags it rather than
+/// presenting it as authentic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicPostRow {
+    /// The post's topic (operator-defined channel).
+    pub topic: String,
+    /// The post body, as inert text.
+    pub body: String,
+    /// Whether the post passed client-side whitelist verification (ISC-A-S3).
+    pub verified: bool,
+    /// Signer's wall-clock at signing, unix ms (advisory ordering, ISC-S7).
+    pub sent_unix_ms: i64,
 }
 
 /// Indexer state as seen by the TUI (ISC-20 / ISC-A-C7). The line at the top
@@ -312,6 +338,18 @@ pub struct App {
     /// the share to fetch; the binary translates this into a
     /// `NetCommand::FetchShare`.
     pending_share_fetch: Option<(String, String)>,
+    /// The connected relay's rendered (inert) MOTD (ISC-25), `None` when the
+    /// relay publishes none.
+    public_motd: Option<String>,
+    /// Latest announcement-posts snapshot from the net actor (ISC-S7), each row
+    /// carrying its client-side whitelist-verification verdict (ISC-A-S3).
+    public_posts: Vec<PublicPostRow>,
+    /// Selected row index in the announcements pane (Up/Down moves it).
+    post_sel: usize,
+    /// A queued public-space refresh the binary should forward to the net actor
+    /// (drained once). Set when the user opens the Public Space pane or presses
+    /// `r`; the binary translates it into a `NetCommand::RefreshPublicSpace`.
+    pending_public_space_refresh: bool,
 }
 
 impl Default for App {
@@ -366,6 +404,10 @@ impl App {
             pending_share_refresh: false,
             fetch: None,
             pending_share_fetch: None,
+            public_motd: None,
+            public_posts: Vec::new(),
+            post_sel: 0,
+            pending_public_space_refresh: false,
         }
     }
 
@@ -490,6 +532,16 @@ impl App {
                 }
             }
             NetEvent::SharesError { message } => self.status = Some(message),
+            NetEvent::PublicSpaceSnapshot { motd, posts } => {
+                self.public_motd = motd;
+                self.public_posts = posts;
+                // Clamp the selection so it never points past the new list.
+                let max_idx = self.public_posts.len().saturating_sub(1);
+                if self.post_sel > max_idx {
+                    self.post_sel = max_idx;
+                }
+            }
+            NetEvent::PublicSpaceError { message } => self.status = Some(message),
             NetEvent::FetchProgress {
                 total_chunks,
                 chunks_received,
@@ -711,6 +763,29 @@ impl App {
         self.pending_share_fetch.take()
     }
 
+    /// The connected relay's rendered (inert) MOTD (ISC-25), for the Public
+    /// Space view's MOTD pane. `None` when the relay publishes no MOTD.
+    pub fn public_motd(&self) -> Option<&str> {
+        self.public_motd.as_deref()
+    }
+
+    /// Latest announcement posts (ISC-S7), for the Public Space view's
+    /// announcements pane. Each row carries its client-side verification verdict.
+    pub fn public_posts(&self) -> &[PublicPostRow] {
+        &self.public_posts
+    }
+
+    /// The selected announcement-post row index, for highlighting.
+    pub fn post_sel(&self) -> usize {
+        self.post_sel
+    }
+
+    /// Take a queued public-space refresh request (drained once by the binary,
+    /// which translates it into a `NetCommand::RefreshPublicSpace`).
+    pub fn take_pending_public_space_refresh(&mut self) -> bool {
+        std::mem::replace(&mut self.pending_public_space_refresh, false)
+    }
+
     /// @-mention autocomplete candidates for the current compose buffer
     /// (ISC-12 / C18). When composing and the buffer ends with a partial
     /// `@token` (no whitespace after the last `@`), returns the full wire
@@ -841,13 +916,20 @@ impl App {
                     MainFocus::Shares => MainFocus::Hide,
                     MainFocus::Hide => MainFocus::Servers,
                     MainFocus::Servers => MainFocus::TrustHistory,
-                    MainFocus::TrustHistory => MainFocus::Chat,
+                    MainFocus::TrustHistory => MainFocus::PublicSpace,
+                    MainFocus::PublicSpace => MainFocus::Chat,
                 };
                 // Opening the Shares pane requests a fresh snapshot — the
                 // alpha gate harness drives this through `RefreshShares` so
                 // the screen is never accidentally empty on first view.
                 if matches!(self.main_focus, MainFocus::Shares | MainFocus::Hide) {
                     self.pending_share_refresh = true;
+                }
+                // Opening the Public Space pane likewise requests a fresh
+                // snapshot, so the MOTD / announcements are never silently
+                // empty on first view (`RefreshPublicSpace`).
+                if matches!(self.main_focus, MainFocus::PublicSpace) {
+                    self.pending_public_space_refresh = true;
                 }
             }
             _ => match self.main_focus {
@@ -858,7 +940,28 @@ impl App {
                 MainFocus::Hide => self.on_key_hide(key),
                 MainFocus::Servers => self.on_key_servers(key),
                 MainFocus::TrustHistory => self.on_key_history(key),
+                MainFocus::PublicSpace => self.on_key_public_space(key),
             },
+        }
+    }
+
+    /// Public-space pane key handling (read-only display, ISC-25 / ISC-S7).
+    /// `Up` / `Down` move the announcement-post selection (clamped to the post
+    /// list); `r` requests a fresh snapshot. No write affordances: the public
+    /// space is a read surface for this client (publishing is operator-side).
+    fn on_key_public_space(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Up => self.post_sel = self.post_sel.saturating_sub(1),
+            KeyCode::Down => {
+                let max = self.public_posts.len().saturating_sub(1);
+                if self.post_sel < max {
+                    self.post_sel += 1;
+                }
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                self.pending_public_space_refresh = true;
+            }
+            _ => {}
         }
     }
 
@@ -1376,6 +1479,8 @@ mod tests {
         assert_eq!(app.main_focus(), MainFocus::Servers);
         app.on_key(press(KeyCode::Tab));
         assert_eq!(app.main_focus(), MainFocus::TrustHistory);
+        app.on_key(press(KeyCode::Tab));
+        assert_eq!(app.main_focus(), MainFocus::PublicSpace);
         app.on_key(press(KeyCode::Tab));
         assert_eq!(app.main_focus(), MainFocus::Chat);
     }
@@ -2343,5 +2448,119 @@ mod tests {
         }
         app.on_key(press(KeyCode::Enter));
         assert_eq!(app.share_sel(), 0, "clamped after hide");
+    }
+
+    // ── Public Space pane (ISC-25 / ISC-S7 / ISC-A-S3) ─────────────────────
+
+    /// Navigate to the Public Space view via the Tab cycle (7 hops from Chat).
+    fn to_public_space(app: &mut App) {
+        for _ in 0..7 {
+            app.on_key(press(KeyCode::Tab));
+        }
+        assert_eq!(app.main_focus(), MainFocus::PublicSpace);
+    }
+
+    fn post_row(topic: &str, body: &str, verified: bool) -> PublicPostRow {
+        PublicPostRow {
+            topic: topic.to_owned(),
+            body: body.to_owned(),
+            verified,
+            sent_unix_ms: 1,
+        }
+    }
+
+    /// ISC-25 / ISC-S7: a `PublicSpaceSnapshot` lands in App state and the view
+    /// renders the MOTD plus each announcement post.
+    #[test]
+    fn public_space_snapshot_lands_and_renders_motd_and_posts() {
+        let mut app = drive_to_main();
+        to_public_space(&mut app);
+        app.on_net_event(NetEvent::PublicSpaceSnapshot {
+            motd: Some("welcome to the relay".to_owned()),
+            posts: vec![post_row("announcements", "maintenance at 0200 UTC", true)],
+        });
+        assert_eq!(app.public_motd(), Some("welcome to the relay"));
+        assert_eq!(app.public_posts().len(), 1);
+        let text = render_text(&app, 120, 28);
+        assert!(text.contains("message of the day"), "MOTD pane titled");
+        assert!(text.contains("welcome to the relay"), "MOTD body rendered");
+        assert!(text.contains("announcements"), "post topic rendered");
+        assert!(
+            text.contains("maintenance at 0200 UTC"),
+            "post body rendered"
+        );
+    }
+
+    /// ISC-A-S3: a post that failed client-side whitelist verification is
+    /// flagged in the render, never presented as authentic.
+    #[test]
+    fn unverified_post_is_flagged() {
+        let mut app = drive_to_main();
+        to_public_space(&mut app);
+        app.on_net_event(NetEvent::PublicSpaceSnapshot {
+            motd: None,
+            posts: vec![post_row("announcements", "forged-by-relay", false)],
+        });
+        let text = render_text(&app, 120, 28);
+        assert!(
+            text.contains("unverified"),
+            "an unverifiable post is flagged (ISC-A-S3)"
+        );
+        // The "no MOTD" state renders its own distinct line.
+        assert!(
+            text.contains("no message of the day"),
+            "empty MOTD state shown"
+        );
+    }
+
+    /// Tabbing into the Public Space view queues a refresh so the pane is never
+    /// silently empty on first view (drained as `NetCommand::RefreshPublicSpace`).
+    #[test]
+    fn tab_to_public_space_queues_a_refresh() {
+        let mut app = drive_to_main();
+        to_public_space(&mut app);
+        assert!(
+            app.take_pending_public_space_refresh(),
+            "tabbing into Public Space queues a refresh"
+        );
+    }
+
+    /// `r` on the Public Space pane queues a fresh refresh.
+    #[test]
+    fn r_key_on_public_space_queues_a_refresh() {
+        let mut app = drive_to_main();
+        to_public_space(&mut app);
+        let _ = app.take_pending_public_space_refresh();
+        app.on_key(press(KeyCode::Char('r')));
+        assert!(app.take_pending_public_space_refresh());
+    }
+
+    /// Up/Down move the announcement-post selection, clamped to the list.
+    #[test]
+    fn up_down_moves_post_selection() {
+        let mut app = drive_to_main();
+        to_public_space(&mut app);
+        app.on_net_event(NetEvent::PublicSpaceSnapshot {
+            motd: None,
+            posts: vec![post_row("a", "first", true), post_row("a", "second", true)],
+        });
+        assert_eq!(app.post_sel(), 0);
+        app.on_key(press(KeyCode::Down));
+        assert_eq!(app.post_sel(), 1);
+        app.on_key(press(KeyCode::Down)); // saturates at last row
+        assert_eq!(app.post_sel(), 1);
+        app.on_key(press(KeyCode::Up));
+        assert_eq!(app.post_sel(), 0);
+    }
+
+    /// A `PublicSpaceError` surfaces on the status line and leaves any prior
+    /// snapshot in place.
+    #[test]
+    fn public_space_error_sets_status_line() {
+        let mut app = App::new();
+        app.on_net_event(NetEvent::PublicSpaceError {
+            message: "not connected to a relay yet".to_owned(),
+        });
+        assert_eq!(app.status(), Some("not connected to a relay yet"));
     }
 }

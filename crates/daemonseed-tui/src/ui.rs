@@ -57,6 +57,7 @@ fn render_main(app: &App, frame: &mut Frame) {
         MainFocus::Servers => render_server_list(app, frame, chunks[1]),
         MainFocus::TrustHistory => render_trust_history(app, frame, chunks[1]),
         MainFocus::Shares | MainFocus::Hide => render_shares(app, frame, chunks[1]),
+        MainFocus::PublicSpace => render_public_space(app, frame, chunks[1]),
         _ => render_chat_transcript(app, frame, chunks[1]),
     }
     render_main_input(app, frame, chunks[2]);
@@ -406,6 +407,87 @@ fn render_public_shares_pane(app: &App, frame: &mut Frame, area: Rect) {
     frame.render_widget(body, area);
 }
 
+/// The Public Space view (ISC-25 / ISC-S7 / ISC-A-S3): the connected relay's
+/// MOTD (rendered inert) stacked above its announcement posts. A read-only
+/// surface over already-shipped server APIs — there is no publish affordance on
+/// this client (publishing is operator-side).
+fn render_public_space(app: &App, frame: &mut Frame, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(6), Constraint::Min(3)])
+        .split(area);
+
+    render_motd_pane(app, frame, chunks[0]);
+    render_announcements_pane(app, frame, chunks[1]);
+}
+
+/// The MOTD pane (ISC-25): the relay's message of the day, already rendered
+/// inert by the net actor ([`daemonseed_cli::public_space::render_motd`] strips
+/// terminal control sequences). A `None` MOTD shows its own distinct line so
+/// the empty state is unambiguous (ISC-S9 — hide the MOTD area when unset).
+fn render_motd_pane(app: &App, frame: &mut Frame, area: Rect) {
+    let (text, color) = match app.public_motd() {
+        Some(motd) => (motd.to_owned(), Color::White),
+        None => ("(no message of the day)".to_owned(), Color::DarkGray),
+    };
+    let body = Paragraph::new(text).wrap(Wrap { trim: false }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" message of the day ")
+            .title_alignment(Alignment::Left)
+            .style(Style::default().fg(color)),
+    );
+    frame.render_widget(body, area);
+}
+
+/// The announcements pane (ISC-S7): the relay's posts, each prefixed with its
+/// client-side verification verdict (ISC-A-S3). An unverifiable post is flagged
+/// red as `⚠ unverified` rather than presented as authentic; the selected row
+/// is highlighted.
+fn render_announcements_pane(app: &App, frame: &mut Frame, area: Rect) {
+    let posts = app.public_posts();
+    let lines: Vec<Line> = if posts.is_empty() {
+        vec![
+            Line::from("(no announcements published by this relay)".to_owned())
+                .style(Style::default().fg(Color::DarkGray)),
+        ]
+    } else {
+        posts
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let marker = if i == app.post_sel() { "▶ " } else { "  " };
+                let mut spans = vec![Span::raw(marker.to_owned())];
+                if p.verified {
+                    spans.push(Span::styled(
+                        "✓ ".to_owned(),
+                        Style::default().fg(Color::Green),
+                    ));
+                } else {
+                    spans.push(Span::styled(
+                        "⚠ unverified ".to_owned(),
+                        Style::default().fg(Color::Red).bold(),
+                    ));
+                }
+                let row_style = if i == app.post_sel() {
+                    Style::default().fg(Color::Cyan).bold()
+                } else {
+                    Style::default()
+                };
+                spans.push(Span::styled(format!("[{}] {}", p.topic, p.body), row_style));
+                Line::from(spans)
+            })
+            .collect()
+    };
+    let body = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" announcements ")
+            .title_alignment(Alignment::Left),
+    );
+    frame.render_widget(body, area);
+}
+
 /// Top bar: connection state, circle state, persistent trust badges (ISC-23),
 /// and — when a close was observed — a distinct close-cause segment (ISC-28).
 fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
@@ -597,7 +679,11 @@ fn render_main_input(app: &App, frame: &mut Frame, area: Rect) {
             app.server_input().to_owned(),
         ),
         MainFocus::TrustHistory => (
-            "trust history  [↑/↓] select  [Enter] dismiss selected  [Tab] chat  [Esc] back",
+            "trust history  [↑/↓] select  [Enter] dismiss selected  [Tab] public-space  [Esc] back",
+            String::new(),
+        ),
+        MainFocus::PublicSpace => (
+            "public space  [↑/↓] select  [r] refresh  [Tab] chat  [Esc] back",
             String::new(),
         ),
     };

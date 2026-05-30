@@ -30,6 +30,9 @@ use std::sync::Arc;
 
 use daemonseed_cli::connect::{ConnectError, connect_session};
 use daemonseed_cli::identity_proof::ClientIdentity;
+use daemonseed_cli::public_space::{
+    post_render_fields, render_motd, verify_served_post, whitelist_from_wire,
+};
 use daemonseed_cli::session::AppSession;
 use daemonseed_core::backoff::{Backoff, CloseCause};
 use daemonseed_core::circle::key::{CotKey, derive_cot_key};
@@ -48,7 +51,7 @@ use daemonseed_proto::v1 as wire;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::app::{IndexerStatus, LocalShareRow};
+use crate::app::{IndexerStatus, LocalShareRow, PublicPostRow};
 
 /// A command from the UI to the network actor.
 #[derive(Debug, Clone)]
@@ -75,6 +78,12 @@ pub enum NetCommand {
     /// watcher are driven independently and the actor reports whatever state
     /// it observes. Emitted as a single [`NetEvent::SharesSnapshot`].
     RefreshShares,
+    /// Refresh the public-space snapshot (ISC-25 / ISC-S7 / ISC-A-S3): fetch the
+    /// connected relay's MOTD, announcement posts, and published signer
+    /// whitelist over the live [`AppSession`], render the MOTD as inert text,
+    /// and re-verify each post against the whitelist client-side. A read-only
+    /// operation emitted as a single [`NetEvent::PublicSpaceSnapshot`].
+    RefreshPublicSpace,
     /// Initiate a share fetch from the connected relay (ISC-19, F23 unified
     /// mechanism). Derives the public-share asset address from `share_id` +
     /// the connected server-id, opens a new bidi `CircleOfTrust.Subscribe`
@@ -157,6 +166,21 @@ pub enum NetEvent {
     /// rendering surfaces this on the status line; the cached snapshot is
     /// left in place so the user keeps seeing the last known state.
     SharesError { message: String },
+    /// A fresh public-space snapshot (ISC-25 / ISC-S7 / ISC-A-S3). `motd` is the
+    /// rendered, terminal-sanitized message of the day (`None` when the relay
+    /// publishes none); `posts` are the announcement posts, each carrying its
+    /// client-side whitelist-verification verdict. MOTD *signature*
+    /// re-verification is not done here — it requires the server's full pubkey,
+    /// which `ConnectOutcome` does not yet thread through (tracked follow-up);
+    /// the MOTD text is rendered inert (ANSI stripped) regardless.
+    PublicSpaceSnapshot {
+        motd: Option<String>,
+        posts: Vec<PublicPostRow>,
+    },
+    /// A `RefreshPublicSpace` command could not complete (no live session, a
+    /// refused RPC, or a malformed signer whitelist). Surfaced on the status
+    /// line; any previously-shown snapshot is left in place.
+    PublicSpaceError { message: String },
     /// Progress on an active share fetch (ISC-19). `total_chunks` is `None`
     /// while the fetcher is still waiting on the `ManifestResponse`, and
     /// `Some(N)` after the manifest arrives. Emitted at least once after the
@@ -299,6 +323,7 @@ async fn net_actor(
                 sender_handle,
             } => actor.handle_send_chat(&body, &sender_handle).await,
             NetCommand::RefreshShares => actor.handle_refresh_shares().await,
+            NetCommand::RefreshPublicSpace => actor.handle_refresh_public_space().await,
             NetCommand::FetchShare {
                 share_id,
                 sharer_handle,
@@ -552,6 +577,84 @@ impl Actor {
             remote,
             indexer_status,
         });
+    }
+
+    /// Fetch the connected relay's public space — MOTD, announcement posts, and
+    /// the published signer whitelist — and emit a single
+    /// [`NetEvent::PublicSpaceSnapshot`] (ISC-25 / ISC-S7 / ISC-A-S3).
+    ///
+    /// Provenance is established client-side, trusting nothing the relay
+    /// asserts: the signer whitelist is fetched first, then each post is
+    /// re-verified against it with [`verify_served_post`] (signature + content
+    /// address). The verdict travels in [`PublicPostRow::verified`] so the
+    /// render layer can flag an unverifiable post rather than present it as
+    /// authentic. The MOTD is rendered inert ([`render_motd`] strips terminal
+    /// control sequences, ISC-25); its *signature* is not re-checked here
+    /// because that needs the server's full pubkey, which the connect outcome
+    /// does not yet carry (tracked follow-up).
+    async fn handle_refresh_public_space(&mut self) {
+        let Some(session) = self.session.as_ref() else {
+            return self.emit(NetEvent::PublicSpaceError {
+                message: "not connected to a relay yet".to_owned(),
+            });
+        };
+        let mut ps = session.public_space();
+
+        // Whitelist first — post provenance verification depends on it.
+        let whitelist = match ps
+            .get_signer_whitelist(wire::GetSignerWhitelistRequest {})
+            .await
+        {
+            Ok(resp) => match whitelist_from_wire(&resp.into_inner().entries, None) {
+                Ok(wl) => wl,
+                Err(e) => {
+                    return self.emit(NetEvent::PublicSpaceError {
+                        message: format!("malformed signer whitelist: {e:?}"),
+                    });
+                }
+            },
+            Err(status) => {
+                return self.emit(NetEvent::PublicSpaceError {
+                    message: format!("signer-whitelist fetch refused: {}", status.message()),
+                });
+            }
+        };
+
+        // MOTD — rendered inert (ANSI stripped); absent is a normal state.
+        let motd = match ps.get_motd(wire::GetMotdRequest {}).await {
+            Ok(resp) => resp.into_inner().motd.as_ref().map(render_motd),
+            Err(status) => {
+                return self.emit(NetEvent::PublicSpaceError {
+                    message: format!("MOTD fetch refused: {}", status.message()),
+                });
+            }
+        };
+
+        // Posts — each re-verified against the whitelist (ISC-A-S3 client half).
+        let posts = match ps.list_posts(wire::ListPostsRequest { topic: None }).await {
+            Ok(resp) => resp
+                .into_inner()
+                .posts
+                .iter()
+                .map(|p| {
+                    let verified = verify_served_post(p, &whitelist).is_ok();
+                    let (topic, body, sent_unix_ms) = post_render_fields(p);
+                    PublicPostRow {
+                        topic,
+                        body,
+                        verified,
+                        sent_unix_ms,
+                    }
+                })
+                .collect(),
+            Err(status) => {
+                return self.emit(NetEvent::PublicSpaceError {
+                    message: format!("posts fetch refused: {}", status.message()),
+                });
+            }
+        };
+
+        self.emit(NetEvent::PublicSpaceSnapshot { motd, posts });
     }
 
     /// Initiate a share fetch (ISC-19, F23 unified mechanism). Opens a fresh
@@ -1076,6 +1179,28 @@ mod tests {
             match evt_rx.try_recv() {
                 Ok(NetEvent::ChatError { message }) => assert!(message.contains("join a circle")),
                 other => panic!("expected ChatError, got {other:?}"),
+            }
+        });
+    }
+
+    /// Refreshing the public space before connecting emits PublicSpaceError, not
+    /// a panic — the actor's prerequisite guard mirrors the shares/chat paths.
+    #[test]
+    fn refresh_public_space_without_session_fails_cleanly() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let (evt_tx, mut evt_rx) = mpsc::unbounded_channel();
+            let mut actor = bare_actor(evt_tx);
+            actor.handle_refresh_public_space().await;
+            match evt_rx.try_recv() {
+                Ok(NetEvent::PublicSpaceError { message }) => {
+                    assert!(message.contains("not connected"));
+                }
+                other => panic!("expected PublicSpaceError, got {other:?}"),
             }
         });
     }
