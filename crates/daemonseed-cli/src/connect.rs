@@ -66,6 +66,12 @@ pub struct ConnectOutcome {
     /// `claimed_handle`, proven self-consistent and equal to the dialed
     /// server-id).
     pub server_handle: String,
+    /// The relay's full ML-DSA-87 public key, as TOFU-pinned by the C22 trust
+    /// slider during this connect (`apply_trust` just pinned exactly these
+    /// bytes). Carried out so a client can verify server-signed artifacts —
+    /// the deprecation policy (ISC-C25 / ISC-A-S11) and, later, the MOTD —
+    /// against the key it already trusts, never one the relay newly asserts.
+    pub server_pubkey: Vec<u8>,
     /// A non-blocking key-rotation notice (ISC-C22): `Some(fingerprint)` when a
     /// trusted-mode server presented a new key that wasn't dismissed. The
     /// connection still succeeded; the caller surfaces this to the user.
@@ -265,6 +271,7 @@ pub async fn connect_session(
         version,
         dialled: address.to_owned(),
         server_handle: verified.handle().to_owned(),
+        server_pubkey: verified.pubkey().to_vec(),
         rotation_notice,
     };
     Ok((outcome, tls))

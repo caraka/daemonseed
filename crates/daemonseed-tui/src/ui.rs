@@ -58,6 +58,7 @@ fn render_main(app: &App, frame: &mut Frame) {
         MainFocus::TrustHistory => render_trust_history(app, frame, chunks[1]),
         MainFocus::Shares | MainFocus::Hide => render_shares(app, frame, chunks[1]),
         MainFocus::PublicSpace => render_public_space(app, frame, chunks[1]),
+        MainFocus::Deprecation => render_deprecation(app, frame, chunks[1]),
         _ => render_chat_transcript(app, frame, chunks[1]),
     }
     render_main_input(app, frame, chunks[2]);
@@ -488,6 +489,69 @@ fn render_announcements_pane(app: &App, frame: &mut Frame, area: Rect) {
     frame.render_widget(body, area);
 }
 
+/// The deprecation pane (ISC-C25 / ISC-A-S11 / ISC-C28): the connected relay's
+/// verified suite-deprecation policy, surfaced as one warning row per in-use
+/// suite scheduled for retirement. Each row leads with a single hyphenated
+/// status token — `suite-deprecation-cutoff-hit` (blocking, already refused) or
+/// `suite-deprecation-pending` (still advisory) — matching the frozen stable
+/// trust-event strings, so a PTY scrape can match the token without a
+/// space-split breaking it. A `None` / unaffected / no-policy state shows its
+/// own distinct line so the empty case is unambiguous.
+fn render_deprecation(app: &App, frame: &mut Frame, area: Rect) {
+    let warnings = app.deprecation_warnings();
+    let header = match app.deprecation_policy_version() {
+        Some(v) => format!("deprecation policy v{v}"),
+        None => "deprecation policy (none fetched)".to_owned(),
+    };
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(header, Style::default().fg(Color::Gray))),
+        Line::from(String::new()),
+    ];
+
+    if warnings.is_empty() {
+        let empty = if app.deprecation_had_policy() {
+            "(no in-use suite is scheduled for deprecation)"
+        } else {
+            "(this relay serves no deprecation policy)"
+        };
+        lines.push(Line::from(empty).style(Style::default().fg(Color::DarkGray)));
+    } else {
+        for (i, w) in warnings.iter().enumerate() {
+            let marker = if i == app.dep_sel() { "▶ " } else { "  " };
+            let (token, color) = if w.past_cutoff {
+                ("suite-deprecation-cutoff-hit", Color::Red)
+            } else {
+                ("suite-deprecation-pending", Color::Yellow)
+            };
+            let row_style = if i == app.dep_sel() {
+                Style::default().fg(Color::Cyan).bold()
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(vec![
+                Span::raw(marker.to_owned()),
+                Span::styled(format!("⚠ {token} "), Style::default().fg(color).bold()),
+                Span::styled(
+                    format!(
+                        "suite-{:#06x} cutoff-unix-ms={} recommended-suite-{:#06x}",
+                        w.suite_id, w.cutoff_unix_ms, w.recommended_suite_id
+                    ),
+                    row_style,
+                ),
+            ]));
+        }
+    }
+
+    let body = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" suite deprecation ")
+            .title_alignment(Alignment::Left),
+    );
+    frame.render_widget(body, area);
+}
+
 /// Top bar: connection state, circle state, persistent trust badges (ISC-23),
 /// and — when a close was observed — a distinct close-cause segment (ISC-28).
 fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
@@ -683,7 +747,11 @@ fn render_main_input(app: &App, frame: &mut Frame, area: Rect) {
             String::new(),
         ),
         MainFocus::PublicSpace => (
-            "public space  [↑/↓] select  [r] refresh  [Tab] chat  [Esc] back",
+            "public space  [↑/↓] select  [r] refresh  [Tab] deprecation  [Esc] back",
+            String::new(),
+        ),
+        MainFocus::Deprecation => (
+            "suite deprecation  [↑/↓] select  [r] refresh  [Tab] chat  [Esc] back",
             String::new(),
         ),
     };

@@ -244,6 +244,53 @@ impl PublicSpaceSeed {
     }
 }
 
+/// A suite-deprecation policy seed (ISC-S16 / ISC-A-S11 / ISC-C25). Unlike
+/// [`PublicSpaceSeed`], nothing is pre-signed here: the server builds and signs
+/// the policy from its `[crypto]` config under its own identity key at boot
+/// (`daemonseed_server::deprecation::build_signed_deprecation_policy`), so the
+/// signer is the same server-wide key the client TOFU-pins at connect — which
+/// is exactly what the client's `verify_policy` checks against. This seed only
+/// emits the `[crypto]` TOML block the booted relay consumes.
+pub struct DeprecationSeed {
+    /// Monotonic policy version (must be ≥ 1; version 0 publishes nothing).
+    version: u64,
+    /// `(suite_id, cutoff_unix_ms, recommended_suite_id)` per cutoff.
+    entries: Vec<(u16, i64, u16)>,
+}
+
+impl DeprecationSeed {
+    /// Deprecate `suite_id` (recommending `recommended_suite_id`) with a cutoff
+    /// three hours out — comfortably past the F30 minimum lead (2× the one-hour
+    /// cache TTL) the server enforces at boot, and still in the future at fetch
+    /// time so the client surfaces a *pending* (not cutoff-hit) warning.
+    pub fn pending(version: u64, suite_id: u16, recommended_suite_id: u16) -> Self {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let cutoff = now_ms + 3 * 3_600_000;
+        Self {
+            version,
+            entries: vec![(suite_id, cutoff, recommended_suite_id)],
+        }
+    }
+
+    /// The `[crypto]` config block, appended verbatim after the server's
+    /// top-level TOML keys (a table header must follow the bare key section).
+    fn to_toml_block(&self) -> String {
+        let mut s = format!(
+            "\n[crypto]\ndeprecation_policy_version = {}\n",
+            self.version
+        );
+        for (suite_id, cutoff_unix_ms, recommended_suite_id) in &self.entries {
+            s.push_str(&format!(
+                "[[crypto.deprecation]]\nsuite_id = {suite_id}\ncutoff_unix_ms = {cutoff_unix_ms}\nrecommended_suite_id = {recommended_suite_id}\n"
+            ));
+        }
+        s
+    }
+}
+
 // ── ServerProcess ────────────────────────────────────────────────────
 
 /// A live `daemonseed-server` subprocess plus the temp data dir its
@@ -280,7 +327,7 @@ impl ServerProcess {
     /// spawned binary repeats the same init in its own process — two
     /// independent processes, no shared state.
     pub fn spawn(display_name: Option<&str>) -> Result<Self> {
-        Self::spawn_inner(display_name, None)
+        Self::spawn_inner(display_name, None, None)
     }
 
     /// Like [`Self::spawn`] but seeds the relay's public space (ISC-S7/S8/S9)
@@ -288,10 +335,25 @@ impl ServerProcess {
     /// are written into the server's data tempdir and referenced from its TOML
     /// config, so the booted relay verify-and-serves them (ISC-A-S3).
     pub fn spawn_seeded(display_name: Option<&str>, seed: &PublicSpaceSeed) -> Result<Self> {
-        Self::spawn_inner(display_name, Some(seed))
+        Self::spawn_inner(display_name, Some(seed), None)
     }
 
-    fn spawn_inner(display_name: Option<&str>, ps_seed: Option<&PublicSpaceSeed>) -> Result<Self> {
+    /// Like [`Self::spawn`] but seeds a `[crypto]` suite-deprecation policy
+    /// (ISC-S16 / ISC-A-S11): the booted relay builds + signs it under its own
+    /// identity key and serves it over `PublicSpace.GetDeprecationPolicy`, so a
+    /// daemon's Deprecation pane fetches, verifies, and surfaces it (ISC-C25).
+    pub fn spawn_seeded_with_deprecation(
+        display_name: Option<&str>,
+        dep: &DeprecationSeed,
+    ) -> Result<Self> {
+        Self::spawn_inner(display_name, None, Some(dep))
+    }
+
+    fn spawn_inner(
+        display_name: Option<&str>,
+        ps_seed: Option<&PublicSpaceSeed>,
+        dep_seed: Option<&DeprecationSeed>,
+    ) -> Result<Self> {
         ensure_module_operational();
 
         let port = pick_ephemeral_port()?;
@@ -321,8 +383,14 @@ impl ServerProcess {
             Some(s) => s.materialize(data_dir.path())?,
             None => String::new(),
         };
+        // The deprecation `[crypto]` block (if any) is a TOML table, so it must
+        // come last — after every bare top-level key the lines above emit.
+        let deprecation_lines = match dep_seed {
+            Some(d) => d.to_toml_block(),
+            None => String::new(),
+        };
         let toml_text = format!(
-            "listen_addr = \"{addr}\"\nkey_path = {key:?}\n{display_line}{public_space_lines}",
+            "listen_addr = \"{addr}\"\nkey_path = {key:?}\n{display_line}{public_space_lines}{deprecation_lines}",
             key = key_path,
         );
         std::fs::write(&config_path, toml_text).context("write server config")?;
@@ -962,6 +1030,22 @@ impl Gate {
             .ok_or_else(|| anyhow!("no daemon at index {idx}"))?;
         daemon.send("\t\t\t\t\t\t\t")?; // 7 Tabs: Chat → … → PublicSpace
         daemon.wait_for_visible("public space", Duration::from_secs(5))
+    }
+
+    /// Drive the daemon at `idx` from Chat focus into the Deprecation pane
+    /// (8 Tabs: Chat→JoinCircle→Mute→Shares→Hide→Servers→TrustHistory→
+    /// PublicSpace→Deprecation). Opening the pane queues a `RefreshDeprecation`,
+    /// so the signed-policy fetch + ML-DSA verification over the live
+    /// `AppSession` begins immediately; the caller then asserts on the rendered
+    /// warning rows. Returns once the pane's footer ("suite deprecation") is on
+    /// screen.
+    pub fn daemon_open_deprecation(&mut self, idx: usize) -> Result<()> {
+        let daemon = self
+            .daemons
+            .get_mut(idx)
+            .ok_or_else(|| anyhow!("no daemon at index {idx}"))?;
+        daemon.send("\t\t\t\t\t\t\t\t")?; // 8 Tabs: Chat → … → Deprecation
+        daemon.wait_for_visible("suite deprecation", Duration::from_secs(5))
     }
 
     /// Render a structured failure report — server log tails + each

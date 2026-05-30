@@ -48,8 +48,8 @@ modules:
       Mute → Servers → TrustHistory.
     no_std: false
     depends_on: [daemonseed-core, "daemonseed_tui::screens::first_start"]
-    iscs: ["1", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", C16, C26, C28, A-C3, A-C7, A-C12, F23]
-    added_in: "M11 scaffold + chat + trust/server + C28 + shares + fetch workstream"
+    iscs: ["1", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", C16, C25, C26, C28, A-S3, A-S11, A-C3, A-C7, A-C12, F23]
+    added_in: "M11 scaffold + chat + trust/server + C28 + shares + fetch + public-space + deprecation workstream"
 
   - name: daemonseed_tui::net
     description: >-
@@ -73,7 +73,16 @@ modules:
       CircleOfTrust.Subscribe stream over the existing AppSession, sends a
       ManifestRequest, reads a ManifestResponse, then issues one ChunkRequest
       per entry, verifies SHA-384 over each ChunkResponse, and emits progress
-      events; fail-closed on any hash mismatch).
+      events; fail-closed on any hash mismatch),
+      RefreshDeprecation (ISC-C25 / A-S11 — fetch the relay's signed
+      GetDeprecationPolicy artifact, verify its ML-DSA-87 signature against the
+      TOFU-pinned server-wide key, anti-rollback-check against the PolicyCache
+      version, reuse core assess_deprecation over the in-use suite set; the pure
+      decide_deprecation decides the outcome so it is unit-testable without a
+      session — a withdrawn-after-cached policy is treated as rollback, a
+      missing/short key fails closed, and affected-suite trust events emit only on
+      a version bump or a blocking cutoff-hit so a dismissed warning never
+      resurrects).
       Events: Connected/ConnectFailed, CircleJoined/CircleJoinFailed,
       ChatMessage, ChatError, TrustEvent (a C28 trust-event key + scope, routed
       by the UI per its affordance class), ConnectionClosed (a C26 close-cause
@@ -82,7 +91,10 @@ modules:
       SharesError (RPC or storage failure surfaced on the status line),
       FetchProgress ({ total_chunks: Option<u32>, chunks_received, bytes_received
       } — first event after manifest arrives), FetchComplete ({ share_id,
-      files_written, bytes_written }), FetchError ({ message } — terminal).
+      files_written, bytes_written }), FetchError ({ message } — terminal),
+      DeprecationSnapshot ({ policy_version: Option<u64>, warnings:
+      Vec<DeprecationWarningRow>, had_policy: bool } — ISC-C25), DeprecationError
+      ({ message } — surfaced on the status line, cached warnings kept intact).
       On connect failure the actor categorizes the error into a CloseCause
       and emits the warranted trust event: an actionable key directly
       (ServerKeyMismatch / NoCommonVersion, Blocking), else the uniform rate-limit
@@ -91,8 +103,8 @@ modules:
       Foreign/undecryptable inbound frames are skipped.
     no_std: false
     depends_on: [daemonseed-cli, daemonseed-core, daemonseed-proto]
-    iscs: ["10", "14", "16", "17", "19", "20", "22", "23", "24", "28", "47", C15, C17, C21, C22, C26, C28, C37, A-S2, A-C7, A-S12, F23]
-    added_in: "M11 connect + chat + C28 + shares + fetch workstream"
+    iscs: ["10", "14", "16", "17", "19", "20", "22", "23", "24", "25", "28", "47", C15, C17, C21, C22, C25, C26, C28, C37, A-S2, A-S3, A-S11, A-C7, A-S12, F23]
+    added_in: "M11 connect + chat + C28 + shares + fetch + public-space + deprecation workstream"
 
   - name: daemonseed_tui::screens::first_start
     description: >-
@@ -168,6 +180,15 @@ public_types:
       - "fn take_pending_share_refresh(&mut self) -> bool  # drained into NetCommand::RefreshShares"
       - "fn fetch(&self) -> Option<&FetchUi>               # ISC-19 active fetch overlay"
       - "fn take_pending_share_fetch(&mut self) -> Option<(String, String)>  # drained into NetCommand::FetchShare"
+      - "fn public_motd(&self) -> Option<&str>             # ISC-25 inert MOTD pane"
+      - "fn public_posts(&self) -> &[PublicPostRow]         # ISC-S7 announcements pane"
+      - "fn post_sel(&self) -> usize                        # announcements row selection"
+      - "fn take_pending_public_space_refresh(&mut self) -> bool  # drained into NetCommand::RefreshPublicSpace"
+      - "fn deprecation_warnings(&self) -> &[DeprecationWarningRow]  # ISC-C25 affected-suite warning rows"
+      - "fn deprecation_policy_version(&self) -> Option<u64>  # ISC-A-S11 accepted policy version"
+      - "fn deprecation_had_policy(&self) -> bool           # distinguishes no-policy from no-suite-affected"
+      - "fn dep_sel(&self) -> usize                         # deprecation-warning row selection"
+      - "fn take_pending_deprecation_refresh(&mut self) -> bool  # drained into NetCommand::RefreshDeprecation"
       - "fn on_net_event(&mut self, event: NetEvent)"
       - "fn on_key(&mut self, key: KeyEvent)"
   - name: daemonseed_tui::app::Screen
@@ -179,11 +200,17 @@ public_types:
     description: "One rendered chat line: sender (self-asserted handle), body, sent_unix_ms (0 for a local echo of a just-sent message, which the relay never reflects to its sender). ISC-10."
   - name: daemonseed_tui::app::MainFocus
     kind: enum
-    description: "Which Main-view input has keyboard focus (Tab cycles Chat → JoinCircle → Mute → Shares → Hide → Servers → TrustHistory). Chat (compose, Enter sends, ISC-14); JoinCircle (phrase, Enter joins, ISC-15/16); Mute (full handle, Enter toggles the client-local mute set, ISC-13 / A-C3); Shares (two-pane My/Public shares view; Up/Down selects, r refreshes, ISC-17/20); Hide (full sharer-handle, Enter toggles the client-local hidden-shares set, ISC-18 / C16 / A-C3 — Shares view stays visible); Servers (F22 server-management — main area shows the server list; Enter adds or connects-selected, Left/Right slides trust, Up/Down selects, ISC-21/26/27); TrustHistory (main area shows the C28 trust-event audit log; Up/Down select, Enter dismisses per (key, scope), ISC-25 / A-C12)."
-    variants: [Chat, JoinCircle, Mute, Shares, Hide, Servers, TrustHistory]
+    description: "Which Main-view input has keyboard focus (Tab cycles Chat → JoinCircle → Mute → Shares → Hide → Servers → TrustHistory → PublicSpace → Deprecation → Chat). Chat (compose, Enter sends, ISC-14); JoinCircle (phrase, Enter joins, ISC-15/16); Mute (full handle, Enter toggles the client-local mute set, ISC-13 / A-C3); Shares (two-pane My/Public shares view; Up/Down selects, r refreshes, ISC-17/20); Hide (full sharer-handle, Enter toggles the client-local hidden-shares set, ISC-18 / C16 / A-C3 — Shares view stays visible); Servers (F22 server-management — main area shows the server list; Enter adds or connects-selected, Left/Right slides trust, Up/Down selects, ISC-21/26/27); TrustHistory (main area shows the C28 trust-event audit log; Up/Down select, Enter dismisses per (key, scope), ISC-25 / A-C12); PublicSpace (read-only MOTD + announcements view; Up/Down selects, r refreshes, ISC-25 / S7 / A-S3); Deprecation (read-only verified suite-deprecation warnings; Up/Down selects, r refreshes, ISC-C25 / A-S11 / C28)."
+    variants: [Chat, JoinCircle, Mute, Shares, Hide, Servers, TrustHistory, PublicSpace, Deprecation]
   - name: daemonseed_tui::app::LocalShareRow
     kind: struct
     description: "One indexed file in the user's own share, as rendered in the My-shares pane (ISC-17 / C21). A render-only projection of daemonseed_core::storage::share_index::ShareEntry: rel_path, size, mtime_unix_ms."
+  - name: daemonseed_tui::app::DeprecationWarningRow
+    kind: struct
+    description: "One affected-suite warning in the Deprecation pane (ISC-C25), a render-only projection of core's DeprecationEntry built by the net actor via daemonseed_core::trust_events::assess_deprecation: suite_id (u16), cutoff_unix_ms (i64), recommended_suite_id (u16), past_cutoff (bool — blocking cutoff-hit vs still-advisory pending)."
+  - name: daemonseed_tui::app::PublicPostRow
+    kind: struct
+    description: "One announcement post in the Public Space pane (ISC-S7), a render-only projection of the wire Post: topic, body (inert), verified (client-side ISC-A-S3 whitelist verdict), sent_unix_ms."
   - name: daemonseed_tui::app::IndexerStatus
     kind: enum
     description: "Indexer state as seen by the TUI (ISC-20 / A-C7): Idle (no share root configured), Indexing { seen, total: Option<u64> } (cold/incremental scan running), Ready { entries }. The status line at the top of the My-shares pane reflects this; transitions never gate user input."

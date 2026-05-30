@@ -39,19 +39,20 @@ use daemonseed_core::circle::key::{CotKey, derive_cot_key};
 use daemonseed_core::circle::message::{open_message, seal_message};
 use daemonseed_core::cot::public_share_asset_address;
 use daemonseed_core::cot::{AssetAddr, asset_address};
-use daemonseed_core::crypto::suite::CNSA_2_0;
+use daemonseed_core::crypto::deprecation::{PolicyCache, PolicyError, verify_policy};
+use daemonseed_core::crypto::suite::{CNSA_2_0, SuiteId};
 use daemonseed_core::federation::store::{InMemoryTrustStore, ServerEntry, TrustStore};
 use daemonseed_core::handle::Handle;
 use daemonseed_core::share_envelope::ShareFrame;
 use daemonseed_core::storage::cas::chunk_addr;
 use daemonseed_core::storage::seeds::CounterState;
 use daemonseed_core::storage::share_index::ShareIndex;
-use daemonseed_core::trust_events::TrustEventKey;
+use daemonseed_core::trust_events::{TrustEventKey, assess_deprecation, unreadable_policy_event};
 use daemonseed_proto::v1 as wire;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::app::{IndexerStatus, LocalShareRow, PublicPostRow};
+use crate::app::{DeprecationWarningRow, IndexerStatus, LocalShareRow, PublicPostRow};
 
 /// A command from the UI to the network actor.
 #[derive(Debug, Clone)]
@@ -84,6 +85,17 @@ pub enum NetCommand {
     /// and re-verify each post against the whitelist client-side. A read-only
     /// operation emitted as a single [`NetEvent::PublicSpaceSnapshot`].
     RefreshPublicSpace,
+    /// Refresh the suite-deprecation policy (ISC-C25 / ISC-A-S11 / ISC-C28):
+    /// fetch the connected relay's signed policy over the live [`AppSession`],
+    /// verify its ML-DSA-87 signature against the pinned server-wide key,
+    /// anti-rollback-check it against the cached version, and surface a warning
+    /// row for each in-use suite the policy schedules for retirement. A
+    /// read-only operation; a verified policy emits a
+    /// [`NetEvent::DeprecationSnapshot`] (and one [`NetEvent::TrustEvent`] per
+    /// newly-surfaced affected suite), while a rollback / unverifiable /
+    /// withdrawn policy emits a [`NetEvent::DeprecationError`] plus the matching
+    /// trust event and leaves the cached warnings in place.
+    RefreshDeprecation,
     /// Initiate a share fetch from the connected relay (ISC-19, F23 unified
     /// mechanism). Derives the public-share asset address from `share_id` +
     /// the connected server-id, opens a new bidi `CircleOfTrust.Subscribe`
@@ -181,6 +193,25 @@ pub enum NetEvent {
     /// refused RPC, or a malformed signer whitelist). Surfaced on the status
     /// line; any previously-shown snapshot is left in place.
     PublicSpaceError { message: String },
+    /// A fresh deprecation-policy snapshot (ISC-C25). `warnings` carries one row
+    /// per in-use suite the verified policy schedules for retirement (empty when
+    /// no in-use suite is affected); `policy_version` is the accepted monotonic
+    /// version (`None` when the relay serves no policy); `had_policy` is `true`
+    /// only when a verified policy was actually served, distinguishing
+    /// "no policy configured" from "policy served but nothing in use affected".
+    DeprecationSnapshot {
+        policy_version: Option<u64>,
+        warnings: Vec<DeprecationWarningRow>,
+        had_policy: bool,
+    },
+    /// A `RefreshDeprecation` command could not complete (no live session, a
+    /// refused RPC, a rollback/withdrawal, a signature/verification failure, or
+    /// a missing/short pinned key). Surfaced on the status line; the cached
+    /// warning rows are deliberately left in place (a rollback must not blank
+    /// the state the anti-rollback check protects). The matching trust event
+    /// (`ServerDeprecationPolicyRollback` / `ServerDeprecationPolicyUnreadable`)
+    /// arrives separately as a [`NetEvent::TrustEvent`].
+    DeprecationError { message: String },
     /// Progress on an active share fetch (ISC-19). `total_chunks` is `None`
     /// while the fetcher is still waiting on the `ManifestResponse`, and
     /// `Some(N)` after the manifest arrives. Emitted at least once after the
@@ -293,6 +324,18 @@ struct Actor {
     /// to a background cold scan in a future commit without giving up the
     /// foreground query path.
     share_index: Option<Arc<ShareIndex>>,
+    /// The connected relay's pinned server-wide public key (ISC-A-S11),
+    /// captured from [`daemonseed_cli::connect::ConnectOutcome`] at connect.
+    /// This is the TOFU-pinned key `apply_trust` already accepted, so verifying
+    /// the deprecation policy against it trusts nothing the relay newly asserts.
+    /// `None` until a connect succeeds; a deprecation refresh without it fails
+    /// closed (an unverifiable policy is never accepted, ISC-C25).
+    server_pubkey: Option<Vec<u8>>,
+    /// Per-server deprecation-policy cache (ISC-C25 / ISC-A-S11): tracks the
+    /// highest accepted `policy_version` for anti-rollback and the fetch time
+    /// for the one-hour TTL. Anti-rollback "just works" by feeding
+    /// [`PolicyCache::cached_version`] into [`verify_policy`].
+    policy_cache: PolicyCache,
 }
 
 /// The actor loop: receive commands and drive each on the current-thread
@@ -309,6 +352,8 @@ async fn net_actor(
         circle: None,
         backoff: Backoff::new(),
         share_index: None,
+        server_pubkey: None,
+        policy_cache: PolicyCache::new(),
     };
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
@@ -324,6 +369,7 @@ async fn net_actor(
             } => actor.handle_send_chat(&body, &sender_handle).await,
             NetCommand::RefreshShares => actor.handle_refresh_shares().await,
             NetCommand::RefreshPublicSpace => actor.handle_refresh_public_space().await,
+            NetCommand::RefreshDeprecation => actor.handle_refresh_deprecation().await,
             NetCommand::FetchShare {
                 share_id,
                 sharer_handle,
@@ -376,6 +422,9 @@ impl Actor {
                 Ok(session) => {
                     self.session = Some(session);
                     self.server_id = Some(server_id.to_owned());
+                    // Capture the TOFU-pinned server-wide key for client-side
+                    // deprecation-policy verification (ISC-C25 / ISC-A-S11).
+                    self.server_pubkey = Some(outcome.server_pubkey.clone());
                     self.backoff.reset();
                     // A trusted-mode key rotation is a PersistentNonBlocking
                     // trust event (ISC-C22/C28): the connect succeeded, but the
@@ -655,6 +704,79 @@ impl Actor {
         };
 
         self.emit(NetEvent::PublicSpaceSnapshot { motd, posts });
+    }
+
+    /// Fetch, verify, and surface the connected relay's signed suite-deprecation
+    /// policy (ISC-C25 / ISC-A-S11 / ISC-C28).
+    ///
+    /// The decision logic — `None`-handling, signature + rollback verification,
+    /// and version-gated trust-event emission — lives in the pure
+    /// [`decide_deprecation`] so every branch is unit-testable without a live
+    /// session. This method does only the I/O: read the cached version, fetch
+    /// the RPC, then apply the decision's cache write and emits. The policy is
+    /// verified against [`Self::server_pubkey`] — the TOFU-pinned key the connect
+    /// path already accepted — so verification trusts nothing the relay newly
+    /// asserts.
+    async fn handle_refresh_deprecation(&mut self) {
+        let Some(session) = self.session.as_ref() else {
+            return self.emit(NetEvent::DeprecationError {
+                message: "not connected to a relay yet".to_owned(),
+            });
+        };
+        let Some(server_id) = self.server_id.clone() else {
+            return self.emit(NetEvent::DeprecationError {
+                message: "no server-id for the connected relay".to_owned(),
+            });
+        };
+        let server_pubkey = self.server_pubkey.clone();
+        let now = now_unix_ms();
+        let prev_version = self.policy_cache.cached_version(&server_id);
+
+        let mut ps = session.public_space();
+        let artifact = match ps
+            .get_deprecation_policy(wire::GetDeprecationPolicyRequest {})
+            .await
+        {
+            Ok(resp) => resp.into_inner().policy,
+            Err(status) => {
+                return self.emit(NetEvent::DeprecationError {
+                    message: format!("deprecation-policy fetch refused: {}", status.message()),
+                });
+            }
+        };
+
+        let decision = decide_deprecation(
+            prev_version,
+            artifact.as_ref(),
+            server_pubkey.as_deref(),
+            &[CNSA_2_0.id],
+            now,
+        );
+
+        // Persist the accepted policy so the next fetch's anti-rollback baseline
+        // and TTL are correct (ISC-C25). Done before emitting so an observer
+        // draining events sees a consistent cache.
+        if let Some(policy) = decision.cache_policy {
+            self.policy_cache.insert(&server_id, policy, now);
+        }
+        // Trust events first (ISC-C28 taxonomy routing), each scoped to this
+        // server for per-(key, server) dismissal (ISC-A-C12).
+        for key in decision.trust_keys {
+            self.emit(NetEvent::TrustEvent {
+                key,
+                server_id: Some(server_id.clone()),
+            });
+        }
+        if let Some(snapshot) = decision.snapshot {
+            self.emit(NetEvent::DeprecationSnapshot {
+                policy_version: snapshot.policy_version,
+                warnings: snapshot.warnings,
+                had_policy: snapshot.had_policy,
+            });
+        }
+        if let Some(message) = decision.error {
+            self.emit(NetEvent::DeprecationError { message });
+        }
     }
 
     /// Initiate a share fetch (ISC-19, F23 unified mechanism). Opens a fresh
@@ -967,6 +1089,156 @@ fn now_unix_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// The cacheable + renderable result of evaluating a fetched deprecation policy
+/// (ISC-C25). Produced by the pure [`decide_deprecation`] so the verification,
+/// rollback, and version-gating logic is unit-testable without a live session.
+struct DeprecationDecision {
+    /// The snapshot to emit, or `None` on an error path — an error deliberately
+    /// leaves the cached warning rows in place rather than blanking them.
+    snapshot: Option<DeprecationSnapshotData>,
+    /// A human-readable cause to emit as [`NetEvent::DeprecationError`], or
+    /// `None` on success.
+    error: Option<String>,
+    /// Trust-event keys to emit (each scoped to the server by the caller).
+    trust_keys: Vec<TrustEventKey>,
+    /// The verified policy to insert into the cache, or `None` when nothing
+    /// valid was accepted (every error path leaves the cache untouched).
+    cache_policy: Option<daemonseed_core::crypto::deprecation::DeprecationPolicy>,
+}
+
+/// The payload of a [`NetEvent::DeprecationSnapshot`], split out so
+/// [`decide_deprecation`] stays independent of the event enum.
+#[cfg_attr(test, derive(Debug, PartialEq))]
+struct DeprecationSnapshotData {
+    policy_version: Option<u64>,
+    warnings: Vec<DeprecationWarningRow>,
+    had_policy: bool,
+}
+
+impl DeprecationDecision {
+    /// An unreadable / unverifiable policy (ISC-A-C9): surface the persistent
+    /// non-blocking `ServerDeprecationPolicyUnreadable` warning and an error;
+    /// never accept or cache the policy.
+    fn unreadable(message: impl Into<String>) -> Self {
+        Self {
+            snapshot: None,
+            error: Some(message.into()),
+            trust_keys: vec![unreadable_policy_event()],
+            cache_policy: None,
+        }
+    }
+
+    /// A rollback or withdrawal of a previously-held policy (ISC-A-S11): surface
+    /// the blocking `ServerDeprecationPolicyRollback` event and an error; keep
+    /// the cached policy (do not accept the offered version).
+    fn rollback(message: impl Into<String>) -> Self {
+        Self {
+            snapshot: None,
+            error: Some(message.into()),
+            trust_keys: vec![TrustEventKey::ServerDeprecationPolicyRollback],
+            cache_policy: None,
+        }
+    }
+}
+
+/// Decide what to surface for a fetched deprecation policy (ISC-C25 /
+/// ISC-A-S11 / ISC-C28), purely from inputs — no I/O, no actor state — so every
+/// branch is unit-testable.
+///
+/// Fail-closed throughout: a missing key, a wrong-length key, a bad signature,
+/// or a rollback never yields an accepted policy. A withdrawn policy (the relay
+/// served `None` after we held a version) is treated as a rollback, not a
+/// benign empty state — otherwise an attacker stripping the policy would look
+/// identical to a fresh server with none configured. Affected-suite trust
+/// events are emitted only when the policy version increased *or* a suite is
+/// already past its cutoff (blocking), so a passive re-fetch never resurrects a
+/// dismissed warning while a genuine escalation always breaks through.
+fn decide_deprecation(
+    prev_version: Option<u64>,
+    artifact: Option<&wire::SignedArtifact>,
+    server_pubkey: Option<&[u8]>,
+    in_use: &[SuiteId],
+    now_ms: i64,
+) -> DeprecationDecision {
+    let Some(artifact) = artifact else {
+        return if prev_version.is_some() {
+            DeprecationDecision::rollback("relay withdrew a previously-served deprecation policy")
+        } else {
+            DeprecationDecision {
+                snapshot: Some(DeprecationSnapshotData {
+                    policy_version: None,
+                    warnings: Vec::new(),
+                    had_policy: false,
+                }),
+                error: None,
+                trust_keys: Vec::new(),
+                cache_policy: None,
+            }
+        };
+    };
+
+    let Some(pubkey) = server_pubkey else {
+        return DeprecationDecision::unreadable(
+            "no pinned server key to verify the deprecation policy",
+        );
+    };
+
+    // The `try_into` target (`&[u8; ml_dsa::PK_LEN]`) is inferred from the
+    // `verify_policy` parameter, so the length constant never has to be named.
+    let policy = match pubkey.try_into() {
+        Ok(key) => match verify_policy(artifact, key, prev_version) {
+            Ok(policy) => policy,
+            Err(PolicyError::VersionRollback { cached, offered }) => {
+                return DeprecationDecision::rollback(format!(
+                    "deprecation policy rollback rejected (offered {offered} < cached {cached})"
+                ));
+            }
+            Err(e) => {
+                return DeprecationDecision::unreadable(format!(
+                    "deprecation policy verification failed: {e}"
+                ));
+            }
+        },
+        Err(_) => {
+            return DeprecationDecision::unreadable("pinned server key has unexpected length");
+        }
+    };
+
+    let is_new = match prev_version {
+        Some(p) => policy.policy_version() > p,
+        None => true,
+    };
+    let signals = assess_deprecation(&policy, in_use, now_ms);
+    let mut warnings = Vec::with_capacity(signals.len());
+    let mut trust_keys = Vec::new();
+    for sig in &signals {
+        let past_cutoff = sig.key == TrustEventKey::SuiteDeprecationCutoffHit;
+        warnings.push(DeprecationWarningRow {
+            suite_id: sig.suite_id.get(),
+            cutoff_unix_ms: sig.cutoff_unix_ms,
+            recommended_suite_id: sig.recommended_suite_id.get(),
+            past_cutoff,
+        });
+        // Re-surface a warning only on a version bump (a policy the user has not
+        // seen) or a blocking cutoff-hit (which must never be masked by a prior
+        // non-blocking dismissal); a passive same-version re-fetch stays quiet.
+        if is_new || past_cutoff {
+            trust_keys.push(sig.key);
+        }
+    }
+
+    DeprecationDecision {
+        snapshot: Some(DeprecationSnapshotData {
+            policy_version: Some(policy.policy_version()),
+            warnings,
+            had_policy: true,
+        }),
+        error: None,
+        trust_keys,
+        cache_policy: Some(policy),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1012,14 +1284,7 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local.block_on(&rt, async {
             let (evt_tx, mut evt_rx) = mpsc::unbounded_channel();
-            let mut actor = Actor {
-                evt_tx,
-                session: None,
-                server_id: None,
-                circle: None,
-                backoff: Backoff::new(),
-                share_index: None,
-            };
+            let mut actor = bare_actor(evt_tx);
             actor.handle_join_circle("some circle phrase").await;
             match evt_rx.try_recv() {
                 Ok(NetEvent::CircleJoinFailed { message }) => {
@@ -1069,6 +1334,8 @@ mod tests {
             circle: None,
             backoff: Backoff::new(),
             share_index: None,
+            server_pubkey: None,
+            policy_cache: PolicyCache::new(),
         }
     }
 
@@ -1167,14 +1434,7 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local.block_on(&rt, async {
             let (evt_tx, mut evt_rx) = mpsc::unbounded_channel();
-            let mut actor = Actor {
-                evt_tx,
-                session: None,
-                server_id: None,
-                circle: None,
-                backoff: Backoff::new(),
-                share_index: None,
-            };
+            let mut actor = bare_actor(evt_tx);
             actor.handle_send_chat("hello", "me#000000000000").await;
             match evt_rx.try_recv() {
                 Ok(NetEvent::ChatError { message }) => assert!(message.contains("join a circle")),
@@ -1203,5 +1463,230 @@ mod tests {
                 other => panic!("expected PublicSpaceError, got {other:?}"),
             }
         });
+    }
+
+    // ── Deprecation policy (ISC-C25 / ISC-A-S11 / ISC-C28) ─────────────────
+
+    /// Refreshing deprecation before connecting emits DeprecationError, not a
+    /// panic — the actor's prerequisite guard mirrors the public-space path.
+    #[test]
+    fn refresh_deprecation_without_session_fails_cleanly() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let (evt_tx, mut evt_rx) = mpsc::unbounded_channel();
+            let mut actor = bare_actor(evt_tx);
+            actor.handle_refresh_deprecation().await;
+            match evt_rx.try_recv() {
+                Ok(NetEvent::DeprecationError { message }) => {
+                    assert!(message.contains("not connected"));
+                }
+                other => panic!("expected DeprecationError, got {other:?}"),
+            }
+        });
+    }
+
+    const HOUR_MS: i64 = 3_600_000;
+
+    /// Sign a one-entry deprecation policy under a fixed key and return the
+    /// artifact + its signer pubkey, for the pure `decide_deprecation` tests.
+    fn signed_policy(
+        version: u64,
+        deprecated: SuiteId,
+        cutoff_ms: i64,
+        signed_now: i64,
+    ) -> (wire::SignedArtifact, Vec<u8>) {
+        use daemonseed_core::crypto::deprecation::{
+            DeprecationEntry, DeprecationPolicy, sign_policy,
+        };
+        use daemonseed_core::identity::keys::SignKeypair;
+        let _ = oxicrypt_module::initialize();
+        let kp = SignKeypair::from_ml_dsa_seed(&[7u8; 32]).unwrap();
+        let entry = DeprecationEntry {
+            suite_id: deprecated,
+            cutoff_unix_ms: cutoff_ms,
+            recommended_suite_id: SuiteId::try_new(0x0002).unwrap(),
+        };
+        let policy =
+            DeprecationPolicy::build(version, signed_now, vec![entry], signed_now).unwrap();
+        let artifact = sign_policy(&policy, &kp).unwrap();
+        (artifact, kp.public_key().to_vec())
+    }
+
+    /// No policy served and nothing cached: a benign empty snapshot, no trust
+    /// events, nothing cached.
+    #[test]
+    fn decide_no_policy_no_cache_is_empty_snapshot() {
+        let d = decide_deprecation(None, None, Some(&[0u8; 4]), &[CNSA_2_0.id], 1_000);
+        let snap = d.snapshot.expect("empty snapshot");
+        assert!(!snap.had_policy);
+        assert!(snap.warnings.is_empty());
+        assert_eq!(snap.policy_version, None);
+        assert!(d.trust_keys.is_empty());
+        assert!(d.error.is_none());
+        assert!(d.cache_policy.is_none());
+    }
+
+    /// Policy withdrawn after we held a version is a rollback, not a benign
+    /// empty state (advisor finding) — blocking trust event, cache untouched.
+    #[test]
+    fn decide_withdrawn_policy_with_cache_is_rollback() {
+        let d = decide_deprecation(Some(3), None, Some(&[0u8; 4]), &[CNSA_2_0.id], 1_000);
+        assert!(d.snapshot.is_none(), "no snapshot — cached panel kept");
+        assert!(d.error.is_some());
+        assert_eq!(
+            d.trust_keys,
+            vec![TrustEventKey::ServerDeprecationPolicyRollback]
+        );
+        assert!(d.cache_policy.is_none());
+    }
+
+    /// A valid, newer policy whose deprecated suite is in use surfaces a pending
+    /// warning row and one pending trust event, and is cached.
+    #[test]
+    fn decide_valid_new_pending_emits_warning_and_trust() {
+        let now = 1_000_000_000_000;
+        let (artifact, pubkey) = signed_policy(1, CNSA_2_0.id, now + 3 * HOUR_MS, now);
+        let d = decide_deprecation(None, Some(&artifact), Some(&pubkey), &[CNSA_2_0.id], now);
+        let snap = d.snapshot.expect("snapshot");
+        assert!(snap.had_policy);
+        assert_eq!(snap.policy_version, Some(1));
+        assert_eq!(snap.warnings.len(), 1);
+        assert!(!snap.warnings[0].past_cutoff);
+        assert_eq!(snap.warnings[0].suite_id, CNSA_2_0.id.get());
+        assert_eq!(d.trust_keys, vec![TrustEventKey::SuiteDeprecationPending]);
+        assert!(d.cache_policy.is_some());
+        assert!(d.error.is_none());
+    }
+
+    /// A passive re-fetch of the same version keeps the warning row but emits NO
+    /// trust event — a dismissed warning must not resurrect (advisor finding).
+    #[test]
+    fn decide_same_version_suppresses_trust_keeps_warning() {
+        let now = 1_000_000_000_000;
+        let (artifact, pubkey) = signed_policy(1, CNSA_2_0.id, now + 3 * HOUR_MS, now);
+        let d = decide_deprecation(Some(1), Some(&artifact), Some(&pubkey), &[CNSA_2_0.id], now);
+        let snap = d.snapshot.expect("snapshot");
+        assert_eq!(snap.warnings.len(), 1, "warning row still rendered");
+        assert!(
+            d.trust_keys.is_empty(),
+            "same-version re-fetch resurrects nothing"
+        );
+    }
+
+    /// A higher policy version re-emits the warning trust event.
+    #[test]
+    fn decide_higher_version_re_emits_trust() {
+        let now = 1_000_000_000_000;
+        let (artifact, pubkey) = signed_policy(2, CNSA_2_0.id, now + 3 * HOUR_MS, now);
+        let d = decide_deprecation(Some(1), Some(&artifact), Some(&pubkey), &[CNSA_2_0.id], now);
+        assert_eq!(d.trust_keys, vec![TrustEventKey::SuiteDeprecationPending]);
+    }
+
+    /// A suite already past its cutoff emits the blocking cutoff-hit event even
+    /// on a same-version re-fetch — a blocking gate is never masked by a prior
+    /// non-blocking dismissal (advisor finding).
+    #[test]
+    fn decide_cutoff_hit_emits_even_same_version() {
+        let signed_now = 1_000_000_000_000;
+        let cutoff = signed_now + 3 * HOUR_MS;
+        let (artifact, pubkey) = signed_policy(1, CNSA_2_0.id, cutoff, signed_now);
+        // Evaluate well past the cutoff, same cached version.
+        let eval_now = cutoff + HOUR_MS;
+        let d = decide_deprecation(
+            Some(1),
+            Some(&artifact),
+            Some(&pubkey),
+            &[CNSA_2_0.id],
+            eval_now,
+        );
+        let snap = d.snapshot.expect("snapshot");
+        assert!(snap.warnings[0].past_cutoff);
+        assert_eq!(d.trust_keys, vec![TrustEventKey::SuiteDeprecationCutoffHit]);
+    }
+
+    /// A version-rollback artifact is rejected: rollback trust event, no cache.
+    #[test]
+    fn decide_version_rollback_is_rejected() {
+        let now = 1_000_000_000_000;
+        let (artifact, pubkey) = signed_policy(3, CNSA_2_0.id, now + 3 * HOUR_MS, now);
+        let d = decide_deprecation(Some(7), Some(&artifact), Some(&pubkey), &[CNSA_2_0.id], now);
+        assert!(d.snapshot.is_none());
+        assert_eq!(
+            d.trust_keys,
+            vec![TrustEventKey::ServerDeprecationPolicyRollback]
+        );
+        assert!(d.cache_policy.is_none());
+    }
+
+    /// A tampered payload fails verification → unreadable (never accepted).
+    #[test]
+    fn decide_bad_signature_is_unreadable() {
+        let now = 1_000_000_000_000;
+        let (mut artifact, pubkey) = signed_policy(1, CNSA_2_0.id, now + 3 * HOUR_MS, now);
+        artifact.signed_payload.push(0xFF);
+        let d = decide_deprecation(None, Some(&artifact), Some(&pubkey), &[CNSA_2_0.id], now);
+        assert!(d.snapshot.is_none());
+        assert_eq!(
+            d.trust_keys,
+            vec![TrustEventKey::ServerDeprecationPolicyUnreadable]
+        );
+        assert!(d.cache_policy.is_none());
+    }
+
+    /// A missing pinned key fails closed — an unverifiable policy is never
+    /// accepted (advisor finding: the one failure mode that defeats the feature).
+    #[test]
+    fn decide_missing_pubkey_is_unreadable() {
+        let now = 1_000_000_000_000;
+        let (artifact, _pubkey) = signed_policy(1, CNSA_2_0.id, now + 3 * HOUR_MS, now);
+        let d = decide_deprecation(None, Some(&artifact), None, &[CNSA_2_0.id], now);
+        assert!(d.snapshot.is_none());
+        assert_eq!(
+            d.trust_keys,
+            vec![TrustEventKey::ServerDeprecationPolicyUnreadable]
+        );
+        assert!(d.cache_policy.is_none());
+    }
+
+    /// A wrong-length pinned key fails closed before verification.
+    #[test]
+    fn decide_short_pubkey_is_unreadable() {
+        let now = 1_000_000_000_000;
+        let (artifact, _pubkey) = signed_policy(1, CNSA_2_0.id, now + 3 * HOUR_MS, now);
+        let d = decide_deprecation(
+            None,
+            Some(&artifact),
+            Some(&[1u8, 2, 3]),
+            &[CNSA_2_0.id],
+            now,
+        );
+        assert!(d.snapshot.is_none());
+        assert_eq!(
+            d.trust_keys,
+            vec![TrustEventKey::ServerDeprecationPolicyUnreadable]
+        );
+        assert!(d.cache_policy.is_none());
+    }
+
+    /// A valid policy deprecating a suite the client does not use: accepted and
+    /// cached, but no warning row and no trust event (distinct from "no policy").
+    #[test]
+    fn decide_unaffected_suite_has_no_warning() {
+        let now = 1_000_000_000_000;
+        let other = SuiteId::try_new(0x0002).unwrap();
+        let (artifact, pubkey) = signed_policy(1, other, now + 3 * HOUR_MS, now);
+        let d = decide_deprecation(None, Some(&artifact), Some(&pubkey), &[CNSA_2_0.id], now);
+        let snap = d.snapshot.expect("snapshot");
+        assert!(snap.had_policy);
+        assert!(snap.warnings.is_empty());
+        assert!(d.trust_keys.is_empty());
+        assert!(
+            d.cache_policy.is_some(),
+            "still cached for rollback baseline"
+        );
     }
 }

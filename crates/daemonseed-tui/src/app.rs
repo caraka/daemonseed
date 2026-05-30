@@ -70,7 +70,8 @@ pub struct ChatLine {
 }
 
 /// Which input on the [`Screen::Main`] view has keyboard focus. `Tab` cycles
-/// Chat → JoinCircle → Mute → Shares → Hide → Servers → TrustHistory → Chat.
+/// Chat → JoinCircle → Mute → Shares → Hide → Servers → TrustHistory →
+/// PublicSpace → Deprecation → Chat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MainFocus {
     /// The chat compose box (default): typing composes, Enter sends (ISC-14).
@@ -112,6 +113,15 @@ pub enum MainFocus {
     /// server APIs (no new wire protocol). The main area shows the public space
     /// instead of chat.
     PublicSpace,
+    /// The Deprecation view (ISC-C25 / ISC-A-S11 / ISC-C28): the connected
+    /// relay's signed suite-deprecation policy, fetched, ML-DSA-verified against
+    /// the pinned server key, anti-rollback-checked, and surfaced as
+    /// persistent non-blocking warning rows for any in-use suite the operator
+    /// has scheduled for retirement. Up/Down navigate the warning rows, `r`
+    /// requests a fresh fetch. A read-only surface over the already-shipped
+    /// `PublicSpace.GetDeprecationPolicy` RPC (no new wire protocol). The main
+    /// area shows the deprecation policy instead of chat.
+    Deprecation,
 }
 
 /// One indexed file in the user's own share, as rendered in the My-shares
@@ -145,6 +155,26 @@ pub struct PublicPostRow {
     pub verified: bool,
     /// Signer's wall-clock at signing, unix ms (advisory ordering, ISC-S7).
     pub sent_unix_ms: i64,
+}
+
+/// One affected-suite warning in the deprecation view (ISC-C25), a render-only
+/// projection kept local to the TUI so [`App`] does not depend on core's
+/// `DeprecationEntry`. Built by the net actor from
+/// [`daemonseed_core::trust_events::assess_deprecation`] for each in-use suite
+/// the verified policy schedules for retirement. `past_cutoff` distinguishes a
+/// blocking cutoff-hit (the suite is already refused) from a still-advisory
+/// pending deprecation, so the render layer can flag it accordingly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeprecationWarningRow {
+    /// The in-use suite the operator has scheduled for retirement.
+    pub suite_id: u16,
+    /// UTC wall-clock milliseconds at/after which the suite is refused.
+    pub cutoff_unix_ms: i64,
+    /// Operator-recommended successor suite to migrate to.
+    pub recommended_suite_id: u16,
+    /// Whether the suite is already at/past its cutoff (blocking) versus a
+    /// still-advisory pending deprecation.
+    pub past_cutoff: bool,
 }
 
 /// Indexer state as seen by the TUI (ISC-20 / ISC-A-C7). The line at the top
@@ -350,6 +380,27 @@ pub struct App {
     /// (drained once). Set when the user opens the Public Space pane or presses
     /// `r`; the binary translates it into a `NetCommand::RefreshPublicSpace`.
     pending_public_space_refresh: bool,
+    /// Latest deprecation-warning snapshot from the net actor (ISC-C25), one row
+    /// per in-use suite the verified policy schedules for retirement. Replaced
+    /// wholesale on each `DeprecationSnapshot` (idempotent — never appended), so
+    /// a refresh can never duplicate or resurrect a row. Left intact on a
+    /// `DeprecationError` so a rollback / fetch failure never blanks the cached
+    /// warnings the user is relying on.
+    deprecation_warnings: Vec<DeprecationWarningRow>,
+    /// Version of the last accepted deprecation policy (ISC-A-S11), `None`
+    /// before any policy has been fetched or when the relay serves none.
+    deprecation_policy_version: Option<u64>,
+    /// Whether the relay served a (verified) policy on the last successful
+    /// fetch. `false` distinguishes "relay has no policy configured" from
+    /// "policy fetched but no in-use suite is affected" — both yield zero
+    /// warning rows but mean different things to the user.
+    deprecation_had_policy: bool,
+    /// Selected row index in the deprecation-warnings pane (Up/Down moves it).
+    dep_sel: usize,
+    /// A queued deprecation refresh the binary should forward to the net actor
+    /// (drained once). Set when the user opens the Deprecation pane or presses
+    /// `r`; the binary translates it into a `NetCommand::RefreshDeprecation`.
+    pending_deprecation_refresh: bool,
 }
 
 impl Default for App {
@@ -408,6 +459,11 @@ impl App {
             public_posts: Vec::new(),
             post_sel: 0,
             pending_public_space_refresh: false,
+            deprecation_warnings: Vec::new(),
+            deprecation_policy_version: None,
+            deprecation_had_policy: false,
+            dep_sel: 0,
+            pending_deprecation_refresh: false,
         }
     }
 
@@ -542,6 +598,26 @@ impl App {
                 }
             }
             NetEvent::PublicSpaceError { message } => self.status = Some(message),
+            NetEvent::DeprecationSnapshot {
+                policy_version,
+                warnings,
+                had_policy,
+            } => {
+                self.deprecation_warnings = warnings;
+                self.deprecation_policy_version = policy_version;
+                self.deprecation_had_policy = had_policy;
+                // Clamp the selection so it never points past the new list.
+                let max_idx = self.deprecation_warnings.len().saturating_sub(1);
+                if self.dep_sel > max_idx {
+                    self.dep_sel = max_idx;
+                }
+            }
+            // A fetch / verification / rollback failure surfaces on the status
+            // line only — the cached warning rows are deliberately left intact
+            // (ISC-C25): going blank on rollback would hide the very state the
+            // anti-rollback check exists to protect. The rollback / unreadable
+            // trust event arrives separately as a `TrustEvent`.
+            NetEvent::DeprecationError { message } => self.status = Some(message),
             NetEvent::FetchProgress {
                 total_chunks,
                 chunks_received,
@@ -786,6 +862,36 @@ impl App {
         std::mem::replace(&mut self.pending_public_space_refresh, false)
     }
 
+    /// Latest deprecation-warning rows (ISC-C25), for the Deprecation view. One
+    /// row per in-use suite the verified policy schedules for retirement.
+    pub fn deprecation_warnings(&self) -> &[DeprecationWarningRow] {
+        &self.deprecation_warnings
+    }
+
+    /// Version of the last accepted deprecation policy (ISC-A-S11), for the
+    /// Deprecation view header. `None` before any policy has been fetched.
+    pub fn deprecation_policy_version(&self) -> Option<u64> {
+        self.deprecation_policy_version
+    }
+
+    /// Whether the relay served a verified policy on the last successful fetch,
+    /// for distinguishing "no policy configured" from "no in-use suite affected"
+    /// in the Deprecation view's empty state.
+    pub fn deprecation_had_policy(&self) -> bool {
+        self.deprecation_had_policy
+    }
+
+    /// The selected deprecation-warning row index, for highlighting.
+    pub fn dep_sel(&self) -> usize {
+        self.dep_sel
+    }
+
+    /// Take a queued deprecation refresh request (drained once by the binary,
+    /// which translates it into a `NetCommand::RefreshDeprecation`).
+    pub fn take_pending_deprecation_refresh(&mut self) -> bool {
+        std::mem::replace(&mut self.pending_deprecation_refresh, false)
+    }
+
     /// @-mention autocomplete candidates for the current compose buffer
     /// (ISC-12 / C18). When composing and the buffer ends with a partial
     /// `@token` (no whitespace after the last `@`), returns the full wire
@@ -917,7 +1023,8 @@ impl App {
                     MainFocus::Hide => MainFocus::Servers,
                     MainFocus::Servers => MainFocus::TrustHistory,
                     MainFocus::TrustHistory => MainFocus::PublicSpace,
-                    MainFocus::PublicSpace => MainFocus::Chat,
+                    MainFocus::PublicSpace => MainFocus::Deprecation,
+                    MainFocus::Deprecation => MainFocus::Chat,
                 };
                 // Opening the Shares pane requests a fresh snapshot — the
                 // alpha gate harness drives this through `RefreshShares` so
@@ -931,6 +1038,12 @@ impl App {
                 if matches!(self.main_focus, MainFocus::PublicSpace) {
                     self.pending_public_space_refresh = true;
                 }
+                // Opening the Deprecation pane requests a fresh policy fetch so
+                // the warning rows reflect the live policy on first view
+                // (`RefreshDeprecation`), never a stale or empty pane.
+                if matches!(self.main_focus, MainFocus::Deprecation) {
+                    self.pending_deprecation_refresh = true;
+                }
             }
             _ => match self.main_focus {
                 MainFocus::Chat => self.on_key_chat(key),
@@ -941,6 +1054,7 @@ impl App {
                 MainFocus::Servers => self.on_key_servers(key),
                 MainFocus::TrustHistory => self.on_key_history(key),
                 MainFocus::PublicSpace => self.on_key_public_space(key),
+                MainFocus::Deprecation => self.on_key_deprecation(key),
             },
         }
     }
@@ -960,6 +1074,27 @@ impl App {
             }
             KeyCode::Char('r') | KeyCode::Char('R') => {
                 self.pending_public_space_refresh = true;
+            }
+            _ => {}
+        }
+    }
+
+    /// Deprecation-pane key handling (read-only display, ISC-C25). `Up` / `Down`
+    /// move the warning-row selection (clamped to the warning list); `r`
+    /// requests a fresh policy fetch. No write affordances: the deprecation
+    /// policy is operator-signed and the client only verifies and surfaces it —
+    /// it never mutates suite state from here (ISC-A-C9 / ISC-A3).
+    fn on_key_deprecation(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Up => self.dep_sel = self.dep_sel.saturating_sub(1),
+            KeyCode::Down => {
+                let max = self.deprecation_warnings.len().saturating_sub(1);
+                if self.dep_sel < max {
+                    self.dep_sel += 1;
+                }
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                self.pending_deprecation_refresh = true;
             }
             _ => {}
         }
@@ -1481,6 +1616,8 @@ mod tests {
         assert_eq!(app.main_focus(), MainFocus::TrustHistory);
         app.on_key(press(KeyCode::Tab));
         assert_eq!(app.main_focus(), MainFocus::PublicSpace);
+        app.on_key(press(KeyCode::Tab));
+        assert_eq!(app.main_focus(), MainFocus::Deprecation);
         app.on_key(press(KeyCode::Tab));
         assert_eq!(app.main_focus(), MainFocus::Chat);
     }
@@ -2562,5 +2699,140 @@ mod tests {
             message: "not connected to a relay yet".to_owned(),
         });
         assert_eq!(app.status(), Some("not connected to a relay yet"));
+    }
+
+    // ── Deprecation pane (ISC-C25 / ISC-A-S11 / ISC-C28) ───────────────────
+
+    /// Navigate to the Deprecation view via the Tab cycle (8 hops from Chat).
+    fn to_deprecation(app: &mut App) {
+        for _ in 0..8 {
+            app.on_key(press(KeyCode::Tab));
+        }
+        assert_eq!(app.main_focus(), MainFocus::Deprecation);
+    }
+
+    fn dep_row(suite_id: u16, past_cutoff: bool) -> DeprecationWarningRow {
+        DeprecationWarningRow {
+            suite_id,
+            cutoff_unix_ms: 1_000_000_000_000,
+            recommended_suite_id: 2,
+            past_cutoff,
+        }
+    }
+
+    /// ISC-C25: a `DeprecationSnapshot` lands in App state and the view renders
+    /// a hyphenated warning token (PTY-matchable) plus the policy version.
+    #[test]
+    fn deprecation_snapshot_lands_and_renders_warning() {
+        let mut app = drive_to_main();
+        to_deprecation(&mut app);
+        app.on_net_event(NetEvent::DeprecationSnapshot {
+            policy_version: Some(3),
+            warnings: vec![dep_row(1, false)],
+            had_policy: true,
+        });
+        assert_eq!(app.deprecation_warnings().len(), 1);
+        assert_eq!(app.deprecation_policy_version(), Some(3));
+        let text = render_text(&app, 120, 28);
+        assert!(
+            text.contains("suite-deprecation-pending"),
+            "a still-advisory deprecation renders the pending token"
+        );
+        assert!(text.contains("recommended"), "recommended-suite surfaced");
+    }
+
+    /// ISC-C25: a still-future cutoff renders the pending token; a past cutoff
+    /// renders the blocking cutoff-hit token instead.
+    #[test]
+    fn deprecation_cutoff_hit_renders_blocking_token() {
+        let mut app = drive_to_main();
+        to_deprecation(&mut app);
+        app.on_net_event(NetEvent::DeprecationSnapshot {
+            policy_version: Some(1),
+            warnings: vec![dep_row(1, true)],
+            had_policy: true,
+        });
+        let text = render_text(&app, 120, 28);
+        assert!(
+            text.contains("suite-deprecation-cutoff-hit"),
+            "a past-cutoff suite renders the blocking token"
+        );
+    }
+
+    /// ISC-C25: a `DeprecationError` (rollback / fetch failure) surfaces on the
+    /// status line but leaves the cached warning rows intact — going blank on
+    /// rollback would hide the very state the anti-rollback check protects.
+    #[test]
+    fn deprecation_error_keeps_cached_warnings() {
+        let mut app = drive_to_main();
+        to_deprecation(&mut app);
+        app.on_net_event(NetEvent::DeprecationSnapshot {
+            policy_version: Some(5),
+            warnings: vec![dep_row(1, false)],
+            had_policy: true,
+        });
+        app.on_net_event(NetEvent::DeprecationError {
+            message: "deprecation policy rollback rejected".to_owned(),
+        });
+        assert_eq!(app.status(), Some("deprecation policy rollback rejected"));
+        assert_eq!(
+            app.deprecation_warnings().len(),
+            1,
+            "cached warnings survive a rollback error (ISC-C25)"
+        );
+        assert_eq!(app.deprecation_policy_version(), Some(5));
+    }
+
+    /// Tabbing into the Deprecation view queues a fetch so the pane is never
+    /// silently empty on first view (drained as `NetCommand::RefreshDeprecation`).
+    #[test]
+    fn tab_to_deprecation_queues_a_refresh() {
+        let mut app = drive_to_main();
+        to_deprecation(&mut app);
+        assert!(
+            app.take_pending_deprecation_refresh(),
+            "tabbing into Deprecation queues a refresh"
+        );
+    }
+
+    /// `r` on the Deprecation pane queues a fresh fetch.
+    #[test]
+    fn r_key_on_deprecation_queues_a_refresh() {
+        let mut app = drive_to_main();
+        to_deprecation(&mut app);
+        let _ = app.take_pending_deprecation_refresh();
+        app.on_key(press(KeyCode::Char('r')));
+        assert!(app.take_pending_deprecation_refresh());
+    }
+
+    /// Up/Down move the warning-row selection, clamped to the list.
+    #[test]
+    fn up_down_moves_dep_selection() {
+        let mut app = drive_to_main();
+        to_deprecation(&mut app);
+        app.on_net_event(NetEvent::DeprecationSnapshot {
+            policy_version: Some(1),
+            warnings: vec![dep_row(1, false), dep_row(3, false)],
+            had_policy: true,
+        });
+        assert_eq!(app.dep_sel(), 0);
+        app.on_key(press(KeyCode::Down));
+        assert_eq!(app.dep_sel(), 1);
+        app.on_key(press(KeyCode::Down)); // saturates at last row
+        assert_eq!(app.dep_sel(), 1);
+        app.on_key(press(KeyCode::Up));
+        assert_eq!(app.dep_sel(), 0);
+    }
+
+    /// A `DeprecationError` before any snapshot surfaces on the status line and
+    /// leaves the (empty) warning list untouched.
+    #[test]
+    fn deprecation_error_sets_status_line() {
+        let mut app = App::new();
+        app.on_net_event(NetEvent::DeprecationError {
+            message: "not connected to a relay yet".to_owned(),
+        });
+        assert_eq!(app.status(), Some("not connected to a relay yet"));
+        assert!(app.deprecation_warnings().is_empty());
     }
 }

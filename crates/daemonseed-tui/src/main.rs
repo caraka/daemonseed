@@ -91,6 +91,9 @@ fn run(terminal: &mut ratatui::DefaultTerminal, mut net: NetHandle) -> io::Resul
         if app.take_pending_public_space_refresh() {
             let _ = net.send(NetCommand::RefreshPublicSpace);
         }
+        if app.take_pending_deprecation_refresh() {
+            let _ = net.send(NetCommand::RefreshDeprecation);
+        }
         if let Some((share_id, sharer_handle)) = app.take_pending_share_fetch() {
             let _ = net.send(NetCommand::FetchShare {
                 share_id,

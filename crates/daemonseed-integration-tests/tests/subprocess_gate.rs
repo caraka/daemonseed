@@ -32,7 +32,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::gate::{Gate, PublicSpaceSeed, ServerProcess};
+use common::gate::{DeprecationSeed, Gate, PublicSpaceSeed, ServerProcess};
 
 /// Bring-up smoke. Spawns the harness, waits for every daemon to paint
 /// its initial Welcome frame, tears down cleanly. Closes the
@@ -184,6 +184,71 @@ fn daemon_sees_seeded_public_space_motd_and_verified_announcement() {
     assert!(
         !screen.contains("unverified"),
         "a whitelist-signed post must verify client-side; screen:\n{screen}"
+    );
+}
+
+/// Gate step 7 — suite-deprecation policy round-trip (fetch + verify + surface).
+///
+/// A relay is booted with a `[crypto]` deprecation policy (version 1) retiring
+/// the in-use CNSA 2.0 suite (id 1) with a cutoff three hours out — past the F30
+/// minimum lead the server enforces at boot, still future at fetch time. The
+/// relay signs the policy under its own identity key at boot. A single daemon
+/// completes first-start, authenticates (TOFU-pinning the server-wide key), then
+/// opens its Deprecation pane — which fetches the signed policy over the
+/// post-Authenticated `GetDeprecationPolicy` RPC, verifies its ML-DSA-87
+/// signature against the pinned key, anti-rollback-checks it, and surfaces a
+/// pending warning for the in-use suite (ISC-C25 / ISC-A-S11 / ISC-C28). The
+/// test asserts the daemon renders the hyphenated `suite-deprecation-pending`
+/// token — proving the policy verified client-side (an unverifiable policy would
+/// surface `server-deprecation-policy-unreadable` instead). Exercises the M11
+/// deprecation client surface end-to-end over already-shipped APIs (no new wire).
+#[test]
+#[ignore = "spawns real binaries; entry point is `cargo xtask mvp-gate`"]
+fn daemon_fetches_verifies_and_surfaces_deprecation_policy() {
+    // Deprecate the in-use suite (CNSA 2.0, id 1), recommending suite id 2.
+    let dep = DeprecationSeed::pending(1, 1, 2);
+    let server = ServerProcess::spawn_seeded_with_deprecation(Some("relay-mvp"), &dep)
+        .expect("deprecation-seeded server subprocess spawns + binds to its ephemeral port");
+    let bootstrap = server.bootstrap_handle();
+    let mut gate = Gate::with_daemons(server, 1).expect("one PTY-attached daemon spawns");
+
+    let passphrase = "correct horse battery staple table mountain";
+    if let Err(e) = gate.all_complete_first_start(passphrase, &bootstrap) {
+        eprintln!("{}", gate.failure_report(&format!("first-start: {e}")));
+        panic!("first-start failed: {e}");
+    }
+    if let Err(e) = gate.wait_all_authenticated(Duration::from_secs(15)) {
+        eprintln!("{}", gate.failure_report(&format!("authenticate: {e}")));
+        panic!("daemon failed to reach Authenticated: {e}");
+    }
+
+    // Open the Deprecation pane — this queues the RefreshDeprecation fetch.
+    if let Err(e) = gate.daemon_open_deprecation(0) {
+        eprintln!("{}", gate.failure_report(&format!("open-deprecation: {e}")));
+        panic!("could not open the Deprecation pane: {e}");
+    }
+
+    // The verified policy surfaces a pending warning for the in-use suite. The
+    // hyphenated token renders as one contiguous PTY word (no space-split), and
+    // its presence proves the signature verified against the TOFU-pinned key.
+    if let Err(e) = gate
+        .daemons
+        .first()
+        .unwrap()
+        .wait_for_visible("suite-deprecation-pending", Duration::from_secs(10))
+    {
+        eprintln!(
+            "{}",
+            gate.failure_report(&format!("deprecation-render: {e}"))
+        );
+        panic!("daemon never surfaced the verified deprecation warning: {e}");
+    }
+    // A verified policy must NOT surface the unreadable fallback — that token
+    // would mean the signature failed against the pinned server-wide key.
+    let screen = gate.daemons.first().unwrap().screen_text();
+    assert!(
+        !screen.contains("server-deprecation-policy-unreadable"),
+        "a server-signed policy must verify against the pinned key; screen:\n{screen}"
     );
 }
 

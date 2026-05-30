@@ -314,8 +314,8 @@ Work breakdown by milestone. Each milestone is a PR; releases are SSH-signed fro
 | M8 | circle-of-trust chunks indexer; founderless entropy-only CoT key | v0.10.0 | shipped |
 | M9 | rate limits, backoff, mute, hide, @mentions | v0.11.0 | shipped |
 | M10 | release verify, boot gate, update FSM, coverage, LAMA manifests | v0.12.1 | shipped |
-| M11 | **MVP-gate client surfaces** — real TUI, M9 wiring, public-space view, introducer refresh, deprecation-policy surfacing, clean-device recovery (all over already-shipped server APIs; **no new wire protocol**) | v0.13.0 (target) | **in progress** |
-| M12 | **user-publish file sharing** — `PublishShare` RPC + server handler + TUI publish surface (ISC-38; carries a SemVer **MINOR wire bump** on its own); **trips the full 4-daemon gate → MVP declared** | v0.14.0 (target) | planned |
+| M11 | **MVP-gate client surfaces** — real TUI, M9 wiring, public-space view, deprecation-policy surfacing, clean-device recovery (all over already-shipped, already-served server APIs; **no new wire protocol**) | v0.13.0 (target) | **in progress** |
+| M12 | **user-publish file sharing + federation introducer endpoint** — `PublishShare` RPC + server handler + TUI publish surface (ISC-38), **plus** the federation introducer endpoint (additive gRPC RPC over the already-shipped `IntroducerQuery`/`IntroducerResponse` messages) + its client refresh surface (gate step 6); both ride **one** SemVer **MINOR wire bump**; **trips the full 4-daemon gate → MVP declared** | v0.14.0 (target) | planned |
 | post-MVP | GFW classifier bench, Pi-4 civility bench, unsigned alpha packaging (parallelizable with M11/M12) | — | planned |
 | alpha2 | direct messaging (ISC-C38–C46 / A-C20–A-C25) | — | deferred |
 | reservations | folder encryption, multi-instance, QUIC transport | — | reserved |
@@ -323,15 +323,67 @@ Work breakdown by milestone. Each milestone is a PR; releases are SSH-signed fro
 **MVP-gate detail (scope decided 2026-05-29, Path 2):** the gate is a 4-daemon 8-step scenario tracked by
 its own test-harness criteria (distinct from spec ISC IDs). Steps 1 (cold first-start), 2 (all peers
 Authenticated), and 4 (CoT chat + mute/@mention) pass on real binaries. The remaining steps are sliced by
-depth: **M11** finishes the four client surfaces that need no new wire protocol — step 3 (public-space
-view), step 6 (introducer refresh), step 7 (deprecation-policy fetch + trust-event surfacing), and step 8
-(clean-device recovery branch) — over already-shipped server APIs, releasing v0.13.0 (gate not yet fully
-passed). **M12** adds the one protocol change — step 5 user-publish file sharing (`PublishShare`) — which
-is the moment all 8 steps pass and the **MVP is declared** at v0.14.0. Clean-device recovery (step 8) is
-confirmed MVP-gating, not deferrable.
+depth: **M11** finishes the client surfaces that need no new wire protocol — step 3 (public-space
+view, done), step 7 (deprecation-policy fetch + trust-event surfacing), and step 8 (clean-device recovery
+branch) — over already-shipped, already-served server APIs, releasing v0.13.0 (gate not yet fully passed).
+**M12** carries the protocol changes — step 5 user-publish file sharing (`PublishShare`) **and** the
+federation introducer endpoint (gate step 6, an additive gRPC RPC over the already-shipped introducer
+messages plus its client refresh surface) — both riding one additive MINOR bump, the moment all 8 steps
+pass and the **MVP is declared** at v0.14.0. Clean-device recovery (step 8) is confirmed MVP-gating, not
+deferrable. **Step 6 moved M11→M12 on 2026-05-30** (see Decisions): M5 shipped the introducer's messages
+and `introducer_response()` builder but never an endpoint, so step 6 was never "client-only over
+already-shipped APIs" — completing it adds protocol surface, which now rides M12's already-planned bump.
 
 ## Decisions
 
+- 2026-05-30: **Introducer endpoint deferred M11→M12; M11 scope = gate steps 7 + 8 only.** While resuming
+  M11, investigation found the federation introducer was never wired to the socket in M5. The
+  `IntroducerQuery` / `IntroducerResponse` messages, the `introducer_response()` builder, and operator
+  peer-config all shipped — but there is **no endpoint**: no gRPC RPC and no post-auth frame handler. The
+  entire post-Authenticated surface is tonic gRPC (`PublicSpace` + `CircleOfTrust`); `IntroducerQuery` is
+  referenced only inside `federation.rs` (builder + its unit tests), never read off a socket. So gate
+  step 6 (introducer refresh) was never "client-only over already-shipped server APIs" as the 2026-05-29
+  Path-2 scope assumed — completing it necessarily adds protocol surface. **Resolution:** the introducer
+  endpoint (an additive gRPC RPC reusing the shipped messages) + its client refresh surface + gate step 6
+  move to **M12**, riding the single additive MINOR bump already planned there for `PublishShare` — one
+  reviewable wire change instead of two, and M11 stays literally wire-clean. M11 now delivers only the
+  genuinely no-wire surfaces: **step 7** (deprecation-policy fetch + trust-event surfacing over the
+  shipped-and-served `GetDeprecationPolicy` RPC) and **step 8** (clean-device recovery, first-start
+  TUI-only branch). The full 8-step gate still trips only at M12/v0.14.0, so the move costs nothing —
+  v0.13.0 never claimed a full gate pass. Approved by caraka 2026-05-30.
+- 2026-05-30: **Effort-tier note:** this resume ran under ALGORITHM E3 via conversation-context override —
+  the UserPromptSubmit classifier tagged the short approval messages MINIMAL/MINIMAL, but in thread
+  context they greenlit a multi-file milestone build. Delegation-floor (E3 soft ≥2) relaxed: work is
+  driven directly by the primary because the investigation context is already loaded, the patterns to
+  mirror (public-space client surface; first-start orchestrator) are in-repo, and the degraded tool-output
+  channel makes subagent-output coordination unreliable this session.
+- 2026-05-30: **Step-7 deprecation surface — version-gated trust-event emission (ISC-C25 / C28).** The
+  warning *panel* (`DeprecationWarningRow` rows) is the always-on persistent non-blocking surface: an
+  idempotent snapshot-replace, never an append, so a re-fetch can't duplicate or resurrect rows. Separately,
+  *trust events* (the C28 taxonomy) are emitted from the net actor only on a meaningful transition — a
+  `policy_version` bump (gated on `PolicyCache::cached_version` read *before* the cache insert) **or** a
+  blocking cutoff-hit — so a passively re-fetched, already-dismissed warning never resurrects while a real
+  escalation always breaks through. A relay that *withdraws* a previously-served policy (serves `None` after
+  we held a version) is treated as a rollback (`ServerDeprecationPolicyRollback`), not a benign empty state,
+  closing the strip-the-policy downgrade hole. A missing/short pinned key and any signature failure fail
+  closed to `ServerDeprecationPolicyUnreadable` — an unverifiable policy is never accepted (ISC-A-C9). The
+  decision logic lives in a pure `decide_deprecation(prev_version, artifact, server_pubkey, in_use, now)`
+  so every branch (rollback, withdrawal, missing-key, version-gating, escalation) is unit-tested without a
+  live session; the surface reuses core's `assess_deprecation` bridge rather than re-deriving the
+  pending-vs-cutoff mapping. The single-relay alpha collapses the C25 `(suite_id, server-id)` dismissal
+  scope to per-server, which is **safe only because** `assess_deprecation` filters the policy against the
+  one-element in-use set `&[CNSA_2_0.id]` — at most one warning can ever surface, so a dismissal cannot
+  swallow a sibling-suite deprecation. Adding a second in-use suite **requires** restoring the per-suite
+  dismissal key before that collapse is removed. **Known limitations (coupled to the deferred client
+  profile-persistence path, not independent):** the `PolicyCache` is in-memory only, so the anti-rollback
+  and withdrawal-as-rollback guarantees hold **within a session only** — a restart wipes the cached version,
+  after which a server that silently withdraws a previously-committed deprecation reads as a fresh clean
+  state rather than a rollback. The one-hour TTL is likewise not cross-restart enforced (the actor refetches
+  on every user action, stricter within-session). Multi-server earliest-cutoff governance is also post-MVP.
+  The unverifiable/unreadable path is deliberately **visible and non-destructive**:
+  `ServerDeprecationPolicyUnreadable` is PersistentNonBlocking (a status badge, never a silent no-op) and
+  flows through the same `DeprecationError` path that keeps the last good cached warning, so an attacker
+  forcing the unreadable branch cannot erase a previously-surfaced pending deprecation.
 - 2026-05-29: **refined:** This `ISA.md` *is* the promotion of the vault ISC draft into the repository as
   the authoritative system-of-record and contributor contract — unifying the previously-planned
   `docs/spec/isc.md` promotion with the Algorithm v6.3 project-ISA requirement into a single artifact. The
@@ -384,6 +436,13 @@ confirmed MVP-gating, not deferrable.
 - ISC coverage: 72/94 MVP spec ISCs have ≥1 registered test (static M7 floor; live count pending). Probe:
   `cargo xtask isc-coverage`.
 - DoD gates green as of M10 close (fmt / clippy `-D warnings` / test / check-proto); 636+ workspace tests.
+- M11 step 7 (suite-deprecation client surface, ISC-C25 / A-S11 / C28) verified 2026-05-30: 96 `daemonseed-tui`
+  unit tests pass (11 pure `decide_deprecation` cases covering rollback / withdrawal / missing-key / short-key /
+  version-gating / cutoff escalation / unaffected-suite, plus app-fold + Tab-ring + render tests), and the
+  end-to-end gate test `daemon_fetches_verifies_and_surfaces_deprecation_policy` passes inside `cargo xtask
+  mvp-gate` (relay boots a signed `[crypto]` policy, daemon fetches over `GetDeprecationPolicy`, verifies
+  against the TOFU-pinned server-wide key, and renders `suite-deprecation-pending`). Probe: `cargo xtask
+  mvp-gate` (PASS) + `cargo test -p daemonseed-tui`.
 - MVP gate: steps 1, 2, 4 pass on real binaries via the PTY harness. Steps 3/6/7/8 are M11 client-surface
   work (→ v0.13.0); step 5 (user-publish) is M12 (→ v0.14.0), at which point all 8 steps pass = MVP. Probe:
   `cargo xtask mvp-gate`.
