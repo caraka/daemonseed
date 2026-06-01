@@ -32,7 +32,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::gate::{DeprecationSeed, Gate, PublicSpaceSeed, ServerProcess};
+use common::gate::{DeprecationSeed, Gate, PtyTui, PublicSpaceSeed, ServerProcess};
 
 /// Bring-up smoke. Spawns the harness, waits for every daemon to paint
 /// its initial Welcome frame, tears down cleanly. Closes the
@@ -45,15 +45,15 @@ fn four_daemons_bring_up_against_real_server() {
         .expect("server subprocess spawns + binds to its ephemeral port");
     let gate = Gate::with_daemons(server, 4).expect("four PTY-attached daemons spawn");
 
-    // "first-start" is a single contiguous span in `ui::render_welcome`'s
-    // body; ratatui's Paragraph widget cursor-moves between space-
-    // separated words so multi-word substrings won't be contiguous in
-    // the raw PTY byte stream. Matching the hyphenated single-word form
-    // proves the spawned binary got past oxicrypt module init, the
-    // rustls provider install, crossterm raw-mode setup, and the first
-    // ratatui draw.
+    // "identity" is a single contiguous word in `ui::render_welcome`'s
+    // footer ("[Enter] new identity   [r] recover identity   [q] quit");
+    // ratatui's Paragraph widget cursor-moves between space-separated
+    // words so multi-word substrings won't be contiguous in the raw PTY
+    // byte stream — match a single word. Seeing it proves the spawned
+    // binary got past oxicrypt module init, the rustls provider install,
+    // crossterm raw-mode setup, and the first ratatui draw.
     for daemon in &gate.daemons {
-        if let Err(e) = daemon.wait_for("first-start", Duration::from_secs(8)) {
+        if let Err(e) = daemon.wait_for("identity", Duration::from_secs(8)) {
             eprintln!("{}", gate.failure_report(&format!("daemon-boot: {e}")));
             panic!(
                 "daemon {} never reached the Welcome screen: {e}",
@@ -428,4 +428,101 @@ fn four_daemons_mention_highlight_and_mute_suppression() {
     // until the recovery driver extracts the same handles for its
     // byte-identical assertion. Shape-only assertion.
     assert!(d2_handle.starts_with('#') && d2_handle.len() == 13);
+}
+
+/// Gate step 8 — clean-device recovery (ISC-C29 recover branch / ISC-A-C2).
+///
+/// Models real device loss. Daemon A cold-starts, authenticates, joins a
+/// circle and chats — surfacing its own `#<12hex>` floor handle in its local
+/// echo. A is then dropped (the device is "lost", freeing its connection). A
+/// FRESH daemon B is spawned on a brand-new profile dir and driven through the
+/// recover branch with A's captured 24-word mnemonic; B authenticates against
+/// the same relay, joins the same circle, and chats. B's own handle must be
+/// byte-identical to A's — proving identity is recovered from the mnemonic
+/// alone on a clean device, over the real binaries.
+#[test]
+#[ignore = "spawns real binaries; entry point is `cargo xtask mvp-gate`"]
+fn fresh_daemon_recovers_identity_from_mnemonic() {
+    let server = ServerProcess::spawn(Some("relay-mvp"))
+        .expect("server subprocess spawns + binds to its ephemeral port");
+    let bootstrap = server.bootstrap_handle();
+    let mut gate = Gate::with_daemons(server, 1).expect("one PTY-attached daemon spawns");
+
+    let passphrase = "correct horse battery staple table mountain";
+    let phrase = "circle-mvp-gate-very-strong-phrase-for-four-daemon-relay-2026";
+
+    // ── Original device A: cold first-start → circle → chat → capture handle ──
+    let captures = gate
+        .all_complete_first_start(passphrase, &bootstrap)
+        .unwrap_or_else(|e| {
+            eprintln!("{}", gate.failure_report(&format!("A first-start: {e}")));
+            panic!("A first-start failed: {e}");
+        });
+    let mnemonic = captures[0].mnemonic.clone();
+    gate.wait_all_authenticated(Duration::from_secs(15))
+        .unwrap_or_else(|e| {
+            eprintln!("{}", gate.failure_report(&format!("A authenticate: {e}")));
+            panic!("A authenticate failed: {e}");
+        });
+    gate.daemon_join_circle(0, phrase, Duration::from_secs(10))
+        .unwrap_or_else(|e| {
+            eprintln!("{}", gate.failure_report(&format!("A circle-join: {e}")));
+            panic!("A circle join failed: {e}");
+        });
+    gate.daemon_send_chat(0, "ping-from-original").unwrap();
+    gate.daemons[0]
+        .wait_for_visible("ping-from-original", Duration::from_secs(10))
+        .unwrap_or_else(|e| {
+            eprintln!("{}", gate.failure_report(&format!("A self-echo: {e}")));
+            panic!("A never rendered its own chat echo: {e}");
+        });
+    let handle_a = gate
+        .extract_handles(0)
+        .expect("extract A's own handle")
+        .into_iter()
+        .next()
+        .expect("A's floor handle present in its own chat echo");
+
+    // ── Device lost: drop A (kills the process, frees the connection). ──
+    let a = gate.daemons.remove(0);
+    drop(a);
+
+    // ── Clean device B: brand-new profile, recover from A's mnemonic. ──
+    gate.daemons
+        .push(PtyTui::spawn("D-recovered").expect("fresh recovery daemon spawns"));
+    gate.recover_one_daemon(0, &mnemonic, passphrase, &bootstrap)
+        .unwrap_or_else(|e| {
+            eprintln!("{}", gate.failure_report(&format!("B recover: {e}")));
+            panic!("B recover flow failed: {e}");
+        });
+    gate.daemons[0]
+        .wait_for_visible("connected to", Duration::from_secs(15))
+        .unwrap_or_else(|e| {
+            eprintln!("{}", gate.failure_report(&format!("B authenticate: {e}")));
+            panic!("recovered daemon B failed to reach Authenticated: {e}");
+        });
+    gate.daemon_join_circle(0, phrase, Duration::from_secs(10))
+        .unwrap_or_else(|e| {
+            eprintln!("{}", gate.failure_report(&format!("B circle-join: {e}")));
+            panic!("B circle join failed: {e}");
+        });
+    gate.daemon_send_chat(0, "ping-from-recovered").unwrap();
+    gate.daemons[0]
+        .wait_for_visible("ping-from-recovered", Duration::from_secs(10))
+        .unwrap_or_else(|e| {
+            eprintln!("{}", gate.failure_report(&format!("B self-echo: {e}")));
+            panic!("B never rendered its own chat echo: {e}");
+        });
+    let handle_b = gate
+        .extract_handles(0)
+        .expect("extract B's own handle")
+        .into_iter()
+        .next()
+        .expect("B's floor handle present in its own chat echo");
+
+    // ── The step-8 assertion: recovered identity == original identity. ──
+    assert_eq!(
+        handle_b, handle_a,
+        "clean-device recovery must reproduce the original identity handle"
+    );
 }

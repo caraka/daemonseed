@@ -773,8 +773,9 @@ impl Gate {
         passphrase: &str,
         bootstrap: &str,
     ) -> Result<Vec<FirstStartCapture>> {
-        // Welcome → press Enter to enter first-start.
-        self.wait_for_all_visible("begin first-start", Duration::from_secs(10))?;
+        // Welcome → press Enter to enter cold first-start (the `[Enter] new
+        // identity` action; `[r]` is the recover branch, exercised by step 8).
+        self.wait_for_all_visible("new identity", Duration::from_secs(10))?;
         self.broadcast_keys("\r")?;
 
         // FsStep::Passphrase — type the passphrase, advance.
@@ -854,6 +855,64 @@ impl Gate {
         Ok(captures)
     }
 
+    /// Drive the daemon at `idx` (a FRESH process sitting on the Welcome
+    /// screen) through the clean-device RECOVER branch (gate step 8 /
+    /// ISC-A-C2): Welcome `[r]` → RecoverChoose `[m]` (typed mnemonic) →
+    /// RecoverMnemonic → RecoverPassphrase → DisplayName (floor handle) →
+    /// Bootstrap → Main. `mnemonic` is the 24-word phrase captured from the
+    /// original device by [`Self::all_complete_first_start`]; `passphrase` is
+    /// the new local seal credential. Mirrors the cold-start driver but on
+    /// the recover path, and chooses a floor handle (empty display name) so
+    /// the recovered daemon's `#<12hex>` self-echo is directly comparable to
+    /// the original's via [`Self::extract_handles`].
+    pub fn recover_one_daemon(
+        &mut self,
+        idx: usize,
+        mnemonic: &str,
+        passphrase: &str,
+        bootstrap: &str,
+    ) -> Result<()> {
+        let d = self
+            .daemons
+            .get_mut(idx)
+            .ok_or_else(|| anyhow!("no daemon at index {idx}"))?;
+
+        // Welcome → `r` enters the recover branch (vs `Enter` for cold start).
+        d.wait_for_visible("recover identity", Duration::from_secs(10))?;
+        d.send("r")?;
+
+        // RecoverChoose → `m` selects the typed-mnemonic input path.
+        d.wait_for_visible("choose input", Duration::from_secs(5))?;
+        d.send("m")?;
+
+        // RecoverMnemonic → type the 24 words, advance.
+        d.wait_for_visible("type all 24 words", Duration::from_secs(5))?;
+        d.send(mnemonic)?;
+        d.send("\r")?;
+
+        // RecoverPassphrase → type the passphrase; recover() re-derives the
+        // identity and re-seals the local blob + .dseed on Enter (argon once),
+        // so cap at 30s for slow CI rigs.
+        d.wait_for_visible("passphrase", Duration::from_secs(5))?;
+        d.send(passphrase)?;
+        d.send("\r")?;
+
+        // DisplayName → clear the adj-noun prefill, submit empty → floor handle.
+        d.wait_for_visible("display name", Duration::from_secs(30))?;
+        d.send(&"\x7f".repeat(64))?;
+        d.send("\r")?;
+
+        // Bootstrap → clear the bundled prefill, type the test server, advance.
+        d.wait_for_visible("bootstrap relay", Duration::from_secs(5))?;
+        d.send(&"\x7f".repeat(200))?;
+        d.send(bootstrap)?;
+        d.send("\r")?;
+
+        // Main reached (Chat focus → "compose" footer).
+        d.wait_for_visible("compose", Duration::from_secs(10))?;
+        Ok(())
+    }
+
     /// Block until every daemon's status bar shows "connected to" —
     /// the green Connected state rendered by `ui::render_status_bar`
     /// once the per-connection identity-proof exchange has driven the
@@ -886,6 +945,28 @@ impl Gate {
             d.send("\r")?;
         }
         self.wait_for_all_visible("circle joined", timeout)?;
+        Ok(())
+    }
+
+    /// Join only the daemon at `idx` to the circle derived from `phrase`.
+    /// Single-daemon analogue of [`Self::all_join_circle`] — used by gate
+    /// step 8, where the recovered daemon joins after the others are set up.
+    /// Leaves the daemon on Chat focus (matching `all_join_circle`).
+    pub fn daemon_join_circle(
+        &mut self,
+        idx: usize,
+        phrase: &str,
+        timeout: Duration,
+    ) -> Result<()> {
+        let d = self
+            .daemons
+            .get_mut(idx)
+            .ok_or_else(|| anyhow!("no daemon at index {idx}"))?;
+        d.send("\t")?; // Chat → JoinCircle focus
+        d.wait_for_visible("circle phrase", Duration::from_secs(3))?;
+        d.send(phrase)?;
+        d.send("\r")?;
+        d.wait_for_visible("circle joined", timeout)?;
         Ok(())
     }
 
