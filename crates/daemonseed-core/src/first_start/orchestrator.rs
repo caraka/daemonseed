@@ -232,6 +232,109 @@ impl FirstStart<Welcome> {
             _state: PhantomData,
         })
     }
+
+    /// Clean-device recovery (ISC-C29 recover branch / ISC-A-C2 / gate step 8).
+    ///
+    /// The mirror image of [`Self::initialize`]: instead of *generating* a
+    /// fresh mnemonic, the caller *supplies* one the user already holds —
+    /// either typed in as 24 words or decrypted from a `.dseed` recovery file
+    /// (`recovery_file::open` → [`Mnemonic::to_phrase`]). Both input paths
+    /// converge here on a phrase string, so the core flow is source-agnostic.
+    ///
+    /// What recovery does and does not carry:
+    /// - **Identity is recovered.** The ML-DSA-87 / ML-KEM-1024 keypairs and
+    ///   thus the handle derive from the mnemonic alone via fixed HKDF `info`
+    ///   strings (no `profile_id` input), so the recovered handle is *byte-
+    ///   identical* to the original device's — that is the whole point of the
+    ///   step-8 gate ("reaches the same identity").
+    /// - **A fresh profile_id is minted.** The recovered device is a new
+    ///   profile (ISC-C36): `profile_id` is non-secret HKDF/Argon2-salt domain
+    ///   separation, generated locally, and the at-rest blob + `.dseed` are
+    ///   re-sealed under it on *this* device. Reusing the source `profile_id`
+    ///   would buy nothing — identity does not depend on it.
+    /// - **Circle-of-trust seeds are NOT recovered** (ISC-A-C2): they derive
+    ///   from user-chosen entropy not contained in the mnemonic. Recovery
+    ///   regains identity; circle access requires re-entering the circle
+    ///   passphrase. The caller surfaces this to the user.
+    ///
+    /// Backup verification (C33/C34) is skipped on purpose: the phrase *is*
+    /// the input, so possession is already proven. The supplied mnemonic is
+    /// dropped (zeroized) before returning; the flow lands directly in
+    /// [`BackupVerified`] and rejoins the shared [`FirstStart::finalize`] →
+    /// [`FirstStart::into_session_materials`] tail.
+    ///
+    /// `passphrase` is the *new local* session passphrase that will protect
+    /// the at-rest blob and the re-written `.dseed` on this device (subject to
+    /// the same ISC-C12 strength gate as first-start); on the `.dseed` path it
+    /// is also the passphrase that opened the source file (ISC-C30, one
+    /// credential).
+    pub fn recover(
+        self,
+        mnemonic_phrase: &str,
+        passphrase: &str,
+        argon2_params: ArgonParams,
+    ) -> Result<FirstStart<BackupVerified>, FirstStartError> {
+        // (C2) parse + verify the BIP-39 checksum / word-count / wordlist of
+        // the supplied phrase. A bad transcription fails closed here.
+        let mnemonic = Mnemonic::from_phrase(mnemonic_phrase).map_err(FirstStartError::Mnemonic)?;
+
+        // (C12) strength gate on the NEW local at-rest passphrase.
+        let strength: Strength = estimate(passphrase);
+        if !strength.is_session_green() {
+            return Err(FirstStartError::PassphraseTooWeak {
+                bits: strength.bits,
+                required: crate::passphrase::strength::SESSION_PASSPHRASE_MIN_BITS,
+            });
+        }
+
+        // (C4 / C2) derive the floor handle from the recovered mnemonic. This
+        // is the value that must match the source device.
+        let identity_handle = {
+            let keys = derive_identity_keys(&mnemonic, Identity::Primary)
+                .map_err(|e| FirstStartError::IdentityDerivation(e.to_string()))?;
+            Handle::from_pubkey(None, keys.signing.public_key())
+                .map_err(|e| FirstStartError::IdentityDerivation(e.to_string()))?
+        };
+
+        // (C36 / C14) fresh local profile config — new device, new profile_id.
+        let profile_config = ProfileConfig::new_for_first_start(argon2_params);
+
+        // (C32 / C30) re-seal a local `.dseed` under the new profile_id (borrow
+        // the mnemonic before it moves into the seeds blob below).
+        let recovery_file_bytes = recovery_file::seal(
+            &mnemonic,
+            passphrase,
+            profile_config.profile_id,
+            profile_config.argon2,
+        )
+        .map_err(FirstStartError::RecoveryFile)?;
+
+        // (C3) re-seal the at-rest blob under the new profile_id.
+        let seeds = Seeds::new(mnemonic);
+        let blob_bytes = seeds::seal(
+            &seeds,
+            passphrase,
+            profile_config.profile_id,
+            profile_config.argon2,
+        )
+        .map_err(FirstStartError::BlobSeal)?;
+
+        // Land directly in BackupVerified: the phrase was the input, so backup
+        // is verified-by-possession. `mnemonic: None` — the supplied phrase has
+        // been consumed into the sealed artifacts and zeroized.
+        Ok(FirstStart {
+            inner: Inner {
+                profile_config,
+                mnemonic: None,
+                blob_bytes,
+                recovery_file_bytes,
+                display_name: None,
+                bootstrap: None,
+                identity_handle: Some(identity_handle),
+            },
+            _state: PhantomData,
+        })
+    }
 }
 
 // ── Sealed ───────────────────────────────────────────────────────────────
@@ -678,5 +781,140 @@ mod tests {
         let m = ready.into_session_materials();
         assert!(m.handle.is_floor());
         assert!(m.handle.to_string().starts_with('#'));
+    }
+
+    // ── recovery (gate step 8 / ISC-A-C2) ──────────────────────────────────
+
+    /// Run a full fresh first-start and return its session materials —
+    /// the "original device" the recovery tests reconstruct against.
+    fn original_device() -> SessionMaterials {
+        let sealed = FirstStart::<Welcome>::new()
+            .initialize(STRONG_PASSPHRASE, fast_params())
+            .unwrap();
+        let phrase = sealed.display_phrase();
+        let verified = sealed.verify_round_trip(&phrase).unwrap();
+        verified
+            .finalize(Some("alice".to_string()), placeholder_anchor())
+            .unwrap()
+            .into_session_materials()
+    }
+
+    /// The load-bearing property of step 8: recovering from the original
+    /// device's 24-word mnemonic yields the *same identity* (same hash
+    /// prefix), regardless of the freshly-minted local profile_id.
+    #[test]
+    fn recover_reaches_same_identity() {
+        init_oxicrypt();
+        let original = original_device();
+        let phrase = recovery_file::open(&original.recovery_file_bytes, STRONG_PASSPHRASE)
+            .unwrap()
+            .mnemonic
+            .to_phrase();
+
+        let recovered = FirstStart::<Welcome>::new()
+            .recover(&phrase, STRONG_PASSPHRASE, fast_params())
+            .unwrap()
+            .finalize(Some("alice".to_string()), placeholder_anchor())
+            .unwrap()
+            .into_session_materials();
+
+        // Same identity-key hash prefix → same daemon, on a clean device.
+        assert_eq!(
+            recovered.handle.hash_prefix(),
+            original.handle.hash_prefix(),
+            "recovered identity must match the source device"
+        );
+        // Full wire handle matches too when the same display name is chosen.
+        assert_eq!(recovered.handle.to_string(), original.handle.to_string());
+    }
+
+    /// Recovery mints a *fresh* profile_id (ISC-C36) — the recovered device
+    /// is a new profile even though the identity is the same.
+    #[test]
+    fn recover_mints_fresh_profile_id() {
+        init_oxicrypt();
+        let original = original_device();
+        let phrase = recovery_file::open(&original.recovery_file_bytes, STRONG_PASSPHRASE)
+            .unwrap()
+            .mnemonic
+            .to_phrase();
+
+        let recovered = FirstStart::<Welcome>::new()
+            .recover(&phrase, STRONG_PASSPHRASE, fast_params())
+            .unwrap()
+            .finalize(None, placeholder_anchor())
+            .unwrap();
+
+        assert_ne!(
+            recovered.profile_id(),
+            original.profile_config.profile_id,
+            "recovered device is a new profile with its own profile_id"
+        );
+    }
+
+    /// The recovered device's at-rest blob and re-written `.dseed` both open
+    /// under the recovery passphrase, carrying the recovered mnemonic.
+    #[test]
+    fn recover_reseals_openable_artifacts() {
+        init_oxicrypt();
+        let original = original_device();
+        let phrase = recovery_file::open(&original.recovery_file_bytes, STRONG_PASSPHRASE)
+            .unwrap()
+            .mnemonic
+            .to_phrase();
+
+        let recovered = FirstStart::<Welcome>::new()
+            .recover(&phrase, STRONG_PASSPHRASE, fast_params())
+            .unwrap()
+            .finalize(None, placeholder_anchor())
+            .unwrap();
+        let pid = recovered.profile_id();
+        let argon = recovered.inner.profile_config.argon2;
+
+        // at-rest blob round-trips under the new profile_id + passphrase
+        let opened = seeds::open(
+            recovered.at_rest_blob_bytes(),
+            STRONG_PASSPHRASE,
+            pid,
+            argon,
+        )
+        .unwrap();
+        assert_eq!(opened.seeds.mnemonic.to_phrase(), phrase);
+
+        // re-written .dseed round-trips and carries the same phrase
+        let dseed =
+            recovery_file::open(recovered.recovery_file_bytes(), STRONG_PASSPHRASE).unwrap();
+        assert_eq!(dseed.mnemonic.to_phrase(), phrase);
+    }
+
+    /// A bad transcription (failed BIP-39 checksum) fails closed — no
+    /// partial profile, a typed error the UX can route.
+    #[test]
+    fn recover_rejects_invalid_mnemonic() {
+        init_oxicrypt();
+        // 24 words but the checksum is wrong (all "abandon" fails the BIP-39
+        // checksum for a 24-word phrase).
+        let bad = "abandon ".repeat(24);
+        match FirstStart::<Welcome>::new().recover(bad.trim(), STRONG_PASSPHRASE, fast_params()) {
+            Err(FirstStartError::Mnemonic(_)) => {}
+            Ok(_) => panic!("expected Mnemonic error, got Ok(FirstStart<BackupVerified>)"),
+            Err(other) => panic!("expected Mnemonic error, got {other:?}"),
+        }
+    }
+
+    /// The new local passphrase is still subject to the C12 strength gate.
+    #[test]
+    fn recover_rejects_weak_passphrase() {
+        init_oxicrypt();
+        let original = original_device();
+        let phrase = recovery_file::open(&original.recovery_file_bytes, STRONG_PASSPHRASE)
+            .unwrap()
+            .mnemonic
+            .to_phrase();
+        match FirstStart::<Welcome>::new().recover(&phrase, "password", fast_params()) {
+            Err(FirstStartError::PassphraseTooWeak { .. }) => {}
+            Ok(_) => panic!("expected PassphraseTooWeak, got Ok(FirstStart<BackupVerified>)"),
+            Err(other) => panic!("expected PassphraseTooWeak, got {other:?}"),
+        }
     }
 }

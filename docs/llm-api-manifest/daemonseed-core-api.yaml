@@ -1112,7 +1112,13 @@ types:
     description: >-
       Generic over phase. Each phase exposes only the methods valid in that
       phase. Welcome / Sealed / BackupVerified / Ready are uninhabited marker
-      types used as the S parameter.
+      types used as the S parameter. Two entry paths from Welcome: initialize()
+      generates a fresh mnemonic (cold enrollment); recover() accepts a mnemonic
+      the user already holds — typed 24 words or decrypted from a .dseed — and
+      lands directly in BackupVerified (clean-device recovery, gate step 8).
+      recover() mints a fresh local profile_id but re-derives the same identity
+      handle from the mnemonic (identity is profile_id-independent); it does not
+      recover circle-of-trust seeds (ISC-A-C2).
 
   - name: FirstStartError
     module: daemonseed_core::first_start
