@@ -864,6 +864,51 @@ types:
           The current signed deprecation policy; absent when none is
           configured.
 
+  - name: PublishShareRequest
+    module: public_space
+    kind: message
+    description: >-
+      Publish a public-space share (M12). listing.share_id is IGNORED — the
+      server assigns it. name/rating/sharer_handle are self-asserted, relayed
+      verbatim (ISC-A-S5b / ISC-C19).
+    iscs: [C19, A-S5b]
+    fields:
+      - name: listing
+        type: PublicShareListing
+        tag: 1
+        description: The share to publish; its share_id is ignored (server-assigned).
+
+  - name: PublishShareResponse
+    module: public_space
+    kind: message
+    description: The server-assigned opaque share id (used to UnpublishShare).
+    iscs: [C19]
+    fields:
+      - name: share_id
+        type: string
+        tag: 1
+        description: Opaque server-scoped share id.
+
+  - name: UnpublishShareRequest
+    module: public_space
+    kind: message
+    description: >-
+      Unpublish a share by its server-assigned id (M12). Owner-scoped; an
+      unknown or other-owned id is a silent no-op (ISC-A-S1).
+    iscs: [A-S1]
+    fields:
+      - name: share_id
+        type: string
+        tag: 1
+        description: A share_id previously returned by PublishShare on this connection.
+
+  - name: UnpublishShareResponse
+    module: public_space
+    kind: message
+    description: Empty acknowledgement; identical whether or not a share was removed (ISC-A-S1).
+    iscs: [A-S1]
+    fields: []
+
   # ── cot.proto ──────────────────────────────────────────────────────
 
   - name: CotFrame
@@ -1057,6 +1102,44 @@ functions:
     returns:
       type: GetDeprecationPolicyResponse
       description: The current signed deprecation policy or an empty response.
+
+  - name: PublicSpace.PublishShare
+    module: public_space
+    description: >-
+      Publish a public-space share (M12, gate step 5 — user-publish file
+      sharing). The server assigns an opaque share_id, holds the listing
+      RAM-ONLY for the lifetime of THIS connection, and includes it in
+      ListPublicShares until the sharer unpublishes or disconnects — nothing
+      persisted (ISC-A-S1). name/rating/sharer_handle are self-asserted, relayed
+      verbatim, never policed (ISC-A-S5b / ISC-C19), and sharer_handle is NOT
+      bound to the connection's authenticated identity (blind relay).
+    signature: "rpc PublishShare(PublishShareRequest) returns (PublishShareResponse)"
+    iscs: [C19, A-S5b, A-S1]
+    parameters:
+      - name: request
+        type: PublishShareRequest
+        description: The listing to publish; listing.share_id is ignored (server-assigned).
+    returns:
+      type: PublishShareResponse
+      description: The server-assigned opaque share_id (used to UnpublishShare).
+
+  - name: PublicSpace.UnpublishShare
+    module: public_space
+    description: >-
+      Unpublish a share this connection previously published, by its server-
+      assigned share_id (M12). Owner-scoped: an unknown or other-owned id is a
+      silent no-op — the relay never reveals another connection's share
+      ownership (ISC-A-S1). Disconnecting unpublishes every share the connection
+      holds regardless.
+    signature: "rpc UnpublishShare(UnpublishShareRequest) returns (UnpublishShareResponse)"
+    iscs: [A-S1]
+    parameters:
+      - name: request
+        type: UnpublishShareRequest
+        description: A share_id previously returned by PublishShare on this connection.
+    returns:
+      type: UnpublishShareResponse
+      description: Empty acknowledgement (identical whether or not a share was removed).
 
   # ── service CircleOfTrust (cot.proto, M8) ──────────────────────────
 

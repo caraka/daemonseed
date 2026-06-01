@@ -338,6 +338,22 @@ already-shipped APIs" — completing it adds protocol surface, which now rides M
 
 ## Decisions
 
+- 2026-06-01: **H2 `PublishShare` — RAM-only, connection-reaped, owner-scoped, blind-relay (gate step 5).**
+  M12 has no dedicated `ISC-38`; the user-publish wire surface was designed against the existing ISCs.
+  Forced choices: **RAM-only** (ISC-A-S1 — a published share is user data, not an operator carve-out, so it
+  is never persisted; it lives in process memory and is **reaped on disconnect**, mirroring the CoT live
+  relay's model); **server-assigned opaque `share_id`** (the M6 `PublicShareListing` doc already specifies
+  "opaque server-scoped identifier"); **self-asserted `sharer_handle`** relayed verbatim and **not bound to
+  the connection's authenticated identity** (M6 doc + ISC-A-S5b — the relay is a blind forwarder, never
+  polices); the RPCs extend the existing **`PublicSpace`** service (additive). Decision (caraka,
+  2026-06-01): **`PublishShare` + `UnpublishShare`** (not publish-only) so a daemon can stop sharing one
+  folder without dropping the connection. `UnpublishShare` is **owner-scoped** — an unknown or other-owned
+  `share_id` is a silent no-op, so the relay never reveals another connection's share ownership (ISC-A-S1).
+  Implementation: `daemonseed-server::share::SharePublishRegistry` (RAM-only, per-connection owner token) +
+  `ShareReapGuard` (reaps on connection close, every exit path incl. panic); `ListPublicShares` now serves
+  the live registry. Additive SemVer **MINOR** (wire version stays 1.0). Server half shipped on `feat/m12`
+  (proto + registry + handlers + reaping + over-the-wire publish/list/unpublish test); TUI/cli publish UX +
+  the full mvp-gate step-5 wiring are the next increment.
 - 2026-06-01: **Introducer refresh is precautionary — discovered peers are candidates the user promotes,
   never auto-trusted (ISC-C22 / ISC-A-C19).** The spec settled the *trust semantics* of an
   introducer-discovered server ("treated identically to manual entry — never auto-trusted from the

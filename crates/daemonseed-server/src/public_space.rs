@@ -63,6 +63,7 @@ use crate::config::PeerConfig;
 use crate::cot::{CotRegistry, CotService};
 use crate::federation::IntroducerService;
 use crate::rate_limit::{ConnectionLimiter, RateLimitConfig};
+use crate::share::{OwnerId, SharePublishRegistry};
 use oxicrypt_ml_dsa as ml_dsa;
 use prost::Message;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -659,12 +660,37 @@ fn load_motd(path: &Path, whitelist: &Whitelist) -> Option<wire::SignedArtifact>
 #[derive(Clone)]
 pub struct PublicSpaceService {
     state: Arc<PublicSpaceState>,
+    /// The relay's RAM-only published-share table (M12, gate step 5), shared
+    /// across connections. A fresh isolated registry by default; the real
+    /// server-wide one is attached per connection by [`Self::set_share_context`]
+    /// so `PublishShare` from any connection is visible to others' listings.
+    shares: SharePublishRegistry,
+    /// This connection's publisher token (M12). Every share this service
+    /// publishes is owned by it, so a single disconnect reaps exactly this
+    /// connection's shares ([`crate::share::ShareReapGuard`]).
+    owner: OwnerId,
 }
 
 impl PublicSpaceService {
-    /// Wrap shared public-space state for serving over one connection.
+    /// Wrap shared public-space state for serving over one connection. The share
+    /// context starts isolated (empty registry, owner 0); the connection driver
+    /// calls [`Self::set_share_context`] to bind the server-wide registry and
+    /// this connection's owner token.
     pub fn new(state: Arc<PublicSpaceState>) -> Self {
-        Self { state }
+        Self {
+            state,
+            shares: SharePublishRegistry::new(),
+            owner: 0,
+        }
+    }
+
+    /// Bind the server-wide published-share registry and this connection's owner
+    /// token (M12). Called once per connection after the owner is allocated;
+    /// the matching [`crate::share::ShareReapGuard`] reaps `owner`'s shares when
+    /// the connection closes.
+    pub fn set_share_context(&mut self, shares: SharePublishRegistry, owner: OwnerId) {
+        self.shares = shares;
+        self.owner = owner;
     }
 }
 
@@ -739,8 +765,11 @@ impl PublicSpace for PublicSpaceService {
         &self,
         _request: Request<wire::ListPublicSharesRequest>,
     ) -> Result<Response<wire::ListPublicSharesResponse>, Status> {
+        // The live RAM-only published set (M12). The relay returns the complete
+        // listing verbatim; rating filtering and the hidden-shares filter are
+        // entirely client-side (ISC-A-C5 / ISC-C16 / ISC-A-S5b).
         Ok(Response::new(wire::ListPublicSharesResponse {
-            shares: self.state.public_shares(),
+            shares: self.shares.list(),
         }))
     }
 
@@ -753,6 +782,37 @@ impl PublicSpace for PublicSpaceService {
         Ok(Response::new(wire::GetDeprecationPolicyResponse {
             policy: self.state.get_deprecation_policy(),
         }))
+    }
+
+    async fn publish_share(
+        &self,
+        request: Request<wire::PublishShareRequest>,
+    ) -> Result<Response<wire::PublishShareResponse>, Status> {
+        // The relay is a blind forwarder: the listing's name / rating /
+        // sharer_handle are self-asserted and stored verbatim, never policed
+        // (ISC-A-S5b / ISC-C19), and never bound to the connection's
+        // authenticated identity. The server assigns the opaque share_id and
+        // holds the listing RAM-only under THIS connection's owner token, so it
+        // is reaped on disconnect (ISC-A-S1).
+        let listing = request
+            .into_inner()
+            .listing
+            .ok_or_else(|| Status::invalid_argument("missing listing"))?;
+        let share_id = self.shares.publish(self.owner, listing);
+        Ok(Response::new(wire::PublishShareResponse { share_id }))
+    }
+
+    async fn unpublish_share(
+        &self,
+        request: Request<wire::UnpublishShareRequest>,
+    ) -> Result<Response<wire::UnpublishShareResponse>, Status> {
+        // Owner-scoped: only this connection can unpublish its own share. An
+        // unknown or other-owned id is a silent no-op — the relay never reveals
+        // another connection's share ownership (ISC-A-S1), so the response is
+        // identical whether the share existed-and-was-ours or not.
+        let share_id = request.into_inner().share_id;
+        self.shares.unpublish(self.owner, &share_id);
+        Ok(Response::new(wire::UnpublishShareResponse {}))
     }
 }
 
@@ -1597,6 +1657,91 @@ mod tests {
             signals[0].recommended_suite_id,
             SuiteId::try_new(2).unwrap()
         );
+
+        drop(client);
+        let _ = server.await;
+    }
+
+    /// M12 gate step 5 end-to-end over the wire: a daemon publishes a share, it
+    /// appears in ListPublicShares with the server-assigned id and the sharer's
+    /// self-asserted fields verbatim, and unpublishing it (owner-scoped) removes
+    /// it. Proves PublishShare / UnpublishShare are wired through the real
+    /// gRPC service over the post-Authenticated stream.
+    #[tokio::test]
+    async fn publish_list_unpublish_share_over_wire() {
+        let registry = SharePublishRegistry::new();
+        let owner = registry.new_owner();
+        let mut service = PublicSpaceService::new(Arc::new(PublicSpaceState::empty()));
+        service.set_share_context(registry.clone(), owner);
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(serve_application(
+            server_io,
+            service,
+            CotRegistry::new(),
+            Arc::new(Vec::new()),
+        ));
+
+        let mut client_io = Some(client_io);
+        let channel = Endpoint::try_from("http://[::1]:50051")
+            .unwrap()
+            .connect_with_connector(tower::service_fn(move |_| {
+                let io = client_io.take().expect("connector invoked once");
+                async move { Ok::<_, io::Error>(TokioIo::new(io)) }
+            }))
+            .await
+            .expect("in-memory connect over duplex");
+        let mut client = PublicSpaceClient::new(channel);
+
+        // Publish: the server assigns the id; the client's share_id is ignored.
+        let share_id = client
+            .publish_share(wire::PublishShareRequest {
+                listing: Some(wire::PublicShareListing {
+                    share_id: "client-guess".to_owned(),
+                    name: "design-docs".to_owned(),
+                    rating: "PG".to_owned(),
+                    sharer_handle: "brave-otter#aabbccddeeff".to_owned(),
+                }),
+            })
+            .await
+            .expect("PublishShare routes")
+            .into_inner()
+            .share_id;
+        assert!(!share_id.is_empty());
+        assert_ne!(
+            share_id, "client-guess",
+            "share_id is server-assigned (F25)"
+        );
+
+        // List: the share is served with the assigned id and verbatim fields.
+        let shares = client
+            .list_public_shares(wire::ListPublicSharesRequest {})
+            .await
+            .expect("ListPublicShares routes")
+            .into_inner()
+            .shares;
+        assert_eq!(shares.len(), 1);
+        assert_eq!(shares[0].share_id, share_id);
+        assert_eq!(shares[0].name, "design-docs");
+        assert_eq!(
+            shares[0].sharer_handle, "brave-otter#aabbccddeeff",
+            "self-asserted handle relayed verbatim (ISC-A-S5b)"
+        );
+
+        // Unpublish (owner-scoped): the share is gone from the listing.
+        client
+            .unpublish_share(wire::UnpublishShareRequest {
+                share_id: share_id.clone(),
+            })
+            .await
+            .expect("UnpublishShare routes");
+        let shares = client
+            .list_public_shares(wire::ListPublicSharesRequest {})
+            .await
+            .expect("ListPublicShares routes")
+            .into_inner()
+            .shares;
+        assert!(shares.is_empty(), "unpublished share no longer listed");
 
         drop(client);
         let _ = server.await;

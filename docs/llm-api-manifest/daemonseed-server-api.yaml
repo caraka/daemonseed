@@ -287,6 +287,23 @@ modules:
     iscs: [S18, A-S13]
     added_in: "v0.12.0 (M10)"
 
+  - name: daemonseed_server::share
+    description: >-
+      RAM-only published-share registry (M12, gate step 5 — user-publish file
+      sharing). SharePublishRegistry holds PublishShare'd listings in process
+      memory ONLY (ISC-A-S1 — a share is user data, not an operator carve-out),
+      keyed by a server-assigned opaque share_id and tagged with the publishing
+      connection's owner token. publish/unpublish/list back the PublicSpace
+      PublishShare / UnpublishShare / ListPublicShares RPCs; unpublish and reap
+      are owner-scoped. ShareReapGuard reaps a connection's shares on disconnect
+      (mirrors the CoT ReleaseGuard) so nothing survives the connection. The
+      relay is a blind forwarder: self-asserted name/rating/handle relayed
+      verbatim, never policed (ISC-A-S5b / ISC-C19), never bound to identity.
+    no_std: false
+    depends_on: [daemonseed-proto]
+    iscs: [C19, A-S1, A-S5b]
+    added_in: "M12 (gate step 5)"
+
 # ─────────────────────────────────────────────────────────────────────
 # Types
 # ─────────────────────────────────────────────────────────────────────

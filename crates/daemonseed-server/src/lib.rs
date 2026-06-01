@@ -33,6 +33,9 @@
 //! - [`rate_limit`] — multi-granularity, RAM-only abuse/DoS rate limits:
 //!   per-connection token bucket + subscription / verify caps, and a
 //!   per-identity-key connection table GC'd on disconnect (M9, ISC-S17/A-S12)
+//! - [`share`] — RAM-only published-share registry: `PublishShare` /
+//!   `UnpublishShare` over the public-space service, owner-scoped and reaped
+//!   on disconnect — nothing persisted (M12, gate step 5, ISC-A-S1 / ISC-C19)
 
 #![forbid(unsafe_code)]
 
@@ -49,4 +52,5 @@ pub mod kats;
 pub mod public_space;
 pub mod rate_limit;
 pub mod runtime;
+pub mod share;
 pub mod tls;
