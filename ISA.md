@@ -338,6 +338,21 @@ already-shipped APIs" — completing it adds protocol surface, which now rides M
 
 ## Decisions
 
+- 2026-06-01: **M12 kicked off on `feat/m12`** (worktree at `.worktrees/feat-m12`, based on `main`
+  449206a). Scope = two halves under **one** additive SemVer MINOR bump → **v0.14.0**, the moment both
+  land the full 4-daemon MVP gate trips and the **MVP is declared**: **H1 (gate step 6)** federation
+  introducer endpoint — additive gRPC RPC over the already-shipped `IntroducerQuery`/`IntroducerResponse`
+  messages + `introducer_response()` builder (verified present on base) + its client refresh surface;
+  **H2 (gate step 5)** `PublishShare` — new RPC + server handler + TUI publish surface (verified absent on
+  base, as expected). Sequencing **H1-first** (smaller/additive warm-up validating the gate harness +
+  version-bump plumbing), then H2; coupling is low (federation discovery vs user-content publish) and the
+  gate trips only on both, so ordering is risk/momentum only. **Coding approach: primary-drives-directly**
+  on the `feat/m12` worktree — the halves are sequential so worktree isolation buys nothing; the
+  Engineer-isolation bug stays **deferred** (do not delegate in-worktree edits to `Engineer`; a single
+  non-isolating general-purpose agent per half, strictly serial, is the only sanctioned delegation). The
+  orphan Engineer-isolation worktree (branch `worktree-agent-a5f26bed24e95a65d`, tip `ad9b520`, zero
+  unmerged commits) was purged as part of this kickoff. Single MINOR bump + changelog land **after** both
+  halves, never per-half. (refined: advisor-reviewed at the kickoff commitment boundary.)
 - 2026-06-01: **Clean-device recovery shipped (gate step 8 — ISC-C29 recover branch / C30 / C32 / C36 /
   A-C2).** Recovery is the mirror of cold first-start: `FirstStart::<Welcome>::recover(mnemonic, passphrase,
   argon)` accepts a phrase the user already holds instead of generating one, and lands directly in
