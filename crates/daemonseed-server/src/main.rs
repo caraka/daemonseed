@@ -141,6 +141,7 @@ fn run_server(cli: Cli) -> Result<(), BootError> {
             identity,
             public_space,
             config.server_source.clone(),
+            config.peers.clone(),
             shutdown_signal(),
             noop_observer(),
         ))

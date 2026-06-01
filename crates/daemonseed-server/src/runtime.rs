@@ -45,6 +45,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
 
+use crate::config::PeerConfig;
 use crate::cot::CotRegistry;
 use crate::hello::{HelloOutcome, serve_hello};
 use crate::identity_proof::{
@@ -79,6 +80,10 @@ struct ServerContext {
     seen: SeenMap,
     cot: CotRegistry,
     key_table: PerKeyRateTable,
+    /// Operator's federation `[[peer]]` table (ISC-S12), shared read-only and
+    /// answered by the M12 introducer endpoint (gate step 6). Cloning shares
+    /// the inner `Arc`; the table is process-lifetime config, never mutated.
+    peers: Arc<Vec<PeerConfig>>,
 }
 
 /// Bind to `addr`, accept connections, terminate TLS via `tls_config`,
@@ -93,12 +98,17 @@ struct ServerContext {
 /// AlgorithmProfile::Cnsa2)` to `Ok(())` before calling this.
 /// `tls_config` will fail to build otherwise; we don't redundantly
 /// gate here.
+// Eight startup inputs, each a distinct process-scoped value with no natural
+// grouping (the M12 `peers` table is the eighth); a params struct would add
+// indirection without clarity. Mirrors `run_server_identity_proof`.
+#[allow(clippy::too_many_arguments)]
 pub async fn run<F>(
     addr: SocketAddr,
     tls_config: ServerConfig,
     identity: Arc<ServerIdentity>,
     public_space: Arc<PublicSpaceState>,
     server_source: Option<String>,
+    peers: Vec<PeerConfig>,
     shutdown: F,
     observer: ConnectionObserver,
 ) -> io::Result<()>
@@ -125,6 +135,11 @@ where
     // connections, GC'd as connections close. Pi-4-floor cap default.
     let key_table = PerKeyRateTable::new(RateLimitConfig::default().max_conns_per_key);
 
+    // Operator's federation peer table (ISC-S12), shared read-only across every
+    // connection for the M12 introducer endpoint (gate step 6). Empty by default
+    // — a server introduces no peers until the operator configures them.
+    let peers = Arc::new(peers);
+
     // Bundle the shared, process-lifetime state once; clone it per connection.
     let ctx = ServerContext {
         identity,
@@ -133,6 +148,7 @@ where
         seen,
         cot,
         key_table,
+        peers,
     };
 
     tokio::pin!(shutdown);
@@ -192,6 +208,7 @@ async fn serve_connection(
         seen,
         cot,
         key_table,
+        peers,
     } = ctx;
 
     let mut tls_stream: TlsStream<TcpStream> = match acceptor.accept(stream).await {
@@ -283,7 +300,7 @@ async fn serve_connection(
             // CoT asset references this connection held, ISC-10).
             let authenticated = versioned.into_authenticated(verified);
             let service = PublicSpaceService::new(public_space);
-            let _ = serve_application(authenticated.into_inner(), service, cot).await;
+            let _ = serve_application(authenticated.into_inner(), service, cot, peers).await;
             // `_slot` drops here (and on unwind), releasing the per-key slot.
         }
         Err(_e) => {

@@ -119,7 +119,11 @@ modules:
       request it returns the federation peers it knows about as
       (server-id, address, last-known-availability) triples. The hard
       invariant (ISC-S6): an introducer response NEVER carries a public
-      key. Generated into daemonseed_proto::v1.
+      key. M5 shipped the messages; M12 added the FederationIntroducer
+      service (Introduce RPC, gate step 6), served as gRPC-over-h2 over
+      the post-Authenticated stream like public_space and cot — an
+      additive SemVer MINOR bump (wire version stays 1.0). Generated into
+      daemonseed_proto::v1.
     no_std: false
     depends_on: []
     iscs: [S6, S12, S13, A-S7]
@@ -1079,3 +1083,32 @@ functions:
       description: >-
         Outbound frame stream carrying frames from co-subscribers of the
         same asset.
+
+  # ── service FederationIntroducer (federation.proto, M12) ────────────
+
+  - name: FederationIntroducer.Introduce
+    module: federation
+    description: >-
+      Federation introducer endpoint (M12, gate step 6). A unary post-
+      Authenticated RPC reusing the M5 IntroducerQuery / IntroducerResponse
+      messages: an empty target_server_id returns the full introduce-to-
+      clients peer list; a populated one returns just that peer's triple if
+      known and introducible. Per ISC-A-S7 an unknown OR don't-introduce
+      peer yields the SAME empty response (indistinguishable on the wire).
+      Never returns a public key — PeerTriple structurally has no key field
+      (ISC-S6). Serves both client and server-to-server introductions
+      (ISC-S12); the filtering rules are identical on both paths. Additive
+      service — wire version stays 1.0, SemVer impact MINOR.
+    signature: "rpc Introduce(IntroducerQuery) returns (IntroducerResponse)"
+    iscs: [S6, S12, S13, A-S7]
+    parameters:
+      - name: request
+        type: IntroducerQuery
+        description: >-
+          Empty target_server_id = full filtered list; populated = single
+          peer by id (or empty if unknown / suppressed, ISC-A-S7).
+    returns:
+      type: IntroducerResponse
+      description: >-
+        Zero or more PeerTriples, never any public keys (ISC-S6). Excludes
+        every introduce_to_clients=false peer (ISC-S13).

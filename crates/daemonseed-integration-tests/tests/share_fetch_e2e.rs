@@ -42,6 +42,8 @@ fn spawn_relay(
         server_io,
         PublicSpaceService::new(Arc::new(PublicSpaceState::empty())),
         registry,
+        // No federation peers in the share-fetch relay scenario (M12 introducer arg).
+        Arc::new(Vec::new()),
     ))
 }
 

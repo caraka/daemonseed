@@ -115,6 +115,7 @@ mod tests {
             server_io,
             PublicSpaceService::new(state),
             CotRegistry::new(),
+            Arc::new(Vec::new()), // no federation peers (M12 introducer arg)
         ));
 
         let session = AppSession::open(client_io).await.expect("session opens");
@@ -153,6 +154,7 @@ mod tests {
             server_io,
             PublicSpaceService::new(state),
             CotRegistry::new(),
+            Arc::new(Vec::new()), // no federation peers (M12 introducer arg)
         ));
 
         let session = AppSession::open(client_io).await.expect("session opens");

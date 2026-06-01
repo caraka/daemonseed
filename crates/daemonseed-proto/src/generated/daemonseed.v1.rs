@@ -479,6 +479,328 @@ pub struct IntroducerResponse {
     #[prost(message, repeated, tag = "1")]
     pub peers: ::prost::alloc::vec::Vec<PeerTriple>,
 }
+/// Generated client implementations.
+pub mod federation_introducer_client {
+    #![allow(
+        unused_variables,
+        dead_code,
+        missing_docs,
+        clippy::wildcard_imports,
+        clippy::let_unit_value,
+    )]
+    use tonic::codegen::*;
+    use tonic::codegen::http::Uri;
+    /// The federation introducer endpoint (ISC-S6 / ISC-S12 / ISC-S13 / ISC-A-S7).
+    ///
+    /// M5 shipped the messages above and the server-side `introducer_response`
+    /// builder, but never an endpoint to read a query off a socket. M12 adds that
+    /// endpoint as a unary post-Authenticated gRPC RPC reusing those messages
+    /// verbatim — discovery, decoupled from trust establishment (see the file
+    /// header). The hard invariant is structural: the response type `PeerTriple`
+    /// has no key field and never gains one (ISC-S6), so this service physically
+    /// cannot leak a peer's public key.
+    #[derive(Debug, Clone)]
+    pub struct FederationIntroducerClient<T> {
+        inner: tonic::client::Grpc<T>,
+    }
+    impl<T> FederationIntroducerClient<T>
+    where
+        T: tonic::client::GrpcService<tonic::body::BoxBody>,
+        T::Error: Into<StdError>,
+        T::ResponseBody: Body<Data = Bytes> + std::marker::Send + 'static,
+        <T::ResponseBody as Body>::Error: Into<StdError> + std::marker::Send,
+    {
+        pub fn new(inner: T) -> Self {
+            let inner = tonic::client::Grpc::new(inner);
+            Self { inner }
+        }
+        pub fn with_origin(inner: T, origin: Uri) -> Self {
+            let inner = tonic::client::Grpc::with_origin(inner, origin);
+            Self { inner }
+        }
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> FederationIntroducerClient<InterceptedService<T, F>>
+        where
+            F: tonic::service::Interceptor,
+            T::ResponseBody: Default,
+            T: tonic::codegen::Service<
+                http::Request<tonic::body::BoxBody>,
+                Response = http::Response<
+                    <T as tonic::client::GrpcService<tonic::body::BoxBody>>::ResponseBody,
+                >,
+            >,
+            <T as tonic::codegen::Service<
+                http::Request<tonic::body::BoxBody>,
+            >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
+        {
+            FederationIntroducerClient::new(InterceptedService::new(inner, interceptor))
+        }
+        /// Compress requests with the given encoding.
+        ///
+        /// This requires the server to support it otherwise it might respond with an
+        /// error.
+        #[must_use]
+        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.inner = self.inner.send_compressed(encoding);
+            self
+        }
+        /// Enable decompressing responses.
+        #[must_use]
+        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.inner = self.inner.accept_compressed(encoding);
+            self
+        }
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.inner = self.inner.max_decoding_message_size(limit);
+            self
+        }
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.inner = self.inner.max_encoding_message_size(limit);
+            self
+        }
+        /// Return the introducer's filtered federation peers. An empty
+        /// `target_server_id` returns the full introduce-to-clients list; a populated
+        /// one returns just that peer's triple if it is both known and introducible.
+        /// Per ISC-A-S7 an unknown OR don't-introduce peer yields the SAME empty
+        /// response, indistinguishable on the wire. Never returns a public key
+        /// (ISC-S6). The same RPC serves client and server-to-server introductions
+        /// (ISC-S12) — the filtering rules are identical on both paths.
+        pub async fn introduce(
+            &mut self,
+            request: impl tonic::IntoRequest<super::IntroducerQuery>,
+        ) -> std::result::Result<
+            tonic::Response<super::IntroducerResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/daemonseed.v1.FederationIntroducer/Introduce",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("daemonseed.v1.FederationIntroducer", "Introduce"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+    }
+}
+/// Generated server implementations.
+pub mod federation_introducer_server {
+    #![allow(
+        unused_variables,
+        dead_code,
+        missing_docs,
+        clippy::wildcard_imports,
+        clippy::let_unit_value,
+    )]
+    use tonic::codegen::*;
+    /// Generated trait containing gRPC methods that should be implemented for use with FederationIntroducerServer.
+    #[async_trait]
+    pub trait FederationIntroducer: std::marker::Send + std::marker::Sync + 'static {
+        /// Return the introducer's filtered federation peers. An empty
+        /// `target_server_id` returns the full introduce-to-clients list; a populated
+        /// one returns just that peer's triple if it is both known and introducible.
+        /// Per ISC-A-S7 an unknown OR don't-introduce peer yields the SAME empty
+        /// response, indistinguishable on the wire. Never returns a public key
+        /// (ISC-S6). The same RPC serves client and server-to-server introductions
+        /// (ISC-S12) — the filtering rules are identical on both paths.
+        async fn introduce(
+            &self,
+            request: tonic::Request<super::IntroducerQuery>,
+        ) -> std::result::Result<
+            tonic::Response<super::IntroducerResponse>,
+            tonic::Status,
+        >;
+    }
+    /// The federation introducer endpoint (ISC-S6 / ISC-S12 / ISC-S13 / ISC-A-S7).
+    ///
+    /// M5 shipped the messages above and the server-side `introducer_response`
+    /// builder, but never an endpoint to read a query off a socket. M12 adds that
+    /// endpoint as a unary post-Authenticated gRPC RPC reusing those messages
+    /// verbatim — discovery, decoupled from trust establishment (see the file
+    /// header). The hard invariant is structural: the response type `PeerTriple`
+    /// has no key field and never gains one (ISC-S6), so this service physically
+    /// cannot leak a peer's public key.
+    #[derive(Debug)]
+    pub struct FederationIntroducerServer<T> {
+        inner: Arc<T>,
+        accept_compression_encodings: EnabledCompressionEncodings,
+        send_compression_encodings: EnabledCompressionEncodings,
+        max_decoding_message_size: Option<usize>,
+        max_encoding_message_size: Option<usize>,
+    }
+    impl<T> FederationIntroducerServer<T> {
+        pub fn new(inner: T) -> Self {
+            Self::from_arc(Arc::new(inner))
+        }
+        pub fn from_arc(inner: Arc<T>) -> Self {
+            Self {
+                inner,
+                accept_compression_encodings: Default::default(),
+                send_compression_encodings: Default::default(),
+                max_decoding_message_size: None,
+                max_encoding_message_size: None,
+            }
+        }
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> InterceptedService<Self, F>
+        where
+            F: tonic::service::Interceptor,
+        {
+            InterceptedService::new(Self::new(inner), interceptor)
+        }
+        /// Enable decompressing requests with the given encoding.
+        #[must_use]
+        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.accept_compression_encodings.enable(encoding);
+            self
+        }
+        /// Compress responses with the given encoding, if the client supports it.
+        #[must_use]
+        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.send_compression_encodings.enable(encoding);
+            self
+        }
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.max_decoding_message_size = Some(limit);
+            self
+        }
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.max_encoding_message_size = Some(limit);
+            self
+        }
+    }
+    impl<T, B> tonic::codegen::Service<http::Request<B>>
+    for FederationIntroducerServer<T>
+    where
+        T: FederationIntroducer,
+        B: Body + std::marker::Send + 'static,
+        B::Error: Into<StdError> + std::marker::Send + 'static,
+    {
+        type Response = http::Response<tonic::body::BoxBody>;
+        type Error = std::convert::Infallible;
+        type Future = BoxFuture<Self::Response, Self::Error>;
+        fn poll_ready(
+            &mut self,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn call(&mut self, req: http::Request<B>) -> Self::Future {
+            match req.uri().path() {
+                "/daemonseed.v1.FederationIntroducer/Introduce" => {
+                    #[allow(non_camel_case_types)]
+                    struct IntroduceSvc<T: FederationIntroducer>(pub Arc<T>);
+                    impl<
+                        T: FederationIntroducer,
+                    > tonic::server::UnaryService<super::IntroducerQuery>
+                    for IntroduceSvc<T> {
+                        type Response = super::IntroducerResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::IntroducerQuery>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as FederationIntroducer>::introduce(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = IntroduceSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                _ => {
+                    Box::pin(async move {
+                        let mut response = http::Response::new(empty_body());
+                        let headers = response.headers_mut();
+                        headers
+                            .insert(
+                                tonic::Status::GRPC_STATUS,
+                                (tonic::Code::Unimplemented as i32).into(),
+                            );
+                        headers
+                            .insert(
+                                http::header::CONTENT_TYPE,
+                                tonic::metadata::GRPC_CONTENT_TYPE,
+                            );
+                        Ok(response)
+                    })
+                }
+            }
+        }
+    }
+    impl<T> Clone for FederationIntroducerServer<T> {
+        fn clone(&self) -> Self {
+            let inner = self.inner.clone();
+            Self {
+                inner,
+                accept_compression_encodings: self.accept_compression_encodings,
+                send_compression_encodings: self.send_compression_encodings,
+                max_decoding_message_size: self.max_decoding_message_size,
+                max_encoding_message_size: self.max_encoding_message_size,
+            }
+        }
+    }
+    /// Generated gRPC service name
+    pub const SERVICE_NAME: &str = "daemonseed.v1.FederationIntroducer";
+    impl<T> tonic::server::NamedService for FederationIntroducerServer<T> {
+        const NAME: &'static str = SERVICE_NAME;
+    }
+}
 /// Wire-tagged identifier for a registry entry. Carried on every
 /// cryptographic artifact (at-rest blob header, recovery file header,
 /// CoT-asset payload, identity-proof signature, server-wide signed material).

@@ -55,10 +55,13 @@ use daemonseed_core::public_space::{
 };
 use daemonseed_proto::v1 as wire;
 use daemonseed_proto::v1::circle_of_trust_server::CircleOfTrustServer;
+use daemonseed_proto::v1::federation_introducer_server::FederationIntroducerServer;
 use daemonseed_proto::v1::public_space_server::{PublicSpace, PublicSpaceServer};
 
 use crate::app_limit::RequestRateLayer;
+use crate::config::PeerConfig;
 use crate::cot::{CotRegistry, CotService};
+use crate::federation::IntroducerService;
 use crate::rate_limit::{ConnectionLimiter, RateLimitConfig};
 use oxicrypt_ml_dsa as ml_dsa;
 use prost::Message;
@@ -820,8 +823,11 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ServedConn<S> {
     }
 }
 
-/// Serve [`PublicSpace`] over a single already-Authenticated transport until
-/// the peer closes the connection.
+/// Serve the post-Authenticated application surface over a single already-
+/// Authenticated transport until the peer closes the connection: the
+/// [`PublicSpace`] service (M6), the `CircleOfTrust` live relay (M8), and the
+/// `FederationIntroducer` endpoint (M12). All three share this one h2 server;
+/// `peers` is the operator's federation peer table the introducer answers from.
 ///
 /// The caller passes the connection only after the identity-proof exchange has
 /// advanced it to `Authenticated` (daemonseed-core type-state), so reaching
@@ -833,6 +839,7 @@ pub async fn serve_application<S>(
     stream: S,
     public_space: PublicSpaceService,
     cot: CotRegistry,
+    peers: Arc<Vec<PeerConfig>>,
 ) -> Result<(), tonic::transport::Error>
 where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
@@ -859,6 +866,13 @@ where
         .http2_keepalive_timeout(Some(Duration::from_secs(20)))
         .add_service(PublicSpaceServer::new(public_space))
         .add_service(CircleOfTrustServer::new(CotService::new(cot, limiter)))
+        // M12 (gate step 6): the federation introducer endpoint, served over
+        // the same post-Authenticated stream. The operator's peer table is
+        // shared read-only; the handler is a pure projection of it (ISC-S6 /
+        // ISC-S13 / ISC-A-S7 live in `federation::introducer_response`).
+        .add_service(FederationIntroducerServer::new(IntroducerService::new(
+            peers,
+        )))
         .serve_with_incoming(incoming)
         .await
 }
@@ -1476,6 +1490,7 @@ mod tests {
             server_io,
             PublicSpaceService::new(state),
             CotRegistry::new(),
+            Arc::new(Vec::new()),
         ));
 
         // One-shot connector hands the client-side duplex half to tonic.
@@ -1550,6 +1565,7 @@ mod tests {
             server_io,
             PublicSpaceService::new(state),
             CotRegistry::new(),
+            Arc::new(Vec::new()),
         ));
 
         let mut client_io = Some(client_io);

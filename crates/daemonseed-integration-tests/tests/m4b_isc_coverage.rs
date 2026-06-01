@@ -120,6 +120,7 @@ async fn m4b_iscs_exercise_end_to_end() {
             identity,
             Arc::new(PublicSpaceState::empty()),
             None,
+            Vec::new(), // no federation peers (M12 introducer arg)
             async move {
                 let _ = shutdown_rx.await;
             },

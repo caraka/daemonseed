@@ -671,6 +671,25 @@ functions:
       - description: "A suppressed peer is indistinguishable from an unknown one (ISC-A-S7)."
     iscs: [S6, S13, A-S7]
 
+  - name: "IntroducerService::new"
+    module: daemonseed_server::federation
+    description: >-
+      Construct the FederationIntroducer gRPC service (M12, gate step 6) from the
+      operator's shared peer table. A thin post-Authenticated adapter over
+      introducer_response: it implements the generated FederationIntroducer trait
+      (the Introduce RPC) and adds no policy of its own. Registered on the post-
+      auth h2 server by serve_application alongside PublicSpace and CircleOfTrust.
+    signature: "pub fn new(peers: Arc<Vec<PeerConfig>>) -> IntroducerService"
+    parameters:
+      - name: peers
+        type: "Arc<Vec<PeerConfig>>"
+        direction: in
+        description: "Operator's `[[peer]]` table, shared read-only across connections."
+    returns:
+      type: IntroducerService
+      description: "A servable introducer; pass to FederationIntroducerServer::new."
+    iscs: [S6, S12, S13, A-S7]
+
   # ── identity ─────────────────────────────────────────────────────
   - name: generate_seed
     module: daemonseed_server::identity
@@ -1001,8 +1020,9 @@ functions:
       Accept loop: bind, accept in a biased tokio::select! that prefers shutdown,
       spawn per-connection tasks sharing one ServerContext (identity, public_space,
       server_source, RAM SeenMap, RAM CotRegistry — so members on different
-      connections meet at the same rendezvous, ISC-A-S5).
-    signature: "pub async fn run<F: Future<Output = ()>>(addr: SocketAddr, tls_config: ServerConfig, identity: Arc<ServerIdentity>, public_space: Arc<PublicSpaceState>, server_source: Option<String>, shutdown: F, observer: ConnectionObserver) -> io::Result<()>"
+      connections meet at the same rendezvous, ISC-A-S5 — and the federation peer
+      table the M12 introducer answers from).
+    signature: "pub async fn run<F: Future<Output = ()>>(addr: SocketAddr, tls_config: ServerConfig, identity: Arc<ServerIdentity>, public_space: Arc<PublicSpaceState>, server_source: Option<String>, peers: Vec<PeerConfig>, shutdown: F, observer: ConnectionObserver) -> io::Result<()>"
     parameters:
       - name: addr
         type: SocketAddr
@@ -1024,6 +1044,10 @@ functions:
         type: "Option<String>"
         direction: in
         description: "AGPL §13 corresponding-source URL advertised in HELLO (ISC-9)."
+      - name: peers
+        type: "Vec<PeerConfig>"
+        direction: in
+        description: "Operator federation `[[peer]]` table; wrapped in an Arc and shared to the M12 introducer endpoint (ISC-S12 / gate step 6). Empty = introduces no peers."
       - name: shutdown
         type: F
         direction: in
@@ -1235,16 +1259,19 @@ functions:
   - name: serve_application
     module: daemonseed_server::public_space
     description: >-
-      Serve BOTH the PublicSpace service and the CircleOfTrust relay over one
-      Authenticated transport (h2 keepalive on; ~10s/20s MVP defaults drive CoT
-      reaping) until the peer closes. In production S is the raw transport from
+      Serve the PublicSpace service, the CircleOfTrust relay, AND the M12
+      FederationIntroducer endpoint over one Authenticated transport (h2 keepalive
+      on; ~10s/20s MVP defaults drive CoT reaping) until the peer closes. In
+      production S is the raw transport from
       Connection<Authenticated, TlsStream<TcpStream>>::into_inner(). Renamed from
       serve_public_space at M8. M11: constructs one per-connection
       ConnectionLimiter (RateLimitConfig::default, Pi-4-sized) shared between a
       RequestRateLayer (per-RPC request-rate budget, ISC-29) applied to both
       services and the CoT subscribe handler (subscription cap, ISC-30); both trip
-      to a uniform connection drop with no wire reason (ISC-A-S12).
-    signature: "pub async fn serve_application<S: AsyncRead + AsyncWrite + Send + Unpin + 'static>(stream: S, public_space: PublicSpaceService, cot: CotRegistry) -> Result<(), tonic::transport::Error>"
+      to a uniform connection drop with no wire reason (ISC-A-S12). M12: also
+      registers FederationIntroducerServer over the operator's peer table (gate
+      step 6, ISC-S6).
+    signature: "pub async fn serve_application<S: AsyncRead + AsyncWrite + Send + Unpin + 'static>(stream: S, public_space: PublicSpaceService, cot: CotRegistry, peers: Arc<Vec<PeerConfig>>) -> Result<(), tonic::transport::Error>"
     parameters:
       - name: stream
         type: S
@@ -1258,6 +1285,10 @@ functions:
         type: CotRegistry
         direction: in
         description: "The shared circle-of-trust fan-out registry."
+      - name: peers
+        type: "Arc<Vec<PeerConfig>>"
+        direction: in
+        description: "Operator's federation peer table the M12 introducer endpoint answers from (ISC-S6 / ISC-S12)."
     returns:
       type: "Result<(), tonic::transport::Error>"
       description: "Ok when the peer closes the connection."

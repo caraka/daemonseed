@@ -24,12 +24,19 @@
 //
 // MINOR bumps to this schema MUST be additive-only (ISC-S14). Never reuse
 // field numbers, never repurpose enum values, never tighten validation after
-// the field has shipped. Adding this message set is itself additive — it
-// introduces no change to the APP_HELLO handshake, so the wire-protocol
-// version stays 1.0.
+// the field has shipped. The M5 message set and the M12 `FederationIntroducer`
+// service are both additive — they introduce no change to the APP_HELLO
+// handshake, so the wire-protocol version stays 1.0 (the M12 service addition
+// is a SemVer MINOR bump).
 //
-// Framing on the wire: each frame is a length-prefixed (u32 big-endian)
-// prost-encoded message — see `daemonseed-server::hello` for the framing.
+// Wire transport: the `FederationIntroducer` service is served as gRPC-over-h2
+// over the SAME post-Authenticated TLS stream as `PublicSpace` (M6) and
+// `CircleOfTrust` (M8) — h2 owns its own framing. The introducer is a post-auth
+// application service, NOT a pre-auth length-prefixed HELLO frame: a client
+// must already have reached the `Authenticated` type-state (ISC-S19 / ISC-C23)
+// before it can ask for an introduction. The length-prefixed (u32 big-endian)
+// prost framing referenced elsewhere belongs only to the pre-auth HELLO / proof
+// phase (see `daemonseed-server::hello`), not here.
 
 syntax = "proto3";
 
@@ -75,4 +82,26 @@ message IntroducerResponse {
   // The revealed peers. Excludes every `introduce-to-clients=false` peer
   // (ISC-S13) regardless of whether the query was a list or a by-id lookup.
   repeated PeerTriple peers = 1;
+}
+
+// ── Service (M12, gate step 6) ────────────────────────────────────────────
+
+// The federation introducer endpoint (ISC-S6 / ISC-S12 / ISC-S13 / ISC-A-S7).
+//
+// M5 shipped the messages above and the server-side `introducer_response`
+// builder, but never an endpoint to read a query off a socket. M12 adds that
+// endpoint as a unary post-Authenticated gRPC RPC reusing those messages
+// verbatim — discovery, decoupled from trust establishment (see the file
+// header). The hard invariant is structural: the response type `PeerTriple`
+// has no key field and never gains one (ISC-S6), so this service physically
+// cannot leak a peer's public key.
+service FederationIntroducer {
+  // Return the introducer's filtered federation peers. An empty
+  // `target_server_id` returns the full introduce-to-clients list; a populated
+  // one returns just that peer's triple if it is both known and introducible.
+  // Per ISC-A-S7 an unknown OR don't-introduce peer yields the SAME empty
+  // response, indistinguishable on the wire. Never returns a public key
+  // (ISC-S6). The same RPC serves client and server-to-server introductions
+  // (ISC-S12) — the filtering rules are identical on both paths.
+  rpc Introduce(IntroducerQuery) returns (IntroducerResponse);
 }
