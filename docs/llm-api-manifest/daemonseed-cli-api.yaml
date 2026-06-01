@@ -102,11 +102,15 @@ modules:
       PublicSpaceClient / CircleOfTrustClient on demand. HTTP/2 multiplexes
       every RPC and the long-lived Subscribe stream over that one connection.
       Generic over the stream type so production (AppStream) and tests
-      (tokio::io::duplex) share the path.
+      (tokio::io::duplex) share the path. M12 (gate step 6) adds introducer():
+      a FederationIntroducerClient over the same channel, and refresh_introducer():
+      it calls the relay's Introduce RPC and merges the result into a
+      DiscoveredPeers candidate cache, reading the active TrustStore only to skip
+      already-known servers and NEVER mutating it (ISC-C22 / ISC-A-C19).
     no_std: false
-    depends_on: [daemonseed-proto, daemonseed-server, daemonseed_cli::connect]
-    iscs: ["10", "36"]
-    added_in: "v0.13.0 (M11)"
+    depends_on: [daemonseed-proto, daemonseed-server, daemonseed-core, daemonseed_cli::connect]
+    iscs: ["10", "36", C22, A-C19, S6]
+    added_in: "v0.13.0 (M11); introducer refresh M12"
 
 # ─────────────────────────────────────────────────────────────────────
 # Types — every struct/enum/trait/alias the crate exposes, hoisted out of

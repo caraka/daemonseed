@@ -19,7 +19,11 @@
 //! `tokio::io::duplex` half), exactly as `serve_application` is generic on its
 //! incoming transport.
 
+use daemonseed_core::federation::discovered::{DiscoveredPeers, MergeOutcome};
+use daemonseed_core::federation::store::TrustStore;
+use daemonseed_proto::v1::IntroducerQuery;
 use daemonseed_proto::v1::circle_of_trust_client::CircleOfTrustClient;
+use daemonseed_proto::v1::federation_introducer_client::FederationIntroducerClient;
 use daemonseed_proto::v1::public_space_client::PublicSpaceClient;
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -90,6 +94,38 @@ impl AppSession {
     /// `Subscribe` live relay stream).
     pub fn circle_of_trust(&self) -> CircleOfTrustClient<Channel> {
         CircleOfTrustClient::new(self.channel.clone())
+    }
+
+    /// A `FederationIntroducer` client over this session (the introducer
+    /// refresh, M12 gate step 6).
+    pub fn introducer(&self) -> FederationIntroducerClient<Channel> {
+        FederationIntroducerClient::new(self.channel.clone())
+    }
+
+    /// Refresh introducer-discovered peers: ask the connected relay's introducer
+    /// for its full peer list and merge the result into `discovered` as
+    /// candidates, returning the per-merge tally.
+    ///
+    /// Precautionary by construction (ISC-C22 / ISC-A-C19): this only reads
+    /// `known` to skip already-configured servers and only writes `discovered`
+    /// — it NEVER mutates the active trust set. A discovered peer becomes a
+    /// candidate the user promotes explicitly ([`DiscoveredPeers::promote_trusted`]
+    /// / [`DiscoveredPeers::promote_untrusted`]); discovery alone trusts nothing.
+    /// The relay already excluded its `introduce_to_clients=false` peers
+    /// server-side (ISC-S13), and the response carries no keys (ISC-S6).
+    pub async fn refresh_introducer(
+        &self,
+        discovered: &mut DiscoveredPeers,
+        known: &dyn TrustStore,
+    ) -> Result<MergeOutcome, tonic::Status> {
+        let response = self
+            .introducer()
+            .introduce(IntroducerQuery {
+                target_server_id: None,
+            })
+            .await?
+            .into_inner();
+        Ok(discovered.merge(&response, known))
     }
 }
 
@@ -165,6 +201,83 @@ mod tests {
         ps2.get_motd(wire::GetMotdRequest {})
             .await
             .expect("second client over the same channel routes");
+
+        drop(session);
+        let _ = server.await;
+    }
+
+    /// End-to-end client refresh (M12, gate step 6): the client calls the
+    /// relay's introducer over the session; the server-side ISC-S13 filter drops
+    /// the `introduce_to_clients=false` peer, so only the introducible one lands
+    /// in the client's discovered-candidate cache — and NOTHING enters the active
+    /// trust store until the user promotes it (ISC-C22 / ISC-A-C19).
+    #[tokio::test]
+    async fn refresh_introducer_populates_discovered_candidates() {
+        use daemonseed_core::federation::discovered::DiscoveredPeers;
+        use daemonseed_core::federation::store::{InMemoryTrustStore, TrustStore};
+        use daemonseed_core::federation::trust::TrustMode;
+        use daemonseed_core::handle::Handle;
+        use daemonseed_server::config::PeerConfig;
+
+        let peer = |server_id: &str, address: &str, introduce: bool| PeerConfig {
+            server_id: server_id.to_owned(),
+            address: address.to_owned(),
+            trust_mode: TrustMode::Trusted,
+            introduce_to_clients: introduce,
+            key_hex: None,
+        };
+        let peers = Arc::new(vec![
+            peer("relay-b#0123456789ab", "b.example:443", true),
+            peer("secret#0123456789ab", "secret.example:443", false),
+        ]);
+
+        let state = Arc::new(PublicSpaceState::empty());
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(serve_application(
+            server_io,
+            PublicSpaceService::new(state),
+            CotRegistry::new(),
+            peers,
+        ));
+
+        let session = AppSession::open(client_io).await.expect("session opens");
+        let known = InMemoryTrustStore::new();
+        let mut discovered = DiscoveredPeers::new();
+
+        let outcome = session
+            .refresh_introducer(&mut discovered, &known)
+            .await
+            .expect("introducer refresh routes");
+
+        let b: Handle = "relay-b#0123456789ab".parse().unwrap();
+        let secret: Handle = "secret#0123456789ab".parse().unwrap();
+        assert_eq!(
+            outcome.added, 1,
+            "only the introducible peer is discovered (ISC-S13)"
+        );
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered.get(&b).unwrap().address, "b.example:443");
+        assert!(
+            discovered.get(&secret).is_none(),
+            "don't-introduce peer never reaches the client"
+        );
+
+        // Precautionary (ISC-C22 / ISC-A-C19): the refresh trusted nothing —
+        // promotion is an explicit, separate step that the user drives.
+        assert!(
+            known.get(&b).is_none(),
+            "refresh must not write the active trust set"
+        );
+        let mut active = InMemoryTrustStore::new();
+        let entry = discovered
+            .promote_trusted(&b, &mut active)
+            .expect("candidate promotes");
+        assert_eq!(entry.mode, TrustMode::Trusted);
+        assert_eq!(
+            entry.pinned_key, None,
+            "trusted promote pins on first contact, not now"
+        );
+        assert!(discovered.is_empty(), "promotion drains the candidate");
 
         drop(session);
         let _ = server.await;

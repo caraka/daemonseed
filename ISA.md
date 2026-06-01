@@ -338,6 +338,23 @@ already-shipped APIs" — completing it adds protocol surface, which now rides M
 
 ## Decisions
 
+- 2026-06-01: **Introducer refresh is precautionary — discovered peers are candidates the user promotes,
+  never auto-trusted (ISC-C22 / ISC-A-C19).** The spec settled the *trust semantics* of an
+  introducer-discovered server ("treated identically to manual entry — never auto-trusted from the
+  introduction", ISC-C22) but left the *refresh behaviour* open: when the client calls a relay's
+  introducer, does it auto-add every discovered peer to the active trust set, or surface them as
+  candidates? **Decision (caraka, 2026-06-01): candidates.** `daemonseed-core::federation::discovered`
+  holds a RAM-only `DiscoveredPeers` cache, structurally distinct from the `TrustStore`; `merge()`
+  records candidates and reads `known` only to skip already-configured servers — it **never writes the
+  trust set**. `promote_trusted` / `promote_untrusted` are the explicit user actions that move a
+  candidate into the active set (the key is then established by first-contact hash verification or an
+  out-of-band key, identical to a manual paste). Rationale: auto-adding would let a relay you connect to
+  populate your active server list with addresses it controls and silently get its own key TOFU-pinned —
+  exactly the transitive-trust hole ISC-S6's no-keys invariant and ISC-A-C19's anti-auto-discovery bias
+  exist to close. The precautionary option keeps discovery and trust strictly separated at every point in
+  the client lifecycle, not just at first-start. Client half shipped on `feat/m12` (AppSession
+  `introducer()` + `refresh_introducer()`, over-the-wire test). Completes the **H1 client refresh
+  surface** (gate step 6); the wire endpoint (H1 server half) shipped earlier this day.
 - 2026-06-01: **M12 kicked off on `feat/m12`** (worktree at `.worktrees/feat-m12`, based on `main`
   449206a). Scope = two halves under **one** additive SemVer MINOR bump → **v0.14.0**, the moment both
   land the full 4-daemon MVP gate trips and the **MVP is declared**: **H1 (gate step 6)** federation

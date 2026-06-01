@@ -501,6 +501,26 @@ modules:
     iscs:
       - S12
 
+  - name: daemonseed_core::federation::discovered
+    description: >-
+      Introducer-discovered peer candidates (M12, gate step 6 — client side).
+      DiscoveredPeers is a RAM-only candidate cache, deliberately distinct from
+      the active TrustStore: merge() records peers learned from a relay's
+      introducer as candidates only and NEVER writes the trust set (ISC-C22 /
+      ISC-A-C19 precautionary design — a relay can suggest addresses, never push
+      one into your trusted set). promote_trusted / promote_untrusted move a
+      candidate into the active set as an explicit user action, identical to a
+      manual add (the key is established by the client's own trust machinery on
+      first contact, not from the introduction).
+    no_std: false
+    depends_on:
+      - daemonseed_core::federation::store
+    iscs:
+      - C22
+      - A-C19
+      - S6
+      - S13
+
   - name: daemonseed_core::circle
     description: >-
       Circle-of-trust types. Client-only scope — per ISC-A-S2 the
