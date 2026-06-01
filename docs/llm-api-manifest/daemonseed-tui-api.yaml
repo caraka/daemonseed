@@ -118,9 +118,15 @@ modules:
       Sealed state, so the component locally pre-validates against the held
       mnemonic and only invokes the consuming verify when it will succeed —
       a mistyped phrase stays on the step instead of destroying the session.
+      Second entry path new_recovery() drives clean-device recovery (gate
+      step 8): RecoverChoose → (RecoverMnemonic | RecoverDseedPath) →
+      RecoverPassphrase → core FirstStart::recover → shared display-name →
+      bootstrap tail. Typed 24 words or a .dseed file converge on one phrase;
+      the recovered identity matches the source device, circles are not
+      recovered (ISC-A-C2).
     no_std: false
     depends_on: [daemonseed-core]
-    iscs: ["2", "3", "4", "5", "6", "7", "8", "9", C2, C4b, C12, C29, C31, C32, C33, C34, C37, A-C15]
+    iscs: ["2", "3", "4", "5", "6", "7", "8", "9", C2, C4b, C12, C29, C31, C32, C33, C34, C37, A-C2, A-C15]
     added_in: "M11 first-start workstream"
 
   - name: daemonseed_tui::ui
@@ -240,6 +246,7 @@ public_types:
     description: "Interactive first-start state, advanced through on_key; produces SessionMaterials on completion."
     methods:
       - "fn new(argon: ArgonParams) -> FirstStartUi"
+      - "fn new_recovery(argon: ArgonParams) -> FirstStartUi"
       - "fn step(&self) -> FsStep"
       - "fn input(&self) -> &str"
       - "fn strength(&self) -> Option<&Strength>"
@@ -252,8 +259,8 @@ public_types:
       - "fn take_completed(&mut self) -> Option<SessionMaterials>"
   - name: daemonseed_tui::screens::first_start::FsStep
     kind: enum
-    description: "First-start step: Passphrase, ShowMnemonic, VerifyRoundTrip, VerifyTypeBack, DisplayName, Bootstrap, Complete."
-    variants: [Passphrase, ShowMnemonic, VerifyRoundTrip, VerifyTypeBack, DisplayName, Bootstrap, Complete]
+    description: "First-start step: Passphrase, ShowMnemonic, VerifyRoundTrip, VerifyTypeBack, DisplayName, Bootstrap, then the recover-branch steps (RecoverChoose, RecoverMnemonic, RecoverDseedPath, RecoverPassphrase), Complete."
+    variants: [Passphrase, ShowMnemonic, VerifyRoundTrip, VerifyTypeBack, DisplayName, Bootstrap, RecoverChoose, RecoverMnemonic, RecoverDseedPath, RecoverPassphrase, Complete]
   - name: daemonseed_tui::screens::first_start::FirstStartOutcome
     kind: enum
     description: "Terminal outcome of the first-start flow: Completed (materials ready) or Cancelled (user backed out)."

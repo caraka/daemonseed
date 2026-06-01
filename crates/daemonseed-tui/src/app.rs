@@ -974,6 +974,12 @@ impl App {
                     self.first_start = Some(FirstStartUi::new(self.argon));
                     self.screen = Screen::FirstStart;
                 }
+                // Clean-device recovery (gate step 8): same FirstStart screen,
+                // started on its recover branch. The completion path is shared.
+                KeyCode::Char('r') | KeyCode::Char('R') => {
+                    self.first_start = Some(FirstStartUi::new_recovery(self.argon));
+                    self.screen = Screen::FirstStart;
+                }
                 _ => {}
             },
             Screen::FirstStart => {
@@ -1420,6 +1426,19 @@ mod tests {
         app.on_key(press(KeyCode::Enter));
         assert_eq!(app.screen(), &Screen::FirstStart);
         assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn r_on_welcome_starts_recovery_branch() {
+        let _ = oxicrypt_module::initialize();
+        let mut app = App::new();
+        app.on_key(press(KeyCode::Char('r')));
+        assert_eq!(app.screen(), &Screen::FirstStart);
+        assert_eq!(
+            app.first_start().map(|f| f.step()),
+            Some(crate::screens::first_start::FsStep::RecoverChoose),
+            "r enters the recover branch, not cold enrollment"
+        );
     }
 
     #[test]

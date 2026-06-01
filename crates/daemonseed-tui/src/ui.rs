@@ -812,7 +812,7 @@ fn render_mention_popup(app: &App, frame: &mut Frame, input_area: Rect) {
 fn render_welcome(frame: &mut Frame) {
     let body = Paragraph::new(
         "daemonseed\n\nA federated, end-to-end-encrypted communication and\n\
-         file-sharing client.\n\n[Enter] begin first-start    [q] quit",
+         file-sharing client.\n\n[Enter] new identity    [r] recover identity    [q] quit",
     )
     .alignment(Alignment::Center)
     .block(
@@ -868,6 +868,22 @@ fn render_first_start(fs: &FirstStartUi, frame: &mut Frame) {
         FsStep::Bootstrap => (
             "First start — bootstrap relay",
             "[Enter] finish   [Esc] cancel",
+        ),
+        FsStep::RecoverChoose => (
+            "Recover identity — choose input",
+            "[m] type mnemonic   [f] load .dseed file   [Esc] cancel",
+        ),
+        FsStep::RecoverMnemonic => (
+            "Recover identity — recovery phrase",
+            "[Enter] continue   [Esc] cancel",
+        ),
+        FsStep::RecoverDseedPath => (
+            "Recover identity — .dseed file",
+            "[Enter] continue   [Esc] cancel",
+        ),
+        FsStep::RecoverPassphrase => (
+            "Recover identity — passphrase",
+            "[Enter] recover   [Esc] cancel",
         ),
         FsStep::Complete => ("First start — complete", ""),
     };
@@ -989,6 +1005,48 @@ fn render_first_start_body(fs: &FirstStartUi, frame: &mut Frame, area: Rect) {
                         .borders(Borders::ALL)
                         .title("bootstrap <server-id>@<host:port>"),
                 ),
+                area,
+            );
+        }
+        FsStep::RecoverChoose => {
+            frame.render_widget(
+                Paragraph::new(
+                    "Recover your identity on this device.\n\n\
+                     [m] type your 24-word recovery phrase\n\
+                     [f] load an identity.dseed recovery file\n\n\
+                     Recovery restores your identity, not your circles —\n\
+                     re-enter circle passphrases to rejoin them.",
+                )
+                .wrap(Wrap { trim: true })
+                .block(Block::default().borders(Borders::ALL).title("recover")),
+                area,
+            );
+        }
+        FsStep::RecoverMnemonic => {
+            frame.render_widget(
+                Paragraph::new(fs.input()).wrap(Wrap { trim: true }).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("type all 24 words"),
+                ),
+                area,
+            );
+        }
+        FsStep::RecoverDseedPath => {
+            frame.render_widget(
+                Paragraph::new(fs.input()).wrap(Wrap { trim: true }).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("path to identity.dseed"),
+                ),
+                area,
+            );
+        }
+        FsStep::RecoverPassphrase => {
+            let masked: String = "*".repeat(fs.input().chars().count());
+            frame.render_widget(
+                Paragraph::new(masked)
+                    .block(Block::default().borders(Borders::ALL).title("passphrase")),
                 area,
             );
         }

@@ -12,14 +12,23 @@
 //! The component is terminal-free: state advances only through
 //! [`FirstStartUi::on_key`], so the PTY gate harness can drive it
 //! deterministically and the transitions are unit-testable.
+//!
+//! A second entry path, [`FirstStartUi::new_recovery`], drives clean-device
+//! recovery (gate step 8 / ISC-A-C2): the user supplies a mnemonic they already
+//! hold — typed 24 words or an `identity.dseed` file — plus the passphrase, and
+//! the core [`FirstStart::recover`] re-derives the *same* identity on this
+//! device. The recover steps converge on the shared display-name → bootstrap
+//! tail, so completion is byte-for-byte identical to cold enrollment.
 
 use daemonseed_core::bootstrap::{BootstrapAnchor, bundled};
 use daemonseed_core::first_start::{
     BackupVerified, FirstStart, Sealed, SessionMaterials, TypeBackChallenge, Welcome,
 };
 use daemonseed_core::handle::display_name::{OsRng, generate_display_name, is_valid_display_name};
+use daemonseed_core::identity::mnemonic::Mnemonic;
 use daemonseed_core::passphrase::strength::{Strength, estimate};
 use daemonseed_core::profile::config::ArgonParams;
+use daemonseed_core::storage::recovery_file;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 
 /// Which step of the first-start flow is on screen.
@@ -37,6 +46,15 @@ pub enum FsStep {
     DisplayName,
     /// Choose / confirm the bootstrap relay (C37).
     Bootstrap,
+    /// Recovery entry: choose typed-mnemonic or `.dseed`-file input (step 8).
+    RecoverChoose,
+    /// Recovery: type the 24-word mnemonic.
+    RecoverMnemonic,
+    /// Recovery: enter the filesystem path to an `identity.dseed` file.
+    RecoverDseedPath,
+    /// Recovery: enter the passphrase — the new local seal credential, which
+    /// on the `.dseed` path is also the credential that opens the file (C30).
+    RecoverPassphrase,
     /// Flow complete — `SessionMaterials` are ready for the connect path.
     Complete,
 }
@@ -49,6 +67,15 @@ enum Phase {
     Welcome(FirstStart<Welcome>),
     Sealed(FirstStart<Sealed>),
     Verified(FirstStart<BackupVerified>),
+}
+
+/// Where a recovery's mnemonic comes from. Both variants converge on a phrase
+/// string fed to [`FirstStart::recover`], keeping the core flow source-agnostic.
+enum RecoverSource {
+    /// 24 words typed directly by the user.
+    Typed(String),
+    /// Path to an `identity.dseed` file, decrypted with the passphrase.
+    Dseed(String),
 }
 
 /// Outcome of feeding a key to the first-start flow.
@@ -84,6 +111,8 @@ pub struct FirstStartUi {
     error: Option<String>,
     /// Completed session materials, taken by the caller after `Complete`.
     materials: Option<SessionMaterials>,
+    /// The chosen recovery input source, set on the recover flow only.
+    recover_source: Option<RecoverSource>,
 }
 
 impl FirstStartUi {
@@ -105,6 +134,32 @@ impl FirstStartUi {
             chosen_name: None,
             error: None,
             materials: None,
+            recover_source: None,
+        }
+    }
+
+    /// Start a clean-device recovery flow (gate step 8 / ISC-A-C2).
+    ///
+    /// Unlike [`Self::new`], which generates a fresh identity, this drives the
+    /// user through supplying a mnemonic they already hold — typed 24 words or
+    /// an `identity.dseed` file — plus the passphrase, then re-derives the same
+    /// identity on this device via [`FirstStart::recover`]. It rejoins the
+    /// shared display-name → bootstrap → [`SessionMaterials`] tail, so the
+    /// caller's completion path is identical to cold enrollment.
+    pub fn new_recovery(argon: ArgonParams) -> Self {
+        Self {
+            step: FsStep::RecoverChoose,
+            phase: Some(Phase::Welcome(FirstStart::<Welcome>::new())),
+            argon,
+            input: String::new(),
+            strength: None,
+            mnemonic: None,
+            challenge: None,
+            name_default: generate_display_name(&mut OsRng),
+            chosen_name: None,
+            error: None,
+            materials: None,
+            recover_source: None,
         }
     }
 
@@ -174,6 +229,10 @@ impl FirstStartUi {
             FsStep::VerifyTypeBack => self.on_verify_type_back(key.code),
             FsStep::DisplayName => self.on_display_name(key.code),
             FsStep::Bootstrap => self.on_bootstrap(key.code),
+            FsStep::RecoverChoose => self.on_recover_choose(key.code),
+            FsStep::RecoverMnemonic => self.on_recover_mnemonic(key.code),
+            FsStep::RecoverDseedPath => self.on_recover_dseed_path(key.code),
+            FsStep::RecoverPassphrase => self.on_recover_passphrase(key.code),
             FsStep::Complete => None,
         }
     }
@@ -380,6 +439,116 @@ impl FirstStartUi {
         None
     }
 
+    // ── recovery flow (gate step 8) ────────────────────────────────────────
+
+    /// Pick the recovery input method: `m` types a mnemonic, `f` loads a
+    /// `.dseed` file. Esc (handled in `on_key`) cancels back to Welcome.
+    fn on_recover_choose(&mut self, code: KeyCode) -> Option<FirstStartOutcome> {
+        match code {
+            KeyCode::Char('m') | KeyCode::Char('M') => {
+                self.input.clear();
+                self.error = None;
+                self.step = FsStep::RecoverMnemonic;
+            }
+            KeyCode::Char('f') | KeyCode::Char('F') => {
+                self.input.clear();
+                self.error = None;
+                self.step = FsStep::RecoverDseedPath;
+            }
+            _ => {}
+        }
+        None
+    }
+
+    /// Accept a typed 24-word phrase. The BIP-39 checksum is validated here for
+    /// immediate feedback; the authoritative re-check happens in `recover` once
+    /// the passphrase is supplied.
+    fn on_recover_mnemonic(&mut self, code: KeyCode) -> Option<FirstStartOutcome> {
+        if self.edit_input(code) {
+            return None;
+        }
+        if code == KeyCode::Enter {
+            if let Err(e) = Mnemonic::from_phrase(self.input.trim()) {
+                self.error = Some(format!("invalid phrase: {e}"));
+                return None;
+            }
+            self.recover_source = Some(RecoverSource::Typed(self.input.trim().to_owned()));
+            self.input.clear();
+            self.error = None;
+            self.step = FsStep::RecoverPassphrase;
+        }
+        None
+    }
+
+    /// Accept a filesystem path to an `identity.dseed`. The file is not read
+    /// until the passphrase step (decryption needs the passphrase).
+    fn on_recover_dseed_path(&mut self, code: KeyCode) -> Option<FirstStartOutcome> {
+        if self.edit_input(code) {
+            return None;
+        }
+        if code == KeyCode::Enter {
+            let path = self.input.trim();
+            if path.is_empty() {
+                self.error = Some("enter the path to an identity.dseed file".to_owned());
+                return None;
+            }
+            self.recover_source = Some(RecoverSource::Dseed(path.to_owned()));
+            self.input.clear();
+            self.error = None;
+            self.step = FsStep::RecoverPassphrase;
+        }
+        None
+    }
+
+    /// Resolve the recovery phrase from the chosen source and re-derive the
+    /// identity. On the `.dseed` path the passphrase first opens the file; on
+    /// either path it then seals the fresh local artifacts. A fresh `Welcome`
+    /// is used per attempt, so a wrong passphrase costs nothing but a retry.
+    fn on_recover_passphrase(&mut self, code: KeyCode) -> Option<FirstStartOutcome> {
+        if self.edit_input(code) {
+            return None;
+        }
+        if code != KeyCode::Enter {
+            return None;
+        }
+        let phrase = match self.recover_source.as_ref() {
+            Some(RecoverSource::Typed(p)) => p.clone(),
+            Some(RecoverSource::Dseed(path)) => {
+                let bytes = match std::fs::read(path) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        self.error = Some(format!("cannot read .dseed: {e}"));
+                        return None;
+                    }
+                };
+                match recovery_file::open(&bytes, &self.input) {
+                    Ok(contents) => contents.mnemonic.to_phrase(),
+                    Err(e) => {
+                        self.error = Some(format!(".dseed: {e}"));
+                        return None;
+                    }
+                }
+            }
+            None => {
+                self.error = Some("internal: recovery source lost".to_owned());
+                return None;
+            }
+        };
+        let Some(Phase::Welcome(fs)) = self.phase.take() else {
+            self.error = Some("internal: first-start phase lost".to_owned());
+            return None;
+        };
+        match fs.recover(&phrase, &self.input, self.argon) {
+            Ok(v) => self.enter_display_name(v),
+            Err(e) => {
+                // Re-seat a fresh Welcome so the user can correct and retry.
+                self.phase = Some(Phase::Welcome(FirstStart::<Welcome>::new()));
+                self.error = Some(e.to_string());
+            }
+        }
+        None
+    }
+
     /// Common transition into the display-name step: stash the verified phase,
     /// drop the now-unneeded mnemonic, and prefill the adj-noun default.
     fn enter_display_name(&mut self, verified: FirstStart<BackupVerified>) {
@@ -557,5 +726,132 @@ mod tests {
         }
         ui.on_key(press(KeyCode::Enter)); // → DisplayName
         assert_eq!(ui.step(), FsStep::DisplayName);
+    }
+
+    // ── recovery flow (gate step 8) ────────────────────────────────────────
+
+    /// Drive a full cold enrollment and return its materials + the 24-word
+    /// phrase shown — the "original device" the recovery tests reconstruct.
+    fn enroll() -> (SessionMaterials, String) {
+        let mut ui = ui();
+        type_str(&mut ui, STRONG);
+        ui.on_key(press(KeyCode::Enter)); // → ShowMnemonic
+        let phrase = ui.mnemonic().expect("mnemonic").to_string();
+        ui.on_key(press(KeyCode::Enter)); // → VerifyRoundTrip
+        type_str(&mut ui, &phrase);
+        ui.on_key(press(KeyCode::Enter)); // → DisplayName (default prefilled)
+        ui.on_key(press(KeyCode::Enter)); // accept default → Bootstrap
+        type_str(&mut ui, "relay#aabbccddeeff@127.0.0.1:443");
+        ui.on_key(press(KeyCode::Enter)); // → Completed
+        let m = ui.take_completed().expect("materials");
+        (m, phrase)
+    }
+
+    /// Drive a recover UI sitting on DisplayName through to Completed, accepting
+    /// the default name and a fixed bootstrap. Returns the recovered materials.
+    fn finish_after_verify(ui: &mut FirstStartUi) -> SessionMaterials {
+        assert_eq!(ui.step(), FsStep::DisplayName);
+        ui.on_key(press(KeyCode::Enter)); // accept default name → Bootstrap
+        type_str(ui, "relay#aabbccddeeff@127.0.0.1:443");
+        let outcome = ui.on_key(press(KeyCode::Enter));
+        assert_eq!(outcome, Some(FirstStartOutcome::Completed));
+        ui.take_completed().expect("materials")
+    }
+
+    #[test]
+    fn new_recovery_starts_on_recover_choose() {
+        let _ = oxicrypt_module::initialize();
+        let ui = FirstStartUi::new_recovery(fast_argon());
+        assert_eq!(ui.step(), FsStep::RecoverChoose);
+    }
+
+    #[test]
+    fn recover_choose_routes_to_both_inputs() {
+        let _ = oxicrypt_module::initialize();
+        let mut ui = FirstStartUi::new_recovery(fast_argon());
+        ui.on_key(press(KeyCode::Char('m')));
+        assert_eq!(ui.step(), FsStep::RecoverMnemonic);
+        let mut ui = FirstStartUi::new_recovery(fast_argon());
+        ui.on_key(press(KeyCode::Char('f')));
+        assert_eq!(ui.step(), FsStep::RecoverDseedPath);
+    }
+
+    #[test]
+    fn recover_typed_invalid_mnemonic_stays() {
+        let _ = oxicrypt_module::initialize();
+        let mut ui = FirstStartUi::new_recovery(fast_argon());
+        ui.on_key(press(KeyCode::Char('m')));
+        type_str(&mut ui, "abandon abandon abandon"); // bad word count / checksum
+        ui.on_key(press(KeyCode::Enter));
+        assert_eq!(
+            ui.step(),
+            FsStep::RecoverMnemonic,
+            "bad phrase must not advance"
+        );
+        assert!(ui.error().is_some());
+    }
+
+    #[test]
+    fn recover_typed_happy_path_matches_identity() {
+        let (enrolled, phrase) = enroll();
+        let mut ui = FirstStartUi::new_recovery(fast_argon());
+        ui.on_key(press(KeyCode::Char('m')));
+        type_str(&mut ui, &phrase);
+        ui.on_key(press(KeyCode::Enter)); // → RecoverPassphrase
+        assert_eq!(ui.step(), FsStep::RecoverPassphrase);
+        type_str(&mut ui, STRONG);
+        ui.on_key(press(KeyCode::Enter)); // recover → DisplayName
+        let recovered = finish_after_verify(&mut ui);
+        assert_eq!(
+            recovered.handle.hash_prefix(),
+            enrolled.handle.hash_prefix(),
+            "typed recovery reaches the same identity"
+        );
+        assert!(!recovered.at_rest_blob_bytes.is_empty());
+    }
+
+    #[test]
+    fn recover_dseed_happy_path_matches_identity() {
+        let (enrolled, _phrase) = enroll();
+        let path = std::env::temp_dir().join("ds-tui-recover-dseed-happy.dseed");
+        std::fs::write(&path, &enrolled.recovery_file_bytes).unwrap();
+
+        let mut ui = FirstStartUi::new_recovery(fast_argon());
+        ui.on_key(press(KeyCode::Char('f')));
+        type_str(&mut ui, path.to_str().unwrap());
+        ui.on_key(press(KeyCode::Enter)); // → RecoverPassphrase
+        assert_eq!(ui.step(), FsStep::RecoverPassphrase);
+        type_str(&mut ui, STRONG); // the passphrase that sealed the .dseed
+        ui.on_key(press(KeyCode::Enter)); // open + recover → DisplayName
+        let recovered = finish_after_verify(&mut ui);
+
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            recovered.handle.hash_prefix(),
+            enrolled.handle.hash_prefix(),
+            ".dseed recovery reaches the same identity"
+        );
+    }
+
+    #[test]
+    fn recover_dseed_wrong_passphrase_stays() {
+        let (enrolled, _phrase) = enroll();
+        let path = std::env::temp_dir().join("ds-tui-recover-dseed-wrong.dseed");
+        std::fs::write(&path, &enrolled.recovery_file_bytes).unwrap();
+
+        let mut ui = FirstStartUi::new_recovery(fast_argon());
+        ui.on_key(press(KeyCode::Char('f')));
+        type_str(&mut ui, path.to_str().unwrap());
+        ui.on_key(press(KeyCode::Enter)); // → RecoverPassphrase
+        type_str(&mut ui, "wrong horse battery staple table mountain");
+        ui.on_key(press(KeyCode::Enter)); // open fails closed → stay
+
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            ui.step(),
+            FsStep::RecoverPassphrase,
+            "wrong .dseed passphrase must not advance"
+        );
+        assert!(ui.error().is_some());
     }
 }
