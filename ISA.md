@@ -314,7 +314,7 @@ Work breakdown by milestone. Each milestone is a PR; releases are SSH-signed fro
 | M8 | circle-of-trust chunks indexer; founderless entropy-only CoT key | v0.10.0 | shipped |
 | M9 | rate limits, backoff, mute, hide, @mentions | v0.11.0 | shipped |
 | M10 | release verify, boot gate, update FSM, coverage, LAMA manifests | v0.12.1 | shipped |
-| M11 | **MVP-gate client surfaces** — real TUI, M9 wiring, public-space view, deprecation-policy surfacing, clean-device recovery (all over already-shipped, already-served server APIs; **no new wire protocol**) | v0.13.0 (target) | **in progress** |
+| M11 | **MVP-gate client surfaces** — real TUI, M9 wiring, public-space view, deprecation-policy surfacing, clean-device recovery (all over already-shipped, already-served server APIs; **no new wire protocol**) | v0.13.0 | **surfaces done (steps 3/7/8); v0.13.0 pending tag** |
 | M12 | **user-publish file sharing + federation introducer endpoint** — `PublishShare` RPC + server handler + TUI publish surface (ISC-38), **plus** the federation introducer endpoint (additive gRPC RPC over the already-shipped `IntroducerQuery`/`IntroducerResponse` messages) + its client refresh surface (gate step 6); both ride **one** SemVer **MINOR wire bump**; **trips the full 4-daemon gate → MVP declared** | v0.14.0 (target) | planned |
 | post-MVP | GFW classifier bench, Pi-4 civility bench, unsigned alpha packaging (parallelizable with M11/M12) | — | planned |
 | alpha2 | direct messaging (ISC-C38–C46 / A-C20–A-C25) | — | deferred |
@@ -324,8 +324,10 @@ Work breakdown by milestone. Each milestone is a PR; releases are SSH-signed fro
 its own test-harness criteria (distinct from spec ISC IDs). Steps 1 (cold first-start), 2 (all peers
 Authenticated), and 4 (CoT chat + mute/@mention) pass on real binaries. The remaining steps are sliced by
 depth: **M11** finishes the client surfaces that need no new wire protocol — step 3 (public-space
-view, done), step 7 (deprecation-policy fetch + trust-event surfacing), and step 8 (clean-device recovery
-branch) — over already-shipped, already-served server APIs, releasing v0.13.0 (gate not yet fully passed).
+view, done), step 7 (deprecation-policy fetch + trust-event surfacing, done), and step 8 (clean-device
+recovery branch, done) — over already-shipped, already-served server APIs, releasing v0.13.0. The
+currently-implemented gate (8 subprocess tests, steps 1/2/3/4/7/8) is green; the *full* 8-step gate still
+trips only at M12 once steps 5 and 6 land.
 **M12** carries the protocol changes — step 5 user-publish file sharing (`PublishShare`) **and** the
 federation introducer endpoint (gate step 6, an additive gRPC RPC over the already-shipped introducer
 messages plus its client refresh surface) — both riding one additive MINOR bump, the moment all 8 steps
@@ -336,6 +338,25 @@ already-shipped APIs" — completing it adds protocol surface, which now rides M
 
 ## Decisions
 
+- 2026-06-01: **Clean-device recovery shipped (gate step 8 — ISC-C29 recover branch / C30 / C32 / C36 /
+  A-C2).** Recovery is the mirror of cold first-start: `FirstStart::<Welcome>::recover(mnemonic, passphrase,
+  argon)` accepts a phrase the user already holds instead of generating one, and lands directly in
+  `BackupVerified` — backup is verified-by-possession, so the C33/C34 backup-verify steps are skipped —
+  rejoining the shared `finalize` / `into_session_materials` tail. The TUI exposes **both** input paths
+  (caraka's call 2026-06-01): typed 24 words, or an `identity.dseed` file decrypted with the passphrase;
+  both converge on one phrase, so the core flow is source-agnostic. The recovered device mints a **fresh
+  local `profile_id`** (C36) and re-seals its own at-rest blob + `.dseed` under it, yet the identity is
+  **byte-identical** to the source device: the ML-DSA-87 / ML-KEM-1024 keys and handle derive from the
+  mnemonic alone via fixed HKDF `info` strings, independent of `profile_id`. This is the load-bearing fact
+  — recovery is identity-from-mnemonic, and the profile is just local scaffolding around it. Circle-of-trust
+  seeds are **not** recovered (A-C2: user-chosen entropy not in the mnemonic), surfaced in the recover UI
+  copy. Failure paths fail closed and stay on-step (bad BIP-39 checksum, wrong `.dseed` passphrase, weak new
+  passphrase); a fresh `Welcome` per recover attempt means a wrong passphrase costs only a retry, never the
+  session. The cold-enrollment path is byte-identical to before — gate steps 1/2/4 unaffected. The gate test
+  `fresh_daemon_recovers_identity_from_mnemonic` models real device loss: daemon A enrolls → chats → is
+  dropped → a fresh daemon B recovers from A's captured mnemonic → B's own `#<12hex>` floor handle must equal
+  A's (identity observed via the floor-handle self-echo, comparable across devices because both pick the
+  floor handle). **With step 8 done, the narrowed M11 (gate steps 7 + 8) is complete → v0.13.0.**
 - 2026-05-30: **Introducer endpoint deferred M11→M12; M11 scope = gate steps 7 + 8 only.** While resuming
   M11, investigation found the federation introducer was never wired to the socket in M5. The
   `IntroducerQuery` / `IntroducerResponse` messages, the `introducer_response()` builder, and operator
@@ -443,8 +464,15 @@ already-shipped APIs" — completing it adds protocol surface, which now rides M
   mvp-gate` (relay boots a signed `[crypto]` policy, daemon fetches over `GetDeprecationPolicy`, verifies
   against the TOFU-pinned server-wide key, and renders `suite-deprecation-pending`). Probe: `cargo xtask
   mvp-gate` (PASS) + `cargo test -p daemonseed-tui`.
-- MVP gate: steps 1, 2, 4 pass on real binaries via the PTY harness. Steps 3/6/7/8 are M11 client-surface
-  work (→ v0.13.0); step 5 (user-publish) is M12 (→ v0.14.0), at which point all 8 steps pass = MVP. Probe:
-  `cargo xtask mvp-gate`.
+- M11 step 8 (clean-device recovery, ISC-C29 recover branch / C30 / C32 / C36 / A-C2) verified 2026-06-01:
+  6 `daemonseed-core` unit tests (recovered handle == source, fresh `profile_id`, blob + `.dseed` re-seal
+  round-trip, invalid-mnemonic + weak-passphrase fail-closed) and 7 `daemonseed-tui` tests (recover-choose
+  routing, typed + `.dseed` happy paths each asserting the recovered handle's hash-prefix equals the source
+  device's, invalid-mnemonic + wrong-`.dseed`-passphrase stay-on-step, and the Welcome `[r]` → recover-branch
+  wiring) pass, and the end-to-end gate test `fresh_daemon_recovers_identity_from_mnemonic` passes inside
+  `cargo xtask mvp-gate`. Probe: `cargo xtask mvp-gate` (PASS) + `cargo test -p daemonseed-core -p daemonseed-tui`.
+- MVP gate: steps 1, 2, 3, 4, 7, 8 pass on real binaries via the PTY harness (`cargo xtask mvp-gate`, 8/8).
+  Step 6 (introducer refresh) moved to M12 (needs the introducer endpoint); step 5 (user-publish) is also
+  M12 (→ v0.14.0), at which point all 8 steps pass = MVP. Probe: `cargo xtask mvp-gate`.
 - ISA sanitization fidelity (no leaked internal paths or personal names; all ISC IDs preserved) — verified
   this session via advisor + Cato cross-vendor audit; see session record.
