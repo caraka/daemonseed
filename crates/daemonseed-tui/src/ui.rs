@@ -20,8 +20,8 @@ use daemonseed_core::passphrase::strength::SESSION_PASSPHRASE_MIN_BITS;
 use daemonseed_core::trust_events::{TrustEventKey, event_key_string};
 
 use crate::app::{
-    App, ChatLine, CircleStatus, ConnectionStatus, FetchStatus, FetchUi, IndexerStatus, MainFocus,
-    Screen, TrustItem,
+    App, ChatLine, ChatSurface, CircleStatus, ConnectionStatus, FetchStatus, FetchUi,
+    IndexerStatus, MainFocus, Screen, TrustItem,
 };
 use crate::screens::first_start::{FirstStartUi, FsStep};
 
@@ -794,19 +794,33 @@ fn chat_line(m: &ChatLine, own: Option<&Handle>) -> Line<'static> {
 /// TrustHistory). When composing a partial `@token`, a mention-autocomplete
 /// popup floats above (ISC-12).
 fn render_main_input(app: &App, frame: &mut Frame, area: Rect) {
-    let (title, text): (&str, String) = match app.main_focus() {
+    let (title, text): (String, String) = match app.main_focus() {
         MainFocus::Chat if !app.can_chat() => (
             // Item F / ISC-C48: greyed/disabled compose until a circle is joined
             // — the title states the requirement and Enter is a no-op.
-            "compose (disabled — join a public room or circle to chat)  [Tab] join-circle  [Esc] back",
+            "compose (disabled — join a public room or circle to chat)  [Tab] join-circle  [Esc] back"
+                .to_owned(),
             app.compose().to_owned(),
         ),
-        MainFocus::Chat => (
-            "compose  [Enter] send  [Tab] join-circle  [Esc] back",
-            app.compose().to_owned(),
-        ),
+        MainFocus::Chat => {
+            // The surface indicator (v0.15.1): the title names where Enter posts,
+            // resolved through the same precedence the handler uses
+            // ([`App::active_chat_surface`]) so the label can never lie about the
+            // destination. A joined circle wins over the auto-joined lobby.
+            let surface = match app.active_chat_surface() {
+                Some(ChatSurface::Circle) => "🔒 circle".to_owned(),
+                Some(ChatSurface::PublicRoom(room)) => format!("# {room} (public)"),
+                // Unreachable while `can_chat()` holds (this arm requires it),
+                // but kept total rather than panicking.
+                None => "no surface".to_owned(),
+            };
+            (
+                format!("compose → {surface}  [Enter] send  [Tab] join-circle  [Esc] back"),
+                app.compose().to_owned(),
+            )
+        }
         MainFocus::JoinCircle => (
-            "circle phrase  [Enter] join  [Tab] mute  [Esc] back",
+            "circle phrase  [Enter] join  [Tab] mute  [Esc] back".to_owned(),
             app.circle_phrase().to_owned(),
         ),
         MainFocus::Mute => {
@@ -817,12 +831,12 @@ fn render_main_input(app: &App, frame: &mut Frame, area: Rect) {
                 format!("   muted: {}", muted.join(", "))
             };
             (
-                "mute handle  [Enter] toggle  [Tab] shares  [Esc] back",
+                "mute handle  [Enter] toggle  [Tab] shares  [Esc] back".to_owned(),
                 format!("{}{suffix}", app.mute_input()),
             )
         }
         MainFocus::Shares => (
-            "shares  [↑/↓] select  [r] refresh  [Tab] hide  [Esc] back",
+            "shares  [↑/↓] select  [r] refresh  [Tab] hide  [Esc] back".to_owned(),
             String::new(),
         ),
         MainFocus::Hide => {
@@ -833,24 +847,26 @@ fn render_main_input(app: &App, frame: &mut Frame, area: Rect) {
                 format!("   hidden: {}", hidden.join(", "))
             };
             (
-                "hide sharer-handle  [Enter] toggle  [Tab] servers  [Esc] back",
+                "hide sharer-handle  [Enter] toggle  [Tab] servers  [Esc] back".to_owned(),
                 format!("{}{suffix}", app.hide_input()),
             )
         }
         MainFocus::Servers => (
-            "add server-id@host:port  [Enter] add / connect-selected  [←/→] trust  [↑/↓] select  [Tab] trust-history",
+            "add server-id@host:port  [Enter] add / connect-selected  [←/→] trust  [↑/↓] select  [Tab] trust-history"
+                .to_owned(),
             app.server_input().to_owned(),
         ),
         MainFocus::TrustHistory => (
-            "trust history  [↑/↓] select  [Enter] dismiss selected  [Tab] public-space  [Esc] back",
+            "trust history  [↑/↓] select  [Enter] dismiss selected  [Tab] public-space  [Esc] back"
+                .to_owned(),
             String::new(),
         ),
         MainFocus::PublicSpace => (
-            "public space  [↑/↓] select  [r] refresh  [Tab] deprecation  [Esc] back",
+            "public space  [↑/↓] select  [r] refresh  [Tab] deprecation  [Esc] back".to_owned(),
             String::new(),
         ),
         MainFocus::Deprecation => (
-            "suite deprecation  [↑/↓] select  [r] refresh  [Tab] chat  [Esc] back",
+            "suite deprecation  [↑/↓] select  [r] refresh  [Tab] chat  [Esc] back".to_owned(),
             String::new(),
         ),
     };

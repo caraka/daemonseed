@@ -173,6 +173,7 @@ public_types:
       - "fn circle_phrase(&self) -> &str"
       - "fn messages(&self) -> &[ChatLine]"
       - "fn circle_status(&self) -> &CircleStatus"
+      - "fn active_chat_surface(&self) -> Option<ChatSurface>  # surface an Enter posts to; circle > public room > None (single source of truth for the indicator + handler, ISC-14 / S22 / C56)"
       - "fn status(&self) -> Option<&str>"
       - "fn own_chat_handle(&self) -> Option<Handle>   # own full handle, for self-@mention (ISC-11)"
       - "fn is_muted(&self, sender: &str) -> bool       # ISC-13 render suppression"
@@ -256,6 +257,10 @@ public_types:
   - name: daemonseed_tui::app::ChatSend
     kind: struct
     description: "A queued chat send the binary forwards to the net actor: body + sender_handle (the user's own display handle, sealed into the message; never seen by the relay)."
+  - name: daemonseed_tui::app::ChatSurface
+    kind: enum
+    description: "Which surface a Chat-pane post lands on, resolved by App::active_chat_surface with a fixed precedence: Circle (the private opt-in, ISC-14) wins over PublicRoom(String) (the default surface carrying its room name, ISC-S22 / ISC-C56). Both the Enter handler and the compose-box indicator resolve through the one method so the indicator can never name a surface a post does not reach — the v0.15.1 fix (the handler had checked public_room first, so a post always went to the auto-joined lobby and a joined circle was unpostable)."
+    variants: [Circle, "PublicRoom(String)"]
   - name: daemonseed_tui::screens::first_start::FirstStartUi
     kind: struct
     description: "Interactive first-start state, advanced through on_key; produces SessionMaterials on completion."

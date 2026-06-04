@@ -285,6 +285,28 @@ pub struct ChatSend {
     pub sender_handle: String,
 }
 
+/// Which surface a Chat-pane post will land on, resolved by a fixed precedence.
+///
+/// A joined circle (the private opt-in, ISC-14) wins over a joined public room
+/// (the default surface, ISC-S22 / ISC-C56). [`App::active_chat_surface`] is the
+/// single source of truth for this precedence: both the Enter handler
+/// ([`App::on_key_chat`]) and the compose-box indicator
+/// ([`crate::ui::render_main_input`]) resolve the target through it, so the
+/// indicator can never claim a different surface than the one a post lands on.
+/// That divergence — the handler posting to the auto-joined lobby while the user
+/// believed they were posting to their joined circle — was the v0.15.1
+/// chat-surface bug (the handler checked `public_room` first, contradicting its
+/// own doc comment). Routing both through one resolver makes the bug
+/// unrepresentable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatSurface {
+    /// The private opt-in surface — a joined circle (ISC-14). Takes precedence.
+    Circle,
+    /// The default surface — a joined public room, carrying its name
+    /// (ISC-S22 / ISC-C56).
+    PublicRoom(String),
+}
+
 /// Interactive application state.
 ///
 /// Construct with [`App::new`], feed key events with [`App::on_key`], render
@@ -1474,19 +1496,42 @@ impl App {
         self.public_room.is_some() || matches!(self.circle_status, CircleStatus::Joined)
     }
 
+    /// The surface a Chat-pane post will land on, or `None` when no surface is
+    /// joined (Enter is then a no-op — Item F / A-C26).
+    ///
+    /// Precedence: a joined circle (the private opt-in, ISC-14) wins over a
+    /// joined public room (the default, ISC-S22 / ISC-C56). This is the single
+    /// source of truth for chat-surface routing — see [`ChatSurface`]. Both the
+    /// Enter handler and the compose-box indicator resolve through it so they
+    /// cannot disagree about where a message goes.
+    pub fn active_chat_surface(&self) -> Option<ChatSurface> {
+        if matches!(self.circle_status, CircleStatus::Joined) {
+            Some(ChatSurface::Circle)
+        } else {
+            self.public_room
+                .as_deref()
+                .map(|room| ChatSurface::PublicRoom(room.to_owned()))
+        }
+    }
+
     /// Chat compose: printable chars append, Backspace deletes, Enter sends a
     /// non-empty message (ISC-14 / ISC-S22 / Item F / ISC-C48 / A-C26).
     ///
-    /// The DEFAULT chat surface is the public room (ISC-S22 / ISC-C56): when a
-    /// public room is joined, Enter posts there (self-signed for provenance by
-    /// the net actor, ISC-S24). A joined circle is the private opt-in and takes
-    /// precedence when present. The author's own post is locally echoed because
-    /// the relay never reflects a frame to its sender. With NEITHER a public room
-    /// nor a circle joined, Enter is a strict no-op with a status hint — nothing
-    /// is appended to the transcript and nothing is transmitted, so a draft can
-    /// never masquerade as a sent message (no false "it sent", Item F — verified
-    /// 2026-06-04 against a peer that received nothing). The compose buffer is
-    /// left intact so the user's draft survives until they join a surface.
+    /// The target surface is resolved by [`App::active_chat_surface`]: a joined
+    /// circle (the private opt-in, ISC-14) takes precedence over a joined public
+    /// room (the default surface, ISC-S22 / ISC-C56, self-signed for provenance
+    /// by the net actor, ISC-S24). Routing through that one resolver — rather
+    /// than re-deciding precedence inline — is what keeps the compose-box
+    /// indicator and this handler in agreement (the v0.15.1 fix: the inline
+    /// check tested `public_room` first, so a post always went to the
+    /// auto-joined lobby and a joined circle never received it).
+    ///
+    /// The author's own post is locally echoed because the relay never reflects
+    /// a frame to its sender. With NEITHER a public room nor a circle joined,
+    /// Enter is a strict no-op with a status hint — nothing is appended to the
+    /// transcript and nothing is transmitted, so a draft can never masquerade as
+    /// a sent message (no false "it sent", Item F). The compose buffer is left
+    /// intact so the user's draft survives until they join a surface.
     fn on_key_chat(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char(c) => self.compose.push(c),
@@ -1494,32 +1539,37 @@ impl App {
                 self.compose.pop();
             }
             KeyCode::Enter if !self.compose.is_empty() => {
-                if self.public_room.is_some() {
-                    let body = std::mem::take(&mut self.compose);
-                    let sender = self.own_handle();
-                    // Local echo: the relay never reflects a frame to its sender.
-                    self.messages.push(ChatLine {
-                        sender,
-                        body: body.clone(),
-                        sent_unix_ms: 0,
-                    });
-                    self.pending_public_room = Some(body);
-                } else if matches!(self.circle_status, CircleStatus::Joined) {
-                    let body = std::mem::take(&mut self.compose);
-                    let sender = self.own_handle();
-                    self.messages.push(ChatLine {
-                        sender: sender.clone(),
-                        body: body.clone(),
-                        sent_unix_ms: 0,
-                    });
-                    self.pending_chat = Some(ChatSend {
-                        body,
-                        sender_handle: sender,
-                    });
-                } else {
-                    // No surface to post to (Item F / A-C26): do not echo, do not
-                    // transmit; leave the draft intact and surface the hint.
-                    self.status = Some("join a public room or circle to chat".to_owned());
+                match self.active_chat_surface() {
+                    Some(ChatSurface::Circle) => {
+                        let body = std::mem::take(&mut self.compose);
+                        let sender = self.own_handle();
+                        // Local echo: the relay never reflects a frame to its sender.
+                        self.messages.push(ChatLine {
+                            sender: sender.clone(),
+                            body: body.clone(),
+                            sent_unix_ms: 0,
+                        });
+                        self.pending_chat = Some(ChatSend {
+                            body,
+                            sender_handle: sender,
+                        });
+                    }
+                    Some(ChatSurface::PublicRoom(_)) => {
+                        let body = std::mem::take(&mut self.compose);
+                        let sender = self.own_handle();
+                        // Local echo: the relay never reflects a frame to its sender.
+                        self.messages.push(ChatLine {
+                            sender,
+                            body: body.clone(),
+                            sent_unix_ms: 0,
+                        });
+                        self.pending_public_room = Some(body);
+                    }
+                    None => {
+                        // No surface to post to (Item F / A-C26): do not echo, do
+                        // not transmit; leave the draft intact and surface the hint.
+                        self.status = Some("join a public room or circle to chat".to_owned());
+                    }
                 }
             }
             _ => {}
@@ -2191,6 +2241,73 @@ mod tests {
         );
     }
 
+    /// Regression (v0.15.1): with BOTH a public room AND a circle joined, a post
+    /// lands in the joined circle (the private opt-in), NOT the auto-joined
+    /// lobby. The shipped bug checked `public_room` first, so once the net actor
+    /// auto-joined the lobby on connect, every post went to the lobby and a
+    /// joined circle was unpostable. The prior circle test never set a public
+    /// room, so it could not catch this — this is the both-surfaces-joined case.
+    #[test]
+    fn circle_takes_precedence_over_public_room_when_both_joined() {
+        let mut app = drive_to_main();
+        // The net actor auto-joins the lobby on connect …
+        app.on_net_event(NetEvent::PublicRoomJoined {
+            room: "lobby".to_owned(),
+        });
+        // … then the user opts into a circle.
+        app.on_net_event(NetEvent::CircleJoined);
+        assert_eq!(app.public_room(), Some("lobby"));
+        assert_eq!(app.circle_status(), &CircleStatus::Joined);
+        assert_eq!(
+            app.active_chat_surface(),
+            Some(ChatSurface::Circle),
+            "a joined circle takes precedence over the auto-joined lobby"
+        );
+
+        for ch in "circle only".chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        app.on_key(press(KeyCode::Enter));
+
+        assert_eq!(app.compose(), "");
+        assert_eq!(app.messages().len(), 1, "echoed once");
+        assert_eq!(app.messages()[0].body, "circle only");
+        // Routed to the circle send path …
+        let send = app.take_pending_chat().expect("post routed to the circle");
+        assert_eq!(send.body, "circle only");
+        // … and NOT to the public room (the v0.15.1 bug).
+        assert!(
+            app.take_pending_public_room().is_none(),
+            "must NOT post to the auto-joined lobby when a circle is joined"
+        );
+    }
+
+    /// The surface resolver reflects the documented precedence at every state:
+    /// none joined → `None`; only a public room → that room; a joined circle
+    /// always wins. This pins the single source of truth the indicator and the
+    /// Enter handler both consume.
+    #[test]
+    fn active_chat_surface_resolves_by_precedence() {
+        let mut app = drive_to_main();
+        assert_eq!(app.active_chat_surface(), None, "nothing joined");
+
+        app.on_net_event(NetEvent::PublicRoomJoined {
+            room: "lobby".to_owned(),
+        });
+        assert_eq!(
+            app.active_chat_surface(),
+            Some(ChatSurface::PublicRoom("lobby".to_owned())),
+            "only a public room joined"
+        );
+
+        app.on_net_event(NetEvent::CircleJoined);
+        assert_eq!(
+            app.active_chat_surface(),
+            Some(ChatSurface::Circle),
+            "circle wins once joined"
+        );
+    }
+
     /// PRD item F position: with NEITHER a public room nor a circle joined, Enter
     /// is a no-op — nothing echoed, nothing transmitted (no false "it sent").
     #[test]
@@ -2328,6 +2445,45 @@ mod tests {
         assert!(text.contains("otter: ping"), "transcript line rendered");
         assert!(text.contains("circle joined"), "circle status shown");
         assert!(text.contains("compose"), "compose footer shown");
+    }
+
+    /// v0.15.1 surface indicator: the compose footer names where Enter posts,
+    /// and it tracks the same precedence as the handler — a joined circle shows
+    /// the circle, the lobby-only case shows the public room. Rendered through
+    /// the real `ui::render` path so the indicator is verified end-to-end.
+    #[test]
+    fn compose_indicator_names_the_active_surface() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // Only the lobby joined → indicator names the public room.
+        let mut app = drive_to_main();
+        app.on_net_event(NetEvent::PublicRoomJoined {
+            room: "lobby".to_owned(),
+        });
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| crate::ui::render(&app, f)).unwrap();
+        assert!(
+            buffer_text(&term).contains("# lobby (public)"),
+            "lobby-only compose footer names the public room"
+        );
+
+        // Joining a circle flips the indicator to the circle (it takes precedence).
+        app.on_net_event(NetEvent::CircleJoined);
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| crate::ui::render(&app, f)).unwrap();
+        let text = buffer_text(&term);
+        // The footer names the circle. (A wide emoji's trailing skip-cell flattens
+        // to an extra space in TestBackend, so match up to the glyph, not past it —
+        // a real terminal renders `compose → 🔒 circle`.)
+        assert!(
+            text.contains("compose → 🔒"),
+            "circle-joined compose footer names the circle"
+        );
+        assert!(
+            !text.contains("# lobby (public)"),
+            "indicator must not still claim the lobby once a circle is joined"
+        );
     }
 
     // ── @mention (ISC-11/12) + mute (ISC-13) ─────────────────────────────
