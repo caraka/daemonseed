@@ -39,7 +39,7 @@
 //! processed, leaving an orphaned share that no disconnect ever reaps. The fix
 //! is to keep the incoming stream open forever (so graceful shutdown never
 //! triggers) and drive termination from the connection's own close via the
-//! [`CloseNotify`] guard — see its docs and [`serve_application`].
+//! `CloseNotify` guard — see its docs and [`serve_application`].
 //!
 //! ## Trust model
 //!
@@ -958,10 +958,29 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for CloseNotify<S> {
 }
 
 /// Serve the post-Authenticated application surface over a single already-
-/// Authenticated transport until the peer closes the connection: the
+/// Authenticated transport until the connection terminates — i.e. until tonic
+/// releases the served IO, which happens on peer close, h2 GOAWAY, request
+/// error, or keepalive-detected death (see `CloseNotify`): the
 /// [`PublicSpace`] service (M6), the `CircleOfTrust` live relay (M8), and the
 /// `FederationIntroducer` endpoint (M12). All three share this one h2 server;
 /// `peers` is the operator's federation peer table the introducer answers from.
+///
+/// ## Resource exposure (post-MVP idle-timeout, tracked)
+///
+/// Because the incoming stream is held open and termination is driven by the
+/// connection's own close, a peer that completes the handshake and then stays
+/// connected but **silent** (zero RPCs) holds this per-connection task open for
+/// as long as it keeps the h2 keepalive answered. This is the deliberate flip
+/// side of the "you must be online to share" model (M12 gate step 5). It is
+/// **not** bounded by the per-connection request-rate limiter below — that
+/// charges per inbound RPC, so a zero-RPC connection is never charged — nor by
+/// the per-key connection cap (an attacker mints a fresh identity per
+/// connection). The only live bounds are the OS / per-IP layer (ISC-A-S1
+/// carve-out) and process FD/memory limits; the h2 keepalive bounds a *dead*
+/// peer (~30s) but not a *live-but-silent* one. An application-level
+/// idle/keep-alive timeout is the tracked post-MVP mitigation — see ISA
+/// "Out of Scope" (application-level connection idle-timeout). Acceptable for
+/// the closed alpha; must not be described as already-mitigated.
 ///
 /// The caller passes the connection only after the identity-proof exchange has
 /// advanced it to `Authenticated` (daemonseed-core type-state), so reaching

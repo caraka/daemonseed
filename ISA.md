@@ -64,6 +64,13 @@ complete and so contributors don't mistake their absence for an oversight.
   so QUIC drops in later without a refactor, but MVP ships TLS 1.3 only.
 - **Hard Sybil resistance** — MVP accepts BIP-39 enrollment friction plus per-IP rate limits as the floor;
   proof-of-work, invitation-gating, and reputation are post-MVP options.
+- **Application-level connection idle-timeout** — post-MVP, tracked. The M12 "you must be online to share"
+  model (gate step 5) holds a per-connection server task open until the connection itself closes, so a
+  handshake-complete but *silent* (zero-RPC) peer is bounded only by the OS/per-IP layer and process
+  FD/memory limits — **not** by the per-RPC request-rate limiter or the per-key connection cap. The h2
+  keepalive reaps a dead peer (~30s) but not a live-but-silent one. An app-level idle/keep-alive timeout
+  (and the NAT/middlebox keep-alive noted in the `publish` hold-open path) is the deferred mitigation;
+  acceptable for the closed alpha, must not be treated as already-solved.
 - **Release-signing key governance** (N-of-M holder identities, rotation cadence) — deferred to a
   governance resolution; MVP reserves the multi-sig wire shape and trust-anchor *set* without naming holders.
 - **A Demonsaw port** — zero lines of original code; the original C++/Qt source is a UX reference only.
