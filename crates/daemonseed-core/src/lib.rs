@@ -21,7 +21,13 @@
 //! secure-enclave session-passphrase unlock, ISC-C7) and [`autostart`] (the
 //! pure OS-autostart descriptor generator + `AutostartManager` trait,
 //! ISC-C20) — abstraction + opt-in flags + warnings only; the platform halves
-//! are reserved to the future GUI/mobile client.
+//! are reserved to the future GUI/mobile client. Alpha2 adds [`share_serve`] —
+//! the reusable sharer-side of the share-fetch protocol ([`ShareContent`]:
+//! directory indexing + content-addressed chunk store + the pure manifest/chunk
+//! `answer` step), factored out of the integration test so `cli publish --path`
+//! and the tests drive byte-identical serve logic (ISC-S27 / ISC-S28 / ISC-S29).
+//!
+//! [`ShareContent`]: share_serve::ShareContent
 
 #![forbid(unsafe_code)]
 
@@ -46,6 +52,7 @@ pub mod profile;
 pub mod public_space;
 pub mod release;
 pub mod share_envelope;
+pub mod share_serve;
 pub mod storage;
 pub mod trust_events;
 pub mod version;

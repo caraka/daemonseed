@@ -34,7 +34,7 @@ pub enum IscClass {
 /// Every ISC known to this MVP, in declaration order from `ds-isc-draft.md`.
 /// Length is [`TOTAL`].
 pub const ISCS: &[(&str, IscClass)] = &[
-    // ── server positive (22) ────────────────────────────────────────────
+    // ── server positive (25) ────────────────────────────────────────────
     ("ISC-S1", IscClass::Positive),
     ("ISC-S2a", IscClass::Positive),
     ("ISC-S2b", IscClass::Positive),
@@ -57,7 +57,10 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-S19", IscClass::Positive),
     ("ISC-S20", IscClass::Positive),
     ("ISC-S21", IscClass::Positive),
-    // ── server negative (17) ────────────────────────────────────────────
+    ("ISC-S27", IscClass::Positive),
+    ("ISC-S28", IscClass::Positive),
+    ("ISC-S29", IscClass::Positive),
+    // ── server negative (19) ────────────────────────────────────────────
     ("ISC-A-S1", IscClass::Negative),
     ("ISC-A-S2", IscClass::Negative),
     ("ISC-A-S3", IscClass::Negative),
@@ -75,6 +78,8 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-A-S13", IscClass::Negative),
     ("ISC-A-S14", IscClass::Negative),
     ("ISC-A-S15", IscClass::Negative),
+    ("ISC-A-S20", IscClass::Negative),
+    ("ISC-A-S21", IscClass::Negative),
     // ── client positive (38) — C5 intentionally vacant (R5) ─────────────
     ("ISC-C1", IscClass::Positive),
     ("ISC-C2", IscClass::Positive),
@@ -137,7 +142,7 @@ pub const ISCS: &[(&str, IscClass)] = &[
 ];
 
 /// Total ISCs tracked by this registry. Recount on every ISC add/remove.
-pub const TOTAL: usize = 96;
+pub const TOTAL: usize = 101;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -241,12 +246,13 @@ mod tests {
                 IscClass::Negative => neg += 1,
             }
         }
-        // AGENTS.md: 39 server-side + 57 client-side = 96. Split:
-        //   server  22 pos + 17 neg = 39  (ISC-S21 / ISC-A-S15 = opaque share_id, alpha2)
+        // AGENTS.md: 44 server-side + 57 client-side = 101. Split:
+        //   server  25 pos + 19 neg = 44  (alpha2: ISC-S21/A-S15 opaque share_id;
+        //                                  ISC-S27..S29 + A-S20/A-S21 share content download)
         //   client  38 pos + 19 neg = 57
-        //   total   60 pos + 36 neg = 96
-        assert_eq!(pos, 60, "positive count drift");
-        assert_eq!(neg, 36, "negative count drift");
+        //   total   63 pos + 38 neg = 101
+        assert_eq!(pos, 63, "positive count drift");
+        assert_eq!(neg, 38, "negative count drift");
     }
 
     #[test]

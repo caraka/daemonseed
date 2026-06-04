@@ -19,14 +19,19 @@
 //! `tokio::io::duplex` half), exactly as `serve_application` is generic on its
 //! incoming transport.
 
+use daemonseed_core::cot::public_share_asset_address;
 use daemonseed_core::federation::discovered::{DiscoveredPeers, MergeOutcome};
 use daemonseed_core::federation::store::TrustStore;
+use daemonseed_core::share_envelope::ShareFrame;
+use daemonseed_core::share_serve::ShareContent;
 use daemonseed_proto::v1::IntroducerQuery;
 use daemonseed_proto::v1::circle_of_trust_client::CircleOfTrustClient;
 use daemonseed_proto::v1::federation_introducer_client::FederationIntroducerClient;
 use daemonseed_proto::v1::public_space_client::PublicSpaceClient;
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Channel, Endpoint};
 
 /// A live application session: one tonic [`Channel`] multiplexed over a single
@@ -127,7 +132,110 @@ impl AppSession {
             .into_inner();
         Ok(discovered.merge(&response, known))
     }
+
+    /// Serve a share's content to any number of fetchers over its circle-of-trust
+    /// fetch-asset (alpha2 item B; ISC-S27 / ISC-S29). Returns `Ok(())` on a
+    /// graceful end-of-stream (the relay reaped the asset, or the peer left);
+    /// the caller typically races this against a Ctrl-C signal.
+    ///
+    /// The fetch-asset is derived from `(share_id, server_id)` via the **same**
+    /// [`public_share_asset_address`] the consumer ([`crate::session`] mirror in
+    /// the TUI net actor, and the integration tests) uses — byte-for-byte
+    /// agreement is guaranteed by reusing the one function with the same inputs
+    /// (the opaque hex `share_id` string, the connected `server_id` string). A
+    /// single bidi `CircleOfTrust.Subscribe` stream names that asset; the relay
+    /// fans every fetcher's `ManifestRequest` / `ChunkRequest` into this one
+    /// stream and our responses back out, so one serve loop handles arbitrarily
+    /// many concurrent fetchers (bounded by the relay's per-connection limiter,
+    /// ISC-S17). Each reply is sourced from `content`'s content-addressed store,
+    /// so its bytes hash to the advertised address by construction (ISC-S28);
+    /// the serve side never fabricates a chunk it does not hold (ISC-A-S21).
+    pub async fn serve_share(
+        &self,
+        server_id: &str,
+        share_id: &str,
+        content: &ShareContent,
+    ) -> Result<(), ServeShareError> {
+        let asset_addr = public_share_asset_address(share_id.as_bytes(), server_id.as_bytes())
+            .map_err(ServeShareError::Derive)?;
+        let asset_bytes = asset_addr.as_bytes().to_vec();
+
+        // Outbound half: the naming frame (empty payload, names the rendezvous
+        // and is not relayed) then our responses. Capacity is generous so a
+        // burst of fetcher requests does not back-pressure the answer path.
+        let (out_tx, out_rx) = mpsc::channel::<daemonseed_proto::v1::CotFrame>(64);
+        out_tx
+            .send(daemonseed_proto::v1::CotFrame {
+                asset_address: asset_bytes.clone(),
+                payload: Vec::new(),
+            })
+            .await
+            .map_err(|_| ServeShareError::ChannelClosed)?;
+
+        let mut cot = self.circle_of_trust();
+        let mut inbound = cot
+            .subscribe(ReceiverStream::new(out_rx))
+            .await
+            .map_err(ServeShareError::Subscribe)?
+            .into_inner();
+
+        // Serve loop: decode each inbound frame, answer requests from the
+        // indexed content, relay the response back. Foreign / undecodable
+        // frames are skipped (same fail-closed posture as the chat envelope).
+        // Ends when the stream closes — returned as Ok.
+        while let Some(frame) = inbound.message().await.map_err(ServeShareError::Stream)? {
+            if frame.payload.is_empty() {
+                continue; // naming-frame echo or noise
+            }
+            let Ok(req) = ShareFrame::decode(&frame.payload) else {
+                continue;
+            };
+            if let Some(response) = content.answer(&req)
+                && out_tx
+                    .send(daemonseed_proto::v1::CotFrame {
+                        asset_address: asset_bytes.clone(),
+                        payload: response.encode(),
+                    })
+                    .await
+                    .is_err()
+            {
+                break; // outbound torn down — stop gracefully
+            }
+        }
+        Ok(())
+    }
 }
+
+/// Why serving a share's content failed.
+#[derive(Debug)]
+pub enum ServeShareError {
+    /// Deriving the share's fetch-asset address failed (oxicrypt SHA-384
+    /// power-up self-test has not passed in this process).
+    Derive(oxicrypt_module::Error),
+    /// The local subscribe channel closed before the naming frame went out.
+    ChannelClosed,
+    /// The relay refused the `CircleOfTrust.Subscribe` stream.
+    Subscribe(tonic::Status),
+    /// The inbound stream errored mid-serve.
+    Stream(tonic::Status),
+}
+
+impl core::fmt::Display for ServeShareError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ServeShareError::Derive(e) => write!(f, "share fetch-asset derivation failed: {e}"),
+            ServeShareError::ChannelClosed => {
+                f.write_str("share serve channel closed before naming frame")
+            }
+            ServeShareError::Subscribe(s) => {
+                write!(f, "share serve subscribe refused: {}", s.message())
+            }
+            ServeShareError::Stream(s) => write!(f, "share serve stream error: {}", s.message()),
+        }
+    }
+}
+
+impl core::error::Error for ServeShareError {}
 
 #[cfg(test)]
 mod tests {

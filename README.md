@@ -20,7 +20,7 @@ daemonseed/
 │   │                                       release trust anchor + multi-sig verify + update-lifecycle FSM (M10)
 │   ├── daemonseed-proto/                   wire schema (Protocol Buffers, prost + tonic)
 │   ├── daemonseed-server/                  relay daemon: TLS 1.3 + APP_HELLO + identity-proof → Authenticated (M4b); federation peer table + introducer endpoint (M5/M12); public-space service (M6); circle-of-trust live relay (M8); RAM-only rate limiting (M9); release boot-gate (M10); user-publish share registry, reaped on disconnect (M12)
-│   ├── daemonseed-cli/                     scriptable client: `connect <server-id>` with identity-proof (M4b) + C22 trust slider (M5); `publish` / `unpublish` / `list-shares` (M12)
+│   ├── daemonseed-cli/                     scriptable client: `connect <server-id>` with identity-proof (M4b) + C22 trust slider (M5); `publish` / `unpublish` / `list-shares` (M12); `publish --path <dir>` serves share content for download (alpha2)
 │   ├── daemonseed-tui/                     interactive ratatui client — the MVP product surface (M11); Servers-pane introducer discovery (M12)
 │   └── daemonseed-integration-tests/       cross-crate integration tests + ISC coverage registry
 │

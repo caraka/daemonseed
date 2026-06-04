@@ -23,9 +23,10 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use daemonseed_cli::connect::{ConnectError, connect, connect_session, resolve_address};
 use daemonseed_cli::identity_proof::{ClientIdentity, ClientIdentityError};
-use daemonseed_cli::session::{AppSession, SessionError};
+use daemonseed_cli::session::{AppSession, ServeShareError, SessionError};
 use daemonseed_core::federation::store::{InMemoryTrustStore, ServerEntry, TrustStore};
 use daemonseed_core::handle::Handle;
+use daemonseed_core::share_serve::{ServeError, ShareContent};
 use daemonseed_core::storage::seeds::CounterState;
 use daemonseed_proto::v1::{
     ListPublicSharesRequest, PublicShareListing, PublishShareRequest, UnpublishShareRequest,
@@ -63,6 +64,14 @@ enum Cmd {
     /// open until interrupted (Ctrl-C). The share is RAM-only and reaped the
     /// instant the connection drops, so the product model is "you must be online
     /// to share": a sharer keeps this running for as long as the share is offered.
+    ///
+    /// With `--path <dir>` the command also **serves the share's content**
+    /// (alpha2 item B, ISC-S27..S29): it indexes the directory, chunks every
+    /// file into a content-addressed store, derives the share's circle-of-trust
+    /// fetch-asset from `(share_id, server_id)`, and runs a serve loop answering
+    /// `ManifestRequest` / `ChunkRequest` from any number of fetchers until
+    /// Ctrl-C. Without `--path` the command publishes the listing only (pure
+    /// discovery — the prior M12 behaviour).
     Publish {
         /// Target server-id (`<name>#<12hex>`).
         server_id: String,
@@ -78,6 +87,11 @@ enum Cmd {
         /// the connection identity.
         #[arg(long, default_value = "")]
         handle: String,
+        /// Directory whose files are served for download. When set, the command
+        /// serves content (manifest + chunks) over the share's CoT fetch-asset
+        /// while held open; when absent, it publishes the listing only.
+        #[arg(long, value_name = "DIR")]
+        path: Option<std::path::PathBuf>,
     },
     /// Unpublish a share previously published on this server (M12). Owner-scoped:
     /// only the publishing connection can unpublish, so this succeeds only within
@@ -175,7 +189,16 @@ fn run(cli: Cli) -> Result<(), CliError> {
             address,
             rating,
             handle,
+            path,
         } => {
+            // If a content directory is named, index + chunk it BEFORE
+            // publishing so a bad path fails fast (and the listing is never
+            // advertised for content we can't serve).
+            let content = match &path {
+                Some(dir) => Some(ShareContent::index_dir(dir).map_err(CliError::Serve)?),
+                None => None,
+            };
+
             let session = dial_session(&rt, &server_id, address.as_deref())?;
             let mut ps = session.public_space();
             // listing.share_id is ignored — the server assigns it (F25).
@@ -190,6 +213,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
                 }))
                 .map_err(|s| CliError::Rpc(Box::new(s)))?;
             let share_id = resp.into_inner().share_id;
+
             // Product model: "you must be online to share". The share is RAM-only
             // and the server's ShareReapGuard reaps it the instant this connection
             // drops, so a fire-and-forget publish would make the share
@@ -198,10 +222,32 @@ fn run(cli: Cli) -> Result<(), CliError> {
             // with it the background h2 connection task, driving while we wait, so
             // the connection stays open the whole time. `session` is dropped at the
             // end of this arm, closing the connection and triggering the reap.
-            println!("sharing {name:?} as {share_id} — press Ctrl-C to stop sharing");
-            rt.block_on(async {
-                let _ = tokio::signal::ctrl_c().await;
-            });
+            match content {
+                Some(content) => {
+                    println!(
+                        "sharing {name:?} as {share_id} ({} file(s)) — press Ctrl-C to stop sharing",
+                        content.file_count()
+                    );
+                    // Run the serve loop until Ctrl-C. The loop answers fetchers'
+                    // ManifestRequest / ChunkRequest over the share's CoT
+                    // fetch-asset; Ctrl-C ends it, dropping the session and
+                    // reaping both the listing and the live fetch-asset (ISC-S20).
+                    rt.block_on(async {
+                        tokio::select! {
+                            _ = tokio::signal::ctrl_c() => Ok(()),
+                            r = session.serve_share(&server_id, &share_id, &content) => {
+                                r.map_err(|e| CliError::ServeLoop(Box::new(e)))
+                            }
+                        }
+                    })?;
+                }
+                None => {
+                    println!("sharing {name:?} as {share_id} — press Ctrl-C to stop sharing");
+                    rt.block_on(async {
+                        let _ = tokio::signal::ctrl_c().await;
+                    });
+                }
+            }
             println!("stopped sharing {share_id}");
             Ok(())
         }
@@ -290,6 +336,11 @@ enum CliError {
     // Boxed: `tonic::Status` is large, and a bare large Err-variant bloats
     // every `Result<_, CliError>` (clippy::result_large_err).
     Rpc(Box<tonic::Status>),
+    /// Indexing the `--path` share directory failed (read / hash error).
+    Serve(ServeError),
+    /// The share serve loop failed at the transport layer. Boxed: it carries a
+    /// `tonic::Status`, which is large enough to bloat every `Result<_, CliError>`.
+    ServeLoop(Box<ServeShareError>),
 }
 
 impl std::fmt::Display for CliError {
@@ -302,6 +353,8 @@ impl std::fmt::Display for CliError {
             Self::Connect(e) => write!(f, "{e}"),
             Self::Session(e) => write!(f, "{e}"),
             Self::Rpc(e) => write!(f, "rpc failed: {e}"),
+            Self::Serve(e) => write!(f, "{e}"),
+            Self::ServeLoop(e) => write!(f, "{e}"),
         }
     }
 }
@@ -336,12 +389,14 @@ mod tests {
                 address,
                 rating,
                 handle,
+                path,
             } => {
                 assert_eq!(server_id, "relay#0123456789ab");
                 assert_eq!(name, "design-docs");
                 assert_eq!(rating, "PG");
                 assert_eq!(handle, "me#aabbccddeeff");
                 assert_eq!(address.as_deref(), Some("host:443"));
+                assert!(path.is_none(), "no --path given → listing-only");
             }
             other => panic!("expected Publish, got {other:?}"),
         }
@@ -350,9 +405,32 @@ mod tests {
     #[test]
     fn publish_rating_and_handle_default_to_empty() {
         match parse(&["daemonseed-cli", "publish", "relay#0123456789ab", "docs"]) {
-            Cmd::Publish { rating, handle, .. } => {
+            Cmd::Publish {
+                rating,
+                handle,
+                path,
+                ..
+            } => {
                 assert_eq!(rating, "");
                 assert_eq!(handle, "");
+                assert!(path.is_none());
+            }
+            other => panic!("expected Publish, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn publish_path_enables_content_serving() {
+        match parse(&[
+            "daemonseed-cli",
+            "publish",
+            "relay#0123456789ab",
+            "docs",
+            "--path",
+            "/srv/share",
+        ]) {
+            Cmd::Publish { path, .. } => {
+                assert_eq!(path.as_deref(), Some(std::path::Path::new("/srv/share")));
             }
             other => panic!("expected Publish, got {other:?}"),
         }
