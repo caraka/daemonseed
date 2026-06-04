@@ -41,6 +41,7 @@ use daemonseed_core::cot::public_share_asset_address;
 use daemonseed_core::cot::{AssetAddr, asset_address};
 use daemonseed_core::crypto::deprecation::{PolicyCache, PolicyError, verify_policy};
 use daemonseed_core::crypto::suite::{CNSA_2_0, SuiteId};
+use daemonseed_core::federation::discovered::DiscoveredPeers;
 use daemonseed_core::federation::store::{InMemoryTrustStore, ServerEntry, TrustStore};
 use daemonseed_core::handle::Handle;
 use daemonseed_core::share_envelope::ShareFrame;
@@ -111,6 +112,21 @@ pub enum NetCommand {
         share_id: String,
         sharer_handle: String,
     },
+    /// Refresh the introducer-discovered candidate peers for the Servers pane
+    /// (M12 gate step 6, ISC-C22 / ISC-S6 / ISC-A-C19). Ask the connected
+    /// relay's `FederationIntroducer` for its peer list over the live
+    /// [`AppSession`] and merge the result into the actor's [`DiscoveredPeers`]
+    /// cache as candidates, then emit the candidate `(server_id, address)`
+    /// pairs as a single [`NetEvent::IntroducerSnapshot`].
+    ///
+    /// Precautionary by construction: discovery records *candidates only* and
+    /// NEVER writes the trust set (ISC-A-C19) — promotion to a trusted/untrusted
+    /// server stays the explicit user action ([`DiscoveredPeers::promote_trusted`]
+    /// / [`DiscoveredPeers::promote_untrusted`]). The introducer response carries
+    /// no key material (ISC-S6), so the snapshot it produces is server-id +
+    /// address only. A read-only operation against an already-shipped gRPC
+    /// service — no new wire protocol.
+    RefreshIntroducer,
 }
 
 /// An event from the network actor back to the UI. Plain data — folded into
@@ -236,6 +252,24 @@ pub enum NetEvent {
     /// can dedupe by chunk_addr). The overlay marks the fetch failed and
     /// waits for the user to dismiss.
     FetchError { message: String },
+    /// A fresh introducer-discovery snapshot for the Servers pane (M12 gate
+    /// step 6, ISC-C22 / ISC-S6 / ISC-A-C19). `candidates` is the full current
+    /// set of introducer-learned peers that are NOT already in the active trust
+    /// set, each as a `(server_id, address)` pair. Server-id + address ONLY —
+    /// the introducer response carries no key material (ISC-S6), so neither
+    /// does this event. Folded into App state wholesale (it replaces the cached
+    /// list, mirroring the idempotent merge); the render surfaces it read-only,
+    /// and promotion to the trust set stays an explicit user action (ISC-A-C19).
+    /// An empty `candidates` is a normal state (nothing new discovered).
+    IntroducerSnapshot {
+        /// Discovered candidate peers as `(server_id, address)` pairs. No keys.
+        candidates: Vec<(String, String)>,
+    },
+    /// A `RefreshIntroducer` command could not complete (no live session, or a
+    /// refused `Introduce` RPC). Surfaced on the status line; the cached
+    /// candidate list is left in place so a transient failure never blanks the
+    /// last-known discovery state (mirrors the deprecation-error precedent).
+    IntroducerError { message: String },
 }
 
 /// Owns the network thread and the command/event channels. Held by the binary
@@ -336,6 +370,12 @@ struct Actor {
     /// for the one-hour TTL. Anti-rollback "just works" by feeding
     /// [`PolicyCache::cached_version`] into [`verify_policy`].
     policy_cache: PolicyCache,
+    /// RAM-only cache of introducer-discovered candidate peers (M12 gate step 6,
+    /// ISC-C22 / ISC-S6 / ISC-A-C19). Refreshed by [`Actor::handle_refresh_introducer`]
+    /// and surfaced read-only in the Servers pane. Deliberately distinct from the
+    /// active trust set: nothing here is trusted or connectable until the user
+    /// promotes it — discovery NEVER writes the trust set.
+    discovered: DiscoveredPeers,
 }
 
 /// The actor loop: receive commands and drive each on the current-thread
@@ -354,6 +394,7 @@ async fn net_actor(
         share_index: None,
         server_pubkey: None,
         policy_cache: PolicyCache::new(),
+        discovered: DiscoveredPeers::new(),
     };
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
@@ -374,6 +415,7 @@ async fn net_actor(
                 share_id,
                 sharer_handle,
             } => actor.handle_fetch_share(&share_id, &sharer_handle).await,
+            NetCommand::RefreshIntroducer => actor.handle_refresh_introducer().await,
         }
     }
 }
@@ -776,6 +818,56 @@ impl Actor {
         }
         if let Some(message) = decision.error {
             self.emit(NetEvent::DeprecationError { message });
+        }
+    }
+
+    /// Refresh the introducer-discovered candidate peers and emit a single
+    /// [`NetEvent::IntroducerSnapshot`] (M12 gate step 6, ISC-C22 / ISC-S6 /
+    /// ISC-A-C19).
+    ///
+    /// Requires a live session — without one there is no relay to ask, so this
+    /// emits [`NetEvent::IntroducerError`] (mirroring the deprecation / public-
+    /// space "not connected yet" path). With a session, it asks the connected
+    /// relay's `FederationIntroducer` over [`AppSession::refresh_introducer`]
+    /// and merges the answer into [`Self::discovered`], then reads the resulting
+    /// candidates back out for the render.
+    ///
+    /// Precautionary by construction (ISC-A-C19): the `known` trust store handed
+    /// to the merge is an empty [`InMemoryTrustStore`] — it is only *read* to
+    /// skip already-configured servers, never written, and the merge itself
+    /// never touches the trust set (it records candidates only). An empty
+    /// `known` simply means no candidate is suppressed as "already trusted"; it
+    /// cannot cause discovery to trust anything. The snapshot carries the
+    /// server-id and address ONLY: the introducer response has no key field
+    /// (ISC-S6), so no key material can ever flow through this path.
+    async fn handle_refresh_introducer(&mut self) {
+        let Some(session) = self.session.as_ref() else {
+            return self.emit(NetEvent::IntroducerError {
+                message: "not connected to a relay yet".to_owned(),
+            });
+        };
+        // `known` is read-only here (skip already-configured servers) and is
+        // never written; an empty store is correct — discovery trusts nothing.
+        let known = InMemoryTrustStore::new();
+        match session
+            .refresh_introducer(&mut self.discovered, &known)
+            .await
+        {
+            Ok(_outcome) => {
+                // Read the full candidate set back out as (server_id, address)
+                // pairs — no keys (ISC-S6). The per-merge tally is intentionally
+                // dropped: the snapshot is the converged candidate list, not the
+                // delta, so a repeated refresh renders the same stable view.
+                let candidates = self
+                    .discovered
+                    .iter()
+                    .map(|peer| (peer.server_id.to_string(), peer.address.clone()))
+                    .collect();
+                self.emit(NetEvent::IntroducerSnapshot { candidates });
+            }
+            Err(status) => self.emit(NetEvent::IntroducerError {
+                message: format!("introducer refresh refused: {}", status.message()),
+            }),
         }
     }
 
@@ -1336,6 +1428,7 @@ mod tests {
             share_index: None,
             server_pubkey: None,
             policy_cache: PolicyCache::new(),
+            discovered: DiscoveredPeers::new(),
         }
     }
 

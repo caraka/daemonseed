@@ -5,7 +5,8 @@
 //! recovery), connect + identity-proof (reusing [`daemonseed_cli::connect`]),
 //! public-space, circle-of-trust chat, file share/fetch, the C22 per-server
 //! trust slider, the C28 trust-event taxonomy, and the F22 server-management
-//! screen.
+//! screen (which also surfaces introducer-discovered candidate peers read-only,
+//! M12 gate step 6 — discovery never auto-trusts, ISC-A-C19).
 //!
 //! ## Architecture
 //!

@@ -99,7 +99,11 @@ pub enum MainFocus {
     Hide,
     /// The server-management screen (F22): add servers, set per-server trust
     /// mode with the trusted/untrusted slider (C22), and connect to a selected
-    /// one (ISC-21/26/27). The main area shows the server list instead of chat.
+    /// one (ISC-21/26/27). The main area shows the server list instead of chat,
+    /// plus a read-only "Discovered (introducer)" sub-section listing candidate
+    /// peers the connected relay's introducer reported (M12 gate step 6, ISC-S6 /
+    /// ISC-A-C19). Opening the pane auto-dispatches a `RefreshIntroducer`;
+    /// candidates are surfaced but never auto-trusted — promotion stays explicit.
     Servers,
     /// The Trust History view (ISC-C28 LogOnly surface, ISC-25): a scrollable
     /// list of every recorded trust event. Up/Down select, Enter dismisses the
@@ -401,6 +405,19 @@ pub struct App {
     /// (drained once). Set when the user opens the Deprecation pane or presses
     /// `r`; the binary translates it into a `NetCommand::RefreshDeprecation`.
     pending_deprecation_refresh: bool,
+    /// Latest introducer-discovered candidate peers (M12 gate step 6, ISC-C22 /
+    /// ISC-S6 / ISC-A-C19), each as a `(server_id, address)` pair. Replaced
+    /// wholesale on each `IntroducerSnapshot` (idempotent — never appended), and
+    /// left intact on an `IntroducerError` so a transient refresh failure never
+    /// blanks the last-known discovery view. Server-id + address ONLY — no key
+    /// material reaches this field (ISC-S6). Surfaced read-only in the Servers
+    /// pane; these are *candidates*, never trusted or connectable until the user
+    /// explicitly promotes one (ISC-A-C19 — discovery never auto-trusts).
+    discovered_peers: Vec<(String, String)>,
+    /// A queued introducer refresh the binary should forward to the net actor
+    /// (drained once). Set when the user opens the Servers pane; the binary
+    /// translates it into a `NetCommand::RefreshIntroducer`.
+    pending_introducer_refresh: bool,
 }
 
 impl Default for App {
@@ -464,6 +481,8 @@ impl App {
             deprecation_had_policy: false,
             dep_sel: 0,
             pending_deprecation_refresh: false,
+            discovered_peers: Vec::new(),
+            pending_introducer_refresh: false,
         }
     }
 
@@ -652,6 +671,16 @@ impl App {
                     self.status = Some(message);
                 }
             }
+            // The discovered-candidate list replaces wholesale (the introducer
+            // merge is idempotent, so the snapshot is the converged set, never a
+            // delta). Server-id + address only — no key material (ISC-S6).
+            NetEvent::IntroducerSnapshot { candidates } => {
+                self.discovered_peers = candidates;
+            }
+            // A refresh failure surfaces on the status line only — the cached
+            // candidate list is left intact so a transient failure never blanks
+            // the last-known discovery view (mirrors the deprecation precedent).
+            NetEvent::IntroducerError { message } => self.status = Some(message),
         }
     }
 
@@ -892,6 +921,21 @@ impl App {
         std::mem::replace(&mut self.pending_deprecation_refresh, false)
     }
 
+    /// Introducer-discovered candidate peers (M12 gate step 6, ISC-C22 /
+    /// ISC-S6 / ISC-A-C19), each as a `(server_id, address)` pair, for the
+    /// Servers pane's "Discovered (introducer)" sub-section. These are
+    /// *candidates* only — known-of but never trusted or connectable until the
+    /// user explicitly promotes one. Server-id + address only; no key material.
+    pub fn discovered_peers(&self) -> &[(String, String)] {
+        &self.discovered_peers
+    }
+
+    /// Take a queued introducer refresh request (drained once by the binary,
+    /// which translates it into a `NetCommand::RefreshIntroducer`).
+    pub fn take_pending_introducer_refresh(&mut self) -> bool {
+        std::mem::replace(&mut self.pending_introducer_refresh, false)
+    }
+
     /// @-mention autocomplete candidates for the current compose buffer
     /// (ISC-12 / C18). When composing and the buffer ends with a partial
     /// `@token` (no whitespace after the last `@`), returns the full wire
@@ -1049,6 +1093,14 @@ impl App {
                 // (`RefreshDeprecation`), never a stale or empty pane.
                 if matches!(self.main_focus, MainFocus::Deprecation) {
                     self.pending_deprecation_refresh = true;
+                }
+                // Opening the Servers pane requests a fresh introducer-discovery
+                // refresh so the "Discovered (introducer)" candidates reflect the
+                // connected relay's current peer list on first view
+                // (`RefreshIntroducer`, M12 gate step 6). Read-only: discovery
+                // surfaces candidates, it never writes the trust set (ISC-A-C19).
+                if matches!(self.main_focus, MainFocus::Servers) {
+                    self.pending_introducer_refresh = true;
                 }
             }
             _ => match self.main_focus {
@@ -2161,6 +2213,105 @@ mod tests {
         let text = buffer_text(&term);
         assert!(text.contains("relay#aabbccddeeff"), "server id rendered");
         assert!(text.contains("TRUSTED"), "trust slider rendered");
+    }
+
+    /// M12 gate step 6 (ISC-C22 / ISC-S6 / ISC-A-C19): an `IntroducerSnapshot`
+    /// folds into App state and the Servers pane renders each candidate's
+    /// server-id and address — and NEVER any key-like bytes (the introducer path
+    /// carries no key material, ISC-S6). The address (`host:port`) and server-id
+    /// (`name#hex`) are single tokens, so each renders contiguously.
+    #[test]
+    fn introducer_snapshot_folds_and_renders_candidate_without_keys() {
+        let mut app = drive_to_main();
+        to_servers(&mut app);
+        let _ = app.take_pending_introducer_refresh(); // drain the open-pane queue
+        app.on_net_event(NetEvent::IntroducerSnapshot {
+            candidates: vec![(
+                "peer#0011aabbccdd".to_owned(),
+                "peer.example.net:443".to_owned(),
+            )],
+        });
+        assert_eq!(
+            app.discovered_peers().len(),
+            1,
+            "candidate folded into state"
+        );
+
+        let text = render_text(&app, 120, 28);
+        assert!(
+            text.contains("Discovered (introducer)"),
+            "discovered sub-section heading rendered"
+        );
+        assert!(
+            text.contains("peer#0011aabbccdd"),
+            "candidate server-id rendered contiguously"
+        );
+        assert!(
+            text.contains("peer.example.net:443"),
+            "candidate address rendered contiguously"
+        );
+        // No key material can ever reach this render (ISC-S6). The introducer
+        // event has no key field; assert the render carries no PEM/base64-ish
+        // key markers as a belt-and-braces guard against a future regression
+        // that tried to thread one through.
+        for marker in ["BEGIN", "PUBLIC KEY", "ml-dsa", "ML-DSA", "pubkey", "0x"] {
+            assert!(
+                !text.contains(marker),
+                "render must contain no key-like bytes (found {marker:?})"
+            );
+        }
+    }
+
+    /// Opening the Servers pane auto-dispatches an introducer refresh so the
+    /// "Discovered (introducer)" candidates are never silently empty on first
+    /// view (drained as `NetCommand::RefreshIntroducer`).
+    #[test]
+    fn tab_to_servers_queues_an_introducer_refresh() {
+        let mut app = drive_to_main();
+        to_servers(&mut app);
+        assert!(
+            app.take_pending_introducer_refresh(),
+            "tabbing into Servers queues an introducer refresh"
+        );
+    }
+
+    /// An empty `IntroducerSnapshot` is a normal state and renders a calm
+    /// empty-state line, not an error.
+    #[test]
+    fn empty_introducer_snapshot_renders_calm_empty_state() {
+        let mut app = drive_to_main();
+        to_servers(&mut app);
+        app.on_net_event(NetEvent::IntroducerSnapshot {
+            candidates: Vec::new(),
+        });
+        let text = render_text(&app, 120, 28);
+        assert!(
+            text.contains("no peers discovered"),
+            "empty discovery shows a calm empty-state line"
+        );
+    }
+
+    /// An `IntroducerError` surfaces on the status line and leaves any prior
+    /// candidate list intact (mirrors the deprecation-error precedent).
+    #[test]
+    fn introducer_error_sets_status_and_keeps_candidates() {
+        let mut app = drive_to_main();
+        app.on_net_event(NetEvent::IntroducerSnapshot {
+            candidates: vec![("p#0011aabbccdd".to_owned(), "p:443".to_owned())],
+        });
+        app.on_net_event(NetEvent::IntroducerError {
+            message: "introducer refresh refused: boom".to_owned(),
+        });
+        assert_eq!(
+            app.discovered_peers().len(),
+            1,
+            "a refresh failure must not blank the cached candidates"
+        );
+        assert_eq!(
+            app.status(),
+            Some("introducer refresh refused: boom"),
+            "error surfaced on the status line"
+        );
     }
 
     #[test]

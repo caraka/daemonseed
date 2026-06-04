@@ -260,7 +260,7 @@ fn centered_rect(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
 /// The server-management list (F22 / C22): each managed server with its
 /// trusted/untrusted slider position; the selected row is highlighted (ISC-21).
 fn render_server_list(app: &App, frame: &mut Frame, area: Rect) {
-    let lines: Vec<Line> = if app.servers().is_empty() {
+    let mut lines: Vec<Line> = if app.servers().is_empty() {
         vec![
             Line::from(
                 "no servers — type <server-id>@<host:port> below and Enter to add".to_owned(),
@@ -289,6 +289,36 @@ fn render_server_list(app: &App, frame: &mut Frame, area: Rect) {
             })
             .collect()
     };
+
+    // The "Discovered (introducer)" sub-section (M12 gate step 6, ISC-C22 /
+    // ISC-S6 / ISC-A-C19): peers the connected relay's introducer reported that
+    // are NOT in the active trust set — candidates only, never auto-trusted. We
+    // render the server-id and the address ONLY; the introducer response carries
+    // no key material (ISC-S6), so neither does this list. Each candidate's
+    // server-id (`name#hex`) and address (`host:port`) are single-token, so each
+    // renders as a contiguous run in the raw PTY byte stream (a multi-word phrase
+    // would be split by ratatui's per-word cursor moves — these are not).
+    lines.push(Line::from(String::new()));
+    lines.push(
+        Line::from("── Discovered (introducer) ──".to_owned())
+            .style(Style::default().fg(Color::Magenta)),
+    );
+    if app.discovered_peers().is_empty() {
+        lines.push(
+            Line::from("(no peers discovered — none, or all already configured)".to_owned())
+                .style(Style::default().fg(Color::DarkGray)),
+        );
+    } else {
+        for (server_id, address) in app.discovered_peers() {
+            // server-id then address, each a contiguous token; "candidate"
+            // labels it as not-yet-trusted (promotion is an explicit action).
+            lines.push(
+                Line::from(format!("  candidate {server_id} at {address}"))
+                    .style(Style::default().fg(Color::Yellow)),
+            );
+        }
+    }
+
     let body = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
         Block::default()
             .borders(Borders::ALL)
