@@ -117,6 +117,34 @@ pub fn circle(family: &str) -> String {
     CIRCLE_TEMPLATE.replace("{family}", family)
 }
 
+// ── Public rooms (ISC-S4 / ISC-S22) ─────────────────────────────────────────
+
+/// HKDF salt for the **global shared** public-room key (ISC-S22). A fixed
+/// protocol constant, distinct from [`CIRCLE_KEY_SALT`] so a public-room key
+/// can never collide with a circle key even for an identically-named input.
+///
+/// Unlike a circle, a public room has **no secret IKM**: the room key derives
+/// from public, well-known inputs (the crypto family token + the room name), so
+/// every client AND the relay derive the byte-identical key. The room is
+/// therefore *server-readable by construction* — encrypted in transit but under
+/// a key everyone holds (ISC-A-S2: public spaces are the deliberately-readable
+/// tier). Per-room uniqueness comes entirely from the room name in the `info`.
+pub const PUBLIC_ROOM_KEY_SALT: &[u8] = b"daemonseed/v1/public-room-key";
+
+/// HKDF info-string template for the global public-room key (ISC-S22). The
+/// `<family>` token anchors the derivation on the crypto family (mirroring
+/// [`CIRCLE_TEMPLATE`]); `<room>` is the public room name, so two rooms differ
+/// iff their names differ.
+const PUBLIC_ROOM_TEMPLATE: &str = "daemonseed/public-room/{family}/{room}";
+
+/// Build the public-room HKDF info string for a crypto-family token and a
+/// public room name.
+pub fn public_room(family: &str, room: &str) -> String {
+    PUBLIC_ROOM_TEMPLATE
+        .replace("{family}", family)
+        .replace("{room}", room)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

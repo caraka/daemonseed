@@ -85,6 +85,9 @@ fn run(terminal: &mut ratatui::DefaultTerminal, mut net: NetHandle) -> io::Resul
                 sender_handle: chat.sender_handle,
             });
         }
+        if let Some(body) = app.take_pending_public_room() {
+            let _ = net.send(NetCommand::SendPublicRoom { body });
+        }
         if app.take_pending_share_refresh() {
             let _ = net.send(NetCommand::RefreshShares);
         }

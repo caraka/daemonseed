@@ -44,6 +44,9 @@ use daemonseed_core::crypto::suite::{CNSA_2_0, SuiteId};
 use daemonseed_core::federation::discovered::DiscoveredPeers;
 use daemonseed_core::federation::store::{InMemoryTrustStore, ServerEntry, TrustStore};
 use daemonseed_core::handle::Handle;
+use daemonseed_core::public_room::{
+    DEFAULT_ROOM, derive_room_key, open_room_message, room_asset_address, seal_room_message,
+};
 use daemonseed_core::share_envelope::ShareFrame;
 use daemonseed_core::storage::cas::chunk_addr;
 use daemonseed_core::storage::seeds::CounterState;
@@ -73,6 +76,11 @@ pub enum NetCommand {
     /// user's own display handle, sealed into the message for the recipient's
     /// client-side @mention (C17) / mute (C15) — never seen by the relay.
     SendChat { body: String, sender_handle: String },
+    /// Post a message to the joined default public room (ISC-S22 / ISC-S24).
+    /// Self-signed for provenance under the daemon's own identity, then sealed
+    /// under the global room key. Any daemon may post; the relay can read it
+    /// (it holds the global key) but it is never wire-cleartext (ISC-A-S16).
+    SendPublicRoom { body: String },
     /// Refresh the Shares-pane snapshot (ISC-17 / ISC-20). Returns the current
     /// `ShareIndex` entries (My shares), the latest `ListPublicShares` from
     /// the connected relay (Public shares), and the current indexer status.
@@ -167,6 +175,25 @@ pub enum NetEvent {
     },
     /// A chat send failed (no joined circle, seal, or publish error).
     ChatError { message: String },
+    /// The default public room is subscribed; everyone-reads chat can flow
+    /// (ISC-S22 / ISC-C56). `room` is the joined room name.
+    PublicRoomJoined { room: String },
+    /// Joining the default public room failed (no live session or subscribe
+    /// error). Non-fatal: the connection itself is up.
+    PublicRoomJoinFailed { message: String },
+    /// A verified public-room message arrived (ISC-S25 / ISC-C57). Only messages
+    /// whose provenance signature verified are emitted (ISC-A-S17).
+    PublicRoomMessage {
+        /// The room the message belongs to.
+        room: String,
+        /// The sender's self-asserted handle (cross-checked against the verified
+        /// pubkey at the UI layer per ISC-C57).
+        sender: String,
+        /// The message body, as posted.
+        body: String,
+        /// Sender wall-clock at compose, unix ms (advisory ordering).
+        sent_unix_ms: i64,
+    },
     /// A trust-state event to surface per its ISC-C28 affordance class. The key
     /// determines the class via `class_of`; the UI routes it (Blocking modal,
     /// Persistent status badge, Transient toast, or LogOnly history).
@@ -337,6 +364,20 @@ struct Circle {
     out_tx: mpsc::Sender<wire::CotFrame>,
 }
 
+/// The live public room a daemon is subscribed to (ISC-S22..S26 / ISC-C56).
+/// Mirrors [`Circle`] but keyed by the *global* room key (server-readable) and
+/// posting is self-signed for provenance under the daemon's own identity.
+struct PublicRoom {
+    /// The room name (e.g. "lobby"), bound into each message's provenance
+    /// signature so it cannot be replayed into another room (ISC-S24).
+    room: String,
+    /// The global shared room key — derived from public inputs, so every
+    /// client and the relay hold it (ISC-S22). Reused for AEAD seal/open.
+    room_key: Rc<CotKey>,
+    asset_addr: AssetAddr,
+    out_tx: mpsc::Sender<wire::CotFrame>,
+}
+
 /// Mutable state the actor carries across commands.
 struct Actor {
     evt_tx: mpsc::UnboundedSender<NetEvent>,
@@ -346,6 +387,13 @@ struct Actor {
     server_id: Option<String>,
     /// The currently-joined circle, if any.
     circle: Option<Circle>,
+    /// The daemon's own client identity, retained after connect so public-room
+    /// posts can be self-signed for provenance (ISC-S24) under the same key that
+    /// proved the connection. `None` until a connect succeeds.
+    identity: Option<ClientIdentity>,
+    /// The auto-joined default public room, if subscribed (ISC-S22 / ISC-C56).
+    /// The default chat surface needs no circle; circles are the private opt-in.
+    public_room: Option<PublicRoom>,
     /// Per-session reconnect-refusal budget (ISC-C26). Consecutive refused
     /// connects advance it so the surfaced trust event escalates
     /// `ConnectionRateLimited` (Transient) → `ConnectionRateLimitedExhausted`
@@ -390,6 +438,8 @@ async fn net_actor(
         session: None,
         server_id: None,
         circle: None,
+        identity: None,
+        public_room: None,
         backoff: Backoff::new(),
         share_index: None,
         server_pubkey: None,
@@ -408,6 +458,7 @@ async fn net_actor(
                 body,
                 sender_handle,
             } => actor.handle_send_chat(&body, &sender_handle).await,
+            NetCommand::SendPublicRoom { body } => actor.handle_send_public_room(&body).await,
             NetCommand::RefreshShares => actor.handle_refresh_shares().await,
             NetCommand::RefreshPublicSpace => actor.handle_refresh_public_space().await,
             NetCommand::RefreshDeprecation => actor.handle_refresh_deprecation().await,
@@ -467,7 +518,16 @@ impl Actor {
                     // Capture the TOFU-pinned server-wide key for client-side
                     // deprecation-policy verification (ISC-C25 / ISC-A-S11).
                     self.server_pubkey = Some(outcome.server_pubkey.clone());
+                    // Retain the identity for public-room provenance signing
+                    // (ISC-S24): the same key that proved this connection signs
+                    // its public-room posts.
+                    self.identity = Some(identity);
                     self.backoff.reset();
+                    // The default chat surface is a public room (ISC-S22 /
+                    // ISC-C56): auto-join it on connect so chatting needs no
+                    // circle. A failure here is non-fatal — it surfaces as a
+                    // room-join failure; the connection itself is up.
+                    self.join_default_public_room().await;
                     // A trusted-mode key rotation is a PersistentNonBlocking
                     // trust event (ISC-C22/C28): the connect succeeded, but the
                     // user should know the key changed.
@@ -599,6 +659,123 @@ impl Actor {
             out_tx,
         });
         self.emit(NetEvent::CircleJoined);
+    }
+
+    /// Subscribe to the well-known default public room (ISC-S22 / ISC-C56) so the
+    /// default chat surface flows without any circle. Reuses the SAME
+    /// `CircleOfTrust.Subscribe` relay (ISC-S23) — only the key (global,
+    /// server-readable) and posting auth (self-signed, ISC-S24) differ.
+    async fn join_default_public_room(&mut self) {
+        let Some(session) = self.session.as_ref() else {
+            return self.emit(NetEvent::PublicRoomJoinFailed {
+                message: "not connected to a relay yet".to_owned(),
+            });
+        };
+        let Some(server_id) = self.server_id.as_ref() else {
+            return self.emit(NetEvent::PublicRoomJoinFailed {
+                message: "no server-id for the connected relay".to_owned(),
+            });
+        };
+
+        // The room key is GLOBAL: derived from public inputs, identical for every
+        // client and the relay (ISC-S22). Reused as the AEAD key for seal/open.
+        let room = DEFAULT_ROOM.to_owned();
+        let room_key = match derive_room_key(&room, &CNSA_2_0) {
+            Ok(k) => Rc::new(k),
+            Err(e) => {
+                return self.emit(NetEvent::PublicRoomJoinFailed {
+                    message: format!("public-room key derivation failed: {e}"),
+                });
+            }
+        };
+        let asset_addr = match room_asset_address(&room_key, server_id.as_bytes()) {
+            Ok(a) => a,
+            Err(e) => {
+                return self.emit(NetEvent::PublicRoomJoinFailed {
+                    message: format!("public-room rendezvous derivation failed: {e}"),
+                });
+            }
+        };
+
+        let (out_tx, out_rx) = mpsc::channel::<wire::CotFrame>(32);
+        let naming = wire::CotFrame {
+            asset_address: asset_addr.as_bytes().to_vec(),
+            payload: Vec::new(),
+        };
+        if out_tx.send(naming).await.is_err() {
+            return self.emit(NetEvent::PublicRoomJoinFailed {
+                message: "public-room subscribe channel closed".to_owned(),
+            });
+        }
+
+        let mut cot = session.circle_of_trust();
+        let inbound = match cot.subscribe(ReceiverStream::new(out_rx)).await {
+            Ok(resp) => resp.into_inner(),
+            Err(status) => {
+                return self.emit(NetEvent::PublicRoomJoinFailed {
+                    message: format!("public-room subscribe refused: {}", status.message()),
+                });
+            }
+        };
+
+        // Inbound reader: open + VERIFY each frame under the global room key
+        // (ISC-S25 / ISC-C57). Unverifiable / forged-provenance frames are
+        // dropped silently (ISC-A-S17). Runs until the stream ends.
+        let reader_key = Rc::clone(&room_key);
+        let reader_tx = self.evt_tx.clone();
+        tokio::task::spawn_local(read_inbound_public_room(inbound, reader_key, reader_tx));
+
+        self.public_room = Some(PublicRoom {
+            room,
+            room_key,
+            asset_addr,
+            out_tx,
+        });
+        self.emit(NetEvent::PublicRoomJoined {
+            room: DEFAULT_ROOM.to_owned(),
+        });
+    }
+
+    /// Post a message to the joined public room (ISC-S22 / ISC-S24). The message
+    /// is self-signed for provenance under the daemon's own identity, then sealed
+    /// under the global room key. Any daemon may post — the signature establishes
+    /// authorship, not authorization.
+    async fn handle_send_public_room(&mut self, body: &str) {
+        let Some(room) = self.public_room.as_ref() else {
+            return self.emit(NetEvent::ChatError {
+                message: "no public room joined".to_owned(),
+            });
+        };
+        let Some(identity) = self.identity.as_ref() else {
+            return self.emit(NetEvent::ChatError {
+                message: "no identity to sign the post".to_owned(),
+            });
+        };
+
+        let sealed = match seal_room_message(
+            &room.room_key,
+            identity.signing(),
+            &room.room,
+            identity.handle(),
+            body,
+            now_unix_ms(),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                return self.emit(NetEvent::ChatError {
+                    message: format!("public-room seal/sign failed: {e}"),
+                });
+            }
+        };
+        let frame = wire::CotFrame {
+            asset_address: room.asset_addr.as_bytes().to_vec(),
+            payload: sealed,
+        };
+        if room.out_tx.send(frame).await.is_err() {
+            self.emit(NetEvent::ChatError {
+                message: "public-room stream closed; reconnect to post".to_owned(),
+            });
+        }
     }
 
     /// Read the My-shares ([`ShareIndex::entries`]) + Public-shares
@@ -1135,6 +1312,39 @@ async fn read_inbound(
     }
 }
 
+/// Read the public room's inbound frames, open + VERIFY each under the global
+/// room key (ISC-S25 / ISC-C57), and emit a [`NetEvent::PublicRoomMessage`].
+/// A frame whose seal or provenance signature does not verify is dropped
+/// silently (forged-provenance or foreign noise, ISC-A-S17) — it is never
+/// surfaced. Returns when the stream ends.
+async fn read_inbound_public_room(
+    mut inbound: tonic::Streaming<wire::CotFrame>,
+    room_key: Rc<CotKey>,
+    evt_tx: mpsc::UnboundedSender<NetEvent>,
+) {
+    loop {
+        match inbound.message().await {
+            Ok(Some(frame)) => {
+                // open_room_message verifies the embedded provenance signature
+                // before returning, so only verified messages are surfaced.
+                if let Ok(msg) = open_room_message(&room_key, &frame.payload)
+                    && evt_tx
+                        .send(NetEvent::PublicRoomMessage {
+                            room: msg.room,
+                            sender: msg.sender_handle,
+                            body: msg.body,
+                            sent_unix_ms: msg.sent_unix_ms,
+                        })
+                        .is_err()
+                {
+                    return; // UI gone
+                }
+            }
+            Ok(None) | Err(_) => return,
+        }
+    }
+}
+
 /// Categorize a connect failure into its observable close layer (ISC-C26) and,
 /// when the error maps to a *specific actionable* trust event (ISC-C28), that
 /// key. Network-layer failures and the deliberately-opaque app-layer closes
@@ -1424,6 +1634,8 @@ mod tests {
             session: None,
             server_id: None,
             circle: None,
+            identity: None,
+            public_room: None,
             backoff: Backoff::new(),
             share_index: None,
             server_pubkey: None,

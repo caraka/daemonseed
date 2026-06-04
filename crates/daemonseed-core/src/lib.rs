@@ -49,6 +49,7 @@ pub mod kdf;
 pub mod mention;
 pub mod passphrase;
 pub mod profile;
+pub mod public_room;
 pub mod public_space;
 pub mod release;
 pub mod share_envelope;

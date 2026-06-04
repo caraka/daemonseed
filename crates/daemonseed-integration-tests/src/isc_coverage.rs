@@ -7,9 +7,9 @@
 //! Count invariants (must stay aligned with AGENTS.md "Standards target"
 //! section and the project manifest):
 //!
-//! - 37 server-side: 21 positive (`ISC-S*`) + 16 negative (`ISC-A-S*`)
-//! - 57 client-side: 38 positive (`ISC-C*`) + 19 negative (`ISC-A-C*`)
-//! - 94 total
+//! - 46 server-side: 26 positive (`ISC-S*`) + 20 negative (`ISC-A-S*`)
+//! - 60 client-side: 41 positive (`ISC-C*`) + 19 negative (`ISC-A-C*`)
+//! - 106 total
 //!
 //! `C5` is intentionally vacant (parking-lot reservation R5, folder
 //! encryption — post-MVP).
@@ -34,7 +34,7 @@ pub enum IscClass {
 /// Every ISC known to this MVP, in declaration order from `ds-isc-draft.md`.
 /// Length is [`TOTAL`].
 pub const ISCS: &[(&str, IscClass)] = &[
-    // ── server positive (25) ────────────────────────────────────────────
+    // ── server positive (30) ────────────────────────────────────────────
     ("ISC-S1", IscClass::Positive),
     ("ISC-S2a", IscClass::Positive),
     ("ISC-S2b", IscClass::Positive),
@@ -57,10 +57,15 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-S19", IscClass::Positive),
     ("ISC-S20", IscClass::Positive),
     ("ISC-S21", IscClass::Positive),
+    ("ISC-S22", IscClass::Positive),
+    ("ISC-S23", IscClass::Positive),
+    ("ISC-S24", IscClass::Positive),
+    ("ISC-S25", IscClass::Positive),
+    ("ISC-S26", IscClass::Positive),
     ("ISC-S27", IscClass::Positive),
     ("ISC-S28", IscClass::Positive),
     ("ISC-S29", IscClass::Positive),
-    // ── server negative (19) ────────────────────────────────────────────
+    // ── server negative (23) ────────────────────────────────────────────
     ("ISC-A-S1", IscClass::Negative),
     ("ISC-A-S2", IscClass::Negative),
     ("ISC-A-S3", IscClass::Negative),
@@ -78,9 +83,13 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-A-S13", IscClass::Negative),
     ("ISC-A-S14", IscClass::Negative),
     ("ISC-A-S15", IscClass::Negative),
+    ("ISC-A-S16", IscClass::Negative),
+    ("ISC-A-S17", IscClass::Negative),
+    ("ISC-A-S18", IscClass::Negative),
+    ("ISC-A-S19", IscClass::Negative),
     ("ISC-A-S20", IscClass::Negative),
     ("ISC-A-S21", IscClass::Negative),
-    // ── client positive (38) — C5 intentionally vacant (R5) ─────────────
+    // ── client positive (41) — C5 intentionally vacant (R5) ─────────────
     ("ISC-C1", IscClass::Positive),
     ("ISC-C2", IscClass::Positive),
     ("ISC-C3", IscClass::Positive),
@@ -119,6 +128,9 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-C35", IscClass::Positive),
     ("ISC-C36", IscClass::Positive),
     ("ISC-C37", IscClass::Positive),
+    ("ISC-C56", IscClass::Positive),
+    ("ISC-C57", IscClass::Positive),
+    ("ISC-C58", IscClass::Positive),
     // ── client negative (19) ────────────────────────────────────────────
     ("ISC-A-C1", IscClass::Negative),
     ("ISC-A-C2", IscClass::Negative),
@@ -142,7 +154,7 @@ pub const ISCS: &[(&str, IscClass)] = &[
 ];
 
 /// Total ISCs tracked by this registry. Recount on every ISC add/remove.
-pub const TOTAL: usize = 101;
+pub const TOTAL: usize = 113;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -246,13 +258,14 @@ mod tests {
                 IscClass::Negative => neg += 1,
             }
         }
-        // AGENTS.md: 44 server-side + 57 client-side = 101. Split:
-        //   server  25 pos + 19 neg = 44  (alpha2: ISC-S21/A-S15 opaque share_id;
-        //                                  ISC-S27..S29 + A-S20/A-S21 share content download)
-        //   client  38 pos + 19 neg = 57
-        //   total   63 pos + 38 neg = 101
-        assert_eq!(pos, 63, "positive count drift");
-        assert_eq!(neg, 38, "negative count drift");
+        // AGENTS.md: 53 server-side + 60 client-side = 113. Split:
+        //   server  30 pos + 23 neg = 53  (alpha2: S21/A-S15 opaque share_id;
+        //                                  S27-S29 + A-S20/A-S21 share download;
+        //                                  S22-S26 + A-S16-A-S19 public rooms)
+        //   client  41 pos + 19 neg = 60  (public rooms: C56-C58)
+        //   total   71 pos + 42 neg = 113
+        assert_eq!(pos, 71, "positive count drift");
+        assert_eq!(neg, 42, "negative count drift");
     }
 
     #[test]

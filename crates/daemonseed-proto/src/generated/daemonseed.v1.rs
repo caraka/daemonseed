@@ -122,6 +122,60 @@ pub struct CircleMessage {
     #[prost(int64, tag = "3")]
     pub sent_unix_ms: i64,
 }
+/// A public-room chat message — the application payload for an INTERACTIVE public
+/// room (ISC-S4 / ISC-S22..S26). A public room is the public-vs-CoT bifurcation's
+/// public tier built over the SAME CircleOfTrust.Subscribe relay and the SAME
+/// CotFrame mechanism — any daemon may post, everyone subscribed reads
+/// (ISC-S22). Two things distinguish it from a CircleMessage:
+///
+///    1. It is SELF-SIGNED FOR PROVENANCE (ISC-S24 / ISC-C57). `sender_pubkey`
+///       and `signature` carry an ML-DSA-87 signature by the POSTING daemon's own
+///       identity over `daemonseed/public-room/message/v1 ‖ room ‖ sender_pubkey
+///       ‖ sent_unix_ms ‖ body`. Posting is open to any daemon — the signature
+///       proves WHO posted, not that they were AUTHORIZED to (contrast the
+///       whitelist-signed operator posts of ISC-S7/S8). Recipients verify it
+///       client-side and bind the displayed handle to `SHA-384(sender_pubkey)\[:12\]`
+///       (ISC-C4) so a spoofed `sender_handle` cannot impersonate a real key.
+///
+///    2. It is ENCRYPTED UNDER A GLOBAL SHARED KEY (ISC-S22 / ISC-A-S2). This
+///       whole message is prost-encoded, then AES-256-GCM-sealed under the public
+///       room key (daemonseed-core public_room::seal_room_message) — a key derived
+///       from PUBLIC inputs that the relay AND every client hold. ONLY the
+///       ciphertext rides in CotFrame.payload: the room is NEVER wire-cleartext
+///       (ISC-A-S16). The relay can read it because it holds the global key
+///       (server-readable, the deliberately-public tier) — NOT because anything
+///       travels in the clear.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PublicRoomMessage {
+    /// The public room name this message belongs to (e.g. "lobby"). Bound into
+    /// the provenance signature so a message cannot be replayed into a different
+    /// room. The rendezvous address already namespaces delivery; this binds the
+    /// signed content too.
+    #[prost(string, tag = "1")]
+    pub room: ::prost::alloc::string::String,
+    /// The poster's full ML-DSA-87 public key (1952 bytes for ML-DSA-87). The
+    /// provenance signature verifies under it, and the recipient derives the
+    /// authoritative handle hash-prefix `SHA-384(sender_pubkey)\[:12\]` from it
+    /// (ISC-C4) — never trusting `sender_handle` alone.
+    #[prost(bytes = "vec", tag = "2")]
+    pub sender_pubkey: ::prost::alloc::vec::Vec<u8>,
+    /// The poster's self-asserted display handle (`<name>#<12hex>`). Advisory:
+    /// the recipient cross-checks its hash component against `sender_pubkey`
+    /// (ISC-C57) and shows the verified `#<prefix>` floor when it disagrees.
+    #[prost(string, tag = "3")]
+    pub sender_handle: ::prost::alloc::string::String,
+    /// The message body as typed. Rendered as inert plaintext by the client.
+    #[prost(string, tag = "4")]
+    pub body: ::prost::alloc::string::String,
+    /// Sender wall-clock at compose time, unix milliseconds. Advisory ordering.
+    #[prost(int64, tag = "5")]
+    pub sent_unix_ms: i64,
+    /// Detached ML-DSA-87 provenance signature (4627 bytes for ML-DSA-87) over the
+    /// domain-separated signed input (ISC-S24). Verified client-side under
+    /// `sender_pubkey`; a bad signature drops the message (ISC-A-S17).
+    #[prost(bytes = "vec", tag = "6")]
+    pub signature: ::prost::alloc::vec::Vec<u8>,
+}
 /// Generated client implementations.
 pub mod circle_of_trust_client {
     #![allow(

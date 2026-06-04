@@ -67,6 +67,15 @@ impl CotKey {
     pub fn as_bytes(&self) -> &[u8; COT_KEY_LEN] {
         &self.0
     }
+
+    /// Wrap raw key bytes into a zeroizing [`CotKey`]. Used by the public-room
+    /// key derivation ([`crate::public_room::derive_room_key`]), which builds a
+    /// *global* symmetric key from public inputs but reuses the same AEAD
+    /// plumbing as a circle. The caller zeroes its own copy of `bytes` after
+    /// this call (the boxed copy here zeroes on drop).
+    pub fn from_bytes(bytes: [u8; COT_KEY_LEN]) -> Self {
+        CotKey(Box::new(bytes))
+    }
 }
 
 impl core::fmt::Debug for CotKey {
