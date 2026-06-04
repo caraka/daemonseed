@@ -34,7 +34,7 @@ pub enum IscClass {
 /// Every ISC known to this MVP, in declaration order from `ds-isc-draft.md`.
 /// Length is [`TOTAL`].
 pub const ISCS: &[(&str, IscClass)] = &[
-    // ── server positive (21) ────────────────────────────────────────────
+    // ── server positive (22) ────────────────────────────────────────────
     ("ISC-S1", IscClass::Positive),
     ("ISC-S2a", IscClass::Positive),
     ("ISC-S2b", IscClass::Positive),
@@ -56,7 +56,8 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-S18", IscClass::Positive),
     ("ISC-S19", IscClass::Positive),
     ("ISC-S20", IscClass::Positive),
-    // ── server negative (16) ────────────────────────────────────────────
+    ("ISC-S21", IscClass::Positive),
+    // ── server negative (17) ────────────────────────────────────────────
     ("ISC-A-S1", IscClass::Negative),
     ("ISC-A-S2", IscClass::Negative),
     ("ISC-A-S3", IscClass::Negative),
@@ -73,6 +74,7 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-A-S12", IscClass::Negative),
     ("ISC-A-S13", IscClass::Negative),
     ("ISC-A-S14", IscClass::Negative),
+    ("ISC-A-S15", IscClass::Negative),
     // ── client positive (38) — C5 intentionally vacant (R5) ─────────────
     ("ISC-C1", IscClass::Positive),
     ("ISC-C2", IscClass::Positive),
@@ -135,7 +137,7 @@ pub const ISCS: &[(&str, IscClass)] = &[
 ];
 
 /// Total ISCs tracked by this registry. Recount on every ISC add/remove.
-pub const TOTAL: usize = 94;
+pub const TOTAL: usize = 96;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -239,12 +241,12 @@ mod tests {
                 IscClass::Negative => neg += 1,
             }
         }
-        // AGENTS.md: 37 server-side + 57 client-side = 94. Split:
-        //   server  21 pos + 16 neg = 37  (ISC-S20 backfilled, M8/F23)
+        // AGENTS.md: 39 server-side + 57 client-side = 96. Split:
+        //   server  22 pos + 17 neg = 39  (ISC-S21 / ISC-A-S15 = opaque share_id, alpha2)
         //   client  38 pos + 19 neg = 57
-        //   total   59 pos + 35 neg = 94
-        assert_eq!(pos, 59, "positive count drift");
-        assert_eq!(neg, 35, "negative count drift");
+        //   total   60 pos + 36 neg = 96
+        assert_eq!(pos, 60, "positive count drift");
+        assert_eq!(neg, 36, "negative count drift");
     }
 
     #[test]

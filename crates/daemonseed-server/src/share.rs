@@ -19,6 +19,13 @@
 //! connection's shares ([`ShareReapGuard`]). `share_id`s are server-assigned and
 //! opaque; an other-owned unpublish is a silent no-op so the relay never reveals
 //! another connection's share ownership (ISC-A-S1).
+//!
+//! **Share ids are drawn from the OS CSPRNG, not a counter (ISC-S21 /
+//! ISC-A-S15).** Each `share_id` is 128 bits of OS entropy, lowercase-hex
+//! encoded. A sequential or otherwise order-derived id would let any peer
+//! enumerate the published-share space (`0000…`, `0001…`, …) and undercut the
+//! blind-relay privacy posture — the CoT fetch-asset for a share derives from
+//! its id, so a guessable id is a guessable rendezvous address.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -29,6 +36,20 @@ use daemonseed_proto::v1::PublicShareListing;
 /// values within a process run; never reused.
 pub type OwnerId = u64;
 
+/// Draw an opaque, unpredictable `share_id`: 128 bits from the OS CSPRNG,
+/// lowercase-hex encoded (32 chars). Drawn from `getrandom` — the same OS
+/// entropy source the rest of daemonseed uses — so ids are not order-derived and
+/// the published-share space is not enumerable (ISC-S21 / ISC-A-S15).
+///
+/// An OS-entropy failure is unrecoverable for the server (the same posture as
+/// every other key/nonce draw in the process), so this panics rather than
+/// silently degrading to a predictable id.
+fn random_share_id() -> String {
+    let mut buf = [0u8; 16];
+    getrandom::fill(&mut buf).expect("OS CSPRNG entropy for share_id");
+    buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 struct OwnedShare {
     owner: OwnerId,
     listing: PublicShareListing,
@@ -38,7 +59,6 @@ struct Inner {
     /// share_id -> owned share.
     shares: BTreeMap<String, OwnedShare>,
     next_owner: OwnerId,
-    next_share: u64,
 }
 
 /// The relay's RAM-only published-share table, shared (`Arc`) across every
@@ -62,7 +82,6 @@ impl SharePublishRegistry {
             inner: Arc::new(Mutex::new(Inner {
                 shares: BTreeMap::new(),
                 next_owner: 0,
-                next_share: 0,
             })),
         }
     }
@@ -77,12 +96,17 @@ impl SharePublishRegistry {
 
     /// Publish `listing` under `owner`; assign and return an opaque `share_id`.
     /// Any `listing.share_id` set by the caller is overwritten — the id is
-    /// server-scoped (ISC-C19 / F25).
+    /// server-scoped (ISC-C19 / F25) and CSPRNG-drawn, not order-derived
+    /// (ISC-S21 / ISC-A-S15). On the astronomically-unlikely collision the draw
+    /// retries, so the returned id is always unique in the live registry.
     pub fn publish(&self, owner: OwnerId, mut listing: PublicShareListing) -> String {
         let mut g = self.lock();
-        let n = g.next_share;
-        g.next_share += 1;
-        let share_id = format!("{n:016x}");
+        let share_id = loop {
+            let candidate = random_share_id();
+            if !g.shares.contains_key(&candidate) {
+                break candidate;
+            }
+        };
         listing.share_id = share_id.clone();
         g.shares
             .insert(share_id.clone(), OwnedShare { owner, listing });
@@ -237,6 +261,54 @@ mod tests {
             "alice's two shares reaped, bob's survives"
         );
         assert_eq!(remaining[0].share_id, bob_share);
+    }
+
+    #[test]
+    fn share_id_is_opaque_128bit_lowercase_hex() {
+        // ISC-S21: the id is 16 bytes (128 bit) of OS entropy, lowercase-hex
+        // encoded — exactly 32 hex chars, never an order-derived counter.
+        let reg = SharePublishRegistry::new();
+        let owner = reg.new_owner();
+        let id = reg.publish(owner, listing("docs", "a#0123456789ab"));
+        assert_eq!(id.len(), 32, "128-bit id is 32 hex chars");
+        assert!(
+            id.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "id is lowercase hex only, got {id:?}"
+        );
+    }
+
+    #[test]
+    fn share_ids_are_not_sequential_or_order_derived() {
+        // ISC-A-S15: the first id must NOT be the old enumerable counter value
+        // (`0000000000000000`), and successive ids must not be adjacent — a peer
+        // cannot walk the published-share space.
+        let reg = SharePublishRegistry::new();
+        let owner = reg.new_owner();
+        let first = reg.publish(owner, listing("a", "a#0123456789ab"));
+        let second = reg.publish(owner, listing("b", "a#0123456789ab"));
+        assert_ne!(first, "0000000000000000", "id is not the counter origin");
+        assert_ne!(first, second, "distinct shares get distinct ids");
+        // Adjacent-counter check: the two ids, parsed as integers, are not n / n+1.
+        let a = u128::from_str_radix(&first, 16).expect("hex");
+        let b = u128::from_str_radix(&second, 16).expect("hex");
+        assert_ne!(b, a.wrapping_add(1), "ids are not a +1 sequence");
+    }
+
+    #[test]
+    fn many_share_ids_are_unique_and_well_formed() {
+        // ISC-S21 / ISC-A-S15: across many draws every id is unique (the
+        // unique-in-registry retry holds) and every id is valid 32-char hex.
+        let reg = SharePublishRegistry::new();
+        let owner = reg.new_owner();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1_000 {
+            let id = reg.publish(owner, listing("docs", "a#0123456789ab"));
+            assert_eq!(id.len(), 32);
+            assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+            assert!(seen.insert(id), "every assigned id is unique");
+        }
+        assert_eq!(reg.live_count(), 1_000);
     }
 
     #[test]
