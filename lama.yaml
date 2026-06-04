@@ -32,15 +32,18 @@ library:
   phase: private
 
 # ─────────────────────────────────────────────────────────────────────
-# Implementation status: M9 closed at v0.11.0; M10 verifiable-core closed at
-# v0.12.0 (PR #14). v0.12.1-pre is M10-completion: it scaffolds the two
-# platform-gated M10 ISCs — C7 (biometric/secure-enclave session-passphrase
-# unlock) and C20 (OS-native autostart) — as abstraction-only traits + a pure
-# descriptor generator + opt-in flags + warnings (platform halves reserved),
-# and brings these LAMA manifests from the former project-local dialect to
-# canonical LAMA 0.1 matching the oxicrypt reference. The M10 release-signing
-# INFRASTRUCTURE (real keys, Sigstore, reproducible build, update-relay role)
-# and the C7/C20 platform halves remain deferred to M10-infra.
+# Implementation status: M10 closed at v0.12.1; M11 (MVP-gate client surfaces:
+# real TUI, public-space view, deprecation surface, clean-device recovery — all
+# over already-shipped server APIs) closed at v0.13.0. M12 (→ v0.14.0 = MVP)
+# ships the last two MVP-gate steps: step 5 user-publish file sharing
+# (PublishShare / UnpublishShare / ListPublicShares — RAM-only, held-connection
+# "you must be online to share", reaped on disconnect) and step 6 the federation
+# introducer endpoint + the TUI Servers-pane refresh that surfaces
+# introducer-discovered candidates. Both ride ONE additive SemVer MINOR wire bump
+# (wire stays 1.x). The full 4-daemon gate now trips 10/10 → MVP declared.
+# The M10 release-signing INFRASTRUCTURE (real keys, Sigstore, reproducible
+# build, update-relay role) and the C7/C20 platform halves remain deferred to
+# M10-infra.
 # ─────────────────────────────────────────────────────────────────────
 
 milestones_complete:
@@ -81,14 +84,22 @@ milestones_complete:
     tag: v0.12.0
     summary: "M10 verifiable-core (the pure-Rust, TDD-able half). Release trust anchor + N-of-M ML-DSA-87 multi-sig verify (daemonseed_core::release), the server boot-gate that refuses to boot on failed verify with no boot-with-warning path (daemonseed_server::boot_gate), and the client update-lifecycle FSM enforcing verify-before-apply / never-auto-install / no-silent-downgrade / wipe-and-log-on-failure (daemonseed_core::release::update). Plus the M9 per-key rate-limit slot RAII drop-guard and the ISC-S20 coverage backfill. Closes S18/A-S13/C27/A-C11. The release-signing infrastructure and C7/C20 platform features are deferred to M10-infra."
   - id: M10-completion
-    tag: "v0.12.1 (cuts on merge)"
+    tag: "v0.12.1"
     summary: "M10 completion. Scaffolds the two platform-gated M10 ISCs as abstraction-only: C7 biometric/secure-enclave session-passphrase unlock (daemonseed_core::biometric — BiometricStore trait + SessionPassphrase + RECOVERY_RISK_WARNING) and C20 OS-native autostart (daemonseed_core::autostart — pure unit_descriptor generator + AutostartManager trait + PRESENCE_SIDE_CHANNEL_WARNING), with opt-in ProfileConfig flags (default off) and post-MVP Reservations; the platform halves stay in M10-infra. Also brings every LAMA manifest (root + 4 per-crate) from the former project-local dialect to canonical LAMA 0.1 matching the oxicrypt reference."
+  - id: M11
+    tag: v0.13.0
+    summary: "MVP-gate client surfaces — the real interactive ratatui TUI driving the full transaction, M9 surface wiring, public-space (MOTD + announcements) view, suite-deprecation policy surfacing (fetch + ML-DSA verify + anti-rollback), and clean-device recovery from a 24-word mnemonic / .dseed file (gate step 8) — all over already-shipped, already-served server APIs (no new wire protocol). Trips gate steps 3/7/8."
+  - id: M12
+    tag: v0.14.0
+    summary: "MVP. The last two gate steps under one additive SemVer MINOR wire bump. Step 5: user-publish file sharing — PublishShare / UnpublishShare / ListPublicShares over the PublicSpace service; RAM-only per-connection registry (SharePublishRegistry), CLI publish holds the connection open until Ctrl-C, and ShareReapGuard reaps the share on real disconnect (ISC-A-S1 / A-S5b / S4). Step 6: the federation introducer endpoint (FederationIntroducer gRPC over the already-shipped IntroducerQuery/IntroducerResponse) + the TUI Servers-pane RefreshIntroducer surface rendering introducer-discovered candidates read-only, no keys, never auto-trusted (ISC-S6 / S13 / C22 / A-C19). serve_application now serves a single connection until real peer close (no genuinely-new ISC closes; the gate trips 10/10 → MVP declared)."
 
 milestones_planned:
   - id: M10-infra
     summary: "M10 deferred half: real release-signing keys + N-of-M governance identities, Sigstore co-signature, reproducible build, store/F-Droid/OS-packager channels, the optional update-relay role, C7 biometric/secure-enclave login, C20 OS-native autostart, and live update fetch."
-  - id: M11
-    summary: "TUI integration + MVP gate (4-daemon end-to-end)."
+  - id: post-MVP
+    summary: "GFW classifier bench, Pi-4 civility bench, unsigned alpha packaging."
+  - id: alpha2
+    summary: "Direct messaging (ISC-C38–C46 / A-C20–A-C25)."
 
 # ─────────────────────────────────────────────────────────────────────
 # Workspace layout
@@ -121,19 +132,19 @@ crates:
     manifest: "docs/llm-api-manifest/daemonseed-proto-protocol.yaml"
 
   - name: daemonseed-server
-    purpose: "Relay daemon binary + library. TLS 1.3 termination, APP_HELLO negotiation, the post-HELLO identity-proof exchange that lands a connection at Authenticated (M4b), federation introducer/peering (M5), the post-Authenticated PublicSpace application-stream service (M6, gRPC-over-h2 via daemonseed_server::public_space), and the M8 CircleOfTrust live relay (daemonseed_server::cot) — refcounted bidirectional Subscribe fan-out keyed by rendezvous address, served alongside public-space with h2 keepalive driving reap-at-zero — the M9 RAM-only rate limiter (daemonseed_server::rate_limit) wired into the per-connection path with per-identity-key admission released via an RAII drop-guard on disconnect, and the M10 release boot-gate (daemonseed_server::boot_gate) that refuses to boot on failed release-signature verify (wiring into real startup deferred to M10-infra)."
+    purpose: "Relay daemon binary + library. TLS 1.3 termination, APP_HELLO negotiation, the post-HELLO identity-proof exchange that lands a connection at Authenticated (M4b), federation introducer/peering (M5), the post-Authenticated PublicSpace application-stream service (M6, gRPC-over-h2 via daemonseed_server::public_space), and the M8 CircleOfTrust live relay (daemonseed_server::cot) — refcounted bidirectional Subscribe fan-out keyed by rendezvous address, served alongside public-space with h2 keepalive driving reap-at-zero — the M9 RAM-only rate limiter (daemonseed_server::rate_limit) wired into the per-connection path with per-identity-key admission released via an RAII drop-guard on disconnect, and the M10 release boot-gate (daemonseed_server::boot_gate) that refuses to boot on failed release-signature verify (wiring into real startup deferred to M10-infra). M12 adds the user-publish share surface (daemonseed_server::share — RAM-only SharePublishRegistry + ShareReapGuard reaping on real disconnect) over the PublicSpace service and the FederationIntroducer gRPC endpoint (gate step 6); serve_application now serves a single connection until real peer close (once().chain(pending()) + CloseNotify-driven shutdown) so a held publisher's share is reaped on disconnect, not on stream-end."
     license: AGPL-3.0-or-later
     status: active
     manifest: "docs/llm-api-manifest/daemonseed-server-api.yaml"
 
   - name: daemonseed-cli
-    purpose: "Non-interactive scriptable client binary + library. `connect <server-id>` does TLS-1.3 + APP_HELLO + (M4b) client-side identity-proof, returning only after Authenticated. Profile/messaging subcommands land M5+."
+    purpose: "Non-interactive scriptable client binary + library. `connect <server-id>` does TLS-1.3 + APP_HELLO + (M4b) client-side identity-proof, returning only after Authenticated. M12 adds the user-publish share subcommands `publish` / `unpublish` / `list-shares` over the PublicSpace RPCs (gate step 5); `publish` holds the connection open until Ctrl-C (you-must-be-online-to-share), and the share is RAM-only — reaped on disconnect (ISC-A-S1). The library side also carries the M6 public-space client plumbing and the M12 introducer refresh."
     license: AGPL-3.0-or-later
     status: active
     manifest: "docs/llm-api-manifest/daemonseed-cli-api.yaml"
 
   - name: daemonseed-tui
-    purpose: "Interactive ratatui client — the MVP product surface. A terminal-free screen state machine (daemonseed_tui::app) rendered by pure functions (daemonseed_tui::ui), driven by a thin binary (terminal lifecycle + event loop) that reuses daemonseed-cli's connect / identity-proof / C22-trust client stack. M11 grows it through first-start, chat, circle, share/fetch, the C22 trust slider, the C28 trust-event taxonomy, the F22 server-management screen, the public-space (MOTD + announcements) view, and the suite-deprecation policy view (fetch + ML-DSA verify + anti-rollback, ISC-C25 / A-S11)."
+    purpose: "Interactive ratatui client — the MVP product surface. A terminal-free screen state machine (daemonseed_tui::app) rendered by pure functions (daemonseed_tui::ui), driven by a thin binary (terminal lifecycle + event loop) that reuses daemonseed-cli's connect / identity-proof / C22-trust client stack. M11 grows it through first-start (incl. clean-device recovery), chat, circle, share/fetch, the C22 trust slider, the C28 trust-event taxonomy, the F22 server-management screen, the public-space (MOTD + announcements) view, and the suite-deprecation policy view (fetch + ML-DSA verify + anti-rollback, ISC-C25 / A-S11). M12 adds the Servers-pane introducer refresh: a read-only Discovered (introducer) sub-section listing introducer-discovered candidates (server-id + address, no keys, never auto-trusted — ISC-S6 / C22 / A-C19; gate step 6)."
     license: AGPL-3.0-or-later
     status: active
     manifest: "docs/llm-api-manifest/daemonseed-tui-api.yaml"
@@ -145,7 +156,7 @@ crates:
     manifest: null
 
   - name: xtask
-    purpose: "Workspace task runner. Subcommands: gen-proto, check-proto, isc-coverage, findings-resolved, install-hooks, mvp-gate (M11 — builds release server+tui binaries then runs the 4-daemon PTY harness, propagating its pass/fail bit)."
+    purpose: "Workspace task runner. Subcommands: gen-proto, check-proto, isc-coverage, findings-resolved, install-hooks, mvp-gate (builds release server+tui binaries then runs the 4-daemon PTY harness, propagating its pass/fail bit — 10/10 at M12 with steps 5 & 6 added), wire-shape (Wu et al. GFW classifier over a real handshake)."
     license: AGPL-3.0-or-later
     status: active
     manifest: null
@@ -483,13 +494,14 @@ external_dependencies:
 # are the authoritative spec sources during the private phase. They
 # live OUTSIDE this repository during the private phase and are
 # referenced by ISC number throughout the LAMA manifests.
-# Selected content will be promoted to `docs/` in this repo at the
-# MVP gate (M11). Until then, ISC numbers are the spec breadcrumbs.
+# The ISC document has been promoted into this repo as the authoritative
+# `ISA.md` (2026-05-29); the suite-registry doc stays vault-side for now.
+# ISC numbers are the spec breadcrumbs throughout these manifests.
 
 isc_reference:
-  current_count: 93
+  current_count: 94
   numbering:
-    server_positive: "ISC-S1 .. ISC-S19"
+    server_positive: "ISC-S1 .. ISC-S20"
     server_negative: "ISC-A-S1 .. ISC-A-S14"
     client_positive: "ISC-C1 .. ISC-C37 (C5 intentionally vacant)"
     client_negative: "ISC-A-C1 .. ISC-A-C19"

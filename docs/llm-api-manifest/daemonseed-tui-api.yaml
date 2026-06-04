@@ -21,7 +21,7 @@ library:
   description: "Interactive ratatui client — the MVP product surface. The interactive logic is a terminal-free screen state machine (daemonseed_tui::app) rendered by pure functions (daemonseed_tui::ui), so it is unit-testable and PTY-driveable without a terminal. The binary owns terminal lifecycle + event loop and reuses daemonseed-cli's connect / identity-proof / C22-trust client stack for the network side."
   license: "AGPL-3.0-or-later"
   manifest_for: "crates/daemonseed-tui"
-  status: "M11 in progress — app state machine + render loop + first-start + chat/circle + C22 trust slider + F22 server-management + C28 trust-event affordances (modal/badge/toast/history) + close-cause live; share / fetch / indexer screens and the gate harness grow across the remaining M11 workstreams"
+  status: "current through M12 — app state machine + render loop + first-start (incl. clean-device recovery) + chat/circle + C22 trust slider + F22 server-management + C28 trust-event affordances (modal/badge/toast/history) + close-cause + shares/fetch/indexer + public-space + deprecation; M12 adds the Servers-pane introducer refresh surfacing introducer-discovered candidates (gate step 6)"
 
 modules:
   - name: daemonseed_tui::app
@@ -44,8 +44,10 @@ modules:
       PersistentNonBlocking status badges (ISC-23), a Transient toast that
       auto-dismisses on the next key (ISC-24), and a TrustEventLog surfaced in a
       scrollable Trust History view (ISC-25, LogOnly); it tracks the last
-      observed close-cause layer (ISC-28). Tab cycles focus Chat → JoinCircle →
-      Mute → Servers → TrustHistory.
+      observed close-cause layer (ISC-28). The Servers pane (M12 gate step 6)
+      surfaces introducer-discovered candidates under a read-only "Discovered
+      (introducer)" sub-section — RAM-only, never auto-trusted (ISC-S6 / ISC-C22 /
+      ISC-A-C19). Tab cycles focus across all Main-view panes (see MainFocus).
     no_std: false
     depends_on: [daemonseed-core, "daemonseed_tui::screens::first_start"]
     iscs: ["1", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", C16, C25, C26, C28, A-S3, A-S11, A-C3, A-C7, A-C12, F23]
@@ -82,7 +84,14 @@ modules:
       session — a withdrawn-after-cached policy is treated as rollback, a
       missing/short key fails closed, and affected-suite trust events emit only on
       a version bump or a blocking cutoff-hit so a dismissed warning never
-      resurrects).
+      resurrects),
+      RefreshIntroducer (M12 gate step 6, ISC-C22 / ISC-S6 / ISC-A-C19 — query
+      the connected relay's FederationIntroducer over AppSession::refresh_introducer
+      into the actor's RAM-only DiscoveredPeers cache, passing the client's known
+      server-ids only to skip already-configured peers, then emit the merged
+      candidate set as one IntroducerSnapshot; discovery never writes the trust set,
+      so a discovered peer is a candidate the user must explicitly promote, never
+      auto-trusted, and the response carries no key material).
       Events: Connected/ConnectFailed, CircleJoined/CircleJoinFailed,
       ChatMessage, ChatError, TrustEvent (a C28 trust-event key + scope, routed
       by the UI per its affordance class), ConnectionClosed (a C26 close-cause
@@ -94,7 +103,11 @@ modules:
       files_written, bytes_written }), FetchError ({ message } — terminal),
       DeprecationSnapshot ({ policy_version: Option<u64>, warnings:
       Vec<DeprecationWarningRow>, had_policy: bool } — ISC-C25), DeprecationError
-      ({ message } — surfaced on the status line, cached warnings kept intact).
+      ({ message } — surfaced on the status line, cached warnings kept intact),
+      IntroducerSnapshot ({ candidates: Vec<(String, String)> } — (server-id,
+      address) pairs only, no keys; replaces the cached list wholesale; M12 gate
+      step 6) and IntroducerError ({ message } — no live session or RPC failure,
+      surfaced on the status line; the cached candidate list is left intact).
       On connect failure the actor categorizes the error into a CloseCause
       and emits the warranted trust event: an actionable key directly
       (ServerKeyMismatch / NoCommonVersion, Blocking), else the uniform rate-limit
@@ -103,8 +116,8 @@ modules:
       Foreign/undecryptable inbound frames are skipped.
     no_std: false
     depends_on: [daemonseed-cli, daemonseed-core, daemonseed-proto]
-    iscs: ["10", "14", "16", "17", "19", "20", "22", "23", "24", "25", "28", "47", C15, C17, C21, C22, C25, C26, C28, C37, A-S2, A-S3, A-S11, A-C7, A-S12, F23]
-    added_in: "M11 connect + chat + C28 + shares + fetch + public-space + deprecation workstream"
+    iscs: ["10", "14", "16", "17", "19", "20", "22", "23", "24", "25", "28", "47", C15, C17, C21, C22, C25, C26, C28, C37, S6, A-S2, A-S3, A-S11, A-C7, A-S12, A-C19, F23]
+    added_in: "M11 connect + chat + C28 + shares + fetch + public-space + deprecation workstream; M12 introducer refresh (gate step 6)"
 
   - name: daemonseed_tui::screens::first_start
     description: >-
@@ -195,6 +208,8 @@ public_types:
       - "fn deprecation_had_policy(&self) -> bool           # distinguishes no-policy from no-suite-affected"
       - "fn dep_sel(&self) -> usize                         # deprecation-warning row selection"
       - "fn take_pending_deprecation_refresh(&mut self) -> bool  # drained into NetCommand::RefreshDeprecation"
+      - "fn discovered_peers(&self) -> &[(String, String)]  # M12 Servers-pane introducer candidates (server-id, address); no keys (ISC-S6 / ISC-C22 / ISC-A-C19)"
+      - "fn take_pending_introducer_refresh(&mut self) -> bool  # drained into NetCommand::RefreshIntroducer"
       - "fn on_net_event(&mut self, event: NetEvent)"
       - "fn on_key(&mut self, key: KeyEvent)"
   - name: daemonseed_tui::app::Screen
@@ -206,7 +221,7 @@ public_types:
     description: "One rendered chat line: sender (self-asserted handle), body, sent_unix_ms (0 for a local echo of a just-sent message, which the relay never reflects to its sender). ISC-10."
   - name: daemonseed_tui::app::MainFocus
     kind: enum
-    description: "Which Main-view input has keyboard focus (Tab cycles Chat → JoinCircle → Mute → Shares → Hide → Servers → TrustHistory → PublicSpace → Deprecation → Chat). Chat (compose, Enter sends, ISC-14); JoinCircle (phrase, Enter joins, ISC-15/16); Mute (full handle, Enter toggles the client-local mute set, ISC-13 / A-C3); Shares (two-pane My/Public shares view; Up/Down selects, r refreshes, ISC-17/20); Hide (full sharer-handle, Enter toggles the client-local hidden-shares set, ISC-18 / C16 / A-C3 — Shares view stays visible); Servers (F22 server-management — main area shows the server list; Enter adds or connects-selected, Left/Right slides trust, Up/Down selects, ISC-21/26/27); TrustHistory (main area shows the C28 trust-event audit log; Up/Down select, Enter dismisses per (key, scope), ISC-25 / A-C12); PublicSpace (read-only MOTD + announcements view; Up/Down selects, r refreshes, ISC-25 / S7 / A-S3); Deprecation (read-only verified suite-deprecation warnings; Up/Down selects, r refreshes, ISC-C25 / A-S11 / C28)."
+    description: "Which Main-view input has keyboard focus (Tab cycles Chat → JoinCircle → Mute → Shares → Hide → Servers → TrustHistory → PublicSpace → Deprecation → Chat). Chat (compose, Enter sends, ISC-14); JoinCircle (phrase, Enter joins, ISC-15/16); Mute (full handle, Enter toggles the client-local mute set, ISC-13 / A-C3); Shares (two-pane My/Public shares view; Up/Down selects, r refreshes, ISC-17/20); Hide (full sharer-handle, Enter toggles the client-local hidden-shares set, ISC-18 / C16 / A-C3 — Shares view stays visible); Servers (F22 server-management — main area shows the server list; Enter adds or connects-selected, Left/Right slides trust, Up/Down selects, ISC-21/26/27; M12 gate step 6 — opening the pane auto-dispatches RefreshIntroducer and a read-only "Discovered (introducer)" sub-section lists each introducer-discovered peer as `server-id  address` with the `candidate` label, carrying no key bytes and never auto-trusted — promotion stays an explicit user action, ISC-S6 / ISC-C22 / ISC-A-C19); TrustHistory (main area shows the C28 trust-event audit log; Up/Down select, Enter dismisses per (key, scope), ISC-25 / A-C12); PublicSpace (read-only MOTD + announcements view; Up/Down selects, r refreshes, ISC-25 / S7 / A-S3); Deprecation (read-only verified suite-deprecation warnings; Up/Down selects, r refreshes, ISC-C25 / A-S11 / C28)."
     variants: [Chat, JoinCircle, Mute, Shares, Hide, Servers, TrustHistory, PublicSpace, Deprecation]
   - name: daemonseed_tui::app::LocalShareRow
     kind: struct

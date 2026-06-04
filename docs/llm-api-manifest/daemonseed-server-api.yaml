@@ -1278,8 +1278,16 @@ functions:
     description: >-
       Serve the PublicSpace service, the CircleOfTrust relay, AND the M12
       FederationIntroducer endpoint over one Authenticated transport (h2 keepalive
-      on; ~10s/20s MVP defaults drive CoT reaping) until the peer closes. In
-      production S is the raw transport from
+      on; ~10s/20s MVP defaults drive CoT reaping) until the peer actually closes.
+      Single-connection contract (M12 fix, gate step 5): tonic is fed an incoming
+      stream that yields the one connection then never ends (once().chain(pending()))
+      so graceful shutdown never triggers on stream-end; termination is driven from
+      the connection's own close via a CloseNotify IO-guard that fires the
+      serve_with_incoming_shutdown signal on real peer close / GOAWAY / keepalive-
+      detected death. This is load-bearing for a held publisher: a daemon that issues
+      PublishShare then holds the connection open is no longer raced into a premature
+      close, and ShareReapGuard reaps exactly this connection's shares once, on the
+      real disconnect (ISC-A-S1). In production S is the raw transport from
       Connection<Authenticated, TlsStream<TcpStream>>::into_inner(). Renamed from
       serve_public_space at M8. M11: constructs one per-connection
       ConnectionLimiter (RateLimitConfig::default, Pi-4-sized) shared between a

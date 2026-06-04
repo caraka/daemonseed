@@ -27,7 +27,7 @@ library:
     - name: connect
       summary: "TLS-1.3 + APP_HELLO + identity-proof to Authenticated; prints wire version (M4a/M4b/M5)."
     - name: publish
-      summary: "Publish a public-space share; server assigns + prints the opaque share_id. RAM-only, vanishes on disconnect (M12 / gate step 5, ISC-A-S1)."
+      summary: "Publish a public-space share; server assigns + prints the opaque share_id, then HOLDS the connection open until Ctrl-C (you-must-be-online-to-share). RAM-only: the share is reaped on disconnect (M12 / gate step 5, ISC-A-S1). Args unchanged from the one-shot form."
     - name: unpublish
       summary: "Unpublish a share by id (owner-scoped; one-shot CLI can only unpublish within the same client that published)."
     - name: list-shares

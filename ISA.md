@@ -6,7 +6,7 @@ phase: build
 progress: 72/94
 mode: interactive
 started: 2026-04-19T00:00:00Z
-updated: 2026-05-29T19:30:00Z
+updated: 2026-06-03T00:00:00Z
 ---
 
 # Daemonseed — ISA (Ideal State Artifact)
@@ -315,7 +315,7 @@ Work breakdown by milestone. Each milestone is a PR; releases are SSH-signed fro
 | M9 | rate limits, backoff, mute, hide, @mentions | v0.11.0 | shipped |
 | M10 | release verify, boot gate, update FSM, coverage, LAMA manifests | v0.12.1 | shipped |
 | M11 | **MVP-gate client surfaces** — real TUI, M9 wiring, public-space view, deprecation-policy surfacing, clean-device recovery (all over already-shipped, already-served server APIs; **no new wire protocol**) | v0.13.0 | **surfaces done (steps 3/7/8); v0.13.0 pending tag** |
-| M12 | **user-publish file sharing + federation introducer endpoint** — `PublishShare` RPC + server handler + TUI publish surface (ISC-38), **plus** the federation introducer endpoint (additive gRPC RPC over the already-shipped `IntroducerQuery`/`IntroducerResponse` messages) + its client refresh surface (gate step 6); both ride **one** SemVer **MINOR wire bump**; **trips the full 4-daemon gate → MVP declared** | v0.14.0 (target) | planned |
+| M12 | **user-publish file sharing + federation introducer endpoint** — `PublishShare` RPC + server handler + TUI publish surface (ISC-38), **plus** the federation introducer endpoint (additive gRPC RPC over the already-shipped `IntroducerQuery`/`IntroducerResponse` messages) + its client refresh surface (gate step 6); both ride **one** SemVer **MINOR wire bump**; **trips the full 4-daemon gate → MVP declared** | v0.14.0 | shipped |
 | post-MVP | GFW classifier bench, Pi-4 civility bench, unsigned alpha packaging (parallelizable with M11/M12) | — | planned |
 | alpha2 | direct messaging (ISC-C38–C46 / A-C20–A-C25) | — | deferred |
 | reservations | folder encryption, multi-instance, QUIC transport | — | reserved |
@@ -338,6 +338,21 @@ already-shipped APIs" — completing it adds protocol surface, which now rides M
 
 ## Decisions
 
+- 2026-06-03: **M12 finish authorized as a full unattended run, incl. release (caraka).** Data-SIM
+  connectivity restored, so the network-gated release path is reachable. caraka authorized the complete
+  run end-to-end: build the remaining surface, trip the full 8-step gate, advance coverage + doc-sync, then
+  **ff-merge `feat/m12`→`main`, SSH-signed `v0.14.0` tag, push, PR #18, declare MVP** — all unattended.
+  Hard abort condition: release only if the gate is green and the AGENTS.md DoD passes. **Step-6 scope
+  decision (caraka, 2026-06-03): surface introducer-discovered candidates in the TUI Servers pane and
+  PTY-drive it like the other panes** — chosen over "session-level test is enough" / a `cli introducer`
+  subcommand. This adds a small MVP client-UI surface beyond the M11→M12 handoff's minimal lean: the
+  Servers pane gains a refresh action (`NetCommand::RefreshIntroducer` → `session.refresh_introducer` →
+  `NetEvent::IntroducerSnapshot`) and renders each candidate as `server-id  address` (no key bytes,
+  ISC-S6/A-C19), with promotion staying the explicit user action. **Delegation approach:** primary
+  orchestrates; bulk editing + cargo loops delegated to non-isolating general-purpose agents working
+  directly in the existing `feat-m12` worktree (never Engineer — worktree-isolation bug; never spawning new
+  worktrees), serial because the feature is tightly coupled. Mode/tier: classifier E3; honored, with the
+  scope expansion logged here (the run is E4-sized but mechanically follows the existing 3-pane pattern).
 - 2026-06-01: **H2 `PublishShare` — RAM-only, connection-reaped, owner-scoped, blind-relay (gate step 5).**
   M12 has no dedicated `ISC-38`; the user-publish wire surface was designed against the existing ISCs.
   Forced choices: **RAM-only** (ISC-A-S1 — a published share is user data, not an operator carve-out, so it
@@ -519,8 +534,19 @@ already-shipped APIs" — completing it adds protocol surface, which now rides M
   device's, invalid-mnemonic + wrong-`.dseed`-passphrase stay-on-step, and the Welcome `[r]` → recover-branch
   wiring) pass, and the end-to-end gate test `fresh_daemon_recovers_identity_from_mnemonic` passes inside
   `cargo xtask mvp-gate`. Probe: `cargo xtask mvp-gate` (PASS) + `cargo test -p daemonseed-core -p daemonseed-tui`.
-- MVP gate: steps 1, 2, 3, 4, 7, 8 pass on real binaries via the PTY harness (`cargo xtask mvp-gate`, 8/8).
-  Step 6 (introducer refresh) moved to M12 (needs the introducer endpoint); step 5 (user-publish) is also
-  M12 (→ v0.14.0), at which point all 8 steps pass = MVP. Probe: `cargo xtask mvp-gate`.
+- M12 steps 5 & 6 verified 2026-06-03: the PTY/subprocess gate now runs **10 tests and passes 10/10**.
+  Step 5 (user-publish file sharing) — `cli_published_share_is_cross_client_visible_then_reaped`: a held
+  `daemonseed-cli publish docs` connection is seen by a *separate* ephemeral client via `ListPublicShares`
+  (online → cross-client visible), then SIGINT'd; the second client polls until the share is gone
+  (offline → reaped), exercising the RAM-only `ShareReapGuard` cross-client reap (ISC-A-S1), the blind-relay
+  publish posture (ISC-A-S5b), and the public-space file-share surface (ISC-S4). Step 6 (introducer refresh)
+  — `daemon_servers_pane_surfaces_introducer_candidate`: a relay seeded with one `introduce_to_clients` peer
+  is queried via `RefreshIntroducer`; the daemon's Servers pane renders the candidate's server-id + address
+  under "Discovered (introducer)" with the `candidate` label, carrying no key material (ISC-S6) and never
+  auto-trusting it (ISC-C22 / ISC-A-C19). Both steps re-exercise already-covered ISCs end-to-end — no
+  genuinely-new ISC closes at M12 (see `m12_isc_coverage` trace map), so the coverage floor stays 72/94.
+  Probe: `cargo xtask mvp-gate` → 10/10 pass.
+- MVP gate: all 8 scenario steps now pass on real binaries via the PTY harness (`cargo xtask mvp-gate`,
+  10/10 subprocess tests) → **MVP reached at v0.14.0**. Probe: `cargo xtask mvp-gate`.
 - ISA sanitization fidelity (no leaked internal paths or personal names; all ISC IDs preserved) — verified
   this session via advisor + Cato cross-vendor audit; see session record.

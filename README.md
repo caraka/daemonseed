@@ -19,9 +19,9 @@ daemonseed/
 │   │                                       reconnect backoff, mute/hide lists, @-mention logic (M9),
 │   │                                       release trust anchor + multi-sig verify + update-lifecycle FSM (M10)
 │   ├── daemonseed-proto/                   wire schema (Protocol Buffers, prost + tonic)
-│   ├── daemonseed-server/                  relay daemon: TLS 1.3 + APP_HELLO + identity-proof → Authenticated (M4b); federation peer table + introducer (M5); public-space service (M6); circle-of-trust live relay (M8); RAM-only rate limiting (M9); release boot-gate (M10)
-│   ├── daemonseed-cli/                     scriptable client: `connect <server-id>` with identity-proof (M4b) + C22 trust slider (M5)
-│   ├── daemonseed-tui/                     interactive ratatui client — the MVP product surface (M11)
+│   ├── daemonseed-server/                  relay daemon: TLS 1.3 + APP_HELLO + identity-proof → Authenticated (M4b); federation peer table + introducer endpoint (M5/M12); public-space service (M6); circle-of-trust live relay (M8); RAM-only rate limiting (M9); release boot-gate (M10); user-publish share registry, reaped on disconnect (M12)
+│   ├── daemonseed-cli/                     scriptable client: `connect <server-id>` with identity-proof (M4b) + C22 trust slider (M5); `publish` / `unpublish` / `list-shares` (M12)
+│   ├── daemonseed-tui/                     interactive ratatui client — the MVP product surface (M11); Servers-pane introducer discovery (M12)
 │   └── daemonseed-integration-tests/       cross-crate integration tests + ISC coverage registry
 │
 ├── docs/
@@ -36,11 +36,11 @@ daemonseed/
                                             isc-coverage, findings-resolved, install-hooks
 ```
 
-Substantive code lives in `daemonseed-core`, `daemonseed-proto`, `daemonseed-server`, and `daemonseed-cli` as of M10. The `tui` crate begins filling in at M11 (the MVP gate): a ratatui client whose interactive logic is a terminal-free, unit-testable screen state machine reused over the proven cli client stack.
+All six crates are substantive as of the alpha1 MVP (M12). The `tui` crate — the MVP product surface — is a ratatui client whose interactive logic is a terminal-free, unit-testable screen state machine reused over the proven cli client stack, exercised end-to-end by the 4-daemon PTY gate.
 
 ## Status
 
-Current release: **v0.11.0** (M9 closed); **v0.12.0-pre** cuts at the **M10 verifiable-core** close — the pure-Rust, test-driven half of release distribution. `daemonseed-core::release` adds a binary-bound release trust anchor (an N-of-M ML-DSA-87 key set) and an N-of-M multi-sig verify that accepts only when enough *distinct* anchor keys have signed; `daemonseed-server::boot_gate` refuses to boot on a failed release-signature verify, with no "boot anyway with a warning" path; and the client update-lifecycle state machine verifies before applying, never auto-installs (even for emergency updates), refuses silent downgrades, and wipes-and-logs on verification failure. This milestone ships the **verifiable core only** — the release-signing *infrastructure* (real signing keys, Sigstore co-signature, reproducible builds, store / F-Droid / package-manager channels, the optional update-relay role) and the platform features (biometric login, OS-native autostart) are deferred to a follow-up "M10-infra" track that needs a key ceremony, accounts, and platform integration rather than pure logic. Promotion to a public repository is gated on the `oxicrypt` sibling crate going public.
+Current release: **v0.14.0 — alpha1 MVP**. The full 4-daemon end-to-end gate (`cargo xtask mvp-gate`) passes 10/10: cold first-start, mutual Authenticated, public-space view, circle-of-trust chat with mute/@mentions, user-publish file sharing, federation introducer discovery, suite-deprecation surfacing, and clean-device recovery from a 24-word mnemonic. M12 — the milestone that reaches MVP — adds the last two gate steps under one additive wire bump: **user-publish file sharing** (the `daemonseed-cli publish` / `unpublish` / `list-shares` commands; a published share is RAM-only and stays live only while you stay online — the relay reaps it the instant your connection drops) and the **federation introducer endpoint** (the TUI Servers pane now surfaces relay-discovered candidate servers read-only — never auto-trusted, promotion is always your explicit action). Earlier milestones delivered the interactive TUI and client surfaces (M11, v0.13.0) and the verifiable-core release machinery (M10, v0.12.1). The release-signing *infrastructure* (real keys, Sigstore co-signature, reproducible builds, store / package-manager channels) and the platform features (biometric login, OS-native autostart) remain on a follow-up "M10-infra" track; direct messaging is alpha2. Promotion to a public repository is gated on the `oxicrypt` sibling crate going public.
 
 ## License
 

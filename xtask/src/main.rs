@@ -131,6 +131,12 @@ const TOTAL_ISCS: u32 = 94;
 ///   A-S3, A-S4, A-S4b, A-S5b, A-S8, C19, A-C5)
 /// - M7: 67 → 72 via `m7_isc_coverage` (5 new — S16, A-S11, C25, C28,
 ///   A-C12; A-C9 was already covered at M3)
+/// - M12: 72 → 72 via `m12_isc_coverage` (**0 new** — gate steps 5 & 6 were
+///   built against the existing ISC surface, so the two new gate tests only
+///   re-exercise already-covered ISCs: step 5 traces to A-S1 (M4b), A-S5b
+///   and S4 (M6); step 6 traces to S6, S13, C22 (M5) and A-C19 (M2). The
+///   floor does not move; `m12_isc_coverage` records the trace map and guards
+///   the "no genuinely-new ISC" invariant.)
 ///
 /// Replacing this constant with a live query against the registered
 /// registry remains a later-milestone task (M11 ties this to the CI gate).
