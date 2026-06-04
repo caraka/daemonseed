@@ -3,8 +3,10 @@
 //! Drives the core type-state machine
 //! [`daemonseed_core::first_start::orchestrator::FirstStart`] through the cold
 //! first-start: passphrase (with a live C12 strength meter) → 24-word mnemonic
-//! display → backup verification (re-type round-trip C33, or a 3-word type-back
-//! fallback C34) → adj-noun display name (C4b) → bootstrap relay (C37) →
+//! display → backup verification. The DEFAULT backup verification (Item C /
+//! ISC-C47) is the 3-word random type-back (C34); the full-24 re-type
+//! round-trip (C33) is kept as the explicit `[f]` opt-in. → adj-noun display
+//! name (C4b) → bootstrap relay (C37) →
 //! [`SessionMaterials`]. No network connection happens until the flow completes
 //! (A-C15 is structural: the connect path only receives `SessionMaterials`,
 //! which only [`FirstStartUi::take_completed`] produces).
@@ -289,18 +291,23 @@ impl FirstStartUi {
     fn on_show_mnemonic(&mut self, code: KeyCode) -> Option<FirstStartOutcome> {
         match code {
             KeyCode::Enter => {
-                self.input.clear();
-                self.error = None;
-                self.step = FsStep::VerifyRoundTrip;
-            }
-            KeyCode::Char('s') => {
-                // Skip-recovery path: issue a 3-word type-back challenge.
+                // Default confirmation (Item C / ISC-C47): a 3-word random
+                // type-back challenge (ISC-C34), not the full-24 re-type. The
+                // full re-type is demoted to the `[f]` path below for users who
+                // want to prove the whole phrase.
                 if let Some(Phase::Sealed(s)) = &self.phase {
                     self.challenge = Some(s.issue_type_back_challenge(&mut OsRng));
                     self.input.clear();
                     self.error = None;
                     self.step = FsStep::VerifyTypeBack;
                 }
+            }
+            KeyCode::Char('f') | KeyCode::Char('F') => {
+                // Full-phrase re-type path (ISC-C33), kept as an explicit
+                // opt-in: re-type all 24 words for a round-trip verify.
+                self.input.clear();
+                self.error = None;
+                self.step = FsStep::VerifyRoundTrip;
             }
             _ => {}
         }
@@ -661,7 +668,7 @@ mod tests {
         let mut ui = ui();
         type_str(&mut ui, STRONG);
         ui.on_key(press(KeyCode::Enter)); // → ShowMnemonic
-        ui.on_key(press(KeyCode::Enter)); // → VerifyRoundTrip
+        ui.on_key(press(KeyCode::Char('f'))); // [f] full re-type → VerifyRoundTrip
         assert_eq!(ui.step(), FsStep::VerifyRoundTrip);
         type_str(
             &mut ui,
@@ -682,7 +689,8 @@ mod tests {
         type_str(&mut ui, STRONG);
         ui.on_key(press(KeyCode::Enter)); // → ShowMnemonic
         let phrase = ui.mnemonic().expect("mnemonic").to_string();
-        ui.on_key(press(KeyCode::Enter)); // → VerifyRoundTrip
+        ui.on_key(press(KeyCode::Char('f'))); // [f] full re-type → VerifyRoundTrip
+        assert_eq!(ui.step(), FsStep::VerifyRoundTrip);
         type_str(&mut ui, &phrase);
         ui.on_key(press(KeyCode::Enter)); // → DisplayName
         assert_eq!(ui.step(), FsStep::DisplayName);
@@ -707,14 +715,39 @@ mod tests {
     }
 
     #[test]
+    fn default_enter_confirm_is_three_word_type_back() {
+        // Item C / ISC-C47: pressing [Enter] on the mnemonic screen issues the
+        // 3-word type-back challenge by default (NOT the full-24 re-type).
+        let mut ui = ui();
+        type_str(&mut ui, STRONG);
+        ui.on_key(press(KeyCode::Enter)); // → ShowMnemonic
+        let phrase = ui.mnemonic().expect("mnemonic").to_string();
+        let words: Vec<&str> = phrase.split_whitespace().collect();
+        ui.on_key(press(KeyCode::Enter)); // default confirm → VerifyTypeBack
+        assert_eq!(ui.step(), FsStep::VerifyTypeBack);
+        let positions = ui
+            .challenge_positions()
+            .expect("default Enter issues a type-back challenge");
+        assert_eq!(positions.len(), 3, "default confirm asks exactly 3 words");
+        for (i, pos) in positions.iter().enumerate() {
+            if i > 0 {
+                ui.on_key(press(KeyCode::Char(' ')));
+            }
+            type_str(&mut ui, words[*pos]);
+        }
+        ui.on_key(press(KeyCode::Enter)); // → DisplayName
+        assert_eq!(ui.step(), FsStep::DisplayName);
+    }
+
+    #[test]
     fn type_back_fallback_completes() {
         let mut ui = ui();
         type_str(&mut ui, STRONG);
         ui.on_key(press(KeyCode::Enter)); // → ShowMnemonic
         let phrase = ui.mnemonic().expect("mnemonic").to_string();
         let words: Vec<&str> = phrase.split_whitespace().collect();
-        // 's' chooses the skip/type-back path.
-        ui.on_key(press(KeyCode::Char('s')));
+        // Enter is now the default confirm → 3-word type-back path.
+        ui.on_key(press(KeyCode::Enter));
         assert_eq!(ui.step(), FsStep::VerifyTypeBack);
         let positions = ui.challenge_positions().expect("challenge issued");
         // Answer each asked position (positions are 0-based word indices).
@@ -737,7 +770,7 @@ mod tests {
         type_str(&mut ui, STRONG);
         ui.on_key(press(KeyCode::Enter)); // → ShowMnemonic
         let phrase = ui.mnemonic().expect("mnemonic").to_string();
-        ui.on_key(press(KeyCode::Enter)); // → VerifyRoundTrip
+        ui.on_key(press(KeyCode::Char('f'))); // [f] full re-type → VerifyRoundTrip
         type_str(&mut ui, &phrase);
         ui.on_key(press(KeyCode::Enter)); // → DisplayName (default prefilled)
         ui.on_key(press(KeyCode::Enter)); // accept default → Bootstrap

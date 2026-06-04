@@ -8,8 +8,11 @@
 //! section and the project manifest):
 //!
 //! - 37 server-side: 21 positive (`ISC-S*`) + 16 negative (`ISC-A-S*`)
-//! - 57 client-side: 38 positive (`ISC-C*`) + 19 negative (`ISC-A-C*`)
-//! - 94 total
+//! - 65 client-side: 43 positive (`ISC-C*`) + 22 negative (`ISC-A-C*`)
+//!   (the alpha2 client-identity-lifecycle batch added C47–C51 +
+//!   A-C26–A-C28; the DM family C38–C46 / A-C20–A-C25 stays alpha2-deferred
+//!   and is not yet tracked here)
+//! - 102 total
 //!
 //! `C5` is intentionally vacant (parking-lot reservation R5, folder
 //! encryption — post-MVP).
@@ -112,6 +115,12 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-C35", IscClass::Positive),
     ("ISC-C36", IscClass::Positive),
     ("ISC-C37", IscClass::Positive),
+    // ── client positive (alpha2 client-identity-lifecycle, C/D/E/F) ─────
+    ("ISC-C47", IscClass::Positive),
+    ("ISC-C48", IscClass::Positive),
+    ("ISC-C49", IscClass::Positive),
+    ("ISC-C50", IscClass::Positive),
+    ("ISC-C51", IscClass::Positive),
     // ── client negative (19) ────────────────────────────────────────────
     ("ISC-A-C1", IscClass::Negative),
     ("ISC-A-C2", IscClass::Negative),
@@ -132,10 +141,14 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-A-C17", IscClass::Negative),
     ("ISC-A-C18", IscClass::Negative),
     ("ISC-A-C19", IscClass::Negative),
+    // ── client negative (alpha2 client-identity-lifecycle, E/F) ─────────
+    ("ISC-A-C26", IscClass::Negative),
+    ("ISC-A-C27", IscClass::Negative),
+    ("ISC-A-C28", IscClass::Negative),
 ];
 
 /// Total ISCs tracked by this registry. Recount on every ISC add/remove.
-pub const TOTAL: usize = 94;
+pub const TOTAL: usize = 102;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -239,12 +252,13 @@ mod tests {
                 IscClass::Negative => neg += 1,
             }
         }
-        // AGENTS.md: 37 server-side + 57 client-side = 94. Split:
+        // 37 server-side + 65 client-side = 102. Split:
         //   server  21 pos + 16 neg = 37  (ISC-S20 backfilled, M8/F23)
-        //   client  38 pos + 19 neg = 57
-        //   total   59 pos + 35 neg = 94
-        assert_eq!(pos, 59, "positive count drift");
-        assert_eq!(neg, 35, "negative count drift");
+        //   client  43 pos + 22 neg = 65  (alpha2 client-identity-lifecycle
+        //           added C47–C51 + A-C26/A-C27/A-C28)
+        //   total   64 pos + 38 neg = 102
+        assert_eq!(pos, 64, "positive count drift");
+        assert_eq!(neg, 38, "negative count drift");
     }
 
     #[test]

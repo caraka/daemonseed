@@ -8,8 +8,15 @@
 #![forbid(unsafe_code)]
 
 use std::io;
+use std::path::PathBuf;
 use std::time::Duration;
 
+use daemonseed_core::profile::resolve::resolve;
+use daemonseed_core::profile::{
+    ResolveArgs, ResolvedProfileRoot, load_for_unlock, session_materials_from_unlock,
+    write_first_start,
+};
+use daemonseed_core::storage::seeds;
 use daemonseed_server::kats::CNSA_2_0_KATS;
 use daemonseed_server::tls::install_provider;
 use daemonseed_tui::app::App;
@@ -36,6 +43,23 @@ fn main() -> io::Result<()> {
         return Err(io::Error::other(e.to_string()));
     }
 
+    // Resolve the profile root (ISC-C35) before raw mode so any config error
+    // prints plainly. `--config <path>` is the only flag plumbed today.
+    let config_flag = parse_config_flag();
+    let (profile_root, existing) = match resolve(ResolveArgs { config_flag }) {
+        Ok(ResolvedProfileRoot::Existing { root, .. }) => {
+            // An existing config means an existing profile; if the blob is also
+            // present this is a daily login (ISC-C3 / Item E), not enrollment.
+            let has_blob = daemonseed_core::profile::blob_exists(&root);
+            (root, has_blob)
+        }
+        Ok(ResolvedProfileRoot::FirstStart { default_root }) => (default_root, false),
+        Err(e) => {
+            eprintln!("daemonseed-tui: profile resolution failed: {e}");
+            return Err(io::Error::other(e.to_string()));
+        }
+    };
+
     // The network actor (tokio runtime + connect driver) is built before raw
     // mode so a runtime-build failure prints plainly.
     let net = match NetHandle::new() {
@@ -47,13 +71,39 @@ fn main() -> io::Result<()> {
     };
 
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, net);
+    let result = run(&mut terminal, net, profile_root, existing);
     ratatui::restore();
     result
 }
 
-fn run(terminal: &mut ratatui::DefaultTerminal, mut net: NetHandle) -> io::Result<()> {
-    let mut app = App::new();
+/// Minimal `--config <path>` parser (ISC-C35). The TUI takes no other flags
+/// today; a full arg parser arrives with the wider CLI surface.
+fn parse_config_flag() -> Option<PathBuf> {
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        if a == "--config" {
+            return args.next().map(PathBuf::from);
+        }
+        if let Some(rest) = a.strip_prefix("--config=") {
+            return Some(PathBuf::from(rest));
+        }
+    }
+    None
+}
+
+fn run(
+    terminal: &mut ratatui::DefaultTerminal,
+    mut net: NetHandle,
+    profile_root: PathBuf,
+    existing_profile: bool,
+) -> io::Result<()> {
+    // An existing profile blob → daily-login Unlock (Item E). Otherwise the
+    // Welcome → first-start enrollment path.
+    let mut app = if existing_profile {
+        App::for_existing_profile()
+    } else {
+        App::new()
+    };
     while !app.should_quit() {
         terminal.draw(|frame| ui::render(&app, frame))?;
 
@@ -102,6 +152,45 @@ fn run(terminal: &mut ratatui::DefaultTerminal, mut net: NetHandle) -> io::Resul
                 share_id,
                 sharer_handle,
             });
+        }
+
+        // Item D / ISC-C49/C50: persist the at-rest blob + `.dseed` to the
+        // profile root once first-start completes. The no-clobber guard
+        // (ISC-A-C28) is satisfied structurally: an existing-profile launch
+        // routes to Unlock, so first-start only runs against a root with no
+        // blob. `allow_clobber = false` keeps the guard honest.
+        if app.take_pending_persist()
+            && let Some(materials) = app.session()
+        {
+            match write_first_start(&profile_root, materials, None, false) {
+                Ok(_) => {}
+                Err(e) => app.set_status(format!("could not save identity: {e}")),
+            }
+        }
+
+        // Item E / ISC-C3: service a queued Unlock attempt — load the on-disk
+        // blob, decrypt with the typed passphrase, reconstruct SessionMaterials.
+        if let Some(passphrase) = app.take_pending_unlock() {
+            match load_for_unlock(&profile_root) {
+                Ok((config, blob)) => {
+                    match seeds::open(&blob, &passphrase, config.profile_id, config.argon2) {
+                        Ok(opened) => match session_materials_from_unlock(
+                            opened.seeds,
+                            config,
+                            blob,
+                            Vec::new(),
+                        ) {
+                            Ok(session) => app.on_unlock_success(session),
+                            Err(e) => app.on_unlock_failure(format!("unlock failed: {e}")),
+                        },
+                        Err(seeds::BlobError::AuthenticationFailed) => {
+                            app.on_unlock_failure("wrong passphrase")
+                        }
+                        Err(e) => app.on_unlock_failure(format!("unlock failed: {e}")),
+                    }
+                }
+                Err(e) => app.on_unlock_failure(format!("could not read profile: {e}")),
+            }
         }
     }
     Ok(())

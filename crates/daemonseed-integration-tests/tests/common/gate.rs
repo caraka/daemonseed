@@ -879,10 +879,38 @@ impl Gate {
         }
         self.broadcast_keys("\r")?;
 
-        // FsStep::VerifyRoundTrip — re-type each daemon's own 24 words.
-        self.wait_for_all_visible("re-type all 24 words", Duration::from_secs(5))?;
-        for (d, cap) in self.daemons.iter_mut().zip(&captures) {
-            d.send(&cap.mnemonic)?;
+        // FsStep::VerifyTypeBack — the DEFAULT confirm (Item C / ISC-C47) is a
+        // 3-word random type-back, not the full-24 re-type. Read each daemon's
+        // challenge positions off its screen and answer with the matching words
+        // from the captured mnemonic.
+        self.wait_for_all_visible("enter words at positions", Duration::from_secs(5))?;
+        // Capture each screen first (immutable borrow), then send (mutable).
+        let mut answers: Vec<String> = Vec::with_capacity(self.daemons.len());
+        for (d, cap) in self.daemons.iter().zip(&captures) {
+            let positions = extract_type_back_positions(&d.screen_text()).with_context(|| {
+                format!(
+                    "{}: failed to read type-back positions from challenge screen:\n{}",
+                    d.tag,
+                    d.screen_text()
+                )
+            })?;
+            let words: Vec<&str> = cap.mnemonic.split_whitespace().collect();
+            let answer = positions
+                .iter()
+                .map(|p| {
+                    // Positions render 1-based; the mnemonic vec is 0-based.
+                    words
+                        .get(p.saturating_sub(1))
+                        .copied()
+                        .unwrap_or_default()
+                        .to_owned()
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            answers.push(answer);
+        }
+        for (d, answer) in self.daemons.iter_mut().zip(&answers) {
+            d.send(answer)?;
             d.send("\r")?;
         }
 
@@ -1308,6 +1336,34 @@ fn extract_mnemonic(rendered: &str) -> Result<String> {
         );
     }
     Ok(words.join(" "))
+}
+
+// ── Type-back challenge position extraction ──────────────────────────
+
+/// Pull the (1-based) challenge word positions out of a vt100-rendered
+/// VerifyTypeBack screen (Item C / ISC-C47). The challenge pane renders
+/// `"enter words at positions: a, b, c"`; this scans the text after the
+/// marker and collects the comma/space-separated integers up to the next
+/// box-border or footer bracket.
+fn extract_type_back_positions(rendered: &str) -> Result<Vec<usize>> {
+    let marker = "enter words at positions:";
+    let start = rendered
+        .find(marker)
+        .map(|i| i + marker.len())
+        .ok_or_else(|| anyhow!("type-back challenge marker not found in rendered screen"))?;
+    let after = &rendered[start..];
+    // Stop at the footer bracket so footer text never contaminates parsing.
+    let stop = after.find('[').unwrap_or(after.len());
+    let window = &after[..stop];
+    let positions: Vec<usize> = window
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|t| !t.is_empty())
+        .filter_map(|t| t.parse::<usize>().ok())
+        .collect();
+    if positions.is_empty() {
+        bail!("no challenge positions parsed from VerifyTypeBack screen: {window:?}");
+    }
+    Ok(positions)
 }
 
 // ── Module-init helper ───────────────────────────────────────────────
