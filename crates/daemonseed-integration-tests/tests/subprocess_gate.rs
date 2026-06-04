@@ -32,7 +32,9 @@ mod common;
 
 use std::time::Duration;
 
-use common::gate::{DeprecationSeed, Gate, PtyTui, PublicSpaceSeed, ServerProcess};
+use common::gate::{
+    CliPublisher, DeprecationSeed, Gate, PtyTui, PublicSpaceSeed, ServerProcess, cli_list_shares,
+};
 
 /// Bring-up smoke. Spawns the harness, waits for every daemon to paint
 /// its initial Welcome frame, tears down cleanly. Closes the
@@ -525,4 +527,223 @@ fn fresh_daemon_recovers_identity_from_mnemonic() {
         handle_b, handle_a,
         "clean-device recovery must reproduce the original identity handle"
     );
+}
+
+/// Gate step 5 — "you must be online to share" end-to-end across two SEPARATE
+/// clients (ISC-A-S1 / `ShareReapGuard`).
+///
+/// Two genuinely-distinct connections drive this: the held `daemonseed-cli
+/// publish` child and each one-shot `cli_list_shares` call each mint their own
+/// `ClientIdentity::ephemeral()` (D8), so they are separate clients by
+/// construction, not two views of one session. A cross-client visibility claim
+/// therefore means a *second* client sees a share the *first* published while
+/// that first client is online.
+///
+/// The flow proves both halves of the product model:
+/// 1. The publisher registers the RAM-only `docs` share and HOLDS its
+///    connection open (the CLI blocks on Ctrl-C). A separate `list-shares`
+///    client polls until `docs` appears → *online → visible*.
+/// 2. The publisher is SIGINT'd (its own graceful Ctrl-C reap path) and waited
+///    on; a separate `list-shares` client polls until `docs` is GONE → *offline
+///    → reaped*. This is the server's `ShareReapGuard` reaping the share the
+///    instant the publishing connection drops; a RAM-only share has no
+///    persistence to outlive its sharer.
+///
+/// No `Gate`/TUI is involved — the share path is fully exercised over the CLI's
+/// `PublicSpace` RPCs against a real subprocess server, over already-shipped
+/// wire (no proto change). Polling (not fixed sleeps) keeps the test robust on
+/// slow CI rigs; the publisher's captured stdout/stderr are tailed on failure.
+#[test]
+#[ignore = "spawns real binaries; entry point is `cargo xtask mvp-gate`"]
+fn cli_published_share_is_cross_client_visible_then_reaped() {
+    let server = ServerProcess::spawn(Some("relay-mvp"))
+        .expect("server subprocess spawns + binds to its ephemeral port");
+    let bootstrap = server.bootstrap_handle();
+    // `<server-id>@<host:port>` → split into the server-id and the address flag
+    // value the CLI's `--address` override expects.
+    let (server_id, address) = bootstrap
+        .split_once('@')
+        .expect("bootstrap_handle is <server-id>@<host:port>");
+    let server_id = server_id.to_owned();
+    let address = address.to_owned();
+
+    // ── Client A: hold a `publish docs` connection open. ──
+    let mut publisher = CliPublisher::spawn(&server_id, "docs", &address)
+        .expect("daemonseed-cli publish child spawns");
+
+    // ── Client B (fresh ephemeral connection per call): poll until `docs`
+    //    is visible — proving cross-client visibility while A is online. ──
+    let visible_deadline = Duration::from_secs(10);
+    let start = std::time::Instant::now();
+    let mut last_listing = String::new();
+    let visible = loop {
+        // A transient connect race (B dialling before its own ephemeral
+        // handshake settles) is non-fatal — keep polling until the deadline.
+        if let Ok(listing) = cli_list_shares(&server_id, &address) {
+            last_listing = listing;
+            // The listing renders `share_id\tname\t[rating]\thandle`; the
+            // share name `docs` is the cross-client-observable token.
+            if last_listing.contains("docs") {
+                break true;
+            }
+        }
+        if start.elapsed() >= visible_deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    if !visible {
+        eprintln!(
+            "===== M12 GATE STEP 5 FAILURE (visibility) =====\n\
+             publisher stdout:\n{}\n\
+             publisher stderr:\n{}\n\
+             last list-shares output:\n{}\n\
+             server stderr (tail):\n{}\n",
+            publisher.tail(common::gate::WhichLog::Stdout, 20),
+            publisher.tail(common::gate::WhichLog::Stderr, 20),
+            last_listing,
+            server.tail(common::gate::WhichLog::Stderr, 40),
+        );
+        panic!("a second client never saw the share published by the held first client");
+    }
+
+    // ── A goes offline: SIGINT the publisher (graceful reap path) + wait. ──
+    publisher
+        .interrupt_and_wait(Duration::from_secs(5))
+        .expect("publisher exits after SIGINT (or is force-killed)");
+
+    // ── Client B: poll until `docs` is GONE — proving ShareReapGuard reaped
+    //    the share when the publishing connection dropped (offline → gone). ──
+    let reaped_deadline = Duration::from_secs(10);
+    let start = std::time::Instant::now();
+    let mut last_listing = String::new();
+    let reaped = loop {
+        if let Ok(listing) = cli_list_shares(&server_id, &address) {
+            last_listing = listing;
+            if !last_listing.contains("docs") {
+                break true;
+            }
+        }
+        if start.elapsed() >= reaped_deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    if !reaped {
+        eprintln!(
+            "===== M12 GATE STEP 5 FAILURE (reap) =====\n\
+             publisher stdout:\n{}\n\
+             publisher stderr:\n{}\n\
+             last list-shares output:\n{}\n\
+             server stderr (tail):\n{}\n",
+            publisher.tail(common::gate::WhichLog::Stdout, 20),
+            publisher.tail(common::gate::WhichLog::Stderr, 20),
+            last_listing,
+            server.tail(common::gate::WhichLog::Stderr, 40),
+        );
+        panic!("share was NOT reaped after the publishing connection dropped");
+    }
+}
+
+/// Gate step 6 — introducer → client refresh → Servers-pane render end-to-end,
+/// with the no-keys / no-auto-trust invariants (ISC-S13 / ISC-S6 / ISC-C22 /
+/// ISC-A-C19).
+///
+/// A relay is booted with ONE federation peer carrying `introduce_to_clients =
+/// true` (ISC-S13). The peer is synthetic-but-well-formed — a valid
+/// `<name>#<12hex>` handle and a `<host>:<port>` address — and need not run: the
+/// introducer only echoes the configured `(server_id, address)` pair to
+/// clients. A single daemon completes first-start and authenticates, then opens
+/// its Servers pane (Tab × 5), which auto-dispatches `RefreshIntroducer`.
+///
+/// The assertions cover the three properties the introducer surface must hold:
+/// 1. **Discovery works.** The daemon renders the peer's address (and/or
+///    server-id) — proving the introducer returned the candidate and the client
+///    surfaced it. Both tokens are single-token (contiguous in the raw PTY byte
+///    stream), so each matches as a whole; a multi-word phrase like
+///    "candidate ... at" would be split by ratatui's per-word cursor moves and
+///    is deliberately NOT matched on.
+/// 2. **No keys (ISC-S6).** The introducer response carries no key material, so
+///    the rendered screen must contain none — asserted by the absence of
+///    PEM/base64-ish key markers.
+/// 3. **Candidate, not trusted (ISC-C22 / ISC-A-C19).** The peer is surfaced
+///    under the read-only `── Discovered (introducer) ──` sub-section as a
+///    `candidate`, NOT auto-added to the active trust set — promotion is an
+///    explicit user action, so the line wears the `candidate` label.
+#[test]
+#[ignore = "spawns real binaries; entry point is `cargo xtask mvp-gate`"]
+fn daemon_servers_pane_surfaces_introducer_candidate() {
+    // Synthetic but well-formed peer: valid `<name>#<12hex>` + `<host>:<port>`.
+    // It need not be reachable — the introducer just echoes the configured pair.
+    let peer_server_id = "peer#0011aabbccdd";
+    let peer_address = "peer.example.net:443";
+
+    let server =
+        ServerProcess::spawn_with_federation_peer(Some("relay-mvp"), peer_server_id, peer_address)
+            .expect(
+                "federation-peer-seeded server subprocess spawns + binds to its ephemeral port",
+            );
+    let bootstrap = server.bootstrap_handle();
+    let mut gate = Gate::with_daemons(server, 1).expect("one PTY-attached daemon spawns");
+
+    let passphrase = "correct horse battery staple table mountain";
+    if let Err(e) = gate.all_complete_first_start(passphrase, &bootstrap) {
+        eprintln!("{}", gate.failure_report(&format!("first-start: {e}")));
+        panic!("first-start failed: {e}");
+    }
+    if let Err(e) = gate.wait_all_authenticated(Duration::from_secs(15)) {
+        eprintln!("{}", gate.failure_report(&format!("authenticate: {e}")));
+        panic!("daemon failed to reach Authenticated: {e}");
+    }
+
+    // Open the Servers pane — Tab × 5 lands on Servers and auto-dispatches
+    // RefreshIntroducer; returns once the Discovered sub-section heading paints.
+    if let Err(e) = gate.daemon_open_servers(0) {
+        eprintln!("{}", gate.failure_report(&format!("open-servers: {e}")));
+        panic!("could not open the Servers pane: {e}");
+    }
+
+    // (1) The discovered candidate's address renders (contiguous token). Seeing
+    //     it proves the introducer returned the peer and the client surfaced it.
+    if let Err(e) = gate
+        .daemons
+        .first()
+        .unwrap()
+        .wait_for_visible(peer_address, Duration::from_secs(10))
+    {
+        eprintln!(
+            "{}",
+            gate.failure_report(&format!("introducer-candidate-render: {e}"))
+        );
+        panic!("daemon never surfaced the introducer-discovered candidate: {e}");
+    }
+
+    let screen = gate.daemons.first().unwrap().screen_text();
+
+    // The server-id is also a single contiguous token; assert it renders too.
+    assert!(
+        screen.contains(peer_server_id),
+        "the candidate's server-id should render contiguously; screen:\n{screen}"
+    );
+
+    // (3) Surfaced under the read-only Discovered sub-section as a `candidate` —
+    //     NOT auto-added to a trusted-server list (ISC-C22 / ISC-A-C19).
+    assert!(
+        screen.contains("Discovered (introducer)"),
+        "candidate must render under the Discovered (introducer) sub-section; screen:\n{screen}"
+    );
+    assert!(
+        screen.contains("candidate"),
+        "the discovered peer must wear the `candidate` label, not be presented as trusted; \
+         screen:\n{screen}"
+    );
+
+    // (2) No-keys invariant (ISC-S6): the introducer response carries no key
+    //     material, so nothing key-like may appear on the rendered screen.
+    for marker in ["BEGIN", "PUBLIC KEY", "ml-dsa", "ML-DSA"] {
+        assert!(
+            !screen.contains(marker),
+            "introducer render must carry no key material (found {marker:?}); screen:\n{screen}"
+        );
+    }
 }

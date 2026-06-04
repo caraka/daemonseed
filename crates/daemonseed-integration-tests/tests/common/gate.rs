@@ -258,6 +258,50 @@ pub struct DeprecationSeed {
     entries: Vec<(u16, i64, u16)>,
 }
 
+/// A single federation peer to seed into a [`ServerProcess`]'s TOML config
+/// (ISC-S12 / ISC-S13). The peer need not be a live, reachable server: the
+/// introducer (ISC-S13) only echoes its configured `(server_id, address)` pair
+/// out to clients on `RefreshIntroducer`, so a syntactically-valid handle and a
+/// well-formed address are sufficient to drive the client's discovery surface.
+///
+/// `introduce_to_clients` is forced `true` here — the whole point of seeding a
+/// peer for the gate's Servers-pane test (M12 gate step 6) is that the client
+/// *sees* it as a discovered candidate. The no-keys invariant (ISC-S6) is
+/// preserved by construction: no `key_hex` is emitted, and the peer is left at
+/// the default `trusted` slider position, so nothing the introducer returns
+/// carries key material.
+pub struct FederationPeerSeed {
+    /// The peer's server-id, a syntactically-valid `<name>#<12hex>` handle.
+    server_id: String,
+    /// The peer's advertised address (`<host>:<port>`).
+    address: String,
+}
+
+impl FederationPeerSeed {
+    /// A peer that will be introduced to clients. The handle must be a valid
+    /// `<name>#<12hex>` (or floor `#<12hex>`); the address is free-form
+    /// `<host>:<port>` and is never dialled by the introducer.
+    pub fn introduced(server_id: impl Into<String>, address: impl Into<String>) -> Self {
+        Self {
+            server_id: server_id.into(),
+            address: address.into(),
+        }
+    }
+
+    /// The `[[peer]]` array-of-tables block. Like [`DeprecationSeed`], this is a
+    /// TOML table, so it must be appended after every bare top-level key the
+    /// server config emits — `spawn_inner` enforces the ordering (bare keys,
+    /// then any public-space lines, then this peer block, then the deprecation
+    /// `[crypto]` table last). `introduce_to_clients = true` (ISC-S13) and no
+    /// `key_hex` (ISC-S6) is the exact shape the gate's introducer test needs.
+    fn to_toml_block(&self) -> String {
+        format!(
+            "\n[[peer]]\nserver_id = \"{}\"\naddress = \"{}\"\nintroduce_to_clients = true\n",
+            self.server_id, self.address,
+        )
+    }
+}
+
 impl DeprecationSeed {
     /// Deprecate `suite_id` (recommending `recommended_suite_id`) with a cutoff
     /// three hours out — comfortably past the F30 minimum lead (2× the one-hour
@@ -327,7 +371,7 @@ impl ServerProcess {
     /// spawned binary repeats the same init in its own process — two
     /// independent processes, no shared state.
     pub fn spawn(display_name: Option<&str>) -> Result<Self> {
-        Self::spawn_inner(display_name, None, None)
+        Self::spawn_inner(display_name, None, None, None)
     }
 
     /// Like [`Self::spawn`] but seeds the relay's public space (ISC-S7/S8/S9)
@@ -335,7 +379,24 @@ impl ServerProcess {
     /// are written into the server's data tempdir and referenced from its TOML
     /// config, so the booted relay verify-and-serves them (ISC-A-S3).
     pub fn spawn_seeded(display_name: Option<&str>, seed: &PublicSpaceSeed) -> Result<Self> {
-        Self::spawn_inner(display_name, Some(seed), None)
+        Self::spawn_inner(display_name, Some(seed), None, None)
+    }
+
+    /// Like [`Self::spawn`] but seeds exactly one federation peer (ISC-S12 /
+    /// ISC-S13) with `introduce_to_clients = true`, so a connected client's
+    /// `RefreshIntroducer` (M12 gate step 6) sees the peer as a discovered
+    /// candidate. `peer_server_id` must be a valid `<name>#<12hex>` handle and
+    /// `peer_address` a `<host>:<port>` string; the peer need not be a live,
+    /// reachable server — the introducer only echoes the configured pair. No
+    /// key material is emitted (ISC-S6) and the peer keeps the default `trusted`
+    /// slider, so the introducer response stays key-free by construction.
+    pub fn spawn_with_federation_peer(
+        display_name: Option<&str>,
+        peer_server_id: &str,
+        peer_address: &str,
+    ) -> Result<Self> {
+        let peer = FederationPeerSeed::introduced(peer_server_id, peer_address);
+        Self::spawn_inner(display_name, None, None, Some(&peer))
     }
 
     /// Like [`Self::spawn`] but seeds a `[crypto]` suite-deprecation policy
@@ -346,13 +407,14 @@ impl ServerProcess {
         display_name: Option<&str>,
         dep: &DeprecationSeed,
     ) -> Result<Self> {
-        Self::spawn_inner(display_name, None, Some(dep))
+        Self::spawn_inner(display_name, None, Some(dep), None)
     }
 
     fn spawn_inner(
         display_name: Option<&str>,
         ps_seed: Option<&PublicSpaceSeed>,
         dep_seed: Option<&DeprecationSeed>,
+        peer_seed: Option<&FederationPeerSeed>,
     ) -> Result<Self> {
         ensure_module_operational();
 
@@ -383,6 +445,16 @@ impl ServerProcess {
             Some(s) => s.materialize(data_dir.path())?,
             None => String::new(),
         };
+        // Federation-peer `[[peer]]` array-of-tables (if any). Like the
+        // deprecation block it is a TOML table, so it must follow the bare keys;
+        // it is emitted before the deprecation `[crypto]` table because the gate
+        // never combines the two and keeping a fixed table order is least
+        // surprising. (TOML itself permits any table order; the bare-keys-first
+        // rule is the only hard constraint.)
+        let peer_lines = match peer_seed {
+            Some(p) => p.to_toml_block(),
+            None => String::new(),
+        };
         // The deprecation `[crypto]` block (if any) is a TOML table, so it must
         // come last — after every bare top-level key the lines above emit.
         let deprecation_lines = match dep_seed {
@@ -390,7 +462,7 @@ impl ServerProcess {
             None => String::new(),
         };
         let toml_text = format!(
-            "listen_addr = \"{addr}\"\nkey_path = {key:?}\n{display_line}{public_space_lines}{deprecation_lines}",
+            "listen_addr = \"{addr}\"\nkey_path = {key:?}\n{display_line}{public_space_lines}{peer_lines}{deprecation_lines}",
             key = key_path,
         );
         std::fs::write(&config_path, toml_text).context("write server config")?;
@@ -1129,6 +1201,23 @@ impl Gate {
         daemon.wait_for_visible("suite deprecation", Duration::from_secs(5))
     }
 
+    /// Drive the daemon at `idx` from Chat focus into the Servers pane (5 Tabs:
+    /// Chat→JoinCircle→Mute→Shares→Hide→Servers). Opening the pane auto-
+    /// dispatches a `RefreshIntroducer` (M12 gate step 6, ISC-S13), so the
+    /// introducer-discovered candidate fetch over the live `AppSession` begins
+    /// immediately; the caller then asserts on the rendered "Discovered
+    /// (introducer)" sub-section. Returns once the pane's footer-/title-bearing
+    /// `── Discovered (introducer) ──` heading is on screen — the heading always
+    /// renders (even with zero candidates), so it is the robust readiness mark.
+    pub fn daemon_open_servers(&mut self, idx: usize) -> Result<()> {
+        let daemon = self
+            .daemons
+            .get_mut(idx)
+            .ok_or_else(|| anyhow!("no daemon at index {idx}"))?;
+        daemon.send("\t\t\t\t\t")?; // 5 Tabs: Chat → … → Servers
+        daemon.wait_for_visible("Discovered (introducer)", Duration::from_secs(5))
+    }
+
     /// Render a structured failure report — server log tails + each
     /// daemon's screen tail — for the assertion-failure path. The xtask
     /// wrapper surfaces this to stdout so a failed gate run is
@@ -1245,6 +1334,148 @@ fn pick_ephemeral_port() -> Result<u16> {
     let port = l.local_addr().context("local_addr")?.port();
     drop(l);
     Ok(port)
+}
+
+// ── CLI publisher / lister (M12 gate step 5) ─────────────────────────
+
+/// A held `daemonseed-cli publish` subprocess plus the temp files its
+/// stdout/stderr are captured to (mirroring [`ServerProcess`]'s log capture so
+/// a failure report can tail them).
+///
+/// The CLI mints `ClientIdentity::ephemeral()` per process (D8), so this child
+/// is a genuinely separate client connection from any other CLI invocation —
+/// which is exactly what proves cross-client visibility in gate step 5. The
+/// `publish` subcommand registers the RAM-only share, prints
+/// `sharing "<name>" as <id> — press Ctrl-C to stop sharing`, then HOLDS the
+/// connection open until interrupted, because the server's `ShareReapGuard`
+/// reaps the share the instant the publishing connection drops (ISC-A-S1 — "you
+/// must be online to share"). The test SIGINTs (then, if needed, kills) the
+/// child to exercise both the graceful reap-on-Ctrl-C and the
+/// reap-on-connection-drop paths.
+///
+/// RAII: `Drop` SIGKILLs the child (no-op if already reaped) and lets the temp
+/// dir clean up the captured logs.
+pub struct CliPublisher {
+    child: Child,
+    /// Owns the captured-log tempdir for the publisher's lifetime.
+    _log_dir: tempfile::TempDir,
+    pub stdout_log: PathBuf,
+    pub stderr_log: PathBuf,
+}
+
+impl CliPublisher {
+    /// Spawn `daemonseed-cli publish <server_id> <name> --address <address>` as
+    /// a held child. Returns once the process is spawned; the caller polls
+    /// [`cli_list_shares`] to confirm the share registered (the publish RPC
+    /// completes before the hold begins, so the share is live by the time it
+    /// appears in a separate client's listing).
+    pub fn spawn(server_id: &str, name: &str, address: &str) -> Result<Self> {
+        let bin = require_release_bin("daemonseed-cli")?;
+        let log_dir = tempfile::tempdir().context("mkdir cli-publisher log tempdir")?;
+        let stdout_log = log_dir.path().join("publish.stdout.log");
+        let stderr_log = log_dir.path().join("publish.stderr.log");
+        let stdout_file =
+            std::fs::File::create(&stdout_log).context("create publish stdout log")?;
+        let stderr_file =
+            std::fs::File::create(&stderr_log).context("create publish stderr log")?;
+        let child = Command::new(&bin)
+            .arg("publish")
+            .arg(server_id)
+            .arg(name)
+            .arg("--address")
+            .arg(address)
+            .stdout(Stdio::from(stdout_file))
+            .stderr(Stdio::from(stderr_file))
+            .spawn()
+            .with_context(|| format!("spawn {} publish", bin.display()))?;
+        Ok(Self {
+            child,
+            _log_dir: log_dir,
+            stdout_log,
+            stderr_log,
+        })
+    }
+
+    /// Send SIGINT to the publisher so its own Ctrl-C reap path runs
+    /// (`stopped sharing <id>`), then wait for it to exit. Falls back to
+    /// `SIGKILL` if the process does not exit within `grace` — either way the
+    /// connection drops and the server-side `ShareReapGuard` reaps the share.
+    ///
+    /// SIGINT is delivered via `kill -INT <pid>` rather than a `nix`/`libc`
+    /// dependency: the harness is unix-only already (portable-pty), and shelling
+    /// out keeps the dependency graph unchanged.
+    pub fn interrupt_and_wait(&mut self, grace: Duration) -> Result<()> {
+        let pid = self.child.id();
+        let _ = Command::new("kill")
+            .arg("-INT")
+            .arg(pid.to_string())
+            .status();
+        let deadline = Instant::now() + grace;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return Ok(()),
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        // Graceful interrupt didn't take in time — force it.
+                        let _ = self.child.kill();
+                        let _ = self.child.wait();
+                        return Ok(());
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => return Err(anyhow!("wait on publisher pid {pid}: {e}")),
+            }
+        }
+    }
+
+    /// Tail the last `lines` lines of either captured stream — used by the gate
+    /// step-5 failure path to surface what the held publisher actually printed.
+    pub fn tail(&self, which: WhichLog, lines: usize) -> String {
+        let path = match which {
+            WhichLog::Stdout => &self.stdout_log,
+            WhichLog::Stderr => &self.stderr_log,
+        };
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                let collected: Vec<&str> = text.lines().rev().take(lines).collect();
+                collected.into_iter().rev().collect::<Vec<_>>().join("\n")
+            }
+            Err(_) => String::new(),
+        }
+    }
+}
+
+impl Drop for CliPublisher {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Run `daemonseed-cli list-shares <server_id> --address <address>` to
+/// completion in a fresh ephemeral-identity process (D8 — a distinct client
+/// connection from the publisher) and return its stdout. Used by gate step 5 to
+/// poll cross-client share visibility: each call is its own connection, so a
+/// share it sees was genuinely published by a *different* online client. The
+/// stdout format is one share per line (`share_id\tname\t[rating]\thandle`), or
+/// the literal `no public shares` line when empty.
+pub fn cli_list_shares(server_id: &str, address: &str) -> Result<String> {
+    let bin = require_release_bin("daemonseed-cli")?;
+    let out = Command::new(&bin)
+        .arg("list-shares")
+        .arg(server_id)
+        .arg("--address")
+        .arg(address)
+        .output()
+        .with_context(|| format!("run {} list-shares", bin.display()))?;
+    if !out.status.success() {
+        bail!(
+            "list-shares exited {:?}; stderr:\n{}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 #[cfg(test)]
