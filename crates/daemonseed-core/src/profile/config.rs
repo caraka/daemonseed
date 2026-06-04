@@ -14,6 +14,8 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::bootstrap::BootstrapAnchor;
+
 /// Argon2id work factors persisted per profile (ISC-C14).
 ///
 /// Defaults below match OWASP 2024 desktop guidance: 19 MiB memory, t=2,
@@ -108,6 +110,14 @@ pub struct ProfileConfig {
     /// [`crate::autostart::PRESENCE_SIDE_CHANNEL_WARNING`].
     #[serde(default)]
     pub autostart: bool,
+
+    /// The bootstrap relay chosen at first-start (ISC-C37). Persisted so the
+    /// daily-login Unlock flow (ISC-C3 / Item E) can re-establish the
+    /// connection without re-running the enrollment wizard. `None` on legacy
+    /// M1–M12 profiles that predate the persisted bootstrap; the Unlock flow
+    /// then reaches Main and lets the user pick a server from the Servers pane.
+    #[serde(default)]
+    pub bootstrap: Option<BootstrapAnchor>,
 }
 
 impl ProfileConfig {
@@ -120,6 +130,7 @@ impl ProfileConfig {
             argon2,
             biometric_unlock: false,
             autostart: false,
+            bootstrap: None,
         }
     }
 

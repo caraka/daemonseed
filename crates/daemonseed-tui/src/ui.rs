@@ -29,12 +29,70 @@ use crate::screens::first_start::{FirstStartUi, FsStep};
 pub fn render(app: &App, frame: &mut Frame) {
     match app.screen() {
         Screen::Welcome => render_welcome(frame),
+        Screen::Unlock => render_unlock(app, frame),
         Screen::FirstStart => match app.first_start() {
             Some(fs) => render_first_start(fs, frame),
             None => render_placeholder(frame, "First start"),
         },
         Screen::Main => render_main(app, frame),
+        Screen::LoggedInMenu => {
+            // Draw Main underneath, then the menu overlay on top.
+            render_main(app, frame);
+            render_logged_in_menu(frame);
+        }
     }
+}
+
+/// Daily-login Unlock screen (ISC-C3 / Item E): a masked passphrase field and
+/// any error. An existing profile blob was found, so this is daily login — not
+/// the enrollment wizard.
+fn render_unlock(app: &App, frame: &mut Frame) {
+    let area = frame.area();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // title
+            Constraint::Min(3),    // passphrase field
+            Constraint::Length(3), // footer / error
+        ])
+        .split(area);
+
+    frame.render_widget(
+        Paragraph::new("Welcome back — unlock your identity".bold())
+            .block(Block::default().borders(Borders::ALL)),
+        chunks[0],
+    );
+    let masked: String = "*".repeat(app.unlock_input().chars().count());
+    frame.render_widget(
+        Paragraph::new(masked).block(Block::default().borders(Borders::ALL).title("passphrase")),
+        chunks[1],
+    );
+    let footer: Line = match app.unlock_error() {
+        Some(err) => Line::from(err.to_string()).style(Style::default().fg(Color::Red)),
+        None => Line::from("[Enter] unlock   [Esc] quit"),
+    };
+    frame.render_widget(
+        Paragraph::new(footer).block(Block::default().borders(Borders::ALL)),
+        chunks[2],
+    );
+}
+
+/// The logged-in "back" menu (Item E / ISC-A-C27): a centered overlay offering
+/// disconnect / quit, never the enrollment wizard. Esc returns to Main.
+fn render_logged_in_menu(frame: &mut Frame) {
+    let area = centered_rect(50, 30, frame.area());
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(
+            "You are logged in.\n\n\
+             [d] disconnect (re-login)\n\
+             [q] quit\n\
+             [Esc] back to the app",
+        )
+        .wrap(Wrap { trim: true })
+        .block(Block::default().borders(Borders::ALL).title(" menu ")),
+        area,
+    );
 }
 
 /// The post-first-start main view: a connection/circle status bar, the circle
@@ -673,10 +731,15 @@ fn render_chat_transcript(app: &App, frame: &mut Frame, area: Rect) {
         .filter(|m| !app.is_muted(&m.sender)) // ISC-13
         .collect();
     let lines: Vec<Line> = if visible.is_empty() {
-        vec![
-            Line::from("no messages yet — Tab to join a circle, then type to chat".to_owned())
-                .style(Style::default().fg(Color::DarkGray)),
-        ]
+        // Item F / ISC-C48: when no circle is joined the chat surface cannot
+        // transmit, so make the requirement explicit rather than implying a
+        // ready-to-chat empty state.
+        let msg = if app.can_chat() {
+            "no messages yet — type to chat"
+        } else {
+            "join a public room or circle to chat — Tab to the circle-join box, enter a phrase"
+        };
+        vec![Line::from(msg.to_owned()).style(Style::default().fg(Color::DarkGray))]
     } else {
         visible.iter().map(|m| chat_line(m, own.as_ref())).collect()
     };
@@ -732,6 +795,12 @@ fn chat_line(m: &ChatLine, own: Option<&Handle>) -> Line<'static> {
 /// popup floats above (ISC-12).
 fn render_main_input(app: &App, frame: &mut Frame, area: Rect) {
     let (title, text): (&str, String) = match app.main_focus() {
+        MainFocus::Chat if !app.can_chat() => (
+            // Item F / ISC-C48: greyed/disabled compose until a circle is joined
+            // — the title states the requirement and Enter is a no-op.
+            "compose (disabled — join a public room or circle to chat)  [Tab] join-circle  [Esc] back",
+            app.compose().to_owned(),
+        ),
         MainFocus::Chat => (
             "compose  [Enter] send  [Tab] join-circle  [Esc] back",
             app.compose().to_owned(),
@@ -881,7 +950,7 @@ fn render_first_start(fs: &FirstStartUi, frame: &mut Frame) {
         ),
         FsStep::ShowMnemonic => (
             "First start — recovery phrase",
-            "[Enter] I've written it down   [s] skip (type-back)   [Esc] cancel",
+            "[Enter] confirm (3 words)   [f] re-type all 24   [Esc] cancel",
         ),
         FsStep::VerifyRoundTrip => (
             "First start — confirm recovery phrase",

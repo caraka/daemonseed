@@ -12,7 +12,12 @@
 //!   per-profile cached state. Resolved per ISC-C35.
 
 pub mod config;
+pub mod persist;
 pub mod resolve;
 
 pub use config::{ArgonParams, ProfileConfig, ProfileConfigError};
+pub use persist::{
+    PersistError, UnlockError, blob_exists, blob_path, config_path, dseed_path, load_for_unlock,
+    session_materials_from_unlock, write_first_start,
+};
 pub use resolve::{ResolveArgs, ResolveError, ResolvedProfileRoot};

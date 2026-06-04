@@ -7,9 +7,12 @@
 //! Count invariants (must stay aligned with AGENTS.md "Standards target"
 //! section and the project manifest):
 //!
-//! - 46 server-side: 26 positive (`ISC-S*`) + 20 negative (`ISC-A-S*`)
-//! - 60 client-side: 41 positive (`ISC-C*`) + 19 negative (`ISC-A-C*`)
-//! - 106 total
+//! - 53 server-side: 30 positive (`ISC-S*`) + 23 negative (`ISC-A-S*`)
+//! - 68 client-side: 46 positive (`ISC-C*`) + 22 negative (`ISC-A-C*`)
+//!   (alpha2 added: S21/A-S15 opaque share_id; S27-S29/A-S20-A-S21 share
+//!   download; S22-S26/A-S16-A-S19 + C56-C58 public rooms; C47-C51/A-C26-A-C28
+//!   client-identity-lifecycle. DM family C38-C46/A-C20-A-C25 stays deferred.)
+//! - 121 total
 //!
 //! `C5` is intentionally vacant (parking-lot reservation R5, folder
 //! encryption — post-MVP).
@@ -128,6 +131,12 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-C35", IscClass::Positive),
     ("ISC-C36", IscClass::Positive),
     ("ISC-C37", IscClass::Positive),
+    // ── client positive (alpha2: C47-C51 client-lifecycle, C56-C58 public rooms) ──
+    ("ISC-C47", IscClass::Positive),
+    ("ISC-C48", IscClass::Positive),
+    ("ISC-C49", IscClass::Positive),
+    ("ISC-C50", IscClass::Positive),
+    ("ISC-C51", IscClass::Positive),
     ("ISC-C56", IscClass::Positive),
     ("ISC-C57", IscClass::Positive),
     ("ISC-C58", IscClass::Positive),
@@ -151,10 +160,14 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-A-C17", IscClass::Negative),
     ("ISC-A-C18", IscClass::Negative),
     ("ISC-A-C19", IscClass::Negative),
+    // ── client negative (alpha2 client-identity-lifecycle, E/F) ─────────
+    ("ISC-A-C26", IscClass::Negative),
+    ("ISC-A-C27", IscClass::Negative),
+    ("ISC-A-C28", IscClass::Negative),
 ];
 
 /// Total ISCs tracked by this registry. Recount on every ISC add/remove.
-pub const TOTAL: usize = 113;
+pub const TOTAL: usize = 121;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -258,14 +271,15 @@ mod tests {
                 IscClass::Negative => neg += 1,
             }
         }
-        // AGENTS.md: 53 server-side + 60 client-side = 113. Split:
+        // AGENTS.md: 53 server-side + 68 client-side = 121. Split:
         //   server  30 pos + 23 neg = 53  (alpha2: S21/A-S15 opaque share_id;
         //                                  S27-S29 + A-S20/A-S21 share download;
         //                                  S22-S26 + A-S16-A-S19 public rooms)
-        //   client  41 pos + 19 neg = 60  (public rooms: C56-C58)
-        //   total   71 pos + 42 neg = 113
-        assert_eq!(pos, 71, "positive count drift");
-        assert_eq!(neg, 42, "negative count drift");
+        //   client  46 pos + 22 neg = 68  (C56-C58 public rooms;
+        //                                  C47-C51 + A-C26-A-C28 client-lifecycle)
+        //   total   76 pos + 45 neg = 121
+        assert_eq!(pos, 76, "positive count drift");
+        assert_eq!(neg, 45, "negative count drift");
     }
 
     #[test]

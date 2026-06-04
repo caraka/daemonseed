@@ -49,14 +49,23 @@ pub struct ConnectRequest {
 /// M11 workstreams; this scaffold establishes the outer navigation skeleton.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Screen {
-    /// Landing screen shown on launch.
+    /// Landing screen shown on launch (no existing profile).
     Welcome,
+    /// Daily-login passphrase unlock (ISC-C3 / Item E). Shown at startup when a
+    /// profile blob already exists at the resolved profile root — the binary
+    /// decrypts the blob and routes to [`Screen::Main`], never the enrollment
+    /// wizard.
+    Unlock,
     /// Cold first-start flow (passphrase → mnemonic → recovery → name →
     /// bootstrap). Expanded by the M11 first-start workstream.
     FirstStart,
     /// Post-first-start main view (chat / circles / shares / trust / servers).
     /// Expanded by the later M11 workstreams.
     Main,
+    /// The logged-in "back" menu (Item E). Reached by Esc on [`Screen::Main`];
+    /// offers disconnect/quit without ever dropping the user back into the
+    /// enrollment wizard (ISC-A-C27). Esc here returns to Main.
+    LoggedInMenu,
 }
 
 /// One rendered chat line in the joined circle (ISC-10). `sent_unix_ms` is the
@@ -426,6 +435,18 @@ pub struct App {
     /// (drained once). Set when the user opens the Servers pane; the binary
     /// translates it into a `NetCommand::RefreshIntroducer`.
     pending_introducer_refresh: bool,
+    /// Set true on first-start completion (Item D / ISC-C49/C50) so the binary
+    /// persists the at-rest blob + `.dseed` to the profile root. Drained once
+    /// by [`Self::take_pending_persist`]; the binary then reads [`Self::session`].
+    pending_persist: bool,
+    /// The daily-login Unlock passphrase buffer (ISC-C3 / Item E).
+    unlock_input: String,
+    /// The last Unlock error to surface (wrong passphrase, etc.).
+    unlock_error: Option<String>,
+    /// A queued Unlock attempt the binary should service (drained once): the
+    /// typed passphrase. The binary decrypts the on-disk blob and feeds the
+    /// result back via [`Self::on_unlock_success`] / [`Self::on_unlock_failure`].
+    pending_unlock: Option<String>,
 }
 
 impl Default for App {
@@ -493,7 +514,25 @@ impl App {
             pending_deprecation_refresh: false,
             discovered_peers: Vec::new(),
             pending_introducer_refresh: false,
+            pending_persist: false,
+            unlock_input: String::new(),
+            unlock_error: None,
+            pending_unlock: None,
         }
+    }
+
+    /// Construct an app that starts on the daily-login [`Screen::Unlock`] (Item
+    /// E): used when the binary detected an existing profile blob at startup.
+    /// Production uses [`ArgonParams::desktop_default`]; tests inject fast params.
+    pub fn for_existing_profile() -> Self {
+        Self::for_existing_profile_with_argon(ArgonParams::desktop_default())
+    }
+
+    /// [`Self::for_existing_profile`] with explicit Argon2 params.
+    pub fn for_existing_profile_with_argon(argon: ArgonParams) -> Self {
+        let mut app = Self::with_argon(argon);
+        app.screen = Screen::Unlock;
+        app
     }
 
     /// The screen currently being displayed.
@@ -550,6 +589,65 @@ impl App {
         self.public_room.as_deref()
     }
 
+    /// The completed/active session materials, for the binary to persist (Item
+    /// D) and for tests. `Some` once first-start completes or an Unlock succeeds.
+    pub fn session(&self) -> Option<&SessionMaterials> {
+        self.session.as_ref()
+    }
+
+    /// Drain the persist flag (Item D / ISC-C49/C50). When `true`, the binary
+    /// writes [`Self::session`]'s blob + `.dseed` to the resolved profile root.
+    pub fn take_pending_persist(&mut self) -> bool {
+        std::mem::replace(&mut self.pending_persist, false)
+    }
+
+    /// Test-only: take the session materials out (to feed an Unlock-success
+    /// test without re-implementing the core enrollment dance).
+    #[cfg(test)]
+    pub(crate) fn session_take_for_test(&mut self) -> SessionMaterials {
+        self.session.take().expect("session present")
+    }
+
+    /// The Unlock passphrase buffer, for rendering the masked field (Item E).
+    pub fn unlock_input(&self) -> &str {
+        &self.unlock_input
+    }
+
+    /// The last Unlock error to surface, if any.
+    pub fn unlock_error(&self) -> Option<&str> {
+        self.unlock_error.as_deref()
+    }
+
+    /// Take a queued Unlock attempt — the typed passphrase (drained once). The
+    /// binary decrypts the on-disk blob and reports back via
+    /// [`Self::on_unlock_success`] / [`Self::on_unlock_failure`].
+    pub fn take_pending_unlock(&mut self) -> Option<String> {
+        self.pending_unlock.take()
+    }
+
+    /// Fold a successful Unlock (ISC-C3 / Item E): stash the reconstructed
+    /// session, queue a trusted-mode connect to the persisted bootstrap relay,
+    /// and route to [`Screen::Main`] — never the enrollment wizard.
+    pub fn on_unlock_success(&mut self, session: SessionMaterials) {
+        self.pending_connect = Some(ConnectRequest {
+            server_id: session.bootstrap.server_id.clone(),
+            address: session.bootstrap.address.clone(),
+            trusted: true,
+        });
+        self.connection = ConnectionStatus::Connecting;
+        self.session = Some(session);
+        self.unlock_input.clear();
+        self.unlock_error = None;
+        self.screen = Screen::Main;
+    }
+
+    /// Fold a failed Unlock: surface the error and stay on [`Screen::Unlock`].
+    /// The passphrase buffer is cleared so a retry starts fresh.
+    pub fn on_unlock_failure(&mut self, message: impl Into<String>) {
+        self.unlock_error = Some(message.into());
+        self.unlock_input.clear();
+    }
+
     /// Which main-view input has focus, for rendering.
     pub fn main_focus(&self) -> MainFocus {
         self.main_focus
@@ -578,6 +676,12 @@ impl App {
     /// A transient status/error line, for rendering.
     pub fn status(&self) -> Option<&str> {
         self.status.as_deref()
+    }
+
+    /// Set the transient status/error line from the binary (e.g. a profile
+    /// persist failure surfaced after first-start, Item D).
+    pub fn set_status(&mut self, message: impl Into<String>) {
+        self.status = Some(message.into());
     }
 
     /// Fold a network-actor event into UI state.
@@ -1067,6 +1171,8 @@ impl App {
                 }
                 _ => {}
             },
+            Screen::Unlock => self.on_key_unlock(key),
+            Screen::LoggedInMenu => self.on_key_logged_in_menu(key),
             Screen::FirstStart => {
                 if let Some(fs) = self.first_start.as_mut() {
                     match fs.on_key(key) {
@@ -1082,6 +1188,9 @@ impl App {
                                     trusted: true,
                                 });
                                 self.connection = ConnectionStatus::Connecting;
+                                // Item D / ISC-C49/C50: ask the binary to persist
+                                // the at-rest blob + `.dseed` to the profile root.
+                                self.pending_persist = true;
                             }
                             self.session = session;
                             self.first_start = None;
@@ -1104,7 +1213,10 @@ impl App {
     /// Welcome, and printable keys / Enter drive whichever input has focus.
     fn on_key_main(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Esc => self.screen = Screen::Welcome,
+            // Item E / ISC-A-C27: "back" never strands the user at the
+            // enrollment wizard. Esc opens the logged-in menu (confirm
+            // disconnect / quit), not Welcome → FirstStart.
+            KeyCode::Esc => self.screen = Screen::LoggedInMenu,
             KeyCode::Tab => {
                 self.main_focus = match self.main_focus {
                     MainFocus::Chat => MainFocus::JoinCircle,
@@ -1155,6 +1267,50 @@ impl App {
                 MainFocus::PublicSpace => self.on_key_public_space(key),
                 MainFocus::Deprecation => self.on_key_deprecation(key),
             },
+        }
+    }
+
+    /// Daily-login Unlock key handling (ISC-C3 / Item E). Printable chars build
+    /// the passphrase, Backspace deletes, Enter queues a decrypt attempt for the
+    /// binary, Esc quits (there is no enrollment wizard to fall back to — an
+    /// existing profile means the only paths are unlock or quit; recovery is a
+    /// separate, explicit launch). `[r]` jumps to clean-device recovery.
+    fn on_key_unlock(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.should_quit = true,
+            KeyCode::Char(c) => {
+                self.unlock_input.push(c);
+                self.unlock_error = None;
+            }
+            KeyCode::Backspace => {
+                self.unlock_input.pop();
+                self.unlock_error = None;
+            }
+            KeyCode::Enter if !self.unlock_input.is_empty() => {
+                // Queue the passphrase for the binary to decrypt the on-disk
+                // blob. App never touches the filesystem or runs Argon2.
+                self.pending_unlock = Some(self.unlock_input.clone());
+            }
+            _ => {}
+        }
+    }
+
+    /// Logged-in "back" menu key handling (Item E / ISC-A-C27). `Esc` returns to
+    /// Main (a stray back never strands the user); `q` quits; `d` disconnects
+    /// (drops to the Unlock screen for re-login, NOT the enrollment wizard).
+    fn on_key_logged_in_menu(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.screen = Screen::Main,
+            KeyCode::Char('q') | KeyCode::Char('Q') => self.should_quit = true,
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                // Disconnect → back to Unlock (re-login), never Welcome.
+                self.connection = ConnectionStatus::Disconnected;
+                self.circle_status = CircleStatus::NotJoined;
+                self.unlock_input.clear();
+                self.unlock_error = None;
+                self.screen = Screen::Unlock;
+            }
+            _ => {}
         }
     }
 
@@ -1309,18 +1465,28 @@ impl App {
         }
     }
 
+    /// Whether a chat surface is joined, so chat can actually transmit. True when
+    /// a public room (the default surface, ISC-S22 / ISC-C56) OR a circle (the
+    /// private opt-in, ISC-14) is joined. Used to gate the compose box: with
+    /// NEITHER joined, Enter is a no-op (Item F / ISC-C48 / A-C26) — no local
+    /// echo, nothing transmitted.
+    pub fn can_chat(&self) -> bool {
+        self.public_room.is_some() || matches!(self.circle_status, CircleStatus::Joined)
+    }
+
     /// Chat compose: printable chars append, Backspace deletes, Enter sends a
-    /// non-empty message (ISC-14 / ISC-S22).
+    /// non-empty message (ISC-14 / ISC-S22 / Item F / ISC-C48 / A-C26).
     ///
     /// The DEFAULT chat surface is the public room (ISC-S22 / ISC-C56): when a
     /// public room is joined, Enter posts there (self-signed for provenance by
     /// the net actor, ISC-S24). A joined circle is the private opt-in and takes
     /// precedence when present. The author's own post is locally echoed because
     /// the relay never reflects a frame to its sender. With NEITHER a public room
-    /// nor a circle joined, Enter is a no-op with a status hint — the message is
-    /// not echoed and not transmitted (no false "it sent", PRD item F; the
-    /// circle-only no-echo refinement is owned by the client-identity-lifecycle
-    /// branch).
+    /// nor a circle joined, Enter is a strict no-op with a status hint — nothing
+    /// is appended to the transcript and nothing is transmitted, so a draft can
+    /// never masquerade as a sent message (no false "it sent", Item F — verified
+    /// 2026-06-04 against a peer that received nothing). The compose buffer is
+    /// left intact so the user's draft survives until they join a surface.
     fn on_key_chat(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char(c) => self.compose.push(c),
@@ -1351,7 +1517,8 @@ impl App {
                         sender_handle: sender,
                     });
                 } else {
-                    // No surface to post to — do not echo, do not transmit.
+                    // No surface to post to (Item F / A-C26): do not echo, do not
+                    // transmit; leave the draft intact and surface the hint.
                     self.status = Some("join a public room or circle to chat".to_owned());
                 }
             }
@@ -1590,7 +1757,7 @@ mod tests {
             .and_then(|fs| fs.mnemonic())
             .expect("mnemonic shown")
             .to_string();
-        app.on_key(press(KeyCode::Enter)); // → VerifyRoundTrip
+        app.on_key(press(KeyCode::Char('f'))); // [f] full re-type → VerifyRoundTrip
         for ch in phrase.chars() {
             app.on_key(press(KeyCode::Char(ch)));
         }
@@ -1688,7 +1855,7 @@ mod tests {
             .and_then(|fs| fs.mnemonic())
             .expect("mnemonic shown")
             .to_string();
-        app.on_key(press(KeyCode::Enter)); // → VerifyRoundTrip
+        app.on_key(press(KeyCode::Char('f'))); // [f] full re-type → VerifyRoundTrip
         for ch in phrase.chars() {
             app.on_key(press(KeyCode::Char(ch)));
         }
@@ -1977,8 +2144,8 @@ mod tests {
     #[test]
     fn composing_and_sending_queues_chat_and_local_echoes() {
         let mut app = drive_to_main();
-        // A joined circle is the private opt-in; with one joined, Enter posts to
-        // the circle (no public room joined here).
+        // A joined circle is the private opt-in; with one joined (and no public
+        // room), Enter posts to the circle.
         app.on_net_event(NetEvent::CircleJoined);
         for ch in "hi there".chars() {
             app.on_key(press(KeyCode::Char(ch)));
@@ -2041,9 +2208,60 @@ mod tests {
     #[test]
     fn empty_compose_enter_is_a_noop() {
         let mut app = drive_to_main();
+        app.on_net_event(NetEvent::CircleJoined);
         app.on_key(press(KeyCode::Enter));
         assert!(app.messages().is_empty(), "no empty message echoed");
         assert!(app.take_pending_chat().is_none(), "no empty send queued");
+    }
+
+    // ── Item F / ISC-C48 / A-C26: no false local echo with no circle ─────
+
+    /// With no circle joined, pressing Enter on a non-empty compose buffer is a
+    /// strict no-op: nothing is appended to the transcript and nothing is
+    /// queued for transmission (ISC-A-C26). The draft is preserved.
+    #[test]
+    fn enter_with_no_circle_does_not_echo_or_transmit() {
+        let mut app = drive_to_main();
+        assert_eq!(app.circle_status(), &CircleStatus::NotJoined);
+        for ch in "did this send?".chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        app.on_key(press(KeyCode::Enter));
+        assert!(
+            app.messages().is_empty(),
+            "no false local echo with no circle joined (ISC-A-C26)"
+        );
+        assert!(
+            app.take_pending_chat().is_none(),
+            "nothing transmitted with no circle joined (ISC-A-C26)"
+        );
+        assert_eq!(
+            app.compose(),
+            "did this send?",
+            "draft preserved — Enter was a no-op, not a clear"
+        );
+        assert_eq!(app.status(), Some("join a public room or circle to chat"));
+    }
+
+    /// After joining a circle, the same Enter now echoes and transmits — the
+    /// gate is the circle membership, not the keystroke (ISC-C48).
+    #[test]
+    fn enter_after_joining_circle_echoes_and_transmits() {
+        let mut app = drive_to_main();
+        for ch in "hello".chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        app.on_key(press(KeyCode::Enter)); // no circle → no-op
+        assert!(app.messages().is_empty());
+        app.on_net_event(NetEvent::CircleJoined);
+        assert!(app.can_chat());
+        app.on_key(press(KeyCode::Enter)); // now sends the preserved draft
+        assert_eq!(app.messages().len(), 1, "echoed after joining");
+        assert_eq!(app.messages()[0].body, "hello");
+        assert!(
+            app.take_pending_chat().is_some(),
+            "transmitted after joining"
+        );
     }
 
     #[test]
@@ -3113,5 +3331,132 @@ mod tests {
         });
         assert_eq!(app.status(), Some("not connected to a relay yet"));
         assert!(app.deprecation_warnings().is_empty());
+    }
+
+    // ── Item D: first-start sets the persist flag (ISC-C49/C50) ──────────
+
+    /// Completing first-start raises the persist flag exactly once so the binary
+    /// writes the at-rest blob + `.dseed` (ISC-C49 / ISC-C50). The session
+    /// materials carry the bytes the binary persists.
+    #[test]
+    fn first_start_completion_queues_persist_once() {
+        let mut app = drive_to_main();
+        assert!(app.has_session());
+        assert!(
+            app.session()
+                .is_some_and(|s| !s.at_rest_blob_bytes.is_empty()),
+            "session carries the at-rest blob bytes to persist (ISC-C49)"
+        );
+        assert!(
+            app.session()
+                .is_some_and(|s| !s.recovery_file_bytes.is_empty()),
+            "session carries the .dseed bytes to persist (ISC-C50)"
+        );
+        assert!(app.take_pending_persist(), "persist queued on completion");
+        assert!(
+            !app.take_pending_persist(),
+            "persist flag drained exactly once"
+        );
+    }
+
+    // ── Item E: Unlock daily-login + sane back (ISC-C3 / A-C27) ──────────
+
+    /// An existing-profile launch starts on the Unlock screen, not enrollment
+    /// (ISC-C51 routing). Enter queues a decrypt attempt; the binary services it.
+    #[test]
+    fn existing_profile_starts_on_unlock_and_queues_attempt() {
+        let mut app = App::for_existing_profile();
+        assert_eq!(app.screen(), &Screen::Unlock);
+        for ch in "my passphrase".chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        assert_eq!(app.unlock_input(), "my passphrase");
+        app.on_key(press(KeyCode::Enter));
+        let pp = app.take_pending_unlock().expect("unlock attempt queued");
+        assert_eq!(pp, "my passphrase");
+        assert!(app.take_pending_unlock().is_none(), "queued exactly once");
+    }
+
+    /// A failed unlock stays on Unlock with an error and a cleared buffer; a
+    /// successful unlock reaches Main and queues a connect to the bootstrap.
+    #[test]
+    fn unlock_failure_then_success_routes_correctly() {
+        let _ = oxicrypt_module::initialize();
+        let mut app = App::for_existing_profile();
+        app.on_unlock_failure("wrong passphrase");
+        assert_eq!(app.screen(), &Screen::Unlock, "failure stays on Unlock");
+        assert_eq!(app.unlock_error(), Some("wrong passphrase"));
+        assert_eq!(app.unlock_input(), "", "buffer cleared for retry");
+
+        // Build a real SessionMaterials via a cold first-start to feed success.
+        let session = {
+            let mut fs = drive_to_main();
+            fs.session_take_for_test()
+        };
+        app.on_unlock_success(session);
+        assert_eq!(app.screen(), &Screen::Main, "success reaches Main (ISC-C3)");
+        assert_eq!(app.connection(), &ConnectionStatus::Connecting);
+        assert!(
+            app.take_pending_connect().is_some(),
+            "unlock queues a connect to the persisted bootstrap"
+        );
+    }
+
+    /// The Unlock screen renders its masked passphrase field + hint (Item E).
+    #[test]
+    fn unlock_screen_renders() {
+        let mut app = App::for_existing_profile();
+        for ch in "secret".chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        let text = render_text(&app, 80, 12);
+        assert!(
+            text.contains("unlock your identity"),
+            "unlock title rendered"
+        );
+        assert!(text.contains("******"), "passphrase masked");
+        assert!(text.contains("[Enter] unlock"), "unlock hint rendered");
+    }
+
+    /// The chat empty-state states the circle requirement when none is joined
+    /// (Item F / ISC-C48), and switches once a circle is joined.
+    #[test]
+    fn chat_empty_state_states_circle_requirement() {
+        let mut app = drive_to_main();
+        let _ = app.take_pending_persist();
+        let text = render_text(&app, 100, 24);
+        assert!(
+            text.contains("join a public room or circle to chat"),
+            "circle requirement stated when no surface joined (ISC-C48)"
+        );
+        app.on_net_event(NetEvent::CircleJoined);
+        let text = render_text(&app, 100, 24);
+        assert!(
+            !text.contains("join a public room or circle to chat"),
+            "requirement message gone once a circle is joined"
+        );
+    }
+
+    /// ISC-A-C27: Esc in Main opens the logged-in menu, never the enrollment
+    /// wizard; Esc in the menu returns to Main; `d` drops to Unlock for re-login.
+    #[test]
+    fn esc_in_main_opens_menu_never_enrollment() {
+        let mut app = drive_to_main();
+        let _ = app.take_pending_persist();
+        app.on_key(press(KeyCode::Esc));
+        assert_eq!(
+            app.screen(),
+            &Screen::LoggedInMenu,
+            "Esc opens the logged-in menu, not Welcome/FirstStart"
+        );
+        // Esc again returns to Main (a stray back never strands the user).
+        app.on_key(press(KeyCode::Esc));
+        assert_eq!(app.screen(), &Screen::Main);
+        // `d` disconnects → Unlock (re-login), never the enrollment wizard.
+        app.on_key(press(KeyCode::Esc));
+        app.on_key(press(KeyCode::Char('d')));
+        assert_eq!(app.screen(), &Screen::Unlock);
+        assert_ne!(app.screen(), &Screen::Welcome);
+        assert_ne!(app.screen(), &Screen::FirstStart);
     }
 }
