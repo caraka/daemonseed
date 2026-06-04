@@ -7,9 +7,9 @@
 //! Count invariants (must stay aligned with AGENTS.md "Standards target"
 //! section and the project manifest):
 //!
-//! - 37 server-side: 21 positive (`ISC-S*`) + 16 negative (`ISC-A-S*`)
-//! - 57 client-side: 38 positive (`ISC-C*`) + 19 negative (`ISC-A-C*`)
-//! - 94 total
+//! - 46 server-side: 26 positive (`ISC-S*`) + 20 negative (`ISC-A-S*`)
+//! - 60 client-side: 41 positive (`ISC-C*`) + 19 negative (`ISC-A-C*`)
+//! - 106 total
 //!
 //! `C5` is intentionally vacant (parking-lot reservation R5, folder
 //! encryption — post-MVP).
@@ -34,7 +34,7 @@ pub enum IscClass {
 /// Every ISC known to this MVP, in declaration order from `ds-isc-draft.md`.
 /// Length is [`TOTAL`].
 pub const ISCS: &[(&str, IscClass)] = &[
-    // ── server positive (21) ────────────────────────────────────────────
+    // ── server positive (26) ────────────────────────────────────────────
     ("ISC-S1", IscClass::Positive),
     ("ISC-S2a", IscClass::Positive),
     ("ISC-S2b", IscClass::Positive),
@@ -56,7 +56,12 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-S18", IscClass::Positive),
     ("ISC-S19", IscClass::Positive),
     ("ISC-S20", IscClass::Positive),
-    // ── server negative (16) ────────────────────────────────────────────
+    ("ISC-S22", IscClass::Positive),
+    ("ISC-S23", IscClass::Positive),
+    ("ISC-S24", IscClass::Positive),
+    ("ISC-S25", IscClass::Positive),
+    ("ISC-S26", IscClass::Positive),
+    // ── server negative (20) ────────────────────────────────────────────
     ("ISC-A-S1", IscClass::Negative),
     ("ISC-A-S2", IscClass::Negative),
     ("ISC-A-S3", IscClass::Negative),
@@ -73,7 +78,11 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-A-S12", IscClass::Negative),
     ("ISC-A-S13", IscClass::Negative),
     ("ISC-A-S14", IscClass::Negative),
-    // ── client positive (38) — C5 intentionally vacant (R5) ─────────────
+    ("ISC-A-S16", IscClass::Negative),
+    ("ISC-A-S17", IscClass::Negative),
+    ("ISC-A-S18", IscClass::Negative),
+    ("ISC-A-S19", IscClass::Negative),
+    // ── client positive (41) — C5 intentionally vacant (R5) ─────────────
     ("ISC-C1", IscClass::Positive),
     ("ISC-C2", IscClass::Positive),
     ("ISC-C3", IscClass::Positive),
@@ -112,6 +121,9 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-C35", IscClass::Positive),
     ("ISC-C36", IscClass::Positive),
     ("ISC-C37", IscClass::Positive),
+    ("ISC-C56", IscClass::Positive),
+    ("ISC-C57", IscClass::Positive),
+    ("ISC-C58", IscClass::Positive),
     // ── client negative (19) ────────────────────────────────────────────
     ("ISC-A-C1", IscClass::Negative),
     ("ISC-A-C2", IscClass::Negative),
@@ -135,7 +147,7 @@ pub const ISCS: &[(&str, IscClass)] = &[
 ];
 
 /// Total ISCs tracked by this registry. Recount on every ISC add/remove.
-pub const TOTAL: usize = 94;
+pub const TOTAL: usize = 106;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -239,12 +251,12 @@ mod tests {
                 IscClass::Negative => neg += 1,
             }
         }
-        // AGENTS.md: 37 server-side + 57 client-side = 94. Split:
-        //   server  21 pos + 16 neg = 37  (ISC-S20 backfilled, M8/F23)
-        //   client  38 pos + 19 neg = 57
-        //   total   59 pos + 35 neg = 94
-        assert_eq!(pos, 59, "positive count drift");
-        assert_eq!(neg, 35, "negative count drift");
+        // AGENTS.md: 46 server-side + 60 client-side = 106. Split:
+        //   server  26 pos + 20 neg = 46  (public rooms: S22-S26 + A-S16-A-S19)
+        //   client  41 pos + 19 neg = 60  (public rooms: C56-C58)
+        //   total   67 pos + 39 neg = 106
+        assert_eq!(pos, 67, "positive count drift");
+        assert_eq!(neg, 39, "negative count drift");
     }
 
     #[test]

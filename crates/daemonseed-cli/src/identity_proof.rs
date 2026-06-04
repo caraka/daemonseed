@@ -113,6 +113,14 @@ impl ClientIdentity {
     pub fn handle(&self) -> &str {
         &self.handle
     }
+
+    /// Borrow the client's long-term signing keypair. Used to self-sign
+    /// public-room messages for provenance (ISC-S24): the same identity that
+    /// proved the connection authors public-room posts, so the provenance
+    /// signature binds to a key the relay already saw at identity-proof time.
+    pub fn signing(&self) -> &SignKeypair {
+        &self.signing
+    }
 }
 
 // ── Orchestration ─────────────────────────────────────────────────

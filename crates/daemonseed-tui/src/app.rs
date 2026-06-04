@@ -304,6 +304,10 @@ pub struct App {
     messages: Vec<ChatLine>,
     /// Current circle subscription state.
     circle_status: CircleStatus,
+    /// The auto-joined default public room (ISC-S22 / ISC-C56), if subscribed.
+    /// The default chat surface is this room — no circle required. `None` until
+    /// the net actor reports a successful join after connect.
+    public_room: Option<String>,
     /// A transient status/error line (e.g. a failed send).
     status: Option<String>,
     /// The mute-box input buffer (ISC-13).
@@ -321,6 +325,10 @@ pub struct App {
     pending_join: Option<String>,
     /// A chat send the binary should forward to the net actor (drained once).
     pending_chat: Option<ChatSend>,
+    /// A public-room post the binary should forward to the net actor (drained
+    /// once). The post is self-signed for provenance by the net actor under the
+    /// daemon's own identity (ISC-S24), so only the body is queued here.
+    pending_public_room: Option<String>,
     /// The bounded, per-session trust-event audit log (ISC-C28). Every recorded
     /// event surfaces in the Trust History view; Transient events are dropped by
     /// [`TrustEventLog::append`] (the ISC-A-C12 asymmetry).
@@ -449,6 +457,7 @@ impl App {
             circle_phrase: String::new(),
             messages: Vec::new(),
             circle_status: CircleStatus::NotJoined,
+            public_room: None,
             status: None,
             mute_input: String::new(),
             muted: std::collections::BTreeSet::new(),
@@ -457,6 +466,7 @@ impl App {
             server_sel: 0,
             pending_join: None,
             pending_chat: None,
+            pending_public_room: None,
             trust_log: TrustEventLog::default(),
             blocking: None,
             persistent: Vec::new(),
@@ -529,6 +539,17 @@ impl App {
         self.pending_chat.take()
     }
 
+    /// Take a queued public-room post (drained once by the binary, ISC-S22).
+    pub fn take_pending_public_room(&mut self) -> Option<String> {
+        self.pending_public_room.take()
+    }
+
+    /// The joined default public room name, if subscribed (ISC-S22 / ISC-C56),
+    /// for rendering the chat-surface header.
+    pub fn public_room(&self) -> Option<&str> {
+        self.public_room.as_deref()
+    }
+
     /// Which main-view input has focus, for rendering.
     pub fn main_focus(&self) -> MainFocus {
         self.main_focus
@@ -590,6 +611,26 @@ impl App {
                 sent_unix_ms,
             }),
             NetEvent::ChatError { message } => self.status = Some(message),
+            // Public-room lifecycle (ISC-S22 / ISC-C56): the default chat surface
+            // is a public room, so a verified public-room message folds into the
+            // same transcript as circle chat. The default surface needs no
+            // circle — joining/failing only updates the status line.
+            NetEvent::PublicRoomJoined { room } => {
+                self.public_room = Some(room);
+            }
+            NetEvent::PublicRoomJoinFailed { message } => {
+                self.status = Some(format!("public room: {message}"));
+            }
+            NetEvent::PublicRoomMessage {
+                room: _,
+                sender,
+                body,
+                sent_unix_ms,
+            } => self.messages.push(ChatLine {
+                sender,
+                body,
+                sent_unix_ms,
+            }),
             NetEvent::TrustEvent { key, server_id } => self.fold_trust_event(key, server_id),
             NetEvent::ConnectionClosed { cause } => self.close_cause = Some(cause),
             NetEvent::SharesSnapshot {
@@ -1269,8 +1310,17 @@ impl App {
     }
 
     /// Chat compose: printable chars append, Backspace deletes, Enter sends a
-    /// non-empty message (queues it for the net actor and locally echoes it,
-    /// since the relay fans out to *other* members, never the sender) (ISC-14).
+    /// non-empty message (ISC-14 / ISC-S22).
+    ///
+    /// The DEFAULT chat surface is the public room (ISC-S22 / ISC-C56): when a
+    /// public room is joined, Enter posts there (self-signed for provenance by
+    /// the net actor, ISC-S24). A joined circle is the private opt-in and takes
+    /// precedence when present. The author's own post is locally echoed because
+    /// the relay never reflects a frame to its sender. With NEITHER a public room
+    /// nor a circle joined, Enter is a no-op with a status hint — the message is
+    /// not echoed and not transmitted (no false "it sent", PRD item F; the
+    /// circle-only no-echo refinement is owned by the client-identity-lifecycle
+    /// branch).
     fn on_key_chat(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char(c) => self.compose.push(c),
@@ -1278,19 +1328,32 @@ impl App {
                 self.compose.pop();
             }
             KeyCode::Enter if !self.compose.is_empty() => {
-                let body = std::mem::take(&mut self.compose);
-                let sender = self.own_handle();
-                // Local echo: the relay never reflects a frame to its sender, so
-                // the author's own client must show it.
-                self.messages.push(ChatLine {
-                    sender: sender.clone(),
-                    body: body.clone(),
-                    sent_unix_ms: 0,
-                });
-                self.pending_chat = Some(ChatSend {
-                    body,
-                    sender_handle: sender,
-                });
+                if self.public_room.is_some() {
+                    let body = std::mem::take(&mut self.compose);
+                    let sender = self.own_handle();
+                    // Local echo: the relay never reflects a frame to its sender.
+                    self.messages.push(ChatLine {
+                        sender,
+                        body: body.clone(),
+                        sent_unix_ms: 0,
+                    });
+                    self.pending_public_room = Some(body);
+                } else if matches!(self.circle_status, CircleStatus::Joined) {
+                    let body = std::mem::take(&mut self.compose);
+                    let sender = self.own_handle();
+                    self.messages.push(ChatLine {
+                        sender: sender.clone(),
+                        body: body.clone(),
+                        sent_unix_ms: 0,
+                    });
+                    self.pending_chat = Some(ChatSend {
+                        body,
+                        sender_handle: sender,
+                    });
+                } else {
+                    // No surface to post to — do not echo, do not transmit.
+                    self.status = Some("join a public room or circle to chat".to_owned());
+                }
             }
             _ => {}
         }
@@ -1914,6 +1977,9 @@ mod tests {
     #[test]
     fn composing_and_sending_queues_chat_and_local_echoes() {
         let mut app = drive_to_main();
+        // A joined circle is the private opt-in; with one joined, Enter posts to
+        // the circle (no public room joined here).
+        app.on_net_event(NetEvent::CircleJoined);
         for ch in "hi there".chars() {
             app.on_key(press(KeyCode::Char(ch)));
         }
@@ -1927,6 +1993,49 @@ mod tests {
         assert_eq!(send.body, "hi there");
         assert!(!send.sender_handle.is_empty());
         assert!(app.take_pending_chat().is_none(), "queued exactly once");
+    }
+
+    /// ISC-S22 / ISC-C56: the DEFAULT chat surface is a public room. With a
+    /// public room joined and NO circle, Enter posts to the public room (queued
+    /// for self-signing by the net actor) and locally echoes.
+    #[test]
+    fn composing_posts_to_public_room_by_default() {
+        let mut app = drive_to_main();
+        app.on_net_event(NetEvent::PublicRoomJoined {
+            room: "lobby".to_owned(),
+        });
+        assert_eq!(app.public_room(), Some("lobby"));
+        for ch in "hello lobby".chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        app.on_key(press(KeyCode::Enter));
+        assert_eq!(app.compose(), "");
+        assert_eq!(app.messages().len(), 1, "sender sees their own post");
+        assert_eq!(app.messages()[0].body, "hello lobby");
+        // The body is queued for the public-room send path; no circle chat queued.
+        assert!(app.take_pending_chat().is_none(), "not a circle send");
+        let body = app
+            .take_pending_public_room()
+            .expect("public-room post queued on Enter");
+        assert_eq!(body, "hello lobby");
+        assert!(
+            app.take_pending_public_room().is_none(),
+            "queued exactly once"
+        );
+    }
+
+    /// PRD item F position: with NEITHER a public room nor a circle joined, Enter
+    /// is a no-op — nothing echoed, nothing transmitted (no false "it sent").
+    #[test]
+    fn enter_with_no_surface_does_not_echo_or_transmit() {
+        let mut app = drive_to_main();
+        for ch in "into the void".chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        app.on_key(press(KeyCode::Enter));
+        assert!(app.messages().is_empty(), "no local echo without a surface");
+        assert!(app.take_pending_chat().is_none(), "no circle send");
+        assert!(app.take_pending_public_room().is_none(), "no room post");
     }
 
     #[test]

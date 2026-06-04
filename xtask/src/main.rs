@@ -112,7 +112,7 @@ fn main() -> Result<()> {
 /// unit tests (`registry_count_matches_total`); xtask only needs the constant
 /// to report the M0 baseline without taking a heavy path-dep on core+proto
 /// transitively. Bump both when the ISC list changes.
-const TOTAL_ISCS: u32 = 94;
+const TOTAL_ISCS: u32 = 106;
 
 /// Static lower-bound coverage count. Bumped each milestone as ISCs gain
 /// exercised tests:
@@ -137,10 +137,12 @@ const TOTAL_ISCS: u32 = 94;
 ///   and S4 (M6); step 6 traces to S6, S13, C22 (M5) and A-C19 (M2). The
 ///   floor does not move; `m12_isc_coverage` records the trace map and guards
 ///   the "no genuinely-new ISC" invariant.)
+/// - alpha2 public rooms: 72 → 84 via `public_rooms_isc_coverage` (12 new —
+///   S22-S26, A-S16-A-S19, C56-C58).
 ///
 /// Replacing this constant with a live query against the registered
 /// registry remains a later-milestone task (M11 ties this to the CI gate).
-const COVERED_ISCS: u32 = 72;
+const COVERED_ISCS: u32 = 84;
 
 /// Reports the static lower-bound coverage. The live registry-driven count
 /// (which walks the per-milestone integration tests and tallies actual

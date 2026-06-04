@@ -75,3 +75,9 @@ bip39 = { workspace = true }
 # back the observable wire features. Both already-workspace deps.
 rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
+# alpha2 — public-room e2e: the forged-provenance test crafts a sealed envelope
+# directly (the global room key is public, so anyone can SEAL), and posts use a
+# raw ML-DSA-87 keypair as the posting identity.
+oxicrypt-aes = { workspace = true }
+oxicrypt-ml-dsa = { workspace = true }
+getrandom = { workspace = true }
