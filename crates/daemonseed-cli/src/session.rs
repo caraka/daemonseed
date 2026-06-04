@@ -194,14 +194,20 @@ mod tests {
         ));
 
         let session = AppSession::open(client_io).await.expect("session opens");
-        let _ps = session.public_space();
-        let _cot = session.circle_of_trust();
+        let ps = session.public_space();
+        let cot = session.circle_of_trust();
         // A second public-space client over the same session also routes.
         let mut ps2 = session.public_space();
         ps2.get_motd(wire::GetMotdRequest {})
             .await
             .expect("second client over the same channel routes");
 
+        // The single-connection server returns once the connection closes, which
+        // requires dropping EVERY handle that owns a channel clone — the session
+        // and all derived service clients (each holds its own `Channel` clone).
+        drop(ps);
+        drop(cot);
+        drop(ps2);
         drop(session);
         let _ = server.await;
     }

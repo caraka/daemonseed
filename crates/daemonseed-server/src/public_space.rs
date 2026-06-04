@@ -17,14 +17,29 @@
 //!
 //! tonic's [`Server`](tonic::transport::Server) is normally driven by a TCP
 //! listener. Here there is exactly one, already-TLS-terminated, already-
-//! identity-proven connection. [`serve_application`] adapts it via
-//! tonic's `serve_with_incoming` fed a one-element stream
-//! ([`tokio_stream::once`]). The connection IO must
-//! impl [`tonic::transport::server::Connected`]; that trait and the concrete
+//! identity-proven connection. [`serve_application`] adapts it via tonic's
+//! `serve_with_incoming_shutdown` fed an incoming stream that yields the single
+//! connection and then never ends (a [`tokio_stream::once`] chained with a
+//! never-yielding [`tokio_stream::pending`]). The connection IO must impl
+//! [`tonic::transport::server::Connected`]; that trait and the concrete
 //! transport types are both foreign, so [`ServedConn`] is a local newtype that
 //! supplies the impl (orphan rule). Its `ConnectInfo` is `()` because the peer
 //! identity is already established by the identity-proof phase — tonic's
 //! connect-info would be redundant.
+//!
+//! ### Why the incoming stream must NOT end (M12 gate step 5)
+//!
+//! A one-element `serve_with_incoming(once(conn))` looks right but is subtly
+//! wrong for a *long-lived, mostly-idle* connection: tonic enters **graceful
+//! shutdown** the instant its incoming stream ends, and graceful shutdown closes
+//! any connection that is idle at that moment. A publisher that issues
+//! `PublishShare` and then holds the connection open (the "you must be online to
+//! share" model, ISC-A-S1) races that shutdown — the connection is torn down
+//! microseconds after it is accepted, often *before* the publish RPC is even
+//! processed, leaving an orphaned share that no disconnect ever reaps. The fix
+//! is to keep the incoming stream open forever (so graceful shutdown never
+//! triggers) and drive termination from the connection's own close via the
+//! [`CloseNotify`] guard — see its docs and [`serve_application`].
 //!
 //! ## Trust model
 //!
@@ -883,6 +898,65 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ServedConn<S> {
     }
 }
 
+/// An `AsyncRead`/`AsyncWrite` passthrough that fires a oneshot when it is
+/// dropped — i.e. when tonic finishes serving the connection and releases the
+/// transport (peer close, h2 GOAWAY, keepalive-detected death, or any error).
+///
+/// This is the close-detection half of [`serve_application`]'s single-connection
+/// serving (M12 gate step 5). tonic's `serve_with_incoming` enters *graceful
+/// shutdown* the instant its incoming stream ends, and graceful shutdown closes
+/// any connection that is idle at that moment — which races a long-lived, mostly-
+/// idle publisher connection (`PublishShare` then hold) into a premature close,
+/// reaping the share before the publish even lands. The fix is to feed tonic an
+/// incoming stream that never ends (so graceful shutdown is never triggered) and
+/// instead drive termination from the *connection's own* lifecycle: tonic drops
+/// the served IO when the peer closes, this guard fires, and the
+/// `serve_with_incoming_shutdown` future returns — at which point the caller's
+/// `ShareReapGuard` drops and the connection's shares are reaped exactly once,
+/// on the real disconnect (ISC-A-S1).
+struct CloseNotify<S> {
+    inner: S,
+    /// Fired on drop. `Option` so `Drop` can `take` it (send consumes self).
+    on_close: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl<S> Drop for CloseNotify<S> {
+    fn drop(&mut self) {
+        if let Some(tx) = self.on_close.take() {
+            // Receiver-dropped is fine (caller already moved on); ignore the err.
+            let _ = tx.send(());
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for CloseNotify<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for CloseNotify<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
 /// Serve the post-Authenticated application surface over a single already-
 /// Authenticated transport until the peer closes the connection: the
 /// [`PublicSpace`] service (M6), the `CircleOfTrust` live relay (M8), and the
@@ -913,7 +987,30 @@ where
     let limiter = Arc::new(Mutex::new(ConnectionLimiter::new(
         RateLimitConfig::default(),
     )));
-    let incoming = tokio_stream::once(Ok::<_, io::Error>(ServedConn(stream)));
+    // Single-connection serving without premature graceful shutdown: yield the
+    // one connection, then keep the incoming stream OPEN forever (chained with a
+    // never-yielding `pending`) so tonic never enters graceful shutdown and never
+    // closes the idle publisher connection out from under a held share (M12 gate
+    // step 5). Termination is driven instead by the connection's own close: the
+    // `CloseNotify` guard fires `close_rx` when tonic drops the served IO (peer
+    // close / GOAWAY / keepalive-detected death), which resolves the shutdown
+    // future and returns control to the caller — at which point `ShareReapGuard`
+    // reaps exactly this connection's shares (ISC-A-S1).
+    let (close_tx, close_rx) = tokio::sync::oneshot::channel::<()>();
+    let served = ServedConn(CloseNotify {
+        inner: stream,
+        on_close: Some(close_tx),
+    });
+    let incoming = tokio_stream::StreamExt::chain(
+        tokio_stream::once(Ok::<_, io::Error>(served)),
+        tokio_stream::pending::<Result<ServedConn<CloseNotify<S>>, io::Error>>(),
+    );
+    let shutdown = async move {
+        // Resolve when the connection closes. A `Cancelled` recv error means the
+        // sender was dropped without sending (shouldn't happen — the guard always
+        // sends on drop), so treat it the same: shut down.
+        let _ = close_rx.await;
+    };
     tonic::transport::Server::builder()
         // Per-RPC request-rate budget, applied to both services (ISC-29).
         .layer(RequestRateLayer::new(Arc::clone(&limiter)))
@@ -933,7 +1030,7 @@ where
         .add_service(FederationIntroducerServer::new(IntroducerService::new(
             peers,
         )))
-        .serve_with_incoming(incoming)
+        .serve_with_incoming_shutdown(incoming, shutdown)
         .await
 }
 
