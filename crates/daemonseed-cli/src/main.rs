@@ -5,7 +5,8 @@
 //!   connection to a daemonseed-server, exchange APP_HELLO, print the
 //!   negotiated wire version, exit 0 on success.
 //! - `publish <server-id> <name> [--rating R] [--handle H]` — publish a
-//!   public-space share (M12, gate step 5); prints the server-assigned id.
+//!   public-space share (M12, gate step 5) and HOLD the connection open until
+//!   Ctrl-C; the RAM-only share lives only while this client stays connected.
 //! - `unpublish <server-id> <share-id>` — unpublish a share (owner-scoped).
 //! - `list-shares <server-id>` — list the server's live public shares.
 //!
@@ -58,9 +59,10 @@ enum Cmd {
         address: Option<String>,
     },
     /// Publish a public-space share to `<server-id>` (M12, gate step 5). The
-    /// server assigns and prints an opaque share id. The share is RAM-only and
-    /// vanishes when this process disconnects — so for a real share, keep a
-    /// long-lived client; this one-shot CLI is for scripting and testing.
+    /// server assigns an opaque share id, then this command HOLDS the connection
+    /// open until interrupted (Ctrl-C). The share is RAM-only and reaped the
+    /// instant the connection drops, so the product model is "you must be online
+    /// to share": a sharer keeps this running for as long as the share is offered.
     Publish {
         /// Target server-id (`<name>#<12hex>`).
         server_id: String,
@@ -181,13 +183,26 @@ fn run(cli: Cli) -> Result<(), CliError> {
                 .block_on(ps.publish_share(PublishShareRequest {
                     listing: Some(PublicShareListing {
                         share_id: String::new(),
-                        name,
+                        name: name.clone(),
                         rating,
                         sharer_handle: handle,
                     }),
                 }))
                 .map_err(|s| CliError::Rpc(Box::new(s)))?;
-            println!("published share {}", resp.into_inner().share_id);
+            let share_id = resp.into_inner().share_id;
+            // Product model: "you must be online to share". The share is RAM-only
+            // and the server's ShareReapGuard reaps it the instant this connection
+            // drops, so a fire-and-forget publish would make the share
+            // undownloadable. Hold the session — and thus the share — alive until
+            // the operator interrupts (Ctrl-C). `block_on` keeps the runtime, and
+            // with it the background h2 connection task, driving while we wait, so
+            // the connection stays open the whole time. `session` is dropped at the
+            // end of this arm, closing the connection and triggering the reap.
+            println!("sharing {name:?} as {share_id} — press Ctrl-C to stop sharing");
+            rt.block_on(async {
+                let _ = tokio::signal::ctrl_c().await;
+            });
+            println!("stopped sharing {share_id}");
             Ok(())
         }
         Cmd::Unpublish {
