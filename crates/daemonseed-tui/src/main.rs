@@ -44,9 +44,14 @@ fn main() -> io::Result<()> {
     }
 
     // Resolve the profile root (ISC-C35) before raw mode so any config error
-    // prints plainly. `--config <path>` is the only flag plumbed today.
+    // prints plainly. `--config <path>` points at an explicit profile;
+    // `--portable` forces the CWD as the profile root (ISC-C52).
     let config_flag = parse_config_flag();
-    let (profile_root, existing) = match resolve(ResolveArgs { config_flag }) {
+    let portable = parse_portable_flag();
+    let (profile_root, existing) = match resolve(ResolveArgs {
+        config_flag,
+        portable,
+    }) {
         Ok(ResolvedProfileRoot::Existing { root, .. }) => {
             // An existing config means an existing profile; if the blob is also
             // present this is a daily login (ISC-C3 / Item E), not enrollment.
@@ -76,8 +81,8 @@ fn main() -> io::Result<()> {
     result
 }
 
-/// Minimal `--config <path>` parser (ISC-C35). The TUI takes no other flags
-/// today; a full arg parser arrives with the wider CLI surface.
+/// Minimal `--config <path>` parser (ISC-C35). A full arg parser arrives with
+/// the wider CLI surface.
 fn parse_config_flag() -> Option<PathBuf> {
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -89,6 +94,14 @@ fn parse_config_flag() -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// `--portable` flag (ISC-C52): force the CWD as the profile root so a fresh
+/// first-start writes its config/blob/`.dseed` into the current directory
+/// instead of the system (XDG) location. Once-only — afterwards plain CWD
+/// discovery picks the directory up with no flag.
+fn parse_portable_flag() -> bool {
+    std::env::args().skip(1).any(|a| a == "--portable")
 }
 
 fn run(

@@ -8,11 +8,12 @@
 //! section and the project manifest):
 //!
 //! - 53 server-side: 30 positive (`ISC-S*`) + 23 negative (`ISC-A-S*`)
-//! - 68 client-side: 46 positive (`ISC-C*`) + 22 negative (`ISC-A-C*`)
+//! - 69 client-side: 47 positive (`ISC-C*`) + 22 negative (`ISC-A-C*`)
 //!   (alpha2 added: S21/A-S15 opaque share_id; S27-S29/A-S20-A-S21 share
 //!   download; S22-S26/A-S16-A-S19 + C56-C58 public rooms; C47-C51/A-C26-A-C28
-//!   client-identity-lifecycle. DM family C38-C46/A-C20-A-C25 stays deferred.)
-//! - 121 total
+//!   client-identity-lifecycle; C52 portable mode. DM family
+//!   C38-C46/A-C20-A-C25 stays deferred.)
+//! - 122 total
 //!
 //! `C5` is intentionally vacant (parking-lot reservation R5, folder
 //! encryption — post-MVP).
@@ -131,12 +132,13 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-C35", IscClass::Positive),
     ("ISC-C36", IscClass::Positive),
     ("ISC-C37", IscClass::Positive),
-    // ── client positive (alpha2: C47-C51 client-lifecycle, C56-C58 public rooms) ──
+    // ── client positive (alpha2: C47-C52 client-lifecycle/portable, C56-C58 public rooms) ──
     ("ISC-C47", IscClass::Positive),
     ("ISC-C48", IscClass::Positive),
     ("ISC-C49", IscClass::Positive),
     ("ISC-C50", IscClass::Positive),
     ("ISC-C51", IscClass::Positive),
+    ("ISC-C52", IscClass::Positive),
     ("ISC-C56", IscClass::Positive),
     ("ISC-C57", IscClass::Positive),
     ("ISC-C58", IscClass::Positive),
@@ -167,7 +169,7 @@ pub const ISCS: &[(&str, IscClass)] = &[
 ];
 
 /// Total ISCs tracked by this registry. Recount on every ISC add/remove.
-pub const TOTAL: usize = 121;
+pub const TOTAL: usize = 122;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -271,14 +273,15 @@ mod tests {
                 IscClass::Negative => neg += 1,
             }
         }
-        // AGENTS.md: 53 server-side + 68 client-side = 121. Split:
+        // AGENTS.md: 53 server-side + 69 client-side = 122. Split:
         //   server  30 pos + 23 neg = 53  (alpha2: S21/A-S15 opaque share_id;
         //                                  S27-S29 + A-S20/A-S21 share download;
         //                                  S22-S26 + A-S16-A-S19 public rooms)
-        //   client  46 pos + 22 neg = 68  (C56-C58 public rooms;
-        //                                  C47-C51 + A-C26-A-C28 client-lifecycle)
-        //   total   76 pos + 45 neg = 121
-        assert_eq!(pos, 76, "positive count drift");
+        //   client  47 pos + 22 neg = 69  (C56-C58 public rooms;
+        //                                  C47-C51 + A-C26-A-C28 client-lifecycle;
+        //                                  C52 portable mode)
+        //   total   77 pos + 45 neg = 122
+        assert_eq!(pos, 77, "positive count drift");
         assert_eq!(neg, 45, "negative count drift");
     }
 

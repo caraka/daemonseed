@@ -15,6 +15,16 @@
 //!
 //! If none of the above turns up a config, [`ResolvedProfileRoot::FirstStart`]
 //! is returned so the caller (M2) can run the enrollment flow.
+//!
+//! ## Portable mode (`--portable`, ISC-C52)
+//!
+//! `--portable` forces the **current working directory** to be the profile root
+//! and **skips the XDG fallback entirely** — so a *fresh* first-start writes its
+//! config, blob, and `.dseed` into the CWD instead of the system location. This
+//! is the once-only "make a new self-contained instance here" verb: after the
+//! first run the directory holds a `daemonseed.toml`, so plain CWD discovery
+//! (path 2) picks it up with no flag thereafter. `--config` still wins over
+//! `--portable` if both are given (it is the more specific instruction).
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -23,12 +33,16 @@ use std::path::{Path, PathBuf};
 /// the F19 finding fix.
 pub const CONFIG_FILENAME: &str = "daemonseed.toml";
 
-/// Inputs to [`resolve`]. Only `--config` is plumbed through today; future
-/// flags land here without touching the resolution body.
+/// Inputs to [`resolve`]. Future flags land here without touching the
+/// resolution body.
 #[derive(Debug, Default, Clone)]
 pub struct ResolveArgs {
     /// Value passed via the `--config <path>` CLI flag, if any.
     pub config_flag: Option<PathBuf>,
+    /// `--portable`: force the CWD as the profile root and skip XDG (ISC-C52),
+    /// so a fresh first-start writes into the CWD. Ignored when `config_flag`
+    /// is set (`--config` is the more specific instruction).
+    pub portable: bool,
 }
 
 /// Outcome of resolution.
@@ -51,6 +65,9 @@ pub enum ResolveError {
     ConfigFlagDirWithoutConfig { path: PathBuf },
     /// XDG default location is unresolvable (`$HOME` unset and no fallback).
     NoXdgRoot,
+    /// `--portable` was requested but the current working directory could not
+    /// be determined (ISC-C52) — there is no "here" to be portable to.
+    PortableWithoutCwd,
 }
 
 impl core::fmt::Display for ResolveError {
@@ -67,6 +84,10 @@ impl core::fmt::Display for ResolveError {
             ResolveError::NoXdgRoot => write!(
                 f,
                 "could not resolve XDG profile location ($HOME unset and no fallback)"
+            ),
+            ResolveError::PortableWithoutCwd => write!(
+                f,
+                "--portable requested but the current working directory is unavailable"
             ),
         }
     }
@@ -94,9 +115,22 @@ pub fn resolve_with_env<F>(
 where
     F: Fn(&str) -> Option<String>,
 {
-    // (1) --config flag.
+    // (1) --config flag (most specific; wins over --portable).
     if let Some(p) = args.config_flag {
         return resolve_config_flag(&p);
+    }
+
+    // (1b) --portable: force the CWD as the profile root and SKIP the XDG
+    // fallback (ISC-C52). An existing config in the CWD is honoured; otherwise a
+    // fresh first-start is targeted at the CWD, not the system location.
+    if args.portable {
+        let root = cwd.ok_or(ResolveError::PortableWithoutCwd)?;
+        let config_path = root.join(CONFIG_FILENAME);
+        return Ok(if config_path.is_file() {
+            ResolvedProfileRoot::Existing { root, config_path }
+        } else {
+            ResolvedProfileRoot::FirstStart { default_root: root }
+        });
     }
 
     // (2) CWD daemonseed.toml.
@@ -216,6 +250,7 @@ mod tests {
         let resolved = resolve_with_env(
             ResolveArgs {
                 config_flag: Some(cfg.clone()),
+                ..ResolveArgs::default()
             },
             None,
             |_| None,
@@ -237,6 +272,7 @@ mod tests {
         let resolved = resolve_with_env(
             ResolveArgs {
                 config_flag: Some(tmp.path.clone()),
+                ..ResolveArgs::default()
             },
             None,
             |_| None,
@@ -257,6 +293,7 @@ mod tests {
         match resolve_with_env(
             ResolveArgs {
                 config_flag: Some(bogus.clone()),
+                ..ResolveArgs::default()
             },
             None,
             |_| None,
@@ -273,6 +310,7 @@ mod tests {
         match resolve_with_env(
             ResolveArgs {
                 config_flag: Some(tmp.path.clone()),
+                ..ResolveArgs::default()
             },
             None,
             |_| None,
@@ -317,6 +355,118 @@ mod tests {
                 assert_eq!(default_root, xdg.path.join("daemonseed"));
             }
             other => panic!("expected FirstStart, got {other:?}"),
+        }
+    }
+
+    // ── --portable (ISC-C52) ──────────────────────────────────────────────
+
+    #[test]
+    fn portable_fresh_targets_cwd_not_xdg() {
+        // A fresh --portable run (no config in the CWD) first-starts INTO the
+        // CWD, never the XDG location — even though XDG is resolvable here.
+        let cwd = Tmp::new();
+        let xdg = Tmp::new();
+        let resolved = resolve_with_env(
+            ResolveArgs {
+                portable: true,
+                ..ResolveArgs::default()
+            },
+            Some(cwd.path.clone()),
+            |k| match k {
+                "XDG_CONFIG_HOME" => Some(xdg.path.to_string_lossy().into_owned()),
+                "HOME" => Some(xdg.path.to_string_lossy().into_owned()),
+                _ => None,
+            },
+        )
+        .unwrap();
+        match resolved {
+            ResolvedProfileRoot::FirstStart { default_root } => assert_eq!(default_root, cwd.path),
+            other => panic!("expected FirstStart in CWD, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn portable_existing_cwd_config_resolves_existing() {
+        let cwd = Tmp::new();
+        let cfg = write_config(&cwd.path);
+        let resolved = resolve_with_env(
+            ResolveArgs {
+                portable: true,
+                ..ResolveArgs::default()
+            },
+            Some(cwd.path.clone()),
+            |_| None,
+        )
+        .unwrap();
+        match resolved {
+            ResolvedProfileRoot::Existing { root, config_path } => {
+                assert_eq!(root, cwd.path);
+                assert_eq!(config_path, cfg);
+            }
+            other => panic!("expected Existing in CWD, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn portable_skips_xdg_even_when_xdg_has_a_config() {
+        // XDG has a real config, but --portable must ignore it and first-start
+        // in the (config-less) CWD.
+        let cwd = Tmp::new();
+        let xdg_home = Tmp::new();
+        let daemonseed_dir = xdg_home.path.join("daemonseed");
+        fs::create_dir_all(&daemonseed_dir).unwrap();
+        write_config(&daemonseed_dir);
+        let resolved = resolve_with_env(
+            ResolveArgs {
+                portable: true,
+                ..ResolveArgs::default()
+            },
+            Some(cwd.path.clone()),
+            |k| match k {
+                "XDG_CONFIG_HOME" => Some(xdg_home.path.to_string_lossy().into_owned()),
+                _ => None,
+            },
+        )
+        .unwrap();
+        match resolved {
+            ResolvedProfileRoot::FirstStart { default_root } => assert_eq!(default_root, cwd.path),
+            other => panic!("--portable must skip XDG, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn portable_without_cwd_errors() {
+        match resolve_with_env(
+            ResolveArgs {
+                portable: true,
+                ..ResolveArgs::default()
+            },
+            None,
+            |_| None,
+        ) {
+            Err(ResolveError::PortableWithoutCwd) => {}
+            other => panic!("expected PortableWithoutCwd, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_flag_wins_over_portable() {
+        // Both --config and --portable given: --config is the more specific
+        // instruction and takes precedence.
+        let tmp = Tmp::new();
+        let cfg = write_config(&tmp.path);
+        let resolved = resolve_with_env(
+            ResolveArgs {
+                config_flag: Some(cfg.clone()),
+                portable: true,
+            },
+            Some(PathBuf::from("/some/other/cwd")),
+            |_| None,
+        )
+        .unwrap();
+        match resolved {
+            ResolvedProfileRoot::Existing { root, .. } => assert_eq!(root, tmp.path),
+            other => panic!("expected --config to win, got {other:?}"),
         }
     }
 
