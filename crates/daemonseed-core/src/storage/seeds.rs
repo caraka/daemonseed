@@ -162,6 +162,11 @@ impl CounterState {
 /// - `mute <handle>` — a muted full wire handle (ISC-C15). The handle is the
 ///   entire rest of the line, so display names containing spaces survive.
 /// - `hide <handle>` — a hidden-shares full wire handle (ISC-C16), same shape.
+/// - `name <display>` — the user's chosen display name (ISC-C4b, M13),
+///   rest-of-line; absent for the floor-handle presentation.
+/// - `circle <hex(entropy)> <hex(label)>` — a remembered circle to rejoin
+///   (ISC-C59 persistence, M13); both fields hex-encoded so spaces/newlines in
+///   the entropy or label can never split the line.
 ///
 /// A bare-phrase payload (no extra lines, the legacy form) parses with default
 /// counters and empty lists, so existing blobs open without re-enrollment.
@@ -179,6 +184,41 @@ pub struct Seeds {
     /// Full wire handles whose file shares the user has hidden (ISC-C16).
     /// Independent of [`Self::muted`].
     pub hidden_shares: BTreeSet<String>,
+    /// The user's chosen display name (ISC-C4b), persisted so it survives a
+    /// daily-login Unlock (ISC-C51) instead of resetting each session. `None`
+    /// is the floor-handle presentation (no name chosen). Mutate via
+    /// [`Self::set_display_name`] (M13 persistence keystone).
+    pub display_name: Option<String>,
+    /// The set of circles to rejoin on next launch (ISC-C59 persistence, M13).
+    /// Each entry carries the canonicalized circle entropy needed to re-derive
+    /// the `cot_key` (ISC-C8) without the user re-typing the phrase, plus the
+    /// client-local label (ISC-C62). Insertion order is preserved so the
+    /// carousel restores in join order. Mutate via [`Self::add_circle`] /
+    /// [`Self::remove_circle`] / [`Self::rename_circle`].
+    ///
+    /// Per the M13 "remember-all" decision (D-2026-06-05), every joined circle
+    /// is persisted by default — this revises the earlier ISC-A-C2 wording that
+    /// circle entropy is never persisted (see ISA Decisions). The entropy lives
+    /// here encrypted under the at-rest blob's two-stage KDF; a per-circle
+    /// opt-out ("ephemeral circle") is the deferred B-path.
+    pub circles: Vec<PersistedCircle>,
+}
+
+/// One remembered circle in the at-rest blob (ISC-C59 persistence, M13).
+///
+/// Holds the minimum needed to rejoin without re-typing: the canonicalized
+/// circle entropy (the `cot_key` IKM, ISC-C8/C9) and the client-local display
+/// label (ISC-C62). Neither field ever leaves the encrypted blob — no wire
+/// message carries them (ISC-A-C3). `entropy` is the canonicalized phrase, not
+/// the derived key, so a later cross-family suite change re-derives correctly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedCircle {
+    /// Canonicalized circle entropy (NFKC + whitespace-folded, ISC-C9). This is
+    /// the IKM the `cot_key` derivation (ISC-C8) re-runs on rejoin.
+    pub entropy: String,
+    /// Client-local circle label (ISC-C62). Never transmitted, never derived
+    /// from members.
+    pub label: String,
 }
 
 impl core::fmt::Debug for Seeds {
@@ -190,6 +230,10 @@ impl core::fmt::Debug for Seeds {
             .field("counters", &self.counters)
             .field("muted", &self.muted.len())
             .field("hidden_shares", &self.hidden_shares.len())
+            // Display name is public (it travels on the wire), so it is safe to
+            // show; circle entropy is a secret, so surface only the count.
+            .field("display_name", &self.display_name)
+            .field("circles", &self.circles.len())
             .finish()
     }
 }
@@ -203,6 +247,8 @@ impl Seeds {
             counters: CounterState::default(),
             muted: BTreeSet::new(),
             hidden_shares: BTreeSet::new(),
+            display_name: None,
+            circles: Vec::new(),
         }
     }
 
@@ -252,6 +298,74 @@ impl Seeds {
         self.hidden_shares.contains(handle)
     }
 
+    /// The persisted display name (ISC-C4b), or `None` for the floor handle.
+    pub fn display_name(&self) -> Option<&str> {
+        self.display_name.as_deref()
+    }
+
+    /// Set (or clear, with `None`) the persisted display name (ISC-C4b, M13).
+    /// Returns `true` if the value changed. Refuses a name containing a line
+    /// break: the `name` directive is rest-of-line, so a `\n`/`\r` would inject
+    /// a spurious directive and corrupt the blob on the next open — same
+    /// integrity rule as [`Self::add_mute`].
+    pub fn set_display_name(&mut self, name: Option<String>) -> bool {
+        if let Some(n) = &name
+            && n.contains(['\n', '\r'])
+        {
+            return false;
+        }
+        if self.display_name == name {
+            return false;
+        }
+        self.display_name = name;
+        true
+    }
+
+    /// The remembered circles, in join order (ISC-C59 persistence, M13).
+    pub fn circles(&self) -> &[PersistedCircle] {
+        &self.circles
+    }
+
+    /// Remember a circle so it rejoins next launch (ISC-C59, M13). `entropy`
+    /// must already be canonicalized (ISC-C9). Returns `true` if newly added,
+    /// `false` if a circle with the same entropy is already remembered
+    /// (idempotent — re-joining a known circle does not duplicate it).
+    pub fn add_circle(&mut self, entropy: impl Into<String>, label: impl Into<String>) -> bool {
+        let entropy = entropy.into();
+        if self.circles.iter().any(|c| c.entropy == entropy) {
+            return false;
+        }
+        self.circles.push(PersistedCircle {
+            entropy,
+            label: label.into(),
+        });
+        true
+    }
+
+    /// Forget a remembered circle, keyed on its canonicalized entropy (M13).
+    /// Returns `true` if one was removed.
+    pub fn remove_circle(&mut self, entropy: &str) -> bool {
+        let before = self.circles.len();
+        self.circles.retain(|c| c.entropy != entropy);
+        self.circles.len() != before
+    }
+
+    /// Rename a remembered circle's client-local label (ISC-C62 override, M13),
+    /// keyed on its canonicalized entropy. Returns `true` if the label changed.
+    pub fn rename_circle(&mut self, entropy: &str, new_label: impl Into<String>) -> bool {
+        let new_label = new_label.into();
+        for c in &mut self.circles {
+            if c.entropy == entropy {
+                if c.label == new_label {
+                    return false;
+                }
+                c.label = new_label;
+                return true;
+            }
+        }
+        false
+    }
+
     fn to_plaintext(&self) -> String {
         let mut s = self.mnemonic.to_phrase();
         if self.counters.send_counter != 0 {
@@ -266,6 +380,21 @@ impl Seeds {
         for handle in &self.hidden_shares {
             s.push_str(&format!("\nhide {handle}"));
         }
+        // Display name (ISC-C4b, M13): rest-of-line value; newlines are refused
+        // at the setter so this never injects a spurious directive.
+        if let Some(name) = &self.display_name {
+            s.push_str(&format!("\nname {name}"));
+        }
+        // Circles (ISC-C59 persistence, M13): both fields are hex-encoded so a
+        // space- or newline-containing entropy/label can never split the line
+        // or inject a directive. Layout: `circle <hex(entropy)> <hex(label)>`.
+        for c in &self.circles {
+            s.push_str(&format!(
+                "\ncircle {} {}",
+                hex::encode(c.entropy.as_bytes()),
+                hex::encode(c.label.as_bytes()),
+            ));
+        }
         s
     }
 
@@ -276,6 +405,8 @@ impl Seeds {
         let mut counters = CounterState::default();
         let mut muted = BTreeSet::new();
         let mut hidden_shares = BTreeSet::new();
+        let mut display_name: Option<String> = None;
+        let mut circles: Vec<PersistedCircle> = Vec::new();
         for line in lines {
             // Mute / hide directives take the entire rest of the line as the
             // handle so a display name containing spaces is never truncated.
@@ -285,6 +416,26 @@ impl Seeds {
             }
             if let Some(handle) = line.strip_prefix("hide ") {
                 hidden_shares.insert(handle.to_string());
+                continue;
+            }
+            // Display name (ISC-C4b, M13): rest-of-line value.
+            if let Some(name) = line.strip_prefix("name ") {
+                display_name = Some(name.to_string());
+                continue;
+            }
+            // Circle (ISC-C59 persistence, M13): `circle <hex(entropy)> <hex(label)>`.
+            if let Some(rest) = line.strip_prefix("circle ") {
+                let (entropy_hex, label_hex) =
+                    rest.split_once(' ').ok_or(BlobError::InvalidPlaintext)?;
+                let entropy = hex::decode(entropy_hex)
+                    .ok()
+                    .and_then(|b| String::from_utf8(b).ok())
+                    .ok_or(BlobError::InvalidPlaintext)?;
+                let label = hex::decode(label_hex)
+                    .ok()
+                    .and_then(|b| String::from_utf8(b).ok())
+                    .ok_or(BlobError::InvalidPlaintext)?;
+                circles.push(PersistedCircle { entropy, label });
                 continue;
             }
             let mut parts = line.splitn(3, ' ');
@@ -307,6 +458,8 @@ impl Seeds {
             counters,
             muted,
             hidden_shares,
+            display_name,
+            circles,
         })
     }
 }
@@ -794,6 +947,86 @@ mod tests {
         // The blob still round-trips cleanly — no injected directive line.
         let blob = seal(&seeds, pp, pid, test_params()).unwrap();
         assert!(open(&blob, pp, pid, test_params()).is_ok());
+    }
+
+    // ── display name + circle persistence (ISC-C4b / C59 / C62, M13) ───────
+
+    #[test]
+    fn display_name_round_trips_through_blob() {
+        ensure_oxicrypt_initialized();
+        let pid = Uuid::new_v4();
+        let pp = "correct horse battery staple table mountain";
+        let mut seeds = fresh_seeds();
+        assert!(seeds.set_display_name(Some("brave otter".to_owned())));
+        let blob = seal(&seeds, pp, pid, test_params()).unwrap();
+        let recovered = open(&blob, pp, pid, test_params()).unwrap().seeds;
+        assert_eq!(recovered.display_name(), Some("brave otter"));
+    }
+
+    #[test]
+    fn fresh_seeds_have_no_display_name_and_no_circles() {
+        let seeds = fresh_seeds();
+        assert_eq!(seeds.display_name(), None);
+        assert!(seeds.circles().is_empty());
+        // Default state still serializes to the bare phrase (no directive lines).
+        assert_eq!(seeds.to_plaintext(), seeds.mnemonic.to_phrase());
+    }
+
+    #[test]
+    fn set_display_name_refuses_line_breaks() {
+        let mut seeds = fresh_seeds();
+        assert!(!seeds.set_display_name(Some("evil\nname x".to_owned())));
+        assert_eq!(seeds.display_name(), None);
+        // Idempotent: setting the same value twice reports no-change the 2nd time.
+        assert!(seeds.set_display_name(Some("ok".to_owned())));
+        assert!(!seeds.set_display_name(Some("ok".to_owned())));
+    }
+
+    #[test]
+    fn circles_round_trip_through_blob_with_spaces() {
+        // Entropy and label both carry spaces; the hex encoding must keep them
+        // intact and in join order across a seal/open round-trip.
+        ensure_oxicrypt_initialized();
+        let pid = Uuid::new_v4();
+        let pp = "correct horse battery staple table mountain";
+        let mut seeds = fresh_seeds();
+        assert!(seeds.add_circle("correct horse battery staple", "Book Club"));
+        assert!(seeds.add_circle("another shared secret phrase", "Ops Room"));
+        let blob = seal(&seeds, pp, pid, test_params()).unwrap();
+        let recovered = open(&blob, pp, pid, test_params()).unwrap().seeds;
+        let circles = recovered.circles();
+        assert_eq!(circles.len(), 2);
+        assert_eq!(circles[0].entropy, "correct horse battery staple");
+        assert_eq!(circles[0].label, "Book Club");
+        assert_eq!(circles[1].entropy, "another shared secret phrase");
+        assert_eq!(circles[1].label, "Ops Room");
+    }
+
+    #[test]
+    fn add_circle_is_idempotent_on_entropy() {
+        let mut seeds = fresh_seeds();
+        assert!(seeds.add_circle("shared secret", "First Label"));
+        // Same entropy → no duplicate, even with a different label.
+        assert!(!seeds.add_circle("shared secret", "Other Label"));
+        assert_eq!(seeds.circles().len(), 1);
+        assert_eq!(seeds.circles()[0].label, "First Label");
+    }
+
+    #[test]
+    fn remove_and_rename_circle_work() {
+        let mut seeds = fresh_seeds();
+        seeds.add_circle("phrase a", "A");
+        seeds.add_circle("phrase b", "B");
+        // Rename keyed on entropy (ISC-C62 override).
+        assert!(seeds.rename_circle("phrase a", "Renamed A"));
+        assert!(!seeds.rename_circle("phrase a", "Renamed A")); // no-op 2nd time
+        assert!(!seeds.rename_circle("missing", "x")); // unknown entropy
+        assert_eq!(seeds.circles()[0].label, "Renamed A");
+        // Remove keyed on entropy.
+        assert!(seeds.remove_circle("phrase a"));
+        assert!(!seeds.remove_circle("phrase a")); // already gone
+        assert_eq!(seeds.circles().len(), 1);
+        assert_eq!(seeds.circles()[0].entropy, "phrase b");
     }
 
     #[test]
