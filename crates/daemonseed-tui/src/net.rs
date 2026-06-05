@@ -25,6 +25,7 @@
 //! `tokio::spawn`ed onto a multi-thread runtime — `spawn_local` sidesteps the
 //! `Send` bound.
 
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -44,12 +45,13 @@ use daemonseed_core::crypto::suite::{CNSA_2_0, SuiteId};
 use daemonseed_core::federation::discovered::DiscoveredPeers;
 use daemonseed_core::federation::store::{InMemoryTrustStore, ServerEntry, TrustStore};
 use daemonseed_core::handle::Handle;
+use daemonseed_core::indexer::scan_into;
 use daemonseed_core::public_room::{
     DEFAULT_ROOM, derive_room_key, open_room_message, room_asset_address, seal_room_message,
 };
 use daemonseed_core::share_envelope::ShareFrame;
 use daemonseed_core::storage::cas::chunk_addr;
-use daemonseed_core::storage::seeds::CounterState;
+use daemonseed_core::storage::seeds::{CounterState, IndexKey};
 use daemonseed_core::storage::share_index::ShareIndex;
 use daemonseed_core::trust_events::{TrustEventKey, assess_deprecation, unreadable_policy_event};
 use daemonseed_proto::v1 as wire;
@@ -88,6 +90,20 @@ pub enum NetCommand {
     /// under the global room key. Any daemon may post; the relay can read it
     /// (it holds the global key) but it is never wire-cleartext (ISC-A-S16).
     SendPublicRoom { body: String },
+    /// Define (activate) a local share root (M14, ISC-C21 / ISC-A-C7). Opens
+    /// the redb [`ShareIndex`] at `index_path` under `index_key` (the
+    /// share-index key derived as a sibling of the at-rest key — the actor never
+    /// re-derives it), retains it for foreground queries, and runs a cold scan
+    /// of `root` on a dedicated blocking thread so the net task is never blocked.
+    /// Progress is surfaced via [`NetEvent::IndexerStatus`]; an open failure via
+    /// [`NetEvent::ShareDefineFailed`]. `index_key` is carried in the redacted
+    /// [`IndexKey`] newtype so it never lands in a `Debug` log.
+    DefineShare {
+        root: PathBuf,
+        label: Option<String>,
+        index_path: PathBuf,
+        index_key: IndexKey,
+    },
     /// Refresh the Shares-pane snapshot (ISC-17 / ISC-20). Returns the current
     /// `ShareIndex` entries (My shares), the latest `ListPublicShares` from
     /// the connected relay (Public shares), and the current indexer status.
@@ -247,6 +263,16 @@ pub enum NetEvent {
     /// rendering surfaces this on the status line; the cached snapshot is
     /// left in place so the user keeps seeing the last known state.
     SharesError { message: String },
+    /// A standalone indexer-status transition (M14, ISC-20 / ISC-A-C7): emitted
+    /// when a share is defined (`Indexing`) and when its background cold scan
+    /// finishes (`Ready`), without a full `SharesSnapshot`. The app folds it
+    /// straight into its indexer-status line; the My-shares rows refresh via the
+    /// `SharesSnapshot` the actor emits once the scan completes.
+    IndexerStatus(IndexerStatus),
+    /// A `DefineShare` command could not open the share index (bad path,
+    /// permissions, redb error). Surfaced on the status line; the previously
+    /// active index, if any, is left in place.
+    ShareDefineFailed { message: String },
     /// A fresh public-space snapshot (ISC-25 / ISC-S7 / ISC-A-S3). `motd` is the
     /// rendered, terminal-sanitized message of the day (`None` when the relay
     /// publishes none); `posts` are the announcement posts, each carrying its
@@ -513,6 +539,16 @@ async fn net_actor(
                     .await
             }
             NetCommand::SendPublicRoom { body } => actor.handle_send_public_room(&body).await,
+            NetCommand::DefineShare {
+                root,
+                label,
+                index_path,
+                index_key,
+            } => {
+                actor
+                    .handle_define_share(root, label, index_path, index_key)
+                    .await
+            }
             NetCommand::RefreshShares => actor.handle_refresh_shares().await,
             NetCommand::RefreshPublicSpace => actor.handle_refresh_public_space().await,
             NetCommand::RefreshDeprecation => actor.handle_refresh_deprecation().await,
@@ -867,6 +903,69 @@ impl Actor {
                 message: "public-room stream closed; reconnect to post".to_owned(),
             });
         }
+    }
+
+    /// Define (activate) a local share root (M14, ISC-C21 / ISC-A-C7).
+    ///
+    /// Opens (create-if-absent) the redb [`ShareIndex`] at `index_path` under
+    /// `index_key` — the share-index key derived once as a sibling of the
+    /// at-rest key, never re-derived here — retains it for foreground queries,
+    /// then runs the cold scan of `root` on a dedicated blocking thread. The
+    /// actor returns to its command loop immediately (the walk never parks it),
+    /// and the same index stays fully queryable from the foreground during the
+    /// scan (redb MVCC — ISC-A-C7 no-startup-blockade / no-fate-sharing). The
+    /// scan thread emits the terminal [`NetEvent::IndexerStatus`]; the app pulls
+    /// the freshly-indexed rows via a follow-up `RefreshShares`.
+    ///
+    /// MVP scope: a single active share index — the latest `DefineShare` wins.
+    /// Multi-root concurrent indexing (one index per root) is a documented
+    /// follow-up; `_label` is reserved for that surface and the at-rest
+    /// `share` directive (D3) rather than consumed here.
+    async fn handle_define_share(
+        &mut self,
+        root: PathBuf,
+        _label: Option<String>,
+        index_path: PathBuf,
+        index_key: IndexKey,
+    ) {
+        // Open off the actor thread — redb's file-create + table-materialize is
+        // blocking I/O. Quick, but offloaded so the async loop does no sync disk.
+        let key_bytes = index_key.to_bytes();
+        let opened = tokio::task::spawn_blocking(move || ShareIndex::open(&index_path, key_bytes))
+            .await
+            .expect("share-index open task panicked");
+        let index = match opened {
+            Ok(index) => Arc::new(index),
+            Err(e) => {
+                self.emit(NetEvent::ShareDefineFailed {
+                    message: format!("could not open share index: {e}"),
+                });
+                return;
+            }
+        };
+        // Retain for foreground queries immediately — queryable during the scan
+        // via redb MVCC (ISC-A-C7).
+        self.share_index = Some(Arc::clone(&index));
+        self.emit(NetEvent::IndexerStatus(IndexerStatus::Indexing {
+            seen: 0,
+            total: None,
+        }));
+
+        // Cold scan on a dedicated blocking thread, writing to the same index
+        // the foreground reads (redb MVCC). Detached: the actor resumes its
+        // command loop at once; the thread reports the terminal status itself.
+        let evt_tx = self.evt_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let status = match scan_into(&index, &root) {
+                Ok(count) => IndexerStatus::Ready {
+                    entries: count as u64,
+                },
+                // A scan error leaves the retained index in place; report Idle so
+                // the status line stops showing an indefinite "indexing".
+                Err(_) => IndexerStatus::Idle,
+            };
+            let _ = evt_tx.send(NetEvent::IndexerStatus(status));
+        });
     }
 
     /// Read the My-shares ([`ShareIndex::entries`]) + Public-shares

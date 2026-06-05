@@ -928,8 +928,15 @@ fn render_main_input(app: &App, frame: &mut Frame, area: Rect) {
             )
         }
         MainFocus::Shares => (
-            "shares  [↑/↓] select  [r] refresh  [Tab] hide  [Esc] back".to_owned(),
+            "shares  [↑/↓] select  [r] refresh  [Tab] define-share  [Esc] back".to_owned(),
             String::new(),
+        ),
+        MainFocus::DefineShare => (
+            // Fork 1 (caraka 2026-06-05): an input box like JoinCircle, with an
+            // example path as the hint so the expected format is obvious.
+            "share a directory · e.g. /home/you/Shared  (path or path|label)  [Enter] add  [Tab] hide  [Esc] back"
+                .to_owned(),
+            app.share_input().to_owned(),
         ),
         MainFocus::Hide => {
             let hidden: Vec<&str> = app.hidden_shares().collect();

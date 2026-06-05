@@ -152,6 +152,19 @@ fn run(
         if let Some(body) = app.take_pending_public_room() {
             let _ = net.send(NetCommand::SendPublicRoom { body });
         }
+        // M14: a Define-Share request → derive the index file path + key from
+        // the active session (the App layer holds no key material) and activate
+        // the indexer. The index lives under the profile root.
+        if let Some(req) = app.take_pending_share_define()
+            && let Some(session) = app.session()
+        {
+            let _ = net.send(NetCommand::DefineShare {
+                root: req.root,
+                label: req.label,
+                index_path: profile_root.join("share-index.redb"),
+                index_key: session.index_key.clone(),
+            });
+        }
         if app.take_pending_share_refresh() {
             let _ = net.send(NetCommand::RefreshShares);
         }

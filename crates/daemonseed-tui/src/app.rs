@@ -123,6 +123,14 @@ pub enum MainFocus {
     /// (ISC-19). The indexer status line at the top of My-shares stays
     /// non-blocking during a cold scan (ISC-A-C7).
     Shares,
+    /// The Define-Share input box (M14, ISC-C21): type a directory path
+    /// (optionally `path|label`), Enter validates the directory exists and
+    /// queues a [`ShareDefineRequest`] the binary turns into a
+    /// `NetCommand::DefineShare` — opening the redb share index and activating
+    /// the M8 indexer against that root. An input box modelled on
+    /// [`MainFocus::JoinCircle`]; on success focus returns to the Shares view so
+    /// the My-shares pane shows the new root indexing.
+    DefineShare,
     /// The Hide box: type a full `name#hash` handle, Enter toggles it in the
     /// client-local hidden-shares set (ISC-18 / C16). The set never leaves
     /// this client (ISC-A-C3) — there is no wire field carrying it — and is
@@ -227,6 +235,23 @@ pub enum IndexerStatus {
     /// The indexer is up-to-date with the last scan; `entries` is the size
     /// of the persisted index (ISC-C21 cross-launch persistence).
     Ready { entries: u64 },
+}
+
+/// A user request to define (add) a local share root (M14, ISC-C21).
+///
+/// Produced by [`App::on_key_define_share`] when the user enters a valid
+/// directory path in the Define-Share box, drained by the binary via
+/// [`App::take_pending_share_define`]. The binary derives the redb index-file
+/// path and the share-index key (the [`daemonseed_core::storage::seeds::IndexKey`]
+/// from the active session) and turns this into a `NetCommand::DefineShare` — the
+/// App layer deliberately holds no key material.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShareDefineRequest {
+    /// The directory the user chose to share. Validated to exist at capture
+    /// time; the indexer walks it on the net task.
+    pub root: std::path::PathBuf,
+    /// Optional human label for the share root; `None` falls back to the path.
+    pub label: Option<String>,
 }
 
 /// Active share-fetch state (ISC-19, F23 unified mechanism).
@@ -405,6 +430,11 @@ pub struct App {
     compose: String,
     /// The circle-join phrase buffer (ISC-15).
     circle_phrase: String,
+    /// The Define-Share input buffer (M14). Typing in [`MainFocus::DefineShare`]
+    /// builds it; Enter parses `path` (optional `path|label`) into a
+    /// [`ShareDefineRequest`]. Kept on validation failure so the user can fix a
+    /// typo'd path in place (mirrors `circle_phrase`).
+    share_input: String,
     /// Received + locally-echoed chat lines, oldest first (ISC-10). Each line
     /// carries a [`Surface`] tag; the split view filters strictly on it
     /// (ISC-C61 / ISC-A-C29).
@@ -442,6 +472,10 @@ pub struct App {
     /// The single-shot slot for an interactive join; [`Self::take_pending_join`]
     /// drains it first, then [`Self::pending_joins`].
     pending_join: Option<String>,
+    /// Single-shot slot for a Define-Share request (M14); the binary drains it
+    /// via [`Self::take_pending_share_define`], derives the index path + key
+    /// from the session, and sends `NetCommand::DefineShare`.
+    pending_share_define: Option<ShareDefineRequest>,
     /// Queued circle-rejoins to forward to the net actor, one per launch-time
     /// remembered circle (M13 persistence, ISC-C59). Filled on Unlock from
     /// `seeds.circles()` and drained one-per-tick by the same binary loop that
@@ -609,6 +643,7 @@ impl App {
             main_focus: MainFocus::Chat,
             compose: String::new(),
             circle_phrase: String::new(),
+            share_input: String::new(),
             messages: Vec::new(),
             circle_status: CircleStatus::NotJoined,
             circles: Vec::new(),
@@ -621,6 +656,7 @@ impl App {
             server_input: String::new(),
             server_sel: 0,
             pending_join: None,
+            pending_share_define: None,
             pending_joins: std::collections::VecDeque::new(),
             pending_chat: None,
             pending_public_room: None,
@@ -721,6 +757,18 @@ impl App {
     /// Take a queued chat send (drained once by the binary).
     pub fn take_pending_chat(&mut self) -> Option<ChatSend> {
         self.pending_chat.take()
+    }
+
+    /// Take a queued Define-Share request (M14, drained once by the binary,
+    /// which derives the index path + key from the session and sends
+    /// `NetCommand::DefineShare`).
+    pub fn take_pending_share_define(&mut self) -> Option<ShareDefineRequest> {
+        self.pending_share_define.take()
+    }
+
+    /// The current Define-Share input buffer, for rendering the box (M14).
+    pub fn share_input(&self) -> &str {
+        &self.share_input
     }
 
     /// Take a queued public-room post (drained once by the binary, ISC-S22).
@@ -1019,6 +1067,17 @@ impl App {
                 }
             }
             NetEvent::SharesError { message } => self.status = Some(message),
+            NetEvent::IndexerStatus(status) => {
+                // M14: a standalone indexer transition (define → Indexing →
+                // Ready). On Ready, pull the freshly-indexed rows into the
+                // My-shares pane with a follow-up RefreshShares.
+                let ready = matches!(status, IndexerStatus::Ready { .. });
+                self.indexer_status = status;
+                if ready {
+                    self.pending_share_refresh = true;
+                }
+            }
+            NetEvent::ShareDefineFailed { message } => self.status = Some(message),
             NetEvent::PublicSpaceSnapshot { motd, posts } => {
                 self.public_motd = motd;
                 self.public_posts = posts;
@@ -1497,7 +1556,8 @@ impl App {
                     MainFocus::Chat => MainFocus::JoinCircle,
                     MainFocus::JoinCircle => MainFocus::Mute,
                     MainFocus::Mute => MainFocus::Shares,
-                    MainFocus::Shares => MainFocus::Hide,
+                    MainFocus::Shares => MainFocus::DefineShare,
+                    MainFocus::DefineShare => MainFocus::Hide,
                     MainFocus::Hide => MainFocus::Servers,
                     MainFocus::Servers => MainFocus::TrustHistory,
                     MainFocus::TrustHistory => MainFocus::PublicSpace,
@@ -1536,6 +1596,7 @@ impl App {
                 MainFocus::JoinCircle => self.on_key_join(key),
                 MainFocus::Mute => self.on_key_mute(key),
                 MainFocus::Shares => self.on_key_shares(key),
+                MainFocus::DefineShare => self.on_key_define_share(key),
                 MainFocus::Hide => self.on_key_hide(key),
                 MainFocus::Servers => self.on_key_servers(key),
                 MainFocus::TrustHistory => self.on_key_history(key),
@@ -1949,6 +2010,46 @@ impl App {
         }
     }
 
+    /// Handle a key in the Define-Share box (M14, ISC-C21). Typing builds the
+    /// buffer; Enter parses `path` (or `path|label`), validates the directory
+    /// exists, and queues a [`ShareDefineRequest`] for the binary to turn into a
+    /// `NetCommand::DefineShare`. A non-existent path keeps the buffer and shows
+    /// a status so the user can correct the typo in place rather than silently
+    /// indexing nothing.
+    fn on_key_define_share(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char(c) => self.share_input.push(c),
+            KeyCode::Backspace => {
+                self.share_input.pop();
+            }
+            KeyCode::Enter if !self.share_input.trim().is_empty() => {
+                let (path_part, label) = match self.share_input.split_once('|') {
+                    Some((p, l)) => {
+                        let l = l.trim();
+                        (p.trim().to_owned(), (!l.is_empty()).then(|| l.to_owned()))
+                    }
+                    None => (self.share_input.trim().to_owned(), None),
+                };
+                let root = std::path::PathBuf::from(&path_part);
+                if !root.is_dir() {
+                    // Keep the buffer so the user can fix the path in place.
+                    self.status = Some(format!("no such directory: {path_part}"));
+                    return;
+                }
+                self.share_input.clear();
+                self.pending_share_define = Some(ShareDefineRequest { root, label });
+                self.status = Some("share added — indexing…".to_owned());
+                // Return to the My-shares view so the new root's indexer status
+                // is visible immediately, and request a snapshot so the pane is
+                // not stale on entry (the actor emits Indexing now, Ready after
+                // the background scan).
+                self.main_focus = MainFocus::Shares;
+                self.pending_share_refresh = true;
+            }
+            _ => {}
+        }
+    }
+
     /// Mute input: printable chars append, Backspace deletes, Enter toggles the
     /// typed full wire handle in the client-local mute set (ISC-13). Muting is
     /// unilateral and silent — nothing is sent to the peer or relay (A-C3).
@@ -2336,6 +2437,8 @@ mod tests {
         app.on_key(press(KeyCode::Tab));
         assert_eq!(app.main_focus(), MainFocus::Shares);
         app.on_key(press(KeyCode::Tab));
+        assert_eq!(app.main_focus(), MainFocus::DefineShare);
+        app.on_key(press(KeyCode::Tab));
         assert_eq!(app.main_focus(), MainFocus::Hide);
         app.on_key(press(KeyCode::Tab));
         assert_eq!(app.main_focus(), MainFocus::Servers);
@@ -2347,6 +2450,64 @@ mod tests {
         assert_eq!(app.main_focus(), MainFocus::Deprecation);
         app.on_key(press(KeyCode::Tab));
         assert_eq!(app.main_focus(), MainFocus::Chat);
+    }
+
+    // ── M14 D1: Define-Share input box (ISC-C21) ─────────────────────────
+
+    /// Tabbing to DefineShare, typing a valid directory (`path|label`) and
+    /// pressing Enter queues a [`ShareDefineRequest`] and returns focus to the
+    /// Shares view so the My-shares pane is visible.
+    #[test]
+    fn define_share_valid_dir_queues_request_and_returns_to_shares() {
+        let mut app = drive_to_main();
+        // Chat → JoinCircle → Mute → Shares → DefineShare
+        for _ in 0..4 {
+            app.on_key(press(KeyCode::Tab));
+        }
+        assert_eq!(app.main_focus(), MainFocus::DefineShare);
+
+        let dir = std::env::temp_dir();
+        let input = format!("{}|My Docs", dir.display());
+        for ch in input.chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        app.on_key(press(KeyCode::Enter));
+
+        assert_eq!(app.main_focus(), MainFocus::Shares, "returns to My-shares");
+        let req = app
+            .take_pending_share_define()
+            .expect("a valid dir queues a define request");
+        assert!(req.root.is_dir());
+        assert_eq!(req.label.as_deref(), Some("My Docs"));
+        assert!(app.share_input().is_empty(), "buffer cleared on success");
+        assert!(
+            app.take_pending_share_define().is_none(),
+            "request drained exactly once"
+        );
+    }
+
+    /// A non-existent directory is rejected: no request is queued, the buffer is
+    /// kept so the user can correct the typo in place, focus stays on the box,
+    /// and a status explains the refusal (no silent empty index).
+    #[test]
+    fn define_share_rejects_nonexistent_dir_and_keeps_buffer() {
+        let mut app = drive_to_main();
+        for _ in 0..4 {
+            app.on_key(press(KeyCode::Tab));
+        }
+        let bogus = "/nonexistent/xyzzy-daemonseed-m14";
+        for ch in bogus.chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        app.on_key(press(KeyCode::Enter));
+
+        assert!(
+            app.take_pending_share_define().is_none(),
+            "a bad path queues nothing"
+        );
+        assert_eq!(app.share_input(), bogus, "buffer kept to fix in place");
+        assert_eq!(app.main_focus(), MainFocus::DefineShare, "stays on the box");
+        assert!(app.status().is_some(), "a status explains the refusal");
     }
 
     // ── C28 trust-event affordance routing (ISC-22..25 / 28) ─────────────
@@ -2459,6 +2620,7 @@ mod tests {
         app.on_key(press(KeyCode::Tab)); // → JoinCircle
         app.on_key(press(KeyCode::Tab)); // → Mute
         app.on_key(press(KeyCode::Tab)); // → Shares
+        app.on_key(press(KeyCode::Tab)); // → DefineShare
         app.on_key(press(KeyCode::Tab)); // → Hide
         app.on_key(press(KeyCode::Tab)); // → Servers
         app.on_key(press(KeyCode::Tab)); // → TrustHistory
@@ -2532,8 +2694,8 @@ mod tests {
             key: TrustEventKey::ServerSourceUnverified,
             server_id: Some("relay#aabbccddeeff".to_owned()),
         });
-        // Tab to the Trust History view (6 hops past Chat → … → TrustHistory).
-        for _ in 0..6 {
+        // Tab to the Trust History view (7 hops past Chat → … → TrustHistory).
+        for _ in 0..7 {
             app.on_key(press(KeyCode::Tab));
         }
         assert_eq!(app.main_focus(), MainFocus::TrustHistory);
@@ -3279,8 +3441,8 @@ mod tests {
             .profile_config
             .profile_id;
 
-        // Tab Chat → JoinCircle → Mute → Shares → Hide.
-        for _ in 0..4 {
+        // Tab Chat → JoinCircle → Mute → Shares → DefineShare → Hide.
+        for _ in 0..5 {
             app.on_key(press(KeyCode::Tab));
         }
         assert_eq!(app.main_focus(), MainFocus::Hide);
@@ -3587,6 +3749,7 @@ mod tests {
         app.on_key(press(KeyCode::Tab)); // Chat → JoinCircle
         app.on_key(press(KeyCode::Tab)); // → Mute
         app.on_key(press(KeyCode::Tab)); // → Shares
+        app.on_key(press(KeyCode::Tab)); // → DefineShare
         app.on_key(press(KeyCode::Tab)); // → Hide
         app.on_key(press(KeyCode::Tab)); // → Servers
         assert_eq!(app.main_focus(), MainFocus::Servers);
@@ -3915,6 +4078,7 @@ mod tests {
         assert!(render_text(&app, 120, 24).contains("Alice notes"));
 
         // Move to the Hide box and toggle alice's handle into the hide set.
+        app.on_key(press(KeyCode::Tab)); // → DefineShare
         app.on_key(press(KeyCode::Tab)); // → Hide
         assert_eq!(app.main_focus(), MainFocus::Hide);
         for ch in "alice#aabbccddeeff".chars() {
@@ -3940,6 +4104,7 @@ mod tests {
     fn hide_toggle_is_idempotent() {
         let mut app = drive_to_main();
         to_shares(&mut app);
+        app.on_key(press(KeyCode::Tab)); // → DefineShare
         app.on_key(press(KeyCode::Tab)); // → Hide
         for ch in "alice#aabbccddeeff".chars() {
             app.on_key(press(KeyCode::Char(ch)));
@@ -3960,6 +4125,7 @@ mod tests {
     fn hide_toggle_refuses_line_break_handle() {
         let mut app = drive_to_main();
         to_shares(&mut app);
+        app.on_key(press(KeyCode::Tab)); // → DefineShare
         app.on_key(press(KeyCode::Tab)); // → Hide
         for ch in "garbage\nmore".chars() {
             app.on_key(press(KeyCode::Char(ch)));
@@ -3984,6 +4150,11 @@ mod tests {
         assert!(
             app.take_pending_share_refresh(),
             "tabbing into Shares queues a refresh"
+        );
+        app.on_key(press(KeyCode::Tab)); // → DefineShare (no refresh queued)
+        assert!(
+            !app.take_pending_share_refresh(),
+            "DefineShare is an input box, not a shares view — no refresh"
         );
         app.on_key(press(KeyCode::Tab)); // → Hide
         assert!(
@@ -4227,6 +4398,7 @@ mod tests {
         app.on_key(press(KeyCode::Down));
         assert_eq!(app.share_sel(), 1);
         // Hide bob — the visible subset shrinks to 1, so the sel must clamp.
+        app.on_key(press(KeyCode::Tab)); // → DefineShare
         app.on_key(press(KeyCode::Tab)); // → Hide
         for ch in "bob#001122334455".chars() {
             app.on_key(press(KeyCode::Char(ch)));
@@ -4239,7 +4411,7 @@ mod tests {
 
     /// Navigate to the Public Space view via the Tab cycle (7 hops from Chat).
     fn to_public_space(app: &mut App) {
-        for _ in 0..7 {
+        for _ in 0..8 {
             app.on_key(press(KeyCode::Tab));
         }
         assert_eq!(app.main_focus(), MainFocus::PublicSpace);
@@ -4353,7 +4525,7 @@ mod tests {
 
     /// Navigate to the Deprecation view via the Tab cycle (8 hops from Chat).
     fn to_deprecation(app: &mut App) {
-        for _ in 0..8 {
+        for _ in 0..9 {
             app.on_key(press(KeyCode::Tab));
         }
         assert_eq!(app.main_focus(), MainFocus::Deprecation);

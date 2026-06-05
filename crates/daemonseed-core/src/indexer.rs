@@ -72,27 +72,11 @@ impl Indexer {
     /// — one bad file must not abort the whole walk (ISC-A-C7 robustness).
     ///
     /// Synchronous by design — see the module docs. Run it on a niced
-    /// background thread so it cannot starve a foreground task.
+    /// background thread so it cannot starve a foreground task. Delegates to the
+    /// free [`scan_into`] so a caller holding only an `Arc<ShareIndex>` (M14
+    /// net-actor activation) can run the identical walk against a borrowed index.
     pub fn cold_scan(&self) -> Result<usize, IndexError> {
-        let mut count = 0usize;
-        for entry in WalkDir::new(&self.root).into_iter().flatten() {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let Ok(meta) = entry.metadata() else {
-                continue;
-            };
-            let Some(rel_path) = self.rel_path(entry.path()) else {
-                continue;
-            };
-            self.index.put(&ShareEntry {
-                rel_path,
-                size: meta.len(),
-                mtime_unix_ms: mtime_ms(&meta),
-            })?;
-            count += 1;
-        }
-        Ok(count)
+        scan_into(&self.index, &self.root)
     }
 
     /// Apply one filesystem event as a **single-entry** index write — never a
@@ -187,6 +171,42 @@ impl Indexer {
             .to_str()
             .map(|s| s.to_owned())
     }
+}
+
+/// Cold-scan `root` into a borrowed [`ShareIndex`]: upsert every regular file
+/// beneath it and return how many were indexed. Unreadable entries are skipped,
+/// not fatal — one bad file must not abort the whole walk (ISC-A-C7 robustness).
+///
+/// Operates on `&ShareIndex` rather than owning it so a caller holding an
+/// `Arc<ShareIndex>` can run the scan on a dedicated background thread while the
+/// *same* index stays fully queryable from the foreground (redb MVCC) — the M14
+/// net-actor share-activation path. [`Indexer::cold_scan`] delegates here.
+pub fn scan_into(index: &ShareIndex, root: &Path) -> Result<usize, IndexError> {
+    let mut count = 0usize;
+    for entry in WalkDir::new(root).into_iter().flatten() {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let Some(rel_path) = entry
+            .path()
+            .strip_prefix(root)
+            .ok()
+            .and_then(|p| p.to_str())
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        index.put(&ShareEntry {
+            rel_path,
+            size: meta.len(),
+            mtime_unix_ms: mtime_ms(&meta),
+        })?;
+        count += 1;
+    }
+    Ok(count)
 }
 
 /// A running background cold-scan ([`Indexer::spawn_background_scan`]). Join to
@@ -339,6 +359,28 @@ mod tests {
         assert_eq!(idx.index().len().unwrap(), 3);
         assert_eq!(idx.index().get("a.txt").unwrap().unwrap().size, 3);
         assert_eq!(idx.index().get("sub/b.txt").unwrap().unwrap().size, 4);
+    }
+
+    /// M14: the free `scan_into` indexes a borrowed `Arc<ShareIndex>` so the
+    /// net-actor can run the walk on a background thread while the same index
+    /// stays queryable from the foreground (redb MVCC). Same result as the
+    /// owning `Indexer::cold_scan`.
+    #[test]
+    fn scan_into_indexes_a_shared_arc_index() {
+        let _ = oxicrypt_module::initialize();
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("share");
+        std::fs::create_dir_all(&root).unwrap();
+        write(&root, "a.txt", b"aaa");
+        write(&root, "sub/b.txt", b"bbbb");
+
+        let index = Arc::new(ShareIndex::open(dir.path().join("index.redb"), KEY).unwrap());
+        // The actor pattern: scan a borrowed Arc while holding another clone.
+        let foreground = Arc::clone(&index);
+        assert_eq!(scan_into(&index, &root).unwrap(), 2);
+        // The foreground clone observes the scan's writes (shared redb).
+        assert_eq!(foreground.len().unwrap(), 2);
+        assert_eq!(foreground.get("a.txt").unwrap().unwrap().size, 3);
     }
 
     /// Directories themselves are not indexed — only the files in them.
