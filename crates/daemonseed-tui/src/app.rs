@@ -320,6 +320,11 @@ pub struct JoinedCircle {
     /// Client-local display label (ISC-C62), shown in the carousel and compose
     /// indicator. Never transmitted, never derived from members.
     pub label: String,
+    /// The phrase this circle's `cot_key` derives from — the in-memory session
+    /// copy of the persisted seed (M13, ISC-C59). The at-rest form is
+    /// [`daemonseed_core::storage::seeds::PersistedCircle`]; this lets the
+    /// `CircleJoined` handler map a runtime circle back to its persisted entry.
+    pub entropy: String,
 }
 
 /// A queued chat send for the binary to forward to the network actor. `body` is
@@ -418,7 +423,15 @@ pub struct App {
     /// Index of the selected server in [`Self::servers`] (Up/Down moves it).
     server_sel: usize,
     /// A circle-join the binary should forward to the net actor (drained once).
+    /// The single-shot slot for an interactive join; [`Self::take_pending_join`]
+    /// drains it first, then [`Self::pending_joins`].
     pending_join: Option<String>,
+    /// Queued circle-rejoins to forward to the net actor, one per launch-time
+    /// remembered circle (M13 persistence, ISC-C59). Filled on Unlock from
+    /// `seeds.circles()` and drained one-per-tick by the same binary loop that
+    /// drains [`Self::pending_join`]; FIFO preserves join order. Distinct slot so
+    /// existing single-join callers/tests are unaffected.
+    pending_joins: std::collections::VecDeque<String>,
     /// A chat send the binary should forward to the net actor (drained once).
     pending_chat: Option<ChatSend>,
     /// A public-room post the binary should forward to the net actor (drained
@@ -592,6 +605,7 @@ impl App {
             server_input: String::new(),
             server_sel: 0,
             pending_join: None,
+            pending_joins: std::collections::VecDeque::new(),
             pending_chat: None,
             pending_public_room: None,
             trust_log: TrustEventLog::default(),
@@ -677,9 +691,15 @@ impl App {
         self.pending_connect.take()
     }
 
-    /// Take a queued circle-join phrase (drained once by the binary).
+    /// Take a queued circle-join phrase (drained once by the binary). The
+    /// interactive single-shot slot wins; with it empty, the next queued rejoin
+    /// (M13 persistence, ISC-C59) is popped FIFO. So the binary's once-per-tick
+    /// drain dispatches all remembered circles over successive ticks without any
+    /// dispatch-loop change.
     pub fn take_pending_join(&mut self) -> Option<String> {
-        self.pending_join.take()
+        self.pending_join
+            .take()
+            .or_else(|| self.pending_joins.pop_front())
     }
 
     /// Take a queued chat send (drained once by the binary).
@@ -778,6 +798,18 @@ impl App {
         self.seal_key = Some(session.seal_key.clone());
         self.muted = session.seeds.muted.clone();
         self.hidden_shares = session.seeds.hidden_shares.clone();
+        // M13 persistence (ISC-C59): every remembered circle is silently rejoined
+        // next launch — no re-typing the phrase. Queue one rejoin per persisted
+        // entry (FIFO preserves join order); the binary drains `take_pending_join`
+        // once per tick and reconnects on unlock, so these dispatch naturally.
+        // The runtime set is NOT pre-populated — the `CircleJoined` events restore
+        // `self.circles` with the persisted labels (the rejoin branch above).
+        for entry in session.seeds.circles() {
+            self.pending_joins.push_back(entry.entropy.clone());
+        }
+        if !self.pending_joins.is_empty() {
+            self.circle_status = CircleStatus::Joining;
+        }
         self.session = Some(session);
         self.unlock_input.clear();
         self.unlock_error = None;
@@ -859,17 +891,44 @@ impl App {
             // an existing one) and select it active (ISC-C60). An idempotent
             // re-join — the actor re-emits an id already in the set — only
             // re-selects it active; the label is refreshed in case it changed.
-            NetEvent::CircleJoined { circle_id, label } => {
+            NetEvent::CircleJoined {
+                circle_id,
+                label,
+                entropy,
+            } => {
                 self.circle_status = CircleStatus::Joined;
                 if let Some(pos) = self.circles.iter().position(|c| c.id == circle_id) {
+                    // Idempotent re-emit: refresh the label, keep the existing
+                    // entropy, and re-select active. Never re-persist.
                     self.circles[pos].label = label;
                     self.active_circle = Some(pos);
-                } else {
+                } else if let Some(persisted) = self
+                    .seeds
+                    .as_ref()
+                    .and_then(|s| s.circles().iter().find(|c| c.entropy == entropy))
+                {
+                    // A rejoin (M13, ISC-C59): this circle is already remembered.
+                    // The user's persisted label (ISC-C62) wins over the
+                    // actor-supplied one, and we must NOT persist again.
                     self.circles.push(JoinedCircle {
                         id: circle_id,
-                        label,
+                        label: persisted.label.clone(),
+                        entropy,
                     });
                     self.active_circle = Some(self.circles.len() - 1);
+                } else {
+                    // A fresh join: remember it (M13 write-through, ISC-C59) so
+                    // it is silently rejoined next launch.
+                    self.circles.push(JoinedCircle {
+                        id: circle_id,
+                        label: label.clone(),
+                        entropy: entropy.clone(),
+                    });
+                    self.active_circle = Some(self.circles.len() - 1);
+                    if let Some(seeds) = self.seeds.as_mut() {
+                        seeds.add_circle(entropy, label);
+                        self.persist_seeds();
+                    }
                 }
             }
             NetEvent::CircleJoinFailed { message } => {
@@ -1714,6 +1773,12 @@ impl App {
         &self.circles
     }
 
+    /// Test-only: the queued circle-rejoins not yet drained (M13, ISC-C59).
+    #[cfg(test)]
+    pub(crate) fn pending_joins_for_test(&self) -> &std::collections::VecDeque<String> {
+        &self.pending_joins
+    }
+
     /// The active-circle index into [`Self::circles`] (ISC-C60), or `None` when
     /// the lobby is active / the set is empty. For the carousel header
     /// ("circle N/M").
@@ -2182,6 +2247,7 @@ mod tests {
         app.on_net_event(NetEvent::CircleJoined {
             circle_id: id,
             label: format!("circle-{id}"),
+            entropy: format!("entropy-{id}"),
         });
     }
 
@@ -3194,6 +3260,126 @@ mod tests {
         assert!(
             app.is_share_hidden("hidden#0a0b0c0d0e0f"),
             "hide restored on unlock"
+        );
+    }
+
+    /// A fresh circle join (entropy not yet in `seeds.circles()`) remembers the
+    /// circle in the live payload AND queues a write-through (M13, ISC-C59).
+    #[test]
+    fn fresh_join_persists_circle_and_queues_blob() {
+        use daemonseed_core::storage::seeds;
+
+        let mut app = drive_to_main();
+        let pid = app
+            .session()
+            .expect("session present")
+            .profile_config
+            .profile_id;
+        // Drain any first-start write-through so we observe the join's own.
+        let _ = app.take_pending_blob_update();
+
+        app.on_net_event(NetEvent::CircleJoined {
+            circle_id: 7,
+            label: "Book Club".to_owned(),
+            entropy: "shared phrase one".to_owned(),
+        });
+
+        // Live seeds carries the remembered circle.
+        let live = app.seeds.as_ref().expect("seeds present");
+        assert_eq!(live.circles().len(), 1);
+        assert_eq!(live.circles()[0].entropy, "shared phrase one");
+        assert_eq!(live.circles()[0].label, "Book Club");
+
+        // And the join queued a write-through that persists it.
+        let bytes = app
+            .take_pending_blob_update()
+            .expect("a fresh join queues a blob re-seal");
+        let recovered = seeds::open(&bytes, WT_PASSPHRASE, pid, wt_params())
+            .expect("re-sealed blob opens")
+            .seeds;
+        assert_eq!(recovered.circles().len(), 1);
+        assert_eq!(recovered.circles()[0].entropy, "shared phrase one");
+    }
+
+    /// On Unlock, every remembered circle is queued for rejoin; the resulting
+    /// `CircleJoined` restores the runtime circle with the PERSISTED label (it
+    /// wins over the actor-supplied one) and does NOT re-persist (M13, ISC-C59).
+    #[test]
+    fn unlock_queues_rejoins_and_persisted_label_wins() {
+        let _ = oxicrypt_module::initialize();
+        let mut materials = {
+            let mut app = drive_to_main();
+            app.session_take_for_test()
+        };
+        // The persisted blob remembers a circle with the user's label.
+        materials.seeds.add_circle("phrase x", "My Label");
+
+        let mut app = App::for_existing_profile_with_argon(wt_params());
+        app.on_unlock_success(materials);
+
+        // The remembered circle is queued for rejoin (not yet in the runtime set).
+        assert!(
+            app.pending_joins_for_test()
+                .contains(&"phrase x".to_owned()),
+            "unlock queues the remembered circle for rejoin"
+        );
+        assert!(app.circles().is_empty(), "runtime set waits for the event");
+        assert_eq!(app.circle_status(), &CircleStatus::Joining);
+        // The unlock-success connect write-through must not be mistaken for a
+        // circle re-persist; drain it before the rejoin event.
+        let _ = app.take_pending_blob_update();
+
+        // The rejoin event arrives with an actor-generated label.
+        app.on_net_event(NetEvent::CircleJoined {
+            circle_id: 3,
+            label: "actor-generated".to_owned(),
+            entropy: "phrase x".to_owned(),
+        });
+
+        // Persisted label wins, the set did not grow, no new blob was queued.
+        assert_eq!(app.circles().len(), 1);
+        assert_eq!(app.circles()[0].label, "My Label");
+        assert_eq!(
+            app.seeds.as_ref().expect("seeds present").circles().len(),
+            1,
+            "a rejoin does not duplicate the persisted entry"
+        );
+        assert!(
+            app.take_pending_blob_update().is_none(),
+            "a rejoin does not re-persist"
+        );
+    }
+
+    /// A disconnect clears the RUNTIME circle set but leaves the persisted
+    /// circles in the live payload intact (M13, ISC-C59).
+    #[test]
+    fn disconnect_keeps_persisted_circles() {
+        let mut app = drive_to_main();
+        let _ = app.take_pending_blob_update();
+
+        app.on_net_event(NetEvent::CircleJoined {
+            circle_id: 1,
+            label: "Ops".to_owned(),
+            entropy: "ops phrase".to_owned(),
+        });
+        assert_eq!(app.circles().len(), 1);
+        assert_eq!(
+            app.seeds.as_ref().expect("seeds present").circles().len(),
+            1
+        );
+
+        // Disconnect via the logged-in back menu (Esc → Main → Esc → menu, d).
+        app.on_key(press(KeyCode::Esc)); // Main → LoggedInMenu
+        app.on_key(press(KeyCode::Char('d'))); // disconnect
+
+        assert!(
+            app.circles().is_empty(),
+            "runtime set cleared on disconnect"
+        );
+        assert_eq!(
+            app.seeds.as_ref().expect("seeds present").circles().len(),
+            1,
+            "persisted circles survive a disconnect"
         );
     }
 

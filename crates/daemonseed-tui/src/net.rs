@@ -172,7 +172,17 @@ pub enum NetEvent {
     /// `circle_id` is the stable per-session id the app keys its membership and
     /// active-surface selection on, and `label` is the client-local display label
     /// assigned at join (ISC-C62) — never transmitted.
-    CircleJoined { circle_id: u64, label: String },
+    ///
+    /// `entropy` is the exact phrase string the actor derived this circle's
+    /// `cot_key` from (M13 persistence keystone, ISC-C59): re-sending it as a
+    /// future [`NetCommand::JoinCircle`] re-derives the same key deterministically,
+    /// so it is the sufficient persisted seed. It travels only on this in-process
+    /// actor→UI channel, never on the wire.
+    CircleJoined {
+        circle_id: u64,
+        label: String,
+        entropy: String,
+    },
     /// Joining a circle failed (no live session, derivation, or subscribe error).
     CircleJoinFailed { message: String },
     /// A decrypted chat message arrived on a joined circle (ISC-10 / ISC-A-C30).
@@ -680,6 +690,9 @@ impl Actor {
             return self.emit(NetEvent::CircleJoined {
                 circle_id: existing.id,
                 label: existing.label.clone(),
+                // The phrase the actor processed is the persisted seed (M13):
+                // re-sending it re-derives the same `cot_key` (ISC-C59).
+                entropy: phrase.to_owned(),
             });
         }
 
@@ -730,7 +743,13 @@ impl Actor {
             asset_addr,
             out_tx,
         });
-        self.emit(NetEvent::CircleJoined { circle_id, label });
+        self.emit(NetEvent::CircleJoined {
+            circle_id,
+            label,
+            // The phrase the actor processed is the persisted seed (M13):
+            // re-sending it re-derives the same `cot_key` (ISC-C59).
+            entropy: phrase.to_owned(),
+        });
     }
 
     /// Subscribe to the well-known default public room (ISC-S22 / ISC-C56) so the
