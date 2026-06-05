@@ -26,7 +26,10 @@
 //! Strength gating (≥128-bit, ISC-C9) is the caller's responsibility via
 //! [`crate::passphrase::strength`]; this function derives unconditionally.
 
+use core::fmt::Write as _;
+
 use oxicrypt_kdf::HkdfSha384;
+use oxicrypt_sha::sha384;
 use zeroize::Zeroize;
 
 use crate::crypto::suite::Suite;
@@ -129,6 +132,44 @@ pub fn derive_cot_key(entropy: &str, suite: &Suite) -> Result<CotKey, CircleKeyE
     Ok(CotKey(boxed))
 }
 
+/// Length of the hex fingerprint body (excluding the leading `#`). 12 hex chars
+/// = 48 bits of the digest — enough for a human cross-check, short enough to
+/// read aloud.
+pub const CIRCLE_FINGERPRINT_HEX_LEN: usize = 12;
+
+/// A short, **relay-independent** `#<hash-of-entropy>` fingerprint of a circle
+/// (the ISC-C62 `#<hash-of-entropy>` floor form).
+///
+/// It is a pure function of the canonicalized entropy (ISC-C9), so two members
+/// confirm "same circle" even across different relays — unlike the
+/// rendezvous-derived adj-noun label ([`crate::handle::display_name`] keyed on
+/// `SHA-384(cot_key ‖ server_id)`), which differs per relay by design
+/// (cross-server unlinkability, ISC-C8).
+///
+/// **Hidden in the terminal client by design** (caraka, 2026-06-05): while TUI
+/// space is limited the human-readable adj-noun label carries cross-daemon
+/// verification, and this hash stays coded-but-unsurfaced. It is reserved for
+/// the GUI era, where the user names the circle and this fingerprint backs
+/// verification (the circle analogue of ISC-C4a's handle hash-prefix). The
+/// canonical form is secret-adjacent, so it is zeroed the moment the digest is
+/// taken (mirrors [`derive_cot_key`]). Returns a bare `"#"` only if the SHA
+/// backend gate is uninitialized — a caller never relies on that path.
+pub fn circle_fingerprint(entropy: &str) -> String {
+    let mut canon = circle_canonicalize::canonicalize(entropy);
+    let digest = sha384(canon.as_bytes());
+    canon.zeroize();
+    let Ok(digest) = digest else {
+        return "#".to_owned();
+    };
+    let mut out = String::with_capacity(1 + CIRCLE_FINGERPRINT_HEX_LEN);
+    out.push('#');
+    for b in digest.iter().take(CIRCLE_FINGERPRINT_HEX_LEN / 2) {
+        // Infallible write into a String; the result is intentionally ignored.
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,6 +203,43 @@ mod tests {
         let a = derive_cot_key("phrase alpha", &CNSA_2_0).unwrap();
         let b = derive_cot_key("phrase bravo", &CNSA_2_0).unwrap();
         assert_ne!(a.as_bytes(), b.as_bytes());
+    }
+
+    /// ISC-C62 — the `#<hash-of-entropy>` fingerprint is deterministic and shares
+    /// the ISC-C9 canonicalization, so incidental whitespace differences between
+    /// members collapse to the same fingerprint (the GUI-era verification check).
+    #[test]
+    fn fingerprint_is_deterministic_and_canonical() {
+        let _ = oxicrypt_module::initialize();
+        let a = circle_fingerprint(EXAMPLE_ENTROPY);
+        let b = circle_fingerprint("  correct   horse battery staple  ");
+        assert_eq!(a, b);
+        assert!(a.starts_with('#'));
+        assert_eq!(a.len(), 1 + CIRCLE_FINGERPRINT_HEX_LEN);
+    }
+
+    /// ISC-C62 — distinct entropy yields distinct fingerprints (the phrase is the
+    /// sole distinguisher, ISC-C8).
+    #[test]
+    fn distinct_entropy_yields_distinct_fingerprints() {
+        let _ = oxicrypt_module::initialize();
+        assert_ne!(
+            circle_fingerprint("phrase alpha"),
+            circle_fingerprint("phrase bravo")
+        );
+    }
+
+    /// The fingerprint is relay-independent — unlike the rendezvous-derived
+    /// adj-noun label, it depends only on the entropy, so it never varies with
+    /// `server_id`. (Same entropy in, same fingerprint out, no address input.)
+    #[test]
+    fn fingerprint_takes_only_entropy() {
+        let _ = oxicrypt_module::initialize();
+        // Two calls with the same phrase agree with no other input in play.
+        assert_eq!(
+            circle_fingerprint("a shared circle passphrase"),
+            circle_fingerprint("a shared circle passphrase")
+        );
     }
 
     /// `Debug` never leaks key bytes (ISC-A-C1 log-surface hygiene).

@@ -5,7 +5,11 @@
 //! while the indicator is below green.
 //!
 //! ISC-C9 (circle-of-trust entropy): same estimator, higher threshold —
-//! ≥128 bits.
+//! ≥128 bits. ⚠️ But zxcvbn saturates `guesses` at 2⁶⁴, so [`Strength::bits`]
+//! never exceeds 64.0 and the literal ≥128 floor is unreachable through this
+//! estimator (discovered M14, 2026-06-05). The circle-join gate uses
+//! [`Strength::meets_circle_interim_floor`] until a key-space (charset /
+//! word-count) estimator replaces zxcvbn for circle entropy.
 //!
 //! The estimator wraps `zxcvbn`'s `Entropy::guesses_log10` and converts
 //! to bits. Diceware-style passphrase generation samples the BIP-39
@@ -44,8 +48,30 @@ impl Strength {
     }
 
     /// True iff the input meets ISC-C9's ≥128-bit circle-of-trust floor.
+    ///
+    /// ⚠️ **Currently unreachable.** The underlying `zxcvbn` model saturates its
+    /// `guesses` estimate at 2⁶⁴, so [`Self::bits`] can never exceed `64.0` and
+    /// this predicate is *always false* — zxcvbn is a crack-difficulty model, the
+    /// wrong tool to certify a 128-bit *key-space* floor. The circle-join gate
+    /// therefore uses [`Self::meets_circle_interim_floor`] until a charset /
+    /// word-count estimator that can actually reach ≥128 bits replaces zxcvbn for
+    /// circle entropy (discovered 2026-06-05, M14; caraka to decide the
+    /// replacement). Kept as the documented target the real estimator must meet.
     pub fn is_circle_green(&self) -> bool {
         self.bits >= CIRCLE_ENTROPY_MIN_BITS
+    }
+
+    /// **Interim** circle-entropy gate (ISC-C9) — the achievable proxy for the
+    /// unreachable ≥128-bit floor (see [`Self::is_circle_green`]).
+    ///
+    /// zxcvbn's `bits` saturate at 64.0, so the join gate instead requires its
+    /// strongest tier (`score == 4`): this rejects weak/predictable phrases
+    /// (`password123`, `Tr0ub4dour&3`, …) without blocking every join, honoring
+    /// the precautionary intent of the M14 Fork-4 decision under the constraint
+    /// that the literal 128-bit threshold cannot be measured today. Replace with
+    /// a true ≥128-bit check once the estimator is upgraded.
+    pub fn meets_circle_interim_floor(&self) -> bool {
+        self.score >= 4
     }
 }
 
@@ -235,5 +261,37 @@ mod tests {
         // higher than the session gate. (Constants-only check is preferred
         // over a runtime assert; `const _` lifts it to compile time.)
         const _: () = assert!(CIRCLE_ENTROPY_MIN_BITS > SESSION_PASSPHRASE_MIN_BITS);
+    }
+
+    /// Regression-pins the zxcvbn 2⁶⁴ cap discovered in M14: `bits` saturate at
+    /// 64.0, so `is_circle_green` (≥128) is unreachable. If a future estimator
+    /// upgrade lifts this cap, THIS test breaks first — the signal to switch the
+    /// circle-join gate back from the interim floor to the real ≥128 check.
+    #[test]
+    fn zxcvbn_bits_saturate_below_the_circle_floor() {
+        let _ = oxicrypt_module::initialize();
+        // A 34-char random mixed string — genuinely ≫128 bits of key space — and
+        // an 11-word phrase both saturate at the same 64.0 zxcvbn ceiling.
+        let rnd = estimate("x7Qk!9zR2m@Lp4wV6sT1bN8dF3hJ5cG0aY");
+        assert!(
+            rnd.bits <= 64.5,
+            "zxcvbn caps bits at ~64 (got {})",
+            rnd.bits
+        );
+        assert!(
+            !rnd.is_circle_green(),
+            "the ≥128-bit floor is unreachable via zxcvbn"
+        );
+    }
+
+    /// The interim floor (`score == 4`) accepts a strong phrase and rejects weak
+    /// / predictable ones — the precautionary M14 gate while ≥128 is unmeasurable.
+    #[test]
+    fn interim_circle_floor_separates_weak_from_strong() {
+        let _ = oxicrypt_module::initialize();
+        assert!(estimate("x7Qk!9zR2m@Lp4wV6sT1bN8dF3hJ5cG0aY").meets_circle_interim_floor());
+        assert!(!estimate("password123").meets_circle_interim_floor());
+        assert!(!estimate("Tr0ub4dour&3").meets_circle_interim_floor());
+        assert!(!estimate("abc").meets_circle_interim_floor());
     }
 }

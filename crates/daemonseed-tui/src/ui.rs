@@ -896,10 +896,25 @@ fn render_main_input(app: &App, frame: &mut Frame, area: Rect) {
                 app.compose().to_owned(),
             )
         }
-        MainFocus::JoinCircle => (
-            "circle phrase  [Enter] join  [Tab] mute  [Esc] back".to_owned(),
-            app.circle_phrase().to_owned(),
-        ),
+        MainFocus::JoinCircle => {
+            // ISC-C9 strength indicator: a red→yellow→green tier (border below
+            // matches). The literal ≥128-bit floor is unmeasurable (zxcvbn caps at
+            // 64 bits), so this shows zxcvbn's tier, not a "/128" bar that could
+            // never fill. A below-floor phrase is blocked at Enter
+            // (App::on_key_join, Fork 4), so the indicator explains the refusal.
+            let s = app.circle_phrase_strength();
+            let tier = if s.meets_circle_interim_floor() {
+                "strong ✓"
+            } else if s.score >= 3 {
+                "fair ⚠"
+            } else {
+                "weak ⚠"
+            };
+            (
+                format!("circle phrase · strength: {tier}  [Enter] join  [Tab] mute  [Esc] back"),
+                app.circle_phrase().to_owned(),
+            )
+        }
         MainFocus::Mute => {
             let muted: Vec<&str> = app.muted().collect();
             let suffix = if muted.is_empty() {
@@ -952,10 +967,27 @@ fn render_main_input(app: &App, frame: &mut Frame, area: Rect) {
         Some(s) => format!("{text}    ! {s}"),
         None => text,
     };
+    // The join box gets a strength-driven border (ISC-C9): red below ~85 bits,
+    // yellow approaching the floor, green at/above the ≥128-bit floor — the
+    // red→green indicator the spec calls for, within the single-line input. An
+    // empty phrase stays neutral cyan like every other focus.
+    let border_color = match app.main_focus() {
+        MainFocus::JoinCircle if !app.circle_phrase().is_empty() => {
+            let s = app.circle_phrase_strength();
+            if s.meets_circle_interim_floor() {
+                Color::Green
+            } else if s.score >= 3 {
+                Color::Yellow
+            } else {
+                Color::Red
+            }
+        }
+        _ => Color::Cyan,
+    };
     let body = Paragraph::new(shown).block(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
+            .border_style(Style::default().fg(border_color))
             .title(title),
     );
     frame.render_widget(body, area);

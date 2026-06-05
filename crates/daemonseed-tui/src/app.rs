@@ -7,6 +7,7 @@
 use daemonseed_core::backoff::CloseCause;
 use daemonseed_core::first_start::SessionMaterials;
 use daemonseed_core::handle::{DisplayMode, Handle};
+use daemonseed_core::passphrase::strength::{self, Strength};
 use daemonseed_core::profile::config::ArgonParams;
 use daemonseed_core::storage::seeds::{SealingKey, Seeds};
 use daemonseed_core::trust_events::{
@@ -325,6 +326,21 @@ pub struct JoinedCircle {
     /// [`daemonseed_core::storage::seeds::PersistedCircle`]; this lets the
     /// `CircleJoined` handler map a runtime circle back to its persisted entry.
     pub entropy: String,
+}
+
+impl JoinedCircle {
+    /// The relay-independent `#<hash-of-entropy>` fingerprint (ISC-C62), a pure
+    /// function of this circle's entropy.
+    ///
+    /// **Coded but unsurfaced in the TUI** (caraka, 2026-06-05): while terminal
+    /// space is limited, the human-readable adj-noun [`Self::label`] carries
+    /// cross-daemon same-circle verification. This precise check is reserved for
+    /// the GUI era — where the user names the circle and the fingerprint backs
+    /// verification — so the renderer never shows it today; it is exposed here so
+    /// that surface can light it up without a core change.
+    pub fn fingerprint(&self) -> String {
+        daemonseed_core::circle::key::circle_fingerprint(&self.entropy)
+    }
 }
 
 /// A queued chat send for the binary to forward to the network actor. `body` is
@@ -836,6 +852,15 @@ impl App {
     /// The current circle-join phrase buffer, for rendering.
     pub fn circle_phrase(&self) -> &str {
         &self.circle_phrase
+    }
+
+    /// Estimated strength of the current circle-join phrase (ISC-C9), for the
+    /// red→green meter in the join box. Mirrors the first-start session-passphrase
+    /// meter (ISC-C12); the circle floor is higher (≥128 bits,
+    /// [`strength::CIRCLE_ENTROPY_MIN_BITS`]). An empty phrase estimates `0.0`
+    /// bits, so the meter reads empty until the user types.
+    pub fn circle_phrase_strength(&self) -> Strength {
+        strength::estimate(&self.circle_phrase)
     }
 
     /// The chat lines, oldest first, for rendering (ISC-10). The split view
@@ -1896,6 +1921,25 @@ impl App {
                 self.circle_phrase.pop();
             }
             KeyCode::Enter if !self.circle_phrase.is_empty() => {
+                // ISC-C9: gate the join on circle-entropy strength. A weak shared
+                // phrase is the circle's whole vulnerability, so a below-floor
+                // estimate BLOCKS the join (caraka 2026-06-05, precautionary
+                // default — Fork 4) rather than merely warning. The phrase is
+                // deliberately kept (not drained) so the user can strengthen it in
+                // place; the meter already shows them the gap.
+                //
+                // The literal ≥128-bit floor (ISC-C9) is unmeasurable today —
+                // zxcvbn saturates at 64 bits (see Strength::is_circle_green) — so
+                // this uses the interim achievable proxy (zxcvbn's strongest tier).
+                // Replace with the real ≥128 check when the estimator is upgraded.
+                let est = strength::estimate(&self.circle_phrase);
+                if !est.meets_circle_interim_floor() {
+                    self.status = Some(
+                        "circle phrase too weak — use a longer, less predictable phrase (ISC-C9)"
+                            .to_owned(),
+                    );
+                    return;
+                }
                 let phrase = std::mem::take(&mut self.circle_phrase);
                 self.pending_join = Some(phrase);
                 self.circle_status = CircleStatus::Joining;
@@ -2963,21 +3007,90 @@ mod tests {
         );
     }
 
+    /// A strong circle phrase (zxcvbn score 4) — used by join tests that must
+    /// clear the ISC-C9 interim floor (`App::on_key_join`). A weak phrase like the
+    /// public xkcd example would now be blocked, by design.
+    const STRONG_CIRCLE_PHRASE: &str = "x7Qk!9zR2m@Lp4wV6sT1bN8dF3hJ5cG0aY";
+
     #[test]
     fn joining_a_circle_queues_phrase_and_marks_joining() {
         let mut app = drive_to_main();
         app.on_key(press(KeyCode::Tab)); // focus → JoinCircle
-        for ch in "correct horse battery staple".chars() {
+        for ch in STRONG_CIRCLE_PHRASE.chars() {
             app.on_key(press(KeyCode::Char(ch)));
         }
-        assert_eq!(app.circle_phrase(), "correct horse battery staple");
+        assert_eq!(app.circle_phrase(), STRONG_CIRCLE_PHRASE);
         app.on_key(press(KeyCode::Enter));
         assert_eq!(app.circle_status(), &CircleStatus::Joining);
         assert_eq!(app.main_focus(), MainFocus::Chat, "focus returns to chat");
         let phrase = app.take_pending_join().expect("join queued");
-        assert_eq!(phrase, "correct horse battery staple");
+        assert_eq!(phrase, STRONG_CIRCLE_PHRASE);
         assert_eq!(app.circle_phrase(), "", "phrase buffer cleared");
         assert!(app.take_pending_join().is_none(), "queued exactly once");
+    }
+
+    /// ISC-C9 / Fork 4 — a weak circle phrase is BLOCKED at Enter: no join is
+    /// queued, the status explains, and the phrase is kept (not drained) so the
+    /// user can strengthen it in place. The literal ≥128-bit floor is unmeasurable
+    /// (zxcvbn caps at 64 bits), so the gate uses the interim score-4 proxy.
+    #[test]
+    fn weak_circle_phrase_is_blocked_at_join() {
+        let mut app = drive_to_main();
+        app.on_key(press(KeyCode::Tab)); // focus → JoinCircle
+        for ch in "password123".chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        app.on_key(press(KeyCode::Enter));
+        assert!(
+            app.take_pending_join().is_none(),
+            "weak phrase must not queue a join"
+        );
+        assert_eq!(
+            app.circle_status(),
+            &CircleStatus::NotJoined,
+            "no join attempt is marked"
+        );
+        assert_eq!(
+            app.circle_phrase(),
+            "password123",
+            "phrase kept so the user can strengthen it"
+        );
+        assert!(app.status().is_some_and(|s| s.contains("too weak")));
+    }
+
+    /// The circle-phrase strength accessor (ISC-C9 meter) reflects the live buffer:
+    /// the strong phrase clears the interim floor, an empty/weak one does not.
+    #[test]
+    fn circle_phrase_strength_tracks_the_buffer() {
+        let mut app = drive_to_main();
+        assert!(
+            !app.circle_phrase_strength().meets_circle_interim_floor(),
+            "empty phrase is not strong"
+        );
+        app.on_key(press(KeyCode::Tab)); // focus → JoinCircle
+        for ch in STRONG_CIRCLE_PHRASE.chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        assert!(app.circle_phrase_strength().meets_circle_interim_floor());
+    }
+
+    /// ISC-C62 — a joined circle exposes a relay-independent `#<hash-of-entropy>`
+    /// fingerprint for future GUI verification, while its visible `label` stays the
+    /// human-readable seed name (caraka 2026-06-05: hash coded but unsurfaced).
+    #[test]
+    fn joined_circle_exposes_hidden_fingerprint() {
+        let mut app = drive_to_main(); // initializes the crypto backend
+        join_circle(&mut app, 1);
+        let c = &app.circles()[0];
+        let fp = c.fingerprint();
+        assert!(fp.starts_with('#'), "fingerprint is #-prefixed: {fp}");
+        assert!(fp.len() > 1, "fingerprint has a hash body: {fp}");
+        assert_ne!(
+            c.label, fp,
+            "the visible label is the seed name, not the hash"
+        );
+        // Deterministic: same entropy → same fingerprint (the verification check).
+        assert_eq!(fp, c.fingerprint());
     }
 
     #[test]
