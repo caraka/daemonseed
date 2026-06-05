@@ -23,7 +23,7 @@ use crate::first_start::SessionMaterials;
 use crate::handle::Handle;
 use crate::identity::keys::{Identity, derive_identity_keys};
 use crate::profile::config::{ProfileConfig, ProfileConfigError};
-use crate::storage::seeds::{SealingKey, Seeds};
+use crate::storage::seeds::{IndexKey, SealingKey, Seeds};
 
 /// Uniform at-rest seeds-blob filename at the profile root (ISC-C3).
 pub const BLOB_FILENAME: &str = "seeds.blob";
@@ -234,6 +234,7 @@ impl std::error::Error for UnlockError {}
 pub fn session_materials_from_unlock(
     seeds: Seeds,
     seal_key: SealingKey,
+    index_key: IndexKey,
     config: ProfileConfig,
     blob_bytes: Vec<u8>,
     recovery_file_bytes: Vec<u8>,
@@ -259,6 +260,7 @@ pub fn session_materials_from_unlock(
         bootstrap,
         seeds,
         seal_key,
+        index_key,
     })
 }
 
@@ -401,9 +403,15 @@ mod tests {
         write_first_start(&tmp.path, &m, None, false).unwrap();
         let (config, blob) = load_for_unlock(&tmp.path).unwrap();
         let opened = seeds::open(&blob, STRONG, config.profile_id, config.argon2).unwrap();
-        let recovered =
-            session_materials_from_unlock(opened.seeds, opened.key, config, blob.clone(), vec![])
-                .expect("unlock reconstructs materials");
+        let recovered = session_materials_from_unlock(
+            opened.seeds,
+            opened.key,
+            opened.index_key,
+            config,
+            blob.clone(),
+            vec![],
+        )
+        .expect("unlock reconstructs materials");
         assert_eq!(
             recovered.handle.hash_prefix(),
             &enrolled_prefix,
@@ -425,7 +433,14 @@ mod tests {
         let (mut config, blob) = load_for_unlock(&tmp.path).unwrap();
         config.bootstrap = None; // simulate a legacy profile
         let opened = seeds::open(&blob, STRONG, config.profile_id, config.argon2).unwrap();
-        match session_materials_from_unlock(opened.seeds, opened.key, config, blob, vec![]) {
+        match session_materials_from_unlock(
+            opened.seeds,
+            opened.key,
+            opened.index_key,
+            config,
+            blob,
+            vec![],
+        ) {
             Err(UnlockError::NoBootstrap) => {}
             other => panic!("expected NoBootstrap, got {other:?}"),
         }

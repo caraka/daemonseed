@@ -85,8 +85,15 @@ fn persist_then_unlock_round_trips_to_same_identity() {
     // Next launch: an existing blob → Unlock (Item E). Decrypt + reconstruct.
     let (config, blob) = load_for_unlock(&tmp.path).unwrap();
     let opened = seeds::open(&blob, STRONG, config.profile_id, config.argon2).unwrap();
-    let session =
-        session_materials_from_unlock(opened.seeds, opened.key, config, blob, Vec::new()).unwrap();
+    let session = session_materials_from_unlock(
+        opened.seeds,
+        opened.key,
+        opened.index_key,
+        config,
+        blob,
+        Vec::new(),
+    )
+    .unwrap();
     assert_eq!(
         session.handle.hash_prefix(),
         &enrolled_prefix,

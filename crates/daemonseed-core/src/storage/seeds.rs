@@ -97,6 +97,10 @@ pub const ARGON2_OUTPUT_LEN: usize = 48;
 /// AEAD key length (AES-256 → 32 bytes).
 pub const AEAD_KEY_LEN: usize = 32;
 
+/// Length of the share-index key (M14), derived as a sibling of the at-rest
+/// key. Re-exported from the redb index module so the two stay in lockstep.
+use crate::storage::share_index::INDEX_KEY_LEN;
+
 /// Replay-protection counter state persisted alongside the mnemonic
 /// (`project_clocks_freshness`).
 ///
@@ -485,6 +489,11 @@ pub struct Opened {
     /// write-through (M13) can re-seal on each mutation without re-running
     /// Argon2id. The Unlock path hands this straight to the running client.
     pub key: SealingKey,
+    /// The share-index key (M14), derived as a sibling of `key` from the *same*
+    /// Argon2id run via a second domain-separated HKDF-Expand. The Unlock path
+    /// hands this to the running client to open the redb [`ShareIndex`]
+    /// (`crate::storage::share_index`) for free — no extra Argon2id.
+    pub index_key: IndexKey,
 }
 
 /// Errors from [`seal`] / [`open`] / [`touch_reseal`].
@@ -587,12 +596,55 @@ impl SealingKey {
     pub fn seal(&self, seeds: &Seeds) -> Result<Vec<u8>, BlobError> {
         seal_with_key(seeds, &self.0, Registry::default_write_suite())
     }
+
+    /// Derive BOTH session keys — the at-rest [`SealingKey`] and the share-index
+    /// [`IndexKey`] — from a single Argon2id run (M14). The index key falls out
+    /// of the same high-entropy intermediate as the at-rest key via a second
+    /// domain-separated HKDF-Expand, so activating the share indexer costs no
+    /// extra Argon2id work on the Pi-4 floor. Used at first-start; the Unlock
+    /// path gets both keys for free from [`open`] via [`Opened`].
+    pub fn derive_session(
+        passphrase: &str,
+        profile_id: Uuid,
+        params: ArgonParams,
+    ) -> Result<(Self, IndexKey), BlobError> {
+        let (mut at_rest, mut index) = derive_session_keys(passphrase, profile_id, params)?;
+        let sk = Self(Zeroizing::new(at_rest));
+        let ik = IndexKey(Zeroizing::new(index));
+        at_rest.zeroize();
+        index.zeroize();
+        Ok((sk, ik))
+    }
 }
 
 impl core::fmt::Debug for SealingKey {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         // The key is the session's most sensitive secret — never render it.
         f.write_str("SealingKey(<redacted>)")
+    }
+}
+
+/// A cached share-index key (M14) derived as a sibling of the at-rest
+/// [`SealingKey`] from the *same* single Argon2id run — one expensive KDF, two
+/// domain-separated HKDF-Expand outputs. Opens the redb
+/// [`ShareIndex`](crate::storage::share_index::ShareIndex). Zeroizes on drop; it
+/// is a session secret on par with the at-rest key — never log or persist it.
+#[derive(Clone)]
+pub struct IndexKey(Zeroizing<[u8; INDEX_KEY_LEN]>);
+
+impl IndexKey {
+    /// The raw key bytes for
+    /// [`ShareIndex::open`](crate::storage::share_index::ShareIndex::open),
+    /// which takes the key by value. The returned copy is the caller's to
+    /// zeroize after use.
+    pub fn to_bytes(&self) -> [u8; INDEX_KEY_LEN] {
+        *self.0
+    }
+}
+
+impl core::fmt::Debug for IndexKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("IndexKey(<redacted>)")
     }
 }
 
@@ -723,10 +775,15 @@ fn open_v2(
     let ciphertext = &after_nonce[..ciphertext_len];
     let tag: &[u8; TAG_LEN] = after_nonce[ciphertext_len..].try_into().unwrap();
 
-    let mut key_bytes = derive_aead_key(passphrase, profile_id, params)?;
+    // Derive both session keys from the single Argon2id run: the at-rest key
+    // decrypts the blob, the index key rides out in `Opened` for the running
+    // client (M14) — no second KDF on the Unlock path.
+    let (mut key_bytes, mut index_bytes) = derive_session_keys(passphrase, profile_id, params)?;
     let aes = Aes256Key::new(&key_bytes).map_err(BlobError::AesKeyInit)?;
     let key = SealingKey(Zeroizing::new(key_bytes));
+    let index_key = IndexKey(Zeroizing::new(index_bytes));
     key_bytes.zeroize();
+    index_bytes.zeroize();
 
     let mut plaintext = vec![0u8; ciphertext.len()];
     gcm_decrypt(&aes, nonce, &suite_bytes, ciphertext, tag, &mut plaintext).map_err(
@@ -744,6 +801,7 @@ fn open_v2(
         suite_id,
         legacy_v1: false,
         key,
+        index_key,
     })
 }
 
@@ -764,10 +822,12 @@ fn open_v1(
     let ciphertext = &after_nonce[..ciphertext_len];
     let tag: &[u8; TAG_LEN] = after_nonce[ciphertext_len..].try_into().unwrap();
 
-    let mut key_bytes = derive_aead_key(passphrase, profile_id, params)?;
+    let (mut key_bytes, mut index_bytes) = derive_session_keys(passphrase, profile_id, params)?;
     let aes = Aes256Key::new(&key_bytes).map_err(BlobError::AesKeyInit)?;
     let key = SealingKey(Zeroizing::new(key_bytes));
+    let index_key = IndexKey(Zeroizing::new(index_bytes));
     key_bytes.zeroize();
+    index_bytes.zeroize();
 
     let mut plaintext = vec![0u8; ciphertext.len()];
     // v1 used empty AAD — preserve that contract or M2 blobs fail to open.
@@ -787,6 +847,7 @@ fn open_v1(
         suite_id: implicit,
         legacy_v1: true,
         key,
+        index_key,
     })
 }
 
@@ -810,13 +871,35 @@ pub fn touch_reseal(
     seal_under(&opened.seeds, passphrase, profile_id, params, write_suite)
 }
 
-/// Run the two-stage Argon2id + HKDF KDF and produce the 32-byte AEAD key.
+/// Run the two-stage Argon2id + HKDF KDF and produce the 32-byte at-rest AEAD
+/// key. Thin wrapper over [`derive_session_keys`] that discards the share-index
+/// sibling — used by the seal-only paths ([`seal_under`], legacy v1 open) that
+/// never touch the index. The at-rest output is byte-identical to the pre-M14
+/// single-key derivation, so existing blobs open unchanged.
 fn derive_aead_key(
     passphrase: &str,
     profile_id: Uuid,
     params: ArgonParams,
 ) -> Result<[u8; AEAD_KEY_LEN], BlobError> {
-    // Stage 1: Argon2id (passphrase, salt=profile_id) → 32-byte intermediate.
+    let (at_rest, mut index) = derive_session_keys(passphrase, profile_id, params)?;
+    index.zeroize();
+    Ok(at_rest)
+}
+
+/// Run the expensive Argon2id KDF **once** and derive both session keys from the
+/// single high-entropy intermediate via domain-separated HKDF-Expand: the
+/// at-rest AEAD key (`info = at_rest`) and the share-index key
+/// (`info = share_index`). One Argon2id run preserves the Pi-4 floor; the
+/// share-index key is one extra HKDF-Expand off the same PRK. Domain separation
+/// (distinct info strings already pinned in [`crate::kdf::info`]) makes the two
+/// keys independent. The at-rest output is byte-identical to the pre-M14
+/// single-key derivation — existing at-rest blobs open unchanged.
+fn derive_session_keys(
+    passphrase: &str,
+    profile_id: Uuid,
+    params: ArgonParams,
+) -> Result<([u8; AEAD_KEY_LEN], [u8; INDEX_KEY_LEN]), BlobError> {
+    // Stage 1: Argon2id (passphrase, salt=profile_id) → high-entropy intermediate.
     let argon = Argon2::new(
         Algorithm::Argon2id,
         Version::default(),
@@ -834,16 +917,23 @@ fn derive_aead_key(
         .hash_password_into(passphrase.as_bytes(), &salt, &mut intermediate)
         .map_err(BlobError::Argon2)?;
 
-    // Stage 2: HKDF-Expand only (intermediate is already a high-entropy
-    // 32-byte secret — no extract needed; that's what `from_prk` is for).
-    let info_str = info::at_rest(&profile_id.to_string());
+    // Stage 2: HKDF-Expand the intermediate twice under distinct info strings
+    // (intermediate is already a high-entropy secret — no extract needed; that's
+    // what `from_prk` is for). The `at_rest` expand is identical to the pre-M14
+    // derivation; the `share_index` expand is the additive M14 sibling.
+    let pid = profile_id.to_string();
     let hkdf = HkdfSha384::from_prk(&intermediate).map_err(BlobError::Hkdf)?;
     intermediate.zeroize();
 
-    let mut key = [0u8; AEAD_KEY_LEN];
-    hkdf.expand(info_str.as_bytes(), &mut key)
+    let mut at_rest_key = [0u8; AEAD_KEY_LEN];
+    hkdf.expand(info::at_rest(&pid).as_bytes(), &mut at_rest_key)
         .map_err(BlobError::Hkdf)?;
-    Ok(key)
+
+    let mut index_key = [0u8; INDEX_KEY_LEN];
+    hkdf.expand(info::share_index(&pid).as_bytes(), &mut index_key)
+        .map_err(BlobError::Hkdf)?;
+
+    Ok((at_rest_key, index_key))
 }
 
 #[cfg(test)]
@@ -1135,6 +1225,43 @@ mod tests {
         let blob = key.seal(&seeds).unwrap();
         let recovered = open(&blob, pp, pid, test_params()).unwrap().seeds;
         assert_eq!(recovered.mnemonic.to_phrase(), seeds.mnemonic.to_phrase());
+    }
+
+    #[test]
+    fn index_key_is_sibling_distinct_deterministic_and_free_on_unlock() {
+        // M14 D2: the share-index key is derived as a sibling of the at-rest key
+        // from the SAME Argon2id run. Properties that must hold:
+        //   1. the at-rest half is byte-identical to the pre-M14 single-key
+        //      derivation (no existing blob breaks);
+        //   2. the index key is distinct from the at-rest key (domain separated);
+        //   3. derivation is deterministic for the same (passphrase, profile_id);
+        //   4. the Unlock path (`open`) recovers the SAME index key for free.
+        ensure_oxicrypt_initialized();
+        let pid = Uuid::new_v4();
+        let pp = "correct horse battery staple table mountain";
+        let p = test_params();
+        let seeds = fresh_seeds();
+
+        let (seal_key, index_key) = SealingKey::derive_session(pp, pid, p).unwrap();
+        // (1) at-rest half unchanged vs. the solo derivation.
+        let solo = derive_aead_key(pp, pid, p).unwrap();
+        assert_eq!(*seal_key.0, solo, "at-rest key must be byte-identical");
+        // (2) index distinct from at-rest.
+        assert_ne!(
+            index_key.to_bytes(),
+            solo,
+            "index key must be domain-separated"
+        );
+        // (3) deterministic.
+        let (_, index_key2) = SealingKey::derive_session(pp, pid, p).unwrap();
+        assert_eq!(index_key.to_bytes(), index_key2.to_bytes());
+        // (4) the Unlock path yields the same index key, no second Argon2id run.
+        let blob = seal_key.seal(&seeds).unwrap();
+        let opened = open(&blob, pp, pid, p).unwrap();
+        assert_eq!(opened.index_key.to_bytes(), index_key.to_bytes());
+        // A different profile_id derives a different index key (salt separation).
+        let (_, other) = SealingKey::derive_session(pp, Uuid::new_v4(), p).unwrap();
+        assert_ne!(other.to_bytes(), index_key.to_bytes());
     }
 
     #[test]

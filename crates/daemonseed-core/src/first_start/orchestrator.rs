@@ -17,7 +17,7 @@ use crate::identity::mnemonic::{Mnemonic, MnemonicError};
 use crate::passphrase::strength::{Strength, estimate};
 use crate::profile::config::{ArgonParams, ProfileConfig, ProfileConfigError};
 use crate::storage::recovery_file::{self, RecoveryFileError};
-use crate::storage::seeds::{BlobError, SealingKey, Seeds};
+use crate::storage::seeds::{BlobError, IndexKey, SealingKey, Seeds};
 
 // ── Phase markers ────────────────────────────────────────────────────────
 
@@ -133,6 +133,10 @@ struct Inner {
     // seal) so the write-through re-seals without a second Argon2id run. None on
     // the placeholder; zeroizes on drop.
     seal_key: Option<SealingKey>,
+    // The share-index key (M14), derived as a sibling of `seal_key` from the
+    // same single Argon2id run during `initialize` / `recover`. None on the
+    // placeholder; zeroizes on drop.
+    index_key: Option<IndexKey>,
 }
 
 /// Type-state first-start state machine. `S` is the phase marker.
@@ -164,6 +168,7 @@ impl FirstStart<Welcome> {
                 identity_handle: None,
                 seeds: None,
                 seal_key: None,
+                index_key: None,
             },
             _state: PhantomData,
         }
@@ -215,11 +220,15 @@ impl FirstStart<Welcome> {
         // (C3) at-rest blob. Derive the cached at-rest key once (M13
         // write-through) and seal with it, so the stashed `SealingKey` is
         // byte-identical to the key that produced `blob_bytes` — the running
-        // client re-seals on each mutation without re-running Argon2id.
+        // client re-seals on each mutation without re-running Argon2id. The
+        // share-index key (M14) falls out of the same Argon2id run.
         let seeds = Seeds::new(mnemonic.clone());
-        let seal_key =
-            SealingKey::derive(passphrase, profile_config.profile_id, profile_config.argon2)
-                .map_err(FirstStartError::BlobSeal)?;
+        let (seal_key, index_key) = SealingKey::derive_session(
+            passphrase,
+            profile_config.profile_id,
+            profile_config.argon2,
+        )
+        .map_err(FirstStartError::BlobSeal)?;
         let blob_bytes = seal_key.seal(&seeds).map_err(FirstStartError::BlobSeal)?;
 
         // (C32 / C30) recovery file under the same passphrase, distinct
@@ -243,6 +252,7 @@ impl FirstStart<Welcome> {
                 identity_handle: Some(identity_handle),
                 seeds: Some(seeds),
                 seal_key: Some(seal_key),
+                index_key: Some(index_key),
             },
             _state: PhantomData,
         })
@@ -326,11 +336,16 @@ impl FirstStart<Welcome> {
 
         // (C3) re-seal the at-rest blob under the new profile_id. Derive the
         // cached at-rest key once (M13 write-through) and seal with it so the
-        // stashed `SealingKey` matches `blob_bytes` byte-for-byte.
+        // stashed `SealingKey` matches `blob_bytes` byte-for-byte. The
+        // share-index key (M14) is derived from the same Argon2id run, under
+        // the new profile_id.
         let seeds = Seeds::new(mnemonic);
-        let seal_key =
-            SealingKey::derive(passphrase, profile_config.profile_id, profile_config.argon2)
-                .map_err(FirstStartError::BlobSeal)?;
+        let (seal_key, index_key) = SealingKey::derive_session(
+            passphrase,
+            profile_config.profile_id,
+            profile_config.argon2,
+        )
+        .map_err(FirstStartError::BlobSeal)?;
         let blob_bytes = seal_key.seal(&seeds).map_err(FirstStartError::BlobSeal)?;
 
         // Land directly in BackupVerified: the phrase was the input, so backup
@@ -347,6 +362,7 @@ impl FirstStart<Welcome> {
                 identity_handle: Some(identity_handle),
                 seeds: Some(seeds),
                 seal_key: Some(seal_key),
+                index_key: Some(index_key),
             },
             _state: PhantomData,
         })
@@ -531,6 +547,10 @@ impl FirstStart<Ready> {
                 .inner
                 .seal_key
                 .expect("initialize / recover always stashes the seal key"),
+            index_key: self
+                .inner
+                .index_key
+                .expect("initialize / recover always stashes the index key"),
         }
     }
 }
@@ -560,6 +580,11 @@ pub struct SessionMaterials {
     /// running client re-seal on every persist-worthy mutation without re-running
     /// Argon2id (M13). Zeroizes on drop; never logged, never persisted.
     pub seal_key: SealingKey,
+    /// The cached share-index key (M14), derived as a sibling of `seal_key` from
+    /// the same Argon2id run. Opens the redb share index so the running client
+    /// can activate the M8 indexer against TUI-defined share roots. Zeroizes on
+    /// drop; never logged, never persisted.
+    pub index_key: IndexKey,
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────

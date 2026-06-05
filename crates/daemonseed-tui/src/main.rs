@@ -205,6 +205,7 @@ fn run(
                         Ok(opened) => match session_materials_from_unlock(
                             opened.seeds,
                             opened.key,
+                            opened.index_key,
                             config,
                             blob,
                             Vec::new(),
