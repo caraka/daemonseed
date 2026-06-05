@@ -472,10 +472,15 @@ pub struct App {
     /// The single-shot slot for an interactive join; [`Self::take_pending_join`]
     /// drains it first, then [`Self::pending_joins`].
     pending_join: Option<String>,
-    /// Single-shot slot for a Define-Share request (M14); the binary drains it
-    /// via [`Self::take_pending_share_define`], derives the index path + key
-    /// from the session, and sends `NetCommand::DefineShare`.
+    /// Single-shot slot for an interactive Define-Share request (M14); the
+    /// binary drains it via [`Self::take_pending_share_define`], derives the
+    /// index path + key from the session, and sends `NetCommand::DefineShare`.
     pending_share_define: Option<ShareDefineRequest>,
+    /// Queued share re-definitions to replay on Unlock (M14, ISC-C21): one per
+    /// persisted share root, drained after the single-shot slot so a returning
+    /// daemon re-indexes its remembered roots without re-typing. FIFO preserves
+    /// definition order. Mirrors [`Self::pending_joins`] for circles.
+    pending_share_defines: std::collections::VecDeque<ShareDefineRequest>,
     /// Queued circle-rejoins to forward to the net actor, one per launch-time
     /// remembered circle (M13 persistence, ISC-C59). Filled on Unlock from
     /// `seeds.circles()` and drained one-per-tick by the same binary loop that
@@ -657,6 +662,7 @@ impl App {
             server_sel: 0,
             pending_join: None,
             pending_share_define: None,
+            pending_share_defines: std::collections::VecDeque::new(),
             pending_joins: std::collections::VecDeque::new(),
             pending_chat: None,
             pending_public_room: None,
@@ -761,9 +767,15 @@ impl App {
 
     /// Take a queued Define-Share request (M14, drained once by the binary,
     /// which derives the index path + key from the session and sends
-    /// `NetCommand::DefineShare`).
+    /// `NetCommand::DefineShare`). The interactive single-shot slot wins; with it
+    /// empty, the next queued Unlock re-definition (ISC-C21) is popped FIFO — so
+    /// the binary's once-per-tick drain replays all remembered roots over
+    /// successive ticks without any dispatch-loop change (mirrors
+    /// [`Self::take_pending_join`]).
     pub fn take_pending_share_define(&mut self) -> Option<ShareDefineRequest> {
-        self.pending_share_define.take()
+        self.pending_share_define
+            .take()
+            .or_else(|| self.pending_share_defines.pop_front())
     }
 
     /// The current Define-Share input buffer, for rendering the box (M14).
@@ -873,6 +885,17 @@ impl App {
         }
         if !self.pending_joins.is_empty() {
             self.circle_status = CircleStatus::Joining;
+        }
+        // M14 persistence (ISC-C21): re-index every remembered share root next
+        // launch. Queue one re-definition per persisted entry (FIFO); the binary
+        // drains `take_pending_share_define` once per tick, so these dispatch as
+        // `NetCommand::DefineShare` naturally — and because they ride the queue
+        // (not `on_key_define_share`), they re-index without re-persisting.
+        for sh in session.seeds.shares() {
+            self.pending_share_defines.push_back(ShareDefineRequest {
+                root: std::path::PathBuf::from(&sh.root),
+                label: sh.label.clone(),
+            });
         }
         self.session = Some(session);
         self.unlock_input.clear();
@@ -2037,6 +2060,16 @@ impl App {
                     return;
                 }
                 self.share_input.clear();
+                // D3 write-through (ISC-C21): remember the root in the at-rest
+                // blob so it re-indexes next launch — persistence of config, not
+                // of shared content (no-client-history invariant holds). The
+                // re-emit on Unlock goes through pending_share_defines, which
+                // does NOT re-persist, so this is the only persist site.
+                let root_str = root.to_string_lossy().into_owned();
+                if let Some(seeds) = self.seeds.as_mut() {
+                    seeds.add_share(root_str, label.clone());
+                    self.persist_seeds();
+                }
                 self.pending_share_define = Some(ShareDefineRequest { root, label });
                 self.status = Some("share added — indexing…".to_owned());
                 // Return to the My-shares view so the new root's indexer status
@@ -3501,6 +3534,95 @@ mod tests {
             recovered.display_name().map(str::to_owned),
             name,
             "persisted blob carries the chosen display name"
+        );
+    }
+
+    /// M14 (ISC-C21): defining a share persists its root in the at-rest blob
+    /// (write-through) AND queues a DefineShare command for the actor.
+    #[test]
+    fn defining_a_share_persists_root_and_queues_the_command() {
+        use daemonseed_core::storage::seeds;
+
+        let mut app = drive_to_main();
+        let pid = app
+            .session()
+            .expect("session present")
+            .profile_config
+            .profile_id;
+        let _ = app.take_pending_blob_update(); // drain first-start's write-through
+
+        // Tab Chat → JoinCircle → Mute → Shares → DefineShare, then define a dir.
+        for _ in 0..4 {
+            app.on_key(press(KeyCode::Tab));
+        }
+        assert_eq!(app.main_focus(), MainFocus::DefineShare);
+        let dir = std::env::temp_dir();
+        for ch in format!("{}|My Docs", dir.display()).chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        app.on_key(press(KeyCode::Enter));
+
+        let root_str = dir.to_string_lossy().into_owned();
+        // Live seeds carry the share.
+        assert!(
+            app.seeds
+                .as_ref()
+                .expect("seeds present")
+                .shares()
+                .iter()
+                .any(|s| s.root == root_str),
+            "live seeds carries the share root"
+        );
+        // The persisted blob carries it too.
+        let bytes = app
+            .take_pending_blob_update()
+            .expect("defining a share queues a blob re-seal");
+        let recovered = seeds::open(&bytes, WT_PASSPHRASE, pid, wt_params())
+            .expect("re-sealed blob opens")
+            .seeds;
+        assert_eq!(recovered.shares().len(), 1);
+        assert_eq!(recovered.shares()[0].root, root_str);
+        assert_eq!(recovered.shares()[0].label.as_deref(), Some("My Docs"));
+        // And a DefineShare command is queued for the actor.
+        assert!(
+            app.take_pending_share_define().is_some(),
+            "DefineShare queued for the actor"
+        );
+    }
+
+    /// M14 (ISC-C21): on Unlock every persisted share root is replayed as a
+    /// DefineShare (FIFO), so a returning daemon re-indexes without re-typing —
+    /// and the replay rides the queue, so it does NOT re-persist.
+    #[test]
+    fn unlock_reemits_define_share_per_persisted_root() {
+        let _ = oxicrypt_module::initialize();
+        let mut materials = drive_to_main().session_take_for_test();
+        materials
+            .seeds
+            .add_share("/data/alpha", Some("Alpha".to_owned()));
+        materials.seeds.add_share("/data/beta", None);
+
+        let mut app = App::new();
+        app.on_unlock_success(materials);
+
+        let first = app
+            .take_pending_share_define()
+            .expect("first persisted share re-emitted");
+        assert_eq!(first.root, std::path::PathBuf::from("/data/alpha"));
+        assert_eq!(first.label.as_deref(), Some("Alpha"));
+        let second = app
+            .take_pending_share_define()
+            .expect("second persisted share re-emitted");
+        assert_eq!(second.root, std::path::PathBuf::from("/data/beta"));
+        assert_eq!(second.label, None);
+        assert!(
+            app.take_pending_share_define().is_none(),
+            "exactly the two persisted roots replayed"
+        );
+        // The replay did not re-persist (no blob update queued by the restore).
+        assert!(
+            app.take_pending_blob_update().is_none(),
+            "Unlock replay re-indexes without re-persisting"
         );
     }
 

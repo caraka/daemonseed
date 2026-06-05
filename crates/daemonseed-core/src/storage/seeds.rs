@@ -171,6 +171,10 @@ impl CounterState {
 /// - `circle <hex(entropy)> <hex(label)>` — a remembered circle to rejoin
 ///   (ISC-C59 persistence, M13); both fields hex-encoded so spaces/newlines in
 ///   the entropy or label can never split the line.
+/// - `share <hex(root)> <hex(label)>` — a remembered local share root to
+///   re-index on next launch (ISC-C21 persistence, M14); both fields
+///   hex-encoded (an empty label hex means "no label"). Client-local only —
+///   no wire message carries it (ISC-A-C3).
 ///
 /// A bare-phrase payload (no extra lines, the legacy form) parses with default
 /// counters and empty lists, so existing blobs open without re-enrollment.
@@ -212,6 +216,24 @@ pub struct Seeds {
     /// here encrypted under the at-rest blob's two-stage KDF; a per-circle
     /// opt-out ("ephemeral circle") is the deferred B-path.
     pub circles: Vec<PersistedCircle>,
+    /// The set of local share roots to re-index on next launch (ISC-C21
+    /// persistence, M14). Each entry carries the directory path plus an optional
+    /// client-local label. Insertion order is preserved. Mutate via
+    /// [`Self::add_share`] / [`Self::remove_share`]. Client-local only — no wire
+    /// message carries it (ISC-A-C3); it is persistence of *configuration*, not
+    /// of shared content, so the no-client-history invariant holds.
+    pub shares: Vec<PersistedShare>,
+}
+
+/// One remembered local share root in the at-rest blob (ISC-C21 persistence,
+/// M14). Holds the share-root directory path and an optional client-local
+/// label. Neither field ever leaves the encrypted blob (ISC-A-C3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedShare {
+    /// The shared directory path, as the user entered it.
+    pub root: String,
+    /// Optional client-local label; `None` falls back to the path at render.
+    pub label: Option<String>,
 }
 
 /// One remembered circle in the at-rest blob (ISC-C59 persistence, M13).
@@ -244,6 +266,7 @@ impl core::fmt::Debug for Seeds {
             // show; circle entropy is a secret, so surface only the count.
             .field("display_name", &self.display_name)
             .field("circles", &self.circles.len())
+            .field("shares", &self.shares.len())
             .finish()
     }
 }
@@ -259,6 +282,7 @@ impl Seeds {
             hidden_shares: BTreeSet::new(),
             display_name: None,
             circles: Vec::new(),
+            shares: Vec::new(),
         }
     }
 
@@ -376,6 +400,33 @@ impl Seeds {
         false
     }
 
+    /// The remembered local share roots, in insertion order (ISC-C21, M14).
+    pub fn shares(&self) -> &[PersistedShare] {
+        &self.shares
+    }
+
+    /// Remember a local share root so it re-indexes next launch (ISC-C21, M14).
+    /// Returns `true` if newly added, `false` if a share with the same `root`
+    /// is already remembered (idempotent — re-defining a known root does not
+    /// duplicate it). Both fields are hex-encoded at serialization, so any path
+    /// or label survives the line-based blob intact.
+    pub fn add_share(&mut self, root: impl Into<String>, label: Option<String>) -> bool {
+        let root = root.into();
+        if self.shares.iter().any(|s| s.root == root) {
+            return false;
+        }
+        self.shares.push(PersistedShare { root, label });
+        true
+    }
+
+    /// Forget a remembered share root, keyed on its path (M14). Returns `true`
+    /// if one was removed.
+    pub fn remove_share(&mut self, root: &str) -> bool {
+        let before = self.shares.len();
+        self.shares.retain(|s| s.root != root);
+        self.shares.len() != before
+    }
+
     fn to_plaintext(&self) -> String {
         let mut s = self.mnemonic.to_phrase();
         if self.counters.send_counter != 0 {
@@ -405,6 +456,16 @@ impl Seeds {
                 hex::encode(c.label.as_bytes()),
             ));
         }
+        // Shares (ISC-C21 persistence, M14): both fields hex-encoded so a path
+        // or label with spaces/newlines never splits the line. A `None` label
+        // serializes as empty hex. Layout: `share <hex(root)> <hex(label)>`.
+        for sh in &self.shares {
+            s.push_str(&format!(
+                "\nshare {} {}",
+                hex::encode(sh.root.as_bytes()),
+                hex::encode(sh.label.as_deref().unwrap_or("").as_bytes()),
+            ));
+        }
         s
     }
 
@@ -417,6 +478,7 @@ impl Seeds {
         let mut hidden_shares = BTreeSet::new();
         let mut display_name: Option<String> = None;
         let mut circles: Vec<PersistedCircle> = Vec::new();
+        let mut shares: Vec<PersistedShare> = Vec::new();
         for line in lines {
             // Mute / hide directives take the entire rest of the line as the
             // handle so a display name containing spaces is never truncated.
@@ -448,6 +510,23 @@ impl Seeds {
                 circles.push(PersistedCircle { entropy, label });
                 continue;
             }
+            // Share (ISC-C21 persistence, M14): `share <hex(root)> <hex(label)>`.
+            // An empty label hex decodes to `None`.
+            if let Some(rest) = line.strip_prefix("share ") {
+                let (root_hex, label_hex) =
+                    rest.split_once(' ').ok_or(BlobError::InvalidPlaintext)?;
+                let root = hex::decode(root_hex)
+                    .ok()
+                    .and_then(|b| String::from_utf8(b).ok())
+                    .ok_or(BlobError::InvalidPlaintext)?;
+                let label_str = hex::decode(label_hex)
+                    .ok()
+                    .and_then(|b| String::from_utf8(b).ok())
+                    .ok_or(BlobError::InvalidPlaintext)?;
+                let label = (!label_str.is_empty()).then_some(label_str);
+                shares.push(PersistedShare { root, label });
+                continue;
+            }
             let mut parts = line.splitn(3, ' ');
             match parts.next() {
                 Some("send-counter") => {
@@ -470,6 +549,7 @@ impl Seeds {
             hidden_shares,
             display_name,
             circles,
+            shares,
         })
     }
 }
@@ -1159,6 +1239,40 @@ mod tests {
         assert_eq!(circles[0].label, "Book Club");
         assert_eq!(circles[1].entropy, "another shared secret phrase");
         assert_eq!(circles[1].label, "Ops Room");
+    }
+
+    #[test]
+    fn shares_round_trip_through_blob_with_spaces_and_optional_label() {
+        // A path with spaces + a labelled and an unlabelled share must survive a
+        // seal/open round-trip intact, in insertion order (ISC-C21, M14). The
+        // empty-label entry must come back as `None`, not `Some("")`.
+        ensure_oxicrypt_initialized();
+        let pid = Uuid::new_v4();
+        let pp = "correct horse battery staple table mountain";
+        let mut seeds = fresh_seeds();
+        assert!(seeds.add_share("/home/me/My Documents", Some("Docs".to_owned())));
+        assert!(seeds.add_share("/srv/shared photos", None));
+        let blob = seal(&seeds, pp, pid, test_params()).unwrap();
+        let recovered = open(&blob, pp, pid, test_params()).unwrap().seeds;
+        let shares = recovered.shares();
+        assert_eq!(shares.len(), 2);
+        assert_eq!(shares[0].root, "/home/me/My Documents");
+        assert_eq!(shares[0].label.as_deref(), Some("Docs"));
+        assert_eq!(shares[1].root, "/srv/shared photos");
+        assert_eq!(shares[1].label, None);
+    }
+
+    #[test]
+    fn add_share_is_idempotent_on_root_and_remove_works() {
+        let mut seeds = fresh_seeds();
+        assert!(seeds.add_share("/data/share", Some("One".to_owned())));
+        // Same root → no duplicate, even with a different label.
+        assert!(!seeds.add_share("/data/share", Some("Two".to_owned())));
+        assert_eq!(seeds.shares().len(), 1);
+        assert_eq!(seeds.shares()[0].label.as_deref(), Some("One"));
+        assert!(seeds.remove_share("/data/share"));
+        assert!(!seeds.remove_share("/data/share")); // already gone
+        assert!(seeds.shares().is_empty());
     }
 
     #[test]
