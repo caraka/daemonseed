@@ -18,6 +18,6 @@ pub mod resolve;
 pub use config::{ArgonParams, ProfileConfig, ProfileConfigError};
 pub use persist::{
     PersistError, UnlockError, blob_exists, blob_path, config_path, dseed_path, load_for_unlock,
-    session_materials_from_unlock, write_first_start,
+    session_materials_from_unlock, write_first_start, write_seeds_blob,
 };
 pub use resolve::{ResolveArgs, ResolveError, ResolvedProfileRoot};

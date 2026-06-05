@@ -14,7 +14,7 @@ use std::time::Duration;
 use daemonseed_core::profile::resolve::resolve;
 use daemonseed_core::profile::{
     ResolveArgs, ResolvedProfileRoot, load_for_unlock, session_materials_from_unlock,
-    write_first_start,
+    write_first_start, write_seeds_blob,
 };
 use daemonseed_core::storage::seeds;
 use daemonseed_server::kats::CNSA_2_0_KATS;
@@ -185,6 +185,17 @@ fn run(
             }
         }
 
+        // M13 write-through: the running client re-sealed its at-rest payload
+        // (display name / mute / hide / circles) under the cached SealingKey and
+        // queued the refreshed blob bytes. Overwrite `seeds.blob` only — the
+        // `.dseed` and config never change on a settings mutation. Distinct from
+        // the first-start persist above (which writes config + blob + `.dseed`).
+        if let Some(bytes) = app.take_pending_blob_update()
+            && let Err(e) = write_seeds_blob(&profile_root, &bytes)
+        {
+            app.set_status(format!("could not save: {e}"));
+        }
+
         // Item E / ISC-C3: service a queued Unlock attempt — load the on-disk
         // blob, decrypt with the typed passphrase, reconstruct SessionMaterials.
         if let Some(passphrase) = app.take_pending_unlock() {
@@ -193,6 +204,7 @@ fn run(
                     match seeds::open(&blob, &passphrase, config.profile_id, config.argon2) {
                         Ok(opened) => match session_materials_from_unlock(
                             opened.seeds,
+                            opened.key,
                             config,
                             blob,
                             Vec::new(),

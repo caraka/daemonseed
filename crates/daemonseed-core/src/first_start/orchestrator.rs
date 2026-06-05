@@ -17,7 +17,7 @@ use crate::identity::mnemonic::{Mnemonic, MnemonicError};
 use crate::passphrase::strength::{Strength, estimate};
 use crate::profile::config::{ArgonParams, ProfileConfig, ProfileConfigError};
 use crate::storage::recovery_file::{self, RecoveryFileError};
-use crate::storage::seeds::{self, BlobError, Seeds};
+use crate::storage::seeds::{BlobError, SealingKey, Seeds};
 
 // ── Phase markers ────────────────────────────────────────────────────────
 
@@ -122,6 +122,17 @@ struct Inner {
     // is already zeroed by that phase, so the handle cannot be re-derived later
     // — it must be computed and stashed up front).
     identity_handle: Option<Handle>,
+    // The live `Seeds` payload sealed into `blob_bytes`, kept so the running
+    // client can mutate + re-seal it for the M13 write-through. Stashed during
+    // `initialize` / `recover` (a clone of the payload that produced the blob);
+    // None on the `Welcome` placeholder. Carries the mnemonic — drops/zeroizes
+    // with the state machine if first-start aborts.
+    seeds: Option<Seeds>,
+    // The at-rest AEAD key matching `blob_bytes`, derived once during
+    // `initialize` / `recover` (same passphrase / profile_id / params as the
+    // seal) so the write-through re-seals without a second Argon2id run. None on
+    // the placeholder; zeroizes on drop.
+    seal_key: Option<SealingKey>,
 }
 
 /// Type-state first-start state machine. `S` is the phase marker.
@@ -151,6 +162,8 @@ impl FirstStart<Welcome> {
                 display_name: None,
                 bootstrap: None,
                 identity_handle: None,
+                seeds: None,
+                seal_key: None,
             },
             _state: PhantomData,
         }
@@ -199,15 +212,15 @@ impl FirstStart<Welcome> {
         // (C36 / C14) fresh profile config.
         let profile_config = ProfileConfig::new_for_first_start(argon2_params);
 
-        // (C3) at-rest blob.
+        // (C3) at-rest blob. Derive the cached at-rest key once (M13
+        // write-through) and seal with it, so the stashed `SealingKey` is
+        // byte-identical to the key that produced `blob_bytes` — the running
+        // client re-seals on each mutation without re-running Argon2id.
         let seeds = Seeds::new(mnemonic.clone());
-        let blob_bytes = seeds::seal(
-            &seeds,
-            passphrase,
-            profile_config.profile_id,
-            profile_config.argon2,
-        )
-        .map_err(FirstStartError::BlobSeal)?;
+        let seal_key =
+            SealingKey::derive(passphrase, profile_config.profile_id, profile_config.argon2)
+                .map_err(FirstStartError::BlobSeal)?;
+        let blob_bytes = seal_key.seal(&seeds).map_err(FirstStartError::BlobSeal)?;
 
         // (C32 / C30) recovery file under the same passphrase, distinct
         // HKDF info string (handled by `recovery_file::seal`).
@@ -228,6 +241,8 @@ impl FirstStart<Welcome> {
                 display_name: None,
                 bootstrap: None,
                 identity_handle: Some(identity_handle),
+                seeds: Some(seeds),
+                seal_key: Some(seal_key),
             },
             _state: PhantomData,
         })
@@ -309,15 +324,14 @@ impl FirstStart<Welcome> {
         )
         .map_err(FirstStartError::RecoveryFile)?;
 
-        // (C3) re-seal the at-rest blob under the new profile_id.
+        // (C3) re-seal the at-rest blob under the new profile_id. Derive the
+        // cached at-rest key once (M13 write-through) and seal with it so the
+        // stashed `SealingKey` matches `blob_bytes` byte-for-byte.
         let seeds = Seeds::new(mnemonic);
-        let blob_bytes = seeds::seal(
-            &seeds,
-            passphrase,
-            profile_config.profile_id,
-            profile_config.argon2,
-        )
-        .map_err(FirstStartError::BlobSeal)?;
+        let seal_key =
+            SealingKey::derive(passphrase, profile_config.profile_id, profile_config.argon2)
+                .map_err(FirstStartError::BlobSeal)?;
+        let blob_bytes = seal_key.seal(&seeds).map_err(FirstStartError::BlobSeal)?;
 
         // Land directly in BackupVerified: the phrase was the input, so backup
         // is verified-by-possession. `mnemonic: None` — the supplied phrase has
@@ -331,6 +345,8 @@ impl FirstStart<Welcome> {
                 display_name: None,
                 bootstrap: None,
                 identity_handle: Some(identity_handle),
+                seeds: Some(seeds),
+                seal_key: Some(seal_key),
             },
             _state: PhantomData,
         })
@@ -490,6 +506,16 @@ impl FirstStart<Ready> {
             .identity_handle
             .expect("initialize always derives the identity handle")
             .with_display_name(display_name.clone());
+        // Fold the chosen display name into the live `Seeds` so it is the value
+        // the first write-through (M13) re-seals — the running client carries
+        // the same payload that produced `at_rest_blob_bytes`, with the name
+        // attached. (The first-start blob itself was sealed before the name was
+        // chosen; the binary persists the refreshed blob via the write-through.)
+        let mut seeds = self
+            .inner
+            .seeds
+            .expect("initialize / recover always stashes the live seeds");
+        seeds.set_display_name(display_name.clone());
         SessionMaterials {
             profile_config: self.inner.profile_config,
             at_rest_blob_bytes: self.inner.blob_bytes,
@@ -500,6 +526,11 @@ impl FirstStart<Ready> {
                 .inner
                 .bootstrap
                 .expect("Ready phase always holds bootstrap"),
+            seeds,
+            seal_key: self
+                .inner
+                .seal_key
+                .expect("initialize / recover always stashes the seal key"),
         }
     }
 }
@@ -520,6 +551,15 @@ pub struct SessionMaterials {
     /// identity — distinct from `display_name`, which is just the name part.
     pub handle: Handle,
     pub bootstrap: BootstrapAnchor,
+    /// The live at-rest payload the running client mutates and re-seals for the
+    /// M13 write-through (display name, mute / hide lists, circles). At
+    /// first-start it carries the chosen display name; on Unlock it is the
+    /// decrypted on-disk payload ([`crate::storage::seeds::Opened::seeds`]).
+    pub seeds: Seeds,
+    /// The cached at-rest AEAD key matching the blob `seeds` seals into. Lets the
+    /// running client re-seal on every persist-worthy mutation without re-running
+    /// Argon2id (M13). Zeroizes on drop; never logged, never persisted.
+    pub seal_key: SealingKey,
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────
@@ -535,6 +575,7 @@ fn phrases_match(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::seeds;
 
     fn init_oxicrypt() {
         let _ = oxicrypt_module::initialize();

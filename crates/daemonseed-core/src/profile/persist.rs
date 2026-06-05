@@ -23,7 +23,7 @@ use crate::first_start::SessionMaterials;
 use crate::handle::Handle;
 use crate::identity::keys::{Identity, derive_identity_keys};
 use crate::profile::config::{ProfileConfig, ProfileConfigError};
-use crate::storage::seeds::Seeds;
+use crate::storage::seeds::{SealingKey, Seeds};
 
 /// Uniform at-rest seeds-blob filename at the profile root (ISC-C3).
 pub const BLOB_FILENAME: &str = "seeds.blob";
@@ -147,6 +147,29 @@ pub fn write_first_start(
     Ok(dseed_p)
 }
 
+/// Overwrite the at-rest seeds blob at `profile_root` (M13 write-through).
+///
+/// Unlike [`write_first_start`], this writes *only* `seeds.blob` and always
+/// clobbers: it is the post-first-start re-seal path, where the running client
+/// has mutated its [`Seeds`] (display name, mute / hide lists, circles), re-sealed
+/// under the cached [`SealingKey`], and needs the refreshed blob on disk. The
+/// `.dseed` recovery file and the config are deliberately left untouched — the
+/// mnemonic and profile params do not change on a write-through, only the
+/// settings payload. The no-clobber guard (ISC-A-C28) does not apply here: by the
+/// time a write-through runs the profile already exists and the user is unlocked,
+/// so overwriting their own blob with their own newer state is the intent.
+pub fn write_seeds_blob(profile_root: &Path, bytes: &[u8]) -> Result<(), PersistError> {
+    std::fs::create_dir_all(profile_root).map_err(|source| PersistError::Io {
+        path: profile_root.to_path_buf(),
+        source,
+    })?;
+    let blob_p = blob_path(profile_root);
+    std::fs::write(&blob_p, bytes).map_err(|source| PersistError::Io {
+        path: blob_p.clone(),
+        source,
+    })
+}
+
 /// Load `daemonseed.toml` + the raw `seeds.blob` bytes for the daily-login
 /// Unlock flow (ISC-C3 / Item E). The passphrase-decrypt itself is
 /// [`crate::storage::seeds::open`]; this just reads the on-disk inputs it needs
@@ -197,35 +220,45 @@ impl std::error::Error for UnlockError {}
 /// Reconstruct [`SessionMaterials`] from a decrypted blob + profile config, for
 /// the daily-login Unlock flow (ISC-C3 / Item E). The handle is re-derived from
 /// the recovered mnemonic (so the hash prefix is byte-identical to enrollment);
-/// the bootstrap relay comes from the persisted config (ISC-C37). The recovered
-/// `Seeds` is consumed; the mnemonic is zeroed when this returns.
+/// the bootstrap relay comes from the persisted config (ISC-C37).
+///
+/// `seeds` is the decrypted at-rest payload ([`crate::storage::seeds::Opened::seeds`])
+/// and `seal_key` its cached AEAD key ([`crate::storage::seeds::Opened::key`]),
+/// both threaded into the returned materials so the running client can re-seal on
+/// every persist-worthy mutation (M13 write-through) — and so the persisted
+/// display name (ISC-C4b) is restored rather than reset each login.
 ///
 /// The blob and recovery bytes in the returned materials are the on-disk bytes
 /// the caller already holds — passed through so the type matches the cold-start
 /// handoff without re-sealing. Unlock never re-writes the profile.
 pub fn session_materials_from_unlock(
     seeds: Seeds,
+    seal_key: SealingKey,
     config: ProfileConfig,
     blob_bytes: Vec<u8>,
     recovery_file_bytes: Vec<u8>,
 ) -> Result<SessionMaterials, UnlockError> {
     let bootstrap: BootstrapAnchor = config.bootstrap.clone().ok_or(UnlockError::NoBootstrap)?;
-    // Re-derive the floor handle from the recovered mnemonic. The display name
-    // is not auto-restored on daily login (it is not persisted at rest — only
-    // the security-bearing identity hash is recovered); the user presents under
-    // their floor handle until they re-set a display name. The hash prefix is
-    // identical to enrollment, which is the load-bearing identity property.
+    // Re-derive the identity handle from the recovered mnemonic (the hash prefix
+    // is identical to enrollment — the load-bearing identity property). The
+    // persisted display name (ISC-C4b, M13) is restored from the blob and
+    // attached to the handle, so the user presents under the same name across
+    // daily logins instead of falling back to the floor handle.
     let keys = derive_identity_keys(&seeds.mnemonic, Identity::Primary)
         .map_err(|e| UnlockError::IdentityDerivation(e.to_string()))?;
+    let display_name = seeds.display_name().map(str::to_owned);
     let handle = Handle::from_pubkey(None, keys.signing.public_key())
-        .map_err(|e| UnlockError::IdentityDerivation(e.to_string()))?;
+        .map_err(|e| UnlockError::IdentityDerivation(e.to_string()))?
+        .with_display_name(display_name.clone());
     Ok(SessionMaterials {
         profile_config: config,
         at_rest_blob_bytes: blob_bytes,
         recovery_file_bytes,
-        display_name: None,
+        display_name,
         handle,
         bootstrap,
+        seeds,
+        seal_key,
     })
 }
 
@@ -368,8 +401,9 @@ mod tests {
         write_first_start(&tmp.path, &m, None, false).unwrap();
         let (config, blob) = load_for_unlock(&tmp.path).unwrap();
         let opened = seeds::open(&blob, STRONG, config.profile_id, config.argon2).unwrap();
-        let recovered = session_materials_from_unlock(opened.seeds, config, blob.clone(), vec![])
-            .expect("unlock reconstructs materials");
+        let recovered =
+            session_materials_from_unlock(opened.seeds, opened.key, config, blob.clone(), vec![])
+                .expect("unlock reconstructs materials");
         assert_eq!(
             recovered.handle.hash_prefix(),
             &enrolled_prefix,
@@ -391,7 +425,7 @@ mod tests {
         let (mut config, blob) = load_for_unlock(&tmp.path).unwrap();
         config.bootstrap = None; // simulate a legacy profile
         let opened = seeds::open(&blob, STRONG, config.profile_id, config.argon2).unwrap();
-        match session_materials_from_unlock(opened.seeds, config, blob, vec![]) {
+        match session_materials_from_unlock(opened.seeds, opened.key, config, blob, vec![]) {
             Err(UnlockError::NoBootstrap) => {}
             other => panic!("expected NoBootstrap, got {other:?}"),
         }

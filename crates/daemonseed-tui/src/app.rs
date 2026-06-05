@@ -8,6 +8,7 @@ use daemonseed_core::backoff::CloseCause;
 use daemonseed_core::first_start::SessionMaterials;
 use daemonseed_core::handle::{DisplayMode, Handle};
 use daemonseed_core::profile::config::ArgonParams;
+use daemonseed_core::storage::seeds::{SealingKey, Seeds};
 use daemonseed_core::trust_events::{
     DismissalScope, TrustEvent, TrustEventClass, TrustEventKey, TrustEventLog, class_of,
 };
@@ -454,9 +455,11 @@ pub struct App {
     /// Client-local hidden-share full wire handles (ISC-18 / C16). Applied as
     /// a render-time filter on [`Self::public_shares`] via
     /// [`daemonseed_cli::public_space::filter_shares_excluding_hidden`]. Never
-    /// leaves the client (ISC-A-C3): no wire field carries it. The persisted
-    /// home for this set is [`daemonseed_core::storage::seeds::Seeds::hidden_shares`];
-    /// session-scoped here pending the .dseed write-through path (ISC-5 partial).
+    /// leaves the client (ISC-A-C3): no wire field carries it. This set is the UI
+    /// source of truth; it is kept in lock-step with the persisted home
+    /// [`daemonseed_core::storage::seeds::Seeds::hidden_shares`] (M13
+    /// write-through) — every toggle mirrors onto [`Self::seeds`] and re-seals, and
+    /// it is restored from there on Unlock (ISC-C16).
     hidden_shares: std::collections::BTreeSet<String>,
     /// The hide-box input buffer (ISC-18).
     hide_input: String,
@@ -533,6 +536,21 @@ pub struct App {
     /// typed passphrase. The binary decrypts the on-disk blob and feeds the
     /// result back via [`Self::on_unlock_success`] / [`Self::on_unlock_failure`].
     pending_unlock: Option<String>,
+    /// The live at-rest payload the running client mutates and re-seals for the
+    /// M13 write-through (display name / mute / hide / circles). Populated from
+    /// [`SessionMaterials::seeds`] at first-start completion and on Unlock; `None`
+    /// before either. Mutations on this drive [`Self::persist_seeds`].
+    seeds: Option<Seeds>,
+    /// The cached at-rest AEAD key matching [`Self::seeds`], from
+    /// [`SessionMaterials::seal_key`]. Lets [`Self::persist_seeds`] re-seal on
+    /// every mutation without re-running Argon2id. `None` until a session lands;
+    /// zeroizes on drop.
+    seal_key: Option<SealingKey>,
+    /// A re-sealed at-rest blob the binary should write over `seeds.blob` (M13
+    /// write-through). Set by [`Self::persist_seeds`], drained once by
+    /// [`Self::take_pending_blob_update`]. Distinct from [`Self::pending_persist`],
+    /// which is the first-start config+blob+`.dseed` write.
+    pending_blob_update: Option<Vec<u8>>,
 }
 
 impl Default for App {
@@ -606,6 +624,9 @@ impl App {
             unlock_input: String::new(),
             unlock_error: None,
             pending_unlock: None,
+            seeds: None,
+            seal_key: None,
+            pending_blob_update: None,
         }
     }
 
@@ -689,6 +710,31 @@ impl App {
         std::mem::replace(&mut self.pending_persist, false)
     }
 
+    /// Re-seal the live [`Seeds`] under the cached [`SealingKey`] and queue the
+    /// refreshed blob for the binary to write over `seeds.blob` (M13
+    /// write-through). A no-op (with no error) before a session lands — both the
+    /// seeds and the key are `None` until first-start completes or an Unlock
+    /// succeeds. A seal failure surfaces on the status line rather than panicking,
+    /// so a persist hiccup never takes the session down; the in-memory mutation is
+    /// kept regardless (the next mutation re-attempts the write).
+    fn persist_seeds(&mut self) {
+        let (Some(seeds), Some(key)) = (self.seeds.as_ref(), self.seal_key.as_ref()) else {
+            return;
+        };
+        match key.seal(seeds) {
+            Ok(bytes) => self.pending_blob_update = Some(bytes),
+            Err(e) => self.status = Some(format!("could not save: {e}")),
+        }
+    }
+
+    /// Drain the queued M13 write-through blob, if any — the binary overwrites
+    /// `seeds.blob` with it (settings payload only; the `.dseed` and config are
+    /// untouched). Distinct from [`Self::take_pending_persist`], the first-start
+    /// config+blob+`.dseed` write.
+    pub fn take_pending_blob_update(&mut self) -> Option<Vec<u8>> {
+        self.pending_blob_update.take()
+    }
+
     /// Test-only: take the session materials out (to feed an Unlock-success
     /// test without re-implementing the core enrollment dance).
     #[cfg(test)]
@@ -723,6 +769,15 @@ impl App {
             trusted: true,
         });
         self.connection = ConnectionStatus::Connecting;
+        // M13 write-through: hold the live payload + cached key for in-place
+        // re-seals, and restore the persisted UI state (mute / hide sets) from it
+        // so the session reflects what was saved instead of starting empty
+        // (ISC-C15 / C16 / C4b). The display name rides in `session.display_name`
+        // / `session.handle` (restored in `session_materials_from_unlock`).
+        self.seeds = Some(session.seeds.clone());
+        self.seal_key = Some(session.seal_key.clone());
+        self.muted = session.seeds.muted.clone();
+        self.hidden_shares = session.seeds.hidden_shares.clone();
         self.session = Some(session);
         self.unlock_input.clear();
         self.unlock_error = None;
@@ -1319,6 +1374,14 @@ impl App {
                                 // Item D / ISC-C49/C50: ask the binary to persist
                                 // the at-rest blob + `.dseed` to the profile root.
                                 self.pending_persist = true;
+                                // M13 write-through: hold the live payload + cached
+                                // key so later mute/hide/name changes re-seal in
+                                // place. The first-start blob was sealed before the
+                                // display name was chosen; the binary persists the
+                                // refreshed blob via the write-through below.
+                                self.seeds = Some(s.seeds.clone());
+                                self.seal_key = Some(s.seal_key.clone());
+                                self.persist_seeds();
                             }
                             self.session = session;
                             self.first_start = None;
@@ -1563,11 +1626,10 @@ impl App {
 
     /// Hide-box key handling (ISC-18 / C16). Typing edits [`Self::hide_input`];
     /// Enter on a non-empty buffer toggles the handle in
-    /// [`Self::hidden_shares`] (set membership), then clears the input. The
-    /// set is session-scoped here pending the .dseed write-through (ISC-5
-    /// partial); on toggle, render-time filtering picks the change up
-    /// immediately because [`Self::visible_public_shares`] reads
-    /// [`Self::hidden_shares`] each time.
+    /// [`Self::hidden_shares`] (set membership), mirrors the change onto
+    /// [`Self::seeds`], re-seals for the M13 write-through, then clears the input.
+    /// On toggle, render-time filtering picks the change up immediately because
+    /// [`Self::visible_public_shares`] reads [`Self::hidden_shares`] each time.
     fn on_key_hide(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char(c) => self.hide_input.push(c),
@@ -1584,9 +1646,19 @@ impl App {
                     self.status = Some("hide handle rejected: line break".to_owned());
                     return;
                 }
-                if !self.hidden_shares.remove(&handle) {
-                    self.hidden_shares.insert(handle);
+                // Toggle, keeping the live `Seeds` in lock-step (ISC-C16) so the
+                // M13 write-through persists the change, then re-seal.
+                if self.hidden_shares.remove(&handle) {
+                    if let Some(seeds) = self.seeds.as_mut() {
+                        seeds.remove_hidden_share(&handle);
+                    }
+                } else {
+                    self.hidden_shares.insert(handle.clone());
+                    if let Some(seeds) = self.seeds.as_mut() {
+                        seeds.add_hidden_share(handle);
+                    }
                 }
+                self.persist_seeds();
                 // Re-clamp selection — the visible subset may have shrunk.
                 let max = self.visible_public_shares_count().saturating_sub(1);
                 if self.share_sel > max {
@@ -1779,10 +1851,20 @@ impl App {
             }
             KeyCode::Enter if !self.mute_input.is_empty() => {
                 let handle = std::mem::take(&mut self.mute_input);
-                // Toggle: a second Enter on the same handle unmutes it.
-                if !self.muted.remove(&handle) {
-                    self.muted.insert(handle);
+                // Toggle: a second Enter on the same handle unmutes it. Keep the
+                // live `Seeds` in lock-step (ISC-C15) so the M13 write-through
+                // persists the change, then re-seal.
+                if self.muted.remove(&handle) {
+                    if let Some(seeds) = self.seeds.as_mut() {
+                        seeds.remove_mute(&handle);
+                    }
+                } else {
+                    self.muted.insert(handle.clone());
+                    if let Some(seeds) = self.seeds.as_mut() {
+                        seeds.add_mute(handle);
+                    }
                 }
+                self.persist_seeds();
             }
             _ => {}
         }
@@ -2942,6 +3024,176 @@ mod tests {
         assert!(
             !app.is_muted("spammer#aabbccddeeff"),
             "unmuted on re-toggle"
+        );
+    }
+
+    // ── M13 write-through (ISC-C15 / C16 / C4b persistence) ──────────────
+
+    /// The fast-Argon params + passphrase `drive_to_main` enrolls under, so a
+    /// test can open the re-sealed blob the write-through queues.
+    const WT_PASSPHRASE: &str = "correct horse battery staple table mountain";
+    fn wt_params() -> daemonseed_core::profile::config::ArgonParams {
+        daemonseed_core::profile::config::ArgonParams {
+            memory_kib: 8,
+            iterations: 1,
+            parallelism: 1,
+        }
+    }
+
+    /// Muting a handle in a running app re-seals the at-rest blob: the queued
+    /// `pending_blob_update` bytes open under the enrollment passphrase + params
+    /// and carry the mute (ISC-C15 persistence via the M13 write-through).
+    #[test]
+    fn muting_queues_a_blob_update_that_persists_the_mute() {
+        use daemonseed_core::storage::seeds;
+
+        let mut app = drive_to_main();
+        let pid = app
+            .session()
+            .expect("session present")
+            .profile_config
+            .profile_id;
+
+        app.on_key(press(KeyCode::Tab)); // Chat → JoinCircle
+        app.on_key(press(KeyCode::Tab)); // JoinCircle → Mute
+        assert_eq!(app.main_focus(), MainFocus::Mute);
+        for ch in "spammer#aabbccddeeff".chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        app.on_key(press(KeyCode::Enter));
+
+        // The live Seeds reflects the mutation immediately.
+        assert!(
+            app.seeds
+                .as_ref()
+                .expect("seeds present")
+                .is_muted("spammer#aabbccddeeff"),
+            "live seeds carries the mute"
+        );
+
+        // The binary would write these bytes over seeds.blob; opening them under
+        // the same passphrase/params recovers the mute.
+        let bytes = app
+            .take_pending_blob_update()
+            .expect("a mute queues a blob re-seal");
+        let recovered = seeds::open(&bytes, WT_PASSPHRASE, pid, wt_params())
+            .expect("re-sealed blob opens")
+            .seeds;
+        assert!(
+            recovered.is_muted("spammer#aabbccddeeff"),
+            "persisted blob carries the mute"
+        );
+        // Drained exactly once.
+        assert!(app.take_pending_blob_update().is_none());
+    }
+
+    /// Hiding a sharer's shares re-seals the blob and the queued bytes carry the
+    /// hide on re-open (ISC-C16 persistence via the M13 write-through).
+    #[test]
+    fn hiding_queues_a_blob_update_that_persists_the_hide() {
+        use daemonseed_core::storage::seeds;
+
+        let mut app = drive_to_main();
+        let pid = app
+            .session()
+            .expect("session present")
+            .profile_config
+            .profile_id;
+
+        // Tab Chat → JoinCircle → Mute → Shares → Hide.
+        for _ in 0..4 {
+            app.on_key(press(KeyCode::Tab));
+        }
+        assert_eq!(app.main_focus(), MainFocus::Hide);
+        for ch in "noisy#0a0b0c0d0e0f".chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        app.on_key(press(KeyCode::Enter));
+
+        assert!(
+            app.seeds
+                .as_ref()
+                .expect("seeds present")
+                .is_share_hidden("noisy#0a0b0c0d0e0f"),
+            "live seeds carries the hide"
+        );
+        let bytes = app
+            .take_pending_blob_update()
+            .expect("a hide queues a blob re-seal");
+        let recovered = seeds::open(&bytes, WT_PASSPHRASE, pid, wt_params())
+            .expect("re-sealed blob opens")
+            .seeds;
+        assert!(
+            recovered.is_share_hidden("noisy#0a0b0c0d0e0f"),
+            "persisted blob carries the hide"
+        );
+    }
+
+    /// First-start completion seeds the live payload with the chosen display name
+    /// and queues a write-through, so the persisted blob carries it (ISC-C4b).
+    #[test]
+    fn first_start_persists_chosen_display_name() {
+        use daemonseed_core::storage::seeds;
+
+        let mut app = drive_to_main();
+        let pid = app
+            .session()
+            .expect("session present")
+            .profile_config
+            .profile_id;
+        // The live payload carries the default display name picked in the flow.
+        let name = app
+            .seeds
+            .as_ref()
+            .expect("seeds present")
+            .display_name()
+            .map(str::to_owned);
+        assert!(name.is_some(), "first-start chose a display name");
+
+        let bytes = app
+            .take_pending_blob_update()
+            .expect("first-start queues a write-through with the name");
+        let recovered = seeds::open(&bytes, WT_PASSPHRASE, pid, wt_params())
+            .expect("re-sealed blob opens")
+            .seeds;
+        assert_eq!(
+            recovered.display_name().map(str::to_owned),
+            name,
+            "persisted blob carries the chosen display name"
+        );
+    }
+
+    /// On Unlock the mute/hide sets and live payload are restored from the
+    /// decrypted blob, not started empty (ISC-C15 / C16 restore).
+    #[test]
+    fn unlock_restores_mute_and_hide_from_seeds() {
+        let _ = oxicrypt_module::initialize();
+        // Build a SessionMaterials carrying a mute + hide, as Unlock would yield.
+        let mut materials = {
+            let mut app = drive_to_main();
+            // Mute + hide so the live seeds carry them.
+            app.on_key(press(KeyCode::Tab));
+            app.on_key(press(KeyCode::Tab));
+            for ch in "muted#aabbccddeeff".chars() {
+                app.on_key(press(KeyCode::Char(ch)));
+            }
+            app.on_key(press(KeyCode::Enter));
+            app.session_take_for_test()
+        };
+        // Replace the materials' seeds with one carrying a known mute + hide, so
+        // the assertion is independent of the flow's defaults.
+        materials.seeds.add_mute("muted#aabbccddeeff");
+        materials.seeds.add_hidden_share("hidden#0a0b0c0d0e0f");
+
+        let mut app = App::for_existing_profile_with_argon(wt_params());
+        app.on_unlock_success(materials);
+        assert!(
+            app.is_muted("muted#aabbccddeeff"),
+            "mute restored on unlock"
+        );
+        assert!(
+            app.is_share_hidden("hidden#0a0b0c0d0e0f"),
+            "hide restored on unlock"
         );
     }
 

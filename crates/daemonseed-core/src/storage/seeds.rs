@@ -175,6 +175,12 @@ impl CounterState {
 /// additive — future fields append new directive kinds without a blob-format
 /// (magic) bump. Mute/hide lists are **client-local only** and never leave the
 /// at-rest blob; no wire message carries them (ISC-A-C3).
+///
+/// `Clone` is derived so the running client can hold its own live payload to
+/// mutate + re-seal (the M13 write-through) while the cold-start
+/// [`SessionMaterials`](crate::first_start::SessionMaterials) keeps its copy.
+/// The clone copies the mnemonic, which still zeroizes on drop.
+#[derive(Clone)]
 pub struct Seeds {
     pub mnemonic: Mnemonic,
     pub counters: CounterState,
