@@ -60,7 +60,7 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use oxicrypt_aes::{Aes256Key, gcm_decrypt, gcm_encrypt};
 use oxicrypt_kdf::HkdfSha384;
 use uuid::Uuid;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::suite::{Registry, SuiteId, SuiteIdError, WriteRefusal};
 use crate::identity::mnemonic::{Mnemonic, MnemonicError};
@@ -475,6 +475,10 @@ pub struct Opened {
     /// schedule a [`touch_reseal`] on the next write to migrate the blob
     /// to v2 (ISC-C24 read-old-write-new).
     pub legacy_v1: bool,
+    /// The at-rest AEAD key derived while opening, cached for the session so the
+    /// write-through (M13) can re-seal on each mutation without re-running
+    /// Argon2id. The Unlock path hands this straight to the running client.
+    pub key: SealingKey,
 }
 
 /// Errors from [`seal`] / [`open`] / [`touch_reseal`].
@@ -545,6 +549,47 @@ impl core::fmt::Display for BlobError {
 
 impl std::error::Error for BlobError {}
 
+/// A cached at-rest AEAD key for the session write-through (M13).
+///
+/// Holds the 32-byte key derived once at unlock ([`Opened::key`]) or first-start
+/// ([`SealingKey::derive`]) so the running client can re-seal the blob on every
+/// persist-worthy mutation (mute, hide, circle join/leave, rename, display-name
+/// change) **without** re-running Argon2id — which on the Pi-4 floor target would
+/// otherwise stall the UI for a second or more per action. The key zeroizes on
+/// drop. It is the session's most sensitive in-RAM secret: never log it, never
+/// persist it, and drop the [`SealingKey`] at logout.
+#[derive(Clone)]
+pub struct SealingKey(Zeroizing<[u8; AEAD_KEY_LEN]>);
+
+impl SealingKey {
+    /// Derive the at-rest AEAD key from the passphrase (one Argon2id run) and
+    /// cache it for the session. Used at first-start; the Unlock path gets the
+    /// key for free from [`open`] via [`Opened::key`] instead of calling this.
+    pub fn derive(
+        passphrase: &str,
+        profile_id: Uuid,
+        params: ArgonParams,
+    ) -> Result<Self, BlobError> {
+        let mut key_bytes = derive_aead_key(passphrase, profile_id, params)?;
+        let sk = Self(Zeroizing::new(key_bytes));
+        key_bytes.zeroize();
+        Ok(sk)
+    }
+
+    /// Re-seal `seeds` under the active write-suite using the cached key — no
+    /// Argon2id. This is what the session calls on every persist-worthy change.
+    pub fn seal(&self, seeds: &Seeds) -> Result<Vec<u8>, BlobError> {
+        seal_with_key(seeds, &self.0, Registry::default_write_suite())
+    }
+}
+
+impl core::fmt::Debug for SealingKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // The key is the session's most sensitive secret — never render it.
+        f.write_str("SealingKey(<redacted>)")
+    }
+}
+
 /// Encrypt a [`Seeds`] payload into the canonical v2 blob layout under the
 /// active write-suite resolved from [`Registry::default_write_suite`].
 ///
@@ -570,15 +615,29 @@ pub fn seal_under(
     params: ArgonParams,
     suite_id: SuiteId,
 ) -> Result<Vec<u8>, BlobError> {
-    Registry::resolve_for_write(suite_id).map_err(BlobError::WriteRefused)?;
-
     let mut key = derive_aead_key(passphrase, profile_id, params)?;
+    let result = seal_with_key(seeds, &key, suite_id);
+    key.zeroize();
+    result
+}
+
+/// Encrypt a [`Seeds`] payload under a pre-derived 32-byte AEAD `key`, skipping
+/// the Argon2id KDF. This is the hot path for the session write-through (M13):
+/// the client derives the key once at unlock/first-start, caches it in a
+/// [`SealingKey`], and re-seals on every persist-worthy mutation without paying
+/// Argon2id again. The registry MUST contain `suite_id` and it MUST be
+/// write-eligible. Layout and AAD binding are identical to [`seal_under`].
+pub fn seal_with_key(
+    seeds: &Seeds,
+    key: &[u8; AEAD_KEY_LEN],
+    suite_id: SuiteId,
+) -> Result<Vec<u8>, BlobError> {
+    Registry::resolve_for_write(suite_id).map_err(BlobError::WriteRefused)?;
 
     let mut nonce = [0u8; NONCE_LEN];
     getrandom::fill(&mut nonce).map_err(BlobError::EntropySource)?;
 
-    let aes = Aes256Key::new(&key).map_err(BlobError::AesKeyInit)?;
-    key.zeroize();
+    let aes = Aes256Key::new(key).map_err(BlobError::AesKeyInit)?;
 
     let plaintext_str = seeds.to_plaintext();
     let plaintext = plaintext_str.as_bytes();
@@ -658,9 +717,10 @@ fn open_v2(
     let ciphertext = &after_nonce[..ciphertext_len];
     let tag: &[u8; TAG_LEN] = after_nonce[ciphertext_len..].try_into().unwrap();
 
-    let mut key = derive_aead_key(passphrase, profile_id, params)?;
-    let aes = Aes256Key::new(&key).map_err(BlobError::AesKeyInit)?;
-    key.zeroize();
+    let mut key_bytes = derive_aead_key(passphrase, profile_id, params)?;
+    let aes = Aes256Key::new(&key_bytes).map_err(BlobError::AesKeyInit)?;
+    let key = SealingKey(Zeroizing::new(key_bytes));
+    key_bytes.zeroize();
 
     let mut plaintext = vec![0u8; ciphertext.len()];
     gcm_decrypt(&aes, nonce, &suite_bytes, ciphertext, tag, &mut plaintext).map_err(
@@ -677,6 +737,7 @@ fn open_v2(
         seeds,
         suite_id,
         legacy_v1: false,
+        key,
     })
 }
 
@@ -697,9 +758,10 @@ fn open_v1(
     let ciphertext = &after_nonce[..ciphertext_len];
     let tag: &[u8; TAG_LEN] = after_nonce[ciphertext_len..].try_into().unwrap();
 
-    let mut key = derive_aead_key(passphrase, profile_id, params)?;
-    let aes = Aes256Key::new(&key).map_err(BlobError::AesKeyInit)?;
-    key.zeroize();
+    let mut key_bytes = derive_aead_key(passphrase, profile_id, params)?;
+    let aes = Aes256Key::new(&key_bytes).map_err(BlobError::AesKeyInit)?;
+    let key = SealingKey(Zeroizing::new(key_bytes));
+    key_bytes.zeroize();
 
     let mut plaintext = vec![0u8; ciphertext.len()];
     // v1 used empty AAD — preserve that contract or M2 blobs fail to open.
@@ -718,6 +780,7 @@ fn open_v1(
         seeds,
         suite_id: implicit,
         legacy_v1: true,
+        key,
     })
 }
 
@@ -1027,6 +1090,45 @@ mod tests {
         assert!(!seeds.remove_circle("phrase a")); // already gone
         assert_eq!(seeds.circles().len(), 1);
         assert_eq!(seeds.circles()[0].entropy, "phrase b");
+    }
+
+    #[test]
+    fn cached_key_reseals_without_passphrase() {
+        // The write-through keystone (M13): open a blob once, then re-seal a
+        // mutated Seeds using only the cached SealingKey — no passphrase, no
+        // second Argon2id run — and confirm the mutation persists on re-open.
+        ensure_oxicrypt_initialized();
+        let pid = Uuid::new_v4();
+        let pp = "correct horse battery staple table mountain";
+        let seeds = fresh_seeds();
+        let blob = seal(&seeds, pp, pid, test_params()).unwrap();
+
+        let opened = open(&blob, pp, pid, test_params()).unwrap();
+        let mut live = opened.seeds;
+        let key = opened.key; // cached — no passphrase from here on
+
+        live.set_display_name(Some("brave otter".to_owned()));
+        live.add_circle("shared secret phrase", "Book Club");
+        let resealed = key.seal(&live).unwrap();
+
+        let recovered = open(&resealed, pp, pid, test_params()).unwrap().seeds;
+        assert_eq!(recovered.display_name(), Some("brave otter"));
+        assert_eq!(recovered.circles().len(), 1);
+        assert_eq!(recovered.circles()[0].label, "Book Club");
+    }
+
+    #[test]
+    fn sealing_key_derive_matches_seal() {
+        // SealingKey::derive (first-start path) must produce the same key the
+        // passphrase-based seal uses, so a blob sealed via derive opens normally.
+        ensure_oxicrypt_initialized();
+        let pid = Uuid::new_v4();
+        let pp = "correct horse battery staple table mountain";
+        let seeds = fresh_seeds();
+        let key = SealingKey::derive(pp, pid, test_params()).unwrap();
+        let blob = key.seal(&seeds).unwrap();
+        let recovered = open(&blob, pp, pid, test_params()).unwrap().seeds;
+        assert_eq!(recovered.mnemonic.to_phrase(), seeds.mnemonic.to_phrase());
     }
 
     #[test]
