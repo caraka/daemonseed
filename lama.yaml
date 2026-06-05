@@ -12,7 +12,7 @@ lama: "0.1"
 
 library:
   name: daemonseed
-  version: "0.12.1-pre"
+  version: "0.17.0-pre"
   description: >-
     Federated end-to-end-encrypted communication and file-sharing
     protocol. Pure-Rust backend, CNSA 2.0 baseline crypto via the
@@ -35,12 +35,35 @@ library:
 # Implementation status: M10 closed at v0.12.1; M11 (MVP-gate client surfaces:
 # real TUI, public-space view, deprecation surface, clean-device recovery — all
 # over already-shipped server APIs) closed at v0.13.0. M12 (→ v0.14.0 = MVP)
-# ships the last two MVP-gate steps: step 5 user-publish file sharing
+# shipped the last two MVP-gate steps: step 5 user-publish file sharing
 # (PublishShare / UnpublishShare / ListPublicShares — RAM-only, held-connection
 # "you must be online to share", reaped on disconnect) and step 6 the federation
 # introducer endpoint + the TUI Servers-pane refresh that surfaces
-# introducer-discovered candidates. Both ride ONE additive SemVer MINOR wire bump
-# (wire stays 1.x). The full 4-daemon gate now trips 10/10 → MVP declared.
+# introducer-discovered candidates. Both rode ONE additive SemVer MINOR wire bump
+# (wire stays 1.x). The full 4-daemon gate trips 10/10 → MVP declared.
+#
+# Post-MVP releases:
+#   v0.15.0 (alpha2 batch): opaque server-assigned share_id (S21 / A-S15);
+#     share download (S27-S29 / A-S20-A-S21); interactive public rooms — the
+#     auto-joined "lobby" (S22-S26 / A-S16-A-S19 / C56-C58); client-identity
+#     lifecycle — first-start persists blob + config + .dseed, daily-login Unlock,
+#     no-clobber (C47-C51 / A-C26-A-C28); --portable mode forcing CWD as profile
+#     root (C52).
+#   v0.15.1: chat-surface precedence fix (posts route to the joined circle, not
+#     the auto-joined lobby) + a compose-box surface indicator.
+#   v0.16.0: multi-circle carousel — simultaneous membership in N circles, split
+#     chat view (lobby pane + active-circle carousel pane), arrow-key cycling,
+#     deterministic client-local labels, per-circle surface isolation +
+#     attribution (C59-C62 / A-C29 / A-C30). Purely client-side, no wire change.
+#   v0.17.0 (M13, persistence keystone): the at-rest seeds blob now persists
+#     display name, mute list, hidden-shares, and circle membership, restored on a
+#     daily-login Unlock; circles silently rejoin without re-typing the phrase. A
+#     cached SealingKey re-seals the blob on each mutation with no second Argon2id
+#     (Pi-4 floor); circle entropy + label are stored as hex directive lines and
+#     stay non-mnemonic-derivable (a mnemonic-only recovery never reconstructs the
+#     social graph). Client-side circle-rename and TUI local-sharing persistence
+#     are deferred to M14. No wire change.
+#
 # The M10 release-signing INFRASTRUCTURE (real keys, Sigstore, reproducible
 # build, update-relay role) and the C7/C20 platform halves remain deferred to
 # M10-infra.
@@ -92,10 +115,24 @@ milestones_complete:
   - id: M12
     tag: v0.14.0
     summary: "MVP. The last two gate steps under one additive SemVer MINOR wire bump. Step 5: user-publish file sharing — PublishShare / UnpublishShare / ListPublicShares over the PublicSpace service; RAM-only per-connection registry (SharePublishRegistry), CLI publish holds the connection open until Ctrl-C, and ShareReapGuard reaps the share on real disconnect (ISC-A-S1 / A-S5b / S4). Step 6: the federation introducer endpoint (FederationIntroducer gRPC over the already-shipped IntroducerQuery/IntroducerResponse) + the TUI Servers-pane RefreshIntroducer surface rendering introducer-discovered candidates read-only, no keys, never auto-trusted (ISC-S6 / S13 / C22 / A-C19). serve_application now serves a single connection until real peer close (no genuinely-new ISC closes; the gate trips 10/10 → MVP declared)."
+  - id: alpha2-batch
+    tag: v0.15.0
+    summary: "Alpha2 batch. Opaque server-assigned share_id (S21 / A-S15); share download (S27-S29 / A-S20-A-S21); interactive public rooms — the auto-joined lobby (S22-S26 / A-S16-A-S19 / C56-C58); client-identity lifecycle — first-start persists the seeds blob + config + .dseed, daily-login Unlock, no-clobber of an existing identity (C47-C51 / A-C26-A-C28); --portable mode forcing CWD as profile root (C52)."
+  - id: chat-surface-fix
+    tag: v0.15.1
+    summary: "Chat-surface precedence fix — posts route to the joined circle rather than the auto-joined lobby — plus a compose-box surface indicator. Client-only."
+  - id: multi-circle-carousel
+    tag: v0.16.0
+    summary: "Multi-circle carousel: simultaneous membership in N circles (joining ADDS, never evicts), a split chat view (lobby pane + active-circle carousel pane), arrow-key cycling of the active circle, deterministic client-local labels, and per-circle surface isolation + attribution (ISC-C59-C62 / A-C29 / A-C30). Purely client-side, no wire change."
+  - id: M13
+    tag: v0.17.0
+    summary: "Persistence keystone. The at-rest seeds blob now persists display name, mute list, hidden-shares, and circle membership (ISC-C51 / C15 / C16 / C59), restored on a daily-login Unlock; circles silently rejoin without re-typing the phrase. Mechanism: a cached SealingKey (daemonseed_core::storage::seeds) re-seals the blob on each mutation with NO second Argon2id (the Pi-4 floor); circle entropy + label are stored as hex directive lines and stay non-mnemonic-derivable, so a mnemonic-only recovery never reconstructs the social graph; CircleJoined echoes the entropy in-process for ordering-free rejoin pairing. No wire change. Deferred to M14: client-side circle-rename (the deterministic seed-label stays canonical until a circle-fingerprint verify affordance exists) and TUI local-sharing + its persistence (the TUI does no local sharing yet — share_index is always None — so there are no own-share definitions to persist)."
 
 milestones_planned:
   - id: M10-infra
     summary: "M10 deferred half: real release-signing keys + N-of-M governance identities, Sigstore co-signature, reproducible build, store/F-Droid/OS-packager channels, the optional update-relay role, C7 biometric/secure-enclave login, C20 OS-native autostart, and live update fetch."
+  - id: M14
+    summary: "M13 deferred half: client-side circle-rename (held until a circle-fingerprint verify affordance exists, since the deterministic seed-label must stay canonical) and TUI local-sharing + its persistence (the TUI currently does no local sharing — share_index is always None — so there are no own-share definitions to persist yet)."
   - id: post-MVP
     summary: "GFW classifier bench, Pi-4 civility bench, unsigned alpha packaging."
   - id: alpha2
@@ -111,9 +148,12 @@ crates:
       Protocol library — identity, storage, bootstrap, first-start
       orchestration, crypto-agility primitives, circle-of-trust key derivation,
       the M9 client surfaces (reconnect backoff, mute / hide-shares lists,
-      @-mention recognition/resolution), and the M10 release surface
+      @-mention recognition/resolution), the M10 release surface
       (daemonseed_core::release: release trust anchor + N-of-M multi-sig verify +
-      update-lifecycle FSM). Pure library (no_std-compatible where the underlying
+      update-lifecycle FSM), and the M13 at-rest persistence keystone — the
+      storage::seeds blob now carries display_name + circle membership alongside
+      the mute/hide lists, re-sealed on each mutation via a cached SealingKey
+      (no second Argon2id). Pure library (no_std-compatible where the underlying
       primitives allow; currently uses std for I/O).
     license: AGPL-3.0-or-later
     status: active
@@ -144,7 +184,7 @@ crates:
     manifest: "docs/llm-api-manifest/daemonseed-cli-api.yaml"
 
   - name: daemonseed-tui
-    purpose: "Interactive ratatui client — the MVP product surface. A terminal-free screen state machine (daemonseed_tui::app) rendered by pure functions (daemonseed_tui::ui), driven by a thin binary (terminal lifecycle + event loop) that reuses daemonseed-cli's connect / identity-proof / C22-trust client stack. M11 grows it through first-start (incl. clean-device recovery), chat, circle, share/fetch, the C22 trust slider, the C28 trust-event taxonomy, the F22 server-management screen, the public-space (MOTD + announcements) view, and the suite-deprecation policy view (fetch + ML-DSA verify + anti-rollback, ISC-C25 / A-S11). M12 adds the Servers-pane introducer refresh: a read-only Discovered (introducer) sub-section listing introducer-discovered candidates (server-id + address, no keys, never auto-trusted — ISC-S6 / C22 / A-C19; gate step 6). v0.16 adds the multi-circle carousel: simultaneous membership in several circles (joining ADDS, never evicts — ISC-C59), a split chat view (lobby pane + active-circle carousel pane) where each line carries a Surface tag and each pane filters strictly on it (no cross-surface bleed — ISC-A-C29), arrow-key cycling of the active circle (ISC-C60), per-circle client-local labels (ISC-C62), and per-circle seal/attribution (a post seals under exactly the active circle's key; an inbound frame is attributed to the single circle whose key opened it — ISC-A-C30) — all client-internal, no wire change."
+    purpose: "Interactive ratatui client — the MVP product surface. A terminal-free screen state machine (daemonseed_tui::app) rendered by pure functions (daemonseed_tui::ui), driven by a thin binary (terminal lifecycle + event loop) that reuses daemonseed-cli's connect / identity-proof / C22-trust client stack. M11 grows it through first-start (incl. clean-device recovery), chat, circle, share/fetch, the C22 trust slider, the C28 trust-event taxonomy, the F22 server-management screen, the public-space (MOTD + announcements) view, and the suite-deprecation policy view (fetch + ML-DSA verify + anti-rollback, ISC-C25 / A-S11). M12 adds the Servers-pane introducer refresh: a read-only Discovered (introducer) sub-section listing introducer-discovered candidates (server-id + address, no keys, never auto-trusted — ISC-S6 / C22 / A-C19; gate step 6). v0.16 adds the multi-circle carousel: simultaneous membership in several circles (joining ADDS, never evicts — ISC-C59), a split chat view (lobby pane + active-circle carousel pane) where each line carries a Surface tag and each pane filters strictly on it (no cross-surface bleed — ISC-A-C29), arrow-key cycling of the active circle (ISC-C60), per-circle client-local labels (ISC-C62), and per-circle seal/attribution (a post seals under exactly the active circle's key; an inbound frame is attributed to the single circle whose key opened it — ISC-A-C30) — all client-internal, no wire change. M13 (the persistence keystone) wires the session write-through: the running client holds the at-rest SealingKey and re-seals the seeds blob on each persist-worthy mutation, so display name + mute/hide + circle membership survive a daily-login Unlock; on Unlock the persisted circles silently rejoin without re-typing the phrase (CircleJoined echoes the entropy in-process for ordering-free rejoin pairing — ISC-C51 / C59). Still client-internal, no wire change."
     license: AGPL-3.0-or-later
     status: active
     manifest: "docs/llm-api-manifest/daemonseed-tui-api.yaml"
@@ -499,7 +539,9 @@ external_dependencies:
 # ISC numbers are the spec breadcrumbs throughout these manifests.
 
 isc_reference:
-  current_count: 94
+  # Authoritative total tracked by xtask `TOTAL_ISCS` (xtask/src/main.rs) and the
+  # integration-tests `isc_coverage::TOTAL`, kept in sync by a unit test.
+  current_count: 122
   numbering:
     server_positive: "ISC-S1 .. ISC-S20"
     server_negative: "ISC-A-S1 .. ISC-A-S14"

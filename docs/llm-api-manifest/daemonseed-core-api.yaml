@@ -1,16 +1,18 @@
 # ─────────────────────────────────────────────────────────────────────
 # daemonseed-core — LAMA API Manifest
 #
-# Public API surface of the daemonseed-core crate through M10 verifiable-core
-# plus the M10-completion C7/C20 scaffolds (v0.12.1-pre). M3 closed the
-# crypto-agility primitives; M4a/M4b added the connection type-state +
-# identity-proof; M5 federation; M6 public-space client plumbing; M7 the
-# deprecation policy + trust-event taxonomy; M8 the CoT/chunk/indexer client
-# surface; M9 backoff + mention + mute/hide; M10 the release trust anchor +
+# Public API surface of the daemonseed-core crate through M13 (v0.17.0-pre).
+# M3 closed the crypto-agility primitives; M4a/M4b added the connection
+# type-state + identity-proof; M5 federation; M6 public-space client plumbing;
+# M7 the deprecation policy + trust-event taxonomy; M8 the CoT/chunk/indexer
+# client surface; M9 backoff + mention + mute/hide; M10 the release trust anchor +
 # multi-sig verify + update-lifecycle FSM; M10-completion the biometric +
-# autostart scaffolds. Written in canonical LAMA 0.1: modules carry only
-# metadata, while types / functions / error_types / constants are separate
-# top-level lists that reference a module by name.
+# autostart scaffolds; M13 (the persistence keystone) extends storage::seeds with
+# the display name + rejoinable circle set and the SealingKey session
+# write-through (re-seal each mutation with no second Argon2id). Written in
+# canonical LAMA 0.1: modules carry only metadata, while types / functions /
+# error_types / constants are separate top-level lists that reference a module by
+# name.
 #
 # Cross-references:
 # - Repository root: ../../lama.yaml
@@ -30,8 +32,11 @@ library:
     circle-of-trust key derivation, the connection type-state + identity-proof,
     federation trust, the trust-event taxonomy, reconnect backoff, @-mention
     logic, the release trust anchor + multi-sig verify + update-lifecycle FSM
-    (M10 verifiable-core), and the biometric + autostart opt-in scaffolds
-    (M10-completion). The wire-protocol surface landed from M4a.
+    (M10 verifiable-core), the biometric + autostart opt-in scaffolds
+    (M10-completion), and the M13 at-rest persistence keystone — storage::seeds
+    now carries the display name + mute/hide lists + rejoinable circle set,
+    re-sealed on each mutation via a cached SealingKey (no second Argon2id). The
+    wire-protocol surface landed from M4a.
   license: "AGPL-3.0-or-later"
   manifest_for: "crates/daemonseed-core"
 
@@ -218,7 +223,13 @@ modules:
       AES-256-GCM. v2 binds suite_id into AEAD AAD so tamper-swap
       fails authentication. M4b extends the plaintext payload (not the
       blob format) with replay-protection counters via a backward-
-      compatible directive-line schema — see CounterState + Seeds.
+      compatible directive-line schema — see CounterState + Seeds. M9
+      adds mute / hide-shares handle lists to the same payload; M13 (the
+      persistence keystone) adds the display name and the rejoinable circle
+      set (PersistedCircle), and introduces the SealingKey — an at-rest AEAD
+      key cached at open/first-start so the running client re-seals the blob
+      on each mutation without a second Argon2id (the Pi-4 floor). open()
+      now returns that key in Opened::key.
     no_std: false
     depends_on:
       - daemonseed_core::identity::mnemonic
@@ -229,6 +240,13 @@ modules:
       - A-C9
       - S19
       - A-S1
+      - C4b
+      - C15
+      - C16
+      - C51
+      - C59
+      - C62
+      - A-C3
 
   - name: daemonseed_core::storage::recovery_file
     description: >-
@@ -898,11 +916,17 @@ types:
     module: daemonseed_core::storage::seeds
     kind: struct
     description: >-
-      Plaintext payload. Construct via Seeds::new(mnemonic) (default counters).
-      Plaintext is line-based: line 0 = phrase, then `send-counter <n>` /
-      `seen <target> <n>` directives. Bare-phrase (legacy M1/M2/M3) payloads
-      parse with default counters — no re-enrollment. Directive scheme is
-      additive for future fields.
+      Plaintext payload. Construct via Seeds::new(mnemonic) (default counters,
+      empty mute/hide/circles, no display name). Plaintext is line-based: line 0 =
+      phrase, then `send-counter <n>` / `seen <target> <n>` directives (M4b), the
+      M9 `muted <handle>` / `hidden-share <handle>` lines, and the M13
+      `display-name <name>` line plus per-circle `circle <entropy-hex> <label-hex>`
+      lines (entropy + label hex-encoded so arbitrary text round-trips through the
+      line-based scheme). Bare-phrase (legacy M1/M2/M3) payloads parse with all
+      fields defaulted — no re-enrollment. Directive scheme is additive for future
+      fields. The struct is Clone so the running client can keep a mutate-and-
+      re-seal copy (the M13 write-through) independent of the cold-start
+      SessionMaterials copy; the clone still zeroizes the mnemonic on drop.
     fields:
       - name: mnemonic
         type: Mnemonic
@@ -910,6 +934,36 @@ types:
       - name: counters
         type: CounterState
         description: Replay-protection counter state.
+      - name: muted
+        type: "BTreeSet<String>"
+        description: >-
+          Full wire handles whose chat is muted (ISC-C15). Unilateral and silent;
+          the muted party is never signalled. Persisted, never sent on the wire.
+      - name: hidden_shares
+        type: "BTreeSet<String>"
+        description: >-
+          Full wire handles whose file shares are hidden (ISC-C16). Independent of
+          `muted`. Persisted, never sent on the wire.
+      - name: display_name
+        type: "Option<String>"
+        description: >-
+          The user's chosen display name (ISC-C4b), persisted at M13 so it survives
+          a daily-login Unlock (ISC-C51) rather than resetting each session. `None`
+          = the floor-handle presentation. Mutate via set_display_name (refuses
+          line breaks). Public (it travels on the wire), so unredacted in Debug.
+      - name: circles
+        type: "Vec<PersistedCircle>"
+        description: >-
+          Circles to silently rejoin on the next Unlock (ISC-C59 persistence, M13),
+          in join order so the carousel restores deterministically. Each entry
+          carries the canonicalized entropy needed to re-derive the cot_key (ISC-C8)
+          without re-typing the phrase, plus the client-local label (ISC-C62).
+          Mutate via add_circle / remove_circle / rename_circle. Per the M13
+          remember-all decision this revises the earlier ISC-A-C2 wording that
+          circle entropy is never persisted; the entropy lives encrypted under the
+          at-rest blob's two-stage KDF and stays non-mnemonic-derivable (a
+          mnemonic-only recovery never reconstructs the social graph). Debug surfaces
+          only the count.
     security:
       contains_secret: true
       zeroize_on_drop: true
@@ -919,7 +973,9 @@ types:
     kind: struct
     description: >-
       Output of open(). legacy_v1=true signals the caller should run
-      touch_reseal on next save.
+      touch_reseal on next save. As of M13, also carries the at-rest AEAD key
+      derived while opening (`key`) so the Unlock path can hand the running client
+      a SealingKey for the write-through without a second Argon2id run.
     fields:
       - name: seeds
         type: Seeds
@@ -930,6 +986,54 @@ types:
       - name: legacy_v1
         type: bool
         description: True if the blob used the legacy v1 magic (re-seal recommended).
+      - name: key
+        type: SealingKey
+        description: >-
+          The at-rest AEAD key derived while opening, cached for the session so the
+          M13 write-through can re-seal on each mutation without re-running
+          Argon2id. The Unlock path hands this straight to the client.
+
+  - name: PersistedCircle
+    module: daemonseed_core::storage::seeds
+    kind: struct
+    description: >-
+      One remembered circle in the at-rest blob (ISC-C59 persistence, M13). Holds
+      the minimum needed to rejoin without re-typing: the canonicalized circle
+      entropy (the cot_key IKM, ISC-C8/C9) and the client-local label (ISC-C62).
+      Neither field ever leaves the encrypted blob — no wire message carries them
+      (ISC-A-C3). `entropy` is the canonicalized phrase, not the derived key, so a
+      later cross-family suite change re-derives correctly.
+    fields:
+      - name: entropy
+        type: String
+        description: >-
+          Canonicalized circle entropy (NFKC + whitespace-folded, ISC-C9) — the IKM
+          the cot_key derivation (ISC-C8) re-runs on rejoin.
+      - name: label
+        type: String
+        description: >-
+          Client-local circle label (ISC-C62). Never transmitted, never derived
+          from members.
+
+  - name: SealingKey
+    module: daemonseed_core::storage::seeds
+    kind: struct
+    description: >-
+      A cached at-rest AEAD key for the session write-through (M13). Holds the
+      32-byte key derived once at unlock (Opened::key) or first-start
+      (SealingKey::derive) so the running client can re-seal the blob on every
+      persist-worthy mutation (mute, hide, circle join/leave, rename, display-name
+      change) without re-running Argon2id — which on the Pi-4 floor target would
+      otherwise stall the UI for a second or more per action. The session's most
+      sensitive in-RAM secret: never logged, never persisted; zeroizes on drop and
+      should be dropped at logout. Clone. Methods: derive(passphrase, profile_id,
+      params) -> Result<SealingKey, BlobError> (one Argon2id run; used at
+      first-start) and seal(&Seeds) -> Result<Vec<u8>, BlobError> (re-seal under the
+      active write-suite using the cached key, no Argon2id). Debug renders
+      "SealingKey(<redacted>)".
+    security:
+      contains_secret: true
+      zeroize_on_drop: true
 
   - name: BlobError
     module: daemonseed_core::storage::seeds
@@ -2654,6 +2758,140 @@ functions:
           condition: The active write-suite is not in an ActiveWrite state.
     preconditions:
       - description: The oxicrypt module must be operational.
+
+  # ── storage::seeds — M13 persistence write-through ────────────────────
+  - name: "SealingKey::derive"
+    module: daemonseed_core::storage::seeds
+    description: >-
+      Derive the at-rest AEAD key from the passphrase (one Argon2id run) and cache
+      it for the session write-through. Used at first-start; the Unlock path gets
+      the key for free from open() via Opened::key instead of calling this (M13).
+    signature: "pub fn derive(passphrase: &str, profile_id: Uuid, params: ArgonParams) -> Result<SealingKey, BlobError>"
+    parameters:
+      - name: passphrase
+        type: "&str"
+        direction: in
+        description: The user passphrase (Argon2id input).
+      - name: profile_id
+        type: Uuid
+        direction: in
+        description: The profile UUID (Argon2 salt).
+      - name: params
+        type: ArgonParams
+        direction: in
+        description: The Argon2 work factors.
+    returns:
+      type: "Result<SealingKey, BlobError>"
+      description: The cached at-rest key for the session.
+    preconditions:
+      - description: The oxicrypt module must be operational.
+
+  - name: "SealingKey::seal"
+    module: daemonseed_core::storage::seeds
+    description: >-
+      Re-seal `seeds` under the active write-suite using the cached key — no
+      Argon2id. The session calls this on every persist-worthy mutation (M13).
+    signature: "pub fn seal(&self, seeds: &Seeds) -> Result<Vec<u8>, BlobError>"
+    parameters:
+      - name: seeds
+        type: "&Seeds"
+        direction: in
+        description: The current plaintext seeds payload to re-seal.
+    returns:
+      type: "Result<Vec<u8>, BlobError>"
+      description: A freshly re-sealed v2 blob under the active write-suite.
+      error_variants:
+        - name: WriteRefused
+          condition: The active write-suite is not in an ActiveWrite state.
+    preconditions:
+      - description: The oxicrypt module must be operational.
+
+  - name: "Seeds::set_display_name"
+    module: daemonseed_core::storage::seeds
+    description: >-
+      Set (or clear, with None) the persisted display name (ISC-C4b, M13). Returns
+      true if the value changed. Refuses a name containing a line break — the
+      directive is rest-of-line, so a \n / \r would inject a spurious directive and
+      corrupt the blob on the next open.
+    signature: "pub fn set_display_name(&mut self, name: Option<String>) -> bool"
+    parameters:
+      - name: name
+        type: "Option<String>"
+        direction: in
+        description: The new display name, or None to clear to the floor handle.
+    returns:
+      type: bool
+      description: True iff the value changed (and was line-break-free).
+
+  - name: "Seeds::display_name"
+    module: daemonseed_core::storage::seeds
+    description: "The persisted display name (ISC-C4b), or None for the floor handle."
+    signature: "pub fn display_name(&self) -> Option<&str>"
+    parameters: []
+    returns:
+      type: "Option<&str>"
+      description: The display name if set.
+
+  - name: "Seeds::circles"
+    module: daemonseed_core::storage::seeds
+    description: "The remembered circles, in join order (ISC-C59 persistence, M13)."
+    signature: "pub fn circles(&self) -> &[PersistedCircle]"
+    parameters: []
+    returns:
+      type: "&[PersistedCircle]"
+      description: The persisted circle set, in join order.
+
+  - name: "Seeds::add_circle"
+    module: daemonseed_core::storage::seeds
+    description: >-
+      Remember a circle so it rejoins next launch (ISC-C59, M13). `entropy` must
+      already be canonicalized (ISC-C9). Idempotent — a circle with the same
+      entropy is not duplicated.
+    signature: "pub fn add_circle(&mut self, entropy: impl Into<String>, label: impl Into<String>) -> bool"
+    parameters:
+      - name: entropy
+        type: "impl Into<String>"
+        direction: in
+        description: Canonicalized circle entropy (the cot_key IKM).
+      - name: label
+        type: "impl Into<String>"
+        direction: in
+        description: Client-local display label (ISC-C62).
+    returns:
+      type: bool
+      description: True if newly added, false if already remembered.
+
+  - name: "Seeds::remove_circle"
+    module: daemonseed_core::storage::seeds
+    description: "Forget a remembered circle, keyed on its canonicalized entropy (M13)."
+    signature: "pub fn remove_circle(&mut self, entropy: &str) -> bool"
+    parameters:
+      - name: entropy
+        type: "&str"
+        direction: in
+        description: The canonicalized entropy of the circle to forget.
+    returns:
+      type: bool
+      description: True if one was removed.
+
+  - name: "Seeds::rename_circle"
+    module: daemonseed_core::storage::seeds
+    description: >-
+      Rename a remembered circle's client-local label (ISC-C62 override, M13),
+      keyed on its canonicalized entropy.
+    signature: "pub fn rename_circle(&mut self, entropy: &str, new_label: impl Into<String>) -> bool"
+    parameters:
+      - name: entropy
+        type: "&str"
+        direction: in
+        description: The canonicalized entropy of the circle to rename.
+      - name: new_label
+        type: "impl Into<String>"
+        direction: in
+        description: The new client-local label.
+    returns:
+      type: bool
+      description: True if the label changed.
 
   # ── storage::recovery_file ──────────────────────────────────────────
   - name: "recovery_file::seal"

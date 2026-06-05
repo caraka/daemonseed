@@ -21,7 +21,7 @@ library:
   description: "Interactive ratatui client — the MVP product surface. The interactive logic is a terminal-free screen state machine (daemonseed_tui::app) rendered by pure functions (daemonseed_tui::ui), so it is unit-testable and PTY-driveable without a terminal. The binary owns terminal lifecycle + event loop and reuses daemonseed-cli's connect / identity-proof / C22-trust client stack for the network side."
   license: "AGPL-3.0-or-later"
   manifest_for: "crates/daemonseed-tui"
-  status: "current through M12 — app state machine + render loop + first-start (incl. clean-device recovery) + chat/circle + C22 trust slider + F22 server-management + C28 trust-event affordances (modal/badge/toast/history) + close-cause + shares/fetch/indexer + public-space + deprecation; M12 adds the Servers-pane introducer refresh surfacing introducer-discovered candidates (gate step 6)"
+  status: "current through M13 (v0.17.0) — app state machine + render loop + first-start (incl. clean-device recovery) + chat/circle + C22 trust slider + F22 server-management + C28 trust-event affordances (modal/badge/toast/history) + close-cause + shares/fetch/indexer + public-space + deprecation; M12 added the Servers-pane introducer refresh surfacing introducer-discovered candidates (gate step 6); v0.16 added the multi-circle carousel; M13 (the persistence keystone) wires the session write-through so display name + mute/hide + circle membership persist into the at-rest seeds blob and silently restore on a daily-login Unlock — persisted circles rejoin without re-typing the phrase, no wire change"
 
 modules:
   - name: daemonseed_tui::app
@@ -47,8 +47,10 @@ modules:
       the split chat view filters lines per pane strictly on the Surface tag so no
       cross-surface bleed (messages_on, ISC-A-C29); a post seals under exactly the
       active circle's key and an inbound message is attributed to the single circle
-      whose key opened it (ISC-A-C30); the set is session-only but
-      serialization-shaped for later additive persistence (ISC-C59). It also has a
+      whose key opened it (ISC-A-C30); the membership set persists into the
+      at-rest seeds blob (M13) and is restored on a daily-login Unlock, with each
+      persisted circle silently rejoined without re-typing the phrase (ISC-C51 /
+      ISC-C59). It also has a
       server-management screen
       (F22: add server, trusted/untrusted slider, connect-selected — ISC-21/26/27).
       It also folds C28 trust events into class-routed slots via core class_of:
@@ -63,7 +65,7 @@ modules:
     no_std: false
     depends_on: [daemonseed-core, "daemonseed_tui::screens::first_start"]
     iscs: ["1", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", C16, C25, C26, C28, C59, C60, C61, C62, A-S3, A-S11, A-C3, A-C7, A-C12, A-C29, A-C30, F23]
-    added_in: "M11 scaffold + chat + trust/server + C28 + shares + fetch + public-space + deprecation workstream; v0.16 multi-circle carousel (C59-C62 / A-C29 / A-C30)"
+    added_in: "M11 scaffold + chat + trust/server + C28 + shares + fetch + public-space + deprecation workstream; v0.16 multi-circle carousel (C59-C62 / A-C29 / A-C30); M13 session write-through + circle-membership persistence/rejoin (C51 / C59)"
 
   - name: daemonseed_tui::net
     description: >-
@@ -112,8 +114,10 @@ modules:
       so a discovered peer is a candidate the user must explicitly promote, never
       auto-trusted, and the response carries no key material).
       Events: Connected/ConnectFailed, CircleJoined ({ circle_id: u64, label:
-      String } — the added circle's stable id + client-local label, ISC-C59 /
-      ISC-C62) / CircleJoinFailed,
+      String, entropy: String } — the added circle's stable id + client-local
+      label, plus the canonicalized entropy echoed back in-process so the app can
+      pair a rejoin to its persisted PersistedCircle without ordering assumptions
+      (M13, ISC-C51 / C59 / C62) / CircleJoinFailed,
       ChatMessage ({ circle_id: u64, sender, body, sent_unix_ms } — attributed to
       the single circle whose key opened the frame, ISC-A-C30), ChatError,
       TrustEvent (a C28 trust-event key + scope, routed
@@ -140,7 +144,7 @@ modules:
     no_std: false
     depends_on: [daemonseed-cli, daemonseed-core, daemonseed-proto]
     iscs: ["10", "14", "16", "17", "19", "20", "22", "23", "24", "25", "28", "47", C15, C17, C21, C22, C25, C26, C28, C37, C59, C60, C62, S6, A-S2, A-S3, A-S11, A-C7, A-S12, A-C19, A-C30, F23]
-    added_in: "M11 connect + chat + C28 + shares + fetch + public-space + deprecation workstream; M12 introducer refresh (gate step 6); v0.16 multi-circle (C59/C60/C62 / A-C30)"
+    added_in: "M11 connect + chat + C28 + shares + fetch + public-space + deprecation workstream; M12 introducer refresh (gate step 6); v0.16 multi-circle (C59/C60/C62 / A-C30); M13 CircleJoined entropy echo for rejoin pairing (C51 / C59)"
 
   - name: daemonseed_tui::screens::first_start
     description: >-
@@ -254,7 +258,7 @@ public_types:
     variants: [Lobby, "Circle(u64)"]
   - name: daemonseed_tui::app::JoinedCircle
     kind: struct
-    description: "One circle in the session-scoped membership set (ISC-C59 / ISC-C62): id (stable per-session id assigned at join — keys the active-surface selection, the Surface::Circle tag, and the SendChat seal target) + label (client-local display label, never transmitted nor derived from members). Serialization-shaped so circle-membership persistence into the at-rest Seeds blob is a later additive change, not a refactor; NOT persisted now (the set is re-entered each session, ISC-A-C2)."
+    description: "One circle in the membership set (ISC-C59 / ISC-C62): id (stable per-session id assigned at join — keys the active-surface selection, the Surface::Circle tag, and the SendChat seal target) + label (client-local display label, never transmitted nor derived from members). As of M13 the membership is persisted into the at-rest Seeds blob (each entry maps to a core PersistedCircle holding the canonicalized entropy + label) and restored on a daily-login Unlock; on restore each persisted circle is silently rejoined without re-typing the phrase (ISC-C51 / C59). Per the M13 remember-all decision this revises the earlier ISC-A-C2 wording that circle entropy is never persisted (the entropy lives encrypted under the at-rest blob's KDF and stays non-mnemonic-derivable)."
   - name: daemonseed_tui::app::MainFocus
     kind: enum
     description: "Which Main-view input has keyboard focus (Tab cycles Chat → JoinCircle → Mute → Shares → Hide → Servers → TrustHistory → PublicSpace → Deprecation → Chat). Chat (compose, Enter sends, ISC-14); JoinCircle (phrase, Enter joins, ISC-15/16); Mute (full handle, Enter toggles the client-local mute set, ISC-13 / A-C3); Shares (two-pane My/Public shares view; Up/Down selects, r refreshes, ISC-17/20); Hide (full sharer-handle, Enter toggles the client-local hidden-shares set, ISC-18 / C16 / A-C3 — Shares view stays visible); Servers (F22 server-management — main area shows the server list; Enter adds or connects-selected, Left/Right slides trust, Up/Down selects, ISC-21/26/27; M12 gate step 6 — opening the pane auto-dispatches RefreshIntroducer and a read-only "Discovered (introducer)" sub-section lists each introducer-discovered peer as `server-id  address` with the `candidate` label, carrying no key bytes and never auto-trusted — promotion stays an explicit user action, ISC-S6 / ISC-C22 / ISC-A-C19); TrustHistory (main area shows the C28 trust-event audit log; Up/Down select, Enter dismisses per (key, scope), ISC-25 / A-C12); PublicSpace (read-only MOTD + announcements view; Up/Down selects, r refreshes, ISC-25 / S7 / A-S3); Deprecation (read-only verified suite-deprecation warnings; Up/Down selects, r refreshes, ISC-C25 / A-S11 / C28)."

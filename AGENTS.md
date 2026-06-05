@@ -72,6 +72,25 @@ If yes, write it into the relevant documentation (rustdoc, README, or a `docs/` 
 
 Insights surface during code work, not during doc work. A manifest-only commit or a refactor commit is just as likely to expose a gem as a feature commit — so this check runs at **every** commit gate. Capture every gem while the context is warm; a gem deferred is usually a gem lost. When no gem applies, that is a valid outcome — many commits legitimately surface none. The discipline is forcing the thought at each commit gate, not producing a gem on every commit.
 
+## Doc-sync ritual at every PR / batch / context-refresh boundary
+
+The per-commit doc-sync above keeps each commit honest. This ritual is the **boundary checkpoint** that catches what per-commit updates miss: release-level state (versions, milestone status, narrative) and the draft "gems" cheapest to capture while the context that produced them is still hot. **Run it in full before opening a PR, before closing a batch or milestone, and before any context refresh or session handoff. It is mandatory, not optional, and it is never deferred to "later."**
+
+**Why this is enforced:** stale docs and stale project context burn inference. Every fact a future session or contributor must reconstruct — because it was true and known *now* but never written down — is paid for again later, at higher cost and lower fidelity. Capture-while-hot is near-zero cost; reconstruct-when-cold compounds. A milestone that ships with a stale README, manifest, or ISA forces the next context to re-derive the state of the world before it can do any real work. The per-commit checks above are necessary but not sufficient: release-level currency (the README Status line, the lama version, the manifest's milestone state) slips silently across several commits unless a boundary checkpoint reconciles it explicitly.
+
+At every boundary, reconcile ALL of the following to reflect what actually shipped — do not stop at the one or two surfaces you happened to touch this batch:
+
+1. **`ISA.md`** — flip any milestone/ISC rows from planned→shipped; add `## Decisions` entries for boundary-level design calls; add `## Verification` evidence. Frozen-contract surfaces (Principles, Constraints, Criteria wording, Out of Scope) change only here, deliberately, in the PR.
+2. **`README.md` `## Status`** — current release version + a proportionate narrative bringing it from the last documented release to now. This is the surface most prone to silent multi-release drift; check it every boundary even when no single commit "changed user-facing status."
+3. **`lama.yaml` (root) + `docs/llm-api-manifest/*-api.yaml`** — version field + status/summary lines current to the release; update the per-crate manifests for any crate whose surface the batch changed.
+4. **Vault project manifest** (`~/carakastan/Projects/DaemonSeed/llm-project-manifest.yaml`, **do not commit**) — `current_release`, `milestones_complete`, `milestones_in_progress`, `next_milestone`, and the recent-milestone summary. Collapse shipped in-progress prose into history; never leave "in progress" / "kicked off" framing on completed work.
+5. **Suite registry** (`~/carakastan/Projects/DaemonSeed/ds-suite-registry.md`, **do not commit**) — if the boundary touched cryptographic suites.
+6. **Gem capture.** Sweep the whole batch's conversation for (a) user/operator-facing explanations → append to the manual scratch files (per the gem check above), and (b) implementer/security insights → rustdoc/README/`docs/`. The boundary is the highest-yield capture moment because the entire batch's reasoning is still in context; once it cools the gem is usually lost.
+
+**Repo docs vs. vault docs — contributor scope.** Items 1–3 and the in-repo half of 6 (rustdoc / README / `docs/`) are **required of every contributor** as part of the PR — a PR is incomplete without them, and a reviewer should block on stale repo docs. Items 4, 5, and the scratch-file half of 6 are **vault-local** (`~/carakastan/Projects/DaemonSeed/`) and require project-folder access: they are the **project lead's responsibility**, reconciled at the same boundary by whoever holds that access. An outside contributor neither can nor must update them — their doc-sync obligation is fully discharged by keeping the in-repo docs current, and the vault docs are never a blocker on an external PR.
+
+**Boundary completion gate:** a PR / batch / refresh is not done until every item above is either updated or explicitly confirmed unaffected. State the reconciliation in the PR body or handoff note (e.g. "doc-sync: ISA milestone row + README Status + lama vX + manifest current_release/milestones + N gems captured"). When refreshing context (compaction, handoff, new session), run this ritual **first**, so the next context starts from a true state of the world rather than paying to rediscover it.
+
 ## License posture
 
 - **Code crates** (`daemonseed-core`, `daemonseed-server`, `daemonseed-cli`, `daemonseed-tui`, `xtask`): **AGPL-3.0-or-later**.
