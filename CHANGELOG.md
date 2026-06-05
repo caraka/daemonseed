@@ -23,6 +23,21 @@ In-progress and next-milestone planning is tracked in the project lead's vault
 manifest (not committed). The next entry is added here at the moment a release
 is tagged, as part of the doc-sync ritual in `AGENTS.md`.
 
+## [0.18.0] — M14, share-management surface + persistence
+
+The TUI gains a **Define-Share** input box: type a local directory (`path` or
+`path|label`) and the net actor opens the redb share index and cold-scans it on a
+dedicated background thread — the command loop never blocks and the index stays
+queryable during the scan (redb MVCC, ISC-A-C7). Defined roots **persist** in the
+at-rest blob as a `share` directive (ISC-C21) and **re-index automatically** on the
+next daily-login Unlock, mirroring circle rejoin. The share-index key is derived as
+a **sibling of the at-rest key from a single Argon2id run** (domain-separated
+HKDF-Expand, ISC-C3 / A-C6); the at-rest key output is byte-identical to before, so
+existing blobs open unchanged. Also folds in the M13 deferrals: a circle-join
+**entropy meter** with the ISC-C9 join gate, and a relay-independent **circle
+fingerprint** (coded, not yet surfaced). Publishing remains operator/CLI-side; the
+TUI is fetch + local-index only. No wire change.
+
 ## [0.17.0] — M13, persistence keystone
 
 The at-rest seeds blob now persists display name, mute list, hidden-shares, and

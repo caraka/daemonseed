@@ -91,6 +91,13 @@ modules:
       ISC-C60 / ISC-A-C30),
       RefreshShares (read the held ShareIndex.entries() and the relay's
       ListPublicShares snapshot, emit a SharesSnapshot event; pure read-path),
+      DefineShare ({ root, label, index_path, index_key } — M14, ISC-C21 / A-C7:
+      open the redb ShareIndex at index_path under the IndexKey off-thread, retain
+      it for foreground queries, then cold-scan root on a dedicated blocking thread
+      writing to the same index the foreground reads (redb MVCC) so the command loop
+      never parks; emits IndexerStatus events; index_key rides in the redacted core
+      IndexKey newtype so it never lands in a Debug log; MVP single active index,
+      latest DefineShare wins),
       FetchShare (ISC-19, F23 unified mechanism — derives the public-share
       asset address from share_id + connected server-id, opens a new bidi
       CircleOfTrust.Subscribe stream over the existing AppSession, sends a
@@ -125,6 +132,10 @@ modules:
       layer), SharesSnapshot ({ local: Vec<LocalShareRow>, remote:
       Vec<PublicShareListing>, indexer_status: IndexerStatus } — ISC-17/20),
       SharesError (RPC or storage failure surfaced on the status line),
+      IndexerStatus(IndexerStatus) (M14 — a standalone indexer transition,
+      Indexing → Ready, emitted on DefineShare and on background-scan completion;
+      Ready triggers a follow-up RefreshShares to pull the new rows),
+      ShareDefineFailed ({ message } — M14, the share index could not be opened),
       FetchProgress ({ total_chunks: Option<u32>, chunks_received, bytes_received
       } — first event after manifest arrives), FetchComplete ({ share_id,
       files_written, bytes_written }), FetchError ({ message } — terminal),
@@ -232,6 +243,8 @@ public_types:
       - "fn take_pending_share_refresh(&mut self) -> bool  # drained into NetCommand::RefreshShares"
       - "fn fetch(&self) -> Option<&FetchUi>               # ISC-19 active fetch overlay"
       - "fn take_pending_share_fetch(&mut self) -> Option<(String, String)>  # drained into NetCommand::FetchShare"
+      - "fn take_pending_share_define(&mut self) -> Option<ShareDefineRequest>  # M14 — drained into NetCommand::DefineShare; single slot then the Unlock re-emit queue"
+      - "fn share_input(&self) -> &str                     # M14 Define-Share input buffer"
       - "fn public_motd(&self) -> Option<&str>             # ISC-25 inert MOTD pane"
       - "fn public_posts(&self) -> &[PublicPostRow]         # ISC-S7 announcements pane"
       - "fn post_sel(&self) -> usize                        # announcements row selection"
@@ -261,11 +274,14 @@ public_types:
     description: "One circle in the membership set (ISC-C59 / ISC-C62): id (stable per-session id assigned at join — keys the active-surface selection, the Surface::Circle tag, and the SendChat seal target) + label (client-local display label, never transmitted nor derived from members). As of M13 the membership is persisted into the at-rest Seeds blob (each entry maps to a core PersistedCircle holding the canonicalized entropy + label) and restored on a daily-login Unlock; on restore each persisted circle is silently rejoined without re-typing the phrase (ISC-C51 / C59). Per the M13 remember-all decision this revises the earlier ISC-A-C2 wording that circle entropy is never persisted (the entropy lives encrypted under the at-rest blob's KDF and stays non-mnemonic-derivable)."
   - name: daemonseed_tui::app::MainFocus
     kind: enum
-    description: "Which Main-view input has keyboard focus (Tab cycles Chat → JoinCircle → Mute → Shares → Hide → Servers → TrustHistory → PublicSpace → Deprecation → Chat). Chat (compose, Enter sends, ISC-14); JoinCircle (phrase, Enter joins, ISC-15/16); Mute (full handle, Enter toggles the client-local mute set, ISC-13 / A-C3); Shares (two-pane My/Public shares view; Up/Down selects, r refreshes, ISC-17/20); Hide (full sharer-handle, Enter toggles the client-local hidden-shares set, ISC-18 / C16 / A-C3 — Shares view stays visible); Servers (F22 server-management — main area shows the server list; Enter adds or connects-selected, Left/Right slides trust, Up/Down selects, ISC-21/26/27; M12 gate step 6 — opening the pane auto-dispatches RefreshIntroducer and a read-only "Discovered (introducer)" sub-section lists each introducer-discovered peer as `server-id  address` with the `candidate` label, carrying no key bytes and never auto-trusted — promotion stays an explicit user action, ISC-S6 / ISC-C22 / ISC-A-C19); TrustHistory (main area shows the C28 trust-event audit log; Up/Down select, Enter dismisses per (key, scope), ISC-25 / A-C12); PublicSpace (read-only MOTD + announcements view; Up/Down selects, r refreshes, ISC-25 / S7 / A-S3); Deprecation (read-only verified suite-deprecation warnings; Up/Down selects, r refreshes, ISC-C25 / A-S11 / C28)."
-    variants: [Chat, JoinCircle, Mute, Shares, Hide, Servers, TrustHistory, PublicSpace, Deprecation]
+    description: "Which Main-view input has keyboard focus (Tab cycles Chat → JoinCircle → Mute → Shares → DefineShare → Hide → Servers → TrustHistory → PublicSpace → Deprecation → Chat). Chat (compose, Enter sends, ISC-14); JoinCircle (phrase, Enter joins, ISC-15/16); Mute (full handle, Enter toggles the client-local mute set, ISC-13 / A-C3); Shares (two-pane My/Public shares view; Up/Down selects, r refreshes, ISC-17/20); DefineShare (M14 — JoinCircle-style input box; type a local directory `path` or `path|label`, Enter validates the dir exists and queues a ShareDefineRequest the binary turns into NetCommand::DefineShare, ISC-C21; a bad path keeps the buffer so the typo is fixable in place; on success focus returns to Shares); Hide (full sharer-handle, Enter toggles the client-local hidden-shares set, ISC-18 / C16 / A-C3 — Shares view stays visible); Servers (F22 server-management — main area shows the server list; Enter adds or connects-selected, Left/Right slides trust, Up/Down selects, ISC-21/26/27; M12 gate step 6 — opening the pane auto-dispatches RefreshIntroducer and a read-only 'Discovered (introducer)' sub-section lists each introducer-discovered peer as `server-id  address` with the `candidate` label, carrying no key bytes and never auto-trusted — promotion stays an explicit user action, ISC-S6 / ISC-C22 / ISC-A-C19); TrustHistory (main area shows the C28 trust-event audit log; Up/Down select, Enter dismisses per (key, scope), ISC-25 / A-C12); PublicSpace (read-only MOTD + announcements view; Up/Down selects, r refreshes, ISC-25 / S7 / A-S3); Deprecation (read-only verified suite-deprecation warnings; Up/Down selects, r refreshes, ISC-C25 / A-S11 / C28)."
+    variants: [Chat, JoinCircle, Mute, Shares, DefineShare, Hide, Servers, TrustHistory, PublicSpace, Deprecation]
   - name: daemonseed_tui::app::LocalShareRow
     kind: struct
     description: "One indexed file in the user's own share, as rendered in the My-shares pane (ISC-17 / C21). A render-only projection of daemonseed_core::storage::share_index::ShareEntry: rel_path, size, mtime_unix_ms."
+  - name: daemonseed_tui::app::ShareDefineRequest
+    kind: struct
+    description: "A user request to define (add) a local share root (M14, ISC-C21): root (PathBuf, validated to exist at capture) + label (Option<String>). Produced by the DefineShare input box, drained by the binary via take_pending_share_define; the binary derives the redb index-file path + the share-index key (core IndexKey from the session) and turns it into NetCommand::DefineShare — the App layer holds no key material. On Unlock, one request per persisted core PersistedShare is replayed (re-indexes without re-persisting)."
   - name: daemonseed_tui::app::DeprecationWarningRow
     kind: struct
     description: "One affected-suite warning in the Deprecation pane (ISC-C25), a render-only projection of core's DeprecationEntry built by the net actor via daemonseed_core::trust_events::assess_deprecation: suite_id (u16), cutoff_unix_ms (i64), recommended_suite_id (u16), past_cutoff (bool — blocking cutoff-hit vs still-advisory pending)."

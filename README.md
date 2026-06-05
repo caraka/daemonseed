@@ -52,7 +52,7 @@ All six crates are substantive as of the alpha1 MVP (M12). The `tui` crate — t
 
 ## Status
 
-Current release: **v0.17.0** — alpha (post-MVP). The alpha1 MVP landed at v0.14.0 (the full 4-daemon end-to-end gate, `cargo xtask mvp-gate`, passes 10/10); releases since have added share download, public rooms, the client-identity lifecycle, the multi-circle carousel, and the at-rest persistence keystone.
+Current release: **v0.18.0** — alpha (post-MVP). The alpha1 MVP landed at v0.14.0 (the full 4-daemon end-to-end gate, `cargo xtask mvp-gate`, passes 10/10); releases since have added share download, public rooms, the client-identity lifecycle, the multi-circle carousel, the at-rest persistence keystone, and the TUI share-management surface (define a local share root, indexed and persisted across Unlock).
 
 The per-release history lives in **[`CHANGELOG.md`](CHANGELOG.md)** (one entry per SSH-signed tag) — this section is intentionally kept to the current release so it can't silently drift. The release-signing *infrastructure* (real keys, Sigstore co-signature, reproducible builds, store / package-manager channels) and the platform features (biometric login, OS-native autostart) remain on a follow-up track; direct messaging is planned. Promotion to a public repository is gated on the `oxicrypt` sibling crate going public.
 

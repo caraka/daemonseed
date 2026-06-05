@@ -367,6 +367,8 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
 
 ## Decisions
 
+- 2026-06-05: **M14 share-management surface — share-index key as a sibling of the at-rest key; single active index for MVP (caraka-reviewed crypto).** The TUI gains a Define-Share input box; defined roots are indexed by the net actor and persisted. **Crypto/trust-boundary call (caraka reviewed the diff before commit):** the share-index key (ISC-C3 / A-C6) is derived as a *sibling* of the at-rest key from the *one* Argon2id run — `derive_session_keys` expands the single high-entropy intermediate twice under distinct HKDF `info` (`at-rest` vs `share-index`), so the at-rest key output is byte-identical (existing blobs open unchanged) and the index key costs no second Argon2id (Pi-4 floor). `IndexKey` is a zeroizing newtype carried on `Opened` + `SessionMaterials`, threaded through first-start and unlock. **Forks locked (caraka):** (1) share UX = a JoinCircle-style input box with an example-path hint; (3) fingerprint-only, rename deferred to the GUI era; (4) block-below-floor on circle join (precautionary). **MVP scope pin:** a single active share index (latest `DefineShare` wins); multi-root concurrent indexing (one index per root) is a documented follow-up; the actor opens the index off-thread and cold-scans on a dedicated blocking thread (redb MVCC) so the command loop never parks (ISC-A-C7). **Persistence (ISC-C21):** a `share <hex(root)> <hex(label)>` directive mirrors the `circle` directive; defining write-throughs the root, and Unlock re-emits one `DefineShare` per persisted root via a queue that re-indexes WITHOUT re-persisting. **Carried, not yet ratified:** zxcvbn saturates at 2^64 so the literal ISC-C9 ≥128-bit floor is unmeasurable; the join gate uses an interim score-4 proxy. The real estimator (key-space / word-count) + restoring a true ≥128 check await caraka's threshold ratification — deliberately NOT recorded as an ISC-C9 change here until then.
+
 - 2026-06-05: **M13 persistence keystone — remember-all (A) over per-circle opt-in (B) (caraka).** The
   at-rest blob now persists display name (ISC-C4b), mute (ISC-C15), hide (ISC-C16), and **circle
   membership** (ISC-C59: entropy + label) via a session write-through, so a daily-login Unlock stops
@@ -601,3 +603,16 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   10/10 subprocess tests) → **MVP reached at v0.14.0**. Probe: `cargo xtask mvp-gate`.
 - ISA sanitization fidelity (no leaked internal paths or personal names; all ISC IDs preserved) — verified
   this session via advisor + Cato cross-vendor audit; see session record.
+- M14 (share-management surface + persistence, ISC-C21 / C3 / A-C6 / A-C7) verified 2026-06-05:
+  `cargo test --workspace` green (core 457, tui 144, all integration crates 0-fail); `cargo fmt --all --check`
+  + `cargo clippy --workspace --all-targets` clean. Unit evidence — `daemonseed-core`:
+  `index_key_is_sibling_distinct_deterministic_and_free_on_unlock` (at-rest key byte-identical, index key
+  distinct + deterministic + recovered on unlock + salt-separated by profile_id), `scan_into_indexes_a_shared_arc_index`
+  (Arc-shared off-thread scan), `shares_round_trip_through_blob_with_spaces_and_optional_label` +
+  `add_share_is_idempotent_on_root_and_remove_works`; `daemonseed-tui`: define-share capture + bad-path reject,
+  `defining_a_share_persists_root_and_queues_the_command`, `unlock_reemits_define_share_per_persisted_root`.
+  **Live single-daemon dogfood** (real `--portable` binary driven via `screen`): define a share root →
+  My-shares `indexer: ready (2 entries)` → quit (seeds.blob written) → relaunch → routed to Unlock (ISC-C51)
+  → passphrase only → My-shares auto re-indexed to 2 entries from the persisted root, no re-typing.
+  Probe: `cargo test --workspace` + the dogfood transcript. (Cross-daemon publish→fetch was also verified live
+  against the alpha relay, but via the operator/CLI publish path — the TUI has no publish affordance.)

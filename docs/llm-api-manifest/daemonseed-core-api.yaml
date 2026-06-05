@@ -229,7 +229,14 @@ modules:
       set (PersistedCircle), and introduces the SealingKey — an at-rest AEAD
       key cached at open/first-start so the running client re-seals the blob
       on each mutation without a second Argon2id (the Pi-4 floor). open()
-      now returns that key in Opened::key.
+      now returns that key in Opened::key. M14 adds the share-index key as a
+      sibling of the at-rest key: derive_session_keys runs the one Argon2id
+      stage and expands the intermediate twice (info=at-rest + info=share-index)
+      so the at-rest output is byte-identical and the IndexKey (zeroizing
+      newtype, returned in Opened::index_key) costs no second Argon2id;
+      SealingKey::derive_session returns both for first-start. M14 also adds the
+      persisted share-root set (PersistedShare) with add_share / remove_share /
+      shares + a `share <hex(root)> <hex(label)>` directive line (ISC-C21).
     no_std: false
     depends_on:
       - daemonseed_core::identity::mnemonic
@@ -364,7 +371,11 @@ modules:
       owns task isolation/priority. The live inotify/FSEvents source is
       ShareWatcher (notify crate); when the OS watch limit is exceeded it
       surfaces WatchError::Limit and the caller drops to the periodic
-      mtime_rescan fallback (ISC-21).
+      mtime_rescan fallback (ISC-21). M14 adds the free fn scan_into(&ShareIndex,
+      root) — the cold-scan walk over a *borrowed* index (cold_scan delegates to
+      it) so a caller holding an Arc<ShareIndex> can run the scan on a background
+      thread while the same index stays queryable from the foreground (redb MVCC);
+      this is the TUI net-actor's share-activation path.
     no_std: false
     depends_on:
       - daemonseed_core::storage::share_index
@@ -964,6 +975,16 @@ types:
           at-rest blob's two-stage KDF and stays non-mnemonic-derivable (a
           mnemonic-only recovery never reconstructs the social graph). Debug surfaces
           only the count.
+      - name: shares
+        type: "Vec<PersistedShare>"
+        description: >-
+          Local share roots to re-index on the next Unlock (ISC-C21 persistence,
+          M14), in insertion order. Each entry is a directory path + optional
+          client-local label, serialized as a `share <hex(root)> <hex(label)>`
+          directive. Mutate via add_share / remove_share / shares. Client-local
+          only — no wire message carries it (ISC-A-C3); this is persistence of
+          configuration, not shared content, so no-client-history holds. Debug
+          surfaces only the count.
     security:
       contains_secret: true
       zeroize_on_drop: true
@@ -992,6 +1013,29 @@ types:
           The at-rest AEAD key derived while opening, cached for the session so the
           M13 write-through can re-seal on each mutation without re-running
           Argon2id. The Unlock path hands this straight to the client.
+      - name: index_key
+        type: IndexKey
+        description: >-
+          The share-index key (M14), derived as a sibling of `key` from the same
+          Argon2id run via a second domain-separated HKDF-Expand (info=share-index).
+          The Unlock path hands it to the client to open the redb ShareIndex for
+          free — no extra Argon2id. Zeroizing; never logged/persisted.
+
+  - name: PersistedShare
+    module: daemonseed_core::storage::seeds
+    kind: struct
+    description: >-
+      One remembered local share root in the at-rest blob (ISC-C21 persistence,
+      M14). Holds the directory path and an optional client-local label; neither
+      leaves the encrypted blob (ISC-A-C3). Serialized as a
+      `share <hex(root)> <hex(label)>` directive (empty label hex = None).
+    fields:
+      - name: root
+        type: String
+        description: The shared directory path, as the user entered it.
+      - name: label
+        type: "Option<String>"
+        description: Optional client-local label; None falls back to the path at render.
 
   - name: PersistedCircle
     module: daemonseed_core::storage::seeds
@@ -1028,9 +1072,28 @@ types:
       sensitive in-RAM secret: never logged, never persisted; zeroizes on drop and
       should be dropped at logout. Clone. Methods: derive(passphrase, profile_id,
       params) -> Result<SealingKey, BlobError> (one Argon2id run; used at
-      first-start) and seal(&Seeds) -> Result<Vec<u8>, BlobError> (re-seal under the
-      active write-suite using the cached key, no Argon2id). Debug renders
+      first-start), derive_session(passphrase, profile_id, params) ->
+      Result<(SealingKey, IndexKey), BlobError> (M14 — both session keys from one
+      Argon2id run; used at first-start so the share index key is free), and
+      seal(&Seeds) -> Result<Vec<u8>, BlobError> (re-seal under the active
+      write-suite using the cached key, no Argon2id). Debug renders
       "SealingKey(<redacted>)".
+
+  - name: IndexKey
+    module: daemonseed_core::storage::seeds
+    kind: struct
+    description: >-
+      A cached share-index key (M14) derived as a sibling of the at-rest SealingKey
+      from the *same* single Argon2id run — one expensive KDF, two domain-separated
+      HKDF-Expand outputs. Opens the redb ShareIndex (storage::share_index). A
+      session secret on par with the at-rest key: zeroizes on drop, never logged or
+      persisted; Debug renders "IndexKey(<redacted>)". Clone. Method:
+      to_bytes() -> [u8; INDEX_KEY_LEN] for ShareIndex::open (which takes the key by
+      value). Obtained via Opened::index_key (unlock) or SealingKey::derive_session
+      (first-start).
+    security:
+      contains_secret: true
+      zeroize_on_drop: true
     security:
       contains_secret: true
       zeroize_on_drop: true
@@ -1279,6 +1342,24 @@ types:
       - name: bootstrap
         type: BootstrapAnchor
         description: The selected initial federation peer.
+      - name: seeds
+        type: Seeds
+        description: >-
+          The live at-rest payload the running client mutates and re-seals for the
+          M13 write-through (display name, mute/hide, circles, M14 shares). At
+          first-start it carries the chosen display name; on Unlock it is the
+          decrypted on-disk payload (Opened::seeds).
+      - name: seal_key
+        type: SealingKey
+        description: >-
+          The cached at-rest AEAD key matching the blob `seeds` seals into (M13), so
+          the client re-seals on each mutation without re-running Argon2id. Zeroizing.
+      - name: index_key
+        type: IndexKey
+        description: >-
+          The cached share-index key (M14), derived as a sibling of seal_key from the
+          same Argon2id run, used to open the redb ShareIndex and activate the M8
+          indexer against TUI-defined share roots. Zeroizing.
 
   - name: TypeBackChallenge
     module: daemonseed_core::first_start
