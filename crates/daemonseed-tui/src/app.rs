@@ -68,14 +68,35 @@ pub enum Screen {
     LoggedInMenu,
 }
 
-/// One rendered chat line in the joined circle (ISC-10). `sent_unix_ms` is the
-/// sender's advisory timestamp (`0` for the local echo of a just-sent message,
-/// which the relay never reflects back to its sender).
+/// Which surface a stored chat line belongs to (ISC-C61 / ISC-A-C29).
+///
+/// Every [`ChatLine`] carries one of these, set at the point it enters the
+/// transcript — `Lobby` for a public-room message (ISC-C56) and `Circle(id)` for
+/// a circle message attributed to the single circle whose key opened it
+/// (ISC-A-C30). The split chat view filters strictly on this tag: the lobby pane
+/// renders only `Lobby` lines, the active-circle pane renders only its own
+/// `Circle(id)` lines, so a line received on one surface can never bleed into
+/// another pane (ISC-A-C29).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Surface {
+    /// The auto-joined default public room (ISC-C56). Always present, always
+    /// rendered in the top lobby pane.
+    Lobby,
+    /// A specific joined circle, keyed by its stable per-session id (ISC-C59).
+    Circle(u64),
+}
+
+/// One rendered chat line (ISC-10). `sent_unix_ms` is the sender's advisory
+/// timestamp (`0` for the local echo of a just-sent message, which the relay
+/// never reflects back to its sender). `surface` tags which pane the line renders
+/// in (ISC-C61 / ISC-A-C29) — set at every push site and never changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatLine {
     pub sender: String,
     pub body: String,
     pub sent_unix_ms: i64,
+    /// The surface this line belongs to (ISC-C61). Drives the per-pane filter.
+    pub surface: Surface,
 }
 
 /// Which input on the [`Screen::Main`] view has keyboard focus. `Tab` cycles
@@ -262,17 +283,42 @@ pub struct ManagedServer {
     pub trusted: bool,
 }
 
-/// State of the circle subscription shown on the main view.
+/// State of the most-recent circle-join attempt, shown on the status bar.
+///
+/// With multiple simultaneous circles (ISC-C59) the durable membership lives in
+/// [`App::circles`]; this enum tracks only the *latest* join attempt so the
+/// status bar can show "joining…" / a failure cause. A successful join leaves it
+/// `Joined`; the actual joined set is the membership list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CircleStatus {
-    /// No circle joined yet.
+    /// No circle joined yet (membership set empty).
     NotJoined,
     /// A join is in flight (the net actor is subscribing).
     Joining,
-    /// Subscribed; chat can flow (ISC-16).
+    /// The most recent join succeeded; chat can flow (ISC-16).
     Joined,
-    /// The join failed; carries a human-readable cause.
+    /// The most recent join failed; carries a human-readable cause.
     Failed(String),
+}
+
+/// One circle in the client's session-scoped membership set (ISC-C59 / ISC-C62).
+///
+/// The struct is intentionally serialization-shaped: id + client-local label are
+/// exactly what a later additive persistence into the at-rest [`Seeds`] blob
+/// would store, so adding circle-membership persistence (ISC-C59) is an additive
+/// change, not a refactor. It is NOT persisted now — the set is rebuilt each
+/// session (circle entropy is re-entered, ISC-A-C2).
+///
+/// [`Seeds`]: daemonseed_core::storage::seeds::Seeds
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinedCircle {
+    /// Stable per-session id assigned by the net actor at join. Keys the
+    /// active-surface selection, the [`Surface::Circle`] tag on inbound lines,
+    /// and the `SendChat` seal target (ISC-A-C30).
+    pub id: u64,
+    /// Client-local display label (ISC-C62), shown in the carousel and compose
+    /// indicator. Never transmitted, never derived from members.
+    pub label: String,
 }
 
 /// A queued chat send for the binary to forward to the network actor. `body` is
@@ -281,6 +327,9 @@ pub enum CircleStatus {
 /// relay).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatSend {
+    /// The active circle to seal under (ISC-C60 / ISC-A-C30). The net actor looks
+    /// this id up in its membership set and seals under exactly that key.
+    pub circle_id: u64,
     pub body: String,
     pub sender_handle: String,
 }
@@ -300,10 +349,13 @@ pub struct ChatSend {
 /// unrepresentable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChatSurface {
-    /// The private opt-in surface — a joined circle (ISC-14). Takes precedence.
-    Circle,
-    /// The default surface — a joined public room, carrying its name
-    /// (ISC-S22 / ISC-C56).
+    /// The private opt-in surface — the *active* joined circle (ISC-14 / ISC-C60).
+    /// Carries the circle's id (the `SendChat` seal target, ISC-A-C30) and its
+    /// client-local label (the compose-indicator name, ISC-C62). Takes precedence
+    /// over the lobby when a circle is active.
+    Circle { id: u64, label: String },
+    /// The default surface — the auto-joined public room (lobby), carrying its
+    /// name (ISC-S22 / ISC-C56). The active surface when no circle is selected.
     PublicRoom(String),
 }
 
@@ -331,10 +383,22 @@ pub struct App {
     compose: String,
     /// The circle-join phrase buffer (ISC-15).
     circle_phrase: String,
-    /// Received + locally-echoed chat lines, oldest first (ISC-10).
+    /// Received + locally-echoed chat lines, oldest first (ISC-10). Each line
+    /// carries a [`Surface`] tag; the split view filters strictly on it
+    /// (ISC-C61 / ISC-A-C29).
     messages: Vec<ChatLine>,
-    /// Current circle subscription state.
+    /// Status of the most-recent circle-join attempt, for the status bar.
     circle_status: CircleStatus,
+    /// The session-scoped circle membership set (ISC-C59). Joining ADDS to it;
+    /// it is never evicted by another join. Order is join order; the carousel
+    /// cycles through it with ←/→. Serialization-shaped (see [`JoinedCircle`])
+    /// but session-only — not persisted.
+    circles: Vec<JoinedCircle>,
+    /// Index into [`Self::circles`] of the active circle, or `None` when no
+    /// circle is selected (the lobby is then the active surface). Bounded to a
+    /// valid index whenever `circles` is non-empty; cleared to `None` only when
+    /// the set is empty (ISC-C60).
+    active_circle: Option<usize>,
     /// The auto-joined default public room (ISC-S22 / ISC-C56), if subscribed.
     /// The default chat surface is this room — no circle required. `None` until
     /// the net actor reports a successful join after connect.
@@ -500,6 +564,8 @@ impl App {
             circle_phrase: String::new(),
             messages: Vec::new(),
             circle_status: CircleStatus::NotJoined,
+            circles: Vec::new(),
+            active_circle: None,
             public_room: None,
             status: None,
             mute_input: String::new(),
@@ -685,9 +751,20 @@ impl App {
         &self.circle_phrase
     }
 
-    /// The chat lines, oldest first, for rendering (ISC-10).
+    /// The chat lines, oldest first, for rendering (ISC-10). The split view
+    /// filters these per pane via [`Self::messages_on`]; this accessor returns the
+    /// whole transcript (used by mention-autocomplete and tests).
     pub fn messages(&self) -> &[ChatLine] {
         &self.messages
+    }
+
+    /// Chat lines whose [`Surface`] tag matches `surface`, oldest first
+    /// (ISC-C61 / ISC-A-C29). The split chat view calls this once per pane —
+    /// `Surface::Lobby` for the top pane and `Surface::Circle(active_id)` for the
+    /// bottom carousel pane — so a line received on one surface can never render
+    /// in another's pane (no cross-surface bleed).
+    pub fn messages_on(&self, surface: Surface) -> impl Iterator<Item = &ChatLine> {
+        self.messages.iter().filter(move |m| m.surface == surface)
     }
 
     /// The circle subscription status, for rendering.
@@ -723,19 +800,45 @@ impl App {
             NetEvent::ConnectFailed { message } => {
                 self.connection = ConnectionStatus::Failed(message);
             }
-            NetEvent::CircleJoined => self.circle_status = CircleStatus::Joined,
+            // A circle joined (ISC-C59): ADD it to the membership set (never evict
+            // an existing one) and select it active (ISC-C60). An idempotent
+            // re-join — the actor re-emits an id already in the set — only
+            // re-selects it active; the label is refreshed in case it changed.
+            NetEvent::CircleJoined { circle_id, label } => {
+                self.circle_status = CircleStatus::Joined;
+                if let Some(pos) = self.circles.iter().position(|c| c.id == circle_id) {
+                    self.circles[pos].label = label;
+                    self.active_circle = Some(pos);
+                } else {
+                    self.circles.push(JoinedCircle {
+                        id: circle_id,
+                        label,
+                    });
+                    self.active_circle = Some(self.circles.len() - 1);
+                }
+            }
             NetEvent::CircleJoinFailed { message } => {
                 self.circle_status = CircleStatus::Failed(message);
             }
+            // A circle message (ISC-A-C30): tag it with the single circle whose
+            // key opened it (the actor's attribution). The split view renders it
+            // only in that circle's pane (ISC-A-C29). A frame for a circle no
+            // longer in the set is dropped — never re-attributed to another pane.
             NetEvent::ChatMessage {
+                circle_id,
                 sender,
                 body,
                 sent_unix_ms,
-            } => self.messages.push(ChatLine {
-                sender,
-                body,
-                sent_unix_ms,
-            }),
+            } => {
+                if self.circles.iter().any(|c| c.id == circle_id) {
+                    self.messages.push(ChatLine {
+                        sender,
+                        body,
+                        sent_unix_ms,
+                        surface: Surface::Circle(circle_id),
+                    });
+                }
+            }
             NetEvent::ChatError { message } => self.status = Some(message),
             // Public-room lifecycle (ISC-S22 / ISC-C56): the default chat surface
             // is a public room, so a verified public-room message folds into the
@@ -756,6 +859,9 @@ impl App {
                 sender,
                 body,
                 sent_unix_ms,
+                // Lobby-tagged so it renders only in the top lobby pane
+                // (ISC-C61 / ISC-A-C29).
+                surface: Surface::Lobby,
             }),
             NetEvent::TrustEvent { key, server_id } => self.fold_trust_event(key, server_id),
             NetEvent::ConnectionClosed { cause } => self.close_cause = Some(cause),
@@ -1325,9 +1431,13 @@ impl App {
             KeyCode::Esc => self.screen = Screen::Main,
             KeyCode::Char('q') | KeyCode::Char('Q') => self.should_quit = true,
             KeyCode::Char('d') | KeyCode::Char('D') => {
-                // Disconnect → back to Unlock (re-login), never Welcome.
+                // Disconnect → back to Unlock (re-login), never Welcome. The
+                // session-scoped circle membership (ISC-C59) is dropped — circles
+                // are re-entered each session (ISC-A-C2).
                 self.connection = ConnectionStatus::Disconnected;
                 self.circle_status = CircleStatus::NotJoined;
+                self.circles.clear();
+                self.active_circle = None;
                 self.unlock_input.clear();
                 self.unlock_error = None;
                 self.screen = Screen::Unlock;
@@ -1493,25 +1603,76 @@ impl App {
     /// NEITHER joined, Enter is a no-op (Item F / ISC-C48 / A-C26) — no local
     /// echo, nothing transmitted.
     pub fn can_chat(&self) -> bool {
-        self.public_room.is_some() || matches!(self.circle_status, CircleStatus::Joined)
+        self.public_room.is_some() || !self.circles.is_empty()
     }
 
-    /// The surface a Chat-pane post will land on, or `None` when no surface is
+    /// The surface a Chat-pane post will land on, or `None` when nothing is
     /// joined (Enter is then a no-op — Item F / A-C26).
     ///
-    /// Precedence: a joined circle (the private opt-in, ISC-14) wins over a
-    /// joined public room (the default, ISC-S22 / ISC-C56). This is the single
+    /// Precedence (ISC-C60): the *active* circle (the private opt-in, ISC-14)
+    /// wins over the auto-joined lobby (the default, ISC-S22 / ISC-C56). The
+    /// active circle is the `active_circle` index into [`Self::circles`]; with
+    /// no circle selected the lobby is the active surface. This is the single
     /// source of truth for chat-surface routing — see [`ChatSurface`]. Both the
     /// Enter handler and the compose-box indicator resolve through it so they
-    /// cannot disagree about where a message goes.
+    /// cannot disagree about where a message goes, nor which circle's key seals it
+    /// (ISC-A-C30).
     pub fn active_chat_surface(&self) -> Option<ChatSurface> {
-        if matches!(self.circle_status, CircleStatus::Joined) {
-            Some(ChatSurface::Circle)
+        if let Some(c) = self.active_circle_ref() {
+            Some(ChatSurface::Circle {
+                id: c.id,
+                label: c.label.clone(),
+            })
         } else {
             self.public_room
                 .as_deref()
                 .map(|room| ChatSurface::PublicRoom(room.to_owned()))
         }
+    }
+
+    /// The active circle (ISC-C60), if one is selected. `None` when the
+    /// membership set is empty or the active surface is the lobby.
+    fn active_circle_ref(&self) -> Option<&JoinedCircle> {
+        self.active_circle.and_then(|i| self.circles.get(i))
+    }
+
+    /// The session-scoped circle membership set (ISC-C59), in join order, for
+    /// the carousel render.
+    pub fn circles(&self) -> &[JoinedCircle] {
+        &self.circles
+    }
+
+    /// The active-circle index into [`Self::circles`] (ISC-C60), or `None` when
+    /// the lobby is active / the set is empty. For the carousel header
+    /// ("circle N/M").
+    pub fn active_circle_index(&self) -> Option<usize> {
+        self.active_circle
+    }
+
+    /// The active circle's id + label (ISC-C60 / ISC-C62), for the circle-pane
+    /// header and the compose indicator. `None` when the lobby is active.
+    pub fn active_circle_label(&self) -> Option<(u64, &str)> {
+        self.active_circle_ref().map(|c| (c.id, c.label.as_str()))
+    }
+
+    /// Cycle the active circle one step (ISC-C60: ←/→ in the circle pane).
+    /// `forward` advances toward the next circle; `false` goes back. Wraps
+    /// around the membership set. A no-op when the set is empty (the lobby is the
+    /// only surface). Cycling changes only the active selection — never the
+    /// membership set — so it can never evict a circle (ISC-C59) and the next
+    /// post seals under the newly-active circle's key (ISC-A-C30).
+    pub fn cycle_active_circle(&mut self, forward: bool) {
+        let n = self.circles.len();
+        if n == 0 {
+            return;
+        }
+        let cur = self.active_circle.unwrap_or(0);
+        let next = if forward {
+            (cur + 1) % n
+        } else {
+            (cur + n - 1) % n
+        };
+        self.active_circle = Some(next);
     }
 
     /// Chat compose: printable chars append, Backspace deletes, Enter sends a
@@ -1534,22 +1695,32 @@ impl App {
     /// intact so the user's draft survives until they join a surface.
     fn on_key_chat(&mut self, key: KeyEvent) {
         match key.code {
+            // ←/→ cycle the active circle (ISC-C60). Cycling changes only the
+            // active selection (and thus the compose target + seal key), never
+            // the membership set — a no-op when no circle is joined.
+            KeyCode::Left => self.cycle_active_circle(false),
+            KeyCode::Right => self.cycle_active_circle(true),
             KeyCode::Char(c) => self.compose.push(c),
             KeyCode::Backspace => {
                 self.compose.pop();
             }
             KeyCode::Enter if !self.compose.is_empty() => {
                 match self.active_chat_surface() {
-                    Some(ChatSurface::Circle) => {
+                    Some(ChatSurface::Circle { id, .. }) => {
                         let body = std::mem::take(&mut self.compose);
                         let sender = self.own_handle();
-                        // Local echo: the relay never reflects a frame to its sender.
+                        // Local echo, tagged with the active circle's surface so
+                        // it renders only in that circle's pane (ISC-A-C29). The
+                        // relay never reflects a frame to its sender.
                         self.messages.push(ChatLine {
                             sender: sender.clone(),
                             body: body.clone(),
                             sent_unix_ms: 0,
+                            surface: Surface::Circle(id),
                         });
+                        // Seal under exactly the active circle's key (ISC-A-C30).
                         self.pending_chat = Some(ChatSend {
+                            circle_id: id,
                             body,
                             sender_handle: sender,
                         });
@@ -1557,11 +1728,13 @@ impl App {
                     Some(ChatSurface::PublicRoom(_)) => {
                         let body = std::mem::take(&mut self.compose);
                         let sender = self.own_handle();
-                        // Local echo: the relay never reflects a frame to its sender.
+                        // Local echo, Lobby-tagged (ISC-A-C29). The relay never
+                        // reflects a frame to its sender.
                         self.messages.push(ChatLine {
                             sender,
                             body: body.clone(),
                             sent_unix_ms: 0,
+                            surface: Surface::Lobby,
                         });
                         self.pending_public_room = Some(body);
                     }
@@ -1921,10 +2094,21 @@ mod tests {
         app
     }
 
+    /// Test helper: simulate the net actor confirming a circle join with a given
+    /// id + a derived label, mirroring `NetEvent::CircleJoined`.
+    fn join_circle(app: &mut App, id: u64) {
+        app.on_net_event(NetEvent::CircleJoined {
+            circle_id: id,
+            label: format!("circle-{id}"),
+        });
+    }
+
     #[test]
     fn chat_message_event_appends_to_transcript() {
         let mut app = App::new();
+        join_circle(&mut app, 1);
         app.on_net_event(NetEvent::ChatMessage {
+            circle_id: 1,
             sender: "otter#aabbccddeeff".to_owned(),
             body: "hello circle".to_owned(),
             sent_unix_ms: 7,
@@ -1938,7 +2122,7 @@ mod tests {
     fn circle_join_events_update_status() {
         let mut app = App::new();
         assert_eq!(app.circle_status(), &CircleStatus::NotJoined);
-        app.on_net_event(NetEvent::CircleJoined);
+        join_circle(&mut app, 1);
         assert_eq!(app.circle_status(), &CircleStatus::Joined);
         app.on_net_event(NetEvent::CircleJoinFailed {
             message: "subscribe refused".to_owned(),
@@ -2196,7 +2380,7 @@ mod tests {
         let mut app = drive_to_main();
         // A joined circle is the private opt-in; with one joined (and no public
         // room), Enter posts to the circle.
-        app.on_net_event(NetEvent::CircleJoined);
+        join_circle(&mut app, 1);
         for ch in "hi there".chars() {
             app.on_key(press(KeyCode::Char(ch)));
         }
@@ -2255,12 +2439,15 @@ mod tests {
             room: "lobby".to_owned(),
         });
         // … then the user opts into a circle.
-        app.on_net_event(NetEvent::CircleJoined);
+        join_circle(&mut app, 1);
         assert_eq!(app.public_room(), Some("lobby"));
         assert_eq!(app.circle_status(), &CircleStatus::Joined);
         assert_eq!(
             app.active_chat_surface(),
-            Some(ChatSurface::Circle),
+            Some(ChatSurface::Circle {
+                id: 1,
+                label: "circle-1".to_owned()
+            }),
             "a joined circle takes precedence over the auto-joined lobby"
         );
 
@@ -2300,11 +2487,258 @@ mod tests {
             "only a public room joined"
         );
 
-        app.on_net_event(NetEvent::CircleJoined);
+        join_circle(&mut app, 1);
         assert_eq!(
             app.active_chat_surface(),
-            Some(ChatSurface::Circle),
+            Some(ChatSurface::Circle {
+                id: 1,
+                label: "circle-1".to_owned()
+            }),
             "circle wins once joined"
+        );
+    }
+
+    // ── Multi-circle carousel (ISC-C59..C62 / A-C29 / A-C30) ─────────────────
+
+    /// ISC-C59: joining a second circle ADDS to the membership set; it never
+    /// evicts the first. Both remain joined, in join order, and the newest is
+    /// selected active.
+    #[test]
+    fn joining_second_circle_does_not_evict_first() {
+        let mut app = drive_to_main();
+        join_circle(&mut app, 1);
+        assert_eq!(app.circles().len(), 1);
+        assert_eq!(app.active_circle_index(), Some(0));
+
+        join_circle(&mut app, 2);
+        assert_eq!(app.circles().len(), 2, "second join ADDS, never evicts");
+        assert_eq!(app.circles()[0].id, 1, "first circle still present");
+        assert_eq!(app.circles()[1].id, 2, "second circle appended");
+        assert_eq!(
+            app.active_circle_index(),
+            Some(1),
+            "the newly-joined circle is selected active (ISC-C60)"
+        );
+    }
+
+    /// ISC-C59: an idempotent re-join (the net actor re-emits an id already in
+    /// the set) does not duplicate the membership; it only re-selects it active.
+    #[test]
+    fn rejoining_existing_circle_is_idempotent() {
+        let mut app = drive_to_main();
+        join_circle(&mut app, 1);
+        join_circle(&mut app, 2);
+        assert_eq!(app.active_circle_index(), Some(1));
+        // Re-emit circle 1 (a re-join of an already-joined circle).
+        join_circle(&mut app, 1);
+        assert_eq!(app.circles().len(), 2, "no duplicate membership");
+        assert_eq!(
+            app.active_circle_index(),
+            Some(0),
+            "re-join re-selects the existing circle active"
+        );
+    }
+
+    /// ISC-C60: cycling the active circle changes the compose target — the
+    /// `active_chat_surface` (and thus the `SendChat` seal id) follows the
+    /// carousel. ←/→ wrap around the set.
+    #[test]
+    fn cycling_active_circle_changes_compose_target() {
+        let mut app = drive_to_main();
+        join_circle(&mut app, 10);
+        join_circle(&mut app, 20);
+        join_circle(&mut app, 30);
+        // Active is the last-joined (id 30).
+        assert_eq!(
+            app.active_chat_surface(),
+            Some(ChatSurface::Circle {
+                id: 30,
+                label: "circle-30".to_owned()
+            })
+        );
+        // → wraps to the first.
+        app.on_key(press(KeyCode::Right));
+        assert!(
+            matches!(
+                app.active_chat_surface(),
+                Some(ChatSurface::Circle { id: 10, .. })
+            ),
+            "→ from the last wraps to the first circle"
+        );
+        // ← wraps back to the last.
+        app.on_key(press(KeyCode::Left));
+        assert!(
+            matches!(
+                app.active_chat_surface(),
+                Some(ChatSurface::Circle { id: 30, .. })
+            ),
+            "← from the first wraps to the last circle"
+        );
+        // One ← step lands on the middle circle (id 20).
+        app.on_key(press(KeyCode::Left));
+        assert!(matches!(
+            app.active_chat_surface(),
+            Some(ChatSurface::Circle { id: 20, .. })
+        ),);
+    }
+
+    /// ISC-A-C30: a composed post seals under EXACTLY the active circle's id —
+    /// never another circle's. Cycling the carousel then composing changes the
+    /// `SendChat` target id accordingly.
+    #[test]
+    fn post_seals_under_active_circle_id_only() {
+        let mut app = drive_to_main();
+        join_circle(&mut app, 7);
+        join_circle(&mut app, 8); // active = 8
+        for ch in "to eight".chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        app.on_key(press(KeyCode::Enter));
+        let send = app.take_pending_chat().expect("queued");
+        assert_eq!(send.circle_id, 8, "sealed under the active circle only");
+        assert_eq!(send.body, "to eight");
+
+        // Cycle to circle 7 and post again — the seal id follows the carousel.
+        app.on_key(press(KeyCode::Left)); // 8 → 7
+        for ch in "to seven".chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        app.on_key(press(KeyCode::Enter));
+        let send = app.take_pending_chat().expect("queued");
+        assert_eq!(
+            send.circle_id, 7,
+            "now sealed under the newly-active circle"
+        );
+        assert_eq!(send.body, "to seven");
+    }
+
+    /// ISC-A-C29: a message received on circle A renders ONLY in circle A's pane.
+    /// The per-surface filter keys strictly on the line's `surface` tag, so a
+    /// circle-A line never appears under circle B or the lobby.
+    #[test]
+    fn inbound_message_renders_only_in_its_own_surface() {
+        let mut app = drive_to_main();
+        join_circle(&mut app, 1);
+        join_circle(&mut app, 2);
+        app.on_net_event(NetEvent::PublicRoomJoined {
+            room: "lobby".to_owned(),
+        });
+        // A message on circle 1, a message on circle 2, and a lobby message.
+        app.on_net_event(NetEvent::ChatMessage {
+            circle_id: 1,
+            sender: "a#aabbccddeeff".to_owned(),
+            body: "only-in-one".to_owned(),
+            sent_unix_ms: 1,
+        });
+        app.on_net_event(NetEvent::ChatMessage {
+            circle_id: 2,
+            sender: "b#ccddeeff0011".to_owned(),
+            body: "only-in-two".to_owned(),
+            sent_unix_ms: 2,
+        });
+        app.on_net_event(NetEvent::PublicRoomMessage {
+            room: "lobby".to_owned(),
+            sender: "c#eeff00112233".to_owned(),
+            body: "only-in-lobby".to_owned(),
+            sent_unix_ms: 3,
+        });
+
+        let circle1: Vec<&str> = app
+            .messages_on(Surface::Circle(1))
+            .map(|m| m.body.as_str())
+            .collect();
+        let circle2: Vec<&str> = app
+            .messages_on(Surface::Circle(2))
+            .map(|m| m.body.as_str())
+            .collect();
+        let lobby: Vec<&str> = app
+            .messages_on(Surface::Lobby)
+            .map(|m| m.body.as_str())
+            .collect();
+
+        assert_eq!(
+            circle1,
+            vec!["only-in-one"],
+            "circle 1 pane is exactly its line"
+        );
+        assert_eq!(
+            circle2,
+            vec!["only-in-two"],
+            "circle 2 pane is exactly its line"
+        );
+        assert_eq!(
+            lobby,
+            vec!["only-in-lobby"],
+            "lobby pane is exactly its line"
+        );
+        // No cross-surface bleed.
+        assert!(!circle1.contains(&"only-in-two"));
+        assert!(!circle1.contains(&"only-in-lobby"));
+        assert!(!lobby.contains(&"only-in-one"));
+    }
+
+    /// ISC-A-C30: an inbound frame attributed to a circle NOT in the membership
+    /// set is dropped — never re-attributed to another pane or the lobby.
+    #[test]
+    fn inbound_for_unknown_circle_is_dropped() {
+        let mut app = drive_to_main();
+        join_circle(&mut app, 1);
+        app.on_net_event(NetEvent::ChatMessage {
+            circle_id: 99, // not joined
+            sender: "ghost#aabbccddeeff".to_owned(),
+            body: "from nowhere".to_owned(),
+            sent_unix_ms: 1,
+        });
+        assert!(app.messages().is_empty(), "unknown-circle frame dropped");
+    }
+
+    /// ISC-C61: the split chat view renders both panes with correct per-surface
+    /// filtering — the lobby pane shows the lobby line, the active-circle pane
+    /// shows the active circle's line and its carousel header, and neither bleeds
+    /// into the other.
+    #[test]
+    fn split_view_renders_both_panes_with_correct_filtering() {
+        let mut app = drive_to_main();
+        let _ = app.take_pending_persist();
+        app.on_net_event(NetEvent::PublicRoomJoined {
+            room: "lobby".to_owned(),
+        });
+        join_circle(&mut app, 1);
+        join_circle(&mut app, 2); // active = circle 2 (index 1 → "2/2")
+        app.on_net_event(NetEvent::PublicRoomMessage {
+            room: "lobby".to_owned(),
+            sender: "c#eeff00112233".to_owned(),
+            body: "LOBBYLINE".to_owned(),
+            sent_unix_ms: 1,
+        });
+        app.on_net_event(NetEvent::ChatMessage {
+            circle_id: 2,
+            sender: "b#ccddeeff0011".to_owned(),
+            body: "CIRCLELINE".to_owned(),
+            sent_unix_ms: 2,
+        });
+        // A line on the NON-active circle 1 must not show in the circle pane.
+        app.on_net_event(NetEvent::ChatMessage {
+            circle_id: 1,
+            sender: "a#aabbccddeeff".to_owned(),
+            body: "HIDDENLINE".to_owned(),
+            sent_unix_ms: 3,
+        });
+
+        let text = render_text(&app, 100, 30);
+        assert!(text.contains("LOBBYLINE"), "lobby pane renders its line");
+        assert!(
+            text.contains("CIRCLELINE"),
+            "active-circle pane renders its line"
+        );
+        assert!(
+            !text.contains("HIDDENLINE"),
+            "non-active circle's line is not rendered in the circle pane (ISC-A-C29)"
+        );
+        // Carousel header names label + position (ISC-C60 / ISC-C62).
+        assert!(
+            text.contains("circle 2/2: circle-2"),
+            "circle pane header names the active label + carousel position"
         );
     }
 
@@ -2325,7 +2759,7 @@ mod tests {
     #[test]
     fn empty_compose_enter_is_a_noop() {
         let mut app = drive_to_main();
-        app.on_net_event(NetEvent::CircleJoined);
+        join_circle(&mut app, 1);
         app.on_key(press(KeyCode::Enter));
         assert!(app.messages().is_empty(), "no empty message echoed");
         assert!(app.take_pending_chat().is_none(), "no empty send queued");
@@ -2370,7 +2804,7 @@ mod tests {
         }
         app.on_key(press(KeyCode::Enter)); // no circle → no-op
         assert!(app.messages().is_empty());
-        app.on_net_event(NetEvent::CircleJoined);
+        join_circle(&mut app, 1);
         assert!(app.can_chat());
         app.on_key(press(KeyCode::Enter)); // now sends the preserved draft
         assert_eq!(app.messages().len(), 1, "echoed after joining");
@@ -2431,8 +2865,9 @@ mod tests {
             version: "1.0".to_owned(),
             rotation_notice: None,
         });
-        app.on_net_event(NetEvent::CircleJoined);
+        join_circle(&mut app, 1);
         app.on_net_event(NetEvent::ChatMessage {
+            circle_id: 1,
             sender: "otter".to_owned(),
             body: "ping".to_owned(),
             sent_unix_ms: 1,
@@ -2469,7 +2904,7 @@ mod tests {
         );
 
         // Joining a circle flips the indicator to the circle (it takes precedence).
-        app.on_net_event(NetEvent::CircleJoined);
+        join_circle(&mut app, 1);
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.draw(|f| crate::ui::render(&app, f)).unwrap();
         let text = buffer_text(&term);
@@ -2516,12 +2951,15 @@ mod tests {
         use ratatui::backend::TestBackend;
 
         let mut app = drive_to_main();
+        join_circle(&mut app, 1);
         app.on_net_event(NetEvent::ChatMessage {
+            circle_id: 1,
             sender: "spammer#aabbccddeeff".to_owned(),
             body: "BUYNOW spam".to_owned(),
             sent_unix_ms: 1,
         });
         app.on_net_event(NetEvent::ChatMessage {
+            circle_id: 1,
             sender: "friend#ccddeeff0011".to_owned(),
             body: "genuine hello".to_owned(),
             sent_unix_ms: 2,
@@ -2554,6 +2992,7 @@ mod tests {
         // generate a different mnemonic → different handle, which would not
         // match the mention).
         let mut app = drive_to_main();
+        join_circle(&mut app, 1);
         let own = app.own_chat_handle().expect("session handle").to_string();
 
         let yellow_cells = |app: &App| -> usize {
@@ -2570,6 +3009,7 @@ mod tests {
         // Baseline: a message that does NOT mention us (the connecting-status
         // line may already be yellow — we measure the delta, not absolute).
         app.on_net_event(NetEvent::ChatMessage {
+            circle_id: 1,
             sender: "friend#ccddeeff0011".to_owned(),
             body: "nothing to see".to_owned(),
             sent_unix_ms: 1,
@@ -2578,6 +3018,7 @@ mod tests {
 
         // Now a message that mentions our own full handle.
         app.on_net_event(NetEvent::ChatMessage {
+            circle_id: 1,
             sender: "friend#ccddeeff0011".to_owned(),
             body: format!("hey @{own} look here"),
             sent_unix_ms: 2,
@@ -2800,12 +3241,15 @@ mod tests {
     #[test]
     fn mention_autocomplete_prefix_matches_seen_senders() {
         let mut app = drive_to_main();
+        join_circle(&mut app, 1);
         app.on_net_event(NetEvent::ChatMessage {
+            circle_id: 1,
             sender: "alice#aabbccddeeff".to_owned(),
             body: "hi".to_owned(),
             sent_unix_ms: 1,
         });
         app.on_net_event(NetEvent::ChatMessage {
+            circle_id: 1,
             sender: "bob#ccddeeff0011".to_owned(),
             body: "yo".to_owned(),
             sent_unix_ms: 2,
@@ -3574,21 +4018,27 @@ mod tests {
         assert!(text.contains("[Enter] unlock"), "unlock hint rendered");
     }
 
-    /// The chat empty-state states the circle requirement when none is joined
-    /// (Item F / ISC-C48), and switches once a circle is joined.
+    /// The split chat view's circle pane states the join requirement when the
+    /// membership set is empty (ISC-C61 narrows ISC-C48 to the circle pane), and
+    /// switches once a circle is joined. The lobby pane is always present
+    /// regardless (ISC-C56).
     #[test]
     fn chat_empty_state_states_circle_requirement() {
         let mut app = drive_to_main();
         let _ = app.take_pending_persist();
         let text = render_text(&app, 100, 24);
         assert!(
-            text.contains("join a public room or circle to chat"),
-            "circle requirement stated when no surface joined (ISC-C48)"
+            text.contains("join a circle to chat"),
+            "circle pane states the join requirement when the set is empty (ISC-C61)"
         );
-        app.on_net_event(NetEvent::CircleJoined);
+        assert!(
+            text.contains("lobby"),
+            "lobby pane is always present (ISC-C56)"
+        );
+        join_circle(&mut app, 1);
         let text = render_text(&app, 100, 24);
         assert!(
-            !text.contains("join a public room or circle to chat"),
+            !text.contains("join a circle to chat"),
             "requirement message gone once a circle is joined"
         );
     }

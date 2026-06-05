@@ -144,6 +144,7 @@ fn run(
         }
         if let Some(chat) = app.take_pending_chat() {
             let _ = net.send(NetCommand::SendChat {
+                circle_id: chat.circle_id,
                 body: chat.body,
                 sender_handle: chat.sender_handle,
             });

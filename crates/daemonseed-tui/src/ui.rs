@@ -21,7 +21,7 @@ use daemonseed_core::trust_events::{TrustEventKey, event_key_string};
 
 use crate::app::{
     App, ChatLine, ChatSurface, CircleStatus, ConnectionStatus, FetchStatus, FetchUi,
-    IndexerStatus, MainFocus, Screen, TrustItem,
+    IndexerStatus, MainFocus, Screen, Surface, TrustItem,
 };
 use crate::screens::first_start::{FirstStartUi, FsStep};
 
@@ -659,11 +659,20 @@ fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
         }
         ConnectionStatus::Failed(msg) => (format!("connection failed: {msg}"), Color::Red),
     };
+    // The circle summary reflects the membership set (ISC-C59): the joined count
+    // plus the most-recent join attempt's status. A failed/joining attempt is
+    // surfaced even while other circles remain joined.
+    let n = app.circles().len();
     let circle = match app.circle_status() {
-        CircleStatus::NotJoined => "no circle".to_owned(),
-        CircleStatus::Joining => "joining circle…".to_owned(),
-        CircleStatus::Joined => "circle joined".to_owned(),
-        CircleStatus::Failed(m) => format!("circle join failed: {m}"),
+        CircleStatus::Joining => format!("joining circle… ({n} joined)"),
+        CircleStatus::Failed(m) => format!("circle join failed: {m} ({n} joined)"),
+        CircleStatus::NotJoined if n == 0 => "no circles".to_owned(),
+        // Joined, or a stale NotJoined with a live set: report the count.
+        _ => match n {
+            0 => "no circles".to_owned(),
+            1 => "1 circle joined".to_owned(),
+            _ => format!("{n} circles joined"),
+        },
     };
 
     let mut spans = vec![
@@ -720,33 +729,98 @@ fn close_cause_color(cause: CloseCause) -> Color {
     }
 }
 
-/// The circle chat transcript, oldest at the top (ISC-10). Muted senders are
-/// suppressed (ISC-13); the sender shows as its friendly handle form; mentions
-/// of the user's own handle are highlighted (ISC-11).
+/// The split chat view (ISC-C61): the lobby pane (always present) on top, the
+/// active-circle pane (the carousel slot) on the bottom — mirroring the Shares
+/// two-pane split. Each pane renders ONLY its own surface's lines (ISC-A-C29: no
+/// cross-surface bleed). With no circle joined, the bottom pane shows the join
+/// prompt (ISC-C48 narrowed to the circle pane; the lobby pane is always live).
 fn render_chat_transcript(app: &App, frame: &mut Frame, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+
+    render_lobby_pane(app, frame, chunks[0]);
+    render_circle_pane(app, frame, chunks[1]);
+}
+
+/// The lobby pane (ISC-C61, top): renders only `Surface::Lobby` lines (ISC-A-C29).
+/// Always present — the auto-joined public room (ISC-C56) is always postable, so
+/// this pane never shows a join prompt.
+fn render_lobby_pane(app: &App, frame: &mut Frame, area: Rect) {
     let own = app.own_chat_handle();
     let visible: Vec<&ChatLine> = app
-        .messages()
-        .iter()
+        .messages_on(Surface::Lobby)
         .filter(|m| !app.is_muted(&m.sender)) // ISC-13
         .collect();
     let lines: Vec<Line> = if visible.is_empty() {
-        // Item F / ISC-C48: when no circle is joined the chat surface cannot
-        // transmit, so make the requirement explicit rather than implying a
-        // ready-to-chat empty state.
-        let msg = if app.can_chat() {
-            "no messages yet — type to chat"
+        let msg = if app.public_room().is_some() {
+            "no lobby messages yet — type to chat"
         } else {
-            "join a public room or circle to chat — Tab to the circle-join box, enter a phrase"
+            "lobby not joined yet"
         };
         vec![Line::from(msg.to_owned()).style(Style::default().fg(Color::DarkGray))]
     } else {
         visible.iter().map(|m| chat_line(m, own.as_ref())).collect()
     };
+    let title = match app.public_room() {
+        Some(room) => format!(" lobby (# {room}) "),
+        None => " lobby ".to_owned(),
+    };
     let body = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" chat ")
+            .title(title)
+            .title_alignment(Alignment::Left),
+    );
+    frame.render_widget(body, area);
+}
+
+/// The active-circle pane (ISC-C61, bottom carousel slot): renders only the
+/// active circle's `Surface::Circle(id)` lines (ISC-A-C29). The header names the
+/// active circle's label and carousel position (ISC-C60 / ISC-C62), e.g.
+/// "circle 2/3: able-otter". With an empty membership set the pane shows the join
+/// prompt (ISC-C48 narrowed here).
+fn render_circle_pane(app: &App, frame: &mut Frame, area: Rect) {
+    let own = app.own_chat_handle();
+    let total = app.circles().len();
+
+    let (title, lines): (String, Vec<Line>) =
+        match (app.active_circle_label(), app.active_circle_index()) {
+            (Some((id, label)), Some(idx)) => {
+                let title = format!(" circle {}/{}: {label}  [←/→] cycle ", idx + 1, total);
+                let visible: Vec<&ChatLine> = app
+                    .messages_on(Surface::Circle(id))
+                    .filter(|m| !app.is_muted(&m.sender)) // ISC-13
+                    .collect();
+                let lines: Vec<Line> = if visible.is_empty() {
+                    vec![
+                        Line::from("no messages yet — type to chat this circle".to_owned())
+                            .style(Style::default().fg(Color::DarkGray)),
+                    ]
+                } else {
+                    visible.iter().map(|m| chat_line(m, own.as_ref())).collect()
+                };
+                (title, lines)
+            }
+            // Empty membership set (ISC-C61): the join prompt lives here; the lobby
+            // pane above stays live.
+            _ => (
+                " circle (none joined) ".to_owned(),
+                vec![
+                    Line::from(
+                        "join a circle to chat — Tab to the circle-join box, enter a phrase"
+                            .to_owned(),
+                    )
+                    .style(Style::default().fg(Color::DarkGray)),
+                ],
+            ),
+        };
+
+    let body = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(title)
             .title_alignment(Alignment::Left),
     );
     frame.render_widget(body, area);
@@ -808,7 +882,10 @@ fn render_main_input(app: &App, frame: &mut Frame, area: Rect) {
             // ([`App::active_chat_surface`]) so the label can never lie about the
             // destination. A joined circle wins over the auto-joined lobby.
             let surface = match app.active_chat_surface() {
-                Some(ChatSurface::Circle) => "🔒 circle".to_owned(),
+                // Name the active circle's client-local label (ISC-C62) so the
+                // post destination is never ambiguous across the carousel
+                // (ISC-C60).
+                Some(ChatSurface::Circle { label, .. }) => format!("🔒 {label}"),
                 Some(ChatSurface::PublicRoom(room)) => format!("# {room} (public)"),
                 // Unreachable while `can_chat()` holds (this arm requires it),
                 // but kept total rather than panicking.

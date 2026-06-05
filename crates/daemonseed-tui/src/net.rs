@@ -72,10 +72,17 @@ pub enum NetCommand {
     /// Join a circle by its shared phrase: derive the circle key, subscribe to
     /// the rendezvous asset on the connected relay, and stream chat (ISC-15/16).
     JoinCircle { phrase: String },
-    /// Send a chat message to the joined circle (ISC-14). `sender_handle` is the
-    /// user's own display handle, sealed into the message for the recipient's
+    /// Send a chat message to one joined circle (ISC-14 / ISC-C60 / ISC-A-C30).
+    /// `circle_id` names the *active* circle the post must seal under; the actor
+    /// looks it up in its membership set and seals under exactly that circle's
+    /// `cot_key` — never another circle's, never broadcast. `sender_handle` is
+    /// the user's own display handle, sealed into the message for the recipient's
     /// client-side @mention (C17) / mute (C15) — never seen by the relay.
-    SendChat { body: String, sender_handle: String },
+    SendChat {
+        circle_id: u64,
+        body: String,
+        sender_handle: String,
+    },
     /// Post a message to the joined default public room (ISC-S22 / ISC-S24).
     /// Self-signed for provenance under the daemon's own identity, then sealed
     /// under the global room key. Any daemon may post; the relay can read it
@@ -160,12 +167,21 @@ pub enum NetEvent {
     },
     /// The connection attempt failed; `message` is a human-readable cause.
     ConnectFailed { message: String },
-    /// A circle subscribe stream is live; chat can flow (ISC-16).
-    CircleJoined,
+    /// A circle subscribe stream is live; chat can flow (ISC-16 / ISC-C59). The
+    /// circle is ADDED to the membership set (it never evicts an existing one);
+    /// `circle_id` is the stable per-session id the app keys its membership and
+    /// active-surface selection on, and `label` is the client-local display label
+    /// assigned at join (ISC-C62) — never transmitted.
+    CircleJoined { circle_id: u64, label: String },
     /// Joining a circle failed (no live session, derivation, or subscribe error).
     CircleJoinFailed { message: String },
-    /// A decrypted chat message arrived on the joined circle (ISC-10).
+    /// A decrypted chat message arrived on a joined circle (ISC-10 / ISC-A-C30).
+    /// `circle_id` is the id of the single circle whose `cot_key` opened this
+    /// frame — the app renders it only in that circle's pane (ISC-A-C29); it is
+    /// never guessed nor broadcast to other panes.
     ChatMessage {
+        /// The circle whose key decrypted this frame (attribution, ISC-A-C30).
+        circle_id: u64,
         /// The sender's self-asserted handle (for client-side mention/mute).
         sender: String,
         /// The message body, as typed.
@@ -356,9 +372,23 @@ impl NetHandle {
     }
 }
 
-/// The live circle a member is currently subscribed to: the outbound frame
-/// sender (to publish sealed messages) plus the key + rendezvous address.
+/// One live circle a member is subscribed to (ISC-C59): the outbound frame
+/// sender (to publish sealed messages) plus the key + rendezvous address, the
+/// stable per-session id the app keys membership/attribution on, and the
+/// client-local display label (ISC-C62, never transmitted).
+///
+/// A member can hold several of these at once ([`Actor::circles`]); each carries
+/// its own `cot_key`, so a post seals under exactly the active circle's key and
+/// an inbound frame is attributed to the single circle whose key opened it
+/// (ISC-A-C30 — no cross-circle key or attribution mixing).
 struct Circle {
+    /// Stable per-session id, assigned monotonically at join. Threaded into the
+    /// inbound reader so every emitted [`NetEvent::ChatMessage`] names its source
+    /// circle, and used by [`NetCommand::SendChat`] to pick the seal key.
+    id: u64,
+    /// Client-local display label (ISC-C62). Generated at join (adj-noun default,
+    /// `#<hex>` floor); never transmitted, never derived from other members.
+    label: String,
     cot_key: Rc<CotKey>,
     asset_addr: AssetAddr,
     out_tx: mpsc::Sender<wire::CotFrame>,
@@ -385,8 +415,16 @@ struct Actor {
     session: Option<AppSession>,
     /// The connected relay's wire server-id, namespacing circle addresses.
     server_id: Option<String>,
-    /// The currently-joined circle, if any.
-    circle: Option<Circle>,
+    /// The set of circles the member is currently joined to (ISC-C59). Joining
+    /// ADDS a circle; it never evicts an existing one. Each holds its own key, so
+    /// sealing/attribution stays per-circle (ISC-A-C30). Held as a `Vec` — a
+    /// serialization-shaped list so circle-membership persistence is a later
+    /// additive change to the at-rest blob, not a refactor (ISC-C59) — though it
+    /// is NOT persisted now (session-only).
+    circles: Vec<Circle>,
+    /// Monotonic counter handing out the next circle id at join. Never reused
+    /// within a session, so an id always names the same circle.
+    next_circle_id: u64,
     /// The daemon's own client identity, retained after connect so public-room
     /// posts can be self-signed for provenance (ISC-S24) under the same key that
     /// proved the connection. `None` until a connect succeeds.
@@ -437,7 +475,8 @@ async fn net_actor(
         evt_tx,
         session: None,
         server_id: None,
-        circle: None,
+        circles: Vec::new(),
+        next_circle_id: 0,
         identity: None,
         public_room: None,
         backoff: Backoff::new(),
@@ -455,9 +494,14 @@ async fn net_actor(
             } => actor.handle_connect(&server_id, &address, trusted).await,
             NetCommand::JoinCircle { phrase } => actor.handle_join_circle(&phrase).await,
             NetCommand::SendChat {
+                circle_id,
                 body,
                 sender_handle,
-            } => actor.handle_send_chat(&body, &sender_handle).await,
+            } => {
+                actor
+                    .handle_send_chat(circle_id, &body, &sender_handle)
+                    .await
+            }
             NetCommand::SendPublicRoom { body } => actor.handle_send_public_room(&body).await,
             NetCommand::RefreshShares => actor.handle_refresh_shares().await,
             NetCommand::RefreshPublicSpace => actor.handle_refresh_public_space().await,
@@ -592,7 +636,14 @@ impl Actor {
     }
 
     /// Derive the circle key, subscribe to the rendezvous asset on the connected
-    /// relay, and spawn the inbound chat reader (ISC-15/16).
+    /// relay, and spawn the inbound chat reader (ISC-15/16 / ISC-C59).
+    ///
+    /// Joining ADDS to the membership set; it never evicts a currently-joined
+    /// circle (ISC-C59). A circle whose rendezvous address is already present is
+    /// a no-op idempotent re-join (re-emitting `CircleJoined` for the existing id
+    /// so the app can re-select it active) — the same shared phrase derives the
+    /// same `cot_key` and therefore the same `asset_addr`, so address-equality is
+    /// the dedupe key.
     async fn handle_join_circle(&mut self, phrase: &str) {
         let Some(session) = self.session.as_ref() else {
             return self.emit(NetEvent::CircleJoinFailed {
@@ -622,6 +673,23 @@ impl Actor {
             }
         };
 
+        // Idempotent join (ISC-C59): a circle already in the set is not
+        // re-subscribed — re-emit its existing id + label so the app re-selects
+        // it active. This never evicts or duplicates the existing membership.
+        if let Some(existing) = self.circles.iter().find(|c| c.asset_addr == asset_addr) {
+            return self.emit(NetEvent::CircleJoined {
+                circle_id: existing.id,
+                label: existing.label.clone(),
+            });
+        }
+
+        // Assign a stable id and a deterministic client-local label (ISC-C62):
+        // derived from the rendezvous address so the same circle gets the same
+        // default label, never from other members and never transmitted.
+        let circle_id = self.next_circle_id;
+        self.next_circle_id += 1;
+        let label = default_circle_label(&asset_addr);
+
         // Outbound half: first frame names the asset (empty payload, not
         // relayed), then publishes flow. Send the naming frame before subscribe
         // consumes the receiver, so it is the stream's first item.
@@ -646,19 +714,23 @@ impl Actor {
             }
         };
 
-        // Inbound reader: decrypt each frame under the circle key and emit a
-        // ChatMessage. Foreign / undecryptable frames are skipped silently
-        // (noise on a shared rendezvous). Runs until the stream ends.
+        // Inbound reader: decrypt each frame under THIS circle's key and emit a
+        // ChatMessage tagged with this circle's id (ISC-A-C30 attribution — a
+        // frame is attributed to the single circle whose key opened it). Foreign
+        // / undecryptable frames are skipped silently (noise on a shared
+        // rendezvous). Runs until the stream ends.
         let reader_key = Rc::clone(&cot_key);
         let reader_tx = self.evt_tx.clone();
-        tokio::task::spawn_local(read_inbound(inbound, reader_key, reader_tx));
+        tokio::task::spawn_local(read_inbound(inbound, circle_id, reader_key, reader_tx));
 
-        self.circle = Some(Circle {
+        self.circles.push(Circle {
+            id: circle_id,
+            label: label.clone(),
             cot_key,
             asset_addr,
             out_tx,
         });
-        self.emit(NetEvent::CircleJoined);
+        self.emit(NetEvent::CircleJoined { circle_id, label });
     }
 
     /// Subscribe to the well-known default public room (ISC-S22 / ISC-C56) so the
@@ -1249,9 +1321,14 @@ impl Actor {
         drop(out_tx);
     }
 
-    /// Seal a chat message under the joined circle's key and publish it (ISC-14).
-    async fn handle_send_chat(&mut self, body: &str, sender_handle: &str) {
-        let Some(circle) = self.circle.as_ref() else {
+    /// Seal a chat message under the *active* circle's key and publish it
+    /// (ISC-14 / ISC-C60 / ISC-A-C30). The post is sealed under exactly the
+    /// circle named by `circle_id` — the app's active circle — never another's,
+    /// so cycling the carousel changes the seal key and never the wrong-circle
+    /// post that ISC-A-C30 forbids. An unknown id (the circle was dropped, or the
+    /// app's active selection went stale) is a clean ChatError, not a panic.
+    async fn handle_send_chat(&mut self, circle_id: u64, body: &str, sender_handle: &str) {
+        let Some(circle) = self.circles.iter().find(|c| c.id == circle_id) else {
             return self.emit(NetEvent::ChatError {
                 message: "join a circle before sending".to_owned(),
             });
@@ -1281,12 +1358,18 @@ impl Actor {
     }
 }
 
-/// Read the circle's inbound frame stream, decrypt each, and emit a
-/// [`NetEvent::ChatMessage`]. Undecryptable frames (foreign noise on the shared
-/// rendezvous, or a tampered frame) are skipped silently. Returns when the
-/// stream ends (the relay closed it or the session dropped).
+/// Read one circle's inbound frame stream, decrypt each under THAT circle's key,
+/// and emit a [`NetEvent::ChatMessage`] tagged with `circle_id` (ISC-A-C30
+/// attribution: a frame is attributed to the single circle whose key opened it,
+/// never guessed nor broadcast). Each joined circle (ISC-C59) gets its own reader
+/// task with its own `cot_key` and `circle_id`, so a frame that only this key can
+/// open can only ever be emitted under this circle's id. Undecryptable frames
+/// (foreign noise on the shared rendezvous, or a tampered frame) are skipped
+/// silently. Returns when the stream ends (the relay closed it or the session
+/// dropped).
 async fn read_inbound(
     mut inbound: tonic::Streaming<wire::CotFrame>,
+    circle_id: u64,
     cot_key: Rc<CotKey>,
     evt_tx: mpsc::UnboundedSender<NetEvent>,
 ) {
@@ -1298,6 +1381,7 @@ async fn read_inbound(
                 if let Ok(msg) = open_message(&cot_key, &frame.payload)
                     && evt_tx
                         .send(NetEvent::ChatMessage {
+                            circle_id,
                             sender: msg.sender_handle,
                             body: msg.body,
                             sent_unix_ms: msg.sent_unix_ms,
@@ -1310,6 +1394,46 @@ async fn read_inbound(
             Ok(None) | Err(_) => return, // stream ended / errored
         }
     }
+}
+
+/// Build the default client-local label for a newly-joined circle (ISC-C62),
+/// deterministically from its rendezvous address. The address is itself a
+/// `SHA-384(cot_key ‖ server_id)` (ISC-S20), so a given circle on a given relay
+/// always yields the same default label — convenient for recognising a re-join —
+/// while the label never leaves the client and is never derived from members.
+///
+/// An `adj-noun` pair indexed by the address bytes is the default; the `#<hex>`
+/// floor is the fallback if the wordlists are somehow empty (they are not, per
+/// the ISC-C4b sizing invariants), keeping this total without an `unwrap`.
+fn default_circle_label(asset_addr: &AssetAddr) -> String {
+    use daemonseed_core::handle::display_name::{DisplayNameRng, generate_display_name};
+
+    /// Deterministic index source: consumes the address bytes (wrapping) so the
+    /// chosen `(adjective, noun)` pair is a pure function of the rendezvous.
+    struct AddrRng<'a> {
+        bytes: &'a [u8],
+        cursor: usize,
+    }
+    impl DisplayNameRng for AddrRng<'_> {
+        fn random_index(&mut self, len: usize) -> usize {
+            // Fold 8 address bytes into a u64, advancing the cursor; modulo the
+            // wordlist length. Deterministic and stable for a given address.
+            let mut acc = 0u64;
+            for _ in 0..8 {
+                let b = self.bytes[self.cursor % self.bytes.len()];
+                self.cursor += 1;
+                acc = (acc << 8) | b as u64;
+            }
+            (acc % len as u64) as usize
+        }
+    }
+
+    let bytes = asset_addr.as_bytes();
+    if bytes.is_empty() {
+        return "#circle".to_owned();
+    }
+    let mut rng = AddrRng { bytes, cursor: 0 };
+    generate_display_name(&mut rng)
 }
 
 /// Read the public room's inbound frames, open + VERIFY each under the global
@@ -1561,12 +1685,19 @@ mod tests {
     #[test]
     fn chat_message_event_is_data() {
         let m = NetEvent::ChatMessage {
+            circle_id: 3,
             sender: "otter#aabbccddeeff".to_owned(),
             body: "hi".to_owned(),
             sent_unix_ms: 1,
         };
         match m {
-            NetEvent::ChatMessage { sender, body, .. } => {
+            NetEvent::ChatMessage {
+                circle_id,
+                sender,
+                body,
+                ..
+            } => {
+                assert_eq!(circle_id, 3);
                 assert_eq!(sender, "otter#aabbccddeeff");
                 assert_eq!(body, "hi");
             }
@@ -1633,7 +1764,8 @@ mod tests {
             evt_tx,
             session: None,
             server_id: None,
-            circle: None,
+            circles: Vec::new(),
+            next_circle_id: 0,
             identity: None,
             public_room: None,
             backoff: Backoff::new(),
@@ -1740,12 +1872,57 @@ mod tests {
         local.block_on(&rt, async {
             let (evt_tx, mut evt_rx) = mpsc::unbounded_channel();
             let mut actor = bare_actor(evt_tx);
-            actor.handle_send_chat("hello", "me#000000000000").await;
+            actor.handle_send_chat(0, "hello", "me#000000000000").await;
             match evt_rx.try_recv() {
                 Ok(NetEvent::ChatError { message }) => assert!(message.contains("join a circle")),
                 other => panic!("expected ChatError, got {other:?}"),
             }
         });
+    }
+
+    /// Sending to a circle id that is not in the membership set emits ChatError,
+    /// not a panic (ISC-A-C30 stale-selection guard) — a post is sealed under an
+    /// existing active circle's key or not at all, never the wrong one.
+    #[test]
+    fn send_chat_unknown_circle_id_fails_cleanly() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let (evt_tx, mut evt_rx) = mpsc::unbounded_channel();
+            let mut actor = bare_actor(evt_tx);
+            // No circles joined, so id 42 cannot resolve.
+            actor.handle_send_chat(42, "hello", "me#000000000000").await;
+            match evt_rx.try_recv() {
+                Ok(NetEvent::ChatError { message }) => assert!(message.contains("join a circle")),
+                other => panic!("expected ChatError, got {other:?}"),
+            }
+        });
+    }
+
+    /// The client-local circle label (ISC-C62) is a deterministic function of the
+    /// rendezvous address: the same address yields the same default label, and
+    /// distinct addresses (overwhelmingly) yield distinct labels. The label is
+    /// generated locally — it is never derived from members or transmitted.
+    #[test]
+    fn default_circle_label_is_deterministic_per_address() {
+        let a = AssetAddr::from_bytes([7u8; 48]);
+        let b = AssetAddr::from_bytes([7u8; 48]);
+        let c = AssetAddr::from_bytes([9u8; 48]);
+        assert_eq!(
+            default_circle_label(&a),
+            default_circle_label(&b),
+            "same address → same label"
+        );
+        assert_ne!(
+            default_circle_label(&a),
+            default_circle_label(&c),
+            "different address → different label"
+        );
+        // Adj-noun shape (the default, not the floor).
+        assert!(default_circle_label(&a).contains('-'));
     }
 
     /// Refreshing the public space before connecting emits PublicSpaceError, not
