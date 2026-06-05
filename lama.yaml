@@ -267,7 +267,7 @@ capabilities:
       - daemonseed_proto::v1
     iscs: [S14, A-S9, C23, C24, S4, A-S2, C15, C17]
 
-  - category: "Abuse / DoS rate limiting (server, M9)"
+  - category: "Abuse / DoS rate limiting (server)"
     summary: >-
       Multi-granularity, RAM-only rate limits (S17). Per-connection
       ConnectionLimiter: a request token bucket (capacity + refill) plus
@@ -286,7 +286,7 @@ capabilities:
       - daemonseed_server::rate_limit
     iscs: [S17, A-S12, A-S1]
 
-  - category: "Chat affordances: backoff, mute/hide, mentions (client, M9)"
+  - category: "Chat affordances: backoff, mute/hide, mentions (client)"
     summary: >-
       Client-side abuse-resilience + chat surfaces, all pure/local. backoff:
       an exponential+jitter reconnect curve (1s→60s, ±25%) with an 8-retry
@@ -306,7 +306,7 @@ capabilities:
       - daemonseed_core::storage::seeds
     iscs: [C15, C16, C17, C18, C26, A-C3, A-C4]
 
-  - category: "Release-signing verify + update lifecycle (M10 verifiable-core)"
+  - category: "Release-signing verify + update lifecycle (verifiable-core)"
     summary: >-
       The pure-Rust half of M10's release/update story. daemonseed_core::release
       holds the binary-bound release trust anchor (an N-of-M ML-DSA-87 key set,
@@ -328,7 +328,7 @@ capabilities:
       - daemonseed_server::boot_gate
     iscs: [S18, A-S13, C27, A-C11]
 
-  - category: "Platform-feature scaffolds — biometric unlock + autostart (M10-completion)"
+  - category: "Platform-feature scaffolds — biometric unlock + autostart"
     summary: >-
       Abstraction-only scaffolds for the two platform-gated M10 ISCs; opt-in,
       off by default, platform halves reserved. daemonseed_core::biometric: the
@@ -349,86 +349,20 @@ capabilities:
     iscs: [C7, C20]
 
 # ─────────────────────────────────────────────────────────────────────
-# Cross-cutting properties (system-wide invariants)
+# Design properties & dependencies — NOT tracked here (canonical homes)
 # ─────────────────────────────────────────────────────────────────────
-
-properties:
-  - id: "no-client-history"
-    summary: >-
-      Clients persist identity + federation state + ephemeral caches
-      only. No message archive, no post archive, no file-content
-      archive. Total wipe = start over with a fresh identity, not data
-      loss. Load-bearing for the .dseed backup design.
-    enforcement: convention (no archival API exists)
-
-  - id: "server-payload-opacity"
-    summary: >-
-      The server never decrypts circle-of-trust payloads, never links
-      a payload to a specific circle, never profiles per-pubkey traffic
-      patterns. Asserted at M3 via grep-anchor in m3_isc_coverage
-      (zero Registry::lookup references in daemonseed-server/src/).
-    enforcement: |
-      Convention + grep-asserted regression anchor (m3_iscs::server_suite_transparency).
-      Compile-time strengthening lands at M5/M6 via separated CoT-relay
-      types that don't depend on the suite registry.
-    iscs: [A-S1, A-S2, A-S10]
-
-  - id: "type-state-protocol-gating"
-    summary: >-
-      Protocol-level invariants (no traffic before APP_HELLO; no
-      identity-proof before HELLO_ACK; no AsyncRead/AsyncWrite before
-      authentication) are enforced via Rust's type system. The
-      Connection<Negotiating → Versioned → Authenticated> machine landed
-      across M4a (Negotiating → Versioned) and M4b (Versioned →
-      Authenticated, gated by a VerifiedPeer token only verify_envelope can
-      mint). Only Authenticated impls AsyncRead/AsyncWrite, so pre-auth
-      application I/O is a compile error (ISC-A6).
-    enforcement: compile-time (M4a + M4b, shipped)
-    iscs: [C23, S14, S19, A-S14, A-C18]
-
-  - id: "censorship-survivability-baseline"
-    summary: >-
-      First TLS record on :443 satisfies Wu et al. (USENIX Security
-      2023) GFW Ex5 negative-allowlist by construction. ALPN is set
-      to generic `h2`; application-protocol identification happens
-      after TLS handshake. Shipped at M4a.
-    enforcement: wire-shape (M4a, shipped)
-    iscs: [S5]
-
-# ─────────────────────────────────────────────────────────────────────
-# External dependencies
-# ─────────────────────────────────────────────────────────────────────
-
-external_dependencies:
-  crypto_foundation:
-    name: oxicrypt
-    relationship: path-dependency (private phase) / registry-dependency (post-public)
-    purpose: "CNSA 2.0 primitives (AES-256-GCM, ML-DSA-87, ML-KEM-1024, SHA-384, HKDF), TLS 1.3 glue. Pure-Rust FIPS 140-3 Level 1 module."
-    visibility: "private during the private phase; goes public before daemonseed does"
-
-  wire:
-    - { name: prost, version: "=0.13.4", purpose: "Protocol Buffers encoding for Rust" }
-    - { name: tonic, version: "=0.12.3", purpose: "gRPC-over-HTTP/2 server + client" }
-    - { name: tonic-build, version: "=0.12.3", purpose: "tonic codegen from .proto" }
-
-  runtime_and_glue:
-    - { name: tokio, version: "1.43", purpose: "async runtime (rt + macros + io-util + net)" }
-    - { name: tower, version: "0.5", purpose: "Service abstraction for tonic" }
-    - { name: ratatui, version: "0.29", purpose: "TUI framework for daemonseed-tui (M11)" }
-
-  identity_and_crypto_aux:
-    - { name: argon2, version: "0.5", purpose: "Argon2id KDF (ISC-C14, ISC-C30) — RFC 9106, not NIST so out of oxicrypt scope" }
-    - { name: bip39, version: "2", purpose: "BIP-39 mnemonic + 2048-word English wordlist (ISC-C2)" }
-    - { name: zeroize, version: "1", purpose: "ZeroizeOnDrop derive for secret-bearing types" }
-    - { name: zxcvbn, version: "3", purpose: "Passphrase strength estimation (ISC-C12, ISC-C9)" }
-    - { name: uuid, version: "1", purpose: "UUID v4 from cryptographic randomness (ISC-C36, ISC-C1)" }
-    - { name: unicode-normalization, version: "0.1", purpose: "NFKC for circle-of-trust entropy (ISC-C9)" }
-
-  config_and_glue:
-    - { name: toml, version: "0.8", purpose: "Profile config persistence — daemonseed.toml (ISC-C35)" }
-    - { name: serde, version: "1", purpose: "(De)serialization for daemonseed.toml" }
-    - { name: hex, version: "0.4", purpose: "12-char hash-prefix codec in handle format (ISC-C4)" }
-    - { name: getrandom, version: "fallback to oxicrypt-managed entropy", purpose: "Direct CSPRNG access for nonces and salts" }
+#
+# System-wide invariants — no-client-history, server-payload-opacity,
+# type-state protocol gating, censorship-survivability baseline — are part of
+# the design contract. Canonical home: ../ISA.md (## Principles + ## Constraints),
+# each tied to its ISC IDs there. Not duplicated here (a LAMA discovery file
+# describes the API surface, not the design invariants).
+#
+# Dependency inventory + pinned versions: the Cargo manifests (Cargo.toml /
+# Cargo.lock) are the canonical, build-enforced source — a copy here only drifts.
+# The one architecturally notable dependency is the sibling crypto/TLS crate
+# `oxicrypt` (CNSA 2.0 primitives + TLS 1.3 glue; path-dep in the private phase,
+# registry-dep once it opens) — see ../ISA.md ## Constraints and ../AGENTS.md.
 
 # ─────────────────────────────────────────────────────────────────────
 # Design-document references
