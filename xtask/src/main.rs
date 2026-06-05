@@ -107,11 +107,14 @@ fn main() -> Result<()> {
     }
 }
 
-/// Total ISC count, kept in sync with `daemonseed-integration-tests::isc_coverage::TOTAL`.
-/// Source of truth for the count check is the integration-tests crate's own
-/// unit tests (`registry_count_matches_total`); xtask only needs the constant
-/// to report the M0 baseline without taking a heavy path-dep on core+proto
-/// transitively. Bump both when the ISC list changes.
+/// CANONICAL ISC count lives in `daemonseed-integration-tests::isc_coverage::TOTAL`
+/// (guarded there by `registry_count_matches_total` against `ISCS.len()`). This
+/// constant is a deliberate CHEAP MIRROR so xtask can report a percentage without
+/// a heavy path-dep on the integration-tests crate (which transitively pulls
+/// core + proto). It is the ONLY sanctioned copy of the count anywhere — no doc
+/// hand-writes it; they all say "run `cargo xtask isc-coverage`". Bump this when
+/// the registry's TOTAL changes. Tracked follow-up: move the registry to a leaf
+/// crate both can depend on cheaply, deleting this mirror outright.
 const TOTAL_ISCS: u32 = 122;
 
 /// Static lower-bound coverage count. Bumped each milestone as ISCs gain

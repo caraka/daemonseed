@@ -12,7 +12,7 @@ lama: "0.1"
 
 library:
   name: daemonseed
-  version: "0.17.0-pre"
+  version: "0.17.0"
   description: >-
     Federated end-to-end-encrypted communication and file-sharing
     protocol. Pure-Rust backend, CNSA 2.0 baseline crypto via the
@@ -32,111 +32,15 @@ library:
   phase: private
 
 # ─────────────────────────────────────────────────────────────────────
-# Implementation status: M10 closed at v0.12.1; M11 (MVP-gate client surfaces:
-# real TUI, public-space view, deprecation surface, clean-device recovery — all
-# over already-shipped server APIs) closed at v0.13.0. M12 (→ v0.14.0 = MVP)
-# shipped the last two MVP-gate steps: step 5 user-publish file sharing
-# (PublishShare / UnpublishShare / ListPublicShares — RAM-only, held-connection
-# "you must be online to share", reaped on disconnect) and step 6 the federation
-# introducer endpoint + the TUI Servers-pane refresh that surfaces
-# introducer-discovered candidates. Both rode ONE additive SemVer MINOR wire bump
-# (wire stays 1.x). The full 4-daemon gate trips 10/10 → MVP declared.
-#
-# Post-MVP releases:
-#   v0.15.0 (alpha2 batch): opaque server-assigned share_id (S21 / A-S15);
-#     share download (S27-S29 / A-S20-A-S21); interactive public rooms — the
-#     auto-joined "lobby" (S22-S26 / A-S16-A-S19 / C56-C58); client-identity
-#     lifecycle — first-start persists blob + config + .dseed, daily-login Unlock,
-#     no-clobber (C47-C51 / A-C26-A-C28); --portable mode forcing CWD as profile
-#     root (C52).
-#   v0.15.1: chat-surface precedence fix (posts route to the joined circle, not
-#     the auto-joined lobby) + a compose-box surface indicator.
-#   v0.16.0: multi-circle carousel — simultaneous membership in N circles, split
-#     chat view (lobby pane + active-circle carousel pane), arrow-key cycling,
-#     deterministic client-local labels, per-circle surface isolation +
-#     attribution (C59-C62 / A-C29 / A-C30). Purely client-side, no wire change.
-#   v0.17.0 (M13, persistence keystone): the at-rest seeds blob now persists
-#     display name, mute list, hidden-shares, and circle membership, restored on a
-#     daily-login Unlock; circles silently rejoin without re-typing the phrase. A
-#     cached SealingKey re-seals the blob on each mutation with no second Argon2id
-#     (Pi-4 floor); circle entropy + label are stored as hex directive lines and
-#     stay non-mnemonic-derivable (a mnemonic-only recovery never reconstructs the
-#     social graph). Client-side circle-rename and TUI local-sharing persistence
-#     are deferred to M14. No wire change.
-#
-# The M10 release-signing INFRASTRUCTURE (real keys, Sigstore, reproducible
-# build, update-relay role) and the C7/C20 platform halves remain deferred to
-# M10-infra.
+# This file is a LAMA discovery manifest, not a project status board. Per the
+# LAMA spec (https://github.com/lamaspec/lama, SPEC.md "Repository discovery"),
+# the root lama.yaml is a concise capabilities + manifest pointer for fast
+# agent triage — it carries NO milestone, release-history, or coverage state.
+# Those live in their canonical homes (see AGENTS.md "Canonical homes"):
+#   • milestone / release history → git tags + ../CHANGELOG.md
+#   • live ISC coverage           → `cargo xtask isc-coverage`
+#   • in-progress / next          → the project lead's vault manifest (uncommitted)
 # ─────────────────────────────────────────────────────────────────────
-
-milestones_complete:
-  - id: M0
-    tag: v0.1.0
-    summary: "Pre-implementation findings, scaffolding, proto-codegen pipeline."
-  - id: M1
-    tag: v0.2.0
-    summary: "Identity primitives (BIP-39 mnemonic, HKDF-derived ML-DSA-87 / ML-KEM-1024 keypairs), profile substrate, at-rest seeds blob, handle format (adj-noun + 12-hex fingerprint)."
-  - id: M2
-    tag: v0.3.0
-    summary: "First-start type-state orchestrator, encrypted recovery file (.dseed), bootstrap-anchor selection (canonical / manual-paste)."
-  - id: M3
-    tag: v0.4.0
-    summary: "Suite registry (CNSA 2.0 baseline), suite_id wire-tagging on at-rest artifacts, read-old-write-new migration on touch, circle-metadata min_suite_id slot."
-  - id: M4a
-    tag: v0.5.0
-    summary: "Server skeleton + TLS 1.3 on :443 with ALPN h2 + APP_HELLO + type-state Connection<Negotiating → Versioned>; CLI connect initiator."
-  - id: M4b
-    tag: v0.6.0
-    summary: "Post-HELLO identity-proof: mutual ML-DSA-87 envelopes bound to the TLS exporter channel binding, ±5min freshness + per-key replay counters, Versioned → Authenticated type-state gate, uniform close on failure. Closes spec-ISCs S19, A-S14, A-C18, A-S12, A-S1."
-  - id: M5
-    tag: v0.7.0
-    summary: "Federation: per-server trusted/untrusted trust slider with TOFU pinning + rotation notices (C22), introducer responses that never carry public keys (S6), server-to-server peering reusing the same slider (S12) with introduce-to-clients suppression (S13) and active-attacker-resistant don't-introduce (A-S7), reference-client connection cap (A-C10). Closes 7 of its 8 ISCs (A-S4b forward-referenced to M6)."
-  - id: M6
-    tag: v0.8.0
-    summary: "Public space: the first post-Authenticated application service (PublicSpace gRPC over the authenticated stream). Verify-and-serve signed announcement posts (S7) + MOTD (S9) against an operator signer whitelist (S8) with a non-removable project-release entry (F17); operator rating taxonomy published, never enforced (S10/A-S5b); public-share listing surface defined (S4/F25); client rating selection + filter plumbing (C19/A-C5); AGPL-§13 source URL advertised in the handshake ack (ISC-9); filesystem isolation — server writes only the group-writable posts dir, never operator config (A-S8). Closes 12 ISCs (55→67)."
-  - id: M7
-    tag: v0.9.0
-    summary: "Suite deprecation policy (operator-signed, replay-protected cutoffs) + the trust-event taxonomy (four affordance classes, closed TrustEventKey enum, bounded encrypted audit log)."
-  - id: M8
-    tag: v0.10.0
-    summary: "Circle-of-trust live relay (refcounted bidi Subscribe, reap-at-zero), flat metadata-free circle key derivation, per-relay rendezvous addressing, content-addressed chunk store, and the encrypted incremental redb share indexer with Pi-civility background scanning. Added ISC-S20."
-  - id: M9
-    tag: v0.11.0
-    summary: "Abuse-resilience + chat affordances. Server: multi-granularity RAM-only rate limits — per-connection token bucket + subscription/verify caps, per-identity-key connection table GC'd on disconnect, uniform silent close (S17/A-S12). Client: exponential+jitter reconnect backoff with an 8-retry budget and layer-based close-cause categorization (C26); mute + hide-shares lists persisted in the seeds blob, never leaked (C15/C16/A-C3); @-mention recognition + resolution as pure post-decrypt/pre-send functions with no new server-visible distinction (C17/C18/A-C4). TUI rendering of these surfaces lands at M11. Closes 9 ISCs."
-  - id: M10-core
-    tag: v0.12.0
-    summary: "M10 verifiable-core (the pure-Rust, TDD-able half). Release trust anchor + N-of-M ML-DSA-87 multi-sig verify (daemonseed_core::release), the server boot-gate that refuses to boot on failed verify with no boot-with-warning path (daemonseed_server::boot_gate), and the client update-lifecycle FSM enforcing verify-before-apply / never-auto-install / no-silent-downgrade / wipe-and-log-on-failure (daemonseed_core::release::update). Plus the M9 per-key rate-limit slot RAII drop-guard and the ISC-S20 coverage backfill. Closes S18/A-S13/C27/A-C11. The release-signing infrastructure and C7/C20 platform features are deferred to M10-infra."
-  - id: M10-completion
-    tag: "v0.12.1"
-    summary: "M10 completion. Scaffolds the two platform-gated M10 ISCs as abstraction-only: C7 biometric/secure-enclave session-passphrase unlock (daemonseed_core::biometric — BiometricStore trait + SessionPassphrase + RECOVERY_RISK_WARNING) and C20 OS-native autostart (daemonseed_core::autostart — pure unit_descriptor generator + AutostartManager trait + PRESENCE_SIDE_CHANNEL_WARNING), with opt-in ProfileConfig flags (default off) and post-MVP Reservations; the platform halves stay in M10-infra. Also brings every LAMA manifest (root + 4 per-crate) from the former project-local dialect to canonical LAMA 0.1 matching the oxicrypt reference."
-  - id: M11
-    tag: v0.13.0
-    summary: "MVP-gate client surfaces — the real interactive ratatui TUI driving the full transaction, M9 surface wiring, public-space (MOTD + announcements) view, suite-deprecation policy surfacing (fetch + ML-DSA verify + anti-rollback), and clean-device recovery from a 24-word mnemonic / .dseed file (gate step 8) — all over already-shipped, already-served server APIs (no new wire protocol). Trips gate steps 3/7/8."
-  - id: M12
-    tag: v0.14.0
-    summary: "MVP. The last two gate steps under one additive SemVer MINOR wire bump. Step 5: user-publish file sharing — PublishShare / UnpublishShare / ListPublicShares over the PublicSpace service; RAM-only per-connection registry (SharePublishRegistry), CLI publish holds the connection open until Ctrl-C, and ShareReapGuard reaps the share on real disconnect (ISC-A-S1 / A-S5b / S4). Step 6: the federation introducer endpoint (FederationIntroducer gRPC over the already-shipped IntroducerQuery/IntroducerResponse) + the TUI Servers-pane RefreshIntroducer surface rendering introducer-discovered candidates read-only, no keys, never auto-trusted (ISC-S6 / S13 / C22 / A-C19). serve_application now serves a single connection until real peer close (no genuinely-new ISC closes; the gate trips 10/10 → MVP declared)."
-  - id: alpha2-batch
-    tag: v0.15.0
-    summary: "Alpha2 batch. Opaque server-assigned share_id (S21 / A-S15); share download (S27-S29 / A-S20-A-S21); interactive public rooms — the auto-joined lobby (S22-S26 / A-S16-A-S19 / C56-C58); client-identity lifecycle — first-start persists the seeds blob + config + .dseed, daily-login Unlock, no-clobber of an existing identity (C47-C51 / A-C26-A-C28); --portable mode forcing CWD as profile root (C52)."
-  - id: chat-surface-fix
-    tag: v0.15.1
-    summary: "Chat-surface precedence fix — posts route to the joined circle rather than the auto-joined lobby — plus a compose-box surface indicator. Client-only."
-  - id: multi-circle-carousel
-    tag: v0.16.0
-    summary: "Multi-circle carousel: simultaneous membership in N circles (joining ADDS, never evicts), a split chat view (lobby pane + active-circle carousel pane), arrow-key cycling of the active circle, deterministic client-local labels, and per-circle surface isolation + attribution (ISC-C59-C62 / A-C29 / A-C30). Purely client-side, no wire change."
-  - id: M13
-    tag: v0.17.0
-    summary: "Persistence keystone. The at-rest seeds blob now persists display name, mute list, hidden-shares, and circle membership (ISC-C51 / C15 / C16 / C59), restored on a daily-login Unlock; circles silently rejoin without re-typing the phrase. Mechanism: a cached SealingKey (daemonseed_core::storage::seeds) re-seals the blob on each mutation with NO second Argon2id (the Pi-4 floor); circle entropy + label are stored as hex directive lines and stay non-mnemonic-derivable, so a mnemonic-only recovery never reconstructs the social graph; CircleJoined echoes the entropy in-process for ordering-free rejoin pairing. No wire change. Deferred to M14: client-side circle-rename (the deterministic seed-label stays canonical until a circle-fingerprint verify affordance exists) and TUI local-sharing + its persistence (the TUI does no local sharing yet — share_index is always None — so there are no own-share definitions to persist)."
-
-milestones_planned:
-  - id: M10-infra
-    summary: "M10 deferred half: real release-signing keys + N-of-M governance identities, Sigstore co-signature, reproducible build, store/F-Droid/OS-packager channels, the optional update-relay role, C7 biometric/secure-enclave login, C20 OS-native autostart, and live update fetch."
-  - id: M14
-    summary: "M13 deferred half: client-side circle-rename (held until a circle-fingerprint verify affordance exists, since the deterministic seed-label must stay canonical) and TUI local-sharing + its persistence (the TUI currently does no local sharing — share_index is always None — so there are no own-share definitions to persist yet)."
-  - id: post-MVP
-    summary: "GFW classifier bench, Pi-4 civility bench, unsigned alpha packaging."
-  - id: alpha2
-    summary: "Direct messaging (ISC-C38–C46 / A-C20–A-C25)."
 
 # ─────────────────────────────────────────────────────────────────────
 # Workspace layout
@@ -538,15 +442,11 @@ external_dependencies:
 # `ISA.md` (2026-05-29); the suite-registry doc stays vault-side for now.
 # ISC numbers are the spec breadcrumbs throughout these manifests.
 
-isc_reference:
-  # Authoritative total tracked by xtask `TOTAL_ISCS` (xtask/src/main.rs) and the
-  # integration-tests `isc_coverage::TOTAL`, kept in sync by a unit test.
-  current_count: 122
-  numbering:
-    server_positive: "ISC-S1 .. ISC-S20"
-    server_negative: "ISC-A-S1 .. ISC-A-S14"
-    client_positive: "ISC-C1 .. ISC-C37 (C5 intentionally vacant)"
-    client_negative: "ISC-A-C1 .. ISC-A-C19"
+# ISC inventory and live coverage are NOT tracked here — the canonical source is
+# the integration-tests registry (`isc_coverage::ISCS` / `TOTAL`), surfaced by
+# `cargo xtask isc-coverage`. The full ISC contract (every ID + its end-state)
+# lives in ../ISA.md `## Criteria`. This kept drifting when duplicated; don't
+# re-add a count here.
 
 # ─────────────────────────────────────────────────────────────────────
 # Where the rich detail lives

@@ -4,6 +4,16 @@ Federated end-to-end-encrypted communication and file-sharing protocol. Pure Rus
 
 Private phase. See [`AGENTS.md`](AGENTS.md) for the working context, conventions, and per-commit discipline. AI agents discovering the project surface should start at [`lama.yaml`](lama.yaml) at the repository root.
 
+## Project map
+
+Each kind of fact has one home — to avoid the drift that comes from duplicating state. Where to look:
+
+- **What shipped, when** → [`CHANGELOG.md`](CHANGELOG.md) (one entry per SSH-signed git tag).
+- **The design contract** (problem, principles, boundaries, every ISC) → [`ISA.md`](ISA.md).
+- **Live ISC coverage** → `cargo xtask isc-coverage`.
+- **The full canonical-homes map** (authoritative; what lives where and why) → the *Canonical homes* table in [`AGENTS.md`](AGENTS.md#canonical-homes).
+- **Per-crate API surface** (for client implementers) → [`docs/llm-api-manifest/`](docs/llm-api-manifest/), indexed from [`lama.yaml`](lama.yaml).
+
 ## Workspace layout
 
 ```
@@ -42,7 +52,9 @@ All six crates are substantive as of the alpha1 MVP (M12). The `tui` crate — t
 
 ## Status
 
-Current release: **v0.17.0**. The full 4-daemon end-to-end gate (`cargo xtask mvp-gate`) passes 10/10: cold first-start, mutual Authenticated, public-space view, circle-of-trust chat with mute/@mentions, user-publish file sharing, federation introducer discovery, suite-deprecation surfacing, and clean-device recovery from a 24-word mnemonic. The alpha1 MVP landed at v0.14.0 (M12), which closed the last two gate steps under one additive wire bump: **user-publish file sharing** (the `daemonseed-cli publish` / `unpublish` / `list-shares` commands; a published share is RAM-only and stays live only while you stay online — the relay reaps it the instant your connection drops) and the **federation introducer endpoint** (the TUI Servers pane surfaces relay-discovered candidate servers read-only — never auto-trusted, promotion is always your explicit action). Four releases followed: **v0.15.0** (alpha2 batch) added an opaque server-assigned `share_id`, share **download**, interactive **public rooms** (the auto-joined "lobby"), the **client-identity lifecycle** (first-start persists the seeds blob + config + `.dseed`; daily-login Unlock; no-clobber of an existing identity), and a **`--portable`** mode that forces the CWD as profile root. **v0.15.1** fixed chat-surface precedence so posts route to the joined circle rather than the auto-joined lobby, and added a compose-box surface indicator. **v0.16.0** added the **multi-circle carousel**: simultaneous membership in N circles with a split chat view (lobby pane + an active-circle carousel pane), ←/→ cycling, deterministic client-local labels, and per-circle surface isolation + attribution — all purely client-side, no wire change. **v0.17.0** (M13, the persistence keystone) makes the at-rest seeds blob carry the **display name, mute list, hidden-shares, and circle membership**, restored on a daily-login Unlock; circles silently rejoin without re-typing the phrase. The write-through caches the session's at-rest `SealingKey` and re-seals on each mutation with no second Argon2id (the Pi-4 floor), so persisting state stays cheap; this persists configuration, not history (the no-client-history property is intact). Earlier milestones delivered the interactive TUI and client surfaces (M11, v0.13.0) and the verifiable-core release machinery (M10, v0.12.1). The release-signing *infrastructure* (real keys, Sigstore co-signature, reproducible builds, store / package-manager channels) and the platform features (biometric login, OS-native autostart) remain on a follow-up "M10-infra" track; direct messaging is alpha2. Client-side circle-rename and TUI local-sharing persistence are deferred to M14. Promotion to a public repository is gated on the `oxicrypt` sibling crate going public.
+Current release: **v0.17.0** — alpha (post-MVP). The alpha1 MVP landed at v0.14.0 (the full 4-daemon end-to-end gate, `cargo xtask mvp-gate`, passes 10/10); releases since have added share download, public rooms, the client-identity lifecycle, the multi-circle carousel, and the at-rest persistence keystone.
+
+The per-release history lives in **[`CHANGELOG.md`](CHANGELOG.md)** (one entry per SSH-signed tag) — this section is intentionally kept to the current release so it can't silently drift. The release-signing *infrastructure* (real keys, Sigstore co-signature, reproducible builds, store / package-manager channels) and the platform features (biometric login, OS-native autostart) remain on a follow-up track; direct messaging is planned. Promotion to a public repository is gated on the `oxicrypt` sibling crate going public.
 
 ## License
 

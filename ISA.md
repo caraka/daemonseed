@@ -3,7 +3,7 @@ task: Daemonseed ideal-state contract and system of record
 project: daemonseed
 effort: comprehensive
 phase: build
-progress: 72/94
+progress: 100/122
 mode: interactive
 started: 2026-04-19T00:00:00Z
 updated: 2026-06-03T00:00:00Z
@@ -325,7 +325,7 @@ The direct-messaging family is deferred from the MVP gate to alpha2. The MVP ter
 
 | surface | check | tool / probe |
 |---------|-------|--------------|
-| Per-ISC coverage | each MVP spec ISC has ≥1 registered integration test | `cargo xtask isc-coverage` (registry: `crates/daemonseed-integration-tests/src/isc_coverage.rs`, `TOTAL = 94`) |
+| Per-ISC coverage | each MVP spec ISC has ≥1 registered integration test | `cargo xtask isc-coverage` (registry: `crates/daemonseed-integration-tests/src/isc_coverage.rs` — its `TOTAL` is the canonical ISC count; never hand-copied elsewhere) |
 | Format | no unformatted code | `cargo fmt --all --check` |
 | Lint | zero warnings | `cargo clippy --workspace --all-targets -- -D warnings` |
 | Tests | all green | `cargo test --workspace` |
@@ -335,50 +335,35 @@ The direct-messaging family is deferred from the MVP gate to alpha2. The MVP ter
 | Censorship survivability | first TLS record is generic-HTTPS-shaped on :443 | wire-shape fixtures (negative-allowlist model) |
 | Resource floor | viable on Raspberry Pi 4 (4 GB) | Pi-4 bench |
 
-The mechanized probe of record is `cargo xtask isc-coverage`. The integration-test registry is the
-source of truth for what "covered" means. **Known reconciliation debt** (see Decisions): the legacy
-`xtask::TOTAL_ISCS` constant is stale at 93 (should be 94) and `xtask::COVERED_ISCS = 72` is a static
-M7 floor — both are slated to be replaced by a live coverage count.
+The mechanized probe of record is `cargo xtask isc-coverage`, and the integration-test registry
+(`isc_coverage::TOTAL` / `ISCS`) is the single source of truth for the ISC count and for what "covered"
+means. No other file carries a hand-written ISC count. **Known coverage debt** (tracked follow-up): the
+`covered` figure xtask reports is still a static lower-bound floor (`xtask::COVERED_ISCS`); a live tally
+that walks the per-milestone `Coverage::register` calls is the deferred replacement. The denominator
+(`TOTAL`) is no longer duplicated — xtask imports it from the registry crate.
 
 ## Features
 
-Work breakdown by milestone. Each milestone is a PR; releases are SSH-signed from M4a onward.
+Work decomposes into **milestones**: one milestone is one PR (multiple commits),
+one SSH-signed release tag from M4a onward, and — for MVP-affecting work — a pass
+of the 4-daemon end-to-end gate (`cargo xtask mvp-gate`; the Definition-of-Done
+lives in `## Test Strategy`). The atomic unit of a feature is an ISC (`## Criteria`);
+a milestone bundles the ISCs whose end-states it delivers.
 
-| milestone | delivers | release | status |
-|-----------|----------|---------|--------|
-| M0 | workspace scaffold, proto codegen pipeline | v0.1.0 | shipped |
-| M1 | identity, handle, 24-word mnemonic, two-stage KDF, at-rest blob | v0.2.0 | shipped |
-| M2 | bootstrap, recovery file, first-start type-state orchestrator | v0.3.0 | shipped |
-| M3 | crypto-suite registry | v0.4.0 | shipped |
-| M4a | relay daemon — TLS 1.3 termination, server identity, APP_HELLO | v0.5.x | shipped |
-| M4b | post-HELLO identity-proof handshake (ISC-S19 / A-S14 / C23), channel-binding | v0.6.0 | shipped |
-| M5 | federation — trust slider, introducer, server-to-server peering | v0.7.0 | shipped |
-| M6 | public space — announcements, signer whitelist, MOTD, rating taxonomy | v0.8.0 | shipped |
-| M7 | crypto-suite deprecation policy + trust-event taxonomy surface | v0.9.0 | shipped |
-| M8 | circle-of-trust chunks indexer; founderless entropy-only CoT key | v0.10.0 | shipped |
-| M9 | rate limits, backoff, mute, hide, @mentions | v0.11.0 | shipped |
-| M10 | release verify, boot gate, update FSM, coverage, LAMA manifests | v0.12.1 | shipped |
-| M11 | **MVP-gate client surfaces** — real TUI, M9 wiring, public-space view, deprecation-policy surfacing, clean-device recovery (all over already-shipped, already-served server APIs; **no new wire protocol**) | v0.13.0 | **surfaces done (steps 3/7/8); v0.13.0 pending tag** |
-| M12 | **user-publish file sharing + federation introducer endpoint** — `PublishShare` RPC + server handler + TUI publish surface (ISC-38), **plus** the federation introducer endpoint (additive gRPC RPC over the already-shipped `IntroducerQuery`/`IntroducerResponse` messages) + its client refresh surface (gate step 6); both ride **one** SemVer **MINOR wire bump**; **trips the full 4-daemon gate → MVP declared** | v0.14.0 | shipped |
-| post-MVP | GFW classifier bench, Pi-4 civility bench, unsigned alpha packaging (parallelizable with M11/M12) | — | planned |
-| alpha2 | direct messaging (ISC-C38–C46 / A-C20–A-C25) | — | deferred |
-| reservations | folder encryption, multi-instance, QUIC transport | — | reserved |
+This section is intentionally **not** a milestone roadmap or status table. That
+history rots the moment it is hand-maintained in two places, so it lives only
+where it cannot drift:
 
-**MVP-gate detail (scope decided 2026-05-29, Path 2):** the gate is a 4-daemon 8-step scenario tracked by
-its own test-harness criteria (distinct from spec ISC IDs). Steps 1 (cold first-start), 2 (all peers
-Authenticated), and 4 (CoT chat + mute/@mention) pass on real binaries. The remaining steps are sliced by
-depth: **M11** finishes the client surfaces that need no new wire protocol — step 3 (public-space
-view, done), step 7 (deprecation-policy fetch + trust-event surfacing, done), and step 8 (clean-device
-recovery branch, done) — over already-shipped, already-served server APIs, releasing v0.13.0. The
-currently-implemented gate (8 subprocess tests, steps 1/2/3/4/7/8) is green; the *full* 8-step gate still
-trips only at M12 once steps 5 and 6 land.
-**M12** carries the protocol changes — step 5 user-publish file sharing (`PublishShare`) **and** the
-federation introducer endpoint (gate step 6, an additive gRPC RPC over the already-shipped introducer
-messages plus its client refresh surface) — both riding one additive MINOR bump, the moment all 8 steps
-pass and the **MVP is declared** at v0.14.0. Clean-device recovery (step 8) is confirmed MVP-gating, not
-deferrable. **Step 6 moved M11→M12 on 2026-05-30** (see Decisions): M5 shipped the introducer's messages
-and `introducer_response()` builder but never an endpoint, so step 6 was never "client-only over
-already-shipped APIs" — completing it adds protocol surface, which now rides M12's already-planned bump.
+- **Shipped history** (which milestone delivered what, at which tag) →
+  the SSH-signed **git tags** and **`CHANGELOG.md`** at the repository root.
+- **Live ISC coverage** (how many ISCs are exercised) →
+  `cargo xtask isc-coverage` (registry: `crates/daemonseed-integration-tests/src/isc_coverage.rs`).
+- **In-progress / next-milestone** (planning) →
+  the project lead's vault manifest (not committed to this repo).
+
+The ISA is the frozen contract — Problem, Vision, Principles, Constraints,
+Criteria, Out of Scope — that every milestone must honor. *What* shipped and
+*when* is history; this file is about what must always hold.
 
 ## Decisions
 
@@ -580,10 +565,11 @@ already-shipped APIs" — completing it adds protocol surface, which now rides M
 
 ## Verification
 
-- Milestones M0–M10 shipped and tagged (v0.1.0 → v0.12.1), SSH-signed from v0.5.x onward; M11 (v0.13.0) in
-  progress on `feat/m11`. Probe: `git -C ~/repos/daemonseed tag` + `git log`.
-- ISC coverage: 72/94 MVP spec ISCs have ≥1 registered test (static M7 floor; live count pending). Probe:
-  `cargo xtask isc-coverage`.
+- Milestone / release history is tracked canonically by the SSH-signed git tags + `CHANGELOG.md`; this ISA
+  records no milestone status (the dated entries below are historical evidence, not a live status board).
+  Probe: `git -C ~/repos/daemonseed tag --verify <tag>` + `CHANGELOG.md`.
+- ISC coverage is reported live by `cargo xtask isc-coverage` (registry `isc_coverage::TOTAL`); no coverage
+  count is hand-written here. Probe: `cargo xtask isc-coverage`.
 - DoD gates green as of M10 close (fmt / clippy `-D warnings` / test / check-proto); 636+ workspace tests.
 - M11 step 7 (suite-deprecation client surface, ISC-C25 / A-S11 / C28) verified 2026-05-30: 96 `daemonseed-tui`
   unit tests pass (11 pure `decide_deprecation` cases covering rollback / withdrawal / missing-key / short-key /
