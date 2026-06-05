@@ -32,13 +32,13 @@ fn main() {
         exit(1);
     });
 
-    let seed = daemonseed_server::identity::load_or_generate(Path::new(&path))
-        .unwrap_or_else(|e| {
+    let seed =
+        daemonseed_server::identity::load_or_generate(Path::new(&path)).unwrap_or_else(|e| {
             eprintln!("failed to load seed: {e}");
             exit(1);
         });
-    let id = daemonseed_server::identity::derive_server_id(&seed, display_name)
-        .unwrap_or_else(|e| {
+    let id =
+        daemonseed_server::identity::derive_server_id(&seed, display_name).unwrap_or_else(|e| {
             eprintln!("failed to derive server-id: {e}");
             exit(1);
         });
