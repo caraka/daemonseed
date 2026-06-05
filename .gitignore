@@ -10,7 +10,7 @@
 Thumbs.db
 desktop.ini
 
-# Editor junk
+# Editor / assistant tool dirs
 *.swp
 *.swo
 *~
@@ -19,6 +19,7 @@ desktop.ini
 .idea/
 .vscode/
 *.iml
+.claude/
 
 # direnv
 .direnv/
