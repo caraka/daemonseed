@@ -158,15 +158,6 @@ pub enum NetCommand {
     /// pane (M15 C; ISC-C64). Emits a [`NetEvent::FetchedShares`] snapshot
     /// (empty if nothing has been fetched).
     ListFetched { fetched_root: PathBuf },
-    /// Extract a previously-fetched share's files from the CAS under
-    /// `fetched_root` into `dest`, reconstructing the rel_path tree (M15 C;
-    /// ISC-C65). Path-traversal-safe (ISC-A-C32). Emits
-    /// [`NetEvent::ExtractComplete`] or [`NetEvent::ExtractError`].
-    ExtractShare {
-        fetched_root: PathBuf,
-        share_id: String,
-        dest: PathBuf,
-    },
     /// Refresh the introducer-discovered candidate peers for the Servers pane
     /// (M12 gate step 6, ISC-C22 / ISC-S6 / ISC-A-C19). Ask the connected
     /// relay's `FederationIntroducer` for its peer list over the live
@@ -374,15 +365,6 @@ pub enum NetEvent {
     /// ISC-C64). Emitted after a successful fetch persists, and in response to
     /// `NetCommand::ListFetched`. Replaces the browse pane's list wholesale.
     FetchedShares { shares: Vec<FetchedShare> },
-    /// A fetched share was extracted to disk (M15 C; ISC-C65). `files` is how
-    /// many files were reconstructed under `dest`.
-    ExtractComplete {
-        share_id: String,
-        dest: PathBuf,
-        files: u32,
-    },
-    /// An extract failed (unknown share, missing chunk, unsafe path, or I/O).
-    ExtractError { message: String },
     /// A fresh introducer-discovery snapshot for the Servers pane (M12 gate
     /// step 6, ISC-C22 / ISC-S6 / ISC-A-C19). `candidates` is the full current
     /// set of introducer-learned peers that are NOT already in the active trust
@@ -636,11 +618,6 @@ async fn net_actor(
                     .await
             }
             NetCommand::ListFetched { fetched_root } => actor.handle_list_fetched(fetched_root),
-            NetCommand::ExtractShare {
-                fetched_root,
-                share_id,
-                dest,
-            } => actor.handle_extract_share(fetched_root, &share_id, dest),
             NetCommand::RefreshIntroducer => actor.handle_refresh_introducer().await,
             NetCommand::PublishShare { root, name } => actor.handle_publish_share(root, name).await,
             NetCommand::UnpublishShare { share_id } => {
@@ -1663,25 +1640,6 @@ impl Actor {
         match FetchedStore::open(&fetched_root).and_then(|s| s.list_shares()) {
             Ok(shares) => self.emit(NetEvent::FetchedShares { shares }),
             Err(_e) => {}
-        }
-    }
-
-    /// Extract a fetched share's files from the CAS under `fetched_root` into
-    /// `dest`, reconstructing the rel_path tree (M15 C; ISC-C65). Path-traversal
-    /// safe (ISC-A-C32, enforced in [`FetchedStore::extract_share`]). Emits
-    /// [`NetEvent::ExtractComplete`] or [`NetEvent::ExtractError`].
-    fn handle_extract_share(&self, fetched_root: PathBuf, share_id: &str, dest: PathBuf) {
-        match FetchedStore::open(&fetched_root)
-            .and_then(|store| store.extract_share(share_id, &dest))
-        {
-            Ok(files) => self.emit(NetEvent::ExtractComplete {
-                share_id: share_id.to_owned(),
-                dest,
-                files,
-            }),
-            Err(e) => self.emit(NetEvent::ExtractError {
-                message: format!("extract failed: {e}"),
-            }),
         }
     }
 
