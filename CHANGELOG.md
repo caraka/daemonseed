@@ -19,6 +19,8 @@ is the durable anchor.
 
 ## [Unreleased]
 
+- M15 C: fetched content → on-disk CAS + browse/extract (`daemonseed_core::storage::fetched`, `MainFocus::Fetched` pane, `NetCommand::{ListFetched,ExtractShare}`, `NetEvent::{FetchedShares,ExtractComplete,ExtractError}`; ISC-C63/C64/C65/A-C31/A-C32).
+
 In-progress and next-milestone planning is tracked in the project lead's vault
 manifest (not committed). The next entry is added here at the moment a release
 is tagged, as part of the doc-sync ritual in `AGENTS.md`.
