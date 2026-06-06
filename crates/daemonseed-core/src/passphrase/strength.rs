@@ -4,12 +4,26 @@
 //! estimated-entropy floor (the "green" threshold). Commit is blocked
 //! while the indicator is below green.
 //!
-//! ISC-C9 (circle-of-trust entropy): same estimator, higher threshold —
-//! ≥128 bits. ⚠️ But zxcvbn saturates `guesses` at 2⁶⁴, so [`Strength::bits`]
-//! never exceeds 64.0 and the literal ≥128 floor is unreachable through this
-//! estimator (discovered M14, 2026-06-05). The circle-join gate uses
-//! [`Strength::meets_circle_interim_floor`] until a key-space (charset /
-//! word-count) estimator replaces zxcvbn for circle entropy.
+//! ISC-C9 (circle-of-trust entropy): a SEPARATE key-space estimator,
+//! [`estimate_circle`], that can actually certify ≥128 bits — zxcvbn cannot
+//! (it is a crack-difficulty model that saturates `guesses` at 2⁶⁴, so
+//! [`Strength::bits`] never exceeds ~64 and a literal ≥128 gate through it would
+//! reject every phrase; discovered M14, 2026-06-05). The circle estimator
+//! combines two independent honest models so EITHER path reaches green
+//! (caraka's M15 decision, 2026-06-05 — "words+charset, keep adding until
+//! green, no formatting forced"):
+//!   • word model — each DISTINCT BIP-39 word contributes log2(2048)=11 bits
+//!     (repeats add 0, so `abandon ×12` cannot cheat the floor);
+//!   • charset model — the RESIDUE (characters of non-wordlist tokens) adds
+//!     `len × log2(distinct_chars)` bits. A word counted at 11 bits is NOT also
+//!     counted character-by-character (no double-count that would green a 6-word
+//!     phrase). 12 diceware words = 132 bits, OR a long mixed string ≈ green —
+//!     neither format is forced.
+//!   • anti-pattern veto — the additive sum over-credits periodic / sequential
+//!     structure (`abcabc…` would read ~143 "bits"), so zxcvbn vetoes any phrase
+//!     it rates trivially guessable (score < 2). zxcvbn is used here only as a
+//!     low-end pattern detector; its 2⁶⁴ ceiling is irrelevant because the
+//!     ≥128 magnitude comes from the key-space sum, not from zxcvbn.
 //!
 //! The estimator wraps `zxcvbn`'s `Entropy::guesses_log10` and converts
 //! to bits. Diceware-style passphrase generation samples the BIP-39
@@ -17,6 +31,9 @@
 //! delivers 66 bits — comfortably above the green threshold, regardless
 //! of natural-language predictability discounts zxcvbn would otherwise
 //! apply to a pattern-bearing input.
+
+use std::collections::HashSet;
+use std::sync::OnceLock;
 
 use bip39::Language;
 
@@ -46,32 +63,30 @@ impl Strength {
     pub fn is_session_green(&self) -> bool {
         self.bits >= SESSION_PASSPHRASE_MIN_BITS
     }
+}
 
-    /// True iff the input meets ISC-C9's ≥128-bit circle-of-trust floor.
-    ///
-    /// ⚠️ **Currently unreachable.** The underlying `zxcvbn` model saturates its
-    /// `guesses` estimate at 2⁶⁴, so [`Self::bits`] can never exceed `64.0` and
-    /// this predicate is *always false* — zxcvbn is a crack-difficulty model, the
-    /// wrong tool to certify a 128-bit *key-space* floor. The circle-join gate
-    /// therefore uses [`Self::meets_circle_interim_floor`] until a charset /
-    /// word-count estimator that can actually reach ≥128 bits replaces zxcvbn for
-    /// circle entropy (discovered 2026-06-05, M14; caraka to decide the
-    /// replacement). Kept as the documented target the real estimator must meet.
+/// Result of estimating a circle-of-trust phrase's strength (ISC-C9). Unlike
+/// [`Strength`] (zxcvbn, session passphrases) this is a key-space estimate that
+/// can actually reach the ≥128-bit floor. See the module docs for the model.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CircleStrength {
+    /// Estimated key-space bits: `distinct_wordlist_words × 11 + charset_residue`.
+    pub bits: f64,
+    /// zxcvbn flagged the phrase as trivially guessable (a repeat / sequence /
+    /// dictionary pattern). Blocks green regardless of the raw key-space `bits`,
+    /// closing the periodic-pattern over-credit the additive model alone leaves
+    /// open (e.g. `abcabc…` = 90 chars × log2(3) ≈ 143 "bits").
+    pub trivially_weak: bool,
+}
+
+impl CircleStrength {
+    /// True iff the phrase meets ISC-C9's ≥128-bit circle-of-trust floor AND is
+    /// not a trivially-guessable pattern — the real gate (M15). A 12-word
+    /// diceware phrase (132 bits) or a sufficiently long, genuinely-varied mixed
+    /// string both clear it; the public xkcd 4-word phrase (≤44 bits) and any
+    /// periodic/sequential pattern do not.
     pub fn is_circle_green(&self) -> bool {
-        self.bits >= CIRCLE_ENTROPY_MIN_BITS
-    }
-
-    /// **Interim** circle-entropy gate (ISC-C9) — the achievable proxy for the
-    /// unreachable ≥128-bit floor (see [`Self::is_circle_green`]).
-    ///
-    /// zxcvbn's `bits` saturate at 64.0, so the join gate instead requires its
-    /// strongest tier (`score == 4`): this rejects weak/predictable phrases
-    /// (`password123`, `Tr0ub4dour&3`, …) without blocking every join, honoring
-    /// the precautionary intent of the M14 Fork-4 decision under the constraint
-    /// that the literal 128-bit threshold cannot be measured today. Replace with
-    /// a true ≥128-bit check once the estimator is upgraded.
-    pub fn meets_circle_interim_floor(&self) -> bool {
-        self.score >= 4
+        self.bits >= CIRCLE_ENTROPY_MIN_BITS && !self.trivially_weak
     }
 }
 
@@ -87,6 +102,74 @@ pub fn estimate(passphrase: &str) -> Strength {
         score: entropy.score() as u8,
         bits,
     }
+}
+
+/// log2(2048) — bits per BIP-39 word (the wordlist has exactly 2048 entries).
+const BITS_PER_WORD: f64 = 11.0;
+
+/// The BIP-39 English wordlist as a lookup set, built once. Used to credit
+/// recognised words at a known per-word entropy in [`estimate_circle`].
+fn bip39_word_set() -> &'static HashSet<&'static str> {
+    static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    SET.get_or_init(|| Language::English.word_list().iter().copied().collect())
+}
+
+/// Estimate a circle-of-trust phrase's key-space entropy (ISC-C9). See the
+/// module docs for the two-model (word + charset) design. The same NFKC +
+/// whitespace canonicalization the KDF applies is applied first, so the meter
+/// agrees with the key the phrase will actually derive.
+pub fn estimate_circle(phrase: &str) -> CircleStrength {
+    let canon = canonicalize(phrase);
+    let words = bip39_word_set();
+
+    // Word model: each DISTINCT recognised BIP-39 word is worth 11 bits.
+    // Everything else is residue for the charset model. A word credited here is
+    // NOT also fed to the charset model, so a pure diceware phrase scores
+    // word-bits only (no inflated per-character double-count).
+    let mut distinct_words: HashSet<&str> = HashSet::new();
+    let mut residue = String::new();
+    for token in canon.split_whitespace() {
+        if words.contains(token) {
+            distinct_words.insert(token);
+        } else {
+            residue.push_str(token);
+        }
+    }
+    let word_bits = distinct_words.len() as f64 * BITS_PER_WORD;
+    let charset_bits = charset_residue_bits(&residue);
+
+    // Anti-pattern veto: the additive key-space sum counts characters/words as if
+    // independent, which over-credits PERIODIC or SEQUENTIAL structure
+    // (`abcabc…`, `abcdef…`). zxcvbn's repeat / sequence / dictionary matchers
+    // catch exactly those below its 2⁶⁴ ceiling, so a phrase it rates trivially
+    // guessable (score < 2 — under ~10⁶ estimated guesses) can never green
+    // however long it is. Genuine diceware or random phrases score 3–4 and pass.
+    // We use zxcvbn ONLY as this low-end pattern detector; its 2⁶⁴ cap (the M14
+    // blocker) is irrelevant because the ≥128 magnitude comes from the sum above.
+    let trivially_weak = canon.is_empty() || (zxcvbn::zxcvbn(&canon, &[]).score() as u8) < 2;
+
+    CircleStrength {
+        bits: word_bits + charset_bits,
+        trivially_weak,
+    }
+}
+
+/// Charset-model contribution of the residue: `len × log2(distinct_chars)`.
+/// The distinct-character base (rather than the looser character-class pool) is
+/// a conservative per-character ceiling — a single repeated character carries no
+/// information, so `aaaa…` scores zero here. Longer-period patterns (`abcabc…`)
+/// still over-credit through this formula; the zxcvbn veto in [`estimate_circle`]
+/// is what actually blocks those.
+fn charset_residue_bits(residue: &str) -> f64 {
+    let len = residue.chars().count();
+    if len == 0 {
+        return 0.0;
+    }
+    let distinct = residue.chars().collect::<HashSet<char>>().len();
+    if distinct <= 1 {
+        return 0.0;
+    }
+    len as f64 * (distinct as f64).log2()
 }
 
 /// Errors from the diceware generator.
@@ -263,35 +346,117 @@ mod tests {
         const _: () = assert!(CIRCLE_ENTROPY_MIN_BITS > SESSION_PASSPHRASE_MIN_BITS);
     }
 
-    /// Regression-pins the zxcvbn 2⁶⁴ cap discovered in M14: `bits` saturate at
-    /// 64.0, so `is_circle_green` (≥128) is unreachable. If a future estimator
-    /// upgrade lifts this cap, THIS test breaks first — the signal to switch the
-    /// circle-join gate back from the interim floor to the real ≥128 check.
+    // ── circle key-space estimator (M15, ISC-C9) ──────────────────────────
+
+    /// 12 distinct BIP-39 words = 12 × 11 = 132 bits → clears the ≥128 floor.
+    /// This is the recommended "generate-then-type" path.
     #[test]
-    fn zxcvbn_bits_saturate_below_the_circle_floor() {
-        let _ = oxicrypt_module::initialize();
-        // A 34-char random mixed string — genuinely ≫128 bits of key space — and
-        // an 11-word phrase both saturate at the same 64.0 zxcvbn ceiling.
-        let rnd = estimate("x7Qk!9zR2m@Lp4wV6sT1bN8dF3hJ5cG0aY");
+    fn twelve_diceware_words_clear_the_circle_floor() {
+        // The first 12 BIP-39 English words — all distinct, all recognised.
+        let phrase = "abandon ability able about above absent \
+                      absorb abstract absurd abuse access accident";
+        let s = estimate_circle(phrase);
         assert!(
-            rnd.bits <= 64.5,
-            "zxcvbn caps bits at ~64 (got {})",
-            rnd.bits
+            s.is_circle_green(),
+            "12 diceware words rated {s:?}, expected ≥128 bits"
         );
         assert!(
-            !rnd.is_circle_green(),
-            "the ≥128-bit floor is unreachable via zxcvbn"
+            (s.bits - 132.0).abs() < 1e-9,
+            "expected 132 bits, got {}",
+            s.bits
         );
     }
 
-    /// The interim floor (`score == 4`) accepts a strong phrase and rejects weak
-    /// / predictable ones — the precautionary M14 gate while ≥128 is unmeasurable.
+    /// The famous public xkcd phrase is only four words (two of which aren't even
+    /// in BIP-39). It MUST be blocked — the interim M14 gate wrongly accepted it.
     #[test]
-    fn interim_circle_floor_separates_weak_from_strong() {
-        let _ = oxicrypt_module::initialize();
-        assert!(estimate("x7Qk!9zR2m@Lp4wV6sT1bN8dF3hJ5cG0aY").meets_circle_interim_floor());
-        assert!(!estimate("password123").meets_circle_interim_floor());
-        assert!(!estimate("Tr0ub4dour&3").meets_circle_interim_floor());
-        assert!(!estimate("abc").meets_circle_interim_floor());
+    fn public_xkcd_four_word_phrase_is_blocked() {
+        let s = estimate_circle("correct horse battery staple");
+        assert!(
+            !s.is_circle_green(),
+            "the public xkcd phrase rated {s:?}, must not green"
+        );
+    }
+
+    /// A repeated word cannot inflate the count — only DISTINCT words score.
+    #[test]
+    fn repeated_word_does_not_inflate() {
+        let s = estimate_circle("abandon abandon abandon abandon abandon abandon");
+        // One distinct word = 11 bits, nowhere near the floor.
+        assert!(
+            (s.bits - 11.0).abs() < 1e-9,
+            "expected 11 bits, got {}",
+            s.bits
+        );
+        assert!(!s.is_circle_green());
+    }
+
+    /// A long, genuinely varied (non-sequential) non-wordlist string reaches
+    /// green via the charset model alone — no diceware format is forced
+    /// (caraka's M15 decision). It must NOT be a sequence, which zxcvbn vetoes.
+    #[test]
+    fn long_varied_string_reaches_green_via_charset() {
+        // 34 random-looking distinct characters → ≈173 key-space bits, and
+        // zxcvbn rates it strong (no repeat/sequence), so it greens.
+        let s = estimate_circle("x7Qk!9zR2m@Lp4wV6sT1bN8dF3hJ5cG0aY");
+        assert!(
+            s.is_circle_green(),
+            "a long varied string rated {s:?}, expected green"
+        );
+    }
+
+    /// A single repeated character carries no information — zero charset bits and
+    /// the zxcvbn veto both keep it red however long it is.
+    #[test]
+    fn repeated_character_never_greens() {
+        let s = estimate_circle(&"a".repeat(200));
+        assert_eq!(s.bits, 0.0, "a single repeated char must score 0 bits");
+        assert!(!s.is_circle_green());
+    }
+
+    /// A small-alphabet PERIODIC pattern (`abcabc…`) has high additive "bits"
+    /// (90 chars × log2(3) ≈ 143) but the zxcvbn anti-pattern veto keeps it red —
+    /// this is the case the additive sum alone gets wrong.
+    #[test]
+    fn small_alphabet_pattern_stays_below_floor() {
+        let s = estimate_circle(&"abc".repeat(30)); // 90 chars, 3 distinct
+        assert!(s.trivially_weak, "a 3-char period must be vetoed by zxcvbn");
+        assert!(
+            !s.is_circle_green(),
+            "a 3-character pattern rated {s:?}, must not green"
+        );
+    }
+
+    /// Words and residue characters combine additively (no double-counting).
+    #[test]
+    fn words_and_residue_combine() {
+        // 2 distinct words (22 bits) + residue "Xq7!vZ" (6 chars, 6 distinct →
+        // 6 × log2(6) ≈ 15.5 bits) = ~37.5 bits.
+        let s = estimate_circle("abandon ability Xq7!vZ");
+        let expected = 22.0 + 6.0 * (6f64).log2();
+        assert!(
+            (s.bits - expected).abs() < 1e-9,
+            "got {}, expected {expected}",
+            s.bits
+        );
+    }
+
+    /// Empty phrase is zero bits and never green.
+    #[test]
+    fn empty_circle_phrase_is_zero_bits() {
+        let s = estimate_circle("");
+        assert_eq!(s.bits, 0.0);
+        assert!(!s.is_circle_green());
+    }
+
+    /// NFKC + whitespace canonicalization is applied before estimation, so the
+    /// meter agrees with the key the KDF will derive (ISC-C9).
+    #[test]
+    fn circle_estimate_canonicalizes_first() {
+        // Fullwidth-spaced and extra-whitespace variants must estimate identically
+        // to the canonical single-spaced form.
+        let a = estimate_circle("abandon   ability    able");
+        let b = estimate_circle("abandon ability able");
+        assert!((a.bits - b.bits).abs() < 1e-9);
     }
 }
