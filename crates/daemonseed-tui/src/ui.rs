@@ -990,34 +990,34 @@ fn render_main_input(app: &App, frame: &mut Frame, area: Rect) {
                 format!("{}{suffix}", app.mute_input()),
             )
         }
-        MainFocus::Shares => (
-            "shares  [↑/↓] select  [f] fetch  [r] refresh  [u] unpublish  [Tab] define-share  [Esc] back"
-                .to_owned(),
-            String::new(),
-        ),
-        MainFocus::DefineShare => (
-            // Fork 1 (caraka 2026-06-05): an input box like JoinCircle, with an
-            // example path as the hint so the expected format is obvious.
-            "share a directory · e.g. /home/you/Shared  (path or path|label)  [Enter] add  [Tab] publish  [Esc] back"
-                .to_owned(),
-            app.share_input().to_owned(),
-        ),
-        MainFocus::Publish => {
-            // D, M15: publish + serve a directory to the connected relay. Mirrors
-            // DefineShare; the serving count + unpublish hint show what's live.
+        MainFocus::Shares => {
+            // M15 cleanup: publishing is `[p]` on the defined share (define once,
+            // then publish) — no separate Publish pane. Show what's defined +
+            // what's serving so the action is obvious.
+            let defined = app
+                .active_defined_share()
+                .map(|(_, name)| format!("   defined: {name} · [p] publish"))
+                .unwrap_or_else(|| "   (Tab → define-share first)".to_owned());
             let serving = app.published().len();
-            let suffix = if serving > 0 {
-                format!("   serving {serving} share(s) · [u] in Shares to stop")
+            let serving_hint = if serving > 0 {
+                format!(" · serving {serving} · [u] unpublish")
             } else {
                 String::new()
             };
             (
                 format!(
-                    "publish a directory · e.g. /home/you/Shared  (path or path|name)  [Enter] publish  [Tab] hide  [Esc] back{suffix}"
+                    "shares  [↑/↓] select  [f] fetch  [r] refresh  [Tab] define-share  [Esc] back{defined}{serving_hint}"
                 ),
-                app.publish_input().to_owned(),
+                String::new(),
             )
         }
+        MainFocus::DefineShare => (
+            // Fork 1 (caraka 2026-06-05): an input box like JoinCircle, with an
+            // example path as the hint so the expected format is obvious.
+            "share a directory · e.g. /home/you/Shared  (path or path|label)  [Enter] add  [Tab] hide  ([p] in Shares to publish)  [Esc] back"
+                .to_owned(),
+            app.share_input().to_owned(),
+        ),
         MainFocus::Hide => {
             let hidden: Vec<&str> = app.hidden_shares().collect();
             let suffix = if hidden.is_empty() {
