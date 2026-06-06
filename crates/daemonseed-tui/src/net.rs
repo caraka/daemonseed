@@ -25,6 +25,7 @@
 //! `tokio::spawn`ed onto a multi-thread runtime — `spawn_local` sidesteps the
 //! `Send` bound.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -50,6 +51,7 @@ use daemonseed_core::public_room::{
     DEFAULT_ROOM, derive_room_key, open_room_message, room_asset_address, seal_room_message,
 };
 use daemonseed_core::share_envelope::ShareFrame;
+use daemonseed_core::share_serve::ShareContent;
 use daemonseed_core::storage::cas::chunk_addr;
 use daemonseed_core::storage::seeds::{CounterState, IndexKey};
 use daemonseed_core::storage::share_index::ShareIndex;
@@ -158,6 +160,21 @@ pub enum NetCommand {
     /// address only. A read-only operation against an already-shipped gRPC
     /// service — no new wire protocol.
     RefreshIntroducer,
+    /// Publish a defined share to the connected relay and serve its content
+    /// (D, M15; ISC-S27 / ISC-S29 / F25). Indexes `root` into a [`ShareContent`]
+    /// (fails fast on a bad path), publishes the listing via `PublishShare` to
+    /// learn the server-assigned `share_id`, then spawns a `serve_share` task
+    /// answering fetchers' manifest/chunk requests over the share's CoT
+    /// fetch-asset for as long as the session is up ("you must be online to
+    /// share" — the relay reaps the share when this connection drops, ISC-S20).
+    /// Lifecycle arrives as `NetEvent::PublishStarted` / `PublishError` /
+    /// `PublishStopped`.
+    PublishShare { root: PathBuf, name: String },
+    /// Unpublish a share published this session and stop serving it (D, M15;
+    /// owner-scoped, ISC-A-S1). Sends `UnpublishShare` to the relay and aborts
+    /// the local serve task, emitting `NetEvent::PublishStopped`. No-op for an
+    /// unknown id.
+    UnpublishShare { share_id: String },
 }
 
 /// An event from the network actor back to the UI. Plain data — folded into
@@ -349,6 +366,21 @@ pub enum NetEvent {
     /// candidate list is left in place so a transient failure never blanks the
     /// last-known discovery state (mirrors the deprecation-error precedent).
     IntroducerError { message: String },
+    /// A share began publishing and is now being served (D, M15). `share_id` is
+    /// the server-assigned id; `file_count` mirrors the indexed manifest. The
+    /// share stays served until `UnpublishShare`, the session drops, or the relay
+    /// reaps the asset — then `PublishStopped` arrives.
+    PublishStarted {
+        share_id: String,
+        name: String,
+        file_count: usize,
+    },
+    /// Publishing a share failed (no session, no server-id, an unreadable path,
+    /// or a refused `PublishShare` RPC). Surfaced on the status line.
+    PublishError { message: String },
+    /// A published share stopped being served (D, M15): the user unpublished it,
+    /// the serve stream ended (peer/relay closed), or the session dropped.
+    PublishStopped { share_id: String },
 }
 
 /// Owns the network thread and the command/event channels. Held by the binary
@@ -498,6 +530,11 @@ struct Actor {
     /// active trust set: nothing here is trusted or connectable until the user
     /// promotes it — discovery NEVER writes the trust set.
     discovered: DiscoveredPeers,
+    /// Active publish serve-tasks keyed by the server-assigned `share_id` (D,
+    /// M15). Each value is the `spawn_local` handle for that share's
+    /// `serve_share` loop; `UnpublishShare` aborts it. Empty until the user
+    /// publishes; a task that ends on its own leaves a harmless completed entry.
+    published: HashMap<String, tokio::task::JoinHandle<()>>,
 }
 
 /// The actor loop: receive commands and drive each on the current-thread
@@ -520,6 +557,7 @@ async fn net_actor(
         server_pubkey: None,
         policy_cache: PolicyCache::new(),
         discovered: DiscoveredPeers::new(),
+        published: HashMap::new(),
     };
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
@@ -557,6 +595,10 @@ async fn net_actor(
                 sharer_handle,
             } => actor.handle_fetch_share(&share_id, &sharer_handle).await,
             NetCommand::RefreshIntroducer => actor.handle_refresh_introducer().await,
+            NetCommand::PublishShare { root, name } => actor.handle_publish_share(root, name).await,
+            NetCommand::UnpublishShare { share_id } => {
+                actor.handle_unpublish_share(&share_id).await
+            }
         }
     }
 }
@@ -564,6 +606,100 @@ async fn net_actor(
 impl Actor {
     fn emit(&self, evt: NetEvent) {
         let _ = self.evt_tx.send(evt);
+    }
+
+    /// Publish a defined share and serve its content for the life of the session
+    /// (D, M15). See [`NetCommand::PublishShare`]. The session is cloned up front
+    /// (cheap — the tonic channel is `Arc`-backed) so no borrow of `self` is held
+    /// across the `&mut self` bookkeeping at the end.
+    async fn handle_publish_share(&mut self, root: PathBuf, name: String) {
+        let session = match self.session.as_ref() {
+            Some(s) => s.clone(),
+            None => {
+                return self.emit(NetEvent::PublishError {
+                    message: "not connected to a relay yet".to_owned(),
+                });
+            }
+        };
+        let Some(server_id) = self.server_id.clone() else {
+            return self.emit(NetEvent::PublishError {
+                message: "no server-id for the connected relay".to_owned(),
+            });
+        };
+        // Index BEFORE publishing so a bad path fails fast and the listing is
+        // never advertised for content we cannot serve (mirrors the CLI).
+        let content = match ShareContent::index_dir(&root) {
+            Ok(c) => c,
+            Err(e) => {
+                return self.emit(NetEvent::PublishError {
+                    message: format!("could not index {}: {e}", root.display()),
+                });
+            }
+        };
+        let file_count = content.file_count();
+        // listing.share_id is ignored — the server assigns it (F25).
+        let resp = session
+            .public_space()
+            .publish_share(wire::PublishShareRequest {
+                listing: Some(wire::PublicShareListing {
+                    share_id: String::new(),
+                    name: name.clone(),
+                    rating: String::new(),
+                    sharer_handle: String::new(),
+                }),
+            })
+            .await;
+        let share_id = match resp {
+            Ok(r) => r.into_inner().share_id,
+            Err(s) => {
+                return self.emit(NetEvent::PublishError {
+                    message: format!("publish refused: {s}"),
+                });
+            }
+        };
+        // Serve concurrently for the life of the session via `spawn_local` (like
+        // the circle inbound readers). `serve_share` ends (Ok) when the relay
+        // reaps the asset or the peer leaves; an explicit `UnpublishShare` aborts
+        // the task before then. On a natural end we emit `PublishStopped`; on an
+        // abort the future is dropped before that line runs, so unpublish's own
+        // `PublishStopped` is the single notification.
+        let evt_tx = self.evt_tx.clone();
+        let task_share_id = share_id.clone();
+        let handle = tokio::task::spawn_local(async move {
+            let _ = session
+                .serve_share(&server_id, &task_share_id, &content)
+                .await;
+            let _ = evt_tx.send(NetEvent::PublishStopped {
+                share_id: task_share_id,
+            });
+        });
+        self.published.insert(share_id.clone(), handle);
+        self.emit(NetEvent::PublishStarted {
+            share_id,
+            name,
+            file_count,
+        });
+    }
+
+    /// Unpublish a share published this session and stop serving it (D, M15).
+    /// See [`NetCommand::UnpublishShare`]. Owner-scoped server-side (ISC-A-S1):
+    /// the relay honours it only on the publishing connection, which is this
+    /// long-lived actor.
+    async fn handle_unpublish_share(&mut self, share_id: &str) {
+        if let Some(handle) = self.published.remove(share_id) {
+            handle.abort();
+        }
+        if let Some(session) = self.session.as_ref() {
+            let _ = session
+                .public_space()
+                .unpublish_share(wire::UnpublishShareRequest {
+                    share_id: share_id.to_owned(),
+                })
+                .await;
+        }
+        self.emit(NetEvent::PublishStopped {
+            share_id: share_id.to_owned(),
+        });
     }
 
     /// Drive a single connect to Authenticated, keep the live session, and emit
@@ -1891,6 +2027,40 @@ mod tests {
             server_pubkey: None,
             policy_cache: PolicyCache::new(),
             discovered: DiscoveredPeers::new(),
+            published: HashMap::new(),
+        }
+    }
+
+    /// Publishing with no live session fails fast with a `PublishError` and
+    /// spawns no serve task (D, M15).
+    #[test]
+    fn publish_without_session_errors() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut actor = bare_actor(tx);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(actor.handle_publish_share(std::path::PathBuf::from("/tmp"), "x".to_owned()));
+        match rx.try_recv().unwrap() {
+            NetEvent::PublishError { message } => assert!(message.contains("not connected")),
+            other => panic!("expected PublishError, got {other:?}"),
+        }
+        assert!(actor.published.is_empty(), "no serve task tracked");
+    }
+
+    /// Unpublishing an unknown id with no session still emits `PublishStopped`
+    /// (idempotent stop) and tracks nothing (D, M15).
+    #[test]
+    fn unpublish_unknown_id_emits_stopped() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut actor = bare_actor(tx);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(actor.handle_unpublish_share("deadbeef"));
+        match rx.try_recv().unwrap() {
+            NetEvent::PublishStopped { share_id } => assert_eq!(share_id, "deadbeef"),
+            other => panic!("expected PublishStopped, got {other:?}"),
         }
     }
 

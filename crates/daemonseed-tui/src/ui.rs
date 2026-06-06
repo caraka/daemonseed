@@ -931,16 +931,33 @@ fn render_main_input(app: &App, frame: &mut Frame, area: Rect) {
             )
         }
         MainFocus::Shares => (
-            "shares  [↑/↓] select  [r] refresh  [Tab] define-share  [Esc] back".to_owned(),
+            "shares  [↑/↓] select  [f] fetch  [r] refresh  [u] unpublish  [Tab] define-share  [Esc] back"
+                .to_owned(),
             String::new(),
         ),
         MainFocus::DefineShare => (
             // Fork 1 (caraka 2026-06-05): an input box like JoinCircle, with an
             // example path as the hint so the expected format is obvious.
-            "share a directory · e.g. /home/you/Shared  (path or path|label)  [Enter] add  [Tab] hide  [Esc] back"
+            "share a directory · e.g. /home/you/Shared  (path or path|label)  [Enter] add  [Tab] publish  [Esc] back"
                 .to_owned(),
             app.share_input().to_owned(),
         ),
+        MainFocus::Publish => {
+            // D, M15: publish + serve a directory to the connected relay. Mirrors
+            // DefineShare; the serving count + unpublish hint show what's live.
+            let serving = app.published().len();
+            let suffix = if serving > 0 {
+                format!("   serving {serving} share(s) · [u] in Shares to stop")
+            } else {
+                String::new()
+            };
+            (
+                format!(
+                    "publish a directory · e.g. /home/you/Shared  (path or path|name)  [Enter] publish  [Tab] hide  [Esc] back{suffix}"
+                ),
+                app.publish_input().to_owned(),
+            )
+        }
         MainFocus::Hide => {
             let hidden: Vec<&str> = app.hidden_shares().collect();
             let suffix = if hidden.is_empty() {
