@@ -272,6 +272,9 @@ pub struct PublishRequest {
     pub root: std::path::PathBuf,
     /// The share's advertised display name (defaults to the directory name).
     pub name: String,
+    /// The publisher's own display handle (name#hash), advertised in the
+    /// listing so peers see who shared it instead of "(operator)".
+    pub sharer_handle: String,
 }
 
 /// Active share-fetch state (ISC-19, F23 unified mechanism).
@@ -2250,9 +2253,14 @@ impl App {
     /// the Shares pane's `[p]` action). Define once, then `[p]`; no re-typing.
     /// A no-op with a hint if nothing is defined yet.
     fn publish_active_share(&mut self) {
+        let sharer_handle = self.own_handle();
         match self.active_defined_share.clone() {
             Some((root, name)) => {
-                self.pending_publish = Some(PublishRequest { root, name });
+                self.pending_publish = Some(PublishRequest {
+                    root,
+                    name,
+                    sharer_handle,
+                });
                 self.status = Some("publishing…".to_owned());
             }
             None => {
@@ -2810,6 +2818,12 @@ mod tests {
             .expect("[p] queues a publish of the defined share");
         assert!(req.root.is_dir());
         assert_eq!(req.name, "My Share");
+        // The listing carries the publisher's handle so peers see the sharer's
+        // name, not "(operator)" (M15 — completes the #6 passthrough).
+        assert!(
+            !req.sharer_handle.is_empty(),
+            "publish carries the sharer handle"
+        );
         assert!(
             app.take_pending_publish().is_none(),
             "request drained exactly once"
