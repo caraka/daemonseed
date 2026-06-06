@@ -3,83 +3,82 @@
 //!
 //! The share-fetch path ([`crate::share_envelope`], the TUI `FetchShare` net
 //! actor) verifies every chunk against its content address (ISC-S28 /
-//! ISC-A-S20) and, until M15, dropped the verified bytes after accounting them
-//! — a fetch proved the content was *fetchable* but left nothing on disk. This
-//! module is the persistence layer above that verification: a fetched share's
-//! files land in an on-disk content-addressed store and a small manifest
-//! records what was downloaded, so the user can browse fetched shares and
-//! extract their files after the fetch overlay closes.
+//! ISC-A-S20). This module persists a fully-verified fetch to disk as an
+//! *explicit download*: the files land **directly, under their real names**, in
+//! a per-share folder the user can open — no content-addressed store, no manual
+//! extract step.
 //!
-//! ## At-rest posture — plaintext explicit downloads (decided 2026-06-05)
+//! ## At-rest posture — plaintext named downloads (M15 cleanup, 2026-06-06)
 //!
 //! A fetched chunk is the **plaintext file bytes** the sharer indexed
 //! ([`crate::share_serve::ShareContent::index_dir`] reads each file and stores
-//! its raw bytes; the chunk address is `SHA-384(file-bytes)`). So this store
-//! holds plaintext content by design — that is the whole point of an *explicit
-//! download*: the user fetched these files to open them. This is a deliberately
-//! larger at-rest surface than the rest of the client (which persists only the
-//! encrypted blob + config, ISC-A-C1) and is the seized-blob footprint the
-//! R-PANIC erasure reservation targets. It does **not** breach the
-//! no-client-history invariant: downloaded files are user-chosen artifacts, not
-//! message/post/session history.
+//! its raw bytes). The fetcher writes those bytes back out under the file's
+//! original `rel_path`, so a download is just *the files the user fetched, named
+//! the way they were shared*. This is a deliberately larger at-rest surface than
+//! the rest of the client (ISC-A-C1) — downloaded files are user-chosen
+//! artifacts, not message/post/session history, so the no-client-history
+//! invariant holds; the surface is the R-PANIC erasure target.
 //!
-//! The manifest is likewise plaintext: encrypting metadata that names files
-//! whose bytes sit beside it in plaintext would be theatre — an attacker with
-//! the seized download directory reads the files directly. A future at-rest
-//! folder-encryption feature (the same one [`crate::storage::share_index`]
-//! anticipates) would wrap the whole `fetched/` tree, content and manifest
-//! together; that is post-MVP and additive.
+//! **Why not a content-addressed store?** The original M15 C design persisted
+//! chunks into a hex-named [`crate::storage::cas::FileChunkStore`] and required a
+//! separate "extract" step. The pre-merge smoke test (2026-06-06) showed that
+//! leaks implementation to the user — a `cas/` folder, hex filenames, stripped
+//! extensions, `.rc` refcount sidecars, all shares mingled by dedup. A CAS earns
+//! its keep on the *serve* side; for a fetcher's explicit downloads it is
+//! over-engineering. So the fetcher writes named files directly instead. (A
+//! future at-rest folder-encryption feature would wrap the whole `downloads/`
+//! tree, additive and post-MVP.)
 //!
 //! ## Layout
 //!
 //! ```text
-//! <root>/                     (e.g. <profile-root>/fetched)
-//!   cas/                      a FileChunkStore — one file per chunk, hex(addr)
-//!   shares.idx                the manifest (see below)
+//! <root>/                      (e.g. <profile-root>/downloads)
+//!   <share-name>/              one folder per fetched share, named by the share
+//!     readme.txt               the files, real names, mirroring the rel_path tree
+//!     sub/notes.md
+//!   downloads.idx              a small manifest, for the browse pane
 //! ```
 //!
-//! ## Manifest format (`shares.idx`)
+//! ## Manifest format (`downloads.idx`)
 //!
 //! A line-based text file (the same hand-rolled, dependency-free style as the
 //! seeds directives — the workspace carries no `serde_json`). Variable fields
-//! are hex-encoded so a path, name, or address can never collide with the
-//! space delimiter or the newline framing:
+//! are hex-encoded so a name or path can never collide with the space delimiter:
 //!
 //! ```text
-//! # daemonseed fetched-share manifest v1
-//! S <share_id_hex> <name_hex> <file_count>
-//! F <rel_path_hex> <chunk_addr_hex> <size_dec>
+//! # daemonseed downloads manifest v2
+//! S <share_id_hex> <name_hex> <folder_hex> <file_count>
+//! F <rel_path_hex> <size_dec>
 //! F ...
 //! S ...
 //! ```
 
 use std::path::{Component, Path, PathBuf};
 
-use crate::storage::cas::{CHUNK_ADDR_LEN, CasError, ChunkAddr, ChunkStore, FileChunkStore};
-
 /// Manifest header — bumped if the on-disk format changes incompatibly.
-const MANIFEST_HEADER: &str = "# daemonseed fetched-share manifest v1";
+const MANIFEST_HEADER: &str = "# daemonseed downloads manifest v2";
 
 /// One downloaded file inside a [`FetchedShare`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchedFile {
-    /// The file's path relative to the share root (the sharer's `rel_path`;
-    /// `/`-separated, as it arrived on the wire). Untrusted — sanitised at
-    /// extraction time (ISC-A-C32).
+    /// The file's path relative to the share's download folder (the sharer's
+    /// `rel_path`, `/`-separated). On disk it is written under its real name.
     pub rel_path: String,
-    /// The content address its bytes live under in the CAS.
-    pub chunk_addr: ChunkAddr,
     /// The file's size in bytes.
     pub size: u64,
 }
 
-/// A fetched share's manifest record: what was downloaded under one `share_id`.
+/// A fetched share's record: what was downloaded under one `share_id`, and the
+/// folder it landed in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchedShare {
     /// The server-assigned share id this content was fetched under (ISC-S21).
     pub share_id: String,
     /// The sharer-advertised display name (from the `PublicShareListing`).
     pub name: String,
+    /// The folder under the downloads root the files landed in (a single safe
+    /// path component, derived from `name`, collision-suffixed if needed).
+    pub folder: String,
     /// One entry per downloaded file.
     pub files: Vec<FetchedFile>,
 }
@@ -96,26 +95,24 @@ impl FetchedShare {
 pub enum FetchedError {
     /// Filesystem I/O failed.
     Io(std::io::Error),
-    /// The underlying content-addressed store failed.
-    Cas(CasError),
-    /// The manifest on disk was unparseable, or a manifest entry named a chunk
-    /// the CAS does not hold (a corrupt or partially-deleted download dir).
+    /// The manifest on disk was unparseable.
     Corrupt(String),
-    /// An extraction was asked to write a file whose `rel_path` escapes the
-    /// destination directory (`..`, an absolute path, or a root/prefix
-    /// component). A hostile sharer's manifest must never write outside the
-    /// chosen dir (ISC-A-C32).
+    /// A download was asked to write a file whose `rel_path` escapes its folder
+    /// (`..`, an absolute path, or a root/prefix component). A hostile sharer's
+    /// manifest must never write outside the share folder (ISC-A-C32).
     UnsafePath(String),
 }
 
 impl core::fmt::Display for FetchedError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            FetchedError::Io(e) => write!(f, "fetched-store I/O failed: {e}"),
-            FetchedError::Cas(e) => write!(f, "fetched-store chunk store failed: {e}"),
-            FetchedError::Corrupt(m) => write!(f, "fetched-store manifest corrupt: {m}"),
+            FetchedError::Io(e) => write!(f, "downloads-store I/O failed: {e}"),
+            FetchedError::Corrupt(m) => write!(f, "downloads manifest corrupt: {m}"),
             FetchedError::UnsafePath(p) => {
-                write!(f, "refusing to extract path escaping the destination: {p}")
+                write!(
+                    f,
+                    "refusing to write a download path escaping its folder: {p}"
+                )
             }
         }
     }
@@ -125,15 +122,8 @@ impl core::error::Error for FetchedError {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             FetchedError::Io(e) => Some(e),
-            FetchedError::Cas(e) => Some(e),
             FetchedError::Corrupt(_) | FetchedError::UnsafePath(_) => None,
         }
-    }
-}
-
-impl From<CasError> for FetchedError {
-    fn from(e: CasError) -> Self {
-        FetchedError::Cas(e)
     }
 }
 
@@ -144,76 +134,99 @@ impl From<std::io::Error> for FetchedError {
 }
 
 /// One file's verified bytes, ready to persist: the sharer's `rel_path` and the
-/// plaintext bytes the fetch verified against the content address. The address
-/// is *re-derived* by the CAS on `put`, never trusted from the caller.
+/// plaintext bytes the fetch verified against the content address.
 pub struct VerifiedFile {
-    /// The file's wire `rel_path` (untrusted; sanitised only at extraction).
+    /// The file's wire `rel_path` (untrusted; sanitised before it is written).
     pub rel_path: String,
     /// The verified plaintext file bytes.
     pub bytes: Vec<u8>,
 }
 
-/// The on-disk store of fetched share content.
+/// The on-disk store of fetched share content — named files under a per-share
+/// folder.
 ///
 /// Open once with [`FetchedStore::open`]; [`record_share`](Self::record_share)
-/// persists a completed fetch, [`list_shares`](Self::list_shares) enumerates
-/// downloads for the browse view, and [`extract_share`](Self::extract_share)
-/// reconstructs a download's files into a chosen directory.
+/// persists a completed fetch (writing named files), and
+/// [`list_shares`](Self::list_shares) enumerates downloads for the browse view.
+/// The files are already on disk under their real names, so there is no extract
+/// step — the browse pane shows each share's folder.
 pub struct FetchedStore {
     root: PathBuf,
 }
 
 impl FetchedStore {
-    /// Open (creating if absent) the fetched-content store rooted at `root`.
-    /// Reopening an existing root recovers every prior download.
+    /// Open (creating if absent) the downloads store rooted at `root`.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, FetchedError> {
         let root = root.into();
         std::fs::create_dir_all(&root)?;
         Ok(Self { root })
     }
 
-    fn cas_root(&self) -> PathBuf {
-        self.root.join("cas")
+    /// The absolute path of the folder a recorded share's files live in.
+    pub fn share_dir(&self, share: &FetchedShare) -> PathBuf {
+        self.root.join(&share.folder)
     }
 
     fn manifest_path(&self) -> PathBuf {
-        self.root.join("shares.idx")
+        self.root.join("downloads.idx")
     }
 
-    /// Persist a fully-verified fetched share. Every file's bytes are stored in
-    /// the content-addressed store and a manifest record is written.
+    /// Persist a fully-verified fetched share by writing its files, under their
+    /// real names, into a per-share folder beneath the downloads root.
     ///
     /// **No-partial invariant (ISC-A-C31):** the caller invokes this only after
-    /// the fetch has verified *every* chunk; a fetch that fails verification
-    /// mid-stream never reaches here, so a poisoned or truncated download is
-    /// never recorded. Re-recording the same `share_id` replaces its manifest
-    /// record (a re-fetch overwrites the listing); the prior chunks remain in
-    /// the CAS — refcount-correct eviction on replace is a documented post-MVP
-    /// follow-up, harmless because the bytes are content-addressed and shared.
+    /// the fetch has verified *every* chunk, so a poisoned or truncated download
+    /// is never written. Re-recording the same `share_id` reuses its folder and
+    /// overwrites the files (a re-fetch refreshes the download).
+    ///
+    /// **Path-traversal safe (ISC-A-C32):** the share folder is a single safe
+    /// component derived from `name`, and every file's `rel_path` is validated
+    /// to be strictly relative with only normal components before it is written.
     pub fn record_share(
         &mut self,
         share_id: &str,
         name: &str,
         files: &[VerifiedFile],
     ) -> Result<FetchedShare, FetchedError> {
-        let mut store = FileChunkStore::open(self.cas_root())?;
+        let mut shares = self.list_shares()?;
+
+        // Reuse this share's existing folder on a re-fetch; otherwise derive a
+        // unique folder name from the share name (collision-suffixed by share_id).
+        let folder = match shares.iter().find(|s| s.share_id == share_id) {
+            Some(existing) => existing.folder.clone(),
+            None => {
+                let base = safe_folder_name(name);
+                let taken: std::collections::BTreeSet<&str> =
+                    shares.iter().map(|s| s.folder.as_str()).collect();
+                if taken.contains(base.as_str()) {
+                    let suffix: String = share_id.chars().take(6).collect();
+                    format!("{base}-{suffix}")
+                } else {
+                    base
+                }
+            }
+        };
+
+        let share_dir = self.root.join(&folder);
         let mut recs = Vec::with_capacity(files.len());
         for vf in files {
-            // `put` re-derives SHA-384(bytes); the address recorded is the
-            // store's, never a wire-asserted value.
-            let addr = store.put(&vf.bytes)?;
+            let safe = sanitize_rel_path(&vf.rel_path)?;
+            let out = share_dir.join(&safe);
+            if let Some(parent) = out.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&out, &vf.bytes)?;
             recs.push(FetchedFile {
                 rel_path: vf.rel_path.clone(),
-                chunk_addr: addr,
                 size: vf.bytes.len() as u64,
             });
         }
 
-        let mut shares = self.list_shares()?;
         shares.retain(|s| s.share_id != share_id);
         let share = FetchedShare {
             share_id: share_id.to_owned(),
             name: name.to_owned(),
+            folder,
             files: recs,
         };
         shares.push(share.clone());
@@ -221,8 +234,8 @@ impl FetchedStore {
         Ok(share)
     }
 
-    /// Enumerate every fetched share, newest-recorded last (the order they sit
-    /// in the manifest). `Ok(vec![])` when nothing has been fetched.
+    /// Enumerate every fetched share, in manifest order. `Ok(vec![])` when
+    /// nothing has been fetched.
     pub fn list_shares(&self) -> Result<Vec<FetchedShare>, FetchedError> {
         let raw = match std::fs::read_to_string(self.manifest_path()) {
             Ok(s) => s,
@@ -232,63 +245,23 @@ impl FetchedStore {
         parse_manifest(&raw)
     }
 
-    /// Reconstruct a fetched share's files into `dest`, returning how many files
-    /// were written. Each file's bytes come from the CAS by content address;
-    /// the directory tree under `dest` mirrors the share's `rel_path`s.
-    ///
-    /// **Path-traversal safe (ISC-A-C32):** every `rel_path` is validated to be
-    /// strictly relative with only normal components — a manifest entry naming
-    /// `..`, an absolute path, or a drive/root prefix is refused with
-    /// [`FetchedError::UnsafePath`] and nothing is written for it, so a hostile
-    /// sharer's manifest can never escape `dest`.
-    pub fn extract_share(&self, share_id: &str, dest: &Path) -> Result<u32, FetchedError> {
-        let share = self
-            .list_shares()?
-            .into_iter()
-            .find(|s| s.share_id == share_id)
-            .ok_or_else(|| FetchedError::Corrupt(format!("no fetched share with id {share_id}")))?;
-
-        let store = FileChunkStore::open(self.cas_root())?;
-        std::fs::create_dir_all(dest)?;
-
-        let mut written = 0u32;
-        for file in &share.files {
-            // Validate BEFORE touching the chunk store so a hostile path is
-            // rejected even if its chunk is present.
-            let safe = sanitize_rel_path(&file.rel_path)?;
-            let bytes = store.get(&file.chunk_addr)?.ok_or_else(|| {
-                FetchedError::Corrupt(format!(
-                    "fetched share {share_id} references a chunk missing from the store ({})",
-                    file.rel_path
-                ))
-            })?;
-            let out = dest.join(&safe);
-            if let Some(parent) = out.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&out, &bytes)?;
-            written += 1;
-        }
-        Ok(written)
-    }
-
     fn write_manifest(&self, shares: &[FetchedShare]) -> Result<(), FetchedError> {
         let mut out = String::new();
         out.push_str(MANIFEST_HEADER);
         out.push('\n');
         for s in shares {
             out.push_str(&format!(
-                "S {} {} {}\n",
+                "S {} {} {} {}\n",
                 hex::encode(s.share_id.as_bytes()),
                 hex::encode(s.name.as_bytes()),
+                hex::encode(s.folder.as_bytes()),
                 s.files.len(),
             ));
             for f in &s.files {
                 out.push_str(&format!(
-                    "F {} {} {}\n",
+                    "F {} {}\n",
                     hex::encode(f.rel_path.as_bytes()),
-                    hex::encode(f.chunk_addr.as_bytes()),
-                    f.size,
+                    f.size
                 ));
             }
         }
@@ -297,17 +270,39 @@ impl FetchedStore {
     }
 }
 
+/// Derive a safe single-component folder name from an untrusted share name.
+/// Path separators and control chars become `_`; leading/trailing dots and
+/// whitespace are trimmed; an empty or all-trimmed result falls back to
+/// `"share"`. The result is always a single safe path component (ISC-A-C32).
+fn safe_folder_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c == '/' || c == '\\' || c.is_control() {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim().trim_matches('.').trim();
+    if trimmed.is_empty() {
+        "share".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
 /// Validate an untrusted wire `rel_path` and return the safe relative
-/// [`PathBuf`] to join under the destination. Rejects absolute paths, `..`,
+/// [`PathBuf`] to join under the share folder. Rejects absolute paths, `..`,
 /// `.`, and any root/prefix component — only `Component::Normal` survives
 /// (ISC-A-C32).
 fn sanitize_rel_path(rel: &str) -> Result<PathBuf, FetchedError> {
     if rel.is_empty() {
         return Err(FetchedError::UnsafePath(rel.to_owned()));
     }
-    // A leading `/` is an absolute path. Joining it under `dest` would silently
-    // relativise it (safe but surprising); reject it outright instead so a
-    // weird/hostile manifest path surfaces rather than being rewritten.
+    // A leading `/` is an absolute path. Reject it outright rather than silently
+    // relativise it.
     if rel.starts_with('/') {
         return Err(FetchedError::UnsafePath(rel.to_owned()));
     }
@@ -316,16 +311,11 @@ fn sanitize_rel_path(rel: &str) -> Result<PathBuf, FetchedError> {
     let mut safe = PathBuf::new();
     for seg in rel.split('/') {
         if seg.is_empty() {
-            // Leading, trailing, or doubled `/` — collapse, but a lone `/`
-            // (absolute) yields an empty first segment and nothing else, which
-            // we reject below via the empty-result guard.
             continue;
         }
         let p = Path::new(seg);
         let mut comps = p.components();
         match (comps.next(), comps.next()) {
-            // Exactly one Normal component and nothing else is the only safe
-            // shape. A `..`, `.`, root, or prefix component is rejected.
             (Some(Component::Normal(c)), None) => safe.push(c),
             _ => return Err(FetchedError::UnsafePath(rel.to_owned())),
         }
@@ -338,7 +328,7 @@ fn sanitize_rel_path(rel: &str) -> Result<PathBuf, FetchedError> {
 
 fn parse_manifest(raw: &str) -> Result<Vec<FetchedShare>, FetchedError> {
     let mut shares = Vec::new();
-    let mut lines = raw.lines().peekable();
+    let mut lines = raw.lines();
     while let Some(line) = lines.next() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -349,6 +339,7 @@ fn parse_manifest(raw: &str) -> Result<Vec<FetchedShare>, FetchedError> {
             Some("S") => {
                 let share_id = next_hex_str(&mut parts, "share_id")?;
                 let name = next_hex_str(&mut parts, "name")?;
+                let folder = next_hex_str(&mut parts, "folder")?;
                 let count: usize = parts
                     .next()
                     .ok_or_else(|| FetchedError::Corrupt("S line missing file count".to_owned()))?
@@ -366,6 +357,7 @@ fn parse_manifest(raw: &str) -> Result<Vec<FetchedShare>, FetchedError> {
                 shares.push(FetchedShare {
                     share_id,
                     name,
+                    folder,
                     files,
                 });
             }
@@ -391,24 +383,12 @@ fn parse_file_line(line: &str) -> Result<FetchedFile, FetchedError> {
         }
     }
     let rel_path = next_hex_str(&mut parts, "rel_path")?;
-    let addr_hex = parts
-        .next()
-        .ok_or_else(|| FetchedError::Corrupt("F line missing chunk_addr".to_owned()))?;
-    let addr_bytes = hex::decode(addr_hex)
-        .map_err(|_| FetchedError::Corrupt("F line chunk_addr not hex".to_owned()))?;
-    let addr_arr: [u8; CHUNK_ADDR_LEN] = addr_bytes
-        .try_into()
-        .map_err(|_| FetchedError::Corrupt("F line chunk_addr wrong length".to_owned()))?;
     let size: u64 = parts
         .next()
         .ok_or_else(|| FetchedError::Corrupt("F line missing size".to_owned()))?
         .parse()
         .map_err(|_| FetchedError::Corrupt("F line size not a number".to_owned()))?;
-    Ok(FetchedFile {
-        rel_path,
-        chunk_addr: ChunkAddr::from_bytes(addr_arr),
-        size,
-    })
+    Ok(FetchedFile { rel_path, size })
 }
 
 fn next_hex_str<'a>(
@@ -434,119 +414,152 @@ mod tests {
         }
     }
 
-    /// ISC-C63 / ISC-C64 — a recorded fetch persists to disk and lists back
-    /// with the same files, names, sizes, and addresses.
+    /// ISC-C63 / ISC-C65 — a recorded fetch writes named files (real names,
+    /// real rel_path tree) directly under a per-share folder; no CAS, no hex,
+    /// no `.rc`.
+    #[test]
+    fn record_writes_named_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut store = FetchedStore::open(dir.path()).unwrap();
+        let share = store
+            .record_share(
+                "abc123",
+                "My Photos",
+                &[vf("readme.txt", b"hello"), vf("sub/pic.png", b"PNGDATA")],
+            )
+            .unwrap();
+
+        let folder = dir.path().join("My Photos");
+        assert!(folder.is_dir());
+        assert_eq!(std::fs::read(folder.join("readme.txt")).unwrap(), b"hello");
+        assert_eq!(
+            std::fs::read(folder.join("sub/pic.png")).unwrap(),
+            b"PNGDATA"
+        );
+        // No CAS internals leaked.
+        assert!(!dir.path().join("cas").exists());
+        assert_eq!(share.folder, "My Photos");
+        // No `.rc` sidecars anywhere under the share folder.
+        for entry in walkdir::WalkDir::new(&folder) {
+            let e = entry.unwrap();
+            assert!(
+                !e.path().to_string_lossy().ends_with(".rc"),
+                "no refcount sidecars"
+            );
+        }
+    }
+
+    /// ISC-C64 — a recorded fetch lists back with the same files, names, sizes,
+    /// and folder across a reopen (process restart).
     #[test]
     fn record_then_list_roundtrip() {
-        let _ = oxicrypt_module::initialize();
         let dir = tempfile::TempDir::new().unwrap();
         let mut store = FetchedStore::open(dir.path()).unwrap();
         store
             .record_share(
                 "abc123",
-                "My Share",
-                &[vf("readme.txt", b"hello"), vf("sub/notes.md", b"notes!")],
+                "docs",
+                &[vf("a.txt", b"hello"), vf("b.md", b"notes!")],
             )
             .unwrap();
 
-        // A fresh handle over the same root == a process restart.
         let reopened = FetchedStore::open(dir.path()).unwrap();
         let shares = reopened.list_shares().unwrap();
         assert_eq!(shares.len(), 1);
         assert_eq!(shares[0].share_id, "abc123");
-        assert_eq!(shares[0].name, "My Share");
+        assert_eq!(shares[0].name, "docs");
+        assert_eq!(shares[0].folder, "docs");
         assert_eq!(shares[0].files.len(), 2);
-        assert_eq!(shares[0].files[0].rel_path, "readme.txt");
-        assert_eq!(shares[0].files[0].size, 5);
-        assert_eq!(shares[0].files[1].rel_path, "sub/notes.md");
         assert_eq!(shares[0].total_bytes(), 11);
+        assert_eq!(reopened.share_dir(&shares[0]), dir.path().join("docs"));
     }
 
-    /// ISC-C65 — extraction reconstructs the share's files byte-for-byte under
-    /// the chosen directory, mirroring the rel_path tree.
+    /// ISC-A-C32 — a manifest entry whose rel_path escapes the folder is
+    /// refused; nothing is written outside the share folder.
     #[test]
-    fn extract_reconstructs_bytes() {
-        let _ = oxicrypt_module::initialize();
+    fn record_rejects_path_traversal() {
         let dir = tempfile::TempDir::new().unwrap();
         let mut store = FetchedStore::open(dir.path()).unwrap();
-        store
-            .record_share(
-                "deadbeef",
-                "docs",
-                &[vf("a.txt", b"alpha"), vf("d/b.txt", b"bravo")],
-            )
-            .unwrap();
-
-        let out = tempfile::TempDir::new().unwrap();
-        let n = store.extract_share("deadbeef", out.path()).unwrap();
-        assert_eq!(n, 2);
-        assert_eq!(std::fs::read(out.path().join("a.txt")).unwrap(), b"alpha");
-        assert_eq!(std::fs::read(out.path().join("d/b.txt")).unwrap(), b"bravo");
-    }
-
-    /// ISC-A-C32 — a manifest entry whose rel_path escapes the destination is
-    /// refused; nothing is written outside the chosen dir.
-    #[test]
-    fn extract_rejects_path_traversal() {
-        let _ = oxicrypt_module::initialize();
-        let dir = tempfile::TempDir::new().unwrap();
-        let mut store = FetchedStore::open(dir.path()).unwrap();
-        store
+        let err = store
             .record_share("evil", "evil", &[vf("../escape.txt", b"pwn")])
-            .unwrap();
-
-        let out = tempfile::TempDir::new().unwrap();
-        let err = store.extract_share("evil", out.path()).unwrap_err();
+            .unwrap_err();
         assert!(matches!(err, FetchedError::UnsafePath(_)));
-        // The sibling-escape target was never written.
-        assert!(!out.path().parent().unwrap().join("escape.txt").exists());
+        assert!(!dir.path().join("escape.txt").exists());
     }
 
-    /// ISC-A-C32 — absolute paths are refused too.
+    /// ISC-A-C32 — absolute and `..` paths are refused; a normal nested path is
+    /// accepted.
     #[test]
     fn sanitize_rejects_absolute_and_dotdot() {
         assert!(sanitize_rel_path("/etc/passwd").is_err());
         assert!(sanitize_rel_path("..").is_err());
         assert!(sanitize_rel_path("a/../../b").is_err());
         assert!(sanitize_rel_path("").is_err());
-        // A normal nested path is accepted and normalised to a relative path.
         assert_eq!(
             sanitize_rel_path("sub/dir/file.txt").unwrap(),
             PathBuf::from("sub").join("dir").join("file.txt")
         );
     }
 
-    /// Re-recording the same share_id replaces its manifest record rather than
-    /// duplicating it (a re-fetch overwrites the listing).
+    /// Two shares with the same name land in distinct folders (no mingling) —
+    /// the second is collision-suffixed by share_id.
     #[test]
-    fn re_record_replaces_listing() {
-        let _ = oxicrypt_module::initialize();
+    fn same_name_shares_get_distinct_folders() {
         let dir = tempfile::TempDir::new().unwrap();
         let mut store = FetchedStore::open(dir.path()).unwrap();
-        store.record_share("s1", "v1", &[vf("a", b"1")]).unwrap();
-        store
-            .record_share("s1", "v2", &[vf("a", b"1"), vf("b", b"2")])
+        let a = store
+            .record_share("aaaaaa11", "Vacation", &[vf("x", b"1")])
             .unwrap();
+        let b = store
+            .record_share("bbbbbb22", "Vacation", &[vf("y", b"2")])
+            .unwrap();
+        assert_eq!(a.folder, "Vacation");
+        assert_eq!(b.folder, "Vacation-bbbbbb");
+        assert_ne!(a.folder, b.folder);
+        assert!(dir.path().join("Vacation").join("x").exists());
+        assert!(dir.path().join("Vacation-bbbbbb").join("y").exists());
+    }
+
+    /// A hostile share name can't escape the downloads root — it's reduced to a
+    /// single safe component.
+    #[test]
+    fn hostile_share_name_is_contained() {
+        assert_eq!(safe_folder_name(""), "share");
+        assert_eq!(safe_folder_name("..."), "share");
+        assert_eq!(safe_folder_name("a/b\\c"), "a_b_c");
+        // Any name reduces to a single safe component — never `.`/`..`, never a
+        // path separator, so it can't escape the downloads root (ISC-A-C32).
+        for n in ["..", "../../etc", "/", "//", ".", "normal name", ""] {
+            let f = safe_folder_name(n);
+            assert!(!f.contains('/') && !f.contains('\\'));
+            assert!(f != "." && f != "..");
+            assert!(!f.is_empty());
+        }
+    }
+
+    /// Re-recording the same share_id reuses its folder and refreshes files.
+    #[test]
+    fn re_record_reuses_folder() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut store = FetchedStore::open(dir.path()).unwrap();
+        store.record_share("s1", "v", &[vf("a", b"1")]).unwrap();
+        let b = store
+            .record_share("s1", "v", &[vf("a", b"12"), vf("b", b"3")])
+            .unwrap();
+        assert_eq!(b.folder, "v");
         let shares = store.list_shares().unwrap();
         assert_eq!(shares.len(), 1);
-        assert_eq!(shares[0].name, "v2");
         assert_eq!(shares[0].files.len(), 2);
     }
 
-    /// An empty store lists nothing (no manifest file yet).
+    /// An empty store lists nothing; a corrupt manifest errors rather than
+    /// silently returning empty.
     #[test]
-    fn empty_store_lists_nothing() {
+    fn empty_and_corrupt() {
         let dir = tempfile::TempDir::new().unwrap();
         let store = FetchedStore::open(dir.path()).unwrap();
         assert!(store.list_shares().unwrap().is_empty());
-    }
-
-    /// A corrupt manifest surfaces as an error rather than a silent empty list.
-    #[test]
-    fn corrupt_manifest_is_an_error() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let store = FetchedStore::open(dir.path()).unwrap();
-        std::fs::write(store.manifest_path(), "S nothex nothex 1\n").unwrap();
+        std::fs::write(store.manifest_path(), "S nothex nothex nothex 1\n").unwrap();
         assert!(matches!(store.list_shares(), Err(FetchedError::Corrupt(_))));
     }
 }

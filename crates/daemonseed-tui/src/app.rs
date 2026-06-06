@@ -588,14 +588,9 @@ pub struct App {
     fetched_shares: Vec<daemonseed_core::storage::fetched::FetchedShare>,
     /// Selected row in the Fetched pane (↑/↓ moves it).
     fetched_sel: usize,
-    /// The extract-destination input buffer for the Fetched pane (M15 C).
-    extract_input: String,
     /// A queued fetched-list refresh the binary forwards as `ListFetched`
     /// (drained once). Set when the Fetched pane opens and after a fetch lands.
     pending_fetched_refresh: bool,
-    /// A queued extract request the binary forwards as `ExtractShare` (drained
-    /// once): `(share_id, dest_dir)`.
-    pending_extract: Option<(String, std::path::PathBuf)>,
     /// The connected relay's rendered (inert) MOTD (ISC-25), `None` when the
     /// relay publishes none.
     public_motd: Option<String>,
@@ -737,9 +732,7 @@ impl App {
             pending_share_fetch: None,
             fetched_shares: Vec::new(),
             fetched_sel: 0,
-            extract_input: String::new(),
             pending_fetched_refresh: false,
-            pending_extract: None,
             public_motd: None,
             public_posts: Vec::new(),
             post_sel: 0,
@@ -1254,14 +1247,6 @@ impl App {
                     self.fetched_sel = self.fetched_shares.len().saturating_sub(1);
                 }
             }
-            NetEvent::ExtractComplete {
-                share_id: _,
-                dest,
-                files,
-            } => {
-                self.status = Some(format!("extracted {files} file(s) to {}", dest.display()));
-            }
-            NetEvent::ExtractError { message } => self.status = Some(message),
             // The discovered-candidate list replaces wholesale (the introducer
             // merge is idempotent, so the snapshot is the converged set, never a
             // delta). Server-id + address only — no key material (ISC-S6).
@@ -1486,19 +1471,9 @@ impl App {
         self.fetched_sel
     }
 
-    /// The current extract-destination input buffer.
-    pub fn extract_input(&self) -> &str {
-        &self.extract_input
-    }
-
     /// Drain a queued fetched-list refresh (binary → `NetCommand::ListFetched`).
     pub fn take_pending_fetched_refresh(&mut self) -> bool {
         std::mem::take(&mut self.pending_fetched_refresh)
-    }
-
-    /// Drain a queued extract request (binary → `NetCommand::ExtractShare`).
-    pub fn take_pending_extract(&mut self) -> Option<(String, std::path::PathBuf)> {
-        self.pending_extract.take()
     }
 
     /// The connected relay's rendered (inert) MOTD (ISC-25), for the Public
@@ -2282,11 +2257,11 @@ impl App {
         }
     }
 
-    /// Fetched-downloads pane key handling (M15 C; ISC-C64 / C65). ↑/↓ selects a
-    /// download; printable chars build the extract-destination directory path;
-    /// Enter extracts the selected download's files there (path-traversal safe,
-    /// ISC-A-C32, enforced in the core store). The list itself is refreshed when
-    /// the pane opens (`ListFetched`).
+    /// Fetched-downloads pane key handling (M15 C; ISC-C64). A read-only browse
+    /// pane — ↑/↓ scrolls the downloaded shares. The files already live on disk
+    /// under their real names in each share's download folder (M15 cleanup: no
+    /// extract step), so there is no input here. Refreshed when the pane opens
+    /// (`ListFetched`).
     fn on_key_fetched(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Up => {
@@ -2294,21 +2269,6 @@ impl App {
             }
             KeyCode::Down if self.fetched_sel + 1 < self.fetched_shares.len() => {
                 self.fetched_sel += 1;
-            }
-            KeyCode::Char(c) => self.extract_input.push(c),
-            KeyCode::Backspace => {
-                self.extract_input.pop();
-            }
-            KeyCode::Enter if !self.extract_input.trim().is_empty() => {
-                let Some(share) = self.fetched_shares.get(self.fetched_sel) else {
-                    self.status = Some("no download selected".to_owned());
-                    return;
-                };
-                let dest = std::path::PathBuf::from(self.extract_input.trim());
-                let share_id = share.share_id.clone();
-                self.pending_extract = Some((share_id, dest));
-                self.status = Some("extracting…".to_owned());
-                self.extract_input.clear();
             }
             _ => {}
         }
@@ -2738,15 +2698,14 @@ mod tests {
     /// M15 C — a `FetchedShares` event populates the browse list (ISC-C64).
     #[test]
     fn fetched_shares_event_populates_list() {
-        use daemonseed_core::storage::cas::ChunkAddr;
         use daemonseed_core::storage::fetched::{FetchedFile, FetchedShare};
         let mut app = drive_to_main();
         let share = FetchedShare {
             share_id: "abc123".to_owned(),
             name: "docs".to_owned(),
+            folder: "docs".to_owned(),
             files: vec![FetchedFile {
                 rel_path: "a.txt".to_owned(),
-                chunk_addr: ChunkAddr::from_bytes([0u8; 48]),
                 size: 5,
             }],
         };
@@ -2755,35 +2714,7 @@ mod tests {
         });
         assert_eq!(app.fetched_shares().len(), 1);
         assert_eq!(app.fetched_shares()[0].name, "docs");
-    }
-
-    /// M15 C — in the Fetched pane, typing a destination and pressing Enter
-    /// queues an extract of the selected download (ISC-C65).
-    #[test]
-    fn fetched_enter_queues_extract() {
-        use daemonseed_core::storage::fetched::FetchedShare;
-        let mut app = drive_to_main();
-        app.on_net_event(NetEvent::FetchedShares {
-            shares: vec![FetchedShare {
-                share_id: "sid".to_owned(),
-                name: "n".to_owned(),
-                files: vec![],
-            }],
-        });
-        for _ in 0..11 {
-            app.on_key(press(KeyCode::Tab));
-        }
-        assert_eq!(app.main_focus(), MainFocus::Fetched);
-        let _ = app.take_pending_fetched_refresh();
-        for c in "/tmp/out".chars() {
-            app.on_key(press(KeyCode::Char(c)));
-        }
-        app.on_key(press(KeyCode::Enter));
-        let (share_id, dest) = app
-            .take_pending_extract()
-            .expect("extract should be queued");
-        assert_eq!(share_id, "sid");
-        assert_eq!(dest, std::path::PathBuf::from("/tmp/out"));
+        assert_eq!(app.fetched_shares()[0].folder, "docs");
     }
 
     // ── M14 D1: Define-Share input box (ISC-C21) ─────────────────────────

@@ -75,10 +75,34 @@ fn main() -> io::Result<()> {
         }
     };
 
+    // Where fetched shares land as named files (M15 C, downloads cleanup):
+    // `--portable` keeps everything self-contained under the CWD profile root;
+    // otherwise downloads go to the OS Downloads directory, namespaced under a
+    // `daemonseed/` subfolder so the per-share folders + manifest stay tidy.
+    let downloads_root = if portable {
+        profile_root.join("downloads")
+    } else {
+        os_downloads_dir().join("daemonseed")
+    };
+
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, net, profile_root, existing);
+    let result = run(&mut terminal, net, profile_root, downloads_root, existing);
     ratatui::restore();
     result
+}
+
+/// The OS default Downloads directory. Honors `XDG_DOWNLOAD_DIR` when set,
+/// otherwise `$HOME/Downloads`, otherwise the CWD as a last resort. (A richer
+/// per-platform resolver is ShareUX/M16 scope; this is the "call it done for
+/// now" path for non-portable runs.)
+fn os_downloads_dir() -> PathBuf {
+    if let Some(d) = std::env::var_os("XDG_DOWNLOAD_DIR").filter(|v| !v.is_empty()) {
+        return PathBuf::from(d);
+    }
+    if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+        return PathBuf::from(home).join("Downloads");
+    }
+    PathBuf::from("Downloads")
 }
 
 /// Minimal `--config <path>` parser (ISC-C35). A full arg parser arrives with
@@ -108,6 +132,7 @@ fn run(
     terminal: &mut ratatui::DefaultTerminal,
     mut net: NetHandle,
     profile_root: PathBuf,
+    downloads_root: PathBuf,
     existing_profile: bool,
 ) -> io::Result<()> {
     // An existing profile blob → daily-login Unlock (Item E). Otherwise the
@@ -182,21 +207,13 @@ fn run(
                 share_id,
                 sharer_handle,
                 name,
-                fetched_root: profile_root.join("fetched"),
+                fetched_root: downloads_root.clone(),
             });
         }
         // M15 C: browse — refresh the fetched-downloads list on demand.
         if app.take_pending_fetched_refresh() {
             let _ = net.send(NetCommand::ListFetched {
-                fetched_root: profile_root.join("fetched"),
-            });
-        }
-        // M15 C: extract a fetched download's files to a chosen directory.
-        if let Some((share_id, dest)) = app.take_pending_extract() {
-            let _ = net.send(NetCommand::ExtractShare {
-                fetched_root: profile_root.join("fetched"),
-                share_id,
-                dest,
+                fetched_root: downloads_root.clone(),
             });
         }
         // D, M15: a Publish request → publish the listing + serve the directory's
