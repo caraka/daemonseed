@@ -92,7 +92,10 @@ pub enum NetCommand {
     /// Self-signed for provenance under the daemon's own identity, then sealed
     /// under the global room key. Any daemon may post; the relay can read it
     /// (it holds the global key) but it is never wire-cleartext (ISC-A-S16).
-    SendPublicRoom { body: String },
+    /// `sender_handle` is the poster's own display handle (name#hash) — sealed
+    /// into the message so peers render the display name, not the floor (parity
+    /// with `SendChat`). The relay never sees it in cleartext (ISC-A-S16).
+    SendPublicRoom { body: String, sender_handle: String },
     /// Define (activate) a local share root (M14, ISC-C21 / ISC-A-C7). Opens
     /// the redb [`ShareIndex`] at `index_path` under `index_key` (the
     /// share-index key derived as a sibling of the at-rest key — the actor never
@@ -593,7 +596,10 @@ async fn net_actor(
                     .handle_send_chat(circle_id, &body, &sender_handle)
                     .await
             }
-            NetCommand::SendPublicRoom { body } => actor.handle_send_public_room(&body).await,
+            NetCommand::SendPublicRoom {
+                body,
+                sender_handle,
+            } => actor.handle_send_public_room(&body, &sender_handle).await,
             NetCommand::DefineShare {
                 root,
                 label,
@@ -1027,7 +1033,7 @@ impl Actor {
     /// is self-signed for provenance under the daemon's own identity, then sealed
     /// under the global room key. Any daemon may post — the signature establishes
     /// authorship, not authorization.
-    async fn handle_send_public_room(&mut self, body: &str) {
+    async fn handle_send_public_room(&mut self, body: &str, sender_handle: &str) {
         let Some(room) = self.public_room.as_ref() else {
             return self.emit(NetEvent::ChatError {
                 message: "no public room joined".to_owned(),
@@ -1039,11 +1045,14 @@ impl Actor {
             });
         };
 
+        // Seal under the poster's display handle (name#hash) so peers render the
+        // name, not the floor — `identity.handle()` is the bare floor handle
+        // (built `from_pubkey(None, ..)`); the app supplies the name-bearing one.
         let sealed = match seal_room_message(
             &room.room_key,
             identity.signing(),
             &room.room,
-            identity.handle(),
+            sender_handle,
             body,
             now_unix_ms(),
         ) {

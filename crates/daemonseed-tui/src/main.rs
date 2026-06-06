@@ -174,8 +174,11 @@ fn run(
                 sender_handle: chat.sender_handle,
             });
         }
-        if let Some(body) = app.take_pending_public_room() {
-            let _ = net.send(NetCommand::SendPublicRoom { body });
+        if let Some((body, sender_handle)) = app.take_pending_public_room() {
+            let _ = net.send(NetCommand::SendPublicRoom {
+                body,
+                sender_handle,
+            });
         }
         // M14: a Define-Share request → derive the index file path + key from
         // the active session (the App layer holds no key material) and activate

@@ -528,7 +528,7 @@ pub struct App {
     /// A public-room post the binary should forward to the net actor (drained
     /// once). The post is self-signed for provenance by the net actor under the
     /// daemon's own identity (ISC-S24), so only the body is queued here.
-    pending_public_room: Option<String>,
+    pending_public_room: Option<(String, String)>,
     /// The bounded, per-session trust-event audit log (ISC-C28). Every recorded
     /// event surfaces in the Trust History view; Transient events are dropped by
     /// [`TrustEventLog::append`] (the ISC-A-C12 asymmetry).
@@ -857,8 +857,10 @@ impl App {
         &self.share_input
     }
 
-    /// Take a queued public-room post (drained once by the binary, ISC-S22).
-    pub fn take_pending_public_room(&mut self) -> Option<String> {
+    /// Take a queued public-room post as `(body, sender_handle)` — drained once
+    /// by the binary (ISC-S22). The handle carries the display name so peers see
+    /// the name, not the floor (parity with the circle path).
+    pub fn take_pending_public_room(&mut self) -> Option<(String, String)> {
         self.pending_public_room.take()
     }
 
@@ -2120,12 +2122,15 @@ impl App {
                         // Local echo, Lobby-tagged (ISC-A-C29). The relay never
                         // reflects a frame to its sender.
                         self.messages.push(ChatLine {
-                            sender,
+                            sender: sender.clone(),
                             body: body.clone(),
                             sent_unix_ms: 0,
                             surface: Surface::Lobby,
                         });
-                        self.pending_public_room = Some(body);
+                        // Carry the name-bearing handle so the post reaches peers
+                        // under the display name, not the floor (parity with the
+                        // circle path's `sender_handle`).
+                        self.pending_public_room = Some((body, sender));
                     }
                     None => {
                         // No surface to post to (Item F / A-C26): do not echo, do
@@ -3136,10 +3141,13 @@ mod tests {
         assert_eq!(app.messages()[0].body, "hello lobby");
         // The body is queued for the public-room send path; no circle chat queued.
         assert!(app.take_pending_chat().is_none(), "not a circle send");
-        let body = app
+        let (body, sender_handle) = app
             .take_pending_public_room()
             .expect("public-room post queued on Enter");
         assert_eq!(body, "hello lobby");
+        // The post carries the poster's own (name-bearing) handle so peers see
+        // the display name, not the floor (parity with the circle path).
+        assert!(!sender_handle.is_empty(), "post carries the sender handle");
         assert!(
             app.take_pending_public_room().is_none(),
             "queued exactly once"
