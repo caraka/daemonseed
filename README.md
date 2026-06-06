@@ -29,12 +29,15 @@ daemonseed/
 │   │                                       reconnect backoff, mute/hide lists, @-mention logic (M9),
 │   │                                       release trust anchor + multi-sig verify + update-lifecycle FSM (M10),
 │   │                                       at-rest persistence of display-name / mute / hide / circle membership
-│   │                                       via a cached SealingKey re-seal (M13)
+│   │                                       via a cached SealingKey re-seal (M13); fetched-download CAS + manifest
+│   │                                       store (storage::fetched, M15)
 │   ├── daemonseed-proto/                   wire schema (Protocol Buffers, prost + tonic)
 │   ├── daemonseed-server/                  relay daemon: TLS 1.3 + APP_HELLO + identity-proof → Authenticated (M4b); federation peer table + introducer endpoint (M5/M12); public-space service (M6); circle-of-trust live relay (M8); RAM-only rate limiting (M9); release boot-gate (M10); user-publish share registry, reaped on disconnect (M12)
 │   ├── daemonseed-cli/                     scriptable client: `connect <server-id>` with identity-proof (M4b) + C22 trust slider (M5); `publish` / `unpublish` / `list-shares` (M12); `publish --path <dir>` serves share content for download (alpha2)
-│   ├── daemonseed-tui/                     interactive ratatui client — the MVP product surface (M11); Servers-pane introducer discovery (M12); multi-circle carousel (v0.16); session write-through + silent circle rejoin from the at-rest blob (M13)
-│   └── daemonseed-integration-tests/       cross-crate integration tests + ISC coverage registry
+│   ├── daemonseed-tui/                     interactive ratatui client — the MVP product surface (M11); Servers-pane introducer discovery (M12); multi-circle carousel (v0.16); session write-through + silent circle rejoin from the at-rest blob (M13); define-share + indexer (M14); publish/serve/unpublish + fetched-download browse/extract (M15)
+│   ├── daemonseed-isc/                      ISC registry leaf crate (zero deps): the single source of
+│   │                                       TOTAL / COVERED, read by both the integration tests and xtask
+│   └── daemonseed-integration-tests/       cross-crate integration tests (re-exports daemonseed-isc)
 │
 ├── docs/
 │   └── llm-api-manifest/                   per-crate LAMA API manifests referenced by lama.yaml

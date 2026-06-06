@@ -93,8 +93,14 @@ crates:
     status: active
     manifest: "docs/llm-api-manifest/daemonseed-tui-api.yaml"
 
+  - name: daemonseed-isc
+    purpose: "ISC registry — the single source of truth for the ISC inventory. A zero-dependency leaf crate (std only) holding IscClass, the ISCS list, TOTAL (built, non-deferred ISC count) and COVERED (registered-test count), with compile-time drift guards (ISCS.len()==TOTAL, COVERED<=TOTAL) and a covered_sum_matches test. Read by both daemonseed-integration-tests (which re-exports it as isc_coverage) and xtask isc-coverage, so the coverage count lives in exactly one place."
+    license: AGPL-3.0-or-later
+    status: active
+    manifest: null
+
   - name: daemonseed-integration-tests
-    purpose: "Cross-crate integration tests + ISC coverage registry. Per-milestone ISC-coverage exercise files under tests/m{N}_isc_coverage.rs. Subprocess-driven end-to-end gate: tests/common/gate.rs (ServerProcess + PtyTui + Gate driver with vt100-emulated screen text + BIP-39-validated mnemonic extractor + lockstep keystroke broadcast) consumed by tests/subprocess_gate.rs (4-daemon end-to-end scenario gated by `cargo xtask mvp-gate`). Wu et al. USENIX'23 GFW negative-allowlist classifier: tests/common/wire_shape.rs consumed by tests/usenix_wire_shape.rs (real TLS 1.3 handshake observation, gated by `cargo xtask wire-shape`)."
+    purpose: "Cross-crate integration tests; re-exports the daemonseed-isc registry as isc_coverage. Per-milestone ISC-coverage exercise files under tests/m{N}_isc_coverage.rs. Subprocess-driven end-to-end gate: tests/common/gate.rs (ServerProcess + PtyTui + Gate driver with vt100-emulated screen text + BIP-39-validated mnemonic extractor + lockstep keystroke broadcast) consumed by tests/subprocess_gate.rs (4-daemon end-to-end scenario gated by `cargo xtask mvp-gate`). Wu et al. USENIX'23 GFW negative-allowlist classifier: tests/common/wire_shape.rs consumed by tests/usenix_wire_shape.rs (real TLS 1.3 handshake observation, gated by `cargo xtask wire-shape`)."
     license: AGPL-3.0-or-later
     status: active
     manifest: null

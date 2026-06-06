@@ -19,7 +19,10 @@ is the durable anchor.
 
 ## [Unreleased]
 
+- M15: real ≥128-bit circle-entropy gate — `passphrase::strength::estimate_circle` (distinct-BIP-39-word + charset key-space sum, zxcvbn low-end veto) replaces the M14 interim score-4 proxy; the circle-join meter is bits-driven (ISC-C9).
+- M15 D: publish + serve + unpublish shares from the TUI (`NetCommand::{PublishShare,UnpublishShare}`, `MainFocus::Publish` pane; serve via a `spawn_local` task, session-scoped per ISC-S20).
 - M15 C: fetched content → on-disk CAS + browse/extract (`daemonseed_core::storage::fetched`, `MainFocus::Fetched` pane, `NetCommand::{ListFetched,ExtractShare}`, `NetEvent::{FetchedShares,ExtractComplete,ExtractError}`; ISC-C63/C64/C65/A-C31/A-C32).
+- M15 E: single-source the ISC `TOTAL`/`COVERED` into a new zero-dependency `daemonseed-isc` leaf crate read by both the integration tests and `xtask isc-coverage` (kills the drifted xtask count mirror); registry reconciled to the built ISA criteria (`TOTAL` 122→133, honest 100/133 coverage).
 
 In-progress and next-milestone planning is tracked in the project lead's vault
 manifest (not committed). The next entry is added here at the moment a release
