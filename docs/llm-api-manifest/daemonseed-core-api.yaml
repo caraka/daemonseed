@@ -359,6 +359,33 @@ modules:
       - A-C6
       - A-C7
 
+  - name: daemonseed_core::storage::fetched
+    description: >-
+      Persistent landing zone for fully-verified fetched share content (M15 C;
+      ISC-C63 / C64 / C65, ISC-A-C31 / A-C32). Sits above the share-fetch path
+      (share_envelope + net actor): a verified fetch persists every file's
+      plaintext bytes into a FileChunkStore at `<fetched-root>/cas` and writes a
+      line-based manifest at `<fetched-root>/shares.idx`, so the user can browse
+      downloads and extract files after the fetch overlay closes. At-rest posture
+      is plaintext by design — fetched files are user-chosen explicit downloads,
+      not message/post/session history (no-client-history invariant intact); this
+      is the R-PANIC erasure target. Manifest encryption rejected as theatre while
+      chunk bytes sit beside it in plaintext; a future at-rest folder-encryption
+      feature wraps the whole fetched/ tree (additive, post-MVP). Path-traversal-
+      safe: every rel_path is validated before any chunk is read (ISC-A-C32).
+      No-partial invariant: record_share is called only after all chunks verified
+      — a fetch that fails verification never reaches it (ISC-A-C31).
+    no_std: false
+    depends_on:
+      - daemonseed_core::storage::cas
+    iscs:
+      - C63
+      - C64
+      - C65
+      - A-C31
+      - A-C32
+    added_in: "v0.18.0-pre (M15 C)"
+
   - name: daemonseed_core::indexer
     description: >-
       Share-folder indexer engine (M8, ISC-C21 / A-C7) — drives a ShareIndex from
@@ -1291,6 +1318,90 @@ types:
     description: >-
       Handle to a running background cold-scan. join() -> Result<usize,
       IndexError> waits + returns the count; drop detaches.
+
+  # ── storage::fetched ────────────────────────────────────────────────
+  - name: FetchedFile
+    module: daemonseed_core::storage::fetched
+    kind: struct
+    description: >-
+      One downloaded file inside a FetchedShare. rel_path is the sharer's
+      wire path (untrusted; sanitised only at extraction, ISC-A-C32).
+      chunk_addr is the content address in the CAS. size is bytes.
+    fields:
+      - name: rel_path
+        type: String
+        description: The file's path relative to the share root (wire value; sanitised at extract).
+      - name: chunk_addr
+        type: ChunkAddr
+        description: The content address in the fetched CAS.
+      - name: size
+        type: u64
+        description: The file's size in bytes.
+
+  - name: FetchedShare
+    module: daemonseed_core::storage::fetched
+    kind: struct
+    description: >-
+      One fetched share's manifest record. share_id is the server-assigned
+      opaque id (ISC-S21); name is the sharer-advertised display name;
+      files is the per-file inventory. total_bytes() sums file sizes.
+    fields:
+      - name: share_id
+        type: String
+        description: Server-assigned opaque share id (ISC-S21).
+      - name: name
+        type: String
+        description: Sharer-advertised display name.
+      - name: files
+        type: "Vec<FetchedFile>"
+        description: One entry per downloaded file.
+
+  - name: VerifiedFile
+    module: daemonseed_core::storage::fetched
+    kind: struct
+    description: >-
+      One file's verified plaintext bytes, ready to persist. The caller
+      (net actor) produces this after the fetch has verified every chunk;
+      FetchedStore::record_share re-derives the CAS address via put (the
+      address is never trusted from the caller).
+    fields:
+      - name: rel_path
+        type: String
+        description: Wire rel_path (untrusted; sanitised at extraction).
+      - name: bytes
+        type: "Vec<u8>"
+        description: Verified plaintext file bytes.
+
+  - name: FetchedError
+    module: daemonseed_core::storage::fetched
+    kind: enum
+    description: Why a FetchedStore operation failed.
+    variants:
+      - name: Io
+        description: "Io(std::io::Error) — filesystem I/O failed."
+      - name: Cas
+        description: "Cas(CasError) — the underlying content-addressed store failed."
+      - name: Corrupt
+        description: >-
+          Corrupt(String) — the manifest is unparseable, or a manifest entry
+          references a chunk missing from the CAS (corrupt or partially-deleted
+          download dir).
+      - name: UnsafePath
+        description: >-
+          UnsafePath(String) — extraction refused because the rel_path escapes
+          dest via `..`, an absolute path, or a root/prefix component
+          (ISC-A-C32). Nothing is written for the offending entry.
+
+  - name: FetchedStore
+    module: daemonseed_core::storage::fetched
+    kind: struct
+    description: >-
+      The on-disk store of fetched share content. Open once with
+      FetchedStore::open(root); record_share persists a completed fetch
+      (ISC-C63 / A-C31), list_shares enumerates downloads for the browse
+      view (ISC-C64), extract_share reconstructs files into a chosen dir
+      (ISC-C65 / A-C32). Layout: `<root>/cas/` (a FileChunkStore) +
+      `<root>/shares.idx` (the line-based manifest).
 
   # ── first_start ─────────────────────────────────────────────────────
   - name: "FirstStart<S>"
@@ -3337,6 +3448,116 @@ functions:
           condition: AES-GCM open failed on an entry.
         - name: Corrupt
           condition: A stored value could not be decoded.
+
+  # ── storage::fetched ────────────────────────────────────────────────
+  - name: FetchedStore::open
+    module: daemonseed_core::storage::fetched
+    description: >-
+      Open (creating if absent) the fetched-content store rooted at `root`.
+      Creates `<root>/` via create_dir_all. Reopening an existing root
+      recovers every prior download; the manifest and CAS are read lazily.
+    signature: "pub fn open(root: impl Into<PathBuf>) -> Result<FetchedStore, FetchedError>"
+    parameters:
+      - name: root
+        type: "impl Into<PathBuf>"
+        direction: in
+        description: The directory to use as the fetched landing zone.
+    returns:
+      type: "Result<FetchedStore, FetchedError>"
+      description: An open store ready for record/list/extract.
+      error_variants:
+        - name: Io
+          condition: create_dir_all failed.
+
+  - name: FetchedStore::record_share
+    module: daemonseed_core::storage::fetched
+    description: >-
+      Persist a fully-verified fetched share (ISC-C63 / A-C31). Every
+      file's bytes are stored in the FileChunkStore (the CAS address is
+      re-derived via put — never trusted from the caller) and the manifest
+      is rewritten. Re-recording the same share_id replaces its manifest
+      record (a re-fetch overwrites). Called only after all chunks have
+      verified; a fetch that fails verification never reaches here.
+    signature: "pub fn record_share(&mut self, share_id: &str, name: &str, files: &[VerifiedFile]) -> Result<FetchedShare, FetchedError>"
+    parameters:
+      - name: share_id
+        type: "&str"
+        direction: in
+        description: Server-assigned opaque share id.
+      - name: name
+        type: "&str"
+        direction: in
+        description: Sharer-advertised display name.
+      - name: files
+        type: "&[VerifiedFile]"
+        direction: in
+        description: Fully-verified plaintext files to persist.
+    returns:
+      type: "Result<FetchedShare, FetchedError>"
+      description: The recorded manifest entry.
+      error_variants:
+        - name: Io
+          condition: CAS or manifest write failed.
+        - name: Cas
+          condition: FileChunkStore put failed.
+
+  - name: FetchedStore::list_shares
+    module: daemonseed_core::storage::fetched
+    description: >-
+      Enumerate every fetched share, newest-recorded last (manifest order).
+      Returns Ok(vec![]) when nothing has been fetched yet (missing
+      manifest is not an error).
+    signature: "pub fn list_shares(&self) -> Result<Vec<FetchedShare>, FetchedError>"
+    parameters: []
+    returns:
+      type: "Result<Vec<FetchedShare>, FetchedError>"
+      description: All recorded downloads, in manifest order (oldest first).
+      error_variants:
+        - name: Io
+          condition: manifest read failed (other than NotFound).
+        - name: Corrupt
+          condition: manifest parse failed.
+
+  - name: FetchedStore::extract_share
+    module: daemonseed_core::storage::fetched
+    description: >-
+      Reconstruct a fetched share's files into `dest`, mirroring the
+      rel_path tree (ISC-C65). Each file's bytes come from the CAS by
+      content address. Path-traversal-safe (ISC-A-C32): every rel_path is
+      validated for only normal relative components before any chunk is
+      read; an unsafe path produces FetchedError::UnsafePath and nothing is
+      written for that entry.
+    signature: "pub fn extract_share(&self, share_id: &str, dest: &Path) -> Result<u32, FetchedError>"
+    parameters:
+      - name: share_id
+        type: "&str"
+        direction: in
+        description: The share_id to extract.
+      - name: dest
+        type: "&Path"
+        direction: in
+        description: Destination directory (created via create_dir_all).
+    returns:
+      type: "Result<u32, FetchedError>"
+      description: The number of files written under dest.
+      error_variants:
+        - name: Corrupt
+          condition: share_id not found in manifest, or manifest references a missing chunk.
+        - name: UnsafePath
+          condition: A manifest rel_path is absolute, contains `..`, or has a root/prefix component.
+        - name: Io
+          condition: CAS open, manifest read, or file write failed.
+        - name: Cas
+          condition: FileChunkStore open or get failed.
+
+  - name: FetchedShare::total_bytes
+    module: daemonseed_core::storage::fetched
+    description: Sum the size fields across all files in this fetched share.
+    signature: "pub fn total_bytes(&self) -> u64"
+    parameters: []
+    returns:
+      type: u64
+      description: Total bytes of all files in the share.
 
   # ── indexer ─────────────────────────────────────────────────────────
   - name: Indexer::cold_scan

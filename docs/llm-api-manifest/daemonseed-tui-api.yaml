@@ -21,7 +21,7 @@ library:
   description: "Interactive ratatui client — the MVP product surface. The interactive logic is a terminal-free screen state machine (daemonseed_tui::app) rendered by pure functions (daemonseed_tui::ui), so it is unit-testable and PTY-driveable without a terminal. The binary owns terminal lifecycle + event loop and reuses daemonseed-cli's connect / identity-proof / C22-trust client stack for the network side."
   license: "AGPL-3.0-or-later"
   manifest_for: "crates/daemonseed-tui"
-  status: "current through M13 (v0.17.0) — app state machine + render loop + first-start (incl. clean-device recovery) + chat/circle + C22 trust slider + F22 server-management + C28 trust-event affordances (modal/badge/toast/history) + close-cause + shares/fetch/indexer + public-space + deprecation; M12 added the Servers-pane introducer refresh surfacing introducer-discovered candidates (gate step 6); v0.16 added the multi-circle carousel; M13 (the persistence keystone) wires the session write-through so display name + mute/hide + circle membership persist into the at-rest seeds blob and silently restore on a daily-login Unlock — persisted circles rejoin without re-typing the phrase, no wire change"
+  status: "current through M15 C (v0.18.0-pre) — app state machine + render loop + first-start (incl. clean-device recovery) + chat/circle + C22 trust slider + F22 server-management + C28 trust-event affordances (modal/badge/toast/history) + close-cause + shares/fetch/indexer + public-space + deprecation; M12 added the Servers-pane introducer refresh surfacing introducer-discovered candidates (gate step 6); v0.16 added the multi-circle carousel; M13 (the persistence keystone) wires the session write-through so display name + mute/hide + circle membership persist into the at-rest seeds blob and silently restore on a daily-login Unlock — persisted circles rejoin without re-typing the phrase, no wire change; M15 C adds the Fetched browse pane (persistent on-disk CAS + manifest, ISC-C63/C64/C65/A-C31/A-C32) at the end of the Tab cycle"
 
 modules:
   - name: daemonseed_tui::app
@@ -64,8 +64,8 @@ modules:
       ISC-A-C19). Tab cycles focus across all Main-view panes (see MainFocus).
     no_std: false
     depends_on: [daemonseed-core, "daemonseed_tui::screens::first_start"]
-    iscs: ["1", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", C16, C25, C26, C28, C59, C60, C61, C62, A-S3, A-S11, A-C3, A-C7, A-C12, A-C29, A-C30, F23]
-    added_in: "M11 scaffold + chat + trust/server + C28 + shares + fetch + public-space + deprecation workstream; v0.16 multi-circle carousel (C59-C62 / A-C29 / A-C30); M13 session write-through + circle-membership persistence/rejoin (C51 / C59)"
+    iscs: ["1", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", C16, C25, C26, C28, C59, C60, C61, C62, C63, C64, C65, A-S3, A-S11, A-C3, A-C7, A-C12, A-C29, A-C30, A-C31, A-C32, F23]
+    added_in: "M11 scaffold + chat + trust/server + C28 + shares + fetch + public-space + deprecation workstream; v0.16 multi-circle carousel (C59-C62 / A-C29 / A-C30); M13 session write-through + circle-membership persistence/rejoin (C51 / C59); M15 C Fetched browse pane (C63 / C64 / C65 / A-C31 / A-C32)"
 
   - name: daemonseed_tui::net
     description: >-
@@ -103,7 +103,18 @@ modules:
       CircleOfTrust.Subscribe stream over the existing AppSession, sends a
       ManifestRequest, reads a ManifestResponse, then issues one ChunkRequest
       per entry, verifies SHA-384 over each ChunkResponse, and emits progress
-      events; fail-closed on any hash mismatch),
+      events; fail-closed on any hash mismatch; gained `name: String` (the
+      listing display name, recorded in the fetched manifest) and
+      `fetched_root: PathBuf` (profile-root/fetched; on a fully-verified fetch
+      the actor persists via FetchedStore and emits a FetchedShares refresh —
+      M15 C; ISC-C63 / A-C31)),
+      ListFetched ({ fetched_root: PathBuf } — M15 C; ISC-C64: open the
+      FetchedStore under fetched_root, list recorded downloads, emit
+      NetEvent::FetchedShares; emitted when the Fetched pane opens and after a
+      fetch lands),
+      ExtractShare ({ fetched_root: PathBuf, share_id: String, dest: PathBuf }
+      — M15 C; ISC-C65 / A-C32: open FetchedStore under fetched_root, call
+      extract_share(share_id, dest), emit ExtractComplete or ExtractError),
       RefreshDeprecation (ISC-C25 / A-S11 — fetch the relay's signed
       GetDeprecationPolicy artifact, verify its ML-DSA-87 signature against the
       TOFU-pinned server-wide key, anti-rollback-check against the PolicyCache
@@ -139,6 +150,14 @@ modules:
       FetchProgress ({ total_chunks: Option<u32>, chunks_received, bytes_received
       } — first event after manifest arrives), FetchComplete ({ share_id,
       files_written, bytes_written }), FetchError ({ message } — terminal),
+      FetchedShares ({ shares: Vec<FetchedShare> } — M15 C; ISC-C64: replaces
+      the Fetched browse pane list wholesale; emitted after a verified fetch
+      persists and in response to ListFetched),
+      ExtractComplete ({ share_id: String, dest: PathBuf, files: u32 } — M15 C;
+      ISC-C65: a fetched share was reconstructed under dest; files is the count
+      of files written),
+      ExtractError ({ message: String } — M15 C: extract failed (unknown share,
+      missing chunk, unsafe path, or I/O)),
       DeprecationSnapshot ({ policy_version: Option<u64>, warnings:
       Vec<DeprecationWarningRow>, had_policy: bool } — ISC-C25), DeprecationError
       ({ message } — surfaced on the status line, cached warnings kept intact),
@@ -154,8 +173,8 @@ modules:
       Foreign/undecryptable inbound frames are skipped.
     no_std: false
     depends_on: [daemonseed-cli, daemonseed-core, daemonseed-proto]
-    iscs: ["10", "14", "16", "17", "19", "20", "22", "23", "24", "25", "28", "47", C15, C17, C21, C22, C25, C26, C28, C37, C59, C60, C62, S6, A-S2, A-S3, A-S11, A-C7, A-S12, A-C19, A-C30, F23]
-    added_in: "M11 connect + chat + C28 + shares + fetch + public-space + deprecation workstream; M12 introducer refresh (gate step 6); v0.16 multi-circle (C59/C60/C62 / A-C30); M13 CircleJoined entropy echo for rejoin pairing (C51 / C59)"
+    iscs: ["10", "14", "16", "17", "19", "20", "22", "23", "24", "25", "28", "47", C15, C17, C21, C22, C25, C26, C28, C37, C59, C60, C62, C63, C64, C65, S6, A-S2, A-S3, A-S11, A-C7, A-S12, A-C19, A-C30, A-C31, A-C32, F23]
+    added_in: "M11 connect + chat + C28 + shares + fetch + public-space + deprecation workstream; M12 introducer refresh (gate step 6); v0.16 multi-circle (C59/C60/C62 / A-C30); M13 CircleJoined entropy echo for rejoin pairing (C51 / C59); M15 C FetchShare gained name+fetched_root fields; new ListFetched/ExtractShare commands and FetchedShares/ExtractComplete/ExtractError events (C63/C64/C65/A-C31/A-C32)"
 
   - name: daemonseed_tui::screens::first_start
     description: >-
@@ -242,13 +261,18 @@ public_types:
       - "fn share_sel(&self) -> usize                    # Public-shares row selection"
       - "fn take_pending_share_refresh(&mut self) -> bool  # drained into NetCommand::RefreshShares"
       - "fn fetch(&self) -> Option<&FetchUi>               # ISC-19 active fetch overlay"
-      - "fn take_pending_share_fetch(&mut self) -> Option<(String, String)>  # drained into NetCommand::FetchShare"
+      - "fn take_pending_share_fetch(&mut self) -> Option<(String, String)>  # drained into NetCommand::FetchShare (share_id, name)"
       - "fn take_pending_share_define(&mut self) -> Option<ShareDefineRequest>  # M14 — drained into NetCommand::DefineShare; single slot then the Unlock re-emit queue"
       - "fn share_input(&self) -> &str                     # M14 Define-Share input buffer"
       - "fn publish_input(&self) -> &str                   # M15 Publish input buffer"
       - "fn published(&self) -> &[(String, String)]        # M15 shares being served this session (share_id, name)"
       - "fn take_pending_publish(&mut self) -> Option<PublishRequest>  # M15 — drained into NetCommand::PublishShare"
       - "fn take_pending_unpublish(&mut self) -> Option<String>  # M15 — drained into NetCommand::UnpublishShare (the share_id)"
+      - "fn fetched_shares(&self) -> &[daemonseed_core::storage::fetched::FetchedShare]  # M15 C — persisted download list for the Fetched browse pane (ISC-C64)"
+      - "fn fetched_sel(&self) -> usize                          # M15 C — selected row index in the Fetched pane"
+      - "fn fetched_extract_input(&self) -> &str                 # M15 C — destination dir input buffer in the Fetched pane"
+      - "fn take_pending_fetched_refresh(&mut self) -> bool      # M15 C — drained into NetCommand::ListFetched"
+      - "fn take_pending_extract(&mut self) -> Option<(String, PathBuf)>  # M15 C — drained into NetCommand::ExtractShare (share_id, dest)"
       - "fn public_motd(&self) -> Option<&str>             # ISC-25 inert MOTD pane"
       - "fn public_posts(&self) -> &[PublicPostRow]         # ISC-S7 announcements pane"
       - "fn post_sel(&self) -> usize                        # announcements row selection"
@@ -278,8 +302,8 @@ public_types:
     description: "One circle in the membership set (ISC-C59 / ISC-C62): id (stable per-session id assigned at join — keys the active-surface selection, the Surface::Circle tag, and the SendChat seal target) + label (client-local display label, never transmitted nor derived from members). As of M13 the membership is persisted into the at-rest Seeds blob (each entry maps to a core PersistedCircle holding the canonicalized entropy + label) and restored on a daily-login Unlock; on restore each persisted circle is silently rejoined without re-typing the phrase (ISC-C51 / C59). Per the M13 remember-all decision this revises the earlier ISC-A-C2 wording that circle entropy is never persisted (the entropy lives encrypted under the at-rest blob's KDF and stays non-mnemonic-derivable)."
   - name: daemonseed_tui::app::MainFocus
     kind: enum
-    description: "Which Main-view input has keyboard focus (Tab cycles Chat → JoinCircle → Mute → Shares → DefineShare → Publish → Hide → Servers → TrustHistory → PublicSpace → Deprecation → Chat). Chat (compose, Enter sends, ISC-14); JoinCircle (phrase, Enter joins, ISC-15/16); Mute (full handle, Enter toggles the client-local mute set, ISC-13 / A-C3); Shares (two-pane My/Public shares view; Up/Down selects, f fetches the selected public share, r refreshes, u unpublishes the most-recent published share, ISC-17/20); DefineShare (M14 — JoinCircle-style input box; type a local directory `path` or `path|label`, Enter validates the dir exists and queues a ShareDefineRequest the binary turns into NetCommand::DefineShare, ISC-C21; a bad path keeps the buffer so the typo is fixable in place; on success focus returns to Shares); Publish (M15 — JoinCircle-style input box; type a local directory `path` or `path|name`, Enter validates the dir and queues a PublishRequest the binary turns into NetCommand::PublishShare — publishing the listing and serving content for the life of the session, ISC-S27/S29/F25; name defaults to the directory name; the Shares pane's `u` unpublishes, ISC-A-S1; serving is session-scoped — the relay reaps the share when the connection drops, ISC-S20); Hide (full sharer-handle, Enter toggles the client-local hidden-shares set, ISC-18 / C16 / A-C3 — Shares view stays visible); Servers (F22 server-management — main area shows the server list; Enter adds or connects-selected, Left/Right slides trust, Up/Down selects, ISC-21/26/27; M12 gate step 6 — opening the pane auto-dispatches RefreshIntroducer and a read-only 'Discovered (introducer)' sub-section lists each introducer-discovered peer as `server-id  address` with the `candidate` label, carrying no key bytes and never auto-trusted — promotion stays an explicit user action, ISC-S6 / ISC-C22 / ISC-A-C19); TrustHistory (main area shows the C28 trust-event audit log; Up/Down select, Enter dismisses per (key, scope), ISC-25 / A-C12); PublicSpace (read-only MOTD + announcements view; Up/Down selects, r refreshes, ISC-25 / S7 / A-S3); Deprecation (read-only verified suite-deprecation warnings; Up/Down selects, r refreshes, ISC-C25 / A-S11 / C28)."
-    variants: [Chat, JoinCircle, Mute, Shares, DefineShare, Publish, Hide, Servers, TrustHistory, PublicSpace, Deprecation]
+    description: "Which Main-view input has keyboard focus (Tab cycles Chat → JoinCircle → Mute → Shares → DefineShare → Publish → Hide → Servers → TrustHistory → PublicSpace → Deprecation → Fetched → Chat). Chat (compose, Enter sends, ISC-14); JoinCircle (phrase, Enter joins, ISC-15/16); Mute (full handle, Enter toggles the client-local mute set, ISC-13 / A-C3); Shares (two-pane My/Public shares view; Up/Down selects, f fetches the selected public share, r refreshes, u unpublishes the most-recent published share, ISC-17/20); DefineShare (M14 — JoinCircle-style input box; type a local directory `path` or `path|label`, Enter validates the dir exists and queues a ShareDefineRequest the binary turns into NetCommand::DefineShare, ISC-C21; a bad path keeps the buffer so the typo is fixable in place; on success focus returns to Shares); Publish (M15 — JoinCircle-style input box; type a local directory `path` or `path|name`, Enter validates the dir and queues a PublishRequest the binary turns into NetCommand::PublishShare — publishing the listing and serving content for the life of the session, ISC-S27/S29/F25; name defaults to the directory name; the Shares pane's `u` unpublishes, ISC-A-S1; serving is session-scoped — the relay reaps the share when the connection drops, ISC-S20); Hide (full sharer-handle, Enter toggles the client-local hidden-shares set, ISC-18 / C16 / A-C3 — Shares view stays visible); Servers (F22 server-management — main area shows the server list; Enter adds or connects-selected, Left/Right slides trust, Up/Down selects, ISC-21/26/27; M12 gate step 6 — opening the pane auto-dispatches RefreshIntroducer and a read-only 'Discovered (introducer)' sub-section lists each introducer-discovered peer as `server-id  address` with the `candidate` label, carrying no key bytes and never auto-trusted — promotion stays an explicit user action, ISC-S6 / ISC-C22 / ISC-A-C19); TrustHistory (main area shows the C28 trust-event audit log; Up/Down select, Enter dismisses per (key, scope), ISC-25 / A-C12); PublicSpace (read-only MOTD + announcements view; Up/Down selects, r refreshes, ISC-25 / S7 / A-S3); Deprecation (read-only verified suite-deprecation warnings; Up/Down selects, r refreshes, ISC-C25 / A-S11 / C28); Fetched (M15 C — browse pane listing persisted downloads; Up/Down selects, opening the pane auto-dispatches ListFetched, Enter with a typed dest queues ExtractShare — ISC-C64 / C65 / A-C31 / A-C32)."
+    variants: [Chat, JoinCircle, Mute, Shares, DefineShare, Publish, Hide, Servers, TrustHistory, PublicSpace, Deprecation, Fetched]
   - name: daemonseed_tui::app::LocalShareRow
     kind: struct
     description: "One indexed file in the user's own share, as rendered in the My-shares pane (ISC-17 / C21). A render-only projection of daemonseed_core::storage::share_index::ShareEntry: rel_path, size, mtime_unix_ms."

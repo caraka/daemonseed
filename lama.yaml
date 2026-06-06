@@ -164,6 +164,24 @@ capabilities:
       - daemonseed_core::storage::share_index
     iscs: [C3, C24, C30, C32, A-C9, C21, A-C6, A-C7]
 
+  - category: "Fetched-content landing zone"
+    summary: >-
+      Persistent on-disk store for fully-verified fetched share content (M15 C;
+      ISC-C63 / C64 / C65, ISC-A-C31 / A-C32). A FileChunkStore at
+      `<fetched-root>/cas` holds each file's plaintext bytes by SHA-384 address;
+      a line-based manifest at `<fetched-root>/shares.idx` records share_id →
+      name → [(rel_path, chunk_addr, size)] so the user can browse downloads
+      and extract files after the fetch overlay closes. At-rest posture:
+      plaintext explicit downloads — user-chosen artifacts, not
+      message/post/session history (no-client-history intact); the R-PANIC
+      erasure target. Extraction is path-traversal-safe (every rel_path is
+      validated before any chunk is read, ISC-A-C32); only fully-verified
+      fetches persist (ISC-A-C31).
+    crate: daemonseed-core
+    modules:
+      - daemonseed_core::storage::fetched
+    iscs: [C63, C64, C65, A-C31, A-C32]
+
   - category: "Share indexer engine"
     summary: >-
       Drives the share index from the filesystem (M8), designed against

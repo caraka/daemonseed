@@ -635,3 +635,15 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   (no-session `PublishError`, idempotent `PublishStopped`); existing Tab-navigation tests updated for the new
   `MainFocus::Publish` cycle entry. tui 151 pass, full workspace green, clippy + fmt clean. Live publish→fetch
   TUI dogfood against the alpha relay deferred to the M15 finishing pass. Probe: `cargo test -p daemonseed-tui`.
+- M15 C (fetched content → on-disk CAS + browse/extract, ISC-C63 / C64 / C65, ISC-A-C31 / A-C32) verified
+  2026-06-05: core unit tests in `daemonseed-core::storage::fetched` — `record_then_list_roundtrip` (store
+  writes + manifest + list reads back identical FetchedShare), `extract_reconstructs_bytes` (extract writes
+  each file's plaintext to dest mirroring rel_path tree), `extract_rejects_path_traversal` (a manifest
+  `rel_path` containing `..` is refused, dest untouched), `sanitize_rejects_absolute_and_dotdot` (absolute
+  path + `..` component each fail sanitize_rel_path), `re_record_replaces_listing` (re-fetching same
+  share_id replaces its manifest record, not duplicates it), `corrupt_manifest_is_an_error` (unparseable
+  manifest surfaces as FetchedError::Corrupt). TUI unit tests in `daemonseed-tui::app` —
+  `fetched_pane_open_requests_refresh` (Tab to Fetched queues a ListFetched drain),
+  `fetched_shares_event_populates_list` (NetEvent::FetchedShares replaces browse list wholesale),
+  `fetched_enter_queues_extract` (Enter on a Fetched row with a typed dest queues ExtractShare).
+  Probe: `cargo test -p daemonseed-core -p daemonseed-tui`.
