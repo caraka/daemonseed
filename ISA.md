@@ -86,7 +86,7 @@ Substrate-independent truths the work must respect. These bind the *thinking*.
   around it; never rest a guarantee on a public key staying private.
 - **Survive the GFW; do not chase unobservability.** Censorship-survivability is the bar (negative-allowlist
   detection, Wu et al., USENIX Security 2023). Real TLS 1.3 on :443 clears the fully-encrypted-traffic
-  filter by construction; we do not pretend to be invisible.
+  filter by construction — the first TLS record satisfies the filter's Ex5 exemption; we do not pretend to be invisible.
 - **The relay learns metadata, not content.** Separation of trust is structural: operators see
   presence-at-hash and refcount changes, never plaintext, membership, or circle enumeration.
 - **Trust is per-entity and user-controlled.** TOFU with a per-server trusted/untrusted slider; no
