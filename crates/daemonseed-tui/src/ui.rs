@@ -117,6 +117,7 @@ fn render_main(app: &App, frame: &mut Frame) {
         MainFocus::Shares | MainFocus::Hide => render_shares(app, frame, chunks[1]),
         MainFocus::PublicSpace => render_public_space(app, frame, chunks[1]),
         MainFocus::Deprecation => render_deprecation(app, frame, chunks[1]),
+        MainFocus::Fetched => render_fetched(app, frame, chunks[1]),
         _ => render_chat_transcript(app, frame, chunks[1]),
     }
     render_main_input(app, frame, chunks[2]);
@@ -219,6 +220,66 @@ fn render_trust_history(app: &App, frame: &mut Frame, area: Rect) {
         Block::default()
             .borders(Borders::ALL)
             .title(" trust history ")
+            .title_alignment(Alignment::Left),
+    );
+    frame.render_widget(body, area);
+}
+
+/// The Fetched-downloads browse pane (M15 C; ISC-C64 / C65). Lists each share
+/// fetched this profile (persisted on disk as an explicit download, ISC-C63)
+/// with its name, short id, file count, and total size; the selected row is
+/// highlighted, and its files are listed beneath. Enter (with a destination
+/// typed in the input below) extracts the selected download.
+fn render_fetched(app: &App, frame: &mut Frame, area: Rect) {
+    let shares = app.fetched_shares();
+    let lines: Vec<Line> = if shares.is_empty() {
+        vec![
+            Line::from("no fetched downloads yet — fetch a share from the Shares pane")
+                .style(Style::default().fg(Color::DarkGray)),
+        ]
+    } else {
+        let mut out: Vec<Line> = Vec::new();
+        for (i, s) in shares.iter().enumerate() {
+            let selected = i == app.fetched_sel();
+            let marker = if selected { "▶ " } else { "  " };
+            let short = if s.share_id.len() > 8 {
+                &s.share_id[..8]
+            } else {
+                &s.share_id
+            };
+            let header = format!(
+                "{marker}{}  #{short}  ({} file(s), {} bytes)",
+                if s.name.is_empty() {
+                    "(unnamed)"
+                } else {
+                    &s.name
+                },
+                s.files.len(),
+                s.total_bytes(),
+            );
+            let style = if selected {
+                Style::default().fg(Color::Cyan).bold()
+            } else {
+                Style::default()
+            };
+            out.push(Line::from(header).style(style));
+            // List the selected download's files so the user can see what
+            // extraction will write.
+            if selected {
+                for f in &s.files {
+                    out.push(
+                        Line::from(format!("      {}  ({} bytes)", f.rel_path, f.size))
+                            .style(Style::default().fg(Color::DarkGray)),
+                    );
+                }
+            }
+        }
+        out
+    };
+    let body = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" fetched downloads ")
             .title_alignment(Alignment::Left),
     );
     frame.render_widget(body, area);
@@ -985,8 +1046,15 @@ fn render_main_input(app: &App, frame: &mut Frame, area: Rect) {
             String::new(),
         ),
         MainFocus::Deprecation => (
-            "suite deprecation  [↑/↓] select  [r] refresh  [Tab] chat  [Esc] back".to_owned(),
+            "suite deprecation  [↑/↓] select  [r] refresh  [Tab] fetched  [Esc] back".to_owned(),
             String::new(),
+        ),
+        MainFocus::Fetched => (
+            // M15 C: browse downloads + extract. ↑/↓ selects a download in the
+            // pane above; the input is the destination directory.
+            "extract to dir · e.g. /home/you/Downloads  [↑/↓] select  [Enter] extract  [Tab] chat  [Esc] back"
+                .to_owned(),
+            app.extract_input().to_owned(),
         ),
     };
     // A status/error line (e.g. a failed send) is appended briefly when present.

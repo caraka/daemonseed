@@ -13,8 +13,13 @@
 //! - [`share_index`] (M8) — the redb-backed indexed-state layer: a persistent,
 //!   incremental, per-value-encrypted index of a shared folder's files
 //!   (ISC-C21 / A-C6 / A-C7).
+//! - [`fetched`] (M15) — the persistent landing zone for *fetched* share
+//!   content: a content-addressed store plus a manifest of explicit downloads,
+//!   so a fetched share can be browsed and extracted after the fetch
+//!   (ISC-C63 / C64 / C65, ISC-A-C31 / A-C32).
 
 pub mod cas;
+pub mod fetched;
 pub mod recovery_file;
 pub mod seeds;
 pub mod share_index;

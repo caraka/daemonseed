@@ -177,10 +177,26 @@ fn run(
         if app.take_pending_introducer_refresh() {
             let _ = net.send(NetCommand::RefreshIntroducer);
         }
-        if let Some((share_id, sharer_handle)) = app.take_pending_share_fetch() {
+        if let Some((share_id, sharer_handle, name)) = app.take_pending_share_fetch() {
             let _ = net.send(NetCommand::FetchShare {
                 share_id,
                 sharer_handle,
+                name,
+                fetched_root: profile_root.join("fetched"),
+            });
+        }
+        // M15 C: browse — refresh the fetched-downloads list on demand.
+        if app.take_pending_fetched_refresh() {
+            let _ = net.send(NetCommand::ListFetched {
+                fetched_root: profile_root.join("fetched"),
+            });
+        }
+        // M15 C: extract a fetched download's files to a chosen directory.
+        if let Some((share_id, dest)) = app.take_pending_extract() {
+            let _ = net.send(NetCommand::ExtractShare {
+                fetched_root: profile_root.join("fetched"),
+                share_id,
+                dest,
             });
         }
         // D, M15: a Publish request → publish the listing + serve the directory's
