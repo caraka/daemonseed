@@ -898,20 +898,23 @@ fn render_main_input(app: &App, frame: &mut Frame, area: Rect) {
         }
         MainFocus::JoinCircle => {
             // ISC-C9 strength indicator: a red→yellow→green tier (border below
-            // matches). The literal ≥128-bit floor is unmeasurable (zxcvbn caps at
-            // 64 bits), so this shows zxcvbn's tier, not a "/128" bar that could
-            // never fill. A below-floor phrase is blocked at Enter
-            // (App::on_key_join, Fork 4), so the indicator explains the refusal.
+            // matches), driven by the M15 word+charset key-space estimate. Green
+            // at the real ≥128-bit floor; a below-floor phrase is blocked at Enter
+            // (App::on_key_join, Fork 4). The bits/128 readout tells the user how
+            // much further to go — "keep adding until green" (caraka 2026-06-05).
             let s = app.circle_phrase_strength();
-            let tier = if s.meets_circle_interim_floor() {
+            let tier = if s.is_circle_green() {
                 "strong ✓"
-            } else if s.score >= 3 {
+            } else if s.bits >= SESSION_PASSPHRASE_MIN_BITS {
                 "fair ⚠"
             } else {
                 "weak ⚠"
             };
             (
-                format!("circle phrase · strength: {tier}  [Enter] join  [Tab] mute  [Esc] back"),
+                format!(
+                    "circle phrase · {tier} {bits:.0}/128 bits  [Enter] join  [Tab] mute  [Esc] back",
+                    bits = s.bits
+                ),
                 app.circle_phrase().to_owned(),
             )
         }
@@ -974,16 +977,16 @@ fn render_main_input(app: &App, frame: &mut Frame, area: Rect) {
         Some(s) => format!("{text}    ! {s}"),
         None => text,
     };
-    // The join box gets a strength-driven border (ISC-C9): red below ~85 bits,
+    // The join box gets a strength-driven border (ISC-C9): red below 60 bits,
     // yellow approaching the floor, green at/above the ≥128-bit floor — the
     // red→green indicator the spec calls for, within the single-line input. An
     // empty phrase stays neutral cyan like every other focus.
     let border_color = match app.main_focus() {
         MainFocus::JoinCircle if !app.circle_phrase().is_empty() => {
             let s = app.circle_phrase_strength();
-            if s.meets_circle_interim_floor() {
+            if s.is_circle_green() {
                 Color::Green
-            } else if s.score >= 3 {
+            } else if s.bits >= SESSION_PASSPHRASE_MIN_BITS {
                 Color::Yellow
             } else {
                 Color::Red

@@ -83,6 +83,17 @@ fn m1_iscs_exercise_end_to_end() {
 
     // ── ISC-C9: NFKC + whitespace canonicalization for circle entropy ────
     assert_eq!(canonicalize("  Hello\u{FF11}  world  "), "Hello1 world");
+    // ISC-C9 also gates circle-of-trust entropy at the ≥128-bit floor via the
+    // M15 word+charset key-space estimator (zxcvbn cannot certify ≥128). A
+    // 12-word diceware phrase clears it; the public xkcd 4-word phrase does not.
+    assert!(
+        strength::estimate_circle(
+            "abandon ability able about above absent \
+             absorb abstract absurd abuse access accident"
+        )
+        .is_circle_green()
+    );
+    assert!(!strength::estimate_circle("correct horse battery staple").is_circle_green());
     coverage.register("ISC-C9", "m1_iscs::circle_canonicalize");
 
     // ── ISC-C10: daemonseed-core exists as a library crate. The fact this

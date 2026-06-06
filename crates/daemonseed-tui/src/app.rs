@@ -7,7 +7,7 @@
 use daemonseed_core::backoff::CloseCause;
 use daemonseed_core::first_start::SessionMaterials;
 use daemonseed_core::handle::{DisplayMode, Handle};
-use daemonseed_core::passphrase::strength::{self, Strength};
+use daemonseed_core::passphrase::strength::{self, CircleStrength};
 use daemonseed_core::profile::config::ArgonParams;
 use daemonseed_core::storage::seeds::{SealingKey, Seeds};
 use daemonseed_core::trust_events::{
@@ -925,13 +925,14 @@ impl App {
         &self.circle_phrase
     }
 
-    /// Estimated strength of the current circle-join phrase (ISC-C9), for the
-    /// red→green meter in the join box. Mirrors the first-start session-passphrase
-    /// meter (ISC-C12); the circle floor is higher (≥128 bits,
-    /// [`strength::CIRCLE_ENTROPY_MIN_BITS`]). An empty phrase estimates `0.0`
+    /// Estimated key-space strength of the current circle-join phrase (ISC-C9),
+    /// for the red→green meter in the join box. Mirrors the first-start
+    /// session-passphrase meter (ISC-C12); the circle floor is higher (≥128 bits,
+    /// [`strength::CIRCLE_ENTROPY_MIN_BITS`]) and uses the M15 word+charset
+    /// estimator that can actually reach it. An empty phrase estimates `0.0`
     /// bits, so the meter reads empty until the user types.
-    pub fn circle_phrase_strength(&self) -> Strength {
-        strength::estimate(&self.circle_phrase)
+    pub fn circle_phrase_strength(&self) -> CircleStrength {
+        strength::estimate_circle(&self.circle_phrase)
     }
 
     /// The chat lines, oldest first, for rendering (ISC-10). The split view
@@ -2006,20 +2007,21 @@ impl App {
             }
             KeyCode::Enter if !self.circle_phrase.is_empty() => {
                 // ISC-C9: gate the join on circle-entropy strength. A weak shared
-                // phrase is the circle's whole vulnerability, so a below-floor
+                // phrase is the circle's whole vulnerability, so a below-≥128-bit
                 // estimate BLOCKS the join (caraka 2026-06-05, precautionary
                 // default — Fork 4) rather than merely warning. The phrase is
                 // deliberately kept (not drained) so the user can strengthen it in
                 // place; the meter already shows them the gap.
                 //
-                // The literal ≥128-bit floor (ISC-C9) is unmeasurable today —
-                // zxcvbn saturates at 64 bits (see Strength::is_circle_green) — so
-                // this uses the interim achievable proxy (zxcvbn's strongest tier).
-                // Replace with the real ≥128 check when the estimator is upgraded.
-                let est = strength::estimate(&self.circle_phrase);
-                if !est.meets_circle_interim_floor() {
+                // M15 (caraka 2026-06-05): the REAL ≥128-bit key-space gate, now
+                // that `estimate_circle` (words + charset) can certify it —
+                // replacing the M14 interim zxcvbn score-4 proxy that wrongly
+                // accepted the public xkcd phrase.
+                let est = strength::estimate_circle(&self.circle_phrase);
+                if !est.is_circle_green() {
                     self.status = Some(
-                        "circle phrase too weak — use a longer, less predictable phrase (ISC-C9)"
+                        "circle phrase too weak — keep adding words or characters until the \
+                         border turns green (need ≥128 bits, ISC-C9)"
                             .to_owned(),
                     );
                     return;
@@ -3202,9 +3204,9 @@ mod tests {
         );
     }
 
-    /// A strong circle phrase (zxcvbn score 4) — used by join tests that must
-    /// clear the ISC-C9 interim floor (`App::on_key_join`). A weak phrase like the
-    /// public xkcd example would now be blocked, by design.
+    /// A strong circle phrase — 34 distinct characters, ≈173 key-space bits —
+    /// used by join tests that must clear the ISC-C9 ≥128-bit floor
+    /// (`App::on_key_join`). The public xkcd 4-word phrase is blocked, by design.
     const STRONG_CIRCLE_PHRASE: &str = "x7Qk!9zR2m@Lp4wV6sT1bN8dF3hJ5cG0aY";
 
     #[test]
@@ -3226,8 +3228,8 @@ mod tests {
 
     /// ISC-C9 / Fork 4 — a weak circle phrase is BLOCKED at Enter: no join is
     /// queued, the status explains, and the phrase is kept (not drained) so the
-    /// user can strengthen it in place. The literal ≥128-bit floor is unmeasurable
-    /// (zxcvbn caps at 64 bits), so the gate uses the interim score-4 proxy.
+    /// user can strengthen it in place. M15: the gate is the real ≥128-bit
+    /// key-space floor (`estimate_circle`); `password123` is ≈36 bits.
     #[test]
     fn weak_circle_phrase_is_blocked_at_join() {
         let mut app = drive_to_main();
@@ -3254,19 +3256,19 @@ mod tests {
     }
 
     /// The circle-phrase strength accessor (ISC-C9 meter) reflects the live buffer:
-    /// the strong phrase clears the interim floor, an empty/weak one does not.
+    /// the strong phrase clears the ≥128-bit floor, an empty/weak one does not.
     #[test]
     fn circle_phrase_strength_tracks_the_buffer() {
         let mut app = drive_to_main();
         assert!(
-            !app.circle_phrase_strength().meets_circle_interim_floor(),
+            !app.circle_phrase_strength().is_circle_green(),
             "empty phrase is not strong"
         );
         app.on_key(press(KeyCode::Tab)); // focus → JoinCircle
         for ch in STRONG_CIRCLE_PHRASE.chars() {
             app.on_key(press(KeyCode::Char(ch)));
         }
-        assert!(app.circle_phrase_strength().meets_circle_interim_floor());
+        assert!(app.circle_phrase_strength().is_circle_green());
     }
 
     /// ISC-C62 — a joined circle exposes a relay-independent `#<hash-of-entropy>`
