@@ -107,66 +107,33 @@ fn main() -> Result<()> {
     }
 }
 
-/// CANONICAL ISC count lives in `daemonseed-integration-tests::isc_coverage::TOTAL`
-/// (guarded there by `registry_count_matches_total` against `ISCS.len()`). This
-/// constant is a deliberate CHEAP MIRROR so xtask can report a percentage without
-/// a heavy path-dep on the integration-tests crate (which transitively pulls
-/// core + proto). It is the ONLY sanctioned copy of the count anywhere — no doc
-/// hand-writes it; they all say "run `cargo xtask isc-coverage`". Bump this when
-/// the registry's TOTAL changes. Tracked follow-up: move the registry to a leaf
-/// crate both can depend on cheaply, deleting this mirror outright.
-const TOTAL_ISCS: u32 = 122;
-
-/// Static lower-bound coverage count. Bumped each milestone as ISCs gain
-/// exercised tests:
-/// - M1: 0 → 17 via `m1_isc_coverage`
-/// - M2: 17 → 29 via `m2_isc_coverage` (12 new — C29-C34, C37, A-C2,
-///   A-C13, A-C14, A-C15, A-C19)
-/// - M3: 29 → 34 via `m3_isc_coverage` (5 new — C24, S15, A-C8, A-S10,
-///   A-C9)
-/// - M4a: 34 → 43 via `m4a_isc_coverage` (9 new — S2a, S2b, S3, S5,
-///   S11, S14, A-S9, C23, A-S6)
-/// - M4b: 43 → 48 via `m4b_isc_coverage` (5 new — S19, A-S14, A-C18,
-///   A-S12, A-S1)
-/// - M5: 48 → 55 via `m5_isc_coverage` (7 new — S1, S6, S12, S13, C22,
-///   A-S7, A-C10; A-S4b forward-referenced to M6)
-/// - M6: 55 → 67 via `m6_isc_coverage` (12 new — S4, S7, S8, S9, S10,
-///   A-S3, A-S4, A-S4b, A-S5b, A-S8, C19, A-C5)
-/// - M7: 67 → 72 via `m7_isc_coverage` (5 new — S16, A-S11, C25, C28,
-///   A-C12; A-C9 was already covered at M3)
-/// - M12: 72 → 72 via `m12_isc_coverage` (**0 new** — gate steps 5 & 6 were
-///   built against the existing ISC surface, so the two new gate tests only
-///   re-exercise already-covered ISCs: step 5 traces to A-S1 (M4b), A-S5b
-///   and S4 (M6); step 6 traces to S6, S13, C22 (M5) and A-C19 (M2). The
-///   floor does not move; `m12_isc_coverage` records the trace map and guards
-///   the "no genuinely-new ISC" invariant.)
-/// - alpha2 (one batch → v0.15.0): 72 → 100 (28 new) —
-///   opaque share_id S21 + A-S15 (2); share download S27-S29 + A-S20/A-S21 (5);
-///   public rooms S22-S26 + A-S16-A-S19 + C56-C58 (12); client-identity-lifecycle
-///   C47-C51 + A-C26-A-C28 (8); portable mode C52 (1).
+/// Reports ISC coverage from the single-source registry.
 ///
-/// Replacing this constant with a live query against the registered
-/// registry remains a later-milestone task (M11 ties this to the CI gate).
-const COVERED_ISCS: u32 = 100;
-
-/// Reports the static lower-bound coverage. The live registry-driven count
-/// (which walks the per-milestone integration tests and tallies actual
-/// `Coverage::register` calls) is M11 scope — at that point this constant
-/// goes away.
+/// Both the denominator [`daemonseed_isc::TOTAL`] (built, non-deferred ISCs)
+/// and the numerator [`daemonseed_isc::COVERED`] (distinct ISCs with a
+/// registered integration test) are read live from the zero-dependency
+/// `daemonseed-isc` leaf crate — there is no longer a hand-maintained mirror in
+/// xtask (the old `TOTAL_ISCS` / `COVERED_ISCS` constants drifted from the
+/// registry, the bug M15 E fixed). The per-milestone provenance of COVERED and
+/// its drift guards (`covered_sum_matches`, `covered_within_total`) live in
+/// `daemonseed_isc`. A future fully-live numerator (running the suite and
+/// tallying actual `Coverage::register` calls) would replace the COVERED
+/// constant; the `covered_sum_matches` test keeps it honest until then.
 fn isc_coverage(min: Option<u8>) -> Result<()> {
-    let covered: u32 = COVERED_ISCS;
-    let pct = if TOTAL_ISCS == 0 {
+    let covered = daemonseed_isc::COVERED as u32;
+    let total = daemonseed_isc::TOTAL as u32;
+    let pct = if total == 0 {
         0.0
     } else {
-        (covered as f64) * 100.0 / (TOTAL_ISCS as f64)
+        (covered as f64) * 100.0 / (total as f64)
     };
-    println!("ISC coverage: {covered}/{TOTAL_ISCS} = {pct:.1}% (static M7 floor)");
+    println!("ISC coverage: {covered}/{total} = {pct:.1}% (built ISC surface)");
     if let Some(m) = min
         && (pct as u32) < (m as u32)
     {
         bail!(
             "ISC coverage {pct:.1}% below required minimum {m}%. \
-             Register tests against entries in daemonseed-integration-tests::isc_coverage."
+             Register tests against entries in daemonseed-isc::ISCS."
         );
     }
     Ok(())

@@ -18,6 +18,7 @@ description = "daemonseed cross-crate integration tests + ISC coverage registry 
 # M0 minimal path-deps: library crates only. server/cli/tui are binary-only
 # today; when M4a / M11 need in-process test access, those crates gain a
 # `[lib]` target and a corresponding path-dep lands here.
+daemonseed-isc = { path = "../daemonseed-isc" }
 daemonseed-core = { path = "../daemonseed-core" }
 daemonseed-proto = { path = "../daemonseed-proto" }
 

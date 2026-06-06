@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/daemonseed-isc",
     "crates/daemonseed-core",
     "crates/daemonseed-proto",
     "crates/daemonseed-server",
