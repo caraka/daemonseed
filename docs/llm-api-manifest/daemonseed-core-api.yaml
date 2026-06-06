@@ -361,30 +361,33 @@ modules:
 
   - name: daemonseed_core::storage::fetched
     description: >-
-      Persistent landing zone for fully-verified fetched share content (M15 C;
-      ISC-C63 / C64 / C65, ISC-A-C31 / A-C32). Sits above the share-fetch path
-      (share_envelope + net actor): a verified fetch persists every file's
-      plaintext bytes into a FileChunkStore at `<fetched-root>/cas` and writes a
-      line-based manifest at `<fetched-root>/shares.idx`, so the user can browse
-      downloads and extract files after the fetch overlay closes. At-rest posture
+      Persistent landing zone for fully-verified fetched share content (M15;
+      ISC-C63 / C64, ISC-A-C31 / A-C32). Sits above the share-fetch path
+      (share_envelope + net actor): a verified fetch writes each file's plaintext
+      bytes directly under its real name into a per-share folder beneath the
+      downloads root, and records the landing in a line-based manifest
+      (`downloads.idx`). Layout: `<root>/<share-name>/<rel_path>` (named files,
+      no CAS layer, no hex filenames, no `.rc` sidecars) + `<root>/downloads.idx`.
+      Because files land under real names at fetch time there is no separate
+      "extract" step — the browse pane shows the folder directly. At-rest posture
       is plaintext by design — fetched files are user-chosen explicit downloads,
       not message/post/session history (no-client-history invariant intact); this
       is the R-PANIC erasure target. Manifest encryption rejected as theatre while
-      chunk bytes sit beside it in plaintext; a future at-rest folder-encryption
-      feature wraps the whole fetched/ tree (additive, post-MVP). Path-traversal-
-      safe: every rel_path is validated before any chunk is read (ISC-A-C32).
-      No-partial invariant: record_share is called only after all chunks verified
-      — a fetch that fails verification never reaches it (ISC-A-C31).
+      file bytes sit beside it in plaintext; a future at-rest folder-encryption
+      feature wraps the whole downloads/ tree (additive, post-MVP). Path-traversal-
+      safe: every rel_path is validated (only Normal path components survive) before
+      any file is written (ISC-A-C32). No-partial invariant: record_share is
+      called only after all chunks verified — a fetch that fails verification never
+      reaches it (ISC-A-C31). NOTE: this module no longer depends on
+      storage::cas; the CAS is used only on the serve side.
     no_std: false
-    depends_on:
-      - daemonseed_core::storage::cas
+    depends_on: []
     iscs:
       - C63
       - C64
-      - C65
       - A-C31
       - A-C32
-    added_in: "v0.18.0-pre (M15 C)"
+    added_in: "v0.19.0 (M15, cleanup from v0.18.0-pre)"
 
   - name: daemonseed_core::indexer
     description: >-
@@ -1325,15 +1328,14 @@ types:
     kind: struct
     description: >-
       One downloaded file inside a FetchedShare. rel_path is the sharer's
-      wire path (untrusted; sanitised only at extraction, ISC-A-C32).
-      chunk_addr is the content address in the CAS. size is bytes.
+      wire path (untrusted; validated at write time — only Normal path
+      components survive, ISC-A-C32). size is bytes. The file's bytes are
+      already on disk at `<root>/<share.folder>/<rel_path>` — no CAS address,
+      no hex filename; the file is directly accessible under its real name.
     fields:
       - name: rel_path
         type: String
-        description: The file's path relative to the share root (wire value; sanitised at extract).
-      - name: chunk_addr
-        type: ChunkAddr
-        description: The content address in the fetched CAS.
+        description: The file's path relative to the share's download folder (`/`-separated; real name on disk).
       - name: size
         type: u64
         description: The file's size in bytes.
@@ -1344,7 +1346,9 @@ types:
     description: >-
       One fetched share's manifest record. share_id is the server-assigned
       opaque id (ISC-S21); name is the sharer-advertised display name;
-      files is the per-file inventory. total_bytes() sums file sizes.
+      folder is the single safe path component under the downloads root where
+      the files landed (derived from name, collision-suffixed by share_id if
+      needed); files is the per-file inventory. total_bytes() sums file sizes.
     fields:
       - name: share_id
         type: String
@@ -1352,6 +1356,13 @@ types:
       - name: name
         type: String
         description: Sharer-advertised display name.
+      - name: folder
+        type: String
+        description: >-
+          The single safe path component under the downloads root where this
+          share's files landed (e.g. "My Photos" or "Vacation-bb3a1f"). Derived
+          from name; collision-suffixed by the first 6 chars of share_id when
+          another share already occupies the same folder (ISC-A-C32).
       - name: files
         type: "Vec<FetchedFile>"
         description: One entry per downloaded file.
@@ -1379,29 +1390,31 @@ types:
     variants:
       - name: Io
         description: "Io(std::io::Error) — filesystem I/O failed."
-      - name: Cas
-        description: "Cas(CasError) — the underlying content-addressed store failed."
       - name: Corrupt
         description: >-
-          Corrupt(String) — the manifest is unparseable, or a manifest entry
-          references a chunk missing from the CAS (corrupt or partially-deleted
-          download dir).
+          Corrupt(String) — the manifest (`downloads.idx`) is unparseable or
+          otherwise malformed.
       - name: UnsafePath
         description: >-
-          UnsafePath(String) — extraction refused because the rel_path escapes
-          dest via `..`, an absolute path, or a root/prefix component
-          (ISC-A-C32). Nothing is written for the offending entry.
+          UnsafePath(String) — writing a file was refused because its rel_path
+          escapes the share folder via `..`, an absolute path, or a non-Normal
+          path component (ISC-A-C32). Nothing is written for the offending entry.
 
   - name: FetchedStore
     module: daemonseed_core::storage::fetched
     kind: struct
     description: >-
-      The on-disk store of fetched share content. Open once with
-      FetchedStore::open(root); record_share persists a completed fetch
-      (ISC-C63 / A-C31), list_shares enumerates downloads for the browse
-      view (ISC-C64), extract_share reconstructs files into a chosen dir
-      (ISC-C65 / A-C32). Layout: `<root>/cas/` (a FileChunkStore) +
-      `<root>/shares.idx` (the line-based manifest).
+      The on-disk store of fetched share content — named files under per-share
+      folders. Open once with FetchedStore::open(root); record_share(share_id,
+      name, files: &[VerifiedFile]) -> FetchedShare persists a completed fetch
+      by writing each file's bytes to `<root>/<folder>/<rel_path>` and
+      appending a record to the manifest (ISC-C63 / A-C31);
+      list_shares() -> Vec<FetchedShare> enumerates downloads for the browse
+      view (ISC-C64); share_dir(&self, &FetchedShare) -> PathBuf returns the
+      absolute path of the share's folder. There is no extract step — files are
+      already on disk under their real names. Layout: `<root>/<share-name>/`
+      (per-share named-file trees) + `<root>/downloads.idx` (the line-based
+      manifest; no `<root>/cas/`, no hex names, no `.rc` sidecars).
 
   # ── first_start ─────────────────────────────────────────────────────
   - name: "FirstStart<S>"
@@ -3453,18 +3466,18 @@ functions:
   - name: FetchedStore::open
     module: daemonseed_core::storage::fetched
     description: >-
-      Open (creating if absent) the fetched-content store rooted at `root`.
+      Open (creating if absent) the downloads store rooted at `root`.
       Creates `<root>/` via create_dir_all. Reopening an existing root
-      recovers every prior download; the manifest and CAS are read lazily.
+      recovers every prior download; the manifest is read lazily on list_shares.
     signature: "pub fn open(root: impl Into<PathBuf>) -> Result<FetchedStore, FetchedError>"
     parameters:
       - name: root
         type: "impl Into<PathBuf>"
         direction: in
-        description: The directory to use as the fetched landing zone.
+        description: The directory to use as the downloads landing zone.
     returns:
       type: "Result<FetchedStore, FetchedError>"
-      description: An open store ready for record/list/extract.
+      description: An open store ready for record/list/share_dir.
       error_variants:
         - name: Io
           condition: create_dir_all failed.
@@ -3472,12 +3485,13 @@ functions:
   - name: FetchedStore::record_share
     module: daemonseed_core::storage::fetched
     description: >-
-      Persist a fully-verified fetched share (ISC-C63 / A-C31). Every
-      file's bytes are stored in the FileChunkStore (the CAS address is
-      re-derived via put — never trusted from the caller) and the manifest
-      is rewritten. Re-recording the same share_id replaces its manifest
-      record (a re-fetch overwrites). Called only after all chunks have
-      verified; a fetch that fails verification never reaches here.
+      Persist a fully-verified fetched share by writing each file's bytes
+      directly under its real name into a per-share folder (ISC-C63 / A-C31).
+      The folder name is derived from `name` (collision-suffixed by share_id
+      prefix when needed). Re-recording the same share_id reuses its folder
+      and overwrites files (a re-fetch refreshes the download). Called only
+      after all chunks have verified; a fetch that fails verification never
+      reaches here.
     signature: "pub fn record_share(&mut self, share_id: &str, name: &str, files: &[VerifiedFile]) -> Result<FetchedShare, FetchedError>"
     parameters:
       - name: share_id
@@ -3487,26 +3501,25 @@ functions:
       - name: name
         type: "&str"
         direction: in
-        description: Sharer-advertised display name.
+        description: Sharer-advertised display name (used to derive the folder).
       - name: files
         type: "&[VerifiedFile]"
         direction: in
-        description: Fully-verified plaintext files to persist.
+        description: Fully-verified plaintext files to write.
     returns:
       type: "Result<FetchedShare, FetchedError>"
-      description: The recorded manifest entry.
+      description: The recorded manifest entry (includes the derived folder name).
       error_variants:
         - name: Io
-          condition: CAS or manifest write failed.
-        - name: Cas
-          condition: FileChunkStore put failed.
+          condition: directory creation, file write, or manifest write failed.
+        - name: UnsafePath
+          condition: A file's rel_path is absolute, contains `..`, or has a non-Normal component.
 
   - name: FetchedStore::list_shares
     module: daemonseed_core::storage::fetched
     description: >-
-      Enumerate every fetched share, newest-recorded last (manifest order).
-      Returns Ok(vec![]) when nothing has been fetched yet (missing
-      manifest is not an error).
+      Enumerate every fetched share in manifest order. Returns Ok(vec![])
+      when nothing has been fetched yet (missing manifest is not an error).
     signature: "pub fn list_shares(&self) -> Result<Vec<FetchedShare>, FetchedError>"
     parameters: []
     returns:
@@ -3518,37 +3531,21 @@ functions:
         - name: Corrupt
           condition: manifest parse failed.
 
-  - name: FetchedStore::extract_share
+  - name: FetchedStore::share_dir
     module: daemonseed_core::storage::fetched
     description: >-
-      Reconstruct a fetched share's files into `dest`, mirroring the
-      rel_path tree (ISC-C65). Each file's bytes come from the CAS by
-      content address. Path-traversal-safe (ISC-A-C32): every rel_path is
-      validated for only normal relative components before any chunk is
-      read; an unsafe path produces FetchedError::UnsafePath and nothing is
-      written for that entry.
-    signature: "pub fn extract_share(&self, share_id: &str, dest: &Path) -> Result<u32, FetchedError>"
+      Return the absolute path of the folder a recorded share's files live
+      in (`<root>/<share.folder>`). The caller uses this to open the folder
+      in a file manager or display it in the browse pane.
+    signature: "pub fn share_dir(&self, share: &FetchedShare) -> PathBuf"
     parameters:
-      - name: share_id
-        type: "&str"
+      - name: share
+        type: "&FetchedShare"
         direction: in
-        description: The share_id to extract.
-      - name: dest
-        type: "&Path"
-        direction: in
-        description: Destination directory (created via create_dir_all).
+        description: A share record from list_shares.
     returns:
-      type: "Result<u32, FetchedError>"
-      description: The number of files written under dest.
-      error_variants:
-        - name: Corrupt
-          condition: share_id not found in manifest, or manifest references a missing chunk.
-        - name: UnsafePath
-          condition: A manifest rel_path is absolute, contains `..`, or has a root/prefix component.
-        - name: Io
-          condition: CAS open, manifest read, or file write failed.
-        - name: Cas
-          condition: FileChunkStore open or get failed.
+      type: PathBuf
+      description: Absolute path of the share's download folder.
 
   - name: FetchedShare::total_bytes
     module: daemonseed_core::storage::fetched
