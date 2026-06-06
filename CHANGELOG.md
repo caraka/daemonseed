@@ -19,14 +19,34 @@ is the durable anchor.
 
 ## [Unreleased]
 
-- M15: real ≥128-bit circle-entropy gate — `passphrase::strength::estimate_circle` (distinct-BIP-39-word + charset key-space sum, zxcvbn low-end veto) replaces the M14 interim score-4 proxy; the circle-join meter is bits-driven (ISC-C9).
-- M15 D: publish + serve + unpublish shares from the TUI (`NetCommand::{PublishShare,UnpublishShare}`, `MainFocus::Publish` pane; serve via a `spawn_local` task, session-scoped per ISC-S20).
-- M15 C: fetched content → on-disk CAS + browse/extract (`daemonseed_core::storage::fetched`, `MainFocus::Fetched` pane, `NetCommand::{ListFetched,ExtractShare}`, `NetEvent::{FetchedShares,ExtractComplete,ExtractError}`; ISC-C63/C64/C65/A-C31/A-C32).
-- M15 E: single-source the ISC `TOTAL`/`COVERED` into a new zero-dependency `daemonseed-isc` leaf crate read by both the integration tests and `xtask isc-coverage` (kills the drifted xtask count mirror); registry reconciled to the built ISA criteria (`TOTAL` 122→133, honest 100/133 coverage).
-
 In-progress and next-milestone planning is tracked in the project lead's vault
 manifest (not committed). The next entry is added here at the moment a release
 is tagged, as part of the doc-sync ritual in `AGENTS.md`.
+
+## [0.19.0] — M15, close the TUI gap
+
+Brings the TUI to parity with the CLI for the full share loop, plus honest
+coverage tooling.
+
+- **Circle-entropy gate (ISC-C9):** a real ≥128-bit key-space estimator
+  (`passphrase::strength::estimate_circle` — distinct BIP-39 words + a charset
+  residue, with a zxcvbn low-end veto) driving a bits-driven join meter,
+  replacing the M14 interim proxy.
+- **Share publishing from the TUI:** publish / serve / unpublish a share via
+  `[p]` / `[u]` on a defined share (define once, then publish — no separate
+  Publish pane). Serving is session-scoped; the relay reaps on disconnect
+  (ISC-S20).
+- **Downloads:** a fetched share lands as named files in a per-share folder
+  under a downloads root (`<profile>/downloads` in `--portable`, else the OS
+  Downloads directory). Path-traversal-safe; nothing is written until the whole
+  fetch verifies (ISC-C63/C64/C65, ISC-A-C31/A-C32).
+- **Identity in chat + listings:** public-room posts and share listings carry
+  the sender's display handle, so peers see the name rather than the `#hash`
+  floor / "(operator)". The share-fetch overlay shows a progress gauge.
+- **Coverage tooling:** the ISC registry `TOTAL` / `COVERED` are single-sourced
+  in a new zero-dependency `daemonseed-isc` leaf crate read by both the
+  integration tests and `xtask isc-coverage`; reconciled to the built ISA
+  criteria (`TOTAL` 122 → 133, honest 100/133).
 
 ## [0.18.0] — M14, share-management surface + persistence
 
