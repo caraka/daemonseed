@@ -2594,6 +2594,26 @@ functions:
       type: StrengthReport
       description: A zxcvbn-derived strength report with the ISC-C12 floor check.
 
+  - name: "strength::estimate_circle"
+    module: daemonseed_core::passphrase
+    description: >-
+      Circle-of-trust entropy estimator (ISC-C9, M15) — the key-space companion
+      to the session estimator that can actually certify >=128 bits (zxcvbn
+      saturates at 2^64). bits = (distinct BIP-39 words x 11) + charset residue
+      (len x log2 of the residue's distinct chars); zxcvbn is retained only as a
+      low-end veto on repeat/sequence patterns the additive sum over-credits.
+      CircleStrength::is_circle_green() = bits >= 128 && !trivially_weak — the
+      real ISC-C9 gate that replaced the M14 interim score-4 proxy.
+    signature: "pub fn estimate_circle(phrase: &str) -> CircleStrength"
+    parameters:
+      - name: phrase
+        type: "&str"
+        direction: in
+        description: The candidate circle-of-trust passphrase.
+    returns:
+      type: CircleStrength
+      description: "{ bits: f64, trivially_weak: bool } with is_circle_green() = bits >= 128 && !trivially_weak."
+
   - name: "circle_canonicalize::canonicalize"
     module: daemonseed_core::passphrase
     description: >-
