@@ -226,6 +226,7 @@ fn run(
             let _ = net.send(NetCommand::PublishShare {
                 root: req.root,
                 name: req.name,
+                sharer_handle: req.sharer_handle,
             });
         }
         if let Some(share_id) = app.take_pending_unpublish() {

@@ -185,7 +185,13 @@ pub enum NetCommand {
     /// share" — the relay reaps the share when this connection drops, ISC-S20).
     /// Lifecycle arrives as `NetEvent::PublishStarted` / `PublishError` /
     /// `PublishStopped`.
-    PublishShare { root: PathBuf, name: String },
+    PublishShare {
+        root: PathBuf,
+        name: String,
+        /// The publisher's display handle, advertised in the listing so peers
+        /// see the sharer's name, not "(operator)".
+        sharer_handle: String,
+    },
     /// Unpublish a share published this session and stop serving it (D, M15;
     /// owner-scoped, ISC-A-S1). Sends `UnpublishShare` to the relay and aborts
     /// the local serve task, emitting `NetEvent::PublishStopped`. No-op for an
@@ -625,7 +631,11 @@ async fn net_actor(
             }
             NetCommand::ListFetched { fetched_root } => actor.handle_list_fetched(fetched_root),
             NetCommand::RefreshIntroducer => actor.handle_refresh_introducer().await,
-            NetCommand::PublishShare { root, name } => actor.handle_publish_share(root, name).await,
+            NetCommand::PublishShare {
+                root,
+                name,
+                sharer_handle,
+            } => actor.handle_publish_share(root, name, sharer_handle).await,
             NetCommand::UnpublishShare { share_id } => {
                 actor.handle_unpublish_share(&share_id).await
             }
@@ -642,7 +652,7 @@ impl Actor {
     /// (D, M15). See [`NetCommand::PublishShare`]. The session is cloned up front
     /// (cheap — the tonic channel is `Arc`-backed) so no borrow of `self` is held
     /// across the `&mut self` bookkeeping at the end.
-    async fn handle_publish_share(&mut self, root: PathBuf, name: String) {
+    async fn handle_publish_share(&mut self, root: PathBuf, name: String, sharer_handle: String) {
         let session = match self.session.as_ref() {
             Some(s) => s.clone(),
             None => {
@@ -675,7 +685,10 @@ impl Actor {
                     share_id: String::new(),
                     name: name.clone(),
                     rating: String::new(),
-                    sharer_handle: String::new(),
+                    // The publisher's display handle so peers see who shared it
+                    // instead of "(operator)" (M15 — completes the #6 handle
+                    // passthrough on the publish side).
+                    sharer_handle,
                 }),
             })
             .await;
@@ -2117,7 +2130,11 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
-        rt.block_on(actor.handle_publish_share(std::path::PathBuf::from("/tmp"), "x".to_owned()));
+        rt.block_on(actor.handle_publish_share(
+            std::path::PathBuf::from("/tmp"),
+            "x".to_owned(),
+            "x#000000000000".to_owned(),
+        ));
         match rx.try_recv().unwrap() {
             NetEvent::PublishError { message } => assert!(message.contains("not connected")),
             other => panic!("expected PublishError, got {other:?}"),

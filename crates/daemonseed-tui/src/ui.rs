@@ -142,7 +142,7 @@ fn render_main(app: &App, frame: &mut Frame) {
 /// progress. While present, [`App::on_key`] routes input here (Esc cancels;
 /// Enter on a terminal state dismisses).
 fn render_fetch_overlay(f: &FetchUi, frame: &mut Frame, area: Rect) {
-    let popup = centered_rect(60, 28, area);
+    let popup = centered_rect(62, 50, area);
     let (phase, color) = match &f.status {
         FetchStatus::RequestingManifest => ("requesting manifest…".to_owned(), Color::Yellow),
         FetchStatus::Receiving => ("receiving chunks…".to_owned(), Color::Cyan),
@@ -158,28 +158,73 @@ fn render_fetch_overlay(f: &FetchUi, frame: &mut Frame, area: Rect) {
     } else {
         f.sharer_handle.clone()
     };
-    let body = format!(
-        "share: {}\nby: {sharer}\n\nphase: {phase}\nchunks: {}/{total}\nbytes:  {}\n\n{}",
-        f.share_id,
-        f.chunks_received,
-        f.bytes_received,
-        match f.status {
-            FetchStatus::Complete | FetchStatus::Failed(_) => "[Enter] dismiss   [Esc] dismiss",
-            _ => "[Esc] cancel",
-        }
-    );
-    let widget = Paragraph::new(body)
-        .alignment(Alignment::Left)
-        .wrap(Wrap { trim: false })
-        .style(Style::default().fg(color))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(color))
-                .title(" share fetch "),
-        );
+    let footer = match f.status {
+        FetchStatus::Complete | FetchStatus::Failed(_) => "[Enter] dismiss   [Esc] dismiss",
+        _ => "[Esc] cancel",
+    };
+
     frame.render_widget(Clear, popup);
-    frame.render_widget(widget, popup);
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(color))
+        .title(" share fetch ");
+    let inner = outer.inner(popup);
+    frame.render_widget(outer, popup);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(6),    // info
+            Constraint::Length(3), // progress gauge
+            Constraint::Length(1), // footer
+        ])
+        .split(inner);
+
+    let info = format!(
+        "share: {}\nby: {sharer}\n\nphase: {phase}\nchunks: {}/{total}\nbytes:  {}",
+        f.share_id, f.chunks_received, f.bytes_received,
+    );
+    frame.render_widget(
+        Paragraph::new(info)
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(color)),
+        rows[0],
+    );
+
+    // A real progress bar so the user sees movement, not just red→green
+    // (M15). Ratio by chunks once the manifest's total is known.
+    let ratio = match f.status {
+        FetchStatus::Complete => 1.0,
+        _ => match f.total_chunks {
+            Some(t) if t > 0 => (f.chunks_received as f64 / t as f64).clamp(0.0, 1.0),
+            _ => 0.0,
+        },
+    };
+    let gauge_label = match f.status {
+        FetchStatus::Complete => "done".to_owned(),
+        FetchStatus::Failed(_) => "failed".to_owned(),
+        _ if f.total_chunks.is_none() => "waiting for manifest…".to_owned(),
+        _ => format!(
+            "{}/{total} chunks · {}%",
+            f.chunks_received,
+            (ratio * 100.0) as u16
+        ),
+    };
+    frame.render_widget(
+        Gauge::default()
+            .block(Block::default().borders(Borders::ALL).title(" progress "))
+            .gauge_style(Style::default().fg(color))
+            .ratio(ratio)
+            .label(gauge_label),
+        rows[1],
+    );
+
+    frame.render_widget(
+        Paragraph::new(footer)
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(color)),
+        rows[2],
+    );
 }
 
 /// The Trust History view (ISC-25 / C28 LogOnly surface): every recorded trust
