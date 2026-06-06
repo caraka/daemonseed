@@ -521,6 +521,7 @@ dependencies = [
  "bip39",
  "daemonseed-cli",
  "daemonseed-core",
+ "daemonseed-isc",
  "daemonseed-proto",
  "daemonseed-server",
  "getrandom 0.3.4",
@@ -541,6 +542,10 @@ dependencies = [
  "uuid",
  "vt100",
 ]
+
+[[package]]
+name = "daemonseed-isc"
+version = "0.1.0"
 
 [[package]]
 name = "daemonseed-proto"
@@ -3182,6 +3187,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "daemonseed-isc",
  "tonic-build",
  "walkdir",
 ]

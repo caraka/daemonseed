@@ -1,0 +1,17 @@
+[package]
+name = "daemonseed-isc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "AGPL-3.0-or-later"
+publish = false
+description = "daemonseed ISC registry — the single source of truth for the ISC inventory (TOTAL) and the static covered count, read by both the integration tests and xtask"
+
+# Deliberately a LEAF crate with ZERO dependencies (std only). Both
+# `daemonseed-integration-tests` (heavy: pulls core + proto) and `xtask` (light)
+# depend on it, so it must not transitively pull anything — that is the whole
+# point of extracting the registry here: one TOTAL/COVERED, cheaply readable
+# from xtask without dragging in the full integration-tests dependency graph.
+[dependencies]

@@ -14,3 +14,6 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 tonic-build = { workspace = true }
 walkdir = { workspace = true }
+# The ISC registry leaf crate (zero deps) — single source of TOTAL / COVERED,
+# read live so xtask no longer carries a hand-maintained count mirror (M15 E).
+daemonseed-isc = { path = "../crates/daemonseed-isc" }
