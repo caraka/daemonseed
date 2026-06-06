@@ -131,6 +131,13 @@ pub enum MainFocus {
     /// [`MainFocus::JoinCircle`]; on success focus returns to the Shares view so
     /// the My-shares pane shows the new root indexing.
     DefineShare,
+    /// The Publish input box (D, M15): type a directory path (optionally
+    /// `path|name`), Enter validates it and queues a [`PublishRequest`] the
+    /// binary turns into a `NetCommand::PublishShare` — publishing the listing to
+    /// the connected relay and serving its content for as long as the session is
+    /// up ("you must be online to share"). Modelled on [`MainFocus::DefineShare`];
+    /// the Shares pane's `[u]` stops serving (unpublish).
+    Publish,
     /// The Hide box: type a full `name#hash` handle, Enter toggles it in the
     /// client-local hidden-shares set (ISC-18 / C16). The set never leaves
     /// this client (ISC-A-C3) — there is no wire field carrying it — and is
@@ -252,6 +259,17 @@ pub struct ShareDefineRequest {
     pub root: std::path::PathBuf,
     /// Optional human label for the share root; `None` falls back to the path.
     pub label: Option<String>,
+}
+
+/// A queued publish request the binary turns into a `NetCommand::PublishShare`
+/// (D, M15). Like [`ShareDefineRequest`] the App holds no key material — publish
+/// + serve run entirely on the net task off the directory `root`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishRequest {
+    /// The directory to publish + serve. Validated to exist at capture time.
+    pub root: std::path::PathBuf,
+    /// The share's advertised display name (defaults to the directory name).
+    pub name: String,
 }
 
 /// Active share-fetch state (ISC-19, F23 unified mechanism).
@@ -481,6 +499,19 @@ pub struct App {
     /// daemon re-indexes its remembered roots without re-typing. FIFO preserves
     /// definition order. Mirrors [`Self::pending_joins`] for circles.
     pending_share_defines: std::collections::VecDeque<ShareDefineRequest>,
+    /// The Publish input pane buffer (`path` or `path|name`) (D, M15).
+    publish_input: String,
+    /// Single-shot slot for an interactive publish request (D, M15); the binary
+    /// drains it via [`Self::take_pending_publish`] into `NetCommand::PublishShare`.
+    pending_publish: Option<PublishRequest>,
+    /// Single-shot slot for an unpublish (D, M15): the server-assigned share_id
+    /// to stop serving; drained into `NetCommand::UnpublishShare`.
+    pending_unpublish: Option<String>,
+    /// Shares currently published+served this session as `(share_id, name)` (D,
+    /// M15). Appended on `PublishStarted`, pruned on `PublishStopped`; drives the
+    /// Shares-pane `[u]` unpublish affordance. Serving is session-scoped — the
+    /// relay reaps these when the connection drops.
+    published: Vec<(String, String)>,
     /// Queued circle-rejoins to forward to the net actor, one per launch-time
     /// remembered circle (M13 persistence, ISC-C59). Filled on Unlock from
     /// `seeds.circles()` and drained one-per-tick by the same binary loop that
@@ -663,6 +694,10 @@ impl App {
             pending_join: None,
             pending_share_define: None,
             pending_share_defines: std::collections::VecDeque::new(),
+            publish_input: String::new(),
+            pending_publish: None,
+            pending_unpublish: None,
+            published: Vec::new(),
             pending_joins: std::collections::VecDeque::new(),
             pending_chat: None,
             pending_public_room: None,
@@ -776,6 +811,28 @@ impl App {
         self.pending_share_define
             .take()
             .or_else(|| self.pending_share_defines.pop_front())
+    }
+
+    /// The Publish input buffer, for rendering (D, M15).
+    pub fn publish_input(&self) -> &str {
+        &self.publish_input
+    }
+
+    /// Shares currently published+served this session as `(share_id, name)` (D, M15).
+    pub fn published(&self) -> &[(String, String)] {
+        &self.published
+    }
+
+    /// Drain a queued publish request (D, M15) — the binary turns it into a
+    /// `NetCommand::PublishShare`.
+    pub fn take_pending_publish(&mut self) -> Option<PublishRequest> {
+        self.pending_publish.take()
+    }
+
+    /// Drain a queued unpublish (D, M15) — the binary turns it into a
+    /// `NetCommand::UnpublishShare`.
+    pub fn take_pending_unpublish(&mut self) -> Option<String> {
+        self.pending_unpublish.take()
     }
 
     /// The current Define-Share input buffer, for rendering the box (M14).
@@ -1176,6 +1233,23 @@ impl App {
             // candidate list is left intact so a transient failure never blanks
             // the last-known discovery view (mirrors the deprecation precedent).
             NetEvent::IntroducerError { message } => self.status = Some(message),
+            // A share is now publishing + being served (D, M15). Track it for the
+            // unpublish affordance and confirm what's serving on the status line.
+            NetEvent::PublishStarted {
+                share_id,
+                name,
+                file_count,
+            } => {
+                self.published.push((share_id.clone(), name.clone()));
+                self.status = Some(format!(
+                    "sharing {name:?} as {share_id} ({file_count} file(s)) — [u] in Shares to stop"
+                ));
+            }
+            NetEvent::PublishError { message } => self.status = Some(message),
+            NetEvent::PublishStopped { share_id } => {
+                self.published.retain(|(id, _)| id != &share_id);
+                self.status = Some(format!("stopped sharing {share_id}"));
+            }
         }
     }
 
@@ -1581,7 +1655,8 @@ impl App {
                     MainFocus::JoinCircle => MainFocus::Mute,
                     MainFocus::Mute => MainFocus::Shares,
                     MainFocus::Shares => MainFocus::DefineShare,
-                    MainFocus::DefineShare => MainFocus::Hide,
+                    MainFocus::DefineShare => MainFocus::Publish,
+                    MainFocus::Publish => MainFocus::Hide,
                     MainFocus::Hide => MainFocus::Servers,
                     MainFocus::Servers => MainFocus::TrustHistory,
                     MainFocus::TrustHistory => MainFocus::PublicSpace,
@@ -1621,6 +1696,7 @@ impl App {
                 MainFocus::Mute => self.on_key_mute(key),
                 MainFocus::Shares => self.on_key_shares(key),
                 MainFocus::DefineShare => self.on_key_define_share(key),
+                MainFocus::Publish => self.on_key_publish(key),
                 MainFocus::Hide => self.on_key_hide(key),
                 MainFocus::Servers => self.on_key_servers(key),
                 MainFocus::TrustHistory => self.on_key_history(key),
@@ -1739,6 +1815,17 @@ impl App {
             }
             KeyCode::Char('r') | KeyCode::Char('R') => {
                 self.pending_share_refresh = true;
+            }
+            KeyCode::Char('u') | KeyCode::Char('U') => {
+                // Unpublish the most-recently published share (D, M15). Serving is
+                // session-scoped, so this is the in-session "stop sharing"; quit /
+                // disconnect reaps everything anyway. The binary forwards it as
+                // NetCommand::UnpublishShare; PublishStopped prunes `published`.
+                if let Some((share_id, _)) = self.published.last() {
+                    self.pending_unpublish = Some(share_id.clone());
+                } else {
+                    self.status = Some("nothing published to unpublish".to_owned());
+                }
             }
             KeyCode::Char('f') | KeyCode::Char('F') => {
                 // Snapshot the selected visible row and start a fetch. A
@@ -2080,6 +2167,44 @@ impl App {
                 // the background scan).
                 self.main_focus = MainFocus::Shares;
                 self.pending_share_refresh = true;
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle a key in the Publish box (D, M15). Mirrors
+    /// [`Self::on_key_define_share`]: printable chars build the buffer; Enter
+    /// parses `path` (or `path|name`), validates the directory exists, and queues
+    /// a [`PublishRequest`] the binary turns into a `NetCommand::PublishShare`.
+    /// The name defaults to the directory's own name; a non-existent path keeps
+    /// the buffer and shows a status so the user can fix it in place.
+    fn on_key_publish(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char(c) => self.publish_input.push(c),
+            KeyCode::Backspace => {
+                self.publish_input.pop();
+            }
+            KeyCode::Enter if !self.publish_input.trim().is_empty() => {
+                let (path_part, name) = match self.publish_input.split_once('|') {
+                    Some((p, n)) => (p.trim().to_owned(), n.trim().to_owned()),
+                    None => (self.publish_input.trim().to_owned(), String::new()),
+                };
+                let root = std::path::PathBuf::from(&path_part);
+                if !root.is_dir() {
+                    self.status = Some(format!("no such directory: {path_part}"));
+                    return;
+                }
+                let name = if name.is_empty() {
+                    root.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path_part.clone())
+                } else {
+                    name
+                };
+                self.publish_input.clear();
+                self.pending_publish = Some(PublishRequest { root, name });
+                self.status = Some("publishing…".to_owned());
+                self.main_focus = MainFocus::Shares;
             }
             _ => {}
         }
@@ -2474,6 +2599,8 @@ mod tests {
         app.on_key(press(KeyCode::Tab));
         assert_eq!(app.main_focus(), MainFocus::DefineShare);
         app.on_key(press(KeyCode::Tab));
+        assert_eq!(app.main_focus(), MainFocus::Publish);
+        app.on_key(press(KeyCode::Tab));
         assert_eq!(app.main_focus(), MainFocus::Hide);
         app.on_key(press(KeyCode::Tab));
         assert_eq!(app.main_focus(), MainFocus::Servers);
@@ -2543,6 +2670,133 @@ mod tests {
         assert_eq!(app.share_input(), bogus, "buffer kept to fix in place");
         assert_eq!(app.main_focus(), MainFocus::DefineShare, "stays on the box");
         assert!(app.status().is_some(), "a status explains the refusal");
+    }
+
+    // ── D (M15): TUI publish + serve + unpublish ─────────────────────────
+
+    /// A valid directory in the Publish box queues a [`PublishRequest`] and
+    /// returns focus to the Shares view. An explicit `|name` overrides the
+    /// directory-name default.
+    #[test]
+    fn publish_valid_dir_queues_request_and_returns_to_shares() {
+        let mut app = drive_to_main();
+        // Chat → JoinCircle → Mute → Shares → DefineShare → Publish
+        for _ in 0..5 {
+            app.on_key(press(KeyCode::Tab));
+        }
+        assert_eq!(app.main_focus(), MainFocus::Publish);
+
+        let dir = std::env::temp_dir();
+        let input = format!("{}|My Share", dir.display());
+        for ch in input.chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        app.on_key(press(KeyCode::Enter));
+
+        assert_eq!(app.main_focus(), MainFocus::Shares, "returns to Shares");
+        let req = app
+            .take_pending_publish()
+            .expect("a valid dir queues a publish request");
+        assert!(req.root.is_dir());
+        assert_eq!(req.name, "My Share");
+        assert!(app.publish_input().is_empty(), "buffer cleared on success");
+        assert!(
+            app.take_pending_publish().is_none(),
+            "request drained exactly once"
+        );
+    }
+
+    /// With no explicit `|name`, the advertised name defaults to the directory's
+    /// own name.
+    #[test]
+    fn publish_defaults_name_to_directory_name() {
+        let mut app = drive_to_main();
+        for _ in 0..5 {
+            app.on_key(press(KeyCode::Tab));
+        }
+        let dir = std::env::temp_dir();
+        for ch in dir.display().to_string().chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        app.on_key(press(KeyCode::Enter));
+        let req = app.take_pending_publish().expect("queued");
+        let expected = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| dir.display().to_string());
+        assert_eq!(req.name, expected);
+    }
+
+    /// A non-existent directory is rejected: nothing queued, buffer kept, focus
+    /// stays on the box, a status explains.
+    #[test]
+    fn publish_rejects_nonexistent_dir_and_keeps_buffer() {
+        let mut app = drive_to_main();
+        for _ in 0..5 {
+            app.on_key(press(KeyCode::Tab));
+        }
+        let bogus = "/nonexistent/xyzzy-daemonseed-m15";
+        for ch in bogus.chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        app.on_key(press(KeyCode::Enter));
+        assert!(
+            app.take_pending_publish().is_none(),
+            "bad path queues nothing"
+        );
+        assert_eq!(app.publish_input(), bogus, "buffer kept to fix in place");
+        assert_eq!(app.main_focus(), MainFocus::Publish, "stays on the box");
+        assert!(app.status().is_some(), "a status explains the refusal");
+    }
+
+    /// `PublishStarted` tracks the share; `[u]` in the Shares pane queues the
+    /// unpublish; `PublishStopped` prunes it from the served list.
+    #[test]
+    fn publish_lifecycle_tracks_and_unpublish_queues() {
+        let mut app = drive_to_main();
+        app.on_net_event(NetEvent::PublishStarted {
+            share_id: "deadbeef".to_owned(),
+            name: "My Share".to_owned(),
+            file_count: 3,
+        });
+        assert_eq!(app.published().len(), 1);
+        assert_eq!(app.published()[0].0, "deadbeef");
+
+        // Focus the Shares pane (Chat → JoinCircle → Mute → Shares) and press [u].
+        for _ in 0..3 {
+            app.on_key(press(KeyCode::Tab));
+        }
+        assert_eq!(app.main_focus(), MainFocus::Shares);
+        app.on_key(press(KeyCode::Char('u')));
+        assert_eq!(
+            app.take_pending_unpublish().as_deref(),
+            Some("deadbeef"),
+            "[u] queues an unpublish for the published share"
+        );
+
+        app.on_net_event(NetEvent::PublishStopped {
+            share_id: "deadbeef".to_owned(),
+        });
+        assert!(
+            app.published().is_empty(),
+            "PublishStopped prunes the share"
+        );
+    }
+
+    /// `[u]` with nothing published is a no-op that sets an explanatory status.
+    #[test]
+    fn unpublish_with_nothing_published_is_a_noop() {
+        let mut app = drive_to_main();
+        for _ in 0..3 {
+            app.on_key(press(KeyCode::Tab));
+        }
+        assert_eq!(app.main_focus(), MainFocus::Shares);
+        app.on_key(press(KeyCode::Char('u')));
+        assert!(
+            app.take_pending_unpublish().is_none(),
+            "nothing to unpublish"
+        );
+        assert!(app.status().is_some());
     }
 
     // ── C28 trust-event affordance routing (ISC-22..25 / 28) ─────────────
@@ -2656,6 +2910,7 @@ mod tests {
         app.on_key(press(KeyCode::Tab)); // → Mute
         app.on_key(press(KeyCode::Tab)); // → Shares
         app.on_key(press(KeyCode::Tab)); // → DefineShare
+        app.on_key(press(KeyCode::Tab)); // → Publish
         app.on_key(press(KeyCode::Tab)); // → Hide
         app.on_key(press(KeyCode::Tab)); // → Servers
         app.on_key(press(KeyCode::Tab)); // → TrustHistory
@@ -2729,8 +2984,8 @@ mod tests {
             key: TrustEventKey::ServerSourceUnverified,
             server_id: Some("relay#aabbccddeeff".to_owned()),
         });
-        // Tab to the Trust History view (7 hops past Chat → … → TrustHistory).
-        for _ in 0..7 {
+        // Tab to the Trust History view (8 hops past Chat → … → TrustHistory).
+        for _ in 0..8 {
             app.on_key(press(KeyCode::Tab));
         }
         assert_eq!(app.main_focus(), MainFocus::TrustHistory);
@@ -3476,8 +3731,8 @@ mod tests {
             .profile_config
             .profile_id;
 
-        // Tab Chat → JoinCircle → Mute → Shares → DefineShare → Hide.
-        for _ in 0..5 {
+        // Tab Chat → JoinCircle → Mute → Shares → DefineShare → Publish → Hide.
+        for _ in 0..6 {
             app.on_key(press(KeyCode::Tab));
         }
         assert_eq!(app.main_focus(), MainFocus::Hide);
@@ -3874,6 +4129,7 @@ mod tests {
         app.on_key(press(KeyCode::Tab)); // → Mute
         app.on_key(press(KeyCode::Tab)); // → Shares
         app.on_key(press(KeyCode::Tab)); // → DefineShare
+        app.on_key(press(KeyCode::Tab)); // → Publish
         app.on_key(press(KeyCode::Tab)); // → Hide
         app.on_key(press(KeyCode::Tab)); // → Servers
         assert_eq!(app.main_focus(), MainFocus::Servers);
@@ -4203,6 +4459,7 @@ mod tests {
 
         // Move to the Hide box and toggle alice's handle into the hide set.
         app.on_key(press(KeyCode::Tab)); // → DefineShare
+        app.on_key(press(KeyCode::Tab)); // → Publish
         app.on_key(press(KeyCode::Tab)); // → Hide
         assert_eq!(app.main_focus(), MainFocus::Hide);
         for ch in "alice#aabbccddeeff".chars() {
@@ -4229,6 +4486,7 @@ mod tests {
         let mut app = drive_to_main();
         to_shares(&mut app);
         app.on_key(press(KeyCode::Tab)); // → DefineShare
+        app.on_key(press(KeyCode::Tab)); // → Publish
         app.on_key(press(KeyCode::Tab)); // → Hide
         for ch in "alice#aabbccddeeff".chars() {
             app.on_key(press(KeyCode::Char(ch)));
@@ -4250,6 +4508,7 @@ mod tests {
         let mut app = drive_to_main();
         to_shares(&mut app);
         app.on_key(press(KeyCode::Tab)); // → DefineShare
+        app.on_key(press(KeyCode::Tab)); // → Publish
         app.on_key(press(KeyCode::Tab)); // → Hide
         for ch in "garbage\nmore".chars() {
             app.on_key(press(KeyCode::Char(ch)));
@@ -4279,6 +4538,11 @@ mod tests {
         assert!(
             !app.take_pending_share_refresh(),
             "DefineShare is an input box, not a shares view — no refresh"
+        );
+        app.on_key(press(KeyCode::Tab)); // → Publish (input box, no refresh)
+        assert!(
+            !app.take_pending_share_refresh(),
+            "Publish is an input box, not a shares view — no refresh"
         );
         app.on_key(press(KeyCode::Tab)); // → Hide
         assert!(
@@ -4523,6 +4787,7 @@ mod tests {
         assert_eq!(app.share_sel(), 1);
         // Hide bob — the visible subset shrinks to 1, so the sel must clamp.
         app.on_key(press(KeyCode::Tab)); // → DefineShare
+        app.on_key(press(KeyCode::Tab)); // → Publish
         app.on_key(press(KeyCode::Tab)); // → Hide
         for ch in "bob#001122334455".chars() {
             app.on_key(press(KeyCode::Char(ch)));
@@ -4533,9 +4798,9 @@ mod tests {
 
     // ── Public Space pane (ISC-25 / ISC-S7 / ISC-A-S3) ─────────────────────
 
-    /// Navigate to the Public Space view via the Tab cycle (7 hops from Chat).
+    /// Navigate to the Public Space view via the Tab cycle (9 hops from Chat).
     fn to_public_space(app: &mut App) {
-        for _ in 0..8 {
+        for _ in 0..9 {
             app.on_key(press(KeyCode::Tab));
         }
         assert_eq!(app.main_focus(), MainFocus::PublicSpace);
@@ -4647,9 +4912,9 @@ mod tests {
 
     // ── Deprecation pane (ISC-C25 / ISC-A-S11 / ISC-C28) ───────────────────
 
-    /// Navigate to the Deprecation view via the Tab cycle (8 hops from Chat).
+    /// Navigate to the Deprecation view via the Tab cycle (10 hops from Chat).
     fn to_deprecation(app: &mut App) {
-        for _ in 0..9 {
+        for _ in 0..10 {
             app.on_key(press(KeyCode::Tab));
         }
         assert_eq!(app.main_focus(), MainFocus::Deprecation);

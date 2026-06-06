@@ -183,6 +183,18 @@ fn run(
                 sharer_handle,
             });
         }
+        // D, M15: a Publish request → publish the listing + serve the directory's
+        // content for the life of the session. The actor checks for a live session
+        // and emits PublishError if absent, so forward unconditionally.
+        if let Some(req) = app.take_pending_publish() {
+            let _ = net.send(NetCommand::PublishShare {
+                root: req.root,
+                name: req.name,
+            });
+        }
+        if let Some(share_id) = app.take_pending_unpublish() {
+            let _ = net.send(NetCommand::UnpublishShare { share_id });
+        }
 
         // Item D / ISC-C49/C50: persist the at-rest blob + `.dseed` to the
         // profile root once first-start completes. The no-clobber guard
