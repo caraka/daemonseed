@@ -53,6 +53,7 @@ use daemonseed_core::public_room::{
 use daemonseed_core::share_envelope::ShareFrame;
 use daemonseed_core::share_serve::ShareContent;
 use daemonseed_core::storage::cas::chunk_addr;
+use daemonseed_core::storage::fetched::{FetchedShare, FetchedStore, VerifiedFile};
 use daemonseed_core::storage::seeds::{CounterState, IndexKey};
 use daemonseed_core::storage::share_index::ShareIndex;
 use daemonseed_core::trust_events::{TrustEventKey, assess_deprecation, unreadable_policy_event};
@@ -141,9 +142,30 @@ pub enum NetCommand {
     /// is advisory — included so subsequent UX layers (post-MVP `f`-keyed
     /// trust-on-sharer affordances) can route per-sharer events; the relay
     /// never sees the value (it lives in the recipient's local state only).
+    /// `name` is the sharer-advertised listing name, recorded in the fetched
+    /// manifest. `fetched_root` is the on-disk landing zone (the binary supplies
+    /// `<profile-root>/fetched`); on a fully-verified fetch the actor persists
+    /// every file there via [`FetchedStore`] and emits a fresh
+    /// [`NetEvent::FetchedShares`] (M15 C; ISC-C63 / C64). A fetch that fails
+    /// verification never persists (ISC-A-C31).
     FetchShare {
         share_id: String,
         sharer_handle: String,
+        name: String,
+        fetched_root: PathBuf,
+    },
+    /// List the fetched shares recorded under `fetched_root` for the browse
+    /// pane (M15 C; ISC-C64). Emits a [`NetEvent::FetchedShares`] snapshot
+    /// (empty if nothing has been fetched).
+    ListFetched { fetched_root: PathBuf },
+    /// Extract a previously-fetched share's files from the CAS under
+    /// `fetched_root` into `dest`, reconstructing the rel_path tree (M15 C;
+    /// ISC-C65). Path-traversal-safe (ISC-A-C32). Emits
+    /// [`NetEvent::ExtractComplete`] or [`NetEvent::ExtractError`].
+    ExtractShare {
+        fetched_root: PathBuf,
+        share_id: String,
+        dest: PathBuf,
     },
     /// Refresh the introducer-discovered candidate peers for the Servers pane
     /// (M12 gate step 6, ISC-C22 / ISC-S6 / ISC-A-C19). Ask the connected
@@ -348,6 +370,19 @@ pub enum NetEvent {
     /// can dedupe by chunk_addr). The overlay marks the fetch failed and
     /// waits for the user to dismiss.
     FetchError { message: String },
+    /// A fresh snapshot of the fetched shares recorded on disk (M15 C;
+    /// ISC-C64). Emitted after a successful fetch persists, and in response to
+    /// `NetCommand::ListFetched`. Replaces the browse pane's list wholesale.
+    FetchedShares { shares: Vec<FetchedShare> },
+    /// A fetched share was extracted to disk (M15 C; ISC-C65). `files` is how
+    /// many files were reconstructed under `dest`.
+    ExtractComplete {
+        share_id: String,
+        dest: PathBuf,
+        files: u32,
+    },
+    /// An extract failed (unknown share, missing chunk, unsafe path, or I/O).
+    ExtractError { message: String },
     /// A fresh introducer-discovery snapshot for the Servers pane (M12 gate
     /// step 6, ISC-C22 / ISC-S6 / ISC-A-C19). `candidates` is the full current
     /// set of introducer-learned peers that are NOT already in the active trust
@@ -593,7 +628,19 @@ async fn net_actor(
             NetCommand::FetchShare {
                 share_id,
                 sharer_handle,
-            } => actor.handle_fetch_share(&share_id, &sharer_handle).await,
+                name,
+                fetched_root,
+            } => {
+                actor
+                    .handle_fetch_share(&share_id, &sharer_handle, &name, fetched_root)
+                    .await
+            }
+            NetCommand::ListFetched { fetched_root } => actor.handle_list_fetched(fetched_root),
+            NetCommand::ExtractShare {
+                fetched_root,
+                share_id,
+                dest,
+            } => actor.handle_extract_share(fetched_root, &share_id, dest),
             NetCommand::RefreshIntroducer => actor.handle_refresh_introducer().await,
             NetCommand::PublishShare { root, name } => actor.handle_publish_share(root, name).await,
             NetCommand::UnpublishShare { share_id } => {
@@ -1387,7 +1434,13 @@ impl Actor {
     /// This is the file-side analog of the chat envelope's `open_message`
     /// fail-closed posture — a corrupt relay or hostile sharer cannot deliver
     /// falsified content to a verifying fetcher.
-    async fn handle_fetch_share(&mut self, share_id: &str, _sharer_handle: &str) {
+    async fn handle_fetch_share(
+        &mut self,
+        share_id: &str,
+        _sharer_handle: &str,
+        name: &str,
+        fetched_root: PathBuf,
+    ) {
         // Pre-flight: live session + known relay are mandatory.
         let Some(session) = self.session.as_ref() else {
             return self.emit(NetEvent::FetchError {
@@ -1488,6 +1541,10 @@ impl Actor {
         // sequential (pipelining is a post-MVP optimisation).
         let mut chunks_received: u32 = 0;
         let mut bytes_received: u64 = 0;
+        // Accumulate each file's verified plaintext bytes; persisted to the
+        // on-disk fetched store only after the whole fetch verifies (ISC-A-C31
+        // — a fetch that fails mid-stream returns early and persists nothing).
+        let mut fetched_files: Vec<VerifiedFile> = Vec::with_capacity(manifest.len());
         for entry in &manifest {
             let request = ShareFrame::ChunkRequest {
                 chunk_addr: entry.chunk_addr,
@@ -1549,15 +1606,17 @@ impl Actor {
                 });
             }
 
-            // The M11 alpha keeps the local sink in-memory: each verified
-            // chunk's bytes are dropped after accounting. A persistent
-            // [`crate::storage::cas`]-backed sink is the next layer (the
-            // M11.5 fetch-persistence workstream wires it in via a
-            // `Box<dyn ChunkStore>` injected at actor construction). The
-            // verification gate above is the load-bearing security
-            // contract for ISC-19; persistence is bookkeeping above it.
+            // The verified bytes are accumulated for persistence below; the
+            // verification gate above (ISC-S28 / ISC-A-S20) is the load-bearing
+            // security contract, persistence is bookkeeping above it. Bytes
+            // are kept in RAM until the whole fetch verifies, then written
+            // once as an explicit download (M15 C; ISC-C63).
             chunks_received += 1;
             bytes_received += chunk_data.1.len() as u64;
+            fetched_files.push(VerifiedFile {
+                rel_path: entry.rel_path.clone(),
+                bytes: chunk_data.1,
+            });
             self.emit(NetEvent::FetchProgress {
                 total_chunks: Some(total_chunks),
                 chunks_received,
@@ -1565,14 +1624,65 @@ impl Actor {
             });
         }
 
+        // Close the subscribe stream first — the network half of the fetch is
+        // done and the relay can reap once both stream halves are gone
+        // (refcount → 0); persistence is a local-disk step that needs no
+        // connection.
+        drop(out_tx);
+
+        // Persist the fully-verified download (M15 C; ISC-C63 / C64). Only a
+        // fetch that verified every chunk reaches here, so a poisoned or
+        // truncated download is never recorded (ISC-A-C31). A persistence
+        // failure surfaces as a fetch error — the user must not believe a
+        // download landed when it did not.
+        match FetchedStore::open(&fetched_root)
+            .and_then(|mut store| store.record_share(share_id, name, &fetched_files))
+        {
+            Ok(_) => {}
+            Err(e) => {
+                return self.emit(NetEvent::FetchError {
+                    message: format!("verified but could not save download: {e}"),
+                });
+            }
+        }
+
         self.emit(NetEvent::FetchComplete {
             share_id: share_id.to_owned(),
             files_written: chunks_received,
             bytes_written: bytes_received,
         });
-        // Close the subscribe stream by dropping the sender; the relay reaps
-        // when both halves of this Subscribe stream are gone (refcount → 0).
-        drop(out_tx);
+        // Refresh the browse pane with the newly-persisted download.
+        self.handle_list_fetched(fetched_root);
+    }
+
+    /// List the fetched shares recorded under `fetched_root` and emit them as a
+    /// [`NetEvent::FetchedShares`] snapshot for the browse pane (M15 C;
+    /// ISC-C64). A transient/corrupt read leaves the pane's last-known list in
+    /// place (no event), mirroring the introducer-refresh precedent.
+    fn handle_list_fetched(&self, fetched_root: PathBuf) {
+        match FetchedStore::open(&fetched_root).and_then(|s| s.list_shares()) {
+            Ok(shares) => self.emit(NetEvent::FetchedShares { shares }),
+            Err(_e) => {}
+        }
+    }
+
+    /// Extract a fetched share's files from the CAS under `fetched_root` into
+    /// `dest`, reconstructing the rel_path tree (M15 C; ISC-C65). Path-traversal
+    /// safe (ISC-A-C32, enforced in [`FetchedStore::extract_share`]). Emits
+    /// [`NetEvent::ExtractComplete`] or [`NetEvent::ExtractError`].
+    fn handle_extract_share(&self, fetched_root: PathBuf, share_id: &str, dest: PathBuf) {
+        match FetchedStore::open(&fetched_root)
+            .and_then(|store| store.extract_share(share_id, &dest))
+        {
+            Ok(files) => self.emit(NetEvent::ExtractComplete {
+                share_id: share_id.to_owned(),
+                dest,
+                files,
+            }),
+            Err(e) => self.emit(NetEvent::ExtractError {
+                message: format!("extract failed: {e}"),
+            }),
+        }
     }
 
     /// Seal a chat message under the *active* circle's key and publish it
