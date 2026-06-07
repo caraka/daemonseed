@@ -267,6 +267,7 @@ Each criterion is a verifiable boundary: positive ISCs describe a durable end-st
 - [ ] ISC-C64: The client surfaces a read-only Downloads browse view listing every persisted download (ISC-C63) — name, file count, total size, the download folder (`downloads/<folder>/`), and the selected download's files (real names + sizes) — refreshed from disk when the view opens. The list reflects exactly what is recorded on disk.
 - [ ] ISC-C65: A fetched download's files are reconstructed at fetch time under their original names, mirroring the share's `rel_path` tree byte-for-byte, in the per-share download folder (ISC-C63) — so the files are usable immediately with no manual extract step. Two shares with the same name land in distinct folders (the second collision-suffixed by `share_id`), so downloads never mingle.
 - [x] ISC-C66: A share fetch is a two-step, user-gated flow (A1 manifest preview). On `f` the client requests only the share's manifest and surfaces it for review — the file list (real `rel_path`s + per-file sizes), file count, and total size — in the fetch overlay's Preview state; no chunk is requested or written. The download proceeds only on explicit confirmation (`Enter`), and `Esc` cancels with nothing downloaded. The net actor splits accordingly: `FetchShare` opens the stream, reads the manifest, emits `NetEvent::FetchManifest`, then closes the stream; the user's confirmation drives a separate `NetCommand::ConfirmFetch` (`Actor::handle_confirm_fetch`) that re-opens and pulls. Re-opening on confirm — rather than parking the live stream during think-time — keeps the actor stateless and never pins a relay subscription (see Decisions).
+- [x] ISC-C67: The manifest preview (ISC-C66) supports selective fetch. Each file is individually selectable (default all-selected so a bare confirm still downloads everything), navigated with `↑`/`↓`, toggled with `space`, and `a` toggles all. On confirm only the selected files' chunks are requested: an all-selected confirm passes the whole manifest (`ConfirmFetch.selected = None`), a subset passes the chosen manifest-row indices (`Some(indices)`), and an empty selection is a no-op (the overlay stays in preview). `handle_confirm_fetch` requests exactly the `selected` rows — one `ChunkRequest` per chosen file, none for the rest.
 
 ### Client — anti-criteria (ISC-A-C*)
 
@@ -634,6 +635,15 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   `preview_enter_queues_confirm_all`, `preview_esc_cancels_without_download` — plus the unchanged fetch
   suite. fmt + clippy `-D warnings` clean; full-workspace `cargo test` 0-fail (tui 156). Live 2-daemon
   preview→confirm probe is a tracked follow-up. Probe: `cargo test -p daemonseed-tui`.
+- ISC-C67 (A2 selective fetch) verified 2026-06-07: per-file selection (`FetchUi::preview_checked`
+  parallel to the manifest, default all-true) + cursor (`preview_cursor`); `↑`/`↓` move, `space` toggles
+  the cursor row, `a` toggles all (`on_key_fetch_overlay`); `Enter` collects the checked indices and
+  passes `ConfirmFetch.selected` (`None` when all are selected = confirm-all, `Some(indices)` for a subset,
+  ignored when empty). `ui` renders a `[x]`/`[ ]` checkbox per row with a `>` cursor and a selected
+  count/size header; `net::handle_confirm_fetch` requests only the `selected` rows. 3 new `daemonseed-tui`
+  tests — `preview_space_deselects_and_enter_queues_subset` (drops file 0 → `Some([1,2])`),
+  `preview_select_none_then_enter_is_ignored`, `preview_down_moves_and_clamps_cursor`. fmt + clippy clean;
+  tui 159 / 0-fail. Probe: `cargo test -p daemonseed-tui`.
 - M12 steps 5 & 6 verified 2026-06-03: the PTY/subprocess gate now runs **10 tests and passes 10/10**.
   Step 5 (user-publish file sharing) — `cli_published_share_is_cross_client_visible_then_reaped`: a held
   `daemonseed-cli publish docs` connection is seen by a *separate* ephemeral client via `ListPublicShares`

@@ -177,7 +177,9 @@ fn render_fetch_overlay(f: &FetchUi, frame: &mut Frame, area: Rect) {
     };
     let footer = match f.status {
         FetchStatus::Complete | FetchStatus::Failed(_) => "[Enter] dismiss   [Esc] dismiss",
-        FetchStatus::Preview(_) => "[Enter] download   [Esc] cancel",
+        FetchStatus::Preview(_) => {
+            "[↑/↓] move  [space] toggle  [a] all  [Enter] download  [Esc] cancel"
+        }
         _ => "[Esc] cancel",
     };
 
@@ -203,14 +205,30 @@ fn render_fetch_overlay(f: &FetchUi, frame: &mut Frame, area: Rect) {
         // sees exactly what a download would pull before committing.
         FetchStatus::Preview(entries) => {
             let total_bytes: u64 = entries.iter().map(|e| e.size).sum();
+            let sel_count = f.preview_checked.iter().filter(|&&c| c).count();
+            let sel_bytes: u64 = entries
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| f.preview_checked.get(*i).copied().unwrap_or(false))
+                .map(|(_, e)| e.size)
+                .sum();
             let mut s = format!(
-                "share: {}\nby: {sharer}\n\n{} file(s) · {} total\n\n",
+                "share: {}\nby: {sharer}\n\n{sel_count}/{} selected · {} of {}\n\n",
                 f.share_id,
                 entries.len(),
+                human_bytes(sel_bytes),
                 human_bytes(total_bytes),
             );
-            for e in entries {
-                s.push_str(&format!("  {}  ({})\n", e.rel_path, human_bytes(e.size)));
+            // A2: each row shows a checkbox; `>` marks the cursor.
+            for (i, e) in entries.iter().enumerate() {
+                let checked = f.preview_checked.get(i).copied().unwrap_or(true);
+                let mark = if checked { "[x]" } else { "[ ]" };
+                let cursor = if i == f.preview_cursor { ">" } else { " " };
+                s.push_str(&format!(
+                    "{cursor}{mark} {}  ({})\n",
+                    e.rel_path,
+                    human_bytes(e.size)
+                ));
             }
             s
         }
@@ -238,7 +256,10 @@ fn render_fetch_overlay(f: &FetchUi, frame: &mut Frame, area: Rect) {
     let gauge_label = match &f.status {
         FetchStatus::Complete => "done".to_owned(),
         FetchStatus::Failed(_) => "failed".to_owned(),
-        FetchStatus::Preview(entries) => format!("{} file(s) ready — press Enter", entries.len()),
+        FetchStatus::Preview(entries) => {
+            let sel = f.preview_checked.iter().filter(|&&c| c).count();
+            format!("{sel}/{} selected — Enter to download", entries.len())
+        }
         _ if f.total_chunks.is_none() => "waiting for manifest…".to_owned(),
         _ => format!(
             "{}/{total} chunks · {}%",

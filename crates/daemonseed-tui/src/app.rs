@@ -303,6 +303,14 @@ pub struct FetchUi {
     pub chunks_received: u32,
     /// Bytes successfully written to local CAS so far (advisory progress).
     pub bytes_received: u64,
+    /// A2 selective fetch: per-manifest-entry selection, parallel to the
+    /// `Preview(entries)` list. Defaulted all-`true` when the manifest arrives
+    /// (Enter-without-toggling downloads everything = the A1 behavior). Only
+    /// meaningful while `status` is `Preview`.
+    pub preview_checked: Vec<bool>,
+    /// A2: the highlighted row in the preview list (`↑`/`↓`); index into
+    /// `preview_checked` / the `Preview` entries. Only meaningful in `Preview`.
+    pub preview_cursor: usize,
 }
 
 /// Phase of an active [`FetchUi`].
@@ -1241,6 +1249,10 @@ impl App {
                 if let Some(f) = self.fetch.as_mut()
                     && f.share_id == share_id
                 {
+                    // A2: default every file selected (Enter without toggling
+                    // downloads all = the A1 behavior); cursor at the top.
+                    f.preview_checked = vec![true; entries.len()];
+                    f.preview_cursor = 0;
                     f.status = FetchStatus::Preview(entries);
                 }
             }
@@ -1945,6 +1957,8 @@ impl App {
                         total_chunks: None,
                         chunks_received: 0,
                         bytes_received: 0,
+                        preview_checked: Vec::new(),
+                        preview_cursor: 0,
                     });
                     self.pending_share_fetch = Some((share_id, sharer_handle, name));
                 }
@@ -1953,14 +1967,16 @@ impl App {
         }
     }
 
-    /// Fetch-overlay key handling (ISC-19). The overlay captures input while
-    /// the fetch is active. In `Preview` (A1): `Enter` accepts the manifest and
-    /// queues the download (all files), `Esc` cancels without downloading. On a
-    /// terminal state (Complete/Failed): either key dismisses. While chunks are
-    /// flowing: `Esc` aborts (marks Failed). Other keys are absorbed so they
-    /// cannot accidentally drive the background view.
+    /// Fetch-overlay key handling (ISC-19 / C66 / C67). The overlay captures
+    /// input while the fetch is active. In `Preview`: `↑`/`↓` move the cursor,
+    /// `space` toggles the cursor file, `a` toggles all (A2 selective fetch),
+    /// `Enter` downloads the selected files, `Esc` cancels without downloading.
+    /// On a terminal state (Complete/Failed): either key dismisses. While chunks
+    /// flow: `Esc` aborts (marks Failed). Other keys are absorbed so they cannot
+    /// accidentally drive the background view.
     fn on_key_fetch_overlay(&mut self, key: KeyEvent) {
         let Some(f) = self.fetch.as_ref() else { return };
+        let in_preview = matches!(f.status, FetchStatus::Preview(_));
         match key.code {
             KeyCode::Esc => {
                 // Preview-cancel and terminal-dismiss both just close the
@@ -1977,29 +1993,72 @@ impl App {
                     f.status = FetchStatus::Failed("cancelled by user".to_owned());
                 }
             }
+            // A2 selective-fetch navigation (only meaningful in Preview).
+            KeyCode::Up | KeyCode::Down if in_preview => {
+                if let Some(f) = self.fetch.as_mut() {
+                    let len = f.preview_checked.len();
+                    match key.code {
+                        KeyCode::Up => f.preview_cursor = f.preview_cursor.saturating_sub(1),
+                        KeyCode::Down if f.preview_cursor + 1 < len => f.preview_cursor += 1,
+                        _ => {}
+                    }
+                }
+            }
+            KeyCode::Char(' ') if in_preview => {
+                if let Some(f) = self.fetch.as_mut() {
+                    let cur = f.preview_cursor;
+                    if let Some(c) = f.preview_checked.get_mut(cur) {
+                        *c = !*c;
+                    }
+                }
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') if in_preview => {
+                if let Some(f) = self.fetch.as_mut() {
+                    // Toggle all: if everything is currently selected, clear;
+                    // otherwise select everything.
+                    let all = !f.preview_checked.is_empty() && f.preview_checked.iter().all(|&c| c);
+                    for c in f.preview_checked.iter_mut() {
+                        *c = !all;
+                    }
+                }
+            }
             KeyCode::Enter => {
                 // Decide with an immutable read, then apply. `Enter` in Preview
-                // accepts the manifest → queue ConfirmFetch (all files = None);
-                // on a terminal overlay it dismisses.
+                // confirms the selected files (an all-selected set passes `None`
+                // = confirm-all; a subset passes `Some(indices)`; an empty set
+                // is ignored). On a terminal overlay it dismisses.
                 let confirm = match &f.status {
-                    FetchStatus::Preview(entries) => Some((
-                        f.share_id.clone(),
-                        f.sharer_handle.clone(),
-                        f.name.clone(),
-                        entries.len() as u32,
-                    )),
+                    FetchStatus::Preview(entries) => {
+                        let selected: Vec<usize> = f
+                            .preview_checked
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, &c)| c.then_some(i))
+                            .collect();
+                        if selected.is_empty() {
+                            None
+                        } else {
+                            let all = selected.len() == entries.len();
+                            Some((
+                                f.share_id.clone(),
+                                f.sharer_handle.clone(),
+                                f.name.clone(),
+                                selected.len() as u32,
+                                if all { None } else { Some(selected) },
+                            ))
+                        }
+                    }
                     _ => None,
                 };
                 let dismiss = matches!(f.status, FetchStatus::Complete | FetchStatus::Failed(_));
-                if let Some((share_id, sharer_handle, name, total)) = confirm {
+                if let Some((share_id, sharer_handle, name, total, selection)) = confirm {
                     if let Some(f) = self.fetch.as_mut() {
                         f.total_chunks = Some(total);
                         f.chunks_received = 0;
                         f.bytes_received = 0;
                         f.status = FetchStatus::Receiving;
                     }
-                    // A1 confirm-all: `None` selection downloads every file.
-                    self.pending_fetch_confirm = Some((share_id, sharer_handle, name, None));
+                    self.pending_fetch_confirm = Some((share_id, sharer_handle, name, selection));
                 } else if dismiss {
                     self.fetch = None;
                 }
@@ -4825,10 +4884,7 @@ mod tests {
                 size: 1,
             }],
         });
-        assert_eq!(
-            app.fetch().unwrap().status,
-            FetchStatus::RequestingManifest
-        );
+        assert_eq!(app.fetch().unwrap().status, FetchStatus::RequestingManifest);
     }
 
     /// A1: Enter on the preview queues ConfirmFetch with a `None` selection
@@ -4893,6 +4949,106 @@ mod tests {
         app.on_key(press(KeyCode::Esc));
         assert!(app.fetch().is_none());
         assert!(app.take_pending_fetch_confirm().is_none());
+    }
+
+    /// A2: space deselects the cursor file; Enter then downloads only the
+    /// remaining selection (`Some(indices)`, not confirm-all).
+    #[test]
+    fn preview_space_deselects_and_enter_queues_subset() {
+        let mut app = drive_to_main();
+        to_shares(&mut app);
+        app.on_net_event(NetEvent::SharesSnapshot {
+            local: Vec::new(),
+            remote: vec![listing("s1", "notes", "", "alice#aabbccddeeff")],
+            indexer_status: IndexerStatus::Idle,
+        });
+        let _ = app.take_pending_share_fetch();
+        app.on_key(press(KeyCode::Char('f')));
+        app.on_net_event(NetEvent::FetchManifest {
+            share_id: "s1".to_owned(),
+            name: "notes".to_owned(),
+            entries: vec![
+                ShareManifestEntry {
+                    rel_path: "a".to_owned(),
+                    size: 1,
+                },
+                ShareManifestEntry {
+                    rel_path: "b".to_owned(),
+                    size: 2,
+                },
+                ShareManifestEntry {
+                    rel_path: "c".to_owned(),
+                    size: 3,
+                },
+            ],
+        });
+        app.on_key(press(KeyCode::Char(' '))); // deselect file 0 (cursor at top)
+        app.on_key(press(KeyCode::Enter));
+        let queued = app.take_pending_fetch_confirm().expect("confirm queued");
+        assert_eq!(queued.3, Some(vec![1, 2]));
+        assert_eq!(app.fetch().unwrap().total_chunks, Some(2));
+    }
+
+    /// A2: `a` toggles all — from the all-selected default that clears the set,
+    /// and Enter on an empty selection is ignored (overlay stays in Preview).
+    #[test]
+    fn preview_select_none_then_enter_is_ignored() {
+        let mut app = drive_to_main();
+        to_shares(&mut app);
+        app.on_net_event(NetEvent::SharesSnapshot {
+            local: Vec::new(),
+            remote: vec![listing("s1", "notes", "", "alice#aabbccddeeff")],
+            indexer_status: IndexerStatus::Idle,
+        });
+        let _ = app.take_pending_share_fetch();
+        app.on_key(press(KeyCode::Char('f')));
+        app.on_net_event(NetEvent::FetchManifest {
+            share_id: "s1".to_owned(),
+            name: "notes".to_owned(),
+            entries: vec![ShareManifestEntry {
+                rel_path: "a".to_owned(),
+                size: 1,
+            }],
+        });
+        app.on_key(press(KeyCode::Char('a'))); // all -> none
+        app.on_key(press(KeyCode::Enter));
+        assert!(app.take_pending_fetch_confirm().is_none());
+        assert!(matches!(
+            app.fetch().unwrap().status,
+            FetchStatus::Preview(_)
+        ));
+    }
+
+    /// A2: ↓ moves the preview cursor and clamps at the last row.
+    #[test]
+    fn preview_down_moves_and_clamps_cursor() {
+        let mut app = drive_to_main();
+        to_shares(&mut app);
+        app.on_net_event(NetEvent::SharesSnapshot {
+            local: Vec::new(),
+            remote: vec![listing("s1", "notes", "", "alice#aabbccddeeff")],
+            indexer_status: IndexerStatus::Idle,
+        });
+        let _ = app.take_pending_share_fetch();
+        app.on_key(press(KeyCode::Char('f')));
+        app.on_net_event(NetEvent::FetchManifest {
+            share_id: "s1".to_owned(),
+            name: "notes".to_owned(),
+            entries: vec![
+                ShareManifestEntry {
+                    rel_path: "a".to_owned(),
+                    size: 1,
+                },
+                ShareManifestEntry {
+                    rel_path: "b".to_owned(),
+                    size: 2,
+                },
+            ],
+        });
+        app.on_key(press(KeyCode::Down));
+        assert_eq!(app.fetch().unwrap().preview_cursor, 1);
+        app.on_key(press(KeyCode::Down)); // clamp at last row
+        assert_eq!(app.fetch().unwrap().preview_cursor, 1);
     }
 
     /// FetchProgress carrying Some(total) transitions the overlay from

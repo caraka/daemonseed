@@ -18,8 +18,8 @@
 //! Count invariants (kept aligned with `ISA.md` `## Criteria`):
 //!
 //! - 53 server-side: 30 positive (`ISC-S*`) + 23 negative (`ISC-A-S*`)
-//! - 82 client-side: 55 positive (`ISC-C*`) + 27 negative (`ISC-A-C*`)
-//!   (M16 A1 added C66 manifest-preview + A-C33 no-blind-download;
+//! - 83 client-side: 56 positive (`ISC-C*`) + 27 negative (`ISC-A-C*`)
+//!   (M16 A1 added C66 manifest-preview + A-C33 no-blind-download, A2 added C67 selective-fetch;
 //!   M13 added C59-C62 circle persistence + A-C29/A-C30; M15 C added C63-C65
 //!   fetched-content browse/extract + A-C31/A-C32. Earlier: alpha2 share_id /
 //!   share download / public rooms / client-lifecycle / portable.)
@@ -163,6 +163,7 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-C64", IscClass::Positive),
     ("ISC-C65", IscClass::Positive),
     ("ISC-C66", IscClass::Positive),
+    ("ISC-C67", IscClass::Positive),
     // ── client negative (20) ────────────────────────────────────────────
     ("ISC-A-C1", IscClass::Negative),
     ("ISC-A-C2", IscClass::Negative),
@@ -199,7 +200,7 @@ pub const ISCS: &[(&str, IscClass)] = &[
 /// of truth for the coverage denominator, read live by `xtask isc-coverage`.
 /// Recount on every ISC add/remove (the `const _` assert below guards it
 /// against [`ISCS`]).
-pub const TOTAL: usize = 135;
+pub const TOTAL: usize = 136;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -338,13 +339,13 @@ mod tests {
                 IscClass::Negative => neg += 1,
             }
         }
-        // ISA `## Criteria` (built, non-deferred): 53 server + 82 client = 135.
+        // ISA `## Criteria` (built, non-deferred): 53 server + 83 client = 136.
         //   server  30 pos + 23 neg = 53
-        //   client  55 pos + 27 neg = 82  (M13 C59-C62 + A-C29/A-C30;
+        //   client  56 pos + 27 neg = 83  (M13 C59-C62 + A-C29/A-C30;
         //                                  M15 C  C63-C65 + A-C31/A-C32;
-        //                                  M16 A1 C66 + A-C33)
-        //   total   85 pos + 50 neg = 135
-        assert_eq!(pos, 85, "positive count drift");
+        //                                  M16 A1 C66 + A-C33; A2 C67)
+        //   total   86 pos + 50 neg = 136
+        assert_eq!(pos, 86, "positive count drift");
         assert_eq!(neg, 50, "negative count drift");
     }
 
