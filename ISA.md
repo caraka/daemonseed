@@ -666,6 +666,16 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   selected-count) so the file list claims the room; the transfer/terminal views keep the compact 62×50 +
   gauge. Regression test `fetch_preview_shows_file_list_on_a_standard_terminal` renders at 80×24 via
   `TestBackend` and asserts the file names appear. Probe: `cargo test -p daemonseed-tui`.
+- ISC-C69 (multi-share publish) fix 2026-06-07: defining a *second* share raised "could not open share
+  index: Database already open. Cannot acquire lock" — `net::handle_define_share` opened the single
+  `share-index.redb` for the new share while the prior `Arc<ShareIndex>` handle was still held (redb's
+  exclusive file lock). Fix: drop `self.share_index` before reopening (single active index, latest wins —
+  the M14 deferral); this also unblocks restore-on-Unlock re-emitting a `DefineShare` per persisted root.
+  Both shares stay publishable (publish is root-based, index-independent); only the latest-defined is
+  browsable in My-shares (single-active, unchanged — true multi-index browse remains the deferred M14
+  piece). Caveat: a still-running prior cold scan holds an `Arc` clone, so the lock frees only once that
+  scan ends. Found by caraka's M16 smoke test; to be verified live on the rebuild (no actor+redb unit
+  test). Probe: live 2-share define.
 - ISC-C67 (A2 selective fetch) verified 2026-06-07: per-file selection (`FetchUi::preview_checked`
   parallel to the manifest, default all-true) + cursor (`preview_cursor`); `↑`/`↓` move, `space` toggles
   the cursor row, `a` toggles all (`on_key_fetch_overlay`); `Enter` collects the checked indices and

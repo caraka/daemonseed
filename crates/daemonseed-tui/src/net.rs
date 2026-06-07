@@ -1170,6 +1170,14 @@ impl Actor {
         // Open off the actor thread — redb's file-create + table-materialize is
         // blocking I/O. Quick, but offloaded so the async loop does no sync disk.
         let key_bytes = index_key.to_bytes();
+        // Single active index — latest DefineShare wins (the M14 MVP). Drop any
+        // previously-opened index FIRST so its redb file lock is released;
+        // otherwise opening the same `share-index.redb` for a second defined
+        // share — or re-emitting a DefineShare per persisted root on Unlock —
+        // hits redb's exclusive lock ("Database already open. Cannot acquire
+        // lock"). A still-running prior cold scan holds an Arc clone, so the
+        // lock frees only once that scan ends — acceptable for the MVP.
+        self.share_index = None;
         let opened = tokio::task::spawn_blocking(move || ShareIndex::open(&index_path, key_bytes))
             .await
             .expect("share-index open task panicked");
