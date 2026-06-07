@@ -91,13 +91,13 @@ fn main() -> io::Result<()> {
     result
 }
 
-/// The OS default Downloads directory. Honors `XDG_DOWNLOAD_DIR` when set,
-/// otherwise `$HOME/Downloads`, otherwise the CWD as a last resort. (A richer
-/// per-platform resolver is ShareUX/M16 scope; this is the "call it done for
-/// now" path for non-portable runs.)
+/// The OS default Downloads directory (ISC-C68 / A3). Resolved per-platform via
+/// `dirs::download_dir()` (honors the XDG user-dirs config on Linux, the known
+/// folder on Windows, `~/Downloads` on macOS), falling back to `$HOME/Downloads`
+/// when the platform reports none, and the CWD as a last resort.
 fn os_downloads_dir() -> PathBuf {
-    if let Some(d) = std::env::var_os("XDG_DOWNLOAD_DIR").filter(|v| !v.is_empty()) {
-        return PathBuf::from(d);
+    if let Some(d) = dirs::download_dir() {
+        return d;
     }
     if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
         return PathBuf::from(home).join("Downloads");
@@ -213,13 +213,22 @@ fn run(
                 fetched_root: downloads_root.clone(),
             });
         }
-        // A1: the user accepted the manifest preview → download it.
-        if let Some((share_id, sharer_handle, name, selected)) = app.take_pending_fetch_confirm() {
+        // A1: the user accepted the manifest preview → download it. A3: an empty
+        // `dest` means "use the default downloads dir"; a non-empty `dest` is the
+        // user-chosen destination from the preview overlay (ISC-C68).
+        if let Some((share_id, sharer_handle, name, selected, dest)) =
+            app.take_pending_fetch_confirm()
+        {
+            let fetched_root = if dest.is_empty() {
+                downloads_root.clone()
+            } else {
+                PathBuf::from(&dest)
+            };
             let _ = net.send(NetCommand::ConfirmFetch {
                 share_id,
                 sharer_handle,
                 name,
-                fetched_root: downloads_root.clone(),
+                fetched_root,
                 selected,
             });
         }

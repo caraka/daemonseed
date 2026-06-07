@@ -177,8 +177,11 @@ fn render_fetch_overlay(f: &FetchUi, frame: &mut Frame, area: Rect) {
     };
     let footer = match f.status {
         FetchStatus::Complete | FetchStatus::Failed(_) => "[Enter] dismiss   [Esc] dismiss",
+        // A3: while editing the destination, the keys mean something else, so
+        // advertise the edit-mode controls instead of the selection ones.
+        FetchStatus::Preview(_) if f.editing_dest => "editing destination — [Enter/Esc] done",
         FetchStatus::Preview(_) => {
-            "[↑/↓] move  [space] toggle  [a] all  [Enter] download  [Esc] cancel"
+            "[↑/↓] move  [space] toggle  [a] all  [d] dest  [Enter] download  [Esc] cancel"
         }
         _ => "[Esc] cancel",
     };
@@ -212,8 +215,18 @@ fn render_fetch_overlay(f: &FetchUi, frame: &mut Frame, area: Rect) {
                 .filter(|(i, _)| f.preview_checked.get(*i).copied().unwrap_or(false))
                 .map(|(_, e)| e.size)
                 .sum();
+            // A3 (ISC-C68): the download destination line. Empty `dest` means
+            // the default Downloads dir; in edit mode a trailing cursor block
+            // marks the field as the one capturing input.
+            let dest_line = if f.editing_dest {
+                format!("dest: {}\u{2588}", f.dest)
+            } else if f.dest.is_empty() {
+                "dest: (default Downloads folder)".to_owned()
+            } else {
+                format!("dest: {}", f.dest)
+            };
             let mut s = format!(
-                "share: {}\nby: {sharer}\n\n{sel_count}/{} selected · {} of {}\n\n",
+                "share: {}\nby: {sharer}\n\n{sel_count}/{} selected · {} of {}\n{dest_line}\n\n",
                 f.share_id,
                 entries.len(),
                 human_bytes(sel_bytes),

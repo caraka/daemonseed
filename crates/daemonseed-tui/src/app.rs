@@ -311,7 +311,26 @@ pub struct FetchUi {
     /// A2: the highlighted row in the preview list (`↑`/`↓`); index into
     /// `preview_checked` / the `Preview` entries. Only meaningful in `Preview`.
     pub preview_cursor: usize,
+    /// A3 (ISC-C68): the user-chosen download destination. **Empty means "use
+    /// the default downloads dir"** — the binary resolves the empty case to
+    /// `main::os_downloads_dir` (or `<profile>/downloads` under `--portable`),
+    /// so the App layer never threads the resolved path through `App::new`. A
+    /// non-empty value is taken verbatim as the fetch's `fetched_root`. Edited
+    /// in `Preview` via the `d` key; carried into `NetCommand::ConfirmFetch`.
+    pub dest: String,
+    /// A3: whether the destination field is being edited (entered with `d` in
+    /// `Preview`). While `true`, `Char`/`Backspace` edit `dest` and the A2 nav
+    /// keys + download-`Enter` are suppressed so typing a path cannot toggle a
+    /// file's checkbox or start the download. `Enter`/`Esc` exit edit mode back
+    /// to the preview without downloading. Only meaningful in `Preview`.
+    pub editing_dest: bool,
 }
+
+/// A queued fetch-confirm the binary drains into `NetCommand::ConfirmFetch`:
+/// `(share_id, sharer_handle, name, selected, dest)`. `selected` is `None` for
+/// confirm-all (A1) / the chosen manifest-row indices (A2); `dest` (A3, ISC-C68)
+/// is the user-chosen download destination, empty for the default downloads dir.
+type PendingFetchConfirm = (String, String, String, Option<Vec<usize>>, String);
 
 /// Phase of an active [`FetchUi`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -601,10 +620,11 @@ pub struct App {
     /// manifest; the binary translates this into a `NetCommand::FetchShare`.
     pending_share_fetch: Option<(String, String, String)>,
     /// A queued fetch-confirm the binary forwards as `NetCommand::ConfirmFetch`
-    /// (drained once). `(share_id, sharer_handle, name, selected)` — `selected`
-    /// is `None` for the A1 confirm-all path; the A2 selective fetch will carry
-    /// the chosen manifest-row indices.
-    pending_fetch_confirm: Option<(String, String, String, Option<Vec<usize>>)>,
+    /// (drained once). `(share_id, sharer_handle, name, selected, dest)` —
+    /// `selected` is `None` for the A1 confirm-all path or the A2 chosen
+    /// manifest-row indices; `dest` (A3, ISC-C68) is the user-chosen download
+    /// destination, empty for the default downloads dir.
+    pending_fetch_confirm: Option<PendingFetchConfirm>,
     /// Fetched-downloads list for the browse pane (M15 C; ISC-C64). Replaced
     /// wholesale by `NetEvent::FetchedShares`.
     fetched_shares: Vec<daemonseed_core::storage::fetched::FetchedShare>,
@@ -1511,11 +1531,11 @@ impl App {
         self.pending_share_fetch.take()
     }
 
-    /// Take a queued fetch-confirm — `(share_id, sharer_handle, name, selected)`
-    /// — drained once by the binary into a `NetCommand::ConfirmFetch` (A1).
-    pub fn take_pending_fetch_confirm(
-        &mut self,
-    ) -> Option<(String, String, String, Option<Vec<usize>>)> {
+    /// Take a queued fetch-confirm —
+    /// `(share_id, sharer_handle, name, selected, dest)` — drained once by the
+    /// binary into a `NetCommand::ConfirmFetch` (A1/A2/A3). `dest` (ISC-C68) is
+    /// the user-chosen download destination, empty for the default downloads dir.
+    pub fn take_pending_fetch_confirm(&mut self) -> Option<PendingFetchConfirm> {
         self.pending_fetch_confirm.take()
     }
 
@@ -1966,6 +1986,10 @@ impl App {
                         bytes_received: 0,
                         preview_checked: Vec::new(),
                         preview_cursor: 0,
+                        // A3: empty = the default downloads dir until the user
+                        // sets one via `d` in the preview (ISC-C68).
+                        dest: String::new(),
+                        editing_dest: false,
                     });
                     self.pending_share_fetch = Some((share_id, sharer_handle, name));
                 }
@@ -1974,16 +1998,46 @@ impl App {
         }
     }
 
-    /// Fetch-overlay key handling (ISC-19 / C66 / C67). The overlay captures
-    /// input while the fetch is active. In `Preview`: `↑`/`↓` move the cursor,
-    /// `space` toggles the cursor file, `a` toggles all (A2 selective fetch),
-    /// `Enter` downloads the selected files, `Esc` cancels without downloading.
-    /// On a terminal state (Complete/Failed): either key dismisses. While chunks
-    /// flow: `Esc` aborts (marks Failed). Other keys are absorbed so they cannot
-    /// accidentally drive the background view.
+    /// Fetch-overlay key handling (ISC-19 / C66 / C67 / C68). The overlay
+    /// captures input while the fetch is active. In `Preview`: `↑`/`↓` move the
+    /// cursor, `space` toggles the cursor file, `a` toggles all (A2 selective
+    /// fetch), `d` enters destination-edit mode (A3), `Enter` downloads the
+    /// selected files, `Esc` cancels without downloading. While editing the
+    /// destination (A3, ISC-C68), `Char`/`Backspace` edit the path and `Enter`
+    /// or `Esc` exit edit mode back to the preview (no download); the A2 nav keys
+    /// and the download-`Enter` are suppressed so typing a path can neither toggle
+    /// a checkbox nor start the download. On a terminal state (Complete/Failed):
+    /// either key dismisses. While chunks flow: `Esc` aborts (marks Failed). Other
+    /// keys are absorbed so they cannot accidentally drive the background view.
     fn on_key_fetch_overlay(&mut self, key: KeyEvent) {
         let Some(f) = self.fetch.as_ref() else { return };
         let in_preview = matches!(f.status, FetchStatus::Preview(_));
+        // A3: while editing the destination, all input routes to the `dest` field
+        // and nothing toggles selection or starts a download (ISC-C68).
+        let editing_dest = in_preview && f.editing_dest;
+        if editing_dest {
+            match key.code {
+                KeyCode::Char(c) => {
+                    if let Some(f) = self.fetch.as_mut() {
+                        f.dest.push(c);
+                    }
+                }
+                KeyCode::Backspace => {
+                    if let Some(f) = self.fetch.as_mut() {
+                        f.dest.pop();
+                    }
+                }
+                // Leave edit mode (commit the typed path into `dest`); does NOT
+                // trigger the download — that is a deliberate second `Enter`.
+                KeyCode::Enter | KeyCode::Esc => {
+                    if let Some(f) = self.fetch.as_mut() {
+                        f.editing_dest = false;
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         match key.code {
             KeyCode::Esc => {
                 // Preview-cancel and terminal-dismiss both just close the
@@ -2029,6 +2083,13 @@ impl App {
                     }
                 }
             }
+            // A3 (ISC-C68): enter destination-edit mode. The `editing_dest`
+            // branch at the top of this fn then routes typed input into `dest`.
+            KeyCode::Char('d') | KeyCode::Char('D') if in_preview => {
+                if let Some(f) = self.fetch.as_mut() {
+                    f.editing_dest = true;
+                }
+            }
             KeyCode::Enter => {
                 // Decide with an immutable read, then apply. `Enter` in Preview
                 // confirms the selected files (an all-selected set passes `None`
@@ -2052,20 +2113,24 @@ impl App {
                                 f.name.clone(),
                                 selected.len() as u32,
                                 if all { None } else { Some(selected) },
+                                // A3 (ISC-C68): the chosen destination (empty =
+                                // default downloads dir, resolved by the binary).
+                                f.dest.clone(),
                             ))
                         }
                     }
                     _ => None,
                 };
                 let dismiss = matches!(f.status, FetchStatus::Complete | FetchStatus::Failed(_));
-                if let Some((share_id, sharer_handle, name, total, selection)) = confirm {
+                if let Some((share_id, sharer_handle, name, total, selection, dest)) = confirm {
                     if let Some(f) = self.fetch.as_mut() {
                         f.total_chunks = Some(total);
                         f.chunks_received = 0;
                         f.bytes_received = 0;
                         f.status = FetchStatus::Receiving;
                     }
-                    self.pending_fetch_confirm = Some((share_id, sharer_handle, name, selection));
+                    self.pending_fetch_confirm =
+                        Some((share_id, sharer_handle, name, selection, dest));
                 } else if dismiss {
                     self.fetch = None;
                 }
@@ -5126,6 +5191,108 @@ mod tests {
         assert_eq!(app.fetch().unwrap().preview_cursor, 1);
         app.on_key(press(KeyCode::Down)); // clamp at last row
         assert_eq!(app.fetch().unwrap().preview_cursor, 1);
+    }
+
+    /// A3 (ISC-C68): editing the destination then confirming queues a confirm
+    /// whose `dest` element is the typed path.
+    #[test]
+    fn preview_edit_dest_then_enter_queues_typed_path() {
+        let mut app = drive_to_main();
+        to_shares(&mut app);
+        app.on_net_event(NetEvent::SharesSnapshot {
+            local: Vec::new(),
+            remote: vec![listing("s1", "notes", "", "alice#aabbccddeeff")],
+            indexer_status: IndexerStatus::Idle,
+        });
+        let _ = app.take_pending_share_fetch();
+        app.on_key(press(KeyCode::Char('f')));
+        app.on_net_event(NetEvent::FetchManifest {
+            share_id: "s1".to_owned(),
+            name: "notes".to_owned(),
+            entries: vec![ShareManifestEntry {
+                rel_path: "a.txt".to_owned(),
+                size: 10,
+            }],
+        });
+        // Enter dest-edit mode, type a path, leave edit mode, then download.
+        app.on_key(press(KeyCode::Char('d')));
+        assert!(app.fetch().unwrap().editing_dest);
+        for c in "/tmp/dl".chars() {
+            app.on_key(press(KeyCode::Char(c)));
+        }
+        app.on_key(press(KeyCode::Enter)); // exit edit mode — no download yet
+        assert!(!app.fetch().unwrap().editing_dest);
+        assert!(app.take_pending_fetch_confirm().is_none());
+        app.on_key(press(KeyCode::Enter)); // now download
+        let queued = app.take_pending_fetch_confirm().expect("confirm queued");
+        assert_eq!(queued.4, "/tmp/dl");
+    }
+
+    /// A3 (ISC-C68): `d` enters dest-edit mode and a typed char lands in `dest`
+    /// — and does NOT toggle a file's checkbox (the routing guard holds).
+    #[test]
+    fn preview_d_enters_edit_and_typing_does_not_toggle_selection() {
+        let mut app = drive_to_main();
+        to_shares(&mut app);
+        app.on_net_event(NetEvent::SharesSnapshot {
+            local: Vec::new(),
+            remote: vec![listing("s1", "notes", "", "alice#aabbccddeeff")],
+            indexer_status: IndexerStatus::Idle,
+        });
+        let _ = app.take_pending_share_fetch();
+        app.on_key(press(KeyCode::Char('f')));
+        app.on_net_event(NetEvent::FetchManifest {
+            share_id: "s1".to_owned(),
+            name: "notes".to_owned(),
+            entries: vec![
+                ShareManifestEntry {
+                    rel_path: "a".to_owned(),
+                    size: 1,
+                },
+                ShareManifestEntry {
+                    rel_path: "b".to_owned(),
+                    size: 2,
+                },
+            ],
+        });
+        app.on_key(press(KeyCode::Char('d'))); // enter dest-edit mode
+        // 'a' would normally toggle-all; while editing it must land in `dest`.
+        app.on_key(press(KeyCode::Char('a')));
+        let f = app.fetch().unwrap();
+        assert!(f.editing_dest);
+        assert_eq!(f.dest, "a");
+        // Selection is untouched — both files still selected (the default).
+        assert_eq!(f.preview_checked, vec![true, true]);
+        // Backspace edits the field.
+        app.on_key(press(KeyCode::Backspace));
+        assert_eq!(app.fetch().unwrap().dest, "");
+    }
+
+    /// A3 (ISC-C68): an empty `dest` still confirms — the binary resolves the
+    /// empty case to the default downloads dir, so the queued confirm carries an
+    /// empty destination element.
+    #[test]
+    fn preview_empty_dest_confirms_with_empty_element() {
+        let mut app = drive_to_main();
+        to_shares(&mut app);
+        app.on_net_event(NetEvent::SharesSnapshot {
+            local: Vec::new(),
+            remote: vec![listing("s1", "notes", "", "alice#aabbccddeeff")],
+            indexer_status: IndexerStatus::Idle,
+        });
+        let _ = app.take_pending_share_fetch();
+        app.on_key(press(KeyCode::Char('f')));
+        app.on_net_event(NetEvent::FetchManifest {
+            share_id: "s1".to_owned(),
+            name: "notes".to_owned(),
+            entries: vec![ShareManifestEntry {
+                rel_path: "a.txt".to_owned(),
+                size: 10,
+            }],
+        });
+        app.on_key(press(KeyCode::Enter)); // confirm without setting a dest
+        let queued = app.take_pending_fetch_confirm().expect("confirm queued");
+        assert_eq!(queued.4, ""); // empty → binary uses the default downloads dir
     }
 
     /// FetchProgress carrying Some(total) transitions the overlay from

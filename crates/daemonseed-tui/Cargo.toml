@@ -52,5 +52,10 @@ tonic = { workspace = true }
 
 anyhow = { workspace = true }
 
+# Per-platform Downloads directory resolver for the fetch download destination
+# (ISC-C68 / A3). Replaces the hand-rolled `$XDG_DOWNLOAD_DIR` / `$HOME/Downloads`
+# probe in `main::os_downloads_dir`.
+dirs = { workspace = true }
+
 [dev-dependencies]
 oxitls-rustls-provider = { workspace = true, features = ["testing"] }
