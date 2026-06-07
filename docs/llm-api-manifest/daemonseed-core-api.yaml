@@ -1380,12 +1380,12 @@ types:
     description: >-
       One file's verified plaintext bytes, ready to persist. The caller
       (net actor) produces this after the fetch has verified every chunk;
-      FetchedStore::record_share re-derives the CAS address via put (the
-      address is never trusted from the caller).
+      FetchedStore::record_share writes the bytes under the file's real name
+      into the share folder (named files, no CAS layer — M15 cleanup).
     fields:
       - name: rel_path
         type: String
-        description: Wire rel_path (untrusted; sanitised at extraction).
+        description: Wire rel_path (untrusted; sanitised before write).
       - name: bytes
         type: "Vec<u8>"
         description: Verified plaintext file bytes.
