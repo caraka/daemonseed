@@ -277,6 +277,45 @@ pub struct PublishRequest {
     pub sharer_handle: String,
 }
 
+/// One node in the fetch preview's collapsible folder tree (ISC-C72). The tree
+/// is a *view* over the flat manifest — selection still lives per-file in
+/// [`FetchUi::preview_checked`]; a node merely names a row and (for a `Dir`)
+/// the contiguous span of descendants it controls.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewNode {
+    /// Nesting depth (0 = top level). Drives the render indent.
+    pub depth: usize,
+    /// The path segment displayed on this row (the last `/`-component).
+    pub name: String,
+    /// Whether this node is a directory or a file.
+    pub kind: PreviewKind,
+}
+
+/// The two node flavours in the preview tree (ISC-C72).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreviewKind {
+    /// A directory. `subtree_end` is the exclusive end of this dir's
+    /// pre-order-contiguous descendant span: `nodes[i+1..subtree_end]` are all
+    /// of node `i`'s descendants. Lets a collapsed dir skip its descendants and
+    /// a folder-select aggregate every file beneath it.
+    Dir { subtree_end: usize },
+    /// A file. `manifest_idx` indexes the flat manifest (and
+    /// [`FetchUi::preview_checked`]); `size` is the per-file byte count.
+    File { manifest_idx: usize, size: u64 },
+}
+
+/// Aggregate selection state of a directory's files (ISC-C72), for the dir
+/// row's checkbox glyph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirSelection {
+    /// Every file under the dir is selected.
+    All,
+    /// No file under the dir is selected.
+    None,
+    /// Some but not all files under the dir are selected.
+    Partial,
+}
+
 /// Active share-fetch state (ISC-19, F23 unified mechanism).
 ///
 /// Constructed when the user presses `f` on a selected Public-shares row;
@@ -308,9 +347,23 @@ pub struct FetchUi {
     /// (Enter-without-toggling downloads everything = the A1 behavior). Only
     /// meaningful while `status` is `Preview`.
     pub preview_checked: Vec<bool>,
-    /// A2: the highlighted row in the preview list (`↑`/`↓`); index into
-    /// `preview_checked` / the `Preview` entries. Only meaningful in `Preview`.
+    /// A2/ISC-C72: the highlighted row in the preview tree (`↑`/`↓`); index
+    /// into the **currently-visible rows** (see [`FetchUi::visible_rows`]), NOT
+    /// the flat manifest. Only meaningful in `Preview`.
     pub preview_cursor: usize,
+    /// ISC-C72: the collapsible folder tree, a pre-order node list built once
+    /// from the flat manifest when it arrives (see
+    /// [`FetchUi::build_preview_tree`]). Empty until the manifest lands and for
+    /// an empty share. Selection still lives in `preview_checked`.
+    pub preview_tree: Vec<PreviewNode>,
+    /// ISC-C72: collapse state parallel to `preview_tree` (`true` = collapsed).
+    /// Every `Dir` defaults collapsed so a dense share opens to a short
+    /// top-level list; `File` entries are always `false` (ignored).
+    pub preview_collapsed: Vec<bool>,
+    /// ISC-C72: the first visible row drawn — the render adjusts it each frame
+    /// so the cursor row stays within `[scroll, scroll + pane_rows)`. Index into
+    /// the currently-visible rows.
+    pub preview_scroll: usize,
     /// A3 (ISC-C68): the user-chosen download destination. **Empty means "use
     /// the default downloads dir"** — the binary resolves the empty case to
     /// `main::os_downloads_dir` (or `<profile>/downloads` under `--portable`),
@@ -324,6 +377,144 @@ pub struct FetchUi {
     /// file's checkbox or start the download. `Enter`/`Esc` exit edit mode back
     /// to the preview without downloading. Only meaningful in `Preview`.
     pub editing_dest: bool,
+}
+
+impl FetchUi {
+    /// ISC-C72: build the pre-order folder tree from the flat manifest.
+    ///
+    /// Each `rel_path` is split on `/`; intermediate segments become `Dir`
+    /// nodes (deduped per parent), the final segment a `File` carrying its index
+    /// into the *received* manifest order (so `preview_checked` /
+    /// `ConfirmFetch.selected` indices stay valid). Entries are visited in
+    /// `rel_path`-sorted order so siblings group and the tree is stable, but the
+    /// stored `manifest_idx` is the original received index. Each `Dir`'s
+    /// `subtree_end` is back-patched to the exclusive end of its descendant
+    /// span. A flat share (no `/`) yields all-`File` nodes at depth 0 — exactly
+    /// the pre-C72 list.
+    pub fn build_preview_tree(entries: &[ShareManifestEntry]) -> Vec<PreviewNode> {
+        // Sort by path for stable grouping; keep the received index alongside.
+        let mut order: Vec<usize> = (0..entries.len()).collect();
+        order.sort_by(|&a, &b| entries[a].rel_path.cmp(&entries[b].rel_path));
+
+        let mut nodes: Vec<PreviewNode> = Vec::new();
+        // The Dir node index for each currently-open path prefix, depth-indexed:
+        // `open[d]` is `(segment, node_idx)` of the dir open at depth `d`.
+        let mut open: Vec<(String, usize)> = Vec::new();
+
+        for &idx in &order {
+            let path = &entries[idx].rel_path;
+            let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+            if segments.is_empty() {
+                continue;
+            }
+            let dir_count = segments.len() - 1;
+
+            // Truncate the open-dir stack back to the longest shared prefix with
+            // this path's directory segments.
+            let mut shared = 0usize;
+            while shared < open.len() && shared < dir_count && open[shared].0 == segments[shared] {
+                shared += 1;
+            }
+            open.truncate(shared);
+
+            // Open any new directory segments.
+            for seg in segments.iter().take(dir_count).skip(shared) {
+                let depth = open.len();
+                let node_idx = nodes.len();
+                nodes.push(PreviewNode {
+                    depth,
+                    name: (*seg).to_owned(),
+                    // subtree_end back-patched once the subtree is complete.
+                    kind: PreviewKind::Dir {
+                        subtree_end: node_idx + 1,
+                    },
+                });
+                open.push(((*seg).to_owned(), node_idx));
+            }
+
+            // The file leaf.
+            let depth = open.len();
+            nodes.push(PreviewNode {
+                depth,
+                name: segments[dir_count].to_owned(),
+                kind: PreviewKind::File {
+                    manifest_idx: idx,
+                    size: entries[idx].size,
+                },
+            });
+        }
+
+        // Back-patch every Dir's subtree_end: it spans all later nodes whose
+        // depth is greater than the dir's (pre-order makes that span
+        // contiguous).
+        for i in 0..nodes.len() {
+            if let PreviewKind::Dir { .. } = nodes[i].kind {
+                let dir_depth = nodes[i].depth;
+                let mut end = i + 1;
+                while end < nodes.len() && nodes[end].depth > dir_depth {
+                    end += 1;
+                }
+                if let PreviewKind::Dir { subtree_end } = &mut nodes[i].kind {
+                    *subtree_end = end;
+                }
+            }
+        }
+        nodes
+    }
+
+    /// ISC-C72: the tree-node indices currently visible, in draw order — walk
+    /// the pre-order tree skipping the descendants of any collapsed `Dir`. The
+    /// `preview_cursor` and `preview_scroll` index INTO this list.
+    pub fn visible_rows(&self) -> Vec<usize> {
+        let mut rows = Vec::new();
+        let mut i = 0usize;
+        while i < self.preview_tree.len() {
+            rows.push(i);
+            match self.preview_tree[i].kind {
+                PreviewKind::Dir { subtree_end }
+                    if self.preview_collapsed.get(i).copied().unwrap_or(false) =>
+                {
+                    // Collapsed: jump past the whole subtree.
+                    i = subtree_end;
+                }
+                _ => i += 1,
+            }
+        }
+        rows
+    }
+
+    /// ISC-C72: aggregate selection state of a `Dir` node's files (the files in
+    /// `tree[node_idx+1..subtree_end]`), for the dir-row checkbox glyph.
+    pub fn dir_selection(&self, node_idx: usize) -> DirSelection {
+        let PreviewKind::Dir { subtree_end } = self.preview_tree[node_idx].kind else {
+            return DirSelection::None;
+        };
+        let (mut any, mut all, mut saw_file) = (false, true, false);
+        for n in &self.preview_tree[node_idx + 1..subtree_end] {
+            if let PreviewKind::File { manifest_idx, .. } = n.kind {
+                saw_file = true;
+                if self
+                    .preview_checked
+                    .get(manifest_idx)
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    any = true;
+                } else {
+                    all = false;
+                }
+            }
+        }
+        if !saw_file {
+            DirSelection::None
+        } else if all {
+            DirSelection::All
+        } else if any {
+            DirSelection::Partial
+        } else {
+            DirSelection::None
+        }
+    }
 }
 
 /// A queued fetch-confirm the binary drains into `NetCommand::ConfirmFetch`:
@@ -1316,6 +1507,15 @@ impl App {
                     // downloads all = the A1 behavior); cursor at the top.
                     f.preview_checked = vec![true; entries.len()];
                     f.preview_cursor = 0;
+                    f.preview_scroll = 0;
+                    // ISC-C72: build the collapsible folder tree once from the
+                    // flat manifest; every Dir starts collapsed.
+                    f.preview_tree = FetchUi::build_preview_tree(&entries);
+                    f.preview_collapsed = f
+                        .preview_tree
+                        .iter()
+                        .map(|n| matches!(n.kind, PreviewKind::Dir { .. }))
+                        .collect();
                     f.status = FetchStatus::Preview(entries);
                 }
             }
@@ -2040,6 +2240,9 @@ impl App {
                         bytes_received: 0,
                         preview_checked: Vec::new(),
                         preview_cursor: 0,
+                        preview_tree: Vec::new(),
+                        preview_collapsed: Vec::new(),
+                        preview_scroll: 0,
                         // A3: empty = the default downloads dir until the user
                         // sets one via `d` in the preview (ISC-C68).
                         dest: String::new(),
@@ -2052,17 +2255,21 @@ impl App {
         }
     }
 
-    /// Fetch-overlay key handling (ISC-19 / C66 / C67 / C68). The overlay
-    /// captures input while the fetch is active. In `Preview`: `↑`/`↓` move the
-    /// cursor, `space` toggles the cursor file, `a` toggles all (A2 selective
-    /// fetch), `d` enters destination-edit mode (A3), `Enter` downloads the
-    /// selected files, `Esc` cancels without downloading. While editing the
-    /// destination (A3, ISC-C68), `Char`/`Backspace` edit the path and `Enter`
-    /// or `Esc` exit edit mode back to the preview (no download); the A2 nav keys
-    /// and the download-`Enter` are suppressed so typing a path can neither toggle
-    /// a checkbox nor start the download. On a terminal state (Complete/Failed):
-    /// either key dismisses. While chunks flow: `Esc` aborts (marks Failed). Other
-    /// keys are absorbed so they cannot accidentally drive the background view.
+    /// Fetch-overlay key handling (ISC-19 / C66 / C67 / C68 / C72). The overlay
+    /// captures input while the fetch is active. In `Preview` (now a collapsible
+    /// folder tree, ISC-C72): `↑`/`↓` move the cursor over the *visible* rows,
+    /// `→` expands a collapsed dir, `←` collapses an expanded dir (or jumps to
+    /// the parent of a file / already-collapsed dir), `space` toggles selection
+    /// of the cursor node (a file toggles itself, a dir toggles all files in its
+    /// subtree), `a` toggles all (A2 selective fetch), `d` enters
+    /// destination-edit mode (A3), `Enter` downloads the selected files, `Esc`
+    /// cancels without downloading. While editing the destination (A3, ISC-C68),
+    /// `Char`/`Backspace` edit the path and `Enter` or `Esc` exit edit mode back
+    /// to the preview (no download); the A2 nav keys and the download-`Enter` are
+    /// suppressed so typing a path can neither toggle a checkbox nor start the
+    /// download. On a terminal state (Complete/Failed): either key dismisses.
+    /// While chunks flow: `Esc` aborts (marks Failed). Other keys are absorbed so
+    /// they cannot accidentally drive the background view.
     fn on_key_fetch_overlay(&mut self, key: KeyEvent) {
         let Some(f) = self.fetch.as_ref() else { return };
         let in_preview = matches!(f.status, FetchStatus::Preview(_));
@@ -2108,22 +2315,87 @@ impl App {
                     f.status = FetchStatus::Failed("cancelled by user".to_owned());
                 }
             }
-            // A2 selective-fetch navigation (only meaningful in Preview).
+            // A2/C72 navigation over the *visible* tree rows (Preview only).
             KeyCode::Up | KeyCode::Down if in_preview => {
                 if let Some(f) = self.fetch.as_mut() {
-                    let len = f.preview_checked.len();
+                    let visible_len = f.visible_rows().len();
                     match key.code {
                         KeyCode::Up => f.preview_cursor = f.preview_cursor.saturating_sub(1),
-                        KeyCode::Down if f.preview_cursor + 1 < len => f.preview_cursor += 1,
+                        KeyCode::Down if f.preview_cursor + 1 < visible_len => {
+                            f.preview_cursor += 1
+                        }
                         _ => {}
                     }
                 }
             }
+            // C72: `→` expands a collapsed dir under the cursor (no-op otherwise).
+            KeyCode::Right if in_preview => {
+                if let Some(f) = self.fetch.as_mut() {
+                    let visible = f.visible_rows();
+                    if let Some(&node) = visible.get(f.preview_cursor)
+                        && matches!(f.preview_tree[node].kind, PreviewKind::Dir { .. })
+                        && f.preview_collapsed.get(node).copied().unwrap_or(false)
+                    {
+                        f.preview_collapsed[node] = false;
+                    }
+                }
+            }
+            // C72: `←` collapses an expanded dir under the cursor; on a file or
+            // already-collapsed dir, move the cursor to the parent dir row.
+            KeyCode::Left if in_preview => {
+                if let Some(f) = self.fetch.as_mut() {
+                    let visible = f.visible_rows();
+                    if let Some(&node) = visible.get(f.preview_cursor) {
+                        let is_expanded_dir =
+                            matches!(f.preview_tree[node].kind, PreviewKind::Dir { .. })
+                                && !f.preview_collapsed.get(node).copied().unwrap_or(false);
+                        if is_expanded_dir {
+                            f.preview_collapsed[node] = true;
+                        } else {
+                            // Move to the nearest visible ancestor (shallower
+                            // depth above the cursor in the visible list).
+                            let depth = f.preview_tree[node].depth;
+                            if depth > 0
+                                && let Some(parent_vis) = visible[..f.preview_cursor]
+                                    .iter()
+                                    .rposition(|&n| f.preview_tree[n].depth < depth)
+                            {
+                                f.preview_cursor = parent_vis;
+                            }
+                        }
+                    }
+                }
+            }
+            // C72: `space` toggles selection of the cursor NODE. A file toggles
+            // its own checkbox; a dir toggles every file in its subtree — check
+            // all if any are unchecked, else uncheck all.
             KeyCode::Char(' ') if in_preview => {
                 if let Some(f) = self.fetch.as_mut() {
-                    let cur = f.preview_cursor;
-                    if let Some(c) = f.preview_checked.get_mut(cur) {
-                        *c = !*c;
+                    let visible = f.visible_rows();
+                    if let Some(&node) = visible.get(f.preview_cursor) {
+                        match f.preview_tree[node].kind {
+                            PreviewKind::File { manifest_idx, .. } => {
+                                if let Some(c) = f.preview_checked.get_mut(manifest_idx) {
+                                    *c = !*c;
+                                }
+                            }
+                            PreviewKind::Dir { subtree_end } => {
+                                // Target: if any file under the dir is currently
+                                // unchecked, set ALL on; else set all off.
+                                let want = matches!(
+                                    f.dir_selection(node),
+                                    DirSelection::None | DirSelection::Partial
+                                );
+                                for n in node + 1..subtree_end {
+                                    if let PreviewKind::File { manifest_idx, .. } =
+                                        f.preview_tree[n].kind
+                                        && let Some(c) = f.preview_checked.get_mut(manifest_idx)
+                                    {
+                                        *c = want;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -5628,6 +5900,217 @@ mod tests {
         app.on_key(press(KeyCode::Enter)); // confirm without setting a dest
         let queued = app.take_pending_fetch_confirm().expect("confirm queued");
         assert_eq!(queued.4, ""); // empty → binary uses the default downloads dir
+    }
+
+    // ── ISC-C72: collapsible folder tree + scroll in the fetch preview ──────
+
+    /// Drive an app into the share-fetch Preview state carrying `paths`
+    /// (rel_path → size 1 each), for the C72 tree tests.
+    fn drive_to_preview(paths: &[&str]) -> App {
+        let mut app = drive_to_main();
+        to_shares(&mut app);
+        app.on_net_event(NetEvent::SharesSnapshot {
+            local: Vec::new(),
+            remote: vec![listing("s1", "share", "", "alice#aabbccddeeff")],
+            indexer_status: IndexerStatus::Idle,
+        });
+        let _ = app.take_pending_share_fetch();
+        app.on_key(press(KeyCode::Char('f')));
+        app.on_net_event(NetEvent::FetchManifest {
+            share_id: "s1".to_owned(),
+            name: "share".to_owned(),
+            entries: paths
+                .iter()
+                .map(|p| ShareManifestEntry {
+                    rel_path: (*p).to_owned(),
+                    size: 1,
+                })
+                .collect(),
+        });
+        app
+    }
+
+    /// C72: a nested manifest builds the expected pre-order node list with the
+    /// right depths and `subtree_end` spans.
+    #[test]
+    fn c72_tree_build_has_correct_depths_and_subtree_ends() {
+        let entries: Vec<ShareManifestEntry> = [
+            "TV/BB/S1/e1.mkv",
+            "TV/BB/S1/e2.mkv",
+            "TV/BB/S2/e1.mkv",
+            "readme.txt",
+        ]
+        .iter()
+        .map(|p| ShareManifestEntry {
+            rel_path: (*p).to_owned(),
+            size: 1,
+        })
+        .collect();
+        let tree = FetchUi::build_preview_tree(&entries);
+        // Pre-order: TV(0) BB(1) S1(2) e1(3) e2(4) S2(5) e1(6) readme(7)
+        assert_eq!(tree.len(), 8);
+        let names: Vec<&str> = tree.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "TV",
+                "BB",
+                "S1",
+                "e1.mkv",
+                "e2.mkv",
+                "S2",
+                "e1.mkv",
+                "readme.txt"
+            ]
+        );
+        let depths: Vec<usize> = tree.iter().map(|n| n.depth).collect();
+        assert_eq!(depths, vec![0, 1, 2, 3, 3, 2, 3, 0]);
+        // Dir spans: TV covers nodes 1..7, BB 2..7, S1 3..5, S2 6..7.
+        assert!(matches!(tree[0].kind, PreviewKind::Dir { subtree_end: 7 }));
+        assert!(matches!(tree[1].kind, PreviewKind::Dir { subtree_end: 7 }));
+        assert!(matches!(tree[2].kind, PreviewKind::Dir { subtree_end: 5 }));
+        assert!(matches!(tree[5].kind, PreviewKind::Dir { subtree_end: 7 }));
+        // The S1 episodes carry the right manifest indices (received order).
+        assert!(matches!(
+            tree[3].kind,
+            PreviewKind::File {
+                manifest_idx: 0,
+                ..
+            }
+        ));
+        assert!(matches!(
+            tree[4].kind,
+            PreviewKind::File {
+                manifest_idx: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            tree[7].kind,
+            PreviewKind::File {
+                manifest_idx: 3,
+                ..
+            }
+        ));
+    }
+
+    /// C72: every Dir starts collapsed, so a dense share opens to just its
+    /// top-level rows; expanding (→) reveals descendants.
+    #[test]
+    fn c72_dirs_default_collapsed_and_arrow_expands() {
+        let mut app = drive_to_preview(&["TV/BB/S1/e1.mkv", "TV/BB/S1/e2.mkv", "readme.txt"]);
+        // Top level: TV (collapsed) + readme.txt = 2 visible rows.
+        assert_eq!(app.fetch().unwrap().visible_rows().len(), 2);
+        // Cursor on TV; → expands it, revealing BB.
+        app.on_key(press(KeyCode::Right));
+        assert_eq!(app.fetch().unwrap().visible_rows().len(), 3); // TV, BB, readme
+    }
+
+    /// C72: collapsing a dir (←) hides its descendants — the visible-row count
+    /// drops and the cursor stays put.
+    #[test]
+    fn c72_collapse_hides_descendants() {
+        let mut app = drive_to_preview(&["TV/BB/e1.mkv", "TV/BB/e2.mkv", "readme.txt"]);
+        // Fully expand: → on TV, → on BB.
+        app.on_key(press(KeyCode::Right)); // expand TV
+        app.on_key(press(KeyCode::Right)); // cursor still on TV → no-op (TV already expanded)
+        // Move to BB and expand it.
+        app.on_key(press(KeyCode::Down)); // cursor → BB
+        app.on_key(press(KeyCode::Right)); // expand BB
+        let full = app.fetch().unwrap().visible_rows().len();
+        assert_eq!(full, 5); // TV, BB, e1, e2, readme
+        // Collapse BB (cursor is on BB) → its two episodes vanish.
+        app.on_key(press(KeyCode::Left));
+        assert_eq!(app.fetch().unwrap().visible_rows().len(), 3); // TV, BB, readme
+    }
+
+    /// C72: `space` on a Dir selects exactly the files in its subtree; a second
+    /// `space` clears them; the resulting confirm carries that subset.
+    #[test]
+    fn c72_folder_select_toggles_subtree_and_confirm_carries_subset() {
+        // S1 has two episodes (manifest 0,1); a third file sits elsewhere (idx 2).
+        let mut app = drive_to_preview(&["TV/S1/e1.mkv", "TV/S1/e2.mkv", "other.txt"]);
+        // Start clean: deselect everything via `a` (default is all-selected).
+        app.on_key(press(KeyCode::Char('a')));
+        assert!(app.fetch().unwrap().preview_checked.iter().all(|&c| !c));
+        // Navigate to the S1 dir: TV(0) is cursor; expand it, move to S1.
+        app.on_key(press(KeyCode::Right)); // expand TV
+        app.on_key(press(KeyCode::Down)); // cursor → S1
+        // `space` on S1 checks exactly its two episodes (manifest 0,1), not idx 2.
+        app.on_key(press(KeyCode::Char(' ')));
+        assert_eq!(
+            app.fetch().unwrap().preview_checked,
+            vec![true, true, false]
+        );
+        // `space` again clears them.
+        app.on_key(press(KeyCode::Char(' ')));
+        assert_eq!(
+            app.fetch().unwrap().preview_checked,
+            vec![false, false, false]
+        );
+        // Re-select the subtree and confirm: the queued selection is Some([0,1]).
+        app.on_key(press(KeyCode::Char(' ')));
+        app.on_key(press(KeyCode::Enter));
+        let queued = app.take_pending_fetch_confirm().expect("confirm queued");
+        assert_eq!(queued.3, Some(vec![0, 1]));
+    }
+
+    /// C72: with one of a dir's two files checked, the dir renders `[~]`
+    /// (partial); all-checked renders `[x]`, none renders `[ ]`.
+    #[test]
+    fn c72_partial_dir_aggregate_renders_tilde() {
+        let app = drive_to_preview(&["TV/S1/e1.mkv", "TV/S1/e2.mkv"]);
+        // Tree: TV(0) S1(1) e1(2,manifest 0) e2(3,manifest 1).
+        let f = app.fetch().unwrap();
+        // Default all-selected → S1 is All.
+        assert_eq!(f.dir_selection(1), DirSelection::All);
+        assert_eq!(f.dir_selection(0), DirSelection::All);
+        // Build a custom FetchUi with exactly one episode checked.
+        let mut f2 = f.clone();
+        f2.preview_checked = vec![true, false];
+        assert_eq!(f2.dir_selection(1), DirSelection::Partial);
+        assert_eq!(f2.dir_selection(0), DirSelection::Partial);
+        f2.preview_checked = vec![false, false];
+        assert_eq!(f2.dir_selection(1), DirSelection::None);
+    }
+
+    /// C72 scroll: with more expanded files than the pane can hold, moving the
+    /// cursor to the last row keeps that row on-screen (the render windows the
+    /// list to the cursor).
+    #[test]
+    fn c72_scroll_keeps_cursor_visible_on_standard_terminal() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        // A single dir with many files — more than the ~70-wide × 24-tall
+        // overlay's tree pane can show at once.
+        let mut paths: Vec<String> = Vec::new();
+        for i in 0..40 {
+            paths.push(format!("flat/file{i:02}.bin"));
+        }
+        let path_refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+        let mut app = drive_to_preview(&path_refs);
+        // Expand the single top-level dir so all 40 files are in the visible list.
+        app.on_key(press(KeyCode::Right));
+        let visible = app.fetch().unwrap().visible_rows().len();
+        assert_eq!(visible, 41); // the dir + 40 files
+        // Drive the cursor to the very last row.
+        for _ in 0..visible {
+            app.on_key(press(KeyCode::Down));
+        }
+        assert_eq!(app.fetch().unwrap().preview_cursor, visible - 1);
+        // Render at a standard terminal; the last file must be on-screen.
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|frame| crate::ui::render(&app, frame)).unwrap();
+        let text = buffer_text(&term);
+        assert!(
+            text.contains("file39.bin"),
+            "the cursor row (last file) must stay visible after scrolling; got:\n{text}"
+        );
+        // And an early file should have scrolled OFF (proving it's a window).
+        assert!(
+            !text.contains("file00.bin"),
+            "early rows should scroll off when the cursor is at the bottom; got:\n{text}"
+        );
     }
 
     /// FetchProgress carrying Some(total) transitions the overlay from

@@ -9,7 +9,7 @@ use core::str::FromStr;
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph, Wrap};
 
@@ -20,8 +20,8 @@ use daemonseed_core::passphrase::strength::SESSION_PASSPHRASE_MIN_BITS;
 use daemonseed_core::trust_events::{TrustEventKey, event_key_string};
 
 use crate::app::{
-    App, ChatLine, ChatSurface, CircleStatus, ConnectionStatus, FetchStatus, FetchUi,
-    IndexerStatus, MainFocus, Screen, Surface, TrustItem,
+    App, ChatLine, ChatSurface, CircleStatus, ConnectionStatus, DirSelection, FetchStatus, FetchUi,
+    IndexerStatus, MainFocus, PreviewKind, Screen, Surface, TrustItem,
 };
 use crate::screens::first_start::{FirstStartUi, FsStep};
 
@@ -190,7 +190,7 @@ fn render_fetch_overlay(f: &FetchUi, frame: &mut Frame, area: Rect) {
         // advertise the edit-mode controls instead of the selection ones.
         FetchStatus::Preview(_) if f.editing_dest => "editing destination — [Enter/Esc] done",
         FetchStatus::Preview(_) => {
-            "[↑/↓] move  [space] toggle  [a] all  [d] dest  [Enter] download  [Esc] cancel"
+            "[↑/↓] move  [←/→] fold  [space] select  [a] all  [d] dest  [Enter] download  [Esc] cancel"
         }
         _ => "[Esc] cancel",
     };
@@ -203,13 +203,19 @@ fn render_fetch_overlay(f: &FetchUi, frame: &mut Frame, area: Rect) {
     let inner = outer.inner(popup);
     frame.render_widget(outer, popup);
 
-    // Preview: [info, footer] (no gauge — see below). Transfer: [info, gauge,
-    // footer]. Splitting the layout this way lets the file list claim the rows
-    // the gauge would otherwise hold.
+    // Preview (ISC-C72): [header, tree list, footer] — the header is fixed and
+    // the collapsible tree gets a dedicated scrollable pane (so the cursor stays
+    // visible). Transfer: [info, gauge, footer]. Splitting the layout this way
+    // lets the file list claim the rows the gauge would otherwise hold.
+    const PREVIEW_HEADER_ROWS: u16 = 6; // share / by / blank / selected / dest / blank
     let rows = if is_preview {
         Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(6), Constraint::Length(1)])
+            .constraints([
+                Constraint::Length(PREVIEW_HEADER_ROWS), // header
+                Constraint::Min(1),                      // tree list (scrolls)
+                Constraint::Length(1),                   // footer
+            ])
             .split(inner)
     } else {
         Layout::default()
@@ -222,9 +228,8 @@ fn render_fetch_overlay(f: &FetchUi, frame: &mut Frame, area: Rect) {
             .split(inner)
     };
 
-    let info = match &f.status {
-        // A1 preview: list the share's contents (names + sizes) so the user
-        // sees exactly what a download would pull before committing.
+    match &f.status {
+        // A1 preview (ISC-C72): a fixed header + a scrollable collapsible tree.
         FetchStatus::Preview(entries) => {
             let total_bytes: u64 = entries.iter().map(|e| e.size).sum();
             let sel_count = f.preview_checked.iter().filter(|&&c| c).count();
@@ -244,37 +249,34 @@ fn render_fetch_overlay(f: &FetchUi, frame: &mut Frame, area: Rect) {
             } else {
                 format!("dest: {}", f.dest)
             };
-            let mut s = format!(
-                "share: {}\nby: {sharer}\n\n{sel_count}/{} selected · {} of {}\n{dest_line}\n\n",
+            let header = format!(
+                "share: {}\nby: {sharer}\n\n{sel_count}/{} selected · {} of {}\n{dest_line}",
                 f.share_id,
                 entries.len(),
                 human_bytes(sel_bytes),
                 human_bytes(total_bytes),
             );
-            // A2: each row shows a checkbox; `>` marks the cursor.
-            for (i, e) in entries.iter().enumerate() {
-                let checked = f.preview_checked.get(i).copied().unwrap_or(true);
-                let mark = if checked { "[x]" } else { "[ ]" };
-                let cursor = if i == f.preview_cursor { ">" } else { " " };
-                s.push_str(&format!(
-                    "{cursor}{mark} {}  ({})\n",
-                    e.rel_path,
-                    human_bytes(e.size)
-                ));
-            }
-            s
+            frame.render_widget(
+                Paragraph::new(header)
+                    .wrap(Wrap { trim: false })
+                    .style(Style::default().fg(color)),
+                rows[0],
+            );
+            render_preview_tree(f, frame, rows[1], color);
         }
-        _ => format!(
-            "share: {}\nby: {sharer}\n\nphase: {phase}\nchunks: {}/{total}\nbytes:  {}",
-            f.share_id, f.chunks_received, f.bytes_received,
-        ),
-    };
-    frame.render_widget(
-        Paragraph::new(info)
-            .wrap(Wrap { trim: false })
-            .style(Style::default().fg(color)),
-        rows[0],
-    );
+        _ => {
+            let info = format!(
+                "share: {}\nby: {sharer}\n\nphase: {phase}\nchunks: {}/{total}\nbytes:  {}",
+                f.share_id, f.chunks_received, f.bytes_received,
+            );
+            frame.render_widget(
+                Paragraph::new(info)
+                    .wrap(Wrap { trim: false })
+                    .style(Style::default().fg(color)),
+                rows[0],
+            );
+        }
+    }
 
     // Progress gauge — only in the transfer/terminal views. Preview drops it
     // (no transfer is running yet, and it merely duplicated the header's
@@ -309,15 +311,70 @@ fn render_fetch_overlay(f: &FetchUi, frame: &mut Frame, area: Rect) {
         );
     }
 
-    // Footer is always the last row: row 1 in the preview's 2-row layout, row 2
+    // Footer is always the last row: row 2 in the preview's 3-row layout, row 2
     // when the gauge is present.
-    let footer_row = if is_preview { rows[1] } else { rows[2] };
+    let footer_row = rows[2];
     frame.render_widget(
         Paragraph::new(footer)
             .alignment(Alignment::Center)
             .style(Style::default().fg(color)),
         footer_row,
     );
+}
+
+/// ISC-C72: render the fetch preview's collapsible folder tree into `area`,
+/// windowed so the cursor row stays on-screen. Each visible row is indented by
+/// `depth*2`; a `Dir` shows a fold glyph, an aggregate checkbox
+/// (`[x]`/`[ ]`/`[~]`), and its name; a `File` shows a checkbox, name, and human
+/// size. The cursor row is marked with a leading `>` and reverse-video.
+fn render_preview_tree(f: &FetchUi, frame: &mut Frame, area: Rect, color: Color) {
+    let visible = f.visible_rows();
+    let pane_rows = area.height as usize;
+
+    // Scroll-to-cursor: keep `preview_cursor` within `[scroll, scroll+pane_rows)`.
+    // `preview_scroll` is the persisted anchor; clamp it here (render is pure, so
+    // we derive the drawn scroll rather than mutate state).
+    let mut scroll = f.preview_scroll.min(visible.len().saturating_sub(1));
+    if pane_rows > 0 {
+        if f.preview_cursor < scroll {
+            scroll = f.preview_cursor;
+        } else if f.preview_cursor >= scroll + pane_rows {
+            scroll = f.preview_cursor + 1 - pane_rows;
+        }
+    }
+
+    let mut lines: Vec<Line> = Vec::with_capacity(pane_rows);
+    for (vis_idx, &node) in visible.iter().enumerate().skip(scroll).take(pane_rows) {
+        let n = &f.preview_tree[node];
+        let indent = " ".repeat(n.depth * 2);
+        let is_cursor = vis_idx == f.preview_cursor;
+        let row = match n.kind {
+            PreviewKind::Dir { .. } => {
+                let collapsed = f.preview_collapsed.get(node).copied().unwrap_or(false);
+                let fold = if collapsed { "▸" } else { "▾" };
+                let mark = match f.dir_selection(node) {
+                    DirSelection::All => "[x]",
+                    DirSelection::None => "[ ]",
+                    DirSelection::Partial => "[~]",
+                };
+                format!("{indent}{fold} {mark} {}/", n.name)
+            }
+            PreviewKind::File { manifest_idx, size } => {
+                let checked = f.preview_checked.get(manifest_idx).copied().unwrap_or(true);
+                let mark = if checked { "[x]" } else { "[ ]" };
+                format!("{indent}{mark} {}  ({})", n.name, human_bytes(size))
+            }
+        };
+        let cursor = if is_cursor { ">" } else { " " };
+        let style = if is_cursor {
+            Style::default().fg(color).add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().fg(color)
+        };
+        lines.push(Line::styled(format!("{cursor}{row}"), style));
+    }
+
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 /// The Trust History view (ISC-25 / C28 LogOnly surface): every recorded trust
