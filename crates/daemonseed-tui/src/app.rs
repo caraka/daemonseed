@@ -1760,6 +1760,13 @@ impl App {
                     MainFocus::Deprecation => MainFocus::Fetched,
                     MainFocus::Fetched => MainFocus::Chat,
                 };
+                // ISC-C70: clear the one-shot status line on every focus change.
+                // A transient status (e.g. "share added — indexing…") is tied to
+                // the pane that produced it; once the user navigates away it is
+                // stale, so it must not linger across the rest of the session.
+                // Deterministic (focus-change, not a timer) so it never makes the
+                // TUI tests flaky.
+                self.status = None;
                 // Opening the Shares pane requests a fresh snapshot — the
                 // alpha gate harness drives this through `RefreshShares` so
                 // the screen is never accidentally empty on first view.
@@ -2815,6 +2822,22 @@ mod tests {
         assert_eq!(app.main_focus(), MainFocus::Fetched);
         app.on_key(press(KeyCode::Tab));
         assert_eq!(app.main_focus(), MainFocus::Chat);
+    }
+
+    /// ISC-C70 — a one-shot status line is cleared when the focus changes, so a
+    /// transient message tied to one pane (e.g. "share added — indexing…") does
+    /// not persist across navigation. Deterministic: keyed on the focus change,
+    /// not a timer.
+    #[test]
+    fn focus_change_clears_one_shot_status() {
+        let mut app = drive_to_main();
+        app.set_status("share added — indexing…");
+        assert!(app.status().is_some(), "status set");
+        app.on_key(press(KeyCode::Tab)); // focus change
+        assert!(
+            app.status().is_none(),
+            "a focus change must clear the one-shot status line"
+        );
     }
 
     /// M15 C — opening the Fetched pane queues a downloads-list refresh so the
