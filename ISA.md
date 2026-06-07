@@ -657,6 +657,14 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   M16 smoke test. Tests: `lobby_is_reachable_via_carousel_when_circles_joined` + updated
   `cycling_active_circle_changes_compose_target`. fmt + clippy clean; tui 168 / 0-fail. Probe:
   `cargo test -p daemonseed-tui`.
+- ISC-C66 / C67 (preview file-list visibility) fixed 2026-06-07: the fetch preview overlay was 62×50, so
+  on an 80×24 terminal the info pane resolved to ~6 rows — exactly the header (share/by/selected/dest) —
+  and the file list rendered entirely below the fold, making a multi-file share look contents-less (found
+  in smoke test by caraka: "I see the dest field but nothing below that"). Fix: the Preview overlay is
+  74×80 and drops the progress gauge (meaningless before a download, and it only duplicated the header's
+  selected-count) so the file list claims the room; the transfer/terminal views keep the compact 62×50 +
+  gauge. Regression test `fetch_preview_shows_file_list_on_a_standard_terminal` renders at 80×24 via
+  `TestBackend` and asserts the file names appear. Probe: `cargo test -p daemonseed-tui`.
 - ISC-C67 (A2 selective fetch) verified 2026-06-07: per-file selection (`FetchUi::preview_checked`
   parallel to the manifest, default all-true) + cursor (`preview_cursor`); `↑`/`↓` move, `space` toggles
   the cursor row, `a` toggles all (`on_key_fetch_overlay`); `Enter` collects the checked indices and

@@ -5488,6 +5488,46 @@ mod tests {
         assert_eq!(app.fetch().unwrap().preview_cursor, 1);
     }
 
+    /// A1/A2 regression: the preview's whole purpose is to SHOW the share's
+    /// contents before downloading — so the file list must actually be visible
+    /// on a standard 80×24 terminal, not pushed below the overlay's info pane by
+    /// the header. (Found in smoke test: the file list rendered off-screen.)
+    #[test]
+    fn fetch_preview_shows_file_list_on_a_standard_terminal() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut app = drive_to_main();
+        to_shares(&mut app);
+        app.on_net_event(NetEvent::SharesSnapshot {
+            local: Vec::new(),
+            remote: vec![listing("s1", "docs", "", "alice#aabbccddeeff")],
+            indexer_status: IndexerStatus::Idle,
+        });
+        let _ = app.take_pending_share_fetch();
+        app.on_key(press(KeyCode::Char('f')));
+        app.on_net_event(NetEvent::FetchManifest {
+            share_id: "s1".to_owned(),
+            name: "docs".to_owned(),
+            entries: vec![
+                ShareManifestEntry {
+                    rel_path: "report.pdf".to_owned(),
+                    size: 1234,
+                },
+                ShareManifestEntry {
+                    rel_path: "notes.md".to_owned(),
+                    size: 56,
+                },
+            ],
+        });
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|frame| crate::ui::render(&app, frame)).unwrap();
+        let text = buffer_text(&term);
+        assert!(
+            text.contains("report.pdf") && text.contains("notes.md"),
+            "the preview must show the share's file list on a standard 80×24 terminal; got:\n{text}"
+        );
+    }
+
     /// A3 (ISC-C68): editing the destination then confirming queues a confirm
     /// whose `dest` element is the typed path.
     #[test]

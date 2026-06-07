@@ -158,7 +158,16 @@ fn human_bytes(n: u64) -> String {
 }
 
 fn render_fetch_overlay(f: &FetchUi, frame: &mut Frame, area: Rect) {
-    let popup = centered_rect(62, 50, area);
+    let is_preview = matches!(f.status, FetchStatus::Preview(_));
+    // The preview needs vertical room for the file list; the transfer view is
+    // compact. Bug fix: at 62×50 on an 80×24 terminal the info pane resolved to
+    // only ~6 rows — exactly the header (share/by/selected/dest) — so the file
+    // list rendered entirely below the fold and the share looked contents-less.
+    let popup = if is_preview {
+        centered_rect(74, 80, area)
+    } else {
+        centered_rect(62, 50, area)
+    };
     let (phase, color) = match &f.status {
         FetchStatus::RequestingManifest => ("requesting manifest…".to_owned(), Color::Yellow),
         FetchStatus::Preview(_) => ("preview — review before download".to_owned(), Color::Cyan),
@@ -194,14 +203,24 @@ fn render_fetch_overlay(f: &FetchUi, frame: &mut Frame, area: Rect) {
     let inner = outer.inner(popup);
     frame.render_widget(outer, popup);
 
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(6),    // info
-            Constraint::Length(3), // progress gauge
-            Constraint::Length(1), // footer
-        ])
-        .split(inner);
+    // Preview: [info, footer] (no gauge — see below). Transfer: [info, gauge,
+    // footer]. Splitting the layout this way lets the file list claim the rows
+    // the gauge would otherwise hold.
+    let rows = if is_preview {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(6), Constraint::Length(1)])
+            .split(inner)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(6),    // info
+                Constraint::Length(3), // progress gauge
+                Constraint::Length(1), // footer
+            ])
+            .split(inner)
+    };
 
     let info = match &f.status {
         // A1 preview: list the share's contents (names + sizes) so the user
@@ -257,43 +276,47 @@ fn render_fetch_overlay(f: &FetchUi, frame: &mut Frame, area: Rect) {
         rows[0],
     );
 
-    // A real progress bar so the user sees movement, not just red→green
-    // (M15). Ratio by chunks once the manifest's total is known.
-    let ratio = match f.status {
-        FetchStatus::Complete => 1.0,
-        _ => match f.total_chunks {
-            Some(t) if t > 0 => (f.chunks_received as f64 / t as f64).clamp(0.0, 1.0),
-            _ => 0.0,
-        },
-    };
-    let gauge_label = match &f.status {
-        FetchStatus::Complete => "done".to_owned(),
-        FetchStatus::Failed(_) => "failed".to_owned(),
-        FetchStatus::Preview(entries) => {
-            let sel = f.preview_checked.iter().filter(|&&c| c).count();
-            format!("{sel}/{} selected — Enter to download", entries.len())
-        }
-        _ if f.total_chunks.is_none() => "waiting for manifest…".to_owned(),
-        _ => format!(
-            "{}/{total} chunks · {}%",
-            f.chunks_received,
-            (ratio * 100.0) as u16
-        ),
-    };
-    frame.render_widget(
-        Gauge::default()
-            .block(Block::default().borders(Borders::ALL).title(" progress "))
-            .gauge_style(Style::default().fg(color))
-            .ratio(ratio)
-            .label(gauge_label),
-        rows[1],
-    );
+    // Progress gauge — only in the transfer/terminal views. Preview drops it
+    // (no transfer is running yet, and it merely duplicated the header's
+    // selected-count) so the file list gets the room.
+    if !is_preview {
+        // A real progress bar so the user sees movement, not just red→green
+        // (M15). Ratio by chunks once the manifest's total is known.
+        let ratio = match f.status {
+            FetchStatus::Complete => 1.0,
+            _ => match f.total_chunks {
+                Some(t) if t > 0 => (f.chunks_received as f64 / t as f64).clamp(0.0, 1.0),
+                _ => 0.0,
+            },
+        };
+        let gauge_label = match &f.status {
+            FetchStatus::Complete => "done".to_owned(),
+            FetchStatus::Failed(_) => "failed".to_owned(),
+            _ if f.total_chunks.is_none() => "waiting for manifest…".to_owned(),
+            _ => format!(
+                "{}/{total} chunks · {}%",
+                f.chunks_received,
+                (ratio * 100.0) as u16
+            ),
+        };
+        frame.render_widget(
+            Gauge::default()
+                .block(Block::default().borders(Borders::ALL).title(" progress "))
+                .gauge_style(Style::default().fg(color))
+                .ratio(ratio)
+                .label(gauge_label),
+            rows[1],
+        );
+    }
 
+    // Footer is always the last row: row 1 in the preview's 2-row layout, row 2
+    // when the gauge is present.
+    let footer_row = if is_preview { rows[1] } else { rows[2] };
     frame.render_widget(
         Paragraph::new(footer)
             .alignment(Alignment::Center)
             .style(Style::default().fg(color)),
-        rows[2],
+        footer_row,
     );
 }
 
