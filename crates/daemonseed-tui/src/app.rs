@@ -2302,24 +2302,31 @@ impl App {
         self.active_circle_ref().map(|c| (c.id, c.label.as_str()))
     }
 
-    /// Cycle the active circle one step (ISC-C60: ←/→ in the circle pane).
-    /// `forward` advances toward the next circle; `false` goes back. Wraps
-    /// around the membership set. A no-op when the set is empty (the lobby is the
-    /// only surface). Cycling changes only the active selection — never the
-    /// membership set — so it can never evict a circle (ISC-C59) and the next
-    /// post seals under the newly-active circle's key (ISC-A-C30).
+    /// Cycle the active surface one step (ISC-C60: ←/→ in the circle pane).
+    /// `forward` advances; `false` goes back. The carousel is
+    /// `[lobby, circle₀, …, circleₙ₋₁]` — **position 0 is the lobby**
+    /// (`active_circle == None`) and positions `1..=n` are the joined circles —
+    /// so cycling always wraps back through the lobby (ISC-C56: the lobby is
+    /// always reachable and postable), not just rotating among circles. A no-op
+    /// when no circle is joined (the lobby is then the only surface). Cycling
+    /// changes only the active selection — never the membership set — so it can
+    /// never evict a circle (ISC-C59) and the next post seals under exactly the
+    /// newly-active surface's key (ISC-A-C30).
     pub fn cycle_active_circle(&mut self, forward: bool) {
         let n = self.circles.len();
         if n == 0 {
             return;
         }
-        let cur = self.active_circle.unwrap_or(0);
+        // Map current selection → carousel position (0 = lobby), step with
+        // wraparound over the n+1 positions, then map back (position 0 → lobby).
+        let total = n + 1;
+        let cur = self.active_circle.map_or(0, |i| i + 1);
         let next = if forward {
-            (cur + 1) % n
+            (cur + 1) % total
         } else {
-            (cur + n - 1) % n
+            (cur + total - 1) % total
         };
-        self.active_circle = Some(next);
+        self.active_circle = (next != 0).then(|| next - 1);
     }
 
     /// Chat compose: printable chars append, Backspace deletes, Enter sends a
@@ -2935,6 +2942,39 @@ mod tests {
             label: format!("circle-{id}"),
             entropy: format!("entropy-{id}"),
         });
+    }
+
+    /// ISC-C56 regression: once circles are joined, the carousel must still be
+    /// able to return to the lobby (`active_circle == None`) so the lobby stays
+    /// the postable surface. Before the fix, `cycle_active_circle` rotated among
+    /// circles only and the lobby became unreachable until disconnect — the
+    /// compose box was locked onto circles.
+    #[test]
+    fn lobby_is_reachable_via_carousel_when_circles_joined() {
+        let mut app = App::new();
+        join_circle(&mut app, 1);
+        join_circle(&mut app, 2);
+        // The carousel is [lobby, circle₀, circle₁]; the last join is active.
+        assert_eq!(app.active_circle_index(), Some(1));
+        // Forward from the last circle wraps to the lobby (position 0).
+        app.cycle_active_circle(true);
+        assert_eq!(
+            app.active_circle_index(),
+            None,
+            "cycling forward must reach the lobby, not skip it"
+        );
+        // Continue forward → first circle.
+        app.cycle_active_circle(true);
+        assert_eq!(app.active_circle_index(), Some(0));
+        // Backward from the first circle also lands on the lobby.
+        app.cycle_active_circle(false);
+        assert_eq!(
+            app.active_circle_index(),
+            None,
+            "cycling backward must also reach the lobby"
+        );
+        // Membership is never touched by cycling (ISC-C59).
+        assert_eq!(app.circles().len(), 2);
     }
 
     #[test]
@@ -3769,12 +3809,18 @@ mod tests {
         );
     }
 
-    /// ISC-C60: cycling the active circle changes the compose target — the
-    /// `active_chat_surface` (and thus the `SendChat` seal id) follows the
-    /// carousel. ←/→ wrap around the set.
+    /// ISC-C60 / ISC-C56: cycling the active surface follows the carousel
+    /// `[lobby, circle₀, …]` — the compose target (and thus the `SendChat` seal
+    /// id) tracks it, and the lobby is ALWAYS a carousel position so it stays
+    /// reachable and postable, never skipped in favour of circles-only rotation.
     #[test]
     fn cycling_active_circle_changes_compose_target() {
         let mut app = drive_to_main();
+        // Join the lobby (the default public room) so it is a real postable
+        // surface, then three circles. Carousel becomes [lobby, c10, c20, c30].
+        app.on_net_event(NetEvent::PublicRoomJoined {
+            room: "lobby".to_owned(),
+        });
         join_circle(&mut app, 10);
         join_circle(&mut app, 20);
         join_circle(&mut app, 30);
@@ -3786,30 +3832,32 @@ mod tests {
                 label: "circle-30".to_owned()
             })
         );
-        // → wraps to the first.
+        // → from the last circle wraps to the LOBBY (carousel position 0) —
+        // always reachable (ISC-C56) — not straight to the first circle.
         app.on_key(press(KeyCode::Right));
         assert!(
-            matches!(
-                app.active_chat_surface(),
-                Some(ChatSurface::Circle { id: 10, .. })
-            ),
-            "→ from the last wraps to the first circle"
+            matches!(app.active_chat_surface(), Some(ChatSurface::PublicRoom(_))),
+            "→ from the last circle lands on the lobby"
         );
-        // ← wraps back to the last.
+        assert_eq!(app.active_circle_index(), None);
+        // → again advances to the first circle.
+        app.on_key(press(KeyCode::Right));
+        assert!(matches!(
+            app.active_chat_surface(),
+            Some(ChatSurface::Circle { id: 10, .. })
+        ));
+        // ← from the first circle returns to the lobby.
         app.on_key(press(KeyCode::Left));
         assert!(
-            matches!(
-                app.active_chat_surface(),
-                Some(ChatSurface::Circle { id: 30, .. })
-            ),
-            "← from the first wraps to the last circle"
+            matches!(app.active_chat_surface(), Some(ChatSurface::PublicRoom(_))),
+            "← from the first circle returns to the lobby"
         );
-        // One ← step lands on the middle circle (id 20).
+        // ← from the lobby wraps to the last circle (id 30).
         app.on_key(press(KeyCode::Left));
         assert!(matches!(
             app.active_chat_surface(),
-            Some(ChatSurface::Circle { id: 20, .. })
-        ),);
+            Some(ChatSurface::Circle { id: 30, .. })
+        ));
     }
 
     /// ISC-A-C30: a composed post seals under EXACTLY the active circle's id —

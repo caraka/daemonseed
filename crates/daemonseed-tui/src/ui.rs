@@ -1011,6 +1011,21 @@ fn render_circle_pane(app: &App, frame: &mut Frame, area: Rect) {
                 };
                 (title, lines)
             }
+            // Lobby is the active surface (carousel position 0) but circles ARE
+            // joined: the bottom slot is parked on the lobby. Show that — and how
+            // to enter a circle — rather than the "none joined" prompt (which
+            // would wrongly imply no circles exist). Compose posts to the lobby
+            // here (ISC-C56); the lobby pane above carries its messages.
+            _ if total > 0 => (
+                format!(" lobby active · {total} circle(s) joined  [←/→] cycle "),
+                vec![
+                    Line::from(
+                        "the lobby is active — compose posts to the lobby; [←/→] to enter a circle"
+                            .to_owned(),
+                    )
+                    .style(Style::default().fg(Color::DarkGray)),
+                ],
+            ),
             // Empty membership set (ISC-C61): the join prompt lives here; the lobby
             // pane above stays live.
             _ => (

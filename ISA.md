@@ -598,6 +598,16 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
 
 ## Changelog
 
+- **conjectured:** the multi-circle carousel (ISC-C60) lets the active surface span the lobby and the
+  joined circles, so the lobby stays reachable and postable (ISC-C56).
+  **refuted by:** a 2026-06-07 smoke test (caraka) — once any circle was joined the compose box was
+  locked onto circles; the lobby could not be selected to post to.
+  **learned:** `cycle_active_circle` rotated only over the circle indices and always set
+  `active_circle = Some(_)`, so the lobby position (`active_circle == None`) was omitted from the
+  carousel and reachable only by disconnecting. Pre-existing since the v0.16 multi-circle carousel.
+  **criterion now:** the carousel is `[lobby, circle₀, …]` — `cycle_active_circle` ranges over the n+1
+  positions and maps position 0 back to `active_circle = None`, so ←/→ always returns to the lobby
+  (regression test `lobby_is_reachable_via_carousel_when_circles_joined`).
 - **conjectured:** project state is "86 ISCs, pre-implementation" (per the vault current-phase snapshot,
   last updated 2026-05-22).
   **refuted by:** reconciliation on 2026-05-29 — git tags show M0–M10 shipped (through v0.12.1) with M11 in
@@ -639,6 +649,14 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   `preview_enter_queues_confirm_all`, `preview_esc_cancels_without_download` — plus the unchanged fetch
   suite. fmt + clippy `-D warnings` clean; full-workspace `cargo test` 0-fail (tui 156). Live 2-daemon
   preview→confirm probe is a tracked follow-up. Probe: `cargo test -p daemonseed-tui`.
+- ISC-C56 / C60 (lobby reachable in the chat carousel) verified 2026-06-07: `cycle_active_circle` now
+  treats the lobby as carousel position 0 (`[lobby, circle₀, …]`); ←/→ returns to `active_circle = None`
+  so the compose box (`active_chat_surface`) routes to the lobby (`PublicRoom`) and stays postable. The
+  circle pane shows "lobby active · N circle(s) joined" when parked on the lobby with circles present
+  (not the "none joined" prompt). Pre-existing regression since the v0.16 carousel, surfaced by caraka's
+  M16 smoke test. Tests: `lobby_is_reachable_via_carousel_when_circles_joined` + updated
+  `cycling_active_circle_changes_compose_target`. fmt + clippy clean; tui 168 / 0-fail. Probe:
+  `cargo test -p daemonseed-tui`.
 - ISC-C67 (A2 selective fetch) verified 2026-06-07: per-file selection (`FetchUi::preview_checked`
   parallel to the manifest, default all-true) + cursor (`preview_cursor`); `↑`/`↓` move, `space` toggles
   the cursor row, `a` toggles all (`on_key_fetch_overlay`); `Enter` collects the checked indices and
