@@ -45,7 +45,7 @@ use daemonseed_core::crypto::deprecation::{PolicyCache, PolicyError, verify_poli
 use daemonseed_core::crypto::suite::{CNSA_2_0, SuiteId};
 use daemonseed_core::federation::discovered::DiscoveredPeers;
 use daemonseed_core::federation::store::{InMemoryTrustStore, ServerEntry, TrustStore};
-use daemonseed_core::handle::Handle;
+use daemonseed_core::handle::{DisplayMode, Handle};
 use daemonseed_core::indexer::scan_into;
 use daemonseed_core::public_room::{
     DEFAULT_ROOM, derive_room_key, open_room_message, room_asset_address, seal_room_message,
@@ -1795,17 +1795,29 @@ async fn read_inbound_public_room(
             Ok(Some(frame)) => {
                 // open_room_message verifies the embedded provenance signature
                 // before returning, so only verified messages are surfaced.
-                if let Ok(msg) = open_room_message(&room_key, &frame.payload)
-                    && evt_tx
+                if let Ok(msg) = open_room_message(&room_key, &frame.payload) {
+                    // ISC-C57: bind the displayed author to SHA-384(sender_pubkey)[:12].
+                    // A self-asserted `sender_handle` whose hash disagrees with the
+                    // verified provenance pubkey is shown at its `#<prefix>` floor,
+                    // never under the spoofed name. A bind error (oxicrypt self-test)
+                    // is effectively unreachable here — `open_room_message` already
+                    // exercised the same key material — so drop the frame rather than
+                    // surface it unbound.
+                    let Ok(bound) = Handle::display_bound(&msg.sender_handle, &msg.sender_pubkey)
+                    else {
+                        continue;
+                    };
+                    if evt_tx
                         .send(NetEvent::PublicRoomMessage {
                             room: msg.room,
-                            sender: msg.sender_handle,
+                            sender: bound.format(DisplayMode::Default),
                             body: msg.body,
                             sent_unix_ms: msg.sent_unix_ms,
                         })
                         .is_err()
-                {
-                    return; // UI gone
+                    {
+                        return; // UI gone
+                    }
                 }
             }
             Ok(None) | Err(_) => return,

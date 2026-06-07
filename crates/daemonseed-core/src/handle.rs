@@ -144,6 +144,38 @@ impl Handle {
         }
     }
 
+    /// Bind a *transmitted* (self-asserted) handle string to the authoritative
+    /// identity proven by `pubkey`, returning the handle that is safe to
+    /// **display** (ISC-C57 / ISC-C4).
+    ///
+    /// A wire message carries a `sender_handle` the sender chose for itself and a
+    /// `sender_pubkey` its provenance signature was verified under (ISC-S24 —
+    /// checked by the opener before this is reached). The authoritative hash
+    /// prefix is always `SHA-384(pubkey)[:12]`; the self-asserted display name is
+    /// honored ONLY when the transmitted handle's hash component matches that
+    /// prefix. A transmitted handle that is unparseable, or whose hash disagrees
+    /// with the pubkey, drops to the verified floor (`#<authoritative-12hex>`) —
+    /// so a spoofed `sender_handle` can never be rendered under another daemon's
+    /// name. The returned handle's hash prefix is *always* the pubkey-derived
+    /// truth, never the transmitted claim.
+    ///
+    /// Returns the underlying oxicrypt error only if SHA-384's power-up self-test
+    /// has not passed — effectively unreachable on this path, since opening the
+    /// message already exercised the same key material.
+    pub fn display_bound(transmitted: &str, pubkey: &[u8]) -> Result<Handle, OxicryptError> {
+        let authoritative = Handle::from_pubkey(None, pubkey)?;
+        match transmitted.parse::<Handle>() {
+            // Hash component matches the key → the self-asserted name is bound to
+            // this identity; honor it (keeping the authoritative prefix).
+            Ok(claimed) if claimed.hash_prefix == authoritative.hash_prefix => {
+                Ok(authoritative.with_display_name(claimed.display_name))
+            }
+            // Unparseable, or hash disagrees with the pubkey → never show the
+            // spoofable name; present the verified floor.
+            _ => Ok(authoritative),
+        }
+    }
+
     /// Returns the display name, if set. `None` indicates floor presentation
     /// (`#<12hex>`).
     pub fn display_name(&self) -> Option<&str> {
@@ -414,5 +446,64 @@ mod tests {
     fn hash_prefix_length_is_six_bytes() {
         assert_eq!(HASH_PREFIX_BYTES, 6);
         assert_eq!(HASH_PREFIX_HEX_CHARS, 12);
+    }
+
+    // ── display_bound (ISC-C57 receive-side handle binding) ─────────────────
+
+    #[test]
+    fn display_bound_honors_name_when_hash_matches_pubkey() {
+        ensure_oxicrypt_initialized();
+        let pubkey = b"sender identity key";
+        let truth = Handle::from_pubkey(None, pubkey).unwrap();
+        let transmitted = format!("alice#{}", hex::encode(truth.hash_prefix()));
+
+        let bound = Handle::display_bound(&transmitted, pubkey).unwrap();
+
+        assert_eq!(bound.display_name(), Some("alice"));
+        assert_eq!(bound.hash_prefix(), truth.hash_prefix());
+        assert_eq!(bound.format(DisplayMode::Default), "alice");
+    }
+
+    #[test]
+    fn display_bound_drops_to_floor_on_hash_mismatch() {
+        // The spoof: an attacker signs with its OWN key (so sender_pubkey is
+        // theirs) but asserts a sender_handle carrying a DIFFERENT hash prefix
+        // to impersonate another daemon. The mismatch must collapse to floor.
+        ensure_oxicrypt_initialized();
+        let pubkey = b"real sender key";
+        let truth = Handle::from_pubkey(None, pubkey).unwrap();
+        let wrong_hex = "0123456789ab";
+        assert_ne!(wrong_hex, hex::encode(truth.hash_prefix()).as_str());
+        let transmitted = format!("bob#{wrong_hex}");
+
+        let bound = Handle::display_bound(&transmitted, pubkey).unwrap();
+
+        assert!(bound.is_floor(), "a spoofed display name must not survive");
+        assert_eq!(bound.hash_prefix(), truth.hash_prefix());
+        assert_eq!(
+            bound.format(DisplayMode::Default),
+            format!("#{}", hex::encode(truth.hash_prefix()))
+        );
+    }
+
+    #[test]
+    fn display_bound_drops_to_floor_on_unparseable_handle() {
+        ensure_oxicrypt_initialized();
+        let pubkey = b"third identity key";
+        let bound = Handle::display_bound("no-hash-separator", pubkey).unwrap();
+        assert!(bound.is_floor());
+    }
+
+    #[test]
+    fn display_bound_floor_handle_stays_floor() {
+        ensure_oxicrypt_initialized();
+        let pubkey = b"fourth identity key";
+        let truth = Handle::from_pubkey(None, pubkey).unwrap();
+        let transmitted = format!("#{}", hex::encode(truth.hash_prefix()));
+
+        let bound = Handle::display_bound(&transmitted, pubkey).unwrap();
+
+        assert!(bound.is_floor());
+        assert_eq!(bound.hash_prefix(), truth.hash_prefix());
     }
 }

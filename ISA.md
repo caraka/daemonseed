@@ -250,7 +250,7 @@ Each criterion is a verifiable boundary: positive ISCs describe a durable end-st
 - [ ] ISC-C37: At first-start the client offers exactly two bootstrap-relay paths: default project-canonical relay (server-id + address shipped in a bundled bootstrap-anchor file, added in trusted mode), and manual paste (a server-id + address obtained out-of-band, also added in trusted mode with first-contact hash verification). No third path — no mDNS/DHT/introducer auto-discovery and no "connect without a relay" mode. The chosen relay persists in the profile config.
   - rationale: Manual paste is the relief valve for users in censored regions — the project canonical relay is the single largest target for network-level censorship, so a community-relay bootstrap path distributed out-of-band must always exist. Shipping a default bootstrap-anchor obliges the project to operate the canonical relay as a governance-level commitment.
 - [ ] ISC-C56: The client derives the global public-room key client-side from public inputs (crypto-family token + room name; ISC-S22) and the room's rendezvous address as `SHA-384(room_key ‖ server_id)` (ISC-S23). The default chat surface is the well-known default public room ("lobby") — no circle is required to chat; circles are the private opt-in. The room key is global by construction (no secret IKM), so any client computes it without coordination.
-- [ ] ISC-C57: When reading a public room the client verifies each message's provenance signature (ISC-S24) and binds the *displayed* author to the handle hash-prefix `SHA-384(sender_pubkey)[:12]` (ISC-C4), trusting the embedded pubkey over the self-asserted `sender_handle`. A handle whose hash component disagrees with the pubkey is shown at its verified `#<prefix>` floor, never under the spoofed display name. When posting, the client self-signs with the user's own identity (ISC-S24).
+- [x] ISC-C57: When reading a public room the client verifies each message's provenance signature (ISC-S24) and binds the *displayed* author to the handle hash-prefix `SHA-384(sender_pubkey)[:12]` (ISC-C4), trusting the embedded pubkey over the self-asserted `sender_handle`. A handle whose hash component disagrees with the pubkey is shown at its verified `#<prefix>` floor, never under the spoofed display name. When posting, the client self-signs with the user's own identity (ISC-S24).
 - [ ] ISC-C58: Public-room abuse is mitigated by the same client-local mute story as circles (ISC-C15): a muted full handle's public-room messages are suppressed locally, unilaterally and silently, on top of the per-connection relay rate limits (ISC-S17). A full ban system is out of scope for the MVP (deferred); mute + rate-limiting is the alpha surface.
 
 - [ ] ISC-C47: The default backup-verification confirmation at first-start (ISC-C29 step 4) is the 3-word random type-back challenge (ISC-C34): pressing the primary confirm action issues `issue_type_back_challenge(OsRng)` and requires the user to type back N=3 cryptographically-chosen words. The full 24-word re-type round-trip (ISC-C33) remains available as an explicit secondary opt-in. Either path is a real demonstration of phrase capture (never a click-through, ISC-A-C13); the change is which one is the default, not weakening the gate.
@@ -564,6 +564,20 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
 - 2026-05-29: **Clean-device recovery (gate step 8) is MVP-gating** — confirmed not deferrable; it is the
   first-start recover branch (ISC-C30–C34 family) and upholds the "identity recoverable before exposed"
   Principle. It lands in M11 (TUI-only) and the full gate at v0.14.0 includes it.
+- 2026-06-07: **ISC-C57 is public-room-only by design; intra-circle sender authentication is a separate,
+  deferred concern.** Implementing C57 (M16 B1) surfaced that `wire::PublicRoomMessage` carries
+  `sender_pubkey` + `signature` (open-post rooms need per-message provenance, ISC-S24) while
+  `wire::CircleMessage` carries only a self-asserted `sender_handle` — no pubkey, no signature. That is
+  intentional: a circle is flat/metadata-free (F16) and circle membership (holding `cot_key`) IS the auth
+  boundary, so the relay and non-members can neither read nor forge a circle message. What is NOT proven is
+  *which* member authored one — `sender_handle` is self-asserted, so a malicious member could display
+  another member's name. C57's text only ever scoped public rooms; it is satisfied by the new
+  `handle::Handle::display_bound(transmitted, pubkey)` helper wired into `net::read_inbound_public_room`
+  (binds the displayed author to `SHA-384(sender_pubkey)[:12]`, dropping a hash-mismatched or unparseable
+  handle to the verified `#<prefix>` floor). Intra-circle sender authentication (add `sender_pubkey` +
+  ML-DSA signature to `CircleMessage`; sign-on-send + verify-on-read) is a new, circle-specific criterion
+  deferred to M17 with the circle-shares work — it reuses `display_bound` unchanged once a pubkey rides the
+  circle wire. (caraka, 2026-06-07.)
 
 ## Changelog
 
@@ -650,3 +664,14 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   `fetched_shares_event_populates_list` (NetEvent::FetchedShares replaces browse list wholesale),
   `fetched_enter_queues_extract` (Enter on a Fetched row with a typed dest queues ExtractShare).
   Probe: `cargo test -p daemonseed-core -p daemonseed-tui`.
+- ISC-C57 (receive-side handle binding) verified 2026-06-07 (M16 B1): new
+  `daemonseed_core::handle::Handle::display_bound(transmitted, pubkey)` + 4 unit tests —
+  `display_bound_honors_name_when_hash_matches_pubkey`, `display_bound_drops_to_floor_on_hash_mismatch`
+  (the spoof case: sign with own key, assert a foreign hash → collapses to floor),
+  `display_bound_drops_to_floor_on_unparseable_handle`, `display_bound_floor_handle_stays_floor` — wired
+  into `daemonseed_tui::net::read_inbound_public_room` so the emitted `PublicRoomMessage.sender` is now
+  `display_bound(&msg.sender_handle, &msg.sender_pubkey).format(Default)`, never the raw `sender_handle`.
+  fmt + clippy `-D warnings` clean; full workspace `cargo test` 0-fail (handle suite 35). The live
+  2-daemon "spoofed handle shows floor" probe is a tracked follow-up (blind-PTY). Circle path is out of
+  scope by the 2026-06-07 Decisions entry (CircleMessage carries no pubkey to bind). Probe: `cargo test -p
+  daemonseed-core handle::` + `cargo test -p daemonseed-tui`.
