@@ -599,12 +599,45 @@ fn render_my_shares_pane(app: &App, frame: &mut Frame, area: Rect) {
         IndexerStatus::Ready { .. } => Color::Green,
     };
 
-    let mut lines: Vec<Line> = Vec::with_capacity(1 + app.local_shares().len());
+    let mut lines: Vec<Line> = Vec::with_capacity(2 + app.local_shares().len());
     lines.push(Line::from(status).style(Style::default().fg(status_color)));
+
+    // My-defined shares (M16 C1, ISC-C69): the roots the user has defined this
+    // session, with a `[`/`]` selection cursor and a `published` marker. `[p]`
+    // publishes the selected one, `[u]` unpublishes it. Each published share is
+    // served by its own session-scoped serve task; the indexed file-count list
+    // below stays single-active (the latest-defined root) per the M14 deferral.
+    if app.defined_shares().is_empty() {
+        lines.push(
+            Line::from("defined: (none — Tab → define-share)".to_owned())
+                .style(Style::default().fg(Color::DarkGray)),
+        );
+    } else {
+        lines.push(
+            Line::from("defined shares  ([[/]] select · [p] publish · [u] unpublish):".to_owned())
+                .style(Style::default().fg(Color::DarkGray)),
+        );
+        let served_names: std::collections::BTreeSet<&str> =
+            app.published().iter().map(|(_, n)| n.as_str()).collect();
+        for (i, (_, name)) in app.defined_shares().iter().enumerate() {
+            let marker = if i == app.defined_sel() { "▶ " } else { "  " };
+            let pub_marker = if served_names.contains(name.as_str()) {
+                "  ● published"
+            } else {
+                ""
+            };
+            let style = if i == app.defined_sel() {
+                Style::default().fg(Color::Cyan).bold()
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(format!("{marker}{name}{pub_marker}")).style(style));
+        }
+    }
 
     if app.local_shares().is_empty() {
         lines.push(
-            Line::from("(no local shares)".to_owned()).style(Style::default().fg(Color::DarkGray)),
+            Line::from("(no indexed files)".to_owned()).style(Style::default().fg(Color::DarkGray)),
         );
     } else {
         for entry in app.local_shares() {
@@ -1106,13 +1139,13 @@ fn render_main_input(app: &App, frame: &mut Frame, area: Rect) {
             )
         }
         MainFocus::Shares => {
-            // M15 cleanup: publishing is `[p]` on the defined share (define once,
-            // then publish) — no separate Publish pane. Show what's defined +
-            // what's serving so the action is obvious.
-            let defined = app
-                .active_defined_share()
-                .map(|(_, name)| format!("   defined: {name} · [p] publish"))
-                .unwrap_or_else(|| "   (Tab → define-share first)".to_owned());
+            // M16 C1 (ISC-C69): several shares can be defined; `[`/`]` select
+            // the My-defined cursor, `[p]`/`[u]` publish/unpublish the selected
+            // one. Show the selected defined share + how many are serving.
+            let defined = match app.selected_defined_share() {
+                Some((_, name)) => format!("   defined: {name} · [[/]] select · [p] publish"),
+                None => "   (Tab → define-share first)".to_owned(),
+            };
             let serving = app.published().len();
             let serving_hint = if serving > 0 {
                 format!(" · serving {serving} · [u] unpublish")
@@ -1121,7 +1154,7 @@ fn render_main_input(app: &App, frame: &mut Frame, area: Rect) {
             };
             (
                 format!(
-                    "shares  [↑/↓] select  [f] fetch  [r] refresh  [Tab] define-share  [Esc] back{defined}{serving_hint}"
+                    "shares  [↑/↓] fetch-select  [f] fetch  [r] refresh  [Tab] define-share  [Esc] back{defined}{serving_hint}"
                 ),
                 String::new(),
             )

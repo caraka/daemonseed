@@ -538,11 +538,21 @@ pub struct App {
     /// daemon re-indexes its remembered roots without re-typing. FIFO preserves
     /// definition order. Mirrors [`Self::pending_joins`] for circles.
     pending_share_defines: std::collections::VecDeque<ShareDefineRequest>,
-    /// The currently-defined share root + its display name (M15 cleanup). Set
-    /// whenever a share is defined (interactively or restored on Unlock); the
-    /// Shares pane's `[p]` action publishes this root. `None` until a share is
-    /// defined. MVP single-active-share (the most recent define wins).
-    active_defined_share: Option<(std::path::PathBuf, String)>,
+    /// The defined share roots + their display names (M16 C1, ISC-C69). One
+    /// entry per share the user has defined this session (interactively or
+    /// restored on Unlock, in full); appended on define (dedup by root) and
+    /// restored entirely across Unlock. The Shares pane lists these with a
+    /// selection cursor ([`Self::defined_sel`]); `[p]` publishes the selected
+    /// root, `[u]` unpublishes the selected one if it is currently served.
+    /// Empty until a share is defined. Each published root is served by its own
+    /// session-scoped serve task on the net actor (the redb browse-index stays
+    /// single-active per the M14 deferral — only the latest-defined root is
+    /// reflected in the "my shares" indexed file-count view).
+    defined_shares: Vec<(std::path::PathBuf, String)>,
+    /// Selection cursor into [`Self::defined_shares`] for the Shares pane's
+    /// My-defined list (M16 C1). `↑`/`↓` move it (clamped); `[p]`/`[u]` act on
+    /// the selected entry. Clamped on restore/append so it never dangles.
+    defined_sel: usize,
     /// Single-shot slot for a publish request (M15); the binary drains it via
     /// [`Self::take_pending_publish`] into `NetCommand::PublishShare`.
     pending_publish: Option<PublishRequest>,
@@ -750,7 +760,8 @@ impl App {
             pending_join: None,
             pending_share_define: None,
             pending_share_defines: std::collections::VecDeque::new(),
-            active_defined_share: None,
+            defined_shares: Vec::new(),
+            defined_sel: 0,
             pending_publish: None,
             pending_unpublish: None,
             published: Vec::new(),
@@ -873,10 +884,41 @@ impl App {
             .or_else(|| self.pending_share_defines.pop_front())
     }
 
-    /// The currently-defined share root + name, if any (M15 cleanup) — what
-    /// the Shares pane's `[p]` publishes.
-    pub fn active_defined_share(&self) -> Option<&(std::path::PathBuf, String)> {
-        self.active_defined_share.as_ref()
+    /// All defined share roots + names, in definition order (M16 C1, ISC-C69) —
+    /// the My-defined list rendered in the Shares pane.
+    pub fn defined_shares(&self) -> &[(std::path::PathBuf, String)] {
+        &self.defined_shares
+    }
+
+    /// The selection cursor into [`Self::defined_shares`] (M16 C1).
+    pub fn defined_sel(&self) -> usize {
+        self.defined_sel
+    }
+
+    /// The currently-selected defined share (M16 C1) — what the Shares pane's
+    /// `[p]`/`[u]` act on. `None` when nothing is defined.
+    pub fn selected_defined_share(&self) -> Option<&(std::path::PathBuf, String)> {
+        self.defined_shares.get(self.defined_sel)
+    }
+
+    /// Append a defined share root, deduplicating by root (M16 C1). Defining the
+    /// same root twice does not duplicate it; the display name is refreshed to
+    /// the latest. Used by both the interactive define and the Unlock restore.
+    fn push_defined_share(&mut self, root: std::path::PathBuf, name: String) {
+        if let Some(existing) = self.defined_shares.iter_mut().find(|(r, _)| r == &root) {
+            existing.1 = name;
+        } else {
+            self.defined_shares.push((root, name));
+        }
+        self.clamp_defined_sel();
+    }
+
+    /// Keep [`Self::defined_sel`] within bounds of [`Self::defined_shares`].
+    fn clamp_defined_sel(&mut self) {
+        let max = self.defined_shares.len().saturating_sub(1);
+        if self.defined_sel > max {
+            self.defined_sel = max;
+        }
     }
 
     /// Shares currently published+served this session as `(share_id, name)` (D, M15).
@@ -1013,10 +1055,11 @@ impl App {
         // (not `on_key_define_share`), they re-index without re-persisting.
         for sh in session.seeds.shares() {
             let root = std::path::PathBuf::from(&sh.root);
-            // Remember the (last) restored root so `[p]` can publish it without
-            // re-defining (M15 cleanup).
-            self.active_defined_share =
-                Some((root.clone(), Self::share_display_name(&root, &sh.label)));
+            // Restore EVERY persisted root into the My-defined list so `[p]`/`[u]`
+            // can publish/unpublish each independently (M16 C1, ISC-C69) — not
+            // just the last-defined one.
+            let name = Self::share_display_name(&root, &sh.label);
+            self.push_defined_share(root.clone(), name);
             self.pending_share_defines.push_back(ShareDefineRequest {
                 root,
                 label: sh.label.clone(),
@@ -1925,12 +1968,16 @@ impl App {
         }
     }
 
-    /// Shares-pane key handling (read-only display, ISC-17 / ISC-20).
+    /// Shares-pane key handling (ISC-17 / ISC-20 / ISC-C69).
     ///
     /// `Up` / `Down` move the public-shares selection (clamped to the visible,
     /// hide-filtered subset so a hidden row can never be highlighted);
-    /// `r` requests a fresh snapshot; `f` initiates a fetch of the currently-
-    /// selected public-share row (ISC-19, F23 unified mechanism).
+    /// `[` / `]` move the My-defined selection (M16 C1, ISC-C69, same
+    /// saturating idiom as the other single-list panes); `r` requests a fresh
+    /// snapshot; `f` initiates a fetch of the currently-selected public-share
+    /// row (ISC-19, F23 unified mechanism); `p` / `u` publish / unpublish the
+    /// selected defined share. (`Up`/`Down` stay on public shares to keep the
+    /// fetch flow's selector untouched; the defined-list cursor rides `[`/`]`.)
     fn on_key_shares(&mut self, key: KeyEvent) {
         let visible = self.visible_public_shares_count();
         match key.code {
@@ -1943,24 +1990,31 @@ impl App {
                     self.share_sel += 1;
                 }
             }
+            KeyCode::Char('[') => {
+                self.defined_sel = self.defined_sel.saturating_sub(1);
+            }
+            KeyCode::Char(']') => {
+                let max = self.defined_shares.len().saturating_sub(1);
+                if self.defined_sel < max {
+                    self.defined_sel += 1;
+                }
+            }
             KeyCode::Char('r') | KeyCode::Char('R') => {
                 self.pending_share_refresh = true;
             }
             KeyCode::Char('p') | KeyCode::Char('P') => {
-                // Publish the currently-defined share to the relay (M15 cleanup —
-                // define once via DefineShare, then `[p]` here; no re-typing).
-                self.publish_active_share();
+                // Publish the SELECTED defined share to the relay (M16 C1,
+                // ISC-C69 — define several via DefineShare, select with `[`/`]`,
+                // then `[p]`). Each published share serves on its own task.
+                self.publish_selected_share();
             }
             KeyCode::Char('u') | KeyCode::Char('U') => {
-                // Unpublish the most-recently published share (D, M15). Serving is
-                // session-scoped, so this is the in-session "stop sharing"; quit /
-                // disconnect reaps everything anyway. The binary forwards it as
-                // NetCommand::UnpublishShare; PublishStopped prunes `published`.
-                if let Some((share_id, _)) = self.published.last() {
-                    self.pending_unpublish = Some(share_id.clone());
-                } else {
-                    self.status = Some("nothing published to unpublish".to_owned());
-                }
+                // Unpublish the SELECTED defined share if it is currently served
+                // (M16 C1, ISC-C69). Serving is session-scoped, so this is the
+                // in-session "stop sharing"; quit / disconnect reaps everything
+                // anyway. The binary forwards it as NetCommand::UnpublishShare;
+                // PublishStopped prunes `published`.
+                self.unpublish_selected_share();
             }
             KeyCode::Char('f') | KeyCode::Char('F') => {
                 // Snapshot the selected visible row and start a fetch. A
@@ -2446,10 +2500,11 @@ impl App {
                     seeds.add_share(root_str, label.clone());
                     self.persist_seeds();
                 }
-                // Remember the defined root so the Shares pane's `[p]` can
-                // publish it (M15 cleanup — define once, then `[p]`).
-                self.active_defined_share =
-                    Some((root.clone(), Self::share_display_name(&root, &label)));
+                // Append the defined root to the My-defined list (dedup by root)
+                // so the Shares pane's `[p]`/`[u]` can publish/unpublish it
+                // independently (M16 C1, ISC-C69 — define several, act per-share).
+                let name = Self::share_display_name(&root, &label);
+                self.push_defined_share(root.clone(), name);
                 self.pending_share_define = Some(ShareDefineRequest { root, label });
                 self.status = Some("share added — indexing… ([p] in Shares to publish)".to_owned());
                 // Return to the My-shares view so the new root's indexer status
@@ -2473,12 +2528,13 @@ impl App {
         })
     }
 
-    /// Publish the currently-defined share root to the relay (M15 cleanup —
-    /// the Shares pane's `[p]` action). Define once, then `[p]`; no re-typing.
+    /// Publish the **selected** defined share root to the relay (M16 C1,
+    /// ISC-C69 — the Shares pane's `[p]` action). Define several, select with
+    /// `↑`/`↓`, then `[p]`; each is served by its own session-scoped serve task.
     /// A no-op with a hint if nothing is defined yet.
-    fn publish_active_share(&mut self) {
+    fn publish_selected_share(&mut self) {
         let sharer_handle = self.own_handle();
-        match self.active_defined_share.clone() {
+        match self.selected_defined_share().cloned() {
             Some((root, name)) => {
                 self.pending_publish = Some(PublishRequest {
                     root,
@@ -2489,6 +2545,31 @@ impl App {
             }
             None => {
                 self.status = Some("define a share first (Tab → DefineShare), then [p]".to_owned());
+            }
+        }
+    }
+
+    /// Unpublish the selected defined share if it is currently being served
+    /// (M16 C1, ISC-C69 — the Shares pane's `[u]` action). The published list
+    /// is keyed by server-assigned `share_id` but carries each share's display
+    /// name, so the selected defined share is matched by name. A no-op with a
+    /// hint if the selected share is not currently published.
+    fn unpublish_selected_share(&mut self) {
+        let selected_name = self.selected_defined_share().map(|(_, name)| name.clone());
+        let share_id = selected_name.as_ref().and_then(|name| {
+            self.published
+                .iter()
+                .find(|(_, n)| n == name)
+                .map(|(id, _)| id.clone())
+        });
+        match share_id {
+            Some(id) => self.pending_unpublish = Some(id),
+            None => {
+                self.status = Some(if selected_name.is_some() {
+                    "selected share is not currently published".to_owned()
+                } else {
+                    "nothing to unpublish".to_owned()
+                });
             }
         }
     }
@@ -3047,7 +3128,7 @@ mod tests {
         assert_eq!(app.main_focus(), MainFocus::Shares);
         let _ = app.take_pending_share_define();
         assert!(
-            app.active_defined_share().is_some(),
+            app.selected_defined_share().is_some(),
             "root remembered for [p]"
         );
 
@@ -3086,11 +3167,26 @@ mod tests {
         assert!(app.status().is_some(), "a hint explains define-first");
     }
 
-    /// `PublishStarted` tracks the share; `[u]` in the Shares pane queues the
-    /// unpublish; `PublishStopped` prunes it from the served list.
+    /// `PublishStarted` tracks the share; `[u]` on the matching selected defined
+    /// share queues the unpublish; `PublishStopped` prunes it (M16 C1, ISC-C69).
     #[test]
     fn publish_lifecycle_tracks_and_unpublish_queues() {
         let mut app = drive_to_main();
+        // Define a share so `[u]` has a selected defined share to act on. The
+        // PublishStarted name must match the defined share's display name.
+        for _ in 0..4 {
+            app.on_key(press(KeyCode::Tab));
+        }
+        assert_eq!(app.main_focus(), MainFocus::DefineShare);
+        let dir = std::env::temp_dir();
+        let input = format!("{}|My Share", dir.display());
+        for ch in input.chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        app.on_key(press(KeyCode::Enter));
+        let _ = app.take_pending_share_define();
+        assert_eq!(app.main_focus(), MainFocus::Shares);
+
         app.on_net_event(NetEvent::PublishStarted {
             share_id: "deadbeef".to_owned(),
             name: "My Share".to_owned(),
@@ -3099,16 +3195,11 @@ mod tests {
         assert_eq!(app.published().len(), 1);
         assert_eq!(app.published()[0].0, "deadbeef");
 
-        // Focus the Shares pane (Chat → JoinCircle → Mute → Shares) and press [u].
-        for _ in 0..3 {
-            app.on_key(press(KeyCode::Tab));
-        }
-        assert_eq!(app.main_focus(), MainFocus::Shares);
         app.on_key(press(KeyCode::Char('u')));
         assert_eq!(
             app.take_pending_unpublish().as_deref(),
             Some("deadbeef"),
-            "[u] queues an unpublish for the published share"
+            "[u] queues an unpublish for the selected published share"
         );
 
         app.on_net_event(NetEvent::PublishStopped {
@@ -3120,7 +3211,7 @@ mod tests {
         );
     }
 
-    /// `[u]` with nothing published is a no-op that sets an explanatory status.
+    /// `[u]` with nothing defined is a no-op that sets an explanatory status.
     #[test]
     fn unpublish_with_nothing_published_is_a_noop() {
         let mut app = drive_to_main();
@@ -3134,6 +3225,162 @@ mod tests {
             "nothing to unpublish"
         );
         assert!(app.status().is_some());
+    }
+
+    // ── M16 C1: multi-share publish (ISC-C69) ────────────────────────────
+
+    /// Define two distinct roots → both land in `defined_shares` (dedup by root);
+    /// publishing each (simulated PublishStarted) → both tracked in `published`;
+    /// `[u]` on the selected one removes only it.
+    #[test]
+    fn multi_share_define_publish_and_independent_unpublish() {
+        let mut app = drive_to_main();
+
+        // Two distinct real directories to define.
+        let base = std::env::temp_dir();
+        let dir_a = base.join("ds-m16-c1-share-a");
+        let dir_b = base.join("ds-m16-c1-share-b");
+        std::fs::create_dir_all(&dir_a).expect("mk dir a");
+        std::fs::create_dir_all(&dir_b).expect("mk dir b");
+
+        // Define share A.
+        for _ in 0..4 {
+            app.on_key(press(KeyCode::Tab));
+        }
+        assert_eq!(app.main_focus(), MainFocus::DefineShare);
+        for ch in format!("{}|Share A", dir_a.display()).chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        app.on_key(press(KeyCode::Enter));
+        let _ = app.take_pending_share_define();
+
+        // Define share B (Shares → DefineShare is one Tab).
+        app.on_key(press(KeyCode::Tab));
+        assert_eq!(app.main_focus(), MainFocus::DefineShare);
+        for ch in format!("{}|Share B", dir_b.display()).chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        app.on_key(press(KeyCode::Enter));
+        let _ = app.take_pending_share_define();
+
+        // Both defined; defining A again does not duplicate it.
+        assert_eq!(app.defined_shares().len(), 2, "two distinct roots defined");
+        app.on_key(press(KeyCode::Tab));
+        for ch in format!("{}|Share A again", dir_a.display()).chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        app.on_key(press(KeyCode::Enter));
+        let _ = app.take_pending_share_define();
+        assert_eq!(
+            app.defined_shares().len(),
+            2,
+            "re-defining the same root does not duplicate"
+        );
+
+        // Publish both (simulate the relay's PublishStarted for each name).
+        app.on_net_event(NetEvent::PublishStarted {
+            share_id: "idA".to_owned(),
+            name: "Share A again".to_owned(),
+            file_count: 1,
+        });
+        app.on_net_event(NetEvent::PublishStarted {
+            share_id: "idB".to_owned(),
+            name: "Share B".to_owned(),
+            file_count: 1,
+        });
+        assert_eq!(app.published().len(), 2, "both shares tracked as served");
+
+        // Select B (`]`) and `[u]` it — only B's id is queued.
+        app.on_key(press(KeyCode::Char(']')));
+        assert_eq!(app.defined_sel(), 1, "`]` moves selection to B");
+        app.on_key(press(KeyCode::Char('u')));
+        assert_eq!(
+            app.take_pending_unpublish().as_deref(),
+            Some("idB"),
+            "[u] on the selected share queues only that share's id"
+        );
+        app.on_net_event(NetEvent::PublishStopped {
+            share_id: "idB".to_owned(),
+        });
+        assert_eq!(app.published().len(), 1, "only B unpublished");
+        assert_eq!(app.published()[0].0, "idA", "A is still served");
+
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    /// `[p]` publishes the SELECTED defined share, not always the first (M16 C1).
+    #[test]
+    fn publish_p_acts_on_the_selected_defined_share() {
+        let mut app = drive_to_main();
+        let base = std::env::temp_dir();
+        let dir_a = base.join("ds-m16-c1-sel-a");
+        let dir_b = base.join("ds-m16-c1-sel-b");
+        std::fs::create_dir_all(&dir_a).expect("mk dir a");
+        std::fs::create_dir_all(&dir_b).expect("mk dir b");
+
+        for _ in 0..4 {
+            app.on_key(press(KeyCode::Tab));
+        }
+        for ch in format!("{}|Alpha", dir_a.display()).chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        app.on_key(press(KeyCode::Enter));
+        let _ = app.take_pending_share_define();
+        app.on_key(press(KeyCode::Tab));
+        for ch in format!("{}|Beta", dir_b.display()).chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        app.on_key(press(KeyCode::Enter));
+        let _ = app.take_pending_share_define();
+
+        // Select Beta and publish — the queued root is Beta's.
+        app.on_key(press(KeyCode::Char(']')));
+        app.on_key(press(KeyCode::Char('p')));
+        let req = app
+            .take_pending_publish()
+            .expect("[p] queues a publish of the selected share");
+        assert_eq!(req.name, "Beta", "publishes the selected, not the first");
+        assert_eq!(req.root, dir_b);
+
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    /// On Unlock, ALL persisted roots are restored into `defined_shares` (M16 C1,
+    /// ISC-C69) — not just the last — each re-emitted for re-indexing.
+    #[test]
+    fn unlock_restores_all_persisted_roots_into_defined_shares() {
+        let _ = oxicrypt_module::initialize();
+        let mut materials = drive_to_main().session_take_for_test();
+        materials
+            .seeds
+            .add_share("/data/alpha", Some("Alpha".to_owned()));
+        materials
+            .seeds
+            .add_share("/data/beta", Some("Beta".to_owned()));
+
+        let mut app = App::new();
+        app.on_unlock_success(materials);
+
+        // Both restored into the My-defined list, in order.
+        assert_eq!(
+            app.defined_shares().len(),
+            2,
+            "every persisted root restored, not just the last"
+        );
+        assert_eq!(app.defined_shares()[0].1, "Alpha");
+        assert_eq!(app.defined_shares()[1].1, "Beta");
+
+        // And both re-emitted as DefineShare for re-indexing.
+        let first = app.take_pending_share_define().expect("first re-emitted");
+        assert_eq!(first.root, std::path::PathBuf::from("/data/alpha"));
+        let second = app.take_pending_share_define().expect("second re-emitted");
+        assert_eq!(second.root, std::path::PathBuf::from("/data/beta"));
+        assert!(
+            app.take_pending_share_define().is_none(),
+            "exactly the two persisted roots replayed"
+        );
     }
 
     // ── C28 trust-event affordance routing (ISC-22..25 / 28) ─────────────

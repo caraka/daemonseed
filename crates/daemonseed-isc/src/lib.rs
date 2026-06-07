@@ -18,13 +18,14 @@
 //! Count invariants (kept aligned with `ISA.md` `## Criteria`):
 //!
 //! - 53 server-side: 30 positive (`ISC-S*`) + 23 negative (`ISC-A-S*`)
-//! - 86 client-side: 59 positive (`ISC-C*`) + 27 negative (`ISC-A-C*`)
+//! - 87 client-side: 60 positive (`ISC-C*`) + 27 negative (`ISC-A-C*`)
 //!   (M16 A1 added C66 manifest-preview + A-C33 no-blind-download, A2 added C67 selective-fetch,
-//!   A3 added C68 choose-download-dir, C2 added C70 status-auto-clear, C3 added C71
-//!   generate-circle-phrase; M13 added C59-C62 circle persistence + A-C29/A-C30; M15 C
-//!   added C63-C65 fetched-content browse/extract + A-C31/A-C32. Earlier: alpha2 share_id /
-//!   share download / public rooms / client-lifecycle / portable.)
-//! - 139 total
+//!   A3 added C68 choose-download-dir, C1 added C69 multi-share-publish, C2 added C70
+//!   status-auto-clear, C3 added C71 generate-circle-phrase; M13 added C59-C62 circle
+//!   persistence + A-C29/A-C30; M15 C added C63-C65 fetched-content browse/extract +
+//!   A-C31/A-C32. Earlier: alpha2 share_id / share download / public rooms /
+//!   client-lifecycle / portable.)
+//! - 140 total
 //!
 //! Deliberately EXCLUDED from [`ISCS`] (and therefore from [`TOTAL`]) because
 //! they are not built: the deferred direct-messaging family
@@ -166,7 +167,8 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-C66", IscClass::Positive),
     ("ISC-C67", IscClass::Positive),
     ("ISC-C68", IscClass::Positive),
-    // ── client positive (M16 C2 status-auto-clear; C3 generate-circle-phrase) ──
+    // ── client positive (M16 C1 multi-share publish; C2 status-auto-clear; C3 generate-circle-phrase) ──
+    ("ISC-C69", IscClass::Positive),
     ("ISC-C70", IscClass::Positive),
     ("ISC-C71", IscClass::Positive),
     // ── client negative (20) ────────────────────────────────────────────
@@ -205,7 +207,7 @@ pub const ISCS: &[(&str, IscClass)] = &[
 /// of truth for the coverage denominator, read live by `xtask isc-coverage`.
 /// Recount on every ISC add/remove (the `const _` assert below guards it
 /// against [`ISCS`]).
-pub const TOTAL: usize = 139;
+pub const TOTAL: usize = 140;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -344,14 +346,14 @@ mod tests {
                 IscClass::Negative => neg += 1,
             }
         }
-        // ISA `## Criteria` (built, non-deferred): 53 server + 86 client = 139.
+        // ISA `## Criteria` (built, non-deferred): 53 server + 87 client = 140.
         //   server  30 pos + 23 neg = 53
-        //   client  59 pos + 27 neg = 86  (M13 C59-C62 + A-C29/A-C30;
+        //   client  60 pos + 27 neg = 87  (M13 C59-C62 + A-C29/A-C30;
         //                                  M15 C  C63-C65 + A-C31/A-C32;
         //                                  M16 A1 C66 + A-C33; A2 C67; A3 C68;
-        //                                  C2 C70; C3 C71)
-        //   total   89 pos + 50 neg = 139
-        assert_eq!(pos, 89, "positive count drift");
+        //                                  C1 C69; C2 C70; C3 C71)
+        //   total   90 pos + 50 neg = 140
+        assert_eq!(pos, 90, "positive count drift");
         assert_eq!(neg, 50, "negative count drift");
     }
 
