@@ -16,7 +16,7 @@ use daemonseed_core::trust_events::{
 use daemonseed_proto::v1 as wire;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 
-use crate::net::NetEvent;
+use crate::net::{NetEvent, ShareManifestEntry};
 use crate::screens::first_start::{FirstStartOutcome, FirstStartUi};
 
 /// Live connection state shown in the main view.
@@ -291,6 +291,9 @@ pub struct FetchUi {
     pub share_id: String,
     /// The sharer's wire handle, for user-facing display.
     pub sharer_handle: String,
+    /// The sharer-advertised listing name, recorded as the download label on
+    /// the confirmed fetch (carried into `NetCommand::ConfirmFetch`).
+    pub name: String,
     /// Phase of the fetch.
     pub status: FetchStatus,
     /// Total chunks (`Some` once the `ManifestResponse` arrives, `None`
@@ -307,6 +310,10 @@ pub struct FetchUi {
 pub enum FetchStatus {
     /// `ManifestRequest` is out; the fetcher is waiting on the manifest.
     RequestingManifest,
+    /// A1: the manifest arrived and is shown for review (file names + sizes)
+    /// before any chunk is downloaded. `Enter` confirms (queues the download),
+    /// `Esc` cancels. Nothing has been written; no stream is held open.
+    Preview(Vec<ShareManifestEntry>),
     /// The manifest has arrived; chunks are flowing.
     Receiving,
     /// All chunks verified and written; user dismisses on Enter.
@@ -585,6 +592,11 @@ pub struct App {
     /// identifies the share and carries the listing name for the fetched
     /// manifest; the binary translates this into a `NetCommand::FetchShare`.
     pending_share_fetch: Option<(String, String, String)>,
+    /// A queued fetch-confirm the binary forwards as `NetCommand::ConfirmFetch`
+    /// (drained once). `(share_id, sharer_handle, name, selected)` — `selected`
+    /// is `None` for the A1 confirm-all path; the A2 selective fetch will carry
+    /// the chosen manifest-row indices.
+    pending_fetch_confirm: Option<(String, String, String, Option<Vec<usize>>)>,
     /// Fetched-downloads list for the browse pane (M15 C; ISC-C64). Replaced
     /// wholesale by `NetEvent::FetchedShares`.
     fetched_shares: Vec<daemonseed_core::storage::fetched::FetchedShare>,
@@ -732,6 +744,7 @@ impl App {
             pending_share_refresh: false,
             fetch: None,
             pending_share_fetch: None,
+            pending_fetch_confirm: None,
             fetched_shares: Vec::new(),
             fetched_sel: 0,
             pending_fetched_refresh: false,
@@ -1216,6 +1229,21 @@ impl App {
             // anti-rollback check exists to protect. The rollback / unreadable
             // trust event arrives separately as a `TrustEvent`.
             NetEvent::DeprecationError { message } => self.status = Some(message),
+            // A1: the manifest arrived. Move the overlay into Preview so the
+            // user can review the file list before any chunk downloads. Guard
+            // on share_id so a stale manifest for a since-replaced fetch is
+            // ignored.
+            NetEvent::FetchManifest {
+                share_id,
+                name: _,
+                entries,
+            } => {
+                if let Some(f) = self.fetch.as_mut()
+                    && f.share_id == share_id
+                {
+                    f.status = FetchStatus::Preview(entries);
+                }
+            }
             NetEvent::FetchProgress {
                 total_chunks,
                 chunks_received,
@@ -1469,6 +1497,14 @@ impl App {
     /// `NetCommand::FetchShare`.
     pub fn take_pending_share_fetch(&mut self) -> Option<(String, String, String)> {
         self.pending_share_fetch.take()
+    }
+
+    /// Take a queued fetch-confirm — `(share_id, sharer_handle, name, selected)`
+    /// — drained once by the binary into a `NetCommand::ConfirmFetch` (A1).
+    pub fn take_pending_fetch_confirm(
+        &mut self,
+    ) -> Option<(String, String, String, Option<Vec<usize>>)> {
+        self.pending_fetch_confirm.take()
     }
 
     /// Accessors + drains for the Fetched browse pane (M15 C).
@@ -1904,6 +1940,7 @@ impl App {
                     self.fetch = Some(FetchUi {
                         share_id: share_id.clone(),
                         sharer_handle: sharer_handle.clone(),
+                        name: name.clone(),
                         status: FetchStatus::RequestingManifest,
                         total_chunks: None,
                         chunks_received: 0,
@@ -1917,24 +1954,55 @@ impl App {
     }
 
     /// Fetch-overlay key handling (ISC-19). The overlay captures input while
-    /// the fetch is active. `Esc` cancels (marks the fetch Failed("cancelled
-    /// by user")); `Enter` on a terminal state (Complete or Failed) dismisses
-    /// the overlay. Other keys are absorbed so they cannot accidentally drive
-    /// the background view.
+    /// the fetch is active. In `Preview` (A1): `Enter` accepts the manifest and
+    /// queues the download (all files), `Esc` cancels without downloading. On a
+    /// terminal state (Complete/Failed): either key dismisses. While chunks are
+    /// flowing: `Esc` aborts (marks Failed). Other keys are absorbed so they
+    /// cannot accidentally drive the background view.
     fn on_key_fetch_overlay(&mut self, key: KeyEvent) {
-        let Some(f) = self.fetch.as_mut() else { return };
+        let Some(f) = self.fetch.as_ref() else { return };
         match key.code {
             KeyCode::Esc => {
-                if matches!(f.status, FetchStatus::Complete | FetchStatus::Failed(_)) {
+                // Preview-cancel and terminal-dismiss both just close the
+                // overlay (no stream is held in Preview; the transfer is done
+                // in a terminal state). An in-flight transfer is marked Failed
+                // so the gauge shows the abort.
+                let close = matches!(
+                    f.status,
+                    FetchStatus::Complete | FetchStatus::Failed(_) | FetchStatus::Preview(_)
+                );
+                if close {
                     self.fetch = None;
-                } else {
+                } else if let Some(f) = self.fetch.as_mut() {
                     f.status = FetchStatus::Failed("cancelled by user".to_owned());
                 }
             }
-            KeyCode::Enter
-                if matches!(f.status, FetchStatus::Complete | FetchStatus::Failed(_)) =>
-            {
-                self.fetch = None;
+            KeyCode::Enter => {
+                // Decide with an immutable read, then apply. `Enter` in Preview
+                // accepts the manifest → queue ConfirmFetch (all files = None);
+                // on a terminal overlay it dismisses.
+                let confirm = match &f.status {
+                    FetchStatus::Preview(entries) => Some((
+                        f.share_id.clone(),
+                        f.sharer_handle.clone(),
+                        f.name.clone(),
+                        entries.len() as u32,
+                    )),
+                    _ => None,
+                };
+                let dismiss = matches!(f.status, FetchStatus::Complete | FetchStatus::Failed(_));
+                if let Some((share_id, sharer_handle, name, total)) = confirm {
+                    if let Some(f) = self.fetch.as_mut() {
+                        f.total_chunks = Some(total);
+                        f.chunks_received = 0;
+                        f.bytes_received = 0;
+                        f.status = FetchStatus::Receiving;
+                    }
+                    // A1 confirm-all: `None` selection downloads every file.
+                    self.pending_fetch_confirm = Some((share_id, sharer_handle, name, None));
+                } else if dismiss {
+                    self.fetch = None;
+                }
             }
             _ => {}
         }
@@ -4693,6 +4761,138 @@ mod tests {
         app.on_key(press(KeyCode::Char('f')));
         assert!(app.fetch().is_none());
         assert!(app.take_pending_share_fetch().is_none());
+    }
+
+    /// A1: when the manifest arrives the overlay enters Preview carrying the
+    /// file list, and nothing is queued for download yet (the user must
+    /// confirm first).
+    #[test]
+    fn fetch_manifest_enters_preview() {
+        let mut app = drive_to_main();
+        to_shares(&mut app);
+        app.on_net_event(NetEvent::SharesSnapshot {
+            local: Vec::new(),
+            remote: vec![listing("s1", "notes", "", "alice#aabbccddeeff")],
+            indexer_status: IndexerStatus::Idle,
+        });
+        let _ = app.take_pending_share_fetch();
+        app.on_key(press(KeyCode::Char('f')));
+        app.on_net_event(NetEvent::FetchManifest {
+            share_id: "s1".to_owned(),
+            name: "notes".to_owned(),
+            entries: vec![
+                ShareManifestEntry {
+                    rel_path: "a.txt".to_owned(),
+                    size: 10,
+                },
+                ShareManifestEntry {
+                    rel_path: "b.txt".to_owned(),
+                    size: 20,
+                },
+            ],
+        });
+        let f = app.fetch().expect("overlay up");
+        match &f.status {
+            FetchStatus::Preview(entries) => {
+                assert_eq!(entries.len(), 2);
+                assert_eq!(entries[0].rel_path, "a.txt");
+                assert_eq!(entries[1].size, 20);
+            }
+            other => panic!("expected Preview, got {other:?}"),
+        }
+        // No download queued — the user has not confirmed.
+        assert!(app.take_pending_fetch_confirm().is_none());
+    }
+
+    /// A1: a manifest for a different share_id than the active fetch is ignored
+    /// (stale-fetch guard) — the overlay stays in RequestingManifest.
+    #[test]
+    fn fetch_manifest_for_other_share_is_ignored() {
+        let mut app = drive_to_main();
+        to_shares(&mut app);
+        app.on_net_event(NetEvent::SharesSnapshot {
+            local: Vec::new(),
+            remote: vec![listing("s1", "notes", "", "alice#aabbccddeeff")],
+            indexer_status: IndexerStatus::Idle,
+        });
+        let _ = app.take_pending_share_fetch();
+        app.on_key(press(KeyCode::Char('f')));
+        app.on_net_event(NetEvent::FetchManifest {
+            share_id: "OTHER".to_owned(),
+            name: "x".to_owned(),
+            entries: vec![ShareManifestEntry {
+                rel_path: "z".to_owned(),
+                size: 1,
+            }],
+        });
+        assert_eq!(
+            app.fetch().unwrap().status,
+            FetchStatus::RequestingManifest
+        );
+    }
+
+    /// A1: Enter on the preview queues ConfirmFetch with a `None` selection
+    /// (confirm-all) and moves the overlay to Receiving with the known total.
+    #[test]
+    fn preview_enter_queues_confirm_all() {
+        let mut app = drive_to_main();
+        to_shares(&mut app);
+        app.on_net_event(NetEvent::SharesSnapshot {
+            local: Vec::new(),
+            remote: vec![listing("s1", "notes", "", "alice#aabbccddeeff")],
+            indexer_status: IndexerStatus::Idle,
+        });
+        let _ = app.take_pending_share_fetch();
+        app.on_key(press(KeyCode::Char('f')));
+        app.on_net_event(NetEvent::FetchManifest {
+            share_id: "s1".to_owned(),
+            name: "notes".to_owned(),
+            entries: vec![
+                ShareManifestEntry {
+                    rel_path: "a.txt".to_owned(),
+                    size: 10,
+                },
+                ShareManifestEntry {
+                    rel_path: "b.txt".to_owned(),
+                    size: 20,
+                },
+            ],
+        });
+        app.on_key(press(KeyCode::Enter));
+        let queued = app.take_pending_fetch_confirm().expect("confirm queued");
+        assert_eq!(queued.0, "s1");
+        assert_eq!(queued.1, "alice#aabbccddeeff");
+        assert_eq!(queued.2, "notes");
+        assert_eq!(queued.3, None); // confirm-all
+        let f = app.fetch().unwrap();
+        assert_eq!(f.status, FetchStatus::Receiving);
+        assert_eq!(f.total_chunks, Some(2));
+    }
+
+    /// A1: Esc on the preview cancels — the overlay closes and nothing is
+    /// queued (no stream is held during preview, so cancel is pure-UI).
+    #[test]
+    fn preview_esc_cancels_without_download() {
+        let mut app = drive_to_main();
+        to_shares(&mut app);
+        app.on_net_event(NetEvent::SharesSnapshot {
+            local: Vec::new(),
+            remote: vec![listing("s1", "notes", "", "alice#aabbccddeeff")],
+            indexer_status: IndexerStatus::Idle,
+        });
+        let _ = app.take_pending_share_fetch();
+        app.on_key(press(KeyCode::Char('f')));
+        app.on_net_event(NetEvent::FetchManifest {
+            share_id: "s1".to_owned(),
+            name: "notes".to_owned(),
+            entries: vec![ShareManifestEntry {
+                rel_path: "a.txt".to_owned(),
+                size: 10,
+            }],
+        });
+        app.on_key(press(KeyCode::Esc));
+        assert!(app.fetch().is_none());
+        assert!(app.take_pending_fetch_confirm().is_none());
     }
 
     /// FetchProgress carrying Some(total) transitions the overlay from

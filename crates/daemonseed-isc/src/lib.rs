@@ -18,8 +18,9 @@
 //! Count invariants (kept aligned with `ISA.md` `## Criteria`):
 //!
 //! - 53 server-side: 30 positive (`ISC-S*`) + 23 negative (`ISC-A-S*`)
-//! - 80 client-side: 54 positive (`ISC-C*`) + 26 negative (`ISC-A-C*`)
-//!   (M13 added C59-C62 circle persistence + A-C29/A-C30; M15 C added C63-C65
+//! - 82 client-side: 55 positive (`ISC-C*`) + 27 negative (`ISC-A-C*`)
+//!   (M16 A1 added C66 manifest-preview + A-C33 no-blind-download;
+//!   M13 added C59-C62 circle persistence + A-C29/A-C30; M15 C added C63-C65
 //!   fetched-content browse/extract + A-C31/A-C32. Earlier: alpha2 share_id /
 //!   share download / public rooms / client-lifecycle / portable.)
 //! - 133 total
@@ -161,7 +162,8 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-C63", IscClass::Positive),
     ("ISC-C64", IscClass::Positive),
     ("ISC-C65", IscClass::Positive),
-    // ── client negative (19) ────────────────────────────────────────────
+    ("ISC-C66", IscClass::Positive),
+    // ── client negative (20) ────────────────────────────────────────────
     ("ISC-A-C1", IscClass::Negative),
     ("ISC-A-C2", IscClass::Negative),
     ("ISC-A-C3", IscClass::Negative),
@@ -190,13 +192,14 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-A-C30", IscClass::Negative),
     ("ISC-A-C31", IscClass::Negative),
     ("ISC-A-C32", IscClass::Negative),
+    ("ISC-A-C33", IscClass::Negative),
 ];
 
 /// Total built, non-deferred ISCs tracked by this registry — the SINGLE source
 /// of truth for the coverage denominator, read live by `xtask isc-coverage`.
 /// Recount on every ISC add/remove (the `const _` assert below guards it
 /// against [`ISCS`]).
-pub const TOTAL: usize = 133;
+pub const TOTAL: usize = 135;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -335,13 +338,14 @@ mod tests {
                 IscClass::Negative => neg += 1,
             }
         }
-        // ISA `## Criteria` (built, non-deferred): 53 server + 80 client = 133.
+        // ISA `## Criteria` (built, non-deferred): 53 server + 82 client = 135.
         //   server  30 pos + 23 neg = 53
-        //   client  54 pos + 26 neg = 80  (M13 C59-C62 + A-C29/A-C30;
-        //                                  M15 C  C63-C65 + A-C31/A-C32)
-        //   total   84 pos + 49 neg = 133
-        assert_eq!(pos, 84, "positive count drift");
-        assert_eq!(neg, 49, "negative count drift");
+        //   client  55 pos + 27 neg = 82  (M13 C59-C62 + A-C29/A-C30;
+        //                                  M15 C  C63-C65 + A-C31/A-C32;
+        //                                  M16 A1 C66 + A-C33)
+        //   total   85 pos + 50 neg = 135
+        assert_eq!(pos, 85, "positive count drift");
+        assert_eq!(neg, 50, "negative count drift");
     }
 
     /// COVERED is single-sourced and must agree with the per-milestone

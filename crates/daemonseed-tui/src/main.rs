@@ -213,6 +213,16 @@ fn run(
                 fetched_root: downloads_root.clone(),
             });
         }
+        // A1: the user accepted the manifest preview → download it.
+        if let Some((share_id, sharer_handle, name, selected)) = app.take_pending_fetch_confirm() {
+            let _ = net.send(NetCommand::ConfirmFetch {
+                share_id,
+                sharer_handle,
+                name,
+                fetched_root: downloads_root.clone(),
+                selected,
+            });
+        }
         // M15 C: browse — refresh the fetched-downloads list on demand.
         if app.take_pending_fetched_refresh() {
             let _ = net.send(NetCommand::ListFetched {

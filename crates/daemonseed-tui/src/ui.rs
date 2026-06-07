@@ -141,10 +141,27 @@ fn render_main(app: &App, frame: &mut Frame) {
 /// box showing the share id, sharer handle, current phase, and N-of-M chunk
 /// progress. While present, [`App::on_key`] routes input here (Esc cancels;
 /// Enter on a terminal state dismisses).
+/// Compact, display-only byte-size formatting for the fetch preview (binary
+/// units; one decimal above bytes). Not security-sensitive — purely cosmetic.
+fn human_bytes(n: u64) -> String {
+    const KB: f64 = 1024.0;
+    let f = n as f64;
+    if f < KB {
+        format!("{n} B")
+    } else if f < KB * KB {
+        format!("{:.1} KB", f / KB)
+    } else if f < KB * KB * KB {
+        format!("{:.1} MB", f / (KB * KB))
+    } else {
+        format!("{:.1} GB", f / (KB * KB * KB))
+    }
+}
+
 fn render_fetch_overlay(f: &FetchUi, frame: &mut Frame, area: Rect) {
     let popup = centered_rect(62, 50, area);
     let (phase, color) = match &f.status {
         FetchStatus::RequestingManifest => ("requesting manifest…".to_owned(), Color::Yellow),
+        FetchStatus::Preview(_) => ("preview — review before download".to_owned(), Color::Cyan),
         FetchStatus::Receiving => ("receiving chunks…".to_owned(), Color::Cyan),
         FetchStatus::Complete => ("complete".to_owned(), Color::Green),
         FetchStatus::Failed(m) => (format!("failed: {m}"), Color::Red),
@@ -160,6 +177,7 @@ fn render_fetch_overlay(f: &FetchUi, frame: &mut Frame, area: Rect) {
     };
     let footer = match f.status {
         FetchStatus::Complete | FetchStatus::Failed(_) => "[Enter] dismiss   [Esc] dismiss",
+        FetchStatus::Preview(_) => "[Enter] download   [Esc] cancel",
         _ => "[Esc] cancel",
     };
 
@@ -180,10 +198,27 @@ fn render_fetch_overlay(f: &FetchUi, frame: &mut Frame, area: Rect) {
         ])
         .split(inner);
 
-    let info = format!(
-        "share: {}\nby: {sharer}\n\nphase: {phase}\nchunks: {}/{total}\nbytes:  {}",
-        f.share_id, f.chunks_received, f.bytes_received,
-    );
+    let info = match &f.status {
+        // A1 preview: list the share's contents (names + sizes) so the user
+        // sees exactly what a download would pull before committing.
+        FetchStatus::Preview(entries) => {
+            let total_bytes: u64 = entries.iter().map(|e| e.size).sum();
+            let mut s = format!(
+                "share: {}\nby: {sharer}\n\n{} file(s) · {} total\n\n",
+                f.share_id,
+                entries.len(),
+                human_bytes(total_bytes),
+            );
+            for e in entries {
+                s.push_str(&format!("  {}  ({})\n", e.rel_path, human_bytes(e.size)));
+            }
+            s
+        }
+        _ => format!(
+            "share: {}\nby: {sharer}\n\nphase: {phase}\nchunks: {}/{total}\nbytes:  {}",
+            f.share_id, f.chunks_received, f.bytes_received,
+        ),
+    };
     frame.render_widget(
         Paragraph::new(info)
             .wrap(Wrap { trim: false })
@@ -200,9 +235,10 @@ fn render_fetch_overlay(f: &FetchUi, frame: &mut Frame, area: Rect) {
             _ => 0.0,
         },
     };
-    let gauge_label = match f.status {
+    let gauge_label = match &f.status {
         FetchStatus::Complete => "done".to_owned(),
         FetchStatus::Failed(_) => "failed".to_owned(),
+        FetchStatus::Preview(entries) => format!("{} file(s) ready — press Enter", entries.len()),
         _ if f.total_chunks.is_none() => "waiting for manifest…".to_owned(),
         _ => format!(
             "{}/{total} chunks · {}%",

@@ -50,7 +50,7 @@ use daemonseed_core::indexer::scan_into;
 use daemonseed_core::public_room::{
     DEFAULT_ROOM, derive_room_key, open_room_message, room_asset_address, seal_room_message,
 };
-use daemonseed_core::share_envelope::ShareFrame;
+use daemonseed_core::share_envelope::{ManifestEntry, ShareFrame};
 use daemonseed_core::share_serve::ShareContent;
 use daemonseed_core::storage::cas::chunk_addr;
 use daemonseed_core::storage::fetched::{FetchedShare, FetchedStore, VerifiedFile};
@@ -157,6 +157,20 @@ pub enum NetCommand {
         name: String,
         fetched_root: PathBuf,
     },
+    /// Confirm an A1-previewed fetch and download it (ISC-19). Issued after the
+    /// user accepts the `NetEvent::FetchManifest` preview. Re-opens the share
+    /// stream, requests the chunks (`selected = None` downloads every file;
+    /// `Some(indices)` downloads only those manifest rows — the A2 selective
+    /// path), verifies each against its content address, and persists the
+    /// fully-verified download (ISC-C63 / A-C31). Terminal state is
+    /// `NetEvent::FetchComplete` or `NetEvent::FetchError`.
+    ConfirmFetch {
+        share_id: String,
+        sharer_handle: String,
+        name: String,
+        fetched_root: PathBuf,
+        selected: Option<Vec<usize>>,
+    },
     /// List the fetched shares recorded under `fetched_root` for the browse
     /// pane (M15 C; ISC-C64). Emits a [`NetEvent::FetchedShares`] snapshot
     /// (empty if nothing has been fetched).
@@ -197,6 +211,28 @@ pub enum NetCommand {
     /// the local serve task, emitting `NetEvent::PublishStopped`. No-op for an
     /// unknown id.
     UnpublishShare { share_id: String },
+}
+
+/// One file in an A1 fetch-preview ([`NetEvent::FetchManifest`]): the
+/// sharer-advertised relative path and its byte size. Carries no `chunk_addr`
+/// — the content address stays in the net actor; the UI shows names + sizes
+/// only and confirms by manifest-row index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShareManifestEntry {
+    pub rel_path: String,
+    pub size: u64,
+}
+
+/// An opened share-fetch stream plus its manifest — the shared front half of
+/// the A1 preview and the confirmed download (see `Actor::open_share_stream`).
+/// Owned values only: `inbound`/`out_tx` come from `into_inner()` / the mpsc
+/// channel and do not borrow the actor, so this is freely movable out of the
+/// helper and dropped (preview) or consumed (confirm) by the caller.
+struct OpenedShare {
+    out_tx: mpsc::Sender<wire::CotFrame>,
+    inbound: tonic::Streaming<wire::CotFrame>,
+    asset_addr: AssetAddr,
+    manifest: Vec<ManifestEntry>,
 }
 
 /// An event from the network actor back to the UI. Plain data — folded into
@@ -346,6 +382,16 @@ pub enum NetEvent {
     /// (`ServerDeprecationPolicyRollback` / `ServerDeprecationPolicyUnreadable`)
     /// arrives separately as a [`NetEvent::TrustEvent`].
     DeprecationError { message: String },
+    /// A1 fetch preview: the share's manifest arrived. Carries the file list
+    /// (names + sizes) for the user to review before any chunk is downloaded.
+    /// The stream is already closed; the user confirms via `NetCommand::
+    /// ConfirmFetch`, which re-opens it. `name` is the listing name (echoed so
+    /// the confirm round-trip can label the persisted download).
+    FetchManifest {
+        share_id: String,
+        name: String,
+        entries: Vec<ShareManifestEntry>,
+    },
     /// Progress on an active share fetch (ISC-19). `total_chunks` is `None`
     /// while the fetcher is still waiting on the `ManifestResponse`, and
     /// `Some(N)` after the manifest arrives. Emitted at least once after the
@@ -627,6 +673,17 @@ async fn net_actor(
             } => {
                 actor
                     .handle_fetch_share(&share_id, &sharer_handle, &name, fetched_root)
+                    .await
+            }
+            NetCommand::ConfirmFetch {
+                share_id,
+                sharer_handle,
+                name,
+                fetched_root,
+                selected,
+            } => {
+                actor
+                    .handle_confirm_fetch(&share_id, &sharer_handle, &name, fetched_root, selected)
                     .await
             }
             NetCommand::ListFetched { fetched_root } => actor.handle_list_fetched(fetched_root),
@@ -1433,32 +1490,36 @@ impl Actor {
     /// This is the file-side analog of the chat envelope's `open_message`
     /// fail-closed posture — a corrupt relay or hostile sharer cannot deliver
     /// falsified content to a verifying fetcher.
-    async fn handle_fetch_share(
-        &mut self,
-        share_id: &str,
-        _sharer_handle: &str,
-        name: &str,
-        fetched_root: PathBuf,
-    ) {
+    /// Open a share-fetch stream and read its manifest — the shared front half
+    /// of the A1 preview ([`Self::handle_fetch_share`]) and the confirmed
+    /// download ([`Self::handle_confirm_fetch`]). Does the pre-flight (live
+    /// session + known relay), opens a fresh `CircleOfTrust.Subscribe` stream,
+    /// sends a `ManifestRequest`, and reads the `ManifestResponse`. On any
+    /// failure it emits `NetEvent::FetchError` and returns `None`; the caller
+    /// then simply returns.
+    async fn open_share_stream(&mut self, share_id: &str) -> Option<OpenedShare> {
         // Pre-flight: live session + known relay are mandatory.
         let Some(session) = self.session.as_ref() else {
-            return self.emit(NetEvent::FetchError {
+            self.emit(NetEvent::FetchError {
                 message: "not connected to a relay yet".to_owned(),
             });
+            return None;
         };
         let Some(server_id) = self.server_id.as_ref() else {
-            return self.emit(NetEvent::FetchError {
+            self.emit(NetEvent::FetchError {
                 message: "no server-id for the connected relay".to_owned(),
             });
+            return None;
         };
 
         let asset_addr = match public_share_asset_address(share_id.as_bytes(), server_id.as_bytes())
         {
             Ok(a) => a,
             Err(e) => {
-                return self.emit(NetEvent::FetchError {
+                self.emit(NetEvent::FetchError {
                     message: format!("share-asset derivation failed: {e}"),
                 });
+                return None;
             }
         };
 
@@ -1466,42 +1527,45 @@ impl Actor {
         // Subscribe stream reads from it. Capacity sized for the small set of
         // round-trip request frames a fetch generates (manifest + chunks);
         // ChunkResponse arrivals do not back-pressure this channel.
-        let (out_tx, out_rx) = mpsc::channel::<daemonseed_proto::v1::CotFrame>(32);
+        let (out_tx, out_rx) = mpsc::channel::<wire::CotFrame>(32);
 
         // The naming frame: every Subscribe stream's first frame names its
         // rendezvous (empty payload, not relayed); same shape as the chat
         // path. Send it before subscribe consumes the receiver.
-        let naming = daemonseed_proto::v1::CotFrame {
+        let naming = wire::CotFrame {
             asset_address: asset_addr.as_bytes().to_vec(),
             payload: Vec::new(),
         };
         if out_tx.send(naming).await.is_err() {
-            return self.emit(NetEvent::FetchError {
+            self.emit(NetEvent::FetchError {
                 message: "fetch subscribe channel closed before naming frame".to_owned(),
             });
+            return None;
         }
 
         let mut cot = session.circle_of_trust();
         let mut inbound = match cot.subscribe(ReceiverStream::new(out_rx)).await {
             Ok(resp) => resp.into_inner(),
             Err(status) => {
-                return self.emit(NetEvent::FetchError {
+                self.emit(NetEvent::FetchError {
                     message: format!("subscribe refused: {}", status.message()),
                 });
+                return None;
             }
         };
 
         // Send ManifestRequest. The first non-empty inbound frame on this
         // stream is expected to be the ManifestResponse from the sharer.
         let request = ShareFrame::ManifestRequest;
-        let req_frame = daemonseed_proto::v1::CotFrame {
+        let req_frame = wire::CotFrame {
             asset_address: asset_addr.as_bytes().to_vec(),
             payload: request.encode(),
         };
         if out_tx.send(req_frame).await.is_err() {
-            return self.emit(NetEvent::FetchError {
+            self.emit(NetEvent::FetchError {
                 message: "fetch subscribe channel closed before manifest request".to_owned(),
             });
+            return None;
         }
 
         // Read the manifest. Foreign / undecryptable frames (other members'
@@ -1512,9 +1576,10 @@ impl Actor {
             let frame = match inbound.message().await {
                 Ok(Some(f)) => f,
                 Ok(None) | Err(_) => {
-                    return self.emit(NetEvent::FetchError {
+                    self.emit(NetEvent::FetchError {
                         message: "stream ended before manifest arrived".to_owned(),
                     });
+                    return None;
                 }
             };
             if frame.payload.is_empty() {
@@ -1527,28 +1592,101 @@ impl Actor {
             }
         };
 
-        let total_chunks = manifest.len() as u32;
+        Some(OpenedShare {
+            out_tx,
+            inbound,
+            asset_addr,
+            manifest,
+        })
+    }
+
+    /// A1 fetch preview: open the share, read its manifest, surface it as
+    /// `NetEvent::FetchManifest` (file names + sizes), then CLOSE the stream.
+    /// Nothing is pulled or written here — the user reviews the contents and
+    /// confirms, and the download is a separate `NetCommand::ConfirmFetch` that
+    /// re-opens the stream. Dropping the stream keeps the actor stateless (no
+    /// parked fetch) and never pins a relay subscription during think-time.
+    async fn handle_fetch_share(
+        &mut self,
+        share_id: &str,
+        _sharer_handle: &str,
+        name: &str,
+        _fetched_root: PathBuf,
+    ) {
+        let Some(opened) = self.open_share_stream(share_id).await else {
+            return;
+        };
+        let entries = opened
+            .manifest
+            .iter()
+            .map(|e| ShareManifestEntry {
+                rel_path: e.rel_path.clone(),
+                size: e.size,
+            })
+            .collect();
+        drop(opened); // close the stream; confirm re-opens
+        self.emit(NetEvent::FetchManifest {
+            share_id: share_id.to_owned(),
+            name: name.to_owned(),
+            entries,
+        });
+    }
+
+    /// A1 confirm: the user accepted the preview. Re-open the share, request the
+    /// selected chunks (`selected = None` downloads every file; `Some(indices)`
+    /// the A2 selective subset), verify each against its content address
+    /// (ISC-S28 / ISC-A-S20), and persist the fully-verified download (ISC-C63
+    /// / A-C31). `selected` indices are into the manifest's natural order, which
+    /// a sharer serves deterministically; an out-of-range index is skipped
+    /// defensively rather than failing the whole fetch.
+    async fn handle_confirm_fetch(
+        &mut self,
+        share_id: &str,
+        _sharer_handle: &str,
+        name: &str,
+        fetched_root: PathBuf,
+        selected: Option<Vec<usize>>,
+    ) {
+        let Some(opened) = self.open_share_stream(share_id).await else {
+            return;
+        };
+        let OpenedShare {
+            out_tx,
+            mut inbound,
+            asset_addr,
+            manifest,
+        } = opened;
+
+        // Resolve the chunk set: an explicit selection (A2) or the whole
+        // manifest (A1 confirm-all). Indices map onto the manifest's order;
+        // an out-of-range index is dropped (filter_map) rather than aborting.
+        let wanted: Vec<&ManifestEntry> = match &selected {
+            Some(idxs) => idxs.iter().filter_map(|&i| manifest.get(i)).collect(),
+            None => manifest.iter().collect(),
+        };
+
+        let total_chunks = wanted.len() as u32;
         self.emit(NetEvent::FetchProgress {
             total_chunks: Some(total_chunks),
             chunks_received: 0,
             bytes_received: 0,
         });
 
-        // For each manifest entry, request the chunk by its advertised
-        // address, verify the response, and account bytes. A single-chunk-
-        // per-file alpha: one request per file, one response per request,
-        // sequential (pipelining is a post-MVP optimisation).
+        // For each wanted entry, request the chunk by its advertised address,
+        // verify the response, and account bytes. A single-chunk-per-file
+        // alpha: one request per file, one response per request, sequential
+        // (pipelining is a post-MVP optimisation).
         let mut chunks_received: u32 = 0;
         let mut bytes_received: u64 = 0;
         // Accumulate each file's verified plaintext bytes; persisted to the
         // on-disk fetched store only after the whole fetch verifies (ISC-A-C31
         // — a fetch that fails mid-stream returns early and persists nothing).
-        let mut fetched_files: Vec<VerifiedFile> = Vec::with_capacity(manifest.len());
-        for entry in &manifest {
+        let mut fetched_files: Vec<VerifiedFile> = Vec::with_capacity(wanted.len());
+        for entry in &wanted {
             let request = ShareFrame::ChunkRequest {
                 chunk_addr: entry.chunk_addr,
             };
-            let req_frame = daemonseed_proto::v1::CotFrame {
+            let req_frame = wire::CotFrame {
                 asset_address: asset_addr.as_bytes().to_vec(),
                 payload: request.encode(),
             };

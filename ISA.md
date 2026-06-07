@@ -266,6 +266,7 @@ Each criterion is a verifiable boundary: positive ISCs describe a durable end-st
 - [ ] ISC-C63: A fully-verified share fetch (ISC-S28 / ISC-A-S20) persists its content to disk as an *explicit download* — the verified files are written **directly under their real names** into a per-share folder beneath a downloads root: `<downloads-root>/<share-name>/<rel_path>`. The downloads root is `<profile-root>/downloads` under `--portable` and the OS Downloads directory (`$XDG_DOWNLOAD_DIR` or `$HOME/Downloads`, namespaced under `daemonseed/`) otherwise. A small line-based manifest (`downloads.idx`) records `share_id → name → folder → [(rel_path, size)]` for the browse view. No content-addressed store, no hex names, no refcount sidecars, no separate extract step (the M15-cleanup reversal of the original CAS design — see Decisions). The download survives the fetch overlay closing and a process restart. This is a deliberately larger at-rest surface than the rest of the client (ISC-A-C1) — downloaded files are user-chosen artifacts, not message/post/session history, so the no-client-history invariant holds; the surface is the R-PANIC erasure target. Content + manifest are plaintext at the MVP (a future at-rest folder-encryption feature wraps the whole `downloads/` tree, additive).
 - [ ] ISC-C64: The client surfaces a read-only Downloads browse view listing every persisted download (ISC-C63) — name, file count, total size, the download folder (`downloads/<folder>/`), and the selected download's files (real names + sizes) — refreshed from disk when the view opens. The list reflects exactly what is recorded on disk.
 - [ ] ISC-C65: A fetched download's files are reconstructed at fetch time under their original names, mirroring the share's `rel_path` tree byte-for-byte, in the per-share download folder (ISC-C63) — so the files are usable immediately with no manual extract step. Two shares with the same name land in distinct folders (the second collision-suffixed by `share_id`), so downloads never mingle.
+- [x] ISC-C66: A share fetch is a two-step, user-gated flow (A1 manifest preview). On `f` the client requests only the share's manifest and surfaces it for review — the file list (real `rel_path`s + per-file sizes), file count, and total size — in the fetch overlay's Preview state; no chunk is requested or written. The download proceeds only on explicit confirmation (`Enter`), and `Esc` cancels with nothing downloaded. The net actor splits accordingly: `FetchShare` opens the stream, reads the manifest, emits `NetEvent::FetchManifest`, then closes the stream; the user's confirmation drives a separate `NetCommand::ConfirmFetch` (`Actor::handle_confirm_fetch`) that re-opens and pulls. Re-opening on confirm — rather than parking the live stream during think-time — keeps the actor stateless and never pins a relay subscription (see Decisions).
 
 ### Client — anti-criteria (ISC-A-C*)
 
@@ -273,6 +274,7 @@ Each criterion is a verifiable boundary: positive ISCs describe a durable end-st
 - [ ] ISC-A-C30: Joining or cycling circles (ISC-C59/C60) must not mix `cot_key`s or sender attribution across circles. A composed post is sealed under exactly the active circle's `cot_key` (ISC-C8 / `seal_message`), and an inbound `CotFrame` is attributed to the single circle whose `cot_key` opened it — never guessed, never broadcast to all panes. Posting to the wrong circle, or attributing a message to a circle other than the one that decrypted it, is forbidden.
 - [ ] ISC-A-C31: A share fetch that fails verification at any point (no manifest, a chunk-hash mismatch per ISC-A-S20, a dropped stream) must NOT persist a partial or poisoned download: nothing is written to the fetched manifest until every chunk has verified, so a browse/extract never surfaces falsified or truncated content. A persistence failure after verification surfaces as a fetch error rather than a silent partial success.
 - [ ] ISC-A-C32: Writing a fetched download (ISC-C63) must never write a file outside its share folder, and the share folder must never escape the downloads root. Every manifest `rel_path` is validated to be strictly relative with only normal components — an absolute path, a `..` component, or a root/prefix component is refused — and the per-share folder name (derived from the untrusted share name) is reduced to a single safe path component (separators/control chars neutralised, `.`/`..` rejected). So a hostile sharer's name or paths cannot escape the downloads root via traversal.
+- [x] ISC-A-C33: No blind download (A1, paired with ISC-C66). A fetch must never request or write any chunk before the user has seen the manifest preview and confirmed. The preview path (`net::handle_fetch_share`) pulls only the manifest and drops the stream, so a fetch that is previewed and then cancelled (`Esc`) writes nothing to disk and opens no download. The sole chunk-pulling path is `handle_confirm_fetch`, reachable only via the user's `Enter`-driven `ConfirmFetch` — there is no auto-download path that bypasses the preview.
 
 
 - [ ] ISC-A-C1: The client persists no plaintext identifiers, no session-activity logs, no message content, and no recently-contacted lists — only the encrypted at-rest blob (ISC-C3) and a minimal configuration file. Optional ephemeral debug logs must be opt-in, auto-truncated, and exclude identifiers and message content.
@@ -578,6 +580,16 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   ML-DSA signature to `CircleMessage`; sign-on-send + verify-on-read) is a new, circle-specific criterion
   deferred to M17 with the circle-shares work — it reuses `display_bound` unchanged once a pubkey rides the
   circle wire. (caraka, 2026-06-07.)
+- 2026-06-07: **A1 manifest preview (ISC-C66) — re-open-on-confirm, not hold-the-stream.** Splitting the
+  fetch at the manifest raised a choice: park the live `Subscribe` stream in actor state across the user's
+  review, or close it and re-open on confirm. Chose re-open: `handle_fetch_share` reads the manifest and
+  drops the stream; `handle_confirm_fetch` re-opens via the shared `open_share_stream` helper and pulls.
+  Rationale: keeps the net actor stateless (no parked-fetch lifecycle to manage, matching every other
+  handler) and never pins a relay subscription open during think-time (which can be minutes). Cost: one
+  extra tiny manifest round-trip on confirm (file names + 48-byte addresses) — negligible. Cancel is
+  therefore pure-UI (no stream to tear down), so no `CancelFetch` command exists. The
+  `selected: Option<Vec<usize>>` on `ConfirmFetch` is `None` for the A1 confirm-all path and will carry
+  the chosen indices for A2 selective fetch. (caraka, 2026-06-07.)
 
 ## Changelog
 
@@ -612,6 +624,16 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   device's, invalid-mnemonic + wrong-`.dseed`-passphrase stay-on-step, and the Welcome `[r]` → recover-branch
   wiring) pass, and the end-to-end gate test `fresh_daemon_recovers_identity_from_mnemonic` passes inside
   `cargo xtask mvp-gate`. Probe: `cargo xtask mvp-gate` (PASS) + `cargo test -p daemonseed-core -p daemonseed-tui`.
+- ISC-C66 / A-C33 (A1 manifest preview) verified 2026-06-07: net actor split into `open_share_stream`
+  (shared front half) + preview `handle_fetch_share` (manifest → `NetEvent::FetchManifest` → close) +
+  `handle_confirm_fetch` (re-open → pull `selected` → verify → persist), with new `NetCommand::ConfirmFetch`
+  + `ShareManifestEntry`. App `FetchStatus::Preview(entries)` folds the manifest; `Enter` queues confirm-all
+  (`selected = None`) and moves to Receiving with the known total, `Esc` cancels writing nothing; `ui`
+  renders the file list + per-file/total sizes; `main` drains the confirm queue. 4 new `daemonseed-tui`
+  tests — `fetch_manifest_enters_preview`, `fetch_manifest_for_other_share_is_ignored` (stale-fetch guard),
+  `preview_enter_queues_confirm_all`, `preview_esc_cancels_without_download` — plus the unchanged fetch
+  suite. fmt + clippy `-D warnings` clean; full-workspace `cargo test` 0-fail (tui 156). Live 2-daemon
+  preview→confirm probe is a tracked follow-up. Probe: `cargo test -p daemonseed-tui`.
 - M12 steps 5 & 6 verified 2026-06-03: the PTY/subprocess gate now runs **10 tests and passes 10/10**.
   Step 5 (user-publish file sharing) — `cli_published_share_is_cross_client_visible_then_reaped`: a held
   `daemonseed-cli publish docs` connection is seen by a *separate* ephemeral client via `ListPublicShares`
