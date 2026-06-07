@@ -2284,6 +2284,31 @@ impl App {
     /// queues a join for a non-empty phrase and returns focus to chat
     /// (ISC-15/16).
     fn on_key_join(&mut self, key: KeyEvent) {
+        // ISC-C71: Ctrl-G generates a strong circle phrase into the input. The
+        // ≥128-bit circle-entropy floor (ISC-C9) is demanding to invent by hand,
+        // so offer a diceware generator the user can accept; circle phrases are
+        // shared out-of-band, so a generated one is fine. A 12-word BIP-39
+        // diceware phrase is 12 × 11 = 132 bits, clearing the floor with margin.
+        // Ctrl-G (not a bare letter — those are typed into the phrase) so it does
+        // not collide with phrase entry.
+        if key.code == KeyCode::Char('g')
+            && key
+                .modifiers
+                .contains(ratatui::crossterm::event::KeyModifiers::CONTROL)
+        {
+            match strength::generate_diceware(12) {
+                Ok(phrase) => {
+                    self.circle_phrase = phrase;
+                    self.status = Some(
+                        "generated a strong circle phrase — [Enter] to join, or edit it; share it \
+                         with members out-of-band"
+                            .to_owned(),
+                    );
+                }
+                Err(e) => self.status = Some(format!("could not generate a phrase: {e}")),
+            }
+            return;
+        }
         match key.code {
             KeyCode::Char(c) => self.circle_phrase.push(c),
             KeyCode::Backspace => {
@@ -3757,6 +3782,35 @@ mod tests {
             "phrase kept so the user can strengthen it"
         );
         assert!(app.status().is_some_and(|s| s.contains("too weak")));
+    }
+
+    /// ISC-C71 — Ctrl-G in the circle-join box fills the input with a generated
+    /// phrase that clears the ISC-C9 circle-entropy floor (`is_circle_green`), so
+    /// the user can accept a strong phrase instead of inventing ≥128-bit entropy.
+    #[test]
+    fn ctrl_g_generates_a_phrase_that_clears_the_circle_floor() {
+        let mut app = drive_to_main();
+        app.on_key(press(KeyCode::Tab)); // focus → JoinCircle
+        assert!(app.circle_phrase().is_empty(), "buffer starts empty");
+        let ctrl_g = KeyEvent::new(
+            KeyCode::Char('g'),
+            ratatui::crossterm::event::KeyModifiers::CONTROL,
+        );
+        app.on_key(ctrl_g);
+        let phrase = app.circle_phrase().to_owned();
+        assert!(!phrase.is_empty(), "Ctrl-G fills the join buffer");
+        assert!(
+            daemonseed_core::passphrase::strength::estimate_circle(&phrase).is_circle_green(),
+            "the generated phrase {phrase:?} must clear the ISC-C9 ≥128-bit circle floor"
+        );
+        // And it must actually join: a generated phrase passes the on-Enter gate.
+        app.on_key(press(KeyCode::Enter));
+        assert_eq!(app.circle_status(), &CircleStatus::Joining);
+        assert_eq!(
+            app.take_pending_join().as_deref(),
+            Some(phrase.as_str()),
+            "the generated phrase is what gets queued for join"
+        );
     }
 
     /// The circle-phrase strength accessor (ISC-C9 meter) reflects the live buffer:

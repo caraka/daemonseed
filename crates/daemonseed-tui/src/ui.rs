@@ -1074,7 +1074,7 @@ fn render_main_input(app: &App, frame: &mut Frame, area: Rect) {
             };
             (
                 format!(
-                    "circle phrase · {tier} {bits:.0}/128 bits  [Enter] join  [Tab] mute  [Esc] back",
+                    "circle phrase · {tier} {bits:.0}/128 bits  [Enter] join  [Ctrl-G] generate  [Tab] mute  [Esc] back",
                     bits = s.bits
                 ),
                 app.circle_phrase().to_owned(),

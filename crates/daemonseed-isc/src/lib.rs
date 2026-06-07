@@ -18,13 +18,13 @@
 //! Count invariants (kept aligned with `ISA.md` `## Criteria`):
 //!
 //! - 53 server-side: 30 positive (`ISC-S*`) + 23 negative (`ISC-A-S*`)
-//! - 84 client-side: 57 positive (`ISC-C*`) + 27 negative (`ISC-A-C*`)
+//! - 85 client-side: 58 positive (`ISC-C*`) + 27 negative (`ISC-A-C*`)
 //!   (M16 A1 added C66 manifest-preview + A-C33 no-blind-download, A2 added C67 selective-fetch,
-//!   C2 added C70 status-auto-clear;
+//!   C2 added C70 status-auto-clear, C3 added C71 generate-circle-phrase;
 //!   M13 added C59-C62 circle persistence + A-C29/A-C30; M15 C added C63-C65
 //!   fetched-content browse/extract + A-C31/A-C32. Earlier: alpha2 share_id /
 //!   share download / public rooms / client-lifecycle / portable.)
-//! - 137 total
+//! - 138 total
 //!
 //! Deliberately EXCLUDED from [`ISCS`] (and therefore from [`TOTAL`]) because
 //! they are not built: the deferred direct-messaging family
@@ -165,8 +165,9 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-C65", IscClass::Positive),
     ("ISC-C66", IscClass::Positive),
     ("ISC-C67", IscClass::Positive),
-    // ── client positive (M16 C2 status-auto-clear) ──
+    // ── client positive (M16 C2 status-auto-clear; C3 generate-circle-phrase) ──
     ("ISC-C70", IscClass::Positive),
+    ("ISC-C71", IscClass::Positive),
     // ── client negative (20) ────────────────────────────────────────────
     ("ISC-A-C1", IscClass::Negative),
     ("ISC-A-C2", IscClass::Negative),
@@ -203,7 +204,7 @@ pub const ISCS: &[(&str, IscClass)] = &[
 /// of truth for the coverage denominator, read live by `xtask isc-coverage`.
 /// Recount on every ISC add/remove (the `const _` assert below guards it
 /// against [`ISCS`]).
-pub const TOTAL: usize = 137;
+pub const TOTAL: usize = 138;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -342,14 +343,14 @@ mod tests {
                 IscClass::Negative => neg += 1,
             }
         }
-        // ISA `## Criteria` (built, non-deferred): 53 server + 84 client = 137.
+        // ISA `## Criteria` (built, non-deferred): 53 server + 85 client = 138.
         //   server  30 pos + 23 neg = 53
-        //   client  57 pos + 27 neg = 84  (M13 C59-C62 + A-C29/A-C30;
+        //   client  58 pos + 27 neg = 85  (M13 C59-C62 + A-C29/A-C30;
         //                                  M15 C  C63-C65 + A-C31/A-C32;
         //                                  M16 A1 C66 + A-C33; A2 C67;
-        //                                  C2 C70)
-        //   total   87 pos + 50 neg = 137
-        assert_eq!(pos, 87, "positive count drift");
+        //                                  C2 C70; C3 C71)
+        //   total   88 pos + 50 neg = 138
+        assert_eq!(pos, 88, "positive count drift");
         assert_eq!(neg, 50, "negative count drift");
     }
 
