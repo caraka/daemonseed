@@ -248,6 +248,12 @@ fn run(
                 sharer_handle: req.sharer_handle,
             });
         }
+        // M16 serve-from-disk: `[u]` mid-hash cancels the in-flight publish
+        // hash for that defined root (a no-op on the actor if it already
+        // finished — the race is benign).
+        if let Some(root) = app.take_pending_cancel_publish() {
+            let _ = net.send(NetCommand::CancelPublish { root });
+        }
         if let Some(share_id) = app.take_pending_unpublish() {
             let _ = net.send(NetCommand::UnpublishShare { share_id });
         }

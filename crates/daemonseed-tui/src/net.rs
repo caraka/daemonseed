@@ -25,10 +25,12 @@
 //! `tokio::spawn`ed onto a multi-thread runtime — `spawn_local` sidesteps the
 //! `Send` bound.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use daemonseed_cli::connect::{ConnectError, connect_session};
 use daemonseed_cli::identity_proof::ClientIdentity;
@@ -46,12 +48,12 @@ use daemonseed_core::crypto::suite::{CNSA_2_0, SuiteId};
 use daemonseed_core::federation::discovered::DiscoveredPeers;
 use daemonseed_core::federation::store::{InMemoryTrustStore, ServerEntry, TrustStore};
 use daemonseed_core::handle::{DisplayMode, Handle};
-use daemonseed_core::indexer::scan_into;
+use daemonseed_core::indexer::{CachedHashError, cached_or_hash, scan_into};
 use daemonseed_core::public_room::{
     DEFAULT_ROOM, derive_room_key, open_room_message, room_asset_address, seal_room_message,
 };
 use daemonseed_core::share_envelope::{ManifestEntry, ShareFrame};
-use daemonseed_core::share_serve::ShareContent;
+use daemonseed_core::share_serve::{DiskShareContent, ServeError};
 use daemonseed_core::storage::cas::chunk_addr;
 use daemonseed_core::storage::fetched::{FetchedShare, FetchedStore, VerifiedFile};
 use daemonseed_core::storage::seeds::{CounterState, IndexKey};
@@ -191,13 +193,20 @@ pub enum NetCommand {
     /// service — no new wire protocol.
     RefreshIntroducer,
     /// Publish a defined share to the connected relay and serve its content
-    /// (D, M15; ISC-S27 / ISC-S29 / F25). Indexes `root` into a [`ShareContent`]
-    /// (fails fast on a bad path), publishes the listing via `PublishShare` to
-    /// learn the server-assigned `share_id`, then spawns a `serve_share` task
-    /// answering fetchers' manifest/chunk requests over the share's CoT
-    /// fetch-asset for as long as the session is up ("you must be online to
-    /// share" — the relay reaps the share when this connection drops, ISC-S20).
-    /// Lifecycle arrives as `NetEvent::PublishStarted` / `PublishError` /
+    /// from disk (D, M15 → serve-from-disk, M16; ISC-S27 / ISC-S29 / F25).
+    /// Hashes `root` into a manifest on a dedicated blocking thread —
+    /// [`cached_or_hash`] reuses redb-cached chunk addresses when the actor's
+    /// single-active [`ShareIndex`] is for this root, hashing only the misses —
+    /// so the actor keeps draining commands while a large share hashes.
+    /// Per-file progress arrives as `NetEvent::PublishProgress`; the hash is
+    /// cancellable via [`NetCommand::CancelPublish`]. On success the listing is
+    /// published via `PublishShare` to learn the server-assigned `share_id`,
+    /// then a `serve_share` task holding a [`DiskShareContent`] (manifest in
+    /// RAM, file bytes read from disk per request) answers fetchers'
+    /// manifest/chunk requests over the share's CoT fetch-asset for as long as
+    /// the session is up ("you must be online to share" — the relay reaps the
+    /// share when this connection drops, ISC-S20). Lifecycle arrives as
+    /// `NetEvent::PublishStarted` / `PublishError` / `PublishCancelled` /
     /// `PublishStopped`.
     PublishShare {
         root: PathBuf,
@@ -206,6 +215,14 @@ pub enum NetCommand {
         /// see the sharer's name, not "(operator)".
         sharer_handle: String,
     },
+    /// Cancel an in-flight publish hash for `root` (M16 serve-from-disk).
+    /// Sets that publish's cancel flag so the blocking [`cached_or_hash`]
+    /// returns [`ServeError::Cancelled`] at its next per-file check and the
+    /// publish flow emits `NetEvent::PublishCancelled` instead of proceeding
+    /// to the RPC. A no-op when no hash for `root` is in flight (the cancel
+    /// raced a completion, or the share is already serving — stopping a
+    /// *served* share is [`NetCommand::UnpublishShare`]'s job).
+    CancelPublish { root: PathBuf },
     /// Unpublish a share published this session and stop serving it (D, M15;
     /// owner-scoped, ISC-A-S1). Sends `UnpublishShare` to the relay and aborts
     /// the local serve task, emitting `NetEvent::PublishStopped`. No-op for an
@@ -451,9 +468,35 @@ pub enum NetEvent {
         name: String,
         file_count: usize,
     },
+    /// Per-file progress on an in-flight publish hash (M16 serve-from-disk).
+    /// Emitted from the blocking [`cached_or_hash`] thread once per file
+    /// (`done` strictly advances — the throttle), so the app can render a
+    /// "hashing N/M" status and offer `[u]` as the cancel affordance while the
+    /// actor stays responsive. `root` is the defined-root key (client-local
+    /// plumbing, mirroring `PublishStarted` — display-name string joins
+    /// conflate distinct shares per ISC-A-C34); `name` is for the status line.
+    PublishProgress {
+        root: PathBuf,
+        name: String,
+        done: usize,
+        total: usize,
+    },
+    /// An in-flight publish hash was cancelled (`NetCommand::CancelPublish`,
+    /// M16 serve-from-disk). Distinct from `PublishError` so the app can word
+    /// it neutrally — a cancel is the user's own action, not a failure.
+    /// Nothing was published or served; `[p]` re-publishes from scratch.
+    /// `root` keys the app's hashing-state set (ISC-A-C34 root-keying).
+    PublishCancelled { root: PathBuf, name: String },
     /// Publishing a share failed (no session, no server-id, an unreadable path,
-    /// or a refused `PublishShare` RPC). Surfaced on the status line.
-    PublishError { message: String },
+    /// or a refused `PublishShare` RPC). Surfaced on the status line. `root` is
+    /// the defined-root key when the failure concerns a specific publish (the
+    /// hash or RPC step) so the app can clear that root's hashing state;
+    /// `None` for the pre-flight failures (no session / no server-id) that
+    /// never started a hash.
+    PublishError {
+        message: String,
+        root: Option<PathBuf>,
+    },
     /// A published share stopped being served (D, M15): the user unpublished it,
     /// the serve stream ended (peer/relay closed), or the session dropped.
     PublishStopped { share_id: String },
@@ -584,10 +627,35 @@ struct Actor {
     /// The user's own share-index, if a share root has been configured
     /// (ISC-17 / ISC-C21). `None` for the M11 alpha default — the screen
     /// shows "no share root configured" until a config / setup flow lands.
-    /// The redb handle is held behind `Arc` so the actor can hand a borrow
-    /// to a background cold scan in a future commit without giving up the
-    /// foreground query path.
+    /// The redb handle is held behind `Arc` so the actor can hand a clone to
+    /// the background cold scan without giving up the foreground query path.
+    ///
+    /// Opened ONCE, at the first `DefineShare`, and retained for the actor's
+    /// life (M16 serve-from-disk; ISC-C69): redb holds an exclusive file lock,
+    /// so dropping + reopening `share-index.redb` per define raced a
+    /// still-running prior scan's `Arc` clone and hit "Database already open"
+    /// (the 15d8192 startup lock error). Re-defines reuse this handle —
+    /// [`ShareIndex::clear`] + a fresh scan keep latest-define-wins semantics
+    /// without ever cycling the lock.
     share_index: Option<Arc<ShareIndex>>,
+    /// The root the single-active [`Self::share_index`] currently indexes —
+    /// i.e. the root of the latest `DefineShare`. A publish whose root matches
+    /// gets the index handed to [`cached_or_hash`] (cache hits skip hashing);
+    /// any other root hashes from scratch with no index (the M14 single-active
+    /// rule). `None` until the first define.
+    share_index_root: Option<PathBuf>,
+    /// Cancel flag for the in-flight define cold scan, if any (M16). A new
+    /// `DefineShare` sets it (the prior scan exits at its next per-file check
+    /// and suppresses its terminal status) and swaps in a fresh flag —
+    /// latest-define-wins. The scan task itself stays detached, exactly as
+    /// before; the flag is the only handle the actor needs.
+    scan_cancel: Option<Arc<AtomicBool>>,
+    /// Cancel flags for in-flight publish hashes, keyed by the defined root
+    /// (M16 serve-from-disk). `CancelPublish` sets the matching flag; the
+    /// detached publish flow removes its own entry once the hash phase ends
+    /// (cancelled or not) — hence the `Rc<RefCell<..>>`, shared with that
+    /// `spawn_local` flow on this single-threaded `LocalSet` runtime.
+    publish_cancels: Rc<RefCell<HashMap<PathBuf, Arc<AtomicBool>>>>,
     /// The connected relay's pinned server-wide public key (ISC-A-S11),
     /// captured from [`daemonseed_cli::connect::ConnectOutcome`] at connect.
     /// This is the TOFU-pinned key `apply_trust` already accepted, so verifying
@@ -609,8 +677,12 @@ struct Actor {
     /// Active publish serve-tasks keyed by the server-assigned `share_id` (D,
     /// M15). Each value is the `spawn_local` handle for that share's
     /// `serve_share` loop; `UnpublishShare` aborts it. Empty until the user
-    /// publishes; a task that ends on its own leaves a harmless completed entry.
-    published: HashMap<String, tokio::task::JoinHandle<()>>,
+    /// publishes; a task that ends on its own leaves a harmless completed
+    /// entry. `Rc<RefCell<..>>` (M16): the publish flow is now a detached
+    /// `spawn_local` (so the actor drains commands while a share hashes) and
+    /// registers its serve task here itself — single-threaded `LocalSet`
+    /// runtime, so the shared mutation is safe.
+    published: Rc<RefCell<HashMap<String, tokio::task::JoinHandle<()>>>>,
 }
 
 /// The actor loop: receive commands and drive each on the current-thread
@@ -630,10 +702,13 @@ async fn net_actor(
         public_room: None,
         backoff: Backoff::new(),
         share_index: None,
+        share_index_root: None,
+        scan_cancel: None,
+        publish_cancels: Rc::new(RefCell::new(HashMap::new())),
         server_pubkey: None,
         policy_cache: PolicyCache::new(),
         discovered: DiscoveredPeers::new(),
-        published: HashMap::new(),
+        published: Rc::new(RefCell::new(HashMap::new())),
     };
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
@@ -697,6 +772,7 @@ async fn net_actor(
                 name,
                 sharer_handle,
             } => actor.handle_publish_share(root, name, sharer_handle).await,
+            NetCommand::CancelPublish { root } => actor.handle_cancel_publish(&root),
             NetCommand::UnpublishShare { share_id } => {
                 actor.handle_unpublish_share(&share_id).await
             }
@@ -709,81 +785,176 @@ impl Actor {
         let _ = self.evt_tx.send(evt);
     }
 
-    /// Publish a defined share and serve its content for the life of the session
-    /// (D, M15). See [`NetCommand::PublishShare`]. The session is cloned up front
-    /// (cheap — the tonic channel is `Arc`-backed) so no borrow of `self` is held
-    /// across the `&mut self` bookkeeping at the end.
+    /// Publish a defined share and serve its content from disk for the life of
+    /// the session (D, M15 → serve-from-disk, M16). See
+    /// [`NetCommand::PublishShare`]. The session is cloned up front (cheap —
+    /// the tonic channel is `Arc`-backed); everything past the pre-flight runs
+    /// as a detached `spawn_local` flow so the actor's command loop keeps
+    /// draining (a `CancelPublish` must be serviceable WHILE the hash runs —
+    /// that is the whole point of the async shape).
     async fn handle_publish_share(&mut self, root: PathBuf, name: String, sharer_handle: String) {
         let session = match self.session.as_ref() {
             Some(s) => s.clone(),
             None => {
                 return self.emit(NetEvent::PublishError {
                     message: "not connected to a relay yet".to_owned(),
+                    root: None,
                 });
             }
         };
         let Some(server_id) = self.server_id.clone() else {
             return self.emit(NetEvent::PublishError {
                 message: "no server-id for the connected relay".to_owned(),
+                root: None,
             });
         };
-        // Index BEFORE publishing so a bad path fails fast and the listing is
-        // never advertised for content we cannot serve (mirrors the CLI).
-        let content = match ShareContent::index_dir(&root) {
-            Ok(c) => c,
-            Err(e) => {
-                return self.emit(NetEvent::PublishError {
-                    message: format!("could not index {}: {e}", root.display()),
-                });
-            }
+
+        // Per-publish cancel flag, keyed by root so `CancelPublish { root }`
+        // finds exactly this hash. A re-publish of the same root overwrites a
+        // stale entry; the detached flow removes its own entry below.
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.publish_cancels
+            .borrow_mut()
+            .insert(root.clone(), Arc::clone(&cancel));
+
+        // The single-active rule (M14): hand `cached_or_hash` the open index
+        // only when it indexes THIS root — its cached chunk addresses are
+        // meaningless for any other directory. A non-matching root hashes
+        // from scratch (`None`).
+        let index = if self.share_index_root.as_ref() == Some(&root) {
+            self.share_index.clone()
+        } else {
+            None
         };
-        let file_count = content.file_count();
-        // listing.share_id is ignored — the server assigns it (F25).
-        let resp = session
-            .public_space()
-            .publish_share(wire::PublishShareRequest {
-                listing: Some(wire::PublicShareListing {
-                    share_id: String::new(),
-                    name: name.clone(),
-                    rating: String::new(),
-                    // The publisher's display handle so peers see who shared it
-                    // instead of "(operator)" (M15 — completes the #6 handle
-                    // passthrough on the publish side).
-                    sharer_handle,
-                }),
-            })
-            .await;
-        let share_id = match resp {
-            Ok(r) => r.into_inner().share_id,
-            Err(s) => {
-                return self.emit(NetEvent::PublishError {
-                    message: format!("publish refused: {s}"),
-                });
-            }
-        };
-        // Serve concurrently for the life of the session via `spawn_local` (like
-        // the circle inbound readers). `serve_share` ends (Ok) when the relay
-        // reaps the asset or the peer leaves; an explicit `UnpublishShare` aborts
-        // the task before then. On a natural end we emit `PublishStopped`; on an
-        // abort the future is dropped before that line runs, so unpublish's own
-        // `PublishStopped` is the single notification.
+
+        // Hash BEFORE publishing so a bad path / cancel fails fast and the
+        // listing is never advertised for content we cannot serve (mirrors the
+        // CLI) — but on a dedicated blocking thread, with per-file progress
+        // events, so a multi-gigabyte share never parks the actor.
+        let hash_root = root.clone();
+        let hash_name = name.clone();
+        let hash_cancel = Arc::clone(&cancel);
+        let progress_tx = self.evt_tx.clone();
+        let hash_task = tokio::task::spawn_blocking(move || {
+            // Throttle: `cached_or_hash` reports per file; emit only when
+            // `done` actually advanced so a redundant callback never floods
+            // the UI channel.
+            let mut last_done = usize::MAX;
+            let mut progress = |done: usize, total: usize| {
+                if done != last_done {
+                    last_done = done;
+                    let _ = progress_tx.send(NetEvent::PublishProgress {
+                        root: hash_root.clone(),
+                        name: hash_name.clone(),
+                        done,
+                        total,
+                    });
+                }
+            };
+            cached_or_hash(index.as_deref(), &hash_root, &hash_cancel, &mut progress)
+        });
+
+        // Detached continuation: await the blocking hash, then run the RPC +
+        // serve steps — mirroring the other detached flows in this file (the
+        // circle inbound readers, the define scan). The actor's `&mut self`
+        // command loop is NOT held across any of this; the flow registers its
+        // serve task / drops its cancel flag through the shared `Rc` handles.
         let evt_tx = self.evt_tx.clone();
-        let task_share_id = share_id.clone();
-        let handle = tokio::task::spawn_local(async move {
-            let _ = session
-                .serve_share(&server_id, &task_share_id, &content)
+        let publish_cancels = Rc::clone(&self.publish_cancels);
+        let published = Rc::clone(&self.published);
+        tokio::task::spawn_local(async move {
+            let hashed = hash_task.await.expect("share-hash task panicked");
+            // The hash phase is over either way — drop the cancel flag so a
+            // late `CancelPublish` is the documented no-op (stopping a served
+            // share is `UnpublishShare`'s job).
+            publish_cancels.borrow_mut().remove(&root);
+            let manifest = match hashed {
+                Ok(m) => m,
+                Err(CachedHashError::Serve(ServeError::Cancelled)) => {
+                    // The user's own cancel, not a failure — worded neutrally
+                    // by the app via the distinct event.
+                    let _ = evt_tx.send(NetEvent::PublishCancelled { root, name });
+                    return;
+                }
+                Err(e) => {
+                    let _ = evt_tx.send(NetEvent::PublishError {
+                        message: format!("could not index {}: {e}", root.display()),
+                        root: Some(root),
+                    });
+                    return;
+                }
+            };
+            // Disk-backed serve content (M16): the manifest stays in RAM, the
+            // file bytes are read from disk per chunk request — a share is no
+            // longer copied whole into a `MemoryChunkStore`. Built before the
+            // RPC so the listing is never advertised for content we cannot
+            // serve. `Arc`-shared because `serve_share` answers each request
+            // on the blocking pool — the per-request disk read must NEVER run
+            // inline on this single-threaded `LocalSet`, or one multi-GB
+            // chunk request parks the whole actor (ISC-A-C7).
+            let content = std::sync::Arc::new(DiskShareContent::new(root.clone(), manifest));
+            let file_count = content.file_count();
+            // listing.share_id is ignored — the server assigns it (F25).
+            let resp = session
+                .public_space()
+                .publish_share(wire::PublishShareRequest {
+                    listing: Some(wire::PublicShareListing {
+                        share_id: String::new(),
+                        name: name.clone(),
+                        rating: String::new(),
+                        // The publisher's display handle so peers see who shared
+                        // it instead of "(operator)" (M15 — completes the #6
+                        // handle passthrough on the publish side).
+                        sharer_handle,
+                    }),
+                })
                 .await;
-            let _ = evt_tx.send(NetEvent::PublishStopped {
-                share_id: task_share_id,
+            let share_id = match resp {
+                Ok(r) => r.into_inner().share_id,
+                Err(s) => {
+                    let _ = evt_tx.send(NetEvent::PublishError {
+                        message: format!("publish refused: {s}"),
+                        root: Some(root),
+                    });
+                    return;
+                }
+            };
+            // Serve concurrently for the life of the session via `spawn_local`
+            // (like the circle inbound readers). `serve_share` ends (Ok) when
+            // the relay reaps the asset or the peer leaves; an explicit
+            // `UnpublishShare` aborts the task before then. On a natural end
+            // we emit `PublishStopped`; on an abort the future is dropped
+            // before that line runs, so unpublish's own `PublishStopped` is
+            // the single notification.
+            let task_share_id = share_id.clone();
+            let serve_evt_tx = evt_tx.clone();
+            let handle = tokio::task::spawn_local(async move {
+                let _ = session
+                    .serve_share(&server_id, &task_share_id, content)
+                    .await;
+                let _ = serve_evt_tx.send(NetEvent::PublishStopped {
+                    share_id: task_share_id,
+                });
+            });
+            published.borrow_mut().insert(share_id.clone(), handle);
+            let _ = evt_tx.send(NetEvent::PublishStarted {
+                share_id,
+                root,
+                name,
+                file_count,
             });
         });
-        self.published.insert(share_id.clone(), handle);
-        self.emit(NetEvent::PublishStarted {
-            share_id,
-            root,
-            name,
-            file_count,
-        });
+    }
+
+    /// Cancel an in-flight publish hash for `root` (M16 serve-from-disk). See
+    /// [`NetCommand::CancelPublish`]. Sets the flag only — the blocking
+    /// [`cached_or_hash`] observes it at its next per-file check and returns
+    /// [`ServeError::Cancelled`], which the publish flow turns into
+    /// `NetEvent::PublishCancelled`. A no-op when nothing is in flight.
+    fn handle_cancel_publish(&self, root: &PathBuf) {
+        if let Some(flag) = self.publish_cancels.borrow().get(root) {
+            flag.store(true, Ordering::Relaxed);
+        }
     }
 
     /// Unpublish a share published this session and stop serving it (D, M15).
@@ -791,7 +962,7 @@ impl Actor {
     /// the relay honours it only on the publishing connection, which is this
     /// long-lived actor.
     async fn handle_unpublish_share(&mut self, share_id: &str) {
-        if let Some(handle) = self.published.remove(share_id) {
+        if let Some(handle) = self.published.borrow_mut().remove(share_id) {
             handle.abort();
         }
         if let Some(session) = self.session.as_ref() {
@@ -1161,6 +1332,15 @@ impl Actor {
     /// scan thread emits the terminal [`NetEvent::IndexerStatus`]; the app pulls
     /// the freshly-indexed rows via a follow-up `RefreshShares`.
     ///
+    /// The index is opened ONCE — the first `DefineShare` — and the handle is
+    /// kept for the actor's life (M16). The old drop-then-reopen-per-define
+    /// raced any still-running prior scan's `Arc` clone on redb's exclusive
+    /// file lock ("Database already open. Cannot acquire lock" — the startup
+    /// re-define burst hit it every launch). Latest-define-wins is preserved
+    /// without the reopen: the prior scan is *cancelled* via its flag, the
+    /// retained index is [`ShareIndex::clear`]ed, and the new root's scan
+    /// repopulates it.
+    ///
     /// MVP scope: a single active share index — the latest `DefineShare` wins.
     /// Multi-root concurrent indexing (one index per root) is a documented
     /// follow-up; `_label` is reserved for that surface and the at-rest
@@ -1172,32 +1352,44 @@ impl Actor {
         index_path: PathBuf,
         index_key: IndexKey,
     ) {
-        // Open off the actor thread — redb's file-create + table-materialize is
-        // blocking I/O. Quick, but offloaded so the async loop does no sync disk.
-        let key_bytes = index_key.to_bytes();
-        // Single active index — latest DefineShare wins (the M14 MVP). Drop any
-        // previously-opened index FIRST so its redb file lock is released;
-        // otherwise opening the same `share-index.redb` for a second defined
-        // share — or re-emitting a DefineShare per persisted root on Unlock —
-        // hits redb's exclusive lock ("Database already open. Cannot acquire
-        // lock"). A still-running prior cold scan holds an Arc clone, so the
-        // lock frees only once that scan ends — acceptable for the MVP.
-        self.share_index = None;
-        let opened = tokio::task::spawn_blocking(move || ShareIndex::open(&index_path, key_bytes))
-            .await
-            .expect("share-index open task panicked");
-        let index = match opened {
-            Ok(index) => Arc::new(index),
-            Err(e) => {
-                self.emit(NetEvent::ShareDefineFailed {
-                    message: format!("could not open share index: {e}"),
-                });
-                return;
+        let index = match self.share_index.as_ref() {
+            // Already open: reuse the handle forever — NEVER drop it to None
+            // (the redb lock must not cycle; see the method doc).
+            Some(index) => Arc::clone(index),
+            None => {
+                // First define: open off the actor thread — redb's file-create
+                // + table-materialize is blocking I/O. Quick, but offloaded so
+                // the async loop does no sync disk.
+                let key_bytes = index_key.to_bytes();
+                let opened =
+                    tokio::task::spawn_blocking(move || ShareIndex::open(&index_path, key_bytes))
+                        .await
+                        .expect("share-index open task panicked");
+                match opened {
+                    Ok(index) => Arc::new(index),
+                    Err(e) => {
+                        self.emit(NetEvent::ShareDefineFailed {
+                            message: format!("could not open share index: {e}"),
+                        });
+                        return;
+                    }
+                }
             }
         };
         // Retain for foreground queries immediately — queryable during the scan
-        // via redb MVCC (ISC-A-C7).
+        // via redb MVCC (ISC-A-C7) — and record which root the single-active
+        // index now serves (the publish cache-reuse key).
         self.share_index = Some(Arc::clone(&index));
+        self.share_index_root = Some(root.clone());
+
+        // Latest-define-wins: cancel any prior in-flight scan (it exits at its
+        // next per-file check and suppresses its terminal status), then swap in
+        // a fresh flag for this scan.
+        if let Some(prior) = self.scan_cancel.replace(Arc::new(AtomicBool::new(false))) {
+            prior.store(true, Ordering::Relaxed);
+        }
+        let cancel = Arc::clone(self.scan_cancel.as_ref().expect("just set"));
+
         self.emit(NetEvent::IndexerStatus(IndexerStatus::Indexing {
             seen: 0,
             total: None,
@@ -1206,17 +1398,29 @@ impl Actor {
         // Cold scan on a dedicated blocking thread, writing to the same index
         // the foreground reads (redb MVCC). Detached: the actor resumes its
         // command loop at once; the thread reports the terminal status itself.
+        // The clear runs on the same blocking thread (redb write I/O), right
+        // before the repopulating scan, so the retained index flips from the
+        // old root's entries to the new root's without the handle ever closing.
         let evt_tx = self.evt_tx.clone();
         tokio::task::spawn_blocking(move || {
-            let status = match scan_into(&index, &root) {
+            let status = match index
+                .clear()
+                .and_then(|()| scan_into(&index, &root, &cancel))
+            {
                 Ok(count) => IndexerStatus::Ready {
                     entries: count as u64,
                 },
-                // A scan error leaves the retained index in place; report Idle so
-                // the status line stops showing an indefinite "indexing".
+                // A clear/scan error leaves the retained index in place; report
+                // Idle so the status line stops showing an indefinite
+                // "indexing".
                 Err(_) => IndexerStatus::Idle,
             };
-            let _ = evt_tx.send(NetEvent::IndexerStatus(status));
+            // A cancelled scan stays silent: a newer define owns the status
+            // line now, and a stale terminal status would clobber its
+            // `Indexing` report.
+            if !cancel.load(Ordering::Relaxed) {
+                let _ = evt_tx.send(NetEvent::IndexerStatus(status));
+            }
         });
     }
 
@@ -2277,10 +2481,13 @@ mod tests {
             public_room: None,
             backoff: Backoff::new(),
             share_index: None,
+            share_index_root: None,
+            scan_cancel: None,
+            publish_cancels: Rc::new(RefCell::new(HashMap::new())),
             server_pubkey: None,
             policy_cache: PolicyCache::new(),
             discovered: DiscoveredPeers::new(),
-            published: HashMap::new(),
+            published: Rc::new(RefCell::new(HashMap::new())),
         }
     }
 
@@ -2299,10 +2506,57 @@ mod tests {
             "x#000000000000".to_owned(),
         ));
         match rx.try_recv().unwrap() {
-            NetEvent::PublishError { message } => assert!(message.contains("not connected")),
+            NetEvent::PublishError { message, root } => {
+                assert!(message.contains("not connected"));
+                assert_eq!(root, None, "pre-flight failure carries no root key");
+            }
             other => panic!("expected PublishError, got {other:?}"),
         }
-        assert!(actor.published.is_empty(), "no serve task tracked");
+        assert!(actor.published.borrow().is_empty(), "no serve task tracked");
+        assert!(
+            actor.publish_cancels.borrow().is_empty(),
+            "no cancel flag registered before the pre-flight passes"
+        );
+    }
+
+    /// Cancelling a publish with nothing in flight is the documented no-op —
+    /// no event, no panic (M16 serve-from-disk).
+    #[test]
+    fn cancel_publish_with_nothing_in_flight_is_a_noop() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let actor = bare_actor(tx);
+        actor.handle_cancel_publish(&std::path::PathBuf::from("/tmp/never-published"));
+        assert!(rx.try_recv().is_err(), "no event for a no-op cancel");
+    }
+
+    /// `CancelPublish` sets exactly the matching root's flag and leaves any
+    /// other in-flight publish's flag untouched (M16 — the per-root keying).
+    #[test]
+    fn cancel_publish_sets_only_the_matching_flag() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let actor = bare_actor(tx);
+        let target = std::path::PathBuf::from("/tmp/share-a");
+        let other = std::path::PathBuf::from("/tmp/share-b");
+        let target_flag = Arc::new(AtomicBool::new(false));
+        let other_flag = Arc::new(AtomicBool::new(false));
+        actor
+            .publish_cancels
+            .borrow_mut()
+            .insert(target.clone(), Arc::clone(&target_flag));
+        actor
+            .publish_cancels
+            .borrow_mut()
+            .insert(other.clone(), Arc::clone(&other_flag));
+
+        actor.handle_cancel_publish(&target);
+        assert!(
+            target_flag.load(Ordering::Relaxed),
+            "the matching root's hash is told to stop"
+        );
+        assert!(
+            !other_flag.load(Ordering::Relaxed),
+            "an unrelated in-flight publish keeps hashing"
+        );
     }
 
     /// Unpublishing an unknown id with no session still emits `PublishStopped`

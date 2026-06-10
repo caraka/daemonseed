@@ -694,8 +694,11 @@ fn render_my_shares_pane(app: &App, frame: &mut Frame, area: Rect) {
         );
     } else {
         lines.push(
-            Line::from("defined shares  ([ / ] select · [p] publish · [u] unpublish):".to_owned())
-                .style(Style::default().fg(Color::DarkGray)),
+            Line::from(
+                "defined shares  ([ / ] select · [p] publish · [u] unpublish/cancel · [x] remove):"
+                    .to_owned(),
+            )
+            .style(Style::default().fg(Color::DarkGray)),
         );
         for (i, (root, name)) in app.defined_shares().iter().enumerate() {
             let marker = if i == app.defined_sel() { "▶ " } else { "  " };

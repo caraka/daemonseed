@@ -97,9 +97,12 @@ async fn fetcher_recovers_share_via_real_serve_path() {
     // ── Sharer: index the directory, run the REAL serve loop. ─────────────
     let content = ShareContent::index_dir(dir.path()).expect("index share dir");
     assert_eq!(content.file_count(), 2, "two files indexed");
+    // `Arc`-shared, as in production: serve_share answers each request on the
+    // blocking pool (ISC-A-C7) and so shares the content across those tasks.
+    let content = Arc::new(content);
     let sharer_task = tokio::spawn(async move {
         // Held until the fetcher drops the asset; returns Ok on graceful end.
-        let _ = sharer_sess.serve_share(SERVER_ID, SHARE_ID, &content).await;
+        let _ = sharer_sess.serve_share(SERVER_ID, SHARE_ID, content).await;
         // Keep `dir` alive for the lifetime of the serve loop.
         drop(dir);
     });

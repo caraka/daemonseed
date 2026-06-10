@@ -23,12 +23,13 @@ use daemonseed_core::cot::public_share_asset_address;
 use daemonseed_core::federation::discovered::{DiscoveredPeers, MergeOutcome};
 use daemonseed_core::federation::store::TrustStore;
 use daemonseed_core::share_envelope::ShareFrame;
-use daemonseed_core::share_serve::ShareContent;
+use daemonseed_core::share_serve::ChunkSource;
 use daemonseed_proto::v1::IntroducerQuery;
 use daemonseed_proto::v1::circle_of_trust_client::CircleOfTrustClient;
 use daemonseed_proto::v1::federation_introducer_client::FederationIntroducerClient;
 use daemonseed_proto::v1::public_space_client::PublicSpaceClient;
 use hyper_util::rt::TokioIo;
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -147,15 +148,28 @@ impl AppSession {
     /// fans every fetcher's `ManifestRequest` / `ChunkRequest` into this one
     /// stream and our responses back out, so one serve loop handles arbitrarily
     /// many concurrent fetchers (bounded by the relay's per-connection limiter,
-    /// ISC-S17). Each reply is sourced from `content`'s content-addressed store,
-    /// so its bytes hash to the advertised address by construction (ISC-S28);
+    /// ISC-S17). Each reply is answered by `content` — any [`ChunkSource`]
+    /// (the in-RAM `ShareContent` or the disk-backed `DiskShareContent`) — so
+    /// its bytes hash to the advertised address by construction (ISC-S28);
     /// the serve side never fabricates a chunk it does not hold (ISC-A-S21).
-    pub async fn serve_share(
+    ///
+    /// `content` is shared via [`Arc`] and every inbound frame is answered on
+    /// the blocking pool ([`tokio::task::spawn_blocking`]), never inline:
+    /// `ChunkSource::answer` does synchronous file I/O for a disk-backed
+    /// chunk, and this loop runs as a `spawn_local` task on the TUI net
+    /// actor's single-threaded `LocalSet` — an inline answer would park the
+    /// entire actor (connects, chat, every other share) for the duration of a
+    /// multi-GB read. Serving must never freeze the client's event loop
+    /// (ISC-A-C7), so the blocking work is pushed off-runtime per request.
+    pub async fn serve_share<C>(
         &self,
         server_id: &str,
         share_id: &str,
-        content: &ShareContent,
-    ) -> Result<(), ServeShareError> {
+        content: Arc<C>,
+    ) -> Result<(), ServeShareError>
+    where
+        C: ChunkSource + Send + Sync + 'static,
+    {
         let asset_addr = public_share_asset_address(share_id.as_bytes(), server_id.as_bytes())
             .map_err(ServeShareError::Derive)?;
         let asset_bytes = asset_addr.as_bytes().to_vec();
@@ -190,7 +204,14 @@ impl AppSession {
             let Ok(req) = ShareFrame::decode(&frame.payload) else {
                 continue;
             };
-            if let Some(response) = content.answer(&req)
+            // Answer off-runtime (ISC-A-C7, see the method doc): the disk
+            // read behind a `ChunkRequest` is blocking, and this task may be
+            // sharing a single-threaded `LocalSet` with the whole TUI actor.
+            let source = Arc::clone(&content);
+            let response = tokio::task::spawn_blocking(move || source.answer(&req))
+                .await
+                .expect("share answer task panicked");
+            if let Some(response) = response
                 && out_tx
                     .send(daemonseed_proto::v1::CotFrame {
                         asset_address: asset_bytes.clone(),

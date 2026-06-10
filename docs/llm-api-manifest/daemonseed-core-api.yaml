@@ -347,18 +347,54 @@ modules:
       - A-S2
       - A-S5b
 
+  - name: daemonseed_core::share_serve
+    description: >-
+      Serve-side share content. ShareContent::index_dir reads a directory
+      whole into a MemoryChunkStore (the in-RAM path — kept for the CLI and
+      tests). M16 adds the disk-backed publish/serve path (ISC-C73 / A-C35):
+      hash_share stream-hashes every file through a fixed 1 MiB buffer into a
+      ShareManifest whose per-file chunk_addr is byte-identical to the in-RAM
+      path's (one SHA-384 over the file's full bytes — fetch-side
+      verification unchanged, ISC-S28), cancellable between files, with
+      per-file progress; DiskShareContent pairs that manifest with the share
+      root and reads ONE file from disk per chunk request, so serve memory is
+      proportional to one file, not the share. The serve loop's needs are
+      factored into the ChunkSource trait (manifest + chunk lookup, pure
+      `answer` provided), implemented by both ShareContent and
+      DiskShareContent so a transport driver serves either through one code
+      path. ServeError gained Cancelled / UnknownChunk / ChunkModified.
+    no_std: false
+    depends_on:
+      - daemonseed_core::share_envelope
+      - daemonseed_core::storage::cas
+    iscs:
+      - S27
+      - S28
+      - A-S20
+      - A-S21
+      - C73
+      - A-C35
+    added_in: "ShareContent M11/M15; disk-backed path M16 (serve-from-disk)"
+
   - name: daemonseed_core::storage::share_index
     description: >-
       Encrypted, incremental redb-backed share index (M8, ISC-C21 / A-C6 / A-C7)
       — the indexed-state layer of the three-layer storage split. One ShareEntry
-      per shared file (rel_path, size, mtime). Incremental: put/remove rewrite ONE
+      per shared file (rel_path, size, mtime, and as of M16 an optional cached
+      chunk_addr — the publish-path hash cache, ISC-C73, valid only while
+      size+mtime still match; a metadata-only scan writes None). Incremental:
+      put/remove rewrite ONE
       entry, never the whole index (A-C7, the Pi-4 civility floor); persisted, so
       reopening reuses rather than cold-rescans (C21). Per entry the redb KEY is
       SHA-384(index_key||rel_path)[:32] (keyed -> not reversible OR confirmable
       without the key; deterministic) and the VALUE is AES-256-GCM(index_key,
       nonce, padded-metadata). Values padded to 256-byte buckets so ciphertext
       length can't leak path length. Index records the LOGICAL view (decrypted
-      names).
+      names). M16 value-format v2: the redb table name bumped share-index →
+      share-index-v2 (alpha format bump — an old v1 table is abandoned in
+      place, never read or migrated; a rescan repopulates, the index is a
+      cache over the filesystem, not a record). New clear() empties the index
+      in one transaction (the clear-then-rescan latest-define-wins move).
     no_std: false
     depends_on: []
     iscs:
@@ -412,12 +448,22 @@ modules:
       root) — the cold-scan walk over a *borrowed* index (cold_scan delegates to
       it) so a caller holding an Arc<ShareIndex> can run the scan on a background
       thread while the same index stays queryable from the foreground (redb MVCC);
-      this is the TUI net-actor's share-activation path.
+      this is the TUI net-actor's share-activation path. M16 (serve-from-disk):
+      scan_into gained a cancel flag — checked per entry, a set flag
+      EARLY-RETURNS Ok(count) with however many files were upserted
+      (cancellation is idempotent metadata work, not an error; a metadata-only
+      scan writes chunk_addr: None). New cached_or_hash uses the index as a
+      chunk-addr CACHE for the disk-backed publish path (ISC-C73): a file
+      whose indexed size+mtime still match and whose entry carries a cached
+      chunk_addr is reused without reading the file; misses stream-hash and
+      write the fresh address back; index None = exactly hash_share.
     no_std: false
     depends_on:
       - daemonseed_core::storage::share_index
+      - daemonseed_core::share_serve
     iscs:
       - C21
+      - C73
       - A-C7
 
   - name: daemonseed_core::first_start
@@ -1239,6 +1285,76 @@ types:
       hex; as_bytes() -> &[u8;48]; from_bytes([u8;48]) names a subscribe target
       (opaque, unvalidatable by the relay).
 
+  # ── share_serve ─────────────────────────────────────────────────────
+  - name: ShareContent
+    module: daemonseed_core::share_serve
+    kind: struct
+    description: >-
+      In-RAM serve content: index_dir(root) reads every file under root into a
+      MemoryChunkStore + manifest (fails fast on a bad path — never advertise
+      content you cannot serve); file_count() / manifest() / answer(&ShareFrame)
+      (inherent, delegates to ChunkSource::answer). Caps a share at available
+      memory — the CLI/test path; the TUI publish path is DiskShareContent.
+
+  - name: ShareManifest
+    module: daemonseed_core::share_serve
+    kind: struct
+    description: >-
+      The manifest a hash pass produces over a share root (M16): entries:
+      Vec<ManifestEntry>, one per file, in the same deterministic order as
+      ShareContent::index_dir (sorted walk + full-path sort) with byte-identical
+      per-file SHA-384 chunk addresses — fetch-side verification unchanged
+      (ISC-S28).
+
+  - name: DiskShareContent
+    module: daemonseed_core::share_serve
+    kind: struct
+    description: >-
+      Disk-backed serve content (M16, ISC-C73 / A-C35): new(root, manifest)
+      pairs a share root with a hashed ShareManifest (O(1) addr→entry map built
+      once); file_count() / manifest() / get_chunk(&ChunkAddr) -> Result<Vec<u8>,
+      ServeError>. get_chunk reads the ONE file behind the address and applies
+      cheap fail-closed checks ONLY — a read error (Io) or a byte length that no
+      longer matches the manifest entry (ChunkModified); UnknownChunk for an
+      address not in the manifest. Deliberately NO serve-time re-hash: the
+      receiver's per-chunk SHA-384 re-derivation (ISC-S28) is the integrity
+      guarantee — a same-size content change passes this server and is rejected
+      by the fetcher; re-publish to serve intentionally changed content.
+
+  - name: ChunkSource
+    module: daemonseed_core::share_serve
+    kind: trait
+    description: >-
+      The minimal content surface a serve loop needs (M16): manifest() ->
+      &[ManifestEntry] + chunk(&ChunkAddr) -> Option<Vec<u8>>, with the pure
+      answer(&ShareFrame) -> Option<ShareFrame> step provided on top
+      (ManifestRequest → full manifest; ChunkRequest → ChunkResponse, or no
+      frame when the source cannot faithfully serve the address — never
+      fabricate content, ISC-A-S21). Implemented by ShareContent and
+      DiskShareContent, so a transport driver (CLI serve loop, TUI net actor)
+      serves either.
+
+  - name: ServeError
+    module: daemonseed_core::share_serve
+    kind: enum
+    description: >-
+      Why serve-side content (an index, a hash pass, or a disk-backed chunk
+      read) failed. M16 added Cancelled / UnknownChunk / ChunkModified.
+    variants:
+      - name: Io
+        description: "Io(std::io::Error) — reading a file under the share root failed."
+      - name: Cas
+        description: "Cas(CasError) — hashing failed (oxicrypt SHA-384 self-test not passed)."
+      - name: Cancelled
+        description: The hash pass was cancelled via its flag (checked between files; no partial manifest).
+      - name: UnknownChunk
+        description: A requested chunk address is not in this content's manifest.
+      - name: ChunkModified
+        description: >-
+          ChunkModified { rel_path } — a share file's on-disk byte length no
+          longer matches its manifest entry (truncated/grew since hashing);
+          fails closed, never a knowingly mismatched frame on the wire.
+
   # ── storage::share_index ────────────────────────────────────────────
   - name: ShareEntry
     module: daemonseed_core::storage::share_index
@@ -1254,6 +1370,13 @@ types:
       - name: mtime_unix_ms
         type: u64
         description: Modification time in Unix milliseconds.
+      - name: chunk_addr
+        type: "Option<Vec<u8>>"
+        description: >-
+          Cached 48-byte SHA-384 content address from the last hash pass
+          (M16, ISC-C73), or None after a metadata-only scan. Valid only
+          while size and mtime_unix_ms still match the file; a change event
+          or rescan writes None so a stale address never survives.
 
   - name: ShareIndex
     module: daemonseed_core::storage::share_index
@@ -1262,7 +1385,8 @@ types:
       Open encrypted index over a redb file; holds a Zeroizing<[u8;32]> index
       key. open(path, key) creates/reopens. Incremental ops: put / get(rel_path)
       / remove(rel_path) / len / is_empty / entries() (decrypts all, paths come
-      from values not keys).
+      from values not keys) / clear() (M16 — drop + re-create the table in one
+      write txn; the clear-then-rescan move for a wholesale root change).
     security:
       contains_secret: true
       zeroize_on_drop: true
@@ -1328,6 +1452,19 @@ types:
     description: >-
       Handle to a running background cold-scan. join() -> Result<usize,
       IndexError> waits + returns the count; drop detaches.
+
+  - name: CachedHashError
+    module: daemonseed_core::indexer
+    kind: enum
+    description: >-
+      Why a cached_or_hash pass failed (M16) — it spans two domains.
+    variants:
+      - name: Index
+        description: "Index(IndexError) — reading/writing the chunk-addr cache failed."
+      - name: Serve
+        description: >-
+          Serve(ServeError) — the hash pass failed: I/O, hashing, or
+          cancellation (ServeError::Cancelled arrives wrapped here).
 
   # ── storage::fetched ────────────────────────────────────────────────
   - name: FetchedFile
@@ -3333,6 +3470,34 @@ functions:
           condition: A manifest entry's rel_path bytes are not valid UTF-8.
     iscs: ["19", F23]
 
+  # ── share_serve ─────────────────────────────────────────────────────
+  - name: hash_share
+    module: daemonseed_core::share_serve
+    description: >-
+      Walk root and stream-hash every regular file into a ShareManifest
+      (M16, ISC-C73) — each file fed through a fixed 1 MiB buffer into
+      SHA-384, never a whole-file read, so the pass's memory footprint is
+      independent of file size. Same deterministic order and per-file
+      chunk_addr as ShareContent::index_dir, so fetch-side verification is
+      unchanged (ISC-S28). progress(done, total) fires after every file
+      (the file list is collected first so total is stable from the first
+      callback); cancel is checked BETWEEN files — a set flag aborts with
+      ServeError::Cancelled, no partial manifest. An unreadable file aborts
+      the pass (a sharer must know its content is complete before
+      advertising it).
+    signature: "pub fn hash_share(root: &Path, cancel: &AtomicBool, progress: &mut dyn FnMut(usize, usize)) -> Result<ShareManifest, ServeError>"
+    returns:
+      type: "Result<ShareManifest, ServeError>"
+      description: The hashed manifest, or why the pass stopped.
+      error_variants:
+        - name: Io
+          condition: A file's metadata or bytes could not be read.
+        - name: Cas
+          condition: SHA-384 init failed (oxicrypt self-test not passed).
+        - name: Cancelled
+          condition: The cancel flag was set before the pass completed.
+    iscs: [C73, C74, S28]
+
   # ── circle::message ─────────────────────────────────────────────────
   - name: seal_message
     module: daemonseed_core::circle::message
@@ -3468,6 +3633,24 @@ functions:
           condition: AES-GCM open failed on an entry.
         - name: Corrupt
           condition: A stored value could not be decoded.
+
+  - name: ShareIndex::clear
+    module: daemonseed_core::storage::share_index
+    description: >-
+      Delete every entry in ONE write transaction — the table is dropped and
+      re-created atomically (M16). The clear-then-rescan move: latest-wins
+      semantics for a share whose root changed wholesale, without tracking
+      per-entry staleness and without ever cycling the redb file lock
+      (ISC-A-C36 — the TUI keeps one open handle for the actor's life).
+    signature: "pub fn clear(&self) -> Result<(), IndexError>"
+    parameters: []
+    returns:
+      type: "Result<(), IndexError>"
+      description: Ok once the empty table is committed.
+      error_variants:
+        - name: Db
+          condition: The redb delete/re-create/commit failed.
+    iscs: [C73, A-C36]
 
   # ── storage::fetched ────────────────────────────────────────────────
   - name: FetchedStore::open
@@ -3655,6 +3838,54 @@ functions:
     returns:
       type: ScanHandle
       description: A handle to the running background scan.
+
+  - name: scan_into
+    module: daemonseed_core::indexer
+    description: >-
+      Cold-scan root into a BORROWED ShareIndex (M14 — the TUI net-actor
+      share-activation path; cold_scan delegates here). Upserts every regular
+      file (metadata only — chunk_addr: None; content addresses come from the
+      hash pass, never a stat walk); unreadable entries skipped, not fatal.
+      M16 added the cancel flag: checked per entry, a set flag EARLY-RETURNS
+      Ok(count) — cancellation is idempotent metadata work, not an error
+      (every entry already written is valid); a caller that must distinguish
+      complete from cut-short checks its own flag after the call.
+    signature: "pub fn scan_into(index: &ShareIndex, root: &Path, cancel: &AtomicBool) -> Result<usize, IndexError>"
+    returns:
+      type: "Result<usize, IndexError>"
+      description: The number of files upserted (possibly cut short by cancel).
+      error_variants:
+        - name: Db
+          condition: A redb write failed during the scan.
+        - name: Crypto
+          condition: AES-GCM seal failed during the scan.
+    iscs: [C21, A-C7]
+
+  - name: cached_or_hash
+    module: daemonseed_core::indexer
+    description: >-
+      Build a share's ShareManifest using the index as a chunk-addr CACHE
+      (M16, ISC-C73 — the disk-backed publish path): a file whose indexed
+      size+mtime still match and whose entry carries a cached chunk_addr is
+      reused WITHOUT reading the file; only misses (new, changed, or
+      never-hashed files) are streamed through SHA-384 as in hash_share, and
+      each fresh address is written back so the next publish of an unchanged
+      share reads no file at all. index None = exactly hash_share (the cache
+      is an optimization, never a requirement). Walk order, rel_path form,
+      progress cadence (after every file, hit or miss), and between-files
+      cancellation (ServeError::Cancelled wrapped in CachedHashError::Serve)
+      all match hash_share, so both paths produce identical manifests for
+      the same tree.
+    signature: "pub fn cached_or_hash(index: Option<&ShareIndex>, root: &Path, cancel: &AtomicBool, progress: &mut dyn FnMut(usize, usize)) -> Result<ShareManifest, CachedHashError>"
+    returns:
+      type: "Result<ShareManifest, CachedHashError>"
+      description: The manifest, or which domain (cache vs hash pass) failed.
+      error_variants:
+        - name: Index
+          condition: Reading or writing the chunk-addr cache (ShareIndex) failed.
+        - name: Serve
+          condition: The hash pass failed — I/O, hashing, or cancellation.
+    iscs: [C73, C74]
 
   # ── first_start ─────────────────────────────────────────────────────
   - name: "FirstStart::<Welcome>::new"

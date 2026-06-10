@@ -854,6 +854,84 @@ functions:
           condition: Signature or whitelist verification failed.
     iscs: [A-S3, "26"]
 
+  # ── daemonseed_cli::session ───────────────────────────────────────
+  - name: "AppSession::open"
+    module: daemonseed_cli::session
+    description: >-
+      Build a session over an already-Authenticated stream. The stream is
+      consumed once by the tonic connector; the placeholder authority is never
+      resolved (no dial happens). Generic over the stream so production
+      (AppStream) and tests (tokio::io::duplex) share the path.
+    signature: "pub async fn open<S>(stream: S) -> Result<AppSession, SessionError> where S: AsyncRead + AsyncWrite + Send + Unpin + 'static"
+    parameters:
+      - name: stream
+        type: S
+        direction: in
+        description: The post-Authenticated stream (production AppStream, or a test duplex half).
+    returns:
+      type: "Result<AppSession, SessionError>"
+      description: A live session whose channel rides the supplied stream.
+      error_variants:
+        - name: Transport
+          condition: The tonic channel failed to come up over the stream.
+    iscs: ["10", "36"]
+
+  - name: "AppSession::public_space"
+    module: daemonseed_cli::session
+    description: A PublicSpaceClient over this session (MOTD, posts, taxonomy, whitelist, shares, deprecation).
+    signature: "pub fn public_space(&self) -> PublicSpaceClient<tonic::transport::Channel>"
+    parameters: []
+    returns:
+      type: "PublicSpaceClient<Channel>"
+      description: A public-space client sharing the session channel.
+    iscs: ["36"]
+
+  - name: "AppSession::circle_of_trust"
+    module: daemonseed_cli::session
+    description: A CircleOfTrustClient over this session (the bidirectional Subscribe live relay).
+    signature: "pub fn circle_of_trust(&self) -> CircleOfTrustClient<tonic::transport::Channel>"
+    parameters: []
+    returns:
+      type: "CircleOfTrustClient<Channel>"
+      description: A circle-of-trust client sharing the session channel.
+    iscs: ["10", S20]
+
+  - name: "AppSession::serve_share"
+    module: daemonseed_cli::session
+    description: >-
+      Serve a published share for the life of the session (D, M15): one
+      Subscribe stream on the share's CoT fetch-asset; the relay fans every
+      fetcher's ManifestRequest / ChunkRequest into it and our responses back
+      out, so one loop handles arbitrarily many concurrent fetchers (bounded
+      by the relay's per-connection limiter, ISC-S17). M16 (serve-from-disk):
+      generic over any core ChunkSource (the in-RAM ShareContent or the
+      disk-backed DiskShareContent), taken as Arc<C>; every inbound frame is
+      answered via tokio::task::spawn_blocking, NEVER inline — answer() does
+      synchronous file I/O for a disk-backed chunk, and this loop may run as
+      a spawn_local task on the TUI net actor's single-threaded LocalSet, so
+      an inline answer would park the entire actor for the duration of a
+      multi-GB read (ISC-A-C35). The source never fabricates a chunk it does
+      not hold (ISC-A-S21); bytes hash to the advertised address by receiver
+      re-derivation (ISC-S28).
+    signature: "pub async fn serve_share<C>(&self, server_id: &str, share_id: &str, content: Arc<C>) -> Result<(), ServeShareError> where C: ChunkSource + Send + Sync + 'static"
+    parameters:
+      - name: server_id
+        type: "&str"
+        direction: in
+        description: The connected relay's server-id (namespaces the asset address).
+      - name: share_id
+        type: "&str"
+        direction: in
+        description: The server-assigned opaque share id being served.
+      - name: content
+        type: "Arc<C>"
+        direction: in
+        description: The shared ChunkSource answering manifest/chunk requests (shared with per-request blocking-pool tasks).
+    returns:
+      type: "Result<(), ServeShareError>"
+      description: Ok when the serve stream ends (relay reaped the asset or peer closed).
+    iscs: [S27, S28, A-S21, A-C35]
+
   # ── binary subcommand entry point ─────────────────────────────────
 
   - name: "daemonseed-cli connect"
@@ -971,48 +1049,6 @@ profile_discovery:
     - "CWD-discovery (daemonseed.toml in current directory)"
     - "XDG fallback ($XDG_CONFIG_HOME/daemonseed/daemonseed.toml)"
   iscs: [C35]
-
-  # ── daemonseed_cli::session ───────────────────────────────────────
-  - name: "AppSession::open"
-    module: daemonseed_cli::session
-    description: >-
-      Build a session over an already-Authenticated stream. The stream is
-      consumed once by the tonic connector; the placeholder authority is never
-      resolved (no dial happens). Generic over the stream so production
-      (AppStream) and tests (tokio::io::duplex) share the path.
-    signature: "pub async fn open<S>(stream: S) -> Result<AppSession, SessionError> where S: AsyncRead + AsyncWrite + Send + Unpin + 'static"
-    parameters:
-      - name: stream
-        type: S
-        direction: in
-        description: The post-Authenticated stream (production AppStream, or a test duplex half).
-    returns:
-      type: "Result<AppSession, SessionError>"
-      description: A live session whose channel rides the supplied stream.
-      error_variants:
-        - name: Transport
-          condition: The tonic channel failed to come up over the stream.
-    iscs: ["10", "36"]
-
-  - name: "AppSession::public_space"
-    module: daemonseed_cli::session
-    description: A PublicSpaceClient over this session (MOTD, posts, taxonomy, whitelist, shares, deprecation).
-    signature: "pub fn public_space(&self) -> PublicSpaceClient<tonic::transport::Channel>"
-    parameters: []
-    returns:
-      type: "PublicSpaceClient<Channel>"
-      description: A public-space client sharing the session channel.
-    iscs: ["36"]
-
-  - name: "AppSession::circle_of_trust"
-    module: daemonseed_cli::session
-    description: A CircleOfTrustClient over this session (the bidirectional Subscribe live relay).
-    signature: "pub fn circle_of_trust(&self) -> CircleOfTrustClient<tonic::transport::Channel>"
-    parameters: []
-    returns:
-      type: "CircleOfTrustClient<Channel>"
-      description: A circle-of-trust client sharing the session channel.
-    iscs: ["10", S20]
 
 # ─────────────────────────────────────────────────────────────────────
 # Output conventions — extra, non-canonical breadcrumb section.

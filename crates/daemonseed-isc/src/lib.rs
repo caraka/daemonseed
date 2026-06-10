@@ -18,14 +18,16 @@
 //! Count invariants (kept aligned with `ISA.md` `## Criteria`):
 //!
 //! - 53 server-side: 30 positive (`ISC-S*`) + 23 negative (`ISC-A-S*`)
-//! - 89 client-side: 61 positive (`ISC-C*`) + 28 negative (`ISC-A-C*`)
+//! - 94 client-side: 64 positive (`ISC-C*`) + 30 negative (`ISC-A-C*`)
 //!   (M16 A1 added C66 manifest-preview + A-C33 no-blind-download, A2 added C67 selective-fetch,
 //!   A3 added C68 choose-download-dir, A4 added C72 collapsible-folder-tree preview, C1 added C69
 //!   multi-share-publish, C2 added C70 status-auto-clear, C3 added C71 generate-circle-phrase;
-//!   M16 smoke fix added A-C34 publish-idempotency; M13 added C59-C62 circle persistence +
-//!   A-C29/A-C30; M15 C added C63-C65 fetched-content browse/extract + A-C31/A-C32. Earlier:
-//!   alpha2 share_id / share download / public rooms / client-lifecycle / portable.)
-//! - 142 total
+//!   M16 smoke fix added A-C34 publish-idempotency; M16 crown (serve-from-disk) added C73
+//!   disk-backed publish/serve + C74 progress/cancel + C75 remove-defined-share + A-C35
+//!   never-park/never-whole-share-in-RAM + A-C36 no-startup-index-lock; M13 added C59-C62 circle
+//!   persistence + A-C29/A-C30; M15 C added C63-C65 fetched-content browse/extract + A-C31/A-C32.
+//!   Earlier: alpha2 share_id / share download / public rooms / client-lifecycle / portable.)
+//! - 147 total
 //!
 //! Deliberately EXCLUDED from [`ISCS`] (and therefore from [`TOTAL`]) because
 //! they are not built: the deferred direct-messaging family
@@ -173,6 +175,9 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-C71", IscClass::Positive),
     // ── client positive (M16 A4 collapsible-folder-tree fetch preview) ──
     ("ISC-C72", IscClass::Positive),
+    ("ISC-C73", IscClass::Positive),
+    ("ISC-C74", IscClass::Positive),
+    ("ISC-C75", IscClass::Positive),
     // ── client negative (20) ────────────────────────────────────────────
     ("ISC-A-C1", IscClass::Negative),
     ("ISC-A-C2", IscClass::Negative),
@@ -204,13 +209,15 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-A-C32", IscClass::Negative),
     ("ISC-A-C33", IscClass::Negative),
     ("ISC-A-C34", IscClass::Negative),
+    ("ISC-A-C35", IscClass::Negative),
+    ("ISC-A-C36", IscClass::Negative),
 ];
 
 /// Total built, non-deferred ISCs tracked by this registry — the SINGLE source
 /// of truth for the coverage denominator, read live by `xtask isc-coverage`.
 /// Recount on every ISC add/remove (the `const _` assert below guards it
 /// against [`ISCS`]).
-pub const TOTAL: usize = 142;
+pub const TOTAL: usize = 147;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -349,16 +356,17 @@ mod tests {
                 IscClass::Negative => neg += 1,
             }
         }
-        // ISA `## Criteria` (built, non-deferred): 53 server + 89 client = 142.
+        // ISA `## Criteria` (built, non-deferred): 53 server + 94 client = 147.
         //   server  30 pos + 23 neg = 53
-        //   client  61 pos + 28 neg = 89  (M13 C59-C62 + A-C29/A-C30;
+        //   client  64 pos + 30 neg = 94  (M13 C59-C62 + A-C29/A-C30;
         //                                  M15 C  C63-C65 + A-C31/A-C32;
         //                                  M16 A1 C66 + A-C33; A2 C67; A3 C68;
         //                                  A4 C72; C1 C69; C2 C70; C3 C71;
-        //                                  smoke fix A-C34 publish-idempotency)
-        //   total   91 pos + 51 neg = 142
-        assert_eq!(pos, 91, "positive count drift");
-        assert_eq!(neg, 51, "negative count drift");
+        //                                  smoke fix A-C34 publish-idempotency;
+        //                                  crown C73-C75 + A-C35/A-C36 serve-from-disk)
+        //   total   94 pos + 53 neg = 147
+        assert_eq!(pos, 94, "positive count drift");
+        assert_eq!(neg, 53, "negative count drift");
     }
 
     /// COVERED is single-sourced and must agree with the per-milestone

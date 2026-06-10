@@ -767,6 +767,18 @@ pub struct App {
     /// Single-shot slot for an unpublish (D, M15): the server-assigned share_id
     /// to stop serving; drained into `NetCommand::UnpublishShare`.
     pending_unpublish: Option<String>,
+    /// Single-shot slot for a publish-hash cancel (M16 serve-from-disk): the
+    /// defined root whose in-flight hash `[u]` asked to stop; drained into
+    /// `NetCommand::CancelPublish`. Root-keyed like [`Self::hashing`]
+    /// (ISC-A-C34 — never a display-name join).
+    pending_cancel_publish: Option<std::path::PathBuf>,
+    /// Defined roots whose publish hash is currently in flight (M16
+    /// serve-from-disk). Inserted on `PublishProgress`; removed on
+    /// `PublishStarted` / `PublishCancelled` / a root-carrying `PublishError`.
+    /// Drives the `[u]`-cancels affordance and extends the `[p]` idempotency
+    /// guard (ISC-A-C34) to the hashing window — without it a second `[p]`
+    /// mid-hash would queue a duplicate publish.
+    hashing: std::collections::BTreeSet<std::path::PathBuf>,
     /// Shares currently published+served this session, keyed by defined root
     /// ([`PublishedShare`], M16 ISC-A-C34). Appended on `PublishStarted`,
     /// pruned on `PublishStopped`; drives the `[p]` idempotency guard and the
@@ -973,6 +985,8 @@ impl App {
             defined_sel: 0,
             pending_publish: None,
             pending_unpublish: None,
+            pending_cancel_publish: None,
+            hashing: std::collections::BTreeSet::new(),
             published: Vec::new(),
             pending_joins: std::collections::VecDeque::new(),
             pending_chat: None,
@@ -1157,6 +1171,12 @@ impl App {
     /// `NetCommand::UnpublishShare`.
     pub fn take_pending_unpublish(&mut self) -> Option<String> {
         self.pending_unpublish.take()
+    }
+
+    /// Drain a queued publish-hash cancel (M16 serve-from-disk) — the binary
+    /// turns it into a `NetCommand::CancelPublish` for that defined root.
+    pub fn take_pending_cancel_publish(&mut self) -> Option<std::path::PathBuf> {
+        self.pending_cancel_publish.take()
     }
 
     /// The current Define-Share input buffer, for rendering the box (M14).
@@ -1608,6 +1628,9 @@ impl App {
                 name,
                 file_count,
             } => {
+                // The hash phase is over — clear the hashing marker so `[u]`
+                // routes to unpublish, not cancel (M16 serve-from-disk).
+                self.hashing.remove(&root);
                 self.published.push(PublishedShare {
                     share_id: share_id.clone(),
                     root,
@@ -1617,7 +1640,36 @@ impl App {
                     "sharing {name:?} as {share_id} ({file_count} file(s)) — [u] in Shares to stop"
                 ));
             }
-            NetEvent::PublishError { message } => self.status = Some(message),
+            // A publish hash is in flight (M16 serve-from-disk): mark the root
+            // hashing — which extends the `[p]` guard (ISC-A-C34) and routes
+            // `[u]` to CancelPublish — and surface the per-file progress with
+            // the cancel affordance spelled out.
+            NetEvent::PublishProgress {
+                root,
+                name,
+                done,
+                total,
+            } => {
+                self.hashing.insert(root);
+                self.status = Some(format!(
+                    "hashing {name}: {done}/{total} files — [u] cancels"
+                ));
+            }
+            // The user's own cancel landed — neutral wording, not a failure
+            // (M16). The root leaves the hashing set so `[p]` can retry.
+            NetEvent::PublishCancelled { root, name } => {
+                self.hashing.remove(&root);
+                self.status = Some(format!("publish of {name:?} cancelled"));
+            }
+            NetEvent::PublishError { message, root } => {
+                // A root-carrying failure (hash / RPC step) clears that root's
+                // hashing marker so the ISC-A-C34 guard stays open and `[p]`
+                // is retryable; a pre-flight failure (`None`) never set one.
+                if let Some(root) = root {
+                    self.hashing.remove(&root);
+                }
+                self.status = Some(message);
+            }
             NetEvent::PublishStopped { share_id } => {
                 self.published.retain(|p| p.share_id != share_id);
                 self.status = Some(format!("stopped sharing {share_id}"));
@@ -2210,9 +2262,11 @@ impl App {
     /// `[` / `]` move the My-defined selection (M16 C1, ISC-C69, same
     /// saturating idiom as the other single-list panes); `r` requests a fresh
     /// snapshot; `f` initiates a fetch of the currently-selected public-share
-    /// row (ISC-19, F23 unified mechanism); `p` / `u` publish / unpublish the
-    /// selected defined share. (`Up`/`Down` stay on public shares to keep the
-    /// fetch flow's selector untouched; the defined-list cursor rides `[`/`]`.)
+    /// row (ISC-19, F23 unified mechanism); `p` / `u` publish /
+    /// unpublish-or-cancel the selected defined share; `x` removes it
+    /// (unpublishing/cancelling first and forgetting the persisted root, M16
+    /// serve-from-disk). (`Up`/`Down` stay on public shares to keep the fetch
+    /// flow's selector untouched; the defined-list cursor rides `[`/`]`.)
     fn on_key_shares(&mut self, key: KeyEvent) {
         let visible = self.visible_public_shares_count();
         match key.code {
@@ -2247,11 +2301,19 @@ impl App {
             }
             KeyCode::Char('u') | KeyCode::Char('U') => {
                 // Unpublish the SELECTED defined share if it is currently served
-                // (M16 C1, ISC-C69). Serving is session-scoped, so this is the
+                // (M16 C1, ISC-C69) — or cancel its in-flight publish hash (M16
+                // serve-from-disk). Serving is session-scoped, so this is the
                 // in-session "stop sharing"; quit / disconnect reaps everything
-                // anyway. The binary forwards it as NetCommand::UnpublishShare;
-                // PublishStopped prunes `published`.
+                // anyway. The binary forwards it as NetCommand::UnpublishShare /
+                // NetCommand::CancelPublish; PublishStopped prunes `published`.
                 self.unpublish_selected_share();
+            }
+            KeyCode::Char('x') | KeyCode::Char('X') => {
+                // Remove the SELECTED defined share entirely (M16
+                // serve-from-disk): stop any publish stage in flight, drop it
+                // from the My-defined list, and forget the persisted root so
+                // it is not re-defined next launch.
+                self.remove_selected_defined_share();
             }
             KeyCode::Char('f') | KeyCode::Char('F') => {
                 // Snapshot the selected visible row and start a fetch. A
@@ -2849,9 +2911,11 @@ impl App {
     /// `[`/`]`, then `[p]`; each is served by its own session-scoped serve task.
     /// A no-op with a hint if nothing is defined yet. Idempotent per root
     /// (ISC-A-C34): a root that is already published — or already queued and
-    /// not yet drained — is never re-queued; `[u]` first to re-publish. A
-    /// failed publish never reaches `published`, so the guard stays open and
-    /// `[p]` is retryable after a `PublishError`.
+    /// not yet drained, or mid-hash on the net actor (M16 serve-from-disk) —
+    /// is never re-queued; `[u]` first to re-publish. A failed publish never
+    /// reaches `published` (and a root-carrying `PublishError` clears the
+    /// hashing marker), so the guard stays open and `[p]` is retryable after
+    /// a `PublishError`.
     fn publish_selected_share(&mut self) {
         let sharer_handle = self.own_handle();
         match self.selected_defined_share().cloned() {
@@ -2860,7 +2924,8 @@ impl App {
                     || self
                         .pending_publish
                         .as_ref()
-                        .is_some_and(|r| r.root == root);
+                        .is_some_and(|r| r.root == root)
+                    || self.hashing.contains(&root);
                 if already {
                     self.status =
                         Some(format!("{name:?} is already published — [u] to stop first"));
@@ -2879,30 +2944,104 @@ impl App {
         }
     }
 
-    /// Unpublish the selected defined share if it is currently being served
-    /// (M16 C1, ISC-C69 — the Shares pane's `[u]` action). The selected
-    /// defined share is matched by its root (the [`PublishedShare`] key,
-    /// ISC-A-C34) — never by display-name string join, which would conflate
-    /// distinct shares sharing a name. A no-op with a hint if the selected
-    /// share is not currently published.
+    /// Unpublish — or cancel the in-flight publish of — the selected defined
+    /// share (M16 C1 / serve-from-disk, ISC-C69 — the Shares pane's `[u]`
+    /// action). The selected defined share is matched by its root (the
+    /// [`PublishedShare`] key, ISC-A-C34) — never by display-name string join,
+    /// which would conflate distinct shares sharing a name.
+    ///
+    /// `[u]` resolves the publish lifecycle stage in priority order, earliest
+    /// stage first (each stage is exclusive of the later ones):
+    /// (a) queued but not yet drained by the binary → drop the request
+    /// locally, nothing ever reached the net actor; (b) hashing in flight on
+    /// the actor → queue a `CancelPublish` for the root; (c) published +
+    /// served → the existing unpublish; (d) none of those → the existing
+    /// hints.
     fn unpublish_selected_share(&mut self) {
-        let selected_root = self.selected_defined_share().map(|(root, _)| root.clone());
-        let share_id = selected_root.as_ref().and_then(|root| {
-            self.published
-                .iter()
-                .find(|p| &p.root == root)
-                .map(|p| p.share_id.clone())
-        });
-        match share_id {
-            Some(id) => self.pending_unpublish = Some(id),
-            None => {
-                self.status = Some(if selected_root.is_some() {
-                    "selected share is not currently published".to_owned()
-                } else {
-                    "nothing to unpublish".to_owned()
-                });
-            }
+        let Some((root, name)) = self.selected_defined_share().cloned() else {
+            self.status = Some("nothing to unpublish".to_owned());
+            return;
+        };
+        // (a) Still queued locally: dropping the request IS the cancel — the
+        // binary never sees it, so no actor round-trip is needed.
+        if self
+            .pending_publish
+            .as_ref()
+            .is_some_and(|r| r.root == root)
+        {
+            self.pending_publish = None;
+            self.status = Some("publish cancelled".to_owned());
+            return;
         }
+        // (b) Hashing on the net actor: ask it to stop (the PublishCancelled
+        // event clears the hashing marker and words the outcome).
+        if self.hashing.contains(&root) {
+            self.pending_cancel_publish = Some(root);
+            self.status = Some(format!("cancelling publish of {name:?}…"));
+            return;
+        }
+        // (c) Published + served: the existing unpublish path.
+        if let Some(id) = self
+            .published
+            .iter()
+            .find(|p| p.root == root)
+            .map(|p| p.share_id.clone())
+        {
+            self.pending_unpublish = Some(id);
+            return;
+        }
+        // (d) Nothing in flight for this share.
+        self.status = Some("selected share is not currently published".to_owned());
+    }
+
+    /// Remove the selected defined share (M16 serve-from-disk — the Shares
+    /// pane's `[x]` action). Stops whatever publish stage is in flight for it
+    /// first — drops an undrained [`PublishRequest`], queues a `CancelPublish`
+    /// for an in-flight hash, queues the unpublish if it is served — then
+    /// drops it from the My-defined list and forgets the persisted root
+    /// ([`Seeds::remove_share`] + the M13 write-through), so it neither
+    /// re-indexes nor reappears next launch. Removing config, not content:
+    /// the directory on disk is untouched (and the no-client-history
+    /// invariant is moot — a share root was never history). A no-op with a
+    /// hint when nothing is defined.
+    ///
+    /// [`Seeds::remove_share`]: daemonseed_core::storage::seeds::Seeds::remove_share
+    fn remove_selected_defined_share(&mut self) {
+        let Some((root, name)) = self.selected_defined_share().cloned() else {
+            self.status = Some("nothing to remove".to_owned());
+            return;
+        };
+        // Stop any in-flight publish stage, mirroring the `[u]` priority
+        // order — but fall through rather than return: the removal proceeds
+        // regardless of which stage (if any) was live.
+        if self
+            .pending_publish
+            .as_ref()
+            .is_some_and(|r| r.root == root)
+        {
+            self.pending_publish = None;
+        }
+        if self.hashing.remove(&root) {
+            self.pending_cancel_publish = Some(root.clone());
+        }
+        if let Some(id) = self
+            .published
+            .iter()
+            .find(|p| p.root == root)
+            .map(|p| p.share_id.clone())
+        {
+            self.pending_unpublish = Some(id);
+        }
+        self.defined_shares.retain(|(r, _)| r != &root);
+        self.clamp_defined_sel();
+        // Forget the persisted root (the inverse of the on_key_define_share
+        // write-through, ISC-C21): keyed by the same string form `add_share`
+        // stored, then re-sealed so the removal survives the session.
+        if let Some(seeds) = self.seeds.as_mut() {
+            seeds.remove_share(&root.to_string_lossy());
+            self.persist_seeds();
+        }
+        self.status = Some(format!("removed {name:?}"));
     }
 
     /// Fetched-downloads pane key handling (M15 C; ISC-C64). A read-only browse
@@ -3792,6 +3931,7 @@ mod tests {
         assert!(app.take_pending_publish().is_some(), "first attempt queued");
         app.on_net_event(NetEvent::PublishError {
             message: "publish refused: relay unreachable".to_owned(),
+            root: Some(dir.clone()),
         });
         app.on_key(press(KeyCode::Char('p')));
         assert!(
@@ -3800,6 +3940,231 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── M16 serve-from-disk: async publish hash + cancel + [x] remove ────
+
+    /// Test helper: define a share named `label` rooted at a fresh temp dir
+    /// and land back on the Shares pane. Returns the root. Mirrors the manual
+    /// Tab-and-type dance the earlier publish tests spell out inline.
+    fn define_share(app: &mut App, dir: &std::path::Path, label: &str) {
+        std::fs::create_dir_all(dir).expect("mk share dir");
+        while app.main_focus() != MainFocus::DefineShare {
+            app.on_key(press(KeyCode::Tab));
+        }
+        for ch in format!("{}|{label}", dir.display()).chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        app.on_key(press(KeyCode::Enter));
+        let _ = app.take_pending_share_define();
+        assert_eq!(app.main_focus(), MainFocus::Shares);
+    }
+
+    /// `PublishProgress` folds into a "hashing N/M — [u] cancels" status, and
+    /// `[u]` during the hash queues a `CancelPublish` for that root (M16
+    /// serve-from-disk) — never an unpublish (nothing is published yet).
+    #[test]
+    fn publish_progress_sets_status_and_u_queues_cancel() {
+        let mut app = drive_to_main();
+        let dir = std::env::temp_dir().join("ds-m16-hash-cancel");
+        define_share(&mut app, &dir, "Hashing");
+
+        // [p], drained by the binary — the hash is now the actor's.
+        app.on_key(press(KeyCode::Char('p')));
+        assert!(app.take_pending_publish().is_some(), "publish queued");
+        app.on_net_event(NetEvent::PublishProgress {
+            root: dir.clone(),
+            name: "Hashing".to_owned(),
+            done: 3,
+            total: 10,
+        });
+        assert!(
+            app.status()
+                .is_some_and(|s| s.contains("hashing Hashing: 3/10 files") && s.contains("[u]")),
+            "progress surfaces with the cancel affordance, got {:?}",
+            app.status()
+        );
+
+        app.on_key(press(KeyCode::Char('u')));
+        assert_eq!(
+            app.take_pending_cancel_publish().as_deref(),
+            Some(dir.as_path()),
+            "[u] mid-hash queues a CancelPublish for the root"
+        );
+        assert!(
+            app.take_pending_unpublish().is_none(),
+            "nothing is published yet — no unpublish"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `[u]` on a publish still queued locally (not yet drained by the binary)
+    /// drops the request in place — no actor round-trip (M16, `[u]` priority
+    /// stage (a)).
+    #[test]
+    fn u_drops_an_undrained_publish_request() {
+        let mut app = drive_to_main();
+        let dir = std::env::temp_dir().join("ds-m16-undrained-cancel");
+        define_share(&mut app, &dir, "Queued");
+
+        app.on_key(press(KeyCode::Char('p')));
+        app.on_key(press(KeyCode::Char('u')));
+        assert!(
+            app.take_pending_publish().is_none(),
+            "[u] dropped the undrained request"
+        );
+        assert!(
+            app.take_pending_cancel_publish().is_none(),
+            "nothing reached the actor — no CancelPublish needed"
+        );
+        assert!(
+            app.status()
+                .is_some_and(|s| s.contains("publish cancelled")),
+            "the drop explains itself, got {:?}",
+            app.status()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The ISC-A-C34 `[p]` guard covers the hashing window: a second `[p]`
+    /// while the hash runs queues nothing, and a `PublishCancelled` re-opens
+    /// the guard so `[p]` retries (M16 serve-from-disk).
+    #[test]
+    fn p_guard_covers_the_hashing_window() {
+        let mut app = drive_to_main();
+        let dir = std::env::temp_dir().join("ds-m16-hash-guard");
+        define_share(&mut app, &dir, "Guarded");
+
+        app.on_key(press(KeyCode::Char('p')));
+        assert!(app.take_pending_publish().is_some(), "first [p] queued");
+        app.on_net_event(NetEvent::PublishProgress {
+            root: dir.clone(),
+            name: "Guarded".to_owned(),
+            done: 1,
+            total: 4,
+        });
+        app.on_key(press(KeyCode::Char('p')));
+        assert!(
+            app.take_pending_publish().is_none(),
+            "[p] mid-hash queues nothing (ISC-A-C34 extended)"
+        );
+        assert!(
+            app.status()
+                .is_some_and(|s| s.contains("already published")),
+            "the no-op explains itself"
+        );
+
+        // The cancel lands → the guard re-opens.
+        app.on_net_event(NetEvent::PublishCancelled {
+            root: dir.clone(),
+            name: "Guarded".to_owned(),
+        });
+        assert!(
+            app.status().is_some_and(|s| s.contains("cancelled")),
+            "a cancel is worded neutrally, got {:?}",
+            app.status()
+        );
+        app.on_key(press(KeyCode::Char('p')));
+        assert!(
+            app.take_pending_publish().is_some(),
+            "after a cancel, [p] re-publishes"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `[x]` removes the selected defined share: queues the unpublish for a
+    /// served share, drops the defined row, and persists the removal via the
+    /// M13 write-through so the root is not re-defined next launch (M16
+    /// serve-from-disk).
+    #[test]
+    fn x_removes_unpublishes_and_persists_the_removal() {
+        let mut app = drive_to_main();
+        let dir = std::env::temp_dir().join("ds-m16-x-remove");
+        define_share(&mut app, &dir, "Removable");
+        // Drain the define's own write-through so the next blob update is
+        // unambiguously the removal's.
+        assert!(
+            app.take_pending_blob_update().is_some(),
+            "define persisted the root"
+        );
+
+        app.on_net_event(NetEvent::PublishStarted {
+            share_id: "idX".to_owned(),
+            root: dir.clone(),
+            name: "Removable".to_owned(),
+            file_count: 2,
+        });
+
+        app.on_key(press(KeyCode::Char('x')));
+        assert_eq!(
+            app.take_pending_unpublish().as_deref(),
+            Some("idX"),
+            "[x] on a served share queues the unpublish first"
+        );
+        assert!(
+            app.defined_shares().is_empty(),
+            "the defined row is dropped"
+        );
+        assert!(
+            app.take_pending_blob_update().is_some(),
+            "the removal is persisted (write-through re-seal queued)"
+        );
+        assert!(
+            app.status().is_some_and(|s| s.contains("removed")),
+            "[x] confirms the removal, got {:?}",
+            app.status()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `[x]` mid-hash cancels the in-flight publish too: the CancelPublish is
+    /// queued alongside the removal (M16 serve-from-disk).
+    #[test]
+    fn x_mid_hash_cancels_the_publish_too() {
+        let mut app = drive_to_main();
+        let dir = std::env::temp_dir().join("ds-m16-x-mid-hash");
+        define_share(&mut app, &dir, "MidHash");
+
+        app.on_key(press(KeyCode::Char('p')));
+        assert!(app.take_pending_publish().is_some(), "publish drained");
+        app.on_net_event(NetEvent::PublishProgress {
+            root: dir.clone(),
+            name: "MidHash".to_owned(),
+            done: 1,
+            total: 9,
+        });
+
+        app.on_key(press(KeyCode::Char('x')));
+        assert_eq!(
+            app.take_pending_cancel_publish().as_deref(),
+            Some(dir.as_path()),
+            "[x] mid-hash queues the CancelPublish"
+        );
+        assert!(app.defined_shares().is_empty(), "row dropped regardless");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `[x]` with nothing defined is a no-op that explains itself.
+    #[test]
+    fn x_with_nothing_defined_is_a_hint() {
+        let mut app = drive_to_main();
+        for _ in 0..3 {
+            app.on_key(press(KeyCode::Tab));
+        }
+        assert_eq!(app.main_focus(), MainFocus::Shares);
+        app.on_key(press(KeyCode::Char('x')));
+        assert!(app.take_pending_unpublish().is_none());
+        assert!(app.take_pending_cancel_publish().is_none());
+        assert!(
+            app.status()
+                .is_some_and(|s| s.contains("nothing to remove")),
+            "the no-op explains itself"
+        );
     }
 
     /// `[`/`]` echo the My-defined selection on the status line (M16 smoke

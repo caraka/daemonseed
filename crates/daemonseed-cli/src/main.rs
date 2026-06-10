@@ -232,10 +232,13 @@ fn run(cli: Cli) -> Result<(), CliError> {
                     // ManifestRequest / ChunkRequest over the share's CoT
                     // fetch-asset; Ctrl-C ends it, dropping the session and
                     // reaping both the listing and the live fetch-asset (ISC-S20).
+                    // `serve_share` takes the content `Arc`-shared so it can
+                    // answer each request on the blocking pool (ISC-A-C7).
+                    let content = std::sync::Arc::new(content);
                     rt.block_on(async {
                         tokio::select! {
                             _ = tokio::signal::ctrl_c() => Ok(()),
-                            r = session.serve_share(&server_id, &share_id, &content) => {
+                            r = session.serve_share(&server_id, &share_id, content) => {
                                 r.map_err(|e| CliError::ServeLoop(Box::new(e)))
                             }
                         }

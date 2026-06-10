@@ -39,6 +39,17 @@
 //! A future at-rest folder-encryption feature must therefore present decrypted
 //! names to the indexer (decrypt-on-access); pointing it at raw on-disk
 //! ciphertext would index obfuscated names, which is wrong, not a crash.
+//!
+//! ## Value format v2 (table-name bump, M16)
+//!
+//! M16 extends [`ShareEntry`] with an optional cached `chunk_addr` (the
+//! 48-byte SHA-384 content address the serve side advertises), so a publish
+//! can reuse the address of an unchanged file instead of re-hashing it. That
+//! changes the stored (encrypted) value format, handled by **bumping the redb
+//! table name** to `share-index-v2`: a v1 store's old `share-index` table is
+//! simply abandoned in place — never read, never migrated — and the v2 table
+//! starts empty. Alpha backward-compatibility is waived by design; a re-scan
+//! repopulates the index (it is a cache over the filesystem, not a record).
 
 use std::path::Path;
 
@@ -60,7 +71,9 @@ const OPAQUE_KEY_LEN: usize = 32;
 /// so ciphertext length reveals only which bucket an entry falls in.
 pub const BUCKET_STEP: usize = 256;
 
-const TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("share-index");
+/// The v2 table (see the module docs): the value format changed in M16, so
+/// the table name was bumped and any v1 `share-index` table is abandoned.
+const TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("share-index-v2");
 
 /// One indexed file in a shared folder: the relative path plus the cheap
 /// `stat` metadata the indexer tracks. Contents are never read into the index.
@@ -72,6 +85,12 @@ pub struct ShareEntry {
     pub size: u64,
     /// Last-modified time, milliseconds since the Unix epoch.
     pub mtime_unix_ms: u64,
+    /// Cached content address — the 48-byte SHA-384 of the file's bytes
+    /// ([`crate::storage::cas::chunk_addr`]) from the last hash pass, or
+    /// `None` after a metadata-only scan. Valid only while `size` and
+    /// `mtime_unix_ms` still match the file (the reuse test
+    /// `indexer::cached_or_hash` applies); a metadata change invalidates it.
+    pub chunk_addr: Option<Vec<u8>>,
 }
 
 /// Failure modes for [`ShareIndex`] operations.
@@ -204,6 +223,27 @@ impl ShareIndex {
         Ok(())
     }
 
+    /// Delete every entry in one write transaction (the table is dropped and
+    /// re-created atomically). The clear-then-rescan move: latest-wins
+    /// semantics for a share whose root changed wholesale, without tracking
+    /// per-entry staleness.
+    pub fn clear(&self) -> Result<(), IndexError> {
+        let wtxn = self
+            .db
+            .begin_write()
+            .map_err(|e| IndexError::Db(Box::new(e.into())))?;
+        {
+            wtxn.delete_table(TABLE)
+                .map_err(|e| IndexError::Db(Box::new(e.into())))?;
+            // Re-materialize so a subsequent read txn finds the (empty) table.
+            wtxn.open_table(TABLE)
+                .map_err(|e| IndexError::Db(Box::new(e.into())))?;
+        }
+        wtxn.commit()
+            .map_err(|e| IndexError::Db(Box::new(e.into())))?;
+        Ok(())
+    }
+
     /// Number of indexed files.
     pub fn len(&self) -> Result<usize, IndexError> {
         let rtxn = self
@@ -301,15 +341,19 @@ impl ShareIndex {
     }
 }
 
-/// Encode an entry's metadata: `[path_len u16][path][size u64][mtime u64]`,
-/// little-endian.
+/// Encode an entry's metadata (v2): `[path_len u16][path][size u64]
+/// [mtime u64][addr_len u8][addr]`, little-endian. `addr_len` is `0` for a
+/// metadata-only entry, else the cached address's length (48 for SHA-384).
 fn encode_entry(entry: &ShareEntry) -> Vec<u8> {
     let path = entry.rel_path.as_bytes();
-    let mut buf = Vec::with_capacity(2 + path.len() + 16);
+    let addr = entry.chunk_addr.as_deref().unwrap_or(&[]);
+    let mut buf = Vec::with_capacity(2 + path.len() + 16 + 1 + addr.len());
     buf.extend_from_slice(&(path.len() as u16).to_le_bytes());
     buf.extend_from_slice(path);
     buf.extend_from_slice(&entry.size.to_le_bytes());
     buf.extend_from_slice(&entry.mtime_unix_ms.to_le_bytes());
+    buf.push(addr.len() as u8);
+    buf.extend_from_slice(addr);
     buf
 }
 
@@ -340,15 +384,19 @@ fn unframe(padded: &[u8]) -> Option<ShareEntry> {
     let path_bytes = content.get(2..2 + path_len)?;
     let rel_path = String::from_utf8(path_bytes.to_vec()).ok()?;
     let after_path = content.get(2 + path_len..)?;
-    if after_path.len() != 16 {
+    let size = u64::from_le_bytes(after_path.get(..8)?.try_into().ok()?);
+    let mtime_unix_ms = u64::from_le_bytes(after_path.get(8..16)?.try_into().ok()?);
+    let addr_len = *after_path.get(16)? as usize;
+    let addr_bytes = after_path.get(17..)?;
+    if addr_bytes.len() != addr_len {
         return None;
     }
-    let size = u64::from_le_bytes(after_path[..8].try_into().ok()?);
-    let mtime_unix_ms = u64::from_le_bytes(after_path[8..16].try_into().ok()?);
+    let chunk_addr = (addr_len > 0).then(|| addr_bytes.to_vec());
     Some(ShareEntry {
         rel_path,
         size,
         mtime_unix_ms,
+        chunk_addr,
     })
 }
 
@@ -363,15 +411,27 @@ mod tests {
             rel_path: path.to_owned(),
             size: 4096,
             mtime_unix_ms: 1_700_000_000_000,
+            chunk_addr: None,
+        }
+    }
+
+    /// An entry carrying a cached 48-byte chunk address (M16 v2 format).
+    fn entry_with_addr(path: &str) -> ShareEntry {
+        ShareEntry {
+            chunk_addr: Some(vec![0xab; 48]),
+            ..entry(path)
         }
     }
 
     // ── framing / padding (ISC-A-C6) ──────────────────────────────────────
 
-    /// frame → unframe round-trips an entry exactly.
+    /// frame → unframe round-trips an entry exactly — both without and with a
+    /// cached chunk address (the two v2 value shapes).
     #[test]
     fn frame_unframe_roundtrips() {
         let e = entry("docs/report.pdf");
+        assert_eq!(unframe(&frame_and_pad(&e)), Some(e));
+        let e = entry_with_addr("docs/report.pdf");
         assert_eq!(unframe(&frame_and_pad(&e)), Some(e));
     }
 
@@ -412,6 +472,38 @@ mod tests {
         idx.put(&e).unwrap();
         assert_eq!(idx.get("photos/2026/trip.jpg").unwrap(), Some(e));
         assert_eq!(idx.get("not/there.txt").unwrap(), None);
+    }
+
+    /// M16 — a cached chunk address round-trips through encryption + redb,
+    /// and a re-put without one (a metadata-only rescan) drops it.
+    #[test]
+    fn chunk_addr_roundtrips_and_is_replaceable() {
+        let (_dir, idx) = open_temp(KEY);
+        let e = entry_with_addr("a.txt");
+        idx.put(&e).unwrap();
+        assert_eq!(idx.get("a.txt").unwrap(), Some(e));
+
+        idx.put(&entry("a.txt")).unwrap();
+        assert_eq!(idx.get("a.txt").unwrap().unwrap().chunk_addr, None);
+    }
+
+    /// M16 — `clear` empties the index in one transaction; it stays usable
+    /// (the clear-then-rescan move) and clearing an empty index is a no-op.
+    #[test]
+    fn clear_empties_index() {
+        let (_dir, idx) = open_temp(KEY);
+        idx.put(&entry("a.txt")).unwrap();
+        idx.put(&entry_with_addr("b.txt")).unwrap();
+        idx.clear().unwrap();
+        assert_eq!(idx.len().unwrap(), 0);
+        assert_eq!(idx.get("a.txt").unwrap(), None);
+
+        // Still writable afterward (the table was re-created), and a second
+        // clear of the now-empty index succeeds.
+        idx.put(&entry("c.txt")).unwrap();
+        assert_eq!(idx.len().unwrap(), 1);
+        idx.clear().unwrap();
+        assert!(idx.is_empty().unwrap());
     }
 
     /// ISC-18 / ISC-C21 — entries persist across a reopen (a fresh process

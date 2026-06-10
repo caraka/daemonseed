@@ -273,6 +273,9 @@ Each criterion is a verifiable boundary: positive ISCs describe a durable end-st
 - [x] ISC-C70: One-shot status messages auto-clear on focus change: switching the active pane/focus (`Tab` in `App::on_key_main`) clears `App::status`, so a transient status line (e.g. "share added — indexing…") never persists across navigation. The clear is deterministic — keyed on the focus change, not a timer — so a status set by one pane does not leak into another.
 - [x] ISC-C71: The circle-join box offers a generator (Ctrl-G in the join input, `App::on_key_join`) that fills the input with a 12-word BIP-39 diceware phrase (`strength::generate_diceware`, 132 bits) meeting the circle-entropy floor (ISC-C9 ≥128-bit, the live `estimate_circle(...).is_circle_green()` gate), so a user can accept a strong phrase rather than invent ≥128-bit entropy by hand. Circle phrases are shared out-of-band, so a generated phrase keeps the bar while removing the friction; the generated phrase passes the same on-`Enter` join gate as a hand-typed one.
 - [x] ISC-C72: The fetch preview (ISC-C66/C67) presents the manifest as a navigable collapsible folder tree with folder-level selection, partial-state folders, and scroll-to-cursor — so a folder-dense share (e.g. `TV Shows/Breaking Bad/Season 1/S01E01.mkv`) is usable, not a flat wall of paths. The flat manifest is folded once into a pre-order node list (`FetchUi::preview_tree`: `PreviewNode { depth, name, kind }`, `PreviewKind::Dir { subtree_end } | File { manifest_idx, size }`) when it arrives; each `Dir`'s `subtree_end` bounds its pre-order-contiguous descendant span. Selection stays per-file in `preview_checked` (unchanged `ConfirmFetch.selected` semantics: all-checked → `None`, subset → `Some(indices)`, empty → no-op); the tree is purely a view/control over it. Every `Dir` defaults collapsed (`preview_collapsed`), so a dense share opens to a short top-level list; the cursor (`preview_cursor`) ranges over the currently-visible rows (`FetchUi::visible_rows`, which skips a collapsed dir's descendants). Keys (`App::on_key_fetch_overlay`, Preview, not editing dest): `↑`/`↓` move; `→` expands a collapsed dir; `←` collapses an expanded dir or moves to the parent of a file/already-collapsed dir; `space` toggles selection of the cursor node — a file toggles its own `preview_checked[manifest_idx]`, a dir toggles every file in its subtree (any-unchecked → check all, else uncheck all); `a` toggles all; `d`/`Enter`/`Esc` unchanged. The render (`ui::render_preview_tree`) draws the visible rows windowed to the cursor (`preview_scroll` kept so the cursor row stays within `[scroll, scroll+pane_rows)`): each row indents `depth*2`, a dir shows a fold glyph `▸`/`▾` + an aggregate checkbox `[x]`/`[ ]`/`[~]` (all/none/partial via `FetchUi::dir_selection`), a file shows `[x]`/`[ ]` + name + size; the cursor row is marked. A flat share (no `/`) yields all-file depth-0 nodes — the pre-C72 behaviour.
+- [x] ISC-C73: Serve-from-disk (M16 crown). Publishing a share of arbitrary size succeeds without loading the share into memory: the manifest is built by a one-time streaming hash pass (`daemonseed_core::share_serve::hash_share` / `daemonseed_core::indexer::cached_or_hash` — fixed-buffer SHA-384, per-file progress, cancellable) on a blocking thread, and each served `ChunkRequest` is answered by reading that ONE file from disk (`DiskShareContent::get_chunk` through the generic `serve_share<C: ChunkSource>`, offloaded per-request via `spawn_blocking`). Transient serve RAM is bounded by the largest single file per in-flight request, never the share. Chunk addresses for the single-active indexed root are cached in the encrypted redb entry (`{size, mtime, chunk_addr}`) and reused when size+mtime match, so re-publishing an unchanged active-root share skips re-hashing entirely.
+- [x] ISC-C74: Publish progress + cancel. While a publish's hash pass runs, the status line shows per-file progress (`hashing <name>: done/total — [u] cancels`) and the actor keeps draining commands; `[u]` on the in-flight share cancels cleanly at any stage (undrained request dropped; running hash cancelled via flag), leaving `[p]` retryable.
+- [x] ISC-C75: Remove defined share. `x` on the selected My-defined share removes it end-to-end: cancels any in-flight hash, unpublishes if served, drops it from the defined list, and removes it from the persisted seeds (write-through), so it does not restore on the next Unlock.
 
 ### Client — anti-criteria (ISC-A-C*)
 
@@ -282,6 +285,8 @@ Each criterion is a verifiable boundary: positive ISCs describe a durable end-st
 - [ ] ISC-A-C32: Writing a fetched download (ISC-C63) must never write a file outside its share folder, and the share folder must never escape the downloads root. Every manifest `rel_path` is validated to be strictly relative with only normal components — an absolute path, a `..` component, or a root/prefix component is refused — and the per-share folder name (derived from the untrusted share name) is reduced to a single safe path component (separators/control chars neutralised, `.`/`..` rejected). So a hostile sharer's name or paths cannot escape the downloads root via traversal.
 - [x] ISC-A-C33: No blind download (A1, paired with ISC-C66). A fetch must never request or write any chunk before the user has seen the manifest preview and confirmed. The preview path (`net::handle_fetch_share`) pulls only the manifest and drops the stream, so a fetch that is previewed and then cancelled (`Esc`) writes nothing to disk and opens no download. The sole chunk-pulling path is `handle_confirm_fetch`, reachable only via the user's `Enter`-driven `ConfirmFetch` — there is no auto-download path that bypasses the preview.
 - [x] ISC-A-C34: No duplicate publish (M16 smoke fix, paired with ISC-C69). A second publish of an already-published share must never create a second relay listing. Client primary guard: the published list is keyed by the client-local defined root (`daemonseed_tui::app::PublishedShare`), and `[p]` on a root that is already published — or still queued in-flight — is a status-hint no-op (`[u]` first to re-publish); a failed publish never reaches `published`, so the guard stays open and `[p]` stays retryable. Relay backstop: `SharePublishRegistry::publish` REFUSES (never replaces) a second live listing for the same `(owner, name)` — replace semantics would silently drop a distinct share that merely reuses a display name. The key is per-connection, so two daemons can share a display name. The defined root never rides the wire: `NetEvent::PublishStarted` echoes it client-side only, and the `●` marker binds per defined row by root (never by name join), so a duplicate can never be invisible to its publisher again.
+- [x] ISC-A-C35: Anti: No publish- or serve-path operation may park the net actor's single-threaded runtime or hold an entire share's bytes in RAM. The hash pass and every per-chunk disk read run on blocking threads; the actor loop keeps draining commands throughout (the define-path ISC-A-C7 discipline, extended to publish/serve). The server performs only cheap fail-closed checks before sending (IO error, size mismatch) — the receiver's per-`ChunkResponse` SHA-384 re-derivation remains the integrity guarantee, so a same-size local tamper is rejected by the fetcher, not the server.
+- [x] ISC-A-C36: Anti: Unlocking a profile with multiple persisted share roots must never fail the share-index open with a lock error. The actor opens `share-index.redb` once per session and never closes/reopens it; a new define cancels the prior scan and clears the single-active index (latest-wins) instead of cycling the file lock.
 
 
 - [ ] ISC-A-C1: The client persists no plaintext identifiers, no session-activity logs, no message content, and no recently-contacted lists — only the encrypted at-rest blob (ISC-C3) and a minimal configuration file. Optional ephemeral debug logs must be opt-in, auto-truncated, and exclude identifiers and message content.
@@ -613,6 +618,24 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   share one pane focus and Up/Down stay pinned to the public fetch selector. (caraka greenlight,
   2026-06-09.)
 
+- **Serve-from-disk (the M16 crown) — advisor-shaped (2026-06-09).** caraka's music-library smoke
+  proved the publish path RAM-bound and actor-parking: M11 gate-era `ShareContent::index_dir`
+  (whole share into a `MemoryChunkStore`, synchronously on the LocalSet) had been silently promoted
+  into the real sharing path by M14-M16. Built to the standing 3-layer storage decision: streaming
+  hash + disk-backed serve + redb-cached chunk addrs. External advisor review reshaped two pieces
+  mid-build: (1) per-chunk disk reads offloaded via `spawn_blocking` through
+  `serve_share<C: ChunkSource + Send + Sync>` — without this the park merely moved from
+  publish-time to serve-time; (2) serve-time full re-hash dropped — the fetcher's per-chunk SHA-384
+  re-derivation is the integrity guarantee; the server does IO/size fail-closed only. Scope pinned
+  deliberately: chunk == whole file stays (sub-file fixed-size CAS chunking would be a second
+  stored-format migration — deferred with eyes open; a large single file transiently occupies RAM
+  per in-flight request); the chunk-addr cache covers the single-active root only (other defined
+  roots re-hash per publish — UX asymmetry documented; single-active is the M14 deferral,
+  unchanged); redb stored format bumped by table rename (`share-index` → `share-index-v2`), old
+  table abandoned (alpha compat waived). A cancelled hash pass leaves only complete per-file cache
+  rows, so post-cancel reuse is correct by construction. (caraka greenlight "crown for M16",
+  2026-06-09.)
+
 ## Changelog
 
 - **conjectured:** the multi-circle carousel (ISC-C60) lets the active surface span the lobby and the
@@ -649,6 +672,22 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   `second_p_on_a_published_share_is_a_guarded_noop`, `p_is_retryable_after_a_publish_error`,
   `duplicate_publish_same_owner_name_is_refused_not_replaced`, `same_name_different_owner_both_publish`,
   `bracket_keys_echo_the_defined_selection`.
+
+- **conjectured:** the M11 `ShareContent::index_dir` (whole share read into a `MemoryChunkStore` at
+  publish time, synchronously on the actor) was adequate scaffolding to carry public shares through
+  the alpha.
+  **refuted by:** caraka's 2026-06-09 music-library smoke — publish parked the entire actor runtime
+  for minutes (status frozen, chat readers dead, an earlier share's serve stream collapsed) and
+  would have required share-sized RAM; the metadata-only redb indexer's civility on the same folder
+  made the contrast unmissable.
+  **learned:** "temporary" content-handling scaffolding gets silently promoted into load-bearing
+  paths by later feature milestones unless an ISC pins the resource envelope. Resource criteria
+  (RAM ceiling, never-park) belong in the ISC set the moment a path touches user-scale data — and
+  an external design review at the commitment boundary catches relocated failure modes (the park
+  moving from publish-time to serve-time) that the author's frame hides.
+  **criterion-now:** ISC-C73 + ISC-A-C35 (serve-from-disk, O(file) transient RAM, never-park),
+  ISC-C74 (progress + cancel), ISC-C75 (remove defined share), ISC-A-C36 (no startup index-lock
+  error) — regression-pinned by the share_serve / indexer / app test suites.
 
 ## Verification
 
@@ -851,3 +890,15 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   compile-time `ISCS.len() == TOTAL` assert caught the first missed bump). Three-crate run 0-fail
   (tui 178 / server 127 / isc 8); full-workspace gate at the commit boundary. Probe: `cargo test -p
   daemonseed-tui app::tests::second_p` + `cargo test -p daemonseed-server share::`.
+
+- ISC-C73/C74/C75/A-C35/A-C36 (serve-from-disk crown) verified 2026-06-09: full workspace 0-fail —
+  core 493 (incl. `hash_share_matches_index_dir`, the byte-parity proof that disk-path chunk addrs
+  equal the retired RAM path's across the 1 MiB buffer seam; `disk_content_serves_manifest_and_
+  chunks_from_disk`; `disk_content_fails_closed_on_modified_file` (size change); `disk_content_
+  same_size_tamper_is_rejected_by_receiver_not_server`; `cached_or_hash_writes_back_then_hits_
+  without_reading`; `scan_into_cancel_early_returns_ok`), tui 186 (progress/cancel/remove/guard
+  app tests), cli 36, server 127, e2e `share_serve_e2e` + `share_fetch_e2e` through the generic
+  `Arc<C: ChunkSource>` serve path. fmt + clippy zero warnings; `cargo xtask isc-coverage` 100/147.
+  [DEFERRED-VERIFY] the live music-library probe (publish Music → watch `hashing N/M` progress →
+  cancel mid-hash → re-publish → cache-hit instant) is caraka's next smoke — follow-up tracked in
+  the vault PRD smoke section.

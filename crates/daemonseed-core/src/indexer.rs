@@ -19,12 +19,18 @@
 //!   share-wide rewalk (ISC-A-C7 / ISC-C21) — that share-wide rewalk on a
 //!   single change is precisely the thrash Demonsaw suffered.
 //!
+//! M16 adds the **cached hash pass** ([`cached_or_hash`]): the index doubles
+//! as a chunk-addr cache for the disk-backed publish path, so re-publishing
+//! an unchanged share reads no file contents at all (the same anti-thrash
+//! posture, applied to hashing instead of stat walks).
+//!
 //! The live filesystem-event source (inotify / FSEvents / ReadDirectoryChangesW
 //! via the `notify` crate) and its watch-limit fallback feed [`FsEvent`]s into
 //! [`Indexer::apply_event`]; that wiring layers on top of this engine.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::UNIX_EPOCH;
@@ -32,6 +38,11 @@ use std::time::UNIX_EPOCH;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use walkdir::WalkDir;
 
+use crate::share_envelope::ManifestEntry;
+use crate::share_serve::{
+    ServeError, ShareManifest, hash_file, hash_share, share_files, share_rel_path,
+};
+use crate::storage::cas::{CHUNK_ADDR_LEN, ChunkAddr};
 use crate::storage::share_index::{IndexError, ShareEntry, ShareIndex};
 
 /// A single filesystem change to fold into the index — the unit of incremental
@@ -73,10 +84,11 @@ impl Indexer {
     ///
     /// Synchronous by design — see the module docs. Run it on a niced
     /// background thread so it cannot starve a foreground task. Delegates to the
-    /// free [`scan_into`] so a caller holding only an `Arc<ShareIndex>` (M14
+    /// free [`scan_into`] (with a never-set cancel flag — an owned cold scan
+    /// runs to completion) so a caller holding only an `Arc<ShareIndex>` (M14
     /// net-actor activation) can run the identical walk against a borrowed index.
     pub fn cold_scan(&self) -> Result<usize, IndexError> {
-        scan_into(&self.index, &self.root)
+        scan_into(&self.index, &self.root, &AtomicBool::new(false))
     }
 
     /// Apply one filesystem event as a **single-entry** index write — never a
@@ -90,10 +102,14 @@ impl Indexer {
                     return Ok(()); // outside the share root — ignore
                 };
                 match std::fs::metadata(path) {
+                    // A change event means the bytes may differ — never carry
+                    // a cached chunk_addr forward; the next hash pass
+                    // ([`cached_or_hash`]) recomputes and re-caches it.
                     Ok(meta) if meta.is_file() => self.index.put(&ShareEntry {
                         rel_path,
                         size: meta.len(),
                         mtime_unix_ms: mtime_ms(&meta),
+                        chunk_addr: None,
                     }),
                     // A directory (its files arrive as their own events) — ignore.
                     Ok(_) => Ok(()),
@@ -157,6 +173,7 @@ impl Indexer {
                 rel_path,
                 size: meta.len(),
                 mtime_unix_ms: mtime,
+                chunk_addr: None, // changed file — a stale address must not survive
             })?;
             updated += 1;
         }
@@ -176,14 +193,31 @@ impl Indexer {
 /// Cold-scan `root` into a borrowed [`ShareIndex`]: upsert every regular file
 /// beneath it and return how many were indexed. Unreadable entries are skipped,
 /// not fatal — one bad file must not abort the whole walk (ISC-A-C7 robustness).
+/// A metadata-only scan writes `chunk_addr: None` — content addresses come from
+/// the hash pass ([`cached_or_hash`]), never from a stat walk.
+///
+/// `cancel` is checked per entry; a set flag **early-returns `Ok(count)`**
+/// with however many files were upserted so far. Cancellation is deliberately
+/// not an error: the scan is idempotent metadata work and every entry already
+/// written is valid (this matches the walk's own skip-and-continue posture —
+/// [`IndexError`]'s variants are storage failures, which this is not). A
+/// caller that must distinguish "complete" from "cut short" checks its own
+/// flag after the call.
 ///
 /// Operates on `&ShareIndex` rather than owning it so a caller holding an
 /// `Arc<ShareIndex>` can run the scan on a dedicated background thread while the
 /// *same* index stays fully queryable from the foreground (redb MVCC) — the M14
 /// net-actor share-activation path. [`Indexer::cold_scan`] delegates here.
-pub fn scan_into(index: &ShareIndex, root: &Path) -> Result<usize, IndexError> {
+pub fn scan_into(
+    index: &ShareIndex,
+    root: &Path,
+    cancel: &AtomicBool,
+) -> Result<usize, IndexError> {
     let mut count = 0usize;
     for entry in WalkDir::new(root).into_iter().flatten() {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(count);
+        }
         if !entry.file_type().is_file() {
             continue;
         }
@@ -203,10 +237,123 @@ pub fn scan_into(index: &ShareIndex, root: &Path) -> Result<usize, IndexError> {
             rel_path,
             size: meta.len(),
             mtime_unix_ms: mtime_ms(&meta),
+            chunk_addr: None,
         })?;
         count += 1;
     }
     Ok(count)
+}
+
+/// Why a cached-or-hash pass ([`cached_or_hash`]) failed — it spans two
+/// domains, so it wraps both error types.
+#[derive(Debug)]
+pub enum CachedHashError {
+    /// Reading or writing the share index (the chunk-addr cache) failed.
+    Index(IndexError),
+    /// The hash pass failed: I/O, hashing, or cancellation —
+    /// [`ServeError::Cancelled`] arrives wrapped here.
+    Serve(ServeError),
+}
+
+impl core::fmt::Display for CachedHashError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            CachedHashError::Index(e) => write!(f, "chunk-addr cache failed: {e}"),
+            CachedHashError::Serve(e) => write!(f, "share hash pass failed: {e}"),
+        }
+    }
+}
+
+impl core::error::Error for CachedHashError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            CachedHashError::Index(e) => Some(e),
+            CachedHashError::Serve(e) => Some(e),
+        }
+    }
+}
+
+/// Build a share's [`ShareManifest`] using the index as a **chunk-addr cache**:
+/// a file whose indexed `size` + `mtime` still match and whose entry carries a
+/// cached `chunk_addr` is reused *without reading the file*; only misses
+/// (new, changed, or never-hashed files) are streamed through SHA-384 (as in
+/// [`hash_share`]), and each freshly computed address is written back into the
+/// index entry so the next publish of an unchanged share reads no file at all.
+///
+/// With `index: None` this is exactly [`hash_share`] — the cache is an
+/// optimization, never a requirement. The walk order, `rel_path` form,
+/// `progress(done, total)` cadence (after every file, hit or miss), and
+/// between-files cancellation ([`ServeError::Cancelled`], wrapped in
+/// [`CachedHashError::Serve`]) all match `hash_share`, so the two paths
+/// produce identical manifests for the same tree.
+///
+/// A cached address is trusted only as far as its `stat` match — mtime
+/// granularity is the usual caveat. The serve side
+/// ([`crate::share_serve::DiskShareContent`]) does NOT re-hash at answer time
+/// (only cheap IO/size fail-closed checks); a stale cached address is caught
+/// by the fetcher's per-`ChunkResponse` SHA-384 re-derivation, which is the
+/// integrity guarantee end to end (ISC-A-C35).
+pub fn cached_or_hash(
+    index: Option<&ShareIndex>,
+    root: &Path,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(usize, usize),
+) -> Result<ShareManifest, CachedHashError> {
+    let Some(index) = index else {
+        return hash_share(root, cancel, progress).map_err(CachedHashError::Serve);
+    };
+
+    let files = share_files(root);
+    let total = files.len();
+    let mut entries = Vec::with_capacity(total);
+
+    for (done, entry) in files.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(CachedHashError::Serve(ServeError::Cancelled));
+        }
+        let meta = entry
+            .metadata()
+            .map_err(|e| CachedHashError::Serve(ServeError::Io(e.into())))?;
+        let size = meta.len();
+        let mtime_unix_ms = mtime_ms(&meta);
+        let rel_path = share_rel_path(root, entry);
+
+        // Cache hit: same rel_path + size + mtime with a well-formed cached
+        // address → reuse it without reading the file.
+        let cached = index
+            .get(&rel_path)
+            .map_err(CachedHashError::Index)?
+            .filter(|e| e.size == size && e.mtime_unix_ms == mtime_unix_ms)
+            .and_then(|e| e.chunk_addr)
+            .and_then(|bytes| <[u8; CHUNK_ADDR_LEN]>::try_from(bytes.as_slice()).ok())
+            .map(ChunkAddr::from_bytes);
+
+        let chunk_addr = match cached {
+            Some(addr) => addr,
+            None => {
+                let addr = hash_file(entry.path()).map_err(CachedHashError::Serve)?;
+                // Write-back: the next pass over this unchanged file is a hit.
+                index
+                    .put(&ShareEntry {
+                        rel_path: rel_path.clone(),
+                        size,
+                        mtime_unix_ms,
+                        chunk_addr: Some(addr.as_bytes().to_vec()),
+                    })
+                    .map_err(CachedHashError::Index)?;
+                addr
+            }
+        };
+
+        entries.push(ManifestEntry {
+            rel_path,
+            chunk_addr,
+            size,
+        });
+        progress(done + 1, total);
+    }
+
+    Ok(ShareManifest { entries })
 }
 
 /// A running background cold-scan ([`Indexer::spawn_background_scan`]). Join to
@@ -377,10 +524,36 @@ mod tests {
         let index = Arc::new(ShareIndex::open(dir.path().join("index.redb"), KEY).unwrap());
         // The actor pattern: scan a borrowed Arc while holding another clone.
         let foreground = Arc::clone(&index);
-        assert_eq!(scan_into(&index, &root).unwrap(), 2);
+        assert_eq!(
+            scan_into(&index, &root, &AtomicBool::new(false)).unwrap(),
+            2
+        );
         // The foreground clone observes the scan's writes (shared redb).
         assert_eq!(foreground.len().unwrap(), 2);
         assert_eq!(foreground.get("a.txt").unwrap().unwrap().size, 3);
+    }
+
+    /// A set cancel flag early-returns `Ok(count)` — cancellation is not an
+    /// error, and a pre-set flag indexes nothing.
+    #[test]
+    fn scan_into_cancel_early_returns_ok() {
+        let (_dir, idx) = fixture();
+        write(&idx.root, "a.txt", b"a");
+        write(&idx.root, "b.txt", b"b");
+
+        let cancelled = AtomicBool::new(true);
+        assert_eq!(scan_into(idx.index(), &idx.root, &cancelled).unwrap(), 0);
+        assert_eq!(idx.index().len().unwrap(), 0);
+    }
+
+    /// A metadata scan writes `chunk_addr: None` — content addresses come
+    /// only from the hash pass.
+    #[test]
+    fn scan_into_writes_no_chunk_addr() {
+        let (_dir, idx) = fixture();
+        write(&idx.root, "a.txt", b"aaa");
+        idx.cold_scan().unwrap();
+        assert_eq!(idx.index().get("a.txt").unwrap().unwrap().chunk_addr, None);
     }
 
     /// Directories themselves are not indexed — only the files in them.
@@ -556,5 +729,120 @@ mod tests {
 
         assert_eq!(handle.join().unwrap(), 200);
         assert_eq!(idx.index().len().unwrap(), 200);
+    }
+
+    // ── cached hash pass (M16) ─────────────────────────────────────────────
+
+    /// A no-op cancel flag for passes that should run to completion.
+    fn no_cancel() -> AtomicBool {
+        AtomicBool::new(false)
+    }
+
+    /// With no index, `cached_or_hash` is exactly `hash_share`: identical
+    /// manifest on the same tree.
+    #[test]
+    fn cached_or_hash_without_index_equals_hash_share() {
+        let _ = oxicrypt_module::initialize();
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("share");
+        std::fs::create_dir_all(&root).unwrap();
+        write(&root, "a.txt", b"alpha");
+        write(&root, "sub/b.txt", b"bravo");
+
+        let direct = hash_share(&root, &no_cancel(), &mut |_, _| {}).unwrap();
+        let cached = cached_or_hash(None, &root, &no_cancel(), &mut |_, _| {}).unwrap();
+        assert_eq!(cached, direct);
+    }
+
+    /// The full cache cycle: a metadata-only entry (no cached address) is
+    /// hashed and **written back**; a second pass over the unchanged file
+    /// reuses the cached address *without reading the file* — proved by
+    /// rewriting the bytes with the same size and restoring the mtime, then
+    /// observing the second pass still return the ORIGINAL address (a re-hash
+    /// would have produced the new bytes' address).
+    #[test]
+    fn cached_or_hash_writes_back_then_hits_without_reading() {
+        let (_dir, idx) = fixture();
+        let path = write(&idx.root, "a.txt", b"original");
+        idx.cold_scan().unwrap(); // metadata only — chunk_addr: None
+
+        // First pass: miss → hash → write-back.
+        let first =
+            cached_or_hash(Some(idx.index()), &idx.root, &no_cancel(), &mut |_, _| {}).unwrap();
+        let original_addr = first.entries[0].chunk_addr;
+        assert_eq!(
+            idx.index().get("a.txt").unwrap().unwrap().chunk_addr,
+            Some(original_addr.as_bytes().to_vec()),
+            "the computed address was written back into the index entry"
+        );
+
+        // Rewrite with different bytes of the SAME length, then restore the
+        // mtime, so the stat triplet matches the cached entry exactly.
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(&path, b"REWRITE!").unwrap(); // 8 bytes, like "original"
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+
+        // Second pass: a hit. Returning the ORIGINAL address (not the new
+        // bytes') proves the file was never read, let alone re-hashed; the
+        // per-file progress cadence is unchanged by hits.
+        let mut seen = Vec::new();
+        let second = cached_or_hash(Some(idx.index()), &idx.root, &no_cancel(), &mut |d, t| {
+            seen.push((d, t));
+        })
+        .unwrap();
+        assert_eq!(second.entries[0].chunk_addr, original_addr);
+        assert_eq!(seen, vec![(1, 1)]);
+    }
+
+    /// Stale mtime → the cached address is NOT reused: the file is re-hashed
+    /// and the fresh address written back.
+    #[test]
+    fn cached_or_hash_stale_mtime_rehashes() {
+        let (_dir, idx) = fixture();
+        let path = write(&idx.root, "a.txt", b"version one");
+        let first =
+            cached_or_hash(Some(idx.index()), &idx.root, &no_cancel(), &mut |_, _| {}).unwrap();
+
+        // New content (and a naturally newer — or at worst equal — mtime;
+        // bump it explicitly so coarse filesystem clocks can't alias).
+        std::fs::write(&path, b"version TWO").unwrap();
+        let later = std::time::SystemTime::now() + Duration::from_secs(10);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+
+        let second =
+            cached_or_hash(Some(idx.index()), &idx.root, &no_cancel(), &mut |_, _| {}).unwrap();
+        assert_ne!(
+            second.entries[0].chunk_addr, first.entries[0].chunk_addr,
+            "a stat mismatch forces a re-hash"
+        );
+        assert_eq!(
+            idx.index().get("a.txt").unwrap().unwrap().chunk_addr,
+            Some(second.entries[0].chunk_addr.as_bytes().to_vec()),
+            "the fresh address replaced the stale one"
+        );
+    }
+
+    /// A set cancel flag aborts the cached pass with `Cancelled` (wrapped in
+    /// `CachedHashError::Serve`) — symmetric with `hash_share`.
+    #[test]
+    fn cached_or_hash_cancel_aborts() {
+        let (_dir, idx) = fixture();
+        write(&idx.root, "a.txt", b"a");
+        let cancelled = AtomicBool::new(true);
+        let result = cached_or_hash(Some(idx.index()), &idx.root, &cancelled, &mut |_, _| {});
+        assert!(matches!(
+            result,
+            Err(CachedHashError::Serve(ServeError::Cancelled))
+        ));
     }
 }
