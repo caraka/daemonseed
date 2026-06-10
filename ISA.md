@@ -281,6 +281,7 @@ Each criterion is a verifiable boundary: positive ISCs describe a durable end-st
 - [ ] ISC-A-C31: A share fetch that fails verification at any point (no manifest, a chunk-hash mismatch per ISC-A-S20, a dropped stream) must NOT persist a partial or poisoned download: nothing is written to the fetched manifest until every chunk has verified, so a browse/extract never surfaces falsified or truncated content. A persistence failure after verification surfaces as a fetch error rather than a silent partial success.
 - [ ] ISC-A-C32: Writing a fetched download (ISC-C63) must never write a file outside its share folder, and the share folder must never escape the downloads root. Every manifest `rel_path` is validated to be strictly relative with only normal components — an absolute path, a `..` component, or a root/prefix component is refused — and the per-share folder name (derived from the untrusted share name) is reduced to a single safe path component (separators/control chars neutralised, `.`/`..` rejected). So a hostile sharer's name or paths cannot escape the downloads root via traversal.
 - [x] ISC-A-C33: No blind download (A1, paired with ISC-C66). A fetch must never request or write any chunk before the user has seen the manifest preview and confirmed. The preview path (`net::handle_fetch_share`) pulls only the manifest and drops the stream, so a fetch that is previewed and then cancelled (`Esc`) writes nothing to disk and opens no download. The sole chunk-pulling path is `handle_confirm_fetch`, reachable only via the user's `Enter`-driven `ConfirmFetch` — there is no auto-download path that bypasses the preview.
+- [x] ISC-A-C34: No duplicate publish (M16 smoke fix, paired with ISC-C69). A second publish of an already-published share must never create a second relay listing. Client primary guard: the published list is keyed by the client-local defined root (`daemonseed_tui::app::PublishedShare`), and `[p]` on a root that is already published — or still queued in-flight — is a status-hint no-op (`[u]` first to re-publish); a failed publish never reaches `published`, so the guard stays open and `[p]` stays retryable. Relay backstop: `SharePublishRegistry::publish` REFUSES (never replaces) a second live listing for the same `(owner, name)` — replace semantics would silently drop a distinct share that merely reuses a display name. The key is per-connection, so two daemons can share a display name. The defined root never rides the wire: `NetEvent::PublishStarted` echoes it client-side only, and the `●` marker binds per defined row by root (never by name join), so a duplicate can never be invisible to its publisher again.
 
 
 - [ ] ISC-A-C1: The client persists no plaintext identifiers, no session-activity logs, no message content, and no recently-contacted lists — only the encrypted at-rest blob (ISC-C3) and a minimal configuration file. Optional ephemeral debug logs must be opt-in, auto-truncated, and exclude identifiers and message content.
@@ -597,6 +598,21 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   `selected: Option<Vec<usize>>` on `ConfirmFetch` is `None` for the A1 confirm-all path and will carry
   the chosen indices for A2 selective fetch. (caraka, 2026-06-07.)
 
+- **A-C34 guard placement — root-keyed client guard + reject-not-replace relay backstop (M16 smoke).**
+  Live smoke (2026-06-09) double-published a share: `[p]` queued unconditionally, the relay mints a
+  fresh share_id per publish, and the `●` marker's name-keyed dedup hid the duplicate from the
+  publisher (it was visible on a second daemon's public pane). Considered relay *replace* per
+  `(owner, name)` — rejected: with no client-stable share identity on the wire, name-keyed replace
+  conflates two distinct roots that happen to share a display name and silently drops one — an
+  invisible lost-publish, worse than the visible duplicate. So: the client guards by root (the
+  identity it actually owns), the relay REFUSES duplicates per `(owner, name)` as defense in depth,
+  and the `[u]`/marker joins switched from display-name match to root match. The clean long-term
+  identity — a client-generated stable share token persisted with the definition, relay upsert
+  preserving share_id — needs a wire change and belongs with M17's share work if wanted. Cursor
+  discoverability shipped as echo-on-`[`/`]` + corrected hint, NOT arrows-move-defined: both lists
+  share one pane focus and Up/Down stay pinned to the public fetch selector. (caraka greenlight,
+  2026-06-09.)
+
 ## Changelog
 
 - **conjectured:** the multi-circle carousel (ISC-C60) lets the active surface span the lobby and the
@@ -617,6 +633,22 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   milestone-completion memos were written but the living snapshot was never updated.
   **criterion now:** project state is tracked by `cargo xtask isc-coverage` against this ISA — a mechanized,
   drift-proof system of record — not by a hand-maintained prose snapshot.
+
+- **conjectured:** ISC-C69's happy path (define several, select with `[`/`]`, publish each) was a
+  sufficient spec for the multi-share publish surface.
+  **refuted by:** the 2026-06-09 live smoke (caraka) — a second `[p]` on an already-published share
+  created a second relay listing (confirmed visible on a second daemon's public pane), with no guard at
+  any layer, while the `●` marker's display-name dedup hid the duplication from the publisher; and the
+  split-cursor scheme gave no feedback at all when the natural-but-wrong keys (arrows) were pressed.
+  **learned:** publish-like criteria need an explicit idempotency anti-criterion at specification time —
+  happy-path specs produce happy-path guards. And identity joins must use the key the layer actually
+  owns (client: defined root; relay: `(owner, name)`); a string join on a user-visible display name can
+  mask the exact failure the surface exists to show.
+  **criterion now:** ISC-A-C34 — client root-keyed `[p]` guard (incl. in-flight, error-retryable) +
+  relay reject-duplicate backstop + per-row root-keyed `●` marker — regression-pinned by
+  `second_p_on_a_published_share_is_a_guarded_noop`, `p_is_retryable_after_a_publish_error`,
+  `duplicate_publish_same_owner_name_is_refused_not_replaced`, `same_name_different_owner_both_publish`,
+  `bracket_keys_echo_the_defined_selection`.
 
 ## Verification
 
@@ -808,3 +840,14 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   2-daemon "spoofed handle shows floor" probe is a tracked follow-up (blind-PTY). Circle path is out of
   scope by the 2026-06-07 Decisions entry (CircleMessage carries no pubkey to bind). Probe: `cargo test -p
   daemonseed-core handle::` + `cargo test -p daemonseed-tui`.
+
+- ISC-A-C34 (publish idempotency, M16 smoke fix) verified 2026-06-09: tui unit tests prove a second `[p]`
+  queues nothing against a published root AND against a still-queued in-flight request, with an
+  explanatory status, and that a `PublishError` leaves the guard open (`[p]` retryable); server unit
+  tests prove a duplicate `(owner, name)` publish is REFUSED with the original listing intact and the
+  name freed again after unpublish, while the same name under a different owner still publishes. The
+  `[`/`]` selection echo (discoverability half of the same smoke finding) is pinned by
+  `bracket_keys_echo_the_defined_selection`. Registry `TOTAL` 141→142 (client neg 27→28; the
+  compile-time `ISCS.len() == TOTAL` assert caught the first missed bump). Three-crate run 0-fail
+  (tui 178 / server 127 / isc 8); full-workspace gate at the commit boundary. Probe: `cargo test -p
+  daemonseed-tui app::tests::second_p` + `cargo test -p daemonseed-server share::`.

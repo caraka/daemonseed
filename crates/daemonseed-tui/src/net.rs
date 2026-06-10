@@ -441,9 +441,13 @@ pub enum NetEvent {
     /// A share began publishing and is now being served (D, M15). `share_id` is
     /// the server-assigned id; `file_count` mirrors the indexed manifest. The
     /// share stays served until `UnpublishShare`, the session drops, or the relay
-    /// reaps the asset — then `PublishStopped` arrives.
+    /// reaps the asset — then `PublishStopped` arrives. `root` is echoed
+    /// client-side from the publish request so the app can key its published
+    /// list by the defined root (ISC-A-C34 idempotency guard) — it is local-only
+    /// plumbing and never rides the wire (the relay sees only the listing).
     PublishStarted {
         share_id: String,
+        root: PathBuf,
         name: String,
         file_count: usize,
     },
@@ -776,6 +780,7 @@ impl Actor {
         self.published.insert(share_id.clone(), handle);
         self.emit(NetEvent::PublishStarted {
             share_id,
+            root,
             name,
             file_count,
         });

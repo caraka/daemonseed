@@ -277,6 +277,23 @@ pub struct PublishRequest {
     pub sharer_handle: String,
 }
 
+/// A share currently published + served this session (M16 smoke fix,
+/// ISC-A-C34). Keyed by the client-local defined `root` so `[p]` can be
+/// idempotent and the Shares pane's `●` marker binds to the exact defined row
+/// — display-name string joins conflate distinct shares that happen to share
+/// a name. `share_id` is the relay-minted listing id (the unpublish handle);
+/// `name` is the advertised display name. `root` is client-local only and
+/// never rides the wire.
+#[derive(Debug, Clone)]
+pub struct PublishedShare {
+    /// Server-assigned opaque listing id (F25); the `[u]` unpublish handle.
+    pub share_id: String,
+    /// The defined share root this listing serves — the idempotency key.
+    pub root: std::path::PathBuf,
+    /// The advertised display name (defaults to the directory name).
+    pub name: String,
+}
+
 /// One node in the fetch preview's collapsible folder tree (ISC-C72). The tree
 /// is a *view* over the flat manifest — selection still lives per-file in
 /// [`FetchUi::preview_checked`]; a node merely names a row and (for a `Dir`)
@@ -750,11 +767,12 @@ pub struct App {
     /// Single-shot slot for an unpublish (D, M15): the server-assigned share_id
     /// to stop serving; drained into `NetCommand::UnpublishShare`.
     pending_unpublish: Option<String>,
-    /// Shares currently published+served this session as `(share_id, name)` (D,
-    /// M15). Appended on `PublishStarted`, pruned on `PublishStopped`; drives the
+    /// Shares currently published+served this session, keyed by defined root
+    /// ([`PublishedShare`], M16 ISC-A-C34). Appended on `PublishStarted`,
+    /// pruned on `PublishStopped`; drives the `[p]` idempotency guard and the
     /// Shares-pane `[u]` unpublish affordance. Serving is session-scoped — the
     /// relay reaps these when the connection drops.
-    published: Vec<(String, String)>,
+    published: Vec<PublishedShare>,
     /// Queued circle-rejoins to forward to the net actor, one per launch-time
     /// remembered circle (M13 persistence, ISC-C59). Filled on Unlock from
     /// `seeds.circles()` and drained one-per-tick by the same binary loop that
@@ -1104,6 +1122,18 @@ impl App {
         self.clamp_defined_sel();
     }
 
+    /// Echo the My-defined selection on the status line after a `[`/`]` move
+    /// (M16 smoke fix). The split-cursor scheme (arrows = public row, `[`/`]`
+    /// = defined row) proved invisible in live smoke — the echo confirms the
+    /// keys did something and names what `[p]`/`[u]` will act on. One-shot:
+    /// cleared on focus change like any status (ISC-C70).
+    fn echo_defined_selection(&mut self) {
+        let (sel, len) = (self.defined_sel, self.defined_shares.len());
+        if let Some(name) = self.defined_shares.get(sel).map(|(_, n)| n.clone()) {
+            self.status = Some(format!("selected {}/{len}: {name}", sel + 1));
+        }
+    }
+
     /// Keep [`Self::defined_sel`] within bounds of [`Self::defined_shares`].
     fn clamp_defined_sel(&mut self) {
         let max = self.defined_shares.len().saturating_sub(1);
@@ -1112,8 +1142,8 @@ impl App {
         }
     }
 
-    /// Shares currently published+served this session as `(share_id, name)` (D, M15).
-    pub fn published(&self) -> &[(String, String)] {
+    /// Shares currently published+served this session (M16, [`PublishedShare`]).
+    pub fn published(&self) -> &[PublishedShare] {
         &self.published
     }
 
@@ -1574,17 +1604,22 @@ impl App {
             // unpublish affordance and confirm what's serving on the status line.
             NetEvent::PublishStarted {
                 share_id,
+                root,
                 name,
                 file_count,
             } => {
-                self.published.push((share_id.clone(), name.clone()));
+                self.published.push(PublishedShare {
+                    share_id: share_id.clone(),
+                    root,
+                    name: name.clone(),
+                });
                 self.status = Some(format!(
                     "sharing {name:?} as {share_id} ({file_count} file(s)) — [u] in Shares to stop"
                 ));
             }
             NetEvent::PublishError { message } => self.status = Some(message),
             NetEvent::PublishStopped { share_id } => {
-                self.published.retain(|(id, _)| id != &share_id);
+                self.published.retain(|p| p.share_id != share_id);
                 self.status = Some(format!("stopped sharing {share_id}"));
             }
         }
@@ -2192,12 +2227,14 @@ impl App {
             }
             KeyCode::Char('[') => {
                 self.defined_sel = self.defined_sel.saturating_sub(1);
+                self.echo_defined_selection();
             }
             KeyCode::Char(']') => {
                 let max = self.defined_shares.len().saturating_sub(1);
                 if self.defined_sel < max {
                     self.defined_sel += 1;
                 }
+                self.echo_defined_selection();
             }
             KeyCode::Char('r') | KeyCode::Char('R') => {
                 self.pending_share_refresh = true;
@@ -2809,12 +2846,26 @@ impl App {
 
     /// Publish the **selected** defined share root to the relay (M16 C1,
     /// ISC-C69 — the Shares pane's `[p]` action). Define several, select with
-    /// `↑`/`↓`, then `[p]`; each is served by its own session-scoped serve task.
-    /// A no-op with a hint if nothing is defined yet.
+    /// `[`/`]`, then `[p]`; each is served by its own session-scoped serve task.
+    /// A no-op with a hint if nothing is defined yet. Idempotent per root
+    /// (ISC-A-C34): a root that is already published — or already queued and
+    /// not yet drained — is never re-queued; `[u]` first to re-publish. A
+    /// failed publish never reaches `published`, so the guard stays open and
+    /// `[p]` is retryable after a `PublishError`.
     fn publish_selected_share(&mut self) {
         let sharer_handle = self.own_handle();
         match self.selected_defined_share().cloned() {
             Some((root, name)) => {
+                let already = self.published.iter().any(|p| p.root == root)
+                    || self
+                        .pending_publish
+                        .as_ref()
+                        .is_some_and(|r| r.root == root);
+                if already {
+                    self.status =
+                        Some(format!("{name:?} is already published — [u] to stop first"));
+                    return;
+                }
                 self.pending_publish = Some(PublishRequest {
                     root,
                     name,
@@ -2829,22 +2880,23 @@ impl App {
     }
 
     /// Unpublish the selected defined share if it is currently being served
-    /// (M16 C1, ISC-C69 — the Shares pane's `[u]` action). The published list
-    /// is keyed by server-assigned `share_id` but carries each share's display
-    /// name, so the selected defined share is matched by name. A no-op with a
-    /// hint if the selected share is not currently published.
+    /// (M16 C1, ISC-C69 — the Shares pane's `[u]` action). The selected
+    /// defined share is matched by its root (the [`PublishedShare`] key,
+    /// ISC-A-C34) — never by display-name string join, which would conflate
+    /// distinct shares sharing a name. A no-op with a hint if the selected
+    /// share is not currently published.
     fn unpublish_selected_share(&mut self) {
-        let selected_name = self.selected_defined_share().map(|(_, name)| name.clone());
-        let share_id = selected_name.as_ref().and_then(|name| {
+        let selected_root = self.selected_defined_share().map(|(root, _)| root.clone());
+        let share_id = selected_root.as_ref().and_then(|root| {
             self.published
                 .iter()
-                .find(|(_, n)| n == name)
-                .map(|(id, _)| id.clone())
+                .find(|p| &p.root == root)
+                .map(|p| p.share_id.clone())
         });
         match share_id {
             Some(id) => self.pending_unpublish = Some(id),
             None => {
-                self.status = Some(if selected_name.is_some() {
+                self.status = Some(if selected_root.is_some() {
                     "selected share is not currently published".to_owned()
                 } else {
                     "nothing to unpublish".to_owned()
@@ -3501,11 +3553,12 @@ mod tests {
 
         app.on_net_event(NetEvent::PublishStarted {
             share_id: "deadbeef".to_owned(),
+            root: dir.clone(),
             name: "My Share".to_owned(),
             file_count: 3,
         });
         assert_eq!(app.published().len(), 1);
-        assert_eq!(app.published()[0].0, "deadbeef");
+        assert_eq!(app.published()[0].share_id, "deadbeef");
 
         app.on_key(press(KeyCode::Char('u')));
         assert_eq!(
@@ -3589,14 +3642,16 @@ mod tests {
             "re-defining the same root does not duplicate"
         );
 
-        // Publish both (simulate the relay's PublishStarted for each name).
+        // Publish both (simulate the relay's PublishStarted for each root).
         app.on_net_event(NetEvent::PublishStarted {
             share_id: "idA".to_owned(),
+            root: dir_a.clone(),
             name: "Share A again".to_owned(),
             file_count: 1,
         });
         app.on_net_event(NetEvent::PublishStarted {
             share_id: "idB".to_owned(),
+            root: dir_b.clone(),
             name: "Share B".to_owned(),
             file_count: 1,
         });
@@ -3615,7 +3670,7 @@ mod tests {
             share_id: "idB".to_owned(),
         });
         assert_eq!(app.published().len(), 1, "only B unpublished");
-        assert_eq!(app.published()[0].0, "idA", "A is still served");
+        assert_eq!(app.published()[0].share_id, "idA", "A is still served");
 
         let _ = std::fs::remove_dir_all(&dir_a);
         let _ = std::fs::remove_dir_all(&dir_b);
@@ -3654,6 +3709,140 @@ mod tests {
             .expect("[p] queues a publish of the selected share");
         assert_eq!(req.name, "Beta", "publishes the selected, not the first");
         assert_eq!(req.root, dir_b);
+
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    // ── M16 smoke fixes: publish idempotency (ISC-A-C34) + `[`/`]` echo ──
+
+    /// A second `[p]` on an already-published share is a status-hint no-op —
+    /// both against a live `published` entry and against a still-queued
+    /// in-flight request (ISC-A-C34).
+    #[test]
+    fn second_p_on_a_published_share_is_a_guarded_noop() {
+        let mut app = drive_to_main();
+        let dir = std::env::temp_dir().join("ds-ac34-guard");
+        std::fs::create_dir_all(&dir).expect("mk dir");
+
+        for _ in 0..4 {
+            app.on_key(press(KeyCode::Tab));
+        }
+        assert_eq!(app.main_focus(), MainFocus::DefineShare);
+        for ch in format!("{}|Guarded", dir.display()).chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        app.on_key(press(KeyCode::Enter));
+        let _ = app.take_pending_share_define();
+        assert_eq!(app.main_focus(), MainFocus::Shares);
+
+        // In-flight guard: a second [p] before the binary drains the first
+        // request queues nothing new (the pending root matches).
+        app.on_key(press(KeyCode::Char('p')));
+        app.on_key(press(KeyCode::Char('p')));
+        assert!(
+            app.take_pending_publish().is_some(),
+            "first [p] queued the publish"
+        );
+        assert!(
+            app.take_pending_publish().is_none(),
+            "second [p] while in-flight queued nothing"
+        );
+
+        // Published guard: once PublishStarted lands for the root, [p] is a
+        // hint no-op until [u].
+        app.on_net_event(NetEvent::PublishStarted {
+            share_id: "id1".to_owned(),
+            root: dir.clone(),
+            name: "Guarded".to_owned(),
+            file_count: 1,
+        });
+        app.on_key(press(KeyCode::Char('p')));
+        assert!(
+            app.take_pending_publish().is_none(),
+            "[p] on a published share queues nothing (ISC-A-C34)"
+        );
+        assert!(
+            app.status()
+                .is_some_and(|s| s.contains("already published")),
+            "the no-op explains itself"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failed publish never reaches `published`, so the ISC-A-C34 guard
+    /// stays open and `[p]` is retryable after a `PublishError`.
+    #[test]
+    fn p_is_retryable_after_a_publish_error() {
+        let mut app = drive_to_main();
+        let dir = std::env::temp_dir().join("ds-ac34-retry");
+        std::fs::create_dir_all(&dir).expect("mk dir");
+
+        for _ in 0..4 {
+            app.on_key(press(KeyCode::Tab));
+        }
+        for ch in format!("{}|Retry", dir.display()).chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        app.on_key(press(KeyCode::Enter));
+        let _ = app.take_pending_share_define();
+
+        app.on_key(press(KeyCode::Char('p')));
+        assert!(app.take_pending_publish().is_some(), "first attempt queued");
+        app.on_net_event(NetEvent::PublishError {
+            message: "publish refused: relay unreachable".to_owned(),
+        });
+        app.on_key(press(KeyCode::Char('p')));
+        assert!(
+            app.take_pending_publish().is_some(),
+            "a failed publish leaves the guard open — [p] retryable"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `[`/`]` echo the My-defined selection on the status line (M16 smoke
+    /// fix) — live smoke showed the split-cursor scheme gave no feedback at
+    /// all when the user reached for the wrong keys.
+    #[test]
+    fn bracket_keys_echo_the_defined_selection() {
+        let mut app = drive_to_main();
+        let base = std::env::temp_dir();
+        let dir_a = base.join("ds-echo-a");
+        let dir_b = base.join("ds-echo-b");
+        std::fs::create_dir_all(&dir_a).expect("mk dir a");
+        std::fs::create_dir_all(&dir_b).expect("mk dir b");
+
+        for _ in 0..4 {
+            app.on_key(press(KeyCode::Tab));
+        }
+        for ch in format!("{}|First", dir_a.display()).chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        app.on_key(press(KeyCode::Enter));
+        let _ = app.take_pending_share_define();
+        app.on_key(press(KeyCode::Tab));
+        for ch in format!("{}|Second", dir_b.display()).chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        app.on_key(press(KeyCode::Enter));
+        let _ = app.take_pending_share_define();
+
+        app.on_key(press(KeyCode::Char(']')));
+        assert!(
+            app.status()
+                .is_some_and(|s| s.contains("2/2") && s.contains("Second")),
+            "`]` echoes the new selection, got {:?}",
+            app.status()
+        );
+        app.on_key(press(KeyCode::Char('[')));
+        assert!(
+            app.status()
+                .is_some_and(|s| s.contains("1/2") && s.contains("First")),
+            "`[` echoes the new selection, got {:?}",
+            app.status()
+        );
 
         let _ = std::fs::remove_dir_all(&dir_a);
         let _ = std::fs::remove_dir_all(&dir_b);

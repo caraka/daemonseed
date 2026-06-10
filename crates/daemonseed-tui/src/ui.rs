@@ -694,14 +694,15 @@ fn render_my_shares_pane(app: &App, frame: &mut Frame, area: Rect) {
         );
     } else {
         lines.push(
-            Line::from("defined shares  ([[/]] select · [p] publish · [u] unpublish):".to_owned())
+            Line::from("defined shares  ([ / ] select · [p] publish · [u] unpublish):".to_owned())
                 .style(Style::default().fg(Color::DarkGray)),
         );
-        let served_names: std::collections::BTreeSet<&str> =
-            app.published().iter().map(|(_, n)| n.as_str()).collect();
-        for (i, (_, name)) in app.defined_shares().iter().enumerate() {
+        for (i, (root, name)) in app.defined_shares().iter().enumerate() {
             let marker = if i == app.defined_sel() { "▶ " } else { "  " };
-            let pub_marker = if served_names.contains(name.as_str()) {
+            // Marker per defined ROW by root (M16 smoke fix, ISC-A-C34) — the
+            // old name-keyed dedup rendered two live serve tasks as one
+            // marker, hiding an accidental double-publish from the publisher.
+            let pub_marker = if app.published().iter().any(|p| &p.root == root) {
                 "  ● published"
             } else {
                 ""

@@ -276,7 +276,7 @@ public_types:
       - "fn defined_shares(&self) -> &[(PathBuf, String)]  # M16 C1 (ISC-C69) — every defined share root + display name (dedup by root; restored in full across Unlock); the My-defined list in the Shares pane"
       - "fn defined_sel(&self) -> usize                     # M16 C1 — selection cursor into defined_shares ([ / ] move it in the Shares pane)"
       - "fn selected_defined_share(&self) -> Option<&(PathBuf, String)>  # M16 C1 (ISC-C69) — the currently-selected (root, name); what [p]/[u] act on; None until DefineShare succeeds"
-      - "fn published(&self) -> &[(String, String)]        # M15 shares being served this session (share_id, name)"
+      - "fn published(&self) -> &[PublishedShare]          # shares being served this session, keyed by defined root (M16 smoke fix, ISC-A-C34) — drives the [p] idempotency guard and the per-row ● marker; PublishedShare { share_id, root, name }, root is client-local plumbing echoed in NetEvent::PublishStarted, never on the wire"
       - "fn take_pending_publish(&mut self) -> Option<PublishRequest>  # M15 — drained into NetCommand::PublishShare"
       - "fn take_pending_unpublish(&mut self) -> Option<String>  # M15 — drained into NetCommand::UnpublishShare (the share_id)"
       - "fn fetched_shares(&self) -> &[daemonseed_core::storage::fetched::FetchedShare]  # M15 — persisted download list for the Fetched browse pane (ISC-C64)"

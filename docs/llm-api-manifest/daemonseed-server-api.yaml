@@ -295,7 +295,12 @@ modules:
       keyed by a server-assigned opaque share_id and tagged with the publishing
       connection's owner token. publish/unpublish/list back the PublicSpace
       PublishShare / UnpublishShare / ListPublicShares RPCs; unpublish and reap
-      are owner-scoped. ShareReapGuard reaps a connection's shares on disconnect
+      are owner-scoped. publish returns Option<share_id> — None refuses a
+      duplicate (owner, name) publish (M16 smoke fix, ISC-A-C34 backstop:
+      refused, never replaced, so a name reused across two distinct shares is
+      a visible error instead of a silent lost listing; the key is
+      per-connection, different daemons can share a name; the RPC maps None to
+      ALREADY_EXISTS). ShareReapGuard reaps a connection's shares on disconnect
       (mirrors the CoT ReleaseGuard) so nothing survives the connection. The
       relay is a blind forwarder: self-asserted name/rating/handle relayed
       verbatim, never policed (ISC-A-S5b / ISC-C19), never bound to identity.

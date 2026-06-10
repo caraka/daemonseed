@@ -813,7 +813,13 @@ impl PublicSpace for PublicSpaceService {
             .into_inner()
             .listing
             .ok_or_else(|| Status::invalid_argument("missing listing"))?;
-        let share_id = self.shares.publish(self.owner, listing);
+        // Duplicate (owner, name) → refused, not replaced (M16 smoke fix,
+        // ISC-A-C34 backstop) — see SharePublishRegistry::publish.
+        let share_id = self.shares.publish(self.owner, listing).ok_or_else(|| {
+            Status::already_exists(
+                "a share with this name is already published on this connection — unpublish it first",
+            )
+        })?;
         Ok(Response::new(wire::PublishShareResponse { share_id }))
     }
 

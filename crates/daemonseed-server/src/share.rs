@@ -99,8 +99,22 @@ impl SharePublishRegistry {
     /// server-scoped (ISC-C19 / F25) and CSPRNG-drawn, not order-derived
     /// (ISC-S21 / ISC-A-S15). On the astronomically-unlikely collision the draw
     /// retries, so the returned id is always unique in the live registry.
-    pub fn publish(&self, owner: OwnerId, mut listing: PublicShareListing) -> String {
+    ///
+    /// Duplicate backstop (M16 smoke fix, ISC-A-C34): at most one live listing
+    /// per `(owner, name)` — a duplicate publish returns `None` (REFUSED, not
+    /// replaced: replacing would silently drop a distinct share that happens
+    /// to reuse a display name, turning a visible duplicate into an invisible
+    /// loss). The publishing client's root-keyed `[p]` guard is the primary
+    /// defense; this is depth. The name key is per-connection only, so two
+    /// different daemons can still publish the same share name.
+    pub fn publish(&self, owner: OwnerId, mut listing: PublicShareListing) -> Option<String> {
         let mut g = self.lock();
+        if g.shares
+            .values()
+            .any(|s| s.owner == owner && s.listing.name == listing.name)
+        {
+            return None;
+        }
         let share_id = loop {
             let candidate = random_share_id();
             if !g.shares.contains_key(&candidate) {
@@ -110,7 +124,7 @@ impl SharePublishRegistry {
         listing.share_id = share_id.clone();
         g.shares
             .insert(share_id.clone(), OwnedShare { owner, listing });
-        share_id
+        Some(share_id)
     }
 
     /// Unpublish `share_id` iff it is owned by `owner`. Returns whether a share
@@ -191,7 +205,9 @@ mod tests {
     fn publish_assigns_id_and_lists() {
         let reg = SharePublishRegistry::new();
         let owner = reg.new_owner();
-        let id = reg.publish(owner, listing("docs", "a#0123456789ab"));
+        let id = reg
+            .publish(owner, listing("docs", "a#0123456789ab"))
+            .expect("fresh publish accepted");
         assert!(!id.is_empty());
 
         let shares = reg.list();
@@ -210,7 +226,7 @@ mod tests {
         let owner = reg.new_owner();
         let mut l = listing("docs", "a#0123456789ab");
         l.share_id = "client-tried-to-pick-this".to_owned();
-        let id = reg.publish(owner, l);
+        let id = reg.publish(owner, l).expect("fresh publish accepted");
         assert_ne!(id, "client-tried-to-pick-this", "share_id is server-scoped");
         assert_eq!(reg.list()[0].share_id, id);
     }
@@ -219,7 +235,9 @@ mod tests {
     fn unpublish_by_owner_removes_the_share() {
         let reg = SharePublishRegistry::new();
         let owner = reg.new_owner();
-        let id = reg.publish(owner, listing("docs", "a#0123456789ab"));
+        let id = reg
+            .publish(owner, listing("docs", "a#0123456789ab"))
+            .expect("fresh publish accepted");
         assert!(reg.unpublish(owner, &id));
         assert_eq!(reg.live_count(), 0);
     }
@@ -231,10 +249,54 @@ mod tests {
         let reg = SharePublishRegistry::new();
         let alice = reg.new_owner();
         let bob = reg.new_owner();
-        let id = reg.publish(alice, listing("docs", "alice#0123456789ab"));
+        let id = reg
+            .publish(alice, listing("docs", "alice#0123456789ab"))
+            .expect("fresh publish accepted");
         assert!(!reg.unpublish(bob, &id), "other owner cannot unpublish");
         assert_eq!(reg.live_count(), 1, "share survives the foreign unpublish");
         assert!(reg.unpublish(alice, &id), "the owner still can");
+    }
+
+    #[test]
+    fn duplicate_publish_same_owner_name_is_refused_not_replaced() {
+        // ISC-A-C34 backstop: a second live listing for the same (owner, name)
+        // is refused — and crucially the FIRST listing survives untouched
+        // (replace semantics would silently drop a distinct share that merely
+        // reuses a display name).
+        let reg = SharePublishRegistry::new();
+        let owner = reg.new_owner();
+        let first = reg
+            .publish(owner, listing("docs", "a#0123456789ab"))
+            .expect("fresh publish accepted");
+        assert!(
+            reg.publish(owner, listing("docs", "a#0123456789ab"))
+                .is_none(),
+            "duplicate (owner, name) refused"
+        );
+        let shares = reg.list();
+        assert_eq!(shares.len(), 1, "exactly one live listing");
+        assert_eq!(shares[0].share_id, first, "the original listing survives");
+        // After unpublish the name is free again — refusal is live-state only.
+        assert!(reg.unpublish(owner, &first));
+        assert!(
+            reg.publish(owner, listing("docs", "a#0123456789ab"))
+                .is_some(),
+            "re-publish after unpublish accepted"
+        );
+    }
+
+    #[test]
+    fn same_name_different_owner_both_publish() {
+        // The (owner, name) key is per-connection: two daemons can publish
+        // shares with the same display name — dedup never crosses owners.
+        let reg = SharePublishRegistry::new();
+        let alice = reg.new_owner();
+        let bob = reg.new_owner();
+        reg.publish(alice, listing("docs", "alice#0123456789ab"))
+            .expect("fresh publish accepted");
+        reg.publish(bob, listing("docs", "bob#0123456789ab"))
+            .expect("same name under another owner accepted");
+        assert_eq!(reg.live_count(), 2);
     }
 
     #[test]
@@ -249,9 +311,13 @@ mod tests {
         let reg = SharePublishRegistry::new();
         let alice = reg.new_owner();
         let bob = reg.new_owner();
-        reg.publish(alice, listing("a1", "alice#0123456789ab"));
-        reg.publish(alice, listing("a2", "alice#0123456789ab"));
-        let bob_share = reg.publish(bob, listing("b1", "bob#0123456789ab"));
+        reg.publish(alice, listing("a1", "alice#0123456789ab"))
+            .expect("fresh publish accepted");
+        reg.publish(alice, listing("a2", "alice#0123456789ab"))
+            .expect("fresh publish accepted");
+        let bob_share = reg
+            .publish(bob, listing("b1", "bob#0123456789ab"))
+            .expect("fresh publish accepted");
 
         reg.reap_owner(alice);
         let remaining = reg.list();
@@ -269,7 +335,9 @@ mod tests {
         // encoded — exactly 32 hex chars, never an order-derived counter.
         let reg = SharePublishRegistry::new();
         let owner = reg.new_owner();
-        let id = reg.publish(owner, listing("docs", "a#0123456789ab"));
+        let id = reg
+            .publish(owner, listing("docs", "a#0123456789ab"))
+            .expect("fresh publish accepted");
         assert_eq!(id.len(), 32, "128-bit id is 32 hex chars");
         assert!(
             id.chars()
@@ -285,8 +353,12 @@ mod tests {
         // cannot walk the published-share space.
         let reg = SharePublishRegistry::new();
         let owner = reg.new_owner();
-        let first = reg.publish(owner, listing("a", "a#0123456789ab"));
-        let second = reg.publish(owner, listing("b", "a#0123456789ab"));
+        let first = reg
+            .publish(owner, listing("a", "a#0123456789ab"))
+            .expect("fresh publish accepted");
+        let second = reg
+            .publish(owner, listing("b", "a#0123456789ab"))
+            .expect("fresh publish accepted");
         assert_ne!(first, "0000000000000000", "id is not the counter origin");
         assert_ne!(first, second, "distinct shares get distinct ids");
         // Adjacent-counter check: the two ids, parsed as integers, are not n / n+1.
@@ -302,8 +374,11 @@ mod tests {
         let reg = SharePublishRegistry::new();
         let owner = reg.new_owner();
         let mut seen = std::collections::HashSet::new();
-        for _ in 0..1_000 {
-            let id = reg.publish(owner, listing("docs", "a#0123456789ab"));
+        for i in 0..1_000 {
+            // Distinct names — one live listing per (owner, name) (ISC-A-C34).
+            let id = reg
+                .publish(owner, listing(&format!("docs{i}"), "a#0123456789ab"))
+                .expect("fresh publish accepted");
             assert_eq!(id.len(), 32);
             assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
             assert!(seen.insert(id), "every assigned id is unique");
@@ -317,7 +392,8 @@ mod tests {
         // shares (ISC-A-S1 ephemerality).
         let reg = SharePublishRegistry::new();
         let owner = reg.new_owner();
-        reg.publish(owner, listing("docs", "a#0123456789ab"));
+        reg.publish(owner, listing("docs", "a#0123456789ab"))
+            .expect("fresh publish accepted");
         assert_eq!(reg.live_count(), 1);
         {
             let _guard = ShareReapGuard::new(reg.clone(), owner);
