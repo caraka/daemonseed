@@ -203,16 +203,19 @@ fn render_fetch_overlay(f: &FetchUi, frame: &mut Frame, area: Rect) {
     let inner = outer.inner(popup);
     frame.render_widget(outer, popup);
 
-    // Preview (ISC-C72): [header, tree list, footer] — the header is fixed and
-    // the collapsible tree gets a dedicated scrollable pane (so the cursor stays
-    // visible). Transfer: [info, gauge, footer]. Splitting the layout this way
-    // lets the file list claim the rows the gauge would otherwise hold.
+    // Preview (ISC-C72): [header, key hint, tree list, footer] — the header is
+    // fixed, a one-line dim key hint sits inside the box (M16 — `a` existed but
+    // was undiscoverable in live use), and the collapsible tree gets a dedicated
+    // scrollable pane (so the cursor stays visible). Transfer: [info, gauge,
+    // footer]. Splitting the layout this way lets the file list claim the rows
+    // the gauge would otherwise hold.
     const PREVIEW_HEADER_ROWS: u16 = 6; // share / by / blank / selected / dest / blank
     let rows = if is_preview {
         Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(PREVIEW_HEADER_ROWS), // header
+                Constraint::Length(1),                   // key hint (dim)
                 Constraint::Min(1),                      // tree list (scrolls)
                 Constraint::Length(1),                   // footer
             ])
@@ -262,7 +265,17 @@ fn render_fetch_overlay(f: &FetchUi, frame: &mut Frame, area: Rect) {
                     .style(Style::default().fg(color)),
                 rows[0],
             );
-            render_preview_tree(f, frame, rows[1], color);
+            // One-line key hint inside the preview box (M16): the Shares-pane
+            // dim-hint convention, answering the live UX complaint that `a`
+            // (select all/none) was undiscoverable.
+            frame.render_widget(
+                Paragraph::new(
+                    "space toggle · a all/none · →/← fold · d dest · Enter fetch · Esc cancel",
+                )
+                .style(Style::default().fg(Color::DarkGray)),
+                rows[1],
+            );
+            render_preview_tree(f, frame, rows[2], color);
         }
         _ => {
             let info = format!(
@@ -311,9 +324,9 @@ fn render_fetch_overlay(f: &FetchUi, frame: &mut Frame, area: Rect) {
         );
     }
 
-    // Footer is always the last row: row 2 in the preview's 3-row layout, row 2
+    // Footer is always the last row: row 3 in the preview's 4-row layout, row 2
     // when the gauge is present.
-    let footer_row = rows[2];
+    let footer_row = *rows.last().expect("overlay layout has rows");
     frame.render_widget(
         Paragraph::new(footer)
             .alignment(Alignment::Center)

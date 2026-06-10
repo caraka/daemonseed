@@ -10,11 +10,13 @@
 //!
 //! ## At-rest posture — plaintext named downloads (M15 cleanup, 2026-06-06)
 //!
-//! A fetched chunk is the **plaintext file bytes** the sharer indexed
-//! ([`crate::share_serve::ShareContent::index_dir`] reads each file and stores
-//! its raw bytes). The fetcher writes those bytes back out under the file's
-//! original `rel_path`, so a download is just *the files the user fetched, named
-//! the way they were shared*. This is a deliberately larger at-rest surface than
+//! A fetched chunk is a **plaintext byte run of a shared file** as the sharer
+//! indexed it (since M16 a file is split into fixed
+//! [`crate::share_serve::CHUNK_SIZE`] chunks of its raw bytes — ISC-C73 /
+//! ISC-A-C35). The fetcher verifies each chunk, concatenates them in manifest
+//! order, and writes the file back out under its original `rel_path`, so a
+//! download is just *the files the user fetched, named the way they were
+//! shared*. This is a deliberately larger at-rest surface than
 //! the rest of the client (ISC-A-C1) — downloaded files are user-chosen
 //! artifacts, not message/post/session history, so the no-client-history
 //! invariant holds; the surface is the R-PANIC erasure target.

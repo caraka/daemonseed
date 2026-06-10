@@ -605,6 +605,7 @@ dependencies = [
  "oxicrypt-module",
  "oxitls-rustls-provider",
  "ratatui",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tonic",

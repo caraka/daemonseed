@@ -101,16 +101,18 @@ async fn fetcher_recovers_share_via_manifest_then_chunks() {
     let asset_bytes = asset_addr.as_bytes().to_vec();
 
     // ── Sharer task: subscribe + serve manifest + serve chunks ────────────
+    // M16 (ISC-C73 / ISC-A-C35): an entry carries its ordered chunk-address
+    // list; these sub-CHUNK_SIZE fixtures are one chunk each.
     let manifest_entries = vec![
         ManifestEntry {
             rel_path: "page-1.txt".to_owned(),
-            chunk_addr: addr_a,
             size: file_a.len() as u64,
+            chunks: vec![addr_a],
         },
         ManifestEntry {
             rel_path: "page-2.txt".to_owned(),
-            chunk_addr: addr_b,
             size: file_b.len() as u64,
+            chunks: vec![addr_b],
         },
     ];
     let chunks: std::collections::HashMap<[u8; 48], Vec<u8>> = [
@@ -206,43 +208,44 @@ async fn fetcher_recovers_share_via_manifest_then_chunks() {
     assert_eq!(manifest[0].rel_path, "page-1.txt");
     assert_eq!(manifest[1].rel_path, "page-2.txt");
 
-    // Per-entry chunk fetch + ISC-19 verification (recompute SHA-384).
+    // Per-entry chunk fetch + ISC-19 verification (recompute SHA-384). M16:
+    // a file is its ordered chunk list — fetch each chunk in order and
+    // concatenate (one chunk each for these small fixtures).
     let mut recovered: Vec<(String, Vec<u8>)> = Vec::new();
     for entry in &manifest {
-        tx.send(frame(
-            &asset_bytes,
-            ShareFrame::ChunkRequest {
-                chunk_addr: entry.chunk_addr,
-            }
-            .encode(),
-        ))
-        .await
-        .unwrap();
-        let chunk = loop {
-            let resp = tokio::time::timeout(Duration::from_secs(5), inbound.message())
-                .await
-                .expect("chunk within timeout")
-                .expect("stream healthy")
-                .expect("frame, not end-of-stream");
-            if resp.payload.is_empty() {
-                continue;
-            }
-            match ShareFrame::decode(&resp.payload).expect("chunk decodes") {
-                ShareFrame::ChunkResponse { chunk_addr, data }
-                    if chunk_addr == entry.chunk_addr =>
-                {
-                    break (chunk_addr, data);
+        let mut file_bytes = Vec::new();
+        for addr in &entry.chunks {
+            tx.send(frame(
+                &asset_bytes,
+                ShareFrame::ChunkRequest { chunk_addr: *addr }.encode(),
+            ))
+            .await
+            .unwrap();
+            let chunk = loop {
+                let resp = tokio::time::timeout(Duration::from_secs(5), inbound.message())
+                    .await
+                    .expect("chunk within timeout")
+                    .expect("stream healthy")
+                    .expect("frame, not end-of-stream");
+                if resp.payload.is_empty() {
+                    continue;
                 }
-                _ => continue,
-            }
-        };
-        // ISC-19 / F23: re-derive SHA-384 and reject on mismatch.
-        let recomputed = chunk_addr(&chunk.1).expect("recompute hash");
-        assert_eq!(
-            recomputed, chunk.0,
-            "fetcher verifies chunk content against advertised address"
-        );
-        recovered.push((entry.rel_path.clone(), chunk.1));
+                match ShareFrame::decode(&resp.payload).expect("chunk decodes") {
+                    ShareFrame::ChunkResponse { chunk_addr, data } if chunk_addr == *addr => {
+                        break (chunk_addr, data);
+                    }
+                    _ => continue,
+                }
+            };
+            // ISC-19 / F23: re-derive SHA-384 and reject on mismatch.
+            let recomputed = chunk_addr(&chunk.1).expect("recompute hash");
+            assert_eq!(
+                recomputed, chunk.0,
+                "fetcher verifies chunk content against advertised address"
+            );
+            file_bytes.extend_from_slice(&chunk.1);
+        }
+        recovered.push((entry.rel_path.clone(), file_bytes));
     }
 
     assert_eq!(recovered[0].1, file_a, "page 1 byte-identical");

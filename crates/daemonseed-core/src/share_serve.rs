@@ -14,11 +14,11 @@
 //! [`ShareContent`] is that reusable serve side, factored out of the test:
 //!
 //! 1. [`ShareContent::index_dir`] walks a directory, reads each regular file,
-//!    chunks it into a [`crate::storage::cas::MemoryChunkStore`]
-//!    (one chunk per file for the alpha — multi-chunk-per-file is post-MVP,
-//!    layered on without wire change), and records a [`ManifestEntry`] per file.
-//!    The chunk's address is `SHA-384(file-bytes)` — the same content address
-//!    the fetcher re-derives and verifies (ISC-S28).
+//!    splits it into fixed [`CHUNK_SIZE`] chunks (M16 — see below), stores
+//!    each chunk in a [`crate::storage::cas::MemoryChunkStore`], and records
+//!    a [`ManifestEntry`] per file carrying the **ordered** per-chunk address
+//!    list. Each address is `SHA-384(chunk-bytes)` — the same content address
+//!    the fetcher re-derives and verifies per chunk (ISC-S28).
 //! 2. [`ShareContent::answer`] is the **pure** request → response step: given a
 //!    decoded inbound `ShareFrame`, it returns the `ShareFrame` to relay back
 //!    (a `ManifestResponse` for a `ManifestRequest`, a `ChunkResponse` for a
@@ -50,27 +50,43 @@
 //! the content is *temporarily unavailable*, never served stale by the relay.
 //!
 //! Every chunk the serve side returns is, by construction, addressed by its own
-//! `SHA-384` (it was stored under `chunk_addr(file-bytes)`), so a faithful relay
+//! `SHA-384` (it was stored under `chunk_addr(chunk-bytes)`), so a faithful relay
 //! forward passes the fetcher's re-derived-hash verification; a relay that
 //! tampers with the bytes in flight fails it (ISC-A-S20, proved fetcher-side).
+//!
+//! ## Sub-file fixed-size chunking (M16 — ISC-C73 / ISC-A-C35)
+//!
+//! The alpha's chunk == whole file put an entire file's bytes into ONE
+//! `ChunkResponse`, hence one gRPC frame: an 8.9 MB file exceeded tonic's
+//! default 4 MB per-message decode cap at the relay and the fetch hung — the
+//! live gap this module closes. Every file is now split into fixed
+//! [`CHUNK_SIZE`] (1 MiB) chunks: chunk `i` covers
+//! `[i*CHUNK_SIZE, min((i+1)*CHUNK_SIZE, size))`, so only the last chunk may
+//! be short, and an empty file has no chunks at all. That keeps every frame
+//! relay-safe regardless of file size, makes serve and fetch O(CHUNK_SIZE)
+//! in memory, and makes the fetcher's per-chunk SHA-384 verification cheap.
+//! The relay never decodes `CotFrame.payload` (ISC-A-S2), so deployed relays
+//! keep working unchanged; the manifest encoding changed in place — see the
+//! [`crate::share_envelope`] module docs for the alpha-compat waiver.
 //!
 //! ## Disk-backed serving (M16)
 //!
 //! [`ShareContent::index_dir`] reads every file into RAM, which caps a share
 //! at available memory. The disk-backed path replaces that for the publish
-//! flow while keeping the wire and the fetcher untouched:
+//! flow while keeping the fetcher's verification untouched:
 //!
 //! 1. [`hash_share`] walks the same deterministic file order as `index_dir`
-//!    but only *hashes* each file — streaming through a fixed buffer, never a
-//!    whole-file read — producing a [`ShareManifest`] whose per-file
-//!    `chunk_addr` is byte-identical to what `MemoryChunkStore::put` derives
-//!    for the same bytes (one SHA-384 over the file's full content), so the
-//!    fetch-side verification is unchanged. It is cancellable between files
-//!    and reports per-file progress.
+//!    but only *hashes* each file — one [`CHUNK_SIZE`] buffer at a time,
+//!    never a whole-file read — producing a [`ShareManifest`] whose per-chunk
+//!    addresses are byte-identical to what `MemoryChunkStore::put` derives
+//!    for the same chunk bytes, so the fetch-side verification is unchanged
+//!    (ISC-S28). It is cancellable between files **and between chunks** of a
+//!    large file, and reports per-file progress.
 //! 2. [`DiskShareContent`] pairs that manifest with the share root and reads
-//!    a requested chunk's one file from disk at answer time, with **cheap**
-//!    fail-closed checks only (a read error, or a byte length that no longer
-//!    matches the manifest entry — [`ServeError::ChunkModified`]). There is
+//!    a requested chunk's [`CHUNK_SIZE`]-bounded byte range from disk at
+//!    answer time (seek + exact-length read), with **cheap** fail-closed
+//!    checks only (a read error, or a length that no longer matches the
+//!    manifest entry — [`ServeError::ChunkModified`]). There is
 //!    deliberately no serve-time re-hash: the fetcher re-derives SHA-384 over
 //!    every `ChunkResponse` and fails closed on mismatch (ISC-S28), so
 //!    receiver-side verification is the integrity guarantee — see
@@ -82,20 +98,61 @@
 //! [`DiskShareContent`] implement, so a transport driver serves either.
 
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use oxicrypt_sha::Sha384;
 use walkdir::WalkDir;
 
 use crate::share_envelope::{ManifestEntry, ShareFrame};
-use crate::storage::cas::{CHUNK_ADDR_LEN, CasError, ChunkAddr, ChunkStore, MemoryChunkStore};
+use crate::storage::cas::{
+    CHUNK_ADDR_LEN, CasError, ChunkAddr, ChunkStore, MemoryChunkStore, chunk_addr,
+};
 
-/// Fixed buffer length for the streaming per-file hash pass (1 MiB). Files
-/// are fed through this buffer in [`hash_file`] — never read whole into
-/// memory — so the hash pass's footprint is independent of file size.
-const HASH_BUF_LEN: usize = 1024 * 1024;
+/// Fixed share-chunk size: 1 MiB (M16 — ISC-C73 / ISC-A-C35). Every file is
+/// split into chunks of exactly this many bytes (only the last chunk of a
+/// file may be short), and one chunk rides in one `ChunkResponse`, hence one
+/// gRPC frame. This MUST stay well under tonic's default 4 MB per-message
+/// decode cap — including the `CotFrame` envelope overhead (asset address,
+/// `ShareFrame` header, protobuf framing) — because the relay decodes the
+/// *outer* `CotFrame` even though it never looks inside the payload: a chunk
+/// that pushes the outer message past the cap stalls the fetch at the relay
+/// (the exact 8.9 MB-file failure that motivated M16 chunking).
+pub const CHUNK_SIZE: usize = 1024 * 1024;
+
+/// The largest encoded `ManifestResponse` a publisher may put on the wire
+/// (M16 design review). [`CHUNK_SIZE`] keeps every *content* frame under
+/// tonic's default 4 MiB (4_194_304 bytes) per-message decode cap at the
+/// relay — but the MANIFEST frame itself grows with file count (~62 bytes +
+/// path per entry), so a file-count-dense share (a music library is exactly
+/// this shape) would reproduce the same silent publish-stall for the
+/// manifest that chunking fixed for content. 3_500_000 leaves ~694 KB of
+/// headroom under the cap for the `CotFrame` envelope around the
+/// `ShareFrame` (asset address, protobuf field/length framing) plus margin
+/// against a relay configured tighter. The publish flow checks
+/// [`manifest_frame_len`] against this BEFORE advertising the listing and
+/// refuses loudly — never a silent stall.
+pub const MANIFEST_FRAME_BUDGET: usize = 3_500_000;
+
+/// The exact byte length of the encoded `ShareFrame::ManifestResponse`
+/// carrying `manifest`'s entries — what the manifest's wire frame will
+/// weigh, computed WITHOUT building the (potentially multi-megabyte)
+/// buffer.
+///
+/// Mirrors the [`crate::share_envelope`] entry encoding exactly:
+/// `[1 kind][u32 count]` + per entry `[u16 path-len][path bytes][u64 size]
+/// [u32 chunk_count][48-byte addr × chunk_count]`. The unit test
+/// `manifest_frame_len_matches_real_encoding` pins this arithmetic to
+/// `ShareFrame::encode`'s actual output length, so the two cannot drift
+/// silently.
+pub fn manifest_frame_len(manifest: &ShareManifest) -> usize {
+    1 + 4
+        + manifest
+            .entries
+            .iter()
+            .map(|e| 2 + e.rel_path.len() + 8 + 4 + e.chunks.len() * CHUNK_ADDR_LEN)
+            .sum::<usize>()
+}
 
 /// An indexed, in-memory view of a shared directory ready to answer
 /// share-fetch requests. Holds the manifest (one [`ManifestEntry`] per file)
@@ -167,13 +224,20 @@ impl core::error::Error for ServeError {
 }
 
 impl ShareContent {
-    /// Walk `root`, chunk every regular file beneath it into the content store,
-    /// and build the manifest. One file = one chunk (the alpha; multi-chunk is
-    /// post-MVP). The manifest's `rel_path` is the file's path relative to
-    /// `root`, using `/` separators on every platform so the wire form is
-    /// stable; an unreadable file aborts the index (a sharer must know its own
-    /// content is complete before advertising it — unlike the relay-side
-    /// indexer's skip-and-continue posture).
+    /// Walk `root`, chunk every regular file beneath it into the content store
+    /// in fixed [`CHUNK_SIZE`] pieces (M16 — ISC-C73 / ISC-A-C35), and build
+    /// the manifest (one entry per file, ordered per-chunk addresses; an
+    /// empty file gets `chunks: []`). The manifest's `rel_path` is the file's
+    /// path relative to `root`, using `/` separators on every platform so the
+    /// wire form is stable; an unreadable file aborts the index (a sharer
+    /// must know its own content is complete before advertising it — unlike
+    /// the relay-side indexer's skip-and-continue posture).
+    ///
+    /// This RAM path is kept for tests and the CLI's small shares — it still
+    /// holds every chunk's bytes in memory. The disk-backed
+    /// [`DiskShareContent`] is the O(CHUNK_SIZE)-memory publish path. The
+    /// parity test `hash_share_matches_index_dir` pins both paths to
+    /// byte-identical manifests.
     pub fn index_dir(root: impl AsRef<Path>) -> Result<Self, ServeError> {
         let root = root.as_ref();
         let mut store = MemoryChunkStore::new();
@@ -181,18 +245,25 @@ impl ShareContent {
 
         for entry in share_files(root) {
             let bytes = std::fs::read(entry.path()).map_err(ServeError::Io)?;
-            let addr = store.put(&bytes).map_err(ServeError::Cas)?;
+            // Same boundaries as the streaming hash pass: chunk i covers
+            // [i*CHUNK_SIZE, min((i+1)*CHUNK_SIZE, size)); empty file → no
+            // chunks. `MemoryChunkStore::put` derives SHA-384 over exactly
+            // the chunk slice, so both paths agree address-for-address.
+            let mut chunks = Vec::with_capacity(bytes.len().div_ceil(CHUNK_SIZE));
+            for chunk in bytes.chunks(CHUNK_SIZE) {
+                chunks.push(store.put(chunk).map_err(ServeError::Cas)?);
+            }
             manifest.push(ManifestEntry {
                 rel_path: share_rel_path(root, &entry),
-                chunk_addr: addr,
                 size: bytes.len() as u64,
+                chunks,
             });
         }
 
         Ok(Self { manifest, store })
     }
 
-    /// The number of files in the share (one chunk per file, alpha).
+    /// The number of files in the share (manifest entries, not chunks).
     pub fn file_count(&self) -> usize {
         self.manifest.len()
     }
@@ -290,19 +361,22 @@ pub struct ShareManifest {
 }
 
 /// Walk `root`, hashing every regular file beneath it into a [`ShareManifest`]
-/// **without ever holding a whole file in memory** — each file streams through
-/// a fixed [`HASH_BUF_LEN`] buffer into SHA-384. The resulting `chunk_addr`
-/// per file is byte-identical to what [`ShareContent::index_dir`] (via
-/// `MemoryChunkStore::put`) derives for the same bytes — one SHA-384 over the
-/// file's full content — so fetch-side verification is unchanged (ISC-S28).
+/// **without ever holding a whole file in memory** — each file is read one
+/// [`CHUNK_SIZE`] buffer at a time, and each buffer-load IS one chunk, hashed
+/// to its own SHA-384 address (M16 — ISC-C73 / ISC-A-C35). The resulting
+/// per-chunk addresses are byte-identical to what [`ShareContent::index_dir`]
+/// (via `MemoryChunkStore::put`) derives for the same chunk bytes, so
+/// fetch-side verification is unchanged (ISC-S28).
 ///
 /// Two passes: the file list is collected first so `progress(done, total)`
 /// reports a stable total from the first callback; then each file is hashed,
-/// with `progress` invoked after every file. `cancel` is checked between
-/// files — a set flag aborts with [`ServeError::Cancelled`] (no partial
-/// manifest). An unreadable file aborts the pass, same posture as
-/// `index_dir`: a sharer must know its own content is complete before
-/// advertising it.
+/// with `progress` invoked after every file — progress stays **per-file**
+/// (a chunk is an internal unit, not a UX one). `cancel` is checked between
+/// files and **between chunks** of a large file — a multi-GB file must not
+/// pin the pass against a cancel request — and a set flag aborts with
+/// [`ServeError::Cancelled`] (no partial manifest). An unreadable file aborts
+/// the pass, same posture as `index_dir`: a sharer must know its own content
+/// is complete before advertising it.
 pub fn hash_share(
     root: &Path,
     cancel: &AtomicBool,
@@ -313,19 +387,16 @@ pub fn hash_share(
     let total = files.len();
     let mut entries = Vec::with_capacity(total);
 
-    // Pass 2: stream-hash each file.
+    // Pass 2: stream-hash each file, chunk by chunk.
     for (done, entry) in files.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             return Err(ServeError::Cancelled);
         }
-        let size = entry
-            .metadata()
-            .map_err(|e| ServeError::Io(e.into()))?
-            .len();
+        let (chunks, size) = hash_file_chunks(entry.path(), cancel)?;
         entries.push(ManifestEntry {
             rel_path: share_rel_path(root, entry),
-            chunk_addr: hash_file(entry.path())?,
             size,
+            chunks,
         });
         progress(done + 1, total);
     }
@@ -335,33 +406,36 @@ pub fn hash_share(
 
 /// Disk-backed serve content: the share root plus a hashed [`ShareManifest`]
 /// (from [`hash_share`] or `indexer::cached_or_hash`). Where [`ShareContent`]
-/// holds every file's bytes in RAM, this reads a requested chunk's **one**
-/// file from disk at answer time, so serving a share costs memory proportional
-/// to one file, not the whole share.
+/// holds every file's bytes in RAM, this reads a requested chunk's
+/// [`CHUNK_SIZE`]-bounded byte range from its one file at answer time, so
+/// serving a share costs O(CHUNK_SIZE) memory per request — never a whole
+/// file, never the whole share (M16, ISC-C73 / ISC-A-C35).
 ///
-/// Each read applies cheap fail-closed checks only — a read error, or a byte
-/// length that no longer matches the manifest entry
-/// ([`ServeError::ChunkModified`]). Content integrity is verified by the
-/// **receiver**, not re-proved here per request — see [`Self::get_chunk`].
+/// Each read applies cheap fail-closed checks only — a read error, or a
+/// length that no longer matches what the manifest entry implies for that
+/// chunk ([`ServeError::ChunkModified`]). Content integrity is verified by
+/// the **receiver**, not re-proved here per request — see [`Self::get_chunk`].
 pub struct DiskShareContent {
     root: PathBuf,
     manifest: ShareManifest,
-    /// `chunk_addr` → index into `manifest.entries`, built once so the
-    /// per-request lookup is O(1) rather than a manifest scan. Duplicate
-    /// content (two identical files) collapses to one slot — either file
-    /// serves the same bytes.
-    by_addr: HashMap<[u8; CHUNK_ADDR_LEN], usize>,
+    /// `chunk_addr` → `(entry index, chunk index within that entry)`, built
+    /// once so the per-request lookup is O(1) rather than a manifest scan.
+    /// Duplicate addresses across (or within) files keep the FIRST mapping —
+    /// CAS semantics: the same address names the same bytes, so any holder
+    /// serves identical content and one slot suffices.
+    by_addr: HashMap<[u8; CHUNK_ADDR_LEN], (usize, usize)>,
 }
 
 impl DiskShareContent {
     /// Pair a share `root` with the `manifest` a hash pass produced over it.
     pub fn new(root: PathBuf, manifest: ShareManifest) -> Self {
-        let by_addr = manifest
-            .entries
-            .iter()
-            .enumerate()
-            .map(|(i, e)| (*e.chunk_addr.as_bytes(), i))
-            .collect();
+        let mut by_addr = HashMap::new();
+        for (i, entry) in manifest.entries.iter().enumerate() {
+            for (c, addr) in entry.chunks.iter().enumerate() {
+                // First wins (CAS: same addr ⇒ same bytes — see field docs).
+                by_addr.entry(*addr.as_bytes()).or_insert((i, c));
+            }
+        }
         Self {
             root,
             manifest,
@@ -369,7 +443,7 @@ impl DiskShareContent {
         }
     }
 
-    /// The number of files in the share (one chunk per file, alpha).
+    /// The number of files in the share (manifest entries, not chunks).
     pub fn file_count(&self) -> usize {
         self.manifest.entries.len()
     }
@@ -379,38 +453,67 @@ impl DiskShareContent {
         &self.manifest.entries
     }
 
-    /// Read one chunk's file from disk, with cheap fail-closed checks only.
+    /// Read one chunk's byte range from its file on disk, with cheap
+    /// fail-closed checks only.
     ///
-    /// Locates the manifest entry by address ([`ServeError::UnknownChunk`] if
-    /// absent) and reads that one file. A read failure — the file moved or
-    /// was deleted since the hash pass, the publish-time TOCTOU — is a clean
-    /// [`ServeError::Io`], never a panic; a byte length that no longer
-    /// matches the manifest entry's size (truncation or growth) fails closed
-    /// with [`ServeError::ChunkModified`].
+    /// Locates `(file, chunk index)` by address via the prebuilt map
+    /// ([`ServeError::UnknownChunk`] if absent), opens that one file, seeks
+    /// to `chunk_index * CHUNK_SIZE`, and reads **exactly** the chunk's
+    /// manifest-implied length into a right-sized buffer — O(CHUNK_SIZE)
+    /// memory however large the file is (M16). Failure posture:
+    ///
+    /// - A read/open failure — the file moved or was deleted since the hash
+    ///   pass, the publish-time TOCTOU — is a clean [`ServeError::Io`],
+    ///   never a panic.
+    /// - A length mismatch — the file's on-disk size no longer matches the
+    ///   manifest entry, or the exact-length read comes up short — fails
+    ///   closed with [`ServeError::ChunkModified`]: we never put a
+    ///   *knowingly* wrong-length frame on the wire.
     ///
     /// Deliberately **no serve-time re-hash**: the fetcher already
     /// re-derives SHA-384 over every `ChunkResponse` and fails closed on a
     /// mismatch (M11, the file-side analog of `open_message` — ISC-S28), so
     /// receiver-side verification is the integrity guarantee. Re-hashing
-    /// here would cost a full pass over the file before the first byte goes
-    /// out on EVERY request — a multi-GB hash per fetch — and catch nothing
-    /// the receiver won't. The consequence, stated plainly: a **same-size**
+    /// here would cost a hash pass before every frame and catch nothing the
+    /// receiver won't. The consequence, stated plainly: a **same-size**
     /// content change on the sharer's own disk passes this server and is
-    /// rejected by the receiver's hash check. Re-run the hash pass and
-    /// re-publish to serve intentionally changed content.
+    /// rejected by the receiver's per-chunk hash check. Re-run the hash pass
+    /// and re-publish to serve intentionally changed content.
     pub fn get_chunk(&self, addr: &ChunkAddr) -> Result<Vec<u8>, ServeError> {
-        let &i = self
+        let &(i, c) = self
             .by_addr
             .get(addr.as_bytes())
             .ok_or(ServeError::UnknownChunk)?;
         let entry = &self.manifest.entries[i];
-        let bytes = std::fs::read(join_rel(&self.root, &entry.rel_path)).map_err(ServeError::Io)?;
-        if bytes.len() as u64 != entry.size {
-            return Err(ServeError::ChunkModified {
-                rel_path: entry.rel_path.clone(),
-            });
+        let modified = || ServeError::ChunkModified {
+            rel_path: entry.rel_path.clone(),
+        };
+
+        let mut file =
+            std::fs::File::open(join_rel(&self.root, &entry.rel_path)).map_err(ServeError::Io)?;
+        // Cheap whole-file length check first: truncation or growth since
+        // the hash pass invalidates every chunk boundary, not just this one.
+        let on_disk = file.metadata().map_err(ServeError::Io)?.len();
+        if on_disk != entry.size {
+            return Err(modified());
         }
-        Ok(bytes)
+
+        // Chunk i covers [i*CHUNK_SIZE, min((i+1)*CHUNK_SIZE, size)) — the
+        // invariant pinned on `ManifestEntry::chunks`.
+        let offset = (c as u64) * (CHUNK_SIZE as u64);
+        let expected = (entry.size - offset).min(CHUNK_SIZE as u64) as usize;
+        file.seek(SeekFrom::Start(offset)).map_err(ServeError::Io)?;
+        let mut buf = vec![0u8; expected];
+        file.read_exact(&mut buf).map_err(|e| {
+            // A short read despite the length check (a race with truncation)
+            // is a modification, not an I/O fault; everything else is Io.
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                modified()
+            } else {
+                ServeError::Io(e)
+            }
+        })?;
+        Ok(buf)
     }
 }
 
@@ -458,22 +561,64 @@ pub(crate) fn share_rel_path(root: &Path, entry: &walkdir::DirEntry) -> String {
     }
 }
 
-/// Stream-hash one file's full contents to its chunk address through a fixed
-/// [`HASH_BUF_LEN`] buffer — the digest is the same SHA-384 over the same
-/// bytes as [`crate::storage::cas::chunk_addr`], just fed incrementally, so
-/// the address is byte-identical to the whole-file path's.
-pub(crate) fn hash_file(path: &Path) -> Result<ChunkAddr, ServeError> {
+/// Stream one file into its ordered per-chunk addresses plus the total byte
+/// count actually read (M16 — ISC-C73 / ISC-A-C35). The file is read one
+/// [`CHUNK_SIZE`] buffer at a time, and each **full** buffer-load is hashed
+/// as one chunk via [`crate::storage::cas::chunk_addr`] — exactly the digest
+/// `MemoryChunkStore::put` derives for the same chunk slice — so memory stays
+/// O(CHUNK_SIZE) regardless of file size and the addresses are byte-identical
+/// to [`ShareContent::index_dir`]'s. An empty file yields `([], 0)`.
+///
+/// The returned size is the bytes *streamed*, not a `stat`, so
+/// `chunks.len() == size.div_ceil(CHUNK_SIZE)` holds by construction — the
+/// manifest can never advertise a chunk list inconsistent with its own size
+/// field even if the file changes mid-pass (the per-chunk fetch verification
+/// then rejects stale chunks, ISC-S28).
+///
+/// `cancel` is checked between chunks: a multi-GB file must not pin the hash
+/// pass against a cancel request (the between-files check alone would).
+pub(crate) fn hash_file_chunks(
+    path: &Path,
+    cancel: &AtomicBool,
+) -> Result<(Vec<ChunkAddr>, u64), ServeError> {
     let mut file = std::fs::File::open(path).map_err(ServeError::Io)?;
-    let mut hasher = Sha384::new().map_err(|e| ServeError::Cas(CasError::Hash(e)))?;
-    let mut buf = vec![0u8; HASH_BUF_LEN];
+    let mut buf = vec![0u8; CHUNK_SIZE];
+    let mut chunks = Vec::new();
+    let mut size: u64 = 0;
     loop {
-        let n = file.read(&mut buf).map_err(ServeError::Io)?;
+        if cancel.load(Ordering::Relaxed) {
+            return Err(ServeError::Cancelled);
+        }
+        // Fill the buffer completely before hashing: `read` may return short
+        // reads mid-file (pipes, network filesystems), and a chunk boundary
+        // moved by a short read would silently change every following
+        // address. Only EOF may leave a chunk short.
+        let n = read_to_fill(&mut file, &mut buf).map_err(ServeError::Io)?;
         if n == 0 {
             break;
         }
-        hasher.update(&buf[..n]);
+        chunks.push(chunk_addr(&buf[..n]).map_err(|e| ServeError::Cas(CasError::Hash(e)))?);
+        size += n as u64;
+        if n < CHUNK_SIZE {
+            break; // EOF inside this chunk — it is the (short) last one.
+        }
     }
-    Ok(ChunkAddr::from_bytes(hasher.finalize()))
+    Ok((chunks, size))
+}
+
+/// Read from `r` until `buf` is full or EOF; returns how many bytes were
+/// read. (Like `read_exact` but EOF-tolerant — the short final chunk of a
+/// file is expected, not an error.)
+fn read_to_fill(r: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        let n = r.read(&mut buf[filled..])?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    Ok(filled)
 }
 
 /// Join a `/`-separated manifest `rel_path` back onto the share root using
@@ -500,8 +645,8 @@ mod tests {
     }
 
     /// ISC-S27 — indexing a directory builds one manifest entry per file, with
-    /// the content address and size of each, recovering the bytes from the
-    /// store under that address.
+    /// the per-chunk content addresses and size of each, recovering the bytes
+    /// from the store under those addresses.
     #[test]
     fn index_dir_builds_manifest_and_stores_chunks() {
         let _ = oxicrypt_module::initialize();
@@ -519,8 +664,37 @@ mod tests {
         assert_eq!(m[1].rel_path, "sub/b.txt");
         assert_eq!(m[1].size, 11);
 
-        // The address is SHA-384 of the file bytes.
-        assert_eq!(m[0].chunk_addr, chunk_addr(b"alpha").unwrap());
+        // A sub-CHUNK_SIZE file is one chunk whose address is SHA-384 of the
+        // file bytes (the whole file IS the chunk).
+        assert_eq!(m[0].chunks, vec![chunk_addr(b"alpha").unwrap()]);
+    }
+
+    /// M16 (ISC-C73 / ISC-A-C35) — a file larger than CHUNK_SIZE indexes to
+    /// multiple ordered chunks, each addressed by SHA-384 of THAT chunk's
+    /// slice, with boundaries at exact CHUNK_SIZE multiples and only the last
+    /// chunk short; an empty file indexes to zero chunks.
+    #[test]
+    fn index_dir_chunks_large_files_at_fixed_boundaries() {
+        let _ = oxicrypt_module::initialize();
+        let dir = tempfile::TempDir::new().unwrap();
+        let big: Vec<u8> = (0..CHUNK_SIZE + 4096).map(|i| (i % 251) as u8).collect();
+        write(dir.path(), "big.bin", &big);
+        write(dir.path(), "empty.bin", b"");
+
+        let content = ShareContent::index_dir(dir.path()).unwrap();
+        let m = content.manifest();
+        assert_eq!(m[0].rel_path, "big.bin");
+        assert_eq!(
+            m[0].chunks,
+            vec![
+                chunk_addr(&big[..CHUNK_SIZE]).unwrap(),
+                chunk_addr(&big[CHUNK_SIZE..]).unwrap(),
+            ],
+            "chunk i is SHA-384 over [i*CHUNK_SIZE, min((i+1)*CHUNK_SIZE, size))"
+        );
+        assert_eq!(m[1].rel_path, "empty.bin");
+        assert_eq!(m[1].size, 0);
+        assert!(m[1].chunks.is_empty(), "empty file → no chunks");
     }
 
     /// ISC-S27 — `answer(ManifestRequest)` returns the full manifest.
@@ -549,7 +723,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         write(dir.path(), "f.bin", b"some bytes to address");
         let content = ShareContent::index_dir(dir.path()).unwrap();
-        let addr = content.manifest()[0].chunk_addr;
+        let addr = content.manifest()[0].chunks[0];
 
         match content.answer(&ShareFrame::ChunkRequest { chunk_addr: addr }) {
             Some(ShareFrame::ChunkResponse {
@@ -604,7 +778,7 @@ mod tests {
                 })
                 .is_none()
         );
-        let addr = content.manifest()[0].chunk_addr;
+        let addr = content.manifest()[0].chunks[0];
         assert!(
             content
                 .answer(&ShareFrame::ChunkResponse {
@@ -630,6 +804,82 @@ mod tests {
         }
     }
 
+    // ── manifest frame budget (M16 design review) ──────────────────────────
+
+    /// `manifest_frame_len`'s arithmetic equals the REAL encoder's output
+    /// length, byte for byte, on a manifest exercising every entry shape:
+    /// an empty file (zero chunks), a one-chunk file, a multi-chunk file,
+    /// and a multi-byte-UTF-8 path (`rel_path.len()` must count BYTES, not
+    /// chars — the encoder writes bytes). This pin is what lets the publish
+    /// guard trust the arithmetic instead of building a probe buffer.
+    #[test]
+    fn manifest_frame_len_matches_real_encoding() {
+        let _ = oxicrypt_module::initialize();
+        let a = |b: &[u8]| chunk_addr(b).unwrap();
+        let manifest = ShareManifest {
+            entries: vec![
+                ManifestEntry {
+                    rel_path: "empty.bin".to_owned(),
+                    size: 0,
+                    chunks: Vec::new(),
+                },
+                ManifestEntry {
+                    rel_path: "söngvar/álbum.flac".to_owned(), // multi-byte UTF-8
+                    size: 7,
+                    chunks: vec![a(b"one")],
+                },
+                ManifestEntry {
+                    rel_path: "big.bin".to_owned(),
+                    size: 3 * CHUNK_SIZE as u64 + 99,
+                    chunks: vec![a(b"c0"), a(b"c1"), a(b"c2"), a(b"c3")],
+                },
+            ],
+        };
+        let encoded = ShareFrame::ManifestResponse {
+            entries: manifest.entries.clone(),
+        }
+        .encode();
+        assert_eq!(
+            manifest_frame_len(&manifest),
+            encoded.len(),
+            "arithmetic must equal the real encoder's length exactly"
+        );
+    }
+
+    /// The threshold logic the publish guard runs: a file-count-dense
+    /// synthetic manifest (built arithmetically — no real files, no encode)
+    /// exceeds [`MANIFEST_FRAME_BUDGET`], while a normal-sized one stays
+    /// under, and the budget itself sits under tonic's 4 MiB decode cap.
+    #[test]
+    fn manifest_frame_budget_threshold_logic() {
+        let _ = oxicrypt_module::initialize();
+        let addr = chunk_addr(b"x").unwrap();
+        let entry = |i: usize| ManifestEntry {
+            rel_path: format!("library/track-{i:06}.mp3"),
+            size: 1,
+            chunks: vec![addr],
+        };
+
+        // ~84 bytes/entry → 60_000 entries ≈ 5.0 MB: over budget.
+        let dense = ShareManifest {
+            entries: (0..60_000).map(entry).collect(),
+        };
+        assert!(
+            manifest_frame_len(&dense) > MANIFEST_FRAME_BUDGET,
+            "a many-small-files share must trip the publish guard"
+        );
+
+        // A 1_000-file share is nowhere near the budget.
+        let normal = ShareManifest {
+            entries: (0..1_000).map(entry).collect(),
+        };
+        assert!(manifest_frame_len(&normal) <= MANIFEST_FRAME_BUDGET);
+
+        // The budget leaves real headroom under tonic's default cap
+        // (compile-time: both sides are consts).
+        const { assert!(MANIFEST_FRAME_BUDGET < 4 * 1024 * 1024) };
+    }
+
     // ── streaming hash pass (M16) ──────────────────────────────────────────
 
     /// A no-op cancel flag for passes that should run to completion.
@@ -639,24 +889,48 @@ mod tests {
 
     /// The streaming hash pass produces a manifest **byte-identical** to
     /// `index_dir`'s on the same fixture tree — same order, same `rel_path`s,
-    /// same sizes, and the same SHA-384 chunk addresses `MemoryChunkStore::put`
-    /// derived — so existing fetch-side verification is unchanged (ISC-S28).
-    /// The fixture includes a file larger than the streaming buffer so the
-    /// multi-read path is exercised, not just the single-read one.
+    /// same sizes, and the same per-chunk SHA-384 addresses
+    /// `MemoryChunkStore::put` derived — so existing fetch-side verification
+    /// is unchanged (ISC-S28). The fixture spans every chunk-boundary seam
+    /// (M16): an empty file (zero chunks), a sub-1MiB file (one short chunk),
+    /// an exactly-1MiB file (one full chunk, no phantom empty second chunk),
+    /// and a >2MiB file (two full chunks + a short last, non-uniform content
+    /// across the seams).
     #[test]
     fn hash_share_matches_index_dir() {
         let _ = oxicrypt_module::initialize();
         let dir = tempfile::TempDir::new().unwrap();
-        write(dir.path(), "a.txt", b"alpha");
-        write(dir.path(), "sub/b.txt", b"bravo bravo");
-        // > HASH_BUF_LEN, with non-uniform content spanning the buffer seam.
-        let big: Vec<u8> = (0..HASH_BUF_LEN + 4096).map(|i| (i % 251) as u8).collect();
-        write(dir.path(), "big.bin", &big);
+        write(dir.path(), "empty.bin", b"");
+        write(dir.path(), "a.txt", b"alpha"); // sub-1MiB
+        let exact: Vec<u8> = (0..CHUNK_SIZE).map(|i| (i % 253) as u8).collect();
+        write(dir.path(), "exact.bin", &exact); // exactly 1 MiB
+        let big: Vec<u8> = (0..2 * CHUNK_SIZE + 4096)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        write(dir.path(), "big.bin", &big); // > 2 MiB
 
         let indexed = ShareContent::index_dir(dir.path()).unwrap();
         let hashed = hash_share(dir.path(), &no_cancel(), &mut |_, _| {}).unwrap();
 
         assert_eq!(hashed.entries, indexed.manifest());
+
+        // Pin the seam shapes themselves (not just parity between paths).
+        let by_path = |p: &str| {
+            hashed
+                .entries
+                .iter()
+                .find(|e| e.rel_path == p)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(by_path("empty.bin").chunks.len(), 0);
+        assert_eq!(by_path("a.txt").chunks.len(), 1);
+        assert_eq!(
+            by_path("exact.bin").chunks.len(),
+            1,
+            "an exactly-CHUNK_SIZE file is ONE chunk — no phantom empty tail"
+        );
+        assert_eq!(by_path("big.bin").chunks.len(), 3);
     }
 
     /// The hash pass reports `(done, total)` after every file, with the total
@@ -721,7 +995,7 @@ mod tests {
             other => panic!("expected ManifestResponse, got {other:?}"),
         }
 
-        let addr = content.manifest()[0].chunk_addr;
+        let addr = content.manifest()[0].chunks[0];
         match content.answer(&ShareFrame::ChunkRequest { chunk_addr: addr }) {
             Some(ShareFrame::ChunkResponse {
                 chunk_addr: a,
@@ -735,6 +1009,80 @@ mod tests {
         }
     }
 
+    /// M16 (ISC-C73 / ISC-A-C35) — the disk-backed source serves every chunk
+    /// of a >2MiB file correctly: first, middle, and the short last chunk
+    /// each come back as exactly their `[i*CHUNK_SIZE, min((i+1)*CHUNK_SIZE,
+    /// size))` slice of the source bytes, hashing to the advertised address.
+    #[test]
+    fn disk_content_serves_first_middle_and_short_last_chunks() {
+        let _ = oxicrypt_module::initialize();
+        let dir = tempfile::TempDir::new().unwrap();
+        let big: Vec<u8> = (0..2 * CHUNK_SIZE + 12345)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        write(dir.path(), "big.bin", &big);
+        let manifest = hash_share(dir.path(), &no_cancel(), &mut |_, _| {}).unwrap();
+        let content = DiskShareContent::new(dir.path().to_path_buf(), manifest);
+
+        let entry = &content.manifest()[0];
+        assert_eq!(entry.chunks.len(), 3);
+        for (i, addr) in entry.chunks.iter().enumerate() {
+            let start = i * CHUNK_SIZE;
+            let end = (start + CHUNK_SIZE).min(big.len());
+            let bytes = content.get_chunk(addr).unwrap();
+            assert_eq!(bytes, &big[start..end], "chunk {i} is its exact slice");
+            assert_eq!(
+                chunk_addr(&bytes).unwrap(),
+                *addr,
+                "chunk {i} hashes to its advertised address (ISC-S28)"
+            );
+        }
+        // The short last chunk really is short.
+        assert_eq!(
+            content.get_chunk(&entry.chunks[2]).unwrap().len(),
+            12345,
+            "last chunk length = size mod CHUNK_SIZE"
+        );
+    }
+
+    /// The receiver-verification contract per chunk, pinned (M16): a
+    /// size-preserving tamper of ONE chunk's bytes (at the chunk-boundary
+    /// region) passes the server's cheap checks — the bytes are served, no
+    /// error — and the served bytes' re-derived SHA-384 differs from that
+    /// chunk's advertised address (the fetcher rejects exactly this chunk,
+    /// ISC-S28), while untampered chunks still verify.
+    #[test]
+    fn disk_content_single_tampered_chunk_fails_only_its_own_addr() {
+        let _ = oxicrypt_module::initialize();
+        let dir = tempfile::TempDir::new().unwrap();
+        let big: Vec<u8> = (0..2 * CHUNK_SIZE + 999).map(|i| (i % 251) as u8).collect();
+        write(dir.path(), "big.bin", &big);
+        let path = dir.path().join("big.bin");
+        let manifest = hash_share(dir.path(), &no_cancel(), &mut |_, _| {}).unwrap();
+        let content = DiskShareContent::new(dir.path().to_path_buf(), manifest);
+        let chunks = content.manifest()[0].chunks.clone();
+
+        // Flip one byte at the very start of chunk 1 (offset CHUNK_SIZE —
+        // the boundary region), preserving the file size.
+        let mut tampered = big.clone();
+        tampered[CHUNK_SIZE] ^= 0x01;
+        std::fs::write(&path, &tampered).unwrap();
+
+        // The server still serves (no serve-time re-hash) …
+        let served = content.get_chunk(&chunks[1]).unwrap();
+        assert_ne!(
+            chunk_addr(&served).unwrap(),
+            chunks[1],
+            "tampered chunk's digest mismatches its advertised address — \
+             the fetcher's per-chunk verify rejects exactly this chunk"
+        );
+        // … and the neighbours still verify (the tamper is contained).
+        for i in [0usize, 2] {
+            let ok = content.get_chunk(&chunks[i]).unwrap();
+            assert_eq!(chunk_addr(&ok).unwrap(), chunks[i], "chunk {i} intact");
+        }
+    }
+
     /// A file whose **size** changed since the hash pass (truncation/growth —
     /// the cheap check `get_chunk` keeps) fails closed: `ChunkModified`, and
     /// the serve answer relays no frame. Content integrity beyond the length
@@ -742,7 +1090,7 @@ mod tests {
     #[test]
     fn disk_content_fails_closed_on_modified_file() {
         let (dir, content) = disk_fixture();
-        let addr = content.manifest()[0].chunk_addr; // a.txt, 5 bytes
+        let addr = content.manifest()[0].chunks[0]; // a.txt, 5 bytes
         write(dir.path(), "a.txt", b"ALPHA REWRITTEN LONGER"); // size 5 → 22
 
         assert!(matches!(
@@ -765,7 +1113,7 @@ mod tests {
     #[test]
     fn disk_content_same_size_tamper_is_rejected_by_receiver_not_server() {
         let (dir, content) = disk_fixture();
-        let addr = content.manifest()[0].chunk_addr; // a.txt = b"alpha"
+        let addr = content.manifest()[0].chunks[0]; // a.txt = b"alpha"
         write(dir.path(), "a.txt", b"tlpha"); // same 5-byte length
 
         let bytes = content
@@ -789,7 +1137,7 @@ mod tests {
     #[test]
     fn disk_content_deleted_file_yields_clean_error() {
         let (dir, content) = disk_fixture();
-        let addr = content.manifest()[0].chunk_addr; // a.txt
+        let addr = content.manifest()[0].chunks[0]; // a.txt
         std::fs::remove_file(dir.path().join("a.txt")).unwrap();
 
         assert!(matches!(content.get_chunk(&addr), Err(ServeError::Io(_))));
@@ -831,7 +1179,7 @@ mod tests {
         let manifest = hash_share(dir.path(), &no_cancel(), &mut |_, _| {}).unwrap();
         let disk = DiskShareContent::new(dir.path().to_path_buf(), manifest);
 
-        let addr = ram.manifest()[0].chunk_addr;
+        let addr = ram.manifest()[0].chunks[0];
         for req in [
             ShareFrame::ManifestRequest,
             ShareFrame::ChunkRequest { chunk_addr: addr },

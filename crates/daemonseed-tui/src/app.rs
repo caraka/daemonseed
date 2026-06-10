@@ -352,12 +352,15 @@ pub struct FetchUi {
     pub name: String,
     /// Phase of the fetch.
     pub status: FetchStatus,
-    /// Total chunks (`Some` once the `ManifestResponse` arrives, `None`
-    /// while the fetcher is waiting on it).
+    /// Total chunks over the SELECTED set (M16, ISC-C73 / ISC-A-C35 —
+    /// chunk-granular, NOT a file count: every selected file contributes its
+    /// `chunk_count`). `Some` from confirm on (seeded from the preview's
+    /// per-entry chunk counts, then confirmed by the net actor's first
+    /// `FetchProgress`); `None` while the fetcher is waiting on the manifest.
     pub total_chunks: Option<u32>,
-    /// Chunks successfully verified and written to local CAS so far.
+    /// Chunks verified and streamed to disk so far (drives the gauge).
     pub chunks_received: u32,
-    /// Bytes successfully written to local CAS so far (advisory progress).
+    /// Bytes verified and streamed to disk so far (advisory progress).
     pub bytes_received: u64,
     /// A2 selective fetch: per-manifest-entry selection, parallel to the
     /// `Preview(entries)` list. Defaulted all-`true` when the manifest arrives
@@ -1592,7 +1595,11 @@ impl App {
             } => {
                 if let Some(f) = self.fetch.as_mut() {
                     f.status = FetchStatus::Complete;
-                    f.chunks_received = files_written;
+                    // Complete means every selected chunk landed: clamp the
+                    // counter to the known chunk total (M16 — `files_written`
+                    // counts FILES, no longer == chunks; it is only the
+                    // fallback when no total was ever learned).
+                    f.chunks_received = f.total_chunks.unwrap_or(files_written);
                     f.bytes_received = bytes_written;
                 }
             }
@@ -2532,11 +2539,18 @@ impl App {
                             None
                         } else {
                             let all = selected.len() == entries.len();
+                            // M16: the gauge total is CHUNKS over the selected
+                            // set, not the file count — each entry contributes
+                            // its chunk_count (0 for an empty file).
+                            let total: u32 = selected
+                                .iter()
+                                .map(|&i| entries.get(i).map_or(0, |e| e.chunk_count))
+                                .sum();
                             Some((
                                 f.share_id.clone(),
                                 f.sharer_handle.clone(),
                                 f.name.clone(),
-                                selected.len() as u32,
+                                total,
                                 if all { None } else { Some(selected) },
                                 // A3 (ISC-C68): the chosen destination (empty =
                                 // default downloads dir, resolved by the binary).
@@ -6106,10 +6120,12 @@ mod tests {
                 ShareManifestEntry {
                     rel_path: "a.txt".to_owned(),
                     size: 10,
+                    chunk_count: 1,
                 },
                 ShareManifestEntry {
                     rel_path: "b.txt".to_owned(),
                     size: 20,
+                    chunk_count: 1,
                 },
             ],
         });
@@ -6145,13 +6161,15 @@ mod tests {
             entries: vec![ShareManifestEntry {
                 rel_path: "z".to_owned(),
                 size: 1,
+                chunk_count: 1,
             }],
         });
         assert_eq!(app.fetch().unwrap().status, FetchStatus::RequestingManifest);
     }
 
     /// A1: Enter on the preview queues ConfirmFetch with a `None` selection
-    /// (confirm-all) and moves the overlay to Receiving with the known total.
+    /// (confirm-all) and moves the overlay to Receiving with the known total —
+    /// the CHUNK sum over the selection (M16), not the file count.
     #[test]
     fn preview_enter_queues_confirm_all() {
         let mut app = drive_to_main();
@@ -6170,10 +6188,13 @@ mod tests {
                 ShareManifestEntry {
                     rel_path: "a.txt".to_owned(),
                     size: 10,
+                    chunk_count: 1,
                 },
+                // A multi-chunk file (M16): e.g. a 2.1 MB file spans 3 chunks.
                 ShareManifestEntry {
                     rel_path: "b.txt".to_owned(),
                     size: 20,
+                    chunk_count: 3,
                 },
             ],
         });
@@ -6185,7 +6206,8 @@ mod tests {
         assert_eq!(queued.3, None); // confirm-all
         let f = app.fetch().unwrap();
         assert_eq!(f.status, FetchStatus::Receiving);
-        assert_eq!(f.total_chunks, Some(2));
+        // 1 chunk (a.txt) + 3 chunks (b.txt) — chunk-granular, not 2 files.
+        assert_eq!(f.total_chunks, Some(4));
     }
 
     /// A1: Esc on the preview cancels — the overlay closes and nothing is
@@ -6207,6 +6229,7 @@ mod tests {
             entries: vec![ShareManifestEntry {
                 rel_path: "a.txt".to_owned(),
                 size: 10,
+                chunk_count: 1,
             }],
         });
         app.on_key(press(KeyCode::Esc));
@@ -6234,14 +6257,18 @@ mod tests {
                 ShareManifestEntry {
                     rel_path: "a".to_owned(),
                     size: 1,
+                    chunk_count: 1,
                 },
                 ShareManifestEntry {
                     rel_path: "b".to_owned(),
                     size: 2,
+                    chunk_count: 2,
                 },
+                // An empty file contributes 0 chunks (M16) but still selects.
                 ShareManifestEntry {
                     rel_path: "c".to_owned(),
-                    size: 3,
+                    size: 0,
+                    chunk_count: 0,
                 },
             ],
         });
@@ -6249,6 +6276,7 @@ mod tests {
         app.on_key(press(KeyCode::Enter));
         let queued = app.take_pending_fetch_confirm().expect("confirm queued");
         assert_eq!(queued.3, Some(vec![1, 2]));
+        // Chunk sum over the SELECTED set only: b (2) + c (0).
         assert_eq!(app.fetch().unwrap().total_chunks, Some(2));
     }
 
@@ -6271,6 +6299,7 @@ mod tests {
             entries: vec![ShareManifestEntry {
                 rel_path: "a".to_owned(),
                 size: 1,
+                chunk_count: 1,
             }],
         });
         app.on_key(press(KeyCode::Char('a'))); // all -> none
@@ -6301,10 +6330,12 @@ mod tests {
                 ShareManifestEntry {
                     rel_path: "a".to_owned(),
                     size: 1,
+                    chunk_count: 1,
                 },
                 ShareManifestEntry {
                     rel_path: "b".to_owned(),
                     size: 2,
+                    chunk_count: 1,
                 },
             ],
         });
@@ -6338,10 +6369,12 @@ mod tests {
                 ShareManifestEntry {
                     rel_path: "report.pdf".to_owned(),
                     size: 1234,
+                    chunk_count: 1,
                 },
                 ShareManifestEntry {
                     rel_path: "notes.md".to_owned(),
                     size: 56,
+                    chunk_count: 1,
                 },
             ],
         });
@@ -6351,6 +6384,13 @@ mod tests {
         assert!(
             text.contains("report.pdf") && text.contains("notes.md"),
             "the preview must show the share's file list on a standard 80×24 terminal; got:\n{text}"
+        );
+        // M16: the key hint renders inside the preview box (dim line under the
+        // header). Assert the leading portion — the overlay is ~57 cols wide
+        // at 80×24, so the line's tail may truncate on narrow terminals.
+        assert!(
+            text.contains("space toggle · a all/none · →/← fold · d dest"),
+            "the preview must show the key-hint line; got:\n{text}"
         );
     }
 
@@ -6373,6 +6413,7 @@ mod tests {
             entries: vec![ShareManifestEntry {
                 rel_path: "a.txt".to_owned(),
                 size: 10,
+                chunk_count: 1,
             }],
         });
         // Enter dest-edit mode, type a path, leave edit mode, then download.
@@ -6409,10 +6450,12 @@ mod tests {
                 ShareManifestEntry {
                     rel_path: "a".to_owned(),
                     size: 1,
+                    chunk_count: 1,
                 },
                 ShareManifestEntry {
                     rel_path: "b".to_owned(),
                     size: 2,
+                    chunk_count: 1,
                 },
             ],
         });
@@ -6449,6 +6492,7 @@ mod tests {
             entries: vec![ShareManifestEntry {
                 rel_path: "a.txt".to_owned(),
                 size: 10,
+                chunk_count: 1,
             }],
         });
         app.on_key(press(KeyCode::Enter)); // confirm without setting a dest
@@ -6478,6 +6522,7 @@ mod tests {
                 .map(|p| ShareManifestEntry {
                     rel_path: (*p).to_owned(),
                     size: 1,
+                    chunk_count: 1,
                 })
                 .collect(),
         });
@@ -6498,6 +6543,7 @@ mod tests {
         .map(|p| ShareManifestEntry {
             rel_path: (*p).to_owned(),
             size: 1,
+            chunk_count: 1,
         })
         .collect();
         let tree = FetchUi::build_preview_tree(&entries);
@@ -6720,10 +6766,42 @@ mod tests {
         });
         let f = app.fetch().unwrap();
         assert_eq!(f.status, FetchStatus::Complete);
+        // No chunk total was ever learned → files_written is the fallback.
         assert_eq!(f.chunks_received, 3);
         // Enter on Complete dismisses.
         app.on_key(press(KeyCode::Enter));
         assert!(app.fetch().is_none());
+    }
+
+    /// M16: with a known chunk total, FetchComplete clamps the counter to the
+    /// TOTAL CHUNKS, not `files_written` (which now counts files) — the done
+    /// gauge must read N/N chunks, not files/N.
+    #[test]
+    fn fetch_complete_clamps_chunks_to_known_total() {
+        let mut app = drive_to_main();
+        to_shares(&mut app);
+        app.on_net_event(NetEvent::SharesSnapshot {
+            local: Vec::new(),
+            remote: vec![listing("s1", "x", "", "alice#aabbccddeeff")],
+            indexer_status: IndexerStatus::Idle,
+        });
+        let _ = app.take_pending_share_fetch();
+        app.on_key(press(KeyCode::Char('f')));
+        // The download started with a chunk-granular total: 2 files, 9 chunks.
+        app.on_net_event(NetEvent::FetchProgress {
+            total_chunks: Some(9),
+            chunks_received: 7,
+            bytes_received: 7 << 20,
+        });
+        app.on_net_event(NetEvent::FetchComplete {
+            share_id: "s1".to_owned(),
+            files_written: 2,
+            bytes_written: 9 << 20,
+        });
+        let f = app.fetch().unwrap();
+        assert_eq!(f.status, FetchStatus::Complete);
+        assert_eq!(f.chunks_received, 9, "clamped to the chunk total");
+        assert_eq!(f.bytes_received, 9 << 20);
     }
 
     /// FetchError with an active fetch puts the overlay into Failed; Enter

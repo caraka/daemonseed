@@ -40,7 +40,8 @@ use walkdir::WalkDir;
 
 use crate::share_envelope::ManifestEntry;
 use crate::share_serve::{
-    ServeError, ShareManifest, hash_file, hash_share, share_files, share_rel_path,
+    CHUNK_SIZE, ServeError, ShareManifest, hash_file_chunks, hash_share, share_files,
+    share_rel_path,
 };
 use crate::storage::cas::{CHUNK_ADDR_LEN, ChunkAddr};
 use crate::storage::share_index::{IndexError, ShareEntry, ShareIndex};
@@ -103,13 +104,13 @@ impl Indexer {
                 };
                 match std::fs::metadata(path) {
                     // A change event means the bytes may differ — never carry
-                    // a cached chunk_addr forward; the next hash pass
+                    // a cached chunk_addrs blob forward; the next hash pass
                     // ([`cached_or_hash`]) recomputes and re-caches it.
                     Ok(meta) if meta.is_file() => self.index.put(&ShareEntry {
                         rel_path,
                         size: meta.len(),
                         mtime_unix_ms: mtime_ms(&meta),
-                        chunk_addr: None,
+                        chunk_addrs: None,
                     }),
                     // A directory (its files arrive as their own events) — ignore.
                     Ok(_) => Ok(()),
@@ -173,7 +174,7 @@ impl Indexer {
                 rel_path,
                 size: meta.len(),
                 mtime_unix_ms: mtime,
-                chunk_addr: None, // changed file — a stale address must not survive
+                chunk_addrs: None, // changed file — a stale address must not survive
             })?;
             updated += 1;
         }
@@ -193,7 +194,7 @@ impl Indexer {
 /// Cold-scan `root` into a borrowed [`ShareIndex`]: upsert every regular file
 /// beneath it and return how many were indexed. Unreadable entries are skipped,
 /// not fatal — one bad file must not abort the whole walk (ISC-A-C7 robustness).
-/// A metadata-only scan writes `chunk_addr: None` — content addresses come from
+/// A metadata-only scan writes `chunk_addrs: None` — content addresses come from
 /// the hash pass ([`cached_or_hash`]), never from a stat walk.
 ///
 /// `cancel` is checked per entry; a set flag **early-returns `Ok(count)`**
@@ -237,7 +238,7 @@ pub fn scan_into(
             rel_path,
             size: meta.len(),
             mtime_unix_ms: mtime_ms(&meta),
-            chunk_addr: None,
+            chunk_addrs: None,
         })?;
         count += 1;
     }
@@ -275,22 +276,33 @@ impl core::error::Error for CachedHashError {
 
 /// Build a share's [`ShareManifest`] using the index as a **chunk-addr cache**:
 /// a file whose indexed `size` + `mtime` still match and whose entry carries a
-/// cached `chunk_addr` is reused *without reading the file*; only misses
-/// (new, changed, or never-hashed files) are streamed through SHA-384 (as in
-/// [`hash_share`]), and each freshly computed address is written back into the
-/// index entry so the next publish of an unchanged share reads no file at all.
+/// well-formed cached `chunk_addrs` blob is reused *without reading the file*;
+/// only misses (new, changed, or never-hashed files) are streamed through
+/// per-chunk SHA-384 (as in [`hash_share`] — fixed
+/// [`CHUNK_SIZE`] chunks, M16, ISC-C73 / ISC-A-C35), and the freshly computed
+/// addresses are written back into the index entry (all of them, ordered,
+/// concatenated) so the next publish of an unchanged share reads no file at
+/// all.
+///
+/// A cached blob is reused only when it **parses** for the statted size:
+/// `len % 48 == 0` and `len/48 == ceil(size/CHUNK_SIZE)` (0 for an empty
+/// file). A malformed or wrong-count blob — e.g. a row written by the
+/// abandoned single-addr v2 shape, or a stat/blob race — is treated as a
+/// miss and re-hashed, never served: a cache must degrade to correctness,
+/// not propagate its own corruption into the manifest.
 ///
 /// With `index: None` this is exactly [`hash_share`] — the cache is an
 /// optimization, never a requirement. The walk order, `rel_path` form,
 /// `progress(done, total)` cadence (after every file, hit or miss), and
-/// between-files cancellation ([`ServeError::Cancelled`], wrapped in
-/// [`CachedHashError::Serve`]) all match `hash_share`, so the two paths
-/// produce identical manifests for the same tree.
+/// cancellation between files *and between chunks*
+/// ([`ServeError::Cancelled`], wrapped in [`CachedHashError::Serve`]) all
+/// match `hash_share`, so the two paths produce identical manifests for the
+/// same tree.
 ///
-/// A cached address is trusted only as far as its `stat` match — mtime
+/// A cached blob is trusted only as far as its `stat` match — mtime
 /// granularity is the usual caveat. The serve side
 /// ([`crate::share_serve::DiskShareContent`]) does NOT re-hash at answer time
-/// (only cheap IO/size fail-closed checks); a stale cached address is caught
+/// (only cheap IO/length fail-closed checks); a stale cached address is caught
 /// by the fetcher's per-`ChunkResponse` SHA-384 re-derivation, which is the
 /// integrity guarantee end to end (ISC-A-C35).
 pub fn cached_or_hash(
@@ -318,42 +330,73 @@ pub fn cached_or_hash(
         let mtime_unix_ms = mtime_ms(&meta);
         let rel_path = share_rel_path(root, entry);
 
-        // Cache hit: same rel_path + size + mtime with a well-formed cached
-        // address → reuse it without reading the file.
+        // Cache hit: same rel_path + size + mtime with a cached blob that
+        // parses for that size → reuse it without reading the file.
         let cached = index
             .get(&rel_path)
             .map_err(CachedHashError::Index)?
             .filter(|e| e.size == size && e.mtime_unix_ms == mtime_unix_ms)
-            .and_then(|e| e.chunk_addr)
-            .and_then(|bytes| <[u8; CHUNK_ADDR_LEN]>::try_from(bytes.as_slice()).ok())
-            .map(ChunkAddr::from_bytes);
+            .and_then(|e| e.chunk_addrs)
+            .and_then(|blob| parse_addr_blob(&blob, size));
 
-        let chunk_addr = match cached {
-            Some(addr) => addr,
+        let (chunks, size) = match cached {
+            Some(chunks) => (chunks, size),
             None => {
-                let addr = hash_file(entry.path()).map_err(CachedHashError::Serve)?;
-                // Write-back: the next pass over this unchanged file is a hit.
+                // Miss → stream-hash per chunk (cancel honoured between
+                // chunks too — a multi-GB file must not pin the pass). The
+                // streamed byte count, not the stat, becomes the entry size
+                // so chunks/size stay mutually consistent even if the file
+                // changed between stat and read (the next pass's stat
+                // mismatch then invalidates this cache row, self-correcting).
+                let (chunks, streamed) =
+                    hash_file_chunks(entry.path(), cancel).map_err(CachedHashError::Serve)?;
+                // Write-back ALL chunk addrs, ordered & concatenated: the
+                // next pass over this unchanged file is a read-free hit.
+                let blob = chunks
+                    .iter()
+                    .flat_map(|a| a.as_bytes().iter().copied())
+                    .collect();
                 index
                     .put(&ShareEntry {
                         rel_path: rel_path.clone(),
-                        size,
+                        size: streamed,
                         mtime_unix_ms,
-                        chunk_addr: Some(addr.as_bytes().to_vec()),
+                        chunk_addrs: Some(blob),
                     })
                     .map_err(CachedHashError::Index)?;
-                addr
+                (chunks, streamed)
             }
         };
 
         entries.push(ManifestEntry {
             rel_path,
-            chunk_addr,
             size,
+            chunks,
         });
         progress(done + 1, total);
     }
 
     Ok(ShareManifest { entries })
+}
+
+/// Parse a cached `chunk_addrs` blob into ordered [`ChunkAddr`]s, validating
+/// it against the file size it claims to describe: the blob must split into
+/// whole 48-byte addresses and yield exactly `ceil(size/CHUNK_SIZE)` of them
+/// (0 for an empty file — `Some(empty)` is a valid hashed state). `None`
+/// means "do not trust this blob, re-hash" (see [`cached_or_hash`]).
+fn parse_addr_blob(blob: &[u8], size: u64) -> Option<Vec<ChunkAddr>> {
+    if !blob.len().is_multiple_of(CHUNK_ADDR_LEN) {
+        return None;
+    }
+    let count = blob.len() / CHUNK_ADDR_LEN;
+    if count as u64 != size.div_ceil(CHUNK_SIZE as u64) {
+        return None;
+    }
+    Some(
+        blob.chunks_exact(CHUNK_ADDR_LEN)
+            .map(|c| ChunkAddr::from_bytes(c.try_into().expect("exact 48-byte chunk")))
+            .collect(),
+    )
 }
 
 /// A running background cold-scan ([`Indexer::spawn_background_scan`]). Join to
@@ -546,14 +589,14 @@ mod tests {
         assert_eq!(idx.index().len().unwrap(), 0);
     }
 
-    /// A metadata scan writes `chunk_addr: None` — content addresses come
+    /// A metadata scan writes `chunk_addrs: None` — content addresses come
     /// only from the hash pass.
     #[test]
-    fn scan_into_writes_no_chunk_addr() {
+    fn scan_into_writes_no_chunk_addrs() {
         let (_dir, idx) = fixture();
         write(&idx.root, "a.txt", b"aaa");
         idx.cold_scan().unwrap();
-        assert_eq!(idx.index().get("a.txt").unwrap().unwrap().chunk_addr, None);
+        assert_eq!(idx.index().get("a.txt").unwrap().unwrap().chunk_addrs, None);
     }
 
     /// Directories themselves are not indexed — only the files in them.
@@ -754,32 +797,48 @@ mod tests {
         assert_eq!(cached, direct);
     }
 
-    /// The full cache cycle: a metadata-only entry (no cached address) is
-    /// hashed and **written back**; a second pass over the unchanged file
-    /// reuses the cached address *without reading the file* — proved by
-    /// rewriting the bytes with the same size and restoring the mtime, then
-    /// observing the second pass still return the ORIGINAL address (a re-hash
-    /// would have produced the new bytes' address).
-    #[test]
-    fn cached_or_hash_writes_back_then_hits_without_reading() {
-        let (_dir, idx) = fixture();
-        let path = write(&idx.root, "a.txt", b"original");
-        idx.cold_scan().unwrap(); // metadata only — chunk_addr: None
+    /// Concatenate a manifest entry's chunk addresses into the blob shape the
+    /// index caches (ordered, 48 bytes each).
+    fn addr_blob(chunks: &[ChunkAddr]) -> Vec<u8> {
+        chunks
+            .iter()
+            .flat_map(|a| a.as_bytes().iter().copied())
+            .collect()
+    }
 
-        // First pass: miss → hash → write-back.
+    /// The full cache cycle (M16 multi-addr): a metadata-only entry (no
+    /// cached blob) is hashed and **all** its per-chunk addresses written
+    /// back, ordered and concatenated; a second pass over the unchanged file
+    /// reuses the cached addresses *without reading the file* — proved by
+    /// rewriting the bytes with the same size and restoring the mtime, then
+    /// observing the second pass still return the ORIGINAL addresses (a
+    /// re-hash would have produced the new bytes' addresses). Uses a
+    /// >CHUNK_SIZE file so the blob really is multi-addr.
+    #[test]
+    fn cached_or_hash_writes_back_multi_addr_then_hits_without_reading() {
+        let (_dir, idx) = fixture();
+        let original: Vec<u8> = (0..CHUNK_SIZE + 4096).map(|i| (i % 251) as u8).collect();
+        let path = write(&idx.root, "big.bin", &original);
+        idx.cold_scan().unwrap(); // metadata only — chunk_addrs: None
+
+        // First pass: miss → hash → write-back of ALL chunk addrs.
         let first =
             cached_or_hash(Some(idx.index()), &idx.root, &no_cancel(), &mut |_, _| {}).unwrap();
-        let original_addr = first.entries[0].chunk_addr;
+        let original_chunks = first.entries[0].chunks.clone();
+        assert_eq!(original_chunks.len(), 2, "fixture spans two chunks");
         assert_eq!(
-            idx.index().get("a.txt").unwrap().unwrap().chunk_addr,
-            Some(original_addr.as_bytes().to_vec()),
-            "the computed address was written back into the index entry"
+            idx.index().get("big.bin").unwrap().unwrap().chunk_addrs,
+            Some(addr_blob(&original_chunks)),
+            "every chunk address was written back, ordered and concatenated"
         );
 
         // Rewrite with different bytes of the SAME length, then restore the
         // mtime, so the stat triplet matches the cached entry exactly.
         let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
-        std::fs::write(&path, b"REWRITE!").unwrap(); // 8 bytes, like "original"
+        let mut rewrite = original.clone();
+        rewrite[0] ^= 0xff;
+        rewrite[CHUNK_SIZE] ^= 0xff; // touch both chunks
+        std::fs::write(&path, &rewrite).unwrap();
         std::fs::File::options()
             .write(true)
             .open(&path)
@@ -787,7 +846,7 @@ mod tests {
             .set_modified(mtime)
             .unwrap();
 
-        // Second pass: a hit. Returning the ORIGINAL address (not the new
+        // Second pass: a hit. Returning the ORIGINAL addresses (not the new
         // bytes') proves the file was never read, let alone re-hashed; the
         // per-file progress cadence is unchanged by hits.
         let mut seen = Vec::new();
@@ -795,12 +854,12 @@ mod tests {
             seen.push((d, t));
         })
         .unwrap();
-        assert_eq!(second.entries[0].chunk_addr, original_addr);
+        assert_eq!(second.entries[0].chunks, original_chunks);
         assert_eq!(seen, vec![(1, 1)]);
     }
 
-    /// Stale mtime → the cached address is NOT reused: the file is re-hashed
-    /// and the fresh address written back.
+    /// Stale mtime → the cached addresses are NOT reused: the file is
+    /// re-hashed and the fresh addresses written back.
     #[test]
     fn cached_or_hash_stale_mtime_rehashes() {
         let (_dir, idx) = fixture();
@@ -822,13 +881,80 @@ mod tests {
         let second =
             cached_or_hash(Some(idx.index()), &idx.root, &no_cancel(), &mut |_, _| {}).unwrap();
         assert_ne!(
-            second.entries[0].chunk_addr, first.entries[0].chunk_addr,
+            second.entries[0].chunks, first.entries[0].chunks,
             "a stat mismatch forces a re-hash"
         );
         assert_eq!(
-            idx.index().get("a.txt").unwrap().unwrap().chunk_addr,
-            Some(second.entries[0].chunk_addr.as_bytes().to_vec()),
-            "the fresh address replaced the stale one"
+            idx.index().get("a.txt").unwrap().unwrap().chunk_addrs,
+            Some(addr_blob(&second.entries[0].chunks)),
+            "the fresh addresses replaced the stale ones"
+        );
+    }
+
+    /// Stale SIZE (mtime restored, size changed) → invalidation: the cached
+    /// blob is not reused even though the mtime matches, because the stat
+    /// filter checks both — and the blob's chunk count would no longer match
+    /// `ceil(size/CHUNK_SIZE)` anyway (the parse-validation backstop).
+    #[test]
+    fn cached_or_hash_stale_size_invalidates() {
+        let (_dir, idx) = fixture();
+        let path = write(&idx.root, "a.txt", b"four");
+        let first =
+            cached_or_hash(Some(idx.index()), &idx.root, &no_cancel(), &mut |_, _| {}).unwrap();
+        assert_eq!(first.entries[0].size, 4);
+
+        // Grow the file but restore the original mtime: only the size differs.
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(&path, b"four and then some").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+
+        let second =
+            cached_or_hash(Some(idx.index()), &idx.root, &no_cancel(), &mut |_, _| {}).unwrap();
+        assert_eq!(second.entries[0].size, 18, "the new size is manifested");
+        assert_ne!(
+            second.entries[0].chunks, first.entries[0].chunks,
+            "a size change forces a re-hash even under a matching mtime"
+        );
+    }
+
+    /// A cached blob that does not parse for the statted size — here a
+    /// single-addr-shaped row as the abandoned v2 format would have written
+    /// for a 2-chunk file — is a miss, not a hit: re-hash and write back the
+    /// well-formed multi-addr blob. The cache degrades to correctness.
+    #[test]
+    fn cached_or_hash_malformed_blob_rehashes() {
+        let (_dir, idx) = fixture();
+        let big: Vec<u8> = (0..CHUNK_SIZE + 1).map(|i| (i % 251) as u8).collect();
+        let path = write(&idx.root, "big.bin", &big);
+
+        // Plant a stat-matching entry whose blob has the WRONG chunk count
+        // (one addr for a two-chunk file).
+        let meta = std::fs::metadata(&path).unwrap();
+        idx.index()
+            .put(&ShareEntry {
+                rel_path: "big.bin".to_owned(),
+                size: meta.len(),
+                mtime_unix_ms: super::mtime_ms(&meta),
+                chunk_addrs: Some(vec![0xaa; CHUNK_ADDR_LEN]),
+            })
+            .unwrap();
+
+        let manifest =
+            cached_or_hash(Some(idx.index()), &idx.root, &no_cancel(), &mut |_, _| {}).unwrap();
+        let direct = hash_share(&idx.root, &no_cancel(), &mut |_, _| {}).unwrap();
+        assert_eq!(
+            manifest, direct,
+            "the planted bad blob was ignored and the file re-hashed"
+        );
+        assert_eq!(
+            idx.index().get("big.bin").unwrap().unwrap().chunk_addrs,
+            Some(addr_blob(&direct.entries[0].chunks)),
+            "the well-formed blob replaced the malformed one"
         );
     }
 

@@ -27,6 +27,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -53,9 +54,11 @@ use daemonseed_core::public_room::{
     DEFAULT_ROOM, derive_room_key, open_room_message, room_asset_address, seal_room_message,
 };
 use daemonseed_core::share_envelope::{ManifestEntry, ShareFrame};
-use daemonseed_core::share_serve::{DiskShareContent, ServeError};
+use daemonseed_core::share_serve::{
+    DiskShareContent, MANIFEST_FRAME_BUDGET, ServeError, ShareManifest, manifest_frame_len,
+};
 use daemonseed_core::storage::cas::chunk_addr;
-use daemonseed_core::storage::fetched::{FetchedShare, FetchedStore, VerifiedFile};
+use daemonseed_core::storage::fetched::{FetchedFile, FetchedShare, FetchedStore};
 use daemonseed_core::storage::seeds::{CounterState, IndexKey};
 use daemonseed_core::storage::share_index::ShareIndex;
 use daemonseed_core::trust_events::{TrustEventKey, assess_deprecation, unreadable_policy_event};
@@ -139,10 +142,10 @@ pub enum NetCommand {
     /// Initiate a share fetch from the connected relay (ISC-19, F23 unified
     /// mechanism). Derives the public-share asset address from `share_id` +
     /// the connected server-id, opens a new bidi `CircleOfTrust.Subscribe`
-    /// stream over the existing `AppSession`, sends a `ManifestRequest`,
-    /// reads a `ManifestResponse`, then issues one `ChunkRequest` per entry
-    /// and writes each verified chunk to a local in-memory CAS. Progress is
-    /// surfaced via `NetEvent::FetchProgress`; the terminal state is one of
+    /// stream over the existing `AppSession`, sends a `ManifestRequest`, and
+    /// reads a `ManifestResponse` for the A1 preview (the download itself is
+    /// the separate `ConfirmFetch`). Progress is surfaced via
+    /// `NetEvent::FetchProgress`; the terminal state is one of
     /// `NetEvent::FetchComplete` or `NetEvent::FetchError`. `sharer_handle`
     /// is advisory — included so subsequent UX layers (post-MVP `f`-keyed
     /// trust-on-sharer affordances) can route per-sharer events; the relay
@@ -161,11 +164,14 @@ pub enum NetCommand {
     },
     /// Confirm an A1-previewed fetch and download it (ISC-19). Issued after the
     /// user accepts the `NetEvent::FetchManifest` preview. Re-opens the share
-    /// stream, requests the chunks (`selected = None` downloads every file;
-    /// `Some(indices)` downloads only those manifest rows — the A2 selective
-    /// path), verifies each against its content address, and persists the
-    /// fully-verified download (ISC-C63 / A-C31). Terminal state is
-    /// `NetEvent::FetchComplete` or `NetEvent::FetchError`.
+    /// stream and requests every chunk of the selected files (`selected = None`
+    /// downloads every file; `Some(indices)` downloads only those manifest
+    /// rows — the A2 selective path), verifying each chunk against its content
+    /// address and streaming it to the destination file as it arrives (M16,
+    /// ISC-C73 / ISC-A-C35 — never a whole file in RAM). A 30s inactivity
+    /// timeout aborts a silent hang; an abort deletes the fetch's partial
+    /// files (ISC-A-C31). Terminal state is `NetEvent::FetchComplete` or
+    /// `NetEvent::FetchError`.
     ConfirmFetch {
         share_id: String,
         sharer_handle: String,
@@ -231,13 +237,19 @@ pub enum NetCommand {
 }
 
 /// One file in an A1 fetch-preview ([`NetEvent::FetchManifest`]): the
-/// sharer-advertised relative path and its byte size. Carries no `chunk_addr`
-/// — the content address stays in the net actor; the UI shows names + sizes
-/// only and confirms by manifest-row index.
+/// sharer-advertised relative path, its byte size, and its chunk count.
+/// Carries no chunk *addresses* — those stay in the net actor; the UI shows
+/// names + sizes only and confirms by manifest-row index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShareManifestEntry {
     pub rel_path: String,
     pub size: u64,
+    /// How many [`daemonseed_core::share_serve::CHUNK_SIZE`] chunks the file's
+    /// bytes span (M16, ISC-C73 / ISC-A-C35) — `manifest.chunks.len()`, so an
+    /// empty file is `0`. The app sums this over the selected files to seed
+    /// the chunk-granular progress gauge before the net actor's authoritative
+    /// first `FetchProgress` arrives.
+    pub chunk_count: u32,
 }
 
 /// An opened share-fetch stream plus its manifest — the shared front half of
@@ -409,29 +421,33 @@ pub enum NetEvent {
         name: String,
         entries: Vec<ShareManifestEntry>,
     },
-    /// Progress on an active share fetch (ISC-19). `total_chunks` is `None`
-    /// while the fetcher is still waiting on the `ManifestResponse`, and
-    /// `Some(N)` after the manifest arrives. Emitted at least once after the
-    /// manifest lands and once per successful chunk write.
+    /// Progress on an active share fetch (ISC-19). Chunk-granular over the
+    /// SELECTED set (M16, ISC-C73 / ISC-A-C35): `total_chunks` counts every
+    /// 1 MiB chunk of every selected file, not the file count. `None` only
+    /// while the fetcher is still waiting on the `ManifestResponse`; `Some(N)`
+    /// from the first confirm-side emit on. Emitted once when the download
+    /// starts and once per verified chunk streamed to disk.
     FetchProgress {
         total_chunks: Option<u32>,
         chunks_received: u32,
         bytes_received: u64,
     },
-    /// The share fetch completed: every chunk in the manifest was verified
-    /// and written. `files_written` and `bytes_written` mirror the manifest's
-    /// tallies (one chunk = one file at the M11 alpha; multi-chunk-per-file
-    /// is post-MVP, layered on without wire change).
+    /// The share fetch completed: every chunk of every selected file was
+    /// verified and streamed to its named destination file. `files_written`
+    /// counts FILES (M16 — no longer == chunks); `bytes_written` is the total
+    /// verified bytes on disk.
     FetchComplete {
         share_id: String,
         files_written: u32,
         bytes_written: u64,
     },
     /// The fetch failed at some point (no session, derive error, decode error,
-    /// chunk-hash mismatch, peer dropped the stream, RPC status). The fetcher
-    /// stops; partial chunks already in local CAS are kept (any later retry
-    /// can dedupe by chunk_addr). The overlay marks the fetch failed and
-    /// waits for the user to dismiss.
+    /// chunk-hash mismatch, peer dropped the stream, RPC status, or the M16
+    /// 30s inactivity timeout). The fetcher stops and DELETES every file this
+    /// fetch wrote — the in-progress partial and any already-completed
+    /// siblings — so a failed fetch never leaves a silently-truncated file on
+    /// disk (ISC-A-C31 posture, now applied to streamed writes). The overlay
+    /// marks the fetch failed and waits for the user to dismiss.
     FetchError { message: String },
     /// A fresh snapshot of the fetched shares recorded on disk (M15 C;
     /// ISC-C64). Emitted after a successful fetch persists, and in response to
@@ -884,6 +900,20 @@ impl Actor {
                     return;
                 }
             };
+            // Manifest-size publish guard (M16 design review): the MANIFEST
+            // frame itself must fit the relay's decode cap, or a fetcher's
+            // ManifestRequest gets a relay-dropped response — the exact
+            // silent stall chunking fixed for content frames, reproduced by
+            // file COUNT instead of file size. Refuse loudly BEFORE the RPC:
+            // the listing must never be advertised for a share whose
+            // manifest cannot be served.
+            if let Some(message) = manifest_too_large_error(&manifest) {
+                let _ = evt_tx.send(NetEvent::PublishError {
+                    message,
+                    root: Some(root),
+                });
+                return;
+            }
             // Disk-backed serve content (M16): the manifest stays in RAM, the
             // file bytes are read from disk per chunk request — a share is no
             // longer copied whole into a `MemoryChunkStore`. Built before the
@@ -1839,6 +1869,7 @@ impl Actor {
             .map(|e| ShareManifestEntry {
                 rel_path: e.rel_path.clone(),
                 size: e.size,
+                chunk_count: e.chunks.len() as u32,
             })
             .collect();
         drop(opened); // close the stream; confirm re-opens
@@ -1849,13 +1880,50 @@ impl Actor {
         });
     }
 
-    /// A1 confirm: the user accepted the preview. Re-open the share, request the
-    /// selected chunks (`selected = None` downloads every file; `Some(indices)`
-    /// the A2 selective subset), verify each against its content address
-    /// (ISC-S28 / ISC-A-S20), and persist the fully-verified download (ISC-C63
-    /// / A-C31). `selected` indices are into the manifest's natural order, which
-    /// a sharer serves deterministically; an out-of-range index is skipped
-    /// defensively rather than failing the whole fetch.
+    /// A1 confirm: the user accepted the preview. Re-open the share, request
+    /// every chunk of the selected files (`selected = None` downloads every
+    /// file; `Some(indices)` the A2 selective subset), verify each chunk
+    /// against its content address (ISC-S28 / ISC-A-S20), and STREAM the
+    /// verified bytes to the destination file as they arrive (M16, extends
+    /// ISC-C73 / ISC-A-C35). `selected` indices are into the manifest's
+    /// natural order, which a sharer serves deterministically; an out-of-range
+    /// index is skipped defensively rather than failing the whole fetch.
+    ///
+    /// **Why chunked (M16):** the pre-chunking fetch moved each file as ONE
+    /// `ChunkResponse` frame, so an 8.9 MB file produced a whole-file frame
+    /// that blew past tonic's 4 MB relay decode cap — the relay dropped it and
+    /// the fetch hung forever (live smoke, 2026-06-09). 1 MiB chunks keep
+    /// every frame relay-safe regardless of file size.
+    ///
+    /// **Streaming writes:** chunks are appended to the destination file on
+    /// disk as they verify — a whole file is never accumulated in RAM (the
+    /// fetcher holds at most one 1 MiB chunk). Parent directories are created
+    /// first; an empty file (`chunks: []`) is created empty and requests
+    /// nothing.
+    ///
+    /// **Inactivity timeout (M16, new behavior):** if no relevant frame
+    /// arrives for [`FETCH_INACTIVITY_TIMEOUT`] while awaiting a chunk, the
+    /// fetch aborts with a `FetchError` instead of hanging silently (the
+    /// pre-M16 failure mode when a frame was dropped relay-side). The
+    /// timeout is frame-granular — see the const's doc for the slow-link
+    /// false-trip caveat.
+    ///
+    /// **Resume policy: restart-from-0 (deliberate MVP).** An aborted fetch
+    /// deletes its partials (below) and a retry re-requests every chunk from
+    /// the first. The per-chunk addresses in the manifest make
+    /// resume-from-chunk-K possible later — verified chunks already on disk
+    /// could be kept and only the remainder re-requested — but that needs
+    /// partial files to SURVIVE an abort, the inverse of the ISC-A-C31
+    /// nothing-persists-on-failure posture shipped here, so it is a
+    /// deliberate follow-up design, not a quick patch.
+    ///
+    /// **Clean partial handling:** any abort (timeout, hash mismatch, stream
+    /// end, I/O error) DELETES every file this fetch wrote — the in-progress
+    /// partial and its already-completed siblings — and prunes the directories
+    /// that emptied. A failed fetch persists nothing (ISC-A-C31): a
+    /// silently-truncated file on disk is worse than no file. On a failed
+    /// RE-fetch the previous download's copies were already truncated by the
+    /// re-write, so its stale `downloads.idx` entry is pruned too.
     async fn handle_confirm_fetch(
         &mut self,
         share_id: &str,
@@ -1874,7 +1942,7 @@ impl Actor {
             manifest,
         } = opened;
 
-        // Resolve the chunk set: an explicit selection (A2) or the whole
+        // Resolve the file set: an explicit selection (A2) or the whole
         // manifest (A1 confirm-all). Indices map onto the manifest's order;
         // an out-of-range index is dropped (filter_map) rather than aborting.
         let wanted: Vec<&ManifestEntry> = match &selected {
@@ -1882,127 +1950,205 @@ impl Actor {
             None => manifest.iter().collect(),
         };
 
-        let total_chunks = wanted.len() as u32;
+        // Chunk-granular progress over the SELECTED set (M16).
+        let total_chunks: u32 = wanted.iter().map(|e| e.chunks.len() as u32).sum();
         self.emit(NetEvent::FetchProgress {
             total_chunks: Some(total_chunks),
             chunks_received: 0,
             bytes_received: 0,
         });
 
-        // For each wanted entry, request the chunk by its advertised address,
-        // verify the response, and account bytes. A single-chunk-per-file
-        // alpha: one request per file, one response per request, sequential
-        // (pipelining is a post-MVP optimisation).
+        // Resolve the destination folder under the downloads root, mirroring
+        // core's `FetchedStore` policy (reuse this share's folder on a
+        // re-fetch; otherwise a safe name, collision-suffixed by share_id).
+        // The store open also creates the root.
+        let store = match FetchedStore::open(&fetched_root) {
+            Ok(s) => s,
+            Err(e) => {
+                return self.emit(NetEvent::FetchError {
+                    message: format!("could not open the downloads folder: {e}"),
+                });
+            }
+        };
+        let mut shares = match store.list_shares() {
+            Ok(s) => s,
+            Err(e) => {
+                return self.emit(NetEvent::FetchError {
+                    message: format!("could not read the downloads manifest: {e}"),
+                });
+            }
+        };
+        let folder = resolve_share_folder(&shares, share_id, name);
+        let share_dir = fetched_root.join(&folder);
+
+        // Every path this fetch writes, for the abort-time cleanup.
+        let mut written_paths: Vec<PathBuf> = Vec::new();
         let mut chunks_received: u32 = 0;
         let mut bytes_received: u64 = 0;
-        // Accumulate each file's verified plaintext bytes; persisted to the
-        // on-disk fetched store only after the whole fetch verifies (ISC-A-C31
-        // — a fetch that fails mid-stream returns early and persists nothing).
-        let mut fetched_files: Vec<VerifiedFile> = Vec::with_capacity(wanted.len());
-        for entry in &wanted {
-            let request = ShareFrame::ChunkRequest {
-                chunk_addr: entry.chunk_addr,
-            };
-            let req_frame = wire::CotFrame {
-                asset_address: asset_addr.as_bytes().to_vec(),
-                payload: request.encode(),
-            };
-            if out_tx.send(req_frame).await.is_err() {
-                return self.emit(NetEvent::FetchError {
-                    message: "fetch subscribe channel closed mid-fetch".to_owned(),
-                });
-            }
 
-            // Read until we see the response naming this chunk_addr; ignore
-            // other frame kinds (re-arrival of the manifest, noise from
-            // other subscribers).
-            let chunk_data = loop {
-                let frame = match inbound.message().await {
-                    Ok(Some(f)) => f,
-                    Ok(None) | Err(_) => {
-                        return self.emit(NetEvent::FetchError {
-                            message: "stream ended mid-fetch".to_owned(),
-                        });
-                    }
+        // The streaming download loop. Factored as an async block returning
+        // `Result` so every failure site funnels through ONE cleanup path
+        // (delete partials, prune dirs, emit FetchError) below.
+        let fetch_result: Result<Vec<FetchedFile>, String> = async {
+            let mut recorded: Vec<FetchedFile> = Vec::with_capacity(wanted.len());
+            for entry in &wanted {
+                // Path-traversal guard (ISC-A-C32): a hostile manifest must
+                // never write outside the share folder. Fail closed.
+                let Some(safe_rel) = sanitize_rel_path(&entry.rel_path) else {
+                    return Err(format!(
+                        "refusing a download path escaping its folder: {}",
+                        entry.rel_path
+                    ));
                 };
-                if frame.payload.is_empty() {
-                    continue;
+                let dest = share_dir.join(&safe_rel);
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("could not create download folder: {e}"))?;
                 }
-                match ShareFrame::decode(&frame.payload) {
-                    Ok(ShareFrame::ChunkResponse { chunk_addr, data }) => {
-                        if chunk_addr == entry.chunk_addr {
-                            break (chunk_addr, data);
-                        }
-                        // Response for some other chunk_addr — skip; sequential
-                        // alpha never has more than one outstanding request.
-                    }
-                    Ok(_) | Err(_) => continue,
-                }
-            };
+                // Create (truncating any previous copy — a re-fetch refreshes
+                // the download); chunks append through this held handle. An
+                // empty file (`chunks: []`) is now complete as-is.
+                let mut file = std::fs::File::create(&dest)
+                    .map_err(|e| format!("could not create {}: {e}", entry.rel_path))?;
+                written_paths.push(dest.clone());
 
-            // Verification (ISC-19 / F23): recompute SHA-384 and compare. A
-            // mismatch fails the whole fetch — the fetcher cannot trust any
-            // chunk after a hostile or corrupted one slipped through.
-            let recomputed = match chunk_addr(&chunk_data.1) {
-                Ok(a) => a,
-                Err(e) => {
-                    return self.emit(NetEvent::FetchError {
-                        message: format!("hash recompute failed: {e}"),
+                let mut file_bytes: u64 = 0;
+                for addr in &entry.chunks {
+                    // Request one chunk by its advertised address; sequential
+                    // (one outstanding request), same as pre-M16.
+                    let request = ShareFrame::ChunkRequest { chunk_addr: *addr };
+                    let req_frame = wire::CotFrame {
+                        asset_address: asset_addr.as_bytes().to_vec(),
+                        payload: request.encode(),
+                    };
+                    if out_tx.send(req_frame).await.is_err() {
+                        return Err("fetch subscribe channel closed mid-fetch".to_owned());
+                    }
+
+                    // Read until the response naming this chunk's address,
+                    // ignoring noise (manifest re-arrivals, other subscribers'
+                    // frames). Irrelevant frames do NOT reset the inactivity
+                    // clock — only the awaited chunk counts as progress.
+                    let last_relevant = std::time::Instant::now();
+                    let data = loop {
+                        let Some(budget) = remaining_inactivity_budget(last_relevant.elapsed())
+                        else {
+                            return Err(FETCH_TIMEOUT_MESSAGE.to_owned());
+                        };
+                        let frame = match tokio::time::timeout(budget, inbound.message()).await {
+                            Err(_elapsed) => return Err(FETCH_TIMEOUT_MESSAGE.to_owned()),
+                            Ok(Ok(Some(f))) => f,
+                            Ok(Ok(None)) | Ok(Err(_)) => {
+                                return Err("stream ended mid-fetch".to_owned());
+                            }
+                        };
+                        if frame.payload.is_empty() {
+                            continue;
+                        }
+                        match ShareFrame::decode(&frame.payload) {
+                            Ok(ShareFrame::ChunkResponse { chunk_addr, data })
+                                if chunk_addr == *addr =>
+                            {
+                                break data;
+                            }
+                            // Another chunk's response, another frame kind, or
+                            // an undecodable payload — skip.
+                            Ok(_) | Err(_) => continue,
+                        }
+                    };
+
+                    // Verification (ISC-19 / F23, ISC-S28 / ISC-A-S20):
+                    // recompute SHA-384 over the chunk's bytes and compare. A
+                    // mismatch fails the whole fetch — the fetcher cannot
+                    // trust any chunk after a hostile or corrupted one.
+                    let recomputed =
+                        chunk_addr(&data).map_err(|e| format!("hash recompute failed: {e}"))?;
+                    if recomputed != *addr {
+                        return Err(format!(
+                            "chunk hash mismatch on {} — refusing tampered content",
+                            entry.rel_path
+                        ));
+                    }
+
+                    // Stream the verified chunk straight to disk — never
+                    // accumulate a whole file in RAM (M16).
+                    file.write_all(&data)
+                        .map_err(|e| format!("could not write {}: {e}", entry.rel_path))?;
+                    file_bytes += data.len() as u64;
+                    chunks_received += 1;
+                    bytes_received += data.len() as u64;
+                    self.emit(NetEvent::FetchProgress {
+                        total_chunks: Some(total_chunks),
+                        chunks_received,
+                        bytes_received,
                     });
                 }
-            };
-            if recomputed != chunk_data.0 {
-                return self.emit(NetEvent::FetchError {
-                    message: format!(
-                        "chunk hash mismatch on {} — refusing tampered content",
-                        entry.rel_path
-                    ),
+
+                // Size on record is the verified bytes actually on disk (the
+                // chunks are the integrity truth; `entry.size` is advisory).
+                recorded.push(FetchedFile {
+                    rel_path: entry.rel_path.clone(),
+                    size: file_bytes,
                 });
             }
-
-            // The verified bytes are accumulated for persistence below; the
-            // verification gate above (ISC-S28 / ISC-A-S20) is the load-bearing
-            // security contract, persistence is bookkeeping above it. Bytes
-            // are kept in RAM until the whole fetch verifies, then written
-            // once as an explicit download (M15 C; ISC-C63).
-            chunks_received += 1;
-            bytes_received += chunk_data.1.len() as u64;
-            fetched_files.push(VerifiedFile {
-                rel_path: entry.rel_path.clone(),
-                bytes: chunk_data.1,
-            });
-            self.emit(NetEvent::FetchProgress {
-                total_chunks: Some(total_chunks),
-                chunks_received,
-                bytes_received,
-            });
+            Ok(recorded)
         }
+        .await;
+
+        let recorded = match fetch_result {
+            Ok(recorded) => recorded,
+            Err(message) => {
+                // Clean partial handling (M16): delete everything this fetch
+                // wrote and prune the directories that emptied — a failed
+                // fetch persists nothing (ISC-A-C31), and the in-progress
+                // partial must never survive as a silently-truncated file.
+                cleanup_written(&fetched_root, &share_dir, &written_paths);
+                // A failed RE-fetch already truncated the previous download's
+                // copies, so its idx entry now describes deleted files —
+                // prune it (best-effort) so the browse pane does not lie.
+                if shares.iter().any(|s| s.share_id == share_id) {
+                    shares.retain(|s| s.share_id != share_id);
+                    let _ = std::fs::write(
+                        fetched_root.join("downloads.idx"),
+                        render_downloads_idx(&shares),
+                    );
+                }
+                return self.emit(NetEvent::FetchError { message });
+            }
+        };
 
         // Close the subscribe stream first — the network half of the fetch is
         // done and the relay can reap once both stream halves are gone
-        // (refcount → 0); persistence is a local-disk step that needs no
+        // (refcount → 0); the idx update is a local-disk step that needs no
         // connection.
         drop(out_tx);
 
-        // Persist the fully-verified download (M15 C; ISC-C63 / C64). Only a
-        // fetch that verified every chunk reaches here, so a poisoned or
-        // truncated download is never recorded (ISC-A-C31). A persistence
-        // failure surfaces as a fetch error — the user must not believe a
-        // download landed when it did not.
-        match FetchedStore::open(&fetched_root)
-            .and_then(|mut store| store.record_share(share_id, name, &fetched_files))
-        {
-            Ok(_) => {}
-            Err(e) => {
-                return self.emit(NetEvent::FetchError {
-                    message: format!("verified but could not save download: {e}"),
-                });
-            }
+        // Record the fully-verified download in `downloads.idx` (M15 C;
+        // ISC-C63 / C64) — same v2 format core's `FetchedStore` parses (the
+        // files themselves were already streamed to their named paths above).
+        // Only a fetch that verified every chunk reaches here (ISC-A-C31). A
+        // bookkeeping failure surfaces as a fetch error — the user must not
+        // believe a download landed when the browse pane will not show it.
+        let files_written = recorded.len() as u32;
+        shares.retain(|s| s.share_id != share_id);
+        shares.push(FetchedShare {
+            share_id: share_id.to_owned(),
+            name: name.to_owned(),
+            folder,
+            files: recorded,
+        });
+        if let Err(e) = std::fs::write(
+            fetched_root.join("downloads.idx"),
+            render_downloads_idx(&shares),
+        ) {
+            return self.emit(NetEvent::FetchError {
+                message: format!("verified but could not save download: {e}"),
+            });
         }
 
         self.emit(NetEvent::FetchComplete {
             share_id: share_id.to_owned(),
-            files_written: chunks_received,
+            files_written,
             bytes_written: bytes_received,
         });
         // Refresh the browse pane with the newly-persisted download.
@@ -2224,6 +2370,196 @@ fn now_unix_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+// ── Fetch streaming-persistence helpers (M16, ISC-C73 / ISC-A-C35) ─────────
+//
+// The confirmed fetch streams verified chunks straight to named destination
+// files (never a whole file in RAM), so it can no longer hand a
+// `Vec<VerifiedFile>` to core's `FetchedStore::record_share` — that API takes
+// fully-buffered bytes. The folder policy, path hygiene, and `downloads.idx`
+// v2 format below deliberately MIRROR `daemonseed_core::storage::fetched`
+// (the round-trip is pinned by a test that reads our writes back through
+// `FetchedStore::list_shares`). Follow-up for core: grow a streaming API on
+// `FetchedStore` (begin/append/finish) so these mirrors can be deleted.
+
+/// How long a confirmed fetch waits for a relevant frame before aborting (M16
+/// inactivity timeout — new behavior, noted where the fetch states are
+/// documented on [`NetEvent::FetchError`]). The pre-M16 fetcher awaited
+/// forever, so a relay-dropped frame (e.g. the >4 MB tonic decode cap on
+/// whole-file frames) hung the overlay silently.
+///
+/// The timeout is **frame-granular**: the clock only resets when the awaited
+/// `ChunkResponse` arrives whole, so a link too slow to move one
+/// [`daemonseed_core::share_serve::CHUNK_SIZE`] (1 MiB) chunk inside the
+/// window — under ~280 kbit/s sustained — false-trips it on a perfectly
+/// healthy (just slow) transfer. Accepted for the MVP; revisit alongside
+/// resume-from-chunk-K (see [`Actor::handle_confirm_fetch`]'s resume-policy
+/// note), which would make a re-try cheap instead of a from-zero restart.
+pub(crate) const FETCH_INACTIVITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The user-facing cause for an inactivity abort.
+const FETCH_TIMEOUT_MESSAGE: &str =
+    "timed out waiting for chunks — the share may have stopped serving";
+
+/// Pure deadline math for the M16 inactivity timeout: given how long ago the
+/// last RELEVANT frame arrived, how much waiting budget remains? `None` means
+/// the budget is spent — abort the fetch. Factored pure so the abort
+/// condition is unit-testable without a runtime or a live stream.
+pub(crate) fn remaining_inactivity_budget(
+    since_last_relevant: std::time::Duration,
+) -> Option<std::time::Duration> {
+    FETCH_INACTIVITY_TIMEOUT
+        .checked_sub(since_last_relevant)
+        .filter(|d| !d.is_zero())
+}
+
+/// The manifest-size publish guard's decision (M16 design review): `Some` with
+/// the LOUD user-facing refusal when `manifest`'s encoded `ManifestResponse`
+/// frame would exceed [`MANIFEST_FRAME_BUDGET`] — i.e. when a fetcher's
+/// manifest request would be relay-dropped at tonic's decode cap, stalling
+/// every fetch of this share silently — `None` when the share is publishable.
+/// Factored pure (like [`remaining_inactivity_budget`]) so the threshold and
+/// message are unit-testable without a session or 70k real files.
+fn manifest_too_large_error(manifest: &ShareManifest) -> Option<String> {
+    let frame_len = manifest_frame_len(manifest);
+    (frame_len > MANIFEST_FRAME_BUDGET).then(|| {
+        format!(
+            "share too large to publish: {} files → {:.1} MB manifest exceeds \
+             the relay frame budget — split the share",
+            manifest.entries.len(),
+            frame_len as f64 / 1_000_000.0
+        )
+    })
+}
+
+/// Resolve the per-share folder for a download, mirroring core
+/// `FetchedStore::record_share`: reuse the share's existing folder on a
+/// re-fetch; otherwise derive a safe name from the listing name,
+/// collision-suffixed by share_id if another share already claimed it.
+fn resolve_share_folder(existing: &[FetchedShare], share_id: &str, name: &str) -> String {
+    if let Some(s) = existing.iter().find(|s| s.share_id == share_id) {
+        return s.folder.clone();
+    }
+    let base = safe_folder_name(name);
+    let taken = existing.iter().any(|s| s.folder == base);
+    if taken {
+        let suffix: String = share_id.chars().take(6).collect();
+        format!("{base}-{suffix}")
+    } else {
+        base
+    }
+}
+
+/// Derive a safe single-component folder name from an untrusted share name
+/// (mirror of core's `fetched::safe_folder_name`, ISC-A-C32): separators and
+/// control chars become `_`, leading/trailing dots and whitespace trimmed,
+/// empty falls back to `"share"`.
+fn safe_folder_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c == '/' || c == '\\' || c.is_control() {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim().trim_matches('.').trim();
+    if trimmed.is_empty() {
+        "share".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+/// Validate an untrusted wire `rel_path` and return the safe relative path to
+/// join under the share folder (mirror of core's `fetched::sanitize_rel_path`,
+/// ISC-A-C32). `None` = unsafe — rejects empty, absolute, `.`/`..`, and any
+/// non-Normal component; the wire form is `/`-separated on every platform.
+fn sanitize_rel_path(rel: &str) -> Option<PathBuf> {
+    use std::path::Component;
+    if rel.is_empty() || rel.starts_with('/') {
+        return None;
+    }
+    let mut safe = PathBuf::new();
+    for seg in rel.split('/') {
+        if seg.is_empty() {
+            continue;
+        }
+        let p = std::path::Path::new(seg);
+        let mut comps = p.components();
+        match (comps.next(), comps.next()) {
+            (Some(Component::Normal(c)), None) => safe.push(c),
+            _ => return None,
+        }
+    }
+    if safe.as_os_str().is_empty() {
+        return None;
+    }
+    Some(safe)
+}
+
+/// Render the `downloads.idx` manifest in core's documented v2 format
+/// (`fetched` module docs): hex-encoded variable fields so a name or path can
+/// never collide with the space delimiter. Must stay parseable by core's
+/// `FetchedStore::list_shares` — pinned by the round-trip test below.
+fn render_downloads_idx(shares: &[FetchedShare]) -> String {
+    let mut out = String::from("# daemonseed downloads manifest v2\n");
+    for s in shares {
+        out.push_str(&format!(
+            "S {} {} {} {}\n",
+            hex_lower(s.share_id.as_bytes()),
+            hex_lower(s.name.as_bytes()),
+            hex_lower(s.folder.as_bytes()),
+            s.files.len(),
+        ));
+        for f in &s.files {
+            out.push_str(&format!(
+                "F {} {}\n",
+                hex_lower(f.rel_path.as_bytes()),
+                f.size
+            ));
+        }
+    }
+    out
+}
+
+/// Dependency-free lowercase hex (the TUI carries no `hex` crate).
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// Best-effort cleanup after an aborted fetch (M16 clean-partial handling):
+/// delete every file the fetch wrote — the in-progress partial AND its
+/// already-completed siblings (a failed fetch persists nothing, ISC-A-C31) —
+/// then prune now-empty directories bottom-up, up to and including the share
+/// folder. `remove_dir` refuses a non-empty dir, which is exactly the guard
+/// that keeps a pre-existing download's other files (and the downloads root)
+/// untouched. Errors are ignored: cleanup must never mask the fetch error.
+fn cleanup_written(
+    fetched_root: &std::path::Path,
+    share_dir: &std::path::Path,
+    written: &[PathBuf],
+) {
+    for p in written {
+        let _ = std::fs::remove_file(p);
+    }
+    for p in written {
+        let mut dir = p.parent();
+        while let Some(d) = dir {
+            if !d.starts_with(share_dir) || d == fetched_root {
+                break;
+            }
+            let _ = std::fs::remove_dir(d);
+            dir = d.parent();
+        }
+    }
 }
 
 /// The cacheable + renderable result of evaluating a fetched deprecation policy
@@ -2516,6 +2852,40 @@ mod tests {
         assert!(
             actor.publish_cancels.borrow().is_empty(),
             "no cancel flag registered before the pre-flight passes"
+        );
+    }
+
+    /// The manifest-size publish guard (M16 design review): a file-count-dense
+    /// synthetic manifest whose encoded frame exceeds the budget yields the
+    /// LOUD refusal (file count + manifest MB + "split the share"), while a
+    /// normal manifest passes. Synthetic entries — the threshold is pure
+    /// arithmetic, no 70k real files needed.
+    #[test]
+    fn publish_guard_refuses_over_budget_manifest() {
+        let _ = oxicrypt_module::initialize();
+        let addr = daemonseed_core::storage::cas::chunk_addr(b"x").unwrap();
+        let entry = |i: usize| ManifestEntry {
+            rel_path: format!("library/track-{i:06}.mp3"),
+            size: 1,
+            chunks: vec![addr],
+        };
+
+        let dense = ShareManifest {
+            entries: (0..60_000).map(entry).collect(),
+        };
+        let message = manifest_too_large_error(&dense)
+            .expect("a manifest frame over the budget must be refused");
+        assert!(message.contains("share too large to publish"), "{message}");
+        assert!(message.contains("60000 files"), "{message}");
+        assert!(message.contains("split the share"), "{message}");
+
+        let normal = ShareManifest {
+            entries: (0..1_000).map(entry).collect(),
+        };
+        assert_eq!(
+            manifest_too_large_error(&normal),
+            None,
+            "a normal share publishes unimpeded"
         );
     }
 
@@ -2969,5 +3339,154 @@ mod tests {
             d.cache_policy.is_some(),
             "still cached for rollback baseline"
         );
+    }
+
+    // ── M16 streaming fetch: inactivity timeout + persistence mirrors ───────
+
+    /// The pure inactivity-deadline check (M16): budget remains strictly below
+    /// the 30s timeout, and is spent at exactly the timeout and beyond — the
+    /// abort condition, tested without a runtime or a live stream.
+    #[test]
+    fn fetch_inactivity_budget_expires_at_the_timeout() {
+        use std::time::Duration;
+        // Fresh wait: the full budget remains.
+        assert_eq!(
+            remaining_inactivity_budget(Duration::ZERO),
+            Some(FETCH_INACTIVITY_TIMEOUT)
+        );
+        // Mid-wait: the remainder.
+        assert_eq!(
+            remaining_inactivity_budget(Duration::from_secs(29)),
+            Some(Duration::from_secs(1))
+        );
+        // At and past the deadline: spent → abort.
+        assert_eq!(remaining_inactivity_budget(FETCH_INACTIVITY_TIMEOUT), None);
+        assert_eq!(
+            remaining_inactivity_budget(FETCH_INACTIVITY_TIMEOUT + Duration::from_secs(5)),
+            None
+        );
+    }
+
+    /// The TUI-side `downloads.idx` writer (M16 streaming persistence) stays
+    /// parseable by core's `FetchedStore::list_shares` — the anti-drift pin on
+    /// the mirrored v2 format.
+    #[test]
+    fn downloads_idx_writer_roundtrips_through_core_store() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let shares = vec![FetchedShare {
+            share_id: "abc123".to_owned(),
+            name: "My Photos".to_owned(),
+            folder: "My Photos".to_owned(),
+            files: vec![
+                FetchedFile {
+                    rel_path: "readme.txt".to_owned(),
+                    size: 5,
+                },
+                FetchedFile {
+                    rel_path: "sub/pic with space.png".to_owned(),
+                    size: 7_340_032,
+                },
+            ],
+        }];
+        std::fs::write(
+            dir.path().join("downloads.idx"),
+            render_downloads_idx(&shares),
+        )
+        .unwrap();
+        let store = FetchedStore::open(dir.path()).unwrap();
+        let read_back = store.list_shares().unwrap();
+        assert_eq!(read_back, shares);
+    }
+
+    /// The path-hygiene mirrors (ISC-A-C32) fail closed exactly like core's:
+    /// absolute / `..` / empty rel_paths are rejected, nested normal paths
+    /// pass; hostile share names reduce to a single safe component.
+    #[test]
+    fn fetch_path_hygiene_mirrors_fail_closed() {
+        assert!(sanitize_rel_path("/etc/passwd").is_none());
+        assert!(sanitize_rel_path("..").is_none());
+        assert!(sanitize_rel_path("a/../../b").is_none());
+        assert!(sanitize_rel_path("").is_none());
+        assert_eq!(
+            sanitize_rel_path("sub/dir/file.txt"),
+            Some(PathBuf::from("sub").join("dir").join("file.txt"))
+        );
+        assert_eq!(safe_folder_name(""), "share");
+        assert_eq!(safe_folder_name("a/b\\c"), "a_b_c");
+        for n in ["..", "../../etc", "/", ".", ""] {
+            let f = safe_folder_name(n);
+            assert!(!f.contains('/') && !f.contains('\\') && f != "." && f != "..");
+        }
+    }
+
+    /// Folder resolution mirrors core's `record_share` policy: a re-fetch
+    /// reuses the share's existing folder; a name collision with a DIFFERENT
+    /// share is suffixed by share_id.
+    #[test]
+    fn resolve_share_folder_reuses_and_collision_suffixes() {
+        let existing = vec![FetchedShare {
+            share_id: "aaaaaa11".to_owned(),
+            name: "Vacation".to_owned(),
+            folder: "Vacation".to_owned(),
+            files: Vec::new(),
+        }];
+        // Re-fetch of the same share_id → same folder.
+        assert_eq!(
+            resolve_share_folder(&existing, "aaaaaa11", "Vacation"),
+            "Vacation"
+        );
+        // A different share with the same name → suffixed.
+        assert_eq!(
+            resolve_share_folder(&existing, "bbbbbb22", "Vacation"),
+            "Vacation-bbbbbb"
+        );
+        // No collision → the safe base name.
+        assert_eq!(resolve_share_folder(&existing, "cccccc33", "docs"), "docs");
+    }
+
+    /// Abort-time cleanup (M16 clean-partial handling): every file the fetch
+    /// wrote is deleted and the directories that emptied are pruned up to the
+    /// share folder — but a pre-existing sibling file (an earlier download in
+    /// a shared folder) and the downloads root survive.
+    #[test]
+    fn cleanup_written_deletes_partials_and_prunes_empty_dirs() {
+        let root = tempfile::TempDir::new().unwrap();
+        let share_dir = root.path().join("docs");
+        let nested = share_dir.join("sub").join("deep");
+        std::fs::create_dir_all(&nested).unwrap();
+        let partial = nested.join("big.bin");
+        let done = share_dir.join("small.txt");
+        std::fs::write(&partial, b"truncated").unwrap();
+        std::fs::write(&done, b"complete").unwrap();
+        // An unrelated pre-existing file in the same share folder.
+        let keep = share_dir.join("keep.txt");
+        std::fs::write(&keep, b"older download").unwrap();
+
+        cleanup_written(root.path(), &share_dir, &[partial.clone(), done.clone()]);
+
+        assert!(!partial.exists(), "in-progress partial deleted");
+        assert!(
+            !done.exists(),
+            "completed sibling of the aborted fetch deleted"
+        );
+        assert!(!nested.exists(), "emptied dirs pruned");
+        assert!(!share_dir.join("sub").exists());
+        assert!(keep.exists(), "pre-existing file untouched");
+        assert!(share_dir.exists(), "non-empty share folder kept");
+        assert!(root.path().exists(), "downloads root never removed");
+    }
+
+    /// Abort-time cleanup removes the share folder itself when the aborted
+    /// fetch was its only content (no empty husk folders).
+    #[test]
+    fn cleanup_written_removes_a_fully_emptied_share_folder() {
+        let root = tempfile::TempDir::new().unwrap();
+        let share_dir = root.path().join("solo");
+        std::fs::create_dir_all(&share_dir).unwrap();
+        let only = share_dir.join("only.bin");
+        std::fs::write(&only, b"x").unwrap();
+        cleanup_written(root.path(), &share_dir, &[only]);
+        assert!(!share_dir.exists(), "emptied share folder pruned");
+        assert!(root.path().exists());
     }
 }

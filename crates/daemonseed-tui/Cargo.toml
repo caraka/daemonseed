@@ -59,3 +59,6 @@ dirs = { workspace = true }
 
 [dev-dependencies]
 oxitls-rustls-provider = { workspace = true, features = ["testing"] }
+# Throwaway dirs for the M16 streaming-fetch persistence tests (the
+# downloads.idx round-trip and the abort-time partial-file cleanup).
+tempfile = { workspace = true }

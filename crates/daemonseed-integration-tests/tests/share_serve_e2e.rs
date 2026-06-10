@@ -153,40 +153,42 @@ async fn fetcher_recovers_share_via_real_serve_path() {
 
     let mut recovered: Vec<(String, Vec<u8>)> = Vec::new();
     for entry in &manifest {
-        tx.send(frame(
-            &asset_bytes,
-            ShareFrame::ChunkRequest {
-                chunk_addr: entry.chunk_addr,
-            }
-            .encode(),
-        ))
-        .await
-        .unwrap();
-        let chunk = loop {
-            let resp = tokio::time::timeout(Duration::from_secs(5), inbound.message())
-                .await
-                .expect("chunk within timeout")
-                .expect("stream healthy")
-                .expect("frame, not end-of-stream");
-            if resp.payload.is_empty() {
-                continue;
-            }
-            match ShareFrame::decode(&resp.payload).expect("chunk decodes") {
-                ShareFrame::ChunkResponse { chunk_addr, data }
-                    if chunk_addr == entry.chunk_addr =>
-                {
-                    break (chunk_addr, data);
+        // M16 (ISC-C73 / ISC-A-C35): a file is its ordered chunk list — fetch
+        // each chunk in order and concatenate (these small fixtures are one
+        // chunk each; the loop is the general shape).
+        let mut file_bytes = Vec::new();
+        for addr in &entry.chunks {
+            tx.send(frame(
+                &asset_bytes,
+                ShareFrame::ChunkRequest { chunk_addr: *addr }.encode(),
+            ))
+            .await
+            .unwrap();
+            let chunk = loop {
+                let resp = tokio::time::timeout(Duration::from_secs(5), inbound.message())
+                    .await
+                    .expect("chunk within timeout")
+                    .expect("stream healthy")
+                    .expect("frame, not end-of-stream");
+                if resp.payload.is_empty() {
+                    continue;
                 }
-                _ => continue,
-            }
-        };
-        // ISC-S28 / ISC-19: re-derive SHA-384 and reject on mismatch.
-        let recomputed = chunk_addr(&chunk.1).expect("recompute hash");
-        assert_eq!(
-            recomputed, chunk.0,
-            "fetcher verifies the served chunk against its advertised address"
-        );
-        recovered.push((entry.rel_path.clone(), chunk.1));
+                match ShareFrame::decode(&resp.payload).expect("chunk decodes") {
+                    ShareFrame::ChunkResponse { chunk_addr, data } if chunk_addr == *addr => {
+                        break (chunk_addr, data);
+                    }
+                    _ => continue,
+                }
+            };
+            // ISC-S28 / ISC-19: re-derive SHA-384 and reject on mismatch.
+            let recomputed = chunk_addr(&chunk.1).expect("recompute hash");
+            assert_eq!(
+                recomputed, chunk.0,
+                "fetcher verifies the served chunk against its advertised address"
+            );
+            file_bytes.extend_from_slice(&chunk.1);
+        }
+        recovered.push((entry.rel_path.clone(), file_bytes));
     }
 
     assert_eq!(recovered[0].1, file_a, "page 1 byte-identical");

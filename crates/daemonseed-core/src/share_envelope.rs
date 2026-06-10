@@ -37,13 +37,30 @@
 //!   ChunkResponse    := [0x03 | chunk_addr(48) | data ]
 //!
 //!   entry            := [ rel_path_len(u16 BE) | rel_path_utf8 |
-//!                         chunk_addr(48) | size(u64 BE) ]
+//!                         size(u64 BE) |
+//!                         chunk_count(u32 BE) | chunk_addr(48) × chunk_count ]
 //! ```
 //!
-//! Each frame fits inside a single `CotFrame.payload`. The relay enforces
-//! whatever per-frame size limit it likes; the largest realistic frame is a
-//! `ChunkResponse` whose chunk-bytes payload is bounded by the file-relay
-//! chunk-size policy (single-chunk-per-file alpha; tunable, post-MVP).
+//! ### ⚠️ M16 in-place format change — alpha compatibility WAIVED
+//!
+//! The `entry` encoding above is the **M16 sub-file-chunking shape**: each
+//! entry carries an ordered per-chunk address list instead of the single
+//! whole-file `chunk_addr` the M11..M15 alpha encoded. This is a breaking,
+//! in-place change to the `ManifestResponse` body — an old client decoding a
+//! new manifest (or vice versa) fails closed as `Truncated`/garbage, by
+//! design. The compatibility waiver is deliberate: the alpha test population
+//! is the in-house daemon group, both ends rebuild from the same commit, and
+//! the relay never decodes `CotFrame.payload` (ISC-A-S2 structural opacity),
+//! so deployed relays — including the live fra1 relay — keep working
+//! unchanged. `ChunkRequest` / `ChunkResponse` wire shapes are UNCHANGED.
+//!
+//! Why chunks at all: the single-chunk-per-file alpha put an entire file's
+//! bytes into ONE `ChunkResponse`, hence one gRPC frame — an 8.9 MB file
+//! blew past tonic's default 4 MB per-message decode cap at the relay and
+//! the fetch hung (the live ISC-C73 / ISC-A-C35 gap). Fixed-size
+//! [`crate::share_serve::CHUNK_SIZE`] (1 MiB) chunks keep every frame
+//! relay-safe regardless of file size, make serve/fetch memory O(1 MiB),
+//! and make per-chunk SHA-384 verification cheap.
 //!
 //! ## Failure modes
 //!
@@ -79,14 +96,20 @@ use crate::storage::cas::{CHUNK_ADDR_LEN, ChunkAddr};
 pub struct ManifestEntry {
     /// The file's path relative to the share root.
     pub rel_path: String,
-    /// The chunk address ([`crate::storage::cas::ChunkAddr`]) the fetcher
-    /// requests to download this file (1 file = 1 chunk for the M11 alpha;
-    /// multi-chunk-per-file is post-MVP, layered on without wire change).
-    pub chunk_addr: ChunkAddr,
-    /// The file's size in bytes (advisory — the fetcher's authoritative size
-    /// check is `data.len()` from the [`ShareFrame::ChunkResponse`] vs the
-    /// re-derived SHA-384 match).
+    /// The file's size in bytes (advisory — the fetcher's authoritative
+    /// integrity check is the per-chunk re-derived SHA-384 match on every
+    /// [`ShareFrame::ChunkResponse`]).
     pub size: u64,
+    /// The file's **ordered** chunk addresses (M16 — ISC-C73 / ISC-A-C35).
+    /// The file's bytes are the concatenation of the chunks in this order;
+    /// chunk `i` covers `[i*CHUNK_SIZE, min((i+1)*CHUNK_SIZE, size))` with
+    /// [`crate::share_serve::CHUNK_SIZE`] fixed at 1 MiB, so only the last
+    /// chunk may be short. Each address is the SHA-384
+    /// ([`crate::storage::cas::chunk_addr`]) of **that chunk's** bytes — the
+    /// fetcher verifies every chunk independently, never buffering more than
+    /// one chunk to do so. An empty file is `size: 0, chunks: []` (nothing to
+    /// request — the fetcher materializes an empty file).
+    pub chunks: Vec<ChunkAddr>,
 }
 
 /// One application-level frame inside a [`crate::cot::AssetAddr`]-routed
@@ -146,7 +169,13 @@ impl ShareFrame {
             ShareFrame::ManifestRequest => vec![KIND_MANIFEST_REQUEST],
             ShareFrame::ManifestResponse { entries } => {
                 // 1 (kind) + 4 (count) + sum(per-entry overhead) + data
-                let mut out = Vec::with_capacity(1 + 4 + entries.len() * (2 + CHUNK_ADDR_LEN + 8));
+                let mut out = Vec::with_capacity(
+                    1 + 4
+                        + entries
+                            .iter()
+                            .map(|e| 2 + e.rel_path.len() + 8 + 4 + e.chunks.len() * CHUNK_ADDR_LEN)
+                            .sum::<usize>(),
+                );
                 out.push(KIND_MANIFEST_RESPONSE);
                 let count = entries.len() as u32;
                 out.extend_from_slice(&count.to_be_bytes());
@@ -155,8 +184,15 @@ impl ShareFrame {
                     let path_len = path_bytes.len() as u16;
                     out.extend_from_slice(&path_len.to_be_bytes());
                     out.extend_from_slice(path_bytes);
-                    out.extend_from_slice(e.chunk_addr.as_bytes());
                     out.extend_from_slice(&e.size.to_be_bytes());
+                    // M16: ordered per-chunk address list (see the module
+                    // docs' compatibility waiver — this replaced the single
+                    // whole-file address in place).
+                    let chunk_count = e.chunks.len() as u32;
+                    out.extend_from_slice(&chunk_count.to_be_bytes());
+                    for addr in &e.chunks {
+                        out.extend_from_slice(addr.as_bytes());
+                    }
                 }
                 out
             }
@@ -192,14 +228,23 @@ impl ShareFrame {
                     let rel_path = core::str::from_utf8(path_bytes)
                         .map_err(|_| DecodeError::BadUtf8)?
                         .to_owned();
-                    let addr_bytes = r.read_slice(CHUNK_ADDR_LEN)?;
-                    let mut addr = [0u8; CHUNK_ADDR_LEN];
-                    addr.copy_from_slice(addr_bytes);
                     let size = r.read_u64_be()?;
+                    // M16: ordered per-chunk address list. A chunk_count that
+                    // names more addresses than the buffer holds fails closed
+                    // as Truncated on the first short read — a hostile count
+                    // cannot force a large allocation (capacity is bounded).
+                    let chunk_count = r.read_u32_be()? as usize;
+                    let mut chunks = Vec::with_capacity(chunk_count.min(1024));
+                    for _ in 0..chunk_count {
+                        let addr_bytes = r.read_slice(CHUNK_ADDR_LEN)?;
+                        let mut addr = [0u8; CHUNK_ADDR_LEN];
+                        addr.copy_from_slice(addr_bytes);
+                        chunks.push(ChunkAddr::from_bytes(addr));
+                    }
                     entries.push(ManifestEntry {
                         rel_path,
-                        chunk_addr: ChunkAddr::from_bytes(addr),
                         size,
+                        chunks,
                     });
                 }
                 Ok(ShareFrame::ManifestResponse { entries })
@@ -303,18 +348,58 @@ mod tests {
             entries: vec![
                 ManifestEntry {
                     rel_path: "a.txt".to_owned(),
-                    chunk_addr: a,
                     size: 13,
+                    chunks: vec![a],
                 },
                 ManifestEntry {
                     rel_path: "sub/b.txt".to_owned(),
-                    chunk_addr: b,
                     size: 13,
+                    chunks: vec![b],
                 },
             ],
         };
         let enc = frame.encode();
         let dec = ShareFrame::decode(&enc).unwrap();
+        assert_eq!(dec, frame);
+    }
+
+    /// M16 (ISC-C73 / ISC-A-C35) — an entry whose file spans several chunks
+    /// round-trips its ordered address list exactly (order is load-bearing:
+    /// the file's bytes are the concatenation of the chunks in this order).
+    #[test]
+    fn manifest_response_roundtrips_multi_chunk_entry() {
+        let c0 = addr(b"chunk zero");
+        let c1 = addr(b"chunk one");
+        let c2 = addr(b"chunk two (short last)");
+        let frame = ShareFrame::ManifestResponse {
+            entries: vec![ManifestEntry {
+                rel_path: "big.bin".to_owned(),
+                size: 2 * 1024 * 1024 + 7,
+                chunks: vec![c0, c1, c2],
+            }],
+        };
+        let dec = ShareFrame::decode(&frame.encode()).unwrap();
+        assert_eq!(dec, frame);
+        match dec {
+            ShareFrame::ManifestResponse { entries } => {
+                assert_eq!(entries[0].chunks, vec![c0, c1, c2], "order preserved");
+            }
+            other => panic!("expected ManifestResponse, got {other:?}"),
+        }
+    }
+
+    /// M16 — an empty file is `size: 0, chunks: []` and round-trips the
+    /// envelope (the fetcher materializes it without requesting any chunk).
+    #[test]
+    fn manifest_response_roundtrips_empty_file_entry() {
+        let frame = ShareFrame::ManifestResponse {
+            entries: vec![ManifestEntry {
+                rel_path: "empty.txt".to_owned(),
+                size: 0,
+                chunks: Vec::new(),
+            }],
+        };
+        let dec = ShareFrame::decode(&frame.encode()).unwrap();
         assert_eq!(dec, frame);
     }
 
@@ -380,9 +465,24 @@ mod tests {
         bytes.extend_from_slice(&1u32.to_be_bytes());
         bytes.extend_from_slice(&2u16.to_be_bytes()); // path_len = 2
         bytes.extend_from_slice(&[0xFF, 0xFE]); // invalid UTF-8
-        bytes.extend_from_slice(&[0u8; CHUNK_ADDR_LEN]);
-        bytes.extend_from_slice(&0u64.to_be_bytes());
+        bytes.extend_from_slice(&0u64.to_be_bytes()); // size
+        bytes.extend_from_slice(&0u32.to_be_bytes()); // chunk_count = 0
         assert_eq!(ShareFrame::decode(&bytes), Err(DecodeError::BadUtf8));
+    }
+
+    /// M16 — a chunk_count that names more addresses than the buffer holds
+    /// fails closed as Truncated (a hostile relay cannot smuggle a short
+    /// chunk list past the parser, nor force a huge allocation).
+    #[test]
+    fn manifest_entry_truncated_chunk_list_is_caught() {
+        let mut bytes = vec![KIND_MANIFEST_RESPONSE];
+        bytes.extend_from_slice(&1u32.to_be_bytes());
+        bytes.extend_from_slice(&1u16.to_be_bytes()); // path_len = 1
+        bytes.push(b'f');
+        bytes.extend_from_slice(&100u64.to_be_bytes()); // size
+        bytes.extend_from_slice(&2u32.to_be_bytes()); // chunk_count = 2 …
+        bytes.extend_from_slice(&[0u8; CHUNK_ADDR_LEN]); // … but only 1 addr
+        assert_eq!(ShareFrame::decode(&bytes), Err(DecodeError::Truncated));
     }
 
     /// ISC-19 / F23: a fetcher verifies a ChunkResponse by recomputing the

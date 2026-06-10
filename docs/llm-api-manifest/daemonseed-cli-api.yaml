@@ -909,8 +909,10 @@ functions:
       answered via tokio::task::spawn_blocking, NEVER inline — answer() does
       synchronous file I/O for a disk-backed chunk, and this loop may run as
       a spawn_local task on the TUI net actor's single-threaded LocalSet, so
-      an inline answer would park the entire actor for the duration of a
-      multi-GB read (ISC-A-C35). The source never fabricates a chunk it does
+      an inline answer would park the entire actor for the duration of each
+      disk read (a 1 MiB chunk-range seek+read since the M16 chunking
+      completion; potentially multi-GB before it — ISC-A-C35). The source
+      never fabricates a chunk it does
       not hold (ISC-A-S21); bytes hash to the advertised address by receiver
       re-derivation (ISC-S28).
     signature: "pub async fn serve_share<C>(&self, server_id: &str, share_id: &str, content: Arc<C>) -> Result<(), ServeShareError> where C: ChunkSource + Send + Sync + 'static"

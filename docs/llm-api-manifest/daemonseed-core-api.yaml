@@ -337,7 +337,17 @@ modules:
       is a daemonseed-core detail, documented in LAMA, not new wire schema).
       Discriminator: 0x00=ManifestRequest, 0x01=ManifestResponse,
       0x02=ChunkRequest, 0x03=ChunkResponse. Decode fails closed on any
-      malformed input.
+      malformed input. M16 sub-file chunking changed the ManifestResponse
+      entry encoding IN PLACE (alpha compat waived — pre-public, both clients
+      rebuild from the same commit, the payload-blind relay keeps working
+      unchanged): an entry is now [u16 path-len][path][u64 size]
+      [u32 chunk_count][48-byte addr x chunk_count] — ManifestEntry carries
+      an ORDERED per-chunk address list (chunks: Vec<ChunkAddr>; empty file =
+      size 0, chunks []) replacing the single whole-file chunk_addr; chunk i
+      covers [i*CHUNK_SIZE, min((i+1)*CHUNK_SIZE, size)). ChunkRequest /
+      ChunkResponse wire shapes are UNCHANGED. A hostile chunk_count that
+      names more addresses than the buffer holds fails closed as Truncated
+      (bounded allocation).
     no_std: false
     depends_on:
       - daemonseed_core::storage::cas
@@ -351,18 +361,32 @@ modules:
     description: >-
       Serve-side share content. ShareContent::index_dir reads a directory
       whole into a MemoryChunkStore (the in-RAM path — kept for the CLI and
-      tests). M16 adds the disk-backed publish/serve path (ISC-C73 / A-C35):
-      hash_share stream-hashes every file through a fixed 1 MiB buffer into a
-      ShareManifest whose per-file chunk_addr is byte-identical to the in-RAM
-      path's (one SHA-384 over the file's full bytes — fetch-side
-      verification unchanged, ISC-S28), cancellable between files, with
-      per-file progress; DiskShareContent pairs that manifest with the share
-      root and reads ONE file from disk per chunk request, so serve memory is
-      proportional to one file, not the share. The serve loop's needs are
-      factored into the ChunkSource trait (manifest + chunk lookup, pure
-      `answer` provided), implemented by both ShareContent and
-      DiskShareContent so a transport driver serves either through one code
-      path. ServeError gained Cancelled / UnknownChunk / ChunkModified.
+      tests). M16 adds the disk-backed publish/serve path (ISC-C73 / A-C35),
+      completed by 1 MiB sub-file chunking: every file is split into fixed
+      CHUNK_SIZE (1 MiB) chunks — chunk i covers [i*CHUNK_SIZE,
+      min((i+1)*CHUNK_SIZE, size)), only the last chunk may be short, empty
+      file = no chunks — so one chunk rides in one ChunkResponse frame and
+      every wire frame stays relay-safe under tonic's default 4 MB
+      per-message decode cap regardless of file size (the 8.9 MB whole-file
+      frame that silently stalled at the payload-blind relay is the motivating
+      failure). hash_share stream-hashes every file one CHUNK_SIZE buffer at
+      a time (hash_file_chunks; never a whole-file read) into a ShareManifest
+      whose ordered per-chunk SHA-384 addresses are byte-identical to the
+      in-RAM path's (fetch-side verification unchanged in principle, now
+      chunk-granular — ISC-S28), cancellable between files AND between
+      chunks, with per-file progress; DiskShareContent pairs that manifest
+      with the share root and seek+exact-length-reads ONE chunk's byte range
+      per request, so serve memory is O(CHUNK_SIZE) — never a whole file,
+      never the share. The serve loop's needs are factored into the
+      ChunkSource trait (manifest + chunk lookup, pure `answer` provided),
+      implemented by both ShareContent and DiskShareContent so a transport
+      driver serves either through one code path. ServeError gained
+      Cancelled / UnknownChunk / ChunkModified. The manifest frame itself
+      grows with file count, so MANIFEST_FRAME_BUDGET (3_500_000 — headroom
+      under the 4 MiB cap for CotFrame envelope overhead) +
+      manifest_frame_len (exact encoded ManifestResponse length, computed
+      without building the buffer, pinned to the real encoder by test) give
+      the publish path its refuse-loudly-at-source guard (ISC-A-C37).
     no_std: false
     depends_on:
       - daemonseed_core::share_envelope
@@ -374,15 +398,19 @@ modules:
       - A-S21
       - C73
       - A-C35
-    added_in: "ShareContent M11/M15; disk-backed path M16 (serve-from-disk)"
+      - A-C37
+    added_in: "ShareContent M11/M15; disk-backed path M16 (serve-from-disk); 1 MiB sub-file chunking + manifest frame budget M16 (crown completion)"
 
   - name: daemonseed_core::storage::share_index
     description: >-
       Encrypted, incremental redb-backed share index (M8, ISC-C21 / A-C6 / A-C7)
       — the indexed-state layer of the three-layer storage split. One ShareEntry
       per shared file (rel_path, size, mtime, and as of M16 an optional cached
-      chunk_addr — the publish-path hash cache, ISC-C73, valid only while
-      size+mtime still match; a metadata-only scan writes None). Incremental:
+      chunk_addrs blob — the publish-path hash cache, ISC-C73: the ORDERED
+      concatenation of the file's per-chunk 48-byte SHA-384 addresses
+      (len/48 == ceil(size/CHUNK_SIZE); Some(empty) = hashed empty file,
+      distinct from None = never hashed), valid only while size+mtime still
+      match; a metadata-only scan writes None). Incremental:
       put/remove rewrite ONE
       entry, never the whole index (A-C7, the Pi-4 civility floor); persisted, so
       reopening reuses rather than cold-rescans (C21). Per entry the redb KEY is
@@ -390,10 +418,13 @@ modules:
       without the key; deterministic) and the VALUE is AES-256-GCM(index_key,
       nonce, padded-metadata). Values padded to 256-byte buckets so ciphertext
       length can't leak path length. Index records the LOGICAL view (decrypted
-      names). M16 value-format v2: the redb table name bumped share-index →
-      share-index-v2 (alpha format bump — an old v1 table is abandoned in
-      place, never read or migrated; a rescan repopulates, the index is a
-      cache over the filesystem, not a record). New clear() empties the index
+      names). M16 value format v3: the redb table name bumped twice within
+      M16 — share-index → share-index-v2 (single cached whole-file addr) →
+      share-index-v3 (multi-addr rows: u8 presence byte + u32 addrs-len +
+      blob, for the sub-file-chunking switch; v2 was hours old and never
+      shipped in a tag). Each bump abandons older tables in place — never
+      read, never migrated; a rescan repopulates, the index is a cache over
+      the filesystem, not a record. New clear() empties the index
       in one transaction (the clear-then-rescan latest-define-wins move).
     no_std: false
     depends_on: []
@@ -452,11 +483,14 @@ modules:
       scan_into gained a cancel flag — checked per entry, a set flag
       EARLY-RETURNS Ok(count) with however many files were upserted
       (cancellation is idempotent metadata work, not an error; a metadata-only
-      scan writes chunk_addr: None). New cached_or_hash uses the index as a
+      scan writes chunk_addrs: None). New cached_or_hash uses the index as a
       chunk-addr CACHE for the disk-backed publish path (ISC-C73): a file
       whose indexed size+mtime still match and whose entry carries a cached
-      chunk_addr is reused without reading the file; misses stream-hash and
-      write the fresh address back; index None = exactly hash_share.
+      chunk_addrs blob that PARSES for that size (len % 48 == 0, len/48 ==
+      ceil(size/CHUNK_SIZE)) is reused without reading the file; misses (and
+      malformed blobs — e.g. abandoned v2 single-addr rows) stream-hash per
+      1 MiB chunk and write all fresh addresses back, ordered + concatenated;
+      index None = exactly hash_share.
     no_std: false
     depends_on:
       - daemonseed_core::storage::share_index
@@ -1302,24 +1336,31 @@ types:
     description: >-
       The manifest a hash pass produces over a share root (M16): entries:
       Vec<ManifestEntry>, one per file, in the same deterministic order as
-      ShareContent::index_dir (sorted walk + full-path sort) with byte-identical
-      per-file SHA-384 chunk addresses — fetch-side verification unchanged
-      (ISC-S28).
+      ShareContent::index_dir (sorted walk + full-path sort) with
+      byte-identical ORDERED per-chunk SHA-384 addresses (1 MiB CHUNK_SIZE
+      sub-file ranges; ManifestEntry { rel_path, size, chunks: Vec<ChunkAddr> },
+      empty file = chunks []) — fetch-side verification unchanged in
+      principle, now chunk-granular (ISC-S28).
 
   - name: DiskShareContent
     module: daemonseed_core::share_serve
     kind: struct
     description: >-
       Disk-backed serve content (M16, ISC-C73 / A-C35): new(root, manifest)
-      pairs a share root with a hashed ShareManifest (O(1) addr→entry map built
-      once); file_count() / manifest() / get_chunk(&ChunkAddr) -> Result<Vec<u8>,
-      ServeError>. get_chunk reads the ONE file behind the address and applies
-      cheap fail-closed checks ONLY — a read error (Io) or a byte length that no
-      longer matches the manifest entry (ChunkModified); UnknownChunk for an
-      address not in the manifest. Deliberately NO serve-time re-hash: the
-      receiver's per-chunk SHA-384 re-derivation (ISC-S28) is the integrity
-      guarantee — a same-size content change passes this server and is rejected
-      by the fetcher; re-publish to serve intentionally changed content.
+      pairs a share root with a hashed ShareManifest (O(1) addr→(entry, chunk
+      index) map built once; duplicate addrs keep the first mapping — CAS
+      semantics); file_count() / manifest() / get_chunk(&ChunkAddr) ->
+      Result<Vec<u8>, ServeError>. get_chunk seeks to chunk_index*CHUNK_SIZE
+      in the ONE file behind the address and reads EXACTLY the chunk's
+      manifest-implied length — O(CHUNK_SIZE) memory however large the file
+      (the former largest-single-file transient-RAM caveat is gone) — with
+      cheap fail-closed checks ONLY: a read/open error (Io), an on-disk size
+      or short-read mismatch vs the manifest (ChunkModified); UnknownChunk
+      for an address not in the manifest. Deliberately NO serve-time re-hash:
+      the receiver's per-chunk SHA-384 re-derivation (ISC-S28) is the
+      integrity guarantee — a same-size content change passes this server and
+      is rejected by the fetcher; re-publish to serve intentionally changed
+      content.
 
   - name: ChunkSource
     module: daemonseed_core::share_serve
@@ -1346,14 +1387,15 @@ types:
       - name: Cas
         description: "Cas(CasError) — hashing failed (oxicrypt SHA-384 self-test not passed)."
       - name: Cancelled
-        description: The hash pass was cancelled via its flag (checked between files; no partial manifest).
+        description: The hash pass was cancelled via its flag (checked between files AND between chunks of a large file; no partial manifest).
       - name: UnknownChunk
         description: A requested chunk address is not in this content's manifest.
       - name: ChunkModified
         description: >-
-          ChunkModified { rel_path } — a share file's on-disk byte length no
-          longer matches its manifest entry (truncated/grew since hashing);
-          fails closed, never a knowingly mismatched frame on the wire.
+          ChunkModified { rel_path } — a share file's on-disk length no
+          longer matches its manifest entry, or a chunk-range read came up
+          short (truncated/grew since hashing); fails closed, never a
+          knowingly mismatched frame on the wire.
 
   # ── storage::share_index ────────────────────────────────────────────
   - name: ShareEntry
@@ -1370,13 +1412,16 @@ types:
       - name: mtime_unix_ms
         type: u64
         description: Modification time in Unix milliseconds.
-      - name: chunk_addr
+      - name: chunk_addrs
         type: "Option<Vec<u8>>"
         description: >-
-          Cached 48-byte SHA-384 content address from the last hash pass
-          (M16, ISC-C73), or None after a metadata-only scan. Valid only
-          while size and mtime_unix_ms still match the file; a change event
-          or rescan writes None so a stale address never survives.
+          Cached content addresses from the last hash pass (M16, ISC-C73):
+          the ORDERED concatenation of the file's per-chunk 48-byte SHA-384
+          addresses (len % 48 == 0, len/48 == ceil(size/CHUNK_SIZE);
+          Some(empty) = hashed empty file, distinct from None = never
+          hashed / metadata-only scan). Valid only while size and
+          mtime_unix_ms still match the file; a change event or rescan
+          writes None so a stale address never survives.
 
   - name: ShareIndex
     module: daemonseed_core::storage::share_index
@@ -3445,8 +3490,10 @@ functions:
       A-S2 structural opacity holds for share traffic the same way it does
       for chat. Each frame fits inside a single CotFrame.payload; the
       largest realistic frame is a ChunkResponse whose data bytes are
-      bounded by the file-relay chunk-size policy (single-chunk-per-file
-      alpha; tunable, post-MVP).
+      bounded by share_serve::CHUNK_SIZE (1 MiB sub-file chunks, M16 —
+      relay-safe under tonic's default 4 MB per-message decode cap), and a
+      ManifestResponse is publish-guarded under
+      share_serve::MANIFEST_FRAME_BUDGET (ISC-A-C37).
     signature: "pub fn encode(&self) -> Vec<u8>"
     iscs: ["19", F23, A-S2]
 
@@ -3475,16 +3522,19 @@ functions:
     module: daemonseed_core::share_serve
     description: >-
       Walk root and stream-hash every regular file into a ShareManifest
-      (M16, ISC-C73) — each file fed through a fixed 1 MiB buffer into
-      SHA-384, never a whole-file read, so the pass's memory footprint is
-      independent of file size. Same deterministic order and per-file
-      chunk_addr as ShareContent::index_dir, so fetch-side verification is
-      unchanged (ISC-S28). progress(done, total) fires after every file
-      (the file list is collected first so total is stable from the first
-      callback); cancel is checked BETWEEN files — a set flag aborts with
-      ServeError::Cancelled, no partial manifest. An unreadable file aborts
-      the pass (a sharer must know its content is complete before
-      advertising it).
+      (M16, ISC-C73) — each file read one CHUNK_SIZE (1 MiB) buffer at a
+      time, never a whole-file read, each full buffer-load hashed as ONE
+      chunk to its own SHA-384 address (only EOF may leave a chunk short),
+      so the pass's memory footprint is independent of file size. Same
+      deterministic order and byte-identical ordered per-chunk addresses as
+      ShareContent::index_dir, so fetch-side verification is unchanged
+      (ISC-S28). progress(done, total) fires after every file — per-file,
+      not per-chunk (a chunk is an internal unit, not a UX one); the file
+      list is collected first so total is stable from the first callback.
+      cancel is checked between files AND between chunks of a large file —
+      a set flag aborts with ServeError::Cancelled, no partial manifest. An
+      unreadable file aborts the pass (a sharer must know its content is
+      complete before advertising it).
     signature: "pub fn hash_share(root: &Path, cancel: &AtomicBool, progress: &mut dyn FnMut(usize, usize)) -> Result<ShareManifest, ServeError>"
     returns:
       type: "Result<ShareManifest, ServeError>"
@@ -3497,6 +3547,26 @@ functions:
         - name: Cancelled
           condition: The cancel flag was set before the pass completed.
     iscs: [C73, C74, S28]
+
+  - name: manifest_frame_len
+    module: daemonseed_core::share_serve
+    description: >-
+      The exact byte length of the encoded ShareFrame::ManifestResponse
+      carrying this manifest's entries — what the manifest's wire frame will
+      weigh, computed WITHOUT building the (potentially multi-megabyte)
+      buffer. Mirrors the share_envelope entry encoding exactly ([1 kind]
+      [u32 count] + per entry [u16 path-len][path][u64 size][u32 chunk_count]
+      [48-byte addr x chunk_count]); the unit test
+      manifest_frame_len_matches_real_encoding pins the arithmetic to
+      ShareFrame::encode's actual output length so the two cannot drift. The
+      publish path compares this against MANIFEST_FRAME_BUDGET (3_500_000 —
+      headroom under tonic's default 4 MiB per-message decode cap for the
+      CotFrame envelope overhead; a compile-time assert keeps it < 4 MiB)
+      and refuses an over-budget share loudly at publish time — never a
+      silent relay-side stall (ISC-A-C37; the ceiling is file-count-driven
+      as much as byte-driven, ~62 bytes + path per entry).
+    signature: "pub fn manifest_frame_len(manifest: &ShareManifest) -> usize"
+    iscs: [A-C37]
 
   # ── circle::message ─────────────────────────────────────────────────
   - name: seal_message
@@ -3844,7 +3914,7 @@ functions:
     description: >-
       Cold-scan root into a BORROWED ShareIndex (M14 — the TUI net-actor
       share-activation path; cold_scan delegates here). Upserts every regular
-      file (metadata only — chunk_addr: None; content addresses come from the
+      file (metadata only — chunk_addrs: None; content addresses come from the
       hash pass, never a stat walk); unreadable entries skipped, not fatal.
       M16 added the cancel flag: checked per entry, a set flag EARLY-RETURNS
       Ok(count) — cancellation is idempotent metadata work, not an error
@@ -3866,16 +3936,20 @@ functions:
     description: >-
       Build a share's ShareManifest using the index as a chunk-addr CACHE
       (M16, ISC-C73 — the disk-backed publish path): a file whose indexed
-      size+mtime still match and whose entry carries a cached chunk_addr is
-      reused WITHOUT reading the file; only misses (new, changed, or
-      never-hashed files) are streamed through SHA-384 as in hash_share, and
-      each fresh address is written back so the next publish of an unchanged
-      share reads no file at all. index None = exactly hash_share (the cache
-      is an optimization, never a requirement). Walk order, rel_path form,
-      progress cadence (after every file, hit or miss), and between-files
-      cancellation (ServeError::Cancelled wrapped in CachedHashError::Serve)
-      all match hash_share, so both paths produce identical manifests for
-      the same tree.
+      size+mtime still match and whose entry carries a cached chunk_addrs
+      blob that PARSES for that size (len % 48 == 0, len/48 ==
+      ceil(size/CHUNK_SIZE)) is reused WITHOUT reading the file; misses
+      (new, changed, never-hashed — and malformed/wrong-count blobs such as
+      abandoned v2 single-addr rows, which degrade to a re-hash, never into
+      the manifest) are streamed through per-chunk SHA-384 as in hash_share,
+      and ALL fresh addresses are written back, ordered + concatenated, so
+      the next publish of an unchanged share reads no file at all. index
+      None = exactly hash_share (the cache is an optimization, never a
+      requirement). Walk order, rel_path form, progress cadence (after every
+      file, hit or miss), and cancellation between files AND between chunks
+      (ServeError::Cancelled wrapped in CachedHashError::Serve) all match
+      hash_share, so both paths produce identical manifests for the same
+      tree.
     signature: "pub fn cached_or_hash(index: Option<&ShareIndex>, root: &Path, cancel: &AtomicBool, progress: &mut dyn FnMut(usize, usize)) -> Result<ShareManifest, CachedHashError>"
     returns:
       type: "Result<ShareManifest, CachedHashError>"
