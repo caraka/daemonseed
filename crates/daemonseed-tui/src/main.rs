@@ -105,6 +105,20 @@ fn os_downloads_dir() -> PathBuf {
     PathBuf::from("Downloads")
 }
 
+/// Expand a leading `~` / `~/` in a user-typed destination path to `$HOME`
+/// (ISC-C68). The dest box is a plain text field, not a shell, so without this
+/// a typed `~/carakastan` would create a literal directory named `~`. Only a
+/// leading bare `~` or `~/` is expanded — a `~user` form or a mid-path `~` is
+/// left verbatim. With no `$HOME`, the path is returned unchanged.
+fn expand_tilde(dest: &str) -> PathBuf {
+    let home = std::env::var_os("HOME").filter(|v| !v.is_empty());
+    match home {
+        Some(home) if dest == "~" => PathBuf::from(home),
+        Some(home) if dest.starts_with("~/") => PathBuf::from(home).join(&dest[2..]),
+        _ => PathBuf::from(dest),
+    }
+}
+
 /// Minimal `--config <path>` parser (ISC-C35). A full arg parser arrives with
 /// the wider CLI surface.
 fn parse_config_flag() -> Option<PathBuf> {
@@ -219,10 +233,11 @@ fn run(
         if let Some((share_id, sharer_handle, name, selected, dest)) =
             app.take_pending_fetch_confirm()
         {
+            let flat_dest = !dest.is_empty();
             let fetched_root = if dest.is_empty() {
                 downloads_root.clone()
             } else {
-                PathBuf::from(&dest)
+                expand_tilde(&dest)
             };
             let _ = net.send(NetCommand::ConfirmFetch {
                 share_id,
@@ -230,6 +245,7 @@ fn run(
                 name,
                 fetched_root,
                 selected,
+                flat_dest,
             });
         }
         // M15 C: browse — refresh the fetched-downloads list on demand.

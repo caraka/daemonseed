@@ -234,11 +234,23 @@ pub fn scan_into(
         else {
             continue;
         };
+        let size = meta.len();
+        let mtime_unix_ms = mtime_ms(&meta);
+        // Preserve a prior hash pass's cached `chunk_addrs` across this metadata
+        // rescan when the file is unchanged (same size + mtime). Without this,
+        // the DefineShare-on-Unlock rescan nulls every entry's addresses, so the
+        // next publish re-hashes the whole share on *every* relaunch. A new or
+        // changed file still resets to `None` — a stale address must never
+        // survive a content change (mirrors `mtime_rescan` and `apply_event`).
+        let chunk_addrs = index
+            .get(&rel_path)?
+            .filter(|e| e.size == size && e.mtime_unix_ms == mtime_unix_ms)
+            .and_then(|e| e.chunk_addrs);
         index.put(&ShareEntry {
             rel_path,
-            size: meta.len(),
-            mtime_unix_ms: mtime_ms(&meta),
-            chunk_addrs: None,
+            size,
+            mtime_unix_ms,
+            chunk_addrs,
         })?;
         count += 1;
     }
@@ -597,6 +609,62 @@ mod tests {
         write(&idx.root, "a.txt", b"aaa");
         idx.cold_scan().unwrap();
         assert_eq!(idx.index().get("a.txt").unwrap().unwrap().chunk_addrs, None);
+    }
+
+    /// A rescan of an UNCHANGED file must preserve a prior hash pass's cached
+    /// `chunk_addrs` (the relaunch re-hash bug): otherwise the DefineShare-on-
+    /// Unlock metadata scan nulls the cache and every publish re-hashes.
+    #[test]
+    fn scan_into_preserves_cached_addrs_for_unchanged_file() {
+        let (_dir, idx) = fixture();
+        write(&idx.root, "a.txt", b"aaa");
+        // First scan records metadata only (chunk_addrs: None).
+        idx.cold_scan().unwrap();
+        let entry = idx.index().get("a.txt").unwrap().unwrap();
+        // Simulate a completed hash pass caching this file's addresses.
+        let blob = vec![0xab; CHUNK_ADDR_LEN];
+        idx.index()
+            .put(&ShareEntry {
+                rel_path: "a.txt".to_owned(),
+                size: entry.size,
+                mtime_unix_ms: entry.mtime_unix_ms,
+                chunk_addrs: Some(blob.clone()),
+            })
+            .unwrap();
+        // Re-scan the unchanged file (the relaunch path) — addresses survive.
+        scan_into(idx.index(), &idx.root, &AtomicBool::new(false)).unwrap();
+        assert_eq!(
+            idx.index().get("a.txt").unwrap().unwrap().chunk_addrs,
+            Some(blob),
+            "an unchanged file must keep its cached chunk addresses across a rescan"
+        );
+    }
+
+    /// A rescan of a CHANGED file (size differs) must drop the stale cached
+    /// `chunk_addrs` — a content change can never carry old addresses forward.
+    #[test]
+    fn scan_into_drops_cached_addrs_when_file_changed() {
+        let (_dir, idx) = fixture();
+        write(&idx.root, "a.txt", b"aaa");
+        idx.cold_scan().unwrap();
+        let entry = idx.index().get("a.txt").unwrap().unwrap();
+        // Cache addresses against the OLD size, then grow the file so the stat
+        // no longer matches.
+        idx.index()
+            .put(&ShareEntry {
+                rel_path: "a.txt".to_owned(),
+                size: entry.size,
+                mtime_unix_ms: entry.mtime_unix_ms,
+                chunk_addrs: Some(vec![0xab; CHUNK_ADDR_LEN]),
+            })
+            .unwrap();
+        write(&idx.root, "a.txt", b"aaaaaaaa"); // size 3 -> 8
+        scan_into(idx.index(), &idx.root, &AtomicBool::new(false)).unwrap();
+        assert_eq!(
+            idx.index().get("a.txt").unwrap().unwrap().chunk_addrs,
+            None,
+            "a changed file must drop its stale cached chunk addresses"
+        );
     }
 
     /// Directories themselves are not indexed — only the files in them.

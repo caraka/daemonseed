@@ -58,7 +58,9 @@ use daemonseed_core::share_serve::{
     DiskShareContent, MANIFEST_FRAME_BUDGET, ServeError, ShareManifest, manifest_frame_len,
 };
 use daemonseed_core::storage::cas::chunk_addr;
-use daemonseed_core::storage::fetched::{FetchedFile, FetchedShare, FetchedStore};
+use daemonseed_core::storage::fetched::{
+    FetchedFile, FetchedShare, FetchedStore, rebase_to_selection_root,
+};
 use daemonseed_core::storage::seeds::{CounterState, IndexKey};
 use daemonseed_core::storage::share_index::ShareIndex;
 use daemonseed_core::trust_events::{TrustEventKey, assess_deprecation, unreadable_policy_event};
@@ -178,6 +180,13 @@ pub enum NetCommand {
         name: String,
         fetched_root: PathBuf,
         selected: Option<Vec<usize>>,
+        /// True when `fetched_root` is an explicit user-chosen destination
+        /// (ISC-C68): files land directly under it, rebased so the selected
+        /// item is the top-level entry ([`rebase_to_selection_root`]), with no
+        /// per-share folder and no `downloads.idx` written into the user's
+        /// directory. False for the managed downloads dir, which keeps the
+        /// namespaced `<share>/<rel_path>` layout and the browse manifest.
+        flat_dest: bool,
     },
     /// List the fetched shares recorded under `fetched_root` for the browse
     /// pane (M15 C; ISC-C64). Emits a [`NetEvent::FetchedShares`] snapshot
@@ -776,9 +785,17 @@ async fn net_actor(
                 name,
                 fetched_root,
                 selected,
+                flat_dest,
             } => {
                 actor
-                    .handle_confirm_fetch(&share_id, &sharer_handle, &name, fetched_root, selected)
+                    .handle_confirm_fetch(
+                        &share_id,
+                        &sharer_handle,
+                        &name,
+                        fetched_root,
+                        selected,
+                        flat_dest,
+                    )
                     .await
             }
             NetCommand::ListFetched { fetched_root } => actor.handle_list_fetched(fetched_root),
@@ -1931,6 +1948,7 @@ impl Actor {
         name: &str,
         fetched_root: PathBuf,
         selected: Option<Vec<usize>>,
+        flat_dest: bool,
     ) {
         let Some(opened) = self.open_share_stream(share_id).await else {
             return;
@@ -1981,6 +1999,27 @@ impl Actor {
         let folder = resolve_share_folder(&shares, share_id, name);
         let share_dir = fetched_root.join(&folder);
 
+        // Destination layout (ISC-C68). For a user-chosen dest, files land
+        // directly under it, rebased so the selected item is the top-level
+        // entry (no per-share folder). For the managed downloads dir, keep the
+        // namespaced `<share>/<rel_path>` layout. `rebased` is index-aligned
+        // with `wanted` and only populated in flat mode.
+        let base_dir = if flat_dest {
+            fetched_root.clone()
+        } else {
+            share_dir.clone()
+        };
+        let rebased: Vec<String> = if flat_dest {
+            rebase_to_selection_root(
+                &wanted
+                    .iter()
+                    .map(|e| e.rel_path.as_str())
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            Vec::new()
+        };
+
         // Every path this fetch writes, for the abort-time cleanup.
         let mut written_paths: Vec<PathBuf> = Vec::new();
         let mut chunks_received: u32 = 0;
@@ -1991,16 +2030,25 @@ impl Actor {
         // (delete partials, prune dirs, emit FetchError) below.
         let fetch_result: Result<Vec<FetchedFile>, String> = async {
             let mut recorded: Vec<FetchedFile> = Vec::with_capacity(wanted.len());
-            for entry in &wanted {
+            for (i, entry) in wanted.iter().enumerate() {
+                // The on-disk relative path: the rebased selection-root path for
+                // a user-chosen dest (ISC-C68), else the share-relative path.
+                let write_rel = if flat_dest {
+                    rebased[i].as_str()
+                } else {
+                    entry.rel_path.as_str()
+                };
                 // Path-traversal guard (ISC-A-C32): a hostile manifest must
-                // never write outside the share folder. Fail closed.
-                let Some(safe_rel) = sanitize_rel_path(&entry.rel_path) else {
+                // never write outside the destination folder. Fail closed.
+                // Rebasing only drops leading components, so the guard still
+                // holds on the rewritten path.
+                let Some(safe_rel) = sanitize_rel_path(write_rel) else {
                     return Err(format!(
                         "refusing a download path escaping its folder: {}",
                         entry.rel_path
                     ));
                 };
-                let dest = share_dir.join(&safe_rel);
+                let dest = base_dir.join(&safe_rel);
                 if let Some(parent) = dest.parent() {
                     std::fs::create_dir_all(parent)
                         .map_err(|e| format!("could not create download folder: {e}"))?;
@@ -2102,11 +2150,13 @@ impl Actor {
                 // wrote and prune the directories that emptied — a failed
                 // fetch persists nothing (ISC-A-C31), and the in-progress
                 // partial must never survive as a silently-truncated file.
-                cleanup_written(&fetched_root, &share_dir, &written_paths);
+                cleanup_written(&fetched_root, &base_dir, &written_paths);
                 // A failed RE-fetch already truncated the previous download's
                 // copies, so its idx entry now describes deleted files —
-                // prune it (best-effort) so the browse pane does not lie.
-                if shares.iter().any(|s| s.share_id == share_id) {
+                // prune it (best-effort) so the browse pane does not lie. Only
+                // the managed downloads dir carries a browse manifest; a
+                // user-chosen dest (flat) has none to prune.
+                if !flat_dest && shares.iter().any(|s| s.share_id == share_id) {
                     shares.retain(|s| s.share_id != share_id);
                     let _ = std::fs::write(
                         fetched_root.join("downloads.idx"),
@@ -2122,6 +2172,18 @@ impl Actor {
         // (refcount → 0); the idx update is a local-disk step that needs no
         // connection.
         drop(out_tx);
+
+        // A user-chosen dest (ISC-C68): the files were placed directly under
+        // the user's directory. Do not write a `downloads.idx` into it and do
+        // not touch the managed browse manifest — the browse pane tracks only
+        // the managed downloads dir.
+        if flat_dest {
+            return self.emit(NetEvent::FetchComplete {
+                share_id: share_id.to_owned(),
+                files_written: recorded.len() as u32,
+                bytes_written: bytes_received,
+            });
+        }
 
         // Record the fully-verified download in `downloads.idx` (M15 C;
         // ISC-C63 / C64) — same v2 format core's `FetchedStore` parses (the

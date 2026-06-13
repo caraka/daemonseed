@@ -328,6 +328,47 @@ fn sanitize_rel_path(rel: &str) -> Result<PathBuf, FetchedError> {
     Ok(safe)
 }
 
+/// Rebase a fetch's selected share-relative paths so the *thing the user
+/// selected* becomes the top-level entry under their chosen destination
+/// (ISC-C68 layout). Used only for an explicit user-chosen dest — the managed
+/// downloads dir keeps its namespaced `<share>/<rel_path>` layout.
+///
+/// The rule, derived from two pinned expectations:
+///  - **Exactly one file** → its basename. Picking a single file drops it
+///    directly in the dest, never recreating its share-internal folders.
+///  - **Many files** → drop the longest common leading path prefix *minus its
+///    last component*, i.e. keep the deepest directory common to the whole
+///    selection as the top entry and preserve everything below it. Selecting an
+///    `Artist/Album` folder lands `Album/<tracks…>`, not `Artist/Album/<tracks…>`.
+///
+/// Inputs are `/`-separated wire paths; outputs are `/`-separated and still
+/// strictly relative (only leading components are dropped), so the per-file
+/// [`sanitize_rel_path`] guard at write time remains the traversal authority.
+pub fn rebase_to_selection_root(rel_paths: &[&str]) -> Vec<String> {
+    match rel_paths {
+        [] => Vec::new(),
+        [only] => vec![only.rsplit('/').next().unwrap_or(only).to_owned()],
+        _ => {
+            let split: Vec<Vec<&str>> = rel_paths.iter().map(|p| p.split('/').collect()).collect();
+            let min_len = split.iter().map(Vec::len).min().unwrap_or(0);
+            // Longest run of leading components shared by every path.
+            let mut common: usize = 0;
+            'outer: for i in 0..min_len {
+                let head = split[0][i];
+                for s in &split[1..] {
+                    if s[i] != head {
+                        break 'outer;
+                    }
+                }
+                common += 1;
+            }
+            // Keep the deepest shared directory: drop all but its last component.
+            let drop = common.saturating_sub(1);
+            split.iter().map(|c| c[drop..].join("/")).collect()
+        }
+    }
+}
+
 fn parse_manifest(raw: &str) -> Result<Vec<FetchedShare>, FetchedError> {
     let mut shares = Vec::new();
     let mut lines = raw.lines();
@@ -414,6 +455,69 @@ mod tests {
             rel_path: rel.to_owned(),
             bytes: bytes.to_vec(),
         }
+    }
+
+    /// ISC-C68 layout — a single selected file lands as its bare basename, no
+    /// matter how deep it sat in the share.
+    #[test]
+    fn rebase_single_file_is_basename() {
+        assert_eq!(
+            rebase_to_selection_root(&["Music/Artist/Album/track.mp3"]),
+            vec!["track.mp3".to_owned()]
+        );
+        // A file already at the share root is unchanged.
+        assert_eq!(
+            rebase_to_selection_root(&["song.flac"]),
+            vec!["song.flac".to_owned()]
+        );
+    }
+
+    /// ISC-C68 layout — selecting a folder keeps the deepest folder common to
+    /// the selection as the top entry (`Album/…`), dropping its ancestors and
+    /// preserving structure below it.
+    #[test]
+    fn rebase_folder_keeps_deepest_common_dir() {
+        let out = rebase_to_selection_root(&[
+            "Music/Artist/Album/01.mp3",
+            "Music/Artist/Album/02.mp3",
+            "Music/Artist/Album/disc2/03.mp3",
+        ]);
+        assert_eq!(
+            out,
+            vec![
+                "Album/01.mp3".to_owned(),
+                "Album/02.mp3".to_owned(),
+                "Album/disc2/03.mp3".to_owned(),
+            ]
+        );
+    }
+
+    /// A messy multi-album selection keeps their shared parent (`Artist/…`) so
+    /// the two albums stay disambiguated under the dest.
+    #[test]
+    fn rebase_disjoint_selection_keeps_shared_parent() {
+        let out =
+            rebase_to_selection_root(&["Music/Artist/AlbumA/01.mp3", "Music/Artist/AlbumB/01.mp3"]);
+        assert_eq!(
+            out,
+            vec![
+                "Artist/AlbumA/01.mp3".to_owned(),
+                "Artist/AlbumB/01.mp3".to_owned(),
+            ]
+        );
+    }
+
+    /// Files sharing no leading directory land directly under the dest, each
+    /// keeping its own top folder (nothing to strip).
+    #[test]
+    fn rebase_no_common_prefix_is_untouched() {
+        let out = rebase_to_selection_root(&["a/x.txt", "b/y.txt"]);
+        assert_eq!(out, vec!["a/x.txt".to_owned(), "b/y.txt".to_owned()]);
+    }
+
+    #[test]
+    fn rebase_empty_selection_is_empty() {
+        assert!(rebase_to_selection_root(&[]).is_empty());
     }
 
     /// ISC-C63 / ISC-C65 — a recorded fetch writes named files (real names,
