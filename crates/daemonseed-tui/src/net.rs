@@ -1835,11 +1835,28 @@ impl Actor {
         // Read the manifest. Foreign / undecryptable frames (other members'
         // chatter, the sharer's naming frame echoing back if any) are skipped
         // silently — same posture as chat. The first valid ManifestResponse
-        // wins.
+        // wins. A dead share (sharer offline) never answers — bound the wait
+        // with the SAME inactivity timeout the chunk phase uses, so a fetch of a
+        // reaped/offline share errors cleanly instead of hanging until the user
+        // cancels (only the awaited manifest counts as progress; noise does not
+        // reset the clock — mirrors the chunk loop).
+        let last_relevant = std::time::Instant::now();
         let manifest = loop {
-            let frame = match inbound.message().await {
-                Ok(Some(f)) => f,
-                Ok(None) | Err(_) => {
+            let Some(budget) = remaining_inactivity_budget(last_relevant.elapsed()) else {
+                self.emit(NetEvent::FetchError {
+                    message: FETCH_MANIFEST_TIMEOUT_MESSAGE.to_owned(),
+                });
+                return None;
+            };
+            let frame = match tokio::time::timeout(budget, inbound.message()).await {
+                Err(_elapsed) => {
+                    self.emit(NetEvent::FetchError {
+                        message: FETCH_MANIFEST_TIMEOUT_MESSAGE.to_owned(),
+                    });
+                    return None;
+                }
+                Ok(Ok(Some(f))) => f,
+                Ok(Ok(None)) | Ok(Err(_)) => {
                     self.emit(NetEvent::FetchError {
                         message: "stream ended before manifest arrived".to_owned(),
                     });
@@ -2463,6 +2480,12 @@ pub(crate) const FETCH_INACTIVITY_TIMEOUT: std::time::Duration = std::time::Dura
 /// The user-facing cause for an inactivity abort.
 const FETCH_TIMEOUT_MESSAGE: &str =
     "timed out waiting for chunks — the share may have stopped serving";
+
+/// Shown when the manifest never arrives within the inactivity budget — the
+/// sharer is most likely offline and its share already reaped from the relay,
+/// so point the user at the refresh that will drop the stale listing entry.
+const FETCH_MANIFEST_TIMEOUT_MESSAGE: &str =
+    "timed out waiting for the share — it may be offline; press r to refresh the list";
 
 /// Pure deadline math for the M16 inactivity timeout: given how long ago the
 /// last RELEVANT frame arrived, how much waiting budget remains? `None` means
