@@ -489,9 +489,13 @@ modules:
       EARLY-RETURNS Ok(count) with however many files were upserted
       (cancellation is idempotent metadata work, not an error; a metadata-only
       scan writes chunk_addrs: None for new/changed files but PRESERVES an
-      existing entry's cached chunk_addrs when size+mtime are unchanged, so a
-      relaunch rescan never wipes a prior publish's hash cache). New
-      cached_or_hash uses the index as a
+      existing entry's cached chunk_addrs when size+mtime are unchanged). M16
+      post-smoke adds reconcile_into (scan_into + prune entries whose file
+      vanished under root): the DefineShare path uses it INSTEAD of the old
+      clear-then-rescan, so an Unlock re-define of the SAME root keeps the
+      publish hash cache (no more full re-hash every relaunch) while a root
+      change still drops every stale entry. New cached_or_hash uses the index
+      as a
       chunk-addr CACHE for the disk-backed publish path (ISC-C73): a file
       whose indexed size+mtime still match and whose entry carries a cached
       chunk_addrs blob that PARSES for that size (len % 48 == 0, len/48 ==

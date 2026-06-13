@@ -49,7 +49,7 @@ use daemonseed_core::crypto::suite::{CNSA_2_0, SuiteId};
 use daemonseed_core::federation::discovered::DiscoveredPeers;
 use daemonseed_core::federation::store::{InMemoryTrustStore, ServerEntry, TrustStore};
 use daemonseed_core::handle::{DisplayMode, Handle};
-use daemonseed_core::indexer::{CachedHashError, cached_or_hash, scan_into};
+use daemonseed_core::indexer::{CachedHashError, cached_or_hash, reconcile_into};
 use daemonseed_core::public_room::{
     DEFAULT_ROOM, derive_room_key, open_room_message, room_asset_address, seal_room_message,
 };
@@ -1450,16 +1450,16 @@ impl Actor {
         // old root's entries to the new root's without the handle ever closing.
         let evt_tx = self.evt_tx.clone();
         tokio::task::spawn_blocking(move || {
-            let status = match index
-                .clear()
-                .and_then(|()| scan_into(&index, &root, &cancel))
-            {
+            // Reconcile (not clear-then-rescan): upsert present files — preserving
+            // an unchanged file's cached chunk_addrs — then prune only vanished
+            // files. An Unlock re-define of the same root therefore keeps the
+            // publish hash cache instead of forcing a full re-hash every launch.
+            let status = match reconcile_into(&index, &root, &cancel) {
                 Ok(count) => IndexerStatus::Ready {
                     entries: count as u64,
                 },
-                // A clear/scan error leaves the retained index in place; report
-                // Idle so the status line stops showing an indefinite
-                // "indexing".
+                // A scan error leaves the retained index in place; report Idle so
+                // the status line stops showing an indefinite "indexing".
                 Err(_) => IndexerStatus::Idle,
             };
             // A cancelled scan stays silent: a newer define owns the status

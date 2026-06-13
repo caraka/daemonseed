@@ -257,6 +257,38 @@ pub fn scan_into(
     Ok(count)
 }
 
+/// Reconcile the index to the filesystem under `root`: upsert every present
+/// file (via [`scan_into`], which preserves an unchanged file's cached
+/// `chunk_addrs`) and then prune index entries whose backing file no longer
+/// exists under `root`.
+///
+/// This replaces the older clear-then-rescan move in the DefineShare path. That
+/// move handled deletions and wholesale root changes by dropping the entire
+/// table first — but on an Unlock re-define of the *same* root it also threw
+/// away the chunk-address cache a prior publish had built, forcing a full
+/// re-hash on every relaunch. Reconciling keeps the cache for unchanged files
+/// while still dropping a removed/renamed file (or, on a root change, every old
+/// entry — none of those paths exist under the new root).
+///
+/// A **cancelled** scan returns early WITHOUT pruning: the walk is partial, so
+/// the seen set is incomplete and pruning would delete not-yet-walked files.
+pub fn reconcile_into(
+    index: &ShareIndex,
+    root: &Path,
+    cancel: &AtomicBool,
+) -> Result<usize, IndexError> {
+    let count = scan_into(index, root, cancel)?;
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(count);
+    }
+    for existing in index.entries()? {
+        if !root.join(&existing.rel_path).is_file() {
+            index.remove(&existing.rel_path)?;
+        }
+    }
+    Ok(count)
+}
+
 /// Why a cached-or-hash pass ([`cached_or_hash`]) failed — it spans two
 /// domains, so it wraps both error types.
 #[derive(Debug)]
@@ -638,6 +670,63 @@ mod tests {
             Some(blob),
             "an unchanged file must keep its cached chunk addresses across a rescan"
         );
+    }
+
+    /// `reconcile_into` keeps an unchanged file's cached `chunk_addrs` across a
+    /// re-define of the SAME root (the relaunch re-hash bug) while still pruning
+    /// a file that vanished — the clear-then-rescan replacement.
+    #[test]
+    fn reconcile_preserves_cache_and_prunes_vanished() {
+        let (_dir, idx) = fixture();
+        write(&idx.root, "keep.txt", b"keep");
+        write(&idx.root, "gone.txt", b"gone");
+        reconcile_into(idx.index(), &idx.root, &AtomicBool::new(false)).unwrap();
+        // Simulate a prior publish caching keep.txt's addresses.
+        let kept = idx.index().get("keep.txt").unwrap().unwrap();
+        let blob = vec![0xcd; CHUNK_ADDR_LEN];
+        idx.index()
+            .put(&ShareEntry {
+                rel_path: "keep.txt".to_owned(),
+                size: kept.size,
+                mtime_unix_ms: kept.mtime_unix_ms,
+                chunk_addrs: Some(blob.clone()),
+            })
+            .unwrap();
+        // Delete one file, then reconcile the same root again (the Unlock path).
+        std::fs::remove_file(idx.root.join("gone.txt")).unwrap();
+        let count = reconcile_into(idx.index(), &idx.root, &AtomicBool::new(false)).unwrap();
+        assert_eq!(count, 1, "only the surviving file is walked");
+        assert_eq!(
+            idx.index().len().unwrap(),
+            1,
+            "the vanished entry is pruned"
+        );
+        assert!(idx.index().get("gone.txt").unwrap().is_none());
+        assert_eq!(
+            idx.index().get("keep.txt").unwrap().unwrap().chunk_addrs,
+            Some(blob),
+            "the unchanged file keeps its cached addresses across the re-define"
+        );
+    }
+
+    /// A re-define onto a DIFFERENT root prunes every old-root entry (none of
+    /// those paths exist under the new root) — the wholesale-root-change case
+    /// the old `clear()` covered.
+    #[test]
+    fn reconcile_onto_new_root_drops_old_entries() {
+        let (dir, idx) = fixture();
+        write(&idx.root, "a.txt", b"a");
+        reconcile_into(idx.index(), &idx.root, &AtomicBool::new(false)).unwrap();
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        write(&other, "b.txt", b"b");
+        reconcile_into(idx.index(), &other, &AtomicBool::new(false)).unwrap();
+        assert!(
+            idx.index().get("a.txt").unwrap().is_none(),
+            "old root pruned"
+        );
+        assert_eq!(idx.index().get("b.txt").unwrap().unwrap().size, 1);
+        assert_eq!(idx.index().len().unwrap(), 1);
     }
 
     /// A rescan of a CHANGED file (size differs) must drop the stale cached
