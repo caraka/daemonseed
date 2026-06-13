@@ -767,6 +767,11 @@ pub struct App {
     /// Single-shot slot for a publish request (M15); the binary drains it via
     /// [`Self::take_pending_publish`] into `NetCommand::PublishShare`.
     pending_publish: Option<PublishRequest>,
+    /// Queue of `(root, name)` auto-republishes restored from the at-rest blob
+    /// on Unlock (publish-intent persistence): each remembered-published root is
+    /// re-asserted once reconnected. Drained via [`Self::take_pending_autopublish`]
+    /// (gated on a live connection — publish needs a session).
+    pending_publishes: std::collections::VecDeque<(std::path::PathBuf, String)>,
     /// Single-shot slot for an unpublish (D, M15): the server-assigned share_id
     /// to stop serving; drained into `NetCommand::UnpublishShare`.
     pending_unpublish: Option<String>,
@@ -987,6 +992,7 @@ impl App {
             defined_shares: Vec::new(),
             defined_sel: 0,
             pending_publish: None,
+            pending_publishes: std::collections::VecDeque::new(),
             pending_unpublish: None,
             pending_cancel_publish: None,
             hashing: std::collections::BTreeSet::new(),
@@ -1170,6 +1176,35 @@ impl App {
         self.pending_publish.take()
     }
 
+    /// Drain one queued auto-republish (publish-intent persistence), but ONLY
+    /// once connected+authed — publish needs a live session, so before that this
+    /// returns `None` and the queue waits. Skips a root already published,
+    /// mid-publish, or queued for a manual publish (the ISC-A-C34 guard). The
+    /// binary drains it into `NetCommand::PublishShare`.
+    pub fn take_pending_autopublish(&mut self) -> Option<PublishRequest> {
+        if !matches!(self.connection, ConnectionStatus::Connected { .. }) {
+            return None;
+        }
+        while let Some((root, name)) = self.pending_publishes.pop_front() {
+            let already = self.published.iter().any(|p| p.root == root)
+                || self
+                    .pending_publish
+                    .as_ref()
+                    .is_some_and(|r| r.root == root)
+                || self.hashing.contains(&root);
+            if already {
+                continue;
+            }
+            let sharer_handle = self.own_handle();
+            return Some(PublishRequest {
+                root,
+                name,
+                sharer_handle,
+            });
+        }
+        None
+    }
+
     /// Drain a queued unpublish (D, M15) — the binary turns it into a
     /// `NetCommand::UnpublishShare`.
     pub fn take_pending_unpublish(&mut self) -> Option<String> {
@@ -1303,7 +1338,14 @@ impl App {
             // can publish/unpublish each independently (M16 C1, ISC-C69) — not
             // just the last-defined one.
             let name = Self::share_display_name(&root, &sh.label);
-            self.push_defined_share(root.clone(), name);
+            self.push_defined_share(root.clone(), name.clone());
+            // Publish-intent persistence: a remembered-published root
+            // auto-republishes once reconnected. Queued here, drained after auth
+            // (publish needs a live session); the relay stays RAM-only and the
+            // client simply re-asserts, so ISC-S20 ephemerality is unchanged.
+            if session.seeds.published().iter().any(|p| p == &sh.root) {
+                self.pending_publishes.push_back((root.clone(), name));
+            }
             self.pending_share_defines.push_back(ShareDefineRequest {
                 root,
                 label: sh.label.clone(),
@@ -1638,6 +1680,17 @@ impl App {
                 // The hash phase is over — clear the hashing marker so `[u]`
                 // routes to unpublish, not cancel (M16 serve-from-disk).
                 self.hashing.remove(&root);
+                // Publish-intent persistence: remember this root as published so
+                // it auto-republishes next launch. Idempotent — an auto-republish
+                // re-firing PublishStarted is a no-op write (add returns false).
+                let root_str = root.to_string_lossy().into_owned();
+                if self
+                    .seeds
+                    .as_mut()
+                    .is_some_and(|s| s.add_published(root_str))
+                {
+                    self.persist_seeds();
+                }
                 self.published.push(PublishedShare {
                     share_id: share_id.clone(),
                     root,
@@ -1678,7 +1731,23 @@ impl App {
                 self.status = Some(message);
             }
             NetEvent::PublishStopped { share_id } => {
+                // Drop the publish-intent persistence for this share (keyed via
+                // its root) so an explicit unpublish does NOT auto-republish next
+                // launch.
+                let root_str = self
+                    .published
+                    .iter()
+                    .find(|p| p.share_id == share_id)
+                    .map(|p| p.root.to_string_lossy().into_owned());
                 self.published.retain(|p| p.share_id != share_id);
+                if let Some(root_str) = root_str
+                    && self
+                        .seeds
+                        .as_mut()
+                        .is_some_and(|s| s.remove_published(&root_str))
+                {
+                    self.persist_seeds();
+                }
                 self.status = Some(format!("stopped sharing {share_id}"));
             }
         }
@@ -2674,6 +2743,16 @@ impl App {
         &self.pending_joins
     }
 
+    /// Test-only: queue an auto-republish directly (publish-intent persistence).
+    #[cfg(test)]
+    pub(crate) fn push_pending_autopublish_for_test(
+        &mut self,
+        root: std::path::PathBuf,
+        name: String,
+    ) {
+        self.pending_publishes.push_back((root, name));
+    }
+
     /// The active-circle index into [`Self::circles`] (ISC-C60), or `None` when
     /// the lobby is active / the set is empty. For the carousel header
     /// ("circle N/M").
@@ -3261,6 +3340,24 @@ mod tests {
             Some(crate::screens::first_start::FsStep::RecoverChoose),
             "r enters the recover branch, not cold enrollment"
         );
+    }
+
+    #[test]
+    fn autopublish_is_gated_on_connection() {
+        // Publish-intent persistence: an auto-republish queued on Unlock must NOT
+        // drain while disconnected — publish needs a live session, and draining
+        // early would storm PublishError. A fresh App starts Disconnected.
+        let mut app = App::new();
+        app.push_pending_autopublish_for_test(
+            std::path::PathBuf::from("/srv/music"),
+            "music".into(),
+        );
+        assert!(
+            app.take_pending_autopublish().is_none(),
+            "auto-republish must wait until connected+authed"
+        );
+        // (The connected-path drain calls own_handle(), which needs a wired
+        // session, so the live republish is covered by smoke, not this unit.)
     }
 
     #[test]

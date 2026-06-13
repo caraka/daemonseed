@@ -243,7 +243,12 @@ modules:
       newtype, returned in Opened::index_key) costs no second Argon2id;
       SealingKey::derive_session returns both for first-start. M14 also adds the
       persisted share-root set (PersistedShare) with add_share / remove_share /
-      shares + a `share <hex(root)> <hex(label)>` directive line (ISC-C21).
+      shares + a `share <hex(root)> <hex(label)>` directive line (ISC-C21). M16
+      post-smoke adds publish-intent persistence (add_published / remove_published
+      / published + a `publish <hex(root)>` directive): the subset of share roots
+      the user has published, so they auto-republish on next Unlock. This persists
+      intent, not relay state — ISC-S20 ephemerality holds (the client re-asserts;
+      the relay stays RAM-only), and each republish still mints a fresh share_id.
     no_std: false
     depends_on:
       - daemonseed_core::identity::mnemonic

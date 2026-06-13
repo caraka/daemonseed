@@ -264,6 +264,17 @@ fn run(
                 sharer_handle: req.sharer_handle,
             });
         }
+        // Publish-intent persistence: auto-republish each remembered-published
+        // root restored on Unlock, once connected+authed (the drain is gated, so
+        // these stay queued until then). Drain all ready this tick — each is a
+        // distinct root, so no duplicate publish.
+        while let Some(req) = app.take_pending_autopublish() {
+            let _ = net.send(NetCommand::PublishShare {
+                root: req.root,
+                name: req.name,
+                sharer_handle: req.sharer_handle,
+            });
+        }
         // M16 serve-from-disk: `[u]` mid-hash cancels the in-flight publish
         // hash for that defined root (a no-op on the actor if it already
         // finished — the race is benign).

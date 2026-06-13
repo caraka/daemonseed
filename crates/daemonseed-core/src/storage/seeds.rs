@@ -223,6 +223,14 @@ pub struct Seeds {
     /// message carries it (ISC-A-C3); it is persistence of *configuration*, not
     /// of shared content, so the no-client-history invariant holds.
     pub shares: Vec<PersistedShare>,
+    /// Remembered *published* share roots — the subset of [`Self::shares`] the
+    /// user has published, so they auto-republish next launch (publish-intent
+    /// persistence, 2026-06-13). Client-local only (ISC-A-C3). This persists the
+    /// *intent* to publish, not any relay-side state: the relay stays RAM-only
+    /// and reaps on disconnect (ISC-S20, "online to share"); the client simply
+    /// re-asserts each published root once reconnected, so ephemerality is
+    /// unchanged. Mutate via [`Self::add_published`] / [`Self::remove_published`].
+    pub published: Vec<String>,
 }
 
 /// One remembered local share root in the at-rest blob (ISC-C21 persistence,
@@ -267,6 +275,7 @@ impl core::fmt::Debug for Seeds {
             .field("display_name", &self.display_name)
             .field("circles", &self.circles.len())
             .field("shares", &self.shares.len())
+            .field("published", &self.published.len())
             .finish()
     }
 }
@@ -283,6 +292,7 @@ impl Seeds {
             display_name: None,
             circles: Vec::new(),
             shares: Vec::new(),
+            published: Vec::new(),
         }
     }
 
@@ -427,6 +437,33 @@ impl Seeds {
         self.shares.len() != before
     }
 
+    /// The remembered *published* share roots, in publish order (publish-intent
+    /// persistence). A subset of [`Self::shares`].
+    pub fn published(&self) -> &[String] {
+        &self.published
+    }
+
+    /// Remember that a share root is published so it auto-republishes next
+    /// launch. Returns `true` if newly added, `false` if already remembered
+    /// (idempotent). Hex-encoded at serialization, so any path survives the
+    /// line-based blob.
+    pub fn add_published(&mut self, root: impl Into<String>) -> bool {
+        let root = root.into();
+        if self.published.iter().any(|r| r == &root) {
+            return false;
+        }
+        self.published.push(root);
+        true
+    }
+
+    /// Forget a published share root, keyed on its path. Returns `true` if one
+    /// was removed.
+    pub fn remove_published(&mut self, root: &str) -> bool {
+        let before = self.published.len();
+        self.published.retain(|r| r != root);
+        self.published.len() != before
+    }
+
     fn to_plaintext(&self) -> String {
         let mut s = self.mnemonic.to_phrase();
         if self.counters.send_counter != 0 {
@@ -466,6 +503,12 @@ impl Seeds {
                 hex::encode(sh.label.as_deref().unwrap_or("").as_bytes()),
             ));
         }
+        // Published roots (publish-intent persistence): hex-encoded path so a
+        // path with spaces/newlines never splits the line. Layout:
+        // `publish <hex(root)>`.
+        for root in &self.published {
+            s.push_str(&format!("\npublish {}", hex::encode(root.as_bytes())));
+        }
         s
     }
 
@@ -479,6 +522,7 @@ impl Seeds {
         let mut display_name: Option<String> = None;
         let mut circles: Vec<PersistedCircle> = Vec::new();
         let mut shares: Vec<PersistedShare> = Vec::new();
+        let mut published: Vec<String> = Vec::new();
         for line in lines {
             // Mute / hide directives take the entire rest of the line as the
             // handle so a display name containing spaces is never truncated.
@@ -527,6 +571,15 @@ impl Seeds {
                 shares.push(PersistedShare { root, label });
                 continue;
             }
+            // Published root (publish-intent persistence): `publish <hex(root)>`.
+            if let Some(root_hex) = line.strip_prefix("publish ") {
+                let root = hex::decode(root_hex)
+                    .ok()
+                    .and_then(|b| String::from_utf8(b).ok())
+                    .ok_or(BlobError::InvalidPlaintext)?;
+                published.push(root);
+                continue;
+            }
             let mut parts = line.splitn(3, ' ');
             match parts.next() {
                 Some("send-counter") => {
@@ -550,6 +603,7 @@ impl Seeds {
             display_name,
             circles,
             shares,
+            published,
         })
     }
 }
@@ -1260,6 +1314,28 @@ mod tests {
         assert_eq!(shares[0].label.as_deref(), Some("Docs"));
         assert_eq!(shares[1].root, "/srv/shared photos");
         assert_eq!(shares[1].label, None);
+    }
+
+    #[test]
+    fn published_roots_round_trip_and_are_idempotent() {
+        // Published roots survive a seal/open round-trip in publish order, paths
+        // with spaces intact; add is idempotent and remove is keyed on the path.
+        ensure_oxicrypt_initialized();
+        let pid = Uuid::new_v4();
+        let pp = "correct horse battery staple table mountain";
+        let mut seeds = fresh_seeds();
+        assert!(seeds.add_published("/home/me/My Music"));
+        assert!(seeds.add_published("/srv/docs"));
+        assert!(
+            !seeds.add_published("/home/me/My Music"),
+            "add_published is idempotent on the root"
+        );
+        let blob = seal(&seeds, pp, pid, test_params()).unwrap();
+        let mut recovered = open(&blob, pp, pid, test_params()).unwrap().seeds;
+        assert_eq!(recovered.published(), ["/home/me/My Music", "/srv/docs"]);
+        assert!(recovered.remove_published("/home/me/My Music"));
+        assert!(!recovered.remove_published("/home/me/My Music"));
+        assert_eq!(recovered.published(), ["/srv/docs"]);
     }
 
     #[test]
