@@ -23,6 +23,32 @@ In-progress and next-milestone planning is tracked in the project lead's vault
 manifest (not committed). The next entry is added here at the moment a release
 is tagged, as part of the doc-sync ritual in `AGENTS.md`.
 
+## [0.20.0] — M16, finished public share path
+
+Completes the public share path as the reference implementation, plus the
+post-smoke fixes from live two-daemon testing on the relay.
+
+- **Fetch UX:** pre-fetch manifest preview, selective fetch, a collapsible
+  folder tree, and a choosable download destination on the preview; multi-share
+  publish from the Shares pane; the public-room sender is bound to its
+  provenance pubkey (ISC-C57).
+- **Serve-from-disk + 1 MiB sub-file chunking:** publish and serve a share of
+  arbitrary size without loading it into memory — every wire frame stays
+  relay-safe under the relay's 4 MB decode cap, transient serve RAM is one
+  chunk per request, and a too-large manifest is refused at publish rather than
+  stalling silently.
+- **Chosen-destination download layout:** files land rebased to the selection
+  root — a single selected file as its basename, a selected folder as
+  `<dest>/<folder>/…` — and a leading `~` in the destination expands to `$HOME`.
+- **No re-hash on relaunch:** the share index is reconciled (not cleared) when a
+  remembered root re-indexes on unlock, so re-publishing an unchanged share
+  reuses its cached chunk addresses instead of re-hashing every file.
+- **Publish persistence:** a published share is remembered and auto-republishes
+  on the next unlock once reconnected. The relay stays RAM-only and reaps on
+  disconnect (ISC-S20), so each republish is a fresh, unlinkable share id.
+- **Manifest-wait timeout:** fetching a share whose sharer is offline now errors
+  cleanly instead of hanging until cancelled.
+
 ## [0.19.0] — M15, close the TUI gap
 
 Brings the TUI to parity with the CLI for the full share loop, plus honest
