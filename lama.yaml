@@ -93,6 +93,20 @@ crates:
     status: active
     manifest: "docs/llm-api-manifest/daemonseed-tui-api.yaml"
 
+  - name: daemonseed-gui
+    purpose: >-
+      Slint GUI client (round-1 scaffold). The design brief's three-zone shell
+      ported from the perf spike into structured components + the alpha tab nav
+      (Chat / Shares / a "coming soon" circle-shares placeholder), with a
+      command-palette overlay seeded from a Rust-side action registry. Stub
+      in-memory data, no daemonseed-core wiring yet. Base build is
+      software-renderer-only (offscreen `--screenshot` PNG, headless-verifiable);
+      the `desktop` feature forwards slint/backend-winit for a real window.
+      Binary, no library API surface in round 1.
+    license: AGPL-3.0-or-later
+    status: scaffold
+    manifest: "docs/llm-api-manifest/daemonseed-gui-api.yaml"
+
   - name: daemonseed-isc
     purpose: "ISC registry — the single source of truth for the ISC inventory. A zero-dependency leaf crate (std only) holding IscClass, the ISCS list, TOTAL (built, non-deferred ISC count) and COVERED (registered-test count), with compile-time drift guards (ISCS.len()==TOTAL, COVERED<=TOTAL) and a covered_sum_matches test. Read by both daemonseed-integration-tests (which re-exports it as isc_coverage) and xtask isc-coverage, so the coverage count lives in exactly one place."
     license: AGPL-3.0-or-later

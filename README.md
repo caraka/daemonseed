@@ -35,6 +35,7 @@ daemonseed/
 │   ├── daemonseed-server/                  relay daemon: TLS 1.3 + APP_HELLO + identity-proof → Authenticated (M4b); federation peer table + introducer endpoint (M5/M12); public-space service (M6); circle-of-trust live relay (M8); RAM-only rate limiting (M9); release boot-gate (M10); user-publish share registry, reaped on disconnect (M12)
 │   ├── daemonseed-cli/                     scriptable client: `connect <server-id>` with identity-proof (M4b) + C22 trust slider (M5); `publish` / `unpublish` / `list-shares` (M12); `publish --path <dir>` serves share content for download (alpha2)
 │   ├── daemonseed-tui/                     interactive ratatui client — the MVP product surface (M11); Servers-pane introducer discovery (M12); multi-circle carousel (v0.16); session write-through + silent circle rejoin from the at-rest blob (M13); define-share + indexer (M14); publish/serve/unpublish + fetched-download browse/extract (M15)
+│   ├── daemonseed-gui/                     Slint GUI client (round-1 scaffold) — software-renderer shell; `--features desktop` opens a real window
 │   ├── daemonseed-isc/                      ISC registry leaf crate (zero deps): the single source of
 │   │                                       TOTAL / COVERED, read by both the integration tests and xtask
 │   └── daemonseed-integration-tests/       cross-crate integration tests (re-exports daemonseed-isc)
@@ -45,7 +46,8 @@ daemonseed/
 │       ├── daemonseed-proto-protocol.yaml
 │       ├── daemonseed-server-api.yaml
 │       ├── daemonseed-cli-api.yaml
-│       └── daemonseed-tui-api.yaml
+│       ├── daemonseed-tui-api.yaml
+│       └── daemonseed-gui-api.yaml
 │
 └── xtask/                                  workspace task runner: gen-proto, check-proto,
                                             isc-coverage, findings-resolved, install-hooks

@@ -1,0 +1,28 @@
+[package]
+name = "daemonseed-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "AGPL-3.0-or-later"
+description = "Slint GUI client for daemonseed (round-1 scaffold: software-renderer shell)."
+publish = false
+
+[dependencies]
+# Round-1 is software-renderer-only (no winit/GL backend) so the crate builds and
+# renders offscreen on a headless host. The windowed backend is the `desktop`
+# feature, enabled on a host with a display (felt-test). See ISA Decisions 2026-06-14.
+slint = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[build-dependencies]
+slint-build = { workspace = true }
+
+[features]
+default = []
+# Real winit window on the Wayland head (the felt-test surface). Forwards Slint's
+# winit backend; still software-rendered (no GL dependency). `cargo run -p
+# daemonseed-gui --features desktop` opens a window. Base build (no features) stays
+# offscreen-only so it compiles/verifies from a headless terminal.
+desktop = ["slint/backend-winit"]

@@ -8,6 +8,7 @@ members = [
     "crates/daemonseed-cli",
     "crates/daemonseed-tui",
     "crates/daemonseed-integration-tests",
+    "crates/daemonseed-gui",
     "xtask",
 ]
 
@@ -47,6 +48,14 @@ walkdir = "2.5"
 # ratatui under its permissive license — FSF-compatible combined-work shape.
 # Pinned at workspace level so future M11 TUI integration uses a single version.
 ratatui = "0.29"
+
+# Slint GUI toolkit for daemonseed-gui (ISC-C6). Consumed under GPLv3
+# (AGPLv3-compatible) — daemonseed-gui is AGPL-3.0-or-later. Base build is
+# software-renderer-only (no GL) so it compiles + offscreen-renders even from a
+# headless terminal; the crate's `desktop` feature forwards `slint/backend-winit`
+# for a real window on the Wayland head (the felt-test surface).
+slint = { version = "1.13", default-features = false, features = ["compat-1-2", "renderer-software", "std"] }
+slint-build = "1.13"
 
 # ── Crypto stack (oxicrypt path-deps via the worktree-parent symlink) ────────
 # During the private phase, daemonseed consumes oxicrypt as a path-dependency

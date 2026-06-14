@@ -1,0 +1,301 @@
+// daemonseed-gui — round-1 shell (Slint, software renderer).
+//
+// The three-zone shell from the design brief, ported from the proven perf spike
+// into structured components: left circle rail · center conversation/shares pane
+// · on-demand context sheet, plus a command-palette overlay (the action registry
+// mirrored to a second surface). Visual language per brief: dark 4-step surface
+// ladder, GRAYSCALE chrome, ONE teal accent (primary action + E2EE "sealed"
+// tint). Trust marker is a LABELED PILL, never a dot (brief #5). Data is stub /
+// in-memory for round 1 (no daemonseed-core wiring yet).
+
+struct CircleData {
+    name: string,
+    sub: string,
+    initial: string,
+    pinned: bool,
+}
+
+struct MsgData {
+    who: string,
+    text: string,
+    mine: bool,
+}
+
+struct FileData {
+    name: string,
+    size: string,
+    checked: bool,
+}
+
+struct ActionData {
+    label: string,
+    shortcut: string,
+}
+
+component RailRow inherits Rectangle {
+    in property <string> name;
+    in property <string> sub;
+    in property <string> initial;
+    in property <bool> selected: false;
+    in property <bool> pinned: false;
+    height: 54px;
+    border-radius: 8px;
+    background: selected ? #141517 : transparent;
+    HorizontalLayout {
+        padding: 8px; spacing: 10px;
+        Rectangle {
+            width: 34px; height: 34px; border-radius: 17px; background: #1b1d20;
+            border-width: 1px; border-color: #ffffff14;
+            Text { text: root.initial; color: #8b93a1; font-size: 14px; horizontal-alignment: center; vertical-alignment: center; }
+        }
+        VerticalLayout {
+            alignment: center; spacing: 2px;
+            HorizontalLayout {
+                spacing: 6px;
+                Text { text: root.name; color: #d6dae1; font-size: 14px; vertical-alignment: center; }
+                if root.pinned : Text { text: "PINNED"; color: #555d6a; font-size: 9px; vertical-alignment: center; }
+            }
+            Text { text: root.sub; color: #5b6472; font-size: 12px; }
+        }
+        Rectangle { }
+    }
+}
+
+component SealedPill inherits Rectangle {
+    width: 58px; height: 20px; border-radius: 10px;
+    background: #11302b; border-width: 1px; border-color: #1f4d45;
+    Text { text: "sealed"; color: #6fb3a4; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
+}
+
+component MsgBubble inherits Rectangle {
+    in property <string> who;
+    in property <string> text;
+    in property <bool> mine;
+    height: 44px;
+    HorizontalLayout {
+        alignment: root.mine ? end : start;
+        Rectangle {
+            border-radius: 10px;
+            background: root.mine ? #15302b : #141517;
+            border-width: 1px;
+            border-color: root.mine ? #1f4d45 : #ffffff10;
+            VerticalLayout {
+                padding: 8px; spacing: 2px;
+                Text { text: root.who; color: root.mine ? #6fb3a4 : #8b93a1; font-size: 11px; }
+                Text { text: root.text; color: #d6dae1; font-size: 13px; }
+            }
+        }
+    }
+}
+
+component FileRow inherits Rectangle {
+    in property <string> name;
+    in property <string> size;
+    in property <bool> checked: true;
+    height: 32px;
+    HorizontalLayout {
+        padding-left: 6px; padding-right: 6px; spacing: 11px;
+        Rectangle {
+            width: 18px; height: 18px; y: 7px; border-radius: 4px;
+            background: root.checked ? #aeb6c2 : transparent;
+            border-width: 1px; border-color: #ffffff24;
+            Text { text: root.checked ? "✓" : ""; color: #0d0e10; font-size: 12px; horizontal-alignment: center; vertical-alignment: center; }
+        }
+        Text { text: root.name; color: root.checked ? #cfd5dd : #6b7280; font-size: 13px; vertical-alignment: center; }
+        Rectangle { }
+        Text { text: root.size; color: #5b6472; font-size: 12px; vertical-alignment: center; }
+    }
+}
+
+component TabLabel inherits VerticalLayout {
+    in property <string> label;
+    in property <bool> active: false;
+    alignment: center;
+    Text { text: root.label; color: root.active ? #d6dae1 : #5b6472; font-size: 13px; horizontal-alignment: center; }
+    Rectangle { height: 2px; background: root.active ? #6b7280 : transparent; border-radius: 1px; }
+}
+
+export component AppWindow inherits Window {
+    width: 1100px; height: 680px;
+    background: #07080a;
+
+    in property <[CircleData]> circles;
+    in property <int> active: 1;
+    in property <int> active-tab: 0;          // 0 = Chat, 1 = Shares, 2 = Circle shares
+    in property <string> header-name;
+    in property <string> header-sub;
+    in property <[MsgData]> messages;
+    in property <[FileData]> files;
+    in property <string> draft;
+    in property <length> scroll-y: 0px;
+    in property <bool> sheet-open: false;
+    in property <bool> palette-open: false;
+    in property <[ActionData]> actions;
+
+    HorizontalLayout {
+        // ── LEFT: circle rail ──
+        Rectangle {
+            width: 256px; background: #0d0e10;
+            VerticalLayout {
+                padding: 10px; spacing: 4px;
+                Rectangle {
+                    height: 42px;
+                    HorizontalLayout { padding: 6px; Text { text: "daemonseed"; color: #aeb6c2; font-size: 16px; vertical-alignment: center; } }
+                }
+                for c[i] in root.circles : RailRow {
+                    name: c.name; sub: c.sub; initial: c.initial; pinned: c.pinned;
+                    selected: i == root.active;
+                }
+                Rectangle { }
+                Rectangle { height: 22px;
+                    HorizontalLayout { padding: 6px; Text { text: "Ctrl+K   commands"; color: #3f4651; font-size: 11px; vertical-alignment: center; } } }
+            }
+        }
+
+        Rectangle { width: 1px; background: #ffffff12; }
+
+        // ── CENTER: header + tab strip + body ──
+        Rectangle {
+            background: #07080a;
+            VerticalLayout {
+                Rectangle {
+                    height: 58px; background: #101113;
+                    HorizontalLayout {
+                        padding: 14px; spacing: 10px;
+                        VerticalLayout { alignment: center; spacing: 2px;
+                            Text { text: root.header-name; color: #e4e8ee; font-size: 16px; }
+                            Text { text: root.header-sub; color: #5b6472; font-size: 12px; } }
+                        Rectangle { }
+                        SealedPill { }
+                    }
+                }
+                // tab strip
+                Rectangle {
+                    height: 38px; background: #0b0c0e;
+                    HorizontalLayout {
+                        padding-left: 16px; spacing: 20px;
+                        TabLabel { label: "Chat"; active: root.active-tab == 0; }
+                        TabLabel { label: "Shares"; active: root.active-tab == 1; }
+                        TabLabel { label: "Circle shares"; active: root.active-tab == 2; }
+                        Rectangle { }
+                    }
+                }
+                Rectangle { height: 1px; background: #ffffff10; }
+
+                // body — one tab visible at a time
+                Rectangle {
+                    background: #07080a;
+
+                    // CHAT
+                    if root.active-tab == 0 : VerticalLayout {
+                        Rectangle {
+                            clip: true;
+                            VerticalLayout {
+                                y: -root.scroll-y;
+                                height: root.messages.length * 52px;
+                                padding: 16px; spacing: 8px;
+                                for m in root.messages : MsgBubble { who: m.who; text: m.text; mine: m.mine; }
+                            }
+                        }
+                        Rectangle {
+                            height: 54px; background: #0d0e10;
+                            HorizontalLayout {
+                                padding: 12px; spacing: 10px;
+                                Rectangle {
+                                    border-radius: 9px; background: #141517; border-width: 1px; border-color: #ffffff12;
+                                    HorizontalLayout { padding-left: 12px;
+                                        Text {
+                                            text: root.draft == "" ? "Message the circle…" : root.draft;
+                                            color: root.draft == "" ? #4d5560 : #d6dae1;
+                                            font-size: 13px; vertical-alignment: center;
+                                        }
+                                    }
+                                }
+                                Rectangle { width: 84px; height: 38px; border-radius: 9px; background: #4a9d8e;
+                                    Text { text: "Send"; color: #06120f; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; } }
+                            }
+                        }
+                    }
+
+                    // SHARES (public — the M16 fetch path)
+                    if root.active-tab == 1 : VerticalLayout {
+                        padding: 16px; spacing: 12px; alignment: start;
+                        HorizontalLayout {
+                            Text { text: "Shares · preview before fetch"; color: #5b6472; font-size: 12px; vertical-alignment: center; }
+                            Rectangle { }
+                        }
+                        Rectangle {
+                            border-radius: 10px; background: #101113; border-width: 1px; border-color: #ffffff10;
+                            VerticalLayout {
+                                padding: 12px; spacing: 6px;
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    Text { text: "quiet-harbor"; color: #d6dae1; font-size: 14px; vertical-alignment: center; }
+                                    Text { text: "3 files"; color: #5b6472; font-size: 12px; vertical-alignment: center; }
+                                    Rectangle { }
+                                    SealedPill { }
+                                }
+                                Rectangle { height: 1px; background: #ffffff10; }
+                                for f in root.files : FileRow { name: f.name; size: f.size; checked: f.checked; }
+                            }
+                        }
+                        Rectangle { }
+                        HorizontalLayout {
+                            Rectangle { }
+                            Rectangle { width: 130px; height: 38px; border-radius: 9px; background: #4a9d8e;
+                                Text { text: "Fetch selected"; color: #06120f; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; } }
+                        }
+                    }
+
+                    // CIRCLE SHARES — placeholder so nav feels complete (M17, not built)
+                    if root.active-tab == 2 : VerticalLayout {
+                        alignment: center;
+                        HorizontalLayout {
+                            alignment: center;
+                            VerticalLayout {
+                                alignment: center; spacing: 8px;
+                                Text { text: "Circle shares"; color: #aeb6c2; font-size: 18px; horizontal-alignment: center; }
+                                Text { text: "work in progress · coming soon"; color: #5b6472; font-size: 13px; horizontal-alignment: center; }
+                                Text { text: "End-to-end-sealed sharing inside a circle."; color: #3f4651; font-size: 12px; horizontal-alignment: center; }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── context sheet overlay (on-demand) ──
+    sheet := Rectangle {
+        y: 0; width: 340px; height: root.height;
+        x: root.sheet-open ? root.width - self.width : root.width;
+        animate x { duration: 220ms; easing: ease-in-out; }
+        background: #101113; border-width: 1px; border-color: #ffffff14;
+        VerticalLayout {
+            padding: 16px; spacing: 10px; alignment: start;
+            Text { text: "Circle details"; color: #e4e8ee; font-size: 15px; }
+            Text { text: "end-to-end sealed"; color: #6fb3a4; font-size: 12px; }
+            Text { text: "members — identity only, no presence"; color: #5b6472; font-size: 12px; }
+        }
+    }
+
+    // ── command palette overlay — the action registry mirrored to a 2nd surface ──
+    palette := Rectangle {
+        x: (root.width - self.width) / 2; y: 90px;
+        width: 520px; height: 320px;
+        visible: root.palette-open;
+        background: #0e0f11; border-radius: 12px; border-width: 1px; border-color: #ffffff18;
+        VerticalLayout {
+            padding: 14px; spacing: 8px; alignment: start;
+            Rectangle { height: 36px; border-radius: 8px; background: #141517;
+                HorizontalLayout { padding-left: 10px; Text { text: "Type a command…"; color: #aeb6c2; font-size: 13px; vertical-alignment: center; } } }
+            for a in root.actions : Rectangle {
+                height: 30px; border-radius: 6px; background: #121315;
+                HorizontalLayout { padding-left: 10px; spacing: 8px;
+                    Text { text: a.label; color: #cfd5dd; font-size: 13px; vertical-alignment: center; }
+                    Rectangle { }
+                    Text { text: a.shortcut; color: #4d5560; font-size: 12px; vertical-alignment: center; } }
+            }
+        }
+    }
+}

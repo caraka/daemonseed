@@ -1,0 +1,40 @@
+# ─────────────────────────────────────────────────────────────────────
+# daemonseed-gui — LAMA API Manifest (Slint GUI client; round-1 scaffold)
+#
+# A binary view-crate that will consume the daemonseed-proto + daemonseed-core
+# public contract. Round 1 is a software-renderer shell on stub data with NO
+# library API surface and NO daemonseed-core wiring yet, so this manifest is a
+# placeholder that grows when the GUI gains a bound data layer (round 2).
+#
+# Cross-references:
+# - Repository root: ../../lama.yaml
+# - Core crate (future data source): ./daemonseed-core-api.yaml
+# - Proto contract (future data source): ./daemonseed-proto-protocol.yaml
+# ─────────────────────────────────────────────────────────────────────
+
+lama: "0.1"
+
+library:
+  name: daemonseed-gui
+  version: "0.1.0"
+  description: >-
+    Slint GUI client for daemonseed (round-1 scaffold). The design brief's
+    three-zone shell (circle rail / conversation pane / on-demand context sheet)
+    ported from the perf spike into structured Slint components, with the alpha
+    tab nav (Chat / Shares / a "coming soon" circle-shares placeholder) and a
+    command-palette overlay seeded from a Rust-side action registry. Data is stub
+    / in-memory; daemonseed-core is not wired yet. Base build is
+    software-renderer-only (offscreen `--screenshot <path>` PNG — the only mode a
+    headless terminal can verify); the `desktop` feature forwards
+    slint/backend-winit for a real software-rendered window. ISC-C6 (the GUI
+    framework commitment) stays unchecked until the on-device mic-permission spike.
+  license: "AGPL-3.0-or-later"
+  manifest_for: "crates/daemonseed-gui"
+  status: "round-1 scaffold — software-renderer shell on stub data; no library API; no daemonseed-core wiring; ISC-C6 unchecked (mic-permission spike pending)"
+
+# The crate is a binary with no public library surface in round 1. When round 2
+# wires daemonseed-core (the net actor + real data) and any reusable view
+# components, this manifest grows `modules` + `public_types` to match.
+modules: []
+public_types: []
+public_functions: []
