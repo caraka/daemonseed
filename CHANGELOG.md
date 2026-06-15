@@ -23,6 +23,22 @@ In-progress and next-milestone planning is tracked in the project lead's vault
 manifest (not committed). The next entry is added here at the moment a release
 is tagged, as part of the doc-sync ritual in `AGENTS.md`.
 
+## [0.24.0] — GUI affordances: persistent New/Join, command palette, edit-crash fix
+
+Keyboard-first and discoverability polish on the GUI alpha, plus a crash fix.
+
+- **Persistent New/Join entry:** the rail shows a "+ New circle / Join" entry
+  whenever circles exist (the New/Join buttons previously vanished once you had a
+  circle, leaving only the palette), so adding another circle is always one click.
+- **Command palette + shortcuts:** Ctrl-K toggles the palette and Escape closes
+  it; Ctrl+L (Lobby), Ctrl+N (New circle), Ctrl+J (Join) are bound directly.
+  Overlays are mutually exclusive (no stacking); shortcut labels brightened. Global
+  shortcuts are intentionally inert while a popup's text field has focus (text-entry
+  mode); Escape / Enter / Close exit it.
+- **Crash fix:** editing a circle phrase could crash the renderer ("RefCell already
+  borrowed") because the status indicators toggled item-tree `if` conditionals
+  mid-edit. They are now stable computed elements — editing changes only properties.
+
 ## [0.23.0] — GUI circle chat: circles talk on the relay
 
 The circles created and joined in v0.22.0 now chat end-to-end-sealed over the
