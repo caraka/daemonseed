@@ -1,12 +1,16 @@
-// daemonseed-gui — round-1 shell (Slint, software renderer).
+// daemonseed-gui — shell (Slint, software renderer).
 //
-// The three-zone shell from the design brief, ported from the proven perf spike
-// into structured components: left circle rail · center conversation/shares pane
-// · on-demand context sheet, plus a command-palette overlay (the action registry
-// mirrored to a second surface). Visual language per brief: dark 4-step surface
-// ladder, GRAYSCALE chrome, ONE teal accent (primary action + E2EE "sealed"
-// tint). Trust marker is a LABELED PILL, never a dot (brief #5). Data is stub /
-// in-memory for round 1 (no daemonseed-core wiring yet).
+// Round 1 ported the three-zone shell from the perf spike. Round 2/3 made it
+// interactive + wired the public Lobby to real networking. Round 4 adds **circle
+// plumbing**: Join-a-circle and New-circle overlays (the action-registry surfaces),
+// a rail empty-state ("No circles yet"), and the materialize flow. Circles are
+// materialized-but-MUTE this round (no networking) — Round 5 plugs the net path
+// into the per-circle net contract the state layer now carries.
+//
+// Visual language per brief: dark 4-step surface ladder, GRAYSCALE chrome, ONE
+// teal accent (primary action + E2EE "sealed" tint). Trust marker is a LABELED
+// PILL, never a dot (brief #5). Entropy/key/derivation words never appear; a quiet
+// "Looks strong" stands in for any meter (brief #34, D3 — numbers HIDDEN).
 
 struct CircleData {
     name: string,
@@ -69,6 +73,14 @@ component SealedPill inherits Rectangle {
     Text { text: "sealed"; color: #6fb3a4; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
 }
 
+// Quiet "Looks strong" affordance (brief D3): a calm reassurance, NEVER a numeric
+// meter or scolding bar. Shown only when the phrase clears the (hidden) floor.
+component StrongPill inherits Rectangle {
+    width: 96px; height: 22px; border-radius: 11px;
+    background: #11302b; border-width: 1px; border-color: #1f4d45;
+    Text { text: "Looks strong"; color: #6fb3a4; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
+}
+
 component MsgBubble inherits Rectangle {
     in property <string> who;
     in property <string> text;
@@ -109,12 +121,26 @@ component FileRow inherits Rectangle {
     }
 }
 
+// A calm pill button (overlay CTAs / secondary actions). `primary` = the one teal
+// accent; otherwise a muted surface-ladder button.
+component PillButton inherits Rectangle {
+    in property <string> label;
+    in property <bool> primary: false;
+    in property <length> w: 130px;
+    callback clicked;
+    width: root.w; height: 38px; border-radius: 9px;
+    background: root.primary ? #4a9d8e : #141517;
+    border-width: root.primary ? 0px : 1px; border-color: #ffffff14;
+    TouchArea { clicked => { root.clicked(); } }
+    Text {
+        text: root.label;
+        color: root.primary ? #06120f : #cfd5dd;
+        font-size: 13px; horizontal-alignment: center; vertical-alignment: center;
+    }
+}
+
 // Inheriting TouchArea makes the WHOLE label clickable (its built-in `clicked`
-// fires anywhere over the content). The previous `inherits VerticalLayout` made
-// the TouchArea a zero-height layout child that didn't cover the text, so tab
-// clicks never registered — unlike RailRow (inherits Rectangle), where a child
-// TouchArea fills the parent. Content-hugging width is preserved (TouchArea sizes
-// to its child VerticalLayout; the tab strip's trailing spacer absorbs the slack).
+// fires anywhere over the content). Content-hugging width is preserved.
 component TabLabel inherits TouchArea {
     in property <string> label;
     in property <bool> active: false;
@@ -130,7 +156,7 @@ export component AppWindow inherits Window {
     background: #07080a;
 
     in property <[CircleData]> circles;
-    in-out property <int> active: 1;          // SOLE writer is Rust (out-of-range guard)
+    in-out property <int> active: 0;          // SOLE writer is Rust (out-of-range guard)
     in-out property <int> active-tab: 0;      // 0 = Chat, 1 = Shares, 2 = Circle shares
     in property <string> header-name;
     in property <string> header-sub;
@@ -142,16 +168,37 @@ export component AppWindow inherits Window {
     in-out property <bool> palette-open: false;
     in property <[ActionData]> actions;
 
-    // Real-networking status (round-3): driven by the net actor's events,
-    // drained on the UI thread by a slint::Timer. Small muted header text.
+    // Round-4 circle-plumbing surfaces.
+    in-out property <bool> join-open: false;       // Join-a-circle overlay visible
+    in-out property <bool> new-open: false;        // New-circle overlay visible
+    in-out property <string> join-phrase;          // live Join phrase (two-way to Rust)
+    in property <bool> join-phrase-strong: false;  // Rust-set: estimate_circle().is_circle_green()
+    in property <string> new-phrase;               // Rust-set: generated 12-word diceware phrase
+    in property <bool> only-lobby: true;           // Rust-set: only the pinned Lobby exists → empty-state
+
+    // Real-networking status (round-3): driven by the net actor's events.
     in-out property <string> connection-status: "connecting…";
     in-out property <bool> connected: false;
 
     callback switch-circle(int);
-    // Fired when the user presses Send (or Enter) on the composer while the
-    // Lobby (rail index 0) is active. Carries the current draft; Rust publishes
-    // a real sealed public-room message and clears the draft.
+    // Composer Send (or Enter) — carries the draft. Lobby → real sealed SendRoom;
+    // a materialized circle → the Round-5 SendCircle seam (local-echo stub).
     callback send-message(string);
+
+    // Round-4 callbacks. `open-*` raise the overlays from EITHER surface (rail
+    // empty-state or palette — action registry → two surfaces). `join-phrase-edited`
+    // lets Rust recompute the hidden strength on each keystroke. `submit-*`
+    // materialize. `reroll-new` regenerates the diceware phrase.
+    callback open-join();
+    callback open-new();
+    callback join-phrase-edited(string);
+    callback submit-join(string);
+    callback reroll-new();
+    callback submit-new(string);
+    // Autofocus the composer after a rail switch so the user can type immediately
+    // (caraka note 2026-06-15). Guarded to the Chat tab; Rust invokes it on switch.
+    callback focus-composer();
+    focus-composer => { if (root.active-tab == 0) { composer.focus(); } }
 
     HorizontalLayout {
         // ── LEFT: circle rail ──
@@ -168,6 +215,23 @@ export component AppWindow inherits Window {
                     selected: i == root.active;
                     clicked => { root.switch-circle(i); }
                 }
+
+                // Empty-state: only the pinned Lobby exists (brief lean, ISC-31).
+                // Mouse-home launch surfaces, mirrored by the palette rows.
+                if root.only-lobby : Rectangle {
+                    height: 96px;
+                    VerticalLayout {
+                        padding: 8px; spacing: 8px; alignment: start;
+                        Text { text: "No circles yet"; color: #8b93a1; font-size: 13px; }
+                        Text { text: "Enter a phrase you were given, or start a new one."; color: #5b6472; font-size: 11px; wrap: word-wrap; }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            PillButton { label: "New circle"; primary: true; w: 108px; clicked => { root.open-new(); } }
+                            PillButton { label: "Join"; w: 72px; clicked => { root.open-join(); } }
+                        }
+                    }
+                }
+
                 Rectangle { }
                 Rectangle { height: 22px;
                     TouchArea { clicked => { root.palette-open = true; } }
@@ -189,7 +253,6 @@ export component AppWindow inherits Window {
                             Text { text: root.header-name; color: #e4e8ee; font-size: 16px; }
                             Text { text: root.header-sub; color: #5b6472; font-size: 12px; } }
                         Rectangle { }
-                        // Small muted connection status (round-3 real net).
                         Text {
                             text: root.connection-status;
                             color: root.connected ? #6fb3a4 : #5b6472;
@@ -212,28 +275,78 @@ export component AppWindow inherits Window {
                 }
                 Rectangle { height: 1px; background: #ffffff10; }
 
-                // body — one tab visible at a time
+                // body — content region swaps by tab; composer bar is ALWAYS
+                // instantiated (so it is a stable autofocus target) but shown only
+                // on the Chat tab.
                 Rectangle {
                     background: #07080a;
+                    VerticalLayout {
+                        // content region (one tab visible at a time)
+                        Rectangle {
+                            // CHAT — message list
+                            if root.active-tab == 0 : Flickable {
+                                viewport-width: self.width;
+                                viewport-height: root.messages.length * 52px + 32px;
+                                viewport-y <=> root.scroll-y;
+                                VerticalLayout {
+                                    padding: 16px; spacing: 8px;
+                                    for m in root.messages : MsgBubble { who: m.who; text: m.text; mine: m.mine; }
+                                }
+                            }
 
-                    // CHAT
-                    if root.active-tab == 0 : VerticalLayout {
-                        Flickable {
-                            viewport-width: self.width;
-                            viewport-height: root.messages.length * 52px + 32px;
-                            viewport-y <=> root.scroll-y;
-                            VerticalLayout {
-                                padding: 16px; spacing: 8px;
-                                for m in root.messages : MsgBubble { who: m.who; text: m.text; mine: m.mine; }
+                            // SHARES (public — the M16 fetch path)
+                            if root.active-tab == 1 : VerticalLayout {
+                                padding: 16px; spacing: 12px; alignment: start;
+                                HorizontalLayout {
+                                    Text { text: "Shares · preview before fetch"; color: #5b6472; font-size: 12px; vertical-alignment: center; }
+                                    Rectangle { }
+                                }
+                                Rectangle {
+                                    border-radius: 10px; background: #101113; border-width: 1px; border-color: #ffffff10;
+                                    VerticalLayout {
+                                        padding: 12px; spacing: 6px;
+                                        HorizontalLayout {
+                                            spacing: 8px;
+                                            Text { text: "quiet-harbor"; color: #d6dae1; font-size: 14px; vertical-alignment: center; }
+                                            Text { text: "3 files"; color: #5b6472; font-size: 12px; vertical-alignment: center; }
+                                            Rectangle { }
+                                            SealedPill { }
+                                        }
+                                        Rectangle { height: 1px; background: #ffffff10; }
+                                        for f in root.files : FileRow { name: f.name; size: f.size; checked: f.checked; }
+                                    }
+                                }
+                                Rectangle { }
+                                HorizontalLayout {
+                                    Rectangle { }
+                                    PillButton { label: "Fetch selected"; primary: true; w: 130px; }
+                                }
+                            }
+
+                            // CIRCLE SHARES — placeholder so nav feels complete (M17, not built)
+                            if root.active-tab == 2 : VerticalLayout {
+                                alignment: center;
+                                HorizontalLayout {
+                                    alignment: center;
+                                    VerticalLayout {
+                                        alignment: center; spacing: 8px;
+                                        Text { text: "Circle shares"; color: #aeb6c2; font-size: 18px; horizontal-alignment: center; }
+                                        Text { text: "work in progress · coming soon"; color: #5b6472; font-size: 13px; horizontal-alignment: center; }
+                                        Text { text: "End-to-end-sealed sharing inside a circle."; color: #3f4651; font-size: 12px; horizontal-alignment: center; }
+                                    }
+                                }
                             }
                         }
+
+                        // composer bar — stable autofocus target; shown on Chat only.
                         Rectangle {
-                            height: 54px; background: #0d0e10;
+                            height: root.active-tab == 0 ? 54px : 0px;
+                            visible: root.active-tab == 0;
+                            background: #0d0e10;
                             HorizontalLayout {
                                 padding: 12px; spacing: 10px;
                                 Rectangle {
                                     border-radius: 9px; background: #141517; border-width: 1px; border-color: #ffffff12;
-                                    // Placeholder shown only when the draft is empty.
                                     HorizontalLayout { padding-left: 12px;
                                         if root.draft == "" : Text {
                                             text: "Message the circle…";
@@ -242,13 +355,12 @@ export component AppWindow inherits Window {
                                         }
                                     }
                                     HorizontalLayout { padding-left: 12px; padding-right: 12px;
-                                        TextInput {
+                                        composer := TextInput {
                                             text <=> root.draft;
                                             color: #d6dae1;
                                             font-size: 13px;
                                             vertical-alignment: center;
                                             single-line: true;
-                                            // Enter sends, parity with the Send button.
                                             accepted => { root.send-message(root.draft); }
                                         }
                                     }
@@ -256,50 +368,6 @@ export component AppWindow inherits Window {
                                 Rectangle { width: 84px; height: 38px; border-radius: 9px; background: #4a9d8e;
                                     TouchArea { clicked => { root.send-message(root.draft); } }
                                     Text { text: "Send"; color: #06120f; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; } }
-                            }
-                        }
-                    }
-
-                    // SHARES (public — the M16 fetch path)
-                    if root.active-tab == 1 : VerticalLayout {
-                        padding: 16px; spacing: 12px; alignment: start;
-                        HorizontalLayout {
-                            Text { text: "Shares · preview before fetch"; color: #5b6472; font-size: 12px; vertical-alignment: center; }
-                            Rectangle { }
-                        }
-                        Rectangle {
-                            border-radius: 10px; background: #101113; border-width: 1px; border-color: #ffffff10;
-                            VerticalLayout {
-                                padding: 12px; spacing: 6px;
-                                HorizontalLayout {
-                                    spacing: 8px;
-                                    Text { text: "quiet-harbor"; color: #d6dae1; font-size: 14px; vertical-alignment: center; }
-                                    Text { text: "3 files"; color: #5b6472; font-size: 12px; vertical-alignment: center; }
-                                    Rectangle { }
-                                    SealedPill { }
-                                }
-                                Rectangle { height: 1px; background: #ffffff10; }
-                                for f in root.files : FileRow { name: f.name; size: f.size; checked: f.checked; }
-                            }
-                        }
-                        Rectangle { }
-                        HorizontalLayout {
-                            Rectangle { }
-                            Rectangle { width: 130px; height: 38px; border-radius: 9px; background: #4a9d8e;
-                                Text { text: "Fetch selected"; color: #06120f; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; } }
-                        }
-                    }
-
-                    // CIRCLE SHARES — placeholder so nav feels complete (M17, not built)
-                    if root.active-tab == 2 : VerticalLayout {
-                        alignment: center;
-                        HorizontalLayout {
-                            alignment: center;
-                            VerticalLayout {
-                                alignment: center; spacing: 8px;
-                                Text { text: "Circle shares"; color: #aeb6c2; font-size: 18px; horizontal-alignment: center; }
-                                Text { text: "work in progress · coming soon"; color: #5b6472; font-size: 13px; horizontal-alignment: center; }
-                                Text { text: "End-to-end-sealed sharing inside a circle."; color: #3f4651; font-size: 12px; horizontal-alignment: center; }
                             }
                         }
                     }
@@ -337,15 +405,141 @@ export component AppWindow inherits Window {
                 TouchArea {
                     clicked => {
                         root.palette-open = false;
-                        // First row ("Go to Lobby") drives REAL behavior off the
-                        // palette surface; the rest just dismiss for now.
+                        // Action registry → real behavior. 0 = Lobby, 1 = New
+                        // circle, 2 = Join a circle; 3 (Fetch) just dismisses for now.
                         if (i == 0) { root.switch-circle(0); }
+                        if (i == 1) { root.open-new(); }
+                        if (i == 2) { root.open-join(); }
                     }
                 }
                 HorizontalLayout { padding-left: 10px; spacing: 8px;
                     Text { text: a.label; color: #cfd5dd; font-size: 13px; vertical-alignment: center; }
                     Rectangle { }
                     Text { text: a.shortcut; color: #4d5560; font-size: 12px; vertical-alignment: center; } }
+            }
+        }
+    }
+
+    // ── Join-a-circle overlay (brief "Join a circle" screen) ──
+    join := Rectangle {
+        x: (root.width - self.width) / 2; y: 70px;
+        width: 540px; height: 420px;
+        visible: root.join-open;
+        background: #0e0f11; border-radius: 12px; border-width: 1px; border-color: #ffffff18;
+        VerticalLayout {
+            padding: 18px; spacing: 12px; alignment: start;
+            HorizontalLayout {
+                Text { text: "Join a circle"; color: #e4e8ee; font-size: 17px; }
+                Rectangle { }
+                PillButton { label: "Close"; w: 70px; clicked => { root.join-open = false; } }
+            }
+            Text { text: "Enter the phrase you were given."; color: #8b93a1; font-size: 13px; }
+
+            HorizontalLayout {
+                spacing: 10px;
+                // phrase field
+                Rectangle {
+                    height: 44px; border-radius: 9px; background: #141517; border-width: 1px; border-color: #ffffff12;
+                    HorizontalLayout { padding-left: 12px;
+                        if root.join-phrase == "" : Text { text: "the words you agreed on…"; color: #4d5560; font-size: 13px; vertical-alignment: center; }
+                    }
+                    HorizontalLayout { padding-left: 12px; padding-right: 12px;
+                        TextInput {
+                            text <=> root.join-phrase;
+                            color: #d6dae1; font-size: 13px; vertical-alignment: center; single-line: true;
+                            edited => { root.join-phrase-edited(root.join-phrase); }
+                            accepted => { root.submit-join(root.join-phrase); }
+                        }
+                    }
+                }
+                // co-equal QR slot (reserved) — same visual weight as the field.
+                Rectangle {
+                    width: 120px; height: 44px; border-radius: 9px; background: #101113; border-width: 1px; border-color: #ffffff12;
+                    Text { text: "Scan QR · soon"; color: #5b6472; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
+                }
+            }
+
+            // quiet strength reassurance (no number) / calm weak recovery
+            HorizontalLayout {
+                if root.join-phrase-strong : StrongPill { }
+                if !root.join-phrase-strong && root.join-phrase != "" : Text {
+                    text: "Keep adding words — a circle phrase needs to be a little longer.";
+                    color: #8b7d5b; font-size: 12px; vertical-alignment: center;
+                }
+                Rectangle { }
+            }
+
+            // pre-commit confirmation card — client-verifiable facts only.
+            Rectangle {
+                border-radius: 10px; background: #101113; border-width: 1px; border-color: #ffffff10;
+                VerticalLayout {
+                    padding: 12px; spacing: 6px; alignment: start;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text { text: "Before you enter"; color: #aeb6c2; font-size: 13px; vertical-alignment: center; }
+                        Rectangle { }
+                        SealedPill { }
+                    }
+                    // PLACEHOLDER — caraka security review: the crypto/relay facts on
+                    // this card are a security-reviewed artifact (brief refinement #3,
+                    // D6). Wording is NOT improvised unattended; these lines are
+                    // structural stand-ins to be replaced with verified claims.
+                    Text { text: "End-to-end sealed · only people with this phrase can read it."; color: #6fb3a4; font-size: 12px; }
+                    Text { text: "[PLACEHOLDER — caraka security review: relay-exposure sentence]"; color: #5b6472; font-size: 11px; }
+                    Text { text: "[PLACEHOLDER — caraka security review: \"N others\" only on a trusted relay]"; color: #5b6472; font-size: 11px; }
+                }
+            }
+
+            Rectangle { }
+            HorizontalLayout {
+                Rectangle { }
+                PillButton {
+                    label: "Enter the circle"; primary: true; w: 160px;
+                    clicked => { root.submit-join(root.join-phrase); }
+                }
+            }
+        }
+    }
+
+    // ── New-circle overlay (brief "New circle" screen) ──
+    new-circle := Rectangle {
+        x: (root.width - self.width) / 2; y: 70px;
+        width: 540px; height: 380px;
+        visible: root.new-open;
+        background: #0e0f11; border-radius: 12px; border-width: 1px; border-color: #ffffff18;
+        VerticalLayout {
+            padding: 18px; spacing: 12px; alignment: start;
+            HorizontalLayout {
+                Text { text: "New circle"; color: #e4e8ee; font-size: 17px; }
+                Rectangle { }
+                PillButton { label: "Close"; w: 70px; clicked => { root.new-open = false; } }
+            }
+            Text { text: "Here's a strong phrase. Share it with members out-of-band."; color: #8b93a1; font-size: 13px; }
+
+            // the generated phrase, shown as readable words
+            Rectangle {
+                height: 64px; border-radius: 10px; background: #141517; border-width: 1px; border-color: #ffffff12;
+                HorizontalLayout { padding: 14px;
+                    Text { text: root.new-phrase; color: #d6dae1; font-size: 14px; wrap: word-wrap; vertical-alignment: center; }
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 8px;
+                StrongPill { }
+                Rectangle { }
+                PillButton { label: "Copy"; w: 84px; clicked => { } }
+                PillButton { label: "Show QR"; w: 96px; clicked => { } }
+                PillButton { label: "Re-roll"; w: 96px; clicked => { root.reroll-new(); } }
+            }
+
+            Rectangle { }
+            HorizontalLayout {
+                Rectangle { }
+                PillButton {
+                    label: "Create the circle"; primary: true; w: 170px;
+                    clicked => { root.submit-new(root.new-phrase); }
+                }
             }
         }
     }
