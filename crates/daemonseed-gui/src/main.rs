@@ -91,6 +91,17 @@ impl Platform for GuiPlatform {
 const W: u32 = 1100;
 const H: u32 = 680;
 
+/// Run `f` on the next event-loop tick instead of synchronously. Used to move
+/// `.focus()` calls OUT of key-event handlers: focusing an element while Slint is
+/// mid key-processing is re-entrant and corrupts routing for the NEXT key (caraka
+/// hit "the third Ctrl shortcut in a row fails" — each prior shortcut had focused a
+/// field synchronously from inside the key handler). A 0ms single-shot defers it to
+/// after the current event completes. No-op in offscreen mode (no event loop), which
+/// is fine — the offscreen paths don't depend on focus.
+fn defer<F: FnOnce() + 'static>(f: F) {
+    slint::Timer::single_shot(Duration::from_millis(0), f);
+}
+
 /// Convert a circle's `Vec<Msg>` into a Slint `ModelRc<MsgData>`.
 fn messages_model(messages: &[Msg]) -> ModelRc<MsgData> {
     let rows: Vec<MsgData> = messages
@@ -169,8 +180,14 @@ fn materialize_and_select(
     };
     match join {
         Some((circle_id, phrase)) => {
-            // Autofocus the composer so the user can type immediately (caraka note).
-            ui.invoke_focus_composer();
+            // Autofocus the composer so the user can type immediately (caraka note),
+            // deferred off any key-triggered call path (re-entrant focus footgun).
+            let w = ui.as_weak();
+            defer(move || {
+                if let Some(ui) = w.upgrade() {
+                    ui.invoke_focus_composer();
+                }
+            });
             // Round 5: subscribe the actor to this circle. Fire-and-forget; if the
             // session isn't Connected yet the actor emits a (drained, non-fatal)
             // CircleError — the create-before-connect edge, flagged in the ISA.
@@ -210,6 +227,10 @@ fn build_ui() -> (AppWindow, Rc<RefCell<GuiState>>, Rc<RefCell<NetHandle>>) {
         let state = state.clone();
         move |target| {
             let ui = weak.unwrap();
+            // Switching dismisses any open overlay (mutual exclusivity — never stack).
+            ui.set_new_open(false);
+            ui.set_join_open(false);
+            ui.set_palette_open(false);
             let live_draft = ui.get_draft().to_string();
             let live_scroll = ui.get_scroll_y();
             {
@@ -218,7 +239,14 @@ fn build_ui() -> (AppWindow, Rc<RefCell<GuiState>>, Rc<RefCell<NetHandle>>) {
                 let active = st.active();
                 apply_view(&ui, st.current(), active as i32);
             }
-            ui.invoke_focus_composer();
+            // Deferred: focusing during a (possibly key-triggered, e.g. Ctrl+L) callback
+            // is re-entrant and breaks the next key's routing.
+            let w = ui.as_weak();
+            defer(move || {
+                if let Some(ui) = w.upgrade() {
+                    ui.invoke_focus_composer();
+                }
+            });
         }
     });
 
@@ -228,11 +256,20 @@ fn build_ui() -> (AppWindow, Rc<RefCell<GuiState>>, Rc<RefCell<NetHandle>>) {
         let weak = ui.as_weak();
         move || {
             let ui = weak.unwrap();
+            // Mutual exclusivity — close the other surfaces so overlays never stack.
+            ui.set_new_open(false);
+            ui.set_palette_open(false);
             ui.set_join_phrase(SharedString::from(""));
             ui.set_join_phrase_strong(false);
             ui.set_join_open(true);
-            // Focus the phrase field so the user can type / paste immediately.
-            ui.invoke_focus_join_input();
+            // Deferred focus (see `defer`): focusing during a key-triggered (Ctrl+J)
+            // callback is re-entrant and breaks the next key's routing.
+            let w = ui.as_weak();
+            defer(move || {
+                if let Some(ui) = w.upgrade() {
+                    ui.invoke_focus_join_input();
+                }
+            });
         }
     });
 
@@ -242,6 +279,9 @@ fn build_ui() -> (AppWindow, Rc<RefCell<GuiState>>, Rc<RefCell<NetHandle>>) {
         let weak = ui.as_weak();
         move || {
             let ui = weak.unwrap();
+            // Mutual exclusivity — close the other surfaces so overlays never stack.
+            ui.set_join_open(false);
+            ui.set_palette_open(false);
             let phrase = state::generate_circle_phrase().unwrap_or_default();
             ui.set_new_phrase(SharedString::from(phrase.as_str()));
             // Generated ⇒ strong; reset the copied confirmation for a fresh open.
