@@ -209,6 +209,19 @@ export component AppWindow inherits Window {
     callback focus-join-input();
     focus-join-input => { join_phrase_input.focus(); }
 
+    // Global shortcut host: Ctrl-K opens the command palette. It is an ancestor of
+    // the composer, so a focused TextInput that rejects Ctrl-K forwards the event
+    // up here; it never steals focus. Explicit fill (it is a Window child alongside
+    // the positioned overlays). The "Ctrl+K commands" rail row remains the click path.
+    FocusScope {
+        width: 100%; height: 100%;
+        key-pressed(event) => {
+            if (event.modifiers.control && event.text == "k") {
+                root.palette-open = true;
+                return accept;
+            }
+            return reject;
+        }
     HorizontalLayout {
         // ── LEFT: circle rail ──
         Rectangle {
@@ -239,6 +252,15 @@ export component AppWindow inherits Window {
                             PillButton { label: "Join"; w: 72px; clicked => { root.open-join(); } }
                         }
                     }
+                }
+
+                // Persistent entry once circles exist — the empty-state's buttons
+                // vanish with `only-lobby`, so adding a SECOND circle needs an
+                // always-present surface (felt-test gap, caraka 2026-06-15).
+                if !root.only-lobby : HorizontalLayout {
+                    padding: 4px; spacing: 8px;
+                    PillButton { label: "+ New circle"; primary: true; w: 120px; clicked => { root.open-new(); } }
+                    PillButton { label: "Join"; w: 64px; clicked => { root.open-join(); } }
                 }
 
                 Rectangle { }
@@ -383,6 +405,7 @@ export component AppWindow inherits Window {
                 }
             }
         }
+    }
     }
 
     // ── context sheet overlay (on-demand) ──
