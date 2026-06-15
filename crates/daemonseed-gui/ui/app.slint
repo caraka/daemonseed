@@ -38,9 +38,11 @@ component RailRow inherits Rectangle {
     in property <string> initial;
     in property <bool> selected: false;
     in property <bool> pinned: false;
+    callback clicked;
     height: 54px;
     border-radius: 8px;
     background: selected ? #141517 : transparent;
+    TouchArea { clicked => { root.clicked(); } }
     HorizontalLayout {
         padding: 8px; spacing: 10px;
         Rectangle {
@@ -110,7 +112,9 @@ component FileRow inherits Rectangle {
 component TabLabel inherits VerticalLayout {
     in property <string> label;
     in property <bool> active: false;
+    callback clicked;
     alignment: center;
+    TouchArea { clicked => { root.clicked(); } }
     Text { text: root.label; color: root.active ? #d6dae1 : #5b6472; font-size: 13px; horizontal-alignment: center; }
     Rectangle { height: 2px; background: root.active ? #6b7280 : transparent; border-radius: 1px; }
 }
@@ -120,17 +124,19 @@ export component AppWindow inherits Window {
     background: #07080a;
 
     in property <[CircleData]> circles;
-    in property <int> active: 1;
-    in property <int> active-tab: 0;          // 0 = Chat, 1 = Shares, 2 = Circle shares
+    in-out property <int> active: 1;          // SOLE writer is Rust (out-of-range guard)
+    in-out property <int> active-tab: 0;      // 0 = Chat, 1 = Shares, 2 = Circle shares
     in property <string> header-name;
     in property <string> header-sub;
     in property <[MsgData]> messages;
     in property <[FileData]> files;
-    in property <string> draft;
-    in property <length> scroll-y: 0px;
+    in-out property <string> draft;           // live composer text, read by Rust on switch
+    in-out property <length> scroll-y: 0px;   // Flickable viewport-y (negative when scrolled)
     in property <bool> sheet-open: false;
-    in property <bool> palette-open: false;
+    in-out property <bool> palette-open: false;
     in property <[ActionData]> actions;
+
+    callback switch-circle(int);
 
     HorizontalLayout {
         // ── LEFT: circle rail ──
@@ -145,9 +151,11 @@ export component AppWindow inherits Window {
                 for c[i] in root.circles : RailRow {
                     name: c.name; sub: c.sub; initial: c.initial; pinned: c.pinned;
                     selected: i == root.active;
+                    clicked => { root.switch-circle(i); }
                 }
                 Rectangle { }
                 Rectangle { height: 22px;
+                    TouchArea { clicked => { root.palette-open = true; } }
                     HorizontalLayout { padding: 6px; Text { text: "Ctrl+K   commands"; color: #3f4651; font-size: 11px; vertical-alignment: center; } } }
             }
         }
@@ -174,9 +182,9 @@ export component AppWindow inherits Window {
                     height: 38px; background: #0b0c0e;
                     HorizontalLayout {
                         padding-left: 16px; spacing: 20px;
-                        TabLabel { label: "Chat"; active: root.active-tab == 0; }
-                        TabLabel { label: "Shares"; active: root.active-tab == 1; }
-                        TabLabel { label: "Circle shares"; active: root.active-tab == 2; }
+                        TabLabel { label: "Chat"; active: root.active-tab == 0; clicked => { root.active-tab = 0; } }
+                        TabLabel { label: "Shares"; active: root.active-tab == 1; clicked => { root.active-tab = 1; } }
+                        TabLabel { label: "Circle shares"; active: root.active-tab == 2; clicked => { root.active-tab = 2; } }
                         Rectangle { }
                     }
                 }
@@ -188,11 +196,11 @@ export component AppWindow inherits Window {
 
                     // CHAT
                     if root.active-tab == 0 : VerticalLayout {
-                        Rectangle {
-                            clip: true;
+                        Flickable {
+                            viewport-width: self.width;
+                            viewport-height: root.messages.length * 52px + 32px;
+                            viewport-y <=> root.scroll-y;
                             VerticalLayout {
-                                y: -root.scroll-y;
-                                height: root.messages.length * 52px;
                                 padding: 16px; spacing: 8px;
                                 for m in root.messages : MsgBubble { who: m.who; text: m.text; mine: m.mine; }
                             }
@@ -203,11 +211,21 @@ export component AppWindow inherits Window {
                                 padding: 12px; spacing: 10px;
                                 Rectangle {
                                     border-radius: 9px; background: #141517; border-width: 1px; border-color: #ffffff12;
+                                    // Placeholder shown only when the draft is empty.
                                     HorizontalLayout { padding-left: 12px;
-                                        Text {
-                                            text: root.draft == "" ? "Message the circle…" : root.draft;
-                                            color: root.draft == "" ? #4d5560 : #d6dae1;
+                                        if root.draft == "" : Text {
+                                            text: "Message the circle…";
+                                            color: #4d5560;
                                             font-size: 13px; vertical-alignment: center;
+                                        }
+                                    }
+                                    HorizontalLayout { padding-left: 12px; padding-right: 12px;
+                                        TextInput {
+                                            text <=> root.draft;
+                                            color: #d6dae1;
+                                            font-size: 13px;
+                                            vertical-alignment: center;
+                                            single-line: true;
                                         }
                                     }
                                 }
@@ -289,8 +307,16 @@ export component AppWindow inherits Window {
             padding: 14px; spacing: 8px; alignment: start;
             Rectangle { height: 36px; border-radius: 8px; background: #141517;
                 HorizontalLayout { padding-left: 10px; Text { text: "Type a command…"; color: #aeb6c2; font-size: 13px; vertical-alignment: center; } } }
-            for a in root.actions : Rectangle {
+            for a[i] in root.actions : Rectangle {
                 height: 30px; border-radius: 6px; background: #121315;
+                TouchArea {
+                    clicked => {
+                        root.palette-open = false;
+                        // First row ("Go to Lobby") drives REAL behavior off the
+                        // palette surface; the rest just dismiss for now.
+                        if (i == 0) { root.switch-circle(0); }
+                    }
+                }
                 HorizontalLayout { padding-left: 10px; spacing: 8px;
                     Text { text: a.label; color: #cfd5dd; font-size: 13px; vertical-alignment: center; }
                     Rectangle { }

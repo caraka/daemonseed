@@ -1,24 +1,35 @@
-//! daemonseed-gui — Slint client (round-1 scaffold).
+//! daemonseed-gui — Slint client (round-2 scaffold).
 //!
-//! Round 1 is the **software-renderer shell** ported from the proven perf spike:
-//! the brief's three-zone shell + alpha tab nav (Chat / Shares / a "coming soon"
-//! circle-shares placeholder), backed by stub in-memory data.
+//! Round 2 makes the shell **interactive** and adds a **RAM-only per-circle state
+//! layer**: clicking a circle in the rail switches to it, and each circle
+//! remembers its own half-typed draft and scroll position across switches
+//! (everything resets on relaunch — no persistence). The state machine lives in
+//! [`state`] (plain Rust, Slint-free, unit-tested). This is mechanics only — there
+//! is still NO `daemonseed-core` wiring, no network, no async; all data is stub.
 //!
 //! Two run modes. **Windowed** (the `desktop` feature) opens a real winit window,
 //! software-rendered (no GL) — the felt-test surface. **Offscreen**
 //! (`--screenshot <path>`) renders the shell to a PNG; it is the only mode a
 //! headless *terminal* can verify — the host has a display, the agent does not.
-//! `daemonseed-core` is NOT wired yet — all data is stub.
+//!
+//! Offscreen verification flags: `--switch <n>` drives the real switch callback
+//! before rendering; `--scroll <px>` sets the (negative-when-scrolled) viewport-y
+//! so a render SHOWS the scroll sign; `--self-check` runs a live retention
+//! round-trip through the real callback and prints `SELF-CHECK PASS` (panics →
+//! non-zero exit) on success.
 //!
 //! Verification oracle: render cost was already cleared by the perf spike
 //! (state-preserving switch ~1.6ms, 220ms easing ~1.4ms/frame on this renderer).
+
+mod state;
 
 slint::include_modules!();
 
 use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType, Rgb565Pixel};
 use slint::platform::{Platform, PlatformError, WindowAdapter};
-use slint::{ModelRc, SharedString, VecModel};
-use std::cell::Cell;
+use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
+use state::{CircleState, GuiState, Msg};
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -48,49 +59,77 @@ const H: u32 = 680;
 // --features desktop` opens a real window on the Wayland head. The base build is
 // offscreen-only so it compiles + verifies from a headless terminal.
 
-/// Populate the shell with stub in-memory data (no daemonseed-core wiring).
+/// Convert a circle's `Vec<Msg>` into a Slint `ModelRc<MsgData>`.
+fn messages_model(messages: &[Msg]) -> ModelRc<MsgData> {
+    let rows: Vec<MsgData> = messages
+        .iter()
+        .map(|m| MsgData {
+            who: SharedString::from(m.who.as_str()),
+            text: SharedString::from(m.text.as_str()),
+            mine: m.mine,
+        })
+        .collect();
+    ModelRc::from(Rc::new(VecModel::from(rows)))
+}
+
+/// The SINGLE path that pushes a circle's state into the UI props.
+///
+/// ORDER MATTERS (ISC-39): set `messages` FIRST so the Flickable's content
+/// height is current, then name/sub/draft/active, and write `scroll-y` LAST — so a
+/// restored negative scroll is clamped against the new content height, not stale.
+fn apply_view(ui: &AppWindow, c: &CircleState, active: i32) {
+    ui.set_messages(messages_model(&c.messages));
+    ui.set_header_name(SharedString::from(c.name.as_str()));
+    ui.set_header_sub(SharedString::from(c.header_sub.as_str()));
+    ui.set_draft(SharedString::from(c.draft.as_str()));
+    ui.set_active(active);
+    ui.set_scroll_y(c.scroll_y);
+}
+
+/// Build the shell, own the RAM-only state, and wire the interactive callbacks
+/// (no daemonseed-core wiring — all data is stub).
 fn build_ui() -> AppWindow {
     let ui = AppWindow::new().expect("create AppWindow");
+    let state = Rc::new(RefCell::new(GuiState::demo()));
 
-    let names = ["Lobby", "midnight-signal", "garden-fence", "harbor-lights"];
-    let subs = [
-        "public lobby · amazon-fra1",
-        "4 here · sealed",
-        "2 here · sealed",
-        "3 here · sealed",
-    ];
-    let initials = ["L", "m", "g", "h"];
-    let pinned = [true, false, false, false];
-    let circles: Vec<CircleData> = (0..names.len())
-        .map(|i| CircleData {
-            name: names[i].into(),
-            sub: subs[i].into(),
-            initial: initials[i].into(),
-            pinned: pinned[i],
-        })
-        .collect();
-    ui.set_circles(ModelRc::from(Rc::new(VecModel::from(circles))));
-    ui.set_active(1);
+    // Rail model — built once from the circle metas (names/subs are static).
+    {
+        let st = state.borrow();
+        let circles: Vec<CircleData> = st
+            .metas()
+            .iter()
+            .map(|c| CircleData {
+                name: SharedString::from(c.name.as_str()),
+                sub: SharedString::from(c.sub.as_str()),
+                initial: SharedString::from(c.initial.as_str()),
+                pinned: c.pinned,
+            })
+            .collect();
+        ui.set_circles(ModelRc::from(Rc::new(VecModel::from(circles))));
+    }
     ui.set_active_tab(0);
-    ui.set_header_name("midnight-signal".into());
-    ui.set_header_sub("4 here · end-to-end sealed".into());
-    ui.set_draft("ready when you are".into());
 
-    let messages: Vec<MsgData> = (0..24)
-        .map(|i| {
-            let mine = i % 3 == 0;
-            MsgData {
-                who: if mine {
-                    SharedString::from("wandering-otter")
-                } else {
-                    SharedString::from(format!("daemon-{i:02}"))
-                },
-                text: SharedString::from(format!("message line {i} — lorem ipsum dolor sit amet")),
-                mine,
-            }
-        })
-        .collect();
-    ui.set_messages(ModelRc::from(Rc::new(VecModel::from(messages))));
+    // Interactive rail: capture live edits into the active circle, then switch.
+    ui.on_switch_circle({
+        let weak = ui.as_weak();
+        let state = state.clone();
+        move |target| {
+            let ui = weak.unwrap();
+            let live_draft = ui.get_draft().to_string();
+            let live_scroll = ui.get_scroll_y();
+            let mut st = state.borrow_mut();
+            st.switch_to(target as usize, live_draft, live_scroll);
+            let active = st.active();
+            apply_view(&ui, st.current(), active as i32);
+        }
+    });
+
+    // Initial view = the demo's active circle.
+    {
+        let st = state.borrow();
+        let active = st.active();
+        apply_view(&ui, st.current(), active as i32);
+    }
 
     let files = vec![
         FileData {
@@ -165,27 +204,74 @@ fn render_png(window: &Rc<MinimalSoftwareWindow>, path: &str) {
     println!("daemonseed-gui: wrote {path} ({W}x{H}, software renderer)");
 }
 
+/// Live retention round-trip through the REAL switch callback (asserts at the
+/// UI-property level). Proves draft + scroll survive a circle switch end-to-end,
+/// not just a state swap. Panics on failure (→ non-zero exit).
+fn self_check(ui: &AppWindow) {
+    const SENTINEL_DRAFT: &str = "SENTINEL-DRAFT";
+    // Within the active circle's scroll range (~24 messages) so it isn't clamped.
+    const SENTINEL_SCROLL: f32 = -120.0;
+
+    let init = ui.get_active();
+    ui.set_draft(SENTINEL_DRAFT.into());
+    ui.set_scroll_y(SENTINEL_SCROLL);
+    // Switch away through the real callback, then back.
+    ui.invoke_switch_circle(3);
+    ui.invoke_switch_circle(init);
+
+    let got_draft = ui.get_draft();
+    let got_scroll = ui.get_scroll_y();
+    assert_eq!(
+        got_draft.as_str(),
+        SENTINEL_DRAFT,
+        "draft not retained across switch: got {got_draft:?}"
+    );
+    assert!(
+        (got_scroll - SENTINEL_SCROLL).abs() < f32::EPSILON,
+        "scroll not retained across switch: got {got_scroll}, want {SENTINEL_SCROLL}"
+    );
+    println!("SELF-CHECK PASS");
+}
+
 fn main() {
     // `--screenshot <path>` forces the offscreen render — the only mode a headless
-    // terminal can verify. Absent + `desktop` feature → a real winit window.
+    // terminal can verify. `--switch <n>` drives the real switch callback before
+    // rendering. `--self-check` runs a live retention round-trip and exits.
+    // Absent any of these + `desktop` feature → a real winit window.
     let args: Vec<String> = std::env::args().collect();
     let mut screenshot: Option<String> = None;
+    let mut switch: Option<i32> = None;
+    // `--scroll <px>` sets the (negative-when-scrolled) viewport-y before render —
+    // a verification affordance to SHOW the scroll sign, not just assert it.
+    let mut scroll: Option<f32> = None;
+    let self_check_requested = args.iter().any(|a| a == "--self-check");
     for w in args.windows(2) {
         if w[0] == "--screenshot" {
             screenshot = Some(w[1].clone());
         }
+        if w[0] == "--switch" {
+            switch = w[1].parse().ok();
+        }
+        if w[0] == "--scroll" {
+            scroll = w[1].parse().ok();
+        }
     }
+    // `offscreen` is only read under the `desktop` feature (it decides windowed vs
+    // offscreen); without it the build is always offscreen, so silence the lint.
+    #[cfg_attr(not(feature = "desktop"), allow(unused_variables))]
+    let offscreen =
+        screenshot.is_some() || switch.is_some() || scroll.is_some() || self_check_requested;
 
     #[cfg(feature = "desktop")]
-    if screenshot.is_none() {
+    if !offscreen {
         // Windowed via Slint's default (winit) backend — the Wayland-head felt-test.
         let ui = build_ui();
         ui.run().expect("run windowed");
         return;
     }
 
-    // Offscreen software render → PNG.
-    let path = screenshot.unwrap_or_else(|| "daemonseed-gui.png".into());
+    // Offscreen software platform — needed for invoke/get/set to work even when no
+    // PNG is produced (--self-check still needs the platform + AppWindow).
     let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
     slint::platform::set_platform(Box::new(GuiPlatform {
         window: window.clone(),
@@ -194,5 +280,23 @@ fn main() {
     let ui = build_ui();
     ui.show().expect("show");
     window.set_size(slint::PhysicalSize::new(W, H));
+
+    if self_check_requested {
+        self_check(&ui);
+        return;
+    }
+
+    // Drive the REAL switch callback so the render reflects the switched circle.
+    if let Some(n) = switch {
+        ui.invoke_switch_circle(n);
+    }
+    // Apply a verification scroll LAST (after any switch reset scroll-y) so the
+    // PNG SHOWS the viewport-y sign, not just asserts it.
+    if let Some(s) = scroll {
+        ui.set_scroll_y(s);
+    }
+
+    // Render AFTER any switch/scroll so the PNG reflects the active circle.
+    let path = screenshot.unwrap_or_else(|| "daemonseed-gui.png".into());
     render_png(&window, &path);
 }

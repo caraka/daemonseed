@@ -1,10 +1,12 @@
 # ─────────────────────────────────────────────────────────────────────
-# daemonseed-gui — LAMA API Manifest (Slint GUI client; round-1 scaffold)
+# daemonseed-gui — LAMA API Manifest (Slint GUI client; round-2 mechanical slice)
 #
 # A binary view-crate that will consume the daemonseed-proto + daemonseed-core
-# public contract. Round 1 is a software-renderer shell on stub data with NO
-# library API surface and NO daemonseed-core wiring yet, so this manifest is a
-# placeholder that grows when the GUI gains a bound data layer (round 2).
+# public contract. It is a software-renderer shell on stub data with NO library
+# API surface and NO daemonseed-core wiring yet (round 2's mechanical slice made
+# the rail interactive over an internal RAM state machine; the live net-actor
+# wiring is the deferred attended half), so this manifest stays a placeholder
+# that grows when the GUI gains a published, bound data layer.
 #
 # Cross-references:
 # - Repository root: ../../lama.yaml
@@ -22,19 +24,26 @@ library:
     three-zone shell (circle rail / conversation pane / on-demand context sheet)
     ported from the perf spike into structured Slint components, with the alpha
     tab nav (Chat / Shares / a "coming soon" circle-shares placeholder) and a
-    command-palette overlay seeded from a Rust-side action registry. Data is stub
-    / in-memory; daemonseed-core is not wired yet. Base build is
+    command-palette overlay seeded from a Rust-side action registry. Round 2's
+    mechanical slice made the rail interactive (click-to-switch) over a Slint-free,
+    unit-tested per-circle RAM state machine (daemonseed_gui::state) that retains
+    each circle's draft + scroll across switches, fed by a real TextInput composer
+    and Flickable transcript. Data is still stub / in-memory; daemonseed-core is
+    not wired yet (that is the deferred attended round-2 half). Base build is
     software-renderer-only (offscreen `--screenshot <path>` PNG — the only mode a
     headless terminal can verify); the `desktop` feature forwards
     slint/backend-winit for a real software-rendered window. ISC-C6 (the GUI
     framework commitment) stays unchecked until the on-device mic-permission spike.
   license: "AGPL-3.0-or-later"
   manifest_for: "crates/daemonseed-gui"
-  status: "round-1 scaffold — software-renderer shell on stub data; no library API; no daemonseed-core wiring; ISC-C6 unchecked (mic-permission spike pending)"
+  status: "round-2 mechanical slice — interactive rail (click-to-switch) + RAM-only per-circle scroll/draft state (Slint-free, unit-tested daemonseed_gui::state) feeding a real TextInput composer + Flickable transcript; still a software-renderer shell on stub data with no library API and NO daemonseed-core wiring (the live net-actor half is the deferred attended round-2 work); ISC-C6 unchecked (mic-permission spike pending)"
 
-# The crate is a binary with no public library surface in round 1. When round 2
-# wires daemonseed-core (the net actor + real data) and any reusable view
-# components, this manifest grows `modules` + `public_types` to match.
+# The crate is a binary with no public library surface. Round 2's MECHANICAL
+# slice added an internal, Slint-free state machine (`daemonseed_gui::state`:
+# Msg / CircleState / GuiState with a persist-on-leave switch_to) — internal, not
+# a published API. When the ATTENDED round-2 half wires daemonseed-core (the net
+# actor + real data) and any reusable view components, this manifest grows
+# `modules` + `public_types` to match.
 modules: []
 public_types: []
 public_functions: []
