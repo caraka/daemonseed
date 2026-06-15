@@ -23,6 +23,21 @@ In-progress and next-milestone planning is tracked in the project lead's vault
 manifest (not committed). The next entry is added here at the moment a release
 is tagged, as part of the doc-sync ritual in `AGENTS.md`.
 
+## [0.23.0] — GUI circle chat: circles talk on the relay
+
+The circles created and joined in v0.22.0 now chat end-to-end-sealed over the
+relay, completing the GUI alpha's core loop (public Lobby + circles).
+
+- **Circle chat:** joining or creating a circle subscribes it to the relay;
+  messages are sealed under the circle key and delivered to the other members.
+  Each circle is independent (its own key and inbound reader); the public Lobby
+  path is unchanged. Verified by an in-process round-trip and a live relay
+  round-trip, then a two-client felt-test.
+- **Phrase-sharing affordances:** the new-circle phrase is editable and
+  copyable (Copy to the clipboard, with a confirmation); the join field accepts
+  the pasted phrase and auto-focuses. (Out-of-band phrase sharing is the alpha's
+  tester crutch; an in-app DM is the production path, a later milestone.)
+
 ## [0.22.0] — GUI circle plumbing: join, create, and materialize circles
 
 The second desktop GUI milestone — the circle rail becomes live. Circles are
