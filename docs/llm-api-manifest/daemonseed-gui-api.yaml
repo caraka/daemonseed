@@ -43,7 +43,7 @@ library:
     framework commitment) stays unchecked until the on-device mic-permission spike.
   license: "AGPL-3.0-or-later"
   manifest_for: "crates/daemonseed-gui"
-  status: "round-3 core wiring — the public Lobby room is wired to REAL networking via an internal Slint-free net actor (daemonseed_gui::net): connect_session to the relay (ephemeral identity), auto-join public_room::DEFAULT_ROOM, real AEAD-sealed chat in/out, UI thread never blocks (NetCommand/NetEvent over tokio::mpsc, drained on a slint::Timer). Other circles keep the round-2 stub; circles-with-phrase + persistent identity/first-start + felt polish are separate milestones. Still a binary with no published library API; ISC-C6 unchecked (mic-permission spike pending)"
+  status: "round-3 core wiring — the public Lobby room is wired to REAL networking via an internal Slint-free net actor (daemonseed_gui::net): connect_session to the relay (ephemeral identity), auto-join public_room::DEFAULT_ROOM, real AEAD-sealed chat in/out, UI thread never blocks (NetCommand/NetEvent over tokio::mpsc, drained on a slint::Timer). Other circles keep the round-2 stub; circles-with-phrase + persistent identity/first-start + felt polish are separate milestones. Lobby chat is live-verified by a 2-client felt-test on the fra1 relay. Launch flag: --x11 / DAEMONSEED_X11=1 forces XWayland (winit 0.30's Wayland pointer path drops clicks under VM software rendering; native Wayland stays the default). Still a binary with no published library API; ISC-C6 unchecked (mic-permission spike pending)"
 
 # The crate is a binary with no published library surface. Internal modules:
 # `daemonseed_gui::state` (Slint-free RAM per-circle state machine) and
