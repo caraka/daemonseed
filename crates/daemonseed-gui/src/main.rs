@@ -1,11 +1,16 @@
-//! daemonseed-gui — Slint client (round-2 scaffold).
+//! daemonseed-gui — Slint client.
 //!
-//! Round 2 makes the shell **interactive** and adds a **RAM-only per-circle state
-//! layer**: clicking a circle in the rail switches to it, and each circle
-//! remembers its own half-typed draft and scroll position across switches
-//! (everything resets on relaunch — no persistence). The state machine lives in
-//! [`state`] (plain Rust, Slint-free, unit-tested). This is mechanics only — there
-//! is still NO `daemonseed-core` wiring, no network, no async; all data is stub.
+//! Round 2 made the shell **interactive** over a RAM-only per-circle [`state`]
+//! layer (click-to-switch rail; each circle keeps its own draft + scroll). Round 3
+//! wired the **public Lobby room to real networking**: the [`net`] actor (a
+//! Slint-free, dedicated-thread tokio runtime, mirroring `daemonseed-tui`'s net
+//! actor) connects to the relay, auto-joins the default public room, and the
+//! Lobby (rail index 0) shows REAL AEAD-sealed chat — messages in, sealed
+//! messages out — while the UI thread never blocks (commands are fire-and-forget;
+//! [`NetEvent`]s drain non-blocking on a `slint::Timer`). The other rail circles
+//! keep the round-2 local-stub behaviour. Connection identity is ephemeral
+//! (`ClientIdentity::ephemeral`, like the TUI); there is no persistent
+//! identity/first-start yet — that is a separate milestone.
 //!
 //! Two run modes. **Windowed** (the `desktop` feature) opens a real winit window,
 //! software-rendered (no GL) — the felt-test surface. **Offscreen**
@@ -21,17 +26,53 @@
 //! Verification oracle: render cost was already cleared by the perf spike
 //! (state-preserving switch ~1.6ms, 220ms easing ~1.4ms/frame on this renderer).
 
+mod net;
 mod state;
 
 slint::include_modules!();
 
+use net::{NetCommand, NetEvent, NetHandle};
 use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType, Rgb565Pixel};
 use slint::platform::{Platform, PlatformError, WindowAdapter};
-use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
+use slint::{ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel};
 use state::{CircleState, GuiState, Msg};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
+
+/// The Lobby is rail index 0 — the only circle wired to the real public room in
+/// this slice. Other circles keep the round-2 local-stub behaviour.
+const LOBBY: usize = 0;
+
+/// Default relay (the alpha1 fra1 VPS). Overridable via env so a tester can point
+/// at their own relay without a rebuild. Mirrors the TUI's connect target.
+fn relay_target() -> (String, String) {
+    let id =
+        std::env::var("DAEMONSEED_RELAY_ID").unwrap_or_else(|_| "fra1#06177b08dc06".to_owned());
+    let addr = std::env::var("DAEMONSEED_RELAY_ADDR").unwrap_or_else(|_| "167.86.91.98".to_owned());
+    // The relay listens on :443; append it if the env value is bare.
+    let addr = if addr.contains(':') {
+        addr
+    } else {
+        format!("{addr}:443")
+    };
+    (id, addr)
+}
+
+/// Bring up the process-wide CryptoProvider + oxicrypt module the cli/tui/server
+/// share, before any `Connect` runs on the net thread (they are process-wide, so
+/// installing here covers the actor's thread). Errors are surfaced to the UI as
+/// "offline · …" via the caller; a failure here means connect would fail anyway.
+/// Returns `Ok(())` on success or a human-readable reason.
+fn init_crypto() -> Result<(), String> {
+    use daemonseed_server::kats::CNSA_2_0_KATS;
+    use daemonseed_server::tls::install_provider;
+    use oxicrypt_module::{AlgorithmProfile, initialize_with_profile};
+    initialize_with_profile(CNSA_2_0_KATS, AlgorithmProfile::Cnsa2)
+        .map_err(|e| format!("crypto module init failed: {e}"))?;
+    install_provider().map_err(|e| format!("TLS provider install failed: {e}"))?;
+    Ok(())
+}
 
 thread_local! {
     static CLOCK: Cell<Duration> = const { Cell::new(Duration::ZERO) };
@@ -86,9 +127,10 @@ fn apply_view(ui: &AppWindow, c: &CircleState, active: i32) {
     ui.set_scroll_y(c.scroll_y);
 }
 
-/// Build the shell, own the RAM-only state, and wire the interactive callbacks
-/// (no daemonseed-core wiring — all data is stub).
-fn build_ui() -> AppWindow {
+/// Build the shell, own the RAM-only state, and wire the interactive callbacks.
+/// Returns the window AND the shared state so the caller can wire real
+/// networking (the Lobby publish path + the event-drain timer) against it.
+fn build_ui() -> (AppWindow, Rc<RefCell<GuiState>>) {
     let ui = AppWindow::new().expect("create AppWindow");
     let state = Rc::new(RefCell::new(GuiState::demo()));
 
@@ -172,7 +214,147 @@ fn build_ui() -> AppWindow {
     ];
     ui.set_actions(ModelRc::from(Rc::new(VecModel::from(actions))));
 
-    ui
+    (ui, state)
+}
+
+/// Everything the running app must keep alive for its whole lifetime. **If this
+/// (or specifically the `Timer` or `NetHandle` inside it) drops, the event drain
+/// and the net thread silently die while the build still passes** — so it is held
+/// until `ui.run()` returns (windowed) or the offscreen render completes.
+struct LiveNet {
+    /// The net actor handle (channels + thread). Shared `RefCell` so the drain
+    /// timer can `try_recv` (&mut) and the send-message callback can `send` (&).
+    /// Held here belt-and-suspenders (the UI callbacks also clone it); dropping
+    /// the last clone would end the actor thread. Underscore: held for lifetime,
+    /// not read through this field.
+    _net: Rc<RefCell<NetHandle>>,
+    /// The repeating drain timer. Dropping it stops the drain.
+    _timer: Timer,
+}
+
+/// Wire the Lobby to real networking: build the net actor, fire a `Connect`
+/// (which auto-joins the default public room), install the composer `send-message`
+/// callback (Lobby → real `SendRoom`; other circles → local stub), and start a
+/// repeating timer that drains [`NetEvent`]s onto the UI thread non-blocking.
+///
+/// Returns the [`LiveNet`] owner the caller MUST keep alive.
+fn wire_net(ui: &AppWindow, state: Rc<RefCell<GuiState>>) -> LiveNet {
+    let net = Rc::new(RefCell::new(
+        NetHandle::new().expect("build daemonseed-gui net actor"),
+    ));
+
+    // Kick off the connection. The actor auto-joins the default public room once
+    // Authenticated; events flow back via the drain timer below.
+    {
+        let (server_id, address) = relay_target();
+        let _ = net
+            .borrow()
+            .send(NetCommand::Connect { server_id, address });
+    }
+
+    // Composer Send / Enter: when the Lobby is active, publish a REAL sealed
+    // public-room message and clear the draft; otherwise keep the round-2 local
+    // stub (append to the active circle's transcript).
+    ui.on_send_message({
+        let weak = ui.as_weak();
+        let state = state.clone();
+        let net = net.clone();
+        move |text| {
+            let text = text.to_string();
+            if text.is_empty() {
+                return;
+            }
+            let ui = weak.unwrap();
+            let active = state.borrow().active();
+            if active == LOBBY {
+                // Fire-and-forget; the local echo arrives back as a NetEvent and
+                // the drain timer appends it (single render path, no double-add).
+                let _ = net.borrow().send(NetCommand::SendRoom { text });
+                ui.set_draft(SharedString::from(""));
+                // Persist the cleared draft into the Lobby's RAM state too.
+                let mut st = state.borrow_mut();
+                let active = st.active();
+                st.set_draft(active, String::new());
+            } else {
+                // Non-Lobby: local stub. Append to the active circle and clear.
+                let mut st = state.borrow_mut();
+                let who = "you".to_owned();
+                st.push_message(active, who, text, true);
+                let active = st.active();
+                st.set_draft(active, String::new());
+                let c = st.current().clone();
+                drop(st);
+                apply_view(&ui, &c, active as i32);
+            }
+        }
+    });
+
+    // Drain timer: ~33ms repeated, CAPPED non-blocking loop. Applies each event
+    // to the UI and into the Lobby's RAM state (so a later switch-back keeps the
+    // transcript). A disconnected actor is treated as offline — never a panic.
+    let timer = Timer::default();
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        let net = net.clone();
+        timer.start(TimerMode::Repeated, Duration::from_millis(33), move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let mut n = 0u32;
+            loop {
+                let evt = match net.borrow_mut().try_recv() {
+                    Ok(Some(evt)) => evt,
+                    Ok(None) => break,
+                    Err(()) => {
+                        // Actor thread gone → offline. No panic.
+                        ui.set_connection_status(SharedString::from("offline"));
+                        ui.set_connected(false);
+                        break;
+                    }
+                };
+                apply_net_event(&ui, &state, evt);
+                n += 1;
+                if n > 256 {
+                    break;
+                }
+            }
+        });
+    }
+
+    LiveNet {
+        _net: net,
+        _timer: timer,
+    }
+}
+
+/// Apply one [`NetEvent`] to the UI + the Lobby's RAM state.
+fn apply_net_event(ui: &AppWindow, state: &Rc<RefCell<GuiState>>, evt: NetEvent) {
+    match evt {
+        NetEvent::Connected { server_handle } => {
+            ui.set_connection_status(SharedString::from(format!("connected · {server_handle}")));
+            ui.set_connected(true);
+        }
+        NetEvent::RoomJoined { room } => {
+            ui.set_connection_status(SharedString::from(format!("connected · {room}")));
+            ui.set_connected(true);
+        }
+        NetEvent::ConnectFailed { reason } | NetEvent::Error { reason } => {
+            ui.set_connection_status(SharedString::from(format!("offline · {reason}")));
+            ui.set_connected(false);
+        }
+        NetEvent::Message { who, text, mine } => {
+            // Always fold the message into the Lobby's RAM state so a switch-back
+            // keeps it; refresh the visible transcript only when the Lobby is
+            // the active circle.
+            let mut st = state.borrow_mut();
+            st.push_message(LOBBY, who, text, mine);
+            let active = st.active();
+            if active == LOBBY {
+                let c = st.current().clone();
+                drop(st);
+                apply_view(ui, &c, active as i32);
+            }
+        }
+    }
 }
 
 /// Render the shell offscreen to a PNG (headless-verifiable).
@@ -262,10 +444,29 @@ fn main() {
     let offscreen =
         screenshot.is_some() || switch.is_some() || scroll.is_some() || self_check_requested;
 
+    // Bring up crypto before any Connect. A failure is non-fatal to the SHELL
+    // (the UI still renders); it just means the lobby stays offline — surfaced on
+    // the status line. `--self-check` never touches the net, so skip init there.
+    let crypto = if self_check_requested {
+        Ok(())
+    } else {
+        init_crypto()
+    };
+
     #[cfg(feature = "desktop")]
     if !offscreen {
         // Windowed via Slint's default (winit) backend — the Wayland-head felt-test.
-        let ui = build_ui();
+        let (ui, state) = build_ui();
+        // Hold `_live` for the whole windowed lifetime — dropping it would kill
+        // the drain timer + net thread silently. It lives until `ui.run()` returns.
+        let _live = match &crypto {
+            Ok(()) => Some(wire_net(&ui, state)),
+            Err(reason) => {
+                ui.set_connection_status(SharedString::from(format!("offline · {reason}")));
+                ui.set_connected(false);
+                None
+            }
+        };
         ui.run().expect("run windowed");
         return;
     }
@@ -277,7 +478,7 @@ fn main() {
         window: window.clone(),
     }))
     .expect("set_platform");
-    let ui = build_ui();
+    let (ui, state) = build_ui();
     ui.show().expect("show");
     window.set_size(slint::PhysicalSize::new(W, H));
 
@@ -285,6 +486,18 @@ fn main() {
         self_check(&ui);
         return;
     }
+
+    // Wire real networking on the offscreen path too (it renders the
+    // connection-status; against an unreachable relay it shows connecting/offline
+    // — fine). `_live` is held until the render completes at the end of `main`.
+    let _live = match &crypto {
+        Ok(()) => Some(wire_net(&ui, state.clone())),
+        Err(reason) => {
+            ui.set_connection_status(SharedString::from(format!("offline · {reason}")));
+            ui.set_connected(false);
+            None
+        }
+    };
 
     // Drive the REAL switch callback so the render reflects the switched circle.
     if let Some(n) = switch {

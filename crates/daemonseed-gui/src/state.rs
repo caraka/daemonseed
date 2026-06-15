@@ -171,6 +171,23 @@ impl GuiState {
         &self.circles
     }
 
+    /// Append a message to circle `idx` (no-op if out of range). Used by the
+    /// real-net event drain to fold inbound/echoed Lobby messages into the RAM
+    /// transcript, and by the non-Lobby local stub.
+    pub fn push_message(&mut self, idx: usize, who: String, text: String, mine: bool) {
+        if let Some(c) = self.circles.get_mut(idx) {
+            c.messages.push(Msg { who, text, mine });
+        }
+    }
+
+    /// Set circle `idx`'s retained draft (no-op if out of range). Used to persist
+    /// a cleared composer into the active circle's RAM state after a send.
+    pub fn set_draft(&mut self, idx: usize, draft: String) {
+        if let Some(c) = self.circles.get_mut(idx) {
+            c.draft = draft;
+        }
+    }
+
     /// Switch the active circle to `target`.
     ///
     /// FIRST persist the caller-supplied live `draft`/`scroll` into the

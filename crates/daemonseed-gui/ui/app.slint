@@ -136,7 +136,16 @@ export component AppWindow inherits Window {
     in-out property <bool> palette-open: false;
     in property <[ActionData]> actions;
 
+    // Real-networking status (round-3): driven by the net actor's events,
+    // drained on the UI thread by a slint::Timer. Small muted header text.
+    in-out property <string> connection-status: "connecting…";
+    in-out property <bool> connected: false;
+
     callback switch-circle(int);
+    // Fired when the user presses Send (or Enter) on the composer while the
+    // Lobby (rail index 0) is active. Carries the current draft; Rust publishes
+    // a real sealed public-room message and clears the draft.
+    callback send-message(string);
 
     HorizontalLayout {
         // ── LEFT: circle rail ──
@@ -174,6 +183,13 @@ export component AppWindow inherits Window {
                             Text { text: root.header-name; color: #e4e8ee; font-size: 16px; }
                             Text { text: root.header-sub; color: #5b6472; font-size: 12px; } }
                         Rectangle { }
+                        // Small muted connection status (round-3 real net).
+                        Text {
+                            text: root.connection-status;
+                            color: root.connected ? #6fb3a4 : #5b6472;
+                            font-size: 11px;
+                            vertical-alignment: center;
+                        }
                         SealedPill { }
                     }
                 }
@@ -226,10 +242,13 @@ export component AppWindow inherits Window {
                                             font-size: 13px;
                                             vertical-alignment: center;
                                             single-line: true;
+                                            // Enter sends, parity with the Send button.
+                                            accepted => { root.send-message(root.draft); }
                                         }
                                     }
                                 }
                                 Rectangle { width: 84px; height: 38px; border-radius: 9px; background: #4a9d8e;
+                                    TouchArea { clicked => { root.send-message(root.draft); } }
                                     Text { text: "Send"; color: #06120f; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; } }
                             }
                         }

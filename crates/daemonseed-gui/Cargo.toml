@@ -16,8 +16,45 @@ publish = false
 slint = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["png"] }
 
+# Real networking (round-3): the GUI lobby wires to a relay by REUSING the proven
+# client stack rather than duplicating security-critical code. `daemonseed-cli`
+# gives the connect / identity-proof / AppSession flow; `daemonseed-core` the
+# public-room key/seal/open primitives; `daemonseed-proto` the `CotFrame` wire
+# type. The net actor (src/net.rs) mirrors `daemonseed-tui`'s net actor exactly.
+daemonseed-cli = { path = "../daemonseed-cli" }
+daemonseed-core = { path = "../daemonseed-core" }
+daemonseed-proto = { path = "../daemonseed-proto" }
+# Process-wide CryptoProvider install + KATs — symmetric with cli/tui. The GUI
+# initializes the same oxicrypt module + rustls provider before connecting
+# (`daemonseed_server::tls::install_provider`, `::kats::CNSA_2_0_KATS`).
+daemonseed-server = { path = "../daemonseed-server" }
+
+# Process-wide CryptoProvider install — symmetric with cli/tui/server. The GUI
+# initializes the same oxicrypt module + rustls provider before connecting.
+oxicrypt-module = { workspace = true }
+oxitls-rustls-provider = { workspace = true }
+
+# Async runtime for the network side. The render loop stays on the main (UI)
+# thread; the net actor runs a current-thread runtime on a dedicated thread and
+# posts results back over an unbounded channel (drained non-blocking each tick).
+tokio = { workspace = true, features = ["rt", "macros", "time", "sync", "io-util"] }
+
+# The public room rides the CircleOfTrust bidirectional Subscribe stream:
+# tokio-stream wraps the outbound mpsc receiver as a Stream; tonic::Streaming is
+# the inbound type the reader task drains.
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+
 [build-dependencies]
 slint-build = { workspace = true }
+
+[dev-dependencies]
+# In-process relay round-trip test (mirrors daemonseed-integration-tests'
+# cot_chat_e2e): a CotRegistry + serve_application over tokio::io::duplex, two
+# AppSessions fed to two actor instances via the AttachSession test seam.
+# (daemonseed-server itself is a regular dep above for crypto init; the relay
+# types it also exposes are used here in tests.)
+oxitls-rustls-provider = { workspace = true, features = ["testing"] }
 
 [features]
 default = []

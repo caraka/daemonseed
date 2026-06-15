@@ -1230,9 +1230,18 @@ dependencies = [
 name = "daemonseed-gui"
 version = "0.1.0"
 dependencies = [
+ "daemonseed-cli",
+ "daemonseed-core",
+ "daemonseed-proto",
+ "daemonseed-server",
  "image",
+ "oxicrypt-module",
+ "oxitls-rustls-provider",
  "slint",
  "slint-build",
+ "tokio",
+ "tokio-stream",
+ "tonic",
 ]
 
 [[package]]
