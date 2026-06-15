@@ -23,6 +23,28 @@ In-progress and next-milestone planning is tracked in the project lead's vault
 manifest (not committed). The next entry is added here at the moment a release
 is tagged, as part of the doc-sync ritual in `AGENTS.md`.
 
+## [0.22.0] — GUI circle plumbing: join, create, and materialize circles
+
+The second desktop GUI milestone — the circle rail becomes live. Circles are
+created and joined from the UI and materialize into the rail. They do not yet
+chat over the network; the circle network path is the next milestone.
+
+- **Join a circle:** a phrase-entry overlay with a co-equal QR slot (reserved),
+  a quiet "looks strong" reassurance (no numeric meter), and a pre-commit
+  confirmation card. The join is gated on the ≥128-bit circle-entropy floor — a
+  weak phrase is blocked and kept so it can be strengthened in place.
+- **New circle:** a one-tap generated diceware phrase (copy / show-QR reserved /
+  re-roll), founderless — the creator is simply the first member. Generation is
+  rejection-sampled so the phrase always clears the same floor the join gate
+  applies.
+- **Materialization:** a joined or created circle is added to the rail at
+  runtime and carries its derived circle-of-trust key and a rendezvous slot,
+  ready for the circle network path. The client seeds with the Lobby only and
+  shows an empty-state until the first circle exists.
+- **Composer:** sending in a materialized circle is locally echoed for now (the
+  circle network path is the next milestone); the public Lobby keeps sending
+  real sealed messages. Switching circles autofocuses the composer.
+
 ## [0.21.0] — GUI foundation: interactive Slint shell + real public-Lobby chat
 
 The first desktop GUI milestone — the `gui-alpha` foundation work, taken from a
