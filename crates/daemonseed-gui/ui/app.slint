@@ -73,13 +73,10 @@ component SealedPill inherits Rectangle {
     Text { text: "sealed"; color: #6fb3a4; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
 }
 
-// Quiet "Looks strong" affordance (brief D3): a calm reassurance, NEVER a numeric
-// meter or scolding bar. Shown only when the phrase clears the (hidden) floor.
-component StrongPill inherits Rectangle {
-    width: 96px; height: 22px; border-radius: 11px;
-    background: #11302b; border-width: 1px; border-color: #1f4d45;
-    Text { text: "Looks strong"; color: #6fb3a4; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
-}
+// The quiet "Looks strong" reassurance (brief D3 — a calm cue, NEVER a numeric
+// meter) is now a stable computed Text in each overlay's status row (a dedicated
+// `StrongPill` component was removed: toggling it via `if` mutated the item tree
+// mid-edit and crashed the partial_renderer with "RefCell already borrowed").
 
 component MsgBubble inherits Rectangle {
     in property <string> who;
@@ -379,8 +376,12 @@ export component AppWindow inherits Window {
                                 Rectangle {
                                     border-radius: 9px; background: #141517; border-width: 1px; border-color: #ffffff12;
                                     HorizontalLayout { padding-left: 12px;
-                                        if root.draft == "" : Text {
+                                        // `visible:` not `if` — the placeholder toggles on the
+                                        // first/last char typed; mutating the item tree mid-edit
+                                        // risks the partial_renderer "RefCell already borrowed" crash.
+                                        Text {
                                             text: "Message the circle…";
+                                            visible: root.draft == "";
                                             color: #4d5560;
                                             font-size: 13px; vertical-alignment: center;
                                         }
@@ -473,7 +474,9 @@ export component AppWindow inherits Window {
                 Rectangle {
                     height: 44px; border-radius: 9px; background: #141517; border-width: 1px; border-color: #ffffff12;
                     HorizontalLayout { padding-left: 12px;
-                        if root.join-phrase == "" : Text { text: "the words you agreed on…"; color: #4d5560; font-size: 13px; vertical-alignment: center; }
+                        // `visible:` not `if` — toggling on the first/last char typed
+                        // must NOT mutate the item tree mid-edit (partial_renderer crash).
+                        Text { text: "the words you agreed on…"; visible: root.join-phrase == ""; color: #4d5560; font-size: 13px; vertical-alignment: center; }
                     }
                     HorizontalLayout { padding-left: 12px; padding-right: 12px;
                         join_phrase_input := TextInput {
@@ -491,12 +494,15 @@ export component AppWindow inherits Window {
                 }
             }
 
-            // quiet strength reassurance (no number) / calm weak recovery
+            // quiet strength reassurance (no number) / calm weak recovery — a STABLE
+            // computed Text (no `if`), so editing the phrase never mutates the item
+            // tree mid-edit (the partial_renderer "RefCell already borrowed" crash).
             HorizontalLayout {
-                if root.join-phrase-strong : StrongPill { }
-                if !root.join-phrase-strong && root.join-phrase != "" : Text {
-                    text: "Keep adding words — a circle phrase needs to be a little longer.";
-                    color: #8b7d5b; font-size: 12px; vertical-alignment: center;
+                Text {
+                    text: root.join-phrase-strong ? "Looks strong"
+                        : root.join-phrase != "" ? "Keep adding words — a little longer." : "";
+                    color: root.join-phrase-strong ? #6fb3a4 : #8b7d5b;
+                    font-size: 12px; vertical-alignment: center;
                 }
                 Rectangle { }
             }
@@ -568,13 +574,17 @@ export component AppWindow inherits Window {
 
             HorizontalLayout {
                 spacing: 8px;
-                if root.new-phrase-strong : StrongPill { }
-                if !root.new-phrase-strong && root.new-phrase != "" : Text {
-                    text: "Keep adding words — a circle phrase needs to be a little longer.";
-                    color: #8b7d5b; font-size: 12px; vertical-alignment: center;
-                }
-                if root.new-copied : Text {
-                    text: "✓ copied to clipboard"; color: #6fb3a4; font-size: 12px; vertical-alignment: center;
+                // STABLE status indicator — a single always-present element whose
+                // text/color are COMPUTED from the booleans. Editing the phrase only
+                // changes properties; it never adds/removes items, so the renderer's
+                // item tree can't mutate mid-edit (the `if`-toggle version crashed
+                // with a partial_renderer "RefCell already borrowed", caraka 2026-06-15).
+                Text {
+                    text: root.new-copied ? "✓ copied to clipboard"
+                        : root.new-phrase-strong ? "Looks strong"
+                        : root.new-phrase != "" ? "Keep adding words — a little longer." : "";
+                    color: (root.new-copied || root.new-phrase-strong) ? #6fb3a4 : #8b7d5b;
+                    font-size: 12px; vertical-alignment: center;
                 }
                 Rectangle { }
                 // Select-all + copy to the system clipboard (Slint-native, via the
