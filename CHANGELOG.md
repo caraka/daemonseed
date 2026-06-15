@@ -23,6 +23,30 @@ In-progress and next-milestone planning is tracked in the project lead's vault
 manifest (not committed). The next entry is added here at the moment a release
 is tagged, as part of the doc-sync ritual in `AGENTS.md`.
 
+## [0.21.0] — GUI foundation: interactive Slint shell + real public-Lobby chat
+
+The first desktop GUI milestone — the `gui-alpha` foundation work, taken from a
+static shell to real networked chat.
+
+- **`daemonseed-gui` crate (Slint, software-renderer):** the three-zone shell —
+  circle rail, conversation pane, tab nav (Chat / Shares / a "coming soon"
+  circle-shares placeholder), command palette — with a `desktop` feature for a
+  real window and an offscreen `--screenshot` mode for headless verification.
+- **Interactive shell:** click-to-switch rail over a per-circle RAM state layer
+  that retains each circle's draft and scroll position across switches; a real
+  text composer and a scrollable transcript.
+- **Real public-Lobby chat:** a net actor (dedicated-thread tokio runtime, live
+  application session, ephemeral identity, mirroring the TUI) connects to the
+  relay, auto-joins the default public room, and sends/receives real AEAD-sealed
+  messages; the UI thread never blocks. Verified by a two-client live felt-test
+  on the relay.
+- **`--x11` / `DAEMONSEED_X11=1` launch opt-in:** forces XWayland for testers on
+  Wayland-in-a-VM (winit's Wayland pointer path drops clicks under VM software
+  rendering); native Wayland stays the default.
+
+Scope: the public Lobby only — circle chat (phrase entry), real shares fetch,
+and persistent identity / first-start are subsequent milestones.
+
 ## [0.20.0] — M16, finished public share path
 
 Completes the public share path as the reference implementation, plus the
