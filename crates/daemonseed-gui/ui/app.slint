@@ -109,14 +109,20 @@ component FileRow inherits Rectangle {
     }
 }
 
-component TabLabel inherits VerticalLayout {
+// Inheriting TouchArea makes the WHOLE label clickable (its built-in `clicked`
+// fires anywhere over the content). The previous `inherits VerticalLayout` made
+// the TouchArea a zero-height layout child that didn't cover the text, so tab
+// clicks never registered — unlike RailRow (inherits Rectangle), where a child
+// TouchArea fills the parent. Content-hugging width is preserved (TouchArea sizes
+// to its child VerticalLayout; the tab strip's trailing spacer absorbs the slack).
+component TabLabel inherits TouchArea {
     in property <string> label;
     in property <bool> active: false;
-    callback clicked;
-    alignment: center;
-    TouchArea { clicked => { root.clicked(); } }
-    Text { text: root.label; color: root.active ? #d6dae1 : #5b6472; font-size: 13px; horizontal-alignment: center; }
-    Rectangle { height: 2px; background: root.active ? #6b7280 : transparent; border-radius: 1px; }
+    VerticalLayout {
+        alignment: center;
+        Text { text: root.label; color: root.active ? #d6dae1 : #5b6472; font-size: 13px; horizontal-alignment: center; }
+        Rectangle { height: 2px; background: root.active ? #6b7280 : transparent; border-radius: 1px; }
+    }
 }
 
 export component AppWindow inherits Window {

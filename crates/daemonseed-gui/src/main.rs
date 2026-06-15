@@ -419,8 +419,24 @@ fn main() {
     // `--screenshot <path>` forces the offscreen render — the only mode a headless
     // terminal can verify. `--switch <n>` drives the real switch callback before
     // rendering. `--self-check` runs a live retention round-trip and exits.
-    // Absent any of these + `desktop` feature → a real winit window.
+    // `--x11` / `DAEMONSEED_X11=1` forces XWayland (see below). Absent a render
+    // flag + the `desktop` feature → a real winit window.
     let args: Vec<String> = std::env::args().collect();
+
+    // X11 opt-in (`DAEMONSEED_X11=1` or `--x11`): force winit onto X11/XWayland by
+    // unsetting WAYLAND_DISPLAY before Slint initializes its backend. winit 0.30's
+    // Wayland pointer path drops button events under VM software rendering (clicks
+    // dead while rendering + timers keep working); XWayland is reliable. Native
+    // Wayland stays the DEFAULT — opt-in only — so real desktops are unaffected.
+    // On non-Linux (e.g. a Windows host) WAYLAND_DISPLAY is simply absent, so this
+    // is a harmless no-op there; it matters for the Linux/Wayland VM guest.
+    let force_x11 = std::env::var("DAEMONSEED_X11").is_ok_and(|v| v == "1" || v == "true")
+        || args.iter().any(|a| a == "--x11");
+    if force_x11 {
+        // SAFETY: top of `main`, before any thread spawns or backend init — the
+        // process is single-threaded here, so the env mutation cannot race.
+        unsafe { std::env::remove_var("WAYLAND_DISPLAY") };
+    }
     let mut screenshot: Option<String> = None;
     let mut switch: Option<i32> = None;
     // `--scroll <px>` sets the (negative-when-scrolled) viewport-y before render —
