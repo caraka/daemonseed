@@ -4,12 +4,13 @@
 //! layer (click-to-switch rail; each circle keeps its own draft + scroll). Round 3
 //! wired the **public Lobby room to real networking** (the [`net`] actor). Round 4
 //! adds **circle plumbing**: Join-a-circle and New-circle flows that *materialize*
-//! a circle into the rail at runtime, each carrying the Round-5 net contract
-//! (phrase → `derive_cot_key` → `CotKey` + a rendezvous slot). The binary now
-//! seeds **Lobby-only** (empty-state for circles; the Lobby stays pinned + real),
-//! and the composer Send on a materialized circle routes to a clearly-marked
-//! Round-5 `SendCircle` seam (local-echo stub — circles are materialized-but-MUTE
-//! this round; no networking).
+//! a circle into the rail at runtime, each carrying the net contract (phrase →
+//! `derive_cot_key` → `CotKey` + a rendezvous slot). Round 5 **wires those circles
+//! to the network**: materialize fires `NetCommand::JoinCircle{circle_id, phrase}`
+//! and the composer Send on a materialized circle fires `SendCircle{circle_id}` —
+//! real sealed circle chat over the relay (mirroring the Lobby path), routed back
+//! into the right circle by `circle_id`. The binary seeds **Lobby-only**
+//! (empty-state for circles; the Lobby stays pinned + real).
 //!
 //! Two run modes. **Windowed** (the `desktop` feature) opens a real winit window,
 //! software-rendered (no GL) — the felt-test surface. **Offscreen** renders the
@@ -139,8 +140,13 @@ fn rebuild_rail(ui: &AppWindow, st: &GuiState) {
 /// autofocus the composer. Returns `false` if derivation failed (rare — a crypto
 /// backend error). Shared by the submit-join / submit-new callbacks and the
 /// `--materialize` offscreen flag.
-fn materialize_and_select(ui: &AppWindow, state: &Rc<RefCell<GuiState>>, phrase: &str) -> bool {
-    let ok = {
+fn materialize_and_select(
+    ui: &AppWindow,
+    state: &Rc<RefCell<GuiState>>,
+    net: &Rc<RefCell<NetHandle>>,
+    phrase: &str,
+) -> bool {
+    let join = {
         let mut st = state.borrow_mut();
         match st.materialize_from_phrase(phrase) {
             Ok(idx) => {
@@ -151,26 +157,47 @@ fn materialize_and_select(ui: &AppWindow, state: &Rc<RefCell<GuiState>>, phrase:
                 let active = st.active();
                 rebuild_rail(ui, &st);
                 apply_view(ui, st.current(), active as i32);
-                true
+                // The JoinCircle inputs come from the STORED net contract (the
+                // keystone is the source of truth), not the passed-through arg.
+                st.current()
+                    .net
+                    .as_ref()
+                    .map(|n| (n.circle_id, n.phrase.clone()))
             }
-            Err(_) => false,
+            Err(_) => None,
         }
     };
-    if ok {
-        // Autofocus the composer so the user can type immediately (caraka note).
-        ui.invoke_focus_composer();
+    match join {
+        Some((circle_id, phrase)) => {
+            // Autofocus the composer so the user can type immediately (caraka note).
+            ui.invoke_focus_composer();
+            // Round 5: subscribe the actor to this circle. Fire-and-forget; if the
+            // session isn't Connected yet the actor emits a (drained, non-fatal)
+            // CircleError — the create-before-connect edge, flagged in the ISA.
+            let _ = net
+                .borrow()
+                .send(NetCommand::JoinCircle { circle_id, phrase });
+            true
+        }
+        None => false,
     }
-    ok
 }
 
 /// Build the shell, own the RAM-only state, and wire ALL interactive callbacks
 /// (rail switch, composer send, and the round-4 circle-plumbing surfaces).
 /// Returns the window AND the shared state so the caller can wire real networking
 /// and drive the offscreen verification flags.
-fn build_ui() -> (AppWindow, Rc<RefCell<GuiState>>) {
+fn build_ui() -> (AppWindow, Rc<RefCell<GuiState>>, Rc<RefCell<NetHandle>>) {
     let ui = AppWindow::new().expect("create AppWindow");
     // Round-4 seed: Lobby only (empty-state for circles; Lobby pinned + real).
     let state = Rc::new(RefCell::new(GuiState::lobby_only()));
+    // The net actor is built HERE (round 5) so the circle-plumbing callbacks can
+    // reach it (materialize → JoinCircle; circle Send → SendCircle). `NetHandle::new`
+    // is crypto-independent — only Connect needs crypto — so it never fails on
+    // crypto; the Connect + drain timer are started later by `start_net`.
+    let net = Rc::new(RefCell::new(
+        NetHandle::new().expect("build daemonseed-gui net actor"),
+    ));
 
     // Rail model + empty-state flag.
     rebuild_rail(&ui, &state.borrow());
@@ -248,6 +275,7 @@ fn build_ui() -> (AppWindow, Rc<RefCell<GuiState>>) {
     ui.on_submit_join({
         let weak = ui.as_weak();
         let state = state.clone();
+        let net = net.clone();
         move |text| {
             let ui = weak.unwrap();
             let phrase = text.to_string();
@@ -255,7 +283,7 @@ fn build_ui() -> (AppWindow, Rc<RefCell<GuiState>>) {
                 ui.set_join_phrase_strong(false);
                 return; // blocked — keep the overlay + phrase for strengthening
             }
-            if materialize_and_select(&ui, &state, &phrase) {
+            if materialize_and_select(&ui, &state, &net, &phrase) {
                 ui.set_join_open(false);
                 ui.set_join_phrase(SharedString::from(""));
                 ui.set_join_phrase_strong(false);
@@ -269,15 +297,49 @@ fn build_ui() -> (AppWindow, Rc<RefCell<GuiState>>) {
     ui.on_submit_new({
         let weak = ui.as_weak();
         let state = state.clone();
+        let net = net.clone();
         move |text| {
             let ui = weak.unwrap();
             let phrase = text.to_string();
             if phrase.trim().is_empty() {
                 return;
             }
-            if materialize_and_select(&ui, &state, &phrase) {
+            if materialize_and_select(&ui, &state, &net, &phrase) {
                 ui.set_new_open(false);
             }
+        }
+    });
+
+    // Composer Send / Enter. The Lobby (no circle id) publishes a real sealed
+    // public-room message; a materialized circle publishes a real sealed circle
+    // message (Round 5 — replaces the round-4 local-echo stub). Both are
+    // fire-and-forget; the local echo arrives back as a drained NetEvent
+    // (`Message` / `CircleMessage`), so there is ONE render path and no double-add.
+    ui.on_send_message({
+        let weak = ui.as_weak();
+        let state = state.clone();
+        let net = net.clone();
+        move |text| {
+            let text = text.to_string();
+            if text.is_empty() {
+                return;
+            }
+            let ui = weak.unwrap();
+            match state.borrow().active_circle_id() {
+                None => {
+                    let _ = net.borrow().send(NetCommand::SendRoom { text });
+                }
+                Some(circle_id) => {
+                    let _ = net
+                        .borrow()
+                        .send(NetCommand::SendCircle { circle_id, text });
+                }
+            }
+            // Clear the composer + persist the cleared draft into the active circle.
+            ui.set_draft(SharedString::from(""));
+            let mut st = state.borrow_mut();
+            let active = st.active();
+            st.set_draft(active, String::new());
         }
     });
 
@@ -329,7 +391,7 @@ fn build_ui() -> (AppWindow, Rc<RefCell<GuiState>>) {
     ];
     ui.set_actions(ModelRc::from(Rc::new(VecModel::from(actions))));
 
-    (ui, state)
+    (ui, state, net)
 }
 
 /// Everything the running app must keep alive for its whole lifetime. **If this
@@ -341,55 +403,31 @@ struct LiveNet {
     _timer: Timer,
 }
 
-/// Wire the Lobby to real networking: build the net actor, fire a `Connect`
-/// (auto-joins the default public room), install the composer `send-message`
-/// callback, and start a repeating timer that drains [`NetEvent`]s onto the UI
-/// thread non-blocking. Returns the [`LiveNet`] owner the caller MUST keep alive.
-fn wire_net(ui: &AppWindow, state: Rc<RefCell<GuiState>>) -> LiveNet {
-    let net = Rc::new(RefCell::new(
-        NetHandle::new().expect("build daemonseed-gui net actor"),
-    ));
-
-    {
-        let (server_id, address) = relay_target();
-        let _ = net
-            .borrow()
-            .send(NetCommand::Connect { server_id, address });
-    }
-
-    // Composer Send / Enter. Lobby (index 0) → real sealed public-room message.
-    // A materialized circle → the **Round-5 `SendCircle` seam**: for now a
-    // clearly-marked LOCAL-ECHO stub (NOT wired to the net actor — circles are
-    // materialized-but-mute this round). Round 5 replaces the local echo with a
-    // `NetCommand::SendCircle{cot_key, rendezvous, text}` against the per-circle
-    // net contract the state layer already carries.
-    ui.on_send_message({
-        let weak = ui.as_weak();
-        let state = state.clone();
-        let net = net.clone();
-        move |text| {
-            let text = text.to_string();
-            if text.is_empty() {
-                return;
-            }
-            let ui = weak.unwrap();
-            let active = state.borrow().active();
-            if active == LOBBY {
-                let _ = net.borrow().send(NetCommand::SendRoom { text });
-                ui.set_draft(SharedString::from(""));
-                let mut st = state.borrow_mut();
-                let active = st.active();
-                st.set_draft(active, String::new());
-            } else {
-                // ── Round-5 SendCircle seam (local-echo stub, NOT net) ──
-                let mut st = state.borrow_mut();
-                st.push_message(active, "you".to_owned(), text, true);
-                let active = st.active();
-                st.set_draft(active, String::new());
-                apply_view(&ui, st.current(), active as i32);
-            }
+/// Start real networking against the net actor `build_ui` created: fire `Connect`
+/// (auto-joins the default public room) when crypto is up, and start a repeating
+/// timer that drains [`NetEvent`]s onto the UI thread non-blocking. The composer
+/// send callback was wired in `build_ui` (it needs the net handle too). On a
+/// crypto-init failure the shell still renders — the Lobby just stays offline; the
+/// drain timer still runs so circle errors surface. Returns the [`LiveNet`] owner
+/// the caller MUST keep alive.
+fn start_net(
+    ui: &AppWindow,
+    state: Rc<RefCell<GuiState>>,
+    net: Rc<RefCell<NetHandle>>,
+    crypto: &Result<(), String>,
+) -> LiveNet {
+    match crypto {
+        Ok(()) => {
+            let (server_id, address) = relay_target();
+            let _ = net
+                .borrow()
+                .send(NetCommand::Connect { server_id, address });
         }
-    });
+        Err(reason) => {
+            ui.set_connection_status(SharedString::from(format!("offline · {reason}")));
+            ui.set_connected(false);
+        }
+    }
 
     // Drain timer: ~33ms repeated, CAPPED non-blocking loop.
     let timer = Timer::default();
@@ -450,6 +488,34 @@ fn apply_net_event(ui: &AppWindow, state: &Rc<RefCell<GuiState>>, evt: NetEvent)
                 apply_view(ui, st.current(), active as i32);
             }
         }
+        NetEvent::CircleJoined { circle_id } => {
+            // The circle is already in the rail (materialized locally); the
+            // subscription is now live. Nothing visual required — keep it quiet.
+            let _ = circle_id;
+        }
+        NetEvent::CircleMessage {
+            circle_id,
+            who,
+            text,
+            mine,
+        } => {
+            // Route by the GUI-assigned circle_id → rail index. Always fold into
+            // that circle's RAM state; refresh the transcript only when it's active.
+            let mut st = state.borrow_mut();
+            if let Some(idx) = st.index_of_circle_id(circle_id) {
+                st.push_message(idx, who, text, mine);
+                let active = st.active();
+                if active == idx {
+                    apply_view(ui, st.current(), active as i32);
+                }
+            }
+        }
+        NetEvent::CircleError { circle_id, reason } => {
+            // Non-fatal (the connection may still be up). Surface on the status
+            // line for felt-test diagnostics; no per-circle status surface yet.
+            let _ = circle_id;
+            ui.set_connection_status(SharedString::from(format!("circle: {reason}")));
+        }
     }
 }
 
@@ -485,14 +551,14 @@ fn render_png(window: &Rc<MinimalSoftwareWindow>, path: &str) {
 /// Live materialize + draft-retention round-trip through the REAL callbacks
 /// (asserts at the UI-property level). Proves a circle materializes from a phrase
 /// AND its draft survives a switch end-to-end. Panics on failure (→ non-zero exit).
-fn self_check(ui: &AppWindow, state: &Rc<RefCell<GuiState>>) {
+fn self_check(ui: &AppWindow, state: &Rc<RefCell<GuiState>>, net: &Rc<RefCell<NetHandle>>) {
     const SENTINEL: &str = "SENTINEL-DRAFT";
     // A genuinely-strong phrase (12 distinct BIP-39 words) so the join gate is moot.
     const PHRASE: &str =
         "abandon ability able about above absent absorb abstract absurd abuse access accident";
 
     assert!(
-        materialize_and_select(ui, state, PHRASE),
+        materialize_and_select(ui, state, net, PHRASE),
         "materialize failed in self-check"
     );
     let circle = ui.get_active();
@@ -559,15 +625,8 @@ fn main() {
 
     #[cfg(feature = "desktop")]
     if !offscreen {
-        let (ui, state) = build_ui();
-        let _live = match &crypto {
-            Ok(()) => Some(wire_net(&ui, state)),
-            Err(reason) => {
-                ui.set_connection_status(SharedString::from(format!("offline · {reason}")));
-                ui.set_connected(false);
-                None
-            }
-        };
+        let (ui, state, net) = build_ui();
+        let _live = start_net(&ui, state, net, &crypto);
         ui.run().expect("run windowed");
         return;
     }
@@ -579,28 +638,21 @@ fn main() {
         window: window.clone(),
     }))
     .expect("set_platform");
-    let (ui, state) = build_ui();
+    let (ui, state, net) = build_ui();
     ui.show().expect("show");
     window.set_size(slint::PhysicalSize::new(W, H));
 
     if self_check_requested {
-        self_check(&ui, &state);
+        self_check(&ui, &state, &net);
         return;
     }
 
-    // Wire real networking on the offscreen path too (renders connection-status).
-    let _live = match &crypto {
-        Ok(()) => Some(wire_net(&ui, state.clone())),
-        Err(reason) => {
-            ui.set_connection_status(SharedString::from(format!("offline · {reason}")));
-            ui.set_connected(false);
-            None
-        }
-    };
+    // Start real networking on the offscreen path too (renders connection-status).
+    let _live = start_net(&ui, state.clone(), net.clone(), &crypto);
 
-    // Drive the round-4 verification surfaces before rendering.
+    // Drive the verification surfaces before rendering.
     if let Some(phrase) = materialize.as_deref() {
-        materialize_and_select(&ui, &state, phrase);
+        materialize_and_select(&ui, &state, &net, phrase);
     }
     if show_join {
         ui.invoke_open_join();

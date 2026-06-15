@@ -11,15 +11,17 @@
 //! This module is **Slint-free** (no `slint` import) so it stays unit-testable in
 //! isolation and the UI/network concerns never entangle.
 //!
-//! ## Scope (this slice)
+//! ## Scope
 //!
-//! The **public Lobby room** end-to-end: connect → auto-join the default public
-//! room → real messages appear → typing + Send publishes a real AEAD-sealed
-//! message. The room derivation, seal/send, inbound reader, and the local-echo
-//! behaviour are mirrored from `daemonseed_tui::net`
-//! (`join_default_public_room` / `handle_send_public_room` /
-//! `read_inbound_public_room`) so the two clients interoperate byte-for-byte on
-//! the same relay.
+//! The **public Lobby room** (round 3) AND **circles** (round 5), end-to-end:
+//! connect → auto-join the default public room → real Lobby chat; plus
+//! `JoinCircle`/`SendCircle` for a SET of circle subscriptions (`Vec<CircleSub>`),
+//! each sealed under its own `cot_key`. Both paths are mirrored from
+//! `daemonseed_tui::net` so the clients interoperate byte-for-byte on the same
+//! relay: the Lobby from `join_default_public_room` / `handle_send_public_room` /
+//! `read_inbound_public_room`, and circles from `handle_join_circle` /
+//! `handle_send_chat` / `read_inbound` (`derive_cot_key` → `asset_address` →
+//! `seal_message`/`open_message` — the CIRCLE path, not the room path).
 //!
 //! ## Identity
 //!
@@ -42,6 +44,9 @@ use std::rc::Rc;
 use daemonseed_cli::connect::connect_session;
 use daemonseed_cli::identity_proof::ClientIdentity;
 use daemonseed_cli::session::AppSession;
+use daemonseed_core::circle::key::{CotKey, derive_cot_key};
+use daemonseed_core::circle::message::{open_message, seal_message};
+use daemonseed_core::cot::{AssetAddr, asset_address};
 use daemonseed_core::crypto::suite::CNSA_2_0;
 use daemonseed_core::federation::store::{InMemoryTrustStore, ServerEntry, TrustStore};
 use daemonseed_core::handle::Handle;
@@ -70,6 +75,17 @@ pub enum NetCommand {
     /// key, send the `CotFrame`, and LOCAL-ECHO it (the relay never reflects a
     /// sender's own frame — see [`Actor::handle_send_room`]).
     SendRoom { text: String },
+    /// Join (subscribe to) a circle by its shared phrase: derive the circle key,
+    /// derive the per-relay rendezvous, subscribe, and spawn the circle's inbound
+    /// reader. `circle_id` is the GUI-assigned routing tag (the GUI owns circle
+    /// identity); it is echoed back on every [`NetEvent::CircleMessage`] so an
+    /// inbound frame lands in the right circle. Mirrors `daemonseed_tui`'s
+    /// `handle_join_circle` (derive_cot_key → asset_address → subscribe).
+    JoinCircle { circle_id: u64, phrase: String },
+    /// Publish a message to a joined circle: seal it under that circle's `cot_key`
+    /// and LOCAL-ECHO it (the relay never reflects a sender's own frame). Mirrors
+    /// `daemonseed_tui`'s `handle_send_chat`.
+    SendCircle { circle_id: u64, text: String },
     /// TEST SEAM (never used in production). Inject a pre-opened [`AppSession`]
     /// plus the `server_id` the test namespaces its rendezvous by, so a test
     /// exercises the SAME post-`open` JoinRoom/SendRoom path as a real Connect
@@ -102,6 +118,21 @@ pub enum NetEvent {
     /// A non-fatal error to surface (join/send failure). The connection itself
     /// may still be up.
     Error { reason: String },
+    /// A circle subscribe stream is live; chat can flow. `circle_id` is the
+    /// GUI-assigned tag from the originating [`NetCommand::JoinCircle`].
+    CircleJoined { circle_id: u64 },
+    /// A circle message to render: a verified inbound frame for `circle_id`, or a
+    /// local echo of the user's own just-sent message. `mine` is true when
+    /// `who == my_handle`.
+    CircleMessage {
+        circle_id: u64,
+        who: String,
+        text: String,
+        mine: bool,
+    },
+    /// A non-fatal circle error (join/send failure) tagged with the circle it
+    /// concerns. The connection itself may still be up.
+    CircleError { circle_id: u64, reason: String },
 }
 
 /// The UI-side handle: owns the channels and the net thread. Held for the app's
@@ -178,6 +209,24 @@ struct PublicRoom {
     out_tx: mpsc::Sender<wire::CotFrame>,
 }
 
+/// One live circle the daemon is subscribed to. A member can hold several at once
+/// ([`Actor::circles`]); each carries its OWN `cot_key`, so a post seals under
+/// exactly that circle's key and an inbound frame is attributed to the single
+/// circle whose key opened it (ISC-A-C30 — no cross-circle key/attribution
+/// mixing). Mirrors `daemonseed_tui::net::Circle`, minus the client-local label
+/// (the GUI owns display); `circle_id` is the GUI-assigned routing tag.
+struct CircleSub {
+    /// GUI-assigned routing tag — echoed on every [`NetEvent::CircleMessage`].
+    circle_id: u64,
+    /// This circle's key. Used to pick the seal key on send and held by the
+    /// inbound reader (`Rc`) to open frames.
+    cot_key: Rc<CotKey>,
+    /// Per-relay rendezvous address; the dedupe key for idempotent re-join.
+    asset_addr: AssetAddr,
+    /// Outbound frame sender — sealing seals + sends here.
+    out_tx: mpsc::Sender<wire::CotFrame>,
+}
+
 /// Mutable state the actor carries across commands. `identity`/`server_id` and
 /// the `counters`/`trust` stores live here for the SESSION lifetime, not as
 /// Connect-handler locals (mirrors the TUI).
@@ -201,6 +250,10 @@ struct Actor {
     trust: InMemoryTrustStore,
     /// The auto-joined default public room, if subscribed.
     public_room: Option<PublicRoom>,
+    /// The set of circles currently joined. Joining ADDS; it never evicts. Each
+    /// holds its own key, so sealing/attribution stays per-circle (ISC-A-C30).
+    /// Session-only (RAM) — not persisted, like the TUI.
+    circles: Vec<CircleSub>,
 }
 
 impl Actor {
@@ -432,6 +485,137 @@ impl Actor {
             mine: true,
         });
     }
+
+    /// Join a circle by its shared phrase: derive the key, derive the per-relay
+    /// rendezvous, subscribe, and spawn the circle's inbound reader. VERBATIM
+    /// mirror of `daemonseed_tui::net::Actor::handle_join_circle` — `derive_cot_key`
+    /// → `asset_address(cot_key, server_id.as_bytes())` (the CIRCLE path, not the
+    /// room path). Joining ADDS to the set; a circle whose rendezvous is already
+    /// present is an idempotent no-op re-join (re-emits `CircleJoined`). All
+    /// failures surface as `CircleError` tagged with `circle_id`; the connection
+    /// stays up.
+    async fn handle_join_circle(&mut self, circle_id: u64, phrase: &str) {
+        let err = |reason: String| NetEvent::CircleError { circle_id, reason };
+
+        let Some(session) = self.session.as_ref() else {
+            return self.emit(err("not connected to a relay yet".to_owned()));
+        };
+        let Some(server_id) = self.server_id.as_ref() else {
+            return self.emit(err("no server-id for the connected relay".to_owned()));
+        };
+
+        let cot_key = match derive_cot_key(phrase, &CNSA_2_0) {
+            Ok(k) => Rc::new(k),
+            Err(e) => return self.emit(err(format!("circle-key derivation failed: {e}"))),
+        };
+        // VERBATIM mirror of TUI net.rs:1172 — the CIRCLE rendezvous is
+        // `asset_address(&cot_key, server_id.as_bytes())` (NOT room_asset_address).
+        let asset_addr = match asset_address(&cot_key, server_id.as_bytes()) {
+            Ok(a) => a,
+            Err(e) => return self.emit(err(format!("rendezvous derivation failed: {e}"))),
+        };
+
+        // Idempotent join (mirror): a circle already subscribed at this rendezvous
+        // is not re-subscribed — re-emit CircleJoined so the UI re-selects it.
+        // Address-equality is the dedupe key (same phrase → same cot_key → same
+        // addr). We key the re-emit on the EXISTING sub's circle_id so the UI's
+        // own routing stays stable.
+        if let Some(existing) = self.circles.iter().find(|c| c.asset_addr == asset_addr) {
+            return self.emit(NetEvent::CircleJoined {
+                circle_id: existing.circle_id,
+            });
+        }
+
+        // Outbound half: first frame names the asset (empty payload, not relayed),
+        // sent before subscribe consumes the receiver (mirror).
+        let (out_tx, out_rx) = mpsc::channel::<wire::CotFrame>(32);
+        let naming = wire::CotFrame {
+            asset_address: asset_addr.as_bytes().to_vec(),
+            payload: Vec::new(),
+        };
+        if out_tx.send(naming).await.is_err() {
+            return self.emit(err("circle subscribe channel closed".to_owned()));
+        }
+
+        let mut cot = session.circle_of_trust();
+        let inbound = match cot.subscribe(ReceiverStream::new(out_rx)).await {
+            Ok(resp) => resp.into_inner(),
+            Err(status) => {
+                return self.emit(err(format!("subscribe refused: {}", status.message())));
+            }
+        };
+
+        // Inbound reader: decrypts each frame under THIS circle's key and emits a
+        // CircleMessage tagged with THIS circle_id (ISC-A-C30 attribution).
+        // `spawn_local` because it holds the `Rc` key (mirrors the TUI / lobby).
+        let reader_key = Rc::clone(&cot_key);
+        let reader_tx = self.evt_tx.clone();
+        let reader_handle = self.my_handle.clone();
+        tokio::task::spawn_local(read_inbound_circle(
+            inbound,
+            circle_id,
+            reader_key,
+            reader_tx,
+            reader_handle,
+        ));
+
+        self.circles.push(CircleSub {
+            circle_id,
+            cot_key,
+            asset_addr,
+            out_tx,
+        });
+        self.emit(NetEvent::CircleJoined { circle_id });
+    }
+
+    /// Publish a message to a joined circle and LOCAL-ECHO it. Mirrors
+    /// `daemonseed_tui::net::Actor::handle_send_chat` for the seal/send; the local
+    /// echo is the GUI's (the relay never reflects a sender's own frame, and the
+    /// GUI has no app layer between the actor and the UI — same as the Lobby path).
+    /// Circle messages are AEAD-only: `seal_message` takes the `cot_key` and no
+    /// signing key — membership IS the auth (no provenance signature, unlike rooms).
+    async fn handle_send_circle(&mut self, circle_id: u64, text: &str) {
+        let Some(circle) = self.circles.iter().find(|c| c.circle_id == circle_id) else {
+            return self.emit(NetEvent::CircleError {
+                circle_id,
+                reason: "join the circle before sending".to_owned(),
+            });
+        };
+        let message = wire::CircleMessage {
+            sender_handle: self.my_handle.clone(),
+            body: text.to_owned(),
+            sent_unix_ms: now_unix_ms(),
+        };
+        let sealed = match seal_message(&circle.cot_key, &message) {
+            Ok(s) => s,
+            Err(e) => {
+                return self.emit(NetEvent::CircleError {
+                    circle_id,
+                    reason: format!("seal failed: {e}"),
+                });
+            }
+        };
+        let frame = wire::CotFrame {
+            asset_address: circle.asset_addr.as_bytes().to_vec(),
+            payload: sealed,
+        };
+        if circle.out_tx.send(frame).await.is_err() {
+            return self.emit(NetEvent::CircleError {
+                circle_id,
+                reason: "circle stream closed; rejoin to send".to_owned(),
+            });
+        }
+
+        // LOCAL ECHO: the relay does not reflect a sender's own frame, so emit it
+        // locally (the inbound reader's `mine` check prevents a double-render even
+        // if a relay ever did reflect).
+        self.emit(NetEvent::CircleMessage {
+            circle_id,
+            who: self.my_handle.clone(),
+            text: text.to_owned(),
+            mine: true,
+        });
+    }
 }
 
 /// The actor loop: build state, then service commands one at a time.
@@ -448,6 +632,7 @@ async fn net_actor(
         counters: CounterState::default(),
         trust: InMemoryTrustStore::new(),
         public_room: None,
+        circles: Vec::new(),
     };
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
@@ -456,6 +641,12 @@ async fn net_actor(
             }
             NetCommand::JoinRoom { room } => actor.join_room(&room).await,
             NetCommand::SendRoom { text } => actor.handle_send_room(&text).await,
+            NetCommand::JoinCircle { circle_id, phrase } => {
+                actor.handle_join_circle(circle_id, &phrase).await
+            }
+            NetCommand::SendCircle { circle_id, text } => {
+                actor.handle_send_circle(circle_id, &text).await
+            }
             #[cfg(test)]
             NetCommand::AttachSession { session, server_id } => {
                 actor.handle_attach(session, server_id).await
@@ -500,6 +691,49 @@ async fn read_inbound_public_room(
                     }
                 }
                 // A decrypt/provenance error means a foreign frame — skip silently.
+            }
+            Ok(None) | Err(_) => return,
+        }
+    }
+}
+
+/// Read one circle's inbound frame stream, decrypt each under THAT circle's key,
+/// and emit a [`NetEvent::CircleMessage`] tagged with `circle_id` (ISC-A-C30
+/// attribution: a frame is attributed only to the circle whose key opened it).
+/// Each joined circle gets its own reader task with its own `cot_key`/`circle_id`.
+/// Empty payloads (the naming/keepalive frame) are skipped before `open_message`
+/// (mirrors the lobby reader); undecryptable frames (foreign noise on the shared
+/// rendezvous, or tampering) are skipped silently. `mine` is set when the sealed
+/// sender handle equals this client's handle. Returns when the stream ends.
+async fn read_inbound_circle(
+    mut inbound: tonic::Streaming<wire::CotFrame>,
+    circle_id: u64,
+    cot_key: Rc<CotKey>,
+    evt_tx: mpsc::UnboundedSender<NetEvent>,
+    my_handle: String,
+) {
+    loop {
+        match inbound.message().await {
+            Ok(Some(frame)) => {
+                // Empty payload = naming/keepalive frame; never a sealed message.
+                if frame.payload.is_empty() {
+                    continue;
+                }
+                if let Ok(msg) = open_message(&cot_key, &frame.payload) {
+                    let mine = msg.sender_handle == my_handle;
+                    if evt_tx
+                        .send(NetEvent::CircleMessage {
+                            circle_id,
+                            who: msg.sender_handle,
+                            text: msg.body,
+                            mine,
+                        })
+                        .is_err()
+                    {
+                        return; // UI gone
+                    }
+                }
+                // A decrypt/auth error means a foreign frame — skip silently.
             }
             Ok(None) | Err(_) => return,
         }
@@ -895,6 +1129,303 @@ mod tests {
                     continue;
                 }
                 let msg = open_room_message(&room_key, &frame.payload).expect("B opens canary");
+                assert_eq!(msg.body, canary);
+                break;
+            }
+        });
+    }
+
+    // ── Round 5: the circle path ─────────────────────────────────────────────
+
+    /// A genuinely-strong 12-word phrase for circle tests (join doesn't gate in the
+    /// actor; the GUI gates before calling, so any phrase derives a key here).
+    const CIRCLE_PHRASE: &str =
+        "abandon ability able about above absent absorb abstract absurd abuse access accident";
+
+    async fn wait_for_circle_message(
+        evt_rx: &mut mpsc::UnboundedReceiver<NetEvent>,
+    ) -> Option<(u64, String, String)> {
+        for _ in 0..400 {
+            while let Ok(evt) = evt_rx.try_recv() {
+                if let NetEvent::CircleMessage {
+                    circle_id,
+                    who,
+                    text,
+                    ..
+                } = evt
+                {
+                    return Some((circle_id, who, text));
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        None
+    }
+
+    async fn wait_for_circle_joined(evt_rx: &mut mpsc::UnboundedReceiver<NetEvent>) {
+        for _ in 0..400 {
+            while let Ok(evt) = evt_rx.try_recv() {
+                if matches!(evt, NetEvent::CircleJoined { .. }) {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("actor never reported CircleJoined");
+    }
+
+    /// Interop insurance (round-3 lesson): the GUI circle rendezvous derivation is
+    /// the canonical one — pinned against an independent `derive_cot_key` +
+    /// `asset_address` (the CIRCLE path) AND asserted DISTINCT from the room path,
+    /// so an accidental swap to `room_asset_address`/`derive_room_key` is caught.
+    /// Both round-trip tests are GUI-to-GUI, so a wrong-but-symmetric derivation
+    /// would pass them; this nails the derivation itself.
+    #[test]
+    fn circle_asset_address_is_canonical() {
+        let _ = oxicrypt_module::initialize();
+        // The address handle_join_circle computes (derive_cot_key → asset_address).
+        let key = derive_cot_key(CIRCLE_PHRASE, &CNSA_2_0).unwrap();
+        let gui_addr = asset_address(&key, SERVER_ID.as_bytes()).unwrap();
+        // Independent re-derivation with the same canonical inputs.
+        let expect_key = derive_cot_key(CIRCLE_PHRASE, &CNSA_2_0).unwrap();
+        let expect_addr = asset_address(&expect_key, b"relay-test#001122334455").unwrap();
+        assert_eq!(
+            gui_addr.as_bytes(),
+            expect_addr.as_bytes(),
+            "GUI circle rendezvous must be the canonical derivation, byte-for-byte"
+        );
+        // Distinct from the ROOM path for the same string (different key domain) —
+        // guards against silently using the lobby derivation for circles.
+        let room_key = derive_room_key(CIRCLE_PHRASE, &CNSA_2_0).unwrap();
+        let room_addr = room_asset_address(&room_key, SERVER_ID.as_bytes()).unwrap();
+        assert_ne!(
+            gui_addr.as_bytes(),
+            room_addr.as_bytes(),
+            "the circle rendezvous must NOT be the room derivation"
+        );
+    }
+
+    /// In-process circle round-trip (deterministic, no network): two actors join the
+    /// SAME circle by phrase; A `SendCircle`, B's actor must emit a decrypted
+    /// `CircleMessage`. Drives the REAL handle_join_circle / handle_send_circle /
+    /// read_inbound_circle path. Mirrors `in_process_relay_round_trip`.
+    #[test]
+    fn in_process_circle_round_trip() {
+        let _ = oxicrypt_module::initialize();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let registry = CotRegistry::new();
+            let (a_client_io, a_server_io) = tokio::io::duplex(64 * 1024);
+            let (b_client_io, b_server_io) = tokio::io::duplex(64 * 1024);
+            let _srv_a = spawn_relay(a_server_io, registry.clone());
+            let _srv_b = spawn_relay(b_server_io, registry.clone());
+
+            let sess_a = AppSession::open(a_client_io).await.expect("A session");
+            let sess_b = AppSession::open(b_client_io).await.expect("B session");
+
+            let mut a = spawn_local_actor();
+            let mut b = spawn_local_actor();
+            a.cmd_tx
+                .send(NetCommand::AttachSession {
+                    session: sess_a,
+                    server_id: SERVER_ID.to_owned(),
+                })
+                .ok();
+            b.cmd_tx
+                .send(NetCommand::AttachSession {
+                    session: sess_b,
+                    server_id: SERVER_ID.to_owned(),
+                })
+                .ok();
+
+            // B joins first (its own circle_id tag); wait for the relay to register
+            // the rendezvous so A's publish lands on a live asset. Same phrase +
+            // server_id → same rendezvous; the ids are per-actor-local routing tags.
+            b.cmd_tx
+                .send(NetCommand::JoinCircle {
+                    circle_id: 1,
+                    phrase: CIRCLE_PHRASE.to_owned(),
+                })
+                .ok();
+            wait_registry(&registry, 1).await;
+            a.cmd_tx
+                .send(NetCommand::JoinCircle {
+                    circle_id: 1,
+                    phrase: CIRCLE_PHRASE.to_owned(),
+                })
+                .ok();
+            wait_for_circle_joined(&mut a.evt_rx).await;
+
+            a.cmd_tx
+                .send(NetCommand::SendCircle {
+                    circle_id: 1,
+                    text: "meet at the cove".to_owned(),
+                })
+                .ok();
+
+            // B's actor emits the DECRYPTED circle message.
+            let got = wait_for_circle_message(&mut b.evt_rx).await;
+            assert_eq!(
+                got.map(|(_, _, text)| text),
+                Some("meet at the cove".to_owned()),
+                "member B's actor emits the decrypted circle message"
+            );
+
+            // A sees its own message only via local echo, tagged with A's circle_id.
+            let a_echo = wait_for_circle_message(&mut a.evt_rx).await;
+            assert_eq!(
+                a_echo.map(|(id, _, text)| (id, text)),
+                Some((1u64, "meet at the cove".to_owned())),
+                "sender A sees its own message via local echo, tagged with its circle_id"
+            );
+        });
+    }
+
+    /// Opacity: a non-member (different circle phrase → different key) cannot
+    /// decrypt the sealed circle frame — exactly the frame read_inbound_circle
+    /// drops silently (the `if let Ok(..)` arm). Uses the core seal/open the actor uses.
+    #[test]
+    fn non_member_cannot_decrypt_circle() {
+        let _ = oxicrypt_module::initialize();
+        let member = derive_cot_key(CIRCLE_PHRASE, &CNSA_2_0).unwrap();
+        let outsider = derive_cot_key(
+            "a completely different circle phrase nobody shared",
+            &CNSA_2_0,
+        )
+        .unwrap();
+        let msg = wire::CircleMessage {
+            sender_handle: "wandering-otter".to_owned(),
+            body: "secret circle line".to_owned(),
+            sent_unix_ms: 1,
+        };
+        let sealed = seal_message(&member, &msg).unwrap();
+        assert!(open_message(&member, &sealed).is_ok(), "a member opens it");
+        assert!(
+            open_message(&outsider, &sealed).is_err(),
+            "a non-member (wrong circle key) must not decrypt the circle frame"
+        );
+    }
+
+    // ── Live fra1 circle round-trip (ignored; env-gated) ─────────────────────
+    //
+    // Two ephemeral clients connect to the real relay, join a UNIQUE RANDOM
+    // throwaway CIRCLE (never a shared circle — a random phrase per run), exchange
+    // a sealed canary via the CIRCLE path (derive_cot_key + asset_address +
+    // seal_message/open_message), and assert round-trip. `#[ignore]` so default
+    // `cargo test` excludes it.
+    #[test]
+    #[ignore = "live relay; run explicitly with DAEMONSEED_RELAY_* set"]
+    fn live_fra1_circle_round_trip() {
+        use daemonseed_server::kats::CNSA_2_0_KATS;
+        use daemonseed_server::tls::install_provider;
+        use oxicrypt_module::{AlgorithmProfile, initialize_with_profile};
+
+        let server_id =
+            std::env::var("DAEMONSEED_RELAY_ID").unwrap_or_else(|_| "fra1#06177b08dc06".to_owned());
+        let address =
+            std::env::var("DAEMONSEED_RELAY_ADDR").unwrap_or_else(|_| "167.86.91.98".to_owned());
+        let address = if address.contains(':') {
+            address
+        } else {
+            format!("{address}:443")
+        };
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            initialize_with_profile(CNSA_2_0_KATS, AlgorithmProfile::Cnsa2).unwrap();
+            install_provider().unwrap();
+
+            // A UNIQUE RANDOM throwaway CIRCLE phrase — never a shared circle.
+            let nonce = now_unix_ms();
+            let phrase = format!(
+                "gui circle canary {nonce:x} {:x} alpha bravo charlie delta echo foxtrot golf",
+                std::process::id()
+            );
+            let cot_key = Rc::new(derive_cot_key(&phrase, &CNSA_2_0).unwrap());
+
+            let id_a = ClientIdentity::ephemeral().unwrap();
+            let id_b = ClientIdentity::ephemeral().unwrap();
+            let mut c_a = CounterState::default();
+            let mut c_b = CounterState::default();
+            let parse = |s: &str| s.parse::<Handle>().unwrap();
+            let mut t_a = InMemoryTrustStore::new();
+            let mut t_b = InMemoryTrustStore::new();
+            t_a.upsert(ServerEntry::new_trusted(parse(&server_id), address.clone()));
+            t_b.upsert(ServerEntry::new_trusted(parse(&server_id), address.clone()));
+
+            let (_oa, sa) = connect_session(&server_id, &address, &id_a, &mut c_a, &mut t_a)
+                .await
+                .expect("A connect");
+            let (_ob, sb) = connect_session(&server_id, &address, &id_b, &mut c_b, &mut t_b)
+                .await
+                .expect("B connect");
+            let sess_a = AppSession::open(sa).await.unwrap();
+            let sess_b = AppSession::open(sb).await.unwrap();
+
+            // CIRCLE rendezvous: asset_address(cot_key, server_id) — NOT the room path.
+            let addr = asset_address(&cot_key, server_id.as_bytes()).unwrap();
+            let addr_bytes = addr.as_bytes().to_vec();
+
+            let mut cot_b = sess_b.circle_of_trust();
+            let (b_tx, b_rx) = mpsc::channel::<wire::CotFrame>(8);
+            b_tx.send(wire::CotFrame {
+                asset_address: addr_bytes.clone(),
+                payload: Vec::new(),
+            })
+            .await
+            .unwrap();
+            let mut b_in = cot_b
+                .subscribe(ReceiverStream::new(b_rx))
+                .await
+                .expect("B subscribe")
+                .into_inner();
+
+            let mut cot_a = sess_a.circle_of_trust();
+            let (a_tx, a_rx) = mpsc::channel::<wire::CotFrame>(8);
+            a_tx.send(wire::CotFrame {
+                asset_address: addr_bytes.clone(),
+                payload: Vec::new(),
+            })
+            .await
+            .unwrap();
+            let _a_in = cot_a
+                .subscribe(ReceiverStream::new(a_rx))
+                .await
+                .expect("A subscribe")
+                .into_inner();
+
+            let canary = "circle canary 67890 — gui live round-trip";
+            let message = wire::CircleMessage {
+                sender_handle: "live-test-a".to_owned(),
+                body: canary.to_owned(),
+                sent_unix_ms: now_unix_ms(),
+            };
+            let sealed = seal_message(&cot_key, &message).unwrap();
+            a_tx.send(wire::CotFrame {
+                asset_address: addr_bytes.clone(),
+                payload: sealed,
+            })
+            .await
+            .unwrap();
+
+            loop {
+                let frame = tokio::time::timeout(Duration::from_secs(10), b_in.message())
+                    .await
+                    .expect("frame within timeout")
+                    .expect("stream healthy")
+                    .expect("a frame, not EOS");
+                if frame.payload.is_empty() {
+                    continue;
+                }
+                let msg = open_message(&cot_key, &frame.payload).expect("B opens circle canary");
                 assert_eq!(msg.body, canary);
                 break;
             }

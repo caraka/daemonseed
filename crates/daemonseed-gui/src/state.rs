@@ -69,11 +69,15 @@ pub struct Msg {
 /// defer to [`CotKey`]'s own redacted `Debug` — neither ever lands on a log
 /// surface (mirrors the `CotKey` / circle-key hygiene, ISC-A-C1).
 pub struct CircleNet {
+    /// Stable per-session id assigned at materialize. The GUI's routing key:
+    /// passed to `NetCommand::JoinCircle`/`SendCircle` and echoed back on
+    /// `NetEvent::CircleMessage` so an inbound frame lands in the right circle's
+    /// RAM state. The GUI owns circle identity, so it assigns the id (the actor
+    /// uses it only as an opaque tag) — unlike the TUI, where the actor hands it out.
+    pub circle_id: u64,
     /// The originating shared phrase. RAM-only secret (like the TUI's
-    /// `pending_join`); Round 5 hands it to `NetCommand::JoinCircle{phrase}`.
-    /// `#[allow(dead_code)]`: write-only until Round 5 reads it (the net path is
-    /// out of scope this round — materialized-but-mute).
-    #[allow(dead_code)]
+    /// `pending_join`); handed to `NetCommand::JoinCircle{phrase}` so the actor
+    /// re-derives the same key (Round-5 circle net path).
     pub phrase: String,
     /// The derived circle-of-trust key. The net contract's keystone — proves the
     /// phrase derives now, so Round 5's seal/open reuses it directly.
@@ -112,18 +116,22 @@ pub struct CircleState {
     /// Flickable `viewport-y` for this circle. NEGATIVE when scrolled down
     /// (Slint sign convention); retained across switches.
     pub scroll_y: f32,
-    /// The Round-5 net contract — `Some` for a materialized circle, `None` for the
-    /// public Lobby (which derives its room key from the room name, not a phrase).
-    /// `#[allow(dead_code)]`: stored this round (the keystone), read by Round 5's
-    /// circle net path; the binary writes it via `materialize_from_phrase`.
-    #[allow(dead_code)]
+    /// The net contract — `Some` for a materialized circle, `None` for the public
+    /// Lobby (which derives its room key from the room name, not a phrase). Round 5
+    /// reads it to drive `JoinCircle`/`SendCircle` and to route inbound frames.
     pub net: Option<CircleNet>,
 }
+
+/// First circle id handed out (0 is reserved/unused so a missing id is obvious).
+const FIRST_CIRCLE_ID: u64 = 1;
 
 /// The whole RAM-only GUI state: the circles plus which one is active.
 pub struct GuiState {
     circles: Vec<CircleState>,
     active: usize,
+    /// Monotonic source of per-circle ids handed out at materialize; never reused
+    /// within a session, so an id always names the same circle (the net routing key).
+    next_circle_id: u64,
 }
 
 impl GuiState {
@@ -145,7 +153,11 @@ impl GuiState {
             scroll_y: 0.0,
             net: None,
         }];
-        GuiState { circles, active: 0 }
+        GuiState {
+            circles,
+            active: 0,
+            next_circle_id: FIRST_CIRCLE_ID,
+        }
     }
 
     /// Materialize a circle from a shared phrase and append it to the rail
@@ -162,6 +174,8 @@ impl GuiState {
     /// no role, owner, or signed metadata — the phrase is the sole distinguisher.
     pub fn materialize_from_phrase(&mut self, phrase: &str) -> Result<usize, CircleKeyError> {
         let cot_key = derive_cot_key(phrase, &CNSA_2_0)?;
+        let circle_id = self.next_circle_id;
+        self.next_circle_id += 1;
         // PLACEHOLDER display name: the relay-independent `#<12hex>` circle
         // fingerprint (ISC-C62, explicitly reserved "for the GUI era") stands in
         // until Round 5's relay-derived adj-noun label (which needs a server_id).
@@ -185,6 +199,7 @@ impl GuiState {
             draft: String::new(),
             scroll_y: 0.0,
             net: Some(CircleNet {
+                circle_id,
                 phrase: phrase.to_owned(),
                 cot_key,
                 rendezvous: None,
@@ -217,6 +232,21 @@ impl GuiState {
     /// ("No circles yet — Join or New", ISC-31).
     pub fn only_lobby(&self) -> bool {
         self.circles.len() <= 1
+    }
+
+    /// The active circle's net `circle_id`, or `None` for the Lobby (no net
+    /// contract). Drives composer Send routing — `Some(id)` → `SendCircle{id}`,
+    /// `None` → the Lobby's `SendRoom`.
+    pub fn active_circle_id(&self) -> Option<u64> {
+        self.circles[self.active].net.as_ref().map(|n| n.circle_id)
+    }
+
+    /// Rail index of the circle with net `circle_id`, or `None`. The inverse of the
+    /// routing tag: an inbound `CircleMessage{circle_id}` is folded into this index.
+    pub fn index_of_circle_id(&self, circle_id: u64) -> Option<usize> {
+        self.circles
+            .iter()
+            .position(|c| c.net.as_ref().is_some_and(|n| n.circle_id == circle_id))
     }
 
     /// The currently active circle's state.
@@ -341,7 +371,11 @@ impl GuiState {
                 fill("harbor-lights", 4, "dock-keeper"),
             ),
         ];
-        GuiState { circles, active: 1 }
+        GuiState {
+            circles,
+            active: 1,
+            next_circle_id: FIRST_CIRCLE_ID,
+        }
     }
 }
 
@@ -435,6 +469,43 @@ mod tests {
             net.rendezvous.is_none(),
             "rendezvous unset pre-net (ISC-23)"
         );
+        // Round-5 routing: a stable id is assigned and round-trips through lookup.
+        assert_eq!(
+            net.circle_id, 1,
+            "first materialized circle gets FIRST_CIRCLE_ID"
+        );
+        assert_eq!(
+            st.active_circle_id(),
+            None,
+            "Lobby (active) has no circle id"
+        );
+        assert_eq!(
+            st.index_of_circle_id(1),
+            Some(1),
+            "circle_id 1 → rail index 1"
+        );
+        assert_eq!(
+            st.index_of_circle_id(999),
+            None,
+            "unknown circle_id → nowhere"
+        );
+    }
+
+    #[test]
+    fn distinct_materialized_circles_get_distinct_ids() {
+        let _ = oxicrypt_module::initialize();
+        let mut st = GuiState::lobby_only();
+        let a = st.materialize_from_phrase(STRONG).unwrap();
+        let b = st
+            .materialize_from_phrase(
+                "zone zoo zebra youth yellow wrong write world worth worry wonder window",
+            )
+            .unwrap();
+        let id_a = st.metas()[a].net.as_ref().unwrap().circle_id;
+        let id_b = st.metas()[b].net.as_ref().unwrap().circle_id;
+        assert_ne!(id_a, id_b, "monotonic ids never collide within a session");
+        assert_eq!(st.index_of_circle_id(id_a), Some(a));
+        assert_eq!(st.index_of_circle_id(id_b), Some(b));
     }
 
     #[test]
