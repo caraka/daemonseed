@@ -173,7 +173,9 @@ export component AppWindow inherits Window {
     in-out property <bool> new-open: false;        // New-circle overlay visible
     in-out property <string> join-phrase;          // live Join phrase (two-way to Rust)
     in property <bool> join-phrase-strong: false;  // Rust-set: estimate_circle().is_circle_green()
-    in property <string> new-phrase;               // Rust-set: generated 12-word diceware phrase
+    in-out property <string> new-phrase;           // generated default; EDITABLE (two-way to Rust)
+    in property <bool> new-phrase-strong: true;    // Rust-set: estimate_circle().is_circle_green() (generated ⇒ strong)
+    in-out property <bool> new-copied: false;      // set on Copy → shows a "copied" confirmation
     in property <bool> only-lobby: true;           // Rust-set: only the pinned Lobby exists → empty-state
 
     // Real-networking status (round-3): driven by the net actor's events.
@@ -195,6 +197,9 @@ export component AppWindow inherits Window {
     callback submit-join(string);
     callback reroll-new();
     callback submit-new(string);
+    // Recompute the (hidden) strength when the user edits the generated phrase, so
+    // an edited-weak phrase loses the "Looks strong" pill and is blocked on submit.
+    callback new-phrase-edited(string);
     // Autofocus the composer after a rail switch so the user can type immediately
     // (caraka note 2026-06-15). Guarded to the Chat tab; Rust invokes it on switch.
     callback focus-composer();
@@ -520,32 +525,40 @@ export component AppWindow inherits Window {
             }
             Text { text: "Here's a strong phrase. Share it with members out-of-band."; color: #8b93a1; font-size: 13px; }
 
-            // The generated phrase. A read-only TextInput (not a Text) so it is
-            // SELECTABLE — the Copy button drives Slint's native clipboard
-            // (`select-all` + `copy`), and a user can also select + Ctrl-C by hand
-            // as a fallback if the platform clipboard is flaky.
+            // The generated phrase — an EDITABLE TextInput (two-way to `new-phrase`)
+            // so a tester can edit / select / paste-overwrite it (delete, Ctrl-V).
+            // The Copy button drives Slint's native clipboard (`select-all`+`copy`);
+            // manual select + Ctrl-C is a fallback. Editing re-checks the (hidden)
+            // strength so an edited-weak phrase loses the pill and is blocked.
             Rectangle {
                 height: 64px; border-radius: 10px; background: #141517; border-width: 1px; border-color: #ffffff12;
                 HorizontalLayout { padding: 14px;
                     new_phrase_input := TextInput {
-                        text: root.new-phrase;
+                        text <=> root.new-phrase;
                         color: #d6dae1; font-size: 14px; wrap: word-wrap;
                         vertical-alignment: center;
                         single-line: false;
-                        read-only: true;
+                        edited => { root.new-copied = false; root.new-phrase-edited(root.new-phrase); }
                     }
                 }
             }
 
             HorizontalLayout {
                 spacing: 8px;
-                StrongPill { }
+                if root.new-phrase-strong : StrongPill { }
+                if !root.new-phrase-strong && root.new-phrase != "" : Text {
+                    text: "Keep adding words — a circle phrase needs to be a little longer.";
+                    color: #8b7d5b; font-size: 12px; vertical-alignment: center;
+                }
+                if root.new-copied : Text {
+                    text: "✓ copied to clipboard"; color: #6fb3a4; font-size: 12px; vertical-alignment: center;
+                }
                 Rectangle { }
                 // Select-all + copy to the system clipboard (Slint-native, via the
-                // backend). No-op was the felt-test blocker (2026-06-15).
+                // backend) + a visible confirmation. No-op was the felt-test blocker.
                 PillButton {
                     label: "Copy"; w: 84px;
-                    clicked => { new_phrase_input.select-all(); new_phrase_input.copy(); }
+                    clicked => { new_phrase_input.select-all(); new_phrase_input.copy(); root.new-copied = true; }
                 }
                 PillButton { label: "Show QR"; w: 96px; clicked => { } }
                 PillButton { label: "Re-roll"; w: 96px; clicked => { root.reroll-new(); } }

@@ -244,6 +244,9 @@ fn build_ui() -> (AppWindow, Rc<RefCell<GuiState>>, Rc<RefCell<NetHandle>>) {
             let ui = weak.unwrap();
             let phrase = state::generate_circle_phrase().unwrap_or_default();
             ui.set_new_phrase(SharedString::from(phrase.as_str()));
+            // Generated ⇒ strong; reset the copied confirmation for a fresh open.
+            ui.set_new_phrase_strong(true);
+            ui.set_new_copied(false);
             ui.set_new_open(true);
         }
     });
@@ -255,6 +258,18 @@ fn build_ui() -> (AppWindow, Rc<RefCell<GuiState>>, Rc<RefCell<NetHandle>>) {
             let ui = weak.unwrap();
             let phrase = state::generate_circle_phrase().unwrap_or_default();
             ui.set_new_phrase(SharedString::from(phrase.as_str()));
+            ui.set_new_phrase_strong(true);
+            ui.set_new_copied(false);
+        }
+    });
+
+    // Live (hidden) strength when the user EDITS the generated phrase → drives the
+    // "Looks strong" pill and the submit gate (same estimator as join; D3).
+    ui.on_new_phrase_edited({
+        let weak = ui.as_weak();
+        move |text| {
+            let ui = weak.unwrap();
+            ui.set_new_phrase_strong(estimate_circle(text.as_str()).is_circle_green());
         }
     });
 
@@ -303,7 +318,11 @@ fn build_ui() -> (AppWindow, Rc<RefCell<GuiState>>, Rc<RefCell<NetHandle>>) {
         move |text| {
             let ui = weak.unwrap();
             let phrase = text.to_string();
-            if phrase.trim().is_empty() {
+            // The generated default is strong; but the phrase is now EDITABLE, so
+            // gate on the same ≥128-bit floor as join — an edited-weak phrase is
+            // blocked (the pill is hidden + the recovery line shows), kept for fixing.
+            if !estimate_circle(&phrase).is_circle_green() {
+                ui.set_new_phrase_strong(false);
                 return;
             }
             if materialize_and_select(&ui, &state, &net, &phrase) {
