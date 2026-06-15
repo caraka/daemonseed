@@ -231,6 +231,8 @@ fn build_ui() -> (AppWindow, Rc<RefCell<GuiState>>, Rc<RefCell<NetHandle>>) {
             ui.set_join_phrase(SharedString::from(""));
             ui.set_join_phrase_strong(false);
             ui.set_join_open(true);
+            // Focus the phrase field so the user can type / paste immediately.
+            ui.invoke_focus_join_input();
         }
     });
 

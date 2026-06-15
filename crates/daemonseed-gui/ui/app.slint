@@ -199,6 +199,10 @@ export component AppWindow inherits Window {
     // (caraka note 2026-06-15). Guarded to the Chat tab; Rust invokes it on switch.
     callback focus-composer();
     focus-composer => { if (root.active-tab == 0) { composer.focus(); } }
+    // Focus the Join phrase field when the overlay opens, so typing / Ctrl-V lands
+    // without needing a click (the VM software-render path can drop pointer clicks).
+    callback focus-join-input();
+    focus-join-input => { join_phrase_input.focus(); }
 
     HorizontalLayout {
         // ── LEFT: circle rail ──
@@ -444,7 +448,7 @@ export component AppWindow inherits Window {
                         if root.join-phrase == "" : Text { text: "the words you agreed on…"; color: #4d5560; font-size: 13px; vertical-alignment: center; }
                     }
                     HorizontalLayout { padding-left: 12px; padding-right: 12px;
-                        TextInput {
+                        join_phrase_input := TextInput {
                             text <=> root.join-phrase;
                             color: #d6dae1; font-size: 13px; vertical-alignment: center; single-line: true;
                             edited => { root.join-phrase-edited(root.join-phrase); }
@@ -516,11 +520,20 @@ export component AppWindow inherits Window {
             }
             Text { text: "Here's a strong phrase. Share it with members out-of-band."; color: #8b93a1; font-size: 13px; }
 
-            // the generated phrase, shown as readable words
+            // The generated phrase. A read-only TextInput (not a Text) so it is
+            // SELECTABLE — the Copy button drives Slint's native clipboard
+            // (`select-all` + `copy`), and a user can also select + Ctrl-C by hand
+            // as a fallback if the platform clipboard is flaky.
             Rectangle {
                 height: 64px; border-radius: 10px; background: #141517; border-width: 1px; border-color: #ffffff12;
                 HorizontalLayout { padding: 14px;
-                    Text { text: root.new-phrase; color: #d6dae1; font-size: 14px; wrap: word-wrap; vertical-alignment: center; }
+                    new_phrase_input := TextInput {
+                        text: root.new-phrase;
+                        color: #d6dae1; font-size: 14px; wrap: word-wrap;
+                        vertical-alignment: center;
+                        single-line: false;
+                        read-only: true;
+                    }
                 }
             }
 
@@ -528,7 +541,12 @@ export component AppWindow inherits Window {
                 spacing: 8px;
                 StrongPill { }
                 Rectangle { }
-                PillButton { label: "Copy"; w: 84px; clicked => { } }
+                // Select-all + copy to the system clipboard (Slint-native, via the
+                // backend). No-op was the felt-test blocker (2026-06-15).
+                PillButton {
+                    label: "Copy"; w: 84px;
+                    clicked => { new_phrase_input.select-all(); new_phrase_input.copy(); }
+                }
                 PillButton { label: "Show QR"; w: 96px; clicked => { } }
                 PillButton { label: "Re-roll"; w: 96px; clicked => { root.reroll-new(); } }
             }
