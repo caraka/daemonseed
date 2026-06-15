@@ -206,15 +206,37 @@ export component AppWindow inherits Window {
     callback focus-join-input();
     focus-join-input => { join_phrase_input.focus(); }
 
-    // Global shortcut host: Ctrl-K opens the command palette. It is an ancestor of
-    // the composer, so a focused TextInput that rejects Ctrl-K forwards the event
-    // up here; it never steals focus. Explicit fill (it is a Window child alongside
-    // the positioned overlays). The "Ctrl+K commands" rail row remains the click path.
-    FocusScope {
+    // Global shortcut host: wraps the WHOLE UI (main + overlays) so a key event from
+    // any focused field bubbles up here — Ctrl-K kept dying once focus moved into an
+    // overlay field that sat outside the scope (caraka, DS2). Grabs focus on init so
+    // the shortcut works before anything else is focused. Ctrl-K TOGGLES the palette;
+    // Escape closes the palette / overlays. The "Ctrl+K commands" rail row also opens it.
+    key-host := FocusScope {
         width: 100%; height: 100%;
+        init => { key-host.focus(); }
         key-pressed(event) => {
             if (event.modifiers.control && event.text == "k") {
-                root.palette-open = true;
+                root.palette-open = !root.palette-open;
+                return accept;
+            }
+            // Direct keyboard-first shortcuts (match the palette labels). They bubble
+            // up here from a focused field that rejects them.
+            if (event.modifiers.control && event.text == "n") {
+                root.open-new();
+                return accept;
+            }
+            if (event.modifiers.control && event.text == "j") {
+                root.open-join();
+                return accept;
+            }
+            if (event.modifiers.control && event.text == "l") {
+                root.switch-circle(0);
+                return accept;
+            }
+            if (event.text == Key.Escape) {
+                root.palette-open = false;
+                root.join-open = false;
+                root.new-open = false;
                 return accept;
             }
             return reject;
@@ -263,7 +285,7 @@ export component AppWindow inherits Window {
                 Rectangle { }
                 Rectangle { height: 22px;
                     TouchArea { clicked => { root.palette-open = true; } }
-                    HorizontalLayout { padding: 6px; Text { text: "Ctrl+K   commands"; color: #3f4651; font-size: 11px; vertical-alignment: center; } } }
+                    HorizontalLayout { padding: 6px; Text { text: "Ctrl+K   commands"; color: #8b93a1; font-size: 13px; vertical-alignment: center; } } }
             }
         }
 
@@ -407,7 +429,6 @@ export component AppWindow inherits Window {
             }
         }
     }
-    }
 
     // ── context sheet overlay (on-demand) ──
     sheet := Rectangle {
@@ -448,7 +469,7 @@ export component AppWindow inherits Window {
                 HorizontalLayout { padding-left: 10px; spacing: 8px;
                     Text { text: a.label; color: #cfd5dd; font-size: 13px; vertical-alignment: center; }
                     Rectangle { }
-                    Text { text: a.shortcut; color: #4d5560; font-size: 12px; vertical-alignment: center; } }
+                    Text { text: a.shortcut; color: #aeb6c2; font-size: 13px; font-weight: 600; vertical-alignment: center; } }
             }
         }
     }
@@ -607,4 +628,6 @@ export component AppWindow inherits Window {
             }
         }
     }
+    } // end key-host FocusScope (wraps main + overlays so Ctrl-K keeps working
+      // even when an overlay field holds focus)
 }

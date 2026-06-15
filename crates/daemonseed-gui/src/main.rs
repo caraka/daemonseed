@@ -395,19 +395,20 @@ fn build_ui() -> (AppWindow, Rc<RefCell<GuiState>>, Rc<RefCell<NetHandle>>) {
     let actions = vec![
         ActionData {
             label: "Go to Lobby".into(),
-            shortcut: "⌘1".into(),
+            shortcut: "Ctrl+L".into(),
         },
         ActionData {
             label: "New circle".into(),
-            shortcut: "⌘N".into(),
+            shortcut: "Ctrl+N".into(),
         },
         ActionData {
             label: "Join a circle".into(),
-            shortcut: "⌘J".into(),
+            shortcut: "Ctrl+J".into(),
         },
         ActionData {
+            // Fetch is not wired yet — no shortcut shown (avoids implying a binding).
             label: "Fetch a share".into(),
-            shortcut: "⌘F".into(),
+            shortcut: "".into(),
         },
     ];
     ui.set_actions(ModelRc::from(Rc::new(VecModel::from(actions))));
