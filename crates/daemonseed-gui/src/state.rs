@@ -19,6 +19,8 @@ use daemonseed_core::cot::AssetAddr;
 use daemonseed_core::crypto::suite::CNSA_2_0;
 use daemonseed_core::passphrase::strength::{DicewareError, estimate_circle, generate_diceware};
 
+use crate::profile::Profile;
+
 /// Word count for a generated circle phrase. 12 BIP-39 words ≈ 132 bits of real
 /// entropy, clearing the ≥128-bit circle floor (ISC-C9 / brief D3) — the same
 /// count the TUI generates (Ctrl-G). The number is HIDDEN from the user.
@@ -125,13 +127,20 @@ pub struct CircleState {
 /// First circle id handed out (0 is reserved/unused so a missing id is obvious).
 const FIRST_CIRCLE_ID: u64 = 1;
 
-/// The whole RAM-only GUI state: the circles plus which one is active.
+/// The whole GUI state: the circles, which one is active, and — round 6 — the
+/// unlocked [`Profile`] (when present) that persists circle membership + the
+/// display handle across relaunches. The circles/draft/scroll layer stays RAM-only
+/// (no message history is ever persisted); only the at-rest settings payload the
+/// `Profile` owns survives.
 pub struct GuiState {
     circles: Vec<CircleState>,
     active: usize,
     /// Monotonic source of per-circle ids handed out at materialize; never reused
     /// within a session, so an id always names the same circle (the net routing key).
     next_circle_id: u64,
+    /// The unlocked profile, once first-start / Unlock produces it. `None` on the
+    /// ephemeral path (shell works; nothing survives relaunch).
+    profile: Option<Profile>,
 }
 
 impl GuiState {
@@ -157,6 +166,56 @@ impl GuiState {
             circles,
             active: 0,
             next_circle_id: FIRST_CIRCLE_ID,
+            profile: None,
+        }
+    }
+
+    /// Adopt an unlocked [`Profile`] (round 6) and restore its persisted circles
+    /// into the rail. Each stored phrase is re-materialized (a fresh per-session
+    /// `circle_id`, the key re-derived — never a persisted key); a stored phrase
+    /// that no longer derives is skipped so one bad entry can't block startup.
+    /// Restoration does NOT re-persist (the circles are already in the blob).
+    /// Call once, right after auth succeeds, before [`GuiState::persisted_rejoins`].
+    pub fn set_profile(&mut self, profile: Profile) {
+        for (phrase, _label) in profile.circles() {
+            let _ = self.materialize_from_phrase(&phrase);
+        }
+        self.profile = Some(profile);
+    }
+
+    /// The unlocked profile's stable display handle, or `None` on the ephemeral
+    /// path. Passed to `NetCommand::Connect` so the user presents under it.
+    pub fn display_handle(&self) -> Option<String> {
+        self.profile.as_ref().map(|p| p.display_handle().to_owned())
+    }
+
+    /// The `(circle_id, phrase)` set the net actor must silently re-join on connect
+    /// — every materialized circle currently in the rail. At startup (right after
+    /// [`GuiState::set_profile`]) these are exactly the restored persisted circles;
+    /// empty on the no-profile path.
+    pub fn persisted_rejoins(&self) -> Vec<(u64, String)> {
+        self.circles
+            .iter()
+            .filter_map(|c| c.net.as_ref().map(|n| (n.circle_id, n.phrase.clone())))
+            .collect()
+    }
+
+    /// Write-through (round 6): record circle `idx`'s phrase into the unlocked
+    /// profile's blob so it silently re-joins next launch. A no-op (returns `Ok`)
+    /// when there is no profile (ephemeral session) or the circle has no net
+    /// contract (the Lobby). A disk / seal failure is surfaced as `Err(reason)` —
+    /// the circle still works in RAM this session regardless.
+    pub fn persist_circle(&mut self, idx: usize) -> Result<(), String> {
+        let Some((phrase, label)) = self
+            .circles
+            .get(idx)
+            .and_then(|c| c.net.as_ref().map(|n| (n.phrase.clone(), c.name.clone())))
+        else {
+            return Ok(());
+        };
+        match self.profile.as_mut() {
+            Some(p) => p.persist_circle(&phrase, &label).map(|_| ()),
+            None => Ok(()),
         }
     }
 
@@ -375,6 +434,7 @@ impl GuiState {
             circles,
             active: 1,
             next_circle_id: FIRST_CIRCLE_ID,
+            profile: None,
         }
     }
 }
@@ -631,5 +691,119 @@ mod tests {
             dbg.contains("CotKey(<redacted>)"),
             "cot_key Debug stays redacted"
         );
+    }
+
+    // ── round-6: persistent identity + silent circle rejoin ──────────────────
+
+    /// The whole persistence loop, end-to-end against a real temp profile root and
+    /// no relay: enroll → adopt the profile → user joins a circle (write-through) →
+    /// reload the blob from disk under the passphrase → restore. The restored circle
+    /// must be back in the rail and re-derive the SAME key, and the display handle
+    /// must survive. This is the round-6 keystone — a tester relaunching keeps their
+    /// handle + circles.
+    #[test]
+    fn profile_round_trips_a_circle_and_handle_across_reload() {
+        use daemonseed_core::bootstrap::BootstrapAnchor;
+        use daemonseed_core::first_start::FirstStart;
+        use daemonseed_core::profile::config::ArgonParams;
+        use daemonseed_core::profile::persist::{
+            load_for_unlock, session_materials_from_unlock, write_first_start,
+        };
+        use daemonseed_core::storage::seeds;
+
+        let _ = oxicrypt_module::initialize();
+
+        // A unique temp profile root (no uuid dep — pid + nanos).
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "ds-gui-profile-test-{}-{nonce}",
+            std::process::id()
+        ));
+        // Fast Argon params for the test (production uses ArgonParams::default()).
+        let fast = ArgonParams {
+            memory_kib: 8,
+            iterations: 1,
+            parallelism: 1,
+        };
+        let pass = "correct horse battery staple table mountain";
+
+        // Enroll + persist a first-start profile.
+        let sealed = FirstStart::new().initialize(pass, fast).unwrap();
+        let phrase = sealed.display_phrase();
+        let verified = sealed.verify_round_trip(&phrase).unwrap();
+        let materials = verified
+            .finalize(
+                Some("alice".to_string()),
+                BootstrapAnchor {
+                    server_id: "relay#aabbccddeeff".to_string(),
+                    address: "127.0.0.1:443".to_string(),
+                },
+            )
+            .unwrap()
+            .into_session_materials();
+        write_first_start(&root, &materials, None, false).unwrap();
+
+        // Session 1: adopt the profile (no circles yet), join a circle, write through.
+        let mut st1 = GuiState::lobby_only();
+        st1.set_profile(Profile::from_materials(materials, root.clone()));
+        assert_eq!(st1.display_handle().as_deref(), Some("alice"));
+        assert!(
+            st1.persisted_rejoins().is_empty(),
+            "no circles persisted on a fresh enrollment"
+        );
+        let idx = st1.materialize_from_phrase(STRONG).unwrap();
+        st1.persist_circle(idx)
+            .expect("write-through persists the circle");
+        drop(st1);
+
+        // Session 2: reload the blob from disk under the passphrase, restore.
+        let (config, blob) = load_for_unlock(&root).unwrap();
+        let opened = seeds::open(&blob, pass, config.profile_id, config.argon2).unwrap();
+        let materials2 = session_materials_from_unlock(
+            opened.seeds,
+            opened.key,
+            opened.index_key,
+            config,
+            blob.clone(),
+            vec![],
+        )
+        .unwrap();
+        let mut st2 = GuiState::lobby_only();
+        st2.set_profile(Profile::from_materials(materials2, root.clone()));
+
+        // The circle survived relaunch: back in the rail + in the rejoin set.
+        assert!(!st2.only_lobby(), "persisted circle restored into the rail");
+        let rejoins = st2.persisted_rejoins();
+        assert_eq!(rejoins.len(), 1, "exactly one persisted circle to rejoin");
+        // The restored (canonicalized) phrase re-derives the ORIGINAL circle key.
+        assert_eq!(
+            derive_cot_key(&rejoins[0].1, &CNSA_2_0).unwrap().as_bytes(),
+            derive_cot_key(STRONG, &CNSA_2_0).unwrap().as_bytes(),
+            "the restored phrase re-derives the original circle key, byte-for-byte"
+        );
+        assert_eq!(
+            st2.display_handle().as_deref(),
+            Some("alice"),
+            "the display handle survives reload"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The ephemeral path (no profile) never persists and never panics: joins work
+    /// in RAM, `persist_circle` is a clean no-op, and there is nothing to rejoin.
+    #[test]
+    fn no_profile_means_no_persistence() {
+        let _ = oxicrypt_module::initialize();
+        let mut st = GuiState::lobby_only();
+        assert_eq!(st.display_handle(), None);
+        let idx = st.materialize_from_phrase(STRONG).unwrap();
+        st.persist_circle(idx)
+            .expect("persist is a no-op without a profile");
+        // The circle is in RAM this session, but there is no persistence surface.
+        assert!(!st.only_lobby());
     }
 }

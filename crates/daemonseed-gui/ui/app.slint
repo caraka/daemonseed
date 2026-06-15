@@ -206,6 +206,47 @@ export component AppWindow inherits Window {
     callback focus-join-input();
     focus-join-input => { join_phrase_input.focus(); }
 
+    // ── Round-6: persistent identity — first-start + unlock auth gate ──
+    //
+    // `screen` selects the top-level surface: "first-start" (enrollment wizard),
+    // "unlock" (daily-login passphrase), or "main" (the shell). Default "main" so the
+    // offscreen render + the existing flows are unchanged unless Rust routes away.
+    // The wizard advances by `fs-step` (0 passphrase → 1 mnemonic → 2 confirm → 3
+    // name); Rust owns the FirstStart state machine and advances the step only when a
+    // core step actually succeeds, so the UI can't get ahead of the crypto.
+    in-out property <string> screen: "main";
+    in-out property <int> fs-step: 0;
+    in-out property <string> fs-passphrase;            // two-way; the chosen unlock passphrase
+    in property <bool> fs-passphrase-strong: false;    // Rust-set: estimate().is_session_green()
+    in property <string> fs-mnemonic;                  // Rust-set: the 24-word recovery phrase
+    in-out property <string> fs-confirm;               // two-way; round-trip re-entry of the phrase
+    in property <bool> fs-confirm-match: false;        // Rust-set: confirm == mnemonic (verified path)
+    in-out property <string> fs-name;                  // two-way; chosen display name
+    in-out property <string> unlock-passphrase;        // two-way; daily-login passphrase
+    in property <string> auth-error;                   // Rust-set: weak / mismatch / wrong-passphrase line
+
+    // Recompute the (hidden) passphrase strength on each keystroke (session floor).
+    callback fs-passphrase-edited(string);
+    // Step 0 → 1: Rust runs FirstStart::initialize (gates strength, generates the
+    // mnemonic). On success it sets fs-mnemonic + advances; on a weak passphrase it
+    // sets auth-error and stays.
+    callback fs-passphrase-next();
+    // Step 1 → 2: "I've saved it" — Rust advances + defers focus to the confirm field.
+    callback fs-saved-next();
+    // Recompute whether the round-trip re-entry matches the shown phrase.
+    callback fs-confirm-edited(string);
+    // Step 2 → 3: Rust runs verify_round_trip; on match it advances, else auth-error.
+    callback fs-confirm-next();
+    // Step 3 finish: Rust finalizes with the display name, persists the profile,
+    // enters "main", and connects under the new identity.
+    callback fs-finish(string);
+    // Unlock: Rust opens the blob under the passphrase; wrong → auth-error, right →
+    // restore + enter "main" + connect under the persisted handle.
+    callback unlock-submit(string);
+    // Auth-field focus is handled by each conditional step container's own `init`
+    // (the standard Slint autofocus pattern) — a sibling callback can't reach an id
+    // nested inside an `if`, and `init` fires exactly when that step appears.
+
     // Global shortcut host: wraps the WHOLE UI (main + overlays) so a key event from
     // any focused field bubbles up here — Ctrl-K kept dying once focus moved into an
     // overlay field that sat outside the scope (caraka, DS2). Grabs focus on init so
@@ -630,4 +671,174 @@ export component AppWindow inherits Window {
     }
     } // end key-host FocusScope (wraps main + overlays so Ctrl-K keeps working
       // even when an overlay field holds focus)
+
+    // ── Round-6 auth gate: full-window, opaque, ON TOP of the shortcut host so it
+    // covers the shell until an identity is unlocked. Outside key-host so its own
+    // fields never trip the global Ctrl shortcuts. Hidden (screen == "main") in the
+    // offscreen render + once authenticated, so the existing shell is unchanged.
+    auth := Rectangle {
+        visible: root.screen != "main";
+        width: 100%; height: 100%;
+        background: #07080a;
+
+        Rectangle {
+            x: (parent.width - self.width) / 2; y: 70px;
+            width: 560px; height: 470px;
+            background: #0e0f11; border-radius: 14px; border-width: 1px; border-color: #ffffff18;
+            VerticalLayout {
+                padding: 26px; spacing: 14px; alignment: start;
+                HorizontalLayout {
+                    Text { text: "daemonseed"; color: #aeb6c2; font-size: 18px; vertical-alignment: center; }
+                    Rectangle { }
+                    SealedPill { }
+                }
+
+                // ── UNLOCK (daily login) ──
+                if root.screen == "unlock" : VerticalLayout {
+                    spacing: 14px; alignment: start;
+                    Text { text: "Welcome back"; color: #e4e8ee; font-size: 21px; }
+                    Text { text: "Enter your passphrase to unlock this device."; color: #8b93a1; font-size: 13px; wrap: word-wrap; }
+                    Rectangle {
+                        height: 46px; border-radius: 9px; background: #141517; border-width: 1px; border-color: #ffffff12;
+                        HorizontalLayout { padding-left: 12px;
+                            Text { text: "passphrase"; visible: root.unlock-passphrase == ""; color: #4d5560; font-size: 13px; vertical-alignment: center; }
+                        }
+                        HorizontalLayout { padding-left: 12px; padding-right: 12px;
+                            unlock_input := TextInput {
+                                text <=> root.unlock-passphrase;
+                                input-type: InputType.password;
+                                color: #d6dae1; font-size: 14px; vertical-alignment: center; single-line: true;
+                                accepted => { root.unlock-submit(root.unlock-passphrase); }
+                            }
+                        }
+                    }
+                    // Error line — STABLE computed Text (never an `if`, so a wrong-passphrase
+                    // attempt can't mutate the item tree mid-keystroke).
+                    Text { text: root.auth-error; color: #c0857d; font-size: 12px; }
+                    Rectangle { }
+                    HorizontalLayout {
+                        Rectangle { }
+                        PillButton { label: "Unlock"; primary: true; w: 130px; clicked => { root.unlock-submit(root.unlock-passphrase); } }
+                    }
+                }
+
+                // ── FIRST-START (enrollment wizard) ──
+                if root.screen == "first-start" : VerticalLayout {
+                    spacing: 14px; alignment: start;
+
+                    // step 0 — passphrase
+                    if root.fs-step == 0 : VerticalLayout {
+                        spacing: 12px; alignment: start;
+                        Text { text: "Create your identity"; color: #e4e8ee; font-size: 21px; }
+                        Text { text: "Choose a passphrase. It encrypts everything on this device — there is no reset, so make it strong and memorable."; color: #8b93a1; font-size: 13px; wrap: word-wrap; }
+                        Rectangle {
+                            height: 46px; border-radius: 9px; background: #141517; border-width: 1px; border-color: #ffffff12;
+                            HorizontalLayout { padding-left: 12px;
+                                Text { text: "a passphrase you'll remember"; visible: root.fs-passphrase == ""; color: #4d5560; font-size: 13px; vertical-alignment: center; }
+                            }
+                            HorizontalLayout { padding-left: 12px; padding-right: 12px;
+                                fs_pass_input := TextInput {
+                                    text <=> root.fs-passphrase;
+                                    input-type: InputType.password;
+                                    color: #d6dae1; font-size: 14px; vertical-alignment: center; single-line: true;
+                                    edited => { root.fs-passphrase-edited(root.fs-passphrase); }
+                                    accepted => { root.fs-passphrase-next(); }
+                                }
+                            }
+                        }
+                        Text {
+                            text: root.fs-passphrase-strong ? "Looks strong"
+                                : root.fs-passphrase != "" ? "Add a few more words." : "";
+                            color: root.fs-passphrase-strong ? #6fb3a4 : #8b7d5b;
+                            font-size: 12px;
+                        }
+                        Text { text: root.auth-error; color: #c0857d; font-size: 12px; }
+                        Rectangle { }
+                        HorizontalLayout {
+                            Rectangle { }
+                            PillButton { label: "Continue"; primary: true; w: 130px; clicked => { root.fs-passphrase-next(); } }
+                        }
+                    }
+
+                    // step 1 — recovery phrase
+                    if root.fs-step == 1 : VerticalLayout {
+                        spacing: 12px; alignment: start;
+                        Text { text: "Your recovery phrase"; color: #e4e8ee; font-size: 21px; }
+                        Text { text: "Write these words down and keep them somewhere safe. They are the ONLY way to recover this identity."; color: #8b93a1; font-size: 13px; wrap: word-wrap; }
+                        Rectangle {
+                            height: 110px; border-radius: 10px; background: #141517; border-width: 1px; border-color: #ffffff12;
+                            HorizontalLayout { padding: 14px;
+                                fs_mnemonic_box := TextInput {
+                                    text: root.fs-mnemonic;
+                                    read-only: true;
+                                    color: #d6dae1; font-size: 14px; wrap: word-wrap; vertical-alignment: top; single-line: false;
+                                }
+                            }
+                        }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            PillButton { label: "Copy"; w: 84px; clicked => { fs_mnemonic_box.select-all(); fs_mnemonic_box.copy(); } }
+                            Rectangle { }
+                            PillButton { label: "I've saved it"; primary: true; w: 150px; clicked => { root.fs-saved-next(); } }
+                        }
+                    }
+
+                    // step 2 — round-trip confirm
+                    if root.fs-step == 2 : VerticalLayout {
+                        spacing: 12px; alignment: start;
+                        Text { text: "Confirm your phrase"; color: #e4e8ee; font-size: 21px; }
+                        Text { text: "Type your recovery phrase back to confirm you saved it."; color: #8b93a1; font-size: 13px; wrap: word-wrap; }
+                        Rectangle {
+                            height: 80px; border-radius: 10px; background: #141517; border-width: 1px; border-color: #ffffff12;
+                            HorizontalLayout { padding: 12px;
+                                fs_confirm_input := TextInput {
+                                    text <=> root.fs-confirm;
+                                    color: #d6dae1; font-size: 14px; wrap: word-wrap; vertical-alignment: top; single-line: false;
+                                    edited => { root.fs-confirm-edited(root.fs-confirm); }
+                                }
+                            }
+                        }
+                        Text {
+                            text: root.fs-confirm-match ? "Matches — you're set"
+                                : root.fs-confirm != "" ? "Doesn't match yet." : "";
+                            color: root.fs-confirm-match ? #6fb3a4 : #8b7d5b;
+                            font-size: 12px;
+                        }
+                        Text { text: root.auth-error; color: #c0857d; font-size: 12px; }
+                        Rectangle { }
+                        HorizontalLayout {
+                            Rectangle { }
+                            PillButton { label: "Confirm"; primary: true; w: 130px; clicked => { root.fs-confirm-next(); } }
+                        }
+                    }
+
+                    // step 3 — display name
+                    if root.fs-step == 3 : VerticalLayout {
+                        spacing: 12px; alignment: start;
+                        Text { text: "Pick a display name"; color: #e4e8ee; font-size: 21px; }
+                        Text { text: "This is how others see you in chats. You can be anyone."; color: #8b93a1; font-size: 13px; wrap: word-wrap; }
+                        Rectangle {
+                            height: 46px; border-radius: 9px; background: #141517; border-width: 1px; border-color: #ffffff12;
+                            HorizontalLayout { padding-left: 12px;
+                                Text { text: "a name others will see"; visible: root.fs-name == ""; color: #4d5560; font-size: 13px; vertical-alignment: center; }
+                            }
+                            HorizontalLayout { padding-left: 12px; padding-right: 12px;
+                                fs_name_input := TextInput {
+                                    text <=> root.fs-name;
+                                    color: #d6dae1; font-size: 14px; vertical-alignment: center; single-line: true;
+                                    accepted => { root.fs-finish(root.fs-name); }
+                                }
+                            }
+                        }
+                        Text { text: root.auth-error; color: #c0857d; font-size: 12px; }
+                        Rectangle { }
+                        HorizontalLayout {
+                            Rectangle { }
+                            PillButton { label: "Create my identity"; primary: true; w: 180px; clicked => { root.fs-finish(root.fs-name); } }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

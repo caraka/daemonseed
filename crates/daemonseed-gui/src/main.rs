@@ -24,17 +24,28 @@
 //! real callbacks and prints `SELF-CHECK PASS` (panics → non-zero exit).
 
 mod net;
+mod profile;
 mod state;
 
 slint::include_modules!();
 
-use daemonseed_core::passphrase::strength::estimate_circle;
+use daemonseed_core::bootstrap::BootstrapAnchor;
+use daemonseed_core::first_start::{BackupVerified, FirstStart, FirstStartError, Sealed};
+use daemonseed_core::passphrase::strength::{estimate, estimate_circle};
+use daemonseed_core::profile::config::ArgonParams;
+use daemonseed_core::profile::persist::{
+    load_for_unlock, session_materials_from_unlock, write_first_start,
+};
+use daemonseed_core::profile::resolve::{ResolveArgs, ResolvedProfileRoot, resolve};
+use daemonseed_core::storage::seeds;
 use net::{NetCommand, NetEvent, NetHandle};
+use profile::Profile;
 use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType, Rgb565Pixel};
 use slint::platform::{Platform, PlatformError, WindowAdapter};
 use slint::{ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel};
 use state::{CircleState, GuiState, Msg};
 use std::cell::{Cell, RefCell};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -100,6 +111,54 @@ const H: u32 = 680;
 /// is fine — the offscreen paths don't depend on focus.
 fn defer<F: FnOnce() + 'static>(f: F) {
     slint::Timer::single_shot(Duration::from_millis(0), f);
+}
+
+/// The first-start wizard's cross-callback state: the `FirstStart` type-state
+/// machine threaded between UI steps. `Sealed` after `initialize` (the mnemonic is
+/// shown + confirmed), `Verified` after a matching round-trip (ready to finalize).
+/// Held in a `RefCell` because each wizard button is a separate callback. `Empty`
+/// is the resting / consumed state.
+enum Wizard {
+    Empty,
+    Sealed(FirstStart<Sealed>),
+    Verified(FirstStart<BackupVerified>),
+}
+
+impl Wizard {
+    /// Take the `Sealed` state out, leaving `Empty`. Returns `None` if not Sealed.
+    fn take_sealed(&mut self) -> Option<FirstStart<Sealed>> {
+        match std::mem::replace(self, Wizard::Empty) {
+            Wizard::Sealed(s) => Some(s),
+            other => {
+                *self = other;
+                None
+            }
+        }
+    }
+
+    /// Take the `Verified` state out, leaving `Empty`. Returns `None` otherwise.
+    fn take_verified(&mut self) -> Option<FirstStart<BackupVerified>> {
+        match std::mem::replace(self, Wizard::Empty) {
+            Wizard::Verified(v) => Some(v),
+            other => {
+                *self = other;
+                None
+            }
+        }
+    }
+}
+
+/// EXACT replica of the core's private `first_start::orchestrator::phrases_match`
+/// (split-whitespace + lowercase, compared word-for-word). Used as the round-trip
+/// PRE-check: `verify_round_trip` consumes the `Sealed` state by value, so calling
+/// it on a mismatch would destroy the enrollment (and regenerate a DIFFERENT
+/// mnemonic on retry — the phrase the user already wrote down). By gating on a
+/// byte-identical normalization first, `verify_round_trip` is only ever invoked
+/// when it will succeed, so the Sealed state is preserved across a mistyped confirm.
+fn phrases_match(a: &str, b: &str) -> bool {
+    let an: Vec<String> = a.split_whitespace().map(|w| w.to_lowercase()).collect();
+    let bn: Vec<String> = b.split_whitespace().map(|w| w.to_lowercase()).collect();
+    an == bn
 }
 
 /// Convert a circle's `Vec<Msg>` into a Slint `ModelRc<MsgData>`.
@@ -168,6 +227,15 @@ fn materialize_and_select(
                 let active = st.active();
                 rebuild_rail(ui, &st);
                 apply_view(ui, st.current(), active as i32);
+                // Round 6 write-through: record the circle in the unlocked profile
+                // so it silently re-joins next launch. A no-op without a profile; a
+                // disk failure is surfaced quietly — the circle still works this
+                // session (no-history property means nothing is lost but the rejoin).
+                if let Err(e) = st.persist_circle(idx) {
+                    ui.set_connection_status(SharedString::from(format!(
+                        "circle active · saved in memory only ({e})"
+                    )));
+                }
                 // The JoinCircle inputs come from the STORED net contract (the
                 // keystone is the source of truth), not the passed-through arg.
                 st.current()
@@ -465,33 +533,17 @@ struct LiveNet {
     _timer: Timer,
 }
 
-/// Start real networking against the net actor `build_ui` created: fire `Connect`
-/// (auto-joins the default public room) when crypto is up, and start a repeating
-/// timer that drains [`NetEvent`]s onto the UI thread non-blocking. The composer
-/// send callback was wired in `build_ui` (it needs the net handle too). On a
-/// crypto-init failure the shell still renders — the Lobby just stays offline; the
-/// drain timer still runs so circle errors surface. Returns the [`LiveNet`] owner
-/// the caller MUST keep alive.
-fn start_net(
+/// Start the [`NetEvent`] drain timer (round 6: this no longer connects — the
+/// `Connect` is deferred to [`connect_now`], fired only once an identity is
+/// unlocked, so the actor never connects under an ephemeral handle while the auth
+/// gate is up). The ~33ms repeated, CAPPED non-blocking loop drains events onto the
+/// UI thread for the app's whole life. Returns the [`LiveNet`] owner the caller MUST
+/// keep alive (dropping it silently kills the drain + net thread).
+fn start_drain(
     ui: &AppWindow,
     state: Rc<RefCell<GuiState>>,
     net: Rc<RefCell<NetHandle>>,
-    crypto: &Result<(), String>,
 ) -> LiveNet {
-    match crypto {
-        Ok(()) => {
-            let (server_id, address) = relay_target();
-            let _ = net
-                .borrow()
-                .send(NetCommand::Connect { server_id, address });
-        }
-        Err(reason) => {
-            ui.set_connection_status(SharedString::from(format!("offline · {reason}")));
-            ui.set_connected(false);
-        }
-    }
-
-    // Drain timer: ~33ms repeated, CAPPED non-blocking loop.
     let timer = Timer::default();
     {
         let weak = ui.as_weak();
@@ -522,6 +574,39 @@ fn start_net(
     LiveNet {
         _net: net,
         _timer: timer,
+    }
+}
+
+/// Fire the real `Connect` against the running net actor: auto-joins the default
+/// public room, presents under the unlocked profile's stable handle (round 6), and
+/// silently re-joins its persisted circles once the session is live. Called once an
+/// identity is in hand — from the auth-success callbacks (first-start finish /
+/// unlock) or, on the offscreen `main` path, directly at startup. On a crypto-init
+/// failure the shell still renders; the Lobby just stays offline.
+fn connect_now(
+    ui: &AppWindow,
+    state: &Rc<RefCell<GuiState>>,
+    net: &Rc<RefCell<NetHandle>>,
+    crypto: &Result<(), String>,
+) {
+    match crypto {
+        Ok(()) => {
+            let (server_id, address) = relay_target();
+            let (display_handle, rejoin_circles) = {
+                let st = state.borrow();
+                (st.display_handle(), st.persisted_rejoins())
+            };
+            let _ = net.borrow().send(NetCommand::Connect {
+                server_id,
+                address,
+                display_handle,
+                rejoin_circles,
+            });
+        }
+        Err(reason) => {
+            ui.set_connection_status(SharedString::from(format!("offline · {reason}")));
+            ui.set_connected(false);
+        }
     }
 }
 
@@ -640,6 +725,275 @@ fn self_check(ui: &AppWindow, state: &Rc<RefCell<GuiState>>, net: &Rc<RefCell<Ne
     println!("SELF-CHECK PASS");
 }
 
+/// Enter the main shell from an authenticated state: refresh the rail (it may now
+/// hold restored circles), drop the auth gate, connect under the identity, and
+/// autofocus the composer.
+fn enter_main(
+    ui: &AppWindow,
+    state: &Rc<RefCell<GuiState>>,
+    net: &Rc<RefCell<NetHandle>>,
+    crypto: &Result<(), String>,
+) {
+    rebuild_rail(ui, &state.borrow());
+    ui.set_screen(SharedString::from("main"));
+    connect_now(ui, state, net, crypto);
+    let w = ui.as_weak();
+    defer(move || {
+        if let Some(ui) = w.upgrade() {
+            ui.invoke_focus_composer();
+        }
+    });
+}
+
+/// Wire the round-6 auth callbacks: the first-start wizard (passphrase → mnemonic →
+/// round-trip confirm → name) and the daily-login Unlock. The `FirstStart` machine
+/// lives in `wizard`; the profile root to write / read lives in `profile_root`. On
+/// success each path adopts the profile and enters the shell via [`enter_main`].
+fn wire_auth(
+    ui: &AppWindow,
+    state: &Rc<RefCell<GuiState>>,
+    net: &Rc<RefCell<NetHandle>>,
+    crypto: Result<(), String>,
+    wizard: Rc<RefCell<Wizard>>,
+    profile_root: Rc<RefCell<PathBuf>>,
+) {
+    // Live (hidden) passphrase strength against the session floor (ISC-C12).
+    ui.on_fs_passphrase_edited({
+        let weak = ui.as_weak();
+        move |text| {
+            let ui = weak.unwrap();
+            ui.set_fs_passphrase_strong(estimate(text.as_str()).is_session_green());
+        }
+    });
+
+    // Step 0 → 1: FirstStart::initialize gates strength + generates the mnemonic.
+    ui.on_fs_passphrase_next({
+        let weak = ui.as_weak();
+        let wizard = wizard.clone();
+        move || {
+            let ui = weak.unwrap();
+            let pass = ui.get_fs_passphrase().to_string();
+            match FirstStart::new().initialize(pass.as_str(), ArgonParams::default()) {
+                Ok(sealed) => {
+                    ui.set_fs_mnemonic(SharedString::from(sealed.display_phrase()));
+                    *wizard.borrow_mut() = Wizard::Sealed(sealed);
+                    ui.set_auth_error(SharedString::from(""));
+                    ui.set_fs_step(1);
+                }
+                Err(FirstStartError::PassphraseTooWeak { .. }) => {
+                    ui.set_auth_error(SharedString::from(
+                        "That passphrase is too easy to guess — add a few more words.",
+                    ));
+                }
+                Err(e) => {
+                    ui.set_auth_error(SharedString::from(format!("Couldn't create identity: {e}")));
+                }
+            }
+        }
+    });
+
+    // Step 1 → 2: "I've saved it" — advance + focus the confirm field (deferred).
+    ui.on_fs_saved_next({
+        let weak = ui.as_weak();
+        move || {
+            let ui = weak.unwrap();
+            ui.set_auth_error(SharedString::from(""));
+            ui.set_fs_confirm(SharedString::from(""));
+            // The step-2 container's `init` focuses the confirm field on appear.
+            ui.set_fs_step(2);
+        }
+    });
+
+    // Live match hint on the round-trip re-entry (same normalization as the core).
+    ui.on_fs_confirm_edited({
+        let weak = ui.as_weak();
+        move |text| {
+            let ui = weak.unwrap();
+            ui.set_fs_confirm_match(phrases_match(text.as_str(), ui.get_fs_mnemonic().as_str()));
+        }
+    });
+
+    // Step 2 → 3: a PRE-checked round-trip verify (never consumes Sealed on a
+    // mismatch — see `phrases_match`), then advance to the name step.
+    ui.on_fs_confirm_next({
+        let weak = ui.as_weak();
+        let wizard = wizard.clone();
+        move || {
+            let ui = weak.unwrap();
+            let confirm = ui.get_fs_confirm().to_string();
+            let mnemonic = ui.get_fs_mnemonic().to_string();
+            if !phrases_match(&confirm, &mnemonic) {
+                ui.set_auth_error(SharedString::from(
+                    "Those words don't match — check and try again.",
+                ));
+                return;
+            }
+            let Some(sealed) = wizard.borrow_mut().take_sealed() else {
+                ui.set_auth_error(SharedString::from(
+                    "Enrollment state lost — please start over.",
+                ));
+                ui.set_fs_step(0);
+                return;
+            };
+            match sealed.verify_round_trip(&confirm) {
+                Ok(verified) => {
+                    *wizard.borrow_mut() = Wizard::Verified(verified);
+                    ui.set_auth_error(SharedString::from(""));
+                    // The step-3 container's `init` focuses the name field on appear.
+                    ui.set_fs_step(3);
+                }
+                Err(_) => {
+                    // Pre-check passed but core rejected — should be unreachable; the
+                    // Sealed state is now consumed, so restart enrollment cleanly.
+                    ui.set_auth_error(SharedString::from(
+                        "Couldn't verify the phrase — please start over.",
+                    ));
+                    ui.set_fs_step(0);
+                }
+            }
+        }
+    });
+
+    // Step 3 finish: finalize with the display name, persist the profile, enter.
+    ui.on_fs_finish({
+        let weak = ui.as_weak();
+        let wizard = wizard.clone();
+        let state = state.clone();
+        let net = net.clone();
+        let crypto = crypto.clone();
+        let profile_root = profile_root.clone();
+        move |name| {
+            let ui = weak.unwrap();
+            let name = name.to_string();
+            if name.trim().is_empty() {
+                ui.set_auth_error(SharedString::from("Pick a name others will see."));
+                return;
+            }
+            let Some(verified) = wizard.borrow_mut().take_verified() else {
+                ui.set_auth_error(SharedString::from(
+                    "Enrollment state lost — please start over.",
+                ));
+                ui.set_fs_step(0);
+                return;
+            };
+            let (server_id, address) = relay_target();
+            let bootstrap = BootstrapAnchor { server_id, address };
+            let ready = match verified.finalize(Some(name), bootstrap) {
+                Ok(r) => r,
+                Err(e) => {
+                    ui.set_auth_error(SharedString::from(format!("Couldn't finish: {e}")));
+                    ui.set_fs_step(0); // verified consumed — restart
+                    return;
+                }
+            };
+            let materials = ready.into_session_materials();
+            let root = profile_root.borrow().clone();
+            if let Err(e) = write_first_start(&root, &materials, None, false) {
+                // Do NOT enter the shell without a persisted profile.
+                ui.set_auth_error(SharedString::from(format!(
+                    "Couldn't save your profile: {e}"
+                )));
+                return;
+            }
+            state
+                .borrow_mut()
+                .set_profile(Profile::from_materials(materials, root));
+            ui.set_auth_error(SharedString::from(""));
+            enter_main(&ui, &state, &net, &crypto);
+        }
+    });
+
+    // Daily-login Unlock: open the blob under the passphrase, restore, enter.
+    ui.on_unlock_submit({
+        let weak = ui.as_weak();
+        let state = state.clone();
+        let net = net.clone();
+        let crypto = crypto.clone();
+        let profile_root = profile_root.clone();
+        move |pass| {
+            let ui = weak.unwrap();
+            let pass = pass.to_string();
+            let root = profile_root.borrow().clone();
+            let (config, blob) = match load_for_unlock(&root) {
+                Ok(x) => x,
+                Err(e) => {
+                    ui.set_auth_error(SharedString::from(format!("Couldn't read profile: {e}")));
+                    return;
+                }
+            };
+            let opened = match seeds::open(&blob, &pass, config.profile_id, config.argon2) {
+                Ok(o) => o,
+                Err(seeds::BlobError::AuthenticationFailed) => {
+                    ui.set_auth_error(SharedString::from("Wrong passphrase."));
+                    return;
+                }
+                Err(e) => {
+                    ui.set_auth_error(SharedString::from(format!("Couldn't unlock: {e}")));
+                    return;
+                }
+            };
+            let materials = match session_materials_from_unlock(
+                opened.seeds,
+                opened.key,
+                opened.index_key,
+                config,
+                blob.clone(),
+                Vec::new(),
+            ) {
+                Ok(m) => m,
+                Err(e) => {
+                    ui.set_auth_error(SharedString::from(format!(
+                        "Couldn't restore identity: {e}"
+                    )));
+                    return;
+                }
+            };
+            state
+                .borrow_mut()
+                .set_profile(Profile::from_materials(materials, root));
+            ui.set_auth_error(SharedString::from(""));
+            ui.set_unlock_passphrase(SharedString::from(""));
+            enter_main(&ui, &state, &net, &crypto);
+        }
+    });
+}
+
+/// Resolve the profile location and route the opening screen: an existing profile →
+/// Unlock, none → the first-start wizard. Stashes the chosen root in `profile_root`
+/// for the auth callbacks. Only the windowed (`desktop`) path routes at startup; the
+/// offscreen build sets screens directly via flags, so this is unused there.
+#[cfg_attr(not(feature = "desktop"), allow(dead_code))]
+fn route_startup(ui: &AppWindow, profile_root: &Rc<RefCell<PathBuf>>, portable: bool) {
+    match resolve(ResolveArgs {
+        config_flag: None,
+        portable,
+    }) {
+        Ok(ResolvedProfileRoot::Existing { root, .. }) => {
+            *profile_root.borrow_mut() = root;
+            ui.set_screen(SharedString::from("unlock"));
+        }
+        Ok(ResolvedProfileRoot::FirstStart { default_root }) => {
+            *profile_root.borrow_mut() = default_root;
+            ui.set_screen(SharedString::from("first-start"));
+            ui.set_fs_step(0);
+        }
+        Err(e) => {
+            ui.set_screen(SharedString::from("first-start"));
+            ui.set_fs_step(0);
+            ui.set_auth_error(SharedString::from(format!(
+                "Using a default profile location ({e})."
+            )));
+        }
+    }
+    // Each auth screen's container `init` focuses its own field when it appears.
+}
+
+/// A fixed sample recovery phrase for offscreen rendering of the wizard's mnemonic /
+/// confirm steps (never used at runtime — the real mnemonic comes from FirstStart).
+const SAMPLE_MNEMONIC: &str = "abandon ability able about above absent absorb abstract \
+absurd abuse access accident account accuse achieve acid acoustic acquire across act \
+action actor actress actual";
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -657,15 +1011,25 @@ fn main() {
     let mut switch: Option<i32> = None;
     let mut scroll: Option<f32> = None;
     let mut materialize: Option<String> = None;
+    let mut fs_step_flag: i32 = 0;
     let self_check_requested = args.iter().any(|a| a == "--self-check");
     let show_join = args.iter().any(|a| a == "--show-join");
     let show_new = args.iter().any(|a| a == "--show-new");
+    // Round-6 routing: `--portable` resolves the profile under CWD (else XDG).
+    // `--first-start [step]` / `--unlock` are OFFSCREEN-only render flags for the
+    // new auth screens (windowed routing always uses `resolve`). `portable` feeds
+    // the windowed `route_startup`, so it's only read under the `desktop` feature.
+    #[cfg_attr(not(feature = "desktop"), allow(unused_variables))]
+    let portable = args.iter().any(|a| a == "--portable");
+    let first_start_flag = args.iter().any(|a| a == "--first-start");
+    let unlock_flag = args.iter().any(|a| a == "--unlock");
     for w in args.windows(2) {
         match w[0].as_str() {
             "--screenshot" => screenshot = Some(w[1].clone()),
             "--switch" => switch = w[1].parse().ok(),
             "--scroll" => scroll = w[1].parse().ok(),
             "--materialize" => materialize = Some(w[1].clone()),
+            "--first-start" => fs_step_flag = w[1].parse().unwrap_or(0),
             _ => {}
         }
     }
@@ -678,6 +1042,8 @@ fn main() {
         || materialize.is_some()
         || show_join
         || show_new
+        || first_start_flag
+        || unlock_flag
         || self_check_requested;
 
     // Bring up crypto before any Connect OR any materialize (derive_cot_key). A
@@ -685,10 +1051,26 @@ fn main() {
     // stays offline. Always init now (self-check materializes, so it needs it too).
     let crypto = init_crypto();
 
+    // Round-6 auth state, shared into the wizard/unlock callbacks: the FirstStart
+    // machine and the profile root to write/read.
+    let wizard = Rc::new(RefCell::new(Wizard::Empty));
+    let profile_root = Rc::new(RefCell::new(PathBuf::new()));
+
     #[cfg(feature = "desktop")]
     if !offscreen {
         let (ui, state, net) = build_ui();
-        let _live = start_net(&ui, state, net, &crypto);
+        wire_auth(
+            &ui,
+            &state,
+            &net,
+            crypto.clone(),
+            wizard.clone(),
+            profile_root.clone(),
+        );
+        // The drain timer runs for the whole app life; the Connect is deferred to
+        // the auth-success callbacks (no connecting under the auth gate).
+        let _live = start_drain(&ui, state, net);
+        route_startup(&ui, &profile_root, portable);
         ui.run().expect("run windowed");
         return;
     }
@@ -701,6 +1083,14 @@ fn main() {
     }))
     .expect("set_platform");
     let (ui, state, net) = build_ui();
+    wire_auth(
+        &ui,
+        &state,
+        &net,
+        crypto.clone(),
+        wizard.clone(),
+        profile_root.clone(),
+    );
     ui.show().expect("show");
     window.set_size(slint::PhysicalSize::new(W, H));
 
@@ -709,26 +1099,41 @@ fn main() {
         return;
     }
 
-    // Start real networking on the offscreen path too (renders connection-status).
-    let _live = start_net(&ui, state.clone(), net.clone(), &crypto);
+    // Keep the drain alive until the render completes (offscreen renders frames
+    // synchronously; the net thread is harmless either way).
+    let mut _live: Option<LiveNet> = None;
 
-    // Drive the verification surfaces before rendering.
-    if let Some(phrase) = materialize.as_deref() {
-        materialize_and_select(&ui, &state, &net, phrase);
-    }
-    if show_join {
-        ui.invoke_open_join();
-    }
-    if show_new {
-        ui.invoke_open_new();
-    }
-    if let Some(n) = switch {
-        ui.invoke_switch_circle(n);
-    }
-    if let Some(s) = scroll {
-        ui.set_scroll_y(s);
+    if first_start_flag {
+        // Render a wizard step (no networking). Steps ≥1 need a phrase to show.
+        ui.set_screen(SharedString::from("first-start"));
+        ui.set_fs_step(fs_step_flag);
+        if fs_step_flag >= 1 {
+            ui.set_fs_mnemonic(SharedString::from(SAMPLE_MNEMONIC));
+        }
+    } else if unlock_flag {
+        ui.set_screen(SharedString::from("unlock"));
+    } else {
+        // Main shell offscreen: connect (renders connection-status) + drive flags.
+        _live = Some(start_drain(&ui, state.clone(), net.clone()));
+        connect_now(&ui, &state, &net, &crypto);
+        if let Some(phrase) = materialize.as_deref() {
+            materialize_and_select(&ui, &state, &net, phrase);
+        }
+        if show_join {
+            ui.invoke_open_join();
+        }
+        if show_new {
+            ui.invoke_open_new();
+        }
+        if let Some(n) = switch {
+            ui.invoke_switch_circle(n);
+        }
+        if let Some(s) = scroll {
+            ui.set_scroll_y(s);
+        }
     }
 
     let path = screenshot.unwrap_or_else(|| "daemonseed-gui.png".into());
     render_png(&window, &path);
+    drop(_live);
 }

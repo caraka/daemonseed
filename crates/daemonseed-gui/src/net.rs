@@ -25,11 +25,16 @@
 //!
 //! ## Identity
 //!
-//! `my_handle` is a throwaway adjective-noun handle regenerated every launch.
-//! There is **no persistent identity / first-start in this slice** — that is a
-//! separate milestone. The actor signs public-room posts under a fresh
-//! [`ClientIdentity::ephemeral`] per connect (the same key that proved the
-//! connection), exactly as the TUI does.
+//! By default `my_handle` is a throwaway adjective-noun handle regenerated every
+//! launch. Round 6 adds **persistent identity**: when the app unlocks a profile,
+//! `Connect` carries the persisted stable display handle (derived from the
+//! profile's mnemonic, decoupled from the connection key) and the actor presents
+//! under it. The connection proof itself stays a fresh [`ClientIdentity::ephemeral`]
+//! per connect (D8) — exactly as the TUI does (`daemonseed-tui` net.rs also
+//! connects ephemeral). Persistence is a stable *display* identity + silent circle
+//! rejoin, NOT a persisted connection-signing key. A spoofed display handle still
+//! cannot impersonate a real key: public-room provenance binds to the ephemeral
+//! signing key, and circle messages are AEAD-only (membership is the auth).
 //!
 //! ## Why current-thread + `LocalSet`
 //!
@@ -64,7 +69,24 @@ pub enum NetCommand {
     /// Open a connection to `server_id` at `address` (trusted mode), run the full
     /// TLS + APP_HELLO + identity-proof flow to Authenticated, keep the live
     /// session, and auto-join the default public room.
-    Connect { server_id: String, address: String },
+    ///
+    /// `display_handle` (round 6) is the persisted, stable presented name from an
+    /// unlocked profile — when `Some`, it replaces the actor's per-launch random
+    /// handle so the user presents the SAME name across sessions. The connection
+    /// proof itself stays ephemeral (D8, mirroring the TUI): persistence is a
+    /// stable *display* identity, not a persisted connection-signing key.
+    ///
+    /// `rejoin_circles` (round 6) is the set of persisted circles to silently
+    /// re-join once the session is live — `(gui_circle_id, phrase)` pairs read
+    /// from the at-rest blob. Re-joined AFTER the lobby auto-join so each has a
+    /// live session; failures surface per-circle (`CircleError`) and never abort
+    /// the connect. Empty for the ephemeral / no-profile path.
+    Connect {
+        server_id: String,
+        address: String,
+        display_handle: Option<String>,
+        rejoin_circles: Vec<(u64, String)>,
+    },
     /// Join (subscribe to) a public room by name. In this slice production Connect
     /// auto-joins the default room directly (via [`Actor::join_room`]); this
     /// command exists so the post-`open` JoinRoom path is driven identically by a
@@ -95,6 +117,13 @@ pub enum NetCommand {
     AttachSession {
         session: AppSession,
         server_id: String,
+        /// Round-6 parity: when `Some`, sets the actor's presented handle exactly
+        /// as a real `Connect{display_handle}` would, so a test can assert echo
+        /// tagging under the persisted name.
+        display_handle: Option<String>,
+        /// Round-6 parity: persisted circles to silently re-join post-attach,
+        /// driving the SAME `handle_join_circle` path the real connect runs.
+        rejoin_circles: Vec<(u64, String)>,
     },
 }
 
@@ -175,7 +204,12 @@ impl NetHandle {
     }
 
     /// Queue a command for the actor (non-blocking). Fails only if the actor
-    /// stopped; the UI treats that as "offline" and never panics.
+    /// stopped; the UI treats that as "offline" and never panics. The `Err` returns
+    /// the bounced command (tokio mpsc convention); callers fire-and-forget it, but
+    /// the enum is large enough (the `Connect` rejoin set, the test `AttachSession`)
+    /// that `result_large_err` flags it — and boxing a never-inspected payload buys
+    /// nothing here.
+    #[allow(clippy::result_large_err)]
     pub fn send(&self, cmd: NetCommand) -> Result<(), NetCommand> {
         self.cmd_tx.send(cmd).map_err(|e| e.0)
     }
@@ -264,7 +298,19 @@ impl Actor {
     /// Open a connection and keep the live session, then auto-join the default
     /// room. Mirrors `daemonseed_tui::net::Actor::handle_connect`: ephemeral
     /// identity, trusted-mode upsert, `connect_session` → `AppSession::open`.
-    async fn handle_connect(&mut self, server_id: &str, address: &str) {
+    async fn handle_connect(
+        &mut self,
+        server_id: &str,
+        address: &str,
+        display_handle: Option<String>,
+        rejoin_circles: Vec<(u64, String)>,
+    ) {
+        // Round 6: present under the persisted stable handle when unlocked from a
+        // profile. The connection proof below stays ephemeral (D8) — only the
+        // display name is persistent.
+        if let Some(handle) = display_handle {
+            self.my_handle = handle;
+        }
         let identity = match ClientIdentity::ephemeral() {
             Ok(i) => i,
             Err(e) => {
@@ -309,6 +355,14 @@ impl Actor {
                     // failure here is non-fatal — it surfaces as an Error; the
                     // connection itself is up.
                     self.join_room(DEFAULT_ROOM).await;
+                    // Round 6: silently re-join persisted circles now that the
+                    // session is live. Each re-derives its key from the stored
+                    // phrase (never a persisted key) through the SAME path a fresh
+                    // user-driven join takes; a per-circle failure surfaces as a
+                    // CircleError and never aborts the others or the connect.
+                    for (circle_id, phrase) in rejoin_circles {
+                        self.handle_join_circle(circle_id, &phrase).await;
+                    }
                 }
                 Err(e) => {
                     self.emit(NetEvent::ConnectFailed {
@@ -329,7 +383,17 @@ impl Actor {
     /// (post-`open` send signs under a fresh ephemeral identity below — but the
     /// test path supplies one explicitly via the same flow as the real connect).
     #[cfg(test)]
-    async fn handle_attach(&mut self, session: AppSession, server_id: String) {
+    async fn handle_attach(
+        &mut self,
+        session: AppSession,
+        server_id: String,
+        display_handle: Option<String>,
+        rejoin_circles: Vec<(u64, String)>,
+    ) {
+        // Round-6 parity: present under the persisted handle if supplied.
+        if let Some(handle) = display_handle {
+            self.my_handle = handle;
+        }
         // A test needs a signing identity to seal room posts, exactly as a real
         // connect retains one. Generate an ephemeral one here so the AttachSession
         // path is faithful to the post-`open` Send path.
@@ -346,6 +410,10 @@ impl Actor {
         self.emit(NetEvent::Connected {
             server_handle: "attached#000000000000".to_owned(),
         });
+        // Round-6 parity: silently re-join persisted circles via the real path.
+        for (circle_id, phrase) in rejoin_circles {
+            self.handle_join_circle(circle_id, &phrase).await;
+        }
     }
 
     /// Derive the room key + rendezvous address, subscribe, spawn the inbound
@@ -636,8 +704,15 @@ async fn net_actor(
     };
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
-            NetCommand::Connect { server_id, address } => {
-                actor.handle_connect(&server_id, &address).await
+            NetCommand::Connect {
+                server_id,
+                address,
+                display_handle,
+                rejoin_circles,
+            } => {
+                actor
+                    .handle_connect(&server_id, &address, display_handle, rejoin_circles)
+                    .await
             }
             NetCommand::JoinRoom { room } => actor.join_room(&room).await,
             NetCommand::SendRoom { text } => actor.handle_send_room(&text).await,
@@ -648,8 +723,15 @@ async fn net_actor(
                 actor.handle_send_circle(circle_id, &text).await
             }
             #[cfg(test)]
-            NetCommand::AttachSession { session, server_id } => {
-                actor.handle_attach(session, server_id).await
+            NetCommand::AttachSession {
+                session,
+                server_id,
+                display_handle,
+                rejoin_circles,
+            } => {
+                actor
+                    .handle_attach(session, server_id, display_handle, rejoin_circles)
+                    .await
             }
         }
     }
@@ -926,12 +1008,16 @@ mod tests {
                 .send(NetCommand::AttachSession {
                     session: sess_a,
                     server_id: SERVER_ID.to_owned(),
+                    display_handle: None,
+                    rejoin_circles: Vec::new(),
                 })
                 .ok();
             b.cmd_tx
                 .send(NetCommand::AttachSession {
                     session: sess_b,
                     server_id: SERVER_ID.to_owned(),
+                    display_handle: None,
+                    rejoin_circles: Vec::new(),
                 })
                 .ok();
 
@@ -1233,12 +1319,16 @@ mod tests {
                 .send(NetCommand::AttachSession {
                     session: sess_a,
                     server_id: SERVER_ID.to_owned(),
+                    display_handle: None,
+                    rejoin_circles: Vec::new(),
                 })
                 .ok();
             b.cmd_tx
                 .send(NetCommand::AttachSession {
                     session: sess_b,
                     server_id: SERVER_ID.to_owned(),
+                    display_handle: None,
+                    rejoin_circles: Vec::new(),
                 })
                 .ok();
 
@@ -1308,6 +1398,86 @@ mod tests {
             open_message(&outsider, &sealed).is_err(),
             "a non-member (wrong circle key) must not decrypt the circle frame"
         );
+    }
+
+    /// Round 6 (persistent identity): a silently RE-JOINED circle (supplied as a
+    /// persisted `(circle_id, phrase)` at attach time, NOT via an explicit
+    /// JoinCircle command) is live, and the member presents under the PERSISTED
+    /// display handle. A attaches with `display_handle = "alice#stable"` and the
+    /// circle in `rejoin_circles`; B joins the same circle the ordinary way; A
+    /// sends. B must receive the message attributed to the persisted handle —
+    /// proving both that the rejoin subscribed A and that the persisted handle is
+    /// what travels on the wire.
+    #[test]
+    fn persisted_circle_rejoins_and_presents_stable_handle() {
+        let _ = oxicrypt_module::initialize();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let registry = CotRegistry::new();
+            let (a_client_io, a_server_io) = tokio::io::duplex(64 * 1024);
+            let (b_client_io, b_server_io) = tokio::io::duplex(64 * 1024);
+            let _srv_a = spawn_relay(a_server_io, registry.clone());
+            let _srv_b = spawn_relay(b_server_io, registry.clone());
+
+            let sess_a = AppSession::open(a_client_io).await.expect("A session");
+            let sess_b = AppSession::open(b_client_io).await.expect("B session");
+
+            let mut a = spawn_local_actor();
+            let mut b = spawn_local_actor();
+
+            // B joins the circle the ordinary way (explicit JoinCircle) and waits
+            // for the relay to register the rendezvous.
+            b.cmd_tx
+                .send(NetCommand::AttachSession {
+                    session: sess_b,
+                    server_id: SERVER_ID.to_owned(),
+                    display_handle: None,
+                    rejoin_circles: Vec::new(),
+                })
+                .ok();
+            b.cmd_tx
+                .send(NetCommand::JoinCircle {
+                    circle_id: 7,
+                    phrase: CIRCLE_PHRASE.to_owned(),
+                })
+                .ok();
+            wait_registry(&registry, 1).await;
+
+            // A attaches with a PERSISTED handle and the circle in rejoin_circles —
+            // no explicit JoinCircle command. The attach path must subscribe it.
+            a.cmd_tx
+                .send(NetCommand::AttachSession {
+                    session: sess_a,
+                    server_id: SERVER_ID.to_owned(),
+                    display_handle: Some("alice#stable".to_owned()),
+                    rejoin_circles: vec![(3, CIRCLE_PHRASE.to_owned())],
+                })
+                .ok();
+            wait_for_circle_joined(&mut a.evt_rx).await;
+
+            a.cmd_tx
+                .send(NetCommand::SendCircle {
+                    circle_id: 3,
+                    text: "rejoined and still me".to_owned(),
+                })
+                .ok();
+
+            // B receives the message attributed to A's PERSISTED handle.
+            let got = wait_for_circle_message(&mut b.evt_rx).await;
+            assert_eq!(
+                got,
+                Some((
+                    7u64,
+                    "alice#stable".to_owned(),
+                    "rejoined and still me".to_owned()
+                )),
+                "a silently re-joined circle delivers under the persisted display handle"
+            );
+        });
     }
 
     // ── Live fra1 circle round-trip (ignored; env-gated) ─────────────────────
