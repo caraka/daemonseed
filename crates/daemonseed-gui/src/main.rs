@@ -1452,6 +1452,23 @@ fn main() {
 
     #[cfg(feature = "desktop")]
     if !offscreen {
+        // Slint's winit backend opens a zbus connection on THIS (main) thread to watch
+        // the xdg Settings portal (dark-mode / accent — `spawn_xdg_settings_watcher`).
+        // zbus is forced onto its *tokio* executor here: the Shares-tab folder picker
+        // pulls `rfd` → `ashpd`, which depends on `zbus` with its `tokio` default, and
+        // Cargo feature-unification applies that to Slint's `zbus` too. A tokio-executor
+        // zbus connect calls `spawn_blocking`, which panics ("there is no reactor
+        // running") unless the calling thread has an ambient tokio runtime. The event
+        // loop blocks the main thread, so a current-thread runtime can't drive zbus's
+        // tasks — enter a MULTI-thread runtime for the loop's lifetime so its worker +
+        // blocking pools service Slint's settings-watcher connection. (Without this the
+        // windowed app panics at startup the moment rfd is in the dependency graph.)
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build main-thread tokio runtime for Slint's zbus settings watcher");
+        let _rt_guard = rt.enter();
         let (ui, state, net, browser) = build_ui();
         wire_auth(
             &ui,
