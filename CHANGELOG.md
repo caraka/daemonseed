@@ -23,6 +23,25 @@ In-progress and next-milestone planning is tracked in the project lead's vault
 manifest (not committed). The next entry is added here at the moment a release
 is tagged, as part of the doc-sync ritual in `AGENTS.md`.
 
+## [0.25.0] — GUI persistent identity: first-start + Unlock + silent circle rejoin
+
+The GUI gains an identity that survives a relaunch — the blocker to a multi-session
+tester felt-test.
+
+- **First-start wizard:** passphrase (strength-gated) → 24-word recovery phrase →
+  streamlined round-trip confirm → display name. Reuses the core `FirstStart` state
+  machine and writes a sealed profile; no new crypto.
+- **Daily-login Unlock:** opens the at-rest blob under the passphrase (wrong → "Wrong
+  passphrase"), restores the stable display handle, and **silently re-joins** the
+  circles recorded in the blob.
+- **What persists:** the display name + circle *phrases* (the key is re-derived on
+  rejoin, never stored). No message history is written — the no-client-history
+  property holds. The connection proof stays ephemeral every connect (mirrors the
+  TUI); persistence is a stable *display* identity, not a persisted connection key.
+- **Crash fix carried in:** auth screens toggle with `visible:` (never `if`), so a
+  screen change hides rather than destroys the focused field — avoiding a
+  `partial_renderer` "RefCell already borrowed" teardown race.
+
 ## [0.24.0] — GUI affordances: persistent New/Join, command palette, edit-crash fix
 
 Keyboard-first and discoverability polish on the GUI alpha, plus a crash fix.
