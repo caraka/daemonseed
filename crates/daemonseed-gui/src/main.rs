@@ -25,6 +25,7 @@
 
 mod net;
 mod profile;
+mod share_browser;
 mod state;
 
 slint::include_modules!();
@@ -40,6 +41,7 @@ use daemonseed_core::profile::resolve::{ResolveArgs, ResolvedProfileRoot, resolv
 use daemonseed_core::storage::seeds;
 use net::{NetCommand, NetEvent, NetHandle};
 use profile::Profile;
+use share_browser::{ManifestRow, NodeKind, ShareBrowser};
 use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType, Rgb565Pixel};
 use slint::platform::{Platform, PlatformError, WindowAdapter};
 use slint::{ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel};
@@ -272,7 +274,14 @@ fn materialize_and_select(
 /// (rail switch, composer send, and the round-4 circle-plumbing surfaces).
 /// Returns the window AND the shared state so the caller can wire real networking
 /// and drive the offscreen verification flags.
-fn build_ui() -> (AppWindow, Rc<RefCell<GuiState>>, Rc<RefCell<NetHandle>>) {
+type BuiltUi = (
+    AppWindow,
+    Rc<RefCell<GuiState>>,
+    Rc<RefCell<NetHandle>>,
+    Rc<RefCell<ShareBrowser>>,
+);
+
+fn build_ui() -> BuiltUi {
     let ui = AppWindow::new().expect("create AppWindow");
     // Round-4 seed: Lobby only (empty-state for circles; Lobby pinned + real).
     let state = Rc::new(RefCell::new(GuiState::lobby_only()));
@@ -283,6 +292,12 @@ fn build_ui() -> (AppWindow, Rc<RefCell<GuiState>>, Rc<RefCell<NetHandle>>) {
     let net = Rc::new(RefCell::new(
         NetHandle::new().expect("build daemonseed-gui net actor"),
     ));
+
+    // The public-share browse-tree model (Shares tab). Slint-free; the net drain
+    // folds `SharesSnapshot`/`FetchManifest` into it and `apply_share_rows` pushes the
+    // flattened rows to the UI. Held here so the callbacks + the drain/poll timer all
+    // share the one instance.
+    let browser = Rc::new(RefCell::new(ShareBrowser::new()));
 
     // Rail model + empty-state flag.
     rebuild_rail(&ui, &state.borrow());
@@ -479,24 +494,38 @@ fn build_ui() -> (AppWindow, Rc<RefCell<GuiState>>, Rc<RefCell<NetHandle>>) {
         apply_view(&ui, st.current(), active as i32);
     }
 
-    let files = vec![
-        FileData {
-            name: "reports/q3-summary.pdf".into(),
-            size: "1.2 MB".into(),
-            checked: true,
-        },
-        FileData {
-            name: "reports/figures/chart.png".into(),
-            size: "340 KB".into(),
-            checked: true,
-        },
-        FileData {
-            name: "raw/dataset.csv".into(),
-            size: "18 MB".into(),
-            checked: false,
-        },
-    ];
-    ui.set_files(ModelRc::from(Rc::new(VecModel::from(files))));
+    // ── Shares tab: browse-tree callbacks (commit 1) ──
+    // Refresh re-lists the relay catalog (Rust reconciles by share_id so open folders
+    // survive); opening the tab fires the same refresh. Toggling a row expands or
+    // collapses it — a share's first expand lazily fetches its manifest preview.
+    ui.on_refresh_shares({
+        let net = net.clone();
+        move || {
+            let _ = net.borrow().send(NetCommand::RefreshShares);
+        }
+    });
+    ui.on_shares_tab_opened({
+        let net = net.clone();
+        move || {
+            let _ = net.borrow().send(NetCommand::RefreshShares);
+        }
+    });
+    ui.on_toggle_share_node({
+        let weak = ui.as_weak();
+        let net = net.clone();
+        let browser = browser.clone();
+        move |id| {
+            let ui = weak.unwrap();
+            let outcome = browser.borrow_mut().toggle(id as u64);
+            if let Some(req) = outcome.needs_fetch {
+                let _ = net.borrow().send(NetCommand::FetchShare {
+                    share_id: req.share_id,
+                    name: req.name,
+                });
+            }
+            apply_share_rows(&ui, &browser.borrow());
+        }
+    });
 
     // Action registry: one list, two surfaces (this palette + the rail empty-state
     // mouse-home). New circle / Join a circle now drive the real overlays.
@@ -514,14 +543,39 @@ fn build_ui() -> (AppWindow, Rc<RefCell<GuiState>>, Rc<RefCell<NetHandle>>) {
             shortcut: "Ctrl+J".into(),
         },
         ActionData {
-            // Fetch is not wired yet — no shortcut shown (avoids implying a binding).
+            // Opens the Shares tab + refreshes the catalog (no keybinding yet).
             label: "Fetch a share".into(),
             shortcut: "".into(),
         },
     ];
     ui.set_actions(ModelRc::from(Rc::new(VecModel::from(actions))));
 
-    (ui, state, net)
+    (ui, state, net, browser)
+}
+
+/// Flatten the [`ShareBrowser`] tree into the Slint `[ShareRow]` model and push it to
+/// the Shares tab. Called after every refresh / expand / manifest-load.
+fn apply_share_rows(ui: &AppWindow, browser: &ShareBrowser) {
+    let rows: Vec<ShareRow> = browser
+        .rows()
+        .into_iter()
+        .map(|r| ShareRow {
+            id: r.id as i32,
+            depth: r.depth as i32,
+            label: SharedString::from(r.label),
+            size: SharedString::from(r.size),
+            kind: match r.kind {
+                NodeKind::Share => 0,
+                NodeKind::Folder => 1,
+                NodeKind::File => 2,
+            },
+            expandable: r.expandable,
+            expanded: r.expanded,
+            mine: r.mine,
+            loading: r.loading,
+        })
+        .collect();
+    ui.set_share_rows(ModelRc::from(Rc::new(VecModel::from(rows))));
 }
 
 /// Everything the running app must keep alive for its whole lifetime. **If this
@@ -543,12 +597,18 @@ fn start_drain(
     ui: &AppWindow,
     state: Rc<RefCell<GuiState>>,
     net: Rc<RefCell<NetHandle>>,
+    browser: Rc<RefCell<ShareBrowser>>,
 ) -> LiveNet {
     let timer = Timer::default();
     {
         let weak = ui.as_weak();
         let state = state.clone();
         let net = net.clone();
+        let browser = browser.clone();
+        // Comparative-real-time poll counter (caraka 2026-06-16): the share catalog
+        // has no relay push (`ListPublicShares` is unary), so liveness = re-list on a
+        // cadence. ~90 × 33ms ≈ 3s.
+        let mut poll_tick: u32 = 0;
         timer.start(TimerMode::Repeated, Duration::from_millis(33), move || {
             let Some(ui) = weak.upgrade() else { return };
             let mut n = 0u32;
@@ -562,10 +622,20 @@ fn start_drain(
                         break;
                     }
                 };
-                apply_net_event(&ui, &state, evt);
+                apply_net_event(&ui, &state, &browser, evt);
                 n += 1;
                 if n > 256 {
                     break;
+                }
+            }
+            // Auto-poll the catalog only while the Shares tab is open AND connected —
+            // off-tab / offline is silent (no chatter, no battery cost). The reconcile
+            // in `set_shares` keeps the user's open folders across each refresh.
+            poll_tick = poll_tick.wrapping_add(1);
+            if poll_tick >= 90 {
+                poll_tick = 0;
+                if ui.get_active_tab() == 1 && ui.get_connected() {
+                    let _ = net.borrow().send(NetCommand::RefreshShares);
                 }
             }
         });
@@ -610,8 +680,13 @@ fn connect_now(
     }
 }
 
-/// Apply one [`NetEvent`] to the UI + the Lobby's RAM state.
-fn apply_net_event(ui: &AppWindow, state: &Rc<RefCell<GuiState>>, evt: NetEvent) {
+/// Apply one [`NetEvent`] to the UI + the Lobby's RAM state + the share browse tree.
+fn apply_net_event(
+    ui: &AppWindow,
+    state: &Rc<RefCell<GuiState>>,
+    browser: &Rc<RefCell<ShareBrowser>>,
+    evt: NetEvent,
+) {
     match evt {
         NetEvent::Connected { server_handle } => {
             ui.set_connection_status(SharedString::from(format!("connected · {server_handle}")));
@@ -675,13 +750,57 @@ fn apply_net_event(ui: &AppWindow, state: &Rc<RefCell<GuiState>>, evt: NetEvent)
             let _ = circle_id;
             ui.set_connection_status(SharedString::from(format!("circle: {reason}")));
         }
-        // ── Shares (net path built; UI wiring is the attended STOP-AND-LEAVE) ──
-        // The publish/serve/fetch net path exists in `net.rs` and is headless-proven
-        // by the in-process publish→fetch round-trip; binding the Shares tab's
-        // buttons to these commands/events is the tester-feedback surface that needs
-        // caraka's eyes, so these events are intentionally not rendered yet. The
-        // fields are bound (not `..`) so the data path stays a compile-checked
-        // contract for the attended wiring to consume.
+        // ── Shares: browse tree (commit 1) ──
+        // SharesSnapshot + FetchManifest drive the Shares-tab tree. Publish events and
+        // fetch progress/complete stay stubbed — publish is commit 3 (overlay), the
+        // download progress meter is commit 2. The fields stay bound (not `..`) so the
+        // data path is a compile-checked contract for those commits to consume.
+        NetEvent::SharesSnapshot { shares } => {
+            {
+                let mut b = browser.borrow_mut();
+                // commit 1: no `mine` tagging — the unlocked wire handle is wired in
+                // with publish (commit 3); for now nothing is tagged "you".
+                b.set_shares(
+                    shares.iter().map(|s| {
+                        (
+                            s.share_id.as_str(),
+                            s.name.as_str(),
+                            s.sharer_handle.as_str(),
+                        )
+                    }),
+                    None,
+                );
+            }
+            apply_share_rows(ui, &browser.borrow());
+            ui.set_share_status(SharedString::from("")); // clear any prior error
+        }
+        NetEvent::SharesError { message } => {
+            ui.set_share_status(SharedString::from(message));
+        }
+        NetEvent::FetchManifest {
+            share_id,
+            name,
+            entries,
+        } => {
+            let _ = name; // the tree already holds the share's name from the listing
+            {
+                // The manifest's order is the share's canonical file order — the index
+                // commit 2's `ConfirmFetch { selected }` will key on.
+                let rows: Vec<ManifestRow> = entries
+                    .iter()
+                    .enumerate()
+                    .map(|(index, e)| ManifestRow {
+                        rel_path: e.rel_path.clone(),
+                        size: e.size,
+                        index,
+                    })
+                    .collect();
+                browser.borrow_mut().load_manifest(&share_id, &rows);
+            }
+            apply_share_rows(ui, &browser.borrow());
+        }
+        // Publish (commit 3) + download progress/complete (commit 2): net path proven,
+        // UI deferred. Fields bound to keep the contract compile-checked.
         NetEvent::PublishStarted {
             share_id,
             name,
@@ -694,19 +813,6 @@ fn apply_net_event(ui: &AppWindow, state: &Rc<RefCell<GuiState>>, evt: NetEvent)
         }
         NetEvent::PublishError { message } => {
             let _ = message;
-        }
-        NetEvent::SharesSnapshot { shares } => {
-            let _ = shares;
-        }
-        NetEvent::SharesError { message } => {
-            let _ = message;
-        }
-        NetEvent::FetchManifest {
-            share_id,
-            name,
-            entries,
-        } => {
-            let _ = (share_id, name, entries);
         }
         NetEvent::FetchProgress {
             total_chunks,
@@ -722,8 +828,11 @@ fn apply_net_event(ui: &AppWindow, state: &Rc<RefCell<GuiState>>, evt: NetEvent)
         } => {
             let _ = (share_id, files_written, bytes_written);
         }
+        // A failed preview (FetchShare) surfaces on the status line. The variant has no
+        // share_id, so the expanded share's "loading…" can't be cleared yet — a known
+        // commit-2 follow-up (add share_id to FetchError when the meter lands).
         NetEvent::FetchError { message } => {
-            let _ = message;
+            ui.set_share_status(SharedString::from(format!("preview failed: {message}")));
         }
     }
 }
@@ -1115,6 +1224,10 @@ fn main() {
     // the rail shows the relay-derived adj-noun label instead of the `#<hex>`
     // placeholder (the live path runs on the CircleJoined event, which needs a relay).
     let show_joined_label = args.iter().any(|a| a == "--joined-label");
+    // Offscreen fixture render of the populated Shares-tab browse tree (no relay):
+    // injects a synthetic catalog + one expanded/previewed share so the PNG shows the
+    // tree without a live connection.
+    let show_shares = args.iter().any(|a| a == "--show-shares");
     // Round-6 routing: `--portable` resolves the profile under CWD (else XDG).
     // `--first-start [step]` / `--unlock` are OFFSCREEN-only render flags for the
     // new auth screens (windowed routing always uses `resolve`). `portable` feeds
@@ -1143,6 +1256,7 @@ fn main() {
         || show_join
         || show_new
         || show_joined_label
+        || show_shares
         || first_start_flag
         || unlock_flag
         || self_check_requested;
@@ -1159,7 +1273,7 @@ fn main() {
 
     #[cfg(feature = "desktop")]
     if !offscreen {
-        let (ui, state, net) = build_ui();
+        let (ui, state, net, browser) = build_ui();
         wire_auth(
             &ui,
             &state,
@@ -1170,7 +1284,7 @@ fn main() {
         );
         // The drain timer runs for the whole app life; the Connect is deferred to
         // the auth-success callbacks (no connecting under the auth gate).
-        let _live = start_drain(&ui, state, net);
+        let _live = start_drain(&ui, state, net, browser);
         route_startup(&ui, &profile_root, portable);
         ui.run().expect("run windowed");
         return;
@@ -1183,7 +1297,7 @@ fn main() {
         window: window.clone(),
     }))
     .expect("set_platform");
-    let (ui, state, net) = build_ui();
+    let (ui, state, net, browser) = build_ui();
     wire_auth(
         &ui,
         &state,
@@ -1213,9 +1327,60 @@ fn main() {
         }
     } else if unlock_flag {
         ui.set_screen(SharedString::from("unlock"));
+    } else if show_shares {
+        // Populated Shares-tab tree, fixture-driven (no relay): a synthetic catalog +
+        // one expanded/previewed share (its `reports` folder opened) so the PNG shows
+        // shares, folders, files, depth, sizes, and disclosure carets.
+        ui.set_active_tab(1);
+        {
+            let mut b = browser.borrow_mut();
+            b.set_shares(
+                [
+                    ("id-quiet", "quiet-harbor", "harbor#aa"),
+                    ("id-amber", "amber-lantern", "lantern#bb"),
+                ],
+                None,
+            );
+            let quiet = b.rows()[0].id;
+            b.toggle(quiet); // expand (ignore the would-be FetchShare; we load directly)
+            b.load_manifest(
+                "id-quiet",
+                &[
+                    ManifestRow {
+                        rel_path: "reports/q3-summary.pdf".into(),
+                        size: 1_258_291,
+                        index: 0,
+                    },
+                    ManifestRow {
+                        rel_path: "reports/figures/chart.png".into(),
+                        size: 348_160,
+                        index: 1,
+                    },
+                    ManifestRow {
+                        rel_path: "raw/dataset.csv".into(),
+                        size: 18_874_368,
+                        index: 2,
+                    },
+                    ManifestRow {
+                        rel_path: "README.md".into(),
+                        size: 2048,
+                        index: 3,
+                    },
+                ],
+            );
+            if let Some(reports) = b.rows().iter().find(|r| r.label == "reports").map(|r| r.id) {
+                b.toggle(reports);
+            }
+        }
+        apply_share_rows(&ui, &browser.borrow());
     } else {
         // Main shell offscreen: connect (renders connection-status) + drive flags.
-        _live = Some(start_drain(&ui, state.clone(), net.clone()));
+        _live = Some(start_drain(
+            &ui,
+            state.clone(),
+            net.clone(),
+            browser.clone(),
+        ));
         connect_now(&ui, &state, &net, &crypto);
         if let Some(phrase) = materialize.as_deref() {
             materialize_and_select(&ui, &state, &net, phrase);

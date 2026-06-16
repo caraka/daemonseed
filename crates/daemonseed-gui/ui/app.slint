@@ -25,10 +25,19 @@ struct MsgData {
     mine: bool,
 }
 
-struct FileData {
-    name: string,
+// One flattened row of the public-share browse tree (Shares tab). `kind`: 0 share
+// (depth-0 root), 1 folder, 2 file. Built by Rust from `share_browser::Row`; the
+// model is replaced on every refresh, so the `for` re-renders — no `if`-teardown.
+struct ShareRow {
+    id: int,
+    depth: int,
+    label: string,
     size: string,
-    checked: bool,
+    kind: int,
+    expandable: bool,
+    expanded: bool,
+    mine: bool,
+    loading: bool,
 }
 
 struct ActionData {
@@ -99,22 +108,48 @@ component MsgBubble inherits Rectangle {
     }
 }
 
-component FileRow inherits Rectangle {
-    in property <string> name;
-    in property <string> size;
-    in property <bool> checked: true;
-    height: 32px;
+// One row of the public-share browse tree: indented by depth, a disclosure caret
+// for expandable rows (share / non-empty folder), the node's own segment, and — on
+// the right — a "you" tag (your own share), a quiet "loading…" while a preview is in
+// flight, or a file's size. The whole row toggles when expandable; a file is inert
+// here (right-click Download is commit 2). Calm/grayscale per the brief: one teal cue
+// (the "you" tag), folders carry a trailing slash, no icons.
+component ShareTreeRow inherits Rectangle {
+    in property <ShareRow> node;
+    callback toggled(int);
+    height: 30px;
+    background: touch.has-hover ? #101113 : transparent;
+    touch := TouchArea {
+        clicked => { if (root.node.expandable) { root.toggled(root.node.id); } }
+    }
     HorizontalLayout {
-        padding-left: 6px; padding-right: 6px; spacing: 11px;
-        Rectangle {
-            width: 18px; height: 18px; y: 7px; border-radius: 4px;
-            background: root.checked ? #aeb6c2 : transparent;
-            border-width: 1px; border-color: #ffffff24;
-            Text { text: root.checked ? "✓" : ""; color: #0d0e10; font-size: 12px; horizontal-alignment: center; vertical-alignment: center; }
+        padding-left: 10px + root.node.depth * 18px;
+        padding-right: 14px; spacing: 8px;
+        // disclosure caret (blank for a file / empty folder). ASCII ">" / "v": the
+        // bundled software-renderer font has no geometric-shape glyphs (▶/▾ render
+        // blank); a proper chevron is a font-embedding polish for later.
+        Text {
+            width: 12px;
+            text: root.node.expandable ? (root.node.expanded ? "v" : ">") : "";
+            color: #8b93a1; font-size: 12px; vertical-alignment: center;
         }
-        Text { text: root.name; color: root.checked ? #cfd5dd : #6b7280; font-size: 13px; vertical-alignment: center; }
+        Text {
+            text: root.node.kind == 1 ? root.node.label + "/" : root.node.label;
+            color: root.node.kind == 0 ? #e4e8ee : root.node.kind == 1 ? #cfd5dd : #aeb6c2;
+            font-size: root.node.kind == 0 ? 14px : 13px;
+            vertical-alignment: center;
+        }
+        // "you" — the one teal cue, computed (never an `if`) so it can't mutate the
+        // item tree; empty string when it does not apply.
+        Text {
+            text: (root.node.kind == 0 && root.node.mine) ? "you" : "";
+            color: #6fb3a4; font-size: 11px; vertical-alignment: center;
+        }
         Rectangle { }
-        Text { text: root.size; color: #5b6472; font-size: 12px; vertical-alignment: center; }
+        Text {
+            text: root.node.loading ? "loading…" : root.node.size;
+            color: #5b6472; font-size: 12px; vertical-alignment: center;
+        }
     }
 }
 
@@ -158,7 +193,14 @@ export component AppWindow inherits Window {
     in property <string> header-name;
     in property <string> header-sub;
     in property <[MsgData]> messages;
-    in property <[FileData]> files;
+
+    // ── Shares tab (public-share browse tree) ──
+    // `share-rows` is the flattened, render-ready tree (Rust rebuilds it on refresh /
+    // expand / manifest-load). `share-status` is a quiet right-of-title line (errors,
+    // counts). `shares-empty-hint` is the centered empty-state copy.
+    in property <[ShareRow]> share-rows;
+    in property <string> share-status;
+    in property <string> shares-empty-hint: "No shares yet — Refresh to see what daemons are sharing.";
     in-out property <string> draft;           // live composer text, read by Rust on switch
     in-out property <length> scroll-y: 0px;   // Flickable viewport-y (negative when scrolled)
     in property <bool> sheet-open: false;
@@ -183,6 +225,15 @@ export component AppWindow inherits Window {
     // Composer Send (or Enter) — carries the draft. Lobby → real sealed SendRoom;
     // a materialized circle → the Round-5 SendCircle seam (local-echo stub).
     callback send-message(string);
+
+    // Shares-tab callbacks (commit 1: browse). `refresh-shares` re-lists the relay
+    // catalog (Rust reconciles by share_id, preserving open folders). `toggle-share-
+    // node(id)` expands/collapses a row — Rust lazily fetches a share's manifest on
+    // first expand. `shares-tab-opened` fires an immediate refresh when the tab is
+    // selected (the ~3s auto-poll while it stays open is driven Rust-side).
+    callback refresh-shares();
+    callback toggle-share-node(int);
+    callback shares-tab-opened();
 
     // Round-4 callbacks. `open-*` raise the overlays from EITHER surface (rail
     // empty-state or palette — action registry → two surfaces). `join-phrase-edited`
@@ -365,7 +416,7 @@ export component AppWindow inherits Window {
                     HorizontalLayout {
                         padding-left: 16px; spacing: 20px;
                         TabLabel { label: "Chat"; active: root.active-tab == 0; clicked => { root.active-tab = 0; } }
-                        TabLabel { label: "Shares"; active: root.active-tab == 1; clicked => { root.active-tab = 1; } }
+                        TabLabel { label: "Shares"; active: root.active-tab == 1; clicked => { root.active-tab = 1; root.shares-tab-opened(); } }
                         TabLabel { label: "Circle shares"; active: root.active-tab == 2; clicked => { root.active-tab = 2; } }
                         Rectangle { }
                     }
@@ -391,32 +442,50 @@ export component AppWindow inherits Window {
                                 }
                             }
 
-                            // SHARES (public — the M16 fetch path)
+                            // SHARES — public-share browse tree (commit 1). The pane
+                            // IS the file browser (demonsaw-4.20 reference): a header
+                            // row (title · status · Refresh) over a full-height,
+                            // scrollable, OS-style tree. Each relay share is a root
+                            // node; expanding lazily previews its files. Download
+                            // (right-click) + publish (overlay) are commits 2 & 3.
                             if root.active-tab == 1 : VerticalLayout {
-                                padding: 16px; spacing: 12px; alignment: start;
+                                // No `alignment: start` — that packs children to their
+                                // preferred height and would zero out the tree's
+                                // `vertical-stretch`. Default fill lets the tree expand.
+                                padding: 14px; spacing: 10px;
                                 HorizontalLayout {
-                                    Text { text: "Shares · preview before fetch"; color: #5b6472; font-size: 12px; vertical-alignment: center; }
+                                    height: 38px;
+                                    spacing: 10px;
+                                    Text { text: "Shares"; color: #e4e8ee; font-size: 15px; vertical-alignment: center; }
+                                    Text { text: root.share-status; color: #5b6472; font-size: 12px; vertical-alignment: center; }
                                     Rectangle { }
+                                    PillButton { label: "Refresh"; w: 96px; clicked => { root.refresh-shares(); } }
                                 }
+                                // the tree fills the rest of the pane
                                 Rectangle {
-                                    border-radius: 10px; background: #101113; border-width: 1px; border-color: #ffffff10;
-                                    VerticalLayout {
-                                        padding: 12px; spacing: 6px;
-                                        HorizontalLayout {
-                                            spacing: 8px;
-                                            Text { text: "quiet-harbor"; color: #d6dae1; font-size: 14px; vertical-alignment: center; }
-                                            Text { text: "3 files"; color: #5b6472; font-size: 12px; vertical-alignment: center; }
-                                            Rectangle { }
-                                            SealedPill { }
+                                    vertical-stretch: 1;
+                                    border-radius: 10px; background: #0b0c0e; border-width: 1px; border-color: #ffffff10;
+                                    Flickable {
+                                        width: 100%; height: 100%;
+                                        viewport-width: self.width;
+                                        viewport-height: root.share-rows.length * 30px + 12px;
+                                        VerticalLayout {
+                                            padding: 6px; alignment: start;
+                                            for r in root.share-rows : ShareTreeRow {
+                                                node: r;
+                                                toggled(id) => { root.toggle-share-node(id); }
+                                            }
                                         }
-                                        Rectangle { height: 1px; background: #ffffff10; }
-                                        for f in root.files : FileRow { name: f.name; size: f.size; checked: f.checked; }
                                     }
-                                }
-                                Rectangle { }
-                                HorizontalLayout {
-                                    Rectangle { }
-                                    PillButton { label: "Fetch selected"; primary: true; w: 130px; }
+                                    // empty-state — computed visibility (never an `if`),
+                                    // centered over the empty tree.
+                                    Text {
+                                        x: (parent.width - self.width) / 2;
+                                        y: (parent.height - self.height) / 2;
+                                        text: root.shares-empty-hint;
+                                        visible: root.share-rows.length == 0;
+                                        color: #5b6472; font-size: 13px; horizontal-alignment: center;
+                                    }
                                 }
                             }
 
@@ -507,10 +576,12 @@ export component AppWindow inherits Window {
                     clicked => {
                         root.palette-open = false;
                         // Action registry → real behavior. 0 = Lobby, 1 = New
-                        // circle, 2 = Join a circle; 3 (Fetch) just dismisses for now.
+                        // circle, 2 = Join a circle, 3 = Fetch a share (open the
+                        // Shares tab + refresh the catalog).
                         if (i == 0) { root.switch-circle(0); }
                         if (i == 1) { root.open-new(); }
                         if (i == 2) { root.open-join(); }
+                        if (i == 3) { root.active-tab = 1; root.shares-tab-opened(); }
                     }
                 }
                 HorizontalLayout { padding-left: 10px; spacing: 8px;
