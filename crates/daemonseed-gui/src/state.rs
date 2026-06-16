@@ -248,6 +248,49 @@ impl GuiState {
         Ok(self.circles.len() - 1)
     }
 
+    /// Apply a circle's relay rendezvous address once it is joined (ISC-C62): fill the
+    /// net contract's `rendezvous` slot and upgrade the display name from the pre-join
+    /// `#<12hex>` fingerprint placeholder to the relay-derived adj-noun label
+    /// ([`daemonseed_core::circle::default_circle_label`], the canonical home shared
+    /// with the TUI). Deterministic per address — a re-join shows the same label.
+    /// No-op for an unknown `circle_id` or the Lobby. Returns the rail index updated.
+    pub fn set_circle_rendezvous(
+        &mut self,
+        circle_id: u64,
+        asset_addr: AssetAddr,
+    ) -> Option<usize> {
+        let idx = self.index_of_circle_id(circle_id)?;
+        let label = daemonseed_core::circle::default_circle_label(&asset_addr);
+        let initial = label
+            .chars()
+            .next()
+            .map(|c| c.to_ascii_uppercase().to_string())
+            .unwrap_or_else(|| "●".to_owned());
+        let circle = &mut self.circles[idx];
+        if let Some(net) = circle.net.as_mut() {
+            net.rendezvous = Some(asset_addr);
+        }
+        circle.name = label;
+        circle.initial = initial;
+        Some(idx)
+    }
+
+    /// The client-local `#<12hex>` fingerprint of circle `idx`, derived on demand from
+    /// its retained phrase (ISC-C62 / Demonsaw handle-UX precedent — the hash is hidden
+    /// behind the friendly label and surfaced only on demand, e.g. hover/detail). `None`
+    /// for the Lobby (no net contract).
+    ///
+    /// `#[allow(dead_code)]`: the data path is in place + unit-tested, but the
+    /// hover/detail UI affordance that surfaces it is attended felt-polish (deferred),
+    /// so the binary does not call it yet — same convention as [`GuiState::len`].
+    #[allow(dead_code)]
+    pub fn circle_fingerprint_of(&self, idx: usize) -> Option<String> {
+        self.circles
+            .get(idx)
+            .and_then(|c| c.net.as_ref())
+            .map(|n| circle_fingerprint(&n.phrase))
+    }
+
     /// Index of the currently active circle.
     pub fn active(&self) -> usize {
         self.active
@@ -635,6 +678,44 @@ mod tests {
             .materialize_from_phrase(&phrase)
             .expect("materialize generated");
         assert!(st.metas()[idx].net.is_some());
+    }
+
+    #[test]
+    fn set_circle_rendezvous_swaps_to_friendly_label_and_keeps_fingerprint() {
+        let _ = oxicrypt_module::initialize();
+        let mut st = GuiState::lobby_only();
+        let phrase = generate_circle_phrase().expect("generate");
+        let idx = st.materialize_from_phrase(&phrase).expect("materialize");
+        let circle_id = st.metas()[idx].net.as_ref().unwrap().circle_id;
+        // Pre-join: the name is the #<12hex> fingerprint placeholder, equal to the
+        // on-demand fingerprint accessor.
+        assert!(st.metas()[idx].name.starts_with('#'));
+        let fp_before = st.circle_fingerprint_of(idx).unwrap();
+        assert_eq!(fp_before, st.metas()[idx].name);
+
+        // Post-join: applying the rendezvous swaps the name to the relay-derived
+        // adj-noun label and fills the rendezvous slot.
+        let addr = AssetAddr::from_bytes([5u8; daemonseed_core::cot::ASSET_ADDR_LEN]);
+        let updated = st
+            .set_circle_rendezvous(circle_id, addr)
+            .expect("known circle");
+        assert_eq!(updated, idx);
+        let want = daemonseed_core::circle::default_circle_label(&addr);
+        assert_eq!(st.metas()[idx].name, want);
+        assert!(!st.metas()[idx].name.starts_with('#'));
+        assert!(st.metas()[idx].net.as_ref().unwrap().rendezvous.is_some());
+        // The fingerprint stays reachable on demand (hash hidden, surfaced on demand).
+        assert_eq!(st.circle_fingerprint_of(idx).unwrap(), fp_before);
+    }
+
+    #[test]
+    fn set_circle_rendezvous_is_noop_for_unknown_circle() {
+        let _ = oxicrypt_module::initialize();
+        let mut st = GuiState::lobby_only();
+        let addr = AssetAddr::from_bytes([1u8; daemonseed_core::cot::ASSET_ADDR_LEN]);
+        assert!(st.set_circle_rendezvous(999, addr).is_none());
+        // The Lobby has no net contract → no fingerprint.
+        assert!(st.circle_fingerprint_of(0).is_none());
     }
 
     #[test]

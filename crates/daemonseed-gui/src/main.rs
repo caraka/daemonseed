@@ -635,10 +635,22 @@ fn apply_net_event(ui: &AppWindow, state: &Rc<RefCell<GuiState>>, evt: NetEvent)
                 apply_view(ui, st.current(), active as i32);
             }
         }
-        NetEvent::CircleJoined { circle_id } => {
-            // The circle is already in the rail (materialized locally); the
-            // subscription is now live. Nothing visual required — keep it quiet.
-            let _ = circle_id;
+        NetEvent::CircleJoined {
+            circle_id,
+            asset_addr,
+        } => {
+            // The circle is already in the rail (materialized locally) and its
+            // subscription is now live with a known relay rendezvous. Upgrade its
+            // pre-join `#<hex>` placeholder to the stable relay-derived adj-noun label
+            // and fill the net contract's rendezvous slot (ISC-C62), then refresh the
+            // rail (and the header if it is the active circle).
+            let mut st = state.borrow_mut();
+            if let Some(idx) = st.set_circle_rendezvous(circle_id, asset_addr) {
+                rebuild_rail(ui, &st);
+                if st.active() == idx {
+                    apply_view(ui, st.current(), idx as i32);
+                }
+            }
         }
         NetEvent::CircleMessage {
             circle_id,
@@ -1049,6 +1061,10 @@ fn main() {
     let self_check_requested = args.iter().any(|a| a == "--self-check");
     let show_join = args.iter().any(|a| a == "--show-join");
     let show_new = args.iter().any(|a| a == "--show-new");
+    // ISC-C62 proof: materialize a circle then apply a synthetic relay rendezvous so
+    // the rail shows the relay-derived adj-noun label instead of the `#<hex>`
+    // placeholder (the live path runs on the CircleJoined event, which needs a relay).
+    let show_joined_label = args.iter().any(|a| a == "--joined-label");
     // Round-6 routing: `--portable` resolves the profile under CWD (else XDG).
     // `--first-start [step]` / `--unlock` are OFFSCREEN-only render flags for the
     // new auth screens (windowed routing always uses `resolve`). `portable` feeds
@@ -1076,6 +1092,7 @@ fn main() {
         || materialize.is_some()
         || show_join
         || show_new
+        || show_joined_label
         || first_start_flag
         || unlock_flag
         || self_check_requested;
@@ -1152,6 +1169,25 @@ fn main() {
         connect_now(&ui, &state, &net, &crypto);
         if let Some(phrase) = materialize.as_deref() {
             materialize_and_select(&ui, &state, &net, phrase);
+        }
+        if show_joined_label {
+            // Materialize a circle, then simulate the post-join rendezvous so the rail
+            // shows the relay-derived adj-noun label (ISC-C62) — the offscreen analog
+            // of the CircleJoined handler.
+            let phrase = state::generate_circle_phrase().unwrap_or_default();
+            if materialize_and_select(&ui, &state, &net, &phrase) {
+                let cid = state.borrow().active_circle_id();
+                if let Some(cid) = cid {
+                    let addr = daemonseed_core::cot::AssetAddr::from_bytes(
+                        [0x5a; daemonseed_core::cot::ASSET_ADDR_LEN],
+                    );
+                    let mut st = state.borrow_mut();
+                    if let Some(idx) = st.set_circle_rendezvous(cid, addr) {
+                        rebuild_rail(&ui, &st);
+                        apply_view(&ui, st.current(), idx as i32);
+                    }
+                }
+            }
         }
         if show_join {
             ui.invoke_open_join();

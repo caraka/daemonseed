@@ -1196,7 +1196,7 @@ impl Actor {
         // default label, never from other members and never transmitted.
         let circle_id = self.next_circle_id;
         self.next_circle_id += 1;
-        let label = default_circle_label(&asset_addr);
+        let label = daemonseed_core::circle::default_circle_label(&asset_addr);
 
         // Outbound half: first frame names the asset (empty payload, not
         // relayed), then publishes flow. Send the naming frame before subscribe
@@ -2320,46 +2320,6 @@ async fn read_inbound(
     }
 }
 
-/// Build the default client-local label for a newly-joined circle (ISC-C62),
-/// deterministically from its rendezvous address. The address is itself a
-/// `SHA-384(cot_key ‖ server_id)` (ISC-S20), so a given circle on a given relay
-/// always yields the same default label — convenient for recognising a re-join —
-/// while the label never leaves the client and is never derived from members.
-///
-/// An `adj-noun` pair indexed by the address bytes is the default; the `#<hex>`
-/// floor is the fallback if the wordlists are somehow empty (they are not, per
-/// the ISC-C4b sizing invariants), keeping this total without an `unwrap`.
-fn default_circle_label(asset_addr: &AssetAddr) -> String {
-    use daemonseed_core::handle::display_name::{DisplayNameRng, generate_display_name};
-
-    /// Deterministic index source: consumes the address bytes (wrapping) so the
-    /// chosen `(adjective, noun)` pair is a pure function of the rendezvous.
-    struct AddrRng<'a> {
-        bytes: &'a [u8],
-        cursor: usize,
-    }
-    impl DisplayNameRng for AddrRng<'_> {
-        fn random_index(&mut self, len: usize) -> usize {
-            // Fold 8 address bytes into a u64, advancing the cursor; modulo the
-            // wordlist length. Deterministic and stable for a given address.
-            let mut acc = 0u64;
-            for _ in 0..8 {
-                let b = self.bytes[self.cursor % self.bytes.len()];
-                self.cursor += 1;
-                acc = (acc << 8) | b as u64;
-            }
-            (acc % len as u64) as usize
-        }
-    }
-
-    let bytes = asset_addr.as_bytes();
-    if bytes.is_empty() {
-        return "#circle".to_owned();
-    }
-    let mut rng = AddrRng { bytes, cursor: 0 };
-    generate_display_name(&mut rng)
-}
-
 /// Read the public room's inbound frames, open + VERIFY each under the global
 /// room key (ISC-S25 / ISC-C57), and emit a [`NetEvent::PublicRoomMessage`].
 /// A frame whose seal or provenance signature does not verify is dropped
@@ -3156,12 +3116,14 @@ mod tests {
         });
     }
 
-    /// The client-local circle label (ISC-C62) is a deterministic function of the
-    /// rendezvous address: the same address yields the same default label, and
-    /// distinct addresses (overwhelmingly) yield distinct labels. The label is
-    /// generated locally — it is never derived from members or transmitted.
+    /// The TUI labels a joined circle via the canonical core derivation
+    /// (`daemonseed_core::circle::default_circle_label`, ISC-C62): a deterministic
+    /// function of the rendezvous address — the same address yields the same default
+    /// label, distinct addresses (overwhelmingly) distinct labels — generated locally,
+    /// never derived from members or transmitted.
     #[test]
     fn default_circle_label_is_deterministic_per_address() {
+        use daemonseed_core::circle::default_circle_label;
         let a = AssetAddr::from_bytes([7u8; 48]);
         let b = AssetAddr::from_bytes([7u8; 48]);
         let c = AssetAddr::from_bytes([9u8; 48]);

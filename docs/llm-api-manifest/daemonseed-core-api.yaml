@@ -727,6 +727,25 @@ modules:
       - A-C3
       - A-C4
 
+  - name: "circle::default_circle_label"
+    module: daemonseed_core::circle
+    description: >-
+      Canonical home (shared by the TUI and the GUI; neither reimplements it) for a
+      circle's stable client-local display label (ISC-C62). Deterministically derives an
+      `adj-noun` pair from the circle's rendezvous AssetAddr (SHA-384(cot_key ‖ server_id))
+      by folding the address bytes into the display-name wordlist index — same address →
+      same label (recognisable re-join), `#circle` only if the address is empty. The label
+      never leaves the client and is never derived from members or the secret phrase (A-S2).
+    signature: "pub fn default_circle_label(asset_addr: &AssetAddr) -> String"
+    parameters:
+      - name: asset_addr
+        type: "&AssetAddr"
+        direction: in
+        description: The circle's relay rendezvous address.
+    returns:
+      type: String
+      description: A deterministic adj-noun client-local label.
+
   - name: daemonseed_core::public_space
     description: >-
       Signed-artifact model for the public-space service (M6), shared

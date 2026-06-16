@@ -148,8 +148,14 @@ pub enum NetEvent {
     /// may still be up.
     Error { reason: String },
     /// A circle subscribe stream is live; chat can flow. `circle_id` is the
-    /// GUI-assigned tag from the originating [`NetCommand::JoinCircle`].
-    CircleJoined { circle_id: u64 },
+    /// GUI-assigned tag from the originating [`NetCommand::JoinCircle`]; `asset_addr`
+    /// is the relay rendezvous the circle resolved to, from which the UI derives the
+    /// stable client-local label (`default_circle_label`) and fills the net contract's
+    /// rendezvous slot.
+    CircleJoined {
+        circle_id: u64,
+        asset_addr: AssetAddr,
+    },
     /// A circle message to render: a verified inbound frame for `circle_id`, or a
     /// local echo of the user's own just-sent message. `mine` is true when
     /// `who == my_handle`.
@@ -591,6 +597,7 @@ impl Actor {
         if let Some(existing) = self.circles.iter().find(|c| c.asset_addr == asset_addr) {
             return self.emit(NetEvent::CircleJoined {
                 circle_id: existing.circle_id,
+                asset_addr: existing.asset_addr,
             });
         }
 
@@ -633,7 +640,10 @@ impl Actor {
             asset_addr,
             out_tx,
         });
-        self.emit(NetEvent::CircleJoined { circle_id });
+        self.emit(NetEvent::CircleJoined {
+            circle_id,
+            asset_addr,
+        });
     }
 
     /// Publish a message to a joined circle and LOCAL-ECHO it. Mirrors
