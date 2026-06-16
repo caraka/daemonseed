@@ -44,6 +44,8 @@
 //! via `block_on(local.run_until(..))` + [`tokio::task::spawn_local`] sidesteps
 //! both `Send` bounds — identical to the TUI's rationale.
 
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use daemonseed_cli::connect::connect_session;
@@ -51,13 +53,17 @@ use daemonseed_cli::identity_proof::ClientIdentity;
 use daemonseed_cli::session::AppSession;
 use daemonseed_core::circle::key::{CotKey, derive_cot_key};
 use daemonseed_core::circle::message::{open_message, seal_message};
-use daemonseed_core::cot::{AssetAddr, asset_address};
+use daemonseed_core::cot::{AssetAddr, asset_address, public_share_asset_address};
 use daemonseed_core::crypto::suite::CNSA_2_0;
 use daemonseed_core::federation::store::{InMemoryTrustStore, ServerEntry, TrustStore};
 use daemonseed_core::handle::Handle;
 use daemonseed_core::public_room::{
     DEFAULT_ROOM, derive_room_key, open_room_message, room_asset_address, seal_room_message,
 };
+use daemonseed_core::share_envelope::{ManifestEntry, ShareFrame};
+use daemonseed_core::share_serve::ShareContent;
+use daemonseed_core::storage::cas::chunk_addr;
+use daemonseed_core::storage::fetched::rebase_to_selection_root;
 use daemonseed_core::storage::seeds::CounterState;
 use daemonseed_proto::v1 as wire;
 use tokio::sync::mpsc;
@@ -108,6 +114,49 @@ pub enum NetCommand {
     /// and LOCAL-ECHO it (the relay never reflects a sender's own frame). Mirrors
     /// `daemonseed_tui`'s `handle_send_chat`.
     SendCircle { circle_id: u64, text: String },
+    /// Publish a local directory as a public share: index it (manifest + 1 MiB
+    /// sub-file chunking), register the listing via the PublicSpace RPC to receive
+    /// the server-assigned opaque `share_id`, and serve it from disk for the session.
+    /// Mirrors `daemonseed_tui`'s `handle_publish_share` — minus the redb chunk-addr
+    /// cache and the cancel/progress events, which are TUI UI affordances the GUI
+    /// alpha does not surface (the manifest + served bytes are byte-identical either
+    /// way). Terminal events: `PublishStarted` / `PublishError`; `PublishStopped` on
+    /// unpublish, session end, or relay reap.
+    ///
+    /// `#[cfg_attr(not(test), allow(dead_code))]`: constructed by the in-process
+    /// round-trip oracle today; the attended Shares-tab wiring constructs it in the
+    /// bin (same convention as [`NetCommand::JoinRoom`]).
+    #[cfg_attr(not(test), allow(dead_code))]
+    PublishShare {
+        root: PathBuf,
+        name: String,
+        sharer_handle: String,
+    },
+    /// Stop serving and unpublish a share published this session (owner-scoped,
+    /// ISC-A-S1). Aborts the serve task and sends `UnpublishShare` to the relay.
+    #[cfg_attr(not(test), allow(dead_code))]
+    UnpublishShare { share_id: String },
+    /// List the relay's live public shares — a single `SharesSnapshot` (or
+    /// `SharesError`). Read-only; no scan.
+    #[cfg_attr(not(test), allow(dead_code))]
+    RefreshShares,
+    /// A1 fetch-preview: open the share's stream, read the manifest, emit
+    /// `FetchManifest` (file names + sizes), then drop the stream. No bytes fetched.
+    #[cfg_attr(not(test), allow(dead_code))]
+    FetchShare { share_id: String, name: String },
+    /// A2 download: re-open the share and fetch the selected files' chunks (all when
+    /// `selected` is `None`), SHA-384-verify each (fail-closed, ISC-S28), and write
+    /// them under `fetched_root`. `flat_dest` rebases the selection to the dest root
+    /// (choose-download-dir). Terminal: `FetchComplete` or `FetchError` (partial
+    /// files deleted, ISC-A-C31). Mirrors `daemonseed_tui`'s `handle_confirm_fetch`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    ConfirmFetch {
+        share_id: String,
+        name: String,
+        fetched_root: PathBuf,
+        selected: Option<Vec<usize>>,
+        flat_dest: bool,
+    },
     /// TEST SEAM (never used in production). Inject a pre-opened [`AppSession`]
     /// plus the `server_id` the test namespaces its rendezvous by, so a test
     /// exercises the SAME post-`open` JoinRoom/SendRoom path as a real Connect
@@ -168,6 +217,57 @@ pub enum NetEvent {
     /// A non-fatal circle error (join/send failure) tagged with the circle it
     /// concerns. The connection itself may still be up.
     CircleError { circle_id: u64, reason: String },
+    /// A share is now published and served; `share_id` is server-assigned (opaque).
+    PublishStarted {
+        share_id: String,
+        name: String,
+        file_count: usize,
+    },
+    /// A published share stopped serving (unpublish, session end, or relay reap).
+    PublishStopped { share_id: String },
+    /// A publish attempt failed (no session, index error, or refused RPC).
+    PublishError { message: String },
+    /// The relay's live public-share listing (response to `RefreshShares`).
+    SharesSnapshot {
+        shares: Vec<wire::PublicShareListing>,
+    },
+    /// A `RefreshShares` could not complete; the previous snapshot is unchanged.
+    SharesError { message: String },
+    /// A1 fetch-preview: the share's file list (names + sizes), no addresses.
+    FetchManifest {
+        share_id: String,
+        name: String,
+        entries: Vec<ShareManifestEntry>,
+    },
+    /// Fetch progress: chunks / bytes received so far (total known post-manifest).
+    FetchProgress {
+        total_chunks: Option<u32>,
+        chunks_received: u32,
+        bytes_received: u64,
+    },
+    /// A fetch completed: all selected files written and SHA-384-verified.
+    FetchComplete {
+        share_id: String,
+        files_written: u32,
+        bytes_written: u64,
+    },
+    /// A fetch failed (timeout, hash mismatch, I/O); partial files are deleted.
+    FetchError { message: String },
+}
+
+/// One file in an A1 fetch-preview ([`NetEvent::FetchManifest`]): the file's
+/// relative path and size plus its chunk count, but NOT the chunk addresses (those
+/// are fetched on `ConfirmFetch`). Mirrors `daemonseed_tui`'s `ShareManifestEntry`.
+///
+/// Fields are read by the in-process fetch-preview oracle and by the attended
+/// Shares-tab wiring; `#[cfg_attr(not(test), allow(dead_code))]` keeps the bin
+/// build clean until that wiring lands (a binary crate's `pub` does not escape).
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone)]
+pub struct ShareManifestEntry {
+    pub rel_path: String,
+    pub size: u64,
+    pub chunk_count: u32,
 }
 
 /// The UI-side handle: owns the channels and the net thread. Held for the app's
@@ -294,6 +394,10 @@ struct Actor {
     /// holds its own key, so sealing/attribution stays per-circle (ISC-A-C30).
     /// Session-only (RAM) — not persisted, like the TUI.
     circles: Vec<CircleSub>,
+    /// Shares published this session, keyed by server-assigned `share_id`, each
+    /// holding its `serve_share` task handle so `UnpublishShare` can abort it
+    /// (mirrors the TUI's `published` map). RAM-only — relay state is ephemeral.
+    published: HashMap<String, tokio::task::JoinHandle<()>>,
 }
 
 impl Actor {
@@ -694,6 +798,453 @@ impl Actor {
             mine: true,
         });
     }
+
+    // ── Shares: publish / serve / fetch (M15/M16 path, mirrors the TUI) ───────
+
+    /// Publish `root` as a public share and serve it from disk for the session.
+    /// See [`NetCommand::PublishShare`].
+    async fn handle_publish_share(&mut self, root: PathBuf, name: String, sharer_handle: String) {
+        let Some(session) = self.session.clone() else {
+            return self.emit(NetEvent::PublishError {
+                message: "not connected to a relay yet".to_owned(),
+            });
+        };
+        let Some(server_id) = self.server_id.clone() else {
+            return self.emit(NetEvent::PublishError {
+                message: "no server-id for the connected relay".to_owned(),
+            });
+        };
+
+        // Index the directory off the actor thread (1 MiB sub-file chunking). The
+        // GUI keeps no redb share-index, so it always hashes fresh — the manifest
+        // and the served bytes are byte-identical to the cached path either way.
+        let index_root = root.clone();
+        let content =
+            match tokio::task::spawn_blocking(move || ShareContent::index_dir(&index_root)).await {
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => {
+                    return self.emit(NetEvent::PublishError {
+                        message: format!("could not index {}: {e}", root.display()),
+                    });
+                }
+                Err(_) => {
+                    return self.emit(NetEvent::PublishError {
+                        message: "share-index task failed".to_owned(),
+                    });
+                }
+            };
+        let content = std::sync::Arc::new(content);
+        let file_count = content.file_count();
+
+        // Register the listing — the server assigns the opaque `share_id` (F25); the
+        // `share_id` we send is ignored. Done BEFORE serving so the listing is never
+        // advertised for content we cannot serve.
+        let resp = session
+            .public_space()
+            .publish_share(wire::PublishShareRequest {
+                listing: Some(wire::PublicShareListing {
+                    share_id: String::new(),
+                    name: name.clone(),
+                    rating: String::new(),
+                    sharer_handle,
+                }),
+            })
+            .await;
+        let share_id = match resp {
+            Ok(r) => r.into_inner().share_id,
+            Err(s) => {
+                return self.emit(NetEvent::PublishError {
+                    message: format!("publish refused: {s}"),
+                });
+            }
+        };
+
+        // Serve from disk for the life of the session via `spawn_local` (like the
+        // circle inbound readers). A natural end emits `PublishStopped`; an explicit
+        // `UnpublishShare` aborts the task before that line runs.
+        let task_share_id = share_id.clone();
+        let serve_evt_tx = self.evt_tx.clone();
+        let handle = tokio::task::spawn_local(async move {
+            let _ = session
+                .serve_share(&server_id, &task_share_id, content)
+                .await;
+            let _ = serve_evt_tx.send(NetEvent::PublishStopped {
+                share_id: task_share_id,
+            });
+        });
+        self.published.insert(share_id.clone(), handle);
+        self.emit(NetEvent::PublishStarted {
+            share_id,
+            name,
+            file_count,
+        });
+    }
+
+    /// Unpublish a share published this session and stop serving it. See
+    /// [`NetCommand::UnpublishShare`].
+    async fn handle_unpublish_share(&mut self, share_id: &str) {
+        if let Some(handle) = self.published.remove(share_id) {
+            handle.abort();
+        }
+        if let Some(session) = self.session.as_ref() {
+            let _ = session
+                .public_space()
+                .unpublish_share(wire::UnpublishShareRequest {
+                    share_id: share_id.to_owned(),
+                })
+                .await;
+        }
+        self.emit(NetEvent::PublishStopped {
+            share_id: share_id.to_owned(),
+        });
+    }
+
+    /// List the relay's live public shares. See [`NetCommand::RefreshShares`].
+    async fn handle_refresh_shares(&mut self) {
+        let Some(session) = self.session.as_ref() else {
+            return self.emit(NetEvent::SharesError {
+                message: "not connected to a relay yet".to_owned(),
+            });
+        };
+        match session
+            .public_space()
+            .list_public_shares(wire::ListPublicSharesRequest {})
+            .await
+        {
+            Ok(r) => self.emit(NetEvent::SharesSnapshot {
+                shares: r.into_inner().shares,
+            }),
+            Err(s) => self.emit(NetEvent::SharesError {
+                message: format!("could not list shares: {s}"),
+            }),
+        }
+    }
+
+    /// A1 fetch-preview: open the share, read the manifest, emit `FetchManifest`,
+    /// drop the stream. See [`NetCommand::FetchShare`].
+    async fn handle_fetch_share(&mut self, share_id: &str, name: &str) {
+        match self.open_share_stream(share_id).await {
+            Ok(opened) => {
+                let entries = opened
+                    .manifest
+                    .iter()
+                    .map(|e| ShareManifestEntry {
+                        rel_path: e.rel_path.clone(),
+                        size: e.size,
+                        chunk_count: e.chunks.len() as u32,
+                    })
+                    .collect();
+                // `opened` (out_tx + inbound) drops here — preview only.
+                self.emit(NetEvent::FetchManifest {
+                    share_id: share_id.to_owned(),
+                    name: name.to_owned(),
+                    entries,
+                });
+            }
+            Err(message) => self.emit(NetEvent::FetchError { message }),
+        }
+    }
+
+    /// A2 download: fetch the selected files' chunks, SHA-384-verify each, and write
+    /// them under `fetched_root`. See [`NetCommand::ConfirmFetch`].
+    async fn handle_confirm_fetch(
+        &mut self,
+        share_id: &str,
+        name: &str,
+        fetched_root: PathBuf,
+        selected: Option<Vec<usize>>,
+        flat_dest: bool,
+    ) {
+        let opened = match self.open_share_stream(share_id).await {
+            Ok(o) => o,
+            Err(message) => return self.emit(NetEvent::FetchError { message }),
+        };
+        let OpenedShare {
+            out_tx,
+            mut inbound,
+            asset_bytes,
+            manifest,
+        } = opened;
+
+        // Resolve the selected file set (None → all; out-of-range indices ignored).
+        let indices: Vec<usize> = match &selected {
+            None => (0..manifest.len()).collect(),
+            Some(sel) => sel
+                .iter()
+                .copied()
+                .filter(|&i| i < manifest.len())
+                .collect(),
+        };
+        // `flat_dest` (choose-download-dir): rebase the selection to the dest root so
+        // a single file lands as its basename and a folder drops its ancestors.
+        let rel_paths: Vec<&str> = indices
+            .iter()
+            .map(|&i| manifest[i].rel_path.as_str())
+            .collect();
+        let rebased: Option<Vec<String>> = flat_dest.then(|| rebase_to_selection_root(&rel_paths));
+
+        let total_chunks: u32 = indices
+            .iter()
+            .map(|&i| manifest[i].chunks.len() as u32)
+            .sum();
+        self.emit(NetEvent::FetchProgress {
+            total_chunks: Some(total_chunks),
+            chunks_received: 0,
+            bytes_received: 0,
+        });
+
+        let mut written: Vec<PathBuf> = Vec::new();
+        let mut chunks_received: u32 = 0;
+        let mut bytes_received: u64 = 0;
+        let mut files_written: u32 = 0;
+
+        for (pos, &i) in indices.iter().enumerate() {
+            let entry = &manifest[i];
+            let rel = match &rebased {
+                Some(r) => r[pos].as_str(),
+                None => entry.rel_path.as_str(),
+            };
+            let Some(safe) = sanitize_rel_path(rel) else {
+                return fail_fetch(self, &written, format!("unsafe path in manifest: {rel:?}"))
+                    .await;
+            };
+            // A chosen dest writes flat; the default namespaces under a share folder.
+            let dest = if flat_dest {
+                fetched_root.join(&safe)
+            } else {
+                fetched_root.join(safe_folder_name(name)).join(&safe)
+            };
+            if let Some(parent) = dest.parent()
+                && let Err(e) = std::fs::create_dir_all(parent)
+            {
+                return fail_fetch(
+                    self,
+                    &written,
+                    format!("could not create {}: {e}", parent.display()),
+                )
+                .await;
+            }
+
+            let mut file_bytes: Vec<u8> = Vec::with_capacity(entry.size as usize);
+            for addr in &entry.chunks {
+                if out_tx
+                    .send(share_frame(
+                        &asset_bytes,
+                        ShareFrame::ChunkRequest { chunk_addr: *addr }.encode(),
+                    ))
+                    .await
+                    .is_err()
+                {
+                    return fail_fetch(self, &written, "share request channel closed".to_owned())
+                        .await;
+                }
+                let data = loop {
+                    let resp = match tokio::time::timeout(FETCH_INACTIVITY, inbound.message()).await
+                    {
+                        Ok(Ok(Some(f))) => f,
+                        Ok(Ok(None)) => {
+                            return fail_fetch(
+                                self,
+                                &written,
+                                "share stream ended mid-fetch".to_owned(),
+                            )
+                            .await;
+                        }
+                        Ok(Err(s)) => {
+                            return fail_fetch(
+                                self,
+                                &written,
+                                format!("share stream error: {}", s.message()),
+                            )
+                            .await;
+                        }
+                        Err(_) => {
+                            return fail_fetch(self, &written, FETCH_TIMEOUT.to_owned()).await;
+                        }
+                    };
+                    if resp.payload.is_empty() {
+                        continue;
+                    }
+                    match ShareFrame::decode(&resp.payload) {
+                        Ok(ShareFrame::ChunkResponse {
+                            chunk_addr: got,
+                            data,
+                        }) if got == *addr => {
+                            break data;
+                        }
+                        _ => continue,
+                    }
+                };
+                // ISC-S28 / ISC-19: re-derive SHA-384 and reject on mismatch.
+                let ok = matches!(chunk_addr(&data), Ok(recomputed) if recomputed == *addr);
+                if !ok {
+                    return fail_fetch(
+                        self,
+                        &written,
+                        "a served chunk failed its hash check".to_owned(),
+                    )
+                    .await;
+                }
+                chunks_received += 1;
+                bytes_received += data.len() as u64;
+                file_bytes.extend_from_slice(&data);
+                self.emit(NetEvent::FetchProgress {
+                    total_chunks: Some(total_chunks),
+                    chunks_received,
+                    bytes_received,
+                });
+            }
+            if let Err(e) = std::fs::write(&dest, &file_bytes) {
+                return fail_fetch(
+                    self,
+                    &written,
+                    format!("could not write {}: {e}", dest.display()),
+                )
+                .await;
+            }
+            written.push(dest);
+            files_written += 1;
+        }
+
+        drop(out_tx);
+        self.emit(NetEvent::FetchComplete {
+            share_id: share_id.to_owned(),
+            files_written,
+            bytes_written: bytes_received,
+        });
+    }
+
+    /// Open a fetch subscribe stream for `share_id`, send the naming frame + a
+    /// `ManifestRequest`, and read until the `ManifestResponse` arrives. Both halves
+    /// derive the SAME rendezvous via [`public_share_asset_address`], so a fetch that
+    /// finds the manifest IS the agreement proof (a mismatch lands on a dead asset
+    /// and times out). Returns the live stream + decoded manifest, or `Err(message)`.
+    async fn open_share_stream(&self, share_id: &str) -> Result<OpenedShare, String> {
+        let session = self
+            .session
+            .as_ref()
+            .ok_or_else(|| "not connected to a relay yet".to_owned())?;
+        let server_id = self
+            .server_id
+            .as_ref()
+            .ok_or_else(|| "no server-id for the connected relay".to_owned())?;
+        let asset_addr = public_share_asset_address(share_id.as_bytes(), server_id.as_bytes())
+            .map_err(|e| format!("share-address derivation failed: {e}"))?;
+        let asset_bytes = asset_addr.as_bytes().to_vec();
+
+        let mut cot = session.circle_of_trust();
+        let (out_tx, out_rx) = mpsc::channel::<wire::CotFrame>(16);
+        out_tx
+            .send(share_frame(&asset_bytes, Vec::new()))
+            .await
+            .map_err(|_| "share subscribe channel closed".to_owned())?;
+        let mut inbound = cot
+            .subscribe(ReceiverStream::new(out_rx))
+            .await
+            .map_err(|s| format!("subscribe refused: {}", s.message()))?
+            .into_inner();
+        out_tx
+            .send(share_frame(
+                &asset_bytes,
+                ShareFrame::ManifestRequest.encode(),
+            ))
+            .await
+            .map_err(|_| "share subscribe channel closed".to_owned())?;
+
+        let manifest = loop {
+            let resp = match tokio::time::timeout(FETCH_INACTIVITY, inbound.message()).await {
+                Ok(Ok(Some(f))) => f,
+                Ok(Ok(None)) => return Err("share stream ended before a manifest".to_owned()),
+                Ok(Err(s)) => return Err(format!("share stream error: {}", s.message())),
+                Err(_) => return Err(FETCH_MANIFEST_TIMEOUT.to_owned()),
+            };
+            if resp.payload.is_empty() {
+                continue;
+            }
+            match ShareFrame::decode(&resp.payload) {
+                Ok(ShareFrame::ManifestResponse { entries }) => break entries,
+                _ => continue,
+            }
+        };
+        Ok(OpenedShare {
+            out_tx,
+            inbound,
+            asset_bytes,
+            manifest,
+        })
+    }
+}
+
+/// A live fetch stream plus the decoded manifest. The GUI analog of the TUI's
+/// `OpenedShare`; both the A1 preview and the A2 download open one.
+struct OpenedShare {
+    out_tx: mpsc::Sender<wire::CotFrame>,
+    inbound: tonic::Streaming<wire::CotFrame>,
+    asset_bytes: Vec<u8>,
+    manifest: Vec<ManifestEntry>,
+}
+
+/// Per-frame inactivity budget for a fetch (manifest or chunk). Only a relevant
+/// frame resets it; relay noise does not (mirrors the TUI's 30s budget).
+const FETCH_INACTIVITY: std::time::Duration = std::time::Duration::from_secs(30);
+const FETCH_TIMEOUT: &str = "timed out waiting for chunks — the share may have stopped serving";
+const FETCH_MANIFEST_TIMEOUT: &str =
+    "timed out waiting for the share — it may be offline; refresh the list";
+
+/// Build a `CotFrame` addressed to a share rendezvous.
+fn share_frame(asset: &[u8], payload: Vec<u8>) -> wire::CotFrame {
+    wire::CotFrame {
+        asset_address: asset.to_vec(),
+        payload,
+    }
+}
+
+/// Delete the partial files written so far and emit `FetchError` (ISC-A-C31 — a
+/// failed fetch persists nothing). Free function so the borrow of `written` does
+/// not collide with `&mut actor`.
+async fn fail_fetch(actor: &Actor, written: &[PathBuf], message: String) {
+    for p in written {
+        let _ = std::fs::remove_file(p);
+    }
+    actor.emit(NetEvent::FetchError { message });
+}
+
+/// Map a wire `/`-separated rel_path to a safe relative path under the fetch root,
+/// or `None` if it escapes (absolute, `.`/`..`, backslash, or empty). ISC-A-C32.
+fn sanitize_rel_path(rel: &str) -> Option<PathBuf> {
+    if rel.is_empty() {
+        return None;
+    }
+    let mut out = PathBuf::new();
+    for comp in rel.split('/') {
+        if comp.is_empty() || comp == "." || comp == ".." || comp.contains('\\') {
+            return None;
+        }
+        out.push(comp);
+    }
+    (!out.as_os_str().is_empty()).then_some(out)
+}
+
+/// A safe single-component folder name derived from a share's display name: path
+/// separators and control chars become `_`, leading/trailing dots+space trimmed,
+/// empty falls back to `share`.
+fn safe_folder_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c == '/' || c == '\\' || c.is_control() {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim().trim_matches('.').trim();
+    if trimmed.is_empty() {
+        "share".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
 }
 
 /// The actor loop: build state, then service commands one at a time.
@@ -711,6 +1262,7 @@ async fn net_actor(
         trust: InMemoryTrustStore::new(),
         public_room: None,
         circles: Vec::new(),
+        published: HashMap::new(),
     };
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
@@ -731,6 +1283,29 @@ async fn net_actor(
             }
             NetCommand::SendCircle { circle_id, text } => {
                 actor.handle_send_circle(circle_id, &text).await
+            }
+            NetCommand::PublishShare {
+                root,
+                name,
+                sharer_handle,
+            } => actor.handle_publish_share(root, name, sharer_handle).await,
+            NetCommand::UnpublishShare { share_id } => {
+                actor.handle_unpublish_share(&share_id).await
+            }
+            NetCommand::RefreshShares => actor.handle_refresh_shares().await,
+            NetCommand::FetchShare { share_id, name } => {
+                actor.handle_fetch_share(&share_id, &name).await
+            }
+            NetCommand::ConfirmFetch {
+                share_id,
+                name,
+                fetched_root,
+                selected,
+                flat_dest,
+            } => {
+                actor
+                    .handle_confirm_fetch(&share_id, &name, fetched_root, selected, flat_dest)
+                    .await
             }
             #[cfg(test)]
             NetCommand::AttachSession {
@@ -1074,6 +1649,289 @@ mod tests {
                 a_echo.map(|(_, text)| text),
                 Some("meet at the usual place".to_owned()),
                 "sender A sees its own message only via local echo"
+            );
+        });
+    }
+
+    // ── Share publish→fetch (the item-3 spine oracle) ─────────────────────────
+
+    /// Canonical-address pin: the GUI derives a share rendezvous via
+    /// `public_share_asset_address(share_id, server_id)` — deterministic, and the
+    /// argument order is load-bearing (swapping the inputs changes the address, so a
+    /// silent swap can't pass). The byte-level *agreement* between serve and fetch is
+    /// proven by the round-trip below (a wrong derivation lands on a dead asset).
+    #[test]
+    fn share_asset_address_is_canonical() {
+        let _ = oxicrypt_module::initialize();
+        let share_id: &[u8] = b"9f3c1a77b2e04d6680aa1c2d3e4f5061";
+        let server = SERVER_ID.as_bytes();
+        let addr = public_share_asset_address(share_id, server).unwrap();
+        assert_eq!(
+            addr.as_bytes(),
+            public_share_asset_address(share_id, server)
+                .unwrap()
+                .as_bytes(),
+            "share-address derivation must be deterministic"
+        );
+        assert_ne!(
+            addr.as_bytes(),
+            public_share_asset_address(server, share_id)
+                .unwrap()
+                .as_bytes(),
+            "argument order (share_id, server_id) is load-bearing"
+        );
+    }
+
+    async fn wait_for_publish_started(
+        evt_rx: &mut mpsc::UnboundedReceiver<NetEvent>,
+    ) -> Option<String> {
+        for _ in 0..600 {
+            while let Ok(evt) = evt_rx.try_recv() {
+                match evt {
+                    NetEvent::PublishStarted { share_id, .. } => return Some(share_id),
+                    NetEvent::PublishError { message } => panic!("publish failed: {message}"),
+                    _ => {}
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        None
+    }
+
+    async fn wait_for_fetch_manifest(
+        evt_rx: &mut mpsc::UnboundedReceiver<NetEvent>,
+    ) -> Option<Vec<ShareManifestEntry>> {
+        for _ in 0..600 {
+            while let Ok(evt) = evt_rx.try_recv() {
+                match evt {
+                    NetEvent::FetchManifest { entries, .. } => return Some(entries),
+                    NetEvent::FetchError { message } => panic!("fetch preview failed: {message}"),
+                    _ => {}
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        None
+    }
+
+    async fn wait_for_fetch_complete(
+        evt_rx: &mut mpsc::UnboundedReceiver<NetEvent>,
+    ) -> Option<(u32, u64)> {
+        for _ in 0..600 {
+            while let Ok(evt) = evt_rx.try_recv() {
+                match evt {
+                    NetEvent::FetchComplete {
+                        files_written,
+                        bytes_written,
+                        ..
+                    } => return Some((files_written, bytes_written)),
+                    NetEvent::FetchError { message } => panic!("fetch failed: {message}"),
+                    _ => {}
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        None
+    }
+
+    /// The item-3 spine, end-to-end through TWO GUI actors on a shared in-process
+    /// relay: actor A publishes a two-file directory (real `publish_share` RPC +
+    /// `serve_share`); actor B previews the manifest, downloads to a temp root, and
+    /// recovers both files byte-for-byte (each chunk SHA-384-verified). Exercises the
+    /// GUI's OWN publish + fetch handlers — not the inlined core path.
+    #[test]
+    fn share_publish_fetch_round_trip() {
+        let _ = oxicrypt_module::initialize();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let registry = CotRegistry::new();
+            let (a_client_io, a_server_io) = tokio::io::duplex(256 * 1024);
+            let (b_client_io, b_server_io) = tokio::io::duplex(256 * 1024);
+            let _srv_a = spawn_relay(a_server_io, registry.clone());
+            let _srv_b = spawn_relay(b_server_io, registry.clone());
+            let sess_a = AppSession::open(a_client_io).await.expect("A session");
+            let sess_b = AppSession::open(b_client_io).await.expect("B session");
+
+            let mut a = spawn_local_actor();
+            let mut b = spawn_local_actor();
+            a.cmd_tx
+                .send(NetCommand::AttachSession {
+                    session: sess_a,
+                    server_id: SERVER_ID.to_owned(),
+                    display_handle: None,
+                    rejoin_circles: Vec::new(),
+                })
+                .ok();
+            b.cmd_tx
+                .send(NetCommand::AttachSession {
+                    session: sess_b,
+                    server_id: SERVER_ID.to_owned(),
+                    display_handle: None,
+                    rejoin_circles: Vec::new(),
+                })
+                .ok();
+
+            // A publishes a two-file share (one nested).
+            let dir = tempfile::TempDir::new().unwrap();
+            let file_a: &[u8] = b"gui share round-trip, page 1";
+            let file_b: &[u8] = b"gui share round-trip, page 2 (with addendum)";
+            std::fs::write(dir.path().join("page-1.txt"), file_a).unwrap();
+            std::fs::create_dir(dir.path().join("sub")).unwrap();
+            std::fs::write(dir.path().join("sub").join("page-2.txt"), file_b).unwrap();
+            a.cmd_tx
+                .send(NetCommand::PublishShare {
+                    root: dir.path().to_path_buf(),
+                    name: "alice-share".to_owned(),
+                    sharer_handle: "alice#aabbccddeeff".to_owned(),
+                })
+                .ok();
+            let share_id = wait_for_publish_started(&mut a.evt_rx)
+                .await
+                .expect("A reports PublishStarted");
+            // A's serve subscription must be live before B fetches.
+            wait_registry(&registry, 1).await;
+
+            // B previews the manifest (A1).
+            b.cmd_tx
+                .send(NetCommand::FetchShare {
+                    share_id: share_id.clone(),
+                    name: "alice-share".to_owned(),
+                })
+                .ok();
+            let entries = wait_for_fetch_manifest(&mut b.evt_rx)
+                .await
+                .expect("B receives the manifest preview");
+            assert_eq!(entries.len(), 2, "two-file manifest preview");
+            assert_eq!(entries[0].rel_path, "page-1.txt");
+            assert_eq!(entries[0].size, file_a.len() as u64, "preview size matches");
+            assert_eq!(entries[0].chunk_count, 1, "a sub-1-MiB file is one chunk");
+            assert_eq!(entries[1].rel_path, "sub/page-2.txt");
+            assert_eq!(entries[1].size, file_b.len() as u64, "preview size matches");
+
+            // B downloads (A2) to a temp fetch root and recovers both files.
+            let out = tempfile::TempDir::new().unwrap();
+            b.cmd_tx
+                .send(NetCommand::ConfirmFetch {
+                    share_id: share_id.clone(),
+                    name: "alice-share".to_owned(),
+                    fetched_root: out.path().to_path_buf(),
+                    selected: None,
+                    flat_dest: false,
+                })
+                .ok();
+            let (files_written, _bytes) = wait_for_fetch_complete(&mut b.evt_rx)
+                .await
+                .expect("B reports FetchComplete");
+            assert_eq!(files_written, 2, "both files written");
+
+            // Files land under <fetched_root>/<share-name>/<rel_path>, byte-identical.
+            let got_a = std::fs::read(out.path().join("alice-share").join("page-1.txt")).unwrap();
+            let got_b = std::fs::read(
+                out.path()
+                    .join("alice-share")
+                    .join("sub")
+                    .join("page-2.txt"),
+            )
+            .unwrap();
+            assert_eq!(got_a, file_a, "page 1 recovered byte-for-byte");
+            assert_eq!(got_b, file_b, "page 2 recovered byte-for-byte");
+        });
+    }
+
+    async fn wait_for_shares_snapshot(
+        evt_rx: &mut mpsc::UnboundedReceiver<NetEvent>,
+    ) -> Option<Vec<wire::PublicShareListing>> {
+        for _ in 0..600 {
+            while let Ok(evt) = evt_rx.try_recv() {
+                match evt {
+                    NetEvent::SharesSnapshot { shares } => return Some(shares),
+                    NetEvent::SharesError { message } => panic!("refresh failed: {message}"),
+                    _ => {}
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        None
+    }
+
+    async fn wait_for_publish_stopped(
+        evt_rx: &mut mpsc::UnboundedReceiver<NetEvent>,
+    ) -> Option<String> {
+        for _ in 0..600 {
+            while let Ok(evt) = evt_rx.try_recv() {
+                if let NetEvent::PublishStopped { share_id } = evt {
+                    return Some(share_id);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        None
+    }
+
+    /// `RefreshShares` lists a share the same actor just published (same connection →
+    /// same `PublicSpaceState`), and `UnpublishShare` stops serving it
+    /// (`PublishStopped`). Exercises the list + unpublish RPCs the round-trip does not.
+    #[test]
+    fn share_refresh_lists_own_publish_then_unpublishes() {
+        let _ = oxicrypt_module::initialize();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let registry = CotRegistry::new();
+            let (a_client_io, a_server_io) = tokio::io::duplex(64 * 1024);
+            let _srv = spawn_relay(a_server_io, registry.clone());
+            let sess_a = AppSession::open(a_client_io).await.expect("A session");
+            let mut a = spawn_local_actor();
+            a.cmd_tx
+                .send(NetCommand::AttachSession {
+                    session: sess_a,
+                    server_id: SERVER_ID.to_owned(),
+                    display_handle: None,
+                    rejoin_circles: Vec::new(),
+                })
+                .ok();
+
+            let dir = tempfile::TempDir::new().unwrap();
+            std::fs::write(dir.path().join("note.txt"), b"hi there").unwrap();
+            a.cmd_tx
+                .send(NetCommand::PublishShare {
+                    root: dir.path().to_path_buf(),
+                    name: "notes".to_owned(),
+                    sharer_handle: "alice#aabbccddeeff".to_owned(),
+                })
+                .ok();
+            let share_id = wait_for_publish_started(&mut a.evt_rx)
+                .await
+                .expect("A reports PublishStarted");
+
+            // RefreshShares: A sees its own listing.
+            a.cmd_tx.send(NetCommand::RefreshShares).ok();
+            let shares = wait_for_shares_snapshot(&mut a.evt_rx)
+                .await
+                .expect("A receives a SharesSnapshot");
+            assert!(
+                shares.iter().any(|s| s.share_id == share_id),
+                "the just-published share is in the listing"
+            );
+
+            // Unpublish stops serving it.
+            a.cmd_tx
+                .send(NetCommand::UnpublishShare {
+                    share_id: share_id.clone(),
+                })
+                .ok();
+            let stopped = wait_for_publish_stopped(&mut a.evt_rx).await;
+            assert_eq!(
+                stopped.as_deref(),
+                Some(share_id.as_str()),
+                "UnpublishShare emits PublishStopped for the share"
             );
         });
     }
@@ -1609,6 +2467,120 @@ mod tests {
                 assert_eq!(msg.body, canary);
                 break;
             }
+        });
+    }
+
+    // ── Live fra1 share round-trip (ignored; env-gated) ──────────────────────
+    //
+    // Two ephemeral clients connect to the real relay; actor A publishes a UNIQUE
+    // throwaway one-file share (real publish_share RPC + serve_share), actor B
+    // fetches it (real subscribe + manifest + chunk + SHA-384 verify) and recovers
+    // the canary byte-for-byte. `#[ignore]` so the default `cargo test` excludes it.
+    #[test]
+    #[ignore = "live relay; run explicitly with DAEMONSEED_RELAY_* set"]
+    fn live_fra1_share_round_trip() {
+        use daemonseed_server::kats::CNSA_2_0_KATS;
+        use daemonseed_server::tls::install_provider;
+        use oxicrypt_module::{AlgorithmProfile, initialize_with_profile};
+
+        let server_id =
+            std::env::var("DAEMONSEED_RELAY_ID").unwrap_or_else(|_| "fra1#06177b08dc06".to_owned());
+        let address =
+            std::env::var("DAEMONSEED_RELAY_ADDR").unwrap_or_else(|_| "167.86.91.98".to_owned());
+        let address = if address.contains(':') {
+            address
+        } else {
+            format!("{address}:443")
+        };
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            initialize_with_profile(CNSA_2_0_KATS, AlgorithmProfile::Cnsa2).unwrap();
+            install_provider().unwrap();
+
+            let id_a = ClientIdentity::ephemeral().unwrap();
+            let id_b = ClientIdentity::ephemeral().unwrap();
+            let mut c_a = CounterState::default();
+            let mut c_b = CounterState::default();
+            let parse = |s: &str| s.parse::<Handle>().unwrap();
+            let mut t_a = InMemoryTrustStore::new();
+            let mut t_b = InMemoryTrustStore::new();
+            t_a.upsert(ServerEntry::new_trusted(parse(&server_id), address.clone()));
+            t_b.upsert(ServerEntry::new_trusted(parse(&server_id), address.clone()));
+            let (_oa, sa) = connect_session(&server_id, &address, &id_a, &mut c_a, &mut t_a)
+                .await
+                .expect("A connect");
+            let (_ob, sb) = connect_session(&server_id, &address, &id_b, &mut c_b, &mut t_b)
+                .await
+                .expect("B connect");
+            let sess_a = AppSession::open(sa).await.unwrap();
+            let sess_b = AppSession::open(sb).await.unwrap();
+
+            let mut a = spawn_local_actor();
+            let mut b = spawn_local_actor();
+            a.cmd_tx
+                .send(NetCommand::AttachSession {
+                    session: sess_a,
+                    server_id: server_id.clone(),
+                    display_handle: None,
+                    rejoin_circles: Vec::new(),
+                })
+                .ok();
+            b.cmd_tx
+                .send(NetCommand::AttachSession {
+                    session: sess_b,
+                    server_id: server_id.clone(),
+                    display_handle: None,
+                    rejoin_circles: Vec::new(),
+                })
+                .ok();
+
+            // A UNIQUE throwaway share (random name + body) so it never collides.
+            let nonce = now_unix_ms();
+            let dir = tempfile::TempDir::new().unwrap();
+            let payload =
+                format!("gui live share canary {nonce:x} {:x}", std::process::id()).into_bytes();
+            std::fs::write(dir.path().join("canary.txt"), &payload).unwrap();
+            a.cmd_tx
+                .send(NetCommand::PublishShare {
+                    root: dir.path().to_path_buf(),
+                    name: format!("gui-live-{nonce:x}"),
+                    sharer_handle: "live-test-a#000000000000".to_owned(),
+                })
+                .ok();
+            let share_id = wait_for_publish_started(&mut a.evt_rx)
+                .await
+                .expect("A publishes on fra1");
+            // Let A's serve subscription register on the real relay before B fetches.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+
+            let out = tempfile::TempDir::new().unwrap();
+            b.cmd_tx
+                .send(NetCommand::ConfirmFetch {
+                    share_id: share_id.clone(),
+                    name: format!("gui-live-{nonce:x}"),
+                    fetched_root: out.path().to_path_buf(),
+                    selected: None,
+                    flat_dest: true,
+                })
+                .ok();
+            let (files_written, _bytes) = wait_for_fetch_complete(&mut b.evt_rx)
+                .await
+                .expect("B fetches from fra1");
+            assert_eq!(files_written, 1);
+            // flat_dest → the single file lands as its basename under the fetch root.
+            let got = std::fs::read(out.path().join("canary.txt")).unwrap();
+            assert_eq!(
+                got, payload,
+                "fra1 share round-trip recovers the canary byte-for-byte"
+            );
+
+            // Clean up the throwaway share.
+            a.cmd_tx.send(NetCommand::UnpublishShare { share_id }).ok();
         });
     }
 }

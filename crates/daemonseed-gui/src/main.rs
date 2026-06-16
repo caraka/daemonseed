@@ -675,6 +675,56 @@ fn apply_net_event(ui: &AppWindow, state: &Rc<RefCell<GuiState>>, evt: NetEvent)
             let _ = circle_id;
             ui.set_connection_status(SharedString::from(format!("circle: {reason}")));
         }
+        // ── Shares (net path built; UI wiring is the attended STOP-AND-LEAVE) ──
+        // The publish/serve/fetch net path exists in `net.rs` and is headless-proven
+        // by the in-process publish→fetch round-trip; binding the Shares tab's
+        // buttons to these commands/events is the tester-feedback surface that needs
+        // caraka's eyes, so these events are intentionally not rendered yet. The
+        // fields are bound (not `..`) so the data path stays a compile-checked
+        // contract for the attended wiring to consume.
+        NetEvent::PublishStarted {
+            share_id,
+            name,
+            file_count,
+        } => {
+            let _ = (share_id, name, file_count);
+        }
+        NetEvent::PublishStopped { share_id } => {
+            let _ = share_id;
+        }
+        NetEvent::PublishError { message } => {
+            let _ = message;
+        }
+        NetEvent::SharesSnapshot { shares } => {
+            let _ = shares;
+        }
+        NetEvent::SharesError { message } => {
+            let _ = message;
+        }
+        NetEvent::FetchManifest {
+            share_id,
+            name,
+            entries,
+        } => {
+            let _ = (share_id, name, entries);
+        }
+        NetEvent::FetchProgress {
+            total_chunks,
+            chunks_received,
+            bytes_received,
+        } => {
+            let _ = (total_chunks, chunks_received, bytes_received);
+        }
+        NetEvent::FetchComplete {
+            share_id,
+            files_written,
+            bytes_written,
+        } => {
+            let _ = (share_id, files_written, bytes_written);
+        }
+        NetEvent::FetchError { message } => {
+            let _ = message;
+        }
     }
 }
 

@@ -1239,6 +1239,7 @@ dependencies = [
  "oxitls-rustls-provider",
  "slint",
  "slint-build",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tonic",

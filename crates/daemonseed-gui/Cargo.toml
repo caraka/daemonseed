@@ -55,6 +55,8 @@ slint-build = { workspace = true }
 # (daemonseed-server itself is a regular dep above for crypto init; the relay
 # types it also exposes are used here in tests.)
 oxitls-rustls-provider = { workspace = true, features = ["testing"] }
+# Share publish→fetch round-trip oracle: a temp share directory + a temp fetch root.
+tempfile = { workspace = true }
 
 [features]
 default = []
