@@ -728,19 +728,47 @@ fn self_check(ui: &AppWindow, state: &Rc<RefCell<GuiState>>, net: &Rc<RefCell<Ne
 /// Enter the main shell from an authenticated state: refresh the rail (it may now
 /// hold restored circles), drop the auth gate, connect under the identity, and
 /// autofocus the composer.
+///
+/// The whole body is DEFERRED off the triggering callback. The auth-success paths
+/// fire from a field's `accepted` (Enter) or a button `clicked` handler that lives
+/// INSIDE the `if screen == …` / `if fs-step == …` subtree. Flipping `screen` to
+/// "main" tears that subtree down — including the element whose event we are still
+/// inside — which re-enters the partial_renderer and panics with "RefCell already
+/// borrowed" (partial_renderer.rs:818), the same footgun as toggling an `if` during
+/// a text edit. A 0ms single-shot runs the teardown after the event fully unwinds.
 fn enter_main(
     ui: &AppWindow,
     state: &Rc<RefCell<GuiState>>,
     net: &Rc<RefCell<NetHandle>>,
     crypto: &Result<(), String>,
 ) {
-    rebuild_rail(ui, &state.borrow());
-    ui.set_screen(SharedString::from("main"));
-    connect_now(ui, state, net, crypto);
+    let ui_weak = ui.as_weak();
+    let state = state.clone();
+    let net = net.clone();
+    let crypto = crypto.clone();
+    defer(move || {
+        let Some(ui) = ui_weak.upgrade() else { return };
+        rebuild_rail(&ui, &state.borrow());
+        ui.set_screen(SharedString::from("main"));
+        connect_now(&ui, &state, &net, &crypto);
+        let w = ui.as_weak();
+        defer(move || {
+            if let Some(ui) = w.upgrade() {
+                ui.invoke_focus_composer();
+            }
+        });
+    });
+}
+
+/// Change the first-start wizard step, DEFERRED off the triggering callback. A step
+/// change swaps which `if fs-step == N` subtree is mounted; doing that synchronously
+/// from inside a field/button handler in the OUTGOING subtree re-enters the
+/// partial_renderer (see [`enter_main`]). The 0ms single-shot defers it safely.
+fn defer_set_fs_step(ui: &AppWindow, step: i32) {
     let w = ui.as_weak();
     defer(move || {
         if let Some(ui) = w.upgrade() {
-            ui.invoke_focus_composer();
+            ui.set_fs_step(step);
         }
     });
 }
@@ -778,7 +806,7 @@ fn wire_auth(
                     ui.set_fs_mnemonic(SharedString::from(sealed.display_phrase()));
                     *wizard.borrow_mut() = Wizard::Sealed(sealed);
                     ui.set_auth_error(SharedString::from(""));
-                    ui.set_fs_step(1);
+                    defer_set_fs_step(&ui, 1);
                 }
                 Err(FirstStartError::PassphraseTooWeak { .. }) => {
                     ui.set_auth_error(SharedString::from(
@@ -799,8 +827,7 @@ fn wire_auth(
             let ui = weak.unwrap();
             ui.set_auth_error(SharedString::from(""));
             ui.set_fs_confirm(SharedString::from(""));
-            // The step-2 container's `init` focuses the confirm field on appear.
-            ui.set_fs_step(2);
+            defer_set_fs_step(&ui, 2);
         }
     });
 
@@ -832,15 +859,14 @@ fn wire_auth(
                 ui.set_auth_error(SharedString::from(
                     "Enrollment state lost — please start over.",
                 ));
-                ui.set_fs_step(0);
+                defer_set_fs_step(&ui, 0);
                 return;
             };
             match sealed.verify_round_trip(&confirm) {
                 Ok(verified) => {
                     *wizard.borrow_mut() = Wizard::Verified(verified);
                     ui.set_auth_error(SharedString::from(""));
-                    // The step-3 container's `init` focuses the name field on appear.
-                    ui.set_fs_step(3);
+                    defer_set_fs_step(&ui, 3);
                 }
                 Err(_) => {
                     // Pre-check passed but core rejected — should be unreachable; the
@@ -848,7 +874,7 @@ fn wire_auth(
                     ui.set_auth_error(SharedString::from(
                         "Couldn't verify the phrase — please start over.",
                     ));
-                    ui.set_fs_step(0);
+                    defer_set_fs_step(&ui, 0);
                 }
             }
         }
@@ -873,7 +899,7 @@ fn wire_auth(
                 ui.set_auth_error(SharedString::from(
                     "Enrollment state lost — please start over.",
                 ));
-                ui.set_fs_step(0);
+                defer_set_fs_step(&ui, 0);
                 return;
             };
             let (server_id, address) = relay_target();
@@ -882,7 +908,7 @@ fn wire_auth(
                 Ok(r) => r,
                 Err(e) => {
                     ui.set_auth_error(SharedString::from(format!("Couldn't finish: {e}")));
-                    ui.set_fs_step(0); // verified consumed — restart
+                    defer_set_fs_step(&ui, 0); // verified consumed — restart
                     return;
                 }
             };
