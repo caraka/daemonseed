@@ -45,6 +45,14 @@ struct ActionData {
     shortcut: string,
 }
 
+// One row of the Publish overlay's "Your live shares" list (commit 3). `id` is the
+// server-assigned opaque share id — passed back verbatim to `unpublish-share`.
+struct MyShareRow {
+    id: string,
+    name: string,
+    files: int,
+}
+
 component RailRow inherits Rectangle {
     in property <string> name;
     in property <string> sub;
@@ -225,6 +233,10 @@ export component AppWindow inherits Window {
     // Round-4 circle-plumbing surfaces.
     in-out property <bool> join-open: false;       // Join-a-circle overlay visible
     in-out property <bool> new-open: false;        // New-circle overlay visible
+    // Commit-3 publish surface: the Publish overlay (a manage-your-shares sheet).
+    in-out property <bool> publish-open: false;    // Publish overlay visible
+    in-out property <string> publish-name;         // optional share name (blank → folder basename)
+    in property <[MyShareRow]> my-shares;          // Rust-set: shares published this session
     in-out property <string> join-phrase;          // live Join phrase (two-way to Rust)
     in property <bool> join-phrase-strong: false;  // Rust-set: estimate_circle().is_circle_green()
     in-out property <string> new-phrase;           // generated default; EDITABLE (two-way to Rust)
@@ -253,6 +265,14 @@ export component AppWindow inherits Window {
     // (file -> itself, folder -> its files, share -> all), opens the native folder
     // picker off-thread, and fires ConfirmFetch to the chosen destination.
     callback download-node(int);
+
+    // Publish callbacks (commit 3). `open-publish` raises the Publish overlay (from the
+    // Shares header or palette). `submit-publish(name)` opens the native folder picker
+    // off-thread and publishes the chosen folder under `name` (blank → basename).
+    // `unpublish-share(id)` stops serving a share you published this session.
+    callback open-publish();
+    callback submit-publish(string);
+    callback unpublish-share(string);
 
     // Round-4 callbacks. `open-*` raise the overlays from EITHER surface (rail
     // empty-state or palette — action registry → two surfaces). `join-phrase-edited`
@@ -497,6 +517,7 @@ export component AppWindow inherits Window {
                                     Text { text: "· right-click an item to download"; color: #4d5560; font-size: 11px; vertical-alignment: center; }
                                     Text { text: root.share-status; color: #5b6472; font-size: 12px; vertical-alignment: center; }
                                     Rectangle { }
+                                    PillButton { label: "Publish"; primary: true; w: 96px; clicked => { root.open-publish(); } }
                                     PillButton { label: "Refresh"; w: 96px; clicked => { root.refresh-shares(); } }
                                 }
                                 // the tree fills the rest of the pane
@@ -781,6 +802,90 @@ export component AppWindow inherits Window {
                 PillButton {
                     label: "Create the circle"; primary: true; w: 170px;
                     clicked => { root.submit-new(root.new-phrase); }
+                }
+            }
+        }
+    }
+    // ── Publish overlay (commit 3): publish a folder + manage your live shares ──
+    publish := Rectangle {
+        x: (root.width - self.width) / 2; y: 70px;
+        width: 540px; height: 460px;
+        visible: root.publish-open;
+        background: #0e0f11; border-radius: 12px; border-width: 1px; border-color: #ffffff18;
+        VerticalLayout {
+            // No `alignment: start` — that packs children to preferred height and zeroes
+            // the live-shares list's `vertical-stretch` (same trap as the Shares tab).
+            padding: 18px; spacing: 12px;
+            HorizontalLayout {
+                Text { text: "Publish a folder"; color: #e4e8ee; font-size: 17px; }
+                Rectangle { }
+                PillButton { label: "Close"; w: 70px; clicked => { root.publish-open = false; } }
+            }
+            Text {
+                text: "Pick a folder to share on the relay. It serves from disk for this session — closing the app or Unpublish stops it.";
+                color: #8b93a1; font-size: 13px; wrap: word-wrap;
+            }
+
+            // optional name field (blank → the folder's own name)
+            Rectangle {
+                height: 44px; border-radius: 9px; background: #141517; border-width: 1px; border-color: #ffffff12;
+                HorizontalLayout { padding-left: 12px;
+                    // `visible:` not `if` — toggling on the first/last char typed must
+                    // NOT mutate the item tree mid-edit (partial_renderer crash).
+                    Text { text: "Name (optional — defaults to the folder name)"; visible: root.publish-name == ""; color: #4d5560; font-size: 13px; vertical-alignment: center; }
+                }
+                HorizontalLayout { padding-left: 12px; padding-right: 12px;
+                    publish_name_input := TextInput {
+                        text <=> root.publish-name;
+                        color: #d6dae1; font-size: 13px; vertical-alignment: center; single-line: true;
+                        accepted => { root.submit-publish(root.publish-name); }
+                    }
+                }
+            }
+            HorizontalLayout {
+                Rectangle { }
+                PillButton {
+                    label: "Choose folder & publish"; primary: true; w: 210px;
+                    clicked => { root.submit-publish(root.publish-name); }
+                }
+            }
+
+            // "Your live shares" — published this session, each removable.
+            Text { text: "Your live shares"; color: #aeb6c2; font-size: 13px; }
+            Rectangle {
+                vertical-stretch: 1;
+                border-radius: 10px; background: #0b0c0e; border-width: 1px; border-color: #ffffff10;
+                Flickable {
+                    width: 100%; height: 100%;
+                    viewport-width: self.width;
+                    viewport-height: root.my-shares.length * 40px + 12px;
+                    VerticalLayout {
+                        padding: 6px; alignment: start;
+                        for s in root.my-shares : Rectangle {
+                            height: 40px;
+                            HorizontalLayout {
+                                padding-left: 10px; padding-right: 10px; spacing: 8px;
+                                VerticalLayout {
+                                    alignment: center; spacing: 1px;
+                                    Text { text: s.name; color: #e4e8ee; font-size: 13px; }
+                                    Text { text: s.files + " file(s) · serving"; color: #5b6472; font-size: 11px; }
+                                }
+                                Rectangle { }
+                                PillButton {
+                                    label: "Unpublish"; w: 104px;
+                                    clicked => { root.unpublish-share(s.id); }
+                                }
+                            }
+                        }
+                    }
+                }
+                // empty-state — computed visibility (never an `if`).
+                Text {
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    text: "Nothing published yet.";
+                    visible: root.my-shares.length == 0;
+                    color: #5b6472; font-size: 13px; horizontal-alignment: center;
                 }
             }
         }

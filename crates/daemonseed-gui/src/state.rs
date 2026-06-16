@@ -39,6 +39,20 @@ pub struct Msg {
     pub mine: bool,
 }
 
+/// A share you published this session — one entry in the Publish overlay's "Your
+/// live shares" list (each removable via Unpublish). RAM-only and session-scoped:
+/// the relay holds published shares ephemerally and nothing here survives relaunch
+/// (publish-persistence is a separate later slice).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MyShare {
+    /// Server-assigned opaque share id — the Unpublish key, set on `PublishStarted`.
+    pub id: String,
+    /// The share's display name (a user-chosen name, else the folder basename).
+    pub name: String,
+    /// File count from the published manifest.
+    pub files: usize,
+}
+
 /// The Round-5 **net contract** carried by a materialized circle (refinement #1).
 ///
 /// Holding the phrase + derived [`CotKey`] + a rendezvous slot here is the single
@@ -121,6 +135,10 @@ pub struct GuiState {
     /// The unlocked profile, once first-start / Unlock produces it. `None` on the
     /// ephemeral path (shell works; nothing survives relaunch).
     profile: Option<Profile>,
+    /// Shares published this session (commit 3), keyed off `PublishStarted` /
+    /// `PublishStopped`. Drives the Publish overlay's "Your live shares" list and the
+    /// Unpublish affordance. RAM-only; cleared on relaunch.
+    my_shares: Vec<MyShare>,
 }
 
 impl GuiState {
@@ -147,6 +165,7 @@ impl GuiState {
             active: 0,
             next_circle_id: FIRST_CIRCLE_ID,
             profile: None,
+            my_shares: Vec::new(),
         }
     }
 
@@ -167,6 +186,26 @@ impl GuiState {
     /// path. Passed to `NetCommand::Connect` so the user presents under it.
     pub fn display_handle(&self) -> Option<String> {
         self.profile.as_ref().map(|p| p.display_handle().to_owned())
+    }
+
+    /// Record a share that just started serving this session (commit 3, on
+    /// `PublishStarted`). Replaces any existing entry with the same id so a relay
+    /// re-list can't double it.
+    pub fn add_my_share(&mut self, id: String, name: String, files: usize) {
+        self.my_shares.retain(|s| s.id != id);
+        self.my_shares.push(MyShare { id, name, files });
+    }
+
+    /// Drop a share that stopped serving (on `PublishStopped` — Unpublish, session
+    /// end, or relay reap). No-op if it was already gone.
+    pub fn remove_my_share(&mut self, id: &str) {
+        self.my_shares.retain(|s| s.id != id);
+    }
+
+    /// The shares published this session, in publish order — the Publish overlay's
+    /// "Your live shares" list.
+    pub fn my_shares(&self) -> &[MyShare] {
+        &self.my_shares
     }
 
     /// The `(circle_id, phrase)` set the net actor must silently re-join on connect
@@ -458,6 +497,7 @@ impl GuiState {
             active: 1,
             next_circle_id: FIRST_CIRCLE_ID,
             profile: None,
+            my_shares: Vec::new(),
         }
     }
 }
@@ -466,6 +506,26 @@ impl GuiState {
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[test]
+    fn my_shares_add_replace_remove() {
+        let mut st = GuiState::lobby_only();
+        assert!(st.my_shares().is_empty());
+        st.add_my_share("id-a".into(), "alpha".into(), 3);
+        st.add_my_share("id-b".into(), "beta".into(), 1);
+        assert_eq!(st.my_shares().len(), 2);
+        // Re-publish (same id) replaces, not duplicates — a relay re-list is idempotent.
+        st.add_my_share("id-a".into(), "alpha-renamed".into(), 9);
+        assert_eq!(st.my_shares().len(), 2);
+        let a = st.my_shares().iter().find(|s| s.id == "id-a").unwrap();
+        assert_eq!(a.name, "alpha-renamed");
+        assert_eq!(a.files, 9);
+        // Unpublish drops by id; unknown id is a no-op.
+        st.remove_my_share("id-a");
+        st.remove_my_share("id-zzz");
+        assert_eq!(st.my_shares().len(), 1);
+        assert_eq!(st.my_shares()[0].id, "id-b");
+    }
 
     // ── round-2 retention/perf (unchanged behavior; demo fixture) ────────────
 

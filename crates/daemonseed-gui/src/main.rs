@@ -21,7 +21,9 @@
 //! circle overlays before rendering; `--materialize <phrase>` drives the real
 //! materialize path so the PNG shows a materialized circle selected in the rail;
 //! `--self-check` runs a live materialize + draft-retention round-trip through the
-//! real callbacks and prints `SELF-CHECK PASS` (panics → non-zero exit).
+//! real callbacks and prints `SELF-CHECK PASS` (panics → non-zero exit);
+//! `--show-shares` / `--show-publish` render the Shares-tab browse tree / the Publish
+//! overlay (with a fixture share set, no relay).
 
 mod net;
 mod profile;
@@ -314,6 +316,7 @@ fn build_ui() -> BuiltUi {
             ui.set_new_open(false);
             ui.set_join_open(false);
             ui.set_palette_open(false);
+            ui.set_publish_open(false);
             let live_draft = ui.get_draft().to_string();
             let live_scroll = ui.get_scroll_y();
             {
@@ -342,6 +345,7 @@ fn build_ui() -> BuiltUi {
             // Mutual exclusivity — close the other surfaces so overlays never stack.
             ui.set_new_open(false);
             ui.set_palette_open(false);
+            ui.set_publish_open(false);
             ui.set_join_phrase(SharedString::from(""));
             ui.set_join_phrase_strong(false);
             ui.set_join_open(true);
@@ -365,6 +369,7 @@ fn build_ui() -> BuiltUi {
             // Mutual exclusivity — close the other surfaces so overlays never stack.
             ui.set_join_open(false);
             ui.set_palette_open(false);
+            ui.set_publish_open(false);
             let phrase = state::generate_circle_phrase().unwrap_or_default();
             ui.set_new_phrase(SharedString::from(phrase.as_str()));
             // Generated ⇒ strong; reset the copied confirmation for a fresh open.
@@ -539,6 +544,49 @@ fn build_ui() -> BuiltUi {
         }
     });
 
+    // ── Publish (commit 3): the Publish overlay (manage-your-shares surface) ──
+    // Open: close the other surfaces (mutual exclusivity), reset the optional name,
+    // and refresh the live-shares list so it reflects anything already serving.
+    ui.on_open_publish({
+        let weak = ui.as_weak();
+        let state = state.clone();
+        move || {
+            let ui = weak.unwrap();
+            ui.set_join_open(false);
+            ui.set_new_open(false);
+            ui.set_palette_open(false);
+            ui.set_publish_name(SharedString::from(""));
+            apply_my_shares(&ui, &state.borrow());
+            ui.set_publish_open(true);
+        }
+    });
+    // Publish: open the native folder picker off-thread; on a chosen folder, publish it
+    // under `name` (blank → the folder's basename), self-asserting the unlocked handle
+    // so our own share comes back tagged "you". The overlay closes immediately; the
+    // outcome arrives as a `PublishStarted` / `PublishError` event.
+    ui.on_submit_publish({
+        let weak = ui.as_weak();
+        let state = state.clone();
+        let net = net.clone();
+        move |name| {
+            let ui = weak.unwrap();
+            let sharer_handle = state.borrow().display_handle().unwrap_or_default();
+            ui.set_publish_open(false);
+            pick_dir_and_publish(&net, name.to_string(), sharer_handle);
+        }
+    });
+    // Unpublish a share published this session (owner-scoped, ISC-A-S1). The relay
+    // confirms with `PublishStopped`, which drops it from the list + (on next poll) the
+    // tree.
+    ui.on_unpublish_share({
+        let net = net.clone();
+        move |share_id| {
+            let _ = net.borrow().send(NetCommand::UnpublishShare {
+                share_id: share_id.to_string(),
+            });
+        }
+    });
+
     // Action registry: one list, two surfaces (this palette + the rail empty-state
     // mouse-home). New circle / Join a circle now drive the real overlays.
     let actions = vec![
@@ -590,6 +638,22 @@ fn apply_share_rows(ui: &AppWindow, browser: &ShareBrowser) {
     ui.set_share_rows(ModelRc::from(Rc::new(VecModel::from(rows))));
 }
 
+/// Push the session's published shares (`GuiState::my_shares`) to the Publish overlay's
+/// "Your live shares" list. Called whenever that set changes (`PublishStarted` /
+/// `PublishStopped`) and when the overlay opens.
+fn apply_my_shares(ui: &AppWindow, state: &GuiState) {
+    let rows: Vec<MyShareRow> = state
+        .my_shares()
+        .iter()
+        .map(|s| MyShareRow {
+            id: SharedString::from(s.id.as_str()),
+            name: SharedString::from(s.name.as_str()),
+            files: s.files as i32,
+        })
+        .collect();
+    ui.set_my_shares(ModelRc::from(Rc::new(VecModel::from(rows))));
+}
+
 /// Open the native folder picker OFF the UI thread and, if a folder is chosen, fire
 /// `ConfirmFetch` to it (commit 2). The xdg portal is async over D-Bus, so a dedicated
 /// thread with a current-thread tokio runtime drives the dialog; the destination is
@@ -622,6 +686,44 @@ fn pick_dir_and_fetch(net: &Rc<RefCell<NetHandle>>, target: FetchTarget) {
                 fetched_root: dir,
                 selected: target.selected,
                 flat_dest: true,
+            });
+        }
+    });
+}
+
+/// Open the native folder picker OFF the UI thread and, on a chosen folder, publish it
+/// (commit 3) under `name` — or the folder's own basename when `name` is blank. Mirrors
+/// [`pick_dir_and_fetch`]: a dedicated thread drives the async xdg portal and dispatches
+/// `PublishShare` through the cloned `Send` command sender, so the UI never blocks. A
+/// cancelled pick (or a system with no portal) simply does nothing.
+fn pick_dir_and_publish(net: &Rc<RefCell<NetHandle>>, name: String, sharer_handle: String) {
+    let sender = net.borrow().command_sender();
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        let chosen = rt.block_on(async {
+            rfd::AsyncFileDialog::new()
+                .set_title("Choose a folder to share…")
+                .pick_folder()
+                .await
+                .map(|handle| handle.path().to_path_buf())
+        });
+        if let Some(dir) = chosen {
+            let name = if name.trim().is_empty() {
+                dir.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "share".to_string())
+            } else {
+                name
+            };
+            let _ = sender.send(NetCommand::PublishShare {
+                root: dir,
+                name,
+                sharer_handle,
             });
         }
     });
@@ -805,10 +907,12 @@ fn apply_net_event(
         // download progress meter is commit 2. The fields stay bound (not `..`) so the
         // data path is a compile-checked contract for those commits to consume.
         NetEvent::SharesSnapshot { shares } => {
+            // commit 3: tag our own shares "you" by matching the relay's self-asserted
+            // sharer_handle against our unlocked display handle (`None` on the ephemeral
+            // path → nothing tagged, the empty-handle guard in `set_shares`).
+            let my_handle = state.borrow().display_handle();
             {
                 let mut b = browser.borrow_mut();
-                // commit 1: no `mine` tagging — the unlocked wire handle is wired in
-                // with publish (commit 3); for now nothing is tagged "you".
                 b.set_shares(
                     shares.iter().map(|s| {
                         (
@@ -817,7 +921,7 @@ fn apply_net_event(
                             s.sharer_handle.as_str(),
                         )
                     }),
-                    None,
+                    my_handle.as_deref(),
                 );
             }
             apply_share_rows(ui, &browser.borrow());
@@ -848,20 +952,28 @@ fn apply_net_event(
             }
             apply_share_rows(ui, &browser.borrow());
         }
-        // Publish (commit 3) + download progress/complete (commit 2): net path proven,
-        // UI deferred. Fields bound to keep the contract compile-checked.
+        // Publish (commit 3): keep the session's live-shares list in sync + surface a
+        // quiet status line. The own share also appears in the browse tree tagged "you"
+        // on the next ~3s catalog poll (the relay re-list folds it in via `set_shares`).
         NetEvent::PublishStarted {
             share_id,
             name,
             file_count,
         } => {
-            let _ = (share_id, name, file_count);
+            state
+                .borrow_mut()
+                .add_my_share(share_id, name.clone(), file_count);
+            apply_my_shares(ui, &state.borrow());
+            ui.set_share_status(SharedString::from(format!(
+                "Published \u{201c}{name}\u{201d} · {file_count} file(s)"
+            )));
         }
         NetEvent::PublishStopped { share_id } => {
-            let _ = share_id;
+            state.borrow_mut().remove_my_share(&share_id);
+            apply_my_shares(ui, &state.borrow());
         }
         NetEvent::PublishError { message } => {
-            let _ = message;
+            ui.set_share_status(SharedString::from(format!("Publish failed: {message}")));
         }
         // Download meter (commit 2): a simple label + fraction bar in the rail footer.
         NetEvent::FetchProgress {
@@ -1293,6 +1405,7 @@ fn main() {
     // injects a synthetic catalog + one expanded/previewed share so the PNG shows the
     // tree without a live connection.
     let show_shares = args.iter().any(|a| a == "--show-shares");
+    let show_publish = args.iter().any(|a| a == "--show-publish");
     // Round-6 routing: `--portable` resolves the profile under CWD (else XDG).
     // `--first-start [step]` / `--unlock` are OFFSCREEN-only render flags for the
     // new auth screens (windowed routing always uses `resolve`). `portable` feeds
@@ -1322,6 +1435,7 @@ fn main() {
         || show_new
         || show_joined_label
         || show_shares
+        || show_publish
         || first_start_flag
         || unlock_flag
         || self_check_requested;
@@ -1441,6 +1555,19 @@ fn main() {
         // Show the rail-footer download meter mid-download too (fixture).
         ui.set_download_label(SharedString::from("Downloading… 42%"));
         ui.set_download_progress(0.42);
+    } else if show_publish {
+        // Publish overlay over the Shares tab, fixture-driven (no relay): a couple of
+        // live shares so the PNG shows the list, the Unpublish affordance, the name
+        // field, and the empty-state path is exercised by the unit/render of an empty
+        // set elsewhere.
+        ui.set_active_tab(1);
+        {
+            let mut st = state.borrow_mut();
+            st.add_my_share("id-mine-1".into(), "trip-photos".into(), 42);
+            st.add_my_share("id-mine-2".into(), "tax-2025".into(), 7);
+        }
+        apply_my_shares(&ui, &state.borrow());
+        ui.set_publish_open(true);
     } else {
         // Main shell offscreen: connect (renders connection-status) + drive flags.
         _live = Some(start_drain(
