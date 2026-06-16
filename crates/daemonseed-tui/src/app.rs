@@ -2877,16 +2877,20 @@ impl App {
         // ISC-C71: Ctrl-G generates a strong circle phrase into the input. The
         // ≥128-bit circle-entropy floor (ISC-C9) is demanding to invent by hand,
         // so offer a diceware generator the user can accept; circle phrases are
-        // shared out-of-band, so a generated one is fine. A 12-word BIP-39
-        // diceware phrase is 12 × 11 = 132 bits, clearing the floor with margin.
-        // Ctrl-G (not a bare letter — those are typed into the phrase) so it does
-        // not collide with phrase entry.
+        // shared out-of-band, so a generated one is fine. A 12-word BIP-39 diceware
+        // phrase is ~132 bits, but a bare `generate_diceware(12)` draws WITH
+        // replacement, so ~3% repeat a word and score below the 128-bit floor on the
+        // distinct-word estimator — the join gate would then reject our own
+        // "generated" phrase. `generate_circle_phrase` (the canonical core home,
+        // shared with the GUI) rejection-samples until `is_circle_green`, so the
+        // generated phrase always clears the same gate. Ctrl-G (not a bare letter —
+        // those are typed into the phrase) so it does not collide with phrase entry.
         if key.code == KeyCode::Char('g')
             && key
                 .modifiers
                 .contains(ratatui::crossterm::event::KeyModifiers::CONTROL)
         {
-            match strength::generate_diceware(12) {
+            match strength::generate_circle_phrase() {
                 Ok(phrase) => {
                     self.circle_phrase = phrase;
                     self.status = Some(
@@ -5093,13 +5097,21 @@ mod tests {
             KeyCode::Char('g'),
             ratatui::crossterm::event::KeyModifiers::CONTROL,
         );
-        app.on_key(ctrl_g);
-        let phrase = app.circle_phrase().to_owned();
-        assert!(!phrase.is_empty(), "Ctrl-G fills the join buffer");
-        assert!(
-            daemonseed_core::passphrase::strength::estimate_circle(&phrase).is_circle_green(),
-            "the generated phrase {phrase:?} must clear the ISC-C9 ≥128-bit circle floor"
-        );
+        // Batch the floor check: a bare `generate_diceware(12)` is ~3% flaky (a
+        // duplicate word drops the distinct-word estimate below 128 bits), which a
+        // single draw can hide. 64 samples make a regression to the bare generator
+        // practically certain to surface. The fix routes Ctrl-G through the
+        // rejection-sampling `strength::generate_circle_phrase`.
+        let mut phrase = String::new();
+        for _ in 0..64 {
+            app.on_key(ctrl_g);
+            phrase = app.circle_phrase().to_owned();
+            assert!(!phrase.is_empty(), "Ctrl-G fills the join buffer");
+            assert!(
+                daemonseed_core::passphrase::strength::estimate_circle(&phrase).is_circle_green(),
+                "the generated phrase {phrase:?} must clear the ISC-C9 ≥128-bit circle floor"
+            );
+        }
         // And it must actually join: a generated phrase passes the on-Enter gate.
         app.on_key(press(KeyCode::Enter));
         assert_eq!(app.circle_status(), &CircleStatus::Joining);

@@ -2944,6 +2944,22 @@ functions:
       type: CircleStrength
       description: "{ bits: f64, trivially_weak: bool } with is_circle_green() = bits >= 128 && !trivially_weak."
 
+  - name: "strength::generate_circle_phrase"
+    module: daemonseed_core::passphrase
+    description: >-
+      Canonical home (shared by the GUI and the TUI — neither reimplements it) for
+      generating a circle phrase that clears the SAME is_circle_green floor the join
+      gate enforces (ISC-C9). Rejection-samples CIRCLE_DICEWARE_WORDS-word (12) BIP-39
+      diceware until is_circle_green: a bare generate_diceware(12) draws WITH
+      replacement, so ~3% repeat a word and score 11x11=121 bits (below the 128 floor)
+      on the distinct-word estimator, which would make the generator emit a phrase its
+      own join gate rejects. gotcha: caps at 32 resamples then returns a final draw
+      (astronomically unreachable) rather than panicking in a display path.
+    signature: "pub fn generate_circle_phrase() -> Result<String, DicewareError>"
+    returns:
+      type: "Result<String, DicewareError>"
+      description: A space-separated 12-word BIP-39 phrase guaranteed is_circle_green.
+
   - name: "circle_canonicalize::canonicalize"
     module: daemonseed_core::passphrase
     description: >-

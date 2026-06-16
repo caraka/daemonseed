@@ -17,38 +17,18 @@
 use daemonseed_core::circle::key::{CircleKeyError, CotKey, circle_fingerprint, derive_cot_key};
 use daemonseed_core::cot::AssetAddr;
 use daemonseed_core::crypto::suite::CNSA_2_0;
-use daemonseed_core::passphrase::strength::{DicewareError, estimate_circle, generate_diceware};
+use daemonseed_core::passphrase::strength::{self, DicewareError};
 
 use crate::profile::Profile;
 
-/// Word count for a generated circle phrase. 12 BIP-39 words ≈ 132 bits of real
-/// entropy, clearing the ≥128-bit circle floor (ISC-C9 / brief D3) — the same
-/// count the TUI generates (Ctrl-G). The number is HIDDEN from the user.
-pub const NEW_CIRCLE_WORDS: usize = 12;
-
-/// Generate a circle phrase that clears the SAME estimator the join gate uses
-/// (D3 — one shared estimator, so a generated phrase is never one the join flow
-/// would reject).
-///
-/// **Why a loop, not a bare `generate_diceware(12)`:** the generator draws WITH
-/// replacement, so ~3% of 12-word phrases repeat a word. `estimate_circle` credits
-/// only DISTINCT words (a conservative key-space model), so a phrase with a
-/// duplicate scores 11×11 = 121 bits — below the 128 floor — even though its real
-/// entropy is 132 bits. Rejection-sampling until `is_circle_green` keeps the New
-/// flow consistent with the Join gate and the "Looks strong" reassurance. The
-/// discarded draws carry the same real entropy; excluding them costs nothing and
-/// the remaining phrase space is still astronomically larger than 2¹²⁸. (Latent in
-/// the TUI's Ctrl-G + its floor test too — flagged 2026-06-15.)
+/// Generate a circle phrase that clears the SAME `is_circle_green` floor the join
+/// gate enforces (D3). Thin delegate to the canonical home,
+/// [`daemonseed_core::passphrase::strength::generate_circle_phrase`] — the
+/// rejection-sampling loop (which keeps a generated phrase from ever scoring below the
+/// floor on a duplicate-word draw) lives in core so the GUI and the TUI share one
+/// implementation rather than each carrying a copy that can drift.
 pub fn generate_circle_phrase() -> Result<String, DicewareError> {
-    for _ in 0..32 {
-        let p = generate_diceware(NEW_CIRCLE_WORDS)?;
-        if estimate_circle(&p).is_circle_green() {
-            return Ok(p);
-        }
-    }
-    // Astronomically unreachable (>=32 consecutive sub-floor 12-word draws); return
-    // a final attempt rather than panicking in a non-security display path.
-    generate_diceware(NEW_CIRCLE_WORDS)
+    strength::generate_circle_phrase()
 }
 
 /// One chat message in a circle's stub transcript.
@@ -640,9 +620,12 @@ mod tests {
         // Run a batch so a single lucky draw can't hide a regression (ISC-13/19).
         for _ in 0..64 {
             let phrase = generate_circle_phrase().expect("generate");
-            assert_eq!(phrase.split_whitespace().count(), NEW_CIRCLE_WORDS);
+            assert_eq!(
+                phrase.split_whitespace().count(),
+                strength::CIRCLE_DICEWARE_WORDS
+            );
             assert!(
-                estimate_circle(&phrase).is_circle_green(),
+                strength::estimate_circle(&phrase).is_circle_green(),
                 "a generated circle phrase must clear the floor every time (ISC-19): {phrase:?}"
             );
         }

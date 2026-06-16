@@ -234,6 +234,36 @@ pub fn generate_default_diceware() -> Result<String, DicewareError> {
     generate_diceware(DEFAULT_DICEWARE_WORDS)
 }
 
+/// Word count for a generated circle phrase. 12 BIP-39 words ≈ 12 × 11 = 132 bits
+/// of real entropy, clearing the ISC-C9 ≥128-bit circle floor with margin. Hidden
+/// from the user (brief D3 — no exposed numbers).
+pub const CIRCLE_DICEWARE_WORDS: usize = 12;
+
+/// Generate a circle phrase that clears the SAME `is_circle_green` floor (ISC-C9)
+/// the circle-join gate enforces, so a generated phrase is never one the join flow
+/// would reject. This is the canonical home for both the GUI and the TUI circle-phrase
+/// generators — neither reimplements the loop.
+///
+/// **Why rejection-sampling, not a bare `generate_diceware(12)`:** the generator draws
+/// WITH replacement, so ~3% of 12-word phrases repeat a word. `estimate_circle` credits
+/// only DISTINCT words (a conservative key-space model), so a phrase with one duplicate
+/// scores 11 × 11 = 121 bits — below the 128 floor — even though its real entropy is
+/// 132 bits. Resampling until `is_circle_green` keeps the generated phrase consistent
+/// with the join gate and the "Looks strong" reassurance. The discarded draws carry the
+/// same real entropy; excluding them costs nothing and the remaining phrase space is
+/// still astronomically larger than 2¹²⁸.
+pub fn generate_circle_phrase() -> Result<String, DicewareError> {
+    for _ in 0..32 {
+        let p = generate_diceware(CIRCLE_DICEWARE_WORDS)?;
+        if estimate_circle(&p).is_circle_green() {
+            return Ok(p);
+        }
+    }
+    // Astronomically unreachable (≥32 consecutive sub-floor 12-word draws); return a
+    // final attempt rather than panicking in a non-security display path.
+    generate_diceware(CIRCLE_DICEWARE_WORDS)
+}
+
 fn sample_index(bound: u64, len: usize) -> Result<usize, getrandom::Error> {
     loop {
         let mut buf = [0u8; 8];
@@ -365,6 +395,27 @@ mod tests {
             "expected 132 bits, got {}",
             s.bits
         );
+    }
+
+    /// `generate_circle_phrase` must ALWAYS clear the ISC-C9 floor — the whole point
+    /// of the rejection-sampling loop. A bare `generate_diceware(12)` would fail this
+    /// ~1 − 0.97⁶⁴ ≈ 86% of the time (the ~3% per-draw dup-word flake compounds), so a
+    /// 64-sample batch makes a regression to the bare generator practically certain to
+    /// surface rather than hide behind a lucky single draw.
+    #[test]
+    fn generate_circle_phrase_always_clears_the_circle_floor() {
+        for _ in 0..64 {
+            let p = generate_circle_phrase().unwrap();
+            assert_eq!(
+                p.split_whitespace().count(),
+                CIRCLE_DICEWARE_WORDS,
+                "generated circle phrase must be {CIRCLE_DICEWARE_WORDS} words: {p:?}"
+            );
+            assert!(
+                estimate_circle(&p).is_circle_green(),
+                "generated circle phrase {p:?} must clear the ISC-C9 ≥128-bit floor every time"
+            );
+        }
     }
 
     /// The famous public xkcd phrase is only four words (two of which aren't even
