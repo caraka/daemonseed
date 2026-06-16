@@ -243,9 +243,15 @@ export component AppWindow inherits Window {
     // Unlock: Rust opens the blob under the passphrase; wrong → auth-error, right →
     // restore + enter "main" + connect under the persisted handle.
     callback unlock-submit(string);
-    // Auth-field focus is handled by each conditional step container's own `init`
-    // (the standard Slint autofocus pattern) — a sibling callback can't reach an id
-    // nested inside an `if`, and `init` fires exactly when that step appears.
+    // Focus the active auth field. Invoked DEFERRED from Rust (a 0ms single-shot,
+    // never from `init` — init-focus re-enters the property graph and panics) after
+    // routing to an auth screen. The fields live in `visible:`-toggled overlays
+    // (always instantiated), so these ids are reachable here, unlike an `if` subtree.
+    callback focus-auth();
+    focus-auth => {
+        if (root.screen == "unlock") { unlock_input.focus(); }
+        if (root.screen == "first-start" && root.fs-step == 0) { fs_pass_input.focus(); }
+    }
 
     // Global shortcut host: wraps the WHOLE UI (main + overlays) so a key event from
     // any focused field bubbles up here — Ctrl-K kept dying once focus moved into an
@@ -672,15 +678,20 @@ export component AppWindow inherits Window {
     } // end key-host FocusScope (wraps main + overlays so Ctrl-K keeps working
       // even when an overlay field holds focus)
 
-    // ── Round-6 auth gate: full-window, opaque, ON TOP of the shortcut host so it
-    // covers the shell until an identity is unlocked. Outside key-host so its own
-    // fields never trip the global Ctrl shortcuts. Hidden (screen == "main") in the
-    // offscreen render + once authenticated, so the existing shell is unchanged.
-    auth := Rectangle {
-        visible: root.screen != "main";
+    // ── Round-6 auth gate: TWO full-window overlays, ON TOP of the shortcut host.
+    // Toggled by `visible:` (NOT `if`) so switching to the shell HIDES rather than
+    // DESTROYS them. Destroying a focused field's subtree (an `if` going false) re-
+    // enters the partial_renderer's `free_graphics_resources` while `partial_cache`
+    // is borrowed → "RefCell already borrowed" (partial_renderer.rs:818); caraka hit
+    // this pressing Return on Unlock. Hiding never frees items, so no teardown, no
+    // crash. Always-instantiated ⇒ the field ids are reachable for deferred
+    // autofocus. Outside key-host so their fields don't trip the global Ctrl shortcuts.
+
+    // ── Daily-login Unlock ──
+    unlock-screen := Rectangle {
+        visible: root.screen == "unlock";
         width: 100%; height: 100%;
         background: #07080a;
-
         Rectangle {
             x: (parent.width - self.width) / 2; y: 70px;
             width: 560px; height: 470px;
@@ -692,42 +703,59 @@ export component AppWindow inherits Window {
                     Rectangle { }
                     SealedPill { }
                 }
-
-                // ── UNLOCK (daily login) ──
-                if root.screen == "unlock" : VerticalLayout {
-                    spacing: 14px; alignment: start;
-                    Text { text: "Welcome back"; color: #e4e8ee; font-size: 21px; }
-                    Text { text: "Enter your passphrase to unlock this device."; color: #8b93a1; font-size: 13px; wrap: word-wrap; }
-                    Rectangle {
-                        height: 46px; border-radius: 9px; background: #141517; border-width: 1px; border-color: #ffffff12;
-                        HorizontalLayout { padding-left: 12px;
-                            Text { text: "passphrase"; visible: root.unlock-passphrase == ""; color: #4d5560; font-size: 13px; vertical-alignment: center; }
-                        }
-                        HorizontalLayout { padding-left: 12px; padding-right: 12px;
-                            unlock_input := TextInput {
-                                text <=> root.unlock-passphrase;
-                                input-type: InputType.password;
-                                color: #d6dae1; font-size: 14px; vertical-alignment: center; single-line: true;
-                                accepted => { root.unlock-submit(root.unlock-passphrase); }
-                            }
-                        }
+                Text { text: "Welcome back"; color: #e4e8ee; font-size: 21px; }
+                Text { text: "Enter your passphrase to unlock this device."; color: #8b93a1; font-size: 13px; wrap: word-wrap; }
+                Rectangle {
+                    height: 46px; border-radius: 9px; background: #141517; border-width: 1px; border-color: #ffffff12;
+                    HorizontalLayout { padding-left: 12px;
+                        Text { text: "passphrase"; visible: root.unlock-passphrase == ""; color: #4d5560; font-size: 13px; vertical-alignment: center; }
                     }
-                    // Error line — STABLE computed Text (never an `if`, so a wrong-passphrase
-                    // attempt can't mutate the item tree mid-keystroke).
-                    Text { text: root.auth-error; color: #c0857d; font-size: 12px; }
-                    Rectangle { }
-                    HorizontalLayout {
-                        Rectangle { }
-                        PillButton { label: "Unlock"; primary: true; w: 130px; clicked => { root.unlock-submit(root.unlock-passphrase); } }
+                    HorizontalLayout { padding-left: 12px; padding-right: 12px;
+                        unlock_input := TextInput {
+                            text <=> root.unlock-passphrase;
+                            input-type: InputType.password;
+                            color: #d6dae1; font-size: 14px; vertical-alignment: center; single-line: true;
+                            accepted => { root.unlock-submit(root.unlock-passphrase); }
+                        }
                     }
                 }
+                Text { text: root.auth-error; color: #c0857d; font-size: 12px; }
+                Rectangle { }
+                HorizontalLayout {
+                    Rectangle { }
+                    PillButton { label: "Unlock"; primary: true; w: 130px; clicked => { root.unlock-submit(root.unlock-passphrase); } }
+                }
+            }
+        }
+    }
 
-                // ── FIRST-START (enrollment wizard) ──
-                if root.screen == "first-start" : VerticalLayout {
-                    spacing: 14px; alignment: start;
-
+    // ── First-start enrollment wizard ──
+    //
+    // The 4 steps OVERLAP inside a content area (each `visible: fs-step == N`, all
+    // at the same x/y filling the area) instead of `if`-mounting — so a step change
+    // is a visibility flip, never an item-tree teardown, and the fields are never
+    // destroyed (same crash-avoidance as the unlock overlay).
+    firststart-screen := Rectangle {
+        visible: root.screen == "first-start";
+        width: 100%; height: 100%;
+        background: #07080a;
+        Rectangle {
+            x: (parent.width - self.width) / 2; y: 70px;
+            width: 560px; height: 470px;
+            background: #0e0f11; border-radius: 14px; border-width: 1px; border-color: #ffffff18;
+            VerticalLayout {
+                padding: 26px; spacing: 14px; alignment: start;
+                HorizontalLayout {
+                    Text { text: "daemonseed"; color: #aeb6c2; font-size: 18px; vertical-alignment: center; }
+                    Rectangle { }
+                    SealedPill { }
+                }
+                // Overlapping step content (Rectangle = no layout, children stack).
+                Rectangle {
                     // step 0 — passphrase
-                    if root.fs-step == 0 : VerticalLayout {
+                    VerticalLayout {
+                        visible: root.fs-step == 0;
+                        x: 0; y: 0; width: 100%; height: 100%;
                         spacing: 12px; alignment: start;
                         Text { text: "Create your identity"; color: #e4e8ee; font-size: 21px; }
                         Text { text: "Choose a passphrase. It encrypts everything on this device — there is no reset, so make it strong and memorable."; color: #8b93a1; font-size: 13px; wrap: word-wrap; }
@@ -761,7 +789,9 @@ export component AppWindow inherits Window {
                     }
 
                     // step 1 — recovery phrase
-                    if root.fs-step == 1 : VerticalLayout {
+                    VerticalLayout {
+                        visible: root.fs-step == 1;
+                        x: 0; y: 0; width: 100%; height: 100%;
                         spacing: 12px; alignment: start;
                         Text { text: "Your recovery phrase"; color: #e4e8ee; font-size: 21px; }
                         Text { text: "Write these words down and keep them somewhere safe. They are the ONLY way to recover this identity."; color: #8b93a1; font-size: 13px; wrap: word-wrap; }
@@ -784,7 +814,9 @@ export component AppWindow inherits Window {
                     }
 
                     // step 2 — round-trip confirm
-                    if root.fs-step == 2 : VerticalLayout {
+                    VerticalLayout {
+                        visible: root.fs-step == 2;
+                        x: 0; y: 0; width: 100%; height: 100%;
                         spacing: 12px; alignment: start;
                         Text { text: "Confirm your phrase"; color: #e4e8ee; font-size: 21px; }
                         Text { text: "Type your recovery phrase back to confirm you saved it."; color: #8b93a1; font-size: 13px; wrap: word-wrap; }
@@ -813,7 +845,9 @@ export component AppWindow inherits Window {
                     }
 
                     // step 3 — display name
-                    if root.fs-step == 3 : VerticalLayout {
+                    VerticalLayout {
+                        visible: root.fs-step == 3;
+                        x: 0; y: 0; width: 100%; height: 100%;
                         spacing: 12px; alignment: start;
                         Text { text: "Pick a display name"; color: #e4e8ee; font-size: 21px; }
                         Text { text: "This is how others see you in chats. You can be anyone."; color: #8b93a1; font-size: 13px; wrap: word-wrap; }

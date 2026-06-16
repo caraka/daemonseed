@@ -1011,7 +1011,15 @@ fn route_startup(ui: &AppWindow, profile_root: &Rc<RefCell<PathBuf>>, portable: 
             )));
         }
     }
-    // Each auth screen's container `init` focuses its own field when it appears.
+    // Focus the active auth field, DEFERRED off this startup path (focusing during
+    // construction re-enters Slint's property graph and panics; a 0ms single-shot
+    // runs it once the window is live — the same pattern as the join-input focus).
+    let w = ui.as_weak();
+    defer(move || {
+        if let Some(ui) = w.upgrade() {
+            ui.invoke_focus_auth();
+        }
+    });
 }
 
 /// A fixed sample recovery phrase for offscreen rendering of the wizard's mnemonic /
