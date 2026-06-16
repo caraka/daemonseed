@@ -70,6 +70,18 @@ pub struct FetchRequest {
     pub name: String,
 }
 
+/// The target of a download action on a tree node (commit 2): which share, and which
+/// files within it. `selected: None` = the whole share (all files); `Some(indices)`
+/// is a subset keyed by manifest position — the `NetCommand::ConfirmFetch { selected }`
+/// contract. A right-click on a file yields its single index; on a folder, all its
+/// descendant files; on a share root, `None` (everything).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchTarget {
+    pub share_id: String,
+    pub name: String,
+    pub selected: Option<Vec<usize>>,
+}
+
 /// One manifest row as handed in by `main.rs` from a `NetEvent::FetchManifest`
 /// (decoupled from `net::ShareManifestEntry` so this module never imports the net
 /// layer). `index` is the file's position in the share manifest — the selection key
@@ -100,8 +112,8 @@ struct File {
     id: u64,
     name: String,
     size: u64,
-    /// Position in the share manifest — the `ConfirmFetch` selection key (commit 2).
-    #[allow(dead_code)]
+    /// Position in the share manifest — the `ConfirmFetch` selection key (used by
+    /// [`ShareBrowser::fetch_target`]).
     manifest_index: usize,
 }
 
@@ -303,6 +315,64 @@ impl ShareBrowser {
             }
         }
         out
+    }
+
+    /// Resolve a node id to a download target (commit 2): a share root → the whole
+    /// share (`selected: None`); a folder → its descendant files; a file → just
+    /// itself. `None` if the id is unknown. A share root resolves even when unloaded
+    /// (`ConfirmFetch { selected: None }` re-opens and fetches every file); a folder /
+    /// file id only exists once the manifest is loaded, so its selection is concrete.
+    pub fn fetch_target(&self, id: u64) -> Option<FetchTarget> {
+        for share in &self.shares {
+            if share.id == id {
+                return Some(FetchTarget {
+                    share_id: share.share_id.clone(),
+                    name: share.name.clone(),
+                    selected: None,
+                });
+            }
+            if let Some(indices) = indices_under(&share.children, id) {
+                return Some(FetchTarget {
+                    share_id: share.share_id.clone(),
+                    name: share.name.clone(),
+                    selected: Some(indices),
+                });
+            }
+        }
+        None
+    }
+}
+
+/// If `id` names a node within `level`, return its file manifest indices: a file →
+/// `[its index]`; a folder → all descendant file indices in tree order. `None` if the
+/// id is not in this subtree.
+fn indices_under(level: &[Node], id: u64) -> Option<Vec<usize>> {
+    for node in level {
+        match node {
+            Node::File(file) if file.id == id => return Some(vec![file.manifest_index]),
+            Node::File(_) => {}
+            Node::Dir(dir) => {
+                if dir.id == id {
+                    let mut acc = Vec::new();
+                    collect_file_indices(&dir.children, &mut acc);
+                    return Some(acc);
+                }
+                if let Some(found) = indices_under(&dir.children, id) {
+                    return Some(found);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Append every descendant file's manifest index under `level`, in tree order.
+fn collect_file_indices(level: &[Node], acc: &mut Vec<usize>) {
+    for node in level {
+        match node {
+            Node::File(file) => acc.push(file.manifest_index),
+            Node::Dir(dir) => collect_file_indices(&dir.children, acc),
+        }
     }
 }
 
@@ -631,6 +701,58 @@ mod tests {
             rows.iter().any(|r| r.label == "new"),
             "the new sibling appears"
         );
+    }
+
+    /// Build a loaded, fully-expanded share for fetch_target tests.
+    fn loaded_share() -> (ShareBrowser, u64) {
+        let mut b = ShareBrowser::new();
+        b.set_shares([("id-a", "share", "a#a")], None);
+        let share_id = b.rows()[0].id;
+        b.toggle(share_id);
+        b.load_manifest(
+            "id-a",
+            &[
+                m("reports/q3.pdf", 2048, 0),
+                m("reports/img/chart.png", 4096, 1),
+                m("README.md", 64, 2),
+            ],
+        );
+        (b, share_id)
+    }
+
+    #[test]
+    fn fetch_target_for_a_share_root_is_the_whole_share() {
+        let (b, share_id) = loaded_share();
+        let t = b.fetch_target(share_id).expect("share resolves");
+        assert_eq!(t.share_id, "id-a");
+        assert_eq!(t.selected, None, "a share root downloads everything");
+    }
+
+    #[test]
+    fn fetch_target_for_a_file_is_its_single_manifest_index() {
+        let (b, _) = loaded_share();
+        let readme = b.rows().iter().find(|r| r.label == "README.md").unwrap().id;
+        let t = b.fetch_target(readme).expect("file resolves");
+        assert_eq!(t.selected, Some(vec![2]), "README.md is manifest index 2");
+    }
+
+    #[test]
+    fn fetch_target_for_a_folder_is_all_its_descendant_files() {
+        let (b, _) = loaded_share();
+        // expand reports so its id is reachable, then target it.
+        let reports = b.rows().iter().find(|r| r.label == "reports").unwrap().id;
+        let t = b.fetch_target(reports).expect("folder resolves");
+        // reports/ holds q3.pdf (idx 0) and img/chart.png (idx 1) — both descendants.
+        let mut got = t.selected.expect("folder selects a subset");
+        got.sort_unstable();
+        assert_eq!(got, vec![0, 1], "folder pulls every descendant file");
+        assert_eq!(t.share_id, "id-a");
+    }
+
+    #[test]
+    fn fetch_target_for_unknown_id_is_none() {
+        let (b, _) = loaded_share();
+        assert_eq!(b.fetch_target(987_654), None);
     }
 
     #[test]

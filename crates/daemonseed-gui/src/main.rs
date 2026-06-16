@@ -41,7 +41,7 @@ use daemonseed_core::profile::resolve::{ResolveArgs, ResolvedProfileRoot, resolv
 use daemonseed_core::storage::seeds;
 use net::{NetCommand, NetEvent, NetHandle};
 use profile::Profile;
-use share_browser::{ManifestRow, NodeKind, ShareBrowser};
+use share_browser::{FetchTarget, ManifestRow, NodeKind, ShareBrowser};
 use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType, Rgb565Pixel};
 use slint::platform::{Platform, PlatformError, WindowAdapter};
 use slint::{ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel};
@@ -526,6 +526,18 @@ fn build_ui() -> BuiltUi {
             apply_share_rows(&ui, &browser.borrow());
         }
     });
+    // Right-click a node -> resolve its download target -> native folder picker
+    // (off-thread) -> ConfirmFetch to the chosen dir (commit 2).
+    ui.on_download_node({
+        let net = net.clone();
+        let browser = browser.clone();
+        move |id| {
+            let target = browser.borrow().fetch_target(id as u64);
+            if let Some(target) = target {
+                pick_dir_and_fetch(&net, target);
+            }
+        }
+    });
 
     // Action registry: one list, two surfaces (this palette + the rail empty-state
     // mouse-home). New circle / Join a circle now drive the real overlays.
@@ -576,6 +588,43 @@ fn apply_share_rows(ui: &AppWindow, browser: &ShareBrowser) {
         })
         .collect();
     ui.set_share_rows(ModelRc::from(Rc::new(VecModel::from(rows))));
+}
+
+/// Open the native folder picker OFF the UI thread and, if a folder is chosen, fire
+/// `ConfirmFetch` to it (commit 2). The xdg portal is async over D-Bus, so a dedicated
+/// thread with a current-thread tokio runtime drives the dialog; the destination is
+/// dispatched through a cloned `Send` command sender (the `Rc<NetHandle>` can't cross
+/// threads). The UI thread never blocks — chat + the download meter stay live while
+/// the dialog is open. A cancelled pick, or a system with no portal service, simply
+/// does nothing. `flat_dest: true` writes the selection under the chosen dir directly
+/// (a single file as its basename; a folder with its ancestors dropped).
+fn pick_dir_and_fetch(net: &Rc<RefCell<NetHandle>>, target: FetchTarget) {
+    let sender = net.borrow().command_sender();
+    let title = format!("Download \u{201c}{}\u{201d} to…", target.name);
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        let chosen = rt.block_on(async {
+            rfd::AsyncFileDialog::new()
+                .set_title(title)
+                .pick_folder()
+                .await
+                .map(|handle| handle.path().to_path_buf())
+        });
+        if let Some(dir) = chosen {
+            let _ = sender.send(NetCommand::ConfirmFetch {
+                share_id: target.share_id,
+                name: target.name,
+                fetched_root: dir,
+                selected: target.selected,
+                flat_dest: true,
+            });
+        }
+    });
 }
 
 /// Everything the running app must keep alive for its whole lifetime. **If this
@@ -814,25 +863,41 @@ fn apply_net_event(
         NetEvent::PublishError { message } => {
             let _ = message;
         }
+        // Download meter (commit 2): a simple label + fraction bar in the rail footer.
         NetEvent::FetchProgress {
             total_chunks,
             chunks_received,
             bytes_received,
         } => {
-            let _ = (total_chunks, chunks_received, bytes_received);
+            let _ = bytes_received;
+            let pct = match total_chunks {
+                Some(total) if total > 0 => chunks_received as f32 / total as f32,
+                _ => 0.0,
+            };
+            ui.set_download_progress(pct);
+            ui.set_download_label(SharedString::from(format!(
+                "Downloading… {}%",
+                (pct * 100.0) as u32
+            )));
         }
         NetEvent::FetchComplete {
             share_id,
             files_written,
             bytes_written,
         } => {
-            let _ = (share_id, files_written, bytes_written);
+            let _ = (share_id, bytes_written);
+            ui.set_download_progress(1.0);
+            ui.set_download_label(SharedString::from(format!(
+                "Downloaded {files_written} file{}",
+                if files_written == 1 { "" } else { "s" }
+            )));
         }
-        // A failed preview (FetchShare) surfaces on the status line. The variant has no
-        // share_id, so the expanded share's "loading…" can't be cleared yet — a known
-        // commit-2 follow-up (add share_id to FetchError when the meter lands).
+        // FetchError covers a failed download AND a failed preview (the variant carries
+        // no share_id to disambiguate). Surface it on the meter as the unified fetch
+        // status; SharesError (catalog refresh) stays on the tree's status line.
         NetEvent::FetchError { message } => {
-            ui.set_share_status(SharedString::from(format!("preview failed: {message}")));
+            ui.set_download_progress(0.0);
+            ui.set_download_label(SharedString::from(format!("Download failed: {message}")));
         }
     }
 }
@@ -1373,6 +1438,9 @@ fn main() {
             }
         }
         apply_share_rows(&ui, &browser.borrow());
+        // Show the rail-footer download meter mid-download too (fixture).
+        ui.set_download_label(SharedString::from("Downloading… 42%"));
+        ui.set_download_progress(0.42);
     } else {
         // Main shell offscreen: connect (renders connection-status) + drive flags.
         _live = Some(start_drain(

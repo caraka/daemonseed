@@ -320,6 +320,14 @@ impl NetHandle {
         self.cmd_tx.send(cmd).map_err(|e| e.0)
     }
 
+    /// A `Send + Clone` handle to the command channel, for code that must dispatch a
+    /// `NetCommand` from OFF the UI thread (the `Rc<RefCell<NetHandle>>` is UI-thread
+    /// only). The folder-picker thread holds one to fire `ConfirmFetch` once a
+    /// download destination is chosen (commit 2), without marshaling back to the UI.
+    pub fn command_sender(&self) -> mpsc::UnboundedSender<NetCommand> {
+        self.cmd_tx.clone()
+    }
+
     /// Non-blocking single-event poll. `Ok(None)` means "nothing right now";
     /// `Err(())` means the actor thread is gone (treat as offline).
     pub fn try_recv(&mut self) -> Result<Option<NetEvent>, ()> {

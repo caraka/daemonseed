@@ -117,9 +117,18 @@ component MsgBubble inherits Rectangle {
 component ShareTreeRow inherits Rectangle {
     in property <ShareRow> node;
     callback toggled(int);
+    callback downloadable(int);
     height: 30px;
     background: touch.has-hover ? #101113 : transparent;
     touch := TouchArea {
+        // Left-click toggles an expandable row; right-click downloads the node
+        // (file -> itself, folder -> its files, share -> all). OS-browser muscle
+        // memory: right-click > Download to…
+        pointer-event(e) => {
+            if (e.button == PointerEventButton.right && e.kind == PointerEventKind.down) {
+                root.downloadable(root.node.id);
+            }
+        }
         clicked => { if (root.node.expandable) { root.toggled(root.node.id); } }
     }
     HorizontalLayout {
@@ -201,6 +210,12 @@ export component AppWindow inherits Window {
     in property <[ShareRow]> share-rows;
     in property <string> share-status;
     in property <string> shares-empty-hint: "No shares yet — Refresh to see what daemons are sharing.";
+    // Download meter (commit 2), in the rail footer so it persists across tabs — a
+    // download keeps running while you return to Chat. Deliberately simple: a label +
+    // a fraction bar, no per-file detail (a full downloads pane is a later idea).
+    // `download-label` empty = hidden; `download-progress` is 0..1.
+    in property <string> download-label;
+    in property <float> download-progress: 0.0;
     in-out property <string> draft;           // live composer text, read by Rust on switch
     in-out property <length> scroll-y: 0px;   // Flickable viewport-y (negative when scrolled)
     in property <bool> sheet-open: false;
@@ -234,6 +249,10 @@ export component AppWindow inherits Window {
     callback refresh-shares();
     callback toggle-share-node(int);
     callback shares-tab-opened();
+    // Right-click a tree node (commit 2): Rust resolves it to a download target
+    // (file -> itself, folder -> its files, share -> all), opens the native folder
+    // picker off-thread, and fires ConfirmFetch to the chosen destination.
+    callback download-node(int);
 
     // Round-4 callbacks. `open-*` raise the overlays from EITHER surface (rail
     // empty-state or palette — action registry → two surfaces). `join-phrase-edited`
@@ -381,6 +400,24 @@ export component AppWindow inherits Window {
                 }
 
                 Rectangle { }
+                // Download meter (commit 2): a label + fraction bar, shown only while
+                // a download is in flight / just finished (`download-label` non-empty).
+                // Lives in the rail so it survives a return to Chat. Simple by design.
+                if root.download-label != "" : Rectangle {
+                    height: 36px;
+                    VerticalLayout {
+                        padding: 6px; spacing: 4px; alignment: center;
+                        Text { text: root.download-label; color: #8b93a1; font-size: 11px; overflow: elide; }
+                        Rectangle {
+                            height: 4px; border-radius: 2px; background: #1b1d20;
+                            Rectangle {
+                                x: 0px; height: 4px; border-radius: 2px;
+                                width: parent.width * root.download-progress;
+                                background: #4a9d8e;
+                            }
+                        }
+                    }
+                }
                 Rectangle { height: 22px;
                     TouchArea { clicked => { root.palette-open = true; } }
                     HorizontalLayout { padding: 6px; Text { text: "Ctrl+K   commands"; color: #8b93a1; font-size: 13px; vertical-alignment: center; } } }
@@ -457,6 +494,7 @@ export component AppWindow inherits Window {
                                     height: 38px;
                                     spacing: 10px;
                                     Text { text: "Shares"; color: #e4e8ee; font-size: 15px; vertical-alignment: center; }
+                                    Text { text: "· right-click an item to download"; color: #4d5560; font-size: 11px; vertical-alignment: center; }
                                     Text { text: root.share-status; color: #5b6472; font-size: 12px; vertical-alignment: center; }
                                     Rectangle { }
                                     PillButton { label: "Refresh"; w: 96px; clicked => { root.refresh-shares(); } }
@@ -474,6 +512,7 @@ export component AppWindow inherits Window {
                                             for r in root.share-rows : ShareTreeRow {
                                                 node: r;
                                                 toggled(id) => { root.toggle-share-node(id); }
+                                                downloadable(id) => { root.download-node(id); }
                                             }
                                         }
                                     }

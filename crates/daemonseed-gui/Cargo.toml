@@ -45,6 +45,14 @@ tokio = { workspace = true, features = ["rt", "macros", "time", "sync", "io-util
 tokio-stream = { workspace = true }
 tonic = { workspace = true }
 
+# Native folder picker for "Download to…" (commit 2). xdg-portal backend (async,
+# over the xdg-desktop-portal D-Bus service) — NO GTK link, keeping the binary lean
+# (ISC-C11); rfd uses native pickers on Android/iOS later. Driven on a dedicated
+# thread with a current-thread tokio runtime so the UI thread never blocks while the
+# dialog is open (caraka 2026-06-16). Needs a running portal service at RUNTIME only
+# (not to build); a system without one falls through to a cancelled pick.
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
+
 [build-dependencies]
 slint-build = { workspace = true }
 
