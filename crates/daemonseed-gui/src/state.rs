@@ -40,9 +40,9 @@ pub struct Msg {
 }
 
 /// A share you published this session — one entry in the Publish overlay's "Your
-/// live shares" list (each removable via Unpublish). RAM-only and session-scoped:
-/// the relay holds published shares ephemerally and nothing here survives relaunch
-/// (publish-persistence is a separate later slice).
+/// live shares" list (each removable via Unpublish). The `root` directory path is
+/// the M16 persistence key: it is remembered in the profile blob so the share
+/// auto-republishes next launch, and it is the key Unpublish forgets.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MyShare {
     /// Server-assigned opaque share id — the Unpublish key, set on `PublishStarted`.
@@ -51,6 +51,9 @@ pub struct MyShare {
     pub name: String,
     /// File count from the published manifest.
     pub files: usize,
+    /// The published directory path — the M16 persistence key (so Unpublish can
+    /// forget the right persisted root). Carried back on `PublishStarted`.
+    pub root: String,
 }
 
 /// The Round-5 **net contract** carried by a materialized circle (refinement #1).
@@ -191,21 +194,72 @@ impl GuiState {
     /// Record a share that just started serving this session (commit 3, on
     /// `PublishStarted`). Replaces any existing entry with the same id so a relay
     /// re-list can't double it.
-    pub fn add_my_share(&mut self, id: String, name: String, files: usize) {
+    pub fn add_my_share(&mut self, id: String, name: String, files: usize, root: String) {
         self.my_shares.retain(|s| s.id != id);
-        self.my_shares.push(MyShare { id, name, files });
+        self.my_shares.push(MyShare {
+            id,
+            name,
+            files,
+            root,
+        });
     }
 
     /// Drop a share that stopped serving (on `PublishStopped` — Unpublish, session
-    /// end, or relay reap). No-op if it was already gone.
-    pub fn remove_my_share(&mut self, id: &str) {
+    /// end, or relay reap). Returns the dropped share's `root` directory path so the
+    /// caller can forget it from the M16 persistence set; `None` if it was already
+    /// gone.
+    pub fn remove_my_share(&mut self, id: &str) -> Option<String> {
+        let root = self
+            .my_shares
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| s.root.clone());
         self.my_shares.retain(|s| s.id != id);
+        root
+    }
+
+    /// The persisted published-share roots (directory paths) the net actor must
+    /// silently re-publish on connect — read from the unlocked profile blob. Empty
+    /// on the no-profile (ephemeral) path.
+    pub fn persisted_published(&self) -> Vec<String> {
+        self.profile
+            .as_ref()
+            .map(Profile::published)
+            .unwrap_or_default()
+    }
+
+    /// Write-through (M16): remember a published share root in the unlocked profile
+    /// blob so it auto-republishes next launch. No-op (returns `Ok`) on the
+    /// ephemeral (no-profile) path; a disk / seal failure is surfaced as `Err`.
+    pub fn persist_published(&mut self, root: &str) -> Result<(), String> {
+        match self.profile.as_mut() {
+            Some(p) => p.persist_published(root).map(|_| ()),
+            None => Ok(()),
+        }
+    }
+
+    /// Write-through (M16): forget a published share root from the profile blob.
+    pub fn unpersist_published(&mut self, root: &str) -> Result<(), String> {
+        match self.profile.as_mut() {
+            Some(p) => p.unpersist_published(root).map(|_| ()),
+            None => Ok(()),
+        }
     }
 
     /// The shares published this session, in publish order — the Publish overlay's
     /// "Your live shares" list.
     pub fn my_shares(&self) -> &[MyShare] {
         &self.my_shares
+    }
+
+    /// The published directory path for a session share, keyed on its `share_id` —
+    /// the M16 persistence key the explicit Unpublish action forgets. `None` if no
+    /// session share has that id.
+    pub fn share_root(&self, id: &str) -> Option<String> {
+        self.my_shares
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| s.root.clone())
     }
 
     /// The `(circle_id, phrase)` set the net actor must silently re-join on connect
@@ -511,18 +565,27 @@ mod tests {
     fn my_shares_add_replace_remove() {
         let mut st = GuiState::lobby_only();
         assert!(st.my_shares().is_empty());
-        st.add_my_share("id-a".into(), "alpha".into(), 3);
-        st.add_my_share("id-b".into(), "beta".into(), 1);
+        st.add_my_share("id-a".into(), "alpha".into(), 3, "/shares/alpha".into());
+        st.add_my_share("id-b".into(), "beta".into(), 1, "/shares/beta".into());
         assert_eq!(st.my_shares().len(), 2);
+        // share_root keys the M16 persistence by id → published directory path.
+        assert_eq!(st.share_root("id-b").as_deref(), Some("/shares/beta"));
+        assert_eq!(st.share_root("id-zzz"), None);
         // Re-publish (same id) replaces, not duplicates — a relay re-list is idempotent.
-        st.add_my_share("id-a".into(), "alpha-renamed".into(), 9);
+        st.add_my_share(
+            "id-a".into(),
+            "alpha-renamed".into(),
+            9,
+            "/shares/alpha".into(),
+        );
         assert_eq!(st.my_shares().len(), 2);
         let a = st.my_shares().iter().find(|s| s.id == "id-a").unwrap();
         assert_eq!(a.name, "alpha-renamed");
         assert_eq!(a.files, 9);
-        // Unpublish drops by id; unknown id is a no-op.
-        st.remove_my_share("id-a");
-        st.remove_my_share("id-zzz");
+        assert_eq!(a.root, "/shares/alpha");
+        // Unpublish drops by id; unknown id is a no-op. (remove returns the dropped root.)
+        assert_eq!(st.remove_my_share("id-a").as_deref(), Some("/shares/alpha"));
+        assert_eq!(st.remove_my_share("id-zzz"), None);
         assert_eq!(st.my_shares().len(), 1);
         assert_eq!(st.my_shares()[0].id, "id-b");
     }
@@ -912,6 +975,90 @@ mod tests {
             st2.display_handle().as_deref(),
             Some("alice"),
             "the display handle survives reload"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// M16 publish-persistence round-trip: enroll → persist two published roots →
+    /// reload the blob from disk → the kept root is back in `persisted_published()`
+    /// (the auto-republish set) and the unpersisted one is gone. Mirrors the circle
+    /// round-trip; this is the persistence half of ISC-DS5 (live restart→republish is
+    /// the felt-test).
+    #[test]
+    fn profile_round_trips_published_shares_across_reload() {
+        use daemonseed_core::bootstrap::BootstrapAnchor;
+        use daemonseed_core::first_start::FirstStart;
+        use daemonseed_core::profile::config::ArgonParams;
+        use daemonseed_core::profile::persist::{
+            load_for_unlock, session_materials_from_unlock, write_first_start,
+        };
+        use daemonseed_core::storage::seeds;
+
+        let _ = oxicrypt_module::initialize();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "ds-gui-pubpersist-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let fast = ArgonParams {
+            memory_kib: 8,
+            iterations: 1,
+            parallelism: 1,
+        };
+        let pass = "correct horse battery staple table mountain";
+
+        let sealed = FirstStart::new().initialize(pass, fast).unwrap();
+        let phrase = sealed.display_phrase();
+        let verified = sealed.verify_round_trip(&phrase).unwrap();
+        let materials = verified
+            .finalize(
+                Some("alice".to_string()),
+                BootstrapAnchor {
+                    server_id: "relay#aabbccddeeff".to_string(),
+                    address: "127.0.0.1:443".to_string(),
+                },
+            )
+            .unwrap()
+            .into_session_materials();
+        write_first_start(&root, &materials, None, false).unwrap();
+
+        // Session 1: adopt the profile, persist two published roots, unpersist one.
+        let mut st1 = GuiState::lobby_only();
+        st1.set_profile(Profile::from_materials(materials, root.clone()));
+        assert!(
+            st1.persisted_published().is_empty(),
+            "nothing published on a fresh enrollment"
+        );
+        st1.persist_published("/home/alice/photos").unwrap();
+        st1.persist_published("/home/alice/docs").unwrap();
+        st1.persist_published("/home/alice/photos").unwrap(); // idempotent: no dup
+        st1.unpersist_published("/home/alice/docs").unwrap();
+        drop(st1);
+
+        // Session 2: reload the blob from disk under the passphrase.
+        let (config, blob) = load_for_unlock(&root).unwrap();
+        let opened = seeds::open(&blob, pass, config.profile_id, config.argon2).unwrap();
+        let materials2 = session_materials_from_unlock(
+            opened.seeds,
+            opened.key,
+            opened.index_key,
+            config,
+            blob.clone(),
+            vec![],
+        )
+        .unwrap();
+        let mut st2 = GuiState::lobby_only();
+        st2.set_profile(Profile::from_materials(materials2, root.clone()));
+
+        // The kept publish survived relaunch; the unpersisted one did not.
+        assert_eq!(
+            st2.persisted_published(),
+            vec!["/home/alice/photos".to_string()],
+            "exactly the kept published root auto-republishes next launch"
         );
 
         let _ = std::fs::remove_dir_all(&root);

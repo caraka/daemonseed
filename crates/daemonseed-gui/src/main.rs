@@ -609,10 +609,19 @@ fn build_ui() -> BuiltUi {
     // tree.
     ui.on_unpublish_share({
         let net = net.clone();
+        let state = state.clone();
         move |share_id| {
-            let _ = net.borrow().send(NetCommand::UnpublishShare {
-                share_id: share_id.to_string(),
-            });
+            let id = share_id.to_string();
+            // Explicit user Unpublish = "forget this share", so drop its persisted
+            // root (M16) — a later reconnect must NOT auto-republish it. PublishStopped
+            // drops it from the session list. Forgetting is keyed on the root path.
+            let root = state.borrow().share_root(&id);
+            if let Some(root) = root {
+                let _ = state.borrow_mut().unpersist_published(&root);
+            }
+            let _ = net
+                .borrow()
+                .send(NetCommand::UnpublishShare { share_id: id });
         }
     });
 
@@ -879,15 +888,23 @@ fn connect_now(
     match crypto {
         Ok(()) => {
             let (server_id, address) = relay_target();
-            let (display_handle, rejoin_circles) = {
+            let (display_handle, rejoin_circles, republish_roots) = {
                 let st = state.borrow();
-                (st.display_handle(), st.persisted_rejoins())
+                (
+                    st.display_handle(),
+                    st.persisted_rejoins(),
+                    st.persisted_published()
+                        .into_iter()
+                        .map(PathBuf::from)
+                        .collect::<Vec<_>>(),
+                )
             };
             let _ = net.borrow().send(NetCommand::Connect {
                 server_id,
                 address,
                 display_handle,
                 rejoin_circles,
+                republish_roots,
             });
         }
         Err(reason) => {
@@ -1025,15 +1042,30 @@ fn apply_net_event(
             share_id,
             name,
             file_count,
+            root,
         } => {
-            state
-                .borrow_mut()
-                .add_my_share(share_id, name.clone(), file_count);
+            // M16 write-through: remember this root so it auto-republishes next launch
+            // (idempotent). A persistence failure is non-fatal — the share still serves
+            // this session; surface it quietly like the circle write-through does.
+            let persist_err = {
+                let mut st = state.borrow_mut();
+                st.add_my_share(share_id, name.clone(), file_count, root.clone());
+                st.persist_published(&root).err()
+            };
             apply_my_shares(ui, &state.borrow());
-            let msg = format!("Published \u{201c}{name}\u{201d} · {file_count} file(s)");
+            let msg = match persist_err {
+                Some(e) => {
+                    format!("Published \u{201c}{name}\u{201d} · served this session only ({e})")
+                }
+                None => format!("Published \u{201c}{name}\u{201d} · {file_count} file(s)"),
+            };
             ui.set_publish_status(SharedString::from(msg.clone()));
             ui.set_share_status(SharedString::from(msg));
         }
+        // PublishStopped fires on user unpublish, session end, AND relay reap — so it
+        // only drops the session list; it must NOT forget the persisted root (that
+        // would defeat auto-republish on a reconnect). Forgetting is done on the
+        // explicit user Unpublish action (`on_unpublish_share`).
         NetEvent::PublishStopped { share_id } => {
             state.borrow_mut().remove_my_share(&share_id);
             apply_my_shares(ui, &state.borrow());
@@ -1697,8 +1729,18 @@ fn main() {
         ui.set_active_tab(1);
         {
             let mut st = state.borrow_mut();
-            st.add_my_share("id-mine-1".into(), "trip-photos".into(), 42);
-            st.add_my_share("id-mine-2".into(), "tax-2025".into(), 7);
+            st.add_my_share(
+                "id-mine-1".into(),
+                "trip-photos".into(),
+                42,
+                "/shares/trip".into(),
+            );
+            st.add_my_share(
+                "id-mine-2".into(),
+                "tax-2025".into(),
+                7,
+                "/shares/tax".into(),
+            );
         }
         apply_my_shares(&ui, &state.borrow());
         ui.set_publish_status(SharedString::from(

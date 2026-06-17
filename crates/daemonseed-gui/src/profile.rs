@@ -89,6 +89,35 @@ impl Profile {
         Ok(added)
     }
 
+    /// Published-share roots (directory paths) recorded in the blob — the M16
+    /// auto-republish set read at next launch.
+    pub fn published(&self) -> Vec<String> {
+        self.seeds.published().to_vec()
+    }
+
+    /// Remember a published share root (a directory path) and re-seal the blob to
+    /// disk, so the share auto-republishes next launch (M16 write-through). Returns
+    /// `Ok(true)` if newly remembered, `Ok(false)` if already present. A disk / seal
+    /// failure is surfaced as `Err(reason)`; the share still serves in RAM this
+    /// session regardless.
+    pub fn persist_published(&mut self, root: &str) -> Result<bool, String> {
+        let added = self.seeds.add_published(root);
+        if added {
+            self.reseal()?;
+        }
+        Ok(added)
+    }
+
+    /// Forget a published share root and re-seal. Returns `Ok(true)` if one was
+    /// removed, `Ok(false)` if it wasn't remembered.
+    pub fn unpersist_published(&mut self, root: &str) -> Result<bool, String> {
+        let removed = self.seeds.remove_published(root);
+        if removed {
+            self.reseal()?;
+        }
+        Ok(removed)
+    }
+
     /// Re-seal the current [`Seeds`] under the cached key and overwrite `seeds.blob`.
     fn reseal(&self) -> Result<(), String> {
         let bytes = self

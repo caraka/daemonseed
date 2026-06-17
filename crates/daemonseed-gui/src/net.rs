@@ -92,6 +92,12 @@ pub enum NetCommand {
         address: String,
         display_handle: Option<String>,
         rejoin_circles: Vec<(u64, String)>,
+        /// (M16) persisted published-share roots (directory paths) to silently
+        /// re-publish once the session is live — read from the at-rest blob, served
+        /// after the lobby auto-join exactly like `rejoin_circles`. Each republish
+        /// uses the directory basename as the share name and `display_handle` as the
+        /// sharer handle. Empty for the ephemeral / no-profile path.
+        republish_roots: Vec<PathBuf>,
     },
     /// Join (subscribe to) a public room by name. In this slice production Connect
     /// auto-joins the default room directly (via [`Actor::join_room`]); this
@@ -218,10 +224,13 @@ pub enum NetEvent {
     /// concerns. The connection itself may still be up.
     CircleError { circle_id: u64, reason: String },
     /// A share is now published and served; `share_id` is server-assigned (opaque).
+    /// `root` is the published directory path — carried back so the GUI can persist
+    /// it for auto-republish (M16) and key Unpublish on it.
     PublishStarted {
         share_id: String,
         name: String,
         file_count: usize,
+        root: String,
     },
     /// A published share stopped serving (unpublish, session end, or relay reap).
     PublishStopped { share_id: String },
@@ -422,6 +431,7 @@ impl Actor {
         address: &str,
         display_handle: Option<String>,
         rejoin_circles: Vec<(u64, String)>,
+        republish_roots: Vec<PathBuf>,
     ) {
         // Round 6: present under the persisted stable handle when unlocked from a
         // profile. The connection proof below stays ephemeral (D8) — only the
@@ -481,6 +491,19 @@ impl Actor {
                     for (circle_id, phrase) in rejoin_circles {
                         self.handle_join_circle(circle_id, &phrase).await;
                     }
+                    // M16: silently re-publish persisted shares now that the session
+                    // is live, exactly like the circle re-join above. Each uses the
+                    // directory basename as the share name and the presented handle
+                    // as the sharer handle; a per-share failure surfaces as a
+                    // PublishError and never aborts the others or the connect.
+                    let sharer = self.my_handle.clone();
+                    for root in republish_roots {
+                        let name = root
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "share".to_owned());
+                        self.handle_publish_share(root, name, sharer.clone()).await;
+                    }
                 }
                 Err(e) => {
                     self.emit(NetEvent::ConnectFailed {
@@ -507,6 +530,7 @@ impl Actor {
         server_id: String,
         display_handle: Option<String>,
         rejoin_circles: Vec<(u64, String)>,
+        republish_roots: Vec<PathBuf>,
     ) {
         // Round-6 parity: present under the persisted handle if supplied.
         if let Some(handle) = display_handle {
@@ -531,6 +555,15 @@ impl Actor {
         // Round-6 parity: silently re-join persisted circles via the real path.
         for (circle_id, phrase) in rejoin_circles {
             self.handle_join_circle(circle_id, &phrase).await;
+        }
+        // M16 parity: silently re-publish persisted shares via the real path.
+        let sharer = self.my_handle.clone();
+        for root in republish_roots {
+            let name = root
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "share".to_owned());
+            self.handle_publish_share(root, name, sharer.clone()).await;
         }
     }
 
@@ -896,6 +929,7 @@ impl Actor {
             share_id,
             name,
             file_count,
+            root: root.to_string_lossy().into_owned(),
         });
     }
 
@@ -1309,9 +1343,16 @@ async fn net_actor(
                 address,
                 display_handle,
                 rejoin_circles,
+                republish_roots,
             } => {
                 actor
-                    .handle_connect(&server_id, &address, display_handle, rejoin_circles)
+                    .handle_connect(
+                        &server_id,
+                        &address,
+                        display_handle,
+                        rejoin_circles,
+                        republish_roots,
+                    )
                     .await
             }
             NetCommand::JoinRoom { room } => actor.join_room(&room).await,
@@ -1353,7 +1394,13 @@ async fn net_actor(
                 rejoin_circles,
             } => {
                 actor
-                    .handle_attach(session, server_id, display_handle, rejoin_circles)
+                    .handle_attach(
+                        session,
+                        server_id,
+                        display_handle,
+                        rejoin_circles,
+                        Vec::new(), // attach seam drives join/send/fetch flows, not republish
+                    )
                     .await
             }
         }
