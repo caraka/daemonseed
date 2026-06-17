@@ -23,6 +23,23 @@ In-progress and next-milestone planning is tracked in the project lead's vault
 manifest (not committed). The next entry is added here at the moment a release
 is tagged, as part of the doc-sync ritual in `AGENTS.md`.
 
+## [0.26.0] — GUI Shares tab: public-share browse, download & publish
+
+The GUI gains the full public-share loop, matching the TUI's M16 surface.
+
+- **Browse:** the Shares tab is an OS-style lazy-expand tree of the relay's public
+  shares; each share previews its file manifest on first expand, with a manual
+  Refresh and a ~3s comparative-real-time poll while the tab is open.
+- **Download:** right-click any node (file / folder / whole share) → native folder
+  picker → SHA-384-verified fetch to the chosen directory, with a rail-footer meter.
+- **Publish:** a Publish overlay — choose a folder (optional name) → publish and serve
+  it from disk for the session; a live-shares list with one-click Unpublish; your own
+  shares are tagged "you" in the tree.
+- **Fixes from the felt-test:** enter a tokio runtime on the main thread so Slint's
+  winit xdg-settings watcher (zbus, forced onto tokio by rfd→ashpd) no longer panics
+  at startup; the Publish overlay stays open and reports its outcome; a guard refuses
+  to publish the home / system directories; auth fields re-focus after a failed unlock.
+
 ## [0.25.0] — GUI persistent identity: first-start + Unlock + silent circle rejoin
 
 The GUI gains an identity that survives a relaunch — the blocker to a multi-session
