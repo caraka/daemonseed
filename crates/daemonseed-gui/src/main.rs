@@ -1161,6 +1161,11 @@ fn defer_set_fs_step(ui: &AppWindow, step: i32) {
     defer(move || {
         if let Some(ui) = w.upgrade() {
             ui.set_fs_step(step);
+            // Focus the new step's entry field on arrival. focus-auth reads the
+            // just-set fs-step and is a no-op for the read-only mnemonic step and
+            // in offscreen mode. Already inside a defer, so reading the freshly-set
+            // property is safe (no synchronous property-graph re-entry).
+            ui.invoke_focus_auth();
         }
     });
 }
@@ -1247,6 +1252,7 @@ fn wire_auth(
                 ui.set_auth_error(SharedString::from(
                     "Those words don't match — check and try again.",
                 ));
+                refocus_auth(&ui); // stay on the confirm field so the user can retry by typing
                 return;
             }
             let Some(sealed) = wizard.borrow_mut().take_sealed() else {
@@ -1287,6 +1293,7 @@ fn wire_auth(
             let name = name.to_string();
             if name.trim().is_empty() {
                 ui.set_auth_error(SharedString::from("Pick a name others will see."));
+                refocus_auth(&ui); // stay on the name field so the user can retry by typing
                 return;
             }
             let Some(verified) = wizard.borrow_mut().take_verified() else {
@@ -1313,6 +1320,7 @@ fn wire_auth(
                 ui.set_auth_error(SharedString::from(format!(
                     "Couldn't save your profile: {e}"
                 )));
+                refocus_auth(&ui); // stay on the name step so the user can retry
                 return;
             }
             state

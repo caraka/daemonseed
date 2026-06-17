@@ -347,6 +347,10 @@ export component AppWindow inherits Window {
     focus-auth => {
         if (root.screen == "unlock") { unlock_input.focus(); }
         if (root.screen == "first-start" && root.fs-step == 0) { fs_pass_input.focus(); }
+        // Step 1 (mnemonic) is a read-and-save step — no field to focus. Steps 2/3
+        // are entry fields, so focus them on (re)entry the same way step 0 is.
+        if (root.screen == "first-start" && root.fs-step == 2) { fs_confirm_input.focus(); }
+        if (root.screen == "first-start" && root.fs-step == 3) { fs_name_input.focus(); }
     }
 
     // Global shortcut host: wraps the WHOLE UI (main + overlays) so a key event from
