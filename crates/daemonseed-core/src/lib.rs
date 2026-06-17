@@ -41,6 +41,7 @@ pub mod cot;
 pub mod crypto;
 pub mod federation;
 pub mod first_start;
+pub mod format;
 pub mod handle;
 pub mod identity;
 pub mod identity_proof;

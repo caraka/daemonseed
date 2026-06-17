@@ -14,6 +14,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph, Wrap};
 
 use daemonseed_core::backoff::CloseCause;
+use daemonseed_core::format::human_bytes;
 use daemonseed_core::handle::{DisplayMode, Handle};
 use daemonseed_core::mention::find_self_mentions;
 use daemonseed_core::passphrase::strength::SESSION_PASSPHRASE_MIN_BITS;
@@ -141,22 +142,6 @@ fn render_main(app: &App, frame: &mut Frame) {
 /// box showing the share id, sharer handle, current phase, and N-of-M chunk
 /// progress. While present, [`App::on_key`] routes input here (Esc cancels;
 /// Enter on a terminal state dismisses).
-/// Compact, display-only byte-size formatting for the fetch preview (binary
-/// units; one decimal above bytes). Not security-sensitive — purely cosmetic.
-fn human_bytes(n: u64) -> String {
-    const KB: f64 = 1024.0;
-    let f = n as f64;
-    if f < KB {
-        format!("{n} B")
-    } else if f < KB * KB {
-        format!("{:.1} KB", f / KB)
-    } else if f < KB * KB * KB {
-        format!("{:.1} MB", f / (KB * KB))
-    } else {
-        format!("{:.1} GB", f / (KB * KB * KB))
-    }
-}
-
 fn render_fetch_overlay(f: &FetchUi, frame: &mut Frame, area: Rect) {
     let is_preview = matches!(f.status, FetchStatus::Preview(_));
     // The preview needs vertical room for the file list; the transfer view is

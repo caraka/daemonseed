@@ -416,7 +416,7 @@ fn push_rows(level: &[Node], depth: u32, out: &mut Vec<Row>) {
                 id: file.id,
                 depth,
                 label: file.name.clone(),
-                size: human_bytes(file.size),
+                size: daemonseed_core::format::human_bytes(file.size),
                 kind: NodeKind::File,
                 expandable: false,
                 expanded: false,
@@ -451,24 +451,6 @@ fn sort_level(level: &mut [Node]) {
         };
         rank(a).cmp(&rank(b)).then_with(|| name(a).cmp(&name(b)))
     });
-}
-
-/// Compact, display-only byte-size formatting for the browse tree. Mirrors the
-/// TUI's private `human_bytes` (daemonseed-tui/src/ui.rs) — a deliberate, flagged
-/// duplication of a zero-correctness-risk display helper; consolidating both into a
-/// `daemonseed_core` home is queued for the pre-alpha cleanup round.
-fn human_bytes(n: u64) -> String {
-    const KB: f64 = 1024.0;
-    let f = n as f64;
-    if f < KB {
-        format!("{n} B")
-    } else if f < KB * KB {
-        format!("{:.1} KB", f / KB)
-    } else if f < KB * KB * KB {
-        format!("{:.1} MB", f / (KB * KB))
-    } else {
-        format!("{:.1} GB", f / (KB * KB * KB))
-    }
 }
 
 #[cfg(test)]
@@ -753,14 +735,5 @@ mod tests {
     fn fetch_target_for_unknown_id_is_none() {
         let (b, _) = loaded_share();
         assert_eq!(b.fetch_target(987_654), None);
-    }
-
-    #[test]
-    fn human_bytes_thresholds() {
-        assert_eq!(human_bytes(0), "0 B");
-        assert_eq!(human_bytes(512), "512 B");
-        assert_eq!(human_bytes(1024), "1.0 KB");
-        assert_eq!(human_bytes(1_572_864), "1.5 MB");
-        assert_eq!(human_bytes(3 * 1024 * 1024 * 1024), "3.0 GB");
     }
 }
