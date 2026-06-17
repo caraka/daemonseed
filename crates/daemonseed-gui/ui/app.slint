@@ -237,6 +237,7 @@ export component AppWindow inherits Window {
     in-out property <bool> publish-open: false;    // Publish overlay visible
     in-out property <string> publish-name;         // optional share name (blank → folder basename)
     in property <[MyShareRow]> my-shares;          // Rust-set: shares published this session
+    in-out property <string> publish-status;       // overlay feedback: "Publishing…" / result / error
     in-out property <string> join-phrase;          // live Join phrase (two-way to Rust)
     in property <bool> join-phrase-strong: false;  // Rust-set: estimate_circle().is_circle_green()
     in-out property <string> new-phrase;           // generated default; EDITABLE (two-way to Rust)
@@ -848,6 +849,15 @@ export component AppWindow inherits Window {
                     label: "Choose folder & publish"; primary: true; w: 210px;
                     clicked => { root.submit-publish(root.publish-name); }
                 }
+            }
+
+            // publish feedback: "Opening folder picker…" / "Published …" / the error
+            // reason (e.g. "not connected to a relay yet"). `visible:` not `if` so a
+            // status change never mutates the item tree mid-edit (partial_renderer).
+            Text {
+                text: root.publish-status;
+                visible: root.publish-status != "";
+                color: #8b93a1; font-size: 12px; wrap: word-wrap;
             }
 
             // "Your live shares" — published this session, each removable.

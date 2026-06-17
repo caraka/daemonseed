@@ -556,6 +556,7 @@ fn build_ui() -> BuiltUi {
             ui.set_new_open(false);
             ui.set_palette_open(false);
             ui.set_publish_name(SharedString::from(""));
+            ui.set_publish_status(SharedString::from(""));
             apply_my_shares(&ui, &state.borrow());
             ui.set_publish_open(true);
         }
@@ -571,7 +572,11 @@ fn build_ui() -> BuiltUi {
         move |name| {
             let ui = weak.unwrap();
             let sharer_handle = state.borrow().display_handle().unwrap_or_default();
-            ui.set_publish_open(false);
+            // Keep the overlay OPEN so the outcome lands somewhere visible: the picker
+            // opens over it, then PublishStarted populates "Your live shares" (or
+            // PublishError shows the reason). Closing it on submit made a successful
+            // publish look like nothing happened.
+            ui.set_publish_status(SharedString::from("Opening folder picker…"));
             pick_dir_and_publish(&net, name.to_string(), sharer_handle);
         }
     });
@@ -964,16 +969,18 @@ fn apply_net_event(
                 .borrow_mut()
                 .add_my_share(share_id, name.clone(), file_count);
             apply_my_shares(ui, &state.borrow());
-            ui.set_share_status(SharedString::from(format!(
-                "Published \u{201c}{name}\u{201d} · {file_count} file(s)"
-            )));
+            let msg = format!("Published \u{201c}{name}\u{201d} · {file_count} file(s)");
+            ui.set_publish_status(SharedString::from(msg.clone()));
+            ui.set_share_status(SharedString::from(msg));
         }
         NetEvent::PublishStopped { share_id } => {
             state.borrow_mut().remove_my_share(&share_id);
             apply_my_shares(ui, &state.borrow());
         }
         NetEvent::PublishError { message } => {
-            ui.set_share_status(SharedString::from(format!("Publish failed: {message}")));
+            let msg = format!("Publish failed: {message}");
+            ui.set_publish_status(SharedString::from(msg.clone()));
+            ui.set_share_status(SharedString::from(msg));
         }
         // Download meter (commit 2): a simple label + fraction bar in the rail footer.
         NetEvent::FetchProgress {
@@ -1584,6 +1591,9 @@ fn main() {
             st.add_my_share("id-mine-2".into(), "tax-2025".into(), 7);
         }
         apply_my_shares(&ui, &state.borrow());
+        ui.set_publish_status(SharedString::from(
+            "Published \u{201c}trip-photos\u{201d} · 42 file(s)",
+        ));
         ui.set_publish_open(true);
     } else {
         // Main shell offscreen: connect (renders connection-status) + drive flags.
