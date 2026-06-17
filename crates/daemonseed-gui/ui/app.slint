@@ -201,7 +201,12 @@ component TabLabel inherits TouchArea {
 }
 
 export component AppWindow inherits Window {
-    width: 1100px; height: 680px;
+    // Resizable: prefer the 1100x680 default but let the window adopt the real
+    // surface (down to a small floor) so the shell + auth overlays reflow instead
+    // of being clipped. A fixed width/height made the surface non-reflowing, which
+    // on small/software-rendered surfaces pushed the passphrase field off-screen.
+    preferred-width: 1100px; preferred-height: 680px;
+    min-width: 720px; min-height: 480px;
     background: #07080a;
 
     in property <[CircleData]> circles;
