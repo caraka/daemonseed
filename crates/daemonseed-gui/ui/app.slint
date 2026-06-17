@@ -315,8 +315,8 @@ export component AppWindow inherits Window {
     in-out property <string> fs-passphrase;            // two-way; the chosen unlock passphrase
     in property <bool> fs-passphrase-strong: false;    // Rust-set: estimate().is_session_green()
     in property <string> fs-mnemonic;                  // Rust-set: the 24-word recovery phrase
-    in-out property <string> fs-confirm;               // two-way; round-trip re-entry of the phrase
-    in property <bool> fs-confirm-match: false;        // Rust-set: confirm == mnemonic (verified path)
+    in-out property <string> fs-confirm;               // two-way; the typed-back C34 challenge words
+    in property <string> fs-typeback-prompt;           // Rust-set: "Type words #4, #12 and #22 …" (C34)
     in-out property <string> fs-name;                  // two-way; chosen display name
     in-out property <string> unlock-passphrase;        // two-way; daily-login passphrase
     in property <string> auth-error;                   // Rust-set: weak / mismatch / wrong-passphrase line
@@ -329,9 +329,8 @@ export component AppWindow inherits Window {
     callback fs-passphrase-next();
     // Step 1 → 2: "I've saved it" — Rust advances + defers focus to the confirm field.
     callback fs-saved-next();
-    // Recompute whether the round-trip re-entry matches the shown phrase.
-    callback fs-confirm-edited(string);
-    // Step 2 → 3: Rust runs verify_round_trip; on match it advances, else auth-error.
+    // Step 2 → 3: Rust pre-checks the C34 type-back answers; on match it advances,
+    // else re-issues a fresh challenge + auth-error.
     callback fs-confirm-next();
     // Step 3 finish: Rust finalizes with the display name, persists the profile,
     // enters "main", and connects under the new identity.
@@ -1047,29 +1046,23 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    // step 2 — round-trip confirm
+                    // step 2 — C34 type-back confirm (3 words by position)
                     VerticalLayout {
                         visible: root.fs-step == 2;
                         x: 0; y: 0; width: 100%; height: 100%;
                         spacing: 12px; alignment: start;
-                        Text { text: "Confirm your phrase"; color: #e4e8ee; font-size: 21px; }
-                        Text { text: "Type your recovery phrase back to confirm you saved it."; color: #8b93a1; font-size: 13px; wrap: word-wrap; }
+                        Text { text: "Confirm your backup"; color: #e4e8ee; font-size: 21px; }
+                        Text { text: root.fs-typeback-prompt; color: #8b93a1; font-size: 13px; wrap: word-wrap; }
                         Rectangle {
                             height: 80px; border-radius: 10px; background: #141517; border-width: 1px; border-color: #ffffff12;
                             HorizontalLayout { padding: 12px;
                                 fs_confirm_input := TextInput {
                                     text <=> root.fs-confirm;
                                     color: #d6dae1; font-size: 14px; wrap: word-wrap; vertical-alignment: top; single-line: false;
-                                    edited => { root.fs-confirm-edited(root.fs-confirm); }
                                 }
                             }
                         }
-                        Text {
-                            text: root.fs-confirm-match ? "Matches — you're set"
-                                : root.fs-confirm != "" ? "Doesn't match yet." : "";
-                            color: root.fs-confirm-match ? #6fb3a4 : #8b7d5b;
-                            font-size: 12px;
-                        }
+                        Text { text: "Separate the words with spaces, in order."; color: #8b7d5b; font-size: 12px; }
                         Text { text: root.auth-error; color: #c0857d; font-size: 12px; }
                         Rectangle { }
                         HorizontalLayout {

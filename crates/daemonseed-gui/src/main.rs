@@ -33,7 +33,10 @@ mod state;
 slint::include_modules!();
 
 use daemonseed_core::bootstrap::BootstrapAnchor;
-use daemonseed_core::first_start::{BackupVerified, FirstStart, FirstStartError, Sealed};
+use daemonseed_core::first_start::{
+    BackupVerified, FirstStart, FirstStartError, Sealed, TypeBackChallenge,
+};
+use daemonseed_core::handle::display_name::OsRng;
 use daemonseed_core::passphrase::strength::{estimate, estimate_circle};
 use daemonseed_core::profile::config::ArgonParams;
 use daemonseed_core::profile::persist::{
@@ -152,17 +155,38 @@ impl Wizard {
     }
 }
 
-/// EXACT replica of the core's private `first_start::orchestrator::phrases_match`
-/// (split-whitespace + lowercase, compared word-for-word). Used as the round-trip
-/// PRE-check: `verify_round_trip` consumes the `Sealed` state by value, so calling
-/// it on a mismatch would destroy the enrollment (and regenerate a DIFFERENT
-/// mnemonic on retry — the phrase the user already wrote down). By gating on a
-/// byte-identical normalization first, `verify_round_trip` is only ever invoked
-/// when it will succeed, so the Sealed state is preserved across a mistyped confirm.
-fn phrases_match(a: &str, b: &str) -> bool {
-    let an: Vec<String> = a.split_whitespace().map(|w| w.to_lowercase()).collect();
-    let bn: Vec<String> = b.split_whitespace().map(|w| w.to_lowercase()).collect();
-    an == bn
+/// Human-readable prompt for a C34 type-back challenge: the 1-based word positions
+/// the user must re-enter (e.g. "Type words #4, #12 and #22 of your recovery
+/// phrase."). Positions come from the challenge in ascending order.
+fn typeback_prompt(challenge: &TypeBackChallenge) -> String {
+    let nums: Vec<String> = challenge
+        .positions()
+        .iter()
+        .map(|p| format!("#{}", p + 1))
+        .collect();
+    match nums.as_slice() {
+        [] => "Type the requested words of your recovery phrase.".to_owned(),
+        [a] => format!("Type word {a} of your recovery phrase."),
+        [rest @ .., last] => format!(
+            "Type words {} and {last} of your recovery phrase.",
+            rest.join(", ")
+        ),
+    }
+}
+
+/// PRE-check a C34 type-back answer set against the held mnemonic + challenge,
+/// case-insensitively, WITHOUT consuming anything. `verify_type_back` consumes the
+/// `Sealed` state by value, so (as with the old round-trip) it is only ever invoked
+/// when it will succeed — a typo must not destroy the enrollment.
+fn type_back_precheck(challenge: &TypeBackChallenge, mnemonic: &str, answers: &[String]) -> bool {
+    let words: Vec<&str> = mnemonic.split_whitespace().collect();
+    let positions = challenge.positions();
+    positions.len() == answers.len()
+        && positions.iter().zip(answers).all(|(p, a)| {
+            words
+                .get(*p)
+                .is_some_and(|w| w.eq_ignore_ascii_case(a.trim()))
+        })
 }
 
 /// Convert a circle's `Vec<Msg>` into a Slint `ModelRc<MsgData>`.
@@ -1180,6 +1204,7 @@ fn wire_auth(
     net: &Rc<RefCell<NetHandle>>,
     crypto: Result<(), String>,
     wizard: Rc<RefCell<Wizard>>,
+    challenge: Rc<RefCell<Option<TypeBackChallenge>>>,
     profile_root: Rc<RefCell<PathBuf>>,
 ) {
     // Live (hidden) passphrase strength against the session floor (ISC-C12).
@@ -1219,50 +1244,72 @@ fn wire_auth(
         }
     });
 
-    // Step 1 → 2: "I've saved it" — advance + focus the confirm field (deferred).
+    // Step 1 → 2: "I've saved it" — issue a fresh C34 type-back challenge from the
+    // sealed mnemonic (3 words by position), then advance + focus the field.
     ui.on_fs_saved_next({
         let weak = ui.as_weak();
+        let wizard = wizard.clone();
+        let challenge = challenge.clone();
         move || {
             let ui = weak.unwrap();
             ui.set_auth_error(SharedString::from(""));
             ui.set_fs_confirm(SharedString::from(""));
+            if let Wizard::Sealed(s) = &*wizard.borrow() {
+                let ch = s.issue_type_back_challenge(&mut OsRng);
+                ui.set_fs_typeback_prompt(SharedString::from(typeback_prompt(&ch)));
+                *challenge.borrow_mut() = Some(ch);
+            }
             defer_set_fs_step(&ui, 2);
         }
     });
 
-    // Live match hint on the round-trip re-entry (same normalization as the core).
-    ui.on_fs_confirm_edited({
-        let weak = ui.as_weak();
-        move |text| {
-            let ui = weak.unwrap();
-            ui.set_fs_confirm_match(phrases_match(text.as_str(), ui.get_fs_mnemonic().as_str()));
-        }
-    });
-
-    // Step 2 → 3: a PRE-checked round-trip verify (never consumes Sealed on a
-    // mismatch — see `phrases_match`), then advance to the name step.
+    // Step 2 → 3 (C34 type-back): pre-check the 3 answers against the held mnemonic
+    // + challenge positions; only the matching path invokes the consuming
+    // `verify_type_back`. A wrong answer re-issues a fresh challenge (per the core's
+    // per-attempt contract) and keeps the Sealed state, so the user can retry.
     ui.on_fs_confirm_next({
         let weak = ui.as_weak();
         let wizard = wizard.clone();
+        let challenge = challenge.clone();
         move || {
             let ui = weak.unwrap();
-            let confirm = ui.get_fs_confirm().to_string();
+            let answers: Vec<String> = ui
+                .get_fs_confirm()
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect();
             let mnemonic = ui.get_fs_mnemonic().to_string();
-            if !phrases_match(&confirm, &mnemonic) {
+
+            let passed = challenge
+                .borrow()
+                .as_ref()
+                .is_some_and(|ch| type_back_precheck(ch, &mnemonic, &answers));
+
+            if !passed {
+                // Re-issue a fresh challenge (keeps the Sealed state intact).
+                if let Wizard::Sealed(s) = &*wizard.borrow() {
+                    let ch = s.issue_type_back_challenge(&mut OsRng);
+                    ui.set_fs_typeback_prompt(SharedString::from(typeback_prompt(&ch)));
+                    *challenge.borrow_mut() = Some(ch);
+                }
+                ui.set_fs_confirm(SharedString::from(""));
                 ui.set_auth_error(SharedString::from(
-                    "Those words don't match — check and try again.",
+                    "Those words don't match — here's a new set to try.",
                 ));
-                refocus_auth(&ui); // stay on the confirm field so the user can retry by typing
+                refocus_auth(&ui);
                 return;
             }
-            let Some(sealed) = wizard.borrow_mut().take_sealed() else {
+
+            let sealed = wizard.borrow_mut().take_sealed();
+            let ch = challenge.borrow_mut().take();
+            let (Some(sealed), Some(ch)) = (sealed, ch) else {
                 ui.set_auth_error(SharedString::from(
                     "Enrollment state lost — please start over.",
                 ));
                 defer_set_fs_step(&ui, 0);
                 return;
             };
-            match sealed.verify_round_trip(&confirm) {
+            match sealed.verify_type_back(ch, &answers) {
                 Ok(verified) => {
                     *wizard.borrow_mut() = Wizard::Verified(verified);
                     ui.set_auth_error(SharedString::from(""));
@@ -1506,6 +1553,9 @@ fn main() {
     // Round-6 auth state, shared into the wizard/unlock callbacks: the FirstStart
     // machine and the profile root to write/read.
     let wizard = Rc::new(RefCell::new(Wizard::Empty));
+    // The current C34 type-back challenge (3 word positions), issued on entry to the
+    // confirm step and re-issued per failed attempt.
+    let challenge: Rc<RefCell<Option<TypeBackChallenge>>> = Rc::new(RefCell::new(None));
     let profile_root = Rc::new(RefCell::new(PathBuf::new()));
 
     #[cfg(feature = "desktop")]
@@ -1534,6 +1584,7 @@ fn main() {
             &net,
             crypto.clone(),
             wizard.clone(),
+            challenge.clone(),
             profile_root.clone(),
         );
         // The drain timer runs for the whole app life; the Connect is deferred to
@@ -1558,6 +1609,7 @@ fn main() {
         &net,
         crypto.clone(),
         wizard.clone(),
+        challenge.clone(),
         profile_root.clone(),
     );
     ui.show().expect("show");
@@ -1578,6 +1630,13 @@ fn main() {
         ui.set_fs_step(fs_step_flag);
         if fs_step_flag >= 1 {
             ui.set_fs_mnemonic(SharedString::from(SAMPLE_MNEMONIC));
+        }
+        if fs_step_flag == 2 {
+            // The live prompt is issued by fs_saved_next, which a direct step-set
+            // bypasses — seed a representative C34 prompt so the PNG shows the step.
+            ui.set_fs_typeback_prompt(SharedString::from(
+                "Type words #4, #12 and #22 of your recovery phrase.",
+            ));
         }
     } else if unlock_flag {
         ui.set_screen(SharedString::from("unlock"));
@@ -1694,4 +1753,75 @@ fn main() {
     let path = screenshot.unwrap_or_else(|| "daemonseed-gui.png".into());
     render_png(&window, &path);
     drop(_live);
+}
+
+#[cfg(test)]
+#[allow(clippy::indexing_slicing, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    // 24 real BIP-39 words (positions 0..=23) so a challenge can sample from them.
+    const PHRASE: &str = "abandon ability able about above absent absorb abstract absurd \
+        abuse access accident account accuse achieve acid acoustic acquire across act \
+        action actor actress actual";
+
+    fn sample_challenge() -> TypeBackChallenge {
+        TypeBackChallenge::new(PHRASE, &mut OsRng)
+    }
+
+    fn correct_answers(ch: &TypeBackChallenge) -> Vec<String> {
+        let words: Vec<&str> = PHRASE.split_whitespace().collect();
+        ch.positions()
+            .iter()
+            .map(|p| words[*p].to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn precheck_accepts_correct_answers() {
+        let ch = sample_challenge();
+        assert!(type_back_precheck(&ch, PHRASE, &correct_answers(&ch)));
+    }
+
+    #[test]
+    fn precheck_is_case_insensitive_and_trims() {
+        let ch = sample_challenge();
+        let ans: Vec<String> = correct_answers(&ch)
+            .iter()
+            .map(|w| format!("  {} ", w.to_uppercase()))
+            .collect();
+        assert!(type_back_precheck(&ch, PHRASE, &ans));
+    }
+
+    #[test]
+    fn precheck_rejects_wrong_word() {
+        let ch = sample_challenge();
+        let mut ans = correct_answers(&ch);
+        ans[0] = "zzzzz".to_owned();
+        assert!(!type_back_precheck(&ch, PHRASE, &ans));
+    }
+
+    #[test]
+    fn precheck_rejects_wrong_count() {
+        let ch = sample_challenge();
+        let mut short = correct_answers(&ch);
+        short.pop();
+        assert!(!type_back_precheck(&ch, PHRASE, &short));
+        assert!(!type_back_precheck(&ch, PHRASE, &[]));
+    }
+
+    #[test]
+    fn prompt_names_each_position_one_based() {
+        let ch = sample_challenge();
+        let p = typeback_prompt(&ch);
+        for pos in ch.positions() {
+            assert!(
+                p.contains(&format!("#{}", pos + 1)),
+                "prompt {p:?} missing #{}",
+                pos + 1
+            );
+        }
+        assert!(p.contains("Type words"));
+        assert!(p.ends_with("of your recovery phrase."));
+    }
 }
