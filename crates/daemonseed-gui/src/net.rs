@@ -812,6 +812,17 @@ impl Actor {
     /// Publish `root` as a public share and serve it from disk for the session.
     /// See [`NetCommand::PublishShare`].
     async fn handle_publish_share(&mut self, root: PathBuf, name: String, sharer_handle: String) {
+        // Fail-safe: never recursively hash the home tree / a system dir. A picker that
+        // returns the default directory (some xdg portals do) would otherwise index all
+        // of $HOME and appear to hang. Reject with a clear error instead.
+        if is_unsafe_publish_root(&root) {
+            return self.emit(NetEvent::PublishError {
+                message: format!(
+                    "refusing to publish {} — pick a specific folder, not your home or a system directory",
+                    root.display()
+                ),
+            });
+        }
         let Some(session) = self.session.clone() else {
             return self.emit(NetEvent::PublishError {
                 message: "not connected to a relay yet".to_owned(),
@@ -1181,6 +1192,25 @@ impl Actor {
             manifest,
         })
     }
+}
+
+/// True if `root` is the home directory, an ancestor of it, or the filesystem root —
+/// directories we must never recursively hash for a share. A picker that returns the
+/// default dir (some xdg portals do) would otherwise index all of `$HOME` and hang.
+/// Canonicalizes both sides; falls back to the raw path if that fails.
+fn is_unsafe_publish_root(root: &std::path::Path) -> bool {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    if root.parent().is_none() {
+        return true; // filesystem root "/"
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = std::path::PathBuf::from(home);
+        let home = home.canonicalize().unwrap_or(home);
+        if root == home || home.starts_with(&root) {
+            return true; // the home dir itself, or an ancestor of it (/home, /)
+        }
+    }
+    false
 }
 
 /// A live fetch stream plus the decoded manifest. The GUI analog of the TUI's

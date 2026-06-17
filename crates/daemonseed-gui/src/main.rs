@@ -703,6 +703,28 @@ fn pick_dir_and_fetch(net: &Rc<RefCell<NetHandle>>, target: FetchTarget) {
 /// cancelled pick (or a system with no portal) simply does nothing.
 fn pick_dir_and_publish(net: &Rc<RefCell<NetHandle>>, name: String, sharer_handle: String) {
     let sender = net.borrow().command_sender();
+    // Headless-test escape hatch (private-phase, review before public): this VM's xdg
+    // portal picker drops selection clicks and returns the default dir, so set
+    // DAEMONSEED_PUBLISH_DIR=<path> to publish that folder directly and exercise the
+    // publish→serve→fetch pipeline without the portal. Ignored unless it names a dir.
+    if let Ok(dir) = std::env::var("DAEMONSEED_PUBLISH_DIR") {
+        let dir = std::path::PathBuf::from(dir.trim());
+        if dir.is_dir() {
+            let name = if name.trim().is_empty() {
+                dir.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "share".to_string())
+            } else {
+                name
+            };
+            let _ = sender.send(NetCommand::PublishShare {
+                root: dir,
+                name,
+                sharer_handle,
+            });
+            return;
+        }
+    }
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -730,6 +752,21 @@ fn pick_dir_and_publish(net: &Rc<RefCell<NetHandle>>, name: String, sharer_handl
                 name,
                 sharer_handle,
             });
+        }
+    });
+}
+
+/// Re-focus the active auth field after a FAILED attempt (wrong/weak passphrase,
+/// mismatch, …) so the user can retry by just typing — essential on hosts where the
+/// WM drops pointer clicks (this VM's software-render path), where clicking back into
+/// the field to recover focus may never register. Deferred: focusing synchronously
+/// from inside the submit callback re-enters the property graph and panics. No-op in
+/// offscreen mode (`defer` doesn't fire without an event loop).
+fn refocus_auth(ui: &AppWindow) {
+    let w = ui.as_weak();
+    defer(move || {
+        if let Some(ui) = w.upgrade() {
+            ui.invoke_focus_auth();
         }
     });
 }
@@ -1167,9 +1204,11 @@ fn wire_auth(
                     ui.set_auth_error(SharedString::from(
                         "That passphrase is too easy to guess — add a few more words.",
                     ));
+                    refocus_auth(&ui);
                 }
                 Err(e) => {
                     ui.set_auth_error(SharedString::from(format!("Couldn't create identity: {e}")));
+                    refocus_auth(&ui);
                 }
             }
         }
@@ -1299,6 +1338,7 @@ fn wire_auth(
                 Ok(x) => x,
                 Err(e) => {
                     ui.set_auth_error(SharedString::from(format!("Couldn't read profile: {e}")));
+                    refocus_auth(&ui);
                     return;
                 }
             };
@@ -1306,10 +1346,12 @@ fn wire_auth(
                 Ok(o) => o,
                 Err(seeds::BlobError::AuthenticationFailed) => {
                     ui.set_auth_error(SharedString::from("Wrong passphrase."));
+                    refocus_auth(&ui);
                     return;
                 }
                 Err(e) => {
                     ui.set_auth_error(SharedString::from(format!("Couldn't unlock: {e}")));
+                    refocus_auth(&ui);
                     return;
                 }
             };
@@ -1326,6 +1368,7 @@ fn wire_auth(
                     ui.set_auth_error(SharedString::from(format!(
                         "Couldn't restore identity: {e}"
                     )));
+                    refocus_auth(&ui);
                     return;
                 }
             };
