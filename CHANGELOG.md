@@ -23,6 +23,26 @@ In-progress and next-milestone planning is tracked in the project lead's vault
 manifest (not committed). The next entry is added here at the moment a release
 is tagged, as part of the doc-sync ritual in `AGENTS.md`.
 
+## [0.27.0] — GUI Shares-tab cleanup (round 1)
+
+Post-`v0.26.0` cleanup of the GUI Shares tab and first-start flow, plus one core
+refactor. Felt-tested on Ubuntu noble via an AppImage build.
+
+- **Publish-persistence:** published shares survive restart and auto-republish on
+  Unlock — the share's root is written through to the at-rest seeds blob (M16);
+  explicit Unpublish forgets it, while a disconnect-reap restores it on reconnect.
+- **First-start backup-verify is the C34 3-word type-back:** the C33 full-phrase
+  round-trip is replaced by typing back 3 random words at cryptographically-chosen
+  positions, with a non-consuming pre-check (a typo never destroys the sealed
+  enrollment) and a fresh challenge per failed attempt. ISC-C47 amended to make C34
+  the sole skip-backup confirmation.
+- **Resizable window:** the GUI is no longer fixed at 1100×680 — it reflows to a
+  720×480 floor so the shell and auth overlays no longer clip.
+- **First-start focus:** auth fields focus on step entry and on error paths
+  (confirm-mismatch, empty-name, save-failure), not just the initial screen.
+- **Refactor:** the `human_bytes` display helper is consolidated into
+  `daemonseed-core::format`; the TUI and GUI both delegate to it.
+
 ## [0.26.0] — GUI Shares tab: public-share browse, download & publish
 
 The GUI gains the full public-share loop, matching the TUI's M16 surface.
