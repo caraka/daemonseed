@@ -23,6 +23,24 @@ In-progress and next-milestone planning is tracked in the project lead's vault
 manifest (not committed). The next entry is added here at the moment a release
 is tagged, as part of the doc-sync ritual in `AGENTS.md`.
 
+## [0.28.0] — GUI auth-input felt-fixes + global font pass (round 2)
+
+Post-`v0.27.0` round-2 polish of the first-start / unlock auth surface, felt-tested
+on Ubuntu noble via an AppImage build.
+
+- **Visible password mask + complete glyph coverage:** the software renderer now
+  bundles DejaVu Sans as the default font, so the masked passphrase renders as `●`
+  bullets (previously blank) and the share-tree disclosure carets render as real
+  `▾`/`▶` chevrons (previously ASCII `v`/`>`). The font is vendored unmodified under
+  the Bitstream Vera license.
+- **First-start Enter-to-submit:** the 3-word backup type-back step submits on Enter;
+  the recovery-phrase ("I've saved it") step also advances on Enter while the window
+  holds focus.
+- **Unlock clears on a wrong passphrase:** a failed unlock empties the field so the
+  next attempt starts from a known-empty state.
+- **Long-input containment:** a long or pasted entry in the single-line auth fields is
+  clipped to its box instead of overrunning the window.
+
 ## [0.27.0] — GUI Shares-tab cleanup (round 1)
 
 Post-`v0.26.0` cleanup of the GUI Shares tab and first-start flow, plus one core
