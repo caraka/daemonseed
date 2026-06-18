@@ -12,6 +12,12 @@
 // PILL, never a dot (brief #5). Entropy/key/derivation words never appear; a quiet
 // "Looks strong" stands in for any meter (brief #34, D3 — numbers HIDDEN).
 
+// Default UI font for the software renderer (which has no system-font access at
+// runtime). DejaVu Sans gives a complete glyph set — the password mask ● (U+25CF)
+// and the disclosure carets ▶/▾ (U+25B6/U+25BE) — that the prior bundled font
+// lacked. Vendored unmodified; see fonts/DejaVuSans-LICENSE.txt.
+import "fonts/DejaVuSans.ttf";
+
 struct CircleData {
     name: string,
     sub: string,
@@ -142,12 +148,12 @@ component ShareTreeRow inherits Rectangle {
     HorizontalLayout {
         padding-left: 10px + root.node.depth * 18px;
         padding-right: 14px; spacing: 8px;
-        // disclosure caret (blank for a file / empty folder). ASCII ">" / "v": the
-        // bundled software-renderer font has no geometric-shape glyphs (▶/▾ render
-        // blank); a proper chevron is a font-embedding polish for later.
+        // disclosure caret (blank for a file / empty folder). Now that the bundled
+        // DejaVu Sans default font carries the geometric shapes, the caret uses the
+        // proper chevrons ▾ (expanded) / ▶ (collapsed) instead of the ASCII v / >.
         Text {
             width: 12px;
-            text: root.node.expandable ? (root.node.expanded ? "v" : ">") : "";
+            text: root.node.expandable ? (root.node.expanded ? "▾" : "▶") : "";
             color: #8b93a1; font-size: 12px; vertical-alignment: center;
         }
         Text {
@@ -208,6 +214,10 @@ export component AppWindow inherits Window {
     preferred-width: 1100px; preferred-height: 680px;
     min-width: 720px; min-height: 480px;
     background: #07080a;
+    // Bundle the UI font so the software renderer draws a complete glyph set
+    // (password mask ●, carets ▶/▾) regardless of the host's fonts. Pairs with
+    // the `import "fonts/DejaVuSans.ttf"` above.
+    default-font-family: "DejaVu Sans";
 
     in property <[CircleData]> circles;
     in-out property <int> active: 0;          // SOLE writer is Rust (out-of-range guard)

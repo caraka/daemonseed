@@ -1675,6 +1675,10 @@ fn main() {
         }
     } else if unlock_flag {
         ui.set_screen(SharedString::from("unlock"));
+        // Seed a sample passphrase so the offscreen PNG exercises the masked field
+        // (mirrors SAMPLE_MNEMONIC for the wizard) — lets the password-mask render
+        // (● U+25CF, from the bundled DejaVu font) be regression-checked headlessly.
+        ui.set_unlock_passphrase(SharedString::from("correct horse battery"));
     } else if show_shares {
         // Populated Shares-tab tree, fixture-driven (no relay): a synthetic catalog +
         // one expanded/previewed share (its `reports` folder opened) so the PNG shows
