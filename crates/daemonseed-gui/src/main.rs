@@ -1672,6 +1672,11 @@ fn main() {
             ui.set_fs_typeback_prompt(SharedString::from(
                 "Type words #4, #12 and #22 of your recovery phrase.",
             ));
+            // Seed an over-long value so the PNG exercises the clip on the type-back
+            // box (regression for the single-line overflow felt-test, 2026-06-18).
+            ui.set_fs_confirm(SharedString::from(
+                "size grit real become unknown call upper execute exist field clock gym journey leader total",
+            ));
         }
     } else if unlock_flag {
         ui.set_screen(SharedString::from("unlock"));

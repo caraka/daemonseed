@@ -389,6 +389,13 @@ export component AppWindow inherits Window {
                 root.switch-circle(0);
                 return accept;
             }
+            // Enter advances the "I've saved it" recovery-phrase step. Step 1 (mnemonic
+            // display) has no input field to carry an `accepted`, so nothing is focused
+            // and the keypress bubbles up here — mirror the per-field Enter-submit.
+            if (event.text == Key.Return && root.screen == "first-start" && root.fs-step == 1) {
+                root.fs-saved-next();
+                return accept;
+            }
             if (event.text == Key.Escape) {
                 root.palette-open = false;
                 root.join-open = false;
@@ -950,6 +957,7 @@ export component AppWindow inherits Window {
                 Text { text: "Enter your passphrase to unlock this device."; color: #8b93a1; font-size: 13px; wrap: word-wrap; }
                 Rectangle {
                     height: 46px; border-radius: 9px; background: #141517; border-width: 1px; border-color: #ffffff12;
+                    clip: true; // contain a long single-line entry inside the box
                     HorizontalLayout { padding-left: 12px;
                         Text { text: "passphrase"; visible: root.unlock-passphrase == ""; color: #4d5560; font-size: 13px; vertical-alignment: center; }
                     }
@@ -1004,6 +1012,7 @@ export component AppWindow inherits Window {
                         Text { text: "Choose a passphrase. It encrypts everything on this device — there is no reset, so make it strong and memorable."; color: #8b93a1; font-size: 13px; wrap: word-wrap; }
                         Rectangle {
                             height: 46px; border-radius: 9px; background: #141517; border-width: 1px; border-color: #ffffff12;
+                            clip: true; // contain a long single-line entry inside the box
                             HorizontalLayout { padding-left: 12px;
                                 Text { text: "a passphrase you'll remember"; visible: root.fs-passphrase == ""; color: #4d5560; font-size: 13px; vertical-alignment: center; }
                             }
@@ -1065,6 +1074,7 @@ export component AppWindow inherits Window {
                         Text { text: root.fs-typeback-prompt; color: #8b93a1; font-size: 13px; wrap: word-wrap; }
                         Rectangle {
                             height: 80px; border-radius: 10px; background: #141517; border-width: 1px; border-color: #ffffff12;
+                            clip: true; // contain a long single-line entry (e.g. a pasted full phrase) inside the box
                             HorizontalLayout { padding: 12px;
                                 fs_confirm_input := TextInput {
                                     text <=> root.fs-confirm;
@@ -1091,6 +1101,7 @@ export component AppWindow inherits Window {
                         Text { text: "This is how others see you in chats. You can be anyone."; color: #8b93a1; font-size: 13px; wrap: word-wrap; }
                         Rectangle {
                             height: 46px; border-radius: 9px; background: #141517; border-width: 1px; border-color: #ffffff12;
+                            clip: true; // contain a long single-line entry inside the box
                             HorizontalLayout { padding-left: 12px;
                                 Text { text: "a name others will see"; visible: root.fs-name == ""; color: #4d5560; font-size: 13px; vertical-alignment: center; }
                             }
