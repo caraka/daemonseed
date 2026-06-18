@@ -1058,7 +1058,8 @@ export component AppWindow inherits Window {
                             HorizontalLayout { padding: 12px;
                                 fs_confirm_input := TextInput {
                                     text <=> root.fs-confirm;
-                                    color: #d6dae1; font-size: 14px; wrap: word-wrap; vertical-alignment: top; single-line: false;
+                                    color: #d6dae1; font-size: 14px; vertical-alignment: center; single-line: true;
+                                    accepted => { root.fs-confirm-next(); }
                                 }
                             }
                         }

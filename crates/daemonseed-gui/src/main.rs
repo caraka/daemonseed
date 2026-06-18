@@ -1433,6 +1433,9 @@ fn wire_auth(
                 Ok(o) => o,
                 Err(seeds::BlobError::AuthenticationFailed) => {
                     ui.set_auth_error(SharedString::from("Wrong passphrase."));
+                    // Clear the (masked) field so the user retypes from a known-empty
+                    // start — no cursor stranded at the end of invisible text.
+                    ui.set_unlock_passphrase(SharedString::from(""));
                     refocus_auth(&ui);
                     return;
                 }
