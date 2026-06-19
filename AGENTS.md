@@ -48,6 +48,8 @@ Three surfaces, one direction of flow — speculative → designed → actionabl
 
 So: an idea enters `ROADMAP.md`; if it needs design, it gets a `docs/design/` doc; once actionable, it graduates into GitHub issues (the roadmap entry is removed, the design doc stays). Nothing here records *status* or *history* — that is issues + git tags + `CHANGELOG.md`.
 
+**Cross-references are hard-bounded to repo-canonical artifacts.** An issue, `ROADMAP.md` entry, or `docs/design/` doc may freely cite the repo `ISA.md`'s `ISC-N` / `ISC-A-N` IDs and repo paths/docs — they are permanent, shared, and authoritative. It must **never** cite a contributor's own local / working-draft / PRD language or its private ISC numbering: those are personal scratch, may diverge from the repo, and mean nothing (or mislead) to anyone else. The test: **if a reference resolves inside the repo, it belongs; if it only resolves in someone's local notes, it does not.**
+
 ## Definition of done
 
 Every task is incomplete until all of these pass:

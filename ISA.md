@@ -11,6 +11,17 @@ updated: 2026-06-03T00:00:00Z
 
 # Daemonseed — ISA (Ideal State Artifact)
 
+**New here?** This file is daemonseed's **authoritative design contract** — the single
+source of truth for *what daemonseed must be and why its boundaries hold*. Read it as:
+**Principles / Constraints / Out of Scope** = the boundaries and their rationale;
+**Goal / Criteria** = the verifiable conditions that define "done" (each `ISC-N` is a
+testable claim; each `ISC-A-*` is a forbidden state); **Decisions / Changelog /
+Verification** = the design rationale, how the understanding evolved, and per-ISC
+evidence. It is **not** release history (that's `CHANGELOG.md` + git tags) and **not**
+task status (that's GitHub Issues + `ROADMAP.md`). To change a boundary, change it
+*here*, deliberately, in a PR. *("ISA" / "ISC" come from the PAI Algorithm method; you
+do not need to know PAI to read or contribute to this file.)*
+
 > This file is the **system of record** for daemonseed: the articulated ideal state, the
 > test harness (its ISCs are the tests), the build-verification surface, and the done-condition
 > for the alpha1 MVP. It is also the contributor contract — read it to understand *where the
