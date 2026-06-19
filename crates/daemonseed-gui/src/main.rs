@@ -1285,7 +1285,9 @@ fn wire_auth(
         move || {
             let ui = weak.unwrap();
             ui.set_auth_error(SharedString::from(""));
-            ui.set_fs_confirm(SharedString::from(""));
+            ui.set_fs_confirm_1(SharedString::from(""));
+            ui.set_fs_confirm_2(SharedString::from(""));
+            ui.set_fs_confirm_3(SharedString::from(""));
             if let Wizard::Sealed(s) = &*wizard.borrow() {
                 let ch = s.issue_type_back_challenge(&mut OsRng);
                 ui.set_fs_typeback_prompt(SharedString::from(typeback_prompt(&ch)));
@@ -1305,11 +1307,16 @@ fn wire_auth(
         let challenge = challenge.clone();
         move || {
             let ui = weak.unwrap();
-            let answers: Vec<String> = ui
-                .get_fs_confirm()
-                .split_whitespace()
-                .map(str::to_owned)
-                .collect();
+            // One challenge word per field (ISC-C34); trim stray whitespace. An
+            // empty field yields an empty answer, which fails the precheck.
+            let answers: Vec<String> = [
+                ui.get_fs_confirm_1(),
+                ui.get_fs_confirm_2(),
+                ui.get_fs_confirm_3(),
+            ]
+            .iter()
+            .map(|w| w.trim().to_owned())
+            .collect();
             let mnemonic = ui.get_fs_mnemonic().to_string();
 
             let passed = challenge
@@ -1324,7 +1331,9 @@ fn wire_auth(
                     ui.set_fs_typeback_prompt(SharedString::from(typeback_prompt(&ch)));
                     *challenge.borrow_mut() = Some(ch);
                 }
-                ui.set_fs_confirm(SharedString::from(""));
+                ui.set_fs_confirm_1(SharedString::from(""));
+                ui.set_fs_confirm_2(SharedString::from(""));
+                ui.set_fs_confirm_3(SharedString::from(""));
                 ui.set_auth_error(SharedString::from(
                     "Those words don't match — here's a new set to try.",
                 ));
@@ -1672,11 +1681,12 @@ fn main() {
             ui.set_fs_typeback_prompt(SharedString::from(
                 "Type words #4, #12 and #22 of your recovery phrase.",
             ));
-            // Seed an over-long value so the PNG exercises the clip on the type-back
-            // box (regression for the single-line overflow felt-test, 2026-06-18).
-            ui.set_fs_confirm(SharedString::from(
-                "size grit real become unknown call upper execute exist field clock gym journey leader total",
-            ));
+            // Seed the three single-word type-back boxes so the PNG shows the
+            // populated 3-field layout (ISC-C34); an over-long word in the first
+            // box still exercises the per-box clip.
+            ui.set_fs_confirm_1(SharedString::from("becomeunknowncallupperexecute"));
+            ui.set_fs_confirm_2(SharedString::from("grit"));
+            ui.set_fs_confirm_3(SharedString::from("real"));
         }
     } else if unlock_flag {
         ui.set_screen(SharedString::from("unlock"));

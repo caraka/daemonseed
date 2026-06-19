@@ -325,7 +325,9 @@ export component AppWindow inherits Window {
     in-out property <string> fs-passphrase;            // two-way; the chosen unlock passphrase
     in property <bool> fs-passphrase-strong: false;    // Rust-set: estimate().is_session_green()
     in property <string> fs-mnemonic;                  // Rust-set: the 24-word recovery phrase
-    in-out property <string> fs-confirm;               // two-way; the typed-back C34 challenge words
+    in-out property <string> fs-confirm-1;             // two-way; C34 type-back word 1 of 3 (own field, ISC-C34)
+    in-out property <string> fs-confirm-2;             // two-way; C34 type-back word 2 of 3
+    in-out property <string> fs-confirm-3;             // two-way; C34 type-back word 3 of 3
     in property <string> fs-typeback-prompt;           // Rust-set: "Type words #4, #12 and #22 …" (C34)
     in-out property <string> fs-name;                  // two-way; chosen display name
     in-out property <string> unlock-passphrase;        // two-way; daily-login passphrase
@@ -358,7 +360,7 @@ export component AppWindow inherits Window {
         if (root.screen == "first-start" && root.fs-step == 0) { fs_pass_input.focus(); }
         // Step 1 (mnemonic) is a read-and-save step — no field to focus. Steps 2/3
         // are entry fields, so focus them on (re)entry the same way step 0 is.
-        if (root.screen == "first-start" && root.fs-step == 2) { fs_confirm_input.focus(); }
+        if (root.screen == "first-start" && root.fs-step == 2) { fs_confirm_1.focus(); }
         if (root.screen == "first-start" && root.fs-step == 3) { fs_name_input.focus(); }
     }
 
@@ -1072,18 +1074,43 @@ export component AppWindow inherits Window {
                         spacing: 12px; alignment: start;
                         Text { text: "Confirm your backup"; color: #e4e8ee; font-size: 21px; }
                         Text { text: root.fs-typeback-prompt; color: #8b93a1; font-size: 13px; wrap: word-wrap; }
-                        Rectangle {
-                            height: 80px; border-radius: 10px; background: #141517; border-width: 1px; border-color: #ffffff12;
-                            clip: true; // contain a long single-line entry (e.g. a pasted full phrase) inside the box
-                            HorizontalLayout { padding: 12px;
-                                fs_confirm_input := TextInput {
-                                    text <=> root.fs-confirm;
-                                    color: #d6dae1; font-size: 14px; vertical-alignment: center; single-line: true;
-                                    accepted => { root.fs-confirm-next(); }
+                        // Three single-word boxes (ISC-C34): one challenge word each,
+                        // Enter advances to the next (the third confirms). One word per
+                        // box retires the single-field trailing-space nit.
+                        HorizontalLayout {
+                            spacing: 8px; min-height: 56px;
+                            Rectangle {
+                                border-radius: 10px; background: #141517; border-width: 1px; border-color: #ffffff12; clip: true;
+                                HorizontalLayout { padding: 12px;
+                                    fs_confirm_1 := TextInput {
+                                        text <=> root.fs-confirm-1;
+                                        color: #d6dae1; font-size: 14px; vertical-alignment: center; single-line: true;
+                                        accepted => { fs_confirm_2.focus(); }
+                                    }
+                                }
+                            }
+                            Rectangle {
+                                border-radius: 10px; background: #141517; border-width: 1px; border-color: #ffffff12; clip: true;
+                                HorizontalLayout { padding: 12px;
+                                    fs_confirm_2 := TextInput {
+                                        text <=> root.fs-confirm-2;
+                                        color: #d6dae1; font-size: 14px; vertical-alignment: center; single-line: true;
+                                        accepted => { fs_confirm_3.focus(); }
+                                    }
+                                }
+                            }
+                            Rectangle {
+                                border-radius: 10px; background: #141517; border-width: 1px; border-color: #ffffff12; clip: true;
+                                HorizontalLayout { padding: 12px;
+                                    fs_confirm_3 := TextInput {
+                                        text <=> root.fs-confirm-3;
+                                        color: #d6dae1; font-size: 14px; vertical-alignment: center; single-line: true;
+                                        accepted => { root.fs-confirm-next(); }
+                                    }
                                 }
                             }
                         }
-                        Text { text: "Separate the words with spaces, in order."; color: #8b7d5b; font-size: 12px; }
+                        Text { text: "Type each word in its own box, in order."; color: #8b7d5b; font-size: 12px; }
                         Text { text: root.auth-error; color: #c0857d; font-size: 12px; }
                         Rectangle { }
                         HorizontalLayout {
