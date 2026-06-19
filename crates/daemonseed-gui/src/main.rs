@@ -1415,6 +1415,16 @@ fn wire_auth(
         move || {
             let ui = weak.unwrap();
             let pass = ui.get_fs_passphrase().to_string();
+            // Confirm the re-entry matches BEFORE sealing — there is no recovery flow
+            // yet, so an unnoticed typo here would lock this identity out permanently.
+            let confirm = ui.get_fs_passphrase_confirm().to_string();
+            if pass != confirm {
+                ui.set_auth_error(SharedString::from(
+                    "Those don't match — type the same passphrase in both boxes.",
+                ));
+                refocus_auth(&ui);
+                return;
+            }
             match FirstStart::new().initialize(pass.as_str(), ArgonParams::default()) {
                 Ok(sealed) => {
                     ui.set_fs_mnemonic(SharedString::from(sealed.display_phrase()));
@@ -1927,6 +1937,14 @@ fn main() {
             ui.set_fs_confirm_1(SharedString::from("becomeunknowncallupperexecute"));
             ui.set_fs_confirm_2(SharedString::from("grit"));
             ui.set_fs_confirm_3(SharedString::from("real"));
+        }
+        if fs_step_flag == 0 {
+            // Seed a passphrase + a deliberately MISMATCHED confirm, then drive the
+            // real next-callback so the PNG proves the confirm guard blocks (auth-error
+            // shown, no advance / no sealing on a mismatch).
+            ui.set_fs_passphrase(SharedString::from("correct horse battery staple"));
+            ui.set_fs_passphrase_confirm(SharedString::from("correct horse battery stapler"));
+            ui.invoke_fs_passphrase_next();
         }
     } else if unlock_flag {
         ui.set_screen(SharedString::from("unlock"));

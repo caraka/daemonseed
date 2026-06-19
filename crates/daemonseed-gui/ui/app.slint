@@ -338,6 +338,7 @@ export component AppWindow inherits Window {
     in-out property <string> screen: "main";
     in-out property <int> fs-step: 0;
     in-out property <string> fs-passphrase;            // two-way; the chosen unlock passphrase
+    in-out property <string> fs-passphrase-confirm;    // two-way; the re-entry that must match fs-passphrase (no recovery yet ⇒ a typo locks the id out)
     in property <bool> fs-passphrase-strong: false;    // Rust-set: estimate().is_session_green()
     in property <string> fs-mnemonic;                  // Rust-set: the 24-word recovery phrase
     in-out property <string> fs-confirm-1;             // two-way; C34 type-back word 1 of 3 (own field, ISC-C34)
@@ -1095,6 +1096,25 @@ export component AppWindow inherits Window {
                                     input-type: InputType.password;
                                     color: #d6dae1; font-size: 14px; vertical-alignment: center; single-line: true;
                                     edited => { root.fs-passphrase-edited(root.fs-passphrase); }
+                                    accepted => { fs_pass_confirm_input.focus(); }
+                                }
+                            }
+                        }
+                        // Confirm re-entry — there is no recovery flow yet, so a typo in
+                        // the passphrase above would silently lock this identity out
+                        // forever. The two must match before Continue proceeds (checked
+                        // Rust-side in `fs-passphrase-next`).
+                        Rectangle {
+                            height: 46px; border-radius: 9px; background: #141517; border-width: 1px; border-color: #ffffff12;
+                            clip: true; // contain a long single-line entry inside the box
+                            HorizontalLayout { padding-left: 12px;
+                                Text { text: "re-enter it to confirm"; visible: root.fs-passphrase-confirm == ""; color: #4d5560; font-size: 13px; vertical-alignment: center; }
+                            }
+                            HorizontalLayout { padding-left: 12px; padding-right: 12px;
+                                fs_pass_confirm_input := TextInput {
+                                    text <=> root.fs-passphrase-confirm;
+                                    input-type: InputType.password;
+                                    color: #d6dae1; font-size: 14px; vertical-alignment: center; single-line: true;
                                     accepted => { root.fs-passphrase-next(); }
                                 }
                             }
