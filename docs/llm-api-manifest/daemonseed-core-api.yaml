@@ -244,9 +244,11 @@ modules:
       SealingKey::derive_session returns both for first-start. M14 also adds the
       persisted share-root set (PersistedShare) with add_share / remove_share /
       shares + a `share <hex(root)> <hex(label)>` directive line (ISC-C21). M16
-      post-smoke adds publish-intent persistence (add_published / remove_published
-      / published + a `publish <hex(root)>` directive): the subset of share roots
-      the user has published, so they auto-republish on next Unlock. This persists
+      post-smoke adds publish-intent persistence (add_published(root, name) /
+      remove_published / published -> Vec<PublishedShare>, with an additive
+      `publish <hex(root)> [<hex(name)>]` directive — a one-field line parses as
+      name None): the subset of share roots the user has published, each with an
+      optional wire-facing name, so they auto-republish on next Unlock. This persists
       intent, not relay state — ISC-S20 ephemerality holds (the client re-asserts;
       the relay stays RAM-only), and each republish still mints a fresh share_id.
     no_std: false
@@ -1138,6 +1140,16 @@ types:
           only — no wire message carries it (ISC-A-C3); this is persistence of
           configuration, not shared content, so no-client-history holds. Debug
           surfaces only the count.
+      - name: published
+        type: "Vec<PublishedShare>"
+        description: >-
+          Published share roots to auto-republish on the next Unlock (publish-intent
+          persistence), in publish order. Each entry is a directory path + an optional
+          wire-facing share name, serialized additively as `publish <hex(root)>` (no
+          name) or `publish <hex(root)> <hex(name)>`. Mutate via add_published /
+          remove_published / published. Client-local persistence of intent only — the
+          relay stays RAM-only (ISC-S20); the client re-asserts each root once
+          reconnected. Debug surfaces only the count.
     security:
       contains_secret: true
       zeroize_on_drop: true
@@ -1189,6 +1201,28 @@ types:
       - name: label
         type: "Option<String>"
         description: Optional client-local label; None falls back to the path at render.
+
+  - name: PublishedShare
+    module: daemonseed_core::storage::seeds
+    kind: struct
+    description: >-
+      One remembered published share root in the at-rest blob (publish-intent
+      persistence). Holds the share-root path and an optional WIRE-FACING share name,
+      deliberately distinct from PersistedShare.label (client-local-only, ISC-A-C3):
+      the published name is the one a fetching peer sees, so it travels on the wire
+      at republish. Serialized additively as `publish <hex(root)>` (name None, legacy
+      form) or `publish <hex(root)> <hex(name)>`; None falls back to the root basename
+      at republish. Distinct from daemonseed_tui's runtime PublishedShare, which also
+      carries a relay-assigned share_id.
+    fields:
+      - name: root
+        type: String
+        description: The published share-root directory path, as the user entered it.
+      - name: name
+        type: "Option<String>"
+        description: >-
+          Optional wire-facing share name; None falls back to the root basename at
+          republish (the value for every share until a name-a-share UI exists).
 
   - name: PersistedCircle
     module: daemonseed_core::storage::seeds

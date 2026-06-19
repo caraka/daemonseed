@@ -92,7 +92,14 @@ impl Profile {
     /// Published-share roots (directory paths) recorded in the blob — the M16
     /// auto-republish set read at next launch.
     pub fn published(&self) -> Vec<String> {
-        self.seeds.published().to_vec()
+        // The net republish path keys on the root path; the optional wire-facing
+        // name (PublishedShare::name) is persisted but not yet consumed here (the
+        // republish-uses-persisted-name wiring + naming UI are a follow-up).
+        self.seeds
+            .published()
+            .iter()
+            .map(|p| p.root.clone())
+            .collect()
     }
 
     /// Remember a published share root (a directory path) and re-seal the blob to
@@ -101,7 +108,9 @@ impl Profile {
     /// failure is surfaced as `Err(reason)`; the share still serves in RAM this
     /// session regardless.
     pub fn persist_published(&mut self, root: &str) -> Result<bool, String> {
-        let added = self.seeds.add_published(root);
+        // name = None until a name-a-share UI exists; the slot round-trips in the
+        // blob (daemonseed_core::storage::seeds::PublishedShare).
+        let added = self.seeds.add_published(root, None);
         if added {
             self.reseal()?;
         }

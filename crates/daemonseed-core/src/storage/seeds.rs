@@ -230,7 +230,7 @@ pub struct Seeds {
     /// and reaps on disconnect (ISC-S20, "online to share"); the client simply
     /// re-asserts each published root once reconnected, so ephemerality is
     /// unchanged. Mutate via [`Self::add_published`] / [`Self::remove_published`].
-    pub published: Vec<String>,
+    pub published: Vec<PublishedShare>,
 }
 
 /// One remembered local share root in the at-rest blob (ISC-C21 persistence,
@@ -242,6 +242,25 @@ pub struct PersistedShare {
     pub root: String,
     /// Optional client-local label; `None` falls back to the path at render.
     pub label: Option<String>,
+}
+
+/// One remembered *published* share root in the at-rest blob (publish-intent
+/// persistence). Holds the share-root path and an optional **wire-facing** share
+/// name.
+///
+/// The `name` is deliberately a distinct field from [`PersistedShare::label`]: the
+/// label is a *client-local-only* display string (ISC-A-C3, never transmitted),
+/// whereas the published name is the name a fetching peer sees, so it travels on
+/// the wire when the share is (re)asserted to the relay. `None` falls back to the
+/// share root's basename at republish — today's behavior, and the value stored for
+/// every share until a name-a-share UI exists. The blob layout stays additive: a
+/// legacy one-field `publish <hex(root)>` line parses as `name = None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedShare {
+    /// The published share-root directory path, as the user entered it.
+    pub root: String,
+    /// Optional wire-facing share name; `None` ⇒ the root's basename at republish.
+    pub name: Option<String>,
 }
 
 /// One remembered circle in the at-rest blob (ISC-C59 persistence, M13).
@@ -437,30 +456,33 @@ impl Seeds {
         self.shares.len() != before
     }
 
-    /// The remembered *published* share roots, in publish order (publish-intent
-    /// persistence). A subset of [`Self::shares`].
-    pub fn published(&self) -> &[String] {
+    /// The remembered *published* shares, in publish order (publish-intent
+    /// persistence). A subset of [`Self::shares`], each with its optional
+    /// wire-facing [`PublishedShare::name`].
+    pub fn published(&self) -> &[PublishedShare] {
         &self.published
     }
 
-    /// Remember that a share root is published so it auto-republishes next
-    /// launch. Returns `true` if newly added, `false` if already remembered
-    /// (idempotent). Hex-encoded at serialization, so any path survives the
-    /// line-based blob.
-    pub fn add_published(&mut self, root: impl Into<String>) -> bool {
+    /// Remember that a share root is published (with an optional wire-facing
+    /// `name`) so it auto-republishes next launch. Returns `true` if newly added,
+    /// `false` if the root was already remembered (idempotent, keyed on the root
+    /// path — re-publishing does not change a stored name). Root and name are both
+    /// hex-encoded at serialization, so any path or name survives the line-based
+    /// blob.
+    pub fn add_published(&mut self, root: impl Into<String>, name: Option<String>) -> bool {
         let root = root.into();
-        if self.published.iter().any(|r| r == &root) {
+        if self.published.iter().any(|p| p.root == root) {
             return false;
         }
-        self.published.push(root);
+        self.published.push(PublishedShare { root, name });
         true
     }
 
-    /// Forget a published share root, keyed on its path. Returns `true` if one
+    /// Forget a published share, keyed on its root path. Returns `true` if one
     /// was removed.
     pub fn remove_published(&mut self, root: &str) -> bool {
         let before = self.published.len();
-        self.published.retain(|r| r != root);
+        self.published.retain(|p| p.root != root);
         self.published.len() != before
     }
 
@@ -503,11 +525,20 @@ impl Seeds {
                 hex::encode(sh.label.as_deref().unwrap_or("").as_bytes()),
             ));
         }
-        // Published roots (publish-intent persistence): hex-encoded path so a
-        // path with spaces/newlines never splits the line. Layout:
-        // `publish <hex(root)>`.
-        for root in &self.published {
-            s.push_str(&format!("\npublish {}", hex::encode(root.as_bytes())));
+        // Published shares (publish-intent persistence): hex-encoded path so a
+        // path with spaces/newlines never splits the line. Layout is additive —
+        // `publish <hex(root)>` when there is no wire-facing name (legacy form),
+        // `publish <hex(root)> <hex(name)>` when there is. A reader of either form
+        // round-trips (see `from_plaintext`).
+        for ps in &self.published {
+            match &ps.name {
+                Some(name) => s.push_str(&format!(
+                    "\npublish {} {}",
+                    hex::encode(ps.root.as_bytes()),
+                    hex::encode(name.as_bytes()),
+                )),
+                None => s.push_str(&format!("\npublish {}", hex::encode(ps.root.as_bytes()))),
+            }
         }
         s
     }
@@ -522,7 +553,7 @@ impl Seeds {
         let mut display_name: Option<String> = None;
         let mut circles: Vec<PersistedCircle> = Vec::new();
         let mut shares: Vec<PersistedShare> = Vec::new();
-        let mut published: Vec<String> = Vec::new();
+        let mut published: Vec<PublishedShare> = Vec::new();
         for line in lines {
             // Mute / hide directives take the entire rest of the line as the
             // handle so a display name containing spaces is never truncated.
@@ -571,13 +602,26 @@ impl Seeds {
                 shares.push(PersistedShare { root, label });
                 continue;
             }
-            // Published root (publish-intent persistence): `publish <hex(root)>`.
-            if let Some(root_hex) = line.strip_prefix("publish ") {
+            // Published share (publish-intent persistence). Additive layout:
+            // `publish <hex(root)>` (legacy, name = None) or
+            // `publish <hex(root)> <hex(name)>` (named). An empty name hex (or no
+            // second field) decodes to `None`.
+            if let Some(rest) = line.strip_prefix("publish ") {
+                let (root_hex, name) = match rest.split_once(' ') {
+                    Some((root_hex, name_hex)) => {
+                        let name_str = hex::decode(name_hex)
+                            .ok()
+                            .and_then(|b| String::from_utf8(b).ok())
+                            .ok_or(BlobError::InvalidPlaintext)?;
+                        (root_hex, (!name_str.is_empty()).then_some(name_str))
+                    }
+                    None => (rest, None),
+                };
                 let root = hex::decode(root_hex)
                     .ok()
                     .and_then(|b| String::from_utf8(b).ok())
                     .ok_or(BlobError::InvalidPlaintext)?;
-                published.push(root);
+                published.push(PublishedShare { root, name });
                 continue;
             }
             let mut parts = line.splitn(3, ' ');
@@ -1324,18 +1368,71 @@ mod tests {
         let pid = Uuid::new_v4();
         let pp = "correct horse battery staple table mountain";
         let mut seeds = fresh_seeds();
-        assert!(seeds.add_published("/home/me/My Music"));
-        assert!(seeds.add_published("/srv/docs"));
+        assert!(seeds.add_published("/home/me/My Music", None));
+        assert!(seeds.add_published("/srv/docs", None));
         assert!(
-            !seeds.add_published("/home/me/My Music"),
+            !seeds.add_published("/home/me/My Music", None),
             "add_published is idempotent on the root"
         );
         let blob = seal(&seeds, pp, pid, test_params()).unwrap();
         let mut recovered = open(&blob, pp, pid, test_params()).unwrap().seeds;
-        assert_eq!(recovered.published(), ["/home/me/My Music", "/srv/docs"]);
+        let roots: Vec<&str> = recovered
+            .published()
+            .iter()
+            .map(|p| p.root.as_str())
+            .collect();
+        assert_eq!(roots, ["/home/me/My Music", "/srv/docs"]);
         assert!(recovered.remove_published("/home/me/My Music"));
         assert!(!recovered.remove_published("/home/me/My Music"));
-        assert_eq!(recovered.published(), ["/srv/docs"]);
+        let roots: Vec<&str> = recovered
+            .published()
+            .iter()
+            .map(|p| p.root.as_str())
+            .collect();
+        assert_eq!(roots, ["/srv/docs"]);
+    }
+
+    #[test]
+    fn published_share_name_round_trips_and_legacy_form_stays_none() {
+        // Item-4 core oracle. A published share's optional wire-facing name must
+        // survive a seal/open round-trip; an unnamed share must serialize in the
+        // legacy one-field `publish <hex(root)>` form (additive — no blob-version
+        // bump) and read back as `name = None` (the basename fallback at republish
+        // lives in the net layer, unchanged).
+        ensure_oxicrypt_initialized();
+        let pid = Uuid::new_v4();
+        let pp = "correct horse battery staple table mountain";
+        let mut seeds = fresh_seeds();
+        assert!(seeds.add_published("/srv/holiday pics", Some("Summer 2026".to_owned())));
+        assert!(seeds.add_published("/srv/docs", None));
+
+        // The unnamed share serializes WITHOUT a second field (legacy-compatible);
+        // the named share carries a hex name field.
+        let plain = seeds.to_plaintext();
+        assert!(
+            plain.contains(&format!(
+                "publish {}\n",
+                hex::encode("/srv/docs".as_bytes())
+            )) || plain.ends_with(&format!("publish {}", hex::encode("/srv/docs".as_bytes()))),
+            "unnamed share must serialize as the one-field legacy form: {plain:?}"
+        );
+        assert!(
+            plain.contains(&format!(
+                "publish {} {}",
+                hex::encode("/srv/holiday pics".as_bytes()),
+                hex::encode("Summer 2026".as_bytes()),
+            )),
+            "named share must serialize root + name: {plain:?}"
+        );
+
+        let blob = seal(&seeds, pp, pid, test_params()).unwrap();
+        let recovered = open(&blob, pp, pid, test_params()).unwrap().seeds;
+        let pubs = recovered.published();
+        assert_eq!(pubs.len(), 2);
+        assert_eq!(pubs[0].root, "/srv/holiday pics");
+        assert_eq!(pubs[0].name.as_deref(), Some("Summer 2026"));
+        assert_eq!(pubs[1].root, "/srv/docs");
+        assert_eq!(pubs[1].name, None);
     }
 
     #[test]

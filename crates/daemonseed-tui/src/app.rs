@@ -1343,7 +1343,7 @@ impl App {
             // auto-republishes once reconnected. Queued here, drained after auth
             // (publish needs a live session); the relay stays RAM-only and the
             // client simply re-asserts, so ISC-S20 ephemerality is unchanged.
-            if session.seeds.published().iter().any(|p| p == &sh.root) {
+            if session.seeds.published().iter().any(|p| p.root == sh.root) {
                 self.pending_publishes.push_back((root.clone(), name));
             }
             self.pending_share_defines.push_back(ShareDefineRequest {
@@ -1687,7 +1687,7 @@ impl App {
                 if self
                     .seeds
                     .as_mut()
-                    .is_some_and(|s| s.add_published(root_str))
+                    .is_some_and(|s| s.add_published(root_str, None))
                 {
                     self.persist_seeds();
                 }
