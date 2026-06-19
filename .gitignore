@@ -2,6 +2,10 @@
 /target/
 **/*.rs.bk
 
+# AppImage packaging output (the recipe in packaging/appimage/ writes here)
+/dist/
+*.AppImage
+
 # Cargo.lock IS committed in this workspace (binary crates present).
 # Do not add it here.
 

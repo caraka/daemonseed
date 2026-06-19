@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Placeholder app icon for the daemonseed-gui AppImage. Scalable SVG so no
+     raster toolchain (imagemagick) is needed at package time. Replace with the
+     real brand icon when one exists. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <rect width="256" height="256" rx="48" fill="#0f1620"/>
+  <circle cx="128" cy="128" r="74" fill="none" stroke="#3ddc97" stroke-width="12"/>
+  <circle cx="128" cy="128" r="30" fill="#3ddc97"/>
+  <text x="128" y="232" font-family="monospace" font-size="34" fill="#3ddc97"
+        text-anchor="middle">ds</text>
+</svg>

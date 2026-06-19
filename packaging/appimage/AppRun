@@ -1,0 +1,12 @@
+#!/bin/sh
+# AppImage entry point for daemonseed-gui.
+#
+# Defaults DAEMONSEED_X11=1 so the bundled software-rendered Slint/winit GUI runs
+# on XWayland by default — winit 0.30's Wayland software-render path drops pointer
+# input in some compositors/VMs, which the X11 path avoids. Override by exporting
+# DAEMONSEED_X11=0 before launch to use native Wayland.
+set -eu
+HERE="$(dirname "$(readlink -f "$0")")"
+: "${DAEMONSEED_X11:=1}"
+export DAEMONSEED_X11
+exec "${HERE}/usr/bin/daemonseed-gui" "$@"

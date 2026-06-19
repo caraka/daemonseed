@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Daemonseed
+GenericName=Encrypted communication & file sharing
+Comment=Federated, end-to-end-encrypted communication and file sharing
+Exec=daemonseed-gui
+Icon=daemonseed-gui
+Categories=Network;FileTransfer;
+Terminal=false

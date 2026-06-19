@@ -77,3 +77,16 @@ cargo xtask isc-coverage                                         # report ISC co
 ```
 
 See `AGENTS.md` for the full definition-of-done, the doc-sync ritual at every commit boundary, and the worktree placement convention.
+
+## Packaging
+
+A reproducible AppImage recipe for the desktop GUI lives in
+[`packaging/appimage/`](packaging/appimage/):
+
+```bash
+packaging/appimage/build-appimage.sh        # → dist/daemonseed-gui-x86_64.AppImage
+```
+
+It builds `daemonseed-gui --release --features desktop` against a glibc 2.35 floor
+via `cargo-zigbuild` and bundles it with `appimagetool`. See
+[`packaging/appimage/README.md`](packaging/appimage/README.md) for requirements and knobs.
