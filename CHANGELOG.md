@@ -19,9 +19,25 @@ is the durable anchor.
 
 ## [Unreleased]
 
-In-progress and next-milestone planning is tracked in the project lead's vault
-manifest (not committed). The next entry is added here at the moment a release
-is tagged, as part of the doc-sync ritual in `AGENTS.md`.
+Changes that have landed on `main` since the last tag accumulate here; at the
+next release this block is renamed to its version + date and a fresh
+`[Unreleased]` is opened (see `AGENTS.md` doc-sync). Planning for *unstarted*
+work lives in the project lead's vault manifest, not here.
+
+### Added
+
+- First-start backup confirmation as three single-word type-back fields (C34):
+  one challenge word per box, Enter advancing to the next (the third confirms).
+- Reproducible AppImage build recipe for the desktop GUI
+  (`packaging/appimage/`, output to `dist/`).
+- Per-share optional wire-facing name persisted with published shares
+  (`PublishedShare { root, name }`; core slice — no naming UI yet).
+- "Restored N shares from last session" label on the connect-time
+  auto-republish path, distinguishing a restore from a fresh publish.
+
+### Changed
+
+- Track oxicrypt 0.15.0 in the lockfile.
 
 ## [0.28.0] — GUI auth-input felt-fixes + global font pass (round 2)
 

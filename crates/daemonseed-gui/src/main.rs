@@ -906,6 +906,13 @@ fn start_drain(
 /// identity is in hand — from the auth-success callbacks (first-start finish /
 /// unlock) or, on the offscreen `main` path, directly at startup. On a crypto-init
 /// failure the shell still renders; the Lobby just stays offline.
+///
+/// Auto-republish invariant: every production connection routes through here, and
+/// this is the only place `republish_roots` is sourced (`persisted_published()`).
+/// There is no mid-session `Reconnect` path today; if one is ever added it MUST go
+/// through `connect_now` (or send `NetCommand::Connect` carrying
+/// `persisted_published()` as `republish_roots`) — a bare reconnect that omits it
+/// silently breaks restore-on-reconnect.
 fn connect_now(
     ui: &AppWindow,
     state: &Rc<RefCell<GuiState>>,
