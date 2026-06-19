@@ -676,6 +676,33 @@ fn apply_share_rows(ui: &AppWindow, browser: &ShareBrowser) {
     ui.set_share_rows(ModelRc::from(Rc::new(VecModel::from(rows))));
 }
 
+/// The publish-status line for a `PublishStarted` event. An auto-republish on
+/// connect (`restored`, the M16 restore path) reads as "Restored N share(s) from
+/// last session" so it is not mistaken for a fresh user-driven publish; a fresh
+/// publish whose write-through persistence failed is surfaced inline. `restored_count`
+/// is the number of shares served after this event (the running restore total, which
+/// reaches N on the last restored share of a connect).
+fn publish_status_line(
+    restored: bool,
+    name: &str,
+    file_count: usize,
+    restored_count: usize,
+    persist_err: Option<&str>,
+) -> String {
+    if restored {
+        let noun = if restored_count == 1 {
+            "share"
+        } else {
+            "shares"
+        };
+        format!("Restored {restored_count} {noun} from last session")
+    } else if let Some(e) = persist_err {
+        format!("Published \u{201c}{name}\u{201d} · served this session only ({e})")
+    } else {
+        format!("Published \u{201c}{name}\u{201d} · {file_count} file(s)")
+    }
+}
+
 /// Push the session's published shares (`GuiState::my_shares`) to the Publish overlay's
 /// "Your live shares" list. Called whenever that set changes (`PublishStarted` /
 /// `PublishStopped`) and when the overlay opens.
@@ -1043,6 +1070,7 @@ fn apply_net_event(
             name,
             file_count,
             root,
+            restored,
         } => {
             // M16 write-through: remember this root so it auto-republishes next launch
             // (idempotent). A persistence failure is non-fatal — the share still serves
@@ -1053,12 +1081,16 @@ fn apply_net_event(
                 st.persist_published(&root).err()
             };
             apply_my_shares(ui, &state.borrow());
-            let msg = match persist_err {
-                Some(e) => {
-                    format!("Published \u{201c}{name}\u{201d} · served this session only ({e})")
-                }
-                None => format!("Published \u{201c}{name}\u{201d} · {file_count} file(s)"),
-            };
+            // An auto-republish on connect reads as "Restored N shares…" rather than a
+            // per-share "Published …" so it is not mistaken for a fresh publish.
+            let restored_count = state.borrow().my_shares().len();
+            let msg = publish_status_line(
+                restored,
+                &name,
+                file_count,
+                restored_count,
+                persist_err.as_deref(),
+            );
             ui.set_publish_status(SharedString::from(msg.clone()));
             ui.set_share_status(SharedString::from(msg));
         }
@@ -1855,6 +1887,30 @@ mod tests {
             .map(|w| format!("  {} ", w.to_uppercase()))
             .collect();
         assert!(type_back_precheck(&ch, PHRASE, &ans));
+    }
+
+    #[test]
+    fn publish_status_line_distinguishes_restore_from_fresh_publish() {
+        // Fresh user-driven publish: per-share "Published …" with the file count.
+        assert_eq!(
+            publish_status_line(false, "trip-photos", 42, 1, None),
+            "Published \u{201c}trip-photos\u{201d} · 42 file(s)"
+        );
+        // Fresh publish whose write-through persistence failed surfaces inline.
+        assert_eq!(
+            publish_status_line(false, "trip-photos", 42, 1, Some("disk full")),
+            "Published \u{201c}trip-photos\u{201d} · served this session only (disk full)"
+        );
+        // Auto-republish on connect reads as a restore summary (pluralized), and
+        // ignores the per-share name / file_count / persist_err.
+        assert_eq!(
+            publish_status_line(true, "trip-photos", 42, 1, None),
+            "Restored 1 share from last session"
+        );
+        assert_eq!(
+            publish_status_line(true, "ignored", 0, 3, Some("ignored")),
+            "Restored 3 shares from last session"
+        );
     }
 
     #[test]

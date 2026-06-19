@@ -231,6 +231,10 @@ pub enum NetEvent {
         name: String,
         file_count: usize,
         root: String,
+        /// True when this is an auto-republish on connect (the M16 restore path),
+        /// false for a fresh user-driven publish — drives the "Restored N shares
+        /// from last session" status vs the per-share "Published …" line.
+        restored: bool,
     },
     /// A published share stopped serving (unpublish, session end, or relay reap).
     PublishStopped { share_id: String },
@@ -502,7 +506,8 @@ impl Actor {
                             .file_name()
                             .map(|n| n.to_string_lossy().into_owned())
                             .unwrap_or_else(|| "share".to_owned());
-                        self.handle_publish_share(root, name, sharer.clone()).await;
+                        self.handle_publish_share(root, name, sharer.clone(), true)
+                            .await;
                     }
                 }
                 Err(e) => {
@@ -563,7 +568,8 @@ impl Actor {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "share".to_owned());
-            self.handle_publish_share(root, name, sharer.clone()).await;
+            self.handle_publish_share(root, name, sharer.clone(), true)
+                .await;
         }
     }
 
@@ -843,8 +849,15 @@ impl Actor {
     // ── Shares: publish / serve / fetch (M15/M16 path, mirrors the TUI) ───────
 
     /// Publish `root` as a public share and serve it from disk for the session.
-    /// See [`NetCommand::PublishShare`].
-    async fn handle_publish_share(&mut self, root: PathBuf, name: String, sharer_handle: String) {
+    /// `restored` is true on the M16 auto-republish path (connect-time restore),
+    /// false for a fresh user-driven publish. See [`NetCommand::PublishShare`].
+    async fn handle_publish_share(
+        &mut self,
+        root: PathBuf,
+        name: String,
+        sharer_handle: String,
+        restored: bool,
+    ) {
         // Fail-safe: never recursively hash the home tree / a system dir. A picker that
         // returns the default directory (some xdg portals do) would otherwise index all
         // of $HOME and appear to hang. Reject with a clear error instead.
@@ -930,6 +943,7 @@ impl Actor {
             name,
             file_count,
             root: root.to_string_lossy().into_owned(),
+            restored,
         });
     }
 
@@ -1367,7 +1381,11 @@ async fn net_actor(
                 root,
                 name,
                 sharer_handle,
-            } => actor.handle_publish_share(root, name, sharer_handle).await,
+            } => {
+                actor
+                    .handle_publish_share(root, name, sharer_handle, false)
+                    .await
+            }
             NetCommand::UnpublishShare { share_id } => {
                 actor.handle_unpublish_share(&share_id).await
             }
