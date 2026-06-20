@@ -26,6 +26,9 @@ work lives in the project lead's vault manifest, not here.
 
 ### Added
 
+- Desktop GUI window/taskbar icon: the `AppWindow` now carries an `icon`,
+  rasterized from the AppImage's scalable placeholder so the windowed app and
+  the AppImage share one mark (aesthetic refinement deferred).
 - First-start backup confirmation as three single-word type-back fields (C34):
   one challenge word per box, Enter advancing to the next (the third confirms).
 - Reproducible AppImage build recipe for the desktop GUI

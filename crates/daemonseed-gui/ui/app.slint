@@ -218,6 +218,11 @@ export component AppWindow inherits Window {
     // (password mask ●, carets ▶/▾) regardless of the host's fonts. Pairs with
     // the `import "fonts/DejaVuSans.ttf"` above.
     default-font-family: "DejaVu Sans";
+    // App/window icon (taskbar + title bar). Rasterized from the AppImage's
+    // scalable placeholder (packaging/appimage/daemonseed-gui.svg) so the
+    // windowed app and the AppImage share one mark; aesthetic refinement is a
+    // separate pass. The .slint compiler bundles this asset into the binary.
+    icon: @image-url("daemonseed-gui.png");
 
     in property <[CircleData]> circles;
     in-out property <int> active: 0;          // SOLE writer is Rust (out-of-range guard)
