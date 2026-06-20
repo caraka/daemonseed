@@ -1779,6 +1779,13 @@ fn main() {
             }
         }
         apply_share_rows(&ui, &browser.borrow());
+        // Seed the Shares-tab status line with the auto-republish restore notice
+        // (the real production string, via `publish_status_line`) so the PNG
+        // regression-checks that "Restored N shares from last session" renders in
+        // the rendered `share-status` widget — the connect-time restore surface (#34).
+        ui.set_share_status(SharedString::from(publish_status_line(
+            true, "", 0, 3, None,
+        )));
         // Show the rail-footer download meter mid-download too (fixture).
         ui.set_download_label(SharedString::from("Downloading… 42%"));
         ui.set_download_progress(0.42);
