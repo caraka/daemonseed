@@ -89,16 +89,16 @@ impl Profile {
         Ok(added)
     }
 
-    /// Published-share roots (directory paths) recorded in the blob — the M16
-    /// auto-republish set read at next launch.
-    pub fn published(&self) -> Vec<String> {
-        // The net republish path keys on the root path; the optional wire-facing
-        // name (PublishedShare::name) is persisted but not yet consumed here (the
-        // republish-uses-persisted-name wiring + naming UI are a follow-up).
+    /// Published shares recorded in the blob — the M16 auto-republish set read at
+    /// next launch, as `(root, optional wire-facing name)` pairs. The republish
+    /// path keys on the root and uses the persisted `name` when present, else the
+    /// root's basename (see `republish_name` in `net`). `name` is `None` until a
+    /// name-a-share UI exists, but the slot is consumed end-to-end now.
+    pub fn published(&self) -> Vec<(String, Option<String>)> {
         self.seeds
             .published()
             .iter()
-            .map(|p| p.root.clone())
+            .map(|p| (p.root.clone(), p.name.clone()))
             .collect()
     }
 

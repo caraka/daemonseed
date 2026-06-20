@@ -929,7 +929,7 @@ fn connect_now(
                     st.persisted_rejoins(),
                     st.persisted_published()
                         .into_iter()
-                        .map(PathBuf::from)
+                        .map(|(root, name)| (PathBuf::from(root), name))
                         .collect::<Vec<_>>(),
                 )
             };

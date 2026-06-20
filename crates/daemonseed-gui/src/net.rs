@@ -45,7 +45,7 @@
 //! both `Send` bounds — identical to the TUI's rationale.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use daemonseed_cli::connect::connect_session;
@@ -68,6 +68,22 @@ use daemonseed_core::storage::seeds::CounterState;
 use daemonseed_proto::v1 as wire;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+
+/// The wire-facing name for an auto-republished share (M16 restore path, #41):
+/// the persisted [`daemonseed_core::storage::seeds::PublishedShare`] `name` when
+/// one was stored, else the root directory's basename, else `"share"`. Centralizes
+/// the choice both republish loops make so the persisted name is consumed
+/// consistently. (The name-a-share UI that would set a non-`None` persisted name is
+/// a separate follow-up; today the persisted slot is `None` and this falls back to
+/// the basename — unchanged behavior — but the wiring now carries a name end to end.)
+fn republish_name(root: &Path, persisted: Option<&str>) -> String {
+    if let Some(name) = persisted.filter(|n| !n.is_empty()) {
+        return name.to_owned();
+    }
+    root.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "share".to_owned())
+}
 
 /// A command from the UI thread to the network actor. Fire-and-forget: the UI
 /// never blocks waiting for one to complete.
@@ -97,7 +113,7 @@ pub enum NetCommand {
         /// after the lobby auto-join exactly like `rejoin_circles`. Each republish
         /// uses the directory basename as the share name and `display_handle` as the
         /// sharer handle. Empty for the ephemeral / no-profile path.
-        republish_roots: Vec<PathBuf>,
+        republish_roots: Vec<(PathBuf, Option<String>)>,
     },
     /// Join (subscribe to) a public room by name. In this slice production Connect
     /// auto-joins the default room directly (via [`Actor::join_room`]); this
@@ -435,7 +451,7 @@ impl Actor {
         address: &str,
         display_handle: Option<String>,
         rejoin_circles: Vec<(u64, String)>,
-        republish_roots: Vec<PathBuf>,
+        republish_roots: Vec<(PathBuf, Option<String>)>,
     ) {
         // Round 6: present under the persisted stable handle when unlocked from a
         // profile. The connection proof below stays ephemeral (D8) — only the
@@ -501,11 +517,8 @@ impl Actor {
                     // as the sharer handle; a per-share failure surfaces as a
                     // PublishError and never aborts the others or the connect.
                     let sharer = self.my_handle.clone();
-                    for root in republish_roots {
-                        let name = root
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| "share".to_owned());
+                    for (root, persisted_name) in republish_roots {
+                        let name = republish_name(&root, persisted_name.as_deref());
                         self.handle_publish_share(root, name, sharer.clone(), true)
                             .await;
                     }
@@ -535,7 +548,7 @@ impl Actor {
         server_id: String,
         display_handle: Option<String>,
         rejoin_circles: Vec<(u64, String)>,
-        republish_roots: Vec<PathBuf>,
+        republish_roots: Vec<(PathBuf, Option<String>)>,
     ) {
         // Round-6 parity: present under the persisted handle if supplied.
         if let Some(handle) = display_handle {
@@ -563,11 +576,8 @@ impl Actor {
         }
         // M16 parity: silently re-publish persisted shares via the real path.
         let sharer = self.my_handle.clone();
-        for root in republish_roots {
-            let name = root
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "share".to_owned());
+        for (root, persisted_name) in republish_roots {
+            let name = republish_name(&root, persisted_name.as_deref());
             self.handle_publish_share(root, name, sharer.clone(), true)
                 .await;
         }
@@ -1561,6 +1571,24 @@ mod tests {
     use daemonseed_core::public_room::{derive_room_key, room_asset_address};
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn republish_name_prefers_persisted_else_basename() {
+        // #41 wiring: a persisted wire-facing name wins over the root basename.
+        assert_eq!(
+            republish_name(Path::new("/home/alice/2026-trip"), Some("trip-photos")),
+            "trip-photos"
+        );
+        // No persisted name → the directory basename (the legacy fallback).
+        assert_eq!(
+            republish_name(Path::new("/home/alice/trip-photos"), None),
+            "trip-photos"
+        );
+        // An empty persisted name is treated as absent → basename.
+        assert_eq!(republish_name(Path::new("/srv/docs"), Some("")), "docs");
+        // Degenerate root with no basename → "share".
+        assert_eq!(republish_name(Path::new("/"), None), "share");
+    }
 
     /// A fixed server-id the cross-derivation + relay tests namespace by.
     const SERVER_ID: &str = "relay-test#001122334455";

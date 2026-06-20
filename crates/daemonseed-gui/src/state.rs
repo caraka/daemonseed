@@ -218,10 +218,11 @@ impl GuiState {
         root
     }
 
-    /// The persisted published-share roots (directory paths) the net actor must
-    /// silently re-publish on connect — read from the unlocked profile blob. Empty
-    /// on the no-profile (ephemeral) path.
-    pub fn persisted_published(&self) -> Vec<String> {
+    /// The persisted published shares the net actor must silently re-publish on
+    /// connect — `(root, optional wire-facing name)` read from the unlocked profile
+    /// blob. The republish path uses the name when present, else the root basename.
+    /// Empty on the no-profile (ephemeral) path.
+    pub fn persisted_published(&self) -> Vec<(String, Option<String>)> {
         self.profile
             .as_ref()
             .map(Profile::published)
@@ -1055,9 +1056,10 @@ mod tests {
         st2.set_profile(Profile::from_materials(materials2, root.clone()));
 
         // The kept publish survived relaunch; the unpersisted one did not.
+        // name is None (no naming UI yet); the slot round-trips through the pair.
         assert_eq!(
             st2.persisted_published(),
-            vec!["/home/alice/photos".to_string()],
+            vec![("/home/alice/photos".to_string(), None)],
             "exactly the kept published root auto-republishes next launch"
         );
 

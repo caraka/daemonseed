@@ -40,7 +40,11 @@ work lives in the project lead's vault manifest, not here.
 
 ### Changed
 
-- Track oxicrypt 0.15.0 in the lockfile.
+- Track oxicrypt 0.16.0 in the lockfile.
+- Auto-republish on connect now consumes the persisted per-share name
+  (`PublishedShare.name`), threaded through the restore path; it falls back to
+  the root directory basename when unset. The name-a-share UI that would set a
+  non-default name remains a follow-up.
 
 ## [0.28.0] — GUI auth-input felt-fixes + global font pass (round 2)
 
