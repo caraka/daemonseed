@@ -74,6 +74,12 @@ work lives in the project lead's vault manifest, not here.
 
 - Circle rail/header no longer shows a stale "not yet connected" placeholder.
 - Keyboard focus restored when the desktop window regains activation. (#39)
+- The desktop GUI window size is remembered in the resolved profile root, so a
+  `--portable` / `--config` instance keeps its own size instead of the shared XDG
+  one.
+- A long phrase/name in the circle-join and Publish-name fields is clipped to its
+  box instead of overrunning to the window edge (the same `clip` fix the auth
+  inputs already carry).
 
 ## [0.28.0] — GUI auth-input felt-fixes + global font pass (round 2)
 

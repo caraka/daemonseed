@@ -727,7 +727,7 @@ export component AppWindow inherits Window {
                 spacing: 10px;
                 // phrase field
                 Rectangle {
-                    height: 44px; border-radius: 9px; background: #141517; border-width: 1px; border-color: #ffffff12;
+                    height: 44px; border-radius: 9px; background: #141517; border-width: 1px; border-color: #ffffff12; clip: true; // contain a long single-line entry inside the box
                     HorizontalLayout { padding-left: 12px;
                         // `visible:` not `if` — toggling on the first/last char typed
                         // must NOT mutate the item tree mid-edit (partial_renderer crash).
@@ -917,7 +917,7 @@ export component AppWindow inherits Window {
 
             // optional name field (blank → the folder's own name)
             Rectangle {
-                height: 44px; border-radius: 9px; background: #141517; border-width: 1px; border-color: #ffffff12;
+                height: 44px; border-radius: 9px; background: #141517; border-width: 1px; border-color: #ffffff12; clip: true; // contain a long single-line entry inside the box
                 HorizontalLayout { padding-left: 12px;
                     // `visible:` not `if` — toggling on the first/last char typed must
                     // NOT mutate the item tree mid-edit (partial_renderer crash).

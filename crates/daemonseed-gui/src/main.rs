@@ -886,34 +886,35 @@ fn refocus_active_field(ui: &AppWindow) {
     }
 }
 
-/// Where the last window size is remembered — `$XDG_CONFIG_HOME/daemonseed/window-size`,
-/// a one-line `WIDTHxHEIGHT` (physical px). A plain file, not the profile/redb store:
-/// it is a non-secret UI convenience, independent of identity.
+/// Where the last window size is remembered — `<profile-root>/window-size`, a
+/// one-line `WIDTHxHEIGHT` (physical px). It lives in the resolved profile root
+/// (so a `--portable` / `--config` instance keeps its own size in its own
+/// directory, not the shared XDG one), but it is a plain file outside the
+/// profile/redb store: a non-secret UI convenience, independent of identity.
 #[cfg(feature = "desktop")]
-fn window_size_path() -> Option<std::path::PathBuf> {
-    dirs::config_dir().map(|c| c.join("daemonseed").join("window-size"))
+fn window_size_path(profile_root: &std::path::Path) -> std::path::PathBuf {
+    profile_root.join("window-size")
 }
 
 /// Last saved window size, or None if absent/unparseable/out-of-sane-range. The clamp
 /// (≥ the 720x480 min, ≤ 8K) drops an absurd value saved on another monitor so we fall
 /// back to the default rather than restore something unusable.
 #[cfg(feature = "desktop")]
-fn load_window_size() -> Option<(u32, u32)> {
-    let s = std::fs::read_to_string(window_size_path()?).ok()?;
+fn load_window_size(profile_root: &std::path::Path) -> Option<(u32, u32)> {
+    let s = std::fs::read_to_string(window_size_path(profile_root)).ok()?;
     let (w, h) = s.trim().split_once('x')?;
     let (w, h) = (w.parse::<u32>().ok()?, h.parse::<u32>().ok()?);
     ((720..=7680).contains(&w) && (480..=4320).contains(&h)).then_some((w, h))
 }
 
-/// Persist the window size (best-effort; a missing config dir is created).
+/// Persist the window size (best-effort; a missing profile dir is created).
 #[cfg(feature = "desktop")]
-fn save_window_size(w: u32, h: u32) {
-    if let Some(p) = window_size_path() {
-        if let Some(parent) = p.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(p, format!("{w}x{h}"));
+fn save_window_size(profile_root: &std::path::Path, w: u32, h: u32) {
+    let p = window_size_path(profile_root);
+    if let Some(parent) = p.parent() {
+        let _ = std::fs::create_dir_all(parent);
     }
+    let _ = std::fs::write(p, format!("{w}x{h}"));
 }
 
 /// Everything the running app must keep alive for its whole lifetime. **If this
@@ -1817,13 +1818,15 @@ fn main() {
             // Restore the last window size (size only — the WM constrains an oversized
             // value, and omitting position avoids landing off-screen on a different
             // monitor; load_window_size() sanity-clamps absurd values).
-            if let Some((w, h)) = load_window_size() {
+            if let Some((w, h)) = load_window_size(&profile_root.borrow()) {
                 ui.window().set_size(slint::PhysicalSize::new(w, h));
             }
             let weak = ui.as_weak();
             // Latest size, persisted once on close (one write per session, no disk churn
-            // during a drag-resize).
+            // during a drag-resize). The size follows the resolved profile root, so a
+            // --portable / --config instance saves into its own directory, not XDG.
             let last_size = std::rc::Rc::new(std::cell::Cell::new(None::<(u32, u32)>));
+            let ws_root = profile_root.clone();
             ui.window().on_winit_window_event(move |_w, event| {
                 match event {
                     // #39: re-grab keyboard focus on activation so input survives an
@@ -1840,7 +1843,7 @@ fn main() {
                     WindowEvent::Resized(sz) => last_size.set(Some((sz.width, sz.height))),
                     WindowEvent::CloseRequested => {
                         if let Some((w, h)) = last_size.get() {
-                            save_window_size(w, h);
+                            save_window_size(&ws_root.borrow(), w, h);
                         }
                     }
                     _ => {}
