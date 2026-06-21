@@ -1243,10 +1243,26 @@ fn apply_net_event(
         } => {
             let _ = (share_id, bytes_written);
             ui.set_download_progress(1.0);
-            ui.set_download_label(SharedString::from(format!(
+            let msg = format!(
                 "Downloaded {files_written} file{}",
                 if files_written == 1 { "" } else { "s" }
-            )));
+            );
+            ui.set_download_label(SharedString::from(msg.clone()));
+            // The completed-download banner is informational — auto-dismiss it
+            // after a generous read so it doesn't linger (the user often steps
+            // away mid-download). Guard on the label being unchanged so a newer
+            // download's banner isn't wiped by this stale timer (#55). Failed
+            // downloads (FetchError) are left up deliberately — don't hide a
+            // failure on a timer.
+            let ui_weak = ui.as_weak();
+            slint::Timer::single_shot(Duration::from_secs(30), move || {
+                if let Some(ui) = ui_weak.upgrade()
+                    && ui.get_download_label().as_str() == msg
+                {
+                    ui.set_download_label(SharedString::from(""));
+                    ui.set_download_progress(0.0);
+                }
+            });
         }
         // FetchError covers a failed download AND a failed preview (the variant carries
         // no share_id to disambiguate). Surface it on the meter as the unified fetch
