@@ -29,8 +29,10 @@
 //! The unified share model adds [`share_announce`] — seal/open for the in-band
 //! share-announcement payload that replaces relay-hosted share discovery, the
 //! share-tier analogue of [`public_room`] — its request-half [`share_rollcall`]
-//! (the sealed late-join roll-call that prompts live sharers to re-announce) —
-//! and [`share_seal`], which seals the
+//! (the sealed late-join roll-call that prompts live sharers to re-announce),
+//! [`share_catalog`] (the client-side discovery catalog that folds announcements
+//! and ages them out, replacing the relay's share registry) — and [`share_seal`],
+//! which seals the
 //! [`share_envelope::ShareFrame`] content itself so share traffic is
 //! indistinguishable from chat on the wire. Both seal under tier-typed keys
 //! ([`circle::key::CircleKey`] / [`public_room::PublicRoomKey`], the key-class
@@ -63,6 +65,7 @@ pub mod public_room;
 pub mod public_space;
 pub mod release;
 pub mod share_announce;
+pub mod share_catalog;
 pub mod share_envelope;
 pub mod share_rollcall;
 pub mod share_seal;

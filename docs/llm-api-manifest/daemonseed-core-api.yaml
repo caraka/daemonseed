@@ -810,6 +810,24 @@ modules:
       - S21
       - C57
 
+  - name: daemonseed_core::share_catalog
+    description: >-
+      In-band share discovery catalog — the client-side replacement for the relay
+      SharePublishRegistry. A client folds each verified ShareAnnouncement
+      (announce/withdraw, via share_announce::open_announcement) into a
+      ShareCatalog and ages entries out by a local receive-time TTL (two-speed
+      liveness: live apply + slow prune; explicit remove is the fetch-failure
+      backstop). Stale/reordered announcements (older sent_unix_ms for a known
+      share) are ignored. Transport-free; both the TUI and GUI net actors hold
+      one. Types: ShareCatalog, DiscoveredShare, CatalogChange.
+    no_std: false
+    depends_on:
+      - daemonseed_core::share_announce
+    iscs:
+      - A-S1
+      - A-S2
+      - S21
+
   - name: daemonseed_core::share_seal
     description: >-
       Share CONTENT sealing — AES-256-GCM-seals each share_envelope ShareFrame

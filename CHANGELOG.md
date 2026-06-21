@@ -46,6 +46,11 @@ work lives in the project lead's vault manifest, not here.
   plus `daemonseed-core::share_rollcall` seal/open — prompts live sharers to
   re-announce; a distinct, tier-guarded kind pairing with `ShareAnnouncement`
   (design: `docs/design/unified-share-model.md`). (#52)
+- In-band share discovery catalog (`daemonseed-core::share_catalog`): the
+  client-side live set that folds verified announcements and ages them out by a
+  receive-time TTL (two-speed liveness), replacing the relay share registry;
+  shared by the TUI and GUI net actors
+  (design: `docs/design/unified-share-model.md`). (#52)
 - Desktop GUI window/taskbar icon: the `AppWindow` now carries an `icon`,
   rasterized from the AppImage's scalable placeholder so the windowed app and
   the AppImage share one mark (aesthetic refinement deferred).
