@@ -32,6 +32,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use daemonseed_cli::connect::{ConnectError, connect_session};
 use daemonseed_cli::identity_proof::ClientIdentity;
@@ -54,7 +55,12 @@ use daemonseed_core::public_room::{
     DEFAULT_ROOM, PublicRoomKey, derive_room_key, open_room_message, room_asset_address,
     seal_room_message,
 };
+use daemonseed_core::share_announce::{
+    AnnouncementFields, mint_share_id, open_announcement, seal_public_announcement,
+};
+use daemonseed_core::share_catalog::{CatalogChange, ShareCatalog};
 use daemonseed_core::share_envelope::{ManifestEntry, ShareFrame};
+use daemonseed_core::share_rollcall::{RollCallFields, open_rollcall, seal_public_rollcall};
 use daemonseed_core::share_seal::{open_share_frame, seal_public_share_frame};
 use daemonseed_core::share_serve::{
     DiskShareContent, MANIFEST_FRAME_BUDGET, ServeError, ShareManifest, manifest_frame_len,
@@ -125,7 +131,25 @@ pub enum NetCommand {
     /// A read-only operation — no scan kicks off here; the cold-scan / live
     /// watcher are driven independently and the actor reports whatever state
     /// it observes. Emitted as a single [`NetEvent::SharesSnapshot`].
+    ///
+    /// In the unified share model this also posts a sealed [`wire::ShareRollCall`]
+    /// to the lobby (the single late-join hook — startup, the Refresh action, and
+    /// the reconcile timer all route through here) so live sharers re-announce,
+    /// then snapshots the in-band [`ShareCatalog`] as the `remote` rows.
     RefreshShares,
+    /// Internal: a verified lobby [`wire::ShareAnnouncement`] the inbound reader
+    /// opened, to fold into the actor's [`ShareCatalog`] (all catalog mutation
+    /// stays on `&mut self`). Posted by [`read_inbound_public_room`]; never sent
+    /// by the binary. Emits a fresh [`NetEvent::SharesSnapshot`] on a real change.
+    ApplyAnnouncement(Box<wire::ShareAnnouncement>),
+    /// Internal: a verified lobby [`wire::ShareRollCall`] the inbound reader
+    /// opened — re-announce every own share so the requester discovers them.
+    /// Posted by [`read_inbound_public_room`]; never sent by the binary.
+    AnswerRollCall,
+    /// Internal: the slow-reconcile tick — prune aged-out catalog entries and
+    /// post a roll-call. Self-scheduled on [`RECONCILE_INTERVAL`]; never sent by
+    /// the binary.
+    ReconcileShares,
     /// Refresh the public-space snapshot (ISC-25 / ISC-S7 / ISC-A-S3): fetch the
     /// connected relay's MOTD, announcement posts, and published signer
     /// whitelist over the live [`AppSession`], render the MOTD as inert text,
@@ -558,6 +582,10 @@ impl NetHandle {
     pub fn new() -> std::io::Result<Self> {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (evt_tx, evt_rx) = mpsc::unbounded_channel();
+        // A self-command sender the actor clones so detached tasks (the lobby
+        // inbound reader, the reconcile timer) can post discovery commands back
+        // into the one command loop, keeping all catalog mutation on `&mut self`.
+        let cmd_tx_actor = cmd_tx.clone();
         let thread = std::thread::Builder::new()
             .name("daemonseed-tui-net".to_owned())
             .spawn(move || {
@@ -566,7 +594,7 @@ impl NetHandle {
                     .build()
                     .expect("build current-thread net runtime");
                 let local = tokio::task::LocalSet::new();
-                local.block_on(&rt, net_actor(cmd_rx, evt_tx));
+                local.block_on(&rt, net_actor(cmd_rx, cmd_tx_actor, evt_tx));
             })?;
         Ok(Self {
             cmd_tx,
@@ -627,9 +655,47 @@ struct PublicRoom {
     out_tx: mpsc::Sender<wire::CotFrame>,
 }
 
+/// A share this daemon is publishing this session — the in-band-discovery
+/// replacement for the relay registry's owner-scoped record. Held so a roll-call
+/// can re-announce every live share (the slow-reconcile / late-join response) and
+/// an unpublish can post a matching withdraw. The serve task itself lives in
+/// [`Actor::published`], keyed by the same `share_id`.
+#[derive(Clone)]
+struct OwnShare {
+    share_id: String,
+    name: String,
+    rating: String,
+    sharer_handle: String,
+}
+
+/// Prune-TTL for a discovered share's in-band liveness ([`ShareCatalog`]). Must
+/// exceed ~2 re-announce intervals so one missed reconcile cycle never drops a
+/// still-live share; [`RECONCILE_INTERVAL`] is the re-announce cadence.
+const SHARE_CATALOG_TTL: Duration = Duration::from_secs(90);
+
+/// Cadence of the slow-reconcile roll-call ([`Actor::handle_reconcile_shares`]):
+/// prune aged-out entries and post a roll-call so live sharers re-announce.
+/// Fixed (not jittered) — a deterministic interval keeps the loop test-friendly,
+/// and `SHARE_CATALOG_TTL` is set to > ~2× this so a single miss is absorbed.
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Mutable state the actor carries across commands.
 struct Actor {
     evt_tx: mpsc::UnboundedSender<NetEvent>,
+    /// A self-command sender so detached tasks (the lobby inbound reader, the
+    /// reconcile timer) can post discovery commands back into the one command
+    /// loop. All [`ShareCatalog`] mutation stays on the actor's `&mut self`.
+    cmd_tx: mpsc::UnboundedSender<NetCommand>,
+    /// In-band discovery catalog for the lobby (unified share model): verified
+    /// [`wire::ShareAnnouncement`]s fold in here, replacing the relay's
+    /// `ListPublicShares` registry. Rendered into the Shares pane as
+    /// [`wire::PublicShareListing`] rows so the UI is unchanged.
+    share_catalog: ShareCatalog,
+    /// Shares this daemon is publishing this session, so a roll-call can
+    /// re-announce them and an unpublish can post a matching withdraw. Behind
+    /// `Rc<RefCell<..>>` like [`Self::published`]: the detached publish flow
+    /// (a `spawn_local`) records its own entry once the hash phase succeeds.
+    own_shares: Rc<RefCell<Vec<OwnShare>>>,
     /// The live application session, once Connected.
     session: Option<AppSession>,
     /// The connected relay's wire server-id, namespacing circle addresses.
@@ -722,10 +788,14 @@ struct Actor {
 /// as a `spawn_local` task).
 async fn net_actor(
     mut cmd_rx: mpsc::UnboundedReceiver<NetCommand>,
+    cmd_tx: mpsc::UnboundedSender<NetCommand>,
     evt_tx: mpsc::UnboundedSender<NetEvent>,
 ) {
     let mut actor = Actor {
         evt_tx,
+        cmd_tx,
+        share_catalog: ShareCatalog::new(SHARE_CATALOG_TTL),
+        own_shares: Rc::new(RefCell::new(Vec::new())),
         session: None,
         server_id: None,
         circles: Vec::new(),
@@ -774,6 +844,9 @@ async fn net_actor(
                     .await
             }
             NetCommand::RefreshShares => actor.handle_refresh_shares().await,
+            NetCommand::ApplyAnnouncement(ann) => actor.handle_apply_announcement(&ann),
+            NetCommand::AnswerRollCall => actor.handle_answer_rollcall().await,
+            NetCommand::ReconcileShares => actor.handle_reconcile_shares().await,
             NetCommand::RefreshPublicSpace => actor.handle_refresh_public_space().await,
             NetCommand::RefreshDeprecation => actor.handle_refresh_deprecation().await,
             NetCommand::FetchShare {
@@ -848,6 +921,57 @@ impl Actor {
                 root: None,
             });
         };
+        // The lobby subscription is the in-band discovery transport (unified
+        // share model): the share is announced by posting a sealed
+        // `ShareAnnouncement` on the SAME stream chat uses, not via a relay RPC.
+        // The lobby auto-joins on connect, so this is present whenever a session
+        // is. Capture its key + out_tx so the detached flow can announce.
+        let Some(room) = self.public_room.as_ref() else {
+            return self.emit(NetEvent::PublishError {
+                message: "public room not joined yet".to_owned(),
+                root: None,
+            });
+        };
+        let Some(identity) = self.identity.as_ref() else {
+            return self.emit(NetEvent::PublishError {
+                message: "no identity to sign the announcement".to_owned(),
+                root: None,
+            });
+        };
+        // Mint the share id CLIENT-side (unified share model): the relay no
+        // longer assigns it, which makes it relay-portable (a future cross-relay
+        // path) and removes the last relay-held share state.
+        let share_id = mint_share_id();
+        let own_shares = Rc::clone(&self.own_shares);
+
+        // Seal the announcement NOW, while `identity` (which is `!Clone` —
+        // `SignKeypair` zeroes on drop and has no clone) is still borrowable from
+        // `&self`. The detached flow only moves the finished `Vec<u8>` + the
+        // lobby address/sender, never the signing key. The announcement does not
+        // depend on the hash result: the share id is already minted and the
+        // listing metadata is known up front. Empty rating (advisory).
+        let rating = String::new();
+        let announce_fields = AnnouncementFields {
+            room: &room.room,
+            sender_handle: &sharer_handle,
+            share_id: &share_id,
+            name: &name,
+            rating: &rating,
+            withdraw: false,
+            sent_unix_ms: now_unix_ms(),
+        };
+        let sealed_announcement =
+            match seal_public_announcement(&room.room_key, identity.signing(), &announce_fields) {
+                Ok(s) => s,
+                Err(e) => {
+                    return self.emit(NetEvent::PublishError {
+                        message: format!("could not seal share announcement: {e}"),
+                        root: None,
+                    });
+                }
+            };
+        let announce_addr = room.asset_addr;
+        let announce_tx = room.out_tx.clone();
 
         // Per-publish cancel flag, keyed by root so `CancelPublish { root }`
         // finds exactly this hash. A re-publish of the same root overwrites a
@@ -903,6 +1027,9 @@ impl Actor {
         let publish_cancels = Rc::clone(&self.publish_cancels);
         let published = Rc::clone(&self.published);
         tokio::task::spawn_local(async move {
+            // The minted share id is the one advertised in-band — no relay RPC
+            // assigns it (unified share model). The lobby announcement IS the
+            // publish; the share is discovered by listeners opening it.
             let hashed = hash_task.await.expect("share-hash task panicked");
             // The hash phase is over either way — drop the cancel flag so a
             // late `CancelPublish` is the documented no-op (stopping a served
@@ -948,31 +1075,33 @@ impl Actor {
             // chunk request parks the whole actor (ISC-A-C7).
             let content = std::sync::Arc::new(DiskShareContent::new(root.clone(), manifest));
             let file_count = content.file_count();
-            // listing.share_id is ignored — the server assigns it (F25).
-            let resp = session
-                .public_space()
-                .publish_share(wire::PublishShareRequest {
-                    listing: Some(wire::PublicShareListing {
-                        share_id: String::new(),
-                        name: name.clone(),
-                        rating: String::new(),
-                        // The publisher's display handle so peers see who shared
-                        // it instead of "(operator)" (M15 — completes the #6
-                        // handle passthrough on the publish side).
-                        sharer_handle,
-                    }),
-                })
-                .await;
-            let share_id = match resp {
-                Ok(r) => r.into_inner().share_id,
-                Err(s) => {
-                    let _ = evt_tx.send(NetEvent::PublishError {
-                        message: format!("publish refused: {s}"),
-                        root: Some(root),
-                    });
-                    return;
-                }
+            // In-band publish (unified share model): announce the share by
+            // posting the pre-sealed, self-signed `ShareAnnouncement` into the
+            // lobby — the same stream chat uses — instead of a relay
+            // `PublishShare` RPC. It was sealed up front (the signing key is
+            // `!Clone`); only the finished bytes were moved here. Listeners fold
+            // it into their `ShareCatalog`; the relay holds no share directory
+            // (ISC-A-S2).
+            let frame = wire::CotFrame {
+                asset_address: announce_addr.as_bytes().to_vec(),
+                payload: sealed_announcement,
             };
+            if announce_tx.send(frame).await.is_err() {
+                let _ = evt_tx.send(NetEvent::PublishError {
+                    message: "lobby stream closed; reconnect to publish".to_owned(),
+                    root: Some(root),
+                });
+                return;
+            }
+            // Record the own-share so a roll-call can re-announce it and an
+            // unpublish can post a matching withdraw (the in-band replacement
+            // for the relay's owner-scoped registry record).
+            own_shares.borrow_mut().push(OwnShare {
+                share_id: share_id.clone(),
+                name: name.clone(),
+                rating,
+                sharer_handle,
+            });
             // Serve concurrently for the life of the session via `spawn_local`
             // (like the circle inbound readers). `serve_share` ends (Ok) when
             // the relay reaps the asset or the peer leaves; an explicit
@@ -1012,24 +1141,199 @@ impl Actor {
     }
 
     /// Unpublish a share published this session and stop serving it (D, M15).
-    /// See [`NetCommand::UnpublishShare`]. Owner-scoped server-side (ISC-A-S1):
-    /// the relay honours it only on the publishing connection, which is this
-    /// long-lived actor.
+    /// See [`NetCommand::UnpublishShare`]. In the unified share model the
+    /// "unpublish" signal is a withdraw [`wire::ShareAnnouncement`] posted to the
+    /// lobby — listeners drop the share from their [`ShareCatalog`] — not a relay
+    /// RPC. The local serve task is aborted and the own-share record removed.
     async fn handle_unpublish_share(&mut self, share_id: &str) {
         if let Some(handle) = self.published.borrow_mut().remove(share_id) {
             handle.abort();
         }
-        if let Some(session) = self.session.as_ref() {
-            let _ = session
-                .public_space()
-                .unpublish_share(wire::UnpublishShareRequest {
-                    share_id: share_id.to_owned(),
-                })
-                .await;
+        // Post a matching withdraw announcement so listeners remove it (the
+        // in-band replacement for the relay's `UnpublishShare`). Re-use the
+        // own-share's advertised metadata so the withdraw's provenance input
+        // matches the announce's (same share, same name/rating).
+        let own = self
+            .own_shares
+            .borrow()
+            .iter()
+            .find(|s| s.share_id == share_id)
+            .cloned();
+        if let Some(own) = own {
+            self.announce_own_share(&own, true).await;
         }
+        self.own_shares
+            .borrow_mut()
+            .retain(|s| s.share_id != share_id);
         self.emit(NetEvent::PublishStopped {
             share_id: share_id.to_owned(),
         });
+    }
+
+    /// Post a sealed, self-signed [`wire::ShareAnnouncement`] for one own-share
+    /// into the lobby — the in-band publish/withdraw/re-announce primitive
+    /// (unified share model). `withdraw = false` announces or re-announces (a
+    /// publish, a roll-call answer); `withdraw = true` retracts (an unpublish).
+    /// A missing lobby/identity, a seal failure, or a closed stream is logged via
+    /// [`NetEvent::PublishError`] and otherwise non-fatal — discovery self-heals
+    /// on the next roll-call.
+    async fn announce_own_share(&self, own: &OwnShare, withdraw: bool) {
+        let Some(room) = self.public_room.as_ref() else {
+            return;
+        };
+        let Some(identity) = self.identity.as_ref() else {
+            return;
+        };
+        let fields = AnnouncementFields {
+            room: &room.room,
+            sender_handle: &own.sharer_handle,
+            share_id: &own.share_id,
+            name: &own.name,
+            rating: &own.rating,
+            withdraw,
+            sent_unix_ms: now_unix_ms(),
+        };
+        let sealed = match seal_public_announcement(&room.room_key, identity.signing(), &fields) {
+            Ok(s) => s,
+            Err(e) => {
+                return self.emit(NetEvent::PublishError {
+                    message: format!("could not seal share announcement: {e}"),
+                    root: None,
+                });
+            }
+        };
+        let frame = wire::CotFrame {
+            asset_address: room.asset_addr.as_bytes().to_vec(),
+            payload: sealed,
+        };
+        if room.out_tx.send(frame).await.is_err() {
+            self.emit(NetEvent::PublishError {
+                message: "lobby stream closed; reconnect to (re)announce".to_owned(),
+                root: None,
+            });
+        }
+    }
+
+    /// Fold a verified lobby [`wire::ShareAnnouncement`] into the in-band
+    /// discovery catalog and emit a fresh [`NetEvent::SharesSnapshot`] on a real
+    /// change (unified share model). See [`NetCommand::ApplyAnnouncement`]. All
+    /// catalog mutation runs here on `&mut self`; the inbound reader only opens
+    /// the frame and posts the command.
+    fn handle_apply_announcement(&mut self, ann: &wire::ShareAnnouncement) {
+        let change = self.share_catalog.apply(ann, Instant::now());
+        if change != CatalogChange::Unchanged {
+            self.emit_shares_snapshot();
+        }
+    }
+
+    /// Answer a verified lobby [`wire::ShareRollCall`] by re-announcing every
+    /// own-share so the requester discovers them (unified share model). See
+    /// [`NetCommand::AnswerRollCall`]. A no-op when nothing is published or the
+    /// lobby is not joined.
+    async fn handle_answer_rollcall(&mut self) {
+        let owned: Vec<OwnShare> = self.own_shares.borrow().clone();
+        for own in &owned {
+            self.announce_own_share(own, false).await;
+        }
+    }
+
+    /// The slow-reconcile tick (unified share model): prune aged-out catalog
+    /// entries, then post a [`wire::ShareRollCall`] so live sharers re-announce.
+    /// See [`NetCommand::ReconcileShares`]. Self-scheduled on
+    /// [`RECONCILE_INTERVAL`]. A prune that removed entries refreshes the
+    /// snapshot; the roll-call is best-effort.
+    async fn handle_reconcile_shares(&mut self) {
+        let pruned = self.share_catalog.prune(Instant::now());
+        if pruned > 0 {
+            self.emit_shares_snapshot();
+        }
+        self.post_rollcall().await;
+    }
+
+    /// Post a sealed, self-signed [`wire::ShareRollCall`] into the lobby — the
+    /// single late-join hook (startup / Refresh / reconcile all route here). A
+    /// missing lobby/identity or a seal failure is non-fatal (discovery
+    /// self-heals on the next tick); a closed stream is silently dropped.
+    async fn post_rollcall(&self) {
+        let Some(room) = self.public_room.as_ref() else {
+            return;
+        };
+        let Some(identity) = self.identity.as_ref() else {
+            return;
+        };
+        let fields = RollCallFields {
+            room: &room.room,
+            requester_handle: identity.handle(),
+            sent_unix_ms: now_unix_ms(),
+        };
+        let Ok(sealed) = seal_public_rollcall(&room.room_key, identity.signing(), &fields) else {
+            return;
+        };
+        let frame = wire::CotFrame {
+            asset_address: room.asset_addr.as_bytes().to_vec(),
+            payload: sealed,
+        };
+        let _ = room.out_tx.send(frame).await;
+    }
+
+    /// Build and emit a [`NetEvent::SharesSnapshot`] from the current local
+    /// share-index entries and the in-band [`ShareCatalog`]. The single snapshot
+    /// builder shared by [`Self::handle_refresh_shares`] and the catalog-mutating
+    /// discovery handlers, so every surface renders the same rows.
+    fn emit_shares_snapshot(&mut self) {
+        let (local, indexer_status) = self.local_shares_snapshot();
+        let remote = self.catalog_listings();
+        self.emit(NetEvent::SharesSnapshot {
+            local,
+            remote,
+            indexer_status,
+        });
+    }
+
+    /// Read the My-shares rows + indexer status from the persisted share-index.
+    /// A redb error surfaces a [`NetEvent::SharesError`] and reverts the local
+    /// list to empty so the UI never blocks on a transient hiccup (ISC-A-C7).
+    fn local_shares_snapshot(&self) -> (Vec<LocalShareRow>, IndexerStatus) {
+        match self.share_index.as_ref() {
+            Some(index) => match index.entries() {
+                Ok(rows) => {
+                    let count = rows.len() as u64;
+                    let local: Vec<LocalShareRow> = rows
+                        .into_iter()
+                        .map(|e| LocalShareRow {
+                            rel_path: e.rel_path,
+                            size: e.size,
+                            mtime_unix_ms: e.mtime_unix_ms,
+                        })
+                        .collect();
+                    (local, IndexerStatus::Ready { entries: count })
+                }
+                Err(e) => {
+                    self.emit(NetEvent::SharesError {
+                        message: format!("share-index read failed: {e}"),
+                    });
+                    (Vec::new(), IndexerStatus::Idle)
+                }
+            },
+            None => (Vec::new(), IndexerStatus::Idle),
+        }
+    }
+
+    /// Render the in-band [`ShareCatalog`] as the Public-shares rows
+    /// ([`wire::PublicShareListing`]) so the UI surface is unchanged from the
+    /// retired `ListPublicShares` path. The recipient applies its private hide
+    /// set at render (ISC-A-C3); the catalog carries every discovered share.
+    fn catalog_listings(&self) -> Vec<wire::PublicShareListing> {
+        self.share_catalog
+            .entries()
+            .into_iter()
+            .map(|s| wire::PublicShareListing {
+                share_id: s.share_id,
+                name: s.name,
+                rating: s.rating,
+                sharer_handle: s.sender_handle,
+            })
+            .collect()
     }
 
     /// Drive a single connect to Authenticated, keep the live session, and emit
@@ -1312,11 +1616,17 @@ impl Actor {
         };
 
         // Inbound reader: open + VERIFY each frame under the global room key
-        // (ISC-S25 / ISC-C57). Unverifiable / forged-provenance frames are
-        // dropped silently (ISC-A-S17). Runs until the stream ends.
+        // (ISC-S25 / ISC-C57). A chat message surfaces as a `PublicRoomMessage`;
+        // a share announcement / roll-call (unified share model) is dispatched
+        // back into the command loop via `cmd_tx` so all catalog mutation stays
+        // on `&mut self`. Unverifiable / forged-provenance frames are dropped
+        // silently (ISC-A-S17). Runs until the stream ends.
         let reader_key = Rc::clone(&room_key);
         let reader_tx = self.evt_tx.clone();
-        tokio::task::spawn_local(read_inbound_public_room(inbound, reader_key, reader_tx));
+        let reader_cmd = self.cmd_tx.clone();
+        tokio::task::spawn_local(read_inbound_public_room(
+            inbound, reader_key, reader_tx, reader_cmd,
+        ));
 
         self.public_room = Some(PublicRoom {
             room,
@@ -1326,6 +1636,29 @@ impl Actor {
         });
         self.emit(NetEvent::PublicRoomJoined {
             room: DEFAULT_ROOM.to_owned(),
+        });
+
+        // Discovery bootstrap (unified share model): post an initial roll-call so
+        // already-live sharers re-announce into our fresh catalog, and start the
+        // slow-reconcile timer that re-polls + prunes on `RECONCILE_INTERVAL`.
+        self.post_rollcall().await;
+        self.start_reconcile_timer();
+    }
+
+    /// Start the slow-reconcile loop (unified share model): a detached
+    /// `spawn_local` that, every [`RECONCILE_INTERVAL`], posts a
+    /// [`NetCommand::ReconcileShares`] back into the command loop (which prunes
+    /// the catalog + posts a roll-call). Self-terminating: the send fails once
+    /// the actor loop ends, breaking the loop. Started once per public-room join.
+    fn start_reconcile_timer(&self) {
+        let cmd_tx = self.cmd_tx.clone();
+        tokio::task::spawn_local(async move {
+            loop {
+                tokio::time::sleep(RECONCILE_INTERVAL).await;
+                if cmd_tx.send(NetCommand::ReconcileShares).is_err() {
+                    break;
+                }
+            }
         });
     }
 
@@ -1489,62 +1822,13 @@ impl Actor {
     /// background `Indexer::spawn_background_scan` will publish updated
     /// states to the actor — this method just reports them.
     async fn handle_refresh_shares(&mut self) {
-        // My shares: best-effort read of the persisted index. A redb error is
-        // surfaced via `SharesError` and the local list reverts to empty so
-        // the UI never blocks on a transient storage hiccup (ISC-A-C7).
-        let (local, indexer_status) = match self.share_index.as_ref() {
-            Some(index) => {
-                let entries = index.entries();
-                match entries {
-                    Ok(rows) => {
-                        let count = rows.len() as u64;
-                        let local: Vec<LocalShareRow> = rows
-                            .into_iter()
-                            .map(|e| LocalShareRow {
-                                rel_path: e.rel_path,
-                                size: e.size,
-                                mtime_unix_ms: e.mtime_unix_ms,
-                            })
-                            .collect();
-                        (local, IndexerStatus::Ready { entries: count })
-                    }
-                    Err(e) => {
-                        self.emit(NetEvent::SharesError {
-                            message: format!("share-index read failed: {e}"),
-                        });
-                        (Vec::new(), IndexerStatus::Idle)
-                    }
-                }
-            }
-            None => (Vec::new(), IndexerStatus::Idle),
-        };
-
-        // Public shares: requires a live session. Missing session is not an
-        // error per se — the user has not yet connected — so we emit a
-        // snapshot with empty `remote` rather than an error.
-        let remote = if let Some(session) = self.session.as_ref() {
-            let mut ps = session.public_space();
-            match ps
-                .list_public_shares(wire::ListPublicSharesRequest {})
-                .await
-            {
-                Ok(resp) => resp.into_inner().shares,
-                Err(status) => {
-                    self.emit(NetEvent::SharesError {
-                        message: format!("list-public-shares refused: {}", status.message()),
-                    });
-                    Vec::new()
-                }
-            }
-        } else {
-            Vec::new()
-        };
-
-        self.emit(NetEvent::SharesSnapshot {
-            local,
-            remote,
-            indexer_status,
-        });
+        // The single late-join hook (unified share model): post a roll-call so
+        // every live sharer re-announces, then snapshot. The catalog filled by
+        // those answers (and by ongoing live announces) IS the Public-shares
+        // pane — the relay holds no share directory (ISC-A-S2). Best-effort: a
+        // missing lobby is a no-op and the snapshot still renders what is known.
+        self.post_rollcall().await;
+        self.emit_shares_snapshot();
     }
 
     /// Fetch the connected relay's public space — MOTD, announcement posts, and
@@ -2361,15 +2645,27 @@ async fn read_inbound(
     }
 }
 
-/// Read the public room's inbound frames, open + VERIFY each under the global
-/// room key (ISC-S25 / ISC-C57), and emit a [`NetEvent::PublicRoomMessage`].
-/// A frame whose seal or provenance signature does not verify is dropped
-/// silently (forged-provenance or foreign noise, ISC-A-S17) — it is never
-/// surfaced. Returns when the stream ends.
+/// Read the public room's inbound frames and route each by sealed kind, all
+/// under the global room key (ISC-S25 / ISC-C57). Three kinds share the lobby
+/// stream, each with a distinct AAD so only the matching open succeeds (the
+/// rest fail closed and are skipped):
+///
+///   1. a chat [`open_room_message`] → [`NetEvent::PublicRoomMessage`];
+///   2. a share [`open_announcement`] (unified share model) →
+///      [`NetCommand::ApplyAnnouncement`] folded into the actor's catalog;
+///   3. a [`open_rollcall`] → [`NetCommand::AnswerRollCall`] (re-announce our
+///      own shares).
+///
+/// The two discovery kinds go back through `cmd_tx` so every catalog mutation
+/// stays on the actor's `&mut self`. A frame whose seal or provenance signature
+/// does not verify under any kind is dropped silently (forged-provenance or
+/// foreign noise, ISC-A-S17). Returns when the stream ends or either channel
+/// closes (the actor is gone).
 async fn read_inbound_public_room(
     mut inbound: tonic::Streaming<wire::CotFrame>,
     room_key: Rc<PublicRoomKey>,
     evt_tx: mpsc::UnboundedSender<NetEvent>,
+    cmd_tx: mpsc::UnboundedSender<NetCommand>,
 ) {
     loop {
         match inbound.message().await {
@@ -2398,6 +2694,22 @@ async fn read_inbound_public_room(
                         .is_err()
                     {
                         return; // UI gone
+                    }
+                } else if let Ok(ann) = open_announcement(room_key.as_ref(), &frame.payload) {
+                    // A verified share announcement — fold into the actor's
+                    // catalog on its command loop (unified share model).
+                    if cmd_tx
+                        .send(NetCommand::ApplyAnnouncement(Box::new(ann)))
+                        .is_err()
+                    {
+                        return; // actor gone
+                    }
+                } else if open_rollcall(room_key.as_ref(), &frame.payload).is_ok() {
+                    // A verified roll-call — answer by re-announcing our shares.
+                    // The verified fields beyond "it opened" are unused (we
+                    // re-announce everything regardless of who asked).
+                    if cmd_tx.send(NetCommand::AnswerRollCall).is_err() {
+                        return; // actor gone
                     }
                 }
             }
@@ -2893,8 +3205,15 @@ mod tests {
     }
 
     fn bare_actor(evt_tx: mpsc::UnboundedSender<NetEvent>) -> Actor {
+        // A throwaway self-command sender: the detached discovery tasks are not
+        // exercised by the unit tests below (no lobby is joined), so nothing
+        // ever sends on it — but the field must be present.
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
         Actor {
             evt_tx,
+            cmd_tx,
+            share_catalog: ShareCatalog::new(SHARE_CATALOG_TTL),
+            own_shares: Rc::new(RefCell::new(Vec::new())),
             session: None,
             server_id: None,
             circles: Vec::new(),

@@ -89,8 +89,8 @@ modules:
       EXACTLY that circle's key → publish a CotFrame on that circle's subscribe
       stream; an unknown id is a clean ChatError, never the wrong-circle post —
       ISC-C60 / ISC-A-C30),
-      RefreshShares (read the held ShareIndex.entries() and the relay's
-      ListPublicShares snapshot, emit a SharesSnapshot event; pure read-path),
+      RefreshShares (post a roll-call to the lobby, then emit a SharesSnapshot
+      from ShareIndex.entries() + the in-band ShareCatalog; the one late-join hook),
       DefineShare ({ root, label, index_path, index_key } — M14, ISC-C21 / A-C7:
       open the redb ShareIndex at index_path under the IndexKey off-thread, retain
       it for foreground queries, then cold-scan root on a dedicated blocking thread
@@ -339,7 +339,7 @@ public_types:
     description: "A user request to define (add) a local share root (M14, ISC-C21): root (PathBuf, validated to exist at capture) + label (Option<String>). Produced by the DefineShare input box, drained by the binary via take_pending_share_define; the binary derives the redb index-file path + the share-index key (core IndexKey from the session) and turns it into NetCommand::DefineShare — the App layer holds no key material. On Unlock, one request per persisted core PersistedShare is replayed (re-indexes without re-persisting)."
   - name: daemonseed_tui::app::PublishRequest
     kind: struct
-    description: "A user request to publish + serve a local directory (M15, ISC-S27/S29/F25): root (PathBuf, validated to exist at capture) + name (advertised display name, defaults to the directory name) + sharer_handle (the publisher's own display handle, name#hash, advertised in the listing so peers see who shared it). Produced when the user presses [p] in the Shares pane (no separate Publish input pane — M15 cleanup); drained by the binary via take_pending_publish into NetCommand::PublishShare. The net actor refuses the publish with a loud PublishError when the hashed manifest's encoded frame would exceed share_serve::MANIFEST_FRAME_BUDGET (ISC-A-C37 — the refusal names the file count and manifest MB; never sent, never a silent relay-side stall). The App layer holds no key material; index + publish + serve run on the net actor. Serving is session-scoped (relay reaps on disconnect, ISC-S20); take_pending_unpublish carries a server-assigned share_id into NetCommand::UnpublishShare (owner-scoped, ISC-A-S1)."
+    description: "A user request to publish + serve a local directory (M15, ISC-S27/S29/F25): root (PathBuf, validated to exist at capture) + name (advertised display name, defaults to the directory name) + sharer_handle (the publisher's own display handle, name#hash, advertised in the listing so peers see who shared it). Produced when the user presses [p] in the Shares pane (no separate Publish input pane — M15 cleanup); drained by the binary via take_pending_publish into NetCommand::PublishShare. The net actor refuses the publish with a loud PublishError when the hashed manifest's encoded frame would exceed share_serve::MANIFEST_FRAME_BUDGET (ISC-A-C37 — the refusal names the file count and manifest MB; never sent, never a silent relay-side stall). The App layer holds no key material; index + publish + serve run on the net actor. Serving is session-scoped. The share_id is minted client-side (mint_share_id); publish posts a sealed ShareAnnouncement to the lobby, and take_pending_unpublish carries the share_id into NetCommand::UnpublishShare, which posts a withdraw announcement."
   - name: daemonseed_tui::app::DeprecationWarningRow
     kind: struct
     description: "One affected-suite warning in the Deprecation pane (ISC-C25), a render-only projection of core's DeprecationEntry built by the net actor via daemonseed_core::trust_events::assess_deprecation: suite_id (u16), cutoff_unix_ms (i64), recommended_suite_id (u16), past_cutoff (bool — blocking cutoff-hit vs still-advisory pending)."
