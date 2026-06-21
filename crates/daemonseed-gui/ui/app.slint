@@ -318,6 +318,10 @@ export component AppWindow inherits Window {
     // (caraka note 2026-06-15). Guarded to the Chat tab; Rust invokes it on switch.
     callback focus-composer();
     focus-composer => { if (root.active-tab == 0) { composer.focus(); } }
+    // Any switch INTO the Chat tab (TabLabel click, post-join, or a programmatic
+    // Rust set) refocuses the composer. composer is always-instantiated (visible-
+    // gated, not `if`-gated), so focusing here is timing-safe.
+    changed active-tab => { if (root.active-tab == 0) { root.focus-composer(); } }
     // Focus the Join phrase field when the overlay opens, so typing / Ctrl-V lands
     // without needing a click (the VM software-render path can drop pointer clicks).
     callback focus-join-input();
@@ -574,7 +578,7 @@ export component AppWindow inherits Window {
                                     Text { text: "· right-click an item to download"; color: #4d5560; font-size: 11px; vertical-alignment: center; }
                                     Text { text: root.share-status; color: #5b6472; font-size: 12px; vertical-alignment: center; }
                                     Rectangle { }
-                                    PillButton { label: "Publish"; primary: true; w: 96px; clicked => { root.open-publish(); } }
+                                    PillButton { label: "Manage shares"; primary: true; w: 140px; clicked => { root.open-publish(); } }
                                     PillButton { label: "Refresh"; w: 96px; clicked => { root.refresh-shares(); } }
                                 }
                                 // the tree fills the rest of the pane
@@ -728,6 +732,11 @@ export component AppWindow inherits Window {
                 spacing: 10px;
                 // phrase field
                 Rectangle {
+                    // Fixed width: this box lives in a HorizontalLayout, so without an
+                    // explicit width the inner TextInput's content width propagates up
+                    // and the box grows past `clip`. Overlay is 540px (padding 18·2 →
+                    // 504 inner) minus the 120px QR slot and 10px spacing = 374px.
+                    width: 374px;
                     height: 44px; border-radius: 9px; background: #141517; border-width: 1px; border-color: #ffffff12; clip: true; // contain a long single-line entry inside the box
                     HorizontalLayout { padding-left: 12px;
                         // `visible:` not `if` — toggling on the first/last char typed
