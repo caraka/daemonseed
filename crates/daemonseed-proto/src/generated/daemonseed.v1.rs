@@ -1227,35 +1227,6 @@ pub struct RatingTaxonomy {
     #[prost(string, repeated, tag = "1")]
     pub labels: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
-/// A single public-space share as it appears in the listing. The rating tag is
-/// the SHARER's self-classification drawn from the active taxonomy (ISC-C19);
-/// it is advisory, not server-verified (ISC-A-S5b). The server returns the full
-/// listing; rating filtering is entirely client-side, at render AND fetch time
-/// (ISC-A-C5). M6 defines this surface (F25); the share CONTENT/transfer path
-/// lands at M8.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct PublicShareListing {
-    /// Opaque server-scoped identifier for the share.
-    #[prost(string, tag = "1")]
-    pub share_id: ::prost::alloc::string::String,
-    /// Display name of the shared folder.
-    #[prost(string, tag = "2")]
-    pub name: ::prost::alloc::string::String,
-    /// Sharer-assigned rating label from the active taxonomy. Advisory only.
-    #[prost(string, tag = "3")]
-    pub rating: ::prost::alloc::string::String,
-    /// Sharer's self-asserted full wire handle (`name#hash`, ISC-C4). Used by
-    /// recipient clients to apply the local hidden-shares filter (ISC-C16 /
-    /// ISC-A-C3 / ISC-A-S5b) — never enforced or interpreted by the relay, and
-    /// never compared against authenticated identity (membership/identity are
-    /// not the relay's trust boundary for this listing). Mirrors the same
-    /// self-asserted shape used by `CircleMessage.sender_handle` for
-    /// client-side @mention / mute. May be empty for legacy / operator-published
-    /// listings that predate this field; an empty handle bypasses the hidden-
-    /// shares filter (no handle to match against → render).
-    #[prost(string, tag = "4")]
-    pub sharer_handle: ::prost::alloc::string::String,
-}
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct GetMotdRequest {}
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1312,13 +1283,6 @@ pub struct DeletePostRequest {
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct DeletePostResponse {}
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
-pub struct ListPublicSharesRequest {}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ListPublicSharesResponse {
-    #[prost(message, repeated, tag = "1")]
-    pub shares: ::prost::alloc::vec::Vec<PublicShareListing>,
-}
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct GetDeprecationPolicyRequest {}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GetDeprecationPolicyResponse {
@@ -1328,32 +1292,6 @@ pub struct GetDeprecationPolicyResponse {
     #[prost(message, optional, tag = "1")]
     pub policy: ::core::option::Option<SignedArtifact>,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct PublishShareRequest {
-    /// The share to publish. The server ASSIGNS `share_id` and IGNORES any value
-    /// set in `listing.share_id` (the id is server-scoped, ISC-C19 / F25). The
-    /// `name`, `rating`, and `sharer_handle` fields are the sharer's self-asserted
-    /// classification, relayed verbatim and never policed (ISC-A-S5b).
-    #[prost(message, optional, tag = "1")]
-    pub listing: ::core::option::Option<PublicShareListing>,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct PublishShareResponse {
-    /// The server-assigned opaque share id. The sharer passes it to UnpublishShare
-    /// to stop sharing this folder without dropping the connection.
-    #[prost(string, tag = "1")]
-    pub share_id: ::prost::alloc::string::String,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct UnpublishShareRequest {
-    /// A `share_id` previously returned by PublishShare on THIS connection. An
-    /// unknown or other-owned id is a silent no-op (ISC-A-S1: the relay never
-    /// reveals another connection's share ownership).
-    #[prost(string, tag = "1")]
-    pub share_id: ::prost::alloc::string::String,
-}
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
-pub struct UnpublishShareResponse {}
 /// Generated client implementations.
 pub mod public_space_client {
     #![allow(
@@ -1595,36 +1533,6 @@ pub mod public_space_client {
                 .insert(GrpcMethod::new("daemonseed.v1.PublicSpace", "DeletePost"));
             self.inner.unary(req, path, codec).await
         }
-        /// List public-space shares with their advisory rating tags (ISC-C19 / F25).
-        /// The server returns the complete live listing (the M12 PublishShare set);
-        /// the client filters by rating locally (ISC-A-C5). Share content transfer
-        /// is M8.
-        pub async fn list_public_shares(
-            &mut self,
-            request: impl tonic::IntoRequest<super::ListPublicSharesRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::ListPublicSharesResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic::codec::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/daemonseed.v1.PublicSpace/ListPublicShares",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new("daemonseed.v1.PublicSpace", "ListPublicShares"),
-                );
-            self.inner.unary(req, path, codec).await
-        }
         /// Fetch the operator's signed suite-deprecation policy, or empty if none is
         /// configured (ISC-S16 / ISC-C25, M7). The server returns the same signed
         /// artifact to every fetcher (ISC-A-S11); the client verifies the signature
@@ -1653,68 +1561,6 @@ pub mod public_space_client {
                 .insert(
                     GrpcMethod::new("daemonseed.v1.PublicSpace", "GetDeprecationPolicy"),
                 );
-            self.inner.unary(req, path, codec).await
-        }
-        /// Publish a public-space share (M12, gate step 5 — user-publish file
-        /// sharing). The server assigns an opaque `share_id`, holds the listing
-        /// RAM-ONLY for the lifetime of THIS connection, and includes it in
-        /// `ListPublicShares` until the sharer unpublishes it or disconnects (no
-        /// persistence — ISC-A-S1). The `name`/`rating`/`sharer_handle` fields are the
-        /// sharer's self-asserted classification, relayed verbatim and never policed
-        /// (ISC-A-S5b / ISC-C19); `sharer_handle` is NOT bound to the connection's
-        /// authenticated identity (the relay is a blind forwarder). Subject to the
-        /// per-connection request-rate budget (ISC-29) and a per-connection share cap.
-        pub async fn publish_share(
-            &mut self,
-            request: impl tonic::IntoRequest<super::PublishShareRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::PublishShareResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic::codec::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/daemonseed.v1.PublicSpace/PublishShare",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("daemonseed.v1.PublicSpace", "PublishShare"));
-            self.inner.unary(req, path, codec).await
-        }
-        /// Unpublish a share this connection previously published, by its server-
-        /// assigned `share_id` (M12). Only the publishing connection can unpublish its
-        /// own share; an unknown or other-owned id is a silent no-op (the relay never
-        /// reveals another connection's share ownership). Disconnecting unpublishes
-        /// every share this connection holds, regardless.
-        pub async fn unpublish_share(
-            &mut self,
-            request: impl tonic::IntoRequest<super::UnpublishShareRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::UnpublishShareResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic::codec::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/daemonseed.v1.PublicSpace/UnpublishShare",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("daemonseed.v1.PublicSpace", "UnpublishShare"));
             self.inner.unary(req, path, codec).await
         }
     }
@@ -1783,17 +1629,6 @@ pub mod public_space_server {
             tonic::Response<super::DeletePostResponse>,
             tonic::Status,
         >;
-        /// List public-space shares with their advisory rating tags (ISC-C19 / F25).
-        /// The server returns the complete live listing (the M12 PublishShare set);
-        /// the client filters by rating locally (ISC-A-C5). Share content transfer
-        /// is M8.
-        async fn list_public_shares(
-            &self,
-            request: tonic::Request<super::ListPublicSharesRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::ListPublicSharesResponse>,
-            tonic::Status,
-        >;
         /// Fetch the operator's signed suite-deprecation policy, or empty if none is
         /// configured (ISC-S16 / ISC-C25, M7). The server returns the same signed
         /// artifact to every fetcher (ISC-A-S11); the client verifies the signature
@@ -1803,34 +1638,6 @@ pub mod public_space_server {
             request: tonic::Request<super::GetDeprecationPolicyRequest>,
         ) -> std::result::Result<
             tonic::Response<super::GetDeprecationPolicyResponse>,
-            tonic::Status,
-        >;
-        /// Publish a public-space share (M12, gate step 5 — user-publish file
-        /// sharing). The server assigns an opaque `share_id`, holds the listing
-        /// RAM-ONLY for the lifetime of THIS connection, and includes it in
-        /// `ListPublicShares` until the sharer unpublishes it or disconnects (no
-        /// persistence — ISC-A-S1). The `name`/`rating`/`sharer_handle` fields are the
-        /// sharer's self-asserted classification, relayed verbatim and never policed
-        /// (ISC-A-S5b / ISC-C19); `sharer_handle` is NOT bound to the connection's
-        /// authenticated identity (the relay is a blind forwarder). Subject to the
-        /// per-connection request-rate budget (ISC-29) and a per-connection share cap.
-        async fn publish_share(
-            &self,
-            request: tonic::Request<super::PublishShareRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::PublishShareResponse>,
-            tonic::Status,
-        >;
-        /// Unpublish a share this connection previously published, by its server-
-        /// assigned `share_id` (M12). Only the publishing connection can unpublish its
-        /// own share; an unknown or other-owned id is a silent no-op (the relay never
-        /// reveals another connection's share ownership). Disconnecting unpublishes
-        /// every share this connection holds, regardless.
-        async fn unpublish_share(
-            &self,
-            request: tonic::Request<super::UnpublishShareRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::UnpublishShareResponse>,
             tonic::Status,
         >;
     }
@@ -2184,52 +1991,6 @@ pub mod public_space_server {
                     };
                     Box::pin(fut)
                 }
-                "/daemonseed.v1.PublicSpace/ListPublicShares" => {
-                    #[allow(non_camel_case_types)]
-                    struct ListPublicSharesSvc<T: PublicSpace>(pub Arc<T>);
-                    impl<
-                        T: PublicSpace,
-                    > tonic::server::UnaryService<super::ListPublicSharesRequest>
-                    for ListPublicSharesSvc<T> {
-                        type Response = super::ListPublicSharesResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::ListPublicSharesRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as PublicSpace>::list_public_shares(&inner, request)
-                                    .await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = ListPublicSharesSvc(inner);
-                        let codec = tonic::codec::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
                 "/daemonseed.v1.PublicSpace/GetDeprecationPolicy" => {
                     #[allow(non_camel_case_types)]
                     struct GetDeprecationPolicySvc<T: PublicSpace>(pub Arc<T>);
@@ -2261,96 +2022,6 @@ pub mod public_space_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = GetDeprecationPolicySvc(inner);
-                        let codec = tonic::codec::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/daemonseed.v1.PublicSpace/PublishShare" => {
-                    #[allow(non_camel_case_types)]
-                    struct PublishShareSvc<T: PublicSpace>(pub Arc<T>);
-                    impl<
-                        T: PublicSpace,
-                    > tonic::server::UnaryService<super::PublishShareRequest>
-                    for PublishShareSvc<T> {
-                        type Response = super::PublishShareResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::PublishShareRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as PublicSpace>::publish_share(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = PublishShareSvc(inner);
-                        let codec = tonic::codec::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/daemonseed.v1.PublicSpace/UnpublishShare" => {
-                    #[allow(non_camel_case_types)]
-                    struct UnpublishShareSvc<T: PublicSpace>(pub Arc<T>);
-                    impl<
-                        T: PublicSpace,
-                    > tonic::server::UnaryService<super::UnpublishShareRequest>
-                    for UnpublishShareSvc<T> {
-                        type Response = super::UnpublishShareResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::UnpublishShareRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as PublicSpace>::unpublish_share(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = UnpublishShareSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

@@ -30,6 +30,7 @@ use daemonseed_core::handle::{Handle, HandleParseError};
 use daemonseed_core::public_space::{
     ArtifactError, Whitelist, WhitelistEntry, WhitelistParseError, verify_artifact,
 };
+use daemonseed_core::share_catalog::ShareListing;
 use daemonseed_proto::v1 as wire;
 use prost::Message;
 
@@ -84,16 +85,16 @@ pub fn select_rating(taxonomy: &[String], choice: &str) -> Result<String, Rating
 /// (which results to keep). Share content/transfer is M8 — in M6 this operates
 /// on the (currently empty) listing surface.
 pub fn filter_shares_by_rating<'a>(
-    shares: &'a [wire::PublicShareListing],
+    shares: &'a [ShareListing],
     rating: Option<&str>,
-) -> Vec<&'a wire::PublicShareListing> {
+) -> Vec<&'a ShareListing> {
     shares
         .iter()
         .filter(|s| rating.is_none_or(|r| s.rating == r))
         .collect()
 }
 
-/// Drop any [`wire::PublicShareListing`] whose sharer wire handle is in
+/// Drop any [`ShareListing`] whose sharer wire handle is in
 /// `hidden` (ISC-C16 / ISC-A-C3).
 ///
 /// Pairs with [`filter_shares_by_rating`]: the rating filter is operator-
@@ -110,9 +111,9 @@ pub fn filter_shares_by_rating<'a>(
 ///
 /// [`Seeds::hidden_shares`]: daemonseed_core::storage::seeds::Seeds::hidden_shares
 pub fn filter_shares_excluding_hidden<'a>(
-    shares: &'a [wire::PublicShareListing],
+    shares: &'a [ShareListing],
     hidden: &std::collections::BTreeSet<String>,
-) -> Vec<&'a wire::PublicShareListing> {
+) -> Vec<&'a ShareListing> {
     shares
         .iter()
         .filter(|s| s.sharer_handle.is_empty() || !hidden.contains(&s.sharer_handle))
@@ -244,12 +245,12 @@ mod tests {
         }
     }
 
-    fn share(id: &str, rating: &str) -> wire::PublicShareListing {
+    fn share(id: &str, rating: &str) -> ShareListing {
         share_with_handle(id, rating, "")
     }
 
-    fn share_with_handle(id: &str, rating: &str, sharer_handle: &str) -> wire::PublicShareListing {
-        wire::PublicShareListing {
+    fn share_with_handle(id: &str, rating: &str, sharer_handle: &str) -> ShareListing {
+        ShareListing {
             share_id: id.to_owned(),
             name: format!("share-{id}"),
             rating: rating.to_owned(),
@@ -375,8 +376,7 @@ mod tests {
         assert_eq!(after_hide.len(), 1);
         // Re-collect references through the rating predicate on the same
         // borrowed slice — establishes the order-independence.
-        let after_hide_owned: Vec<wire::PublicShareListing> =
-            after_hide.into_iter().cloned().collect();
+        let after_hide_owned: Vec<ShareListing> = after_hide.into_iter().cloned().collect();
         let after_both = filter_shares_by_rating(&after_hide_owned, Some("PG13"));
         assert_eq!(after_both.len(), 1);
         assert_eq!(after_both[0].share_id, "c");

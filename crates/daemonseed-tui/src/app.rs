@@ -9,11 +9,11 @@ use daemonseed_core::first_start::SessionMaterials;
 use daemonseed_core::handle::{DisplayMode, Handle};
 use daemonseed_core::passphrase::strength::{self, CircleStrength};
 use daemonseed_core::profile::config::ArgonParams;
+use daemonseed_core::share_catalog::ShareListing;
 use daemonseed_core::storage::seeds::{SealingKey, Seeds};
 use daemonseed_core::trust_events::{
     DismissalScope, TrustEvent, TrustEventClass, TrustEventKey, TrustEventLog, class_of,
 };
-use daemonseed_proto::v1 as wire;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 
 use crate::net::{NetEvent, ShareManifestEntry};
@@ -117,7 +117,7 @@ pub enum MainFocus {
     Mute,
     /// The Shares view (ISC-17 / ISC-20): two panes — local files indexed by
     /// the user's own [`daemonseed_core::indexer::Indexer`] (My shares), and
-    /// the remote [`wire::PublicShareListing`] snapshot fetched from the
+    /// the remote [`ShareListing`] snapshot fetched from the
     /// connected relay (Public shares). Up/Down navigates the public-shares
     /// rows, `r` requests a fresh snapshot, `f` (later) initiates a fetch
     /// (ISC-19). The indexer status line at the top of My-shares stays
@@ -828,7 +828,7 @@ pub struct App {
     /// Latest Public-shares snapshot from the net actor (ISC-17 / ISC-18).
     /// Pre-filter; the hide set is applied at render time (ISC-A-C3 keeps the
     /// hide set off the wire — there is nothing for the relay to know).
-    public_shares: Vec<wire::PublicShareListing>,
+    public_shares: Vec<ShareListing>,
     /// Current indexer status, surfaced non-blocking at the top of the
     /// My-shares pane (ISC-20 / ISC-A-C7).
     indexer_status: IndexerStatus,
@@ -1867,7 +1867,7 @@ impl App {
     /// `App` does not depend on cli's public surface from its own renderer.
     /// Listings with an empty `sharer_handle` (legacy / operator-pinned) are
     /// always kept (no handle to filter against).
-    pub fn visible_public_shares(&self) -> Vec<&wire::PublicShareListing> {
+    pub fn visible_public_shares(&self) -> Vec<&ShareListing> {
         self.public_shares
             .iter()
             .filter(|s| {
@@ -1888,7 +1888,7 @@ impl App {
 
     /// Raw public-share snapshot, pre-filter, for tests that need to assert on
     /// what arrived from the relay vs what renders.
-    pub fn public_shares_raw(&self) -> &[wire::PublicShareListing] {
+    pub fn public_shares_raw(&self) -> &[ShareListing] {
         &self.public_shares
     }
 
@@ -5976,8 +5976,8 @@ mod tests {
 
     // ── Shares pane (ISC-17 / ISC-18 / ISC-20) ─────────────────────────────
 
-    fn listing(share_id: &str, name: &str, rating: &str, sharer: &str) -> wire::PublicShareListing {
-        wire::PublicShareListing {
+    fn listing(share_id: &str, name: &str, rating: &str, sharer: &str) -> ShareListing {
+        ShareListing {
             share_id: share_id.to_owned(),
             name: name.to_owned(),
             rating: rating.to_owned(),

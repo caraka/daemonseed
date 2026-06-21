@@ -66,7 +66,7 @@ use daemonseed_core::public_room::{
 use daemonseed_core::share_announce::{
     AnnouncementFields, mint_share_id, open_announcement, seal_public_announcement,
 };
-use daemonseed_core::share_catalog::{CatalogChange, ShareCatalog};
+use daemonseed_core::share_catalog::{CatalogChange, ShareCatalog, ShareListing};
 use daemonseed_core::share_envelope::{ManifestEntry, ShareFrame};
 use daemonseed_core::share_rollcall::{RollCallFields, open_rollcall, seal_public_rollcall};
 use daemonseed_core::share_seal::{open_share_frame, seal_public_share_frame};
@@ -285,9 +285,7 @@ pub enum NetEvent {
     PublishError { message: String },
     /// The in-band discovery catalog rendered as public-share rows (response to
     /// `RefreshShares` and emitted on every catalog change).
-    SharesSnapshot {
-        shares: Vec<wire::PublicShareListing>,
-    },
+    SharesSnapshot { shares: Vec<ShareListing> },
     /// A share-listing read could not complete; the previous snapshot is unchanged.
     /// Retained as a render target (`main.rs`, matching the TUI) for a future
     /// in-band error producer; the discovery refresh is best-effort and has no
@@ -476,7 +474,7 @@ struct Actor {
     /// In-band discovery catalog for the lobby (unified share model): verified
     /// [`wire::ShareAnnouncement`]s fold in here, replacing the relay's
     /// `ListPublicShares` registry. Rendered into the Shares pane as
-    /// [`wire::PublicShareListing`] rows so the UI is unchanged.
+    /// [`ShareListing`] rows so the UI is unchanged.
     share_catalog: ShareCatalog,
     /// Shares this daemon is publishing this session, so a roll-call can
     /// re-announce them and an unpublish can post a matching withdraw. Behind
@@ -1248,18 +1246,18 @@ impl Actor {
     }
 
     /// Render the in-band [`ShareCatalog`] as the public-share rows
-    /// ([`wire::PublicShareListing`]) so the UI surface is unchanged from the
+    /// ([`ShareListing`]) so the UI surface is unchanged from the
     /// retired `ListPublicShares` path.
-    fn catalog_listings(&self) -> Vec<wire::PublicShareListing> {
+    fn catalog_listings(&self) -> Vec<ShareListing> {
         // Own shares are never reflected back by the relay, so they never enter the
         // received-announcement catalog — merge them in first (deduped by share_id)
         // so a publisher sees their own shares in their own Shares list, not only on
         // other clients.
         let mut seen = std::collections::HashSet::new();
-        let mut out: Vec<wire::PublicShareListing> = Vec::new();
+        let mut out: Vec<ShareListing> = Vec::new();
         for own in self.own_shares.borrow().iter() {
             if seen.insert(own.share_id.clone()) {
-                out.push(wire::PublicShareListing {
+                out.push(ShareListing {
                     share_id: own.share_id.clone(),
                     name: own.name.clone(),
                     rating: own.rating.clone(),
@@ -1269,12 +1267,7 @@ impl Actor {
         }
         for s in self.share_catalog.entries() {
             if seen.insert(s.share_id.clone()) {
-                out.push(wire::PublicShareListing {
-                    share_id: s.share_id,
-                    name: s.name,
-                    rating: s.rating,
-                    sharer_handle: s.sender_handle,
-                });
+                out.push(ShareListing::from(&s));
             }
         }
         out

@@ -69,6 +69,29 @@ pub struct DiscoveredShare {
     pub received_at: Instant,
 }
 
+/// A public-share row as surfaced to clients — the in-band replacement for the
+/// retired `wire::PublicShareListing` (#51). Plain client-side struct: the relay
+/// no longer defines or carries this shape. Fields are the sharer's self-asserted
+/// classification (advisory; never relay-policed).
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct ShareListing {
+    pub share_id: String,
+    pub name: String,
+    pub rating: String,
+    pub sharer_handle: String,
+}
+
+impl From<&DiscoveredShare> for ShareListing {
+    fn from(d: &DiscoveredShare) -> Self {
+        Self {
+            share_id: d.share_id.clone(),
+            name: d.name.clone(),
+            rating: d.rating.clone(),
+            sharer_handle: d.sender_handle.clone(),
+        }
+    }
+}
+
 /// What [`ShareCatalog::apply`] did with an announcement — lets a caller decide
 /// whether the share browser needs a redraw without diffing the whole catalog.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

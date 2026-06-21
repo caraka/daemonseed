@@ -58,7 +58,7 @@ use daemonseed_core::public_room::{
 use daemonseed_core::share_announce::{
     AnnouncementFields, mint_share_id, open_announcement, seal_public_announcement,
 };
-use daemonseed_core::share_catalog::{CatalogChange, ShareCatalog};
+use daemonseed_core::share_catalog::{CatalogChange, ShareCatalog, ShareListing};
 use daemonseed_core::share_envelope::{ManifestEntry, ShareFrame};
 use daemonseed_core::share_rollcall::{RollCallFields, open_rollcall, seal_public_rollcall};
 use daemonseed_core::share_seal::{open_share_frame, seal_public_share_frame};
@@ -308,7 +308,7 @@ struct OpenedShare {
 /// [`crate::app::App`] by `on_net_event` with no runtime dependency.
 ///
 /// `Eq` is intentionally NOT derived: `SharesSnapshot` carries a
-/// `Vec<wire::PublicShareListing>` and the prost-generated message type only
+/// `Vec<ShareListing>` and the prost-generated message type only
 /// implements `PartialEq`. Tests use `assert_eq!` (which only needs PartialEq);
 /// equality on raw wire types is well-defined for the strings/integers they
 /// carry but not for arbitrary embedded prost values, so `PartialEq` is the
@@ -399,7 +399,7 @@ pub enum NetEvent {
     /// "no share root configured" and "no public listings" are normal states.
     SharesSnapshot {
         local: Vec<LocalShareRow>,
-        remote: Vec<wire::PublicShareListing>,
+        remote: Vec<ShareListing>,
         indexer_status: IndexerStatus,
     },
     /// A `RefreshShares` command could not complete (e.g., no live session,
@@ -689,7 +689,7 @@ struct Actor {
     /// In-band discovery catalog for the lobby (unified share model): verified
     /// [`wire::ShareAnnouncement`]s fold in here, replacing the relay's
     /// `ListPublicShares` registry. Rendered into the Shares pane as
-    /// [`wire::PublicShareListing`] rows so the UI is unchanged.
+    /// [`ShareListing`] rows so the UI is unchanged.
     share_catalog: ShareCatalog,
     /// Shares this daemon is publishing this session, so a roll-call can
     /// re-announce them and an unpublish can post a matching withdraw. Behind
@@ -1320,19 +1320,14 @@ impl Actor {
     }
 
     /// Render the in-band [`ShareCatalog`] as the Public-shares rows
-    /// ([`wire::PublicShareListing`]) so the UI surface is unchanged from the
+    /// ([`ShareListing`]) so the UI surface is unchanged from the
     /// retired `ListPublicShares` path. The recipient applies its private hide
     /// set at render (ISC-A-C3); the catalog carries every discovered share.
-    fn catalog_listings(&self) -> Vec<wire::PublicShareListing> {
+    fn catalog_listings(&self) -> Vec<ShareListing> {
         self.share_catalog
             .entries()
-            .into_iter()
-            .map(|s| wire::PublicShareListing {
-                share_id: s.share_id,
-                name: s.name,
-                rating: s.rating,
-                sharer_handle: s.sender_handle,
-            })
+            .iter()
+            .map(ShareListing::from)
             .collect()
     }
 

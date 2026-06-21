@@ -13,6 +13,7 @@
 
 use daemonseed_cli::public_space::{filter_shares_by_rating, render_motd, select_rating};
 use daemonseed_core::identity::keys::SignKeypair;
+use daemonseed_core::share_catalog::ShareListing;
 use daemonseed_integration_tests::isc_coverage::Coverage;
 use daemonseed_proto::v1 as wire;
 use daemonseed_server::public_space::{PublicSpaceConfig, PublicSpaceState};
@@ -141,11 +142,6 @@ fn public_space_serves_the_full_public_surface() {
         1,
         "S8: whitelist published"
     );
-    // S4 public arm: the public-share listing surface exists (content is M8).
-    assert!(
-        fx.state.public_shares().is_empty(),
-        "S4/F25: listing surface present"
-    );
 }
 
 /// A-S3 (negative): a forged/unsigned post file cannot be served — the
@@ -259,12 +255,10 @@ fn server_publishes_taxonomy_but_never_filters() {
     let taxonomy = vec!["PG13".to_owned(), "X".to_owned()];
     let fx = fixture(&signer, &[], &taxonomy);
 
-    // Taxonomy is published verbatim...
+    // Taxonomy is published verbatim; post-unified-share-model the relay has no
+    // share-listing surface at all, so there is no server-side rating filter to
+    // invoke — moderation by rating is structurally impossible (A-S5b).
     assert_eq!(fx.state.taxonomy().labels, taxonomy);
-    // ...and the listing is returned whole — there is no server-side rating
-    // filter to invoke (the API takes no rating argument). The server cannot
-    // moderate by rating.
-    let _all: Vec<wire::PublicShareListing> = fx.state.public_shares();
 }
 
 /// A-S8 (negative): the server's only runtime write surface is the posts dir;
@@ -324,13 +318,13 @@ fn client_selects_rating_from_active_taxonomy() {
 #[test]
 fn client_filter_excludes_filtered_tier() {
     let shares = vec![
-        wire::PublicShareListing {
+        ShareListing {
             share_id: "a".to_owned(),
             name: "a".to_owned(),
             rating: "PG13".to_owned(),
             sharer_handle: String::new(),
         },
-        wire::PublicShareListing {
+        ShareListing {
             share_id: "b".to_owned(),
             name: "b".to_owned(),
             rating: "X".to_owned(),

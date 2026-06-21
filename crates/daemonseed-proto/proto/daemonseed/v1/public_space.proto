@@ -183,36 +183,6 @@ message RatingTaxonomy {
   repeated string labels = 1;
 }
 
-// ── Public share listing (ISC-C19 / finding F25) ─────────────────────────
-
-// A single public-space share as it appears in the listing. The rating tag is
-// the SHARER's self-classification drawn from the active taxonomy (ISC-C19);
-// it is advisory, not server-verified (ISC-A-S5b). The server returns the full
-// listing; rating filtering is entirely client-side, at render AND fetch time
-// (ISC-A-C5). M6 defines this surface (F25); the share CONTENT/transfer path
-// lands at M8.
-message PublicShareListing {
-  // Opaque server-scoped identifier for the share.
-  string share_id = 1;
-
-  // Display name of the shared folder.
-  string name = 2;
-
-  // Sharer-assigned rating label from the active taxonomy. Advisory only.
-  string rating = 3;
-
-  // Sharer's self-asserted full wire handle (`name#hash`, ISC-C4). Used by
-  // recipient clients to apply the local hidden-shares filter (ISC-C16 /
-  // ISC-A-C3 / ISC-A-S5b) — never enforced or interpreted by the relay, and
-  // never compared against authenticated identity (membership/identity are
-  // not the relay's trust boundary for this listing). Mirrors the same
-  // self-asserted shape used by `CircleMessage.sender_handle` for
-  // client-side @mention / mute. May be empty for legacy / operator-published
-  // listings that predate this field; an empty handle bypasses the hidden-
-  // shares filter (no handle to match against → render).
-  string sharer_handle = 4;
-}
-
 // ── Service ──────────────────────────────────────────────────────────────
 
 // The public-space application service, served over the post-Authenticated
@@ -243,35 +213,23 @@ service PublicSpace {
   // (ISC-S7). Verified against the current whitelist.
   rpc DeletePost(DeletePostRequest) returns (DeletePostResponse);
 
-  // List public-space shares with their advisory rating tags (ISC-C19 / F25).
-  // The server returns the complete live listing (the M12 PublishShare set);
-  // the client filters by rating locally (ISC-A-C5). Share content transfer
-  // is M8.
-  rpc ListPublicShares(ListPublicSharesRequest) returns (ListPublicSharesResponse);
-
   // Fetch the operator's signed suite-deprecation policy, or empty if none is
   // configured (ISC-S16 / ISC-C25, M7). The server returns the same signed
   // artifact to every fetcher (ISC-A-S11); the client verifies the signature
   // against the server-wide key and replay-protects on `policy_version`.
   rpc GetDeprecationPolicy(GetDeprecationPolicyRequest) returns (GetDeprecationPolicyResponse);
 
-  // Publish a public-space share (M12, gate step 5 — user-publish file
-  // sharing). The server assigns an opaque `share_id`, holds the listing
-  // RAM-ONLY for the lifetime of THIS connection, and includes it in
-  // `ListPublicShares` until the sharer unpublishes it or disconnects (no
-  // persistence — ISC-A-S1). The `name`/`rating`/`sharer_handle` fields are the
-  // sharer's self-asserted classification, relayed verbatim and never policed
-  // (ISC-A-S5b / ISC-C19); `sharer_handle` is NOT bound to the connection's
-  // authenticated identity (the relay is a blind forwarder). Subject to the
-  // per-connection request-rate budget (ISC-29) and a per-connection share cap.
-  rpc PublishShare(PublishShareRequest) returns (PublishShareResponse);
-
-  // Unpublish a share this connection previously published, by its server-
-  // assigned `share_id` (M12). Only the publishing connection can unpublish its
-  // own share; an unknown or other-owned id is a silent no-op (the relay never
-  // reveals another connection's share ownership). Disconnecting unpublishes
-  // every share this connection holds, regardless.
-  rpc UnpublishShare(UnpublishShareRequest) returns (UnpublishShareResponse);
+  // NOTE (ISC-S14 exception, pre-first-consumer): the public-share registry
+  // RPCs ListPublicShares / PublishShare / UnpublishShare and the
+  // PublicShareListing message were RETIRED in the unified-share-model
+  // migration (v0.29.0). Share discovery is now fully in-band — sealed
+  // ShareAnnouncement / ShareRollCall on the CoT subscribe stream — and the
+  // relay is a pure blind forwarder with no share directory (ISC-A-S1 / A-S2).
+  // This removal predates any external consumer of the schema, so the
+  // additive-only discipline (ISC-S14) is not broken for any live peer. The
+  // rule's real trigger is the first shipped build: from v0.29.0 — the first
+  // build handed to human testers — additive-only holds absolutely and no
+  // field/RPC may be removed or repurposed thereafter.
 }
 
 message GetMotdRequest {}
@@ -321,12 +279,6 @@ message DeletePostRequest {
 
 message DeletePostResponse {}
 
-message ListPublicSharesRequest {}
-
-message ListPublicSharesResponse {
-  repeated PublicShareListing shares = 1;
-}
-
 message GetDeprecationPolicyRequest {}
 
 message GetDeprecationPolicyResponse {
@@ -335,26 +287,3 @@ message GetDeprecationPolicyResponse {
   // the operator has configured no deprecation policy.
   SignedArtifact policy = 1;
 }
-
-message PublishShareRequest {
-  // The share to publish. The server ASSIGNS `share_id` and IGNORES any value
-  // set in `listing.share_id` (the id is server-scoped, ISC-C19 / F25). The
-  // `name`, `rating`, and `sharer_handle` fields are the sharer's self-asserted
-  // classification, relayed verbatim and never policed (ISC-A-S5b).
-  PublicShareListing listing = 1;
-}
-
-message PublishShareResponse {
-  // The server-assigned opaque share id. The sharer passes it to UnpublishShare
-  // to stop sharing this folder without dropping the connection.
-  string share_id = 1;
-}
-
-message UnpublishShareRequest {
-  // A `share_id` previously returned by PublishShare on THIS connection. An
-  // unknown or other-owned id is a silent no-op (ISC-A-S1: the relay never
-  // reveals another connection's share ownership).
-  string share_id = 1;
-}
-
-message UnpublishShareResponse {}

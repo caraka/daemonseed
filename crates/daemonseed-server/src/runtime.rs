@@ -53,7 +53,6 @@ use crate::identity_proof::{
 };
 use crate::public_space::{PublicSpaceService, PublicSpaceState, serve_application};
 use crate::rate_limit::{PerKeyRateTable, RateLimitConfig};
-use crate::share::{SharePublishRegistry, ShareReapGuard};
 
 /// Hand the per-connection HELLO outcome up via this callback. Used by
 /// the integration-test harness in commit 6 to observe a real
@@ -85,11 +84,6 @@ struct ServerContext {
     /// answered by the M12 introducer endpoint (gate step 6). Cloning shares
     /// the inner `Arc`; the table is process-lifetime config, never mutated.
     peers: Arc<Vec<PeerConfig>>,
-    /// RAM-only published-share table (M12, gate step 5). ONE instance shared
-    /// across every connection so one daemon's published share is visible to
-    /// others' `ListPublicShares`; per-connection shares are reaped on
-    /// disconnect (ISC-A-S1). Cloning shares the inner `Arc`.
-    shares: SharePublishRegistry,
 }
 
 /// Bind to `addr`, accept connections, terminate TLS via `tls_config`,
@@ -146,11 +140,6 @@ where
     // — a server introduces no peers until the operator configures them.
     let peers = Arc::new(peers);
 
-    // The relay's RAM-only published-share table (M12, gate step 5). ONE
-    // instance shared across every connection; per-connection shares reaped on
-    // disconnect. RAM-only — nothing survives the process (ISC-A-S1).
-    let shares = SharePublishRegistry::new();
-
     // Bundle the shared, process-lifetime state once; clone it per connection.
     let ctx = ServerContext {
         identity,
@@ -160,7 +149,6 @@ where
         cot,
         key_table,
         peers,
-        shares,
     };
 
     tokio::pin!(shutdown);
@@ -221,7 +209,6 @@ async fn serve_connection(
         cot,
         key_table,
         peers,
-        shares,
     } = ctx;
 
     let mut tls_stream: TlsStream<TcpStream> = match acceptor.accept(stream).await {
@@ -312,18 +299,12 @@ async fn serve_connection(
             // ends when the peer closes the connection (which also reaps any
             // CoT asset references this connection held, ISC-10).
             let authenticated = versioned.into_authenticated(verified);
-            // M12 gate step 5: issue this connection's share-publisher token,
-            // bind the server-wide registry to its public-space service, and
-            // hold a reap guard for the connection's lifetime — so every share
-            // it publishes is reaped the moment it disconnects (ISC-A-S1), on
-            // any exit path including a panic in the serving future.
-            let owner = shares.new_owner();
-            let mut service = PublicSpaceService::new(public_space);
-            service.set_share_context(shares.clone(), owner);
-            let _share_reap = ShareReapGuard::new(shares, owner);
+            // Share publication is in-band (unified share model): the relay
+            // holds no share state, so there is no per-connection registry or
+            // reap guard here. Sharers announce/withdraw over the room/circle
+            // streams the relay blindly forwards; the relay is a pure forwarder.
+            let service = PublicSpaceService::new(public_space);
             let _ = serve_application(authenticated.into_inner(), service, cot, peers).await;
-            // `_share_reap` drops here (and on unwind), reaping this connection's
-            // published shares.
             // `_slot` drops here (and on unwind), releasing the per-key slot.
         }
         Err(_e) => {
