@@ -782,6 +782,28 @@ modules:
       - S21
       - C57
 
+  - name: daemonseed_core::share_seal
+    description: >-
+      Share CONTENT sealing — AES-256-GCM-seals each share_envelope ShareFrame
+      (manifest/chunk) before it enters CotFrame.payload, so public-share traffic
+      is structurally indistinguishable from chat/circle traffic (the alpha
+      shipped it in the clear). seal_public_share_frame / seal_circle_share_frame
+      are tier-split (the PublicRoomKey / CircleKey type is the guard — the wrong
+      tier is a compile error); open_share_frame is generic over AeadKey256. No
+      provenance signature: per-chunk SHA-384 integrity already lives inside the
+      frame, and authorship is established by the share announcement. AAD =
+      SHARE_FRAME_AAD, distinct from the chat / room / announce AADs.
+    no_std: false
+    depends_on:
+      - daemonseed_core::circle::key
+      - daemonseed_core::circle::message
+      - daemonseed_core::public_room
+      - daemonseed_core::share_envelope
+    iscs:
+      - A-S2
+      - A-S16
+      - C19
+
   - name: "circle::default_circle_label"
     module: daemonseed_core::circle
     description: >-

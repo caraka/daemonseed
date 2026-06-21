@@ -35,6 +35,13 @@ work lives in the project lead's vault manifest, not here.
   `public_room`. Sealed under the public room key (public tier, server-readable)
   or a circle `cot_key` (members-only); relay-agnostic (carries `share_id`, not
   `server_id`). Design-of-record: `docs/design/unified-share-model.md`.
+- Share content sealing (`daemonseed-core::share_seal`):
+  `seal_public_share_frame` / `seal_circle_share_frame` (tier-guarded) and a
+  tier-agnostic `open_share_frame` seal each `ShareFrame` (manifest/chunk) under
+  the room/circle key with a distinct AAD, so share traffic is structurally
+  indistinguishable from chat on the wire (the alpha shipped public-share content
+  in the clear). No provenance signature — per-chunk SHA-384 integrity already
+  lives inside the frame.
 - Desktop GUI window/taskbar icon: the `AppWindow` now carries an `icon`,
   rasterized from the AppImage's scalable placeholder so the windowed app and
   the AppImage share one mark (aesthetic refinement deferred).

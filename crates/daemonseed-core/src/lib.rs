@@ -28,8 +28,11 @@
 //! and the tests drive byte-identical serve logic (ISC-S27 / ISC-S28 / ISC-S29).
 //! The unified share model adds [`share_announce`] — seal/open for the in-band
 //! share-announcement payload that replaces relay-hosted share discovery, the
-//! share-tier analogue of [`public_room`] (design-of-record:
-//! `docs/design/unified-share-model.md`).
+//! share-tier analogue of [`public_room`] — and [`share_seal`], which seals the
+//! [`share_envelope::ShareFrame`] content itself so share traffic is
+//! indistinguishable from chat on the wire. Both seal under tier-typed keys
+//! ([`circle::key::CircleKey`] / [`public_room::PublicRoomKey`], the key-class
+//! guard). Design-of-record: `docs/design/unified-share-model.md`.
 //!
 //! [`ShareContent`]: share_serve::ShareContent
 
@@ -59,6 +62,7 @@ pub mod public_space;
 pub mod release;
 pub mod share_announce;
 pub mod share_envelope;
+pub mod share_seal;
 pub mod share_serve;
 pub mod storage;
 pub mod trust_events;
