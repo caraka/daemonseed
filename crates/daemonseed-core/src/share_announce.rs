@@ -68,6 +68,18 @@ pub const SHARE_ANNOUNCE_AAD: &[u8] = b"daemonseed/share/announce/v1";
 /// ML-DSA-87 signature daemonseed produces.
 pub const SHARE_ANNOUNCE_PROVENANCE_DOMAIN: &[u8] = b"daemonseed/share/announce/v1";
 
+/// Mint an opaque, unpredictable `share_id`: 128 bits from the OS CSPRNG,
+/// lowercase-hex encoded (32 chars), so ids are not order-derived and the
+/// published-share space is not enumerable (ISC-S21 / ISC-A-S15). The publisher
+/// mints it client-side and the announcement hands it out in-band. An OS-entropy
+/// failure is unrecoverable (the same posture as every key/nonce draw in the
+/// process), so this panics rather than degrade to a predictable id.
+pub fn mint_share_id() -> String {
+    let mut buf = [0u8; 16];
+    getrandom::fill(&mut buf).expect("OS CSPRNG entropy for share_id");
+    buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// The plaintext fields of an announcement the caller supplies; the announcer
 /// pubkey and the signature are filled in by [`seal_public_announcement`] /
 /// [`seal_circle_announcement`]. Borrowed so sealing never forces a clone.
@@ -350,6 +362,20 @@ mod tests {
     fn room_key(room: &str) -> PublicRoomKey {
         let _ = oxicrypt_module::initialize();
         derive_room_key(room, &CNSA_2_0).unwrap()
+    }
+
+    /// A minted share_id is 32 lowercase-hex chars (128 bits) and two mints
+    /// differ — opaque and not enumerable (ISC-S21 / ISC-A-S15).
+    #[test]
+    fn mint_share_id_is_32_lowercase_hex_and_unpredictable() {
+        let a = mint_share_id();
+        let b = mint_share_id();
+        assert_eq!(a.len(), 32);
+        assert!(
+            a.bytes()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+        assert_ne!(a, b);
     }
 
     /// Round-trip under the PUBLIC room key: seal, open, and the embedded

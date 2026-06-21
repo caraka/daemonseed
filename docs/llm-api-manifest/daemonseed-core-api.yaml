@@ -758,18 +758,15 @@ modules:
 
   - name: daemonseed_core::share_announce
     description: >-
-      Share-announcement sealing — the in-band replacement for the relay-hosted
-      share registry (design: docs/design/unified-share-model.md), the share-tier
-      analogue of public_room. seal_public_announcement / seal_circle_announcement
-      self-sign a ShareAnnouncement (ML-DSA provenance, C57) then AES-256-GCM seal
-      it under the public room key (public tier) or a circle cot_key (members-only)
-      respectively — the typed key is the tier guard (a circle payload cannot be
-      sealed under a public key, a compile error); AAD =
-      SHARE_ANNOUNCE_AAD, envelope nonce(12)||ciphertext||tag(16).
-      open_announcement fails closed (Authentication) on a wrong key or any tamper
-      and (Provenance) on a bad signature. Relay-agnostic — the announcement
-      carries share_id (S21), never server_id — so discovery is "listen to the
-      stream" and the relay holds no directory (A-S2, A-S1).
+      Share-announcement sealing. mint_share_id draws a 128-bit client-side
+      share_id (S21/A-S15). seal_public_announcement / seal_circle_announcement
+      self-sign a ShareAnnouncement (ML-DSA, C57) then AES-256-GCM-seal it under
+      the public room key or a circle cot_key respectively (the typed key is the
+      tier guard — wrong tier is a compile error); AAD = SHARE_ANNOUNCE_AAD,
+      envelope nonce(12)||ciphertext||tag(16). open_announcement is generic over
+      AeadKey256 and fails closed (Authentication on a wrong key or tamper,
+      Provenance on a bad signature). The announcement carries share_id (S21),
+      never server_id.
     no_std: false
     depends_on:
       - daemonseed_core::circle::key

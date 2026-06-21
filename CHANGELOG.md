@@ -35,6 +35,8 @@ work lives in the project lead's vault manifest, not here.
 - `ShareRollCall` wire message + `daemonseed-core::share_rollcall` seal/open. (#52)
 - `daemonseed-core::share_catalog` — client-side share discovery catalog
   (`ShareCatalog` apply / prune / remove). (#52)
+- `daemonseed-core::share_announce::mint_share_id` — client-side 128-bit
+  `share_id` minting. (#52)
 - Desktop GUI window/taskbar icon on `AppWindow`. (#40)
 - First-start backup confirmation as three single-word type-back fields (C34).
 - Reproducible AppImage build recipe (`packaging/appimage/`, output to `dist/`).
