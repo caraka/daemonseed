@@ -20,9 +20,11 @@
 //! incoming transport.
 
 use daemonseed_core::cot::public_share_asset_address;
+use daemonseed_core::crypto::suite::CNSA_2_0;
 use daemonseed_core::federation::discovered::{DiscoveredPeers, MergeOutcome};
 use daemonseed_core::federation::store::TrustStore;
-use daemonseed_core::share_envelope::ShareFrame;
+use daemonseed_core::public_room::{DEFAULT_ROOM, RoomKeyError, derive_room_key};
+use daemonseed_core::share_seal::{open_share_frame, seal_public_share_frame};
 use daemonseed_core::share_serve::ChunkSource;
 use daemonseed_proto::v1::IntroducerQuery;
 use daemonseed_proto::v1::circle_of_trust_client::CircleOfTrustClient;
@@ -174,6 +176,20 @@ impl AppSession {
             .map_err(ServeShareError::Derive)?;
         let asset_bytes = asset_addr.as_bytes().to_vec();
 
+        // The seal key for a PUBLIC share: the public room key, derived from
+        // public inputs (the lobby room name + suite) — never from `share_id`.
+        // Both serve and fetch sides derive it independently, so it is threaded
+        // by *derivation here*, not passed in: `serve_share` serves public
+        // shares only, the inputs are constants, and deriving locally keeps the
+        // public signature unchanged and the fetcher↔sharer key agreement
+        // structural (same function, same inputs) rather than a wired-through
+        // parameter that could drift. Content frames ride sealed under it so
+        // public-share traffic is structurally indistinguishable from circle
+        // traffic on the wire (was cleartext); see
+        // `docs/design/unified-share-model.md` workstream A.
+        let room_key =
+            derive_room_key(DEFAULT_ROOM, &CNSA_2_0).map_err(ServeShareError::RoomKey)?;
+
         // Outbound half: the naming frame (empty payload, names the rendezvous
         // and is not relayed) then our responses. Capacity is generous so a
         // burst of fetcher requests does not back-pressure the answer path.
@@ -201,7 +217,11 @@ impl AppSession {
             if frame.payload.is_empty() {
                 continue; // naming-frame echo or noise
             }
-            let Ok(req) = ShareFrame::decode(&frame.payload) else {
+            // Open the sealed request frame under the public room key. A
+            // wrong-key / tampered / garbage payload fails closed — skipped
+            // exactly as an undecodable `ShareFrame::decode` was before
+            // (same fail-closed posture toward hostile relay noise).
+            let Ok(req) = open_share_frame(&room_key, &frame.payload) else {
                 continue;
             };
             // Answer off-runtime (ISC-A-C7, see the method doc): the disk
@@ -211,11 +231,15 @@ impl AppSession {
             let response = tokio::task::spawn_blocking(move || source.answer(&req))
                 .await
                 .expect("share answer task panicked");
+            // Seal the response under the same public room key before it enters
+            // `CotFrame.payload`. A seal failure (entropy/AEAD) drops this one
+            // answer rather than panicking; the fetcher times out and retries.
             if let Some(response) = response
+                && let Ok(sealed) = seal_public_share_frame(&room_key, &response)
                 && out_tx
                     .send(daemonseed_proto::v1::CotFrame {
                         asset_address: asset_bytes.clone(),
-                        payload: response.encode(),
+                        payload: sealed,
                     })
                     .await
                     .is_err()
@@ -233,6 +257,9 @@ pub enum ServeShareError {
     /// Deriving the share's fetch-asset address failed (oxicrypt SHA-384
     /// power-up self-test has not passed in this process).
     Derive(oxicrypt_module::Error),
+    /// Deriving the public room key (the content-frame seal key) failed —
+    /// the oxicrypt KDF power-up self-test has not passed in this process.
+    RoomKey(RoomKeyError),
     /// The local subscribe channel closed before the naming frame went out.
     ChannelClosed,
     /// The relay refused the `CircleOfTrust.Subscribe` stream.
@@ -245,6 +272,7 @@ impl core::fmt::Display for ServeShareError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             ServeShareError::Derive(e) => write!(f, "share fetch-asset derivation failed: {e}"),
+            ServeShareError::RoomKey(e) => write!(f, "share seal-key derivation failed: {e}"),
             ServeShareError::ChannelClosed => {
                 f.write_str("share serve channel closed before naming frame")
             }

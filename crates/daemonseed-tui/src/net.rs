@@ -55,6 +55,7 @@ use daemonseed_core::public_room::{
     seal_room_message,
 };
 use daemonseed_core::share_envelope::{ManifestEntry, ShareFrame};
+use daemonseed_core::share_seal::{open_share_frame, seal_public_share_frame};
 use daemonseed_core::share_serve::{
     DiskShareContent, MANIFEST_FRAME_BUDGET, ServeError, ShareManifest, manifest_frame_len,
 };
@@ -272,6 +273,11 @@ struct OpenedShare {
     inbound: tonic::Streaming<wire::CotFrame>,
     asset_addr: AssetAddr,
     manifest: Vec<ManifestEntry>,
+    /// The public room key the content frames are sealed/opened under. Derived
+    /// once when the stream opens and reused for the manifest + every chunk, so
+    /// the confirm-fetch loop never re-derives. Public-share-only (this fetch
+    /// path serves the public tier); see `docs/design/unified-share-model.md`.
+    room_key: PublicRoomKey,
 }
 
 /// An event from the network actor back to the UI. Plain data — folded into
@@ -1788,6 +1794,22 @@ impl Actor {
             }
         };
 
+        // The content-frame seal key for a PUBLIC share: the public room key,
+        // derived from public inputs (lobby room name + suite), independently of
+        // the serve side — never from `share_id`. Request frames ride sealed
+        // under it and responses are opened with it, so share traffic is
+        // structurally indistinguishable from chat on the wire (was cleartext);
+        // see `docs/design/unified-share-model.md` workstream A.
+        let room_key = match derive_room_key(DEFAULT_ROOM, &CNSA_2_0) {
+            Ok(k) => k,
+            Err(e) => {
+                self.emit(NetEvent::FetchError {
+                    message: format!("share seal-key derivation failed: {e}"),
+                });
+                return None;
+            }
+        };
+
         // The outbound half: a tokio mpsc the actor publishes to; the bidi
         // Subscribe stream reads from it. Capacity sized for the small set of
         // round-trip request frames a fetch generates (manifest + chunks);
@@ -1819,12 +1841,21 @@ impl Actor {
             }
         };
 
-        // Send ManifestRequest. The first non-empty inbound frame on this
-        // stream is expected to be the ManifestResponse from the sharer.
-        let request = ShareFrame::ManifestRequest;
+        // Send ManifestRequest, sealed under the public room key. The first
+        // non-empty inbound frame on this stream is expected to be the
+        // ManifestResponse from the sharer.
+        let payload = match seal_public_share_frame(&room_key, &ShareFrame::ManifestRequest) {
+            Ok(p) => p,
+            Err(e) => {
+                self.emit(NetEvent::FetchError {
+                    message: format!("could not seal manifest request: {e}"),
+                });
+                return None;
+            }
+        };
         let req_frame = wire::CotFrame {
             asset_address: asset_addr.as_bytes().to_vec(),
-            payload: request.encode(),
+            payload,
         };
         if out_tx.send(req_frame).await.is_err() {
             self.emit(NetEvent::FetchError {
@@ -1867,7 +1898,10 @@ impl Actor {
             if frame.payload.is_empty() {
                 continue; // naming-frame echo or noise
             }
-            match ShareFrame::decode(&frame.payload) {
+            // Open the sealed response under the public room key. A wrong-key /
+            // tampered / foreign payload fails closed — skipped exactly as an
+            // undecodable frame was before (same posture toward relay noise).
+            match open_share_frame(&room_key, &frame.payload) {
                 Ok(ShareFrame::ManifestResponse { entries }) => break entries,
                 Ok(_) => continue, // out-of-order request or chunk noise
                 Err(_) => continue,
@@ -1879,6 +1913,7 @@ impl Actor {
             inbound,
             asset_addr,
             manifest,
+            room_key,
         })
     }
 
@@ -1976,6 +2011,7 @@ impl Actor {
             mut inbound,
             asset_addr,
             manifest,
+            room_key,
         } = opened;
 
         // Resolve the file set: an explicit selection (A2) or the whole
@@ -2083,9 +2119,13 @@ impl Actor {
                     // Request one chunk by its advertised address; sequential
                     // (one outstanding request), same as pre-M16.
                     let request = ShareFrame::ChunkRequest { chunk_addr: *addr };
+                    let payload = match seal_public_share_frame(&room_key, &request) {
+                        Ok(p) => p,
+                        Err(e) => return Err(format!("could not seal chunk request: {e}")),
+                    };
                     let req_frame = wire::CotFrame {
                         asset_address: asset_addr.as_bytes().to_vec(),
-                        payload: request.encode(),
+                        payload,
                     };
                     if out_tx.send(req_frame).await.is_err() {
                         return Err("fetch subscribe channel closed mid-fetch".to_owned());
@@ -2111,14 +2151,14 @@ impl Actor {
                         if frame.payload.is_empty() {
                             continue;
                         }
-                        match ShareFrame::decode(&frame.payload) {
+                        match open_share_frame(&room_key, &frame.payload) {
                             Ok(ShareFrame::ChunkResponse { chunk_addr, data })
                                 if chunk_addr == *addr =>
                             {
                                 break data;
                             }
                             // Another chunk's response, another frame kind, or
-                            // an undecodable payload — skip.
+                            // a wrong-key / undecodable payload — skip.
                             Ok(_) | Err(_) => continue,
                         }
                     };

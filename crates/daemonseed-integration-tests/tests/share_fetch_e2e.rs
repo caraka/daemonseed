@@ -6,7 +6,11 @@
 //! single bidirectional `CircleOfTrust.Subscribe` stream each. The relay
 //! forwards opaque `CotFrame.payload` bytes verbatim (it never decodes the
 //! `ShareFrame` envelope), so A-S2 holds for the share path the same way it
-//! holds for chat. The fetcher re-derives `SHA-384(chunk)` over every
+//! holds for chat. Content frames ride **sealed** under the public room key
+//! (unified share model, workstream A — `docs/design/unified-share-model.md`):
+//! both inlined halves seal/open with `derive_room_key(DEFAULT_ROOM, ..)`, so
+//! public-share frames are structurally indistinguishable from chat on the
+//! wire. Inside the seal, the fetcher re-derives `SHA-384(chunk)` over every
 //! `ChunkResponse` and rejects any frame whose recomputed address does not
 //! match — the file-side analog of `open_message` failing closed.
 //!
@@ -21,7 +25,10 @@ use std::time::Duration;
 
 use daemonseed_cli::session::AppSession;
 use daemonseed_core::cot::public_share_asset_address;
+use daemonseed_core::crypto::suite::CNSA_2_0;
+use daemonseed_core::public_room::{DEFAULT_ROOM, PublicRoomKey, derive_room_key};
 use daemonseed_core::share_envelope::{ManifestEntry, ShareFrame};
+use daemonseed_core::share_seal::{open_share_frame, seal_public_share_frame};
 use daemonseed_core::storage::cas::chunk_addr;
 use daemonseed_proto::v1 as wire;
 use daemonseed_server::cot::CotRegistry;
@@ -52,6 +59,12 @@ fn frame(addr: &[u8], payload: Vec<u8>) -> wire::CotFrame {
         asset_address: addr.to_vec(),
         payload,
     }
+}
+
+/// The public room key both inlined halves derive to seal/open content frames —
+/// the unified share model's public-tier key (`docs/design/unified-share-model.md`).
+fn room_key() -> PublicRoomKey {
+    derive_room_key(DEFAULT_ROOM, &CNSA_2_0).expect("derive public room key")
 }
 
 async fn wait_until(mut cond: impl FnMut() -> bool) {
@@ -124,6 +137,7 @@ async fn fetcher_recovers_share_via_manifest_then_chunks() {
 
     let sharer_asset = asset_bytes.clone();
     let sharer_task = tokio::spawn(async move {
+        let key = room_key();
         let mut cot = sharer_sess.circle_of_trust();
         let (tx, rx) = mpsc::channel::<wire::CotFrame>(16);
         // First frame names the rendezvous (empty payload, not relayed).
@@ -134,12 +148,14 @@ async fn fetcher_recovers_share_via_manifest_then_chunks() {
             .expect("sharer subscribes")
             .into_inner();
 
-        // Serve requests until the fetcher closes the stream.
+        // Serve requests until the fetcher closes the stream. Open each sealed
+        // request, seal each response — the same seam the real `serve_share`
+        // implements.
         while let Ok(Some(in_frame)) = inbound.message().await {
             if in_frame.payload.is_empty() {
                 continue;
             }
-            let req = match ShareFrame::decode(&in_frame.payload) {
+            let req = match open_share_frame(&key, &in_frame.payload) {
                 Ok(r) => r,
                 Err(_) => continue,
             };
@@ -156,11 +172,11 @@ async fn fetcher_recovers_share_via_manifest_then_chunks() {
                 }
                 _ => continue,
             };
-            if tx
-                .send(frame(&sharer_asset, response.encode()))
-                .await
-                .is_err()
-            {
+            let sealed = match seal_public_share_frame(&key, &response) {
+                Ok(p) => p,
+                Err(_) => break,
+            };
+            if tx.send(frame(&sharer_asset, sealed)).await.is_err() {
                 break;
             }
         }
@@ -184,10 +200,15 @@ async fn fetcher_recovers_share_via_manifest_then_chunks() {
     // fetcher's request is fanned out to the sharer.
     wait_until(|| registry.live_assets() >= 1).await;
 
-    // Send ManifestRequest.
-    tx.send(frame(&asset_bytes, ShareFrame::ManifestRequest.encode()))
-        .await
-        .unwrap();
+    // Send ManifestRequest — sealed under the public room key, as the real
+    // fetch path does (the sharer opens it under the same key).
+    let key = room_key();
+    tx.send(frame(
+        &asset_bytes,
+        seal_public_share_frame(&key, &ShareFrame::ManifestRequest).expect("seal manifest request"),
+    ))
+    .await
+    .unwrap();
 
     // Wait for the manifest.
     let manifest = loop {
@@ -199,7 +220,7 @@ async fn fetcher_recovers_share_via_manifest_then_chunks() {
         if resp.payload.is_empty() {
             continue;
         }
-        match ShareFrame::decode(&resp.payload).expect("manifest decodes") {
+        match open_share_frame(&key, &resp.payload).expect("manifest opens") {
             ShareFrame::ManifestResponse { entries } => break entries,
             _ => continue,
         }
@@ -217,7 +238,8 @@ async fn fetcher_recovers_share_via_manifest_then_chunks() {
         for addr in &entry.chunks {
             tx.send(frame(
                 &asset_bytes,
-                ShareFrame::ChunkRequest { chunk_addr: *addr }.encode(),
+                seal_public_share_frame(&key, &ShareFrame::ChunkRequest { chunk_addr: *addr })
+                    .expect("seal chunk request"),
             ))
             .await
             .unwrap();
@@ -230,7 +252,7 @@ async fn fetcher_recovers_share_via_manifest_then_chunks() {
                 if resp.payload.is_empty() {
                     continue;
                 }
-                match ShareFrame::decode(&resp.payload).expect("chunk decodes") {
+                match open_share_frame(&key, &resp.payload).expect("chunk opens") {
                     ShareFrame::ChunkResponse { chunk_addr, data } if chunk_addr == *addr => {
                         break (chunk_addr, data);
                     }
@@ -285,6 +307,7 @@ async fn tampered_chunk_response_fails_recomputed_hash_check() {
     tampered[0] ^= 0x01;
     let hostile_asset = asset_bytes.clone();
     let responder_task = tokio::spawn(async move {
+        let key = room_key();
         let mut cot = responder_sess.circle_of_trust();
         let (tx, rx) = mpsc::channel::<wire::CotFrame>(8);
         tx.send(frame(&hostile_asset, Vec::new())).await.unwrap();
@@ -298,13 +321,14 @@ async fn tampered_chunk_response_fails_recomputed_hash_check() {
                 continue;
             }
             if let Ok(ShareFrame::ChunkRequest { chunk_addr }) =
-                ShareFrame::decode(&in_frame.payload)
+                open_share_frame(&key, &in_frame.payload)
             {
                 let resp = ShareFrame::ChunkResponse {
                     chunk_addr,
                     data: tampered.clone(),
                 };
-                let _ = tx.send(frame(&hostile_asset, resp.encode())).await;
+                let sealed = seal_public_share_frame(&key, &resp).expect("seal tampered response");
+                let _ = tx.send(frame(&hostile_asset, sealed)).await;
             }
         }
     });
@@ -322,12 +346,16 @@ async fn tampered_chunk_response_fails_recomputed_hash_check() {
 
     wait_until(|| registry.live_assets() >= 1).await;
 
+    let key = room_key();
     tx.send(frame(
         &asset_bytes,
-        ShareFrame::ChunkRequest {
-            chunk_addr: advertised,
-        }
-        .encode(),
+        seal_public_share_frame(
+            &key,
+            &ShareFrame::ChunkRequest {
+                chunk_addr: advertised,
+            },
+        )
+        .expect("seal chunk request"),
     ))
     .await
     .unwrap();
@@ -341,7 +369,7 @@ async fn tampered_chunk_response_fails_recomputed_hash_check() {
         if f.payload.is_empty() {
             continue;
         }
-        match ShareFrame::decode(&f.payload).unwrap() {
+        match open_share_frame(&key, &f.payload).unwrap() {
             ShareFrame::ChunkResponse { chunk_addr, data } => break (chunk_addr, data),
             _ => continue,
         }

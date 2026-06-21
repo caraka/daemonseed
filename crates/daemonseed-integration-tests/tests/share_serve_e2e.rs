@@ -15,13 +15,24 @@
 //! (the opaque hex `share_id`, the `server_id` string). This test passes the
 //! identical pair to both halves, so a fetch that finds the manifest *is* the
 //! agreement proof — a mismatch would land on a dead asset and time out.
+//!
+//! Content frames ride **sealed** under the public room key (unified share
+//! model, workstream A — `docs/design/unified-share-model.md`): the real
+//! `serve_share` opens each sealed request and seals each response, so this
+//! fetcher seals its requests and opens the responses under the same
+//! independently-derived `derive_room_key(DEFAULT_ROOM, ..)`. The seal is the
+//! confidentiality/indistinguishability layer; the per-chunk SHA-384 check
+//! lives inside it and still gates every recovered chunk.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use daemonseed_cli::session::AppSession;
 use daemonseed_core::cot::public_share_asset_address;
+use daemonseed_core::crypto::suite::CNSA_2_0;
+use daemonseed_core::public_room::{DEFAULT_ROOM, PublicRoomKey, derive_room_key};
 use daemonseed_core::share_envelope::ShareFrame;
+use daemonseed_core::share_seal::{open_share_frame, seal_public_share_frame};
 use daemonseed_core::share_serve::ShareContent;
 use daemonseed_core::storage::cas::chunk_addr;
 use daemonseed_proto::v1 as wire;
@@ -53,6 +64,12 @@ fn frame(addr: &[u8], payload: Vec<u8>) -> wire::CotFrame {
         asset_address: addr.to_vec(),
         payload,
     }
+}
+
+/// The public room key both the real `serve_share` and this fetcher derive
+/// independently to seal/open content frames.
+fn room_key() -> PublicRoomKey {
+    derive_room_key(DEFAULT_ROOM, &CNSA_2_0).expect("derive public room key")
 }
 
 async fn wait_until(mut cond: impl FnMut() -> bool) {
@@ -115,6 +132,7 @@ async fn fetcher_recovers_share_via_real_serve_path() {
         public_share_asset_address(SHARE_ID.as_bytes(), SERVER_ID.as_bytes()).expect("derive");
     let asset_bytes = asset_addr.as_bytes().to_vec();
 
+    let key = room_key();
     let mut cot = fetcher_sess.circle_of_trust();
     let (tx, rx) = mpsc::channel::<wire::CotFrame>(16);
     tx.send(frame(&asset_bytes, Vec::new())).await.unwrap();
@@ -124,11 +142,16 @@ async fn fetcher_recovers_share_via_real_serve_path() {
         .expect("fetcher subscribes")
         .into_inner();
 
-    tx.send(frame(&asset_bytes, ShareFrame::ManifestRequest.encode()))
-        .await
-        .unwrap();
+    tx.send(frame(
+        &asset_bytes,
+        seal_public_share_frame(&key, &ShareFrame::ManifestRequest).expect("seal manifest request"),
+    ))
+    .await
+    .unwrap();
 
-    let manifest = loop {
+    // Keep the RAW sealed manifest wire-payload so we can prove no rel_path
+    // rode it in the clear (workstream A: content frames stop riding cleartext).
+    let (manifest, sealed_manifest_wire) = loop {
         let resp = tokio::time::timeout(Duration::from_secs(5), inbound.message())
             .await
             .expect("manifest within timeout")
@@ -137,11 +160,22 @@ async fn fetcher_recovers_share_via_real_serve_path() {
         if resp.payload.is_empty() {
             continue;
         }
-        match ShareFrame::decode(&resp.payload).expect("manifest decodes") {
-            ShareFrame::ManifestResponse { entries } => break entries,
+        let raw = resp.payload.clone();
+        match open_share_frame(&key, &resp.payload).expect("manifest opens") {
+            ShareFrame::ManifestResponse { entries } => break (entries, raw),
             _ => continue,
         }
     };
+    // The real serve loop's sealed manifest response must NOT contain the file
+    // names in the clear — the metadata leak the seal closes (ISC-A-S16).
+    for name in ["page-1.txt", "sub/page-2.txt", "page-2.txt"] {
+        assert!(
+            !sealed_manifest_wire
+                .windows(name.len())
+                .any(|w| w == name.as_bytes()),
+            "sealed manifest wire bytes must not contain the plaintext name {name:?}"
+        );
+    }
     assert_eq!(
         manifest.len(),
         2,
@@ -160,7 +194,8 @@ async fn fetcher_recovers_share_via_real_serve_path() {
         for addr in &entry.chunks {
             tx.send(frame(
                 &asset_bytes,
-                ShareFrame::ChunkRequest { chunk_addr: *addr }.encode(),
+                seal_public_share_frame(&key, &ShareFrame::ChunkRequest { chunk_addr: *addr })
+                    .expect("seal chunk request"),
             ))
             .await
             .unwrap();
@@ -173,7 +208,7 @@ async fn fetcher_recovers_share_via_real_serve_path() {
                 if resp.payload.is_empty() {
                     continue;
                 }
-                match ShareFrame::decode(&resp.payload).expect("chunk decodes") {
+                match open_share_frame(&key, &resp.payload).expect("chunk opens") {
                     ShareFrame::ChunkResponse { chunk_addr, data } if chunk_addr == *addr => {
                         break (chunk_addr, data);
                     }
@@ -212,6 +247,7 @@ async fn offline_sharer_content_is_unfetchable() {
     let fetcher_sess = AppSession::open(fetcher_client_io).await.expect("fetcher");
 
     // Same derivation the sharer WOULD use — but no sharer is online.
+    let key = room_key();
     let asset_addr =
         public_share_asset_address(SHARE_ID.as_bytes(), SERVER_ID.as_bytes()).expect("derive");
     let asset_bytes = asset_addr.as_bytes().to_vec();
@@ -226,9 +262,12 @@ async fn offline_sharer_content_is_unfetchable() {
         .into_inner();
 
     // Only the fetcher is subscribed; nobody answers a ManifestRequest.
-    tx.send(frame(&asset_bytes, ShareFrame::ManifestRequest.encode()))
-        .await
-        .unwrap();
+    tx.send(frame(
+        &asset_bytes,
+        seal_public_share_frame(&key, &ShareFrame::ManifestRequest).expect("seal manifest request"),
+    ))
+    .await
+    .unwrap();
 
     // No manifest arrives within a bounded wait — the content is unfetchable.
     let outcome = tokio::time::timeout(Duration::from_millis(600), async {
@@ -236,7 +275,8 @@ async fn offline_sharer_content_is_unfetchable() {
             match inbound.message().await {
                 Ok(Some(f)) if f.payload.is_empty() => continue,
                 Ok(Some(f)) => {
-                    if let Ok(ShareFrame::ManifestResponse { .. }) = ShareFrame::decode(&f.payload)
+                    if let Ok(ShareFrame::ManifestResponse { .. }) =
+                        open_share_frame(&key, &f.payload)
                     {
                         return true; // a manifest arrived — would be a failure
                     }

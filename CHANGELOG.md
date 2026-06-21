@@ -84,6 +84,18 @@ work lives in the project lead's vault manifest, not here.
   versa) is now a compile error. The share-announcement seal is tier-split
   accordingly (`seal_public_announcement` / `seal_circle_announcement`); opening
   stays tier-agnostic. Behavior-preserving (no wire change).
+- Public-share content now rides the wire AES-256-GCM-sealed instead of
+  cleartext: the serve/fetch transport (`daemonseed-cli::serve_share` and the
+  TUI/GUI fetch paths) seals every `ShareFrame` (manifest + chunk, both
+  directions) under the public room key via
+  `daemonseed-core::share_seal::{seal_public_share_frame, open_share_frame}`, so
+  public-share traffic is structurally indistinguishable from chat/circle traffic
+  (the alpha shipped it in the clear). Server-readable by design (the public room
+  key is derivable by anyone, including the relay) — the seal buys structural
+  indistinguishability, not confidentiality; the per-chunk SHA-384 integrity
+  check is unchanged (it sits inside the seal). The relay is unaffected (it routes
+  by `asset_address` and forwards opaque bytes). Design-of-record:
+  `docs/design/unified-share-model.md` (workstream A).
 - Track oxicrypt 0.16.0 in the lockfile.
 - Auto-republish on connect now consumes the persisted per-share name
   (`PublishedShare.name`), threaded through the restore path; it falls back to

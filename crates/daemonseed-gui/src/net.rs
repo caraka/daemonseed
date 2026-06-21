@@ -58,9 +58,11 @@ use daemonseed_core::crypto::suite::CNSA_2_0;
 use daemonseed_core::federation::store::{InMemoryTrustStore, ServerEntry, TrustStore};
 use daemonseed_core::handle::Handle;
 use daemonseed_core::public_room::{
-    DEFAULT_ROOM, derive_room_key, open_room_message, room_asset_address, seal_room_message,
+    DEFAULT_ROOM, PublicRoomKey, derive_room_key, open_room_message, room_asset_address,
+    seal_room_message,
 };
 use daemonseed_core::share_envelope::{ManifestEntry, ShareFrame};
+use daemonseed_core::share_seal::{open_share_frame, seal_public_share_frame};
 use daemonseed_core::share_serve::ShareContent;
 use daemonseed_core::storage::cas::chunk_addr;
 use daemonseed_core::storage::fetched::rebase_to_selection_root;
@@ -1041,6 +1043,7 @@ impl Actor {
             mut inbound,
             asset_bytes,
             manifest,
+            room_key,
         } = opened;
 
         // Resolve the selected file set (None → all; out-of-range indices ignored).
@@ -1104,11 +1107,22 @@ impl Actor {
 
             let mut file_bytes: Vec<u8> = Vec::with_capacity(entry.size as usize);
             for addr in &entry.chunks {
+                let chunk_req = match seal_public_share_frame(
+                    &room_key,
+                    &ShareFrame::ChunkRequest { chunk_addr: *addr },
+                ) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return fail_fetch(
+                            self,
+                            &written,
+                            format!("could not seal chunk request: {e}"),
+                        )
+                        .await;
+                    }
+                };
                 if out_tx
-                    .send(share_frame(
-                        &asset_bytes,
-                        ShareFrame::ChunkRequest { chunk_addr: *addr }.encode(),
-                    ))
+                    .send(share_frame(&asset_bytes, chunk_req))
                     .await
                     .is_err()
                 {
@@ -1142,7 +1156,7 @@ impl Actor {
                     if resp.payload.is_empty() {
                         continue;
                     }
-                    match ShareFrame::decode(&resp.payload) {
+                    match open_share_frame(&room_key, &resp.payload) {
                         Ok(ShareFrame::ChunkResponse {
                             chunk_addr: got,
                             data,
@@ -1209,6 +1223,15 @@ impl Actor {
             .map_err(|e| format!("share-address derivation failed: {e}"))?;
         let asset_bytes = asset_addr.as_bytes().to_vec();
 
+        // Content-frame seal key for a PUBLIC share: the public room key, from
+        // public inputs (lobby room name + suite), derived independently of the
+        // serve side — never from `share_id`. Requests ride sealed under it and
+        // responses are opened with it, so share traffic is structurally
+        // indistinguishable from chat on the wire (was cleartext); see
+        // `docs/design/unified-share-model.md` workstream A.
+        let room_key = derive_room_key(DEFAULT_ROOM, &CNSA_2_0)
+            .map_err(|e| format!("share seal-key derivation failed: {e}"))?;
+
         let mut cot = session.circle_of_trust();
         let (out_tx, out_rx) = mpsc::channel::<wire::CotFrame>(16);
         out_tx
@@ -1220,11 +1243,10 @@ impl Actor {
             .await
             .map_err(|s| format!("subscribe refused: {}", s.message()))?
             .into_inner();
+        let manifest_req = seal_public_share_frame(&room_key, &ShareFrame::ManifestRequest)
+            .map_err(|e| format!("could not seal manifest request: {e}"))?;
         out_tx
-            .send(share_frame(
-                &asset_bytes,
-                ShareFrame::ManifestRequest.encode(),
-            ))
+            .send(share_frame(&asset_bytes, manifest_req))
             .await
             .map_err(|_| "share subscribe channel closed".to_owned())?;
 
@@ -1238,7 +1260,9 @@ impl Actor {
             if resp.payload.is_empty() {
                 continue;
             }
-            match ShareFrame::decode(&resp.payload) {
+            // Open the sealed response under the public room key; a wrong-key /
+            // tampered / foreign payload fails closed and is skipped.
+            match open_share_frame(&room_key, &resp.payload) {
                 Ok(ShareFrame::ManifestResponse { entries }) => break entries,
                 _ => continue,
             }
@@ -1248,6 +1272,7 @@ impl Actor {
             inbound,
             asset_bytes,
             manifest,
+            room_key,
         })
     }
 }
@@ -1278,6 +1303,11 @@ struct OpenedShare {
     inbound: tonic::Streaming<wire::CotFrame>,
     asset_bytes: Vec<u8>,
     manifest: Vec<ManifestEntry>,
+    /// The public room key the content frames are sealed/opened under. Derived
+    /// once when the stream opens and reused for the manifest + every chunk.
+    /// Public-share-only (this fetch path serves the public tier); see
+    /// `docs/design/unified-share-model.md` workstream A.
+    room_key: PublicRoomKey,
 }
 
 /// Per-frame inactivity budget for a fetch (manifest or chunk). Only a relevant
