@@ -753,35 +753,40 @@ fn apply_my_shares(ui: &AppWindow, state: &GuiState) {
     ui.set_my_shares(ModelRc::from(Rc::new(VecModel::from(rows))));
 }
 
+/// Handle to the app's long-lived multi-thread runtime (built once at windowed
+/// startup, ~`new_multi_thread()` below). The Shares folder pickers run their
+/// xdg-portal dialogs on THIS runtime rather than a throwaway per-pick
+/// `new_current_thread` runtime: a fresh runtime dropped the instant `block_on`
+/// returns abruptly cancels ashpd/zbus connection-cleanup tasks mid-flight, leaking
+/// D-Bus connections until a later portal pick hangs (#33). A persistent runtime
+/// drives each pick's cleanup to completion. `None` only in offscreen/headless runs,
+/// where the pickers aren't reached (publish uses the `DAEMONSEED_PUBLISH_DIR` hatch).
+static PICKER_RT: std::sync::OnceLock<tokio::runtime::Handle> = std::sync::OnceLock::new();
+
 /// Open the native folder picker OFF the UI thread and, if a folder is chosen, fire
-/// `ConfirmFetch` to it (commit 2). The xdg portal is async over D-Bus, so a dedicated
-/// thread with a current-thread tokio runtime drives the dialog; the destination is
-/// dispatched through a cloned `Send` command sender (the `Rc<NetHandle>` can't cross
-/// threads). The UI thread never blocks — chat + the download meter stay live while
-/// the dialog is open. A cancelled pick, or a system with no portal service, simply
-/// does nothing. `flat_dest: true` writes the selection under the chosen dir directly
-/// (a single file as its basename; a folder with its ancestors dropped).
+/// `ConfirmFetch` to it (commit 2). The xdg portal is async over D-Bus; the dialog
+/// runs as a task on the app's persistent runtime (`PICKER_RT`), and the destination
+/// is dispatched through a cloned `Send` command sender (the `Rc<NetHandle>` can't
+/// cross threads). The UI thread never blocks — chat + the download meter stay live
+/// while the dialog is open. A cancelled pick, or a system with no portal service,
+/// simply does nothing. `flat_dest: true` writes the selection under the chosen dir
+/// directly (a single file as its basename; a folder with its ancestors dropped).
 fn pick_dir_and_fetch(net: &Rc<RefCell<NetHandle>>, target: FetchTarget) {
     let sender = net.borrow().command_sender();
     let title = format!("Download \u{201c}{}\u{201d} to…", target.name);
-    std::thread::spawn(move || {
-        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        else {
-            return;
-        };
+    let Some(rt) = PICKER_RT.get() else {
+        return;
+    };
+    rt.spawn(async move {
         let mut dialog = rfd::AsyncFileDialog::new().set_title(title);
         // Default the destination to the OS Downloads folder, not $HOME.
         if let Some(downloads) = dirs::download_dir() {
             dialog = dialog.set_directory(downloads);
         }
-        let chosen = rt.block_on(async {
-            dialog
-                .pick_folder()
-                .await
-                .map(|handle| handle.path().to_path_buf())
-        });
+        let chosen = dialog
+            .pick_folder()
+            .await
+            .map(|handle| handle.path().to_path_buf());
         if let Some(dir) = chosen {
             let _ = sender.send(NetCommand::ConfirmFetch {
                 share_id: target.share_id,
@@ -823,20 +828,15 @@ fn pick_dir_and_publish(net: &Rc<RefCell<NetHandle>>, name: String, sharer_handl
             return;
         }
     }
-    std::thread::spawn(move || {
-        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        else {
-            return;
-        };
-        let chosen = rt.block_on(async {
-            rfd::AsyncFileDialog::new()
-                .set_title("Choose a folder to share…")
-                .pick_folder()
-                .await
-                .map(|handle| handle.path().to_path_buf())
-        });
+    let Some(rt) = PICKER_RT.get() else {
+        return;
+    };
+    rt.spawn(async move {
+        let chosen = rfd::AsyncFileDialog::new()
+            .set_title("Choose a folder to share…")
+            .pick_folder()
+            .await
+            .map(|handle| handle.path().to_path_buf());
         if let Some(dir) = chosen {
             let name = if name.trim().is_empty() {
                 dir.file_name()
@@ -1795,6 +1795,10 @@ fn main() {
             .build()
             .expect("build main-thread tokio runtime for Slint's zbus settings watcher");
         let _rt_guard = rt.enter();
+        // The Shares folder pickers run their xdg-portal dialogs on this long-lived
+        // runtime instead of a throwaway per-pick one (#33). Set before any UI wiring
+        // so the first pick already has it.
+        let _ = PICKER_RT.set(rt.handle().clone());
         let (ui, state, net, browser) = build_ui();
         wire_auth(
             &ui,
