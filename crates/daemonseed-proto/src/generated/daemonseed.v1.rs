@@ -242,6 +242,56 @@ pub struct ShareAnnouncement {
     #[prost(bytes = "vec", tag = "9")]
     pub signature: ::prost::alloc::vec::Vec<u8>,
 }
+/// A SHARE ROLL-CALL — the late-join discovery request that pairs with
+/// ShareAnnouncement (design-of-record: docs/design/unified-share-model.md).
+/// Because the relay is a pure blind forwarder it cannot tell live sharers that
+/// a new member subscribed, so fast late-join is pull-based: a joining (or
+/// refreshing) client posts this sealed roll-call into the room, and every
+/// currently-connected sharer answers by re-posting its ShareAnnouncement(s).
+/// One late-join hook — startup discovery, the Refresh action, and the jittered
+/// reconcile timer all post a roll-call — and it needs NO new relay capability:
+/// it is just another CotFrame.payload at the room's rendezvous address, fitting
+/// the relay's existing live-only, no-retention posture (a late chat joiner
+/// likewise sees no history).
+///
+/// It is a DISTINCT sealed payload kind (not implicit-on-subscribe): the relay
+/// emits no subscribe events, so the request must travel in-band as its own
+/// message. Like ShareAnnouncement it is (1) SELF-SIGNED FOR PROVENANCE (C57) —
+/// the signature proves WHO asked — and (2) AES-256-GCM-sealed under the tier
+/// key (public room key, or a circle cot_key), so only room/circle members can
+/// post or read a roll-call and the relay sees ciphertext only (A-S2, A-S16). A
+/// distinct AAD (daemonseed/share/rollcall/v1) keeps it from ever being opened
+/// as — or substituted from — a chat message, a public-room message, a share
+/// announcement, or a content frame under a coincidentally-equal key. See
+/// daemonseed-core share_rollcall::{seal_public_rollcall, seal_circle_rollcall,
+/// open_rollcall}.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ShareRollCall {
+    /// The room/circle the roll-call probes (e.g. "lobby" for public). Bound into
+    /// the provenance signature so a roll-call cannot be replayed into a different
+    /// room.
+    #[prost(string, tag = "1")]
+    pub room: ::prost::alloc::string::String,
+    /// The requester's full ML-DSA-87 public key. The provenance signature
+    /// verifies under it; the recipient derives the authoritative handle
+    /// hash-prefix SHA-384(requester_pubkey)\[:12\] (ISC-C4), never trusting
+    /// requester_handle alone. Carried for parity with ShareAnnouncement
+    /// provenance; a roll-call confers no authority — any member may ask.
+    #[prost(bytes = "vec", tag = "2")]
+    pub requester_pubkey: ::prost::alloc::vec::Vec<u8>,
+    /// The requester's self-asserted display handle (`name#12hex`). Advisory only.
+    #[prost(string, tag = "3")]
+    pub requester_handle: ::prost::alloc::string::String,
+    /// Requester wall-clock at request time, unix milliseconds. Advisory only —
+    /// never trusted for security (the relay stamps nothing and sees ciphertext).
+    #[prost(int64, tag = "4")]
+    pub sent_unix_ms: i64,
+    /// Detached ML-DSA-87 provenance signature over the domain-separated signed
+    /// input (room ‖ requester_pubkey ‖ sent_unix_ms). Verified client-side under
+    /// requester_pubkey; a bad signature drops the roll-call.
+    #[prost(bytes = "vec", tag = "5")]
+    pub signature: ::prost::alloc::vec::Vec<u8>,
+}
 /// Generated client implementations.
 pub mod circle_of_trust_client {
     #![allow(

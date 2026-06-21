@@ -42,6 +42,17 @@ work lives in the project lead's vault manifest, not here.
   indistinguishable from chat on the wire (the alpha shipped public-share content
   in the clear). No provenance signature — per-chunk SHA-384 integrity already
   lives inside the frame.
+- In-band share discovery — roll-call request payload and seal/open: a
+  `ShareRollCall` wire message and `daemonseed-core::share_rollcall`
+  (`seal_public_rollcall` / `seal_circle_rollcall` / `open_rollcall`), the
+  late-join request half that pairs with `ShareAnnouncement`. Because the relay
+  is a blind forwarder that emits no subscribe events, late-join is pull-based: a
+  joining/refreshing client posts a sealed, ML-DSA self-signed roll-call into the
+  room and every connected sharer re-announces. A distinct sealed kind (not
+  implicit-on-subscribe), tier-guarded by key type, with a distinct AAD
+  (`SHARE_ROLLCALL_AAD`) so it can never be confused with an announcement, a
+  content frame, or a chat message. Design-of-record:
+  `docs/design/unified-share-model.md`.
 - Desktop GUI window/taskbar icon: the `AppWindow` now carries an `icon`,
   rasterized from the AppImage's scalable placeholder so the windowed app and
   the AppImage share one mark (aesthetic refinement deferred).
