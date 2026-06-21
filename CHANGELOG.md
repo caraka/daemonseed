@@ -42,17 +42,10 @@ work lives in the project lead's vault manifest, not here.
   indistinguishable from chat on the wire (the alpha shipped public-share content
   in the clear). No provenance signature — per-chunk SHA-384 integrity already
   lives inside the frame.
-- In-band share discovery — roll-call request payload and seal/open: a
-  `ShareRollCall` wire message and `daemonseed-core::share_rollcall`
-  (`seal_public_rollcall` / `seal_circle_rollcall` / `open_rollcall`), the
-  late-join request half that pairs with `ShareAnnouncement`. Because the relay
-  is a blind forwarder that emits no subscribe events, late-join is pull-based: a
-  joining/refreshing client posts a sealed, ML-DSA self-signed roll-call into the
-  room and every connected sharer re-announces. A distinct sealed kind (not
-  implicit-on-subscribe), tier-guarded by key type, with a distinct AAD
-  (`SHARE_ROLLCALL_AAD`) so it can never be confused with an announcement, a
-  content frame, or a chat message. Design-of-record:
-  `docs/design/unified-share-model.md`.
+- In-band share discovery: a sealed, signed `ShareRollCall` late-join request
+  plus `daemonseed-core::share_rollcall` seal/open — prompts live sharers to
+  re-announce; a distinct, tier-guarded kind pairing with `ShareAnnouncement`
+  (design: `docs/design/unified-share-model.md`). (#52)
 - Desktop GUI window/taskbar icon: the `AppWindow` now carries an `icon`,
   rasterized from the AppImage's scalable placeholder so the windowed app and
   the AppImage share one mark (aesthetic refinement deferred).
@@ -84,18 +77,10 @@ work lives in the project lead's vault manifest, not here.
   versa) is now a compile error. The share-announcement seal is tier-split
   accordingly (`seal_public_announcement` / `seal_circle_announcement`); opening
   stays tier-agnostic. Behavior-preserving (no wire change).
-- Public-share content now rides the wire AES-256-GCM-sealed instead of
-  cleartext: the serve/fetch transport (`daemonseed-cli::serve_share` and the
-  TUI/GUI fetch paths) seals every `ShareFrame` (manifest + chunk, both
-  directions) under the public room key via
-  `daemonseed-core::share_seal::{seal_public_share_frame, open_share_frame}`, so
-  public-share traffic is structurally indistinguishable from chat/circle traffic
-  (the alpha shipped it in the clear). Server-readable by design (the public room
-  key is derivable by anyone, including the relay) — the seal buys structural
-  indistinguishability, not confidentiality; the per-chunk SHA-384 integrity
-  check is unchanged (it sits inside the seal). The relay is unaffected (it routes
-  by `asset_address` and forwards opaque bytes). Design-of-record:
-  `docs/design/unified-share-model.md` (workstream A).
+- Public-share content now rides AES-256-GCM-sealed under the public room key on
+  the serve/fetch path (was cleartext), making share traffic wire-indistinguishable
+  from chat; per-chunk SHA-384 integrity and the relay are unchanged (design:
+  `docs/design/unified-share-model.md`). (#52)
 - Track oxicrypt 0.16.0 in the lockfile.
 - Auto-republish on connect now consumes the persisted per-share name
   (`PublishedShare.name`), threaded through the restore path; it falls back to
