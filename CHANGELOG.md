@@ -58,6 +58,9 @@ work lives in the project lead's vault manifest, not here.
 - TUI share publish / unpublish / refresh now run in-band — sealed
   `ShareAnnouncement` + `ShareRollCall` over the lobby, with a `ShareCatalog` and
   a reconcile timer — instead of the relay registry RPCs. (#52)
+- GUI share publish / unpublish / refresh now run in-band — sealed
+  `ShareAnnouncement` + `ShareRollCall` over the lobby, with a `ShareCatalog` and
+  a reconcile timer — instead of the relay registry RPCs. (#53)
 - Track oxicrypt 0.16.0 in the lockfile.
 - Auto-republish on connect consumes the persisted per-share name
   (`PublishedShare.name`), falling back to the root basename. (#41)
