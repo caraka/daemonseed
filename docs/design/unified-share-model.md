@@ -150,6 +150,17 @@ dedicated heartbeat?)
   re-forwards blind would solve late-join without roll-call — but it adds relay
   state (A-S1 tension). Currently rejected in favour of a stateless relay; record
   the tradeoff.
+- **Federation / cross-relay reach:** rooms, circles, and shares are **per-relay**
+  today — the rendezvous bakes in `server_id` (cross-server unlinkability, ISC-C8)
+  and federation (`FederationIntroducer`) is relay *discovery*, not live-content
+  forwarding (a relay fans a `CotFrame` only to its own co-subscribers). The
+  `ShareAnnouncement` is already relay-agnostic (it carries `share_id`, not
+  `server_id`), and retiring the relay registry moves `share_id` minting
+  client-side (relay-independent ids) — so a future cross-relay path needs **no
+  message change**. The privacy-preserving shape is **client-side multi-relay
+  fan-out** (announce + serve the same share on each connected relay), not
+  relay-to-relay gossip (which would erode per-relay circle unlinkability and let
+  a forwarding relay learn which addresses cross). Future work, not this milestone.
 - **Presence convergence:** does presence derive from share announcements
   (one mechanism, Demonsaw-style) or ride a dedicated heartbeat (decouples
   presence from whether a member is sharing)? Resolve jointly with

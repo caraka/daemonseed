@@ -26,6 +26,14 @@ work lives in the project lead's vault manifest, not here.
 
 ### Added
 
+- In-band share discovery — announcement payload and seal/open: a
+  `ShareAnnouncement` wire message and `daemonseed-core::share_announce`
+  (`seal_announcement` / `open_announcement`), a share announcement sealed
+  (AES-256-GCM) and ML-DSA self-signed for provenance, carried in a
+  `CotFrame.payload` at a room/circle rendezvous address, mirroring
+  `public_room`. Sealed under the public room key (public tier, server-readable)
+  or a circle `cot_key` (members-only); relay-agnostic (carries `share_id`, not
+  `server_id`). Design-of-record: `docs/design/unified-share-model.md`.
 - Desktop GUI window/taskbar icon: the `AppWindow` now carries an `icon`,
   rasterized from the AppImage's scalable placeholder so the windowed app and
   the AppImage share one mark (aesthetic refinement deferred).

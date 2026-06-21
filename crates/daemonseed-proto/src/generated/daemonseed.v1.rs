@@ -176,6 +176,71 @@ pub struct PublicRoomMessage {
     #[prost(bytes = "vec", tag = "6")]
     pub signature: ::prost::alloc::vec::Vec<u8>,
 }
+/// A SHARE ANNOUNCEMENT — the in-band discovery payload that replaces the
+/// relay-hosted share registry (design-of-record: docs/design/unified-share-model.md).
+/// It is posted into a room/circle as a CotFrame.payload at that room's
+/// rendezvous address, sealed + ML-DSA self-signed exactly like a
+/// PublicRoomMessage: discovery becomes "listen to the stream" instead of a
+/// relay ListPublicShares call, so the relay holds NO share directory (A-S2,
+/// A-S1) and is a pure blind forwarder for shares as it already is for chat.
+///
+/// Like PublicRoomMessage it is (1) SELF-SIGNED FOR PROVENANCE (C57): the
+/// signature over the domain-separated input proves WHO announced, not that they
+/// were authorized to. And (2) ENCRYPTED UNDER THE TIER KEY: the whole message
+/// is prost-encoded then AES-256-GCM-sealed — under the public room key for a
+/// public announcement (server-readable, the deliberately-public tier) or under
+/// a circle cot_key for a circle announcement (members-only). ONLY the
+/// ciphertext rides in CotFrame.payload (A-S16). See daemonseed-core
+/// share_announce::{seal_announcement, open_announcement}.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ShareAnnouncement {
+    /// The room/circle this announcement belongs to (e.g. "lobby" for public).
+    /// Bound into the provenance signature so an announcement cannot be replayed
+    /// into a different room.
+    #[prost(string, tag = "1")]
+    pub room: ::prost::alloc::string::String,
+    /// The announcer's full ML-DSA-87 public key. The provenance signature
+    /// verifies under it; the recipient derives the authoritative handle
+    /// hash-prefix SHA-384(sender_pubkey)\[:12\] (ISC-C4), never trusting
+    /// sender_handle alone.
+    #[prost(bytes = "vec", tag = "2")]
+    pub sender_pubkey: ::prost::alloc::vec::Vec<u8>,
+    /// The announcer's self-asserted display handle (`name#12hex`). Advisory: the
+    /// recipient cross-checks its hash component against sender_pubkey (ISC-C57).
+    #[prost(string, tag = "3")]
+    pub sender_handle: ::prost::alloc::string::String,
+    /// The share's opaque id (ISC-S21). The fetcher derives the rendezvous address
+    /// it subscribes to from this — public_share_asset_address(share_id,
+    /// server_id) for a public share (daemonseed-core cot). This is what the old
+    /// PublicShareListing.share_id carried; the announcement hands it out in-band
+    /// instead of via the relay registry.
+    #[prost(string, tag = "4")]
+    pub share_id: ::prost::alloc::string::String,
+    /// Display name of the shared folder (was PublicShareListing.name).
+    #[prost(string, tag = "5")]
+    pub name: ::prost::alloc::string::String,
+    /// Sharer-assigned rating label from the active taxonomy. Advisory, never
+    /// relay-enforced (was PublicShareListing.rating, ISC-C19 / ISC-A-S5b).
+    #[prost(string, tag = "6")]
+    pub rating: ::prost::alloc::string::String,
+    /// True = this share is being WITHDRAWN (unpublish); false = announce/refresh.
+    /// Bound into the provenance signature so a withdraw cannot be forged for, or
+    /// replayed against, another announcer's share.
+    #[prost(bool, tag = "7")]
+    pub withdraw: bool,
+    /// Announcer wall-clock at announce time, unix milliseconds. Advisory ordering
+    /// and liveness aging — the two-speed reconcile prunes announcements not
+    /// refreshed within a TTL; never trusted for security (the relay sees only
+    /// ciphertext and stamps nothing).
+    #[prost(int64, tag = "8")]
+    pub sent_unix_ms: i64,
+    /// Detached ML-DSA-87 provenance signature over the domain-separated signed
+    /// input (room ‖ sender_pubkey ‖ share_id ‖ name ‖ rating ‖ withdraw ‖
+    /// sent_unix_ms). Verified client-side under sender_pubkey; a bad signature
+    /// drops the announcement.
+    #[prost(bytes = "vec", tag = "9")]
+    pub signature: ::prost::alloc::vec::Vec<u8>,
+}
 /// Generated client implementations.
 pub mod circle_of_trust_client {
     #![allow(

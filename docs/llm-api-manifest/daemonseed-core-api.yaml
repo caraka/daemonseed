@@ -729,6 +729,57 @@ modules:
       - A-C3
       - A-C4
 
+  - name: daemonseed_core::public_room
+    description: >-
+      Interactive public-room sealing — the public tier of the public-vs-circle
+      bifurcation (S4 / S22..S26). derive_room_key builds a GLOBAL key from
+      PUBLIC inputs (crypto family token + room name under PUBLIC_ROOM_KEY_SALT,
+      no secret IKM), so every client AND the relay derive it: the room is
+      server-readable by design — protocol uniformity, NOT a confidentiality
+      barrier. room_asset_address = SHA-384(room_key ‖ server_id) puts a room on
+      the SAME Subscribe surface as a circle. seal_room_message self-signs
+      (ML-DSA provenance, S24) then AES-256-GCM seals (AAD = ROOM_MESSAGE_AAD);
+      open_room_message fails closed (Authentication) on a wrong key/tamper and
+      (Provenance) on a bad signature (A-S17). DEFAULT_ROOM = "lobby".
+    no_std: false
+    depends_on:
+      - daemonseed_core::circle::key
+      - daemonseed_core::circle::message
+      - daemonseed_core::cot
+      - daemonseed_core::identity::keys
+    iscs:
+      - S4
+      - S22
+      - S24
+      - C57
+      - A-S2
+      - A-S16
+      - A-S17
+
+  - name: daemonseed_core::share_announce
+    description: >-
+      Share-announcement sealing — the in-band replacement for the relay-hosted
+      share registry (design: docs/design/unified-share-model.md), the share-tier
+      analogue of public_room. seal_announcement self-signs a ShareAnnouncement
+      (ML-DSA provenance, C57) then AES-256-GCM seals it under the public room key
+      (public tier, server-readable) or a circle cot_key (members-only); AAD =
+      SHARE_ANNOUNCE_AAD, envelope nonce(12)||ciphertext||tag(16).
+      open_announcement fails closed (Authentication) on a wrong key or any tamper
+      and (Provenance) on a bad signature. Relay-agnostic — the announcement
+      carries share_id (S21), never server_id — so discovery is "listen to the
+      stream" and the relay holds no directory (A-S2, A-S1).
+    no_std: false
+    depends_on:
+      - daemonseed_core::circle::key
+      - daemonseed_core::circle::message
+      - daemonseed_core::identity::keys
+    iscs:
+      - A-S1
+      - A-S2
+      - A-S16
+      - S21
+      - C57
+
   - name: "circle::default_circle_label"
     module: daemonseed_core::circle
     description: >-

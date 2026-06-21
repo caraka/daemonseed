@@ -26,6 +26,10 @@
 //! directory indexing + content-addressed chunk store + the pure manifest/chunk
 //! `answer` step), factored out of the integration test so `cli publish --path`
 //! and the tests drive byte-identical serve logic (ISC-S27 / ISC-S28 / ISC-S29).
+//! The unified share model adds [`share_announce`] — seal/open for the in-band
+//! share-announcement payload that replaces relay-hosted share discovery, the
+//! share-tier analogue of [`public_room`] (design-of-record:
+//! `docs/design/unified-share-model.md`).
 //!
 //! [`ShareContent`]: share_serve::ShareContent
 
@@ -53,6 +57,7 @@ pub mod profile;
 pub mod public_room;
 pub mod public_space;
 pub mod release;
+pub mod share_announce;
 pub mod share_envelope;
 pub mod share_serve;
 pub mod storage;
