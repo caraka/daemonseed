@@ -44,6 +44,9 @@ work lives in the project lead's vault manifest, not here.
   "installed", so nothing did this before. Never silent; honours a "don't ask
   again" choice; `StartupWMClass=daemonseed-gui` matches the window's WM_CLASS so
   the live window inherits the icon (`src/desktop_integration.rs`).
+- The desktop GUI remembers its window size across restarts: the last size is saved
+  on close and restored on launch (size only — position is omitted to avoid landing
+  off-screen on another monitor; an out-of-range saved value is ignored).
 
 ### Changed
 
@@ -64,6 +67,8 @@ work lives in the project lead's vault manifest, not here.
 
 - The circle rail/header no longer shows a stale "not yet connected" placeholder
   that contradicted the live connection state.
+- Keyboard focus is restored when the desktop window regains activation, so
+  typing / Enter survive an app-switch without clicking back into the field (#39).
 
 ## [0.28.0] — GUI auth-input felt-fixes + global font pass (round 2)
 

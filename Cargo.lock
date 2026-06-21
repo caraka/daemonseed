@@ -1256,6 +1256,7 @@ dependencies = [
  "daemonseed-proto",
  "daemonseed-server",
  "dirs",
+ "i-slint-backend-winit",
  "image",
  "oxicrypt-module",
  "oxitls-rustls-provider",

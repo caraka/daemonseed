@@ -18,6 +18,10 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # XDG-correct user dirs (data/config) for first-run desktop integration
 # (src/desktop_integration.rs). Already in the workspace lockfile via daemonseed-core.
 dirs = "5"
+# Direct handle on the winit backend for the focus-restoration hook (#39): re-grab
+# keyboard focus on window activation. Optional + desktop-gated; already in the lock
+# transitively via `slint/backend-winit`, so no new download. Version tracks `slint`.
+i-slint-backend-winit = { version = "1.13", optional = true }
 
 # Real networking (round-3): the GUI lobby wires to a relay by REUSING the proven
 # client stack rather than duplicating security-critical code. `daemonseed-cli`
@@ -75,4 +79,4 @@ default = []
 # winit backend; still software-rendered (no GL dependency). `cargo run -p
 # daemonseed-gui --features desktop` opens a window. Base build (no features) stays
 # offscreen-only so it compiles/verifies from a headless terminal.
-desktop = ["slint/backend-winit"]
+desktop = ["slint/backend-winit", "dep:i-slint-backend-winit"]

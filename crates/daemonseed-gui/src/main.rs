@@ -865,6 +865,57 @@ fn refocus_auth(ui: &AppWindow) {
     });
 }
 
+/// #39: dispatch keyboard focus to the field appropriate for the CURRENT screen, used
+/// when the window regains activation (app-switch) so typing/Enter survive without a
+/// click. Always invoked from inside a `defer()` (off the winit event handler), so the
+/// `invoke_focus_*` calls here are synchronous — same safe pattern as `refocus_auth`'s
+/// deferred body. Desktop-only (the winit hook that calls it is desktop-gated).
+#[cfg(feature = "desktop")]
+fn refocus_active_field(ui: &AppWindow) {
+    match ui.get_screen().as_str() {
+        "first-start" | "unlock" => ui.invoke_focus_auth(),
+        "main" => {
+            if ui.get_join_open() {
+                ui.invoke_focus_join_input();
+            } else if ui.get_active_tab() == 0 {
+                ui.invoke_focus_composer();
+            }
+            // other tabs / overlays carry no text field that needs keyboard focus
+        }
+        _ => {}
+    }
+}
+
+/// Where the last window size is remembered — `$XDG_CONFIG_HOME/daemonseed/window-size`,
+/// a one-line `WIDTHxHEIGHT` (physical px). A plain file, not the profile/redb store:
+/// it is a non-secret UI convenience, independent of identity.
+#[cfg(feature = "desktop")]
+fn window_size_path() -> Option<std::path::PathBuf> {
+    dirs::config_dir().map(|c| c.join("daemonseed").join("window-size"))
+}
+
+/// Last saved window size, or None if absent/unparseable/out-of-sane-range. The clamp
+/// (≥ the 720x480 min, ≤ 8K) drops an absurd value saved on another monitor so we fall
+/// back to the default rather than restore something unusable.
+#[cfg(feature = "desktop")]
+fn load_window_size() -> Option<(u32, u32)> {
+    let s = std::fs::read_to_string(window_size_path()?).ok()?;
+    let (w, h) = s.trim().split_once('x')?;
+    let (w, h) = (w.parse::<u32>().ok()?, h.parse::<u32>().ok()?);
+    ((720..=7680).contains(&w) && (480..=4320).contains(&h)).then_some((w, h))
+}
+
+/// Persist the window size (best-effort; a missing config dir is created).
+#[cfg(feature = "desktop")]
+fn save_window_size(w: u32, h: u32) {
+    if let Some(p) = window_size_path() {
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(p, format!("{w}x{h}"));
+    }
+}
+
 /// Everything the running app must keep alive for its whole lifetime. **If this
 /// (or the `Timer` / `NetHandle` inside it) drops, the event drain and the net
 /// thread silently die while the build still passes** — so it is held until
@@ -1756,6 +1807,47 @@ fn main() {
         // First-run: offer to self-register the .desktop + icon (AppImage only, not yet
         // integrated, not declined). The overlay defers itself to the main screen.
         ui.set_desktop_prompt_open(desktop_integration::should_prompt());
+        // #39: re-grab keyboard focus when the window regains activation, so input
+        // survives an app-switch. Slint exposes no window `active` property to .slint,
+        // so this lives at the winit backend. defer() the refocus off the event handler
+        // to avoid re-entering the focus machinery synchronously.
+        {
+            use i_slint_backend_winit::winit::event::WindowEvent;
+            use i_slint_backend_winit::{EventResult, WinitWindowAccessor};
+            // Restore the last window size (size only — the WM constrains an oversized
+            // value, and omitting position avoids landing off-screen on a different
+            // monitor; load_window_size() sanity-clamps absurd values).
+            if let Some((w, h)) = load_window_size() {
+                ui.window().set_size(slint::PhysicalSize::new(w, h));
+            }
+            let weak = ui.as_weak();
+            // Latest size, persisted once on close (one write per session, no disk churn
+            // during a drag-resize).
+            let last_size = std::rc::Rc::new(std::cell::Cell::new(None::<(u32, u32)>));
+            ui.window().on_winit_window_event(move |_w, event| {
+                match event {
+                    // #39: re-grab keyboard focus on activation so input survives an
+                    // app-switch. defer() off the handler to avoid re-entering the focus
+                    // machinery synchronously.
+                    WindowEvent::Focused(true) => {
+                        let weak = weak.clone();
+                        defer(move || {
+                            if let Some(ui) = weak.upgrade() {
+                                refocus_active_field(&ui);
+                            }
+                        });
+                    }
+                    WindowEvent::Resized(sz) => last_size.set(Some((sz.width, sz.height))),
+                    WindowEvent::CloseRequested => {
+                        if let Some((w, h)) = last_size.get() {
+                            save_window_size(w, h);
+                        }
+                    }
+                    _ => {}
+                }
+                EventResult::Propagate
+            });
+        }
         ui.run().expect("run windowed");
         return;
     }
