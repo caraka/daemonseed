@@ -771,9 +771,13 @@ fn pick_dir_and_fetch(net: &Rc<RefCell<NetHandle>>, target: FetchTarget) {
         else {
             return;
         };
+        let mut dialog = rfd::AsyncFileDialog::new().set_title(title);
+        // Default the destination to the OS Downloads folder, not $HOME.
+        if let Some(downloads) = dirs::download_dir() {
+            dialog = dialog.set_directory(downloads);
+        }
         let chosen = rt.block_on(async {
-            rfd::AsyncFileDialog::new()
-                .set_title(title)
+            dialog
                 .pick_folder()
                 .await
                 .map(|handle| handle.path().to_path_buf())

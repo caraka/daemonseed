@@ -80,6 +80,12 @@ work lives in the project lead's vault manifest, not here.
 - A long phrase/name in the circle-join and Publish-name fields is clipped to its
   box instead of overrunning to the window edge (the same `clip` fix the auth
   inputs already carry).
+- A publisher's own shares now appear in their own Shares list, not only on other
+  clients — own shares are merged into the snapshot since the relay never echoes
+  an announcement back to its sender. (#53)
+- The download folder picker defaults to the OS Downloads folder instead of `$HOME`.
+- The chat composer regains focus when the circle-join dialog is closed (Esc or
+  Close).
 
 ## [0.28.0] — GUI auth-input felt-fixes + global font pass (round 2)
 

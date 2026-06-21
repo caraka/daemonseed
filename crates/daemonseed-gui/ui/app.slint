@@ -413,6 +413,7 @@ export component AppWindow inherits Window {
                 root.palette-open = false;
                 root.join-open = false;
                 root.new-open = false;
+                root.focus-composer();
                 return accept;
             }
             return reject;
@@ -719,7 +720,7 @@ export component AppWindow inherits Window {
             HorizontalLayout {
                 Text { text: "Join a circle"; color: #e4e8ee; font-size: 17px; }
                 Rectangle { }
-                PillButton { label: "Close"; w: 70px; clicked => { root.join-open = false; } }
+                PillButton { label: "Close"; w: 70px; clicked => { root.join-open = false; root.focus-composer(); } }
             }
             Text { text: "Enter the phrase you were given."; color: #8b93a1; font-size: 13px; }
 

@@ -1074,6 +1074,9 @@ impl Actor {
             rating,
             sharer_handle,
         });
+        // Reflect the new own-share in our own Shares list immediately — the relay
+        // never echoes our own announcement back, so the local catalog never sees it.
+        self.emit_shares_snapshot();
 
         // Serve from disk for the life of the session via `spawn_local` (like the
         // circle inbound readers). A natural end emits `PublishStopped`; an explicit
@@ -1123,6 +1126,8 @@ impl Actor {
         self.own_shares
             .borrow_mut()
             .retain(|s| s.share_id != share_id);
+        // Drop it from our own Shares list immediately too.
+        self.emit_shares_snapshot();
         self.emit(NetEvent::PublishStopped {
             share_id: share_id.to_owned(),
         });
@@ -1246,16 +1251,33 @@ impl Actor {
     /// ([`wire::PublicShareListing`]) so the UI surface is unchanged from the
     /// retired `ListPublicShares` path.
     fn catalog_listings(&self) -> Vec<wire::PublicShareListing> {
-        self.share_catalog
-            .entries()
-            .into_iter()
-            .map(|s| wire::PublicShareListing {
-                share_id: s.share_id,
-                name: s.name,
-                rating: s.rating,
-                sharer_handle: s.sender_handle,
-            })
-            .collect()
+        // Own shares are never reflected back by the relay, so they never enter the
+        // received-announcement catalog — merge them in first (deduped by share_id)
+        // so a publisher sees their own shares in their own Shares list, not only on
+        // other clients.
+        let mut seen = std::collections::HashSet::new();
+        let mut out: Vec<wire::PublicShareListing> = Vec::new();
+        for own in self.own_shares.borrow().iter() {
+            if seen.insert(own.share_id.clone()) {
+                out.push(wire::PublicShareListing {
+                    share_id: own.share_id.clone(),
+                    name: own.name.clone(),
+                    rating: own.rating.clone(),
+                    sharer_handle: own.sharer_handle.clone(),
+                });
+            }
+        }
+        for s in self.share_catalog.entries() {
+            if seen.insert(s.share_id.clone()) {
+                out.push(wire::PublicShareListing {
+                    share_id: s.share_id,
+                    name: s.name,
+                    rating: s.rating,
+                    sharer_handle: s.sender_handle,
+                });
+            }
+        }
+        out
     }
 
     /// The single late-join hook (unified share model): post a roll-call so every
