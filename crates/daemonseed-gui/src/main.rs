@@ -25,6 +25,7 @@
 //! `--show-shares` / `--show-publish` render the Shares-tab browse tree / the Publish
 //! overlay (with a fixture share set, no relay).
 
+mod desktop_integration;
 mod net;
 mod profile;
 mod share_browser;
@@ -604,6 +605,39 @@ fn build_ui() -> BuiltUi {
             pick_dir_and_publish(&net, name.to_string(), sharer_handle);
         }
     });
+    // First-run desktop integration: register / decline the .desktop + icon. install()
+    // is a few small file writes + best-effort cache refresh (synchronous); on success
+    // the prompt shows a ✓ then closes after a beat. See desktop_integration.rs.
+    ui.on_desktop_integrate({
+        let weak = ui.as_weak();
+        move || {
+            let ui = weak.unwrap();
+            match desktop_integration::install() {
+                Ok(msg) => {
+                    ui.set_desktop_prompt_status(SharedString::from(format!("{msg} ✓")));
+                    let w2 = ui.as_weak();
+                    slint::Timer::single_shot(Duration::from_millis(1400), move || {
+                        if let Some(ui) = w2.upgrade() {
+                            ui.set_desktop_prompt_open(false);
+                        }
+                    });
+                }
+                Err(e) => {
+                    ui.set_desktop_prompt_status(SharedString::from(format!("Couldn't add: {e}")));
+                }
+            }
+        }
+    });
+    ui.on_desktop_dismiss({
+        let weak = ui.as_weak();
+        move |remember| {
+            let ui = weak.unwrap();
+            if remember {
+                desktop_integration::mark_declined();
+            }
+            ui.set_desktop_prompt_open(false);
+        }
+    });
     // Unpublish a share published this session (owner-scoped, ISC-A-S1). The relay
     // confirms with `PublishStopped`, which drops it from the list + (on next poll) the
     // tree.
@@ -1099,7 +1133,22 @@ fn apply_net_event(
                 persist_err.as_deref(),
             );
             ui.set_publish_status(SharedString::from(msg.clone()));
-            ui.set_share_status(SharedString::from(msg));
+            ui.set_share_status(SharedString::from(msg.clone()));
+            // Felt-test 2026-06-21: a restore must be visible from the Chat landing
+            // view, not Shares-tab-only (share-status). Tab-independent banner shows
+            // "Restored N shares…" wherever the user lands, then auto-dismisses after a
+            // brief read (effortless motif: comes and goes on startup). 6s sits in the
+            // GNOME toast / Material Snackbar-LONG range for a short informational line.
+            // The ✕ still allows an early manual dismiss.
+            if restored {
+                ui.set_connect_notice(SharedString::from(msg));
+                let ui_weak = ui.as_weak();
+                slint::Timer::single_shot(Duration::from_secs(6), move || {
+                    if let Some(ui) = ui_weak.upgrade() {
+                        ui.set_connect_notice(SharedString::from(""));
+                    }
+                });
+            }
         }
         // PublishStopped fires on user unpublish, session end, AND relay reap — so it
         // only drops the session list; it must NOT forget the persisted root (that
@@ -1577,6 +1626,34 @@ fn main() {
         unsafe { std::env::remove_var("WAYLAND_DISPLAY") };
     }
 
+    // Headless desktop-integration management (scriptable; the same work the first-run
+    // prompt does interactively). These register/remove the .desktop + icon and exit
+    // without opening a window.
+    if args.iter().any(|a| a == "--install") {
+        match desktop_integration::install() {
+            Ok(m) => {
+                println!("{m}");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("desktop integration failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if args.iter().any(|a| a == "--remove") {
+        match desktop_integration::remove() {
+            Ok(m) => {
+                println!("{m}");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("desktop integration removal failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     let mut screenshot: Option<String> = None;
     let mut switch: Option<i32> = None;
     let mut scroll: Option<f32> = None;
@@ -1594,6 +1671,7 @@ fn main() {
     // tree without a live connection.
     let show_shares = args.iter().any(|a| a == "--show-shares");
     let show_publish = args.iter().any(|a| a == "--show-publish");
+    let show_desktop_prompt = args.iter().any(|a| a == "--show-desktop-prompt");
     // Round-6 routing: `--portable` resolves the profile under CWD (else XDG).
     // `--first-start [step]` / `--unlock` are OFFSCREEN-only render flags for the
     // new auth screens (windowed routing always uses `resolve`). `portable` feeds
@@ -1624,6 +1702,7 @@ fn main() {
         || show_joined_label
         || show_shares
         || show_publish
+        || show_desktop_prompt
         || first_start_flag
         || unlock_flag
         || self_check_requested;
@@ -1674,6 +1753,9 @@ fn main() {
         // the auth-success callbacks (no connecting under the auth gate).
         let _live = start_drain(&ui, state, net, browser);
         route_startup(&ui, &profile_root, portable);
+        // First-run: offer to self-register the .desktop + icon (AppImage only, not yet
+        // integrated, not declined). The overlay defers itself to the main screen.
+        ui.set_desktop_prompt_open(desktop_integration::should_prompt());
         ui.run().expect("run windowed");
         return;
     }
@@ -1815,6 +1897,10 @@ fn main() {
             "Published \u{201c}trip-photos\u{201d} · 42 file(s)",
         ));
         ui.set_publish_open(true);
+    } else if show_desktop_prompt {
+        // Offscreen render of the first-run "add to applications?" prompt (main screen).
+        ui.set_screen(SharedString::from("main"));
+        ui.set_desktop_prompt_open(true);
     } else {
         // Main shell offscreen: connect (renders connection-status) + drive flags.
         _live = Some(start_drain(

@@ -321,13 +321,16 @@ impl GuiState {
             .unwrap_or_else(|| "●".to_owned());
         let circle = CircleState {
             name: fp,
-            // PLACEHOLDER — caraka security review: the secondary/header lines are
-            // operator-facing trust copy (brief refinement #3, D6). No bit numbers
-            // (ISC-45). Round 5 replaces "not yet connected" with the live state.
-            sub: "sealed · not yet connected".to_owned(),
+            // Operator-facing trust copy (brief refinement #3, D6). No bit numbers
+            // (ISC-45). The old "· not yet connected" was a placeholder that never got
+            // the live-state wiring (felt-test 2026-06-21: it contradicted the live
+            // header status on a circle whose chat works) — dropped. Live per-circle
+            // connection state is the Round-5 item; the header `connection-status`
+            // property already carries the truthful live state.
+            sub: "end-to-end encrypted".to_owned(),
             initial,
             pinned: false,
-            header_sub: "end-to-end sealed · not yet connected".to_owned(),
+            header_sub: "end-to-end encrypted".to_owned(),
             messages: Vec::new(),
             draft: String::new(),
             scroll_y: 0.0,
@@ -524,26 +527,26 @@ impl GuiState {
             ),
             mk(
                 "midnight-signal",
-                "4 here · sealed",
+                "4 here · encrypted",
                 "m",
                 false,
-                "4 here · end-to-end sealed",
+                "4 here · end-to-end encrypted",
                 fill("midnight-signal", 24, "wandering-otter"),
             ),
             mk(
                 "garden-fence",
-                "2 here · sealed",
+                "2 here · encrypted",
                 "g",
                 false,
-                "2 here · sealed · neighbours",
+                "2 here · encrypted · neighbours",
                 fill("garden-fence", 5, "quiet-sparrow"),
             ),
             mk(
                 "harbor-lights",
-                "3 here · sealed",
+                "3 here · encrypted",
                 "h",
                 false,
-                "3 here · sealed · waterfront",
+                "3 here · encrypted · waterfront",
                 fill("harbor-lights", 4, "dock-keeper"),
             ),
         ];

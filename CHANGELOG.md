@@ -37,6 +37,13 @@ work lives in the project lead's vault manifest, not here.
   (`PublishedShare { root, name }`; core slice — no naming UI yet).
 - "Restored N shares from last session" label on the connect-time
   auto-republish path, distinguishing a restore from a fresh publish.
+- First-run desktop integration: an opt-in prompt ("Add Daemonseed to your
+  applications?") plus `--install` / `--remove` CLI flags self-register an XDG
+  `.desktop` entry + hicolor icons (256px PNG + scalable SVG), so the app menu /
+  dock resolve a real icon across desktop environments. AppImages are not
+  "installed", so nothing did this before. Never silent; honours a "don't ask
+  again" choice; `StartupWMClass=daemonseed-gui` matches the window's WM_CLASS so
+  the live window inherits the icon (`src/desktop_integration.rs`).
 
 ### Changed
 
@@ -45,6 +52,18 @@ work lives in the project lead's vault manifest, not here.
   (`PublishedShare.name`), threaded through the restore path; it falls back to
   the root directory basename when unset. The name-a-share UI that would set a
   non-default name remains a follow-up.
+- User-facing "sealed" → "encrypted" in all GUI trust copy (the E2EE pill and
+  the end-to-end-encrypted lines).
+- Session-restore notice ("Restored N shares…") now shows as a tab-independent,
+  auto-dismissing banner on the landing (Chat) view, not only on the Shares tab.
+- Desktop GUI window title is now "Daemonseed" (was the toolkit default).
+- The AppImage recipe now emits a 256px raster PNG + a top-level `.DirIcon` (was
+  scalable-SVG only) — what desktop integrators and the dock actually read.
+
+### Fixed
+
+- The circle rail/header no longer shows a stale "not yet connected" placeholder
+  that contradicted the live connection state.
 
 ## [0.28.0] — GUI auth-input felt-fixes + global font pass (round 2)
 

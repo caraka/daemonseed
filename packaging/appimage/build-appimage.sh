@@ -62,6 +62,30 @@ install -m 0644 "${HERE}/${BIN}.desktop"            "${APPDIR}/usr/share/applica
 install -m 0644 "${HERE}/${BIN}.svg"                "${APPDIR}/${BIN}.svg"
 install -m 0644 "${HERE}/${BIN}.svg"                "${APPDIR}/usr/share/icons/hicolor/scalable/apps/${BIN}.svg"
 
+# Ubuntu/GNOME's dash does not reliably render a scalable-only app icon, and AppImage
+# desktop integration reads a top-level .DirIcon — neither was present, the classic
+# "AppImage shows no icon on the Ubuntu dash" gap (felt-test 2026-06-21). Provide a
+# sized raster PNG in the extra places that actually get read: a 256x256 hicolor PNG,
+# a root-level PNG matching Icon=, and the .DirIcon at the AppDir root.
+ICON_PNG_DIR="${APPDIR}/usr/share/icons/hicolor/256x256/apps"
+mkdir -p "${ICON_PNG_DIR}"
+ICON_PNG="${ICON_PNG_DIR}/${BIN}.png"
+if command -v rsvg-convert >/dev/null 2>&1; then
+  rsvg-convert -w 256 -h 256 "${HERE}/${BIN}.svg" -o "${ICON_PNG}"
+elif command -v magick >/dev/null 2>&1; then
+  magick -background none -density 384 "${HERE}/${BIN}.svg" -resize 256x256 "${ICON_PNG}"
+elif command -v convert >/dev/null 2>&1; then
+  convert -background none -density 384 "${HERE}/${BIN}.svg" -resize 256x256 "${ICON_PNG}"
+else
+  log "no SVG rasterizer (rsvg-convert/magick/convert) — falling back to SVG .DirIcon (Ubuntu dash may still show no icon)"
+fi
+if [ -f "${ICON_PNG}" ]; then
+  install -m 0644 "${ICON_PNG}" "${APPDIR}/${BIN}.png"   # root-level raster PNG matching Icon=
+  install -m 0644 "${ICON_PNG}" "${APPDIR}/.DirIcon"     # AppImage integration / dash icon
+else
+  install -m 0644 "${HERE}/${BIN}.svg" "${APPDIR}/.DirIcon"
+fi
+
 mkdir -p "${OUT_DIR}"
 OUT_FILE="${OUT_DIR}/${BIN}-x86_64.AppImage"
 log "packaging → ${OUT_FILE}"

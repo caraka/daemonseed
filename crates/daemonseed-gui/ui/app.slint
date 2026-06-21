@@ -91,9 +91,9 @@ component RailRow inherits Rectangle {
 }
 
 component SealedPill inherits Rectangle {
-    width: 58px; height: 20px; border-radius: 10px;
+    width: 80px; height: 20px; border-radius: 10px;
     background: #11302b; border-width: 1px; border-color: #1f4d45;
-    Text { text: "sealed"; color: #6fb3a4; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
+    Text { text: "encrypted"; color: #6fb3a4; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
 }
 
 // The quiet "Looks strong" reassurance (brief D3 — a calm cue, NEVER a numeric
@@ -222,6 +222,7 @@ export component AppWindow inherits Window {
     // scalable placeholder (packaging/appimage/daemonseed-gui.svg) so the
     // windowed app and the AppImage share one mark; aesthetic refinement is a
     // separate pass. The .slint compiler bundles this asset into the binary.
+    title: "Daemonseed";
     icon: @image-url("daemonseed-gui.png");
 
     in property <[CircleData]> circles;
@@ -258,6 +259,9 @@ export component AppWindow inherits Window {
     in-out property <string> publish-name;         // optional share name (blank → folder basename)
     in property <[MyShareRow]> my-shares;          // Rust-set: shares published this session
     in-out property <string> publish-status;       // overlay feedback: "Publishing…" / result / error
+    in-out property <string> connect-notice;       // tab-independent banner: "Restored N shares…" on connect
+    in-out property <bool> desktop-prompt-open: false; // first-run "add to applications?" prompt (AppImage only)
+    in-out property <string> desktop-prompt-status;    // result line inside that prompt
     in-out property <string> join-phrase;          // live Join phrase (two-way to Rust)
     in property <bool> join-phrase-strong: false;  // Rust-set: estimate_circle().is_circle_green()
     in-out property <string> new-phrase;           // generated default; EDITABLE (two-way to Rust)
@@ -294,6 +298,8 @@ export component AppWindow inherits Window {
     callback open-publish();
     callback submit-publish(string);
     callback unpublish-share(string);
+    callback desktop-integrate();          // first-run: register the .desktop + icon
+    callback desktop-dismiss(bool);        // close the prompt; true = "don't ask again"
 
     // Round-4 callbacks. `open-*` raise the overlays from EITHER surface (rail
     // empty-state or palette — action registry → two surfaces). `join-phrase-edited`
@@ -513,6 +519,23 @@ export component AppWindow inherits Window {
                 }
                 Rectangle { height: 1px; background: #ffffff10; }
 
+                // Restore notice — tab-INDEPENDENT so it is seen from the Chat landing
+                // view (felt-test 2026-06-21: was Shares-tab-only via share-status →
+                // the user lands on Chat and never saw it). Persists until dismissed; no timeout.
+                if root.connect-notice != "" : Rectangle {
+                    height: 30px; background: #11302b; border-width: 1px; border-color: #1f4d45;
+                    HorizontalLayout {
+                        padding-left: 16px; padding-right: 12px; spacing: 10px;
+                        Text { text: root.connect-notice; color: #6fb3a4; font-size: 12px; vertical-alignment: center; }
+                        Rectangle { }
+                        TouchArea {
+                            width: 22px;
+                            Text { text: "✕"; color: #6fb3a4; font-size: 12px; horizontal-alignment: center; vertical-alignment: center; }
+                            clicked => { root.connect-notice = ""; }
+                        }
+                    }
+                }
+
                 // body — content region swaps by tab; composer bar is ALWAYS
                 // instantiated (so it is a stable autofocus target) but shown only
                 // on the Chat tab.
@@ -591,7 +614,7 @@ export component AppWindow inherits Window {
                                         alignment: center; spacing: 8px;
                                         Text { text: "Circle shares"; color: #aeb6c2; font-size: 18px; horizontal-alignment: center; }
                                         Text { text: "work in progress · coming soon"; color: #5b6472; font-size: 13px; horizontal-alignment: center; }
-                                        Text { text: "End-to-end-sealed sharing inside a circle."; color: #3f4651; font-size: 12px; horizontal-alignment: center; }
+                                        Text { text: "End-to-end-encrypted sharing inside a circle."; color: #3f4651; font-size: 12px; horizontal-alignment: center; }
                                     }
                                 }
                             }
@@ -648,7 +671,7 @@ export component AppWindow inherits Window {
         VerticalLayout {
             padding: 16px; spacing: 10px; alignment: start;
             Text { text: "Circle details"; color: #e4e8ee; font-size: 15px; }
-            Text { text: "end-to-end sealed"; color: #6fb3a4; font-size: 12px; }
+            Text { text: "end-to-end encrypted"; color: #6fb3a4; font-size: 12px; }
             Text { text: "members — identity only, no presence"; color: #5b6472; font-size: 12px; }
         }
     }
@@ -754,7 +777,7 @@ export component AppWindow inherits Window {
                     // this card are a security-reviewed artifact (brief refinement #3,
                     // D6). Wording is NOT improvised unattended; these lines are
                     // structural stand-ins to be replaced with verified claims.
-                    Text { text: "End-to-end sealed · only people with this phrase can read it."; color: #6fb3a4; font-size: 12px; }
+                    Text { text: "End-to-end encrypted · only people with this phrase can read it."; color: #6fb3a4; font-size: 12px; }
                     Text { text: "[PLACEHOLDER — caraka security review: relay-exposure sentence]"; color: #5b6472; font-size: 11px; }
                     Text { text: "[PLACEHOLDER — caraka security review: \"N others\" only on a trusted relay]"; color: #5b6472; font-size: 11px; }
                 }
@@ -767,6 +790,39 @@ export component AppWindow inherits Window {
                     label: "Enter the circle"; primary: true; w: 160px;
                     clicked => { root.submit-join(root.join-phrase); }
                 }
+            }
+        }
+    }
+
+    // ── First-run desktop-integration prompt (self-register .desktop + icon) ──
+    // Shown only on the main screen and only when Rust flips desktop-prompt-open
+    // (launched from an AppImage, not yet integrated, not declined). The whole reason
+    // this exists: AppImages aren't "installed", so the dock shows a generic icon until
+    // a .desktop is registered. See src/desktop_integration.rs (universal / XDG).
+    desktop-prompt := Rectangle {
+        x: (root.width - self.width) / 2; y: 90px;
+        width: 460px; height: 224px;
+        visible: root.desktop-prompt-open && root.screen == "main";
+        background: #0e0f11; border-radius: 12px; border-width: 1px; border-color: #ffffff18;
+        VerticalLayout {
+            padding: 20px; spacing: 12px; alignment: start;
+            Text { text: "Add Daemonseed to your applications?"; color: #e4e8ee; font-size: 16px; }
+            Text {
+                text: "Adds it to your app menu and dock with its icon. You can undo this anytime; nothing else is installed.";
+                color: #8b93a1; font-size: 13px; wrap: word-wrap;
+            }
+            Text {
+                text: root.desktop-prompt-status;
+                color: #6fb3a4; font-size: 12px;
+                visible: root.desktop-prompt-status != "";
+            }
+            Rectangle { }
+            HorizontalLayout {
+                spacing: 8px;
+                PillButton { label: "Not now"; w: 88px; clicked => { root.desktop-dismiss(false); } }
+                PillButton { label: "Don't ask again"; w: 140px; clicked => { root.desktop-dismiss(true); } }
+                Rectangle { }
+                PillButton { label: "Add"; primary: true; w: 80px; clicked => { root.desktop-integrate(); } }
             }
         }
     }
