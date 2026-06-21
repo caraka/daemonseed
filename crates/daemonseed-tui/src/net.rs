@@ -40,7 +40,7 @@ use daemonseed_cli::public_space::{
 };
 use daemonseed_cli::session::AppSession;
 use daemonseed_core::backoff::{Backoff, CloseCause};
-use daemonseed_core::circle::key::{CotKey, derive_cot_key};
+use daemonseed_core::circle::key::{CircleKey, derive_cot_key};
 use daemonseed_core::circle::message::{open_message, seal_message};
 use daemonseed_core::cot::public_share_asset_address;
 use daemonseed_core::cot::{AssetAddr, asset_address};
@@ -51,7 +51,8 @@ use daemonseed_core::federation::store::{InMemoryTrustStore, ServerEntry, TrustS
 use daemonseed_core::handle::{DisplayMode, Handle};
 use daemonseed_core::indexer::{CachedHashError, cached_or_hash, reconcile_into};
 use daemonseed_core::public_room::{
-    DEFAULT_ROOM, derive_room_key, open_room_message, room_asset_address, seal_room_message,
+    DEFAULT_ROOM, PublicRoomKey, derive_room_key, open_room_message, room_asset_address,
+    seal_room_message,
 };
 use daemonseed_core::share_envelope::{ManifestEntry, ShareFrame};
 use daemonseed_core::share_serve::{
@@ -601,7 +602,7 @@ struct Circle {
     /// Client-local display label (ISC-C62). Generated at join (adj-noun default,
     /// `#<hex>` floor); never transmitted, never derived from other members.
     label: String,
-    cot_key: Rc<CotKey>,
+    cot_key: Rc<CircleKey>,
     asset_addr: AssetAddr,
     out_tx: mpsc::Sender<wire::CotFrame>,
 }
@@ -615,7 +616,7 @@ struct PublicRoom {
     room: String,
     /// The global shared room key — derived from public inputs, so every
     /// client and the relay hold it (ISC-S22). Reused for AEAD seal/open.
-    room_key: Rc<CotKey>,
+    room_key: Rc<PublicRoomKey>,
     asset_addr: AssetAddr,
     out_tx: mpsc::Sender<wire::CotFrame>,
 }
@@ -2294,7 +2295,7 @@ impl Actor {
 async fn read_inbound(
     mut inbound: tonic::Streaming<wire::CotFrame>,
     circle_id: u64,
-    cot_key: Rc<CotKey>,
+    cot_key: Rc<CircleKey>,
     evt_tx: mpsc::UnboundedSender<NetEvent>,
 ) {
     loop {
@@ -2327,7 +2328,7 @@ async fn read_inbound(
 /// surfaced. Returns when the stream ends.
 async fn read_inbound_public_room(
     mut inbound: tonic::Streaming<wire::CotFrame>,
-    room_key: Rc<CotKey>,
+    room_key: Rc<PublicRoomKey>,
     evt_tx: mpsc::UnboundedSender<NetEvent>,
 ) {
     loop {

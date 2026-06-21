@@ -62,28 +62,45 @@ pub const EXAMPLE_ENTROPY: &str = "correct horse battery staple";
 /// A derived circle-of-trust symmetric key. Zeroes on drop; `Debug` is
 /// redacted so it never lands in a log surface (ISC-A-C1).
 #[derive(zeroize::ZeroizeOnDrop)]
-pub struct CotKey(Box<[u8; COT_KEY_LEN]>);
+pub struct CircleKey(Box<[u8; COT_KEY_LEN]>);
 
-impl CotKey {
+impl CircleKey {
     /// Borrow the raw key bytes for AEAD use. Callers must not copy these
     /// into a non-zeroizing buffer.
     pub fn as_bytes(&self) -> &[u8; COT_KEY_LEN] {
         &self.0
     }
 
-    /// Wrap raw key bytes into a zeroizing [`CotKey`]. Used by the public-room
-    /// key derivation ([`crate::public_room::derive_room_key`]), which builds a
-    /// *global* symmetric key from public inputs but reuses the same AEAD
-    /// plumbing as a circle. The caller zeroes its own copy of `bytes` after
-    /// this call (the boxed copy here zeroes on drop).
+    /// Wrap raw key bytes into a zeroizing [`CircleKey`] (e.g. reconstructing a
+    /// circle key from at-rest storage). The caller zeroes its own copy of
+    /// `bytes` after this call (the boxed copy here zeroes on drop).
     pub fn from_bytes(bytes: [u8; COT_KEY_LEN]) -> Self {
-        CotKey(Box::new(bytes))
+        CircleKey(Box::new(bytes))
     }
 }
 
-impl core::fmt::Debug for CotKey {
+impl core::fmt::Debug for CircleKey {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("CotKey(<redacted>)")
+        f.write_str("CircleKey(<redacted>)")
+    }
+}
+
+/// A 32-byte AEAD key, abstracted so a *decrypt/open* path can accept either
+/// tier's key — a [`CircleKey`] or a [`crate::public_room::PublicRoomKey`] —
+/// without the two becoming substitutable at a *seal* site. Sealing is
+/// type-split per tier (a circle payload can only be sealed with a `CircleKey`,
+/// a public payload only with a `PublicRoomKey` — the wrong one is a compile
+/// error, the key-class guard); opening is tier-agnostic because a wrong key
+/// merely fails AEAD authentication with no confidentiality loss.
+pub trait AeadKey256 {
+    /// The raw 32-byte key for AEAD use. Callers must not copy it into a
+    /// non-zeroizing buffer.
+    fn aead_key_bytes(&self) -> &[u8; COT_KEY_LEN];
+}
+
+impl AeadKey256 for CircleKey {
+    fn aead_key_bytes(&self) -> &[u8; COT_KEY_LEN] {
+        self.as_bytes()
     }
 }
 
@@ -108,7 +125,7 @@ impl core::error::Error for CircleKeyError {}
 /// (ISC-C8). `entropy` is raw text; it is canonicalized (ISC-C9) internally
 /// so every member who agrees on the same phrase — regardless of incidental
 /// whitespace or Unicode form — derives the byte-identical key.
-pub fn derive_cot_key(entropy: &str, suite: &Suite) -> Result<CotKey, CircleKeyError> {
+pub fn derive_cot_key(entropy: &str, suite: &Suite) -> Result<CircleKey, CircleKeyError> {
     // ISC-C9: canonicalize so members agreeing on the same phrase — modulo
     // incidental whitespace / Unicode form — derive the identical key. The
     // canonical form is secret-adjacent, so zero it the moment HKDF-Extract
@@ -129,7 +146,7 @@ pub fn derive_cot_key(entropy: &str, suite: &Suite) -> Result<CotKey, CircleKeyE
     }
     let boxed = Box::new(key);
     key.zeroize();
-    Ok(CotKey(boxed))
+    Ok(CircleKey(boxed))
 }
 
 /// Length of the hex fingerprint body (excluding the leading `#`). 12 hex chars
@@ -247,6 +264,6 @@ mod tests {
     fn debug_is_redacted() {
         let _ = oxicrypt_module::initialize();
         let k = derive_cot_key("some entropy phrase here", &CNSA_2_0).unwrap();
-        assert_eq!(format!("{k:?}"), "CotKey(<redacted>)");
+        assert_eq!(format!("{k:?}"), "CircleKey(<redacted>)");
     }
 }

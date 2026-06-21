@@ -50,7 +50,7 @@ use oxicrypt_sha::sha384;
 use prost::Message;
 use zeroize::Zeroize;
 
-use crate::circle::key::{COT_KEY_LEN, CotKey};
+use crate::circle::key::{AeadKey256, COT_KEY_LEN};
 use crate::circle::message::{NONCE_LEN, TAG_LEN};
 use crate::cot::{ASSET_ADDR_LEN, AssetAddr};
 use crate::crypto::suite::Suite;
@@ -74,6 +74,43 @@ pub const ROOM_MESSAGE_AAD: &[u8] = b"daemonseed/public-room/message/v1";
 /// any other ML-DSA-87 signature daemonseed produces.
 pub const ROOM_PROVENANCE_DOMAIN: &[u8] = b"daemonseed/public-room/message/v1";
 
+/// A derived public-room key — the global, server-readable AEAD key for a public
+/// room (ISC-S22). A **distinct type** from [`crate::circle::key::CircleKey`] so
+/// the two can never be substituted at a seal site (the key-class guard): a
+/// public payload can only be sealed with a `PublicRoomKey` and a circle payload
+/// only with a `CircleKey` — the wrong one is a compile error. Both implement
+/// [`AeadKey256`], so a tier-agnostic *open* path can still accept either (a
+/// wrong key merely fails AEAD authentication, no confidentiality loss). Zeroes
+/// on drop; `Debug` is redacted (ISC-A-C1).
+#[derive(zeroize::ZeroizeOnDrop)]
+pub struct PublicRoomKey(Box<[u8; COT_KEY_LEN]>);
+
+impl PublicRoomKey {
+    /// Borrow the raw key bytes for AEAD use. Callers must not copy these into a
+    /// non-zeroizing buffer.
+    pub fn as_bytes(&self) -> &[u8; COT_KEY_LEN] {
+        &self.0
+    }
+
+    /// Wrap raw key bytes into a zeroizing `PublicRoomKey`. The caller zeroes its
+    /// own copy of `bytes` after this call (the boxed copy here zeroes on drop).
+    pub fn from_bytes(bytes: [u8; COT_KEY_LEN]) -> Self {
+        PublicRoomKey(Box::new(bytes))
+    }
+}
+
+impl core::fmt::Debug for PublicRoomKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("PublicRoomKey(<redacted>)")
+    }
+}
+
+impl AeadKey256 for PublicRoomKey {
+    fn aead_key_bytes(&self) -> &[u8; COT_KEY_LEN] {
+        self.as_bytes()
+    }
+}
+
 /// Derive the **global shared** key for a public room (ISC-S22).
 ///
 /// ```text
@@ -86,9 +123,9 @@ pub const ROOM_PROVENANCE_DOMAIN: &[u8] = b"daemonseed/public-room/message/v1";
 /// Every input is public, so this is reproducible by every client and by the
 /// relay — the room is server-readable by design (ISC-A-S2 public tier). The
 /// derivation is family-anchored exactly like a circle key, so within-family
-/// suite ratchets leave the room key unchanged. Returns a [`CotKey`] purely to
+/// suite ratchets leave the room key unchanged. Returns a [`PublicRoomKey`] purely to
 /// reuse the existing AEAD plumbing — it is a *global* key, not a circle secret.
-pub fn derive_room_key(room: &str, suite: &Suite) -> Result<CotKey, RoomKeyError> {
+pub fn derive_room_key(room: &str, suite: &Suite) -> Result<PublicRoomKey, RoomKeyError> {
     // The IKM is the public family token — a public room has no secret IKM. The
     // per-room distinguisher rides entirely in the `info` string.
     let family = suite.family_token();
@@ -101,7 +138,7 @@ pub fn derive_room_key(room: &str, suite: &Suite) -> Result<CotKey, RoomKeyError
         key.zeroize();
         return Err(RoomKeyError::Hkdf(e));
     }
-    let out = CotKey::from_bytes(key);
+    let out = PublicRoomKey::from_bytes(key);
     key.zeroize();
     Ok(out)
 }
@@ -113,7 +150,10 @@ pub fn derive_room_key(room: &str, suite: &Suite) -> Result<CotKey, RoomKeyError
 /// room key is public, the relay can compute this address too — but it does not
 /// need to: the relay routes blindly by the address its subscribers present
 /// (the fan-out mechanism is identical to a circle, ISC-S20).
-pub fn room_asset_address(room_key: &CotKey, server_id: &[u8]) -> Result<AssetAddr, OxicryptError> {
+pub fn room_asset_address(
+    room_key: &PublicRoomKey,
+    server_id: &[u8],
+) -> Result<AssetAddr, OxicryptError> {
     let mut input = Vec::with_capacity(COT_KEY_LEN + server_id.len());
     input.extend_from_slice(room_key.as_bytes());
     input.extend_from_slice(server_id);
@@ -150,7 +190,7 @@ fn provenance_input(room: &str, sender_pubkey: &[u8], sent_unix_ms: i64, body: &
 /// `CotFrame.payload`. `sender` is the posting daemon's OWN identity keypair —
 /// any daemon may post; the signature establishes authorship, not authorization.
 pub fn seal_room_message(
-    room_key: &CotKey,
+    room_key: &PublicRoomKey,
     sender: &SignKeypair,
     room: &str,
     sender_handle: &str,
@@ -211,7 +251,7 @@ pub fn seal_room_message(
 /// `SHA-384(sender_pubkey)[:12]` (ISC-C4 / ISC-C57); this function returns the
 /// verified wire message and leaves that UI-layer binding to the caller.
 pub fn open_room_message(
-    room_key: &CotKey,
+    room_key: &PublicRoomKey,
     sealed: &[u8],
 ) -> Result<wire::PublicRoomMessage, RoomMessageError> {
     if sealed.len() < NONCE_LEN + TAG_LEN {

@@ -760,9 +760,11 @@ modules:
     description: >-
       Share-announcement sealing — the in-band replacement for the relay-hosted
       share registry (design: docs/design/unified-share-model.md), the share-tier
-      analogue of public_room. seal_announcement self-signs a ShareAnnouncement
-      (ML-DSA provenance, C57) then AES-256-GCM seals it under the public room key
-      (public tier, server-readable) or a circle cot_key (members-only); AAD =
+      analogue of public_room. seal_public_announcement / seal_circle_announcement
+      self-sign a ShareAnnouncement (ML-DSA provenance, C57) then AES-256-GCM seal
+      it under the public room key (public tier) or a circle cot_key (members-only)
+      respectively — the typed key is the tier guard (a circle payload cannot be
+      sealed under a public key, a compile error); AAD =
       SHARE_ANNOUNCE_AAD, envelope nonce(12)||ciphertext||tag(16).
       open_announcement fails closed (Authentication) on a wrong key or any tamper
       and (Provenance) on a bad signature. Relay-agnostic — the announcement

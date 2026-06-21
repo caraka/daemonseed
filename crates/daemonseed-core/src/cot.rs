@@ -1,7 +1,7 @@
 //! Circle-of-trust rendezvous addressing (M8 — ISC-8 / ISC-S4 / F23).
 //!
 //! A circle's members exchange traffic through a *rendezvous address* on each
-//! relay they share. The circle key itself ([`crate::circle::key::CotKey`])
+//! relay they share. The circle key itself ([`crate::circle::key::CircleKey`])
 //! never leaves a member's machine; what reaches the relay is the address
 //!
 //! ```text
@@ -31,7 +31,7 @@ use oxicrypt_module::Error as OxicryptError;
 use oxicrypt_sha::sha384;
 use zeroize::Zeroize;
 
-use crate::circle::key::{COT_KEY_LEN, CotKey};
+use crate::circle::key::{COT_KEY_LEN, CircleKey};
 
 /// Length of a circle-of-trust rendezvous address, in bytes (SHA-384).
 pub const ASSET_ADDR_LEN: usize = 48;
@@ -81,7 +81,7 @@ impl core::fmt::Debug for AssetAddr {
 ///
 /// Returns the underlying oxicrypt error only if SHA-384's power-up self-test
 /// has not yet passed (first hash in a fresh process).
-pub fn asset_address(cot_key: &CotKey, server_id: &[u8]) -> Result<AssetAddr, OxicryptError> {
+pub fn asset_address(cot_key: &CircleKey, server_id: &[u8]) -> Result<AssetAddr, OxicryptError> {
     let mut input = Vec::with_capacity(COT_KEY_LEN + server_id.len());
     input.extend_from_slice(cot_key.as_bytes());
     input.extend_from_slice(server_id);
@@ -140,7 +140,7 @@ mod tests {
     const RELAY_A: &[u8] = b"relay-alpha#001122334455";
     const RELAY_B: &[u8] = b"relay-bravo#66778899aabb";
 
-    fn example_key() -> CotKey {
+    fn example_key() -> CircleKey {
         let _ = oxicrypt_module::initialize();
         derive_cot_key(EXAMPLE_ENTROPY, &CNSA_2_0).unwrap()
     }

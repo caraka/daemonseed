@@ -51,7 +51,7 @@ use std::rc::Rc;
 use daemonseed_cli::connect::connect_session;
 use daemonseed_cli::identity_proof::ClientIdentity;
 use daemonseed_cli::session::AppSession;
-use daemonseed_core::circle::key::{CotKey, derive_cot_key};
+use daemonseed_core::circle::key::{CircleKey, derive_cot_key};
 use daemonseed_core::circle::message::{open_message, seal_message};
 use daemonseed_core::cot::{AssetAddr, asset_address, public_share_asset_address};
 use daemonseed_core::crypto::suite::CNSA_2_0;
@@ -379,7 +379,7 @@ struct PublicRoom {
     room: String,
     /// The GLOBAL shared room key — derived from public inputs, so every client
     /// AND the relay hold it. Reused as the AEAD key for seal/open.
-    room_key: Rc<daemonseed_core::circle::key::CotKey>,
+    room_key: Rc<daemonseed_core::public_room::PublicRoomKey>,
     /// The room's rendezvous address on the connected relay.
     asset_addr: daemonseed_core::cot::AssetAddr,
     /// Outbound frame sender — publishing seals + sends here.
@@ -397,7 +397,7 @@ struct CircleSub {
     circle_id: u64,
     /// This circle's key. Used to pick the seal key on send and held by the
     /// inbound reader (`Rc`) to open frames.
-    cot_key: Rc<CotKey>,
+    cot_key: Rc<CircleKey>,
     /// Per-relay rendezvous address; the dedupe key for idempotent re-join.
     asset_addr: AssetAddr,
     /// Outbound frame sender — sealing seals + sends here.
@@ -1442,7 +1442,7 @@ async fn net_actor(
 /// `Message`; on a decrypt/provenance error, skip silently (a foreign frame).
 async fn read_inbound_public_room(
     mut inbound: tonic::Streaming<wire::CotFrame>,
-    room_key: Rc<daemonseed_core::circle::key::CotKey>,
+    room_key: Rc<daemonseed_core::public_room::PublicRoomKey>,
     evt_tx: mpsc::UnboundedSender<NetEvent>,
     my_handle: String,
 ) {
@@ -1488,7 +1488,7 @@ async fn read_inbound_public_room(
 async fn read_inbound_circle(
     mut inbound: tonic::Streaming<wire::CotFrame>,
     circle_id: u64,
-    cot_key: Rc<CotKey>,
+    cot_key: Rc<CircleKey>,
     evt_tx: mpsc::UnboundedSender<NetEvent>,
     my_handle: String,
 ) {

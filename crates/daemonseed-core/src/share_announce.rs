@@ -21,8 +21,10 @@
 //! - **Which key seals it.** A *public* announcement seals under the public room
 //!   key ([`crate::public_room::derive_room_key`]) — server-readable by design,
 //!   the deliberately-public tier. A *circle* announcement seals under the
-//!   circle `cot_key` ([`crate::circle::key`]) — members only. Both are a
-//!   [`CotKey`]; only the derivation (and thus who can open) differs.
+//!   circle `cot_key` ([`crate::circle::key`]) — members only. The two are
+//!   **distinct types** ([`crate::public_room::PublicRoomKey`] vs
+//!   [`crate::circle::key::CircleKey`]) so a seal cannot take the wrong tier's
+//!   key — the key-class guard; only the derivation (and who can open) differs.
 //! - **Provenance is always self-signed (ISC-C57).** Every announcement carries
 //!   an ML-DSA-87 signature by the announcer's own identity over a
 //!   domain-separated input binding room, announcer pubkey, share id, name,
@@ -49,9 +51,10 @@ use oxicrypt_module::Error as OxicryptError;
 use prost::Message;
 use zeroize::Zeroize;
 
-use crate::circle::key::CotKey;
+use crate::circle::key::{AeadKey256, COT_KEY_LEN, CircleKey};
 use crate::circle::message::{NONCE_LEN, TAG_LEN};
 use crate::identity::keys::{SignKeypair, verify_signature};
+use crate::public_room::PublicRoomKey;
 use oxicrypt_ml_dsa as ml_dsa;
 
 /// Domain-separation tag bound as AEAD additional-authenticated-data for the
@@ -66,8 +69,8 @@ pub const SHARE_ANNOUNCE_AAD: &[u8] = b"daemonseed/share/announce/v1";
 pub const SHARE_ANNOUNCE_PROVENANCE_DOMAIN: &[u8] = b"daemonseed/share/announce/v1";
 
 /// The plaintext fields of an announcement the caller supplies; the announcer
-/// pubkey and the signature are filled in by [`seal_announcement`]. Borrowed so
-/// sealing never forces the caller to clone.
+/// pubkey and the signature are filled in by [`seal_public_announcement`] /
+/// [`seal_circle_announcement`]. Borrowed so sealing never forces a clone.
 pub struct AnnouncementFields<'a> {
     /// The room/circle the announcement belongs to (e.g. `"lobby"` for public).
     pub room: &'a str,
@@ -118,16 +121,37 @@ fn provenance_input(
     buf
 }
 
-/// Seal a share announcement: SELF-SIGN it for provenance (ISC-C57), then
-/// AES-256-GCM-seal the whole [`wire::ShareAnnouncement`] under `key`. The
-/// output is `nonce ‖ ciphertext ‖ tag` suitable for a `CotFrame.payload`.
-///
-/// `key` is the public room key for a public announcement or the circle
-/// `cot_key` for a circle announcement; `announcer` is the posting daemon's OWN
-/// identity keypair — any daemon may announce, and the signature establishes
+/// Seal a share announcement for a PUBLIC room: SELF-SIGN it for provenance
+/// (ISC-C57), then AES-256-GCM-seal the whole [`wire::ShareAnnouncement`] under
+/// the public room key. The output is `nonce ‖ ciphertext ‖ tag` for a
+/// `CotFrame.payload`. Taking a [`PublicRoomKey`] (never a [`CircleKey`]) is the
+/// key-class guard: a circle announcement can never be sealed under a public key
+/// by mistake — it is a compile error. `announcer` is the posting daemon's OWN
+/// identity keypair; any daemon may announce, and the signature establishes
 /// authorship, not authorization.
-pub fn seal_announcement(
-    key: &CotKey,
+pub fn seal_public_announcement(
+    key: &PublicRoomKey,
+    announcer: &SignKeypair,
+    fields: &AnnouncementFields<'_>,
+) -> Result<Vec<u8>, ShareAnnounceError> {
+    seal_announcement_with(key.as_bytes(), announcer, fields)
+}
+
+/// Seal a share announcement for a CIRCLE — as [`seal_public_announcement`] but
+/// under the circle `cot_key`. Taking a [`CircleKey`] (never a [`PublicRoomKey`])
+/// is the key-class guard in the other direction.
+pub fn seal_circle_announcement(
+    key: &CircleKey,
+    announcer: &SignKeypair,
+    fields: &AnnouncementFields<'_>,
+) -> Result<Vec<u8>, ShareAnnounceError> {
+    seal_announcement_with(key.as_bytes(), announcer, fields)
+}
+
+/// Shared seal body, keyed by the raw 32-byte AEAD key the tier-split entry
+/// points pass. Private, so the only public seal paths are the typed ones above.
+fn seal_announcement_with(
+    key_bytes: &[u8; COT_KEY_LEN],
     announcer: &SignKeypair,
     fields: &AnnouncementFields<'_>,
 ) -> Result<Vec<u8>, ShareAnnounceError> {
@@ -158,7 +182,7 @@ pub fn seal_announcement(
         signature,
     };
 
-    let aes = Aes256Key::new(key.as_bytes()).map_err(ShareAnnounceError::KeyInit)?;
+    let aes = Aes256Key::new(key_bytes).map_err(ShareAnnounceError::KeyInit)?;
     let mut nonce = [0u8; NONCE_LEN];
     getrandom::fill(&mut nonce).map_err(ShareAnnounceError::EntropySource)?;
 
@@ -196,8 +220,8 @@ pub fn seal_announcement(
 /// On success the recipient still must bind the *displayed* handle to
 /// `SHA-384(sender_pubkey)[:12]` (ISC-C4 / ISC-C57); this function returns the
 /// verified wire message and leaves that UI-layer binding to the caller.
-pub fn open_announcement(
-    key: &CotKey,
+pub fn open_announcement<K: AeadKey256>(
+    key: &K,
     sealed: &[u8],
 ) -> Result<wire::ShareAnnouncement, ShareAnnounceError> {
     if sealed.len() < NONCE_LEN + TAG_LEN {
@@ -211,7 +235,7 @@ pub fn open_announcement(
         .try_into()
         .expect("checked length");
 
-    let aes = Aes256Key::new(key.as_bytes()).map_err(ShareAnnounceError::KeyInit)?;
+    let aes = Aes256Key::new(key.aead_key_bytes()).map_err(ShareAnnounceError::KeyInit)?;
     let mut plaintext = vec![0u8; ciphertext_len];
     gcm_decrypt(
         &aes,
@@ -323,7 +347,7 @@ mod tests {
 
     /// Derive a public room key, initializing the crypto module first so each
     /// test stands alone (no cross-test ordering dependency).
-    fn room_key(room: &str) -> CotKey {
+    fn room_key(room: &str) -> PublicRoomKey {
         let _ = oxicrypt_module::initialize();
         derive_room_key(room, &CNSA_2_0).unwrap()
     }
@@ -334,7 +358,8 @@ mod tests {
     fn seal_open_round_trip_verifies_provenance() {
         let key = room_key(DEFAULT_ROOM);
         let me = announcer(7);
-        let sealed = seal_announcement(&key, &me, &fields("deadbeef", "my docs", false)).unwrap();
+        let sealed =
+            seal_public_announcement(&key, &me, &fields("deadbeef", "my docs", false)).unwrap();
         let opened = open_announcement(&key, &sealed).unwrap();
         assert_eq!(opened.share_id, "deadbeef");
         assert_eq!(opened.name, "my docs");
@@ -351,7 +376,7 @@ mod tests {
         let key = derive_cot_key(EXAMPLE_ENTROPY, &CNSA_2_0).unwrap();
         let me = announcer(8);
         let sealed =
-            seal_announcement(&key, &me, &fields("c0ffee", "circle share", false)).unwrap();
+            seal_circle_announcement(&key, &me, &fields("c0ffee", "circle share", false)).unwrap();
         let opened = open_announcement(&key, &sealed).unwrap();
         assert_eq!(opened.share_id, "c0ffee");
     }
@@ -361,7 +386,8 @@ mod tests {
     fn withdraw_flag_round_trips() {
         let key = room_key(DEFAULT_ROOM);
         let me = announcer(9);
-        let sealed = seal_announcement(&key, &me, &fields("abc123", "going away", true)).unwrap();
+        let sealed =
+            seal_public_announcement(&key, &me, &fields("abc123", "going away", true)).unwrap();
         let opened = open_announcement(&key, &sealed).unwrap();
         assert!(opened.withdraw, "withdraw flag survives the round trip");
     }
@@ -373,7 +399,8 @@ mod tests {
         let key = room_key(DEFAULT_ROOM);
         let me = announcer(10);
         let secret_name = "uniquely-identifiable-folder-name-12345";
-        let sealed = seal_announcement(&key, &me, &fields("sid", secret_name, false)).unwrap();
+        let sealed =
+            seal_public_announcement(&key, &me, &fields("sid", secret_name, false)).unwrap();
         assert!(
             !sealed
                 .windows(secret_name.len())
@@ -443,7 +470,7 @@ mod tests {
         let lobby = room_key("lobby");
         let other = room_key("other-room");
         let me = announcer(12);
-        let sealed = seal_announcement(&lobby, &me, &fields("sid", "n", false)).unwrap();
+        let sealed = seal_public_announcement(&lobby, &me, &fields("sid", "n", false)).unwrap();
         match open_announcement(&other, &sealed) {
             Err(ShareAnnounceError::Authentication) => {}
             other => panic!("expected Authentication, got {other:?}"),
@@ -455,7 +482,8 @@ mod tests {
     fn tampered_ciphertext_fails_authentication() {
         let key = room_key(DEFAULT_ROOM);
         let me = announcer(13);
-        let mut sealed = seal_announcement(&key, &me, &fields("sid", "intact", false)).unwrap();
+        let mut sealed =
+            seal_public_announcement(&key, &me, &fields("sid", "intact", false)).unwrap();
         let last = sealed.len() - TAG_LEN - 1;
         sealed[last] ^= 0x01;
         match open_announcement(&key, &sealed) {

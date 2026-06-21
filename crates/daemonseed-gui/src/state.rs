@@ -8,13 +8,13 @@
 //! **Round 4 adds the net contract.** A circle can now be *materialized at
 //! runtime* from a shared phrase (join / new-circle flows), and a materialized
 //! circle carries the [`CircleNet`] contract — the originating phrase, its derived
-//! [`CotKey`] (`daemonseed_core::circle::key::derive_cot_key`), and a rendezvous
+//! [`CircleKey`] (`daemonseed_core::circle::key::derive_cot_key`), and a rendezvous
 //! slot — so Round 5's circle networking plugs in without reworking this layer.
 //! This is why the module now depends on `daemonseed-core` (it did not in round 2);
 //! it stays Slint-free and network-free. Materialized circles are RAM-only and
 //! gone on relaunch — config persistence is a separate milestone.
 
-use daemonseed_core::circle::key::{CircleKeyError, CotKey, circle_fingerprint, derive_cot_key};
+use daemonseed_core::circle::key::{CircleKey, CircleKeyError, circle_fingerprint, derive_cot_key};
 use daemonseed_core::cot::AssetAddr;
 use daemonseed_core::crypto::suite::CNSA_2_0;
 use daemonseed_core::passphrase::strength::{self, DicewareError};
@@ -58,15 +58,15 @@ pub struct MyShare {
 
 /// The Round-5 **net contract** carried by a materialized circle (refinement #1).
 ///
-/// Holding the phrase + derived [`CotKey`] + a rendezvous slot here is the single
+/// Holding the phrase + derived [`CircleKey`] + a rendezvous slot here is the single
 /// most important thing Round 4 gets right: Round 5's `NetCommand::JoinCircle`
 /// takes the phrase (the net actor derives its own key, mirroring the public-room
 /// name path), and seal/open needs the `cot_key` + `rendezvous` — so the net path
 /// plugs into an already-materialized circle with no rework.
 ///
 /// `Debug` is hand-rolled to REDACT the phrase (the circle's whole secret) and
-/// defer to [`CotKey`]'s own redacted `Debug` — neither ever lands on a log
-/// surface (mirrors the `CotKey` / circle-key hygiene, ISC-A-C1).
+/// defer to [`CircleKey`]'s own redacted `Debug` — neither ever lands on a log
+/// surface (mirrors the `CircleKey` / circle-key hygiene, ISC-A-C1).
 pub struct CircleNet {
     /// Stable per-session id assigned at materialize. The GUI's routing key:
     /// passed to `NetCommand::JoinCircle`/`SendCircle` and echoed back on
@@ -80,7 +80,7 @@ pub struct CircleNet {
     pub phrase: String,
     /// The derived circle-of-trust key. The net contract's keystone — proves the
     /// phrase derives now, so Round 5's seal/open reuses it directly.
-    pub cot_key: CotKey,
+    pub cot_key: CircleKey,
     /// The circle's rendezvous address on a connected relay. `None` pre-net —
     /// Round 5 fills it (`daemonseed_core::cot::asset_address(cot_key, server_id)`)
     /// once a relay/server-id is in hand.
@@ -99,7 +99,7 @@ impl core::fmt::Debug for CircleNet {
 
 /// A single circle and its retained, per-circle UI state.
 ///
-/// **No longer `Clone`** (round 4): it now holds a [`CircleNet`] whose [`CotKey`]
+/// **No longer `Clone`** (round 4): it now holds a [`CircleNet`] whose [`CircleKey`]
 /// is a zeroizing secret that must not be silently copied. The render path borrows
 /// `&CircleState` and applies it; it never clones.
 #[derive(Debug)]
@@ -879,7 +879,7 @@ mod tests {
             "the secret phrase must never appear in Debug"
         );
         assert!(
-            dbg.contains("CotKey(<redacted>)"),
+            dbg.contains("CircleKey(<redacted>)"),
             "cot_key Debug stays redacted"
         );
     }

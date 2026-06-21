@@ -12,7 +12,7 @@
 //! ```
 //!
 //! - **Keyed by the circle secret.** The AEAD key *is* the 32-byte `cot_key`
-//!   ([`CotKey`], derived from the shared phrase). Only a circle member can
+//!   ([`CircleKey`], derived from the shared phrase). Only a circle member can
 //!   seal or open a message; the relay and any non-member see indistinguishable
 //!   ciphertext. AES-256-GCM matches the CNSA-2.0 AEAD and the 32-byte key.
 //! - **Per-message random nonce.** A fresh 96-bit nonce per [`seal_message`]
@@ -37,7 +37,7 @@ use oxicrypt_module::Error as OxicryptError;
 use prost::Message;
 use zeroize::Zeroize;
 
-use crate::circle::key::CotKey;
+use crate::circle::key::CircleKey;
 
 /// AES-GCM nonce length in bytes (96-bit, the GCM-canonical size).
 pub const NONCE_LEN: usize = 12;
@@ -89,7 +89,7 @@ impl core::error::Error for MessageError {}
 ///
 /// The prost-encoded plaintext is zeroed the moment GCM has consumed it.
 pub fn seal_message(
-    cot_key: &CotKey,
+    cot_key: &CircleKey,
     message: &wire::CircleMessage,
 ) -> Result<Vec<u8>, MessageError> {
     let aes = Aes256Key::new(cot_key.as_bytes()).map_err(MessageError::KeyInit)?;
@@ -126,7 +126,10 @@ pub fn seal_message(
 /// The recovered plaintext bytes are zeroed before returning the decoded
 /// message (the decoded `String` fields are the rendered surface; the raw
 /// buffer is secret-adjacent).
-pub fn open_message(cot_key: &CotKey, sealed: &[u8]) -> Result<wire::CircleMessage, MessageError> {
+pub fn open_message(
+    cot_key: &CircleKey,
+    sealed: &[u8],
+) -> Result<wire::CircleMessage, MessageError> {
     if sealed.len() < NONCE_LEN + TAG_LEN {
         return Err(MessageError::Truncated);
     }
@@ -159,7 +162,7 @@ mod tests {
     use crate::circle::key::{EXAMPLE_ENTROPY, derive_cot_key};
     use crate::crypto::suite::CNSA_2_0;
 
-    fn key(phrase: &str) -> CotKey {
+    fn key(phrase: &str) -> CircleKey {
         let _ = oxicrypt_module::initialize();
         derive_cot_key(phrase, &CNSA_2_0).unwrap()
     }

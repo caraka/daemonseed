@@ -191,7 +191,8 @@ pub struct PublicRoomMessage {
 /// public announcement (server-readable, the deliberately-public tier) or under
 /// a circle cot_key for a circle announcement (members-only). ONLY the
 /// ciphertext rides in CotFrame.payload (A-S16). See daemonseed-core
-/// share_announce::{seal_announcement, open_announcement}.
+/// share_announce::{seal_public_announcement, seal_circle_announcement,
+/// open_announcement}.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ShareAnnouncement {
     /// The room/circle this announcement belongs to (e.g. "lobby" for public).

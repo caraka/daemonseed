@@ -28,7 +28,8 @@ work lives in the project lead's vault manifest, not here.
 
 - In-band share discovery — announcement payload and seal/open: a
   `ShareAnnouncement` wire message and `daemonseed-core::share_announce`
-  (`seal_announcement` / `open_announcement`), a share announcement sealed
+  (`seal_public_announcement` / `seal_circle_announcement` / `open_announcement`),
+  a share announcement sealed
   (AES-256-GCM) and ML-DSA self-signed for provenance, carried in a
   `CotFrame.payload` at a room/circle rendezvous address, mirroring
   `public_room`. Sealed under the public room key (public tier, server-readable)
@@ -58,6 +59,13 @@ work lives in the project lead's vault manifest, not here.
 
 ### Changed
 
+- Key-class separation: the circle key type is renamed `CotKey` → `CircleKey`
+  and the public room key gets its own distinct `PublicRoomKey` (was an aliased
+  `CotKey`); both implement `AeadKey256` for tier-agnostic opens. The two are no
+  longer substitutable — sealing a circle payload under a public key (or vice
+  versa) is now a compile error. The share-announcement seal is tier-split
+  accordingly (`seal_public_announcement` / `seal_circle_announcement`); opening
+  stays tier-agnostic. Behavior-preserving (no wire change).
 - Track oxicrypt 0.16.0 in the lockfile.
 - Auto-republish on connect now consumes the persisted per-share name
   (`PublishedShare.name`), threaded through the restore path; it falls back to

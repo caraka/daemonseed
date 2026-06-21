@@ -231,7 +231,7 @@ async fn forged_provenance_is_rejected_end_to_end() {
 /// WITHOUT going through `seal_room_message` — used to craft a forged-provenance
 /// envelope an attacker who knows the public key could send.
 fn seal_raw_under_room_key(
-    room_key: &daemonseed_core::circle::key::CotKey,
+    room_key: &daemonseed_core::public_room::PublicRoomKey,
     message: &wire::PublicRoomMessage,
 ) -> Vec<u8> {
     use daemonseed_core::public_room::ROOM_MESSAGE_AAD;
