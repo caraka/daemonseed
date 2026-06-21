@@ -26,85 +26,46 @@ work lives in the project lead's vault manifest, not here.
 
 ### Added
 
-- In-band share discovery — announcement payload and seal/open: a
-  `ShareAnnouncement` wire message and `daemonseed-core::share_announce`
-  (`seal_public_announcement` / `seal_circle_announcement` / `open_announcement`),
-  a share announcement sealed
-  (AES-256-GCM) and ML-DSA self-signed for provenance, carried in a
-  `CotFrame.payload` at a room/circle rendezvous address, mirroring
-  `public_room`. Sealed under the public room key (public tier, server-readable)
-  or a circle `cot_key` (members-only); relay-agnostic (carries `share_id`, not
-  `server_id`). Design-of-record: `docs/design/unified-share-model.md`.
-- Share content sealing (`daemonseed-core::share_seal`):
-  `seal_public_share_frame` / `seal_circle_share_frame` (tier-guarded) and a
-  tier-agnostic `open_share_frame` seal each `ShareFrame` (manifest/chunk) under
-  the room/circle key with a distinct AAD, so share traffic is structurally
-  indistinguishable from chat on the wire (the alpha shipped public-share content
-  in the clear). No provenance signature — per-chunk SHA-384 integrity already
-  lives inside the frame.
-- In-band share discovery: a sealed, signed `ShareRollCall` late-join request
-  plus `daemonseed-core::share_rollcall` seal/open — prompts live sharers to
-  re-announce; a distinct, tier-guarded kind pairing with `ShareAnnouncement`
-  (design: `docs/design/unified-share-model.md`). (#52)
-- In-band share discovery catalog (`daemonseed-core::share_catalog`): the
-  client-side live set that folds verified announcements and ages them out by a
-  receive-time TTL (two-speed liveness), replacing the relay share registry;
-  shared by the TUI and GUI net actors
-  (design: `docs/design/unified-share-model.md`). (#52)
-- Desktop GUI window/taskbar icon: the `AppWindow` now carries an `icon`,
-  rasterized from the AppImage's scalable placeholder so the windowed app and
-  the AppImage share one mark (aesthetic refinement deferred).
-- First-start backup confirmation as three single-word type-back fields (C34):
-  one challenge word per box, Enter advancing to the next (the third confirms).
-- Reproducible AppImage build recipe for the desktop GUI
-  (`packaging/appimage/`, output to `dist/`).
-- Per-share optional wire-facing name persisted with published shares
-  (`PublishedShare { root, name }`; core slice — no naming UI yet).
-- "Restored N shares from last session" label on the connect-time
-  auto-republish path, distinguishing a restore from a fresh publish.
-- First-run desktop integration: an opt-in prompt ("Add Daemonseed to your
-  applications?") plus `--install` / `--remove` CLI flags self-register an XDG
-  `.desktop` entry + hicolor icons (256px PNG + scalable SVG), so the app menu /
-  dock resolve a real icon across desktop environments. AppImages are not
-  "installed", so nothing did this before. Never silent; honours a "don't ask
-  again" choice; `StartupWMClass=daemonseed-gui` matches the window's WM_CLASS so
-  the live window inherits the icon (`src/desktop_integration.rs`).
-- The desktop GUI remembers its window size across restarts: the last size is saved
-  on close and restored on launch (size only — position is omitted to avoid landing
-  off-screen on another monitor; an out-of-range saved value is ignored).
+- `ShareAnnouncement` wire message + `daemonseed-core::share_announce` seal/open
+  (sealed under the public room key or a circle `cot_key`, ML-DSA self-signed;
+  relay-agnostic). (#50)
+- `daemonseed-core::share_seal` content sealing: `seal_public_share_frame` /
+  `seal_circle_share_frame` (tier-guarded) + `open_share_frame` (generic over
+  `AeadKey256`). (#49)
+- `ShareRollCall` wire message + `daemonseed-core::share_rollcall` seal/open. (#52)
+- `daemonseed-core::share_catalog` — client-side share discovery catalog
+  (`ShareCatalog` apply / prune / remove). (#52)
+- Desktop GUI window/taskbar icon on `AppWindow`. (#40)
+- First-start backup confirmation as three single-word type-back fields (C34).
+- Reproducible AppImage build recipe (`packaging/appimage/`, output to `dist/`).
+- Optional wire-facing name persisted per published share
+  (`PublishedShare { root, name }`). (#41)
+- "Restored N shares from last session" label on the connect-time auto-republish
+  path. (#34)
+- First-run desktop-integration prompt + `--install` / `--remove` flags that
+  register an XDG `.desktop` entry and hicolor icons.
+- Desktop GUI window-size persistence across restarts (size only).
 
 ### Changed
 
-- Key-class separation: the circle key type is renamed `CotKey` → `CircleKey`
-  and the public room key gets its own distinct `PublicRoomKey` (was an aliased
-  `CotKey`); both implement `AeadKey256` for tier-agnostic opens. The two are no
-  longer substitutable — sealing a circle payload under a public key (or vice
-  versa) is now a compile error. The share-announcement seal is tier-split
-  accordingly (`seal_public_announcement` / `seal_circle_announcement`); opening
-  stays tier-agnostic. Behavior-preserving (no wire change).
-- Public-share content now rides AES-256-GCM-sealed under the public room key on
-  the serve/fetch path (was cleartext), making share traffic wire-indistinguishable
-  from chat; per-chunk SHA-384 integrity and the relay are unchanged (design:
-  `docs/design/unified-share-model.md`). (#52)
+- Key-class separation: `CotKey` → `CircleKey` and a distinct `PublicRoomKey`,
+  both `AeadKey256`; non-substitutable (sealing a circle payload under a public
+  key is a compile error). No wire change. (#49)
+- Public-share content sealed under the public room key on the serve/fetch path
+  (per-chunk SHA-384 integrity and the relay unchanged). (#52)
 - Track oxicrypt 0.16.0 in the lockfile.
-- Auto-republish on connect now consumes the persisted per-share name
-  (`PublishedShare.name`), threaded through the restore path; it falls back to
-  the root directory basename when unset. The name-a-share UI that would set a
-  non-default name remains a follow-up.
-- User-facing "sealed" → "encrypted" in all GUI trust copy (the E2EE pill and
-  the end-to-end-encrypted lines).
-- Session-restore notice ("Restored N shares…") now shows as a tab-independent,
-  auto-dismissing banner on the landing (Chat) view, not only on the Shares tab.
-- Desktop GUI window title is now "Daemonseed" (was the toolkit default).
-- The AppImage recipe now emits a 256px raster PNG + a top-level `.DirIcon` (was
-  scalable-SVG only) — what desktop integrators and the dock actually read.
+- Auto-republish on connect consumes the persisted per-share name
+  (`PublishedShare.name`), falling back to the root basename. (#41)
+- GUI trust copy: "sealed" → "encrypted".
+- "Restored N shares…" shows as a tab-independent auto-dismissing banner on the
+  Chat landing view. (#34)
+- Desktop GUI window title is "Daemonseed".
+- AppImage recipe emits a 256px PNG + top-level `.DirIcon`.
 
 ### Fixed
 
-- The circle rail/header no longer shows a stale "not yet connected" placeholder
-  that contradicted the live connection state.
-- Keyboard focus is restored when the desktop window regains activation, so
-  typing / Enter survive an app-switch without clicking back into the field (#39).
+- Circle rail/header no longer shows a stale "not yet connected" placeholder.
+- Keyboard focus restored when the desktop window regains activation. (#39)
 
 ## [0.28.0] — GUI auth-input felt-fixes + global font pass (round 2)
 

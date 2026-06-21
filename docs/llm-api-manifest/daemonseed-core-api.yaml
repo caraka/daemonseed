@@ -784,19 +784,13 @@ modules:
 
   - name: daemonseed_core::share_rollcall
     description: >-
-      Share roll-call sealing — the request half of in-band discovery that pairs
-      with share_announce (design: docs/design/unified-share-model.md). The relay
-      is a blind forwarder and emits no subscribe events, so fast late-join is
-      pull-based: a joining/refreshing client posts a sealed roll-call into the
-      room and every connected sharer re-announces. One late-join hook (startup /
-      Refresh / reconcile timer) all post a roll-call; no new relay capability.
-      seal_public_rollcall / seal_circle_rollcall self-sign a ShareRollCall
-      (ML-DSA provenance, C57) then AES-256-GCM seal it under the public room key
-      or a circle cot_key — the typed key is the tier guard (wrong tier is a
-      compile error); AAD = SHARE_ROLLCALL_AAD, distinct from the chat / room /
-      announce / frame AADs. open_rollcall fails closed (Authentication) on a
-      wrong key or tamper and (Provenance) on a bad signature. The distinct
-      sealed kind chosen over implicit-on-subscribe.
+      Seal/open for the ShareRollCall late-join request. seal_public_rollcall /
+      seal_circle_rollcall self-sign a ShareRollCall (ML-DSA, C57) then
+      AES-256-GCM-seal it under the public room key or a circle cot_key
+      respectively (the typed key is the tier guard — wrong tier is a compile
+      error); open_rollcall is generic over AeadKey256 and fails closed
+      (Authentication on a wrong key or tamper, Provenance on a bad signature).
+      AAD = SHARE_ROLLCALL_AAD.
     no_std: false
     depends_on:
       - daemonseed_core::circle::key
@@ -812,17 +806,12 @@ modules:
 
   - name: daemonseed_core::share_catalog
     description: >-
-      In-band share discovery catalog — the client-side replacement for the relay
-      SharePublishRegistry. A client folds each verified ShareAnnouncement
-      (announce/withdraw, via share_announce::open_announcement) into a
-      ShareCatalog and ages entries out by a local receive-time TTL (two-speed
-      liveness: live apply + slow prune; explicit remove is the fetch-failure
-      backstop). Stale/reordered announcements (older sent_unix_ms for a known
-      share) are ignored. Transport-free; both the TUI and GUI net actors hold
-      one. Types: ShareCatalog, DiscoveredShare, CatalogChange.
+      Client-side catalog of shares discovered in one room/circle. apply() folds
+      a verified ShareAnnouncement: an announce inserts or refreshes, a withdraw
+      removes, an older sent_unix_ms for a known share is ignored. prune() ages
+      entries out past a receive-time TTL; remove() drops one explicitly.
+      Transport-free. Types: ShareCatalog, DiscoveredShare, CatalogChange.
     no_std: false
-    depends_on:
-      - daemonseed_core::share_announce
     iscs:
       - A-S1
       - A-S2

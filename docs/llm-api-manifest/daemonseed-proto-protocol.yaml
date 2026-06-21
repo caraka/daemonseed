@@ -1081,15 +1081,11 @@ types:
     module: cot
     kind: message
     description: >-
-      A share roll-call — the late-join discovery REQUEST that pairs with
-      ShareAnnouncement (design: docs/design/unified-share-model.md). The relay
-      is a blind forwarder and cannot signal live sharers that a member
-      subscribed, so fast late-join is pull-based: a joining/refreshing client
-      posts this sealed roll-call into the room and every connected sharer
-      answers by re-posting its ShareAnnouncement(s). A distinct sealed kind (not
-      implicit-on-subscribe); like ShareAnnouncement it is sealed under the tier
-      key (A-S2, A-S16) and ML-DSA self-signed for provenance (C57). Distinct AAD
-      (daemonseed/share/rollcall/v1). See daemonseed-core share_rollcall.
+      The late-join share-discovery request. Posted into a room/circle as a
+      CotFrame.payload, sealed under the tier key (A-S2, A-S16) and ML-DSA
+      self-signed for provenance (C57); AAD daemonseed/share/rollcall/v1. A
+      connected sharer answers it by re-posting its ShareAnnouncement(s). See
+      daemonseed-core share_rollcall.
     iscs: [A-S1, A-S2, A-S16, S21, C57]
     fields:
       - name: room
