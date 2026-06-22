@@ -336,6 +336,9 @@ export component AppWindow inherits Window {
     // without needing a click (the VM software-render path can drop pointer clicks).
     callback focus-join-input();
     focus-join-input => { join_phrase_input.focus(); }
+    // Right-click "paste" into the Join phrase field (#63). Handled in Rust
+    // (clipboard read), which sets `join-phrase`, refreshes strength, and refocuses.
+    callback paste-into-join();
 
     // ── Round-6: persistent identity — first-start + unlock auth gate ──
     //
@@ -803,6 +806,17 @@ export component AppWindow inherits Window {
                     // 504 inner) minus the 120px QR slot and 10px spacing = 374px.
                     width: 374px;
                     height: 44px; border-radius: 9px; background: #141517; border-width: 1px; border-color: #ffffff12; clip: true; // contain a long single-line entry inside the box
+                    // Right-click paste (#63). Declared FIRST so it sits BEHIND the
+                    // TextInput: left-clicks still reach the input for cursor/selection;
+                    // a right-click the TextInput ignores falls through to here.
+                    TouchArea {
+                        width: 100%; height: 100%;
+                        pointer-event(e) => {
+                            if (e.button == PointerEventButton.right && e.kind == PointerEventKind.down) {
+                                root.paste-into-join();
+                            }
+                        }
+                    }
                     HorizontalLayout { padding-left: 12px;
                         // `visible:` not `if` — toggling on the first/last char typed
                         // must NOT mutate the item tree mid-edit (partial_renderer crash).

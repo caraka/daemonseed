@@ -60,6 +60,13 @@ tonic = { workspace = true }
 # (not to build); a system without one falls through to a cancelled pick.
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
 
+# Clipboard read for right-click "paste" (#63) — the platform clipboard plumbing
+# the GUI reuses wherever a right-click paste affordance is wanted. A plain dep
+# like rfd: it compiles in the offscreen build and is exercised only on the
+# windowed paste path. Permissive (MIT/Apache); the X11/Wayland/Windows backends
+# are already in the lock tree transitively via winit.
+arboard = "3"
+
 [build-dependencies]
 slint-build = { workspace = true }
 

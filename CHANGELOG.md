@@ -39,6 +39,7 @@ work lives in the project lead's vault manifest, not here.
 - Command palette has a close (×) control, so it dismisses without selecting an item. (#58)
 - Switching rooms while on a shares tab selects the tab matching the destination — a circle's "Circle shares", the Lobby's "Public Shares" — so public shares no longer appear available inside a circle.
 - First-start re-seals the at-rest blob with the chosen display name, so a named identity keeps its name across unlock; previously the name was lost at next launch (peers saw the hash-only handle) unless a later write-through happened to re-seal. (#65)
+- Right-clicking the Join phrase field pastes from the clipboard and refocuses; previously a right-click only moved focus off the field, leaving Ctrl-V as the sole paste path. (#63)
 
 ## [0.29.1] — GUI window-size default + build-version readout
 

@@ -466,6 +466,25 @@ fn build_ui() -> BuiltUi {
         }
     });
 
+    // Right-click "paste" into the Join phrase field (#63). Reads the system
+    // clipboard (the reusable plumbing for any future right-click paste), fills the
+    // field, refreshes the strength cue with the SAME estimator typing uses, and
+    // refocuses so the user can keep editing.
+    ui.on_paste_into_join({
+        let weak = ui.as_weak();
+        move || {
+            let ui = weak.unwrap();
+            if let Some(text) = read_clipboard_text() {
+                let text = text.trim();
+                if !text.is_empty() {
+                    ui.set_join_phrase(SharedString::from(text));
+                    ui.set_join_phrase_strong(estimate_circle(text).is_circle_green());
+                    ui.invoke_focus_join_input();
+                }
+            }
+        }
+    });
+
     // Submit Join: GATE on the ≥128-bit circle floor (ISC-C9, precautionary
     // default — block a weak phrase rather than warn). A weak phrase is KEPT in the
     // field so the user can strengthen it in place (the overlay stays open and the
@@ -1021,6 +1040,15 @@ fn start_drain(
         _net: net,
         _timer: timer,
     }
+}
+
+/// Read the system clipboard as text, or `None` if it is unavailable or empty.
+/// The reusable clipboard-read plumbing behind right-click paste (#63); a fresh
+/// `Clipboard` per call is fine for reads (the X11 ownership caveat only applies
+/// to writes).
+fn read_clipboard_text() -> Option<String> {
+    let text = arboard::Clipboard::new().ok()?.get_text().ok()?;
+    if text.is_empty() { None } else { Some(text) }
 }
 
 /// Fire the real `Connect` against the running net actor: auto-joins the default
