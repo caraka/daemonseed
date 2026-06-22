@@ -30,9 +30,14 @@ work lives in the project lead's vault manifest, not here.
 - In-app release-version readout: a version line in the rail footer plus an About overlay (version, license, source) reachable from the command palette. (#59)
 - Client-side unread dot on rail rooms: an unfocused room (circle or Lobby) shows a dot when a chat message arrives, cleared when the room gains focus. Chat-only. (#64)
 
+### Changed
+
+- Renamed the "Shares" tab (and its in-pane heading) to "Public Shares", distinct from "Circle shares".
+
 ### Fixed
 
 - Command palette has a close (×) control, so it dismisses without selecting an item. (#58)
+- Switching rooms while on a shares tab selects the tab matching the destination — a circle's "Circle shares", the Lobby's "Public Shares" — so public shares no longer appear available inside a circle.
 
 ## [0.29.1] — GUI window-size default + build-version readout
 

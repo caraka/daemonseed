@@ -538,7 +538,7 @@ export component AppWindow inherits Window {
                     HorizontalLayout {
                         padding-left: 16px; spacing: 20px;
                         TabLabel { label: "Chat"; active: root.active-tab == 0; clicked => { root.active-tab = 0; } }
-                        TabLabel { label: "Shares"; active: root.active-tab == 1; clicked => { root.active-tab = 1; root.shares-tab-opened(); } }
+                        TabLabel { label: "Public Shares"; active: root.active-tab == 1; clicked => { root.active-tab = 1; root.shares-tab-opened(); } }
                         TabLabel { label: "Circle shares"; active: root.active-tab == 2; clicked => { root.active-tab = 2; } }
                         Rectangle { }
                     }
@@ -595,7 +595,7 @@ export component AppWindow inherits Window {
                                 HorizontalLayout {
                                     height: 38px;
                                     spacing: 10px;
-                                    Text { text: "Shares"; color: #e4e8ee; font-size: 15px; vertical-alignment: center; }
+                                    Text { text: "Public Shares"; color: #e4e8ee; font-size: 15px; vertical-alignment: center; }
                                     Text { text: "· right-click an item to download"; color: #4d5560; font-size: 11px; vertical-alignment: center; }
                                     Text { text: root.share-status; color: #5b6472; font-size: 12px; vertical-alignment: center; }
                                     Rectangle { }

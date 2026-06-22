@@ -351,6 +351,7 @@ fn build_ui() -> BuiltUi {
             ui.set_publish_open(false);
             let live_draft = ui.get_draft().to_string();
             let live_scroll = ui.get_scroll_y();
+            let mut refresh_public_shares = false;
             {
                 let mut st = state.borrow_mut();
                 st.switch_to(target as usize, live_draft, live_scroll);
@@ -358,12 +359,30 @@ fn build_ui() -> BuiltUi {
                 // #64: switch_to cleared the focused room's unread; reflect it.
                 rebuild_rail(&ui, &st);
                 apply_view(&ui, st.current(), active as i32);
+                // Tidiness: keep the shares view coherent with the room. If already
+                // on a shares tab, show the one that matches the destination — a
+                // circle's "Circle shares" (tab 2) or the Lobby's public "Shares"
+                // (tab 1) — so public shares never look available inside a circle
+                // (or vice versa). Chat (tab 0) is left alone.
+                let tab = ui.get_active_tab();
+                if tab == 1 || tab == 2 {
+                    if st.current().net.is_some() {
+                        ui.set_active_tab(2);
+                    } else {
+                        ui.set_active_tab(1);
+                        refresh_public_shares = true;
+                    }
+                }
             }
             // Deferred: focusing during a (possibly key-triggered, e.g. Ctrl+L) callback
-            // is re-entrant and breaks the next key's routing.
+            // is re-entrant and breaks the next key's routing. The public-shares
+            // refresh is deferred for the same reason (its handler re-borrows state).
             let w = ui.as_weak();
             defer(move || {
                 if let Some(ui) = w.upgrade() {
+                    if refresh_public_shares {
+                        ui.invoke_shares_tab_opened();
+                    }
                     ui.invoke_focus_composer();
                 }
             });
@@ -1767,6 +1786,7 @@ fn main() {
     let show_palette = args.iter().any(|a| a == "--show-palette");
     let show_about = args.iter().any(|a| a == "--show-about");
     let show_unread = args.iter().any(|a| a == "--show-unread");
+    let show_tab_coherence = args.iter().any(|a| a == "--show-tab-coherence");
     // ISC-C62 proof: materialize a circle then apply a synthetic relay rendezvous so
     // the rail shows the relay-derived adj-noun label instead of the `#<hex>`
     // placeholder (the live path runs on the CircleJoined event, which needs a relay).
@@ -1807,6 +1827,7 @@ fn main() {
         || show_palette
         || show_about
         || show_unread
+        || show_tab_coherence
         || show_joined_label
         || show_shares
         || show_publish
@@ -2126,6 +2147,14 @@ fn main() {
             // Reflect the Lobby as the focused row so the circle (idx 1) is the
             // unfocused one carrying the dot.
             apply_view(&ui, st.current(), 0);
+        }
+        if show_tab_coherence {
+            // Tidiness proof: with the public Shares tab open, entering a circle from
+            // the rail should land on "Circle shares" (tab 2), not the public tab.
+            materialize_and_select(&ui, &state, &net, "demo tab coherence phrase");
+            ui.invoke_switch_circle(0); // back to the Lobby
+            ui.set_active_tab(1); // public Shares tab open
+            ui.invoke_switch_circle(1); // enter the circle from the rail
         }
         if let Some(n) = switch {
             ui.invoke_switch_circle(n);
