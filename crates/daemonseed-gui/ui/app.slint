@@ -23,6 +23,7 @@ struct CircleData {
     sub: string,
     initial: string,
     pinned: bool,
+    unread: bool,
 }
 
 struct MsgData {
@@ -65,6 +66,7 @@ component RailRow inherits Rectangle {
     in property <string> initial;
     in property <bool> selected: false;
     in property <bool> pinned: false;
+    in property <bool> unread: false;   // #64: new-message dot for an unfocused room
     callback clicked;
     height: 54px;
     border-radius: 8px;
@@ -87,6 +89,12 @@ component RailRow inherits Rectangle {
             Text { text: root.sub; color: #5b6472; font-size: 12px; }
         }
         Rectangle { }
+        // #64: unread dot — unseen activity in a room you're not focused on. The
+        // active row never shows it (state clears unread on focus), but gate on
+        // !selected too so it can never linger on the focused row.
+        if root.unread && !root.selected : Rectangle {
+            width: 8px; height: 8px; border-radius: 4px; background: #4a9d8e;
+        }
     }
 }
 
@@ -438,6 +446,7 @@ export component AppWindow inherits Window {
                 }
                 for c[i] in root.circles : RailRow {
                     name: c.name; sub: c.sub; initial: c.initial; pinned: c.pinned;
+                    unread: c.unread;
                     selected: i == root.active;
                     clicked => { root.switch-circle(i); }
                 }

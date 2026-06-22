@@ -119,6 +119,10 @@ pub struct CircleState {
     /// Lobby (which derives its room key from the room name, not a phrase). Round 5
     /// reads it to drive `JoinCircle`/`SendCircle` and to route inbound frames.
     pub net: Option<CircleNet>,
+    /// #64: client-side unread (new-message) dot. Set when a non-own message lands
+    /// in this room while it is NOT the active room; cleared the moment it gains
+    /// focus. Chat-only (driven by `push_message`); shares ride a separate path.
+    pub unread: bool,
 }
 
 /// First circle id handed out (0 is reserved/unused so a missing id is obvious).
@@ -162,6 +166,7 @@ impl GuiState {
             draft: String::new(),
             scroll_y: 0.0,
             net: None,
+            unread: false,
         }];
         GuiState {
             circles,
@@ -340,6 +345,7 @@ impl GuiState {
                 cot_key,
                 rendezvous: None,
             }),
+            unread: false,
         };
         self.circles.push(circle);
         Ok(self.circles.len() - 1)
@@ -441,10 +447,19 @@ impl GuiState {
     /// Append a message to circle `idx` (no-op if out of range). Used by the
     /// real-net event drain to fold inbound/echoed Lobby messages into the RAM
     /// transcript, and by the non-Lobby local stub (the Round-5 `SendCircle` seam).
-    pub fn push_message(&mut self, idx: usize, who: String, text: String, mine: bool) {
+    /// Returns `true` iff this call newly raised circle `idx`'s unread dot (#64) —
+    /// a non-own message into a non-active room — so the caller knows to rebuild the
+    /// rail. Own echoes (`mine`) and messages into the active room never raise it.
+    pub fn push_message(&mut self, idx: usize, who: String, text: String, mine: bool) -> bool {
+        let active = self.active;
         if let Some(c) = self.circles.get_mut(idx) {
             c.messages.push(Msg { who, text, mine });
+            if !mine && idx != active && !c.unread {
+                c.unread = true;
+                return true;
+            }
         }
+        false
     }
 
     /// Set circle `idx`'s retained draft (no-op if out of range). Used to persist
@@ -467,6 +482,8 @@ impl GuiState {
         cur.scroll_y = live_scroll;
         if target < self.circles.len() {
             self.active = target;
+            // #64: focusing a room clears its unread dot.
+            self.circles[self.active].unread = false;
         }
     }
 }
@@ -514,6 +531,7 @@ impl GuiState {
                 draft: String::new(),
                 scroll_y: 0.0,
                 net: None,
+                unread: false,
             }
         };
         let circles = vec![
@@ -622,6 +640,52 @@ mod tests {
         assert_eq!(st.current().draft, "draft-for-one");
         st.switch_to(2, String::new(), 0.0);
         assert_eq!(st.current().draft, "draft-for-two");
+    }
+
+    // ── #64 unread/new-message dot ───────────────────────────────────────────
+
+    #[test]
+    fn unread_set_on_nonactive_inbound() {
+        let mut st = GuiState::demo(); // active == 1
+        let raised = st.push_message(2, "ally".into(), "ping".into(), false);
+        assert!(
+            raised,
+            "a non-own message into a non-active room raises unread"
+        );
+        assert!(st.metas()[2].unread);
+        assert!(!st.metas()[1].unread, "the active room never gets a dot");
+    }
+
+    #[test]
+    fn unread_not_set_for_active_room_or_own_echo() {
+        let mut st = GuiState::demo(); // active == 1
+        assert!(!st.push_message(1, "x".into(), "hi".into(), false));
+        assert!(
+            !st.metas()[1].unread,
+            "message into the active room: no dot"
+        );
+        assert!(!st.push_message(2, "me".into(), "hi".into(), true));
+        assert!(!st.metas()[2].unread, "own echo never dots");
+    }
+
+    #[test]
+    fn focus_clears_unread() {
+        let mut st = GuiState::demo(); // active == 1
+        st.push_message(2, "ally".into(), "ping".into(), false);
+        assert!(st.metas()[2].unread);
+        st.switch_to(2, String::new(), 0.0); // focus circle 2
+        assert!(!st.metas()[2].unread, "focusing a room clears its dot");
+    }
+
+    #[test]
+    fn unread_raise_is_idempotent() {
+        let mut st = GuiState::demo(); // active == 1
+        assert!(st.push_message(2, "a".into(), "1".into(), false));
+        assert!(
+            !st.push_message(2, "a".into(), "2".into(), false),
+            "already-unread room does not re-raise (no spurious rail rebuilds)"
+        );
+        assert!(st.metas()[2].unread);
     }
 
     #[test]

@@ -234,6 +234,7 @@ fn rebuild_rail(ui: &AppWindow, st: &GuiState) {
             sub: SharedString::from(c.sub.as_str()),
             initial: SharedString::from(c.initial.as_str()),
             pinned: c.pinned,
+            unread: c.unread,
         })
         .collect();
     ui.set_circles(ModelRc::from(Rc::new(VecModel::from(circles))));
@@ -354,6 +355,8 @@ fn build_ui() -> BuiltUi {
                 let mut st = state.borrow_mut();
                 st.switch_to(target as usize, live_draft, live_scroll);
                 let active = st.active();
+                // #64: switch_to cleared the focused room's unread; reflect it.
+                rebuild_rail(&ui, &st);
                 apply_view(&ui, st.current(), active as i32);
             }
             // Deferred: focusing during a (possibly key-triggered, e.g. Ctrl+L) callback
@@ -1073,10 +1076,13 @@ fn apply_net_event(
             // Always fold the message into the Lobby's RAM state; refresh the
             // visible transcript only when the Lobby is the active circle.
             let mut st = state.borrow_mut();
-            st.push_message(LOBBY, who, text, mine);
+            let raised = st.push_message(LOBBY, who, text, mine);
             let active = st.active();
             if active == LOBBY {
                 apply_view(ui, st.current(), active as i32);
+            } else if raised {
+                // #64: the Lobby got a message while unfocused — show its dot.
+                rebuild_rail(ui, &st);
             }
         }
         NetEvent::CircleJoined {
@@ -1106,10 +1112,13 @@ fn apply_net_event(
             // that circle's RAM state; refresh the transcript only when it's active.
             let mut st = state.borrow_mut();
             if let Some(idx) = st.index_of_circle_id(circle_id) {
-                st.push_message(idx, who, text, mine);
+                let raised = st.push_message(idx, who, text, mine);
                 let active = st.active();
                 if active == idx {
                     apply_view(ui, st.current(), active as i32);
+                } else if raised {
+                    // #64: a circle got a message while unfocused — show its dot.
+                    rebuild_rail(ui, &st);
                 }
             }
         }
@@ -1757,6 +1766,7 @@ fn main() {
     let show_new = args.iter().any(|a| a == "--show-new");
     let show_palette = args.iter().any(|a| a == "--show-palette");
     let show_about = args.iter().any(|a| a == "--show-about");
+    let show_unread = args.iter().any(|a| a == "--show-unread");
     // ISC-C62 proof: materialize a circle then apply a synthetic relay rendezvous so
     // the rail shows the relay-derived adj-noun label instead of the `#<hex>`
     // placeholder (the live path runs on the CircleJoined event, which needs a relay).
@@ -1796,6 +1806,7 @@ fn main() {
         || show_new
         || show_palette
         || show_about
+        || show_unread
         || show_joined_label
         || show_shares
         || show_publish
@@ -2103,6 +2114,18 @@ fn main() {
         }
         if show_about {
             ui.set_about_open(true);
+        }
+        if show_unread {
+            // #64 fixture: materialize a circle, return to the Lobby, then receive a
+            // non-own message in the now-unfocused circle so its rail dot renders.
+            materialize_and_select(&ui, &state, &net, "demo unread fixture phrase");
+            let mut st = state.borrow_mut();
+            st.switch_to(0, String::new(), 0.0);
+            st.push_message(1, "ally".into(), "ping".into(), false);
+            rebuild_rail(&ui, &st);
+            // Reflect the Lobby as the focused row so the circle (idx 1) is the
+            // unfocused one carrying the dot.
+            apply_view(&ui, st.current(), 0);
         }
         if let Some(n) = switch {
             ui.invoke_switch_circle(n);
