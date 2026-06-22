@@ -28,6 +28,10 @@ work lives in the project lead's vault manifest, not here.
 
 - Windows build recipe (`packaging/windows/build-windows.sh`): cross-compiles a self-contained `daemonseed-gui.exe` for `x86_64-pc-windows-gnu` via cargo-zigbuild (zig static-links the mingw runtime; depends only on stock Windows 10+ DLLs).
 
+### Fixed
+
+- Command palette has a close (×) control, so it dismisses without selecting an item. (#58)
+
 ## [0.29.1] — GUI window-size default + build-version readout
 
 Fresh-identity windows open at the intended landscape size, the running build

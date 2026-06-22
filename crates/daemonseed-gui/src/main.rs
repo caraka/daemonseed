@@ -1750,6 +1750,7 @@ fn main() {
     let self_check_requested = args.iter().any(|a| a == "--self-check");
     let show_join = args.iter().any(|a| a == "--show-join");
     let show_new = args.iter().any(|a| a == "--show-new");
+    let show_palette = args.iter().any(|a| a == "--show-palette");
     // ISC-C62 proof: materialize a circle then apply a synthetic relay rendezvous so
     // the rail shows the relay-derived adj-noun label instead of the `#<hex>`
     // placeholder (the live path runs on the CircleJoined event, which needs a relay).
@@ -1787,6 +1788,7 @@ fn main() {
         || materialize.is_some()
         || show_join
         || show_new
+        || show_palette
         || show_joined_label
         || show_shares
         || show_publish
@@ -2088,6 +2090,9 @@ fn main() {
         }
         if show_new {
             ui.invoke_open_new();
+        }
+        if show_palette {
+            ui.set_palette_open(true);
         }
         if let Some(n) = switch {
             ui.invoke_switch_circle(n);

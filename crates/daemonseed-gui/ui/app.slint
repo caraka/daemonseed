@@ -713,6 +713,15 @@ export component AppWindow inherits Window {
                     Text { text: a.shortcut; color: #aeb6c2; font-size: 13px; font-weight: 600; vertical-alignment: center; } }
             }
         }
+        // Backend-independent dismiss: Ctrl-K/Escape die on the winit Windows
+        // backend (#58), so a clickable close-X is the reliable exit path.
+        Rectangle {
+            x: parent.width - self.width - 10px; y: 10px;
+            width: 26px; height: 26px; border-radius: 6px;
+            background: palette-close.has-hover ? #ffffff14 : transparent;
+            palette-close := TouchArea { clicked => { root.palette-open = false; root.focus-composer(); } }
+            Text { text: "×"; color: #aeb6c2; font-size: 20px; horizontal-alignment: center; vertical-alignment: center; }
+        }
     }
 
     // ── Join-a-circle overlay (brief "Join a circle" screen) ──
