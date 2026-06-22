@@ -254,6 +254,7 @@ export component AppWindow inherits Window {
     // Round-4 circle-plumbing surfaces.
     in-out property <bool> join-open: false;       // Join-a-circle overlay visible
     in-out property <bool> new-open: false;        // New-circle overlay visible
+    in-out property <bool> about-open: false;      // About overlay visible (#59)
     // Commit-3 publish surface: the Publish overlay (a manage-your-shares sheet).
     in-out property <bool> publish-open: false;    // Publish overlay visible
     in-out property <string> publish-name;         // optional share name (blank → folder basename)
@@ -419,6 +420,7 @@ export component AppWindow inherits Window {
                 root.palette-open = false;
                 root.join-open = false;
                 root.new-open = false;
+                root.about-open = false;
                 root.focus-composer();
                 return accept;
             }
@@ -484,9 +486,17 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
+                // Footer: the Ctrl+K hint (click opens the palette) on the left, the
+                // always-visible release version on the right (#59) — the in-app
+                // readout testers need; reads the same `app-version` property as the
+                // auth screens. One row, so it can't clip the window's bottom edge.
                 Rectangle { height: 22px;
                     TouchArea { clicked => { root.palette-open = true; } }
-                    HorizontalLayout { padding: 6px; Text { text: "Ctrl+K   commands"; color: #8b93a1; font-size: 13px; vertical-alignment: center; } } }
+                    HorizontalLayout { padding: 6px; spacing: 6px;
+                        Text { text: "Ctrl+K   commands"; color: #8b93a1; font-size: 13px; vertical-alignment: center; }
+                        Rectangle { }
+                        Text { text: root.app-version; color: #5b6472; font-size: 12px; vertical-alignment: center; }
+                    } }
             }
         }
 
@@ -700,11 +710,12 @@ export component AppWindow inherits Window {
                         root.palette-open = false;
                         // Action registry → real behavior. 0 = Lobby, 1 = New
                         // circle, 2 = Join a circle, 3 = Fetch a share (open the
-                        // Shares tab + refresh the catalog).
+                        // Shares tab + refresh the catalog), 4 = About overlay.
                         if (i == 0) { root.switch-circle(0); }
                         if (i == 1) { root.open-new(); }
                         if (i == 2) { root.open-join(); }
                         if (i == 3) { root.active-tab = 1; root.shares-tab-opened(); }
+                        if (i == 4) { root.about-open = true; }
                     }
                 }
                 HorizontalLayout { padding-left: 10px; spacing: 8px;
@@ -721,6 +732,40 @@ export component AppWindow inherits Window {
             background: palette-close.has-hover ? #ffffff14 : transparent;
             palette-close := TouchArea { clicked => { root.palette-open = false; root.focus-composer(); } }
             Text { text: "×"; color: #aeb6c2; font-size: 20px; horizontal-alignment: center; vertical-alignment: center; }
+        }
+    }
+
+    // ── About overlay (#59) — version / project / license / repo readout. The
+    // Close pill is a mouse dismiss path (Windows-safe, like join/new). ──
+    about := Rectangle {
+        x: (root.width - self.width) / 2; y: 110px;
+        width: 440px; height: 250px;
+        visible: root.about-open;
+        background: #0e0f11; border-radius: 12px; border-width: 1px; border-color: #ffffff18;
+        VerticalLayout {
+            padding: 22px; spacing: 10px; alignment: start;
+            HorizontalLayout {
+                Text { text: "daemonseed"; color: #e4e8ee; font-size: 19px; vertical-alignment: center; }
+                Rectangle { }
+                Text { text: root.app-version; color: #4a9d8e; font-size: 15px; vertical-alignment: center; }
+            }
+            Text { text: "Federated, end-to-end-encrypted comms & file sharing."; color: #8b93a1; font-size: 13px; }
+            Rectangle { height: 1px; background: #ffffff12; }
+            HorizontalLayout {
+                Text { text: "License"; color: #5b6472; font-size: 13px; }
+                Rectangle { }
+                Text { text: "AGPL-3.0-or-later"; color: #cfd5dd; font-size: 13px; }
+            }
+            HorizontalLayout {
+                Text { text: "Source"; color: #5b6472; font-size: 13px; }
+                Rectangle { }
+                Text { text: "github.com/caraka/daemonseed"; color: #cfd5dd; font-size: 13px; }
+            }
+            Rectangle { }
+            HorizontalLayout {
+                Rectangle { }
+                PillButton { label: "Close"; w: 80px; clicked => { root.about-open = false; root.focus-composer(); } }
+            }
         }
     }
 

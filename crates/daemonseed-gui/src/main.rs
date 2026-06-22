@@ -685,6 +685,11 @@ fn build_ui() -> BuiltUi {
             label: "Fetch a share".into(),
             shortcut: "".into(),
         },
+        ActionData {
+            // Opens the About overlay (#59 — version / license / repo readout).
+            label: "About daemonseed".into(),
+            shortcut: "".into(),
+        },
     ];
     ui.set_actions(ModelRc::from(Rc::new(VecModel::from(actions))));
 
@@ -1751,6 +1756,7 @@ fn main() {
     let show_join = args.iter().any(|a| a == "--show-join");
     let show_new = args.iter().any(|a| a == "--show-new");
     let show_palette = args.iter().any(|a| a == "--show-palette");
+    let show_about = args.iter().any(|a| a == "--show-about");
     // ISC-C62 proof: materialize a circle then apply a synthetic relay rendezvous so
     // the rail shows the relay-derived adj-noun label instead of the `#<hex>`
     // placeholder (the live path runs on the CircleJoined event, which needs a relay).
@@ -1789,6 +1795,7 @@ fn main() {
         || show_join
         || show_new
         || show_palette
+        || show_about
         || show_joined_label
         || show_shares
         || show_publish
@@ -2093,6 +2100,9 @@ fn main() {
         }
         if show_palette {
             ui.set_palette_open(true);
+        }
+        if show_about {
+            ui.set_about_open(true);
         }
         if let Some(n) = switch {
             ui.invoke_switch_circle(n);
