@@ -24,6 +24,11 @@ next release this block is renamed to its version + date and a fresh
 `[Unreleased]` is opened (see `AGENTS.md` doc-sync). Planning for *unstarted*
 work lives in the project lead's vault manifest, not here.
 
+### Fixed
+
+- ISC distribution drift-guard counts corrected to 97 positive / 55 negative /
+  152 total, matching the unified-share-model registry additions (S30, A-S22, C77).
+
 ## [0.29.0] — Unified share model: relay-blind in-band share discovery
 
 Shares move to fully relay-blind in-band discovery: sealed `ShareAnnouncement` /

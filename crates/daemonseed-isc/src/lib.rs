@@ -367,19 +367,20 @@ mod tests {
                 IscClass::Negative => neg += 1,
             }
         }
-        // ISA `## Criteria` (built, non-deferred): 53 server + 96 client = 149.
-        //   server  30 pos + 23 neg = 53
-        //   client  65 pos + 31 neg = 96  (M13 C59-C62 + A-C29/A-C30;
+        // ISA `## Criteria` (built, non-deferred): 55 server + 97 client = 152.
+        //   server  31 pos + 24 neg = 55  (unified share model: S30 pos, A-S22 neg)
+        //   client  66 pos + 31 neg = 97  (M13 C59-C62 + A-C29/A-C30;
         //                                  M15 C  C63-C65 + A-C31/A-C32;
         //                                  M16 A1 C66 + A-C33; A2 C67; A3 C68;
         //                                  A4 C72; C1 C69; C2 C70; C3 C71;
         //                                  smoke fix A-C34 publish-idempotency;
         //                                  crown C73-C75 + A-C35/A-C36 serve-from-disk;
         //                                  chunking completion C76 robust-chunked-fetch
-        //                                  + A-C37 manifest-frame-budget)
-        //   total   95 pos + 54 neg = 149
-        assert_eq!(pos, 95, "positive count drift");
-        assert_eq!(neg, 54, "negative count drift");
+        //                                  + A-C37 manifest-frame-budget;
+        //                                  unified share model C77 pos)
+        //   total   97 pos + 55 neg = 152
+        assert_eq!(pos, 97, "positive count drift");
+        assert_eq!(neg, 55, "negative count drift");
     }
 
     /// COVERED is single-sourced and must agree with the per-milestone
