@@ -24,6 +24,13 @@ next release this block is renamed to its version + date and a fresh
 `[Unreleased]` is opened (see `AGENTS.md` doc-sync). Planning for *unstarted*
 work lives in the project lead's vault manifest, not here.
 
+## [0.29.0] — Unified share model: relay-blind in-band share discovery
+
+Shares move to fully relay-blind in-band discovery: sealed `ShareAnnouncement` /
+`ShareRollCall` over the subscribe stream replace the relay share registry,
+public-share content is sealed under the public room key, and the relay holds no
+share directory. Plus first-start passphrase confirmation and GUI felt-fixes.
+
 ### Added
 
 - `ShareAnnouncement` wire message + `daemonseed-core::share_announce` seal/open
@@ -47,6 +54,8 @@ work lives in the project lead's vault manifest, not here.
 - First-run desktop-integration prompt + `--install` / `--remove` flags that
   register an XDG `.desktop` entry and hicolor icons.
 - Desktop GUI window-size persistence across restarts (size only).
+- First-start passphrase confirm re-entry — a second masked field that must match
+  before sealing a new identity.
 
 ### Changed
 
@@ -69,6 +78,8 @@ work lives in the project lead's vault manifest, not here.
   Chat landing view. (#34)
 - Desktop GUI window title is "Daemonseed".
 - AppImage recipe emits a 256px PNG + top-level `.DirIcon`.
+- The Shares-tab "Publish" button reads "Manage shares".
+- The download-complete banner auto-dismisses after a 30s read. (#55)
 
 ### Fixed
 
@@ -86,6 +97,15 @@ work lives in the project lead's vault manifest, not here.
 - The download folder picker defaults to the OS Downloads folder instead of `$HOME`.
 - The chat composer regains focus when the circle-join dialog is closed (Esc or
   Close).
+- The folder picker no longer hangs on a repeated publish — the pickers run on the
+  app's long-lived runtime instead of a fresh per-pick one. (#33)
+
+### Removed
+
+- The relay share registry: the `PublishShare` / `UnpublishShare` /
+  `ListPublicShares` PublicSpace RPCs, the `PublicShareListing` message, and the
+  server-side `SharePublishRegistry`. (#51)
+- The CLI's registry-backed `publish` / `unpublish` / `list-shares` subcommands. (#51)
 
 ## [0.28.0] — GUI auth-input felt-fixes + global font pass (round 2)
 

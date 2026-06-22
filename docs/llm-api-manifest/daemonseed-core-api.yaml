@@ -807,7 +807,8 @@ modules:
       a verified ShareAnnouncement: an announce inserts or refreshes, a withdraw
       removes, an older sent_unix_ms for a known share is ignored. prune() ages
       entries out past a receive-time TTL; remove() drops one explicitly.
-      Transport-free. Types: ShareCatalog, DiscoveredShare, CatalogChange.
+      Transport-free. Types: ShareCatalog, DiscoveredShare, ShareListing,
+      CatalogChange.
     no_std: false
     iscs:
       - A-S1
@@ -818,8 +819,8 @@ modules:
     description: >-
       Share CONTENT sealing — AES-256-GCM-seals each share_envelope ShareFrame
       (manifest/chunk) before it enters CotFrame.payload, so public-share traffic
-      is structurally indistinguishable from chat/circle traffic (the alpha
-      shipped it in the clear). seal_public_share_frame / seal_circle_share_frame
+      is structurally indistinguishable from chat/circle traffic.
+      seal_public_share_frame / seal_circle_share_frame
       are tier-split (the PublicRoomKey / CircleKey type is the guard — the wrong
       tier is a compile error); open_share_frame is generic over AeadKey256. No
       provenance signature: per-chunk SHA-384 integrity already lives inside the
@@ -2192,18 +2193,30 @@ types:
     description: "HashMap-backed, keyed by server-id string. M5 default; not persisted."
 
   # ── circle ──────────────────────────────────────────────────────────
-  - name: CotKey
-    module: daemonseed_core::circle
+  - name: CircleKey
+    module: daemonseed_core::circle::key
     kind: struct
     description: >-
-      Derived 32-byte symmetric key. ZeroizeOnDrop; Debug is redacted to
-      `CotKey(<redacted>)` per ISC-A-C1.
+      A derived 32-byte circle symmetric key (AES-256-GCM). ZeroizeOnDrop;
+      Debug is redacted to `CircleKey(<redacted>)` per ISC-A-C1. Implements
+      AeadKey256. as_bytes borrows the raw key; from_bytes wraps raw bytes into
+      a zeroizing CircleKey.
+    implements: [AeadKey256]
     security:
       contains_secret: true
       zeroize_on_drop: true
 
+  - name: AeadKey256
+    module: daemonseed_core::circle::key
+    kind: trait
+    description: >-
+      A 32-byte AEAD key abstraction implemented by both CircleKey and
+      PublicRoomKey, so a tier-agnostic open path accepts either tier's key
+      while seal sites stay type-split per tier. aead_key_bytes borrows the raw
+      32-byte key.
+
   - name: CircleKeyError
-    module: daemonseed_core::circle
+    module: daemonseed_core::circle::key
     kind: enum
     description: Failure modes for derive_cot_key.
     variants:
@@ -2612,6 +2625,193 @@ types:
       Methods: enable(&AutostartSpec, AutostartTarget) /
       disable(AutostartTarget) / is_enabled(AutostartTarget), each returning
       Result<_, AutostartError>.
+
+  # ── public_room ─────────────────────────────────────────────────────
+  - name: PublicRoomKey
+    module: daemonseed_core::public_room
+    kind: struct
+    description: >-
+      A derived 32-byte public-room key (AES-256-GCM) — the global,
+      server-readable key for a public room. A distinct type from CircleKey so
+      the two cannot be substituted at a seal site (the key-class guard);
+      implements AeadKey256 so an open path accepts either tier. ZeroizeOnDrop;
+      Debug is redacted to `PublicRoomKey(<redacted>)` per ISC-A-C1. as_bytes
+      borrows the raw key; from_bytes wraps raw bytes.
+    implements: [AeadKey256]
+    security:
+      contains_secret: true
+      zeroize_on_drop: true
+
+  # ── share_announce ──────────────────────────────────────────────────
+  - name: AnnouncementFields
+    module: daemonseed_core::share_announce
+    kind: struct
+    description: >-
+      The plaintext fields of a ShareAnnouncement the caller supplies; the
+      announcer pubkey and signature are filled in by the seal functions.
+      Borrowed (lifetime 'a) so sealing never forces a clone.
+    fields:
+      - name: room
+        type: "&'a str"
+        description: The room/circle the announcement belongs to (e.g. "lobby").
+      - name: sender_handle
+        type: "&'a str"
+        description: The announcer's self-asserted display handle (name#12hex). Advisory.
+      - name: share_id
+        type: "&'a str"
+        description: The share's opaque id (ISC-S21).
+      - name: name
+        type: "&'a str"
+        description: Display name of the shared folder.
+      - name: rating
+        type: "&'a str"
+        description: Sharer-assigned rating label. Advisory, never relay-enforced.
+      - name: withdraw
+        type: bool
+        description: "true = withdraw (unpublish); false = announce/refresh."
+      - name: sent_unix_ms
+        type: i64
+        description: Announcer wall-clock at announce time, unix milliseconds. Advisory.
+
+  # ── share_rollcall ──────────────────────────────────────────────────
+  - name: RollCallFields
+    module: daemonseed_core::share_rollcall
+    kind: struct
+    description: >-
+      The plaintext fields of a ShareRollCall the caller supplies; the requester
+      pubkey and signature are filled in by the seal functions. Borrowed
+      (lifetime 'a) so sealing never forces a clone.
+    fields:
+      - name: room
+        type: "&'a str"
+        description: The room/circle the roll-call probes (e.g. "lobby").
+      - name: requester_handle
+        type: "&'a str"
+        description: The requester's self-asserted display handle (name#12hex). Advisory.
+      - name: sent_unix_ms
+        type: i64
+        description: Requester wall-clock at request time, unix milliseconds. Advisory.
+
+  # ── share_catalog ───────────────────────────────────────────────────
+  - name: ShareCatalog
+    module: daemonseed_core::share_catalog
+    kind: struct
+    description: >-
+      The live set of shares discovered in one room/circle. new(ttl) constructs
+      an empty catalog pruning entries older than ttl (receive-time-measured);
+      apply folds a verified ShareAnnouncement; prune ages entries out; remove
+      drops one explicitly; entries returns the live shares sorted by name then
+      share_id; len / is_empty report size. The caller scopes it to one room
+      (it does not re-check the announcement's room field).
+
+  - name: DiscoveredShare
+    module: daemonseed_core::share_catalog
+    kind: struct
+    description: >-
+      One discovered share — the rendered row of the share browser, built from a
+      verified ShareAnnouncement.
+    fields:
+      - name: share_id
+        type: String
+        description: The share's opaque id (ISC-S21) — names the fetch rendezvous address.
+      - name: name
+        type: String
+        description: Display name of the shared folder.
+      - name: rating
+        type: String
+        description: Sharer-assigned rating label. Advisory.
+      - name: sender_handle
+        type: String
+        description: The announcer's self-asserted display handle (name#12hex). Advisory.
+      - name: sender_pubkey
+        type: "Vec<u8>"
+        description: The announcer's ML-DSA-87 public key (for the ISC-C4 handle binding).
+      - name: announced_unix_ms
+        type: i64
+        description: The announcer's advisory wall-clock; used only to order successive announces of the same share.
+      - name: received_at
+        type: "std::time::Instant"
+        description: Local monotonic receive time of the most recent announce; TTL pruning measures from here.
+
+  - name: ShareListing
+    module: daemonseed_core::share_catalog
+    kind: struct
+    description: >-
+      A public-share row as surfaced to clients. Plain client-side struct;
+      fields are the sharer's self-asserted classification (advisory, never
+      relay-policed). Derives Clone, Debug, PartialEq, Eq, Default; convertible
+      From<&DiscoveredShare>.
+    implements: [Clone, Debug, PartialEq, Eq, Default]
+    fields:
+      - name: share_id
+        type: String
+        description: The share's opaque id.
+      - name: name
+        type: String
+        description: Display name of the shared folder.
+      - name: rating
+        type: String
+        description: Sharer-assigned rating label. Advisory.
+      - name: sharer_handle
+        type: String
+        description: The sharer's self-asserted handle.
+
+  - name: CatalogChange
+    module: daemonseed_core::share_catalog
+    kind: enum
+    description: >-
+      What ShareCatalog::apply did with an announcement, so a caller can decide
+      whether the browser needs a redraw without diffing the catalog. Copy.
+    variants:
+      - name: Added
+        description: A previously-unknown share was inserted.
+      - name: Updated
+        description: A known share's metadata / liveness was refreshed.
+      - name: Removed
+        description: A known share was withdrawn (removed).
+      - name: Unchanged
+        description: No-op (stale/reordered, or a withdraw of an unknown share).
+
+  # ── share_envelope ──────────────────────────────────────────────────
+  - name: ShareFrame
+    module: daemonseed_core::share_envelope
+    kind: enum
+    description: >-
+      One application-level frame inside a CotFrame.payload on the share-fetch
+      path (ISC-19). encode serializes it to its on-wire bytes; decode parses a
+      payload back, fail-closed (DecodeError). Derives Debug, Clone, PartialEq,
+      Eq.
+    implements: [Debug, Clone, PartialEq, Eq]
+    variants:
+      - name: ManifestRequest
+        description: "Fetcher → sharer: send me the manifest for this share."
+      - name: ManifestResponse
+        description: "Sharer → fetcher: { entries: Vec<ManifestEntry> } — one entry per file."
+      - name: ChunkRequest
+        description: "Fetcher → sharer: { chunk_addr: ChunkAddr } — send me this chunk."
+      - name: ChunkResponse
+        description: "Sharer → fetcher: { chunk_addr: ChunkAddr, data: Vec<u8> } — the fetcher MUST re-derive SHA-384 over data and reject a mismatch."
+
+  - name: ManifestEntry
+    module: daemonseed_core::share_envelope
+    kind: struct
+    description: >-
+      One file's entry in a ShareFrame::ManifestResponse. Derives Debug, Clone,
+      PartialEq, Eq.
+    implements: [Debug, Clone, PartialEq, Eq]
+    fields:
+      - name: rel_path
+        type: String
+        description: The file's path relative to the share root.
+      - name: size
+        type: u64
+        description: The file's size in bytes (advisory; the per-chunk SHA-384 is authoritative).
+      - name: chunks
+        type: "Vec<ChunkAddr>"
+        description: >-
+          The file's ordered chunk addresses (M16). The bytes are the
+          concatenation of the chunks in this order; each address is the SHA-384
+          of that chunk. An empty file is size 0, chunks [].
 
 # ─────────────────────────────────────────────────────────────────────
 # Functions — every public function. Each references its module.
@@ -3625,10 +3825,10 @@ functions:
       SHA-384(cot_key.as_bytes() || server_id) (ISC-8). Transient key||id buffer
       is zeroed after hashing. server_id must be the same stable wire server-id
       representation on member + relay.
-    signature: "pub fn asset_address(cot_key: &circle::key::CotKey, server_id: &[u8]) -> Result<AssetAddr, oxicrypt_module::Error>"
+    signature: "pub fn asset_address(cot_key: &circle::key::CircleKey, server_id: &[u8]) -> Result<AssetAddr, oxicrypt_module::Error>"
     parameters:
       - name: cot_key
-        type: "&circle::key::CotKey"
+        type: "&circle::key::CircleKey"
         direction: in
         description: The circle-of-trust symmetric key.
       - name: server_id
@@ -3661,7 +3861,7 @@ functions:
       - name: share_id
         type: "&[u8]"
         direction: in
-        description: The public share identifier (from PublicShareListing.share_id).
+        description: The public share's opaque id (a ShareAnnouncement.share_id, ISC-S21).
       - name: server_id
         type: "&[u8]"
         direction: in
@@ -3769,10 +3969,10 @@ functions:
       nonce(12)||ciphertext||tag(16) envelope for a CotFrame.payload. Fresh
       random nonce per call; AAD = MESSAGE_AAD; prost plaintext zeroed after
       GCM consumes it.
-    signature: "pub fn seal_message(cot_key: &circle::key::CotKey, message: &daemonseed_proto::v1::CircleMessage) -> Result<Vec<u8>, MessageError>"
+    signature: "pub fn seal_message(cot_key: &circle::key::CircleKey, message: &daemonseed_proto::v1::CircleMessage) -> Result<Vec<u8>, MessageError>"
     parameters:
       - name: cot_key
-        type: "&circle::key::CotKey"
+        type: "&circle::key::CircleKey"
         direction: in
         description: The circle-of-trust symmetric key (the AES-256-GCM key).
       - name: message
@@ -3792,10 +3992,10 @@ functions:
       Fails closed (Authentication) on a wrong cot_key or any tamper — the
       position a content-blind relay is in (ISC-A-S2). Recovered plaintext
       zeroed before returning.
-    signature: "pub fn open_message(cot_key: &circle::key::CotKey, sealed: &[u8]) -> Result<daemonseed_proto::v1::CircleMessage, MessageError>"
+    signature: "pub fn open_message(cot_key: &circle::key::CircleKey, sealed: &[u8]) -> Result<daemonseed_proto::v1::CircleMessage, MessageError>"
     parameters:
       - name: cot_key
-        type: "&circle::key::CotKey"
+        type: "&circle::key::CircleKey"
         direction: in
         description: The circle-of-trust symmetric key.
       - name: sealed
@@ -4627,7 +4827,7 @@ functions:
 
   # ── circle ──────────────────────────────────────────────────────────
   - name: derive_cot_key
-    module: daemonseed_core::circle
+    module: daemonseed_core::circle::key
     description: >-
       ISC-C8/C9. Canonicalizes entropy (NFKC + whitespace) then
       HKDF-SHA-384(salt=CIRCLE_KEY_SALT, ikm=canonical) ->
@@ -4636,7 +4836,7 @@ functions:
       unchanged; only a cross-family change re-derives (ISC-A-C8 new-circle
       event). Strength gating (>=128-bit) is the caller's responsibility via
       passphrase::strength.
-    signature: "pub fn derive_cot_key(entropy: &str, suite: &Suite) -> Result<CotKey, CircleKeyError>"
+    signature: "pub fn derive_cot_key(entropy: &str, suite: &Suite) -> Result<CircleKey, CircleKeyError>"
     parameters:
       - name: entropy
         type: "&str"
@@ -4647,7 +4847,7 @@ functions:
         direction: in
         description: The suite whose family anchors the derivation.
     returns:
-      type: "Result<CotKey, CircleKeyError>"
+      type: "Result<CircleKey, CircleKeyError>"
       description: The derived 32-byte circle key.
       error_variants:
         - name: Hkdf
@@ -4655,12 +4855,55 @@ functions:
     preconditions:
       - description: The oxicrypt module must be operational.
 
-  - name: CotKey::as_bytes
-    module: daemonseed_core::circle
+  - name: CircleKey::as_bytes
+    module: daemonseed_core::circle::key
     description: >-
       Borrow raw key bytes for AEAD use; callers must not copy into a
       non-zeroizing buffer.
     signature: "pub fn as_bytes(&self) -> &[u8; COT_KEY_LEN]"
+    parameters: []
+    returns:
+      type: "&[u8; COT_KEY_LEN]"
+      description: A borrow of the raw 32-byte key.
+
+  - name: CircleKey::from_bytes
+    module: daemonseed_core::circle::key
+    description: >-
+      Wrap raw key bytes into a zeroizing CircleKey. The caller zeroes its own
+      copy of bytes after this call; the boxed copy zeroes on drop.
+    signature: "pub fn from_bytes(bytes: [u8; COT_KEY_LEN]) -> Self"
+    parameters:
+      - name: bytes
+        type: "[u8; COT_KEY_LEN]"
+        direction: in
+        description: The raw 32-byte key to wrap.
+    returns:
+      type: CircleKey
+      description: The zeroizing key wrapper.
+
+  - name: circle_fingerprint
+    module: daemonseed_core::circle::key
+    description: >-
+      ISC-C62. A relay-independent `#<12hex>` fingerprint of a circle — a pure
+      function of the ISC-C9-canonicalized entropy (SHA-384, first 6 bytes hex).
+      The canonical form is zeroed after hashing. Returns a bare `"#"` if the SHA
+      backend gate is uninitialized.
+    signature: "pub fn circle_fingerprint(entropy: &str) -> String"
+    parameters:
+      - name: entropy
+        type: "&str"
+        direction: in
+        description: The shared circle phrase.
+    returns:
+      type: String
+      description: The `#<12hex>` fingerprint.
+
+  - name: AeadKey256::aead_key_bytes
+    module: daemonseed_core::circle::key
+    description: >-
+      Borrow the raw 32-byte AEAD key. Callers must not copy it into a
+      non-zeroizing buffer. Implemented by both CircleKey and PublicRoomKey.
+    signature: "fn aead_key_bytes(&self) -> &[u8; COT_KEY_LEN]"
     parameters: []
     returns:
       type: "&[u8; COT_KEY_LEN]"

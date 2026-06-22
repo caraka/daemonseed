@@ -57,7 +57,7 @@ pub enum IscClass {
 /// Every ISC known to this MVP, in declaration order from `ds-isc-draft.md`.
 /// Length is [`TOTAL`].
 pub const ISCS: &[(&str, IscClass)] = &[
-    // ── server positive (30) ────────────────────────────────────────────
+    // ── server positive (31) ────────────────────────────────────────────
     ("ISC-S1", IscClass::Positive),
     ("ISC-S2a", IscClass::Positive),
     ("ISC-S2b", IscClass::Positive),
@@ -88,7 +88,8 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-S27", IscClass::Positive),
     ("ISC-S28", IscClass::Positive),
     ("ISC-S29", IscClass::Positive),
-    // ── server negative (23) ────────────────────────────────────────────
+    ("ISC-S30", IscClass::Positive),
+    // ── server negative (24) ────────────────────────────────────────────
     ("ISC-A-S1", IscClass::Negative),
     ("ISC-A-S2", IscClass::Negative),
     ("ISC-A-S3", IscClass::Negative),
@@ -112,6 +113,7 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-A-S19", IscClass::Negative),
     ("ISC-A-S20", IscClass::Negative),
     ("ISC-A-S21", IscClass::Negative),
+    ("ISC-A-S22", IscClass::Negative),
     // ── client positive (42) — C5 intentionally vacant (R5) ─────────────
     ("ISC-C1", IscClass::Positive),
     ("ISC-C2", IscClass::Positive),
@@ -183,6 +185,8 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-C75", IscClass::Positive),
     // ── client positive (M16 chunking completion: robust chunked fetch) ──
     ("ISC-C76", IscClass::Positive),
+    // ── client positive (alpha3 unified-share-model: key-class safety) ──
+    ("ISC-C77", IscClass::Positive),
     // ── client negative (20) ────────────────────────────────────────────
     ("ISC-A-C1", IscClass::Negative),
     ("ISC-A-C2", IscClass::Negative),
@@ -224,7 +228,7 @@ pub const ISCS: &[(&str, IscClass)] = &[
 /// of truth for the coverage denominator, read live by `xtask isc-coverage`.
 /// Recount on every ISC add/remove (the `const _` assert below guards it
 /// against [`ISCS`]).
-pub const TOTAL: usize = 149;
+pub const TOTAL: usize = 152;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,

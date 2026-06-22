@@ -76,7 +76,7 @@ modules:
       so a slow connect or cold index never blocks the UI (ISC-A-C7 substrate).
       Current-thread + LocalSet is required because connect_session takes
       &mut dyn TrustStore (not Send) and the circle inbound-reader holds an
-      Rc<CotKey> — neither can be tokio::spawn'd onto a multi-thread runtime.
+      Rc<CircleKey> — neither can be tokio::spawn'd onto a multi-thread runtime.
       Commands: Connect (keeps the live AppSession, ephemeral identity D8 +
       trust store seeded for the dialed server in the requested C22 mode),
       JoinCircle (derive_cot_key + asset_address → subscribe; spawn_local an
@@ -161,7 +161,7 @@ modules:
       TrustEvent (a C28 trust-event key + scope, routed
       by the UI per its affordance class), ConnectionClosed (a C26 close-cause
       layer), SharesSnapshot ({ local: Vec<LocalShareRow>, remote:
-      Vec<PublicShareListing>, indexer_status: IndexerStatus } — ISC-17/20),
+      Vec<ShareListing>, indexer_status: IndexerStatus } — ISC-17/20),
       SharesError (RPC or storage failure surfaced on the status line),
       IndexerStatus(IndexerStatus) (M14 — a standalone indexer transition,
       Indexing → Ready, emitted on DefineShare and on background-scan completion;
@@ -276,8 +276,8 @@ public_types:
       - "fn close_cause(&self) -> Option<CloseCause>     # last close layer (ISC-28)"
       - "fn history_sel(&self) -> usize                  # Trust History selection (newest-first)"
       - "fn local_shares(&self) -> &[LocalShareRow]      # ISC-17 My-shares pane"
-      - "fn visible_public_shares(&self) -> Vec<&wire::PublicShareListing>  # ISC-17/18 post-filter"
-      - "fn public_shares_raw(&self) -> &[wire::PublicShareListing]  # pre-filter snapshot"
+      - "fn visible_public_shares(&self) -> Vec<&ShareListing>  # ISC-17/18 post-filter"
+      - "fn public_shares_raw(&self) -> &[ShareListing]  # pre-filter snapshot"
       - "fn indexer_status(&self) -> &IndexerStatus      # ISC-20 status line"
       - "fn is_share_hidden(&self, sharer: &str) -> bool # ISC-18 / C16"
       - "fn hide_input(&self) -> &str"

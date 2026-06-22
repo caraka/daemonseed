@@ -287,28 +287,6 @@ modules:
     iscs: [S18, A-S13]
     added_in: "v0.12.0 (M10)"
 
-  - name: daemonseed_server::share
-    description: >-
-      RAM-only published-share registry (M12, gate step 5 — user-publish file
-      sharing). SharePublishRegistry holds PublishShare'd listings in process
-      memory ONLY (ISC-A-S1 — a share is user data, not an operator carve-out),
-      keyed by a server-assigned opaque share_id and tagged with the publishing
-      connection's owner token. publish/unpublish/list back the PublicSpace
-      PublishShare / UnpublishShare / ListPublicShares RPCs; unpublish and reap
-      are owner-scoped. publish returns Option<share_id> — None refuses a
-      duplicate (owner, name) publish (M16 smoke fix, ISC-A-C34 backstop:
-      refused, never replaced, so a name reused across two distinct shares is
-      a visible error instead of a silent lost listing; the key is
-      per-connection, different daemons can share a name; the RPC maps None to
-      ALREADY_EXISTS). ShareReapGuard reaps a connection's shares on disconnect
-      (mirrors the CoT ReleaseGuard) so nothing survives the connection. The
-      relay is a blind forwarder: self-asserted name/rating/handle relayed
-      verbatim, never policed (ISC-A-S5b / ISC-C19), never bound to identity.
-    no_std: false
-    depends_on: [daemonseed-proto]
-    iscs: [C19, A-S1, A-S5b]
-    added_in: "M12 (gate step 5)"
-
 # ─────────────────────────────────────────────────────────────────────
 # Types
 # ─────────────────────────────────────────────────────────────────────
@@ -1289,10 +1267,9 @@ functions:
       so graceful shutdown never triggers on stream-end; termination is driven from
       the connection's own close via a CloseNotify IO-guard that fires the
       serve_with_incoming_shutdown signal on real peer close / GOAWAY / keepalive-
-      detected death. This is load-bearing for a held publisher: a daemon that issues
-      PublishShare then holds the connection open is no longer raced into a premature
-      close, and ShareReapGuard reaps exactly this connection's shares once, on the
-      real disconnect (ISC-A-S1). In production S is the raw transport from
+      detected death. This is load-bearing for a sharer serving content: a daemon serving a share
+      over its held subscribe stream is no longer raced into a premature close, and
+      connection-scoped relay state is released only on the real disconnect (ISC-A-S1). In production S is the raw transport from
       Connection<Authenticated, TlsStream<TcpStream>>::into_inner(). Renamed from
       serve_public_space at M8. M11: constructs one per-connection
       ConnectionLimiter (RateLimitConfig::default, Pi-4-sized) shared between a
