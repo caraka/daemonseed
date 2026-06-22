@@ -24,6 +24,12 @@ next release this block is renamed to its version + date and a fresh
 `[Unreleased]` is opened (see `AGENTS.md` doc-sync). Planning for *unstarted*
 work lives in the project lead's vault manifest, not here.
 
+## [0.29.1] — GUI window-size default + build-version readout
+
+Fresh-identity windows open at the intended landscape size, the running build
+version is visible on the auth screens, and the ISC distribution drift-guard is
+corrected to the unified-share-model registry counts.
+
 ### Added
 
 - Build version shown on the GUI unlock and first-start screens. (#59)

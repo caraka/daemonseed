@@ -57,7 +57,7 @@ All six crates are substantive as of the alpha1 MVP (M12). The `tui` crate — t
 
 ## Status
 
-Current release: **v0.29.0** — alpha (post-MVP). Unified share model: relay-blind in-band share discovery — sealed `ShareAnnouncement` / `ShareRollCall` over the subscribe stream replace the relay share registry, public-share content is sealed under the public room key, and the relay holds no share directory. Plus first-start passphrase confirmation and GUI felt-fixes.
+Current release: **v0.29.1** — alpha (post-MVP). GUI polish over the v0.29.0 unified share model (relay-blind in-band share discovery): fresh-identity windows open at the landscape default size and the running build version shows on the auth screens. See `CHANGELOG.md` for per-release detail.
 
 The per-release history lives in **[`CHANGELOG.md`](CHANGELOG.md)** (one entry per SSH-signed tag) — this section is intentionally kept to the current release so it can't silently drift. The release-signing *infrastructure* (real keys, Sigstore co-signature, reproducible builds, store / package-manager channels) and the platform features (biometric login, OS-native autostart) remain on a follow-up track; direct messaging is planned. Promotion to a public repository is gated on the `oxicrypt` sibling crate going public.
 
