@@ -478,6 +478,17 @@ impl FirstStart<BackupVerified> {
         }
         self.inner.display_name = display_name;
         self.inner.bootstrap = Some(bootstrap);
+        // Re-seal the at-rest blob so it carries the chosen name. The blob produced
+        // by `initialize` predates the name; without re-sealing here, a first-start
+        // whose name is never followed by another write-through persists a NAMELESS
+        // blob, and the name is silently lost at the next unlock (#65, and the
+        // earlier #57). `seeds` + `seal_key` were stashed at `initialize`.
+        if let (Some(seeds), Some(seal_key)) =
+            (self.inner.seeds.as_mut(), self.inner.seal_key.as_ref())
+        {
+            seeds.set_display_name(self.inner.display_name.clone());
+            self.inner.blob_bytes = seal_key.seal(seeds).map_err(FirstStartError::BlobSeal)?;
+        }
         Ok(FirstStart {
             inner: self.inner,
             _state: PhantomData,
@@ -522,11 +533,11 @@ impl FirstStart<Ready> {
             .identity_handle
             .expect("initialize always derives the identity handle")
             .with_display_name(display_name.clone());
-        // Fold the chosen display name into the live `Seeds` so it is the value
-        // the first write-through (M13) re-seals — the running client carries
-        // the same payload that produced `at_rest_blob_bytes`, with the name
-        // attached. (The first-start blob itself was sealed before the name was
-        // chosen; the binary persists the refreshed blob via the write-through.)
+        // The live `Seeds` already carry the chosen name (set in `finalize`, which
+        // also re-sealed `at_rest_blob_bytes` so the persisted blob is NOT nameless —
+        // #65). Re-assert it here so the recover() path (which does not go through
+        // `finalize`) still folds the name into the running payload; idempotent for
+        // the first-start path.
         let mut seeds = self
             .inner
             .seeds
@@ -782,6 +793,33 @@ mod tests {
         let blob = verified.at_rest_blob_bytes().to_vec();
         let opened = seeds::open(&blob, STRONG_PASSPHRASE, pid, argon).unwrap();
         assert_eq!(opened.seeds.mnemonic.to_phrase(), phrase);
+    }
+
+    /// Regression (#65, and the earlier #57): `finalize` must re-seal the at-rest
+    /// blob WITH the chosen display name. The blob is first sealed at `initialize`,
+    /// before any name exists; before the fix it was never re-sealed, so a
+    /// first-start with no later write-through persisted a NAMELESS blob and the
+    /// name was lost at the next unlock — peers then saw only the hash handle.
+    #[test]
+    fn finalize_persists_display_name_into_at_rest_blob() {
+        init_oxicrypt();
+        let sealed = FirstStart::<Welcome>::new()
+            .initialize(STRONG_PASSPHRASE, fast_params())
+            .unwrap();
+        let phrase = sealed.display_phrase();
+        let verified = sealed.verify_round_trip(&phrase).unwrap();
+        let ready = verified
+            .finalize(Some("alice".to_string()), placeholder_anchor())
+            .unwrap();
+        let pid = ready.inner.profile_config.profile_id;
+        let argon = ready.inner.profile_config.argon2;
+        let blob = ready.at_rest_blob_bytes().to_vec();
+        let opened = seeds::open(&blob, STRONG_PASSPHRASE, pid, argon).unwrap();
+        assert_eq!(
+            opened.seeds.display_name(),
+            Some("alice"),
+            "the persisted at-rest blob must carry the chosen display name"
+        );
     }
 
     #[test]
