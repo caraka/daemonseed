@@ -110,6 +110,11 @@ impl Platform for GuiPlatform {
 const W: u32 = 1100;
 const H: u32 = 680;
 
+/// Released build version shown in-app (auth-screen readout, issue #59 surface).
+/// Stamped at release from the git tag — like `lama.yaml` `version` and the README
+/// Status line — NOT Cargo's tag-driven `0.1.0`.
+const APP_VERSION: &str = "v0.29.1";
+
 /// Run `f` on the next event-loop tick instead of synchronously. Used to move
 /// `.focus()` calls OUT of key-event handlers: focusing an element while Slint is
 /// mid key-processing is re-entrant and corrupts routing for the NEXT key (caraka
@@ -310,6 +315,7 @@ type BuiltUi = (
 
 fn build_ui() -> BuiltUi {
     let ui = AppWindow::new().expect("create AppWindow");
+    ui.set_app_version(SharedString::from(APP_VERSION));
     // Round-4 seed: Lobby only (empty-state for circles; Lobby pinned + real).
     let state = Rc::new(RefCell::new(GuiState::lobby_only()));
     // The net actor is built HERE (round 5) so the circle-plumbing callbacks can
@@ -1854,6 +1860,14 @@ fn main() {
             // monitor; load_window_size() sanity-clamps absurd values).
             if let Some((w, h)) = load_window_size(&profile_root.borrow()) {
                 ui.window().set_size(slint::PhysicalSize::new(w, h));
+            } else {
+                // No saved size yet (fresh identity): winit does not reliably honour
+                // the .slint preferred-width/height on first map, so the window comes
+                // up square. Apply the design default explicitly. LOGICAL px keeps it
+                // DPI-independent (the restore branch above uses physical because
+                // winit's Resized event reports physical px).
+                ui.window()
+                    .set_size(slint::LogicalSize::new(W as f32, H as f32));
             }
             let weak = ui.as_weak();
             // Latest size, persisted once on close (one write per session, no disk churn

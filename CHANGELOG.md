@@ -24,8 +24,13 @@ next release this block is renamed to its version + date and a fresh
 `[Unreleased]` is opened (see `AGENTS.md` doc-sync). Planning for *unstarted*
 work lives in the project lead's vault manifest, not here.
 
+### Added
+
+- Build version shown on the GUI unlock and first-start screens. (#59)
+
 ### Fixed
 
+- Fresh-identity GUI windows open at the landscape default size instead of square. (#54)
 - ISC distribution drift-guard counts corrected to 97 positive / 55 negative /
   152 total, matching the unified-share-model registry additions (S30, A-S22, C77).
 

@@ -271,6 +271,7 @@ export component AppWindow inherits Window {
 
     // Real-networking status (round-3): driven by the net actor's events.
     in-out property <string> connection-status: "connecting…";
+    in property <string> app-version;                  // Rust-set release version (#59 readout)
     in-out property <bool> connected: false;
 
     callback switch-circle(int);
@@ -1241,5 +1242,16 @@ export component AppWindow inherits Window {
                 }
             }
         }
+    }
+
+    // Build-version readout, gated to the auth surfaces so a tester can cite the
+    // build before unlocking. Topmost child ⇒ draws over the opaque auth overlays.
+    // The full About/Help home is issue #59.
+    Text {
+        text: root.app-version;
+        visible: root.screen == "unlock" || root.screen == "first-start";
+        color: #4d5560; font-size: 11px;
+        x: (parent.width - self.width) / 2;
+        y: parent.height - self.height - 16px;
     }
 }
