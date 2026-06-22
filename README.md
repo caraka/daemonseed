@@ -90,3 +90,15 @@ packaging/appimage/build-appimage.sh        # → dist/daemonseed-gui-x86_64.App
 It builds `daemonseed-gui --release --features desktop` against a glibc 2.35 floor
 via `cargo-zigbuild` and bundles it with `appimagetool`. See
 [`packaging/appimage/README.md`](packaging/appimage/README.md) for requirements and knobs.
+
+A self-contained Windows build (no MSVC, no Windows host needed) lives in
+[`packaging/windows/`](packaging/windows/):
+
+```bash
+packaging/windows/build-windows.sh          # → dist/daemonseed-gui.exe
+```
+
+It cross-compiles `daemonseed-gui --release --features desktop` for
+`x86_64-pc-windows-gnu` via `cargo-zigbuild`; zig static-links the mingw runtime, so the
+`.exe` depends only on stock Windows 10+ system DLLs (nothing to ship alongside it).
+Requires the target: `rustup target add x86_64-pc-windows-gnu`.
