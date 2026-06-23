@@ -1119,6 +1119,14 @@ fn apply_net_event(
             ui.set_connection_status(SharedString::from(format!("offline · {reason}")));
             ui.set_connected(false);
         }
+        // #72: a live connection dropped. The actor already cleared its stale
+        // session and (when a connect plan exists, #71) armed auto-reconnect, so
+        // the UI just reflects offline + "reconnecting"; no UI-side reconnect is
+        // issued (that would double-dial and bypass the actor's backoff).
+        NetEvent::Disconnected { reason } => {
+            ui.set_connection_status(SharedString::from(format!("reconnecting · {reason}")));
+            ui.set_connected(false);
+        }
         NetEvent::Message { who, text, mine } => {
             // Always fold the message into the Lobby's RAM state; refresh the
             // visible transcript only when the Lobby is the active circle.
@@ -1338,6 +1346,10 @@ fn apply_net_event(
             ui.set_download_progress(0.0);
             ui.set_download_label(SharedString::from(format!("Download failed: {message}")));
         }
+        // Test-only probe (net.rs in-process oracle); never produced in a running
+        // binary, so it carries no UI effect.
+        #[cfg(test)]
+        NetEvent::ConnectedProbe { .. } => {}
     }
 }
 

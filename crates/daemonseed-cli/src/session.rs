@@ -37,6 +37,16 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Channel, Endpoint};
 
+/// h2 keepalive PING cadence on an idle application channel (#72). Chosen below
+/// the relay's ~30s h2 connection reap (ISA Out-of-Scope, "you must be online")
+/// so a live-but-idle peer is kept alive while a genuinely dead half-open socket
+/// is detected promptly.
+const KEEPALIVE_INTERVAL: core::time::Duration = core::time::Duration::from_secs(15);
+
+/// Bound on the PONG wait before a keepalive PING is treated as a dead
+/// connection (#72): the channel errors, ending the inbound `Subscribe` stream.
+const KEEPALIVE_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(10);
+
 /// A live application session: one tonic [`Channel`] multiplexed over a single
 /// post-`Authenticated` stream. Clone-cheap clients are minted on demand; the
 /// channel itself is shared (tonic `Channel` is internally reference-counted).
@@ -83,6 +93,17 @@ impl AppSession {
         let mut stream = Some(stream);
         let channel = Endpoint::try_from("http://[::1]:50051")
             .expect("static placeholder authority parses")
+            // h2 keepalive (#72): a half-open socket — e.g. the peer's host moves
+            // to a new network namespace on a VPN swap, silently black-holing the
+            // TCP connection — otherwise hangs a long-lived `Subscribe` stream
+            // forever, because no bytes flow to trigger an error. Sending a PING on
+            // an idle connection and bounding the PONG wait surfaces the dead link
+            // as a stream error within `KEEPALIVE_INTERVAL + KEEPALIVE_TIMEOUT`, so
+            // the inbound reader's `Err(_)` exit arm fires and the actor reconnects
+            // (#71) rather than waiting indefinitely.
+            .http2_keep_alive_interval(KEEPALIVE_INTERVAL)
+            .keep_alive_timeout(KEEPALIVE_TIMEOUT)
+            .keep_alive_while_idle(true)
             .connect_with_connector(tower::service_fn(move |_| {
                 let io = stream.take().expect("connector invoked exactly once");
                 async move { Ok::<_, std::io::Error>(TokioIo::new(io)) }

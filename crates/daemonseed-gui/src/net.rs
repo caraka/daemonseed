@@ -189,6 +189,38 @@ pub enum NetCommand {
     /// post a roll-call. Self-scheduled on [`RECONCILE_INTERVAL`]; never sent by
     /// the binary.
     ReconcileShares,
+    /// Internal (#72): an inbound subscribe stream ended or errored, so the live
+    /// connection is gone. Posted by [`read_inbound_public_room`] /
+    /// [`read_inbound_circle`] from their stream-exit arm. The actor clears the
+    /// stale session/server-id (so no half-open state is reused), emits
+    /// [`NetEvent::Disconnected`], and arms auto-reconnect (#71) when a prior
+    /// successful connect plan exists. Idempotent: the first such command per
+    /// drop tears down; later ones (from sibling readers of the same dead session)
+    /// are no-ops. Never sent by the binary.
+    Disconnected { reason: String },
+    /// Internal (#71): a backoff-timer tick — re-issue the stored [`ConnectPlan`]
+    /// to re-establish the connection (and silently re-join circles / re-publish
+    /// shares like a fresh launch). Self-scheduled by [`Actor::arm_reconnect`] on
+    /// capped exponential backoff while disconnected. Never sent by the binary.
+    Reconnect,
+    /// TEST SEAM (never used in production): drive the post-reconnect re-establish
+    /// path with a fresh in-memory [`AppSession`] instead of a real TCP `Connect`,
+    /// so the in-process oracle exercises the SAME re-subscribe logic the backoff
+    /// timer triggers. Carries the same `rejoin_circles` the stored plan would.
+    #[doc(hidden)]
+    #[cfg(test)]
+    ReattachSession {
+        session: AppSession,
+        server_id: String,
+        display_handle: Option<String>,
+        rejoin_circles: Vec<(u64, String)>,
+    },
+    /// TEST SEAM (never used in production): ask the actor to emit its current
+    /// `connected` flag as a [`NetEvent::ConnectedProbe`], so the oracle can assert
+    /// the post-drop teardown (#72) without a side channel into actor state.
+    #[doc(hidden)]
+    #[cfg(test)]
+    ProbeConnected,
     /// A1 fetch-preview: open the share's stream, read the manifest, emit
     /// `FetchManifest` (file names + sizes), then drop the stream. No bytes fetched.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -233,6 +265,12 @@ pub enum NetEvent {
     Connected { server_handle: String },
     /// The connection attempt failed; `reason` is human-readable.
     ConnectFailed { reason: String },
+    /// A live connection dropped — a subscribe stream ended (`Ok(None)`) or
+    /// errored (`Err`, e.g. an h2 keepalive PING went unanswered on a half-open
+    /// socket). The actor has cleared its stale session/server-id so no half-open
+    /// state is reused (#72); the UI shows offline. Auto-reconnect (#71) is armed
+    /// when a prior successful connect plan exists; `reason` is human-readable.
+    Disconnected { reason: String },
     /// A public room is subscribed and chat can flow; `room` is the joined name.
     RoomJoined { room: String },
     /// A message to render: a verified inbound frame, or a local echo of the
@@ -312,6 +350,13 @@ pub enum NetEvent {
     },
     /// A fetch failed (timeout, hash mismatch, I/O); partial files are deleted.
     FetchError { message: String },
+    /// TEST SEAM (never produced in production): the actor's current `connected`
+    /// flag, emitted in response to [`NetCommand::ProbeConnected`] so the in-process
+    /// oracle can assert the actor cleared its live state after a drop (#72) and
+    /// restored it after reconnect (#71).
+    #[doc(hidden)]
+    #[cfg(test)]
+    ConnectedProbe { connected: bool },
 }
 
 /// One file in an A1 fetch-preview ([`NetEvent::FetchManifest`]): the file's
@@ -451,6 +496,32 @@ struct OwnShare {
     sharer_handle: String,
 }
 
+/// The parameters of the last successful [`NetCommand::Connect`] (#71). Retained
+/// so the auto-reconnect timer can re-establish the connection exactly like the
+/// original launch — same relay, same persisted display handle, and the same
+/// `rejoin_circles` / `republish_roots` so a recovered connection restores circles
+/// and shares without any UI involvement. `None` until a first successful connect;
+/// cleared only by an explicit re-`Connect` replacing it (never by a drop, so a
+/// drop can reconnect using the same plan).
+#[derive(Clone)]
+struct ConnectPlan {
+    server_id: String,
+    address: String,
+    display_handle: Option<String>,
+    rejoin_circles: Vec<(u64, String)>,
+    republish_roots: Vec<(PathBuf, Option<String>)>,
+}
+
+/// First auto-reconnect backoff delay (#71). The actor waits this long after a
+/// drop before the first reconnect attempt, doubling each failed attempt up to
+/// [`RECONNECT_BACKOFF_MAX`]. Never a busy-loop.
+const RECONNECT_BACKOFF_BASE: Duration = Duration::from_secs(2);
+
+/// Cap on the auto-reconnect backoff delay (#71): exponential growth from
+/// [`RECONNECT_BACKOFF_BASE`] saturates here so a long outage retries steadily
+/// (once per cap) rather than backing off unboundedly.
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
 /// Prune-TTL for a discovered share's in-band liveness ([`ShareCatalog`]). Must
 /// exceed ~2 re-announce intervals so one missed reconcile cycle never drops a
 /// still-live share; [`RECONCILE_INTERVAL`] is the re-announce cadence.
@@ -507,6 +578,20 @@ struct Actor {
     /// holding its `serve_share` task handle so `UnpublishShare` can abort it
     /// (mirrors the TUI's `published` map). RAM-only — relay state is ephemeral.
     published: HashMap<String, tokio::task::JoinHandle<()>>,
+    /// `true` once a session is live (Authenticated), `false` after a drop (#72)
+    /// or before the first connect. Gates [`NetCommand::Disconnected`] so the
+    /// FIRST stream-exit per drop tears down and arms reconnect, while later ones
+    /// from sibling readers of the same dead session are no-ops (one drop, one
+    /// teardown).
+    connected: bool,
+    /// The last successful connect's parameters (#71), so the auto-reconnect timer
+    /// re-establishes exactly like the original launch. `None` until a first
+    /// successful connect.
+    last_connect: Option<ConnectPlan>,
+    /// The current auto-reconnect attempt counter (#71), driving the exponential
+    /// backoff delay. Reset to 0 on a successful (re)connect; incremented per
+    /// scheduled attempt.
+    reconnect_attempt: u32,
 }
 
 impl Actor {
@@ -567,6 +652,18 @@ impl Actor {
                     self.session = Some(session);
                     self.server_id = Some(server_id.to_owned());
                     self.identity = Some(identity);
+                    self.connected = true;
+                    // #71: remember this connect so a later drop reconnects with the
+                    // SAME relay + persisted handle + rejoin/republish sets. Reset the
+                    // backoff counter — a fresh success clears any prior failure run.
+                    self.last_connect = Some(ConnectPlan {
+                        server_id: server_id.to_owned(),
+                        address: address.to_owned(),
+                        display_handle: Some(self.my_handle.clone()),
+                        rejoin_circles: rejoin_circles.clone(),
+                        republish_roots: republish_roots.clone(),
+                    });
+                    self.reconnect_attempt = 0;
                     self.emit(NetEvent::Connected {
                         server_handle: outcome.server_handle,
                     });
@@ -639,6 +736,8 @@ impl Actor {
         }
         self.session = Some(session);
         self.server_id = Some(server_id);
+        self.connected = true;
+        self.reconnect_attempt = 0;
         self.emit(NetEvent::Connected {
             server_handle: "attached#000000000000".to_owned(),
         });
@@ -652,6 +751,105 @@ impl Actor {
             let name = republish_name(&root, persisted_name.as_deref());
             self.handle_publish_share(root, name, sharer.clone(), true)
                 .await;
+        }
+    }
+
+    /// Re-establish over a fresh in-memory session (TEST SEAM, #71/#72). Mirrors
+    /// what [`Actor::handle_reconnect`]'s `Connect` does — clears the prior
+    /// reconnect counter, re-attaches the (test-supplied) session, and re-joins the
+    /// circles — so the in-process oracle drives the SAME re-subscribe path the
+    /// backoff timer triggers in production, without a real TCP dial.
+    #[cfg(test)]
+    async fn handle_reattach(
+        &mut self,
+        session: AppSession,
+        server_id: String,
+        display_handle: Option<String>,
+        rejoin_circles: Vec<(u64, String)>,
+    ) {
+        self.handle_attach(
+            session,
+            server_id,
+            display_handle,
+            rejoin_circles,
+            Vec::new(),
+        )
+        .await;
+    }
+
+    /// Handle a live-connection drop (#72): tear down stale session state so a
+    /// half-open session is never reused, surface [`NetEvent::Disconnected`], and
+    /// arm auto-reconnect (#71). Idempotent — only the FIRST drop signal per
+    /// session does work; later ones (sibling readers of the same dead connection)
+    /// short-circuit because `connected` is already `false`.
+    fn handle_disconnected(&mut self, reason: String) {
+        if !self.connected {
+            return; // already torn down for this drop
+        }
+        self.connected = false;
+        // Drop every live handle to the dead connection. The detached reader tasks
+        // observe their streams ending and exit on their own; clearing the OUT
+        // halves here makes any in-flight send fail fast rather than block.
+        self.session = None;
+        self.server_id = None;
+        self.identity = None;
+        self.public_room = None;
+        self.circles.clear();
+        // Abort each serve task — its subscribe stream is dead; a republish on
+        // reconnect re-establishes it from the stored plan.
+        for (_id, task) in self.published.drain() {
+            task.abort();
+        }
+        self.own_shares.borrow_mut().clear();
+        self.emit(NetEvent::Disconnected { reason });
+        // #71: schedule a reconnect if we have a plan to reconnect WITH. Without a
+        // prior successful connect there is nothing to retry (e.g. a drop during
+        // the very first handshake surfaces as ConnectFailed, not here).
+        if self.last_connect.is_some() {
+            self.arm_reconnect();
+        }
+    }
+
+    /// Schedule one auto-reconnect attempt (#71) on capped exponential backoff: a
+    /// detached timer sleeps `min(BASE · 2^attempt, MAX)` then posts a
+    /// [`NetCommand::Reconnect`] back into the command loop. Self-terminating — the
+    /// send fails (and the loop ends) once the actor is gone. Never busy-loops.
+    fn arm_reconnect(&mut self) {
+        let attempt = self.reconnect_attempt;
+        self.reconnect_attempt = attempt.saturating_add(1);
+        let delay = reconnect_backoff(attempt);
+        let cmd_tx = self.cmd_tx.clone();
+        tokio::task::spawn_local(async move {
+            tokio::time::sleep(delay).await;
+            let _ = cmd_tx.send(NetCommand::Reconnect);
+        });
+    }
+
+    /// Run one auto-reconnect attempt (#71): if still disconnected and a stored
+    /// [`ConnectPlan`] exists, re-issue the full `Connect` (which restores circles
+    /// and shares from the plan). A successful connect resets the backoff and stops
+    /// the retry chain (`handle_connect` sets `connected = true`); a failed one
+    /// arms the next attempt with a longer delay. A reconnect that finds the
+    /// session already live (a racing manual reconnect) is a no-op.
+    async fn handle_reconnect(&mut self) {
+        if self.connected {
+            return; // already back up — nothing to retry
+        }
+        let Some(plan) = self.last_connect.clone() else {
+            return; // no plan to reconnect with
+        };
+        self.handle_connect(
+            &plan.server_id,
+            &plan.address,
+            plan.display_handle.clone(),
+            plan.rejoin_circles.clone(),
+            plan.republish_roots.clone(),
+        )
+        .await;
+        // If the attempt failed (`handle_connect` emitted ConnectFailed and left
+        // `connected == false`), schedule the next backoff tick.
+        if !self.connected && self.last_connect.is_some() {
+            self.arm_reconnect();
         }
     }
 
@@ -887,12 +1085,14 @@ impl Actor {
         let reader_key = Rc::clone(&cot_key);
         let reader_tx = self.evt_tx.clone();
         let reader_handle = self.my_handle.clone();
+        let reader_cmd = self.cmd_tx.clone();
         tokio::task::spawn_local(read_inbound_circle(
             inbound,
             circle_id,
             reader_key,
             reader_tx,
             reader_handle,
+            reader_cmd,
         ));
 
         self.circles.push(CircleSub {
@@ -1677,6 +1877,9 @@ async fn net_actor(
         public_room: None,
         circles: Vec::new(),
         published: HashMap::new(),
+        connected: false,
+        last_connect: None,
+        reconnect_attempt: 0,
     };
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
@@ -1721,6 +1924,8 @@ async fn net_actor(
             NetCommand::ApplyAnnouncement(ann) => actor.handle_apply_announcement(&ann),
             NetCommand::AnswerRollCall => actor.handle_answer_rollcall().await,
             NetCommand::ReconcileShares => actor.handle_reconcile_shares().await,
+            NetCommand::Disconnected { reason } => actor.handle_disconnected(reason),
+            NetCommand::Reconnect => actor.handle_reconnect().await,
             NetCommand::FetchShare { share_id, name } => {
                 actor.handle_fetch_share(&share_id, &name).await
             }
@@ -1752,6 +1957,21 @@ async fn net_actor(
                     )
                     .await
             }
+            #[cfg(test)]
+            NetCommand::ReattachSession {
+                session,
+                server_id,
+                display_handle,
+                rejoin_circles,
+            } => {
+                actor
+                    .handle_reattach(session, server_id, display_handle, rejoin_circles)
+                    .await
+            }
+            #[cfg(test)]
+            NetCommand::ProbeConnected => actor.emit(NetEvent::ConnectedProbe {
+                connected: actor.connected,
+            }),
         }
     }
 }
@@ -1822,7 +2042,16 @@ async fn read_inbound_public_room(
                 // A frame that opened under none of the three kinds is a foreign
                 // frame — skip silently.
             }
-            Ok(None) | Err(_) => return,
+            // #72: the subscribe stream ended (`Ok(None)`) or errored (`Err`, e.g.
+            // an h2 keepalive PING went unanswered on a half-open socket). Signal
+            // the actor so it tears down the stale session and arms reconnect (#71).
+            // Best-effort: if the actor is already gone the send fails and we just
+            // return.
+            Ok(None) | Err(_) => {
+                let reason = "lobby stream ended".to_owned();
+                let _ = cmd_tx.send(NetCommand::Disconnected { reason });
+                return;
+            }
         }
     }
 }
@@ -1841,6 +2070,7 @@ async fn read_inbound_circle(
     cot_key: Rc<CircleKey>,
     evt_tx: mpsc::UnboundedSender<NetEvent>,
     my_handle: String,
+    cmd_tx: mpsc::UnboundedSender<NetCommand>,
 ) {
     loop {
         match inbound.message().await {
@@ -1865,9 +2095,28 @@ async fn read_inbound_circle(
                 }
                 // A decrypt/auth error means a foreign frame — skip silently.
             }
-            Ok(None) | Err(_) => return,
+            // #72: a circle subscribe stream ended/errored. The whole session
+            // shares one h2 connection, so this is the same drop the lobby reader
+            // sees; signal the actor (idempotent teardown collapses the duplicates).
+            Ok(None) | Err(_) => {
+                let reason = "circle stream ended".to_owned();
+                let _ = cmd_tx.send(NetCommand::Disconnected { reason });
+                return;
+            }
         }
     }
+}
+
+/// The auto-reconnect backoff delay for a given attempt index (#71): capped
+/// exponential — `min(RECONNECT_BACKOFF_BASE · 2^attempt, RECONNECT_BACKOFF_MAX)`.
+/// Attempt 0 is the first retry after a drop; the delay doubles each failed
+/// attempt and saturates at the cap so a long outage retries steadily, never in a
+/// busy-loop and never backing off unboundedly.
+fn reconnect_backoff(attempt: u32) -> Duration {
+    let base = RECONNECT_BACKOFF_BASE.as_secs();
+    // 2^attempt with overflow saturating straight to the cap.
+    let secs = base.saturating_mul(1u64.checked_shl(attempt).unwrap_or(u64::MAX));
+    Duration::from_secs(secs.min(RECONNECT_BACKOFF_MAX.as_secs()))
 }
 
 /// Wall-clock now in unix milliseconds (advisory message timestamp). Mirrors the
@@ -1993,6 +2242,110 @@ mod tests {
             registry,
             Arc::new(Vec::new()),
         ))
+    }
+
+    /// A transport wrapper whose I/O can be force-killed (#72 oracle): once
+    /// `kill()` fires, every read returns EOF and every write/flush errors, exactly
+    /// as a dead socket (a VPN namespace swap black-holing the TCP connection)
+    /// behaves to the h2 layer. Aborting the relay *task* alone does NOT close the
+    /// connection — tonic keeps the live h2 connection on internal runtime tasks the
+    /// outer abort never touches — so the test needs a transport it can actually
+    /// sever. Wrapping the relay's SERVER-side IO and killing it propagates EOF to
+    /// the CLIENT's subscribe stream, the same end-of-stream the reader exits on.
+    /// Shared kill switch for [`KillableIo`]: a flag plus the parked read [`Waker`]
+    /// so flipping the flag also WAKES the server's parked read. Without the wake, a
+    /// kill on an idle connection (no frames flowing) would never be observed —
+    /// `poll_read` is parked and only re-polls when the underlying duplex signals,
+    /// which a mere flag flip does not do. Modelling the dead socket faithfully
+    /// requires actively waking the reader.
+    #[derive(Default)]
+    struct KillSwitch {
+        killed: std::sync::atomic::AtomicBool,
+        read_waker: std::sync::Mutex<Option<std::task::Waker>>,
+    }
+
+    impl KillSwitch {
+        fn kill(&self) {
+            self.killed.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(w) = self.read_waker.lock().unwrap().take() {
+                w.wake();
+            }
+        }
+        fn dead(&self) -> bool {
+            self.killed.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    struct KillableIo {
+        inner: tokio::io::DuplexStream,
+        kill: Arc<KillSwitch>,
+    }
+
+    impl tokio::io::AsyncRead for KillableIo {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.kill.dead() {
+                // EOF — the peer is gone. The server's h2 layer sees the read close
+                // and writes a GOAWAY, ending the CLIENT's subscribe stream.
+                return std::task::Poll::Ready(Ok(()));
+            }
+            // Park our waker so a later `kill()` wakes this read even while idle.
+            *self.kill.read_waker.lock().unwrap() = Some(cx.waker().clone());
+            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for KillableIo {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            // Writes pass through even after kill so the server can still write its
+            // GOAWAY to terminate the client's stream promptly; a write-error would
+            // strand the client. The kill models the read direction dying.
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// A relay whose server-side transport can be force-killed mid-session (#72
+    /// oracle). Returns a [`KillSwitch`]: calling `kill()` severs the connection
+    /// (read-EOF + wake) so the client's subscribe stream ends. The relay still
+    /// uses a real `serve_application`; only the transport under it is killable.
+    fn spawn_killable_relay(
+        server_io: tokio::io::DuplexStream,
+        registry: CotRegistry,
+    ) -> (
+        tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+        Arc<KillSwitch>,
+    ) {
+        let kill = Arc::new(KillSwitch::default());
+        let io = KillableIo {
+            inner: server_io,
+            kill: Arc::clone(&kill),
+        };
+        let task = tokio::task::spawn_local(serve_application(
+            io,
+            PublicSpaceService::new(Arc::new(PublicSpaceState::empty())),
+            registry,
+            Arc::new(Vec::new()),
+        ));
+        (task, kill)
     }
 
     /// Build a `NetHandle` whose actor is pre-attached to `session` via the test
@@ -2667,6 +3020,40 @@ mod tests {
         panic!("actor never reported CircleJoined");
     }
 
+    /// Wait for the actor to surface a drop (#72): returns the `Disconnected`
+    /// event's reason, or `None` if none arrived within the budget.
+    async fn wait_for_disconnected(
+        evt_rx: &mut mpsc::UnboundedReceiver<NetEvent>,
+    ) -> Option<String> {
+        for _ in 0..400 {
+            while let Ok(evt) = evt_rx.try_recv() {
+                if let NetEvent::Disconnected { reason } = evt {
+                    return Some(reason);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        None
+    }
+
+    /// Probe the actor's `connected` flag via the test seam and return it. Drains
+    /// any interleaved events until the [`NetEvent::ConnectedProbe`] reply arrives.
+    async fn probe_connected(
+        cmd_tx: &mpsc::UnboundedSender<NetCommand>,
+        evt_rx: &mut mpsc::UnboundedReceiver<NetEvent>,
+    ) -> bool {
+        cmd_tx.send(NetCommand::ProbeConnected).ok();
+        for _ in 0..400 {
+            while let Ok(evt) = evt_rx.try_recv() {
+                if let NetEvent::ConnectedProbe { connected } = evt {
+                    return connected;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("actor never answered ProbeConnected");
+    }
+
     /// Interop insurance (round-3 lesson): the GUI circle rendezvous derivation is
     /// the canonical one — pinned against an independent `derive_cot_key` +
     /// `asset_address` (the CIRCLE path) AND asserted DISTINCT from the room path,
@@ -2780,6 +3167,171 @@ mod tests {
                 "sender A sees its own message via local echo, tagged with its circle_id"
             );
         });
+    }
+
+    /// #72 + #71 ORACLE: a dropped inbound stream surfaces a [`NetEvent::Disconnected`]
+    /// and tears the actor's live state down (`connected == false`), then the
+    /// re-establish path re-subscribes the persisted circle and a post-reconnect
+    /// send/receive round-trips. Mirrors `in_process_circle_round_trip`, adding the
+    /// drop + reconnect legs.
+    ///
+    /// The drop is staged the in-process way a half-open socket dies: A's relay
+    /// server task is aborted, so A's `Subscribe` inbound stream ends (`Ok(None)`)
+    /// — the SAME exit arm a keepalive-detected `Err` takes. The reconnect is driven
+    /// through the [`NetCommand::ReattachSession`] seam (a fresh in-memory session on
+    /// the same relay) so the test exercises the actor's real re-subscribe logic
+    /// without a TCP dial — carrying the persisted circle exactly as the stored
+    /// [`ConnectPlan`]'s `rejoin_circles` would on a production backoff reconnect.
+    #[test]
+    fn disconnect_detected_then_reconnect_restores_circle() {
+        let _ = oxicrypt_module::initialize();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            // One shared relay registry: B stays put across A's reconnect, and A's
+            // FRESH post-reconnect session lands on the same relay so the round-trip
+            // meets at the same circle rendezvous.
+            let registry = CotRegistry::new();
+            let (a_client_io, a_server_io) = tokio::io::duplex(64 * 1024);
+            let (b_client_io, b_server_io) = tokio::io::duplex(64 * 1024);
+            // A's relay rides a KILLABLE transport so the test can sever the
+            // connection out from under A (an aborted relay task alone does not
+            // close tonic's live h2 connection — see `spawn_killable_relay`).
+            let (_srv_a, kill_a) = spawn_killable_relay(a_server_io, registry.clone());
+            let _srv_b = spawn_relay(b_server_io, registry.clone());
+
+            let sess_a = AppSession::open(a_client_io).await.expect("A session");
+            let sess_b = AppSession::open(b_client_io).await.expect("B session");
+
+            let mut a = spawn_local_actor();
+            let mut b = spawn_local_actor();
+            a.cmd_tx
+                .send(NetCommand::AttachSession {
+                    session: sess_a,
+                    server_id: SERVER_ID.to_owned(),
+                    display_handle: Some("alice#stable".to_owned()),
+                    rejoin_circles: Vec::new(),
+                })
+                .ok();
+            b.cmd_tx
+                .send(NetCommand::AttachSession {
+                    session: sess_b,
+                    server_id: SERVER_ID.to_owned(),
+                    display_handle: None,
+                    rejoin_circles: Vec::new(),
+                })
+                .ok();
+
+            // B joins the circle and waits for the relay to register the rendezvous;
+            // A joins the SAME circle. Baseline: A → B round-trips while live.
+            b.cmd_tx
+                .send(NetCommand::JoinCircle {
+                    circle_id: 1,
+                    phrase: CIRCLE_PHRASE.to_owned(),
+                })
+                .ok();
+            wait_registry(&registry, 1).await;
+            a.cmd_tx
+                .send(NetCommand::JoinCircle {
+                    circle_id: 9,
+                    phrase: CIRCLE_PHRASE.to_owned(),
+                })
+                .ok();
+            wait_for_circle_joined(&mut a.evt_rx).await;
+            assert!(
+                probe_connected(&a.cmd_tx, &mut a.evt_rx).await,
+                "A is connected after the initial attach + join"
+            );
+            a.cmd_tx
+                .send(NetCommand::SendCircle {
+                    circle_id: 9,
+                    text: "before the drop".to_owned(),
+                })
+                .ok();
+            assert_eq!(
+                wait_for_circle_message(&mut b.evt_rx)
+                    .await
+                    .map(|(_, who, text)| (who, text)),
+                Some(("alice#stable".to_owned(), "before the drop".to_owned())),
+                "baseline: A → B round-trips on the live connection"
+            );
+
+            // ── DROP: sever A's transport. A's subscribe stream ends (`Ok(None)`)
+            // → the inbound reader's exit arm posts Disconnected → the actor tears
+            // down + emits. Yield so the runtime polls the EOF propagation on this
+            // single thread. ──
+            kill_a.kill();
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+
+            let reason = wait_for_disconnected(&mut a.evt_rx)
+                .await
+                .expect("A surfaces a Disconnected event when its stream dies (#72)");
+            assert!(
+                !reason.is_empty(),
+                "the Disconnected event carries a human-readable reason"
+            );
+            assert!(
+                !probe_connected(&a.cmd_tx, &mut a.evt_rx).await,
+                "after the drop the actor cleared its live state (connected == false, #72)"
+            );
+
+            // ── RECONNECT: a fresh session on the same relay, carrying the persisted
+            // circle — the SAME re-subscribe path a production backoff reconnect runs. ──
+            let (a2_client_io, a2_server_io) = tokio::io::duplex(64 * 1024);
+            let _srv_a2 = spawn_relay(a2_server_io, registry.clone());
+            let sess_a2 = AppSession::open(a2_client_io).await.expect("A re-session");
+            a.cmd_tx
+                .send(NetCommand::ReattachSession {
+                    session: sess_a2,
+                    server_id: SERVER_ID.to_owned(),
+                    display_handle: Some("alice#stable".to_owned()),
+                    rejoin_circles: vec![(9, CIRCLE_PHRASE.to_owned())],
+                })
+                .ok();
+            wait_for_circle_joined(&mut a.evt_rx).await;
+            assert!(
+                probe_connected(&a.cmd_tx, &mut a.evt_rx).await,
+                "the reconnect restored the connection (connected == true, #71)"
+            );
+
+            // Post-reconnect round-trip: A sends on the re-subscribed circle, B
+            // receives — the recovered connection restores the circle like a launch.
+            a.cmd_tx
+                .send(NetCommand::SendCircle {
+                    circle_id: 9,
+                    text: "after the reconnect".to_owned(),
+                })
+                .ok();
+            assert_eq!(
+                wait_for_circle_message(&mut b.evt_rx)
+                    .await
+                    .map(|(_, who, text)| (who, text)),
+                Some(("alice#stable".to_owned(), "after the reconnect".to_owned())),
+                "the re-subscribed circle round-trips after reconnect (#71)"
+            );
+        });
+    }
+
+    /// #71: the auto-reconnect backoff is capped exponential and never zero — so the
+    /// timer can't busy-loop and a long outage retries steadily rather than backing
+    /// off forever.
+    #[test]
+    fn reconnect_backoff_is_capped_exponential() {
+        assert_eq!(reconnect_backoff(0), RECONNECT_BACKOFF_BASE);
+        assert_eq!(
+            reconnect_backoff(1),
+            Duration::from_secs(RECONNECT_BACKOFF_BASE.as_secs() * 2)
+        );
+        // Saturates at the cap and stays there for large / overflowing attempts.
+        assert_eq!(reconnect_backoff(20), RECONNECT_BACKOFF_MAX);
+        assert_eq!(reconnect_backoff(u32::MAX), RECONNECT_BACKOFF_MAX);
+        // Never a busy-loop.
+        assert!(reconnect_backoff(0) > Duration::ZERO);
     }
 
     /// Opacity: a non-member (different circle phrase → different key) cannot

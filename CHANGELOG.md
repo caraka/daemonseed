@@ -24,6 +24,15 @@ next release this block is renamed to its version + date and a fresh
 `[Unreleased]` is opened (see `AGENTS.md` doc-sync). Planning for *unstarted*
 work lives in the project lead's vault manifest, not here.
 
+### Added
+
+- GUI auto-reconnect: after a dropped connection the network actor re-issues the connect on a capped exponential backoff (2s–30s), restoring the persisted display handle, circles, and shares like a fresh launch. (#71)
+- h2 keepalive on the application channel (`http2_keep_alive_interval` + `keep_alive_timeout` + `keep_alive_while_idle`), so a half-open socket surfaces as an error within a bounded window. (#72)
+
+### Fixed
+
+- GUI no longer shows "connected" over a dead session: a dropped or half-open connection now surfaces `NetEvent::Disconnected` and the actor clears its stale session/circle/share state so no half-open session is reused. (#72)
+
 ### Changed
 
 - Sync `Cargo.lock` to `oxicrypt` 0.17.0 (workspace crypto path-deps).
