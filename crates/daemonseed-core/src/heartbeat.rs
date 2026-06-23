@@ -77,13 +77,23 @@ pub struct HeartbeatFields<'a> {
     /// Member wall-clock at beacon time, unix milliseconds (advisory ordering +
     /// liveness aging).
     pub sent_unix_ms: i64,
+    /// The share-ids this member is currently serving into this room — the
+    /// live-share digest (#76). Empty when nothing is shared. Bound into the
+    /// provenance signature so it cannot be tampered.
+    pub live_share_ids: &'a [String],
 }
 
 /// Build the domain-separated provenance signing input. Binds room, member
-/// pubkey, and timestamp so a signature is valid for exactly one (room, member,
-/// time) tuple and cannot be replayed into another room. Length-prefixing each
-/// field makes the concatenation unambiguous.
-fn provenance_input(room: &str, sender_pubkey: &[u8], sent_unix_ms: i64) -> Vec<u8> {
+/// pubkey, timestamp, and the live-share digest so a signature is valid for
+/// exactly one (room, member, time, digest) tuple and cannot be replayed into
+/// another room or have its digest tampered. Length-prefixing each field — and
+/// the digest's count plus each id — makes the concatenation unambiguous.
+fn provenance_input(
+    room: &str,
+    sender_pubkey: &[u8],
+    sent_unix_ms: i64,
+    live_share_ids: &[String],
+) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend_from_slice(HEARTBEAT_PROVENANCE_DOMAIN);
     let mut push_field = |bytes: &[u8]| {
@@ -93,6 +103,10 @@ fn provenance_input(room: &str, sender_pubkey: &[u8], sent_unix_ms: i64) -> Vec<
     push_field(room.as_bytes());
     push_field(sender_pubkey);
     push_field(&sent_unix_ms.to_be_bytes());
+    push_field(&(live_share_ids.len() as u64).to_be_bytes());
+    for id in live_share_ids {
+        push_field(id.as_bytes());
+    }
     buf
 }
 
@@ -128,7 +142,12 @@ fn seal_heartbeat_with(
     fields: &HeartbeatFields<'_>,
 ) -> Result<Vec<u8>, HeartbeatError> {
     let sender_pubkey = member.public_key().to_vec();
-    let signing_input = provenance_input(fields.room, &sender_pubkey, fields.sent_unix_ms);
+    let signing_input = provenance_input(
+        fields.room,
+        &sender_pubkey,
+        fields.sent_unix_ms,
+        fields.live_share_ids,
+    );
     let signature = member
         .sign(&signing_input)
         .map_err(|_| HeartbeatError::Sign)?
@@ -140,6 +159,7 @@ fn seal_heartbeat_with(
         sender_handle: fields.sender_handle.to_owned(),
         sent_unix_ms: fields.sent_unix_ms,
         signature,
+        live_share_ids: fields.live_share_ids.to_vec(),
     };
 
     let aes = Aes256Key::new(key_bytes).map_err(HeartbeatError::KeyInit)?;
@@ -218,8 +238,12 @@ pub fn open_heartbeat<K: AeadKey256>(
         .as_slice()
         .try_into()
         .map_err(|_| HeartbeatError::Provenance)?;
-    let signing_input =
-        provenance_input(&message.room, &message.sender_pubkey, message.sent_unix_ms);
+    let signing_input = provenance_input(
+        &message.room,
+        &message.sender_pubkey,
+        message.sent_unix_ms,
+        &message.live_share_ids,
+    );
     verify_signature(pubkey, &signing_input, signature).map_err(|_| HeartbeatError::Provenance)?;
 
     Ok(message)
@@ -283,6 +307,7 @@ mod tests {
             room: DEFAULT_ROOM,
             sender_handle: handle,
             sent_unix_ms: 1_700_000_000_000,
+            live_share_ids: &[],
         }
     }
 
@@ -333,6 +358,56 @@ mod tests {
         );
     }
 
+    /// The live-share digest (#76) round-trips and is bound into provenance.
+    #[test]
+    fn digest_round_trips() {
+        let key = room_key(DEFAULT_ROOM);
+        let me = member(20);
+        let ids = vec!["aaaa".to_owned(), "bbbb".to_owned()];
+        let f = HeartbeatFields {
+            room: DEFAULT_ROOM,
+            sender_handle: "a#000000000000",
+            sent_unix_ms: 5,
+            live_share_ids: &ids,
+        };
+        let sealed = seal_public_heartbeat(&key, &me, &f).unwrap();
+        let opened = open_heartbeat(&key, &sealed).unwrap();
+        assert_eq!(opened.live_share_ids, ids);
+    }
+
+    /// A tampered digest (signed empty, shipped with an injected id) fails
+    /// provenance — a relay cannot forge what a member is serving.
+    #[test]
+    fn tampered_digest_rejected() {
+        let key = room_key(DEFAULT_ROOM);
+        let me = member(21);
+        let signing_input = provenance_input(DEFAULT_ROOM, me.public_key().as_ref(), 1, &[]);
+        let signature = me.sign(&signing_input).unwrap().to_vec();
+        let forged = wire::MemberHeartbeat {
+            room: DEFAULT_ROOM.to_owned(),
+            sender_pubkey: me.public_key().to_vec(),
+            sender_handle: "a#000000000000".to_owned(),
+            sent_unix_ms: 1,
+            signature,
+            live_share_ids: vec!["injected".to_owned()], // not covered by the signature
+        };
+        let aes = Aes256Key::new(key.as_bytes()).unwrap();
+        let mut nonce = [0u8; NONCE_LEN];
+        getrandom::fill(&mut nonce).unwrap();
+        let plaintext = forged.encode_to_vec();
+        let mut ct = vec![0u8; plaintext.len()];
+        let mut tag = [0u8; TAG_LEN];
+        gcm_encrypt(&aes, &nonce, HEARTBEAT_AAD, &plaintext, &mut ct, &mut tag).unwrap();
+        let mut sealed = Vec::new();
+        sealed.extend_from_slice(&nonce);
+        sealed.extend_from_slice(&ct);
+        sealed.extend_from_slice(&tag);
+        match open_heartbeat(&key, &sealed) {
+            Err(HeartbeatError::Provenance) => {}
+            other => panic!("expected Provenance rejection, got {other:?}"),
+        }
+    }
+
     /// A forged signature (signed for a different room, shipped claiming another)
     /// fails provenance: presence cannot be spoofed into a room the member never
     /// beaconed into.
@@ -341,7 +416,7 @@ mod tests {
         let key = room_key(DEFAULT_ROOM);
         let me = member(11);
         // Sign for room "other", then ship a message claiming DEFAULT_ROOM.
-        let signing_input = provenance_input("other", me.public_key().as_ref(), 1);
+        let signing_input = provenance_input("other", me.public_key().as_ref(), 1, &[]);
         let signature = me.sign(&signing_input).unwrap().to_vec();
         let forged = wire::MemberHeartbeat {
             room: DEFAULT_ROOM.to_owned(), // signature does not cover this room
@@ -349,6 +424,7 @@ mod tests {
             sender_handle: "a#000000000000".to_owned(),
             sent_unix_ms: 1,
             signature,
+            live_share_ids: vec![],
         };
         let aes = Aes256Key::new(key.as_bytes()).unwrap();
         let mut nonce = [0u8; NONCE_LEN];

@@ -337,10 +337,19 @@ pub struct MemberHeartbeat {
     #[prost(int64, tag = "4")]
     pub sent_unix_ms: i64,
     /// Detached ML-DSA-87 provenance signature over the domain-separated signed
-    /// input (room ‖ sender_pubkey ‖ sent_unix_ms). Verified client-side under
-    /// sender_pubkey; a bad signature drops the heartbeat.
+    /// input (room ‖ sender_pubkey ‖ sent_unix_ms ‖ live_share_ids). Verified
+    /// client-side under sender_pubkey; a bad signature drops the heartbeat.
     #[prost(bytes = "vec", tag = "5")]
     pub signature: ::prost::alloc::vec::Vec<u8>,
+    /// The share-ids this member is currently serving into this room — the
+    /// live-share digest (#76). A receiver refreshes the liveness of these shares
+    /// and prunes any of this member's shares absent from the digest, so share
+    /// liveness rides the heartbeat and a full ShareAnnouncement fires only on
+    /// change (publish/unpublish) plus the late-join roll-call. Empty when the
+    /// member serves nothing. Bound into the provenance signature so the digest
+    /// cannot be tampered or replayed across rooms.
+    #[prost(string, repeated, tag = "6")]
+    pub live_share_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// Generated client implementations.
 pub mod circle_of_trust_client {

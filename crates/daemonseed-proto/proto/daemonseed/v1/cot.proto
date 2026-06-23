@@ -298,7 +298,16 @@ message MemberHeartbeat {
   int64 sent_unix_ms = 4;
 
   // Detached ML-DSA-87 provenance signature over the domain-separated signed
-  // input (room ‖ sender_pubkey ‖ sent_unix_ms). Verified client-side under
-  // sender_pubkey; a bad signature drops the heartbeat.
+  // input (room ‖ sender_pubkey ‖ sent_unix_ms ‖ live_share_ids). Verified
+  // client-side under sender_pubkey; a bad signature drops the heartbeat.
   bytes signature = 5;
+
+  // The share-ids this member is currently serving into this room — the
+  // live-share digest (#76). A receiver refreshes the liveness of these shares
+  // and prunes any of this member's shares absent from the digest, so share
+  // liveness rides the heartbeat and a full ShareAnnouncement fires only on
+  // change (publish/unpublish) plus the late-join roll-call. Empty when the
+  // member serves nothing. Bound into the provenance signature so the digest
+  // cannot be tampered or replayed across rooms.
+  repeated string live_share_ids = 6;
 }

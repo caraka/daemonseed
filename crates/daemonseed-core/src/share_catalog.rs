@@ -195,6 +195,52 @@ impl ShareCatalog {
         self.entries.remove(share_id).is_some()
     }
 
+    /// Reconcile one sharer's shares against a verified heartbeat's live-share
+    /// digest (#76). For shares this catalog holds from `sharer_pubkey`: refresh
+    /// the receive-time of those whose id is in `live_ids` (so share liveness
+    /// rides the heartbeat — no periodic re-announce needed), and remove any
+    /// absent from it (the sharer dropped them without a withdraw — self-healing).
+    /// Digest ids not yet in the catalog are ignored — a full `ShareAnnouncement`
+    /// (on change, or via a late-join roll-call) fills those in; the digest never
+    /// fabricates a share, since it lacks the name/rating/rendezvous. Returns
+    /// whether the visible set changed (a removal); a pure liveness refresh is not.
+    pub fn reconcile_sharer(
+        &mut self,
+        sharer_pubkey: &[u8],
+        live_ids: &[String],
+        now: Instant,
+    ) -> bool {
+        let mut removed = false;
+        self.entries.retain(|id, s| {
+            if s.sender_pubkey != sharer_pubkey {
+                return true;
+            }
+            if live_ids.iter().any(|d| d == id) {
+                true
+            } else {
+                removed = true;
+                false
+            }
+        });
+        for id in live_ids {
+            if let Some(s) = self.entries.get_mut(id)
+                && s.sender_pubkey == sharer_pubkey
+            {
+                s.received_at = now;
+            }
+        }
+        removed
+    }
+
+    /// Drop every share from one sharer — the prune-on-heartbeat-lapse backstop
+    /// (#76): when a member's heartbeat ages out of the presence tracker, its
+    /// shares go with it. Returns the number removed.
+    pub fn prune_sharer(&mut self, sharer_pubkey: &[u8]) -> usize {
+        let before = self.entries.len();
+        self.entries.retain(|_, s| s.sender_pubkey != sharer_pubkey);
+        before - self.entries.len()
+    }
+
     /// The live shares, sorted by display name then `share_id` for a stable
     /// render order.
     pub fn entries(&self) -> Vec<DiscoveredShare> {
@@ -353,6 +399,56 @@ mod tests {
         assert!(cat.remove("a"));
         assert!(!cat.remove("a")); // already gone
         assert!(cat.is_empty());
+    }
+
+    /// #76: a heartbeat digest refreshes in-digest shares' liveness and removes
+    /// a sharer's shares absent from it.
+    #[test]
+    fn reconcile_refreshes_in_digest_and_removes_absent() {
+        let mut cat = ShareCatalog::new(Duration::from_secs(60));
+        let t0 = Instant::now();
+        cat.apply(&announcement("s1", "one", false, 100), t0); // sharer pubkey [1,2,3]
+        cat.apply(&announcement("s2", "two", false, 100), t0);
+        assert_eq!(cat.len(), 2);
+        // Digest says only s1 is live → s2 removed (sharer dropped it), s1 refreshed.
+        let changed =
+            cat.reconcile_sharer(&[1, 2, 3], &["s1".to_owned()], t0 + Duration::from_secs(30));
+        assert!(changed);
+        assert_eq!(cat.len(), 1);
+        assert_eq!(cat.entries()[0].share_id, "s1");
+        // s1's received_at was refreshed to +30s → survives a prune at +50s (60s TTL).
+        assert_eq!(cat.prune(t0 + Duration::from_secs(50)), 0);
+    }
+
+    /// #76: reconcile touches only the named sharer; another sharer's shares are
+    /// untouched even with an empty digest.
+    #[test]
+    fn reconcile_only_touches_the_named_sharer() {
+        let mut cat = ShareCatalog::new(Duration::from_secs(60));
+        let t0 = Instant::now();
+        cat.apply(&announcement("s1", "mine", false, 100), t0); // pubkey [1,2,3]
+        let mut other = announcement("s2", "theirs", false, 100);
+        other.sender_pubkey = vec![9, 9, 9];
+        cat.apply(&other, t0);
+        // Empty digest for [1,2,3] removes only s1; the other sharer's s2 stays.
+        assert!(cat.reconcile_sharer(&[1, 2, 3], &[], t0));
+        assert_eq!(cat.len(), 1);
+        assert_eq!(cat.entries()[0].share_id, "s2");
+    }
+
+    /// #76: prune_sharer drops all of one sharer's shares (heartbeat-lapse).
+    #[test]
+    fn prune_sharer_drops_all_of_one_sharer() {
+        let mut cat = ShareCatalog::new(Duration::from_secs(60));
+        let t0 = Instant::now();
+        cat.apply(&announcement("s1", "a", false, 100), t0);
+        cat.apply(&announcement("s2", "b", false, 100), t0);
+        let mut other = announcement("s3", "c", false, 100);
+        other.sender_pubkey = vec![9, 9, 9];
+        cat.apply(&other, t0);
+        assert_eq!(cat.prune_sharer(&[1, 2, 3]), 2);
+        assert_eq!(cat.len(), 1);
+        assert_eq!(cat.entries()[0].share_id, "s3");
     }
 
     #[test]

@@ -168,13 +168,20 @@ impl PresenceTracker {
     }
 
     /// Age out every member not re-heard within the TTL — the slow half of
-    /// liveness, called on the periodic timer. Returns the number reaped.
-    pub fn reap(&mut self, now: Instant) -> usize {
+    /// liveness, called on the periodic timer. Returns the reaped members so the
+    /// caller can drop their shares too (#76 prune-on-heartbeat-lapse); use
+    /// `.len()` for a bare count.
+    pub fn reap(&mut self, now: Instant) -> Vec<LiveMember> {
         let ttl = self.ttl;
-        let before = self.members.len();
-        self.members
-            .retain(|_, m| now.saturating_duration_since(m.last_seen) < ttl);
-        before - self.members.len()
+        let mut reaped = Vec::new();
+        self.members.retain(|_, m| {
+            let alive = now.saturating_duration_since(m.last_seen) < ttl;
+            if !alive {
+                reaped.push(m.clone());
+            }
+            alive
+        });
+        reaped
     }
 
     /// The live members, sorted by display handle then pubkey for a stable roster
@@ -211,6 +218,7 @@ mod tests {
             sender_handle: handle.to_owned(),
             sent_unix_ms,
             signature: vec![9, 9, 9],
+            live_share_ids: vec![],
         }
     }
 
@@ -267,10 +275,12 @@ mod tests {
         let t0 = Instant::now();
         t.apply(&heartbeat(b"pk-a", "otter", 100), t0);
         // 2.5 intervals later (25s < 30s TTL) → still live.
-        assert_eq!(t.reap(t0 + Duration::from_secs(25)), 0);
+        assert_eq!(t.reap(t0 + Duration::from_secs(25)).len(), 0);
         assert_eq!(t.len(), 1);
-        // 3.5 intervals later (35s > 30s TTL) → reaped.
-        assert_eq!(t.reap(t0 + Duration::from_secs(35)), 1);
+        // 3.5 intervals later (35s > 30s TTL) → reaped, and reap names the member.
+        let reaped = t.reap(t0 + Duration::from_secs(35));
+        assert_eq!(reaped.len(), 1);
+        assert_eq!(reaped[0].pubkey, b"pk-a".to_vec());
         assert!(t.is_empty());
     }
 
@@ -281,7 +291,7 @@ mod tests {
         t.apply(&heartbeat(b"old", "old", 100), t0);
         t.apply(&heartbeat(b"new", "new", 100), t0 + Duration::from_secs(40));
         // At t0 + 50s: "old" is 50s stale (>45s), "new" is 10s (<45s).
-        assert_eq!(t.reap(t0 + Duration::from_secs(50)), 1);
+        assert_eq!(t.reap(t0 + Duration::from_secs(50)).len(), 1);
         assert_eq!(t.len(), 1);
         assert_eq!(t.members()[0].handle, "new");
     }
@@ -296,7 +306,7 @@ mod tests {
             &heartbeat(b"pk-a", "otter", 200),
             t0 + Duration::from_secs(40),
         );
-        assert_eq!(t.reap(t0 + Duration::from_secs(50)), 0);
+        assert_eq!(t.reap(t0 + Duration::from_secs(50)).len(), 0);
         assert_eq!(t.len(), 1);
     }
 

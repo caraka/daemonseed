@@ -765,8 +765,10 @@ modules:
       error); open_heartbeat is generic over AeadKey256 and fails closed
       (Authentication on a wrong key or tamper, Provenance on a bad signature).
       AAD = HEARTBEAT_AAD, envelope nonce(12)||ciphertext||tag(16). The beacon
-      carries only the member's own presence assertion (room, pubkey, handle,
-      timestamp) — never a roster. Types: HeartbeatFields, HeartbeatError.
+      carries the member's own presence assertion (room, pubkey, handle,
+      timestamp) plus a live_share_ids digest of the shares it is serving into
+      that room (#76, provenance-bound) — never a roster. Types: HeartbeatFields,
+      HeartbeatError.
     no_std: false
     depends_on:
       - daemonseed_core::circle::key
@@ -779,13 +781,15 @@ modules:
       - C57
       - C83
       - C84
+      - C86
       - A-C38
 
   - name: daemonseed_core::presence
     description: >-
       Receiver-side member liveness view. PresenceTracker.apply folds a verified
       MemberHeartbeat keyed by sender pubkey (an older sent_unix_ms is ignored);
-      reap() ages members out past a TTL measured from monotonic receive time.
+      reap() ages members out past a TTL measured from monotonic receive time and
+      returns the reaped members (so a caller can drop their shares too, #76).
       with_cadence(interval, miss_count) sets TTL = interval * miss_count
       (decoupled knobs, bias to forgiveness). next_heartbeat_interval draws a
       jittered interval in [HEARTBEAT_INTERVAL_MIN, HEARTBEAT_INTERVAL_MAX].
@@ -851,13 +855,16 @@ modules:
       a verified ShareAnnouncement: an announce inserts or refreshes, a withdraw
       removes, an older sent_unix_ms for a known share is ignored. prune() ages
       entries out past a receive-time TTL; remove() drops one explicitly.
-      Transport-free. Types: ShareCatalog, DiscoveredShare, ShareListing,
-      CatalogChange.
+      reconcile_sharer() folds a heartbeat's live-share digest (#76: refresh
+      in-digest shares, drop a sharer's shares absent from it); prune_sharer()
+      drops all of one sharer's shares on heartbeat lapse. Transport-free. Types:
+      ShareCatalog, DiscoveredShare, ShareListing, CatalogChange.
     no_std: false
     iscs:
       - A-S1
       - A-S2
       - S21
+      - C86
 
   - name: daemonseed_core::share_seal
     description: >-
@@ -2704,6 +2711,9 @@ types:
       - name: sent_unix_ms
         type: i64
         description: Member wall-clock at beacon time, unix milliseconds. Advisory.
+      - name: live_share_ids
+        type: "&'a [String]"
+        description: The share-ids this member is serving into the room — the live-share digest (#76). Bound into provenance.
 
   # ── presence ────────────────────────────────────────────────────────
   - name: PresenceTracker

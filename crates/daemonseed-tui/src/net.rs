@@ -705,10 +705,11 @@ struct OwnShare {
 /// still-live share; [`RECONCILE_INTERVAL`] is the re-announce cadence.
 const SHARE_CATALOG_TTL: Duration = Duration::from_secs(90);
 
-/// Cadence of the slow-reconcile roll-call ([`Actor::handle_reconcile_shares`]):
-/// prune aged-out entries and post a roll-call so live sharers re-announce.
-/// Fixed (not jittered) — a deterministic interval keeps the loop test-friendly,
-/// and `SHARE_CATALOG_TTL` is set to > ~2× this so a single miss is absorbed.
+/// Cadence of the slow-reconcile tick ([`Actor::handle_reconcile_shares`]):
+/// prune aged-out catalog entries. Liveness rides the member heartbeat (#76), so
+/// this no longer re-announces. Fixed (not jittered) — a deterministic interval
+/// keeps the loop test-friendly, and `SHARE_CATALOG_TTL` is set to > ~2× this so
+/// a single miss is absorbed.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Mutable state the actor carries across commands.
@@ -1274,16 +1275,17 @@ impl Actor {
     }
 
     /// The slow-reconcile tick (unified share model): prune aged-out catalog
-    /// entries, then post a [`wire::ShareRollCall`] so live sharers re-announce.
-    /// See [`NetCommand::ReconcileShares`]. Self-scheduled on
+    /// entries. See [`NetCommand::ReconcileShares`]. Self-scheduled on
     /// [`RECONCILE_INTERVAL`]. A prune that removed entries refreshes the
-    /// snapshot; the roll-call is best-effort.
+    /// snapshot. Liveness now rides the member heartbeat (#76), so the periodic
+    /// roll-call re-announce was retired here; the startup roll-call (on connect)
+    /// and the manual Refresh roll-call still drive late-join + on-demand
+    /// self-heal via [`Self::post_rollcall`].
     async fn handle_reconcile_shares(&mut self) {
         let pruned = self.share_catalog.prune(Instant::now());
         if pruned > 0 {
             self.emit_shares_snapshot();
         }
-        self.post_rollcall().await;
     }
 
     /// Post a sealed, self-signed [`wire::ShareRollCall`] into the lobby — the
@@ -1332,6 +1334,17 @@ impl Actor {
             let signing = identity.signing();
             let sent_unix_ms = now_unix_ms();
 
+            // The lobby beacon carries the digest of the shares this client
+            // currently serves into the lobby (#76) so subscribers can reconcile
+            // share liveness off the heartbeat. Collect into an owned Vec so the
+            // RefCell borrow ends before any await below.
+            let lobby_share_ids: Vec<String> = self
+                .own_shares
+                .borrow()
+                .iter()
+                .map(|s| s.share_id.clone())
+                .collect();
+
             // Lobby beacon (if the lobby is joined). Borrow ends before the await:
             // seal first, then send via the cloned sender.
             if let Some(room) = self.public_room.as_ref() {
@@ -1339,6 +1352,7 @@ impl Actor {
                     room: &room.room,
                     sender_handle: handle,
                     sent_unix_ms,
+                    live_share_ids: &lobby_share_ids,
                 };
                 match seal_public_heartbeat(&room.room_key, signing, &fields) {
                     Ok(sealed) => {
@@ -1364,6 +1378,9 @@ impl Actor {
                     room: &circle.label,
                     sender_handle: handle,
                     sent_unix_ms,
+                    // No circle-share concept yet (#76): circle beacons carry an
+                    // empty digest.
+                    live_share_ids: &[],
                 };
                 match seal_circle_heartbeat(&circle.cot_key, signing, &fields) {
                     Ok(sealed) => {
@@ -1383,12 +1400,34 @@ impl Actor {
         }
 
         // Reap every tracker on the same tick — the timer is the reap clock.
+        // Capture the lobby's reaped member pubkeys into a local so the
+        // public_room/circles borrow ends before we touch self.share_catalog and
+        // self.emit_shares_snapshot below (#76: a lapsed sharer's shares go too).
         let now = Instant::now();
+        let mut reaped_lobby_pubkeys: Vec<Vec<u8>> = Vec::new();
         if let Some(room) = self.public_room.as_mut() {
-            room.presence.reap(now);
+            reaped_lobby_pubkeys = room
+                .presence
+                .reap(now)
+                .into_iter()
+                .map(|m| m.pubkey)
+                .collect();
         }
         for circle in &mut self.circles {
-            circle.presence.reap(now);
+            // No circle-share catalog to prune — just keep the tracker honest.
+            let _ = circle.presence.reap(now);
+        }
+
+        // Prune the lobby catalog for every member whose heartbeat just lapsed,
+        // refreshing the snapshot once if any share was actually removed.
+        let mut catalog_changed = false;
+        for pubkey in &reaped_lobby_pubkeys {
+            if self.share_catalog.prune_sharer(pubkey) > 0 {
+                catalog_changed = true;
+            }
+        }
+        if catalog_changed {
+            self.emit_shares_snapshot();
         }
     }
 
@@ -1412,9 +1451,22 @@ impl Actor {
             && lobby.room == room
         {
             let _ = lobby.presence.apply(heartbeat, now);
+            // Reconcile the lobby share catalog against the beacon's digest (#76):
+            // refresh liveness of the sharer's shares present in it, drop those
+            // absent. The presence borrow ended with the if-let block above, so
+            // self.share_catalog is free to touch here.
+            let changed = self.share_catalog.reconcile_sharer(
+                &heartbeat.sender_pubkey,
+                &heartbeat.live_share_ids,
+                now,
+            );
+            if changed {
+                self.emit_shares_snapshot();
+            }
             return;
         }
         if let Some(circle) = self.circles.iter_mut().find(|c| c.label == room) {
+            // No circle-share catalog yet (#76) — apply presence only.
             let _ = circle.presence.apply(heartbeat, now);
         }
     }
