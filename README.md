@@ -57,7 +57,7 @@ All six crates are substantive as of the alpha1 MVP (M12). The `tui` crate — t
 
 ## Status
 
-Current release: **v0.29.2** — alpha (post-MVP). Tester-facing GUI fixes over v0.29.1 — command-palette close control, in-app version + About, client-side unread dots, shares-tab clarity ("Public Shares"), right-click paste — plus a first-start fix so a chosen display name persists across unlock. See `CHANGELOG.md` for per-release detail.
+Current release: **v0.30.0** — alpha (post-MVP). GUI/network resilience — relay disconnect-detect with auto-reconnect on capped backoff, h2 keepalive, a single-instance guard, and Public Shares → Lobby — plus a core rename-identity path and `cargo xtask release-gate` so a tag can't be cut on a red tree. See `CHANGELOG.md` for per-release detail.
 
 The per-release history lives in **[`CHANGELOG.md`](CHANGELOG.md)** (one entry per SSH-signed tag) — this section is intentionally kept to the current release so it can't silently drift. The release-signing *infrastructure* (real keys, Sigstore co-signature, reproducible builds, store / package-manager channels) and the platform features (biometric login, OS-native autostart) remain on a follow-up track; direct messaging is planned. Promotion to a public repository is gated on the `oxicrypt` sibling crate going public.
 
