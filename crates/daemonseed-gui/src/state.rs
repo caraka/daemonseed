@@ -394,6 +394,27 @@ impl GuiState {
             .map(|n| circle_fingerprint(&n.phrase))
     }
 
+    /// #36: the deterministic display name of circle `idx` — the second
+    /// out-of-band compare vector alongside [`Self::circle_fingerprint_of`].
+    /// Derived from the **net contract**, NOT from `circle.name` (which becomes the
+    /// user's chosen-name override once rename lands, #66): once the relay
+    /// rendezvous is known it is the adj-noun label
+    /// ([`daemonseed_core::circle::default_circle_label`]). That label is
+    /// relay-DEPENDENT (rendezvous = `SHA-384(cot_key ‖ server_id)`), so it
+    /// compares only between members on the SAME relay — distinct from the
+    /// relay-INDEPENDENT phrase-keyed fingerprint. Pre-join (no rendezvous yet) it
+    /// falls back to that fingerprint, so the line only diverges once connected.
+    /// `None` for the Lobby (no net contract). `#[allow(dead_code)]`: the
+    /// detail-pane affordance that surfaces it is attended felt-polish (deferred).
+    #[allow(dead_code)]
+    pub fn circle_deterministic_label_of(&self, idx: usize) -> Option<String> {
+        let net = self.circles.get(idx)?.net.as_ref()?;
+        Some(match &net.rendezvous {
+            Some(addr) => daemonseed_core::circle::default_circle_label(addr),
+            None => circle_fingerprint(&net.phrase),
+        })
+    }
+
     /// Index of the currently active circle.
     pub fn active(&self) -> usize {
         self.active
@@ -920,6 +941,44 @@ mod tests {
         assert!(st.metas()[idx].net.as_ref().unwrap().rendezvous.is_some());
         // The fingerprint stays reachable on demand (hash hidden, surfaced on demand).
         assert_eq!(st.circle_fingerprint_of(idx).unwrap(), fp_before);
+    }
+
+    #[test]
+    fn circle_detail_label_derives_from_net_contract_not_chosen_name() {
+        // #36: the deterministic-label compare vector is derived from the net
+        // contract (rendezvous → adj-noun label, else fingerprint), independent of
+        // `circle.name` — so it survives a future chosen-name override (#66).
+        let _ = oxicrypt_module::initialize();
+        let mut st = GuiState::lobby_only();
+        let phrase = generate_circle_phrase().expect("generate");
+        let idx = st.materialize_from_phrase(&phrase).expect("materialize");
+        let circle_id = st.metas()[idx].net.as_ref().unwrap().circle_id;
+        let fp = st.circle_fingerprint_of(idx).expect("fingerprint");
+        // Pre-join (no rendezvous): falls back to the relay-independent fingerprint.
+        assert_eq!(
+            st.circle_deterministic_label_of(idx).as_deref(),
+            Some(fp.as_str())
+        );
+        // Post-join: the relay-derived adj-noun label, distinct from the fingerprint.
+        let addr = AssetAddr::from_bytes([5u8; daemonseed_core::cot::ASSET_ADDR_LEN]);
+        st.set_circle_rendezvous(circle_id, addr)
+            .expect("known circle");
+        let want = daemonseed_core::circle::default_circle_label(&addr);
+        assert_eq!(
+            st.circle_deterministic_label_of(idx).as_deref(),
+            Some(want.as_str())
+        );
+        assert_eq!(
+            st.circle_fingerprint_of(idx).as_deref(),
+            Some(fp.as_str()),
+            "fingerprint stays phrase-keyed (relay-independent)"
+        );
+        assert_ne!(
+            want, fp,
+            "post-join the deterministic label diverges from the fingerprint"
+        );
+        // The Lobby has no net contract → no deterministic label.
+        assert!(st.circle_deterministic_label_of(0).is_none());
     }
 
     #[test]
