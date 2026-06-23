@@ -52,9 +52,16 @@ Resolves the seed's three open questions.
 2. **Rides the existing stream.** The heartbeat travels as a sealed room frame over the existing
    CoT/room subscription (the same surface share announcements use), not a separate asset — keeping
    it one indistinguishable flow.
-3. **Cadence / window → jittered, generous, lag-accepted.** A jittered interval with a liveness TTL
-   of > ~2 intervals; a member silent past TTL is shown gone. The exact values are tuning, not
-   architecture.
+3. **Cadence / window → fast beacon, multi-miss reap, decoupled knobs.** The heartbeat *interval*
+   sets presence resolution; the *miss-count × interval* sets the liveness TTL — keep them separate.
+   Default: a fast jittered interval (~10–15 s) with reap only after ~3 consecutive misses
+   (TTL ~30–45 s), so a brief connection wobble (≤ ~2 missed beacons) never reaps a live share, while
+   a genuine departure clears within ~TTL. **Bias to forgiveness:** briefly over-showing a crashed
+   client as present is far cheaper than share-availability churn or a false reap that wastes the
+   sharer's re-announce. A slow beacon where a *single* miss reaps is the brittle opposite — it both
+   reaps on the first wobble and gives sluggish presence. This composes with auto-reconnect (#71/#72):
+   a wobbling client re-connects within the 2–30 s backoff and resumes beaconing well inside the TTL,
+   so the share rides through the wobble rather than flapping out and back.
 
 ### Payoffs of unifying
 
@@ -92,7 +99,9 @@ the identical mechanism once the Lobby increment is proven.
   present" rather than "FAQ is present".)
 - **Relay-plane vs member-plane convergence for reaping** — does the member heartbeat subsume the
   relay's sharer-reap signal, or do both run (defense in depth)?
-- **Cadence / jitter / TTL values** — chosen against the censorship traffic-analysis budget.
+- **Final cadence / jitter / TTL values** — the ~10–15 s interval / 3-miss / ~30–45 s TTL default
+  above is the starting point; tune against the censorship traffic-analysis budget and real wobble
+  data once the Lobby increment is live.
 
 ## Cross-references
 
