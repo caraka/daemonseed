@@ -83,6 +83,26 @@ ping-lost) is known and **accepted as part of the no-logs ethos** — the cost o
 remembers nothing. Daemons understand this contract: presence says "worth a try," never "delivered."
 This is deliberately *less* than a traditional chat app, and that restraint is the point.
 
+## Indication — the roster *is* the signal
+
+Presence is shown by a **roster of currently-live members**, nothing more — the
+Demonsaw model: a name is on the roster while its heartbeat is fresh and drops off when the
+heartbeat lapses past TTL. Appearing and disappearing is the *only* indication.
+
+- **No decorators** — no dots, colors, badges, "last seen", typing, or join/leave toasts. On the
+  roster or not.
+- **No offline rows, no separate members list.** This is not an aesthetic choice: ISC-A-S2 means no
+  membership list exists for anyone to enumerate, so the only knowable set *is* who is live now. The
+  roster is that set, rendered; a decorated "show all members, light the online ones" view is
+  impossible by construction.
+- **Stability comes from the cadence, not the UI** — the multi-miss TTL and auto-reconnect (#71/#72)
+  keep a brief wobble from blinking a name off, so a disappearance reads as genuinely gone.
+
+**Placement is open.** In Demonsaw the roster was the left pane; in daemonseed the left rail
+currently holds rooms (Lobby, circles), not people. Where and how the people-roster lives — in the
+rail, a section of the active room, or a separate pane — is an undecided UI question, deferred to the
+increment work (#75 / #77).
+
 ## First increment: the public Lobby
 
 Land presence in the public Lobby first. The Lobby is a public room (membership open, server is a
