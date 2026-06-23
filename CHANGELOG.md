@@ -24,6 +24,10 @@ next release this block is renamed to its version + date and a fresh
 `[Unreleased]` is opened (see `AGENTS.md` doc-sync). Planning for *unstarted*
 work lives in the project lead's vault manifest, not here.
 
+### Changed
+
+- Sync `Cargo.lock` to `oxicrypt` 0.17.0 (workspace crypto path-deps).
+
 ## [0.29.2] — 2026-06-22
 
 Tester-facing GUI fixes plus a first-start display-name persistence fix.
