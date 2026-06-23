@@ -756,6 +756,50 @@ modules:
       - A-S16
       - A-S17
 
+  - name: daemonseed_core::heartbeat
+    description: >-
+      Member-plane presence heartbeat sealing. seal_public_heartbeat /
+      seal_circle_heartbeat self-sign a MemberHeartbeat (ML-DSA, C57) then
+      AES-256-GCM-seal it under the public room key or a circle cot_key
+      respectively (the typed key is the tier guard — wrong tier is a compile
+      error); open_heartbeat is generic over AeadKey256 and fails closed
+      (Authentication on a wrong key or tamper, Provenance on a bad signature).
+      AAD = HEARTBEAT_AAD, envelope nonce(12)||ciphertext||tag(16). The beacon
+      carries only the member's own presence assertion (room, pubkey, handle,
+      timestamp) — never a roster. Types: HeartbeatFields, HeartbeatError.
+    no_std: false
+    depends_on:
+      - daemonseed_core::circle::key
+      - daemonseed_core::circle::message
+      - daemonseed_core::identity::keys
+      - daemonseed_core::public_room
+    iscs:
+      - A-S2
+      - A-S23
+      - C57
+      - C83
+      - C84
+      - A-C38
+
+  - name: daemonseed_core::presence
+    description: >-
+      Receiver-side member liveness view. PresenceTracker.apply folds a verified
+      MemberHeartbeat keyed by sender pubkey (an older sent_unix_ms is ignored);
+      reap() ages members out past a TTL measured from monotonic receive time.
+      with_cadence(interval, miss_count) sets TTL = interval * miss_count
+      (decoupled knobs, bias to forgiveness). next_heartbeat_interval draws a
+      jittered interval in [HEARTBEAT_INTERVAL_MIN, HEARTBEAT_INTERVAL_MAX].
+      Transport-free, RAM-only. Types: PresenceTracker, LiveMember,
+      PresenceChange.
+    no_std: false
+    depends_on:
+      - daemonseed_core::heartbeat
+    iscs:
+      - A-S2
+      - S20
+      - C85
+      - A-C39
+
   - name: daemonseed_core::share_announce
     description: >-
       Share-announcement sealing. mint_share_id draws a 128-bit client-side
@@ -2641,6 +2685,64 @@ types:
     security:
       contains_secret: true
       zeroize_on_drop: true
+
+  # ── heartbeat ───────────────────────────────────────────────────────
+  - name: HeartbeatFields
+    module: daemonseed_core::heartbeat
+    kind: struct
+    description: >-
+      The plaintext fields of a MemberHeartbeat the caller supplies; the member
+      pubkey and signature are filled in by the seal functions. Borrowed
+      (lifetime 'a) so sealing never forces a clone.
+    fields:
+      - name: room
+        type: "&'a str"
+        description: The room/circle the heartbeat belongs to (e.g. "lobby").
+      - name: sender_handle
+        type: "&'a str"
+        description: The member's self-asserted display handle (name#12hex). Advisory.
+      - name: sent_unix_ms
+        type: i64
+        description: Member wall-clock at beacon time, unix milliseconds. Advisory.
+
+  # ── presence ────────────────────────────────────────────────────────
+  - name: PresenceTracker
+    module: daemonseed_core::presence
+    kind: struct
+    description: >-
+      The live set of members heard in one room/circle. new(ttl) /
+      with_cadence(interval, miss_count) construct it; apply folds a verified
+      MemberHeartbeat (keyed by sender pubkey, an older sent_unix_ms ignored);
+      reap ages members out past the TTL (receive-time-measured); members returns
+      the live set sorted by handle then pubkey; len / is_empty / ttl report
+      state. RAM-only; the caller scopes it to one room and filters its own beacon.
+
+  - name: LiveMember
+    module: daemonseed_core::presence
+    kind: struct
+    description: >-
+      One live member — a roster row built from a verified MemberHeartbeat.
+    fields:
+      - name: handle
+        type: String
+        description: The member's self-asserted display handle (name#12hex). Advisory.
+      - name: pubkey
+        type: "Vec<u8>"
+        description: The member's ML-DSA-87 public key (for the ISC-C4 handle binding; stable identity key).
+      - name: beacon_unix_ms
+        type: i64
+        description: The member's advisory wall-clock at beacon time (unix ms); ordering only, never TTL.
+      - name: last_seen
+        type: Instant
+        description: Local monotonic receive time of the most recent beacon; TTL reaping measures from here.
+
+  - name: PresenceChange
+    module: daemonseed_core::presence
+    kind: enum
+    description: >-
+      What PresenceTracker.apply did: Appeared (a member newly on the roster),
+      Refreshed (a known member's liveness updated), or Unchanged (a stale or
+      reordered beacon was a no-op).
 
   # ── share_announce ──────────────────────────────────────────────────
   - name: AnnouncementFields

@@ -50,7 +50,13 @@ use daemonseed_core::crypto::suite::{CNSA_2_0, SuiteId};
 use daemonseed_core::federation::discovered::DiscoveredPeers;
 use daemonseed_core::federation::store::{InMemoryTrustStore, ServerEntry, TrustStore};
 use daemonseed_core::handle::{DisplayMode, Handle};
+use daemonseed_core::heartbeat::{
+    HeartbeatFields, open_heartbeat, seal_circle_heartbeat, seal_public_heartbeat,
+};
 use daemonseed_core::indexer::{CachedHashError, cached_or_hash, reconcile_into};
+use daemonseed_core::presence::{
+    HEARTBEAT_INTERVAL_MAX, HEARTBEAT_MISS_COUNT, PresenceTracker, next_heartbeat_interval,
+};
 use daemonseed_core::public_room::{
     DEFAULT_ROOM, PublicRoomKey, derive_room_key, open_room_message, room_asset_address,
     seal_room_message,
@@ -150,6 +156,22 @@ pub enum NetCommand {
     /// post a roll-call. Self-scheduled on [`RECONCILE_INTERVAL`]; never sent by
     /// the binary.
     ReconcileShares,
+    /// Internal: the presence-heartbeat tick (#74) — emit one sealed member
+    /// beacon into the lobby and each joined circle, then `reap` every tracker so
+    /// members past their TTL age out (the timer is the reap clock too).
+    /// Self-scheduled on [`next_heartbeat_interval`]; never sent by the binary.
+    EmitHeartbeat,
+    /// Internal: a verified member heartbeat the inbound reader opened, to fold
+    /// into the matching room/circle's [`PresenceTracker`] (all tracker mutation
+    /// stays on `&mut self`). `room` is the session-local routing key — the lobby
+    /// room name for a lobby beacon, the circle's label for a circle beacon.
+    /// Boxed because [`wire::MemberHeartbeat`] is large (mirrors
+    /// [`Self::ApplyAnnouncement`]). Posted by the inbound readers; never sent by
+    /// the binary.
+    ApplyHeartbeat {
+        room: String,
+        heartbeat: Box<wire::MemberHeartbeat>,
+    },
     /// Refresh the public-space snapshot (ISC-25 / ISC-S7 / ISC-A-S3): fetch the
     /// connected relay's MOTD, announcement posts, and published signer
     /// whitelist over the live [`AppSession`], render the MOTD as inert text,
@@ -639,6 +661,12 @@ struct Circle {
     cot_key: Rc<CircleKey>,
     asset_addr: AssetAddr,
     out_tx: mpsc::Sender<wire::CotFrame>,
+    /// Live-member presence tracker for THIS circle (#74). Beacons opened by the
+    /// inbound reader fold in via `apply`; the heartbeat-timer's `reap` ages out
+    /// members past their TTL. Its lifetime is the circle's — dropped on
+    /// disconnect/leave, so presence is inherently live-only (no stale roster
+    /// survives the stream). The roster UI that consumes it is #75.
+    presence: PresenceTracker,
 }
 
 /// The live public room a daemon is subscribed to (ISC-S22..S26 / ISC-C56).
@@ -653,6 +681,10 @@ struct PublicRoom {
     room_key: Rc<PublicRoomKey>,
     asset_addr: AssetAddr,
     out_tx: mpsc::Sender<wire::CotFrame>,
+    /// Live-member presence tracker for the lobby (#74). Mirrors [`Circle::presence`]:
+    /// inbound beacons `apply`, the heartbeat-timer `reap`s, and its lifetime is the
+    /// room subscription's (dropped on disconnect → live-only). Consumed by #75.
+    presence: PresenceTracker,
 }
 
 /// A share this daemon is publishing this session — the in-band-discovery
@@ -847,6 +879,10 @@ async fn net_actor(
             NetCommand::ApplyAnnouncement(ann) => actor.handle_apply_announcement(&ann),
             NetCommand::AnswerRollCall => actor.handle_answer_rollcall().await,
             NetCommand::ReconcileShares => actor.handle_reconcile_shares().await,
+            NetCommand::EmitHeartbeat => actor.handle_emit_heartbeat().await,
+            NetCommand::ApplyHeartbeat { room, heartbeat } => {
+                actor.handle_apply_heartbeat(&room, &heartbeat)
+            }
             NetCommand::RefreshPublicSpace => actor.handle_refresh_public_space().await,
             NetCommand::RefreshDeprecation => actor.handle_refresh_deprecation().await,
             NetCommand::FetchShare {
@@ -1276,6 +1312,113 @@ impl Actor {
         let _ = room.out_tx.send(frame).await;
     }
 
+    /// Emit one sealed member beacon (#74) into the lobby (if joined) and each
+    /// joined circle, then `reap` every presence tracker so members past their TTL
+    /// age out (the heartbeat timer is the reap clock too). See
+    /// [`NetCommand::EmitHeartbeat`]. A missing identity, a seal failure, or a
+    /// closed stream is logged-as-skipped and otherwise non-fatal — discovery
+    /// self-heals on the next tick, exactly like the reconcile/announce handlers.
+    ///
+    /// Each beacon is self-signed under the daemon's own identity (provenance,
+    /// ISC-C57) and sealed under the tier-correct key (the global room key for the
+    /// lobby; the circle key for a circle). The relay only fans a beacon to OTHER
+    /// subscribers, so a daemon never sees its own — and [`Self::handle_apply_heartbeat`]
+    /// filters it defensively regardless.
+    async fn handle_emit_heartbeat(&mut self) {
+        // Without an identity there is nothing to self-sign with; nothing to do
+        // but still keep the trackers honest by reaping below.
+        if let Some(identity) = self.identity.as_ref() {
+            let handle = identity.handle();
+            let signing = identity.signing();
+            let sent_unix_ms = now_unix_ms();
+
+            // Lobby beacon (if the lobby is joined). Borrow ends before the await:
+            // seal first, then send via the cloned sender.
+            if let Some(room) = self.public_room.as_ref() {
+                let fields = HeartbeatFields {
+                    room: &room.room,
+                    sender_handle: handle,
+                    sent_unix_ms,
+                };
+                match seal_public_heartbeat(&room.room_key, signing, &fields) {
+                    Ok(sealed) => {
+                        let frame = wire::CotFrame {
+                            asset_address: room.asset_addr.as_bytes().to_vec(),
+                            payload: sealed,
+                        };
+                        // A closed lobby stream is non-fatal: the next reconnect
+                        // re-subscribes and resumes beaconing.
+                        let _ = room.out_tx.send(frame).await;
+                    }
+                    Err(e) => {
+                        self.emit(NetEvent::ChatError {
+                            message: format!("could not seal lobby presence beacon: {e}"),
+                        });
+                    }
+                }
+            }
+
+            // One beacon per joined circle, each sealed under its own key.
+            for circle in &self.circles {
+                let fields = HeartbeatFields {
+                    room: &circle.label,
+                    sender_handle: handle,
+                    sent_unix_ms,
+                };
+                match seal_circle_heartbeat(&circle.cot_key, signing, &fields) {
+                    Ok(sealed) => {
+                        let frame = wire::CotFrame {
+                            asset_address: circle.asset_addr.as_bytes().to_vec(),
+                            payload: sealed,
+                        };
+                        let _ = circle.out_tx.send(frame).await;
+                    }
+                    Err(e) => {
+                        self.emit(NetEvent::ChatError {
+                            message: format!("could not seal circle presence beacon: {e}"),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Reap every tracker on the same tick — the timer is the reap clock.
+        let now = Instant::now();
+        if let Some(room) = self.public_room.as_mut() {
+            room.presence.reap(now);
+        }
+        for circle in &mut self.circles {
+            circle.presence.reap(now);
+        }
+    }
+
+    /// Fold a verified member heartbeat into the matching room/circle's
+    /// [`PresenceTracker`] (#74). See [`NetCommand::ApplyHeartbeat`]. The inbound
+    /// readers verify provenance before posting; this only routes by the
+    /// session-local `room` key and applies. An unknown room/circle drops
+    /// (non-fatal — likely raced a disconnect), and a beacon whose `sender_pubkey`
+    /// is our own identity is filtered defensively (the relay should never fan it
+    /// back to us). The [`PresenceChange`] return is ignored for now — the roster
+    /// UI that consumes it is #75.
+    fn handle_apply_heartbeat(&mut self, room: &str, heartbeat: &wire::MemberHeartbeat) {
+        // Self-filter: never count our own beacon as a live OTHER member.
+        if let Some(identity) = self.identity.as_ref()
+            && heartbeat.sender_pubkey.as_slice() == identity.signing().public_key().as_slice()
+        {
+            return;
+        }
+        let now = Instant::now();
+        if let Some(lobby) = self.public_room.as_mut()
+            && lobby.room == room
+        {
+            let _ = lobby.presence.apply(heartbeat, now);
+            return;
+        }
+        if let Some(circle) = self.circles.iter_mut().find(|c| c.label == room) {
+            let _ = circle.presence.apply(heartbeat, now);
+        }
+    }
+
     /// Build and emit a [`NetEvent::SharesSnapshot`] from the current local
     /// share-index entries and the in-band [`ShareCatalog`]. The single snapshot
     /// builder shared by [`Self::handle_refresh_shares`] and the catalog-mutating
@@ -1535,7 +1678,16 @@ impl Actor {
         // rendezvous). Runs until the stream ends.
         let reader_key = Rc::clone(&cot_key);
         let reader_tx = self.evt_tx.clone();
-        tokio::task::spawn_local(read_inbound(inbound, circle_id, reader_key, reader_tx));
+        let reader_cmd = self.cmd_tx.clone();
+        let reader_room = label.clone();
+        tokio::task::spawn_local(read_inbound(
+            inbound,
+            circle_id,
+            reader_room,
+            reader_key,
+            reader_tx,
+            reader_cmd,
+        ));
 
         self.circles.push(Circle {
             id: circle_id,
@@ -1543,6 +1695,7 @@ impl Actor {
             cot_key,
             asset_addr,
             out_tx,
+            presence: PresenceTracker::with_cadence(HEARTBEAT_INTERVAL_MAX, HEARTBEAT_MISS_COUNT),
         });
         self.emit(NetEvent::CircleJoined {
             circle_id,
@@ -1619,8 +1772,13 @@ impl Actor {
         let reader_key = Rc::clone(&room_key);
         let reader_tx = self.evt_tx.clone();
         let reader_cmd = self.cmd_tx.clone();
+        let reader_room = room.clone();
         tokio::task::spawn_local(read_inbound_public_room(
-            inbound, reader_key, reader_tx, reader_cmd,
+            inbound,
+            reader_room,
+            reader_key,
+            reader_tx,
+            reader_cmd,
         ));
 
         self.public_room = Some(PublicRoom {
@@ -1628,6 +1786,7 @@ impl Actor {
             room_key,
             asset_addr,
             out_tx,
+            presence: PresenceTracker::with_cadence(HEARTBEAT_INTERVAL_MAX, HEARTBEAT_MISS_COUNT),
         });
         self.emit(NetEvent::PublicRoomJoined {
             room: DEFAULT_ROOM.to_owned(),
@@ -1638,6 +1797,7 @@ impl Actor {
         // slow-reconcile timer that re-polls + prunes on `RECONCILE_INTERVAL`.
         self.post_rollcall().await;
         self.start_reconcile_timer();
+        self.start_heartbeat_timer();
     }
 
     /// Start the slow-reconcile loop (unified share model): a detached
@@ -1651,6 +1811,25 @@ impl Actor {
             loop {
                 tokio::time::sleep(RECONCILE_INTERVAL).await;
                 if cmd_tx.send(NetCommand::ReconcileShares).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    /// Start the presence-heartbeat loop (#74): a detached `spawn_local` that
+    /// posts a [`NetCommand::EmitHeartbeat`] back into the command loop on a
+    /// freshly-jittered [`next_heartbeat_interval`] each pass (~10–15s) so beacons
+    /// never lock-step across daemons. Self-terminating — the send fails once the
+    /// actor loop ends, breaking the loop. Started once per public-room join,
+    /// alongside the reconcile timer; one timer drives the beacon AND the reap for
+    /// the lobby and every joined circle.
+    fn start_heartbeat_timer(&self) {
+        let cmd_tx = self.cmd_tx.clone();
+        tokio::task::spawn_local(async move {
+            loop {
+                tokio::time::sleep(next_heartbeat_interval()).await;
+                if cmd_tx.send(NetCommand::EmitHeartbeat).is_err() {
                     break;
                 }
             }
@@ -2614,16 +2793,18 @@ impl Actor {
 async fn read_inbound(
     mut inbound: tonic::Streaming<wire::CotFrame>,
     circle_id: u64,
+    room: String,
     cot_key: Rc<CircleKey>,
     evt_tx: mpsc::UnboundedSender<NetEvent>,
+    cmd_tx: mpsc::UnboundedSender<NetCommand>,
 ) {
     loop {
         match inbound.message().await {
             Ok(Some(frame)) => {
                 // Foreign/undecryptable frames (noise on the shared rendezvous,
                 // or tampering) skip silently; a closed UI channel ends the task.
-                if let Ok(msg) = open_message(&cot_key, &frame.payload)
-                    && evt_tx
+                if let Ok(msg) = open_message(&cot_key, &frame.payload) {
+                    if evt_tx
                         .send(NetEvent::ChatMessage {
                             circle_id,
                             sender: msg.sender_handle,
@@ -2631,8 +2812,23 @@ async fn read_inbound(
                             sent_unix_ms: msg.sent_unix_ms,
                         })
                         .is_err()
-                {
-                    return; // UI gone
+                    {
+                        return; // UI gone
+                    }
+                } else if let Ok(hb) = open_heartbeat(cot_key.as_ref(), &frame.payload) {
+                    // A verified member beacon (#74) — fold into THIS circle's
+                    // presence tracker on the actor's command loop. The verified
+                    // `room` is unused for routing (the key already named the
+                    // circle); the circle's session-local label is the routing key.
+                    if cmd_tx
+                        .send(NetCommand::ApplyHeartbeat {
+                            room: room.clone(),
+                            heartbeat: Box::new(hb),
+                        })
+                        .is_err()
+                    {
+                        return; // actor gone
+                    }
                 }
             }
             Ok(None) | Err(_) => return, // stream ended / errored
@@ -2658,6 +2854,7 @@ async fn read_inbound(
 /// closes (the actor is gone).
 async fn read_inbound_public_room(
     mut inbound: tonic::Streaming<wire::CotFrame>,
+    room: String,
     room_key: Rc<PublicRoomKey>,
     evt_tx: mpsc::UnboundedSender<NetEvent>,
     cmd_tx: mpsc::UnboundedSender<NetCommand>,
@@ -2704,6 +2901,19 @@ async fn read_inbound_public_room(
                     // The verified fields beyond "it opened" are unused (we
                     // re-announce everything regardless of who asked).
                     if cmd_tx.send(NetCommand::AnswerRollCall).is_err() {
+                        return; // actor gone
+                    }
+                } else if let Ok(hb) = open_heartbeat(room_key.as_ref(), &frame.payload) {
+                    // A verified member beacon (#74) — fold into the lobby's
+                    // presence tracker on the actor's command loop (all tracker
+                    // mutation stays on `&mut self`).
+                    if cmd_tx
+                        .send(NetCommand::ApplyHeartbeat {
+                            room: room.clone(),
+                            heartbeat: Box::new(hb),
+                        })
+                        .is_err()
+                    {
                         return; // actor gone
                     }
                 }

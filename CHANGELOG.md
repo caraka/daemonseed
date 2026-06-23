@@ -24,6 +24,12 @@ next release this block is renamed to its version + date and a fresh
 `[Unreleased]` is opened (see `AGENTS.md` doc-sync). Planning for *unstarted*
 work lives in the project lead's vault manifest, not here.
 
+### Added
+
+- `daemonseed_core::heartbeat` — AES-256-GCM-sealed, ML-DSA-87-self-signed `MemberHeartbeat`, tier-split by key class (`seal_public_heartbeat` / `seal_circle_heartbeat` / `open_heartbeat`), distinct AAD `daemonseed/presence/heartbeat/v1`. (#74)
+- `daemonseed_core::presence::PresenceTracker` — per-room member liveness keyed by sender pubkey, reaped after a multi-miss TTL; `next_heartbeat_interval` draws a jittered ~10–15s emit interval. (#74)
+- TUI net actor emits a member heartbeat per subscribed room on the jittered timer and folds inbound beacons into a per-room presence tracker; roster surfacing deferred to #75/#77. (#74)
+
 ## [0.30.0] — 2026-06-23
 
 ### Added

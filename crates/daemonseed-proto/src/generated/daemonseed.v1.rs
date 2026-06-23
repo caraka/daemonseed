@@ -292,6 +292,56 @@ pub struct ShareRollCall {
     #[prost(bytes = "vec", tag = "5")]
     pub signature: ::prost::alloc::vec::Vec<u8>,
 }
+/// A MEMBER HEARTBEAT — the member-plane connected-presence beacon (presence
+/// superstructure; design-of-record: docs/design/presence-superstructure.md).
+/// Every connected member periodically posts this sealed beacon into each room it
+/// is subscribed to, as a CotFrame.payload at that room's rendezvous address, so
+/// members can see who is online while the relay stays blind. It is the
+/// member-plane counterpart to the relay-plane subscription-refcount presence
+/// (ISC-S20): the relay knows an address has live subscribers but never their
+/// identities; this beacon carries the member's self-asserted presence INSIDE the
+/// seal, where only room members can read it.
+///
+/// Like ShareAnnouncement / ShareRollCall it is (1) SELF-SIGNED FOR PROVENANCE
+/// (C57) — the signature over the domain-separated input proves WHO is present —
+/// and (2) AES-256-GCM-sealed under the tier key (public room key, or a circle
+/// cot_key), so only room/circle members can post or read a heartbeat and the
+/// relay sees ciphertext only (A-S2, A-S16). A distinct AAD
+/// (daemonseed/presence/heartbeat/v1) keeps it from ever being opened as — or
+/// substituted from — a chat message, a public-room message, a share
+/// announcement, or a roll-call under a coincidentally-equal key. It is
+/// wire-shape-identical to those sealed frames, adding no new distinguishable
+/// flow (A-S2 traffic-shape), and carries ONLY the beacon's own presence
+/// assertion — never a roster or peer list (A-C38). See daemonseed-core
+/// heartbeat::{seal_public_heartbeat, seal_circle_heartbeat, open_heartbeat}.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MemberHeartbeat {
+    /// The room/circle this heartbeat belongs to (e.g. "lobby" for public). Bound
+    /// into the provenance signature so a heartbeat cannot be replayed into a
+    /// different room.
+    #[prost(string, tag = "1")]
+    pub room: ::prost::alloc::string::String,
+    /// The member's full ML-DSA-87 public key. The provenance signature verifies
+    /// under it; the recipient derives the authoritative handle hash-prefix
+    /// SHA-384(sender_pubkey)\[:12\] (ISC-C4), never trusting sender_handle alone.
+    #[prost(bytes = "vec", tag = "2")]
+    pub sender_pubkey: ::prost::alloc::vec::Vec<u8>,
+    /// The member's self-asserted display handle (`name#12hex`). Advisory: the
+    /// recipient cross-checks its hash component against sender_pubkey (ISC-C57).
+    #[prost(string, tag = "3")]
+    pub sender_handle: ::prost::alloc::string::String,
+    /// Member wall-clock at beacon time, unix milliseconds. Advisory ordering and
+    /// liveness aging — a receiver ages out a member not re-heard within a TTL,
+    /// measured from local receive time; never trusted for security (the relay sees
+    /// only ciphertext and stamps nothing).
+    #[prost(int64, tag = "4")]
+    pub sent_unix_ms: i64,
+    /// Detached ML-DSA-87 provenance signature over the domain-separated signed
+    /// input (room ‖ sender_pubkey ‖ sent_unix_ms). Verified client-side under
+    /// sender_pubkey; a bad signature drops the heartbeat.
+    #[prost(bytes = "vec", tag = "5")]
+    pub signature: ::prost::alloc::vec::Vec<u8>,
+}
 /// Generated client implementations.
 pub mod circle_of_trust_client {
     #![allow(

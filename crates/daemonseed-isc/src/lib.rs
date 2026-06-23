@@ -17,8 +17,8 @@
 //!
 //! Count invariants (kept aligned with `ISA.md` `## Criteria`):
 //!
-//! - 55 server-side: 31 positive (`ISC-S*`) + 24 negative (`ISC-A-S*`)
-//! - 98 client-side: 67 positive (`ISC-C*`) + 31 negative (`ISC-A-C*`)
+//! - 56 server-side: 31 positive (`ISC-S*`) + 25 negative (`ISC-A-S*`)
+//! - 107 client-side: 74 positive (`ISC-C*`) + 33 negative (`ISC-A-C*`)
 //!   (M16 A1 added C66 manifest-preview + A-C33 no-blind-download, A2 added C67 selective-fetch,
 //!   A3 added C68 choose-download-dir, A4 added C72 collapsible-folder-tree preview, C1 added C69
 //!   multi-share-publish, C2 added C70 status-auto-clear, C3 added C71 generate-circle-phrase;
@@ -114,6 +114,8 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-A-S20", IscClass::Negative),
     ("ISC-A-S21", IscClass::Negative),
     ("ISC-A-S22", IscClass::Negative),
+    // ── server negative (presence heartbeat #74: relay does no heartbeat handling) ──
+    ("ISC-A-S23", IscClass::Negative),
     // ── client positive (42) — C5 intentionally vacant (R5) ─────────────
     ("ISC-C1", IscClass::Positive),
     ("ISC-C2", IscClass::Positive),
@@ -195,6 +197,10 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-C81", IscClass::Positive),
     // ── client positive (rename identity: re-seal display name) ──
     ("ISC-C82", IscClass::Positive),
+    // ── client positive (presence heartbeat #74: emit, wire-shape, tracker) ──
+    ("ISC-C83", IscClass::Positive),
+    ("ISC-C84", IscClass::Positive),
+    ("ISC-C85", IscClass::Positive),
     // ── client negative (20) ────────────────────────────────────────────
     ("ISC-A-C1", IscClass::Negative),
     ("ISC-A-C2", IscClass::Negative),
@@ -230,13 +236,16 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-A-C36", IscClass::Negative),
     // ── client negative (M16 chunking completion: manifest frame budget) ──
     ("ISC-A-C37", IscClass::Negative),
+    // ── client negative (presence heartbeat #74: no roster leak, no persist) ──
+    ("ISC-A-C38", IscClass::Negative),
+    ("ISC-A-C39", IscClass::Negative),
 ];
 
 /// Total built, non-deferred ISCs tracked by this registry — the SINGLE source
 /// of truth for the coverage denominator, read live by `xtask isc-coverage`.
 /// Recount on every ISC add/remove (the `const _` assert below guards it
 /// against [`ISCS`]).
-pub const TOTAL: usize = 157;
+pub const TOTAL: usize = 163;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -375,9 +384,9 @@ mod tests {
                 IscClass::Negative => neg += 1,
             }
         }
-        // ISA `## Criteria` (built, non-deferred): 55 server + 102 client = 157.
-        //   server  31 pos + 24 neg = 55  (unified share model: S30 pos, A-S22 neg)
-        //   client  71 pos + 31 neg = 102 (M13 C59-C62 + A-C29/A-C30;
+        // ISA `## Criteria` (built, non-deferred): 56 server + 107 client = 163.
+        //   server  31 pos + 25 neg = 56  (presence heartbeat #74: A-S23 neg)
+        //   client  74 pos + 33 neg = 107 (M13 C59-C62 + A-C29/A-C30;
         //                                  M15 C  C63-C65 + A-C31/A-C32;
         //                                  M16 A1 C66 + A-C33; A2 C67; A3 C68;
         //                                  A4 C72; C1 C69; C2 C70; C3 C71;
@@ -390,10 +399,11 @@ mod tests {
         //                                  connection resilience C79 drop-detection #72,
         //                                  C80 auto-reconnect #71;
         //                                  single-instance lock C81 pos, #60;
-        //                                  rename-identity re-seal C82 pos, #66)
-        //   total   102 pos + 55 neg = 157
-        assert_eq!(pos, 102, "positive count drift");
-        assert_eq!(neg, 55, "negative count drift");
+        //                                  rename-identity re-seal C82 pos, #66;
+        //                                  presence heartbeat C83-C85 pos + A-C38/A-C39 neg, #74)
+        //   total   105 pos + 58 neg = 163
+        assert_eq!(pos, 105, "positive count drift");
+        assert_eq!(neg, 58, "negative count drift");
     }
 
     /// COVERED is single-sourced and must agree with the per-milestone
