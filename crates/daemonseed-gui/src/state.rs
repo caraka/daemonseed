@@ -196,6 +196,23 @@ impl GuiState {
         self.profile.as_ref().map(|p| p.display_handle().to_owned())
     }
 
+    /// #66: rename the unlocked identity — set a new display name and re-seal the
+    /// at-rest blob (write-through) so it persists across unlock; also the recovery
+    /// path for a profile created nameless before #65. Returns the new display
+    /// handle, or `Err` for an invalid name, no unlocked profile, or a disk-seal
+    /// failure. The cryptographic identity (handle hash) is unchanged. The Ctrl-K
+    /// command-palette entry that drives this is felt-deferred (#66), so the binary
+    /// has no caller yet — `#[allow(dead_code)]`, same convention as
+    /// [`GuiState::circle_fingerprint_of`]; the core path is exercised by the
+    /// `rename_identity_*` unit tests.
+    #[allow(dead_code)]
+    pub fn rename_identity(&mut self, new_name: &str) -> Result<String, String> {
+        match self.profile.as_mut() {
+            Some(p) => p.rename(new_name).map(str::to_owned),
+            None => Err("no unlocked profile to rename".into()),
+        }
+    }
+
     /// Record a share that just started serving this session (commit 3, on
     /// `PublishStarted`). Replaces any existing entry with the same id so a relay
     /// re-list can't double it.
@@ -1126,6 +1143,160 @@ mod tests {
             Some("alice"),
             "the display handle survives reload"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #66: renaming an unlocked identity re-seals the at-rest blob, so the new
+    /// display name persists across an unlock from disk; an invalid name is rejected
+    /// and leaves the prior name intact.
+    #[test]
+    fn rename_identity_persists_the_new_name_across_reload() {
+        use daemonseed_core::bootstrap::BootstrapAnchor;
+        use daemonseed_core::first_start::FirstStart;
+        use daemonseed_core::profile::config::ArgonParams;
+        use daemonseed_core::profile::persist::{
+            load_for_unlock, session_materials_from_unlock, write_first_start,
+        };
+        use daemonseed_core::storage::seeds;
+
+        let _ = oxicrypt_module::initialize();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("ds-gui-rename-test-{}-{nonce}", std::process::id()));
+        let fast = ArgonParams {
+            memory_kib: 8,
+            iterations: 1,
+            parallelism: 1,
+        };
+        let pass = "correct horse battery staple table mountain";
+
+        // Enroll a NAMED profile "alice".
+        let sealed = FirstStart::new().initialize(pass, fast).unwrap();
+        let phrase = sealed.display_phrase();
+        let verified = sealed.verify_round_trip(&phrase).unwrap();
+        let materials = verified
+            .finalize(
+                Some("alice".to_string()),
+                BootstrapAnchor {
+                    server_id: "relay#aabbccddeeff".to_string(),
+                    address: "127.0.0.1:443".to_string(),
+                },
+            )
+            .unwrap()
+            .into_session_materials();
+        write_first_start(&root, &materials, None, false).unwrap();
+
+        // Rename alice -> bob; the live handle updates.
+        let mut st1 = GuiState::lobby_only();
+        st1.set_profile(Profile::from_materials(materials, root.clone()));
+        assert_eq!(st1.display_handle().as_deref(), Some("alice"));
+        assert_eq!(st1.rename_identity("bob").unwrap(), "bob");
+        assert_eq!(
+            st1.display_handle().as_deref(),
+            Some("bob"),
+            "the live handle updates on rename"
+        );
+        // An invalid (line-break) name is rejected and leaves the name intact.
+        assert!(st1.rename_identity("bad\nname").is_err());
+        assert_eq!(st1.display_handle().as_deref(), Some("bob"));
+        drop(st1);
+
+        // Reload from disk under the passphrase: the renamed name persisted.
+        let (config, blob) = load_for_unlock(&root).unwrap();
+        let opened = seeds::open(&blob, pass, config.profile_id, config.argon2).unwrap();
+        let materials2 = session_materials_from_unlock(
+            opened.seeds,
+            opened.key,
+            opened.index_key,
+            config,
+            blob.clone(),
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(
+            materials2.display_name.as_deref(),
+            Some("bob"),
+            "the renamed display name persists across unlock"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #66 doubles as the #65 recovery path: a profile created nameless (before the
+    /// fix) can be given a name via rename, and that name then persists across unlock.
+    #[test]
+    fn rename_identity_names_a_nameless_pre_fix_profile() {
+        use daemonseed_core::bootstrap::BootstrapAnchor;
+        use daemonseed_core::first_start::FirstStart;
+        use daemonseed_core::profile::config::ArgonParams;
+        use daemonseed_core::profile::persist::{
+            load_for_unlock, session_materials_from_unlock, write_first_start,
+        };
+        use daemonseed_core::storage::seeds;
+
+        let _ = oxicrypt_module::initialize();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "ds-gui-rename-nameless-{}-{nonce}",
+            std::process::id()
+        ));
+        let fast = ArgonParams {
+            memory_kib: 8,
+            iterations: 1,
+            parallelism: 1,
+        };
+        let pass = "correct horse battery staple table mountain";
+
+        // Enroll a NAMELESS profile (finalize(None) — the pre-#65 state).
+        let sealed = FirstStart::new().initialize(pass, fast).unwrap();
+        let phrase = sealed.display_phrase();
+        let verified = sealed.verify_round_trip(&phrase).unwrap();
+        let materials = verified
+            .finalize(
+                None,
+                BootstrapAnchor {
+                    server_id: "relay#aabbccddeeff".to_string(),
+                    address: "127.0.0.1:443".to_string(),
+                },
+            )
+            .unwrap()
+            .into_session_materials();
+        assert!(
+            materials.display_name.is_none(),
+            "fixture: a nameless enrollment"
+        );
+        write_first_start(&root, &materials, None, false).unwrap();
+
+        let mut st = GuiState::lobby_only();
+        st.set_profile(Profile::from_materials(materials, root.clone()));
+        // A nameless profile presents the formatted handle, not a chosen name.
+        let before = st.display_handle().expect("a formatted-handle fallback");
+        assert_ne!(before, "carol");
+        // Recovery: set a name on the existing identity.
+        assert_eq!(st.rename_identity("carol").unwrap(), "carol");
+        assert_eq!(st.display_handle().as_deref(), Some("carol"));
+        drop(st);
+
+        // The recovered name persists across unlock.
+        let (config, blob) = load_for_unlock(&root).unwrap();
+        let opened = seeds::open(&blob, pass, config.profile_id, config.argon2).unwrap();
+        let materials2 = session_materials_from_unlock(
+            opened.seeds,
+            opened.key,
+            opened.index_key,
+            config,
+            blob.clone(),
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(materials2.display_name.as_deref(), Some("carol"));
 
         let _ = std::fs::remove_dir_all(&root);
     }

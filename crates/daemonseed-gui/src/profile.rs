@@ -127,6 +127,26 @@ impl Profile {
         Ok(removed)
     }
 
+    /// #66: rename this identity — set a new display name in the at-rest blob and
+    /// re-seal it (M13 write-through), so the chosen name persists across unlock.
+    /// Also the recovery path for a profile created nameless before #65: it sets a
+    /// name on an existing identity. The cryptographic identity (the handle hash) is
+    /// unchanged — only the presented name. Rejects an invalid name
+    /// (`is_valid_display_name`: non-empty, no line breaks, length-bounded); on a
+    /// disk/seal failure the live handle still reflects the rename (it persists on
+    /// the next write-through, mirroring `persist_circle`). Returns the new handle.
+    pub fn rename(&mut self, new_name: &str) -> Result<&str, String> {
+        if !daemonseed_core::handle::display_name::is_valid_display_name(new_name) {
+            return Err("invalid display name (empty, too long, or contains a line break)".into());
+        }
+        if !self.seeds.set_display_name(Some(new_name.to_owned())) {
+            return Err("the seeds layer rejected the display name".into());
+        }
+        self.display_handle = new_name.to_owned();
+        self.reseal()?;
+        Ok(&self.display_handle)
+    }
+
     /// Re-seal the current [`Seeds`] under the cached key and overwrite `seeds.blob`.
     fn reseal(&self) -> Result<(), String> {
         let bytes = self
