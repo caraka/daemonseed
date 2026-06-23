@@ -582,8 +582,24 @@ fn build_ui() -> BuiltUi {
         }
     });
     ui.on_shares_tab_opened({
+        let weak = ui.as_weak();
+        let state = state.clone();
         let net = net.clone();
         move || {
+            // #70: opening Public Shares while a circle is the active room follows
+            // the room to the Lobby, so the highlighted room matches the public
+            // context. `on_switch_circle` re-renders the rail and re-opens the
+            // public-shares tab (which re-enters here with the Lobby active — a
+            // None target), so the RefreshShares rides that path. Bind the Copy
+            // result before invoking so the `state` borrow is released (the switch
+            // handler re-borrows `state` mutably).
+            let target = state.borrow().public_shares_target_room();
+            if let Some(lobby) = target {
+                if let Some(ui) = weak.upgrade() {
+                    ui.invoke_switch_circle(lobby as i32);
+                }
+                return;
+            }
             let _ = net.borrow().send(NetCommand::RefreshShares);
         }
     });

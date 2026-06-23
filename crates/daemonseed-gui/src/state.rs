@@ -486,6 +486,18 @@ impl GuiState {
             self.circles[self.active].unread = false;
         }
     }
+
+    /// #70: the room the active view should follow to when the **Public Shares**
+    /// tab is opened. Returns `Some(0)` (the Lobby) when a circle is the active
+    /// room, so the highlighted room matches the public context being shown; `None`
+    /// when the pinned Lobby (index 0) is already active — a no-op. The Lobby is
+    /// invariantly the pinned index-0 room, so `active != 0` ⟺ a circle is active
+    /// (equivalently `current().net.is_some()` in the live app). Deliberately NOT
+    /// symmetric: opening the Circle-shares tab from the Lobby has no single target
+    /// circle, so that direction is left untouched.
+    pub fn public_shares_target_room(&self) -> Option<usize> {
+        (self.active != 0).then_some(0)
+    }
 }
 
 #[cfg(test)]
@@ -582,6 +594,17 @@ impl GuiState {
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[test]
+    fn public_shares_opening_follows_a_circle_to_the_lobby() {
+        // #70: with a circle active (demo seeds active = 1), opening the Public
+        // Shares tab follows the room to the Lobby (index 0); a no-op on the Lobby.
+        let mut st = GuiState::demo();
+        assert_ne!(st.active(), 0, "demo fixture seeds a circle active");
+        assert_eq!(st.public_shares_target_room(), Some(0));
+        st.switch_to(0, String::new(), 0.0);
+        assert_eq!(st.public_shares_target_room(), None);
+    }
 
     #[test]
     fn my_shares_add_replace_remove() {
