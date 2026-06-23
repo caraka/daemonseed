@@ -191,6 +191,8 @@ pub const ISCS: &[(&str, IscClass)] = &[
     // ── client positive (alpha3 GUI connection resilience: drop detection + auto-reconnect) ──
     ("ISC-C79", IscClass::Positive),
     ("ISC-C80", IscClass::Positive),
+    // ── client positive (single-instance profile-root guard) ──
+    ("ISC-C81", IscClass::Positive),
     // ── client negative (20) ────────────────────────────────────────────
     ("ISC-A-C1", IscClass::Negative),
     ("ISC-A-C2", IscClass::Negative),
@@ -232,7 +234,7 @@ pub const ISCS: &[(&str, IscClass)] = &[
 /// of truth for the coverage denominator, read live by `xtask isc-coverage`.
 /// Recount on every ISC add/remove (the `const _` assert below guards it
 /// against [`ISCS`]).
-pub const TOTAL: usize = 155;
+pub const TOTAL: usize = 156;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -371,9 +373,9 @@ mod tests {
                 IscClass::Negative => neg += 1,
             }
         }
-        // ISA `## Criteria` (built, non-deferred): 55 server + 100 client = 155.
+        // ISA `## Criteria` (built, non-deferred): 55 server + 101 client = 156.
         //   server  31 pos + 24 neg = 55  (unified share model: S30 pos, A-S22 neg)
-        //   client  69 pos + 31 neg = 100 (M13 C59-C62 + A-C29/A-C30;
+        //   client  70 pos + 31 neg = 101 (M13 C59-C62 + A-C29/A-C30;
         //                                  M15 C  C63-C65 + A-C31/A-C32;
         //                                  M16 A1 C66 + A-C33; A2 C67; A3 C68;
         //                                  A4 C72; C1 C69; C2 C70; C3 C71;
@@ -384,9 +386,10 @@ mod tests {
         //                                  unified share model C77 pos;
         //                                  client-side unread dot C78 pos, #64;
         //                                  connection resilience C79 drop-detection #72,
-        //                                  C80 auto-reconnect #71)
-        //   total   100 pos + 55 neg = 155
-        assert_eq!(pos, 100, "positive count drift");
+        //                                  C80 auto-reconnect #71;
+        //                                  single-instance lock C81 pos, #60)
+        //   total   101 pos + 55 neg = 156
+        assert_eq!(pos, 101, "positive count drift");
         assert_eq!(neg, 55, "negative count drift");
     }
 

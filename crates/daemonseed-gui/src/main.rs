@@ -29,6 +29,7 @@ mod desktop_integration;
 mod net;
 mod profile;
 mod share_browser;
+mod single_instance;
 mod state;
 
 slint::include_modules!();
@@ -1750,17 +1751,47 @@ fn wire_auth(
 /// Unlock, none → the first-start wizard. Stashes the chosen root in `profile_root`
 /// for the auth callbacks. Only the windowed (`desktop`) path routes at startup; the
 /// offscreen build sets screens directly via flags, so this is unused there.
+/// Acquire the single-instance lock (#60) on the resolved profile `root`, or refuse
+/// to start. A live same-root holder exits the process (refuse-to-start is the safe
+/// minimum; focus-existing needs cross-process IPC, deferred). A lockfile I/O hiccup
+/// degrades to unguarded rather than blocking a legitimate launch.
 #[cfg_attr(not(feature = "desktop"), allow(dead_code))]
-fn route_startup(ui: &AppWindow, profile_root: &Rc<RefCell<PathBuf>>, portable: bool) {
+fn acquire_or_refuse(root: &std::path::Path) -> Option<single_instance::InstanceLock> {
+    match single_instance::acquire(root) {
+        Ok(lock) => Some(lock),
+        Err(single_instance::LockError::AlreadyRunning) => {
+            eprintln!(
+                "daemonseed is already running for this profile root ({}); refusing to start a second instance.",
+                root.display()
+            );
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("single-instance guard unavailable, proceeding unguarded: {e}");
+            None
+        }
+    }
+}
+
+#[cfg_attr(not(feature = "desktop"), allow(dead_code))]
+fn route_startup(
+    ui: &AppWindow,
+    profile_root: &Rc<RefCell<PathBuf>>,
+    portable: bool,
+) -> Option<single_instance::InstanceLock> {
+    let mut instance_lock = None;
     match resolve(ResolveArgs {
         config_flag: None,
         portable,
     }) {
         Ok(ResolvedProfileRoot::Existing { root, .. }) => {
+            // #60: guard the resolved root before its single-writer storage opens.
+            instance_lock = acquire_or_refuse(&root);
             *profile_root.borrow_mut() = root;
             ui.set_screen(SharedString::from("unlock"));
         }
         Ok(ResolvedProfileRoot::FirstStart { default_root }) => {
+            instance_lock = acquire_or_refuse(&default_root);
             *profile_root.borrow_mut() = default_root;
             ui.set_screen(SharedString::from("first-start"));
             ui.set_fs_step(0);
@@ -1782,6 +1813,7 @@ fn route_startup(ui: &AppWindow, profile_root: &Rc<RefCell<PathBuf>>, portable: 
             ui.invoke_focus_auth();
         }
     });
+    instance_lock
 }
 
 /// A fixed sample recovery phrase for offscreen rendering of the wizard's mnemonic /
@@ -1941,7 +1973,10 @@ fn main() {
         // The drain timer runs for the whole app life; the Connect is deferred to
         // the auth-success callbacks (no connecting under the auth gate).
         let _live = start_drain(&ui, state, net, browser);
-        route_startup(&ui, &profile_root, portable);
+        // #60: hold the single-instance lock for the whole windowed session — dropped
+        // on return (clean exit removes the lockfile; a crash leaves it for the next
+        // launch to reclaim by PID-liveness).
+        let _instance_lock = route_startup(&ui, &profile_root, portable);
         // First-run: offer to self-register the .desktop + icon (AppImage only, not yet
         // integrated, not declined). The overlay defers itself to the main screen.
         ui.set_desktop_prompt_open(desktop_integration::should_prompt());
