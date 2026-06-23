@@ -93,6 +93,11 @@ enum Cmd {
         #[arg(long)]
         skip_build: bool,
     },
+    /// Run the full Definition-of-Done gate (fmt, clippy workspace +
+    /// gui/desktop, test --workspace, check-proto, isc-coverage) and refuse
+    /// (non-zero exit) if any check is red — so a release tag is never cut on a
+    /// red tree (#62). Run before `git tag`.
+    ReleaseGate,
 }
 
 fn main() -> Result<()> {
@@ -104,6 +109,7 @@ fn main() -> Result<()> {
         Cmd::InstallHooks { target } => install_hooks(target),
         Cmd::MvpGate { skip_build } => mvp_gate(skip_build),
         Cmd::WireShape { skip_build } => wire_shape(skip_build),
+        Cmd::ReleaseGate => release_gate(),
     }
 }
 
@@ -564,4 +570,144 @@ fn wire_shape(skip_build: bool) -> Result<()> {
     }
     println!("wire-shape: PASS");
     Ok(())
+}
+
+// ── release-gate ─────────────────────────────────────────────────────
+
+/// One Definition-of-Done step the release gate runs, in order. `args` go to
+/// `cargo`. Mirrors `AGENTS.md` § Definition of done.
+struct GateStep {
+    name: &'static str,
+    args: &'static [&'static str],
+}
+
+/// The full DoD gate a release tag-cut must pass green (#62).
+const RELEASE_GATE_STEPS: &[GateStep] = &[
+    GateStep {
+        name: "fmt --all --check",
+        args: &["fmt", "--all", "--check"],
+    },
+    GateStep {
+        name: "clippy --workspace -D warnings",
+        args: &[
+            "clippy",
+            "--workspace",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ],
+    },
+    GateStep {
+        name: "clippy -p daemonseed-gui --features desktop -D warnings",
+        args: &[
+            "clippy",
+            "-p",
+            "daemonseed-gui",
+            "--features",
+            "desktop",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ],
+    },
+    GateStep {
+        name: "test --workspace",
+        args: &["test", "--workspace"],
+    },
+    GateStep {
+        name: "xtask check-proto",
+        args: &["xtask", "check-proto"],
+    },
+    GateStep {
+        name: "xtask isc-coverage",
+        args: &["xtask", "isc-coverage"],
+    },
+];
+
+/// Pure verdict: GREEN iff every step passed, else RED naming the failed steps in
+/// order. Separated from the subprocess runner so the refuse-on-red logic is
+/// unit-tested without shelling out (#62).
+fn release_gate_verdict(
+    results: &[(&'static str, bool)],
+) -> std::result::Result<(), Vec<&'static str>> {
+    let failed: Vec<&'static str> = results
+        .iter()
+        .filter(|(_, ok)| !ok)
+        .map(|(name, _)| *name)
+        .collect();
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(failed)
+    }
+}
+
+/// Run every DoD step and refuse the tag-cut (non-zero exit) if any is red, so a
+/// release tag is never created on a red tree — the v0.29.0 slip, where a tag was
+/// cut while `test --workspace` was red (#62). Run before `git tag`.
+fn release_gate() -> Result<()> {
+    let repo = workspace_root_from_xtask()?;
+    let cargo = cargo_bin();
+    let mut results: Vec<(&'static str, bool)> = Vec::with_capacity(RELEASE_GATE_STEPS.len());
+    for step in RELEASE_GATE_STEPS {
+        println!("release-gate: {} …", step.name);
+        let status = Command::new(&cargo)
+            .current_dir(&repo)
+            .args(step.args)
+            .status()
+            .with_context(|| format!("spawn cargo {}", step.name))?;
+        results.push((step.name, status.success()));
+    }
+    match release_gate_verdict(&results) {
+        Ok(()) => {
+            println!("release-gate: GREEN — every DoD check passed; safe to cut the signed tag.");
+            Ok(())
+        }
+        Err(failed) => bail!(
+            "release-gate: RED — refusing the tag-cut; failed: {}. Fix and re-run before `git tag`.",
+            failed.join(", ")
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn green_only_when_every_step_passes() {
+        let all_green = [("fmt", true), ("clippy", true), ("test --workspace", true)];
+        assert!(release_gate_verdict(&all_green).is_ok());
+    }
+
+    #[test]
+    fn the_v0290_slip_red_test_workspace_refuses_the_tag() {
+        // The v0.29.0 slip: a red `test --workspace` while every other step is
+        // green must still produce a RED verdict that names it.
+        let results = [
+            ("fmt", true),
+            ("clippy", true),
+            ("test --workspace", false),
+            ("xtask check-proto", true),
+        ];
+        assert_eq!(
+            release_gate_verdict(&results),
+            Err(vec!["test --workspace"])
+        );
+    }
+
+    #[test]
+    fn every_red_step_is_named_in_order() {
+        let results = [
+            ("fmt", false),
+            ("clippy", true),
+            ("test --workspace", false),
+        ];
+        assert_eq!(
+            release_gate_verdict(&results),
+            Err(vec!["fmt", "test --workspace"])
+        );
+    }
 }

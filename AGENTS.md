@@ -62,6 +62,8 @@ Every task is incomplete until all of these pass:
 
 Run checks 1–4 as the last step before handing control back to the user, and re-run after any post-review fix-ups; check 5 (doc-sync) is applied per-commit as you go, not deferred to handback. If `cargo fmt --all --check` reports diffs, run `cargo fmt --all` to fix them before the clippy step — clippy output is easier to read on formatted code.
 
+**Cutting a release tag:** run `cargo xtask release-gate` before `git tag`. It runs the full DoD gate (fmt · clippy workspace + `daemonseed-gui --features desktop` · `test --workspace` · check-proto · isc-coverage) and exits non-zero naming any red step, so a tag is never created on a red tree — the v0.29.0 slip, where a tag was cut while `test --workspace` was red. The pre-push hook is the backstop on push; the release-gate stops the tag being created in the first place.
+
 ## Documentation sync at every commit point
 
 At each commit boundary, refresh documentation while the context is fresh. For any commit that touches a crate — directly or by reference — do all of:
