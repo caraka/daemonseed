@@ -24,7 +24,6 @@ doc under `docs/design/`. When a design is accepted, its component deliverables
 become GitHub issues and the entry here is removed — but the design doc stays as
 the design-of-record.
 
-- **Circle share/chat presence superstructure** → [`docs/design/presence-superstructure.md`](docs/design/presence-superstructure.md)
 - **Sharer identity → `handle#hash` verification** — cryptographically verifiable *who I'm downloading from* (today `sharer_handle` is self-asserted, relay-unenforced, used only for the cosmetic "you" tag; likely `daemonseed-core::identity_proof`). Needs a trust-property design pass → design doc TBD.
 
 ## Features

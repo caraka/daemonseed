@@ -1,7 +1,8 @@
 # Design: presence superstructure (member-visible connected-presence)
 
 **Status:** accepted (design-of-record) — resolves the draft seed's open questions; component
-issues not yet filed (the ROADMAP entry stays until they are).
+deliverables filed as #74 (heartbeat primitive), #75 (Lobby increment), #76 (share unification),
+#77 (circle presence). Removed from the ROADMAP `Designs` list; this doc stays as the rationale.
 
 ## Problem
 
