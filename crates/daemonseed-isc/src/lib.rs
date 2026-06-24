@@ -18,7 +18,7 @@
 //! Count invariants (kept aligned with `ISA.md` `## Criteria`):
 //!
 //! - 56 server-side: 31 positive (`ISC-S*`) + 25 negative (`ISC-A-S*`)
-//! - 110 client-side: 76 positive (`ISC-C*`) + 34 negative (`ISC-A-C*`)
+//! - 111 client-side: 76 positive (`ISC-C*`) + 35 negative (`ISC-A-C*`)
 //!   (M16 A1 added C66 manifest-preview + A-C33 no-blind-download, A2 added C67 selective-fetch,
 //!   A3 added C68 choose-download-dir, A4 added C72 collapsible-folder-tree preview, C1 added C69
 //!   multi-share-publish, C2 added C70 status-auto-clear, C3 added C71 generate-circle-phrase;
@@ -31,8 +31,9 @@
 //!   persistence + A-C29/A-C30; M15 C added C63-C65 fetched-content browse/extract + A-C31/A-C32.
 //!   Earlier: alpha2 share_id / share download / public rooms / client-lifecycle / portable.
 //!   alpha3: C77/C78 unified-share + unread; C79/C80 connection resilience; C81 single-instance;
-//!   C82 rename; C83-C86 + A-C38/A-C39 presence heartbeat; C87 + A-C40 graceful-EOS re-subscribe.)
-//! - 166 total
+//!   C82 rename; C83-C86 + A-C38/A-C39 presence heartbeat; C87 + A-C40 graceful-EOS re-subscribe;
+//!   A-C41 presence replay-freshness.)
+//! - 167 total
 //!
 //! Deliberately EXCLUDED from [`ISCS`] (and therefore from [`TOTAL`]) because
 //! they are not built: the deferred direct-messaging family
@@ -247,13 +248,15 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-A-C39", IscClass::Negative),
     // ── client negative (#80: a graceful EOS must not tear down the session) ──
     ("ISC-A-C40", IscClass::Negative),
+    // ── client negative (#78: a replayed/stale-dated beacon must not refresh presence) ──
+    ("ISC-A-C41", IscClass::Negative),
 ];
 
 /// Total built, non-deferred ISCs tracked by this registry — the SINGLE source
 /// of truth for the coverage denominator, read live by `xtask isc-coverage`.
 /// Recount on every ISC add/remove (the `const _` assert below guards it
 /// against [`ISCS`]).
-pub const TOTAL: usize = 166;
+pub const TOTAL: usize = 167;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -410,10 +413,11 @@ mod tests {
         //                                  rename-identity re-seal C82 pos, #66;
         //                                  presence heartbeat C83-C85 pos + A-C38/A-C39 neg, #74;
         //                                  share-liveness-on-heartbeat C86 pos, #76;
-        //                                  graceful-EOS re-subscribe C87 pos + A-C40 neg, #80)
-        //   total   107 pos + 59 neg = 166
+        //                                  graceful-EOS re-subscribe C87 pos + A-C40 neg, #80;
+        //                                  presence replay-freshness A-C41 neg, #78)
+        //   total   107 pos + 60 neg = 167
         assert_eq!(pos, 107, "positive count drift");
-        assert_eq!(neg, 59, "negative count drift");
+        assert_eq!(neg, 60, "negative count drift");
     }
 
     /// COVERED is single-sourced and must agree with the per-milestone

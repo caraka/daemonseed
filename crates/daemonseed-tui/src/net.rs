@@ -55,7 +55,8 @@ use daemonseed_core::heartbeat::{
 };
 use daemonseed_core::indexer::{CachedHashError, cached_or_hash, reconcile_into};
 use daemonseed_core::presence::{
-    HEARTBEAT_INTERVAL_MAX, HEARTBEAT_MISS_COUNT, PresenceTracker, next_heartbeat_interval,
+    HEARTBEAT_INTERVAL_MAX, HEARTBEAT_MISS_COUNT, PresenceTracker, beacon_is_fresh,
+    next_heartbeat_interval,
 };
 use daemonseed_core::public_room::{
     DEFAULT_ROOM, PublicRoomKey, derive_room_key, open_room_message, room_asset_address,
@@ -1444,6 +1445,13 @@ impl Actor {
         if let Some(identity) = self.identity.as_ref()
             && heartbeat.sender_pubkey.as_slice() == identity.signing().public_key().as_slice()
         {
+            return;
+        }
+        // #78 replay-freshness: drop a beacon whose advisory timestamp is outside
+        // the freshness window — an untrusted relay replaying a captured beacon
+        // must not refresh presence (or share-liveness) for a member who has
+        // actually departed. Bounds replay to the window; see `beacon_is_fresh`.
+        if !beacon_is_fresh(heartbeat.sent_unix_ms, now_unix_ms()) {
             return;
         }
         let now = Instant::now();

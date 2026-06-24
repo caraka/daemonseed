@@ -52,6 +52,38 @@ pub const HEARTBEAT_INTERVAL_MAX: Duration = Duration::from_secs(15);
 /// Consecutive missed beacons before a member is reaped (the TTL multiplier).
 pub const HEARTBEAT_MISS_COUNT: u32 = 3;
 
+/// #78 replay-freshness — how far in the PAST a beacon's advisory `sent_unix_ms`
+/// may be (relative to local wall-clock) and still be accepted. An untrusted
+/// relay controls delivery and can replay a captured beacon to keep a departed
+/// member on the roster past the presence TTL; rejecting beacons older than this
+/// bounds that replay to the window instead of indefinitely. CONSERVATIVE on
+/// purpose: it must exceed realistic unsynchronised-clock skew between peers
+/// (daemonseed assumes no shared time source), so it errs toward accepting a
+/// legitimate beacon from a skewed peer over tightening the replay bound. The
+/// value (and whether to depend on loosely-synced wall clocks at all, vs a
+/// nonce/sequence anti-replay) is an OPEN design call flagged for ratification —
+/// see ISA Decisions (#78).
+pub const REPLAY_FRESHNESS_PAST: Duration = Duration::from_secs(300);
+/// #78 replay-freshness — how far in the FUTURE a beacon may be timestamped and
+/// still be accepted (a small skew allowance; a beacon further ahead is a
+/// fast/forged clock). Tighter than the past bound because a future timestamp has
+/// no benign replay explanation.
+pub const REPLAY_FRESHNESS_FUTURE: Duration = Duration::from_secs(60);
+
+/// Whether a heartbeat's advisory `sent_unix_ms` is fresh relative to the local
+/// wall-clock `now_unix_ms` — inside `[now − REPLAY_FRESHNESS_PAST, now +
+/// REPLAY_FRESHNESS_FUTURE]`. The ingest path drops a non-fresh beacon (#78) so a
+/// replayed/captured beacon cannot refresh presence or share-liveness for a
+/// member who has actually departed. This BOUNDS replay to the window; it does not
+/// eliminate replay of a still-recent beacon (that needs a nonce/sequence scheme,
+/// a deferred design). Pure + clock-injected so it is unit-testable without a real
+/// clock.
+pub fn beacon_is_fresh(sent_unix_ms: i64, now_unix_ms: i64) -> bool {
+    let past = REPLAY_FRESHNESS_PAST.as_millis() as i64;
+    let future = REPLAY_FRESHNESS_FUTURE.as_millis() as i64;
+    sent_unix_ms >= now_unix_ms - past && sent_unix_ms <= now_unix_ms + future
+}
+
 /// Draw the next heartbeat emit interval, uniformly random in
 /// `[HEARTBEAT_INTERVAL_MIN, HEARTBEAT_INTERVAL_MAX]`. Jitter keeps emissions
 /// from forming a fixed-period timing signature (ISC-A-S2 traffic-shape) and
@@ -255,6 +287,37 @@ mod tests {
             ),
             PresenceChange::Unchanged
         );
+    }
+
+    /// #78 replay-freshness: a beacon within the window is fresh; one timestamped
+    /// far in the past (a relay replaying a captured beacon) or far in the future
+    /// (a forged/fast clock) is rejected, so the ingest path drops it before it can
+    /// refresh presence for a departed member.
+    #[test]
+    fn beacon_freshness_accepts_recent_rejects_replayed_or_future() {
+        let now = 1_000_000_000_000_i64; // arbitrary wall-clock anchor (ms)
+        // In-window: current, slightly past, slightly future.
+        assert!(beacon_is_fresh(now, now));
+        assert!(beacon_is_fresh(now - 10_000, now)); // 10s old — a normal beacon
+        assert!(beacon_is_fresh(
+            now - REPLAY_FRESHNESS_PAST.as_millis() as i64,
+            now
+        )); // exactly at the past edge
+        assert!(beacon_is_fresh(
+            now + REPLAY_FRESHNESS_FUTURE.as_millis() as i64,
+            now
+        )); // exactly at the future edge
+        // Out of window: a replayed beacon older than the past bound, and a beacon
+        // dated beyond the future skew allowance.
+        assert!(!beacon_is_fresh(
+            now - REPLAY_FRESHNESS_PAST.as_millis() as i64 - 1,
+            now
+        ));
+        assert!(!beacon_is_fresh(now - 3_600_000, now)); // an hour-old replay
+        assert!(!beacon_is_fresh(
+            now + REPLAY_FRESHNESS_FUTURE.as_millis() as i64 + 1,
+            now
+        ));
     }
 
     #[test]
