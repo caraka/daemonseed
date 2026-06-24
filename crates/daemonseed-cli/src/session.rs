@@ -45,7 +45,15 @@ const KEEPALIVE_INTERVAL: core::time::Duration = core::time::Duration::from_secs
 
 /// Bound on the PONG wait before a keepalive PING is treated as a dead
 /// connection (#72): the channel errors, ending the inbound `Subscribe` stream.
-const KEEPALIVE_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(10);
+/// Raised 10s → 30s (#80): the original 10s was tight enough that a slow PONG on a
+/// high-latency / congested WAN tripped a spurious "dead connection", tearing down
+/// a live session. 30s tolerates a slow ack while still detecting a genuine
+/// half-open within `KEEPALIVE_INTERVAL + KEEPALIVE_TIMEOUT` (~45s). Shared by the
+/// GUI, TUI, and CLI via [`AppSession::open`]. (Belt-and-braces only: #80's
+/// re-subscribe-then-fallback path recovers from a stream death regardless of why
+/// it died, so this tuning is a performance optimization, not a correctness
+/// dependency.)
+const KEEPALIVE_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(30);
 
 /// A live application session: one tonic [`Channel`] multiplexed over a single
 /// post-`Authenticated` stream. Clone-cheap clients are minted on demand; the

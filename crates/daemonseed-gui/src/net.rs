@@ -189,20 +189,28 @@ pub enum NetCommand {
     /// post a roll-call. Self-scheduled on [`RECONCILE_INTERVAL`]; never sent by
     /// the binary.
     ReconcileShares,
-    /// Internal (#72): an inbound subscribe stream ended or errored, so the live
-    /// connection is gone. Posted by [`read_inbound_public_room`] /
-    /// [`read_inbound_circle`] from their stream-exit arm. The actor clears the
-    /// stale session/server-id (so no half-open state is reused), emits
-    /// [`NetEvent::Disconnected`], and arms auto-reconnect (#71) when a prior
-    /// successful connect plan exists. Idempotent: the first such command per
-    /// drop tears down; later ones (from sibling readers of the same dead session)
-    /// are no-ops. Never sent by the binary.
-    Disconnected { reason: String },
     /// Internal (#71): a backoff-timer tick — re-issue the stored [`ConnectPlan`]
     /// to re-establish the connection (and silently re-join circles / re-publish
     /// shares like a fresh launch). Self-scheduled by [`Actor::arm_reconnect`] on
     /// capped exponential backoff while disconnected. Never sent by the binary.
     Reconnect,
+    /// Internal (#80): the lobby subscribe stream ended (`Ok(None)` end-of-stream
+    /// OR `Err`). Because a half-open connection ALSO surfaces as end-of-stream
+    /// (the relay's GOAWAY), the reader can't tell a graceful per-stream EOS from a
+    /// dead connection by the result code alone — so it asks the actor to RE-SUBSCRIBE
+    /// the lobby on the live session. A successful re-subscribe proves the
+    /// authenticated connection is still up (the channel rides one already-opened
+    /// stream, [`AppSession::open`] — there is no transparent re-dial), so circles
+    /// and serve tasks are left intact; a failed one means the connection is dead,
+    /// and the handler tears down + reconnects via [`Actor::handle_disconnected`]
+    /// (#72/#71). Posted by [`read_inbound_public_room`]; never sent by the binary.
+    ResubscribeRoom,
+    /// Internal (#80): one circle's subscribe stream ended (`Ok(None)` or `Err`) —
+    /// re-subscribe just THAT circle on the live session (same active-probe rationale
+    /// as [`NetCommand::ResubscribeRoom`]). Posted by [`read_inbound_circle`]; never
+    /// sent by the binary. A `circle_id` no longer in the joined set (already torn
+    /// down) is a no-op (never resurrected).
+    ResubscribeCircle { circle_id: u64 },
     /// TEST SEAM (never used in production): drive the post-reconnect re-establish
     /// path with a fresh in-memory [`AppSession`] instead of a real TCP `Connect`,
     /// so the in-process oracle exercises the SAME re-subscribe logic the backoff
@@ -479,8 +487,11 @@ struct CircleSub {
     cot_key: Rc<CircleKey>,
     /// Per-relay rendezvous address; the dedupe key for idempotent re-join.
     asset_addr: AssetAddr,
-    /// Outbound frame sender — sealing seals + sends here.
+    /// Outbound frame sender — sealing seals + sends here. Replaced (not the whole
+    /// entry) when this circle's stream is re-subscribed after an EOS (#80).
     out_tx: mpsc::Sender<wire::CotFrame>,
+    /// #80 flap detector for THIS circle's re-subscribe path.
+    resub: BurstGuard,
 }
 
 /// A share this daemon is publishing this session — the in-band-discovery
@@ -533,6 +544,43 @@ const SHARE_CATALOG_TTL: Duration = Duration::from_secs(90);
 /// `SHARE_CATALOG_TTL` is set to > ~2× this so a single miss is absorbed.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 
+/// #80 storm guard: a re-subscribe of a stream landing within this window of the
+/// previous one counts as a "rapid" burst; a stream that lived longer than this
+/// before ending resets the burst (it was healthy).
+const RESUB_BURST_WINDOW: Duration = Duration::from_secs(3);
+
+/// #80 storm guard: after this many consecutive rapid re-subscribes of one stream
+/// the link is treated as flapping and escalated to a full teardown + reconnect
+/// (which retries on capped backoff) instead of hot-looping re-subscribes.
+const RESUB_BURST_MAX: u32 = 5;
+
+/// Per-stream flap detector for the #80 re-subscribe path. Records each
+/// re-subscribe; once too many land in rapid succession (each within
+/// [`RESUB_BURST_WINDOW`] of the last) it reports the stream as flapping so the
+/// caller escalates to teardown + reconnect rather than re-subscribing forever.
+#[derive(Default)]
+struct BurstGuard {
+    last: Option<Instant>,
+    burst: u32,
+}
+
+impl BurstGuard {
+    /// Record a re-subscribe at `now`; return `true` if the stream is now flapping
+    /// (≥ [`RESUB_BURST_MAX`] consecutive rapid re-subscribes) and should escalate.
+    fn record_and_is_flapping(&mut self, now: Instant) -> bool {
+        let rapid = self
+            .last
+            .is_some_and(|t| now.duration_since(t) < RESUB_BURST_WINDOW);
+        self.burst = if rapid {
+            self.burst.saturating_add(1)
+        } else {
+            0
+        };
+        self.last = Some(now);
+        self.burst >= RESUB_BURST_MAX
+    }
+}
+
 /// Mutable state the actor carries across commands. `identity`/`server_id` and
 /// the `counters`/`trust` stores live here for the SESSION lifetime, not as
 /// Connect-handler locals (mirrors the TUI).
@@ -579,10 +627,10 @@ struct Actor {
     /// (mirrors the TUI's `published` map). RAM-only — relay state is ephemeral.
     published: HashMap<String, tokio::task::JoinHandle<()>>,
     /// `true` once a session is live (Authenticated), `false` after a drop (#72)
-    /// or before the first connect. Gates [`NetCommand::Disconnected`] so the
-    /// FIRST stream-exit per drop tears down and arms reconnect, while later ones
-    /// from sibling readers of the same dead session are no-ops (one drop, one
-    /// teardown).
+    /// or before the first connect. Gates [`Actor::handle_disconnected`] so the
+    /// FIRST failed re-subscribe per drop tears down and arms reconnect, while later
+    /// ones from sibling readers of the same dead connection are no-ops (one drop,
+    /// one teardown).
     connected: bool,
     /// The last successful connect's parameters (#71), so the auto-reconnect timer
     /// re-establishes exactly like the original launch. `None` until a first
@@ -592,6 +640,9 @@ struct Actor {
     /// backoff delay. Reset to 0 on a successful (re)connect; incremented per
     /// scheduled attempt.
     reconnect_attempt: u32,
+    /// #80 flap detector for the lobby re-subscribe path. Each circle carries its
+    /// own in [`CircleSub::resub`].
+    room_resub: BurstGuard,
 }
 
 impl Actor {
@@ -777,11 +828,12 @@ impl Actor {
         .await;
     }
 
-    /// Handle a live-connection drop (#72): tear down stale session state so a
+    /// Handle a live-connection drop (#72/#80): tear down stale session state so a
     /// half-open session is never reused, surface [`NetEvent::Disconnected`], and
-    /// arm auto-reconnect (#71). Idempotent — only the FIRST drop signal per
-    /// session does work; later ones (sibling readers of the same dead connection)
-    /// short-circuit because `connected` is already `false`.
+    /// arm auto-reconnect (#71). Reached when a re-subscribe fails (the connection
+    /// is dead) or a stream is flapping. Idempotent — only the FIRST such signal per
+    /// session does work; later ones (sibling readers' failed re-subscribes of the
+    /// same dead connection) short-circuit because `connected` is already `false`.
     fn handle_disconnected(&mut self, reason: String) {
         if !self.connected {
             return; // already torn down for this drop
@@ -853,43 +905,155 @@ impl Actor {
         }
     }
 
-    /// Derive the room key + rendezvous address, subscribe, spawn the inbound
-    /// reader, and store the outbound half. ONE shared path for Connect's
-    /// auto-join and the `AttachSession`-driven JoinRoom (both route here off
-    /// actor state), mirroring `daemonseed_tui::net::Actor::join_default_public_room`.
-    async fn join_room(&mut self, room: &str) {
+    /// Re-subscribe the lobby after its inbound stream ended (#80). The re-subscribe
+    /// attempt is the active probe that tells a graceful per-stream EOS on a LIVE
+    /// connection apart from a dead one: success ⇒ the authenticated connection is
+    /// still up (circles + serve tasks left intact); failure ⇒ the connection is
+    /// gone, so post `Disconnected` to tear down + reconnect (#72/#71). No-op if
+    /// already torn down (`!connected`) or there is no lobby — never resurrects state.
+    async fn handle_resubscribe_room(&mut self) {
+        if !self.connected {
+            return;
+        }
+        let Some(room) = self.public_room.as_ref().map(|r| r.room.clone()) else {
+            return;
+        };
+        // Flap guard: too many rapid lobby re-subscribes ⇒ stop hot-looping and
+        // escalate to a full teardown + reconnect (which retries on backoff).
+        if self.room_resub.record_and_is_flapping(Instant::now()) {
+            return self.handle_disconnected("lobby stream flapping".to_owned());
+        }
+        match self.establish_room(&room).await {
+            // Re-discover shares missed during the blip; do NOT re-emit RoomJoined
+            // or start a second reconcile timer (the original join already did).
+            Ok(()) => self.post_rollcall().await,
+            Err(_) => self.handle_disconnected("lobby connection lost".to_owned()),
+        }
+    }
+
+    /// Re-subscribe ONE circle after its inbound stream ended (#80) — same
+    /// active-probe rationale as [`Actor::handle_resubscribe_room`]. Replaces just
+    /// that circle's outbound half + reader; every other circle and the lobby are
+    /// left untouched (ISC-10). No-op if already torn down or the `circle_id` is no
+    /// longer joined (never resurrects a circle).
+    async fn handle_resubscribe_circle(&mut self, circle_id: u64) {
+        if !self.connected {
+            return;
+        }
+        let Some(idx) = self.circles.iter().position(|c| c.circle_id == circle_id) else {
+            return;
+        };
+        if self.circles[idx]
+            .resub
+            .record_and_is_flapping(Instant::now())
+        {
+            return self.handle_disconnected("circle stream flapping".to_owned());
+        }
+        let cot_key = Rc::clone(&self.circles[idx].cot_key);
+        let asset_addr = self.circles[idx].asset_addr;
+        match self.subscribe_circle(circle_id, cot_key, asset_addr).await {
+            Ok(out_tx) => {
+                // Re-find by id (the single-threaded actor keeps the set stable
+                // across this await, but re-finding keeps the swap robust): swap in
+                // the live sender, leaving the rest of the entry (key, guard) intact.
+                if let Some(sub) = self.circles.iter_mut().find(|c| c.circle_id == circle_id) {
+                    sub.out_tx = out_tx;
+                }
+            }
+            Err(_) => self.handle_disconnected("circle connection lost".to_owned()),
+        }
+    }
+
+    /// Subscribe one circle's rendezvous on the live session and spawn its inbound
+    /// reader, returning the outbound half. Shared by [`Actor::handle_join_circle`]
+    /// (initial join) and [`Actor::handle_resubscribe_circle`] (#80). Does NOT touch
+    /// the joined-circle set — the caller adds (join) or replaces (re-subscribe).
+    async fn subscribe_circle(
+        &self,
+        circle_id: u64,
+        cot_key: Rc<CircleKey>,
+        asset_addr: AssetAddr,
+    ) -> Result<mpsc::Sender<wire::CotFrame>, String> {
         let Some(session) = self.session.as_ref() else {
-            return self.emit(NetEvent::Error {
-                reason: "not connected to a relay yet".to_owned(),
-            });
+            return Err("not connected to a relay yet".to_owned());
+        };
+        let (out_tx, out_rx) = mpsc::channel::<wire::CotFrame>(32);
+        // Name the rendezvous (empty payload, not relayed) before subscribing.
+        let naming = wire::CotFrame {
+            asset_address: asset_addr.as_bytes().to_vec(),
+            payload: Vec::new(),
+        };
+        out_tx
+            .send(naming)
+            .await
+            .map_err(|_| "circle subscribe channel closed".to_owned())?;
+        let mut cot = session.circle_of_trust();
+        let inbound = cot
+            .subscribe(ReceiverStream::new(out_rx))
+            .await
+            .map_err(|status| format!("subscribe refused: {}", status.message()))?
+            .into_inner();
+        // Inbound reader: decrypts each frame under THIS circle's key and emits a
+        // CircleMessage tagged with THIS circle_id (ISC-A-C30 attribution).
+        let reader_key = Rc::clone(&cot_key);
+        let reader_tx = self.evt_tx.clone();
+        let reader_handle = self.my_handle.clone();
+        let reader_cmd = self.cmd_tx.clone();
+        tokio::task::spawn_local(read_inbound_circle(
+            inbound,
+            circle_id,
+            reader_key,
+            reader_tx,
+            reader_handle,
+            reader_cmd,
+        ));
+        Ok(out_tx)
+    }
+
+    /// Auto-join / re-join the default public room: establish the inbound stream
+    /// (see [`Actor::establish_room`]) then bootstrap share discovery. ONE shared
+    /// path for Connect's auto-join and the `AttachSession`-driven JoinRoom (both
+    /// route here off actor state), mirroring
+    /// `daemonseed_tui::net::Actor::join_default_public_room`.
+    async fn join_room(&mut self, room: &str) {
+        let room = room.to_owned();
+        if let Err(reason) = self.establish_room(&room).await {
+            return self.emit(NetEvent::Error { reason });
+        }
+        self.emit(NetEvent::RoomJoined { room });
+
+        // Discovery bootstrap (unified share model): post an initial roll-call so
+        // already-live sharers re-announce into our fresh catalog, and start the
+        // slow-reconcile timer that re-polls + prunes on `RECONCILE_INTERVAL`.
+        self.post_rollcall().await;
+        self.start_reconcile_timer();
+    }
+
+    /// Derive the room key + rendezvous, subscribe, spawn the inbound reader, and
+    /// store the live [`PublicRoom`] (replacing any prior one). Shared by
+    /// [`Actor::join_room`] (initial / auto-join) and [`Actor::handle_resubscribe_room`]
+    /// (#80 re-subscribe after an EOS). Returns `Err(reason)` if any derivation or
+    /// the subscribe fails; the caller decides whether that surfaces as an Error
+    /// event (join) or a dead-connection teardown (#80 re-subscribe).
+    async fn establish_room(&mut self, room: &str) -> Result<(), String> {
+        let Some(session) = self.session.as_ref() else {
+            return Err("not connected to a relay yet".to_owned());
         };
         let Some(server_id) = self.server_id.as_ref() else {
-            return self.emit(NetEvent::Error {
-                reason: "no server-id for the connected relay".to_owned(),
-            });
+            return Err("no server-id for the connected relay".to_owned());
         };
 
         // The room key is GLOBAL: derived from public inputs, identical for every
         // client and the relay. Reused as the AEAD key for seal/open.
         let room = room.to_owned();
-        let room_key = match derive_room_key(&room, &CNSA_2_0) {
-            Ok(k) => Rc::new(k),
-            Err(e) => {
-                return self.emit(NetEvent::Error {
-                    reason: format!("public-room key derivation failed: {e}"),
-                });
-            }
-        };
+        let room_key = Rc::new(
+            derive_room_key(&room, &CNSA_2_0)
+                .map_err(|e| format!("public-room key derivation failed: {e}"))?,
+        );
         // VERBATIM mirror of TUI net.rs:1277 —
         //   `room_asset_address(&room_key, server_id.as_bytes())`
-        let asset_addr = match room_asset_address(&room_key, server_id.as_bytes()) {
-            Ok(a) => a,
-            Err(e) => {
-                return self.emit(NetEvent::Error {
-                    reason: format!("public-room rendezvous derivation failed: {e}"),
-                });
-            }
-        };
+        let asset_addr = room_asset_address(&room_key, server_id.as_bytes())
+            .map_err(|e| format!("public-room rendezvous derivation failed: {e}"))?;
 
         let (out_tx, out_rx) = mpsc::channel::<wire::CotFrame>(32);
         // Name the rendezvous with an initial EMPTY frame (registers the asset;
@@ -898,29 +1062,20 @@ impl Actor {
             asset_address: asset_addr.as_bytes().to_vec(),
             payload: Vec::new(),
         };
-        if out_tx.send(naming).await.is_err() {
-            return self.emit(NetEvent::Error {
-                reason: "public-room subscribe channel closed".to_owned(),
-            });
-        }
+        out_tx
+            .send(naming)
+            .await
+            .map_err(|_| "public-room subscribe channel closed".to_owned())?;
 
         let mut cot = session.circle_of_trust();
-        let inbound = match cot.subscribe(ReceiverStream::new(out_rx)).await {
-            Ok(resp) => resp.into_inner(),
-            Err(status) => {
-                return self.emit(NetEvent::Error {
-                    reason: format!("public-room subscribe refused: {}", status.message()),
-                });
-            }
-        };
+        let inbound = cot
+            .subscribe(ReceiverStream::new(out_rx))
+            .await
+            .map_err(|status| format!("public-room subscribe refused: {}", status.message()))?
+            .into_inner();
 
         // Inbound reader: owns the IN half, decrypts each frame under the global
-        // room key. A chat message surfaces as a `Message`; a share announcement /
-        // roll-call (unified share model) is dispatched back into the command loop
-        // via `cmd_tx` so all catalog mutation stays on `&mut self`. `spawn_local`
-        // because it holds the `Rc` room key (mirrors the TUI). The OUT sender stays
-        // here in actor state — `&mut AppSession` is never shared between reader and
-        // sender.
+        // room key (mirrors the TUI). The OUT sender stays here in actor state.
         let reader_key = Rc::clone(&room_key);
         let reader_tx = self.evt_tx.clone();
         let reader_handle = self.my_handle.clone();
@@ -934,18 +1089,12 @@ impl Actor {
         ));
 
         self.public_room = Some(PublicRoom {
-            room: room.clone(),
+            room,
             room_key,
             asset_addr,
             out_tx,
         });
-        self.emit(NetEvent::RoomJoined { room });
-
-        // Discovery bootstrap (unified share model): post an initial roll-call so
-        // already-live sharers re-announce into our fresh catalog, and start the
-        // slow-reconcile timer that re-polls + prunes on `RECONCILE_INTERVAL`.
-        self.post_rollcall().await;
-        self.start_reconcile_timer();
+        Ok(())
     }
 
     /// Start the slow-reconcile loop (unified share model): a detached `spawn_local`
@@ -1030,9 +1179,9 @@ impl Actor {
     async fn handle_join_circle(&mut self, circle_id: u64, phrase: &str) {
         let err = |reason: String| NetEvent::CircleError { circle_id, reason };
 
-        let Some(session) = self.session.as_ref() else {
+        if self.session.is_none() {
             return self.emit(err("not connected to a relay yet".to_owned()));
-        };
+        }
         let Some(server_id) = self.server_id.as_ref() else {
             return self.emit(err("no server-id for the connected relay".to_owned()));
         };
@@ -1060,46 +1209,22 @@ impl Actor {
             });
         }
 
-        // Outbound half: first frame names the asset (empty payload, not relayed),
-        // sent before subscribe consumes the receiver (mirror).
-        let (out_tx, out_rx) = mpsc::channel::<wire::CotFrame>(32);
-        let naming = wire::CotFrame {
-            asset_address: asset_addr.as_bytes().to_vec(),
-            payload: Vec::new(),
+        // Subscribe the rendezvous + spawn the reader (shared with the #80
+        // re-subscribe path); ADD the new circle to the joined set.
+        let out_tx = match self
+            .subscribe_circle(circle_id, Rc::clone(&cot_key), asset_addr)
+            .await
+        {
+            Ok(tx) => tx,
+            Err(reason) => return self.emit(err(reason)),
         };
-        if out_tx.send(naming).await.is_err() {
-            return self.emit(err("circle subscribe channel closed".to_owned()));
-        }
-
-        let mut cot = session.circle_of_trust();
-        let inbound = match cot.subscribe(ReceiverStream::new(out_rx)).await {
-            Ok(resp) => resp.into_inner(),
-            Err(status) => {
-                return self.emit(err(format!("subscribe refused: {}", status.message())));
-            }
-        };
-
-        // Inbound reader: decrypts each frame under THIS circle's key and emits a
-        // CircleMessage tagged with THIS circle_id (ISC-A-C30 attribution).
-        // `spawn_local` because it holds the `Rc` key (mirrors the TUI / lobby).
-        let reader_key = Rc::clone(&cot_key);
-        let reader_tx = self.evt_tx.clone();
-        let reader_handle = self.my_handle.clone();
-        let reader_cmd = self.cmd_tx.clone();
-        tokio::task::spawn_local(read_inbound_circle(
-            inbound,
-            circle_id,
-            reader_key,
-            reader_tx,
-            reader_handle,
-            reader_cmd,
-        ));
 
         self.circles.push(CircleSub {
             circle_id,
             cot_key,
             asset_addr,
             out_tx,
+            resub: BurstGuard::default(),
         });
         self.emit(NetEvent::CircleJoined {
             circle_id,
@@ -1880,6 +2005,7 @@ async fn net_actor(
         connected: false,
         last_connect: None,
         reconnect_attempt: 0,
+        room_resub: BurstGuard::default(),
     };
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
@@ -1924,8 +2050,11 @@ async fn net_actor(
             NetCommand::ApplyAnnouncement(ann) => actor.handle_apply_announcement(&ann),
             NetCommand::AnswerRollCall => actor.handle_answer_rollcall().await,
             NetCommand::ReconcileShares => actor.handle_reconcile_shares().await,
-            NetCommand::Disconnected { reason } => actor.handle_disconnected(reason),
             NetCommand::Reconnect => actor.handle_reconnect().await,
+            NetCommand::ResubscribeRoom => actor.handle_resubscribe_room().await,
+            NetCommand::ResubscribeCircle { circle_id } => {
+                actor.handle_resubscribe_circle(circle_id).await
+            }
             NetCommand::FetchShare { share_id, name } => {
                 actor.handle_fetch_share(&share_id, &name).await
             }
@@ -2042,14 +2171,16 @@ async fn read_inbound_public_room(
                 // A frame that opened under none of the three kinds is a foreign
                 // frame — skip silently.
             }
-            // #72: the subscribe stream ended (`Ok(None)`) or errored (`Err`, e.g.
-            // an h2 keepalive PING went unanswered on a half-open socket). Signal
-            // the actor so it tears down the stale session and arms reconnect (#71).
-            // Best-effort: if the actor is already gone the send fails and we just
-            // return.
+            // #80: the subscribe stream ended (`Ok(None)`) or errored (`Err`). Both
+            // a graceful per-stream EOS on a LIVE connection and a dead half-open
+            // socket surface here (the relay's GOAWAY arrives as end-of-stream), so
+            // the result code can't tell them apart. Ask the actor to RE-SUBSCRIBE
+            // the lobby; the re-subscribe attempt is the active probe — success means
+            // the connection is alive (don't tear down circles), failure means it is
+            // dead (the handler then posts Disconnected → teardown + reconnect, #72/#71).
+            // Best-effort: if the actor is already gone the send fails and we return.
             Ok(None) | Err(_) => {
-                let reason = "lobby stream ended".to_owned();
-                let _ = cmd_tx.send(NetCommand::Disconnected { reason });
+                let _ = cmd_tx.send(NetCommand::ResubscribeRoom);
                 return;
             }
         }
@@ -2095,12 +2226,13 @@ async fn read_inbound_circle(
                 }
                 // A decrypt/auth error means a foreign frame — skip silently.
             }
-            // #72: a circle subscribe stream ended/errored. The whole session
-            // shares one h2 connection, so this is the same drop the lobby reader
-            // sees; signal the actor (idempotent teardown collapses the duplicates).
+            // #80: a circle subscribe stream ended/errored. Re-subscribe just THIS
+            // circle on the live session (same active-probe rationale as the lobby
+            // reader). If the connection is actually dead the handler's re-subscribe
+            // fails and it posts Disconnected (idempotent teardown collapses the
+            // duplicates from sibling readers of the same dead connection).
             Ok(None) | Err(_) => {
-                let reason = "circle stream ended".to_owned();
-                let _ = cmd_tx.send(NetCommand::Disconnected { reason });
+                let _ = cmd_tx.send(NetCommand::ResubscribeCircle { circle_id });
                 return;
             }
         }
@@ -3313,6 +3445,190 @@ mod tests {
                     .map(|(_, who, text)| (who, text)),
                 Some(("alice#stable".to_owned(), "after the reconnect".to_owned())),
                 "the re-subscribed circle round-trips after reconnect (#71)"
+            );
+        });
+    }
+
+    /// #80 ORACLE: a graceful per-stream EOS on a LIVE connection re-subscribes that
+    /// one stream and leaves the rest of the session intact — it does NOT tear the
+    /// whole session down (the v0.30.0 regression). Drives the real
+    /// `handle_resubscribe_room` / `handle_resubscribe_circle` against a live
+    /// in-process relay: after each re-subscribe the actor stays `connected` and the
+    /// joined circle still round-trips A → B. (The graceful per-stream EOS is staged
+    /// by posting the Resubscribe command the reader's exit arm posts on `Ok(None)`;
+    /// the relay can't close one stream while keeping the connection up, so the
+    /// command is the faithful stand-in for the handler under test. The pre-existing
+    /// reader left running is a harmless test artifact — the A → B assertion reads
+    /// A's fresh out half.)
+    #[test]
+    fn graceful_eos_resubscribes_without_tearing_down_session() {
+        let _ = oxicrypt_module::initialize();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let registry = CotRegistry::new();
+            let (a_client_io, a_server_io) = tokio::io::duplex(64 * 1024);
+            let (b_client_io, b_server_io) = tokio::io::duplex(64 * 1024);
+            let _srv_a = spawn_relay(a_server_io, registry.clone());
+            let _srv_b = spawn_relay(b_server_io, registry.clone());
+            let sess_a = AppSession::open(a_client_io).await.expect("A session");
+            let sess_b = AppSession::open(b_client_io).await.expect("B session");
+
+            let mut a = spawn_local_actor();
+            let mut b = spawn_local_actor();
+            a.cmd_tx
+                .send(NetCommand::AttachSession {
+                    session: sess_a,
+                    server_id: SERVER_ID.to_owned(),
+                    display_handle: None,
+                    rejoin_circles: Vec::new(),
+                })
+                .ok();
+            b.cmd_tx
+                .send(NetCommand::AttachSession {
+                    session: sess_b,
+                    server_id: SERVER_ID.to_owned(),
+                    display_handle: None,
+                    rejoin_circles: Vec::new(),
+                })
+                .ok();
+
+            // B subscribes the circle rendezvous; A joins the lobby AND the same
+            // circle. Baseline: A → B circle round-trips on the live connection.
+            b.cmd_tx
+                .send(NetCommand::JoinCircle {
+                    circle_id: 1,
+                    phrase: CIRCLE_PHRASE.to_owned(),
+                })
+                .ok();
+            wait_registry(&registry, 1).await;
+            a.cmd_tx
+                .send(NetCommand::JoinRoom {
+                    room: DEFAULT_ROOM.to_owned(),
+                })
+                .ok();
+            wait_for_room_joined(&mut a.evt_rx).await;
+            a.cmd_tx
+                .send(NetCommand::JoinCircle {
+                    circle_id: 9,
+                    phrase: CIRCLE_PHRASE.to_owned(),
+                })
+                .ok();
+            wait_for_circle_joined(&mut a.evt_rx).await;
+            a.cmd_tx
+                .send(NetCommand::SendCircle {
+                    circle_id: 9,
+                    text: "before the EOS".to_owned(),
+                })
+                .ok();
+            assert_eq!(
+                wait_for_circle_message(&mut b.evt_rx)
+                    .await
+                    .map(|(_, _, text)| text),
+                Some("before the EOS".to_owned()),
+                "baseline: A → B round-trips on the live connection"
+            );
+
+            // ── Graceful LOBBY EOS: re-subscribe the lobby. The session must stay up
+            // and the joined circle must survive (the #80 anti-criterion: a lobby EOS
+            // must NOT clear circles). ──
+            a.cmd_tx.send(NetCommand::ResubscribeRoom).ok();
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                probe_connected(&a.cmd_tx, &mut a.evt_rx).await,
+                "a graceful lobby EOS re-subscribes on the live connection; session stays up"
+            );
+
+            // ── Graceful CIRCLE EOS: re-subscribe just that circle. ──
+            a.cmd_tx
+                .send(NetCommand::ResubscribeCircle { circle_id: 9 })
+                .ok();
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                probe_connected(&a.cmd_tx, &mut a.evt_rx).await,
+                "a graceful circle EOS re-subscribes on the live connection; session stays up"
+            );
+
+            // The circle still round-trips after BOTH re-subscribes — proof the
+            // session + circle survived and the re-subscribed stream is live.
+            a.cmd_tx
+                .send(NetCommand::SendCircle {
+                    circle_id: 9,
+                    text: "after the resubscribe".to_owned(),
+                })
+                .ok();
+            assert_eq!(
+                wait_for_circle_message(&mut b.evt_rx)
+                    .await
+                    .map(|(_, _, text)| text),
+                Some("after the resubscribe".to_owned()),
+                "the circle still round-trips after a lobby + circle re-subscribe (#80)"
+            );
+        });
+    }
+
+    /// #80 ORACLE (Advisor-required fall-through): when the connection is genuinely
+    /// dead, the re-subscribe ATTEMPT fails, and the handler escalates to a full
+    /// teardown — `Disconnected` fires and `connected` flips false. This is the path
+    /// the brief's naive `Ok(None)`-vs-`Err` split would have broken; here the dead
+    /// connection still tears down because the active-probe re-subscribe can't
+    /// succeed on a severed transport (no transparent re-dial — [`AppSession::open`]).
+    #[test]
+    fn resubscribe_on_dead_connection_tears_down() {
+        let _ = oxicrypt_module::initialize();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let registry = CotRegistry::new();
+            let (a_client_io, a_server_io) = tokio::io::duplex(64 * 1024);
+            let (_srv_a, kill_a) = spawn_killable_relay(a_server_io, registry.clone());
+            let sess_a = AppSession::open(a_client_io).await.expect("A session");
+
+            let mut a = spawn_local_actor();
+            a.cmd_tx
+                .send(NetCommand::AttachSession {
+                    session: sess_a,
+                    server_id: SERVER_ID.to_owned(),
+                    display_handle: Some("alice#stable".to_owned()),
+                    rejoin_circles: Vec::new(),
+                })
+                .ok();
+            a.cmd_tx
+                .send(NetCommand::JoinCircle {
+                    circle_id: 9,
+                    phrase: CIRCLE_PHRASE.to_owned(),
+                })
+                .ok();
+            wait_for_circle_joined(&mut a.evt_rx).await;
+            assert!(
+                probe_connected(&a.cmd_tx, &mut a.evt_rx).await,
+                "A is connected after attach + join"
+            );
+
+            // Sever the transport. The circle reader hits EOF → posts ResubscribeCircle
+            // → the handler's re-subscribe attempt fails on the dead connection →
+            // escalates to handle_disconnected.
+            kill_a.kill();
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                wait_for_disconnected(&mut a.evt_rx).await.is_some(),
+                "a failed re-subscribe on a dead connection surfaces Disconnected (#80 fall-through)"
+            );
+            assert!(
+                !probe_connected(&a.cmd_tx, &mut a.evt_rx).await,
+                "the dead-connection teardown cleared live state (connected == false)"
             );
         });
     }
