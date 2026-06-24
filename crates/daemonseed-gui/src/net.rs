@@ -59,6 +59,11 @@ use daemonseed_core::cot::{AssetAddr, asset_address, public_share_asset_address}
 use daemonseed_core::crypto::suite::CNSA_2_0;
 use daemonseed_core::federation::store::{InMemoryTrustStore, ServerEntry, TrustStore};
 use daemonseed_core::handle::Handle;
+use daemonseed_core::heartbeat::{HeartbeatFields, open_heartbeat, seal_public_heartbeat};
+use daemonseed_core::presence::{
+    HEARTBEAT_INTERVAL_MAX, HEARTBEAT_MISS_COUNT, LiveMember, PresenceChange, PresenceTracker,
+    beacon_is_fresh, next_heartbeat_interval,
+};
 use daemonseed_core::public_room::{
     DEFAULT_ROOM, PublicRoomKey, derive_room_key, open_room_message, room_asset_address,
     seal_room_message,
@@ -185,6 +190,22 @@ pub enum NetCommand {
     /// opened — re-announce every own share so the requester discovers them.
     /// Posted by [`read_inbound_public_room`]; never sent by the binary.
     AnswerRollCall,
+    /// Internal: the presence-heartbeat tick (#74) — emit one sealed member beacon
+    /// into the lobby (if joined), then `reap` the lobby tracker so members past
+    /// their TTL age out (the timer is the reap clock too). Self-scheduled on
+    /// [`next_heartbeat_interval`]; spawned ONCE for the actor's life so a
+    /// reconnect/rejoin never double-emits. A no-op when no lobby is joined or no
+    /// identity is held. Never sent by the binary.
+    EmitHeartbeat,
+    /// Internal: a verified member heartbeat the inbound reader opened, to fold into
+    /// the lobby's [`PresenceTracker`] (all tracker mutation stays on `&mut self`).
+    /// `room` is the session-local routing key (the lobby room name). Boxed because
+    /// [`wire::MemberHeartbeat`] is large (mirrors [`Self::ApplyAnnouncement`]).
+    /// Posted by [`read_inbound_public_room`]; never sent by the binary.
+    ApplyHeartbeat {
+        room: String,
+        heartbeat: Box<wire::MemberHeartbeat>,
+    },
     /// Internal: the slow-reconcile tick — prune aged-out catalog entries and
     /// post a roll-call. Self-scheduled on [`RECONCILE_INTERVAL`]; never sent by
     /// the binary.
@@ -338,6 +359,14 @@ pub enum NetEvent {
     /// producer today, so nothing constructs it yet.
     #[allow(dead_code)]
     SharesError { message: String },
+    /// The live Lobby roster (#74/#75): the set of currently-present members, keyed
+    /// internally by pubkey (so two members with identical display names are two
+    /// distinct rows). Pushed on a roster-changing `ApplyHeartbeat` (a member
+    /// appeared, or a refresh changed a displayed handle) and whenever a heartbeat
+    /// tick reaped ≥ 1 member — so a reap-to-empty pushes an empty roster. The Slint
+    /// roster UI that renders this is the right-hand Lobby roster column (#75); the
+    /// `main.rs` arm replaces the Slint `roster` model from `entries`.
+    Roster { entries: Vec<RosterEntry> },
     /// A1 fetch-preview: the share's file list (names + sizes), no addresses.
     FetchManifest {
         share_id: String,
@@ -380,6 +409,24 @@ pub struct ShareManifestEntry {
     pub rel_path: String,
     pub size: u64,
     pub chunk_count: u32,
+}
+
+/// One row of the live Lobby roster ([`NetEvent::Roster`], #74/#75). Built from a
+/// verified [`daemonseed_core::presence::LiveMember`]: `handle` is the member's
+/// advisory display handle (`name#12hex`), while `fingerprint` is the canonical
+/// `#12hex` derived from the VERIFIED `sender_pubkey` (ISC-C4 / ISC-C57 binding,
+/// via [`member_fingerprint`]) — the UI shows `fingerprint` as the trust anchor,
+/// not the self-asserted handle. Two members with identical display names produce
+/// two distinct entries because the tracker keys by pubkey.
+///
+/// `#[cfg_attr(not(test), allow(dead_code))]`: the producer is wired in this half;
+/// the Slint roster pane that consumes the fields is #75 half two, so the bin build
+/// would otherwise warn the fields unread (a binary crate's `pub` does not escape).
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RosterEntry {
+    pub handle: String,
+    pub fingerprint: String,
 }
 
 /// The UI-side handle: owns the channels and the net thread. Held for the app's
@@ -471,6 +518,11 @@ struct PublicRoom {
     asset_addr: daemonseed_core::cot::AssetAddr,
     /// Outbound frame sender — publishing seals + sends here.
     out_tx: mpsc::Sender<wire::CotFrame>,
+    /// Member-presence roster for this lobby (#74/#75): verified member beacons
+    /// fold in via [`PresenceTracker::apply`]; the heartbeat timer `reap`s it. A
+    /// FRESH tracker is built per [`PublicRoom`] construction (so a leave/rejoin
+    /// never shows stale members). Cadence-matched to the emit interval.
+    presence: PresenceTracker,
 }
 
 /// One live circle the daemon is subscribed to. A member can hold several at once
@@ -1080,8 +1132,10 @@ impl Actor {
         let reader_tx = self.evt_tx.clone();
         let reader_handle = self.my_handle.clone();
         let reader_cmd = self.cmd_tx.clone();
+        let reader_room = room.clone();
         tokio::task::spawn_local(read_inbound_public_room(
             inbound,
+            reader_room,
             reader_key,
             reader_tx,
             reader_handle,
@@ -1093,6 +1147,9 @@ impl Actor {
             room_key,
             asset_addr,
             out_tx,
+            // A fresh tracker per construction: a leave/rejoin (or #80 re-subscribe)
+            // starts from an empty roster rather than carrying stale members.
+            presence: PresenceTracker::with_cadence(HEARTBEAT_INTERVAL_MAX, HEARTBEAT_MISS_COUNT),
         });
         Ok(())
     }
@@ -1112,6 +1169,133 @@ impl Actor {
                 }
             }
         });
+    }
+
+    /// Start the presence-heartbeat loop (#74): a detached `spawn_local` that posts
+    /// a [`NetCommand::EmitHeartbeat`] back into the command loop on a freshly
+    /// jittered [`next_heartbeat_interval`] each pass (~10–15s) so beacons never
+    /// lock-step across daemons. Self-terminating — the send fails once the actor
+    /// loop ends, breaking the loop. Spawned EXACTLY ONCE at actor start (NOT per
+    /// join, unlike the reconcile timer), so a reconnect/rejoin can never
+    /// double-emit; the emit handler is a no-op until a lobby is joined.
+    fn start_heartbeat_timer(&self) {
+        let cmd_tx = self.cmd_tx.clone();
+        tokio::task::spawn_local(async move {
+            loop {
+                tokio::time::sleep(next_heartbeat_interval()).await;
+                if cmd_tx.send(NetCommand::EmitHeartbeat).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    /// Emit one sealed member beacon (#74) into the lobby (if joined), then `reap`
+    /// the lobby presence tracker so members past their TTL age out (the heartbeat
+    /// timer is the reap clock too). See [`NetCommand::EmitHeartbeat`]. A missing
+    /// identity, a missing lobby, a seal failure, or a closed stream is non-fatal —
+    /// presence self-heals on the next tick, exactly like the reconcile/announce
+    /// handlers. Mirrors `daemonseed_tui::net::Actor::handle_emit_heartbeat` (lobby
+    /// half; circle beacons are #77, out of scope here). The beacon is self-signed
+    /// under the daemon's own identity (provenance, ISC-C57) and sealed under the
+    /// global room key. A reap that removed ≥ 1 member pushes a fresh (possibly
+    /// empty) roster.
+    async fn handle_emit_heartbeat(&mut self) {
+        // Seal + send the lobby beacon (only when both an identity and a joined
+        // lobby exist). Collect nothing across the await beyond owned data.
+        if let (Some(identity), Some(room)) = (self.identity.as_ref(), self.public_room.as_ref()) {
+            let lobby_share_ids: Vec<String> = self
+                .own_shares
+                .borrow()
+                .iter()
+                .map(|s| s.share_id.clone())
+                .collect();
+            let fields = HeartbeatFields {
+                room: &room.room,
+                sender_handle: &self.my_handle,
+                sent_unix_ms: now_unix_ms(),
+                live_share_ids: &lobby_share_ids,
+            };
+            match seal_public_heartbeat(&room.room_key, identity.signing(), &fields) {
+                Ok(sealed) => {
+                    let frame = wire::CotFrame {
+                        asset_address: room.asset_addr.as_bytes().to_vec(),
+                        payload: sealed,
+                    };
+                    // A closed lobby stream is non-fatal: the next reconnect
+                    // re-subscribes and resumes beaconing.
+                    let _ = room.out_tx.send(frame).await;
+                }
+                Err(_) => {
+                    // No identifying data in any log; a seal failure is silent and
+                    // recovers on the next tick.
+                }
+            }
+        }
+
+        // Reap the lobby tracker on the same tick — the timer is the reap clock.
+        // A reap that removed any member changes the roster (down to empty), so
+        // push a fresh snapshot. Predicate on whether anything was removed so a
+        // reap-to-empty still pushes an empty roster.
+        let mut reaped_any = false;
+        let mut rows: Vec<RosterEntry> = Vec::new();
+        if let Some(room) = self.public_room.as_mut() {
+            let now = Instant::now();
+            reaped_any = !room.presence.reap(now).is_empty();
+            if reaped_any {
+                rows = roster_from_members(&room.presence.members());
+            }
+        }
+        if reaped_any {
+            self.emit(NetEvent::Roster { entries: rows });
+        }
+    }
+
+    /// Fold a verified member heartbeat into the lobby's [`PresenceTracker`] (#74).
+    /// See [`NetCommand::ApplyHeartbeat`]. The inbound reader verifies provenance
+    /// before posting; this self-filters our own beacon, drops a replayed/stale
+    /// beacon ([`beacon_is_fresh`], #78), routes by the session-local `room` key,
+    /// and applies. Pushes a fresh roster on a real change — a member appeared, or a
+    /// refresh changed the displayed handle (a refresh that did not change the
+    /// handle leaves the rendered roster identical, so it is not pushed). Mirrors
+    /// `daemonseed_tui::net::Actor::handle_apply_heartbeat` (lobby half).
+    fn handle_apply_heartbeat(&mut self, room: &str, heartbeat: &wire::MemberHeartbeat) {
+        // Self-filter: never count our own beacon as a live OTHER member.
+        if let Some(identity) = self.identity.as_ref()
+            && heartbeat.sender_pubkey.as_slice() == identity.signing().public_key().as_slice()
+        {
+            return;
+        }
+        // #78 replay-freshness: drop a beacon outside the freshness window so a
+        // captured-and-replayed beacon cannot pin a departed member present.
+        if !beacon_is_fresh(heartbeat.sent_unix_ms, now_unix_ms()) {
+            return;
+        }
+        let Some(lobby) = self.public_room.as_mut() else {
+            return; // no lobby joined — drop (likely raced a disconnect)
+        };
+        if lobby.room != room {
+            return; // routes to the lobby only; circle presence is #77
+        }
+        // Capture the handle a refresh might replace, to decide if the rendered
+        // roster actually changed (a same-handle refresh is invisible to the UI).
+        let prior_handle = lobby
+            .presence
+            .members()
+            .into_iter()
+            .find(|m| m.pubkey == heartbeat.sender_pubkey)
+            .map(|m| m.handle);
+        let now = Instant::now();
+        let change = lobby.presence.apply(heartbeat, now);
+        let roster_changed = match change {
+            PresenceChange::Appeared => true,
+            PresenceChange::Refreshed => prior_handle.as_deref() != Some(&heartbeat.sender_handle),
+            PresenceChange::Unchanged => false,
+        };
+        if roster_changed {
+            let rows = roster_from_members(&lobby.presence.members());
+            self.emit(NetEvent::Roster { entries: rows });
+        }
     }
 
     /// Publish a message to the joined public room and LOCAL-ECHO it. Mirrors
@@ -2007,6 +2191,10 @@ async fn net_actor(
         reconnect_attempt: 0,
         room_resub: BurstGuard::default(),
     };
+    // Start the presence-heartbeat timer ONCE for the actor's life (#74/#75) — not
+    // per join, so a reconnect/rejoin can never double-emit. The emit handler is a
+    // no-op until a lobby is joined and an identity is held.
+    actor.start_heartbeat_timer();
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
             NetCommand::Connect {
@@ -2049,6 +2237,10 @@ async fn net_actor(
             NetCommand::RefreshShares => actor.handle_refresh_shares().await,
             NetCommand::ApplyAnnouncement(ann) => actor.handle_apply_announcement(&ann),
             NetCommand::AnswerRollCall => actor.handle_answer_rollcall().await,
+            NetCommand::EmitHeartbeat => actor.handle_emit_heartbeat().await,
+            NetCommand::ApplyHeartbeat { room, heartbeat } => {
+                actor.handle_apply_heartbeat(&room, &heartbeat)
+            }
             NetCommand::ReconcileShares => actor.handle_reconcile_shares().await,
             NetCommand::Reconnect => actor.handle_reconnect().await,
             NetCommand::ResubscribeRoom => actor.handle_resubscribe_room().await,
@@ -2114,15 +2306,18 @@ async fn net_actor(
 ///   2. a share [`open_announcement`] (unified share model) →
 ///      [`NetCommand::ApplyAnnouncement`] folded into the actor's catalog;
 ///   3. a [`open_rollcall`] → [`NetCommand::AnswerRollCall`] (re-announce our own
-///      shares).
+///      shares);
+///   4. a member [`open_heartbeat`] (#74) → [`NetCommand::ApplyHeartbeat`] folded
+///      into the lobby's presence tracker.
 ///
-/// The two discovery kinds go back through `cmd_tx` so every catalog mutation
-/// stays on the actor's `&mut self`. Empty payloads (the subscribe stream's
+/// The discovery and presence kinds go back through `cmd_tx` so every catalog and
+/// tracker mutation stays on the actor's `&mut self`. Empty payloads (the subscribe stream's
 /// initial/keepalive frames) are skipped BEFORE any open. A frame whose seal or
 /// provenance signature does not verify under any kind is dropped silently (a
 /// foreign frame). Returns when the stream ends or either channel closes.
 async fn read_inbound_public_room(
     mut inbound: tonic::Streaming<wire::CotFrame>,
+    room: String,
     room_key: Rc<daemonseed_core::public_room::PublicRoomKey>,
     evt_tx: mpsc::UnboundedSender<NetEvent>,
     my_handle: String,
@@ -2167,8 +2362,21 @@ async fn read_inbound_public_room(
                     if cmd_tx.send(NetCommand::AnswerRollCall).is_err() {
                         return; // actor gone
                     }
+                } else if let Ok(hb) = open_heartbeat(room_key.as_ref(), &frame.payload) {
+                    // A verified member beacon (#74) — fold into the lobby's presence
+                    // tracker on the actor's command loop (all tracker mutation stays
+                    // on `&mut self`).
+                    if cmd_tx
+                        .send(NetCommand::ApplyHeartbeat {
+                            room: room.clone(),
+                            heartbeat: Box::new(hb),
+                        })
+                        .is_err()
+                    {
+                        return; // actor gone
+                    }
                 }
-                // A frame that opened under none of the three kinds is a foreign
+                // A frame that opened under none of the four kinds is a foreign
                 // frame — skip silently.
             }
             // #80: the subscribe stream ended (`Ok(None)`) or errored (`Err`). Both
@@ -2259,6 +2467,35 @@ fn now_unix_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// The canonical `#12hex` member fingerprint bound to a VERIFIED pubkey — the
+/// ISC-C4 / ISC-C57 trust anchor the roster shows instead of the self-asserted
+/// handle. Reuses [`Handle::from_pubkey`] (which computes `SHA-384(pubkey)[:12]`
+/// and renders the floor `#<12hex>` form) so the GUI never rolls its own hash and
+/// the fingerprint matches every other surface. A pubkey that cannot be hashed
+/// (an entropy/length failure inside `from_pubkey`) yields a bare `#` sentinel —
+/// degenerate but never a panic; the member still appears, just without a usable
+/// fingerprint, which is strictly safer than dropping a live roster row.
+fn member_fingerprint(pubkey: &[u8]) -> String {
+    Handle::from_pubkey(None, pubkey)
+        .map(|h| h.to_string())
+        .unwrap_or_else(|_| "#".to_owned())
+}
+
+/// Build the roster rows from a presence tracker's current members. Mirrors
+/// [`PresenceTracker::members`] ordering (handle, then pubkey) for a stable view,
+/// and binds each row's `fingerprint` to the verified pubkey via
+/// [`member_fingerprint`]. Keying lives in the tracker (by pubkey), so two members
+/// sharing a display name yield two distinct rows here.
+fn roster_from_members(members: &[LiveMember]) -> Vec<RosterEntry> {
+    members
+        .iter()
+        .map(|m| RosterEntry {
+            handle: m.handle.clone(),
+            fingerprint: member_fingerprint(&m.pubkey),
+        })
+        .collect()
 }
 
 /// A readable, ephemeral adjective-noun display handle, regenerated every launch.
@@ -3999,5 +4236,191 @@ mod tests {
             // Clean up the throwaway share.
             a.cmd_tx.send(NetCommand::UnpublishShare { share_id }).ok();
         });
+    }
+
+    // ── Presence / Lobby roster (#74/#75 half one) ───────────────────────────
+    //
+    // These exercise the roster-building + push-decision logic the GUI net actor
+    // adds on top of `daemonseed_core::presence` (which is itself unit-tested in
+    // core). They use the core seal/open primitives the actor's inbound reader
+    // uses, so the "sealed beacon → roster" path is real, not faked.
+    mod presence_roster {
+        use super::*;
+        use daemonseed_core::identity::keys::SignKeypair;
+
+        /// A wire heartbeat as `seal_public_heartbeat`/`open_heartbeat` would yield
+        /// (provenance fields populated by the seal path). Built directly here to
+        /// drive the tracker/roster logic without a relay.
+        fn heartbeat(pubkey: &[u8], handle: &str, sent_unix_ms: i64) -> wire::MemberHeartbeat {
+            wire::MemberHeartbeat {
+                room: DEFAULT_ROOM.to_owned(),
+                sender_pubkey: pubkey.to_vec(),
+                sender_handle: handle.to_owned(),
+                sent_unix_ms,
+                signature: vec![9, 9, 9],
+                live_share_ids: vec![],
+            }
+        }
+
+        /// Guardrail 1: the roster keys by pubkey, never handle — two members with
+        /// IDENTICAL display names produce two DISTINCT rows.
+        #[test]
+        fn identical_display_names_are_two_rows() {
+            let mut t = PresenceTracker::with_cadence(HEARTBEAT_INTERVAL_MAX, HEARTBEAT_MISS_COUNT);
+            let now = Instant::now();
+            t.apply(&heartbeat(b"pubkey-a", "twin#aaaa", 100), now);
+            t.apply(&heartbeat(b"pubkey-b", "twin#bbbb", 100), now);
+            let rows = roster_from_members(&t.members());
+            assert_eq!(
+                rows.len(),
+                2,
+                "two distinct pubkeys must be two roster rows"
+            );
+            // Same advisory handle, but distinct pubkey-bound fingerprints.
+            assert_eq!(rows[0].handle, "twin#aaaa");
+            assert_eq!(rows[1].handle, "twin#bbbb");
+            assert_ne!(
+                rows[0].fingerprint, rows[1].fingerprint,
+                "fingerprint must be bound to the pubkey, so identical handles differ"
+            );
+        }
+
+        /// The fingerprint is the canonical `#12hex` derived from the VERIFIED
+        /// pubkey (ISC-C4), reusing `Handle::from_pubkey` — not a GUI-local hash.
+        #[test]
+        fn fingerprint_matches_handle_from_pubkey() {
+            let pubkey = b"some-verified-ml-dsa-pubkey-bytes";
+            let fp = member_fingerprint(pubkey);
+            let expected = Handle::from_pubkey(None, pubkey).unwrap().to_string();
+            assert_eq!(fp, expected);
+            assert!(fp.starts_with('#'), "floor form is #<12hex>: {fp}");
+            assert_eq!(fp.len(), 1 + 12, "12 hex chars after the #: {fp}");
+        }
+
+        /// A sealed beacon, opened under the lobby key and applied, appears in the
+        /// roster; after the TTL elapses a `reap` ages it out. Uses the REAL
+        /// seal/open primitives (the actor's path), so this is the sealed-beacon →
+        /// roster end-to-end (sans relay).
+        #[test]
+        fn sealed_beacon_appears_then_reaps() {
+            let _ = oxicrypt_module::initialize();
+            let lobby = derive_room_key(DEFAULT_ROOM, &CNSA_2_0).unwrap();
+            let member = SignKeypair::from_ml_dsa_seed(&[7u8; 32]).unwrap();
+            let fields = HeartbeatFields {
+                room: DEFAULT_ROOM,
+                sender_handle: "wandering-otter#abc",
+                sent_unix_ms: now_unix_ms(),
+                live_share_ids: &[],
+            };
+            let sealed = seal_public_heartbeat(&lobby, &member, &fields).unwrap();
+            // The actor's inbound reader opens it under the lobby key.
+            let hb = open_heartbeat(&lobby, &sealed).expect("verified beacon opens");
+            assert_eq!(hb.sender_pubkey, member.public_key().to_vec());
+
+            let mut t = PresenceTracker::with_cadence(HEARTBEAT_INTERVAL_MAX, HEARTBEAT_MISS_COUNT);
+            let t0 = Instant::now();
+            assert_eq!(t.apply(&hb, t0), PresenceChange::Appeared);
+            let rows = roster_from_members(&t.members());
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].handle, "wandering-otter#abc");
+            // The fingerprint is bound to the VERIFIED pubkey, not the advisory handle.
+            assert_eq!(rows[0].fingerprint, member_fingerprint(member.public_key()));
+
+            // Past the TTL → reaped → empty roster.
+            let past_ttl = t0 + t.ttl() + Duration::from_secs(1);
+            assert_eq!(t.reap(past_ttl).len(), 1, "the lone member ages out");
+            assert!(roster_from_members(&t.members()).is_empty());
+        }
+
+        /// Guardrail 2 (the push predicate): the actor pushes a roster on a reap that
+        /// removed ≥ 1 member, predicated on the REMOVED set — so a reap-to-empty
+        /// still pushes (an empty roster). Models the `handle_emit_heartbeat` reap
+        /// branch: `reaped_any = !reap().is_empty()` gates the push. A member appears
+        /// (one push), then reaps to empty (a second push, empty).
+        #[test]
+        fn reap_to_empty_still_pushes_empty_roster() {
+            let mut t = PresenceTracker::with_cadence(HEARTBEAT_INTERVAL_MAX, HEARTBEAT_MISS_COUNT);
+            let t0 = Instant::now();
+
+            // Push 1: a member appears (the apply path pushes on Appeared).
+            let mut pushes: Vec<Vec<RosterEntry>> = Vec::new();
+            assert_eq!(
+                t.apply(&heartbeat(b"pk", "lone#dddd", 100), t0),
+                PresenceChange::Appeared
+            );
+            pushes.push(roster_from_members(&t.members()));
+
+            // Push 2: a later tick reaps the now-stale member. The emit handler's
+            // predicate is "did reap remove anything?" — true here, so it pushes the
+            // resulting (empty) roster.
+            let past_ttl = t0 + t.ttl() + Duration::from_secs(1);
+            let reaped_any = !t.reap(past_ttl).is_empty();
+            assert!(reaped_any, "the member must have been reaped");
+            pushes.push(roster_from_members(&t.members()));
+
+            assert_eq!(pushes.len(), 2, "appear then reap-to-empty = two pushes");
+            assert_eq!(pushes[0].len(), 1, "first push has the member");
+            assert!(pushes[1].is_empty(), "second push is the empty roster");
+        }
+
+        /// A no-op reap (nothing aged out) does NOT push — the predicate is on the
+        /// removed set, not on calling reap.
+        #[test]
+        fn reap_that_removes_nothing_does_not_push() {
+            let mut t = PresenceTracker::with_cadence(HEARTBEAT_INTERVAL_MAX, HEARTBEAT_MISS_COUNT);
+            let t0 = Instant::now();
+            t.apply(&heartbeat(b"pk", "fresh#eeee", 100), t0);
+            // Well within the TTL → nothing reaped → no push.
+            let reaped_any = !t.reap(t0 + Duration::from_secs(1)).is_empty();
+            assert!(
+                !reaped_any,
+                "a fresh member is not reaped, so no roster push"
+            );
+        }
+
+        /// A same-handle refresh is invisible to the rendered roster, so the apply
+        /// path does NOT push for it; only an Appeared or a handle-changing Refresh
+        /// pushes. Models the `roster_changed` predicate in `handle_apply_heartbeat`.
+        #[test]
+        fn same_handle_refresh_does_not_push() {
+            let mut t = PresenceTracker::with_cadence(HEARTBEAT_INTERVAL_MAX, HEARTBEAT_MISS_COUNT);
+            let t0 = Instant::now();
+            t.apply(&heartbeat(b"pk", "otter#ffff", 100), t0);
+
+            // A newer beacon, SAME handle → Refreshed but the roster render is
+            // unchanged, so the predicate must be false.
+            let prior = t
+                .members()
+                .into_iter()
+                .find(|m| m.pubkey == b"pk".to_vec())
+                .map(|m| m.handle);
+            let hb = heartbeat(b"pk", "otter#ffff", 200);
+            assert_eq!(
+                t.apply(&hb, t0 + Duration::from_secs(1)),
+                PresenceChange::Refreshed
+            );
+            let roster_changed = prior.as_deref() != Some(hb.sender_handle.as_str());
+            assert!(
+                !roster_changed,
+                "a same-handle refresh must not push a roster"
+            );
+
+            // A handle-CHANGING refresh → push.
+            let prior2 = t
+                .members()
+                .into_iter()
+                .find(|m| m.pubkey == b"pk".to_vec())
+                .map(|m| m.handle);
+            let hb2 = heartbeat(b"pk", "otter-renamed#ffff", 300);
+            assert_eq!(
+                t.apply(&hb2, t0 + Duration::from_secs(2)),
+                PresenceChange::Refreshed
+            );
+            let roster_changed2 = prior2.as_deref() != Some(hb2.sender_handle.as_str());
+            assert!(
+                roster_changed2,
+                "a handle-changing refresh must push a roster"
+            );
+        }
     }
 }

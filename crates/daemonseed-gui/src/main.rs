@@ -46,7 +46,7 @@ use daemonseed_core::profile::persist::{
 };
 use daemonseed_core::profile::resolve::{ResolveArgs, ResolvedProfileRoot, resolve};
 use daemonseed_core::storage::seeds;
-use net::{NetCommand, NetEvent, NetHandle};
+use net::{NetCommand, NetEvent, NetHandle, RosterEntry};
 use profile::Profile;
 use share_browser::{FetchTarget, ManifestRow, NodeKind, ShareBrowser};
 use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType, Rgb565Pixel};
@@ -194,6 +194,21 @@ fn type_back_precheck(challenge: &TypeBackChallenge, mnemonic: &str, answers: &[
                 .get(*p)
                 .is_some_and(|w| w.eq_ignore_ascii_case(a.trim()))
         })
+}
+
+/// Convert the live-roster entries (#75) into a Slint `ModelRc<RosterRow>`. The
+/// whole model is replaced on each presence change (the `for` re-renders) — entries
+/// are OTHER live members only (own beacon is filtered net-side). `handle` → the
+/// row name; the `#12hex` fingerprint rides along for the on-hover verification cue.
+fn roster_model(entries: &[RosterEntry]) -> ModelRc<RosterRow> {
+    let rows: Vec<RosterRow> = entries
+        .iter()
+        .map(|e| RosterRow {
+            name: SharedString::from(e.handle.as_str()),
+            fingerprint: SharedString::from(e.fingerprint.as_str()),
+        })
+        .collect();
+    ModelRc::from(Rc::new(VecModel::from(rows)))
 }
 
 /// Convert a circle's `Vec<Msg>` into a Slint `ModelRc<MsgData>`.
@@ -1362,6 +1377,16 @@ fn apply_net_event(
         NetEvent::FetchError { message } => {
             ui.set_download_progress(0.0);
             ui.set_download_label(SharedString::from(format!("Download failed: {message}")));
+        }
+        // #74/#75 half one wires the PRODUCER (the net actor builds + pushes this);
+        // the Lobby roster pane that RENDERS it is half two (the orchestrator). Until
+        // then this is a deliberate no-op so the producer can ship and be tested
+        // independently of the Slint UI.
+        NetEvent::Roster { entries } => {
+            // Replace the Lobby roster model (#75). Runs on the UI thread (the Timer
+            // drains events here), so a direct set is correct — no cross-thread hop.
+            // The roster column renders/collapses by Lobby+Chat visibility Slint-side.
+            ui.set_roster(roster_model(&entries));
         }
         // Test-only probe (net.rs in-process oracle); never produced in a running
         // binary, so it carries no UI effect.

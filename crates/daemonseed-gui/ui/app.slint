@@ -60,6 +60,16 @@ struct MyShareRow {
     files: int,
 }
 
+// One live Lobby roster row (#75). `name` is the member's display handle; the
+// `#12hex` verification fingerprint (ISC-C4 binding to the verified pubkey) is
+// carried per-row but shown only ON HOVER (caraka 2026-06-24 — names stay short).
+// Rust replaces the whole `roster` model on every presence change, so the `for`
+// re-renders without an `if`-teardown (partial_renderer item-tree safety).
+struct RosterRow {
+    name: string,
+    fingerprint: string,
+}
+
 component RailRow inherits Rectangle {
     in property <string> name;
     in property <string> sub;
@@ -127,6 +137,35 @@ component MsgBubble inherits Rectangle {
                 Text { text: root.text; color: #d6dae1; font-size: 13px; }
             }
         }
+    }
+}
+
+// One live-roster row (#75): the member's display name, calm/grayscale, no
+// decorator (the roster IS the presence signal — no dot/badge/"last seen"). The
+// `#12hex` fingerprint is the on-demand verification cue: it appears ONLY while the
+// row is hovered, via a COMPUTED text (never an `if`), so hover can't mutate the
+// item tree (the partial_renderer "RefCell already borrowed" crash).
+component RosterRowView inherits Rectangle {
+    in property <string> name;
+    in property <string> fingerprint;
+    // Tall enough to hold the name AND the on-hover fingerprint line WITHIN the
+    // row's own bounds, so the hex can never overlap the next member's name
+    // (caraka felt-test 2026-06-24). Accessibility pass: larger, higher-contrast
+    // text for low-vision readability.
+    height: 46px; border-radius: 6px;
+    background: touch.has-hover ? #1b1d20 : transparent;
+    touch := TouchArea { }
+    HorizontalLayout {
+        padding-left: 10px; padding-right: 10px; spacing: 6px;
+        VerticalLayout {
+            alignment: center; spacing: 2px;
+            Text { text: root.name; color: #eef1f5; font-size: 16px; overflow: elide; }
+            // verification fingerprint — revealed on hover, its OWN line inside the
+            // 46px row (never floats over the next row); brighter than chrome so it
+            // stays legible. Empty when not hovered (computed, never an `if`).
+            Text { text: touch.has-hover ? root.fingerprint : ""; color: #9aa3b0; font-size: 12px; }
+        }
+        Rectangle { }
     }
 }
 
@@ -239,6 +278,11 @@ export component AppWindow inherits Window {
     in property <string> header-name;
     in property <string> header-sub;
     in property <[MsgData]> messages;
+    // Live Lobby roster (#75) — Rust-replaced on every presence change. Holds only
+    // OTHER live members (own presence is implicit, filtered net-side); empty ⇒ the
+    // "No one else here yet" empty-state. Bound to the Lobby for this increment;
+    // circle presence is #77.
+    in property <[RosterRow]> roster;
 
     // ── Shares tab (public-share browse tree) ──
     // `share-rows` is the flattened, render-ready tree (Rust rebuilds it on refresh /
@@ -685,6 +729,46 @@ export component AppWindow inherits Window {
                                     Text { text: "Send"; color: #06120f; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; } }
                             }
                         }
+                    }
+                }
+            }
+        }
+
+        // ── RIGHT: live Lobby roster (#75) ── the people column. Per the presence
+        // design-of-record the roster IS the indication: names appear when a heartbeat
+        // arrives and vanish past TTL — no dots/badges/"last seen"/toasts. Shown only
+        // for the Lobby Chat; the width collapses to 0 off-Lobby so chat reclaims the
+        // space (circle presence is #77). Demonsaw's full-height roster pane.
+        Rectangle {
+            width: (root.active == 0 && root.active-tab == 0) ? 1px : 0px;
+            background: #ffffff12;
+        }
+        Rectangle {
+            width: (root.active == 0 && root.active-tab == 0) ? 240px : 0px;
+            visible: root.active == 0 && root.active-tab == 0;
+            background: #0d0e10;
+            VerticalLayout {
+                padding: 12px; spacing: 8px;
+                // Centered over the pane + brighter/larger (caraka accessibility pass).
+                Text { text: "HERE NOW"; color: #c8ced6; font-size: 14px; horizontal-alignment: center; }
+                Rectangle { height: 1px; background: #ffffff14; }
+                Rectangle {
+                    vertical-stretch: 1;
+                    Flickable {
+                        width: 100%; height: 100%;
+                        viewport-width: self.width;
+                        viewport-height: root.roster.length * 46px + 8px;
+                        VerticalLayout {
+                            padding: 2px; spacing: 2px; alignment: start;
+                            for r in root.roster : RosterRowView { name: r.name; fingerprint: r.fingerprint; }
+                        }
+                    }
+                    // empty-state — computed visibility (never an `if`), centered; brighter/larger.
+                    Text {
+                        x: (parent.width - self.width) / 2; y: 16px;
+                        text: "No one else here yet";
+                        visible: root.roster.length == 0;
+                        color: #9aa3b0; font-size: 14px; horizontal-alignment: center; wrap: word-wrap;
                     }
                 }
             }
