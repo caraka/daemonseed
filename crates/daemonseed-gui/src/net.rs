@@ -48,6 +48,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use daemonseed_cli::connect::connect_session;
@@ -60,6 +62,7 @@ use daemonseed_core::crypto::suite::CNSA_2_0;
 use daemonseed_core::federation::store::{InMemoryTrustStore, ServerEntry, TrustStore};
 use daemonseed_core::handle::Handle;
 use daemonseed_core::heartbeat::{HeartbeatFields, open_heartbeat, seal_public_heartbeat};
+use daemonseed_core::indexer::{CachedHashError, cached_or_hash};
 use daemonseed_core::presence::{
     HEARTBEAT_INTERVAL_MAX, HEARTBEAT_MISS_COUNT, LiveMember, PresenceChange, PresenceTracker,
     beacon_is_fresh, next_heartbeat_interval,
@@ -75,10 +78,11 @@ use daemonseed_core::share_catalog::{CatalogChange, ShareCatalog, ShareListing};
 use daemonseed_core::share_envelope::{ManifestEntry, ShareFrame};
 use daemonseed_core::share_rollcall::{RollCallFields, open_rollcall, seal_public_rollcall};
 use daemonseed_core::share_seal::{open_share_frame, seal_public_share_frame};
-use daemonseed_core::share_serve::ShareContent;
+use daemonseed_core::share_serve::{DiskShareContent, ServeError};
 use daemonseed_core::storage::cas::chunk_addr;
 use daemonseed_core::storage::fetched::rebase_to_selection_root;
-use daemonseed_core::storage::seeds::CounterState;
+use daemonseed_core::storage::seeds::{CounterState, IndexKey};
+use daemonseed_core::storage::share_index::{ShareIndex, per_share_index_filename};
 use daemonseed_proto::v1 as wire;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -128,6 +132,19 @@ pub enum NetCommand {
         /// uses the directory basename as the share name and `display_handle` as the
         /// sharer handle. Empty for the ephemeral / no-profile path.
         republish_roots: Vec<(PathBuf, Option<String>)>,
+        /// (#81) the persisted share-index location + key for the unlocked profile:
+        /// `(index_path, index_key)`, where `index_path` is
+        /// `profile_root/share-index.redb` (mirroring the TUI) and `index_key` is
+        /// the share-index key from [`SessionMaterials`]
+        /// (`daemonseed_core::first_start::SessionMaterials::index_key`). Opened ONCE
+        /// (create-if-absent) here, BEFORE the connect-time republish loop, so an
+        /// unchanged share's republish reuses the persisted chunk-address cache
+        /// (cache hits only — no from-scratch re-hash). `None` on the ephemeral /
+        /// no-profile path: with no profile root there is nowhere to persist the
+        /// cache, so a publish falls back to hashing fresh (no index). The key is
+        /// carried in the redacted [`IndexKey`] newtype so it never lands in a
+        /// `Debug` log.
+        index_params: Option<(PathBuf, IndexKey)>,
     },
     /// Join (subscribe to) a public room by name. In this slice production Connect
     /// auto-joins the default room directly (via [`Actor::join_room`]); this
@@ -250,6 +267,25 @@ pub enum NetCommand {
     #[doc(hidden)]
     #[cfg(test)]
     ProbeConnected,
+    /// TEST SEAM (#81, never used in production): set the persisted-index home
+    /// (`index_dir` + `index_key`) the SAME way a real `Connect{index_params}` does,
+    /// so a publish opens its per-share index file under it — letting a test prove the
+    /// publish path reuses the persisted chunk-address cache without a real Connect.
+    #[doc(hidden)]
+    #[cfg(test)]
+    SetIndexHome {
+        index_dir: PathBuf,
+        index_key: IndexKey,
+    },
+    /// TEST SEAM (#81, never used in production): emit the first cached chunk address
+    /// the per-share index for `root` holds for `rel_path` as a
+    /// [`NetEvent::CachedAddrProbe`] — `None` if no index for `root`, no entry, or no
+    /// cached blob. Lets the oracle assert a republish was a cache HIT (the address is
+    /// unchanged even after the file's bytes are rewritten at the same size+mtime)
+    /// rather than a re-hash.
+    #[doc(hidden)]
+    #[cfg(test)]
+    ProbeCachedAddr { root: PathBuf, rel_path: String },
     /// A1 fetch-preview: open the share's stream, read the manifest, emit
     /// `FetchManifest` (file names + sizes), then drop the stream. No bytes fetched.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -394,6 +430,13 @@ pub enum NetEvent {
     #[doc(hidden)]
     #[cfg(test)]
     ConnectedProbe { connected: bool },
+    /// TEST SEAM (#81): the first cached chunk address the open share index holds for
+    /// the probed `rel_path` (48-byte [`daemonseed_core::storage::cas::ChunkAddr`]
+    /// bytes), or `None` if there is no entry / no cached blob. Reply to
+    /// [`NetCommand::ProbeCachedAddr`].
+    #[doc(hidden)]
+    #[cfg(test)]
+    CachedAddrProbe { addr: Option<Vec<u8>> },
 }
 
 /// One file in an A1 fetch-preview ([`NetEvent::FetchManifest`]): the file's
@@ -573,6 +616,10 @@ struct ConnectPlan {
     display_handle: Option<String>,
     rejoin_circles: Vec<(u64, String)>,
     republish_roots: Vec<(PathBuf, Option<String>)>,
+    /// (#81) the share-index location + key, so a reconnect re-opens the SAME
+    /// persisted index and a reconnect-time republish reuses the cache instead of
+    /// re-hashing from scratch. Carried verbatim from the original `Connect`.
+    index_params: Option<(PathBuf, IndexKey)>,
 }
 
 /// First auto-reconnect backoff delay (#71). The actor waits this long after a
@@ -695,11 +742,84 @@ struct Actor {
     /// #80 flap detector for the lobby re-subscribe path. Each circle carries its
     /// own in [`CircleSub::resub`].
     room_resub: BurstGuard,
+    /// (#81) the persisted-index home: the profile root dir + share-index key,
+    /// captured from the first `Connect` carrying `index_params`. A publish opens a
+    /// PER-SHARE redb file under this dir (one per share root — see
+    /// [`Self::share_indexes`]). `None` on the ephemeral / no-profile path, where a
+    /// publish hashes fresh with no cache.
+    index_home: Option<(PathBuf, IndexKey)>,
+    /// (#81) open per-share redb indexes, keyed by share root. ONE redb FILE per
+    /// share (`share-index-<12hex(root)>.redb` under [`Self::index_home`]'s dir), so
+    /// a share's cache pass can never evict another share's cached chunk addresses —
+    /// the multi-share startup re-hash bug (#81), where a single shared index
+    /// cross-pruned every other share on each publish. Opened create-if-absent on the
+    /// first publish of a root and retained for the actor's life (redb holds an
+    /// exclusive file lock; each `Arc` clone goes to a blocking hash pass while the
+    /// foreground keeps querying via redb MVCC). Empty on the ephemeral / no-profile
+    /// path.
+    share_indexes: HashMap<PathBuf, Arc<ShareIndex>>,
 }
 
 impl Actor {
     fn emit(&self, evt: NetEvent) {
         let _ = self.evt_tx.send(evt);
+    }
+
+    /// (#81) The persisted redb share index for `root`, opened create-if-absent under
+    /// [`Self::index_home`] as a PER-SHARE file (`share-index-<12hex(root)>.redb`) and
+    /// cached in [`Self::share_indexes`] for the actor's life. Returns `None` on the
+    /// ephemeral / no-profile path (no `index_home`), where a publish hashes fresh.
+    ///
+    /// A per-share file holds only this root's files, so cache-hitting (or otherwise
+    /// touching) it can never affect another share's cache — that is the whole point
+    /// of the per-share split (#81). The open is blocking redb I/O (file-create +
+    /// table-materialize), so it runs on a blocking thread off the actor's async loop.
+    /// A failed open is non-fatal: it surfaces an Error and returns `None`, degrading
+    /// that one publish to a from-scratch hash (correct, just uncached).
+    async fn index_for_root(&mut self, root: &Path) -> Option<Arc<ShareIndex>> {
+        if let Some(existing) = self.share_indexes.get(root) {
+            return Some(existing.clone());
+        }
+        let (index_dir, index_key) = self.index_home.as_ref()?;
+        let index_path = index_dir.join(per_share_index_filename(root));
+        let key_bytes = index_key.to_bytes();
+        let opened =
+            tokio::task::spawn_blocking(move || ShareIndex::open(&index_path, key_bytes)).await;
+        match opened {
+            Ok(Ok(index)) => {
+                let index = Arc::new(index);
+                self.share_indexes.insert(root.to_path_buf(), index.clone());
+                Some(index)
+            }
+            // A failed open is non-fatal: surface it and return `None` so this publish
+            // degrades to a from-scratch hash (correct, just not cached).
+            Ok(Err(e)) => {
+                self.emit(NetEvent::Error {
+                    reason: format!("could not open share index: {e}"),
+                });
+                None
+            }
+            Err(_) => {
+                self.emit(NetEvent::Error {
+                    reason: "share-index open task failed".to_owned(),
+                });
+                None
+            }
+        }
+    }
+
+    /// TEST SEAM (#81): the first cached chunk address the per-share index for `root`
+    /// holds for `rel_path`, or `None` if no index is open for `root`, no entry, or no
+    /// cached blob. Reads only the first 48 bytes of the cached blob (one
+    /// [`daemonseed_core::storage::cas::ChunkAddr`]), all the cache-hit-vs-rehash
+    /// assertion needs.
+    #[cfg(test)]
+    fn probe_cached_addr(&self, root: &Path, rel_path: &str) -> Option<Vec<u8>> {
+        use daemonseed_core::storage::cas::CHUNK_ADDR_LEN;
+        let index = self.share_indexes.get(root)?;
+        let entry = index.get(rel_path).ok().flatten()?;
+        let blob = entry.chunk_addrs?;
+        (blob.len() >= CHUNK_ADDR_LEN).then(|| blob[..CHUNK_ADDR_LEN].to_vec())
     }
 
     /// Open a connection and keep the live session, then auto-join the default
@@ -712,12 +832,20 @@ impl Actor {
         display_handle: Option<String>,
         rejoin_circles: Vec<(u64, String)>,
         republish_roots: Vec<(PathBuf, Option<String>)>,
+        index_params: Option<(PathBuf, IndexKey)>,
     ) {
         // Round 6: present under the persisted stable handle when unlocked from a
         // profile. The connection proof below stays ephemeral (D8) — only the
         // display name is persistent.
         if let Some(handle) = display_handle {
             self.my_handle = handle;
+        }
+        // (#81) Capture the persisted-index home (profile dir + key) BEFORE the
+        // republish loop, so a connect-time republish of an unchanged share opens its
+        // per-share index file under it and reuses the cache instead of re-hashing
+        // from scratch. Set once; idempotent across reconnects.
+        if self.index_home.is_none() {
+            self.index_home = index_params.clone();
         }
         let identity = match ClientIdentity::ephemeral() {
             Ok(i) => i,
@@ -765,6 +893,7 @@ impl Actor {
                         display_handle: Some(self.my_handle.clone()),
                         rejoin_circles: rejoin_circles.clone(),
                         republish_roots: republish_roots.clone(),
+                        index_params: index_params.clone(),
                     });
                     self.reconnect_attempt = 0;
                     self.emit(NetEvent::Connected {
@@ -948,6 +1077,7 @@ impl Actor {
             plan.display_handle.clone(),
             plan.rejoin_circles.clone(),
             plan.republish_roots.clone(),
+            plan.index_params.clone(),
         )
         .await;
         // If the attempt failed (`handle_connect` emitted ConnectFailed and left
@@ -1499,25 +1629,57 @@ impl Actor {
             });
         };
 
-        // Index the directory off the actor thread (1 MiB sub-file chunking). The
-        // GUI keeps no redb share-index, so it always hashes fresh — the manifest
-        // and the served bytes are byte-identical to the cached path either way.
-        let index_root = root.clone();
-        let content =
-            match tokio::task::spawn_blocking(move || ShareContent::index_dir(&index_root)).await {
-                Ok(Ok(c)) => c,
-                Ok(Err(e)) => {
-                    return self.emit(NetEvent::PublishError {
-                        message: format!("could not index {}: {e}", root.display()),
-                    });
-                }
-                Err(_) => {
-                    return self.emit(NetEvent::PublishError {
-                        message: "share-index task failed".to_owned(),
-                    });
-                }
-            };
-        let content = std::sync::Arc::new(content);
+        // (#81) Index the directory off the actor thread (1 MiB sub-file chunking),
+        // reusing the PER-SHARE persisted redb chunk-address cache so an unchanged
+        // share — the common case, especially the connect-time auto-republish of a
+        // large share — is cache-hits-only (near-instant) instead of a full
+        // from-scratch re-hash (the Demonsaw-style CPU thrash ISC-C21 / ISC-A-C7 exist
+        // to prevent). The hashing stays inside `spawn_blocking` (off the async loop,
+        // ISC-A-C7); `cached_or_hash` reads no file whose size+mtime still match a
+        // cached entry, and writes fresh addresses back for misses so the next publish
+        // of an unchanged share reads no file at all.
+        //
+        // The index is a per-share redb file dedicated to THIS root, so its cache pass
+        // can never evict another share's cache — every published share keeps its own
+        // cache across launches (the #81 multi-share re-hash bug). With no index_home
+        // (the ephemeral / no-profile path) the pass degrades to a from-scratch hash.
+        let index = self.index_for_root(&root).await;
+
+        let hash_root = root.clone();
+        let manifest = match tokio::task::spawn_blocking(move || {
+            cached_or_hash(
+                index.as_deref(),
+                &hash_root,
+                &AtomicBool::new(false),
+                &mut |_, _| {},
+            )
+        })
+        .await
+        {
+            Ok(Ok(m)) => m,
+            Ok(Err(CachedHashError::Serve(ServeError::Cancelled))) => {
+                // The GUI alpha never cancels a publish hash; treat a Cancelled as a
+                // benign no-op rather than a hard error.
+                return self.emit(NetEvent::PublishError {
+                    message: format!("indexing {} was cancelled", root.display()),
+                });
+            }
+            Ok(Err(e)) => {
+                return self.emit(NetEvent::PublishError {
+                    message: format!("could not index {}: {e}", root.display()),
+                });
+            }
+            Err(_) => {
+                return self.emit(NetEvent::PublishError {
+                    message: "share-index task failed".to_owned(),
+                });
+            }
+        };
+        // Disk-backed serve content (mirrors the TUI): the manifest stays in RAM, the
+        // file bytes are read from disk per chunk request, so a share is never copied
+        // whole into RAM. `Arc`-shared because `serve_share` answers each request on
+        // the blocking pool.
+        let content = std::sync::Arc::new(DiskShareContent::new(root.clone(), manifest));
         let file_count = content.file_count();
 
         // The lobby subscription is the in-band discovery transport (unified share
@@ -2190,6 +2352,8 @@ async fn net_actor(
         last_connect: None,
         reconnect_attempt: 0,
         room_resub: BurstGuard::default(),
+        index_home: None,
+        share_indexes: HashMap::new(),
     };
     // Start the presence-heartbeat timer ONCE for the actor's life (#74/#75) — not
     // per join, so a reconnect/rejoin can never double-emit. The emit handler is a
@@ -2203,6 +2367,7 @@ async fn net_actor(
                 display_handle,
                 rejoin_circles,
                 republish_roots,
+                index_params,
             } => {
                 actor
                     .handle_connect(
@@ -2211,6 +2376,7 @@ async fn net_actor(
                         display_handle,
                         rejoin_circles,
                         republish_roots,
+                        index_params,
                     )
                     .await
             }
@@ -2293,6 +2459,18 @@ async fn net_actor(
             NetCommand::ProbeConnected => actor.emit(NetEvent::ConnectedProbe {
                 connected: actor.connected,
             }),
+            #[cfg(test)]
+            NetCommand::SetIndexHome {
+                index_dir,
+                index_key,
+            } => {
+                actor.index_home = Some((index_dir, index_key));
+            }
+            #[cfg(test)]
+            NetCommand::ProbeCachedAddr { root, rel_path } => {
+                let addr = actor.probe_cached_addr(&root, &rel_path);
+                actor.emit(NetEvent::CachedAddrProbe { addr });
+            }
         }
     }
 }
@@ -2537,7 +2715,6 @@ mod tests {
     use super::*;
     use daemonseed_core::crypto::suite::CNSA_2_0;
     use daemonseed_core::public_room::{derive_room_key, room_asset_address};
-    use std::sync::Arc;
     use std::time::Duration;
 
     #[test]
@@ -3056,6 +3233,342 @@ mod tests {
             .unwrap();
             assert_eq!(got_a, file_a, "page 1 recovered byte-for-byte");
             assert_eq!(got_b, file_b, "page 2 recovered byte-for-byte");
+        });
+    }
+
+    /// Drain events until a [`NetEvent::CachedAddrProbe`] arrives; the outer `Option`
+    /// is `Some` once the probe replied, the inner is the probed address (the first
+    /// cached chunk address, or `None` if the index has no cached blob for it).
+    async fn wait_for_cached_addr(
+        evt_rx: &mut mpsc::UnboundedReceiver<NetEvent>,
+    ) -> Option<Option<Vec<u8>>> {
+        for _ in 0..600 {
+            while let Ok(evt) = evt_rx.try_recv() {
+                if let NetEvent::CachedAddrProbe { addr } = evt {
+                    return Some(addr);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        None
+    }
+
+    /// (#81) The publish path reuses the persisted chunk-address cache instead of
+    /// re-hashing from scratch. After a first publish caches a file's chunk address,
+    /// the file's BYTES are rewritten at the SAME size + mtime (so the cache's
+    /// size+mtime stat triplet still matches) and the share is published AGAIN: a
+    /// cache HIT leaves the cached address unchanged (the rewritten bytes were never
+    /// read, let alone re-hashed), whereas a from-scratch re-hash would replace it
+    /// with the new bytes' address. Mirrors the core
+    /// `cached_or_hash_writes_back_multi_addr_then_hits_without_reading` test,
+    /// observed end-to-end through the GUI net actor.
+    #[test]
+    fn publish_reuses_persisted_cache_not_rehash() {
+        use daemonseed_core::bootstrap::BootstrapAnchor;
+        use daemonseed_core::first_start::FirstStart;
+        use daemonseed_core::profile::config::ArgonParams;
+
+        let _ = oxicrypt_module::initialize();
+
+        // A real share-index key, derived the production way (the sibling of the
+        // at-rest key from one Argon2id run) — no synthetic key, no new core API.
+        let fast = ArgonParams {
+            memory_kib: 8,
+            iterations: 1,
+            parallelism: 1,
+        };
+        let pass = "correct horse battery staple table mountain";
+        let sealed = FirstStart::new().initialize(pass, fast).unwrap();
+        let phrase = sealed.display_phrase();
+        let verified = sealed.verify_round_trip(&phrase).unwrap();
+        let index_key = verified
+            .finalize(
+                Some("alice".to_string()),
+                BootstrapAnchor {
+                    server_id: "relay#aabbccddeeff".to_string(),
+                    address: "127.0.0.1:443".to_string(),
+                },
+            )
+            .unwrap()
+            .into_session_materials()
+            .index_key;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let registry = CotRegistry::new();
+            let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+            let _srv = spawn_relay(server_io, registry.clone());
+            let sess = AppSession::open(client_io).await.expect("session");
+
+            let mut a = spawn_local_actor();
+            a.cmd_tx
+                .send(NetCommand::AttachSession {
+                    session: sess,
+                    server_id: SERVER_ID.to_owned(),
+                    display_handle: None,
+                    rejoin_circles: Vec::new(),
+                })
+                .ok();
+            a.cmd_tx
+                .send(NetCommand::JoinRoom {
+                    room: DEFAULT_ROOM.to_owned(),
+                })
+                .ok();
+            wait_for_room_joined(&mut a.evt_rx).await;
+
+            // Set the persisted-index home (a temp dir) the SAME way a real
+            // Connect{index_params} does; the publish opens its per-share file under it.
+            let index_dir = tempfile::TempDir::new().unwrap();
+            a.cmd_tx
+                .send(NetCommand::SetIndexHome {
+                    index_dir: index_dir.path().to_path_buf(),
+                    index_key,
+                })
+                .ok();
+
+            // A single-file share. The bytes hash to address X.
+            let share_dir = tempfile::TempDir::new().unwrap();
+            let file_path = share_dir.path().join("doc.bin");
+            let original: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+            std::fs::write(&file_path, &original).unwrap();
+
+            // First publish: a MISS → hash → write-back of the address.
+            a.cmd_tx
+                .send(NetCommand::PublishShare {
+                    root: share_dir.path().to_path_buf(),
+                    name: "doc-share".to_owned(),
+                    sharer_handle: "alice#aabbccddeeff".to_owned(),
+                })
+                .ok();
+            wait_for_publish_started(&mut a.evt_rx)
+                .await
+                .expect("first publish started");
+            a.cmd_tx
+                .send(NetCommand::ProbeCachedAddr {
+                    root: share_dir.path().to_path_buf(),
+                    rel_path: "doc.bin".to_owned(),
+                })
+                .ok();
+            let first_addr = wait_for_cached_addr(&mut a.evt_rx)
+                .await
+                .expect("probe replied")
+                .expect("first publish wrote a cached chunk address (the cache path ran)");
+
+            // Rewrite the file with DIFFERENT bytes of the SAME length, then restore
+            // the original mtime so the cache's (size, mtime) stat triplet still
+            // matches — the only way a re-hash vs cache-hit is observable.
+            let mtime = std::fs::metadata(&file_path).unwrap().modified().unwrap();
+            let mut rewritten = original.clone();
+            rewritten[0] ^= 0xff;
+            std::fs::write(&file_path, &rewritten).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&file_path)
+                .unwrap()
+                .set_modified(mtime)
+                .unwrap();
+
+            // Second publish of the unchanged-by-stat file: a cache HIT — the file is
+            // never read or re-hashed, so the index still holds the ORIGINAL address.
+            a.cmd_tx
+                .send(NetCommand::PublishShare {
+                    root: share_dir.path().to_path_buf(),
+                    name: "doc-share-2".to_owned(),
+                    sharer_handle: "alice#aabbccddeeff".to_owned(),
+                })
+                .ok();
+            wait_for_publish_started(&mut a.evt_rx)
+                .await
+                .expect("second publish started");
+            a.cmd_tx
+                .send(NetCommand::ProbeCachedAddr {
+                    root: share_dir.path().to_path_buf(),
+                    rel_path: "doc.bin".to_owned(),
+                })
+                .ok();
+            let second_addr = wait_for_cached_addr(&mut a.evt_rx)
+                .await
+                .expect("probe replied")
+                .expect("the cached address survives the second publish");
+
+            assert_eq!(
+                first_addr, second_addr,
+                "the republish was a cache HIT — the rewritten bytes were never \
+                 re-hashed, so the cached chunk address is unchanged (a from-scratch \
+                 re-hash would have produced the new bytes' address)"
+            );
+        });
+    }
+
+    /// (#81) The multi-share regression: each published share keeps its OWN cache, so
+    /// publishing a SECOND share never evicts the FIRST share's cache. This is the
+    /// exact bug a multi-share user hit — a single shared index re-pointed (and
+    /// cross-pruned) on every publish, so every share re-hashed on every launch.
+    ///
+    /// Reproduction: publish share A (caches A's address), publish share B in between,
+    /// then corrupt A's file at the SAME size+mtime and publish A again. With per-share
+    /// index files A's republish is a cache HIT (address unchanged). With the old
+    /// single-active index, B's publish would have evicted A's entry, so A's republish
+    /// would MISS and re-hash → a DIFFERENT (corrupted-bytes) address — the assertion
+    /// below would fail.
+    #[test]
+    fn second_share_publish_does_not_evict_first_share_cache() {
+        use daemonseed_core::bootstrap::BootstrapAnchor;
+        use daemonseed_core::first_start::FirstStart;
+        use daemonseed_core::profile::config::ArgonParams;
+
+        let _ = oxicrypt_module::initialize();
+
+        let fast = ArgonParams {
+            memory_kib: 8,
+            iterations: 1,
+            parallelism: 1,
+        };
+        let pass = "correct horse battery staple table mountain";
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            // A real share-index key, derived the production way.
+            let sealed = FirstStart::new().initialize(pass, fast).unwrap();
+            let phrase = sealed.display_phrase();
+            let index_key = sealed
+                .verify_round_trip(&phrase)
+                .unwrap()
+                .finalize(
+                    Some("alice".to_string()),
+                    BootstrapAnchor {
+                        server_id: "relay#aabbccddeeff".to_string(),
+                        address: "127.0.0.1:443".to_string(),
+                    },
+                )
+                .unwrap()
+                .into_session_materials()
+                .index_key;
+
+            let registry = CotRegistry::new();
+            let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+            let _srv = spawn_relay(server_io, registry.clone());
+            let sess = AppSession::open(client_io).await.expect("session");
+
+            let mut a = spawn_local_actor();
+            a.cmd_tx
+                .send(NetCommand::AttachSession {
+                    session: sess,
+                    server_id: SERVER_ID.to_owned(),
+                    display_handle: None,
+                    rejoin_circles: Vec::new(),
+                })
+                .ok();
+            a.cmd_tx
+                .send(NetCommand::JoinRoom {
+                    room: DEFAULT_ROOM.to_owned(),
+                })
+                .ok();
+            wait_for_room_joined(&mut a.evt_rx).await;
+
+            // One shared index home; TWO distinct share roots under it.
+            let index_dir = tempfile::TempDir::new().unwrap();
+            a.cmd_tx
+                .send(NetCommand::SetIndexHome {
+                    index_dir: index_dir.path().to_path_buf(),
+                    index_key,
+                })
+                .ok();
+
+            let share_a = tempfile::TempDir::new().unwrap();
+            let file_a = share_a.path().join("a.bin");
+            let bytes_a: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+            std::fs::write(&file_a, &bytes_a).unwrap();
+            let mtime_a = std::fs::metadata(&file_a).unwrap().modified().unwrap();
+
+            let share_b = tempfile::TempDir::new().unwrap();
+            let file_b = share_b.path().join("b.bin");
+            let bytes_b: Vec<u8> = (0..4096u32).map(|i| ((i + 7) % 251) as u8).collect();
+            std::fs::write(&file_b, &bytes_b).unwrap();
+
+            // Publish A → MISS → hash → write-back A's address.
+            a.cmd_tx
+                .send(NetCommand::PublishShare {
+                    root: share_a.path().to_path_buf(),
+                    name: "share-a".to_owned(),
+                    sharer_handle: "alice#aabbccddeeff".to_owned(),
+                })
+                .ok();
+            wait_for_publish_started(&mut a.evt_rx)
+                .await
+                .expect("share A published");
+            a.cmd_tx
+                .send(NetCommand::ProbeCachedAddr {
+                    root: share_a.path().to_path_buf(),
+                    rel_path: "a.bin".to_owned(),
+                })
+                .ok();
+            let a_addr_before = wait_for_cached_addr(&mut a.evt_rx)
+                .await
+                .expect("probe replied")
+                .expect("share A cached its address");
+
+            // Publish B in between — under the old single-active index this re-points
+            // and cross-prunes A's entry from the shared db.
+            a.cmd_tx
+                .send(NetCommand::PublishShare {
+                    root: share_b.path().to_path_buf(),
+                    name: "share-b".to_owned(),
+                    sharer_handle: "alice#aabbccddeeff".to_owned(),
+                })
+                .ok();
+            wait_for_publish_started(&mut a.evt_rx)
+                .await
+                .expect("share B published");
+
+            // Corrupt A's file at the SAME size+mtime so a re-hash is observable as a
+            // changed address, while a cache hit leaves the original address.
+            let mut rewritten = bytes_a.clone();
+            rewritten[0] ^= 0xff;
+            std::fs::write(&file_a, &rewritten).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&file_a)
+                .unwrap()
+                .set_modified(mtime_a)
+                .unwrap();
+
+            // Republish A: with per-share files this is a cache HIT despite B's publish.
+            a.cmd_tx
+                .send(NetCommand::PublishShare {
+                    root: share_a.path().to_path_buf(),
+                    name: "share-a-again".to_owned(),
+                    sharer_handle: "alice#aabbccddeeff".to_owned(),
+                })
+                .ok();
+            wait_for_publish_started(&mut a.evt_rx)
+                .await
+                .expect("share A republished");
+            a.cmd_tx
+                .send(NetCommand::ProbeCachedAddr {
+                    root: share_a.path().to_path_buf(),
+                    rel_path: "a.bin".to_owned(),
+                })
+                .ok();
+            let a_addr_after = wait_for_cached_addr(&mut a.evt_rx)
+                .await
+                .expect("probe replied")
+                .expect("share A still has its cached address after B's publish");
+
+            assert_eq!(
+                a_addr_before, a_addr_after,
+                "share A's cache survived an intervening publish of share B — per-share \
+                 index files never cross-evict (a single shared index would have pruned \
+                 A on B's publish, forcing a re-hash to the corrupted bytes' address)"
+            );
         });
     }
 

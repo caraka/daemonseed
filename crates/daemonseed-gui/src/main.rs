@@ -1105,7 +1105,7 @@ fn connect_now(
     match crypto {
         Ok(()) => {
             let (server_id, address) = relay_target();
-            let (display_handle, rejoin_circles, republish_roots) = {
+            let (display_handle, rejoin_circles, republish_roots, index_params) = {
                 let st = state.borrow();
                 (
                     st.display_handle(),
@@ -1114,6 +1114,7 @@ fn connect_now(
                         .into_iter()
                         .map(|(root, name)| (PathBuf::from(root), name))
                         .collect::<Vec<_>>(),
+                    st.persisted_index_params(),
                 )
             };
             let _ = net.borrow().send(NetCommand::Connect {
@@ -1122,6 +1123,7 @@ fn connect_now(
                 display_handle,
                 rejoin_circles,
                 republish_roots,
+                index_params,
             });
         }
         Err(reason) => {
@@ -1378,20 +1380,18 @@ fn apply_net_event(
             ui.set_download_progress(0.0);
             ui.set_download_label(SharedString::from(format!("Download failed: {message}")));
         }
-        // #74/#75 half one wires the PRODUCER (the net actor builds + pushes this);
-        // the Lobby roster pane that RENDERS it is half two (the orchestrator). Until
-        // then this is a deliberate no-op so the producer can ship and be tested
-        // independently of the Slint UI.
         NetEvent::Roster { entries } => {
             // Replace the Lobby roster model (#75). Runs on the UI thread (the Timer
             // drains events here), so a direct set is correct — no cross-thread hop.
             // The roster column renders/collapses by Lobby+Chat visibility Slint-side.
             ui.set_roster(roster_model(&entries));
         }
-        // Test-only probe (net.rs in-process oracle); never produced in a running
-        // binary, so it carries no UI effect.
+        // Test-only probes (net.rs in-process oracle); never produced in a running
+        // binary, so they carry no UI effect.
         #[cfg(test)]
         NetEvent::ConnectedProbe { .. } => {}
+        #[cfg(test)]
+        NetEvent::CachedAddrProbe { .. } => {}
     }
 }
 

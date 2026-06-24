@@ -1015,6 +1015,57 @@ mod tests {
         assert_eq!(seen, vec![(1, 1)]);
     }
 
+    /// #81 cross-restart: the cache MUST survive dropping + reopening the
+    /// `ShareIndex` at the same path/key (a process restart), then a reconcile,
+    /// then a cached_or_hash — otherwise the GUI re-hashes a large share on every
+    /// launch (the bug felt-tested 2026-06-24). Mirrors the GUI restart flow:
+    /// open → reconcile → cached_or_hash (session 1), DROP, reopen → reconcile →
+    /// cached_or_hash (session 2). The same-size + restored-mtime corruption makes
+    /// a cache HIT return the ORIGINAL chunks; a re-hash would return the new bytes'.
+    #[test]
+    fn cached_or_hash_survives_drop_and_reopen() {
+        let _ = oxicrypt_module::initialize();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("share");
+        std::fs::create_dir_all(&root).unwrap();
+        let index_path = tmp.path().join("index.redb");
+        let original: Vec<u8> = (0..CHUNK_SIZE + 4096).map(|i| (i % 251) as u8).collect();
+        let file = root.join("big.bin");
+        std::fs::write(&file, &original).unwrap();
+        let mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
+
+        // Session 1: open, reconcile, hash + write-back, then DROP (process exit).
+        let original_chunks = {
+            let idx = ShareIndex::open(&index_path, KEY).unwrap();
+            reconcile_into(&idx, &root, &no_cancel()).unwrap();
+            let m = cached_or_hash(Some(&idx), &root, &no_cancel(), &mut |_, _| {}).unwrap();
+            m.entries[0].chunks.clone()
+        };
+
+        // Corrupt the file (different bytes, SAME size) + restore mtime, so the
+        // stat triplet still matches the cached entry: a hit returns the original
+        // chunks, a re-hash returns the new bytes'.
+        let mut rewrite = original.clone();
+        rewrite[0] ^= 0xff;
+        rewrite[CHUNK_SIZE] ^= 0xff;
+        std::fs::write(&file, &rewrite).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+
+        // Session 2: REOPEN at the same path/key, reconcile, cached_or_hash — must HIT.
+        let idx2 = ShareIndex::open(&index_path, KEY).unwrap();
+        reconcile_into(&idx2, &root, &no_cancel()).unwrap();
+        let second = cached_or_hash(Some(&idx2), &root, &no_cancel(), &mut |_, _| {}).unwrap();
+        assert_eq!(
+            second.entries[0].chunks, original_chunks,
+            "cache must survive drop+reopen+reconcile (a restart); else a large share re-hashes every launch (#81)"
+        );
+    }
+
     /// Stale mtime → the cached addresses are NOT reused: the file is
     /// re-hashed and the fresh addresses written back.
     #[test]

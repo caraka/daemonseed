@@ -18,6 +18,7 @@ use daemonseed_core::circle::key::{CircleKey, CircleKeyError, circle_fingerprint
 use daemonseed_core::cot::AssetAddr;
 use daemonseed_core::crypto::suite::CNSA_2_0;
 use daemonseed_core::passphrase::strength::{self, DicewareError};
+use daemonseed_core::storage::seeds::IndexKey;
 
 use crate::profile::Profile;
 
@@ -249,6 +250,16 @@ impl GuiState {
             .as_ref()
             .map(Profile::published)
             .unwrap_or_default()
+    }
+
+    /// (#81) The unlocked profile's persisted-index home + key —
+    /// `(profile_root_dir, index_key)` — passed to `NetCommand::Connect` so the net
+    /// actor opens a PER-SHARE index file under the dir for each published share and
+    /// reuses its chunk-address cache across launches instead of re-hashing from
+    /// scratch. `None` on the ephemeral (no-profile) path, where there is no profile
+    /// root to persist a cache under.
+    pub fn persisted_index_params(&self) -> Option<(std::path::PathBuf, IndexKey)> {
+        self.profile.as_ref().map(Profile::index_params)
     }
 
     /// Write-through (M16): remember a published share root in the unlocked profile

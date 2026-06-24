@@ -431,8 +431,12 @@ modules:
       blob, for the sub-file-chunking switch; v2 was hours old and never
       shipped in a tag). Each bump abandons older tables in place — never
       read, never migrated; a rescan repopulates, the index is a cache over
-      the filesystem, not a record. New clear() empties the index
-      in one transaction (the clear-then-rescan latest-define-wins move).
+      the filesystem, not a record. clear() empties the index
+      in one transaction. Free fn per_share_index_filename(root) returns a stable
+      per-share index filename `share-index-<12hex>.redb`, the 12-hex stem being
+      the first 6 bytes of SHA-384 over the canonical root path (one index file
+      per share root, so a caller's cache pass over one share never touches
+      another's).
     no_std: false
     depends_on: []
     iscs:

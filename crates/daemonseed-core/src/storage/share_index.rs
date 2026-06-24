@@ -145,6 +145,43 @@ pub struct ShareIndex {
     index_key: Zeroizing<[u8; INDEX_KEY_LEN]>,
 }
 
+/// The stable, per-share index FILENAME for a share rooted at `root`:
+/// `share-index-<12hex>.redb`, where `<12hex>` is the first 6 bytes of SHA-384
+/// over the share's canonical absolute path. One redb file per share, so a
+/// publish's cache pass over one share can never evict another share's cached
+/// chunk addresses (a single shared index cross-prunes on every publish, forcing
+/// a multi-share user to re-hash every share on every launch — #81). The path is
+/// canonicalized for stability, so `/a/b`, `/a/b/`, and a symlinked equivalent
+/// all map to one file; if canonicalization fails (e.g. the root was removed)
+/// the raw path bytes are hashed, still stable for an identical path string.
+pub fn per_share_index_filename(root: &Path) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let path_bytes = canonical.as_os_str().as_encoded_bytes();
+    // SHA-384 is the keyed-free path digest. The only failure is an uninitialized
+    // oxicrypt module — which never happens on a real publish path — but a constant
+    // fallback would collide every share into one file (the very bug this prevents),
+    // so degrade to a deterministic std hash of the same bytes instead: still stable
+    // and distinct per path.
+    let stem: Vec<u8> = match sha384(path_bytes) {
+        Ok(digest) => digest[..6].to_vec(),
+        Err(_) => {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            path_bytes.hash(&mut h);
+            h.finish().to_le_bytes()[..6].to_vec()
+        }
+    };
+    let mut name = String::with_capacity("share-index-".len() + 12 + ".redb".len());
+    name.push_str("share-index-");
+    for b in &stem {
+        name.push(HEX[(b >> 4) as usize] as char);
+        name.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    name.push_str(".redb");
+    name
+}
+
 impl ShareIndex {
     /// Open (creating if absent) the index at `path`, encrypting under
     /// `index_key`. Reopening an existing file recovers every entry written
