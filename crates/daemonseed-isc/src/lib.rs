@@ -208,6 +208,8 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-C86", IscClass::Positive),
     // ── client positive (#80: graceful per-stream EOS re-subscribes, keeps session) ──
     ("ISC-C87", IscClass::Positive),
+    // ── client positive (#75: GUI surfaces the live Lobby roster) ──
+    ("ISC-C88", IscClass::Positive),
     // ── client negative (20) ────────────────────────────────────────────
     ("ISC-A-C1", IscClass::Negative),
     ("ISC-A-C2", IscClass::Negative),
@@ -250,13 +252,15 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-A-C40", IscClass::Negative),
     // ── client negative (#78: a replayed/stale-dated beacon must not refresh presence) ──
     ("ISC-A-C41", IscClass::Negative),
+    // ── client negative (#75: the roster shows only the live set, no decorators/persistence) ──
+    ("ISC-A-C42", IscClass::Negative),
 ];
 
 /// Total built, non-deferred ISCs tracked by this registry — the SINGLE source
 /// of truth for the coverage denominator, read live by `xtask isc-coverage`.
 /// Recount on every ISC add/remove (the `const _` assert below guards it
 /// against [`ISCS`]).
-pub const TOTAL: usize = 167;
+pub const TOTAL: usize = 169;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -414,10 +418,11 @@ mod tests {
         //                                  presence heartbeat C83-C85 pos + A-C38/A-C39 neg, #74;
         //                                  share-liveness-on-heartbeat C86 pos, #76;
         //                                  graceful-EOS re-subscribe C87 pos + A-C40 neg, #80;
-        //                                  presence replay-freshness A-C41 neg, #78)
-        //   total   107 pos + 60 neg = 167
-        assert_eq!(pos, 107, "positive count drift");
-        assert_eq!(neg, 60, "negative count drift");
+        //                                  presence replay-freshness A-C41 neg, #78;
+        //                                  GUI Lobby roster surface C88 pos + A-C42 neg, #75)
+        //   total   108 pos + 61 neg = 169
+        assert_eq!(pos, 108, "positive count drift");
+        assert_eq!(neg, 61, "negative count drift");
     }
 
     /// COVERED is single-sourced and must agree with the per-milestone
