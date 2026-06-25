@@ -57,7 +57,7 @@ All six crates are substantive as of the alpha1 MVP (M12). The `tui` crate — t
 
 ## Status
 
-Current release: **v0.31.0** — alpha (post-MVP). Presence: a live member-plane heartbeat with a Lobby connected-presence roster, share-liveness riding the heartbeat, and replay-freshness bounding — plus a GUI send-after-blip fix and per-share persisted index files so a published share is cache-hits-only at startup instead of re-hashing. See `CHANGELOG.md` for per-release detail.
+Current release: **v0.31.1** — alpha (post-MVP). GUI chat polish: the transcript auto-scrolls to the newest message, other people's messages use the readable green bubble (your own the dark one), messages wrap in variable-height bubbles, and a long pasted draft or message no longer pushes the chat column off-screen. See `CHANGELOG.md` for per-release detail.
 
 The per-release history lives in **[`CHANGELOG.md`](CHANGELOG.md)** (one entry per SSH-signed tag) — this section is intentionally kept to the current release so it can't silently drift. The release-signing *infrastructure* (real keys, Sigstore co-signature, reproducible builds, store / package-manager channels) and the platform features (biometric login, OS-native autostart) remain on a follow-up track; direct messaging is planned. Promotion to a public repository is gated on the `oxicrypt` sibling crate going public.
 
