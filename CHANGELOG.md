@@ -27,6 +27,7 @@ work lives in the project lead's vault manifest, not here.
 ### Fixed
 
 - GUI chat auto-scrolls to the newest message: a new message in the active room pins the transcript to the bottom when the reader is already at the bottom (always on your own send), and holds position when scrolled up reading history. (#84)
+- GUI chat messages wrap and bubbles size to their content: a long or multi-line message wraps within a bubble capped at ~72% of the row instead of clipping to a fixed height. (#86)
 
 ### Changed
 

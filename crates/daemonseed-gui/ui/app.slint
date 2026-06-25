@@ -123,10 +123,12 @@ component MsgBubble inherits Rectangle {
     in property <string> who;
     in property <string> text;
     in property <bool> mine;
-    height: 44px;
     HorizontalLayout {
         alignment: root.mine ? end : start;
         Rectangle {
+            // #86: cap the bubble at ~72% of the row so a long message wraps instead of
+            // clipping; with no fixed height the bubble grows to fit the wrapped text.
+            max-width: root.width * 0.72;
             border-radius: 10px;
             // #85: others get the readable green bubble (the ones you need to read);
             // your own messages get the dark bubble (no need to re-read what you wrote).
@@ -136,7 +138,7 @@ component MsgBubble inherits Rectangle {
             VerticalLayout {
                 padding: 8px; spacing: 2px;
                 Text { text: root.who; color: root.mine ? #8b93a1 : #6fb3a4; font-size: 11px; }
-                Text { text: root.text; color: #d6dae1; font-size: 13px; }
+                Text { text: root.text; color: #d6dae1; font-size: 13px; wrap: word-wrap; }
             }
         }
     }
@@ -301,12 +303,16 @@ export component AppWindow inherits Window {
     in property <float> download-progress: 0.0;
     in-out property <string> draft;           // live composer text, read by Rust on switch
     in-out property <length> scroll-y: 0px;   // Flickable viewport-y (negative when scrolled)
+    // #84/#86: the chat transcript's real laid-out content height, pushed up from inside
+    // the chat Flickable. Bubbles are variable-height since #86, so a fixed per-message
+    // stride no longer measures the content; 0px until the chat tab first instantiates.
+    property <length> chat-content-h: 0px;
     // #84: true when the chat transcript is scrolled to (or near) its bottom. Read by
     // Rust BEFORE a new message lands so it can decide stick-to-bottom vs hold-position.
     // `chat-area` is the always-present content wrapper (its height == the chat
-    // Flickable's visible height); the 52px/32px mirror the Flickable viewport-height.
+    // Flickable's visible height).
     out property <bool> chat-at-bottom:
-        root.scroll-y <= -(root.messages.length * 52px + 32px - chat-area.height) + 24px;
+        root.scroll-y <= -(root.chat-content-h - chat-area.height) + 24px;
     in property <bool> sheet-open: false;
     in-out property <bool> palette-open: false;
     in property <[ActionData]> actions;
@@ -628,9 +634,15 @@ export component AppWindow inherits Window {
                             // CHAT — message list
                             if root.active-tab == 0 : Flickable {
                                 viewport-width: self.width;
-                                viewport-height: root.messages.length * 52px + 32px;
+                                // #86: real laid-out content height (variable-height bubbles),
+                                // not a fixed per-message stride. Mirrored into root.chat-content-h
+                                // so the #84 at-bottom test can use it (root can't see into this `if`).
+                                viewport-height: chat-content.preferred-height;
                                 viewport-y <=> root.scroll-y;
-                                VerticalLayout {
+                                property <length> content-h: chat-content.preferred-height;
+                                init => { root.chat-content-h = self.content-h; }
+                                changed content-h => { root.chat-content-h = self.content-h; }
+                                chat-content := VerticalLayout {
                                     padding: 16px; spacing: 8px;
                                     for m in root.messages : MsgBubble { who: m.who; text: m.text; mine: m.mine; }
                                 }
