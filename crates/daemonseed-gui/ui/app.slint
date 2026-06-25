@@ -574,6 +574,11 @@ export component AppWindow inherits Window {
 
         // ── CENTER: header + tab strip + body ──
         Rectangle {
+            // Take the space left by the fixed rail + roster, never grow to content:
+            // without this a long pasted draft or message sized this column to its
+            // content width, pushing the roster off-screen and overflowing the window.
+            horizontal-stretch: 1;
+            clip: true;
             background: #07080a;
             VerticalLayout {
                 Rectangle {
@@ -721,27 +726,34 @@ export component AppWindow inherits Window {
                             HorizontalLayout {
                                 padding: 12px; spacing: 10px;
                                 Rectangle {
+                                    // Fill the composer width (minus the Send button) and clip:
+                                    // a long pasted single-line draft must scroll inside the box,
+                                    // not grow the box and balloon the whole centre column.
+                                    horizontal-stretch: 1;
+                                    clip: true;
                                     border-radius: 9px; background: #141517; border-width: 1px; border-color: #ffffff12;
-                                    HorizontalLayout { padding-left: 12px;
-                                        // `visible:` not `if` — the placeholder toggles on the
-                                        // first/last char typed; mutating the item tree mid-edit
-                                        // risks the partial_renderer "RefCell already borrowed" crash.
-                                        Text {
-                                            text: "Message the circle…";
-                                            visible: root.draft == "";
-                                            color: #4d5560;
-                                            font-size: 13px; vertical-alignment: center;
-                                        }
+                                    // Explicit-positioned (not a content-sizing layout): a single-line
+                                    // TextInput reports its full text as its minimum width, so a layout
+                                    // that sizes to it balloons the whole centre column on a long paste.
+                                    // Binding the width to the box (parent) makes the field a fixed
+                                    // viewport the text scrolls within. `visible:` not `if` for the
+                                    // placeholder — mutating the item tree mid-edit risks the
+                                    // partial_renderer "RefCell already borrowed" crash.
+                                    Text {
+                                        x: 12px; width: parent.width - 24px; height: 100%;
+                                        text: "Message the circle…";
+                                        visible: root.draft == "";
+                                        color: #4d5560;
+                                        font-size: 13px; vertical-alignment: center;
                                     }
-                                    HorizontalLayout { padding-left: 12px; padding-right: 12px;
-                                        composer := TextInput {
-                                            text <=> root.draft;
-                                            color: #d6dae1;
-                                            font-size: 13px;
-                                            vertical-alignment: center;
-                                            single-line: true;
-                                            accepted => { root.send-message(root.draft); }
-                                        }
+                                    composer := TextInput {
+                                        x: 12px; width: parent.width - 24px; height: 100%;
+                                        text <=> root.draft;
+                                        color: #d6dae1;
+                                        font-size: 13px;
+                                        vertical-alignment: center;
+                                        single-line: true;
+                                        accepted => { root.send-message(root.draft); }
                                     }
                                 }
                                 Rectangle { width: 84px; height: 38px; border-radius: 9px; background: #4a9d8e;
