@@ -128,12 +128,14 @@ component MsgBubble inherits Rectangle {
         alignment: root.mine ? end : start;
         Rectangle {
             border-radius: 10px;
-            background: root.mine ? #15302b : #141517;
+            // #85: others get the readable green bubble (the ones you need to read);
+            // your own messages get the dark bubble (no need to re-read what you wrote).
+            background: root.mine ? #141517 : #15302b;
             border-width: 1px;
-            border-color: root.mine ? #1f4d45 : #ffffff10;
+            border-color: root.mine ? #ffffff10 : #1f4d45;
             VerticalLayout {
                 padding: 8px; spacing: 2px;
-                Text { text: root.who; color: root.mine ? #6fb3a4 : #8b93a1; font-size: 11px; }
+                Text { text: root.who; color: root.mine ? #8b93a1 : #6fb3a4; font-size: 11px; }
                 Text { text: root.text; color: #d6dae1; font-size: 13px; }
             }
         }
@@ -299,6 +301,12 @@ export component AppWindow inherits Window {
     in property <float> download-progress: 0.0;
     in-out property <string> draft;           // live composer text, read by Rust on switch
     in-out property <length> scroll-y: 0px;   // Flickable viewport-y (negative when scrolled)
+    // #84: true when the chat transcript is scrolled to (or near) its bottom. Read by
+    // Rust BEFORE a new message lands so it can decide stick-to-bottom vs hold-position.
+    // `chat-area` is the always-present content wrapper (its height == the chat
+    // Flickable's visible height); the 52px/32px mirror the Flickable viewport-height.
+    out property <bool> chat-at-bottom:
+        root.scroll-y <= -(root.messages.length * 52px + 32px - chat-area.height) + 24px;
     in property <bool> sheet-open: false;
     in-out property <bool> palette-open: false;
     in property <[ActionData]> actions;
@@ -616,7 +624,7 @@ export component AppWindow inherits Window {
                     background: #07080a;
                     VerticalLayout {
                         // content region (one tab visible at a time)
-                        Rectangle {
+                        chat-area := Rectangle {
                             // CHAT — message list
                             if root.active-tab == 0 : Flickable {
                                 viewport-width: self.width;

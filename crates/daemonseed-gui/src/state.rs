@@ -519,6 +519,15 @@ impl GuiState {
         }
     }
 
+    /// Set circle `idx`'s retained `scroll_y` (no-op if out of range). #84: used on a
+    /// new message to pin the transcript to the bottom (a large-negative sentinel that
+    /// the Flickable clamps to the true bottom) or to hold the reader's live position.
+    pub fn set_scroll(&mut self, idx: usize, scroll_y: f32) {
+        if let Some(c) = self.circles.get_mut(idx) {
+            c.scroll_y = scroll_y;
+        }
+    }
+
     /// Switch the active circle to `target`.
     ///
     /// FIRST persist the caller-supplied live `draft`/`scroll` into the

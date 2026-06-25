@@ -62,6 +62,13 @@ use std::time::Duration;
 /// materialized circle (index ≥1) routes its Send to the Round-5 `SendCircle` seam.
 const LOBBY: usize = 0;
 
+/// #84: large-negative `scroll_y` sentinel meaning "pin to the bottom". `apply_view`
+/// writes it into the Flickable's `viewport-y`, which Slint clamps against the current
+/// content height — so it lands exactly at the newest message without the GUI needing
+/// to know the visible height. Any value below the real minimum (≈ -msg_count*52px)
+/// works; this is safely beyond it.
+const STICK_BOTTOM: f32 = -1.0e7;
+
 /// Default relay (the alpha1 fra1 VPS). Overridable via env so a tester can point
 /// at their own relay without a rebuild. Mirrors the TUI's connect target.
 fn relay_target() -> (String, String) {
@@ -1162,12 +1169,18 @@ fn apply_net_event(
             ui.set_connected(false);
         }
         NetEvent::Message { who, text, mine } => {
+            // #84: capture scroll intent from the LIVE view BEFORE the transcript grows.
+            // Own sends always pin to bottom; an incoming message pins only if the reader
+            // was already at the bottom — otherwise we hold their current position.
+            let live = ui.get_scroll_y();
+            let stick = mine || ui.get_chat_at_bottom();
             // Always fold the message into the Lobby's RAM state; refresh the
             // visible transcript only when the Lobby is the active circle.
             let mut st = state.borrow_mut();
             let raised = st.push_message(LOBBY, who, text, mine);
             let active = st.active();
             if active == LOBBY {
+                st.set_scroll(LOBBY, if stick { STICK_BOTTOM } else { live });
                 apply_view(ui, st.current(), active as i32);
             } else if raised {
                 // #64: the Lobby got a message while unfocused — show its dot.
@@ -1197,6 +1210,11 @@ fn apply_net_event(
             text,
             mine,
         } => {
+            // #84: capture scroll intent from the LIVE view before the transcript grows
+            // (see the Lobby branch). Own sends pin to bottom; incoming pins only if the
+            // reader was already at the bottom.
+            let live = ui.get_scroll_y();
+            let stick = mine || ui.get_chat_at_bottom();
             // Route by the GUI-assigned circle_id → rail index. Always fold into
             // that circle's RAM state; refresh the transcript only when it's active.
             let mut st = state.borrow_mut();
@@ -1204,6 +1222,7 @@ fn apply_net_event(
                 let raised = st.push_message(idx, who, text, mine);
                 let active = st.active();
                 if active == idx {
+                    st.set_scroll(idx, if stick { STICK_BOTTOM } else { live });
                     apply_view(ui, st.current(), active as i32);
                 } else if raised {
                     // #64: a circle got a message while unfocused — show its dot.
