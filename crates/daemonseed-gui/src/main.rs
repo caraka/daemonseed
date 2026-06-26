@@ -23,7 +23,8 @@
 //! `--self-check` runs a live materialize + draft-retention round-trip through the
 //! real callbacks and prints `SELF-CHECK PASS` (panics → non-zero exit);
 //! `--show-shares` / `--show-publish` render the Shares-tab browse tree / the Publish
-//! overlay (with a fixture share set, no relay).
+//! overlay (with a fixture share set, no relay); `--show-rename` opens the
+//! rename-identity overlay prefilled with a sample name (#66).
 
 mod desktop_integration;
 mod net;
@@ -432,6 +433,7 @@ fn build_ui() -> BuiltUi {
             ui.set_join_open(false);
             ui.set_palette_open(false);
             ui.set_publish_open(false);
+            ui.set_rename_open(false);
             let live_draft = ui.get_draft().to_string();
             let live_scroll = ui.get_scroll_y();
             let mut refresh_public_shares = false;
@@ -524,6 +526,70 @@ fn build_ui() -> BuiltUi {
             ui.set_new_phrase(SharedString::from(phrase.as_str()));
             ui.set_new_phrase_strong(true);
             ui.set_new_copied(false);
+        }
+    });
+
+    // #66: open the rename-identity overlay (from the palette). Prefill the field with
+    // the current display name (empty for a nameless profile — the #65 recovery path),
+    // clear any prior error, and close the other surfaces so overlays never stack.
+    ui.on_open_rename({
+        let weak = ui.as_weak();
+        let state = state.clone();
+        move || {
+            let ui = weak.unwrap();
+            ui.set_new_open(false);
+            ui.set_join_open(false);
+            ui.set_palette_open(false);
+            ui.set_publish_open(false);
+            ui.set_about_open(false);
+            let current = state.borrow().display_handle().unwrap_or_default();
+            ui.set_rename_name(SharedString::from(current));
+            ui.set_rename_error(SharedString::from(""));
+            ui.set_rename_open(true);
+            // Deferred focus (re-entrancy: focusing during a key-triggered callback
+            // breaks the next key's routing — same as the Join overlay).
+            let w = ui.as_weak();
+            defer(move || {
+                if let Some(ui) = w.upgrade() {
+                    ui.invoke_focus_rename_input();
+                }
+            });
+        }
+    });
+
+    // #66: apply a rename. Validate the name (is_valid_display_name); on an invalid
+    // name surface an inline error and keep the overlay open. On success re-seal via
+    // GuiState::rename_identity, refresh the live identity line IN PLACE, and push the
+    // new handle to the net actor (SetMyHandle) so local echoes / heartbeats / `mine`
+    // detection present the new name without a reconnect.
+    ui.on_submit_rename({
+        let weak = ui.as_weak();
+        let state = state.clone();
+        let net = net.clone();
+        move |name| {
+            let ui = weak.unwrap();
+            let name = name.to_string();
+            if !daemonseed_core::handle::display_name::is_valid_display_name(&name) {
+                ui.set_rename_error(SharedString::from(
+                    "Names can't be empty, contain \u{201c}#\u{201d}, or be too long.",
+                ));
+                return;
+            }
+            let outcome = state.borrow_mut().rename_identity(&name);
+            match outcome {
+                Ok(handle) => {
+                    // Live update: the rail identity line + the net actor's presented
+                    // handle, both without a reload.
+                    ui.set_my_handle(SharedString::from(handle.clone()));
+                    let _ = net.borrow().send(NetCommand::SetMyHandle { handle });
+                    ui.set_rename_open(false);
+                    ui.set_rename_error(SharedString::from(""));
+                    ui.invoke_focus_composer();
+                }
+                Err(reason) => {
+                    ui.set_rename_error(SharedString::from(format!("Couldn't rename: {reason}")));
+                }
+            }
         }
     });
 
@@ -864,6 +930,12 @@ fn build_ui() -> BuiltUi {
         ActionData {
             // #91: opens the Announcements pane + fetches this relay's MOTD/posts.
             label: "Announcements".into(),
+            shortcut: "".into(),
+        },
+        ActionData {
+            // #66: opens the rename-identity overlay (change the display name; also the
+            // #65 recovery path for a profile created nameless).
+            label: "Rename identity".into(),
             shortcut: "".into(),
         },
     ];
@@ -1652,6 +1724,10 @@ fn enter_main(
     defer(move || {
         let Some(ui) = ui_weak.upgrade() else { return };
         rebuild_rail(&ui, &state.borrow());
+        // #66: seed the rail identity line with the unlocked handle (empty on the
+        // ephemeral path); a later rename refreshes it in place.
+        let handle = state.borrow().display_handle().unwrap_or_default();
+        ui.set_my_handle(SharedString::from(handle));
         ui.set_screen(SharedString::from("main"));
         connect_now(&ui, &state, &net, &crypto);
         let w = ui.as_weak();
@@ -2072,6 +2148,9 @@ fn main() {
     let show_new = args.iter().any(|a| a == "--show-new");
     let show_palette = args.iter().any(|a| a == "--show-palette");
     let show_about = args.iter().any(|a| a == "--show-about");
+    // #66: open the rename-identity overlay (prefilled with a sample current name) so
+    // the offscreen PNG shows the rename UI. Mirrors --show-about / --show-join.
+    let show_rename = args.iter().any(|a| a == "--show-rename");
     let show_unread = args.iter().any(|a| a == "--show-unread");
     let show_tab_coherence = args.iter().any(|a| a == "--show-tab-coherence");
     // ISC-C62 proof: materialize a circle then apply a synthetic relay rendezvous so
@@ -2118,6 +2197,7 @@ fn main() {
         || show_new
         || show_palette
         || show_about
+        || show_rename
         || show_unread
         || show_tab_coherence
         || show_joined_label
@@ -2455,6 +2535,13 @@ fn main() {
         }
         if show_about {
             ui.set_about_open(true);
+        }
+        if show_rename {
+            // Open the rename overlay prefilled with a sample current name so the PNG
+            // shows the populated field (the offscreen shell is ephemeral / nameless,
+            // so open_rename would otherwise prefill blank).
+            ui.invoke_open_rename();
+            ui.set_rename_name(SharedString::from("battle-otter"));
         }
         if show_unread {
             // #64 fixture: materialize a circle, return to the Lobby, then receive a

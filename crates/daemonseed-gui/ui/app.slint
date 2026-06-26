@@ -379,6 +379,13 @@ export component AppWindow inherits Window {
     in-out property <bool> join-open: false;       // Join-a-circle overlay visible
     in-out property <bool> new-open: false;        // New-circle overlay visible
     in-out property <bool> about-open: false;      // About overlay visible (#59)
+    // #66 rename-identity overlay (Ctrl-K → "Rename identity"). `rename-name` is the
+    // editable display name (prefilled with the current handle, blank for a nameless
+    // profile — the #65 recovery path). `rename-error` is an inline validation/persist
+    // failure line; non-empty keeps the overlay open.
+    in-out property <bool> rename-open: false;     // Rename-identity overlay visible
+    in-out property <string> rename-name;          // editable display name (two-way to Rust)
+    in property <string> rename-error;             // Rust-set: invalid-name / persist-failure line
     // Commit-3 publish surface: the Publish overlay (a manage-your-shares sheet).
     in-out property <bool> publish-open: false;    // Publish overlay visible
     in-out property <string> publish-name;         // optional share name (blank → folder basename)
@@ -397,6 +404,11 @@ export component AppWindow inherits Window {
     // Real-networking status (round-3): driven by the net actor's events.
     in-out property <string> connection-status: "connecting…";
     in property <string> app-version;                  // Rust-set release version (#59 readout)
+    // #66: the user's own live display handle (`name#hash`, or the floor `#hash` when
+    // nameless). Set from `GuiState::display_handle()` on enter-main and refreshed
+    // IN PLACE on a successful rename, so the rail identity line reflects the new name
+    // without a reload. Empty on the ephemeral (no-profile) path.
+    in-out property <string> my-handle;
     in-out property <bool> connected: false;
 
     callback switch-circle(int);
@@ -433,6 +445,14 @@ export component AppWindow inherits Window {
     // materialize. `reroll-new` regenerates the diceware phrase.
     callback open-join();
     callback open-new();
+    // #66: `open-rename` raises the rename-identity overlay (palette → main shell),
+    // prefilled by Rust with the current display name. `submit-rename(name)` validates
+    // + re-seals + updates the live handle; on an invalid name Rust sets `rename-error`
+    // and leaves the overlay open.
+    callback open-rename();
+    callback submit-rename(string);
+    callback focus-rename-input();
+    focus-rename-input => { rename_name_input.focus(); }
     callback join-phrase-edited(string);
     callback submit-join(string);
     callback reroll-new();
@@ -548,6 +568,7 @@ export component AppWindow inherits Window {
                 root.join-open = false;
                 root.new-open = false;
                 root.about-open = false;
+                root.rename-open = false;
                 root.focus-composer();
                 return accept;
             }
@@ -561,7 +582,12 @@ export component AppWindow inherits Window {
                 padding: 10px; spacing: 4px;
                 Rectangle {
                     height: 42px;
-                    HorizontalLayout { padding: 6px; Text { text: "daemonseed"; color: #aeb6c2; font-size: 16px; vertical-alignment: center; } }
+                    VerticalLayout { padding-left: 6px; padding-right: 6px; alignment: center;
+                        Text { text: "daemonseed"; color: #aeb6c2; font-size: 16px; }
+                        // #66: the user's own live identity handle, refreshed in place on
+                        // rename. `visible:` (not `if`) so a rename never mutates the tree.
+                        Text { text: root.my-handle; visible: root.my-handle != ""; color: #5b6472; font-size: 11px; }
+                    }
                 }
                 for c[i] in root.circles : RailRow {
                     name: c.name; sub: c.sub; initial: c.initial; pinned: c.pinned;
@@ -1005,13 +1031,15 @@ export component AppWindow inherits Window {
                         // Action registry → real behavior. 0 = Lobby, 1 = New
                         // circle, 2 = Join a circle, 3 = Fetch a share (open the
                         // Shares tab + refresh the catalog), 4 = About overlay,
-                        // 5 = Announcements (open the pane + fetch this relay's news).
+                        // 5 = Announcements (open the pane + fetch this relay's news),
+                        // 6 = Rename identity (open the rename overlay, #66).
                         if (i == 0) { root.switch-circle(0); }
                         if (i == 1) { root.open-new(); }
                         if (i == 2) { root.open-join(); }
                         if (i == 3) { root.active-tab = 1; root.shares-tab-opened(); }
                         if (i == 4) { root.about-open = true; }
                         if (i == 5) { root.active-tab = 3; root.announcements-tab-opened(); }
+                        if (i == 6) { root.open-rename(); }
                     }
                 }
                 HorizontalLayout { padding-left: 10px; spacing: 8px;
@@ -1061,6 +1089,56 @@ export component AppWindow inherits Window {
             HorizontalLayout {
                 Rectangle { }
                 PillButton { label: "Close"; w: 80px; clicked => { root.about-open = false; root.focus-composer(); } }
+            }
+        }
+    }
+
+    // ── Rename-identity overlay (#66) — set/change the display name on the existing
+    // identity, then re-seal. Reachable for a nameless profile too (the #65 recovery
+    // path). The cryptographic identity (the handle hash) never changes; only the
+    // presented name does. Cancel + Save are mouse dismiss paths (Windows-safe). ──
+    rename := Rectangle {
+        x: (root.width - self.width) / 2; y: 110px;
+        width: 460px; height: 240px;
+        visible: root.rename-open;
+        background: #0e0f11; border-radius: 12px; border-width: 1px; border-color: #ffffff18;
+        VerticalLayout {
+            padding: 20px; spacing: 12px; alignment: start;
+            HorizontalLayout {
+                Text { text: "Rename identity"; color: #e4e8ee; font-size: 17px; }
+                Rectangle { }
+                PillButton { label: "Cancel"; w: 80px; clicked => { root.rename-open = false; root.focus-composer(); } }
+            }
+            Text { text: "Change the name others see. Your identity and circles are unchanged."; color: #8b93a1; font-size: 13px; wrap: word-wrap; }
+            // name field — mirrors the Join phrase box (fixed width, clipped, single-line).
+            Rectangle {
+                height: 44px; border-radius: 9px; background: #141517; border-width: 1px; border-color: #ffffff12; clip: true;
+                HorizontalLayout { padding-left: 12px;
+                    // `visible:` not `if` — toggling on the first/last char typed must
+                    // NOT mutate the item tree mid-edit (partial_renderer crash).
+                    Text { text: "a name others will see…"; visible: root.rename-name == ""; color: #4d5560; font-size: 13px; vertical-alignment: center; }
+                }
+                HorizontalLayout { padding-left: 12px; padding-right: 12px;
+                    rename_name_input := TextInput {
+                        text <=> root.rename-name;
+                        color: #d6dae1; font-size: 13px; vertical-alignment: center; single-line: true;
+                        accepted => { root.submit-rename(root.rename-name); }
+                    }
+                }
+            }
+            // inline error (invalid name / persist failure) — STABLE Text, no `if`.
+            Text {
+                text: root.rename-error;
+                visible: root.rename-error != "";
+                color: #c2785b; font-size: 12px;
+            }
+            Rectangle { }
+            HorizontalLayout {
+                Rectangle { }
+                PillButton {
+                    label: "Save name"; primary: true; w: 150px;
+                    clicked => { root.submit-rename(root.rename-name); }
+                }
             }
         }
     }

@@ -160,6 +160,13 @@ pub enum NetCommand {
         /// the ephemeral / no-profile path (read-only public space, no composer).
         stable_signing_key: Option<SignKeypair>,
     },
+    /// (#66) Update the presented display handle in place after a rename, without a
+    /// reconnect. Sets the actor's `my_handle` exactly as a `Connect{display_handle}`
+    /// would, so subsequent local echoes, heartbeats, and `mine` detection present the
+    /// new name. The connection proof stays the ephemeral one already established —
+    /// only the *display* identity changes (D8). A no-op effect when not connected (the
+    /// next Connect carries the persisted handle anyway).
+    SetMyHandle { handle: String },
     /// Join (subscribe to) a public room by name. In this slice production Connect
     /// auto-joins the default room directly (via [`Actor::join_room`]); this
     /// command exists so the post-`open` JoinRoom path is driven identically by a
@@ -846,6 +853,38 @@ struct Actor {
 }
 
 impl Actor {
+    /// Build a fresh actor with a throwaway per-launch `my_handle` and no live
+    /// session. The presence-heartbeat timer is armed separately by [`net_actor`]
+    /// (once per actor life); tests that don't need the timer call this directly.
+    fn new(
+        evt_tx: mpsc::UnboundedSender<NetEvent>,
+        cmd_tx: mpsc::UnboundedSender<NetCommand>,
+    ) -> Self {
+        Actor {
+            evt_tx,
+            cmd_tx,
+            share_catalog: ShareCatalog::new(SHARE_CATALOG_TTL),
+            own_shares: Rc::new(RefCell::new(Vec::new())),
+            session: None,
+            server_id: None,
+            server_pubkey: None,
+            identity: None,
+            stable_signing_key: None,
+            my_handle: generate_handle(),
+            counters: CounterState::default(),
+            trust: InMemoryTrustStore::new(),
+            public_room: None,
+            circles: Vec::new(),
+            published: HashMap::new(),
+            connected: false,
+            last_connect: None,
+            reconnect_attempt: 0,
+            room_resub: BurstGuard::default(),
+            index_home: None,
+            share_indexes: HashMap::new(),
+        }
+    }
+
     fn emit(&self, evt: NetEvent) {
         let _ = self.evt_tx.send(evt);
     }
@@ -2260,6 +2299,14 @@ impl Actor {
     /// the ISC-S9 single-line-plaintext rule BEFORE signing) and upload it via
     /// `UploadMotd` (#89), then refresh. Non-plaintext text is rejected before any
     /// upload and surfaced as a [`NetEvent::PublicSpaceError`] — the composer shows
+    /// (#66) Adopt a renamed display handle for the rest of this session — the live
+    /// counterpart of the `Connect{display_handle}` assignment, applied without a
+    /// reconnect. Only the presented name changes; the ephemeral connection proof is
+    /// untouched (D8).
+    fn handle_set_my_handle(&mut self, handle: String) {
+        self.my_handle = handle;
+    }
+
     /// the message rather than silently dropping. Same no-stable-key / no-session
     /// guards as [`Self::handle_upload_announcement`].
     async fn handle_set_motd(&mut self, text: &str) {
@@ -2678,29 +2725,7 @@ async fn net_actor(
     cmd_tx: mpsc::UnboundedSender<NetCommand>,
     evt_tx: mpsc::UnboundedSender<NetEvent>,
 ) {
-    let mut actor = Actor {
-        evt_tx,
-        cmd_tx,
-        share_catalog: ShareCatalog::new(SHARE_CATALOG_TTL),
-        own_shares: Rc::new(RefCell::new(Vec::new())),
-        session: None,
-        server_id: None,
-        server_pubkey: None,
-        identity: None,
-        stable_signing_key: None,
-        my_handle: generate_handle(),
-        counters: CounterState::default(),
-        trust: InMemoryTrustStore::new(),
-        public_room: None,
-        circles: Vec::new(),
-        published: HashMap::new(),
-        connected: false,
-        last_connect: None,
-        reconnect_attempt: 0,
-        room_resub: BurstGuard::default(),
-        index_home: None,
-        share_indexes: HashMap::new(),
-    };
+    let mut actor = Actor::new(evt_tx, cmd_tx);
     // Start the presence-heartbeat timer ONCE for the actor's life (#74/#75) — not
     // per join, so a reconnect/rejoin can never double-emit. The emit handler is a
     // no-op until a lobby is joined and an identity is held.
@@ -2728,6 +2753,7 @@ async fn net_actor(
                     )
                     .await
             }
+            NetCommand::SetMyHandle { handle } => actor.handle_set_my_handle(handle),
             NetCommand::JoinRoom { room } => actor.join_room(&room).await,
             NetCommand::SendRoom { text } => actor.handle_send_room(&text).await,
             NetCommand::JoinCircle { circle_id, phrase } => {
@@ -3127,6 +3153,21 @@ mod tests {
         assert_eq!(republish_name(Path::new("/srv/docs"), Some("")), "docs");
         // Degenerate root with no basename → "share".
         assert_eq!(republish_name(Path::new("/"), None), "share");
+    }
+
+    /// #66: `SetMyHandle` updates the presented handle in place — the same
+    /// `my_handle` field a `Connect{display_handle}` sets, which drives local echoes,
+    /// heartbeats, and `mine` detection. A rename therefore presents the new name
+    /// without a reconnect.
+    #[test]
+    fn set_my_handle_updates_presented_handle() {
+        let (evt_tx, _evt_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let mut actor = Actor::new(evt_tx, cmd_tx);
+        let original = actor.my_handle.clone();
+        actor.handle_set_my_handle("battle-otter#abc123def456".to_owned());
+        assert_eq!(actor.my_handle, "battle-otter#abc123def456");
+        assert_ne!(actor.my_handle, original, "the presented handle changed");
     }
 
     /// A fixed server-id the cross-derivation + relay tests namespace by.

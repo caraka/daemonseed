@@ -399,12 +399,10 @@ impl GuiState {
     /// at-rest blob (write-through) so it persists across unlock; also the recovery
     /// path for a profile created nameless before #65. Returns the new display
     /// handle, or `Err` for an invalid name, no unlocked profile, or a disk-seal
-    /// failure. The cryptographic identity (handle hash) is unchanged. The Ctrl-K
-    /// command-palette entry that drives this is felt-deferred (#66), so the binary
-    /// has no caller yet — `#[allow(dead_code)]`, same convention as
-    /// [`GuiState::circle_fingerprint_of`]; the core path is exercised by the
-    /// `rename_identity_*` unit tests.
-    #[allow(dead_code)]
+    /// failure. The cryptographic identity (handle hash) is unchanged. Driven by the
+    /// Ctrl-K "Rename identity" command-palette entry (`on_submit_rename`), which
+    /// validates the name and pushes the new handle to the net actor for a live
+    /// update; the core path is also exercised by the `rename_identity_*` unit tests.
     pub fn rename_identity(&mut self, new_name: &str) -> Result<String, String> {
         match self.profile.as_mut() {
             Some(p) => p.rename(new_name).map(str::to_owned),
