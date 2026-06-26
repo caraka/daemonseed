@@ -3,18 +3,20 @@
 //! Inbound `VeilidUpdate`s are mapped to typed [`VeilidNetEvent`]s on a
 //! separate stream the app/UI consumes.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 use veilid_core::{
-    api_startup, RouteBlob, RouteId, RoutingContext, Target, VeilidAPI, VeilidConfig, VeilidUpdate,
+    api_startup, RecordKey, RouteBlob, RouteId, RoutingContext, Target, VeilidAPI, VeilidConfig,
+    VeilidUpdate,
 };
 
 use crate::config::VeilidNetConfig;
 use crate::error::{Result, VeilidNetError};
 use crate::event::VeilidNetEvent;
-use crate::identity;
+use crate::{circle, identity};
 
 /// Veilid's `app_message` / `app_call` payload cap (bytes). Sealed envelopes
 /// must fit; file-share chunks re-chunk to this in Phase 3.
@@ -37,6 +39,15 @@ enum Command {
     SendSealed {
         route: RouteId,
         sealed: Vec<u8>,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    PublishCircle {
+        owner_seed: [u8; 32],
+        sealed: Vec<u8>,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    SubscribeCircle {
+        owner_seed: [u8; 32],
         reply: oneshot::Sender<Result<()>>,
     },
     Shutdown {
@@ -104,23 +115,36 @@ impl VeilidNetHandle {
         let _ = self.send(|reply| Command::Shutdown { reply }).await;
     }
 
-    // ── Phase 2+ surface (not built yet; mechanics characterized in Phase 0) ──
-    // Signposts only: these return Unimplemented without touching the actor, so
-    // the command set stays the Phase-1 proven path.
+    // ── Circles (Phase 2): shared-owner DFLT rendezvous + append-ring fan-out ──
 
-    /// Publish a sealed message to a circle's DHT rendezvous record (`SMPL`,
-    /// owner derived from the circle `cot_key`). **Phase 2.**
-    pub async fn publish_circle(&self, _circle_cot_key: &[u8], _sealed: Vec<u8>) -> Result<()> {
-        Err(VeilidNetError::Unimplemented(
-            "circles (DHT/SMPL) — Phase 2",
-        ))
+    /// Publish a SEALED message to a circle (Phase 2). `owner_seed` is the
+    /// circle's deterministic Veilid rendezvous-owner seed
+    /// (`daemonseed_core::circle::key::derive_circle_veilid_owner_seed`); the
+    /// actor opens/creates the shared-owner DFLT record at the derived
+    /// rendezvous address and writes `sealed` into this member's append-ring.
+    /// `sealed` is the opaque circle envelope — this layer never holds the key
+    /// or plaintext.
+    pub async fn publish_circle(&self, owner_seed: [u8; 32], sealed: Vec<u8>) -> Result<()> {
+        self.send(|reply| Command::PublishCircle {
+            owner_seed,
+            sealed,
+            reply,
+        })
+        .await?
     }
 
-    /// Watch a circle's DHT record for member writes (eventual, ~tens of
-    /// seconds — fine for membership/announcements, not typing). **Phase 2.**
-    pub async fn subscribe_circle(&self, _circle_cot_key: &[u8]) -> Result<()> {
-        Err(VeilidNetError::Unimplemented("circle subscribe — Phase 2"))
+    /// Subscribe to a circle (Phase 2): open the same rendezvous record, watch
+    /// it for member writes, and sweep it once for the bounded login backlog.
+    /// Inbound circle messages arrive as [`VeilidNetEvent::Inbound`] on the
+    /// event stream (eventual — watch latency is tens of seconds). `owner_seed`
+    /// is the circle's rendezvous-owner seed, as for [`Self::publish_circle`].
+    pub async fn subscribe_circle(&self, owner_seed: [u8; 32]) -> Result<()> {
+        self.send(|reply| Command::SubscribeCircle { owner_seed, reply })
+            .await?
     }
+
+    // ── Phase 3+ surface (not built yet; mechanics characterized in Phase 0) ──
+    // Signposts only: these return Unimplemented without touching the actor.
 
     /// Announce a public share; chunks served owner-on-demand, re-chunked to
     /// ≤32 KiB. **Phase 3.**
@@ -137,8 +161,9 @@ impl VeilidNetHandle {
 /// Brings up the daemonseed Veilid transport node.
 ///
 /// Phase 1 implements the PROVEN 1:1 path: identity-bound node, private routes,
-/// sealed `app_message`. Circles (DHT/`SMPL`), shares, presence, and
-/// announcements are Phase 2+ ([`VeilidNetHandle`] signposts them).
+/// sealed `app_message`. Phase 2 adds circles (shared-owner DFLT rendezvous +
+/// append-ring fan-out). Shares, presence, and announcements are Phase 3+
+/// ([`VeilidNetHandle`] signposts them).
 pub struct VeilidNet;
 
 impl VeilidNet {
@@ -151,10 +176,11 @@ impl VeilidNet {
         std::fs::create_dir_all(&cfg.storage_dir).ok();
 
         let (ev_tx, ev_rx) = mpsc::unbounded_channel::<VeilidNetEvent>();
+        let ev_tx_cb = ev_tx.clone();
         let update_callback: Arc<dyn Fn(VeilidUpdate) + Send + Sync> =
             Arc::new(move |u: VeilidUpdate| {
                 if let Some(ev) = map_update(u) {
-                    let _ = ev_tx.send(ev);
+                    let _ = ev_tx_cb.send(ev);
                 }
             });
 
@@ -198,15 +224,30 @@ impl VeilidNet {
             .routing_context()
             .map_err(|e| VeilidNetError::Routing(e.to_string()))?;
 
+        // This node's pubkey spreads it across the circle record's subkey
+        // regions (Phase 2 fan-out).
+        let node_pub = identity::node_public_bytes(&cfg.identity_seed);
+
         let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(64);
-        tokio::spawn(actor_loop(api, rc, cmd_rx));
+        tokio::spawn(actor_loop(api, rc, cmd_rx, ev_tx, node_pub));
         Ok((VeilidNetHandle { cmd_tx }, ev_rx))
     }
 }
 
 /// The actor task: owns the `VeilidAPI` + `RoutingContext` and processes
-/// commands until `Shutdown` or the command channel closes.
-async fn actor_loop(api: VeilidAPI, rc: RoutingContext, mut cmd_rx: mpsc::Receiver<Command>) {
+/// commands until `Shutdown` or the command channel closes. Holds an event
+/// sender (for background circle sweeps), this node's pubkey (circle region
+/// assignment), and a per-circle append-ring write cursor.
+async fn actor_loop(
+    api: VeilidAPI,
+    rc: RoutingContext,
+    mut cmd_rx: mpsc::Receiver<Command>,
+    ev_tx: mpsc::UnboundedSender<VeilidNetEvent>,
+    node_pub: [u8; 32],
+) {
+    // Per-circle local write cursor: which ring slot this member writes next.
+    let mut circle_seq: HashMap<RecordKey, u32> = HashMap::new();
+
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
             Command::Attach {
@@ -235,6 +276,18 @@ async fn actor_loop(api: VeilidAPI, rc: RoutingContext, mut cmd_rx: mpsc::Receiv
             } => {
                 let _ = reply.send(send_sealed(&rc, route, sealed).await);
             }
+            Command::PublishCircle {
+                owner_seed,
+                sealed,
+                reply,
+            } => {
+                let _ = reply.send(
+                    publish_circle(&api, &rc, &node_pub, &mut circle_seq, owner_seed, sealed).await,
+                );
+            }
+            Command::SubscribeCircle { owner_seed, reply } => {
+                let _ = reply.send(subscribe_circle(&api, &rc, &ev_tx, owner_seed).await);
+            }
             Command::Shutdown { reply } => {
                 api.shutdown().await;
                 let _ = reply.send(());
@@ -244,6 +297,46 @@ async fn actor_loop(api: VeilidAPI, rc: RoutingContext, mut cmd_rx: mpsc::Receiv
     }
     // Channel closed without an explicit Shutdown — clean up the node.
     api.shutdown().await;
+}
+
+/// Open/create the circle's rendezvous record and write `sealed` into this
+/// member's append-ring slot, advancing the local cursor.
+async fn publish_circle(
+    api: &VeilidAPI,
+    rc: &RoutingContext,
+    node_pub: &[u8; 32],
+    circle_seq: &mut HashMap<RecordKey, u32>,
+    owner_seed: [u8; 32],
+    sealed: Vec<u8>,
+) -> Result<()> {
+    let owner = identity::circle_owner_keypair(&owner_seed)?;
+    let key = circle::open_or_create(api, rc, &owner).await?;
+    let base = circle::member_base_subkey(node_pub);
+    let seq = {
+        let cur = circle_seq.entry(key.clone()).or_insert(0);
+        let s = *cur;
+        *cur = cur.wrapping_add(1);
+        s
+    };
+    circle::publish(rc, &key, &owner, base, seq, sealed).await
+}
+
+/// Open/create the circle's rendezvous record, register a watch, and kick off a
+/// one-shot background sweep for the bounded login backlog. Inbound messages
+/// flow out as [`VeilidNetEvent::Inbound`].
+async fn subscribe_circle(
+    api: &VeilidAPI,
+    rc: &RoutingContext,
+    ev_tx: &mpsc::UnboundedSender<VeilidNetEvent>,
+    owner_seed: [u8; 32],
+) -> Result<()> {
+    let owner = identity::circle_owner_keypair(&owner_seed)?;
+    let key = circle::open_or_create(api, rc, &owner).await?;
+    rc.watch_dht_values(key.clone(), None, None, None)
+        .await
+        .map_err(|e| VeilidNetError::Routing(e.to_string()))?;
+    tokio::spawn(circle::sweep(rc.clone(), key, ev_tx.clone()));
+    Ok(())
 }
 
 /// Attach and poll until public-internet-ready or the deadline elapses.
@@ -291,7 +384,16 @@ fn map_update(u: VeilidUpdate) -> Option<VeilidNetEvent> {
             public_internet_ready: a.public_internet_ready,
         }),
         VeilidUpdate::RouteChange(_) => Some(VeilidNetEvent::RouteChanged),
-        VeilidUpdate::ValueChange(_) => Some(VeilidNetEvent::ValueChanged),
+        // A watched circle record changed. Phase 2 only watches circle records,
+        // so a value-bearing change is an inbound sealed circle message —
+        // surface its bytes (the app opens it with the circle key). An empty
+        // change (no value) means the watch died; report it as ValueChanged.
+        VeilidUpdate::ValueChange(vc) => match vc.value {
+            Some(v) => Some(VeilidNetEvent::Inbound {
+                bytes: v.data().to_vec(),
+            }),
+            None => Some(VeilidNetEvent::ValueChanged),
+        },
         _ => None,
     }
 }

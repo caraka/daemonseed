@@ -15,9 +15,11 @@ use veilid_core::{KeyPair, PublicKeyGroup, SecretKeyGroup};
 
 use crate::error::{Result, VeilidNetError};
 
-/// Build the VLD0 node keypair from a daemonseed Veilid node seed (D3).
-pub fn node_keypair(seed: &VeilidNodeSeed) -> Result<KeyPair> {
-    let sk = SigningKey::from_bytes(seed.as_bytes());
+/// Build a VLD0 keypair from any 32-byte Ed25519 seed — the node identity (D3)
+/// or a circle's rendezvous-owner seed (Phase 2). VLD0 is Ed25519, so the seed
+/// IS the secret and the public is its verifying key.
+fn vld0_keypair(seed: &[u8; 32]) -> Result<KeyPair> {
+    let sk = SigningKey::from_bytes(seed);
     let pk = sk.verifying_key();
     let s = format!(
         "VLD0:{}:{}",
@@ -25,6 +27,26 @@ pub fn node_keypair(seed: &VeilidNodeSeed) -> Result<KeyPair> {
         URL_SAFE_NO_PAD.encode(sk.to_bytes())
     );
     KeyPair::from_str(&s).map_err(|e| VeilidNetError::Identity(e.to_string()))
+}
+
+/// Build the VLD0 node keypair from a daemonseed Veilid node seed (D3).
+pub fn node_keypair(seed: &VeilidNodeSeed) -> Result<KeyPair> {
+    vld0_keypair(seed.as_bytes())
+}
+
+/// Build the VLD0 **rendezvous-owner** keypair for a circle from its
+/// deterministic owner seed (Phase 2). Every member derives the same keypair,
+/// so all compute the same DHT record key and can write owner-signed subkeys.
+pub fn circle_owner_keypair(owner_seed: &[u8; 32]) -> Result<KeyPair> {
+    vld0_keypair(owner_seed)
+}
+
+/// This node's 32-byte Ed25519 public key — a pure function of the node seed,
+/// used to spread members across the circle record's subkey regions.
+pub fn node_public_bytes(seed: &VeilidNodeSeed) -> [u8; 32] {
+    SigningKey::from_bytes(seed.as_bytes())
+        .verifying_key()
+        .to_bytes()
 }
 
 /// Build the `(public_keys, secret_keys)` groups to pin this identity in the

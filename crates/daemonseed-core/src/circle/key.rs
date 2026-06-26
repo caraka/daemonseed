@@ -149,6 +149,71 @@ pub fn derive_cot_key(entropy: &str, suite: &Suite) -> Result<CircleKey, CircleK
     Ok(CircleKey(boxed))
 }
 
+/// Length of a circle's Veilid rendezvous-owner seed — 32 bytes (a VLD0
+/// Ed25519 seed).
+pub const CIRCLE_VEILID_OWNER_SEED_LEN: usize = 32;
+
+/// A circle's deterministic Veilid **rendezvous-owner** seed (Phase 2
+/// transport): the 32-byte VLD0 (Ed25519) seed every member derives from the
+/// shared circle entropy, so all members independently compute the SAME DHT
+/// record key — the circle's relay-free rendezvous address (the DHT analog of
+/// the relay-era `SHA-384(cot_key ‖ server_id)`). Zeroes on drop; `Debug` is
+/// redacted (ISC-A-C1).
+///
+/// It is a **sibling** of [`derive_cot_key`]: both expand the same circle PRK
+/// but under different `info` labels, so the rendezvous address is not a
+/// function of the content key and vice versa. Every circle member can derive
+/// it, and therefore every member can act as the DHT record owner — the trust
+/// set is identical to the one that already holds `cot_key`, so this opens no
+/// new boundary. The content key is unaffected: content NEVER derives from
+/// transport material.
+#[derive(zeroize::ZeroizeOnDrop)]
+pub struct CircleVeilidOwnerSeed(Box<[u8; CIRCLE_VEILID_OWNER_SEED_LEN]>);
+
+impl CircleVeilidOwnerSeed {
+    /// Borrow the raw seed bytes to build a VLD0 keypair. Callers must not copy
+    /// these into a non-zeroizing buffer.
+    pub fn as_bytes(&self) -> &[u8; CIRCLE_VEILID_OWNER_SEED_LEN] {
+        &self.0
+    }
+}
+
+impl core::fmt::Debug for CircleVeilidOwnerSeed {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("CircleVeilidOwnerSeed(<redacted>)")
+    }
+}
+
+/// Derive a circle's Veilid rendezvous-owner seed from shared entropy — the
+/// deterministic transport-address sibling of [`derive_cot_key`]. `entropy` is
+/// canonicalized identically (ISC-C9), so every member who agrees on the phrase
+/// derives the byte-identical owner seed, and thus the same rendezvous record
+/// key. Family-anchored (like the content key) so a cross-family rekey moves
+/// the rendezvous and the content key together.
+pub fn derive_circle_veilid_owner_seed(
+    entropy: &str,
+    suite: &Suite,
+) -> Result<CircleVeilidOwnerSeed, CircleKeyError> {
+    // Re-extract the same circle PRK (same salt + canonical entropy as
+    // derive_cot_key), then expand under the OWNER label — a sibling expansion,
+    // so neither the owner seed nor the content key is a function of the other.
+    let mut canonical = circle_canonicalize::canonicalize(entropy);
+    let extract = HkdfSha384::extract(Some(info::CIRCLE_KEY_SALT), canonical.as_bytes());
+    canonical.zeroize();
+    let hkdf = extract.map_err(CircleKeyError::Hkdf)?;
+
+    let info_str = info::circle_veilid_owner(suite.family_token());
+
+    let mut seed = [0u8; CIRCLE_VEILID_OWNER_SEED_LEN];
+    if let Err(e) = hkdf.expand(info_str.as_bytes(), &mut seed) {
+        seed.zeroize();
+        return Err(CircleKeyError::Hkdf(e));
+    }
+    let boxed = Box::new(seed);
+    seed.zeroize();
+    Ok(CircleVeilidOwnerSeed(boxed))
+}
+
 /// Length of the hex fingerprint body (excluding the leading `#`). 12 hex chars
 /// = 48 bits of the digest — enough for a human cross-check, short enough to
 /// read aloud.
@@ -265,5 +330,58 @@ mod tests {
         let _ = oxicrypt_module::initialize();
         let k = derive_cot_key("some entropy phrase here", &CNSA_2_0).unwrap();
         assert_eq!(format!("{k:?}"), "CircleKey(<redacted>)");
+    }
+
+    /// Phase 2 — the rendezvous-owner seed is deterministic: every member who
+    /// agrees on the phrase derives the byte-identical seed, hence the same DHT
+    /// rendezvous address.
+    #[test]
+    fn veilid_owner_seed_is_deterministic() {
+        let _ = oxicrypt_module::initialize();
+        let a = derive_circle_veilid_owner_seed(EXAMPLE_ENTROPY, &CNSA_2_0).unwrap();
+        let b = derive_circle_veilid_owner_seed(EXAMPLE_ENTROPY, &CNSA_2_0).unwrap();
+        assert_eq!(a.as_bytes(), b.as_bytes());
+    }
+
+    /// Phase 2 — it shares the ISC-C9 canonicalization, so incidental
+    /// whitespace / form differences between members collapse to the same seed.
+    #[test]
+    fn veilid_owner_seed_canonicalizes_entropy() {
+        let _ = oxicrypt_module::initialize();
+        let plain = derive_circle_veilid_owner_seed(EXAMPLE_ENTROPY, &CNSA_2_0).unwrap();
+        let messy =
+            derive_circle_veilid_owner_seed("  correct   horse battery staple  ", &CNSA_2_0)
+                .unwrap();
+        assert_eq!(plain.as_bytes(), messy.as_bytes());
+    }
+
+    /// Phase 2 — distinct phrases yield distinct rendezvous addresses (the
+    /// phrase is the sole distinguisher, mirroring ISC-C8).
+    #[test]
+    fn veilid_owner_seed_diverges_by_entropy() {
+        let _ = oxicrypt_module::initialize();
+        let a = derive_circle_veilid_owner_seed("phrase alpha", &CNSA_2_0).unwrap();
+        let b = derive_circle_veilid_owner_seed("phrase bravo", &CNSA_2_0).unwrap();
+        assert_ne!(a.as_bytes(), b.as_bytes());
+    }
+
+    /// Transport/content separation — the rendezvous-owner seed is a sibling of
+    /// the content key, not derived from it: for the same phrase the owner seed
+    /// bytes differ from the `cot_key` bytes. The DHT address is not a function
+    /// of the content key.
+    #[test]
+    fn veilid_owner_seed_differs_from_cot_key() {
+        let _ = oxicrypt_module::initialize();
+        let owner = derive_circle_veilid_owner_seed(EXAMPLE_ENTROPY, &CNSA_2_0).unwrap();
+        let cot = derive_cot_key(EXAMPLE_ENTROPY, &CNSA_2_0).unwrap();
+        assert_ne!(owner.as_bytes(), cot.as_bytes());
+    }
+
+    /// `Debug` never leaks the rendezvous-owner seed (ISC-A-C1).
+    #[test]
+    fn veilid_owner_seed_debug_is_redacted() {
+        let _ = oxicrypt_module::initialize();
+        let s = derive_circle_veilid_owner_seed("some entropy phrase here", &CNSA_2_0).unwrap();
+        assert_eq!(format!("{s:?}"), "CircleVeilidOwnerSeed(<redacted>)");
     }
 }

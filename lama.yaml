@@ -280,6 +280,12 @@ capabilities:
       (nonce||ciphertext||tag, domain-separated AAD) — the only path that
       produces CotFrame.payload bytes, making relay content-blindness a
       crypto guarantee not a policy (A-S2); open_message fails closed.
+      `derive_circle_veilid_owner_seed(entropy, suite)` is the Veilid-era
+      rendezvous-addressing sibling (a separate HKDF expansion of the same
+      circle PRK): a deterministic VLD0 owner seed from which every member
+      computes the same DHT rendezvous record key, the substrate-independent
+      analog of asset_address. Not a function of cot_key; content keys never
+      derive from transport material.
     crate: daemonseed-core
     modules:
       - daemonseed_core::circle::key

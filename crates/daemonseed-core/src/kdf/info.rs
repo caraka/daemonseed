@@ -124,6 +124,22 @@ pub fn circle(family: &str) -> String {
     CIRCLE_TEMPLATE.replace("{family}", family)
 }
 
+/// HKDF info-string template for a circle's **Veilid rendezvous-owner** seed
+/// (Phase 2 transport). A sibling of [`CIRCLE_TEMPLATE`]: the same circle PRK is
+/// expanded under this distinct label to a VLD0 (Ed25519) owner seed, so the
+/// transport rendezvous address is NOT a function of the content `cot_key` —
+/// neither key derives from the other. Family-anchored like the content key, so
+/// a cross-family rekey moves rendezvous + content together (the circle-rekey
+/// event, ISC-A-C8). Content NEVER derives from this — it binds only the DHT
+/// record-owner / rendezvous address.
+const CIRCLE_VEILID_OWNER_TEMPLATE: &str = "daemonseed/veilid/circle-owner/{family}";
+
+/// Build the circle Veilid rendezvous-owner HKDF info string for a
+/// crypto-family token.
+pub fn circle_veilid_owner(family: &str) -> String {
+    CIRCLE_VEILID_OWNER_TEMPLATE.replace("{family}", family)
+}
+
 // ── Public rooms (ISC-S4 / ISC-S22) ─────────────────────────────────────────
 
 /// HKDF salt for the **global shared** public-room key (ISC-S22). A fixed
@@ -206,5 +222,18 @@ mod tests {
     fn circle_info_string_is_pinned() {
         assert_eq!(CIRCLE_KEY_SALT, b"daemonseed/v1/circle-key");
         assert_eq!(circle("hkdf-sha384"), "daemonseed/circle/hkdf-sha384");
+    }
+
+    /// **Spec contract (Phase 2 transport)** — the circle Veilid-owner info
+    /// string is protocol-visible: every member derives the same rendezvous
+    /// address only if these bytes match. It is distinct from [`circle`] so the
+    /// rendezvous owner seed and the content `cot_key` never collide.
+    #[test]
+    fn circle_veilid_owner_info_string_is_pinned() {
+        assert_eq!(
+            circle_veilid_owner("hkdf-sha384"),
+            "daemonseed/veilid/circle-owner/hkdf-sha384"
+        );
+        assert_ne!(circle_veilid_owner("hkdf-sha384"), circle("hkdf-sha384"));
     }
 }

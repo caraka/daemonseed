@@ -2283,10 +2283,24 @@ types:
   - name: CircleKeyError
     module: daemonseed_core::circle::key
     kind: enum
-    description: Failure modes for derive_cot_key.
+    description: Failure modes for derive_cot_key and derive_circle_veilid_owner_seed.
     variants:
       - name: Hkdf
         description: "Hkdf(oxicrypt_kdf::KdfError) — HKDF derivation failed."
+
+  - name: CircleVeilidOwnerSeed
+    module: daemonseed_core::circle::key
+    kind: struct
+    description: >-
+      A circle's deterministic 32-byte Veilid rendezvous-owner seed (VLD0 /
+      Ed25519). A sibling of CircleKey from the same circle PRK under a distinct
+      label, so the DHT rendezvous address is not a function of the content key.
+      Every member derives the same seed, hence the same DHT record key.
+      ZeroizeOnDrop; Debug redacted to `CircleVeilidOwnerSeed(<redacted>)`.
+      as_bytes borrows the raw seed.
+    security:
+      contains_secret: true
+      zeroize_on_drop: true
 
   - name: MessageError
     module: daemonseed_core::circle::message
@@ -5043,6 +5057,47 @@ functions:
     returns:
       type: CircleKey
       description: The zeroizing key wrapper.
+
+  - name: derive_circle_veilid_owner_seed
+    module: daemonseed_core::circle::key
+    description: >-
+      Derive a circle's deterministic Veilid rendezvous-owner seed from shared
+      entropy — the transport-address sibling of derive_cot_key. Canonicalizes
+      entropy (ISC-C9) then HKDF-SHA-384(salt=CIRCLE_KEY_SALT, ikm=canonical) ->
+      expand(info="daemonseed/veilid/circle-owner/<family>"). Family-anchored
+      like the content key, so a cross-family rekey moves rendezvous and content
+      together. Every member who agrees on the phrase derives the byte-identical
+      owner seed, hence the same DHT rendezvous record key. Not a function of,
+      and not derived from, the cot_key.
+    signature: "pub fn derive_circle_veilid_owner_seed(entropy: &str, suite: &Suite) -> Result<CircleVeilidOwnerSeed, CircleKeyError>"
+    parameters:
+      - name: entropy
+        type: "&str"
+        direction: in
+        description: The shared circle phrase (the sole circle secret).
+      - name: suite
+        type: "&Suite"
+        direction: in
+        description: The suite whose family anchors the derivation.
+    returns:
+      type: "Result<CircleVeilidOwnerSeed, CircleKeyError>"
+      description: The derived 32-byte VLD0 rendezvous-owner seed.
+      error_variants:
+        - name: Hkdf
+          condition: HKDF derivation failed.
+    preconditions:
+      - description: The oxicrypt module must be operational.
+
+  - name: CircleVeilidOwnerSeed::as_bytes
+    module: daemonseed_core::circle::key
+    description: >-
+      Borrow the raw 32-byte seed to build a VLD0 keypair; callers must not copy
+      into a non-zeroizing buffer.
+    signature: "pub fn as_bytes(&self) -> &[u8; CIRCLE_VEILID_OWNER_SEED_LEN]"
+    parameters: []
+    returns:
+      type: "&[u8; CIRCLE_VEILID_OWNER_SEED_LEN]"
+      description: A borrow of the raw 32-byte rendezvous-owner seed.
 
   - name: circle_fingerprint
     module: daemonseed_core::circle::key
