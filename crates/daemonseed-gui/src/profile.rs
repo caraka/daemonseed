@@ -160,6 +160,26 @@ impl Profile {
         Ok(removed)
     }
 
+    /// (#93) The per-relay last-seen announcements/MOTD content hash for
+    /// `server_id`, or `None` if this relay was never marked seen.
+    pub fn announce_seen(&self, server_id: &str) -> Option<&str> {
+        self.seeds.announce_seen(server_id)
+    }
+
+    /// (#93) Record `hash` as the last-seen announcements/MOTD content hash for
+    /// `server_id` and re-seal the blob to disk (unread-gating write-through).
+    /// Returns `Ok(true)` if the stored value changed, `Ok(false)` if unchanged
+    /// (idempotent — no re-seal). A disk / seal failure is surfaced as
+    /// `Err(reason)`; the unread state is non-critical, so the caller decides how
+    /// loud to be.
+    pub fn persist_announce_seen(&mut self, server_id: &str, hash: &str) -> Result<bool, String> {
+        let changed = self.seeds.set_announce_seen(server_id, hash);
+        if changed {
+            self.reseal()?;
+        }
+        Ok(changed)
+    }
+
     /// #66: rename this identity — set a new display name in the at-rest blob and
     /// re-seal it (M13 write-through), so the chosen name persists across unlock.
     /// Also the recovery path for a profile created nameless before #65: it sets a

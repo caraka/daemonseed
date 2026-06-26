@@ -1313,6 +1313,16 @@ types:
           remove_published / published. Client-local persistence of intent only — the
           relay stays RAM-only (ISC-S20); the client re-asserts each root once
           reconnected. Debug surfaces only the count.
+      - name: announce_seen
+        type: "BTreeMap<String, String>"
+        description: >-
+          Per-relay last-seen announcements/MOTD content hash (#93 unread-gating),
+          keyed by server_id -> the client-derived combined content hash (hex),
+          serialized as the additive `announce-seen <server_id> <hex_hash>` directive
+          (both tokens whitespace-free; a malformed line is skipped). Mutate via
+          set_announce_seen / announce_seen. Client-local only — no wire message
+          carries it (ISC-A-C3); persistence of read-state, not content. Debug
+          surfaces only the count.
     security:
       contains_secret: true
       zeroize_on_drop: true
@@ -3815,6 +3825,43 @@ functions:
     returns:
       type: bool
       description: True if the label changed.
+
+  - name: "Seeds::announce_seen"
+    module: daemonseed_core::storage::seeds
+    description: >-
+      The per-relay last-seen announcements/MOTD content hash for server_id (#93),
+      or None if this relay was never marked seen.
+    signature: "pub fn announce_seen(&self, server_id: &str) -> Option<&str>"
+    parameters:
+      - name: server_id
+        type: "&str"
+        direction: in
+        description: The relay whose last-seen hash to read.
+    returns:
+      type: "Option<&str>"
+      description: The stored hex content hash if this relay was marked seen.
+
+  - name: "Seeds::set_announce_seen"
+    module: daemonseed_core::storage::seeds
+    description: >-
+      Record hash as the last-seen announcements/MOTD content hash for server_id
+      (#93 unread-gating). Returns true if the stored value changed. Refuses a
+      server_id or hash containing whitespace or a line break — the single-line
+      two-token `announce-seen` directive would otherwise become ambiguous or inject
+      a spurious directive.
+    signature: "pub fn set_announce_seen(&mut self, server_id: impl Into<String>, hash: impl Into<String>) -> bool"
+    parameters:
+      - name: server_id
+        type: "impl Into<String>"
+        direction: in
+        description: The relay the marker is keyed by.
+      - name: hash
+        type: "impl Into<String>"
+        direction: in
+        description: The client-derived combined content hash (hex).
+    returns:
+      type: bool
+      description: True iff the stored value changed (and both tokens were whitespace-free).
 
   # ── storage::recovery_file ──────────────────────────────────────────
   - name: "recovery_file::seal"

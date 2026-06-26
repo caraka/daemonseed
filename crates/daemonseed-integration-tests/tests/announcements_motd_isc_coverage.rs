@@ -221,3 +221,28 @@ fn isc_c92_covered() {
         "ISC-C92 registered (signer-gated composer)"
     );
 }
+
+// ── #93 unread-gated announcements/MOTD landing (ISC-C93) ──────────────────
+//
+// The pure landing logic (`daemonseed_gui::state::{combined_content_hash,
+// landing_decision}`) is unit-tested IN the gui crate (a binary crate, so its
+// `pub` does not escape to this integration crate): `landing_decision_covers_all_cases`
+// proves the no-stored→open / changed→open / equal→Lobby table, and
+// `viewing_updates_stored_hash_then_bypasses` proves a viewed hash bypasses next
+// time. This registration records the coverage; the Slint auto-land + Seeds
+// write-through wiring is felt-test-gated (ISA `## Criteria` ISC-C93 left `[ ]`).
+
+/// ISC-C93: on connect the client computes a single combined hash of the relay's
+/// verified MOTD + announcements and compares it to a per-relay last-seen hash;
+/// a mismatch (or no stored hash) opens the announcements pane, an exact match
+/// opens the Lobby; viewing updates the stored hash (D5).
+#[test]
+fn isc_c93_covered() {
+    let mut c = Coverage::empty();
+    c.register("ISC-C93", "landing_decision_covers_all_cases");
+    assert_eq!(
+        c.covered_count(),
+        1,
+        "ISC-C93 registered (unread-gated landing)"
+    );
+}

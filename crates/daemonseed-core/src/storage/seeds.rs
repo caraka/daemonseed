@@ -175,6 +175,10 @@ impl CounterState {
 ///   re-index on next launch (ISC-C21 persistence, M14); both fields
 ///   hex-encoded (an empty label hex means "no label"). Client-local only —
 ///   no wire message carries it (ISC-A-C3).
+/// - `announce-seen <server_id> <hex_hash>` — the per-relay last-seen
+///   announcements/MOTD content hash (#93 unread-gating). Both tokens are
+///   whitespace-free, so the two-token split is unambiguous; a malformed line is
+///   skipped. Client-local only — no wire message carries it (ISC-A-C3).
 ///
 /// A bare-phrase payload (no extra lines, the legacy form) parses with default
 /// counters and empty lists, so existing blobs open without re-enrollment.
@@ -231,6 +235,14 @@ pub struct Seeds {
     /// re-asserts each published root once reconnected, so ephemerality is
     /// unchanged. Mutate via [`Self::add_published`] / [`Self::remove_published`].
     pub published: Vec<PublishedShare>,
+    /// Per-relay last-seen announcements/MOTD content hash (#93 unread-gating),
+    /// keyed by `server_id` → the client-derived combined content hash (hex). On
+    /// connect the client compares the current relay content hash to this marker
+    /// to decide whether to auto-open the announcements pane (new news) or the
+    /// Lobby (already seen). Default empty. Client-local only — no wire message
+    /// carries it (ISC-A-C3); it is persistence of read-state, not of content.
+    /// Mutate via [`Self::set_announce_seen`] / read via [`Self::announce_seen`].
+    pub announce_seen: BTreeMap<String, String>,
 }
 
 /// One remembered local share root in the at-rest blob (ISC-C21 persistence,
@@ -295,6 +307,7 @@ impl core::fmt::Debug for Seeds {
             .field("circles", &self.circles.len())
             .field("shares", &self.shares.len())
             .field("published", &self.published.len())
+            .field("announce_seen", &self.announce_seen.len())
             .finish()
     }
 }
@@ -312,6 +325,7 @@ impl Seeds {
             circles: Vec::new(),
             shares: Vec::new(),
             published: Vec::new(),
+            announce_seen: BTreeMap::new(),
         }
     }
 
@@ -486,6 +500,39 @@ impl Seeds {
         self.published.len() != before
     }
 
+    /// The per-relay last-seen announcements/MOTD content hash for `server_id`
+    /// (#93), or `None` if this relay was never marked seen.
+    pub fn announce_seen(&self, server_id: &str) -> Option<&str> {
+        self.announce_seen.get(server_id).map(String::as_str)
+    }
+
+    /// Record `hash` as the last-seen announcements/MOTD content hash for
+    /// `server_id` (#93 unread-gating). Returns `true` if the stored value
+    /// changed, `false` if unchanged (idempotent) or rejected.
+    ///
+    /// Refuses a `server_id` or `hash` containing whitespace or a line break: the
+    /// `announce-seen <server_id> <hash>` directive is a single, two-token line, so
+    /// a space would make the split ambiguous and a `\n`/`\r` would inject a
+    /// spurious directive and corrupt the blob on the next open — same integrity
+    /// rule as [`Self::add_mute`]. A server_id (`name#hex`) and a hex hash never
+    /// contain whitespace, so a well-formed marker is always accepted.
+    pub fn set_announce_seen(
+        &mut self,
+        server_id: impl Into<String>,
+        hash: impl Into<String>,
+    ) -> bool {
+        let server_id = server_id.into();
+        let hash = hash.into();
+        if server_id.contains([' ', '\t', '\n', '\r']) || hash.contains([' ', '\t', '\n', '\r']) {
+            return false;
+        }
+        if self.announce_seen.get(&server_id).map(String::as_str) == Some(hash.as_str()) {
+            return false;
+        }
+        self.announce_seen.insert(server_id, hash);
+        true
+    }
+
     fn to_plaintext(&self) -> String {
         let mut s = self.mnemonic.to_phrase();
         if self.counters.send_counter != 0 {
@@ -540,6 +587,13 @@ impl Seeds {
                 None => s.push_str(&format!("\npublish {}", hex::encode(ps.root.as_bytes()))),
             }
         }
+        // Per-relay last-seen announcements/MOTD hash (#93): one line per entry,
+        // `announce-seen <server_id> <hex_hash>`. Both tokens are whitespace-free
+        // (guarded at the setter), so a two-token split round-trips; the BTreeMap
+        // iterates in deterministic key order. Client-local only (ISC-A-C3).
+        for (server_id, hash) in &self.announce_seen {
+            s.push_str(&format!("\nannounce-seen {server_id} {hash}"));
+        }
         s
     }
 
@@ -554,6 +608,7 @@ impl Seeds {
         let mut circles: Vec<PersistedCircle> = Vec::new();
         let mut shares: Vec<PersistedShare> = Vec::new();
         let mut published: Vec<PublishedShare> = Vec::new();
+        let mut announce_seen: BTreeMap<String, String> = BTreeMap::new();
         for line in lines {
             // Mute / hide directives take the entire rest of the line as the
             // handle so a display name containing spaces is never truncated.
@@ -624,6 +679,16 @@ impl Seeds {
                 published.push(PublishedShare { root, name });
                 continue;
             }
+            // Per-relay last-seen announcements/MOTD hash (#93):
+            // `announce-seen <server_id> <hex_hash>`. A malformed line (missing the
+            // second token) is SKIPPED, not fatal — matching the directive scheme's
+            // additive tolerance; an older blob with no such line parses to empty.
+            if let Some(rest) = line.strip_prefix("announce-seen ") {
+                if let Some((server_id, hash)) = rest.split_once(' ') {
+                    announce_seen.insert(server_id.to_string(), hash.to_string());
+                }
+                continue;
+            }
             let mut parts = line.splitn(3, ' ');
             match parts.next() {
                 Some("send-counter") => {
@@ -648,6 +713,7 @@ impl Seeds {
             circles,
             shares,
             published,
+            announce_seen,
         })
     }
 }
@@ -1433,6 +1499,55 @@ mod tests {
         assert_eq!(pubs[0].name.as_deref(), Some("Summer 2026"));
         assert_eq!(pubs[1].root, "/srv/docs");
         assert_eq!(pubs[1].name, None);
+    }
+
+    #[test]
+    fn announce_seen_round_trips_through_blob() {
+        // #93 oracle. A per-relay last-seen announcements/MOTD hash survives a
+        // seal/open round-trip, the setter is idempotent on an unchanged value,
+        // and whitespace/line-break inputs are refused (blob-integrity).
+        ensure_oxicrypt_initialized();
+        let pid = Uuid::new_v4();
+        let pp = "correct horse battery staple table mountain";
+        let mut seeds = fresh_seeds();
+        assert_eq!(seeds.announce_seen("fra1#06177b08dc06"), None);
+        assert!(seeds.set_announce_seen("fra1#06177b08dc06", "deadbeefcafe"));
+        // Idempotent: re-setting the same value reports no change.
+        assert!(!seeds.set_announce_seen("fra1#06177b08dc06", "deadbeefcafe"));
+        // A new value for the same relay overwrites.
+        assert!(seeds.set_announce_seen("fra1#06177b08dc06", "00112233"));
+        // A second relay is tracked independently.
+        assert!(seeds.set_announce_seen("nyc1#aabbccdd0011", "feedface"));
+        // Whitespace / line breaks in either token are rejected (would break the
+        // single-line two-token directive).
+        assert!(!seeds.set_announce_seen("srv#x", "bad hash"));
+        assert!(!seeds.set_announce_seen("srv\n#x", "abcd"));
+
+        let blob = seal(&seeds, pp, pid, test_params()).unwrap();
+        let recovered = open(&blob, pp, pid, test_params()).unwrap().seeds;
+        assert_eq!(
+            recovered.announce_seen("fra1#06177b08dc06"),
+            Some("00112233")
+        );
+        assert_eq!(
+            recovered.announce_seen("nyc1#aabbccdd0011"),
+            Some("feedface")
+        );
+        assert_eq!(recovered.announce_seen("unknown#relay"), None);
+    }
+
+    #[test]
+    fn absent_announce_seen_directive_parses_empty() {
+        // A blob with no `announce-seen` line (the legacy / typical form) parses
+        // with an empty map — the directive is additive and backward-compatible.
+        ensure_oxicrypt_initialized();
+        let pid = Uuid::new_v4();
+        let pp = "correct horse battery staple table mountain";
+        let seeds = fresh_seeds();
+        assert!(!seeds.to_plaintext().contains("announce-seen"));
+        let blob = seal(&seeds, pp, pid, test_params()).unwrap();
+        let recovered = open(&blob, pp, pid, test_params()).unwrap().seeds;
+        assert_eq!(recovered.announce_seen("anything"), None);
     }
 
     #[test]

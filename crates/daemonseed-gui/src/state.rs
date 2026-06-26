@@ -118,6 +118,83 @@ pub fn build_announcements_view(
     }
 }
 
+// ── Unread-gated landing (#93 / D5) ──────────────────────────────────────────
+
+/// Domain-separation prefix for the #93 combined content hash. Bump the tag on
+/// any change to the canonical encoding in [`combined_content_hash`].
+const ANNOUNCE_HASH_DOMAIN: &[u8] = b"daemonseed/announce-hash/v1\0";
+
+/// Compute the single combined content hash of a verified announcements/MOTD
+/// view (#93) — the client-derived unread marker.
+///
+/// Deterministic and server-order-independent: the MOTD (the empty string when
+/// `None`) and the posts in a **canonical sort order** (`(topic, sent_unix_ms,
+/// body)`) are folded into a length-prefixed, domain-separated buffer so no field
+/// concatenation is ambiguous, then hashed with SHA-384
+/// ([`content_address`](daemonseed_core::public_space::content_address)) and
+/// rendered as lowercase hex. Identical content ⇒ identical hash; any change — a
+/// MOTD edit, a post added / removed / edited — ⇒ a different hash; a reorder of
+/// the relay's served posts ⇒ the **same** hash. The value is a stable,
+/// collision-resistant local marker only, never a wire artifact: it is compared
+/// solely to the per-relay marker persisted in
+/// [`Seeds`](daemonseed_core::storage::seeds::Seeds).
+pub fn combined_content_hash(view: &AnnouncementsView) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(ANNOUNCE_HASH_DOMAIN);
+
+    // MOTD: length-prefixed so an empty MOTD and an empty first post can't alias.
+    let motd = view.motd.as_deref().unwrap_or("");
+    buf.extend_from_slice(&(motd.len() as u64).to_le_bytes());
+    buf.extend_from_slice(motd.as_bytes());
+
+    // Posts in canonical order: the relay's served order must not change the hash.
+    let mut rows: Vec<&AnnouncementRow> = view.posts.iter().collect();
+    rows.sort_by(|a, b| {
+        a.topic
+            .cmp(&b.topic)
+            .then(a.sent_unix_ms.cmp(&b.sent_unix_ms))
+            .then(a.body.cmp(&b.body))
+    });
+    buf.extend_from_slice(&(rows.len() as u64).to_le_bytes());
+    for r in rows {
+        buf.extend_from_slice(&(r.topic.len() as u64).to_le_bytes());
+        buf.extend_from_slice(r.topic.as_bytes());
+        buf.extend_from_slice(&r.sent_unix_ms.to_le_bytes());
+        buf.extend_from_slice(&(r.body.len() as u64).to_le_bytes());
+        buf.extend_from_slice(r.body.as_bytes());
+    }
+
+    // `content_address` = SHA-384(buf); its `Display` is lowercase hex. The only
+    // error path is SHA-384's power-up self-test not having passed yet (the first
+    // crypto call in a fresh process) — unreachable once the client has initialized
+    // oxicrypt at startup. The empty fallback only appears pre-init and never
+    // collides with a real digest in practice.
+    daemonseed_core::public_space::content_address(&buf)
+        .map(|a| a.to_string())
+        .unwrap_or_default()
+}
+
+/// Where the client lands the user after a **connect-time** public-space fetch
+/// (#93 / D5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Landing {
+    /// Auto-open the announcements/MOTD pane — there is unread news.
+    Announcements,
+    /// Open the Lobby — the user has already seen this exact content.
+    Lobby,
+}
+
+/// Decide the connect-time landing (#93 / D5) from the per-relay stored hash and
+/// the freshly-computed current hash. No stored hash (a first arrival) OR a
+/// mismatch (content changed since last seen) ⇒ [`Landing::Announcements`]; an
+/// exact match (already seen this version) ⇒ [`Landing::Lobby`].
+pub fn landing_decision(stored_hash: Option<&str>, current_hash: &str) -> Landing {
+    match stored_hash {
+        Some(h) if h == current_hash => Landing::Lobby,
+        _ => Landing::Announcements,
+    }
+}
+
 /// One chat message in a circle's stub transcript.
 #[derive(Clone, Debug)]
 pub struct Msg {
@@ -293,6 +370,29 @@ impl GuiState {
         self.profile
             .as_ref()
             .and_then(|p| p.stable_signing_key().ok())
+    }
+
+    /// (#93) The per-relay last-seen announcements/MOTD content hash for
+    /// `server_id`, read from the unlocked profile's blob. `None` on the ephemeral
+    /// (no-profile) path or when this relay has never been marked seen. Returns an
+    /// owned `String` so the caller does not hold a borrow across the subsequent
+    /// `persist_announce_seen` write-through.
+    pub fn announce_seen_hash(&self, server_id: &str) -> Option<String> {
+        self.profile
+            .as_ref()
+            .and_then(|p| p.announce_seen(server_id).map(str::to_owned))
+    }
+
+    /// (#93) Write-through: record `hash` as the last-seen announcements/MOTD
+    /// content hash for `server_id` and re-seal the blob, so the unread gate
+    /// bypasses this exact content next connect. A no-op (`Ok`) on the ephemeral
+    /// (no-profile) path or when the value is unchanged; a disk / seal failure is
+    /// surfaced as `Err(reason)`.
+    pub fn persist_announce_seen(&mut self, server_id: &str, hash: &str) -> Result<(), String> {
+        match self.profile.as_mut() {
+            Some(p) => p.persist_announce_seen(server_id, hash).map(|_| ()),
+            None => Ok(()),
+        }
     }
 
     /// #66: rename the unlocked identity — set a new display name and re-seal the
@@ -842,6 +942,92 @@ mod tests {
         let view = build_announcements_view(&motd, &posts, &whitelist, server.public_key());
         assert!(view.motd.is_none(), "an unverifiable MOTD is hidden");
         assert!(view.posts.is_empty());
+    }
+
+    // ── #93 unread-gated landing (ISC-C93) ───────────────────────────────────
+
+    fn ann_view(motd: Option<&str>, posts: &[(&str, &str, i64)]) -> AnnouncementsView {
+        AnnouncementsView {
+            motd: motd.map(str::to_owned),
+            posts: posts
+                .iter()
+                .map(|(topic, body, ts)| AnnouncementRow {
+                    topic: (*topic).to_owned(),
+                    body: (*body).to_owned(),
+                    sent_unix_ms: *ts,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn landing_decision_covers_all_cases() {
+        // No stored hash (a first arrival) → open the pane.
+        assert_eq!(landing_decision(None, "abc"), Landing::Announcements);
+        // Stored ≠ current (content changed since last seen) → open the pane.
+        assert_eq!(landing_decision(Some("old"), "new"), Landing::Announcements);
+        // Stored == current (already seen this exact version) → Lobby.
+        assert_eq!(landing_decision(Some("same"), "same"), Landing::Lobby);
+    }
+
+    #[test]
+    fn viewing_updates_stored_hash_then_bypasses() {
+        // Mirrors the GUI write-through: a first arrival lands on the pane; once the
+        // current hash is stored (the "viewing updates the stored hash" step), the
+        // next decision for the SAME content is Lobby (bypassed).
+        let _ = oxicrypt_module::initialize();
+        let view = ann_view(Some("relay is up"), &[("announcements", "v2", 5)]);
+        let current = combined_content_hash(&view);
+
+        let mut seeds = daemonseed_core::storage::seeds::Seeds::new(
+            daemonseed_core::identity::mnemonic::Mnemonic::generate().unwrap(),
+        );
+        assert_eq!(
+            landing_decision(seeds.announce_seen("fra1#abc"), &current),
+            Landing::Announcements,
+            "first arrival opens the pane"
+        );
+        assert!(seeds.set_announce_seen("fra1#abc", current.clone()));
+        assert_eq!(
+            landing_decision(seeds.announce_seen("fra1#abc"), &current),
+            Landing::Lobby,
+            "after viewing, the same content is bypassed to the Lobby"
+        );
+    }
+
+    #[test]
+    fn combined_content_hash_is_stable_order_independent_and_change_sensitive() {
+        let _ = oxicrypt_module::initialize();
+        let base = ann_view(Some("relay is up"), &[("a", "x", 1)]);
+        let h0 = combined_content_hash(&base);
+        // Same content (rebuilt) → identical hash.
+        assert_eq!(h0, combined_content_hash(&base.clone()));
+
+        // MOTD edit → different hash.
+        let motd_edit = ann_view(Some("maintenance soon"), &[("a", "x", 1)]);
+        assert_ne!(h0, combined_content_hash(&motd_edit));
+        // MOTD removed → different hash.
+        let motd_gone = ann_view(None, &[("a", "x", 1)]);
+        assert_ne!(h0, combined_content_hash(&motd_gone));
+
+        // A post added → different hash.
+        let added = ann_view(Some("relay is up"), &[("a", "x", 1), ("b", "y", 2)]);
+        assert_ne!(h0, combined_content_hash(&added));
+        // A post removed → different hash.
+        let removed = ann_view(Some("relay is up"), &[]);
+        assert_ne!(h0, combined_content_hash(&removed));
+        // A post edited → different hash.
+        let edited = ann_view(Some("relay is up"), &[("a", "x!", 1)]);
+        assert_ne!(h0, combined_content_hash(&edited));
+
+        // Reordered served posts (same set) → SAME hash (canonical sort).
+        let ordered = ann_view(Some("relay is up"), &[("a", "x", 1), ("b", "y", 2)]);
+        let reversed = ann_view(Some("relay is up"), &[("b", "y", 2), ("a", "x", 1)]);
+        assert_eq!(
+            combined_content_hash(&ordered),
+            combined_content_hash(&reversed),
+            "server post order must not change the unread marker"
+        );
     }
 
     #[test]

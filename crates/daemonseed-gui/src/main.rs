@@ -52,7 +52,9 @@ use share_browser::{FetchTarget, ManifestRow, NodeKind, ShareBrowser};
 use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType, Rgb565Pixel};
 use slint::platform::{Platform, PlatformError, WindowAdapter};
 use slint::{ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel};
-use state::{AnnouncementsView, CircleState, GuiState, Msg};
+use state::{
+    AnnouncementsView, CircleState, GuiState, Landing, Msg, combined_content_hash, landing_decision,
+};
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -244,6 +246,9 @@ fn format_unix_ms(ms: i64) -> String {
     let year = if m <= 2 { y + 1 } else { y };
     format!("{year:04}-{m:02}-{d:02} {hh:02}:{mm:02} UTC")
 }
+
+/// The rail index of the announcements/MOTD pane tab (#91 pane, #93 landing).
+const ANNOUNCEMENTS_TAB: i32 = 3;
 
 /// Convert the verified announcements view (#91) into a Slint `[AnnouncementRow]`.
 /// Only client-re-verified posts are ever in `view` (ISC-A-S3), so the whole model
@@ -1369,9 +1374,41 @@ fn apply_net_event(
         NetEvent::SharesError { message } => {
             ui.set_share_status(SharedString::from(message));
         }
-        // ── Announcements + MOTD pane (#91/#92) ──
-        NetEvent::PublicSpaceSnapshot { view, can_compose } => {
+        // ── Announcements + MOTD pane (#91/#92) + unread-gated landing (#93) ──
+        NetEvent::PublicSpaceSnapshot {
+            view,
+            can_compose,
+            connect_time,
+        } => {
             apply_announcements(ui, &view, can_compose);
+            // #93: the client-derived combined content hash is the unread marker.
+            let current = combined_content_hash(&view);
+            let server_id = relay_target().0;
+            // Auto-land on the announcements pane ONLY for the connect-time fetch
+            // (a manual Refresh / poll / post-upload refresh must never yank the
+            // user away): open the pane (tab 3) when the content changed since last
+            // seen OR was never seen; otherwise stay where we are (the Lobby).
+            if connect_time {
+                let stored = state.borrow().announce_seen_hash(&server_id);
+                if matches!(
+                    landing_decision(stored.as_deref(), &current),
+                    Landing::Announcements
+                ) {
+                    ui.set_active_tab(ANNOUNCEMENTS_TAB);
+                }
+            }
+            // Viewing the pane marks this content seen: if the announcements pane is
+            // the active tab now — whether the user opened it or the unread gate just
+            // did — persist the current hash + re-seal (idempotent: a no-op when
+            // unchanged or on the ephemeral no-profile path). A persist failure is
+            // non-fatal; surface it quietly in the pane's status line.
+            if ui.get_active_tab() == ANNOUNCEMENTS_TAB
+                && let Err(message) = state
+                    .borrow_mut()
+                    .persist_announce_seen(&server_id, &current)
+            {
+                ui.set_announce_status(SharedString::from(message));
+            }
         }
         NetEvent::PublicSpaceError { message } => {
             ui.set_announce_status(SharedString::from(message));

@@ -19,7 +19,7 @@
 //!
 //! - 57 server-side: 32 positive (`ISC-S*`) + 25 negative (`ISC-A-S*`)
 //!   (S31 added the #89 UploadMotd in-band signer-set MOTD)
-//! - 117 client-side: 81 positive (`ISC-C*`) + 36 negative (`ISC-A-C*`)
+//! - 118 client-side: 82 positive (`ISC-C*`) + 36 negative (`ISC-A-C*`)
 //!   (M16 A1 added C66 manifest-preview + A-C33 no-blind-download, A2 added C67 selective-fetch,
 //!   A3 added C68 choose-download-dir, A4 added C72 collapsible-folder-tree preview, C1 added C69
 //!   multi-share-publish, C2 added C70 status-auto-clear, C3 added C71 generate-circle-phrase;
@@ -36,8 +36,9 @@
 //!   A-C41 presence replay-freshness; C88 + A-C42 GUI Lobby roster;
 //!   C89/C90 client signer authoring + self-determination;
 //!   C91 GUI announcement + MOTD display panes;
-//!   C92 signer-gated MOTD/announcement composer.)
-//! - 174 total
+//!   C92 signer-gated MOTD/announcement composer;
+//!   C93 unread-gated announcements/MOTD landing.)
+//! - 175 total
 //!
 //! Deliberately EXCLUDED from [`ISCS`] (and therefore from [`TOTAL`]) because
 //! they are not built: the deferred direct-messaging family
@@ -223,6 +224,8 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-C91", IscClass::Positive),
     // ── client positive (#92: signer-gated MOTD/announcement composer) ──
     ("ISC-C92", IscClass::Positive),
+    // ── client positive (#93: unread-gated announcements/MOTD landing) ──
+    ("ISC-C93", IscClass::Positive),
     // ── client negative (20) ────────────────────────────────────────────
     ("ISC-A-C1", IscClass::Negative),
     ("ISC-A-C2", IscClass::Negative),
@@ -273,7 +276,7 @@ pub const ISCS: &[(&str, IscClass)] = &[
 /// of truth for the coverage denominator, read live by `xtask isc-coverage`.
 /// Recount on every ISC add/remove (the `const _` assert below guards it
 /// against [`ISCS`]).
-pub const TOTAL: usize = 174;
+pub const TOTAL: usize = 175;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -302,14 +305,14 @@ pub const MILESTONE_COVERED: &[(&str, usize)] = &[
     ("M7", 5),
     ("M12", 0),
     ("alpha2", 28),
-    ("alpha3", 5),
+    ("alpha3", 6),
 ];
 
 /// Distinct ISCs covered by a registered integration test — the SINGLE source
 /// of truth for the coverage numerator, read live by `xtask isc-coverage`
 /// (it replaced a hand-maintained `COVERED_ISCS` mirror in xtask). Equals the
 /// sum of [`MILESTONE_COVERED`] (guarded by `covered_sum_matches`).
-pub const COVERED: usize = 105;
+pub const COVERED: usize = 106;
 
 const _: () = assert!(
     COVERED <= TOTAL,
@@ -437,9 +440,10 @@ mod tests {
         //                                  in-band UploadMotd S31 pos, #89;
         //                                  client signer authoring C89 + self-determination C90 pos, #90;
         //                                  GUI announcement + MOTD display panes C91 pos, #91;
-        //                                  signer-gated MOTD/announcement composer C92 pos, #92)
-        //   total   113 pos + 61 neg = 174
-        assert_eq!(pos, 113, "positive count drift");
+        //                                  signer-gated MOTD/announcement composer C92 pos, #92;
+        //                                  unread-gated announcements/MOTD landing C93 pos, #93)
+        //   total   114 pos + 61 neg = 175
+        assert_eq!(pos, 114, "positive count drift");
         assert_eq!(neg, 61, "negative count drift");
     }
 

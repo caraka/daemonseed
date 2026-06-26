@@ -30,6 +30,7 @@ work lives in the project lead's vault manifest, not here.
 - cli/public_space: client signer authoring (`sign_post`/`sign_motd`/`sign_post_delete`) + signer self-determination (`local_key_is_whitelisted`) (#90)
 - gui: announcement + MOTD display panes — relay MOTD (verbatim) + announcements list, client-re-verified (#91)
 - gui/tui: signer-gated MOTD/announcement composer — shown only when the local identity key is on the relay's published whitelist; signs + uploads via UploadMotd/UploadPost (#92)
+- gui: unread-gated landing — auto-open the Announcements pane on connect when the relay's MOTD/announcements changed since last seen (per-relay client-derived hash), else the Lobby (#93)
 
 ## [0.31.1] — 2026-06-25
 
