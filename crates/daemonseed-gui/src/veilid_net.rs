@@ -24,9 +24,7 @@
 //! (already local-echoed on send) are suppressed by sender-handle match, matching
 //! the relay actor's `mine` de-dup.
 
-use daemonseed_core::circle::key::{
-    CircleKey, derive_circle_veilid_owner_seed, derive_cot_key,
-};
+use daemonseed_core::circle::key::{CircleKey, derive_circle_veilid_owner_seed, derive_cot_key};
 use daemonseed_core::circle::message::{open_message, seal_message};
 use daemonseed_core::cot::{AssetAddr, asset_address};
 use daemonseed_core::crypto::suite::CNSA_2_0;
@@ -88,9 +86,7 @@ pub async fn veilid_net_actor(
 
 /// Await the optional Veilid event receiver. The `if ev_rx.is_some()` guard on
 /// the select arm ensures this is only polled when `Some`, so the `unwrap` holds.
-async fn recv_opt(
-    ev_rx: &mut Option<UnboundedReceiver<VeilidNetEvent>>,
-) -> Option<VeilidNetEvent> {
+async fn recv_opt(ev_rx: &mut Option<UnboundedReceiver<VeilidNetEvent>>) -> Option<VeilidNetEvent> {
     ev_rx.as_mut().unwrap().recv().await
 }
 

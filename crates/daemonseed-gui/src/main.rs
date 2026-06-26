@@ -31,11 +31,11 @@
 mod desktop_integration;
 mod net;
 mod profile;
-#[cfg(feature = "veilid")]
-mod veilid_net;
 mod share_browser;
 mod single_instance;
 mod state;
+#[cfg(feature = "veilid")]
+mod veilid_net;
 
 slint::include_modules!();
 
