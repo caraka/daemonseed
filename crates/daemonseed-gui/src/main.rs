@@ -1559,7 +1559,27 @@ fn apply_net_event(
             let persist_err = {
                 let mut st = state.borrow_mut();
                 st.add_my_share(share_id, name.clone(), file_count, root.clone());
-                st.persist_published(&root).err()
+                // #41: persist the user's CUSTOM share name so it survives to the next
+                // launch's auto-republish. The publish path resolves a blank name field
+                // to the folder basename, so the effective `name` is either the typed
+                // custom name or the basename. Persist `Some(name)` for a custom name and
+                // `None` for the basename default, so `republish_name` keeps deriving the
+                // basename for un-named shares. The custom-vs-basename signal is the
+                // effective name compared to the root's own basename; a custom name that
+                // happens to equal the basename persists as `None`, which republishes to
+                // the same basename (inert). On the auto-republish path (`restored`) the
+                // root is already stored, so `persist_published` is a keyed no-op that
+                // never clobbers an existing stored name.
+                let basename = std::path::Path::new(&root)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "share".to_string());
+                let persist_name = if name == basename {
+                    None
+                } else {
+                    Some(name.as_str())
+                };
+                st.persist_published(&root, persist_name).err()
             };
             apply_my_shares(ui, &state.borrow());
             // An auto-republish on connect reads as "Restored N shares…" rather than a

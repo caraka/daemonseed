@@ -125,8 +125,9 @@ impl Profile {
     /// Published shares recorded in the blob — the M16 auto-republish set read at
     /// next launch, as `(root, optional wire-facing name)` pairs. The republish
     /// path keys on the root and uses the persisted `name` when present, else the
-    /// root's basename (see `republish_name` in `net`). `name` is `None` until a
-    /// name-a-share UI exists, but the slot is consumed end-to-end now.
+    /// root's basename (see `republish_name` in `net`). A `Some(name)` is the
+    /// custom name the user typed in the publish overlay (#41); `None` is an
+    /// un-named share that republishes under its folder basename.
     pub fn published(&self) -> Vec<(String, Option<String>)> {
         self.seeds
             .published()
@@ -135,15 +136,18 @@ impl Profile {
             .collect()
     }
 
-    /// Remember a published share root (a directory path) and re-seal the blob to
-    /// disk, so the share auto-republishes next launch (M16 write-through). Returns
-    /// `Ok(true)` if newly remembered, `Ok(false)` if already present. A disk / seal
-    /// failure is surfaced as `Err(reason)`; the share still serves in RAM this
-    /// session regardless.
-    pub fn persist_published(&mut self, root: &str) -> Result<bool, String> {
-        // name = None until a name-a-share UI exists; the slot round-trips in the
-        // blob (daemonseed_core::storage::seeds::PublishedShare).
-        let added = self.seeds.add_published(root, None);
+    /// Remember a published share root (a directory path) with its optional
+    /// wire-facing `name` and re-seal the blob to disk, so the share
+    /// auto-republishes next launch (M16 write-through, #41). `name` is
+    /// `Some(custom)` when the user named the share in the publish overlay and
+    /// `None` when it defaults to the root's basename (the republish path derives
+    /// the basename for `None`; see `republish_name` in `net`). Returns `Ok(true)`
+    /// if newly remembered, `Ok(false)` if already present — idempotent, keyed on
+    /// the root, so a re-publish never changes a stored name. A disk / seal failure
+    /// is surfaced as `Err(reason)`; the share still serves in RAM this session
+    /// regardless.
+    pub fn persist_published(&mut self, root: &str, name: Option<&str>) -> Result<bool, String> {
+        let added = self.seeds.add_published(root, name.map(str::to_owned));
         if added {
             self.reseal()?;
         }

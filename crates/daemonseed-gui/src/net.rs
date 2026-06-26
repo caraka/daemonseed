@@ -97,9 +97,9 @@ use tokio_stream::wrappers::ReceiverStream;
 /// the persisted [`daemonseed_core::storage::seeds::PublishedShare`] `name` when
 /// one was stored, else the root directory's basename, else `"share"`. Centralizes
 /// the choice both republish loops make so the persisted name is consumed
-/// consistently. (The name-a-share UI that would set a non-`None` persisted name is
-/// a separate follow-up; today the persisted slot is `None` and this falls back to
-/// the basename — unchanged behavior — but the wiring now carries a name end to end.)
+/// consistently. The publish overlay's name field sets the persisted name, so a
+/// custom name returns verbatim here and an un-named share (`None`) falls back to
+/// the folder basename.
 fn republish_name(root: &Path, persisted: Option<&str>) -> String {
     if let Some(name) = persisted.filter(|n| !n.is_empty()) {
         return name.to_owned();

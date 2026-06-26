@@ -458,12 +458,14 @@ impl GuiState {
         self.profile.as_ref().map(Profile::index_params)
     }
 
-    /// Write-through (M16): remember a published share root in the unlocked profile
-    /// blob so it auto-republishes next launch. No-op (returns `Ok`) on the
-    /// ephemeral (no-profile) path; a disk / seal failure is surfaced as `Err`.
-    pub fn persist_published(&mut self, root: &str) -> Result<(), String> {
+    /// Write-through (M16): remember a published share root with its optional
+    /// wire-facing `name` in the unlocked profile blob so it auto-republishes next
+    /// launch (#41). `Some(name)` is a user-typed custom name; `None` defaults to
+    /// the root basename at republish. No-op (returns `Ok`) on the ephemeral
+    /// (no-profile) path; a disk / seal failure is surfaced as `Err`.
+    pub fn persist_published(&mut self, root: &str, name: Option<&str>) -> Result<(), String> {
         match self.profile.as_mut() {
-            Some(p) => p.persist_published(root).map(|_| ()),
+            Some(p) => p.persist_published(root, name).map(|_| ()),
             None => Ok(()),
         }
     }
@@ -1739,17 +1741,26 @@ mod tests {
             .into_session_materials();
         write_first_start(&root, &materials, None, false).unwrap();
 
-        // Session 1: adopt the profile, persist two published roots, unpersist one.
+        // Session 1: adopt the profile, persist three published roots with mixed
+        // name forms (#41: a custom name `Some` vs the basename default `None`),
+        // re-persist one to prove the keyed idempotency leaves a stored name
+        // untouched, unpersist one.
         let mut st1 = GuiState::lobby_only();
         st1.set_profile(Profile::from_materials(materials, root.clone()));
         assert!(
             st1.persisted_published().is_empty(),
             "nothing published on a fresh enrollment"
         );
-        st1.persist_published("/home/alice/photos").unwrap();
-        st1.persist_published("/home/alice/docs").unwrap();
-        st1.persist_published("/home/alice/photos").unwrap(); // idempotent: no dup
-        st1.unpersist_published("/home/alice/docs").unwrap();
+        st1.persist_published("/home/alice/photos", Some("alice-photos"))
+            .unwrap();
+        st1.persist_published("/home/alice/docs", None).unwrap();
+        st1.persist_published("/home/alice/music", Some("mixtape"))
+            .unwrap();
+        // Idempotent: re-publishing an existing root adds no duplicate AND does not
+        // change the stored name (keyed on the root path).
+        st1.persist_published("/home/alice/photos", Some("ignored-on-dup"))
+            .unwrap();
+        st1.unpersist_published("/home/alice/music").unwrap();
         drop(st1);
 
         // Session 2: reload the blob from disk under the passphrase.
@@ -1767,12 +1778,19 @@ mod tests {
         let mut st2 = GuiState::lobby_only();
         st2.set_profile(Profile::from_materials(materials2, root.clone()));
 
-        // The kept publish survived relaunch; the unpersisted one did not.
-        // name is None (no naming UI yet); the slot round-trips through the pair.
+        // The kept publishes survived relaunch with their persisted name forms
+        // (#41): the custom name as `Some` (un-clobbered by the re-publish), the
+        // basename default as `None`; the unpersisted root is gone.
         assert_eq!(
             st2.persisted_published(),
-            vec![("/home/alice/photos".to_string(), None)],
-            "exactly the kept published root auto-republishes next launch"
+            vec![
+                (
+                    "/home/alice/photos".to_string(),
+                    Some("alice-photos".to_string())
+                ),
+                ("/home/alice/docs".to_string(), None),
+            ],
+            "kept roots auto-republish with their persisted custom-name / basename-default forms"
         );
 
         let _ = std::fs::remove_dir_all(&root);
