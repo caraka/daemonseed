@@ -4,9 +4,11 @@
 //!
 //! `#[ignore]` — it needs a host that can attach to the PUBLIC Veilid network.
 //! This VM's SLIRP NAT blocks attach, so run it on a real-network host
-//! (e.g. orinoco):
+//! (e.g. orinoco). This crate is `[workspace] exclude`d, so `-p` won't resolve
+//! it from the repo root — build from the crate's own directory:
 //!
-//!     cargo test -p daemonseed-veilid-net --test two_node_sealed -- --ignored --nocapture
+//!     cd crates/daemonseed-veilid-net
+//!     cargo test --test two_node_sealed -- --ignored --nocapture
 //!
 //! It drives the productized Phase-1 path end-to-end through the
 //! `VeilidNetHandle` API (the same surface the app drives), reusing the REAL
