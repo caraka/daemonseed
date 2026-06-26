@@ -43,6 +43,16 @@
 //! `tokio::spawn`ed onto a multi-thread runtime. Driving everything on one thread
 //! via `block_on(local.run_until(..))` + [`tokio::task::spawn_local`] sidesteps
 //! both `Send` bounds — identical to the TUI's rationale.
+//!
+//! ## `veilid` feature
+//!
+//! Under `--features veilid` this relay actor is **dormant** — [`NetHandle::new`]
+//! spawns [`crate::veilid_net::veilid_net_actor`] instead, and the UI drives the
+//! same `NetCommand`/`NetEvent` contract over Veilid. The relay code stays
+//! compiled (so both paths typecheck) but unused, so it is `allow(dead_code,
+//! unused_imports)` under the feature; it is deleted outright at the v0.33.0
+//! cutover when Veilid becomes the only transport.
+#![cfg_attr(feature = "veilid", allow(dead_code, unused_imports))]
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -571,15 +581,36 @@ impl NetHandle {
         let thread = std::thread::Builder::new()
             .name("daemonseed-gui-net".to_owned())
             .spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("build current-thread net runtime");
-                let local = tokio::task::LocalSet::new();
-                // `spawn_local` (the inbound reader) is run INSIDE this
-                // `run_until` context — the reader holds an `Rc` of the room key,
-                // so it cannot ride a multi-thread runtime.
-                rt.block_on(local.run_until(net_actor(cmd_rx, cmd_tx_actor, evt_tx)));
+                // #98 backend selection: the `veilid` feature swaps the relay
+                // actor for the Veilid-backed one. Same channels, same
+                // `NetCommand`/`NetEvent` contract, so `main.rs` (the UI) is
+                // untouched. veilid-core spawns its own tasks and needs a
+                // multi-thread runtime; the relay actor's circle reader holds an
+                // `Rc` and must ride the current-thread runtime + `LocalSet`.
+                #[cfg(feature = "veilid")]
+                {
+                    let rt = tokio::runtime::Builder::new_multi_thread()
+                        .enable_all()
+                        .build()
+                        .expect("build veilid net runtime");
+                    rt.block_on(crate::veilid_net::veilid_net_actor(
+                        cmd_rx,
+                        cmd_tx_actor,
+                        evt_tx,
+                    ));
+                }
+                #[cfg(not(feature = "veilid"))]
+                {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("build current-thread net runtime");
+                    let local = tokio::task::LocalSet::new();
+                    // `spawn_local` (the inbound reader) is run INSIDE this
+                    // `run_until` context — the reader holds an `Rc` of the room
+                    // key, so it cannot ride a multi-thread runtime.
+                    rt.block_on(local.run_until(net_actor(cmd_rx, cmd_tx_actor, evt_tx)));
+                }
             })?;
         Ok(Self {
             cmd_tx,
