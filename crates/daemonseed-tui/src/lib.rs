@@ -50,3 +50,9 @@ pub mod app;
 pub mod net;
 pub mod screens;
 pub mod ui;
+
+// #98 S2: the parallel Veilid net actor, compiled only under `--features veilid`.
+// It implements the same `NetCommand`/`NetEvent` contract `net` does; `net`'s
+// `NetHandle::new` selects between them. Deleted at the v0.33.0 cutover.
+#[cfg(feature = "veilid")]
+mod veilid_net;

@@ -125,11 +125,11 @@ The seed above is realized, with one refinement: the fan-out is **shared-owner `
 **Connect semantics in Veilid mode.** No relay address or identity-proof handshake: `Connect` = `attach_and_wait` + store the derived identity; bootstrap is baked into config (D1/D4). `JoinCircle{phrase}` derives both `cot_key` (content) and the rendezvous-owner seed (`derive_circle_veilid_owner_seed`) from the phrase, then `subscribe_circle`; `SendCircle` = `publish_circle`. The `server_id` namespace vanishes (circle rendezvous is global per D4).
 
 **Stepwise plan (pause points marked).**
-- **S0** — this design-of-record. ⏸ caraka review
-- **S1** — add the `veilid` feature + optional dep to gui/tui; verify default (relay) build + the frozen workspace gate are unchanged and `--features veilid` compiles. ⏸ gates
-- **S2** — build the parallel Veilid net actor (circles + attach; lobby/shares/presence → not-yet-on-Veilid); unit-test. ⏸
-- **S3** — UI bridge: `NetHandle::new()` backend selection (gui + tui); UI unchanged. ⏸
-- **S4** — live felt-test on orinoco: two clients in Veilid mode join a circle by phrase and exchange messages. ⏸ felt-test
+- **S0** — this design-of-record. ✅ accepted (caraka, 2026-06-26)
+- **S1** — add the `veilid` feature + optional dep to gui/tui; verify default (relay) build + the frozen workspace gate are unchanged and `--features veilid` compiles. ✅ done (`8bb48f4`)
+- **S2** — build the parallel Veilid net actor (circles + attach; lobby/shares/presence → not-yet-on-Veilid); unit-test. ✅ done — GUI half (`74f9a5d`) + TUI half (`crates/daemonseed-tui/src/veilid_net.rs`). The TUI's `NetCommand`/`NetEvent` diverges (`JoinCircle{phrase}` with the actor assigning the id + label; `SendChat{circle_id,body,sender_handle}`; `drain_events`; per-surface error events not a single `Error`), and crucially the **TUI app layer already local-echoes on Enter**, so the TUI actor does NOT echo (it would double-render) — it only suppresses the DHT re-surface of the own write.
+- **S3** — UI bridge: `NetHandle::new()` backend selection (gui + tui); UI unchanged. ✅ folded into S2 — the seam lives in `NetHandle::new()` and was built with each actor half (`#[cfg(feature="veilid")]` → multi-thread rt + `veilid_net_actor`; relay branch unchanged; `main.rs`/UI byte-unchanged).
+- **S4** — live felt-test on orinoco: two clients in Veilid mode join a circle by phrase and exchange messages. ⏸ felt-test (this VM's SLIRP NAT blocks public attach)
 - **S5** — doc-sync + commit on `feat/veilid-migration`; #98 stays open (circles-only) until Phases 3/4 + the cutover flip.
 
 **Out of scope for #98.** Lobby/public-room, shares, presence/roster, MOTD/announcements (Phases 3/4); the cutover flag-flip + relay-actor deletion (Phase 5); the federation introducer (becomes Veilid bootstrap, not a runtime RPC).
