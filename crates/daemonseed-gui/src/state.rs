@@ -607,10 +607,8 @@ impl GuiState {
     /// behind the friendly label and surfaced only on demand, e.g. hover/detail). `None`
     /// for the Lobby (no net contract).
     ///
-    /// `#[allow(dead_code)]`: the data path is in place + unit-tested, but the
-    /// hover/detail UI affordance that surfaces it is attended felt-polish (deferred),
-    /// so the binary does not call it yet — same convention as [`GuiState::len`].
-    #[allow(dead_code)]
+    /// Surfaced by the #36 circle-detail sheet (`main::apply_circle_detail`) as the
+    /// universal out-of-band verification vector.
     pub fn circle_fingerprint_of(&self, idx: usize) -> Option<String> {
         self.circles
             .get(idx)
@@ -628,9 +626,8 @@ impl GuiState {
     /// compares only between members on the SAME relay — distinct from the
     /// relay-INDEPENDENT phrase-keyed fingerprint. Pre-join (no rendezvous yet) it
     /// falls back to that fingerprint, so the line only diverges once connected.
-    /// `None` for the Lobby (no net contract). `#[allow(dead_code)]`: the
-    /// detail-pane affordance that surfaces it is attended felt-polish (deferred).
-    #[allow(dead_code)]
+    /// `None` for the Lobby (no net contract). Surfaced by the #36 circle-detail
+    /// sheet (`main::apply_circle_detail`) as the relay-scoped compare vector.
     pub fn circle_deterministic_label_of(&self, idx: usize) -> Option<String> {
         let net = self.circles.get(idx)?.net.as_ref()?;
         Some(match &net.rendezvous {

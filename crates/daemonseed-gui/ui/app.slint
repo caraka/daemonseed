@@ -372,6 +372,15 @@ export component AppWindow inherits Window {
     out property <bool> chat-at-bottom:
         root.scroll-y <= -(root.chat-content-h - chat-area.height) + 24px;
     in property <bool> sheet-open: false;
+    // #36 circle-detail name vectors, set from `GuiState` for the active circle (all
+    // blank for the Lobby, which has no net contract → the vector rows hide). The
+    // three are distinct on purpose: `circle-name` is the chosen display name;
+    // `circle-relay-label` is the relay-scoped adj-noun label (matches only between
+    // members on the SAME relay); `circle-fingerprint` is the relay-independent
+    // `#<12hex>` — the universal out-of-band verification vector.
+    in property <string> circle-name;
+    in property <string> circle-relay-label;
+    in property <string> circle-fingerprint;
     in-out property <bool> palette-open: false;
     in property <[ActionData]> actions;
 
@@ -1010,6 +1019,23 @@ export component AppWindow inherits Window {
             Text { text: "Circle details"; color: #e4e8ee; font-size: 15px; }
             Text { text: "end-to-end encrypted"; color: #6fb3a4; font-size: 12px; }
             Text { text: "members — identity only, no presence"; color: #5b6472; font-size: 12px; }
+
+            // ── #36 name vectors (hidden for the Lobby — all three blank) ──
+            if root.circle-name != "" : VerticalLayout {
+                spacing: 2px;
+                Text { text: "Name"; color: #5b6472; font-size: 11px; }
+                Text { text: root.circle-name; color: #cfd5dd; font-size: 13px; }
+            }
+            if root.circle-relay-label != "" : VerticalLayout {
+                spacing: 2px;
+                Text { text: "Relay name (matches only on this relay)"; color: #5b6472; font-size: 11px; wrap: word-wrap; }
+                Text { text: root.circle-relay-label; color: #cfd5dd; font-size: 13px; }
+            }
+            if root.circle-fingerprint != "" : VerticalLayout {
+                spacing: 2px;
+                Text { text: "Fingerprint (verify out-of-band — same everywhere)"; color: #5b6472; font-size: 11px; wrap: word-wrap; }
+                Text { text: root.circle-fingerprint; color: #cfd5dd; font-size: 13px; }
+            }
         }
     }
 

@@ -24,7 +24,9 @@
 //! real callbacks and prints `SELF-CHECK PASS` (panics → non-zero exit);
 //! `--show-shares` / `--show-publish` render the Shares-tab browse tree / the Publish
 //! overlay (with a fixture share set, no relay); `--show-rename` opens the
-//! rename-identity overlay prefilled with a sample name (#66).
+//! rename-identity overlay prefilled with a sample name (#66);
+//! `--show-circle-detail` materializes a circle, applies a synthetic rendezvous,
+//! and slides the context sheet open showing the three name vectors (#36).
 
 mod desktop_integration;
 mod net;
@@ -306,6 +308,34 @@ fn apply_view(ui: &AppWindow, c: &CircleState, active: i32) {
     ui.set_scroll_y(c.scroll_y);
 }
 
+/// #36: push the active circle's three name vectors into the context-sheet props.
+///
+/// All three are blank for the Lobby (no net contract), which hides the sheet's
+/// vector rows. The three are deliberately distinct: `circle-name` is the chosen
+/// display name (`circle.name`); `circle-relay-label` is the relay-SCOPED adj-noun
+/// label (`GuiState::circle_deterministic_label_of` — `default_circle_label` once
+/// the rendezvous is known, the fingerprint before), which compares only between
+/// members on the SAME relay; `circle-fingerprint` is the relay-INDEPENDENT
+/// `#<12hex>` (`GuiState::circle_fingerprint_of`), the universal out-of-band
+/// verification vector. The label and the fingerprint diverge once connected.
+/// Display-only — never mutates state.
+fn apply_circle_detail(ui: &AppWindow, st: &GuiState, idx: usize) {
+    // The chosen name is shown only for a real circle (a net contract present), so
+    // the Lobby's sheet stays blank — matching the relay-label/fingerprint accessors,
+    // which already return `None` for the Lobby.
+    let name = st
+        .metas()
+        .get(idx)
+        .filter(|c| c.net.is_some())
+        .map(|c| c.name.clone())
+        .unwrap_or_default();
+    let relay = st.circle_deterministic_label_of(idx).unwrap_or_default();
+    let fp = st.circle_fingerprint_of(idx).unwrap_or_default();
+    ui.set_circle_name(SharedString::from(name));
+    ui.set_circle_relay_label(SharedString::from(relay));
+    ui.set_circle_fingerprint(SharedString::from(fp));
+}
+
 /// Rebuild the rail model from the current circle metas and refresh the
 /// empty-state flag. Called once at startup and again after every materialize (a
 /// circle was ADDED, so the `for`-over-model must be rebuilt).
@@ -346,6 +376,7 @@ fn materialize_and_select(
                 let active = st.active();
                 rebuild_rail(ui, &st);
                 apply_view(ui, st.current(), active as i32);
+                apply_circle_detail(ui, &st, active);
                 // Round 6 write-through: record the circle in the unlocked profile
                 // so it silently re-joins next launch. A no-op without a profile; a
                 // disk failure is surfaced quietly — the circle still works this
@@ -444,6 +475,7 @@ fn build_ui() -> BuiltUi {
                 // #64: switch_to cleared the focused room's unread; reflect it.
                 rebuild_rail(&ui, &st);
                 apply_view(&ui, st.current(), active as i32);
+                apply_circle_detail(&ui, &st, active);
                 // Tidiness: keep the shares view coherent with the room. If already
                 // on a shares tab, show the one that matches the destination — a
                 // circle's "Circle shares" (tab 2) or the Lobby's public "Shares"
@@ -718,6 +750,7 @@ fn build_ui() -> BuiltUi {
         let st = state.borrow();
         let active = st.active();
         apply_view(&ui, st.current(), active as i32);
+        apply_circle_detail(&ui, &st, active);
     }
 
     // ── Shares tab: browse-tree callbacks (commit 1) ──
@@ -1382,6 +1415,9 @@ fn apply_net_event(
                 rebuild_rail(ui, &st);
                 if st.active() == idx {
                     apply_view(ui, st.current(), idx as i32);
+                    // #36: the relay-derived label just replaced the fingerprint
+                    // placeholder — refresh the detail sheet's vectors too.
+                    apply_circle_detail(ui, &st, idx);
                 }
             }
         }
@@ -2157,6 +2193,10 @@ fn main() {
     // the rail shows the relay-derived adj-noun label instead of the `#<hex>`
     // placeholder (the live path runs on the CircleJoined event, which needs a relay).
     let show_joined_label = args.iter().any(|a| a == "--joined-label");
+    // #36 fixture: materialize a circle, apply a synthetic relay rendezvous (so the
+    // relay-scoped label diverges from the universal fingerprint), populate the three
+    // name vectors, and slide the context sheet open so the PNG shows all three.
+    let show_circle_detail = args.iter().any(|a| a == "--show-circle-detail");
     // Offscreen fixture render of the populated Shares-tab browse tree (no relay):
     // injects a synthetic catalog + one expanded/previewed share so the PNG shows the
     // tree without a live connection.
@@ -2201,6 +2241,7 @@ fn main() {
         || show_unread
         || show_tab_coherence
         || show_joined_label
+        || show_circle_detail
         || show_shares
         || show_publish
         || show_desktop_prompt
@@ -2523,6 +2564,27 @@ fn main() {
                     }
                 }
             }
+        }
+        if show_circle_detail {
+            // Materialize a circle, then simulate the post-join rendezvous so its
+            // relay-derived label diverges from the relay-independent fingerprint —
+            // then populate the detail vectors and slide the context sheet open.
+            let phrase = state::generate_circle_phrase().unwrap_or_default();
+            if materialize_and_select(&ui, &state, &net, &phrase) {
+                let cid = state.borrow().active_circle_id();
+                if let Some(cid) = cid {
+                    let addr = daemonseed_core::cot::AssetAddr::from_bytes(
+                        [0x36; daemonseed_core::cot::ASSET_ADDR_LEN],
+                    );
+                    let mut st = state.borrow_mut();
+                    if let Some(idx) = st.set_circle_rendezvous(cid, addr) {
+                        rebuild_rail(&ui, &st);
+                        apply_view(&ui, st.current(), idx as i32);
+                        apply_circle_detail(&ui, &st, idx);
+                    }
+                }
+            }
+            ui.set_sheet_open(true);
         }
         if show_join {
             ui.invoke_open_join();
