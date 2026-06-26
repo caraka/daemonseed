@@ -51,9 +51,20 @@ pub async fn rendezvous_key(api: &VeilidAPI, owner: &KeyPair) -> Result<RecordKe
 
 /// Open the circle's rendezvous record, creating it deterministically if it is
 /// not yet on the network. Every member holds the owner secret, so any member
-/// can do either; create-with-owner fails if the record already exists, so a
-/// lost create race falls back to a second open. Returns the (deterministic)
-/// record key.
+/// can do either. Returns the (deterministic) record key.
+///
+/// **Single encryption layer.** The record key is derived with NO Veilid
+/// encryption key ([`rendezvous_key`] passes `None`), so Veilid stores values
+/// verbatim — our cot-sealed (AES-256-GCM, post-quantum) bytes are the ONLY
+/// encryption, and the DHT sees ciphertext exactly as the relay did (ISC-A-S2).
+/// `create_dht_record` force-assigns a *random* per-record encryption key to
+/// the local handle (`create_record.rs`), which other members cannot derive; we
+/// reopen with our no-encryption-key record key, which resets the handle's
+/// encryption to none (`open_record.rs`: `crypto_with_key` defaults to `None`),
+/// so writes are stored verbatim and any member who derives the same address
+/// reads them back byte-identical. This also keeps content crypto fully
+/// decoupled from Veilid's (classical) transport crypto — so adopting a future
+/// Veilid PQC suite is a free, content-independent change.
 pub async fn open_or_create(
     api: &VeilidAPI,
     rc: &RoutingContext,
@@ -67,18 +78,17 @@ pub async fn open_or_create(
     {
         return Ok(key);
     }
-    match rc
+    // Not present — create the network record. Ignore the result: on success
+    // the handle carries create's random encryption key; on a lost create race
+    // a peer already created it. Either way the reopen below (with our
+    // no-encryption-key record key) resets the handle to verbatim storage.
+    let _ = rc
         .create_dht_record(CRYPTO_KIND_VLD0, schema()?, Some(owner.clone()))
+        .await;
+    rc.open_dht_record(key.clone(), Some(owner.clone()))
         .await
-    {
-        Ok(desc) => Ok(desc.key().clone()),
-        // A peer created it between our open and create — open now succeeds.
-        Err(_) => rc
-            .open_dht_record(key.clone(), Some(owner.clone()))
-            .await
-            .map(|_| key)
-            .map_err(|e| VeilidNetError::Routing(e.to_string())),
-    }
+        .map(|_| key)
+        .map_err(|e| VeilidNetError::Routing(e.to_string()))
 }
 
 /// The base subkey of this member's append-ring region, from its node pubkey.
