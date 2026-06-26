@@ -1049,7 +1049,9 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "daemonseed-core",
+ "daemonseed-proto",
  "ed25519-dalek",
+ "oxicrypt-module",
  "thiserror 1.0.69",
  "tokio",
  "veilid-core",

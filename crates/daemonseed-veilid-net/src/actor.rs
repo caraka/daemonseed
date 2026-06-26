@@ -169,6 +169,12 @@ impl VeilidNet {
         vcfg.namespace = cfg.namespace.clone();
         vcfg.protected_store.always_use_insecure_storage = true;
         vcfg.protected_store.allow_insecure_fallback = true;
+        // Distinct listen ports let several nodes coexist on one host (tests).
+        if let Some(addr) = &cfg.listen_address {
+            vcfg.network.protocol.udp.listen_address = addr.clone();
+            vcfg.network.protocol.tcp.listen_address = addr.clone();
+            vcfg.network.protocol.ws.listen_address = addr.clone();
+        }
         // D4: public network — no network_key_password. Override bootstrap only
         // if the caller baked one in (the fra1 seed).
         if !cfg.bootstrap.is_empty() {

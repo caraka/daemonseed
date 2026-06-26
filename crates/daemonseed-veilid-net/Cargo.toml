@@ -27,3 +27,10 @@ base64 = "0.22"
 
 tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
 thiserror = "1"
+
+[dev-dependencies]
+# Integration test (#97): the 2-node send_sealed-over-private-route oracle.
+# Runs on a real-network host (`--ignored`); this VM's NAT blocks public attach.
+daemonseed-proto = { path = "../daemonseed-proto" }
+oxicrypt-module = { path = "../../../oxicrypt/crates/oxicrypt-module" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }

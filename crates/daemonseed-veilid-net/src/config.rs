@@ -23,6 +23,11 @@ pub struct VeilidNetConfig {
 
     /// Program namespace — lets multiple nodes coexist (tests, subnodes).
     pub namespace: String,
+
+    /// UDP/TCP/WS listen address (e.g. `":5150"`). `None` = veilid's defaults.
+    /// Set a distinct port per node when running several on one host (tests,
+    /// multi-node bring-up).
+    pub listen_address: Option<String>,
 }
 
 impl VeilidNetConfig {
@@ -35,6 +40,7 @@ impl VeilidNetConfig {
             storage_dir: storage_dir.into(),
             hop_count: 2,
             namespace: "daemonseed".to_owned(),
+            listen_address: None,
         }
     }
 }
