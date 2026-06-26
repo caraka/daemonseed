@@ -52,6 +52,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
+use crate::state::{AnnouncementsView, build_announcements_view};
 use daemonseed_cli::connect::connect_session;
 use daemonseed_cli::identity_proof::ClientIdentity;
 use daemonseed_cli::session::AppSession;
@@ -198,6 +199,14 @@ pub enum NetCommand {
     /// [`NetEvent::SharesSnapshot`]. Read-only; no scan.
     #[cfg_attr(not(test), allow(dead_code))]
     RefreshShares,
+    /// (#91) Fetch the connected relay's public space — MOTD, announcement posts,
+    /// and the published signer whitelist — re-verify it client-side (trusting
+    /// nothing the relay asserts), and deliver a single
+    /// [`NetEvent::PublicSpaceSnapshot`]. Read-only display path; mirrors the TUI's
+    /// `handle_refresh_public_space`. Constructed by the binary (the announcements
+    /// pane open + the on-tab poll), like [`NetCommand::RefreshShares`].
+    #[cfg_attr(not(test), allow(dead_code))]
+    RefreshPublicSpace,
     /// Internal: a verified lobby [`wire::ShareAnnouncement`] the inbound reader
     /// opened, to fold into the actor's [`ShareCatalog`] (all catalog mutation
     /// stays on `&mut self`). Posted by [`read_inbound_public_room`]; never sent
@@ -395,6 +404,15 @@ pub enum NetEvent {
     /// producer today, so nothing constructs it yet.
     #[allow(dead_code)]
     SharesError { message: String },
+    /// (#91) The connected relay's verified public space — the inert verbatim MOTD
+    /// (if present and verified) and the verified announcement rows — assembled
+    /// client-side by [`build_announcements_view`] (ISC-A-S3: nothing the relay
+    /// asserts is trusted). The `main.rs` arm renders the `view` into the
+    /// announcements pane.
+    PublicSpaceSnapshot { view: AnnouncementsView },
+    /// (#91) A public-space fetch could not complete (not connected, a refused RPC,
+    /// or a malformed whitelist). The previous pane content is left unchanged.
+    PublicSpaceError { message: String },
     /// The live Lobby roster (#74/#75): the set of currently-present members, keyed
     /// internally by pubkey (so two members with identical display names are two
     /// distinct rows). Pushed on a roster-changing `ApplyHeartbeat` (a member
@@ -703,6 +721,11 @@ struct Actor {
     session: Option<AppSession>,
     /// The connected relay's wire server-id, namespacing the room address.
     server_id: Option<String>,
+    /// (#91) The connected relay's TOFU-pinned public key, captured from the
+    /// connect [`daemonseed_cli::connect::ConnectOutcome`]. Needed to build the
+    /// MOTD verification whitelist (a MOTD may be server-signed, ISC-26). `None`
+    /// before a successful connect / on the test-attach path (no public-space fetch).
+    server_pubkey: Option<Vec<u8>>,
     /// The daemon's own ephemeral identity, retained after connect so room posts
     /// are self-signed for provenance under the key that proved the connection.
     identity: Option<ClientIdentity>,
@@ -882,6 +905,8 @@ impl Actor {
                 Ok(session) => {
                     self.session = Some(session);
                     self.server_id = Some(server_id.to_owned());
+                    // (#91) Pin the relay's verified key for MOTD re-verification.
+                    self.server_pubkey = Some(outcome.server_pubkey);
                     self.identity = Some(identity);
                     self.connected = true;
                     // #71: remember this connect so a later drop reconnects with the
@@ -1025,6 +1050,7 @@ impl Actor {
         // halves here makes any in-flight send fail fast rather than block.
         self.session = None;
         self.server_id = None;
+        self.server_pubkey = None;
         self.identity = None;
         self.public_room = None;
         self.circles.clear();
@@ -1954,6 +1980,55 @@ impl Actor {
         self.emit_shares_snapshot();
     }
 
+    /// (#91) Fetch the connected relay's public space — signer whitelist, MOTD, and
+    /// announcement posts — re-verify it client-side via
+    /// [`build_announcements_view`] (trusting nothing the relay asserts, ISC-A-S3),
+    /// and emit a single [`NetEvent::PublicSpaceSnapshot`]. Mirrors the TUI's
+    /// `handle_refresh_public_space`. Any missing session / pinned key, or a refused
+    /// RPC, surfaces as [`NetEvent::PublicSpaceError`] and leaves the pane unchanged.
+    async fn handle_refresh_public_space(&mut self) {
+        let (Some(session), Some(server_pubkey)) =
+            (self.session.as_ref(), self.server_pubkey.as_ref())
+        else {
+            return self.emit(NetEvent::PublicSpaceError {
+                message: "not connected to a relay yet".to_owned(),
+            });
+        };
+        let server_pubkey = server_pubkey.clone();
+        let mut ps = session.public_space();
+
+        let whitelist = match ps
+            .get_signer_whitelist(wire::GetSignerWhitelistRequest {})
+            .await
+        {
+            Ok(resp) => resp.into_inner(),
+            Err(status) => {
+                return self.emit(NetEvent::PublicSpaceError {
+                    message: format!("signer-whitelist fetch refused: {}", status.message()),
+                });
+            }
+        };
+        let motd = match ps.get_motd(wire::GetMotdRequest {}).await {
+            Ok(resp) => resp.into_inner(),
+            Err(status) => {
+                return self.emit(NetEvent::PublicSpaceError {
+                    message: format!("MOTD fetch refused: {}", status.message()),
+                });
+            }
+        };
+        let posts = match ps.list_posts(wire::ListPostsRequest { topic: None }).await {
+            Ok(resp) => resp.into_inner(),
+            Err(status) => {
+                return self.emit(NetEvent::PublicSpaceError {
+                    message: format!("posts fetch refused: {}", status.message()),
+                });
+            }
+        };
+
+        let view = build_announcements_view(&motd, &posts, &whitelist, &server_pubkey);
+        self.emit(NetEvent::PublicSpaceSnapshot { view });
+    }
+
     /// A1 fetch-preview: open the share, read the manifest, emit `FetchManifest`,
     /// drop the stream. See [`NetCommand::FetchShare`].
     async fn handle_fetch_share(&mut self, share_id: &str, name: &str) {
@@ -2341,6 +2416,7 @@ async fn net_actor(
         own_shares: Rc::new(RefCell::new(Vec::new())),
         session: None,
         server_id: None,
+        server_pubkey: None,
         identity: None,
         my_handle: generate_handle(),
         counters: CounterState::default(),
@@ -2401,6 +2477,7 @@ async fn net_actor(
                 actor.handle_unpublish_share(&share_id).await
             }
             NetCommand::RefreshShares => actor.handle_refresh_shares().await,
+            NetCommand::RefreshPublicSpace => actor.handle_refresh_public_space().await,
             NetCommand::ApplyAnnouncement(ann) => actor.handle_apply_announcement(&ann),
             NetCommand::AnswerRollCall => actor.handle_answer_rollcall().await,
             NetCommand::EmitHeartbeat => actor.handle_emit_heartbeat().await,

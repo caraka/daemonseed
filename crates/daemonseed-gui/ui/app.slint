@@ -70,6 +70,17 @@ struct RosterRow {
     fingerprint: string,
 }
 
+// One verified announcement row (#91, ISC-S7). `topic`/`body` are the inert
+// decoded post fields, rendered verbatim; `ts` is the signing wall-clock formatted
+// to a short UTC caption by Rust. Rust replaces the whole `announcements` model on
+// each refresh, so the `for` re-renders without an `if`-teardown (only verified
+// posts are ever in the model — ISC-A-S3).
+struct AnnouncementRow {
+    topic: string,
+    body: string,
+    ts: string,
+}
+
 component RailRow inherits Rectangle {
     in property <string> name;
     in property <string> sub;
@@ -170,6 +181,29 @@ component RosterRowView inherits Rectangle {
             Text { text: touch.has-hover ? root.fingerprint : ""; color: #9aa3b0; font-size: 12px; }
         }
         Rectangle { }
+    }
+}
+
+// One announcement row (#91): a calm card with the topic, the wrapping body, and a
+// muted UTC timestamp caption. Read-only (display-only — composing is #92); reuses
+// the chat-bubble idiom (the readable green accent on the topic, dark card body).
+component AnnouncementRowView inherits Rectangle {
+    in property <string> topic;
+    in property <string> body;
+    in property <string> ts;
+    border-radius: 10px;
+    background: #101113;
+    border-width: 1px;
+    border-color: #ffffff10;
+    VerticalLayout {
+        padding: 10px; spacing: 4px;
+        HorizontalLayout {
+            spacing: 8px;
+            Text { text: root.topic; color: #6fb3a4; font-size: 13px; font-weight: 600; vertical-alignment: center; }
+            Rectangle { }
+            Text { text: root.ts; color: #5b6472; font-size: 11px; vertical-alignment: center; }
+        }
+        Text { text: root.body; color: #d6dae1; font-size: 13px; wrap: word-wrap; }
     }
 }
 
@@ -287,6 +321,16 @@ export component AppWindow inherits Window {
     // "No one else here yet" empty-state. Bound to the Lobby for this increment;
     // circle presence is #77.
     in property <[RosterRow]> roster;
+
+    // ── Announcements + MOTD pane (#91) — display-only, scoped to the connected
+    // relay. `motd` is the inert verbatim MOTD ("" ⇒ hide the MOTD area, ISC-S9);
+    // `announcements` are the client-re-verified posts; `announce-status` carries a
+    // fetch error / hint line. The pane is reachable via the Ctrl-K palette + tab.
+    in property <string> motd;
+    in property <[AnnouncementRow]> announcements;
+    in-out property <string> announce-status;
+    in property <string> announcements-empty-hint: "No announcements from this relay yet.";
+    callback announcements-tab-opened();
 
     // ── Shares tab (public-share browse tree) ──
     // `share-rows` is the flattened, render-ready tree (Rust rebuilds it on refresh /
@@ -606,6 +650,7 @@ export component AppWindow inherits Window {
                         TabLabel { label: "Chat"; active: root.active-tab == 0; clicked => { root.active-tab = 0; } }
                         TabLabel { label: "Public Shares"; active: root.active-tab == 1; clicked => { root.active-tab = 1; root.shares-tab-opened(); } }
                         TabLabel { label: "Circle shares"; active: root.active-tab == 2; clicked => { root.active-tab = 2; } }
+                        TabLabel { label: "Announcements"; active: root.active-tab == 3; clicked => { root.active-tab = 3; root.announcements-tab-opened(); } }
                         Rectangle { }
                     }
                 }
@@ -713,6 +758,55 @@ export component AppWindow inherits Window {
                                         Text { text: "Circle shares"; color: #aeb6c2; font-size: 18px; horizontal-alignment: center; }
                                         Text { text: "work in progress · coming soon"; color: #5b6472; font-size: 13px; horizontal-alignment: center; }
                                         Text { text: "End-to-end-encrypted sharing inside a circle."; color: #3f4651; font-size: 12px; horizontal-alignment: center; }
+                                    }
+                                }
+                            }
+
+                            // ANNOUNCEMENTS + MOTD (#91) — display-only, the connected
+                            // relay's verbatim MOTD over its client-re-verified
+                            // announcement posts. The MOTD area hides when unset
+                            // (ISC-S9); the posts list shows an empty-state otherwise.
+                            if root.active-tab == 3 : VerticalLayout {
+                                padding: 14px; spacing: 10px;
+                                HorizontalLayout {
+                                    height: 28px; spacing: 10px;
+                                    Text { text: "Announcements"; color: #e4e8ee; font-size: 15px; vertical-alignment: center; }
+                                    Text { text: "· this relay"; color: #4d5560; font-size: 11px; vertical-alignment: center; }
+                                    Text { text: root.announce-status; color: #5b6472; font-size: 12px; vertical-alignment: center; }
+                                    Rectangle { }
+                                    PillButton { label: "Refresh"; w: 96px; clicked => { root.announcements-tab-opened(); } }
+                                }
+                                // MOTD — hidden when unset (computed `if`, not a stale box).
+                                if root.motd != "" : Rectangle {
+                                    border-radius: 10px; background: #11302b; border-width: 1px; border-color: #1f4d45;
+                                    VerticalLayout {
+                                        padding: 12px; spacing: 4px;
+                                        Text { text: "Message of the day"; color: #6fb3a4; font-size: 11px; font-weight: 600; }
+                                        Text { text: root.motd; color: #d6dae1; font-size: 13px; wrap: word-wrap; }
+                                    }
+                                }
+                                // announcements list fills the rest of the pane.
+                                Rectangle {
+                                    vertical-stretch: 1;
+                                    border-radius: 10px; background: #0b0c0e; border-width: 1px; border-color: #ffffff10;
+                                    Flickable {
+                                        width: 100%; height: 100%;
+                                        viewport-width: self.width;
+                                        viewport-height: ann-list.preferred-height;
+                                        ann-list := VerticalLayout {
+                                            padding: 8px; spacing: 8px; alignment: start;
+                                            for a in root.announcements : AnnouncementRowView {
+                                                topic: a.topic; body: a.body; ts: a.ts;
+                                            }
+                                        }
+                                    }
+                                    // empty-state — computed visibility (never an `if`).
+                                    Text {
+                                        x: (parent.width - self.width) / 2;
+                                        y: (parent.height - self.height) / 2;
+                                        text: root.announcements-empty-hint;
+                                        visible: root.announcements.length == 0;
+                                        color: #5b6472; font-size: 13px; horizontal-alignment: center;
                                     }
                                 }
                             }
@@ -838,12 +932,14 @@ export component AppWindow inherits Window {
                         root.palette-open = false;
                         // Action registry → real behavior. 0 = Lobby, 1 = New
                         // circle, 2 = Join a circle, 3 = Fetch a share (open the
-                        // Shares tab + refresh the catalog), 4 = About overlay.
+                        // Shares tab + refresh the catalog), 4 = About overlay,
+                        // 5 = Announcements (open the pane + fetch this relay's news).
                         if (i == 0) { root.switch-circle(0); }
                         if (i == 1) { root.open-new(); }
                         if (i == 2) { root.open-join(); }
                         if (i == 3) { root.active-tab = 1; root.shares-tab-opened(); }
                         if (i == 4) { root.about-open = true; }
+                        if (i == 5) { root.active-tab = 3; root.announcements-tab-opened(); }
                     }
                 }
                 HorizontalLayout { padding-left: 10px; spacing: 8px;

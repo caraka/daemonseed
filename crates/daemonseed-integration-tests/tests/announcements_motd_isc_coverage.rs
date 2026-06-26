@@ -156,3 +156,29 @@ fn isc_c90_covered() {
         "ISC-C90 registered (self-determination)"
     );
 }
+
+// ── #91 GUI announcement + MOTD display panes (ISC-C91) ───────────────────
+//
+// The data-prep + client re-verification (`daemonseed_gui::state::
+// build_announcements_view`) is unit-tested IN the gui crate (a binary crate, so
+// its `pub` does not escape to this integration crate). The test
+// `build_announcements_view_verifies_motd_and_drops_unverifiable_post` proves the
+// verified-in → correct-display-model-out behaviour and that an unverifiable post
+// is dropped (ISC-A-S3). This registration records the coverage; the Slint
+// rendering of the model is felt-test-gated (ISA `## Criteria` ISC-C91 left `[ ]`).
+
+/// ISC-C91: the GUI announcements/MOTD data-prep verifies the relay's served MOTD
+/// + posts client-side and drops anything unverifiable, producing the pane model.
+#[test]
+fn isc_c91_covered() {
+    let mut c = Coverage::empty();
+    c.register(
+        "ISC-C91",
+        "build_announcements_view_verifies_motd_and_drops_unverifiable_post",
+    );
+    assert_eq!(
+        c.covered_count(),
+        1,
+        "ISC-C91 registered (GUI announcement + MOTD display panes)"
+    );
+}

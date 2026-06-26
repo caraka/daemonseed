@@ -52,7 +52,7 @@ use share_browser::{FetchTarget, ManifestRow, NodeKind, ShareBrowser};
 use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType, Rgb565Pixel};
 use slint::platform::{Platform, PlatformError, WindowAdapter};
 use slint::{ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel};
-use state::{CircleState, GuiState, Msg};
+use state::{AnnouncementsView, CircleState, GuiState, Msg};
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -216,6 +216,58 @@ fn roster_model(entries: &[RosterEntry]) -> ModelRc<RosterRow> {
         })
         .collect();
     ModelRc::from(Rc::new(VecModel::from(rows)))
+}
+
+/// Format a signing wall-clock (unix ms, ISC-S7) as a short `YYYY-MM-DD HH:MM UTC`
+/// caption for the announcements pane (#91). Dependency-free — the project avoids a
+/// date crate where a few lines suffice — via the standard days-from-civil
+/// algorithm (Hinnant). A non-positive timestamp (absent / placeholder) renders
+/// empty so the caption simply disappears.
+fn format_unix_ms(ms: i64) -> String {
+    if ms <= 0 {
+        return String::new();
+    }
+    let secs = ms / 1000;
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+    let (hh, mm) = (tod / 3600, (tod % 3600) / 60);
+    // days-from-civil → (year, month, day), epoch 1970-01-01 = day 0.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = if m <= 2 { y + 1 } else { y };
+    format!("{year:04}-{m:02}-{d:02} {hh:02}:{mm:02} UTC")
+}
+
+/// Convert the verified announcements view (#91) into a Slint `[AnnouncementRow]`.
+/// Only client-re-verified posts are ever in `view` (ISC-A-S3), so the whole model
+/// is replaced verbatim — the timestamp is formatted to its UTC caption here.
+fn announcements_model(view: &AnnouncementsView) -> ModelRc<AnnouncementRow> {
+    let rows: Vec<AnnouncementRow> = view
+        .posts
+        .iter()
+        .map(|p| AnnouncementRow {
+            topic: SharedString::from(p.topic.as_str()),
+            body: SharedString::from(p.body.as_str()),
+            ts: SharedString::from(format_unix_ms(p.sent_unix_ms)),
+        })
+        .collect();
+    ModelRc::from(Rc::new(VecModel::from(rows)))
+}
+
+/// Push the verified announcements/MOTD view into the pane props (#91). The MOTD is
+/// the verbatim inert string (`""` hides the MOTD area, ISC-S9); the posts replace
+/// the list model; the status line is cleared on a successful snapshot.
+fn apply_announcements(ui: &AppWindow, view: &AnnouncementsView) {
+    ui.set_motd(SharedString::from(view.motd.as_deref().unwrap_or("")));
+    ui.set_announcements(announcements_model(view));
+    ui.set_announce_status(SharedString::from(""));
 }
 
 /// Convert a circle's `Vec<Msg>` into a Slint `ModelRc<MsgData>`.
@@ -604,6 +656,14 @@ fn build_ui() -> BuiltUi {
             let _ = net.borrow().send(NetCommand::RefreshShares);
         }
     });
+    // #91: opening (or Refresh-ing) the Announcements pane fetches the connected
+    // relay's MOTD + posts; the snapshot lands via NetEvent::PublicSpaceSnapshot.
+    ui.on_announcements_tab_opened({
+        let net = net.clone();
+        move || {
+            let _ = net.borrow().send(NetCommand::RefreshPublicSpace);
+        }
+    });
     ui.on_shares_tab_opened({
         let weak = ui.as_weak();
         let state = state.clone();
@@ -768,6 +828,11 @@ fn build_ui() -> BuiltUi {
         ActionData {
             // Opens the About overlay (#59 — version / license / repo readout).
             label: "About daemonseed".into(),
+            shortcut: "".into(),
+        },
+        ActionData {
+            // #91: opens the Announcements pane + fetches this relay's MOTD/posts.
+            label: "Announcements".into(),
             shortcut: "".into(),
         },
     ];
@@ -1068,8 +1133,17 @@ fn start_drain(
             poll_tick = poll_tick.wrapping_add(1);
             if poll_tick >= 90 {
                 poll_tick = 0;
-                if ui.get_active_tab() == 1 && ui.get_connected() {
-                    let _ = net.borrow().send(NetCommand::RefreshShares);
+                if ui.get_connected() {
+                    // Liveness re-fetch, but only for the open tab (off-tab is silent).
+                    match ui.get_active_tab() {
+                        1 => {
+                            let _ = net.borrow().send(NetCommand::RefreshShares);
+                        }
+                        3 => {
+                            let _ = net.borrow().send(NetCommand::RefreshPublicSpace);
+                        }
+                        _ => {}
+                    }
                 }
             }
         });
@@ -1264,6 +1338,13 @@ fn apply_net_event(
         }
         NetEvent::SharesError { message } => {
             ui.set_share_status(SharedString::from(message));
+        }
+        // ── Announcements + MOTD pane (#91) ──
+        NetEvent::PublicSpaceSnapshot { view } => {
+            apply_announcements(ui, &view);
+        }
+        NetEvent::PublicSpaceError { message } => {
+            ui.set_announce_status(SharedString::from(message));
         }
         NetEvent::FetchManifest {
             share_id,
@@ -1929,6 +2010,7 @@ fn main() {
     let show_shares = args.iter().any(|a| a == "--show-shares");
     let show_publish = args.iter().any(|a| a == "--show-publish");
     let show_desktop_prompt = args.iter().any(|a| a == "--show-desktop-prompt");
+    let show_announcements = args.iter().any(|a| a == "--show-announcements");
     // Round-6 routing: `--portable` resolves the profile under CWD (else XDG).
     // `--first-start [step]` / `--unlock` are OFFSCREEN-only render flags for the
     // new auth screens (windowed routing always uses `resolve`). `portable` feeds
@@ -1964,6 +2046,7 @@ fn main() {
         || show_shares
         || show_publish
         || show_desktop_prompt
+        || show_announcements
         || first_start_flag
         || unlock_flag
         || self_check_requested;
@@ -2228,6 +2311,27 @@ fn main() {
         // Offscreen render of the first-run "add to applications?" prompt (main screen).
         ui.set_screen(SharedString::from("main"));
         ui.set_desktop_prompt_open(true);
+    } else if show_announcements {
+        // Populated Announcements pane, fixture-driven (no relay): a sample MOTD +
+        // two announcements so the PNG shows the #91 display panes (verbatim MOTD
+        // box + scrollable posts list). Mirrors the --show-shares fixture pattern.
+        ui.set_active_tab(3);
+        let view = AnnouncementsView {
+            motd: Some("Welcome — relay maintenance Sunday 02:00-03:00 UTC".to_string()),
+            posts: vec![
+                state::AnnouncementRow {
+                    topic: "releases".to_string(),
+                    body: "v0.31.1 is live — presence roster + per-share index fix.".to_string(),
+                    sent_unix_ms: 1_750_000_000_000,
+                },
+                state::AnnouncementRow {
+                    topic: "general".to_string(),
+                    body: "Thanks to the alpha testers — keep the feedback coming.".to_string(),
+                    sent_unix_ms: 1_750_100_000_000,
+                },
+            ],
+        };
+        apply_announcements(&ui, &view);
     } else {
         // Main shell offscreen: connect (renders connection-status) + drive flags.
         _live = Some(start_drain(
@@ -2316,6 +2420,17 @@ mod tests {
 
     fn sample_challenge() -> TypeBackChallenge {
         TypeBackChallenge::new(PHRASE, &mut OsRng)
+    }
+
+    #[test]
+    fn format_unix_ms_renders_utc_caption() {
+        // 1_000_000_000_000 ms = 2001-09-09 01:46:40 UTC.
+        assert_eq!(format_unix_ms(1_000_000_000_000), "2001-09-09 01:46 UTC");
+        // Epoch start.
+        assert_eq!(format_unix_ms(1), "1970-01-01 00:00 UTC");
+        // Non-positive renders empty (absent / placeholder timestamp).
+        assert_eq!(format_unix_ms(0), "");
+        assert_eq!(format_unix_ms(-5), "");
     }
 
     fn correct_answers(ch: &TypeBackChallenge) -> Vec<String> {
