@@ -107,6 +107,33 @@ The seed above is realized, with one refinement: the fan-out is **shared-owner `
 - **Single encryption layer — verbatim DHT storage (caraka).** We do NOT use Veilid's DHT value-encryption layer. The rendezvous record key is derived with no Veilid encryption key, so Veilid stores values verbatim (our cot-sealed, post-quantum ciphertext); the DHT sees ciphertext exactly as the relay did (ISC-A-S2). This is forced by a Veilid wrinkle: `create_dht_record` always assigns a *random* per-record encryption key (`create_record.rs:87`) that is not part of the record address, so a deterministic owner gives a shared address but NOT a shared value-encryption key — members would read each other's writes as garbage. `open_or_create` reopens the record with the no-encryption-key record key, which resets the handle to verbatim storage (`open_record.rs`). This was the first live-oracle failure on orinoco (B read A's bytes but they would not open, because A's writes were encrypted under a random key B could not derive). Beyond simplicity, keeping content crypto decoupled from Veilid's *classical* transport crypto preserves a free path to adopt a future Veilid-PQC (VLD1-class) suite without touching content security.
 - **Oracle.** `crates/daemonseed-veilid-net/tests/two_node_circle.rs` (#99, `#[ignore]`): two members derive the same rendezvous from the entropy, one publishes a sealed `CircleMessage`, the other receives + opens it, an outsider key cannot. Runs on a real-network host (orinoco) — this VM's NAT blocks public attach.
 
+## #98 — App integration (the AppSession swap)
+
+> Accepted 2026-06-26 (caraka). The first step of putting Veilid behind the real UI. Circles-only now; grows into the full cutover as Phases 3–4 land.
+
+**The seam.** The GUI and TUI drive transport through a net actor with an identical `NetCommand` / `NetEvent` contract (`crates/daemonseed-{gui,tui}/src/net.rs`); the UI sends commands and drains events and never touches the transport directly. The actor's *internals* use `AppSession` (the gRPC-over-h2 relay client, `crates/daemonseed-cli/src/session.rs`). #98 swaps those internals for `VeilidNetHandle` while keeping the contract stable — so the UI (Slint / ratatui) does not change.
+
+**Capability gap — only circles are ready.** `Connect`→`attach_and_wait`, `JoinCircle`/`SendCircle`→`subscribe_circle`/`publish_circle`, `CircleMessage`←`Inbound` are all Phase 2 and available. `SendRoom` (lobby), MOTD/announcements, presence/roster are Phase 4; `PublishShare`/`FetchShare`/`serve_share` are Phase 3 — all `Unimplemented` in veilid-net today.
+
+**Decision — parallel Veilid actor behind a `veilid` feature flag, circles-only.**
+- A new net actor (new module) implements the SAME `NetCommand`/`NetEvent`, backed by `VeilidNetHandle`. `NetHandle::new()` selects the backend (relay default; Veilid when the flag is on). The UI is unchanged.
+- Circle commands route to veilid-net; lobby/shares/presence/MOTD commands return `NetEvent::Error("not yet on Veilid")` until Phases 3/4 fill them in. This is a degraded-but-honest dev/test mode, **not** a dual-transport — it honors the no-relay↔Veilid-interop clean cut (one transport at a time).
+- At the v0.33.0 cutover the flag flips to Veilid-default and the relay actor is deleted.
+
+**Dependency — optional dep behind the `veilid` feature.** gui/tui declare `daemonseed-veilid-net` as `optional = true`, gated by a `veilid` feature. veilid-core enters the workspace `Cargo.lock` (inert lockfile entries), but default builds and the CI relay gate do NOT compile it, so the frozen relay BUILD stays unperturbed; `--features veilid` compiles the Veilid path. The `[workspace] exclude` on veilid-net stays until the cutover.
+
+**Connect semantics in Veilid mode.** No relay address or identity-proof handshake: `Connect` = `attach_and_wait` + store the derived identity; bootstrap is baked into config (D1/D4). `JoinCircle{phrase}` derives both `cot_key` (content) and the rendezvous-owner seed (`derive_circle_veilid_owner_seed`) from the phrase, then `subscribe_circle`; `SendCircle` = `publish_circle`. The `server_id` namespace vanishes (circle rendezvous is global per D4).
+
+**Stepwise plan (pause points marked).**
+- **S0** — this design-of-record. ⏸ caraka review
+- **S1** — add the `veilid` feature + optional dep to gui/tui; verify default (relay) build + the frozen workspace gate are unchanged and `--features veilid` compiles. ⏸ gates
+- **S2** — build the parallel Veilid net actor (circles + attach; lobby/shares/presence → not-yet-on-Veilid); unit-test. ⏸
+- **S3** — UI bridge: `NetHandle::new()` backend selection (gui + tui); UI unchanged. ⏸
+- **S4** — live felt-test on orinoco: two clients in Veilid mode join a circle by phrase and exchange messages. ⏸ felt-test
+- **S5** — doc-sync + commit on `feat/veilid-migration`; #98 stays open (circles-only) until Phases 3/4 + the cutover flip.
+
+**Out of scope for #98.** Lobby/public-room, shares, presence/roster, MOTD/announcements (Phases 3/4); the cutover flag-flip + relay-actor deletion (Phase 5); the federation introducer (becomes Veilid bootstrap, not a runtime RPC).
+
 ## Cutover mechanics
 
 Greenfield fresh local repo; copy keep-set crates (`daemonseed-core`, `daemonseed-proto`, gui/tui) ~intact; write `veilid-net`; drop `daemonseed-server`. Land onto `github.com/caraka/daemonseed` as a **signed v0.33.0 tree-replacement cutover commit** (not a squash of unrelated histories) — preserves name/history/tags/issues/version line. **No relay↔Veilid interop** (clean cut); identity carries over via the phrase; bootstrap baked in.
