@@ -57,7 +57,7 @@ All six crates are substantive as of the alpha1 MVP (M12). The `tui` crate — t
 
 ## Status
 
-Current release: **v0.31.1** — alpha (post-MVP). GUI chat polish: the transcript auto-scrolls to the newest message, other people's messages use the readable green bubble (your own the dark one), messages wrap in variable-height bubbles, and a long pasted draft or message no longer pushes the chat column off-screen. See `CHANGELOG.md` for per-release detail.
+Current release: **v0.32.0** — alpha (post-MVP). Announcements & MOTD admin: a relay operator whose key is on the signer whitelist can author the MOTD and announcements in-band from the app, and everyone gets read-only announcement/MOTD panes with an unread-gated landing on connect. Also adds per-circle connected-presence, identity rename from the Ctrl-K palette, a reachable circle-details sheet (name vectors + verification fingerprint), right-click clipboard menus, and persistent custom share names. See `CHANGELOG.md` for per-release detail.
 
 The per-release history lives in **[`CHANGELOG.md`](CHANGELOG.md)** (one entry per SSH-signed tag) — this section is intentionally kept to the current release so it can't silently drift. The release-signing *infrastructure* (real keys, Sigstore co-signature, reproducible builds, store / package-manager channels) and the platform features (biometric login, OS-native autostart) remain on a follow-up track; direct messaging is planned. Promotion to a public repository is gated on the `oxicrypt` sibling crate going public.
 
