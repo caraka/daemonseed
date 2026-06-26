@@ -433,7 +433,7 @@ export component AppWindow inherits Window {
     // Flickable's visible height).
     out property <bool> chat-at-bottom:
         root.scroll-y <= -(root.chat-content-h - chat-area.height) + 24px;
-    in property <bool> sheet-open: false;
+    in-out property <bool> sheet-open: false;
     // #36 circle-detail name vectors, set from `GuiState` for the active circle (all
     // blank for the Lobby, which has no net contract → the vector rows hide). The
     // three are distinct on purpose: `circle-name` is the chosen display name;
@@ -749,6 +749,13 @@ export component AppWindow inherits Window {
                             color: root.connected ? #6fb3a4 : #5b6472;
                             font-size: 11px;
                             vertical-alignment: center;
+                        }
+                        // #35: open the Circle-details sheet — per-circle only
+                        // (hidden on the Lobby, which has no phrase/fingerprint).
+                        // `if` (not `visible:`) leaves no layout gap on the Lobby.
+                        if root.active != 0 : PillButton {
+                            label: "Details"; w: 88px;
+                            clicked => { root.sheet-open = true; }
                         }
                         SealedPill { }
                     }
@@ -1067,11 +1074,19 @@ export component AppWindow inherits Window {
     sheet := Rectangle {
         y: 0; width: 340px; height: root.height;
         x: root.sheet-open ? root.width - self.width : root.width;
+        // `visible:`-gated so the pane isn't permanently mounted off-screen (a
+        // resize-flash source); it exists only while open. `sheet-open` is `in-out`
+        // so the header Details button opens it and the Close button dismisses it.
+        visible: root.sheet-open;
         animate x { duration: 220ms; easing: ease-in-out; }
         background: #101113; border-width: 1px; border-color: #ffffff14;
         VerticalLayout {
             padding: 16px; spacing: 10px; alignment: start;
-            Text { text: "Circle details"; color: #e4e8ee; font-size: 15px; }
+            HorizontalLayout {
+                Text { text: "Circle details"; color: #e4e8ee; font-size: 15px; vertical-alignment: center; }
+                Rectangle { }
+                PillButton { label: "Close"; w: 70px; clicked => { root.sheet-open = false; } }
+            }
             Text { text: "end-to-end encrypted"; color: #6fb3a4; font-size: 12px; }
             Text { text: "members — identity only, no presence"; color: #5b6472; font-size: 12px; }
 
