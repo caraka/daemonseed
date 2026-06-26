@@ -90,7 +90,7 @@ fn isc_s31_covered() {
 // symmetric counterpart to the read/verify helpers — at the library level.
 
 use daemonseed_cli::public_space::{
-    local_key_is_whitelisted, sign_post, verify_served_post, whitelist_from_wire,
+    composer_visible, local_key_is_whitelisted, sign_post, verify_served_post, whitelist_from_wire,
 };
 
 fn full_key_entry(signer: &SignKeypair) -> wire::SignerWhitelistEntry {
@@ -180,5 +180,44 @@ fn isc_c91_covered() {
         c.covered_count(),
         1,
         "ISC-C91 registered (GUI announcement + MOTD display panes)"
+    );
+}
+
+// ── #92 signer-gated MOTD/announcement composer (ISC-C92) ─────────────────
+//
+// The shared gating predicate (`daemonseed_cli::public_space::composer_visible`)
+// is what both clients (GUI + TUI) gate the composer affordance on: it is true iff
+// the local stable identity key is on the relay's published whitelist, and fails
+// CLOSED on an empty / malformed whitelist. The Slint composer + TUI composer that
+// surface this verdict are felt-test-gated (ISA `## Criteria` ISC-C92 left `[ ]`).
+
+/// ISC-C92: the signer-gated composer predicate — `composer_visible` is true only
+/// when the local stable identity key is on the relay's published whitelist, and
+/// false for a non-signer and a malformed/empty whitelist (fail-closed). This is
+/// the boolean the GUI + TUI gate the MOTD/announcement composer on (D3).
+#[test]
+fn client_signer_composer_gating() {
+    let signer = keypair(124);
+    let stranger = keypair(125);
+    let entries = [full_key_entry(&signer)];
+    // On-list signer → composer shown.
+    assert!(composer_visible(signer.public_key(), &entries));
+    // Off-list key → composer hidden.
+    assert!(!composer_visible(stranger.public_key(), &entries));
+    // No published signers → composer hidden (read-only pane).
+    assert!(!composer_visible(signer.public_key(), &[]));
+    // Malformed published whitelist (no `entry` oneof) → fail-closed.
+    let malformed = wire::SignerWhitelistEntry { entry: None };
+    assert!(!composer_visible(signer.public_key(), &[malformed]));
+}
+
+#[test]
+fn isc_c92_covered() {
+    let mut c = Coverage::empty();
+    c.register("ISC-C92", "client_signer_composer_gating");
+    assert_eq!(
+        c.covered_count(),
+        1,
+        "ISC-C92 registered (signer-gated composer)"
     );
 }

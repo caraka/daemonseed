@@ -969,6 +969,29 @@ functions:
           condition: The oxicrypt module was not operational for the hash-prefix authorization check.
     iscs: [S8]
 
+  - name: composer_visible
+    module: daemonseed_cli::public_space
+    description: >-
+      The composer-gating decision (ISC-S8 / D3): true iff the local stable
+      identity key is on the relay's published signer whitelist. Fail-closed —
+      any conversion / authorization error yields false. The shared boolean both
+      the GUI and TUI gate the MOTD/announcement composer affordance on; a
+      non-signer key gets the read-only pane.
+    signature: "pub fn composer_visible(local_pubkey: &[u8], entries: &[wire::SignerWhitelistEntry]) -> bool"
+    parameters:
+      - name: local_pubkey
+        type: "&[u8]"
+        direction: in
+        description: The local stable identity's public key.
+      - name: entries
+        type: "&[wire::SignerWhitelistEntry]"
+        direction: in
+        description: The relay's published whitelist wire entries.
+    returns:
+      type: bool
+      description: Whether to show the composer (true) or keep the pane read-only (false, incl. on any whitelist error).
+    iscs: [S8]
+
   # ── daemonseed_cli::session ───────────────────────────────────────
   - name: "AppSession::open"
     module: daemonseed_cli::session

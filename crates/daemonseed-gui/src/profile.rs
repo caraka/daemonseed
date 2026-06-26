@@ -22,6 +22,9 @@
 use std::path::PathBuf;
 
 use daemonseed_core::first_start::SessionMaterials;
+use daemonseed_core::identity::keys::{
+    Identity, KeyDerivationError, SignKeypair, derive_identity_keys,
+};
 use daemonseed_core::profile::persist::write_seeds_blob;
 use daemonseed_core::storage::seeds::{IndexKey, SealingKey, Seeds};
 
@@ -73,6 +76,18 @@ impl Profile {
     /// The stable presented name.
     pub fn display_handle(&self) -> &str {
         &self.display_handle
+    }
+
+    /// (#92) Derive the STABLE persistent identity signing keypair from the
+    /// unlocked profile's mnemonic — `derive_identity_keys(.., Identity::Primary)`,
+    /// the SAME key behind the `name#hash` handle an operator whitelists. This is
+    /// the key the signer-gated composer gates on and signs MOTD/announcements
+    /// with, NOT the per-launch ephemeral connection-proof key (which proves the
+    /// connection but is unknown to any whitelist). Deriving runs crypto, so the
+    /// caller derives ONCE on unlock/connect and hands the key to the net actor to
+    /// hold — never per keystroke.
+    pub fn stable_signing_key(&self) -> Result<SignKeypair, KeyDerivationError> {
+        derive_identity_keys(&self.seeds.mnemonic, Identity::Primary).map(|k| k.signing)
     }
 
     /// (#81) The persisted-index home + key the net actor opens per-share indexes

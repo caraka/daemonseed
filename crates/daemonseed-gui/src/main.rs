@@ -261,13 +261,16 @@ fn announcements_model(view: &AnnouncementsView) -> ModelRc<AnnouncementRow> {
     ModelRc::from(Rc::new(VecModel::from(rows)))
 }
 
-/// Push the verified announcements/MOTD view into the pane props (#91). The MOTD is
-/// the verbatim inert string (`""` hides the MOTD area, ISC-S9); the posts replace
-/// the list model; the status line is cleared on a successful snapshot.
-fn apply_announcements(ui: &AppWindow, view: &AnnouncementsView) {
+/// Push the verified announcements/MOTD view into the pane props (#91/#92). The
+/// MOTD is the verbatim inert string (`""` hides the MOTD area, ISC-S9); the posts
+/// replace the list model; the status line is cleared on a successful snapshot.
+/// `can_compose` (#92) toggles the signer-gated composer: true reveals the
+/// MOTD/announcement composer, false leaves the pane read-only.
+fn apply_announcements(ui: &AppWindow, view: &AnnouncementsView, can_compose: bool) {
     ui.set_motd(SharedString::from(view.motd.as_deref().unwrap_or("")));
     ui.set_announcements(announcements_model(view));
     ui.set_announce_status(SharedString::from(""));
+    ui.set_can_compose(can_compose);
 }
 
 /// Convert a circle's `Vec<Msg>` into a Slint `ModelRc<MsgData>`.
@@ -662,6 +665,29 @@ fn build_ui() -> BuiltUi {
         let net = net.clone();
         move || {
             let _ = net.borrow().send(NetCommand::RefreshPublicSpace);
+        }
+    });
+    // #92: the signer-gated composer (shown only when `can-compose` is true). The
+    // net actor signs with the held STABLE identity key and uploads via
+    // UploadMotd/UploadPost; a non-plaintext MOTD or a refused upload surfaces as a
+    // NetEvent::PublicSpaceError (rendered into the status line). On success the
+    // actor re-runs the public-space fetch, so the new content lands via the
+    // PublicSpaceSnapshot path.
+    ui.on_set_motd({
+        let net = net.clone();
+        move |text| {
+            let _ = net.borrow().send(NetCommand::SetMotd {
+                text: text.to_string(),
+            });
+        }
+    });
+    ui.on_upload_announcement({
+        let net = net.clone();
+        move |topic, body| {
+            let _ = net.borrow().send(NetCommand::UploadAnnouncement {
+                topic: topic.to_string(),
+                body: body.to_string(),
+            });
         }
     });
     ui.on_shares_tab_opened({
@@ -1186,7 +1212,7 @@ fn connect_now(
     match crypto {
         Ok(()) => {
             let (server_id, address) = relay_target();
-            let (display_handle, rejoin_circles, republish_roots, index_params) = {
+            let (display_handle, rejoin_circles, republish_roots, index_params, stable_signing_key) = {
                 let st = state.borrow();
                 (
                     st.display_handle(),
@@ -1196,6 +1222,9 @@ fn connect_now(
                         .map(|(root, name)| (PathBuf::from(root), name))
                         .collect::<Vec<_>>(),
                     st.persisted_index_params(),
+                    // (#92) Derive the stable identity signing key ONCE per connect
+                    // and hand it to the net actor to hold for composer-gating + signing.
+                    st.stable_signing_key(),
                 )
             };
             let _ = net.borrow().send(NetCommand::Connect {
@@ -1205,6 +1234,7 @@ fn connect_now(
                 rejoin_circles,
                 republish_roots,
                 index_params,
+                stable_signing_key,
             });
         }
         Err(reason) => {
@@ -1339,9 +1369,9 @@ fn apply_net_event(
         NetEvent::SharesError { message } => {
             ui.set_share_status(SharedString::from(message));
         }
-        // ── Announcements + MOTD pane (#91) ──
-        NetEvent::PublicSpaceSnapshot { view } => {
-            apply_announcements(ui, &view);
+        // ── Announcements + MOTD pane (#91/#92) ──
+        NetEvent::PublicSpaceSnapshot { view, can_compose } => {
+            apply_announcements(ui, &view, can_compose);
         }
         NetEvent::PublicSpaceError { message } => {
             ui.set_announce_status(SharedString::from(message));
@@ -2011,6 +2041,10 @@ fn main() {
     let show_publish = args.iter().any(|a| a == "--show-publish");
     let show_desktop_prompt = args.iter().any(|a| a == "--show-desktop-prompt");
     let show_announcements = args.iter().any(|a| a == "--show-announcements");
+    // (#92) `--show-composer` renders the SAME Announcements pane as the SIGNER
+    // (can_compose = true) so the offscreen PNG shows the composer affordance;
+    // `--show-announcements` renders it as a NON-signer (composer absent, read-only).
+    let show_composer = args.iter().any(|a| a == "--show-composer");
     // Round-6 routing: `--portable` resolves the profile under CWD (else XDG).
     // `--first-start [step]` / `--unlock` are OFFSCREEN-only render flags for the
     // new auth screens (windowed routing always uses `resolve`). `portable` feeds
@@ -2047,6 +2081,7 @@ fn main() {
         || show_publish
         || show_desktop_prompt
         || show_announcements
+        || show_composer
         || first_start_flag
         || unlock_flag
         || self_check_requested;
@@ -2311,10 +2346,12 @@ fn main() {
         // Offscreen render of the first-run "add to applications?" prompt (main screen).
         ui.set_screen(SharedString::from("main"));
         ui.set_desktop_prompt_open(true);
-    } else if show_announcements {
+    } else if show_announcements || show_composer {
         // Populated Announcements pane, fixture-driven (no relay): a sample MOTD +
         // two announcements so the PNG shows the #91 display panes (verbatim MOTD
         // box + scrollable posts list). Mirrors the --show-shares fixture pattern.
+        // (#92) `--show-composer` renders it with can_compose = true so the signer
+        // composer affordance is present; `--show-announcements` leaves it read-only.
         ui.set_active_tab(3);
         let view = AnnouncementsView {
             motd: Some("Welcome — relay maintenance Sunday 02:00-03:00 UTC".to_string()),
@@ -2331,7 +2368,7 @@ fn main() {
                 },
             ],
         };
-        apply_announcements(&ui, &view);
+        apply_announcements(&ui, &view, show_composer);
     } else {
         // Main shell offscreen: connect (renders connection-status) + drive flags.
         _live = Some(start_drain(

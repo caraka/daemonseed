@@ -331,6 +331,20 @@ export component AppWindow inherits Window {
     in-out property <string> announce-status;
     in property <string> announcements-empty-hint: "No announcements from this relay yet.";
     callback announcements-tab-opened();
+    // ── Signer-gated composer (#92 / D3) — shown ONLY when the local stable
+    // identity key is on the relay's published whitelist. `can-compose` is set
+    // by the PublicSpaceSnapshot (never by typing), so gating the composer
+    // subtree with an `if` is safe. A non-signer never sees these affordances
+    // (read-only pane). `set-motd` signs+uploads the MOTD (UploadMotd, #89);
+    // `upload-announcement(topic, body)` signs+uploads a post (UploadPost). The
+    // net actor signs with the STABLE identity key; a plaintext-rule rejection or
+    // refused upload returns via `announce-status`.
+    in property <bool> can-compose;
+    in-out property <string> compose-motd;
+    in-out property <string> compose-topic;
+    in-out property <string> compose-body;
+    callback set-motd(string);
+    callback upload-announcement(string, string);
 
     // ── Shares tab (public-share browse tree) ──
     // `share-rows` is the flattened, render-ready tree (Rust rebuilds it on refresh /
@@ -807,6 +821,64 @@ export component AppWindow inherits Window {
                                         text: root.announcements-empty-hint;
                                         visible: root.announcements.length == 0;
                                         color: #5b6472; font-size: 13px; horizontal-alignment: center;
+                                    }
+                                }
+                                // (#92) signer-gated composer — present ONLY for a
+                                // whitelisted signer (`can-compose`, set on snapshot,
+                                // not by typing → an `if` here is safe). A non-signer
+                                // never sees it, so the pane stays read-only.
+                                if root.can-compose : VerticalLayout {
+                                    spacing: 8px;
+                                    Rectangle { height: 1px; background: #ffffff14; }
+                                    Text { text: "Compose — you can post here"; color: #6fb3a4; font-size: 12px; font-weight: 600; }
+                                    // MOTD setter — single line, plaintext (ISC-S9).
+                                    Rectangle {
+                                        height: 40px; border-radius: 9px; background: #141517; border-width: 1px; border-color: #ffffff12; clip: true;
+                                        HorizontalLayout { padding-left: 12px;
+                                            Text { text: "Set MOTD (single line, plain text)"; visible: root.compose-motd == ""; color: #4d5560; font-size: 13px; vertical-alignment: center; }
+                                        }
+                                        HorizontalLayout { padding-left: 12px; padding-right: 12px;
+                                            motd_input := TextInput {
+                                                text <=> root.compose-motd;
+                                                color: #d6dae1; font-size: 13px; vertical-alignment: center; single-line: true;
+                                                accepted => { root.set-motd(root.compose-motd); }
+                                            }
+                                        }
+                                    }
+                                    HorizontalLayout {
+                                        Rectangle { }
+                                        PillButton { label: "Set MOTD"; w: 110px; clicked => { root.set-motd(root.compose-motd); } }
+                                    }
+                                    // Announcement composer — topic + body.
+                                    Rectangle {
+                                        height: 40px; border-radius: 9px; background: #141517; border-width: 1px; border-color: #ffffff12; clip: true;
+                                        HorizontalLayout { padding-left: 12px;
+                                            Text { text: "Topic"; visible: root.compose-topic == ""; color: #4d5560; font-size: 13px; vertical-alignment: center; }
+                                        }
+                                        HorizontalLayout { padding-left: 12px; padding-right: 12px;
+                                            topic_input := TextInput {
+                                                text <=> root.compose-topic;
+                                                color: #d6dae1; font-size: 13px; vertical-alignment: center; single-line: true;
+                                                accepted => { body_input.focus(); }
+                                            }
+                                        }
+                                    }
+                                    Rectangle {
+                                        height: 40px; border-radius: 9px; background: #141517; border-width: 1px; border-color: #ffffff12; clip: true;
+                                        HorizontalLayout { padding-left: 12px;
+                                            Text { text: "Announcement body"; visible: root.compose-body == ""; color: #4d5560; font-size: 13px; vertical-alignment: center; }
+                                        }
+                                        HorizontalLayout { padding-left: 12px; padding-right: 12px;
+                                            body_input := TextInput {
+                                                text <=> root.compose-body;
+                                                color: #d6dae1; font-size: 13px; vertical-alignment: center; single-line: true;
+                                                accepted => { root.upload-announcement(root.compose-topic, root.compose-body); }
+                                            }
+                                        }
+                                    }
+                                    HorizontalLayout {
+                                        Rectangle { }
+                                        PillButton { label: "Post announcement"; primary: true; w: 180px; clicked => { root.upload-announcement(root.compose-topic, root.compose-body); } }
                                     }
                                 }
                             }

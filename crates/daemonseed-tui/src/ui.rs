@@ -787,17 +787,75 @@ fn render_public_shares_pane(app: &App, frame: &mut Frame, area: Rect) {
 }
 
 /// The Public Space view (ISC-25 / ISC-S7 / ISC-A-S3): the connected relay's
-/// MOTD (rendered inert) stacked above its announcement posts. A read-only
-/// surface over already-shipped server APIs — there is no publish affordance on
-/// this client (publishing is operator-side).
+/// MOTD (rendered inert) stacked above its announcement posts. Read-only for a
+/// non-signer; a whitelisted signer (#92, `can_compose`) additionally gets a
+/// bottom composer bar to set the MOTD / post an announcement, signed with the
+/// stable identity key. Whitelist membership stays operator-only / out-of-band.
 fn render_public_space(app: &App, frame: &mut Frame, area: Rect) {
+    let constraints = if app.can_compose() {
+        // Reserve a bottom composer bar for the signer affordance.
+        vec![
+            Constraint::Length(6),
+            Constraint::Min(3),
+            Constraint::Length(3),
+        ]
+    } else {
+        vec![Constraint::Length(6), Constraint::Min(3)]
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(6), Constraint::Min(3)])
+        .constraints(constraints)
         .split(area);
 
     render_motd_pane(app, frame, chunks[0]);
     render_announcements_pane(app, frame, chunks[1]);
+    if app.can_compose() {
+        render_public_composer(app, frame, chunks[2]);
+    }
+}
+
+/// (#92) The signer-gated composer bar — shown only when the local stable identity
+/// key is on the relay's published whitelist (`can_compose`). The hint line reflects
+/// the active [`PublicComposeMode`]: idle advertises `[m]`/`[a]`; an open field
+/// echoes its buffer with a cursor and the Enter/Esc affordances. The signing +
+/// upload happens net-side under the stable identity key.
+fn render_public_composer(app: &App, frame: &mut Frame, area: Rect) {
+    use crate::app::PublicComposeMode;
+    let (title, line) = match app.compose_mode() {
+        PublicComposeMode::None => (
+            " compose (signer) ",
+            "[m] set MOTD   [a] new announcement   [r] refresh".to_owned(),
+        ),
+        PublicComposeMode::Motd => (
+            " set MOTD (single line, plain text) ",
+            format!(
+                "{}\u{2588}   [Enter] post  [Esc] cancel",
+                app.compose_motd()
+            ),
+        ),
+        PublicComposeMode::Topic => (
+            " new announcement · topic ",
+            format!(
+                "{}\u{2588}   [Enter] next  [Esc] cancel",
+                app.compose_topic()
+            ),
+        ),
+        PublicComposeMode::Body => (
+            " new announcement · body ",
+            format!(
+                "{}\u{2588}   [Enter] post  [Esc] cancel",
+                app.compose_body()
+            ),
+        ),
+    };
+    let body = Paragraph::new(line).wrap(Wrap { trim: false }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(title.to_owned())
+            .title_alignment(Alignment::Left)
+            .style(Style::default().fg(Color::Cyan)),
+    );
+    frame.render_widget(body, area);
 }
 
 /// The MOTD pane (ISC-25): the relay's message of the day, already rendered

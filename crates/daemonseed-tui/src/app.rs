@@ -7,6 +7,7 @@
 use daemonseed_core::backoff::CloseCause;
 use daemonseed_core::first_start::SessionMaterials;
 use daemonseed_core::handle::{DisplayMode, Handle};
+use daemonseed_core::identity::keys::SignKeypair;
 use daemonseed_core::passphrase::strength::{self, CircleStrength};
 use daemonseed_core::profile::config::ArgonParams;
 use daemonseed_core::share_catalog::ShareListing;
@@ -175,6 +176,23 @@ pub enum MainFocus {
     /// path, Enter extracts the selected download's files there (path-traversal
     /// safe, ISC-A-C32). Opening the pane requests a fresh list (`ListFetched`).
     Fetched,
+}
+
+/// (#92) Public-space composer sub-mode, active only for a whitelisted signer
+/// (`can_compose`). `None` is the read-only display state (Up/Down navigate posts,
+/// `r` refreshes, `m`/`a` open a composer). The other variants capture keystrokes
+/// into the matching buffer; `Esc` cancels back to `None`. Non-signers never leave
+/// `None` (the open keys are ignored), keeping the pane read-only (D3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicComposeMode {
+    /// Read-only display (no composer open).
+    None,
+    /// Typing the single-line MOTD (ISC-S9); Enter signs+uploads via `UploadMotd`.
+    Motd,
+    /// Typing the announcement topic; Enter advances to [`PublicComposeMode::Body`].
+    Topic,
+    /// Typing the announcement body; Enter signs+uploads via `UploadPost`.
+    Body,
 }
 
 /// One indexed file in the user's own share, as rendered in the My-shares
@@ -884,6 +902,24 @@ pub struct App {
     /// (drained once). Set when the user opens the Public Space pane or presses
     /// `r`; the binary translates it into a `NetCommand::RefreshPublicSpace`.
     pending_public_space_refresh: bool,
+    /// (#92) Signer self-determination verdict from the latest `PublicSpaceSnapshot`
+    /// (`composer_visible`): `true` iff the held stable identity key is on the
+    /// relay's published whitelist. Gates the composer affordance — `false` keeps
+    /// the pane read-only (non-signer / ephemeral path).
+    can_compose: bool,
+    /// (#92) The active public-space composer sub-mode (`None` = read-only).
+    compose_mode: PublicComposeMode,
+    /// (#92) The composer buffers: the single-line MOTD draft, and the
+    /// announcement topic + body drafts. Cleared after a submit or `Esc`.
+    compose_motd: String,
+    compose_topic: String,
+    compose_body: String,
+    /// (#92) A queued signed-MOTD upload the binary forwards as `NetCommand::SetMotd`
+    /// (drained once). The net actor signs with the stable key and uploads.
+    pending_set_motd: Option<String>,
+    /// (#92) A queued signed-announcement upload `(topic, body)` the binary forwards
+    /// as `NetCommand::UploadAnnouncement` (drained once).
+    pending_upload_announcement: Option<(String, String)>,
     /// Latest deprecation-warning snapshot from the net actor (ISC-C25), one row
     /// per in-use suite the verified policy schedules for retirement. Replaced
     /// wholesale on each `DeprecationSnapshot` (idempotent — never appended), so
@@ -1022,6 +1058,13 @@ impl App {
             public_motd: None,
             public_posts: Vec::new(),
             post_sel: 0,
+            can_compose: false,
+            compose_mode: PublicComposeMode::None,
+            compose_motd: String::new(),
+            compose_topic: String::new(),
+            compose_body: String::new(),
+            pending_set_motd: None,
+            pending_upload_announcement: None,
             pending_public_space_refresh: false,
             deprecation_warnings: Vec::new(),
             deprecation_policy_version: None,
@@ -1556,9 +1599,15 @@ impl App {
                 }
             }
             NetEvent::ShareDefineFailed { message } => self.status = Some(message),
-            NetEvent::PublicSpaceSnapshot { motd, posts } => {
+            NetEvent::PublicSpaceSnapshot {
+                motd,
+                posts,
+                can_compose,
+            } => {
                 self.public_motd = motd;
                 self.public_posts = posts;
+                // (#92) Signer-gating verdict for the composer affordance.
+                self.can_compose = can_compose;
                 // Clamp the selection so it never points past the new list.
                 let max_idx = self.public_posts.len().saturating_sub(1);
                 if self.post_sel > max_idx {
@@ -1983,6 +2032,58 @@ impl App {
         std::mem::replace(&mut self.pending_public_space_refresh, false)
     }
 
+    /// (#92) Signer self-determination verdict for the latest snapshot: `true` iff
+    /// the local stable identity key is on the relay's published whitelist
+    /// (`composer_visible`). Gates the composer affordance in the Public Space view.
+    pub fn can_compose(&self) -> bool {
+        self.can_compose
+    }
+
+    /// (#92) The active public-space composer sub-mode (`None` = read-only display),
+    /// for the Public Space view's composer rendering.
+    pub fn compose_mode(&self) -> PublicComposeMode {
+        self.compose_mode
+    }
+
+    /// (#92) The current composer buffers — the MOTD draft, the announcement topic
+    /// draft, and the announcement body draft — for echoing the active field.
+    pub fn compose_motd(&self) -> &str {
+        &self.compose_motd
+    }
+    pub fn compose_topic(&self) -> &str {
+        &self.compose_topic
+    }
+    pub fn compose_body(&self) -> &str {
+        &self.compose_body
+    }
+
+    /// (#92) Take a queued signed-MOTD upload (drained once by the binary into a
+    /// `NetCommand::SetMotd`). The net actor signs with the held stable key.
+    pub fn take_pending_set_motd(&mut self) -> Option<String> {
+        self.pending_set_motd.take()
+    }
+
+    /// (#92) Take a queued signed-announcement upload `(topic, body)` (drained once
+    /// by the binary into a `NetCommand::UploadAnnouncement`).
+    pub fn take_pending_upload_announcement(&mut self) -> Option<(String, String)> {
+        self.pending_upload_announcement.take()
+    }
+
+    /// (#92) Derive the STABLE persistent identity signing key from the unlocked
+    /// profile's mnemonic — `derive_identity_keys(.., Identity::Primary)`, the key
+    /// behind the whitelisted `name#hash` handle — for the binary to hand to the net
+    /// actor on Connect (composer gating + MOTD/announcement signing). `None` on the
+    /// ephemeral / no-profile path (no seeds) or if derivation fails.
+    pub fn stable_signing_key(&self) -> Option<SignKeypair> {
+        let seeds = self.seeds.as_ref()?;
+        daemonseed_core::identity::keys::derive_identity_keys(
+            &seeds.mnemonic,
+            daemonseed_core::identity::keys::Identity::Primary,
+        )
+        .ok()
+        .map(|k| k.signing)
+    }
+
     /// Latest deprecation-warning rows (ISC-C25), for the Deprecation view. One
     /// row per in-use suite the verified policy schedules for retirement.
     pub fn deprecation_warnings(&self) -> &[DeprecationWarningRow] {
@@ -2167,6 +2268,16 @@ impl App {
     /// between the chat compose box and the circle-join box, `Esc` leaves to
     /// Welcome, and printable keys / Enter drive whichever input has focus.
     fn on_key_main(&mut self, key: KeyEvent) {
+        // (#92) While the public-space composer is open, every key (incl. Esc/Tab)
+        // belongs to it: Esc cancels the compose rather than opening the menu, and
+        // chars/Enter drive the active field. Route before the global Esc/Tab so the
+        // composer owns the keystream until it submits or cancels.
+        if matches!(self.main_focus, MainFocus::PublicSpace)
+            && self.compose_mode != PublicComposeMode::None
+        {
+            self.on_key_public_space(key);
+            return;
+        }
         match key.code {
             // Item E / ISC-A-C27: "back" never strands the user at the
             // enrollment wizard. Esc opens the logged-in menu (confirm
@@ -2295,18 +2406,85 @@ impl App {
     /// list); `r` requests a fresh snapshot. No write affordances: the public
     /// space is a read surface for this client (publishing is operator-side).
     fn on_key_public_space(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Up => self.post_sel = self.post_sel.saturating_sub(1),
-            KeyCode::Down => {
-                let max = self.public_posts.len().saturating_sub(1);
-                if self.post_sel < max {
-                    self.post_sel += 1;
+        match self.compose_mode {
+            // Read-only display: Up/Down navigate posts, `r` refreshes, and (for a
+            // signer only, ISC-S8 / D3) `m` / `a` open the composer.
+            PublicComposeMode::None => match key.code {
+                KeyCode::Up => self.post_sel = self.post_sel.saturating_sub(1),
+                KeyCode::Down => {
+                    let max = self.public_posts.len().saturating_sub(1);
+                    if self.post_sel < max {
+                        self.post_sel += 1;
+                    }
                 }
-            }
-            KeyCode::Char('r') | KeyCode::Char('R') => {
-                self.pending_public_space_refresh = true;
-            }
-            _ => {}
+                KeyCode::Char('r') | KeyCode::Char('R') => {
+                    self.pending_public_space_refresh = true;
+                }
+                // (#92) composer entry — gated on the signer verdict; ignored for a
+                // non-signer so the pane stays read-only.
+                KeyCode::Char('m') | KeyCode::Char('M') if self.can_compose => {
+                    self.compose_motd.clear();
+                    self.compose_mode = PublicComposeMode::Motd;
+                }
+                KeyCode::Char('a') | KeyCode::Char('A') if self.can_compose => {
+                    self.compose_topic.clear();
+                    self.compose_body.clear();
+                    self.compose_mode = PublicComposeMode::Topic;
+                }
+                _ => {}
+            },
+            // MOTD entry — single line, plaintext (ISC-S9). The net actor / relay
+            // enforce the plaintext rule; a rejection returns on the status line.
+            PublicComposeMode::Motd => match key.code {
+                KeyCode::Esc => {
+                    self.compose_motd.clear();
+                    self.compose_mode = PublicComposeMode::None;
+                }
+                KeyCode::Char(c) => self.compose_motd.push(c),
+                KeyCode::Backspace => {
+                    self.compose_motd.pop();
+                }
+                KeyCode::Enter if !self.compose_motd.is_empty() => {
+                    self.pending_set_motd = Some(std::mem::take(&mut self.compose_motd));
+                    self.compose_mode = PublicComposeMode::None;
+                }
+                _ => {}
+            },
+            // Announcement topic — Enter advances to the body field.
+            PublicComposeMode::Topic => match key.code {
+                KeyCode::Esc => {
+                    self.compose_topic.clear();
+                    self.compose_body.clear();
+                    self.compose_mode = PublicComposeMode::None;
+                }
+                KeyCode::Char(c) => self.compose_topic.push(c),
+                KeyCode::Backspace => {
+                    self.compose_topic.pop();
+                }
+                KeyCode::Enter if !self.compose_topic.is_empty() => {
+                    self.compose_mode = PublicComposeMode::Body;
+                }
+                _ => {}
+            },
+            // Announcement body — Enter signs+uploads the post (topic + body).
+            PublicComposeMode::Body => match key.code {
+                KeyCode::Esc => {
+                    self.compose_topic.clear();
+                    self.compose_body.clear();
+                    self.compose_mode = PublicComposeMode::None;
+                }
+                KeyCode::Char(c) => self.compose_body.push(c),
+                KeyCode::Backspace => {
+                    self.compose_body.pop();
+                }
+                KeyCode::Enter if !self.compose_body.is_empty() => {
+                    let topic = std::mem::take(&mut self.compose_topic);
+                    let body = std::mem::take(&mut self.compose_body);
+                    self.pending_upload_announcement = Some((topic, body));
+                    self.compose_mode = PublicComposeMode::None;
+                }
+                _ => {}
+            },
         }
     }
 
@@ -7072,6 +7250,7 @@ mod tests {
         app.on_net_event(NetEvent::PublicSpaceSnapshot {
             motd: Some("welcome to the relay".to_owned()),
             posts: vec![post_row("announcements", "maintenance at 0200 UTC", true)],
+            can_compose: false,
         });
         assert_eq!(app.public_motd(), Some("welcome to the relay"));
         assert_eq!(app.public_posts().len(), 1);
@@ -7094,6 +7273,7 @@ mod tests {
         app.on_net_event(NetEvent::PublicSpaceSnapshot {
             motd: None,
             posts: vec![post_row("announcements", "forged-by-relay", false)],
+            can_compose: false,
         });
         let text = render_text(&app, 120, 28);
         assert!(
@@ -7137,6 +7317,7 @@ mod tests {
         app.on_net_event(NetEvent::PublicSpaceSnapshot {
             motd: None,
             posts: vec![post_row("a", "first", true), post_row("a", "second", true)],
+            can_compose: false,
         });
         assert_eq!(app.post_sel(), 0);
         app.on_key(press(KeyCode::Down));

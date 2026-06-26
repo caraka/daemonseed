@@ -19,7 +19,7 @@
 //!
 //! - 57 server-side: 32 positive (`ISC-S*`) + 25 negative (`ISC-A-S*`)
 //!   (S31 added the #89 UploadMotd in-band signer-set MOTD)
-//! - 116 client-side: 80 positive (`ISC-C*`) + 36 negative (`ISC-A-C*`)
+//! - 117 client-side: 81 positive (`ISC-C*`) + 36 negative (`ISC-A-C*`)
 //!   (M16 A1 added C66 manifest-preview + A-C33 no-blind-download, A2 added C67 selective-fetch,
 //!   A3 added C68 choose-download-dir, A4 added C72 collapsible-folder-tree preview, C1 added C69
 //!   multi-share-publish, C2 added C70 status-auto-clear, C3 added C71 generate-circle-phrase;
@@ -35,8 +35,9 @@
 //!   C82 rename; C83-C86 + A-C38/A-C39 presence heartbeat; C87 + A-C40 graceful-EOS re-subscribe;
 //!   A-C41 presence replay-freshness; C88 + A-C42 GUI Lobby roster;
 //!   C89/C90 client signer authoring + self-determination;
-//!   C91 GUI announcement + MOTD display panes.)
-//! - 173 total
+//!   C91 GUI announcement + MOTD display panes;
+//!   C92 signer-gated MOTD/announcement composer.)
+//! - 174 total
 //!
 //! Deliberately EXCLUDED from [`ISCS`] (and therefore from [`TOTAL`]) because
 //! they are not built: the deferred direct-messaging family
@@ -220,6 +221,8 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-C90", IscClass::Positive),
     // ── client positive (#91: GUI announcement + MOTD display panes) ──
     ("ISC-C91", IscClass::Positive),
+    // ── client positive (#92: signer-gated MOTD/announcement composer) ──
+    ("ISC-C92", IscClass::Positive),
     // ── client negative (20) ────────────────────────────────────────────
     ("ISC-A-C1", IscClass::Negative),
     ("ISC-A-C2", IscClass::Negative),
@@ -270,7 +273,7 @@ pub const ISCS: &[(&str, IscClass)] = &[
 /// of truth for the coverage denominator, read live by `xtask isc-coverage`.
 /// Recount on every ISC add/remove (the `const _` assert below guards it
 /// against [`ISCS`]).
-pub const TOTAL: usize = 173;
+pub const TOTAL: usize = 174;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -299,14 +302,14 @@ pub const MILESTONE_COVERED: &[(&str, usize)] = &[
     ("M7", 5),
     ("M12", 0),
     ("alpha2", 28),
-    ("alpha3", 4),
+    ("alpha3", 5),
 ];
 
 /// Distinct ISCs covered by a registered integration test — the SINGLE source
 /// of truth for the coverage numerator, read live by `xtask isc-coverage`
 /// (it replaced a hand-maintained `COVERED_ISCS` mirror in xtask). Equals the
 /// sum of [`MILESTONE_COVERED`] (guarded by `covered_sum_matches`).
-pub const COVERED: usize = 104;
+pub const COVERED: usize = 105;
 
 const _: () = assert!(
     COVERED <= TOTAL,
@@ -410,9 +413,9 @@ mod tests {
                 IscClass::Negative => neg += 1,
             }
         }
-        // ISA `## Criteria` (built, non-deferred): 56 server + 111 client = 167.
+        // ISA `## Criteria` (built, non-deferred): 56 server + 112 client = 168.
         //   server  31 pos + 25 neg = 56  (presence heartbeat #74: A-S23 neg)
-        //   client  77 pos + 34 neg = 111 (M13 C59-C62 + A-C29/A-C30;
+        //   client  78 pos + 34 neg = 112 (M13 C59-C62 + A-C29/A-C30;
         //                                  M15 C  C63-C65 + A-C31/A-C32;
         //                                  M16 A1 C66 + A-C33; A2 C67; A3 C68;
         //                                  A4 C72; C1 C69; C2 C70; C3 C71;
@@ -433,9 +436,10 @@ mod tests {
         //                                  GUI Lobby roster surface C88 pos + A-C42 neg, #75;
         //                                  in-band UploadMotd S31 pos, #89;
         //                                  client signer authoring C89 + self-determination C90 pos, #90;
-        //                                  GUI announcement + MOTD display panes C91 pos, #91)
-        //   total   112 pos + 61 neg = 173
-        assert_eq!(pos, 112, "positive count drift");
+        //                                  GUI announcement + MOTD display panes C91 pos, #91;
+        //                                  signer-gated MOTD/announcement composer C92 pos, #92)
+        //   total   113 pos + 61 neg = 174
+        assert_eq!(pos, 113, "positive count drift");
         assert_eq!(neg, 61, "negative count drift");
     }
 

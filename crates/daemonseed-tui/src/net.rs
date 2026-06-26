@@ -37,7 +37,8 @@ use std::time::{Duration, Instant};
 use daemonseed_cli::connect::{ConnectError, connect_session};
 use daemonseed_cli::identity_proof::ClientIdentity;
 use daemonseed_cli::public_space::{
-    post_render_fields, render_motd, verify_served_post, whitelist_from_wire,
+    composer_visible, post_render_fields, render_motd, sign_motd, sign_post, verify_served_post,
+    whitelist_from_wire,
 };
 use daemonseed_cli::session::AppSession;
 use daemonseed_core::backoff::{Backoff, CloseCause};
@@ -53,6 +54,7 @@ use daemonseed_core::handle::{DisplayMode, Handle};
 use daemonseed_core::heartbeat::{
     HeartbeatFields, open_heartbeat, seal_circle_heartbeat, seal_public_heartbeat,
 };
+use daemonseed_core::identity::keys::SignKeypair;
 use daemonseed_core::indexer::{CachedHashError, cached_or_hash, reconcile_into};
 use daemonseed_core::presence::{
     HEARTBEAT_INTERVAL_MAX, HEARTBEAT_MISS_COUNT, PresenceTracker, beacon_is_fresh,
@@ -85,6 +87,20 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::app::{DeprecationWarningRow, IndexerStatus, LocalShareRow, PublicPostRow};
 
+/// (#92) `Clone + Debug` wrapper around the stable identity signing key so it can
+/// ride the `Clone + Debug` [`NetCommand`] enum. The inner [`SignKeypair`] is
+/// `!Clone` (`ZeroizeOnDrop`) and `!Debug` (it holds secret bytes); the [`Arc`]
+/// makes the wrapper cheaply clonable (shared, never copied) and the redacted
+/// `Debug` keeps the secret out of any log (mirrors [`IndexKey`]'s redaction).
+#[derive(Clone)]
+pub struct StableSigningKey(pub Arc<SignKeypair>);
+
+impl std::fmt::Debug for StableSigningKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StableSigningKey(<redacted>)")
+    }
+}
+
 /// A command from the UI to the network actor.
 #[derive(Debug, Clone)]
 pub enum NetCommand {
@@ -95,6 +111,14 @@ pub enum NetCommand {
         server_id: String,
         address: String,
         trusted: bool,
+        /// (#92) the unlocked profile's STABLE persistent identity signing key
+        /// (derived from the mnemonic via `derive_identity_keys(.., Primary)` —
+        /// the key behind the whitelisted `name#hash` handle). Held by the actor
+        /// for the session so the public-space composer is gated (`composer_visible`)
+        /// and MOTD/announcements are signed under the persistent identity, NOT the
+        /// ephemeral connection key. `None` on the ephemeral / no-profile path
+        /// (read-only public space, no composer).
+        stable_signing_key: Option<StableSigningKey>,
     },
     /// Join a circle by its shared phrase: derive the circle key, subscribe to
     /// the rendezvous asset on the connected relay, and stream chat (ISC-15/16).
@@ -179,6 +203,17 @@ pub enum NetCommand {
     /// and re-verify each post against the whitelist client-side. A read-only
     /// operation emitted as a single [`NetEvent::PublicSpaceSnapshot`].
     RefreshPublicSpace,
+    /// (#92) Signer authoring: sign an announcement post with the held stable
+    /// identity key ([`sign_post`]) and upload it via `UploadPost`, then refresh.
+    /// A no-op surfaced as [`NetEvent::PublicSpaceError`] when no stable key is held
+    /// (non-signer / ephemeral) or no session is live; the relay independently
+    /// re-verifies the signature against the published whitelist (ISC-S8).
+    UploadAnnouncement { topic: String, body: String },
+    /// (#92) Signer authoring: sign a MOTD with the held stable identity key
+    /// ([`sign_motd`], which enforces the ISC-S9 single-line-plaintext rule) and
+    /// upload it via `UploadMotd` (#89), then refresh. Non-plaintext text is
+    /// rejected BEFORE upload and surfaced as [`NetEvent::PublicSpaceError`].
+    SetMotd { text: String },
     /// Refresh the suite-deprecation policy (ISC-C25 / ISC-A-S11 / ISC-C28):
     /// fetch the connected relay's signed policy over the live [`AppSession`],
     /// verify its ML-DSA-87 signature against the pinned server-wide key,
@@ -450,6 +485,10 @@ pub enum NetEvent {
     PublicSpaceSnapshot {
         motd: Option<String>,
         posts: Vec<PublicPostRow>,
+        /// (#92) signer-gating verdict ([`composer_visible`]): true iff the held
+        /// stable identity key is on the relay's published whitelist, gating the
+        /// composer affordance. False for a non-signer or the ephemeral path.
+        can_compose: bool,
     },
     /// A `RefreshPublicSpace` command could not complete (no live session, a
     /// refused RPC, or a malformed signer whitelist). Surfaced on the status
@@ -748,6 +787,13 @@ struct Actor {
     /// posts can be self-signed for provenance (ISC-S24) under the same key that
     /// proved the connection. `None` until a connect succeeds.
     identity: Option<ClientIdentity>,
+    /// (#92) The unlocked profile's STABLE persistent identity signing key — the
+    /// key behind the whitelisted `name#hash` handle (derived from the mnemonic,
+    /// NOT the ephemeral `identity` above). Held for the actor's life so composer
+    /// gating (`composer_visible`) and MOTD/announcement signing use the persistent
+    /// identity. `None` on the ephemeral / no-profile path: the public space stays
+    /// read-only.
+    stable_signing_key: Option<Arc<SignKeypair>>,
     /// The auto-joined default public room, if subscribed (ISC-S22 / ISC-C56).
     /// The default chat surface needs no circle; circles are the private opt-in.
     public_room: Option<PublicRoom>,
@@ -835,6 +881,7 @@ async fn net_actor(
         circles: Vec::new(),
         next_circle_id: 0,
         identity: None,
+        stable_signing_key: None,
         public_room: None,
         backoff: Backoff::new(),
         share_index: None,
@@ -852,7 +899,12 @@ async fn net_actor(
                 server_id,
                 address,
                 trusted,
-            } => actor.handle_connect(&server_id, &address, trusted).await,
+                stable_signing_key,
+            } => {
+                actor
+                    .handle_connect(&server_id, &address, trusted, stable_signing_key)
+                    .await
+            }
             NetCommand::JoinCircle { phrase } => actor.handle_join_circle(&phrase).await,
             NetCommand::SendChat {
                 circle_id,
@@ -886,6 +938,10 @@ async fn net_actor(
                 actor.handle_apply_heartbeat(&room, &heartbeat)
             }
             NetCommand::RefreshPublicSpace => actor.handle_refresh_public_space().await,
+            NetCommand::UploadAnnouncement { topic, body } => {
+                actor.handle_upload_announcement(&topic, &body).await
+            }
+            NetCommand::SetMotd { text } => actor.handle_set_motd(&text).await,
             NetCommand::RefreshDeprecation => actor.handle_refresh_deprecation().await,
             NetCommand::FetchShare {
                 share_id,
@@ -1541,7 +1597,19 @@ impl Actor {
     /// in-memory counter, and an in-memory trust store seeded with one entry for
     /// the dialed server in the requested C22 mode. Trusted-mode first-contact
     /// pins the presented key (TOFU); untrusted mode requires a pre-imported key.
-    async fn handle_connect(&mut self, server_id: &str, address: &str, trusted: bool) {
+    async fn handle_connect(
+        &mut self,
+        server_id: &str,
+        address: &str,
+        trusted: bool,
+        stable_signing_key: Option<StableSigningKey>,
+    ) {
+        // (#92) Hold the unlocked profile's stable identity signing key for the
+        // actor's life — it gates the composer and signs MOTD/announcements. Set
+        // when supplied (idempotent across reconnects; the key never changes).
+        if let Some(sk) = stable_signing_key {
+            self.stable_signing_key = Some(sk.0);
+        }
         let identity = match ClientIdentity::ephemeral() {
             Ok(i) => i,
             Err(e) => {
@@ -2087,24 +2155,33 @@ impl Actor {
         let mut ps = session.public_space();
 
         // Whitelist first — post provenance verification depends on it.
-        let whitelist = match ps
+        let entries = match ps
             .get_signer_whitelist(wire::GetSignerWhitelistRequest {})
             .await
         {
-            Ok(resp) => match whitelist_from_wire(&resp.into_inner().entries, None) {
-                Ok(wl) => wl,
-                Err(e) => {
-                    return self.emit(NetEvent::PublicSpaceError {
-                        message: format!("malformed signer whitelist: {e:?}"),
-                    });
-                }
-            },
+            Ok(resp) => resp.into_inner().entries,
             Err(status) => {
                 return self.emit(NetEvent::PublicSpaceError {
                     message: format!("signer-whitelist fetch refused: {}", status.message()),
                 });
             }
         };
+        let whitelist = match whitelist_from_wire(&entries, None) {
+            Ok(wl) => wl,
+            Err(e) => {
+                return self.emit(NetEvent::PublicSpaceError {
+                    message: format!("malformed signer whitelist: {e:?}"),
+                });
+            }
+        };
+        // (#92) Self-determine signer status against the SAME published whitelist
+        // (`composer_visible`, fail-closed): true only when a stable identity key is
+        // held AND it is on the published whitelist; a non-signer / ephemeral path
+        // is false → the pane stays read-only.
+        let can_compose = self
+            .stable_signing_key
+            .as_ref()
+            .is_some_and(|kp| composer_visible(kp.public_key(), &entries));
 
         // MOTD — rendered inert (ANSI stripped); absent is a normal state.
         let motd = match ps.get_motd(wire::GetMotdRequest {}).await {
@@ -2140,7 +2217,88 @@ impl Actor {
             }
         };
 
-        self.emit(NetEvent::PublicSpaceSnapshot { motd, posts });
+        self.emit(NetEvent::PublicSpaceSnapshot {
+            motd,
+            posts,
+            can_compose,
+        });
+    }
+
+    /// (#92) Sign an announcement post with the held stable identity key and
+    /// upload it via `UploadPost`, then refresh so it appears. Guards: a missing
+    /// stable key (non-signer / ephemeral) or no live session surfaces a
+    /// [`NetEvent::PublicSpaceError`] and uploads nothing; the relay independently
+    /// re-verifies the signature against the published whitelist before storing
+    /// (ISC-S8), so a non-signer can never write.
+    async fn handle_upload_announcement(&mut self, topic: &str, body: &str) {
+        let Some(kp) = self.stable_signing_key.as_ref() else {
+            return self.emit(NetEvent::PublicSpaceError {
+                message: "not a signer on this relay — cannot post announcements".to_owned(),
+            });
+        };
+        let Some(session) = self.session.as_ref() else {
+            return self.emit(NetEvent::PublicSpaceError {
+                message: "not connected to a relay yet".to_owned(),
+            });
+        };
+        let artifact = match sign_post(kp, topic, body, now_unix_ms()) {
+            Ok(a) => a,
+            Err(e) => {
+                return self.emit(NetEvent::PublicSpaceError {
+                    message: format!("could not sign announcement: {e}"),
+                });
+            }
+        };
+        let mut ps = session.public_space();
+        match ps
+            .upload_post(wire::UploadPostRequest {
+                artifact: Some(artifact),
+            })
+            .await
+        {
+            Ok(_) => self.handle_refresh_public_space().await,
+            Err(status) => self.emit(NetEvent::PublicSpaceError {
+                message: format!("announcement upload refused: {}", status.message()),
+            }),
+        }
+    }
+
+    /// (#92) Sign a MOTD with the held stable identity key ([`sign_motd`] enforces
+    /// the ISC-S9 single-line-plaintext rule BEFORE signing) and upload it via
+    /// `UploadMotd` (#89), then refresh. Non-plaintext text is rejected before any
+    /// upload and surfaced as a [`NetEvent::PublicSpaceError`]. Same no-stable-key /
+    /// no-session guards as [`Self::handle_upload_announcement`].
+    async fn handle_set_motd(&mut self, text: &str) {
+        let Some(kp) = self.stable_signing_key.as_ref() else {
+            return self.emit(NetEvent::PublicSpaceError {
+                message: "not a signer on this relay — cannot set the MOTD".to_owned(),
+            });
+        };
+        let Some(session) = self.session.as_ref() else {
+            return self.emit(NetEvent::PublicSpaceError {
+                message: "not connected to a relay yet".to_owned(),
+            });
+        };
+        let artifact = match sign_motd(kp, text, now_unix_ms()) {
+            Ok(a) => a,
+            Err(e) => {
+                return self.emit(NetEvent::PublicSpaceError {
+                    message: format!("could not set MOTD: {e}"),
+                });
+            }
+        };
+        let mut ps = session.public_space();
+        match ps
+            .upload_motd(wire::UploadMotdRequest {
+                artifact: Some(artifact),
+            })
+            .await
+        {
+            Ok(_) => self.handle_refresh_public_space().await,
+            Err(status) => self.emit(NetEvent::PublicSpaceError {
+                message: format!("MOTD upload refused: {}", status.message()),
+            }),
+        }
     }
 
     /// Fetch, verify, and surface the connected relay's signed suite-deprecation
@@ -3484,6 +3642,7 @@ mod tests {
             circles: Vec::new(),
             next_circle_id: 0,
             identity: None,
+            stable_signing_key: None,
             public_room: None,
             backoff: Backoff::new(),
             share_index: None,

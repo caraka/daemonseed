@@ -339,6 +339,17 @@ pub fn local_key_is_whitelisted(
         .map_err(WhitelistConvertError::Module)
 }
 
+/// The composer-gating decision (ISC-S8, ISC-C92 / D3): show the in-client
+/// MOTD/announcement composer iff the local stable identity key is on the relay's
+/// *published* signer whitelist. Fail-CLOSED — any error rebuilding or
+/// authorizing against the published whitelist (a malformed entry, an
+/// inoperative crypto module) yields `false`, never a composer the relay would
+/// reject anyway. This is the boolean both clients (GUI + TUI) gate the composer
+/// affordance on; a non-signer key gets the read-only pane.
+pub fn composer_visible(local_pubkey: &[u8], entries: &[wire::SignerWhitelistEntry]) -> bool {
+    local_key_is_whitelisted(local_pubkey, entries).unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -733,5 +744,43 @@ mod tests {
             local_key_is_whitelisted(signer.public_key(), &[]),
             Ok(false)
         );
+    }
+
+    // ── composer_visible gating predicate (ISC-C92) ──────────────────────
+
+    #[test]
+    fn composer_visible_true_on_list() {
+        let signer = keypair(93);
+        assert!(composer_visible(
+            signer.public_key(),
+            &[wire_full_key(&signer)]
+        ));
+    }
+
+    #[test]
+    fn composer_visible_false_off_list() {
+        let signer = keypair(94);
+        let stranger = keypair(95);
+        assert!(!composer_visible(
+            stranger.public_key(),
+            &[wire_full_key(&signer)]
+        ));
+    }
+
+    #[test]
+    fn composer_visible_false_on_empty_whitelist() {
+        // No published signers → composer hidden (read-only pane).
+        let signer = keypair(96);
+        assert!(!composer_visible(signer.public_key(), &[]));
+    }
+
+    #[test]
+    fn composer_visible_fails_closed_on_malformed_whitelist() {
+        // A published whitelist entry with no `entry` oneof set is malformed;
+        // local_key_is_whitelisted returns Err, and the gate fails closed.
+        let signer = keypair(97);
+        let bad = [wire::SignerWhitelistEntry { entry: None }];
+        assert!(local_key_is_whitelisted(signer.public_key(), &bad).is_err());
+        assert!(!composer_visible(signer.public_key(), &bad));
     }
 }

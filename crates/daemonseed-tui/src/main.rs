@@ -172,10 +172,18 @@ fn run(
 
         // Hand any queued commands to the network actor.
         if let Some(req) = app.take_pending_connect() {
+            // (#92) Derive the stable identity signing key ONCE here and hand it to
+            // the net actor so it can gate the public-space composer + sign
+            // MOTD/announcements under the persistent identity (None on the
+            // ephemeral / no-profile path). Wrapped for the Clone+Debug command enum.
+            let stable_signing_key = app
+                .stable_signing_key()
+                .map(|k| daemonseed_tui::net::StableSigningKey(std::sync::Arc::new(k)));
             let _ = net.send(NetCommand::Connect {
                 server_id: req.server_id,
                 address: req.address,
                 trusted: req.trusted,
+                stable_signing_key,
             });
         }
         if let Some(phrase) = app.take_pending_join() {
@@ -212,6 +220,14 @@ fn run(
         }
         if app.take_pending_public_space_refresh() {
             let _ = net.send(NetCommand::RefreshPublicSpace);
+        }
+        // (#92) signer composer uploads — the net actor signs with the held stable
+        // key and uploads via UploadMotd / UploadPost, then refreshes.
+        if let Some(text) = app.take_pending_set_motd() {
+            let _ = net.send(NetCommand::SetMotd { text });
+        }
+        if let Some((topic, body)) = app.take_pending_upload_announcement() {
+            let _ = net.send(NetCommand::UploadAnnouncement { topic, body });
         }
         if app.take_pending_deprecation_refresh() {
             let _ = net.send(NetCommand::RefreshDeprecation);

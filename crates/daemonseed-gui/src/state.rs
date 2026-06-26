@@ -20,6 +20,7 @@ use daemonseed_cli::public_space::{
 use daemonseed_core::circle::key::{CircleKey, CircleKeyError, circle_fingerprint, derive_cot_key};
 use daemonseed_core::cot::AssetAddr;
 use daemonseed_core::crypto::suite::CNSA_2_0;
+use daemonseed_core::identity::keys::SignKeypair;
 use daemonseed_core::passphrase::strength::{self, DicewareError};
 use daemonseed_core::storage::seeds::IndexKey;
 use daemonseed_proto::v1 as wire;
@@ -280,6 +281,18 @@ impl GuiState {
     /// path. Passed to `NetCommand::Connect` so the user presents under it.
     pub fn display_handle(&self) -> Option<String> {
         self.profile.as_ref().map(|p| p.display_handle().to_owned())
+    }
+
+    /// (#92) The unlocked profile's STABLE persistent identity signing key
+    /// (`Profile::stable_signing_key`), or `None` on the ephemeral / no-profile
+    /// path or if derivation fails. Passed to `NetCommand::Connect` so the net
+    /// actor can gate the composer and sign MOTD/announcements under the persistent
+    /// identity (the key behind the whitelisted `name#hash` handle), NOT the
+    /// ephemeral connection key. Derived once here per connect.
+    pub fn stable_signing_key(&self) -> Option<SignKeypair> {
+        self.profile
+            .as_ref()
+            .and_then(|p| p.stable_signing_key().ok())
     }
 
     /// #66: rename the unlocked identity — set a new display name and re-seal the
