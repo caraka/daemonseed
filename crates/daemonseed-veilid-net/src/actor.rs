@@ -8,8 +8,7 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 use veilid_core::{
-    api_startup, RouteBlob, RouteId, RoutingContext, SafetySelection, Sequencing, Target,
-    VeilidAPI, VeilidConfig, VeilidUpdate,
+    api_startup, RouteBlob, RouteId, RoutingContext, Target, VeilidAPI, VeilidConfig, VeilidUpdate,
 };
 
 use crate::config::VeilidNetConfig;
@@ -188,13 +187,15 @@ impl VeilidNet {
         let api = api_startup(update_callback, vcfg)
             .await
             .map_err(|e| VeilidNetError::Startup(e.to_string()))?;
-        // Phase 1 uses the spike-proven Unsafe routing context (no safety
-        // route). D5 — turning the safety route ON with cfg.hop_count — is the
-        // planned dial-up once the productized path is green live; cfg.hop_count
-        // is carried for it.
+        // Phase 1 uses Veilid's DEFAULT routing context, which already carries a
+        // 1-hop safety route. Sends ride the receiver's private route
+        // (Target::RouteId), so no safety override is needed. D5 — raising the
+        // hop count via with_safety(Safe { hop_count: cfg.hop_count }) — is the
+        // planned dial-up; cfg.hop_count is carried for it. (An explicit Unsafe
+        // context would need veilid-core's footgun-nodeid-target feature — the
+        // anti-dox NodeId path we deliberately avoid.)
         let rc = api
             .routing_context()
-            .and_then(|rc| rc.with_safety(SafetySelection::Unsafe(Sequencing::PreferOrdered)))
             .map_err(|e| VeilidNetError::Routing(e.to_string()))?;
 
         let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(64);

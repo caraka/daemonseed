@@ -16,9 +16,9 @@ pub struct VeilidNetConfig {
 
     /// Private-route hop count (D5). daemonseed default is > 1 to harden
     /// unlinkability (latency vs anonymity). Carried for the planned safety-route
-    /// dial-up; NOT applied while Phase 1 uses the spike-proven Unsafe routing
-    /// context (no safety route). Wired into `SafetySpec.hop_count` when Safe
-    /// routing is turned on.
+    /// dial-up; NOT yet applied — Phase 1 uses Veilid's default routing context
+    /// (a 1-hop safety route). Wired into `SafetySpec.hop_count` when the higher
+    /// hop count is turned on via `with_safety(Safe { .. })`.
     pub hop_count: usize,
 
     /// Program namespace — lets multiple nodes coexist (tests, subnodes).
