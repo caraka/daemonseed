@@ -320,9 +320,62 @@ pub fn verify_artifact(
     content_address(signed_payload).map_err(ArtifactError::Module)
 }
 
+// ── MOTD plaintext rule (ISC-S9) ─────────────────────────────────────────
+
+/// True if `text` is a valid single-line plaintext MOTD (ISC-S9 anti-injection):
+/// no forbidden character (see [`is_motd_forbidden_char`]). This enforces a
+/// single line with no embedded control / line-break / direction-spoofing
+/// sequences. Markdown/HTML/link *rendering* is the client's verbatim-render
+/// obligation, not server-detectable.
+///
+/// Shared so server-ingest (`UploadMotd`) and the client composer enforce one
+/// definition of "plaintext MOTD".
+pub fn motd_text_is_valid(text: &str) -> bool {
+    !text.chars().any(is_motd_forbidden_char)
+}
+
+/// A character forbidden in a single-line plaintext MOTD (ISC-S9). `char::
+/// is_control()` covers only C0/C1 controls, so the Unicode line/paragraph
+/// separators (which DO render as line breaks) and the bidi/format controls
+/// (text-direction spoofing surface) are listed explicitly — otherwise the
+/// "single line, no injection" invariant is bypassable.
+fn is_motd_forbidden_char(c: char) -> bool {
+    c.is_control()
+        || matches!(c,
+            '\u{2028}' | '\u{2029}'                  // line / paragraph separator
+            | '\u{200E}' | '\u{200F}' | '\u{061C}'   // LRM / RLM / ALM
+            | '\u{202A}'..='\u{202E}'                // LRE RLE PDF LRO RLO
+            | '\u{2066}'..='\u{2069}'                // LRI RLI FSI PDI
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ISC-S9: a normal single line is accepted; any control character
+    /// (newline / CR / tab) is rejected.
+    #[test]
+    fn motd_text_validity_accepts_plaintext_rejects_controls() {
+        // Accepted: a normal line, empty, spaces, punctuation, a URL-looking string.
+        assert!(motd_text_is_valid("Welcome to the relay!"));
+        assert!(motd_text_is_valid(""));
+        assert!(motd_text_is_valid("   "));
+        assert!(motd_text_is_valid("Maintenance 02:00-03:00 UTC; thanks."));
+        assert!(motd_text_is_valid(
+            "see https://example.org/news for details"
+        ));
+        // Rejected: embedded control characters (no single-line guarantee).
+        assert!(!motd_text_is_valid("a\nb"));
+        assert!(!motd_text_is_valid("a\tb"));
+        assert!(!motd_text_is_valid("\r"));
+        // Rejected: Unicode line/paragraph separators (render as line breaks).
+        assert!(!motd_text_is_valid("a\u{2028}b"));
+        assert!(!motd_text_is_valid("a\u{2029}b"));
+        // Rejected: bidi/format controls (text-direction spoofing surface).
+        assert!(!motd_text_is_valid("a\u{202E}b"));
+        assert!(!motd_text_is_valid("a\u{2066}b"));
+    }
 
     /// Bootstrap oxicrypt's FIPS module for SHA-384 / ML-DSA tests.
     /// `initialize` is idempotent; the `AlreadyInitialized` second call is

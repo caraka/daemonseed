@@ -66,7 +66,7 @@ use std::time::Duration;
 use daemonseed_core::crypto::deprecation::DeprecationPolicy;
 use daemonseed_core::public_space::{
     ArtifactError, CONTENT_ADDRESS_LEN, Whitelist, WhitelistEntry, WhitelistParseError,
-    verify_artifact,
+    motd_text_is_valid, verify_artifact,
 };
 use daemonseed_proto::v1 as wire;
 use daemonseed_proto::v1::circle_of_trust_server::CircleOfTrustServer;
@@ -238,6 +238,9 @@ pub struct PublicSpaceState {
     motd: RwLock<Option<wire::SignedArtifact>>,
     /// Where `UploadPost` / `DeletePost` write (signer-writable; ISC-A-S8).
     posts_dir: Option<PathBuf>,
+    /// Where `UploadMotd` writes the single MOTD slot (signer-writable; ISC-A-S8).
+    /// `load_motd` reads this same path at startup; `None` disables MOTD upload.
+    motd_path: Option<PathBuf>,
     /// Operator suite-deprecation policy (ISC-S16 / A-S11, M7): the signed
     /// artifact served to every fetcher plus its decoded form for cutoff
     /// enforcement. `None` until the operator configures one. Behind a lock so
@@ -299,6 +302,7 @@ impl PublicSpaceState {
             posts: RwLock::new(posts),
             motd: RwLock::new(motd),
             posts_dir: cfg.posts_dir.map(Path::to_path_buf),
+            motd_path: cfg.motd_path.map(Path::to_path_buf),
             deprecation: RwLock::new(None),
         })
     }
@@ -314,6 +318,7 @@ impl PublicSpaceState {
             posts: RwLock::new(BTreeMap::new()),
             motd: RwLock::new(None),
             posts_dir: None,
+            motd_path: None,
             deprecation: RwLock::new(None),
         }
     }
@@ -453,6 +458,60 @@ impl PublicSpaceState {
         Ok(addr)
     }
 
+    /// Verify + set the single-slot MOTD (ISC-S9 / ISC-A-S3).
+    ///
+    /// Parity with [`Self::upload_post`]: the artifact is verified against the
+    /// signer whitelist (ISC-S8) — the same trust model as posts, not a separate
+    /// MOTD whitelist — then its inner [`wire::MotdPayload`] is decoded and its
+    /// `text` checked against the shared plaintext rule
+    /// ([`motd_text_is_valid`], ISC-S9 anti-injection). On success the signed
+    /// bytes are persisted verbatim to `motd_path` (never re-encoded — D-M6-7)
+    /// and replace the in-RAM slot (latest-validated-wins); returns the content
+    /// address.
+    ///
+    /// A whitelist-signed MOTD survives a restart because `load_motd`'s MOTD
+    /// whitelist is a superset of the post whitelist (ISC-26); the server-wide
+    /// key remains a file-drop-only MOTD path.
+    pub fn upload_motd(
+        &self,
+        artifact: wire::SignedArtifact,
+    ) -> Result<[u8; CONTENT_ADDRESS_LEN], UploadMotdError> {
+        let motd_path = self
+            .motd_path
+            .as_ref()
+            .ok_or(UploadMotdError::StorageDisabled)?;
+
+        let address = verify_artifact(
+            &artifact.signed_payload,
+            &artifact.signer_pubkey,
+            &artifact.signature,
+            &self.post_whitelist,
+        )
+        .map_err(upload_motd_artifact_err)?;
+        let addr = *address.as_bytes();
+
+        let payload = wire::MotdPayload::decode(artifact.signed_payload.as_slice())
+            .map_err(|_| UploadMotdError::Malformed)?;
+        // ISC-S9: single-line plaintext only (no embedded control sequences).
+        if !motd_text_is_valid(&payload.text) {
+            return Err(UploadMotdError::NotPlaintext);
+        }
+
+        // Persist verbatim. The inner `signed_payload` (the bytes the signature
+        // and content-address cover, D-M6-7) rides as opaque `bytes` through the
+        // prost re-encode; `load_motd` re-verifies it at the next startup.
+        if let Some(parent) = motd_path.parent() {
+            std::fs::create_dir_all(parent).map_err(UploadMotdError::Io)?;
+        }
+        // Hold the slot lock across the file write + RAM update so concurrent
+        // UploadMotd calls serialize (single-slot, latest-validated-wins) and
+        // the on-disk file and the in-RAM slot never disagree.
+        let mut slot = self.motd.write().expect("motd lock poisoned");
+        std::fs::write(motd_path, artifact.encode_to_vec()).map_err(UploadMotdError::Io)?;
+        *slot = Some(artifact);
+        Ok(addr)
+    }
+
     /// Delete a post the caller previously signed (ISC-S7 / ISC-8 / ISC-20).
     ///
     /// The delete request is itself a signed artifact; its signer must be
@@ -510,6 +569,14 @@ fn upload_artifact_err(e: ArtifactError) -> UploadError {
     }
 }
 
+/// Map a core artifact-verification failure to a MOTD-upload rejection.
+fn upload_motd_artifact_err(e: ArtifactError) -> UploadMotdError {
+    match e {
+        ArtifactError::UnknownSigner | ArtifactError::BadSignature => UploadMotdError::Unauthorized,
+        ArtifactError::Module(m) => UploadMotdError::Module(m),
+    }
+}
+
 /// Map a core artifact-verification failure to a delete rejection.
 fn delete_artifact_err(e: ArtifactError) -> DeleteError {
     match e {
@@ -548,6 +615,23 @@ pub enum UploadError {
     /// The relay has no `posts_dir` configured (→ FailedPrecondition).
     StorageDisabled,
     /// Persisting the post to disk failed (→ Internal).
+    Io(io::Error),
+    /// The crypto module was not operational (→ Internal).
+    Module(oxicrypt_module::Error),
+}
+
+/// Failure of [`PublicSpaceState::upload_motd`].
+#[derive(Debug)]
+pub enum UploadMotdError {
+    /// Signer not whitelisted or signature invalid (→ gRPC PermissionDenied).
+    Unauthorized,
+    /// The signed payload is not a well-formed `MotdPayload` (→ InvalidArgument).
+    Malformed,
+    /// MOTD text is not single-line plaintext (→ InvalidArgument).
+    NotPlaintext,
+    /// The relay has no `motd_path` configured (→ FailedPrecondition).
+    StorageDisabled,
+    /// Persisting the MOTD to disk failed (→ Internal).
     Io(io::Error),
     /// The crypto module was not operational (→ Internal).
     Module(oxicrypt_module::Error),
@@ -728,6 +812,23 @@ impl PublicSpace for PublicSpaceService {
         }))
     }
 
+    async fn upload_motd(
+        &self,
+        request: Request<wire::UploadMotdRequest>,
+    ) -> Result<Response<wire::UploadMotdResponse>, Status> {
+        let artifact = request
+            .into_inner()
+            .artifact
+            .ok_or_else(|| Status::invalid_argument("missing artifact"))?;
+        let address = self
+            .state
+            .upload_motd(artifact)
+            .map_err(upload_motd_status)?;
+        Ok(Response::new(wire::UploadMotdResponse {
+            content_address: address.to_vec(),
+        }))
+    }
+
     async fn delete_post(
         &self,
         request: Request<wire::DeletePostRequest>,
@@ -763,6 +864,22 @@ fn upload_status(e: UploadError) -> Status {
         UploadError::Malformed => Status::invalid_argument("malformed post payload"),
         UploadError::StorageDisabled => Status::failed_precondition("post storage not configured"),
         UploadError::Io(_) | UploadError::Module(_) => Status::internal("upload failed"),
+    }
+}
+
+/// Map an [`UploadMotdError`] to a gRPC status. `Io` / `Module` collapse to
+/// `internal` so a persistence or crypto-module fault never leaks detail.
+fn upload_motd_status(e: UploadMotdError) -> Status {
+    match e {
+        UploadMotdError::Unauthorized => Status::permission_denied("signer not authorized"),
+        UploadMotdError::Malformed => Status::invalid_argument("malformed motd payload"),
+        UploadMotdError::NotPlaintext => {
+            Status::invalid_argument("motd text must be single-line plaintext")
+        }
+        UploadMotdError::StorageDisabled => {
+            Status::failed_precondition("motd storage not configured")
+        }
+        UploadMotdError::Io(_) | UploadMotdError::Module(_) => Status::internal("upload failed"),
     }
 }
 
@@ -1462,6 +1579,169 @@ mod tests {
 
         let result = state.delete_post(delete_artifact(&signer, &[0x11u8; CONTENT_ADDRESS_LEN]));
         assert!(matches!(result, Err(DeleteError::NotFound)));
+    }
+
+    // ── In-band MOTD upload (ISC-S9 / ISC-S31 / A-S3) ────────────────────
+
+    /// Build a loaded state whose MOTD slot is signer-writable: the given
+    /// whitelisted signers + a `motd_path` inside `dir` (parent intentionally
+    /// absent so `upload_motd` exercises its create-dir path). No posts_dir.
+    fn state_with_motd(dir: &Path, signers: &[&SignKeypair]) -> PublicSpaceState {
+        let server = keypair(99);
+        let wl_path = dir.join("signers.txt");
+        let mut contents = String::new();
+        for s in signers {
+            contents.push_str(&hex::encode(s.public_key()));
+            contents.push('\n');
+        }
+        std::fs::write(&wl_path, contents).unwrap();
+        let motd_path = dir.join("motd").join("motd.signed");
+        let cfg = PublicSpaceConfig {
+            posts_dir: None,
+            motd_path: Some(&motd_path),
+            whitelist_path: Some(&wl_path),
+            taxonomy: &[],
+            topics: &[],
+        };
+        PublicSpaceState::load(&cfg, server.public_key()).unwrap()
+    }
+
+    fn motd_text(art: &wire::SignedArtifact) -> String {
+        wire::MotdPayload::decode(art.signed_payload.as_slice())
+            .unwrap()
+            .text
+    }
+
+    /// ISC-S9/S31: a whitelisted signer sets the MOTD in-band; it is persisted
+    /// to disk, served from RAM, and a second upload replaces the single slot.
+    #[test]
+    fn upload_motd_replaces_slot() {
+        let signer = keypair(70);
+        let dir = TempDir::new().unwrap();
+        let state = state_with_motd(dir.path(), &[&signer]);
+        let motd_path = dir.path().join("motd").join("motd.signed");
+
+        let addr = state
+            .upload_motd(motd_artifact(&signer, "first", 1))
+            .unwrap();
+        let stored = state.get_motd().expect("MOTD set");
+        assert_eq!(motd_text(&stored), "first");
+        assert_eq!(
+            addr,
+            *content_address(&stored.signed_payload).unwrap().as_bytes(),
+            "returns the content address of the stored MOTD"
+        );
+        assert!(motd_path.exists(), "persisted to disk under motd_path");
+        let on_disk =
+            wire::SignedArtifact::decode(std::fs::read(&motd_path).unwrap().as_slice()).unwrap();
+        assert_eq!(motd_text(&on_disk), "first", "file re-decodes to the MOTD");
+
+        // Latest-validated-wins: a second upload replaces the slot.
+        state
+            .upload_motd(motd_artifact(&signer, "second", 2))
+            .unwrap();
+        assert_eq!(motd_text(&state.get_motd().unwrap()), "second");
+    }
+
+    /// ISC-S9/S31: a MOTD signed by a non-whitelisted signer is rejected.
+    #[test]
+    fn upload_motd_rejects_unknown_signer() {
+        let whitelisted = keypair(71);
+        let stranger = keypair(72);
+        let dir = TempDir::new().unwrap();
+        let state = state_with_motd(dir.path(), &[&whitelisted]);
+
+        assert!(matches!(
+            state.upload_motd(motd_artifact(&stranger, "hi", 1)),
+            Err(UploadMotdError::Unauthorized)
+        ));
+        assert!(state.get_motd().is_none(), "rejected MOTD never set");
+    }
+
+    /// ISC-S31 / A-S3: a tampered signature from a whitelisted signer is
+    /// rejected (BadSignature maps to Unauthorized).
+    #[test]
+    fn upload_motd_rejects_bad_signature() {
+        let signer = keypair(73);
+        let dir = TempDir::new().unwrap();
+        let state = state_with_motd(dir.path(), &[&signer]);
+
+        let mut art = motd_artifact(&signer, "tampered", 1);
+        art.signature[0] ^= 0xff;
+        assert!(matches!(
+            state.upload_motd(art),
+            Err(UploadMotdError::Unauthorized)
+        ));
+    }
+
+    /// ISC-S9: a MOTD whose text carries an embedded control char is rejected.
+    #[test]
+    fn upload_motd_rejects_non_plaintext() {
+        let signer = keypair(74);
+        let dir = TempDir::new().unwrap();
+        let state = state_with_motd(dir.path(), &[&signer]);
+
+        assert!(matches!(
+            state.upload_motd(motd_artifact(&signer, "line1\nline2", 1)),
+            Err(UploadMotdError::NotPlaintext)
+        ));
+        assert!(state.get_motd().is_none(), "rejected MOTD never set");
+    }
+
+    /// ISC-S31: with no `motd_path` configured, in-band MOTD upload is refused
+    /// even for a whitelisted signer (isolates StorageDisabled from Unauthorized).
+    #[test]
+    fn upload_motd_storage_disabled() {
+        let signer = keypair(75);
+        let dir = TempDir::new().unwrap();
+        let wl_path = dir.path().join("signers.txt");
+        write_signer_file(&wl_path, &signer);
+        let cfg = PublicSpaceConfig {
+            posts_dir: None,
+            motd_path: None,
+            whitelist_path: Some(&wl_path),
+            taxonomy: &[],
+            topics: &[],
+        };
+        let state = PublicSpaceState::load(&cfg, keypair(99).public_key()).unwrap();
+
+        assert!(matches!(
+            state.upload_motd(motd_artifact(&signer, "hi", 1)),
+            Err(UploadMotdError::StorageDisabled)
+        ));
+    }
+
+    /// ISC-S31 / ISC-26: an in-band MOTD set by a whitelist signer survives a
+    /// restart — a freshly `load`ed state re-verifies the persisted artifact
+    /// against the MOTD whitelist (operator entries + server key ⊇ post
+    /// whitelist) and serves it. This locks the "no separate MOTD whitelist"
+    /// rationale: the superset relationship is by-construction in `load`, so a
+    /// signer's in-band MOTD never silently vanishes on restart.
+    #[test]
+    fn upload_motd_survives_reload() {
+        let signer = keypair(76);
+        let server = keypair(99);
+        let dir = TempDir::new().unwrap();
+        let wl_path = dir.path().join("signers.txt");
+        write_signer_file(&wl_path, &signer);
+        let motd_path = dir.path().join("motd.signed");
+        let cfg = PublicSpaceConfig {
+            posts_dir: None,
+            motd_path: Some(&motd_path),
+            whitelist_path: Some(&wl_path),
+            taxonomy: &[],
+            topics: &[],
+        };
+
+        let state = PublicSpaceState::load(&cfg, server.public_key()).unwrap();
+        state
+            .upload_motd(motd_artifact(&signer, "persisted across restart", 1))
+            .unwrap();
+
+        // Simulate a restart: a brand-new state loaded from the same paths.
+        let reloaded = PublicSpaceState::load(&cfg, server.public_key()).unwrap();
+        let served = reloaded.get_motd().expect("in-band MOTD survives reload");
+        assert_eq!(motd_text(&served), "persisted across restart");
     }
 
     // ── Filesystem isolation (ISC-33/34/35/36) ───────────────────────────

@@ -1334,6 +1334,18 @@ pub struct UploadPostResponse {
     pub content_address: ::prost::alloc::vec::Vec<u8>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UploadMotdRequest {
+    /// Signed MotdPayload (signature in the envelope).
+    #[prost(message, optional, tag = "1")]
+    pub artifact: ::core::option::Option<SignedArtifact>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UploadMotdResponse {
+    /// SHA-384(artifact.signed_payload) under which the server stored the MOTD.
+    #[prost(bytes = "vec", tag = "1")]
+    pub content_address: ::prost::alloc::vec::Vec<u8>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DeletePostRequest {
     /// Signed PostDeletePayload (signature in the envelope).
     #[prost(message, optional, tag = "1")]
@@ -1566,6 +1578,35 @@ pub mod public_space_client {
                 .insert(GrpcMethod::new("daemonseed.v1.PublicSpace", "UploadPost"));
             self.inner.unary(req, path, codec).await
         }
+        /// Upload a signed MOTD (ISC-S9). The server verifies the signature against
+        /// the signer whitelist (same trust model as UploadPost) and replaces the
+        /// single MOTD slot (latest-validated-wins). Rejects (gRPC status) on an
+        /// unknown signer, bad signature, a payload that isn't a well-formed
+        /// MotdPayload, or non-plaintext MOTD text.
+        pub async fn upload_motd(
+            &mut self,
+            request: impl tonic::IntoRequest<super::UploadMotdRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::UploadMotdResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/daemonseed.v1.PublicSpace/UploadMotd",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("daemonseed.v1.PublicSpace", "UploadMotd"));
+            self.inner.unary(req, path, codec).await
+        }
         /// Delete a post the caller previously signed, matched by content-address
         /// (ISC-S7). Verified against the current whitelist.
         pub async fn delete_post(
@@ -1677,6 +1718,18 @@ pub mod public_space_server {
             request: tonic::Request<super::UploadPostRequest>,
         ) -> std::result::Result<
             tonic::Response<super::UploadPostResponse>,
+            tonic::Status,
+        >;
+        /// Upload a signed MOTD (ISC-S9). The server verifies the signature against
+        /// the signer whitelist (same trust model as UploadPost) and replaces the
+        /// single MOTD slot (latest-validated-wins). Rejects (gRPC status) on an
+        /// unknown signer, bad signature, a payload that isn't a well-formed
+        /// MotdPayload, or non-plaintext MOTD text.
+        async fn upload_motd(
+            &self,
+            request: tonic::Request<super::UploadMotdRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::UploadMotdResponse>,
             tonic::Status,
         >;
         /// Delete a post the caller previously signed, matched by content-address
@@ -1990,6 +2043,51 @@ pub mod public_space_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = UploadPostSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/daemonseed.v1.PublicSpace/UploadMotd" => {
+                    #[allow(non_camel_case_types)]
+                    struct UploadMotdSvc<T: PublicSpace>(pub Arc<T>);
+                    impl<
+                        T: PublicSpace,
+                    > tonic::server::UnaryService<super::UploadMotdRequest>
+                    for UploadMotdSvc<T> {
+                        type Response = super::UploadMotdResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::UploadMotdRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as PublicSpace>::upload_motd(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = UploadMotdSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

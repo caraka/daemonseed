@@ -765,6 +765,31 @@ types:
           SHA-384(artifact.signed_payload) under which the server stored
           the post.
 
+  - name: UploadMotdRequest
+    module: public_space
+    kind: message
+    description: A signed MOTD upload (ISC-S9).
+    iscs: [S9]
+    fields:
+      - name: artifact
+        type: SignedArtifact
+        tag: 1
+        description: Signed MotdPayload (signature in the envelope).
+
+  - name: UploadMotdResponse
+    module: public_space
+    kind: message
+    description: >-
+      The content-address under which the server stored the MOTD (ISC-S9).
+    iscs: [S9]
+    fields:
+      - name: content_address
+        type: bytes
+        tag: 1
+        description: >-
+          SHA-384(artifact.signed_payload) under which the server stored
+          the MOTD.
+
   - name: DeletePostRequest
     module: public_space
     kind: message
@@ -1105,6 +1130,30 @@ functions:
           The signer's public key must be on the current published
           whitelist (ISC-S8) and the signature must verify over
           signed_payload.
+
+  - name: PublicSpace.UploadMotd
+    module: public_space
+    description: >-
+      Upload a signed MOTD. The server verifies the signature against the
+      signer whitelist (same trust model as UploadPost) and replaces the
+      single MOTD slot (latest-validated-wins, ISC-S9).
+    signature: "rpc UploadMotd(UploadMotdRequest) returns (UploadMotdResponse)"
+    iscs: [S9, S31, A-S3]
+    parameters:
+      - name: request
+        type: UploadMotdRequest
+        description: Signed MotdPayload artifact.
+    returns:
+      type: UploadMotdResponse
+      description: >-
+        The content-address under which the MOTD was stored. Rejects via
+        gRPC status on an unknown signer, bad signature, a non-MotdPayload
+        body, or non-plaintext text.
+    preconditions:
+      - description: >-
+          The signer's public key must be on the current published
+          whitelist (ISC-S8), the signature must verify over signed_payload,
+          and the MOTD text must be single-line plaintext (ISC-S9).
 
   - name: PublicSpace.DeletePost
     module: public_space

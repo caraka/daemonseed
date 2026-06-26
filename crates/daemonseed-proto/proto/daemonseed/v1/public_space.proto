@@ -209,6 +209,13 @@ service PublicSpace {
   // signer or bad signature.
   rpc UploadPost(UploadPostRequest) returns (UploadPostResponse);
 
+  // Upload a signed MOTD (ISC-S9). The server verifies the signature against
+  // the signer whitelist (same trust model as UploadPost) and replaces the
+  // single MOTD slot (latest-validated-wins). Rejects (gRPC status) on an
+  // unknown signer, bad signature, a payload that isn't a well-formed
+  // MotdPayload, or non-plaintext MOTD text.
+  rpc UploadMotd(UploadMotdRequest) returns (UploadMotdResponse);
+
   // Delete a post the caller previously signed, matched by content-address
   // (ISC-S7). Verified against the current whitelist.
   rpc DeletePost(DeletePostRequest) returns (DeletePostResponse);
@@ -269,6 +276,16 @@ message UploadPostRequest {
 
 message UploadPostResponse {
   // SHA-384(artifact.signed_payload) under which the server stored the post.
+  bytes content_address = 1;
+}
+
+message UploadMotdRequest {
+  // Signed MotdPayload (signature in the envelope).
+  SignedArtifact artifact = 1;
+}
+
+message UploadMotdResponse {
+  // SHA-384(artifact.signed_payload) under which the server stored the MOTD.
   bytes content_address = 1;
 }
 

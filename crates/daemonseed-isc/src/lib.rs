@@ -17,8 +17,9 @@
 //!
 //! Count invariants (kept aligned with `ISA.md` `## Criteria`):
 //!
-//! - 56 server-side: 31 positive (`ISC-S*`) + 25 negative (`ISC-A-S*`)
-//! - 111 client-side: 76 positive (`ISC-C*`) + 35 negative (`ISC-A-C*`)
+//! - 57 server-side: 32 positive (`ISC-S*`) + 25 negative (`ISC-A-S*`)
+//!   (S31 added the #89 UploadMotd in-band signer-set MOTD)
+//! - 113 client-side: 77 positive (`ISC-C*`) + 36 negative (`ISC-A-C*`)
 //!   (M16 A1 added C66 manifest-preview + A-C33 no-blind-download, A2 added C67 selective-fetch,
 //!   A3 added C68 choose-download-dir, A4 added C72 collapsible-folder-tree preview, C1 added C69
 //!   multi-share-publish, C2 added C70 status-auto-clear, C3 added C71 generate-circle-phrase;
@@ -33,7 +34,7 @@
 //!   alpha3: C77/C78 unified-share + unread; C79/C80 connection resilience; C81 single-instance;
 //!   C82 rename; C83-C86 + A-C38/A-C39 presence heartbeat; C87 + A-C40 graceful-EOS re-subscribe;
 //!   A-C41 presence replay-freshness.)
-//! - 167 total
+//! - 170 total
 //!
 //! Deliberately EXCLUDED from [`ISCS`] (and therefore from [`TOTAL`]) because
 //! they are not built: the deferred direct-messaging family
@@ -60,7 +61,7 @@ pub enum IscClass {
 /// Every ISC known to this MVP, in declaration order from `ds-isc-draft.md`.
 /// Length is [`TOTAL`].
 pub const ISCS: &[(&str, IscClass)] = &[
-    // ── server positive (31) ────────────────────────────────────────────
+    // ── server positive (32) ────────────────────────────────────────────
     ("ISC-S1", IscClass::Positive),
     ("ISC-S2a", IscClass::Positive),
     ("ISC-S2b", IscClass::Positive),
@@ -92,6 +93,8 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-S28", IscClass::Positive),
     ("ISC-S29", IscClass::Positive),
     ("ISC-S30", IscClass::Positive),
+    // ── server positive (#89 UploadMotd: in-band signer-set MOTD) ────────
+    ("ISC-S31", IscClass::Positive),
     // ── server negative (24) ────────────────────────────────────────────
     ("ISC-A-S1", IscClass::Negative),
     ("ISC-A-S2", IscClass::Negative),
@@ -260,7 +263,7 @@ pub const ISCS: &[(&str, IscClass)] = &[
 /// of truth for the coverage denominator, read live by `xtask isc-coverage`.
 /// Recount on every ISC add/remove (the `const _` assert below guards it
 /// against [`ISCS`]).
-pub const TOTAL: usize = 169;
+pub const TOTAL: usize = 170;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -289,13 +292,14 @@ pub const MILESTONE_COVERED: &[(&str, usize)] = &[
     ("M7", 5),
     ("M12", 0),
     ("alpha2", 28),
+    ("alpha3", 1),
 ];
 
 /// Distinct ISCs covered by a registered integration test — the SINGLE source
 /// of truth for the coverage numerator, read live by `xtask isc-coverage`
 /// (it replaced a hand-maintained `COVERED_ISCS` mirror in xtask). Equals the
 /// sum of [`MILESTONE_COVERED`] (guarded by `covered_sum_matches`).
-pub const COVERED: usize = 100;
+pub const COVERED: usize = 101;
 
 const _: () = assert!(
     COVERED <= TOTAL,
@@ -419,9 +423,10 @@ mod tests {
         //                                  share-liveness-on-heartbeat C86 pos, #76;
         //                                  graceful-EOS re-subscribe C87 pos + A-C40 neg, #80;
         //                                  presence replay-freshness A-C41 neg, #78;
-        //                                  GUI Lobby roster surface C88 pos + A-C42 neg, #75)
-        //   total   108 pos + 61 neg = 169
-        assert_eq!(pos, 108, "positive count drift");
+        //                                  GUI Lobby roster surface C88 pos + A-C42 neg, #75;
+        //                                  in-band UploadMotd S31 pos, #89)
+        //   total   109 pos + 61 neg = 170
+        assert_eq!(pos, 109, "positive count drift");
         assert_eq!(neg, 61, "negative count drift");
     }
 

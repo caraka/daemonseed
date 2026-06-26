@@ -441,11 +441,11 @@ types:
     description: >-
       Server-wide state shared via Arc: post_whitelist (operator + F17),
       published wire entries, taxonomy, topics, RwLock posts map keyed by
-      content-address, RwLock single-slot MOTD, posts_dir, empty M6 share
-      listing. Methods: get_motd / list_posts(topic) / taxonomy /
-      signer_whitelist / public_shares / upload_post / delete_post;
-      load(cfg, server_pubkey) and empty().
-    iscs: [S4, S7, S8, S9, S10]
+      content-address, RwLock single-slot MOTD, posts_dir, motd_path, empty M6
+      share listing. Methods: get_motd / list_posts(topic) / taxonomy /
+      signer_whitelist / public_shares / upload_post / upload_motd /
+      delete_post; load(cfg, server_pubkey) and empty().
+    iscs: [S4, S7, S8, S9, S10, S31]
 
   - name: "PublicSpaceConfig<'a>"
     module: daemonseed_server::public_space
@@ -1212,6 +1212,37 @@ functions:
         - name: Module
           condition: "A crypto-module error occurred during verification (gRPC Internal)."
     iscs: [S7, S8, "7", "19"]
+
+  - name: "PublicSpaceState::upload_motd"
+    module: daemonseed_server::public_space
+    description: >-
+      Verify vs the signer whitelist (ISC-S8, same trust model as upload_post),
+      enforce the ISC-S9 single-line-plaintext rule (motd_text_is_valid),
+      persist verbatim to motd_path (D-M6-7) + replace the single in-RAM slot
+      (latest-validated-wins); returns the 48-byte address.
+    signature: "pub fn upload_motd(&self, artifact: SignedArtifact) -> Result<[u8; 48], UploadMotdError>"
+    parameters:
+      - name: artifact
+        type: SignedArtifact
+        direction: in
+        description: "The signed MOTD artifact."
+    returns:
+      type: "Result<[u8; 48], UploadMotdError>"
+      description: "The content-address of the stored MOTD."
+      error_variants:
+        - name: Unauthorized
+          condition: "Signer is not whitelisted or the signature failed (gRPC PermissionDenied)."
+        - name: Malformed
+          condition: "The artifact is not a well-formed MotdPayload (gRPC InvalidArgument)."
+        - name: NotPlaintext
+          condition: "The MOTD text is not single-line plaintext (gRPC InvalidArgument)."
+        - name: StorageDisabled
+          condition: "No motd_path is configured (gRPC FailedPrecondition)."
+        - name: Io
+          condition: "Persisting the MOTD to disk failed (gRPC Internal)."
+        - name: Module
+          condition: "A crypto-module error occurred during verification (gRPC Internal)."
+    iscs: [S9, S31, S8]
 
   - name: "PublicSpaceState::delete_post"
     module: daemonseed_server::public_space
