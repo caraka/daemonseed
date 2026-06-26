@@ -27,8 +27,10 @@
 use core::str::FromStr;
 
 use daemonseed_core::handle::{Handle, HandleParseError};
+use daemonseed_core::identity::keys::{SignKeypair, SignatureError};
 use daemonseed_core::public_space::{
-    ArtifactError, Whitelist, WhitelistEntry, WhitelistParseError, verify_artifact,
+    ArtifactError, Whitelist, WhitelistEntry, WhitelistParseError, motd_text_is_valid,
+    verify_artifact,
 };
 use daemonseed_core::share_catalog::ShareListing;
 use daemonseed_proto::v1 as wire;
@@ -122,7 +124,7 @@ pub fn filter_shares_excluding_hidden<'a>(
 
 // ── Client re-verification (ISC-A-S3 client half) ────────────────────────
 
-/// Why converting the published wire whitelist failed.
+/// Why converting (or authorizing against) the published wire whitelist failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WhitelistConvertError {
     /// A `SignerWhitelistEntry` had no `entry` oneof set.
@@ -131,6 +133,9 @@ pub enum WhitelistConvertError {
     BadKey(WhitelistParseError),
     /// A handle entry didn't parse as `<name>#<hash>`.
     BadHandle(HandleParseError),
+    /// Authorizing a key against the rebuilt whitelist failed (the oxicrypt
+    /// module was not operational for the hash-prefix check).
+    Module(oxicrypt_module::Error),
 }
 
 /// Build a [`Whitelist`] from the wire entries a client fetched via
@@ -227,6 +232,111 @@ pub fn verify_served_motd(
     )
     .map(|_| ())
     .map_err(ServedVerifyError::Verify)
+}
+
+// ── Client signer authoring + self-determination (ISC-C89 / ISC-C90) ──────
+
+/// Why authoring a MOTD as a signer failed.
+#[derive(Debug)]
+pub enum MotdAuthorError {
+    /// The text is not single-line plaintext (ISC-S9).
+    NotPlaintext,
+    /// Signing the payload with the local identity key failed.
+    Sign(SignatureError),
+}
+
+impl core::fmt::Display for MotdAuthorError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            MotdAuthorError::NotPlaintext => write!(f, "motd text must be single-line plaintext"),
+            MotdAuthorError::Sign(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for MotdAuthorError {}
+
+/// Assemble a [`wire::SignedArtifact`]: sign the canonical payload bytes with the
+/// local identity key and carry the full pubkey (the same envelope the server
+/// and every client verify, D-M6-7). `signed_payload` is stored/forwarded
+/// verbatim — never re-encoded, which would change the content address and
+/// invalidate the signature.
+fn signed_artifact(
+    kp: &SignKeypair,
+    signed_payload: Vec<u8>,
+) -> Result<wire::SignedArtifact, SignatureError> {
+    let signature = kp.sign(&signed_payload)?.to_vec();
+    Ok(wire::SignedArtifact {
+        signed_payload,
+        signer_pubkey: kp.public_key().to_vec(),
+        signature,
+    })
+}
+
+/// Author a signed announcement post (ISC-S7): build the inner `PostPayload`,
+/// prost-encode it, and sign with the local identity key. The result re-verifies
+/// against the signer whitelist via [`verify_served_post`] — the authoring
+/// counterpart to that read helper.
+pub fn sign_post(
+    kp: &SignKeypair,
+    topic: &str,
+    body: &str,
+    signed_timestamp_ms: i64,
+) -> Result<wire::SignedArtifact, SignatureError> {
+    let payload = wire::PostPayload {
+        topic: topic.to_owned(),
+        body: body.to_owned(),
+        signed_timestamp_ms,
+    };
+    signed_artifact(kp, payload.encode_to_vec())
+}
+
+/// Author a signed MOTD (ISC-S9): enforce the shared single-line-plaintext rule
+/// FIRST, then build/encode/sign the inner `MotdPayload`. The plaintext check is
+/// the same [`motd_text_is_valid`] the server ingest enforces, so the composer
+/// and the relay agree on one definition of the ISC-S9 rule.
+pub fn sign_motd(
+    kp: &SignKeypair,
+    text: &str,
+    signed_timestamp_ms: i64,
+) -> Result<wire::SignedArtifact, MotdAuthorError> {
+    if !motd_text_is_valid(text) {
+        return Err(MotdAuthorError::NotPlaintext);
+    }
+    let payload = wire::MotdPayload {
+        text: text.to_owned(),
+        signed_timestamp_ms,
+    };
+    signed_artifact(kp, payload.encode_to_vec()).map_err(MotdAuthorError::Sign)
+}
+
+/// Author a signed delete of one's own post (ISC-S7): build the inner
+/// `PostDeletePayload` over the target post's content address and sign it.
+/// Server-side author-match enforcement already lives in `delete_post`; this is
+/// the client authoring of the delete artifact.
+pub fn sign_post_delete(
+    kp: &SignKeypair,
+    content_address: &[u8],
+    signed_timestamp_ms: i64,
+) -> Result<wire::SignedArtifact, SignatureError> {
+    let payload = wire::PostDeletePayload {
+        content_address: content_address.to_vec(),
+        signed_timestamp_ms,
+    };
+    signed_artifact(kp, payload.encode_to_vec())
+}
+
+/// Signer self-determination (ISC-S8): true iff the local pubkey is authorized
+/// by the relay's *published* whitelist (`GetSignerWhitelist`). This is the
+/// boolean that gates the in-client authoring composer — cryptographic, with no
+/// separate admin login; a non-member key gets a read-only view.
+pub fn local_key_is_whitelisted(
+    local_pubkey: &[u8],
+    entries: &[wire::SignerWhitelistEntry],
+) -> Result<bool, WhitelistConvertError> {
+    whitelist_from_wire(entries, None)?
+        .authorizes(local_pubkey)
+        .map_err(WhitelistConvertError::Module)
 }
 
 #[cfg(test)]
@@ -482,5 +592,146 @@ mod tests {
             signature,
         };
         assert_eq!(verify_served_motd(&motd, &wl), Ok(()));
+    }
+
+    // ── Client signer authoring (ISC-C89) ────────────────────────────────
+
+    /// Wrap a signed post artifact in a `Post` with its correct content address.
+    fn post_from_artifact(artifact: wire::SignedArtifact) -> wire::Post {
+        let address =
+            daemonseed_core::public_space::content_address(&artifact.signed_payload).unwrap();
+        wire::Post {
+            artifact: Some(artifact),
+            content_address: address.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn sign_post_round_trips_through_verify_served_post() {
+        let signer = keypair(80);
+        let post =
+            post_from_artifact(sign_post(&signer, "announcements", "v2 shipped", 5).unwrap());
+        let wl = whitelist_from_wire(&[wire_full_key(&signer)], None).unwrap();
+        assert_eq!(verify_served_post(&post, &wl), Ok(()));
+    }
+
+    #[test]
+    fn sign_post_rejected_by_foreign_whitelist() {
+        // A signer's post never verifies against a whitelist of a different key.
+        let signer = keypair(81);
+        let other = keypair(82);
+        let post =
+            post_from_artifact(sign_post(&signer, "announcements", "v2 shipped", 5).unwrap());
+        let wl = whitelist_from_wire(&[wire_full_key(&other)], None).unwrap();
+        assert_eq!(
+            verify_served_post(&post, &wl),
+            Err(ServedVerifyError::Verify(ArtifactError::UnknownSigner))
+        );
+    }
+
+    #[test]
+    fn sign_motd_round_trips_through_verify_served_motd() {
+        let signer = keypair(83);
+        let motd = sign_motd(&signer, "relay is up", 1).unwrap();
+        let wl = whitelist_from_wire(&[wire_full_key(&signer)], None).unwrap();
+        assert_eq!(verify_served_motd(&motd, &wl), Ok(()));
+    }
+
+    #[test]
+    fn sign_motd_rejects_non_plaintext() {
+        // The composer enforces the shared ISC-S9 rule before signing.
+        let signer = keypair(84);
+        assert!(matches!(
+            sign_motd(&signer, "a\nb", 1),
+            Err(MotdAuthorError::NotPlaintext)
+        ));
+    }
+
+    #[test]
+    fn sign_post_delete_round_trips_and_verifies() {
+        let signer = keypair(85);
+        let target = [9u8; 48];
+        let artifact = sign_post_delete(&signer, &target, 7).unwrap();
+        let decoded = wire::PostDeletePayload::decode(artifact.signed_payload.as_slice()).unwrap();
+        assert_eq!(decoded.content_address, target.to_vec());
+        assert_eq!(decoded.signed_timestamp_ms, 7);
+        let wl = whitelist_from_wire(&[wire_full_key(&signer)], None).unwrap();
+        assert!(
+            daemonseed_core::public_space::verify_artifact(
+                &artifact.signed_payload,
+                &artifact.signer_pubkey,
+                &artifact.signature,
+                &wl,
+            )
+            .is_ok(),
+            "signed delete verifies against the signer whitelist"
+        );
+    }
+
+    // ── Signer self-determination (ISC-C90) ──────────────────────────────
+
+    #[test]
+    fn local_key_is_whitelisted_true_on_list() {
+        let signer = keypair(86);
+        assert_eq!(
+            local_key_is_whitelisted(signer.public_key(), &[wire_full_key(&signer)]),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn local_key_is_whitelisted_false_off_list() {
+        let signer = keypair(87);
+        let stranger = keypair(88);
+        assert_eq!(
+            local_key_is_whitelisted(stranger.public_key(), &[wire_full_key(&signer)]),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn local_key_is_whitelisted_matches_handle_form_entry() {
+        // A handle-form whitelist entry authorizes by hash-prefix (ISC-12), so a
+        // signer listed by `name#hash` self-determines as a signer too.
+        let signer = keypair(89);
+        let handle = Handle::from_pubkey(None, signer.public_key()).unwrap();
+        let entry = wire::SignerWhitelistEntry {
+            entry: Some(wire::signer_whitelist_entry::Entry::Handle(
+                handle.to_string(),
+            )),
+        };
+        assert_eq!(
+            local_key_is_whitelisted(signer.public_key(), &[entry]),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn local_key_is_whitelisted_handle_entry_rejects_wrong_key() {
+        // The spoofing case: a handle-form entry authorizes by the hash-prefix
+        // of the ARRIVING key (ISC-12), not by a claimed handle string, so a
+        // different key never self-determines true off another signer's handle.
+        let listed = keypair(90);
+        let stranger = keypair(91);
+        let handle = Handle::from_pubkey(None, listed.public_key()).unwrap();
+        let entry = wire::SignerWhitelistEntry {
+            entry: Some(wire::signer_whitelist_entry::Entry::Handle(
+                handle.to_string(),
+            )),
+        };
+        assert_eq!(
+            local_key_is_whitelisted(stranger.public_key(), &[entry]),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn local_key_is_whitelisted_empty_list_fails_closed() {
+        // No published signers → a normal key self-determines false (read-only).
+        let signer = keypair(92);
+        assert_eq!(
+            local_key_is_whitelisted(signer.public_key(), &[]),
+            Ok(false)
+        );
     }
 }

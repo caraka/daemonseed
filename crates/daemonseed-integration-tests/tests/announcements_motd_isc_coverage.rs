@@ -83,3 +83,76 @@ fn isc_s31_covered() {
         "ISC-S31 registered (in-band MOTD upload)"
     );
 }
+
+// ── #90 client signer authoring + self-determination (ISC-C89 / ISC-C90) ──
+//
+// Exercises the cli authoring half (`daemonseed_cli::public_space`) — the
+// symmetric counterpart to the read/verify helpers — at the library level.
+
+use daemonseed_cli::public_space::{
+    local_key_is_whitelisted, sign_post, verify_served_post, whitelist_from_wire,
+};
+
+fn full_key_entry(signer: &SignKeypair) -> wire::SignerWhitelistEntry {
+    wire::SignerWhitelistEntry {
+        entry: Some(wire::signer_whitelist_entry::Entry::FullPubkey(
+            signer.public_key().to_vec(),
+        )),
+    }
+}
+
+/// ISC-C89: a signer authors a post with `sign_post`; the served artifact
+/// re-verifies against the published signer whitelist via `verify_served_post`
+/// (the authoring counterpart to the verify-and-serve read path).
+#[test]
+fn client_signer_authoring_round_trips() {
+    let signer = keypair(121);
+    let artifact = sign_post(&signer, "announcements", "v2 shipped", 9).unwrap();
+    let address = daemonseed_core::public_space::content_address(&artifact.signed_payload).unwrap();
+    let post = wire::Post {
+        artifact: Some(artifact),
+        content_address: address.as_bytes().to_vec(),
+    };
+    let wl = whitelist_from_wire(&[full_key_entry(&signer)], None).unwrap();
+    assert!(verify_served_post(&post, &wl).is_ok());
+}
+
+#[test]
+fn isc_c89_covered() {
+    let mut c = Coverage::empty();
+    c.register("ISC-C89", "client_signer_authoring_round_trips");
+    assert_eq!(
+        c.covered_count(),
+        1,
+        "ISC-C89 registered (signer authoring)"
+    );
+}
+
+/// ISC-C90: signer self-determination — `local_key_is_whitelisted` is true iff
+/// the local pubkey is on the relay's published whitelist; it gates the
+/// in-client composer (#92) cryptographically, with no admin login.
+#[test]
+fn client_signer_self_determination() {
+    let signer = keypair(122);
+    let stranger = keypair(123);
+    let entries = [full_key_entry(&signer)];
+    assert_eq!(
+        local_key_is_whitelisted(signer.public_key(), &entries),
+        Ok(true)
+    );
+    assert_eq!(
+        local_key_is_whitelisted(stranger.public_key(), &entries),
+        Ok(false)
+    );
+}
+
+#[test]
+fn isc_c90_covered() {
+    let mut c = Coverage::empty();
+    c.register("ISC-C90", "client_signer_self_determination");
+    assert_eq!(
+        c.covered_count(),
+        1,
+        "ISC-C90 registered (self-determination)"
+    );
+}

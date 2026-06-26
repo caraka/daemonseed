@@ -846,6 +846,129 @@ functions:
           condition: Signature or whitelist verification failed.
     iscs: [A-S3, "26"]
 
+  - name: sign_post
+    module: daemonseed_cli::public_space
+    description: >-
+      Author a signed announcement post (ISC-S7): build the inner PostPayload,
+      prost-encode it, and sign with the local identity key into a
+      SignedArtifact that re-verifies against the signer whitelist (authoring
+      counterpart to verify_served_post).
+    signature: "pub fn sign_post(kp: &SignKeypair, topic: &str, body: &str, signed_timestamp_ms: i64) -> Result<wire::SignedArtifact, SignatureError>"
+    parameters:
+      - name: kp
+        type: "&SignKeypair"
+        direction: in
+        description: The local identity's signing keypair.
+      - name: topic
+        type: "&str"
+        direction: in
+        description: Operator-defined topic id to post into.
+      - name: body
+        type: "&str"
+        direction: in
+        description: The post body.
+      - name: signed_timestamp_ms
+        type: i64
+        direction: in
+        description: Signer wall-clock milliseconds; orders posts within a topic.
+    returns:
+      type: "Result<wire::SignedArtifact, SignatureError>"
+      description: The signed post artifact, or a signing failure.
+      error_variants:
+        - name: "Module(oxicrypt_module::Error)"
+          condition: The oxicrypt module was not operational for signing.
+    iscs: ["S7"]
+
+  - name: sign_motd
+    module: daemonseed_cli::public_space
+    description: >-
+      Author a signed MOTD (ISC-S9): enforce the shared single-line-plaintext
+      rule (motd_text_is_valid) before encoding and signing the inner
+      MotdPayload, so composer and relay agree on one definition of the rule.
+    signature: "pub fn sign_motd(kp: &SignKeypair, text: &str, signed_timestamp_ms: i64) -> Result<wire::SignedArtifact, MotdAuthorError>"
+    parameters:
+      - name: kp
+        type: "&SignKeypair"
+        direction: in
+        description: The local identity's signing keypair.
+      - name: text
+        type: "&str"
+        direction: in
+        description: The plaintext MOTD; rejected if not single-line plaintext.
+      - name: signed_timestamp_ms
+        type: i64
+        direction: in
+        description: Signer wall-clock milliseconds; latest validated update wins.
+    returns:
+      type: "Result<wire::SignedArtifact, MotdAuthorError>"
+      description: The signed MOTD artifact, or a plaintext / signing failure.
+      error_variants:
+        - name: NotPlaintext
+          condition: The text is not single-line plaintext (ISC-S9).
+        - name: "Sign(SignatureError)"
+          condition: Signing the payload with the local identity key failed.
+    iscs: ["S9"]
+
+  - name: sign_post_delete
+    module: daemonseed_cli::public_space
+    description: >-
+      Author a signed delete of one's own post (ISC-S7): build and sign a
+      PostDeletePayload over the target post's content address. Server-side
+      author-match enforcement lives in delete_post; this is the client
+      authoring of the delete artifact.
+    signature: "pub fn sign_post_delete(kp: &SignKeypair, content_address: &[u8], signed_timestamp_ms: i64) -> Result<wire::SignedArtifact, SignatureError>"
+    parameters:
+      - name: kp
+        type: "&SignKeypair"
+        direction: in
+        description: The local identity's signing keypair.
+      - name: content_address
+        type: "&[u8]"
+        direction: in
+        description: SHA-384 content address of the post to delete.
+      - name: signed_timestamp_ms
+        type: i64
+        direction: in
+        description: Signer wall-clock milliseconds (freshness).
+    returns:
+      type: "Result<wire::SignedArtifact, SignatureError>"
+      description: The signed delete artifact, or a signing failure.
+      error_variants:
+        - name: "Module(oxicrypt_module::Error)"
+          condition: The oxicrypt module was not operational for signing.
+    iscs: ["S7"]
+
+  - name: local_key_is_whitelisted
+    module: daemonseed_cli::public_space
+    description: >-
+      Signer self-determination (ISC-S8): true iff the local pubkey is
+      authorized by the relay's published whitelist (GetSignerWhitelist),
+      gating the in-client authoring composer cryptographically with no admin
+      login. Whitelist membership stays operator-only / out-of-band.
+    signature: "pub fn local_key_is_whitelisted(local_pubkey: &[u8], entries: &[wire::SignerWhitelistEntry]) -> Result<bool, WhitelistConvertError>"
+    parameters:
+      - name: local_pubkey
+        type: "&[u8]"
+        direction: in
+        description: The local identity's public key.
+      - name: entries
+        type: "&[wire::SignerWhitelistEntry]"
+        direction: in
+        description: The relay's published whitelist wire entries.
+    returns:
+      type: "Result<bool, WhitelistConvertError>"
+      description: Whether the local key is authorized, or a conversion / authorization failure.
+      error_variants:
+        - name: EmptyEntry
+          condition: A SignerWhitelistEntry had no `entry` oneof set.
+        - name: "BadKey(WhitelistParseError)"
+          condition: A full-key entry was the wrong length.
+        - name: "BadHandle(HandleParseError)"
+          condition: A handle entry didn't parse as "<name>#<hash>".
+        - name: "Module(oxicrypt_module::Error)"
+          condition: The oxicrypt module was not operational for the hash-prefix authorization check.
+    iscs: [S8]
+
   # ── daemonseed_cli::session ───────────────────────────────────────
   - name: "AppSession::open"
     module: daemonseed_cli::session

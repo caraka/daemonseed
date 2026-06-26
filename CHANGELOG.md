@@ -27,6 +27,7 @@ work lives in the project lead's vault manifest, not here.
 ### Added
 
 - server: `UploadMotd` RPC — in-band signer-set MOTD, single-slot replace, plaintext-enforced (#89)
+- cli/public_space: client signer authoring (`sign_post`/`sign_motd`/`sign_post_delete`) + signer self-determination (`local_key_is_whitelisted`) (#90)
 
 ## [0.31.1] — 2026-06-25
 

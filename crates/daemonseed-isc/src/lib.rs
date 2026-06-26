@@ -19,7 +19,7 @@
 //!
 //! - 57 server-side: 32 positive (`ISC-S*`) + 25 negative (`ISC-A-S*`)
 //!   (S31 added the #89 UploadMotd in-band signer-set MOTD)
-//! - 113 client-side: 77 positive (`ISC-C*`) + 36 negative (`ISC-A-C*`)
+//! - 115 client-side: 79 positive (`ISC-C*`) + 36 negative (`ISC-A-C*`)
 //!   (M16 A1 added C66 manifest-preview + A-C33 no-blind-download, A2 added C67 selective-fetch,
 //!   A3 added C68 choose-download-dir, A4 added C72 collapsible-folder-tree preview, C1 added C69
 //!   multi-share-publish, C2 added C70 status-auto-clear, C3 added C71 generate-circle-phrase;
@@ -33,8 +33,9 @@
 //!   Earlier: alpha2 share_id / share download / public rooms / client-lifecycle / portable.
 //!   alpha3: C77/C78 unified-share + unread; C79/C80 connection resilience; C81 single-instance;
 //!   C82 rename; C83-C86 + A-C38/A-C39 presence heartbeat; C87 + A-C40 graceful-EOS re-subscribe;
-//!   A-C41 presence replay-freshness.)
-//! - 170 total
+//!   A-C41 presence replay-freshness; C88 + A-C42 GUI Lobby roster;
+//!   C89/C90 client signer authoring + self-determination.)
+//! - 172 total
 //!
 //! Deliberately EXCLUDED from [`ISCS`] (and therefore from [`TOTAL`]) because
 //! they are not built: the deferred direct-messaging family
@@ -213,6 +214,9 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-C87", IscClass::Positive),
     // ── client positive (#75: GUI surfaces the live Lobby roster) ──
     ("ISC-C88", IscClass::Positive),
+    // ── client positive (#90: client signer authoring + self-determination) ──
+    ("ISC-C89", IscClass::Positive),
+    ("ISC-C90", IscClass::Positive),
     // ── client negative (20) ────────────────────────────────────────────
     ("ISC-A-C1", IscClass::Negative),
     ("ISC-A-C2", IscClass::Negative),
@@ -263,7 +267,7 @@ pub const ISCS: &[(&str, IscClass)] = &[
 /// of truth for the coverage denominator, read live by `xtask isc-coverage`.
 /// Recount on every ISC add/remove (the `const _` assert below guards it
 /// against [`ISCS`]).
-pub const TOTAL: usize = 170;
+pub const TOTAL: usize = 172;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -292,14 +296,14 @@ pub const MILESTONE_COVERED: &[(&str, usize)] = &[
     ("M7", 5),
     ("M12", 0),
     ("alpha2", 28),
-    ("alpha3", 1),
+    ("alpha3", 3),
 ];
 
 /// Distinct ISCs covered by a registered integration test — the SINGLE source
 /// of truth for the coverage numerator, read live by `xtask isc-coverage`
 /// (it replaced a hand-maintained `COVERED_ISCS` mirror in xtask). Equals the
 /// sum of [`MILESTONE_COVERED`] (guarded by `covered_sum_matches`).
-pub const COVERED: usize = 101;
+pub const COVERED: usize = 103;
 
 const _: () = assert!(
     COVERED <= TOTAL,
@@ -424,9 +428,10 @@ mod tests {
         //                                  graceful-EOS re-subscribe C87 pos + A-C40 neg, #80;
         //                                  presence replay-freshness A-C41 neg, #78;
         //                                  GUI Lobby roster surface C88 pos + A-C42 neg, #75;
-        //                                  in-band UploadMotd S31 pos, #89)
-        //   total   109 pos + 61 neg = 170
-        assert_eq!(pos, 109, "positive count drift");
+        //                                  in-band UploadMotd S31 pos, #89;
+        //                                  client signer authoring C89 + self-determination C90 pos, #90)
+        //   total   111 pos + 61 neg = 172
+        assert_eq!(pos, 111, "positive count drift");
         assert_eq!(neg, 61, "negative count drift");
     }
 
