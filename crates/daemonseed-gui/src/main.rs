@@ -1547,11 +1547,18 @@ fn apply_net_event(
             ui.set_download_progress(0.0);
             ui.set_download_label(SharedString::from(format!("Download failed: {message}")));
         }
-        NetEvent::Roster { entries } => {
-            // Replace the Lobby roster model (#75). Runs on the UI thread (the Timer
-            // drains events here), so a direct set is correct — no cross-thread hop.
-            // The roster column renders/collapses by Lobby+Chat visibility Slint-side.
-            ui.set_roster(roster_model(&entries));
+        NetEvent::Roster { circle_id, entries } => {
+            // Replace the roster model for the ACTIVE room only (#75 lobby / #77
+            // circles). A roster is room-scoped: the lobby is `None`, a circle is
+            // `Some(circle_id)`. The active room is `state.active_circle_id()` (None
+            // for the Lobby). A roster for a background room updated its tracker
+            // net-side but must not change the visible column. Runs on the UI thread
+            // (the Timer drains events here), so a direct set is correct — no
+            // cross-thread hop. The column renders/collapses by Chat visibility
+            // Slint-side.
+            if state.borrow().active_circle_id() == circle_id {
+                ui.set_roster(roster_model(&entries));
+            }
         }
         // Test-only probes (net.rs in-process oracle); never produced in a running
         // binary, so they carry no UI effect.
