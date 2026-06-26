@@ -38,8 +38,15 @@ pub const DOMAIN_KEM_D: &str = "kem-d";
 /// Domain separator for the ML-KEM-1024 `z` seed (per FIPS 203 keygen).
 pub const DOMAIN_KEM_Z: &str = "kem-z";
 
+/// Domain separator for the Veilid node identity seed (VLD0 = Ed25519), so the
+/// transport node key derives from the same mnemonic as the ML-DSA/ML-KEM
+/// identity yet shares no key material with it (D3). Content keys NEVER derive
+/// from this — it binds only the node/transport identity.
+pub const DOMAIN_VEILID_NODE: &str = "veilid-node";
+
 /// Build the full HKDF info string for the primary identity's given domain.
-/// `domain` is one of `DOMAIN_SIGN`, `DOMAIN_KEM_D`, `DOMAIN_KEM_Z`.
+/// `domain` is one of `DOMAIN_SIGN`, `DOMAIN_KEM_D`, `DOMAIN_KEM_Z`,
+/// `DOMAIN_VEILID_NODE`.
 pub fn primary(domain: &str) -> String {
     format!("{PRIMARY_PREFIX}/{domain}")
 }

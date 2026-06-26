@@ -211,13 +211,43 @@ impl core::fmt::Debug for KemKeypair {
     }
 }
 
+/// Length of the Veilid node identity seed — VLD0 is Ed25519, so these 32
+/// bytes ARE the node's secret seed and the public node key is its Ed25519
+/// verifying key (D3).
+pub const VEILID_NODE_SEED_LEN: usize = 32;
+
+/// The Veilid node identity seed (D3). Derived from the same mnemonic as the
+/// ML-DSA/ML-KEM identity but under a domain-separated HKDF label
+/// (`info::DOMAIN_VEILID_NODE`), so one recovery phrase yields one identity
+/// across both the content layer and the Veilid transport layer while sharing
+/// no key material with the content/identity keys. Zeroizes on drop.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct VeilidNodeSeed([u8; VEILID_NODE_SEED_LEN]);
+
+impl VeilidNodeSeed {
+    /// The raw 32-byte Ed25519 secret seed, for building the VLD0 node keypair.
+    pub fn as_bytes(&self) -> &[u8; VEILID_NODE_SEED_LEN] {
+        &self.0
+    }
+}
+
+impl core::fmt::Debug for VeilidNodeSeed {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("VeilidNodeSeed")
+            .field("seed", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Both keypairs an [`Identity`] produces, derived deterministically from a
-/// mnemonic.
+/// mnemonic, plus the Veilid node identity seed (D3).
 #[derive(Debug)]
 pub struct IdentityKeys {
     pub identity: Identity,
     pub signing: SignKeypair,
     pub kem: KemKeypair,
+    /// Veilid node identity seed (D3) — see [`VeilidNodeSeed`].
+    pub veilid_node_seed: VeilidNodeSeed,
 }
 
 /// Derive the signing + KEM keypair for one [`Identity`] from a mnemonic.
@@ -272,10 +302,23 @@ pub fn derive_identity_keys(
         decapsulation_key: Box::new(dk_arr),
     };
 
+    // Veilid node seed (D3): one more expansion of the SAME PRK under a
+    // domain-separated label. VLD0 = Ed25519, so this 32-byte output is the
+    // node's secret seed directly. Copied into a self-zeroizing wrapper before
+    // the transient buffer drops and zeroes.
+    let mut veilid_seed = SecretBuffer::<VEILID_NODE_SEED_LEN>::zero();
+    hkdf.expand(
+        identity.info_for(info::DOMAIN_VEILID_NODE).as_bytes(),
+        &mut *veilid_seed,
+    )
+    .map_err(KeyDerivationError::Hkdf)?;
+    let veilid_node_seed = VeilidNodeSeed(*veilid_seed);
+
     Ok(IdentityKeys {
         identity,
         signing,
         kem,
+        veilid_node_seed,
     })
 }
 
@@ -466,5 +509,52 @@ mod tests {
         // long lowercase hex run that would indicate raw bytes).
         assert!(!sign_dbg.contains("0x"));
         assert!(!kem_dbg.contains("0x"));
+    }
+
+    #[test]
+    fn veilid_node_seed_is_deterministic() {
+        ensure_oxicrypt_initialized();
+        let m = Mnemonic::from_phrase(ALL_ZEROS_PHRASE).unwrap();
+        let a = derive_identity_keys(&m, Identity::Primary).unwrap();
+        let b = derive_identity_keys(&m, Identity::Primary).unwrap();
+        assert_eq!(a.veilid_node_seed.as_bytes(), b.veilid_node_seed.as_bytes());
+    }
+
+    #[test]
+    fn veilid_node_seed_is_derived_not_zero() {
+        // The HKDF expansion actually ran (not a left-over zeroed buffer).
+        ensure_oxicrypt_initialized();
+        let m = Mnemonic::from_phrase(ALL_ZEROS_PHRASE).unwrap();
+        let keys = derive_identity_keys(&m, Identity::Primary).unwrap();
+        assert_ne!(
+            keys.veilid_node_seed.as_bytes(),
+            &[0u8; VEILID_NODE_SEED_LEN]
+        );
+    }
+
+    #[test]
+    fn veilid_node_seed_diverges_by_identity() {
+        // Domain separation across identities: same mnemonic, different identity
+        // → different node seed (the HKDF info carries the identity), the same
+        // mechanism that separates the node seed's DOMAIN_VEILID_NODE label from
+        // the ML-DSA / ML-KEM content-key labels.
+        ensure_oxicrypt_initialized();
+        let m = Mnemonic::from_phrase(ALL_ZEROS_PHRASE).unwrap();
+        let primary = derive_identity_keys(&m, Identity::Primary).unwrap();
+        let device = derive_identity_keys(&m, Identity::Device { uuid: Uuid::nil() }).unwrap();
+        assert_ne!(
+            primary.veilid_node_seed.as_bytes(),
+            device.veilid_node_seed.as_bytes()
+        );
+    }
+
+    #[test]
+    fn veilid_node_seed_diverges_by_mnemonic() {
+        ensure_oxicrypt_initialized();
+        let m1 = Mnemonic::generate().unwrap();
+        let m2 = Mnemonic::generate().unwrap();
+        let a = derive_identity_keys(&m1, Identity::Primary).unwrap();
+        let b = derive_identity_keys(&m2, Identity::Primary).unwrap();
+        assert_ne!(a.veilid_node_seed.as_bytes(), b.veilid_node_seed.as_bytes());
     }
 }

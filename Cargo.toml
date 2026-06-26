@@ -11,6 +11,11 @@ members = [
     "crates/daemonseed-gui",
     "xtask",
 ]
+# Held out of the unified workspace lock until the v0.33.0 cutover: veilid-core's
+# dependency tree must not perturb the frozen v0.32.0 relay resolution. This
+# crate carries its own Cargo.lock and builds independently; it joins `members`
+# when daemonseed-server is disconnected at cutover.
+exclude = ["crates/daemonseed-veilid-net"]
 
 [workspace.package]
 version = "0.1.0"

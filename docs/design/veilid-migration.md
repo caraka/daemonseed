@@ -1,0 +1,109 @@
+# Veilid Migration — Design of Record
+
+> Status: ACCEPTED design. Feasibility proven 2026-06-26 (spike: a real daemonseed circle message crossed the public Veilid network over a private route, PQ envelope intact — oracle green). This is the design-of-record for the daemonseed → Veilid transition; its **locked decisions D1–D5** are the durable references cited from `ISA.md` and `CHANGELOG.md`. Phase 1 (the `veilid-net` core) lands on the `feat/veilid-migration` branch.
+
+## Problem
+
+daemonseed runs on its own relay (`daemonseed-server`): a blind forwarder that provides rendezvous, message forwarding, and NAT traversal. That relay is an always-on dependency, a centralization point, and a maintenance burden. Veilid provides NAT traversal, onion-routed private transport, and decentralized DHT discovery as a substrate — so daemonseed can drop its relay, decentralize, and become a post-quantum app on a Veilid-class ecosystem. The migration is a substrate swap, not a rewrite: the v0.29.0 relay-blind refactor already cut the codebase along exactly this seam, and the spike proved the security core rides Veilid untouched.
+
+## Locked decisions (caraka, 2026-06-26)
+
+- **D1 — fra1 role = bootstrap-only at MVP.** fra1 runs a vanilla `veilid-server` as a Veilid bootstrap/seed node. No availability/pinning node at MVP (that is a separate, later role).
+- **D2 — fan-out model = discover/decide as we go.** The circle/lobby fan-out mechanism (shared DHT record vs per-member private routes vs a lobby-host) is resolved empirically in the Phase 0 spike, not pre-committed.
+- **D3 — identity = derive the Veilid node key from the daemonseed identity seed.** One identity, one 24-word phrase; the Veilid `TypedKey` is derived from the daemonseed seed rather than being a separate, separately-managed key.
+- **D4 — ride the PUBLIC Veilid network.** Not a private daemonseed-only island. The anti-dox property depends on a large, diverse anonymity set, so daemonseed nodes join the public Veilid network; **fra1 contributes a node to that public network.**
+- **D5 — hop count is a user setting with a reasonable default > 1.** Veilid's own default is 1 hop each side (lightest meaningful default); daemonseed defaults higher to harden unlinkability, and exposes it as a setting (latency vs anonymity trade).
+
+## Invariants — the security core, do NOT touch
+
+These are why the spike was ~200 lines. They are transport-independent and carry over unchanged:
+
+- **Identity:** ML-DSA-87 (sign) + ML-KEM-1024 (KEM), HKDF-rooted from the seed (`daemonseed-core` identity/keys); the 24-word recovery phrase.
+- **Content envelopes:** AES-256-GCM sealed under the circle `cot_key` / `PublicRoomKey` (`circle::message::{seal_message,open_message}`). Proven transport-independent 2026-06-26. The content key never derives from any Veilid (classical x25519) key material — that is the rule that keeps content post-quantum regardless of substrate.
+- **Proto payload schemas:** `CircleMessage`, `PublicRoomMessage`, `ShareAnnouncement`, `EncryptedEnvelope` (`daemonseed-proto`).
+- **oxicrypt**, the crypto suite registry, and the GUI/TUI surfaces (rewire only the net layer beneath them).
+
+## What is replaced
+
+- **`daemonseed-server` (the relay) → DELETED.** Its three jobs (rendezvous, blind forward, NAT traversal) become Veilid's.
+- **`AppSession` (gRPC-over-h2 tonic client) → a new `veilid-net` crate.** A Veilid networking actor owning one `VeilidAPI` + `RoutingContext` + the update-callback pump, exposing daemonseed-shaped operations to the UI.
+
+## The `veilid-net` actor
+
+A single long-lived async actor that:
+
+- Boots a `VeilidAPI` (per the verified 0.5.4 startup: `api_startup(update_callback, config)`; bootstrap = the baked-in fra1 seed + public Veilid bootstrap; `network_key_password` UNSET so it joins the public net per D4).
+- Pumps `VeilidUpdate`s (AppMessage / AppCall / Attachment / RouteChange / ValueChange) into typed daemonseed events.
+- Exposes the operations the UI needs: `send_circle_message`, `subscribe_circle`, `publish_share`, `fetch_share`, `lobby_post` / `lobby_subscribe`, `presence`, `publish_announcement` / `watch_announcements`.
+- Maps each onto Veilid primitives (see Feature re-model). All sends use a `Safe` routing context (safety route on); the hop count comes from the D5 setting.
+
+## Privacy model (anti-dox) — how a download hides both ends
+
+This is the property the share/download flow must preserve, and it is the reason for D4 + D5. Verified against `veilid-core` source (`veilid_config.rs:455-461,974-984`; `types/safety.rs:252-277`; `route_spec_store/route_validate.rs`; `examples/private_route/README.md`).
+
+Two onion routes stack, one hiding each end:
+
+- **The sharer's private route (hides the uploader).** The host calls `new_private_route()`, picks a chain of *other* Veilid nodes as hops, and publishes only an opaque **route blob** — never their node id or IP. A downloader addresses the blob, not the host. Each hop is onion-encrypted and knows only its neighbors; only the final hop reaches the host, and it does not know it is carrying the origin's traffic. The downloader never learns the host's node/IP.
+- **The downloader's safety route (hides the downloader).** With a `Safe` routing context, the downloader's own hops are prepended, so the host (and the intermediates) see traffic from the safety-route *exit*, not from the downloader.
+
+No single node on the combined path knows BOTH endpoints. Hop counts: Veilid default is 1 each side, max 4 — **daemonseed sets a higher default (D5)** and exposes it. Anti-dox strength scales with the size/diversity of the node set, which is why D4 (ride the public network) is load-bearing: on a tiny island an adversary running an intermediate could correlate; on the public net it rarely controls the right hops.
+
+Caveat to track: Veilid private routing is explicitly a work-in-progress (route stability; `examples/private_route/README.md`). Route reliability/stabilization is a Phase 0 / ongoing item.
+
+## Feature re-model (daemonseed concept → Veilid primitive)
+
+| Feature | Today (relay) | On Veilid |
+|---|---|---|
+| Circle / direct message | sealed `CotFrame` via relay rendezvous | **PROVEN** — private route + `app_message(sealed)`. PQ-intact, sender-private. |
+| Circles | `SHA-384(cot_key‖server_id)` asset addr | DHT record keyed from the circle entropy; members watch it. Fan-out model per D2 (Phase 0). |
+| Lobby (public broadcast) | relay fan-out | publicly-derivable DHT record everyone watches; fan-out/ordering is hardest here (D2). |
+| Public shares | owner-served chunks via relay | `ShareAnnouncement` in a DHT record (discovery) + chunks served owner-on-demand via private route + `app_call`. **Re-chunk 1 MiB → ≤32 KiB** (verified `app_message`/`app_call` cap = 32768 B). stigmerge = reference. |
+| Presence | relay roster | watched DHT subkey + freshness stamp (Demonsaw roster: on-list = online). |
+| Announcements / MOTD | signed via relay whitelist | DHT record signed by the operator key; clients watch + verify against the published whitelist. |
+
+## Identity binding (D3)
+
+Derive the Veilid node `TypedKey` from the daemonseed identity seed (the same seed behind ML-DSA-87 / ML-KEM-1024), so a user has one identity and one 24-word phrase across both layers. Phase 0 confirms the mechanism: whether to seed Veilid's keypair generation deterministically from the daemonseed seed (preferred) or bind a separate Veilid key via a signed record. The content-key rule (never derive content keys from Veilid material) is unaffected — this is about the *node/transport* identity, not content keys.
+
+## Seed / bootstrap node (D1, D4)
+
+- fra1 runs a vanilla `veilid-server`, **joined to the public Veilid network** (D4), baked into the app as the initial bootstrap entry (the analog of `bootstrap-v1.veilid.net`, and of how fra1's relay address was baked in).
+- **Discovery-only, off the data path.** Unlike the old relay, the seed only helps a fresh node *find* the network; once a node has peers, all traffic is peer-to-peer over private routes and the seed is out of the loop. Less load, less trust, less criticality, better privacy.
+- **Movable.** Bootstrap records are signed discovery entries, shippable as updatable config in releases; nodes persist their routing table and don't need the seed after first join; run several seeds for redundancy. SPOF caveat: a single-seed outage only blocks *brand-new* onboarding, not existing nodes → add a 2nd/3rd seed before public beta.
+- **Availability note (not a regression):** with bootstrap-only and no pinning node, a public share requires the owner to be online to serve chunks — but the old relay was also owner-served-on-demand (owner had to be online; no re-seed), so Veilid does not make availability worse. A swarm re-seed model (stigmerge-style) or a dedicated availability/pinning node is the future upgrade, explicitly out of MVP scope (D1).
+
+## Phasing
+
+Each phase is shippable and testable on its own.
+
+- **Phase 0 — de-risk spikes ✅ COMPLETE 2026-06-26.** All unknowns resolved live on the public Veilid network (D3 offline; DHT cap/round-trip/watch + SMPL fan-out on orinoco). Phase 1 is GO-able. Findings below.
+- **Phase 1 — `veilid-net` core + identity binding (D3) + 1:1 circle message.** Productize the proven path; GUI on it.
+- **Phase 2 — circles** (DHT rendezvous + fan-out, the D2 decision made concrete) — hardest design.
+- **Phase 3 — public shares** (re-chunk ≤32 KiB + `ShareAnnouncement` + `app_call`).
+- **Phase 4 — presence + lobby + announcements/MOTD** on DHT watches.
+- **Phase 5 — cutover v0.33.0** + fra1 relay → fra1 public `veilid-server` seed; add seeds; (availability node later).
+
+## Phase 0 spike scope (the immediate next build)
+
+The 1:1 message path is already proven; Phase 0 targets only the unknowns:
+
+1. **DHT records — subkey cap RESOLVED + LIVE-CONFIRMED on the public net (2026-06-26).** `phase0-dht` PASSED on orinoco: 1 KB / 4608 B / 32768 B accepted, 32769 rejected (`Generic: invalid size`); create→set→get round-trip intact; watch registered. So the 4.6 KB ML-DSA-87 object fits in one subkey, proven on the wire. API is `create_dht_record(kind, schema, owner)` / `get_dht_value(key, subkey, force_refresh)` / `set_dht_value(key, subkey, data, opts)` / `watch_dht_values(key, subkeys, expiration, count)→ValueChange`. **Per-subkey cap = 32768 B** (`EncryptedValueData::MAX_LEN`); a record holds up to 1024 subkeys (1 MiB total, `MAX_RECORD_DATA_SIZE`). So the largest daemonseed signed object (ML-DSA-87 sig ~4.6 KB) fits in ONE subkey with ~7× headroom; the "small record + blob-out-of-DHT" fallback is NOT needed for the common case (announcements/rendezvous ≤ ~8 KB). The `phase0-dht` probe sweeps the cap live to confirm. **D2 fan-out primitive identified:** `DHTSchema::SMPL(o_cnt, members)` = multi-writer (each circle member owns a subkey range) vs `DFLT` = single-owner — SMPL is the natural circle/lobby fan-out shape, validated empirically next (needs ≥2 nodes).
+2. **DHT watch semantics — ✅ CONFIRMED live (2026-06-26).** Cross-node `watch_dht_values`→`ValueChange` works (FANOUT-2). **Measured cross-node watch latency ≈ 14.7 s** on the public net. ⚠️ **Design input:** this is fine for announcements / share-discovery / circle-membership (Demonsaw-style roster, eventual), but **too slow for sub-second presence/typing** — presence convergence is ~tens of seconds, so cadence must assume it (or supplement watches with periodic gets). Also learned: a created record isn't network-visible until first `set_dht_value`, and opens/reads need backoff (DHT is eventually consistent) — so **discovery is publish-then-find-with-backoff**.
+3. **Fan-out / many-writer ordering (D2) — ✅ PASSED live (2026-06-26, `phase0-fanout`).** Two public nodes, a SMPL record (member-A → subkey 1, member-B → subkey 2): each member wrote its own subkey independently (FANOUT-1), the cross-node watch fired (FANOUT-2), and both nodes read each other's subkey (FANOUT-3). **D2 DECIDED: `DHTSchema::SMPL` is the circle/lobby fan-out primitive** — each member owns a subkey range, the record owner identity (random/derived) is the rendezvous key. (Record key derives from the OWNER keypair — a deterministic owner gives a stable, re-findable circle address; that's how circle rendezvous addressing works.)
+4. **Identity derivation (D3) — ✅ PROVEN 2026-06-26 (offline, this VM).** VLD0 is Ed25519, so the node key is the daemonseed BIP-39 seed HKDF-expanded with a Veilid-domain label (`daemonseed/veilid/node/vld0`, domain-separated from the ML-DSA/ML-KEM labels) → 32-byte Ed25519 seed → injected via `routing_table.{public_keys,secret_keys}`. Veilid assigns identity at `api_startup` *before* attach, so this verifies with no network: the assigned node id (`VLD0:a3t3sS6nOtv9QWw-TrzFBDLcrJKhtkSwyMDQ4lUdRzs`) == the derived public; determinism + phrase-separation hold (ISC-D3a/b/c/d PASS). Spike: `veilid-ds-spike phase0-d3`. **Productization:** fold the 4th HKDF expansion into `derive_identity_keys` (keys.rs) so it shares the one HKDF-Extract rooted at the identity salt, rather than a standalone Extract as the spike does.
+5. **Hop-count tuning + route stability (D5) — observed OK.** Across all spike runs the default `Safe` routing context (SafetySpec hop_count=1, Reliable, PreferOrdered seen in logs) built routes and carried DHT + private-route traffic reliably; the 1:1 private-route spike and these DHT probes all completed. D5 default still to be chosen (>1 hop per the locked decision); no stability blocker found.
+
+**Phase 2 design seed (from D2):** a circle's DHT rendezvous record should be created with an owner keypair **derived from the circle entropy/`cot_key`** (deterministic), so every member independently computes the SAME record key and finds the rendezvous with no relay and no out-of-band key exchange — the DHT analog of today's `SHA-384(cot_key‖server_id)` address. (The spike used a random owner only to avoid cross-run collision; real circles want the deterministic owner.) Members are SMPL writers keyed by their identity; the circle key still seals content as today.
+
+## Cutover mechanics
+
+Greenfield fresh local repo; copy keep-set crates (`daemonseed-core`, `daemonseed-proto`, gui/tui) ~intact; write `veilid-net`; drop `daemonseed-server`. Land onto `github.com/caraka/daemonseed` as a **signed v0.33.0 tree-replacement cutover commit** (not a squash of unrelated histories) — preserves name/history/tags/issues/version line. **No relay↔Veilid interop** (clean cut); identity carries over via the phrase; bootstrap baked in.
+
+**Relay-overlap window (caraka, 2026-06-26):** keep the existing daemonseed **relay LIVE as a safety net until every daemon in the fleet is confirmed on > v0.33.0** — not merely until the tag is cut. During the overlap, **fra1 runs BOTH** the relay (serving any node still ≤ v0.32) and the public `veilid-server` seed (for upgraded nodes), on separate processes/ports. The two cohorts do not interoperate (the clean cut), which is acceptable for a small, coordinated tester fleet doing a deliberate upgrade. Only once **all** daemons are confirmed > v0.33.0 is the relay decommissioned and fra1 becomes seed-only. This makes the migration reversible per-tester: a daemon that hasn't upgraded keeps working until it does.
+
+## Risks
+
+- **Fan-out / ordering** (D2) — shared DHT-record write contention has no clean Veilid equivalent; biggest design risk, owned by Phase 0/2.
+- **DHT size cap vs PQ object sizes** — mitigated by small-record + blob-out-of-DHT design.
+- **Availability without an always-on relay** — same model as today (owner-served on-demand); pinning/swarm-reseed is a future upgrade, not MVP.
+- **Veilid 0.5.x API churn + private-routing WIP** — pin a Veilid version; track route-stability upstream.
