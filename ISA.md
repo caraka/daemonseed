@@ -6,7 +6,7 @@ phase: build
 progress: 100/122
 mode: interactive
 started: 2026-04-19T00:00:00Z
-updated: 2026-06-03T00:00:00Z
+updated: 2026-06-26T00:00:00Z
 ---
 
 # Daemonseed — ISA (Ideal State Artifact)
