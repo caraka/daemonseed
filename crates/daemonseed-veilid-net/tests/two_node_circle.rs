@@ -1,7 +1,9 @@
 //! Integration test (#99): a sealed daemonseed `CircleMessage` reaches a second
 //! member through a shared-owner DFLT DHT **rendezvous record** — both members
 //! derive the SAME record key from the circle entropy (no relay, no key
-//! exchange) — and is recovered byte-for-byte; an outsider key cannot open it.
+//! exchange) — and the second member opens it under the circle key; an outsider
+//! key cannot. (The record is shared + persistent and the ring may hold several
+//! slots, so the oracle is decryptability of an inbound, not byte-equality.)
 //!
 //! `#[ignore]` — it needs a host that can attach to the PUBLIC Veilid network.
 //! This VM's SLIRP NAT blocks attach, so run it on a real-network host
@@ -16,7 +18,7 @@
 //! daemonseed crypto (`derive_circle_veilid_owner_seed` / `derive_cot_key` /
 //! `seal_message` / `open_message`) — no crypto is reimplemented.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use daemonseed_core::circle::key::{derive_circle_veilid_owner_seed, derive_cot_key};
 use daemonseed_core::circle::message::{open_message, seal_message};
@@ -48,12 +50,20 @@ async fn sealed_circle_message_reaches_a_second_member() {
 
     // The shared circle secret. Both members derive the SAME rendezvous-owner
     // seed (→ same DFLT record key = rendezvous address) AND the SAME content
-    // key, INDEPENDENTLY — neither is ever sent over Veilid.
-    let entropy = "two-node-circle oracle: a shared circle passphrase";
-    let owner_seed = *derive_circle_veilid_owner_seed(entropy, &CNSA_2_0)
+    // key, INDEPENDENTLY — neither is ever sent over Veilid. The rendezvous
+    // record is DETERMINISTIC and PERSISTS on the public DHT, so a fixed phrase
+    // would accumulate stale blobs across runs (each run's random node identity
+    // writes a different member region that is never overwritten); make the
+    // phrase unique per run so every run gets a fresh, isolated rendezvous.
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let entropy = format!("two-node-circle oracle: a shared circle passphrase {nonce}");
+    let owner_seed = *derive_circle_veilid_owner_seed(&entropy, &CNSA_2_0)
         .expect("owner seed")
         .as_bytes();
-    let cot_key = derive_cot_key(entropy, &CNSA_2_0).expect("cot_key");
+    let cot_key = derive_cot_key(&entropy, &CNSA_2_0).expect("cot_key");
 
     let (node_a, _rx_a) = VeilidNet::start(node_config(":5160", &base.join("A")))
         .await
@@ -105,37 +115,59 @@ async fn sealed_circle_message_reaches_a_second_member() {
         .await
         .expect("B subscribe to circle");
 
-    let wire_bytes = tokio::time::timeout(Duration::from_secs(120), async {
+    // Oracle: the shared record can surface several inbound blobs (this member's
+    // ring slots, and possibly others), so the property is "at least one inbound
+    // OPENS to A's message under the circle key" — NOT byte-equality of the first
+    // blob (a fresh seal uses a random nonce, and the ring may hold > 1 slot).
+    // Every blob must also be ciphertext (never the plaintext in the clear).
+    let mut opened = None;
+    let _ = tokio::time::timeout(Duration::from_secs(120), async {
         loop {
             match rx_b.recv().await {
-                Some(VeilidNetEvent::Inbound { bytes }) => break bytes,
+                Some(VeilidNetEvent::Inbound { bytes }) => {
+                    assert!(
+                        !bytes
+                            .windows(original.body.len())
+                            .any(|w| w == original.body.as_bytes()),
+                        "the plaintext body must never appear on the wire"
+                    );
+                    match open_message(&cot_key, &bytes) {
+                        Ok(m)
+                            if m.body == original.body
+                                && m.sender_handle == original.sender_handle =>
+                        {
+                            eprintln!(
+                                "[oracle] inbound {} bytes OPENED to A's message",
+                                bytes.len()
+                            );
+                            opened = Some(bytes);
+                            break;
+                        }
+                        Ok(_) => eprintln!(
+                            "[oracle] inbound {} bytes opened but did not match (skip)",
+                            bytes.len()
+                        ),
+                        Err(_) => eprintln!(
+                            "[oracle] inbound {} bytes did not open under the circle key (skip)",
+                            bytes.len()
+                        ),
+                    }
+                }
                 Some(_) => continue,
-                None => panic!("B event stream closed before delivery"),
+                None => break,
             }
         }
     })
-    .await
-    .expect("an inbound circle message reached B within 120s");
+    .await;
     publisher.abort();
 
-    // Oracle: the wire carried ciphertext, the member recovers it exactly, an
-    // outsider cannot.
-    assert!(
-        !wire_bytes
-            .windows(original.body.len())
-            .any(|w| w == original.body.as_bytes()),
-        "the plaintext body must never appear on the wire"
-    );
-    assert_eq!(wire_bytes, sealed, "B received exactly the bytes A sealed");
+    let matched = opened.expect("B received and opened A's sealed circle message within 120s");
 
-    let recovered = open_message(&cot_key, &wire_bytes).expect("a member opens it");
-    assert_eq!(recovered.body, original.body);
-    assert_eq!(recovered.sender_handle, original.sender_handle);
-
+    // An outsider key cannot open the recovered bytes.
     let outsider = derive_cot_key("a phrase no member ever agreed to", &CNSA_2_0).unwrap();
     assert!(
-        open_message(&outsider, &wire_bytes).is_err(),
-        "an outsider key must fail to open the same bytes"
+        open_message(&outsider, &matched).is_err(),
+        "an outsider key must fail to open the message"
     );
 
     node_a.shutdown().await;
