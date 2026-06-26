@@ -19,7 +19,7 @@
 //!
 //! - 57 server-side: 32 positive (`ISC-S*`) + 25 negative (`ISC-A-S*`)
 //!   (S31 added the #89 UploadMotd in-band signer-set MOTD)
-//! - 121 client-side: 85 positive (`ISC-C*`) + 36 negative (`ISC-A-C*`)
+//! - 122 client-side: 86 positive (`ISC-C*`) + 36 negative (`ISC-A-C*`)
 //!   (M16 A1 added C66 manifest-preview + A-C33 no-blind-download, A2 added C67 selective-fetch,
 //!   A3 added C68 choose-download-dir, A4 added C72 collapsible-folder-tree preview, C1 added C69
 //!   multi-share-publish, C2 added C70 status-auto-clear, C3 added C71 generate-circle-phrase;
@@ -235,6 +235,8 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-C95", IscClass::Positive),
     // ── client positive (#36: circle-detail name vectors) ──
     ("ISC-C96", IscClass::Positive),
+    // ── client positive (#67: right-click Cut/Copy/Paste/Select-all context menu on text fields) ──
+    ("ISC-C97", IscClass::Positive),
     // ── client negative (20) ────────────────────────────────────────────
     ("ISC-A-C1", IscClass::Negative),
     ("ISC-A-C2", IscClass::Negative),
@@ -285,7 +287,7 @@ pub const ISCS: &[(&str, IscClass)] = &[
 /// of truth for the coverage denominator, read live by `xtask isc-coverage`.
 /// Recount on every ISC add/remove (the `const _` assert below guards it
 /// against [`ISCS`]).
-pub const TOTAL: usize = 178;
+pub const TOTAL: usize = 179;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -453,9 +455,10 @@ mod tests {
         //                                  unread-gated announcements/MOTD landing C93 pos, #93;
         //                                  GUI per-circle connected-presence C94 pos, #77;
         //                                  palette rename-identity + live update C95 pos, #66;
-        //                                  GUI circle-detail name vectors C96 pos, #36)
-        //   total   117 pos + 61 neg = 178
-        assert_eq!(pos, 117, "positive count drift");
+        //                                  GUI circle-detail name vectors C96 pos, #36;
+        //                                  right-click clipboard context menu C97 pos, #67)
+        //   total   118 pos + 61 neg = 179
+        assert_eq!(pos, 118, "positive count drift");
         assert_eq!(neg, 61, "negative count drift");
     }
 

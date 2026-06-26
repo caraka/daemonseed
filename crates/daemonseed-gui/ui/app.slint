@@ -291,6 +291,68 @@ component TabLabel inherits TouchArea {
     }
 }
 
+// A text-entry field wrapped in a right-click context menu (Cut / Copy / Paste /
+// Select all) — #67. The menu items invoke the wrapped TextInput's OWN built-in
+// clipboard functions (cut/copy/paste/select-all), which use Slint's backend
+// (winit) clipboard. That backend keeps X11 selection ownership correct, unlike a
+// transient `arboard::Clipboard` that drops ownership on drop — so Copy/Cut need
+// NO hand-rolled clipboard write and dodge the X11-ownership felt-test risk. The
+// pattern mirrors Slint's own LineEditBase. The wrapped input fills the wrapper,
+// so left-click still focuses/edits it; only right-click raises the menu.
+//
+// `custom-paste` routes the Paste item to `paste-requested` instead of the field's
+// own paste — used by the Join field to keep the #63 read_clipboard_text path
+// (clipboard read + strength refresh + refocus) live and unregressed.
+component MenuTextInput inherits Rectangle {
+    in-out property <string> text;
+    in property <bool> single-line: true;
+    in property <length> font-size: 13px;
+    in property <TextWrap> wrap: TextWrap.no-wrap;
+    in property <InputType> input-type: InputType.text;
+    in property <bool> custom-paste: false;
+    callback accepted();
+    callback edited();
+    callback paste-requested();
+    // `focus` is a built-in element member, so the passthrough is named
+    // `focus-input` to avoid colliding with it; call sites use `.focus-input()`.
+    public function focus-input() { ti.focus(); }
+    public function select-all() { ti.select-all(); }
+    public function copy() { ti.copy(); }
+    // min-width 1px: a TextInput narrower than 1px (or clipped to it) can't be
+    // focused (mirrors Slint's own LineEditBase). forward-focus so a click on the
+    // wrapper's padding still lands in the input.
+    min-width: 1px;
+    forward-focus: ti;
+    // A real builtin ContextMenuArea (NOT inherited — the menu-lowering pass
+    // requires a builtin here, not a user component), with the field as content
+    // and the right-click menu as its Menu. Mirrors LineEditBase.
+    ContextMenuArea {
+        Menu {
+            MenuItem { title: "Cut"; activated => { ti.cut(); } }
+            MenuItem { title: "Copy"; enabled: !root.text.is-empty; activated => { ti.copy(); } }
+            MenuItem {
+                title: "Paste";
+                activated => {
+                    if (root.custom-paste) { root.paste-requested(); } else { ti.paste(); }
+                }
+            }
+            MenuItem { title: "Select all"; enabled: !root.text.is-empty; activated => { ti.select-all(); } }
+        }
+        ti := TextInput {
+            width: 100%; height: 100%;
+            text <=> root.text;
+            single-line: root.single-line;
+            font-size: root.font-size;
+            color: #d6dae1;
+            wrap: root.wrap;
+            input-type: root.input-type;
+            vertical-alignment: center;
+            accepted => { root.accepted(); }
+            edited => { root.edited(); }
+        }
+    }
+}
+
 export component AppWindow inherits Window {
     // Resizable: prefer the 1100x680 default but let the window adopt the real
     // surface (down to a small floor) so the shell + auth overlays reflow instead
@@ -461,7 +523,7 @@ export component AppWindow inherits Window {
     callback open-rename();
     callback submit-rename(string);
     callback focus-rename-input();
-    focus-rename-input => { rename_name_input.focus(); }
+    focus-rename-input => { rename_name_input.focus-input(); }
     callback join-phrase-edited(string);
     callback submit-join(string);
     callback reroll-new();
@@ -472,7 +534,7 @@ export component AppWindow inherits Window {
     // Autofocus the composer after a rail switch so the user can type immediately
     // (caraka note 2026-06-15). Guarded to the Chat tab; Rust invokes it on switch.
     callback focus-composer();
-    focus-composer => { if (root.active-tab == 0) { composer.focus(); } }
+    focus-composer => { if (root.active-tab == 0) { composer.focus-input(); } }
     // Any switch INTO the Chat tab (TabLabel click, post-join, or a programmatic
     // Rust set) refocuses the composer. composer is always-instantiated (visible-
     // gated, not `if`-gated), so focusing here is timing-safe.
@@ -480,7 +542,7 @@ export component AppWindow inherits Window {
     // Focus the Join phrase field when the overlay opens, so typing / Ctrl-V lands
     // without needing a click (the VM software-render path can drop pointer clicks).
     callback focus-join-input();
-    focus-join-input => { join_phrase_input.focus(); }
+    focus-join-input => { join_phrase_input.focus-input(); }
     // Right-click "paste" into the Join phrase field (#63). Handled in Rust
     // (clipboard read), which sets `join-phrase`, refreshes strength, and refocuses.
     callback paste-into-join();
@@ -530,12 +592,12 @@ export component AppWindow inherits Window {
     // (always instantiated), so these ids are reachable here, unlike an `if` subtree.
     callback focus-auth();
     focus-auth => {
-        if (root.screen == "unlock") { unlock_input.focus(); }
-        if (root.screen == "first-start" && root.fs-step == 0) { fs_pass_input.focus(); }
+        if (root.screen == "unlock") { unlock_input.focus-input(); }
+        if (root.screen == "first-start" && root.fs-step == 0) { fs_pass_input.focus-input(); }
         // Step 1 (mnemonic) is a read-and-save step — no field to focus. Steps 2/3
         // are entry fields, so focus them on (re)entry the same way step 0 is.
-        if (root.screen == "first-start" && root.fs-step == 2) { fs_confirm_1.focus(); }
-        if (root.screen == "first-start" && root.fs-step == 3) { fs_name_input.focus(); }
+        if (root.screen == "first-start" && root.fs-step == 2) { fs_confirm_1.focus-input(); }
+        if (root.screen == "first-start" && root.fs-step == 3) { fs_name_input.focus-input(); }
     }
 
     // Global shortcut host: wraps the WHOLE UI (main + overlays) so a key event from
@@ -873,9 +935,8 @@ export component AppWindow inherits Window {
                                             Text { text: "Set MOTD (single line, plain text)"; visible: root.compose-motd == ""; color: #4d5560; font-size: 13px; vertical-alignment: center; }
                                         }
                                         HorizontalLayout { padding-left: 12px; padding-right: 12px;
-                                            motd_input := TextInput {
+                                            motd_input := MenuTextInput {
                                                 text <=> root.compose-motd;
-                                                color: #d6dae1; font-size: 13px; vertical-alignment: center; single-line: true;
                                                 accepted => { root.set-motd(root.compose-motd); }
                                             }
                                         }
@@ -891,10 +952,9 @@ export component AppWindow inherits Window {
                                             Text { text: "Topic"; visible: root.compose-topic == ""; color: #4d5560; font-size: 13px; vertical-alignment: center; }
                                         }
                                         HorizontalLayout { padding-left: 12px; padding-right: 12px;
-                                            topic_input := TextInput {
+                                            topic_input := MenuTextInput {
                                                 text <=> root.compose-topic;
-                                                color: #d6dae1; font-size: 13px; vertical-alignment: center; single-line: true;
-                                                accepted => { body_input.focus(); }
+                                                accepted => { body_input.focus-input(); }
                                             }
                                         }
                                     }
@@ -904,9 +964,8 @@ export component AppWindow inherits Window {
                                             Text { text: "Announcement body"; visible: root.compose-body == ""; color: #4d5560; font-size: 13px; vertical-alignment: center; }
                                         }
                                         HorizontalLayout { padding-left: 12px; padding-right: 12px;
-                                            body_input := TextInput {
+                                            body_input := MenuTextInput {
                                                 text <=> root.compose-body;
-                                                color: #d6dae1; font-size: 13px; vertical-alignment: center; single-line: true;
                                                 accepted => { root.upload-announcement(root.compose-topic, root.compose-body); }
                                             }
                                         }
@@ -947,13 +1006,9 @@ export component AppWindow inherits Window {
                                         color: #4d5560;
                                         font-size: 13px; vertical-alignment: center;
                                     }
-                                    composer := TextInput {
+                                    composer := MenuTextInput {
                                         x: 12px; width: parent.width - 24px; height: 100%;
                                         text <=> root.draft;
-                                        color: #d6dae1;
-                                        font-size: 13px;
-                                        vertical-alignment: center;
-                                        single-line: true;
                                         accepted => { root.send-message(root.draft); }
                                     }
                                 }
@@ -1145,9 +1200,8 @@ export component AppWindow inherits Window {
                     Text { text: "a name others will see…"; visible: root.rename-name == ""; color: #4d5560; font-size: 13px; vertical-alignment: center; }
                 }
                 HorizontalLayout { padding-left: 12px; padding-right: 12px;
-                    rename_name_input := TextInput {
+                    rename_name_input := MenuTextInput {
                         text <=> root.rename-name;
-                        color: #d6dae1; font-size: 13px; vertical-alignment: center; single-line: true;
                         accepted => { root.submit-rename(root.rename-name); }
                     }
                 }
@@ -1194,26 +1248,20 @@ export component AppWindow inherits Window {
                     // 504 inner) minus the 120px QR slot and 10px spacing = 374px.
                     width: 374px;
                     height: 44px; border-radius: 9px; background: #141517; border-width: 1px; border-color: #ffffff12; clip: true; // contain a long single-line entry inside the box
-                    // Right-click paste (#63). Declared FIRST so it sits BEHIND the
-                    // TextInput: left-clicks still reach the input for cursor/selection;
-                    // a right-click the TextInput ignores falls through to here.
-                    TouchArea {
-                        width: 100%; height: 100%;
-                        pointer-event(e) => {
-                            if (e.button == PointerEventButton.right && e.kind == PointerEventKind.down) {
-                                root.paste-into-join();
-                            }
-                        }
-                    }
                     HorizontalLayout { padding-left: 12px;
                         // `visible:` not `if` — toggling on the first/last char typed
                         // must NOT mutate the item tree mid-edit (partial_renderer crash).
                         Text { text: "the words you agreed on…"; visible: root.join-phrase == ""; color: #4d5560; font-size: 13px; vertical-alignment: center; }
                     }
                     HorizontalLayout { padding-left: 12px; padding-right: 12px;
-                        join_phrase_input := TextInput {
+                        // Right-click context menu (#67). `custom-paste` routes the Paste
+                        // item to the #63 `paste-into-join` path (clipboard read + strength
+                        // refresh + refocus), so that behavior is preserved while Cut /
+                        // Copy / Select all come from the field's own backend clipboard.
+                        join_phrase_input := MenuTextInput {
                             text <=> root.join-phrase;
-                            color: #d6dae1; font-size: 13px; vertical-alignment: center; single-line: true;
+                            custom-paste: true;
+                            paste-requested => { root.paste-into-join(); }
                             edited => { root.join-phrase-edited(root.join-phrase); }
                             accepted => { root.submit-join(root.join-phrase); }
                         }
@@ -1327,11 +1375,9 @@ export component AppWindow inherits Window {
             Rectangle {
                 height: 64px; border-radius: 10px; background: #141517; border-width: 1px; border-color: #ffffff12;
                 HorizontalLayout { padding: 14px;
-                    new_phrase_input := TextInput {
+                    new_phrase_input := MenuTextInput {
                         text <=> root.new-phrase;
-                        color: #d6dae1; font-size: 14px; wrap: word-wrap;
-                        vertical-alignment: center;
-                        single-line: false;
+                        font-size: 14px; wrap: word-wrap; single-line: false;
                         edited => { root.new-copied = false; root.new-phrase-edited(root.new-phrase); }
                     }
                 }
@@ -1401,9 +1447,8 @@ export component AppWindow inherits Window {
                     Text { text: "Name (optional — defaults to the folder name)"; visible: root.publish-name == ""; color: #4d5560; font-size: 13px; vertical-alignment: center; }
                 }
                 HorizontalLayout { padding-left: 12px; padding-right: 12px;
-                    publish_name_input := TextInput {
+                    publish_name_input := MenuTextInput {
                         text <=> root.publish-name;
-                        color: #d6dae1; font-size: 13px; vertical-alignment: center; single-line: true;
                         accepted => { root.submit-publish(root.publish-name); }
                     }
                 }
@@ -1502,10 +1547,10 @@ export component AppWindow inherits Window {
                         Text { text: "passphrase"; visible: root.unlock-passphrase == ""; color: #4d5560; font-size: 13px; vertical-alignment: center; }
                     }
                     HorizontalLayout { padding-left: 12px; padding-right: 12px;
-                        unlock_input := TextInput {
+                        unlock_input := MenuTextInput {
                             text <=> root.unlock-passphrase;
                             input-type: InputType.password;
-                            color: #d6dae1; font-size: 14px; vertical-alignment: center; single-line: true;
+                            font-size: 14px;
                             accepted => { root.unlock-submit(root.unlock-passphrase); }
                         }
                     }
@@ -1557,12 +1602,12 @@ export component AppWindow inherits Window {
                                 Text { text: "a passphrase you'll remember"; visible: root.fs-passphrase == ""; color: #4d5560; font-size: 13px; vertical-alignment: center; }
                             }
                             HorizontalLayout { padding-left: 12px; padding-right: 12px;
-                                fs_pass_input := TextInput {
+                                fs_pass_input := MenuTextInput {
                                     text <=> root.fs-passphrase;
                                     input-type: InputType.password;
-                                    color: #d6dae1; font-size: 14px; vertical-alignment: center; single-line: true;
+                                    font-size: 14px;
                                     edited => { root.fs-passphrase-edited(root.fs-passphrase); }
-                                    accepted => { fs_pass_confirm_input.focus(); }
+                                    accepted => { fs_pass_confirm_input.focus-input(); }
                                 }
                             }
                         }
@@ -1577,10 +1622,10 @@ export component AppWindow inherits Window {
                                 Text { text: "re-enter it to confirm"; visible: root.fs-passphrase-confirm == ""; color: #4d5560; font-size: 13px; vertical-alignment: center; }
                             }
                             HorizontalLayout { padding-left: 12px; padding-right: 12px;
-                                fs_pass_confirm_input := TextInput {
+                                fs_pass_confirm_input := MenuTextInput {
                                     text <=> root.fs-passphrase-confirm;
                                     input-type: InputType.password;
-                                    color: #d6dae1; font-size: 14px; vertical-alignment: center; single-line: true;
+                                    font-size: 14px;
                                     accepted => { root.fs-passphrase-next(); }
                                 }
                             }
@@ -1639,29 +1684,29 @@ export component AppWindow inherits Window {
                             Rectangle {
                                 border-radius: 10px; background: #141517; border-width: 1px; border-color: #ffffff12; clip: true;
                                 HorizontalLayout { padding: 12px;
-                                    fs_confirm_1 := TextInput {
+                                    fs_confirm_1 := MenuTextInput {
                                         text <=> root.fs-confirm-1;
-                                        color: #d6dae1; font-size: 14px; vertical-alignment: center; single-line: true;
-                                        accepted => { fs_confirm_2.focus(); }
+                                        font-size: 14px;
+                                        accepted => { fs_confirm_2.focus-input(); }
                                     }
                                 }
                             }
                             Rectangle {
                                 border-radius: 10px; background: #141517; border-width: 1px; border-color: #ffffff12; clip: true;
                                 HorizontalLayout { padding: 12px;
-                                    fs_confirm_2 := TextInput {
+                                    fs_confirm_2 := MenuTextInput {
                                         text <=> root.fs-confirm-2;
-                                        color: #d6dae1; font-size: 14px; vertical-alignment: center; single-line: true;
-                                        accepted => { fs_confirm_3.focus(); }
+                                        font-size: 14px;
+                                        accepted => { fs_confirm_3.focus-input(); }
                                     }
                                 }
                             }
                             Rectangle {
                                 border-radius: 10px; background: #141517; border-width: 1px; border-color: #ffffff12; clip: true;
                                 HorizontalLayout { padding: 12px;
-                                    fs_confirm_3 := TextInput {
+                                    fs_confirm_3 := MenuTextInput {
                                         text <=> root.fs-confirm-3;
-                                        color: #d6dae1; font-size: 14px; vertical-alignment: center; single-line: true;
+                                        font-size: 14px;
                                         accepted => { root.fs-confirm-next(); }
                                     }
                                 }
@@ -1690,9 +1735,9 @@ export component AppWindow inherits Window {
                                 Text { text: "a name others will see"; visible: root.fs-name == ""; color: #4d5560; font-size: 13px; vertical-alignment: center; }
                             }
                             HorizontalLayout { padding-left: 12px; padding-right: 12px;
-                                fs_name_input := TextInput {
+                                fs_name_input := MenuTextInput {
                                     text <=> root.fs-name;
-                                    color: #d6dae1; font-size: 14px; vertical-alignment: center; single-line: true;
+                                    font-size: 14px;
                                     accepted => { root.fs-finish(root.fs-name); }
                                 }
                             }

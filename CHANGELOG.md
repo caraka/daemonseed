@@ -34,6 +34,7 @@ work lives in the project lead's vault manifest, not here.
 - gui: per-circle connected-presence — sealed member heartbeats emitted into and tracked per joined circle (relay-blind), feeding the active room's roster (#77)
 - gui: rename your identity from the Ctrl-K palette — validate, re-seal, and update the live handle without a reload; also recovers a nameless profile (#66)
 - gui: circle-details sheet shows the three name vectors — chosen name, the relay-scoped adj-noun label, and the universal `#<12hex>` fingerprint (#36)
+- gui: right-click context menu (Cut / Copy / Paste / Select all) on text fields (#67)
 
 ## [0.31.1] — 2026-06-25
 
