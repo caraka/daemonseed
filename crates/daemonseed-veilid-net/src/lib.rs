@@ -29,12 +29,20 @@
 //! Public-share **discovery** rides the lobby record (a `ShareAnnouncement`
 //! sealed under the `PublicRoomKey` is just an item published there).
 //!
-//! ## What is stubbed (Phase 3 Slice 2 / Phase 4)
-//! Public-share **content** serving (owner-on-demand `app_call` + a private
-//! route, with ≤32 KiB transport fragmentation of the 1 MiB content-addressed
-//! chunks), presence, and announcements/MOTD return
-//! [`VeilidNetError::Unimplemented`]. Their Phase-0 mechanics are characterized
-//! in the migration design doc; this crate is where they get built.
+//! ## Public-share content (Phase 3)
+//! A share's bytes move owner-on-demand over `app_call` + a private route:
+//! [`VeilidNetHandle::serve_share`] registers an indexed share, and a fetcher
+//! pulls it with [`VeilidNetHandle::fetch_manifest`] +
+//! [`VeilidNetHandle::fetch_chunk`]. The 1 MiB content-addressed chunks are
+//! transport-fragmented to ≤32 KiB and reassembled, then SHA-384-verified
+//! against their address (ISC-S28). Content stays sealed under the
+//! `PublicRoomKey` (ISC-A-S22). Delivering the sharer's route blob in the
+//! `ShareAnnouncement` (so discovery auto-wires to fetch) + the GUI/TUI wiring
+//! are the remaining Phase-3 step.
+//!
+//! ## What is stubbed (Phase 4)
+//! Presence and announcements/MOTD return [`VeilidNetError::Unimplemented`];
+//! they become further parameterizations of the rendezvous engine.
 //!
 //! ## Invariant
 //! Content keys NEVER derive from Veilid (classical x25519) material. The seal/
@@ -64,6 +72,7 @@ pub mod error;
 pub mod event;
 pub mod identity;
 mod rendezvous;
+mod share;
 
 pub use actor::{VeilidNet, VeilidNetHandle};
 pub use config::VeilidNetConfig;

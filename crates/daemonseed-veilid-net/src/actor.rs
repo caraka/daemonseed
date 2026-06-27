@@ -9,14 +9,19 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 use veilid_core::{
-    api_startup, RecordKey, RouteBlob, RouteId, RoutingContext, Target, VeilidAPI, VeilidConfig,
-    VeilidUpdate,
+    api_startup, OperationId, RecordKey, RouteBlob, RouteId, RoutingContext, Target, VeilidAPI,
+    VeilidConfig, VeilidUpdate,
 };
+
+use daemonseed_core::public_room::PublicRoomKey;
+use daemonseed_core::share_envelope::ManifestEntry;
+use daemonseed_core::share_serve::ShareContent;
+use daemonseed_core::storage::cas::ChunkAddr;
 
 use crate::config::VeilidNetConfig;
 use crate::error::{Result, VeilidNetError};
 use crate::event::VeilidNetEvent;
-use crate::{identity, rendezvous};
+use crate::{identity, rendezvous, share};
 
 /// Veilid's `app_message` / `app_call` payload cap (bytes). Sealed envelopes
 /// must fit; file-share chunks re-chunk to this in Phase 3.
@@ -53,6 +58,29 @@ enum Command {
     SubscribeRendezvous {
         owner_seed: [u8; 32],
         reply: oneshot::Sender<Result<()>>,
+    },
+    // ── Public-share content (Phase 3) ──
+    /// Register an indexed share to serve owner-on-demand (`share_id` → content
+    /// + the `PublicRoomKey` bytes responses seal under).
+    ServeShare {
+        share_id: String,
+        content: Arc<ShareContent>,
+        room_key: [u8; 32],
+        reply: oneshot::Sender<Result<()>>,
+    },
+    /// Make one outbound `app_call` over a peer's private route (the fetch
+    /// side's per-fragment round-trip). Spawned so a long fetch never blocks the
+    /// actor loop.
+    AppCall {
+        route: RouteId,
+        request: Vec<u8>,
+        reply: oneshot::Sender<Result<Vec<u8>>>,
+    },
+    /// An inbound `app_call` forwarded from the update pump — the serve side
+    /// answers it against the served-share registry via `app_call_reply`.
+    InboundAppCall {
+        call_id: OperationId,
+        message: Vec<u8>,
     },
     Shutdown {
         reply: oneshot::Sender<()>,
@@ -179,17 +207,74 @@ impl VeilidNetHandle {
             .await?
     }
 
-    // ── Phase 3 share CONTENT serving (Slice 2; mechanics per Phase 0) ──────
-    // Signpost only: discovery (above) rides the lobby record; owner-on-demand
-    // chunk serving over `app_call` + a private route, with ≤32 KiB transport
-    // fragmentation of the 1 MiB content-addressed chunks, lands next.
+    // ── Public-share CONTENT transfer (Phase 3): owner-on-demand over app_call ──
 
-    /// Serve a published share's content owner-on-demand over a private route.
-    /// **Phase 3, Slice 2.**
-    pub async fn serve_share(&self) -> Result<()> {
-        Err(VeilidNetError::Unimplemented(
-            "public-share content serving — Phase 3 Slice 2",
-        ))
+    /// Register an indexed share to serve owner-on-demand. The actor answers
+    /// inbound fragment `app_call`s for `share_id` from `content`, sealing each
+    /// response under `room_key` (the share's `PublicRoomKey` bytes). The sharer
+    /// must stay online to serve (ISC-A-S21); discovery (`publish_room`) is what
+    /// advertises it.
+    pub async fn serve_share(
+        &self,
+        share_id: String,
+        content: Arc<ShareContent>,
+        room_key: [u8; 32],
+    ) -> Result<()> {
+        self.send(|reply| Command::ServeShare {
+            share_id,
+            content,
+            room_key,
+            reply,
+        })
+        .await?
+    }
+
+    /// Fetch + reassemble + open a share's manifest from the sharer reachable at
+    /// private-route `route`. `room_key` is the share's `PublicRoomKey` bytes.
+    pub async fn fetch_manifest(
+        &self,
+        route: RouteId,
+        share_id: &str,
+        room_key: [u8; 32],
+    ) -> Result<Vec<ManifestEntry>> {
+        let rk = PublicRoomKey::from_bytes(room_key);
+        let this = self.clone();
+        share::fetch_manifest(share_id, &rk, move |req| {
+            let this = this.clone();
+            let route = route.clone();
+            async move { this.app_call(route, req).await }
+        })
+        .await
+    }
+
+    /// Fetch + reassemble + open + SHA-384-VERIFY one content chunk (ISC-S28 /
+    /// ISC-A-S20) from the sharer at private-route `route`.
+    pub async fn fetch_chunk(
+        &self,
+        route: RouteId,
+        share_id: &str,
+        chunk_addr: ChunkAddr,
+        room_key: [u8; 32],
+    ) -> Result<Vec<u8>> {
+        let rk = PublicRoomKey::from_bytes(room_key);
+        let this = self.clone();
+        share::fetch_chunk(share_id, &chunk_addr, &rk, move |req| {
+            let this = this.clone();
+            let route = route.clone();
+            async move { this.app_call(route, req).await }
+        })
+        .await
+    }
+
+    /// One outbound `app_call` over a peer's private route (a fetch fragment
+    /// round-trip).
+    async fn app_call(&self, route: RouteId, request: Vec<u8>) -> Result<Vec<u8>> {
+        self.send(|reply| Command::AppCall {
+            route,
+            request,
+            reply,
+        })
+        .await?
     }
 
     /// Member-plane presence heartbeat over a room/circle record. **Phase 4.**
@@ -216,11 +301,24 @@ impl VeilidNet {
         std::fs::create_dir_all(&cfg.storage_dir).ok();
 
         let (ev_tx, ev_rx) = mpsc::unbounded_channel::<VeilidNetEvent>();
+        let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(64);
         let ev_tx_cb = ev_tx.clone();
+        let cmd_tx_cb = cmd_tx.clone();
         let update_callback: Arc<dyn Fn(VeilidUpdate) + Send + Sync> =
-            Arc::new(move |u: VeilidUpdate| {
-                if let Some(ev) = map_update(u) {
-                    let _ = ev_tx_cb.send(ev);
+            Arc::new(move |u: VeilidUpdate| match u {
+                // Inbound app_calls are the share-serve request path: forward
+                // them to the actor, which holds the VeilidAPI + the served-share
+                // registry and answers via app_call_reply.
+                VeilidUpdate::AppCall(call) => {
+                    let _ = cmd_tx_cb.try_send(Command::InboundAppCall {
+                        call_id: call.id(),
+                        message: call.message().to_vec(),
+                    });
+                }
+                other => {
+                    if let Some(ev) = map_update(other) {
+                        let _ = ev_tx_cb.send(ev);
+                    }
                 }
             });
 
@@ -276,7 +374,6 @@ impl VeilidNet {
         // regions (Phase 2 fan-out).
         let node_pub = identity::node_public_bytes(&cfg.identity_seed);
 
-        let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(64);
         tokio::spawn(actor_loop(api, rc, cmd_rx, ev_tx, node_pub));
         Ok((VeilidNetHandle { cmd_tx }, ev_rx))
     }
@@ -296,6 +393,8 @@ async fn actor_loop(
     // Per-rendezvous local write cursor: which ring slot this node writes next
     // (keyed by record, so circles and rooms share the same map).
     let mut ring_seq: HashMap<RecordKey, u32> = HashMap::new();
+    // Shares this node serves owner-on-demand (Phase 3), keyed by share_id.
+    let mut shares: HashMap<String, share::ServedShare> = HashMap::new();
 
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
@@ -337,6 +436,41 @@ async fn actor_loop(
             }
             Command::SubscribeRendezvous { owner_seed, reply } => {
                 let _ = reply.send(subscribe_rendezvous(&api, &rc, &ev_tx, owner_seed).await);
+            }
+            Command::ServeShare {
+                share_id,
+                content,
+                room_key,
+                reply,
+            } => {
+                shares.insert(
+                    share_id,
+                    share::ServedShare::new(content, PublicRoomKey::from_bytes(room_key)),
+                );
+                let _ = reply.send(Ok(()));
+            }
+            Command::AppCall {
+                route,
+                request,
+                reply,
+            } => {
+                // Spawn so a multi-fragment fetch never blocks the actor loop.
+                let rc2 = rc.clone();
+                tokio::spawn(async move {
+                    let r = rc2
+                        .app_call(Target::RouteId(route), request)
+                        .await
+                        .map_err(|e| VeilidNetError::Send(e.to_string()));
+                    let _ = reply.send(r);
+                });
+            }
+            Command::InboundAppCall { call_id, message } => {
+                // Answer the fragment request against the served-share registry
+                // and reply over the same private route the call arrived on.
+                let response = share::serve(&mut shares, &message);
+                if let Err(e) = api.app_call_reply(call_id, response).await {
+                    crate::vtrace!("inbound app_call: reply failed ({e})");
+                }
             }
             Command::Shutdown { reply } => {
                 api.shutdown().await;

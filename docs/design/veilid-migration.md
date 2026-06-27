@@ -122,6 +122,8 @@ Phase 3 (public shares) and Phase 4 (lobby/public rooms, presence, MOTD) are **o
 
 **Slice 1 status (2026-06-27):** D-3.1 + D-3.2 + the lobby/public-room rendezvous + share-discovery surface landed on `feat/veilid-migration`; gates green; live two-node discovery DEFERRED-VERIFY → orinoco (`tests/two_node_room.rs`). Slices' ISC numbers are minted at cutover (frozen-contract posture). See `ISA.md` `## Decisions` (2026-06-27 Phase 3/4 Slice 1).
 
+**Slice 2a status (2026-06-27):** the public-share CONTENT transport landed — `VeilidNetHandle::{serve_share, fetch_manifest, fetch_chunk}` move a share's bytes over fragment-granular `app_call` + a private route, keeping the 1 MiB SHA-384 content-addressing (D-3.4) and SHA-384-verifying each chunk on the fetcher. Proven HERE by in-process `share::tests` (multi-fragment reassembly + verify, no network); live `app_call` DEFERRED-VERIFY → orinoco (`tests/two_node_share.rs`). **Slice 2b remaining:** deliver the sharer's route blob in the `ShareAnnouncement` (additive `route_blob` field + provenance signing, D-3.5) so discovery auto-wires to fetch, then the GUI/TUI net-actor share-command wiring. See `ISA.md` `## Decisions` (2026-06-27 Phase 3 Slice 2a).
+
 ## #98 — App integration (the AppSession swap)
 
 > Accepted 2026-06-26 (caraka). The first step of putting Veilid behind the real UI. Circles-only now; grows into the full cutover as Phases 3–4 land.
