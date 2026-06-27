@@ -71,24 +71,35 @@ pub async fn open_or_create(
     owner: &KeyPair,
 ) -> Result<RecordKey> {
     let key = rendezvous_key(api, owner).await?;
-    if rc
-        .open_dht_record(key.clone(), Some(owner.clone()))
-        .await
-        .is_ok()
-    {
-        return Ok(key);
+    crate::vtrace!("open_or_create: rendezvous key={key:?}; trying open#1");
+    match rc.open_dht_record(key.clone(), Some(owner.clone())).await {
+        Ok(_) => {
+            crate::vtrace!("open_or_create: open#1 ok (record already on net) -> Ok");
+            return Ok(key);
+        }
+        Err(e) => crate::vtrace!("open_or_create: open#1 failed ({e}); creating record"),
     }
     // Not present — create the network record. Ignore the result: on success
     // the handle carries create's random encryption key; on a lost create race
     // a peer already created it. Either way the reopen below (with our
     // no-encryption-key record key) resets the handle to verbatim storage.
-    let _ = rc
+    match rc
         .create_dht_record(CRYPTO_KIND_VLD0, schema()?, Some(owner.clone()))
-        .await;
-    rc.open_dht_record(key.clone(), Some(owner.clone()))
+        .await
+    {
+        Ok(_) => crate::vtrace!("open_or_create: create ok"),
+        Err(e) => crate::vtrace!("open_or_create: create failed ({e}) (lost race? reopen anyway)"),
+    }
+    let r = rc
+        .open_dht_record(key.clone(), Some(owner.clone()))
         .await
         .map(|_| key)
-        .map_err(|e| VeilidNetError::Routing(e.to_string()))
+        .map_err(|e| VeilidNetError::Routing(e.to_string()));
+    crate::vtrace!(
+        "open_or_create: reopen {}",
+        if r.is_ok() { "ok -> Ok" } else { "ERR" }
+    );
+    r
 }
 
 /// The base subkey of this member's append-ring region, from its node pubkey.
@@ -137,8 +148,10 @@ pub async fn sweep(
     key: RecordKey,
     ev_tx: mpsc::UnboundedSender<VeilidNetEvent>,
 ) {
+    let mut found = 0u32;
     for subkey in 0..u32::from(SUBKEY_COUNT) {
         if let Ok(Some(v)) = rc.get_dht_value(key.clone(), subkey, true).await {
+            found += 1;
             if ev_tx
                 .send(VeilidNetEvent::Inbound {
                     bytes: v.data().to_vec(),
@@ -149,4 +162,5 @@ pub async fn sweep(
             }
         }
     }
+    crate::vtrace!("sweep: done, {found} backlog slot(s) emitted");
 }

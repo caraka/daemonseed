@@ -32,6 +32,7 @@ work lives in the project lead's vault manifest, not here.
 - `daemonseed-core`: `derive_circle_veilid_owner_seed` + `CircleVeilidOwnerSeed` + `circle_veilid_owner` HKDF label — a circle's deterministic Veilid rendezvous-owner seed, a sibling of `cot_key` from the same circle PRK, so every member computes the same DHT rendezvous address (#99).
 - `daemonseed-tui`: Veilid net actor behind the `veilid` feature (#98) — `NetHandle::new` selects a `VeilidNetHandle`-backed actor (circles + attach; lobby/shares/presence/MOTD return "not yet on Veilid") over the same `NetCommand`/`NetEvent` contract; UI unchanged. Off by default.
 - `daemonseed-{gui,tui}`: `DAEMONSEED_VEILID_DIR` / `DAEMONSEED_VEILID_PORT` env knobs select a per-instance Veilid store, listen port, and program namespace so several Veilid-mode clients run on one host (#98).
+- `daemonseed-veilid-net` + `daemonseed-gui`: `DAEMONSEED_VEILID_TRACE` env gate (`vtrace!`) emits stderr probes at the attach (with peer counts), `open_or_create`, watch, sweep, and circle join/send/inbound boundaries for live Veilid felt-test diagnosis (#98).
 
 ## [0.32.0] — 2026-06-26
 

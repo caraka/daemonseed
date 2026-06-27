@@ -191,6 +191,12 @@ async fn connect(
         cfg.namespace = format!("daemonseed-{port}");
     }
 
+    daemonseed_veilid_net::vtrace!(
+        "gui connect: namespace={} listen={:?} dir-env={:?}",
+        cfg.namespace,
+        cfg.listen_address,
+        std::env::var("DAEMONSEED_VEILID_DIR").ok()
+    );
     match VeilidNet::start(cfg).await {
         Ok((handle, rx)) => match handle.attach_and_wait(180).await {
             Ok(()) => {
@@ -219,7 +225,9 @@ async fn join_circle(
     net: &Option<VeilidNetHandle>,
     circles: &mut Vec<VeilidCircle>,
 ) {
+    daemonseed_veilid_net::vtrace!("gui join_circle: requested id={circle_id}");
     let err = |reason: String| {
+        daemonseed_veilid_net::vtrace!("gui join_circle: CircleError id={circle_id}: {reason}");
         let _ = evt_tx.send(NetEvent::CircleError { circle_id, reason });
     };
     let Some(handle) = net.as_ref() else {
@@ -236,6 +244,10 @@ async fn join_circle(
     // A circle already joined (same phrase → same owner_seed) re-emits CircleJoined
     // so the UI re-selects it, rather than re-subscribing.
     if let Some(existing) = circles.iter().find(|c| c.owner_seed == owner_seed) {
+        daemonseed_veilid_net::vtrace!(
+            "gui join_circle: already joined -> re-emit CircleJoined id={}",
+            existing.circle_id
+        );
         let _ = evt_tx.send(NetEvent::CircleJoined {
             circle_id: existing.circle_id,
             asset_addr: circle_fingerprint(&existing.cot_key),
@@ -245,6 +257,7 @@ async fn join_circle(
     if let Err(e) = handle.subscribe_circle(owner_seed).await {
         return err(format!("subscribe failed: {e}"));
     }
+    daemonseed_veilid_net::vtrace!("gui join_circle: subscribed ok -> CircleJoined id={circle_id}");
     let fingerprint = circle_fingerprint(&cot_key);
     circles.push(VeilidCircle {
         circle_id,
@@ -280,6 +293,10 @@ async fn send_circle(
     let err = |reason: String| {
         let _ = evt_tx.send(NetEvent::CircleError { circle_id, reason });
     };
+    daemonseed_veilid_net::vtrace!(
+        "gui send_circle: requested id={circle_id} known={:?}",
+        circles.iter().map(|c| c.circle_id).collect::<Vec<_>>()
+    );
     let Some(circle) = circles.iter().find(|c| c.circle_id == circle_id) else {
         return err("join the circle before sending".to_owned());
     };
@@ -320,17 +337,37 @@ fn handle_inbound(
         // Attachment / RouteChanged / ValueChanged carry no chat payload for S2.
         return;
     };
+    daemonseed_veilid_net::vtrace!(
+        "gui inbound: {} bytes; trying {} joined circle(s)",
+        bytes.len(),
+        circles.len()
+    );
     for circle in circles {
         if let Ok(msg) = open_message(&circle.cot_key, &bytes) {
             if msg.sender_handle != my_handle {
+                daemonseed_veilid_net::vtrace!(
+                    "gui inbound: opened circle {} from '{}' -> deliver",
+                    circle.circle_id,
+                    msg.sender_handle
+                );
                 let _ = evt_tx.send(NetEvent::CircleMessage {
                     circle_id: circle.circle_id,
                     who: msg.sender_handle,
                     text: msg.body,
                     mine: false,
                 });
+            } else {
+                daemonseed_veilid_net::vtrace!(
+                    "gui inbound: opened circle {} but SUPPRESSED (own handle '{}')",
+                    circle.circle_id,
+                    my_handle
+                );
             }
             return; // opened under exactly one circle
         }
     }
+    daemonseed_veilid_net::vtrace!(
+        "gui inbound: {} bytes opened under no joined circle",
+        bytes.len()
+    );
 }

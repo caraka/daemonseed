@@ -210,9 +210,17 @@ impl VeilidNet {
         vcfg.network.routing_table.public_keys = pks;
         vcfg.network.routing_table.secret_keys = sks;
 
+        crate::vtrace!(
+            "start: namespace={:?} listen={:?} store={} bootstrap_overrides={}",
+            vcfg.namespace,
+            cfg.listen_address,
+            cfg.storage_dir,
+            cfg.bootstrap.len()
+        );
         let api = api_startup(update_callback, vcfg)
             .await
             .map_err(|e| VeilidNetError::Startup(e.to_string()))?;
+        crate::vtrace!("start: api_startup ok; node identity assigned");
         // Phase 1 uses Veilid's DEFAULT routing context, which already carries a
         // 1-hop safety route. Sends ride the receiver's private route
         // (Target::RouteId), so no safety override is needed. D5 — raising the
@@ -309,6 +317,7 @@ async fn publish_circle(
     owner_seed: [u8; 32],
     sealed: Vec<u8>,
 ) -> Result<()> {
+    crate::vtrace!("publish_circle: open_or_create rendezvous");
     let owner = identity::circle_owner_keypair(&owner_seed)?;
     let key = circle::open_or_create(api, rc, &owner).await?;
     let base = circle::member_base_subkey(node_pub);
@@ -318,7 +327,13 @@ async fn publish_circle(
         *cur = cur.wrapping_add(1);
         s
     };
-    circle::publish(rc, &key, &owner, base, seq, sealed).await
+    crate::vtrace!("publish_circle: key={key:?} ring base={base} seq={seq}");
+    let r = circle::publish(rc, &key, &owner, base, seq, sealed).await;
+    crate::vtrace!(
+        "publish_circle: write {}",
+        if r.is_ok() { "ok" } else { "ERR" }
+    );
+    r
 }
 
 /// Open/create the circle's rendezvous record, register a watch, and kick off a
@@ -330,31 +345,56 @@ async fn subscribe_circle(
     ev_tx: &mpsc::UnboundedSender<VeilidNetEvent>,
     owner_seed: [u8; 32],
 ) -> Result<()> {
+    crate::vtrace!("subscribe_circle: open_or_create rendezvous");
     let owner = identity::circle_owner_keypair(&owner_seed)?;
     let key = circle::open_or_create(api, rc, &owner).await?;
+    crate::vtrace!("subscribe_circle: record open key={key:?}; registering watch");
     rc.watch_dht_values(key.clone(), None, None, None)
         .await
         .map_err(|e| VeilidNetError::Routing(e.to_string()))?;
+    crate::vtrace!("subscribe_circle: watch ok; spawning backlog sweep -> Ok");
     tokio::spawn(circle::sweep(rc.clone(), key, ev_tx.clone()));
     Ok(())
 }
 
 /// Attach and poll until public-internet-ready or the deadline elapses.
 async fn attach_and_wait(api: &VeilidAPI, timeout_secs: u64) -> Result<()> {
+    crate::vtrace!("attach: calling api.attach()");
     api.attach()
         .await
         .map_err(|e| VeilidNetError::Startup(e.to_string()))?;
+    crate::vtrace!(
+        "attach: api.attach() ok; waiting up to {timeout_secs}s for public_internet_ready"
+    );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    // Log only when the snapshot changes — the peer counts distinguish a
+    // bootstrap/NAT-discovery stall (peers stay 0) from a DHT-cold-but-reachable
+    // node, the two competing Branch-1 causes.
+    let mut last = String::new();
     loop {
         let attachment = api
             .get_state()
             .await
             .map_err(|e| VeilidNetError::Startup(e.to_string()))?
             .attachment;
+        let snap = format!(
+            "state={:?} public={} local={} peers(reliable={:?} live={:?})",
+            attachment.state,
+            attachment.public_internet_ready,
+            attachment.local_network_ready,
+            attachment.reliable_peer_count,
+            attachment.live_peer_count
+        );
+        if snap != last {
+            crate::vtrace!("attach: {snap}");
+            last = snap;
+        }
         if attachment.public_internet_ready {
+            crate::vtrace!("attach: public_internet_ready -> Ok");
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
+            crate::vtrace!("attach: deadline elapsed -> NotReady (last {last})");
             return Err(VeilidNetError::NotReady);
         }
         tokio::time::sleep(Duration::from_millis(500)).await;

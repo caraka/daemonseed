@@ -33,6 +33,24 @@
 //! Content keys NEVER derive from Veilid (classical x25519) material. The seal/
 //! open lives in `daemonseed-core`; this crate only moves opaque bytes.
 
+/// Env-gated stderr trace for live attach/circle debugging on a real node.
+///
+/// Enabled when `DAEMONSEED_VEILID_TRACE` is set (any value); a zero-output
+/// no-op otherwise. It exists because the attach and circle-rendezvous paths can
+/// only be exercised on a real public-network host (a NAT'd VM blocks attach),
+/// where no debugger attaches — so the next felt-test produces a decisive trace
+/// instead of an inference. Not a logging framework: a deliberate, minimal probe
+/// at the exact points the `veilid-migration` design's fault tree enumerates.
+/// Reachable from dependent crates as `daemonseed_veilid_net::vtrace!`.
+#[macro_export]
+macro_rules! vtrace {
+    ($($arg:tt)*) => {
+        if ::std::env::var_os("DAEMONSEED_VEILID_TRACE").is_some() {
+            ::std::eprintln!("[veilid-net] {}", ::std::format_args!($($arg)*));
+        }
+    };
+}
+
 pub mod actor;
 mod circle;
 pub mod config;
