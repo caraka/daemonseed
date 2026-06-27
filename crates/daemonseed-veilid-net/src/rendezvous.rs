@@ -1,16 +1,26 @@
-//! Phase 2 — circle group messaging over a shared-owner DFLT DHT record.
+//! The shared-owner DFLT DHT **rendezvous engine** — one generic primitive
+//! underneath circles, the lobby / public rooms, share discovery, and (later)
+//! presence and announcements. It is parameterized by exactly two things: a
+//! deterministically-derivable **owner keypair** and the opaque **sealed bytes**
+//! a participant publishes; the engine never knows which feature it is serving.
 //!
-//! Design (`docs/design/veilid-migration.md`): a circle's owner keypair is
-//! derived deterministically from the shared circle entropy (a sibling of the
-//! content `cot_key`), so every member computes the SAME DFLT record key — the
-//! relay-free rendezvous address (the DHT analog of the relay-era
-//! `SHA-384(cot_key ‖ server_id)`). Every member holds the owner secret, so all
-//! write owner-signed subkeys with no pre-known member list (which is what an
-//! `SMPL` baked-in member set could not give for open membership). Each member
-//! writes a small append-ring within its own region (region = hash of its node
-//! pubkey), so a connecting member finds a bounded backlog of recent messages
-//! with no relay and no roster. Content stays sealed under the circle key — this
-//! layer moves opaque bytes only.
+//! Design (`docs/design/veilid-migration.md`): an owner keypair is derived
+//! deterministically from shared inputs — a circle's entropy (a sibling of the
+//! content `cot_key`), or a public room's name+family (a sibling of the room
+//! key) — so every participant computes the SAME DFLT record key, the relay-free
+//! rendezvous address (the DHT analog of the relay-era `SHA-384(key ‖ server_id)`).
+//! Every participant holds the owner secret, so all write owner-signed subkeys
+//! with no pre-known member list (which is what an `SMPL` baked-in member set
+//! could not give for open membership). Each participant writes a small
+//! append-ring within its own region (region = hash of its node pubkey), so a
+//! connecting participant finds a bounded backlog of recent items with no relay
+//! and no roster. Content stays sealed under the feature's key (circle key /
+//! `PublicRoomKey`) — this layer moves opaque bytes only.
+//!
+//! The owner-derivation is the *only* thing that distinguishes the consumers:
+//! member-secret (circle) → confidential; world-derivable (lobby/public room,
+//! share discovery) → open; operator-only owner (announcements/MOTD) → the
+//! non-derivable owner keypair is the write-gate.
 
 use tokio::sync::mpsc;
 use veilid_core::{
@@ -21,9 +31,9 @@ use crate::actor::APP_MESSAGE_CAP;
 use crate::error::{Result, VeilidNetError};
 use crate::event::VeilidNetEvent;
 
-/// Total subkeys in a circle's DFLT record. Fixed — it is part of the
-/// deterministic record key, so every member MUST agree. Kept small so a
-/// connecting member can sweep the whole record for backlog cheaply.
+/// Total subkeys in a rendezvous DFLT record. Fixed — it is part of the
+/// deterministic record key, so every participant MUST agree. Kept small so a
+/// connecting participant can sweep the whole record for backlog cheaply.
 /// `= MEMBER_REGIONS * RING_DEPTH`.
 pub const SUBKEY_COUNT: u16 = 64;
 
@@ -36,12 +46,12 @@ pub const MEMBER_REGIONS: u32 = 32;
 /// "A couple of recent messages", deliberately not durable scrollback.
 pub const RING_DEPTH: u32 = 2;
 
-/// The fixed DFLT schema shared by every circle record.
+/// The fixed DFLT schema shared by every rendezvous record.
 fn schema() -> Result<DHTSchema> {
     DHTSchema::dflt(SUBKEY_COUNT).map_err(|e| VeilidNetError::Routing(e.to_string()))
 }
 
-/// Compute a circle's deterministic rendezvous record key from its owner
+/// Compute a rendezvous record's deterministic record key from its owner
 /// keypair. Local crypto only — no network round-trip.
 pub async fn rendezvous_key(api: &VeilidAPI, owner: &KeyPair) -> Result<RecordKey> {
     api.get_dht_record_key(schema()?, owner.key(), None)

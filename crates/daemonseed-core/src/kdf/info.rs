@@ -168,6 +168,25 @@ pub fn public_room(family: &str, room: &str) -> String {
         .replace("{room}", room)
 }
 
+/// HKDF info-string template for a public room's **Veilid rendezvous-owner**
+/// seed (Phase 3/4 transport). The sibling of [`PUBLIC_ROOM_TEMPLATE`]: the same
+/// public-room PRK (the [`PUBLIC_ROOM_KEY_SALT`] extract of the family token) is
+/// expanded under this distinct label to a VLD0 (Ed25519) owner seed, so the
+/// room's DHT rendezvous address is NOT a function of the room key — neither
+/// derives from the other (mirrors [`CIRCLE_VEILID_OWNER_TEMPLATE`]). The inputs
+/// are public (family + room name), so every participant derives the same owner
+/// and thus the same rendezvous; an operator-owned channel (MOTD/announcements)
+/// instead uses a non-derivable owner keypair as its write-gate.
+const PUBLIC_ROOM_VEILID_OWNER_TEMPLATE: &str = "daemonseed/veilid/room-owner/{family}/{room}";
+
+/// Build the public-room Veilid rendezvous-owner HKDF info string for a
+/// crypto-family token and a public room name.
+pub fn public_room_veilid_owner(family: &str, room: &str) -> String {
+    PUBLIC_ROOM_VEILID_OWNER_TEMPLATE
+        .replace("{family}", family)
+        .replace("{room}", room)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,5 +254,27 @@ mod tests {
             "daemonseed/veilid/circle-owner/hkdf-sha384"
         );
         assert_ne!(circle_veilid_owner("hkdf-sha384"), circle("hkdf-sha384"));
+    }
+
+    /// **Spec contract (Phase 3/4 transport)** — the public-room Veilid-owner
+    /// info string is protocol-visible: every participant derives the same lobby
+    /// rendezvous only if these bytes match. Distinct from both [`public_room`]
+    /// (so the rendezvous owner seed never collides with the room key) and
+    /// [`circle_veilid_owner`] (so a public room and a like-named circle never
+    /// share a rendezvous owner).
+    #[test]
+    fn public_room_veilid_owner_info_string_is_pinned() {
+        assert_eq!(
+            public_room_veilid_owner("hkdf-sha384", "lobby"),
+            "daemonseed/veilid/room-owner/hkdf-sha384/lobby"
+        );
+        assert_ne!(
+            public_room_veilid_owner("hkdf-sha384", "lobby"),
+            public_room("hkdf-sha384", "lobby")
+        );
+        assert_ne!(
+            public_room_veilid_owner("hkdf-sha384", "lobby"),
+            circle_veilid_owner("hkdf-sha384")
+        );
     }
 }

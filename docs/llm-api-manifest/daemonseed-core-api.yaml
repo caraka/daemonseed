@@ -2302,6 +2302,21 @@ types:
       contains_secret: true
       zeroize_on_drop: true
 
+  - name: RoomVeilidOwnerSeed
+    module: daemonseed_core::public_room
+    kind: struct
+    description: >-
+      A public room's deterministic 32-byte Veilid rendezvous-owner seed (VLD0 /
+      Ed25519). A sibling of PublicRoomKey from the same public-room PRK under a
+      distinct label, so the DHT rendezvous address is not a function of the room
+      key. World-derivable (room name + family are public), so every participant
+      derives the same seed and hence the same DHT record key — the lobby/public
+      room is an open rendezvous. ZeroizeOnDrop; Debug redacted to
+      `RoomVeilidOwnerSeed(<redacted>)`. as_bytes borrows the raw seed.
+    security:
+      contains_secret: true
+      zeroize_on_drop: true
+
   - name: MessageError
     module: daemonseed_core::circle::message
     kind: enum
@@ -5097,6 +5112,47 @@ functions:
     parameters: []
     returns:
       type: "&[u8; CIRCLE_VEILID_OWNER_SEED_LEN]"
+      description: A borrow of the raw 32-byte rendezvous-owner seed.
+
+  - name: derive_room_veilid_owner_seed
+    module: daemonseed_core::public_room
+    description: >-
+      Derive a public room's deterministic Veilid rendezvous-owner seed from its
+      public inputs — the transport-address sibling of derive_room_key.
+      HKDF-SHA-384(salt=PUBLIC_ROOM_KEY_SALT, ikm=family_token) ->
+      expand(info="daemonseed/veilid/room-owner/<family>/<room>"). Family-anchored
+      like the room key. World-derivable, so every participant derives the
+      byte-identical owner seed, hence the same DHT rendezvous record key — an
+      open rendezvous by construction. Not a function of, and not derived from,
+      the room key.
+    signature: "pub fn derive_room_veilid_owner_seed(room: &str, suite: &Suite) -> Result<RoomVeilidOwnerSeed, RoomKeyError>"
+    parameters:
+      - name: room
+        type: "&str"
+        direction: in
+        description: The public room name (the sole per-room distinguisher).
+      - name: suite
+        type: "&Suite"
+        direction: in
+        description: The suite whose family anchors the derivation.
+    returns:
+      type: "Result<RoomVeilidOwnerSeed, RoomKeyError>"
+      description: The derived 32-byte VLD0 rendezvous-owner seed.
+      error_variants:
+        - name: Hkdf
+          condition: HKDF derivation failed.
+    preconditions:
+      - description: The oxicrypt module must be operational.
+
+  - name: RoomVeilidOwnerSeed::as_bytes
+    module: daemonseed_core::public_room
+    description: >-
+      Borrow the raw 32-byte seed to build a VLD0 keypair; callers must not copy
+      into a non-zeroizing buffer.
+    signature: "pub fn as_bytes(&self) -> &[u8; ROOM_VEILID_OWNER_SEED_LEN]"
+    parameters: []
+    returns:
+      type: "&[u8; ROOM_VEILID_OWNER_SEED_LEN]"
       description: A borrow of the raw 32-byte rendezvous-owner seed.
 
   - name: circle_fingerprint

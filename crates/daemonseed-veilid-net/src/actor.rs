@@ -16,7 +16,7 @@ use veilid_core::{
 use crate::config::VeilidNetConfig;
 use crate::error::{Result, VeilidNetError};
 use crate::event::VeilidNetEvent;
-use crate::{circle, identity};
+use crate::{identity, rendezvous};
 
 /// Veilid's `app_message` / `app_call` payload cap (bytes). Sealed envelopes
 /// must fit; file-share chunks re-chunk to this in Phase 3.
@@ -41,12 +41,16 @@ enum Command {
         sealed: Vec<u8>,
         reply: oneshot::Sender<Result<()>>,
     },
-    PublishCircle {
+    // One generic command pair drives every shared-owner rendezvous — circles
+    // (Phase 2) and the lobby / public rooms + share discovery (Phase 3/4). The
+    // ONLY difference is which `owner_seed` the caller derives; the engine treats
+    // the payload as opaque sealed bytes regardless of feature.
+    PublishRendezvous {
         owner_seed: [u8; 32],
         sealed: Vec<u8>,
         reply: oneshot::Sender<Result<()>>,
     },
-    SubscribeCircle {
+    SubscribeRendezvous {
         owner_seed: [u8; 32],
         reply: oneshot::Sender<Result<()>>,
     },
@@ -125,7 +129,7 @@ impl VeilidNetHandle {
     /// `sealed` is the opaque circle envelope — this layer never holds the key
     /// or plaintext.
     pub async fn publish_circle(&self, owner_seed: [u8; 32], sealed: Vec<u8>) -> Result<()> {
-        self.send(|reply| Command::PublishCircle {
+        self.send(|reply| Command::PublishRendezvous {
             owner_seed,
             sealed,
             reply,
@@ -139,20 +143,56 @@ impl VeilidNetHandle {
     /// event stream (eventual — watch latency is tens of seconds). `owner_seed`
     /// is the circle's rendezvous-owner seed, as for [`Self::publish_circle`].
     pub async fn subscribe_circle(&self, owner_seed: [u8; 32]) -> Result<()> {
-        self.send(|reply| Command::SubscribeCircle { owner_seed, reply })
+        self.send(|reply| Command::SubscribeRendezvous { owner_seed, reply })
             .await?
     }
 
-    // ── Phase 3+ surface (not built yet; mechanics characterized in Phase 0) ──
-    // Signposts only: these return Unimplemented without touching the actor.
+    // ── Lobby / public rooms + share discovery (Phase 3/4) ──────────────────
+    // The SAME shared-owner DFLT rendezvous engine as a circle — only the owner
+    // derivation differs. `owner_seed` is the public-room rendezvous-owner seed
+    // (`daemonseed_core::public_room::derive_room_veilid_owner_seed`), which is
+    // WORLD-derivable, so the room is an open rendezvous. A public-share
+    // announcement is just a `ShareAnnouncement` sealed under the room's
+    // `PublicRoomKey` and published here — discovery rides the lobby record.
 
-    /// Announce a public share; chunks served owner-on-demand, re-chunked to
-    /// ≤32 KiB. **Phase 3.**
-    pub async fn publish_share(&self) -> Result<()> {
-        Err(VeilidNetError::Unimplemented("public shares — Phase 3"))
+    /// Publish a SEALED payload to a public room / lobby (Phase 3/4). Mechanics
+    /// are identical to [`Self::publish_circle`]; the difference is only that
+    /// `owner_seed` is a public-room rendezvous-owner seed and `sealed` is sealed
+    /// under the room's `PublicRoomKey` (a room message, or a `ShareAnnouncement`
+    /// for share discovery). This layer never holds the key or plaintext.
+    pub async fn publish_room(&self, owner_seed: [u8; 32], sealed: Vec<u8>) -> Result<()> {
+        self.send(|reply| Command::PublishRendezvous {
+            owner_seed,
+            sealed,
+            reply,
+        })
+        .await?
     }
 
-    /// Member-plane presence heartbeat over the sealed circle. **Phase 4.**
+    /// Subscribe to a public room / lobby (Phase 3/4): open the room's
+    /// rendezvous record, watch it, and sweep it for the bounded backlog —
+    /// identical to [`Self::subscribe_circle`] but for a public-room
+    /// `owner_seed`. Inbound sealed room messages / share announcements arrive as
+    /// [`VeilidNetEvent::Inbound`]; the app opens them under the `PublicRoomKey`.
+    pub async fn subscribe_room(&self, owner_seed: [u8; 32]) -> Result<()> {
+        self.send(|reply| Command::SubscribeRendezvous { owner_seed, reply })
+            .await?
+    }
+
+    // ── Phase 3 share CONTENT serving (Slice 2; mechanics per Phase 0) ──────
+    // Signpost only: discovery (above) rides the lobby record; owner-on-demand
+    // chunk serving over `app_call` + a private route, with ≤32 KiB transport
+    // fragmentation of the 1 MiB content-addressed chunks, lands next.
+
+    /// Serve a published share's content owner-on-demand over a private route.
+    /// **Phase 3, Slice 2.**
+    pub async fn serve_share(&self) -> Result<()> {
+        Err(VeilidNetError::Unimplemented(
+            "public-share content serving — Phase 3 Slice 2",
+        ))
+    }
+
+    /// Member-plane presence heartbeat over a room/circle record. **Phase 4.**
     pub async fn presence(&self) -> Result<()> {
         Err(VeilidNetError::Unimplemented("presence — Phase 4"))
     }
@@ -244,8 +284,8 @@ impl VeilidNet {
 
 /// The actor task: owns the `VeilidAPI` + `RoutingContext` and processes
 /// commands until `Shutdown` or the command channel closes. Holds an event
-/// sender (for background circle sweeps), this node's pubkey (circle region
-/// assignment), and a per-circle append-ring write cursor.
+/// sender (for background rendezvous sweeps), this node's pubkey (region
+/// assignment), and a per-rendezvous append-ring write cursor.
 async fn actor_loop(
     api: VeilidAPI,
     rc: RoutingContext,
@@ -253,8 +293,9 @@ async fn actor_loop(
     ev_tx: mpsc::UnboundedSender<VeilidNetEvent>,
     node_pub: [u8; 32],
 ) {
-    // Per-circle local write cursor: which ring slot this member writes next.
-    let mut circle_seq: HashMap<RecordKey, u32> = HashMap::new();
+    // Per-rendezvous local write cursor: which ring slot this node writes next
+    // (keyed by record, so circles and rooms share the same map).
+    let mut ring_seq: HashMap<RecordKey, u32> = HashMap::new();
 
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
@@ -284,17 +325,18 @@ async fn actor_loop(
             } => {
                 let _ = reply.send(send_sealed(&rc, route, sealed).await);
             }
-            Command::PublishCircle {
+            Command::PublishRendezvous {
                 owner_seed,
                 sealed,
                 reply,
             } => {
                 let _ = reply.send(
-                    publish_circle(&api, &rc, &node_pub, &mut circle_seq, owner_seed, sealed).await,
+                    publish_rendezvous(&api, &rc, &node_pub, &mut ring_seq, owner_seed, sealed)
+                        .await,
                 );
             }
-            Command::SubscribeCircle { owner_seed, reply } => {
-                let _ = reply.send(subscribe_circle(&api, &rc, &ev_tx, owner_seed).await);
+            Command::SubscribeRendezvous { owner_seed, reply } => {
+                let _ = reply.send(subscribe_rendezvous(&api, &rc, &ev_tx, owner_seed).await);
             }
             Command::Shutdown { reply } => {
                 api.shutdown().await;
@@ -307,53 +349,54 @@ async fn actor_loop(
     api.shutdown().await;
 }
 
-/// Open/create the circle's rendezvous record and write `sealed` into this
-/// member's append-ring slot, advancing the local cursor.
-async fn publish_circle(
+/// Open/create the rendezvous record (a circle's, or a public room's / lobby's)
+/// and write `sealed` into this node's append-ring slot, advancing the local
+/// cursor. Identical for every consumer — only the caller's `owner_seed` differs.
+async fn publish_rendezvous(
     api: &VeilidAPI,
     rc: &RoutingContext,
     node_pub: &[u8; 32],
-    circle_seq: &mut HashMap<RecordKey, u32>,
+    ring_seq: &mut HashMap<RecordKey, u32>,
     owner_seed: [u8; 32],
     sealed: Vec<u8>,
 ) -> Result<()> {
-    crate::vtrace!("publish_circle: open_or_create rendezvous");
-    let owner = identity::circle_owner_keypair(&owner_seed)?;
-    let key = circle::open_or_create(api, rc, &owner).await?;
-    let base = circle::member_base_subkey(node_pub);
+    crate::vtrace!("publish_rendezvous: open_or_create rendezvous");
+    let owner = identity::rendezvous_owner_keypair(&owner_seed)?;
+    let key = rendezvous::open_or_create(api, rc, &owner).await?;
+    let base = rendezvous::member_base_subkey(node_pub);
     let seq = {
-        let cur = circle_seq.entry(key.clone()).or_insert(0);
+        let cur = ring_seq.entry(key.clone()).or_insert(0);
         let s = *cur;
         *cur = cur.wrapping_add(1);
         s
     };
-    crate::vtrace!("publish_circle: key={key:?} ring base={base} seq={seq}");
-    let r = circle::publish(rc, &key, &owner, base, seq, sealed).await;
+    crate::vtrace!("publish_rendezvous: key={key:?} ring base={base} seq={seq}");
+    let r = rendezvous::publish(rc, &key, &owner, base, seq, sealed).await;
     crate::vtrace!(
-        "publish_circle: write {}",
+        "publish_rendezvous: write {}",
         if r.is_ok() { "ok" } else { "ERR" }
     );
     r
 }
 
-/// Open/create the circle's rendezvous record, register a watch, and kick off a
-/// one-shot background sweep for the bounded login backlog. Inbound messages
-/// flow out as [`VeilidNetEvent::Inbound`].
-async fn subscribe_circle(
+/// Open/create the rendezvous record, register a watch, and kick off a one-shot
+/// background sweep for the bounded login backlog. Inbound items flow out as
+/// [`VeilidNetEvent::Inbound`]. Used for circles and public rooms / lobby alike.
+async fn subscribe_rendezvous(
     api: &VeilidAPI,
     rc: &RoutingContext,
     ev_tx: &mpsc::UnboundedSender<VeilidNetEvent>,
     owner_seed: [u8; 32],
 ) -> Result<()> {
-    crate::vtrace!("subscribe_circle: open_or_create rendezvous");
-    let owner = identity::circle_owner_keypair(&owner_seed)?;
-    let key = circle::open_or_create(api, rc, &owner).await?;
-    crate::vtrace!("subscribe_circle: record open key={key:?}; registering watch");
+    crate::vtrace!("subscribe_rendezvous: open_or_create rendezvous");
+    let owner = identity::rendezvous_owner_keypair(&owner_seed)?;
+    let key = rendezvous::open_or_create(api, rc, &owner).await?;
+    crate::vtrace!("subscribe_rendezvous: record open key={key:?}; registering watch");
     rc.watch_dht_values(key.clone(), None, None, None)
         .await
         .map_err(|e| VeilidNetError::Routing(e.to_string()))?;
-    crate::vtrace!("subscribe_circle: watch ok; spawning backlog sweep -> Ok");
-    tokio::spawn(circle::sweep(rc.clone(), key, ev_tx.clone()));
+    crate::vtrace!("subscribe_rendezvous: watch ok; spawning backlog sweep -> Ok");
+    tokio::spawn(rendezvous::sweep(rc.clone(), key, ev_tx.clone()));
     Ok(())
 }
 
@@ -424,10 +467,11 @@ fn map_update(u: VeilidUpdate) -> Option<VeilidNetEvent> {
             public_internet_ready: a.public_internet_ready,
         }),
         VeilidUpdate::RouteChange(_) => Some(VeilidNetEvent::RouteChanged),
-        // A watched circle record changed. Phase 2 only watches circle records,
-        // so a value-bearing change is an inbound sealed circle message —
-        // surface its bytes (the app opens it with the circle key). An empty
-        // change (no value) means the watch died; report it as ValueChanged.
+        // A watched rendezvous record changed. We only watch rendezvous records
+        // (circles + public rooms / lobby), so a value-bearing change is an
+        // inbound sealed item — surface its bytes (the app opens it with the
+        // circle key or `PublicRoomKey`). An empty change (no value) means the
+        // watch died; report it as ValueChanged.
         VeilidUpdate::ValueChange(vc) => match vc.value {
             Some(v) => Some(VeilidNetEvent::Inbound {
                 bytes: v.data().to_vec(),

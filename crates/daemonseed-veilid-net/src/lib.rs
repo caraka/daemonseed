@@ -15,19 +15,26 @@
 //!   plaintext, which is what keeps the guarantee post-quantum regardless of
 //!   Veilid's classical transport.
 //!
-//! ## Circles (Phase 2)
-//! A circle's owner keypair is derived deterministically from the shared circle
-//! entropy (a sibling of the content key), so every member computes the SAME
-//! shared-owner DFLT DHT record key — the relay-free rendezvous address. Members
-//! write sealed messages into per-member append-rings; a connecting member
-//! sweeps the record for a bounded recent backlog and watches it for new writes
-//! ([`VeilidNetHandle::publish_circle`] / [`VeilidNetHandle::subscribe_circle`]).
+//! ## Rendezvous engine (circles + lobby / public rooms)
+//! One shared-owner DFLT DHT [`rendezvous`] record underlies every group
+//! surface; the only thing that varies is where the owner keypair comes from.
+//! A circle derives it from the shared circle entropy (a sibling of the content
+//! key, Phase 2); a public room / the lobby derives it from the world-derivable
+//! room name+family (a sibling of the room key, Phase 3/4). Every participant
+//! computes the SAME record key — the relay-free rendezvous address — writes
+//! sealed items into per-participant append-rings, and a connecting participant
+//! sweeps the record for a bounded backlog and watches it for new writes:
+//! [`VeilidNetHandle::publish_circle`]/[`subscribe_circle`](VeilidNetHandle::subscribe_circle)
+//! and [`publish_room`](VeilidNetHandle::publish_room)/[`subscribe_room`](VeilidNetHandle::subscribe_room).
+//! Public-share **discovery** rides the lobby record (a `ShareAnnouncement`
+//! sealed under the `PublicRoomKey` is just an item published there).
 //!
-//! ## What is stubbed (Phase 3+)
-//! Public shares (≤32 KiB chunks + `ShareAnnouncement`), presence, and
-//! announcements/MOTD return [`VeilidNetError::Unimplemented`]. Their Phase-0
-//! mechanics are characterized in the migration design doc; this crate is where
-//! they get built.
+//! ## What is stubbed (Phase 3 Slice 2 / Phase 4)
+//! Public-share **content** serving (owner-on-demand `app_call` + a private
+//! route, with ≤32 KiB transport fragmentation of the 1 MiB content-addressed
+//! chunks), presence, and announcements/MOTD return
+//! [`VeilidNetError::Unimplemented`]. Their Phase-0 mechanics are characterized
+//! in the migration design doc; this crate is where they get built.
 //!
 //! ## Invariant
 //! Content keys NEVER derive from Veilid (classical x25519) material. The seal/
@@ -52,11 +59,11 @@ macro_rules! vtrace {
 }
 
 pub mod actor;
-mod circle;
 pub mod config;
 pub mod error;
 pub mod event;
 pub mod identity;
+mod rendezvous;
 
 pub use actor::{VeilidNet, VeilidNetHandle};
 pub use config::VeilidNetConfig;

@@ -143,6 +143,63 @@ pub fn derive_room_key(room: &str, suite: &Suite) -> Result<PublicRoomKey, RoomK
     Ok(out)
 }
 
+/// Length of a public-room Veilid rendezvous-owner seed: a 32-byte Ed25519
+/// (VLD0) secret seed.
+pub const ROOM_VEILID_OWNER_SEED_LEN: usize = 32;
+
+/// A public room's Veilid **rendezvous-owner** seed (Phase 3/4 transport) — the
+/// deterministic DHT-address sibling of [`derive_room_key`], the public-room
+/// analog of [`crate::circle::key::CircleVeilidOwnerSeed`]. Every input is
+/// public, so every participant derives the byte-identical owner keypair and
+/// thus the same lobby/public-room rendezvous record key, with no relay and no
+/// key exchange (the DHT analog of [`room_asset_address`]). Zeroes on drop;
+/// `Debug` is redacted (ISC-A-C1). Content NEVER derives from this — it binds
+/// only the DHT record-owner / rendezvous address.
+#[derive(zeroize::ZeroizeOnDrop)]
+pub struct RoomVeilidOwnerSeed(Box<[u8; ROOM_VEILID_OWNER_SEED_LEN]>);
+
+impl RoomVeilidOwnerSeed {
+    /// Borrow the raw seed bytes to build a VLD0 keypair. Callers must not copy
+    /// these into a non-zeroizing buffer.
+    pub fn as_bytes(&self) -> &[u8; ROOM_VEILID_OWNER_SEED_LEN] {
+        &self.0
+    }
+}
+
+impl core::fmt::Debug for RoomVeilidOwnerSeed {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("RoomVeilidOwnerSeed(<redacted>)")
+    }
+}
+
+/// Derive a public room's Veilid rendezvous-owner seed from its public inputs —
+/// the deterministic transport-address sibling of [`derive_room_key`]. Re-extract
+/// the same public-room PRK (the [`info::PUBLIC_ROOM_KEY_SALT`] extract of the
+/// family token), then expand under the OWNER label, so neither the owner seed
+/// nor the room key is a function of the other — exactly mirroring
+/// [`crate::circle::key::derive_circle_veilid_owner_seed`]. Family-anchored (like
+/// the room key) so a cross-family change moves the rendezvous and the room key
+/// together. World-derivable: every participant computes the same owner, so the
+/// lobby/public room is an open rendezvous by construction (ISC-S22).
+pub fn derive_room_veilid_owner_seed(
+    room: &str,
+    suite: &Suite,
+) -> Result<RoomVeilidOwnerSeed, RoomKeyError> {
+    let family = suite.family_token();
+    let extract = HkdfSha384::extract(Some(info::PUBLIC_ROOM_KEY_SALT), family.as_bytes())
+        .map_err(RoomKeyError::Hkdf)?;
+    let info_str = info::public_room_veilid_owner(family, room);
+
+    let mut seed = [0u8; ROOM_VEILID_OWNER_SEED_LEN];
+    if let Err(e) = extract.expand(info_str.as_bytes(), &mut seed) {
+        seed.zeroize();
+        return Err(RoomKeyError::Hkdf(e));
+    }
+    let boxed = Box::new(seed);
+    seed.zeroize();
+    Ok(RoomVeilidOwnerSeed(boxed))
+}
+
 /// Derive a public room's rendezvous address on a given relay (ISC-S23):
 /// `SHA-384(room_key ‖ server_id)` — byte-identical in shape to a circle's
 /// [`crate::cot::asset_address`], so a public room rides the SAME
@@ -522,5 +579,49 @@ mod tests {
             Err(RoomMessageError::Authentication) => {}
             other => panic!("expected Authentication, got {other:?}"),
         }
+    }
+
+    /// The room rendezvous-owner seed is deterministic from PUBLIC inputs: every
+    /// participant derives the byte-identical owner (→ same lobby rendezvous).
+    #[test]
+    fn room_owner_seed_is_deterministic() {
+        let _ = oxicrypt_module::initialize();
+        let a = derive_room_veilid_owner_seed(DEFAULT_ROOM, &CNSA_2_0).unwrap();
+        let b = derive_room_veilid_owner_seed(DEFAULT_ROOM, &CNSA_2_0).unwrap();
+        assert_eq!(a.as_bytes(), b.as_bytes());
+    }
+
+    /// Distinct room names yield distinct rendezvous owners (the name is the
+    /// sole distinguisher, so two rooms never share a rendezvous).
+    #[test]
+    fn room_owner_seed_distinct_rooms() {
+        let _ = oxicrypt_module::initialize();
+        let lobby = derive_room_veilid_owner_seed("lobby", &CNSA_2_0).unwrap();
+        let news = derive_room_veilid_owner_seed("announcements", &CNSA_2_0).unwrap();
+        assert_ne!(lobby.as_bytes(), news.as_bytes());
+    }
+
+    /// ISC-A-S18 / ISC-A-S2 domain separation: the room rendezvous-owner seed is
+    /// a sibling of the room key (distinct `info`), so it equals neither the room
+    /// key bytes nor a like-named circle's rendezvous-owner seed (distinct salt +
+    /// `info`). Transport material never collides with content material, and the
+    /// public tier never bleeds into the circle tier.
+    #[test]
+    fn room_owner_seed_disjoint_from_room_key_and_circle_owner() {
+        use crate::circle::key::derive_circle_veilid_owner_seed;
+        let _ = oxicrypt_module::initialize();
+        let owner = derive_room_veilid_owner_seed("lobby", &CNSA_2_0).unwrap();
+        let room_key = derive_room_key("lobby", &CNSA_2_0).unwrap();
+        assert_ne!(
+            owner.as_bytes(),
+            room_key.as_bytes(),
+            "room rendezvous owner must not equal the room content key"
+        );
+        let circle_owner = derive_circle_veilid_owner_seed("lobby", &CNSA_2_0).unwrap();
+        assert_ne!(
+            owner.as_bytes(),
+            circle_owner.as_bytes(),
+            "public-room and circle rendezvous-owner domains must be disjoint"
+        );
     }
 }
