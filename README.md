@@ -78,6 +78,19 @@ cargo xtask isc-coverage                                         # report ISC co
 
 See `AGENTS.md` for the full definition-of-done, the doc-sync ritual at every commit boundary, and the worktree placement convention.
 
+## Running the GUI
+
+```bash
+cargo run -p daemonseed-gui --features desktop          # opens a real window
+```
+
+**Wayland input note.** Under some Wayland compositors — most reliably reproduced when running **more than one client in the same session** — winit 0.30's Wayland pointer path can stop delivering input, leaving the window non-responsive (the process stays healthy; it is a dead surface, not a hang). Force XWayland with `--x11` or `DAEMONSEED_X11=1` to work around it:
+
+```bash
+DAEMONSEED_X11=1 cargo run -p daemonseed-gui --features desktop
+./daemonseed-gui --x11                                  # equivalent, for a built binary
+```
+
 ## Packaging
 
 A reproducible AppImage recipe for the desktop GUI lives in
