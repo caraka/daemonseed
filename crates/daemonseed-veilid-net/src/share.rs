@@ -25,7 +25,7 @@ use std::sync::Arc;
 use daemonseed_core::public_room::PublicRoomKey;
 use daemonseed_core::share_envelope::{ManifestEntry, ShareFrame};
 use daemonseed_core::share_seal::{open_share_frame, seal_public_share_frame};
-use daemonseed_core::share_serve::ShareContent;
+use daemonseed_core::share_serve::{ShareContent, MANIFEST_FRAME_BUDGET};
 use daemonseed_core::storage::cas::{chunk_addr, ChunkAddr, CHUNK_ADDR_LEN};
 
 use crate::error::{Result, VeilidNetError};
@@ -34,6 +34,15 @@ use crate::error::{Result, VeilidNetError};
 /// `[status(1)][total(4)][fragment]`; 30 KiB leaves comfortable headroom under
 /// the 32768-byte `app_call` cap.
 pub const FRAGMENT_SIZE: usize = 30 * 1024;
+
+/// Largest legitimate reassembled sealed response: a `MANIFEST_FRAME_BUDGET`
+/// (3.5 MB) manifest dominates a 1 MiB content chunk, plus AEAD + framing
+/// headroom. A reply claiming more than this — by fragment count or cumulative
+/// bytes — is a malicious or buggy sharer; the fetcher rejects it BEFORE the
+/// SHA-384 check (which only runs after full reassembly), bounding the fetch-side
+/// `app_call` loop and its allocation against an attacker-controlled `total`.
+const MAX_REASSEMBLED_LEN: usize = MANIFEST_FRAME_BUDGET + 64 * 1024;
+const MAX_FRAGMENTS: u32 = MAX_REASSEMBLED_LEN.div_ceil(FRAGMENT_SIZE) as u32;
 
 /// A `share_id` is 128 bits hex-encoded — 32 ASCII chars (`mint_share_id`).
 const SHARE_ID_LEN: usize = 32;
@@ -280,12 +289,31 @@ where
     let first = call(encode_request(share_id, target, 0)?).await?;
     let (total, frag0) = decode_response(&first)?
         .ok_or_else(|| VeilidNetError::Send("share/chunk not served (offline?)".to_owned()))?;
+    // The sharer is untrusted (any public announcer): a malicious `total` would
+    // drive a ~4-billion-`app_call` loop, and oversize fragments would grow `buf`
+    // without bound. Cap both before reassembling — the SHA-384 chunk check only
+    // runs after the full blob is in memory, so it is no defense here.
+    if total > MAX_FRAGMENTS {
+        return Err(VeilidNetError::Send(format!(
+            "sharer claims {total} fragments, over the {MAX_FRAGMENTS} cap (malicious?)"
+        )));
+    }
     let mut buf = frag0;
     for i in 1..total {
+        if buf.len() > MAX_REASSEMBLED_LEN {
+            return Err(VeilidNetError::Send(
+                "reassembled share response exceeds the size cap (malicious?)".to_owned(),
+            ));
+        }
         let reply = call(encode_request(share_id, target, i)?).await?;
         let (_t, frag) = decode_response(&reply)?
             .ok_or_else(|| VeilidNetError::Send("fragment vanished mid-fetch".to_owned()))?;
         buf.extend_from_slice(&frag);
+    }
+    if buf.len() > MAX_REASSEMBLED_LEN {
+        return Err(VeilidNetError::Send(
+            "reassembled share response exceeds the size cap (malicious?)".to_owned(),
+        ));
     }
     Ok(buf)
 }
@@ -383,6 +411,22 @@ mod tests {
         };
         let rk = room_key();
         let err = fetch_manifest("ffffffffffffffffffffffffffffffff", &rk, &call)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, VeilidNetError::Send(_)));
+    }
+
+    /// A malicious sharer claiming more fragments than any legitimate response
+    /// is rejected before the reassembly loop (bounds the fetch-side DoS).
+    #[tokio::test]
+    async fn oversized_fragment_total_is_rejected() {
+        let _ = oxicrypt_module::initialize();
+        let rk = room_key();
+        let call = |_req: Vec<u8>| {
+            let reply = encode_response_ok(MAX_FRAGMENTS + 1, &[0u8; 16]);
+            async move { Ok(reply) }
+        };
+        let err = fetch_manifest("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", &rk, &call)
             .await
             .unwrap_err();
         assert!(matches!(err, VeilidNetError::Send(_)));
