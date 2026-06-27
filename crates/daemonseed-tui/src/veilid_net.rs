@@ -246,8 +246,27 @@ async fn connect(
         Ok(k) => k,
         Err(e) => return fail(evt_tx, format!("identity keys: {e}")),
     };
-    let dir = std::env::temp_dir().join("daemonseed-tui-veilid");
-    let cfg = VeilidNetConfig::new(id.veilid_node_seed, dir.to_string_lossy().into_owned());
+    // Per-instance overrides so several clients can run on ONE host (the
+    // single-machine felt-test): `DAEMONSEED_VEILID_DIR` gives each instance its
+    // own Veilid protected-store, `DAEMONSEED_VEILID_PORT` its own listen port.
+    // Without them two nodes on one host collide on the default store dir + port.
+    let dir = std::env::var("DAEMONSEED_VEILID_DIR").unwrap_or_else(|_| {
+        std::env::temp_dir()
+            .join("daemonseed-tui-veilid")
+            .to_string_lossy()
+            .into_owned()
+    });
+    let mut cfg = VeilidNetConfig::new(id.veilid_node_seed, dir);
+    if let Ok(port) = std::env::var("DAEMONSEED_VEILID_PORT") {
+        cfg.listen_address = Some(format!(":{port}"));
+        // Distinct program namespace per instance too. veilid keys some
+        // process/host-global coexistence state on the namespace, so two nodes
+        // sharing the default "daemonseed" evict each other even with distinct
+        // stores + ports (the #99 `two_node_circle` test gives each node its own
+        // namespace for exactly this reason). Derive it from the distinct port so
+        // it tracks automatically.
+        cfg.namespace = format!("daemonseed-{port}");
+    }
 
     match VeilidNet::start(cfg).await {
         Ok((handle, rx)) => match handle.attach_and_wait(180).await {
