@@ -283,6 +283,16 @@ fn apply_announcements(ui: &AppWindow, view: &AnnouncementsView, can_compose: bo
     ui.set_can_compose(can_compose);
 }
 
+/// Best-effort wall-clock (ms since epoch) for ordering a Lobby message into the
+/// transcript (#105). Circles carry the sender's stamp on the wire; the Lobby
+/// arrives in order, so its receive time keeps the ordered-insert an append.
+fn now_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 /// Convert a circle's `Vec<Msg>` into a Slint `ModelRc<MsgData>`.
 fn messages_model(messages: &[Msg]) -> ModelRc<MsgData> {
     let rows: Vec<MsgData> = messages
@@ -1393,7 +1403,7 @@ fn apply_net_event(
             // Always fold the message into the Lobby's RAM state; refresh the
             // visible transcript only when the Lobby is the active circle.
             let mut st = state.borrow_mut();
-            let raised = st.push_message(LOBBY, who, text, mine);
+            let raised = st.push_message(LOBBY, who, text, mine, now_unix_ms());
             let active = st.active();
             if active == LOBBY {
                 st.set_scroll(LOBBY, if stick { STICK_BOTTOM } else { live });
@@ -1428,6 +1438,7 @@ fn apply_net_event(
             who,
             text,
             mine,
+            sent_unix_ms,
         } => {
             // #84: capture scroll intent from the LIVE view before the transcript grows
             // (see the Lobby branch). Own sends pin to bottom; incoming pins only if the
@@ -1438,7 +1449,7 @@ fn apply_net_event(
             // that circle's RAM state; refresh the transcript only when it's active.
             let mut st = state.borrow_mut();
             if let Some(idx) = st.index_of_circle_id(circle_id) {
-                let raised = st.push_message(idx, who, text, mine);
+                let raised = st.push_message(idx, who, text, mine, sent_unix_ms);
                 let active = st.active();
                 if active == idx {
                     st.set_scroll(idx, if stick { STICK_BOTTOM } else { live });
@@ -2633,7 +2644,7 @@ fn main() {
             materialize_and_select(&ui, &state, &net, "demo unread fixture phrase");
             let mut st = state.borrow_mut();
             st.switch_to(0, String::new(), 0.0);
-            st.push_message(1, "ally".into(), "ping".into(), false);
+            st.push_message(1, "ally".into(), "ping".into(), false, now_unix_ms());
             rebuild_rail(&ui, &st);
             // Reflect the Lobby as the focused row so the circle (idx 1) is the
             // unfocused one carrying the dot.

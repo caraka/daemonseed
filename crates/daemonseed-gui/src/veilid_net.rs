@@ -317,10 +317,11 @@ async fn send_circle(
     let Some(handle) = net.as_ref() else {
         return err("not connected to Veilid yet".to_owned());
     };
+    let sent_unix_ms = now_unix_ms();
     let message = wire::CircleMessage {
         sender_handle: my_handle.to_owned(),
         body: text.to_owned(),
-        sent_unix_ms: now_unix_ms(),
+        sent_unix_ms,
     };
     let sealed = match seal_message(&circle.cot_key, &message) {
         Ok(s) => s,
@@ -335,6 +336,7 @@ async fn send_circle(
         who: my_handle.to_owned(),
         text: text.to_owned(),
         mine: true,
+        sent_unix_ms,
     });
     // Publish off-task so a slow DHT write does not stall the actor's select loop
     // (which would also delay inbound delivery). A failure surfaces as a
@@ -383,6 +385,7 @@ fn handle_inbound(
                     who: msg.sender_handle,
                     text: msg.body,
                     mine: false,
+                    sent_unix_ms: msg.sent_unix_ms,
                 });
             } else {
                 daemonseed_veilid_net::vtrace!(

@@ -201,6 +201,12 @@ pub struct Msg {
     pub who: String,
     pub text: String,
     pub mine: bool,
+    /// Best-effort sender wall-clock (ms since epoch) the transcript is ordered
+    /// by (#105). For circles, DHT propagation latency means arrival order can
+    /// differ from send order, so messages are inserted in `sent_unix_ms` order
+    /// rather than appended. Lobby messages arrive in order and carry their
+    /// receive time, so ordered-insert is a no-op append for them.
+    pub sent_unix_ms: i64,
 }
 
 /// A share you published this session — one entry in the Publish overlay's "Your
@@ -694,10 +700,32 @@ impl GuiState {
     /// Returns `true` iff this call newly raised circle `idx`'s unread dot (#64) —
     /// a non-own message into a non-active room — so the caller knows to rebuild the
     /// rail. Own echoes (`mine`) and messages into the active room never raise it.
-    pub fn push_message(&mut self, idx: usize, who: String, text: String, mine: bool) -> bool {
+    pub fn push_message(
+        &mut self,
+        idx: usize,
+        who: String,
+        text: String,
+        mine: bool,
+        sent_unix_ms: i64,
+    ) -> bool {
         let active = self.active;
         if let Some(c) = self.circles.get_mut(idx) {
-            c.messages.push(Msg { who, text, mine });
+            // #105: insert in sent_unix_ms order so a late-arriving (older) circle
+            // message slots into its chronological place instead of appending out
+            // of order. `partition_point` keeps the Vec sorted and is a no-op
+            // append for in-order arrivals (Lobby, and the common circle case).
+            let pos = c
+                .messages
+                .partition_point(|m| m.sent_unix_ms <= sent_unix_ms);
+            c.messages.insert(
+                pos,
+                Msg {
+                    who,
+                    text,
+                    mine,
+                    sent_unix_ms,
+                },
+            );
             if !mine && idx != active && !c.unread {
                 c.unread = true;
                 return true;
@@ -767,6 +795,7 @@ impl GuiState {
                 who: who.into(),
                 text: format!("welcome to {circle} — this circle is {circle}"),
                 mine: false,
+                sent_unix_ms: 0,
             }
         }
         fn fill(name: &str, n: usize, owner: &str) -> Vec<Msg> {
@@ -781,6 +810,7 @@ impl GuiState {
                     },
                     text: format!("{name} line {i} — lorem ipsum dolor sit amet"),
                     mine,
+                    sent_unix_ms: i as i64,
                 });
             }
             msgs
@@ -1102,7 +1132,7 @@ mod tests {
     #[test]
     fn unread_set_on_nonactive_inbound() {
         let mut st = GuiState::demo(); // active == 1
-        let raised = st.push_message(2, "ally".into(), "ping".into(), false);
+        let raised = st.push_message(2, "ally".into(), "ping".into(), false, 1);
         assert!(
             raised,
             "a non-own message into a non-active room raises unread"
@@ -1114,19 +1144,19 @@ mod tests {
     #[test]
     fn unread_not_set_for_active_room_or_own_echo() {
         let mut st = GuiState::demo(); // active == 1
-        assert!(!st.push_message(1, "x".into(), "hi".into(), false));
+        assert!(!st.push_message(1, "x".into(), "hi".into(), false, 1));
         assert!(
             !st.metas()[1].unread,
             "message into the active room: no dot"
         );
-        assert!(!st.push_message(2, "me".into(), "hi".into(), true));
+        assert!(!st.push_message(2, "me".into(), "hi".into(), true, 2));
         assert!(!st.metas()[2].unread, "own echo never dots");
     }
 
     #[test]
     fn focus_clears_unread() {
         let mut st = GuiState::demo(); // active == 1
-        st.push_message(2, "ally".into(), "ping".into(), false);
+        st.push_message(2, "ally".into(), "ping".into(), false, 1);
         assert!(st.metas()[2].unread);
         st.switch_to(2, String::new(), 0.0); // focus circle 2
         assert!(!st.metas()[2].unread, "focusing a room clears its dot");
@@ -1135,12 +1165,36 @@ mod tests {
     #[test]
     fn unread_raise_is_idempotent() {
         let mut st = GuiState::demo(); // active == 1
-        assert!(st.push_message(2, "a".into(), "1".into(), false));
+        assert!(st.push_message(2, "a".into(), "1".into(), false, 1));
         assert!(
-            !st.push_message(2, "a".into(), "2".into(), false),
+            !st.push_message(2, "a".into(), "2".into(), false, 2),
             "already-unread room does not re-raise (no spurious rail rebuilds)"
         );
         assert!(st.metas()[2].unread);
+    }
+
+    // ── #105 transcript ordering by sent_unix_ms ─────────────────────────────
+
+    #[test]
+    fn circle_messages_insert_in_sent_unix_ms_order() {
+        let mut st = GuiState::demo(); // active == 1; circle 2 exists
+        // Arrive OUT of send-order (DHT latency): t=30, then a late t=10, then t=20.
+        st.push_message(2, "a".into(), "third".into(), false, 30);
+        st.push_message(2, "b".into(), "first".into(), false, 10);
+        st.push_message(2, "c".into(), "second".into(), false, 20);
+        // Filter to our three (demo() seeds fixture messages) and assert they land
+        // in timestamp order regardless of arrival order.
+        let ours: Vec<&str> = st.circles[2]
+            .messages
+            .iter()
+            .map(|m| m.text.as_str())
+            .filter(|t| ["first", "second", "third"].contains(t))
+            .collect();
+        assert_eq!(
+            ours,
+            vec!["first", "second", "third"],
+            "messages ordered by sent_unix_ms, not arrival order"
+        );
     }
 
     #[test]

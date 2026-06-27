@@ -420,6 +420,9 @@ pub enum NetEvent {
         who: String,
         text: String,
         mine: bool,
+        /// Best-effort sender wall-clock (ms since epoch) — the transcript is
+        /// ordered by this (#105).
+        sent_unix_ms: i64,
     },
     /// A non-fatal circle error (join/send failure) tagged with the circle it
     /// concerns. The connection itself may still be up.
@@ -1858,6 +1861,7 @@ impl Actor {
             who: self.my_handle.clone(),
             text: text.to_owned(),
             mine: true,
+            sent_unix_ms: message.sent_unix_ms,
         });
     }
 
@@ -3014,6 +3018,7 @@ async fn read_inbound_circle(
                             who: msg.sender_handle,
                             text: msg.body,
                             mine,
+                            sent_unix_ms: msg.sent_unix_ms,
                         })
                         .is_err()
                     {

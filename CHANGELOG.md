@@ -38,6 +38,7 @@ work lives in the project lead's vault manifest, not here.
 
 - `daemonseed-gui` Veilid mode: the sender's own circle message echoes immediately — the local echo is emitted before the DHT publish (which now runs off-task) instead of after the round-trip (#101).
 - `daemonseed-gui` Veilid mode: persisted circles are re-subscribed on connect via `rejoin_circles`, so a restored circle pane is joined on the transport rather than failing the next send with "join the circle before sending" (#102).
+- `daemonseed-gui`: the circle transcript is ordered by `sent_unix_ms` (ordered-insert in `push_message`), so a message delivered out of send-order by DHT propagation latency slots into its chronological place instead of appending out of order (#105).
 
 ## [0.32.0] — 2026-06-26
 
