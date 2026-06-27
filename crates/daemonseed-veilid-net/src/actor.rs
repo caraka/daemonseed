@@ -21,7 +21,7 @@ use daemonseed_core::storage::cas::ChunkAddr;
 use crate::config::VeilidNetConfig;
 use crate::error::{Result, VeilidNetError};
 use crate::event::VeilidNetEvent;
-use crate::{identity, rendezvous, share};
+use crate::{discovery, identity, rendezvous, share};
 
 /// Veilid's `app_message` / `app_call` payload cap (bytes). Sealed envelopes
 /// must fit; file-share chunks re-chunk to this in Phase 3.
@@ -82,6 +82,22 @@ enum Command {
         call_id: OperationId,
         message: Vec<u8>,
     },
+    /// Announce a public share to the lobby with an anti-swap SIGNED route advert
+    /// (D-3.5). The actor allocates a private inbound route, asks `signer` to sign
+    /// `share_id ‖ route_blob`, wraps it with the sealed announcement into a
+    /// `DiscoveryEnvelope`, and publishes it on the lobby rendezvous; it remembers
+    /// the advert so a `RouteChanged` can re-allocate + re-sign + re-publish.
+    PublishShare {
+        owner_seed: [u8; 32],
+        share_id: String,
+        sealed_announcement: Vec<u8>,
+        signer: Arc<dyn discovery::RouteAdvertSigner>,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    /// A private route died/rotated (from the update pump). Re-publish every active
+    /// share advert with a fresh route + signature so discovery never points at a
+    /// dead route. Coalesced against bursts; fire-and-forget.
+    RouteMaintenance,
     Shutdown {
         reply: oneshot::Sender<()>,
     },
@@ -277,6 +293,31 @@ impl VeilidNetHandle {
         .await?
     }
 
+    /// Announce a public share to the lobby with a SIGNED route advert (D-3.5 /
+    /// [`crate::discovery`]). Allocates a private inbound route, has `signer` sign
+    /// the route advert (`share_id ‖ route_blob`), wraps it with `sealed_announcement`
+    /// (the core sealed `ShareAnnouncement`) into a [`crate::DiscoveryEnvelope`], and
+    /// publishes it on the lobby rendezvous identified by `owner_seed`
+    /// (`daemonseed_core::public_room::derive_room_veilid_owner_seed`). The advert is
+    /// remembered and re-published on `RouteChanged`. Pair with [`Self::serve_share`],
+    /// which registers the content this route serves.
+    pub async fn publish_share(
+        &self,
+        owner_seed: [u8; 32],
+        share_id: String,
+        sealed_announcement: Vec<u8>,
+        signer: Arc<dyn discovery::RouteAdvertSigner>,
+    ) -> Result<()> {
+        self.send(|reply| Command::PublishShare {
+            owner_seed,
+            share_id,
+            sealed_announcement,
+            signer,
+            reply,
+        })
+        .await?
+    }
+
     /// Member-plane presence heartbeat over a room/circle record. **Phase 4.**
     pub async fn presence(&self) -> Result<()> {
         Err(VeilidNetError::Unimplemented("presence — Phase 4"))
@@ -314,6 +355,12 @@ impl VeilidNet {
                         call_id: call.id(),
                         message: call.message().to_vec(),
                     });
+                }
+                // A private route died/rotated: drive an advert refresh in the
+                // actor (which holds the signer + advert set) AND surface the event.
+                VeilidUpdate::RouteChange(_) => {
+                    let _ = cmd_tx_cb.try_send(Command::RouteMaintenance);
+                    let _ = ev_tx_cb.send(VeilidNetEvent::RouteChanged);
                 }
                 other => {
                     if let Some(ev) = map_update(other) {
@@ -395,6 +442,11 @@ async fn actor_loop(
     let mut ring_seq: HashMap<RecordKey, u32> = HashMap::new();
     // Shares this node serves owner-on-demand (Phase 3), keyed by share_id.
     let mut shares: HashMap<String, share::ServedShare> = HashMap::new();
+    // Active share adverts (Phase 3 discovery), keyed by share_id, so a
+    // RouteChanged can re-allocate + re-sign + re-publish each one.
+    let mut share_adverts: HashMap<String, AdvertState> = HashMap::new();
+    // Coalesce RouteChanged bursts into at most one advert refresh per interval.
+    let mut last_advert_refresh: Option<tokio::time::Instant> = None;
 
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
@@ -472,6 +524,36 @@ async fn actor_loop(
                     crate::vtrace!("inbound app_call: reply failed ({e})");
                 }
             }
+            Command::PublishShare {
+                owner_seed,
+                share_id,
+                sealed_announcement,
+                signer,
+                reply,
+            } => {
+                let advert = AdvertState {
+                    owner_seed,
+                    sealed_announcement,
+                    signer,
+                };
+                let res =
+                    publish_one_advert(&api, &rc, &node_pub, &mut ring_seq, &share_id, &advert)
+                        .await;
+                if res.is_ok() {
+                    share_adverts.insert(share_id, advert);
+                }
+                let _ = reply.send(res);
+            }
+            Command::RouteMaintenance => {
+                let now = tokio::time::Instant::now();
+                let due = last_advert_refresh
+                    .is_none_or(|t| now.duration_since(t) >= ADVERT_REFRESH_MIN_INTERVAL);
+                if due && !share_adverts.is_empty() {
+                    last_advert_refresh = Some(now);
+                    refresh_share_adverts(&api, &rc, &node_pub, &mut ring_seq, &share_adverts)
+                        .await;
+                }
+            }
             Command::Shutdown { reply } => {
                 api.shutdown().await;
                 let _ = reply.send(());
@@ -532,6 +614,67 @@ async fn subscribe_rendezvous(
     crate::vtrace!("subscribe_rendezvous: watch ok; spawning backlog sweep -> Ok");
     tokio::spawn(rendezvous::sweep(rc.clone(), key, ev_tx.clone()));
     Ok(())
+}
+
+/// Min interval between RouteChanged-triggered advert refreshes — coalesces route
+/// churn bursts (NAT flaps cluster) into at most one re-publish wave, breaking the
+/// churn → republish → load → churn reinforcing loop.
+const ADVERT_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(5);
+
+/// A remembered public-share advert: enough to re-allocate a route, re-sign, and
+/// re-publish it on RouteChanged. Holds the signing CAPABILITY, never key material.
+struct AdvertState {
+    owner_seed: [u8; 32],
+    sealed_announcement: Vec<u8>,
+    signer: Arc<dyn discovery::RouteAdvertSigner>,
+}
+
+/// Allocate a fresh private inbound route, sign the route advert with the sharer's
+/// capability, wrap it with the sealed announcement into a `DiscoveryEnvelope`, and
+/// publish it on the lobby rendezvous. The signed `share_id ‖ route_blob` is the
+/// anti-swap binding (D-3.5); this layer never holds the announcer's key.
+async fn publish_one_advert(
+    api: &VeilidAPI,
+    rc: &RoutingContext,
+    node_pub: &[u8; 32],
+    ring_seq: &mut HashMap<RecordKey, u32>,
+    share_id: &str,
+    advert: &AdvertState,
+) -> Result<()> {
+    let route = api
+        .new_private_route()
+        .await
+        .map_err(|e| VeilidNetError::Routing(e.to_string()))?;
+    let route_sig = advert.signer.sign_route_advert(share_id, &route.blob)?;
+    let envelope = discovery::DiscoveryEnvelope {
+        sealed_announcement: advert.sealed_announcement.clone(),
+        route_blob: route.blob,
+        route_sig,
+    }
+    .encode();
+    crate::vtrace!(
+        "publish_one_advert: share_id={share_id} envelope={} bytes",
+        envelope.len()
+    );
+    publish_rendezvous(api, rc, node_pub, ring_seq, advert.owner_seed, envelope).await
+}
+
+/// Re-publish every active share advert with a fresh route + signature (called on
+/// RouteChanged). A failure on one advert is logged and skipped — the others still
+/// refresh.
+async fn refresh_share_adverts(
+    api: &VeilidAPI,
+    rc: &RoutingContext,
+    node_pub: &[u8; 32],
+    ring_seq: &mut HashMap<RecordKey, u32>,
+    adverts: &HashMap<String, AdvertState>,
+) {
+    crate::vtrace!("refresh_share_adverts: {} advert(s)", adverts.len());
+    for (share_id, st) in adverts {
+        if let Err(e) = publish_one_advert(api, rc, node_pub, ring_seq, share_id, st).await {
+            crate::vtrace!("refresh_share_adverts: {share_id} ERR ({e})");
+        }
+    }
 }
 
 /// Attach and poll until public-internet-ready or the deadline elapses.
@@ -600,7 +743,8 @@ fn map_update(u: VeilidUpdate) -> Option<VeilidNetEvent> {
         VeilidUpdate::Attachment(a) => Some(VeilidNetEvent::Attachment {
             public_internet_ready: a.public_internet_ready,
         }),
-        VeilidUpdate::RouteChange(_) => Some(VeilidNetEvent::RouteChanged),
+        // `RouteChange` is intercepted in the update callback (it drives advert
+        // refresh + emits `RouteChanged` directly), so it never reaches here.
         // A watched rendezvous record changed. We only watch rendezvous records
         // (circles + public rooms / lobby), so a value-bearing change is an
         // inbound sealed item — surface its bytes (the app opens it with the

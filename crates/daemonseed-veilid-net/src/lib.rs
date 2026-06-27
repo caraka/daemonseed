@@ -16,7 +16,7 @@
 //!   Veilid's classical transport.
 //!
 //! ## Rendezvous engine (circles + lobby / public rooms)
-//! One shared-owner DFLT DHT [`rendezvous`] record underlies every group
+//! One shared-owner DFLT DHT `rendezvous` record underlies every group
 //! surface; the only thing that varies is where the owner keypair comes from.
 //! A circle derives it from the shared circle entropy (a sibling of the content
 //! key, Phase 2); a public room / the lobby derives it from the world-derivable
@@ -29,16 +29,25 @@
 //! Public-share **discovery** rides the lobby record (a `ShareAnnouncement`
 //! sealed under the `PublicRoomKey` is just an item published there).
 //!
-//! ## Public-share content (Phase 3)
+//! ## Public-share content + discovery (Phase 3)
 //! A share's bytes move owner-on-demand over `app_call` + a private route:
 //! [`VeilidNetHandle::serve_share`] registers an indexed share, and a fetcher
 //! pulls it with [`VeilidNetHandle::fetch_manifest`] +
 //! [`VeilidNetHandle::fetch_chunk`]. The 1 MiB content-addressed chunks are
 //! transport-fragmented to ≤32 KiB and reassembled, then SHA-384-verified
 //! against their address (ISC-S28). Content stays sealed under the
-//! `PublicRoomKey` (ISC-A-S22). Delivering the sharer's route blob in the
-//! `ShareAnnouncement` (so discovery auto-wires to fetch) + the GUI/TUI wiring
-//! are the remaining Phase-3 step.
+//! `PublicRoomKey` (ISC-A-S22).
+//!
+//! Discovery wires to that fetch through a SIGNED route advert
+//! ([`discovery`], D-3.5): [`VeilidNetHandle::publish_share`] allocates a private
+//! route, asks the sharer's [`RouteAdvertSigner`] capability to sign
+//! `share_id ‖ route_blob`, and publishes a [`DiscoveryEnvelope`]
+//! `{ sealed_announcement, route_blob, route_sig }` onto the lobby rendezvous —
+//! re-publishing on `RouteChanged`. A fetcher opens the announcement (core), then
+//! [`verify_route_advert`]s the route against the announcer's pubkey before
+//! importing it, so a man-in-the-middle on the world-writable lobby record cannot
+//! redirect the fetch (anti-swap). The GUI/TUI share-command wiring onto this
+//! surface is the remaining Phase-3 step.
 //!
 //! ## What is stubbed (Phase 4)
 //! Presence and announcements/MOTD return [`VeilidNetError::Unimplemented`];
@@ -68,6 +77,7 @@ macro_rules! vtrace {
 
 pub mod actor;
 pub mod config;
+pub mod discovery;
 pub mod error;
 pub mod event;
 pub mod identity;
@@ -76,5 +86,8 @@ mod share;
 
 pub use actor::{VeilidNet, VeilidNetHandle};
 pub use config::VeilidNetConfig;
+pub use discovery::{
+    route_provenance_input, verify_route_advert, DiscoveryEnvelope, RouteAdvertSigner,
+};
 pub use error::{Result, VeilidNetError};
 pub use event::VeilidNetEvent;
