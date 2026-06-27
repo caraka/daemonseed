@@ -99,11 +99,25 @@ async fn handle_command(
     my_handle: &mut String,
 ) {
     match cmd {
-        NetCommand::Connect { display_handle, .. } => {
+        NetCommand::Connect {
+            display_handle,
+            rejoin_circles,
+            ..
+        } => {
             if let Some(h) = display_handle {
                 *my_handle = h;
             }
             connect(evt_tx, net, ev_rx).await;
+            // #102: relay-parity — silently re-subscribe persisted circles after
+            // attach, so a circle restored into the UI is actually joined on the
+            // transport (else SendCircle finds known=[] → "join before sending").
+            // Mirrors the relay's `handle_connect` loop; `join_circle` is
+            // idempotent by owner_seed.
+            if net.is_some() {
+                for (circle_id, phrase) in rejoin_circles {
+                    join_circle(circle_id, &phrase, evt_tx, net, circles).await;
+                }
+            }
         }
         NetCommand::SetMyHandle { handle } => {
             *my_handle = handle;
@@ -312,15 +326,29 @@ async fn send_circle(
         Ok(s) => s,
         Err(e) => return err(format!("seal failed: {e}")),
     };
-    if let Err(e) = handle.publish_circle(circle.owner_seed, sealed).await {
-        return err(format!("publish failed: {e}"));
-    }
-    // LOCAL ECHO (mirrors the relay actor): show the sender's own message now.
+    // #101: optimistic local echo FIRST — the sender sees their own message
+    // immediately, not after the DHT publish round-trip (seconds on Veilid). The
+    // delayed DHT re-surface of this same write is suppressed by sender-handle in
+    // `handle_inbound`, so there is no double-render.
     let _ = evt_tx.send(NetEvent::CircleMessage {
         circle_id,
         who: my_handle.to_owned(),
         text: text.to_owned(),
         mine: true,
+    });
+    // Publish off-task so a slow DHT write does not stall the actor's select loop
+    // (which would also delay inbound delivery). A failure surfaces as a
+    // CircleError; the already-echoed line stays (optimistic UI).
+    let owner_seed = circle.owner_seed;
+    let handle = handle.clone();
+    let evt_tx_pub = evt_tx.clone();
+    tokio::spawn(async move {
+        if let Err(e) = handle.publish_circle(owner_seed, sealed).await {
+            let _ = evt_tx_pub.send(NetEvent::CircleError {
+                circle_id,
+                reason: format!("publish failed: {e}"),
+            });
+        }
     });
 }
 
