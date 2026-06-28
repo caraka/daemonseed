@@ -226,6 +226,7 @@ async fn handle_command(
         NetCommand::Connect {
             display_handle,
             rejoin_circles,
+            republish_roots,
             stable_signing_key,
             ..
         } => {
@@ -246,6 +247,17 @@ async fn handle_command(
                 // transport (else SendCircle finds known=[] → "join before sending").
                 for (circle_id, phrase) in rejoin_circles {
                     join_circle(circle_id, &phrase, evt_tx, net, circles).await;
+                }
+                // #108: relay-parity — re-publish persisted shares on connect, exactly
+                // like the circle re-join above (the relay path does this; the Veilid
+                // path was dropping `republish_roots`). The node identity is ephemeral
+                // per launch, so each re-serves under a fresh private route and
+                // discovery re-announces it. A per-share failure surfaces as a publish
+                // error and never aborts the others.
+                let sharer = my_handle.clone();
+                for (root, persisted_name) in republish_roots {
+                    let name = crate::net::republish_name(&root, persisted_name.as_deref());
+                    publish_share(shares, evt_tx, net, root, name, sharer.clone()).await;
                 }
             }
         }

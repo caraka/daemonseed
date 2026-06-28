@@ -1222,8 +1222,10 @@ mod tests {
             .count();
         assert_eq!(hellos, 1, "duplicate (sender, body, ms) coalesced to one");
         assert_eq!(st.circles[2].messages.len(), before + 1);
-        // A distinct body at the same ms is NOT coalesced.
-        assert!(st.push_message(2, "alice".into(), "world".into(), false, 100) || true);
+        // A distinct body at the same ms is NOT coalesced — it is inserted. (The
+        // bool return is the unread-dot signal, already raised above, so it is
+        // irrelevant here; the count assertion below is the real check.)
+        let _ = st.push_message(2, "alice".into(), "world".into(), false, 100);
         assert_eq!(
             st.circles[2]
                 .messages

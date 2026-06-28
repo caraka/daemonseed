@@ -110,7 +110,10 @@ use tokio_stream::wrappers::ReceiverStream;
 /// consistently. The publish overlay's name field sets the persisted name, so a
 /// custom name returns verbatim here and an un-named share (`None`) falls back to
 /// the folder basename.
-fn republish_name(root: &Path, persisted: Option<&str>) -> String {
+///
+/// `pub(crate)` so the Veilid net actor's connect-time republish (#108) names
+/// shares identically to the relay path — one source for the choice, no drift.
+pub(crate) fn republish_name(root: &Path, persisted: Option<&str>) -> String {
     if let Some(name) = persisted.filter(|n| !n.is_empty()) {
         return name.to_owned();
     }
