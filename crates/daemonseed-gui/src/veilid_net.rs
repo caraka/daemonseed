@@ -726,9 +726,7 @@ async fn unpublish_share(
 /// ambiguity: a deliberate unpublish reads plainly instead of an indefinite timeout.
 fn fetch_error_message(context: &str, e: VeilidNetError) -> String {
     match e {
-        VeilidNetError::NotServed => {
-            "the sharer withdrew this share — it is no longer served".to_owned()
-        }
+        VeilidNetError::NotServed => "sharer withdrew this share".to_owned(),
         // Log the FULL error to the trace — the GUI status line truncates it to an
         // ellipsis, hiding the diagnostic for a transport/reassembly/verify failure.
         other => {
