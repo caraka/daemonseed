@@ -729,7 +729,12 @@ fn fetch_error_message(context: &str, e: VeilidNetError) -> String {
         VeilidNetError::NotServed => {
             "the sharer withdrew this share — it is no longer served".to_owned()
         }
-        other => format!("{context}: {other}"),
+        // Log the FULL error to the trace — the GUI status line truncates it to an
+        // ellipsis, hiding the diagnostic for a transport/reassembly/verify failure.
+        other => {
+            daemonseed_veilid_net::vtrace!("fetch error — {context}: {other}");
+            format!("{context}: {other}")
+        }
     }
 }
 

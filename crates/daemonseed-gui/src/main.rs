@@ -1382,9 +1382,20 @@ fn apply_net_event(
             ui.set_connection_status(SharedString::from(format!("connected · {room}")));
             ui.set_connected(true);
         }
-        NetEvent::ConnectFailed { reason } | NetEvent::Error { reason } => {
+        NetEvent::ConnectFailed { reason } => {
             ui.set_connection_status(SharedString::from(format!("offline · {reason}")));
             ui.set_connected(false);
+        }
+        // A surface-level operation error is NOT a connection-state change. It must
+        // never flip the global online indicator — a stubbed Phase-4 surface
+        // returning "not yet on Veilid" was reading as "offline" while the transport
+        // was AttachedFull. Connection state is owned solely by Connected /
+        // ConnectFailed / Disconnected; a real error shows as a transient notice,
+        // the known dev stub is silent.
+        NetEvent::Error { reason } => {
+            if reason != "not yet on Veilid" {
+                ui.set_connect_notice(SharedString::from(reason));
+            }
         }
         // #72: a live connection dropped. The actor already cleared its stale
         // session and (when a connect plan exists, #71) armed auto-reconnect, so
