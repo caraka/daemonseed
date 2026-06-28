@@ -28,6 +28,12 @@ base64 = "0.22"
 tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
 thiserror = "1"
 
+# Fragment-pipelining the share fetch (#109): `StreamExt::buffered` keeps N
+# fragment app_calls in flight in ONE task (no spawn → the in-process `call`
+# closures need not be Send/'static). Already in this crate's lock via
+# veilid-core — a direct dep adds no new supply-chain surface.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
 [dev-dependencies]
 # Integration test (#97): the 2-node send_sealed-over-private-route oracle.
 # Runs on a real-network host (`--ignored`); this VM's NAT blocks public attach.

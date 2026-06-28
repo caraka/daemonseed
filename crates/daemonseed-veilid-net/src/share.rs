@@ -3,8 +3,9 @@
 //! Discovery (`rendezvous` / `publish_room`) tells a fetcher a share EXISTS;
 //! this module moves its bytes. A 1 MiB content-addressed chunk far exceeds
 //! Veilid's 32 KiB `app_call` payload cap, so the transport fragments the
-//! SEALED content frame into ≤[`FRAGMENT_SIZE`] pieces the fetcher pulls one
-//! `app_call` at a time and reassembles. The 1 MiB SHA-384 content-addressing
+//! SEALED content frame into ≤[`FRAGMENT_SIZE`] pieces the fetcher pulls in a
+//! bounded-concurrency pipeline ([`FRAGMENT_FETCH_CONCURRENCY`] `app_call`s in
+//! flight, in request order) and reassembles. The 1 MiB SHA-384 content-addressing
 //! is untouched (D-3.4, "the cleaner invariant"): the fetcher reassembles a
 //! chunk, opens it under the `PublicRoomKey`, and re-derives SHA-384 to verify
 //! it against the requested address (ISC-S28 / ISC-A-S20).
@@ -21,6 +22,8 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+
+use futures_util::stream::{self, StreamExt, TryStreamExt};
 
 use daemonseed_core::public_room::PublicRoomKey;
 use daemonseed_core::share_envelope::{ManifestEntry, ShareFrame};
@@ -51,6 +54,31 @@ const MAX_FRAGMENTS: u32 = MAX_REASSEMBLED_LEN.div_ceil(FRAGMENT_SIZE) as u32;
 /// brief backoff before giving up.
 const FRAGMENT_RETRIES: u32 = 3;
 const FRAGMENT_RETRY_BACKOFF_MS: u64 = 250;
+
+/// How many fragment `app_call`s (after fragment 0) are kept in flight at once.
+/// Fragment 0 is fetched alone to learn `total`; fragments `1..total` are then
+/// pipelined — up to this many concurrent round-trips within the one fetch task
+/// (`StreamExt::buffered`, no spawn, so the in-process `call` closures need not
+/// be `Send`/`'static`). A 1 MiB chunk is ~34 fragments; a window of 8 collapses
+/// ~34 serial round-trips into ~5 waves — the wall-clock win behind #109 — while
+/// a bounded window avoids hammering a work-in-progress private route.
+const FRAGMENT_FETCH_CONCURRENCY: usize = 8;
+
+/// A legitimate fragment is sliced to ≤[`FRAGMENT_SIZE`] on the serve side
+/// ([`ServedShare::answer_fragment`]); a larger one is malformed or hostile.
+/// Capping each fragment keeps the reassembly bound at
+/// `MAX_FRAGMENTS × FRAGMENT_SIZE = `[`MAX_REASSEMBLED_LEN`] even though the
+/// pipelined fetch can no longer abort mid-stream the way the serial loop did —
+/// a strictly stronger bound than the prior cumulative-only check.
+fn check_fragment_size(frag: &[u8]) -> Result<()> {
+    if frag.len() > FRAGMENT_SIZE {
+        return Err(VeilidNetError::Send(format!(
+            "fragment is {} bytes, over the {FRAGMENT_SIZE}-byte cap (malicious?)",
+            frag.len()
+        )));
+    }
+    Ok(())
+}
 
 /// A `share_id` is 128 bits hex-encoded — 32 ASCII chars (`mint_share_id`).
 const SHARE_ID_LEN: usize = 32;
@@ -330,26 +358,42 @@ where
     // deliberate withdraw from a silent disconnect.
     let (total, frag0) = decode_response(&first)?.ok_or(VeilidNetError::NotServed)?;
     // The sharer is untrusted (any public announcer): a malicious `total` would
-    // drive a ~4-billion-`app_call` loop, and oversize fragments would grow `buf`
-    // without bound. Cap both before reassembling — the SHA-384 chunk check only
-    // runs after the full blob is in memory, so it is no defense here.
+    // drive a ~4-billion-`app_call` loop, and oversize fragments would grow the
+    // buffer without bound. Cap the fragment count up front and every fragment's
+    // size as it lands — the SHA-384 chunk check only runs after the full blob is
+    // in memory, so it is no defense here. `total ≤ MAX_FRAGMENTS` plus each
+    // fragment `≤ FRAGMENT_SIZE` bounds reassembly at MAX_REASSEMBLED_LEN even
+    // though the pipelined fetch can't abort mid-stream like the serial loop did.
     if total > MAX_FRAGMENTS {
         return Err(VeilidNetError::Send(format!(
             "sharer claims {total} fragments, over the {MAX_FRAGMENTS} cap (malicious?)"
         )));
     }
+    check_fragment_size(&frag0)?;
+    // Pipeline fragments 1..total (#109): `buffered` keeps up to
+    // FRAGMENT_FETCH_CONCURRENCY round-trips in flight AND yields them in request
+    // order, so reassembly stays a simple in-order concat. Polling happens within
+    // this one task (no spawn) → the `call` closure needs no Send/'static, so the
+    // in-process test transports keep working. A fragment that vanishes, oversteps
+    // its size cap, or fails its retry budget fails the whole fetch (`try_collect`).
+    let rest: Vec<Vec<u8>> = stream::iter(1..total)
+        .map(|i| async move {
+            let reply = call_fragment(call, encode_request(share_id, target, i)?).await?;
+            let (_t, frag) = decode_response(&reply)?
+                .ok_or_else(|| VeilidNetError::Send("fragment vanished mid-fetch".to_owned()))?;
+            check_fragment_size(&frag)?;
+            Ok::<Vec<u8>, VeilidNetError>(frag)
+        })
+        .buffered(FRAGMENT_FETCH_CONCURRENCY)
+        .try_collect()
+        .await?;
+
     let mut buf = frag0;
-    for i in 1..total {
-        if buf.len() > MAX_REASSEMBLED_LEN {
-            return Err(VeilidNetError::Send(
-                "reassembled share response exceeds the size cap (malicious?)".to_owned(),
-            ));
-        }
-        let reply = call_fragment(call, encode_request(share_id, target, i)?).await?;
-        let (_t, frag) = decode_response(&reply)?
-            .ok_or_else(|| VeilidNetError::Send("fragment vanished mid-fetch".to_owned()))?;
+    for frag in rest {
         buf.extend_from_slice(&frag);
     }
+    // Backstop the per-fragment cap: even within bounds the concat must not exceed
+    // the largest legitimate reassembled response.
     if buf.len() > MAX_REASSEMBLED_LEN {
         return Err(VeilidNetError::Send(
             "reassembled share response exceeds the size cap (malicious?)".to_owned(),
@@ -497,6 +541,100 @@ mod tests {
         let rk = room_key();
         let call = |_req: Vec<u8>| {
             let reply = encode_response_ok(MAX_FRAGMENTS + 1, &[0u8; 16]);
+            async move { Ok(reply) }
+        };
+        let err = fetch_manifest("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", &rk, &call)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, VeilidNetError::Send(_)));
+    }
+
+    /// #109 — fragments after fragment 0 are pulled CONCURRENTLY, and the
+    /// out-of-order completion still reassembles in request order. A real
+    /// multi-fragment chunk is served through an instrumented transport that
+    /// records the peak number of fragment `app_call`s in flight at once and
+    /// forces overlap with a small async delay. Pipelining is proven iff the
+    /// peak exceeds 1 (a serial fetcher could never exceed 1); correctness is
+    /// proven by the byte-for-byte recovery.
+    #[tokio::test]
+    async fn fragments_pipeline_concurrently_and_reassemble_in_order() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let _ = oxicrypt_module::initialize();
+        let dir = std::env::temp_dir().join(format!("ds-share-pipe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // One file well over FRAGMENT_SIZE but under the 1 MiB chunk size, so it
+        // is a single content chunk whose SEALED form spans ~20 fragments —
+        // comfortably more than FRAGMENT_FETCH_CONCURRENCY, so the window fills.
+        let payload = vec![0xCDu8; FRAGMENT_SIZE * 20 + 7];
+        std::fs::write(dir.join("blob.bin"), &payload).unwrap();
+
+        let content = Arc::new(ShareContent::index_dir(&dir).unwrap());
+        let rk = room_key();
+        let mut shares: HashMap<String, ServedShare> = HashMap::new();
+        let share_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned();
+        shares.insert(
+            share_id.clone(),
+            ServedShare::new(content.clone(), room_key()),
+        );
+        let shares = std::sync::Mutex::new(shares);
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let call = |req: Vec<u8>| {
+            // serve() is synchronous; run it up front (the lock is released before
+            // the future is awaited, so reassembly concurrency isn't serialized by
+            // the test's own mutex).
+            let reply = serve(&mut shares.lock().unwrap(), &req);
+            let in_flight = in_flight.clone();
+            let peak = peak.clone();
+            async move {
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                Ok(reply)
+            }
+        };
+
+        let manifest = fetch_manifest(&share_id, &rk, &call).await.unwrap();
+        assert_eq!(manifest[0].chunks.len(), 1, "600 KB < 1 MiB ⇒ one chunk");
+        peak.store(0, Ordering::SeqCst); // measure the chunk fetch, not the manifest
+
+        let data = fetch_chunk(&share_id, &manifest[0].chunks[0], &rk, &call)
+            .await
+            .unwrap();
+        assert_eq!(
+            data, payload,
+            "reassembled chunk is byte-for-byte the source"
+        );
+        let observed = peak.load(Ordering::SeqCst);
+        assert!(
+            observed > 1,
+            "fragments must overlap (peak in-flight {observed}, serial would be 1)"
+        );
+        assert!(
+            observed <= FRAGMENT_FETCH_CONCURRENCY,
+            "concurrency stays bounded by the window (peak {observed})"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A single oversized fragment (beyond [`FRAGMENT_SIZE`]) is rejected, holding
+    /// the reassembly memory bound now that the pipelined fetch can't abort
+    /// mid-stream on the running cumulative total.
+    #[tokio::test]
+    async fn oversized_fragment_is_rejected() {
+        let _ = oxicrypt_module::initialize();
+        let rk = room_key();
+        // total=2: fragment 0 ok-sized, fragment 1 one byte over the cap.
+        let call = |req: Vec<u8>| {
+            let (_sid, _t, frag) = decode_request(&req).unwrap();
+            let reply = if frag == 0 {
+                encode_response_ok(2, &[0u8; 16])
+            } else {
+                encode_response_ok(2, &vec![0u8; FRAGMENT_SIZE + 1])
+            };
             async move { Ok(reply) }
         };
         let err = fetch_manifest("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", &rk, &call)

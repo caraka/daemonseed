@@ -1051,6 +1051,7 @@ dependencies = [
  "daemonseed-core",
  "daemonseed-proto",
  "ed25519-dalek",
+ "futures-util",
  "oxicrypt-module",
  "thiserror 1.0.69",
  "tokio",
