@@ -41,6 +41,7 @@ work lives in the project lead's vault manifest, not here.
 - `daemonseed-cli`: `route_signer::IdentityRouteAdvertSigner` (feature `veilid`) — least-authority adapter wrapping the stable `SignKeypair` as the `RouteAdvertSigner` capability, keeping the identity key out of the transport crate.
 - `daemonseed-veilid-net`: `VeilidNetHandle::stop_serve` — the teeth of unpublish: de-registers a share from the serve registry and drops its advert, so the owner stops answering fetch `app_call`s for it (a withdraw announcement alone only removes it from listeners' catalogs).
 - `daemonseed-veilid-net`: `VeilidNetError::NotServed` — an authoritative "the peer no longer serves this share" (withdrawn or never offered), distinct from a transport error, so a downloader distinguishes a deliberate unpublish from a silent disconnect instead of guessing through timeouts; surfaced in the GUI fetch path as a plain "the sharer withdrew this share" notice.
+- `daemonseed-tui`: the same public-share publish / discover / fetch path on the Veilid transport behind the `veilid` feature (Phase 3 Slice 2b TUI mirror) — adapted to the TUI's `NetCommand`/`NetEvent` contract (`SharesSnapshot{local,remote,indexer_status}`, per-surface error events, `FetchedStore`-backed downloads), with the same invariants (ephemeral node id, stable-content identity, least-authority `RouteAdvertSigner`, `stop_serve` on unpublish, `NotServed`→withdrawn notice, anti-swap verify-before-import).
 
 ### Fixed
 

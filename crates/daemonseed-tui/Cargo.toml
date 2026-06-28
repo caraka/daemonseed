@@ -68,8 +68,11 @@ dirs = { workspace = true }
 [features]
 default = []
 # Veilid transport backend (#98). Off by default (relay path); when on, the net
-# actor selects `VeilidNetHandle` for circle traffic. Flips to default at v0.33.0.
-veilid = ["dep:daemonseed-veilid-net"]
+# actor selects `VeilidNetHandle` for circle + public-share traffic (Phase 3
+# Slice 2b). Also turns on `daemonseed-cli/veilid` so the least-authority
+# `IdentityRouteAdvertSigner` (the `Arc<dyn RouteAdvertSigner>` the share-publish
+# path hands veilid-net) is in scope. Flips to default at v0.33.0.
+veilid = ["dep:daemonseed-veilid-net", "daemonseed-cli/veilid"]
 
 [dev-dependencies]
 oxitls-rustls-provider = { workspace = true, features = ["testing"] }

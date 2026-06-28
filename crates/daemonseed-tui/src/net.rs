@@ -3289,7 +3289,11 @@ fn manifest_too_large_error(manifest: &ShareManifest) -> Option<String> {
 /// `FetchedStore::record_share`: reuse the share's existing folder on a
 /// re-fetch; otherwise derive a safe name from the listing name,
 /// collision-suffixed by share_id if another share already claimed it.
-fn resolve_share_folder(existing: &[FetchedShare], share_id: &str, name: &str) -> String {
+pub(crate) fn resolve_share_folder(
+    existing: &[FetchedShare],
+    share_id: &str,
+    name: &str,
+) -> String {
     if let Some(s) = existing.iter().find(|s| s.share_id == share_id) {
         return s.folder.clone();
     }
@@ -3330,7 +3334,7 @@ fn safe_folder_name(name: &str) -> String {
 /// join under the share folder (mirror of core's `fetched::sanitize_rel_path`,
 /// ISC-A-C32). `None` = unsafe — rejects empty, absolute, `.`/`..`, and any
 /// non-Normal component; the wire form is `/`-separated on every platform.
-fn sanitize_rel_path(rel: &str) -> Option<PathBuf> {
+pub(crate) fn sanitize_rel_path(rel: &str) -> Option<PathBuf> {
     use std::path::Component;
     if rel.is_empty() || rel.starts_with('/') {
         return None;
@@ -3357,7 +3361,7 @@ fn sanitize_rel_path(rel: &str) -> Option<PathBuf> {
 /// (`fetched` module docs): hex-encoded variable fields so a name or path can
 /// never collide with the space delimiter. Must stay parseable by core's
 /// `FetchedStore::list_shares` — pinned by the round-trip test below.
-fn render_downloads_idx(shares: &[FetchedShare]) -> String {
+pub(crate) fn render_downloads_idx(shares: &[FetchedShare]) -> String {
     let mut out = String::from("# daemonseed downloads manifest v2\n");
     for s in shares {
         out.push_str(&format!(
@@ -3394,7 +3398,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 /// folder. `remove_dir` refuses a non-empty dir, which is exactly the guard
 /// that keeps a pre-existing download's other files (and the downloads root)
 /// untouched. Errors are ignored: cleanup must never mask the fetch error.
-fn cleanup_written(
+pub(crate) fn cleanup_written(
     fetched_root: &std::path::Path,
     share_dir: &std::path::Path,
     written: &[PathBuf],
