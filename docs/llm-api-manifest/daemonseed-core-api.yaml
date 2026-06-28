@@ -810,8 +810,10 @@ modules:
 
   - name: daemonseed_core::share_announce
     description: >-
-      Share-announcement sealing. mint_share_id draws a 128-bit client-side
-      share_id (S21/A-S15). seal_public_announcement / seal_circle_announcement
+      Share-announcement sealing. mint_share_id draws a random 128-bit
+      client-side share_id (S21/A-S15); derive_share_id computes a deterministic
+      128-bit share_id from (sender_pubkey, root) so a republish re-asserts the
+      same id (same hex shape, 32 chars). seal_public_announcement / seal_circle_announcement
       self-sign a ShareAnnouncement (ML-DSA, C57) then AES-256-GCM-seal it under
       the public room key or a circle cot_key respectively (the typed key is the
       tier guard — wrong tier is a compile error); AAD = SHARE_ANNOUNCE_AAD,

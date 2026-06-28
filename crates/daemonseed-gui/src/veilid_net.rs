@@ -58,7 +58,7 @@ use daemonseed_core::public_room::{
     DEFAULT_ROOM, PublicRoomKey, derive_room_key, derive_room_veilid_owner_seed,
 };
 use daemonseed_core::share_announce::{
-    AnnouncementFields, mint_share_id, open_announcement, seal_public_announcement,
+    AnnouncementFields, derive_share_id, open_announcement, seal_public_announcement,
 };
 use daemonseed_core::share_catalog::{CatalogChange, ShareCatalog, ShareListing};
 use daemonseed_core::share_serve::ShareContent;
@@ -614,7 +614,12 @@ async fn publish_share(
     let file_count = content.file_count();
     let content = Arc::new(content);
 
-    let share_id = mint_share_id();
+    // Deterministic id (not a fresh mint): the same (identity, root) always yields
+    // the same share_id, so a republish on reconnect re-asserts the SAME id and a
+    // fetcher folds it onto the existing catalog entry — no duplicate / dead-route
+    // second copy (#112). The pubkey is already the announcement's provenance
+    // anchor, so this adds no linkability.
+    let share_id = derive_share_id(signing.public_key(), &root_str);
     let rating = String::new();
     let room_key = PublicRoomKey::from_bytes(room_key_bytes);
     let fields = AnnouncementFields {
@@ -1068,6 +1073,7 @@ fn apply_discovery(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use daemonseed_core::share_announce::mint_share_id;
     use daemonseed_veilid_net::route_provenance_input;
     use tokio::sync::mpsc::unbounded_channel;
 

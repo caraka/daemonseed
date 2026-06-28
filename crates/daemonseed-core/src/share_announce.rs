@@ -48,6 +48,7 @@
 use daemonseed_proto::v1 as wire;
 use oxicrypt_aes::{Aes256Key, ModeError, gcm_decrypt, gcm_encrypt};
 use oxicrypt_module::Error as OxicryptError;
+use oxicrypt_sha::sha384;
 use prost::Message;
 use zeroize::Zeroize;
 
@@ -78,6 +79,35 @@ pub fn mint_share_id() -> String {
     let mut buf = [0u8; 16];
     getrandom::fill(&mut buf).expect("OS CSPRNG entropy for share_id");
     buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Domain separation for [`derive_share_id`] — distinct from every other label
+/// the identity key material feeds, so the derivation can't collide with another
+/// protocol input.
+const SHARE_ID_DERIVE_DOMAIN: &[u8] = b"daemonseed/share-id/v1";
+
+/// Derive a DETERMINISTIC `share_id` for `root` under the publisher's stable
+/// identity public key `sender_pubkey`. Unlike [`mint_share_id`], the same
+/// (identity, root) always yields the same id, so a republish (e.g. on reconnect
+/// under a fresh ephemeral node) re-asserts the SAME id and a fetcher folds it
+/// onto its existing catalog entry instead of seeing a second, dead-route copy.
+/// Output shape matches `mint_share_id`: SHA-384 over a domain-separated,
+/// length-prefixed `(pubkey ‖ root)`, truncated to 128 bits, lowercase-hex
+/// (32 chars). This adds no linkability — the announcement already carries
+/// `sender_pubkey` as its provenance + verification anchor, so an observer can
+/// already tie the publisher to the share (Demonsaw lineage: a derived, stable
+/// share id). Panics only on an unrecoverable crypto-module failure, the same
+/// posture as `mint_share_id`'s entropy draw.
+pub fn derive_share_id(sender_pubkey: &[u8], root: &str) -> String {
+    let mut input =
+        Vec::with_capacity(SHARE_ID_DERIVE_DOMAIN.len() + 16 + sender_pubkey.len() + root.len());
+    input.extend_from_slice(SHARE_ID_DERIVE_DOMAIN);
+    input.extend_from_slice(&(sender_pubkey.len() as u64).to_be_bytes());
+    input.extend_from_slice(sender_pubkey);
+    input.extend_from_slice(&(root.len() as u64).to_be_bytes());
+    input.extend_from_slice(root.as_bytes());
+    let digest = sha384(&input).expect("crypto module for share_id derivation");
+    digest[..16].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// The plaintext fields of an announcement the caller supplies; the announcer
@@ -376,6 +406,27 @@ mod tests {
                 .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
         );
         assert_ne!(a, b);
+    }
+
+    /// A derived share_id is the same shape as a minted one, deterministic for a
+    /// given (identity, root), and varies with either input — so a republish
+    /// re-asserts the SAME id (no duplicate) while distinct shares stay distinct.
+    #[test]
+    fn derive_share_id_is_deterministic_and_shaped() {
+        let kp = announcer(7);
+        let pk = kp.public_key();
+        let a = derive_share_id(pk, "/srv/docs");
+        assert_eq!(a.len(), 32);
+        assert!(
+            a.bytes()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+        // Stable across calls (the property that kills the duplicate-share bug).
+        assert_eq!(a, derive_share_id(pk, "/srv/docs"));
+        // A different root → a different id.
+        assert_ne!(a, derive_share_id(pk, "/srv/other"));
+        // A different identity → a different id (no cross-publisher collision).
+        assert_ne!(a, derive_share_id(announcer(8).public_key(), "/srv/docs"));
     }
 
     /// Round-trip under the PUBLIC room key: seal, open, and the embedded
