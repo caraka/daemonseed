@@ -3054,7 +3054,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "oxicrypt-aes"
-version = "0.18.1"
+version = "0.19.0"
 dependencies = [
  "oxicrypt-module",
  "oxicrypt-zeroize",
@@ -3062,7 +3062,7 @@ dependencies = [
 
 [[package]]
 name = "oxicrypt-hmac"
-version = "0.18.1"
+version = "0.19.0"
 dependencies = [
  "oxicrypt-module",
  "oxicrypt-sha",
@@ -3072,7 +3072,7 @@ dependencies = [
 
 [[package]]
 name = "oxicrypt-kdf"
-version = "0.18.1"
+version = "0.19.0"
 dependencies = [
  "oxicrypt-hmac",
  "oxicrypt-module",
@@ -3083,7 +3083,7 @@ dependencies = [
 
 [[package]]
 name = "oxicrypt-ml-dsa"
-version = "0.18.1"
+version = "0.19.0"
 dependencies = [
  "oxicrypt-module",
  "oxicrypt-sha",
@@ -3093,7 +3093,7 @@ dependencies = [
 
 [[package]]
 name = "oxicrypt-ml-kem"
-version = "0.18.1"
+version = "0.19.0"
 dependencies = [
  "oxicrypt-module",
  "oxicrypt-sha",
@@ -3103,11 +3103,11 @@ dependencies = [
 
 [[package]]
 name = "oxicrypt-module"
-version = "0.18.1"
+version = "0.19.0"
 
 [[package]]
 name = "oxicrypt-sha"
-version = "0.18.1"
+version = "0.19.0"
 dependencies = [
  "oxicrypt-module",
  "oxicrypt-test-vectors",
@@ -3116,11 +3116,11 @@ dependencies = [
 
 [[package]]
 name = "oxicrypt-test-vectors"
-version = "0.18.1"
+version = "0.19.0"
 
 [[package]]
 name = "oxicrypt-xof"
-version = "0.18.1"
+version = "0.19.0"
 dependencies = [
  "oxicrypt-module",
  "oxicrypt-sha",
@@ -3129,7 +3129,7 @@ dependencies = [
 
 [[package]]
 name = "oxicrypt-zeroize"
-version = "0.18.1"
+version = "0.19.0"
 
 [[package]]
 name = "parking"

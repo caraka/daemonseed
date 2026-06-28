@@ -44,6 +44,14 @@ pub const FRAGMENT_SIZE: usize = 30 * 1024;
 const MAX_REASSEMBLED_LEN: usize = MANIFEST_FRAME_BUDGET + 64 * 1024;
 const MAX_FRAGMENTS: u32 = MAX_REASSEMBLED_LEN.div_ceil(FRAGMENT_SIZE) as u32;
 
+/// Per-fragment `app_call` retry budget. Veilid private routes are work-in-progress
+/// on stability: a single round-trip among a chunk's ~34 fragments can transiently
+/// time out, and without a retry one timeout fails the whole chunk (observed live —
+/// `chunk fetch failed: send failed: Timeout`). Retry a fragment a few times with a
+/// brief backoff before giving up.
+const FRAGMENT_RETRIES: u32 = 3;
+const FRAGMENT_RETRY_BACKOFF_MS: u64 = 250;
+
 /// A `share_id` is 128 bits hex-encoded — 32 ASCII chars (`mint_share_id`).
 const SHARE_ID_LEN: usize = 32;
 
@@ -281,12 +289,41 @@ where
 
 /// Pull every fragment of a target via `call` and concatenate into the full
 /// sealed blob. `total_fragments` comes from the first reply.
+/// One fragment `app_call`, retried on a transient transport error (e.g. Timeout)
+/// up to [`FRAGMENT_RETRIES`] times. A retryable error is any `call` Err — a
+/// not_found / withdraw is a SUCCESSFUL reply the caller decodes (`decode_response`
+/// → `None`), never an Err here, so retry can never mask an authoritative negative.
+async fn call_fragment<F, Fut>(call: &F, request: Vec<u8>) -> Result<Vec<u8>>
+where
+    F: Fn(Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>>>,
+{
+    let mut last: Option<VeilidNetError> = None;
+    for attempt in 0..=FRAGMENT_RETRIES {
+        match call(request.clone()).await {
+            Ok(reply) => return Ok(reply),
+            Err(e) => {
+                crate::vtrace!(
+                    "fetch fragment app_call attempt {} failed: {e}",
+                    attempt + 1
+                );
+                last = Some(e);
+                if attempt < FRAGMENT_RETRIES {
+                    tokio::time::sleep(std::time::Duration::from_millis(FRAGMENT_RETRY_BACKOFF_MS))
+                        .await;
+                }
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| VeilidNetError::Send("fragment fetch failed".to_owned())))
+}
+
 async fn fetch_sealed<F, Fut>(share_id: &str, target: &FetchTarget, call: &F) -> Result<Vec<u8>>
 where
     F: Fn(Vec<u8>) -> Fut,
     Fut: std::future::Future<Output = Result<Vec<u8>>>,
 {
-    let first = call(encode_request(share_id, target, 0)?).await?;
+    let first = call_fragment(call, encode_request(share_id, target, 0)?).await?;
     // A decoded not_found means the owner ANSWERED — the share is withdrawn or was
     // never offered, NOT offline (an offline owner errors `call` above, surfacing as
     // a transport error). This authoritative negative lets the client distinguish a
@@ -308,7 +345,7 @@ where
                 "reassembled share response exceeds the size cap (malicious?)".to_owned(),
             ));
         }
-        let reply = call(encode_request(share_id, target, i)?).await?;
+        let reply = call_fragment(call, encode_request(share_id, target, i)?).await?;
         let (_t, frag) = decode_response(&reply)?
             .ok_or_else(|| VeilidNetError::Send("fragment vanished mid-fetch".to_owned()))?;
         buf.extend_from_slice(&frag);
@@ -419,6 +456,37 @@ mod tests {
         // The peer answered not_found → the authoritative NotServed (withdrawn /
         // never offered), distinct from a transport error (offline / slow).
         assert!(matches!(err, VeilidNetError::NotServed));
+    }
+
+    #[tokio::test]
+    async fn call_fragment_retries_a_transient_error_then_succeeds() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let attempts = AtomicU32::new(0);
+        // Times out on the first two attempts, then succeeds — a flaky private-route
+        // round-trip that recovers within the retry budget (the live Timeout case).
+        let call = |_req: Vec<u8>| {
+            let n = attempts.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if n < 2 {
+                    Err(VeilidNetError::Send("Timeout".to_owned()))
+                } else {
+                    Ok(vec![9, 9, 9])
+                }
+            }
+        };
+        let reply = call_fragment(&call, vec![0]).await.unwrap();
+        assert_eq!(reply, vec![9, 9, 9]);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3, "2 timeouts + 1 success");
+    }
+
+    #[tokio::test]
+    async fn call_fragment_gives_up_after_the_retry_budget() {
+        let call =
+            |_req: Vec<u8>| async { Err::<Vec<u8>, _>(VeilidNetError::Send("Timeout".to_owned())) };
+        assert!(matches!(
+            call_fragment(&call, vec![0]).await.unwrap_err(),
+            VeilidNetError::Send(_)
+        ));
     }
 
     /// A malicious sharer claiming more fragments than any legitimate response
