@@ -758,7 +758,7 @@ fn fetch_error_message(context: &str, e: VeilidNetError) -> String {
 /// No bytes are fetched. The route is anti-swap-verified at discovery time, before
 /// it ever enters `shares.discovered`.
 async fn fetch_share(
-    shares: &ShareState,
+    shares: &mut ShareState,
     evt_tx: &UnboundedSender<NetEvent>,
     net: &Option<VeilidNetHandle>,
     share_id: &str,
@@ -770,16 +770,25 @@ async fn fetch_share(
     let Some(handle) = net.as_ref() else {
         return fail("not connected to Veilid yet".to_owned());
     };
-    let Some(lobby) = shares.lobby.as_ref() else {
-        return fail("lobby not subscribed yet".to_owned());
+    // Copy the route + room key out, dropping the immutable borrow so a fetch
+    // failure can prune (&mut) below.
+    let (route_blob, room_key_bytes) = {
+        let Some(lobby) = shares.lobby.as_ref() else {
+            return fail("lobby not subscribed yet".to_owned());
+        };
+        let Some(disc) = shares.discovered.get(share_id) else {
+            return fail("share not discovered yet — refresh the list".to_owned());
+        };
+        (disc.route_blob.clone(), *lobby.room_key.as_bytes())
     };
-    let Some(disc) = shares.discovered.get(share_id) else {
-        return fail("share not discovered yet — refresh the list".to_owned());
-    };
-    let room_key_bytes = *lobby.room_key.as_bytes();
-    let route = match handle.import_route(disc.route_blob.clone()).await {
+    let route = match handle.import_route(route_blob).await {
         Ok(r) => r,
-        Err(e) => return fail(format!("could not import the sharer's route: {e}")),
+        Err(e) => {
+            // The advertised route won't import (the sharer/route is gone): prune
+            // the stale entry so the dead copy disappears (ISC-S30, #112).
+            prune_unreachable_share(shares, evt_tx, share_id);
+            return fail(format!("could not import the sharer's route: {e}"));
+        }
     };
     match handle.fetch_manifest(route, share_id, room_key_bytes).await {
         Ok(manifest) => {
@@ -797,7 +806,33 @@ async fn fetch_share(
                 entries,
             });
         }
-        Err(e) => fail(fetch_error_message("could not fetch the share manifest", e)),
+        Err(e) => {
+            prune_unreachable_share(shares, evt_tx, share_id);
+            fail(fetch_error_message("could not fetch the share manifest", e));
+        }
+    }
+}
+
+/// Prune a share that failed to fetch — a dead/un-importable route or an
+/// authoritative withdraw means the catalog entry is stale (ISC-S30
+/// prune-on-fetch-fail). Drops it from the discovered-route map + the catalog and
+/// refreshes the listing; a still-live share re-announces and reappears. This
+/// self-heals the stale duplicate (#112): a copy whose route points at a gone node
+/// disappears when its fetch fails, instead of lingering until its TTL.
+fn prune_unreachable_share(
+    shares: &mut ShareState,
+    evt_tx: &UnboundedSender<NetEvent>,
+    share_id: &str,
+) {
+    let removed_route = shares.discovered.remove(share_id).is_some();
+    let removed_cat = shares.catalog.remove(share_id);
+    if removed_route || removed_cat {
+        daemonseed_veilid_net::vtrace!(
+            "pruned unreachable share {share_id} after fetch fail (prune-on-fetch-fail)"
+        );
+        let _ = evt_tx.send(NetEvent::SharesSnapshot {
+            shares: shares.listings(),
+        });
     }
 }
 
@@ -807,7 +842,7 @@ async fn fetch_share(
 /// Mirrors the relay actor's `handle_confirm_fetch`.
 #[allow(clippy::too_many_arguments)]
 async fn confirm_fetch(
-    shares: &ShareState,
+    shares: &mut ShareState,
     evt_tx: &UnboundedSender<NetEvent>,
     net: &Option<VeilidNetHandle>,
     share_id: &str,
@@ -839,7 +874,7 @@ async fn confirm_fetch(
 
 #[allow(clippy::too_many_arguments)]
 async fn confirm_fetch_inner(
-    shares: &ShareState,
+    shares: &mut ShareState,
     evt_tx: &UnboundedSender<NetEvent>,
     net: &Option<VeilidNetHandle>,
     share_id: &str,
@@ -852,23 +887,36 @@ async fn confirm_fetch_inner(
     let handle = net
         .as_ref()
         .ok_or_else(|| "not connected to Veilid yet".to_owned())?;
-    let lobby = shares
-        .lobby
-        .as_ref()
-        .ok_or_else(|| "lobby not subscribed yet".to_owned())?;
-    let disc = shares
-        .discovered
-        .get(share_id)
-        .ok_or_else(|| "share not discovered yet — refresh the list".to_owned())?;
-    let room_key_bytes = *lobby.room_key.as_bytes();
-    let route = handle
-        .import_route(disc.route_blob.clone())
-        .await
-        .map_err(|e| format!("could not import the sharer's route: {e}"))?;
-    let manifest = handle
+    // Copy the route + room key out, dropping the immutable borrow so a fetch-stage
+    // failure can prune the stale entry (&mut) below (ISC-S30 prune-on-fetch-fail).
+    let (route_blob, room_key_bytes) = {
+        let lobby = shares
+            .lobby
+            .as_ref()
+            .ok_or_else(|| "lobby not subscribed yet".to_owned())?;
+        let disc = shares
+            .discovered
+            .get(share_id)
+            .ok_or_else(|| "share not discovered yet — refresh the list".to_owned())?;
+        (disc.route_blob.clone(), *lobby.room_key.as_bytes())
+    };
+    let route = match handle.import_route(route_blob).await {
+        Ok(r) => r,
+        Err(e) => {
+            prune_unreachable_share(shares, evt_tx, share_id);
+            return Err(format!("could not import the sharer's route: {e}"));
+        }
+    };
+    let manifest = match handle
         .fetch_manifest(route.clone(), share_id, room_key_bytes)
         .await
-        .map_err(|e| fetch_error_message("could not fetch the share manifest", e))?;
+    {
+        Ok(m) => m,
+        Err(e) => {
+            prune_unreachable_share(shares, evt_tx, share_id);
+            return Err(fetch_error_message("could not fetch the share manifest", e));
+        }
+    };
 
     // Resolve the selected file set (None → all; out-of-range indices ignored).
     let indices: Vec<usize> = match &selected {
@@ -921,10 +969,16 @@ async fn confirm_fetch_inner(
         for addr in &entry.chunks {
             // `fetch_chunk` reassembles fragments and SHA-384-verifies the chunk
             // against its address before returning (ISC-S28 / ISC-A-S20).
-            let data = handle
+            let data = match handle
                 .fetch_chunk(route.clone(), share_id, *addr, room_key_bytes)
                 .await
-                .map_err(|e| fetch_error_message("chunk fetch failed", e))?;
+            {
+                Ok(d) => d,
+                Err(e) => {
+                    prune_unreachable_share(shares, evt_tx, share_id);
+                    return Err(fetch_error_message("chunk fetch failed", e));
+                }
+            };
             chunks_received += 1;
             bytes_received += data.len() as u64;
             file_bytes.extend_from_slice(&data);
@@ -1170,6 +1224,42 @@ mod tests {
         assert!(
             matches!(evt_rx.try_recv(), Ok(NetEvent::SharesSnapshot { shares }) if shares.len() == 1),
             "a SharesSnapshot listing the share is emitted"
+        );
+    }
+
+    #[test]
+    fn prune_unreachable_share_drops_a_folded_item_and_snapshots() {
+        let signer = announcer(13);
+        let mut shares = ShareState::new();
+        let room_key = derive_room_key(DEFAULT_ROOM, &CNSA_2_0).unwrap();
+        shares.lobby = Some(lobby());
+
+        let share_id = mint_share_id();
+        let blob = vec![0xCD; 96];
+        let bytes = discovery_bytes(&room_key, &signer, &share_id, &blob, &blob);
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        assert!(apply_discovery(&mut shares, &evt_tx, &bytes));
+        assert_eq!(shares.catalog.len(), 1);
+        let _ = evt_rx.try_recv(); // drain the fold snapshot
+
+        // A failed fetch prunes the share from BOTH the catalog and the
+        // discovered-route map, and snapshots the now-shorter listing.
+        prune_unreachable_share(&mut shares, &evt_tx, &share_id);
+        assert_eq!(shares.catalog.len(), 0, "pruned from the catalog");
+        assert!(
+            !shares.discovered.contains_key(&share_id),
+            "pruned from the discovered-route map"
+        );
+        assert!(
+            matches!(evt_rx.try_recv(), Ok(NetEvent::SharesSnapshot { shares }) if shares.is_empty()),
+            "an empty SharesSnapshot is emitted after the prune"
+        );
+
+        // Pruning an unknown id is a no-op — no snapshot.
+        prune_unreachable_share(&mut shares, &evt_tx, "deadbeef");
+        assert!(
+            evt_rx.try_recv().is_err(),
+            "a no-op prune emits no snapshot"
         );
     }
 
