@@ -97,4 +97,7 @@ default = []
 desktop = ["slint/backend-winit", "dep:i-slint-backend-winit"]
 # Veilid transport backend (#98). Off by default (relay path); when on, the net
 # actor selects `VeilidNetHandle` for circle traffic. Flips to default at v0.33.0.
-veilid = ["dep:daemonseed-veilid-net"]
+# Also turns on `daemonseed-cli/veilid` so the least-authority
+# `IdentityRouteAdvertSigner` route-advert capability is in scope for the
+# public-share publish path (Phase 3 Slice 2b).
+veilid = ["dep:daemonseed-veilid-net", "daemonseed-cli/veilid"]

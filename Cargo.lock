@@ -1721,6 +1721,7 @@ dependencies = [
  "daemonseed-core",
  "daemonseed-proto",
  "daemonseed-server",
+ "daemonseed-veilid-net",
  "hyper-util",
  "oxicrypt-module",
  "oxitls-rustls-provider",

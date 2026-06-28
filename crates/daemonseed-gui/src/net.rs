@@ -2662,7 +2662,7 @@ impl Actor {
 /// directories we must never recursively hash for a share. A picker that returns the
 /// default dir (some xdg portals do) would otherwise index all of `$HOME` and hang.
 /// Canonicalizes both sides; falls back to the raw path if that fails.
-fn is_unsafe_publish_root(root: &std::path::Path) -> bool {
+pub(crate) fn is_unsafe_publish_root(root: &std::path::Path) -> bool {
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     if root.parent().is_none() {
         return true; // filesystem root "/"
@@ -2718,7 +2718,7 @@ async fn fail_fetch(actor: &Actor, written: &[PathBuf], message: String) {
 
 /// Map a wire `/`-separated rel_path to a safe relative path under the fetch root,
 /// or `None` if it escapes (absolute, `.`/`..`, backslash, or empty). ISC-A-C32.
-fn sanitize_rel_path(rel: &str) -> Option<PathBuf> {
+pub(crate) fn sanitize_rel_path(rel: &str) -> Option<PathBuf> {
     if rel.is_empty() {
         return None;
     }
@@ -2735,7 +2735,7 @@ fn sanitize_rel_path(rel: &str) -> Option<PathBuf> {
 /// A safe single-component folder name derived from a share's display name: path
 /// separators and control chars become `_`, leading/trailing dots+space trimmed,
 /// empty falls back to `share`.
-fn safe_folder_name(name: &str) -> String {
+pub(crate) fn safe_folder_name(name: &str) -> String {
     let cleaned: String = name
         .chars()
         .map(|c| {

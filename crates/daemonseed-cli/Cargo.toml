@@ -16,6 +16,11 @@ daemonseed-proto = { path = "../daemonseed-proto" }
 daemonseed-server = { path = "../daemonseed-server" }
 prost = { workspace = true }
 
+# Veilid transport (optional) — compiled only under the `veilid` feature, which
+# gui/tui enable via `daemonseed-cli/veilid`. Off by default, so the relay/server
+# build never compiles it. Home of the least-authority RouteAdvertSigner adapter.
+daemonseed-veilid-net = { path = "../daemonseed-veilid-net", optional = true }
+
 # oxicrypt + oxitls — the CLI installs the same process-wide
 # CryptoProvider as the server so a single binary can act as
 # either side without re-installing.
@@ -45,6 +50,11 @@ hyper-util = "=0.1.20"
 
 # Argument parsing.
 clap = { workspace = true }
+
+[features]
+# Veilid transport path — pulls in daemonseed-veilid-net (the RouteAdvertSigner
+# adapter). Off by default so the relay/server build is byte-unchanged.
+veilid = ["dep:daemonseed-veilid-net"]
 
 [dev-dependencies]
 oxitls-rustls-provider = { workspace = true, features = ["testing"] }

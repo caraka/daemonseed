@@ -94,6 +94,13 @@ enum Command {
         signer: Arc<dyn discovery::RouteAdvertSigner>,
         reply: oneshot::Sender<Result<()>>,
     },
+    /// Stop serving a share and drop its advert (the teeth of unpublish): removes
+    /// it from the serve registry so inbound fetch `app_call`s for it are no longer
+    /// answered, and from the advert set so a `RouteChanged` never re-publishes it.
+    StopServe {
+        share_id: String,
+        reply: oneshot::Sender<Result<()>>,
+    },
     /// A private route died/rotated (from the update pump). Re-publish every active
     /// share advert with a fresh route + signature so discovery never points at a
     /// dead route. Coalesced against bursts; fire-and-forget.
@@ -316,6 +323,16 @@ impl VeilidNetHandle {
             reply,
         })
         .await?
+    }
+
+    /// Stop serving a previously [`Self::serve_share`]d share and drop its advert.
+    /// The teeth of unpublish: after this the owner no longer answers fetch
+    /// `app_call`s for `share_id` (a holder of a stale route gets nothing), and a
+    /// `RouteChanged` will not re-publish its advert. Pair with a withdraw
+    /// announcement, which removes the share from listeners' discovery catalogs.
+    pub async fn stop_serve(&self, share_id: String) -> Result<()> {
+        self.send(|reply| Command::StopServe { share_id, reply })
+            .await?
     }
 
     /// Member-plane presence heartbeat over a room/circle record. **Phase 4.**
@@ -543,6 +560,16 @@ async fn actor_loop(
                     share_adverts.insert(share_id, advert);
                 }
                 let _ = reply.send(res);
+            }
+            Command::StopServe { share_id, reply } => {
+                // De-register from BOTH the serve registry (inbound fetch
+                // app_calls for it are no longer answered) and the advert set (a
+                // RouteChanged will not re-publish a dead advert). The route blob
+                // still routes to this node until released, but the share is
+                // unserved — a holder of a stale route gets a not-found, never bytes.
+                shares.remove(&share_id);
+                share_adverts.remove(&share_id);
+                let _ = reply.send(Ok(()));
             }
             Command::RouteMaintenance => {
                 let now = tokio::time::Instant::now();

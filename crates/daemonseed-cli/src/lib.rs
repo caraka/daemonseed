@@ -39,5 +39,8 @@
 pub mod connect;
 pub mod identity_proof;
 pub mod public_space;
+/// Veilid-transport route-advert signing capability (feature `veilid`).
+#[cfg(feature = "veilid")]
+pub mod route_signer;
 pub mod session;
 pub mod tofu_stub;

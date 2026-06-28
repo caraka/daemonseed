@@ -287,8 +287,11 @@ where
     Fut: std::future::Future<Output = Result<Vec<u8>>>,
 {
     let first = call(encode_request(share_id, target, 0)?).await?;
-    let (total, frag0) = decode_response(&first)?
-        .ok_or_else(|| VeilidNetError::Send("share/chunk not served (offline?)".to_owned()))?;
+    // A decoded not_found means the owner ANSWERED — the share is withdrawn or was
+    // never offered, NOT offline (an offline owner errors `call` above, surfacing as
+    // a transport error). This authoritative negative lets the client distinguish a
+    // deliberate withdraw from a silent disconnect.
+    let (total, frag0) = decode_response(&first)?.ok_or(VeilidNetError::NotServed)?;
     // The sharer is untrusted (any public announcer): a malicious `total` would
     // drive a ~4-billion-`app_call` loop, and oversize fragments would grow `buf`
     // without bound. Cap both before reassembling — the SHA-384 chunk check only
@@ -413,7 +416,9 @@ mod tests {
         let err = fetch_manifest("ffffffffffffffffffffffffffffffff", &rk, &call)
             .await
             .unwrap_err();
-        assert!(matches!(err, VeilidNetError::Send(_)));
+        // The peer answered not_found → the authoritative NotServed (withdrawn /
+        // never offered), distinct from a transport error (offline / slow).
+        assert!(matches!(err, VeilidNetError::NotServed));
     }
 
     /// A malicious sharer claiming more fragments than any legitimate response
