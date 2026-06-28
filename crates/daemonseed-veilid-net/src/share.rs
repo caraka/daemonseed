@@ -20,7 +20,7 @@
 //! each answer once and caches it ([`ServedShare`]), slicing fragments from the
 //! cached blob; the fetcher reassembles all fragments before opening.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use futures_util::stream::{self, StreamExt, TryStreamExt};
@@ -197,13 +197,25 @@ pub fn decode_response(bytes: &[u8]) -> Result<Option<(u32, Vec<u8>)>> {
 
 // ── Serve side ───────────────────────────────────────────────────────────────
 
+/// Max distinct per-target sealed responses cached per share. Each entry is at
+/// most a `MANIFEST_FRAME_BUDGET`/1-MiB-chunk sealed blob, so a large share's many
+/// chunks could otherwise grow the cache to the whole share. A fetcher (with #109
+/// fragment pipelining) holds ONE target's fragments in flight at a time, so this
+/// covers many concurrent fetchers before any mid-fetch eviction; an eviction
+/// beyond capacity is fail-closed (a re-seal under a fresh nonce makes the
+/// fetcher's mixed-seal reassembly fail its AEAD open — it errors, never accepts
+/// bytes), not corruption.
+const SEAL_CACHE_CAPACITY: usize = 16;
+
 /// A share registered for serving: its indexed content + the public room key it
-/// seals responses under, plus a per-target sealed-response cache so every
-/// fragment of one response comes from the SAME seal (AEAD nonce consistency).
+/// seals responses under, plus a bounded-LRU per-target sealed-response cache so
+/// every fragment of one response comes from the SAME seal (AEAD nonce consistency).
 pub struct ServedShare {
     content: Arc<ShareContent>,
     room_key: PublicRoomKey,
     cache: HashMap<String, Vec<u8>>,
+    /// LRU recency, oldest at the front — bounds `cache` to [`SEAL_CACHE_CAPACITY`].
+    lru: VecDeque<String>,
 }
 
 impl ServedShare {
@@ -212,21 +224,48 @@ impl ServedShare {
             content,
             room_key,
             cache: HashMap::new(),
+            lru: VecDeque::new(),
         }
+    }
+
+    /// Mark `key` most-recently-used (move it to the back of the recency ring).
+    fn touch(&mut self, key: &str) {
+        if let Some(pos) = self.lru.iter().position(|k| k == key) {
+            if let Some(k) = self.lru.remove(pos) {
+                self.lru.push_back(k);
+            }
+        }
+    }
+
+    /// Insert a freshly-sealed blob as most-recently-used, evicting the
+    /// least-recently-used entries first to hold the cache at capacity.
+    fn insert_cached(&mut self, key: String, sealed: Vec<u8>) {
+        while self.cache.len() >= SEAL_CACHE_CAPACITY {
+            match self.lru.pop_front() {
+                Some(old) => {
+                    self.cache.remove(&old);
+                }
+                None => break,
+            }
+        }
+        self.lru.push_back(key.clone());
+        self.cache.insert(key, sealed);
     }
 
     /// Build the reply bytes for one fragment request: seal the answer once
     /// (cached), then slice fragment `fragment` out of the cached sealed blob.
     pub fn answer_fragment(&mut self, target: &FetchTarget, fragment: u32) -> Vec<u8> {
         let key = target.cache_key();
-        if !self.cache.contains_key(&key) {
+        if self.cache.contains_key(&key) {
+            self.touch(&key);
+        } else {
             let Some(resp) = self.content.answer(&target.share_frame()) else {
                 return encode_response_not_found();
             };
             let Ok(sealed) = seal_public_share_frame(&self.room_key, &resp) else {
                 return encode_response_not_found();
             };
-            self.cache.insert(key.clone(), sealed);
+            self.insert_cached(key.clone(), sealed);
         }
         let sealed = &self.cache[&key];
         let total = sealed.len().div_ceil(FRAGMENT_SIZE).max(1) as u32;
@@ -641,5 +680,39 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, VeilidNetError::Send(_)));
+    }
+
+    /// The serve-side seal cache is LRU-bounded: more distinct targets than
+    /// capacity evicts the least-recently-used, never growing past the cap, and a
+    /// touched (recently-used) entry survives further inserts.
+    #[test]
+    fn seal_cache_is_lru_bounded() {
+        let _ = oxicrypt_module::initialize();
+        let dir = std::env::temp_dir().join(format!("ds-share-lru-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f.bin"), [0u8; 8]).unwrap();
+        let content = Arc::new(ShareContent::index_dir(&dir).unwrap());
+        let mut s = ServedShare::new(content, room_key());
+
+        for i in 0..(SEAL_CACHE_CAPACITY + 5) {
+            s.insert_cached(format!("k{i}"), vec![0u8; 8]);
+        }
+        assert_eq!(s.cache.len(), SEAL_CACHE_CAPACITY, "cache held at capacity");
+        assert_eq!(s.lru.len(), s.cache.len(), "recency ring tracks the cache");
+        assert!(!s.cache.contains_key("k0"), "oldest evicted");
+        let newest = format!("k{}", SEAL_CACHE_CAPACITY + 4);
+        assert!(s.cache.contains_key(&newest), "newest retained");
+
+        // Touch the current LRU entry → it becomes MRU and survives the next insert.
+        let oldest_kept = s.lru.front().unwrap().clone();
+        s.touch(&oldest_kept);
+        s.insert_cached("knew".into(), vec![0u8; 8]);
+        assert!(
+            s.cache.contains_key(&oldest_kept),
+            "a touched entry is not the next evicted"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

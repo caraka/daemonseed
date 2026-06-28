@@ -49,6 +49,10 @@ work lives in the project lead's vault manifest, not here.
 
 ### Fixed
 
+- `daemonseed-veilid-net`: the share-advert refresh no longer leaks private routes — each `RouteChanged` re-allocation releases the share's previous `RouteId` (`release_private_route`) instead of accumulating dead routes under churn.
+- `daemonseed-veilid-net`: the `RouteChanged` advert refresh runs off the actor loop (spawned, coalesced by an in-flight guard, the interval stamped from completion) so re-allocating a route per advert no longer head-of-line-blocks inbound serve `app_call`s and outbound fetches; the append-ring cursor is shared behind a mutex so off-loop and on-loop writes don't collide.
+- `daemonseed-veilid-net`: an inbound serve `app_call` is no longer silently dropped when the command channel is momentarily full — it falls back to a spawned awaited send so the fetcher doesn't time out on that fragment.
+- `daemonseed-veilid-net`: the served-share seal cache is LRU-bounded (`SEAL_CACHE_CAPACITY`) so a large share's many chunks can't grow it without limit; an eviction beyond capacity is fail-closed (a re-seal makes the fetcher's mixed-seal reassembly fail its AEAD open, never accepting bytes).
 - `daemonseed-gui` Veilid mode: persisted shares are re-published on connect — the Veilid path dropped `republish_roots`, so a restored share was neither re-served nor re-announced after a reconnect/restart; it now re-serves under a fresh route and re-announces on the lobby, relay-parity with the #102 circle rejoin (#108).
 - `daemonseed-gui` Veilid mode: the sender's own circle message echoes immediately — the local echo is emitted before the DHT publish (which now runs off-task) instead of after the round-trip (#101).
 - `daemonseed-gui` Veilid mode: persisted circles are re-subscribed on connect via `rejoin_circles`, so a restored circle pane is joined on the transport rather than failing the next send with "join the circle before sending" (#102).

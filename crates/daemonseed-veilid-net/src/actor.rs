@@ -4,7 +4,8 @@
 //! separate stream the app/UI consumes.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
@@ -368,10 +369,21 @@ impl VeilidNet {
                 // them to the actor, which holds the VeilidAPI + the served-share
                 // registry and answers via app_call_reply.
                 VeilidUpdate::AppCall(call) => {
-                    let _ = cmd_tx_cb.try_send(Command::InboundAppCall {
+                    let cmd = Command::InboundAppCall {
                         call_id: call.id(),
                         message: call.message().to_vec(),
-                    });
+                    };
+                    // Don't silently drop a serve request when the command channel
+                    // is momentarily full (a dropped inbound app_call = the fetcher
+                    // times out on that fragment). Fast-path the non-contended case
+                    // with try_send; on Full, queue it on a spawned awaited send so
+                    // it is delivered once a slot frees. On Closed the actor is gone.
+                    if let Err(mpsc::error::TrySendError::Full(cmd)) = cmd_tx_cb.try_send(cmd) {
+                        let tx = cmd_tx_cb.clone();
+                        tokio::spawn(async move {
+                            let _ = tx.send(cmd).await;
+                        });
+                    }
                 }
                 // A private route died/rotated: drive an advert refresh in the
                 // actor (which holds the signer + advert set) AND surface the event.
@@ -454,16 +466,27 @@ async fn actor_loop(
     ev_tx: mpsc::UnboundedSender<VeilidNetEvent>,
     node_pub: [u8; 32],
 ) {
-    // Per-rendezvous local write cursor: which ring slot this node writes next
-    // (keyed by record, so circles and rooms share the same map).
-    let mut ring_seq: HashMap<RecordKey, u32> = HashMap::new();
+    // Per-rendezvous append-ring write cursor: which ring slot this node writes
+    // next (keyed by record, so circles and rooms share the same map). Behind an
+    // Arc<Mutex> so a spawned advert refresh (RouteMaintenance) advances the SAME
+    // cursors as the main loop — else a refresh writing to the lobby record could
+    // collide with a concurrent room-message write. Locked only for the sync bump.
+    let ring_seq: Arc<Mutex<HashMap<RecordKey, u32>>> = Arc::new(Mutex::new(HashMap::new()));
     // Shares this node serves owner-on-demand (Phase 3), keyed by share_id.
     let mut shares: HashMap<String, share::ServedShare> = HashMap::new();
     // Active share adverts (Phase 3 discovery), keyed by share_id, so a
     // RouteChanged can re-allocate + re-sign + re-publish each one.
     let mut share_adverts: HashMap<String, AdvertState> = HashMap::new();
-    // Coalesce RouteChanged bursts into at most one advert refresh per interval.
-    let mut last_advert_refresh: Option<tokio::time::Instant> = None;
+    // The CURRENT private RouteId per advertised share, so a re-publish releases
+    // the previous route instead of leaking it under route churn. Shared so the
+    // spawned refresh releases through the same map as the main loop.
+    let advert_routes: Arc<Mutex<HashMap<String, RouteId>>> = Arc::new(Mutex::new(HashMap::new()));
+    // Coalesce RouteChanged bursts: at most one refresh in flight at a time, and
+    // the next no sooner than ADVERT_REFRESH_MIN_INTERVAL after the last one
+    // COMPLETED. Both are shared with the spawned refresh, which stamps the
+    // completion time and clears the in-flight flag when it finishes.
+    let refresh_in_flight = Arc::new(AtomicBool::new(false));
+    let last_advert_refresh: Arc<Mutex<Option<tokio::time::Instant>>> = Arc::new(Mutex::new(None));
 
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
@@ -499,8 +522,7 @@ async fn actor_loop(
                 reply,
             } => {
                 let _ = reply.send(
-                    publish_rendezvous(&api, &rc, &node_pub, &mut ring_seq, owner_seed, sealed)
-                        .await,
+                    publish_rendezvous(&api, &rc, &node_pub, &ring_seq, owner_seed, sealed).await,
                 );
             }
             Command::SubscribeRendezvous { owner_seed, reply } => {
@@ -553,9 +575,16 @@ async fn actor_loop(
                     sealed_announcement,
                     signer,
                 };
-                let res =
-                    publish_one_advert(&api, &rc, &node_pub, &mut ring_seq, &share_id, &advert)
-                        .await;
+                let res = publish_one_advert(
+                    &api,
+                    &rc,
+                    &node_pub,
+                    &ring_seq,
+                    &advert_routes,
+                    &share_id,
+                    &advert,
+                )
+                .await;
                 if res.is_ok() {
                     share_adverts.insert(share_id, advert);
                 }
@@ -569,16 +598,46 @@ async fn actor_loop(
                 // unserved — a holder of a stale route gets a not-found, never bytes.
                 shares.remove(&share_id);
                 share_adverts.remove(&share_id);
+                // Release this share's current private route (route-leak fix): once
+                // unpublished it serves nothing, so the route is dead weight.
+                if let Some(route_id) = advert_routes.lock().unwrap().remove(&share_id) {
+                    if let Err(e) = api.release_private_route(route_id) {
+                        crate::vtrace!("stop_serve: release route for {share_id} failed ({e})");
+                    }
+                }
                 let _ = reply.send(Ok(()));
             }
             Command::RouteMaintenance => {
-                let now = tokio::time::Instant::now();
-                let due = last_advert_refresh
-                    .is_none_or(|t| now.duration_since(t) >= ADVERT_REFRESH_MIN_INTERVAL);
-                if due && !share_adverts.is_empty() {
-                    last_advert_refresh = Some(now);
-                    refresh_share_adverts(&api, &rc, &node_pub, &mut ring_seq, &share_adverts)
+                // Coalesce: skip if a refresh is in flight or the last one completed
+                // within the interval. Re-allocating a route per advert is slow, so
+                // the refresh is SPAWNED — running it inline would block serving
+                // (inbound app_calls) and fetching for the whole wave (head-of-line).
+                let last = *last_advert_refresh.lock().unwrap();
+                if refresh_due(last, !share_adverts.is_empty(), ADVERT_REFRESH_MIN_INTERVAL)
+                    && !refresh_in_flight.swap(true, Ordering::SeqCst)
+                {
+                    let api = api.clone();
+                    let rc = rc.clone();
+                    let ring_seq = ring_seq.clone();
+                    let advert_routes = advert_routes.clone();
+                    let adverts = share_adverts.clone();
+                    let in_flight = refresh_in_flight.clone();
+                    let last_refresh = last_advert_refresh.clone();
+                    tokio::spawn(async move {
+                        refresh_share_adverts(
+                            &api,
+                            &rc,
+                            &node_pub,
+                            &ring_seq,
+                            &advert_routes,
+                            &adverts,
+                        )
                         .await;
+                        // Stamp the coalesce window from COMPLETION, then release the
+                        // in-flight guard so the next RouteChange can schedule again.
+                        *last_refresh.lock().unwrap() = Some(tokio::time::Instant::now());
+                        in_flight.store(false, Ordering::SeqCst);
+                    });
                 }
             }
             Command::Shutdown { reply } => {
@@ -599,7 +658,7 @@ async fn publish_rendezvous(
     api: &VeilidAPI,
     rc: &RoutingContext,
     node_pub: &[u8; 32],
-    ring_seq: &mut HashMap<RecordKey, u32>,
+    ring_seq: &Mutex<HashMap<RecordKey, u32>>,
     owner_seed: [u8; 32],
     sealed: Vec<u8>,
 ) -> Result<()> {
@@ -607,8 +666,11 @@ async fn publish_rendezvous(
     let owner = identity::rendezvous_owner_keypair(&owner_seed)?;
     let key = rendezvous::open_or_create(api, rc, &owner).await?;
     let base = rendezvous::member_base_subkey(node_pub);
+    // Lock only for the synchronous cursor bump — never across an await — so the
+    // main loop and a spawned refresh can interleave ring writes safely.
     let seq = {
-        let cur = ring_seq.entry(key.clone()).or_insert(0);
+        let mut seqs = ring_seq.lock().unwrap();
+        let cur = seqs.entry(key.clone()).or_insert(0);
         let s = *cur;
         *cur = cur.wrapping_add(1);
         s
@@ -650,6 +712,9 @@ const ADVERT_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(5);
 
 /// A remembered public-share advert: enough to re-allocate a route, re-sign, and
 /// re-publish it on RouteChanged. Holds the signing CAPABILITY, never key material.
+/// `Clone` so a `RouteMaintenance` refresh can take a snapshot of the advert set to
+/// re-publish off-loop (the `Arc<dyn …>` signer clones cheaply).
+#[derive(Clone)]
 struct AdvertState {
     owner_seed: [u8; 32],
     sealed_announcement: Vec<u8>,
@@ -664,7 +729,8 @@ async fn publish_one_advert(
     api: &VeilidAPI,
     rc: &RoutingContext,
     node_pub: &[u8; 32],
-    ring_seq: &mut HashMap<RecordKey, u32>,
+    ring_seq: &Mutex<HashMap<RecordKey, u32>>,
+    advert_routes: &Mutex<HashMap<String, RouteId>>,
     share_id: &str,
     advert: &AdvertState,
 ) -> Result<()> {
@@ -672,6 +738,18 @@ async fn publish_one_advert(
         .new_private_route()
         .await
         .map_err(|e| VeilidNetError::Routing(e.to_string()))?;
+    // Record this share's new route and release the PREVIOUS one (route-leak fix):
+    // each refresh allocates a fresh route, so the old one must be freed or routes
+    // accumulate under churn.
+    let prev = advert_routes
+        .lock()
+        .unwrap()
+        .insert(share_id.to_owned(), route.route_id.clone());
+    if let Some(prev) = prev {
+        if let Err(e) = api.release_private_route(prev) {
+            crate::vtrace!("publish_one_advert: release prev route for {share_id} failed ({e})");
+        }
+    }
     let route_sig = advert.signer.sign_route_advert(share_id, &route.blob)?;
     let envelope = discovery::DiscoveryEnvelope {
         sealed_announcement: advert.sealed_announcement.clone(),
@@ -693,15 +771,30 @@ async fn refresh_share_adverts(
     api: &VeilidAPI,
     rc: &RoutingContext,
     node_pub: &[u8; 32],
-    ring_seq: &mut HashMap<RecordKey, u32>,
+    ring_seq: &Mutex<HashMap<RecordKey, u32>>,
+    advert_routes: &Mutex<HashMap<String, RouteId>>,
     adverts: &HashMap<String, AdvertState>,
 ) {
     crate::vtrace!("refresh_share_adverts: {} advert(s)", adverts.len());
     for (share_id, st) in adverts {
-        if let Err(e) = publish_one_advert(api, rc, node_pub, ring_seq, share_id, st).await {
+        if let Err(e) =
+            publish_one_advert(api, rc, node_pub, ring_seq, advert_routes, share_id, st).await
+        {
             crate::vtrace!("refresh_share_adverts: {share_id} ERR ({e})");
         }
     }
+}
+
+/// Whether a `RouteMaintenance` refresh should be scheduled now: there are adverts
+/// to refresh, and either none has run yet or the last completed at least
+/// `min_interval` ago. Pure so the coalesce gate is unit-testable (the in-flight
+/// guard is an atomic side effect checked separately at the call site).
+fn refresh_due(
+    last_completed: Option<tokio::time::Instant>,
+    have_adverts: bool,
+    min_interval: Duration,
+) -> bool {
+    have_adverts && last_completed.is_none_or(|t| t.elapsed() >= min_interval)
 }
 
 /// Attach and poll until public-internet-ready or the deadline elapses.
@@ -784,5 +877,24 @@ fn map_update(u: VeilidUpdate) -> Option<VeilidNetEvent> {
             None => Some(VeilidNetEvent::ValueChanged),
         },
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn refresh_due_gates_on_adverts_and_interval() {
+        // No prior refresh + adverts present → schedule.
+        assert!(refresh_due(None, true, Duration::from_secs(5)));
+        // No adverts → never schedule, regardless of timing.
+        assert!(!refresh_due(None, false, Duration::from_secs(5)));
+        // A refresh just completed → wait out the interval before the next.
+        let now = tokio::time::Instant::now();
+        assert!(!refresh_due(Some(now), true, Duration::from_secs(3600)));
+        // Zero interval → eligible again immediately (only the in-flight guard,
+        // checked separately, prevents overlap).
+        assert!(refresh_due(Some(now), true, Duration::ZERO));
     }
 }
