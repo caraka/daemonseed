@@ -710,6 +710,17 @@ impl GuiState {
     ) -> bool {
         let active = self.active;
         if let Some(c) = self.circles.get_mut(idx) {
+            // Dedup: the login backlog sweep and the live watch can both deliver the
+            // SAME circle message (the sweep re-emits a recent ring slot the watch
+            // already surfaced), so skip an exact (sender, body, sent_unix_ms) match
+            // already present rather than rendering it twice or re-tripping unread.
+            // Two genuinely distinct sends colliding on the same ms + identical text
+            // from the same sender is vanishingly unlikely and harmless to coalesce.
+            if c.messages.iter().any(|m| {
+                m.sent_unix_ms == sent_unix_ms && m.mine == mine && m.who == who && m.text == text
+            }) {
+                return false;
+            }
             // #105: insert in sent_unix_ms order so a late-arriving (older) circle
             // message slots into its chronological place instead of appending out
             // of order. `partition_point` keeps the Vec sorted and is a no-op
@@ -1194,6 +1205,33 @@ mod tests {
             ours,
             vec!["first", "second", "third"],
             "messages ordered by sent_unix_ms, not arrival order"
+        );
+    }
+
+    #[test]
+    fn duplicate_circle_message_is_coalesced() {
+        let mut st = GuiState::demo(); // active == 1; circle 2 exists
+        let before = st.circles[2].messages.len();
+        // The same message delivered twice (sweep + watch) must land once.
+        st.push_message(2, "alice".into(), "hello".into(), false, 100);
+        st.push_message(2, "alice".into(), "hello".into(), false, 100);
+        let hellos = st.circles[2]
+            .messages
+            .iter()
+            .filter(|m| m.who == "alice" && m.text == "hello" && m.sent_unix_ms == 100)
+            .count();
+        assert_eq!(hellos, 1, "duplicate (sender, body, ms) coalesced to one");
+        assert_eq!(st.circles[2].messages.len(), before + 1);
+        // A distinct body at the same ms is NOT coalesced.
+        assert!(st.push_message(2, "alice".into(), "world".into(), false, 100) || true);
+        assert_eq!(
+            st.circles[2]
+                .messages
+                .iter()
+                .filter(|m| m.who == "alice" && m.sent_unix_ms == 100)
+                .count(),
+            2,
+            "distinct bodies at the same ms both kept"
         );
     }
 

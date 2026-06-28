@@ -51,6 +51,7 @@ work lives in the project lead's vault manifest, not here.
 - `daemonseed-veilid-net`: the public-share fetcher caps reassembly (fragment count + cumulative bytes, `MAX_FRAGMENTS` / `MAX_REASSEMBLED_LEN`) so a malicious sharer's oversized `total` cannot drive an unbounded `app_call` loop or memory growth before the post-reassembly SHA-384 chunk check (Phase 3).
 - `daemonseed-gui`: a surface-level `NetEvent::Error` no longer flips the connection indicator to "offline" — a stubbed Phase-4 surface returning "not yet on Veilid" was being treated as a connection failure (`connected=false`), so a fully-attached Veilid node displayed as offline; connection state is now owned solely by `Connected`/`ConnectFailed`/`Disconnected`, and a real surface error shows as a transient notice.
 - `daemonseed-gui`: the full fetch error is logged via `DAEMONSEED_VEILID_TRACE` (the GUI status line truncates it to an ellipsis), so a chunk-fetch failure's cause is diagnosable.
+- `daemonseed-gui` Veilid mode: duplicate circle messages are coalesced — the login backlog sweep and the live watch could both deliver the same message; `push_message` now skips an exact `(sender, body, sent_unix_ms)` already present (alongside the #105 ordered-insert).
 
 ## [0.32.0] — 2026-06-26
 
