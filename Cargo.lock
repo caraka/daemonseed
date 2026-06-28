@@ -1894,6 +1894,7 @@ dependencies = [
  "base64 0.22.1",
  "daemonseed-core",
  "ed25519-dalek",
+ "futures-util",
  "thiserror 1.0.69",
  "tokio",
  "veilid-core",
