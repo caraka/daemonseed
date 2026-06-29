@@ -76,8 +76,15 @@ use crate::net::{
 };
 
 /// How long a discovered share lives in the catalog without a fresh announce —
-/// mirrors the relay actor's `SHARE_CATALOG_TTL`.
-const SHARE_CATALOG_TTL: Duration = Duration::from_secs(90);
+/// Generous TTL — a backstop for a sharer that vanished WITHOUT a withdraw (a hard
+/// crash, or — until withdraw-on-close lands — a graceful quit). A live share is kept
+/// fresh by natural route-rotation re-announce well within it, so the generous window
+/// avoids ever aging out a live share. Tunable; diverges from the relay's faster
+/// roll-call cadence.
+const SHARE_CATALOG_TTL: Duration = Duration::from_secs(600);
+
+/// How often the recipient ages out shares it has not reheard within the TTL.
+const SHARE_CATALOG_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// A joined circle's local state: the GUI routing tag, the content key (for
 /// seal/open), and the shared rendezvous-owner seed (for publish/subscribe).
@@ -189,6 +196,7 @@ pub async fn veilid_net_actor(
     // Connect/SetMyHandle; the fallback only matters on the ephemeral path, and
     // the S4 felt-test uses named profiles.
     let mut my_handle = "guest".to_owned();
+    let mut prune_timer = tokio::time::interval(SHARE_CATALOG_PRUNE_INTERVAL);
 
     loop {
         tokio::select! {
@@ -201,6 +209,14 @@ pub async fn veilid_net_actor(
             // Only poll the Veilid event stream once connected.
             Some(ev) = recv_opt(&mut ev_rx), if ev_rx.is_some() => {
                 handle_inbound(ev, &evt_tx, &circles, &my_handle, &mut shares);
+            }
+            // Age out discovered shares not reheard within the TTL (Shape B liveness):
+            // a sharer that vanished without a withdraw self-clears from the list.
+            // Own shares live in `shares.own`, never in the catalog, so they are safe.
+            _ = prune_timer.tick() => {
+                if shares.catalog.prune(Instant::now()) > 0 {
+                    let _ = evt_tx.send(NetEvent::SharesSnapshot { shares: shares.listings() });
+                }
             }
         }
     }
