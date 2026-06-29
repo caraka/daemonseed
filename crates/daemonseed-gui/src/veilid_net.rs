@@ -1110,6 +1110,20 @@ fn apply_discovery(
         // Parsed as an envelope but not openable under the lobby key — foreign.
         return false;
     };
+    // #116 self-filter: our own announcements (republish AND withdraw) loop back
+    // through the same lobby record we sweep. Our shares live in `shares.own`,
+    // never the discovered catalog — folding one in creates an un-manageable
+    // self-ghost: visible in Public shares yet absent from the unpublish dialog.
+    // Drop anything signed by our own identity key before it touches the catalog.
+    if let Some(signing) = shares.signing.as_ref()
+        && ann.sender_pubkey.as_slice() == signing.public_key().as_slice()
+    {
+        daemonseed_veilid_net::vtrace!(
+            "gui lobby: dropping own announcement for {} (self-filter, #116)",
+            ann.share_id
+        );
+        return true; // consumed: our own announcement is never a discovered share
+    }
     let now = Instant::now();
     if ann.withdraw {
         let change = shares.catalog.apply(&ann, now);
@@ -1285,6 +1299,40 @@ mod tests {
         assert!(
             evt_rx.try_recv().is_err(),
             "a no-op prune emits no snapshot"
+        );
+    }
+
+    #[test]
+    fn apply_discovery_drops_our_own_looped_back_announcement() {
+        // #116: we publish our own share to the same lobby record we sweep, so the
+        // announcement returns to us. It must NOT land in the discovered catalog —
+        // own shares live in `shares.own`. Otherwise it appears in Public shares yet
+        // is absent from the unpublish dialog: an un-deletable self-ghost.
+        let me = Arc::new(announcer(14));
+        let mut shares = ShareState::new();
+        let room_key = derive_room_key(DEFAULT_ROOM, &CNSA_2_0).unwrap();
+        shares.lobby = Some(lobby());
+        shares.signing = Some(me.clone());
+
+        let share_id = mint_share_id();
+        let blob = vec![0xEF; 96];
+        // An honest, well-formed announcement signed by our OWN identity key.
+        let bytes = discovery_bytes(&room_key, me.as_ref(), &share_id, &blob, &blob);
+
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        assert!(
+            apply_discovery(&mut shares, &evt_tx, &bytes),
+            "our own bytes are a lobby item (consumed)"
+        );
+        assert_eq!(
+            shares.catalog.len(),
+            0,
+            "our own share never enters the discovered catalog"
+        );
+        assert!(shares.discovered.is_empty(), "no self-route is retained");
+        assert!(
+            evt_rx.try_recv().is_err(),
+            "no SharesSnapshot is emitted for our own looped-back announcement"
         );
     }
 
