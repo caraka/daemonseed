@@ -370,9 +370,42 @@ impl GuiState {
     /// Call once, right after auth succeeds, before [`GuiState::persisted_rejoins`].
     pub fn set_profile(&mut self, profile: Profile) {
         for (phrase, _label) in profile.circles() {
-            let _ = self.materialize_from_phrase(&phrase);
+            if let Ok(idx) = self.materialize_from_phrase(&phrase) {
+                // #107: seed the circle's read high-water from the blob so a relaunch's
+                // backlog re-delivery does NOT re-trip the unread dot for already-seen
+                // messages (a genuinely newer message still does). `circle_seen` is
+                // keyed by the same canonicalized entropy `profile.circles()` returns.
+                if let Some(ms) = profile.circle_seen(&phrase)
+                    && let Some(c) = self.circles.get_mut(idx)
+                {
+                    c.high_water_ms = ms;
+                }
+            }
         }
         self.profile = Some(profile);
+    }
+
+    /// #107: persist every circle's current read high-water into the profile blob.
+    /// Called on graceful close (the common restart path) so a relaunch seeds each
+    /// circle's mark and does not re-trip the unread dot for already-seen messages.
+    /// Best-effort + monotonic: a circle with no net contract (the Lobby) or no
+    /// profile is skipped, and a re-seal failure is swallowed (the mark is
+    /// non-critical — a miss only re-trips the dot once after a restart).
+    // Driven by the desktop windowed close handler; the base offscreen build never
+    // builds that path, so the method reads as dead there (the tests still use it).
+    #[cfg_attr(not(feature = "desktop"), allow(dead_code))]
+    pub fn persist_all_circle_seen(&mut self) {
+        let marks: Vec<(String, i64)> = self
+            .circles
+            .iter()
+            .filter_map(|c| c.net.as_ref().map(|n| (n.phrase.clone(), c.high_water_ms)))
+            .filter(|(_, ms)| *ms > 0)
+            .collect();
+        if let Some(p) = self.profile.as_mut() {
+            for (entropy, ms) in marks {
+                let _ = p.persist_circle_seen(&entropy, ms);
+            }
+        }
     }
 
     /// The unlocked profile's stable display handle, or `None` on the ephemeral
@@ -1898,6 +1931,102 @@ mod tests {
         assert!(
             st2.only_lobby(),
             "the forgotten circle did not silently rejoin from disk"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #107: a circle's read high-water survives a relaunch — persisted on close,
+    /// seeded on restore — so backlog re-delivered after the restart does NOT
+    /// re-trip the unread dot for already-seen messages, while a genuinely newer
+    /// one still does.
+    #[test]
+    fn circle_high_water_persists_across_relaunch_and_suppresses_backlog_retrip() {
+        use daemonseed_core::bootstrap::BootstrapAnchor;
+        use daemonseed_core::first_start::FirstStart;
+        use daemonseed_core::profile::config::ArgonParams;
+        use daemonseed_core::profile::persist::{
+            load_for_unlock, session_materials_from_unlock, write_first_start,
+        };
+        use daemonseed_core::storage::seeds;
+
+        let _ = oxicrypt_module::initialize();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("ds-gui-hw-test-{}-{nonce}", std::process::id()));
+        let fast = ArgonParams {
+            memory_kib: 8,
+            iterations: 1,
+            parallelism: 1,
+        };
+        let pass = "correct horse battery staple table mountain";
+        let sealed = FirstStart::new().initialize(pass, fast).unwrap();
+        let recovery = sealed.display_phrase();
+        let materials = sealed
+            .verify_round_trip(&recovery)
+            .unwrap()
+            .finalize(
+                Some("alice".to_string()),
+                BootstrapAnchor {
+                    server_id: "relay#aabbccddeeff".to_string(),
+                    address: "127.0.0.1:443".to_string(),
+                },
+            )
+            .unwrap()
+            .into_session_materials();
+        write_first_start(&root, &materials, None, false).unwrap();
+
+        // Session 1: join + persist a circle, read it up to ts=100, then close
+        // (persist all circle high-waters).
+        let mut st1 = GuiState::lobby_only();
+        st1.set_profile(Profile::from_materials(materials, root.clone()));
+        let idx = st1.materialize_from_phrase(STRONG).unwrap();
+        st1.persist_circle(idx).unwrap();
+        st1.switch_to(idx, String::new(), 0.0); // make it active
+        st1.push_message(idx, "ally".into(), "seen".into(), false, 100); // active → high_water 100
+        assert_eq!(st1.metas()[idx].high_water_ms, 100);
+        st1.persist_all_circle_seen(); // the close hook
+        drop(st1);
+
+        // Session 2: reload from disk and restore — the circle's high-water is seeded.
+        let (config, blob) = load_for_unlock(&root).unwrap();
+        let opened = seeds::open(&blob, pass, config.profile_id, config.argon2).unwrap();
+        let materials2 = session_materials_from_unlock(
+            opened.seeds,
+            opened.key,
+            opened.index_key,
+            config,
+            blob.clone(),
+            vec![],
+        )
+        .unwrap();
+        let mut st2 = GuiState::lobby_only(); // active == 0 (Lobby); the circle is non-active
+        st2.set_profile(Profile::from_materials(materials2, root.clone()));
+        let cidx = st2
+            .metas()
+            .iter()
+            .position(|c| c.net.is_some())
+            .expect("the persisted circle restored");
+        assert_eq!(
+            st2.metas()[cidx].high_water_ms,
+            100,
+            "the read high-water was seeded from the blob on restore"
+        );
+        // Backlog at/below the seeded mark must NOT re-trip the dot after the restart.
+        let raised = st2.push_message(cidx, "ally".into(), "re-swept".into(), false, 100);
+        assert!(
+            !raised,
+            "relaunch backlog at the high-water must not re-trip unread"
+        );
+        assert!(!st2.metas()[cidx].unread);
+        // A genuinely newer message still trips.
+        let raised_new = st2.push_message(cidx, "ally".into(), "fresh".into(), false, 101);
+        assert!(
+            raised_new,
+            "a message newer than the high-water still trips"
         );
 
         let _ = std::fs::remove_dir_all(&root);

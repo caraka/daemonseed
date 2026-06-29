@@ -209,6 +209,28 @@ impl Profile {
         Ok(changed)
     }
 
+    /// (#107) The persisted read high-water (newest seen `sent_unix_ms`) for the
+    /// circle keyed by canonicalized `entropy`, or `None` if none recorded.
+    pub fn circle_seen(&self, entropy: &str) -> Option<i64> {
+        self.seeds.circle_seen(entropy)
+    }
+
+    /// (#107) Advance the circle read high-water for `entropy` to `ms` (monotonic)
+    /// and re-seal the blob. Returns `Ok(true)` if it advanced, `Ok(false)` if
+    /// unchanged (no re-seal). A disk / seal failure is surfaced as `Err(reason)`;
+    /// the high-water is non-critical (a miss only re-trips the unread dot once
+    /// after a restart), so the caller decides how loud to be.
+    // Reached only via `GuiState::persist_all_circle_seen` (the desktop close path);
+    // the base offscreen build never builds that path, so it reads as dead there.
+    #[cfg_attr(not(feature = "desktop"), allow(dead_code))]
+    pub fn persist_circle_seen(&mut self, entropy: &str, ms: i64) -> Result<bool, String> {
+        let changed = self.seeds.set_circle_seen(entropy, ms);
+        if changed {
+            self.reseal()?;
+        }
+        Ok(changed)
+    }
+
     /// #66: rename this identity — set a new display name in the at-rest blob and
     /// re-seal it (M13 write-through), so the chosen name persists across unlock.
     /// Also the recovery path for a profile created nameless before #65: it sets a

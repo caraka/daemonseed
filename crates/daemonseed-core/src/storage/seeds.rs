@@ -243,6 +243,14 @@ pub struct Seeds {
     /// carries it (ISC-A-C3); it is persistence of read-state, not of content.
     /// Mutate via [`Self::set_announce_seen`] / read via [`Self::announce_seen`].
     pub announce_seen: BTreeMap<String, String>,
+    /// Per-circle read high-water mark (#107), keyed by the canonicalized circle
+    /// entropy → the newest `sent_unix_ms` the user has seen in that circle. On
+    /// restore each circle's in-RAM high-water is seeded from this, so a relaunch's
+    /// backlog re-delivery does NOT re-trip the unread dot for already-seen messages
+    /// (a genuinely newer message still does). Advanced via [`Self::set_circle_seen`]
+    /// (monotonic) / read via [`Self::circle_seen`]. Client-local only (ISC-A-C3) —
+    /// persistence of read-state, not of message content.
+    pub circle_seen: BTreeMap<String, i64>,
 }
 
 /// One remembered local share root in the at-rest blob (ISC-C21 persistence,
@@ -308,6 +316,7 @@ impl core::fmt::Debug for Seeds {
             .field("shares", &self.shares.len())
             .field("published", &self.published.len())
             .field("announce_seen", &self.announce_seen.len())
+            .field("circle_seen", &self.circle_seen.len())
             .finish()
     }
 }
@@ -326,6 +335,7 @@ impl Seeds {
             shares: Vec::new(),
             published: Vec::new(),
             announce_seen: BTreeMap::new(),
+            circle_seen: BTreeMap::new(),
         }
     }
 
@@ -533,6 +543,25 @@ impl Seeds {
         true
     }
 
+    /// The persisted read high-water (#107) for the circle keyed by canonicalized
+    /// `entropy` — the newest `sent_unix_ms` the user has seen there, or `None` if
+    /// the circle has no recorded mark yet.
+    pub fn circle_seen(&self, entropy: &str) -> Option<i64> {
+        self.circle_seen.get(entropy).copied()
+    }
+
+    /// Advance the circle read high-water (#107) for `entropy` to `ms`. Monotonic —
+    /// only moves forward, so an out-of-order/older write never lowers the mark.
+    /// Returns `true` if the stored value advanced, `false` if unchanged.
+    pub fn set_circle_seen(&mut self, entropy: impl Into<String>, ms: i64) -> bool {
+        let entropy = entropy.into();
+        if self.circle_seen.get(&entropy).is_some_and(|cur| *cur >= ms) {
+            return false;
+        }
+        self.circle_seen.insert(entropy, ms);
+        true
+    }
+
     fn to_plaintext(&self) -> String {
         let mut s = self.mnemonic.to_phrase();
         if self.counters.send_counter != 0 {
@@ -594,6 +623,15 @@ impl Seeds {
         for (server_id, hash) in &self.announce_seen {
             s.push_str(&format!("\nannounce-seen {server_id} {hash}"));
         }
+        // Per-circle read high-water (#107): `circle-seen <hex(entropy)> <ms>`. The
+        // entropy is hex-encoded (it is a phrase with spaces); `ms` is a plain i64.
+        // Additive — an older blob with no such line parses to an empty map.
+        for (entropy, ms) in &self.circle_seen {
+            s.push_str(&format!(
+                "\ncircle-seen {} {ms}",
+                hex::encode(entropy.as_bytes())
+            ));
+        }
         s
     }
 
@@ -609,6 +647,7 @@ impl Seeds {
         let mut shares: Vec<PersistedShare> = Vec::new();
         let mut published: Vec<PublishedShare> = Vec::new();
         let mut announce_seen: BTreeMap<String, String> = BTreeMap::new();
+        let mut circle_seen: BTreeMap<String, i64> = BTreeMap::new();
         for line in lines {
             // Mute / hide directives take the entire rest of the line as the
             // handle so a display name containing spaces is never truncated.
@@ -689,6 +728,18 @@ impl Seeds {
                 }
                 continue;
             }
+            // Per-circle read high-water (#107): `circle-seen <hex(entropy)> <ms>`. A
+            // malformed line is SKIPPED, not fatal (additive tolerance); an older blob
+            // with no such line parses to an empty map.
+            if let Some(rest) = line.strip_prefix("circle-seen ") {
+                if let Some((entropy_hex, ms_str)) = rest.split_once(' ')
+                    && let (Ok(bytes), Ok(ms)) = (hex::decode(entropy_hex), ms_str.parse::<i64>())
+                    && let Ok(entropy) = String::from_utf8(bytes)
+                {
+                    circle_seen.insert(entropy, ms);
+                }
+                continue;
+            }
             let mut parts = line.splitn(3, ' ');
             match parts.next() {
                 Some("send-counter") => {
@@ -714,6 +765,7 @@ impl Seeds {
             shares,
             published,
             announce_seen,
+            circle_seen,
         })
     }
 }
@@ -1534,6 +1586,47 @@ mod tests {
             Some("feedface")
         );
         assert_eq!(recovered.announce_seen("unknown#relay"), None);
+    }
+
+    #[test]
+    fn circle_seen_round_trips_and_is_monotonic() {
+        // #107 oracle. A per-circle read high-water (keyed by entropy — a phrase
+        // WITH SPACES, so the directive hex-encodes it) survives a seal/open
+        // round-trip, the setter only advances forward, and an absent line parses
+        // to an empty map (additive / backward-compatible).
+        ensure_oxicrypt_initialized();
+        let pid = Uuid::new_v4();
+        let pp = "correct horse battery staple table mountain";
+        let mut seeds = fresh_seeds();
+        let entropy = "correct horse battery staple"; // a phrase with spaces
+        assert_eq!(seeds.circle_seen(entropy), None);
+        assert!(seeds.set_circle_seen(entropy, 100));
+        // Monotonic: an equal or older write does not lower the mark.
+        assert!(!seeds.set_circle_seen(entropy, 100));
+        assert!(!seeds.set_circle_seen(entropy, 50));
+        // A newer write advances it.
+        assert!(seeds.set_circle_seen(entropy, 150));
+        // A second circle is tracked independently.
+        assert!(seeds.set_circle_seen("another circle phrase here", 7));
+
+        let blob = seal(&seeds, pp, pid, test_params()).unwrap();
+        let recovered = open(&blob, pp, pid, test_params()).unwrap().seeds;
+        assert_eq!(recovered.circle_seen(entropy), Some(150));
+        assert_eq!(recovered.circle_seen("another circle phrase here"), Some(7));
+        assert_eq!(recovered.circle_seen("never seen"), None);
+    }
+
+    #[test]
+    fn absent_circle_seen_directive_parses_empty() {
+        // A blob with no `circle-seen` line parses with an empty map — additive.
+        ensure_oxicrypt_initialized();
+        let pid = Uuid::new_v4();
+        let pp = "correct horse battery staple table mountain";
+        let seeds = fresh_seeds();
+        assert!(!seeds.to_plaintext().contains("circle-seen"));
+        let blob = seal(&seeds, pp, pid, test_params()).unwrap();
+        let recovered = open(&blob, pp, pid, test_params()).unwrap().seeds;
+        assert_eq!(recovered.circle_seen("anything"), None);
     }
 
     #[test]

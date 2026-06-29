@@ -2454,6 +2454,7 @@ fn main() {
         // The drain timer runs for the whole app life; the Connect is deferred to
         // the auth-success callbacks (no connecting under the auth gate).
         let net_close = net.clone();
+        let state_close = state.clone();
         let _live = start_drain(&ui, state, net, browser);
         // #60: hold the single-instance lock for the whole windowed session — dropped
         // on return (clean exit removes the lockfile; a crash leaves it for the next
@@ -2507,6 +2508,10 @@ fn main() {
                         if let Some((w, h)) = last_size.get() {
                             save_window_size(&ws_root.borrow(), w, h);
                         }
+                        // #107: persist each circle's read high-water on graceful close
+                        // (the common restart path) so a relaunch seeds the marks and
+                        // does not re-trip the unread dot for already-seen backlog.
+                        state_close.borrow_mut().persist_all_circle_seen();
                         // Business-as-usual on a graceful quit: withdraw owned shares
                         // so they drop from peers' lists immediately, then briefly
                         // block the close (bounded) until they reach the network — the
