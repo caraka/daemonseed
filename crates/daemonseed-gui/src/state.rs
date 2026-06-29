@@ -293,6 +293,16 @@ pub struct CircleState {
     /// in this room while it is NOT the active room; cleared the moment it gains
     /// focus. Chat-only (driven by `push_message`); shares ride a separate path.
     pub unread: bool,
+    /// #107: per-circle read high-water mark — the newest `sent_unix_ms` the user
+    /// has already seen in this room (advanced when the room is active and when it
+    /// gains focus). A message at or below it is BACKLOG the user already caught up
+    /// on, so it never re-trips the unread dot — the login/reconnect ring sweep
+    /// re-delivers old messages into a RAM transcript that may be fresh (relaunch)
+    /// or already-pruned, so the exact-match dedup alone can't suppress them.
+    /// RAM-only like the transcript; a first-ever load this session may still trip
+    /// once (genuinely new to the session), but a reconnect after catching up will
+    /// not. Lobby keeps it at 0 (the public room has no per-circle dot semantics).
+    pub high_water_ms: i64,
 }
 
 /// First circle id handed out (0 is reserved/unused so a missing id is obvious).
@@ -337,6 +347,7 @@ impl GuiState {
             scroll_y: 0.0,
             net: None,
             unread: false,
+            high_water_ms: 0,
         }];
         GuiState {
             circles,
@@ -578,6 +589,7 @@ impl GuiState {
                 rendezvous: None,
             }),
             unread: false,
+            high_water_ms: 0,
         };
         self.circles.push(circle);
         Ok(self.circles.len() - 1)
@@ -737,7 +749,15 @@ impl GuiState {
                     sent_unix_ms,
                 },
             );
-            if !mine && idx != active && !c.unread {
+            if idx == active {
+                // The user is looking at this room, so every message here is seen:
+                // keep the read high-water current so a later reconnect re-delivering
+                // these same messages cannot re-trip the unread dot (#107).
+                c.high_water_ms = c.high_water_ms.max(sent_unix_ms);
+            } else if !mine && sent_unix_ms > c.high_water_ms && !c.unread {
+                // #107: only a message NEWER than what the user has already caught up
+                // on raises the dot — backlog re-delivered by the reconnect/login ring
+                // sweep (sent_unix_ms <= high_water) is folded in silently, no dot.
                 c.unread = true;
                 return true;
             }
@@ -775,7 +795,15 @@ impl GuiState {
         if target < self.circles.len() {
             self.active = target;
             // #64: focusing a room clears its unread dot.
-            self.circles[self.active].unread = false;
+            let c = &mut self.circles[self.active];
+            c.unread = false;
+            // #107: the user has now seen everything currently loaded, so advance the
+            // read high-water to the newest message in the transcript (messages are
+            // kept in `sent_unix_ms` order, so the last is the max). A later reconnect
+            // re-delivering this backlog then falls at/below the mark and won't re-trip.
+            if let Some(latest) = c.messages.last().map(|m| m.sent_unix_ms) {
+                c.high_water_ms = c.high_water_ms.max(latest);
+            }
         }
     }
 
@@ -838,6 +866,7 @@ impl GuiState {
                 scroll_y: 0.0,
                 net: None,
                 unread: false,
+                high_water_ms: 0,
             }
         };
         let circles = vec![
@@ -1182,6 +1211,61 @@ mod tests {
             "already-unread room does not re-raise (no spurious rail rebuilds)"
         );
         assert!(st.metas()[2].unread);
+    }
+
+    // ── #107 backlog unread high-water mark ──────────────────────────────────
+
+    #[test]
+    fn backlog_at_or_below_high_water_does_not_retrip_unread() {
+        let mut st = GuiState::demo(); // active == 1
+        // The user opens circle 2 and reads live messages up to ts=10.
+        st.switch_to(2, String::new(), 0.0); // active == 2
+        st.push_message(2, "ally".into(), "live-a".into(), false, 9);
+        st.push_message(2, "ally".into(), "live-b".into(), false, 10);
+        assert!(!st.metas()[2].unread, "no dot while the room is active");
+        assert!(
+            st.metas()[2].high_water_ms >= 10,
+            "watching live advances the read high-water"
+        );
+        // Switch away; a reconnect re-delivers backlog at the high-water mark into the
+        // now-non-active circle 2 (distinct text, so it is NOT a dedup hit — it is a
+        // genuinely new transcript entry that must still NOT raise the dot).
+        st.switch_to(1, String::new(), 0.0); // active == 1
+        let raised = st.push_message(2, "ally".into(), "re-swept".into(), false, 10);
+        assert!(
+            !raised,
+            "backlog at the high-water mark must not re-trip unread"
+        );
+        assert!(!st.metas()[2].unread);
+    }
+
+    #[test]
+    fn message_newer_than_high_water_still_trips_unread() {
+        let mut st = GuiState::demo(); // active == 1
+        st.switch_to(2, String::new(), 0.0);
+        st.push_message(2, "ally".into(), "seen".into(), false, 10); // active → high_water 10
+        st.switch_to(1, String::new(), 0.0); // active == 1
+        let raised = st.push_message(2, "ally".into(), "fresh".into(), false, 11);
+        assert!(
+            raised,
+            "a message newer than the high-water mark raises the dot"
+        );
+        assert!(st.metas()[2].unread);
+    }
+
+    #[test]
+    fn focusing_a_circle_advances_high_water_to_latest() {
+        let mut st = GuiState::demo(); // active == 1
+        // First-load backlog into a non-active circle trips once (expected — new this
+        // session); focusing then clears the dot AND catches the high-water up so the
+        // NEXT reconnect's re-delivery of that backlog stays silent.
+        st.push_message(2, "ally".into(), "backlog".into(), false, 7);
+        assert!(st.metas()[2].unread);
+        st.switch_to(2, String::new(), 0.0);
+        assert!(
+            st.metas()[2].high_water_ms >= 7,
+            "focus catches the high-water up to the newest message in the transcript"
+        );
     }
 
     // ── #105 transcript ordering by sent_unix_ms ─────────────────────────────
