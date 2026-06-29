@@ -49,6 +49,7 @@ work lives in the project lead's vault manifest, not here.
 
 ### Fixed
 
+- `daemonseed-gui`: leaving a circle no longer panics with "RefCell already borrowed" — the leave handler's `forget_circle` + rail rebuild is deferred to the next event-loop tick (`defer`) instead of mutating the rail model synchronously from inside the Slint clicked handler, where an inbound-circle-message rail rebuild on the drain timer could re-enter the partial renderer (#120).
 - `daemonseed-gui` Veilid mode: a published share no longer appears twice (the second copy pointing at a dead route) on the sharer's reconnect — the `share_id` is now derived deterministically from `(identity pubkey, root)` (`daemonseed_core::share_announce::derive_share_id`) instead of freshly minted, so a republish re-asserts the same id and a fetcher folds it onto the existing catalog entry (#112).
 - `daemonseed-gui` Veilid mode: a share whose fetch fails on a dead/un-importable route or an authoritative withdraw is pruned from the recipient's catalog + discovered-route map (ISC-S30 prune-on-fetch-fail), self-healing a stale copy instead of leaving it in the list; a still-live share re-announces and reappears (#112).
 - `daemonseed-veilid-net`: the share-advert refresh no longer leaks private routes — each `RouteChanged` re-allocation releases the share's previous `RouteId` (`release_private_route`) instead of accumulating dead routes under churn.

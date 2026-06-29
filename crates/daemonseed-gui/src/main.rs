@@ -703,24 +703,37 @@ fn build_ui() -> BuiltUi {
         let weak = ui.as_weak();
         let state = state.clone();
         move || {
-            let ui = weak.unwrap();
-            let outcome = {
-                let mut st = state.borrow_mut();
-                let active = st.active();
-                st.forget_circle(active)
-            };
-            let st = state.borrow();
-            rebuild_rail(&ui, &st);
-            let now_active = st.active();
-            apply_view(&ui, st.current(), now_active as i32);
-            apply_circle_detail(&ui, &st, now_active);
-            drop(st);
-            ui.set_circle_phrase_revealed(SharedString::from(""));
-            if let Err(reason) = outcome {
-                ui.set_connection_status(SharedString::from(format!(
-                    "Left, but couldn't update the profile: {reason}"
-                )));
-            }
+            // #120: this callback fires from inside the Slint clicked handler
+            // (app.slint leave-confirm), and the NetEvent drain timer can be
+            // mid-`rebuild_rail` of the same rail on an inbound circle message.
+            // Forgetting the circle + rebuilding the rail synchronously here shrinks
+            // the rail model mid-render and re-enters Slint's partial renderer
+            // ("RefCell already borrowed"). Defer to the next event-loop tick — the
+            // same re-entrancy guard `defer` already applies to focus calls.
+            let weak = weak.clone();
+            let state = state.clone();
+            defer(move || {
+                let Some(ui) = weak.upgrade() else {
+                    return;
+                };
+                let outcome = {
+                    let mut st = state.borrow_mut();
+                    let active = st.active();
+                    st.forget_circle(active)
+                };
+                let st = state.borrow();
+                rebuild_rail(&ui, &st);
+                let now_active = st.active();
+                apply_view(&ui, st.current(), now_active as i32);
+                apply_circle_detail(&ui, &st, now_active);
+                drop(st);
+                ui.set_circle_phrase_revealed(SharedString::from(""));
+                if let Err(reason) = outcome {
+                    ui.set_connection_status(SharedString::from(format!(
+                        "Left, but couldn't update the profile: {reason}"
+                    )));
+                }
+            });
         }
     });
 
