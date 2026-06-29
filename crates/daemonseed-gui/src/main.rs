@@ -346,6 +346,9 @@ fn apply_circle_detail(ui: &AppWindow, st: &GuiState, idx: usize) {
     ui.set_circle_name(SharedString::from(name));
     ui.set_circle_relay_label(SharedString::from(relay));
     ui.set_circle_fingerprint(SharedString::from(fp));
+    // #115: the active circle changed, so a previously-revealed join phrase must not
+    // linger into a different circle's sheet — clear it (re-auth to reveal again).
+    ui.set_circle_phrase_revealed(SharedString::from(""));
 }
 
 /// Rebuild the rail model from the current circle metas and refresh the
@@ -633,6 +636,90 @@ fn build_ui() -> BuiltUi {
                 Err(reason) => {
                     ui.set_rename_error(SharedString::from(format!("Couldn't rename: {reason}")));
                 }
+            }
+        }
+    });
+
+    // #115: reveal a circle's join phrase ONLY after the unlock passphrase verifies
+    // (an evil-maid guard on an unlocked client). On success fill the revealed phrase
+    // (the sheet then shows it + a Copy button) and close the prompt; on a wrong
+    // passphrase keep the prompt open with an inline error.
+    ui.on_reveal_phrase({
+        let weak = ui.as_weak();
+        let state = state.clone();
+        move |pass| {
+            let ui = weak.unwrap();
+            let pass = pass.to_string();
+            let st = state.borrow();
+            if st.verify_passphrase(&pass) {
+                let phrase = st.circle_phrase(st.active()).unwrap_or_default();
+                drop(st);
+                ui.set_circle_phrase_revealed(SharedString::from(phrase));
+                ui.set_phrase_prompt_open(false);
+                ui.set_phrase_prompt_pass(SharedString::from(""));
+                ui.set_phrase_prompt_error(SharedString::from(""));
+            } else {
+                ui.set_phrase_prompt_error(SharedString::from("Wrong passphrase."));
+            }
+        }
+    });
+
+    // #115: copy the already-revealed phrase to the clipboard (best-effort; see the
+    // X11 caveat on `write_clipboard_text`).
+    ui.on_copy_phrase({
+        let weak = ui.as_weak();
+        move || {
+            let ui = weak.unwrap();
+            let phrase = ui.get_circle_phrase_revealed().to_string();
+            if !phrase.is_empty() {
+                let msg = if write_clipboard_text(&phrase) {
+                    "Join phrase copied."
+                } else {
+                    "Couldn't access the clipboard — read it off the screen."
+                };
+                ui.set_connection_status(SharedString::from(msg));
+            }
+        }
+    });
+
+    // #115: clear a revealed phrase + reset the prompt (sheet Close / explicit hide).
+    ui.on_hide_phrase({
+        let weak = ui.as_weak();
+        move || {
+            let ui = weak.unwrap();
+            ui.set_circle_phrase_revealed(SharedString::from(""));
+            ui.set_phrase_prompt_open(false);
+            ui.set_phrase_prompt_pass(SharedString::from(""));
+            ui.set_phrase_prompt_error(SharedString::from(""));
+        }
+    });
+
+    // #115: leave the active circle — drop it from the rail AND the profile blob (so
+    // it does not silently re-join next launch), then re-render onto the now-active
+    // circle. Leaving is easy by design; the confirm overlay carries the "saved the
+    // phrase?" reminder. A profile re-seal failure is surfaced but never blocks the
+    // in-session removal.
+    ui.on_leave_circle({
+        let weak = ui.as_weak();
+        let state = state.clone();
+        move || {
+            let ui = weak.unwrap();
+            let outcome = {
+                let mut st = state.borrow_mut();
+                let active = st.active();
+                st.forget_circle(active)
+            };
+            let st = state.borrow();
+            rebuild_rail(&ui, &st);
+            let now_active = st.active();
+            apply_view(&ui, st.current(), now_active as i32);
+            apply_circle_detail(&ui, &st, now_active);
+            drop(st);
+            ui.set_circle_phrase_revealed(SharedString::from(""));
+            if let Err(reason) = outcome {
+                ui.set_connection_status(SharedString::from(format!(
+                    "Left, but couldn't update the profile: {reason}"
+                )));
             }
         }
     });
@@ -1310,6 +1397,17 @@ fn start_drain(
 fn read_clipboard_text() -> Option<String> {
     let text = arboard::Clipboard::new().ok()?.get_text().ok()?;
     if text.is_empty() { None } else { Some(text) }
+}
+
+/// Best-effort clipboard WRITE (#115 copy-phrase). NOTE the X11 caveat above: arboard
+/// can clear the selection when a transient `Clipboard` is dropped, so a paste into
+/// another app may not land — this is felt-test-gated. The reveal itself (the phrase
+/// shown in the sheet for the user to read / screenshot) works regardless, so copy
+/// degrades gracefully to "read it off the screen".
+fn write_clipboard_text(text: &str) -> bool {
+    arboard::Clipboard::new()
+        .and_then(|mut c| c.set_text(text.to_owned()))
+        .is_ok()
 }
 
 /// Fire the real `Connect` against the running net actor: auto-joins the default

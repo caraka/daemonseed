@@ -25,8 +25,8 @@ use daemonseed_core::first_start::SessionMaterials;
 use daemonseed_core::identity::keys::{
     Identity, KeyDerivationError, SignKeypair, derive_identity_keys,
 };
-use daemonseed_core::profile::persist::write_seeds_blob;
-use daemonseed_core::storage::seeds::{IndexKey, SealingKey, Seeds};
+use daemonseed_core::profile::persist::{load_for_unlock, write_seeds_blob};
+use daemonseed_core::storage::seeds::{self, IndexKey, SealingKey, Seeds};
 
 /// An unlocked identity + its on-disk profile root, with the write-through path.
 pub struct Profile {
@@ -120,6 +120,31 @@ impl Profile {
             self.reseal()?;
         }
         Ok(added)
+    }
+
+    /// #115: forget a circle — drop its phrase from the blob and re-seal so it does
+    /// NOT silently re-join next launch (the inverse of [`Self::persist_circle`]).
+    /// Returns `Ok(true)` if it was present and removed, `Ok(false)` if it was not
+    /// recorded (idempotent). A disk / seal failure is surfaced as `Err(reason)`.
+    pub fn forget_circle(&mut self, phrase: &str) -> Result<bool, String> {
+        let removed = self.seeds.remove_circle(phrase);
+        if removed {
+            self.reseal()?;
+        }
+        Ok(removed)
+    }
+
+    /// #115: verify the unlock passphrase by re-opening the on-disk at-rest blob with
+    /// it — the SAME crypto as Unlock (one Argon2id run, fails closed on a wrong
+    /// passphrase or a missing/corrupt blob). Gates the circle-phrase reveal: an
+    /// evil-maid guard so an unattended *unlocked* client can't surrender a circle's
+    /// secret to a quick click. `false` on any read/decrypt failure. It re-reads disk
+    /// rather than caching the key, so it never widens the in-RAM secret surface.
+    pub fn verify_passphrase(&self, passphrase: &str) -> bool {
+        let Ok((config, blob)) = load_for_unlock(&self.root) else {
+            return false;
+        };
+        seeds::open(&blob, passphrase, config.profile_id, config.argon2).is_ok()
     }
 
     /// Published shares recorded in the blob — the M16 auto-republish set read at

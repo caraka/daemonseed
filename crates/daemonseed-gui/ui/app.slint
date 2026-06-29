@@ -443,6 +443,15 @@ export component AppWindow inherits Window {
     in property <string> circle-name;
     in property <string> circle-relay-label;
     in property <string> circle-fingerprint;
+    // #115 circle-phrase reveal (evil-maid-gated) + leave-circle confirm. The phrase
+    // is the circle's shared secret, so it is revealed ONLY after Rust verifies the
+    // unlock passphrase: `circle-phrase-revealed` is "" until then. Cleared whenever
+    // the sheet closes / the active circle changes, so a revealed phrase never lingers.
+    in property <string> circle-phrase-revealed;
+    in-out property <bool> phrase-prompt-open: false;
+    in-out property <string> phrase-prompt-pass;
+    in property <string> phrase-prompt-error;
+    in-out property <bool> leave-confirm-open: false;
     in-out property <bool> palette-open: false;
     in property <[ActionData]> actions;
 
@@ -523,7 +532,17 @@ export component AppWindow inherits Window {
     callback open-rename();
     callback submit-rename(string);
     callback focus-rename-input();
+    // #115: reveal-phrase(passphrase) → Rust verifies; on success sets
+    // circle-phrase-revealed, else sets phrase-prompt-error. copy-phrase copies the
+    // revealed phrase to the clipboard. leave-circle forgets the active circle (drops
+    // it from the rail + the profile blob). hide-phrase clears the revealed phrase.
+    callback reveal-phrase(string);
+    callback copy-phrase();
+    callback leave-circle();
+    callback hide-phrase();
+    callback focus-phrase-pass-input();
     focus-rename-input => { rename_name_input.focus-input(); }
+    focus-phrase-pass-input => { phrase_pass_input.focus-input(); }
     callback join-phrase-edited(string);
     callback submit-join(string);
     callback reroll-new();
@@ -1085,7 +1104,7 @@ export component AppWindow inherits Window {
             HorizontalLayout {
                 Text { text: "Circle details"; color: #e4e8ee; font-size: 15px; vertical-alignment: center; }
                 Rectangle { }
-                PillButton { label: "Close"; w: 70px; clicked => { root.sheet-open = false; } }
+                PillButton { label: "Close"; w: 70px; clicked => { root.sheet-open = false; root.hide-phrase(); } }
             }
             Text { text: "end-to-end encrypted"; color: #6fb3a4; font-size: 12px; }
             Text { text: "members — identity only, no presence"; color: #5b6472; font-size: 12px; }
@@ -1105,6 +1124,44 @@ export component AppWindow inherits Window {
                 spacing: 2px;
                 Text { text: "Fingerprint (verify out-of-band — same everywhere)"; color: #5b6472; font-size: 11px; wrap: word-wrap; }
                 Text { text: root.circle-fingerprint; color: #cfd5dd; font-size: 13px; }
+            }
+
+            // ── #115 phrase reveal (passphrase-gated) + leave (real circles only) ──
+            if root.circle-fingerprint != "" : VerticalLayout {
+                spacing: 8px;
+                Rectangle { height: 1px; background: #ffffff12; }
+                // The revealed phrase — Rust sets it ONLY after a verified passphrase.
+                // `visible:` not `if` so revealing/hiding never mutates the item tree.
+                Text {
+                    text: "Join phrase — anyone with it can read & post";
+                    visible: root.circle-phrase-revealed != "";
+                    color: #5b6472; font-size: 11px; wrap: word-wrap;
+                }
+                Text {
+                    text: root.circle-phrase-revealed;
+                    visible: root.circle-phrase-revealed != "";
+                    color: #cfd5dd; font-size: 13px; wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    // One button: "Show join phrase" (opens the passphrase prompt) before
+                    // a reveal, "Copy phrase" (to clipboard) after.
+                    PillButton {
+                        label: root.circle-phrase-revealed == "" ? "Show join phrase" : "Copy phrase";
+                        w: 160px;
+                        clicked => {
+                            if (root.circle-phrase-revealed == "") {
+                                root.phrase-prompt-pass = "";
+                                root.phrase-prompt-open = true;
+                                root.focus-phrase-pass-input();
+                            } else {
+                                root.copy-phrase();
+                            }
+                        }
+                    }
+                    Rectangle { }
+                    PillButton { label: "Leave circle"; w: 130px; clicked => { root.leave-confirm-open = true; } }
+                }
             }
         }
     }
@@ -1233,6 +1290,68 @@ export component AppWindow inherits Window {
                 PillButton {
                     label: "Save name"; primary: true; w: 150px;
                     clicked => { root.submit-rename(root.rename-name); }
+                }
+            }
+        }
+    }
+
+    // ── #115 passphrase prompt: gate the circle-phrase reveal (evil-maid guard) ──
+    // The unlock passphrase is more sensitive than the phrase it reveals, so the input
+    // is masked (input-type: password). On Reveal, Rust verifies and either fills
+    // circle-phrase-revealed (the sheet then shows it + a Copy button) or sets the error.
+    phrase_prompt := Rectangle {
+        x: (root.width - self.width) / 2; y: 110px;
+        width: 460px; height: 230px;
+        visible: root.phrase-prompt-open;
+        background: #0e0f11; border-radius: 12px; border-width: 1px; border-color: #ffffff18;
+        VerticalLayout {
+            padding: 20px; spacing: 12px; alignment: start;
+            HorizontalLayout {
+                Text { text: "Show join phrase"; color: #e4e8ee; font-size: 17px; }
+                Rectangle { }
+                PillButton { label: "Cancel"; w: 80px; clicked => { root.phrase-prompt-open = false; root.phrase-prompt-pass = ""; root.focus-composer(); } }
+            }
+            Text { text: "Enter your passphrase to reveal this circle's join phrase."; color: #8b93a1; font-size: 13px; wrap: word-wrap; }
+            Rectangle {
+                height: 44px; border-radius: 9px; background: #141517; border-width: 1px; border-color: #ffffff12; clip: true;
+                HorizontalLayout { padding-left: 12px;
+                    Text { text: "passphrase…"; visible: root.phrase-prompt-pass == ""; color: #4d5560; font-size: 13px; vertical-alignment: center; }
+                }
+                HorizontalLayout { padding-left: 12px; padding-right: 12px;
+                    phrase_pass_input := MenuTextInput {
+                        input-type: password;
+                        text <=> root.phrase-prompt-pass;
+                        accepted => { root.reveal-phrase(root.phrase-prompt-pass); }
+                    }
+                }
+            }
+            Text { text: root.phrase-prompt-error; visible: root.phrase-prompt-error != ""; color: #c2785b; font-size: 12px; }
+            Rectangle { }
+            HorizontalLayout {
+                Rectangle { }
+                PillButton { label: "Reveal"; primary: true; w: 130px; clicked => { root.reveal-phrase(root.phrase-prompt-pass); } }
+            }
+        }
+    }
+
+    // ── #115 leave-circle confirm: leaving is easy, but acknowledge the phrase is saved ──
+    leave_confirm := Rectangle {
+        x: (root.width - self.width) / 2; y: 130px;
+        width: 440px; height: 200px;
+        visible: root.leave-confirm-open;
+        background: #0e0f11; border-radius: 12px; border-width: 1px; border-color: #ffffff18;
+        VerticalLayout {
+            padding: 20px; spacing: 14px; alignment: start;
+            Text { text: "Leave this circle?"; color: #e4e8ee; font-size: 17px; }
+            Text { text: "You'll need its join phrase to rejoin — make sure you've saved it. There is no recovery."; color: #8b93a1; font-size: 13px; wrap: word-wrap; }
+            Rectangle { }
+            HorizontalLayout {
+                spacing: 10px;
+                PillButton { label: "Cancel"; w: 100px; clicked => { root.leave-confirm-open = false; } }
+                Rectangle { }
+                PillButton {
+                    label: "Leave circle"; primary: true; w: 150px;
+                    clicked => { root.leave-confirm-open = false; root.sheet-open = false; root.leave-circle(); }
                 }
             }
         }

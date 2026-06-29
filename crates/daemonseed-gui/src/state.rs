@@ -541,6 +541,56 @@ impl GuiState {
         }
     }
 
+    /// #115: the join phrase (the circle's shared secret) for circle `idx`, for the
+    /// passphrase-gated reveal/export affordance. `None` for the Lobby (no net
+    /// contract) or an unknown index. Callers gate the actual reveal on
+    /// [`Self::verify_passphrase`] — this accessor itself does not.
+    pub fn circle_phrase(&self, idx: usize) -> Option<String> {
+        self.circles
+            .get(idx)
+            .and_then(|c| c.net.as_ref().map(|n| n.phrase.clone()))
+    }
+
+    /// #115: verify the user's unlock passphrase (gates the circle-phrase reveal — an
+    /// evil-maid guard on an unlocked client). `false` on the ephemeral no-profile
+    /// path: there is no passphrase to check, so reveal is a profile-only affordance.
+    pub fn verify_passphrase(&self, passphrase: &str) -> bool {
+        self.profile
+            .as_ref()
+            .is_some_and(|p| p.verify_passphrase(passphrase))
+    }
+
+    /// #115: leave a circle — remove it from the rail AND drop its phrase from the
+    /// profile blob (so it does not silently re-join next launch). The pinned Lobby
+    /// (index 0, no net contract) and an out-of-range index are no-ops. The circle is
+    /// always removed from the rail this session; a profile re-seal failure is
+    /// surfaced (the circle would otherwise re-join next launch) but does not block
+    /// the in-session removal. `active` is shifted so it stays on the same circle.
+    pub fn forget_circle(&mut self, idx: usize) -> Result<(), String> {
+        let Some(phrase) = self
+            .circles
+            .get(idx)
+            .and_then(|c| c.net.as_ref().map(|n| n.phrase.clone()))
+        else {
+            return Ok(()); // Lobby or unknown index — nothing to forget.
+        };
+        let result = match self.profile.as_mut() {
+            Some(p) => p.forget_circle(&phrase).map(|_| ()),
+            None => Ok(()),
+        };
+        self.circles.remove(idx);
+        // Keep `active` pointing at the same circle: shift back if we removed the
+        // active circle or one before it. `idx >= 1` here (the Lobby is never
+        // forgotten), so this never underflows.
+        if self.active >= idx && self.active > 0 {
+            self.active -= 1;
+        }
+        if self.active >= self.circles.len() {
+            self.active = self.circles.len().saturating_sub(1);
+        }
+        result
+    }
+
     /// Materialize a circle from a shared phrase and append it to the rail
     /// (ISC-20). Derives the circle-of-trust key (`derive_cot_key`, ISC-21) and
     /// stores it + the phrase + an empty rendezvous slot as the [`CircleNet`]
@@ -1714,6 +1764,100 @@ mod tests {
             st2.display_handle().as_deref(),
             Some("alice"),
             "the display handle survives reload"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #115: leaving a circle drops it from the rail AND the blob (so it does not
+    /// silently re-join next launch), and revealing a circle's phrase is gated on the
+    /// unlock passphrase (an evil-maid guard) — the correct passphrase verifies, a
+    /// wrong one fails closed.
+    #[test]
+    fn forget_circle_drops_it_from_disk_and_reveal_is_passphrase_gated() {
+        use daemonseed_core::bootstrap::BootstrapAnchor;
+        use daemonseed_core::first_start::FirstStart;
+        use daemonseed_core::profile::config::ArgonParams;
+        use daemonseed_core::profile::persist::{
+            load_for_unlock, session_materials_from_unlock, write_first_start,
+        };
+        use daemonseed_core::storage::seeds;
+
+        let _ = oxicrypt_module::initialize();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("ds-gui-forget-test-{}-{nonce}", std::process::id()));
+        let fast = ArgonParams {
+            memory_kib: 8,
+            iterations: 1,
+            parallelism: 1,
+        };
+        let pass = "correct horse battery staple table mountain";
+
+        let sealed = FirstStart::new().initialize(pass, fast).unwrap();
+        let recovery = sealed.display_phrase();
+        let materials = sealed
+            .verify_round_trip(&recovery)
+            .unwrap()
+            .finalize(
+                Some("alice".to_string()),
+                BootstrapAnchor {
+                    server_id: "relay#aabbccddeeff".to_string(),
+                    address: "127.0.0.1:443".to_string(),
+                },
+            )
+            .unwrap()
+            .into_session_materials();
+        write_first_start(&root, &materials, None, false).unwrap();
+
+        // Session 1: join + persist a circle, inspect the gated reveal, then leave it.
+        let mut st1 = GuiState::lobby_only();
+        st1.set_profile(Profile::from_materials(materials, root.clone()));
+        let idx = st1.materialize_from_phrase(STRONG).unwrap();
+        st1.persist_circle(idx).unwrap();
+        assert_eq!(
+            st1.circle_phrase(idx).as_deref(),
+            Some(STRONG),
+            "the join phrase is reachable for export"
+        );
+        assert!(st1.circle_phrase(0).is_none(), "the Lobby has no phrase");
+        assert!(
+            st1.verify_passphrase(pass),
+            "the correct passphrase verifies"
+        );
+        assert!(
+            !st1.verify_passphrase("wrong words here please nope"),
+            "a wrong passphrase fails closed (the evil-maid guard)"
+        );
+        st1.forget_circle(idx)
+            .expect("forget drops the circle + re-seals");
+        assert!(st1.only_lobby(), "the rail is back to just the Lobby");
+        assert!(
+            st1.persisted_rejoins().is_empty(),
+            "no rejoin remains this session"
+        );
+        drop(st1);
+
+        // Session 2: reload from disk — the forgotten circle does NOT come back.
+        let (config, blob) = load_for_unlock(&root).unwrap();
+        let opened = seeds::open(&blob, pass, config.profile_id, config.argon2).unwrap();
+        let materials2 = session_materials_from_unlock(
+            opened.seeds,
+            opened.key,
+            opened.index_key,
+            config,
+            blob.clone(),
+            vec![],
+        )
+        .unwrap();
+        let mut st2 = GuiState::lobby_only();
+        st2.set_profile(Profile::from_materials(materials2, root.clone()));
+        assert!(
+            st2.only_lobby(),
+            "the forgotten circle did not silently rejoin from disk"
         );
 
         let _ = std::fs::remove_dir_all(&root);
