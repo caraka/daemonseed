@@ -225,6 +225,17 @@ pub enum NetCommand {
     /// listeners drop the share from their [`ShareCatalog`] (unified share model).
     #[cfg_attr(not(test), allow(dead_code))]
     UnpublishShare { share_id: String },
+    /// Graceful-close (business-as-usual on quit): withdraw EVERY owned share, then
+    /// signal `ack` once the withdraws are posted, so the UI can briefly block the
+    /// close until they reach the network. The TTL backstop covers any miss. Unlike
+    /// the others, this is NOT fire-and-forget — the close path waits on `ack` with a
+    /// short timeout.
+    // Constructed only by the windowed close handler (`desktop`); the base
+    // offscreen build never builds that path, so the variant reads as dead there.
+    #[cfg_attr(not(feature = "desktop"), allow(dead_code))]
+    WithdrawAllOwned {
+        ack: tokio::sync::oneshot::Sender<()>,
+    },
     /// The single late-join hook (unified share model): post a sealed
     /// [`wire::ShareRollCall`] to the lobby (startup, the Refresh action, and the
     /// reconcile timer all route through here) so live sharers re-announce, then
@@ -2808,6 +2819,12 @@ async fn net_actor(
                 actor
                     .handle_publish_share(root, name, sharer_handle, false)
                     .await
+            }
+            NetCommand::WithdrawAllOwned { ack } => {
+                // Full withdraw-on-close lives on the Veilid path; the relay actor is
+                // being retired at the v0.33.0 cutover, so here we ack immediately —
+                // relay-mode graceful quits fall back to the TTL backstop.
+                let _ = ack.send(());
             }
             NetCommand::UnpublishShare { share_id } => {
                 actor.handle_unpublish_share(&share_id).await

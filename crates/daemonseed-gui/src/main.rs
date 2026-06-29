@@ -2343,6 +2343,7 @@ fn main() {
         );
         // The drain timer runs for the whole app life; the Connect is deferred to
         // the auth-success callbacks (no connecting under the auth gate).
+        let net_close = net.clone();
         let _live = start_drain(&ui, state, net, browser);
         // #60: hold the single-instance lock for the whole windowed session — dropped
         // on return (clean exit removes the lockfile; a crash leaves it for the next
@@ -2395,6 +2396,23 @@ fn main() {
                     WindowEvent::CloseRequested => {
                         if let Some((w, h)) = last_size.get() {
                             save_window_size(&ws_root.borrow(), w, h);
+                        }
+                        // Business-as-usual on a graceful quit: withdraw owned shares
+                        // so they drop from peers' lists immediately, then briefly
+                        // block the close (bounded) until they reach the network — the
+                        // TTL backstop covers anything that misses. Safe: the net actor
+                        // runs off the main thread, so blocking here never starves it,
+                        // and the timeout bounds the wait.
+                        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+                        let sent = net_close
+                            .borrow()
+                            .send(NetCommand::WithdrawAllOwned { ack: ack_tx })
+                            .is_ok();
+                        if sent && let Some(rt) = PICKER_RT.get() {
+                            let _ = rt.block_on(async {
+                                tokio::time::timeout(std::time::Duration::from_secs(2), ack_rx)
+                                    .await
+                            });
                         }
                     }
                     _ => {}

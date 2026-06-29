@@ -298,6 +298,15 @@ async fn handle_command(
         NetCommand::UnpublishShare { share_id } => {
             unpublish_share(shares, evt_tx, net, &share_id).await;
         }
+        NetCommand::WithdrawAllOwned { ack } => {
+            // Business-as-usual on a graceful quit: withdraw every owned share so it
+            // drops from peers' lists at once (not via the TTL backstop), then ack so
+            // the close path can briefly wait for these to reach the network.
+            for s in shares.own.clone() {
+                unpublish_share(shares, evt_tx, net, &s.share_id).await;
+            }
+            let _ = ack.send(());
+        }
         NetCommand::RefreshShares => {
             let _ = evt_tx.send(NetEvent::SharesSnapshot {
                 shares: shares.listings(),
