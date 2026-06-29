@@ -1682,6 +1682,20 @@ fn apply_net_event(
         // Publish (commit 3): keep the session's live-shares list in sync + surface a
         // quiet status line. The own share also appears in the browse tree tagged "you"
         // on the next ~3s catalog poll (the relay re-list folds it in via `set_shares`).
+        NetEvent::RestoreStarted { count } => {
+            // #122: lead the connect-time restore with a reassurance banner BEFORE any
+            // share row appears, so it is not a redundant toast coincident with the
+            // share going live. Auto-dismisses like the completion notice it replaces.
+            let noun = if count == 1 { "share" } else { "shares" };
+            let msg = format!("Restoring {count} {noun} from last session…");
+            ui.set_connect_notice(SharedString::from(msg));
+            let ui_weak = ui.as_weak();
+            slint::Timer::single_shot(Duration::from_secs(6), move || {
+                if let Some(ui) = ui_weak.upgrade() {
+                    ui.set_connect_notice(SharedString::from(""));
+                }
+            });
+        }
         NetEvent::PublishStarted {
             share_id,
             name,
@@ -1739,22 +1753,12 @@ fn apply_net_event(
                     persist_err.as_deref(),
                 );
                 ui.set_publish_status(SharedString::from(msg.clone()));
-                ui.set_share_status(SharedString::from(msg.clone()));
-                // Felt-test 2026-06-21: a restore must be visible from the Chat landing
-                // view, not Shares-tab-only (share-status). Tab-independent banner shows
-                // "Restored N shares…" wherever the user lands, then auto-dismisses after a
-                // brief read (effortless motif: comes and goes on startup). 6s sits in the
-                // GNOME toast / Material Snackbar-LONG range for a short informational line.
-                // The ✕ still allows an early manual dismiss.
-                if restored {
-                    ui.set_connect_notice(SharedString::from(msg));
-                    let ui_weak = ui.as_weak();
-                    slint::Timer::single_shot(Duration::from_secs(6), move || {
-                        if let Some(ui) = ui_weak.upgrade() {
-                            ui.set_connect_notice(SharedString::from(""));
-                        }
-                    });
-                }
+                ui.set_share_status(SharedString::from(msg));
+                // #122: the floating restore banner now LEADS the restore via
+                // NetEvent::RestoreStarted (emitted before any share is re-served), so a
+                // per-share completion no longer raises a connect_notice coincident with
+                // the share appearing — that toast read as redundant. The Shares-tab
+                // status line above still reflects the restore.
             }
         }
         // PublishStopped fires on user unpublish, session end, AND relay reap — so it

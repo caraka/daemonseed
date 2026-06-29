@@ -459,6 +459,11 @@ pub enum NetEvent {
         /// `PublishStarted` with `republishing: false` confirms it is live.
         republishing: bool,
     },
+    /// Emitted once at the start of a connect-time auto-republish, before any share is
+    /// re-served, so the UI can lead with a "Restoring N shares from last session…"
+    /// reassurance during the slow republish window — instead of a toast that arrives
+    /// coincident with the share going live, which reads as redundant (#122).
+    RestoreStarted { count: usize },
     /// A published share stopped serving (unpublish, session end, or relay reap).
     PublishStopped { share_id: String },
     /// A publish attempt failed (no session, index error, or refused RPC).
@@ -1107,6 +1112,11 @@ impl Actor {
                     // directory basename as the share name and the presented handle
                     // as the sharer handle; a per-share failure surfaces as a
                     // PublishError and never aborts the others or the connect.
+                    if !republish_roots.is_empty() {
+                        self.emit(NetEvent::RestoreStarted {
+                            count: republish_roots.len(),
+                        });
+                    }
                     let sharer = self.my_handle.clone();
                     for (root, persisted_name) in republish_roots {
                         let name = republish_name(&root, persisted_name.as_deref());
@@ -1177,6 +1187,11 @@ impl Actor {
             self.handle_join_circle(circle_id, &phrase).await;
         }
         // M16 parity: silently re-publish persisted shares via the real path.
+        if !republish_roots.is_empty() {
+            self.emit(NetEvent::RestoreStarted {
+                count: republish_roots.len(),
+            });
+        }
         let sharer = self.my_handle.clone();
         for (root, persisted_name) in republish_roots {
             let name = republish_name(&root, persisted_name.as_deref());

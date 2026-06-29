@@ -271,9 +271,16 @@ async fn handle_command(
                 // discovery re-announces it. A per-share failure surfaces as a publish
                 // error and never aborts the others.
                 let sharer = my_handle.clone();
+                // #122: lead the restore with a single reassurance banner before any
+                // share is re-served, instead of a per-share toast coincident with the
+                // share going live.
+                if !republish_roots.is_empty() {
+                    let _ = evt_tx.send(NetEvent::RestoreStarted {
+                        count: republish_roots.len(),
+                    });
+                }
                 for (root, persisted_name) in republish_roots {
                     let name = crate::net::republish_name(&root, persisted_name.as_deref());
-                    // restored: true → the "Restored N shares…" reassurance banner.
                     publish_share(shares, evt_tx, net, root, name, sharer.clone(), true).await;
                 }
             }
