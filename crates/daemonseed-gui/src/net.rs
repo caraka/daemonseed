@@ -453,6 +453,11 @@ pub enum NetEvent {
         /// false for a fresh user-driven publish — drives the "Restored N shares
         /// from last session" status vs the per-share "Published …" line.
         restored: bool,
+        /// #117: true while a (re)publish is in flight — the slow serve+advert window
+        /// over Veilid, which on a reconnect made a sharer think their share had died
+        /// (and re-publish it). The own-share row shows "republishing…" until a second
+        /// `PublishStarted` with `republishing: false` confirms it is live.
+        republishing: bool,
     },
     /// A published share stopped serving (unpublish, session end, or relay reap).
     PublishStopped { share_id: String },
@@ -2051,6 +2056,10 @@ impl Actor {
             file_count,
             root: root.to_string_lossy().into_owned(),
             restored,
+            // The relay path publishes synchronously here (already served), so a relay
+            // share is never in the in-flight state — #117's "republishing…" tag is a
+            // Veilid-path affordance (the relay is retiring at the v0.33.0 cutover).
+            republishing: false,
         });
     }
 

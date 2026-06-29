@@ -58,6 +58,9 @@ struct MyShareRow {
     id: string,
     name: string,
     files: int,
+    // #117: true while a (re)publish is in flight (the slow Veilid serve+advert
+    // window) — the row reads "republishing…" instead of "serving".
+    republishing: bool,
 }
 
 // One live Lobby roster row (#75). `name` is the member's display handle; the
@@ -1622,7 +1625,13 @@ export component AppWindow inherits Window {
                                 VerticalLayout {
                                     alignment: center; spacing: 1px;
                                     Text { text: s.name; color: #e4e8ee; font-size: 13px; }
-                                    Text { text: s.files + " file(s) · serving"; color: #5b6472; font-size: 11px; }
+                                    // #117: computed status (never an `if` — item-tree
+                                    // safety): "republishing…" while in flight, else serving.
+                                    Text {
+                                        text: s.republishing ? "republishing… · re-establishing your share" : (s.files + " file(s) · serving");
+                                        color: s.republishing ? #c9a24b : #5b6472;
+                                        font-size: 11px;
+                                    }
                                 }
                                 Rectangle { }
                                 PillButton {

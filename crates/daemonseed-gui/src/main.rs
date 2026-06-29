@@ -1139,6 +1139,7 @@ fn apply_my_shares(ui: &AppWindow, state: &GuiState) {
             id: SharedString::from(s.id.as_str()),
             name: SharedString::from(s.name.as_str()),
             files: s.files as i32,
+            republishing: s.republishing,
         })
         .collect();
     ui.set_my_shares(ModelRc::from(Rc::new(VecModel::from(rows))));
@@ -1674,62 +1675,73 @@ fn apply_net_event(
             file_count,
             root,
             restored,
+            republishing,
         } => {
-            // M16 write-through: remember this root so it auto-republishes next launch
-            // (idempotent). A persistence failure is non-fatal — the share still serves
-            // this session; surface it quietly like the circle write-through does.
-            let persist_err = {
-                let mut st = state.borrow_mut();
-                st.add_my_share(share_id, name.clone(), file_count, root.clone());
-                // #41: persist the user's CUSTOM share name so it survives to the next
-                // launch's auto-republish. The publish path resolves a blank name field
-                // to the folder basename, so the effective `name` is either the typed
-                // custom name or the basename. Persist `Some(name)` for a custom name and
-                // `None` for the basename default, so `republish_name` keeps deriving the
-                // basename for un-named shares. The custom-vs-basename signal is the
-                // effective name compared to the root's own basename; a custom name that
-                // happens to equal the basename persists as `None`, which republishes to
-                // the same basename (inert). On the auto-republish path (`restored`) the
-                // root is already stored, so `persist_published` is a keyed no-op that
-                // never clobbers an existing stored name.
-                let basename = std::path::Path::new(&root)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "share".to_string());
-                let persist_name = if name == basename {
-                    None
-                } else {
-                    Some(name.as_str())
+            if republishing {
+                // #117: a (re)publish is in flight — surface the share now with its
+                // "republishing…" tag. M16 persistence + the status line wait for the
+                // live confirmation (the second PublishStarted, republishing: false).
+                state
+                    .borrow_mut()
+                    .add_my_share(share_id, name, file_count, root, true);
+                apply_my_shares(ui, &state.borrow());
+            } else {
+                // M16 write-through: remember this root so it auto-republishes next launch
+                // (idempotent). A persistence failure is non-fatal — the share still serves
+                // this session; surface it quietly like the circle write-through does.
+                let persist_err = {
+                    let mut st = state.borrow_mut();
+                    st.add_my_share(share_id, name.clone(), file_count, root.clone(), false);
+                    // #41: persist the user's CUSTOM share name so it survives to the next
+                    // launch's auto-republish. The publish path resolves a blank name field
+                    // to the folder basename, so the effective `name` is either the typed
+                    // custom name or the basename. Persist `Some(name)` for a custom name and
+                    // `None` for the basename default, so `republish_name` keeps deriving the
+                    // basename for un-named shares. The custom-vs-basename signal is the
+                    // effective name compared to the root's own basename; a custom name that
+                    // happens to equal the basename persists as `None`, which republishes to
+                    // the same basename (inert). On the auto-republish path (`restored`) the
+                    // root is already stored, so `persist_published` is a keyed no-op that
+                    // never clobbers an existing stored name.
+                    let basename = std::path::Path::new(&root)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "share".to_string());
+                    let persist_name = if name == basename {
+                        None
+                    } else {
+                        Some(name.as_str())
+                    };
+                    st.persist_published(&root, persist_name).err()
                 };
-                st.persist_published(&root, persist_name).err()
-            };
-            apply_my_shares(ui, &state.borrow());
-            // An auto-republish on connect reads as "Restored N shares…" rather than a
-            // per-share "Published …" so it is not mistaken for a fresh publish.
-            let restored_count = state.borrow().my_shares().len();
-            let msg = publish_status_line(
-                restored,
-                &name,
-                file_count,
-                restored_count,
-                persist_err.as_deref(),
-            );
-            ui.set_publish_status(SharedString::from(msg.clone()));
-            ui.set_share_status(SharedString::from(msg.clone()));
-            // Felt-test 2026-06-21: a restore must be visible from the Chat landing
-            // view, not Shares-tab-only (share-status). Tab-independent banner shows
-            // "Restored N shares…" wherever the user lands, then auto-dismisses after a
-            // brief read (effortless motif: comes and goes on startup). 6s sits in the
-            // GNOME toast / Material Snackbar-LONG range for a short informational line.
-            // The ✕ still allows an early manual dismiss.
-            if restored {
-                ui.set_connect_notice(SharedString::from(msg));
-                let ui_weak = ui.as_weak();
-                slint::Timer::single_shot(Duration::from_secs(6), move || {
-                    if let Some(ui) = ui_weak.upgrade() {
-                        ui.set_connect_notice(SharedString::from(""));
-                    }
-                });
+                apply_my_shares(ui, &state.borrow());
+                // An auto-republish on connect reads as "Restored N shares…" rather than a
+                // per-share "Published …" so it is not mistaken for a fresh publish.
+                let restored_count = state.borrow().my_shares().len();
+                let msg = publish_status_line(
+                    restored,
+                    &name,
+                    file_count,
+                    restored_count,
+                    persist_err.as_deref(),
+                );
+                ui.set_publish_status(SharedString::from(msg.clone()));
+                ui.set_share_status(SharedString::from(msg.clone()));
+                // Felt-test 2026-06-21: a restore must be visible from the Chat landing
+                // view, not Shares-tab-only (share-status). Tab-independent banner shows
+                // "Restored N shares…" wherever the user lands, then auto-dismisses after a
+                // brief read (effortless motif: comes and goes on startup). 6s sits in the
+                // GNOME toast / Material Snackbar-LONG range for a short informational line.
+                // The ✕ still allows an early manual dismiss.
+                if restored {
+                    ui.set_connect_notice(SharedString::from(msg));
+                    let ui_weak = ui.as_weak();
+                    slint::Timer::single_shot(Duration::from_secs(6), move || {
+                        if let Some(ui) = ui_weak.upgrade() {
+                            ui.set_connect_notice(SharedString::from(""));
+                        }
+                    });
+                }
             }
         }
         // PublishStopped fires on user unpublish, session end, AND relay reap — so it
@@ -2654,12 +2666,15 @@ fn main() {
                 "trip-photos".into(),
                 42,
                 "/shares/trip".into(),
+                false,
             );
+            // #117: one row in-flight so the offscreen fixture shows the tag.
             st.add_my_share(
                 "id-mine-2".into(),
                 "tax-2025".into(),
                 7,
                 "/shares/tax".into(),
+                true,
             );
         }
         apply_my_shares(&ui, &state.borrow());

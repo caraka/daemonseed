@@ -661,6 +661,20 @@ async fn publish_share(
         Err(e) => return err(format!("could not seal share announcement: {e}")),
     };
 
+    // #117: show the share as "republishing…" for the slow serve+advert window below
+    // (route allocation + DHT write over Veilid). On a reconnect this window is what
+    // made a sharer think their share had died — the in-flight tag says it is being
+    // re-established, not gone. Cleared to live by the final `PublishStarted` once the
+    // advert lands; the entry is removed (`PublishStopped`) if the publish fails.
+    let _ = evt_tx.send(NetEvent::PublishStarted {
+        share_id: share_id.clone(),
+        name: name.clone(),
+        file_count,
+        root: root_str.clone(),
+        restored: false,
+        republishing: true,
+    });
+
     // Register the content to serve owner-on-demand (chunks sealed under the room
     // key), then announce it with a signed route advert. veilid-net allocates the
     // private route + signs via the capability internally.
@@ -668,6 +682,9 @@ async fn publish_share(
         .serve_share(share_id.clone(), content, room_key_bytes)
         .await
     {
+        let _ = evt_tx.send(NetEvent::PublishStopped {
+            share_id: share_id.clone(),
+        });
         return err(format!("could not register share to serve: {e}"));
     }
     let signer = IdentityRouteAdvertSigner::from_arc(signing).into_arc();
@@ -675,6 +692,9 @@ async fn publish_share(
         .publish_share(owner_seed, share_id.clone(), sealed, signer)
         .await
     {
+        let _ = evt_tx.send(NetEvent::PublishStopped {
+            share_id: share_id.clone(),
+        });
         return err(format!("could not announce share: {e}"));
     }
 
@@ -688,12 +708,14 @@ async fn publish_share(
     let _ = evt_tx.send(NetEvent::SharesSnapshot {
         shares: shares.listings(),
     });
+    // The advert is live: flip the in-flight tag off (republishing: false).
     let _ = evt_tx.send(NetEvent::PublishStarted {
         share_id,
         name,
         file_count,
         root: root_str,
         restored: false,
+        republishing: false,
     });
 }
 

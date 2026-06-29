@@ -224,6 +224,10 @@ pub struct MyShare {
     /// The published directory path — the M16 persistence key (so Unpublish can
     /// forget the right persisted root). Carried back on `PublishStarted`.
     pub root: String,
+    /// #117: true while a (re)publish is in flight (the slow Veilid serve+advert
+    /// window) — drives the per-share "republishing…" tag. Cleared to `false` when the
+    /// share confirms live (the second `PublishStarted`).
+    pub republishing: bool,
 }
 
 /// The Round-5 **net contract** carried by a materialized circle (refinement #1).
@@ -429,14 +433,23 @@ impl GuiState {
 
     /// Record a share that just started serving this session (commit 3, on
     /// `PublishStarted`). Replaces any existing entry with the same id so a relay
-    /// re-list can't double it.
-    pub fn add_my_share(&mut self, id: String, name: String, files: usize, root: String) {
+    /// re-list can't double it. `republishing` (#117) flags an in-flight (re)publish —
+    /// the same id is re-pushed with `false` once it confirms live.
+    pub fn add_my_share(
+        &mut self,
+        id: String,
+        name: String,
+        files: usize,
+        root: String,
+        republishing: bool,
+    ) {
         self.my_shares.retain(|s| s.id != id);
         self.my_shares.push(MyShare {
             id,
             name,
             files,
             root,
+            republishing,
         });
     }
 
@@ -1162,24 +1175,51 @@ mod tests {
     fn my_shares_add_replace_remove() {
         let mut st = GuiState::lobby_only();
         assert!(st.my_shares().is_empty());
-        st.add_my_share("id-a".into(), "alpha".into(), 3, "/shares/alpha".into());
-        st.add_my_share("id-b".into(), "beta".into(), 1, "/shares/beta".into());
+        // #117: id-a starts in-flight (republishing), id-b live.
+        st.add_my_share(
+            "id-a".into(),
+            "alpha".into(),
+            3,
+            "/shares/alpha".into(),
+            true,
+        );
+        st.add_my_share(
+            "id-b".into(),
+            "beta".into(),
+            1,
+            "/shares/beta".into(),
+            false,
+        );
         assert_eq!(st.my_shares().len(), 2);
+        assert!(
+            st.my_shares()
+                .iter()
+                .find(|s| s.id == "id-a")
+                .unwrap()
+                .republishing,
+            "#117: id-a is flagged republishing while in flight"
+        );
         // share_root keys the M16 persistence by id → published directory path.
         assert_eq!(st.share_root("id-b").as_deref(), Some("/shares/beta"));
         assert_eq!(st.share_root("id-zzz"), None);
         // Re-publish (same id) replaces, not duplicates — a relay re-list is idempotent.
+        // #117: the live confirmation re-pushes id-a with republishing=false (tag clears).
         st.add_my_share(
             "id-a".into(),
             "alpha-renamed".into(),
             9,
             "/shares/alpha".into(),
+            false,
         );
         assert_eq!(st.my_shares().len(), 2);
         let a = st.my_shares().iter().find(|s| s.id == "id-a").unwrap();
         assert_eq!(a.name, "alpha-renamed");
         assert_eq!(a.files, 9);
         assert_eq!(a.root, "/shares/alpha");
+        assert!(
+            !a.republishing,
+            "#117: the live confirmation clears the tag"
+        );
         // Unpublish drops by id; unknown id is a no-op. (remove returns the dropped root.)
         assert_eq!(st.remove_my_share("id-a").as_deref(), Some("/shares/alpha"));
         assert_eq!(st.remove_my_share("id-zzz"), None);
