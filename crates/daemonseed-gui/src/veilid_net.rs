@@ -273,7 +273,8 @@ async fn handle_command(
                 let sharer = my_handle.clone();
                 for (root, persisted_name) in republish_roots {
                     let name = crate::net::republish_name(&root, persisted_name.as_deref());
-                    publish_share(shares, evt_tx, net, root, name, sharer.clone()).await;
+                    // restored: true → the "Restored N shares…" reassurance banner.
+                    publish_share(shares, evt_tx, net, root, name, sharer.clone(), true).await;
                 }
             }
         }
@@ -293,7 +294,8 @@ async fn handle_command(
             name,
             sharer_handle,
         } => {
-            publish_share(shares, evt_tx, net, root, name, sharer_handle).await;
+            // A fresh user-driven publish (restored: false → "Published …" status).
+            publish_share(shares, evt_tx, net, root, name, sharer_handle, false).await;
         }
         NetCommand::UnpublishShare { share_id } => {
             unpublish_share(shares, evt_tx, net, &share_id).await;
@@ -604,6 +606,10 @@ async fn publish_share(
     root: PathBuf,
     name: String,
     sharer_handle: String,
+    // #117: true on the connect-time auto-republish (the M16 restore path) so the
+    // live emit drives the always-visible "Restored N shares from last session"
+    // banner — a sharer sees their shares come back without opening Manage shares.
+    restored: bool,
 ) {
     let err = |message: String| {
         let _ = evt_tx.send(NetEvent::PublishError { message });
@@ -671,7 +677,7 @@ async fn publish_share(
         name: name.clone(),
         file_count,
         root: root_str.clone(),
-        restored: false,
+        restored,
         republishing: true,
     });
 
@@ -714,7 +720,7 @@ async fn publish_share(
         name,
         file_count,
         root: root_str,
-        restored: false,
+        restored,
         republishing: false,
     });
 }

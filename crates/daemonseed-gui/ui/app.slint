@@ -1628,7 +1628,7 @@ export component AppWindow inherits Window {
                                     // #117: computed status (never an `if` — item-tree
                                     // safety): "republishing…" while in flight, else serving.
                                     Text {
-                                        text: s.republishing ? "republishing… · re-establishing your share" : (s.files + " file(s) · serving");
+                                        text: s.republishing ? "publishing… · establishing your share" : (s.files + " file(s) · serving");
                                         color: s.republishing ? #c9a24b : #5b6472;
                                         font-size: 11px;
                                     }
