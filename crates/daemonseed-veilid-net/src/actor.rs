@@ -684,6 +684,25 @@ async fn publish_rendezvous(
     r
 }
 
+/// Open/create the rendezvous record and write `sealed` to the stable-identity slot
+/// for `stable_id` — the **current-state** (Shape B) publish. Re-publishing the same
+/// `stable_id` overwrites in place (last-writer-wins), so a share's dead-route advert
+/// never orphans across a restart (#118) and a withdraw cancels it in the same slot.
+/// The public-share advert path uses this; circles / lobby-chat keep the append-ring.
+async fn publish_current_state(
+    api: &VeilidAPI,
+    rc: &RoutingContext,
+    owner_seed: [u8; 32],
+    stable_id: &str,
+    sealed: Vec<u8>,
+) -> Result<()> {
+    let owner = identity::rendezvous_owner_keypair(&owner_seed)?;
+    let key = rendezvous::open_or_create(api, rc, &owner).await?;
+    let subkey = rendezvous::current_state_subkey(stable_id);
+    crate::vtrace!("publish_current_state: stable_id={stable_id} key={key:?} subkey={subkey}");
+    rendezvous::publish_at_subkey(rc, &key, &owner, subkey, sealed).await
+}
+
 /// Open/create the rendezvous record, register a watch, and kick off a one-shot
 /// background sweep for the bounded login backlog. Inbound items flow out as
 /// [`VeilidNetEvent::Inbound`]. Used for circles and public rooms / lobby alike.
@@ -728,8 +747,12 @@ struct AdvertState {
 async fn publish_one_advert(
     api: &VeilidAPI,
     rc: &RoutingContext,
-    node_pub: &[u8; 32],
-    ring_seq: &Mutex<HashMap<RecordKey, u32>>,
+    // node_pub / ring_seq are no longer used by the advert path — Shape B places by
+    // share_id (current-state), not the node-region append-ring. Kept in the
+    // signature so the two call sites stay unchanged; remove when refresh_share_adverts
+    // is next touched.
+    _node_pub: &[u8; 32],
+    _ring_seq: &Mutex<HashMap<RecordKey, u32>>,
     advert_routes: &Mutex<HashMap<String, RouteId>>,
     share_id: &str,
     advert: &AdvertState,
@@ -761,7 +784,7 @@ async fn publish_one_advert(
         "publish_one_advert: share_id={share_id} envelope={} bytes",
         envelope.len()
     );
-    publish_rendezvous(api, rc, node_pub, ring_seq, advert.owner_seed, envelope).await
+    publish_current_state(api, rc, advert.owner_seed, share_id, envelope).await
 }
 
 /// Re-publish every active share advert with a fresh route + signature (called on

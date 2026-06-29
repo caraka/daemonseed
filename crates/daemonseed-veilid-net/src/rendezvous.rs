@@ -129,13 +129,45 @@ pub async fn publish(
     seq: u32,
     sealed: Vec<u8>,
 ) -> Result<()> {
+    publish_at_subkey(rc, key, owner, base + (seq % RING_DEPTH), sealed).await
+}
+
+/// Map a stable logical identity (a `share_id`; later a presence member id) to a
+/// fixed subkey — the **current-state** placement (Shape B,
+/// `docs/design/unified-room-model.md`). Unlike [`member_base_subkey`], the slot is a
+/// pure function of the item's stable identity, NOT the ephemeral node pubkey, so a
+/// republish (even under a fresh node identity after a restart) overwrites the SAME
+/// slot — last-writer-wins — and a withdraw cancels it in place. This is what stops
+/// dead-route share announcements from orphaning across restarts (#118). Collision
+/// (two ids → same slot) degrades to slot-sharing, bounded by [`SUBKEY_COUNT`]; a
+/// larger dedicated schema lifts the ceiling if it ever bites.
+pub fn current_state_subkey(stable_id: &str) -> u32 {
+    // FNV-1a — dep-free and well-distributed over the input bytes.
+    let mut h: u32 = 0x811c_9dc5;
+    for b in stable_id.as_bytes() {
+        h ^= u32::from(*b);
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h % u32::from(SUBKEY_COUNT)
+}
+
+/// Write `sealed` to a SPECIFIC subkey (owner-signed), last-writer-wins — the
+/// current-state counterpart to [`publish`]'s append-ring write. The caller picks the
+/// slot from a stable identity via [`current_state_subkey`], so re-publishing the same
+/// item overwrites in place instead of orphaning a stale copy.
+pub async fn publish_at_subkey(
+    rc: &RoutingContext,
+    key: &RecordKey,
+    owner: &KeyPair,
+    subkey: u32,
+    sealed: Vec<u8>,
+) -> Result<()> {
     if sealed.len() > APP_MESSAGE_CAP {
         return Err(VeilidNetError::Send(format!(
             "sealed {} bytes exceeds the {APP_MESSAGE_CAP}-byte subkey cap (re-chunk)",
             sealed.len()
         )));
     }
-    let subkey = base + (seq % RING_DEPTH);
     rc.set_dht_value(
         key.clone(),
         subkey,
@@ -173,4 +205,31 @@ pub async fn sweep(
         }
     }
     crate::vtrace!("sweep: done, {found} backlog slot(s) emitted");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn current_state_subkey_is_stable_and_in_range() {
+        // A share's slot must be identical across calls — last-writer-wins on
+        // re-publish (the #118 fix) depends on it.
+        let id = "3cbac166afc8088bc30cb1dd256c754d";
+        assert_eq!(current_state_subkey(id), current_state_subkey(id));
+        assert!(current_state_subkey(id) < u32::from(SUBKEY_COUNT));
+    }
+
+    #[test]
+    fn current_state_subkey_ignores_node_identity_and_distributes() {
+        // The slot is a pure function of the stable id — by construction it cannot
+        // depend on the ephemeral per-launch node pubkey, so a restart can never
+        // orphan a share into a new slot. Distinct ids spread across many slots.
+        let slots: HashSet<u32> = (0..200)
+            .map(|i| current_state_subkey(&format!("share-{i:032x}")))
+            .collect();
+        assert!(slots.len() > 1, "ids spread across slots, not all into one");
+        assert!(slots.iter().all(|s| *s < u32::from(SUBKEY_COUNT)));
+    }
 }

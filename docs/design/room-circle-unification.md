@@ -54,6 +54,11 @@ So any holder of a circle key — an ex-member, an infiltrator, a leaked or comp
 - **Opportunistic operator-gate unification** — whether to fold the operator-owner parameterization in at the same time, or leave it.
 - **Relationship to the existing `ROADMAP.md` Designs entry _"Sharer identity → handle#hash verification"_** — this design delivers that property for circles; reconcile or absorb that entry at scoping.
 
-## Sequencing (hard gate)
+## Sequencing (hard gate — REVISED 2026-06-29, see `unified-room-model.md`)
 
-Implementation is DEFERRED until **both**: (1) the Veilid migration's 2b transport wiring is complete and tested, **and** (2) the Veilid migration is signed off and closed (other Veilid phases may precede). One major refactor at a time. This design graduates into GitHub issues only when that gate clears.
+Split into two layers (caraka, 2026-06-29):
+
+- **Layer 1 — the engine / state / discovery / liveness unification (internal, no wire break)** is NOT deferred: it is the substance of Veilid **Phase 4** and is built now, on the one unified rendezvous engine (one code path, entropy-source the only variant). The room↔circle storage / discovery / fan-out / share-liveness equivalence lands here. Design-of-record: `unified-room-model.md`.
+- **Layer 2 — the proto message-type merge + signed circle authorship (this document's headline; wire-breaking, MAJOR)** rides the **v0.33.0 cutover** clean break, which pays for the wire break once. This is what stays gated: the wire merge waits for the cutover it lands with.
+
+"One major refactor at a time" still holds — there is exactly one cutover and one wire break. This document's Layer-2 content graduates into GitHub issues at the cutover; the Layer-1 engine unification graduates now via `unified-room-model.md`.
