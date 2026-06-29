@@ -120,7 +120,11 @@ const NOT_YET: &str = "not yet on Veilid";
 
 /// How long a discovered share lives in the catalog without a fresh announce —
 /// mirrors the relay actor's `SHARE_CATALOG_TTL`.
-const SHARE_CATALOG_TTL: Duration = Duration::from_secs(90);
+const SHARE_CATALOG_TTL: Duration = Duration::from_secs(600);
+
+/// How often the recipient ages out shares it has not reheard within the TTL
+/// (mirrors the GUI Veilid actor's prune tick).
+const SHARE_CATALOG_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// A joined circle's local state: the per-session routing id, the content key
 /// (for seal/open), the shared rendezvous-owner seed (for publish/subscribe),
@@ -220,6 +224,7 @@ pub async fn veilid_net_actor(
     // `name#hash` is learned, a collision is identity-derived and astronomically
     // unlikely.
     let mut my_handle: Option<String> = None;
+    let mut prune_timer = tokio::time::interval(SHARE_CATALOG_PRUNE_INTERVAL);
 
     loop {
         tokio::select! {
@@ -233,6 +238,14 @@ pub async fn veilid_net_actor(
             // Only poll the Veilid event stream once connected.
             Some(ev) = recv_opt(&mut ev_rx), if ev_rx.is_some() => {
                 handle_inbound(ev, &evt_tx, &circles, &my_handle, &mut shares);
+            }
+            // Age out discovered shares not reheard within the TTL (Shape B liveness),
+            // mirroring the GUI Veilid actor. Own shares ride PublishStarted/Stopped,
+            // never the catalog, so they are unaffected.
+            _ = prune_timer.tick() => {
+                if shares.catalog.prune(Instant::now()) > 0 {
+                    emit_shares_snapshot(&shares, &evt_tx);
+                }
             }
         }
     }
