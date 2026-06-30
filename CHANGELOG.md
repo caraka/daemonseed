@@ -49,6 +49,7 @@ work lives in the project lead's vault manifest, not here.
 
 - `daemonseed-gui`: the restore banner now leads the connect-time republish — a single "Restoring N shares from last session…" notice fires (via `NetEvent::RestoreStarted`) before any share is re-served, instead of a per-share completion notice that arrived coincident with the share going live and read as redundant (#122).
 - `daemonseed-veilid-net`: the public-share fetcher pulls fragments in a bounded-concurrency pipeline (`buffered`, in request order) instead of one `app_call` at a time, with each fragment size-capped at `FRAGMENT_SIZE` to bound reassembly memory (#109).
+- `daemonseed-gui`: public-share downloads fetch a file's chunks with bounded concurrency (`fetch_chunks_ordered`, `buffered` window `CHUNK_FETCH_CONCURRENCY`) instead of one chunk at a time, preserving manifest order for byte-for-byte reassembly and per-chunk progress; the higher level above #109's within-chunk fragment pipeline (#113).
 
 ### Fixed
 

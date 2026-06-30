@@ -44,6 +44,12 @@ daemonseed-server = { path = "../daemonseed-server" }
 # crate's relay actor are both deleted at the v0.33.0 cutover.
 daemonseed-veilid-net = { path = "../daemonseed-veilid-net", optional = true }
 
+# Bounded-concurrency stream combinator (`StreamExt::buffered`) for parallelizing
+# public-share chunk downloads (#113) — same dep + spec the veilid-net fragment
+# pipeline (#109) uses; already in the workspace lock. Optional + veilid-gated: the
+# download path is `#[cfg(feature = "veilid")]`, so default builds never pull it.
+futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
+
 # Process-wide CryptoProvider install — symmetric with cli/tui/server. The GUI
 # initializes the same oxicrypt module + rustls provider before connecting.
 oxicrypt-module = { workspace = true }
@@ -100,4 +106,4 @@ desktop = ["slint/backend-winit", "dep:i-slint-backend-winit"]
 # Also turns on `daemonseed-cli/veilid` so the least-authority
 # `IdentityRouteAdvertSigner` route-advert capability is in scope for the
 # public-share publish path (Phase 3 Slice 2b).
-veilid = ["dep:daemonseed-veilid-net", "daemonseed-cli/veilid"]
+veilid = ["dep:daemonseed-veilid-net", "dep:futures-util", "daemonseed-cli/veilid"]

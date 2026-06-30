@@ -65,6 +65,7 @@ use daemonseed_core::share_announce::{
 };
 use daemonseed_core::share_catalog::{CatalogChange, ShareCatalog, ShareListing};
 use daemonseed_core::share_serve::ShareContent;
+use daemonseed_core::storage::cas::ChunkAddr;
 use daemonseed_core::storage::fetched::rebase_to_selection_root;
 use daemonseed_proto::v1 as wire;
 use daemonseed_veilid_net::{
@@ -88,6 +89,12 @@ const SHARE_CATALOG_TTL: Duration = Duration::from_secs(600);
 
 /// How often the recipient ages out shares it has not reheard within the TTL.
 const SHARE_CATALOG_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Max chunk fetches in flight at once during a download (#113). Bounds the
+/// parallelism so a many-chunk file saturates the link without an unbounded fan-out
+/// of `app_call`s; mirrors the veilid-net fragment pipeline window (#109). Chunks
+/// still reassemble in manifest order (`buffered` preserves order).
+const CHUNK_FETCH_CONCURRENCY: usize = 8;
 
 /// A joined circle's local state: the GUI routing tag, the content key (for
 /// seal/open), and the shared rendezvous-owner seed (for publish/subscribe).
@@ -976,6 +983,36 @@ fn prune_unreachable_share(
     }
 }
 
+/// Fetch every chunk in `addrs` with bounded concurrency `cap`, returning the chunk
+/// bytes in the SAME order as `addrs` so a file reassembles byte-for-byte (#113).
+/// `buffered` runs up to `cap` `fetch` futures at once but yields them in input
+/// order, so reassembly is correct while the link stays busy; `on_chunk` fires per
+/// chunk as it arrives (download progress). The first error short-circuits — the
+/// remaining in-flight fetches are cancelled when the stream drops. `fetch` is a
+/// closure so the real path closes over `handle.fetch_chunk` while a test injects a
+/// concurrency-counting fake (no network).
+async fn fetch_chunks_ordered<F, Fut, P>(
+    addrs: &[ChunkAddr],
+    cap: usize,
+    fetch: F,
+    mut on_chunk: P,
+) -> Result<Vec<Vec<u8>>, VeilidNetError>
+where
+    F: Fn(ChunkAddr) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>, VeilidNetError>>,
+    P: FnMut(&[u8]),
+{
+    use futures_util::stream::{self, StreamExt};
+    let mut stream = stream::iter(addrs.iter().copied().map(fetch)).buffered(cap.max(1));
+    let mut out: Vec<Vec<u8>> = Vec::with_capacity(addrs.len());
+    while let Some(res) = stream.next().await {
+        let data = res?;
+        on_chunk(&data);
+        out.push(data);
+    }
+    Ok(out)
+}
+
 /// A2 download: import the route, fetch the selected files' chunks (each
 /// SHA-384-verified inside `fetch_chunk`, ISC-S28), and write them under
 /// `fetched_root`. On any failure the partial files are deleted (ISC-A-C31).
@@ -1105,28 +1142,35 @@ async fn confirm_fetch_inner(
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
         }
+        // Fetch this file's chunks with bounded concurrency (#113), preserving
+        // manifest order for byte-for-byte reassembly. Each `fetch_chunk` reassembles
+        // its transport fragments and SHA-384-verifies the chunk against its address
+        // (ISC-S28 / ISC-A-S20); the first failure prunes the stale share and aborts.
+        let chunks = match fetch_chunks_ordered(
+            &entry.chunks,
+            CHUNK_FETCH_CONCURRENCY,
+            |addr| handle.fetch_chunk(route.clone(), share_id, addr, room_key_bytes),
+            |data| {
+                chunks_received += 1;
+                bytes_received += data.len() as u64;
+                let _ = evt_tx.send(NetEvent::FetchProgress {
+                    total_chunks: Some(total_chunks),
+                    chunks_received,
+                    bytes_received,
+                });
+            },
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                prune_unreachable_share(shares, evt_tx, share_id);
+                return Err(fetch_error_message("chunk fetch failed", e));
+            }
+        };
         let mut file_bytes: Vec<u8> = Vec::with_capacity(entry.size as usize);
-        for addr in &entry.chunks {
-            // `fetch_chunk` reassembles fragments and SHA-384-verifies the chunk
-            // against its address before returning (ISC-S28 / ISC-A-S20).
-            let data = match handle
-                .fetch_chunk(route.clone(), share_id, *addr, room_key_bytes)
-                .await
-            {
-                Ok(d) => d,
-                Err(e) => {
-                    prune_unreachable_share(shares, evt_tx, share_id);
-                    return Err(fetch_error_message("chunk fetch failed", e));
-                }
-            };
-            chunks_received += 1;
-            bytes_received += data.len() as u64;
-            file_bytes.extend_from_slice(&data);
-            let _ = evt_tx.send(NetEvent::FetchProgress {
-                total_chunks: Some(total_chunks),
-                chunks_received,
-                bytes_received,
-            });
+        for data in &chunks {
+            file_bytes.extend_from_slice(data);
         }
         std::fs::write(&dest, &file_bytes)
             .map_err(|e| format!("could not write {}: {e}", dest.display()))?;
@@ -1665,5 +1709,59 @@ mod tests {
             }
             other => panic!("expected Error, got {other:?}"),
         }
+    }
+
+    /// #113 oracle: chunk fetches run with bounded concurrency and reassemble in
+    /// manifest order. A counting fake fetcher records the peak in-flight count; the
+    /// helper must run more than one at once, never exceed the cap, and return the
+    /// chunks in addr order (byte-for-byte reassembly).
+    #[tokio::test]
+    async fn fetch_chunks_ordered_runs_bounded_concurrent_and_reassembles_in_order() {
+        use daemonseed_core::storage::cas::CHUNK_ADDR_LEN;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let addrs: Vec<ChunkAddr> = (0..20u8)
+            .map(|i| ChunkAddr::from_bytes([i; CHUNK_ADDR_LEN]))
+            .collect();
+        let cap = CHUNK_FETCH_CONCURRENCY;
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+
+        let chunks = fetch_chunks_ordered(
+            &addrs,
+            cap,
+            |addr| {
+                let inflight = inflight.clone();
+                let peak = peak.clone();
+                async move {
+                    let now = inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    // Park so other fetches enter before this one resolves — makes
+                    // genuine concurrency (not mere interleaving) observable.
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    inflight.fetch_sub(1, Ordering::SeqCst);
+                    // The chunk "content" encodes its addr's first byte so the
+                    // returned order is checkable.
+                    Ok(vec![addr.as_bytes()[0]])
+                }
+            },
+            |_data| {},
+        )
+        .await
+        .expect("all fake fetches succeed");
+
+        let order: Vec<u8> = chunks.iter().map(|c| c[0]).collect();
+        assert_eq!(
+            order,
+            (0..20u8).collect::<Vec<_>>(),
+            "chunks reassemble in manifest (addr) order"
+        );
+        let peak = peak.load(Ordering::SeqCst);
+        assert!(peak > 1, "fetches ran concurrently (peak {peak})");
+        assert!(
+            peak <= cap,
+            "concurrency stayed bounded (peak {peak} <= cap {cap})"
+        );
     }
 }
