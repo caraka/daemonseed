@@ -8,12 +8,12 @@
 //! of `daemonseed-gui`'s `veilid_net` module, adapted to the TUI's command
 //! surface (the GUI and TUI `NetCommand`/`NetEvent` enums diverge — see below).
 //!
-//! **Circles + public shares today.** `Connect` (attach + lobby subscribe),
-//! `JoinCircle`, `SendChat`, the inbound circle path, and the public-share
-//! publish / discover / fetch path (Phase 3 Slice 2b) are live; the lobby chat
-//! room, presence, MOTD and announcements return the matching per-surface error
-//! event carrying `"not yet on Veilid"` until Phase 4. This is a
-//! degraded-but-honest dev/test mode, NOT a dual transport — it honors the
+//! **Circles, public shares + lobby chat today.** `Connect` (attach + lobby
+//! subscribe), `JoinCircle`, `SendChat`, the inbound circle path, the public-share
+//! publish / discover / fetch path (Phase 3 Slice 2b), and public-room (Lobby) chat
+//! (`SendPublicRoom`) are live; presence, MOTD and announcements return the
+//! matching per-surface error event carrying `"not yet on Veilid"` until Phase 4.
+//! This is a degraded-but-honest dev/test mode, NOT a dual transport — it honors the
 //! no-relay↔Veilid-interop clean cut (one transport at a time).
 //!
 //! **TUI surface differences from the GUI mirror.** The TUI `NetCommand` carries
@@ -68,8 +68,11 @@
 //!
 //! **Inbound demux.** `VeilidNetEvent::Inbound` carries only sealed bytes (no
 //! record tag), so a received blob is tried against each joined circle's `cot_key`
-//! (the AEAD seal authenticates the match) and, failing that, parsed as a lobby
-//! `DiscoveryEnvelope` and opened under the lobby `PublicRoomKey`.
+//! (the AEAD seal authenticates the match), then as a lobby chat message
+//! (`open_room_message` under the lobby `PublicRoomKey`), then as a lobby
+//! `DiscoveryEnvelope` (share discovery). The distinct per-kind AAD means only the
+//! matching open succeeds; own lobby messages are suppressed by handle (the app
+//! already echoed them on Enter).
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -86,7 +89,8 @@ use daemonseed_core::crypto::suite::CNSA_2_0;
 use daemonseed_core::identity::keys::{Identity, SignKeypair, derive_identity_keys};
 use daemonseed_core::identity::mnemonic::Mnemonic;
 use daemonseed_core::public_room::{
-    DEFAULT_ROOM, PublicRoomKey, derive_room_key, derive_room_veilid_owner_seed,
+    DEFAULT_ROOM, PublicRoomKey, derive_room_key, derive_room_veilid_owner_seed, open_room_message,
+    seal_room_message,
 };
 use daemonseed_core::share_announce::{
     AnnouncementFields, mint_share_id, open_announcement, seal_public_announcement,
@@ -280,8 +284,9 @@ async fn handle_command(
             connect(evt_tx, net, ev_rx).await;
             if net.is_some() {
                 // Subscribe the world-derivable lobby so share announcements fold
-                // into the catalog as they arrive (Phase 3 discovery).
-                subscribe_lobby(shares, net).await;
+                // into the catalog as they arrive (Phase 3 discovery) and so lobby
+                // chat can flow (emits PublicRoomJoined).
+                subscribe_lobby(shares, net, evt_tx).await;
             }
         }
         NetCommand::JoinCircle { phrase } => {
@@ -337,15 +342,21 @@ async fn handle_command(
             emit_fetched_snapshot(evt_tx, &fetched_root);
         }
 
+        // ── Public-room (Lobby) chat ──
+        NetCommand::SendPublicRoom {
+            body,
+            sender_handle,
+        } => {
+            // Learn our handle so the inbound demux suppresses our own DHT
+            // re-surface (parity with SendChat; the app already echoed on Enter).
+            *my_handle = Some(sender_handle.clone());
+            send_public_room(&body, &sender_handle, evt_tx, net, shares).await;
+        }
+
         // User-facing surfaces not yet on Veilid (Phase 4): answer honestly on the
         // matching per-surface error event (the TUI has no single generic `Error`
         // variant — the GUI's contract does — so each maps to the event its UI
         // status line already renders) rather than silently swallow.
-        NetCommand::SendPublicRoom { .. } => {
-            let _ = evt_tx.send(NetEvent::PublicRoomJoinFailed {
-                message: NOT_YET.to_owned(),
-            });
-        }
         // The redb "My shares" index is a relay-path concept (it backs the
         // serve-from-disk publish cache). The Veilid publish path indexes its
         // root fresh on each `PublishShare`, so there is nothing for `DefineShare`
@@ -460,7 +471,11 @@ fn fail(evt_tx: &UnboundedSender<NetEvent>, message: String) {
 /// name + suite, subscribe the rendezvous record, and remember it so discovery
 /// items fold into the catalog. Best-effort: a derivation/subscribe failure is
 /// traced and leaves the lobby unset (publish/fetch then surface a clean error).
-async fn subscribe_lobby(shares: &mut ShareState, net: &Option<VeilidNetHandle>) {
+async fn subscribe_lobby(
+    shares: &mut ShareState,
+    net: &Option<VeilidNetHandle>,
+    evt_tx: &UnboundedSender<NetEvent>,
+) {
     if shares.lobby.is_some() {
         return;
     }
@@ -489,6 +504,12 @@ async fn subscribe_lobby(shares: &mut ShareState, net: &Option<VeilidNetHandle>)
     shares.lobby = Some(LobbyRendezvous {
         room_key,
         owner_seed,
+    });
+    // The lobby rendezvous is live: tell the app the public room is joined so its
+    // Lobby chat input is enabled (relay-path parity — the relay emits
+    // PublicRoomJoined on its connect-time auto-join).
+    let _ = evt_tx.send(NetEvent::PublicRoomJoined {
+        room: DEFAULT_ROOM.to_owned(),
     });
 }
 
@@ -591,6 +612,47 @@ async fn send_chat(
     };
     if let Err(e) = handle.publish_circle(circle.owner_seed, sealed).await {
         err(format!("publish failed: {e}"));
+    }
+}
+
+/// Seal a public-room (Lobby) message under the lobby `PublicRoomKey` and publish
+/// it onto the lobby rendezvous. The public-tier counterpart of [`send_chat`]: NO
+/// local echo (the TUI app already echoed the composed line on Enter), so the
+/// actor's only job is the seal+publish; the DELAYED DHT re-surface of this same
+/// write is suppressed by handle in [`handle_inbound`]. Mirrors the relay actor's
+/// `handle_send_public_room`.
+async fn send_public_room(
+    body: &str,
+    sender_handle: &str,
+    evt_tx: &UnboundedSender<NetEvent>,
+    net: &Option<VeilidNetHandle>,
+    shares: &ShareState,
+) {
+    let err = |message: String| {
+        let _ = evt_tx.send(NetEvent::PublicRoomJoinFailed { message });
+    };
+    let Some(lobby) = shares.lobby.as_ref() else {
+        return err("no public room joined".to_owned());
+    };
+    let Some(handle) = net.as_ref() else {
+        return err("not connected to Veilid yet".to_owned());
+    };
+    let Some(signing) = shares.signing.clone() else {
+        return err("no identity to sign the post".to_owned());
+    };
+    let sealed = match seal_room_message(
+        &lobby.room_key,
+        signing.as_ref(),
+        DEFAULT_ROOM,
+        sender_handle,
+        body,
+        now_unix_ms(),
+    ) {
+        Ok(s) => s,
+        Err(e) => return err(format!("public-room seal/sign failed: {e}")),
+    };
+    if let Err(e) = handle.publish_room(lobby.owner_seed, sealed).await {
+        err(format!("public-room publish failed: {e}"));
     }
 }
 
@@ -1131,7 +1193,25 @@ fn handle_inbound(
             return; // opened under exactly one circle
         }
     }
-    // Not a circle message — try it as a lobby share-discovery item.
+    // Not a circle message — try it as a public-room (Lobby) chat message before
+    // share discovery. Both ride the lobby record; the distinct per-kind AEAD AAD
+    // means only the matching open succeeds. Own messages are suppressed by handle
+    // (the app already echoed on Enter), mirroring the circle path above.
+    if let Some(lobby) = shares.lobby.as_ref()
+        && let Ok(msg) = open_room_message(&lobby.room_key, &bytes)
+    {
+        let is_own = my_handle.as_deref() == Some(msg.sender_handle.as_str());
+        if !is_own {
+            let _ = evt_tx.send(NetEvent::PublicRoomMessage {
+                room: msg.room,
+                sender: msg.sender_handle,
+                body: msg.body,
+                sent_unix_ms: msg.sent_unix_ms,
+            });
+        }
+        return;
+    }
+    // Not a chat message — try it as a lobby share-discovery item.
     let _ = apply_discovery(shares, evt_tx, &bytes);
 }
 
@@ -1366,6 +1446,86 @@ mod tests {
             owner_seed: *derive_room_veilid_owner_seed(DEFAULT_ROOM, &CNSA_2_0)
                 .unwrap()
                 .as_bytes(),
+        }
+    }
+
+    /// A verified inbound lobby chat message (sealed under the public room key by a
+    /// peer) surfaces as a `PublicRoomMessage` — the Veilid lobby-chat ingest path.
+    #[test]
+    fn handle_inbound_surfaces_a_verified_lobby_chat_message() {
+        let signer = announcer(31);
+        let mut shares = ShareState::new();
+        shares.lobby = Some(lobby());
+        let room_key = derive_room_key(DEFAULT_ROOM, &CNSA_2_0).unwrap();
+        let sealed = seal_room_message(
+            &room_key,
+            &signer,
+            DEFAULT_ROOM,
+            "river-otter#aabbccddeeff",
+            "hello lobby",
+            42,
+        )
+        .unwrap();
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        handle_inbound(
+            VeilidNetEvent::Inbound { bytes: sealed },
+            &evt_tx,
+            &[],
+            &Some("me#000000000000".to_owned()),
+            &mut shares,
+        );
+        match evt_rx.try_recv() {
+            Ok(NetEvent::PublicRoomMessage {
+                room, sender, body, ..
+            }) => {
+                assert_eq!(room, DEFAULT_ROOM);
+                assert_eq!(sender, "river-otter#aabbccddeeff");
+                assert_eq!(body, "hello lobby");
+            }
+            other => panic!("expected a PublicRoomMessage, got {other:?}"),
+        }
+    }
+
+    /// Our own lobby message re-surfaces via the DHT sweep; the app already echoed
+    /// it on Enter, so the inbound copy (same handle) is suppressed — no double
+    /// render (parity with the circle own-suppression).
+    #[test]
+    fn handle_inbound_suppresses_our_own_looped_back_lobby_message() {
+        let me = announcer(32);
+        let my_handle = "me#aabbccddeeff";
+        let mut shares = ShareState::new();
+        shares.lobby = Some(lobby());
+        let room_key = derive_room_key(DEFAULT_ROOM, &CNSA_2_0).unwrap();
+        let sealed =
+            seal_room_message(&room_key, &me, DEFAULT_ROOM, my_handle, "my own line", 7).unwrap();
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        handle_inbound(
+            VeilidNetEvent::Inbound { bytes: sealed },
+            &evt_tx,
+            &[],
+            &Some(my_handle.to_owned()),
+            &mut shares,
+        );
+        assert!(
+            evt_rx.try_recv().is_err(),
+            "our own looped-back lobby message must be suppressed"
+        );
+    }
+
+    /// `SendPublicRoom` with no lobby subscribed reports a clean error rather than
+    /// panicking or silently dropping.
+    #[tokio::test]
+    async fn send_public_room_without_a_lobby_reports_a_clean_error() {
+        let ev = first_event(NetCommand::SendPublicRoom {
+            body: "hi".to_owned(),
+            sender_handle: "alice#abcd".to_owned(),
+        })
+        .await;
+        match ev {
+            NetEvent::PublicRoomJoinFailed { message } => {
+                assert!(message.contains("no public room"), "got: {message}");
+            }
+            other => panic!("expected PublicRoomJoinFailed, got {other:?}"),
         }
     }
 
