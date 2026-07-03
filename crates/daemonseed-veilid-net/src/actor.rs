@@ -77,12 +77,6 @@ enum Command {
         request: Vec<u8>,
         reply: oneshot::Sender<Result<Vec<u8>>>,
     },
-    /// An inbound `app_call` forwarded from the update pump — the serve side
-    /// answers it against the served-share registry via `app_call_reply`.
-    InboundAppCall {
-        call_id: OperationId,
-        message: Vec<u8>,
-    },
     /// Announce a public share to the lobby with an anti-swap SIGNED route advert
     /// (D-3.5). The actor allocates a private inbound route, asks `signer` to sign
     /// `share_id ‖ route_blob`, wraps it with the sealed announcement into a
@@ -102,10 +96,15 @@ enum Command {
         share_id: String,
         reply: oneshot::Sender<Result<()>>,
     },
-    /// A private route died/rotated (from the update pump). Re-publish every active
-    /// share advert with a fresh route + signature so discovery never points at a
-    /// dead route. Coalesced against bursts; fire-and-forget.
-    RouteMaintenance,
+    /// A private route died/rotated (from the update pump). Carries veilid's dead
+    /// allocated-route list so the actor refreshes ONLY when a route it currently
+    /// advertises died — veilid reports routes we ourselves released (each advert
+    /// re-publish releases its previous route) in the same update, and reacting to
+    /// those re-armed an endless refresh→release→RouteChange→refresh storm.
+    /// Coalesced against bursts; fire-and-forget.
+    RouteMaintenance {
+        dead_routes: Vec<RouteId>,
+    },
     Shutdown {
         reply: oneshot::Sender<()>,
     },
@@ -361,34 +360,42 @@ impl VeilidNet {
 
         let (ev_tx, ev_rx) = mpsc::unbounded_channel::<VeilidNetEvent>();
         let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(64);
+        // Inbound app_calls (the share-serve request path) get a DEDICATED lane,
+        // never the command channel: veilid answers an inbound call for only
+        // `rpc.timeout_ms` (5s default), and a shared FIFO parks serve requests
+        // behind multi-second inline DHT commands (a chat publish is an
+        // open_or_create + set), so every reply landed late → "Unmatched
+        // operation id" on the sharer, timeout wave + prune on the fetcher.
+        // Unbounded: entries are (id, small request, stamp) and the producer is
+        // the update callback, which must never block.
+        let (serve_tx, serve_rx) =
+            mpsc::unbounded_channel::<(OperationId, Vec<u8>, std::time::Instant)>();
         let ev_tx_cb = ev_tx.clone();
         let cmd_tx_cb = cmd_tx.clone();
         let update_callback: Arc<dyn Fn(VeilidUpdate) + Send + Sync> =
             Arc::new(move |u: VeilidUpdate| match u {
-                // Inbound app_calls are the share-serve request path: forward
-                // them to the actor, which holds the VeilidAPI + the served-share
-                // registry and answers via app_call_reply.
                 VeilidUpdate::AppCall(call) => {
-                    let cmd = Command::InboundAppCall {
-                        call_id: call.id(),
-                        message: call.message().to_vec(),
+                    let _ = serve_tx.send((
+                        call.id(),
+                        call.message().to_vec(),
+                        std::time::Instant::now(),
+                    ));
+                }
+                // A private route died/rotated: hand the dead-route list to the
+                // actor (which knows which routes it currently advertises) AND
+                // surface the event. Under the relevance filter a genuine death
+                // is a ONE-SHOT event, so a full FIFO must not eat it — on Full,
+                // deliver on a spawned awaited send once a slot frees.
+                VeilidUpdate::RouteChange(chg) => {
+                    let cmd = Command::RouteMaintenance {
+                        dead_routes: chg.dead_routes.clone(),
                     };
-                    // Don't silently drop a serve request when the command channel
-                    // is momentarily full (a dropped inbound app_call = the fetcher
-                    // times out on that fragment). Fast-path the non-contended case
-                    // with try_send; on Full, queue it on a spawned awaited send so
-                    // it is delivered once a slot frees. On Closed the actor is gone.
                     if let Err(mpsc::error::TrySendError::Full(cmd)) = cmd_tx_cb.try_send(cmd) {
                         let tx = cmd_tx_cb.clone();
                         tokio::spawn(async move {
                             let _ = tx.send(cmd).await;
                         });
                     }
-                }
-                // A private route died/rotated: drive an advert refresh in the
-                // actor (which holds the signer + advert set) AND surface the event.
-                VeilidUpdate::RouteChange(_) => {
-                    let _ = cmd_tx_cb.try_send(Command::RouteMaintenance);
                     let _ = ev_tx_cb.send(VeilidNetEvent::RouteChanged);
                 }
                 other => {
@@ -408,6 +415,14 @@ impl VeilidNet {
         vcfg.namespace = cfg.namespace.clone();
         vcfg.protected_store.always_use_insecure_storage = true;
         vcfg.protected_store.allow_insecure_fallback = true;
+        // Veilid timeouts stay at defaults (rpc 5s, dht value ops 10s).
+        // `rpc.timeout_ms` is not an app_call-only knob: it prices every RPC
+        // probe, the fanout slow-node throttle is pegged to 33% of it, and the
+        // config validator forces the DHT value budgets to >= 2x it — so
+        // raising it reprices every chat publish, sweep, and watch. veilid-core
+        // exposes no per-call app_call timeout ("governed by
+        // network.rpc.timeout_ms"); a longer fragment-fetch deadline needs an
+        // app-level mechanism, not this knob.
         // Distinct listen ports let several nodes coexist on one host (tests).
         if let Some(addr) = &cfg.listen_address {
             vcfg.network.protocol.udp.listen_address = addr.clone();
@@ -450,7 +465,21 @@ impl VeilidNet {
         // regions (Phase 2 fan-out).
         let node_pub = identity::node_public_bytes(&cfg.identity_seed);
 
-        tokio::spawn(actor_loop(api, rc, cmd_rx, ev_tx, node_pub));
+        // Served-share registry, shared between the actor loop (ServeShare /
+        // StopServe register + withdraw) and the dedicated serve task (answers
+        // inbound fetch app_calls). Locked only for synchronous map ops and the
+        // in-memory seal — never across an await.
+        let shares: Arc<Mutex<HashMap<String, share::ServedShare>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        tokio::spawn(serve_loop(api.clone(), shares.clone(), serve_rx));
+        // Weak so the actor's own re-arm tasks never hold the command channel
+        // open: it still closes (and the loop still cleans up) when the last
+        // real handle drops.
+        let cmd_weak = cmd_tx.downgrade();
+        tokio::spawn(actor_loop(
+            api, rc, cmd_rx, ev_tx, node_pub, shares, cmd_weak,
+        ));
         Ok((VeilidNetHandle { cmd_tx }, ev_rx))
     }
 }
@@ -465,6 +494,8 @@ async fn actor_loop(
     mut cmd_rx: mpsc::Receiver<Command>,
     ev_tx: mpsc::UnboundedSender<VeilidNetEvent>,
     node_pub: [u8; 32],
+    shares: Arc<Mutex<HashMap<String, share::ServedShare>>>,
+    cmd_weak: mpsc::WeakSender<Command>,
 ) {
     // Per-rendezvous append-ring write cursor: which ring slot this node writes
     // next (keyed by record, so circles and rooms share the same map). Behind an
@@ -472,8 +503,6 @@ async fn actor_loop(
     // cursors as the main loop — else a refresh writing to the lobby record could
     // collide with a concurrent room-message write. Locked only for the sync bump.
     let ring_seq: Arc<Mutex<HashMap<RecordKey, u32>>> = Arc::new(Mutex::new(HashMap::new()));
-    // Shares this node serves owner-on-demand (Phase 3), keyed by share_id.
-    let mut shares: HashMap<String, share::ServedShare> = HashMap::new();
     // Active share adverts (Phase 3 discovery), keyed by share_id, so a
     // RouteChanged can re-allocate + re-sign + re-publish each one.
     let mut share_adverts: HashMap<String, AdvertState> = HashMap::new();
@@ -534,10 +563,13 @@ async fn actor_loop(
                 room_key,
                 reply,
             } => {
-                shares.insert(
-                    share_id,
-                    share::ServedShare::new(content, PublicRoomKey::from_bytes(room_key)),
-                );
+                shares
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(
+                        share_id,
+                        share::ServedShare::new(content, PublicRoomKey::from_bytes(room_key)),
+                    );
                 let _ = reply.send(Ok(()));
             }
             Command::AppCall {
@@ -554,14 +586,6 @@ async fn actor_loop(
                         .map_err(|e| VeilidNetError::Send(e.to_string()));
                     let _ = reply.send(r);
                 });
-            }
-            Command::InboundAppCall { call_id, message } => {
-                // Answer the fragment request against the served-share registry
-                // and reply over the same private route the call arrived on.
-                let response = share::serve(&mut shares, &message);
-                if let Err(e) = api.app_call_reply(call_id, response).await {
-                    crate::vtrace!("inbound app_call: reply failed ({e})");
-                }
             }
             Command::PublishShare {
                 owner_seed,
@@ -596,7 +620,10 @@ async fn actor_loop(
                 // RouteChanged will not re-publish a dead advert). The route blob
                 // still routes to this node until released, but the share is
                 // unserved — a holder of a stale route gets a not-found, never bytes.
-                shares.remove(&share_id);
+                shares
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&share_id);
                 share_adverts.remove(&share_id);
                 // Release this share's current private route (route-leak fix): once
                 // unpublished it serves nothing, so the route is dead weight.
@@ -607,11 +634,33 @@ async fn actor_loop(
                 }
                 let _ = reply.send(Ok(()));
             }
-            Command::RouteMaintenance => {
+            Command::RouteMaintenance { dead_routes } => {
+                // Refresh ONLY if a route we currently advertise is in the dead
+                // set. Veilid reports a route in `dead_routes` when it dies OR
+                // when we release it — and every advert re-publish releases its
+                // previous route AFTER swapping the map to the new one, so a
+                // self-inflicted release never matches here. Without this filter
+                // the actor's own releases re-armed refresh forever: an endless
+                // refresh→release→RouteChange→refresh storm re-publishing a 12KB
+                // envelope every coalesce window (2026-07-02 felt-test log).
+                let relevant = {
+                    let routes = advert_routes.lock().unwrap();
+                    dead_routes.iter().any(|d| routes.values().any(|r| r == d))
+                };
+                // Always trace: correlating route churn against a fetch wave's
+                // serve/reply timing is the latency-kill vs rotation-kill
+                // discriminator a felt-test log needs.
+                crate::vtrace!(
+                    "route_maintenance: {} dead route(s), relevant={relevant}",
+                    dead_routes.len()
+                );
+                if !relevant {
+                    continue;
+                }
                 // Coalesce: skip if a refresh is in flight or the last one completed
                 // within the interval. Re-allocating a route per advert is slow, so
-                // the refresh is SPAWNED — running it inline would block serving
-                // (inbound app_calls) and fetching for the whole wave (head-of-line).
+                // the refresh is SPAWNED — running it inline would block the loop
+                // for the whole wave (head-of-line).
                 let last = *last_advert_refresh.lock().unwrap();
                 if refresh_due(last, !share_adverts.is_empty(), ADVERT_REFRESH_MIN_INTERVAL)
                     && !refresh_in_flight.swap(true, Ordering::SeqCst)
@@ -638,6 +687,21 @@ async fn actor_loop(
                         *last_refresh.lock().unwrap() = Some(tokio::time::Instant::now());
                         in_flight.store(false, Ordering::SeqCst);
                     });
+                } else {
+                    // A relevant death is ONE-SHOT under the filter, so a busy
+                    // gate (refresh in flight, or inside the coalesce window)
+                    // must not consume it silently: re-deliver the same command
+                    // after the window. Relevance is re-checked on arrival, so
+                    // once a refresh has replaced the dead route the redelivery
+                    // is a quiet no-op and the cycle stops.
+                    crate::vtrace!("route_maintenance: gate busy, re-arming redelivery");
+                    let cmd_weak = cmd_weak.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(ADVERT_REFRESH_MIN_INTERVAL).await;
+                        if let Some(tx) = cmd_weak.upgrade() {
+                            let _ = tx.send(Command::RouteMaintenance { dead_routes }).await;
+                        }
+                    });
                 }
             }
             Command::Shutdown { reply } => {
@@ -649,6 +713,64 @@ async fn actor_loop(
     }
     // Channel closed without an explicit Shutdown — clean up the node.
     api.shutdown().await;
+}
+
+/// The dedicated serve task: answers inbound fetch `app_call`s against the
+/// served-share registry, on its OWN lane — never the actor command channel.
+/// veilid holds an inbound call's answer window open for only `rpc.timeout_ms`
+/// (5s default) from the moment it fires the update callback; a reply after
+/// that is dropped as "Unmatched operation id" and the fetcher times out. The
+/// command FIFO cannot guarantee that budget — one inline chat publish
+/// (open_or_create + DHT set) parks everything behind it for seconds — so
+/// serve requests bypass it entirely (2026-07-02 root cause; the earlier
+/// reply-spawn fix moved latency off the reply await but not off the queue).
+/// The registry lock is held only for the synchronous serve (map lookup +
+/// in-memory seal), never across the reply await.
+async fn serve_loop(
+    api: VeilidAPI,
+    shares: Arc<Mutex<HashMap<String, share::ServedShare>>>,
+    mut serve_rx: mpsc::UnboundedReceiver<(OperationId, Vec<u8>, std::time::Instant)>,
+) {
+    // veilid's default answer window (`rpc.timeout_ms`): a reply after this is
+    // rejected as "Unmatched operation id", so serving an older entry is pure
+    // wasted seal + network work that only deepens a backlog.
+    const SERVE_ANSWER_WINDOW: Duration = Duration::from_secs(5);
+    while let Some((call_id, message, received)) = serve_rx.recv().await {
+        let queued_ms = received.elapsed().as_millis();
+        if received.elapsed() > SERVE_ANSWER_WINDOW {
+            crate::vtrace!("serve: EXPIRED after {queued_ms}ms in queue, dropped");
+            continue;
+        }
+        // Recover the guard if another holder panicked: a poisoned registry
+        // must not cascade into the actor's later ServeShare/StopServe locks.
+        let seal_started = std::time::Instant::now();
+        let response = {
+            let mut s = shares
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            share::serve(&mut s, &message)
+        };
+        let seal_ms = seal_started.elapsed().as_millis();
+        // Reply on a spawned task: awaiting `app_call_reply` inline serializes
+        // the lane at whatever per-reply latency the network imposes (observed
+        // ~4.6s per call, cause not yet pinned). queued / seal / reply are
+        // timed separately so a slow felt-test log names the stage to blame.
+        let api = api.clone();
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let result = api.app_call_reply(call_id, response).await;
+            let reply_ms = started.elapsed().as_millis();
+            match result {
+                Err(e) => crate::vtrace!(
+                    "serve: reply failed (queued {queued_ms}ms, seal {seal_ms}ms, reply {reply_ms}ms) ({e})"
+                ),
+                Ok(()) if queued_ms + seal_ms + reply_ms > 1_000 => crate::vtrace!(
+                    "serve: SLOW reply delivered (queued {queued_ms}ms, seal {seal_ms}ms, reply {reply_ms}ms)"
+                ),
+                Ok(()) => {}
+            }
+        });
+    }
 }
 
 /// Open/create the rendezvous record (a circle's, or a public room's / lobby's)
@@ -676,10 +798,14 @@ async fn publish_rendezvous(
         s
     };
     crate::vtrace!("publish_rendezvous: key={key:?} ring base={base} seq={seq}");
+    let started = std::time::Instant::now();
     let r = rendezvous::publish(rc, &key, &owner, base, seq, sealed).await;
+    // Duration matters: this runs INLINE on the actor loop (a chat send), so a
+    // slow write here is queue latency for every command behind it.
     crate::vtrace!(
-        "publish_rendezvous: write {}",
-        if r.is_ok() { "ok" } else { "ERR" }
+        "publish_rendezvous: write {} in {}ms",
+        if r.is_ok() { "ok" } else { "ERR" },
+        started.elapsed().as_millis()
     );
     r
 }
@@ -773,7 +899,14 @@ async fn publish_one_advert(
             crate::vtrace!("publish_one_advert: release prev route for {share_id} failed ({e})");
         }
     }
-    let route_sig = advert.signer.sign_route_advert(share_id, &route.blob)?;
+    let route_sig = match advert.signer.sign_route_advert(share_id, &route.blob) {
+        Ok(sig) => sig,
+        Err(e) => {
+            rollback_advert_route(api, advert_routes, share_id, route.route_id);
+            return Err(e);
+        }
+    };
+    let route_id = route.route_id.clone();
     let envelope = discovery::DiscoveryEnvelope {
         sealed_announcement: advert.sealed_announcement.clone(),
         route_blob: route.blob,
@@ -784,7 +917,27 @@ async fn publish_one_advert(
         "publish_one_advert: share_id={share_id} envelope={} bytes",
         envelope.len()
     );
-    publish_current_state(api, rc, advert.owner_seed, share_id, envelope).await
+    let res = publish_current_state(api, rc, advert.owner_seed, share_id, envelope).await;
+    if res.is_err() {
+        rollback_advert_route(api, advert_routes, share_id, route_id);
+    }
+    res
+}
+
+/// Undo the `advert_routes` insert for a publish that never landed. The
+/// RouteMaintenance relevance filter reads that map, so an entry must only ever
+/// name a route backing a PUBLISHED advert — and the never-published route is
+/// released rather than leaked.
+fn rollback_advert_route(
+    api: &VeilidAPI,
+    advert_routes: &Mutex<HashMap<String, RouteId>>,
+    share_id: &str,
+    route_id: RouteId,
+) {
+    advert_routes.lock().unwrap().remove(share_id);
+    if let Err(e) = api.release_private_route(route_id) {
+        crate::vtrace!("publish_one_advert: rollback release for {share_id} failed ({e})");
+    }
 }
 
 /// Re-publish every active share advert with a fresh route + signature (called on
@@ -799,6 +952,7 @@ async fn refresh_share_adverts(
     adverts: &HashMap<String, AdvertState>,
 ) {
     crate::vtrace!("refresh_share_adverts: {} advert(s)", adverts.len());
+    let started = std::time::Instant::now();
     for (share_id, st) in adverts {
         if let Err(e) =
             publish_one_advert(api, rc, node_pub, ring_seq, advert_routes, share_id, st).await
@@ -806,6 +960,10 @@ async fn refresh_share_adverts(
             crate::vtrace!("refresh_share_adverts: {share_id} ERR ({e})");
         }
     }
+    crate::vtrace!(
+        "refresh_share_adverts: done in {}ms",
+        started.elapsed().as_millis()
+    );
 }
 
 /// Whether a `RouteMaintenance` refresh should be scheduled now: there are adverts

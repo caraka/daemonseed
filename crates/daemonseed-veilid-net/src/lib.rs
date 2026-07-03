@@ -70,9 +70,27 @@
 macro_rules! vtrace {
     ($($arg:tt)*) => {
         if ::std::env::var_os("DAEMONSEED_VEILID_TRACE").is_some() {
-            ::std::eprintln!("[veilid-net] {}", ::std::format_args!($($arg)*));
+            ::std::eprintln!(
+                "[veilid-net +{:>8.3}s] {}",
+                $crate::trace_elapsed_secs(),
+                ::std::format_args!($($arg)*)
+            );
         }
     };
+}
+
+/// Seconds since this process's first trace line, prefixed onto every [`vtrace!`]
+/// so a felt-test log carries relative timing. Event ORDER alone cannot show
+/// where a deadline was spent (veilid answers an inbound `app_call` for only
+/// `rpc.timeout_ms` = 5s; the 2026-07-02 chunk-fetch diagnosis needed to know
+/// WHICH 5s elapsed, and the untimestamped trace could not say).
+pub fn trace_elapsed_secs() -> f64 {
+    use std::sync::OnceLock;
+    static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+    EPOCH
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_secs_f64()
 }
 
 pub mod actor;

@@ -734,6 +734,18 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   `downloads.idx` v2 format because `record_share` only takes fully-buffered bytes, with drift
   pinned by a round-trip test through `FetchedStore::list_shares`; core should grow
   begin/append/finish so the mirrors can be deleted. (caraka, 2026-06-09.)
+- **Veilid timeouts are frozen at defaults; fragment-fetch deadlines must be app-level.** In
+  veilid-core 0.5.4, `network.rpc.timeout_ms` is structurally global: it prices every RPC probe,
+  the fanout slow-node compensation throttle is pegged to 33% of it, the config validator forces
+  the DHT value budgets to >= 2x it, and `app_call` exposes no per-call timeout ("governed by
+  network.rpc.timeout_ms"). Raising it 5s->25s (DHT budgets at the validator-forced 50s) was
+  verified live as a ~5x repricing of every chat publish, discovery sweep, and watch — multi-minute
+  felt latency, restored by reverting in the same session (A/B on orinoco). Consequence: the
+  public-share fetch's need for more-than-5s patience over a private route (measured ~7.5s one-way
+  transit) cannot be met in veilid config; the fix is an app-level transfer owning its own
+  correlation + deadlines (or reducing route transit) — tracked in the fetch-deadline issue.
+  Guard-rail adopted: any future transport-config change carries an interactive-latency oracle
+  (echo / delivery / discovery) alongside the fetch oracle. (caraka + Sanjay, 2026-07-03.)
 
 ## Changelog
 
@@ -810,6 +822,7 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   Probe: `git -C ~/repos/daemonseed tag --verify <tag>` + `CHANGELOG.md`.
 - ISC coverage is reported live by `cargo xtask isc-coverage` (registry `isc_coverage::TOTAL`); no coverage
   count is hand-written here. Probe: `cargo xtask isc-coverage`.
+- 2026-07-03: **Veilid serve lane + relevant-only advert refresh + timeout revert — gates green, smoke FELT-CONFIRMED on orinoco.** `crates/daemonseed-veilid-net`: fmt clean, clippy `--all-targets -D warnings` clean, 19 lib tests pass; gui clippy `--features "desktop veilid" --all-targets -D warnings` clean; `cargo check --workspace` clean; no VM-linked bin (glibc-skew rule). Felt-test (caraka, two clients, real public Veilid): own echo instant, lobby + circle exchange both directions, restored shares republished. The rpc/DHT timeout raise was verified as the latency-regression cause by A/B: raised -> multi-minute chat/echo/discovery with the refresh button ineffective; reverted (same session, same build otherwise) -> restored. Fragment fetch still fails at default timeouts (caller patience 5 s < measured private-route transit) -> tracked as the fetch-deadline issue. Independent review (code-review, high effort): 10 verified findings, 7 applied in-diff (busy-gate re-delivery of a one-shot route death, lossless RouteChange send on full FIFO, queued/seal/reply timing split, expired-serve shedding, poison-proof registry locks, advert publish rollback, present-tense config comment), 2 filed as issues (advert watchdog; serve-lane backpressure), 1 satisfied by this doc-sync.
 - 2026-06-29: **#113 (partial) — GUI Veilid bounded-concurrent chunk download** — oracle green: a concurrency-counting fake fetcher records peak in-flight `1 < peak ≤ CHUNK_FETCH_CONCURRENCY` with byte-for-byte in-order reassembly. Probe: `cargo test -p daemonseed-gui --features "desktop veilid" veilid_net` → 12 passed (incl. `fetch_chunks_ordered_runs_bounded_concurrent_and_reassembles_in_order`); clippy `-D warnings` clean (desktop & desktop+veilid). Faster wall-clock on a real multi-chunk download DEFERRED-VERIFY → orinoco.
 - 2026-06-29: **Veilid lobby chat (TUI parity)** — in-process oracles green: a peer's `seal_room_message` blob surfaces as `NetEvent::PublicRoomMessage`; an own-handle blob is suppressed (the app echoes on Enter); `SendPublicRoom` with no lobby errors cleanly via `PublicRoomJoinFailed`. Probe: `cargo test -p daemonseed-tui --features veilid veilid_net` → 14 passed (incl. `handle_inbound_surfaces_a_verified_lobby_chat_message`, `handle_inbound_suppresses_our_own_looped_back_lobby_message`, `send_public_room_without_a_lobby_reports_a_clean_error`); clippy `-D warnings` clean (veilid). Live two-client exchange DEFERRED-VERIFY → orinoco.
 - 2026-06-29: **Veilid lobby chat (GUI)** — in-process oracles green: a peer's `seal_room_message` blob opens via `open_room_message` and surfaces as `NetEvent::Message`; an own-handle blob is suppressed; `SendRoom` with no lobby errors cleanly. Probe: `cargo test -p daemonseed-gui --features "desktop veilid" veilid_net` → 11 passed (incl. `handle_inbound_surfaces_a_verified_lobby_chat_message`, `handle_inbound_suppresses_our_own_looped_back_lobby_message`, `send_room_without_a_lobby_reports_a_clean_error`); clippy `-D warnings` clean (desktop & desktop+veilid). Live two-client Lobby exchange over real public Veilid is DEFERRED-VERIFY → orinoco (SLIRP NAT blocks public attach on this VM).
