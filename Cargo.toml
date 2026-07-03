@@ -17,6 +17,24 @@ members = [
 # when daemonseed-server is disconnected at cutover.
 exclude = ["crates/daemonseed-veilid-net"]
 
+# Crypto runs at full optimization even in dev builds. oxicrypt's portable
+# constant-time paths (accelerated backends are off by default) are unusable at
+# opt-level 0 for bulk work: a debug felt-test measured ~5 s to AEAD-seal one
+# 1 MiB share chunk — past veilid's 5 s app_call answer window on its own — and
+# the fetch side pays the same tax on its SHA-384 chunk verify (#123).
+[profile.dev.package.oxicrypt-aes]
+opt-level = 3
+[profile.dev.package.oxicrypt-sha]
+opt-level = 3
+[profile.dev.package.oxicrypt-kdf]
+opt-level = 3
+[profile.dev.package.oxicrypt-ml-dsa]
+opt-level = 3
+[profile.dev.package.oxicrypt-ml-kem]
+opt-level = 3
+[profile.dev.package.oxicrypt-module]
+opt-level = 3
+
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
