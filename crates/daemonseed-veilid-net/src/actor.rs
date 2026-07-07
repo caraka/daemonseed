@@ -503,6 +503,12 @@ async fn actor_loop(
     // cursors as the main loop — else a refresh writing to the lobby record could
     // collide with a concurrent room-message write. Locked only for the sync bump.
     let ring_seq: Arc<Mutex<HashMap<RecordKey, u32>>> = Arc::new(Mutex::new(HashMap::new()));
+    // Cache of opened rendezvous records (owner seed → post-reopen key):
+    // open_or_create costs a fresh ~6–10 s open per publish/subscribe, so once a
+    // record is open its key is reused. Shared (Arc) so a spawned advert refresh
+    // reuses the SAME opened handles as the main loop; a publish error invalidates
+    // the entry and reopens once.
+    let opened: Arc<rendezvous::OpenCache> = Arc::new(Mutex::new(HashMap::new()));
     // Active share adverts (Phase 3 discovery), keyed by share_id, so a
     // RouteChanged can re-allocate + re-sign + re-publish each one.
     let mut share_adverts: HashMap<String, AdvertState> = HashMap::new();
@@ -551,11 +557,15 @@ async fn actor_loop(
                 reply,
             } => {
                 let _ = reply.send(
-                    publish_rendezvous(&api, &rc, &node_pub, &ring_seq, owner_seed, sealed).await,
+                    publish_rendezvous(
+                        &api, &rc, &node_pub, &ring_seq, &opened, owner_seed, sealed,
+                    )
+                    .await,
                 );
             }
             Command::SubscribeRendezvous { owner_seed, reply } => {
-                let _ = reply.send(subscribe_rendezvous(&api, &rc, &ev_tx, owner_seed).await);
+                let _ =
+                    reply.send(subscribe_rendezvous(&api, &rc, &ev_tx, &opened, owner_seed).await);
             }
             Command::ServeShare {
                 share_id,
@@ -599,16 +609,9 @@ async fn actor_loop(
                     sealed_announcement,
                     signer,
                 };
-                let res = publish_one_advert(
-                    &api,
-                    &rc,
-                    &node_pub,
-                    &ring_seq,
-                    &advert_routes,
-                    &share_id,
-                    &advert,
-                )
-                .await;
+                let res =
+                    publish_one_advert(&api, &rc, &opened, &advert_routes, &share_id, &advert)
+                        .await;
                 if res.is_ok() {
                     share_adverts.insert(share_id, advert);
                 }
@@ -667,21 +670,13 @@ async fn actor_loop(
                 {
                     let api = api.clone();
                     let rc = rc.clone();
-                    let ring_seq = ring_seq.clone();
+                    let opened = opened.clone();
                     let advert_routes = advert_routes.clone();
                     let adverts = share_adverts.clone();
                     let in_flight = refresh_in_flight.clone();
                     let last_refresh = last_advert_refresh.clone();
                     tokio::spawn(async move {
-                        refresh_share_adverts(
-                            &api,
-                            &rc,
-                            &node_pub,
-                            &ring_seq,
-                            &advert_routes,
-                            &adverts,
-                        )
-                        .await;
+                        refresh_share_adverts(&api, &rc, &opened, &advert_routes, &adverts).await;
                         // Stamp the coalesce window from COMPLETION, then release the
                         // in-flight guard so the next RouteChange can schedule again.
                         *last_refresh.lock().unwrap() = Some(tokio::time::Instant::now());
@@ -781,12 +776,18 @@ async fn publish_rendezvous(
     rc: &RoutingContext,
     node_pub: &[u8; 32],
     ring_seq: &Mutex<HashMap<RecordKey, u32>>,
+    opened: &rendezvous::OpenCache,
     owner_seed: [u8; 32],
     sealed: Vec<u8>,
 ) -> Result<()> {
-    crate::vtrace!("publish_rendezvous: open_or_create rendezvous");
+    crate::vtrace!("publish_rendezvous: open (cached) rendezvous");
     let owner = identity::rendezvous_owner_keypair(&owner_seed)?;
-    let key = rendezvous::open_or_create(api, rc, &owner).await?;
+    let key = rendezvous::open_cached(
+        opened,
+        &owner_seed,
+        rendezvous::open_or_create(api, rc, &owner),
+    )
+    .await?;
     let base = rendezvous::member_base_subkey(node_pub);
     // Lock only for the synchronous cursor bump — never across an await — so the
     // main loop and a spawned refresh can interleave ring writes safely.
@@ -818,12 +819,18 @@ async fn publish_rendezvous(
 async fn publish_current_state(
     api: &VeilidAPI,
     rc: &RoutingContext,
+    opened: &rendezvous::OpenCache,
     owner_seed: [u8; 32],
     stable_id: &str,
     sealed: Vec<u8>,
 ) -> Result<()> {
     let owner = identity::rendezvous_owner_keypair(&owner_seed)?;
-    let key = rendezvous::open_or_create(api, rc, &owner).await?;
+    let key = rendezvous::open_cached(
+        opened,
+        &owner_seed,
+        rendezvous::open_or_create(api, rc, &owner),
+    )
+    .await?;
     let subkey = rendezvous::current_state_subkey(stable_id);
     crate::vtrace!("publish_current_state: stable_id={stable_id} key={key:?} subkey={subkey}");
     rendezvous::publish_at_subkey(rc, &key, &owner, subkey, sealed).await
@@ -836,11 +843,17 @@ async fn subscribe_rendezvous(
     api: &VeilidAPI,
     rc: &RoutingContext,
     ev_tx: &mpsc::UnboundedSender<VeilidNetEvent>,
+    opened: &rendezvous::OpenCache,
     owner_seed: [u8; 32],
 ) -> Result<()> {
-    crate::vtrace!("subscribe_rendezvous: open_or_create rendezvous");
+    crate::vtrace!("subscribe_rendezvous: open (cached) rendezvous");
     let owner = identity::rendezvous_owner_keypair(&owner_seed)?;
-    let key = rendezvous::open_or_create(api, rc, &owner).await?;
+    let key = rendezvous::open_cached(
+        opened,
+        &owner_seed,
+        rendezvous::open_or_create(api, rc, &owner),
+    )
+    .await?;
     crate::vtrace!("subscribe_rendezvous: record open key={key:?}; registering watch");
     rc.watch_dht_values(key.clone(), None, None, None)
         .await
@@ -873,12 +886,7 @@ struct AdvertState {
 async fn publish_one_advert(
     api: &VeilidAPI,
     rc: &RoutingContext,
-    // node_pub / ring_seq are no longer used by the advert path — Shape B places by
-    // share_id (current-state), not the node-region append-ring. Kept in the
-    // signature so the two call sites stay unchanged; remove when refresh_share_adverts
-    // is next touched.
-    _node_pub: &[u8; 32],
-    _ring_seq: &Mutex<HashMap<RecordKey, u32>>,
+    opened: &rendezvous::OpenCache,
     advert_routes: &Mutex<HashMap<String, RouteId>>,
     share_id: &str,
     advert: &AdvertState,
@@ -917,7 +925,7 @@ async fn publish_one_advert(
         "publish_one_advert: share_id={share_id} envelope={} bytes",
         envelope.len()
     );
-    let res = publish_current_state(api, rc, advert.owner_seed, share_id, envelope).await;
+    let res = publish_current_state(api, rc, opened, advert.owner_seed, share_id, envelope).await;
     if res.is_err() {
         rollback_advert_route(api, advert_routes, share_id, route_id);
     }
@@ -946,17 +954,14 @@ fn rollback_advert_route(
 async fn refresh_share_adverts(
     api: &VeilidAPI,
     rc: &RoutingContext,
-    node_pub: &[u8; 32],
-    ring_seq: &Mutex<HashMap<RecordKey, u32>>,
+    opened: &rendezvous::OpenCache,
     advert_routes: &Mutex<HashMap<String, RouteId>>,
     adverts: &HashMap<String, AdvertState>,
 ) {
     crate::vtrace!("refresh_share_adverts: {} advert(s)", adverts.len());
     let started = std::time::Instant::now();
     for (share_id, st) in adverts {
-        if let Err(e) =
-            publish_one_advert(api, rc, node_pub, ring_seq, advert_routes, share_id, st).await
-        {
+        if let Err(e) = publish_one_advert(api, rc, opened, advert_routes, share_id, st).await {
             crate::vtrace!("refresh_share_adverts: {share_id} ERR ({e})");
         }
     }

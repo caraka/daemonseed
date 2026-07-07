@@ -22,6 +22,9 @@
 //! share discovery) → open; operator-only owner (announcements/MOTD) → the
 //! non-derivable owner keypair is the write-gate.
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use tokio::sync::mpsc;
 use veilid_core::{
     DHTSchema, KeyPair, RecordKey, RoutingContext, SetDHTValueOptions, VeilidAPI, CRYPTO_KIND_VLD0,
@@ -110,6 +113,40 @@ pub async fn open_or_create(
         if r.is_ok() { "ok -> Ok" } else { "ERR" }
     );
     r
+}
+
+/// A session cache of rendezvous records already opened, keyed by owner seed →
+/// the post-reopen [`RecordKey`]. [`open_or_create`] pays a fresh open (~6–10 s
+/// live-measured) on every publish/subscribe; once a key is cached, callers reuse
+/// the open handle and skip the round-trip. The cached key is the reopen result,
+/// so it carries the verbatim-storage (no-encryption) handle semantics — never a
+/// raw `create` handle with a random encryption key.
+pub type OpenCache = Mutex<HashMap<[u8; 32], RecordKey>>;
+
+/// Return the cached open key for `owner_seed`, else run `open` once, cache its
+/// result, and return it. Generic over the key type so the caching logic is
+/// unit-testable without veilid types. `open` is a lazy future built by the
+/// caller: on a cache hit it is dropped un-awaited (an `async fn` future runs no
+/// body until polled), so a hit costs nothing beyond the map lookup.
+///
+/// The record is opened once per session and never closed, so the cached key
+/// stays valid — there is deliberately no error-path invalidation. A `set`/`get`
+/// failure is a transient network condition the caller surfaces (and may retry),
+/// not a dead local handle; dropping the entry would only force a redundant
+/// re-open, and on the shared lobby record (every share advert + the lobby
+/// subscription derive the SAME `owner_seed`) it would evict an entry other
+/// callers are actively using. See ISA Decisions (2026-07-06, #128 D-0a).
+pub async fn open_cached<K: Clone>(
+    cache: &Mutex<HashMap<[u8; 32], K>>,
+    owner_seed: &[u8; 32],
+    open: impl std::future::Future<Output = Result<K>>,
+) -> Result<K> {
+    if let Some(k) = cache.lock().unwrap().get(owner_seed).cloned() {
+        return Ok(k);
+    }
+    let k = open.await?;
+    cache.lock().unwrap().insert(*owner_seed, k.clone());
+    Ok(k)
 }
 
 /// The base subkey of this member's append-ring region, from its node pubkey.
@@ -211,6 +248,15 @@ pub async fn sweep(
 mod tests {
     use super::*;
     use std::collections::HashSet;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// Counting stand-in for [`open_or_create`]'s network round-trip: increments on
+    /// every actual open, so a test can assert the cache collapsed N calls to one.
+    /// `u32` avoids constructing a veilid `RecordKey` — no network types in a unit test.
+    async fn counting_open(opens: &AtomicU32, ret: u32) -> Result<u32> {
+        opens.fetch_add(1, Ordering::SeqCst);
+        Ok(ret)
+    }
 
     #[test]
     fn current_state_subkey_is_stable_and_in_range() {
@@ -231,5 +277,59 @@ mod tests {
             .collect();
         assert!(slots.len() > 1, "ids spread across slots, not all into one");
         assert!(slots.iter().all(|s| *s < u32::from(SUBKEY_COUNT)));
+    }
+
+    #[tokio::test]
+    async fn open_cached_opens_once_across_repeated_publishes_to_same_key() {
+        // The D-0a invariant: five publishes to one owner seed trigger exactly ONE
+        // open. On a cache hit the counting_open future is built but dropped un-awaited,
+        // so it never increments.
+        let cache: Mutex<HashMap<[u8; 32], u32>> = Mutex::new(HashMap::new());
+        let opens = AtomicU32::new(0);
+        let seed = [7u8; 32];
+        for _ in 0..5 {
+            let k = open_cached(&cache, &seed, counting_open(&opens, 42))
+                .await
+                .unwrap();
+            assert_eq!(k, 42);
+        }
+        assert_eq!(
+            opens.load(Ordering::SeqCst),
+            1,
+            "one open across five publishes to the same key"
+        );
+    }
+
+    #[tokio::test]
+    async fn distinct_seeds_each_open_once_and_a_hit_returns_the_cached_key() {
+        let cache: Mutex<HashMap<[u8; 32], u32>> = Mutex::new(HashMap::new());
+        let opens = AtomicU32::new(0);
+        let (a, b) = ([1u8; 32], [2u8; 32]);
+        assert_eq!(
+            open_cached(&cache, &a, counting_open(&opens, 10))
+                .await
+                .unwrap(),
+            10
+        );
+        // Cache hit on the same seed: returns the CACHED key (10), and the
+        // counting_open(…, 99) future is dropped un-awaited (no open, no 99).
+        assert_eq!(
+            open_cached(&cache, &a, counting_open(&opens, 99))
+                .await
+                .unwrap(),
+            10
+        );
+        // A distinct seed is a separate open.
+        assert_eq!(
+            open_cached(&cache, &b, counting_open(&opens, 20))
+                .await
+                .unwrap(),
+            20
+        );
+        assert_eq!(
+            opens.load(Ordering::SeqCst),
+            2,
+            "one open per distinct seed; hits reuse the cached key"
+        );
     }
 }

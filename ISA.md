@@ -746,6 +746,34 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   correlation + deadlines (or reducing route transit) — tracked in the fetch-deadline issue.
   Guard-rail adopted: any future transport-config change carries an interactive-latency oracle
   (echo / delivery / discovery) alongside the fetch oracle. (caraka + Sanjay, 2026-07-03.)
+- **Rendezvous open handles are cached per owner seed (D-0a).** `open_or_create` opened the DFLT
+  record on every publish/subscribe — ~6–10 s live-measured (`trace-ds1.log`), the dominant cost
+  behind the fat-link chat stall (#128). A session cache (`rendezvous::OpenCache`: owner seed → the
+  post-`open_or_create` `RecordKey`) reuses the open handle after the first touch. The cached key is
+  the reopen result, so it carries the verbatim-storage / no-encryption handle semantics (#99),
+  never a raw `create` handle with a random encryption key. Held behind a shared `Arc<Mutex>` so the
+  spawned advert refresh reuses the SAME handles as the main loop; the lock is taken only for the
+  synchronous map op, never across an await (matching the `ring_seq` cursor discipline). The record
+  is opened once per session and never closed, so the cached key stays valid for the session.
+  **Deviation from the D-0a brief, adopted on the `high` code-review pass:** the brief specified
+  "invalidate the entry and reopen once on a publish error." That was dropped — the review showed it
+  net-negative on three counts: (1) all share adverts AND the lobby subscription derive the SAME
+  lobby `owner_seed`, so invalidate-by-seed evicts an entry other live callers depend on, thrashing
+  under route churn (the exact latency the cache removes); (2) `invalidate` only dropped the map
+  entry — it never `close_dht_record`d, so the "reopen" was a local no-op that healed nothing (the
+  pre-cache code relied on the same `open#1`-on-already-open idempotency and likewise never healed a
+  genuinely dead handle); (3) it forced an unconditional 32 KiB `sealed` clone on the inline hot
+  path. Cache-only is a strict improvement over the pre-cache behaviour and adds no new failure mode:
+  a `set`/`get` failure surfaces to the caller (transient network; app may retry) exactly as before,
+  minus the redundant open. The now-dead `_node_pub` / `_ring_seq` pass-through params on
+  `publish_one_advert` / `refresh_share_adverts` (Shape B places adverts by `share_id`, not the
+  node-region append-ring) were removed in the same pass, as their own comment requested. No wire or
+  public-contract change. **Deferred (flagged for review):** the loop-vs-refresh cold-cache
+  double-open race is PRE-EXISTING (both paths already called `open_or_create` on the shared lobby
+  record before this change; the cache only reduces it) and is left as-is; a genuine per-record
+  self-heal (close+reopen, ref-counted so one advert failure cannot evict the shared lobby handle)
+  is a separate design item if live testing shows a handle ever dies mid-session. (Sanjay,
+  2026-07-06, #128 D-0a.)
 
 ## Changelog
 
@@ -1105,3 +1133,14 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   workspace 954 / 0-fail; `cargo xtask isc-coverage` 100/149. [DEFERRED-VERIFY] live re-smoke =
   caraka fetching the 8.9 MB song end-to-end against the (unchanged) fra1 relay — follow-up:
   this evening's session.
+- D-0a (rendezvous open-handle cache) verified 2026-07-06: `daemonseed-veilid-net` nextest 21/21.
+  `rendezvous::tests::open_cached_opens_once_across_repeated_publishes_to_same_key` proves exactly
+  ONE open across five publishes to a single owner seed (counting fake stands in for the network
+  round-trip, `u32` avoids a veilid `RecordKey`); `distinct_seeds_each_open_once_and_a_hit_returns_
+  the_cached_key` proves per-seed isolation and that a hit returns the cached key with the redundant
+  open-future dropped un-awaited. `cargo fmt` clean; crate `clippy --all-targets -D warnings` clean;
+  GUI `clippy --features "desktop veilid"` clean (workspace-side integration). A `high` workflow
+  code-review pass drove the cache-only simplification (see Decisions): 6 findings — 5 applied by
+  dropping the brief's error-path invalidate/reopen, 1 declined as pre-existing. [DEFERRED-VERIFY]
+  live confirmation that the cache removes the ~6–10 s per-publish `open_or_create` on the fat link
+  (the `publish_rendezvous … in {ms}` trace lines answer it) — morning orinoco item.
