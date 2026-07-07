@@ -94,6 +94,7 @@ pub fn trace_elapsed_secs() -> f64 {
 }
 
 pub mod actor;
+pub mod aimd;
 pub mod config;
 pub mod discovery;
 pub mod error;
@@ -103,6 +104,7 @@ mod rendezvous;
 mod share;
 
 pub use actor::{VeilidNet, VeilidNetHandle};
+pub use aimd::AimdWindow;
 pub use config::VeilidNetConfig;
 pub use discovery::{
     route_provenance_input, verify_route_advert, DiscoveryEnvelope, RouteAdvertSigner,

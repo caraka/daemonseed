@@ -791,6 +791,20 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   decision deferred to **#129** (best resolved with #126). NB D-0a already removed the dominant
   ~6–10s open cost, so D-0b's residual benefit is the `set_dht_value` block. No wire or
   public-contract change. (Sanjay, 2026-07-06, #128 D-0b.)
+- **AIMD fetch-concurrency controller built, live-wiring deferred (D-1, #128).** #128 ratified an
+  adaptive fetch window (D-1) + fetcher-side throttle (D-2) + "transfer active" affordance (D-3) as
+  the thin-link (cellular) protection layer. Built the ratified core as a self-contained
+  `daemonseed_veilid_net::AimdWindow` — additive-increase (+1 per healthy observation) /
+  multiplicative-decrease (halve on breach), bounded `[floor, ceiling]` with the ceiling = the
+  static #109/#113 concurrency cap; signal-agnostic + clock-free, so it is deterministically
+  unit-testable with injected latency samples. **Live wiring is deliberately NOT done tonight:**
+  #128 mandates *measure-then-confirm* — the morning fat-link felt-test decides whether D-0a + D-0b
+  alone dissolved the chat starvation before the adaptive yield is engaged — and *measure before
+  choosing* the signal source and threshold. Both are choices the measurement grounds, and the
+  interactive-latency signal originates outside the fetcher (a proxy or cross-layer wire), so
+  rushing the wiring at night would pre-empt a ratified step. The primitive ships tested and ready;
+  the live wiring (fetch level, signal, threshold) is the D-2 follow-on tracked on #128. No fetch
+  behaviour change this commit (nothing consumes the controller yet). (Sanjay, 2026-07-07, #128 D-1.)
 
 ## Changelog
 
@@ -1171,3 +1185,15 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   receiver-side (GUI dispatch loses send-order upstream). [DEFERRED-VERIFY] live confirmation that a
   chat send stays responsive during a fat-link transfer (queue-latency + `publish_rendezvous … in
   {ms}` traces) — morning orinoco item.
+- D-1 (AIMD fetch-concurrency controller) verified 2026-07-07: `daemonseed-veilid-net` nextest 24/24
+  (3 new `aimd::tests`): `starts_open_at_ceiling_and_clamps_the_floor` (opens at ceiling; floor
+  clamped into `[1, ceiling]`), `a_breach_halves_and_recovery_climbs_within_bounds` (8→4→2→1→1 floor
+  hold; then +1 per healthy step up to the ceiling), `observe_routes_a_latency_sample_against_the_
+  threshold` (`>= threshold` breaches, under climbs). `cargo fmt` clean; crate `clippy --all-targets
+  -D warnings` clean; GUI `clippy --features "desktop veilid"` clean (workspace-side, the new pub
+  module). No fetch-path change (controller unconsumed), so all fetch tests are untouched-green.
+  A `high` code-review confirmed the controller math is correct and drove one improvement — the
+  floor-clamp test now breaches a `floor=0` controller all the way down and asserts it floors at 1
+  (not just the initial window), guarding against a future dropped `clamp(1, ceiling)`.
+  [DEFERRED-VERIFY] live wiring + signal-source + threshold — the D-2 follow-on gated on #128's
+  measure-then-confirm (morning fat-link felt-test).
