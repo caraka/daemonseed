@@ -69,8 +69,8 @@ use daemonseed_core::storage::cas::ChunkAddr;
 use daemonseed_core::storage::fetched::rebase_to_selection_root;
 use daemonseed_proto::v1 as wire;
 use daemonseed_veilid_net::{
-    DiscoveryEnvelope, VeilidNet, VeilidNetConfig, VeilidNetError, VeilidNetEvent, VeilidNetHandle,
-    verify_route_advert,
+    AimdWindow, DiscoveryEnvelope, VeilidNet, VeilidNetConfig, VeilidNetError, VeilidNetEvent,
+    VeilidNetHandle, verify_route_advert,
 };
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
@@ -1162,6 +1162,19 @@ async fn confirm_fetch_inner(
     let mut bytes_received: u64 = 0;
     let mut files_written: u32 = 0;
 
+    // #128 D-1: ONE adaptive fragment-concurrency window for the whole download,
+    // shared across every chunk fetch (chunks still run concurrently — #113).
+    // It starts fully open at FRAGMENT_FETCH_CONCURRENCY (safe-by-default: a
+    // healthy download is unchanged) and only narrows, floored at 1, when a
+    // chunk's fragment `app_call`s breach FRAGMENT_LATENCY_THRESHOLD — yielding
+    // bandwidth back to interactive chat under fat-link congestion, then climbing
+    // back as latency recovers. `Arc<Mutex>` because concurrent chunk fetches read
+    // and update it (the guard is never held across an await).
+    let aimd = std::sync::Arc::new(std::sync::Mutex::new(AimdWindow::new(
+        1,
+        daemonseed_veilid_net::share::FRAGMENT_FETCH_CONCURRENCY,
+    )));
+
     for (pos, &i) in indices.iter().enumerate() {
         let entry = &manifest[i];
         let rel = match &rebased {
@@ -1186,7 +1199,24 @@ async fn confirm_fetch_inner(
         let chunks = match fetch_chunks_ordered(
             &entry.chunks,
             CHUNK_FETCH_CONCURRENCY,
-            |addr| handle.fetch_chunk(route.clone(), share_id, addr, room_key_bytes),
+            |addr| {
+                // Fetch this chunk's fragments at the current adaptive window, then
+                // feed the max observed fragment latency back so the NEXT chunk's
+                // window backs off (or recovers) — #128 D-1.
+                let aimd = aimd.clone();
+                let route = route.clone();
+                let window = aimd.lock().expect("aimd mutex").window();
+                async move {
+                    let (data, latency) = handle
+                        .fetch_chunk(route, share_id, addr, room_key_bytes, window)
+                        .await?;
+                    aimd.lock().expect("aimd mutex").observe(
+                        latency,
+                        daemonseed_veilid_net::share::FRAGMENT_LATENCY_THRESHOLD,
+                    );
+                    Ok::<Vec<u8>, VeilidNetError>(data)
+                }
+            },
             |data| {
                 chunks_received += 1;
                 bytes_received += data.len() as u64;

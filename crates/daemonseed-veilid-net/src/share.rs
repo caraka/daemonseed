@@ -22,6 +22,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 
@@ -62,7 +63,22 @@ const FRAGMENT_RETRY_BACKOFF_MS: u64 = 250;
 /// be `Send`/`'static`). A 1 MiB chunk is ~34 fragments; a window of 8 collapses
 /// ~34 serial round-trips into ~5 waves — the wall-clock win behind #109 — while
 /// a bounded window avoids hammering a work-in-progress private route.
-const FRAGMENT_FETCH_CONCURRENCY: usize = 8;
+///
+/// This is also the CEILING (and the safe-by-default starting value) of the
+/// fetcher-side [`crate::AimdWindow`] adaptive window (#128 D-1): a healthy
+/// download runs fully open at this cap, and the controller only narrows below it
+/// on a latency breach.
+pub const FRAGMENT_FETCH_CONCURRENCY: usize = 8;
+
+/// Per-fragment `app_call` round-trip latency at or above which the fetcher-side
+/// AIMD window treats the link as congested and backs off (#128 D-1). INITIAL,
+/// felt-test-tunable value: a healthy private-route fragment `app_call` runs well
+/// under this (the transit experiment's worst observed rtt was ~1.7 s), while
+/// veilid's inbound `app_call` answer window (~5 s) is the hard ceiling — so a
+/// fragment reaching this threshold signals real congestion and is the point to
+/// yield concurrency (and thus bandwidth) back to interactive chat. Kept as a
+/// named `const` so the fat-link felt-test can retune it in one place.
+pub const FRAGMENT_LATENCY_THRESHOLD: Duration = Duration::from_secs(2);
 
 /// A legitimate fragment is sliced to ≤[`FRAGMENT_SIZE`] on the serve side
 /// ([`ServedShare::answer_fragment`]); a larger one is malformed or hostile.
@@ -305,7 +321,15 @@ where
     F: Fn(Vec<u8>) -> Fut,
     Fut: std::future::Future<Output = Result<Vec<u8>>>,
 {
-    let sealed = fetch_sealed(share_id, &FetchTarget::Manifest, &call).await?;
+    // The manifest is one small fetch, fetched fully open at the ceiling; its
+    // latency does not feed the adaptive window (that adapts across content chunks).
+    let (sealed, _lat) = fetch_sealed(
+        share_id,
+        &FetchTarget::Manifest,
+        FRAGMENT_FETCH_CONCURRENCY,
+        &call,
+    )
+    .await?;
     match open_share_frame(room_key, &sealed).map_err(|e| VeilidNetError::Send(e.to_string()))? {
         ShareFrame::ManifestResponse { entries } => Ok(entries),
         _ => Err(VeilidNetError::Send(
@@ -318,17 +342,24 @@ where
 /// recovered bytes and reject any mismatch with the requested address
 /// (ISC-S28 / ISC-A-S20). A faithful sharer passes by construction; a tampered
 /// chunk fails closed.
+///
+/// `window` caps how many fragment `app_call`s run in flight for this chunk (the
+/// fetcher-side AIMD window, #128 D-1). Returns the chunk bytes plus the MAX
+/// per-fragment round-trip latency observed, the congestion signal the caller
+/// feeds back into its [`crate::AimdWindow`] to size the NEXT chunk's window.
 pub async fn fetch_chunk<F, Fut>(
     share_id: &str,
     want: &ChunkAddr,
     room_key: &PublicRoomKey,
+    window: usize,
     call: F,
-) -> Result<Vec<u8>>
+) -> Result<(Vec<u8>, Duration)>
 where
     F: Fn(Vec<u8>) -> Fut,
     Fut: std::future::Future<Output = Result<Vec<u8>>>,
 {
-    let sealed = fetch_sealed(share_id, &FetchTarget::Chunk(*want), &call).await?;
+    let (sealed, max_latency) =
+        fetch_sealed(share_id, &FetchTarget::Chunk(*want), window, &call).await?;
     let data = match open_share_frame(room_key, &sealed)
         .map_err(|e| VeilidNetError::Send(e.to_string()))?
     {
@@ -351,7 +382,7 @@ where
             "chunk failed SHA-384 content-address verification (ISC-S28)".to_owned(),
         ));
     }
-    Ok(data)
+    Ok((data, max_latency))
 }
 
 /// Pull every fragment of a target via `call` and concatenate into the full
@@ -385,12 +416,24 @@ where
     Err(last.unwrap_or_else(|| VeilidNetError::Send("fragment fetch failed".to_owned())))
 }
 
-async fn fetch_sealed<F, Fut>(share_id: &str, target: &FetchTarget, call: &F) -> Result<Vec<u8>>
+/// Pull every fragment of `target` and concatenate into the full sealed blob,
+/// keeping up to `window` fragment `app_call`s in flight (the AIMD-controlled
+/// concurrency, #128 D-1). Returns the blob plus the MAX per-fragment round-trip
+/// latency observed across ALL fragments (fragment 0 included) — the congestion
+/// signal the caller feeds back to its window controller.
+async fn fetch_sealed<F, Fut>(
+    share_id: &str,
+    target: &FetchTarget,
+    window: usize,
+    call: &F,
+) -> Result<(Vec<u8>, Duration)>
 where
     F: Fn(Vec<u8>) -> Fut,
     Fut: std::future::Future<Output = Result<Vec<u8>>>,
 {
+    let frag0_started = Instant::now();
     let first = call_fragment(call, encode_request(share_id, target, 0)?).await?;
+    let mut max_latency = frag0_started.elapsed();
     // A decoded not_found means the owner ANSWERED — the share is withdrawn or was
     // never offered, NOT offline (an offline owner errors `call` above, surfacing as
     // a transport error). This authoritative negative lets the client distinguish a
@@ -409,26 +452,31 @@ where
         )));
     }
     check_fragment_size(&frag0)?;
-    // Pipeline fragments 1..total (#109): `buffered` keeps up to
-    // FRAGMENT_FETCH_CONCURRENCY round-trips in flight AND yields them in request
-    // order, so reassembly stays a simple in-order concat. Polling happens within
-    // this one task (no spawn) → the `call` closure needs no Send/'static, so the
-    // in-process test transports keep working. A fragment that vanishes, oversteps
-    // its size cap, or fails its retry budget fails the whole fetch (`try_collect`).
-    let rest: Vec<Vec<u8>> = stream::iter(1..total)
+    // Pipeline fragments 1..total (#109): `buffered` keeps up to `window`
+    // round-trips in flight AND yields them in request order, so reassembly stays
+    // a simple in-order concat. `window` is the AIMD-controlled cap (#128 D-1),
+    // floored at 1 so a fetch never stalls to zero concurrency. Polling happens
+    // within this one task (no spawn) → the `call` closure needs no Send/'static,
+    // so the in-process test transports keep working. Each fragment is timed and
+    // returned with its round-trip latency; a fragment that vanishes, oversteps its
+    // size cap, or fails its retry budget fails the whole fetch (`try_collect`).
+    let rest: Vec<(Vec<u8>, Duration)> = stream::iter(1..total)
         .map(|i| async move {
+            let started = Instant::now();
             let reply = call_fragment(call, encode_request(share_id, target, i)?).await?;
+            let latency = started.elapsed();
             let (_t, frag) = decode_response(&reply)?
                 .ok_or_else(|| VeilidNetError::Send("fragment vanished mid-fetch".to_owned()))?;
             check_fragment_size(&frag)?;
-            Ok::<Vec<u8>, VeilidNetError>(frag)
+            Ok::<(Vec<u8>, Duration), VeilidNetError>((frag, latency))
         })
-        .buffered(FRAGMENT_FETCH_CONCURRENCY)
+        .buffered(window.max(1))
         .try_collect()
         .await?;
 
     let mut buf = frag0;
-    for frag in rest {
+    for (frag, latency) in rest {
+        max_latency = max_latency.max(latency);
         buf.extend_from_slice(&frag);
     }
     // Backstop the per-fragment cap: even within bounds the concat must not exceed
@@ -438,7 +486,7 @@ where
             "reassembled share response exceeds the size cap (malicious?)".to_owned(),
         ));
     }
-    Ok(buf)
+    Ok((buf, max_latency))
 }
 
 #[cfg(test)]
@@ -515,7 +563,9 @@ mod tests {
         // Fetch + verify every chunk, reassemble the file, compare to the source.
         let mut recovered = Vec::new();
         for addr in &manifest[0].chunks {
-            let data = fetch_chunk(&share_id, addr, &rk, &call).await.unwrap();
+            let (data, _lat) = fetch_chunk(&share_id, addr, &rk, FRAGMENT_FETCH_CONCURRENCY, &call)
+                .await
+                .unwrap();
             recovered.extend_from_slice(&data);
         }
         assert_eq!(recovered, payload, "fetched bytes match the served file");
@@ -640,9 +690,15 @@ mod tests {
         assert_eq!(manifest[0].chunks.len(), 1, "600 KB < 1 MiB ⇒ one chunk");
         peak.store(0, Ordering::SeqCst); // measure the chunk fetch, not the manifest
 
-        let data = fetch_chunk(&share_id, &manifest[0].chunks[0], &rk, &call)
-            .await
-            .unwrap();
+        let (data, _lat) = fetch_chunk(
+            &share_id,
+            &manifest[0].chunks[0],
+            &rk,
+            FRAGMENT_FETCH_CONCURRENCY,
+            &call,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             data, payload,
             "reassembled chunk is byte-for-byte the source"

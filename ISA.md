@@ -1248,8 +1248,12 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   (not just the initial window), guarding against a future dropped `clamp(1, ceiling)`.
   measure-then-confirm DISCHARGED 2026-07-07 (orinoco fat-link felt-test): chat fully PAUSED on both
   sides during a share download, then burst into the circle on completion — #128's exact signature,
-  confirming the controller needs wiring. [DEFERRED-VERIFY] live wiring + signal-source + threshold
-  remains (the D-1/D-2 follow-on now justified by this measurement; #128 stays open).
+  confirming the controller needs wiring. D-1 fetcher-side wiring IMPLEMENTED 2026-07-07: the fragment
+  `app_call` window adapts per chunk against `FRAGMENT_LATENCY_THRESHOLD` (2 s, felt-test-tunable),
+  safe-by-default (starts at the ceiling, narrows only on a latency breach), one `AimdWindow` per
+  download over the concurrent chunk fetch. [DEFERRED-VERIFY] live fat-link validation (chat stays
+  responsive during an active transfer) + threshold calibration — orinoco felt-test; #128 stays open
+  (D-2 fetcher-side / D-3 transfer-active affordance remain).
 - accel-aes (#123) verified 2026-07-07: `cargo check --workspace` + `clippy --workspace -D warnings`
   + GUI `clippy --features "desktop veilid"` all clean with the feature on. `daemonseed-core` nextest
   = 590/595; the 5 failures (`public_room::{seal_open_round_trip, body_never_wire_cleartext,

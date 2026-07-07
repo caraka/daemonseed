@@ -119,8 +119,14 @@ async fn public_share_content_crosses_app_call() {
 
     // Fetch + reassemble + SHA-384-verify the chunk; the recovered bytes equal
     // the served file exactly.
-    let data = fetcher
-        .fetch_chunk(route.clone(), &share_id, chunk0, rk)
+    let (data, _lat) = fetcher
+        .fetch_chunk(
+            route.clone(),
+            &share_id,
+            chunk0,
+            rk,
+            daemonseed_veilid_net::share::FRAGMENT_FETCH_CONCURRENCY,
+        )
         .await
         .expect("fetch + verify the chunk");
     assert_eq!(

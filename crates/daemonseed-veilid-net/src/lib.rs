@@ -101,7 +101,7 @@ pub mod error;
 pub mod event;
 pub mod identity;
 mod rendezvous;
-mod share;
+pub mod share;
 
 pub use actor::{VeilidNet, VeilidNetHandle};
 pub use aimd::AimdWindow;

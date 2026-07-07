@@ -1073,8 +1073,16 @@ async fn confirm_fetch(
                 // `fetch_chunk` reassembles fragments and SHA-384-verifies the
                 // chunk against its address before returning (ISC-S28 / ISC-A-S20),
                 // so no manual re-verify is needed here (unlike the relay's stream).
-                let data = handle
-                    .fetch_chunk(route.clone(), share_id, *addr, room_key_bytes)
+                // TUI keeps the static fragment window for now (adaptive parity is
+                // a follow-up, #128 D-1); the latency signal is unused here.
+                let (data, _lat) = handle
+                    .fetch_chunk(
+                        route.clone(),
+                        share_id,
+                        *addr,
+                        room_key_bytes,
+                        daemonseed_veilid_net::share::FRAGMENT_FETCH_CONCURRENCY,
+                    )
                     .await
                     .map_err(|e| fetch_error_message("chunk fetch failed", e))?;
                 file.write_all(&data)
