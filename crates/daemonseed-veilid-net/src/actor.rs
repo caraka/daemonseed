@@ -556,12 +556,24 @@ async fn actor_loop(
                 sealed,
                 reply,
             } => {
-                let _ = reply.send(
-                    publish_rendezvous(
+                // Spawn the DHT write off the command loop (same pattern as AppCall):
+                // a rendezvous publish can take seconds, and awaiting it inline parks
+                // every command queued behind it (the fat-link chat stall). Delivery
+                // ordering is NOT guaranteed here — the GUI dispatches each publish
+                // from its own task, so send-order is lost upstream and the receiver
+                // orders by sent_unix_ms (#105/#126). Shutdown-drain / backpressure
+                // hardening is deferred to #129.
+                let api = api.clone();
+                let rc = rc.clone();
+                let ring_seq = ring_seq.clone();
+                let opened = opened.clone();
+                tokio::spawn(async move {
+                    let r = publish_rendezvous(
                         &api, &rc, &node_pub, &ring_seq, &opened, owner_seed, sealed,
                     )
-                    .await,
-                );
+                    .await;
+                    let _ = reply.send(r);
+                });
             }
             Command::SubscribeRendezvous { owner_seed, reply } => {
                 let _ =
@@ -801,8 +813,8 @@ async fn publish_rendezvous(
     crate::vtrace!("publish_rendezvous: key={key:?} ring base={base} seq={seq}");
     let started = std::time::Instant::now();
     let r = rendezvous::publish(rc, &key, &owner, base, seq, sealed).await;
-    // Duration matters: this runs INLINE on the actor loop (a chat send), so a
-    // slow write here is queue latency for every command behind it.
+    // Runs on a spawned task off the actor command loop (D-0b, #128), so a slow
+    // write never becomes queue latency for the commands behind it.
     crate::vtrace!(
         "publish_rendezvous: write {} in {}ms",
         if r.is_ok() { "ok" } else { "ERR" },

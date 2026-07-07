@@ -774,6 +774,23 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   self-heal (close+reopen, ref-counted so one advert failure cannot evict the shared lobby handle)
   is a separate design item if live testing shows a handle ever dies mid-session. (Sanjay,
   2026-07-06, #128 D-0a.)
+- **Rendezvous publishes run on a spawned task off the actor loop (D-0b).** The `PublishRendezvous`
+  arm awaited `publish_rendezvous` inline, so a multi-second DHT write parked every command behind
+  it (the fat-link stall root-caused 2026-07-02). It now spawns the write (the `AppCall` pattern the
+  brief named), so the command loop returns immediately; the per-command `reply` oneshot delivers
+  whenever the write completes. **Design-scope call (two `high` review passes):** a per-record serial
+  publish lane was prototyped to make same-record writes land in send order, but rejected — the GUI
+  already dispatches every publish from its own task (`send_circle` / `send_room`), so send-order is
+  lost UPSTREAM of the actor and no actor-side mechanism can restore it; ordering is necessarily
+  receiver-side (`sent_unix_ms`, #105 / #126), and the append-ring is a lossy bounded backlog by
+  design. The lane also added a monotonic lane-lifecycle leak and its own shutdown-drop for no
+  ordering gain. So the shipped change is the minimal non-blocking spawn. The reviews' remaining
+  concerns — shutdown drops in-flight publishes (widened from a pre-existing inline-cmd-queue drop;
+  interacts with the GUI's optimistic echo), no backpressure on the now-unbounded publish path, and
+  confirming receiver-side ordering as the contract — are a cross-layer delivery-semantics design
+  decision deferred to **#129** (best resolved with #126). NB D-0a already removed the dominant
+  ~6–10s open cost, so D-0b's residual benefit is the `set_dht_value` block. No wire or
+  public-contract change. (Sanjay, 2026-07-06, #128 D-0b.)
 
 ## Changelog
 
@@ -1144,3 +1161,13 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   dropping the brief's error-path invalidate/reopen, 1 declined as pre-existing. [DEFERRED-VERIFY]
   live confirmation that the cache removes the ~6–10 s per-publish `open_or_create` on the fat link
   (the `publish_rendezvous … in {ms}` trace lines answer it) — morning orinoco item.
+- D-0b (rendezvous publishes spawned off the actor loop) verified 2026-07-06: `daemonseed-veilid-net`
+  nextest 21/21 (no new unit oracle — the non-blocking property is a live/integration behavior; both
+  `high` review passes rejected a unit test as either tautological or testing a hand-rolled copy, so
+  it is a live check, not a hollow green). `cargo fmt` clean; crate `clippy --all-targets -D warnings`
+  clean; GUI `clippy --features "desktop veilid"` clean. Two `high` code-review passes ran; their
+  delivery-semantics findings (shutdown-drain, backpressure, receiver-side ordering) are triaged to
+  #129 (see Decisions), and a same-slot reorder concern was resolved by recognizing ordering is
+  receiver-side (GUI dispatch loses send-order upstream). [DEFERRED-VERIFY] live confirmation that a
+  chat send stays responsive during a fat-link transfer (queue-latency + `publish_rendezvous … in
+  {ms}` traces) — morning orinoco item.
