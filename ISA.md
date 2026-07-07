@@ -822,6 +822,18 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   (STOP-AND-LEAVE): wiring it into the Slint transcript rows so the label recomputes at paint time
   (ages live) + the on-screen felt-test is the #100 morning item, so the fn carries
   `#[allow(dead_code)]` until then. No wire or public-contract change. (Sanjay, 2026-07-07, #100.)
+- **Discovered-share sharer attribution (#114).** The share listing already threaded the announcer's
+  `sharer_handle` into `ShareListing` (foreign shares carry the announcer's handle via
+  `From<&DiscoveredShare>`; own shares carry their own). The one gap vs the brief's oracle was the
+  own/foreign distinction: added a `mine: bool` to `ShareListing` (core) — `false` for a discovered
+  share (`From` default), `true` for a node's own published share (set in both the gui and relay
+  `listings()` own-share loops). So the (deferred) render can attribute a foreign share to its
+  announcer's handle and mark own shares as "you", with no `#hash` unless hovered. Additive: the
+  field derives `Default`, so the test-only construction sites (cli / tui / integration-tests) take
+  `mine: false`. RENDER DEFERRED (STOP-AND-LEAVE): showing `sharer_handle` / "you" in the Public
+  Shares Slint listing (+ hover-`#hash`) is the #114 morning felt-test; `sharer_handle` + `mine`
+  are unrendered view-model data until then (pub fields, so no dead_code). GUI first; TUI attribution
+  folds into #111. No wire change (the handle was already on the wire). (Sanjay, 2026-07-07, #114.)
 
 ## Changelog
 
@@ -1236,3 +1248,12 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   the full workflow review was skipped for this trivial pure formatter with an exhaustive boundary
   test (brief's judgment allowance, as with the accel-aes config). [DEFERRED-VERIFY] the
   transcript-row render (live-recompute at paint time + on-screen felt-test) — morning item.
+- #114 (discovered-share sharer attribution) verified 2026-07-07: `daemonseed-core` nextest
+  `share_catalog::tests::share_listing_from_a_discovered_share_carries_the_announcer_handle_not_mine`
+  PASS — a `From<&DiscoveredShare>` listing carries the announcer `sender_handle` as `sharer_handle`
+  and `mine == false`; own shares set `mine == true` in the gui/relay `listings()` (inspection). `cargo
+  fmt` clean; `cargo check --workspace` clean; `clippy --workspace -D warnings` clean; ALL test targets
+  compile (`nextest --workspace --no-run`, verifying the cli/tui/integration `mine: false` helper
+  edits); no runnable gui bin. The full workflow review was skipped for this additive view-model field
+  (self-verified at every site; judgment, as with #100). [DEFERRED-VERIFY] the Public-Shares Slint
+  render showing `sharer_handle` / "you" (+ hover-`#hash`) — morning felt-test.

@@ -376,6 +376,7 @@ mod tests {
             name: format!("share-{id}"),
             rating: rating.to_owned(),
             sharer_handle: sharer_handle.to_owned(),
+            mine: false,
         }
     }
 

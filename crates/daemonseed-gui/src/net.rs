@@ -2241,6 +2241,7 @@ impl Actor {
                     name: own.name.clone(),
                     rating: own.rating.clone(),
                     sharer_handle: own.sharer_handle.clone(),
+                    mine: true, // our own published share → rendered as "you" (#114)
                 });
             }
         }

@@ -323,12 +323,14 @@ fn client_filter_excludes_filtered_tier() {
             name: "a".to_owned(),
             rating: "PG13".to_owned(),
             sharer_handle: String::new(),
+            mine: false,
         },
         ShareListing {
             share_id: "b".to_owned(),
             name: "b".to_owned(),
             rating: "X".to_owned(),
             sharer_handle: String::new(),
+            mine: false,
         },
     ];
     let visible = filter_shares_by_rating(&shares, Some("PG13"));

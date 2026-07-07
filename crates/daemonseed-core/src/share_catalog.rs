@@ -79,6 +79,11 @@ pub struct ShareListing {
     pub name: String,
     pub rating: String,
     pub sharer_handle: String,
+    /// True for a share this node published itself (rendered as "you"); false for
+    /// a foreign discovered share, which shows the announcer's `sharer_handle` as
+    /// the attribution (#114). Own shares are the caller's own, so their handle is
+    /// not a discovery attribution.
+    pub mine: bool,
 }
 
 impl From<&DiscoveredShare> for ShareListing {
@@ -88,6 +93,7 @@ impl From<&DiscoveredShare> for ShareListing {
             name: d.name.clone(),
             rating: d.rating.clone(),
             sharer_handle: d.sender_handle.clone(),
+            mine: false, // a discovered share is a foreign announcer's
         }
     }
 }
@@ -267,6 +273,28 @@ impl ShareCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn share_listing_from_a_discovered_share_carries_the_announcer_handle_not_mine() {
+        // #114: a foreign discovered share surfaces the ANNOUNCER's handle as its
+        // attribution and is NOT marked `mine` — own shares are marked mine by the
+        // client's own-share listing path (gui/relay `listings()`).
+        let d = DiscoveredShare {
+            share_id: "s1".to_owned(),
+            name: "vacation".to_owned(),
+            rating: "PG".to_owned(),
+            sender_handle: "river-otter#aabbccddeeff".to_owned(),
+            sender_pubkey: vec![1, 2, 3],
+            announced_unix_ms: 100,
+            received_at: Instant::now(),
+        };
+        let listing = ShareListing::from(&d);
+        assert_eq!(listing.sharer_handle, "river-otter#aabbccddeeff");
+        assert!(
+            !listing.mine,
+            "a discovered share is a foreign announcer's, not mine"
+        );
+    }
 
     fn announcement(
         share_id: &str,

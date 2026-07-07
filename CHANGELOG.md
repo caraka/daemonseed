@@ -51,6 +51,7 @@ work lives in the project lead's vault manifest, not here.
 
 ### Changed
 
+- `daemonseed-core`: `ShareListing` gains a `mine` marker distinguishing a node's own published shares from foreign discovered shares, so the share-listing render can attribute a foreign share to its announcer's `sharer_handle` (already carried) and mark own shares as "you"; the render is a follow-on (#114).
 - workspace: enable oxicrypt's `accel-aes` feature — AES-GCM (the cot seal/open) dispatches to AES-NI at runtime via CPUID when present, else the portable constant-time path; adds the `oxicrypt-aes-accel` path dep to the lock (#123).
 - `daemonseed-veilid-net`: each rendezvous publish (`PublishRendezvous`) runs on a spawned task off the actor command loop instead of blocking it on the DHT write, so a slow publish no longer parks the commands behind it; delivery ordering stays receiver-side (`sent_unix_ms`), with shutdown-drain / backpressure hardening tracked in #129 (#128).
 - `daemonseed-veilid-net`: opened rendezvous DHT records are cached per owner (`rendezvous::OpenCache`, owner seed → the post-`open_or_create` `RecordKey`), so repeated publishes/subscribes to a circle or the lobby reuse the open handle instead of paying a fresh `open_or_create` each time (#128).
