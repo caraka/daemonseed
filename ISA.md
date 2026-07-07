@@ -834,6 +834,28 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   Shares Slint listing (+ hover-`#hash`) is the #114 morning felt-test; `sharer_handle` + `mine`
   are unrendered view-model data until then (pub fields, so no dead_code). GUI first; TUI attribution
   folds into #111. No wire change (the handle was already on the wire). (Sanjay, 2026-07-07, #114.)
+- **Per-record serialization lock — xhigh-review fix of the D-0a + D-0b regression (#128).** The
+  2026-07-07 xhigh review of the night's 6 commits found a CONFIRMED message-loss regression the
+  per-item night reviews missed because each commit was clean *in isolation*: D-0b spawns each
+  `PublishRendezvous` off the actor loop, and the append-ring holds the 2 most-recent messages across
+  `RING_DEPTH = 2` slots relying on inline serialization (write order == seq order). Two spawned
+  publishes for one record (a chat burst) get distinct seqs n / n+2 that map to the SAME slot
+  `base + (seq % 2)`; the writes race, so seq n landing after seq n+2 overwrites the newer message at
+  the slot — it is never stored, so the receiver's `sent_unix_ms` sort cannot recover it (worse than
+  the accepted #129 reordering tradeoff). The review also flagged a cold-cache double-open race (two
+  first-publishes both miss the open cache and run `open_or_create`) and a false comment claiming the
+  open cache "invalidates the entry and reopens once" (no such path — D-0a is deliberately
+  no-invalidation). Fix (caraka-ratified — per-record single-flight): a per-`owner_seed` async lock
+  (`rendezvous::RecordLocks` / `record_lock`) held across the whole open+write of a record.
+  `publish_rendezvous` holds it across open + seq-bump + publish (serializes the ring — the loss fix);
+  every open path (`publish_rendezvous`, `publish_current_state`, `subscribe_rendezvous`) takes it, so
+  the cold open single-flights too (the double-open fix). Distinct records take distinct locks and stay
+  concurrent, so the actor loop still never blocks (D-0b preserved). Coverage verified: the sole DHT
+  writer (`set_dht_value` in `publish_at_subkey`) is reached only via those two locked helpers; no
+  deadlock (one lock type; the map guard is never held across an await). The false comment is
+  corrected; the no-mid-session-reopen robustness gap (a veilid-dropped handle never re-opens) stays
+  the accepted D-0a behavior, captured on #128 for a later reopen path. No wire or public
+  `VeilidNetHandle`-contract change. (Sanjay, 2026-07-07, #128 xhigh review.)
 
 ## Changelog
 
@@ -1257,3 +1279,17 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   edits); no runnable gui bin. The full workflow review was skipped for this additive view-model field
   (self-verified at every site; judgment, as with #100). [DEFERRED-VERIFY] the Public-Shares Slint
   render showing `sharer_handle` / "you" (+ hover-`#hash`) — morning felt-test.
+- Per-record serialization lock (#128 xhigh-review fix) verified 2026-07-07: `daemonseed-veilid-net`
+  from its crate dir — `cargo fmt --check` clean, `cargo clippy --all-targets -- -D warnings` clean,
+  `cargo nextest run` 26/26 (5 skipped) incl. two new `rendezvous::tests`:
+  `record_lock_is_per_seed_same_shares_distinct_separate` (same seed → one `Arc`, distinct seeds →
+  distinct locks) and `same_record_critical_sections_do_not_interleave_across_await` (8 tasks contend
+  on one seed's lock around a `yield_now`; every logged (start,end) is an unbroken pair — the oracle
+  proving the ring-write critical section stays atomic across an await, i.e. the message-loss race is
+  closed). Feature-gated compile: `cargo check -p daemonseed-gui --features "desktop veilid"` and
+  `-p daemonseed-tui --features veilid` clean (public `VeilidNetHandle` API unchanged). Writer-coverage
+  grep confirmed the only `set_dht_value` reaches the network via `publish` and `publish_at_subkey`,
+  both under a `record_lock`; the three `record_lock` acquisitions cover both writers + the subscribe
+  open. glibc rule honored (check/clippy/nextest only, no runnable-bin build). [DEFERRED-VERIFY] live
+  burst behavior (3 rapid same-circle sends all delivered, in order) — orinoco felt-test (this VM's
+  SLIRP NAT blocks Veilid attach).

@@ -23,7 +23,7 @@
 //! non-derivable owner keypair is the write-gate.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 use veilid_core::{
@@ -147,6 +147,31 @@ pub async fn open_cached<K: Clone>(
     let k = open.await?;
     cache.lock().unwrap().insert(*owner_seed, k.clone());
     Ok(k)
+}
+
+/// Per-rendezvous-record serialization lock: one async mutex per record, keyed by
+/// owner seed. Two operations on the SAME record must not run concurrently —
+/// spawned append-ring [`publish`]es (the off-loop publish path) would otherwise
+/// race into the shared `base + (seq % RING_DEPTH)` slot, and an older write landing
+/// after a newer one silently DROPS the newer message (not merely reorders it — the
+/// receiver's `sent_unix_ms` sort cannot recover a value that was never stored); and
+/// two cold-cache callers would both run [`open_or_create`] on the same record.
+/// Holding this lock across the open+write of one record serializes both, while
+/// DISTINCT records take DISTINCT locks and stay fully concurrent — so a slow write
+/// to one record never blocks another's traffic or the actor command loop. See ISA
+/// Decisions (2026-07-07, #128 xhigh review).
+pub type RecordLocks = Mutex<HashMap<[u8; 32], Arc<tokio::sync::Mutex<()>>>>;
+
+/// The serialization lock for `owner_seed`, creating it on first use. The returned
+/// `Arc` is `.lock().await`-ed by the caller; the brief `std::sync::Mutex` guard on
+/// the map itself is never held across an await.
+pub fn record_lock(locks: &RecordLocks, owner_seed: &[u8; 32]) -> Arc<tokio::sync::Mutex<()>> {
+    locks
+        .lock()
+        .unwrap()
+        .entry(*owner_seed)
+        .or_default()
+        .clone()
 }
 
 /// The base subkey of this member's append-ring region, from its node pubkey.
@@ -331,5 +356,54 @@ mod tests {
             2,
             "one open per distinct seed; hits reuse the cached key"
         );
+    }
+
+    #[test]
+    fn record_lock_is_per_seed_same_shares_distinct_separate() {
+        // Same owner seed → the SAME lock (same-record ops serialize); distinct
+        // seeds → distinct locks (different records run concurrently).
+        let locks: RecordLocks = Mutex::new(HashMap::new());
+        let a = record_lock(&locks, &[1u8; 32]);
+        let a2 = record_lock(&locks, &[1u8; 32]);
+        let b = record_lock(&locks, &[2u8; 32]);
+        assert!(Arc::ptr_eq(&a, &a2), "same seed reuses one lock");
+        assert!(!Arc::ptr_eq(&a, &b), "distinct seeds get distinct locks");
+    }
+
+    #[tokio::test]
+    async fn same_record_critical_sections_do_not_interleave_across_await() {
+        // The regression fix: writes to one record must not interleave even across
+        // an await (the DHT open/set). Eight tasks contend on one seed's lock, each
+        // logging start/end around a yield; with the lock held every (start,end) is
+        // an unbroken pair. Without it a yield would let another task's start slip
+        // between — the exact race that lets an older ring write land after a newer.
+        let locks: Arc<RecordLocks> = Arc::new(Mutex::new(HashMap::new()));
+        let log: Arc<Mutex<Vec<(u32, char)>>> = Arc::new(Mutex::new(Vec::new()));
+        let seed = [9u8; 32];
+        let mut handles = Vec::new();
+        for i in 0..8u32 {
+            let locks = locks.clone();
+            let log = log.clone();
+            handles.push(tokio::spawn(async move {
+                let lock = record_lock(&locks, &seed);
+                let _guard = lock.lock().await;
+                log.lock().unwrap().push((i, 's'));
+                tokio::task::yield_now().await;
+                log.lock().unwrap().push((i, 'e'));
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 16);
+        for pair in log.chunks(2) {
+            assert_eq!(pair[0].1, 's');
+            assert_eq!(pair[1].1, 'e');
+            assert_eq!(
+                pair[0].0, pair[1].0,
+                "one record's critical section stays atomic across the await"
+            );
+        }
     }
 }
