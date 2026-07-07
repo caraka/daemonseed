@@ -813,6 +813,15 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   The excluded `daemonseed-veilid-net` standalone build keeps accel off in its own lock but gets it
   via the GUI's workspace build graph. No wire or public-contract change. (Sanjay, 2026-07-07,
   #123 accel-aes.)
+- **Relative-age formatter (#100, logic slice).** Added a pure `format_relative_age(sent_unix_ms,
+  now_ms)` (daemonseed-gui `state.rs`): buckets an age into "just now" (< 1 min, incl. a future
+  timestamp from peer clock skew), "{m}m ago" (< 1 h), "{h}h ago" (< 1 day), "sitting {n} day(s)"
+  (≥ 1 day). Clock-injected (both args passed) so it is deterministically unit-testable — one
+  fake-clock test covers every boundary. The "sitting N days" framing is deliberate: a Veilid
+  bounded-backlog message swept days later must read as stale, not live. RENDER DEFERRED
+  (STOP-AND-LEAVE): wiring it into the Slint transcript rows so the label recomputes at paint time
+  (ages live) + the on-screen felt-test is the #100 morning item, so the fn carries
+  `#[allow(dead_code)]` until then. No wire or public-contract change. (Sanjay, 2026-07-07, #100.)
 
 ## Changelog
 
@@ -1219,3 +1228,11 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   VM test-harness gap (module not initialized in those bare unit tests) — worth confirming they pass
   on orinoco / in the full-gate context. [DEFERRED-VERIFY] host full-gate (`cargo test --workspace`
   with the module powered on) — morning item.
+- #100 (relative-age formatter, logic slice) verified 2026-07-07: `daemonseed-gui` nextest
+  `state::tests::format_relative_age_buckets_across_boundaries` PASS — fake-clock across the
+  second/minute/hour/day boundaries incl. a future timestamp ("just now") and the "sitting N days"
+  backlog framing. `cargo fmt` clean; gui `clippy` clean on BOTH `desktop` and `desktop veilid` (the
+  `#[allow(dead_code)]` for the deferred render satisfies `-D warnings`). Boundaries self-verified;
+  the full workflow review was skipped for this trivial pure formatter with an exhaustive boundary
+  test (brief's judgment allowance, as with the accel-aes config). [DEFERRED-VERIFY] the
+  transcript-row render (live-recompute at paint time + on-screen felt-test) — morning item.

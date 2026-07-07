@@ -47,6 +47,7 @@ work lives in the project lead's vault manifest, not here.
 - `daemonseed-veilid-net`: transit-experiment harness (`tests/transit_experiment.rs`, `--ignored`) — a two-node live-network matrix measuring private-route `app_call` latency across the Stability × Sequencing 2×2 plus hop-count and burst cells, with a same-clock rtt split (`req_1way` / `reply_op` / `reply_path`) (#123).
 - `daemonseed-veilid-net`: `DAEMONSEED_VEILID_TRACE` lines carry a `+seconds` relative timestamp (`trace_elapsed_secs`), and the serve / publish / advert-refresh paths report per-stage durations (queued / seal / reply; write ms), so a live log localizes where a deadline is spent.
 - `daemonseed-veilid-net`: `AimdWindow` — an AIMD (additive-increase / multiplicative-decrease) fetch-concurrency window controller: climbs by one per healthy latency observation, halves on a breach, bounded to `[floor, ceiling]` where the ceiling is the static #109/#113 cap. Signal-agnostic and clock-free. Not yet wired to the live fetch path (#128).
+- `daemonseed-gui`: `format_relative_age(sent_unix_ms, now_ms)` — a pure transcript-age formatter ("just now" / "2m ago" / "3h ago" / "sitting 3 days") so a swept old backlog message reads as stale, not live; the live transcript-row render is a follow-on (#100).
 
 ### Changed
 

@@ -209,6 +209,39 @@ pub struct Msg {
     pub sent_unix_ms: i64,
 }
 
+/// Format a message's age (its `sent_unix_ms`) relative to `now_ms` as a short
+/// transcript label: "just now", "2m ago", "3h ago", "sitting 3 days". Pure +
+/// clock-injected (both args passed) so it is deterministically unit-testable.
+/// Especially valuable for a Veilid bounded-backlog message that is genuinely old
+/// — a swept days-old line must read as stale, not live (#100). A future timestamp
+/// (peers have no shared clock) reads as "just now" rather than a negative age.
+///
+/// NB: the transcript-row RENDER that consumes this — recomputing the label at
+/// paint time so it ages live, and threading it into the Slint row — is the
+/// deferred #100 morning item (STOP-AND-LEAVE), so this pure slice is unused until then.
+#[allow(dead_code)]
+pub(crate) fn format_relative_age(sent_unix_ms: i64, now_ms: i64) -> String {
+    let age_ms = now_ms.saturating_sub(sent_unix_ms);
+    // Under a minute (including a future timestamp from clock skew) → "just now".
+    if age_ms < 60_000 {
+        return "just now".to_owned();
+    }
+    let mins = age_ms / 60_000;
+    if mins < 60 {
+        return format!("{mins}m ago");
+    }
+    let hours = mins / 60;
+    if hours < 24 {
+        return format!("{hours}h ago");
+    }
+    let days = hours / 24;
+    if days == 1 {
+        "sitting 1 day".to_owned()
+    } else {
+        format!("sitting {days} days")
+    }
+}
+
 /// A share you published this session — one entry in the Publish overlay's "Your
 /// live shares" list (each removable via Unpublish). The `root` directory path is
 /// the M16 persistence key: it is remembered in the profile blob so the share
@@ -1413,6 +1446,30 @@ mod tests {
             vec!["first", "second", "third"],
             "messages ordered by sent_unix_ms, not arrival order"
         );
+    }
+
+    #[test]
+    fn format_relative_age_buckets_across_boundaries() {
+        // #100: fake-clock (both args injected) across the second/minute/hour/day
+        // boundaries; a days-old backlog line reads "sitting N days", not live.
+        let t = 1_700_000_000_000_i64; // fixed "sent" anchor (ms)
+        let m = 60_000_i64;
+        let h = 60 * m;
+        let d = 24 * h;
+        // Under a minute — incl. a future timestamp from peer clock skew — is "just now".
+        assert_eq!(format_relative_age(t, t - 5_000), "just now"); // 5s in the future
+        assert_eq!(format_relative_age(t, t), "just now");
+        assert_eq!(format_relative_age(t, t + 59_000), "just now");
+        // Minutes.
+        assert_eq!(format_relative_age(t, t + m), "1m ago");
+        assert_eq!(format_relative_age(t, t + 2 * m), "2m ago");
+        assert_eq!(format_relative_age(t, t + 59 * m), "59m ago");
+        // Hours.
+        assert_eq!(format_relative_age(t, t + h), "1h ago");
+        assert_eq!(format_relative_age(t, t + 23 * h), "23h ago");
+        // Days — the "sitting" framing so an old swept backlog line does not read as live.
+        assert_eq!(format_relative_age(t, t + d), "sitting 1 day");
+        assert_eq!(format_relative_age(t, t + 3 * d), "sitting 3 days");
     }
 
     #[test]
