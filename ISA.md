@@ -978,6 +978,32 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   `-D warnings` gui + tui (default & veilid). **DEFERRED-VERIFY → orinoco.** (Sanjay, 2026-07-07,
   #131 review-fix.)
 
+- **Phase 4 (presence + announcements/MOTD) re-grounded on Veilid; design-of-record consolidated.**
+  The two accepted Phase-4 designs (`presence-superstructure.md`, `announcements-motd-admin.md`) were
+  relay-era (2026-06-25) — written before the Veilid Phase 3/4 re-model (`veilid-migration.md` D-3.1/2,
+  2026-06-27) — and described `daemonseed-server` RPCs deleted at the v0.33.0 cutover. Consolidated into
+  one active design-of-record `docs/design/phase4-veilid-presence-announcements.md`; the two originals
+  archived under `docs/design/zarchive/` behind redirect tombstones (one active source of truth). A
+  first-hand code survey grounds the plan: **presence is transport-agnostic core already built**
+  (`heartbeat.rs`, `presence.rs`, #78 freshness) with only the Veilid net-actor emit/ingest loop missing
+  (relay actor has it; dies at cutover) — a re-wiring job (#74→#75/#77). **Announcements/MOTD needs one
+  net-new core primitive** — an operator owner-seed as the DHT write-gate — because the whitelist model
+  was relay-shaped. **Two boundary calls (unchanged ISCs; new ISC IDs minted at cutover):** (P1) presence
+  gets its OWN sibling rendezvous record via `current_state_subkey` (last-writer-wins, one slot/member)
+  so heartbeats never evict the chat append-ring (`RING_DEPTH=2`); cadence raised to ~15–20 s to sit above
+  the ~14.7 s watch floor (P2). (A1) announcements/MOTD live on an operator-owned rendezvous record whose
+  non-derivable owner keypair is the sole write-gate; **write-gate (Veilid owner key) ≠ content-provenance
+  (ML-DSA whitelist, `verify_artifact` carries over)** — the whitelist degrades from a server-enforced
+  security boundary to a client-verified documentary roster (A2, named accepted cost); multi-author
+  quarantined behind a post-MVP out-of-band submission channel (A3, shared-owner rejected on
+  revocation-by-rekey); MOTD and announcements kept separable (A4). Closed pre-freeze gaps: roster
+  rollback-freshness via the #78 monotonic guard; single combined unread-hash (subkey cap has ~7× headroom
+  over an ML-DSA object, split not forced); operator stable signing key = the #94 composer gate;
+  owner-key-loss = accepted unrecoverable-record MVP risk. Cutover-gate coverage: presence P-a/P-b +
+  announcements A-a/A-b are MUST-before-Phase-5; #92/#93/#77 SHOULD; multi-author + UI polish MAY (post).
+  This is the DESIGN decision — no Phase-4 code written this session. (Sanjay, 2026-07-07, Phase-4 design
+  freeze.)
+
 ## Changelog
 
 - **conjectured:** the multi-circle carousel (ISC-C60) lets the active surface span the lobby and the
