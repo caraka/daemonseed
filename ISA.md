@@ -857,6 +857,24 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   the accepted D-0a behavior, captured on #128 for a later reopen path. No wire or public
   `VeilidNetHandle`-contract change. (Sanjay, 2026-07-07, #128 xhigh review.)
 
+- 2026-07-07: **#124 advert watchdog + #125 serve-lane hardening (pre-cutover).** The
+  `RouteMaintenance` relevance filter (the storm fix) left the observed-death path as the *only*
+  advert-refresh trigger, so a route veilid never reported dead would never be re-published (share
+  shows published, every fetch times out). Added a `Command::AdvertWatchdog` fired by a weak-sender
+  ticker every `ADVERT_WATCHDOG_INTERVAL` (150 s); it refreshes every advert unconditionally through
+  the SAME coalesce gate as `RouteMaintenance` — extracted to `spawn_refresh_if_due` so both paths
+  share one in-flight guard + interval. The 150 s cadence is 30× the 5 s coalesce window, so a
+  periodic refresh can never approach the tight refresh→release→RouteChange loop the filter closed
+  (unit `watchdog_cadence_is_storm_safe`). #125: the inbound serve lane's unbounded queue + per-call
+  spawned reply are bounded — `SERVE_QUEUE_CAP` (256) with producer-side `try_send` shed (a shed serve
+  = one fetcher retry), and a `MAX_CONCURRENT_SERVE_REPLIES` (32) semaphore acquired before sealing so
+  a fetch burst holds neither unbounded tasks nor unbounded sealed responses (the remote-flood
+  scenario was already refuted; this is principled local hardening). All internal to
+  `daemonseed-veilid-net`; no wire / core / `VeilidNetHandle`-contract change. Gates: veilid-net fmt +
+  clippy `--all-targets -D warnings` + 28 nextest (2 new); gui/tui `cargo check` with the `veilid`
+  feature clean. **DEFERRED-VERIFY → orinoco:** a silently-dead-route share self-recovers within one
+  watchdog interval; a serve burst stays bounded. (Sanjay, 2026-07-07.)
+
 ## Changelog
 
 - **conjectured:** the multi-circle carousel (ISC-C60) lets the active surface span the lobby and the
@@ -1304,3 +1322,13 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   ds1→ds2 all delivered, none dropped, across multiple bursts — the append-ring message loss is closed
   in practice (negative-control reproduction on the pre-fix build not run; unit oracle
   `same_record_critical_sections_do_not_interleave_across_await` backs the fix).
+- ISC-inspect (#124/#125, 2026-07-07): `AdvertWatchdog` ticker spawned in `VeilidNet::start` on a
+  weak sender (dies with the last handle); handler routes through `spawn_refresh_if_due`, shared with
+  the `RouteMaintenance` arm (byte-faithful extraction — the `refresh_due` + in-flight-swap gate and
+  completion-stamp are unchanged). Serve lane: `serve_tx`/`serve_rx` are a bounded `mpsc::channel`
+  (`SERVE_QUEUE_CAP`), the update-callback `try_send`-sheds on `Full`, and `serve_loop` acquires a
+  `Semaphore` permit (`MAX_CONCURRENT_SERVE_REPLIES`) before sealing, held across `app_call_reply`.
+  Gate evidence: veilid-net `cargo clippy --all-targets -- -D warnings` clean; `cargo nextest run` =
+  28 passed (incl. `watchdog_cadence_is_storm_safe`, `serve_lane_bounds_are_sane`); `cargo check -p
+  daemonseed-gui --features "desktop veilid"` + `-p daemonseed-tui --features veilid` both Finished.
+  Live behaviour DEFERRED-VERIFY → orinoco.

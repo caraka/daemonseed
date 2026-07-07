@@ -28,6 +28,17 @@ use crate::{discovery, identity, rendezvous, share};
 /// must fit; file-share chunks re-chunk to this in Phase 3.
 pub const APP_MESSAGE_CAP: usize = 32768;
 
+/// Bound on the inbound serve queue (#125): a full queue sheds the incoming fetch
+/// request on the producer rather than growing without limit under a serve-latency
+/// spike. Sized well above a single fetch's fragment fan-out so a normal burst never
+/// sheds; a shed request is one fetcher retry.
+const SERVE_QUEUE_CAP: usize = 256;
+
+/// Max concurrent `app_call_reply` tasks (#125): caps the network work — and the
+/// sealed responses held in memory — in flight at once, applying backpressure to the
+/// serve intake when replies are slow.
+const MAX_CONCURRENT_SERVE_REPLIES: usize = 32;
+
 /// Commands the [`VeilidNetHandle`] sends to the actor task. Each carries a
 /// `oneshot` reply so the caller awaits the result.
 enum Command {
@@ -112,6 +123,13 @@ enum Command {
     RouteMaintenance {
         dead_routes: Vec<RouteId>,
     },
+    /// Periodic slow-cadence advert refresh (the #124 watchdog). Unlike
+    /// [`Command::RouteMaintenance`], which fires only on an OBSERVED route death,
+    /// this fires on a timer and refreshes every advert unconditionally — the sole
+    /// recovery path for a route that died SILENTLY (veilid never surfaced it in a
+    /// `RouteChange.dead_routes`). Bounded by a minutes-scale interval well above the
+    /// coalesce window so it cannot recreate the refresh storm. Fire-and-forget.
+    AdvertWatchdog,
     Shutdown {
         reply: oneshot::Sender<()>,
     },
@@ -388,20 +406,29 @@ impl VeilidNet {
         // behind multi-second inline DHT commands (a chat publish is an
         // open_or_create + set), so every reply landed late → "Unmatched
         // operation id" on the sharer, timeout wave + prune on the fetcher.
-        // Unbounded: entries are (id, small request, stamp) and the producer is
-        // the update callback, which must never block.
+        // BOUNDED + shed (#125): the producer (the update callback) must never
+        // block, so on a full queue it `try_send`-sheds the incoming request — a
+        // shed serve is one fetcher retry, which the fetch side already does — rather
+        // than growing without limit under a serve-latency spike.
         let (serve_tx, serve_rx) =
-            mpsc::unbounded_channel::<(OperationId, Vec<u8>, std::time::Instant)>();
+            mpsc::channel::<(OperationId, Vec<u8>, std::time::Instant)>(SERVE_QUEUE_CAP);
         let ev_tx_cb = ev_tx.clone();
         let cmd_tx_cb = cmd_tx.clone();
-        let update_callback: Arc<dyn Fn(VeilidUpdate) + Send + Sync> =
-            Arc::new(move |u: VeilidUpdate| match u {
+        let update_callback: Arc<dyn Fn(VeilidUpdate) + Send + Sync> = Arc::new(
+            move |u: VeilidUpdate| match u {
                 VeilidUpdate::AppCall(call) => {
-                    let _ = serve_tx.send((
+                    let entry = (
                         call.id(),
                         call.message().to_vec(),
                         std::time::Instant::now(),
-                    ));
+                    );
+                    match serve_tx.try_send(entry) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => crate::vtrace!(
+                            "serve: inbound queue full ({SERVE_QUEUE_CAP} cap), shedding a fetch request (fetcher retries)"
+                        ),
+                        Err(mpsc::error::TrySendError::Closed(_)) => {} // actor gone
+                    }
                 }
                 // A private route died/rotated: hand the dead-route list to the
                 // actor (which knows which routes it currently advertises) AND
@@ -425,7 +452,8 @@ impl VeilidNet {
                         let _ = ev_tx_cb.send(ev);
                     }
                 }
-            });
+            },
+        );
 
         let mut vcfg = VeilidConfig::new(
             "daemonseed_veilid_net",
@@ -499,6 +527,26 @@ impl VeilidNet {
         // open: it still closes (and the loop still cleans up) when the last
         // real handle drops.
         let cmd_weak = cmd_tx.downgrade();
+        // #124 watchdog ticker: a slow heartbeat that nudges the actor to re-publish
+        // its adverts, recovering a route that died without an observed RouteChange.
+        // Weak sender so the ticker dies with the last real handle (never keeps the
+        // actor alive); a send failure means the actor is gone → stop ticking.
+        let watchdog_weak = cmd_tx.downgrade();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(ADVERT_WATCHDOG_INTERVAL);
+            tick.tick().await; // consume the immediate first tick — first refresh at +interval
+            loop {
+                tick.tick().await;
+                match watchdog_weak.upgrade() {
+                    Some(tx) => {
+                        if tx.send(Command::AdvertWatchdog).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+        });
         tokio::spawn(actor_loop(
             api, rc, cmd_rx, ev_tx, node_pub, shares, cmd_weak,
         ));
@@ -727,38 +775,20 @@ async fn actor_loop(
                 if !relevant {
                     continue;
                 }
-                // Coalesce: skip if a refresh is in flight or the last one completed
-                // within the interval. Re-allocating a route per advert is slow, so
-                // the refresh is SPAWNED — running it inline would block the loop
-                // for the whole wave (head-of-line).
-                let last = *last_advert_refresh.lock().unwrap();
-                if refresh_due(last, !share_adverts.is_empty(), ADVERT_REFRESH_MIN_INTERVAL)
-                    && !refresh_in_flight.swap(true, Ordering::SeqCst)
-                {
-                    let api = api.clone();
-                    let rc = rc.clone();
-                    let opened = opened.clone();
-                    let record_locks = record_locks.clone();
-                    let advert_routes = advert_routes.clone();
-                    let adverts = share_adverts.clone();
-                    let in_flight = refresh_in_flight.clone();
-                    let last_refresh = last_advert_refresh.clone();
-                    tokio::spawn(async move {
-                        refresh_share_adverts(
-                            &api,
-                            &rc,
-                            &opened,
-                            &record_locks,
-                            &advert_routes,
-                            &adverts,
-                        )
-                        .await;
-                        // Stamp the coalesce window from COMPLETION, then release the
-                        // in-flight guard so the next RouteChange can schedule again.
-                        *last_refresh.lock().unwrap() = Some(tokio::time::Instant::now());
-                        in_flight.store(false, Ordering::SeqCst);
-                    });
-                } else {
+                // Coalesce + spawn the refresh (shared with the #124 watchdog). Skips
+                // if a refresh is in flight or one completed within the interval; the
+                // refresh is SPAWNED so re-allocating a route per advert never blocks
+                // the loop for the whole wave (head-of-line).
+                if !spawn_refresh_if_due(
+                    &api,
+                    &rc,
+                    &opened,
+                    &record_locks,
+                    &advert_routes,
+                    &share_adverts,
+                    &refresh_in_flight,
+                    &last_advert_refresh,
+                ) {
                     // A relevant death is ONE-SHOT under the filter, so a busy
                     // gate (refresh in flight, or inside the coalesce window)
                     // must not consume it silently: re-deliver the same command
@@ -773,6 +803,29 @@ async fn actor_loop(
                             let _ = tx.send(Command::RouteMaintenance { dead_routes }).await;
                         }
                     });
+                }
+            }
+            Command::AdvertWatchdog => {
+                // The silently-dead-route recovery path (#124): re-publish every
+                // advert on a slow timer, with NO relevance filter (the death was
+                // never observed) and NO busy-gate re-delivery (the next tick is the
+                // retry). The shared coalesce gate makes a tick landing just after a
+                // real refresh a quiet no-op, so the minutes-scale cadence can never
+                // approach the refresh storm the RouteMaintenance filter closed.
+                if spawn_refresh_if_due(
+                    &api,
+                    &rc,
+                    &opened,
+                    &record_locks,
+                    &advert_routes,
+                    &share_adverts,
+                    &refresh_in_flight,
+                    &last_advert_refresh,
+                ) {
+                    crate::vtrace!(
+                        "advert_watchdog: refreshing {} advert(s)",
+                        share_adverts.len()
+                    );
                 }
             }
             Command::Shutdown { reply } => {
@@ -800,18 +853,32 @@ async fn actor_loop(
 async fn serve_loop(
     api: VeilidAPI,
     shares: Arc<Mutex<HashMap<String, share::ServedShare>>>,
-    mut serve_rx: mpsc::UnboundedReceiver<(OperationId, Vec<u8>, std::time::Instant)>,
+    mut serve_rx: mpsc::Receiver<(OperationId, Vec<u8>, std::time::Instant)>,
 ) {
     // veilid's default answer window (`rpc.timeout_ms`): a reply after this is
     // rejected as "Unmatched operation id", so serving an older entry is pure
     // wasted seal + network work that only deepens a backlog.
     const SERVE_ANSWER_WINDOW: Duration = Duration::from_secs(5);
+    // Cap concurrent app_call_reply tasks (#125): a fetch burst must not spawn
+    // unbounded reply tasks, each holding a sealed response across a slow network
+    // send. Acquiring the permit BEFORE sealing means we never seal work we can't yet
+    // send, and a permit-starved reply awaits — deliberate backpressure that pairs
+    // with the bounded+shed intake channel to bound the whole serve lane.
+    let reply_sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SERVE_REPLIES));
     while let Some((call_id, message, received)) = serve_rx.recv().await {
         let queued_ms = received.elapsed().as_millis();
         if received.elapsed() > SERVE_ANSWER_WINDOW {
             crate::vtrace!("serve: EXPIRED after {queued_ms}ms in queue, dropped");
             continue;
         }
+        // Reserve a reply slot before doing any seal work; held on the spawned task
+        // across app_call_reply. `acquire_owned` errors only on a closed semaphore,
+        // which never happens here (it lives for the loop).
+        let permit = reply_sem
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("serve reply semaphore is never closed");
         // Recover the guard if another holder panicked: a poisoned registry
         // must not cascade into the actor's later ServeShare/StopServe locks.
         let seal_started = std::time::Instant::now();
@@ -828,6 +895,7 @@ async fn serve_loop(
         // timed separately so a slow felt-test log names the stage to blame.
         let api = api.clone();
         tokio::spawn(async move {
+            let _permit = permit; // released when this reply task ends
             let started = std::time::Instant::now();
             let result = api.app_call_reply(call_id, response).await;
             let reply_ms = started.elapsed().as_millis();
@@ -999,6 +1067,14 @@ async fn resweep_rendezvous(
 /// churn → republish → load → churn reinforcing loop.
 const ADVERT_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Cadence of the #124 advert watchdog: a slow, unconditional advert re-publish that
+/// recovers a route which died without veilid ever reporting it in `dead_routes`.
+/// Deliberately minutes-scale — two orders of magnitude above
+/// [`ADVERT_REFRESH_MIN_INTERVAL`], so even back-to-back with an observed refresh it
+/// cannot reconstruct the tight refresh→release→RouteChange storm the relevance filter
+/// closed. A tick that lands inside a recent refresh's coalesce window is a no-op.
+const ADVERT_WATCHDOG_INTERVAL: Duration = Duration::from_secs(150);
+
 /// A remembered public-share advert: enough to re-allocate a route, re-sign, and
 /// re-publish it on RouteChanged. Holds the signing CAPABILITY, never key material.
 /// `Clone` so a `RouteMaintenance` refresh can take a snapshot of the advert set to
@@ -1115,6 +1191,51 @@ async fn refresh_share_adverts(
     );
 }
 
+/// Spawn an advert refresh if the coalesce gate allows it, returning whether one was
+/// spawned. Shared by `RouteMaintenance` (an OBSERVED route death) and the #124
+/// watchdog (a SILENT death): routing both through the SAME in-flight guard + interval
+/// is what lets the watchdog fire on a slow timer without ever doubling a just-fired
+/// route-change refresh — so the combined cadence stays far below the storm the
+/// relevance filter closed. Clones the shared caches into the spawned task and stamps
+/// completion + clears the in-flight guard when it finishes.
+#[allow(clippy::too_many_arguments)]
+fn spawn_refresh_if_due(
+    api: &VeilidAPI,
+    rc: &RoutingContext,
+    opened: &Arc<rendezvous::OpenCache>,
+    record_locks: &Arc<rendezvous::RecordLocks>,
+    advert_routes: &Arc<Mutex<HashMap<String, RouteId>>>,
+    share_adverts: &HashMap<String, AdvertState>,
+    refresh_in_flight: &Arc<AtomicBool>,
+    last_advert_refresh: &Arc<Mutex<Option<tokio::time::Instant>>>,
+) -> bool {
+    let last = *last_advert_refresh.lock().unwrap();
+    if !refresh_due(last, !share_adverts.is_empty(), ADVERT_REFRESH_MIN_INTERVAL) {
+        return false;
+    }
+    // Claim the in-flight guard; a `true` return means another refresh already holds
+    // it. Swapped only after the due-check so we never set it when nothing is due.
+    if refresh_in_flight.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    let api = api.clone();
+    let rc = rc.clone();
+    let opened = opened.clone();
+    let record_locks = record_locks.clone();
+    let advert_routes = advert_routes.clone();
+    let adverts = share_adverts.clone();
+    let in_flight = refresh_in_flight.clone();
+    let last_refresh = last_advert_refresh.clone();
+    tokio::spawn(async move {
+        refresh_share_adverts(&api, &rc, &opened, &record_locks, &advert_routes, &adverts).await;
+        // Stamp the coalesce window from COMPLETION, then release the in-flight guard
+        // so the next RouteChange or watchdog tick can schedule again.
+        *last_refresh.lock().unwrap() = Some(tokio::time::Instant::now());
+        in_flight.store(false, Ordering::SeqCst);
+    });
+    true
+}
+
 /// Whether a `RouteMaintenance` refresh should be scheduled now: there are adverts
 /// to refresh, and either none has run yet or the last completed at least
 /// `min_interval` ago. Pure so the coalesce gate is unit-testable (the in-flight
@@ -1226,5 +1347,35 @@ mod tests {
         // Zero interval → eligible again immediately (only the in-flight guard,
         // checked separately, prevents overlap).
         assert!(refresh_due(Some(now), true, Duration::ZERO));
+    }
+
+    #[test]
+    fn watchdog_cadence_is_storm_safe() {
+        // The #124 watchdog fires unconditionally on its own timer, so its cadence
+        // MUST stay far above the coalesce window — otherwise a periodic refresh could
+        // approach the tight refresh→release→RouteChange loop the relevance filter
+        // closed. Require at least a 10× margin.
+        assert!(
+            ADVERT_WATCHDOG_INTERVAL >= ADVERT_REFRESH_MIN_INTERVAL * 10,
+            "watchdog interval must dwarf the coalesce window"
+        );
+    }
+
+    #[test]
+    fn serve_lane_bounds_are_sane() {
+        // #125 hardening invariants (compile-time): a bounded intake with room for
+        // more than one fetch's fragment fan-out, and a reply cap below the queue cap
+        // so replies are the tighter bound (the network work), not the buffer.
+        const {
+            assert!(
+                SERVE_QUEUE_CAP >= 64,
+                "queue must hold a normal fetch burst"
+            );
+            assert!(
+                MAX_CONCURRENT_SERVE_REPLIES < SERVE_QUEUE_CAP,
+                "concurrent replies are the tighter bound"
+            );
+            assert!(MAX_CONCURRENT_SERVE_REPLIES >= 1);
+        }
     }
 }
