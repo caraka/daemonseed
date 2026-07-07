@@ -58,7 +58,8 @@ use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferTyp
 use slint::platform::{Platform, PlatformError, WindowAdapter};
 use slint::{ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel};
 use state::{
-    AnnouncementsView, CircleState, GuiState, Landing, Msg, combined_content_hash, landing_decision,
+    AnnouncementsView, CircleState, GuiState, Landing, Msg, combined_content_hash,
+    format_relative_age, landing_decision,
 };
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -293,14 +294,18 @@ fn now_unix_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Convert a circle's `Vec<Msg>` into a Slint `ModelRc<MsgData>`.
+/// Convert a circle's `Vec<Msg>` into a Slint `ModelRc<MsgData>`. The relative-age
+/// caption (#100) is formatted against the current wall-clock captured once per
+/// rebuild, so every message ages against the same "now".
 fn messages_model(messages: &[Msg]) -> ModelRc<MsgData> {
+    let now_ms = now_unix_ms();
     let rows: Vec<MsgData> = messages
         .iter()
         .map(|m| MsgData {
             who: SharedString::from(m.who.as_str()),
             text: SharedString::from(m.text.as_str()),
             mine: m.mine,
+            age: SharedString::from(format_relative_age(m.sent_unix_ms, now_ms)),
         })
         .collect();
     ModelRc::from(Rc::new(VecModel::from(rows)))
@@ -1109,6 +1114,8 @@ fn apply_share_rows(ui: &AppWindow, browser: &ShareBrowser) {
             expanded: r.expanded,
             mine: r.mine,
             loading: r.loading,
+            sharer: SharedString::from(r.sharer),
+            sharer_fingerprint: SharedString::from(r.sharer_fingerprint),
         })
         .collect();
     ui.set_share_rows(ModelRc::from(Rc::new(VecModel::from(rows))));
@@ -1357,6 +1364,10 @@ fn start_drain(
         // has no relay push (`ListPublicShares` is unary), so liveness = re-list on a
         // cadence. ~90 × 33ms ≈ 3s.
         let mut poll_tick: u32 = 0;
+        // #100: relative-age repaint cadence. ~900 × 33ms ≈ 30s — advances the
+        // transcript's age captions ("2m ago" → "3m ago") even when no new message
+        // arrives, without the churn of a per-tick rebuild.
+        let mut age_tick: u32 = 0;
         timer.start(TimerMode::Repeated, Duration::from_millis(33), move || {
             let Some(ui) = weak.upgrade() else { return };
             let mut n = 0u32;
@@ -1394,6 +1405,15 @@ fn start_drain(
                         _ => {}
                     }
                 }
+            }
+            // #100: rebuild the active circle's message model on the ~30s cadence so
+            // the age captions advance live. Only the messages model is replaced (not a
+            // full `apply_view`), so the reader's scroll position is left untouched.
+            age_tick = age_tick.wrapping_add(1);
+            if age_tick >= 900 {
+                age_tick = 0;
+                let st = state.borrow();
+                ui.set_messages(messages_model(&st.current().messages));
             }
         });
     }

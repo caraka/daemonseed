@@ -216,10 +216,9 @@ pub struct Msg {
 /// — a swept days-old line must read as stale, not live (#100). A future timestamp
 /// (peers have no shared clock) reads as "just now" rather than a negative age.
 ///
-/// NB: the transcript-row RENDER that consumes this — recomputing the label at
-/// paint time so it ages live, and threading it into the Slint row — is the
-/// deferred #100 morning item (STOP-AND-LEAVE), so this pure slice is unused until then.
-#[allow(dead_code)]
+/// The transcript-row render consumes this via `messages_model` (#100): each rebuild
+/// recomputes the label against the current wall-clock, and a ~30s repaint tick
+/// rebuilds the active circle's model so ages advance without a new message.
 pub(crate) fn format_relative_age(sent_unix_ms: i64, now_ms: i64) -> String {
     let age_ms = now_ms.saturating_sub(sent_unix_ms);
     // Under a minute (including a future timestamp from clock skew) → "just now".

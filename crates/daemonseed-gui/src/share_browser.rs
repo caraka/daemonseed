@@ -52,6 +52,14 @@ pub struct Row {
     /// True for a share that is expanded but whose manifest has not arrived yet
     /// (the FetchShare preview is in flight) — the UI shows a quiet "loading…".
     pub loading: bool,
+    /// #114: the sharer's display handle (name part of the advisory `name#12hex`),
+    /// shown on a foreign share's depth-0 row so it is not anonymous. Empty for
+    /// own shares (the UI tags those "you") and for non-share rows.
+    pub sharer: String,
+    /// #114: the sharer's `#12hex` fingerprint (the `#…` tail of the advisory
+    /// handle), revealed only on hover per the "no hash unless hover" design. Empty
+    /// when the handle carries no fingerprint, for own shares, and non-share rows.
+    pub sharer_fingerprint: String,
 }
 
 /// The outcome of a [`ShareBrowser::toggle`]: if `needs_fetch` is `Some`, the caller
@@ -123,6 +131,10 @@ struct ShareNode {
     share_id: String,
     name: String,
     mine: bool,
+    /// #114: the sharer's advisory display handle (`name#12hex`), carried so the
+    /// depth-0 row can show who published a foreign share. Split into the visible
+    /// handle + on-hover fingerprint in [`ShareBrowser::rows`].
+    sharer_handle: String,
     expanded: bool,
     /// True once the manifest preview has been folded in via [`ShareBrowser::load_manifest`].
     loaded: bool,
@@ -181,6 +193,7 @@ impl ShareBrowser {
                 // Persisting share: keep id/expansion/loaded/children; refresh display.
                 existing.name = name.to_owned();
                 existing.mine = mine;
+                existing.sharer_handle = sharer_handle.to_owned();
                 next.push(existing);
             } else {
                 let id = self.fresh_id();
@@ -189,6 +202,7 @@ impl ShareBrowser {
                     share_id: share_id.to_owned(),
                     name: name.to_owned(),
                     mine,
+                    sharer_handle: sharer_handle.to_owned(),
                     expanded: false,
                     loaded: false,
                     children: Vec::new(),
@@ -299,6 +313,14 @@ impl ShareBrowser {
     pub fn rows(&self) -> Vec<Row> {
         let mut out = Vec::new();
         for share in &self.shares {
+            // #114: own shares are tagged "you" by the UI, so leave their sharer
+            // fields empty; a foreign share splits its advisory `name#12hex` handle
+            // into the visible handle + the on-hover fingerprint.
+            let (sharer, sharer_fingerprint) = if share.mine {
+                (String::new(), String::new())
+            } else {
+                split_handle(&share.sharer_handle)
+            };
             out.push(Row {
                 id: share.id,
                 depth: 0,
@@ -309,6 +331,8 @@ impl ShareBrowser {
                 expanded: share.expanded,
                 mine: share.mine,
                 loading: share.expanded && !share.loaded,
+                sharer,
+                sharer_fingerprint,
             });
             if share.expanded && share.loaded {
                 push_rows(&share.children, 1, &mut out);
@@ -407,6 +431,8 @@ fn push_rows(level: &[Node], depth: u32, out: &mut Vec<Row>) {
                     expanded: dir.expanded,
                     mine: false,
                     loading: false,
+                    sharer: String::new(),
+                    sharer_fingerprint: String::new(),
                 });
                 if dir.expanded {
                     push_rows(&dir.children, depth + 1, out);
@@ -422,8 +448,22 @@ fn push_rows(level: &[Node], depth: u32, out: &mut Vec<Row>) {
                 expanded: false,
                 mine: false,
                 loading: false,
+                sharer: String::new(),
+                sharer_fingerprint: String::new(),
             }),
         }
+    }
+}
+
+/// Split an advisory display handle `name#12hex` into `(handle, "#12hex")` for the
+/// #114 "no hash unless hover" render: the visible handle carries no hash, the
+/// fingerprint is revealed only on hover. Splits on the LAST `#` (the fingerprint
+/// separator) so a `#` inside a chosen name is preserved in the handle. A handle
+/// with no `#` yields `(whole, "")` — nothing to reveal on hover.
+fn split_handle(handle: &str) -> (String, String) {
+    match handle.rsplit_once('#') {
+        Some((name, hex)) => (name.to_owned(), format!("#{hex}")),
+        None => (handle.to_owned(), String::new()),
     }
 }
 

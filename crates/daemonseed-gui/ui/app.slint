@@ -30,6 +30,9 @@ struct MsgData {
     who: string,
     text: string,
     mine: bool,
+    // #100: relative-age caption ("2m ago", "sitting 3 days"), formatted by Rust from
+    // the message's send stamp on every model rebuild so a swept old line reads stale.
+    age: string,
 }
 
 // One flattened row of the public-share browse tree (Shares tab). `kind`: 0 share
@@ -45,6 +48,10 @@ struct ShareRow {
     expanded: bool,
     mine: bool,
     loading: bool,
+    // #114: the sharer's display handle (foreign share only; empty for own/non-share
+    // rows) and its `#12hex` fingerprint (revealed on hover — "no hash unless hover").
+    sharer: string,
+    sharer_fingerprint: string,
 }
 
 struct ActionData {
@@ -137,6 +144,7 @@ component MsgBubble inherits Rectangle {
     in property <string> who;
     in property <string> text;
     in property <bool> mine;
+    in property <string> age;
     HorizontalLayout {
         alignment: root.mine ? end : start;
         Rectangle {
@@ -151,7 +159,14 @@ component MsgBubble inherits Rectangle {
             border-color: root.mine ? #ffffff10 : #1f4d45;
             VerticalLayout {
                 padding: 8px; spacing: 2px;
-                Text { text: root.who; color: root.mine ? #8b93a1 : #6fb3a4; font-size: 11px; }
+                // header: sender handle + a muted relative-age caption (#100). The age
+                // stays calm (same muted tone as the announcement timestamp) and shares
+                // the header line so the message wrap layout below is undisturbed.
+                HorizontalLayout {
+                    spacing: 6px;
+                    Text { text: root.who; color: root.mine ? #8b93a1 : #6fb3a4; font-size: 11px; vertical-alignment: center; }
+                    Text { text: root.age; color: #5b6472; font-size: 11px; vertical-alignment: center; }
+                }
                 Text { text: root.text; color: #d6dae1; font-size: 13px; wrap: word-wrap; }
             }
         }
@@ -250,11 +265,19 @@ component ShareTreeRow inherits Rectangle {
             font-size: root.node.kind == 0 ? 14px : 13px;
             vertical-alignment: center;
         }
-        // "you" — the one teal cue, computed (never an `if`) so it can't mutate the
-        // item tree; empty string when it does not apply.
+        // #114: share-row sharer label — "you" for your own share, else the sharer's
+        // handle (empty for folders/files). Computed (never an `if`) so it can't mutate
+        // the item tree.
         Text {
-            text: (root.node.kind == 0 && root.node.mine) ? "you" : "";
+            text: root.node.kind == 0 ? (root.node.mine ? "you" : root.node.sharer) : "";
             color: #6fb3a4; font-size: 11px; vertical-alignment: center;
+        }
+        // #114: the sharer's `#12hex` fingerprint, revealed ONLY on hover for a foreign
+        // share ("no hash unless hover") — its own computed Text (mirrors RosterRowView),
+        // empty otherwise so hover can't mutate the item tree.
+        Text {
+            text: (root.node.kind == 0 && !root.node.mine && touch.has-hover) ? root.node.sharer_fingerprint : "";
+            color: #5b6472; font-size: 11px; vertical-alignment: center;
         }
         Rectangle { }
         Text {
@@ -834,7 +857,7 @@ export component AppWindow inherits Window {
                                 changed content-h => { root.chat-content-h = self.content-h; }
                                 chat-content := VerticalLayout {
                                     padding: 16px; spacing: 8px;
-                                    for m in root.messages : MsgBubble { who: m.who; text: m.text; mine: m.mine; }
+                                    for m in root.messages : MsgBubble { who: m.who; text: m.text; mine: m.mine; age: m.age; }
                                 }
                             }
 
