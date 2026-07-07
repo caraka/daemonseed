@@ -1,0 +1,817 @@
+# ─────────────────────────────────────────────────────────────────────
+# daemonseed-veilid-net — LAMA API Manifest (Veilid transport layer)
+#
+# The Veilid-native transport for daemonseed: an identity-bound node driven
+# through a command-channel actor (VeilidNet / VeilidNetHandle), the
+# AppSession-replacement the GUI/TUI drive behind their `veilid` feature. Moves
+# ONLY opaque cot-sealed bytes — content stays sealed under a circle key /
+# PublicRoomKey (ISC-A-S2); this layer never holds a content key or plaintext.
+# Circles, the lobby / public rooms, and public-share discovery all ride ONE
+# shared-owner DFLT DHT rendezvous engine, distinguished only by which owner seed
+# the caller derives. Public-share content moves owner-on-demand over app_call +
+# a private route. The crate is workspace-excluded until the v0.33.0 cutover and
+# is compiled by the GUI/TUI only under their `veilid` feature.
+#
+# Cross-references:
+# - Repository root: ../../lama.yaml
+# - Core crate (key derivation, seal/open, share types): ./daemonseed-core-api.yaml
+# - Wire schema: ./daemonseed-proto-protocol.yaml
+# - Schema specification: https://github.com/lamaspec/lama/blob/main/SPEC.md
+# ─────────────────────────────────────────────────────────────────────
+
+lama: "0.1"
+
+library:
+  name: daemonseed-veilid-net
+  version: "0.1.0"
+  description: >-
+    Veilid transport layer for daemonseed. Brings up an identity-bound Veilid
+    node (VeilidNet::start), driven through a cloneable command-channel handle
+    (VeilidNetHandle) that serializes access to the single VeilidAPI. Provides:
+    sealed 1:1 messaging over a private route; circles + lobby / public rooms over
+    a shared-owner DFLT DHT rendezvous (append-ring fan-out + login-backlog sweep +
+    a re-sweep recovery primitive); public-share discovery via an anti-swap SIGNED
+    route advert on the lobby rendezvous (DiscoveryEnvelope); and public-share
+    content transfer owner-on-demand over app_call, fragment-reassembled and
+    SHA-384-verified per chunk. Emits typed VeilidNetEvents so the app never
+    touches veilid types. Presence / announcements are Phase 4.
+  license: "AGPL-3.0-or-later"
+  manifest_for: "crates/daemonseed-veilid-net"
+  status: >-
+    Phase 3 (public shares) complete and live-verified on the public Veilid
+    network; circles + lobby live. Presence / announcements are Phase 4. Consumed
+    by the GUI/TUI behind their `veilid` feature; workspace-excluded until the
+    v0.33.0 cutover.
+
+# ─────────────────────────────────────────────────────────────────────
+# Library-wide constraints
+# ─────────────────────────────────────────────────────────────────────
+
+constraints:
+  - description: >-
+      `oxicrypt_module::initialize()` MUST have run before any operation that
+      seals/opens or signs/verifies (share serve/fetch, route advert sign/verify).
+      The consuming binary initializes oxicrypt at startup.
+    enforcement: runtime
+    severity: error
+
+  - description: >-
+      The node MUST be attached and public-internet-ready before any transport
+      operation — call `VeilidNetHandle::attach_and_wait` after `VeilidNet::start`.
+    enforcement: runtime
+    severity: error
+
+  - description: >-
+      This layer moves ONLY opaque sealed bytes. Content is sealed under a circle
+      key / PublicRoomKey in daemonseed-core; the DHT and app_call frames carry
+      ciphertext (ISC-A-S2). Rendezvous records are opened with NO Veilid
+      encryption key so values are stored verbatim — the cot seal is the only
+      content-encryption layer, keeping content crypto decoupled from Veilid's
+      transport crypto.
+    enforcement: convention + tests
+    severity: error
+
+# ─────────────────────────────────────────────────────────────────────
+# Modules
+# ─────────────────────────────────────────────────────────────────────
+
+modules:
+  - name: daemonseed_veilid_net::actor
+    description: >-
+      The command-channel actor. `VeilidNet::start` spawns the actor + a dedicated
+      inbound-serve lane + a slow advert watchdog; `VeilidNetHandle` is the
+      cloneable command surface (attach, routes, sealed send, circle/room
+      publish/subscribe/resweep, share serve/fetch, share advert publish/stop).
+    no_std: false
+    depends_on: []
+  - name: daemonseed_veilid_net::config
+    description: Bring-up configuration (VeilidNetConfig) — identity seed, bootstrap, storage dir, hop count, namespace, listen address.
+    no_std: false
+    depends_on: []
+  - name: daemonseed_veilid_net::event
+    description: Typed transport events (VeilidNetEvent), mapped from raw VeilidUpdates so the app never touches veilid types.
+    no_std: false
+    depends_on: []
+  - name: daemonseed_veilid_net::error
+    description: The transport error surface (VeilidNetError) and the crate `Result` alias.
+    no_std: false
+    depends_on: []
+  - name: daemonseed_veilid_net::identity
+    description: Derive the Veilid node keypair and the rendezvous-owner keypair from daemonseed-core seeds (D3).
+    no_std: false
+    depends_on: []
+  - name: daemonseed_veilid_net::discovery
+    description: >-
+      The anti-swap SIGNED route advert for public-share discovery (D-3.5): a
+      DiscoveryEnvelope binds the sharer's private-route blob to the announcer's
+      ML-DSA-87 identity over a domain-separated `share_id ‖ route_blob`, signed via
+      the least-authority RouteAdvertSigner capability.
+    no_std: false
+    depends_on: []
+  - name: daemonseed_veilid_net::share
+    description: >-
+      Public-share content transfer over app_call: request/response framing, a
+      served-share registry (ServedShare) that answers fragment requests from a
+      seal cache, and the fetch side that reassembles ≤30 KiB fragments and
+      SHA-384-verifies each chunk against its content address (ISC-S28).
+    no_std: false
+    depends_on:
+      - daemonseed_veilid_net::error
+  - name: daemonseed_veilid_net::aimd
+    description: An additive-increase/multiplicative-decrease fragment-concurrency window (AimdWindow) that narrows under fragment-latency congestion and recovers as it clears (#128 D-1).
+    no_std: false
+    depends_on: []
+
+# ─────────────────────────────────────────────────────────────────────
+# Types
+# ─────────────────────────────────────────────────────────────────────
+
+types:
+  - name: VeilidNet
+    module: daemonseed_veilid_net::actor
+    kind: struct
+    description: Entry point; `start` brings up the node and spawns the actor.
+  - name: VeilidNetHandle
+    module: daemonseed_veilid_net::actor
+    kind: struct
+    description: >-
+      Cloneable handle to the running actor — every transport operation goes
+      through it; the actor task serializes access to the single VeilidAPI. The
+      shape the app/UI drives (the AppSession replacement).
+  - name: VeilidNetConfig
+    module: daemonseed_veilid_net::config
+    kind: struct
+    description: Node bring-up configuration.
+    fields:
+      - name: identity_seed
+        type: VeilidNodeSeed
+        description: Node identity seed (D3), from the daemonseed mnemonic.
+      - name: bootstrap
+        type: "Vec<String>"
+        description: Bootstrap entries; empty uses veilid's built-in defaults.
+      - name: storage_dir
+        type: String
+        description: veilid protected-store + DHT-cache directory.
+      - name: hop_count
+        type: usize
+        description: Private-route hop count (D5); carried, applied when the safety-route dial-up is on.
+      - name: namespace
+        type: String
+        description: Program namespace so multiple nodes coexist on one host.
+      - name: listen_address
+        type: "Option<String>"
+        description: UDP/TCP/WS listen address; None uses veilid's defaults.
+  - name: VeilidNetEvent
+    module: daemonseed_veilid_net::event
+    kind: enum
+    description: A daemonseed-facing transport event.
+    variants:
+      - name: Attachment
+        description: "Attachment state changed; `public_internet_ready` gates all operations."
+      - name: Inbound
+        description: An opaque sealed inbound message arrived; the app opens it with the relevant circle/room key.
+      - name: RouteChanged
+        description: An allocated/imported private route died or changed and may need re-allocation.
+      - name: ValueChanged
+        description: A watched DHT value changed (circles / shares).
+  - name: RouteAdvertSigner
+    module: daemonseed_veilid_net::discovery
+    kind: trait
+    description: >-
+      Least-authority capability to sign a route advert (`share_id ‖ route_blob`)
+      with the sharer's ML-DSA-87 identity — keeps the identity key out of the
+      transport crate.
+  - name: DiscoveryEnvelope
+    module: daemonseed_veilid_net::discovery
+    kind: struct
+    description: A public-share discovery item on the lobby rendezvous — the sealed self-signed announcement, the sharer's route blob, and the anti-swap route signature.
+  - name: ServedShare
+    module: daemonseed_veilid_net::share
+    kind: struct
+    description: A registered share served owner-on-demand; answers fragment requests from an LRU-bounded seal cache so all fragments of one response come from a single seal.
+  - name: FetchTarget
+    module: daemonseed_veilid_net::share
+    kind: enum
+    description: What a fetcher is pulling.
+    variants:
+      - name: Manifest
+        description: The share manifest (file names + sizes + chunk addresses).
+      - name: Chunk
+        description: One content chunk, by its ChunkAddr.
+  - name: AimdWindow
+    module: daemonseed_veilid_net::aimd
+    kind: struct
+    description: A bounded additive-increase/multiplicative-decrease concurrency window (floor..ceiling).
+
+# ─────────────────────────────────────────────────────────────────────
+# Functions
+# ─────────────────────────────────────────────────────────────────────
+
+functions:
+  # ── actor: bring-up ──────────────────────────────────────────────────
+  - name: VeilidNet::start
+    module: daemonseed_veilid_net::actor
+    description: Bring up the node with a daemonseed-derived identity, spawn the actor, and return the handle plus a stream of events. Does NOT attach.
+    signature: "pub async fn start(cfg: VeilidNetConfig) -> Result<(VeilidNetHandle, mpsc::UnboundedReceiver<VeilidNetEvent>)>"
+    parameters:
+      - name: cfg
+        type: VeilidNetConfig
+        direction: in
+        description: Node bring-up configuration.
+    returns:
+      type: "Result<(VeilidNetHandle, mpsc::UnboundedReceiver<VeilidNetEvent>)>"
+      description: The command handle and the event stream, or a startup error.
+
+  # ── actor: VeilidNetHandle ───────────────────────────────────────────
+  - name: VeilidNetHandle::attach_and_wait
+    module: daemonseed_veilid_net::actor
+    description: Attach and poll until public-internet-ready or the deadline elapses.
+    signature: "pub async fn attach_and_wait(&self, timeout_secs: u64) -> Result<()>"
+    parameters:
+      - name: timeout_secs
+        type: u64
+        direction: in
+        description: Deadline for reaching public-internet-ready.
+    returns:
+      type: "Result<()>"
+      description: Ok when ready; NotReady on timeout.
+  - name: VeilidNetHandle::new_inbound_route
+    module: daemonseed_veilid_net::actor
+    description: Allocate a private inbound route; the returned blob never exposes this node's id or IP.
+    signature: "pub async fn new_inbound_route(&self) -> Result<RouteBlob>"
+    parameters: []
+    returns:
+      type: "Result<RouteBlob>"
+      description: The route blob a peer addresses.
+  - name: VeilidNetHandle::import_route
+    module: daemonseed_veilid_net::actor
+    description: Import a peer's private-route blob, returning the route id to send to.
+    signature: "pub async fn import_route(&self, blob: Vec<u8>) -> Result<RouteId>"
+    parameters:
+      - name: blob
+        type: "Vec<u8>"
+        direction: in
+        description: A peer's private-route blob.
+    returns:
+      type: "Result<RouteId>"
+      description: The imported route id.
+  - name: VeilidNetHandle::send_sealed
+    module: daemonseed_veilid_net::actor
+    description: Send a sealed 1:1 payload over a peer's private route.
+    signature: "pub async fn send_sealed(&self, route: RouteId, sealed: Vec<u8>) -> Result<()>"
+    parameters:
+      - name: route
+        type: RouteId
+        direction: in
+        description: The imported peer route.
+      - name: sealed
+        type: "Vec<u8>"
+        direction: in
+        description: The cot-sealed payload.
+    returns:
+      type: "Result<()>"
+      description: Ok on send, else a Send error.
+  - name: VeilidNetHandle::publish_circle
+    module: daemonseed_veilid_net::actor
+    description: Publish a sealed payload to a circle's shared-owner rendezvous append-ring.
+    signature: "pub async fn publish_circle(&self, owner_seed: [u8; 32], sealed: Vec<u8>) -> Result<()>"
+    parameters:
+      - name: owner_seed
+        type: "[u8; 32]"
+        direction: in
+        description: The circle's rendezvous-owner seed (daemonseed_core::derive_circle_veilid_owner_seed).
+      - name: sealed
+        type: "Vec<u8>"
+        direction: in
+        description: The circle-key-sealed message.
+    returns:
+      type: "Result<()>"
+      description: Ok on write.
+  - name: VeilidNetHandle::subscribe_circle
+    module: daemonseed_veilid_net::actor
+    description: Open + watch + backlog-sweep a circle's rendezvous record; inbound messages arrive as VeilidNetEvent::Inbound.
+    signature: "pub async fn subscribe_circle(&self, owner_seed: [u8; 32]) -> Result<()>"
+    parameters:
+      - name: owner_seed
+        type: "[u8; 32]"
+        direction: in
+        description: The circle's rendezvous-owner seed.
+    returns:
+      type: "Result<()>"
+      description: Ok once subscribed.
+  - name: VeilidNetHandle::publish_room
+    module: daemonseed_veilid_net::actor
+    description: Publish a sealed payload to a public room / lobby rendezvous (a room message, or a ShareAnnouncement for share discovery). Mechanics identical to publish_circle; only the owner seed differs.
+    signature: "pub async fn publish_room(&self, owner_seed: [u8; 32], sealed: Vec<u8>) -> Result<()>"
+    parameters:
+      - name: owner_seed
+        type: "[u8; 32]"
+        direction: in
+        description: The public-room rendezvous-owner seed (daemonseed_core::derive_room_veilid_owner_seed), world-derivable.
+      - name: sealed
+        type: "Vec<u8>"
+        direction: in
+        description: Payload sealed under the room's PublicRoomKey.
+    returns:
+      type: "Result<()>"
+      description: Ok on write.
+  - name: VeilidNetHandle::subscribe_room
+    module: daemonseed_veilid_net::actor
+    description: Open + watch + backlog-sweep a public room / lobby rendezvous; inbound sealed room messages / share announcements arrive as VeilidNetEvent::Inbound.
+    signature: "pub async fn subscribe_room(&self, owner_seed: [u8; 32]) -> Result<()>"
+    parameters:
+      - name: owner_seed
+        type: "[u8; 32]"
+        direction: in
+        description: The public-room rendezvous-owner seed.
+    returns:
+      type: "Result<()>"
+      description: Ok once subscribed.
+  - name: VeilidNetHandle::resweep_rendezvous
+    module: daemonseed_veilid_net::actor
+    description: Re-run the one-shot backlog sweep on an already-subscribed rendezvous record WITHOUT registering another watch — the recovery primitive for an item published during the post-(re)connect watch-warmup window (#132/#133) and for re-resolving a stale-route share (#118).
+    signature: "pub async fn resweep_rendezvous(&self, owner_seed: [u8; 32]) -> Result<()>"
+    parameters:
+      - name: owner_seed
+        type: "[u8; 32]"
+        direction: in
+        description: The circle or public-room rendezvous-owner seed.
+    returns:
+      type: "Result<()>"
+      description: Ok once the re-sweep is dispatched; re-swept items arrive as Inbound and are deduped downstream.
+  - name: VeilidNetHandle::serve_share
+    module: daemonseed_veilid_net::actor
+    description: Register an indexed share to serve owner-on-demand; the actor answers inbound fragment app_calls for share_id from content, sealing each response under room_key. The sharer must stay online to serve (ISC-A-S21).
+    signature: "pub async fn serve_share(&self, share_id: String, content: Arc<ShareContent>, room_key: [u8; 32]) -> Result<()>"
+    parameters:
+      - name: share_id
+        type: String
+        direction: in
+        description: The share's stable id (daemonseed_core::share_announce::derive_share_id).
+      - name: content
+        type: "Arc<ShareContent>"
+        direction: in
+        description: The indexed share content (manifest + content-addressed chunks).
+      - name: room_key
+        type: "[u8; 32]"
+        direction: in
+        description: The share's PublicRoomKey bytes (responses seal under it).
+    returns:
+      type: "Result<()>"
+      description: Ok once registered.
+  - name: VeilidNetHandle::fetch_manifest
+    module: daemonseed_veilid_net::actor
+    description: Fetch + reassemble + open a share's manifest from the sharer at a private route.
+    signature: "pub async fn fetch_manifest(&self, route: RouteId, share_id: &str, room_key: [u8; 32]) -> Result<Vec<ManifestEntry>>"
+    parameters:
+      - name: route
+        type: RouteId
+        direction: in
+        description: The imported sharer route (anti-swap-verified at discovery before import).
+      - name: share_id
+        type: "&str"
+        direction: in
+        description: The share id.
+      - name: room_key
+        type: "[u8; 32]"
+        direction: in
+        description: The share's PublicRoomKey bytes.
+    returns:
+      type: "Result<Vec<ManifestEntry>>"
+      description: The manifest entries, or a transport / NotServed error.
+  - name: VeilidNetHandle::fetch_chunk
+    module: daemonseed_veilid_net::actor
+    description: Fetch + reassemble + open + SHA-384-verify one content chunk (ISC-S28 / ISC-A-S20) from the sharer; returns the chunk bytes plus the max per-fragment latency observed (the congestion signal for the caller's AIMD window, #128 D-1).
+    signature: "pub async fn fetch_chunk(&self, route: RouteId, share_id: &str, chunk_addr: ChunkAddr, room_key: [u8; 32], window: usize) -> Result<(Vec<u8>, Duration)>"
+    parameters:
+      - name: route
+        type: RouteId
+        direction: in
+        description: The imported sharer route.
+      - name: share_id
+        type: "&str"
+        direction: in
+        description: The share id.
+      - name: chunk_addr
+        type: ChunkAddr
+        direction: in
+        description: The content-address of the chunk to fetch.
+      - name: room_key
+        type: "[u8; 32]"
+        direction: in
+        description: The share's PublicRoomKey bytes.
+      - name: window
+        type: usize
+        direction: in
+        description: Max concurrent fragment app_calls (the caller's AIMD window).
+    returns:
+      type: "Result<(Vec<u8>, Duration)>"
+      description: The verified chunk bytes and the max per-fragment latency observed.
+  - name: VeilidNetHandle::publish_share
+    module: daemonseed_veilid_net::actor
+    description: Announce a public share to the lobby with an anti-swap SIGNED route advert — allocate a private route, sign the advert via signer, wrap it with the sealed announcement into a DiscoveryEnvelope, publish on the lobby rendezvous, and re-publish on RouteChanged. Pair with serve_share.
+    signature: "pub async fn publish_share(&self, owner_seed: [u8; 32], share_id: String, sealed_announcement: Vec<u8>, signer: Arc<dyn RouteAdvertSigner>) -> Result<()>"
+    parameters:
+      - name: owner_seed
+        type: "[u8; 32]"
+        direction: in
+        description: The lobby rendezvous-owner seed.
+      - name: share_id
+        type: String
+        direction: in
+        description: The share's stable id (also its stable-slot placement key).
+      - name: sealed_announcement
+        type: "Vec<u8>"
+        direction: in
+        description: The core ShareAnnouncement sealed under the PublicRoomKey.
+      - name: signer
+        type: "Arc<dyn RouteAdvertSigner>"
+        direction: in
+        description: Least-authority capability signing `share_id ‖ route_blob`.
+    returns:
+      type: "Result<()>"
+      description: Ok once the advert is published.
+  - name: VeilidNetHandle::stop_serve
+    module: daemonseed_veilid_net::actor
+    description: Stop serving a share and drop its advert (the teeth of unpublish) — inbound fetch app_calls for it are no longer answered and a RouteChanged will not re-publish it; its private route is released.
+    signature: "pub async fn stop_serve(&self, share_id: String) -> Result<()>"
+    parameters:
+      - name: share_id
+        type: String
+        direction: in
+        description: The share to stop serving.
+    returns:
+      type: "Result<()>"
+      description: Ok once de-registered.
+  - name: VeilidNetHandle::shutdown
+    module: daemonseed_veilid_net::actor
+    description: Shut the node down cleanly.
+    signature: "pub async fn shutdown(&self)"
+    parameters: []
+    returns:
+      type: "()"
+      description: Returns once the node has shut down.
+
+  # ── config ───────────────────────────────────────────────────────────
+  - name: VeilidNetConfig::new
+    module: daemonseed_veilid_net::config
+    description: A node config with daemonseed defaults (public network, hop_count = 2).
+    signature: "pub fn new(identity_seed: VeilidNodeSeed, storage_dir: impl Into<String>) -> Self"
+    parameters:
+      - name: identity_seed
+        type: VeilidNodeSeed
+        direction: in
+        description: The node identity seed (D3).
+      - name: storage_dir
+        type: "impl Into<String>"
+        direction: in
+        description: The protected-store + DHT-cache directory.
+    returns:
+      type: Self
+      description: A config with daemonseed defaults.
+
+  # ── discovery ────────────────────────────────────────────────────────
+  - name: route_provenance_input
+    module: daemonseed_veilid_net::discovery
+    description: The domain-separated bytes a route advert signs/verifies over — ROUTE_ADVERT_DOMAIN ‖ share_id ‖ route_blob.
+    signature: "pub fn route_provenance_input(share_id: &str, route_blob: &[u8]) -> Vec<u8>"
+    parameters:
+      - name: share_id
+        type: "&str"
+        direction: in
+        description: The share id.
+      - name: route_blob
+        type: "&[u8]"
+        direction: in
+        description: The sharer's opaque Veilid route blob.
+    returns:
+      type: "Vec<u8>"
+      description: The provenance input for sign/verify.
+  - name: verify_route_advert
+    module: daemonseed_veilid_net::discovery
+    description: Verify a route advert against the announcer's ML-DSA-87 public key (the one open_announcement provenance-verified). Fails closed (returns false) on a wrong-length key/signature, a tampered/rogue route_blob, a share_id mismatch, or a forged signature — uniform close-shape, the caller cannot tell which.
+    signature: "pub fn verify_route_advert(announcer_pubkey: &[u8], share_id: &str, route_blob: &[u8], route_sig: &[u8]) -> bool"
+    parameters:
+      - name: announcer_pubkey
+        type: "&[u8]"
+        direction: in
+        description: The provenance-verified announcer public key.
+      - name: share_id
+        type: "&str"
+        direction: in
+        description: The share id.
+      - name: route_blob
+        type: "&[u8]"
+        direction: in
+        description: The advertised route blob.
+      - name: route_sig
+        type: "&[u8]"
+        direction: in
+        description: The advert signature.
+    returns:
+      type: bool
+      description: true iff the advert is authentic; false (fail-closed) otherwise.
+  - name: DiscoveryEnvelope::encode
+    module: daemonseed_veilid_net::discovery
+    description: Length-prefixed encode of the envelope for publication on the lobby rendezvous.
+    signature: "pub fn encode(&self) -> Vec<u8>"
+    parameters: []
+    returns:
+      type: "Vec<u8>"
+      description: The wire bytes.
+  - name: DiscoveryEnvelope::decode
+    module: daemonseed_veilid_net::discovery
+    description: Fail-closed decode of a swept lobby item into an envelope.
+    signature: "pub fn decode(bytes: &[u8]) -> Result<Self>"
+    parameters:
+      - name: bytes
+        type: "&[u8]"
+        direction: in
+        description: A swept lobby-record value.
+    returns:
+      type: "Result<Self>"
+      description: The envelope, or an error if the bytes are not a well-formed envelope.
+
+  # ── share (lower-level codec + serve/fetch primitives) ───────────────
+  - name: share::encode_request
+    module: daemonseed_veilid_net::share
+    description: "Encode a fetch request frame: [tag][share_id(32)]([chunk_addr(48)] iff chunk)[fragment(u32 BE)]."
+    signature: "pub fn encode_request(share_id: &str, target: &FetchTarget, fragment: u32) -> Result<Vec<u8>>"
+    parameters:
+      - name: share_id
+        type: "&str"
+        direction: in
+        description: The share id.
+      - name: target
+        type: "&FetchTarget"
+        direction: in
+        description: Manifest or a specific chunk.
+      - name: fragment
+        type: u32
+        direction: in
+        description: The fragment index within the target.
+    returns:
+      type: "Result<Vec<u8>>"
+      description: The encoded request frame.
+  - name: share::decode_request
+    module: daemonseed_veilid_net::share
+    description: Decode a fetch request frame (sharer side).
+    signature: "pub fn decode_request(bytes: &[u8]) -> Result<(String, FetchTarget, u32)>"
+    parameters:
+      - name: bytes
+        type: "&[u8]"
+        direction: in
+        description: An inbound request frame.
+    returns:
+      type: "Result<(String, FetchTarget, u32)>"
+      description: The share id, target, and fragment index.
+  - name: share::decode_response
+    module: daemonseed_veilid_net::share
+    description: Decode a fetch response frame into (fragment index, payload), or None for a not-found response.
+    signature: "pub fn decode_response(bytes: &[u8]) -> Result<Option<(u32, Vec<u8>)>>"
+    parameters:
+      - name: bytes
+        type: "&[u8]"
+        direction: in
+        description: An inbound response frame.
+    returns:
+      type: "Result<Option<(u32, Vec<u8>)>>"
+      description: The fragment index + payload, or None if the sharer returned not-found.
+  - name: share::serve
+    module: daemonseed_veilid_net::share
+    description: Answer one inbound fetch request from the served-share registry, returning the response frame (a not-found frame if the share is unregistered).
+    signature: "pub fn serve(shares: &mut HashMap<String, ServedShare>, request: &[u8]) -> Vec<u8>"
+    parameters:
+      - name: shares
+        type: "&mut HashMap<String, ServedShare>"
+        direction: in
+        description: The served-share registry.
+      - name: request
+        type: "&[u8]"
+        direction: in
+        description: The inbound request frame.
+    returns:
+      type: "Vec<u8>"
+      description: The response frame to reply with.
+  - name: share::fetch_manifest
+    module: daemonseed_veilid_net::share
+    description: Fetch + reassemble + open a manifest via a caller-supplied per-fragment app_call closure. Used by VeilidNetHandle::fetch_manifest.
+    signature: "pub async fn fetch_manifest<F, Fut>(share_id: &str, room_key: &PublicRoomKey, call: F) -> Result<Vec<ManifestEntry>>"
+    parameters:
+      - name: share_id
+        type: "&str"
+        direction: in
+        description: The share id.
+      - name: room_key
+        type: "&PublicRoomKey"
+        direction: in
+        description: The share's room key.
+      - name: call
+        type: "F: Fn(Vec<u8>) -> Fut"
+        direction: in
+        description: A per-fragment app_call round-trip.
+    returns:
+      type: "Result<Vec<ManifestEntry>>"
+      description: The reassembled, opened manifest.
+  - name: share::fetch_chunk
+    module: daemonseed_veilid_net::share
+    description: Fetch + reassemble (bounded-concurrency fragment pipeline) + open + SHA-384-verify one chunk via a caller-supplied app_call closure; returns the bytes + max fragment latency. Used by VeilidNetHandle::fetch_chunk.
+    signature: "pub async fn fetch_chunk<F, Fut>(share_id: &str, chunk_addr: &ChunkAddr, room_key: &PublicRoomKey, window: usize, call: F) -> Result<(Vec<u8>, Duration)>"
+    parameters:
+      - name: share_id
+        type: "&str"
+        direction: in
+        description: The share id.
+      - name: chunk_addr
+        type: "&ChunkAddr"
+        direction: in
+        description: The content-address of the chunk.
+      - name: room_key
+        type: "&PublicRoomKey"
+        direction: in
+        description: The share's room key.
+      - name: window
+        type: usize
+        direction: in
+        description: Max concurrent fragment app_calls.
+      - name: call
+        type: "F: Fn(Vec<u8>) -> Fut"
+        direction: in
+        description: A per-fragment app_call round-trip.
+    returns:
+      type: "Result<(Vec<u8>, Duration)>"
+      description: The SHA-384-verified chunk bytes and the max per-fragment latency.
+  - name: ServedShare::new
+    module: daemonseed_veilid_net::share
+    description: Register a share's content + room key for owner-on-demand serving.
+    signature: "pub fn new(content: Arc<ShareContent>, room_key: PublicRoomKey) -> Self"
+    parameters:
+      - name: content
+        type: "Arc<ShareContent>"
+        direction: in
+        description: The indexed share content.
+      - name: room_key
+        type: PublicRoomKey
+        direction: in
+        description: The room key responses seal under.
+    returns:
+      type: Self
+      description: The served-share entry.
+
+  # ── aimd ─────────────────────────────────────────────────────────────
+  - name: AimdWindow::new
+    module: daemonseed_veilid_net::aimd
+    description: A window bounded to floor..=ceiling, starting fully open at the ceiling (safe-by-default).
+    signature: "pub fn new(floor: usize, ceiling: usize) -> Self"
+    parameters:
+      - name: floor
+        type: usize
+        direction: in
+        description: The minimum window (never below 1).
+      - name: ceiling
+        type: usize
+        direction: in
+        description: The maximum (and initial) window.
+    returns:
+      type: Self
+      description: A window at the ceiling.
+  - name: AimdWindow::observe
+    module: daemonseed_veilid_net::aimd
+    description: Fold one latency sample against a threshold — additive-increase below it, multiplicative-decrease at/above it.
+    signature: "pub fn observe(&mut self, latency: Duration, threshold: Duration)"
+    parameters:
+      - name: latency
+        type: Duration
+        direction: in
+        description: The observed (max per-chunk fragment) latency.
+      - name: threshold
+        type: Duration
+        direction: in
+        description: The congestion threshold (FRAGMENT_LATENCY_THRESHOLD).
+    returns:
+      type: "()"
+      description: Adjusts the window in place.
+
+  # ── identity ─────────────────────────────────────────────────────────
+  - name: identity::node_keypair
+    module: daemonseed_veilid_net::identity
+    description: Derive the Veilid node keypair from a VeilidNodeSeed (D3).
+    signature: "pub fn node_keypair(seed: &VeilidNodeSeed) -> Result<KeyPair>"
+    parameters:
+      - name: seed
+        type: "&VeilidNodeSeed"
+        direction: in
+        description: The node identity seed.
+    returns:
+      type: "Result<KeyPair>"
+      description: The node keypair.
+  - name: identity::rendezvous_owner_keypair
+    module: daemonseed_veilid_net::identity
+    description: Derive the shared rendezvous-owner keypair from a 32-byte owner seed (every participant derives the same one).
+    signature: "pub fn rendezvous_owner_keypair(owner_seed: &[u8; 32]) -> Result<KeyPair>"
+    parameters:
+      - name: owner_seed
+        type: "&[u8; 32]"
+        direction: in
+        description: The circle/room rendezvous-owner seed.
+    returns:
+      type: "Result<KeyPair>"
+      description: The rendezvous-owner keypair.
+
+# ─────────────────────────────────────────────────────────────────────
+# Error types
+# ─────────────────────────────────────────────────────────────────────
+
+error_types:
+  - name: VeilidNetError
+    module: daemonseed_veilid_net::error
+    kind: enum
+    description: Errors from bringing up or operating the daemonseed Veilid node.
+    variants:
+      - name: Startup
+        condition: veilid startup failed.
+      - name: NotReady
+        condition: The node did not become public-internet-ready in time.
+      - name: Routing
+        condition: A routing / private-route error.
+      - name: Send
+        condition: A send / transport failure (offline / slow / dead route).
+      - name: NotServed
+        condition: The peer answered but does not serve the requested share/chunk (withdrawn or never offered) — an authoritative negative distinct from a transport error.
+      - name: Identity
+        condition: Invalid node identity.
+      - name: Actor
+        condition: The actor task is gone or dropped a reply.
+      - name: Unimplemented
+        condition: A Phase 4 surface (presence / announcements) not yet implemented.
+
+# ─────────────────────────────────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────────────────────────────────
+
+constants:
+  - name: APP_MESSAGE_CAP
+    module: daemonseed_veilid_net::actor
+    type: usize
+    value: "32768"
+    description: veilid's app_message / app_call payload cap (bytes); sealed envelopes must fit.
+  - name: FRAGMENT_SIZE
+    module: daemonseed_veilid_net::share
+    type: usize
+    value: "30 * 1024"
+    description: Per-fragment payload size for share transfer over app_call.
+  - name: FRAGMENT_FETCH_CONCURRENCY
+    module: daemonseed_veilid_net::share
+    type: usize
+    value: "8"
+    description: Default (ceiling) concurrent fragment app_calls per chunk fetch.
+  - name: FRAGMENT_LATENCY_THRESHOLD
+    module: daemonseed_veilid_net::share
+    type: Duration
+    value: "2s"
+    description: Per-fragment latency above which the AIMD window narrows (#128 D-1).
+  - name: ROUTE_ADVERT_DOMAIN
+    module: daemonseed_veilid_net::discovery
+    type: "&[u8]"
+    value: "b\"daemonseed/veilid/share-route/v1\""
+    description: Domain-separation prefix for the route-advert provenance input.
+
+# ─────────────────────────────────────────────────────────────────────
+# Gotchas
+# ─────────────────────────────────────────────────────────────────────
+
+gotchas:
+  - description: >-
+      Attach first. Every operation requires the node public-internet-ready —
+      call attach_and_wait after start; operations before then fail.
+  - description: >-
+      Node identity is EPHEMERAL (fresh per launch); content identity (the ML-DSA
+      signing key) is stable. Share adverts are placed at a stable-share_id
+      rendezvous slot (last-writer-wins), so a republish under a fresh node
+      identity overwrites in place and a withdraw cancels it (#118).
+  - description: >-
+      A share is served owner-on-demand: the sharer MUST stay online (ISC-A-S21).
+      serve_share registers content; publish_share advertises the route. Unpublish
+      is stop_serve (drops the serve registry entry + advert) plus a signed
+      withdraw announcement.
+  - description: >-
+      Discovery is anti-swap: a fetcher MUST verify_route_advert against the
+      announcer pubkey (from open_announcement) before importing a discovered
+      route — a MITM on the world-writable lobby record cannot redirect a fetch.
+  - description: >-
+      Rendezvous records are opened with no Veilid encryption key (verbatim
+      storage). Do not rely on Veilid value-encryption; the cot seal is the only
+      content layer.
+
+# ─────────────────────────────────────────────────────────────────────
+# Testing
+# ─────────────────────────────────────────────────────────────────────
+
+testing:
+  - description: >-
+      Unit tests run without a network (in-process app_call closures for share
+      serve/fetch, pure codec + AIMD + discovery anti-swap tests). Live two-node
+      tests (crates/daemonseed-veilid-net/tests/two_node_*.rs) require a real
+      public Veilid attach and are `#[ignore]`d by default — run with
+      `cargo nextest run -- --ignored` on a network-capable host (a NAT'd VM's
+      SLIRP path cannot attach).

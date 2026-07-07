@@ -107,6 +107,12 @@ crates:
     status: scaffold
     manifest: "docs/llm-api-manifest/daemonseed-gui-api.yaml"
 
+  - name: daemonseed-veilid-net
+    purpose: "Veilid transport layer — the AppSession replacement the GUI/TUI drive behind their `veilid` feature. An identity-bound Veilid node (VeilidNet::start) driven through a command-channel handle (VeilidNetHandle): sealed 1:1 messaging over a private route; circles + lobby / public rooms over a shared-owner DFLT DHT rendezvous (append-ring fan-out + backlog sweep + re-sweep recovery); public-share discovery via an anti-swap SIGNED route advert on the lobby rendezvous (DiscoveryEnvelope + verify_route_advert); and public-share content transfer owner-on-demand over app_call, fragment-reassembled and SHA-384-verified per chunk. Moves only opaque cot-sealed bytes (ISC-A-S2). Presence / announcements are Phase 4. Workspace-excluded until the v0.33.0 cutover."
+    license: AGPL-3.0-or-later
+    status: active
+    manifest: "docs/llm-api-manifest/daemonseed-veilid-net-api.yaml"
+
   - name: daemonseed-isc
     purpose: "ISC registry — the single source of truth for the ISC inventory. A zero-dependency leaf crate (std only) holding IscClass, the ISCS list, TOTAL (built, non-deferred ISC count) and COVERED (registered-test count), with compile-time drift guards (ISCS.len()==TOTAL, COVERED<=TOTAL) and a covered_sum_matches test. Read by both daemonseed-integration-tests (which re-exports it as isc_coverage) and xtask isc-coverage, so the coverage count lives in exactly one place."
     license: AGPL-3.0-or-later

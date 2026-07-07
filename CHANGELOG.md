@@ -26,6 +26,7 @@ work lives in the project lead's vault manifest, not here.
 
 ### Added
 
+- `docs/llm-api-manifest/daemonseed-veilid-net-api.yaml`: LAMA API manifest for the Veilid transport crate — modules, the `VeilidNet` / `VeilidNetHandle` surface (attach, routes, sealed send, circle/room publish/subscribe/resweep, share serve/fetch, share-advert publish/stop), the `discovery` (anti-swap route advert) and `share` primitives, `VeilidNetError`, and constants; plus a `lama.yaml` crate entry + manifest pointer. Closes the manifest gap open since the crate's Phase 1 (#127).
 - `daemonseed-veilid-net` crate: Veilid transport layer (Phase 1) — identity-bound node, command-channel actor (`VeilidNet` / `VeilidNetHandle`), sealed 1:1 `app_message` over a private route, per-node `VeilidNetConfig::listen_address`. Workspace-excluded until the v0.33.0 cutover.
 - `daemonseed-core`: `VeilidNodeSeed` + `DOMAIN_VEILID_NODE` — Veilid node identity derived from the identity mnemonic under a domain-separated HKDF label (D3).
 - `daemonseed-veilid-net`: circles over Veilid (Phase 2, #99) — `VeilidNetHandle::publish_circle` / `subscribe_circle` over a shared-owner DFLT DHT rendezvous record; per-member append-ring fan-out; login-backlog sweep plus watch surfacing inbound circle messages as `VeilidNetEvent::Inbound`.

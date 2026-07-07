@@ -1382,3 +1382,11 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   out-of-order + one exact re-delivery) and asserts `messages_on(Lobby)` == `["first","second"]`. Gate:
   tui `cargo clippy --all-targets -D warnings` clean default AND `--features veilid`; `cargo nextest`
   196 passed. Runnable bins removed post-gate (glibc rule). Live behaviour DEFERRED-VERIFY → orinoco.
+- ISC-inspect (#127, 2026-07-07): `docs/llm-api-manifest/daemonseed-veilid-net-api.yaml` authored to
+  the LAMA spec (mirrors the sibling `daemonseed-core-api.yaml` shape: library / constraints / modules /
+  types / functions / error_types / constants / gotchas / testing). Covers the crate's re-exported
+  public surface — `VeilidNet::start`, the full `VeilidNetHandle` method set, `VeilidNetConfig`,
+  `VeilidNetEvent`, `VeilidNetError`, `AimdWindow`, and the `discovery` + `share` + `identity`
+  primitives (32 functions, 9 types, 8 modules, 5 constants); the private `rendezvous` mod is excluded.
+  `lama.yaml` gains a `crates[]` entry + manifest pointer. Both YAMLs `yaml.safe_load`-parse clean.
+  Doc-only; no code gate applies. (Sanjay, 2026-07-07.)
