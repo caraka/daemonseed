@@ -240,9 +240,17 @@ pub enum NetCommand {
     /// [`wire::ShareRollCall`] to the lobby (startup, the Refresh action, and the
     /// reconcile timer all route through here) so live sharers re-announce, then
     /// snapshot the in-band [`ShareCatalog`] as the `remote` rows of a single
-    /// [`NetEvent::SharesSnapshot`]. Read-only; no scan.
+    /// [`NetEvent::SharesSnapshot`]. Read-only; no scan. Rides the ~3 s liveness
+    /// auto-poll, so it stays a cheap local re-render (no DHT work).
     #[cfg_attr(not(test), allow(dead_code))]
     RefreshShares,
+    /// User-initiated re-discovery (the Refresh button): like [`NetCommand::RefreshShares`]
+    /// but on Veilid it ALSO re-sweeps the lobby rendezvous to recover an announcement
+    /// missed during the watch-warmup window (#133). NOT for the liveness auto-poll —
+    /// the re-sweep is a DHT op, far too costly at the ~3 s poll cadence. On the relay
+    /// path it maps to the ordinary roll-call refresh.
+    #[cfg_attr(not(test), allow(dead_code))]
+    ResweepShares,
     /// (#91) Fetch the connected relay's public space — MOTD, announcement posts,
     /// and the published signer whitelist — re-verify it client-side (trusting
     /// nothing the relay asserts), and deliver a single
@@ -2855,6 +2863,7 @@ async fn net_actor(
                 actor.handle_unpublish_share(&share_id).await
             }
             NetCommand::RefreshShares => actor.handle_refresh_shares().await,
+            NetCommand::ResweepShares => actor.handle_refresh_shares().await,
             NetCommand::RefreshPublicSpace => actor.handle_refresh_public_space(false).await,
             NetCommand::UploadAnnouncement { topic, body } => {
                 actor.handle_upload_announcement(&topic, &body).await

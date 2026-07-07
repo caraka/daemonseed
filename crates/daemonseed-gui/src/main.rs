@@ -877,7 +877,10 @@ fn build_ui() -> BuiltUi {
     ui.on_refresh_shares({
         let net = net.clone();
         move || {
-            let _ = net.borrow().send(NetCommand::RefreshShares);
+            // The manual Refresh button re-discovers: on Veilid this re-sweeps the
+            // lobby (#133). The ~3 s liveness auto-poll keeps sending the cheap
+            // local-only RefreshShares (see start_drain) — never ResweepShares.
+            let _ = net.borrow().send(NetCommand::ResweepShares);
         }
     });
     // #91: opening (or Refresh-ing) the Announcements pane fetches the connected

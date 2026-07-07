@@ -352,19 +352,30 @@ async fn handle_command(
             let _ = ack.send(());
         }
         NetCommand::RefreshShares => {
-            // Responsive local re-render of the current catalog.
+            // Local re-render of the current catalog ONLY. This rides the ~3 s
+            // liveness auto-poll (main.rs poll_tick), so it MUST stay cheap: putting a
+            // DHT re-sweep here re-swept the lobby every 3 s (#133 regression) — a CPU
+            // storm plus re-delivery of the whole un-deduped lobby backlog. The
+            // re-sweep now lives on the user-initiated ResweepShares (below) and the
+            // one-shot delayed post-connect re-sweep (#132).
             let _ = evt_tx.send(NetEvent::SharesSnapshot {
                 shares: shares.listings(),
             });
-            // #133: a bare re-render can't surface an announcement the watch missed
-            // during the warmup window, so also re-sweep the lobby rendezvous. The
-            // swept ShareAnnouncements arrive as inbound events → apply_discovery
-            // folds them → that path emits a fresh SharesSnapshot.
+        }
+        NetCommand::ResweepShares => {
+            // User-initiated (the Refresh button): re-render locally AND re-sweep the
+            // lobby rendezvous to surface an announcement the watch missed during the
+            // warmup window (#133). Swept ShareAnnouncements arrive as inbound events →
+            // apply_discovery folds them → a fresh SharesSnapshot. NOT on the auto-poll
+            // cadence — a manual click is rare, so the re-sweep cost is acceptable.
+            let _ = evt_tx.send(NetEvent::SharesSnapshot {
+                shares: shares.listings(),
+            });
             if let (Some(lobby), Some(handle)) = (shares.lobby.as_ref(), net.as_ref()) {
                 let owner_seed = lobby.owner_seed;
-                daemonseed_veilid_net::vtrace!("gui refresh: re-sweeping lobby");
+                daemonseed_veilid_net::vtrace!("gui resweep: re-sweeping lobby");
                 if let Err(e) = handle.resweep_rendezvous(owner_seed).await {
-                    daemonseed_veilid_net::vtrace!("gui refresh: lobby re-sweep failed: {e}");
+                    daemonseed_veilid_net::vtrace!("gui resweep: lobby re-sweep failed: {e}");
                 }
             }
         }
