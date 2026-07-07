@@ -875,6 +875,21 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   feature clean. **DEFERRED-VERIFY → orinoco:** a silently-dead-route share self-recovers within one
   watchdog interval; a serve burst stays bounded. (Sanjay, 2026-07-07.)
 
+- 2026-07-07: **#118 recipient re-resolve (recipient half; sender side already landed at
+  `e807837`).** The sender-side root cause — a share advert orphaning into a node-region slot on
+  restart — was already fixed by placing adverts at a stable-`share_id` slot (`current_state_subkey`,
+  last-writer-wins); `member_base_subkey` (the ephemeral node-region append-ring) now serves only the
+  chat/circle path. This adds the recipient half from the issue's fix direction: on a TRANSPORT-stage
+  fetch failure (dead / rotated route — not an authoritative `NotServed` withdraw), the GUI prunes the
+  stale entry (ISC-S30, unchanged) AND kicks a one-shot lobby resweep (`resweep_rendezvous`) so the
+  freshest advert at the share's stable slot is re-pulled — a route-rotated-but-live sharer reappears
+  reachable rather than waiting for the periodic re-sweep. Gated on `is_authoritative_withdraw` so a
+  withdrawn share still prunes-and-stops; because fetch is user-initiated, prune+resweep cannot
+  auto-thrash, and a genuinely-gone sharer is cleared by the existing TTL backstop. GUI-only; no wire /
+  core change. **Open tuning for caraka's felt-test:** whether to resweep-in-place *without* the prune
+  (avoids a brief flicker but leaves a known-dead row until the resweep or TTL clears it) — left as
+  prune+resweep, the non-regressing choice. **DEFERRED-VERIFY → orinoco.** (Sanjay, 2026-07-07.)
+
 ## Changelog
 
 - **conjectured:** the multi-circle carousel (ISC-C60) lets the active surface span the lobby and the
@@ -1332,3 +1347,13 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   28 passed (incl. `watchdog_cadence_is_storm_safe`, `serve_lane_bounds_are_sane`); `cargo check -p
   daemonseed-gui --features "desktop veilid"` + `-p daemonseed-tui --features veilid` both Finished.
   Live behaviour DEFERRED-VERIFY → orinoco.
+- ISC-inspect (#118 recipient, 2026-07-07): five fetch-fail sites (`fetch_share` import + manifest;
+  `confirm_fetch_inner` import + manifest + chunk) route through `prune_and_reresolve`, which prunes
+  (`prune_unreachable_share`, unchanged) then — gated on `!is_authoritative_withdraw(err)` — awaits a
+  `resweep_rendezvous(lobby.owner_seed)`. Unit oracle `veilid_net::tests::only_a_withdraw_skips_reresolve`
+  asserts `NotServed` → no resweep, transport errors → resweep. Gate: gui `cargo clippy -p
+  daemonseed-gui --features "desktop veilid" --all-targets -D warnings` clean; `cargo nextest` 109
+  passed / 2 failed (both the PRE-EXISTING `net::tests::presence_roster` fingerprint failures,
+  confirmed unrelated by stashing this change — the whole `veilid_net` module incl. the new test and
+  all `apply_discovery` tests pass). Runnable app bin removed post-gate (glibc rule). Live behaviour
+  DEFERRED-VERIFY → orinoco.
