@@ -131,6 +131,40 @@ persistent-handle presence follows for circles (#77), where members already carr
 
 ## Part 2 — Announcements + MOTD on Veilid
 
+### Decision A0 — MVP scope: ONE project-owned channel; per-community channels (Fork B) deferred
+
+Settle *how many* channels exist and *who owns them* first, because the relay answered this with
+`server_id` and Veilid deletes `server_id`.
+
+**Relay-era truth:** MOTD/announcements were **per-server** — each relay had its own, signed by that
+server's key, and `server_id` was a `name#hash` (a hash of that key). "The community" was "the relay
+you connected to," so multi-community MOTD is not new — it *was* federation. `server_id` did three
+jobs for the public space: community **identity**, write **authority**, address **discovery**. On
+Veilid the operator-owned record covers authority (owner secret) and discovery (address from owner
+pubkey); community identity has no automatic successor — the owner **pubkey** becomes the identity (a
+human name is a local label, as with circles/rooms — ISC-C8).
+
+**Decision (caraka, 2026-07-07): MVP ships Fork A only — a single PROJECT-owned channel.** Owner =
+the maintainer-held project key (the existing F17 `project_release` anchor, ISC-15): a maintainer-held
+**offline** seed derives both the ML-DSA content-signing key (F17, already present) and a sibling
+Veilid owner keypair (the DHT write-gate); **only the two public keys are baked into clients** — the
+exact F17 model already in code ("the placeholder is replaced by a baked-in real release public key
+whose secret stays offline"; the current `PROJECT_RELEASE_SEED` is a dev placeholder). Clients derive
+the record address from the baked owner pubkey, read/watch/verify, and cannot write. MVP
+"MOTD/announcements" = **maintainers → all users** ("v0.34 shipped, here's what's new") — exactly what
+#88 asked for. The relay-era *per-server operator* MOTD retires with the relay (no host to own it).
+
+**Fork B — mintable per-community channels — is deferred as a deliberate future feature, not smuggled
+in.** B is "federation reborn without a server": anyone mints a channel (keypair + record), distributes
+the owner pubkey like a circle phrase, optionally binds it to a public room. It fits daemonseed's
+community-revival mission but is deeper than it looks: the moment a channel attaches to a **circle** it
+reintroduces an **owner/originator** onto circles, which are deliberately **ownerless** (ISC-C8:
+shared-owner, no founder — every member equal). "Who owns this circle / who may speak for it" is an
+unsolved governance problem the circle model was built to avoid. B therefore needs its own design pass
+(community identity, pubkey distribution/trust, room↔channel binding, the circle-ownership question) —
+NOT the cutover. A0's operator-only decisions below (A1–A4) all hold for the one project channel and
+are the reusable substrate a future B would parameterize.
+
 ### The decoupling the relay collapsed: write-gate ≠ content-provenance
 
 On the relay these were one thing (the server sat on both). On Veilid they are two independent
@@ -245,8 +279,8 @@ Phase 4 is the gate: at v0.33.0 the relay actor is deleted, so **every surface a
 must be non-stubbed on Veilid, or it goes dark.** Required before Phase 5:
 
 - **MUST (gates cutover):** presence P-a/P-b (Lobby roster) — the motivating "is X online to ping?"
-  need; announcements/MOTD A-a/A-b (the operator record) — so a relay operator can still post "what's
-  new" after the relay is gone. Without these, the app loses presence and the update channel at
+  need; announcements/MOTD A-a/A-b (the project channel, A0) — so the maintainers can still post
+  "what's new" after the relay is gone. Without these, the app loses presence and the update channel at
   cutover.
 - **SHOULD (strongly wanted, small):** #92 composer, #93 landing, #77 circle presence — complete the
   experience but a daemon is not *broken* without them at the instant of cutover.

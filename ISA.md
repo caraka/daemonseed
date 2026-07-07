@@ -1004,6 +1004,20 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   This is the DESIGN decision — no Phase-4 code written this session. (Sanjay, 2026-07-07, Phase-4 design
   freeze.)
 
+- **Phase-4 announcements/MOTD scoped to ONE project channel; per-community channels deferred (A0).**
+  Follow-up decision (caraka, 2026-07-07) resolving the multi-channel question the freeze surfaced.
+  Relay-era MOTD/announcements were **per-server** (`server_id`-namespaced, ISC-S4/S23 — federation);
+  `server_id` anchored community identity + write authority + discovery. Veilid deletes `server_id`: the
+  operator-owned record covers authority + discovery, but community *identity* has no automatic
+  successor. **MVP ships Fork A — a single PROJECT-owned channel** (owner = the F17 `project_release`
+  anchor, ISC-15: maintainer-held offline seed → ML-DSA content key + a sibling Veilid owner keypair;
+  only the public keys baked into clients; the current `PROJECT_RELEASE_SEED` is a dev placeholder). MVP
+  MOTD/announcements = maintainers → all users (what #88 asked for); the relay-era per-server operator
+  MOTD retires with the relay. **Fork B (mintable per-community channels) is deferred** — it reintroduces
+  an owner/originator onto circles, which are deliberately ownerless (ISC-C8: shared-owner, no founder),
+  an unsolved governance problem needing its own design pass, not the cutover. A1–A4 hold for the one
+  project channel and are the substrate a future B parameterizes. (Sanjay, 2026-07-07, A0.)
+
 ## Changelog
 
 - **conjectured:** the multi-circle carousel (ISC-C60) lets the active surface span the lobby and the
