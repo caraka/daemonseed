@@ -5313,6 +5313,7 @@ mod tests {
         /// IDENTICAL display names produce two DISTINCT rows.
         #[test]
         fn identical_display_names_are_two_rows() {
+            let _ = oxicrypt_module::initialize(); // SHA-384 self-test must pass for fingerprints
             let mut t = PresenceTracker::with_cadence(HEARTBEAT_INTERVAL_MAX, HEARTBEAT_MISS_COUNT);
             let now = Instant::now();
             t.apply(&heartbeat(b"pubkey-a", "twin#aaaa", 100), now);
@@ -5336,6 +5337,7 @@ mod tests {
         /// pubkey (ISC-C4), reusing `Handle::from_pubkey` — not a GUI-local hash.
         #[test]
         fn fingerprint_matches_handle_from_pubkey() {
+            let _ = oxicrypt_module::initialize(); // SHA-384 self-test must pass for fingerprints
             let pubkey = b"some-verified-ml-dsa-pubkey-bytes";
             let fp = member_fingerprint(pubkey);
             let expected = Handle::from_pubkey(None, pubkey).unwrap().to_string();
