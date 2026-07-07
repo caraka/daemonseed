@@ -1246,8 +1246,10 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   A `high` code-review confirmed the controller math is correct and drove one improvement — the
   floor-clamp test now breaches a `floor=0` controller all the way down and asserts it floors at 1
   (not just the initial window), guarding against a future dropped `clamp(1, ceiling)`.
-  [DEFERRED-VERIFY] live wiring + signal-source + threshold — the D-2 follow-on gated on #128's
-  measure-then-confirm (morning fat-link felt-test).
+  measure-then-confirm DISCHARGED 2026-07-07 (orinoco fat-link felt-test): chat fully PAUSED on both
+  sides during a share download, then burst into the circle on completion — #128's exact signature,
+  confirming the controller needs wiring. [DEFERRED-VERIFY] live wiring + signal-source + threshold
+  remains (the D-1/D-2 follow-on now justified by this measurement; #128 stays open).
 - accel-aes (#123) verified 2026-07-07: `cargo check --workspace` + `clippy --workspace -D warnings`
   + GUI `clippy --features "desktop veilid"` all clean with the feature on. `daemonseed-core` nextest
   = 590/595; the 5 failures (`public_room::{seal_open_round_trip, body_never_wire_cleartext,
@@ -1260,8 +1262,11 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   correct; dispatch correctness is further covered by oxicrypt's own AES KATs. ⚠️ MORNING NOTE for
   caraka: the 5 pre-existing `PowerOff` core failures + the 2 `presence_roster` GUI failures are a
   VM test-harness gap (module not initialized in those bare unit tests) — worth confirming they pass
-  on orinoco / in the full-gate context. [DEFERRED-VERIFY] host full-gate (`cargo test --workspace`
-  with the module powered on) — morning item.
+  on orinoco / in the full-gate context. CONFIRMED 2026-07-07 (orinoco): `cargo test -p daemonseed-core`
+  = 596 passed / 0 failed with the module powered on — the 5 `public_room`/`share_seal` `PowerOff`
+  failures all pass; accel-aes adds zero real failures, VM-only harness gap confirmed. (Full
+  `--workspace` incl. the 2 GUI `presence_roster` tests deferred on a Wayland pkg-config env gap in the
+  test shell — secondary, not crypto.)
 - #100 (relative-age formatter, logic slice) verified 2026-07-07: `daemonseed-gui` nextest
   `state::tests::format_relative_age_buckets_across_boundaries` PASS — fake-clock across the
   second/minute/hour/day boundaries incl. a future timestamp ("just now") and the "sitting N days"
@@ -1290,6 +1295,8 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   `-p daemonseed-tui --features veilid` clean (public `VeilidNetHandle` API unchanged). Writer-coverage
   grep confirmed the only `set_dht_value` reaches the network via `publish` and `publish_at_subkey`,
   both under a `record_lock`; the three `record_lock` acquisitions cover both writers + the subscribe
-  open. glibc rule honored (check/clippy/nextest only, no runnable-bin build). [DEFERRED-VERIFY] live
-  burst behavior (3 rapid same-circle sends all delivered, in order) — orinoco felt-test (this VM's
-  SLIRP NAT blocks Veilid attach).
+  open. glibc rule honored (check/clippy/nextest only, no runnable-bin build). LIVE-VERIFIED 2026-07-07
+  (orinoco felt-test, warmed circle, fresh `0a32639` both clients): rapid bursts of distinct payloads
+  ds1→ds2 all delivered, none dropped, across multiple bursts — the append-ring message loss is closed
+  in practice (negative-control reproduction on the pre-fix build not run; unit oracle
+  `same_record_critical_sections_do_not_interleave_across_await` backs the fix).
