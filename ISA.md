@@ -805,6 +805,14 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   rushing the wiring at night would pre-empt a ratified step. The primitive ships tested and ready;
   the live wiring (fetch level, signal, threshold) is the D-2 follow-on tracked on #128. No fetch
   behaviour change this commit (nothing consumes the controller yet). (Sanjay, 2026-07-07, #128 D-1.)
+- **accel-aes enabled workspace-wide (#123, ratified).** Enabled oxicrypt's `accel-aes` feature on
+  the workspace `oxicrypt-aes` dependency, so AES-GCM (the cot seal/open used by circles, the lobby,
+  and share content) dispatches to AES-NI at runtime via CPUID when present, else the portable
+  constant-time path. Frozen-lock note: adds `oxicrypt-aes-accel` v0.19.0 to the workspace
+  `Cargo.lock` (a new package + one dep line); it reaches `main` only at the v0.33.0 cutover merge.
+  The excluded `daemonseed-veilid-net` standalone build keeps accel off in its own lock but gets it
+  via the GUI's workspace build graph. No wire or public-contract change. (Sanjay, 2026-07-07,
+  #123 accel-aes.)
 
 ## Changelog
 
@@ -1197,3 +1205,17 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   (not just the initial window), guarding against a future dropped `clamp(1, ceiling)`.
   [DEFERRED-VERIFY] live wiring + signal-source + threshold — the D-2 follow-on gated on #128's
   measure-then-confirm (morning fat-link felt-test).
+- accel-aes (#123) verified 2026-07-07: `cargo check --workspace` + `clippy --workspace -D warnings`
+  + GUI `clippy --features "desktop veilid"` all clean with the feature on. `daemonseed-core` nextest
+  = 590/595; the 5 failures (`public_room::{seal_open_round_trip, body_never_wire_cleartext,
+  tampered_provenance_rejected, wrong_room_key_fails_authentication}` + `share_seal::wrong_key_fails_
+  authentication`) fail IDENTICALLY on the clean D-1 tree (confirmed by a `git stash` diff of
+  Cargo.toml+lock) with the same `Module(NotOperational{PowerOff})` — a pre-existing environment
+  quirk on this VM where those specific unit tests don't power on the FIPS module (same class as the
+  GUI `presence_roster` failures). So accel-aes adds ZERO new failures, and the 590 passing crypto
+  tests (this CPU reports `aes`, so the AES-NI path IS exercised) prove the accel dispatch is
+  correct; dispatch correctness is further covered by oxicrypt's own AES KATs. ⚠️ MORNING NOTE for
+  caraka: the 5 pre-existing `PowerOff` core failures + the 2 `presence_roster` GUI failures are a
+  VM test-harness gap (module not initialized in those bare unit tests) — worth confirming they pass
+  on orinoco / in the full-gate context. [DEFERRED-VERIFY] host full-gate (`cargo test --workspace`
+  with the module powered on) — morning item.

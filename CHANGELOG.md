@@ -50,6 +50,7 @@ work lives in the project lead's vault manifest, not here.
 
 ### Changed
 
+- workspace: enable oxicrypt's `accel-aes` feature — AES-GCM (the cot seal/open) dispatches to AES-NI at runtime via CPUID when present, else the portable constant-time path; adds the `oxicrypt-aes-accel` path dep to the lock (#123).
 - `daemonseed-veilid-net`: each rendezvous publish (`PublishRendezvous`) runs on a spawned task off the actor command loop instead of blocking it on the DHT write, so a slow publish no longer parks the commands behind it; delivery ordering stays receiver-side (`sent_unix_ms`), with shutdown-drain / backpressure hardening tracked in #129 (#128).
 - `daemonseed-veilid-net`: opened rendezvous DHT records are cached per owner (`rendezvous::OpenCache`, owner seed → the post-`open_or_create` `RecordKey`), so repeated publishes/subscribes to a circle or the lobby reuse the open handle instead of paying a fresh `open_or_create` each time (#128).
 - `daemonseed-gui`: the restore banner now leads the connect-time republish — a single "Restoring N shares from last session…" notice fires (via `NetEvent::RestoreStarted`) before any share is re-served, instead of a per-share completion notice that arrived coincident with the share going live and read as redundant (#122).
