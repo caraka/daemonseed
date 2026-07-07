@@ -808,6 +808,18 @@ modules:
       - C85
       - A-C39
 
+  - name: daemonseed_core::transcript
+    description: >-
+      Chat-transcript ordering policy shared by the GUI + TUI (#131). clamp_order_ms
+      bounds an untrusted advisory sent_unix_ms to [now − TRANSCRIPT_MAX_BACKLOG_AGE,
+      now + TRANSCRIPT_MAX_CLOCK_SKEW] for ORDERING + read high-water on the open lobby:
+      real backlog (in-window) is returned unchanged, a forged/broken timestamp is
+      pulled to a window edge, so a peer cannot pin/hide/suppress. Callers dedup on the
+      ORIGINAL sent_unix_ms and never advance the high-water past now. Pure +
+      clock-injected.
+    no_std: false
+    depends_on: []
+
   - name: daemonseed_core::share_announce
     description: >-
       Share-announcement sealing. mint_share_id draws a random 128-bit
@@ -5642,6 +5654,23 @@ functions:
     postconditions:
       - description: No filesystem or process side effects occur; output is deterministic per spec.
 
+  - name: clamp_order_ms
+    module: daemonseed_core::transcript
+    description: Clamp an untrusted advisory sent_unix_ms into the ordering trust window for the open lobby (#131) — a no-op inside the window, pulling only forged/broken timestamps to an edge. Callers dedup on the ORIGINAL value and cap the high-water at now.
+    signature: "pub fn clamp_order_ms(sent_unix_ms: i64, now_ms: i64) -> i64"
+    parameters:
+      - name: sent_unix_ms
+        type: i64
+        direction: in
+        description: The untrusted advisory sender timestamp.
+      - name: now_ms
+        type: i64
+        direction: in
+        description: Local wall-clock now (injected for testability).
+    returns:
+      type: i64
+      description: sent_unix_ms if within [now − 24h, now + 120s], else the nearest window edge.
+
 # ─────────────────────────────────────────────────────────────────────
 # Error types — every error/result enum, with recoverability + action.
 # ─────────────────────────────────────────────────────────────────────
@@ -6029,6 +6058,17 @@ constants:
     type: usize
     value: "24"
     description: BIP-39 mnemonic length pinned at 24 words (256-bit entropy).
+
+  - name: TRANSCRIPT_MAX_BACKLOG_AGE
+    module: daemonseed_core::transcript
+    type: Duration
+    value: "24h"
+    description: Past bound of the #131 ordering trust window; must exceed the longest a message legitimately lives in the DHT rendezvous ring so real backlog is never clamped.
+  - name: TRANSCRIPT_MAX_CLOCK_SKEW
+    module: daemonseed_core::transcript
+    type: Duration
+    value: "120s"
+    description: Future bound of the #131 ordering trust window (clock-skew tolerance); a timestamp beyond it is a bad clock or a forgery.
 
   - name: ML_DSA_SEED_LEN
     module: daemonseed_core::identity::keys

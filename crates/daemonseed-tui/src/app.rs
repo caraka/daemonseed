@@ -1480,9 +1480,17 @@ impl App {
         }) {
             return false;
         }
-        let pos = self
-            .messages
-            .partition_point(|m| m.sent_unix_ms <= sent_unix_ms);
+        // #131: order by the CLAMPED timestamp so a forged extreme on the open lobby
+        // can't pin the transcript, while real backlog (in-window) keeps its exact
+        // order. Dedup above stays on the ORIGINAL sent_unix_ms (stable across
+        // re-sweeps; the clamp is time-relative). `clamp_order_ms` is pure in
+        // (original, now), so re-evaluating it here keeps the flat Vec consistently
+        // sorted. (No read high-water on the TUI — it has no unread indicator.)
+        let now = crate::net::now_unix_ms();
+        let order = daemonseed_core::transcript::clamp_order_ms(sent_unix_ms, now);
+        let pos = self.messages.partition_point(|m| {
+            daemonseed_core::transcript::clamp_order_ms(m.sent_unix_ms, now) <= order
+        });
         self.messages.insert(
             pos,
             ChatLine {
@@ -5139,26 +5147,29 @@ mod tests {
     /// out-of-order arrivals chronologically (TUI parity with the GUI `push_message`).
     #[test]
     fn transcript_dedups_and_orders_by_sent_unix_ms() {
+        // #131: now-relative timestamps so they're INSIDE the ordering window
+        // (unclamped) and exercise real chronological ordering.
+        let now = crate::net::now_unix_ms();
         let mut app = drive_to_main();
         // Arrive out of send order on the lobby surface.
         app.on_net_event(NetEvent::PublicRoomMessage {
             room: "lobby".to_owned(),
             sender: "a#aabbccddeeff".to_owned(),
             body: "second".to_owned(),
-            sent_unix_ms: 20,
+            sent_unix_ms: now - 1000,
         });
         app.on_net_event(NetEvent::PublicRoomMessage {
             room: "lobby".to_owned(),
             sender: "a#aabbccddeeff".to_owned(),
             body: "first".to_owned(),
-            sent_unix_ms: 10,
+            sent_unix_ms: now - 2000,
         });
         // A DHT re-sweep re-delivers an already-seen line verbatim.
         app.on_net_event(NetEvent::PublicRoomMessage {
             room: "lobby".to_owned(),
             sender: "a#aabbccddeeff".to_owned(),
             body: "second".to_owned(),
-            sent_unix_ms: 20,
+            sent_unix_ms: now - 1000,
         });
         let lobby: Vec<&str> = app
             .messages_on(Surface::Lobby)
@@ -5168,6 +5179,41 @@ mod tests {
             lobby,
             vec!["first", "second"],
             "ordered by sent_unix_ms with the re-swept duplicate coalesced"
+        );
+    }
+
+    #[test]
+    fn forged_lobby_timestamp_is_clamped_not_pinned() {
+        // #131: an open-lobby peer forging i64::MIN/MAX cannot pin the transcript top or
+        // bottom past the trust window — a real message stays between the clamped edges.
+        let now = crate::net::now_unix_ms();
+        let mut app = drive_to_main();
+        app.on_net_event(NetEvent::PublicRoomMessage {
+            room: "lobby".to_owned(),
+            sender: "evil".to_owned(),
+            body: "pin-bottom".to_owned(),
+            sent_unix_ms: i64::MAX,
+        });
+        app.on_net_event(NetEvent::PublicRoomMessage {
+            room: "lobby".to_owned(),
+            sender: "ally".to_owned(),
+            body: "real".to_owned(),
+            sent_unix_ms: now - 1000,
+        });
+        app.on_net_event(NetEvent::PublicRoomMessage {
+            room: "lobby".to_owned(),
+            sender: "evil".to_owned(),
+            body: "pin-top".to_owned(),
+            sent_unix_ms: i64::MIN,
+        });
+        let lobby: Vec<&str> = app
+            .messages_on(Surface::Lobby)
+            .map(|m| m.body.as_str())
+            .collect();
+        assert_eq!(
+            lobby,
+            vec!["pin-top", "real", "pin-bottom"],
+            "forged extremes clamp to the window edges; the real message sits between"
         );
     }
 

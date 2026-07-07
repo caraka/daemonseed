@@ -73,5 +73,6 @@ pub mod share_rollcall;
 pub mod share_seal;
 pub mod share_serve;
 pub mod storage;
+pub mod transcript;
 pub mod trust_events;
 pub mod version;

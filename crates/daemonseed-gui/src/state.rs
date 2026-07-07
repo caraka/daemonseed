@@ -209,6 +209,17 @@ pub struct Msg {
     pub sent_unix_ms: i64,
 }
 
+/// Wall-clock now in unix milliseconds — the reference for the #131 transcript
+/// ordering clamp (`transcript::clamp_order_ms`). Falls back to 0 only if the system
+/// clock predates the epoch (never in practice).
+fn now_unix_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 /// Format a message's age (its `sent_unix_ms`) relative to `now_ms` as a short
 /// transcript label: "just now", "2m ago", "3h ago", "sitting 3 days". Pure +
 /// clock-injected (both args passed) so it is deterministically unit-testable.
@@ -849,25 +860,32 @@ impl GuiState {
         sent_unix_ms: i64,
     ) -> bool {
         let active = self.active;
+        // #131: order + high-water on the CLAMPED timestamp, never the raw untrusted
+        // one. Real backlog is inside the window so it is unclamped and orders exactly;
+        // only a forged/broken stamp is pulled to a window edge (bounded influence).
+        let now = now_unix_ms();
+        let order = daemonseed_core::transcript::clamp_order_ms(sent_unix_ms, now);
         if let Some(c) = self.circles.get_mut(idx) {
-            // Dedup: the login backlog sweep and the live watch can both deliver the
-            // SAME circle message (the sweep re-emits a recent ring slot the watch
-            // already surfaced), so skip an exact (sender, body, sent_unix_ms) match
-            // already present rather than rendering it twice or re-tripping unread.
-            // Two genuinely distinct sends colliding on the same ms + identical text
-            // from the same sender is vanishingly unlikely and harmless to coalesce.
+            // Dedup on the ORIGINAL sent_unix_ms: the login backlog sweep and the live
+            // watch can both deliver the SAME message, and dedup must key on a value
+            // stable across re-sweeps (the clamp is time-relative, so a re-swept forged
+            // frame would not dedup on the clamped value). An exact (sender, body,
+            // sent_unix_ms) match already present is skipped. Two genuinely distinct
+            // sends colliding on the same ms + identical text from the same sender is
+            // vanishingly unlikely and harmless to coalesce.
             if c.messages.iter().any(|m| {
                 m.sent_unix_ms == sent_unix_ms && m.mine == mine && m.who == who && m.text == text
             }) {
                 return false;
             }
-            // #105: insert in sent_unix_ms order so a late-arriving (older) circle
-            // message slots into its chronological place instead of appending out
-            // of order. `partition_point` keeps the Vec sorted and is a no-op
-            // append for in-order arrivals (Lobby, and the common circle case).
-            let pos = c
-                .messages
-                .partition_point(|m| m.sent_unix_ms <= sent_unix_ms);
+            // #105/#131: insert in CLAMPED-order so a late-arriving (older) message
+            // slots chronologically while a forged extreme can't pin the transcript.
+            // `clamp_order_ms` is a pure function of (stored original, now), so re-
+            // evaluating it here keeps the Vec consistently sorted; it is a no-op for
+            // in-window backlog and an append for in-order arrivals.
+            let pos = c.messages.partition_point(|m| {
+                daemonseed_core::transcript::clamp_order_ms(m.sent_unix_ms, now) <= order
+            });
             c.messages.insert(
                 pos,
                 Msg {
@@ -877,15 +895,19 @@ impl GuiState {
                     sent_unix_ms,
                 },
             );
+            // #131: high-water tracks the clamped order but never advances past `now`,
+            // so a far-future forged stamp cannot push the mark ahead and suppress
+            // genuine unreads.
+            let hw_input = order.min(now);
             if idx == active {
                 // The user is looking at this room, so every message here is seen:
                 // keep the read high-water current so a later reconnect re-delivering
                 // these same messages cannot re-trip the unread dot (#107).
-                c.high_water_ms = c.high_water_ms.max(sent_unix_ms);
-            } else if !mine && sent_unix_ms > c.high_water_ms && !c.unread {
-                // #107: only a message NEWER than what the user has already caught up
-                // on raises the dot — backlog re-delivered by the reconnect/login ring
-                // sweep (sent_unix_ms <= high_water) is folded in silently, no dot.
+                c.high_water_ms = c.high_water_ms.max(hw_input);
+            } else if !mine && order > c.high_water_ms && !c.unread {
+                // #107: only a message NEWER (by clamped order) than what the user has
+                // caught up on raises the dot — re-delivered backlog (order <=
+                // high_water) is folded in silently, no dot.
                 c.unread = true;
                 return true;
             }
@@ -1372,21 +1394,24 @@ mod tests {
 
     #[test]
     fn backlog_at_or_below_high_water_does_not_retrip_unread() {
+        // #131: timestamps are now-relative so they sit INSIDE the ordering window
+        // (unclamped) and exercise the real high-water semantics.
+        let now = now_unix_ms();
         let mut st = GuiState::demo(); // active == 1
-        // The user opens circle 2 and reads live messages up to ts=10.
+        // The user opens circle 2 and reads live messages up to now-1s.
         st.switch_to(2, String::new(), 0.0); // active == 2
-        st.push_message(2, "ally".into(), "live-a".into(), false, 9);
-        st.push_message(2, "ally".into(), "live-b".into(), false, 10);
+        st.push_message(2, "ally".into(), "live-a".into(), false, now - 2000);
+        st.push_message(2, "ally".into(), "live-b".into(), false, now - 1000);
         assert!(!st.metas()[2].unread, "no dot while the room is active");
         assert!(
-            st.metas()[2].high_water_ms >= 10,
+            st.metas()[2].high_water_ms >= now - 1000,
             "watching live advances the read high-water"
         );
         // Switch away; a reconnect re-delivers backlog at the high-water mark into the
         // now-non-active circle 2 (distinct text, so it is NOT a dedup hit — it is a
         // genuinely new transcript entry that must still NOT raise the dot).
         st.switch_to(1, String::new(), 0.0); // active == 1
-        let raised = st.push_message(2, "ally".into(), "re-swept".into(), false, 10);
+        let raised = st.push_message(2, "ally".into(), "re-swept".into(), false, now - 1000);
         assert!(
             !raised,
             "backlog at the high-water mark must not re-trip unread"
@@ -1396,16 +1421,48 @@ mod tests {
 
     #[test]
     fn message_newer_than_high_water_still_trips_unread() {
+        let now = now_unix_ms();
         let mut st = GuiState::demo(); // active == 1
         st.switch_to(2, String::new(), 0.0);
-        st.push_message(2, "ally".into(), "seen".into(), false, 10); // active → high_water 10
+        st.push_message(2, "ally".into(), "seen".into(), false, now - 2000); // active → high_water
         st.switch_to(1, String::new(), 0.0); // active == 1
-        let raised = st.push_message(2, "ally".into(), "fresh".into(), false, 11);
+        let raised = st.push_message(2, "ally".into(), "fresh".into(), false, now - 1000);
         assert!(
             raised,
             "a message newer than the high-water mark raises the dot"
         );
         assert!(st.metas()[2].unread);
+    }
+
+    #[test]
+    fn forged_timestamp_is_clamped_and_cannot_pin_or_suppress() {
+        // #131: an open-room peer forging extreme timestamps cannot pin the transcript
+        // or suppress unreads — the clamp bounds ordering + high-water influence.
+        let now = now_unix_ms();
+        let mut st = GuiState::demo(); // active == 1
+        st.switch_to(2, String::new(), 0.0);
+        // A real recent message the user reads.
+        st.push_message(2, "ally".into(), "real".into(), false, now - 1000);
+        let hw_after_real = st.metas()[2].high_water_ms;
+        // A far-FUTURE forgery must NOT push the high-water past ~now (no unread-suppress).
+        st.push_message(2, "evil".into(), "future".into(), false, i64::MAX);
+        assert!(
+            st.metas()[2].high_water_ms <= now + 120_000,
+            "high-water never advances past now + skew, even for i64::MAX"
+        );
+        assert!(st.metas()[2].high_water_ms >= hw_after_real);
+        // A far-PAST forgery (i64::MIN) sorts to the window edge, NOT above every real
+        // message off-screen — it lands at/after the clamp floor, not at epoch 0.
+        st.push_message(2, "evil".into(), "past".into(), false, i64::MIN);
+        let texts: Vec<&str> = st.circles[2]
+            .messages
+            .iter()
+            .map(|m| m.text.as_str())
+            .filter(|t| ["real", "future", "past"].contains(t))
+            .collect();
+        // "past" clamps to now-24h (top of the window), "real" is now-1s, "future"
+        // clamps to now+skew (bottom) — a bounded, sensible order.
+        assert_eq!(texts, vec!["past", "real", "future"]);
     }
 
     #[test]
@@ -1427,11 +1484,13 @@ mod tests {
 
     #[test]
     fn circle_messages_insert_in_sent_unix_ms_order() {
+        let now = now_unix_ms();
         let mut st = GuiState::demo(); // active == 1; circle 2 exists
-        // Arrive OUT of send-order (DHT latency): t=30, then a late t=10, then t=20.
-        st.push_message(2, "a".into(), "third".into(), false, 30);
-        st.push_message(2, "b".into(), "first".into(), false, 10);
-        st.push_message(2, "c".into(), "second".into(), false, 20);
+        // Arrive OUT of send-order (DHT latency), now-relative so they're in-window
+        // (unclamped) and order by their real timestamps.
+        st.push_message(2, "a".into(), "third".into(), false, now - 1000);
+        st.push_message(2, "b".into(), "first".into(), false, now - 3000);
+        st.push_message(2, "c".into(), "second".into(), false, now - 2000);
         // Filter to our three (demo() seeds fixture messages) and assert they land
         // in timestamp order regardless of arrival order.
         let ours: Vec<&str> = st.circles[2]
@@ -2035,15 +2094,19 @@ mod tests {
             .into_session_materials();
         write_first_start(&root, &materials, None, false).unwrap();
 
-        // Session 1: join + persist a circle, read it up to ts=100, then close
+        // #131: now-relative timestamps so they're in-window (unclamped); captured once
+        // so the persisted high-water survives verbatim into session 2.
+        let now = now_unix_ms();
+        let seen_ts = now - 2000;
+        // Session 1: join + persist a circle, read it up to `seen_ts`, then close
         // (persist all circle high-waters).
         let mut st1 = GuiState::lobby_only();
         st1.set_profile(Profile::from_materials(materials, root.clone()));
         let idx = st1.materialize_from_phrase(STRONG).unwrap();
         st1.persist_circle(idx).unwrap();
         st1.switch_to(idx, String::new(), 0.0); // make it active
-        st1.push_message(idx, "ally".into(), "seen".into(), false, 100); // active → high_water 100
-        assert_eq!(st1.metas()[idx].high_water_ms, 100);
+        st1.push_message(idx, "ally".into(), "seen".into(), false, seen_ts); // active → high_water
+        assert_eq!(st1.metas()[idx].high_water_ms, seen_ts);
         st1.persist_all_circle_seen(); // the close hook
         drop(st1);
 
@@ -2068,18 +2131,18 @@ mod tests {
             .expect("the persisted circle restored");
         assert_eq!(
             st2.metas()[cidx].high_water_ms,
-            100,
+            seen_ts,
             "the read high-water was seeded from the blob on restore"
         );
         // Backlog at/below the seeded mark must NOT re-trip the dot after the restart.
-        let raised = st2.push_message(cidx, "ally".into(), "re-swept".into(), false, 100);
+        let raised = st2.push_message(cidx, "ally".into(), "re-swept".into(), false, seen_ts);
         assert!(
             !raised,
             "relaunch backlog at the high-water must not re-trip unread"
         );
         assert!(!st2.metas()[cidx].unread);
         // A genuinely newer message still trips.
-        let raised_new = st2.push_message(cidx, "ally".into(), "fresh".into(), false, 101);
+        let raised_new = st2.push_message(cidx, "ally".into(), "fresh".into(), false, now - 1000);
         assert!(
             raised_new,
             "a message newer than the high-water still trips"

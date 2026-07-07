@@ -933,6 +933,30 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   enhancement if it ever bites. Gates re-run green: veilid-net 28 nextest, gui 110 nextest, both clippy
   `-D warnings`. (Sanjay, 2026-07-07, xhigh review.)
 
+- 2026-07-07: **#131/#126 lobby-ordering security fix — clamp untrusted `sent_unix_ms` to a trust
+  window (cutover gate, caraka-ratified).** The open lobby is world-writable, so ordering + read
+  high-water on the raw advisory `sent_unix_ms` let a peer pin the transcript (`i64::MIN`/`MAX`), bury a
+  message in the far past, or suppress unreads with a far-future stamp (confirmed live; the audit flag
+  that superseded the xhigh review's F2 decline). Ordering on *receive* time was rejected (caraka) —
+  the DHT re-delivers real backlog after (re)connect, which receive-time would clump at "now".
+  **Chosen: clamp, not drop** (caraka's call, with my recommendation): a too-tight *drop* window would
+  silently discard real old-but-legit backlog — the fidelity he wanted to protect — whereas clamp keeps
+  every message and only bounds where a forged one lands. New `daemonseed_core::transcript`:
+  `clamp_order_ms(sent, now)` bounds to `[now − TRANSCRIPT_MAX_BACKLOG_AGE (24h), now +
+  TRANSCRIPT_MAX_CLOCK_SKEW (120s)]`. In `push_message` (GUI `state.rs` + TUI `app.rs`): **dedup stays
+  on the ORIGINAL `sent_unix_ms`** (stable across re-sweeps — the clamp is time-relative, so a forged
+  frame wouldn't dedup on its clamped value); **ordering** uses `clamp_order_ms` in the
+  `partition_point` comparator (pure in `(original, now)`, so the Vec stays consistently sorted — a
+  no-op for in-window backlog); **high-water** advances on `order.min(now)` so a far-future stamp can't
+  push the mark ahead and suppress genuine unreads. Scope: lobby AND circles, both surfaces (TUI has no
+  high-water — ordering only). Reduces a forger to an honest participant's in-window influence; full
+  removal needs signed authorship (room↔circle design, out of scope). Params tunable — caraka flagged
+  a residual worry about clamp-vs-order to watch in felt-test. Gates: core clippy + 2 new transcript
+  tests; gui 111 nextest (rewrote the sentinel-timestamp ordering/high-water tests to now-relative +
+  added a forged-clamp oracle); tui 197 nextest (+ a forged-clamp oracle). **DEFERRED-VERIFY →
+  orinoco:** an open-lobby peer stamping extreme times can't reorder/hide/suppress; real backlog still
+  orders correctly. (Sanjay, 2026-07-07, #131/#126.)
+
 ## Changelog
 
 - **conjectured:** the multi-circle carousel (ISC-C60) lets the active surface span the lobby and the
@@ -1426,3 +1450,14 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   fetcher's 64-wide outbound app_call burst saturates its Veilid node + the shared command channel, and
   the D-1 AIMD (latency-only trigger) never engages on a fast link. Recorded on #128 with design
   options; UX degradation, not a correctness break, not a cutover blocker. (Sanjay, 2026-07-07.)
+- ISC-inspect (#131/#126, 2026-07-07): `daemonseed_core::transcript::clamp_order_ms` +
+  `TRANSCRIPT_MAX_BACKLOG_AGE` (24h) / `TRANSCRIPT_MAX_CLOCK_SKEW` (120s) added + exported in
+  `lib.rs`. GUI `state.rs::push_message` and TUI `app.rs::push_message` both: dedup on original
+  `sent_unix_ms`, order via `clamp_order_ms(m.sent_unix_ms, now)` in `partition_point`, GUI high-water
+  on `order.min(now)`. Oracles: core `in_window_timestamps_pass_through_unchanged` +
+  `forged_extremes_clamp_to_the_window_edges`; gui `forged_timestamp_is_clamped_and_cannot_pin_or_suppress`
+  (i64::MAX doesn't advance hw past now+skew; i64::MIN/real/i64::MAX order as past/real/future); tui
+  `forged_lobby_timestamp_is_clamped_not_pinned`. Gate: core clippy `-D warnings`; gui clippy
+  `--features "desktop veilid" --all-targets -D warnings` + 111 nextest; tui clippy default +
+  `--features veilid` + 197 nextest. Runnable bins rm'd. Live behaviour DEFERRED-VERIFY → orinoco.
+  (Sanjay, 2026-07-07.)
