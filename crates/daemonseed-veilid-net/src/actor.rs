@@ -60,6 +60,13 @@ enum Command {
         owner_seed: [u8; 32],
         reply: oneshot::Sender<Result<()>>,
     },
+    /// Re-run the one-shot backlog sweep on an already-subscribed rendezvous
+    /// record WITHOUT registering another watch — the recovery primitive for an
+    /// item published during the post-(re)connect watch-warmup window (#132/#133).
+    ResweepRendezvous {
+        owner_seed: [u8; 32],
+        reply: oneshot::Sender<Result<()>>,
+    },
     // ── Public-share content (Phase 3) ──
     /// Register an indexed share to serve owner-on-demand (`share_id` → content
     /// + the `PublicRoomKey` bytes responses seal under).
@@ -227,6 +234,17 @@ impl VeilidNetHandle {
     /// [`VeilidNetEvent::Inbound`]; the app opens them under the `PublicRoomKey`.
     pub async fn subscribe_room(&self, owner_seed: [u8; 32]) -> Result<()> {
         self.send(|reply| Command::SubscribeRendezvous { owner_seed, reply })
+            .await?
+    }
+
+    /// Re-sweep an already-subscribed rendezvous record for backlog missed during
+    /// the watch-warmup window, WITHOUT registering another watch — the recovery
+    /// primitive for #132/#133. `owner_seed` is the circle or public-room
+    /// rendezvous-owner seed (same as [`Self::subscribe_circle`] /
+    /// [`Self::subscribe_room`]). Re-swept items arrive as
+    /// [`VeilidNetEvent::Inbound`] and are deduped downstream.
+    pub async fn resweep_rendezvous(&self, owner_seed: [u8; 32]) -> Result<()> {
+        self.send(|reply| Command::ResweepRendezvous { owner_seed, reply })
             .await?
     }
 
@@ -600,6 +618,11 @@ async fn actor_loop(
                         .await,
                 );
             }
+            Command::ResweepRendezvous { owner_seed, reply } => {
+                let _ = reply.send(
+                    resweep_rendezvous(&api, &rc, &ev_tx, &opened, &record_locks, owner_seed).await,
+                );
+            }
             Command::ServeShare {
                 share_id,
                 content,
@@ -931,6 +954,38 @@ async fn subscribe_rendezvous(
         .await
         .map_err(|e| VeilidNetError::Routing(e.to_string()))?;
     crate::vtrace!("subscribe_rendezvous: watch ok; spawning backlog sweep -> Ok");
+    tokio::spawn(rendezvous::sweep(rc.clone(), key, ev_tx.clone()));
+    Ok(())
+}
+
+/// Re-open an already-known rendezvous record and kick off a fresh one-shot sweep,
+/// WITHOUT registering a watch — the recovery primitive for a backlog item published
+/// during the post-(re)connect watch-warmup window (#132/#133). The open block is
+/// identical to [`subscribe_rendezvous`]; found items flow out as
+/// [`VeilidNetEvent::Inbound`] and are deduped downstream.
+async fn resweep_rendezvous(
+    api: &VeilidAPI,
+    rc: &RoutingContext,
+    ev_tx: &mpsc::UnboundedSender<VeilidNetEvent>,
+    opened: &rendezvous::OpenCache,
+    record_locks: &rendezvous::RecordLocks,
+    owner_seed: [u8; 32],
+) -> Result<()> {
+    crate::vtrace!("resweep_rendezvous: open (cached) rendezvous");
+    let owner = identity::rendezvous_owner_keypair(&owner_seed)?;
+    // Single-flight the open against a concurrent same-record publish (mirrors
+    // subscribe_rendezvous); no watch is registered here.
+    let key = {
+        let record_lock = rendezvous::record_lock(record_locks, &owner_seed);
+        let _open_guard = record_lock.lock().await;
+        rendezvous::open_cached(
+            opened,
+            &owner_seed,
+            rendezvous::open_or_create(api, rc, &owner),
+        )
+        .await?
+    };
+    crate::vtrace!("resweep_rendezvous: record open key={key:?}; spawning backlog sweep -> Ok");
     tokio::spawn(rendezvous::sweep(rc.clone(), key, ev_tx.clone()));
     Ok(())
 }

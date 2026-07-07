@@ -294,6 +294,30 @@ async fn handle_command(
                     let name = crate::net::republish_name(&root, persisted_name.as_deref());
                     publish_share(shares, evt_tx, net, root, name, sharer.clone(), true).await;
                 }
+                // #132: watch latency is tens of seconds, so an announcement/message
+                // published during the post-connect warmup window is missed by the
+                // join-time one-shot sweep and never re-fetched. Spawn a single
+                // delayed re-sweep of the lobby + every joined circle to catch it;
+                // re-swept already-seen items are deduped downstream (apply_discovery
+                // self-filter, push_message exact-match).
+                if let Some(handle) = net.as_ref() {
+                    let handle = handle.clone();
+                    let mut seeds: Vec<[u8; 32]> = Vec::new();
+                    if let Some(lobby) = shares.lobby.as_ref() {
+                        seeds.push(lobby.owner_seed);
+                    }
+                    seeds.extend(circles.iter().map(|c| c.owner_seed));
+                    daemonseed_veilid_net::vtrace!(
+                        "gui connect: scheduling delayed re-sweep of {} rendezvous",
+                        seeds.len()
+                    );
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_secs(25)).await;
+                        for seed in seeds {
+                            let _ = handle.resweep_rendezvous(seed).await;
+                        }
+                    });
+                }
             }
         }
         NetCommand::SetMyHandle { handle } => {
@@ -328,9 +352,21 @@ async fn handle_command(
             let _ = ack.send(());
         }
         NetCommand::RefreshShares => {
+            // Responsive local re-render of the current catalog.
             let _ = evt_tx.send(NetEvent::SharesSnapshot {
                 shares: shares.listings(),
             });
+            // #133: a bare re-render can't surface an announcement the watch missed
+            // during the warmup window, so also re-sweep the lobby rendezvous. The
+            // swept ShareAnnouncements arrive as inbound events → apply_discovery
+            // folds them → that path emits a fresh SharesSnapshot.
+            if let (Some(lobby), Some(handle)) = (shares.lobby.as_ref(), net.as_ref()) {
+                let owner_seed = lobby.owner_seed;
+                daemonseed_veilid_net::vtrace!("gui refresh: re-sweeping lobby");
+                if let Err(e) = handle.resweep_rendezvous(owner_seed).await {
+                    daemonseed_veilid_net::vtrace!("gui refresh: lobby re-sweep failed: {e}");
+                }
+            }
         }
         NetCommand::FetchShare { share_id, name } => {
             fetch_share(shares, evt_tx, net, &share_id, &name).await;
