@@ -890,6 +890,23 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   (avoids a brief flicker but leaves a known-dead row until the resweep or TTL clears it) — left as
   prune+resweep, the non-regressing choice. **DEFERRED-VERIFY → orinoco.** (Sanjay, 2026-07-07.)
 
+- 2026-07-07: **#130 TUI transcript parity (dedup + ordered-insert; unread half N/A).** The TUI
+  transcript was append-only over one flat `messages: Vec<ChatLine>` (surface-tagged), so a DHT
+  re-sweep duplicated a line and out-of-order arrivals rendered out of order. Added `App::push_message`
+  mirroring the GUI: exact `(surface, sender, body, sent_unix_ms)` dedup + `partition_point`
+  ordered-insert, keeping the flat Vec globally `sent_unix_ms`-sorted (so `messages_on` yields each
+  surface chronologically). Both inbound sites (circle, lobby) and both local echoes route through it.
+  **Echo timestamp change:** local echoes now stamp a real `now_unix_ms()` (was the `0` sentinel) —
+  required, because an ordered-insert would otherwise pin the user's own just-sent line to the epoch-0
+  front; `net::now_unix_ms` was promoted to `pub(crate)` for the app layer. **Scope call:** #130 also
+  named a per-room read high-water to not re-trip unread on re-swept backlog — that is GUI-specific and
+  **N/A to the TUI, which has no unread indicator**; building the high-water machinery for a
+  nonexistent affordance would be dead weight, so it is deliberately omitted (not forgotten). TUI-only;
+  no wire / core change. Oracle `app::tests::transcript_dedups_and_orders_by_sent_unix_ms`. Gates: tui
+  fmt + clippy `--all-targets -D warnings` (default AND `--features veilid`) + 196 nextest.
+  **DEFERRED-VERIFY → orinoco:** a TUI↔TUI reconnect re-sweep shows no duplicate; out-of-order lobby +
+  circle arrivals render chronologically. (Sanjay, 2026-07-07.)
+
 ## Changelog
 
 - **conjectured:** the multi-circle carousel (ISC-C60) lets the active surface span the lobby and the
@@ -1357,3 +1374,11 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   confirmed unrelated by stashing this change — the whole `veilid_net` module incl. the new test and
   all `apply_discovery` tests pass). Runnable app bin removed post-gate (glibc rule). Live behaviour
   DEFERRED-VERIFY → orinoco.
+- ISC-inspect (#130, 2026-07-07): `App::push_message` (app.rs) is the single transcript entry point —
+  dedup on `(surface, sender, body, sent_unix_ms)` + `partition_point` ordered-insert; the four push
+  sites (`NetEvent::ChatMessage`, `NetEvent::PublicRoomMessage`, and the two `on_key_chat` echoes) all
+  route through it; echoes stamp `crate::net::now_unix_ms()`. Oracle
+  `app::tests::transcript_dedups_and_orders_by_sent_unix_ms` drives three `PublicRoomMessage`s (two
+  out-of-order + one exact re-delivery) and asserts `messages_on(Lobby)` == `["first","second"]`. Gate:
+  tui `cargo clippy --all-targets -D warnings` clean default AND `--features veilid`; `cargo nextest`
+  196 passed. Runnable bins removed post-gate (glibc rule). Live behaviour DEFERRED-VERIFY → orinoco.

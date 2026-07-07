@@ -90,9 +90,10 @@ pub enum Surface {
 }
 
 /// One rendered chat line (ISC-10). `sent_unix_ms` is the sender's advisory
-/// timestamp (`0` for the local echo of a just-sent message, which the relay
-/// never reflects back to its sender). `surface` tags which pane the line renders
-/// in (ISC-C61 / ISC-A-C29) — set at every push site and never changed.
+/// timestamp; a local echo of a just-sent message (which the relay never reflects
+/// back to its sender) carries a real `now_unix_ms()` so it sorts as the newest line
+/// under the #130 chronological ordered-insert. `surface` tags which pane the line
+/// renders in (ISC-C61 / ISC-A-C29) — set at every push site and never changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatLine {
     pub sender: String,
@@ -1448,6 +1449,52 @@ impl App {
         self.messages.iter().filter(move |m| m.surface == surface)
     }
 
+    /// Fold a chat line into the transcript with de-dup + chronological ordered-insert
+    /// (#130 — TUI parity with the GUI's `push_message`). The DHT re-sweep and the live
+    /// watch can both deliver the SAME message, and DHT propagation can deliver messages
+    /// out of send order, so a plain append duplicated a re-swept line and rendered
+    /// out-of-order arrivals out of order. Returns `true` if the line was inserted.
+    ///
+    /// - **De-dup:** an exact `(surface, sender, body, sent_unix_ms)` match already
+    ///   present is skipped, so a re-swept already-seen line renders once.
+    /// - **Ordered-insert:** the line lands at its `sent_unix_ms` position — a no-op
+    ///   append for the common in-order case, a chronological slot for a late arrival.
+    ///
+    /// The flat transcript is kept globally sorted by `sent_unix_ms`; `messages_on`
+    /// filters by surface, so each pane stays chronological (a local echo carries a real
+    /// `now_unix_ms()` so it sorts as the newest line, not to the epoch-0 front). The
+    /// GUI's per-room read high-water / unread half of #126 has no TUI counterpart —
+    /// the TUI has no unread indicator.
+    fn push_message(
+        &mut self,
+        sender: String,
+        body: String,
+        sent_unix_ms: i64,
+        surface: Surface,
+    ) -> bool {
+        if self.messages.iter().any(|m| {
+            m.sent_unix_ms == sent_unix_ms
+                && m.surface == surface
+                && m.sender == sender
+                && m.body == body
+        }) {
+            return false;
+        }
+        let pos = self
+            .messages
+            .partition_point(|m| m.sent_unix_ms <= sent_unix_ms);
+        self.messages.insert(
+            pos,
+            ChatLine {
+                sender,
+                body,
+                sent_unix_ms,
+                surface,
+            },
+        );
+        true
+    }
+
     /// The circle subscription status, for rendering.
     pub fn circle_status(&self) -> &CircleStatus {
         &self.circle_status
@@ -1539,12 +1586,10 @@ impl App {
                 sent_unix_ms,
             } => {
                 if self.circles.iter().any(|c| c.id == circle_id) {
-                    self.messages.push(ChatLine {
-                        sender,
-                        body,
-                        sent_unix_ms,
-                        surface: Surface::Circle(circle_id),
-                    });
+                    // De-dup + ordered-insert (#130): a DHT re-sweep can re-deliver an
+                    // already-seen circle message, and propagation can deliver out of
+                    // send order.
+                    self.push_message(sender, body, sent_unix_ms, Surface::Circle(circle_id));
                 }
             }
             NetEvent::ChatError { message } => self.status = Some(message),
@@ -1563,14 +1608,11 @@ impl App {
                 sender,
                 body,
                 sent_unix_ms,
-            } => self.messages.push(ChatLine {
-                sender,
-                body,
-                sent_unix_ms,
-                // Lobby-tagged so it renders only in the top lobby pane
-                // (ISC-C61 / ISC-A-C29).
-                surface: Surface::Lobby,
-            }),
+            } => {
+                // De-dup + ordered-insert (#130), Lobby-tagged so it renders only in
+                // the top lobby pane (ISC-C61 / ISC-A-C29).
+                self.push_message(sender, body, sent_unix_ms, Surface::Lobby);
+            }
             NetEvent::TrustEvent { key, server_id } => self.fold_trust_event(key, server_id),
             NetEvent::ConnectionClosed { cause } => self.close_cause = Some(cause),
             NetEvent::SharesSnapshot {
@@ -3007,13 +3049,15 @@ impl App {
                         let sender = self.own_handle();
                         // Local echo, tagged with the active circle's surface so
                         // it renders only in that circle's pane (ISC-A-C29). The
-                        // relay never reflects a frame to its sender.
-                        self.messages.push(ChatLine {
-                            sender: sender.clone(),
-                            body: body.clone(),
-                            sent_unix_ms: 0,
-                            surface: Surface::Circle(id),
-                        });
+                        // relay never reflects a frame to its sender. A real
+                        // `now_unix_ms()` (not the old 0) sorts it as the newest line
+                        // under the #130 ordered-insert instead of the epoch-0 front.
+                        self.push_message(
+                            sender.clone(),
+                            body.clone(),
+                            crate::net::now_unix_ms(),
+                            Surface::Circle(id),
+                        );
                         // Seal under exactly the active circle's key (ISC-A-C30).
                         self.pending_chat = Some(ChatSend {
                             circle_id: id,
@@ -3025,13 +3069,15 @@ impl App {
                         let body = std::mem::take(&mut self.compose);
                         let sender = self.own_handle();
                         // Local echo, Lobby-tagged (ISC-A-C29). The relay never
-                        // reflects a frame to its sender.
-                        self.messages.push(ChatLine {
-                            sender: sender.clone(),
-                            body: body.clone(),
-                            sent_unix_ms: 0,
-                            surface: Surface::Lobby,
-                        });
+                        // reflects a frame to its sender. A real `now_unix_ms()` (not
+                        // the old 0) sorts it as the newest line under the #130
+                        // ordered-insert instead of the epoch-0 front.
+                        self.push_message(
+                            sender.clone(),
+                            body.clone(),
+                            crate::net::now_unix_ms(),
+                            Surface::Lobby,
+                        );
                         // Carry the name-bearing handle so the post reaches peers
                         // under the display name, not the floor (parity with the
                         // circle path's `sender_handle`).
@@ -5087,6 +5133,42 @@ mod tests {
             sent_unix_ms: 1,
         });
         assert!(app.messages().is_empty(), "unknown-circle frame dropped");
+    }
+
+    /// #130: the transcript de-dups an exactly-repeated swept line and inserts
+    /// out-of-order arrivals chronologically (TUI parity with the GUI `push_message`).
+    #[test]
+    fn transcript_dedups_and_orders_by_sent_unix_ms() {
+        let mut app = drive_to_main();
+        // Arrive out of send order on the lobby surface.
+        app.on_net_event(NetEvent::PublicRoomMessage {
+            room: "lobby".to_owned(),
+            sender: "a#aabbccddeeff".to_owned(),
+            body: "second".to_owned(),
+            sent_unix_ms: 20,
+        });
+        app.on_net_event(NetEvent::PublicRoomMessage {
+            room: "lobby".to_owned(),
+            sender: "a#aabbccddeeff".to_owned(),
+            body: "first".to_owned(),
+            sent_unix_ms: 10,
+        });
+        // A DHT re-sweep re-delivers an already-seen line verbatim.
+        app.on_net_event(NetEvent::PublicRoomMessage {
+            room: "lobby".to_owned(),
+            sender: "a#aabbccddeeff".to_owned(),
+            body: "second".to_owned(),
+            sent_unix_ms: 20,
+        });
+        let lobby: Vec<&str> = app
+            .messages_on(Surface::Lobby)
+            .map(|m| m.body.as_str())
+            .collect();
+        assert_eq!(
+            lobby,
+            vec!["first", "second"],
+            "ordered by sent_unix_ms with the re-swept duplicate coalesced"
+        );
     }
 
     /// ISC-C61: the split chat view renders both panes with correct per-surface

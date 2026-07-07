@@ -3209,8 +3209,10 @@ fn classify_failure(e: &ConnectError) -> (CloseCause, Option<TrustEventKey>) {
     }
 }
 
-/// Wall-clock now in unix milliseconds (advisory message timestamp).
-fn now_unix_ms() -> i64 {
+/// Wall-clock now in unix milliseconds (advisory message timestamp). `pub(crate)` so
+/// the app layer stamps a local echo with a real time for chronological ordered-insert
+/// (#130), matching the wire timestamp the actor stamps on the sent frame.
+pub(crate) fn now_unix_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
