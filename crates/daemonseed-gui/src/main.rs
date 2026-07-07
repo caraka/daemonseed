@@ -1540,16 +1540,24 @@ fn apply_net_event(
             ui.set_connection_status(SharedString::from(format!("reconnecting · {reason}")));
             ui.set_connected(false);
         }
-        NetEvent::Message { who, text, mine } => {
+        NetEvent::Message {
+            who,
+            text,
+            mine,
+            sent_unix_ms,
+        } => {
             // #84: capture scroll intent from the LIVE view BEFORE the transcript grows.
             // Own sends always pin to bottom; an incoming message pins only if the reader
             // was already at the bottom — otherwise we hold their current position.
             let live = ui.get_scroll_y();
             let stick = mine || ui.get_chat_at_bottom();
             // Always fold the message into the Lobby's RAM state; refresh the
-            // visible transcript only when the Lobby is the active circle.
+            // visible transcript only when the Lobby is the active circle. #126: order
+            // + dedup by the sender's wire timestamp (mirrors the circle path) so
+            // out-of-order / re-swept lobby messages slot chronologically and the age
+            // caption is real, not "just now".
             let mut st = state.borrow_mut();
-            let raised = st.push_message(LOBBY, who, text, mine, now_unix_ms());
+            let raised = st.push_message(LOBBY, who, text, mine, sent_unix_ms);
             let active = st.active();
             if active == LOBBY {
                 st.set_scroll(LOBBY, if stick { STICK_BOTTOM } else { live });
@@ -1630,6 +1638,7 @@ fn apply_net_event(
                             s.share_id.as_str(),
                             s.name.as_str(),
                             s.sharer_handle.as_str(),
+                            s.sharer_fingerprint.as_str(),
                         )
                     }),
                     my_handle.as_deref(),
@@ -2658,8 +2667,8 @@ fn main() {
             let mut b = browser.borrow_mut();
             b.set_shares(
                 [
-                    ("id-quiet", "quiet-harbor", "harbor#aa"),
-                    ("id-amber", "amber-lantern", "lantern#bb"),
+                    ("id-quiet", "quiet-harbor", "harbor", "#aabbccddeeff"),
+                    ("id-amber", "amber-lantern", "lantern", "#112233445566"),
                 ],
                 None,
             );

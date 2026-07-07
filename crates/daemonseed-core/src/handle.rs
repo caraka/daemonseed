@@ -204,6 +204,18 @@ impl Handle {
     }
 }
 
+/// The `#<12hex>` fingerprint of an identity public key — `SHA-384(pubkey)[:12]`,
+/// the same value a handle presents at its verified floor (ISC-C4 / ISC-C57). #114:
+/// lets a caller (e.g. the share browser) show the VERIFIED announcer fingerprint
+/// without re-implementing the hashing. Returns an empty string only if SHA-384's
+/// power-up self-test has not passed — effectively unreachable on any path that has
+/// already opened a provenance-signed message.
+pub fn pubkey_fingerprint(pubkey: &[u8]) -> String {
+    Handle::from_pubkey(None, pubkey)
+        .map(|h| h.to_string())
+        .unwrap_or_default()
+}
+
 impl fmt::Display for Handle {
     /// Canonical wire/storage form per ISC-C4: `<name>#<12hex>` or floor
     /// `#<12hex>` when no display name is set. Equivalent to

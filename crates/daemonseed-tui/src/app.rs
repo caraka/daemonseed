@@ -6160,6 +6160,7 @@ mod tests {
             name: name.to_owned(),
             rating: rating.to_owned(),
             sharer_handle: sharer.to_owned(),
+            sharer_fingerprint: String::new(),
             mine: false,
         }
     }

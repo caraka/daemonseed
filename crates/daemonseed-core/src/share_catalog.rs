@@ -43,6 +43,8 @@ use std::time::{Duration, Instant};
 
 use daemonseed_proto::v1 as wire;
 
+use crate::handle::pubkey_fingerprint;
+
 /// One discovered share — the rendered row of the share browser, built from a
 /// verified [`wire::ShareAnnouncement`]. Carries `sender_pubkey` so the UI can
 /// bind the displayed handle to `SHA-384(sender_pubkey)[:12]` (ISC-C4 / ISC-C57)
@@ -79,6 +81,12 @@ pub struct ShareListing {
     pub name: String,
     pub rating: String,
     pub sharer_handle: String,
+    /// #114: the announcer's `#12hex` fingerprint, derived from the VERIFIED
+    /// `sender_pubkey` (`SHA-384(pubkey)[:12]`) — NOT parsed from the advisory,
+    /// spoofable `sharer_handle`. Empty for own shares (rendered "you"). The UI
+    /// reveals it on hover so a foreign sharer can be identity-checked against the
+    /// same fingerprint the Lobby roster shows.
+    pub sharer_fingerprint: String,
     /// True for a share this node published itself (rendered as "you"); false for
     /// a foreign discovered share, which shows the announcer's `sharer_handle` as
     /// the attribution (#114). Own shares are the caller's own, so their handle is
@@ -93,6 +101,9 @@ impl From<&DiscoveredShare> for ShareListing {
             name: d.name.clone(),
             rating: d.rating.clone(),
             sharer_handle: d.sender_handle.clone(),
+            // #114: the verified-pubkey fingerprint, the anti-spoof attribution the
+            // UI reveals on hover (the advisory `sender_handle` carries no hash).
+            sharer_fingerprint: pubkey_fingerprint(&d.sender_pubkey),
             mine: false, // a discovered share is a foreign announcer's
         }
     }

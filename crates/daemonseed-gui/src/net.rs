@@ -421,6 +421,11 @@ pub enum NetEvent {
         who: String,
         text: String,
         mine: bool,
+        /// Best-effort sender wall-clock (ms since epoch). The Lobby transcript is
+        /// ordered + deduped by this (#126), mirroring `CircleMessage`; the age
+        /// caption (#100) renders against it. Inbound uses the wire timestamp;
+        /// a local echo uses `now_unix_ms()`.
+        sent_unix_ms: i64,
     },
     /// A non-fatal error to surface (join/send failure). The connection itself
     /// may still be up.
@@ -1754,13 +1759,14 @@ impl Actor {
             });
         };
 
+        let sent_unix_ms = now_unix_ms();
         let sealed = match seal_room_message(
             &room.room_key,
             identity.signing(),
             &room.room,
             &self.my_handle,
             text,
-            now_unix_ms(),
+            sent_unix_ms,
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -1787,6 +1793,7 @@ impl Actor {
             who: self.my_handle.clone(),
             text: text.to_owned(),
             mine: true,
+            sent_unix_ms,
         });
     }
 
@@ -2249,6 +2256,7 @@ impl Actor {
                     name: own.name.clone(),
                     rating: own.rating.clone(),
                     sharer_handle: own.sharer_handle.clone(),
+                    sharer_fingerprint: String::new(), // own shares render "you" (#114)
                     mine: true, // our own published share → rendered as "you" (#114)
                 });
             }
@@ -2987,6 +2995,7 @@ async fn read_inbound_public_room(
                             who: msg.sender_handle,
                             text: msg.body,
                             mine,
+                            sent_unix_ms: msg.sent_unix_ms,
                         })
                         .is_err()
                     {

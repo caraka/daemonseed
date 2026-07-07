@@ -131,10 +131,14 @@ struct ShareNode {
     share_id: String,
     name: String,
     mine: bool,
-    /// #114: the sharer's advisory display handle (`name#12hex`), carried so the
-    /// depth-0 row can show who published a foreign share. Split into the visible
-    /// handle + on-hover fingerprint in [`ShareBrowser::rows`].
+    /// #114: the sharer's advisory display handle (name only — the wire
+    /// `sender_handle` carries no `#hash`), shown on the depth-0 row so a foreign
+    /// share is not anonymous.
     sharer_handle: String,
+    /// #114: the sharer's `#12hex` fingerprint, derived from the VERIFIED announcer
+    /// pubkey (not the spoofable handle) and revealed only on hover. Empty for own
+    /// shares.
+    sharer_fingerprint: String,
     expanded: bool,
     /// True once the manifest preview has been folded in via [`ShareBrowser::load_manifest`].
     loaded: bool,
@@ -163,9 +167,10 @@ impl ShareBrowser {
     }
 
     /// Reconcile the listing against a relay `SharesSnapshot` (refresh). Each tuple
-    /// is `(share_id, name, sharer_handle)`. `my_handle` (the unlocked wire handle,
-    /// or `None` on the ephemeral path) tags a share as `mine` when it matches the
-    /// sharer handle exactly.
+    /// is `(share_id, name, sharer_handle, sharer_fingerprint)` — the fingerprint is
+    /// the announcer's verified `#12hex` (#114), empty for own shares. `my_handle`
+    /// (the unlocked wire handle, or `None` on the ephemeral path) tags a share as
+    /// `mine` when it matches the sharer handle exactly.
     ///
     /// **Reconcile, not replace** — keyed on the stable opaque `share_id`: a share
     /// still listed keeps its node identity (id, expansion, loaded manifest, open
@@ -177,7 +182,7 @@ impl ShareBrowser {
     /// so the only way to track other daemons' shares is to re-list and reconcile).
     pub fn set_shares<'a, I>(&mut self, listings: I, my_handle: Option<&str>)
     where
-        I: IntoIterator<Item = (&'a str, &'a str, &'a str)>,
+        I: IntoIterator<Item = (&'a str, &'a str, &'a str, &'a str)>,
     {
         // Drain the prior shares into a by-share_id map so a persisting share's node
         // (with its expansion + loaded subtree) is reused rather than rebuilt.
@@ -187,13 +192,14 @@ impl ShareBrowser {
             .map(|s| (s.share_id.clone(), s))
             .collect();
         let mut next: Vec<ShareNode> = Vec::new();
-        for (share_id, name, sharer_handle) in listings {
+        for (share_id, name, sharer_handle, sharer_fingerprint) in listings {
             let mine = my_handle.is_some_and(|h| !h.is_empty() && h == sharer_handle);
             if let Some(mut existing) = prior.remove(share_id) {
                 // Persisting share: keep id/expansion/loaded/children; refresh display.
                 existing.name = name.to_owned();
                 existing.mine = mine;
                 existing.sharer_handle = sharer_handle.to_owned();
+                existing.sharer_fingerprint = sharer_fingerprint.to_owned();
                 next.push(existing);
             } else {
                 let id = self.fresh_id();
@@ -203,6 +209,7 @@ impl ShareBrowser {
                     name: name.to_owned(),
                     mine,
                     sharer_handle: sharer_handle.to_owned(),
+                    sharer_fingerprint: sharer_fingerprint.to_owned(),
                     expanded: false,
                     loaded: false,
                     children: Vec::new(),
@@ -314,12 +321,15 @@ impl ShareBrowser {
         let mut out = Vec::new();
         for share in &self.shares {
             // #114: own shares are tagged "you" by the UI, so leave their sharer
-            // fields empty; a foreign share splits its advisory `name#12hex` handle
-            // into the visible handle + the on-hover fingerprint.
+            // fields empty; a foreign share shows its (hash-less) handle plainly and
+            // reveals the VERIFIED-pubkey fingerprint only on hover.
             let (sharer, sharer_fingerprint) = if share.mine {
                 (String::new(), String::new())
             } else {
-                split_handle(&share.sharer_handle)
+                (
+                    share.sharer_handle.clone(),
+                    share.sharer_fingerprint.clone(),
+                )
             };
             out.push(Row {
                 id: share.id,
@@ -455,18 +465,6 @@ fn push_rows(level: &[Node], depth: u32, out: &mut Vec<Row>) {
     }
 }
 
-/// Split an advisory display handle `name#12hex` into `(handle, "#12hex")` for the
-/// #114 "no hash unless hover" render: the visible handle carries no hash, the
-/// fingerprint is revealed only on hover. Splits on the LAST `#` (the fingerprint
-/// separator) so a `#` inside a chosen name is preserved in the handle. A handle
-/// with no `#` yields `(whole, "")` — nothing to reveal on hover.
-fn split_handle(handle: &str) -> (String, String) {
-    match handle.rsplit_once('#') {
-        Some((name, hex)) => (name.to_owned(), format!("#{hex}")),
-        None => (handle.to_owned(), String::new()),
-    }
-}
-
 /// Recursively sort every level of a subtree into OS-browser order.
 fn sort_tree(level: &mut [Node]) {
     sort_level(level);
@@ -516,8 +514,8 @@ mod tests {
         let mut b = ShareBrowser::new();
         b.set_shares(
             [
-                ("id-a", "quiet-harbor", "alice#aa"),
-                ("id-b", "amber-lantern", "bob#bb"),
+                ("id-a", "quiet-harbor", "alice", "#aa"),
+                ("id-b", "amber-lantern", "bob", "#bb"),
             ],
             None,
         );
@@ -543,7 +541,10 @@ mod tests {
     fn my_handle_tags_only_the_exact_sharer() {
         let mut b = ShareBrowser::new();
         b.set_shares(
-            [("id-a", "mine", "me#11"), ("id-b", "theirs", "you#22")],
+            [
+                ("id-a", "mine", "me#11", ""),
+                ("id-b", "theirs", "you#22", ""),
+            ],
             Some("me#11"),
         );
         let rows = b.rows();
@@ -552,9 +553,35 @@ mod tests {
     }
 
     #[test]
+    fn foreign_share_surfaces_name_and_verified_fingerprint_own_share_neither() {
+        // #114: a foreign row shows the (hash-less) handle as `sharer` and the
+        // verified `#12hex` in `sharer_fingerprint` (revealed on hover); an own
+        // share is tagged "you" by the UI, so both fields are empty.
+        let mut b = ShareBrowser::new();
+        b.set_shares(
+            [
+                ("id-them", "vacation", "river-otter", "#aabbccddeeff"),
+                ("id-mine", "backups", "me", ""),
+            ],
+            Some("me"),
+        );
+        let rows = b.rows();
+        assert_eq!(rows[0].sharer, "river-otter", "foreign handle, no hash");
+        assert_eq!(
+            rows[0].sharer_fingerprint, "#aabbccddeeff",
+            "verified fingerprint revealed on hover"
+        );
+        assert!(rows[1].mine, "our own share");
+        assert!(
+            rows[1].sharer.is_empty() && rows[1].sharer_fingerprint.is_empty(),
+            "own shares render \"you\" — no attribution fields"
+        );
+    }
+
+    #[test]
     fn empty_my_handle_never_tags_mine() {
         let mut b = ShareBrowser::new();
-        b.set_shares([("id-a", "s", "")], Some(""));
+        b.set_shares([("id-a", "s", "", "")], Some(""));
         assert!(
             !b.rows()[0].mine,
             "empty handle must not match an empty sharer"
@@ -564,7 +591,7 @@ mod tests {
     #[test]
     fn expanding_an_unloaded_share_requests_a_fetch_and_shows_loading() {
         let mut b = ShareBrowser::new();
-        b.set_shares([("id-a", "quiet-harbor", "alice#aa")], None);
+        b.set_shares([("id-a", "quiet-harbor", "alice", "#aa")], None);
         let share_id = b.rows()[0].id;
         let t = b.toggle(share_id);
         assert_eq!(
@@ -586,7 +613,7 @@ mod tests {
     #[test]
     fn load_manifest_builds_a_dirs_first_alphabetical_tree() {
         let mut b = ShareBrowser::new();
-        b.set_shares([("id-a", "share", "a#a")], None);
+        b.set_shares([("id-a", "share", "a#a", "")], None);
         let share_id = b.rows()[0].id;
         b.toggle(share_id); // expand + request fetch
         b.load_manifest(
@@ -622,7 +649,7 @@ mod tests {
     #[test]
     fn expanding_a_folder_reveals_its_children_at_increasing_depth() {
         let mut b = ShareBrowser::new();
-        b.set_shares([("id-a", "share", "a#a")], None);
+        b.set_shares([("id-a", "share", "a#a", "")], None);
         let share_id = b.rows()[0].id;
         b.toggle(share_id);
         b.load_manifest(
@@ -646,7 +673,7 @@ mod tests {
     #[test]
     fn collapsing_a_loaded_share_hides_children_without_refetch() {
         let mut b = ShareBrowser::new();
-        b.set_shares([("id-a", "share", "a#a")], None);
+        b.set_shares([("id-a", "share", "a#a", "")], None);
         let share_id = b.rows()[0].id;
         b.toggle(share_id);
         b.load_manifest("id-a", &[m("a.txt", 1, 0)]);
@@ -665,7 +692,7 @@ mod tests {
     #[test]
     fn load_manifest_for_unknown_share_is_a_noop() {
         let mut b = ShareBrowser::new();
-        b.set_shares([("id-a", "share", "a#a")], None);
+        b.set_shares([("id-a", "share", "a#a", "")], None);
         b.load_manifest("id-gone", &[m("x", 1, 0)]); // refreshed away
         assert_eq!(b.rows().len(), 1, "no crash, no spurious rows");
     }
@@ -673,17 +700,20 @@ mod tests {
     #[test]
     fn toggle_unknown_id_is_a_quiet_noop() {
         let mut b = ShareBrowser::new();
-        b.set_shares([("id-a", "share", "a#a")], None);
+        b.set_shares([("id-a", "share", "a#a", "")], None);
         assert_eq!(b.toggle(99_999), Toggle::default());
     }
 
     #[test]
     fn refresh_reconciles_keeping_persisting_shares_and_dropping_vanished_ones() {
         let mut b = ShareBrowser::new();
-        b.set_shares([("id-a", "first", "a#a")], None);
+        b.set_shares([("id-a", "first", "a#a", "")], None);
         let first_id = b.rows()[0].id;
         // A refresh that adds id-b and keeps id-a: id-a's node identity is preserved.
-        b.set_shares([("id-a", "first", "a#a"), ("id-b", "second", "b#b")], None);
+        b.set_shares(
+            [("id-a", "first", "a#a", ""), ("id-b", "second", "b#b", "")],
+            None,
+        );
         let rows = b.rows();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].id, first_id, "a persisting share keeps its node id");
@@ -692,7 +722,7 @@ mod tests {
             "a new share gets a fresh, never-reused id"
         );
         // A refresh where id-a vanished: it is dropped, id-b remains.
-        b.set_shares([("id-b", "second", "b#b")], None);
+        b.set_shares([("id-b", "second", "b#b", "")], None);
         let rows = b.rows();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].label, "second");
@@ -701,7 +731,7 @@ mod tests {
     #[test]
     fn refresh_preserves_expansion_and_loaded_subtree_of_a_persisting_share() {
         let mut b = ShareBrowser::new();
-        b.set_shares([("id-a", "share", "a#a")], None);
+        b.set_shares([("id-a", "share", "a#a", "")], None);
         let share_id = b.rows()[0].id;
         b.toggle(share_id);
         b.load_manifest("id-a", &[m("docs/a.txt", 1, 0)]);
@@ -711,7 +741,10 @@ mod tests {
         assert_eq!(before, 3, "share / docs(open) / a.txt");
         // A poll/refresh that still lists id-a (a sibling appears too) must NOT
         // collapse the open tree — comparative-real-time without losing the user's view.
-        b.set_shares([("id-a", "share", "a#a"), ("id-z", "new", "z#z")], None);
+        b.set_shares(
+            [("id-a", "share", "a#a", ""), ("id-z", "new", "z#z", "")],
+            None,
+        );
         let rows = b.rows();
         assert_eq!(rows[0].id, share_id, "id-a node preserved across refresh");
         assert!(rows[1].expanded, "the open folder stays open");
@@ -728,7 +761,7 @@ mod tests {
     /// Build a loaded, fully-expanded share for fetch_target tests.
     fn loaded_share() -> (ShareBrowser, u64) {
         let mut b = ShareBrowser::new();
-        b.set_shares([("id-a", "share", "a#a")], None);
+        b.set_shares([("id-a", "share", "a#a", "")], None);
         let share_id = b.rows()[0].id;
         b.toggle(share_id);
         b.load_manifest(

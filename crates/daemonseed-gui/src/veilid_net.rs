@@ -170,6 +170,7 @@ impl ShareState {
                     name: own.name.clone(),
                     rating: own.rating.clone(),
                     sharer_handle: own.sharer_handle.clone(),
+                    sharer_fingerprint: String::new(), // own shares render "you" (#114)
                     mine: true, // our own published share → rendered as "you" (#114)
                 });
             }
@@ -701,13 +702,14 @@ async fn send_room(
     let Some(signing) = shares.signing.clone() else {
         return err("no identity to sign the post".to_owned());
     };
+    let sent_unix_ms = now_unix_ms();
     let sealed = match seal_room_message(
         &lobby.room_key,
         signing.as_ref(),
         DEFAULT_ROOM,
         my_handle,
         text,
-        now_unix_ms(),
+        sent_unix_ms,
     ) {
         Ok(s) => s,
         Err(e) => return err(format!("public-room seal/sign failed: {e}")),
@@ -719,6 +721,7 @@ async fn send_room(
         who: my_handle.to_owned(),
         text: text.to_owned(),
         mine: true,
+        sent_unix_ms,
     });
     // Publish off-task so a slow DHT write does not stall the actor's select loop.
     let owner_seed = lobby.owner_seed;
@@ -1326,6 +1329,7 @@ fn handle_inbound(
                 who: msg.sender_handle,
                 text: msg.body,
                 mine: false,
+                sent_unix_ms: msg.sent_unix_ms,
             });
         } else {
             daemonseed_veilid_net::vtrace!("gui inbound: lobby chat SUPPRESSED (own handle)");
@@ -1724,10 +1728,16 @@ mod tests {
             &mut shares,
         );
         match evt_rx.try_recv() {
-            Ok(NetEvent::Message { who, text, mine }) => {
+            Ok(NetEvent::Message {
+                who,
+                text,
+                mine,
+                sent_unix_ms,
+            }) => {
                 assert_eq!(who, "river-otter#aabbccddeeff");
                 assert_eq!(text, "hello lobby");
                 assert!(!mine, "a peer's message is not ours");
+                assert_eq!(sent_unix_ms, 42, "#126: the wire timestamp is plumbed");
             }
             other => panic!("expected a lobby Message, got {other:?}"),
         }
