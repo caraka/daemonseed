@@ -201,12 +201,16 @@ pub struct Msg {
     pub who: String,
     pub text: String,
     pub mine: bool,
-    /// Best-effort sender wall-clock (ms since epoch) the transcript is ordered
-    /// by (#105). For circles, DHT propagation latency means arrival order can
-    /// differ from send order, so messages are inserted in `sent_unix_ms` order
-    /// rather than appended. Lobby messages arrive in order and carry their
-    /// receive time, so ordered-insert is a no-op append for them.
+    /// Best-effort sender wall-clock (ms since epoch). DEDUP + display key. Untrusted
+    /// on the open lobby, so it is NOT used directly for ordering — see `order_ms`.
     pub sent_unix_ms: i64,
+    /// The ORDERING + high-water key: `sent_unix_ms` clamped to the trust window
+    /// (`transcript::clamp_order_ms`) ONCE at insert time (#131). Stored (not
+    /// recomputed) so the transcript stays a stably-sorted Vec — a forged future
+    /// stamp that later re-enters the window as the clock advances cannot silently
+    /// re-sort past inserts and corrupt `partition_point`. In-window traffic has
+    /// `order_ms == sent_unix_ms`, so honest ordering is exact.
+    pub order_ms: i64,
 }
 
 /// Wall-clock now in unix milliseconds — the reference for the #131 transcript
@@ -880,12 +884,11 @@ impl GuiState {
             }
             // #105/#131: insert in CLAMPED-order so a late-arriving (older) message
             // slots chronologically while a forged extreme can't pin the transcript.
-            // `clamp_order_ms` is a pure function of (stored original, now), so re-
-            // evaluating it here keeps the Vec consistently sorted; it is a no-op for
-            // in-window backlog and an append for in-order arrivals.
-            let pos = c.messages.partition_point(|m| {
-                daemonseed_core::transcript::clamp_order_ms(m.sent_unix_ms, now) <= order
-            });
+            // Compare against each element's STORED `order_ms` (clamped once at its own
+            // insert), NOT a re-clamp against the current `now` — re-clamping would let a
+            // future forgery that has since re-entered the window silently re-sort past
+            // inserts and break `partition_point`'s sorted invariant (xhigh review).
+            let pos = c.messages.partition_point(|m| m.order_ms <= order);
             c.messages.insert(
                 pos,
                 Msg {
@@ -893,6 +896,7 @@ impl GuiState {
                     text,
                     mine,
                     sent_unix_ms,
+                    order_ms: order,
                 },
             );
             // #131: high-water tracks the clamped order but never advances past `now`,
@@ -948,11 +952,14 @@ impl GuiState {
             let c = &mut self.circles[self.active];
             c.unread = false;
             // #107: the user has now seen everything currently loaded, so advance the
-            // read high-water to the newest message in the transcript (messages are
-            // kept in `sent_unix_ms` order, so the last is the max). A later reconnect
-            // re-delivering this backlog then falls at/below the mark and won't re-trip.
-            if let Some(latest) = c.messages.last().map(|m| m.sent_unix_ms) {
-                c.high_water_ms = c.high_water_ms.max(latest);
+            // read high-water to the newest message in the transcript (messages are kept
+            // in `order_ms` order, so the last is the max). #131: advance from the
+            // CLAMPED `order_ms` capped at `now` — NOT the raw `sent_unix_ms` — so a
+            // forged far-future stamp cannot push the mark ahead and permanently suppress
+            // unreads (the xhigh-review hole). A later reconnect re-delivering this
+            // backlog then falls at/below the mark and won't re-trip.
+            if let Some(latest) = c.messages.last().map(|m| m.order_ms) {
+                c.high_water_ms = c.high_water_ms.max(latest.min(now_unix_ms()));
             }
         }
     }
@@ -985,6 +992,7 @@ impl GuiState {
                 text: format!("welcome to {circle} — this circle is {circle}"),
                 mine: false,
                 sent_unix_ms: 0,
+                order_ms: 0,
             }
         }
         fn fill(name: &str, n: usize, owner: &str) -> Vec<Msg> {
@@ -1000,6 +1008,7 @@ impl GuiState {
                     text: format!("{name} line {i} — lorem ipsum dolor sit amet"),
                     mine,
                     sent_unix_ms: i as i64,
+                    order_ms: i as i64,
                 });
             }
             msgs
@@ -1463,6 +1472,34 @@ mod tests {
         // "past" clamps to now-24h (top of the window), "real" is now-1s, "future"
         // clamps to now+skew (bottom) — a bounded, sensible order.
         assert_eq!(texts, vec!["past", "real", "future"]);
+    }
+
+    #[test]
+    fn forged_future_via_switch_to_cannot_suppress_future_unreads() {
+        // #131 (xhigh-review hole): the suppression path is switch_to, NOT the active
+        // push. A forged i64::MAX lands in a NON-active room; focusing it must advance
+        // the high-water only to ~now (clamped `order_ms`, capped), NOT to i64::MAX — so
+        // a later genuine message still trips the unread dot.
+        let now = now_unix_ms();
+        let mut st = GuiState::demo(); // active == 1
+        // Forge a far-future message into non-active circle 2, then focus it.
+        st.push_message(2, "evil".into(), "future".into(), false, i64::MAX);
+        st.switch_to(2, String::new(), 0.0); // focus → advances high-water
+        assert!(
+            st.metas()[2].high_water_ms <= now + 120_000,
+            "switch_to must clamp the high-water; a forged i64::MAX cannot pin it"
+        );
+        // Switch away; a genuine newer message must still raise the dot. It is stamped
+        // now+60s (legit clock skew, in-window) so it is strictly newer than the
+        // focus-time high-water (~now) — with Bug 1 present the high-water would be
+        // i64::MAX and this would NOT trip (suppressed); with the fix it trips.
+        st.switch_to(1, String::new(), 0.0);
+        let raised = st.push_message(2, "ally".into(), "genuine".into(), false, now + 60_000);
+        assert!(
+            raised,
+            "a real message still trips unread — suppression is closed"
+        );
+        assert!(st.metas()[2].unread);
     }
 
     #[test]

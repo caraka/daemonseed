@@ -957,6 +957,27 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   orinoco:** an open-lobby peer stamping extreme times can't reorder/hide/suppress; real backlog still
   orders correctly. (Sanjay, 2026-07-07, #131/#126.)
 
+- 2026-07-07: **#131 fix corrected after an xhigh review found two CONFIRMED bugs in the first cut
+  (which had shipped unreviewed — the review was skipped, then run on caraka's prompt).** (1) `switch_to`
+  advanced the read high-water from the RAW `last().sent_unix_ms`, so a forged `i64::MAX` still pinned
+  the high-water and permanently suppressed unreads — the exact #131 hole, reintroduced via a path the
+  first cut left unclamped. (2) The `partition_point` comparator re-clamped stored elements against a
+  MOVING `now`, so a future forgery that later re-entered the window as the clock advanced silently
+  re-sorted past inserts and corrupted ordering (my "clamp is pure → Vec stays sorted" reasoning was
+  wrong — it holds for past forgeries, not future ones). **Fix:** `Msg` now stores a clamp-at-insert
+  `order_ms` (a stable key computed once); ordering + high-water use the STORED `order_ms`, and
+  `switch_to` advances the high-water from `order_ms.min(now)`. Dedup stays on the original
+  `sent_unix_ms`. Test-gap (also flagged): the original oracle only exercised the active-room path;
+  added `forged_future_via_switch_to_cannot_suppress_future_unreads` covering the real suppression path.
+  **TUI clamp REVERTED** — it had introduced bug (2), and the sound fix needs the same stored key + a
+  large test-literal change; the TUI is a post-cutover non-gating surface, so its transcript keeps the
+  #130 raw (stable) ordering and TUI-#131 is deferred to the TUI parity epic (#111). Accepted residuals
+  from the review: a pre-epoch `now == 0` clock collapses the window (broken-device-only, PLAUSIBLE —
+  daemonseed needs a real clock); the GUI's duplicated `now_unix_ms` helpers (cleanup, deferred). Gates:
+  core clippy + 2 oracles; gui 112 nextest (incl. both forged oracles); tui 196 nextest; clippy
+  `-D warnings` gui + tui (default & veilid). **DEFERRED-VERIFY → orinoco.** (Sanjay, 2026-07-07,
+  #131 review-fix.)
+
 ## Changelog
 
 - **conjectured:** the multi-circle carousel (ISC-C60) lets the active surface span the lobby and the

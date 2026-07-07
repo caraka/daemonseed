@@ -1480,17 +1480,14 @@ impl App {
         }) {
             return false;
         }
-        // #131: order by the CLAMPED timestamp so a forged extreme on the open lobby
-        // can't pin the transcript, while real backlog (in-window) keeps its exact
-        // order. Dedup above stays on the ORIGINAL sent_unix_ms (stable across
-        // re-sweeps; the clamp is time-relative). `clamp_order_ms` is pure in
-        // (original, now), so re-evaluating it here keeps the flat Vec consistently
-        // sorted. (No read high-water on the TUI — it has no unread indicator.)
-        let now = crate::net::now_unix_ms();
-        let order = daemonseed_core::transcript::clamp_order_ms(sent_unix_ms, now);
-        let pos = self.messages.partition_point(|m| {
-            daemonseed_core::transcript::clamp_order_ms(m.sent_unix_ms, now) <= order
-        });
+        // Ordered-insert by sent_unix_ms (#130). The #131 forged-timestamp clamp is
+        // GUI-only for now: the TUI is a post-cutover surface (does not gate), and the
+        // sound clamp needs a stored per-line order key (a moving-`now` re-clamp in the
+        // comparator would break the sorted invariant — xhigh review); TUI-#131 rides
+        // the TUI parity work (#111). Raw ordering here is stable.
+        let pos = self
+            .messages
+            .partition_point(|m| m.sent_unix_ms <= sent_unix_ms);
         self.messages.insert(
             pos,
             ChatLine {
@@ -5179,41 +5176,6 @@ mod tests {
             lobby,
             vec!["first", "second"],
             "ordered by sent_unix_ms with the re-swept duplicate coalesced"
-        );
-    }
-
-    #[test]
-    fn forged_lobby_timestamp_is_clamped_not_pinned() {
-        // #131: an open-lobby peer forging i64::MIN/MAX cannot pin the transcript top or
-        // bottom past the trust window — a real message stays between the clamped edges.
-        let now = crate::net::now_unix_ms();
-        let mut app = drive_to_main();
-        app.on_net_event(NetEvent::PublicRoomMessage {
-            room: "lobby".to_owned(),
-            sender: "evil".to_owned(),
-            body: "pin-bottom".to_owned(),
-            sent_unix_ms: i64::MAX,
-        });
-        app.on_net_event(NetEvent::PublicRoomMessage {
-            room: "lobby".to_owned(),
-            sender: "ally".to_owned(),
-            body: "real".to_owned(),
-            sent_unix_ms: now - 1000,
-        });
-        app.on_net_event(NetEvent::PublicRoomMessage {
-            room: "lobby".to_owned(),
-            sender: "evil".to_owned(),
-            body: "pin-top".to_owned(),
-            sent_unix_ms: i64::MIN,
-        });
-        let lobby: Vec<&str> = app
-            .messages_on(Surface::Lobby)
-            .map(|m| m.body.as_str())
-            .collect();
-        assert_eq!(
-            lobby,
-            vec!["pin-top", "real", "pin-bottom"],
-            "forged extremes clamp to the window edges; the real message sits between"
         );
     }
 
