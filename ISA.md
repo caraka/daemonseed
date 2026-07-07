@@ -1416,3 +1416,13 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   primitives (32 functions, 9 types, 8 modules, 5 constants); the private `rendezvous` mod is excluded.
   `lama.yaml` gains a `crates[]` entry + manifest pointer. Both YAMLs `yaml.safe_load`-parse clean.
   Doc-only; no code gate applies. (Sanjay, 2026-07-07.)
+- LIVE-VERIFIED 2026-07-07 (orinoco felt-test, caraka; branch `722d054`): the xhigh-review fixes
+  confirmed in the wild. **#118** — a ghost share pruned itself on open and did NOT return (the F3
+  revert is correct; no dead-route reappearance). **#124/#125** — a large share download completed
+  **uninterrupted** (the watchdog no longer rotates an in-use route at the 150s tick; the 128 reply cap
+  clears one fetcher's 64-fragment peak). **Baseline** — Lobby + circle messages age + order correctly.
+  New observation (NOT a regression from this round; feeds #128): the download starved the FETCHER's
+  Lobby chat for its duration (flooding in at completion) while the SHARER chatted normally — the
+  fetcher's 64-wide outbound app_call burst saturates its Veilid node + the shared command channel, and
+  the D-1 AIMD (latency-only trigger) never engages on a fast link. Recorded on #128 with design
+  options; UX degradation, not a correctness break, not a cutover blocker. (Sanjay, 2026-07-07.)
