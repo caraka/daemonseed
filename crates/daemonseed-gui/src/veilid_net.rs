@@ -982,12 +982,10 @@ async fn fetch_share(
     let route = match handle.import_route(route_blob).await {
         Ok(r) => r,
         Err(e) => {
-            // The advertised route won't import (dead / rotated route): prune the
-            // stale entry (ISC-S30, #112) then re-resolve so a rotated-but-live route
-            // recovers on the next sweep (#118).
-            let msg = format!("could not import the sharer's route: {e}");
-            prune_and_reresolve(shares, evt_tx, net, share_id, &e).await;
-            return fail(msg);
+            // The advertised route won't import (the sharer/route is gone): prune
+            // the stale entry so the dead copy disappears (ISC-S30, #112).
+            prune_unreachable_share(shares, evt_tx, share_id);
+            return fail(format!("could not import the sharer's route: {e}"));
         }
     };
     match handle.fetch_manifest(route, share_id, room_key_bytes).await {
@@ -1007,7 +1005,7 @@ async fn fetch_share(
             });
         }
         Err(e) => {
-            prune_and_reresolve(shares, evt_tx, net, share_id, &e).await;
+            prune_unreachable_share(shares, evt_tx, share_id);
             fail(fetch_error_message("could not fetch the share manifest", e));
         }
     }
@@ -1033,49 +1031,6 @@ fn prune_unreachable_share(
         let _ = evt_tx.send(NetEvent::SharesSnapshot {
             shares: shares.listings(),
         });
-    }
-}
-
-/// A fetch failure that is an authoritative withdraw (`NotServed`) means the sharer
-/// declared the share gone — prune it and stop. Any other error is a transport-stage
-/// failure (a dead / rotated route), where the announcement at the share's stable-id
-/// slot may already carry a fresh live route, so a re-resolve can recover it.
-fn is_authoritative_withdraw(err: &VeilidNetError) -> bool {
-    matches!(err, VeilidNetError::NotServed)
-}
-
-/// Handle a fetch-stage failure for `share_id`: prune the stale local entry
-/// (ISC-S30 prune-on-fetch-fail), then — unless it was an authoritative withdraw —
-/// RE-RESOLVE by kicking a one-shot lobby resweep (#118 recipient half). The share
-/// advert lives at a stable-id slot (last-writer-wins), so a sharer that merely
-/// rotated its route has already overwritten it with a live route; the resweep
-/// re-pulls that fresh announcement and the share reappears reachable, instead of the
-/// recipient waiting for the periodic re-sweep. Fetch is user-initiated, so a
-/// prune+resweep cannot auto-thrash; a genuinely-gone sharer simply does not
-/// reappear (or the TTL backstop clears a lingering stale advert). No-op if
-/// disconnected / the lobby is not subscribed.
-async fn prune_and_reresolve(
-    shares: &mut ShareState,
-    evt_tx: &UnboundedSender<NetEvent>,
-    net: &Option<VeilidNetHandle>,
-    share_id: &str,
-    err: &VeilidNetError,
-) {
-    prune_unreachable_share(shares, evt_tx, share_id);
-    if is_authoritative_withdraw(err) {
-        return; // the sharer withdrew it — gone for good, nothing to re-resolve
-    }
-    let (Some(handle), Some(lobby)) = (net.as_ref(), shares.lobby.as_ref()) else {
-        return;
-    };
-    let owner_seed = lobby.owner_seed;
-    match handle.resweep_rendezvous(owner_seed).await {
-        Ok(()) => daemonseed_veilid_net::vtrace!(
-            "re-resolve: kicked a lobby resweep after {share_id} fetch fail (#118)"
-        ),
-        Err(e) => {
-            daemonseed_veilid_net::vtrace!("re-resolve: lobby resweep for {share_id} failed ({e})")
-        }
     }
 }
 
@@ -1176,9 +1131,8 @@ async fn confirm_fetch_inner(
     let route = match handle.import_route(route_blob).await {
         Ok(r) => r,
         Err(e) => {
-            let msg = format!("could not import the sharer's route: {e}");
-            prune_and_reresolve(shares, evt_tx, net, share_id, &e).await;
-            return Err(msg);
+            prune_unreachable_share(shares, evt_tx, share_id);
+            return Err(format!("could not import the sharer's route: {e}"));
         }
     };
     let manifest = match handle
@@ -1187,7 +1141,7 @@ async fn confirm_fetch_inner(
     {
         Ok(m) => m,
         Err(e) => {
-            prune_and_reresolve(shares, evt_tx, net, share_id, &e).await;
+            prune_unreachable_share(shares, evt_tx, share_id);
             return Err(fetch_error_message("could not fetch the share manifest", e));
         }
     };
@@ -1291,7 +1245,7 @@ async fn confirm_fetch_inner(
         {
             Ok(c) => c,
             Err(e) => {
-                prune_and_reresolve(shares, evt_tx, net, share_id, &e).await;
+                prune_unreachable_share(shares, evt_tx, share_id);
                 return Err(fetch_error_message("chunk fetch failed", e));
             }
         };
@@ -1497,20 +1451,6 @@ mod tests {
         );
         assert!(transport.contains("chunk fetch failed"));
         assert!(transport.contains("route dead"));
-    }
-
-    #[test]
-    fn only_a_withdraw_skips_reresolve() {
-        // #118 re-resolve gating: an authoritative withdraw (NotServed) means the
-        // share is gone — prune, no resweep. Any transport error is a dead/rotated
-        // route → re-resolve (kick a lobby resweep) to recover a live route.
-        assert!(is_authoritative_withdraw(&VeilidNetError::NotServed));
-        assert!(!is_authoritative_withdraw(&VeilidNetError::Send(
-            "route dead".to_owned()
-        )));
-        assert!(!is_authoritative_withdraw(&VeilidNetError::Routing(
-            "could not get remote private route".to_owned()
-        )));
     }
 
     fn announcer(seed: u8) -> SignKeypair {

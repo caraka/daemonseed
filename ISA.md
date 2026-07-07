@@ -907,6 +907,32 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   **DEFERRED-VERIFY → orinoco:** a TUI↔TUI reconnect re-sweep shows no duplicate; out-of-order lobby +
   circle arrivals render chronologically. (Sanjay, 2026-07-07.)
 
+- 2026-07-07: **xhigh review of the 5-commit round (`origin/feat/veilid-migration..HEAD`) — 8 findings,
+  3 CONFIRMED regressions the batch introduced; fixed 3 + 2 cleanups, declined 3 as GUI-parity
+  tradeoffs.** Workflow-backed review (20 agents, 19 verified findings → 8 distinct). **Fixed:**
+  (F1) the #124 watchdog re-allocated+released EVERY advert's route every 150s including a route
+  actively serving a download → the recipient's single imported route died mid-transfer, breaking any
+  download > 150s. Now the watchdog skips shares served within `SERVE_RECENCY_WINDOW` (a
+  `ServedShare::last_served` stamp updated in `share::serve`), rotating only genuinely-idle shares —
+  which is what #124 asked for ("adverts whose route has not been confirmed alive"); RouteMaintenance
+  (observed death) still refreshes unconditionally. (F4) `MAX_CONCURRENT_SERVE_REPLIES` 32 → 128,
+  above one fetcher's 64-fragment peak (CHUNK 8 × FRAGMENT 8) so a single legit download no longer
+  self-throttles past the answer window; invariant encoded in `serve_lane_bounds_are_sane`. (F6) the
+  serve answer-window expiry is re-checked AFTER the permit wait (a request can age out while blocked).
+  (F8) doc/CHANGELOG "two orders of magnitude" → the true 30× (150/5). **REVERTED (F3):** the #118
+  recipient re-resolve. The review showed it is net-negative — on a crashed sharer (no `NotServed`),
+  the immediate resweep re-pulled the same dead-route announcement, so a share the plain prune would
+  have cleared reappeared un-fetchable after every fetch attempt until the ~600s TTL. Sender-side
+  stable placement (`e807837`) remains the real #118 fix; the recipient half is dropped. **Declined
+  (GUI-parity tradeoffs, not new bugs):** (F2) TUI transcript now orders by the advisory sender
+  `sent_unix_ms` — identical to the GUI since #105/#126; the open-room forgeability is tracked by #131
+  and a cross-surface fix belongs there, not a TUI-only divergence. (F5) exact-tuple dedup can drop a
+  vanishingly-rare same-ms same-text same-sender duplicate — the accepted GUI `push_message` tradeoff.
+  (F7) `push_message` is O(n)/write (O(M²) session) — matches the GUI; human-paced volume + dedup
+  dropping re-swept backlog keep M small, so it is negligible; a bounded transcript is a separate
+  enhancement if it ever bites. Gates re-run green: veilid-net 28 nextest, gui 110 nextest, both clippy
+  `-D warnings`. (Sanjay, 2026-07-07, xhigh review.)
+
 ## Changelog
 
 - **conjectured:** the multi-circle carousel (ISC-C60) lets the active surface span the lobby and the

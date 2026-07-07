@@ -36,8 +36,13 @@ const SERVE_QUEUE_CAP: usize = 256;
 
 /// Max concurrent `app_call_reply` tasks (#125): caps the network work — and the
 /// sealed responses held in memory — in flight at once, applying backpressure to the
-/// serve intake when replies are slow.
-const MAX_CONCURRENT_SERVE_REPLIES: usize = 32;
+/// serve intake when replies are slow. MUST exceed one fetcher's peak concurrent
+/// fragment demand (gui `CHUNK_FETCH_CONCURRENCY` 8 × `share::FRAGMENT_FETCH_CONCURRENCY`
+/// 8 = 64), or a single legitimate large download self-throttles: fragments beyond the
+/// cap wait for a permit, age past the 5s answer window, and the download fails on an
+/// otherwise-idle sharer (xhigh review). 128 clears one full download with margin while
+/// still bounding a pathological multi-fetcher burst.
+const MAX_CONCURRENT_SERVE_REPLIES: usize = 128;
 
 /// Commands the [`VeilidNetHandle`] sends to the actor task. Each carries a
 /// `oneshot` reply so the caller awaits the result.
@@ -806,26 +811,44 @@ async fn actor_loop(
                 }
             }
             Command::AdvertWatchdog => {
-                // The silently-dead-route recovery path (#124): re-publish every
-                // advert on a slow timer, with NO relevance filter (the death was
-                // never observed) and NO busy-gate re-delivery (the next tick is the
-                // retry). The shared coalesce gate makes a tick landing just after a
-                // real refresh a quiet no-op, so the minutes-scale cadence can never
-                // approach the refresh storm the RouteMaintenance filter closed.
-                if spawn_refresh_if_due(
-                    &api,
-                    &rc,
-                    &opened,
-                    &record_locks,
-                    &advert_routes,
-                    &share_adverts,
-                    &refresh_in_flight,
-                    &last_advert_refresh,
-                ) {
-                    crate::vtrace!(
-                        "advert_watchdog: refreshing {} advert(s)",
-                        share_adverts.len()
-                    );
+                // The silently-dead-route recovery path (#124): re-publish IDLE adverts
+                // on a slow timer to recover a route that died without an observed
+                // `dead_routes`. Rotating a route (`publish_one_advert` allocates a new
+                // one + releases the old) would kill an active download's imported
+                // route mid-transfer, so a share that served a fetch within
+                // SERVE_RECENCY_WINDOW is skipped — a live download keeps its route
+                // stamped fresh and is never disturbed (xhigh review). No busy-gate
+                // re-delivery (the next tick is the retry); the shared coalesce gate
+                // makes a tick just after a real refresh a quiet no-op, so the cadence
+                // never approaches the refresh storm the RouteMaintenance filter closed.
+                let now = std::time::Instant::now();
+                let idle: HashMap<String, AdvertState> = {
+                    let served = shares
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    share_adverts
+                        .iter()
+                        .filter(|(id, _)| {
+                            served.get(*id).is_none_or(|s| {
+                                now.duration_since(s.last_served()) >= SERVE_RECENCY_WINDOW
+                            })
+                        })
+                        .map(|(id, st)| (id.clone(), st.clone()))
+                        .collect()
+                };
+                if !idle.is_empty()
+                    && spawn_refresh_if_due(
+                        &api,
+                        &rc,
+                        &opened,
+                        &record_locks,
+                        &advert_routes,
+                        &idle,
+                        &refresh_in_flight,
+                        &last_advert_refresh,
+                    )
+                {
+                    crate::vtrace!("advert_watchdog: refreshing {} idle advert(s)", idle.len());
                 }
             }
             Command::Shutdown { reply } => {
@@ -879,6 +902,18 @@ async fn serve_loop(
             .acquire_owned()
             .await
             .expect("serve reply semaphore is never closed");
+        // Re-check expiry AFTER the permit wait: acquiring can block seconds when all
+        // permits are held (the exact latency spike #125 targets), so an entry that
+        // passed the dequeue check may have aged past the window while waiting. Sealing
+        // + sending it would be pure wasted work the reply lands too late for (xhigh
+        // review). The permit drops here on `continue`.
+        if received.elapsed() > SERVE_ANSWER_WINDOW {
+            crate::vtrace!(
+                "serve: EXPIRED after {}ms (post-permit), dropped",
+                received.elapsed().as_millis()
+            );
+            continue;
+        }
         // Recover the guard if another holder panicked: a poisoned registry
         // must not cascade into the actor's later ServeShare/StopServe locks.
         let seal_started = std::time::Instant::now();
@@ -1067,13 +1102,23 @@ async fn resweep_rendezvous(
 /// churn → republish → load → churn reinforcing loop.
 const ADVERT_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Cadence of the #124 advert watchdog: a slow, unconditional advert re-publish that
-/// recovers a route which died without veilid ever reporting it in `dead_routes`.
-/// Deliberately minutes-scale — two orders of magnitude above
-/// [`ADVERT_REFRESH_MIN_INTERVAL`], so even back-to-back with an observed refresh it
-/// cannot reconstruct the tight refresh→release→RouteChange storm the relevance filter
-/// closed. A tick that lands inside a recent refresh's coalesce window is a no-op.
+/// Cadence of the #124 advert watchdog: a slow advert re-publish that recovers a
+/// route which died without veilid ever reporting it in `dead_routes`. Deliberately
+/// minutes-scale — 30× [`ADVERT_REFRESH_MIN_INTERVAL`], so even back-to-back with an
+/// observed refresh it cannot reconstruct the tight refresh→release→RouteChange storm
+/// the relevance filter closed. A tick that lands inside a recent refresh's coalesce
+/// window is a no-op, and a share actively serving a download (served within
+/// [`SERVE_RECENCY_WINDOW`]) is skipped so its in-use route is never rotated.
 const ADVERT_WATCHDOG_INTERVAL: Duration = Duration::from_secs(150);
+
+/// A share that answered a fetch request within this window is treated as actively
+/// serving, so the #124 watchdog skips rotating its route — a route rotation
+/// (`publish_one_advert` allocates a new route and releases the old) would kill the
+/// recipient's single imported route mid-download. A download continuously serves
+/// fragments, so it keeps refreshing the stamp and is never disturbed; only a genuinely
+/// idle share (no serve for this long) has its route re-allocated to recover a silent
+/// death. Set to the watchdog cadence so one idle tick makes a share eligible.
+const SERVE_RECENCY_WINDOW: Duration = ADVERT_WATCHDOG_INTERVAL;
 
 /// A remembered public-share advert: enough to re-allocate a route, re-sign, and
 /// re-publish it on RouteChanged. Holds the signing CAPABILITY, never key material.
@@ -1363,19 +1408,25 @@ mod tests {
 
     #[test]
     fn serve_lane_bounds_are_sane() {
-        // #125 hardening invariants (compile-time): a bounded intake with room for
-        // more than one fetch's fragment fan-out, and a reply cap below the queue cap
-        // so replies are the tighter bound (the network work), not the buffer.
+        // #125 hardening invariants (compile-time): the reply cap MUST exceed one
+        // fetcher's peak concurrent fragment fan-out (gui CHUNK_FETCH_CONCURRENCY 8 ×
+        // share::FRAGMENT_FETCH_CONCURRENCY 8 = 64) or a single legitimate download
+        // self-throttles past the answer window (xhigh review); it stays below the
+        // intake cap so replies remain the tighter bound (the network work).
+        const SINGLE_FETCHER_PEAK_FRAGMENTS: usize = 8 * 8;
         const {
             assert!(
                 SERVE_QUEUE_CAP >= 64,
                 "queue must hold a normal fetch burst"
             );
             assert!(
+                MAX_CONCURRENT_SERVE_REPLIES > SINGLE_FETCHER_PEAK_FRAGMENTS,
+                "one download's 64-fragment peak must not self-throttle"
+            );
+            assert!(
                 MAX_CONCURRENT_SERVE_REPLIES < SERVE_QUEUE_CAP,
                 "concurrent replies are the tighter bound"
             );
-            assert!(MAX_CONCURRENT_SERVE_REPLIES >= 1);
         }
     }
 }

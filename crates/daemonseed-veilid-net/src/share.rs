@@ -232,6 +232,10 @@ pub struct ServedShare {
     cache: HashMap<String, Vec<u8>>,
     /// LRU recency, oldest at the front — bounds `cache` to [`SEAL_CACHE_CAPACITY`].
     lru: VecDeque<String>,
+    /// When this share last answered a fetch request. The #124 advert watchdog reads
+    /// it to skip re-allocating a route that is actively serving a download — rotating
+    /// an in-use route would kill the recipient's single imported route mid-transfer.
+    last_served: Instant,
 }
 
 impl ServedShare {
@@ -241,7 +245,14 @@ impl ServedShare {
             room_key,
             cache: HashMap::new(),
             lru: VecDeque::new(),
+            last_served: Instant::now(),
         }
+    }
+
+    /// When this share last answered a fetch request (the #124 watchdog's
+    /// route-in-use signal). Stamped by [`serve`] on every matched request.
+    pub fn last_served(&self) -> Instant {
+        self.last_served
     }
 
     /// Mark `key` most-recently-used (move it to the back of the recency ring).
@@ -303,7 +314,12 @@ pub fn serve(shares: &mut HashMap<String, ServedShare>, request: &[u8]) -> Vec<u
         return encode_response_not_found();
     };
     match shares.get_mut(&share_id) {
-        Some(s) => s.answer_fragment(&target, fragment),
+        Some(s) => {
+            // Stamp route-in-use so the #124 watchdog does not rotate this share's
+            // route out from under an active download.
+            s.last_served = Instant::now();
+            s.answer_fragment(&target, fragment)
+        }
         None => encode_response_not_found(),
     }
 }
