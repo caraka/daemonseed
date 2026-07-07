@@ -165,6 +165,18 @@ unsolved governance problem the circle model was built to avoid. B therefore nee
 NOT the cutover. A0's operator-only decisions below (A1–A4) all hold for the one project channel and
 are the reusable substrate a future B would parameterize.
 
+**Seed for a future B (caraka, 2026-07-07) — the crux is first-contact key distribution, not the DHT.**
+Owned channels are the *inverse* of circles: an abandoned circle self-purges (ownerless + live-only
+DHT = natural GC), but an owned channel persists exactly as long as someone keeps writing it — so a
+persistent adversary can keep a *squatted* look-alike channel alive and divert trust/traffic to it.
+Persistence is what makes an owned channel useful AND is exactly what an adversary can buy. The defense
+is already in daemonseed's DNA: trust binds to the **`name#hash`** (the key fingerprint), never the
+human label — an impostor can take the name but never the hash, so a client that knows the real hash
+never resolves to the impostor no matter how alive it is kept. That reduces B's security to **how a
+user learns the right hash at first contact** (the petname / Zooko's-triangle problem) — solved for
+circles by out-of-band phrases and for the app by baked keys, unsolved for open community discovery.
+Any B design starts here, not at the DHT mechanics.
+
 ### The decoupling the relay collapsed: write-gate ≠ content-provenance
 
 On the relay these were one thing (the server sat on both). On Veilid they are two independent
