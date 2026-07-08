@@ -81,6 +81,14 @@ rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "t
 # are already in the lock tree transitively via winit.
 arboard = "3"
 
+# Encode/decode the operator announce-record item envelope (Phase 4 A-c): the
+# 1-byte-tagged `SignedArtifact` (MOTD) / `Post` (announcement) values the Veilid
+# composer publishes + the inbound reader verifies. Optional + veilid-gated — the
+# operator-space path is `#[cfg(feature = "veilid")]`, so default builds never pull
+# them; `hex` keys announcement items by their content-address slot.
+prost = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
+
 [build-dependencies]
 slint-build = { workspace = true }
 
@@ -106,4 +114,10 @@ desktop = ["slint/backend-winit", "dep:i-slint-backend-winit"]
 # Also turns on `daemonseed-cli/veilid` so the least-authority
 # `IdentityRouteAdvertSigner` route-advert capability is in scope for the
 # public-share publish path (Phase 3 Slice 2b).
-veilid = ["dep:daemonseed-veilid-net", "dep:futures-util", "daemonseed-cli/veilid"]
+veilid = [
+    "dep:daemonseed-veilid-net",
+    "dep:futures-util",
+    "dep:prost",
+    "dep:hex",
+    "daemonseed-cli/veilid",
+]

@@ -6,13 +6,15 @@
 //! [`crate::net::NetHandle::new`] spawns (a `#[cfg(feature = "veilid")]` branch).
 //! Backed by [`daemonseed_veilid_net::VeilidNetHandle`].
 //!
-//! **Circles, public shares + lobby chat today.** `Connect` (attach + lobby
+//! **Circles, public shares, lobby chat, lobby presence + operator
+//! announcements/MOTD today.** `Connect` (attach + lobby + operator-record
 //! subscribe), `JoinCircle`, `SendCircle`, the inbound circle path, the
-//! public-share publish / discover / fetch path (Phase 3 Slice 2b), and
-//! public-room (Lobby) chat (`JoinRoom` / `SendRoom`) are live; presence and
-//! MOTD/announcements return `NetEvent::Error("not yet on Veilid")` until Phase 4.
-//! This is a degraded-but-honest dev/test mode, NOT a dual transport — it honors
-//! the no-relay↔Veilid-interop clean cut (one transport at a time).
+//! public-share publish / discover / fetch path (Phase 3 Slice 2b), public-room
+//! (Lobby) chat (`JoinRoom` / `SendRoom`), lobby member presence (#74), and the
+//! operator announcements/MOTD composer (Phase 4 A-c — `RefreshPublicSpace`,
+//! `SetMotd`, `UploadAnnouncement`) are live. This is a degraded-but-honest
+//! dev/test mode, NOT a dual transport — it honors the no-relay↔Veilid-interop
+//! clean cut (one transport at a time).
 //!
 //! **Single encryption layer.** Content is sealed under the circle `cot_key` /
 //! the public-room `PublicRoomKey` exactly as on the relay; the Veilid DHT stores
@@ -44,11 +46,14 @@
 //! matching open succeeds. Own circle/lobby messages (already local-echoed on send)
 //! are suppressed by sender-handle match.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use daemonseed_cli::public_space::{
+    post_render_fields, render_motd, sign_motd, sign_post, verify_served_motd, verify_served_post,
+};
 use daemonseed_cli::route_signer::IdentityRouteAdvertSigner;
 use daemonseed_core::circle::key::{CircleKey, derive_circle_veilid_owner_seed, derive_cot_key};
 use daemonseed_core::circle::message::{open_message, seal_message};
@@ -64,6 +69,9 @@ use daemonseed_core::public_room::{
     DEFAULT_ROOM, PublicRoomKey, derive_room_key, derive_room_presence_veilid_owner_seed,
     derive_room_veilid_owner_seed, open_room_message, seal_room_message,
 };
+use daemonseed_core::public_space::{
+    Whitelist, content_address, dev_project_announce_veilid_owner_seed, dev_project_release_keypair,
+};
 use daemonseed_core::share_announce::{
     AnnouncementFields, derive_share_id, open_announcement, seal_public_announcement,
 };
@@ -76,12 +84,14 @@ use daemonseed_veilid_net::{
     AimdWindow, DiscoveryEnvelope, VeilidNet, VeilidNetConfig, VeilidNetError, VeilidNetEvent,
     VeilidNetHandle, verify_route_advert,
 };
+use prost::Message as _;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::net::{
     NetCommand, NetEvent, ShareManifestEntry, beacon_is_own, is_unsafe_publish_root,
     roster_from_members, roster_render_changed, safe_folder_name, sanitize_rel_path,
 };
+use crate::state::{AnnouncementRow, AnnouncementsView};
 
 /// How long a discovered share lives in the catalog without a fresh announce —
 /// Generous TTL — a backstop for a sharer that vanished WITHOUT a withdraw (a hard
@@ -99,6 +109,32 @@ const SHARE_CATALOG_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 /// of `app_call`s; mirrors the veilid-net fragment pipeline window (#109). Chunks
 /// still reassemble in manifest order (`buffered` preserves order).
 const CHUNK_FETCH_CONCURRENCY: usize = 8;
+
+// ── Operator announce-record item envelope (Phase 4 A-c) ─────────────────────
+//
+// Inbound `VeilidNetEvent::Inbound { bytes }` carries NO slot id, and a
+// `MotdPayload` vs a `PostPayload` are prost-ambiguous, so the reader cannot tell a
+// MOTD from an announcement by content. Each value published to the operator record
+// is therefore prefixed with a 1-byte KIND tag: `[kind] ++ prost(artifact)`.
+
+/// KIND tag for a MOTD value: the payload is a [`wire::SignedArtifact`].
+const OPERATOR_ITEM_MOTD: u8 = 0x00;
+/// KIND tag for an announcement value: the payload is a [`wire::Post`].
+const OPERATOR_ITEM_ANNOUNCEMENT: u8 = 0x01;
+
+/// Prepend the 1-byte KIND tag to a prost-encoded operator artifact.
+fn encode_operator_item(kind: u8, bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + bytes.len());
+    out.push(kind);
+    out.extend_from_slice(bytes);
+    out
+}
+
+/// Split an operator-record value into `(kind, payload)`. `None` for an empty
+/// buffer (no tag byte) — the read side treats that as "not an operator item".
+fn decode_operator_item(buf: &[u8]) -> Option<(u8, &[u8])> {
+    buf.split_first().map(|(kind, rest)| (*kind, rest))
+}
 
 /// A joined circle's local state: the GUI routing tag, the content key (for
 /// seal/open), and the shared rendezvous-owner seed (for publish/subscribe).
@@ -143,6 +179,32 @@ struct OwnShare {
     sharer_handle: String,
 }
 
+/// The subscribed operator announce/MOTD record (Phase 4 A-c): the write-gate owner
+/// seed (dev-only — the in-source project seed) plus the accumulated, verified
+/// operator content. A0: ONE project-owned channel; the composer signs with the F17
+/// project-release key, so an empty [`Whitelist`] authorizes it and NO signer
+/// whitelist distribution is needed. `motd` holds the current verified MOTD;
+/// `posts` maps a content-address hex slot → its verified announcement (dedup +
+/// stable order).
+///
+/// **Slot ceiling (#134, deferred).** The MOTD (fixed `"motd"` slot) and every
+/// announcement (content-address slot) key into the SAME `current_state_subkey`
+/// 64-slot space on the operator record, so past a handful of items two can collide
+/// (last-writer-wins) on-wire — and an announcement colliding with `"motd"` evicts
+/// the MOTD for peers. Low-volume here (a project posts few live items), so it bites
+/// far later than lobby presence; the fix is the same #134 dedicated-schema call.
+struct OperatorSpace {
+    /// The project-announce Veilid rendezvous-owner seed — the DHT write-gate. In the
+    /// dev phase this is derivable by everyone from the in-source project seed, so any
+    /// client can compose (A0/A1 dev-possession gate); in production only the offline
+    /// seed-holder can write.
+    announce_owner_seed: [u8; 32],
+    /// The current verified MOTD (F17-signed), or `None` if none verifies yet.
+    motd: Option<wire::SignedArtifact>,
+    /// Verified announcement posts, keyed by their content-address hex slot.
+    posts: BTreeMap<String, wire::Post>,
+}
+
 /// The actor's public-share state (Phase 3 Slice 2b): the held signing key, the
 /// subscribed lobby, the discovered-share catalog + their routes, and our own
 /// published shares. Bundled into one struct so the share wiring adds a single
@@ -156,6 +218,9 @@ struct ShareState {
     catalog: ShareCatalog,
     discovered: HashMap<String, DiscoveredRoute>,
     own: Vec<OwnShare>,
+    /// The subscribed operator announce/MOTD record (Phase 4 A-c), set on Connect
+    /// after the owner seed derives + the record subscribes. `None` until connected.
+    operator: Option<OperatorSpace>,
 }
 
 impl ShareState {
@@ -166,6 +231,7 @@ impl ShareState {
             catalog: ShareCatalog::new(SHARE_CATALOG_TTL),
             discovered: HashMap::new(),
             own: Vec::new(),
+            operator: None,
         }
     }
 
@@ -363,6 +429,9 @@ async fn handle_command(
                 // Subscribe the world-derivable lobby so share announcements fold
                 // into the catalog as they arrive (Phase 3 discovery).
                 subscribe_lobby(shares, net, evt_tx).await;
+                // Subscribe the operator announce/MOTD record (Phase 4 A-c) so MOTD +
+                // announcement items fold in as they arrive.
+                subscribe_operator_space(shares, net).await;
                 // #102: relay-parity — silently re-subscribe persisted circles after
                 // attach, so a circle restored into the UI is actually joined on the
                 // transport (else SendCircle finds known=[] → "join before sending").
@@ -513,14 +582,11 @@ async fn handle_command(
             send_room(&text, evt_tx, net, my_handle, shares).await;
         }
 
-        // User-facing surfaces not yet on Veilid (Phase 4): answer honestly rather
-        // than silently swallow.
-        NetCommand::RefreshPublicSpace
-        | NetCommand::UploadAnnouncement { .. }
-        | NetCommand::SetMotd { .. } => {
-            let _ = evt_tx.send(NetEvent::Error {
-                reason: "not yet on Veilid".to_owned(),
-            });
+        // ── Operator announcements / MOTD (Phase 4 A-c) ──
+        NetCommand::RefreshPublicSpace => refresh_public_space(shares, evt_tx, net).await,
+        NetCommand::SetMotd { text } => set_motd(shares, evt_tx, net, &text).await,
+        NetCommand::UploadAnnouncement { topic, body } => {
+            upload_announcement(shares, evt_tx, net, &topic, &body).await;
         }
 
         // Internal / timer-driven commands the relay actor self-sends. None are
@@ -842,6 +908,262 @@ async fn send_room(
             });
         }
     });
+}
+
+// ── Operator announcements / MOTD (Phase 4 A-c) ─────────────────────────────
+
+/// Subscribe the operator announce/MOTD record (A-c): derive the dev project-announce
+/// owner seed (the DHT write-gate), subscribe the record so MOTD + announcement items
+/// fold in as they arrive, and remember it. Best-effort — a derivation/subscribe
+/// failure is traced and leaves `operator` unset (compose/refresh then surface a clean
+/// not-connected error). Mirrors [`subscribe_lobby`].
+async fn subscribe_operator_space(shares: &mut ShareState, net: &Option<VeilidNetHandle>) {
+    if shares.operator.is_some() {
+        return;
+    }
+    let Some(handle) = net.as_ref() else {
+        return;
+    };
+    let announce_owner_seed = match dev_project_announce_veilid_owner_seed() {
+        Ok(s) => *s.as_bytes(),
+        Err(e) => {
+            daemonseed_veilid_net::vtrace!("gui operator: owner-seed derivation failed: {e}");
+            return;
+        }
+    };
+    if let Err(e) = handle.subscribe_room(announce_owner_seed).await {
+        daemonseed_veilid_net::vtrace!("gui operator: subscribe failed: {e}");
+        return;
+    }
+    daemonseed_veilid_net::vtrace!("gui operator: announce/MOTD record subscribed");
+    shares.operator = Some(OperatorSpace {
+        announce_owner_seed,
+        motd: None,
+        posts: BTreeMap::new(),
+    });
+}
+
+/// Project the current verified operator content as a [`NetEvent::PublicSpaceSnapshot`]
+/// (A-c). Everything in `OperatorSpace` was ALREADY verified before it was folded in
+/// (`apply_operator_item` runs `verify_served_*` before insert; our own publishes are
+/// self-authored), so the view is built **directly** from the stored artifacts —
+/// `render_motd` / `post_render_fields` are the same inert decodes
+/// `build_announcements_view` uses, minus the re-verification. Building the view
+/// through `build_announcements_view` here would re-run the ML-DSA-87 signature check
+/// on every stored post on every inbound item — O(N²) post-quantum work on the event
+/// path during a backlog sweep (review finding). `can_compose = true` is the dev
+/// possession gate; `connect_time = false` (the connect-time landing is #93).
+fn public_space_snapshot_event(op: &OperatorSpace) -> NetEvent {
+    let motd = op.motd.as_ref().map(render_motd);
+    let posts = op
+        .posts
+        .values()
+        .map(|p| {
+            let (topic, body, sent_unix_ms) = post_render_fields(p);
+            AnnouncementRow {
+                topic,
+                body,
+                sent_unix_ms,
+            }
+        })
+        .collect();
+    NetEvent::PublicSpaceSnapshot {
+        view: AnnouncementsView { motd, posts },
+        can_compose: true,
+        connect_time: false,
+    }
+}
+
+/// The error surfaced when the operator record isn't available: honest about WHY —
+/// truly not connected vs connected-but-the-subscribe-hasn't-landed (a transient
+/// failure the lazy re-subscribe retries), rather than always claiming "not connected".
+fn operator_unavailable_message(net: &Option<VeilidNetHandle>) -> String {
+    if net.is_none() {
+        "not connected to Veilid yet".to_owned()
+    } else {
+        "the announce/MOTD record isn't available yet — try again in a moment".to_owned()
+    }
+}
+
+/// Re-render the current operator view (A-c) — the Veilid counterpart of the relay
+/// `handle_refresh_public_space`, but local (verified content already lives in
+/// `OperatorSpace`, no fetch). Lazily (re-)subscribes first so a transient subscribe
+/// failure at Connect doesn't disable announcements for the whole session. Still
+/// unavailable → a clean [`NetEvent::PublicSpaceError`], leaving the pane unchanged.
+async fn refresh_public_space(
+    shares: &mut ShareState,
+    evt_tx: &UnboundedSender<NetEvent>,
+    net: &Option<VeilidNetHandle>,
+) {
+    subscribe_operator_space(shares, net).await;
+    match shares.operator.as_ref() {
+        Some(op) => {
+            let _ = evt_tx.send(public_space_snapshot_event(op));
+        }
+        None => {
+            let _ = evt_tx.send(NetEvent::PublicSpaceError {
+                message: operator_unavailable_message(net),
+            });
+        }
+    }
+}
+
+/// (#92 / A-c) Sign a MOTD with the F17 project-release key ([`sign_motd`] enforces the
+/// ISC-S9 single-line-plaintext rule BEFORE signing), publish it to the operator
+/// record's fixed `"motd"` slot, then fold it in locally + refresh. Guards mirror the
+/// relay path (not connected → a clean [`NetEvent::PublicSpaceError`], nothing
+/// published). The dev composer signs with F17 (A0), NOT the local stable identity —
+/// so an empty whitelist authorizes it and non-signer distribution is unnecessary.
+async fn set_motd(
+    shares: &mut ShareState,
+    evt_tx: &UnboundedSender<NetEvent>,
+    net: &Option<VeilidNetHandle>,
+    text: &str,
+) {
+    // Lazily (re-)subscribe first so a transient Connect-time subscribe failure doesn't
+    // wedge the composer for the session (review finding); a no-op once subscribed.
+    subscribe_operator_space(shares, net).await;
+    let err = |message: String| {
+        let _ = evt_tx.send(NetEvent::PublicSpaceError { message });
+    };
+    let Some(owner_seed) = shares.operator.as_ref().map(|o| o.announce_owner_seed) else {
+        return err(operator_unavailable_message(net));
+    };
+    let Some(handle) = net.as_ref() else {
+        return err("not connected to Veilid yet".to_owned());
+    };
+    let kp = match dev_project_release_keypair() {
+        Ok(k) => k,
+        Err(e) => return err(format!("could not load the project-release key: {e}")),
+    };
+    let artifact = match sign_motd(&kp, text, now_unix_ms()) {
+        Ok(a) => a,
+        // Includes the ISC-S9 plaintext rejection (single line, no markup/links) —
+        // surfaced, not silently dropped.
+        Err(e) => return err(format!("could not set MOTD: {e}")),
+    };
+    let value = encode_operator_item(OPERATOR_ITEM_MOTD, &artifact.encode_to_vec());
+    if let Err(e) = handle
+        .publish_current_state(owner_seed, "motd", value)
+        .await
+    {
+        return err(format!("could not publish MOTD: {e}"));
+    }
+    // Fold our own MOTD in immediately (the record sweep also re-surfaces it).
+    if let Some(op) = shares.operator.as_mut() {
+        op.motd = Some(artifact);
+    }
+    if let Some(op) = shares.operator.as_ref() {
+        let _ = evt_tx.send(public_space_snapshot_event(op));
+    }
+}
+
+/// (#92 / A-c) Sign an announcement post with the F17 project-release key, publish it
+/// to the operator record at its content-address slot, then fold it in locally +
+/// refresh. Same guards + F17 signing rationale as [`set_motd`].
+async fn upload_announcement(
+    shares: &mut ShareState,
+    evt_tx: &UnboundedSender<NetEvent>,
+    net: &Option<VeilidNetHandle>,
+    topic: &str,
+    body: &str,
+) {
+    subscribe_operator_space(shares, net).await;
+    let err = |message: String| {
+        let _ = evt_tx.send(NetEvent::PublicSpaceError { message });
+    };
+    let Some(owner_seed) = shares.operator.as_ref().map(|o| o.announce_owner_seed) else {
+        return err(operator_unavailable_message(net));
+    };
+    let Some(handle) = net.as_ref() else {
+        return err("not connected to Veilid yet".to_owned());
+    };
+    let kp = match dev_project_release_keypair() {
+        Ok(k) => k,
+        Err(e) => return err(format!("could not load the project-release key: {e}")),
+    };
+    let artifact = match sign_post(&kp, topic, body, now_unix_ms()) {
+        Ok(a) => a,
+        Err(e) => return err(format!("could not sign announcement: {e}")),
+    };
+    let addr = match content_address(&artifact.signed_payload) {
+        Ok(a) => a,
+        Err(e) => return err(format!("could not derive the announcement address: {e}")),
+    };
+    let content_address_bytes = addr.as_bytes().to_vec();
+    let slot = hex::encode(&content_address_bytes);
+    let post = wire::Post {
+        artifact: Some(artifact),
+        content_address: content_address_bytes,
+    };
+    let value = encode_operator_item(OPERATOR_ITEM_ANNOUNCEMENT, &post.encode_to_vec());
+    if let Err(e) = handle.publish_current_state(owner_seed, &slot, value).await {
+        return err(format!("could not publish announcement: {e}"));
+    }
+    if let Some(op) = shares.operator.as_mut() {
+        op.posts.insert(slot, post);
+    }
+    if let Some(op) = shares.operator.as_ref() {
+        let _ = evt_tx.send(public_space_snapshot_event(op));
+    }
+}
+
+/// Try inbound bytes as an operator announce-record item (A-c). Returns `true` only
+/// when the bytes were a VERIFIED operator item (folded into `OperatorSpace` + a fresh
+/// [`NetEvent::PublicSpaceSnapshot`] pushed) — so the caller stops interpreting them.
+/// Returns `false` when they are not an operator item, or fail to decode/verify
+/// (dropped; the caller logs them as unrecognized).
+///
+/// A0 verification: an empty [`Whitelist`] authorizes the F17 project-release key the
+/// item is signed with, so no signer-whitelist distribution is needed. A MOTD uses
+/// [`verify_served_motd`]; an announcement uses [`verify_served_post`] (signature AND
+/// content-address). This runs AFTER the circle / lobby-chat / presence / discovery
+/// attempts, so a legitimate blob of those kinds has already been consumed — the tag +
+/// prost-decode + verify is a tight filter a foreign/unknown blob fails.
+fn apply_operator_item(
+    shares: &mut ShareState,
+    evt_tx: &UnboundedSender<NetEvent>,
+    bytes: &[u8],
+) -> bool {
+    // Only fold when the operator record is subscribed (else these bytes aren't ours).
+    if shares.operator.is_none() {
+        return false;
+    }
+    let Some((kind, payload)) = decode_operator_item(bytes) else {
+        return false;
+    };
+    // A0: an empty whitelist authorizes the F17 project-release signer.
+    let whitelist = Whitelist::default();
+    match kind {
+        OPERATOR_ITEM_MOTD => {
+            let Ok(artifact) = wire::SignedArtifact::decode(payload) else {
+                return false;
+            };
+            if verify_served_motd(&artifact, &whitelist).is_err() {
+                return false; // not F17-authorized / bad signature → dropped
+            }
+            if let Some(op) = shares.operator.as_mut() {
+                op.motd = Some(artifact);
+            }
+        }
+        OPERATOR_ITEM_ANNOUNCEMENT => {
+            let Ok(post) = wire::Post::decode(payload) else {
+                return false;
+            };
+            if verify_served_post(&post, &whitelist).is_err() {
+                return false; // bad signature / content-address mismatch → dropped
+            }
+            let slot = hex::encode(&post.content_address);
+            if let Some(op) = shares.operator.as_mut() {
+                op.posts.insert(slot, post);
+            }
+        }
+        _ => return false, // unknown tag → not an operator item
+    }
+    if let Some(op) = shares.operator.as_ref() {
+        let _ = evt_tx.send(public_space_snapshot_event(op));
+    }
+    true
 }
 
 // ── Public shares (Phase 3 Slice 2b) ────────────────────────────────────────
@@ -1487,6 +1809,11 @@ fn handle_inbound(
     if apply_discovery(shares, evt_tx, &bytes) {
         return;
     }
+    // Not a discovery item — try it as an operator announce/MOTD record item (A-c). A
+    // verified item folds into OperatorSpace and pushes a fresh PublicSpaceSnapshot.
+    if apply_operator_item(shares, evt_tx, &bytes) {
+        return;
+    }
     daemonseed_veilid_net::vtrace!(
         "gui inbound: {} bytes opened under no joined circle / lobby",
         bytes.len()
@@ -1825,17 +2152,17 @@ mod tests {
         }
     }
 
+    /// A-c: `RefreshPublicSpace` with no operator record subscribed (not connected)
+    /// reports a clean `PublicSpaceError` rather than panicking or silently dropping.
     #[tokio::test]
-    async fn phase4_surfaces_are_still_honestly_unimplemented() {
+    async fn refresh_public_space_without_a_connection_reports_a_clean_error() {
         let mut net: Option<VeilidNetHandle> = None;
         let mut ev_rx: Option<UnboundedReceiver<VeilidNetEvent>> = None;
         let mut circles: Vec<VeilidCircle> = Vec::new();
         let mut my_handle = "guest".to_owned();
-        let mut shares = ShareState::new();
+        let mut shares = ShareState::new(); // operator = None
         let (evt_tx, mut evt_rx) = unbounded_channel();
 
-        // RefreshPublicSpace is still a Phase-4 surface (lobby chat, below, is now
-        // wired — so it no longer exercises this honest-error path).
         handle_command(
             NetCommand::RefreshPublicSpace,
             &evt_tx,
@@ -1849,8 +2176,163 @@ mod tests {
 
         assert!(matches!(
             evt_rx.try_recv(),
-            Ok(NetEvent::Error { reason }) if reason == "not yet on Veilid"
+            Ok(NetEvent::PublicSpaceError { message }) if message.contains("not connected")
         ));
+    }
+
+    /// A-c: `SetMotd` dispatched with no operator record subscribed (not connected)
+    /// reports a clean `PublicSpaceError` — guards the command dispatch + the
+    /// not-subscribed guard so a click before subscribe can never `unwrap`-panic the
+    /// actor task (which would tear down all Veilid connectivity).
+    #[tokio::test]
+    async fn set_motd_without_a_connection_reports_a_clean_error() {
+        let mut net: Option<VeilidNetHandle> = None;
+        let mut ev_rx: Option<UnboundedReceiver<VeilidNetEvent>> = None;
+        let mut circles: Vec<VeilidCircle> = Vec::new();
+        let mut my_handle = "guest".to_owned();
+        let mut shares = ShareState::new();
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        handle_command(
+            NetCommand::SetMotd {
+                text: "hello".to_owned(),
+            },
+            &evt_tx,
+            &mut net,
+            &mut ev_rx,
+            &mut circles,
+            &mut my_handle,
+            &mut shares,
+        )
+        .await;
+        assert!(matches!(
+            evt_rx.try_recv(),
+            Ok(NetEvent::PublicSpaceError { message }) if message.contains("not connected")
+        ));
+    }
+
+    /// A-c: `UploadAnnouncement` dispatched with no operator record subscribed reports
+    /// a clean `PublicSpaceError` rather than panicking.
+    #[tokio::test]
+    async fn upload_announcement_without_a_connection_reports_a_clean_error() {
+        let mut net: Option<VeilidNetHandle> = None;
+        let mut ev_rx: Option<UnboundedReceiver<VeilidNetEvent>> = None;
+        let mut circles: Vec<VeilidCircle> = Vec::new();
+        let mut my_handle = "guest".to_owned();
+        let mut shares = ShareState::new();
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        handle_command(
+            NetCommand::UploadAnnouncement {
+                topic: "t".to_owned(),
+                body: "b".to_owned(),
+            },
+            &evt_tx,
+            &mut net,
+            &mut ev_rx,
+            &mut circles,
+            &mut my_handle,
+            &mut shares,
+        )
+        .await;
+        assert!(matches!(
+            evt_rx.try_recv(),
+            Ok(NetEvent::PublicSpaceError { message }) if message.contains("not connected")
+        ));
+    }
+
+    // ── Operator announcements / MOTD (Phase 4 A-c) ──────────────────────
+
+    fn operator_space() -> OperatorSpace {
+        OperatorSpace {
+            announce_owner_seed: [0u8; 32],
+            motd: None,
+            posts: BTreeMap::new(),
+        }
+    }
+
+    /// The operator-item envelope round-trips through the 1-byte KIND tag, and a
+    /// buffer with no tag byte is rejected (not an operator item).
+    #[test]
+    fn operator_item_envelope_round_trips_and_rejects_empty() {
+        let payload: &[u8] = b"prost-bytes-here";
+        let framed = encode_operator_item(OPERATOR_ITEM_ANNOUNCEMENT, payload);
+        assert_eq!(
+            decode_operator_item(&framed),
+            Some((OPERATOR_ITEM_ANNOUNCEMENT, payload))
+        );
+        // A zero-length payload still carries its tag byte.
+        let motd = encode_operator_item(OPERATOR_ITEM_MOTD, b"");
+        assert_eq!(
+            decode_operator_item(&motd),
+            Some((OPERATOR_ITEM_MOTD, b"".as_slice()))
+        );
+        // An empty buffer has no tag byte → not an operator item.
+        assert_eq!(decode_operator_item(&[]), None);
+    }
+
+    /// A verified F17-signed MOTD folds into `OperatorSpace` and pushes a
+    /// `PublicSpaceSnapshot`; an EMPTY whitelist authorizes the F17 signer (A0), so no
+    /// whitelist distribution is needed, and `can_compose` is the dev possession gate.
+    #[test]
+    fn apply_operator_item_folds_a_verified_f17_motd() {
+        let _ = oxicrypt_module::initialize();
+        let kp = dev_project_release_keypair().unwrap();
+        let artifact = sign_motd(&kp, "Welcome to daemonseed", 100).unwrap();
+        let bytes = encode_operator_item(OPERATOR_ITEM_MOTD, &artifact.encode_to_vec());
+
+        let mut shares = ShareState::new();
+        shares.operator = Some(operator_space());
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        assert!(apply_operator_item(&mut shares, &evt_tx, &bytes));
+        assert!(shares.operator.as_ref().unwrap().motd.is_some());
+        match evt_rx.try_recv() {
+            Ok(NetEvent::PublicSpaceSnapshot {
+                view,
+                can_compose,
+                connect_time,
+            }) => {
+                assert_eq!(view.motd.as_deref(), Some("Welcome to daemonseed"));
+                assert!(can_compose, "dev-possession gate is open");
+                assert!(
+                    !connect_time,
+                    "an inbound fold is never the connect-time land"
+                );
+            }
+            other => panic!("expected a PublicSpaceSnapshot, got {other:?}"),
+        }
+    }
+
+    /// A verified F17-signed announcement folds in, keyed by its content-address slot,
+    /// and appears in the projected view's posts.
+    #[test]
+    fn apply_operator_item_folds_a_verified_f17_announcement() {
+        let _ = oxicrypt_module::initialize();
+        let kp = dev_project_release_keypair().unwrap();
+        let artifact = sign_post(&kp, "release", "v0.33.0 is out", 200).unwrap();
+        let addr = content_address(&artifact.signed_payload).unwrap();
+        let post = wire::Post {
+            artifact: Some(artifact),
+            content_address: addr.as_bytes().to_vec(),
+        };
+        let bytes = encode_operator_item(OPERATOR_ITEM_ANNOUNCEMENT, &post.encode_to_vec());
+
+        let mut shares = ShareState::new();
+        shares.operator = Some(operator_space());
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        assert!(apply_operator_item(&mut shares, &evt_tx, &bytes));
+        assert_eq!(shares.operator.as_ref().unwrap().posts.len(), 1);
+        assert!(matches!(
+            evt_rx.try_recv(),
+            Ok(NetEvent::PublicSpaceSnapshot { view, .. }) if view.posts.len() == 1
+        ));
+    }
+
+    /// Bytes arriving with no operator record subscribed are not consumed (they fall
+    /// through to the caller's other interpretations / the unrecognized trace).
+    #[test]
+    fn apply_operator_item_ignores_bytes_when_operator_unsubscribed() {
+        let mut shares = ShareState::new(); // operator = None
+        let (evt_tx, _rx) = unbounded_channel();
+        assert!(!apply_operator_item(&mut shares, &evt_tx, b"\x00garbage"));
     }
 
     /// A verified inbound lobby chat message (sealed under the public room key by a

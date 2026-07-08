@@ -33,7 +33,7 @@ use oxicrypt_sha::sha384;
 use zeroize::Zeroize;
 
 use crate::handle::{Handle, HandleParseError};
-use crate::identity::keys::{SignKeypair, verify_signature};
+use crate::identity::keys::{KeyDerivationError, SignKeypair, verify_signature};
 use crate::kdf::info;
 
 /// Length of a SHA-384 content address, in bytes.
@@ -194,6 +194,14 @@ pub fn project_release_pubkey() -> &'static [u8; ml_dsa::PK_LEN] {
             .expect("oxicrypt module operational for project-release key derivation");
         Box::new(*kp.public_key())
     })
+}
+
+/// The **development** project-release SIGNING keypair (F17), from the in-source
+/// [`PROJECT_RELEASE_SEED`] — the dev analog of [`project_release_pubkey`], exposing
+/// the key the dev composer signs MOTD/announcements with. Dev-only: retired when the
+/// seed becomes a baked-in pubkey with an offline secret. See ISA A0/A1.
+pub fn dev_project_release_keypair() -> Result<SignKeypair, KeyDerivationError> {
+    SignKeypair::from_ml_dsa_seed(&PROJECT_RELEASE_SEED)
 }
 
 /// Length of the project-announce Veilid rendezvous-owner seed — 32 bytes (a VLD0
@@ -662,6 +670,16 @@ mod tests {
 
         let stranger = keypair(9);
         assert!(!wl.authorizes(stranger.public_key()).unwrap());
+    }
+
+    /// The dev project-release SIGNING keypair yields exactly the F17 pubkey the
+    /// verify path is gated on — so a MOTD/announcement the dev composer signs with
+    /// it authorizes against an empty whitelist (F17 always-authorized).
+    #[test]
+    fn dev_project_release_keypair_matches_project_release_pubkey() {
+        ensure_module();
+        let kp = dev_project_release_keypair().unwrap();
+        assert_eq!(kp.public_key(), project_release_pubkey());
     }
 
     // ── verify_artifact (ISC-A-S3 / ISC-7 / ISC-17) ──────────────────────

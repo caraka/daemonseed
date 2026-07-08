@@ -5308,6 +5308,23 @@ functions:
       type: "&'static [u8; PK_LEN]"
       description: The always-authorized project-release public key.
 
+  - name: dev_project_release_keypair
+    module: daemonseed_core::public_space
+    description: >-
+      The development F17 project-release SIGNING keypair, from the in-source
+      PROJECT_RELEASE_SEED — the dev analog of project_release_pubkey, exposing the key
+      the dev announce composer signs MOTD/announcements with (verified against the
+      always-authorized project_release_pubkey, so no signer whitelist is needed).
+      Dev-only: retired when the seed becomes a baked-in pubkey with an offline secret.
+    signature: "pub fn dev_project_release_keypair() -> Result<SignKeypair, KeyDerivationError>"
+    parameters: []
+    returns:
+      type: "Result<SignKeypair, KeyDerivationError>"
+      description: The dev F17 signing keypair.
+      error_variants:
+        - name: KeyDerivationError
+          condition: ML-DSA key derivation from the seed failed.
+
   - name: derive_project_announce_veilid_owner_seed
     module: daemonseed_core::public_space
     description: >-
