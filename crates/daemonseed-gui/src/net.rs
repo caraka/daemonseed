@@ -3159,7 +3159,7 @@ fn member_fingerprint(pubkey: &[u8]) -> String {
 /// relay should never fan a sender's own beacon back, but this filters it
 /// defensively at ingest, for the lobby and every circle alike. Extracted so the
 /// per-room self-filter is unit-testable independently of the actor.
-fn beacon_is_own(own_pubkey: &[u8], beacon_pubkey: &[u8]) -> bool {
+pub(crate) fn beacon_is_own(own_pubkey: &[u8], beacon_pubkey: &[u8]) -> bool {
     own_pubkey == beacon_pubkey
 }
 
@@ -3168,7 +3168,7 @@ fn beacon_is_own(own_pubkey: &[u8], beacon_pubkey: &[u8]) -> bool {
 /// handle (a same-handle refresh is invisible to the UI); an unchanged apply never
 /// does. Shared by the lobby and per-circle ingest so both push a fresh roster on
 /// exactly the same condition.
-fn roster_render_changed(
+pub(crate) fn roster_render_changed(
     change: PresenceChange,
     prior_handle: Option<&str>,
     new_handle: &str,
@@ -3185,7 +3185,7 @@ fn roster_render_changed(
 /// and binds each row's `fingerprint` to the verified pubkey via
 /// [`member_fingerprint`]. Keying lives in the tracker (by pubkey), so two members
 /// sharing a display name yield two distinct rows here.
-fn roster_from_members(members: &[LiveMember]) -> Vec<RosterEntry> {
+pub(crate) fn roster_from_members(members: &[LiveMember]) -> Vec<RosterEntry> {
     members
         .iter()
         .map(|m| RosterEntry {

@@ -140,6 +140,22 @@ pub fn circle_veilid_owner(family: &str) -> String {
     CIRCLE_VEILID_OWNER_TEMPLATE.replace("{family}", family)
 }
 
+/// HKDF info-string template for a circle's **presence** Veilid rendezvous-owner
+/// seed (Phase 4). A sibling of [`CIRCLE_VEILID_OWNER_TEMPLATE`] under a distinct
+/// label, so a circle's presence beacons ride their OWN DHT record — never the
+/// chat record's 2-slot append-ring (P1: presence is current-state, chat is
+/// event-history; sharing one record would let a ~15 s beacon evict chat
+/// backlog). Family-anchored like its siblings; content NEVER derives from this —
+/// it binds only the presence rendezvous address.
+const CIRCLE_PRESENCE_VEILID_OWNER_TEMPLATE: &str =
+    "daemonseed/veilid/circle-presence-owner/{family}";
+
+/// Build the circle presence Veilid rendezvous-owner HKDF info string for a
+/// crypto-family token.
+pub fn circle_presence_veilid_owner(family: &str) -> String {
+    CIRCLE_PRESENCE_VEILID_OWNER_TEMPLATE.replace("{family}", family)
+}
+
 // ── Public rooms (ISC-S4 / ISC-S22) ─────────────────────────────────────────
 
 /// HKDF salt for the **global shared** public-room key (ISC-S22). A fixed
@@ -183,6 +199,25 @@ const PUBLIC_ROOM_VEILID_OWNER_TEMPLATE: &str = "daemonseed/veilid/room-owner/{f
 /// crypto-family token and a public room name.
 pub fn public_room_veilid_owner(family: &str, room: &str) -> String {
     PUBLIC_ROOM_VEILID_OWNER_TEMPLATE
+        .replace("{family}", family)
+        .replace("{room}", room)
+}
+
+/// HKDF info-string template for a public room's **presence** Veilid
+/// rendezvous-owner seed (Phase 4). A sibling of
+/// [`PUBLIC_ROOM_VEILID_OWNER_TEMPLATE`] under a distinct label, so lobby/room
+/// presence beacons ride their OWN world-derivable DHT record, separate from the
+/// room's chat rendezvous (P1: presence is current-state, chat is event-history).
+/// Family- and room-anchored like its sibling; the inputs are public, so every
+/// participant derives the same presence rendezvous. Content NEVER derives from
+/// this — it binds only the presence rendezvous address.
+const PUBLIC_ROOM_PRESENCE_VEILID_OWNER_TEMPLATE: &str =
+    "daemonseed/veilid/room-presence-owner/{family}/{room}";
+
+/// Build the public-room presence Veilid rendezvous-owner HKDF info string for a
+/// crypto-family token and a public room name.
+pub fn public_room_presence_veilid_owner(family: &str, room: &str) -> String {
+    PUBLIC_ROOM_PRESENCE_VEILID_OWNER_TEMPLATE
         .replace("{family}", family)
         .replace("{room}", room)
 }
@@ -275,6 +310,38 @@ mod tests {
         assert_ne!(
             public_room_veilid_owner("hkdf-sha384", "lobby"),
             circle_veilid_owner("hkdf-sha384")
+        );
+    }
+
+    /// **Spec contract (Phase 4 presence)** — the presence rendezvous-owner info
+    /// strings are protocol-visible: every participant derives the same presence
+    /// record only if these bytes match. Each presence label is distinct from its
+    /// chat-record sibling (so presence beacons ride their OWN record, P1) and
+    /// from the other tier's presence label (so a public room and a like-named
+    /// circle never share a presence rendezvous owner).
+    #[test]
+    fn presence_veilid_owner_info_strings_are_pinned() {
+        assert_eq!(
+            circle_presence_veilid_owner("hkdf-sha384"),
+            "daemonseed/veilid/circle-presence-owner/hkdf-sha384"
+        );
+        assert_eq!(
+            public_room_presence_veilid_owner("hkdf-sha384", "lobby"),
+            "daemonseed/veilid/room-presence-owner/hkdf-sha384/lobby"
+        );
+        // Presence label ≠ its chat-record sibling (separate records, P1).
+        assert_ne!(
+            circle_presence_veilid_owner("hkdf-sha384"),
+            circle_veilid_owner("hkdf-sha384")
+        );
+        assert_ne!(
+            public_room_presence_veilid_owner("hkdf-sha384", "lobby"),
+            public_room_veilid_owner("hkdf-sha384", "lobby")
+        );
+        // Public-room presence ≠ circle presence (tiers stay disjoint).
+        assert_ne!(
+            public_room_presence_veilid_owner("hkdf-sha384", "lobby"),
+            circle_presence_veilid_owner("hkdf-sha384")
         );
     }
 }

@@ -49,9 +49,13 @@
 //! redirect the fetch (anti-swap). The GUI/TUI share-command wiring onto this
 //! surface is the remaining Phase-3 step.
 //!
-//! ## What is stubbed (Phase 4)
-//! Presence and announcements/MOTD return [`VeilidNetError::Unimplemented`];
-//! they become further parameterizations of the rendezvous engine.
+//! ## Phase 4
+//! Member presence is live: [`VeilidNetHandle::publish_presence`] writes a sealed
+//! `MemberHeartbeat` to a per-member current-state slot on the presence sibling
+//! rendezvous record (the app net actor holds the keys, seals/opens, and runs the
+//! emit/ingest/reap loop; this crate only moves opaque bytes). Announcements/MOTD
+//! still return [`VeilidNetError::Unimplemented`] — a further parameterization of
+//! the rendezvous engine (an operator-owned write-gate).
 //!
 //! ## Invariant
 //! Content keys NEVER derive from Veilid (classical x25519) material. The seal/

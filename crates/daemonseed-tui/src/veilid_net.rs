@@ -86,11 +86,15 @@ use daemonseed_core::circle::key::{CircleKey, derive_circle_veilid_owner_seed, d
 use daemonseed_core::circle::message::{open_message, seal_message};
 use daemonseed_core::cot::{AssetAddr, asset_address};
 use daemonseed_core::crypto::suite::CNSA_2_0;
+use daemonseed_core::heartbeat::{HeartbeatFields, open_heartbeat, seal_public_heartbeat};
 use daemonseed_core::identity::keys::{Identity, SignKeypair, derive_identity_keys};
 use daemonseed_core::identity::mnemonic::Mnemonic;
+use daemonseed_core::presence::{
+    HEARTBEAT_MISS_COUNT, PresenceTracker, beacon_is_fresh, next_heartbeat_interval,
+};
 use daemonseed_core::public_room::{
-    DEFAULT_ROOM, PublicRoomKey, derive_room_key, derive_room_veilid_owner_seed, open_room_message,
-    seal_room_message,
+    DEFAULT_ROOM, PublicRoomKey, derive_room_key, derive_room_presence_veilid_owner_seed,
+    derive_room_veilid_owner_seed, open_room_message, seal_room_message,
 };
 use daemonseed_core::share_announce::{
     AnnouncementFields, mint_share_id, open_announcement, seal_public_announcement,
@@ -147,6 +151,15 @@ struct VeilidCircle {
 struct LobbyRendezvous {
     room_key: PublicRoomKey,
     owner_seed: [u8; 32],
+    /// The **presence** sibling record's owner seed (P1: presence rides its OWN
+    /// world-derivable record, never the chat rendezvous). Publishes/subscribes
+    /// lobby member beacons.
+    presence_owner_seed: [u8; 32],
+    /// Receiver-side liveness view for the lobby (#74). Verified, fresh, non-own
+    /// beacons fold in via [`PresenceTracker::apply`]; the heartbeat timer reaps it.
+    /// Maintained for symmetry with the GUI + #77/roster; the TUI does not yet
+    /// render a roster (it applies/reaps like the relay TUI). Live-only.
+    presence: PresenceTracker,
 }
 
 /// A discovered share's anti-swap-verified route: the sharer's opaque Veilid
@@ -229,6 +242,12 @@ pub async fn veilid_net_actor(
     // unlikely.
     let mut my_handle: Option<String> = None;
     let mut prune_timer = tokio::time::interval(SHARE_CATALOG_PRUNE_INTERVAL);
+    // Presence emit + reap clock (#74): a jittered [15,20]s beacon into the lobby
+    // presence record (when joined) that also reaps the tracker each fire. A
+    // self-rescheduling `Sleep` (not a fixed `interval`) so each tick draws a fresh
+    // jittered deadline (ISC-A-S2 traffic shape).
+    let heartbeat = tokio::time::sleep(veilid_presence_interval());
+    tokio::pin!(heartbeat);
 
     loop {
         tokio::select! {
@@ -250,6 +269,14 @@ pub async fn veilid_net_actor(
                 if shares.catalog.prune(Instant::now()) > 0 {
                     emit_shares_snapshot(&shares, &evt_tx);
                 }
+            }
+            // Emit one lobby presence beacon + reap the tracker, then re-arm with a
+            // fresh jittered deadline.
+            () = heartbeat.as_mut() => {
+                emit_and_reap_lobby_presence(&net, &my_handle, &mut shares);
+                heartbeat
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + veilid_presence_interval());
             }
         }
     }
@@ -496,14 +523,27 @@ async fn subscribe_lobby(
             return;
         }
     };
+    // The PRESENCE sibling record (P1) — a distinct, world-derivable rendezvous so
+    // beacons never share the chat append-ring. Non-fatal on failure.
+    let presence_owner_seed = derive_room_presence_veilid_owner_seed(DEFAULT_ROOM, &CNSA_2_0)
+        .map(|s| *s.as_bytes())
+        .unwrap_or([0u8; 32]);
     if let Err(e) = handle.subscribe_room(owner_seed).await {
         daemonseed_veilid_net::vtrace!("tui lobby: subscribe failed: {e}");
         return;
     }
-    daemonseed_veilid_net::vtrace!("tui lobby: subscribed");
+    // Subscribe the presence record too so inbound beacons fold into the tracker.
+    // Non-fatal — chat is unaffected if it fails.
+    if let Err(e) = handle.subscribe_room(presence_owner_seed).await {
+        daemonseed_veilid_net::vtrace!("tui lobby: presence subscribe failed: {e}");
+    }
+    daemonseed_veilid_net::vtrace!("tui lobby: subscribed (chat + presence)");
     shares.lobby = Some(LobbyRendezvous {
         room_key,
         owner_seed,
+        presence_owner_seed,
+        // TTL = 20s × 3 = 60s, sized to the 15–20s emit band (P2 ~45–60s window).
+        presence: PresenceTracker::with_cadence(Duration::from_secs(20), HEARTBEAT_MISS_COUNT),
     });
     // The lobby rendezvous is live: tell the app the public room is joined so its
     // Lobby chat input is enabled (relay-path parity — the relay emits
@@ -1219,8 +1259,78 @@ fn handle_inbound(
         }
         return;
     }
-    // Not a chat message — try it as a lobby share-discovery item.
+    // Not a chat message — try it as a lobby member-presence heartbeat (#74). A
+    // beacon rides the SEPARATE presence record but arrives as the same Inbound
+    // (no record tag); the distinct heartbeat AAD means only a real beacon opens.
+    // Fold a verified, fresh, non-own beacon into the tracker (no roster render in
+    // the TUI — it maintains the tracker like the relay TUI). Read our own pubkey
+    // before the `&mut lobby` borrow to avoid aliasing `shares`.
+    let own_pubkey = shares.signing.as_ref().map(|s| s.public_key().to_vec());
+    if let Some(lobby) = shares.lobby.as_mut()
+        && let Ok(hb) = open_heartbeat(&lobby.room_key, &bytes)
+    {
+        let is_own = own_pubkey
+            .as_deref()
+            .is_some_and(|pk| pk == hb.sender_pubkey.as_slice());
+        // #78 replay-freshness drops a captured/replayed or future-dated beacon.
+        if !is_own && beacon_is_fresh(hb.sent_unix_ms, now_unix_ms()) {
+            let _ = lobby.presence.apply(&hb, Instant::now());
+        }
+        return;
+    }
+    // Not a heartbeat — try it as a lobby share-discovery item.
     let _ = apply_discovery(shares, evt_tx, &bytes);
+}
+
+/// The jittered lobby presence-beacon interval — [15, 20]s (P2), at/above the
+/// ~14.7s cross-node DHT watch floor so beaconing never outruns propagation.
+/// Reuses the core [10, 15]s jittered draw plus a 5s floor (shared CSPRNG jitter →
+/// de-sync + no fixed period, ISC-A-S2). A felt-test tunable.
+fn veilid_presence_interval() -> Duration {
+    next_heartbeat_interval() + Duration::from_secs(5)
+}
+
+/// Emit one sealed lobby presence beacon (#74) to the presence record, then reap
+/// the lobby tracker (the timer is the reap clock). A missing identity/lobby, a
+/// seal failure, or a closed transport is non-fatal — presence self-heals on the
+/// next tick. Lobby-only; circle presence is #77. The TUI does not push a roster
+/// event (it has none — it applies/reaps like the relay TUI); emitting is what
+/// makes this node visible on other clients' rosters.
+///
+/// The DHT publish is **spawned off the actor loop** (like `send_chat`, the #128
+/// D-0b pattern): awaiting the write's ack inline in the select arm would stall the
+/// loop for seconds every ~15–20 s. The reap is a fast in-memory op and stays inline.
+fn emit_and_reap_lobby_presence(
+    net: &Option<VeilidNetHandle>,
+    my_handle: &Option<String>,
+    shares: &mut ShareState,
+) {
+    if let (Some(handle), Some(signing)) = (net.as_ref(), shares.signing.clone())
+        && let Some(lobby) = shares.lobby.as_ref()
+    {
+        let own_share_ids: Vec<String> = shares.own.iter().map(|s| s.share_id.clone()).collect();
+        let fields = HeartbeatFields {
+            room: DEFAULT_ROOM,
+            // Advisory handle; the pubkey is authoritative. `guest` until the first
+            // send learns a real `name#hash` (the TUI carries the handle per-message).
+            sender_handle: my_handle.as_deref().unwrap_or("guest"),
+            sent_unix_ms: now_unix_ms(),
+            live_share_ids: &own_share_ids,
+        };
+        if let Ok(sealed) = seal_public_heartbeat(&lobby.room_key, &signing, &fields) {
+            let handle = handle.clone();
+            let seed = lobby.presence_owner_seed;
+            let pubkey = signing.public_key().to_vec();
+            tokio::spawn(async move {
+                if let Err(e) = handle.publish_presence(seed, &pubkey, sealed).await {
+                    daemonseed_veilid_net::vtrace!("tui presence: beacon emit failed: {e}");
+                }
+            });
+        }
+    }
+    if let Some(lobby) = shares.lobby.as_mut() {
+        let _ = lobby.presence.reap(Instant::now());
+    }
 }
 
 /// Try inbound bytes as a lobby `DiscoveryEnvelope` (share discovery). Returns
@@ -1454,6 +1564,10 @@ mod tests {
             owner_seed: *derive_room_veilid_owner_seed(DEFAULT_ROOM, &CNSA_2_0)
                 .unwrap()
                 .as_bytes(),
+            presence_owner_seed: *derive_room_presence_veilid_owner_seed(DEFAULT_ROOM, &CNSA_2_0)
+                .unwrap()
+                .as_bytes(),
+            presence: PresenceTracker::with_cadence(Duration::from_secs(20), HEARTBEAT_MISS_COUNT),
         }
     }
 

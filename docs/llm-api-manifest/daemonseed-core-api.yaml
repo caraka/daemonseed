@@ -5169,6 +5169,85 @@ functions:
       type: "&[u8; ROOM_VEILID_OWNER_SEED_LEN]"
       description: A borrow of the raw 32-byte rendezvous-owner seed.
 
+  - name: derive_room_presence_veilid_owner_seed
+    module: daemonseed_core::public_room
+    description: >-
+      Derive a public room's PRESENCE Veilid rendezvous-owner seed — a second,
+      distinct sibling of derive_room_key under info
+      "daemonseed/veilid/room-presence-owner/<family>/<room>", disjoint from both
+      the room key and the chat rendezvous owner (derive_room_veilid_owner_seed).
+      Presence beacons ride this OWN world-derivable record so a heartbeat can
+      never evict the room chat append-ring (P1).
+    signature: "pub fn derive_room_presence_veilid_owner_seed(room: &str, suite: &Suite) -> Result<RoomPresenceVeilidOwnerSeed, RoomKeyError>"
+    parameters:
+      - name: room
+        type: "&str"
+        direction: in
+        description: The public room name (the sole per-room distinguisher).
+      - name: suite
+        type: "&Suite"
+        direction: in
+        description: The suite whose family anchors the derivation.
+    returns:
+      type: "Result<RoomPresenceVeilidOwnerSeed, RoomKeyError>"
+      description: The derived 32-byte VLD0 presence rendezvous-owner seed.
+      error_variants:
+        - name: Hkdf
+          condition: HKDF derivation failed.
+    preconditions:
+      - description: The oxicrypt module must be operational.
+
+  - name: RoomPresenceVeilidOwnerSeed::as_bytes
+    module: daemonseed_core::public_room
+    description: >-
+      Borrow the raw 32-byte presence seed to build a VLD0 keypair; callers must
+      not copy into a non-zeroizing buffer.
+    signature: "pub fn as_bytes(&self) -> &[u8; ROOM_VEILID_OWNER_SEED_LEN]"
+    parameters: []
+    returns:
+      type: "&[u8; ROOM_VEILID_OWNER_SEED_LEN]"
+      description: A borrow of the raw 32-byte presence rendezvous-owner seed.
+
+  - name: derive_circle_presence_veilid_owner_seed
+    module: daemonseed_core::circle::key
+    description: >-
+      Derive a circle's PRESENCE Veilid rendezvous-owner seed from shared entropy
+      — a second, distinct sibling of derive_cot_key under info
+      "daemonseed/veilid/circle-presence-owner/<family>", disjoint from both the
+      content cot_key and the chat rendezvous owner (derive_circle_veilid_owner_seed).
+      Canonicalized (ISC-C9) like its siblings, so every member agreeing on the
+      phrase derives the byte-identical presence owner. Presence beacons ride this
+      OWN record so a heartbeat can never evict the circle chat append-ring (P1).
+    signature: "pub fn derive_circle_presence_veilid_owner_seed(entropy: &str, suite: &Suite) -> Result<CirclePresenceVeilidOwnerSeed, CircleKeyError>"
+    parameters:
+      - name: entropy
+        type: "&str"
+        direction: in
+        description: The shared circle entropy (canonicalized internally, ISC-C9).
+      - name: suite
+        type: "&Suite"
+        direction: in
+        description: The suite whose family anchors the derivation.
+    returns:
+      type: "Result<CirclePresenceVeilidOwnerSeed, CircleKeyError>"
+      description: The derived 32-byte VLD0 presence rendezvous-owner seed.
+      error_variants:
+        - name: Hkdf
+          condition: HKDF derivation failed.
+    preconditions:
+      - description: The oxicrypt module must be operational.
+
+  - name: CirclePresenceVeilidOwnerSeed::as_bytes
+    module: daemonseed_core::circle::key
+    description: >-
+      Borrow the raw 32-byte presence seed to build a VLD0 keypair; callers must
+      not copy into a non-zeroizing buffer.
+    signature: "pub fn as_bytes(&self) -> &[u8; CIRCLE_VEILID_OWNER_SEED_LEN]"
+    parameters: []
+    returns:
+      type: "&[u8; CIRCLE_VEILID_OWNER_SEED_LEN]"
+      description: A borrow of the raw 32-byte presence rendezvous-owner seed.
+
   - name: circle_fingerprint
     module: daemonseed_core::circle::key
     description: >-

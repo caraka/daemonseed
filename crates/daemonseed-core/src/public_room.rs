@@ -200,6 +200,55 @@ pub fn derive_room_veilid_owner_seed(
     Ok(RoomVeilidOwnerSeed(boxed))
 }
 
+/// A public room's **presence** Veilid rendezvous-owner seed (Phase 4) — a
+/// second, distinct sibling of [`derive_room_key`], separate from the chat
+/// rendezvous owner ([`RoomVeilidOwnerSeed`]). Presence beacons ride their OWN
+/// world-derivable DHT record so a ~15 s heartbeat can never evict the room
+/// chat's 2-slot append-ring (P1). Same shape/hygiene as its sibling: 32-byte
+/// VLD0 seed, zeroes on drop, redacted `Debug`. Content NEVER derives from this.
+#[derive(zeroize::ZeroizeOnDrop)]
+pub struct RoomPresenceVeilidOwnerSeed(Box<[u8; ROOM_VEILID_OWNER_SEED_LEN]>);
+
+impl RoomPresenceVeilidOwnerSeed {
+    /// Borrow the raw seed bytes to build a VLD0 keypair. Callers must not copy
+    /// these into a non-zeroizing buffer.
+    pub fn as_bytes(&self) -> &[u8; ROOM_VEILID_OWNER_SEED_LEN] {
+        &self.0
+    }
+}
+
+impl core::fmt::Debug for RoomPresenceVeilidOwnerSeed {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("RoomPresenceVeilidOwnerSeed(<redacted>)")
+    }
+}
+
+/// Derive a public room's **presence** Veilid rendezvous-owner seed from its
+/// public inputs — a sibling of [`derive_room_key`] under a distinct
+/// (`info::public_room_presence_veilid_owner`) label, so presence rides its own
+/// DHT record, disjoint from both the room key and the chat rendezvous owner
+/// ([`derive_room_veilid_owner_seed`]). World-derivable (public inputs), so every
+/// participant computes the same presence rendezvous. Family-anchored like its
+/// siblings; content never derives from this.
+pub fn derive_room_presence_veilid_owner_seed(
+    room: &str,
+    suite: &Suite,
+) -> Result<RoomPresenceVeilidOwnerSeed, RoomKeyError> {
+    let family = suite.family_token();
+    let extract = HkdfSha384::extract(Some(info::PUBLIC_ROOM_KEY_SALT), family.as_bytes())
+        .map_err(RoomKeyError::Hkdf)?;
+    let info_str = info::public_room_presence_veilid_owner(family, room);
+
+    let mut seed = [0u8; ROOM_VEILID_OWNER_SEED_LEN];
+    if let Err(e) = extract.expand(info_str.as_bytes(), &mut seed) {
+        seed.zeroize();
+        return Err(RoomKeyError::Hkdf(e));
+    }
+    let boxed = Box::new(seed);
+    seed.zeroize();
+    Ok(RoomPresenceVeilidOwnerSeed(boxed))
+}
+
 /// Derive a public room's rendezvous address on a given relay (ISC-S23):
 /// `SHA-384(room_key ‖ server_id)` — byte-identical in shape to a circle's
 /// [`crate::cot::asset_address`], so a public room rides the SAME
@@ -622,6 +671,45 @@ mod tests {
             owner.as_bytes(),
             circle_owner.as_bytes(),
             "public-room and circle rendezvous-owner domains must be disjoint"
+        );
+    }
+
+    /// Phase 4 presence — the room presence rendezvous-owner seed is deterministic
+    /// from PUBLIC inputs (every participant derives the same presence record) and
+    /// per-room (two rooms never share a presence rendezvous).
+    #[test]
+    fn room_presence_owner_seed_is_deterministic_and_per_room() {
+        let _ = oxicrypt_module::initialize();
+        let a = derive_room_presence_veilid_owner_seed(DEFAULT_ROOM, &CNSA_2_0).unwrap();
+        let b = derive_room_presence_veilid_owner_seed(DEFAULT_ROOM, &CNSA_2_0).unwrap();
+        assert_eq!(a.as_bytes(), b.as_bytes());
+        let news = derive_room_presence_veilid_owner_seed("announcements", &CNSA_2_0).unwrap();
+        assert_ne!(a.as_bytes(), news.as_bytes());
+    }
+
+    /// P1 domain separation — the room presence rendezvous owner is a THIRD,
+    /// distinct sibling: it equals neither the room key, nor the chat rendezvous
+    /// owner, nor a like-named circle's presence owner. Presence beacons therefore
+    /// ride their own record (never the chat append-ring), and the two tiers stay
+    /// disjoint.
+    #[test]
+    fn room_presence_owner_disjoint_from_all_siblings() {
+        use crate::circle::key::derive_circle_presence_veilid_owner_seed;
+        let _ = oxicrypt_module::initialize();
+        let presence = derive_room_presence_veilid_owner_seed("lobby", &CNSA_2_0).unwrap();
+        let room_key = derive_room_key("lobby", &CNSA_2_0).unwrap();
+        let chat_owner = derive_room_veilid_owner_seed("lobby", &CNSA_2_0).unwrap();
+        assert_ne!(presence.as_bytes(), room_key.as_bytes());
+        assert_ne!(
+            presence.as_bytes(),
+            chat_owner.as_bytes(),
+            "presence must ride its own record, not the chat rendezvous"
+        );
+        let circle_presence = derive_circle_presence_veilid_owner_seed("lobby", &CNSA_2_0).unwrap();
+        assert_ne!(
+            presence.as_bytes(),
+            circle_presence.as_bytes(),
+            "public-room and circle presence-owner domains must be disjoint"
         );
     }
 }

@@ -214,6 +214,58 @@ pub fn derive_circle_veilid_owner_seed(
     Ok(CircleVeilidOwnerSeed(boxed))
 }
 
+/// A circle's **presence** Veilid rendezvous-owner seed (Phase 4) — a second,
+/// distinct sibling of [`derive_cot_key`], separate from the chat rendezvous
+/// owner ([`CircleVeilidOwnerSeed`]). Presence beacons ride their OWN DHT record
+/// so a ~15 s heartbeat can never evict the circle chat's 2-slot append-ring
+/// (P1). Same shape/hygiene as its sibling: 32-byte VLD0 seed, zeroes on drop,
+/// redacted `Debug`. Content NEVER derives from this.
+#[derive(zeroize::ZeroizeOnDrop)]
+pub struct CirclePresenceVeilidOwnerSeed(Box<[u8; CIRCLE_VEILID_OWNER_SEED_LEN]>);
+
+impl CirclePresenceVeilidOwnerSeed {
+    /// Borrow the raw seed bytes to build a VLD0 keypair. Callers must not copy
+    /// these into a non-zeroizing buffer.
+    pub fn as_bytes(&self) -> &[u8; CIRCLE_VEILID_OWNER_SEED_LEN] {
+        &self.0
+    }
+}
+
+impl core::fmt::Debug for CirclePresenceVeilidOwnerSeed {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("CirclePresenceVeilidOwnerSeed(<redacted>)")
+    }
+}
+
+/// Derive a circle's **presence** Veilid rendezvous-owner seed from shared
+/// entropy — a sibling of [`derive_cot_key`] under a distinct
+/// (`info::circle_presence_veilid_owner`) label, so presence rides its own DHT
+/// record, disjoint from both the content `cot_key` and the chat rendezvous owner
+/// ([`derive_circle_veilid_owner_seed`]). `entropy` is canonicalized identically
+/// (ISC-C9), so every member who agrees on the phrase derives the byte-identical
+/// presence owner. Family-anchored like its siblings; content never derives from
+/// this.
+pub fn derive_circle_presence_veilid_owner_seed(
+    entropy: &str,
+    suite: &Suite,
+) -> Result<CirclePresenceVeilidOwnerSeed, CircleKeyError> {
+    let mut canonical = circle_canonicalize::canonicalize(entropy);
+    let extract = HkdfSha384::extract(Some(info::CIRCLE_KEY_SALT), canonical.as_bytes());
+    canonical.zeroize();
+    let hkdf = extract.map_err(CircleKeyError::Hkdf)?;
+
+    let info_str = info::circle_presence_veilid_owner(suite.family_token());
+
+    let mut seed = [0u8; CIRCLE_VEILID_OWNER_SEED_LEN];
+    if let Err(e) = hkdf.expand(info_str.as_bytes(), &mut seed) {
+        seed.zeroize();
+        return Err(CircleKeyError::Hkdf(e));
+    }
+    let boxed = Box::new(seed);
+    seed.zeroize();
+    Ok(CirclePresenceVeilidOwnerSeed(boxed))
+}
+
 /// Length of the hex fingerprint body (excluding the leading `#`). 12 hex chars
 /// = 48 bits of the digest — enough for a human cross-check, short enough to
 /// read aloud.
@@ -383,5 +435,54 @@ mod tests {
         let _ = oxicrypt_module::initialize();
         let s = derive_circle_veilid_owner_seed("some entropy phrase here", &CNSA_2_0).unwrap();
         assert_eq!(format!("{s:?}"), "CircleVeilidOwnerSeed(<redacted>)");
+    }
+
+    /// Phase 4 presence — the circle presence rendezvous-owner seed is
+    /// deterministic and canonicalized (every member agreeing on the phrase
+    /// derives the byte-identical seed), so all members compute the same presence
+    /// rendezvous.
+    #[test]
+    fn presence_owner_seed_is_deterministic_and_canonical() {
+        let _ = oxicrypt_module::initialize();
+        let a = derive_circle_presence_veilid_owner_seed(EXAMPLE_ENTROPY, &CNSA_2_0).unwrap();
+        let b = derive_circle_presence_veilid_owner_seed(
+            "  correct   horse battery staple  ",
+            &CNSA_2_0,
+        )
+        .unwrap();
+        assert_eq!(a.as_bytes(), b.as_bytes());
+        let other = derive_circle_presence_veilid_owner_seed("phrase bravo", &CNSA_2_0).unwrap();
+        assert_ne!(a.as_bytes(), other.as_bytes());
+    }
+
+    /// P1 domain separation — the circle presence rendezvous owner is a THIRD,
+    /// distinct sibling: it equals neither the content `cot_key` nor the chat
+    /// rendezvous owner, so presence beacons ride their own record (never the chat
+    /// append-ring).
+    #[test]
+    fn presence_owner_seed_disjoint_from_cot_key_and_chat_owner() {
+        let _ = oxicrypt_module::initialize();
+        let presence =
+            derive_circle_presence_veilid_owner_seed(EXAMPLE_ENTROPY, &CNSA_2_0).unwrap();
+        let cot = derive_cot_key(EXAMPLE_ENTROPY, &CNSA_2_0).unwrap();
+        let chat_owner = derive_circle_veilid_owner_seed(EXAMPLE_ENTROPY, &CNSA_2_0).unwrap();
+        assert_ne!(presence.as_bytes(), cot.as_bytes());
+        assert_ne!(
+            presence.as_bytes(),
+            chat_owner.as_bytes(),
+            "presence must ride its own record, not the chat rendezvous"
+        );
+    }
+
+    /// `Debug` never leaks the presence rendezvous-owner seed (ISC-A-C1).
+    #[test]
+    fn presence_owner_seed_debug_is_redacted() {
+        let _ = oxicrypt_module::initialize();
+        let s = derive_circle_presence_veilid_owner_seed("some entropy phrase here", &CNSA_2_0)
+            .unwrap();
+        assert_eq!(
+            format!("{s:?}"),
+            "CirclePresenceVeilidOwnerSeed(<redacted>)"
+        );
     }
 }

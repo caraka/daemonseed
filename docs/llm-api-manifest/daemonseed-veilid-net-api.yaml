@@ -339,6 +339,38 @@ functions:
     returns:
       type: "Result<()>"
       description: Ok once the re-sweep is dispatched; re-swept items arrive as Inbound and are deduped downstream.
+  - name: VeilidNetHandle::publish_presence
+    module: daemonseed_veilid_net::actor
+    description: Publish a sealed member-presence beacon to a per-member current-state slot on the presence sibling rendezvous record; a re-beacon overwrites the same slot (last-writer-wins). The presence record is distinct from the chat rendezvous, so a beacon never evicts chat backlog. member_pubkey owns the stable-slot-id encoding (member_slot_id, hex) so all callers agree. The slot count is bounded (SUBKEY_COUNT), so at unbounded membership two members can slot-share (a bounded, self-healing degradation). The app net actor holds the keys and runs the emit/ingest/reap loop; a receiver subscribes via subscribe_room on the same presence owner seed.
+    signature: "pub async fn publish_presence(&self, owner_seed: [u8; 32], member_pubkey: &[u8], sealed: Vec<u8>) -> Result<()>"
+    parameters:
+      - name: owner_seed
+        type: "[u8; 32]"
+        direction: in
+        description: The presence sibling record's rendezvous-owner seed (daemonseed_core::derive_room_presence_veilid_owner_seed / derive_circle_presence_veilid_owner_seed).
+      - name: member_pubkey
+        type: "&[u8]"
+        direction: in
+        description: The beacon's stable identity pubkey; hex-encoded to a slot id via member_slot_id.
+      - name: sealed
+        type: "Vec<u8>"
+        direction: in
+        description: The opaque sealed MemberHeartbeat.
+    returns:
+      type: "Result<()>"
+      description: Ok on write.
+  - name: member_slot_id
+    module: daemonseed_veilid_net::actor
+    description: The stable presence-slot id for a member — its identity pubkey, hex-encoded. A pure function of the member's stable identity, so a re-beacon overwrites the same current_state_subkey slot and all callers agree byte-for-byte.
+    signature: "pub fn member_slot_id(member_pubkey: &[u8]) -> String"
+    parameters:
+      - name: member_pubkey
+        type: "&[u8]"
+        direction: in
+        description: The member's identity pubkey.
+    returns:
+      type: "String"
+      description: The lowercase-hex slot id.
   - name: VeilidNetHandle::serve_share
     module: daemonseed_veilid_net::actor
     description: Register an indexed share to serve owner-on-demand; the actor answers inbound fragment app_calls for share_id from content, sealing each response under room_key. The sharer must stay online to serve (ISC-A-S21).

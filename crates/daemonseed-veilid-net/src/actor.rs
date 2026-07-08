@@ -76,6 +76,19 @@ enum Command {
         owner_seed: [u8; 32],
         reply: oneshot::Sender<Result<()>>,
     },
+    /// Write a SEALED payload to a stable-identity slot on a rendezvous record —
+    /// the current-state (last-writer-wins) counterpart to [`Command::PublishRendezvous`]'s
+    /// append-ring write. Presence beacons use it: one fixed slot per member
+    /// (keyed by `stable_id` via [`rendezvous::current_state_subkey`]), so a
+    /// re-beacon overwrites in place instead of filling the ring (P1). `owner_seed`
+    /// is the presence sibling record's owner seed; the engine treats `sealed` as
+    /// opaque.
+    PublishCurrentState {
+        owner_seed: [u8; 32],
+        stable_id: String,
+        sealed: Vec<u8>,
+        reply: oneshot::Sender<Result<()>>,
+    },
     /// Re-run the one-shot backlog sweep on an already-subscribed rendezvous
     /// record WITHOUT registering another watch — the recovery primitive for an
     /// item published during the post-(re)connect watch-warmup window (#132/#133).
@@ -380,10 +393,59 @@ impl VeilidNetHandle {
             .await?
     }
 
-    /// Member-plane presence heartbeat over a room/circle record. **Phase 4.**
-    pub async fn presence(&self) -> Result<()> {
-        Err(VeilidNetError::Unimplemented("presence — Phase 4"))
+    /// Publish a SEALED member-presence beacon to a presence rendezvous record
+    /// (Phase 4). `owner_seed` is the **presence sibling** record's owner seed
+    /// (`daemonseed_core::public_room::derive_room_presence_veilid_owner_seed` for
+    /// the lobby/public room, `…::circle::key::derive_circle_presence_veilid_owner_seed`
+    /// for a circle) — a record DISTINCT from the chat rendezvous, so a heartbeat
+    /// can never evict the chat append-ring (P1). `member_pubkey` is the beacon's
+    /// stable identity key; this owns the stable-id encoding
+    /// ([`member_slot_id`], hex) so both the gui and tui callers derive the SAME
+    /// slot, and the write lands in that member's [`rendezvous::current_state_subkey`]
+    /// slot — last-writer-wins.
+    ///
+    /// **Slot-collision ceiling (bounded, degrades not-crashes).** The current-state
+    /// scheme has only [`rendezvous::SUBKEY_COUNT`] slots (sized for a handful of
+    /// shares). Presence membership is UNBOUNDED, so two members whose ids collide to
+    /// one slot slot-share (last-writer-wins) — the loser is transiently missing from
+    /// rosters. Bounded, self-healing (the next beacon may win the race back), but a
+    /// real ceiling at lobby scale; the remedy is a larger dedicated presence schema —
+    /// a record-key boundary change, deferred (#134).
+    ///
+    /// `sealed` is the opaque sealed `MemberHeartbeat`; this layer never holds the
+    /// room key or the member's signing key. The emit/ingest/reap loop and all
+    /// sealing/opening live in the app net actor (which holds the keys); a receiver
+    /// SUBSCRIBES to the presence record via [`Self::subscribe_room`] on the same
+    /// presence `owner_seed`.
+    pub async fn publish_presence(
+        &self,
+        owner_seed: [u8; 32],
+        member_pubkey: &[u8],
+        sealed: Vec<u8>,
+    ) -> Result<()> {
+        let stable_id = member_slot_id(member_pubkey);
+        self.send(|reply| Command::PublishCurrentState {
+            owner_seed,
+            stable_id,
+            sealed,
+            reply,
+        })
+        .await?
     }
+}
+
+/// A stable presence-slot id for a member — its identity pubkey, hex-encoded. A
+/// pure function of the member's stable identity, so a re-beacon overwrites the
+/// SAME [`rendezvous::current_state_subkey`] slot (last-writer-wins) and the gui +
+/// tui callers agree byte-for-byte. Owned here (not duplicated per caller) so the
+/// slot encoding has one home.
+pub fn member_slot_id(member_pubkey: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(member_pubkey.len() * 2);
+    for b in member_pubkey {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 /// Brings up the daemonseed Veilid transport node.
@@ -674,6 +736,35 @@ async fn actor_loop(
                     subscribe_rendezvous(&api, &rc, &ev_tx, &opened, &record_locks, owner_seed)
                         .await,
                 );
+            }
+            Command::PublishCurrentState {
+                owner_seed,
+                stable_id,
+                sealed,
+                reply,
+            } => {
+                // Spawn off the command loop (same rationale as PublishRendezvous): a
+                // DHT set can take seconds and must not park the commands queued behind
+                // it. `publish_current_state` takes the presence record's own record_lock,
+                // which single-flights writes to THAT record only — distinct from the chat
+                // record's lock, so a presence write never blocks chat traffic.
+                let api = api.clone();
+                let rc = rc.clone();
+                let opened = opened.clone();
+                let record_locks = record_locks.clone();
+                tokio::spawn(async move {
+                    let r = publish_current_state(
+                        &api,
+                        &rc,
+                        &opened,
+                        &record_locks,
+                        owner_seed,
+                        &stable_id,
+                        sealed,
+                    )
+                    .await;
+                    let _ = reply.send(r);
+                });
             }
             Command::ResweepRendezvous { owner_seed, reply } => {
                 let _ = reply.send(
