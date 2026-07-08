@@ -209,6 +209,20 @@ pub struct Msg {
     pub order_ms: i64,
 }
 
+/// Outcome of [`GuiState::push_message`]: two orthogonal facts about what happened to
+/// the transcript, so a caller can react precisely. `inserted` gates re-render + scroll
+/// — a deduped no-op must NOT disturb the reader's scroll position (#143 scroll-yank);
+/// `unread_raised` gates the background rail rebuild (#64). `unread_raised` always
+/// implies `inserted` (a deduped message returns before the dot logic).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PushOutcome {
+    /// A new line was inserted (i.e. NOT a dedup no-op).
+    pub inserted: bool,
+    /// This call newly raised the unread dot: a non-own message, into a non-active room,
+    /// newer than the read high-water.
+    pub unread_raised: bool,
+}
+
 /// Wall-clock now in unix milliseconds — the reference for the #131 transcript
 /// ordering clamp (`transcript::clamp_order_ms`). Falls back to 0 only if the system
 /// clock predates the epoch (never in practice).
@@ -848,9 +862,11 @@ impl GuiState {
     /// Append a message to circle `idx` (no-op if out of range). Used by the
     /// real-net event drain to fold inbound/echoed Lobby messages into the RAM
     /// transcript, and by the non-Lobby local stub (the Round-5 `SendCircle` seam).
-    /// Returns `true` iff this call newly raised circle `idx`'s unread dot (#64) —
-    /// a non-own message into a non-active room — so the caller knows to rebuild the
-    /// rail. Own echoes (`mine`) and messages into the active room never raise it.
+    /// Returns a [`PushOutcome`]: `inserted` is false on a dedup no-op (so the caller
+    /// skips re-render + scroll — #143 scroll-yank), true on a genuine insert;
+    /// `unread_raised` is true only when this newly raised circle `idx`'s unread dot
+    /// (#64) — a non-own message, into a non-active room, newer than the read
+    /// high-water. Own echoes (`mine`) and messages into the active room never raise it.
     pub fn push_message(
         &mut self,
         idx: usize,
@@ -858,7 +874,7 @@ impl GuiState {
         text: String,
         mine: bool,
         sent_unix_ms: i64,
-    ) -> bool {
+    ) -> PushOutcome {
         let active = self.active;
         // #131: order + high-water on the CLAMPED timestamp, never the raw untrusted
         // one. Real backlog is inside the window so it is unclamped and orders exactly;
@@ -876,7 +892,7 @@ impl GuiState {
             if c.messages.iter().any(|m| {
                 m.sent_unix_ms == sent_unix_ms && m.mine == mine && m.who == who && m.text == text
             }) {
-                return false;
+                return PushOutcome::default(); // dedup no-op: nothing inserted, no dot
             }
             // #105/#131: insert in CLAMPED-order so a late-arriving (older) message
             // slots chronologically while a forged extreme can't pin the transcript.
@@ -899,20 +915,27 @@ impl GuiState {
             // so a far-future forged stamp cannot push the mark ahead and suppress
             // genuine unreads.
             let hw_input = order.min(now);
-            if idx == active {
+            let unread_raised = if idx == active {
                 // The user is looking at this room, so every message here is seen:
                 // keep the read high-water current so a later reconnect re-delivering
                 // these same messages cannot re-trip the unread dot (#107).
                 c.high_water_ms = c.high_water_ms.max(hw_input);
+                false
             } else if !mine && order > c.high_water_ms && !c.unread {
                 // #107: only a message NEWER (by clamped order) than what the user has
                 // caught up on raises the dot — re-delivered backlog (order <=
                 // high_water) is folded in silently, no dot.
                 c.unread = true;
-                return true;
-            }
+                true
+            } else {
+                false
+            };
+            return PushOutcome {
+                inserted: true,
+                unread_raised,
+            };
         }
-        false
+        PushOutcome::default()
     }
 
     /// Set circle `idx`'s retained draft (no-op if out of range). Used to persist
@@ -1359,7 +1382,9 @@ mod tests {
     #[test]
     fn unread_set_on_nonactive_inbound() {
         let mut st = GuiState::demo(); // active == 1
-        let raised = st.push_message(2, "ally".into(), "ping".into(), false, 1);
+        let raised = st
+            .push_message(2, "ally".into(), "ping".into(), false, 1)
+            .unread_raised;
         assert!(
             raised,
             "a non-own message into a non-active room raises unread"
@@ -1371,12 +1396,18 @@ mod tests {
     #[test]
     fn unread_not_set_for_active_room_or_own_echo() {
         let mut st = GuiState::demo(); // active == 1
-        assert!(!st.push_message(1, "x".into(), "hi".into(), false, 1));
+        assert!(
+            !st.push_message(1, "x".into(), "hi".into(), false, 1)
+                .unread_raised
+        );
         assert!(
             !st.metas()[1].unread,
             "message into the active room: no dot"
         );
-        assert!(!st.push_message(2, "me".into(), "hi".into(), true, 2));
+        assert!(
+            !st.push_message(2, "me".into(), "hi".into(), true, 2)
+                .unread_raised
+        );
         assert!(!st.metas()[2].unread, "own echo never dots");
     }
 
@@ -1392,9 +1423,13 @@ mod tests {
     #[test]
     fn unread_raise_is_idempotent() {
         let mut st = GuiState::demo(); // active == 1
-        assert!(st.push_message(2, "a".into(), "1".into(), false, 1));
         assert!(
-            !st.push_message(2, "a".into(), "2".into(), false, 2),
+            st.push_message(2, "a".into(), "1".into(), false, 1)
+                .unread_raised
+        );
+        assert!(
+            !st.push_message(2, "a".into(), "2".into(), false, 2)
+                .unread_raised,
             "already-unread room does not re-raise (no spurious rail rebuilds)"
         );
         assert!(st.metas()[2].unread);
@@ -1421,7 +1456,9 @@ mod tests {
         // now-non-active circle 2 (distinct text, so it is NOT a dedup hit — it is a
         // genuinely new transcript entry that must still NOT raise the dot).
         st.switch_to(1, String::new(), 0.0); // active == 1
-        let raised = st.push_message(2, "ally".into(), "re-swept".into(), false, now - 1000);
+        let raised = st
+            .push_message(2, "ally".into(), "re-swept".into(), false, now - 1000)
+            .unread_raised;
         assert!(
             !raised,
             "backlog at the high-water mark must not re-trip unread"
@@ -1436,7 +1473,9 @@ mod tests {
         st.switch_to(2, String::new(), 0.0);
         st.push_message(2, "ally".into(), "seen".into(), false, now - 2000); // active → high_water
         st.switch_to(1, String::new(), 0.0); // active == 1
-        let raised = st.push_message(2, "ally".into(), "fresh".into(), false, now - 1000);
+        let raised = st
+            .push_message(2, "ally".into(), "fresh".into(), false, now - 1000)
+            .unread_raised;
         assert!(
             raised,
             "a message newer than the high-water mark raises the dot"
@@ -1495,7 +1534,9 @@ mod tests {
         // focus-time high-water (~now) — with Bug 1 present the high-water would be
         // i64::MAX and this would NOT trip (suppressed); with the fix it trips.
         st.switch_to(1, String::new(), 0.0);
-        let raised = st.push_message(2, "ally".into(), "genuine".into(), false, now + 60_000);
+        let raised = st
+            .push_message(2, "ally".into(), "genuine".into(), false, now + 60_000)
+            .unread_raised;
         assert!(
             raised,
             "a real message still trips unread — suppression is closed"
@@ -1594,6 +1635,31 @@ mod tests {
                 .count(),
             2,
             "distinct bodies at the same ms both kept"
+        );
+    }
+
+    #[test]
+    fn own_echo_loopback_is_deduped_and_reports_not_inserted() {
+        // #143 scroll-yank: an own message (mine=true) is echoed locally on send, then
+        // loops back from the DHT/relay as the SAME (who, text, sent_unix_ms). The
+        // loopback must dedup and report `inserted:false` — the exact signal the Lobby /
+        // Circle handlers gate the re-render + scroll on, so a deduped loopback never
+        // yanks the reader's scroll to the bottom. The first delivery inserts.
+        let mut st = GuiState::demo(); // active == 1; circle 2 exists
+        let before = st.circles[2].messages.len();
+        let first = st.push_message(2, "me".into(), "hello".into(), true, 100);
+        assert!(first.inserted, "the first own delivery inserts a line");
+        assert!(!first.unread_raised, "an own echo never raises the dot");
+        let loopback = st.push_message(2, "me".into(), "hello".into(), true, 100);
+        assert!(
+            !loopback.inserted,
+            "the looped-back own message dedups — inserted:false gates the scroll (#143)"
+        );
+        assert!(!loopback.unread_raised);
+        assert_eq!(
+            st.circles[2].messages.len(),
+            before + 1,
+            "exactly one copy after the loopback"
         );
     }
 
@@ -2173,14 +2239,18 @@ mod tests {
             "the read high-water was seeded from the blob on restore"
         );
         // Backlog at/below the seeded mark must NOT re-trip the dot after the restart.
-        let raised = st2.push_message(cidx, "ally".into(), "re-swept".into(), false, seen_ts);
+        let raised = st2
+            .push_message(cidx, "ally".into(), "re-swept".into(), false, seen_ts)
+            .unread_raised;
         assert!(
             !raised,
             "relaunch backlog at the high-water must not re-trip unread"
         );
         assert!(!st2.metas()[cidx].unread);
         // A genuinely newer message still trips.
-        let raised_new = st2.push_message(cidx, "ally".into(), "fresh".into(), false, now - 1000);
+        let raised_new = st2
+            .push_message(cidx, "ally".into(), "fresh".into(), false, now - 1000)
+            .unread_raised;
         assert!(
             raised_new,
             "a message newer than the high-water still trips"

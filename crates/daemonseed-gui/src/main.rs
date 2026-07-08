@@ -1571,12 +1571,16 @@ fn apply_net_event(
             // out-of-order / re-swept lobby messages slot chronologically and the age
             // caption is real, not "just now".
             let mut st = state.borrow_mut();
-            let raised = st.push_message(LOBBY, who, text, mine, sent_unix_ms);
+            let out = st.push_message(LOBBY, who, text, mine, sent_unix_ms);
             let active = st.active();
             if active == LOBBY {
-                st.set_scroll(LOBBY, if stick { STICK_BOTTOM } else { live });
-                apply_view(ui, st.current(), active as i32);
-            } else if raised {
+                // #143: only a genuine insert re-renders + moves scroll — a deduped own
+                // loopback (inserted:false) must not yank the reader to the bottom.
+                if out.inserted {
+                    st.set_scroll(LOBBY, if stick { STICK_BOTTOM } else { live });
+                    apply_view(ui, st.current(), active as i32);
+                }
+            } else if out.unread_raised {
                 // #64: the Lobby got a message while unfocused — show its dot.
                 rebuild_rail(ui, &st);
             }
@@ -1619,12 +1623,16 @@ fn apply_net_event(
             // that circle's RAM state; refresh the transcript only when it's active.
             let mut st = state.borrow_mut();
             if let Some(idx) = st.index_of_circle_id(circle_id) {
-                let raised = st.push_message(idx, who, text, mine, sent_unix_ms);
+                let out = st.push_message(idx, who, text, mine, sent_unix_ms);
                 let active = st.active();
                 if active == idx {
-                    st.set_scroll(idx, if stick { STICK_BOTTOM } else { live });
-                    apply_view(ui, st.current(), active as i32);
-                } else if raised {
+                    // #143: only a genuine insert re-renders + moves scroll — a deduped
+                    // own loopback (inserted:false) must not yank the reader to bottom.
+                    if out.inserted {
+                        st.set_scroll(idx, if stick { STICK_BOTTOM } else { live });
+                        apply_view(ui, st.current(), active as i32);
+                    }
+                } else if out.unread_raised {
                     // #64: a circle got a message while unfocused — show its dot.
                     rebuild_rail(ui, &st);
                 }
