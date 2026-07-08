@@ -1534,3 +1534,20 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   `--features "desktop veilid" --all-targets -D warnings` + 111 nextest; tui clippy default +
   `--features veilid` + 197 nextest. Runnable bins rm'd. Live behaviour DEFERRED-VERIFY → orinoco.
   (Sanjay, 2026-07-07.)
+- LIVE-VERIFIED 2026-07-08 (orinoco felt-test, caraka; two `daemonseed-gui --features "desktop veilid"`
+  clients on real public Veilid; branch `feat/veilid-migration`): the Phase-4 night-run slices are
+  felt-confirmed, discharging the DEFERRED-VERIFY markers on the entries above. **Lobby member-presence
+  (#74):** each client appears on the other's Lobby roster. **Lobby + circle chat baseline:** messages
+  round-trip both directions once warm — post-warmup sends are reliable (two sends 5.3 s apart delivered
+  5.5 s apart, publish→deliver correlated in the `DAEMONSEED_VEILID_TRACE` logs). **MOTD + announcement
+  (#92 post path):** a signer's `Set MOTD` and `Post announcement` propagate to the second client and
+  render in its Announcements pane. **Unread-gated auto-landing (#93):** on restart with changed operator
+  content the client holds the Lobby through warmup then auto-switches to the Announcements pane once the
+  change parses; unchanged content stays on the Lobby. **Still felt-pending:** #77 circle-presence render
+  (only Lobby presence exercised this round) and #92's non-signer read-only composer path (dev builds
+  derive the in-source F17 key, so every client is a signer — the read-only gate has no non-holder to
+  exercise). **Findings filed:** #139 (signer composer squeezes the Announcements post list on short
+  windows — signer-only layout, taller window is the workaround) and #140 (cold-start warmup is the
+  dominant UX cost — trace shows attach ~8 s + all-9-record open+watch ~13 ms, so the ~1.5–2 min is DHT
+  value-propagation, not local setup; Phase-4 grew connect-time records 4→9; umbrella over
+  #117/#132/#128/#109/#123). (Sanjay, 2026-07-08.)
