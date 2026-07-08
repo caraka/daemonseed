@@ -124,8 +124,9 @@ const CHUNK_FETCH_CONCURRENCY: usize = 8;
 // is therefore prefixed with a 1-byte KIND tag: `[kind] ++ prost(artifact)`.
 
 /// Delay after Connect before the #93 unread-gated landing fires its one-shot
-/// self-refresh — set past the #132 re-sweep (25 s) PLUS DHT fold latency so the
-/// re-swept operator items have arrived, and the landing decision runs over as
+/// self-refresh — set past the first two [`WARMUP_RESWEEP_SCHEDULE`] rounds (12 s /
+/// 25 s) PLUS DHT fold latency so the re-swept operator items have arrived, and the
+/// landing decision runs over as
 /// settled a view as the async transport allows. **Best-effort, not a settle
 /// confirmation:** on a slow/congested DHT the backlog may still be folding at this
 /// deadline, so the landing can run over a partial view (land early / spuriously, or
@@ -133,6 +134,45 @@ const CHUNK_FETCH_CONCURRENCY: usize = 8;
 /// auto-open TIMING is heuristic). Robust settle-detection (hash-stable window) is a
 /// follow-up (#137). A felt-test tunable.
 const OPERATOR_CONNECT_LANDING_DELAY: Duration = Duration::from_secs(35);
+
+/// #140 stepped warmup re-sweep schedule: absolute deadlines from connect at which a
+/// force-refresh re-sweep round runs (dispatched via `sleep_until`, so a round's own
+/// re-sweep await time never pushes later rounds later — no accumulated drift). The
+/// passive DHT watch's first fold lands tens of seconds in (measured ~68 s for lobby
+/// chat on a warm restart), so a few front-loaded rounds catch converged content sooner
+/// and give each surface an earlier "discovering → content" reveal. Each re-sweep is
+/// `SUBKEY_COUNT` (64) force-refresh gets/record, so rounds are few + widening, not a
+/// tight loop; re-swept already-seen items are deduped downstream (`apply_discovery`
+/// self-filter, `push_message` exact-match). The first two rounds land at/under
+/// [`OPERATOR_CONNECT_LANDING_DELAY`] (35 s) so operator MOTD/announcement content is
+/// refreshed before the #93 connect-landing decision. Felt-tunable.
+const WARMUP_RESWEEP_SCHEDULE: [Duration; 4] = [
+    Duration::from_secs(12),
+    Duration::from_secs(25),
+    Duration::from_secs(45),
+    Duration::from_secs(75),
+];
+
+/// Rounds (from the front of [`WARMUP_RESWEEP_SCHEDULE`]) in which the circle records
+/// are ALSO re-swept. Operator + lobby — the top priority and the #93 landing feed —
+/// are re-swept every round; circles (which can be many) only in the early rounds, so a
+/// heavily-joined user's warmup doesn't fan out to `rounds × circles` concurrent
+/// backlog sweeps competing with initial chat/downloads (#140 review). Felt-tunable.
+const WARMUP_CIRCLE_RESWEEP_ROUNDS: usize = 2;
+
+/// Build the #140 warmup PRIORITY re-sweep records: operator MOTD/announce first (its
+/// content feeds the #93 landing), then lobby chat. These are re-swept every round;
+/// circle records are handled separately (early rounds only — see
+/// [`WARMUP_CIRCLE_RESWEEP_ROUNDS`]). Presence records are excluded (they self-heal via
+/// the heartbeat emit/reap cycle). Order is issue-order and load-bearing: within a round
+/// each `resweep_rendezvous` awaits its record open before the next is issued, so the
+/// operator sweep is dispatched first (the spawned backlog reads then overlap).
+fn warmup_priority_records(operator: Option<[u8; 32]>, lobby: Option<[u8; 32]>) -> Vec<[u8; 32]> {
+    let mut seeds = Vec::with_capacity(2);
+    seeds.extend(operator);
+    seeds.extend(lobby);
+    seeds
+}
 
 /// KIND tag for a MOTD value: the payload is a [`wire::SignedArtifact`].
 const OPERATOR_ITEM_MOTD: u8 = 0x00;
@@ -518,8 +558,8 @@ async fn handle_command(
                 // an eager connect_time snapshot would land on an empty/partial view and
                 // false-positive-land on every reconnect. The self-sent RefreshPublicSpace
                 // consumes `landing_pending` and emits the single connect_time:true
-                // snapshot; the delay sits just past the #132 re-sweep so re-swept items
-                // have folded. A felt-test tunable.
+                // snapshot; the delay sits just past the first warmup re-sweep rounds
+                // (#140) so re-swept operator items have folded. A felt-test tunable.
                 if let Some(op) = shares.operator.as_mut() {
                     op.landing_pending = true;
                     let cmd_tx = cmd_tx.clone();
@@ -553,34 +593,48 @@ async fn handle_command(
                     let name = crate::net::republish_name(&root, persisted_name.as_deref());
                     publish_share(shares, evt_tx, net, root, name, sharer.clone(), true).await;
                 }
-                // #132: watch latency is tens of seconds, so an announcement/message
-                // published during the post-connect warmup window is missed by the
-                // join-time one-shot sweep and never re-fetched. Spawn a single
-                // delayed re-sweep of the lobby + every joined circle to catch it;
-                // re-swept already-seen items are deduped downstream (apply_discovery
-                // self-filter, push_message exact-match).
+                // #132 / #140: the passive watch's first fold lands tens of seconds in,
+                // so a message/announcement published during the post-connect warmup
+                // window is missed by the join-time one-shot sweep and only surfaces
+                // late. Replace the single delayed re-sweep with a STEPPED, priority-
+                // ordered schedule ([`WARMUP_RESWEEP_SCHEDULE`]): force-refresh the
+                // operator record first (its MOTD/announce feeds the #93 landing), then
+                // the lobby, then circles, at widening delays. Re-swept already-seen
+                // items are deduped downstream (`apply_discovery` self-filter,
+                // `push_message` exact-match). Presence records self-heal via the
+                // heartbeat cycle and are excluded.
                 if let Some(handle) = net.as_ref() {
                     let handle = handle.clone();
-                    let mut seeds: Vec<[u8; 32]> = Vec::new();
-                    if let Some(lobby) = shares.lobby.as_ref() {
-                        seeds.push(lobby.owner_seed);
-                    }
-                    // Include the operator announce/MOTD record (#93): a MOTD /
-                    // announcement published during the warmup window must be
-                    // re-fetched BEFORE the connect-landing fires, else the landing
-                    // runs over stale content and misses the new item.
-                    if let Some(op) = shares.operator.as_ref() {
-                        seeds.push(op.announce_owner_seed);
-                    }
-                    seeds.extend(circles.iter().map(|c| c.owner_seed));
+                    let priority = warmup_priority_records(
+                        shares.operator.as_ref().map(|op| op.announce_owner_seed),
+                        shares.lobby.as_ref().map(|l| l.owner_seed),
+                    );
+                    let circle_seeds: Vec<[u8; 32]> =
+                        circles.iter().map(|c| c.owner_seed).collect();
                     daemonseed_veilid_net::vtrace!(
-                        "gui connect: scheduling delayed re-sweep of {} rendezvous",
-                        seeds.len()
+                        "gui connect: scheduling {}-round stepped warmup re-sweep ({} priority + {} circles)",
+                        WARMUP_RESWEEP_SCHEDULE.len(),
+                        priority.len(),
+                        circle_seeds.len()
                     );
                     tokio::spawn(async move {
-                        tokio::time::sleep(Duration::from_secs(25)).await;
-                        for seed in seeds {
-                            let _ = handle.resweep_rendezvous(seed).await;
+                        // Absolute deadlines from connect: `sleep_until` means a round's own
+                        // re-sweep await time never pushes later rounds later (#140 review —
+                        // no accumulated drift, so round 2 stays at/under the 35 s #93 landing).
+                        let start = tokio::time::Instant::now();
+                        for (round, &at) in WARMUP_RESWEEP_SCHEDULE.iter().enumerate() {
+                            tokio::time::sleep_until(start + at).await;
+                            // Operator + lobby every round (top priority + #93 landing feed).
+                            for seed in &priority {
+                                let _ = handle.resweep_rendezvous(*seed).await;
+                            }
+                            // Circles only in the early rounds — bounds the fan-out for a
+                            // heavily-joined user (#140 review).
+                            if round < WARMUP_CIRCLE_RESWEEP_ROUNDS {
+                                for seed in &circle_seeds {
+                                    let _ = handle.resweep_rendezvous(*seed).await;
+                                }
+                            }
                         }
                     });
                 }
@@ -2080,6 +2134,36 @@ mod tests {
         );
         assert!(transport.contains("chunk fetch failed"));
         assert!(transport.contains("route dead"));
+    }
+
+    #[test]
+    fn warmup_priority_records_order_operator_then_lobby() {
+        let op = [1u8; 32];
+        let lobby = [2u8; 32];
+        // #140 priority: operator MOTD/announce before lobby chat.
+        assert_eq!(
+            warmup_priority_records(Some(op), Some(lobby)),
+            vec![op, lobby]
+        );
+        // Operator alone.
+        assert_eq!(warmup_priority_records(Some(op), None), vec![op]);
+        // Lobby alone.
+        assert_eq!(warmup_priority_records(None, Some(lobby)), vec![lobby]);
+        // Neither joined → empty (the scheduler re-sweeps nothing that round).
+        assert!(warmup_priority_records(None, None).is_empty());
+    }
+
+    #[test]
+    fn warmup_resweep_schedule_is_strictly_increasing_and_nonempty() {
+        assert!(!WARMUP_RESWEEP_SCHEDULE.is_empty());
+        for w in WARMUP_RESWEEP_SCHEDULE.windows(2) {
+            assert!(w[0] < w[1], "re-sweep schedule must be strictly increasing");
+        }
+        // The first two rounds precede the #93 landing so operator content is
+        // refreshed before the landing decision runs.
+        assert!(WARMUP_RESWEEP_SCHEDULE[1] <= OPERATOR_CONNECT_LANDING_DELAY);
+        // The circle-taper round count can't exceed the schedule length.
+        assert!(WARMUP_CIRCLE_RESWEEP_ROUNDS <= WARMUP_RESWEEP_SCHEDULE.len());
     }
 
     fn announcer(seed: u8) -> SignKeypair {
