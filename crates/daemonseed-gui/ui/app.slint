@@ -489,6 +489,7 @@ export component AppWindow inherits Window {
     in-out property <bool> leave-confirm-open: false;
     in-out property <bool> palette-open: false;
     in-out property <bool> announce-unread: false; // #142: unseen announcements/MOTD dot
+    in-out property <bool> startup-overlay-open: false; // #144: cold-start "assembling network" mask
     in property <[ActionData]> actions;
 
     // Round-4 circle-plumbing surfaces.
@@ -1280,6 +1281,31 @@ export component AppWindow inherits Window {
             HorizontalLayout {
                 Rectangle { }
                 PillButton { label: "Close"; w: 80px; clicked => { root.about-open = false; root.focus-composer(); } }
+            }
+        }
+    }
+
+    // #144: startup "assembling network" mask — a full-cover splash shown from Connect
+    // until the first real content lands (dismissed from Rust on the first Lobby/circle
+    // message or non-empty roster) or the user enters anyway. Frames the unavoidable
+    // cold-start DHT warmup as the serverless feature. First cut: branded copy + the live
+    // connection-status; the attach peer-count + an animation are follow-ups (#144).
+    startup := Rectangle {
+        width: 100%;
+        height: 100%;
+        visible: root.startup-overlay-open;
+        background: #0b0c0e;
+        VerticalLayout {
+            alignment: center;
+            spacing: 12px;
+            Text { text: "daemonseed"; color: #e4e8ee; font-size: 26px; horizontal-alignment: center; }
+            Text { text: "Assembling your peer network"; color: #6fb3a4; font-size: 16px; horizontal-alignment: center; }
+            Text { text: "No servers — just peers. This can take a moment on a cold start."; color: #8b93a1; font-size: 13px; horizontal-alignment: center; }
+            Text { text: root.connection-status; color: #5b6472; font-size: 12px; horizontal-alignment: center; }
+            Rectangle { height: 6px; }
+            HorizontalLayout {
+                alignment: center;
+                PillButton { label: "Enter anyway"; w: 140px; clicked => { root.startup-overlay-open = false; } }
             }
         }
     }

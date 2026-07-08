@@ -1500,6 +1500,11 @@ fn connect_now(
                 index_params,
                 stable_signing_key,
             });
+            // #144: raise the "assembling network" startup mask for the cold-start
+            // warmup; it is dismissed on the first real content (a Lobby/circle message
+            // or a non-empty roster) or by the user, framing the unavoidable
+            // DHT-convergence wait as the serverless feature rather than a hang.
+            ui.set_startup_overlay_open(true);
         }
         Err(reason) => {
             ui.set_connection_status(SharedString::from(format!("offline · {reason}")));
@@ -1553,6 +1558,8 @@ fn apply_net_event(
             mine,
             sent_unix_ms,
         } => {
+            // #144: first real content → dismiss the startup "assembling network" mask.
+            ui.set_startup_overlay_open(false);
             // #84: capture scroll intent from the LIVE view BEFORE the transcript grows.
             // Own sends always pin to bottom; an incoming message pins only if the reader
             // was already at the bottom — otherwise we hold their current position.
@@ -1601,6 +1608,8 @@ fn apply_net_event(
             mine,
             sent_unix_ms,
         } => {
+            // #144: first real content → dismiss the startup "assembling network" mask.
+            ui.set_startup_overlay_open(false);
             // #84: capture scroll intent from the LIVE view before the transcript grows
             // (see the Lobby branch). Own sends pin to bottom; incoming pins only if the
             // reader was already at the bottom.
@@ -1864,6 +1873,10 @@ fn apply_net_event(
             ui.set_download_label(SharedString::from(format!("Download failed: {message}")));
         }
         NetEvent::Roster { circle_id, entries } => {
+            // #144: real presence (a peer is online) → dismiss the startup mask.
+            if !entries.is_empty() {
+                ui.set_startup_overlay_open(false);
+            }
             // Replace the roster model for the ACTIVE room only (#75 lobby / #77
             // circles). A roster is room-scoped: the lobby is `None`, a circle is
             // `Some(circle_id)`. The active room is `state.active_circle_id()` (None
