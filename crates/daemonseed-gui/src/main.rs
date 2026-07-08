@@ -1705,7 +1705,8 @@ fn apply_net_event(
                 // guard inside `announcements_unread`) — a non-intrusive indicator that
                 // behaves the same on connect and mid-session (mirrors the room dot #64).
                 let stored = state.borrow().announce_seen_hash(&server_id);
-                ui.set_announce_unread(announcements_unread(&view, stored.as_deref()));
+                // #142: reuse the `current` hash already computed above — no second pass.
+                ui.set_announce_unread(announcements_unread(&view, &current, stored.as_deref()));
             }
         }
         NetEvent::PublicSpaceError { message } => {

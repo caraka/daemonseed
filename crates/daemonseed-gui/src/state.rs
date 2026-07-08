@@ -175,18 +175,24 @@ pub fn combined_content_hash(view: &AnnouncementsView) -> String {
 }
 
 /// #142: whether the Announcements tab should show an unread dot — the verified content
-/// is non-empty AND differs from what was last seen (or was never seen). The empty-view
-/// guard means an unconverged / genuinely-empty view never trips a spurious dot.
-/// Replaces the #93 connect-time auto-landing: the client NEVER force-opens the pane (a
-/// rude yank for rare operator content, and it could land on a not-yet-converged blank
-/// view); the dot is a non-intrusive indicator that behaves identically on connect and
-/// mid-session, mirroring the room unread dot (#64).
-pub fn announcements_unread(view: &AnnouncementsView, stored_hash: Option<&str>) -> bool {
+/// is non-empty AND `current_hash` (the caller's `combined_content_hash(view)`) differs
+/// from what was last seen (or was never seen). The caller passes the current hash in so
+/// it is computed once per snapshot (it also needs it for the seen-hash persist). The
+/// empty-view guard means an unconverged / genuinely-empty view never trips a spurious
+/// dot. Replaces the #93 connect-time auto-landing: the client NEVER force-opens the
+/// pane (a rude yank for rare operator content, and it could land on a not-yet-converged
+/// blank view); the dot is a non-intrusive indicator that behaves identically on connect
+/// and mid-session, mirroring the room unread dot (#64).
+pub fn announcements_unread(
+    view: &AnnouncementsView,
+    current_hash: &str,
+    stored_hash: Option<&str>,
+) -> bool {
     if view.motd.is_none() && view.posts.is_empty() {
         return false; // empty-view guard — nothing to be unread about
     }
     match stored_hash {
-        Some(h) => h != combined_content_hash(view),
+        Some(h) => h != current_hash,
         None => true, // never seen → unread
     }
 }
@@ -1209,17 +1215,22 @@ mod tests {
     fn announcements_unread_covers_all_cases() {
         let _ = oxicrypt_module::initialize();
         let empty = ann_view(None, &[]);
+        let empty_hash = combined_content_hash(&empty);
         let content = ann_view(Some("relay is up"), &[("a", "x", 1)]);
         let content_hash = combined_content_hash(&content);
         // Empty view → never unread (empty-view guard), even with no stored hash — an
         // unconverged/blank view must not trip a spurious dot.
-        assert!(!announcements_unread(&empty, None));
+        assert!(!announcements_unread(&empty, &empty_hash, None));
         // Non-empty, never seen → unread.
-        assert!(announcements_unread(&content, None));
+        assert!(announcements_unread(&content, &content_hash, None));
         // Non-empty, stored != current → unread.
-        assert!(announcements_unread(&content, Some("stale")));
+        assert!(announcements_unread(&content, &content_hash, Some("stale")));
         // Non-empty, stored == current (already seen) → not unread.
-        assert!(!announcements_unread(&content, Some(&content_hash)));
+        assert!(!announcements_unread(
+            &content,
+            &content_hash,
+            Some(&content_hash)
+        ));
     }
 
     #[test]
@@ -1235,12 +1246,12 @@ mod tests {
             daemonseed_core::identity::mnemonic::Mnemonic::generate().unwrap(),
         );
         assert!(
-            announcements_unread(&view, seeds.announce_seen("fra1#abc")),
+            announcements_unread(&view, &current, seeds.announce_seen("fra1#abc")),
             "first arrival is unread"
         );
         assert!(seeds.set_announce_seen("fra1#abc", current.clone()));
         assert!(
-            !announcements_unread(&view, seeds.announce_seen("fra1#abc")),
+            !announcements_unread(&view, &current, seeds.announce_seen("fra1#abc")),
             "after viewing, the same content is no longer unread"
         );
     }
