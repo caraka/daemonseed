@@ -179,6 +179,16 @@ const OPERATOR_ITEM_MOTD: u8 = 0x00;
 /// KIND tag for an announcement value: the payload is a [`wire::Post`].
 const OPERATOR_ITEM_ANNOUNCEMENT: u8 = 0x01;
 
+/// #141: how often a writer re-publishes its known operator MOTD + announcements so
+/// their DHT subkey values do not expire. Operator content is otherwise written only
+/// on post, and Veilid DHT values age out without owner refresh — so an announcement
+/// silently vanished across sessions (felt-test 2026-07-08). Gated on holding the
+/// announce owner seed, so only a writer (dev: any client; prod: the operator) keeps
+/// content alive; the record is low-volume, so re-publishing a handful of already-signed
+/// items on this cadence is cheap. Felt-tunable; set safely under Veilid's default DHT
+/// value TTL (to confirm).
+const OPERATOR_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(120);
+
 /// Prepend the 1-byte KIND tag to a prost-encoded operator artifact.
 fn encode_operator_item(kind: u8, bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + bytes.len());
@@ -357,6 +367,9 @@ pub async fn veilid_net_actor(
     // the S4 felt-test uses named profiles.
     let mut my_handle = "guest".to_owned();
     let mut prune_timer = tokio::time::interval(SHARE_CATALOG_PRUNE_INTERVAL);
+    // #141: re-publish operator MOTD/announcements on a slow cadence so their DHT
+    // values do not expire (operator content is otherwise written only on post).
+    let mut operator_keepalive = tokio::time::interval(OPERATOR_KEEPALIVE_INTERVAL);
     // Presence emit + reap clock (#74): a jittered [15,20]s beacon into the lobby
     // presence record (when joined) that also reaps the roster on each fire. A
     // self-rescheduling `Sleep` (not a fixed `interval`) so each tick draws a fresh
@@ -384,6 +397,34 @@ pub async fn veilid_net_actor(
             _ = prune_timer.tick() => {
                 if shares.catalog.prune(Instant::now()) > 0 {
                     let _ = evt_tx.send(NetEvent::SharesSnapshot { shares: shares.listings() });
+                }
+            }
+            // #141: keep operator content alive in the DHT — re-publish the known MOTD +
+            // announcements OFF the actor loop (their DHT values age out without owner
+            // refresh, else they silently expire). Collect synchronously, spawn the
+            // writes so a many-item record never stalls chat/commands (#128 class).
+            _ = operator_keepalive.tick() => {
+                if let (Some(handle), Some((owner_seed, items))) =
+                    (net.as_ref(), collect_operator_keepalive_items(&shares))
+                {
+                    let handle = handle.clone();
+                    tokio::spawn(async move {
+                        let mut n = 0usize;
+                        for (slot, value) in items {
+                            if handle
+                                .publish_current_state(owner_seed, &slot, value)
+                                .await
+                                .is_ok()
+                            {
+                                n += 1;
+                            }
+                        }
+                        if n > 0 {
+                            daemonseed_veilid_net::vtrace!(
+                                "gui operator: keep-alive re-published {n} item(s)"
+                            );
+                        }
+                    });
                 }
             }
             // Emit one lobby presence beacon + reap the roster, then re-arm the timer
@@ -1282,6 +1323,38 @@ async fn upload_announcement(
     }
     if let Some(op) = shares.operator.as_ref() {
         let _ = evt_tx.send(public_space_snapshot_event(op, false));
+    }
+}
+
+/// (owner seed, `[(slot_id, encoded-value)]`) — one #141 keep-alive re-publish batch.
+type OperatorKeepaliveBatch = ([u8; 32], Vec<(String, Vec<u8>)>);
+
+/// #141: collect the operator record's known items (MOTD + announcements) as
+/// `(slot_id, encoded-value)` pairs for a keep-alive re-publish, with the owner seed to
+/// write them. `None` when there is no operator record or nothing to re-publish. Pure
+/// (no I/O) so the caller can spawn the DHT writes off the actor loop. The stored
+/// artifacts are already F17-signed, so this re-publishes the EXACT bytes to the SAME
+/// slots (`"motd"` / the content-address hex key — identical to [`set_motd`] /
+/// [`upload_announcement`]), idempotent under last-writer-wins.
+fn collect_operator_keepalive_items(shares: &ShareState) -> Option<OperatorKeepaliveBatch> {
+    let op = shares.operator.as_ref()?;
+    let mut items: Vec<(String, Vec<u8>)> = Vec::new();
+    if let Some(artifact) = op.motd.as_ref() {
+        items.push((
+            "motd".to_owned(),
+            encode_operator_item(OPERATOR_ITEM_MOTD, &artifact.encode_to_vec()),
+        ));
+    }
+    for (slot, post) in op.posts.iter() {
+        items.push((
+            slot.clone(),
+            encode_operator_item(OPERATOR_ITEM_ANNOUNCEMENT, &post.encode_to_vec()),
+        ));
+    }
+    if items.is_empty() {
+        None
+    } else {
+        Some((op.announce_owner_seed, items))
     }
 }
 
@@ -2492,6 +2565,33 @@ mod tests {
             posts: BTreeMap::new(),
             landing_pending: false,
         }
+    }
+
+    #[test]
+    fn collect_operator_keepalive_items_bundles_known_content() {
+        let _ = oxicrypt_module::initialize();
+        // No operator record → nothing to re-publish.
+        assert!(collect_operator_keepalive_items(&ShareState::new()).is_none());
+        // Operator subscribed but empty → still None.
+        let mut shares = ShareState::new();
+        shares.operator = Some(operator_space());
+        assert!(collect_operator_keepalive_items(&shares).is_none());
+        // A verified MOTD folds in → collected at the "motd" slot, KIND-tagged, with the
+        // owner seed to write it back (#141 keep-alive).
+        let kp = dev_project_release_keypair().unwrap();
+        let (evt_tx, _rx) = unbounded_channel();
+        let motd = sign_motd(&kp, "hello", 100).unwrap();
+        let bytes = encode_operator_item(OPERATOR_ITEM_MOTD, &motd.encode_to_vec());
+        assert!(apply_operator_item(&mut shares, &evt_tx, &bytes));
+        let (seed, items) =
+            collect_operator_keepalive_items(&shares).expect("the MOTD should be collected");
+        assert_eq!(seed, shares.operator.as_ref().unwrap().announce_owner_seed);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].0, "motd");
+        assert_eq!(
+            decode_operator_item(&items[0].1).unwrap().0,
+            OPERATOR_ITEM_MOTD
+        );
     }
 
     /// A-d (#93): the FIRST refresh after subscribe consumes `landing_pending` and
