@@ -174,24 +174,20 @@ pub fn combined_content_hash(view: &AnnouncementsView) -> String {
         .unwrap_or_default()
 }
 
-/// Where the client lands the user after a **connect-time** public-space fetch
-/// (#93 / D5).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Landing {
-    /// Auto-open the announcements/MOTD pane — there is unread news.
-    Announcements,
-    /// Open the Lobby — the user has already seen this exact content.
-    Lobby,
-}
-
-/// Decide the connect-time landing (#93 / D5) from the per-relay stored hash and
-/// the freshly-computed current hash. No stored hash (a first arrival) OR a
-/// mismatch (content changed since last seen) ⇒ [`Landing::Announcements`]; an
-/// exact match (already seen this version) ⇒ [`Landing::Lobby`].
-pub fn landing_decision(stored_hash: Option<&str>, current_hash: &str) -> Landing {
+/// #142: whether the Announcements tab should show an unread dot — the verified content
+/// is non-empty AND differs from what was last seen (or was never seen). The empty-view
+/// guard means an unconverged / genuinely-empty view never trips a spurious dot.
+/// Replaces the #93 connect-time auto-landing: the client NEVER force-opens the pane (a
+/// rude yank for rare operator content, and it could land on a not-yet-converged blank
+/// view); the dot is a non-intrusive indicator that behaves identically on connect and
+/// mid-session, mirroring the room unread dot (#64).
+pub fn announcements_unread(view: &AnnouncementsView, stored_hash: Option<&str>) -> bool {
+    if view.motd.is_none() && view.posts.is_empty() {
+        return false; // empty-view guard — nothing to be unread about
+    }
     match stored_hash {
-        Some(h) if h == current_hash => Landing::Lobby,
-        _ => Landing::Announcements,
+        Some(h) => h != combined_content_hash(view),
+        None => true, // never seen → unread
     }
 }
 
@@ -1187,20 +1183,27 @@ mod tests {
     }
 
     #[test]
-    fn landing_decision_covers_all_cases() {
-        // No stored hash (a first arrival) → open the pane.
-        assert_eq!(landing_decision(None, "abc"), Landing::Announcements);
-        // Stored ≠ current (content changed since last seen) → open the pane.
-        assert_eq!(landing_decision(Some("old"), "new"), Landing::Announcements);
-        // Stored == current (already seen this exact version) → Lobby.
-        assert_eq!(landing_decision(Some("same"), "same"), Landing::Lobby);
+    fn announcements_unread_covers_all_cases() {
+        let _ = oxicrypt_module::initialize();
+        let empty = ann_view(None, &[]);
+        let content = ann_view(Some("relay is up"), &[("a", "x", 1)]);
+        let content_hash = combined_content_hash(&content);
+        // Empty view → never unread (empty-view guard), even with no stored hash — an
+        // unconverged/blank view must not trip a spurious dot.
+        assert!(!announcements_unread(&empty, None));
+        // Non-empty, never seen → unread.
+        assert!(announcements_unread(&content, None));
+        // Non-empty, stored != current → unread.
+        assert!(announcements_unread(&content, Some("stale")));
+        // Non-empty, stored == current (already seen) → not unread.
+        assert!(!announcements_unread(&content, Some(&content_hash)));
     }
 
     #[test]
-    fn viewing_updates_stored_hash_then_bypasses() {
-        // Mirrors the GUI write-through: a first arrival lands on the pane; once the
-        // current hash is stored (the "viewing updates the stored hash" step), the
-        // next decision for the SAME content is Lobby (bypassed).
+    fn viewing_updates_stored_hash_then_clears_unread() {
+        // Mirrors the GUI write-through: a first arrival is unread; once the current
+        // hash is stored (the "viewing updates the stored hash" step), the SAME content
+        // is no longer unread (the dot clears).
         let _ = oxicrypt_module::initialize();
         let view = ann_view(Some("relay is up"), &[("announcements", "v2", 5)]);
         let current = combined_content_hash(&view);
@@ -1208,16 +1211,14 @@ mod tests {
         let mut seeds = daemonseed_core::storage::seeds::Seeds::new(
             daemonseed_core::identity::mnemonic::Mnemonic::generate().unwrap(),
         );
-        assert_eq!(
-            landing_decision(seeds.announce_seen("fra1#abc"), &current),
-            Landing::Announcements,
-            "first arrival opens the pane"
+        assert!(
+            announcements_unread(&view, seeds.announce_seen("fra1#abc")),
+            "first arrival is unread"
         );
         assert!(seeds.set_announce_seen("fra1#abc", current.clone()));
-        assert_eq!(
-            landing_decision(seeds.announce_seen("fra1#abc"), &current),
-            Landing::Lobby,
-            "after viewing, the same content is bypassed to the Lobby"
+        assert!(
+            !announcements_unread(&view, seeds.announce_seen("fra1#abc")),
+            "after viewing, the same content is no longer unread"
         );
     }
 

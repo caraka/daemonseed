@@ -310,9 +310,18 @@ component PillButton inherits Rectangle {
 component TabLabel inherits TouchArea {
     in property <string> label;
     in property <bool> active: false;
+    in property <bool> unread: false;   // #142: unseen-content dot (never on the active tab)
     VerticalLayout {
         alignment: center;
-        Text { text: root.label; color: root.active ? #d6dae1 : #5b6472; font-size: 13px; horizontal-alignment: center; }
+        HorizontalLayout {
+            alignment: center; spacing: 5px;
+            Text { text: root.label; color: root.active ? #d6dae1 : #5b6472; font-size: 13px; vertical-alignment: center; }
+            // #142: unread dot — new content on a tab you're not viewing. Never on the
+            // active tab (opening it clears unread), mirroring the room dot (#64).
+            if root.unread && !root.active : Rectangle {
+                y: 2px; width: 7px; height: 7px; border-radius: 3.5px; background: #6fb3a4;
+            }
+        }
         Rectangle { height: 2px; background: root.active ? #6b7280 : transparent; border-radius: 1px; }
     }
 }
@@ -479,6 +488,7 @@ export component AppWindow inherits Window {
     in property <string> phrase-prompt-error;
     in-out property <bool> leave-confirm-open: false;
     in-out property <bool> palette-open: false;
+    in-out property <bool> announce-unread: false; // #142: unseen announcements/MOTD dot
     in property <[ActionData]> actions;
 
     // Round-4 circle-plumbing surfaces.
@@ -813,7 +823,7 @@ export component AppWindow inherits Window {
                         TabLabel { label: "Chat"; active: root.active-tab == 0; clicked => { root.active-tab = 0; } }
                         TabLabel { label: "Public Shares"; active: root.active-tab == 1; clicked => { root.active-tab = 1; root.shares-tab-opened(); } }
                         TabLabel { label: "Circle shares"; active: root.active-tab == 2; clicked => { root.active-tab = 2; } }
-                        TabLabel { label: "Announcements"; active: root.active-tab == 3; clicked => { root.active-tab = 3; root.announcements-tab-opened(); } }
+                        TabLabel { label: "Announcements"; active: root.active-tab == 3; unread: root.announce-unread; clicked => { root.active-tab = 3; root.announcements-tab-opened(); } }
                         Rectangle { }
                     }
                 }

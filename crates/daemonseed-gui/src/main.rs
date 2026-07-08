@@ -58,8 +58,8 @@ use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferTyp
 use slint::platform::{Platform, PlatformError, WindowAdapter};
 use slint::{ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel};
 use state::{
-    AnnouncementsView, CircleState, GuiState, Landing, Msg, combined_content_hash,
-    format_relative_age, landing_decision,
+    AnnouncementsView, CircleState, GuiState, Msg, announcements_unread, combined_content_hash,
+    format_relative_age,
 };
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -887,7 +887,14 @@ fn build_ui() -> BuiltUi {
     // relay's MOTD + posts; the snapshot lands via NetEvent::PublicSpaceSnapshot.
     ui.on_announcements_tab_opened({
         let net = net.clone();
+        let ui = ui.as_weak();
         move || {
+            // #142: clear the unread dot on open (the tab also becomes active, which
+            // already hides the dot via the `!active` gate; this keeps the flag
+            // truthful). The refresh below yields a snapshot that persists the seen-hash.
+            if let Some(ui) = ui.upgrade() {
+                ui.set_announce_unread(false);
+            }
             let _ = net.borrow().send(NetCommand::RefreshPublicSpace);
         }
     });
@@ -1654,36 +1661,34 @@ fn apply_net_event(
         NetEvent::PublicSpaceSnapshot {
             view,
             can_compose,
-            connect_time,
+            // #142: `connect_time` no longer drives an auto-land — the client never
+            // force-opens the pane; unread is computed on EVERY snapshot (connect +
+            // mid-session), so the flag is ignored here.
+            connect_time: _,
         } => {
             apply_announcements(ui, &view, can_compose);
-            // #93: the client-derived combined content hash is the unread marker.
+            // #93/#142: the client-derived combined content hash is the unread marker.
             let current = combined_content_hash(&view);
             let server_id = relay_target().0;
-            // Auto-land on the announcements pane ONLY for the connect-time fetch
-            // (a manual Refresh / poll / post-upload refresh must never yank the
-            // user away): open the pane (tab 3) when the content changed since last
-            // seen OR was never seen; otherwise stay where we are (the Lobby).
-            if connect_time {
-                let stored = state.borrow().announce_seen_hash(&server_id);
-                if matches!(
-                    landing_decision(stored.as_deref(), &current),
-                    Landing::Announcements
-                ) {
-                    ui.set_active_tab(ANNOUNCEMENTS_TAB);
-                }
-            }
-            // Viewing the pane marks this content seen: if the announcements pane is
-            // the active tab now — whether the user opened it or the unread gate just
-            // did — persist the current hash + re-seal (idempotent: a no-op when
-            // unchanged or on the ephemeral no-profile path). A persist failure is
-            // non-fatal; surface it quietly in the pane's status line.
-            if ui.get_active_tab() == ANNOUNCEMENTS_TAB
-                && let Err(message) = state
+            if ui.get_active_tab() == ANNOUNCEMENTS_TAB {
+                // The user is looking at the pane → mark this content seen (persist the
+                // hash + re-seal; idempotent, a no-op when unchanged or on the ephemeral
+                // no-profile path) and clear the dot. A persist failure is non-fatal;
+                // surface it quietly in the pane's status line.
+                ui.set_announce_unread(false);
+                if let Err(message) = state
                     .borrow_mut()
                     .persist_announce_seen(&server_id, &current)
-            {
-                ui.set_announce_status(SharedString::from(message));
+                {
+                    ui.set_announce_status(SharedString::from(message));
+                }
+            } else {
+                // #142: NEVER force-open. Set the Announcements-tab unread dot when the
+                // verified content is non-empty AND changed since last seen (empty-view
+                // guard inside `announcements_unread`) — a non-intrusive indicator that
+                // behaves the same on connect and mid-session (mirrors the room dot #64).
+                let stored = state.borrow().announce_seen_hash(&server_id);
+                ui.set_announce_unread(announcements_unread(&view, stored.as_deref()));
             }
         }
         NetEvent::PublicSpaceError { message } => {
