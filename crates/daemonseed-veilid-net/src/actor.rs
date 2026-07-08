@@ -432,6 +432,34 @@ impl VeilidNetHandle {
         })
         .await?
     }
+
+    /// Publish opaque bytes to a NAMED current-state slot on an owner-gated
+    /// rendezvous record (Phase 4 A-b — the operator announcements/MOTD record).
+    /// Last-writer-wins per slot; the write is owner-signed, so **only a holder of
+    /// `owner_seed`** (the non-derivable project-announce owner —
+    /// `daemonseed_core::public_space::derive_project_announce_veilid_owner_seed`)
+    /// can place a value: it IS the DHT write-gate (A1). Clients holding only the
+    /// owner PUBKEY [`Self::subscribe_room`] the record and read/verify but cannot
+    /// write. `slot_id` is the stable slot key — a fixed `"motd"` for the MOTD, or an
+    /// announcement item's content address. `bytes` is the caller's payload — a
+    /// signed `SignedArtifact` (public + ML-DSA-87-provenance-signed, verified
+    /// client-side by `daemonseed_core::public_space::verify_artifact`; NOT
+    /// AEAD-sealed, since operator announcements are public). Spawned off-loop +
+    /// per-record serialized, exactly like [`Self::publish_presence`].
+    pub async fn publish_current_state(
+        &self,
+        owner_seed: [u8; 32],
+        slot_id: &str,
+        bytes: Vec<u8>,
+    ) -> Result<()> {
+        self.send(|reply| Command::PublishCurrentState {
+            owner_seed,
+            stable_id: slot_id.to_owned(),
+            sealed: bytes,
+            reply,
+        })
+        .await?
+    }
 }
 
 /// A stable presence-slot id for a member — its identity pubkey, hex-encoded. A

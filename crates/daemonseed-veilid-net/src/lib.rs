@@ -54,8 +54,12 @@
 //! `MemberHeartbeat` to a per-member current-state slot on the presence sibling
 //! rendezvous record (the app net actor holds the keys, seals/opens, and runs the
 //! emit/ingest/reap loop; this crate only moves opaque bytes). Announcements/MOTD
-//! still return [`VeilidNetError::Unimplemented`] — a further parameterization of
-//! the rendezvous engine (an operator-owned write-gate).
+//! transport is live too: [`VeilidNetHandle::publish_current_state`] writes a
+//! public signed payload to a named slot on the operator-owned announce record —
+//! the owner-signed write is the write-gate (only the project-announce owner-seed
+//! holder can write; clients read via [`VeilidNetHandle::subscribe_room`]). The
+//! signer-gated composer, the app publish wiring, and the rollback-freshness
+//! version field are follow-ons.
 //!
 //! ## Invariant
 //! Content keys NEVER derive from Veilid (classical x25519) material. The seal/

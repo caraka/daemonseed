@@ -359,6 +359,26 @@ functions:
     returns:
       type: "Result<()>"
       description: Ok on write.
+  - name: VeilidNetHandle::publish_current_state
+    module: daemonseed_veilid_net::actor
+    description: Publish opaque bytes to a named current-state slot (last-writer-wins) on an owner-gated rendezvous record — the Phase-4 A-b operator announcements/MOTD record. The write is owner-signed, so only a holder of owner_seed (the non-derivable project-announce owner from daemonseed_core::derive_project_announce_veilid_owner_seed — the write-gate) can place a value; clients subscribe_room and read/verify but cannot write. slot_id is the stable slot key ("motd", or an announcement's content address); bytes is a public signed SignedArtifact (verified client-side by verify_artifact, not AEAD-sealed). Spawned off-loop, per-record serialized.
+    signature: "pub async fn publish_current_state(&self, owner_seed: [u8; 32], slot_id: &str, bytes: Vec<u8>) -> Result<()>"
+    parameters:
+      - name: owner_seed
+        type: "[u8; 32]"
+        direction: in
+        description: The operator record's owner seed (the write-gate secret).
+      - name: slot_id
+        type: "&str"
+        direction: in
+        description: The stable slot key ("motd" or an announcement's content address).
+      - name: bytes
+        type: "Vec<u8>"
+        direction: in
+        description: The opaque payload (a signed SignedArtifact).
+    returns:
+      type: "Result<()>"
+      description: Ok on write.
   - name: member_slot_id
     module: daemonseed_veilid_net::actor
     description: The stable presence-slot id for a member — its identity pubkey, hex-encoded. A pure function of the member's stable identity, so a re-beacon overwrites the same current_state_subkey slot and all callers agree byte-for-byte.
