@@ -24,8 +24,6 @@ doc under `docs/design/`. When a design is accepted, its component deliverables
 become GitHub issues and the entry here is removed — but the design doc stays as
 the design-of-record.
 
-- **Sharer identity → `handle#hash` verification** — cryptographically verifiable *who I'm downloading from* (today `sharer_handle` is self-asserted, relay-unenforced, used only for the cosmetic "you" tag; likely `daemonseed-core::identity_proof`). Needs a trust-property design pass → design doc TBD.
-- **Room ↔ circle unification** — a public room and a private circle behave identically except in how the key is derived (world-derivable vs secret-entropy-gated); collapses the two parallel messaging surfaces into one key-parameterized path and closes circle message/share **authorship** provenance (today `CircleMessage` is membership-authed only — forgeable by any holder of the circle key). See [`docs/design/room-circle-unification.md`](docs/design/room-circle-unification.md).
 
 ## Features
 

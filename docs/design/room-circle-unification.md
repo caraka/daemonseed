@@ -1,6 +1,6 @@
 # Room ↔ Circle Unification — Design of Record
 
-> Status: ACCEPTED design; implementation DEFERRED behind a hard sequencing gate (see *Sequencing*). Captured 2026-06-28.
+> Status: ACCEPTED — **Option A (full type-merge) ratified 2026-07-08**; **no cutover gate** (the relay is unused, so the MAJOR wire break breaks no users). Graduated to GitHub issues. Captured 2026-06-28; resolved 2026-07-08. Implementation-ready spec in *Design (A)* below.
 
 ## Problem
 
@@ -41,24 +41,41 @@ So any holder of a circle key — an ex-member, an infiltrator, a leaked or comp
 
 ## Approach (sketch — detail at implementation)
 
-1. **Proto** (`daemonseed-proto`): merge into one room-message type (or, fallback, align `CircleMessage` to carry `sender_pubkey` + `signature`). A type-merge is the faithful expression of the principle and the larger wire break.
+1. **Proto** (`daemonseed-proto`): merge into one room-message type (**Option A, ratified** — see *Design (A)*). A type-merge is the faithful expression of the principle; the wire break is free (relay unused).
 2. **Core**: collapse the `circle` and `public_room` seal/open + verify into one path parameterized by `RoomKey`; each surface's job shrinks to "supply the key."
 3. **Shares**: route circle shares through the signed `ShareAnnouncement` path.
 4. **ISCs**: add criteria for circle authorship provenance; revise/merge the diverged criteria; tombstone per the ID-stability rule (never renumber).
 
-## Open questions
+## Resolved decisions (2026-07-08 — Option A ratified)
 
-- **Type-merge vs alignment** — one proto message (faithful, MAJOR wire break) vs two messages with identical fields (smaller break). Decide at implementation.
-- **SemVer** — MAJOR if the message types merge.
-- **Persisted-data migration** — confirm no durable unsigned circle data needs migrating (DHT/relay content is ephemeral; expected none).
-- **Opportunistic operator-gate unification** — whether to fold the operator-owner parameterization in at the same time, or leave it.
-- **Relationship to the existing `ROADMAP.md` Designs entry _"Sharer identity → handle#hash verification"_** — this design delivers that property for circles; reconcile or absorb that entry at scoping.
+- **Type-merge vs alignment → A (full type-merge).** One `RoomMessage` proto type + one seal/open path. Decisive fact: the field delta between a signed circle message and a `PublicRoomMessage` is only *(seal key, domain tag, identifier content)* — no structural divergence, so a merged type needs no mode-branching. The usual brake on a merge (the wire-break cost) is absent (relay unused). A over alignment because alignment pays the break yet leaves two parallel paths to re-drift.
+- **SemVer → MAJOR** (message types merge; wire-breaking).
+- **Persisted-data migration → none.** DHT/relay circle content is ephemeral; any unsigned backlog fails the new verify and drops. No durable unsigned circle store.
+- **Operator-gate unification → left out** (orthogonal capability; not part of the room↔circle equivalence).
+- **`ROADMAP.md` "Sharer identity → handle#hash" → absorbed for circles.** A delivers verifiable `#12hex` authorship for circle messages AND shares (the public side already has it); the ROADMAP entry is removed at graduation.
+- **Circle-identifier binding → the member-derivable circle fingerprint `SHA-384(cot_key)[:12]`** (the structural analog of the public room name), NOT the secret `cot_key`. Inside the AEAD seal; one-way (no secret leak); verifier recomputes it from its own key and checks the signature covers *that*.
+- **Key rotation → identity is the raw pubkey.** A pre-rotation own-message reads as not-`mine` after a rotation (cosmetic); a stable-ID→current-key mapping is a separate future concern (out of scope).
 
-## Sequencing (hard gate — REVISED 2026-06-29, see `unified-room-model.md`)
+## Sequencing (REVISED 2026-07-08 — cutover gate dropped)
 
-Split into two layers (caraka, 2026-06-29):
+- **Layer 1 — engine / state / discovery / liveness unification (internal, no wire break)** landed with Veilid **Phase 4** on the one unified rendezvous engine. Design-of-record: `unified-room-model.md`.
+- **Layer 2 — the proto message-type merge + signed circle authorship (this document's headline; wire-breaking, MAJOR)** is **no longer gated behind the v0.33.0 cutover.** The gate protected a non-existent user base — the relay is unused (caraka, 2026-07-08), so a wire break breaks no users. Layer 2 is built now, sequenced after the round-2 quick fixes, with its own review (**xhigh** — trust surface) and an adversarial pass on the drafted implementation. Graduated to GitHub issues 2026-07-08.
 
-- **Layer 1 — the engine / state / discovery / liveness unification (internal, no wire break)** is NOT deferred: it is the substance of Veilid **Phase 4** and is built now, on the one unified rendezvous engine (one code path, entropy-source the only variant). The room↔circle storage / discovery / fan-out / share-liveness equivalence lands here. Design-of-record: `unified-room-model.md`.
-- **Layer 2 — the proto message-type merge + signed circle authorship (this document's headline; wire-breaking, MAJOR)** rides the **v0.33.0 cutover** clean break, which pays for the wire break once. This is what stays gated: the wire merge waits for the cutover it lands with.
+## Design (A) — implementation-ready (ratified 2026-07-08)
 
-"One major refactor at a time" still holds — there is exactly one cutover and one wire break. This document's Layer-2 content graduates into GitHub issues at the cutover; the Layer-1 engine unification graduates now via `unified-room-model.md`.
+**What it fixes (not cosmetic):** the AEAD seal proves only that *a* `cot_key` holder sealed a message — never *which* member. Any holder can post spoofing another member's `sender_handle`. Per-sender ML-DSA-87 signatures close that and make `mine`/authorship key on identity.
+
+**Wire — one `RoomMessage` replaces both `CircleMessage` and `PublicRoomMessage`:**
+`RoomMessage { room_id: string, sender_pubkey: bytes, sender_handle: string, body: string, sent_unix_ms: int64, signature: bytes }`. `room_id` holds the public room name (public rooms) or the circle fingerprint `SHA-384(cot_key)[:12]` (circles). `ShareAnnouncement` already has this shape (`room` + `sender_pubkey` + `signature`), so circle shares ride it unchanged with `room` = the circle fingerprint.
+
+**Core — one signed seal/open path** parameterized by `(key, domain_tags, room_id)`; `public_room` and `circle` become thin wrappers that supply the key + their own domain tags. Mirrors `public_room::{seal,open}_room_message`.
+- Signature spans `provenance_domain ‖ room_id ‖ sender_pubkey ‖ sent_unix_ms ‖ body`.
+- **Distinct domain-separation strings per surface** — `daemonseed/public-room/message/v1` vs a NEW signed `daemonseed/circle/message/v2` (both the AEAD AAD and the provenance domain differ) — the load-bearing detail: one helper is only safe if the two callers pass different domains.
+- **Verifier recomputes the circle fingerprint from its own `cot_key`** and checks the signature covers that — never trusts the carried `room_id`.
+- **Open verifies fail-closed:** absent/empty `sender_pubkey` or `signature` = hard reject (no "unsigned/unknown sender" surface). An empty pubkey must not equal anyone.
+
+**App (gui + tui):** `mine = (sender_pubkey == my_pubkey)`, evaluated **after** signature verification, replacing handle-keyed own-message suppression — which also **fixes the rename-mid-session dedup break** (#143 root: handle is mutable, pubkey is stable).
+
+**ISCs:** add circle-authorship-provenance criteria mirroring ISC-S24 / ISC-C57; revise the ISC-10..14 "membership ≠ authorship" wording to "signed authorship"; tombstone-not-renumber per the ID-stability rule.
+
+**Migration:** none (ephemeral content). SemVer MAJOR.
