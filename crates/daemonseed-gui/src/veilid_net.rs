@@ -43,8 +43,8 @@
 //! (the AEAD seal authenticates the match), then as a lobby chat message
 //! (`open_room_message` under the lobby `PublicRoomKey`), then as a lobby
 //! `DiscoveryEnvelope` (share discovery). The distinct per-kind AAD means only the
-//! matching open succeeds. Own circle/lobby messages (already local-echoed on send)
-//! are suppressed by sender-handle match.
+//! matching open succeeds. Own circle/lobby messages are emitted `mine:true` and
+//! deduped against the optimistic local echo in `push_message` (#143).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
@@ -961,8 +961,8 @@ fn circle_fingerprint(cot_key: &CircleKey) -> AssetAddr {
 
 /// Seal a message under the circle key, publish it to the rendezvous record, and
 /// local-echo it (the DHT sweep would also re-surface our own write after watch
-/// latency; the inbound path suppresses own messages by handle to avoid a double
-/// render).
+/// latency; the inbound path emits it `mine:true` and `push_message` dedups it against
+/// this echo by `sent_unix_ms`, so there is no double render — #143).
 async fn send_circle(
     circle_id: u64,
     text: &str,
@@ -996,8 +996,8 @@ async fn send_circle(
     };
     // #101: optimistic local echo FIRST — the sender sees their own message
     // immediately, not after the DHT publish round-trip (seconds on Veilid). The
-    // delayed DHT re-surface of this same write is suppressed by sender-handle in
-    // `handle_inbound`, so there is no double-render.
+    // delayed DHT re-surface of this same write is emitted `mine:true` and deduped
+    // against this echo by `sent_unix_ms` in `push_message` (#143), so no double-render.
     let _ = evt_tx.send(NetEvent::CircleMessage {
         circle_id,
         who: my_handle.to_owned(),
@@ -1024,8 +1024,9 @@ async fn send_circle(
 /// Seal a public-room (Lobby) message under the lobby `PublicRoomKey`, publish it
 /// onto the lobby rendezvous, and optimistically local-echo it. The public-tier
 /// counterpart of [`send_circle`]: the DHT sweep re-surfaces our own write after
-/// watch latency, so `handle_inbound` suppresses own room messages by handle to
-/// avoid a double render. Mirrors the relay actor's `handle_send_room`.
+/// watch latency, so `handle_inbound` emits own room messages `mine:true` and
+/// `push_message` dedups them against this echo (#143). Mirrors the relay actor's
+/// `handle_send_room`.
 async fn send_room(
     text: &str,
     evt_tx: &UnboundedSender<NetEvent>,
@@ -1059,7 +1060,7 @@ async fn send_room(
     };
     // Optimistic local echo FIRST — the sender sees their own message immediately,
     // not after the Veilid publish round-trip; the delayed DHT re-surface of this
-    // same write is suppressed by sender-handle in `handle_inbound`.
+    // same write is emitted `mine:true` and deduped against this echo (#143).
     let _ = evt_tx.send(NetEvent::Message {
         who: my_handle.to_owned(),
         text: text.to_owned(),
@@ -1875,7 +1876,7 @@ async fn confirm_fetch_inner(
 
 /// Translate a `VeilidNetEvent` into the `NetEvent` contract. Inbound sealed bytes
 /// are tried against each joined circle's key (the AEAD seal authenticates the
-/// match); own circle messages are suppressed (already local-echoed). Bytes that
+/// match); own messages are emitted `mine:true` and deduped in `push_message` (#143). Bytes that
 /// open under no circle are tried as a lobby `DiscoveryEnvelope` (share discovery).
 /// Fold a verified member heartbeat into a room's presence tracker and push a
 /// `Roster` on a render-visible change (#74 lobby / #77 circles). ONE home for the
@@ -1930,51 +1931,47 @@ fn handle_inbound(
     );
     for circle in circles.iter() {
         if let Ok(msg) = open_message(&circle.cot_key, &bytes) {
-            if msg.sender_handle != my_handle {
-                daemonseed_veilid_net::vtrace!(
-                    "gui inbound: opened circle {} from '{}' -> deliver",
-                    circle.circle_id,
-                    msg.sender_handle
-                );
-                let _ = evt_tx.send(NetEvent::CircleMessage {
-                    circle_id: circle.circle_id,
-                    who: msg.sender_handle,
-                    text: msg.body,
-                    mine: false,
-                    sent_unix_ms: msg.sent_unix_ms,
-                });
-            } else {
-                daemonseed_veilid_net::vtrace!(
-                    "gui inbound: opened circle {} but SUPPRESSED (own handle '{}')",
-                    circle.circle_id,
-                    my_handle
-                );
-            }
+            // #143: emit own messages too (mine == our handle) instead of suppressing.
+            // A LIVE own message dedups against its optimistic local echo in
+            // `push_message` (same `sent_unix_ms`); a COLD-START backlog own message has
+            // no prior echo and renders once — so the reconstructed transcript shows
+            // BOTH halves of the conversation, not just the other party's.
+            let mine = msg.sender_handle == my_handle;
+            daemonseed_veilid_net::vtrace!(
+                "gui inbound: opened circle {} from '{}' (mine={mine}) -> deliver",
+                circle.circle_id,
+                msg.sender_handle
+            );
+            let _ = evt_tx.send(NetEvent::CircleMessage {
+                circle_id: circle.circle_id,
+                who: msg.sender_handle,
+                text: msg.body,
+                mine,
+                sent_unix_ms: msg.sent_unix_ms,
+            });
             return; // opened under exactly one circle
         }
     }
     // Not a circle message — try it as a public-room (Lobby) chat message before
     // share discovery. Both ride the lobby record; the distinct per-kind AAD means
     // only the matching open succeeds (a DiscoveryEnvelope fails `open_room_message`'s
-    // AEAD and a chat blob fails `apply_discovery`). Own messages are suppressed —
-    // already local-echoed on send (#101 lesson, mirrored for the public tier).
+    // AEAD and a chat blob fails `apply_discovery`). #143: own messages are emitted
+    // `mine:true` (not suppressed) — they dedup against the optimistic local echo live
+    // (same `sent_unix_ms`) and render once from the cold-start backlog.
     if let Some(lobby) = shares.lobby.as_ref()
         && let Ok(msg) = open_room_message(&lobby.room_key, &bytes)
     {
-        if msg.sender_handle != my_handle {
-            daemonseed_veilid_net::vtrace!(
-                "gui inbound: opened lobby chat from '{}' -> deliver",
-                msg.sender_handle
-            );
-            let _ = evt_tx.send(NetEvent::Message {
-                who: msg.sender_handle,
-                text: msg.body,
-                mine: false,
-                sent_unix_ms: msg.sent_unix_ms,
-            });
-        } else {
-            daemonseed_veilid_net::vtrace!("gui inbound: lobby chat SUPPRESSED (own handle)");
-        }
+        let mine = msg.sender_handle == my_handle;
+        daemonseed_veilid_net::vtrace!(
+            "gui inbound: opened lobby chat from '{}' (mine={mine}) -> deliver",
+            msg.sender_handle
+        );
+        let _ = evt_tx.send(NetEvent::Message {
+            who: msg.sender_handle,
+            text: msg.body,
+            mine,
+            sent_unix_ms: msg.sent_unix_ms,
+        });
         return;
     }
     // Not a chat message — try it as a lobby member-presence heartbeat (#74). A
@@ -2706,11 +2703,11 @@ mod tests {
         }
     }
 
-    /// Our own lobby message re-surfaces via the DHT sweep; we already echoed it on
-    /// send, so the inbound copy (same handle) is suppressed — no double render
-    /// (#101 own-suppression, mirrored for the public tier).
+    /// Our own lobby message re-surfaces via the DHT sweep; it is emitted `mine:true`
+    /// (dedup against the echo lives in `push_message`), and on a cold-start backlog
+    /// with no echo it renders once (#143).
     #[test]
-    fn handle_inbound_suppresses_our_own_looped_back_lobby_message() {
+    fn handle_inbound_emits_our_own_looped_back_lobby_message_as_mine() {
         let me = announcer(32);
         let my_handle = "me#aabbccddeeff";
         let mut shares = ShareState::new();
@@ -2726,10 +2723,21 @@ mod tests {
             my_handle,
             &mut shares,
         );
-        assert!(
-            evt_rx.try_recv().is_err(),
-            "our own looped-back lobby message must be suppressed"
-        );
+        // #143: an own looped-back message is now EMITTED as `mine:true` (not
+        // suppressed) — dedup against the optimistic local echo happens in
+        // `push_message`; the cold-start backlog (no echo) renders it once.
+        let ev = evt_rx
+            .try_recv()
+            .expect("own looped-back lobby message must now be emitted");
+        let NetEvent::Message {
+            who, text, mine, ..
+        } = ev
+        else {
+            panic!("expected a lobby Message event for the own looped-back line");
+        };
+        assert_eq!(who, my_handle);
+        assert_eq!(text, "my own line");
+        assert!(mine, "own message must be flagged mine:true");
     }
 
     /// `SendRoom` with no lobby subscribed reports a clean error rather than
