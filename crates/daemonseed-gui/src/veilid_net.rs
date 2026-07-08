@@ -55,11 +55,17 @@ use daemonseed_cli::public_space::{
     post_render_fields, render_motd, sign_motd, sign_post, verify_served_motd, verify_served_post,
 };
 use daemonseed_cli::route_signer::IdentityRouteAdvertSigner;
-use daemonseed_core::circle::key::{CircleKey, derive_circle_veilid_owner_seed, derive_cot_key};
+use daemonseed_core::circle::default_circle_label;
+use daemonseed_core::circle::key::{
+    CircleKey, derive_circle_presence_veilid_owner_seed, derive_circle_veilid_owner_seed,
+    derive_cot_key,
+};
 use daemonseed_core::circle::message::{open_message, seal_message};
 use daemonseed_core::cot::{AssetAddr, asset_address};
 use daemonseed_core::crypto::suite::CNSA_2_0;
-use daemonseed_core::heartbeat::{HeartbeatFields, open_heartbeat, seal_public_heartbeat};
+use daemonseed_core::heartbeat::{
+    HeartbeatFields, open_heartbeat, seal_circle_heartbeat, seal_public_heartbeat,
+};
 use daemonseed_core::identity::keys::{Identity, SignKeypair, derive_identity_keys};
 use daemonseed_core::identity::mnemonic::Mnemonic;
 use daemonseed_core::presence::{
@@ -153,6 +159,13 @@ struct VeilidCircle {
     circle_id: u64,
     cot_key: CircleKey,
     owner_seed: [u8; 32],
+    /// The circle's **presence** sibling record owner seed (#77, P1: presence rides
+    /// its OWN record, never the chat rendezvous). Publishes/subscribes circle beacons.
+    presence_owner_seed: [u8; 32],
+    /// Receiver-side liveness view for THIS circle's roster (#77): verified, fresh,
+    /// non-own circle beacons fold in via [`PresenceTracker::apply`]; the heartbeat
+    /// timer reaps it. Live-only — dropped with the circle on teardown.
+    presence: PresenceTracker,
 }
 
 /// The subscribed lobby / public-room rendezvous: the world-derivable
@@ -323,7 +336,7 @@ pub async fn veilid_net_actor(
             }
             // Only poll the Veilid event stream once connected.
             Some(ev) = recv_opt(&mut ev_rx), if ev_rx.is_some() => {
-                handle_inbound(ev, &evt_tx, &circles, &my_handle, &mut shares);
+                handle_inbound(ev, &evt_tx, &mut circles, &my_handle, &mut shares);
             }
             // Age out discovered shares not reheard within the TTL (Shape B liveness):
             // a sharer that vanished without a withdraw self-clears from the list.
@@ -336,7 +349,7 @@ pub async fn veilid_net_actor(
             // Emit one lobby presence beacon + reap the roster, then re-arm the timer
             // with a fresh jittered deadline.
             () = heartbeat.as_mut() => {
-                emit_and_reap_lobby_presence(&evt_tx, &net, &my_handle, &mut shares);
+                emit_and_reap_presence(&evt_tx, &net, &my_handle, &mut shares, &mut circles);
                 heartbeat
                     .as_mut()
                     .reset(tokio::time::Instant::now() + veilid_presence_interval());
@@ -367,11 +380,12 @@ fn veilid_presence_interval() -> Duration {
 /// can take seconds, so awaiting it inline in the select arm would stall the loop —
 /// no inbound chat rendered, no commands serviced — every ~15–20 s. The reap is a
 /// fast in-memory op and stays inline.
-fn emit_and_reap_lobby_presence(
+fn emit_and_reap_presence(
     evt_tx: &UnboundedSender<NetEvent>,
     net: &Option<VeilidNetHandle>,
     my_handle: &str,
     shares: &mut ShareState,
+    circles: &mut [VeilidCircle],
 ) {
     // EMIT — needs an identity to self-sign with (ISC-C57), a live transport, and a
     // subscribed lobby. The beacon carries this node's served-share digest (#76).
@@ -408,6 +422,51 @@ fn emit_and_reap_lobby_presence(
             circle_id: None,
             entries,
         });
+    }
+
+    // ── Per-circle presence (#77) ──
+    // One beacon per joined circle, sealed under that circle's `cot_key` and
+    // published to that circle's presence sibling record. Mirrors the lobby emit
+    // above + the relay `Actor::handle_emit_heartbeat` circle loop. `room` is the
+    // circle's deterministic client-local label (provenance-only — the beacon is
+    // self-verifying; routing is by which circle's key opened it, not the label).
+    // No circle-share digest yet (#76): an empty `live_share_ids`. Skip entirely
+    // (no keypair clone) when no circles are joined.
+    if !circles.is_empty()
+        && let (Some(handle), Some(signing)) = (net.as_ref(), shares.signing.clone())
+    {
+        let sent_unix_ms = now_unix_ms();
+        for circle in circles.iter() {
+            let label = default_circle_label(&circle_fingerprint(&circle.cot_key));
+            let fields = HeartbeatFields {
+                room: &label,
+                sender_handle: my_handle,
+                sent_unix_ms,
+                live_share_ids: &[],
+            };
+            if let Ok(sealed) = seal_circle_heartbeat(&circle.cot_key, &signing, &fields) {
+                let handle = handle.clone();
+                let seed = circle.presence_owner_seed;
+                let pubkey = signing.public_key().to_vec();
+                tokio::spawn(async move {
+                    if let Err(e) = handle.publish_presence(seed, &pubkey, sealed).await {
+                        daemonseed_veilid_net::vtrace!("gui circle presence: emit failed: {e}");
+                    }
+                });
+            }
+        }
+    }
+    // Reap each circle's tracker on the same tick; push a fresh (possibly empty)
+    // roster tagged with that circle for any tracker a reap changed.
+    let now = Instant::now();
+    for circle in circles.iter_mut() {
+        if !circle.presence.reap(now).is_empty() {
+            let entries = roster_from_members(&circle.presence.members());
+            let _ = evt_tx.send(NetEvent::Roster {
+                circle_id: Some(circle.circle_id),
+                entries,
+            });
+        }
     }
 }
 
@@ -813,12 +872,24 @@ async fn join_circle(
     if let Err(e) = handle.subscribe_circle(owner_seed).await {
         return err(format!("subscribe failed: {e}"));
     }
+    // #77: the circle PRESENCE sibling record (P1) — a distinct rendezvous so circle
+    // beacons never share the chat append-ring. Non-fatal on failure (chat still
+    // works; the roster just stays empty).
+    let presence_owner_seed = derive_circle_presence_veilid_owner_seed(phrase, &CNSA_2_0)
+        .map(|s| *s.as_bytes())
+        .unwrap_or([0u8; 32]);
+    if let Err(e) = handle.subscribe_room(presence_owner_seed).await {
+        daemonseed_veilid_net::vtrace!("gui join_circle: presence subscribe failed: {e}");
+    }
     daemonseed_veilid_net::vtrace!("gui join_circle: subscribed ok -> CircleJoined id={circle_id}");
     let fingerprint = circle_fingerprint(&cot_key);
     circles.push(VeilidCircle {
         circle_id,
         cot_key,
         owner_seed,
+        presence_owner_seed,
+        // TTL = 20s × 3 = 60s, matching the lobby presence cadence (P2).
+        presence: PresenceTracker::with_cadence(Duration::from_secs(20), HEARTBEAT_MISS_COUNT),
     });
     let _ = evt_tx.send(NetEvent::CircleJoined {
         circle_id,
@@ -1752,10 +1823,45 @@ async fn confirm_fetch_inner(
 /// are tried against each joined circle's key (the AEAD seal authenticates the
 /// match); own circle messages are suppressed (already local-echoed). Bytes that
 /// open under no circle are tried as a lobby `DiscoveryEnvelope` (share discovery).
+/// Fold a verified member heartbeat into a room's presence tracker and push a
+/// `Roster` on a render-visible change (#74 lobby / #77 circles). ONE home for the
+/// receive-side apply so the own-filter, #78 replay-freshness, and roster-emit logic
+/// can't diverge between the lobby and circle paths. `own_pubkey` is our signing
+/// pubkey (own beacons are never roster rows); `circle_id` tags the roster (`None` =
+/// lobby). The caller has already `open_heartbeat`'d the beacon (provenance verified)
+/// and scoped it to this room (the seal/key), so this only decides liveness + render.
+fn apply_inbound_beacon(
+    tracker: &mut PresenceTracker,
+    own_pubkey: Option<&[u8]>,
+    circle_id: Option<u64>,
+    hb: &wire::MemberHeartbeat,
+    evt_tx: &UnboundedSender<NetEvent>,
+) {
+    // Own beacon → presence is implicit for us, never a roster row.
+    if own_pubkey.is_some_and(|pk| beacon_is_own(pk, &hb.sender_pubkey)) {
+        return;
+    }
+    // #78 replay-freshness: drop a captured/replayed or future-dated beacon so it
+    // cannot pin a departed member present past the TTL.
+    if !beacon_is_fresh(hb.sent_unix_ms, now_unix_ms()) {
+        return;
+    }
+    let prior_handle = tracker
+        .members()
+        .into_iter()
+        .find(|m| m.pubkey == hb.sender_pubkey)
+        .map(|m| m.handle);
+    let change = tracker.apply(hb, Instant::now());
+    if roster_render_changed(change, prior_handle.as_deref(), &hb.sender_handle) {
+        let entries = roster_from_members(&tracker.members());
+        let _ = evt_tx.send(NetEvent::Roster { circle_id, entries });
+    }
+}
+
 fn handle_inbound(
     ev: VeilidNetEvent,
     evt_tx: &UnboundedSender<NetEvent>,
-    circles: &[VeilidCircle],
+    circles: &mut [VeilidCircle],
     my_handle: &str,
     shares: &mut ShareState,
 ) {
@@ -1768,7 +1874,7 @@ fn handle_inbound(
         bytes.len(),
         circles.len()
     );
-    for circle in circles {
+    for circle in circles.iter() {
         if let Ok(msg) = open_message(&circle.cot_key, &bytes) {
             if msg.sender_handle != my_handle {
                 daemonseed_veilid_net::vtrace!(
@@ -1828,33 +1934,31 @@ fn handle_inbound(
     if let Some(lobby) = shares.lobby.as_mut()
         && let Ok(hb) = open_heartbeat(&lobby.room_key, &bytes)
     {
-        // Own beacon → presence is implicit for us, never a roster row.
-        if own_pubkey
-            .as_deref()
-            .is_some_and(|pk| beacon_is_own(pk, &hb.sender_pubkey))
-        {
-            return;
-        }
-        // #78 replay-freshness: drop a captured/replayed or future-dated beacon so
-        // it cannot pin a departed member present past the TTL.
-        if !beacon_is_fresh(hb.sent_unix_ms, now_unix_ms()) {
-            return;
-        }
-        let prior_handle = lobby
-            .presence
-            .members()
-            .into_iter()
-            .find(|m| m.pubkey == hb.sender_pubkey)
-            .map(|m| m.handle);
-        let change = lobby.presence.apply(&hb, Instant::now());
-        if roster_render_changed(change, prior_handle.as_deref(), &hb.sender_handle) {
-            let entries = roster_from_members(&lobby.presence.members());
-            let _ = evt_tx.send(NetEvent::Roster {
-                circle_id: None,
-                entries,
-            });
-        }
+        apply_inbound_beacon(
+            &mut lobby.presence,
+            own_pubkey.as_deref(),
+            None,
+            &hb,
+            evt_tx,
+        );
         return;
+    }
+    // Not a lobby heartbeat — try it as a CIRCLE member-presence heartbeat (#77).
+    // Each circle's beacon rides its OWN presence record but arrives as the same
+    // Inbound (no record tag); try opening under each joined circle's `cot_key` (the
+    // seal scopes it to that circle), then fold it into THAT circle's roster via the
+    // shared apply path. Mirrors the relay `Actor::handle_apply_heartbeat` circle route.
+    for circle in circles.iter_mut() {
+        if let Ok(hb) = open_heartbeat(&circle.cot_key, &bytes) {
+            apply_inbound_beacon(
+                &mut circle.presence,
+                own_pubkey.as_deref(),
+                Some(circle.circle_id),
+                &hb,
+                evt_tx,
+            );
+            return; // opened under exactly one circle
+        }
     }
     // Not a heartbeat — try it as a lobby share-discovery item.
     if apply_discovery(shares, evt_tx, &bytes) {
@@ -2344,6 +2448,53 @@ mod tests {
         ));
     }
 
+    /// #77: a verified, fresh, non-own circle beacon (sealed under the circle's
+    /// `cot_key`) folds into THAT circle's roster and pushes a `Roster` tagged with
+    /// its `circle_id` — the per-circle mirror of the lobby presence path.
+    #[test]
+    fn circle_heartbeat_folds_into_the_owning_circles_roster() {
+        let _ = oxicrypt_module::initialize();
+        let phrase = "a shared circle passphrase for presence #77";
+        let cot_key = derive_cot_key(phrase, &CNSA_2_0).unwrap();
+        // A DISTINCT member (not us): shares.signing is None below, so the own-filter
+        // is a no-op and this beacon is a genuine "other member" row.
+        let member = announcer(77);
+        let label = default_circle_label(&circle_fingerprint(&cot_key));
+        let fields = HeartbeatFields {
+            room: &label,
+            sender_handle: "otter#aabbccddeeff",
+            sent_unix_ms: now_unix_ms(),
+            live_share_ids: &[],
+        };
+        let sealed = seal_circle_heartbeat(&cot_key, &member, &fields).unwrap();
+
+        let mut circles = vec![VeilidCircle {
+            circle_id: 42,
+            cot_key: derive_cot_key(phrase, &CNSA_2_0).unwrap(),
+            owner_seed: [0u8; 32],
+            presence_owner_seed: [0u8; 32],
+            presence: PresenceTracker::with_cadence(Duration::from_secs(20), HEARTBEAT_MISS_COUNT),
+        }];
+        let mut shares = ShareState::new(); // signing None → own-filter no-op
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        handle_inbound(
+            VeilidNetEvent::Inbound { bytes: sealed },
+            &evt_tx,
+            &mut circles,
+            "guest",
+            &mut shares,
+        );
+        assert_eq!(
+            circles[0].presence.len(),
+            1,
+            "the beacon folded into the circle"
+        );
+        assert!(matches!(
+            evt_rx.try_recv(),
+            Ok(NetEvent::Roster { circle_id: Some(42), entries }) if entries.len() == 1
+        ));
+    }
+
     /// The operator-item envelope round-trips through the 1-byte KIND tag, and a
     /// buffer with no tag byte is rejected (not an operator item).
     #[test]
@@ -2451,7 +2602,7 @@ mod tests {
         handle_inbound(
             VeilidNetEvent::Inbound { bytes: sealed },
             &evt_tx,
-            &[],
+            &mut [],
             "me#000000000000",
             &mut shares,
         );
@@ -2487,7 +2638,7 @@ mod tests {
         handle_inbound(
             VeilidNetEvent::Inbound { bytes: sealed },
             &evt_tx,
-            &[],
+            &mut [],
             my_handle,
             &mut shares,
         );

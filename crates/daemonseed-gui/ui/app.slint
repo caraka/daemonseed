@@ -1077,15 +1077,17 @@ export component AppWindow inherits Window {
         // ── RIGHT: live Lobby roster (#75) ── the people column. Per the presence
         // design-of-record the roster IS the indication: names appear when a heartbeat
         // arrives and vanish past TTL — no dots/badges/"last seen"/toasts. Shown only
-        // for the Lobby Chat; the width collapses to 0 off-Lobby so chat reclaims the
-        // space (circle presence is #77). Demonsaw's full-height roster pane.
+        // for the active room's Chat (Lobby OR a circle, #77); the width collapses to
+        // 0 off the chat tab so the announcements/other tabs reclaim the space. The
+        // Rust side sets `root.roster` to the ACTIVE room's roster, so this pane always
+        // shows the current room's HERE NOW. Demonsaw's full-height roster pane.
         Rectangle {
-            width: (root.active == 0 && root.active-tab == 0) ? 1px : 0px;
+            width: (root.active-tab == 0) ? 1px : 0px;
             background: #ffffff12;
         }
         Rectangle {
-            width: (root.active == 0 && root.active-tab == 0) ? 240px : 0px;
-            visible: root.active == 0 && root.active-tab == 0;
+            width: (root.active-tab == 0) ? 240px : 0px;
+            visible: root.active-tab == 0;
             background: #0d0e10;
             VerticalLayout {
                 padding: 12px; spacing: 8px;
