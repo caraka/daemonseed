@@ -1675,14 +1675,7 @@ fn apply_net_event(
             ui.set_share_status(SharedString::from(message));
         }
         // ── Announcements + MOTD pane (#91/#92) + unread-gated landing (#93) ──
-        NetEvent::PublicSpaceSnapshot {
-            view,
-            can_compose,
-            // #142: `connect_time` no longer drives an auto-land — the client never
-            // force-opens the pane; unread is computed on EVERY snapshot (connect +
-            // mid-session), so the flag is ignored here.
-            connect_time: _,
-        } => {
+        NetEvent::PublicSpaceSnapshot { view, can_compose } => {
             apply_announcements(ui, &view, can_compose);
             // #93/#142: the client-derived combined content hash is the unread marker.
             let current = combined_content_hash(&view);

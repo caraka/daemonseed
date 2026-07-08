@@ -497,16 +497,12 @@ pub enum NetEvent {
     /// ([`composer_visible`]): true iff the held stable identity key is on the
     /// relay's published whitelist, gating the composer affordance — false for a
     /// non-signer or the ephemeral / no-profile path. The `main.rs` arm renders the
-    /// `view` into the announcements pane and shows/hides the composer.
-    ///
-    /// `connect_time` (#93) marks the snapshot produced by the automatic
-    /// connect-time fetch (vs a manual Refresh / on-tab poll / post-upload
-    /// refresh). The unread gate auto-opens the announcements pane ONLY on a
-    /// connect-time snapshot, so a manual refresh never yanks the user away.
+    /// `view` into the announcements pane and shows/hides the composer. The client
+    /// never force-opens the pane; a per-relay content-hash unread dot (#142) marks
+    /// changed content on every snapshot (connect + mid-session alike).
     PublicSpaceSnapshot {
         view: AnnouncementsView,
         can_compose: bool,
-        connect_time: bool,
     },
     /// (#91) A public-space fetch could not complete (not connected, a refused RPC,
     /// or a malformed whitelist). The previous pane content is left unchanged.
@@ -1144,7 +1140,7 @@ impl Actor {
                     // whitelist) yields an empty view — the gate then compares an
                     // empty-content hash and behaves sanely. Best-effort: a refused
                     // fetch surfaces as a PublicSpaceError and never aborts the connect.
-                    self.handle_refresh_public_space(true).await;
+                    self.handle_refresh_public_space().await;
                 }
                 Err(e) => {
                     self.emit(NetEvent::ConnectFailed {
@@ -2285,12 +2281,7 @@ impl Actor {
     /// and emit a single [`NetEvent::PublicSpaceSnapshot`]. Mirrors the TUI's
     /// `handle_refresh_public_space`. Any missing session / pinned key, or a refused
     /// RPC, surfaces as [`NetEvent::PublicSpaceError`] and leaves the pane unchanged.
-    ///
-    /// `connect_time` (#93) is threaded onto the emitted
-    /// [`NetEvent::PublicSpaceSnapshot`] so the binary auto-lands on the pane only
-    /// for the connect-time fetch — `true` from the post-connect fetch, `false` from
-    /// the manual Refresh / on-tab poll / post-upload refresh.
-    async fn handle_refresh_public_space(&mut self, connect_time: bool) {
+    async fn handle_refresh_public_space(&mut self) {
         let (Some(session), Some(server_pubkey)) =
             (self.session.as_ref(), self.server_pubkey.as_ref())
         else {
@@ -2338,11 +2329,7 @@ impl Actor {
             .stable_signing_key
             .as_ref()
             .is_some_and(|kp| composer_visible(kp.public_key(), &whitelist.entries));
-        self.emit(NetEvent::PublicSpaceSnapshot {
-            view,
-            can_compose,
-            connect_time,
-        });
+        self.emit(NetEvent::PublicSpaceSnapshot { view, can_compose });
     }
 
     /// (#92) Sign an announcement post with the held stable identity key and
@@ -2378,7 +2365,7 @@ impl Actor {
             })
             .await
         {
-            Ok(_) => self.handle_refresh_public_space(false).await,
+            Ok(_) => self.handle_refresh_public_space().await,
             Err(status) => self.emit(NetEvent::PublicSpaceError {
                 message: format!("announcement upload refused: {}", status.message()),
             }),
@@ -2428,7 +2415,7 @@ impl Actor {
             })
             .await
         {
-            Ok(_) => self.handle_refresh_public_space(false).await,
+            Ok(_) => self.handle_refresh_public_space().await,
             Err(status) => self.emit(NetEvent::PublicSpaceError {
                 message: format!("MOTD upload refused: {}", status.message()),
             }),
@@ -2872,7 +2859,7 @@ async fn net_actor(
             }
             NetCommand::RefreshShares => actor.handle_refresh_shares().await,
             NetCommand::ResweepShares => actor.handle_refresh_shares().await,
-            NetCommand::RefreshPublicSpace => actor.handle_refresh_public_space(false).await,
+            NetCommand::RefreshPublicSpace => actor.handle_refresh_public_space().await,
             NetCommand::UploadAnnouncement { topic, body } => {
                 actor.handle_upload_announcement(&topic, &body).await
             }

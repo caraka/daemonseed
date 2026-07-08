@@ -123,14 +123,6 @@ const CHUNK_FETCH_CONCURRENCY: usize = 8;
 // MOTD from an announcement by content. Each value published to the operator record
 // is therefore prefixed with a 1-byte KIND tag: `[kind] ++ prost(artifact)`.
 
-/// Delay after Connect before the #93 unread-gated landing fires its one-shot
-/// self-refresh (`RefreshPublicSpace`) fires. **#142 removed the #93 auto-landing this
-/// used to trigger** — the client no longer force-opens the pane (it shows an unread dot
-/// instead), so this is now just a post-connect refresh nudge and its exact value no
-/// longer gates anything. The spawn + this const are vestigial and slated for removal
-/// alongside the `connect_time` / `landing_pending` plumbing (deferred). Felt-tunable.
-const OPERATOR_CONNECT_LANDING_DELAY: Duration = Duration::from_secs(35);
-
 /// #140 stepped warmup re-sweep schedule: absolute deadlines from connect at which a
 /// force-refresh re-sweep round runs (dispatched via `sleep_until`, so a round's own
 /// re-sweep await time never pushes later rounds later — no accumulated drift). The
@@ -273,12 +265,6 @@ struct OperatorSpace {
     motd: Option<wire::SignedArtifact>,
     /// Verified announcement posts, keyed by their content-address hex slot.
     posts: BTreeMap<String, wire::Post>,
-    /// #93 unread-gated landing: `true` from subscribe until the ONE connect-time
-    /// snapshot has been emitted (by the delayed self-refresh, or a manual open first).
-    /// The next refresh with this set emits `connect_time: true` so `main.rs` runs the
-    /// landing decision (land on the pane iff the content changed since last seen),
-    /// then clears it — a manual refresh / poll / post-publish refresh never re-lands.
-    landing_pending: bool,
 }
 
 /// The actor's public-share state (Phase 3 Slice 2b): the held signing key, the
@@ -557,7 +543,10 @@ async fn recv_opt(ev_rx: &mut Option<UnboundedReceiver<VeilidNetEvent>>) -> Opti
 async fn handle_command(
     cmd: NetCommand,
     evt_tx: &UnboundedSender<NetEvent>,
-    cmd_tx: &UnboundedSender<NetCommand>,
+    // Kept for a uniform spawn signature with the relay actor; the veilid actor no
+    // longer self-sends (the #93 connect-landing refresh that used it was removed in
+    // #142 in favour of the #142 unread dot).
+    _cmd_tx: &UnboundedSender<NetCommand>,
     net: &mut Option<VeilidNetHandle>,
     ev_rx: &mut Option<UnboundedReceiver<VeilidNetEvent>>,
     circles: &mut Vec<VeilidCircle>,
@@ -587,24 +576,12 @@ async fn handle_command(
                 // Subscribe the operator announce/MOTD record (Phase 4 A-c) so MOTD +
                 // announcement items fold in as they arrive.
                 subscribe_operator_space(shares, net).await;
-                // #93 connect-landing: re-arm for THIS connect (relay parity — the
-                // landing fires on every connect if the content changed since last seen,
-                // not only the first), then fire a delayed settle-then-refresh. The
-                // operator backlog arrives ASYNC via the post-connect sweep, so a delayed
-                // one-shot self-refresh runs the landing decision over the SETTLED view —
-                // an eager connect_time snapshot would land on an empty/partial view and
-                // false-positive-land on every reconnect. The self-sent RefreshPublicSpace
-                // consumes `landing_pending` and emits the single connect_time:true
-                // snapshot; the delay sits just past the first warmup re-sweep rounds
-                // (#140) so re-swept operator items have folded. A felt-test tunable.
-                if let Some(op) = shares.operator.as_mut() {
-                    op.landing_pending = true;
-                    let cmd_tx = cmd_tx.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(OPERATOR_CONNECT_LANDING_DELAY).await;
-                        let _ = cmd_tx.send(NetCommand::RefreshPublicSpace);
-                    });
-                }
+                // Operator content (MOTD/announcements) folds in ASYNC via the
+                // post-connect sweep + watch; each verified fold emits a
+                // `PublicSpaceSnapshot` that drives the #142 unread dot, and the warmup
+                // re-sweep below force-refreshes the operator record early. (The #93
+                // connect-time auto-landing was removed in #142 in favour of the dot, so
+                // there is no self-sent settle-refresh here any more.)
                 // #102: relay-parity — silently re-subscribe persisted circles after
                 // attach, so a circle restored into the UI is actually joined on the
                 // transport (else SendCircle finds known=[] → "join before sending").
@@ -635,8 +612,8 @@ async fn handle_command(
                 // window is missed by the join-time one-shot sweep and only surfaces
                 // late. Replace the single delayed re-sweep with a STEPPED, priority-
                 // ordered schedule ([`WARMUP_RESWEEP_SCHEDULE`]): force-refresh the
-                // operator record first (its MOTD/announce feeds the #93 landing), then
-                // the lobby, then circles, at widening delays. Re-swept already-seen
+                // operator record first (its MOTD/announce feeds the #142 unread dot),
+                // then the lobby, then circles, at widening delays. Re-swept already-seen
                 // items are deduped downstream (`apply_discovery` self-filter,
                 // `push_message` exact-match). Presence records self-heal via the
                 // heartbeat cycle and are excluded.
@@ -657,7 +634,7 @@ async fn handle_command(
                     tokio::spawn(async move {
                         // Absolute deadlines from connect: `sleep_until` means a round's own
                         // re-sweep await time never pushes later rounds later (#140 review —
-                        // no accumulated drift, so round 2 stays at/under the 35 s #93 landing).
+                        // no accumulated drift between rounds).
                         let start = tokio::time::Instant::now();
                         for (round, &at) in WARMUP_RESWEEP_SCHEDULE.iter().enumerate() {
                             tokio::time::sleep_until(start + at).await;
@@ -1147,7 +1124,6 @@ async fn subscribe_operator_space(shares: &mut ShareState, net: &Option<VeilidNe
         announce_owner_seed,
         motd: None,
         posts: BTreeMap::new(),
-        landing_pending: true,
     });
 }
 
@@ -1160,11 +1136,8 @@ async fn subscribe_operator_space(shares: &mut ShareState, net: &Option<VeilidNe
 /// through `build_announcements_view` here would re-run the ML-DSA-87 signature check
 /// on every stored post on every inbound item — O(N²) post-quantum work on the event
 /// path during a backlog sweep (review finding). `can_compose = true` is the dev
-/// possession gate. `connect_time` drives the #93 unread-gated landing in `main.rs`:
-/// `true` ONLY for the single post-connect settle snapshot (so it can auto-land on
-/// the pane when the content changed) — every other snapshot (a manual refresh, an
-/// inbound fold, a post-publish refresh) passes `false` so it never yanks the user.
-fn public_space_snapshot_event(op: &OperatorSpace, connect_time: bool) -> NetEvent {
+/// possession gate.
+fn public_space_snapshot_event(op: &OperatorSpace) -> NetEvent {
     let motd = op.motd.as_ref().map(render_motd);
     let posts = op
         .posts
@@ -1181,7 +1154,6 @@ fn public_space_snapshot_event(op: &OperatorSpace, connect_time: bool) -> NetEve
     NetEvent::PublicSpaceSnapshot {
         view: AnnouncementsView { motd, posts },
         can_compose: true,
-        connect_time,
     }
 }
 
@@ -1209,10 +1181,7 @@ async fn refresh_public_space(
     subscribe_operator_space(shares, net).await;
     match shares.operator.as_mut() {
         Some(op) => {
-            // Consume the one-shot connect-landing flag: this snapshot may auto-land
-            // (#93); every subsequent refresh is a plain re-render that never re-lands.
-            let connect_time = std::mem::replace(&mut op.landing_pending, false);
-            let _ = evt_tx.send(public_space_snapshot_event(op, connect_time));
+            let _ = evt_tx.send(public_space_snapshot_event(op));
         }
         None => {
             let _ = evt_tx.send(NetEvent::PublicSpaceError {
@@ -1268,7 +1237,7 @@ async fn set_motd(
         op.motd = Some(artifact);
     }
     if let Some(op) = shares.operator.as_ref() {
-        let _ = evt_tx.send(public_space_snapshot_event(op, false));
+        let _ = evt_tx.send(public_space_snapshot_event(op));
     }
 }
 
@@ -1318,7 +1287,7 @@ async fn upload_announcement(
         op.posts.insert(slot, post);
     }
     if let Some(op) = shares.operator.as_ref() {
-        let _ = evt_tx.send(public_space_snapshot_event(op, false));
+        let _ = evt_tx.send(public_space_snapshot_event(op));
     }
 }
 
@@ -1409,7 +1378,7 @@ fn apply_operator_item(
         _ => return false, // unknown tag → not an operator item
     }
     if let Some(op) = shares.operator.as_ref() {
-        let _ = evt_tx.send(public_space_snapshot_event(op, false));
+        let _ = evt_tx.send(public_space_snapshot_event(op));
     }
     true
 }
@@ -2558,7 +2527,6 @@ mod tests {
             announce_owner_seed: [0u8; 32],
             motd: None,
             posts: BTreeMap::new(),
-            landing_pending: false,
         }
     }
 
@@ -2603,38 +2571,21 @@ mod tests {
         );
     }
 
-    /// A-d (#93): the FIRST refresh after subscribe consumes `landing_pending` and
-    /// emits `connect_time: true` (so `main.rs` runs the unread-gated landing); the
-    /// next refresh is `connect_time: false` — a manual refresh / poll / post-publish
-    /// refresh never re-lands.
+    /// `refresh_public_space` re-renders the current operator content as a plain
+    /// `PublicSpaceSnapshot`. (The #93 connect-time landing signal was removed in #142 in
+    /// favour of the #142 unread dot, so every refresh is an equal re-render — there is
+    /// no longer a one-shot "landing" snapshot.)
     #[tokio::test]
-    async fn refresh_fires_the_connect_landing_once_then_clears() {
+    async fn refresh_public_space_emits_a_snapshot() {
         let mut shares = ShareState::new();
-        let mut op = operator_space();
-        op.landing_pending = true;
-        shares.operator = Some(op);
+        shares.operator = Some(operator_space());
         let net: Option<VeilidNetHandle> = None; // already subscribed → no re-subscribe
         let (evt_tx, mut evt_rx) = unbounded_channel();
 
         refresh_public_space(&mut shares, &evt_tx, &net).await;
-        assert!(
-            matches!(
-                evt_rx.try_recv(),
-                Ok(NetEvent::PublicSpaceSnapshot {
-                    connect_time: true,
-                    ..
-                })
-            ),
-            "first post-connect refresh lands"
-        );
-        // Consumed → subsequent refreshes never re-land.
-        refresh_public_space(&mut shares, &evt_tx, &net).await;
         assert!(matches!(
             evt_rx.try_recv(),
-            Ok(NetEvent::PublicSpaceSnapshot {
-                connect_time: false,
-                ..
-            })
+            Ok(NetEvent::PublicSpaceSnapshot { .. })
         ));
     }
 
@@ -2721,17 +2672,9 @@ mod tests {
         assert!(apply_operator_item(&mut shares, &evt_tx, &bytes));
         assert!(shares.operator.as_ref().unwrap().motd.is_some());
         match evt_rx.try_recv() {
-            Ok(NetEvent::PublicSpaceSnapshot {
-                view,
-                can_compose,
-                connect_time,
-            }) => {
+            Ok(NetEvent::PublicSpaceSnapshot { view, can_compose }) => {
                 assert_eq!(view.motd.as_deref(), Some("Welcome to daemonseed"));
                 assert!(can_compose, "dev-possession gate is open");
-                assert!(
-                    !connect_time,
-                    "an inbound fold is never the connect-time land"
-                );
             }
             other => panic!("expected a PublicSpaceSnapshot, got {other:?}"),
         }
