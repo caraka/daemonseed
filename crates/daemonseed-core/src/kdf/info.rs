@@ -222,6 +222,25 @@ pub fn public_room_presence_veilid_owner(family: &str, room: &str) -> String {
         .replace("{room}", room)
 }
 
+// ── Project announce channel (F17 / A0/A1) ──────────────────────────────────
+
+/// HKDF salt for the project-announce Veilid rendezvous-owner seed (Phase 4 A1).
+/// A fixed protocol constant. The IKM is the maintainer-held project-release seed
+/// (F17), so the owner keypair — the DHT write-gate for the single project
+/// announcements/MOTD channel (A0) — is NON-derivable by clients (they hold only
+/// the derived owner pubkey). A distinct salt so the announce owner can never
+/// collide with a circle/room owner or the content-signing key.
+pub const PROJECT_ANNOUNCE_OWNER_SALT: &[u8] = b"daemonseed/v1/project-announce-owner";
+
+/// HKDF info string for the project-announce Veilid rendezvous-owner seed (Phase 4
+/// A1). A **sibling** of the F17 content-signing key: both derive from the one
+/// maintainer-held project-release seed, but the content key uses the seed as an
+/// ML-DSA seed directly while this HKDF-expands it under this label — so
+/// transport-owner and content-signing material are domain-separated (possessing
+/// one never yields the other). A single global channel — no per-room/family
+/// distinguisher.
+pub const PROJECT_ANNOUNCE_VEILID_OWNER: &str = "daemonseed/veilid/project-announce-owner";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,6 +361,31 @@ mod tests {
         assert_ne!(
             public_room_presence_veilid_owner("hkdf-sha384", "lobby"),
             circle_presence_veilid_owner("hkdf-sha384")
+        );
+    }
+
+    /// **Spec contract (Phase 4 A1)** — the project-announce owner salt + info
+    /// string are protocol-visible: every client derives the same announce channel
+    /// record address (from the owner pubkey) only if these bytes match. The info
+    /// label is distinct from every rendezvous-owner label so the announce owner
+    /// never collides with a circle/room/presence owner.
+    #[test]
+    fn project_announce_owner_constants_are_pinned() {
+        assert_eq!(
+            PROJECT_ANNOUNCE_OWNER_SALT,
+            b"daemonseed/v1/project-announce-owner"
+        );
+        assert_eq!(
+            PROJECT_ANNOUNCE_VEILID_OWNER,
+            "daemonseed/veilid/project-announce-owner"
+        );
+        assert_ne!(
+            PROJECT_ANNOUNCE_VEILID_OWNER,
+            circle_veilid_owner("hkdf-sha384")
+        );
+        assert_ne!(
+            PROJECT_ANNOUNCE_VEILID_OWNER,
+            public_room_veilid_owner("hkdf-sha384", "lobby")
         );
     }
 }

@@ -26,12 +26,15 @@ use core::fmt;
 use core::str::FromStr;
 use std::sync::OnceLock;
 
+use oxicrypt_kdf::HkdfSha384;
 use oxicrypt_ml_dsa as ml_dsa;
 use oxicrypt_module::Error as OxicryptError;
 use oxicrypt_sha::sha384;
+use zeroize::Zeroize;
 
 use crate::handle::{Handle, HandleParseError};
 use crate::identity::keys::{SignKeypair, verify_signature};
+use crate::kdf::info;
 
 /// Length of a SHA-384 content address, in bytes.
 pub const CONTENT_ADDRESS_LEN: usize = 48;
@@ -191,6 +194,159 @@ pub fn project_release_pubkey() -> &'static [u8; ml_dsa::PK_LEN] {
             .expect("oxicrypt module operational for project-release key derivation");
         Box::new(*kp.public_key())
     })
+}
+
+/// Length of the project-announce Veilid rendezvous-owner seed — 32 bytes (a VLD0
+/// Ed25519 secret seed).
+pub const PROJECT_ANNOUNCE_VEILID_OWNER_SEED_LEN: usize = 32;
+
+/// The project-announce channel's Veilid **rendezvous-owner** seed (Phase 4 A1) —
+/// the DHT write-gate for the single project announcements/MOTD channel (A0). A
+/// **sibling** of the F17 content-signing key: both derive from the one
+/// maintainer-held project-release seed, but the content key uses it as an ML-DSA
+/// seed directly while this HKDF-expands it under a distinct label
+/// ([`info::PROJECT_ANNOUNCE_VEILID_OWNER`]), so transport-owner and
+/// content-signing material are domain-separated — possessing one never yields the
+/// other. Held ONLY by the maintainer (the single-owner DHT constraint IS the
+/// write-gate, A1); clients hold only the derived owner PUBKEY, from which they
+/// compute the record address to read / watch / verify — they cannot write. Zeroes
+/// on drop; `Debug` is redacted (ISC-A-C1). Content NEVER derives from this.
+#[derive(zeroize::ZeroizeOnDrop)]
+pub struct ProjectAnnounceVeilidOwnerSeed(Box<[u8; PROJECT_ANNOUNCE_VEILID_OWNER_SEED_LEN]>);
+
+impl ProjectAnnounceVeilidOwnerSeed {
+    /// Borrow the raw seed bytes to build a VLD0 keypair. Callers must not copy
+    /// these into a non-zeroizing buffer.
+    pub fn as_bytes(&self) -> &[u8; PROJECT_ANNOUNCE_VEILID_OWNER_SEED_LEN] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ProjectAnnounceVeilidOwnerSeed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ProjectAnnounceVeilidOwnerSeed(<redacted>)")
+    }
+}
+
+/// Failure deriving the project-announce Veilid rendezvous-owner seed.
+#[derive(Debug)]
+pub enum AnnounceOwnerError {
+    /// The HKDF extract/expand step failed.
+    Hkdf(oxicrypt_kdf::KdfError),
+}
+
+impl fmt::Display for AnnounceOwnerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Hkdf(e) => write!(f, "project-announce owner HKDF failed: {e:?}"),
+        }
+    }
+}
+
+impl std::error::Error for AnnounceOwnerError {}
+
+/// Derive the project-announce channel's Veilid rendezvous-owner seed from the
+/// maintainer's project-release seed (A1 write-gate).
+///
+/// ```text
+///   owner_seed = HKDF-SHA-384(
+///       salt = PROJECT_ANNOUNCE_OWNER_SALT,
+///       ikm  = project_seed,                       // maintainer-held (offline in prod)
+///       info = "daemonseed/veilid/project-announce-owner")
+/// ```
+///
+/// Domain-separated from the F17 content-signing key (which uses `project_seed`
+/// as an ML-DSA seed directly), so a holder of one cannot derive the other. In
+/// production `project_seed` stays OFFLINE (maintainer-held) and only the derived
+/// owner PUBKEY is baked into clients; the in-source [`PROJECT_RELEASE_SEED`] is a
+/// dev placeholder (see [`dev_project_announce_veilid_owner_seed`]).
+pub fn derive_project_announce_veilid_owner_seed(
+    project_seed: &[u8; 32],
+) -> Result<ProjectAnnounceVeilidOwnerSeed, AnnounceOwnerError> {
+    let extract = HkdfSha384::extract(Some(info::PROJECT_ANNOUNCE_OWNER_SALT), project_seed)
+        .map_err(AnnounceOwnerError::Hkdf)?;
+    let mut seed = [0u8; PROJECT_ANNOUNCE_VEILID_OWNER_SEED_LEN];
+    if let Err(e) = extract.expand(info::PROJECT_ANNOUNCE_VEILID_OWNER.as_bytes(), &mut seed) {
+        seed.zeroize();
+        return Err(AnnounceOwnerError::Hkdf(e));
+    }
+    let boxed = Box::new(seed);
+    seed.zeroize();
+    Ok(ProjectAnnounceVeilidOwnerSeed(boxed))
+}
+
+/// The **development** project-announce owner seed, derived from the in-source
+/// [`PROJECT_RELEASE_SEED`] placeholder (F17). The dev analog of
+/// [`project_release_pubkey`]: during the private phase the project seed is
+/// in-source, so this exposes the dev channel's write-gate for the client composer
+/// and felt-tests. **Dev-only** — before the public repo opens, `PROJECT_RELEASE_SEED`
+/// becomes a baked-in owner PUBKEY whose secret stays offline, and this convenience
+/// is retired (a client then holds only the pubkey and cannot write). The
+/// dev-vs-prod owner-key custody split is the named A1/A2 accepted cost (ISA
+/// Decisions).
+pub fn dev_project_announce_veilid_owner_seed()
+-> Result<ProjectAnnounceVeilidOwnerSeed, AnnounceOwnerError> {
+    derive_project_announce_veilid_owner_seed(&PROJECT_RELEASE_SEED)
+}
+
+/// A monotonic freshness / rollback guard for an operator announce/MOTD record —
+/// the **#78 replay guard applied to the operator record** (A1, "gaps closed").
+/// Live-only DHT has no store-and-forward, so a client reading a stale subkey sees
+/// an old roster/MOTD, and an untrusted transport could serve a stale slot to roll
+/// back a revocation or a superseded MOTD. The guard holds the newest version a
+/// client has accepted and rejects anything strictly older.
+///
+/// **The version MUST be a strictly-monotonic, operator-incremented counter —
+/// NEVER a wall clock.** A `sent_unix_ms` source is unsafe *here*: an operator clock
+/// step-back (NTP correction, VM drift, a same-millisecond republish) makes a
+/// legitimate newer record carry a LOWER version, which the guard would then reject
+/// fleet-wide with no feedback — the operator's update silently vanishes. (This is
+/// why it is NOT the presence beacon's `beacon_is_fresh`, whose bounded-window,
+/// self-healing check tolerates skew: a rollback guard cannot.)
+///
+/// Keeping `last_seen` as STATE rather than a second argument makes the guard
+/// **transposition-proof** — there is no `(incoming, last_seen)` call a caller can
+/// silently reverse to invert the check (an argument-order bug here would accept
+/// rollbacks, the exact attack this exists to block).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AnnounceFreshness {
+    last_seen: u64,
+}
+
+impl AnnounceFreshness {
+    /// A guard with no record accepted yet (accepts any first version).
+    pub fn new() -> Self {
+        Self { last_seen: 0 }
+    }
+
+    /// A guard seeded from a persisted last-seen version.
+    pub fn from_last_seen(last_seen: u64) -> Self {
+        Self { last_seen }
+    }
+
+    /// The newest accepted version.
+    pub fn last_seen(&self) -> u64 {
+        self.last_seen
+    }
+
+    /// Whether an arriving record at `incoming` is fresh (`>= last_seen`, so an
+    /// idempotent re-fetch of the current version is accepted; a strictly-older slot
+    /// is rejected) — a PURE check that does not advance the state.
+    pub fn accepts(&self, incoming: u64) -> bool {
+        incoming >= self.last_seen
+    }
+
+    /// Accept an arriving record at `incoming`: returns whether it was fresh, and on
+    /// a fresh record advances `last_seen` to it (an equal re-accept is a no-op
+    /// advance). A strictly-older record is rejected and leaves the state unchanged.
+    pub fn accept(&mut self, incoming: u64) -> bool {
+        if incoming >= self.last_seen {
+            self.last_seen = incoming;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// The operator's signer whitelist (ISC-S8), plus the always-present
@@ -576,5 +732,113 @@ mod tests {
             verify_artifact(mutated, signer.public_key(), &sig, &wl),
             Err(ArtifactError::BadSignature)
         );
+    }
+
+    /// A1 — the project-announce owner seed is deterministic from the project seed
+    /// (every client/maintainer derives the same record address) and per-seed
+    /// (distinct project seeds → distinct channels).
+    #[test]
+    fn announce_owner_seed_is_deterministic_and_per_seed() {
+        let _ = oxicrypt_module::initialize();
+        let a = derive_project_announce_veilid_owner_seed(&[0x5d; 32]).unwrap();
+        let b = derive_project_announce_veilid_owner_seed(&[0x5d; 32]).unwrap();
+        assert_eq!(a.as_bytes(), b.as_bytes());
+        let other = derive_project_announce_veilid_owner_seed(&[0x11; 32]).unwrap();
+        assert_ne!(a.as_bytes(), other.as_bytes());
+    }
+
+    /// A1 domain separation — the announce owner seed is a SIBLING of the F17
+    /// content-signing key: derived from the SAME project seed but disjoint, so a
+    /// holder of the owner seed cannot recover the content-signing key material and
+    /// vice versa. (The content key uses the seed as an ML-DSA seed directly; the
+    /// owner seed HKDF-expands it under a distinct label.)
+    #[test]
+    fn announce_owner_seed_disjoint_from_content_signing_seed() {
+        let _ = oxicrypt_module::initialize();
+        let owner = derive_project_announce_veilid_owner_seed(&PROJECT_RELEASE_SEED).unwrap();
+        // The owner seed must not equal the raw project seed (the ML-DSA content
+        // key's IKM) — else the transport owner would leak the content key's seed.
+        assert_ne!(owner.as_bytes(), &PROJECT_RELEASE_SEED);
+        // And the dev convenience derives the identical seed.
+        let dev = dev_project_announce_veilid_owner_seed().unwrap();
+        assert_eq!(owner.as_bytes(), dev.as_bytes());
+    }
+
+    /// The announce owner seed is disjoint from every world-derivable rendezvous
+    /// owner (circle / room / their presence siblings), so the operator channel can
+    /// never share a record with an open rendezvous.
+    #[test]
+    fn announce_owner_seed_disjoint_from_world_derivable_owners() {
+        use crate::circle::key::{
+            derive_circle_presence_veilid_owner_seed, derive_circle_veilid_owner_seed,
+        };
+        use crate::crypto::suite::CNSA_2_0;
+        use crate::public_room::{
+            derive_room_presence_veilid_owner_seed, derive_room_veilid_owner_seed,
+        };
+        let _ = oxicrypt_module::initialize();
+        let owner = derive_project_announce_veilid_owner_seed(&PROJECT_RELEASE_SEED).unwrap();
+        assert_ne!(
+            owner.as_bytes(),
+            derive_room_veilid_owner_seed("lobby", &CNSA_2_0)
+                .unwrap()
+                .as_bytes()
+        );
+        assert_ne!(
+            owner.as_bytes(),
+            derive_room_presence_veilid_owner_seed("lobby", &CNSA_2_0)
+                .unwrap()
+                .as_bytes()
+        );
+        assert_ne!(
+            owner.as_bytes(),
+            derive_circle_veilid_owner_seed("lobby", &CNSA_2_0)
+                .unwrap()
+                .as_bytes()
+        );
+        assert_ne!(
+            owner.as_bytes(),
+            derive_circle_presence_veilid_owner_seed("lobby", &CNSA_2_0)
+                .unwrap()
+                .as_bytes()
+        );
+    }
+
+    /// `Debug` never leaks the announce owner seed (ISC-A-C1 log-surface hygiene).
+    #[test]
+    fn announce_owner_seed_debug_is_redacted() {
+        let _ = oxicrypt_module::initialize();
+        let s = derive_project_announce_veilid_owner_seed(&[7; 32]).unwrap();
+        assert_eq!(
+            format!("{s:?}"),
+            "ProjectAnnounceVeilidOwnerSeed(<redacted>)"
+        );
+    }
+
+    /// A1 rollback guard (#78 pattern) — a record at/after the last-seen version is
+    /// fresh (accept, incl. an idempotent re-fetch of the current version); a
+    /// strictly-older version (a replayed stale slot rolling back a revocation) is
+    /// rejected. `accept` advances on a fresh record and leaves state unchanged on a
+    /// stale one.
+    #[test]
+    fn announce_freshness_rejects_rollback_accepts_forward_and_equal() {
+        let g = AnnounceFreshness::from_last_seen(5);
+        assert!(g.accepts(5)); // idempotent re-fetch of current
+        assert!(g.accepts(6)); // a genuine newer publish
+        assert!(!g.accepts(4)); // a rolled-back older slot
+        assert!(!g.accepts(0)); // the empty/zero slot after having seen v5
+
+        let mut g = AnnounceFreshness::from_last_seen(5);
+        assert!(g.accept(7)); // fresh → accepted + advances
+        assert_eq!(g.last_seen(), 7);
+        assert!(!g.accept(6)); // stale → rejected, state unchanged
+        assert_eq!(g.last_seen(), 7);
+        assert!(g.accept(7)); // equal re-accept, no-op advance
+        assert_eq!(g.last_seen(), 7);
+
+        // A fresh guard starts at 0 and accepts a first record.
+        let fresh = AnnounceFreshness::new();
+        assert_eq!(fresh.last_seen(), 0);
+        assert!(fresh.accepts(1));
     }
 }

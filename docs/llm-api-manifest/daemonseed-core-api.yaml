@@ -5308,6 +5308,92 @@ functions:
       type: "&'static [u8; PK_LEN]"
       description: The always-authorized project-release public key.
 
+  - name: derive_project_announce_veilid_owner_seed
+    module: daemonseed_core::public_space
+    description: >-
+      Derive the project-announce channel's Veilid rendezvous-owner seed (Phase 4
+      A1 write-gate) — HKDF-SHA-384(salt=PROJECT_ANNOUNCE_OWNER_SALT,
+      ikm=project_seed) expand under PROJECT_ANNOUNCE_VEILID_OWNER. A sibling of the
+      F17 content-signing key (same project seed, disjoint derivation), so a holder
+      of one cannot derive the other. In production project_seed stays offline and
+      only the owner pubkey is baked into clients.
+    signature: "pub fn derive_project_announce_veilid_owner_seed(project_seed: &[u8; 32]) -> Result<ProjectAnnounceVeilidOwnerSeed, AnnounceOwnerError>"
+    parameters:
+      - name: project_seed
+        type: "&[u8; 32]"
+        direction: in
+        description: The maintainer-held project-release seed (offline in production).
+    returns:
+      type: "Result<ProjectAnnounceVeilidOwnerSeed, AnnounceOwnerError>"
+      description: The derived 32-byte VLD0 owner seed (the DHT write-gate secret).
+      error_variants:
+        - name: Hkdf
+          condition: HKDF derivation failed.
+    preconditions:
+      - description: The oxicrypt module must be operational.
+
+  - name: dev_project_announce_veilid_owner_seed
+    module: daemonseed_core::public_space
+    description: >-
+      The development project-announce owner seed, derived from the in-source
+      PROJECT_RELEASE_SEED placeholder — the dev analog of project_release_pubkey.
+      Dev-only: retired when the seed becomes a baked-in pubkey (secret offline).
+    signature: "pub fn dev_project_announce_veilid_owner_seed() -> Result<ProjectAnnounceVeilidOwnerSeed, AnnounceOwnerError>"
+    parameters: []
+    returns:
+      type: "Result<ProjectAnnounceVeilidOwnerSeed, AnnounceOwnerError>"
+      description: The dev channel's owner seed.
+      error_variants:
+        - name: Hkdf
+          condition: HKDF derivation failed.
+
+  - name: ProjectAnnounceVeilidOwnerSeed::as_bytes
+    module: daemonseed_core::public_space
+    description: >-
+      Borrow the raw 32-byte owner seed to build a VLD0 keypair; callers must not
+      copy into a non-zeroizing buffer. Zeroes on drop; Debug redacted.
+    signature: "pub fn as_bytes(&self) -> &[u8; PROJECT_ANNOUNCE_VEILID_OWNER_SEED_LEN]"
+    parameters: []
+    returns:
+      type: "&[u8; PROJECT_ANNOUNCE_VEILID_OWNER_SEED_LEN]"
+      description: A borrow of the raw 32-byte owner seed.
+
+  - name: AnnounceFreshness::accepts
+    module: daemonseed_core::public_space
+    description: >-
+      The #78 monotonic rollback guard for an operator announce/MOTD record (Phase 4
+      A1). Holds last_seen as state (transposition-proof — no reversible second arg);
+      accepts an arriving version iff it is >= last_seen (an idempotent re-fetch is
+      accepted, a strictly-older slot rolling back a revocation/MOTD is rejected). The
+      version MUST be a strictly-monotonic operator counter, never a wall clock (a
+      clock step-back would silently drop a legitimate update). `accepts` is a pure
+      check; `accept` also advances last_seen to the max on a fresh record. Construct
+      via `new` (last_seen 0) or `from_last_seen`.
+    signature: "pub fn accepts(&self, incoming: u64) -> bool"
+    parameters:
+      - name: incoming
+        type: "u64"
+        direction: in
+        description: The version on the arriving record.
+    returns:
+      type: "bool"
+      description: True if the record is at/after last_seen (fresh), false if a rollback.
+  - name: AnnounceFreshness::accept
+    module: daemonseed_core::public_space
+    description: >-
+      Accept an arriving record at `incoming`: returns whether it was fresh, advancing
+      last_seen to it on a fresh record (an equal re-accept is a no-op advance); a
+      strictly-older record is rejected and leaves state unchanged.
+    signature: "pub fn accept(&mut self, incoming: u64) -> bool"
+    parameters:
+      - name: incoming
+        type: "u64"
+        direction: in
+        description: The version on the arriving record.
+    returns:
+      type: "bool"
+      description: True if fresh (and advanced), false if a rejected rollback.
+
   - name: WhitelistEntry::from_str
     module: daemonseed_core::public_space
     description: Parse one whitelist-file line (ISC-10 / ISC-11).
