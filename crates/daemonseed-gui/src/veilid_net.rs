@@ -124,15 +124,11 @@ const CHUNK_FETCH_CONCURRENCY: usize = 8;
 // is therefore prefixed with a 1-byte KIND tag: `[kind] ++ prost(artifact)`.
 
 /// Delay after Connect before the #93 unread-gated landing fires its one-shot
-/// self-refresh — set past the first two [`WARMUP_RESWEEP_SCHEDULE`] rounds (12 s /
-/// 25 s) PLUS DHT fold latency so the re-swept operator items have arrived, and the
-/// landing decision runs over as
-/// settled a view as the async transport allows. **Best-effort, not a settle
-/// confirmation:** on a slow/congested DHT the backlog may still be folding at this
-/// deadline, so the landing can run over a partial view (land early / spuriously, or
-/// miss a late item — the pane, content, and marker are all still correct, only the
-/// auto-open TIMING is heuristic). Robust settle-detection (hash-stable window) is a
-/// follow-up (#137). A felt-test tunable.
+/// self-refresh (`RefreshPublicSpace`) fires. **#142 removed the #93 auto-landing this
+/// used to trigger** — the client no longer force-opens the pane (it shows an unread dot
+/// instead), so this is now just a post-connect refresh nudge and its exact value no
+/// longer gates anything. The spawn + this const are vestigial and slated for removal
+/// alongside the `connect_time` / `landing_pending` plumbing (deferred). Felt-tunable.
 const OPERATOR_CONNECT_LANDING_DELAY: Duration = Duration::from_secs(35);
 
 /// #140 stepped warmup re-sweep schedule: absolute deadlines from connect at which a
@@ -143,22 +139,22 @@ const OPERATOR_CONNECT_LANDING_DELAY: Duration = Duration::from_secs(35);
 /// and give each surface an earlier "discovering → content" reveal. Each re-sweep is
 /// `SUBKEY_COUNT` (64) force-refresh gets/record, so rounds are few + widening, not a
 /// tight loop; re-swept already-seen items are deduped downstream (`apply_discovery`
-/// self-filter, `push_message` exact-match). The first two rounds land at/under
-/// [`OPERATOR_CONNECT_LANDING_DELAY`] (35 s) so operator MOTD/announcement content is
-/// refreshed before the #93 connect-landing decision. Felt-tunable.
-const WARMUP_RESWEEP_SCHEDULE: [Duration; 4] = [
-    Duration::from_secs(12),
-    Duration::from_secs(25),
-    Duration::from_secs(45),
-    Duration::from_secs(75),
-];
+/// self-filter, `push_message` exact-match). **#140 dial-down (felt-test 2026-07-08):**
+/// the original 4-round 12/25/45/75 s schedule spun the host fans up (~900 gets/client)
+/// for marginal benefit — operator content converged (~120 s) past the window, and #142
+/// removed the #93 landing this schedule used to feed — so it is dialled to a LIGHT
+/// 2-round best-effort early-catch that helps only fast-converging content; slower
+/// content rides the passive watch. The proper load fix (stop-on-content backoff) is
+/// deferred; whether to keep / revert this at all is caraka's call after felt-test.
+/// Felt-tunable.
+const WARMUP_RESWEEP_SCHEDULE: [Duration; 2] = [Duration::from_secs(20), Duration::from_secs(60)];
 
 /// Rounds (from the front of [`WARMUP_RESWEEP_SCHEDULE`]) in which the circle records
 /// are ALSO re-swept. Operator + lobby — the top priority and the #93 landing feed —
 /// are re-swept every round; circles (which can be many) only in the early rounds, so a
 /// heavily-joined user's warmup doesn't fan out to `rounds × circles` concurrent
 /// backlog sweeps competing with initial chat/downloads (#140 review). Felt-tunable.
-const WARMUP_CIRCLE_RESWEEP_ROUNDS: usize = 2;
+const WARMUP_CIRCLE_RESWEEP_ROUNDS: usize = 1;
 
 /// Build the #140 warmup PRIORITY re-sweep records: operator MOTD/announce first (its
 /// content feeds the #93 landing), then lobby chat. These are re-swept every round;
@@ -2229,9 +2225,6 @@ mod tests {
         for w in WARMUP_RESWEEP_SCHEDULE.windows(2) {
             assert!(w[0] < w[1], "re-sweep schedule must be strictly increasing");
         }
-        // The first two rounds precede the #93 landing so operator content is
-        // refreshed before the landing decision runs.
-        assert!(WARMUP_RESWEEP_SCHEDULE[1] <= OPERATOR_CONNECT_LANDING_DELAY);
         // The circle-taper round count can't exceed the schedule length.
         assert!(WARMUP_CIRCLE_RESWEEP_ROUNDS <= WARMUP_RESWEEP_SCHEDULE.len());
     }
