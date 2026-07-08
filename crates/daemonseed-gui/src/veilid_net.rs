@@ -1325,22 +1325,24 @@ async fn upload_announcement(
 /// (owner seed, `[(slot_id, encoded-value)]`) — one #141 keep-alive re-publish batch.
 type OperatorKeepaliveBatch = ([u8; 32], Vec<(String, Vec<u8>)>);
 
-/// #141: collect the operator record's known items (MOTD + announcements) as
-/// `(slot_id, encoded-value)` pairs for a keep-alive re-publish, with the owner seed to
-/// write them. `None` when there is no operator record or nothing to re-publish. Pure
-/// (no I/O) so the caller can spawn the DHT writes off the actor loop. The stored
-/// artifacts are already F17-signed, so this re-publishes the EXACT bytes to the SAME
-/// slots (`"motd"` / the content-address hex key — identical to [`set_motd`] /
-/// [`upload_announcement`]), idempotent under last-writer-wins.
+/// #141: collect the operator record's re-publishable items as `(slot_id,
+/// encoded-value)` pairs for a keep-alive, with the owner seed to write them. `None`
+/// when there is no operator record or nothing to re-publish. Pure (no I/O) so the
+/// caller can spawn the DHT writes off the actor loop.
+///
+/// ONLY the announcements are kept alive, NOT the MOTD. Announcements live in
+/// content-addressed slots (`hex(content_address)`), so re-publishing their exact
+/// F17-signed bytes to the same key is idempotent under last-writer-wins — it can never
+/// revert anything a peer already holds. The MOTD lives in the single MUTABLE `"motd"`
+/// slot and the fold ([`apply_operator_item`]) has no newer-wins, so re-publishing a
+/// stale MOTD would let peers adopt + rebroadcast it and revert a newer/cleared MOTD
+/// network-wide. MOTD keep-alive waits for the #136 monotonic version that makes the
+/// mutable slot safe to refresh.
 fn collect_operator_keepalive_items(shares: &ShareState) -> Option<OperatorKeepaliveBatch> {
     let op = shares.operator.as_ref()?;
     let mut items: Vec<(String, Vec<u8>)> = Vec::new();
-    if let Some(artifact) = op.motd.as_ref() {
-        items.push((
-            "motd".to_owned(),
-            encode_operator_item(OPERATOR_ITEM_MOTD, &artifact.encode_to_vec()),
-        ));
-    }
+    // Announcements only — content-addressed slots are idempotent under re-publish. The
+    // mutable MOTD slot is deliberately excluded (see the fn doc: reverts without #136).
     for (slot, post) in op.posts.iter() {
         items.push((
             slot.clone(),
@@ -2561,7 +2563,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_operator_keepalive_items_bundles_known_content() {
+    fn collect_operator_keepalive_items_excludes_the_mutable_motd() {
         let _ = oxicrypt_module::initialize();
         // No operator record → nothing to re-publish.
         assert!(collect_operator_keepalive_items(&ShareState::new()).is_none());
@@ -2569,21 +2571,35 @@ mod tests {
         let mut shares = ShareState::new();
         shares.operator = Some(operator_space());
         assert!(collect_operator_keepalive_items(&shares).is_none());
-        // A verified MOTD folds in → collected at the "motd" slot, KIND-tagged, with the
-        // owner seed to write it back (#141 keep-alive).
         let kp = dev_project_release_keypair().unwrap();
         let (evt_tx, _rx) = unbounded_channel();
+        // #141: a MOTD alone is NOT kept alive — the mutable "motd" slot has no
+        // newer-wins, so re-publishing a stale one could revert a newer MOTD
+        // network-wide. A MOTD-only operator therefore has nothing safe to refresh.
         let motd = sign_motd(&kp, "hello", 100).unwrap();
-        let bytes = encode_operator_item(OPERATOR_ITEM_MOTD, &motd.encode_to_vec());
-        assert!(apply_operator_item(&mut shares, &evt_tx, &bytes));
-        let (seed, items) =
-            collect_operator_keepalive_items(&shares).expect("the MOTD should be collected");
+        let motd_bytes = encode_operator_item(OPERATOR_ITEM_MOTD, &motd.encode_to_vec());
+        assert!(apply_operator_item(&mut shares, &evt_tx, &motd_bytes));
+        assert!(
+            collect_operator_keepalive_items(&shares).is_none(),
+            "a MOTD-only operator has nothing safe to keep alive"
+        );
+        // An announcement (content-addressed → idempotent under re-publish) IS kept alive.
+        let post_artifact = sign_post(&kp, "release", "v0.33.0 is out", 200).unwrap();
+        let addr = content_address(&post_artifact.signed_payload).unwrap();
+        let post = wire::Post {
+            artifact: Some(post_artifact),
+            content_address: addr.as_bytes().to_vec(),
+        };
+        let post_bytes = encode_operator_item(OPERATOR_ITEM_ANNOUNCEMENT, &post.encode_to_vec());
+        assert!(apply_operator_item(&mut shares, &evt_tx, &post_bytes));
+        let (seed, items) = collect_operator_keepalive_items(&shares)
+            .expect("the announcement should be collected");
         assert_eq!(seed, shares.operator.as_ref().unwrap().announce_owner_seed);
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].0, "motd");
+        assert_eq!(items.len(), 1, "only the announcement, never the MOTD");
+        assert_eq!(items[0].0, hex::encode(&post.content_address));
         assert_eq!(
             decode_operator_item(&items[0].1).unwrap().0,
-            OPERATOR_ITEM_MOTD
+            OPERATOR_ITEM_ANNOUNCEMENT
         );
     }
 
