@@ -167,7 +167,7 @@ types:
     description: A daemonseed-facing transport event.
     variants:
       - name: Attachment
-        description: "Attachment state changed; `public_internet_ready` gates all operations."
+        description: "Attachment state changed; `public_internet_ready` gates all operations. Also carries `reliable_peers` / `live_peers` (u32) — the current attach peer counts, climbing during the cold-start warmup (#144)."
       - name: Inbound
         description: An opaque sealed inbound message arrived; the app opens it with the relevant circle/room key.
       - name: RouteChanged

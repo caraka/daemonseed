@@ -1593,7 +1593,9 @@ impl App {
                 if self.circles.iter().any(|c| c.id == circle_id) {
                     // De-dup + ordered-insert (#130): a DHT re-sweep can re-deliver an
                     // already-seen circle message, and propagation can deliver out of
-                    // send order.
+                    // send order. (#151 stale-backlog prune is GUI-only for now — the
+                    // TUI is a post-cutover surface; it rides the TUI parity work #111,
+                    // like the #131 clamp.)
                     self.push_message(sender, body, sent_unix_ms, Surface::Circle(circle_id));
                 }
             }
@@ -1615,7 +1617,8 @@ impl App {
                 sent_unix_ms,
             } => {
                 // De-dup + ordered-insert (#130), Lobby-tagged so it renders only in
-                // the top lobby pane (ISC-C61 / ISC-A-C29).
+                // the top lobby pane (ISC-C61 / ISC-A-C29). (#151 stale-backlog prune
+                // is GUI-only for now; the TUI rides #111, like the #131 clamp.)
                 self.push_message(sender, body, sent_unix_ms, Surface::Lobby);
             }
             NetEvent::TrustEvent { key, server_id } => self.fold_trust_event(key, server_id),

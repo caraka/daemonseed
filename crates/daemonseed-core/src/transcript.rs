@@ -44,6 +44,23 @@ pub fn clamp_order_ms(sent_unix_ms: i64, now_ms: i64) -> i64 {
     sent_unix_ms.clamp(now_ms - past, now_ms + future)
 }
 
+/// True when `sent_unix_ms` is older than [`TRANSCRIPT_MAX_BACKLOG_AGE`] relative
+/// to `now_ms` — stale DHT-ring backlog that should be PRUNED at ingest rather
+/// than rendered.
+///
+/// The append-ring is bounded by COUNT (`RING_DEPTH`), not age, so on a
+/// low-traffic room a member's last messages persist for days and the cold-start
+/// sweep re-surfaces them as "ghosts". Dropping them at ingest keeps the
+/// transcript to recent traffic AND removes the >MAX_AGE messages that would
+/// otherwise all clamp to the same `now-MAX_AGE` ordering edge and sort mixed
+/// (they lose their relative order once collapsed onto one edge). A live message
+/// is always in-window, so this only ever drops backlog. A future/skewed
+/// timestamp is never "stale" — it is bounded by the ordering clamp, not here.
+pub fn is_stale_backlog(sent_unix_ms: i64, now_ms: i64) -> bool {
+    let max_age = TRANSCRIPT_MAX_BACKLOG_AGE.as_millis() as i64;
+    sent_unix_ms < now_ms - max_age
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,5 +90,32 @@ mod tests {
         // Just outside each edge clamps to the edge.
         assert_eq!(clamp_order_ms(now - past - 1, now), now - past);
         assert_eq!(clamp_order_ms(now + future + 1, now), now + future);
+    }
+
+    #[test]
+    fn stale_backlog_is_older_than_max_age() {
+        let now = 1_700_000_000_000;
+        let past = TRANSCRIPT_MAX_BACKLOG_AGE.as_millis() as i64;
+        // In-window (fresh live + up to the edge) is NOT stale.
+        assert!(!is_stale_backlog(now, now), "a live message is never stale");
+        assert!(
+            !is_stale_backlog(now - past, now),
+            "exactly at the edge is kept"
+        );
+        assert!(
+            !is_stale_backlog(now - past + 1, now),
+            "just inside the window is kept"
+        );
+        // A future/skewed stamp is never stale (the ordering clamp handles it).
+        assert!(!is_stale_backlog(now + 60_000, now));
+        // Older than the window (the 5-day ghost) IS stale → pruned.
+        assert!(
+            is_stale_backlog(now - past - 1, now),
+            "just past the edge prunes"
+        );
+        assert!(
+            is_stale_backlog(now - 5 * 24 * 60 * 60 * 1000, now),
+            "a 5-day-old ring ghost prunes"
+        );
     }
 }

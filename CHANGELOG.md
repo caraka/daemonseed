@@ -26,6 +26,8 @@ work lives in the project lead's vault manifest, not here.
 
 ### Added
 
+- `daemonseed-gui`: the startup "assembling network" mask now shows the Veilid attach **peer count counting up** during the cold-start warmup, and holds a short settle window past the first content before opening the Lobby (so it opens with more backlog already in) instead of snapping shut on the first message (#144).
+- `daemonseed-core`: `transcript::is_stale_backlog(sent_unix_ms, now_ms)` — true when a message is older than `TRANSCRIPT_MAX_BACKLOG_AGE` (24h), for pruning stale count-bounded-ring backlog at ingest (#151).
 - `daemonseed-core`: `room_message` module — the one signed room-message seal/open path (`seal_signed_room_message` / `open_signed_room_message`, parameterized by key + AEAD AAD + provenance domain + expected room_id) shared by public rooms and circles; plus `circle::key::circle_room_id`, the member-derivable circle wire identifier `SHA-384(cot_key)[:12]`, and `net::canonical_wire_handle` (gui) (#145, #146).
 - `daemonseed-gui`: a startup "assembling your peer network" mask — a full-cover splash shown from Connect through the cold-start DHT warmup, framing the unavoidable convergence wait (see #140) as the serverless feature. Event-driven: dismissed on the first real content (a Lobby/circle message or a non-empty roster) or by the user ("Enter anyway"), never on a fixed timer (the warmup is long + variable). Shows the live connection-status; the attach peer-count + an animation are follow-ups (#144).
 - `daemonseed-gui`: circle member-presence over Veilid (Phase 4 #77) — extends the lobby presence (#74) to circles: each joined circle gets a `PresenceTracker` and subscribes its presence sibling record; the heartbeat timer emits a per-circle sealed beacon and reaps each circle's roster, and inbound circle beacons fold into the owning circle's roster (`NetEvent::Roster{circle_id: Some(id)}`, routed to the active circle by `main.rs`). GUI only.
@@ -64,6 +66,7 @@ work lives in the project lead's vault manifest, not here.
 
 ### Changed
 
+- `daemonseed-veilid-net`: `VeilidNetEvent::Attachment` carries the current `reliable_peers` / `live_peers` attach counts (was only traced), surfaced to the startup mask as they climb (#144).
 - `daemonseed-proto`: **BREAKING (MAJOR wire)** — `CircleMessage` and `PublicRoomMessage` merge into one signed `RoomMessage { room_id, sender_pubkey, sender_handle, body, sent_unix_ms, signature }`. Circle chat is now self-signed for per-sender authorship exactly as a public-room post; `room_id` is the room name (public) or the member-derivable circle fingerprint `SHA-384(cot_key)[:12]` (circle). No migration (ephemeral content; unsigned backlog fails verify and drops) (#145, #147).
 - `daemonseed-core`: `circle::message::{seal_message, open_message}` and `public_room::{seal_room_message, open_room_message}` are thin wrappers over one signed `room_message` seal/open path; `seal_message` takes the poster's `SignKeypair`; the circle AAD + provenance domain are `daemonseed/circle/message/v2`; `open_room_message` gains a `room` argument (the signature is verified against the caller's expected room_id, never the carried field) (#145).
 - `daemonseed-{gui,tui}`: circle send/open route through the signed `RoomMessage`; `mine`, own-loopback suppression, and dedup key on the stable `sender_pubkey`; the displayed author binds to `SHA-384(sender_pubkey)[:12]` via `Handle::display_bound`; the GUI send paths transmit the canonical `name#<12hex>` handle so receivers honor the display name (#146).
@@ -81,6 +84,7 @@ work lives in the project lead's vault manifest, not here.
 
 ### Fixed
 
+- `daemonseed-gui`: stale DHT-ring backlog (a message older than 24h, a count-bounded-ring ghost from a prior session) is pruned at ingest — no longer renders as a "ghost" nor collapses onto the `now-24h` ordering edge (which sorted old messages mixed) (#151). TUI prune deferred to #111.
 - `daemonseed-{gui,tui}`: a mid-session identity rename no longer duplicates or mis-attributes own messages — authorship, `mine`, and own-loopback dedup key on the stable identity pubkey, not the mutable display handle (#143, #146).
 - `daemonseed-gui`: operator announcements are kept alive in the DHT — the announce-owner-seed holder re-publishes the content-addressed announcement slots every `OPERATOR_KEEPALIVE_INTERVAL` (120s) off the actor loop so their DHT TTLs stay fresh; the mutable MOTD slot is excluded (#141).
 - `daemonseed-gui`: own chat messages now render from the cold-start backlog — `handle_inbound` emits an own looped-back lobby/circle message `mine:true` (it was suppressed by handle match), and `push_message`'s exact-match dedup (`sent_unix_ms` + content) collapses the live echo↔re-surface pair, so a fresh start reconstructs BOTH halves of the conversation instead of only the other party's (#143).

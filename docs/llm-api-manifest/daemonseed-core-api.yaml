@@ -851,7 +851,9 @@ modules:
       now + TRANSCRIPT_MAX_CLOCK_SKEW] for ORDERING + read high-water on the open lobby:
       real backlog (in-window) is returned unchanged, a forged/broken timestamp is
       pulled to a window edge, so a peer cannot pin/hide/suppress. Callers dedup on the
-      ORIGINAL sent_unix_ms and never advance the high-water past now. Pure +
+      ORIGINAL sent_unix_ms and never advance the high-water past now. is_stale_backlog
+      is true when sent_unix_ms is older than TRANSCRIPT_MAX_BACKLOG_AGE (24h) — for
+      pruning stale count-bounded-ring backlog at ingest (#151, GUI). Pure +
       clock-injected.
     no_std: false
     depends_on: []

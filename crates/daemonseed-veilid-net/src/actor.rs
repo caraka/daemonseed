@@ -1477,6 +1477,9 @@ fn map_update(u: VeilidUpdate) -> Option<VeilidNetEvent> {
         }),
         VeilidUpdate::Attachment(a) => Some(VeilidNetEvent::Attachment {
             public_internet_ready: a.public_internet_ready,
+            // NodeCount is a u64 newtype; peer counts are small, so the cast is safe.
+            reliable_peers: a.reliable_peer_count.as_u64() as u32,
+            live_peers: a.live_peer_count.as_u64() as u32,
         }),
         // `RouteChange` is intercepted in the update callback (it drives advert
         // refresh + emits `RouteChanged` directly), so it never reaches here.

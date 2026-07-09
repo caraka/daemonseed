@@ -405,6 +405,11 @@ pub enum NetEvent {
     /// The connection reached Authenticated; `server_handle` is the verified
     /// relay handle.
     Connected { server_handle: String },
+    /// (#144) The Veilid attach peer counts, emitted as they climb during the
+    /// cold-start DHT warmup — drives the startup mask's counting-up progress.
+    /// Relay-mode never emits it, so it is unconstructed in a non-veilid build.
+    #[cfg_attr(not(feature = "veilid"), allow(dead_code))]
+    PeerCount { reliable: u32, live: u32 },
     /// The connection attempt failed; `reason` is human-readable.
     ConnectFailed { reason: String },
     /// A live connection dropped — a subscribe stream ended (`Ok(None)`) or

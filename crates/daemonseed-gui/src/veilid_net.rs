@@ -372,7 +372,22 @@ pub async fn veilid_net_actor(
             }
             // Only poll the Veilid event stream once connected.
             Some(ev) = recv_opt(&mut ev_rx), if ev_rx.is_some() => {
-                handle_inbound(ev, &evt_tx, &mut circles, &mut shares);
+                // #144: surface the attach peer counts to the startup mask as they
+                // climb during the cold-start warmup; everything else demuxes in
+                // handle_inbound (which only acts on Inbound).
+                if let VeilidNetEvent::Attachment {
+                    reliable_peers,
+                    live_peers,
+                    ..
+                } = ev
+                {
+                    let _ = evt_tx.send(NetEvent::PeerCount {
+                        reliable: reliable_peers,
+                        live: live_peers,
+                    });
+                } else {
+                    handle_inbound(ev, &evt_tx, &mut circles, &mut shares);
+                }
             }
             // Age out discovered shares not reheard within the TTL (Shape B liveness):
             // a sharer that vanished without a withdraw self-clears from the list.

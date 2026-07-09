@@ -1505,12 +1505,35 @@ fn connect_now(
             // or a non-empty roster) or by the user, framing the unavoidable
             // DHT-convergence wait as the serverless feature rather than a hang.
             ui.set_startup_overlay_open(true);
+            // #144: re-arm the settle-timer guard + clear the stale peer count so a
+            // reconnect gets a fresh mask (counting up + a fresh settle window).
+            ui.set_mask_settling(false);
+            ui.set_mask_peer_count(SharedString::default());
         }
         Err(reason) => {
             ui.set_connection_status(SharedString::from(format!("offline · {reason}")));
             ui.set_connected(false);
         }
     }
+}
+
+/// #144: dismiss the startup "assembling network" mask a short SETTLE window after
+/// the first real content, instead of snapping it shut on the very first message —
+/// so the Lobby opens with more of the cold-start DHT backlog already in, and the
+/// peer count keeps climbing during the hold. Guarded by `mask-settling` so only the
+/// first content arms the one timer (a message burst can't restart it); a no-op once
+/// the mask is closed. The "Enter anyway" button still dismisses immediately (Slint).
+fn settle_dismiss_mask(ui: &AppWindow) {
+    if !ui.get_startup_overlay_open() || ui.get_mask_settling() {
+        return;
+    }
+    ui.set_mask_settling(true);
+    let ui_weak = ui.as_weak();
+    slint::Timer::single_shot(Duration::from_secs(3), move || {
+        if let Some(ui) = ui_weak.upgrade() {
+            ui.set_startup_overlay_open(false);
+        }
+    });
 }
 
 /// Apply one [`NetEvent`] to the UI + the Lobby's RAM state + the share browse tree.
@@ -1524,6 +1547,19 @@ fn apply_net_event(
         NetEvent::Connected { server_handle } => {
             ui.set_connection_status(SharedString::from(format!("connected · {server_handle}")));
             ui.set_connected(true);
+        }
+        // #144: the attach peer count climbing during the cold-start warmup — shown
+        // on the startup mask so the wait has live motion instead of a static status.
+        NetEvent::PeerCount { reliable, live } => {
+            let n = live.max(reliable);
+            let label = if n == 0 {
+                "finding peers…".to_owned()
+            } else if n == 1 {
+                "1 peer".to_owned()
+            } else {
+                format!("{n} peers")
+            };
+            ui.set_mask_peer_count(SharedString::from(label));
         }
         NetEvent::RoomJoined { room } => {
             ui.set_connection_status(SharedString::from(format!("connected · {room}")));
@@ -1558,8 +1594,16 @@ fn apply_net_event(
             mine,
             sent_unix_ms,
         } => {
-            // #144: first real content → dismiss the startup "assembling network" mask.
-            ui.set_startup_overlay_open(false);
+            // #151: drop stale DHT-ring backlog at ingest — a message older than
+            // TRANSCRIPT_MAX_BACKLOG_AGE (24h) is a count-bounded-ring ghost from a
+            // prior session; it neither renders nor counts as "real content" for the
+            // mask. Live/own messages are always in-window, so this only drops backlog.
+            if daemonseed_core::transcript::is_stale_backlog(sent_unix_ms, now_unix_ms()) {
+                return;
+            }
+            // #144: first real content → settle-dismiss the mask (hold a short
+            // window so the Lobby opens with more cold-start backlog already in).
+            settle_dismiss_mask(ui);
             // #84: capture scroll intent from the LIVE view BEFORE the transcript grows.
             // Own sends always pin to bottom; an incoming message pins only if the reader
             // was already at the bottom — otherwise we hold their current position.
@@ -1612,8 +1656,13 @@ fn apply_net_event(
             mine,
             sent_unix_ms,
         } => {
-            // #144: first real content → dismiss the startup "assembling network" mask.
-            ui.set_startup_overlay_open(false);
+            // #151: drop stale DHT-ring backlog at ingest (see the Lobby branch).
+            if daemonseed_core::transcript::is_stale_backlog(sent_unix_ms, now_unix_ms()) {
+                return;
+            }
+            // #144: first real content → settle-dismiss the mask (hold a short
+            // window so the Lobby opens with more cold-start backlog already in).
+            settle_dismiss_mask(ui);
             // #84: capture scroll intent from the LIVE view before the transcript grows
             // (see the Lobby branch). Own sends pin to bottom; incoming pins only if the
             // reader was already at the bottom.
@@ -1875,9 +1924,9 @@ fn apply_net_event(
             ui.set_download_label(SharedString::from(format!("Download failed: {message}")));
         }
         NetEvent::Roster { circle_id, entries } => {
-            // #144: real presence (a peer is online) → dismiss the startup mask.
+            // #144: real presence (a peer is online) → settle-dismiss the mask.
             if !entries.is_empty() {
-                ui.set_startup_overlay_open(false);
+                settle_dismiss_mask(ui);
             }
             // Replace the roster model for the ACTIVE room only (#75 lobby / #77
             // circles). A roster is room-scoped: the lobby is `None`, a circle is

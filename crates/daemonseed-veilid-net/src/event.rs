@@ -5,7 +5,13 @@
 #[derive(Debug)]
 pub enum VeilidNetEvent {
     /// Attachment state changed; `public_internet_ready` gates all operations.
-    Attachment { public_internet_ready: bool },
+    /// `reliable_peers` / `live_peers` are the current attach peer counts (the
+    /// DHT-warmup progress indicator, #144) — they climb during the cold-start.
+    Attachment {
+        public_internet_ready: bool,
+        reliable_peers: u32,
+        live_peers: u32,
+    },
 
     /// An opaque, sealed inbound message arrived off the wire. The app opens it
     /// with the relevant circle/room key — this layer never sees plaintext.
