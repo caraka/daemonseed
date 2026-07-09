@@ -323,6 +323,7 @@ fn client_filter_excludes_filtered_tier() {
             name: "a".to_owned(),
             rating: "PG13".to_owned(),
             sharer_handle: String::new(),
+            sharer_fingerprint: String::new(),
             mine: false,
         },
         ShareListing {
@@ -330,6 +331,7 @@ fn client_filter_excludes_filtered_tier() {
             name: "b".to_owned(),
             rating: "X".to_owned(),
             sharer_handle: String::new(),
+            sharer_fingerprint: String::new(),
             mine: false,
         },
     ];

@@ -73,7 +73,7 @@ use daemonseed_core::circle::message::{open_message, seal_message};
 use daemonseed_core::cot::{AssetAddr, asset_address, public_share_asset_address};
 use daemonseed_core::crypto::suite::CNSA_2_0;
 use daemonseed_core::federation::store::{InMemoryTrustStore, ServerEntry, TrustStore};
-use daemonseed_core::handle::Handle;
+use daemonseed_core::handle::{DisplayMode, Handle};
 use daemonseed_core::heartbeat::{
     HeartbeatFields, open_heartbeat, seal_circle_heartbeat, seal_public_heartbeat,
 };
@@ -1407,14 +1407,14 @@ impl Actor {
         // CircleMessage tagged with THIS circle_id (ISC-A-C30 attribution).
         let reader_key = Rc::clone(&cot_key);
         let reader_tx = self.evt_tx.clone();
-        let reader_handle = self.my_handle.clone();
+        let reader_pubkey = self.my_pubkey();
         let reader_cmd = self.cmd_tx.clone();
         tokio::task::spawn_local(read_inbound_circle(
             inbound,
             circle_id,
             reader_key,
             reader_tx,
-            reader_handle,
+            reader_pubkey,
             reader_cmd,
         ));
         Ok(out_tx)
@@ -1488,7 +1488,7 @@ impl Actor {
         // room key (mirrors the TUI). The OUT sender stays here in actor state.
         let reader_key = Rc::clone(&room_key);
         let reader_tx = self.evt_tx.clone();
-        let reader_handle = self.my_handle.clone();
+        let reader_pubkey = self.my_pubkey();
         let reader_cmd = self.cmd_tx.clone();
         let reader_room = room.clone();
         tokio::task::spawn_local(read_inbound_public_room(
@@ -1496,7 +1496,7 @@ impl Actor {
             reader_room,
             reader_key,
             reader_tx,
-            reader_handle,
+            reader_pubkey,
             reader_cmd,
         ));
 
@@ -1756,11 +1756,14 @@ impl Actor {
         };
 
         let sent_unix_ms = now_unix_ms();
+        // Transmit the CANONICAL `name#<12hex>` handle so a receiver's display_bound
+        // honors the name (a bare handle would floor to `#<hex>` for every peer).
+        let wire_handle = canonical_wire_handle(&self.my_handle, identity.signing().public_key());
         let sealed = match seal_room_message(
             &room.room_key,
             identity.signing(),
             &room.room,
-            &self.my_handle,
+            &wire_handle,
             text,
             sent_unix_ms,
         ) {
@@ -1864,21 +1867,49 @@ impl Actor {
     /// `daemonseed_tui::net::Actor::handle_send_chat` for the seal/send; the local
     /// echo is the GUI's (the relay never reflects a sender's own frame, and the
     /// GUI has no app layer between the actor and the UI — same as the Lobby path).
-    /// Circle messages are AEAD-only: `seal_message` takes the `cot_key` and no
-    /// signing key — membership IS the auth (no provenance signature, unlike rooms).
+    /// Our own identity signing pubkey bytes, or empty if no identity is loaded.
+    /// Threaded to the inbound readers so `mine` keys on the STABLE pubkey, not
+    /// the mutable display handle (the room↔circle convergence's #143 fix). An
+    /// empty vec (no identity) marks nothing as ours — never a false positive,
+    /// since a verified message can never carry an empty `sender_pubkey`.
+    fn my_pubkey(&self) -> Vec<u8> {
+        self.identity
+            .as_ref()
+            .map(|i| i.signing().public_key().to_vec())
+            .unwrap_or_default()
+    }
+
+    /// Circle messages are now SIGNED (room↔circle convergence): `seal_message`
+    /// takes the `cot_key` AND the poster's identity keypair, so authorship is
+    /// verifiable exactly as a public-room post — membership authenticates
+    /// membership, the signature authenticates the author.
     async fn handle_send_circle(&mut self, circle_id: u64, text: &str) {
-        let Some(circle) = self.circles.iter().find(|c| c.circle_id == circle_id) else {
+        let sent_unix_ms = now_unix_ms();
+        // Address before auth: an unknown circle is the first failure a caller sees,
+        // independent of whether an identity is loaded.
+        if !self.circles.iter().any(|c| c.circle_id == circle_id) {
             return self.emit(NetEvent::CircleError {
                 circle_id,
                 reason: "join the circle before sending".to_owned(),
             });
+        }
+        let Some(identity) = self.identity.as_ref() else {
+            return self.emit(NetEvent::CircleError {
+                circle_id,
+                reason: "no identity to sign the message".to_owned(),
+            });
         };
-        let message = wire::CircleMessage {
-            sender_handle: self.my_handle.clone(),
-            body: text.to_owned(),
-            sent_unix_ms: now_unix_ms(),
-        };
-        let sealed = match seal_message(&circle.cot_key, &message) {
+        let signing = identity.signing();
+        // Transmit the CANONICAL `name#<12hex>` handle so a receiver's display_bound
+        // honors the name (a bare handle would floor to `#<hex>` for every peer).
+        let wire_handle = canonical_wire_handle(&self.my_handle, signing.public_key());
+        let circle = self
+            .circles
+            .iter()
+            .find(|c| c.circle_id == circle_id)
+            .expect("circle presence checked above");
+        let sealed = match seal_message(&circle.cot_key, signing, &wire_handle, text, sent_unix_ms)
+        {
             Ok(s) => s,
             Err(e) => {
                 return self.emit(NetEvent::CircleError {
@@ -1906,7 +1937,7 @@ impl Actor {
             who: self.my_handle.clone(),
             text: text.to_owned(),
             mine: true,
-            sent_unix_ms: message.sent_unix_ms,
+            sent_unix_ms,
         });
     }
 
@@ -2961,7 +2992,7 @@ async fn read_inbound_public_room(
     room: String,
     room_key: Rc<daemonseed_core::public_room::PublicRoomKey>,
     evt_tx: mpsc::UnboundedSender<NetEvent>,
-    my_handle: String,
+    my_pubkey: Vec<u8>,
     cmd_tx: mpsc::UnboundedSender<NetCommand>,
 ) {
     loop {
@@ -2974,12 +3005,20 @@ async fn read_inbound_public_room(
                     continue;
                 }
                 // `open_room_message` verifies the embedded provenance signature
-                // before returning, so only verified messages are surfaced.
-                if let Ok(msg) = open_room_message(&room_key, &frame.payload) {
-                    let mine = msg.sender_handle == my_handle;
+                // against the room name we subscribed to (never the carried
+                // room_id) before returning, so only verified messages surface.
+                if let Ok(msg) = open_room_message(&room_key, &room, &frame.payload) {
+                    // `mine` keys on the STABLE pubkey, not the mutable handle;
+                    // `who` is bound to SHA-384(sender_pubkey)[:12] (ISC-C4/C57),
+                    // so a spoofed handle shows at its `#<prefix>` floor.
+                    let mine = msg.sender_pubkey == my_pubkey;
+                    let Ok(bound) = Handle::display_bound(&msg.sender_handle, &msg.sender_pubkey)
+                    else {
+                        continue;
+                    };
                     if evt_tx
                         .send(NetEvent::Message {
-                            who: msg.sender_handle,
+                            who: bound.format(DisplayMode::Default),
                             text: msg.body,
                             mine,
                             sent_unix_ms: msg.sent_unix_ms,
@@ -3050,7 +3089,7 @@ async fn read_inbound_circle(
     circle_id: u64,
     cot_key: Rc<CircleKey>,
     evt_tx: mpsc::UnboundedSender<NetEvent>,
-    my_handle: String,
+    my_pubkey: Vec<u8>,
     cmd_tx: mpsc::UnboundedSender<NetCommand>,
 ) {
     loop {
@@ -3060,12 +3099,21 @@ async fn read_inbound_circle(
                 if frame.payload.is_empty() {
                     continue;
                 }
+                // `open_message` verifies the embedded provenance signature
+                // (recomputing the circle room_id from cot_key) before returning.
                 if let Ok(msg) = open_message(&cot_key, &frame.payload) {
-                    let mine = msg.sender_handle == my_handle;
+                    // `mine` keys on the STABLE pubkey, not the mutable handle
+                    // (the convergence's #143 fix); `who` binds to the verified
+                    // pubkey (ISC-C4/C57), spoofed handles shown at their floor.
+                    let mine = msg.sender_pubkey == my_pubkey;
+                    let Ok(bound) = Handle::display_bound(&msg.sender_handle, &msg.sender_pubkey)
+                    else {
+                        continue;
+                    };
                     if evt_tx
                         .send(NetEvent::CircleMessage {
                             circle_id,
-                            who: msg.sender_handle,
+                            who: bound.format(DisplayMode::Default),
                             text: msg.body,
                             mine,
                             sent_unix_ms: msg.sent_unix_ms,
@@ -3139,6 +3187,20 @@ fn member_fingerprint(pubkey: &[u8]) -> String {
     Handle::from_pubkey(None, pubkey)
         .map(|h| h.to_string())
         .unwrap_or_else(|_| "#".to_owned())
+}
+
+/// Build our own canonical `name#<12hex>` wire handle from a display name and our
+/// identity pubkey. Receivers bind the shown author with [`Handle::display_bound`],
+/// which honors the name ONLY when the transmitted handle carries the matching
+/// `#<hash>` — a BARE name is unparseable and floors to `#<hex>`. So the sender
+/// must transmit the canonical form (matching what the TUI's `own_handle()` sends).
+/// Any `#`-suffix on `display` is stripped first (the name is the pre-`#` segment);
+/// falls back to `display` verbatim only if the pubkey can't be hashed.
+pub(crate) fn canonical_wire_handle(display: &str, pubkey: &[u8]) -> String {
+    let name = display.split('#').next().unwrap_or(display);
+    Handle::from_pubkey((!name.is_empty()).then(|| name.to_owned()), pubkey)
+        .map(|h| h.format(DisplayMode::Verify))
+        .unwrap_or_else(|_| display.to_owned())
 }
 
 /// The self-filter predicate (#74/#77): true when a beacon's signer pubkey is our
@@ -4252,10 +4314,10 @@ mod tests {
         )
         .unwrap();
         // A member opens it.
-        assert!(open_room_message(&lobby, &sealed).is_ok());
+        assert!(open_room_message(&lobby, DEFAULT_ROOM, &sealed).is_ok());
         // A non-member (wrong key) cannot — exactly what the actor's reader drops.
         assert!(
-            open_room_message(&other, &sealed).is_err(),
+            open_room_message(&other, DEFAULT_ROOM, &sealed).is_err(),
             "a non-member must not decrypt the public-room frame"
         );
     }
@@ -4377,7 +4439,8 @@ mod tests {
                 if frame.payload.is_empty() {
                     continue;
                 }
-                let msg = open_room_message(&room_key, &frame.payload).expect("B opens canary");
+                let msg =
+                    open_room_message(&room_key, &room, &frame.payload).expect("B opens canary");
                 assert_eq!(msg.body, canary);
                 break;
             }
@@ -4657,8 +4720,8 @@ mod tests {
             assert_eq!(
                 wait_for_circle_message(&mut b.evt_rx)
                     .await
-                    .map(|(_, who, text)| (who, text)),
-                Some(("alice#stable".to_owned(), "before the drop".to_owned())),
+                    .map(|(_, _, text)| text),
+                Some("before the drop".to_owned()),
                 "baseline: A → B round-trips on the live connection"
             );
 
@@ -4713,8 +4776,8 @@ mod tests {
             assert_eq!(
                 wait_for_circle_message(&mut b.evt_rx)
                     .await
-                    .map(|(_, who, text)| (who, text)),
-                Some(("alice#stable".to_owned(), "after the reconnect".to_owned())),
+                    .map(|(_, _, text)| text),
+                Some("after the reconnect".to_owned()),
                 "the re-subscribed circle round-trips after reconnect (#71)"
             );
         });
@@ -4933,12 +4996,9 @@ mod tests {
             &CNSA_2_0,
         )
         .unwrap();
-        let msg = wire::CircleMessage {
-            sender_handle: "wandering-otter".to_owned(),
-            body: "secret circle line".to_owned(),
-            sent_unix_ms: 1,
-        };
-        let sealed = seal_message(&member, &msg).unwrap();
+        let signer = SignKeypair::from_ml_dsa_seed(&[0x33; 32]).unwrap();
+        let sealed =
+            seal_message(&member, &signer, "wandering-otter", "secret circle line", 1).unwrap();
         assert!(open_message(&member, &sealed).is_ok(), "a member opens it");
         assert!(
             open_message(&outsider, &sealed).is_err(),
@@ -4946,14 +5006,15 @@ mod tests {
         );
     }
 
-    /// Round 6 (persistent identity): a silently RE-JOINED circle (supplied as a
-    /// persisted `(circle_id, phrase)` at attach time, NOT via an explicit
-    /// JoinCircle command) is live, and the member presents under the PERSISTED
-    /// display handle. A attaches with `display_handle = "alice#stable"` and the
-    /// circle in `rejoin_circles`; B joins the same circle the ordinary way; A
-    /// sends. B must receive the message attributed to the persisted handle —
-    /// proving both that the rejoin subscribed A and that the persisted handle is
-    /// what travels on the wire.
+    /// Round 6 (persistent identity) + room↔circle convergence: a silently
+    /// RE-JOINED circle (supplied as a persisted `(circle_id, phrase)` at attach
+    /// time, NOT via an explicit JoinCircle command) is live, and A's message
+    /// round-trips to B under A's display name. The send path transmits the
+    /// CANONICAL `alice#<12hex>` handle (rebuilt from the display name + A's
+    /// identity pubkey), so B's `display_bound` verifies the hash against the
+    /// provenance pubkey (ISC-C4/C57) and honors the name "alice" — proving both
+    /// that the rejoin subscribed A and that the presented name is pubkey-bound,
+    /// never the raw self-asserted string.
     #[test]
     fn persisted_circle_rejoins_and_presents_stable_handle() {
         let _ = oxicrypt_module::initialize();
@@ -5012,16 +5073,18 @@ mod tests {
                 })
                 .ok();
 
-            // B receives the message attributed to A's PERSISTED handle.
-            let got = wait_for_circle_message(&mut b.evt_rx).await;
+            // B receives A's message via the silently re-joined circle. A's client
+            // transmits the canonical `alice#<12hex>` handle, so B binds it to A's
+            // verified provenance pubkey and honors the display name "alice"
+            // (ISC-C4/C57) — the name presents, proven pubkey-bound not raw-trusted.
+            let (circle_id, who, text) = wait_for_circle_message(&mut b.evt_rx)
+                .await
+                .expect("a silently re-joined circle delivers A's message");
+            assert_eq!(circle_id, 7, "delivered under B's local circle id");
+            assert_eq!(text, "rejoined and still me");
             assert_eq!(
-                got,
-                Some((
-                    7u64,
-                    "alice#stable".to_owned(),
-                    "rejoined and still me".to_owned()
-                )),
-                "a silently re-joined circle delivers under the persisted display handle"
+                who, "alice",
+                "the display name presents, bound to A's verified pubkey; got {who:?}"
             );
         });
     }
@@ -5119,12 +5182,9 @@ mod tests {
                 .into_inner();
 
             let canary = "circle canary 67890 — gui live round-trip";
-            let message = wire::CircleMessage {
-                sender_handle: "live-test-a".to_owned(),
-                body: canary.to_owned(),
-                sent_unix_ms: now_unix_ms(),
-            };
-            let sealed = seal_message(&cot_key, &message).unwrap();
+            let signer = SignKeypair::from_ml_dsa_seed(&[0x5a; 32]).unwrap();
+            let sealed =
+                seal_message(&cot_key, &signer, "live-test-a", canary, now_unix_ms()).unwrap();
             a_tx.send(wire::CotFrame {
                 asset_address: addr_bytes.clone(),
                 payload: sealed,

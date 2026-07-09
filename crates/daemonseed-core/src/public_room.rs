@@ -43,20 +43,19 @@
 //! be confused with a circle-sealed one even under a coincidentally-equal key.
 
 use daemonseed_proto::v1 as wire;
-use oxicrypt_aes::{Aes256Key, ModeError, gcm_decrypt, gcm_encrypt};
 use oxicrypt_kdf::HkdfSha384;
 use oxicrypt_module::Error as OxicryptError;
 use oxicrypt_sha::sha384;
-use prost::Message;
 use zeroize::Zeroize;
 
 use crate::circle::key::{AeadKey256, COT_KEY_LEN};
-use crate::circle::message::{NONCE_LEN, TAG_LEN};
 use crate::cot::{ASSET_ADDR_LEN, AssetAddr};
 use crate::crypto::suite::Suite;
-use crate::identity::keys::{SignKeypair, verify_signature};
+use crate::identity::keys::SignKeypair;
 use crate::kdf::info;
-use oxicrypt_ml_dsa as ml_dsa;
+use crate::room_message::{open_signed_room_message, seal_signed_room_message};
+
+pub use crate::room_message::RoomMessageError;
 
 /// The well-known default public room every daemon lands in by default
 /// (ISC-S22 / ISC-C56). A public, fixed name — there is nothing secret about a
@@ -271,30 +270,14 @@ pub fn room_asset_address(
     Ok(AssetAddr::from_bytes(out))
 }
 
-/// Build the domain-separated provenance signing input for a public-room
-/// message (ISC-S24). Binds the room, sender pubkey, timestamp, and body so a
-/// signature is valid for exactly one (room, author, time, content) tuple and
-/// cannot be replayed into another room. Length-prefixing each variable field
-/// makes the concatenation unambiguous.
-fn provenance_input(room: &str, sender_pubkey: &[u8], sent_unix_ms: i64, body: &str) -> Vec<u8> {
-    let mut buf = Vec::new();
-    buf.extend_from_slice(ROOM_PROVENANCE_DOMAIN);
-    let mut push_field = |bytes: &[u8]| {
-        buf.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
-        buf.extend_from_slice(bytes);
-    };
-    push_field(room.as_bytes());
-    push_field(sender_pubkey);
-    push_field(&sent_unix_ms.to_be_bytes());
-    push_field(body.as_bytes());
-    buf
-}
-
-/// Seal a public-room message: SELF-SIGN it for provenance (ISC-S24), then
-/// AES-256-GCM-seal the whole [`wire::PublicRoomMessage`] under the global room
-/// key (ISC-S22). The output is `nonce ‖ ciphertext ‖ tag` suitable for a
-/// `CotFrame.payload`. `sender` is the posting daemon's OWN identity keypair —
-/// any daemon may post; the signature establishes authorship, not authorization.
+/// Seal a public-room message via the unified signed room-message path
+/// ([`crate::room_message::seal_signed_room_message`]): SELF-SIGN it for
+/// provenance (ISC-S24) then AES-256-GCM-seal the whole [`wire::RoomMessage`]
+/// under the global room key (ISC-S22). `sender` is the posting daemon's OWN
+/// identity keypair — any daemon may post; the signature establishes authorship,
+/// not authorization. The public-room `room_id` is the room name; the AAD +
+/// provenance domain are the public-room-specific [`ROOM_MESSAGE_AAD`] /
+/// [`ROOM_PROVENANCE_DOMAIN`], distinct from the circle surface's.
 pub fn seal_room_message(
     room_key: &PublicRoomKey,
     sender: &SignKeypair,
@@ -303,114 +286,37 @@ pub fn seal_room_message(
     body: &str,
     sent_unix_ms: i64,
 ) -> Result<Vec<u8>, RoomMessageError> {
-    let sender_pubkey = sender.public_key().to_vec();
-    let signing_input = provenance_input(room, &sender_pubkey, sent_unix_ms, body);
-    let signature = sender
-        .sign(&signing_input)
-        .map_err(|_| RoomMessageError::Sign)?
-        .to_vec();
-
-    let message = wire::PublicRoomMessage {
-        room: room.to_owned(),
-        sender_pubkey,
-        sender_handle: sender_handle.to_owned(),
-        body: body.to_owned(),
-        sent_unix_ms,
-        signature,
-    };
-
-    let aes = Aes256Key::new(room_key.as_bytes()).map_err(RoomMessageError::KeyInit)?;
-    let mut nonce = [0u8; NONCE_LEN];
-    getrandom::fill(&mut nonce).map_err(RoomMessageError::EntropySource)?;
-
-    let mut plaintext = message.encode_to_vec();
-    let mut ciphertext = vec![0u8; plaintext.len()];
-    let mut tag = [0u8; TAG_LEN];
-    let result = gcm_encrypt(
-        &aes,
-        &nonce,
+    seal_signed_room_message(
+        room_key,
         ROOM_MESSAGE_AAD,
-        &plaintext,
-        &mut ciphertext,
-        &mut tag,
-    );
-    plaintext.zeroize();
-    result.map_err(RoomMessageError::Aead)?;
-
-    let mut sealed = Vec::with_capacity(NONCE_LEN + ciphertext.len() + TAG_LEN);
-    sealed.extend_from_slice(&nonce);
-    sealed.extend_from_slice(&ciphertext);
-    sealed.extend_from_slice(&tag);
-    Ok(sealed)
+        ROOM_PROVENANCE_DOMAIN,
+        sender,
+        room,
+        sender_handle,
+        body,
+        sent_unix_ms,
+    )
 }
 
-/// Open + VERIFY a sealed public-room envelope (ISC-S22 / ISC-C57 / ISC-A-S17).
-///
-/// Two checks, both fail-closed:
-///   1. AES-256-GCM open under the global room key (ISC-A-S16: only the sealed
-///      form ever rides the wire; this is where it becomes plaintext locally).
-///   2. The embedded ML-DSA-87 provenance signature verifies under the embedded
-///      `sender_pubkey` (ISC-S24). A bad signature is rejected — the message is
-///      never surfaced unverified (ISC-A-S17).
-///
-/// On success the recipient still must bind the *displayed* handle to
-/// `SHA-384(sender_pubkey)[:12]` (ISC-C4 / ISC-C57); this function returns the
-/// verified wire message and leaves that UI-layer binding to the caller.
+/// Open + VERIFY a sealed public-room envelope via the unified path
+/// ([`crate::room_message::open_signed_room_message`]) — AES-256-GCM open under
+/// the global room key (ISC-A-S16) then ML-DSA-87 provenance verification
+/// (ISC-S24 / ISC-A-S17), both fail-closed. The signature is verified against
+/// the caller-supplied `room` (the room the client subscribed to), never the
+/// carried `room_id`. On success the recipient still binds the *displayed*
+/// handle to `SHA-384(sender_pubkey)[:12]` (ISC-C4 / ISC-C57).
 pub fn open_room_message(
     room_key: &PublicRoomKey,
+    room: &str,
     sealed: &[u8],
-) -> Result<wire::PublicRoomMessage, RoomMessageError> {
-    if sealed.len() < NONCE_LEN + TAG_LEN {
-        return Err(RoomMessageError::Truncated);
-    }
-    let nonce: &[u8; NONCE_LEN] = sealed[..NONCE_LEN].try_into().expect("checked length");
-    let after_nonce = &sealed[NONCE_LEN..];
-    let ciphertext_len = after_nonce.len() - TAG_LEN;
-    let ciphertext = &after_nonce[..ciphertext_len];
-    let tag: &[u8; TAG_LEN] = after_nonce[ciphertext_len..]
-        .try_into()
-        .expect("checked length");
-
-    let aes = Aes256Key::new(room_key.as_bytes()).map_err(RoomMessageError::KeyInit)?;
-    let mut plaintext = vec![0u8; ciphertext_len];
-    gcm_decrypt(
-        &aes,
-        nonce,
+) -> Result<wire::RoomMessage, RoomMessageError> {
+    open_signed_room_message(
+        room_key,
         ROOM_MESSAGE_AAD,
-        ciphertext,
-        tag,
-        &mut plaintext,
+        ROOM_PROVENANCE_DOMAIN,
+        sealed,
+        room,
     )
-    .map_err(|e| match e {
-        ModeError::TagMismatch => RoomMessageError::Authentication,
-        other => RoomMessageError::Aead(other),
-    })?;
-
-    let decoded = wire::PublicRoomMessage::decode(plaintext.as_slice());
-    plaintext.zeroize();
-    let message = decoded.map_err(RoomMessageError::Decode)?;
-
-    // ISC-S24 / ISC-A-S17: verify the self-signed provenance before returning.
-    let pubkey: &[u8; ml_dsa::PK_LEN] = message
-        .sender_pubkey
-        .as_slice()
-        .try_into()
-        .map_err(|_| RoomMessageError::Provenance)?;
-    let signature: &[u8; ml_dsa::SIG_LEN] = message
-        .signature
-        .as_slice()
-        .try_into()
-        .map_err(|_| RoomMessageError::Provenance)?;
-    let signing_input = provenance_input(
-        &message.room,
-        &message.sender_pubkey,
-        message.sent_unix_ms,
-        &message.body,
-    );
-    verify_signature(pubkey, &signing_input, signature)
-        .map_err(|_| RoomMessageError::Provenance)?;
-
-    Ok(message)
 }
 
 /// Failure deriving a public-room key.
@@ -429,46 +335,6 @@ impl core::fmt::Display for RoomKeyError {
 }
 
 impl core::error::Error for RoomKeyError {}
-
-/// Failure sealing/opening a public-room message.
-#[derive(Debug)]
-pub enum RoomMessageError {
-    /// The AES-256 key schedule failed to initialise.
-    KeyInit(OxicryptError),
-    /// The OS entropy source failed while drawing a nonce.
-    EntropySource(getrandom::Error),
-    /// A non-`TagMismatch` AEAD mode error.
-    Aead(ModeError),
-    /// AEAD authentication failed (wrong key, tampered ciphertext, swapped
-    /// nonce, or wrong AAD). Carries no sub-cause.
-    Authentication,
-    /// The sealed buffer is shorter than `nonce ‖ tag`.
-    Truncated,
-    /// The decrypted bytes did not decode as a [`wire::PublicRoomMessage`].
-    Decode(prost::DecodeError),
-    /// Signing the provenance input failed (crypto module not operational).
-    Sign,
-    /// The embedded provenance signature did not verify under the embedded
-    /// sender pubkey, or those fields were the wrong length (ISC-A-S17).
-    Provenance,
-}
-
-impl core::fmt::Display for RoomMessageError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::KeyInit(e) => write!(f, "public-room AES key init failed: {e}"),
-            Self::EntropySource(e) => write!(f, "public-room nonce entropy failed: {e}"),
-            Self::Aead(e) => write!(f, "public-room AEAD error: {e:?}"),
-            Self::Authentication => write!(f, "public-room authentication failed"),
-            Self::Truncated => write!(f, "public-room envelope is truncated"),
-            Self::Decode(e) => write!(f, "public-room decode failed: {e}"),
-            Self::Sign => write!(f, "public-room provenance signing failed"),
-            Self::Provenance => write!(f, "public-room provenance verification failed"),
-        }
-    }
-}
-
-impl core::error::Error for RoomMessageError {}
 
 #[cfg(test)]
 mod tests {
@@ -546,10 +412,10 @@ mod tests {
             1_700_000_000_000,
         )
         .unwrap();
-        let opened = open_room_message(&key, &sealed).unwrap();
+        let opened = open_room_message(&key, DEFAULT_ROOM, &sealed).unwrap();
         assert_eq!(opened.body, "hello public room");
         assert_eq!(opened.sender_pubkey, sender.public_key().to_vec());
-        assert_eq!(opened.room, DEFAULT_ROOM);
+        assert_eq!(opened.room_id, DEFAULT_ROOM);
     }
 
     /// ISC-A-S16 — the body is NEVER present in the sealed bytes (it rode the
@@ -571,19 +437,22 @@ mod tests {
     /// provenance verification: the message is never surfaced unverified.
     #[test]
     fn tampered_provenance_rejected() {
+        use crate::room_message::provenance_input;
+        use oxicrypt_aes::{Aes256Key, gcm_encrypt};
         let key = derive_room_key(DEFAULT_ROOM, &CNSA_2_0).unwrap();
         let sender = keypair(9);
         // Forge a message: valid seal under the (public) global key, but the
         // signature covers a DIFFERENT body than the one we ship.
         let good_sig_input = provenance_input(
+            ROOM_PROVENANCE_DOMAIN,
             DEFAULT_ROOM,
             sender.public_key().as_ref(),
             1,
             "the honest body",
         );
         let signature = sender.sign(&good_sig_input).unwrap().to_vec();
-        let forged = wire::PublicRoomMessage {
-            room: DEFAULT_ROOM.to_owned(),
+        let forged = wire::RoomMessage {
+            room_id: DEFAULT_ROOM.to_owned(),
             sender_pubkey: sender.public_key().to_vec(),
             sender_handle: "a#000000000000".to_owned(),
             body: "TAMPERED body".to_owned(), // signature does not cover this
@@ -591,11 +460,11 @@ mod tests {
             signature,
         };
         let aes = Aes256Key::new(key.as_bytes()).unwrap();
-        let mut nonce = [0u8; NONCE_LEN];
+        let mut nonce = [0u8; 12];
         getrandom::fill(&mut nonce).unwrap();
-        let plaintext = forged.encode_to_vec();
+        let plaintext = prost::Message::encode_to_vec(&forged);
         let mut ct = vec![0u8; plaintext.len()];
-        let mut tag = [0u8; TAG_LEN];
+        let mut tag = [0u8; 16];
         gcm_encrypt(
             &aes,
             &nonce,
@@ -610,7 +479,7 @@ mod tests {
         sealed.extend_from_slice(&ct);
         sealed.extend_from_slice(&tag);
 
-        match open_room_message(&key, &sealed) {
+        match open_room_message(&key, DEFAULT_ROOM, &sealed) {
             Err(RoomMessageError::Provenance) => {}
             other => panic!("expected Provenance rejection, got {other:?}"),
         }
@@ -624,7 +493,7 @@ mod tests {
         let other = derive_room_key("other-room", &CNSA_2_0).unwrap();
         let sender = keypair(10);
         let sealed = seal_room_message(&lobby, &sender, "lobby", "a#000000000000", "x", 1).unwrap();
-        match open_room_message(&other, &sealed) {
+        match open_room_message(&other, "other-room", &sealed) {
             Err(RoomMessageError::Authentication) => {}
             other => panic!("expected Authentication, got {other:?}"),
         }

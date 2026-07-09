@@ -63,6 +63,7 @@ use daemonseed_core::circle::key::{
 use daemonseed_core::circle::message::{open_message, seal_message};
 use daemonseed_core::cot::{AssetAddr, asset_address};
 use daemonseed_core::crypto::suite::CNSA_2_0;
+use daemonseed_core::handle::{DisplayMode, Handle};
 use daemonseed_core::heartbeat::{
     HeartbeatFields, open_heartbeat, seal_circle_heartbeat, seal_public_heartbeat,
 };
@@ -371,7 +372,7 @@ pub async fn veilid_net_actor(
             }
             // Only poll the Veilid event stream once connected.
             Some(ev) = recv_opt(&mut ev_rx), if ev_rx.is_some() => {
-                handle_inbound(ev, &evt_tx, &mut circles, &my_handle, &mut shares);
+                handle_inbound(ev, &evt_tx, &mut circles, &mut shares);
             }
             // Age out discovered shares not reheard within the TTL (Shape B liveness):
             // a sharer that vanished without a withdraw self-clears from the list.
@@ -661,7 +662,16 @@ async fn handle_command(
             join_circle(circle_id, &phrase, evt_tx, net, circles).await;
         }
         NetCommand::SendCircle { circle_id, text } => {
-            send_circle(circle_id, &text, evt_tx, net, circles, my_handle).await;
+            send_circle(
+                circle_id,
+                &text,
+                evt_tx,
+                net,
+                circles,
+                my_handle,
+                shares.signing.clone(),
+            )
+            .await;
         }
 
         // ── Public shares (Phase 3 Slice 2b) ──
@@ -984,6 +994,7 @@ async fn send_circle(
     net: &Option<VeilidNetHandle>,
     circles: &[VeilidCircle],
     my_handle: &str,
+    signing: Option<Arc<SignKeypair>>,
 ) {
     let err = |reason: String| {
         let _ = evt_tx.send(NetEvent::CircleError { circle_id, reason });
@@ -998,23 +1009,33 @@ async fn send_circle(
     let Some(handle) = net.as_ref() else {
         return err("not connected to Veilid yet".to_owned());
     };
-    let sent_unix_ms = now_unix_ms();
-    let message = wire::CircleMessage {
-        sender_handle: my_handle.to_owned(),
-        body: text.to_owned(),
-        sent_unix_ms,
+    let Some(signing) = signing else {
+        return err("no identity to sign the message".to_owned());
     };
-    let sealed = match seal_message(&circle.cot_key, &message) {
+    let sent_unix_ms = now_unix_ms();
+    // Circle messages are now SIGNED (room↔circle convergence): the poster's
+    // identity signs the RoomMessage so authorship is verifiable. Transmit the
+    // CANONICAL `name#<12hex>` handle so a receiver's display_bound honors the name.
+    let wire_handle = crate::net::canonical_wire_handle(my_handle, signing.public_key());
+    let sealed = match seal_message(
+        &circle.cot_key,
+        signing.as_ref(),
+        &wire_handle,
+        text,
+        sent_unix_ms,
+    ) {
         Ok(s) => s,
         Err(e) => return err(format!("seal failed: {e}")),
     };
     // #101: optimistic local echo FIRST — the sender sees their own message
     // immediately, not after the DHT publish round-trip (seconds on Veilid). The
-    // delayed DHT re-surface of this same write is emitted `mine:true` and deduped
-    // against this echo by `sent_unix_ms` in `push_message` (#143), so no double-render.
+    // delayed DHT re-surface of this same write is emitted `mine:true`; its `who` is
+    // `display_bound(...).format(Default)` = our display name, so the echo emits the
+    // SAME display name (not the raw handle) and `push_message` dedups them (#143).
+    let display_name = my_handle.split('#').next().unwrap_or(my_handle).to_owned();
     let _ = evt_tx.send(NetEvent::CircleMessage {
         circle_id,
-        who: my_handle.to_owned(),
+        who: display_name,
         text: text.to_owned(),
         mine: true,
         sent_unix_ms,
@@ -1061,11 +1082,14 @@ async fn send_room(
         return err("no identity to sign the post".to_owned());
     };
     let sent_unix_ms = now_unix_ms();
+    // Transmit the CANONICAL `name#<12hex>` handle so a receiver's display_bound
+    // honors the name (a bare handle would floor to `#<hex>` for every peer).
+    let wire_handle = crate::net::canonical_wire_handle(my_handle, signing.public_key());
     let sealed = match seal_room_message(
         &lobby.room_key,
         signing.as_ref(),
         DEFAULT_ROOM,
-        my_handle,
+        &wire_handle,
         text,
         sent_unix_ms,
     ) {
@@ -1073,10 +1097,12 @@ async fn send_room(
         Err(e) => return err(format!("public-room seal/sign failed: {e}")),
     };
     // Optimistic local echo FIRST — the sender sees their own message immediately,
-    // not after the Veilid publish round-trip; the delayed DHT re-surface of this
-    // same write is emitted `mine:true` and deduped against this echo (#143).
+    // not after the Veilid publish round-trip; the delayed DHT re-surface emits
+    // `mine:true` with `who = display_bound(...).format(Default)` = our display name,
+    // so the echo emits the SAME display name and `push_message` dedups them (#143).
+    let display_name = my_handle.split('#').next().unwrap_or(my_handle).to_owned();
     let _ = evt_tx.send(NetEvent::Message {
-        who: my_handle.to_owned(),
+        who: display_name,
         text: text.to_owned(),
         mine: true,
         sent_unix_ms,
@@ -1957,7 +1983,6 @@ fn handle_inbound(
     ev: VeilidNetEvent,
     evt_tx: &UnboundedSender<NetEvent>,
     circles: &mut [VeilidCircle],
-    my_handle: &str,
     shares: &mut ShareState,
 ) {
     let VeilidNetEvent::Inbound { bytes } = ev else {
@@ -1969,22 +1994,34 @@ fn handle_inbound(
         bytes.len(),
         circles.len()
     );
+    // `mine` keys on the STABLE identity pubkey, not the mutable display handle —
+    // the room↔circle convergence's #143 fix (a mid-session rename no longer makes
+    // an own DHT-loopback fail the own-message check and duplicate).
+    let my_pubkey = shares
+        .signing
+        .as_ref()
+        .map(|s| s.public_key().to_vec())
+        .unwrap_or_default();
     for circle in circles.iter() {
         if let Ok(msg) = open_message(&circle.cot_key, &bytes) {
-            // #143: emit own messages too (mine == our handle) instead of suppressing.
+            // #143: emit own messages too (mine == our pubkey) instead of suppressing.
             // A LIVE own message dedups against its optimistic local echo in
             // `push_message` (same `sent_unix_ms`); a COLD-START backlog own message has
             // no prior echo and renders once — so the reconstructed transcript shows
             // BOTH halves of the conversation, not just the other party's.
-            let mine = msg.sender_handle == my_handle;
+            let mine = msg.sender_pubkey == my_pubkey;
+            // `who` binds to SHA-384(sender_pubkey)[:12] (ISC-C4/C57): a spoofed
+            // handle shows at its `#<prefix>` floor, never under the stolen name.
+            let Ok(bound) = Handle::display_bound(&msg.sender_handle, &msg.sender_pubkey) else {
+                return; // unbindable pubkey (unreachable post-verify) — drop
+            };
             daemonseed_veilid_net::vtrace!(
-                "gui inbound: opened circle {} from '{}' (mine={mine}) -> deliver",
-                circle.circle_id,
-                msg.sender_handle
+                "gui inbound: opened circle {} (mine={mine}) -> deliver",
+                circle.circle_id
             );
             let _ = evt_tx.send(NetEvent::CircleMessage {
                 circle_id: circle.circle_id,
-                who: msg.sender_handle,
+                who: bound.format(DisplayMode::Default),
                 text: msg.body,
                 mine,
                 sent_unix_ms: msg.sent_unix_ms,
@@ -1999,15 +2036,16 @@ fn handle_inbound(
     // `mine:true` (not suppressed) — they dedup against the optimistic local echo live
     // (same `sent_unix_ms`) and render once from the cold-start backlog.
     if let Some(lobby) = shares.lobby.as_ref()
-        && let Ok(msg) = open_room_message(&lobby.room_key, &bytes)
+        && let Ok(msg) = open_room_message(&lobby.room_key, DEFAULT_ROOM, &bytes)
     {
-        let mine = msg.sender_handle == my_handle;
-        daemonseed_veilid_net::vtrace!(
-            "gui inbound: opened lobby chat from '{}' (mine={mine}) -> deliver",
-            msg.sender_handle
-        );
+        // Pubkey-keyed `mine` + pubkey-bound `who` (ISC-C4/C57), same as circles.
+        let mine = msg.sender_pubkey == my_pubkey;
+        let Ok(bound) = Handle::display_bound(&msg.sender_handle, &msg.sender_pubkey) else {
+            return; // unbindable pubkey (unreachable post-verify) — drop
+        };
+        daemonseed_veilid_net::vtrace!("gui inbound: opened lobby chat (mine={mine}) -> deliver");
         let _ = evt_tx.send(NetEvent::Message {
-            who: msg.sender_handle,
+            who: bound.format(DisplayMode::Default),
             text: msg.body,
             mine,
             sent_unix_ms: msg.sent_unix_ms,
@@ -2622,7 +2660,6 @@ mod tests {
             VeilidNetEvent::Inbound { bytes: sealed },
             &evt_tx,
             &mut circles,
-            "guest",
             &mut shares,
         );
         assert_eq!(
@@ -2731,14 +2768,21 @@ mod tests {
             42,
         )
         .unwrap();
+        // No signing key in `shares` → own_pubkey is None → nothing is `mine`.
         let (evt_tx, mut evt_rx) = unbounded_channel();
         handle_inbound(
             VeilidNetEvent::Inbound { bytes: sealed },
             &evt_tx,
             &mut [],
-            "me#000000000000",
             &mut shares,
         );
+        // `who` is now bound to the signer's pubkey (ISC-C4/C57): the self-asserted
+        // "river-otter#aabbccddeeff" whose hash disagrees is shown at its `#<prefix>`
+        // floor, never under the spoofed name.
+        let expected_who =
+            Handle::display_bound("river-otter#aabbccddeeff", signer.public_key().as_slice())
+                .unwrap()
+                .format(DisplayMode::Default);
         match evt_rx.try_recv() {
             Ok(NetEvent::Message {
                 who,
@@ -2746,7 +2790,7 @@ mod tests {
                 mine,
                 sent_unix_ms,
             }) => {
-                assert_eq!(who, "river-otter#aabbccddeeff");
+                assert_eq!(who, expected_who);
                 assert_eq!(text, "hello lobby");
                 assert!(!mine, "a peer's message is not ours");
                 assert_eq!(sent_unix_ms, 42, "#126: the wire timestamp is plumbed");
@@ -2760,19 +2804,28 @@ mod tests {
     /// with no echo it renders once (#143).
     #[test]
     fn handle_inbound_emits_our_own_looped_back_lobby_message_as_mine() {
-        let me = announcer(32);
+        let me = Arc::new(announcer(32));
         let my_handle = "me#aabbccddeeff";
         let mut shares = ShareState::new();
         shares.lobby = Some(lobby());
+        // #143: `mine` keys on the STABLE pubkey — set our signing key so the
+        // looped-back own message is recognised regardless of the display handle.
+        shares.signing = Some(Arc::clone(&me));
         let room_key = derive_room_key(DEFAULT_ROOM, &CNSA_2_0).unwrap();
-        let sealed =
-            seal_room_message(&room_key, &me, DEFAULT_ROOM, my_handle, "my own line", 7).unwrap();
+        let sealed = seal_room_message(
+            &room_key,
+            me.as_ref(),
+            DEFAULT_ROOM,
+            my_handle,
+            "my own line",
+            7,
+        )
+        .unwrap();
         let (evt_tx, mut evt_rx) = unbounded_channel();
         handle_inbound(
             VeilidNetEvent::Inbound { bytes: sealed },
             &evt_tx,
             &mut [],
-            my_handle,
             &mut shares,
         );
         // #143: an own looped-back message is now EMITTED as `mine:true` (not
@@ -2787,9 +2840,15 @@ mod tests {
         else {
             panic!("expected a lobby Message event for the own looped-back line");
         };
-        assert_eq!(who, my_handle);
+        let expected_who = Handle::display_bound(my_handle, me.public_key().as_slice())
+            .unwrap()
+            .format(DisplayMode::Default);
+        assert_eq!(who, expected_who);
         assert_eq!(text, "my own line");
-        assert!(mine, "own message must be flagged mine:true");
+        assert!(
+            mine,
+            "own message must be flagged mine:true (keyed on pubkey)"
+        );
     }
 
     /// `SendRoom` with no lobby subscribed reports a clean error rather than

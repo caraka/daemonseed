@@ -117,12 +117,13 @@ async fn two_members_chat_through_relay_with_sealed_envelope() {
         .expect("A subscribes")
         .into_inner();
 
-    let original = wire::CircleMessage {
-        sender_handle: "river-otter#aabbccddeeff".to_owned(),
-        body: "meet at the usual place".to_owned(),
-        sent_unix_ms: 1_700_000_000_000,
-    };
-    let sealed = seal_message(&key_a, &original).unwrap();
+    // Circle messages are now SIGNED (room↔circle convergence): A signs the
+    // RoomMessage with its identity so authorship is verifiable.
+    let signer =
+        daemonseed_core::identity::keys::SignKeypair::from_ml_dsa_seed(&[7u8; 32]).unwrap();
+    let handle = "river-otter#aabbccddeeff";
+    let body = "meet at the usual place";
+    let sealed = seal_message(&key_a, &signer, handle, body, 1_700_000_000_000).unwrap();
     a_tx.send(frame(&addr_bytes, sealed)).await.unwrap();
 
     // B receives the opaque frame the relay forwarded.
@@ -135,14 +136,17 @@ async fn two_members_chat_through_relay_with_sealed_envelope() {
     // ISC-A-S2: the relay carried ciphertext, never the plaintext body.
     assert_ne!(
         received.payload,
-        original.body.as_bytes(),
+        body.as_bytes(),
         "the relay must forward ciphertext, not the plaintext message"
     );
     assert_eq!(received.asset_address, addr_bytes, "routed by rendezvous");
 
-    // ISC-10: B opens it under the shared circle key and recovers A's message.
+    // ISC-10: B opens+verifies it under the shared circle key and recovers A's
+    // signed message, including the provenance pubkey.
     let opened = open_message(&key_b, &received.payload).expect("member opens the message");
-    assert_eq!(opened, original, "B recovers A's message byte-for-byte");
+    assert_eq!(opened.body, body);
+    assert_eq!(opened.sender_handle, handle);
+    assert_eq!(opened.sender_pubkey, signer.public_key().to_vec());
 
     // A non-member (different phrase → different key) cannot open the frame —
     // the position the relay and any eavesdropper are structurally in.

@@ -23,9 +23,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use daemonseed_core::circle::key::{derive_circle_veilid_owner_seed, derive_cot_key};
 use daemonseed_core::circle::message::{open_message, seal_message};
 use daemonseed_core::crypto::suite::CNSA_2_0;
+use daemonseed_core::identity::keys::SignKeypair;
 use daemonseed_core::identity::keys::{derive_identity_keys, Identity};
 use daemonseed_core::identity::mnemonic::Mnemonic;
-use daemonseed_proto::v1::CircleMessage;
 use daemonseed_veilid_net::{VeilidNet, VeilidNetConfig, VeilidNetEvent};
 
 /// A node config with a fresh daemonseed-derived node identity (D3), a distinct
@@ -81,13 +81,11 @@ async fn sealed_circle_message_reaches_a_second_member() {
         .await
         .expect("B public-internet-ready");
 
-    // Seal a real CircleMessage; the wire carries only these opaque bytes.
-    let original = CircleMessage {
-        sender_handle: "river-otter#aabbccddeeff".to_owned(),
-        body: "carried over a Veilid DHT circle rendezvous".to_owned(),
-        sent_unix_ms: 1_700_000_000_000,
-    };
-    let sealed = seal_message(&cot_key, &original).expect("seal");
+    // Seal a real signed circle RoomMessage; the wire carries only opaque bytes.
+    let signer = SignKeypair::from_ml_dsa_seed(&[7u8; 32]).expect("signer");
+    let handle = "river-otter#aabbccddeeff";
+    let body = "carried over a Veilid DHT circle rendezvous";
+    let sealed = seal_message(&cot_key, &signer, handle, body, 1_700_000_000_000).expect("seal");
 
     // A publishes (creates + sets the rendezvous record → network-visible), then
     // keeps re-publishing: a created record isn't visible until first set, and
@@ -126,16 +124,11 @@ async fn sealed_circle_message_reaches_a_second_member() {
             match rx_b.recv().await {
                 Some(VeilidNetEvent::Inbound { bytes }) => {
                     assert!(
-                        !bytes
-                            .windows(original.body.len())
-                            .any(|w| w == original.body.as_bytes()),
+                        !bytes.windows(body.len()).any(|w| w == body.as_bytes()),
                         "the plaintext body must never appear on the wire"
                     );
                     match open_message(&cot_key, &bytes) {
-                        Ok(m)
-                            if m.body == original.body
-                                && m.sender_handle == original.sender_handle =>
-                        {
+                        Ok(m) if m.body == body && m.sender_handle == handle => {
                             eprintln!(
                                 "[oracle] inbound {} bytes OPENED to A's message",
                                 bytes.len()

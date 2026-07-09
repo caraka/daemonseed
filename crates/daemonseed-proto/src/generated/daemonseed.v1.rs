@@ -92,87 +92,67 @@ pub struct CotFrame {
     #[prost(bytes = "vec", tag = "2")]
     pub payload: ::prost::alloc::vec::Vec<u8>,
 }
-/// A circle chat message — the FIRST application payload type carried inside a
-/// CotFrame (ISC-10..14 / ISC-C15 / ISC-C17). This is the *plaintext* shape:
-/// it is prost-encoded, then AES-256-GCM-sealed under the circle's cot_key
-/// (daemonseed-core circle::message), and ONLY the resulting ciphertext rides
-/// in CotFrame.payload. It is NEVER sent on any wire path in the clear — the
-/// relay is content-blind by construction (ISC-A-S2), so this message exists
-/// purely as the encode boundary between the chat UI and the AEAD seal.
+/// A ROOM MESSAGE — the unified chat payload for BOTH a public room and a
+/// private circle (ISC-S4 / ISC-S22..S26 / ISC-10..14 / ISC-C57). A public room
+/// and a private circle behave identically in every respect except how their key
+/// is derived: a public room's key is world-derivable from the room name, a
+/// circle's key is entropy-gated from the shared phrase. Everything downstream —
+/// provenance, the #12hex authorship binding, sealing, fan-out, discovery — is
+/// ONE code path parameterized by the room key (design-of-record:
+/// docs/design/room-circle-unification.md § Design (A)). This is the *plaintext*
+/// shape: it is prost-encoded, then AES-256-GCM-sealed under the surface's key
+/// (daemonseed-core room_message via public_room / circle::message), and ONLY the
+/// resulting ciphertext rides in CotFrame.payload — it is NEVER wire-cleartext
+/// (ISC-A-S16), the relay is content-blind by construction (ISC-A-S2).
 ///
-/// `sender_handle` is set by the sender and is therefore self-asserted: a
-/// circle member could spoof another member's handle. That is an accepted
-/// property of the seed-key trust model — circle membership is the security
-/// boundary, not per-message authorship — and is the same plaintext the
-/// recipient uses CLIENT-SIDE for @mention detection (ISC-C17) and mute
-/// filtering (ISC-C15), neither of which the relay can see (ISC-A-C3 / A-C4).
+/// It is SELF-SIGNED FOR PROVENANCE (ISC-S24 / ISC-C57): `sender_pubkey` and
+/// `signature` carry an ML-DSA-87 signature by the posting identity over a
+/// domain-separated input binding `provenance_domain ‖ room_id ‖ sender_pubkey ‖
+/// sent_unix_ms ‖ body`. The signature proves WHO posted (not that they were
+/// authorized to). Recipients verify it client-side and bind the displayed
+/// handle to `SHA-384(sender_pubkey)\[:12\]` (ISC-C4) so a spoofed `sender_handle`
+/// cannot impersonate a real key — closing the pre-merge gap where a circle
+/// message carried only a self-asserted handle. The two surfaces use DISTINCT
+/// domain strings (public-room/message/v1 vs circle/message/v2), so a signature
+/// or seal from one can never be opened or replayed as the other.
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct CircleMessage {
-    /// The sender's full wire handle (`<name>#<12hex>`), self-asserted. Used by
-    /// recipients client-side for @mention highlighting and mute suppression.
+pub struct RoomMessage {
+    /// The room/circle identifier bound into the provenance signature so a message
+    /// cannot be replayed across rooms/circles. For a public room this is the room
+    /// name (e.g. "lobby"); for a circle it is the member-derivable fingerprint
+    /// SHA-384(cot_key)\[:12\] (12 hex) — one-way, leaks no secret, recomputed by the
+    /// verifier from its OWN key. The verifier NEVER trusts this carried value for
+    /// crypto: it verifies the signature against a room_id it recomputes/knows from
+    /// context, so a forged or foreign room_id cannot validate.
     #[prost(string, tag = "1")]
+    pub room_id: ::prost::alloc::string::String,
+    /// The poster's full ML-DSA-87 public key (2592 bytes for ML-DSA-87). The
+    /// provenance signature verifies under it, and the recipient derives the
+    /// authoritative handle hash-prefix `SHA-384(sender_pubkey)\[:12\]` from it
+    /// (ISC-C4) — never trusting `sender_handle` alone. Authorship, dedup, and the
+    /// `mine` decision all key on this stable pubkey, not the mutable handle.
+    #[prost(bytes = "vec", tag = "2")]
+    pub sender_pubkey: ::prost::alloc::vec::Vec<u8>,
+    /// The poster's self-asserted display handle (`<name>#<12hex>`). DECORATIVE:
+    /// the recipient cross-checks its hash component against `sender_pubkey`
+    /// (ISC-C57) and shows the verified `#<prefix>` floor when it disagrees. It is
+    /// NOT in the signed transcript and is never read by any trust/dedup path.
+    #[prost(string, tag = "3")]
     pub sender_handle: ::prost::alloc::string::String,
     /// The message body as typed. Rendered as inert plaintext by the client
     /// (terminal control sequences stripped at the UI boundary).
-    #[prost(string, tag = "2")]
-    pub body: ::prost::alloc::string::String,
-    /// Sender wall-clock at compose time, unix milliseconds. Advisory ordering
-    /// only — there is no global clock and no relay timestamp (the relay sees
-    /// ciphertext). Recipients display it; they do not trust it for security.
-    #[prost(int64, tag = "3")]
-    pub sent_unix_ms: i64,
-}
-/// A public-room chat message — the application payload for an INTERACTIVE public
-/// room (ISC-S4 / ISC-S22..S26). A public room is the public-vs-CoT bifurcation's
-/// public tier built over the SAME CircleOfTrust.Subscribe relay and the SAME
-/// CotFrame mechanism — any daemon may post, everyone subscribed reads
-/// (ISC-S22). Two things distinguish it from a CircleMessage:
-///
-///    1. It is SELF-SIGNED FOR PROVENANCE (ISC-S24 / ISC-C57). `sender_pubkey`
-///       and `signature` carry an ML-DSA-87 signature by the POSTING daemon's own
-///       identity over `daemonseed/public-room/message/v1 ‖ room ‖ sender_pubkey
-///       ‖ sent_unix_ms ‖ body`. Posting is open to any daemon — the signature
-///       proves WHO posted, not that they were AUTHORIZED to (contrast the
-///       whitelist-signed operator posts of ISC-S7/S8). Recipients verify it
-///       client-side and bind the displayed handle to `SHA-384(sender_pubkey)\[:12\]`
-///       (ISC-C4) so a spoofed `sender_handle` cannot impersonate a real key.
-///
-///    2. It is ENCRYPTED UNDER A GLOBAL SHARED KEY (ISC-S22 / ISC-A-S2). This
-///       whole message is prost-encoded, then AES-256-GCM-sealed under the public
-///       room key (daemonseed-core public_room::seal_room_message) — a key derived
-///       from PUBLIC inputs that the relay AND every client hold. ONLY the
-///       ciphertext rides in CotFrame.payload: the room is NEVER wire-cleartext
-///       (ISC-A-S16). The relay can read it because it holds the global key
-///       (server-readable, the deliberately-public tier) — NOT because anything
-///       travels in the clear.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct PublicRoomMessage {
-    /// The public room name this message belongs to (e.g. "lobby"). Bound into
-    /// the provenance signature so a message cannot be replayed into a different
-    /// room. The rendezvous address already namespaces delivery; this binds the
-    /// signed content too.
-    #[prost(string, tag = "1")]
-    pub room: ::prost::alloc::string::String,
-    /// The poster's full ML-DSA-87 public key (1952 bytes for ML-DSA-87). The
-    /// provenance signature verifies under it, and the recipient derives the
-    /// authoritative handle hash-prefix `SHA-384(sender_pubkey)\[:12\]` from it
-    /// (ISC-C4) — never trusting `sender_handle` alone.
-    #[prost(bytes = "vec", tag = "2")]
-    pub sender_pubkey: ::prost::alloc::vec::Vec<u8>,
-    /// The poster's self-asserted display handle (`<name>#<12hex>`). Advisory:
-    /// the recipient cross-checks its hash component against `sender_pubkey`
-    /// (ISC-C57) and shows the verified `#<prefix>` floor when it disagrees.
-    #[prost(string, tag = "3")]
-    pub sender_handle: ::prost::alloc::string::String,
-    /// The message body as typed. Rendered as inert plaintext by the client.
     #[prost(string, tag = "4")]
     pub body: ::prost::alloc::string::String,
-    /// Sender wall-clock at compose time, unix milliseconds. Advisory ordering.
+    /// Sender wall-clock at compose time, unix milliseconds. Advisory ordering and
+    /// provenance binding only — there is no global clock and no relay timestamp
+    /// (the relay sees ciphertext). Recipients display it; they do not trust it for
+    /// security, and it is provenance binding, NOT anti-replay.
     #[prost(int64, tag = "5")]
     pub sent_unix_ms: i64,
     /// Detached ML-DSA-87 provenance signature (4627 bytes for ML-DSA-87) over the
     /// domain-separated signed input (ISC-S24). Verified client-side under
-    /// `sender_pubkey`; a bad signature drops the message (ISC-A-S17).
+    /// `sender_pubkey`; an absent, empty, or bad signature drops the message
+    /// (ISC-A-S17, fail-closed).
     #[prost(bytes = "vec", tag = "6")]
     pub signature: ::prost::alloc::vec::Vec<u8>,
 }
@@ -180,11 +160,11 @@ pub struct PublicRoomMessage {
 /// relay-hosted share registry (design-of-record: docs/design/unified-share-model.md).
 /// It is posted into a room/circle as a CotFrame.payload at that room's
 /// rendezvous address, sealed + ML-DSA self-signed exactly like a
-/// PublicRoomMessage: discovery becomes "listen to the stream" instead of a
+/// RoomMessage: discovery becomes "listen to the stream" instead of a
 /// relay ListPublicShares call, so the relay holds NO share directory (A-S2,
 /// A-S1) and is a pure blind forwarder for shares as it already is for chat.
 ///
-/// Like PublicRoomMessage it is (1) SELF-SIGNED FOR PROVENANCE (C57): the
+/// Like RoomMessage it is (1) SELF-SIGNED FOR PROVENANCE (C57): the
 /// signature over the domain-separated input proves WHO announced, not that they
 /// were authorized to. And (2) ENCRYPTED UNDER THE TIER KEY: the whole message
 /// is prost-encoded then AES-256-GCM-sealed — under the public room key for a
@@ -261,7 +241,7 @@ pub struct ShareAnnouncement {
 /// key (public room key, or a circle cot_key), so only room/circle members can
 /// post or read a roll-call and the relay sees ciphertext only (A-S2, A-S16). A
 /// distinct AAD (daemonseed/share/rollcall/v1) keeps it from ever being opened
-/// as — or substituted from — a chat message, a public-room message, a share
+/// as — or substituted from — a room message (public or circle), a share
 /// announcement, or a content frame under a coincidentally-equal key. See
 /// daemonseed-core share_rollcall::{seal_public_rollcall, seal_circle_rollcall,
 /// open_rollcall}.
@@ -308,7 +288,7 @@ pub struct ShareRollCall {
 /// cot_key), so only room/circle members can post or read a heartbeat and the
 /// relay sees ciphertext only (A-S2, A-S16). A distinct AAD
 /// (daemonseed/presence/heartbeat/v1) keeps it from ever being opened as — or
-/// substituted from — a chat message, a public-room message, a share
+/// substituted from — a room message (public or circle), a share
 /// announcement, or a roll-call under a coincidentally-equal key. It is
 /// wire-shape-identical to those sealed frames, adding no new distinguishable
 /// flow (A-S2 traffic-shape), and carries ONLY the beacon's own presence

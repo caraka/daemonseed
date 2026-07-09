@@ -332,7 +332,7 @@ modules:
       Share-fetch envelope (M11 — ISC-19, F23 unified mechanism). Public and
       CoT shares ride the same CircleOfTrust.Subscribe bidi stream as chat
       circles. What rides inside CotFrame.payload differs per asset kind:
-      chat circles carry a prost-encoded CircleMessage sealed with AES-256-GCM
+      chat circles carry a prost-encoded RoomMessage sealed with AES-256-GCM
       under cot_key (`circle::message`); public shares carry a `ShareFrame`
       encoded by `ShareFrame::encode`, plain (ISC-C19 makes public-share
       content server-visible); CoT shares (post-MVP) will carry the same
@@ -712,26 +712,58 @@ modules:
       - A-C8
       - A-S2
 
-  - name: daemonseed_core::circle::message
+  - name: daemonseed_core::room_message
     description: >-
-      Circle chat-message sealing — the boundary where a plaintext
-      daemonseed_proto CircleMessage becomes the opaque bytes carried in a
-      CotFrame.payload and back. seal_message prost-encodes then AES-256-GCM
-      seals under the 32-byte cot_key (AAD = MESSAGE_AAD domain tag); the
-      envelope is nonce(12)||ciphertext||tag(16). open_message fails closed
-      (Authentication) on a wrong key or any tamper — the position a
-      content-blind relay is structurally in (ISC-A-S2). The sender_handle in
-      the message is self-asserted: membership is the trust boundary, and that
-      handle is used client-side only for @mention (C17) and mute (C15).
+      The ONE signed room-message seal/open path shared by public rooms and
+      circles (room↔circle convergence). seal_signed_room_message(key, aad,
+      provenance_domain, sender, room_id, sender_handle, body, sent_unix_ms)
+      self-signs a RoomMessage over provenance_domain||room_id||sender_pubkey||
+      sent_unix_ms||body then AES-256-GCM seals it under `key` with `aad`.
+      open_signed_room_message(key, aad, provenance_domain, sealed,
+      expected_room_id) opens, exact-length-gates sender_pubkey/signature BEFORE
+      any ML-DSA call (empty pubkey ≠ anyone), and verifies the signature against
+      the caller-supplied expected_room_id — NEVER the carried field. public_room
+      and circle::message are thin wrappers supplying their key + DISTINCT AAD +
+      domain. RoomMessageError is the shared error (KeyInit/EntropySource/Aead/
+      Authentication/Truncated/Decode/Sign/Provenance).
     no_std: false
     depends_on:
       - daemonseed_core::circle::key
+      - daemonseed_core::circle::message
+      - daemonseed_core::identity::keys
+    iscs:
+      - S24
+      - C57
+      - C99
+      - A-S2
+      - A-S16
+      - A-S17
+
+  - name: daemonseed_core::circle::message
+    description: >-
+      Circle chat-message sealing — the thin circle-side wrapper over the ONE
+      signed seal/open path in room_message (room↔circle convergence). A circle
+      is a public room with a secret key: seal_message signs a RoomMessage with
+      the poster's identity (C99) then AES-256-GCM seals under the 32-byte cot_key
+      with the circle AAD + provenance domain (daemonseed/circle/message/v2, the
+      signed shape); envelope = nonce(12)||ciphertext||tag(16). open_message
+      recomputes room_id from cot_key and verifies the signature against that,
+      fails closed (Authentication) on a wrong key/tamper (A-S2) and (Provenance)
+      on an absent/bad signature or a message signed for a different circle
+      (A-S17). MESSAGE_AAD / CIRCLE_PROVENANCE_DOMAIN / NONCE_LEN / TAG_LEN live
+      here; MessageError re-exports room_message::RoomMessageError.
+    no_std: false
+    depends_on:
+      - daemonseed_core::circle::key
+      - daemonseed_core::room_message
+      - daemonseed_core::identity::keys
     iscs:
       - C15
       - C17
+      - C57
+      - C99
       - A-S2
-      - A-C3
-      - A-C4
+      - A-S17
 
   - name: daemonseed_core::public_room
     description: >-
@@ -741,14 +773,18 @@ modules:
       no secret IKM), so every client AND the relay derive it: the room is
       server-readable by design — protocol uniformity, NOT a confidentiality
       barrier. room_asset_address = SHA-384(room_key ‖ server_id) puts a room on
-      the SAME Subscribe surface as a circle. seal_room_message self-signs
-      (ML-DSA provenance, S24) then AES-256-GCM seals (AAD = ROOM_MESSAGE_AAD);
-      open_room_message fails closed (Authentication) on a wrong key/tamper and
-      (Provenance) on a bad signature (A-S17). DEFAULT_ROOM = "lobby".
+      the SAME Subscribe surface as a circle. seal_room_message / open_room_message
+      are thin wrappers over the unified room_message seal/open path (AAD =
+      ROOM_MESSAGE_AAD, domain daemonseed/public-room/message/v1). open_room_message
+      takes the subscribed `room` and verifies the signature against it (never the
+      carried room_id), failing closed (Authentication) on a wrong key/tamper and
+      (Provenance) on a bad signature (A-S17). DEFAULT_ROOM = "lobby". Also derives
+      the Veilid rendezvous-owner + presence-owner seeds (siblings of the room key).
     no_std: false
     depends_on:
       - daemonseed_core::circle::key
       - daemonseed_core::circle::message
+      - daemonseed_core::room_message
       - daemonseed_core::cot
       - daemonseed_core::identity::keys
     iscs:
@@ -2349,7 +2385,7 @@ types:
       - name: Truncated
         description: "Sealed buffer shorter than nonce||tag."
       - name: Decode
-        description: "Decode(prost::DecodeError) — decrypted bytes are not a CircleMessage."
+        description: "Decode(prost::DecodeError) — decrypted bytes are not a RoomMessage."
 
   # ── public_space ────────────────────────────────────────────────────
   - name: ContentAddress
@@ -4171,34 +4207,50 @@ functions:
   - name: seal_message
     module: daemonseed_core::circle::message
     description: >-
-      Seal a plaintext CircleMessage under cot_key into an opaque
-      nonce(12)||ciphertext||tag(16) envelope for a CotFrame.payload. Fresh
-      random nonce per call; AAD = MESSAGE_AAD; prost plaintext zeroed after
-      GCM consumes it.
-    signature: "pub fn seal_message(cot_key: &circle::key::CircleKey, message: &daemonseed_proto::v1::CircleMessage) -> Result<Vec<u8>, MessageError>"
+      Seal a SIGNED circle RoomMessage under cot_key into an opaque
+      nonce(12)||ciphertext||tag(16) envelope for a CotFrame.payload — a thin
+      wrapper over room_message::seal_signed_room_message with the circle AAD +
+      provenance domain (daemonseed/circle/message/v2) and room_id =
+      circle_room_id(cot_key). `sender` signs for authorship (C99). Fresh random
+      nonce per call; prost plaintext zeroed after GCM consumes it.
+    signature: "pub fn seal_message(cot_key: &circle::key::CircleKey, sender: &identity::keys::SignKeypair, sender_handle: &str, body: &str, sent_unix_ms: i64) -> Result<Vec<u8>, MessageError>"
     parameters:
       - name: cot_key
         type: "&circle::key::CircleKey"
         direction: in
         description: The circle-of-trust symmetric key (the AES-256-GCM key).
-      - name: message
-        type: "&daemonseed_proto::v1::CircleMessage"
+      - name: sender
+        type: "&identity::keys::SignKeypair"
         direction: in
-        description: The plaintext chat message to seal.
+        description: The poster's OWN identity keypair; signs the message for authorship (C99).
+      - name: sender_handle
+        type: "&str"
+        direction: in
+        description: The poster's self-asserted display handle (decorative; bound to the pubkey on open).
+      - name: body
+        type: "&str"
+        direction: in
+        description: The message body.
+      - name: sent_unix_ms
+        type: i64
+        direction: in
+        description: Sender wall-clock at compose, unix ms (advisory + provenance binding).
     returns:
       type: "Result<Vec<u8>, MessageError>"
-      description: The opaque sealed envelope.
+      description: The opaque sealed envelope. MessageError is a re-export of room_message::RoomMessageError.
     preconditions:
       - description: The oxicrypt module must be operational.
 
   - name: open_message
     module: daemonseed_core::circle::message
     description: >-
-      Open an envelope produced by seal_message back into a CircleMessage.
-      Fails closed (Authentication) on a wrong cot_key or any tamper — the
-      position a content-blind relay is in (ISC-A-S2). Recovered plaintext
-      zeroed before returning.
-    signature: "pub fn open_message(cot_key: &circle::key::CircleKey, sealed: &[u8]) -> Result<daemonseed_proto::v1::CircleMessage, MessageError>"
+      Open + VERIFY an envelope produced by seal_message back into a verified
+      RoomMessage. Recomputes room_id from cot_key and verifies the provenance
+      signature against that (never the carried field). Fails closed
+      (Authentication) on a wrong cot_key or tamper (A-S2), (Provenance) on an
+      absent/bad signature or a message signed for a different circle (A-S17).
+      Recovered plaintext zeroed before returning.
+    signature: "pub fn open_message(cot_key: &circle::key::CircleKey, sealed: &[u8]) -> Result<daemonseed_proto::v1::RoomMessage, MessageError>"
     parameters:
       - name: cot_key
         type: "&circle::key::CircleKey"
@@ -4209,7 +4261,7 @@ functions:
         direction: in
         description: The nonce||ciphertext||tag envelope.
     returns:
-      type: "Result<daemonseed_proto::v1::CircleMessage, MessageError>"
+      type: "Result<daemonseed_proto::v1::RoomMessage, MessageError>"
       description: The decoded plaintext message.
       error_variants:
         - name: Authentication
@@ -4217,7 +4269,7 @@ functions:
         - name: Truncated
           condition: Buffer shorter than nonce||tag.
         - name: Decode
-          condition: Decrypted bytes are not a valid CircleMessage.
+          condition: Decrypted bytes are not a valid RoomMessage.
     preconditions:
       - description: The oxicrypt module must be operational.
 

@@ -4,7 +4,7 @@
 //! bidirectional stream as chat circles. What rides inside `CotFrame.payload`
 //! differs per asset kind:
 //!
-//! - **Chat circles** carry a [`prost`]-encoded [`CircleMessage`][circle-msg],
+//! - **Chat circles** carry a [`prost`]-encoded signed [`RoomMessage`][circle-msg],
 //!   AES-256-GCM-sealed under the circle's `cot_key` ([`crate::circle::message`]).
 //! - **Public shares** carry a [`ShareFrame`] encoded by [`ShareFrame::encode`],
 //!   plain (ISC-C19 makes public-share content server-visible by design).

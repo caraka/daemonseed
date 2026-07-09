@@ -858,70 +858,47 @@ types:
           Opaque end-to-end-encrypted application bytes. The relay never
           decrypts or interprets them.
 
-  - name: CircleMessage
+  - name: RoomMessage
     module: cot
     kind: message
     description: >-
-      A circle chat message — the first application payload type carried
-      inside a CotFrame. This is the PLAINTEXT shape: it is prost-encoded then
-      AES-256-GCM-sealed under the circle's cot_key (daemonseed-core
-      circle::message) and ONLY the ciphertext rides in CotFrame.payload. It
-      is never sent in the clear on any wire path — the relay is content-blind
-      (ISC-A-S2). sender_handle is self-asserted (membership is the trust
-      boundary) and used client-side only for @mention (C17) and mute (C15).
-    iscs: [A-S2, C15, C17, A-C3, A-C4]
+      The unified chat payload for BOTH a public room and a private circle
+      (replaces CircleMessage + PublicRoomMessage; room↔circle convergence, MAJOR
+      wire break). A public room and a private circle behave identically except
+      how their key is derived. PLAINTEXT shape: prost-encoded then AES-256-GCM
+      sealed under the surface's key (daemonseed-core room_message via
+      public_room / circle::message); ONLY the ciphertext rides in
+      CotFrame.payload (never wire-cleartext, A-S16; relay content-blind, A-S2).
+      SELF-SIGNED FOR PROVENANCE (S24 / C57): sender_pubkey + signature carry an
+      ML-DSA-87 signature over provenance_domain||room_id||sender_pubkey||
+      sent_unix_ms||body, so authorship is verifiable and a circle-key holder can
+      no longer spoof another member's handle. The two surfaces use DISTINCT
+      domains (daemonseed/circle/message/v2 vs daemonseed/public-room/message/v1)
+      so neither can be opened or replayed as the other.
+    iscs: [S4, S22, S24, C57, C99, A-S2, A-S16, A-S17, C15, C17]
     fields:
-      - name: sender_handle
+      - name: room_id
         type: string
         tag: 1
         description: >-
-          Sender's full wire handle (<name>#<12hex>), self-asserted. Used by
-          recipients client-side for @mention highlight and mute suppression.
-      - name: body
-        type: string
-        tag: 2
-        description: The message body, rendered as inert plaintext by the client.
-      - name: sent_unix_ms
-        type: int64
-        tag: 3
-        description: >-
-          Sender wall-clock at compose, unix ms. Advisory ordering only — no
-          global clock, no relay timestamp; not trusted for security.
-
-  - name: PublicRoomMessage
-    module: cot
-    kind: message
-    description: >-
-      A public-room chat message — the public tier of the public-vs-circle
-      bifurcation (S4 / S22..S26), carried inside a CotFrame over the SAME
-      Subscribe relay as a circle. Two things distinguish it from CircleMessage:
-      it is SELF-SIGNED FOR PROVENANCE (S24 / C57 — any daemon may post; the
-      signature proves WHO posted, not that they were authorized) and ENCRYPTED
-      UNDER A GLOBAL SHARED KEY (S22 — the public room key derives from public
-      inputs so the relay AND every client hold it; the room is server-readable
-      by design, never wire-cleartext, A-S16). Sealed by daemonseed-core
-      public_room; open_room_message verifies provenance and drops a bad
-      signature (A-S17).
-    iscs: [S4, S22, S24, C57, A-S2, A-S16, A-S17]
-    fields:
-      - name: room
-        type: string
-        tag: 1
-        description: >-
-          The public room name (e.g. "lobby"), bound into the provenance
-          signature so a message cannot be replayed into a different room.
+          The room/circle identifier bound into the provenance signature — the
+          room name (public) or the member-derivable fingerprint
+          SHA-384(cot_key)[:12] (circle). NEVER trusted by the verifier: the
+          signature is checked against a room_id recomputed/known from context.
       - name: sender_pubkey
         type: bytes
         tag: 2
         description: >-
           The poster's ML-DSA-87 public key; the provenance signature verifies
           under it and the authoritative handle hash-prefix derives from it (C4).
+          Authorship, dedup, and the `mine` decision key on this stable pubkey.
       - name: sender_handle
         type: string
         tag: 3
         description: >-
-          Poster's self-asserted display handle (name#12hex). Advisory; the
-          recipient cross-checks its hash component against sender_pubkey (C57).
+          Poster's self-asserted display handle (name#12hex). DECORATIVE: the
+          recipient binds the shown author to sender_pubkey via display_bound
+          (C57); not in the signed transcript, never read by a trust/dedup path.
       - name: body
         type: string
         tag: 4
@@ -929,13 +906,16 @@ types:
       - name: sent_unix_ms
         type: int64
         tag: 5
-        description: Poster wall-clock at compose, unix ms. Advisory ordering.
+        description: >-
+          Sender wall-clock at compose, unix ms. Advisory ordering + provenance
+          binding only; not trusted for security, and NOT anti-replay.
       - name: signature
         type: bytes
         tag: 6
         description: >-
           Detached ML-DSA-87 provenance signature over the domain-separated
-          signed input (S24); a bad signature drops the message (A-S17).
+          signed input (S24); an absent/empty/bad signature drops the message
+          (A-S17, fail-closed).
 
   - name: ShareAnnouncement
     module: cot
@@ -944,7 +924,7 @@ types:
       A share announcement — the in-band discovery payload that replaces the
       relay-hosted share registry (design: docs/design/unified-share-model.md).
       Posted into a room/circle as a CotFrame.payload at that room's rendezvous
-      address, sealed + ML-DSA self-signed exactly like PublicRoomMessage
+      address, sealed + ML-DSA self-signed exactly like RoomMessage
       (daemonseed-core share_announce); discovery becomes "listen to the stream"
       so the relay holds no share directory (A-S2, A-S1). Sealed under the public
       room key (public tier, server-readable) or a circle cot_key (members-only);

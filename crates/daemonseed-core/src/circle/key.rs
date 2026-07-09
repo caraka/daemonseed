@@ -304,6 +304,34 @@ pub fn circle_fingerprint(entropy: &str) -> String {
     out
 }
 
+/// The circle's wire `room_id` — the member-derivable fingerprint of the KEY,
+/// `SHA-384(cot_key)[:6]` rendered as 12 lowercase hex chars.
+///
+/// Bound into a circle [`crate::room_message`] provenance signature (the
+/// structural analog of a public room's name). Every member derives the
+/// byte-identical value from the shared `cot_key`, so a verifier recomputes it
+/// from its OWN key and checks the signature covers *that* — never trusting the
+/// value carried on the wire (cross-circle replay binding + defence-in-depth
+/// atop the AEAD key gate).
+///
+/// **Distinct from [`circle_fingerprint`]**, which hashes the *entropy* for the
+/// ISC-C62 GUI verification display: this hashes the *derived key*. It is
+/// one-way (48 bits of the key digest) and leaks no key material. Returns an
+/// empty string only if the SHA backend gate is uninitialised — unreachable once
+/// any crypto op has run; both sides would still agree, and the AEAD `cot_key`
+/// remains the real gate.
+pub fn circle_room_id(cot_key: &CircleKey) -> String {
+    let Ok(digest) = sha384(cot_key.as_bytes()) else {
+        return String::new();
+    };
+    let mut out = String::with_capacity(CIRCLE_FINGERPRINT_HEX_LEN);
+    for b in digest.iter().take(CIRCLE_FINGERPRINT_HEX_LEN / 2) {
+        // Infallible write into a String; the result is intentionally ignored.
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,6 +389,28 @@ mod tests {
             circle_fingerprint("phrase alpha"),
             circle_fingerprint("phrase bravo")
         );
+    }
+
+    /// ISC-6 — the wire `room_id` is deterministic from the KEY (12 lowercase
+    /// hex), distinct per key, and distinct from the entropy-based
+    /// `circle_fingerprint` (it hashes the derived cot_key, not the phrase).
+    #[test]
+    fn circle_room_id_is_deterministic_hex_and_key_derived() {
+        let _ = oxicrypt_module::initialize();
+        let k = derive_cot_key(EXAMPLE_ENTROPY, &CNSA_2_0).unwrap();
+        let a = circle_room_id(&k);
+        let b = circle_room_id(&k);
+        assert_eq!(a, b, "deterministic from the key");
+        assert_eq!(a.len(), CIRCLE_FINGERPRINT_HEX_LEN, "12 hex chars");
+        assert!(
+            a.bytes().all(|c| c.is_ascii_hexdigit()),
+            "hex, no '#' prefix"
+        );
+        // Distinct from the entropy-based display fingerprint (key vs phrase).
+        assert_ne!(a, circle_fingerprint(EXAMPLE_ENTROPY));
+        // Distinct per key.
+        let other = derive_cot_key("a different circle phrase", &CNSA_2_0).unwrap();
+        assert_ne!(a, circle_room_id(&other));
     }
 
     /// The fingerprint is relay-independent — unlike the rendezvous-derived

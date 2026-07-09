@@ -150,7 +150,7 @@ async fn any_daemon_posts_everyone_reads_through_relay() {
 
     // ISC-S25 / ISC-S24: B opens it under the GLOBAL key and the embedded
     // provenance signature verifies under the poster's own key.
-    let opened = open_room_message(&room_key, &received.payload)
+    let opened = open_room_message(&room_key, DEFAULT_ROOM, &received.payload)
         .expect("reader opens + verifies the posted message");
     assert_eq!(opened.body, body);
     assert_eq!(
@@ -158,7 +158,7 @@ async fn any_daemon_posts_everyone_reads_through_relay() {
         poster.public_key().to_vec(),
         "provenance binds the message to the poster's own identity (ISC-S24)"
     );
-    assert_eq!(opened.room, DEFAULT_ROOM);
+    assert_eq!(opened.room_id, DEFAULT_ROOM);
 }
 
 /// ISC-A-S17: a forged-provenance message (re-sealed under the public global key
@@ -203,8 +203,8 @@ async fn forged_provenance_is_rejected_end_to_end() {
     // Forge: a structurally-valid sealed message whose embedded signature is
     // garbage (the global key is public, so anyone can SEAL — but not SIGN).
     let attacker = SignKeypair::from_ml_dsa_seed(&[7u8; 32]).unwrap();
-    let forged = wire::PublicRoomMessage {
-        room: DEFAULT_ROOM.to_owned(),
+    let forged = wire::RoomMessage {
+        room_id: DEFAULT_ROOM.to_owned(),
         sender_pubkey: attacker.public_key().to_vec(),
         sender_handle: "impostor#000000000000".to_owned(),
         body: "trust me i am legit".to_owned(),
@@ -222,7 +222,7 @@ async fn forged_provenance_is_rejected_end_to_end() {
 
     // The reader rejects it: provenance does not verify (ISC-A-S17).
     assert!(
-        open_room_message(&room_key, &received.payload).is_err(),
+        open_room_message(&room_key, DEFAULT_ROOM, &received.payload).is_err(),
         "a forged-provenance message must be rejected, never surfaced"
     );
 }
@@ -232,7 +232,7 @@ async fn forged_provenance_is_rejected_end_to_end() {
 /// envelope an attacker who knows the public key could send.
 fn seal_raw_under_room_key(
     room_key: &daemonseed_core::public_room::PublicRoomKey,
-    message: &wire::PublicRoomMessage,
+    message: &wire::RoomMessage,
 ) -> Vec<u8> {
     use daemonseed_core::public_room::ROOM_MESSAGE_AAD;
     use oxicrypt_aes::{Aes256Key, gcm_encrypt};

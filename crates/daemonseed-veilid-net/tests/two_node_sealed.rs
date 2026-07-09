@@ -20,9 +20,9 @@ use std::time::Duration;
 use daemonseed_core::circle::key::{derive_cot_key, EXAMPLE_ENTROPY};
 use daemonseed_core::circle::message::{open_message, seal_message};
 use daemonseed_core::crypto::suite::CNSA_2_0;
+use daemonseed_core::identity::keys::SignKeypair;
 use daemonseed_core::identity::keys::{derive_identity_keys, Identity};
 use daemonseed_core::identity::mnemonic::Mnemonic;
-use daemonseed_proto::v1::CircleMessage;
 use daemonseed_veilid_net::{VeilidNet, VeilidNetConfig, VeilidNetEvent};
 
 /// A node config with a fresh daemonseed-derived identity (D3), a distinct
@@ -82,13 +82,11 @@ async fn sealed_circle_message_crosses_a_private_route() {
         .await
         .expect("A import route");
 
-    // Seal a real CircleMessage and send the opaque bytes over the route.
-    let original = CircleMessage {
-        sender_handle: "river-otter#aabbccddeeff".to_owned(),
-        body: "carried over a Veilid private route".to_owned(),
-        sent_unix_ms: 1_700_000_000_000,
-    };
-    let sealed = seal_message(&cot_key, &original).expect("seal");
+    // Seal a real signed circle RoomMessage and send the opaque bytes over the route.
+    let signer = SignKeypair::from_ml_dsa_seed(&[7u8; 32]).expect("signer");
+    let handle = "river-otter#aabbccddeeff";
+    let body = "carried over a Veilid private route";
+    let sealed = seal_message(&cot_key, &signer, handle, body, 1_700_000_000_000).expect("seal");
 
     // Retry the send until the route carries it; await B's inbound event.
     let sender = {
@@ -120,16 +118,14 @@ async fn sealed_circle_message_crosses_a_private_route() {
     // Oracle: the wire carried ciphertext, the member recovers it exactly, an
     // outsider cannot.
     assert!(
-        !wire_bytes
-            .windows(original.body.len())
-            .any(|w| w == original.body.as_bytes()),
+        !wire_bytes.windows(body.len()).any(|w| w == body.as_bytes()),
         "the plaintext body must never appear on the wire"
     );
     assert_eq!(wire_bytes, sealed, "B received exactly the bytes A sealed");
 
     let recovered = open_message(&cot_key, &wire_bytes).expect("a member opens it");
-    assert_eq!(recovered.body, original.body);
-    assert_eq!(recovered.sender_handle, original.sender_handle);
+    assert_eq!(recovered.body, body);
+    assert_eq!(recovered.sender_handle, handle);
 
     let outsider = derive_cot_key("a phrase no member ever agreed to", &CNSA_2_0).unwrap();
     assert!(

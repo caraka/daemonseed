@@ -3000,17 +3000,30 @@ impl Actor {
     /// post that ISC-A-C30 forbids. An unknown id (the circle was dropped, or the
     /// app's active selection went stale) is a clean ChatError, not a panic.
     async fn handle_send_chat(&mut self, circle_id: u64, body: &str, sender_handle: &str) {
-        let Some(circle) = self.circles.iter().find(|c| c.id == circle_id) else {
+        let sent_unix_ms = now_unix_ms();
+        // Address before auth: an unknown circle is the first failure a caller sees
+        // (ISC-A-C30 stale-selection guard), independent of whether an identity is
+        // loaded.
+        if !self.circles.iter().any(|c| c.id == circle_id) {
             return self.emit(NetEvent::ChatError {
                 message: "join a circle before sending".to_owned(),
             });
+        }
+        let Some(identity) = self.identity.as_ref() else {
+            return self.emit(NetEvent::ChatError {
+                message: "no identity to sign the message".to_owned(),
+            });
         };
-        let message = wire::CircleMessage {
-            sender_handle: sender_handle.to_owned(),
-            body: body.to_owned(),
-            sent_unix_ms: now_unix_ms(),
-        };
-        let sealed = match seal_message(&circle.cot_key, &message) {
+        let signing = identity.signing();
+        let circle = self
+            .circles
+            .iter()
+            .find(|c| c.id == circle_id)
+            .expect("circle presence checked above");
+        // Circle messages are now SIGNED (room↔circle convergence): the poster's
+        // identity signs the RoomMessage so authorship is verifiable.
+        let sealed = match seal_message(&circle.cot_key, signing, sender_handle, body, sent_unix_ms)
+        {
             Ok(s) => s,
             Err(e) => {
                 return self.emit(NetEvent::ChatError {
@@ -3053,10 +3066,18 @@ async fn read_inbound(
                 // Foreign/undecryptable frames (noise on the shared rendezvous,
                 // or tampering) skip silently; a closed UI channel ends the task.
                 if let Ok(msg) = open_message(&cot_key, &frame.payload) {
+                    // ISC-C4/C57: bind the displayed author to the verified pubkey;
+                    // a spoofed handle shows at its `#<prefix>` floor. A bind error
+                    // (unreachable post-verify) drops the frame rather than surface
+                    // it unbound.
+                    let Ok(bound) = Handle::display_bound(&msg.sender_handle, &msg.sender_pubkey)
+                    else {
+                        continue;
+                    };
                     if evt_tx
                         .send(NetEvent::ChatMessage {
                             circle_id,
-                            sender: msg.sender_handle,
+                            sender: bound.format(DisplayMode::Default),
                             body: msg.body,
                             sent_unix_ms: msg.sent_unix_ms,
                         })
@@ -3113,7 +3134,7 @@ async fn read_inbound_public_room(
             Ok(Some(frame)) => {
                 // open_room_message verifies the embedded provenance signature
                 // before returning, so only verified messages are surfaced.
-                if let Ok(msg) = open_room_message(&room_key, &frame.payload) {
+                if let Ok(msg) = open_room_message(&room_key, &room, &frame.payload) {
                     // ISC-C57: bind the displayed author to SHA-384(sender_pubkey)[:12].
                     // A self-asserted `sender_handle` whose hash disagrees with the
                     // verified provenance pubkey is shown at its `#<prefix>` floor,
@@ -3127,7 +3148,10 @@ async fn read_inbound_public_room(
                     };
                     if evt_tx
                         .send(NetEvent::PublicRoomMessage {
-                            room: msg.room,
+                            // The room we SUBSCRIBED to — never the untrusted carried
+                            // `room_id` (LOW-1: the proto binds the sig to expected_room_id
+                            // and the carried field is never trusted; don't leak it here).
+                            room: room.clone(),
                             sender: bound.format(DisplayMode::Default),
                             body: msg.body,
                             sent_unix_ms: msg.sent_unix_ms,
