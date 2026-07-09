@@ -154,6 +154,13 @@ impl ShareCatalog {
     pub fn apply(&mut self, ann: &wire::ShareAnnouncement, now: Instant) -> CatalogChange {
         if ann.withdraw {
             match self.entries.get(&ann.share_id) {
+                // Owner-binding (#152): only the share's own announcer may withdraw
+                // it. The lobby record is world-writable and the `share_id` is
+                // publicly visible, so without this a foreign peer could scrape a
+                // victim's `share_id`, self-sign a validly-provenanced withdraw for
+                // it, and evict (censor) the share. `open_announcement` proves WHO
+                // announced, not that they OWN this id — so we check ownership here.
+                Some(cur) if ann.sender_pubkey != cur.sender_pubkey => CatalogChange::Unchanged,
                 // A withdraw older than the live announce it would cancel is a
                 // reorder/replay — ignore it.
                 Some(cur) if ann.sent_unix_ms < cur.announced_unix_ms => CatalogChange::Unchanged,
@@ -165,6 +172,14 @@ impl ShareCatalog {
             }
         } else {
             match self.entries.get_mut(&ann.share_id) {
+                // First-writer-wins on identity (#152): a refresh may NOT change the
+                // owner of a known `share_id`. Blocks the takeover/redirect exploit
+                // where a foreign peer re-announces a victim's `share_id` under its
+                // own key + route, so a fetcher intending the victim's share is
+                // redirected. An honest owner always re-derives the same
+                // `share_id = derive_share_id(sender_pubkey, root)`, so a differing
+                // `sender_pubkey` for a live id is never legitimate.
+                Some(cur) if ann.sender_pubkey != cur.sender_pubkey => CatalogChange::Unchanged,
                 Some(cur) if ann.sent_unix_ms < cur.announced_unix_ms => CatalogChange::Unchanged,
                 Some(cur) => {
                     cur.name = ann.name.clone();
@@ -399,6 +414,49 @@ mod tests {
             CatalogChange::Unchanged
         );
         assert_eq!(cat.len(), 1);
+    }
+
+    /// #152 (censorship): a foreign peer that scraped a victim's public `share_id`
+    /// cannot evict the share by self-signing a validly-provenanced withdraw for it.
+    #[test]
+    fn foreign_peer_cannot_withdraw_a_share_it_does_not_own() {
+        let mut cat = ShareCatalog::new(Duration::from_secs(60));
+        let t0 = Instant::now();
+        cat.apply(&announcement("a", "docs", false, 100), t0); // owner [1,2,3]
+        // Attacker [9,9,9] forges a withdraw with a large sent_unix_ms.
+        let mut forged = announcement("a", "docs", true, 1_000_000);
+        forged.sender_pubkey = vec![9, 9, 9];
+        assert_eq!(
+            cat.apply(&forged, t0 + Duration::from_secs(1)),
+            CatalogChange::Unchanged
+        );
+        assert_eq!(
+            cat.len(),
+            1,
+            "the victim's share must survive the forged withdraw"
+        );
+        assert_eq!(cat.entries()[0].sender_pubkey, vec![1, 2, 3]);
+    }
+
+    /// #152 (takeover/redirect): a foreign peer cannot re-announce a known
+    /// `share_id` under its own key/route to redirect fetchers. First-writer-wins
+    /// on identity — the owner's metadata is untouched.
+    #[test]
+    fn foreign_peer_cannot_hijack_a_known_share_id() {
+        let mut cat = ShareCatalog::new(Duration::from_secs(60));
+        let t0 = Instant::now();
+        cat.apply(&announcement("a", "real", false, 100), t0); // owner [1,2,3]
+        let mut forged = announcement("a", "evil", false, 1_000_000);
+        forged.sender_pubkey = vec![9, 9, 9];
+        forged.sender_handle = "attacker#ffffffffffff".to_owned();
+        assert_eq!(
+            cat.apply(&forged, t0 + Duration::from_secs(1)),
+            CatalogChange::Unchanged
+        );
+        let e = &cat.entries()[0];
+        assert_eq!(e.sender_pubkey, vec![1, 2, 3], "owner key must not change");
+        assert_eq!(e.name, "real", "hijacker metadata must not overwrite");
+        assert_eq!(e.sender_handle, "river-otter#aabbccddeeff");
     }
 
     #[test]

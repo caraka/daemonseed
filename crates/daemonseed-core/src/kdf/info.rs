@@ -222,6 +222,28 @@ pub fn public_room_presence_veilid_owner(family: &str, room: &str) -> String {
         .replace("{room}", room)
 }
 
+/// HKDF info-string template for a public room's **share-discovery** Veilid
+/// rendezvous-owner seed (#153). A third sibling of
+/// [`PUBLIC_ROOM_VEILID_OWNER_TEMPLATE`] under a distinct label, so public-share
+/// announcements ride their OWN world-derivable DHT record, separate from BOTH
+/// the room's chat rendezvous ([`PUBLIC_ROOM_VEILID_OWNER_TEMPLATE`]) and its
+/// presence record. Chat uses an append-ring subkey scheme and shares use a
+/// current-state subkey scheme; co-located on one record they overlapped the same
+/// 64-slot space and silently overwrote each other (#153) — a dedicated sibling
+/// record removes the collision entirely, exactly as presence was separated (P1).
+/// Family- and room-anchored like its siblings; the inputs are public, so every
+/// participant derives the same share rendezvous. Content NEVER derives from this.
+const PUBLIC_ROOM_SHARE_VEILID_OWNER_TEMPLATE: &str =
+    "daemonseed/veilid/room-share-owner/{family}/{room}";
+
+/// Build the public-room share-discovery Veilid rendezvous-owner HKDF info string
+/// for a crypto-family token and a public room name.
+pub fn public_room_share_veilid_owner(family: &str, room: &str) -> String {
+    PUBLIC_ROOM_SHARE_VEILID_OWNER_TEMPLATE
+        .replace("{family}", family)
+        .replace("{room}", room)
+}
+
 // ── Project announce channel (F17 / A0/A1) ──────────────────────────────────
 
 /// HKDF salt for the project-announce Veilid rendezvous-owner seed (Phase 4 A1).
@@ -361,6 +383,29 @@ mod tests {
         assert_ne!(
             public_room_presence_veilid_owner("hkdf-sha384", "lobby"),
             circle_presence_veilid_owner("hkdf-sha384")
+        );
+    }
+
+    /// **Spec contract (#153 share-record split)** — the share-discovery
+    /// rendezvous-owner info string is protocol-visible: every participant derives
+    /// the same share record only if these bytes match. It is distinct from BOTH
+    /// the room's chat-record owner and its presence-record owner, so public-share
+    /// announcements and lobby chat no longer collide on one record.
+    #[test]
+    fn public_room_share_veilid_owner_info_string_is_pinned() {
+        assert_eq!(
+            public_room_share_veilid_owner("hkdf-sha384", "lobby"),
+            "daemonseed/veilid/room-share-owner/hkdf-sha384/lobby"
+        );
+        // Share label ≠ chat-record sibling (the whole point of #153).
+        assert_ne!(
+            public_room_share_veilid_owner("hkdf-sha384", "lobby"),
+            public_room_veilid_owner("hkdf-sha384", "lobby")
+        );
+        // Share label ≠ presence-record sibling.
+        assert_ne!(
+            public_room_share_veilid_owner("hkdf-sha384", "lobby"),
+            public_room_presence_veilid_owner("hkdf-sha384", "lobby")
         );
     }
 

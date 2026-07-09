@@ -95,7 +95,8 @@ use daemonseed_core::presence::{
 };
 use daemonseed_core::public_room::{
     DEFAULT_ROOM, PublicRoomKey, derive_room_key, derive_room_presence_veilid_owner_seed,
-    derive_room_veilid_owner_seed, open_room_message, seal_room_message,
+    derive_room_share_veilid_owner_seed, derive_room_veilid_owner_seed, open_room_message,
+    seal_room_message,
 };
 use daemonseed_core::share_announce::{
     AnnouncementFields, mint_share_id, open_announcement, seal_public_announcement,
@@ -151,6 +152,11 @@ struct VeilidCircle {
 struct LobbyRendezvous {
     room_key: PublicRoomKey,
     owner_seed: [u8; 32],
+    /// The **share-discovery** sibling record's owner seed (#153: share adverts ride
+    /// their OWN world-derivable record, never the chat rendezvous, so a share advert
+    /// can never silently overwrite the chat append-ring — and vice versa).
+    /// Publishes/subscribes public-share adverts.
+    share_owner_seed: [u8; 32],
     /// The **presence** sibling record's owner seed (P1: presence rides its OWN
     /// world-derivable record, never the chat rendezvous). Publishes/subscribes
     /// lobby member beacons.
@@ -532,6 +538,20 @@ async fn subscribe_lobby(
             return;
         }
     };
+    // The SHARE-discovery sibling record (#153) — a distinct, world-derivable
+    // rendezvous so share adverts never share the chat append-ring's record (the two
+    // subkey schemes overlapped and silently overwrote each other). Unlike presence
+    // (read-only), this is a WRITE record — publish_share advertises on it — so a
+    // [0u8;32] fallback would advertise on a predictable, world-writable record. Same
+    // KDF primitive as the chat owner seed, so a failure means the lobby is broken:
+    // bail rather than write to a zeros record.
+    let share_owner_seed = match derive_room_share_veilid_owner_seed(DEFAULT_ROOM, &CNSA_2_0) {
+        Ok(s) => *s.as_bytes(),
+        Err(e) => {
+            daemonseed_veilid_net::vtrace!("tui lobby: share owner-seed derivation failed: {e}");
+            return;
+        }
+    };
     // The PRESENCE sibling record (P1) — a distinct, world-derivable rendezvous so
     // beacons never share the chat append-ring. Non-fatal on failure.
     let presence_owner_seed = derive_room_presence_veilid_owner_seed(DEFAULT_ROOM, &CNSA_2_0)
@@ -541,15 +561,21 @@ async fn subscribe_lobby(
         daemonseed_veilid_net::vtrace!("tui lobby: subscribe failed: {e}");
         return;
     }
+    // Subscribe the share record too so inbound share adverts fold into the catalog
+    // (#153). Non-fatal — chat is unaffected if it fails.
+    if let Err(e) = handle.subscribe_room(share_owner_seed).await {
+        daemonseed_veilid_net::vtrace!("tui lobby: share-record subscribe failed: {e}");
+    }
     // Subscribe the presence record too so inbound beacons fold into the tracker.
     // Non-fatal — chat is unaffected if it fails.
     if let Err(e) = handle.subscribe_room(presence_owner_seed).await {
         daemonseed_veilid_net::vtrace!("tui lobby: presence subscribe failed: {e}");
     }
-    daemonseed_veilid_net::vtrace!("tui lobby: subscribed (chat + presence)");
+    daemonseed_veilid_net::vtrace!("tui lobby: subscribed (chat + shares + presence)");
     shares.lobby = Some(LobbyRendezvous {
         room_key,
         owner_seed,
+        share_owner_seed,
         presence_owner_seed,
         // TTL = 20s × 3 = 60s, sized to the 15–20s emit band (P2 ~45–60s window).
         presence: PresenceTracker::with_cadence(Duration::from_secs(20), HEARTBEAT_MISS_COUNT),
@@ -779,9 +805,10 @@ async fn publish_share(
         );
     };
     // Copy the lobby's address material out so no borrow of `shares` is held
-    // across an `.await` (and so the later `shares.own.push` is unobstructed).
+    // across an `.await` (and so the later `shares.own.push` is unobstructed). The
+    // advert publishes on the SHARE record (#153), disjoint from the chat record.
     let (room_key_bytes, owner_seed) = match shares.lobby.as_ref() {
-        Some(l) => (*l.room_key.as_bytes(), l.owner_seed),
+        Some(l) => (*l.room_key.as_bytes(), l.share_owner_seed),
         None => return publish_fail(evt_tx, "lobby not subscribed yet".to_owned(), None),
     };
 
@@ -895,7 +922,7 @@ async fn unpublish_share(
         return;
     };
     let (room_key_bytes, owner_seed) = match shares.lobby.as_ref() {
-        Some(l) => (*l.room_key.as_bytes(), l.owner_seed),
+        Some(l) => (*l.room_key.as_bytes(), l.share_owner_seed),
         None => return,
     };
     let own = own.unwrap_or(OwnShare {
@@ -1403,8 +1430,11 @@ fn apply_discovery(
     let now = Instant::now();
     if ann.withdraw {
         let change = shares.catalog.apply(&ann, now);
-        shares.discovered.remove(&ann.share_id);
-        if change != CatalogChange::Unchanged {
+        // #152: gate the ROUTE map on the catalog decision — a forged withdraw
+        // (foreign key → owner-mismatch → `Unchanged`) must not evict the owner's
+        // route (the fetch path reads `discovered`, not the catalog).
+        if change == CatalogChange::Removed {
+            shares.discovered.remove(&ann.share_id);
             emit_shares_snapshot(shares, evt_tx);
         }
         return true;
@@ -1423,13 +1453,16 @@ fn apply_discovery(
         return true; // consumed-and-dropped; do not fall through
     }
     let change = shares.catalog.apply(&ann, now);
-    shares.discovered.insert(
-        ann.share_id.clone(),
-        DiscoveredRoute {
-            route_blob: env.route_blob.clone(),
-        },
-    );
+    // #152: only trust the advertised route when the catalog ACCEPTED the announce.
+    // An owner-mismatch hijack refresh returns `Unchanged` (first-writer-wins) —
+    // skipping the insert prevents the fetch redirect.
     if change != CatalogChange::Unchanged {
+        shares.discovered.insert(
+            ann.share_id.clone(),
+            DiscoveredRoute {
+                route_blob: env.route_blob.clone(),
+            },
+        );
         emit_shares_snapshot(shares, evt_tx);
     }
     true
@@ -1589,6 +1622,9 @@ mod tests {
             owner_seed: *derive_room_veilid_owner_seed(DEFAULT_ROOM, &CNSA_2_0)
                 .unwrap()
                 .as_bytes(),
+            share_owner_seed: *derive_room_share_veilid_owner_seed(DEFAULT_ROOM, &CNSA_2_0)
+                .unwrap()
+                .as_bytes(),
             presence_owner_seed: *derive_room_presence_veilid_owner_seed(DEFAULT_ROOM, &CNSA_2_0)
                 .unwrap()
                 .as_bytes(),
@@ -1720,6 +1756,104 @@ mod tests {
             route_sig,
         }
         .encode()
+    }
+
+    /// A self-signed WITHDRAW envelope (the withdraw path never checks the route
+    /// advert, so the route fields are inert); `sent_unix_ms` is fresh so a rejection
+    /// can only come from the owner-check.
+    fn withdraw_bytes(room_key: &PublicRoomKey, signer: &SignKeypair, share_id: &str) -> Vec<u8> {
+        let fields = AnnouncementFields {
+            room: DEFAULT_ROOM,
+            sender_handle: "tester",
+            share_id,
+            name: "demo-share",
+            rating: "",
+            withdraw: true,
+            sent_unix_ms: 2_000,
+        };
+        let sealed_announcement = seal_public_announcement(room_key, signer, &fields).unwrap();
+        let route_sig = signer
+            .sign(&route_provenance_input(share_id, &[]))
+            .unwrap()
+            .to_vec();
+        DiscoveryEnvelope {
+            sealed_announcement,
+            route_blob: Vec::new(),
+            route_sig,
+        }
+        .encode()
+    }
+
+    /// #152 (finding 3): a foreign forged withdraw must NOT evict the owner's route.
+    #[test]
+    fn a_forged_withdraw_cannot_evict_the_owners_route() {
+        let victim = announcer(41);
+        let attacker = announcer(42);
+        let mut shares = ShareState::new();
+        let room_key = derive_room_key(DEFAULT_ROOM, &CNSA_2_0).unwrap();
+        shares.lobby = Some(lobby());
+
+        let share_id = mint_share_id();
+        let vblob = vec![0x11; 96];
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        assert!(apply_discovery(
+            &mut shares,
+            &evt_tx,
+            &discovery_bytes(&room_key, &victim, &share_id, &vblob, &vblob)
+        ));
+        let _ = evt_rx.try_recv();
+
+        assert!(apply_discovery(
+            &mut shares,
+            &evt_tx,
+            &withdraw_bytes(&room_key, &attacker, &share_id)
+        ));
+        assert_eq!(shares.catalog.len(), 1, "the victim's share survives");
+        assert_eq!(
+            shares
+                .discovered
+                .get(&share_id)
+                .map(|d| d.route_blob.clone()),
+            Some(vblob),
+            "the owner's route is NOT evicted"
+        );
+        assert!(evt_rx.try_recv().is_err(), "no-op → no snapshot");
+    }
+
+    /// #152 (finding 1): a hijack re-announce must NOT replace the owner's route.
+    #[test]
+    fn a_hijack_reannounce_cannot_replace_the_owners_route() {
+        let victim = announcer(43);
+        let attacker = announcer(44);
+        let mut shares = ShareState::new();
+        let room_key = derive_room_key(DEFAULT_ROOM, &CNSA_2_0).unwrap();
+        shares.lobby = Some(lobby());
+
+        let share_id = mint_share_id();
+        let vblob = vec![0x33; 96];
+        let ablob = vec![0x44; 96];
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        assert!(apply_discovery(
+            &mut shares,
+            &evt_tx,
+            &discovery_bytes(&room_key, &victim, &share_id, &vblob, &vblob)
+        ));
+        let _ = evt_rx.try_recv();
+
+        assert!(apply_discovery(
+            &mut shares,
+            &evt_tx,
+            &discovery_bytes(&room_key, &attacker, &share_id, &ablob, &ablob)
+        ));
+        assert_eq!(
+            shares
+                .discovered
+                .get(&share_id)
+                .map(|d| d.route_blob.clone()),
+            Some(vblob),
+            "the fetch route stays the owner's — no redirect"
+        );
+        assert!(evt_rx.try_recv().is_err(), "hijack rejected → no snapshot");
     }
 
     #[test]

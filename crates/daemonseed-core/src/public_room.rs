@@ -180,15 +180,21 @@ impl core::fmt::Debug for RoomVeilidOwnerSeed {
 /// the room key) so a cross-family change moves the rendezvous and the room key
 /// together. World-derivable: every participant computes the same owner, so the
 /// lobby/public room is an open rendezvous by construction (ISC-S22).
-pub fn derive_room_veilid_owner_seed(
-    room: &str,
+/// Shared body for the three public-room Veilid rendezvous-owner seed derivations
+/// (chat / presence / share) — collapses the triplicated extract/expand/zeroize
+/// plumbing so a future hardening change to one cannot silently diverge the others
+/// (#153 review). Re-extract the public-room PRK (the [`info::PUBLIC_ROOM_KEY_SALT`]
+/// extract of the family token) and expand under the caller's distinct `info` label
+/// into a fresh 32-byte VLD0 seed, zeroizing the stack buffer on every path. The
+/// distinct newtypes (`Room*VeilidOwnerSeed`) are kept for key-class safety; only
+/// this body is shared.
+fn expand_room_owner_seed(
     suite: &Suite,
-) -> Result<RoomVeilidOwnerSeed, RoomKeyError> {
+    info_str: &str,
+) -> Result<Box<[u8; ROOM_VEILID_OWNER_SEED_LEN]>, RoomKeyError> {
     let family = suite.family_token();
     let extract = HkdfSha384::extract(Some(info::PUBLIC_ROOM_KEY_SALT), family.as_bytes())
         .map_err(RoomKeyError::Hkdf)?;
-    let info_str = info::public_room_veilid_owner(family, room);
-
     let mut seed = [0u8; ROOM_VEILID_OWNER_SEED_LEN];
     if let Err(e) = extract.expand(info_str.as_bytes(), &mut seed) {
         seed.zeroize();
@@ -196,7 +202,17 @@ pub fn derive_room_veilid_owner_seed(
     }
     let boxed = Box::new(seed);
     seed.zeroize();
-    Ok(RoomVeilidOwnerSeed(boxed))
+    Ok(boxed)
+}
+
+pub fn derive_room_veilid_owner_seed(
+    room: &str,
+    suite: &Suite,
+) -> Result<RoomVeilidOwnerSeed, RoomKeyError> {
+    let info_str = info::public_room_veilid_owner(suite.family_token(), room);
+    Ok(RoomVeilidOwnerSeed(expand_room_owner_seed(
+        suite, &info_str,
+    )?))
 }
 
 /// A public room's **presence** Veilid rendezvous-owner seed (Phase 4) — a
@@ -233,19 +249,52 @@ pub fn derive_room_presence_veilid_owner_seed(
     room: &str,
     suite: &Suite,
 ) -> Result<RoomPresenceVeilidOwnerSeed, RoomKeyError> {
-    let family = suite.family_token();
-    let extract = HkdfSha384::extract(Some(info::PUBLIC_ROOM_KEY_SALT), family.as_bytes())
-        .map_err(RoomKeyError::Hkdf)?;
-    let info_str = info::public_room_presence_veilid_owner(family, room);
+    let info_str = info::public_room_presence_veilid_owner(suite.family_token(), room);
+    Ok(RoomPresenceVeilidOwnerSeed(expand_room_owner_seed(
+        suite, &info_str,
+    )?))
+}
 
-    let mut seed = [0u8; ROOM_VEILID_OWNER_SEED_LEN];
-    if let Err(e) = extract.expand(info_str.as_bytes(), &mut seed) {
-        seed.zeroize();
-        return Err(RoomKeyError::Hkdf(e));
+/// A public room's **share-discovery** Veilid rendezvous-owner seed (#153) — a
+/// third, distinct sibling of [`derive_room_key`], separate from BOTH the chat
+/// rendezvous owner ([`RoomVeilidOwnerSeed`]) and the presence owner
+/// ([`RoomPresenceVeilidOwnerSeed`]). Public-share announcements ride their OWN
+/// world-derivable DHT record so a share advert (a current-state writer) can never
+/// silently overwrite the room chat's append-ring, and vice versa — the collision
+/// #153 documents. Same shape/hygiene as its siblings: 32-byte VLD0 seed, zeroes
+/// on drop, redacted `Debug`. Content NEVER derives from this.
+#[derive(zeroize::ZeroizeOnDrop)]
+pub struct RoomShareVeilidOwnerSeed(Box<[u8; ROOM_VEILID_OWNER_SEED_LEN]>);
+
+impl RoomShareVeilidOwnerSeed {
+    /// Borrow the raw seed bytes to build a VLD0 keypair. Callers must not copy
+    /// these into a non-zeroizing buffer.
+    pub fn as_bytes(&self) -> &[u8; ROOM_VEILID_OWNER_SEED_LEN] {
+        &self.0
     }
-    let boxed = Box::new(seed);
-    seed.zeroize();
-    Ok(RoomPresenceVeilidOwnerSeed(boxed))
+}
+
+impl core::fmt::Debug for RoomShareVeilidOwnerSeed {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("RoomShareVeilidOwnerSeed(<redacted>)")
+    }
+}
+
+/// Derive a public room's **share-discovery** Veilid rendezvous-owner seed from
+/// its public inputs — a sibling of [`derive_room_key`] under a distinct
+/// (`info::public_room_share_veilid_owner`) label, so share announcements ride
+/// their own DHT record, disjoint from both the room key and the chat/presence
+/// rendezvous owners. World-derivable (public inputs), so every participant
+/// computes the same share rendezvous. Family-anchored like its siblings; content
+/// never derives from this.
+pub fn derive_room_share_veilid_owner_seed(
+    room: &str,
+    suite: &Suite,
+) -> Result<RoomShareVeilidOwnerSeed, RoomKeyError> {
+    let info_str = info::public_room_share_veilid_owner(suite.family_token(), room);
+    Ok(RoomShareVeilidOwnerSeed(expand_room_owner_seed(
+        suite, &info_str,
+    )?))
 }
 
 /// Derive a public room's rendezvous address on a given relay (ISC-S23):
@@ -580,5 +629,35 @@ mod tests {
             circle_presence.as_bytes(),
             "public-room and circle presence-owner domains must be disjoint"
         );
+    }
+
+    /// #153 domain separation — the share-discovery rendezvous owner is a FOURTH,
+    /// distinct sibling: it equals neither the room key, nor the chat rendezvous
+    /// owner, nor the presence owner. Share announcements therefore ride their own
+    /// DHT record and can never silently overwrite the chat append-ring (or be
+    /// overwritten by it). Deterministic from public inputs and per-room.
+    #[test]
+    fn room_share_owner_seed_is_deterministic_and_disjoint_from_all_siblings() {
+        let _ = oxicrypt_module::initialize();
+        let a = derive_room_share_veilid_owner_seed("lobby", &CNSA_2_0).unwrap();
+        let b = derive_room_share_veilid_owner_seed("lobby", &CNSA_2_0).unwrap();
+        assert_eq!(
+            a.as_bytes(),
+            b.as_bytes(),
+            "world-derivable + deterministic"
+        );
+        let other_room = derive_room_share_veilid_owner_seed("announcements", &CNSA_2_0).unwrap();
+        assert_ne!(a.as_bytes(), other_room.as_bytes(), "per-room");
+
+        let room_key = derive_room_key("lobby", &CNSA_2_0).unwrap();
+        let chat_owner = derive_room_veilid_owner_seed("lobby", &CNSA_2_0).unwrap();
+        let presence = derive_room_presence_veilid_owner_seed("lobby", &CNSA_2_0).unwrap();
+        assert_ne!(a.as_bytes(), room_key.as_bytes());
+        assert_ne!(
+            a.as_bytes(),
+            chat_owner.as_bytes(),
+            "shares must ride their own record, not the chat rendezvous (#153)"
+        );
+        assert_ne!(a.as_bytes(), presence.as_bytes());
     }
 }

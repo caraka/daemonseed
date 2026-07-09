@@ -74,7 +74,8 @@ use daemonseed_core::presence::{
 };
 use daemonseed_core::public_room::{
     DEFAULT_ROOM, PublicRoomKey, derive_room_key, derive_room_presence_veilid_owner_seed,
-    derive_room_veilid_owner_seed, open_room_message, seal_room_message,
+    derive_room_share_veilid_owner_seed, derive_room_veilid_owner_seed, open_room_message,
+    seal_room_message,
 };
 use daemonseed_core::public_space::{
     Whitelist, content_address, dev_project_announce_veilid_owner_seed, dev_project_release_keypair,
@@ -156,10 +157,17 @@ const WARMUP_CIRCLE_RESWEEP_ROUNDS: usize = 1;
 /// the heartbeat emit/reap cycle). Order is issue-order and load-bearing: within a round
 /// each `resweep_rendezvous` awaits its record open before the next is issued, so the
 /// operator sweep is dispatched first (the spawned backlog reads then overlap).
-fn warmup_priority_records(operator: Option<[u8; 32]>, lobby: Option<[u8; 32]>) -> Vec<[u8; 32]> {
-    let mut seeds = Vec::with_capacity(2);
+fn warmup_priority_records(
+    operator: Option<[u8; 32]>,
+    lobby: Option<[u8; 32]>,
+    share: Option<[u8; 32]>,
+) -> Vec<[u8; 32]> {
+    let mut seeds = Vec::with_capacity(3);
     seeds.extend(operator);
     seeds.extend(lobby);
+    // #153: the share record is a separate rendezvous, so a cold-joiner must
+    // re-sweep it too to discover shares announced before it subscribed.
+    seeds.extend(share);
     seeds
 }
 
@@ -214,6 +222,11 @@ struct VeilidCircle {
 struct LobbyRendezvous {
     room_key: PublicRoomKey,
     owner_seed: [u8; 32],
+    /// The **share-discovery** sibling record's owner seed (#153: share
+    /// announcements ride their OWN world-derivable record, never the chat
+    /// rendezvous, so a share advert can never silently overwrite the chat
+    /// append-ring — and vice versa). Publishes/subscribes public-share adverts.
+    share_owner_seed: [u8; 32],
     /// The **presence** sibling record's owner seed (P1: presence rides its OWN
     /// world-derivable record, never the chat rendezvous, so a ~15–20s beacon can
     /// never evict chat backlog). Publishes/subscribes lobby member beacons.
@@ -638,6 +651,7 @@ async fn handle_command(
                     let priority = warmup_priority_records(
                         shares.operator.as_ref().map(|op| op.announce_owner_seed),
                         shares.lobby.as_ref().map(|l| l.owner_seed),
+                        shares.lobby.as_ref().map(|l| l.share_owner_seed),
                     );
                     let circle_seeds: Vec<[u8; 32]> =
                         circles.iter().map(|c| c.owner_seed).collect();
@@ -723,18 +737,20 @@ async fn handle_command(
         }
         NetCommand::ResweepShares => {
             // User-initiated (the Refresh button): re-render locally AND re-sweep the
-            // lobby rendezvous to surface an announcement the watch missed during the
-            // warmup window (#133). Swept ShareAnnouncements arrive as inbound events →
-            // apply_discovery folds them → a fresh SharesSnapshot. NOT on the auto-poll
-            // cadence — a manual click is rare, so the re-sweep cost is acceptable.
+            // SHARE rendezvous to surface an announcement the watch missed during the
+            // warmup window (#133). Share adverts ride the share record (#153), so the
+            // Refresh re-sweeps THAT record, not the chat one. Swept ShareAnnouncements
+            // arrive as inbound events → apply_discovery folds them → a fresh
+            // SharesSnapshot. NOT on the auto-poll cadence — a manual click is rare, so
+            // the re-sweep cost is acceptable.
             let _ = evt_tx.send(NetEvent::SharesSnapshot {
                 shares: shares.listings(),
             });
             if let (Some(lobby), Some(handle)) = (shares.lobby.as_ref(), net.as_ref()) {
-                let owner_seed = lobby.owner_seed;
-                daemonseed_veilid_net::vtrace!("gui resweep: re-sweeping lobby");
+                let owner_seed = lobby.share_owner_seed;
+                daemonseed_veilid_net::vtrace!("gui resweep: re-sweeping share record");
                 if let Err(e) = handle.resweep_rendezvous(owner_seed).await {
-                    daemonseed_veilid_net::vtrace!("gui resweep: lobby re-sweep failed: {e}");
+                    daemonseed_veilid_net::vtrace!("gui resweep: share re-sweep failed: {e}");
                 }
             }
         }
@@ -892,6 +908,21 @@ async fn subscribe_lobby(
             return;
         }
     };
+    // The SHARE-discovery sibling record (#153) — a distinct, world-derivable
+    // rendezvous so public-share adverts never share the chat append-ring's record
+    // (co-located, the two subkey schemes overlapped and silently overwrote each
+    // other). Unlike presence (read-only, benign on failure), this is a WRITE record —
+    // publish_share advertises on it — so a [0u8;32] fallback would put the advert on a
+    // predictable, world-writable all-zeros-owned record. It is the same KDF primitive
+    // as the chat owner seed above, so a failure means the whole lobby is broken: bail
+    // (return) rather than write to a zeros record.
+    let share_owner_seed = match derive_room_share_veilid_owner_seed(DEFAULT_ROOM, &CNSA_2_0) {
+        Ok(s) => *s.as_bytes(),
+        Err(e) => {
+            daemonseed_veilid_net::vtrace!("gui lobby: share owner-seed derivation failed: {e}");
+            return;
+        }
+    };
     // The PRESENCE sibling record (P1) — a distinct, world-derivable rendezvous so
     // member beacons never share the chat append-ring. A derivation failure is
     // non-fatal: chat still works; the roster just stays empty.
@@ -902,15 +933,21 @@ async fn subscribe_lobby(
         daemonseed_veilid_net::vtrace!("gui lobby: subscribe failed: {e}");
         return;
     }
+    // Subscribe the share record too so inbound share adverts fold into the catalog
+    // (#153). Non-fatal on failure — discovery stays empty but chat is unaffected.
+    if let Err(e) = handle.subscribe_room(share_owner_seed).await {
+        daemonseed_veilid_net::vtrace!("gui lobby: share-record subscribe failed: {e}");
+    }
     // Subscribe the presence record too so inbound beacons fold into the roster.
     // Non-fatal on failure — the roster stays empty but chat is unaffected.
     if let Err(e) = handle.subscribe_room(presence_owner_seed).await {
         daemonseed_veilid_net::vtrace!("gui lobby: presence subscribe failed: {e}");
     }
-    daemonseed_veilid_net::vtrace!("gui lobby: subscribed (chat + presence)");
+    daemonseed_veilid_net::vtrace!("gui lobby: subscribed (chat + shares + presence)");
     shares.lobby = Some(LobbyRendezvous {
         room_key,
         owner_seed,
+        share_owner_seed,
         presence_owner_seed,
         // TTL = 20s × 3 misses = 60s, sized to the 15–20s emit band (P2 ~45–60s
         // bias-to-forgiveness window). A brief wobble never reaps a live member.
@@ -1461,9 +1498,10 @@ async fn publish_share(
         return err("no identity to sign the announcement".to_owned());
     };
     // Copy the lobby's address material out so no borrow of `shares` is held
-    // across an `.await` (and so the later `shares.own.push` is unobstructed).
+    // across an `.await` (and so the later `shares.own.push` is unobstructed). The
+    // advert publishes on the SHARE record (#153), disjoint from the chat record.
     let (room_key_bytes, owner_seed) = match shares.lobby.as_ref() {
-        Some(l) => (*l.room_key.as_bytes(), l.owner_seed),
+        Some(l) => (*l.room_key.as_bytes(), l.share_owner_seed),
         None => return err("lobby not subscribed yet".to_owned()),
     };
 
@@ -1594,7 +1632,7 @@ async fn unpublish_share(
         return;
     };
     let (room_key_bytes, owner_seed) = match shares.lobby.as_ref() {
-        Some(l) => (*l.room_key.as_bytes(), l.owner_seed),
+        Some(l) => (*l.room_key.as_bytes(), l.share_owner_seed),
         None => return,
     };
     let own = own.unwrap_or(OwnShare {
@@ -2045,9 +2083,11 @@ fn handle_inbound(
         }
     }
     // Not a circle message — try it as a public-room (Lobby) chat message before
-    // share discovery. Both ride the lobby record; the distinct per-kind AAD means
-    // only the matching open succeeds (a DiscoveryEnvelope fails `open_room_message`'s
-    // AEAD and a chat blob fails `apply_discovery`). #143: own messages are emitted
+    // share discovery. Chat and share adverts now ride SEPARATE records (#153), but
+    // inbound carries no record tag, so every blob is tried against each opener; the
+    // distinct per-kind AAD means only the matching open succeeds (a DiscoveryEnvelope
+    // fails `open_room_message`'s AEAD and a chat blob fails `apply_discovery`). #143:
+    // own messages are emitted
     // `mine:true` (not suppressed) — they dedup against the optimistic local echo live
     // (same `sent_unix_ms`) and render once from the cold-start backlog.
     if let Some(lobby) = shares.lobby.as_ref()
@@ -2164,8 +2204,13 @@ fn apply_discovery(
     let now = Instant::now();
     if ann.withdraw {
         let change = shares.catalog.apply(&ann, now);
-        shares.discovered.remove(&ann.share_id);
-        if change != CatalogChange::Unchanged {
+        // #152: gate the ROUTE map on the catalog decision. The fetch path resolves
+        // routes from `discovered`, not the catalog, so an unconditional remove would
+        // let a forged withdraw (foreign key → owner-mismatch → `Unchanged`) evict the
+        // owner's route and leave the share visible-but-unfetchable. Only drop the
+        // route when the catalog actually removed the share.
+        if change == CatalogChange::Removed {
+            shares.discovered.remove(&ann.share_id);
             let _ = evt_tx.send(NetEvent::SharesSnapshot {
                 shares: shares.listings(),
             });
@@ -2186,13 +2231,19 @@ fn apply_discovery(
         return true; // consumed-and-dropped; do not fall through
     }
     let change = shares.catalog.apply(&ann, now);
-    shares.discovered.insert(
-        ann.share_id.clone(),
-        DiscoveredRoute {
-            route_blob: env.route_blob.clone(),
-        },
-    );
+    // #152: only trust the advertised route when the catalog ACCEPTED the announce
+    // (`Added`/`Updated`). An owner-mismatch hijack refresh returns `Unchanged`
+    // (first-writer-wins) — skipping the route insert here is what actually prevents
+    // the redirect: otherwise an attacker who validly signs its OWN route for a
+    // victim's `share_id` replaces the owner's route in `discovered` while the catalog
+    // (and thus the browser row) still shows the victim, redirecting the fetch.
     if change != CatalogChange::Unchanged {
+        shares.discovered.insert(
+            ann.share_id.clone(),
+            DiscoveredRoute {
+                route_blob: env.route_blob.clone(),
+            },
+        );
         let _ = evt_tx.send(NetEvent::SharesSnapshot {
             shares: shares.listings(),
         });
@@ -2227,20 +2278,25 @@ mod tests {
     }
 
     #[test]
-    fn warmup_priority_records_order_operator_then_lobby() {
+    fn warmup_priority_records_order_operator_then_lobby_then_share() {
         let op = [1u8; 32];
         let lobby = [2u8; 32];
-        // #140 priority: operator MOTD/announce before lobby chat.
+        let share = [3u8; 32];
+        // #140 priority: operator MOTD/announce before lobby chat; #153: the share
+        // record re-sweeps too so a cold-joiner discovers pre-existing shares.
         assert_eq!(
-            warmup_priority_records(Some(op), Some(lobby)),
-            vec![op, lobby]
+            warmup_priority_records(Some(op), Some(lobby), Some(share)),
+            vec![op, lobby, share]
         );
         // Operator alone.
-        assert_eq!(warmup_priority_records(Some(op), None), vec![op]);
-        // Lobby alone.
-        assert_eq!(warmup_priority_records(None, Some(lobby)), vec![lobby]);
+        assert_eq!(warmup_priority_records(Some(op), None, None), vec![op]);
+        // Lobby + share, no operator.
+        assert_eq!(
+            warmup_priority_records(None, Some(lobby), Some(share)),
+            vec![lobby, share]
+        );
         // Neither joined → empty (the scheduler re-sweeps nothing that round).
-        assert!(warmup_priority_records(None, None).is_empty());
+        assert!(warmup_priority_records(None, None, None).is_empty());
     }
 
     #[test]
@@ -2262,6 +2318,9 @@ mod tests {
         LobbyRendezvous {
             room_key: derive_room_key(DEFAULT_ROOM, &CNSA_2_0).unwrap(),
             owner_seed: *derive_room_veilid_owner_seed(DEFAULT_ROOM, &CNSA_2_0)
+                .unwrap()
+                .as_bytes(),
+            share_owner_seed: *derive_room_share_veilid_owner_seed(DEFAULT_ROOM, &CNSA_2_0)
                 .unwrap()
                 .as_bytes(),
             presence_owner_seed: *derive_room_presence_veilid_owner_seed(DEFAULT_ROOM, &CNSA_2_0)
@@ -2302,6 +2361,122 @@ mod tests {
             route_sig,
         }
         .encode()
+    }
+
+    /// A self-signed WITHDRAW envelope for `share_id` (the withdraw path never checks
+    /// the route advert, so the route fields are inert). `sent_unix_ms` is fresh so a
+    /// rejection can only come from the owner-check, not staleness.
+    fn withdraw_bytes(room_key: &PublicRoomKey, signer: &SignKeypair, share_id: &str) -> Vec<u8> {
+        let fields = AnnouncementFields {
+            room: DEFAULT_ROOM,
+            sender_handle: "tester",
+            share_id,
+            name: "demo-share",
+            rating: "",
+            withdraw: true,
+            sent_unix_ms: 2_000,
+        };
+        let sealed_announcement = seal_public_announcement(room_key, signer, &fields).unwrap();
+        let route_sig = signer
+            .sign(&route_provenance_input(share_id, &[]))
+            .unwrap()
+            .to_vec();
+        DiscoveryEnvelope {
+            sealed_announcement,
+            route_blob: Vec::new(),
+            route_sig,
+        }
+        .encode()
+    }
+
+    /// #152 (finding 3): a foreign peer's forged withdraw for the victim's `share_id`
+    /// must NOT evict the owner's route from `discovered` — the fetch path reads that
+    /// map, so an unconditional remove would leave the share visible-but-unfetchable.
+    #[test]
+    fn a_forged_withdraw_cannot_evict_the_owners_route() {
+        let victim = announcer(21);
+        let attacker = announcer(22);
+        let mut shares = ShareState::new();
+        let room_key = derive_room_key(DEFAULT_ROOM, &CNSA_2_0).unwrap();
+        shares.lobby = Some(lobby());
+
+        let share_id = mint_share_id();
+        let vblob = vec![0x11; 96];
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        // Victim announces first → catalog entry + route.
+        assert!(apply_discovery(
+            &mut shares,
+            &evt_tx,
+            &discovery_bytes(&room_key, &victim, &share_id, &vblob, &vblob)
+        ));
+        let _ = evt_rx.try_recv(); // drain the fold snapshot
+
+        // Attacker forges a withdraw for the victim's share_id under the ATTACKER's key.
+        assert!(apply_discovery(
+            &mut shares,
+            &evt_tx,
+            &withdraw_bytes(&room_key, &attacker, &share_id)
+        ));
+        assert_eq!(
+            shares.catalog.len(),
+            1,
+            "the victim's share survives the forged withdraw"
+        );
+        assert_eq!(
+            shares
+                .discovered
+                .get(&share_id)
+                .map(|d| d.route_blob.clone()),
+            Some(vblob),
+            "the owner's route is NOT evicted → the share stays fetchable"
+        );
+        assert!(
+            evt_rx.try_recv().is_err(),
+            "the forged withdraw is a no-op — no snapshot"
+        );
+    }
+
+    /// #152 (finding 1): a foreign peer re-announcing the victim's `share_id` under
+    /// its OWN key + route (validly self-signed) must NOT replace the owner's route in
+    /// `discovered` — otherwise a click on the victim-attributed row fetches attacker
+    /// content. The catalog keeps the owner (first-writer-wins) AND the route map does.
+    #[test]
+    fn a_hijack_reannounce_cannot_replace_the_owners_route() {
+        let victim = announcer(23);
+        let attacker = announcer(24);
+        let mut shares = ShareState::new();
+        let room_key = derive_room_key(DEFAULT_ROOM, &CNSA_2_0).unwrap();
+        shares.lobby = Some(lobby());
+
+        let share_id = mint_share_id();
+        let vblob = vec![0x33; 96];
+        let ablob = vec![0x44; 96];
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        assert!(apply_discovery(
+            &mut shares,
+            &evt_tx,
+            &discovery_bytes(&room_key, &victim, &share_id, &vblob, &vblob)
+        ));
+        let _ = evt_rx.try_recv();
+
+        // Attacker re-announces the same share_id with its own key + route.
+        assert!(apply_discovery(
+            &mut shares,
+            &evt_tx,
+            &discovery_bytes(&room_key, &attacker, &share_id, &ablob, &ablob)
+        ));
+        assert_eq!(
+            shares
+                .discovered
+                .get(&share_id)
+                .map(|d| d.route_blob.clone()),
+            Some(vblob),
+            "the fetch route stays the owner's — no redirect"
+        );
+        assert!(
+            evt_rx.try_recv().is_err(),
+            "the hijack refresh is rejected — no snapshot"
+        );
     }
 
     #[test]
