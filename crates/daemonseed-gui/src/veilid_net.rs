@@ -151,6 +151,30 @@ const WARMUP_RESWEEP_SCHEDULE: [Duration; 2] = [Duration::from_secs(20), Duratio
 /// backlog sweeps competing with initial chat/downloads (#140 review). Felt-tunable.
 const WARMUP_CIRCLE_RESWEEP_ROUNDS: usize = 1;
 
+/// #157 (generalized, felt-test 2026-07-10): the steady-state resweep tick. The
+/// warmup schedule above stops at +60s, but the passive DHT watch is lossy — a chat
+/// message or share advert *written after* warmup gets no reliable ValueChange, so it
+/// never re-surfaces at a peer that has already settled (the felt-test symptom: matching
+/// record keys, writes 36–246s, lobby chat that echoes locally but never arrives). WB-4
+/// sanctions a reader-side resweep as the fix. On each tick ONE record from the current
+/// subscribed chat/discovery set is re-swept, round-robin, so the instantaneous read
+/// burst stays one `SUBKEY_COUNT` (64) force-refresh sweep (WB-2 read lane) and the
+/// per-record cadence = tick × record-count (scales with room count instead of fanning
+/// out). Presence records are excluded — they self-heal via keepalive re-writes (WB-4
+/// table). Known limitations (both felt-tunable, each with a follow-up lever): (1)
+/// per-record latency grows linearly with room count — the fix is a tail-sweep (resweep
+/// only beyond each record's high-water) so more records fit per tick; (2) the sweep is a
+/// continuous background read load (one 64-GET sweep per tick, indefinitely) — the fix is
+/// a stop-on-quiet backoff that widens the tick when no new content arrives. The tick is
+/// set conservatively for the alpha to bound (2) against the #140 fan-spin ceiling.
+const STEADY_RESWEEP_TICK: Duration = Duration::from_secs(15);
+
+/// Hand-off point from [`WARMUP_RESWEEP_SCHEDULE`]: the steady resweep begins only once
+/// the warmup window (last round at +60s) has elapsed, so the two resweep sources never
+/// double the read burst against the same DHT nodes (WB-2). A small margin past the last
+/// warmup round.
+const STEADY_RESWEEP_WARMUP_HANDOFF: Duration = Duration::from_secs(70);
+
 /// Build the #140 warmup PRIORITY re-sweep records: operator MOTD/announce first (its
 /// content feeds the #93 landing), then lobby chat. These are re-swept every round;
 /// circle records are handled separately (early rounds only — see
@@ -170,6 +194,31 @@ fn warmup_priority_records(
     // re-sweep it too to discover shares announced before it subscribed.
     seeds.extend(share);
     seeds
+}
+
+/// Round-robin selector for the steady-state resweep (#157 generalized). Given the
+/// CURRENT subscribed record seeds and the last-swept seed, return the next seed to
+/// re-sweep: the smallest seed strictly greater than `last`, wrapping to the smallest
+/// when `last` is `None`, is the largest, or has itself left the set. **Key-based, not
+/// index-based** — a join/leave that reshapes the set between ticks must never skip a
+/// record (an index cursor over a shifting `Vec` would reintroduce the exact
+/// non-delivery bug this resweep exists to kill). An empty set yields `None` (clean
+/// no-op). The seeds are sorted+deduped in place so the traversal order is stable across
+/// ticks regardless of the caller's insertion order.
+fn next_resweep_seed(seeds: &mut Vec<[u8; 32]>, last: Option<[u8; 32]>) -> Option<[u8; 32]> {
+    if seeds.is_empty() {
+        return None;
+    }
+    seeds.sort_unstable();
+    seeds.dedup();
+    match last {
+        None => seeds.first().copied(),
+        Some(last) => seeds
+            .iter()
+            .copied()
+            .find(|s| *s > last)
+            .or_else(|| seeds.first().copied()),
+    }
 }
 
 /// KIND tag for a MOTD value: the payload is a [`wire::SignedArtifact`].
@@ -374,11 +423,30 @@ pub async fn veilid_net_actor(
     // (WB-3.I6), and the cadence takes NO input from user activity (WB-0).
     let heartbeat = tokio::time::sleep(next_keepalive_interval());
     tokio::pin!(heartbeat);
+    // #157 (generalized): steady-state resweep clock. Round-robins ONE subscribed
+    // chat/discovery record per tick once the warmup window closes (see
+    // STEADY_RESWEEP_TICK / STEADY_RESWEEP_WARMUP_HANDOFF). `connected_at` is the
+    // warmup hand-off reference (set on Connect); `resweep_cursor` is the key-based
+    // round-robin position.
+    let mut steady_resweep = tokio::time::interval(STEADY_RESWEEP_TICK);
+    steady_resweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut connected_at: Option<Instant> = None;
+    let mut resweep_cursor: Option<[u8; 32]> = None;
+    // In-flight guard: skip a tick while a prior resweep is still running, so a sweep
+    // that outlasts the tick on a slow DHT can't overlap the next one — keeps the WB-2
+    // read burst at one 64-GET sweep at a time (review finding).
+    let resweep_busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     loop {
         tokio::select! {
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { break }; // UI side dropped — shut down
+                // #157: anchor the steady-resweep warmup hand-off to each Connect, and
+                // reset the round-robin cursor so a reconnect re-sweeps from the top.
+                if matches!(cmd, NetCommand::Connect { .. }) {
+                    connected_at = Some(Instant::now());
+                    resweep_cursor = None;
+                }
                 handle_command(
                     cmd, &evt_tx, &cmd_tx, &mut net, &mut ev_rx, &mut circles, &mut my_handle,
                     &mut shares,
@@ -446,6 +514,44 @@ pub async fn veilid_net_actor(
                 heartbeat
                     .as_mut()
                     .reset(tokio::time::Instant::now() + next_keepalive_interval());
+            }
+            // #157 (generalized): once the warmup window has closed, re-sweep ONE
+            // subscribed chat/discovery record per tick (round-robin) so a message or
+            // advert written after warmup can no longer be stranded by the lossy DHT
+            // watch. Presence records are excluded — they self-heal via keepalive
+            // re-writes (WB-4). The sweep is spawned off the loop (its record-open await
+            // must not stall commands/chat, #128 class); the cursor advance is
+            // synchronous so the round-robin stays deterministic.
+            _ = steady_resweep.tick() => {
+                // Ready once the warmup hand-off window has elapsed, we are attached, and
+                // no prior resweep is still in flight (the WB-2 one-sweep-at-a-time bound
+                // — a resweep can outlast the tick on a slow DHT).
+                let ready = connected_at
+                    .is_some_and(|t| t.elapsed() >= STEADY_RESWEEP_WARMUP_HANDOFF)
+                    && !resweep_busy.load(std::sync::atomic::Ordering::Acquire);
+                if let Some(handle) = net.as_ref().filter(|_| ready) {
+                    let mut seeds: Vec<[u8; 32]> = Vec::new();
+                    seeds.extend(shares.operator.as_ref().map(|op| op.announce_owner_seed));
+                    if let Some(lobby) = shares.lobby.as_ref() {
+                        seeds.push(lobby.owner_seed);
+                        seeds.push(lobby.share_owner_seed);
+                    }
+                    seeds.extend(circles.iter().map(|c| c.owner_seed));
+                    if let Some(seed) = next_resweep_seed(&mut seeds, resweep_cursor) {
+                        resweep_cursor = Some(seed);
+                        resweep_busy.store(true, std::sync::atomic::Ordering::Release);
+                        daemonseed_veilid_net::vtrace!(
+                            "gui steady-resweep: re-sweeping 1 of {} record(s)",
+                            seeds.len()
+                        );
+                        let handle = handle.clone();
+                        let busy = resweep_busy.clone();
+                        tokio::spawn(async move {
+                            let _ = handle.resweep_rendezvous(seed).await;
+                            busy.store(false, std::sync::atomic::Ordering::Release);
+                        });
+                    }
+                }
             }
         }
     }
@@ -2531,6 +2637,38 @@ mod tests {
     }
 
     #[test]
+    fn next_resweep_seed_is_key_based_and_survives_set_changes() {
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        let c = [3u8; 32];
+        // Empty set → clean no-op (advisor trap #2: no panic/mod-by-zero).
+        assert_eq!(next_resweep_seed(&mut vec![], None), None);
+        // First pick is the smallest, regardless of insertion order.
+        assert_eq!(next_resweep_seed(&mut vec![c, a, b], None), Some(a));
+        // Advance to the next-greater key each tick.
+        assert_eq!(next_resweep_seed(&mut vec![a, b, c], Some(a)), Some(b));
+        assert_eq!(next_resweep_seed(&mut vec![a, b, c], Some(b)), Some(c));
+        // Wrap at the end.
+        assert_eq!(next_resweep_seed(&mut vec![a, b, c], Some(c)), Some(a));
+        // Single element re-selects itself (wrap).
+        assert_eq!(next_resweep_seed(&mut vec![a], Some(a)), Some(a));
+        // Advisor trap #1: a set change between ticks must NOT skip a record. Cursor at
+        // `a`, `b` has left → next-greater is `c` (not a skipped slot or a panic).
+        assert_eq!(next_resweep_seed(&mut vec![a, c], Some(a)), Some(c));
+        // Cursor points at a seed that has itself left the set → still advances to the
+        // next-greater present seed.
+        assert_eq!(next_resweep_seed(&mut vec![a, c], Some(b)), Some(c));
+    }
+
+    #[test]
+    fn steady_resweep_hands_off_after_the_warmup_window() {
+        // The steady resweep must not overlap the warmup schedule (advisor trap #3):
+        // its hand-off point is strictly past the last warmup round.
+        let last_warmup = *WARMUP_RESWEEP_SCHEDULE.last().unwrap();
+        assert!(STEADY_RESWEEP_WARMUP_HANDOFF > last_warmup);
+    }
+
+    #[test]
     fn warmup_resweep_schedule_is_strictly_increasing_and_nonempty() {
         assert!(!WARMUP_RESWEEP_SCHEDULE.is_empty());
         for w in WARMUP_RESWEEP_SCHEDULE.windows(2) {
@@ -3234,9 +3372,15 @@ mod tests {
         // A fresh same-room chat write folds the sender into presence (WB-ISC-4).
         let mut shares = ShareState::new();
         shares.lobby = Some(lobby());
-        let fresh =
-            seal_room_message(&room_key, &signer, DEFAULT_ROOM, "otter#aabbccddeeff", "hi", now)
-                .unwrap();
+        let fresh = seal_room_message(
+            &room_key,
+            &signer,
+            DEFAULT_ROOM,
+            "otter#aabbccddeeff",
+            "hi",
+            now,
+        )
+        .unwrap();
         let (evt_tx, _rx) = unbounded_channel();
         handle_inbound(
             VeilidNetEvent::Inbound { bytes: fresh },

@@ -304,13 +304,20 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("WB-ISC-6", IscClass::Positive),
     ("WB-ISC-7", IscClass::Positive),
     ("WB-ISC-8", IscClass::Negative),
+    // WB-4 two-leg discovery (#157, docs/design/veilid-write-budget.md). WB-ISC-14
+    // (anti: every discovery-class surface has a declared steady-state re-surfacing
+    // mechanism) registers here — satisfied by the steady-state reader resweep in the
+    // gui/tui net actors plus the key-based round-robin cursor unit oracle. WB-ISC-15
+    // (a late-converging client still discovers a share) is DEFERRED to its two-node
+    // orinoco oracle and is NOT registered until that live probe lands (ISA Criteria).
+    ("WB-ISC-14", IscClass::Negative),
 ];
 
 /// Total built, non-deferred ISCs tracked by this registry — the SINGLE source
 /// of truth for the coverage denominator, read live by `xtask isc-coverage`.
 /// Recount on every ISC add/remove (the `const _` assert below guards it
 /// against [`ISCS`]).
-pub const TOTAL: usize = 193;
+pub const TOTAL: usize = 194;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -484,10 +491,11 @@ mod tests {
         //                                  WB-3 write scheduler WB-ISC-9/10/13 pos +
         //                                  WB-ISC-11/12 neg, #159;
         //                                  WB-1 presence model WB-ISC-3/4/5/6/7 pos +
-        //                                  WB-ISC-1/2/8 neg, #159)
-        //   total   127 pos + 66 neg = 193
+        //                                  WB-ISC-1/2/8 neg, #159;
+        //                                  WB-4 steady-state re-surfacing WB-ISC-14 neg, #157)
+        //   total   127 pos + 67 neg = 194
         assert_eq!(pos, 127, "positive count drift");
-        assert_eq!(neg, 66, "negative count drift");
+        assert_eq!(neg, 67, "negative count drift");
     }
 
     /// COVERED is single-sourced and must agree with the per-milestone

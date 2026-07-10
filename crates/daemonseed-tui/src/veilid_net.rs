@@ -229,6 +229,47 @@ fn now_unix_ms() -> i64 {
 /// The Veilid net actor. Same channel shape as [`crate::net`]'s `net_actor`
 /// (`cmd_rx` in, `evt_tx` out; `_cmd_tx` is the self-send handle the relay actor
 /// uses for timers — unused here, kept for a uniform spawn signature).
+/// #157 (generalized, felt-test 2026-07-10): the steady-state resweep tick. The passive
+/// DHT watch is lossy — a chat message or share advert written after the login sweep gets
+/// no reliable ValueChange, so it never re-surfaces at a peer that has already settled.
+/// WB-4 sanctions a reader-side resweep as the fix. On each tick ONE record from the
+/// current subscribed chat/discovery set is re-swept, round-robin, so the instantaneous
+/// read burst stays one `SUBKEY_COUNT` (64) force-refresh sweep (WB-2 read lane) and the
+/// per-record cadence = tick × record-count (scales with room count). Presence records
+/// are excluded — they self-heal via keepalive re-writes (WB-4 table). Mirrors the GUI
+/// actor; same known limitations (per-record latency vs room count → tail-sweep;
+/// continuous read load → stop-on-quiet backoff). Felt-tunable.
+const STEADY_RESWEEP_TICK: Duration = Duration::from_secs(15);
+
+/// Hand-off delay past Connect before the steady resweep begins. Unlike the GUI, the TUI
+/// has NO stepped warmup re-sweep schedule — only the single connect-time login sweep in
+/// `subscribe_lobby` — so this is kept SHORT: just long enough to clear the connect-time
+/// subscribe/login-sweep read burst (WB-2), never a 70s dead window in which nothing
+/// re-surfaces (review finding). Felt-tunable.
+const STEADY_RESWEEP_WARMUP_HANDOFF: Duration = Duration::from_secs(20);
+
+/// Round-robin selector for the steady-state resweep (#157 generalized). Returns the
+/// next seed to re-sweep: the smallest seed strictly greater than `last`, wrapping when
+/// `last` is `None`, is the largest, or has left the set. **Key-based, not index-based** —
+/// a join/leave that reshapes the set between ticks must never skip a record (an index
+/// cursor over a shifting `Vec` would reintroduce the exact non-delivery bug). Empty set
+/// → `None`. Seeds are sorted+deduped in place for a stable traversal order.
+fn next_resweep_seed(seeds: &mut Vec<[u8; 32]>, last: Option<[u8; 32]>) -> Option<[u8; 32]> {
+    if seeds.is_empty() {
+        return None;
+    }
+    seeds.sort_unstable();
+    seeds.dedup();
+    match last {
+        None => seeds.first().copied(),
+        Some(last) => seeds
+            .iter()
+            .copied()
+            .find(|s| *s > last)
+            .or_else(|| seeds.first().copied()),
+    }
+}
+
 pub async fn veilid_net_actor(
     mut cmd_rx: UnboundedReceiver<NetCommand>,
     _cmd_tx: UnboundedSender<NetCommand>,
@@ -255,11 +296,26 @@ pub async fn veilid_net_actor(
     // jittered deadline — no fixed period, no activity coupling (WB-0).
     let heartbeat = tokio::time::sleep(veilid_keepalive_interval());
     tokio::pin!(heartbeat);
+    // #157 (generalized): steady-state resweep clock — round-robins ONE subscribed
+    // chat/discovery record per tick once the Connect hand-off window closes.
+    let mut steady_resweep = tokio::time::interval(STEADY_RESWEEP_TICK);
+    steady_resweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut connected_at: Option<Instant> = None;
+    let mut resweep_cursor: Option<[u8; 32]> = None;
+    // In-flight guard: skip a tick while a prior resweep is still running, so a slow
+    // resweep can't overlap the next one (keeps the WB-2 read burst at one sweep).
+    let resweep_busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     loop {
         tokio::select! {
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { break }; // UI side dropped — shut down
+                // #157: anchor the steady-resweep hand-off to each Connect, and reset
+                // the round-robin cursor so a reconnect re-sweeps from the top.
+                if matches!(cmd, NetCommand::Connect { .. }) {
+                    connected_at = Some(Instant::now());
+                    resweep_cursor = None;
+                }
                 handle_command(
                     cmd, &evt_tx, &mut net, &mut ev_rx, &mut circles,
                     &mut next_circle_id, &mut my_handle, &mut shares,
@@ -284,6 +340,41 @@ pub async fn veilid_net_actor(
                 heartbeat
                     .as_mut()
                     .reset(tokio::time::Instant::now() + veilid_keepalive_interval());
+            }
+            // #157 (generalized): once the Connect hand-off window has closed, re-sweep
+            // ONE subscribed chat/discovery record per tick (round-robin) so a message
+            // or advert written after the login sweep can no longer be stranded by the
+            // lossy DHT watch. Presence records are excluded (self-heal via keepalive
+            // re-writes, WB-4). Spawned off the loop so its record-open await never
+            // stalls commands/chat; the cursor advance is synchronous.
+            _ = steady_resweep.tick() => {
+                // Ready once the hand-off window has elapsed, we are attached, and no
+                // prior resweep is still in flight (the WB-2 one-sweep-at-a-time bound).
+                let ready = connected_at
+                    .is_some_and(|t| t.elapsed() >= STEADY_RESWEEP_WARMUP_HANDOFF)
+                    && !resweep_busy.load(std::sync::atomic::Ordering::Acquire);
+                if let Some(handle) = net.as_ref().filter(|_| ready) {
+                    let mut seeds: Vec<[u8; 32]> = Vec::new();
+                    if let Some(lobby) = shares.lobby.as_ref() {
+                        seeds.push(lobby.owner_seed);
+                        seeds.push(lobby.share_owner_seed);
+                    }
+                    seeds.extend(circles.iter().map(|c| c.owner_seed));
+                    if let Some(seed) = next_resweep_seed(&mut seeds, resweep_cursor) {
+                        resweep_cursor = Some(seed);
+                        resweep_busy.store(true, std::sync::atomic::Ordering::Release);
+                        daemonseed_veilid_net::vtrace!(
+                            "tui steady-resweep: re-sweeping 1 of {} record(s)",
+                            seeds.len()
+                        );
+                        let handle = handle.clone();
+                        let busy = resweep_busy.clone();
+                        tokio::spawn(async move {
+                            let _ = handle.resweep_rendezvous(seed).await;
+                            busy.store(false, std::sync::atomic::Ordering::Release);
+                        });
+                    }
+                }
             }
         }
     }
@@ -1539,6 +1630,31 @@ mod tests {
     use super::*;
     use daemonseed_veilid_net::route_provenance_input;
     use tokio::sync::mpsc::unbounded_channel;
+
+    #[test]
+    fn next_resweep_seed_is_key_based_and_survives_set_changes() {
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        let c = [3u8; 32];
+        assert_eq!(next_resweep_seed(&mut vec![], None), None);
+        assert_eq!(next_resweep_seed(&mut vec![c, a, b], None), Some(a));
+        assert_eq!(next_resweep_seed(&mut vec![a, b, c], Some(a)), Some(b));
+        assert_eq!(next_resweep_seed(&mut vec![a, b, c], Some(c)), Some(a));
+        assert_eq!(next_resweep_seed(&mut vec![a], Some(a)), Some(a));
+        // A set change between ticks must not skip a record: cursor at `a`, `b` left →
+        // next-greater is `c`, and a cursor at a now-absent `b` still advances to `c`.
+        assert_eq!(next_resweep_seed(&mut vec![a, c], Some(a)), Some(c));
+        assert_eq!(next_resweep_seed(&mut vec![a, c], Some(b)), Some(c));
+    }
+
+    #[test]
+    fn steady_resweep_hands_off_within_a_short_connect_window() {
+        // The TUI has no stepped warmup schedule, so the hand-off must clear the
+        // connect-time subscribe/login-sweep burst yet stay short enough that it is not a
+        // dead window with no re-surfacing (review finding) — a sensible band, not >0.
+        assert!(STEADY_RESWEEP_WARMUP_HANDOFF >= Duration::from_secs(10));
+        assert!(STEADY_RESWEEP_WARMUP_HANDOFF <= Duration::from_secs(45));
+    }
 
     /// Drive the actor with one command and return its first emitted event,
     /// WITHOUT a live Veilid node. Every arm exercised here emits synchronously
