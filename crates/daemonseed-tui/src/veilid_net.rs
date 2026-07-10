@@ -1334,12 +1334,15 @@ fn handle_inbound(
     let _ = apply_discovery(shares, evt_tx, &bytes);
 }
 
-/// The jittered lobby presence-beacon interval — [15, 20]s (P2), at/above the
-/// ~14.7s cross-node DHT watch floor so beaconing never outruns propagation.
-/// Reuses the core [10, 15]s jittered draw plus a 5s floor (shared CSPRNG jitter →
-/// de-sync + no fixed period, ISC-A-S2). A felt-test tunable.
+/// The jittered lobby presence-beacon interval — [50, 55]s (Tier-1 write-budget
+/// tuning, 2026-07-09), well above the ~14.7s cross-node DHT watch floor. Widened
+/// from [15, 20]s because per-member ~17s beacons saturated the Veilid DHT write
+/// path (set_dht_value backing up to minutes). Reuses the core [10, 15]s jittered
+/// draw (shared CSPRNG jitter → de-sync + no fixed period, ISC-A-S2) plus a 40s
+/// offset. Re-test tunable; structural fix (presence-as-reads) is the
+/// veilid-write-budget design.
 fn veilid_presence_interval() -> Duration {
-    next_heartbeat_interval() + Duration::from_secs(5)
+    next_heartbeat_interval() + Duration::from_secs(40)
 }
 
 /// Emit one sealed lobby presence beacon (#74) to the presence record, then reap
