@@ -91,7 +91,8 @@ use daemonseed_core::heartbeat::{HeartbeatFields, open_heartbeat, seal_public_he
 use daemonseed_core::identity::keys::{Identity, SignKeypair, derive_identity_keys};
 use daemonseed_core::identity::mnemonic::Mnemonic;
 use daemonseed_core::presence::{
-    HEARTBEAT_MISS_COUNT, PresenceTracker, beacon_is_fresh, next_heartbeat_interval,
+    PRESENCE_TTL, PresenceTracker, REAP_CONGESTION_THRESHOLD, beacon_is_fresh,
+    next_keepalive_interval,
 };
 use daemonseed_core::public_room::{
     DEFAULT_ROOM, PublicRoomKey, derive_room_key, derive_room_presence_veilid_owner_seed,
@@ -108,8 +109,8 @@ use daemonseed_core::storage::fetched::{
     FetchedFile, FetchedShare, FetchedStore, rebase_to_selection_root,
 };
 use daemonseed_veilid_net::{
-    DiscoveryEnvelope, VeilidNet, VeilidNetConfig, VeilidNetError, VeilidNetEvent, VeilidNetHandle,
-    verify_route_advert,
+    DiscoveryEnvelope, PresenceBoundary, VeilidNet, VeilidNetConfig, VeilidNetError,
+    VeilidNetEvent, VeilidNetHandle, verify_route_advert,
 };
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
@@ -248,11 +249,11 @@ pub async fn veilid_net_actor(
     // unlikely.
     let mut my_handle: Option<String> = None;
     let mut prune_timer = tokio::time::interval(SHARE_CATALOG_PRUNE_INTERVAL);
-    // Presence emit + reap clock (#74): a jittered [15,20]s beacon into the lobby
-    // presence record (when joined) that also reaps the tracker each fire. A
-    // self-rescheduling `Sleep` (not a fixed `interval`) so each tick draws a fresh
-    // jittered deadline (ISC-A-S2 traffic shape).
-    let heartbeat = tokio::time::sleep(veilid_presence_interval());
+    // Presence keepalive + reap clock (WB-1.2): a jittered [180,220]s keepalive into
+    // the lobby presence record (when joined) that also reaps the tracker each fire,
+    // only in calm (WB-1.10). Self-rescheduling `Sleep` so each tick draws a fresh
+    // jittered deadline — no fixed period, no activity coupling (WB-0).
+    let heartbeat = tokio::time::sleep(veilid_keepalive_interval());
     tokio::pin!(heartbeat);
 
     loop {
@@ -282,7 +283,7 @@ pub async fn veilid_net_actor(
                 emit_and_reap_lobby_presence(&net, &my_handle, &mut shares);
                 heartbeat
                     .as_mut()
-                    .reset(tokio::time::Instant::now() + veilid_presence_interval());
+                    .reset(tokio::time::Instant::now() + veilid_keepalive_interval());
             }
         }
     }
@@ -319,7 +320,7 @@ async fn handle_command(
                 // Subscribe the world-derivable lobby so share announcements fold
                 // into the catalog as they arrive (Phase 3 discovery) and so lobby
                 // chat can flow (emits PublicRoomJoined).
-                subscribe_lobby(shares, net, evt_tx).await;
+                subscribe_lobby(shares, net, evt_tx, my_handle.as_deref().unwrap_or("guest")).await;
             }
         }
         NetCommand::JoinCircle { phrase } => {
@@ -517,6 +518,7 @@ async fn subscribe_lobby(
     shares: &mut ShareState,
     net: &Option<VeilidNetHandle>,
     evt_tx: &UnboundedSender<NetEvent>,
+    my_handle: &str,
 ) {
     if shares.lobby.is_some() {
         return;
@@ -577,9 +579,21 @@ async fn subscribe_lobby(
         owner_seed,
         share_owner_seed,
         presence_owner_seed,
-        // TTL = 20s × 3 = 60s, sized to the 15–20s emit band (P2 ~45–60s window).
-        presence: PresenceTracker::with_cadence(Duration::from_secs(20), HEARTBEAT_MISS_COUNT),
+        // WB-1.9: TTL 600s + read-side fold; the crash/network-loss backstop only.
+        presence: PresenceTracker::for_room(DEFAULT_ROOM, PRESENCE_TTL),
     });
+    // WB-1.1: publish one JOIN beacon on subscribe so the member shows on rosters
+    // within the connect window (not a keepalive interval later).
+    if let (Some(signing), Some(lobby)) = (shares.signing.clone(), shares.lobby.as_ref()) {
+        spawn_public_beacon(
+            handle,
+            &signing,
+            &lobby.room_key,
+            lobby.presence_owner_seed,
+            my_handle,
+            PresenceBoundary::Join,
+        );
+    }
     // The lobby rendezvous is live: tell the app the public room is joined so its
     // Lobby chat input is enabled (relay-path parity — the relay emits
     // PublicRoomJoined on its connect-time auto-join).
@@ -1294,9 +1308,12 @@ fn handle_inbound(
     // share discovery. Both ride the lobby record; the distinct per-kind AEAD AAD
     // means only the matching open succeeds. Own messages are suppressed by pubkey
     // (the app already echoed on Enter), mirroring the circle path above.
-    if let Some(lobby) = shares.lobby.as_ref()
-        && let Ok(msg) = open_room_message(&lobby.room_key, DEFAULT_ROOM, &bytes)
-    {
+    // Open under an immutable borrow, then fold under a mutable one (WB-ISC-4).
+    let lobby_msg = shares
+        .lobby
+        .as_ref()
+        .and_then(|lobby| open_room_message(&lobby.room_key, DEFAULT_ROOM, &bytes).ok());
+    if let Some(msg) = lobby_msg {
         if !is_own(&msg.sender_pubkey)
             && let Ok(bound) = Handle::display_bound(&msg.sender_handle, &msg.sender_pubkey)
         {
@@ -1308,6 +1325,18 @@ fn handle_inbound(
                 body: msg.body,
                 sent_unix_ms: msg.sent_unix_ms,
             });
+            // WB-ISC-4 (after the message, chat is primary): a verified same-room
+            // chat write advances the sender's roster freshness — read-side fold,
+            // emits nothing.
+            if let Some(lobby) = shares.lobby.as_mut() {
+                let _ = lobby.presence.apply_member_write(
+                    DEFAULT_ROOM,
+                    &msg.sender_pubkey,
+                    &msg.sender_handle,
+                    msg.sent_unix_ms,
+                    Instant::now(),
+                );
+            }
         }
         return;
     }
@@ -1334,15 +1363,12 @@ fn handle_inbound(
     let _ = apply_discovery(shares, evt_tx, &bytes);
 }
 
-/// The jittered lobby presence-beacon interval — [50, 55]s (Tier-1 write-budget
-/// tuning, 2026-07-09), well above the ~14.7s cross-node DHT watch floor. Widened
-/// from [15, 20]s because per-member ~17s beacons saturated the Veilid DHT write
-/// path (set_dht_value backing up to minutes). Reuses the core [10, 15]s jittered
-/// draw (shared CSPRNG jitter → de-sync + no fixed period, ISC-A-S2) plus a 40s
-/// offset. Re-test tunable; structural fix (presence-as-reads) is the
-/// veilid-write-budget design.
-fn veilid_presence_interval() -> Duration {
-    next_heartbeat_interval() + Duration::from_secs(40)
+/// The jittered lobby presence-KEEPALIVE interval — [180, 220]s (WB-1.2), well
+/// above the ~14.7s DHT watch floor and under the WB-2 write ceiling. Presence is a
+/// read question moved to the read side; the write cadence takes NO input from user
+/// activity (WB-0) and re-draws fresh per emission (no fixed period / phase-lock).
+fn veilid_keepalive_interval() -> Duration {
+    next_keepalive_interval()
 }
 
 /// Emit one sealed lobby presence beacon (#74) to the presence record, then reap
@@ -1355,36 +1381,68 @@ fn veilid_presence_interval() -> Duration {
 /// The DHT publish is **spawned off the actor loop** (like `send_chat`, the #128
 /// D-0b pattern): awaiting the write's ack inline in the select arm would stall the
 /// loop for seconds every ~15–20 s. The reap is a fast in-memory op and stays inline.
+/// Seal and publish ONE lobby presence beacon (WB-1 join / keepalive / leave, per
+/// `boundary`), spawning the DHT write off the actor loop. Fixed-length (WB-ISC-6)
+/// with an EMPTY digest — share liveness rides the share record post-#153.
+fn spawn_public_beacon(
+    handle: &VeilidNetHandle,
+    signing: &SignKeypair,
+    room_key: &PublicRoomKey,
+    presence_seed: [u8; 32],
+    my_handle: &str,
+    boundary: PresenceBoundary,
+) {
+    let fields = HeartbeatFields {
+        room: DEFAULT_ROOM,
+        sender_handle: my_handle,
+        sent_unix_ms: now_unix_ms(),
+        live_share_ids: &[],
+        is_leave: matches!(boundary, PresenceBoundary::Leave),
+    };
+    if let Ok(sealed) = seal_public_heartbeat(room_key, signing, &fields) {
+        let handle = handle.clone();
+        let pubkey = signing.public_key().to_vec();
+        tokio::spawn(async move {
+            if let Err(e) = handle
+                .publish_presence(presence_seed, &pubkey, sealed, boundary)
+                .await
+            {
+                daemonseed_veilid_net::vtrace!("tui presence: {boundary:?} emit failed: {e}");
+            }
+        });
+    }
+}
+
+/// Whether the local write funnel is congested (WB-1.10 / WB-ISC-5): the
+/// scheduler's most-recent non-chat enqueue-to-ack latency is at/above
+/// [`REAP_CONGESTION_THRESHOLD`]. While congested, presence reaping is suspended.
+fn write_congested(net: &Option<VeilidNetHandle>) -> bool {
+    net.as_ref()
+        .map(|h| h.last_write_latency_ms() >= REAP_CONGESTION_THRESHOLD.as_millis() as u64)
+        .unwrap_or(false)
+}
+
 fn emit_and_reap_lobby_presence(
     net: &Option<VeilidNetHandle>,
     my_handle: &Option<String>,
     shares: &mut ShareState,
 ) {
+    let congested = write_congested(net);
     if let (Some(handle), Some(signing)) = (net.as_ref(), shares.signing.clone())
         && let Some(lobby) = shares.lobby.as_ref()
     {
-        let own_share_ids: Vec<String> = shares.own.iter().map(|s| s.share_id.clone()).collect();
-        let fields = HeartbeatFields {
-            room: DEFAULT_ROOM,
-            // Advisory handle; the pubkey is authoritative. `guest` until the first
-            // send learns a real `name#hash` (the TUI carries the handle per-message).
-            sender_handle: my_handle.as_deref().unwrap_or("guest"),
-            sent_unix_ms: now_unix_ms(),
-            live_share_ids: &own_share_ids,
-        };
-        if let Ok(sealed) = seal_public_heartbeat(&lobby.room_key, &signing, &fields) {
-            let handle = handle.clone();
-            let seed = lobby.presence_owner_seed;
-            let pubkey = signing.public_key().to_vec();
-            tokio::spawn(async move {
-                if let Err(e) = handle.publish_presence(seed, &pubkey, sealed).await {
-                    daemonseed_veilid_net::vtrace!("tui presence: beacon emit failed: {e}");
-                }
-            });
-        }
+        spawn_public_beacon(
+            handle,
+            &signing,
+            &lobby.room_key,
+            lobby.presence_owner_seed,
+            my_handle.as_deref().unwrap_or("guest"),
+            PresenceBoundary::Keepalive,
+        );
     }
+    // WB-1.10: reap only in calm (the timer is the reap clock).
     if let Some(lobby) = shares.lobby.as_mut() {
-        let _ = lobby.presence.reap(Instant::now());
+        let _ = lobby.presence.reap(Instant::now(), congested);
     }
 }
 
@@ -1631,7 +1689,7 @@ mod tests {
             presence_owner_seed: *derive_room_presence_veilid_owner_seed(DEFAULT_ROOM, &CNSA_2_0)
                 .unwrap()
                 .as_bytes(),
-            presence: PresenceTracker::with_cadence(Duration::from_secs(20), HEARTBEAT_MISS_COUNT),
+            presence: PresenceTracker::for_room(DEFAULT_ROOM, PRESENCE_TTL),
         }
     }
 

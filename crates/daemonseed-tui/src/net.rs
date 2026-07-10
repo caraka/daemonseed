@@ -1441,6 +1441,7 @@ impl Actor {
                     sender_handle: handle,
                     sent_unix_ms,
                     live_share_ids: &lobby_share_ids,
+                    is_leave: false,
                 };
                 match seal_public_heartbeat(&room.room_key, signing, &fields) {
                     Ok(sealed) => {
@@ -1469,6 +1470,7 @@ impl Actor {
                     // No circle-share concept yet (#76): circle beacons carry an
                     // empty digest.
                     live_share_ids: &[],
+                    is_leave: false,
                 };
                 match seal_circle_heartbeat(&circle.cot_key, signing, &fields) {
                     Ok(sealed) => {
@@ -1496,14 +1498,14 @@ impl Actor {
         if let Some(room) = self.public_room.as_mut() {
             reaped_lobby_pubkeys = room
                 .presence
-                .reap(now)
+                .reap(now, false)
                 .into_iter()
                 .map(|m| m.pubkey)
                 .collect();
         }
         for circle in &mut self.circles {
             // No circle-share catalog to prune — just keep the tracker honest.
-            let _ = circle.presence.reap(now);
+            let _ = circle.presence.reap(now, false);
         }
 
         // Prune the lobby catalog for every member whose heartbeat just lapsed,

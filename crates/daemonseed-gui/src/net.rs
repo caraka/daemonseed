@@ -1585,6 +1585,7 @@ impl Actor {
                     sender_handle: &self.my_handle,
                     sent_unix_ms,
                     live_share_ids: &lobby_share_ids,
+                    is_leave: false,
                 };
                 if let Ok(sealed) = seal_public_heartbeat(&room.room_key, signing, &fields) {
                     let frame = wire::CotFrame {
@@ -1609,6 +1610,7 @@ impl Actor {
                     sender_handle: &self.my_handle,
                     sent_unix_ms,
                     live_share_ids: &[],
+                    is_leave: false,
                 };
                 if let Ok(sealed) = seal_circle_heartbeat(&circle.cot_key, signing, &fields) {
                     let frame = wire::CotFrame {
@@ -1628,7 +1630,7 @@ impl Actor {
         let mut lobby_reaped = false;
         let mut lobby_rows: Vec<RosterEntry> = Vec::new();
         if let Some(room) = self.public_room.as_mut() {
-            lobby_reaped = !room.presence.reap(now).is_empty();
+            lobby_reaped = !room.presence.reap(now, false).is_empty();
             if lobby_reaped {
                 lobby_rows = roster_from_members(&room.presence.members());
             }
@@ -1643,7 +1645,7 @@ impl Actor {
         // borrow ends before each `self.emit` (which borrows `&self`).
         let mut circle_rosters: Vec<(u64, Vec<RosterEntry>)> = Vec::new();
         for circle in &mut self.circles {
-            if !circle.presence.reap(now).is_empty() {
+            if !circle.presence.reap(now, false).is_empty() {
                 circle_rosters.push((
                     circle.circle_id,
                     roster_from_members(&circle.presence.members()),
@@ -3228,7 +3230,9 @@ pub(crate) fn roster_render_changed(
     new_handle: &str,
 ) -> bool {
     match change {
-        PresenceChange::Appeared => true,
+        // Appeared/Departed both change the roster membership; a leave tombstone
+        // (WB-1.3) removes a row, so it must re-render.
+        PresenceChange::Appeared | PresenceChange::Departed => true,
         PresenceChange::Refreshed => prior_handle != Some(new_handle),
         PresenceChange::Unchanged => false,
     }
@@ -5358,6 +5362,7 @@ mod tests {
                 sent_unix_ms,
                 signature: vec![9, 9, 9],
                 live_share_ids: vec![],
+                is_leave: false,
             }
         }
 
@@ -5412,6 +5417,7 @@ mod tests {
                 sender_handle: "wandering-otter#abc",
                 sent_unix_ms: now_unix_ms(),
                 live_share_ids: &[],
+                is_leave: false,
             };
             let sealed = seal_public_heartbeat(&lobby, &member, &fields).unwrap();
             // The actor's inbound reader opens it under the lobby key.
@@ -5429,7 +5435,7 @@ mod tests {
 
             // Past the TTL → reaped → empty roster.
             let past_ttl = t0 + t.ttl() + Duration::from_secs(1);
-            assert_eq!(t.reap(past_ttl).len(), 1, "the lone member ages out");
+            assert_eq!(t.reap(past_ttl, false).len(), 1, "the lone member ages out");
             assert!(roster_from_members(&t.members()).is_empty());
         }
 
@@ -5455,7 +5461,7 @@ mod tests {
             // predicate is "did reap remove anything?" — true here, so it pushes the
             // resulting (empty) roster.
             let past_ttl = t0 + t.ttl() + Duration::from_secs(1);
-            let reaped_any = !t.reap(past_ttl).is_empty();
+            let reaped_any = !t.reap(past_ttl, false).is_empty();
             assert!(reaped_any, "the member must have been reaped");
             pushes.push(roster_from_members(&t.members()));
 
@@ -5472,7 +5478,7 @@ mod tests {
             let t0 = Instant::now();
             t.apply(&heartbeat(b"pk", "fresh#eeee", 100), t0);
             // Well within the TTL → nothing reaped → no push.
-            let reaped_any = !t.reap(t0 + Duration::from_secs(1)).is_empty();
+            let reaped_any = !t.reap(t0 + Duration::from_secs(1), false).is_empty();
             assert!(
                 !reaped_any,
                 "a fresh member is not reaped, so no roster push"
@@ -5550,6 +5556,7 @@ mod tests {
                 sender_handle: "wandering-otter#abc",
                 sent_unix_ms: now_unix_ms(),
                 live_share_ids: &[],
+                is_leave: false,
             };
             let sealed = seal_circle_heartbeat(&circle_a, &member, &fields).unwrap();
 
@@ -5573,7 +5580,11 @@ mod tests {
 
             // Past the TTL → reaped → the circle roster empties (live-only).
             let past_ttl = t0 + t.ttl() + Duration::from_secs(1);
-            assert_eq!(t.reap(past_ttl).len(), 1, "the circle member ages out");
+            assert_eq!(
+                t.reap(past_ttl, false).len(),
+                1,
+                "the circle member ages out"
+            );
             assert!(roster_from_members(&t.members()).is_empty());
         }
 

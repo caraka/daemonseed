@@ -43,8 +43,9 @@
 //!   C96 GUI circle-detail name vectors;
 //!   C97 right-click clipboard context menu on text fields;
 //!   C98 GUI share-name persistence;
-//!   WB-ISC-9/10/13 pos + WB-ISC-11/12 neg — the WB-3 write scheduler, #159.)
-//! - 185 total
+//!   WB-ISC-9/10/13 pos + WB-ISC-11/12 neg — the WB-3 write scheduler, #159;
+//!   WB-ISC-3/4/5/6/7 pos + WB-ISC-1/2/8 neg — the WB-1 presence model, #159.)
+//! - 193 total
 //!
 //! Deliberately EXCLUDED from [`ISCS`] (and therefore from [`TOTAL`]) because
 //! they are not built: the deferred direct-messaging family
@@ -293,13 +294,23 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("WB-ISC-11", IscClass::Negative),
     ("WB-ISC-12", IscClass::Negative),
     ("WB-ISC-13", IscClass::Positive),
+    // WB-1 presence model (#159 Slice B). Anti: WB-ISC-1 (timing independence),
+    // WB-ISC-2 (cross-room), WB-ISC-8 (emission-free). Positive: WB-ISC-3/4/5/6/7.
+    ("WB-ISC-1", IscClass::Negative),
+    ("WB-ISC-2", IscClass::Negative),
+    ("WB-ISC-3", IscClass::Positive),
+    ("WB-ISC-4", IscClass::Positive),
+    ("WB-ISC-5", IscClass::Positive),
+    ("WB-ISC-6", IscClass::Positive),
+    ("WB-ISC-7", IscClass::Positive),
+    ("WB-ISC-8", IscClass::Negative),
 ];
 
 /// Total built, non-deferred ISCs tracked by this registry — the SINGLE source
 /// of truth for the coverage denominator, read live by `xtask isc-coverage`.
 /// Recount on every ISC add/remove (the `const _` assert below guards it
 /// against [`ISCS`]).
-pub const TOTAL: usize = 185;
+pub const TOTAL: usize = 193;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -471,10 +482,12 @@ mod tests {
         //                                  right-click clipboard context menu C97 pos, #67;
         //                                  GUI share-name persistence C98 pos, #41;
         //                                  WB-3 write scheduler WB-ISC-9/10/13 pos +
-        //                                  WB-ISC-11/12 neg, #159)
-        //   total   122 pos + 63 neg = 185
-        assert_eq!(pos, 122, "positive count drift");
-        assert_eq!(neg, 63, "negative count drift");
+        //                                  WB-ISC-11/12 neg, #159;
+        //                                  WB-1 presence model WB-ISC-3/4/5/6/7 pos +
+        //                                  WB-ISC-1/2/8 neg, #159)
+        //   total   127 pos + 66 neg = 193
+        assert_eq!(pos, 127, "positive count drift");
+        assert_eq!(neg, 66, "negative count drift");
     }
 
     /// COVERED is single-sourced and must agree with the per-milestone

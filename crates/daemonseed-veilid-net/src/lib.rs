@@ -124,7 +124,7 @@ mod rendezvous;
 pub mod schedule;
 pub mod share;
 
-pub use actor::{VeilidNet, VeilidNetHandle};
+pub use actor::{PresenceBoundary, VeilidNet, VeilidNetHandle};
 pub use aimd::AimdWindow;
 pub use config::VeilidNetConfig;
 pub use discovery::{

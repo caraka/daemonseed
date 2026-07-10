@@ -4,7 +4,7 @@
 //! separate stream the app/UI consumes.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -27,6 +27,45 @@ use crate::schedule::{
     WriteSchedulerHandle, WriteSink,
 };
 use crate::{discovery, identity, rendezvous, share};
+
+/// How a presence current-state write is classified in the WB-3 funnel (WB-1).
+/// The write itself is always a last-writer-wins current-state beacon at the
+/// member's slot; the boundary decides its priority class and whether it dominates
+/// (a leave tombstone), so the funnel protects join/leave with I3 dominance and
+/// paces keepalives under the non-chat cap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PresenceBoundary {
+    /// A periodic keepalive (WB-1.2) — class-4, last-writer-wins current-state.
+    Keepalive,
+    /// A session-boundary JOIN beacon (WB-1.1) published on subscribe — class-2,
+    /// current-state, so it rides the funnel's session-boundary priority.
+    Join,
+    /// A session-boundary LEAVE tombstone (WB-1.3) published on graceful close —
+    /// class-2 and non-coalescible-dominant (I3), so a queued keepalive can never
+    /// supersede it and resurrect a departed member.
+    Leave,
+}
+
+impl PresenceBoundary {
+    /// The funnel priority class + coalescing kind for this boundary, given the
+    /// member's stable slot `logical_id`.
+    fn classify(self, logical_id: String) -> (WriteClass, WriteKind) {
+        match self {
+            PresenceBoundary::Keepalive => (
+                WriteClass::Keepalive,
+                WriteKind::CurrentState { logical_id },
+            ),
+            PresenceBoundary::Join => (
+                WriteClass::SessionBoundary,
+                WriteKind::CurrentState { logical_id },
+            ),
+            PresenceBoundary::Leave => (
+                WriteClass::SessionBoundary,
+                WriteKind::Tombstone { logical_id },
+            ),
+        }
+    }
+}
 
 /// Close-flush budget handed to the write scheduler on graceful shutdown (WB-3.I7):
 /// pending chat writes + leave tombstones + share withdraws flush within this,
@@ -97,6 +136,10 @@ enum Command {
         owner_seed: [u8; 32],
         stable_id: String,
         sealed: Vec<u8>,
+        /// WB-1 presence classification (Keepalive / Join / Leave). The operator
+        /// MOTD path uses [`PresenceBoundary::Keepalive`] (a class-4 current-state
+        /// write, its previous behaviour).
+        boundary: PresenceBoundary,
         reply: oneshot::Sender<Result<()>>,
     },
     /// Re-run the one-shot backlog sweep on an already-subscribed rendezvous
@@ -169,6 +212,11 @@ enum Command {
 #[derive(Clone)]
 pub struct VeilidNetHandle {
     cmd_tx: mpsc::Sender<Command>,
+    /// The scheduler's most-recent non-chat enqueue-to-ack latency in millis — the
+    /// WB-1.10 / WB-ISC-5 congestion signal, read by the presence reaper to suspend
+    /// reaping while the local write funnel is backed up. `0` until the first
+    /// non-chat write completes.
+    write_latency: Arc<AtomicU64>,
 }
 
 impl VeilidNetHandle {
@@ -221,6 +269,16 @@ impl VeilidNetHandle {
     /// Shut the node down cleanly.
     pub async fn shutdown(&self) {
         let _ = self.send(|reply| Command::Shutdown { reply }).await;
+    }
+
+    /// The scheduler's most-recent non-chat enqueue-to-ack latency in millis (WB-1.10
+    /// congestion signal). The presence reaper compares it against
+    /// `daemonseed_core::presence::REAP_CONGESTION_THRESHOLD` and suspends reaping
+    /// while elevated (WB-ISC-5). A synchronous relaxed read — no command round-trip
+    /// — so the reap timer can consult it cheaply. `0` before the first non-chat
+    /// write completes (treated as calm).
+    pub fn last_write_latency_ms(&self) -> u64 {
+        self.write_latency.load(Ordering::Relaxed)
     }
 
     // ── Circles (Phase 2): shared-owner DFLT rendezvous + append-ring fan-out ──
@@ -432,12 +490,14 @@ impl VeilidNetHandle {
         owner_seed: [u8; 32],
         member_pubkey: &[u8],
         sealed: Vec<u8>,
+        boundary: PresenceBoundary,
     ) -> Result<()> {
         let stable_id = member_slot_id(member_pubkey);
         self.send(|reply| Command::PublishCurrentState {
             owner_seed,
             stable_id,
             sealed,
+            boundary,
             reply,
         })
         .await?
@@ -466,6 +526,7 @@ impl VeilidNetHandle {
             owner_seed,
             stable_id: slot_id.to_owned(),
             sealed: bytes,
+            boundary: PresenceBoundary::Keepalive,
             reply,
         })
         .await?
@@ -652,10 +713,27 @@ impl VeilidNet {
                 }
             }
         });
+        // Shared congestion probe (WB-1.10): the scheduler publishes each non-chat
+        // write's enqueue-to-ack latency here; the handle exposes it to the presence
+        // reaper. Created before the actor loop so both sides share the one Arc.
+        let write_latency = Arc::new(AtomicU64::new(0));
         tokio::spawn(actor_loop(
-            api, rc, cmd_rx, ev_tx, node_pub, shares, cmd_weak,
+            api,
+            rc,
+            cmd_rx,
+            ev_tx,
+            node_pub,
+            shares,
+            cmd_weak,
+            write_latency.clone(),
         ));
-        Ok((VeilidNetHandle { cmd_tx }, ev_rx))
+        Ok((
+            VeilidNetHandle {
+                cmd_tx,
+                write_latency,
+            },
+            ev_rx,
+        ))
     }
 }
 
@@ -663,6 +741,7 @@ impl VeilidNet {
 /// commands until `Shutdown` or the command channel closes. Holds an event
 /// sender (for background rendezvous sweeps), this node's pubkey (region
 /// assignment), and a per-rendezvous append-ring write cursor.
+#[allow(clippy::too_many_arguments)]
 async fn actor_loop(
     api: VeilidAPI,
     rc: RoutingContext,
@@ -671,6 +750,7 @@ async fn actor_loop(
     node_pub: [u8; 32],
     shares: Arc<Mutex<HashMap<String, share::ServedShare>>>,
     cmd_weak: mpsc::WeakSender<Command>,
+    write_latency: Arc<AtomicU64>,
 ) {
     // Cache of opened rendezvous records (owner seed → post-reopen key):
     // open_or_create costs a fresh ~6–10 s open per publish/subscribe, so once a
@@ -710,7 +790,7 @@ async fn actor_loop(
     // on the record's `record_lock`. The append-ring cursor lives in the sink because
     // only the write path touches it. The write commands below enqueue and return, so
     // a slow DHT set never parks this loop (#154 retired).
-    let sched: WriteSchedulerHandle<ProdWrite> = WriteScheduler::spawn(
+    let sched: WriteSchedulerHandle<ProdWrite> = WriteScheduler::spawn_with_probe(
         Arc::new(ProductionSink {
             api: api.clone(),
             rc: rc.clone(),
@@ -720,6 +800,7 @@ async fn actor_loop(
             record_locks: record_locks.clone(),
         }),
         SchedulerConfig::default(),
+        write_latency,
     );
 
     while let Some(cmd) = cmd_rx.recv().await {
@@ -780,21 +861,21 @@ async fn actor_loop(
                 owner_seed,
                 stable_id,
                 sealed,
+                boundary,
                 reply,
             } => {
-                // Current-state (presence beacon / operator MOTD) write — class-4
-                // keepalive (I1), last-writer-wins coalescible on its logical id (I3).
+                // Current-state presence / MOTD write. The WB-1 boundary sets the
+                // funnel class + coalescing kind (Slice B live callers): a keepalive
+                // is class-4 last-writer-wins; a join is class-2 session-boundary
+                // current-state; a leave is a class-2 non-coalescible tombstone that
+                // dominates any queued same-member keepalive (I3, no resurrection).
                 // Enqueue and return; the scheduler paces it under the non-chat cap so
-                // it never blocks chat traffic, and dispatches through the record's own
-                // `record_lock`. (Session-boundary join/leave + withdraw tombstone
-                // classification is supplied by the presence emit/ingest/reap loop —
-                // Slice B; the funnel already carries those classes.)
+                // it never blocks chat, and dispatches through the record's `record_lock`.
+                let (class, kind) = boundary.classify(stable_id.clone());
                 sched.enqueue(WriteRequest {
                     record: owner_seed,
-                    class: WriteClass::Keepalive,
-                    kind: WriteKind::CurrentState {
-                        logical_id: stable_id.clone(),
-                    },
+                    class,
+                    kind,
                     deadline: None,
                     item: ProdWrite::CurrentState {
                         owner_seed,

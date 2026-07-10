@@ -55,6 +55,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -280,9 +281,22 @@ impl WriteScheduler {
         sink: Arc<S>,
         cfg: SchedulerConfig,
     ) -> WriteSchedulerHandle<S::Item> {
+        Self::spawn_with_probe(sink, cfg, Arc::new(AtomicU64::new(0)))
+    }
+
+    /// As [`Self::spawn`], but publishes each non-chat write's enqueue-to-ack
+    /// latency (millis) into `latency_probe` on completion — the WB-1.10 /
+    /// WB-ISC-5 congestion signal the presence reaper reads to suspend reaping
+    /// while the local funnel is backed up. The probe is the SAME signal feeding
+    /// the AIMD pacer (I5); exposing it costs one relaxed store per write.
+    pub fn spawn_with_probe<S: WriteSink>(
+        sink: Arc<S>,
+        cfg: SchedulerConfig,
+        latency_probe: Arc<AtomicU64>,
+    ) -> WriteSchedulerHandle<S::Item> {
         let (tx, rx) = mpsc::unbounded_channel::<SchedMsg<S::Item>>();
         let (done_tx, done_rx) = mpsc::unbounded_channel::<Done>();
-        tokio::spawn(run(sink, cfg, rx, done_tx, done_rx));
+        tokio::spawn(run(sink, cfg, rx, done_tx, done_rx, latency_probe));
         WriteSchedulerHandle { tx }
     }
 }
@@ -297,17 +311,21 @@ struct State<D> {
     nonchat_in_flight: usize,
     /// AIMD pacer for the non-chat in-flight window (I5).
     window: AimdWindow,
+    /// Most-recent non-chat enqueue-to-ack latency in millis (WB-1.10 congestion
+    /// signal), published for the presence reaper via the handle.
+    latency_probe: Arc<AtomicU64>,
     seq: u64,
 }
 
 impl<D: Send + 'static> State<D> {
-    fn new(cfg: SchedulerConfig) -> Self {
+    fn new(cfg: SchedulerConfig, latency_probe: Arc<AtomicU64>) -> Self {
         Self {
             window: AimdWindow::new(cfg.nonchat_floor, cfg.nonchat_cap),
             cfg,
             queues: HashMap::new(),
             in_flight: HashSet::new(),
             nonchat_in_flight: 0,
+            latency_probe,
             seq: 0,
         }
     }
@@ -502,6 +520,11 @@ impl<D: Send + 'static> State<D> {
             // Feed the AIMD pacer: a slow enqueue-to-ack shrinks the non-chat window
             // (I5 rate-limits, not merely orders).
             self.window.observe(d.latency, self.cfg.latency_threshold);
+            // Publish the same signal for the presence reaper (WB-1.10 / WB-ISC-5).
+            self.latency_probe.store(
+                u64::try_from(d.latency.as_millis()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
         }
     }
 
@@ -595,8 +618,9 @@ async fn run<S: WriteSink>(
     mut rx: mpsc::UnboundedReceiver<SchedMsg<S::Item>>,
     done_tx: mpsc::UnboundedSender<Done>,
     mut done_rx: mpsc::UnboundedReceiver<Done>,
+    latency_probe: Arc<AtomicU64>,
 ) {
-    let mut st = State::<S::Item>::new(cfg);
+    let mut st = State::<S::Item>::new(cfg, latency_probe);
     loop {
         let wakeup = st.next_wakeup(Instant::now());
         let timer = async {
@@ -1183,6 +1207,94 @@ mod tests {
         assert!(
             motd.at <= session.at,
             "the deadline-expired write must dispatch no later than the higher class"
+        );
+    }
+
+    // ── WB-ISC-1 (Anti) ───────────────────────────────────────────────────────
+    /// Keepalive dispatch timing is statistically independent of other-class write
+    /// load: the keepalive dispatch-delay distribution under a heavy chat burst is
+    /// INDISTINGUISHABLE from the idle distribution (a KS distance of 0 — strictly
+    /// stronger than "within the jitter band"). Chat holds a reserved dispatch slot
+    /// and never counts against the non-chat cap (I4/I6), so chat load cannot shift
+    /// when a keepalive dispatches — there is no correlated bias for a metadata
+    /// observer to separate from zero-mean jitter.
+    #[tokio::test(start_paused = true)]
+    async fn wb_isc_1_keepalive_dispatch_timing_independent_of_chat_load() {
+        async fn keepalive_delays(with_chat_burst: bool) -> Vec<Duration> {
+            let sink = MockSink::new(Duration::from_millis(50));
+            let h = WriteScheduler::spawn(sink.clone(), SchedulerConfig::default());
+            let start = Instant::now();
+            // A fixed set of keepalives, one per record (enqueued first, so their
+            // seqs — and thus tie-break order — are identical in both runs).
+            for r in 0..10u8 {
+                let (rq, _rx) = req(
+                    rec_id(r),
+                    WriteClass::Keepalive,
+                    WriteKind::CurrentState {
+                        logical_id: format!("m-{r}"),
+                    },
+                    &format!("ka-{r}"),
+                );
+                h.enqueue(rq);
+            }
+            if with_chat_burst {
+                // A heavy chat burst across distinct records — the "user activity"
+                // whose load must NOT couple into keepalive timing.
+                for c in 0..40u8 {
+                    let (rq, _rx) = req(
+                        rec_id(100 + c),
+                        WriteClass::Chat,
+                        WriteKind::Ring,
+                        &format!("chat-{c}"),
+                    );
+                    h.enqueue(rq);
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let mut delays: Vec<Duration> = sink
+                .log()
+                .into_iter()
+                .filter(|r| r.label.starts_with("ka-"))
+                .map(|r| r.at.duration_since(start))
+                .collect();
+            delays.sort_unstable();
+            delays
+        }
+
+        let idle = keepalive_delays(false).await;
+        let burst = keepalive_delays(true).await;
+        assert_eq!(idle.len(), 10, "all keepalives dispatched");
+        assert_eq!(
+            idle, burst,
+            "chat-burst load shifted keepalive dispatch timing (KS distance ≠ 0):\n idle={idle:?}\nburst={burst:?}"
+        );
+    }
+
+    /// The latency probe (WB-1.10 congestion signal) reflects non-chat
+    /// enqueue-to-ack: after a slow non-chat write completes, the probe holds a
+    /// latency at/above the sink's simulated RTT; chat completions never write it.
+    #[tokio::test(start_paused = true)]
+    async fn latency_probe_tracks_nonchat_enqueue_to_ack() {
+        let sink = MockSink::new(Duration::from_secs(3));
+        let probe = Arc::new(AtomicU64::new(0));
+        let h = WriteScheduler::spawn_with_probe(
+            sink.clone(),
+            SchedulerConfig::default(),
+            probe.clone(),
+        );
+        let (rq, _rx) = req(
+            rec_id(1),
+            WriteClass::Keepalive,
+            WriteKind::CurrentState {
+                logical_id: "m".into(),
+            },
+            "ka",
+        );
+        h.enqueue(rq);
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert!(
+            probe.load(Ordering::Relaxed) >= 3000,
+            "probe must reflect the ≥3s enqueue-to-ack latency"
         );
     }
 }

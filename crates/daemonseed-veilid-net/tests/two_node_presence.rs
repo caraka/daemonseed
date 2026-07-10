@@ -33,7 +33,7 @@ use daemonseed_core::identity::keys::{derive_identity_keys, Identity, SignKeypai
 use daemonseed_core::identity::mnemonic::Mnemonic;
 use daemonseed_core::presence::{PresenceChange, PresenceTracker, HEARTBEAT_MISS_COUNT};
 use daemonseed_core::public_room::{derive_room_key, derive_room_presence_veilid_owner_seed};
-use daemonseed_veilid_net::{VeilidNet, VeilidNetConfig, VeilidNetEvent};
+use daemonseed_veilid_net::{PresenceBoundary, VeilidNet, VeilidNetConfig, VeilidNetEvent};
 
 /// A node config with a fresh daemonseed-derived node identity (D3), a distinct
 /// listen port, and its own storage dir — so two can coexist in one process.
@@ -111,9 +111,12 @@ async fn presence_roster_converges_on_a_second_node() {
                     sender_handle: a_handle,
                     sent_unix_ms: now_ms,
                     live_share_ids: &[],
+                    is_leave: false,
                 };
                 if let Ok(sealed) = seal_public_heartbeat(&room_key, &member_a, &fields) {
-                    let _ = a.publish_presence(seed, &pubkey, sealed).await;
+                    let _ = a
+                        .publish_presence(seed, &pubkey, sealed, PresenceBoundary::Keepalive)
+                        .await;
                 }
                 tokio::time::sleep(Duration::from_secs(3)).await;
             }

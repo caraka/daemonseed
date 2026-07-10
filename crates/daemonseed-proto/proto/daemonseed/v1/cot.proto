@@ -289,6 +289,20 @@ message MemberHeartbeat {
   // liveness rides the heartbeat and a full ShareAnnouncement fires only on
   // change (publish/unpublish) plus the late-join roll-call. Empty when the
   // member serves nothing. Bound into the provenance signature so the digest
-  // cannot be tampered or replayed across rooms.
+  // cannot be tampered or replayed across rooms. (Post-#153 the veilid presence
+  // path leaves this empty — share liveness rides the share record; the field
+  // stays for the relay path.)
   repeated string live_share_ids = 6;
+
+  // Whether this beacon is a LEAVE tombstone (WB-1.3): posted on graceful close
+  // to mark the member departed. A receiver applies leave-dominance (WB-1.5): it
+  // records this beacon's sent_unix_ms as the member's leave time and reaps the
+  // member, and thereafter no same-room write with sent_unix_ms <= that leave
+  // time re-freshens the departed member (a final chat racing the tombstone can
+  // no longer flicker it back onto the roster). A genuinely newer write (rejoin /
+  // post-leave message) re-freshens normally. Bound into the provenance signature
+  // so a relay cannot forge or strip a leave. The sealed frame is padded to one
+  // constant length (WB-ISC-6), so a key-free observer cannot distinguish a leave
+  // tombstone from a keepalive — only cessation is visible, as it must be.
+  bool is_leave = 7;
 }

@@ -40,6 +40,16 @@
 //! The heartbeat carries ONLY the beacon's own presence assertion (its handle,
 //! pubkey, and timestamp) — never a roster or a peer list (ISC-A-C38). The
 //! receiver-side liveness view that ages members out is [`crate::presence`].
+//!
+//! ## WB-1 fixed-length sealing + leave tombstones
+//!
+//! Every presence beacon — join, keepalive, and leave — seals to ONE constant
+//! plaintext length ([`HEARTBEAT_PADDED_PLAINTEXT_LEN`] → [`HEARTBEAT_SEALED_LEN`])
+//! before AES-256-GCM (WB-ISC-6): AEAD is length-preserving, so a variable payload
+//! would leak share count / handle length / a leave-vs-keepalive distinction to a
+//! key-free storage node. A leave tombstone sets [`HeartbeatFields::is_leave`] —
+//! bound into the provenance signature so a relay can neither forge nor strip it —
+//! and, being fixed-length, is byte-indistinguishable from a keepalive on the wire.
 
 use daemonseed_proto::v1 as wire;
 use oxicrypt_aes::{Aes256Key, ModeError, gcm_decrypt, gcm_encrypt};
@@ -66,6 +76,33 @@ pub const HEARTBEAT_AAD: &[u8] = b"daemonseed/presence/heartbeat/v1";
 /// signature daemonseed produces.
 pub const HEARTBEAT_PROVENANCE_DOMAIN: &[u8] = b"daemonseed/presence/heartbeat/v1";
 
+/// The ONE constant plaintext length every presence beacon seals to before
+/// AES-256-GCM (WB-ISC-6 / WB-1.4). AEAD is length-preserving, so a variable
+/// plaintext would make the sealed ciphertext length a plaintext-metadata oracle
+/// to any key-free storage node — leaking share count (`live_share_ids`), handle
+/// length, and (via a shorter tombstone) a clean session-end marker. Padding
+/// every beacon — join, keepalive, and leave tombstone — to one constant length
+/// closes that channel: the wire shows a jittered constant-rate stream of
+/// constant-size sealed values, and a leave is byte-indistinguishable from a
+/// keepalive (only cessation is visible).
+///
+/// The plaintext framing is `len(4, LE) ‖ protobuf ‖ zero-pad` filled to exactly
+/// this many bytes; [`open_heartbeat`] reads the length prefix and decodes only
+/// the real protobuf. Sized to hold the fixed ML-DSA-87 `sender_pubkey` (2592) +
+/// `signature` (4627) core — ~7.2 KiB — plus room, handle, and a bounded digest,
+/// with headroom. A message that will not fit is rejected
+/// ([`HeartbeatError::TooLarge`]); the caller drops that beacon and presence
+/// self-heals on the next cadence.
+pub const HEARTBEAT_PADDED_PLAINTEXT_LEN: usize = 8192;
+
+/// Bytes reserved at the front of the padded plaintext for the little-endian
+/// `u32` protobuf-length prefix.
+const HEARTBEAT_LEN_PREFIX: usize = 4;
+
+/// The constant sealed size on the wire — `nonce ‖ padded-ciphertext ‖ tag`. All
+/// presence beacons are exactly this many bytes (WB-ISC-6).
+pub const HEARTBEAT_SEALED_LEN: usize = NONCE_LEN + HEARTBEAT_PADDED_PLAINTEXT_LEN + TAG_LEN;
+
 /// The plaintext fields of a heartbeat the caller supplies; the member pubkey and
 /// the signature are filled in by [`seal_public_heartbeat`] /
 /// [`seal_circle_heartbeat`]. Borrowed so sealing never forces a clone.
@@ -79,8 +116,16 @@ pub struct HeartbeatFields<'a> {
     pub sent_unix_ms: i64,
     /// The share-ids this member is currently serving into this room — the
     /// live-share digest (#76). Empty when nothing is shared. Bound into the
-    /// provenance signature so it cannot be tampered.
+    /// provenance signature so it cannot be tampered. (The veilid presence path
+    /// leaves this empty post-#153 — share liveness rides the share record; the
+    /// relay path still populates it.)
     pub live_share_ids: &'a [String],
+    /// Whether this beacon is a LEAVE tombstone (WB-1.3) rather than a keepalive.
+    /// Posted on graceful close; a receiver records the leave time and applies
+    /// leave-dominance (WB-1.5). Bound into the provenance signature so a relay
+    /// cannot forge or strip it, and the sealed frame is padded to a constant
+    /// length so it is byte-indistinguishable from a keepalive on the wire.
+    pub is_leave: bool,
 }
 
 /// Build the domain-separated provenance signing input. Binds room, member
@@ -93,6 +138,7 @@ fn provenance_input(
     sender_pubkey: &[u8],
     sent_unix_ms: i64,
     live_share_ids: &[String],
+    is_leave: bool,
 ) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend_from_slice(HEARTBEAT_PROVENANCE_DOMAIN);
@@ -107,7 +153,45 @@ fn provenance_input(
     for id in live_share_ids {
         push_field(id.as_bytes());
     }
+    // Bind the leave marker so a relay cannot forge a leave (hiding a live member)
+    // or strip one (flickering a departed member back).
+    push_field(&[u8::from(is_leave)]);
     buf
+}
+
+/// Serialize `message` and frame it into a constant-length padded plaintext
+/// `len(4, LE) ‖ protobuf ‖ zero-pad`, exactly [`HEARTBEAT_PADDED_PLAINTEXT_LEN`]
+/// bytes (WB-ISC-6). Errors [`HeartbeatError::TooLarge`] if the protobuf plus its
+/// length prefix will not fit — the caller drops the beacon, presence self-heals.
+fn pad_plaintext(message: &wire::MemberHeartbeat) -> Result<Vec<u8>, HeartbeatError> {
+    let encoded = message.encode_to_vec();
+    if HEARTBEAT_LEN_PREFIX + encoded.len() > HEARTBEAT_PADDED_PLAINTEXT_LEN {
+        return Err(HeartbeatError::TooLarge {
+            got: HEARTBEAT_LEN_PREFIX + encoded.len(),
+            max: HEARTBEAT_PADDED_PLAINTEXT_LEN,
+        });
+    }
+    let mut buf = vec![0u8; HEARTBEAT_PADDED_PLAINTEXT_LEN];
+    buf[..HEARTBEAT_LEN_PREFIX].copy_from_slice(&(encoded.len() as u32).to_le_bytes());
+    buf[HEARTBEAT_LEN_PREFIX..HEARTBEAT_LEN_PREFIX + encoded.len()].copy_from_slice(&encoded);
+    Ok(buf)
+}
+
+/// Recover the protobuf bytes from a padded plaintext produced by
+/// [`pad_plaintext`]: read the little-endian `u32` length prefix and slice out
+/// exactly that many bytes. Rejects a corrupt/oversized length as
+/// [`HeartbeatError::Truncated`] (fail-closed).
+fn unpad_plaintext(padded: &[u8]) -> Result<&[u8], HeartbeatError> {
+    if padded.len() < HEARTBEAT_LEN_PREFIX {
+        return Err(HeartbeatError::Truncated);
+    }
+    let len =
+        u32::from_le_bytes(padded[..HEARTBEAT_LEN_PREFIX].try_into().expect("4 bytes")) as usize;
+    let end = HEARTBEAT_LEN_PREFIX
+        .checked_add(len)
+        .filter(|e| *e <= padded.len())
+        .ok_or(HeartbeatError::Truncated)?;
+    Ok(&padded[HEARTBEAT_LEN_PREFIX..end])
 }
 
 /// Seal a heartbeat for a PUBLIC room: SELF-SIGN it for provenance (ISC-C57),
@@ -147,6 +231,7 @@ fn seal_heartbeat_with(
         &sender_pubkey,
         fields.sent_unix_ms,
         fields.live_share_ids,
+        fields.is_leave,
     );
     let signature = member
         .sign(&signing_input)
@@ -160,13 +245,17 @@ fn seal_heartbeat_with(
         sent_unix_ms: fields.sent_unix_ms,
         signature,
         live_share_ids: fields.live_share_ids.to_vec(),
+        is_leave: fields.is_leave,
     };
 
     let aes = Aes256Key::new(key_bytes).map_err(HeartbeatError::KeyInit)?;
     let mut nonce = [0u8; NONCE_LEN];
     getrandom::fill(&mut nonce).map_err(HeartbeatError::EntropySource)?;
 
-    let mut plaintext = message.encode_to_vec();
+    // Fixed-length padding (WB-ISC-6): frame `len(4, LE) ‖ protobuf ‖ zeros` to
+    // exactly HEARTBEAT_PADDED_PLAINTEXT_LEN so every beacon — join, keepalive,
+    // and leave — seals to one constant size and ciphertext length leaks nothing.
+    let mut plaintext = pad_plaintext(&message)?;
     let mut ciphertext = vec![0u8; plaintext.len()];
     let mut tag = [0u8; TAG_LEN];
     let result = gcm_encrypt(
@@ -223,9 +312,11 @@ pub fn open_heartbeat<K: AeadKey256>(
         },
     )?;
 
-    let decoded = wire::MemberHeartbeat::decode(plaintext.as_slice());
+    // Strip the fixed-length padding (WB-ISC-6) before decoding.
+    let decoded = unpad_plaintext(&plaintext)
+        .and_then(|pb| wire::MemberHeartbeat::decode(pb).map_err(HeartbeatError::Decode));
     plaintext.zeroize();
-    let message = decoded.map_err(HeartbeatError::Decode)?;
+    let message = decoded?;
 
     // Verify the self-signed provenance before returning (ISC-C57).
     let pubkey: &[u8; ml_dsa::PK_LEN] = message
@@ -243,6 +334,7 @@ pub fn open_heartbeat<K: AeadKey256>(
         &message.sender_pubkey,
         message.sent_unix_ms,
         &message.live_share_ids,
+        message.is_leave,
     );
     verify_signature(pubkey, &signing_input, signature).map_err(|_| HeartbeatError::Provenance)?;
 
@@ -261,8 +353,18 @@ pub enum HeartbeatError {
     /// AEAD authentication failed (wrong key, tampered ciphertext, swapped nonce,
     /// or wrong AAD). Carries no sub-cause.
     Authentication,
-    /// The sealed buffer is shorter than `nonce ‖ tag`.
+    /// The sealed buffer is shorter than `nonce ‖ tag`, or a padded plaintext
+    /// carried a corrupt/oversized length prefix.
     Truncated,
+    /// The message plus its length prefix exceeds
+    /// [`HEARTBEAT_PADDED_PLAINTEXT_LEN`]; it cannot be sealed at the constant
+    /// presence length (WB-ISC-6).
+    TooLarge {
+        /// Bytes the framed plaintext would need.
+        got: usize,
+        /// The fixed budget.
+        max: usize,
+    },
     /// The decrypted bytes did not decode as a [`wire::MemberHeartbeat`].
     Decode(prost::DecodeError),
     /// Signing the provenance input failed (crypto module not operational).
@@ -280,6 +382,9 @@ impl core::fmt::Display for HeartbeatError {
             Self::Aead(e) => write!(f, "heartbeat AEAD error: {e:?}"),
             Self::Authentication => write!(f, "heartbeat authentication failed"),
             Self::Truncated => write!(f, "heartbeat envelope is truncated"),
+            Self::TooLarge { got, max } => {
+                write!(f, "heartbeat plaintext {got} exceeds constant length {max}")
+            }
             Self::Decode(e) => write!(f, "heartbeat decode failed: {e}"),
             Self::Sign => write!(f, "heartbeat provenance signing failed"),
             Self::Provenance => write!(f, "heartbeat provenance verification failed"),
@@ -308,6 +413,7 @@ mod tests {
             sender_handle: handle,
             sent_unix_ms: 1_700_000_000_000,
             live_share_ids: &[],
+            is_leave: false,
         }
     }
 
@@ -369,6 +475,7 @@ mod tests {
             sender_handle: "a#000000000000",
             sent_unix_ms: 5,
             live_share_ids: &ids,
+            is_leave: false,
         };
         let sealed = seal_public_heartbeat(&key, &me, &f).unwrap();
         let opened = open_heartbeat(&key, &sealed).unwrap();
@@ -381,7 +488,7 @@ mod tests {
     fn tampered_digest_rejected() {
         let key = room_key(DEFAULT_ROOM);
         let me = member(21);
-        let signing_input = provenance_input(DEFAULT_ROOM, me.public_key().as_ref(), 1, &[]);
+        let signing_input = provenance_input(DEFAULT_ROOM, me.public_key().as_ref(), 1, &[], false);
         let signature = me.sign(&signing_input).unwrap().to_vec();
         let forged = wire::MemberHeartbeat {
             room: DEFAULT_ROOM.to_owned(),
@@ -390,11 +497,12 @@ mod tests {
             sent_unix_ms: 1,
             signature,
             live_share_ids: vec!["injected".to_owned()], // not covered by the signature
+            is_leave: false,
         };
         let aes = Aes256Key::new(key.as_bytes()).unwrap();
         let mut nonce = [0u8; NONCE_LEN];
         getrandom::fill(&mut nonce).unwrap();
-        let plaintext = forged.encode_to_vec();
+        let plaintext = pad_plaintext(&forged).unwrap();
         let mut ct = vec![0u8; plaintext.len()];
         let mut tag = [0u8; TAG_LEN];
         gcm_encrypt(&aes, &nonce, HEARTBEAT_AAD, &plaintext, &mut ct, &mut tag).unwrap();
@@ -416,7 +524,7 @@ mod tests {
         let key = room_key(DEFAULT_ROOM);
         let me = member(11);
         // Sign for room "other", then ship a message claiming DEFAULT_ROOM.
-        let signing_input = provenance_input("other", me.public_key().as_ref(), 1, &[]);
+        let signing_input = provenance_input("other", me.public_key().as_ref(), 1, &[], false);
         let signature = me.sign(&signing_input).unwrap().to_vec();
         let forged = wire::MemberHeartbeat {
             room: DEFAULT_ROOM.to_owned(), // signature does not cover this room
@@ -425,11 +533,12 @@ mod tests {
             sent_unix_ms: 1,
             signature,
             live_share_ids: vec![],
+            is_leave: false,
         };
         let aes = Aes256Key::new(key.as_bytes()).unwrap();
         let mut nonce = [0u8; NONCE_LEN];
         getrandom::fill(&mut nonce).unwrap();
-        let plaintext = forged.encode_to_vec();
+        let plaintext = pad_plaintext(&forged).unwrap();
         let mut ct = vec![0u8; plaintext.len()];
         let mut tag = [0u8; TAG_LEN];
         gcm_encrypt(&aes, &nonce, HEARTBEAT_AAD, &plaintext, &mut ct, &mut tag).unwrap();
@@ -497,6 +606,137 @@ mod tests {
         match open_heartbeat(&public, &sealed) {
             Err(HeartbeatError::Authentication) => {}
             other => panic!("expected Authentication, got {other:?}"),
+        }
+    }
+
+    /// WB-ISC-6: every presence-class write — join, keepalive, AND leave tombstone,
+    /// across every payload shape (short handle / long handle / empty vs many
+    /// share ids) — seals to ONE constant byte length. Ciphertext length is
+    /// therefore not a share-count / handle-length / leave-vs-keepalive oracle to a
+    /// key-free storage node.
+    #[test]
+    fn wb_isc_6_all_presence_writes_seal_to_one_constant_length() {
+        let key = room_key(DEFAULT_ROOM);
+        let me = member(30);
+        let many: Vec<String> = (0..12).map(|i| format!("share-{i:04x}")).collect();
+        let shapes: Vec<HeartbeatFields<'_>> = vec![
+            // join (a keepalive published at subscribe) — empty digest, short handle
+            HeartbeatFields {
+                room: DEFAULT_ROOM,
+                sender_handle: "a#000000000000",
+                sent_unix_ms: 1,
+                live_share_ids: &[],
+                is_leave: false,
+            },
+            // keepalive — long handle + many share ids
+            HeartbeatFields {
+                room: DEFAULT_ROOM,
+                sender_handle: "a-considerably-longer-display-handle#abcdefabcdef",
+                sent_unix_ms: 2,
+                live_share_ids: &many,
+                is_leave: false,
+            },
+            // leave tombstone — empty digest, short handle
+            HeartbeatFields {
+                room: DEFAULT_ROOM,
+                sender_handle: "z#ffffffffffff",
+                sent_unix_ms: 3,
+                live_share_ids: &[],
+                is_leave: true,
+            },
+        ];
+        let lengths: Vec<usize> = shapes
+            .iter()
+            .map(|f| seal_public_heartbeat(&key, &me, f).unwrap().len())
+            .collect();
+        for (i, len) in lengths.iter().enumerate() {
+            assert_eq!(
+                *len, HEARTBEAT_SEALED_LEN,
+                "shape {i} sealed to {len}, not the constant {HEARTBEAT_SEALED_LEN}"
+            );
+        }
+        assert!(
+            lengths.windows(2).all(|w| w[0] == w[1]),
+            "presence writes must all share one length: {lengths:?}"
+        );
+    }
+
+    /// A leave tombstone round-trips: `is_leave` survives sealing and its
+    /// provenance verifies (the receiver can trust the leave marker).
+    #[test]
+    fn leave_tombstone_round_trips_and_verifies() {
+        let key = room_key(DEFAULT_ROOM);
+        let me = member(31);
+        let f = HeartbeatFields {
+            room: DEFAULT_ROOM,
+            sender_handle: "a#000000000000",
+            sent_unix_ms: 9,
+            live_share_ids: &[],
+            is_leave: true,
+        };
+        let sealed = seal_public_heartbeat(&key, &me, &f).unwrap();
+        let opened = open_heartbeat(&key, &sealed).unwrap();
+        assert!(
+            opened.is_leave,
+            "the leave marker must survive the round-trip"
+        );
+        assert_eq!(opened.sent_unix_ms, 9);
+    }
+
+    /// A relay flipping `is_leave` (stripping a leave to keep a departed member on
+    /// the roster, or forging one to hide a live member) fails provenance — the
+    /// marker is bound into the signature.
+    #[test]
+    fn flipped_leave_flag_fails_provenance() {
+        let key = room_key(DEFAULT_ROOM);
+        let me = member(32);
+        // Sign as a keepalive (is_leave=false) but ship claiming a leave.
+        let signing_input = provenance_input(DEFAULT_ROOM, me.public_key().as_ref(), 1, &[], false);
+        let signature = me.sign(&signing_input).unwrap().to_vec();
+        let forged = wire::MemberHeartbeat {
+            room: DEFAULT_ROOM.to_owned(),
+            sender_pubkey: me.public_key().to_vec(),
+            sender_handle: "a#000000000000".to_owned(),
+            sent_unix_ms: 1,
+            signature,
+            live_share_ids: vec![],
+            is_leave: true, // signature covers false
+        };
+        let aes = Aes256Key::new(key.as_bytes()).unwrap();
+        let mut nonce = [0u8; NONCE_LEN];
+        getrandom::fill(&mut nonce).unwrap();
+        let plaintext = pad_plaintext(&forged).unwrap();
+        let mut ct = vec![0u8; plaintext.len()];
+        let mut tag = [0u8; TAG_LEN];
+        gcm_encrypt(&aes, &nonce, HEARTBEAT_AAD, &plaintext, &mut ct, &mut tag).unwrap();
+        let mut sealed = Vec::new();
+        sealed.extend_from_slice(&nonce);
+        sealed.extend_from_slice(&ct);
+        sealed.extend_from_slice(&tag);
+        match open_heartbeat(&key, &sealed) {
+            Err(HeartbeatError::Provenance) => {}
+            other => panic!("expected Provenance rejection, got {other:?}"),
+        }
+    }
+
+    /// A message that will not fit the constant padded length is rejected rather
+    /// than silently sealing to a longer frame (which would break WB-ISC-6). The
+    /// digest is the only unbounded field, so an absurd one overflows.
+    #[test]
+    fn oversized_payload_rejected_as_too_large() {
+        let key = room_key(DEFAULT_ROOM);
+        let me = member(33);
+        let huge: Vec<String> = (0..4096).map(|i| format!("id-{i}")).collect();
+        let f = HeartbeatFields {
+            room: DEFAULT_ROOM,
+            sender_handle: "a#000000000000",
+            sent_unix_ms: 1,
+            live_share_ids: &huge,
+            is_leave: false,
+        };
+        match seal_public_heartbeat(&key, &me, &f) {
+            Err(HeartbeatError::TooLarge { .. }) => {}
+            other => panic!("expected TooLarge, got {other:?}"),
         }
     }
 }

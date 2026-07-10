@@ -70,7 +70,8 @@ use daemonseed_core::heartbeat::{
 use daemonseed_core::identity::keys::{Identity, SignKeypair, derive_identity_keys};
 use daemonseed_core::identity::mnemonic::Mnemonic;
 use daemonseed_core::presence::{
-    HEARTBEAT_MISS_COUNT, PresenceTracker, beacon_is_fresh, next_heartbeat_interval,
+    PRESENCE_TTL, PresenceChange, PresenceTracker, REAP_CONGESTION_THRESHOLD, beacon_is_fresh,
+    next_keepalive_interval,
 };
 use daemonseed_core::public_room::{
     DEFAULT_ROOM, PublicRoomKey, derive_room_key, derive_room_presence_veilid_owner_seed,
@@ -89,8 +90,8 @@ use daemonseed_core::storage::cas::ChunkAddr;
 use daemonseed_core::storage::fetched::rebase_to_selection_root;
 use daemonseed_proto::v1 as wire;
 use daemonseed_veilid_net::{
-    AimdWindow, DiscoveryEnvelope, VeilidNet, VeilidNetConfig, VeilidNetError, VeilidNetEvent,
-    VeilidNetHandle, verify_route_advert,
+    AimdWindow, DiscoveryEnvelope, PresenceBoundary, VeilidNet, VeilidNetConfig, VeilidNetError,
+    VeilidNetEvent, VeilidNetHandle, verify_route_advert,
 };
 use prost::Message as _;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -366,12 +367,12 @@ pub async fn veilid_net_actor(
     // #141: re-publish operator MOTD/announcements on a slow cadence so their DHT
     // values do not expire (operator content is otherwise written only on post).
     let mut operator_keepalive = tokio::time::interval(OPERATOR_KEEPALIVE_INTERVAL);
-    // Presence emit + reap clock (#74): a jittered [15,20]s beacon into the lobby
-    // presence record (when joined) that also reaps the roster on each fire. A
+    // Presence keepalive + reap clock (WB-1.2): a jittered [180,220]s keepalive into
+    // each joined room's presence record that also reaps the roster on each fire. A
     // self-rescheduling `Sleep` (not a fixed `interval`) so each tick draws a fresh
-    // jittered deadline — de-syncing daemons and keeping the cadence off a fixed
-    // period (ISC-A-S2 traffic shape).
-    let heartbeat = tokio::time::sleep(veilid_presence_interval());
+    // jittered deadline — no fixed-period signature, no cross-record phase-lock
+    // (WB-3.I6), and the cadence takes NO input from user activity (WB-0).
+    let heartbeat = tokio::time::sleep(next_keepalive_interval());
     tokio::pin!(heartbeat);
 
     loop {
@@ -438,43 +439,105 @@ pub async fn veilid_net_actor(
                     });
                 }
             }
-            // Emit one lobby presence beacon + reap the roster, then re-arm the timer
-            // with a fresh jittered deadline.
+            // Emit one presence keepalive per joined room + reap the rosters, then
+            // re-arm the timer with a fresh jittered deadline (WB-1.2).
             () = heartbeat.as_mut() => {
                 emit_and_reap_presence(&evt_tx, &net, &my_handle, &mut shares, &mut circles);
                 heartbeat
                     .as_mut()
-                    .reset(tokio::time::Instant::now() + veilid_presence_interval());
+                    .reset(tokio::time::Instant::now() + next_keepalive_interval());
             }
         }
     }
 }
 
-/// The jittered lobby presence-beacon interval — [50, 55]s (Tier-1 write-budget
-/// tuning, 2026-07-09), well above the ~14.7s cross-node DHT watch floor. Widened
-/// from [15, 20]s: per-member ~17s beacons were the dominant Veilid DHT writer and
-/// saturated the write path (set_dht_value backing up to minutes → presence
-/// flicker-reap and starved chat / share-advert refresh), so slowing the beacon
-/// ~3x cuts the biggest write source. Reuses the core [10, 15]s jittered draw
-/// (CSPRNG jitter → de-sync + no fixed period, ISC-A-S2, shared with the relay
-/// path) plus a 40s offset. Re-test tunable; the structural fix (presence-as-reads)
-/// is the veilid-write-budget design.
-fn veilid_presence_interval() -> Duration {
-    next_heartbeat_interval() + Duration::from_secs(40)
+/// Seal and publish ONE presence beacon for a PUBLIC room (lobby) — a WB-1 join,
+/// keepalive, or leave, per `boundary` — spawning the DHT write off the actor loop
+/// (the #128 D-0b pattern: `publish_presence` awaits an ack that can take seconds).
+/// Fixed-length (WB-ISC-6) with an EMPTY digest: share liveness rides the share
+/// record post-#153, so the veilid presence beacon carries no `live_share_ids` (its
+/// removal also keeps the padded payload well inside the constant length). A seal /
+/// transport failure is non-fatal — presence self-heals on the next cadence.
+fn spawn_public_beacon(
+    handle: &VeilidNetHandle,
+    signing: &SignKeypair,
+    room_key: &PublicRoomKey,
+    presence_seed: [u8; 32],
+    my_handle: &str,
+    boundary: PresenceBoundary,
+) {
+    let fields = HeartbeatFields {
+        room: DEFAULT_ROOM,
+        sender_handle: my_handle,
+        sent_unix_ms: now_unix_ms(),
+        live_share_ids: &[],
+        is_leave: matches!(boundary, PresenceBoundary::Leave),
+    };
+    if let Ok(sealed) = seal_public_heartbeat(room_key, signing, &fields) {
+        let handle = handle.clone();
+        let pubkey = signing.public_key().to_vec();
+        tokio::spawn(async move {
+            if let Err(e) = handle
+                .publish_presence(presence_seed, &pubkey, sealed, boundary)
+                .await
+            {
+                daemonseed_veilid_net::vtrace!("gui presence: {boundary:?} emit failed: {e}");
+            }
+        });
+    }
 }
 
-/// Emit one sealed lobby presence beacon (#74) to the presence record, then `reap`
-/// the lobby roster so members past their TTL age out (the timer is the reap clock
-/// too). A missing identity/lobby, a seal failure, or a closed transport is
-/// non-fatal — presence self-heals on the next tick. A reap that changed the set
-/// pushes a fresh (possibly empty) Roster. Lobby-only; circle presence is #77.
-/// Mirrors the relay `Actor::handle_emit_heartbeat`.
-///
-/// The DHT publish is **spawned off the actor loop** (like `send_room` / `send_circle`,
-/// the #128 D-0b pattern): `handle.publish_presence` awaits the write's ack, which
-/// can take seconds, so awaiting it inline in the select arm would stall the loop —
-/// no inbound chat rendered, no commands serviced — every ~15–20 s. The reap is a
-/// fast in-memory op and stays inline.
+/// Seal and publish ONE presence beacon for a CIRCLE (WB-1) — as
+/// [`spawn_public_beacon`] but sealed under the circle `cot_key` and posted to the
+/// circle's presence sibling record.
+fn spawn_circle_beacon(
+    handle: &VeilidNetHandle,
+    signing: &SignKeypair,
+    circle: &VeilidCircle,
+    my_handle: &str,
+    boundary: PresenceBoundary,
+) {
+    let label = default_circle_label(&circle_fingerprint(&circle.cot_key));
+    let fields = HeartbeatFields {
+        room: &label,
+        sender_handle: my_handle,
+        sent_unix_ms: now_unix_ms(),
+        live_share_ids: &[],
+        is_leave: matches!(boundary, PresenceBoundary::Leave),
+    };
+    if let Ok(sealed) = seal_circle_heartbeat(&circle.cot_key, signing, &fields) {
+        let handle = handle.clone();
+        let seed = circle.presence_owner_seed;
+        let pubkey = signing.public_key().to_vec();
+        tokio::spawn(async move {
+            if let Err(e) = handle
+                .publish_presence(seed, &pubkey, sealed, boundary)
+                .await
+            {
+                daemonseed_veilid_net::vtrace!(
+                    "gui circle presence: {boundary:?} emit failed: {e}"
+                );
+            }
+        });
+    }
+}
+
+/// Whether the local write funnel is congested (WB-1.10 / WB-ISC-5): the
+/// scheduler's most-recent non-chat enqueue-to-ack latency is at/above
+/// [`REAP_CONGESTION_THRESHOLD`]. While congested, the presence reaper is suspended
+/// so a keepalive merely queued in the funnel does not false-reap its member.
+fn write_congested(net: &Option<VeilidNetHandle>) -> bool {
+    net.as_ref()
+        .map(|h| h.last_write_latency_ms() >= REAP_CONGESTION_THRESHOLD.as_millis() as u64)
+        .unwrap_or(false)
+}
+
+/// Emit one sealed presence KEEPALIVE (WB-1.2) per joined room to its presence
+/// record, then `reap` each roster so members past their TTL age out — but only in
+/// calm (WB-1.10): while the local write funnel is congested, reaping is suspended.
+/// A missing identity/lobby, a seal failure, or a closed transport is non-fatal —
+/// presence self-heals on the next tick. A reap that changed a set pushes a fresh
+/// (possibly empty) Roster.
 fn emit_and_reap_presence(
     evt_tx: &UnboundedSender<NetEvent>,
     net: &Option<VeilidNetHandle>,
@@ -482,35 +545,28 @@ fn emit_and_reap_presence(
     shares: &mut ShareState,
     circles: &mut [VeilidCircle],
 ) {
-    // EMIT — needs an identity to self-sign with (ISC-C57), a live transport, and a
-    // subscribed lobby. The beacon carries this node's served-share digest (#76).
-    // Seal on the loop (fast, in-memory), then spawn the DHT write.
+    // WB-1.10: suspend reaping while the local funnel is backed up (a keepalive may
+    // simply be queued). Sampled once per tick for the whole reap pass.
+    let congested = write_congested(net);
+    // EMIT the lobby keepalive — needs an identity to self-sign with (ISC-C57), a
+    // live transport, and a subscribed lobby.
     if let (Some(handle), Some(signing)) = (net.as_ref(), shares.signing.clone())
         && let Some(lobby) = shares.lobby.as_ref()
     {
-        let own_share_ids: Vec<String> = shares.own.iter().map(|s| s.share_id.clone()).collect();
-        let fields = HeartbeatFields {
-            room: DEFAULT_ROOM,
-            sender_handle: my_handle,
-            sent_unix_ms: now_unix_ms(),
-            live_share_ids: &own_share_ids,
-        };
-        if let Ok(sealed) = seal_public_heartbeat(&lobby.room_key, &signing, &fields) {
-            let handle = handle.clone();
-            let seed = lobby.presence_owner_seed;
-            let pubkey = signing.public_key().to_vec();
-            tokio::spawn(async move {
-                if let Err(e) = handle.publish_presence(seed, &pubkey, sealed).await {
-                    daemonseed_veilid_net::vtrace!("gui presence: beacon emit failed: {e}");
-                }
-            });
-        }
+        spawn_public_beacon(
+            handle,
+            &signing,
+            &lobby.room_key,
+            lobby.presence_owner_seed,
+            my_handle,
+            PresenceBoundary::Keepalive,
+        );
     }
-    // REAP on the same tick — the timer is the reap clock. Push a fresh roster only
-    // when a reap actually removed someone (a reap-to-empty still pushes an empty
-    // roster so the UI clears).
+    // REAP the lobby on the same tick — the timer is the reap clock. Push a fresh
+    // roster only when a reap actually removed someone (a reap-to-empty still pushes
+    // an empty roster so the UI clears).
     if let Some(lobby) = shares.lobby.as_mut()
-        && !lobby.presence.reap(Instant::now()).is_empty()
+        && !lobby.presence.reap(Instant::now(), congested).is_empty()
     {
         let entries = roster_from_members(&lobby.presence.members());
         let _ = evt_tx.send(NetEvent::Roster {
@@ -519,43 +575,25 @@ fn emit_and_reap_presence(
         });
     }
 
-    // ── Per-circle presence (#77) ──
-    // One beacon per joined circle, sealed under that circle's `cot_key` and
-    // published to that circle's presence sibling record. Mirrors the lobby emit
-    // above + the relay `Actor::handle_emit_heartbeat` circle loop. `room` is the
-    // circle's deterministic client-local label (provenance-only — the beacon is
-    // self-verifying; routing is by which circle's key opened it, not the label).
-    // No circle-share digest yet (#76): an empty `live_share_ids`. Skip entirely
-    // (no keypair clone) when no circles are joined.
+    // ── Per-circle presence (#77) — one keepalive per joined circle. ──
     if !circles.is_empty()
         && let (Some(handle), Some(signing)) = (net.as_ref(), shares.signing.clone())
     {
-        let sent_unix_ms = now_unix_ms();
         for circle in circles.iter() {
-            let label = default_circle_label(&circle_fingerprint(&circle.cot_key));
-            let fields = HeartbeatFields {
-                room: &label,
-                sender_handle: my_handle,
-                sent_unix_ms,
-                live_share_ids: &[],
-            };
-            if let Ok(sealed) = seal_circle_heartbeat(&circle.cot_key, &signing, &fields) {
-                let handle = handle.clone();
-                let seed = circle.presence_owner_seed;
-                let pubkey = signing.public_key().to_vec();
-                tokio::spawn(async move {
-                    if let Err(e) = handle.publish_presence(seed, &pubkey, sealed).await {
-                        daemonseed_veilid_net::vtrace!("gui circle presence: emit failed: {e}");
-                    }
-                });
-            }
+            spawn_circle_beacon(
+                handle,
+                &signing,
+                circle,
+                my_handle,
+                PresenceBoundary::Keepalive,
+            );
         }
     }
-    // Reap each circle's tracker on the same tick; push a fresh (possibly empty)
-    // roster tagged with that circle for any tracker a reap changed.
+    // Reap each circle's tracker on the same tick (in calm); push a fresh (possibly
+    // empty) roster tagged with that circle for any tracker a reap changed.
     let now = Instant::now();
     for circle in circles.iter_mut() {
-        if !circle.presence.reap(now).is_empty() {
+        if !circle.presence.reap(now, congested).is_empty() {
             let entries = roster_from_members(&circle.presence.members());
             let _ = evt_tx.send(NetEvent::Roster {
                 circle_id: Some(circle.circle_id),
@@ -604,7 +642,7 @@ async fn handle_command(
             if net.is_some() {
                 // Subscribe the world-derivable lobby so share announcements fold
                 // into the catalog as they arrive (Phase 3 discovery).
-                subscribe_lobby(shares, net, evt_tx).await;
+                subscribe_lobby(shares, net, evt_tx, my_handle).await;
                 // Subscribe the operator announce/MOTD record (Phase 4 A-c) so MOTD +
                 // announcement items fold in as they arrive.
                 subscribe_operator_space(shares, net).await;
@@ -618,7 +656,16 @@ async fn handle_command(
                 // attach, so a circle restored into the UI is actually joined on the
                 // transport (else SendCircle finds known=[] → "join before sending").
                 for (circle_id, phrase) in rejoin_circles {
-                    join_circle(circle_id, &phrase, evt_tx, net, circles).await;
+                    join_circle(
+                        circle_id,
+                        &phrase,
+                        evt_tx,
+                        net,
+                        circles,
+                        my_handle,
+                        shares.signing.clone(),
+                    )
+                    .await;
                 }
                 // #108: relay-parity — re-publish persisted shares on connect, exactly
                 // like the circle re-join above (the relay path does this; the Veilid
@@ -691,7 +738,16 @@ async fn handle_command(
             *my_handle = handle;
         }
         NetCommand::JoinCircle { circle_id, phrase } => {
-            join_circle(circle_id, &phrase, evt_tx, net, circles).await;
+            join_circle(
+                circle_id,
+                &phrase,
+                evt_tx,
+                net,
+                circles,
+                my_handle,
+                shares.signing.clone(),
+            )
+            .await;
         }
         NetCommand::SendCircle { circle_id, text } => {
             send_circle(
@@ -724,6 +780,33 @@ async fn handle_command(
             // the close path can briefly wait for these to reach the network.
             for s in shares.own.clone() {
                 unpublish_share(shares, evt_tx, net, &s.share_id).await;
+            }
+            // WB-1.3: publish one LEAVE tombstone per joined room inside the same
+            // close budget (the #121 pattern). The funnel's I3 dominance keeps a
+            // queued keepalive from superseding it, so peers see the member depart
+            // immediately rather than aging out at the ~600s TTL. The tombstone is
+            // byte-identical to a keepalive on the wire (WB-ISC-6); only in-room
+            // members decrypt the leave marker.
+            if let (Some(handle), Some(signing)) = (net.as_ref(), shares.signing.clone()) {
+                if let Some(lobby) = shares.lobby.as_ref() {
+                    spawn_public_beacon(
+                        handle,
+                        &signing,
+                        &lobby.room_key,
+                        lobby.presence_owner_seed,
+                        my_handle,
+                        PresenceBoundary::Leave,
+                    );
+                }
+                for circle in circles.iter() {
+                    spawn_circle_beacon(
+                        handle,
+                        &signing,
+                        circle,
+                        my_handle,
+                        PresenceBoundary::Leave,
+                    );
+                }
             }
             let _ = ack.send(());
         }
@@ -890,6 +973,7 @@ async fn subscribe_lobby(
     shares: &mut ShareState,
     net: &Option<VeilidNetHandle>,
     evt_tx: &UnboundedSender<NetEvent>,
+    my_handle: &str,
 ) {
     if shares.lobby.is_some() {
         return;
@@ -952,10 +1036,23 @@ async fn subscribe_lobby(
         owner_seed,
         share_owner_seed,
         presence_owner_seed,
-        // TTL = 20s × 3 misses = 60s, sized to the 15–20s emit band (P2 ~45–60s
-        // bias-to-forgiveness window). A brief wobble never reaps a live member.
-        presence: PresenceTracker::with_cadence(Duration::from_secs(20), HEARTBEAT_MISS_COUNT),
+        // WB-1.9: TTL 600s + read-side fold; the crash/network-loss backstop only —
+        // a graceful close disappears immediately via the leave tombstone.
+        presence: PresenceTracker::for_room(DEFAULT_ROOM, PRESENCE_TTL),
     });
+    // WB-1.1: publish one JOIN beacon (a session-boundary current-state write) so
+    // the roster shows this member within the connect window, not a keepalive
+    // interval later.
+    if let (Some(signing), Some(lobby)) = (shares.signing.clone(), shares.lobby.as_ref()) {
+        spawn_public_beacon(
+            handle,
+            &signing,
+            &lobby.room_key,
+            lobby.presence_owner_seed,
+            my_handle,
+            PresenceBoundary::Join,
+        );
+    }
     // The lobby rendezvous is live: tell the UI the public room is joined so its
     // Lobby chat box is enabled (relay-path parity — the relay emits RoomJoined on
     // its connect-time auto-join).
@@ -972,6 +1069,8 @@ async fn join_circle(
     evt_tx: &UnboundedSender<NetEvent>,
     net: &Option<VeilidNetHandle>,
     circles: &mut Vec<VeilidCircle>,
+    my_handle: &str,
+    signing: Option<Arc<SignKeypair>>,
 ) {
     daemonseed_veilid_net::vtrace!("gui join_circle: requested id={circle_id}");
     let err = |reason: String| {
@@ -1016,14 +1115,21 @@ async fn join_circle(
     }
     daemonseed_veilid_net::vtrace!("gui join_circle: subscribed ok -> CircleJoined id={circle_id}");
     let fingerprint = circle_fingerprint(&cot_key);
+    let label = default_circle_label(&fingerprint);
     circles.push(VeilidCircle {
         circle_id,
         cot_key,
         owner_seed,
         presence_owner_seed,
-        // TTL = 20s × 3 = 60s, matching the lobby presence cadence (P2).
-        presence: PresenceTracker::with_cadence(Duration::from_secs(20), HEARTBEAT_MISS_COUNT),
+        // WB-1.9: TTL 600s + read-side fold; scoped to this circle's label so
+        // cross-room activity can never refresh it (WB-1.6).
+        presence: PresenceTracker::for_room(label, PRESENCE_TTL),
     });
+    // WB-1.1: one JOIN beacon on subscribe so the circle roster shows this member
+    // within the connect window.
+    if let (Some(signing), Some(circle)) = (signing, circles.last()) {
+        spawn_circle_beacon(handle, &signing, circle, my_handle, PresenceBoundary::Join);
+    }
     let _ = evt_tx.send(NetEvent::CircleJoined {
         circle_id,
         asset_addr: fingerprint,
@@ -2058,7 +2164,7 @@ fn handle_inbound(
         .as_ref()
         .map(|s| s.public_key().to_vec())
         .unwrap_or_default();
-    for circle in circles.iter() {
+    for circle in circles.iter_mut() {
         if let Ok(msg) = open_message(&circle.cot_key, &bytes) {
             // #143: emit own messages too (mine == our pubkey) instead of suppressing.
             // A LIVE own message dedups against its optimistic local echo in
@@ -2082,6 +2188,28 @@ fn handle_inbound(
                 mine,
                 sent_unix_ms: msg.sent_unix_ms,
             });
+            // WB-ISC-4: a verified same-room chat write advances the sender's roster
+            // freshness (read-side fold — emits nothing to the network), so a chatty
+            // member never false-reaps without needing a keepalive. Delivered AFTER
+            // the message so chat is the primary event; own messages are implicit
+            // presence, never rostered.
+            if !mine {
+                let label = default_circle_label(&circle_fingerprint(&circle.cot_key));
+                if circle.presence.apply_member_write(
+                    &label,
+                    &msg.sender_pubkey,
+                    &msg.sender_handle,
+                    msg.sent_unix_ms,
+                    Instant::now(),
+                ) == PresenceChange::Appeared
+                {
+                    let entries = roster_from_members(&circle.presence.members());
+                    let _ = evt_tx.send(NetEvent::Roster {
+                        circle_id: Some(circle.circle_id),
+                        entries,
+                    });
+                }
+            }
             return; // opened under exactly one circle
         }
     }
@@ -2093,9 +2221,12 @@ fn handle_inbound(
     // own messages are emitted
     // `mine:true` (not suppressed) — they dedup against the optimistic local echo live
     // (same `sent_unix_ms`) and render once from the cold-start backlog.
-    if let Some(lobby) = shares.lobby.as_ref()
-        && let Ok(msg) = open_room_message(&lobby.room_key, DEFAULT_ROOM, &bytes)
-    {
+    // Open under an immutable borrow, then fold under a mutable one (WB-ISC-4).
+    let lobby_msg = shares
+        .lobby
+        .as_ref()
+        .and_then(|lobby| open_room_message(&lobby.room_key, DEFAULT_ROOM, &bytes).ok());
+    if let Some(msg) = lobby_msg {
         // Pubkey-keyed `mine` + pubkey-bound `who` (ISC-C4/C57), same as circles.
         let mine = msg.sender_pubkey == my_pubkey;
         let Ok(bound) = Handle::display_bound(&msg.sender_handle, &msg.sender_pubkey) else {
@@ -2108,6 +2239,25 @@ fn handle_inbound(
             mine,
             sent_unix_ms: msg.sent_unix_ms,
         });
+        // WB-ISC-4 read-side fold (after the message, chat is primary): a same-room
+        // lobby chat write advances the sender's roster freshness (emits nothing to
+        // the network). Own messages are implicit presence.
+        if !mine
+            && let Some(lobby) = shares.lobby.as_mut()
+            && lobby.presence.apply_member_write(
+                DEFAULT_ROOM,
+                &msg.sender_pubkey,
+                &msg.sender_handle,
+                msg.sent_unix_ms,
+                Instant::now(),
+            ) == PresenceChange::Appeared
+        {
+            let entries = roster_from_members(&lobby.presence.members());
+            let _ = evt_tx.send(NetEvent::Roster {
+                circle_id: None,
+                entries,
+            });
+        }
         return;
     }
     // Not a chat message — try it as a lobby member-presence heartbeat (#74). A
@@ -2329,7 +2479,7 @@ mod tests {
             presence_owner_seed: *derive_room_presence_veilid_owner_seed(DEFAULT_ROOM, &CNSA_2_0)
                 .unwrap()
                 .as_bytes(),
-            presence: PresenceTracker::with_cadence(Duration::from_secs(20), HEARTBEAT_MISS_COUNT),
+            presence: PresenceTracker::for_room(DEFAULT_ROOM, PRESENCE_TTL),
         }
     }
 
@@ -2837,6 +2987,7 @@ mod tests {
             sender_handle: "otter#aabbccddeeff",
             sent_unix_ms: now_unix_ms(),
             live_share_ids: &[],
+            is_leave: false,
         };
         let sealed = seal_circle_heartbeat(&cot_key, &member, &fields).unwrap();
 
@@ -2845,7 +2996,7 @@ mod tests {
             cot_key: derive_cot_key(phrase, &CNSA_2_0).unwrap(),
             owner_seed: [0u8; 32],
             presence_owner_seed: [0u8; 32],
-            presence: PresenceTracker::with_cadence(Duration::from_secs(20), HEARTBEAT_MISS_COUNT),
+            presence: PresenceTracker::for_room(DEFAULT_ROOM, PRESENCE_TTL),
         }];
         let mut shares = ShareState::new(); // signing None → own-filter no-op
         let (evt_tx, mut evt_rx) = unbounded_channel();

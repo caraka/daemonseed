@@ -46,6 +46,7 @@ fn circle_presence_seal_open_track_round_trip() {
         sender_handle: "wandering-otter#abc",
         sent_unix_ms: 1_000,
         live_share_ids: &[],
+        is_leave: false,
     };
     let sealed = seal_circle_heartbeat(&circle_a, &member, &fields).unwrap();
 
@@ -79,7 +80,11 @@ fn circle_presence_seal_open_track_round_trip() {
 
     // Live-only: past the TTL the member is reaped and the roster empties.
     let past_ttl = t0 + tracker.ttl() + Duration::from_secs(1);
-    assert_eq!(tracker.reap(past_ttl).len(), 1, "the member ages out");
+    assert_eq!(
+        tracker.reap(past_ttl, false).len(),
+        1,
+        "the member ages out"
+    );
     assert!(tracker.members().is_empty(), "circle presence is live-only");
 }
 
