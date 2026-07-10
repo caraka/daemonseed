@@ -2631,18 +2631,19 @@ fn main() {
                         // does not re-trip the unread dot for already-seen backlog.
                         state_close.borrow_mut().persist_all_circle_seen();
                         // Business-as-usual on a graceful quit: withdraw owned shares so
-                        // they drop from peers' lists immediately, then block the close
-                        // (bounded) until the withdraw reaches the network. The actor
-                        // acks WithdrawAllOwned only AFTER each withdraw `set_dht_value`
-                        // returns (i.e. after it is written to the DHT's responsible
-                        // nodes), so the ack means the withdraw has actually landed — the
-                        // block returns the instant it arrives, keeping a healthy close
-                        // fast. The cap is generous (a Veilid DHT set under load can take
-                        // several seconds; the old 2 s exited mid-set and aborted the
-                        // withdraw, leaving a peer to wait out the ~600 s TTL backstop —
-                        // #121); the TTL still covers the rare set that overruns even
-                        // this. Safe: the net actor runs off the main thread, so blocking
-                        // here never starves it.
+                        // they drop from peers' lists immediately AND publish a LEAVE
+                        // tombstone per joined room (#161), then block the close (bounded)
+                        // until they reach the network. The actor acks WithdrawAllOwned
+                        // only AFTER each withdraw + leave `set_dht_value` returns (i.e.
+                        // after it is written to the DHT's responsible nodes), so the ack
+                        // means the departure has actually landed — the block returns the
+                        // instant it arrives, keeping a healthy close fast. The cap is
+                        // generous (a Veilid DHT set under load can take several seconds,
+                        // and the leaves ride the same budget after the withdraws; the old
+                        // 2 s exited mid-set and aborted the withdraw, leaving a peer to
+                        // wait out the ~600 s TTL backstop — #121); the TTL still covers a
+                        // set that overruns even this. Safe: the net actor runs off the
+                        // main thread, so blocking here never starves it.
                         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
                         let sent = net_close
                             .borrow()
@@ -2650,7 +2651,7 @@ fn main() {
                             .is_ok();
                         if sent && let Some(rt) = PICKER_RT.get() {
                             let _ = rt.block_on(async {
-                                tokio::time::timeout(std::time::Duration::from_secs(8), ack_rx)
+                                tokio::time::timeout(std::time::Duration::from_secs(12), ack_rx)
                                     .await
                             });
                         }

@@ -522,6 +522,70 @@ fn spawn_circle_beacon(
     }
 }
 
+/// Seal and AWAIT one LEAVE tombstone for a PUBLIC room (lobby) — the close-path
+/// counterpart of [`spawn_public_beacon`]. On graceful close the write is *awaited*,
+/// not spawned fire-and-forget, so the leave reaches the DHT within the close budget
+/// before the process exits (#161) — a spawned task is aborted at exit, leaving the
+/// member to age out at the ~600s TTL. `publish_presence` resolves after the
+/// scheduler's `set_dht_value` returns, so the await bounds delivery. Non-fatal on
+/// seal/transport failure (the TTL backstops it).
+async fn publish_public_leave(
+    handle: &VeilidNetHandle,
+    signing: &SignKeypair,
+    room_key: &PublicRoomKey,
+    presence_seed: [u8; 32],
+    my_handle: &str,
+) {
+    let fields = HeartbeatFields {
+        room: DEFAULT_ROOM,
+        sender_handle: my_handle,
+        sent_unix_ms: now_unix_ms(),
+        live_share_ids: &[],
+        is_leave: true,
+    };
+    if let Ok(sealed) = seal_public_heartbeat(room_key, signing, &fields) {
+        let pubkey = signing.public_key().to_vec();
+        if let Err(e) = handle
+            .publish_presence(presence_seed, &pubkey, sealed, PresenceBoundary::Leave)
+            .await
+        {
+            daemonseed_veilid_net::vtrace!("gui presence: Leave emit failed: {e}");
+        }
+    }
+}
+
+/// Seal and AWAIT one LEAVE tombstone for a CIRCLE — the close-path counterpart of
+/// [`spawn_circle_beacon`] (see [`publish_public_leave`] for why the leave is awaited).
+async fn publish_circle_leave(
+    handle: &VeilidNetHandle,
+    signing: &SignKeypair,
+    circle: &VeilidCircle,
+    my_handle: &str,
+) {
+    let label = default_circle_label(&circle_fingerprint(&circle.cot_key));
+    let fields = HeartbeatFields {
+        room: &label,
+        sender_handle: my_handle,
+        sent_unix_ms: now_unix_ms(),
+        live_share_ids: &[],
+        is_leave: true,
+    };
+    if let Ok(sealed) = seal_circle_heartbeat(&circle.cot_key, signing, &fields) {
+        let pubkey = signing.public_key().to_vec();
+        if let Err(e) = handle
+            .publish_presence(
+                circle.presence_owner_seed,
+                &pubkey,
+                sealed,
+                PresenceBoundary::Leave,
+            )
+            .await
+        {
+            daemonseed_veilid_net::vtrace!("gui circle presence: Leave emit failed: {e}");
+        }
+    }
+}
+
 /// Whether the local write funnel is congested (WB-1.10 / WB-ISC-5): the
 /// scheduler's most-recent non-chat enqueue-to-ack latency is at/above
 /// [`REAP_CONGESTION_THRESHOLD`]. While congested, the presence reaper is suspended
@@ -782,30 +846,26 @@ async fn handle_command(
                 unpublish_share(shares, evt_tx, net, &s.share_id).await;
             }
             // WB-1.3: publish one LEAVE tombstone per joined room inside the same
-            // close budget (the #121 pattern). The funnel's I3 dominance keeps a
-            // queued keepalive from superseding it, so peers see the member depart
-            // immediately rather than aging out at the ~600s TTL. The tombstone is
-            // byte-identical to a keepalive on the wire (WB-ISC-6); only in-room
-            // members decrypt the leave marker.
+            // close budget (the #121 pattern). AWAIT each (not fire-and-forget spawn,
+            // #161) so the leave actually reaches the DHT before the process exits —
+            // a spawned task is aborted at exit and the member ages out at the ~600s
+            // TTL instead of departing immediately. The funnel's I3 dominance keeps a
+            // queued keepalive from superseding it (now closed on the in-flight window
+            // too, #164). The tombstone is byte-identical to a keepalive on the wire
+            // (WB-ISC-6); only in-room members decrypt the leave marker.
             if let (Some(handle), Some(signing)) = (net.as_ref(), shares.signing.clone()) {
                 if let Some(lobby) = shares.lobby.as_ref() {
-                    spawn_public_beacon(
+                    publish_public_leave(
                         handle,
                         &signing,
                         &lobby.room_key,
                         lobby.presence_owner_seed,
                         my_handle,
-                        PresenceBoundary::Leave,
-                    );
+                    )
+                    .await;
                 }
                 for circle in circles.iter() {
-                    spawn_circle_beacon(
-                        handle,
-                        &signing,
-                        circle,
-                        my_handle,
-                        PresenceBoundary::Leave,
-                    );
+                    publish_circle_leave(handle, &signing, circle, my_handle).await;
                 }
             }
             let _ = ack.send(());
