@@ -1193,7 +1193,13 @@ async fn send_circle(
     // delayed DHT re-surface of this same write is emitted `mine:true`; its `who` is
     // `display_bound(...).format(Default)` = our display name, so the echo emits the
     // SAME display name (not the raw handle) and `push_message` dedups them (#143).
-    let display_name = my_handle.split('#').next().unwrap_or(my_handle).to_owned();
+    // #155: compute the echo `who` via the SAME display_bound(wire_handle,
+    // pubkey).format(Default) path as the DHT re-surface, so a nameless/floor
+    // identity floors to `#<hex>` identically on both sides and push_message
+    // dedups the own echo (was: `"#hex".split('#').next()` = "" → double-render).
+    let display_name = Handle::display_bound(&wire_handle, signing.public_key().as_slice())
+        .map(|b| b.format(DisplayMode::Default))
+        .unwrap_or_else(|_| my_handle.to_owned());
     let _ = evt_tx.send(NetEvent::CircleMessage {
         circle_id,
         who: display_name,
@@ -1261,7 +1267,13 @@ async fn send_room(
     // not after the Veilid publish round-trip; the delayed DHT re-surface emits
     // `mine:true` with `who = display_bound(...).format(Default)` = our display name,
     // so the echo emits the SAME display name and `push_message` dedups them (#143).
-    let display_name = my_handle.split('#').next().unwrap_or(my_handle).to_owned();
+    // #155: compute the echo `who` via the SAME display_bound(wire_handle,
+    // pubkey).format(Default) path as the DHT re-surface, so a nameless/floor
+    // identity floors to `#<hex>` identically on both sides and push_message
+    // dedups the own echo (was: `"#hex".split('#').next()` = "" → double-render).
+    let display_name = Handle::display_bound(&wire_handle, signing.public_key().as_slice())
+        .map(|b| b.format(DisplayMode::Default))
+        .unwrap_or_else(|_| my_handle.to_owned());
     let _ = evt_tx.send(NetEvent::Message {
         who: display_name,
         text: text.to_owned(),
@@ -3192,6 +3204,50 @@ mod tests {
         assert!(
             mine,
             "own message must be flagged mine:true (keyed on pubkey)"
+        );
+    }
+
+    /// #155: for a nameless/floor identity the sender's own-echo `who` must equal
+    /// the DHT re-surface `who` so `push_message` dedups it. The re-surface floors
+    /// to `#<hex>` via `display_bound(...).format(Default)`; the pre-fix echo used
+    /// `my_handle.split('#').next()`, which yields `""` for a `#<hex>` handle — so
+    /// the echo (`""`) and re-surface (`#<hex>`) `who` mismatched and the own
+    /// message rendered twice. After the fix both floor identically.
+    #[test]
+    fn floor_identity_own_echo_who_matches_resurface() {
+        let me = announcer(41);
+        let pubkey = me.public_key().as_slice();
+        // A nameless identity transmits the canonical floor handle `#<hex>`.
+        let wire = crate::net::canonical_wire_handle("", pubkey);
+        assert!(
+            wire.starts_with('#'),
+            "a nameless identity floors on the wire: {wire:?}"
+        );
+        // The re-surface `who` (veilid_net inbound path, 2186/2237).
+        let resurface_who = Handle::display_bound(&wire, pubkey)
+            .unwrap()
+            .format(DisplayMode::Default);
+        // The FIXED echo `who` — same wire handle + pubkey, so identical.
+        let echo_who = Handle::display_bound(&wire, pubkey)
+            .map(|b| b.format(DisplayMode::Default))
+            .unwrap_or_else(|_| wire.clone());
+        assert_eq!(
+            echo_who, resurface_who,
+            "#155: the echo `who` must equal the re-surface `who`"
+        );
+        assert!(
+            !echo_who.is_empty() && echo_who.starts_with('#'),
+            "a floor identity's `who` is `#<hex>`, never empty: {echo_who:?}"
+        );
+        // Regression witness: the pre-fix computation collapsed a `#<hex>` handle to "".
+        let pre_fix = wire.split('#').next().unwrap_or(&wire).to_owned();
+        assert_eq!(
+            pre_fix, "",
+            "pre-#155: split('#').next() on a floor handle gave \"\""
+        );
+        assert_ne!(
+            pre_fix, resurface_who,
+            "pre-#155: echo \"\" != re-surface `#<hex>` → the double-render"
         );
     }
 
