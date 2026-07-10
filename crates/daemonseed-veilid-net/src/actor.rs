@@ -22,7 +22,17 @@ use daemonseed_core::storage::cas::ChunkAddr;
 use crate::config::VeilidNetConfig;
 use crate::error::{Result, VeilidNetError};
 use crate::event::VeilidNetEvent;
+use crate::schedule::{
+    DispatchFuture, SchedulerConfig, WriteClass, WriteKind, WriteRequest, WriteScheduler,
+    WriteSchedulerHandle, WriteSink,
+};
 use crate::{discovery, identity, rendezvous, share};
+
+/// Close-flush budget handed to the write scheduler on graceful shutdown (WB-3.I7):
+/// pending chat writes + leave tombstones + share withdraws flush within this,
+/// class-3/4/5 current-state writes are shed. Same close-budget class as the share
+/// `WithdrawAllOwned` flush; an overrun abandons to the TTL backstop.
+const SHUTDOWN_FLUSH_BUDGET: Duration = Duration::from_secs(8);
 
 /// Veilid's `app_message` / `app_call` payload cap (bytes). Sealed envelopes
 /// must fit; file-share chunks re-chunk to this in Phase 3.
@@ -662,12 +672,6 @@ async fn actor_loop(
     shares: Arc<Mutex<HashMap<String, share::ServedShare>>>,
     cmd_weak: mpsc::WeakSender<Command>,
 ) {
-    // Per-rendezvous append-ring write cursor: which ring slot this node writes
-    // next (keyed by record, so circles and rooms share the same map). Behind an
-    // Arc<Mutex> so a spawned advert refresh (RouteMaintenance) advances the SAME
-    // cursors as the main loop — else a refresh writing to the lobby record could
-    // collide with a concurrent room-message write. Locked only for the sync bump.
-    let ring_seq: Arc<Mutex<HashMap<RecordKey, u32>>> = Arc::new(Mutex::new(HashMap::new()));
     // Cache of opened rendezvous records (owner seed → post-reopen key):
     // open_or_create costs a fresh ~6–10 s open per publish/subscribe, so once a
     // record is open its key is reused. Shared (Arc) so a spawned advert refresh
@@ -698,6 +702,25 @@ async fn actor_loop(
     // completion time and clears the in-flight flag when it finishes.
     let refresh_in_flight = Arc::new(AtomicBool::new(false));
     let last_advert_refresh: Arc<Mutex<Option<tokio::time::Instant>>> = Arc::new(Mutex::new(None));
+
+    // The WB-3 write funnel (I1): every `set_dht_value` in this actor is dispatched
+    // through this one prioritized, rate-limited scheduler. The production sink holds
+    // the SAME shared caches (opened / record_locks) the read paths use, so a
+    // scheduled write and a concurrent same-record subscribe/resweep still serialize
+    // on the record's `record_lock`. The append-ring cursor lives in the sink because
+    // only the write path touches it. The write commands below enqueue and return, so
+    // a slow DHT set never parks this loop (#154 retired).
+    let sched: WriteSchedulerHandle<ProdWrite> = WriteScheduler::spawn(
+        Arc::new(ProductionSink {
+            api: api.clone(),
+            rc: rc.clone(),
+            node_pub,
+            ring_seq: Arc::new(Mutex::new(HashMap::new())),
+            opened: opened.clone(),
+            record_locks: record_locks.clone(),
+        }),
+        SchedulerConfig::default(),
+    );
 
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
@@ -732,31 +755,19 @@ async fn actor_loop(
                 sealed,
                 reply,
             } => {
-                // Spawn the DHT write off the command loop (same pattern as AppCall):
-                // a rendezvous publish can take seconds, and awaiting it inline parks
-                // every command queued behind it (the fat-link chat stall). Delivery
-                // ordering is NOT guaranteed here — the GUI dispatches each publish
-                // from its own task, so send-order is lost upstream and the receiver
-                // orders by sent_unix_ms (#105/#126). Shutdown-drain / backpressure
-                // hardening is deferred to #129.
-                let api = api.clone();
-                let rc = rc.clone();
-                let ring_seq = ring_seq.clone();
-                let opened = opened.clone();
-                let record_locks = record_locks.clone();
-                tokio::spawn(async move {
-                    let r = publish_rendezvous(
-                        &api,
-                        &rc,
-                        &node_pub,
-                        &ring_seq,
-                        &opened,
-                        &record_locks,
-                        owner_seed,
-                        sealed,
-                    )
-                    .await;
-                    let _ = reply.send(r);
+                // Chat / room / circle append-ring write — the highest priority class
+                // (I1) and never coalesced (I3). Enqueue and return: the scheduler
+                // dispatches (record_lock + ring-seq bump inside it, #131/I2 intact)
+                // and fires the reply, so a slow DHT set never parks this loop (#154).
+                // Per-record FIFO in the funnel + the receiver's sent_unix_ms sort
+                // (#105/#126) preserve ordering.
+                sched.enqueue(WriteRequest {
+                    record: owner_seed,
+                    class: WriteClass::Chat,
+                    kind: WriteKind::Ring,
+                    deadline: None,
+                    item: ProdWrite::Rendezvous { owner_seed, sealed },
+                    reply: Some(reply),
                 });
             }
             Command::SubscribeRendezvous { owner_seed, reply } => {
@@ -771,27 +782,26 @@ async fn actor_loop(
                 sealed,
                 reply,
             } => {
-                // Spawn off the command loop (same rationale as PublishRendezvous): a
-                // DHT set can take seconds and must not park the commands queued behind
-                // it. `publish_current_state` takes the presence record's own record_lock,
-                // which single-flights writes to THAT record only — distinct from the chat
-                // record's lock, so a presence write never blocks chat traffic.
-                let api = api.clone();
-                let rc = rc.clone();
-                let opened = opened.clone();
-                let record_locks = record_locks.clone();
-                tokio::spawn(async move {
-                    let r = publish_current_state(
-                        &api,
-                        &rc,
-                        &opened,
-                        &record_locks,
+                // Current-state (presence beacon / operator MOTD) write — class-4
+                // keepalive (I1), last-writer-wins coalescible on its logical id (I3).
+                // Enqueue and return; the scheduler paces it under the non-chat cap so
+                // it never blocks chat traffic, and dispatches through the record's own
+                // `record_lock`. (Session-boundary join/leave + withdraw tombstone
+                // classification is supplied by the presence emit/ingest/reap loop —
+                // Slice B; the funnel already carries those classes.)
+                sched.enqueue(WriteRequest {
+                    record: owner_seed,
+                    class: WriteClass::Keepalive,
+                    kind: WriteKind::CurrentState {
+                        logical_id: stable_id.clone(),
+                    },
+                    deadline: None,
+                    item: ProdWrite::CurrentState {
                         owner_seed,
-                        &stable_id,
+                        stable_id,
                         sealed,
-                    )
-                    .await;
-                    let _ = reply.send(r);
+                    },
+                    reply: Some(reply),
                 });
             }
             Command::ResweepRendezvous { owner_seed, reply } => {
@@ -841,20 +851,20 @@ async fn actor_loop(
                     sealed_announcement,
                     signer,
                 };
-                let res = publish_one_advert(
-                    &api,
-                    &rc,
-                    &opened,
-                    &record_locks,
-                    &advert_routes,
-                    &share_id,
-                    &advert,
-                )
-                .await;
-                if res.is_ok() {
-                    share_adverts.insert(share_id, advert);
-                }
-                let _ = reply.send(res);
+                // Remember the advert now (so a RouteChanged / watchdog can refresh it,
+                // and a first-publish write failure self-heals on the next watchdog tick
+                // rather than being lost), then do the route alloc + funnel write OFF the
+                // command loop so it never parks (#154). The scheduler classes the advert
+                // write class-3 and coalesces same-share refreshes (I1/I3).
+                share_adverts.insert(share_id.clone(), advert.clone());
+                let api = api.clone();
+                let sched = sched.clone();
+                let advert_routes = advert_routes.clone();
+                tokio::spawn(async move {
+                    let res =
+                        publish_one_advert(&api, &sched, &advert_routes, &share_id, &advert).await;
+                    let _ = reply.send(res);
+                });
             }
             Command::StopServe { share_id, reply } => {
                 // De-register from BOTH the serve registry (inbound fetch
@@ -905,9 +915,7 @@ async fn actor_loop(
                 // the loop for the whole wave (head-of-line).
                 if !spawn_refresh_if_due(
                     &api,
-                    &rc,
-                    &opened,
-                    &record_locks,
+                    &sched,
                     &advert_routes,
                     &share_adverts,
                     &refresh_in_flight,
@@ -958,9 +966,7 @@ async fn actor_loop(
                 if !idle.is_empty()
                     && spawn_refresh_if_due(
                         &api,
-                        &rc,
-                        &opened,
-                        &record_locks,
+                        &sched,
                         &advert_routes,
                         &idle,
                         &refresh_in_flight,
@@ -971,6 +977,11 @@ async fn actor_loop(
                 }
             }
             Command::Shutdown { reply } => {
+                // I7: flush pending chat writes + leave tombstones + share withdraws
+                // within the close budget, shed class-3/4/5 current-state writes, THEN
+                // tear the node down — a locally-echoed chat silently dropped at close
+                // is data loss the sender already saw as sent.
+                sched.shutdown(SHUTDOWN_FLUSH_BUDGET).await;
                 api.shutdown().await;
                 let _ = reply.send(());
                 return;
@@ -1150,6 +1161,87 @@ async fn publish_current_state(
     rendezvous::publish_at_subkey(rc, &key, &owner, subkey, sealed).await
 }
 
+/// The dispatch token the write scheduler carries per queued write, matched by the
+/// [`ProductionSink`] onto the existing per-record write function. The scheduler
+/// treats it opaquely; only the sink interprets it, so #131 / ring-seq-inside-
+/// `record_lock` stay where they are (inside these two functions, at dispatch time).
+enum ProdWrite {
+    /// An append-ring (chat / room / circle) write → [`publish_rendezvous`].
+    Rendezvous {
+        owner_seed: [u8; 32],
+        sealed: Vec<u8>,
+    },
+    /// A current-state (presence beacon / MOTD / share advert) write →
+    /// [`publish_current_state`].
+    CurrentState {
+        owner_seed: [u8; 32],
+        stable_id: String,
+        sealed: Vec<u8>,
+    },
+}
+
+/// The production [`WriteSink`] (WB-3.I1): the funnel's dispatch end. Holds the same
+/// shared caches the actor loop and the read paths share (`ring_seq`, `opened`,
+/// `record_locks`), so a scheduled write serializes against a concurrent same-record
+/// subscribe/resweep exactly as before. Every `set_dht_value` in the crate reaches
+/// the network only through here, called by the scheduler task.
+struct ProductionSink {
+    api: VeilidAPI,
+    rc: RoutingContext,
+    node_pub: [u8; 32],
+    // Per-record append-ring cursor — the seq bump happens INSIDE `record_lock` at
+    // dispatch (`publish_rendezvous`), never at enqueue (#131 / I2 / I13 untouched).
+    ring_seq: Arc<Mutex<HashMap<RecordKey, u32>>>,
+    opened: Arc<rendezvous::OpenCache>,
+    record_locks: Arc<rendezvous::RecordLocks>,
+}
+
+impl WriteSink for ProductionSink {
+    type Item = ProdWrite;
+
+    fn dispatch(&self, item: ProdWrite) -> DispatchFuture {
+        let api = self.api.clone();
+        let rc = self.rc.clone();
+        let node_pub = self.node_pub;
+        let ring_seq = self.ring_seq.clone();
+        let opened = self.opened.clone();
+        let record_locks = self.record_locks.clone();
+        Box::pin(async move {
+            match item {
+                ProdWrite::Rendezvous { owner_seed, sealed } => {
+                    publish_rendezvous(
+                        &api,
+                        &rc,
+                        &node_pub,
+                        &ring_seq,
+                        &opened,
+                        &record_locks,
+                        owner_seed,
+                        sealed,
+                    )
+                    .await
+                }
+                ProdWrite::CurrentState {
+                    owner_seed,
+                    stable_id,
+                    sealed,
+                } => {
+                    publish_current_state(
+                        &api,
+                        &rc,
+                        &opened,
+                        &record_locks,
+                        owner_seed,
+                        &stable_id,
+                        sealed,
+                    )
+                    .await
+                }
+            }
+        })
+    }
+}
+
 /// Open/create the rendezvous record, register a watch, and kick off a one-shot
 /// background sweep for the bounded login backlog. Inbound items flow out as
 /// [`VeilidNetEvent::Inbound`]. Used for circles and public rooms / lobby alike.
@@ -1252,13 +1344,14 @@ struct AdvertState {
 
 /// Allocate a fresh private inbound route, sign the route advert with the sharer's
 /// capability, wrap it with the sealed announcement into a `DiscoveryEnvelope`, and
-/// publish it on the lobby rendezvous. The signed `share_id ‖ route_blob` is the
-/// anti-swap binding (D-3.5); this layer never holds the announcer's key.
+/// publish it on the lobby rendezvous THROUGH the write funnel (WB-3.I1, class-3
+/// advert-refresh, coalescing key = `share_id`). The signed `share_id ‖ route_blob`
+/// is the anti-swap binding (D-3.5); this layer never holds the announcer's key. The
+/// route alloc/sign/release happen off the command loop (this fn is only ever spawned)
+/// and the DHT set itself is enqueued, so nothing here parks the actor loop.
 async fn publish_one_advert(
     api: &VeilidAPI,
-    rc: &RoutingContext,
-    opened: &rendezvous::OpenCache,
-    record_locks: &rendezvous::RecordLocks,
+    sched: &WriteSchedulerHandle<ProdWrite>,
     advert_routes: &Mutex<HashMap<String, RouteId>>,
     share_id: &str,
     advert: &AdvertState,
@@ -1297,16 +1390,30 @@ async fn publish_one_advert(
         "publish_one_advert: share_id={share_id} envelope={} bytes",
         envelope.len()
     );
-    let res = publish_current_state(
-        api,
-        rc,
-        opened,
-        record_locks,
-        advert.owner_seed,
-        share_id,
-        envelope,
-    )
-    .await;
+    // Funnel the DHT write (I1): class-3 advert refresh, coalescing key = share_id, so
+    // a RouteChanged burst or a watchdog tick racing a route-change refresh collapses
+    // to one write per share (I3). Await the scheduler's completion so route rollback
+    // still runs on failure.
+    let (reply_tx, reply_rx) = oneshot::channel();
+    sched.enqueue(WriteRequest {
+        record: advert.owner_seed,
+        class: WriteClass::AdvertRefresh,
+        kind: WriteKind::CurrentState {
+            logical_id: share_id.to_owned(),
+        },
+        deadline: None,
+        item: ProdWrite::CurrentState {
+            owner_seed: advert.owner_seed,
+            stable_id: share_id.to_owned(),
+            sealed: envelope,
+        },
+        reply: Some(reply_tx),
+    });
+    let res = reply_rx.await.unwrap_or_else(|_| {
+        Err(VeilidNetError::Actor(
+            "write scheduler dropped advert reply".into(),
+        ))
+    });
     if res.is_err() {
         rollback_advert_route(api, advert_routes, share_id, route_id);
     }
@@ -1334,18 +1441,14 @@ fn rollback_advert_route(
 /// refresh.
 async fn refresh_share_adverts(
     api: &VeilidAPI,
-    rc: &RoutingContext,
-    opened: &rendezvous::OpenCache,
-    record_locks: &rendezvous::RecordLocks,
+    sched: &WriteSchedulerHandle<ProdWrite>,
     advert_routes: &Mutex<HashMap<String, RouteId>>,
     adverts: &HashMap<String, AdvertState>,
 ) {
     crate::vtrace!("refresh_share_adverts: {} advert(s)", adverts.len());
     let started = std::time::Instant::now();
     for (share_id, st) in adverts {
-        if let Err(e) =
-            publish_one_advert(api, rc, opened, record_locks, advert_routes, share_id, st).await
-        {
+        if let Err(e) = publish_one_advert(api, sched, advert_routes, share_id, st).await {
             crate::vtrace!("refresh_share_adverts: {share_id} ERR ({e})");
         }
     }
@@ -1362,12 +1465,9 @@ async fn refresh_share_adverts(
 /// route-change refresh — so the combined cadence stays far below the storm the
 /// relevance filter closed. Clones the shared caches into the spawned task and stamps
 /// completion + clears the in-flight guard when it finishes.
-#[allow(clippy::too_many_arguments)]
 fn spawn_refresh_if_due(
     api: &VeilidAPI,
-    rc: &RoutingContext,
-    opened: &Arc<rendezvous::OpenCache>,
-    record_locks: &Arc<rendezvous::RecordLocks>,
+    sched: &WriteSchedulerHandle<ProdWrite>,
     advert_routes: &Arc<Mutex<HashMap<String, RouteId>>>,
     share_adverts: &HashMap<String, AdvertState>,
     refresh_in_flight: &Arc<AtomicBool>,
@@ -1383,15 +1483,16 @@ fn spawn_refresh_if_due(
         return false;
     }
     let api = api.clone();
-    let rc = rc.clone();
-    let opened = opened.clone();
-    let record_locks = record_locks.clone();
+    let sched = sched.clone();
     let advert_routes = advert_routes.clone();
     let adverts = share_adverts.clone();
     let in_flight = refresh_in_flight.clone();
     let last_refresh = last_advert_refresh.clone();
     tokio::spawn(async move {
-        refresh_share_adverts(&api, &rc, &opened, &record_locks, &advert_routes, &adverts).await;
+        // The outer #124 coalesce gate (in-flight guard + min interval) still bounds
+        // the refresh CADENCE; the per-write funnel adds cross-record priority + the
+        // I5 cap + I3 same-share coalescing on top.
+        refresh_share_adverts(&api, &sched, &advert_routes, &adverts).await;
         // Stamp the coalesce window from COMPLETION, then release the in-flight guard
         // so the next RouteChange or watchdog tick can schedule again.
         *last_refresh.lock().unwrap() = Some(tokio::time::Instant::now());

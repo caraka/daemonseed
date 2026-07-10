@@ -61,6 +61,18 @@
 //! signer-gated composer, the app publish wiring, and the rollback-freshness
 //! version field are follow-ons.
 //!
+//! ## Write scheduler (WB-3)
+//! Every `set_dht_value` funnels through one prioritized, rate-limited queue
+//! ([`schedule`], design `docs/design/veilid-write-budget.md`): chat >
+//! session-boundary > advert-refresh > keepalive > republish, per-record FIFO,
+//! last-writer-wins current-state coalescing with non-coalescible dominant
+//! tombstones, an AIMD-bounded non-chat in-flight window, deadline override,
+//! shutdown flush/shed, and no read-triggered writes. The actor's write commands
+//! and the advert-refresh path enqueue and return, so a slow DHT set never parks
+//! the command loop (#154). The scheduler dispatches through the existing
+//! per-record write functions, so #131 clamp-at-insert and ring-seq-inside-
+//! `record_lock` are untouched; a [`WriteSink`] seam makes it paused-time testable.
+//!
 //! ## Invariant
 //! Content keys NEVER derive from Veilid (classical x25519) material. The seal/
 //! open lives in `daemonseed-core`; this crate only moves opaque bytes.
@@ -109,6 +121,7 @@ pub mod error;
 pub mod event;
 pub mod identity;
 mod rendezvous;
+pub mod schedule;
 pub mod share;
 
 pub use actor::{VeilidNet, VeilidNetHandle};
@@ -119,3 +132,7 @@ pub use discovery::{
 };
 pub use error::{Result, VeilidNetError};
 pub use event::VeilidNetEvent;
+pub use schedule::{
+    SchedulerConfig, WriteClass, WriteKind, WriteRequest, WriteScheduler, WriteSchedulerHandle,
+    WriteSink,
+};

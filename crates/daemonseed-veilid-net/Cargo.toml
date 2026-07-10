@@ -37,6 +37,8 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 [dev-dependencies]
 # Integration test (#97): the 2-node send_sealed-over-private-route oracle.
 # Runs on a real-network host (`--ignored`); this VM's NAT blocks public attach.
+# `test-util` drives the WB-3 scheduler oracles in paused virtual time
+# (`#[tokio::test(start_paused = true)]`) — the WB-2 paused-time write-budget oracle.
 daemonseed-proto = { path = "../daemonseed-proto" }
 oxicrypt-module = { path = "../../../oxicrypt/crates/oxicrypt-module" }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "test-util"] }

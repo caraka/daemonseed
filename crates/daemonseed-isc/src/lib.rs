@@ -42,8 +42,9 @@
 //!   C95 palette rename-identity + live handle update;
 //!   C96 GUI circle-detail name vectors;
 //!   C97 right-click clipboard context menu on text fields;
-//!   C98 GUI share-name persistence.)
-//! - 180 total
+//!   C98 GUI share-name persistence;
+//!   WB-ISC-9/10/13 pos + WB-ISC-11/12 neg — the WB-3 write scheduler, #159.)
+//! - 185 total
 //!
 //! Deliberately EXCLUDED from [`ISCS`] (and therefore from [`TOTAL`]) because
 //! they are not built: the deferred direct-messaging family
@@ -285,13 +286,20 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-A-C41", IscClass::Negative),
     // ── client negative (#75: the roster shows only the live set, no decorators/persistence) ──
     ("ISC-A-C42", IscClass::Negative),
+    // ── write budget scheduler (#159 WB-3 funnel — docs/design/veilid-write-budget.md) ──
+    // WB-ISC-9/10/13 positive; WB-ISC-11/12 anti (no-chat-drop / tombstone-dominance).
+    ("WB-ISC-9", IscClass::Positive),
+    ("WB-ISC-10", IscClass::Positive),
+    ("WB-ISC-11", IscClass::Negative),
+    ("WB-ISC-12", IscClass::Negative),
+    ("WB-ISC-13", IscClass::Positive),
 ];
 
 /// Total built, non-deferred ISCs tracked by this registry — the SINGLE source
 /// of truth for the coverage denominator, read live by `xtask isc-coverage`.
 /// Recount on every ISC add/remove (the `const _` assert below guards it
 /// against [`ISCS`]).
-pub const TOTAL: usize = 180;
+pub const TOTAL: usize = 185;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -461,10 +469,12 @@ mod tests {
         //                                  palette rename-identity + live update C95 pos, #66;
         //                                  GUI circle-detail name vectors C96 pos, #36;
         //                                  right-click clipboard context menu C97 pos, #67;
-        //                                  GUI share-name persistence C98 pos, #41)
-        //   total   119 pos + 61 neg = 180
-        assert_eq!(pos, 119, "positive count drift");
-        assert_eq!(neg, 61, "negative count drift");
+        //                                  GUI share-name persistence C98 pos, #41;
+        //                                  WB-3 write scheduler WB-ISC-9/10/13 pos +
+        //                                  WB-ISC-11/12 neg, #159)
+        //   total   122 pos + 63 neg = 185
+        assert_eq!(pos, 122, "positive count drift");
+        assert_eq!(neg, 63, "negative count drift");
     }
 
     /// COVERED is single-sourced and must agree with the per-milestone
