@@ -26,6 +26,7 @@ work lives in the project lead's vault manifest, not here.
 
 ### Added
 
+- `docs/design/veilid-write-budget.md` — design-of-record for the #159 Tier-2 structural fix: frozen presence model (constant-cadence fixed-length sealed keepalive + read-side freshness inference), priority write-scheduler invariants (single funnel, 4 non-chat writes/min ceiling), and the two-leg rendezvous discovery rule (swept-whole placement + steady-state re-surfacing) under which #157 is a temporal defect (#159, #157, #141, #77).
 - `daemonseed-gui`: the startup "assembling network" mask now shows the Veilid attach **peer count counting up** during the cold-start warmup, and holds a short settle window past the first content before opening the Lobby (so it opens with more backlog already in) instead of snapping shut on the first message (#144).
 - `daemonseed-core`: `transcript::is_stale_backlog(sent_unix_ms, now_ms)` — true when a message is older than `TRANSCRIPT_MAX_BACKLOG_AGE` (24h), for pruning stale count-bounded-ring backlog at ingest (#151).
 - `daemonseed-core`: `room_message` module — the one signed room-message seal/open path (`seal_signed_room_message` / `open_signed_room_message`, parameterized by key + AEAD AAD + provenance domain + expected room_id) shared by public rooms and circles; plus `circle::key::circle_room_id`, the member-derivable circle wire identifier `SHA-384(cot_key)[:12]`, and `net::canonical_wire_handle` (gui) (#145, #146).
