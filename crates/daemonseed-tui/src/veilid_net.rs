@@ -1328,7 +1328,12 @@ fn handle_inbound(
             // WB-ISC-4 (after the message, chat is primary): a verified same-room
             // chat write advances the sender's roster freshness — read-side fold,
             // emits nothing.
-            if let Some(lobby) = shares.lobby.as_mut() {
+            // #165: gate the presence fold on beacon freshness, as the beacon fold
+            // does below — a replayed old chat write must not re-freshen a departed
+            // member. Message delivery is unaffected.
+            if beacon_is_fresh(msg.sent_unix_ms, now_unix_ms())
+                && let Some(lobby) = shares.lobby.as_mut()
+            {
                 let _ = lobby.presence.apply_member_write(
                     DEFAULT_ROOM,
                     &msg.sender_pubkey,

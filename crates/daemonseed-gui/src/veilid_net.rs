@@ -2265,7 +2265,11 @@ fn handle_inbound(
             // member never false-reaps without needing a keepalive. Delivered AFTER
             // the message so chat is the primary event; own messages are implicit
             // presence, never rostered.
-            if !mine {
+            // #165: gate the presence fold on beacon freshness (±window), exactly as
+            // the beacon fold does — an untrusted relay replaying one captured,
+            // provenance-valid OLD chat write must not indefinitely re-freshen a
+            // departed member's roster liveness. Message delivery/dedup is unaffected.
+            if !mine && beacon_is_fresh(msg.sent_unix_ms, now_unix_ms()) {
                 let label = default_circle_label(&circle_fingerprint(&circle.cot_key));
                 if circle.presence.apply_member_write(
                     &label,
@@ -2314,7 +2318,9 @@ fn handle_inbound(
         // WB-ISC-4 read-side fold (after the message, chat is primary): a same-room
         // lobby chat write advances the sender's roster freshness (emits nothing to
         // the network). Own messages are implicit presence.
+        // #165: gate the presence fold on beacon freshness (see the circle fold above).
         if !mine
+            && beacon_is_fresh(msg.sent_unix_ms, now_unix_ms())
             && let Some(lobby) = shares.lobby.as_mut()
             && lobby.presence.apply_member_write(
                 DEFAULT_ROOM,
@@ -3213,6 +3219,67 @@ mod tests {
             }
             other => panic!("expected a lobby Message, got {other:?}"),
         }
+    }
+
+    /// #165: a replayed OLD chat write must not fold into presence (it would let an
+    /// untrusted relay indefinitely re-freshen a departed member's roster liveness).
+    /// A fresh chat write folds; a stale one (outside the beacon-freshness window) is
+    /// still delivered as a message but leaves the roster untouched.
+    #[test]
+    fn issue_165_stale_chat_write_does_not_refresh_presence() {
+        let signer = announcer(31);
+        let room_key = derive_room_key(DEFAULT_ROOM, &CNSA_2_0).unwrap();
+        let now = now_unix_ms();
+
+        // A fresh same-room chat write folds the sender into presence (WB-ISC-4).
+        let mut shares = ShareState::new();
+        shares.lobby = Some(lobby());
+        let fresh =
+            seal_room_message(&room_key, &signer, DEFAULT_ROOM, "otter#aabbccddeeff", "hi", now)
+                .unwrap();
+        let (evt_tx, _rx) = unbounded_channel();
+        handle_inbound(
+            VeilidNetEvent::Inbound { bytes: fresh },
+            &evt_tx,
+            &mut [],
+            &mut shares,
+        );
+        assert_eq!(
+            shares.lobby.as_ref().unwrap().presence.members().len(),
+            1,
+            "a fresh chat write folds the sender into presence"
+        );
+
+        // A stale/replayed chat write (600s old, outside the freshness window) is still
+        // delivered as a message but must NOT fold into presence.
+        let mut shares2 = ShareState::new();
+        shares2.lobby = Some(lobby());
+        let stale_ts = now.saturating_sub(600_000);
+        let stale = seal_room_message(
+            &room_key,
+            &signer,
+            DEFAULT_ROOM,
+            "otter#aabbccddeeff",
+            "replayed",
+            stale_ts,
+        )
+        .unwrap();
+        let (evt_tx2, mut rx2) = unbounded_channel();
+        handle_inbound(
+            VeilidNetEvent::Inbound { bytes: stale },
+            &evt_tx2,
+            &mut [],
+            &mut shares2,
+        );
+        assert!(
+            matches!(rx2.try_recv(), Ok(NetEvent::Message { .. })),
+            "the stale message is still delivered"
+        );
+        assert_eq!(
+            shares2.lobby.as_ref().unwrap().presence.members().len(),
+            0,
+            "a stale/replayed chat write must not fold into presence (#165)"
+        );
     }
 
     /// Our own lobby message re-surfaces via the DHT sweep; it is emitted `mine:true`
