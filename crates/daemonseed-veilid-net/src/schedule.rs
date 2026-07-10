@@ -307,6 +307,12 @@ struct State<D> {
     queues: HashMap<RecordId, VecDeque<Pending<D>>>,
     /// Records with a write currently in flight (per-record single-flight).
     in_flight: HashSet<RecordId>,
+    /// Logical id of a TOMBSTONE currently in flight, per record (#164). Single-flight
+    /// means at most one in-flight write per record, so this holds that record's
+    /// in-flight tombstone id (if any) — a same-id current-state enqueued while the
+    /// tombstone is mid-write is dominated exactly like a queued one (WB-ISC-12),
+    /// closing the window where a keepalive resurrects a just-departed member.
+    in_flight_tombstone: HashMap<RecordId, String>,
     /// Count of NON-chat writes in flight (the I5 cap subject; chat is uncapped).
     nonchat_in_flight: usize,
     /// AIMD pacer for the non-chat in-flight window (I5).
@@ -324,6 +330,7 @@ impl<D: Send + 'static> State<D> {
             cfg,
             queues: HashMap::new(),
             in_flight: HashSet::new(),
+            in_flight_tombstone: HashMap::new(),
             nonchat_in_flight: 0,
             latency_probe,
             seq: 0,
@@ -333,18 +340,23 @@ impl<D: Send + 'static> State<D> {
     /// Apply the I3 coalescing + dominance rules and enqueue (or drop) the request.
     fn enqueue(&mut self, req: WriteRequest<D>) {
         let now = Instant::now();
+        // An in-flight tombstone dominates a same-id current-state exactly like a
+        // queued one (#164 / WB-ISC-12); capture it before borrowing the record queue.
+        let in_flight_tomb = self.in_flight_tombstone.get(&req.record).cloned();
         let q = self.queues.entry(req.record).or_default();
         match &req.kind {
             // Chat ring writes are never coalesced or dropped (I3/WB-ISC-11).
             WriteKind::Ring => {}
             WriteKind::CurrentState { logical_id } => {
-                // Tombstone dominance (WB-ISC-12): a same-id withdraw already queued
-                // suppresses this current-state write entirely — it must not resurrect
-                // a withdrawn share (#121/#118). Report Ok (intent deliberately
-                // superseded), do not enqueue.
-                if q.iter().any(|p| {
+                // Tombstone dominance (WB-ISC-12): a same-id withdraw already queued —
+                // OR one in flight (#164) — suppresses this current-state write
+                // entirely; it must not resurrect a withdrawn share / departed member
+                // (#121/#118). Report Ok (intent deliberately superseded), do not enqueue.
+                let dominated_by_queued = q.iter().any(|p| {
                     p.kind.is_tombstone() && p.kind.logical_id() == Some(logical_id.as_str())
-                }) {
+                });
+                let dominated_by_in_flight = in_flight_tomb.as_deref() == Some(logical_id.as_str());
+                if dominated_by_queued || dominated_by_in_flight {
                     resolve_ok(req.reply);
                     return;
                 }
@@ -486,6 +498,11 @@ impl<D: Send + 'static> State<D> {
         }
         let is_chat = p.class == WriteClass::Chat;
         self.in_flight.insert(rec);
+        // Track an in-flight tombstone so a same-id current-state enqueued before it
+        // acks is dominated (#164). Cleared in `on_done`.
+        if let WriteKind::Tombstone { logical_id } = &p.kind {
+            self.in_flight_tombstone.insert(rec, logical_id.clone());
+        }
         if !is_chat {
             self.nonchat_in_flight += 1;
         }
@@ -515,6 +532,7 @@ impl<D: Send + 'static> State<D> {
 
     fn on_done(&mut self, d: Done) {
         self.in_flight.remove(&d.record);
+        self.in_flight_tombstone.remove(&d.record);
         if !d.is_chat {
             self.nonchat_in_flight = self.nonchat_in_flight.saturating_sub(1);
             // Feed the AIMD pacer: a slow enqueue-to-ack shrinks the non-chat window
@@ -539,9 +557,18 @@ impl<D: Send + 'static> State<D> {
                 let head = q.front().unwrap();
                 let rank = head.class.rank();
                 let esc = head.enqueued + self.cfg.age_bounds[(rank - 1) as usize];
-                [head.deadline, Some(esc)].into_iter().flatten()
+                // A deadline (I6b) wakes immediately when due: `pick_deadline_due`
+                // dispatches it bypassing the I5 cap, so it clears the queue — no spin.
+                // An escalation crossing (I8) only reorders the non-chat pool; it does
+                // NOT bypass the cap, so once it has passed there is nothing new to wake
+                // for — the head already sorts at its escalated rank (`effective_rank`)
+                // and dispatches on the next `on_done`. Re-arming the timer for a
+                // past-due crossing was the 100% CPU busy-spin (#162); include the
+                // crossing only while it is still in the future.
+                let deadline = head.deadline.map(|d| d.max(now));
+                let esc = (esc > now).then_some(esc);
+                [deadline, esc].into_iter().flatten()
             })
-            .map(|t| t.max(now))
             .min()
     }
 
@@ -1295,6 +1322,95 @@ mod tests {
         assert!(
             probe.load(Ordering::Relaxed) >= 3000,
             "probe must reflect the ≥3s enqueue-to-ack latency"
+        );
+    }
+
+    // ── #162 regression ──────────────────────────────────────────────────────
+    /// A past-due starvation-escalation crossing (I8) must NOT keep re-arming the
+    /// wakeup timer. `next_wakeup` returns `Some(future)` while a crossing is
+    /// pending, then `None` (park until on_done/enqueue) once it has passed — the
+    /// escalation already applies via `effective_rank`, so re-waking at `now` does
+    /// nothing but burn 100% CPU. Pre-fix, `.map(|t| t.max(now))` returned
+    /// `Some(now)` for the past-due crossing and the driver hot-spun.
+    #[tokio::test(start_paused = true)]
+    async fn issue_162_past_due_escalation_does_not_busy_spin() {
+        let cfg = SchedulerConfig::default();
+        let bound = cfg.age_bounds[WriteClass::Keepalive.rank() as usize - 1];
+        let probe = Arc::new(AtomicU64::new(0));
+        let mut st = State::<MockItem>::new(cfg, probe);
+        let (r, _rx) = req(
+            rec_id(1),
+            WriteClass::Keepalive,
+            WriteKind::CurrentState {
+                logical_id: "m1".to_owned(),
+            },
+            "ka",
+        );
+        st.enqueue(r);
+        // While the escalation crossing is in the future, a wakeup is armed for it.
+        assert!(
+            st.next_wakeup(Instant::now()).is_some(),
+            "a pending escalation crossing arms a future wakeup"
+        );
+        // Advance past the crossing without dispatching (window stays saturated in
+        // production); the record is still idle and queued.
+        tokio::time::advance(bound + Duration::from_secs(1)).await;
+        assert_eq!(
+            st.next_wakeup(Instant::now()),
+            None,
+            "a past-due escalation crossing must not re-arm the timer (#162 busy-spin)"
+        );
+    }
+
+    // ── #164 regression ──────────────────────────────────────────────────────
+    /// An IN-FLIGHT tombstone dominates a same-id current-state exactly like a
+    /// queued one (WB-ISC-12 only exercised the queued case). A keepalive enqueued
+    /// while a leave tombstone is mid-DHT-write must be dropped, not resurrect the
+    /// departed member on peers' rosters.
+    #[tokio::test(start_paused = true)]
+    async fn issue_164_in_flight_tombstone_dominates_same_id_current_state() {
+        let sink = MockSink::new(Duration::from_secs(5));
+        let h = WriteScheduler::spawn(sink.clone(), SchedulerConfig::default());
+        let rec = rec_id(9);
+
+        // A leave tombstone on an idle record dispatches immediately and is now in
+        // flight (its 5s DHT set is running); it is no longer in any queue.
+        let (leave, _rxl) = req(
+            rec,
+            WriteClass::SessionBoundary,
+            WriteKind::Tombstone {
+                logical_id: "m9".into(),
+            },
+            "leave",
+        );
+        h.enqueue(leave);
+        tokio::time::sleep(Duration::from_millis(10)).await; // let it go in-flight
+
+        // A same-id keepalive enqueued WHILE the leave is in flight must be dominated.
+        let (keepalive, ka_reply) = req(
+            rec,
+            WriteClass::Keepalive,
+            WriteKind::CurrentState {
+                logical_id: "m9".into(),
+            },
+            "keepalive",
+        );
+        h.enqueue(keepalive);
+
+        tokio::time::sleep(Duration::from_secs(20)).await;
+
+        let labels: Vec<String> = sink.log().into_iter().map(|r| r.label).collect();
+        assert!(
+            labels.contains(&"leave".to_string()),
+            "the leave tombstone must dispatch"
+        );
+        assert!(
+            !labels.contains(&"keepalive".to_string()),
+            "a same-id keepalive enqueued while the leave is in flight must be dropped"
+        );
+        assert!(
+            ka_reply.await.unwrap().is_ok(),
+            "the dominated keepalive resolves Ok (intent superseded)"
         );
     }
 }
