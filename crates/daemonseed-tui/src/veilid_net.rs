@@ -110,7 +110,7 @@ use daemonseed_core::storage::fetched::{
 };
 use daemonseed_veilid_net::{
     DiscoveryEnvelope, PresenceBoundary, VeilidNet, VeilidNetConfig, VeilidNetError,
-    VeilidNetEvent, VeilidNetHandle, verify_route_advert,
+    VeilidNetEvent, VeilidNetHandle, next_resweep_seed, verify_route_advert,
 };
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
@@ -247,28 +247,6 @@ const STEADY_RESWEEP_TICK: Duration = Duration::from_secs(15);
 /// subscribe/login-sweep read burst (WB-2), never a 70s dead window in which nothing
 /// re-surfaces (review finding). Felt-tunable.
 const STEADY_RESWEEP_WARMUP_HANDOFF: Duration = Duration::from_secs(20);
-
-/// Round-robin selector for the steady-state resweep (#157 generalized). Returns the
-/// next seed to re-sweep: the smallest seed strictly greater than `last`, wrapping when
-/// `last` is `None`, is the largest, or has left the set. **Key-based, not index-based** —
-/// a join/leave that reshapes the set between ticks must never skip a record (an index
-/// cursor over a shifting `Vec` would reintroduce the exact non-delivery bug). Empty set
-/// → `None`. Seeds are sorted+deduped in place for a stable traversal order.
-fn next_resweep_seed(seeds: &mut Vec<[u8; 32]>, last: Option<[u8; 32]>) -> Option<[u8; 32]> {
-    if seeds.is_empty() {
-        return None;
-    }
-    seeds.sort_unstable();
-    seeds.dedup();
-    match last {
-        None => seeds.first().copied(),
-        Some(last) => seeds
-            .iter()
-            .copied()
-            .find(|s| *s > last)
-            .or_else(|| seeds.first().copied()),
-    }
-}
 
 pub async fn veilid_net_actor(
     mut cmd_rx: UnboundedReceiver<NetCommand>,
@@ -1630,22 +1608,6 @@ mod tests {
     use super::*;
     use daemonseed_veilid_net::route_provenance_input;
     use tokio::sync::mpsc::unbounded_channel;
-
-    #[test]
-    fn next_resweep_seed_is_key_based_and_survives_set_changes() {
-        let a = [1u8; 32];
-        let b = [2u8; 32];
-        let c = [3u8; 32];
-        assert_eq!(next_resweep_seed(&mut vec![], None), None);
-        assert_eq!(next_resweep_seed(&mut vec![c, a, b], None), Some(a));
-        assert_eq!(next_resweep_seed(&mut vec![a, b, c], Some(a)), Some(b));
-        assert_eq!(next_resweep_seed(&mut vec![a, b, c], Some(c)), Some(a));
-        assert_eq!(next_resweep_seed(&mut vec![a], Some(a)), Some(a));
-        // A set change between ticks must not skip a record: cursor at `a`, `b` left →
-        // next-greater is `c`, and a cursor at a now-absent `b` still advances to `c`.
-        assert_eq!(next_resweep_seed(&mut vec![a, c], Some(a)), Some(c));
-        assert_eq!(next_resweep_seed(&mut vec![a, c], Some(b)), Some(c));
-    }
 
     #[test]
     fn steady_resweep_hands_off_within_a_short_connect_window() {

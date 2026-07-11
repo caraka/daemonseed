@@ -121,6 +121,7 @@ pub mod error;
 pub mod event;
 pub mod identity;
 mod rendezvous;
+pub mod resweep;
 pub mod schedule;
 pub mod share;
 
@@ -132,6 +133,7 @@ pub use discovery::{
 };
 pub use error::{Result, VeilidNetError};
 pub use event::VeilidNetEvent;
+pub use resweep::next_resweep_seed;
 pub use schedule::{
     SchedulerConfig, WriteClass, WriteKind, WriteRequest, WriteScheduler, WriteSchedulerHandle,
     WriteSink,

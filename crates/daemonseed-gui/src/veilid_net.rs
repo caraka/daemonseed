@@ -91,7 +91,7 @@ use daemonseed_core::storage::fetched::rebase_to_selection_root;
 use daemonseed_proto::v1 as wire;
 use daemonseed_veilid_net::{
     AimdWindow, DiscoveryEnvelope, PresenceBoundary, VeilidNet, VeilidNetConfig, VeilidNetError,
-    VeilidNetEvent, VeilidNetHandle, verify_route_advert,
+    VeilidNetEvent, VeilidNetHandle, next_resweep_seed, verify_route_advert,
 };
 use prost::Message as _;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -194,31 +194,6 @@ fn warmup_priority_records(
     // re-sweep it too to discover shares announced before it subscribed.
     seeds.extend(share);
     seeds
-}
-
-/// Round-robin selector for the steady-state resweep (#157 generalized). Given the
-/// CURRENT subscribed record seeds and the last-swept seed, return the next seed to
-/// re-sweep: the smallest seed strictly greater than `last`, wrapping to the smallest
-/// when `last` is `None`, is the largest, or has itself left the set. **Key-based, not
-/// index-based** — a join/leave that reshapes the set between ticks must never skip a
-/// record (an index cursor over a shifting `Vec` would reintroduce the exact
-/// non-delivery bug this resweep exists to kill). An empty set yields `None` (clean
-/// no-op). The seeds are sorted+deduped in place so the traversal order is stable across
-/// ticks regardless of the caller's insertion order.
-fn next_resweep_seed(seeds: &mut Vec<[u8; 32]>, last: Option<[u8; 32]>) -> Option<[u8; 32]> {
-    if seeds.is_empty() {
-        return None;
-    }
-    seeds.sort_unstable();
-    seeds.dedup();
-    match last {
-        None => seeds.first().copied(),
-        Some(last) => seeds
-            .iter()
-            .copied()
-            .find(|s| *s > last)
-            .or_else(|| seeds.first().copied()),
-    }
 }
 
 /// KIND tag for a MOTD value: the payload is a [`wire::SignedArtifact`].
@@ -2634,30 +2609,6 @@ mod tests {
         );
         // Neither joined → empty (the scheduler re-sweeps nothing that round).
         assert!(warmup_priority_records(None, None, None).is_empty());
-    }
-
-    #[test]
-    fn next_resweep_seed_is_key_based_and_survives_set_changes() {
-        let a = [1u8; 32];
-        let b = [2u8; 32];
-        let c = [3u8; 32];
-        // Empty set → clean no-op (advisor trap #2: no panic/mod-by-zero).
-        assert_eq!(next_resweep_seed(&mut vec![], None), None);
-        // First pick is the smallest, regardless of insertion order.
-        assert_eq!(next_resweep_seed(&mut vec![c, a, b], None), Some(a));
-        // Advance to the next-greater key each tick.
-        assert_eq!(next_resweep_seed(&mut vec![a, b, c], Some(a)), Some(b));
-        assert_eq!(next_resweep_seed(&mut vec![a, b, c], Some(b)), Some(c));
-        // Wrap at the end.
-        assert_eq!(next_resweep_seed(&mut vec![a, b, c], Some(c)), Some(a));
-        // Single element re-selects itself (wrap).
-        assert_eq!(next_resweep_seed(&mut vec![a], Some(a)), Some(a));
-        // Advisor trap #1: a set change between ticks must NOT skip a record. Cursor at
-        // `a`, `b` has left → next-greater is `c` (not a skipped slot or a panic).
-        assert_eq!(next_resweep_seed(&mut vec![a, c], Some(a)), Some(c));
-        // Cursor points at a seed that has itself left the set → still advances to the
-        // next-greater present seed.
-        assert_eq!(next_resweep_seed(&mut vec![a, c], Some(b)), Some(c));
     }
 
     #[test]
