@@ -461,8 +461,8 @@ functions:
       description: The verified chunk bytes and the max per-fragment latency observed.
   - name: VeilidNetHandle::publish_share
     module: daemonseed_veilid_net::actor
-    description: Announce a public share to the lobby with an anti-swap SIGNED route advert — allocate a private route, sign the advert via signer, wrap it with the sealed announcement into a DiscoveryEnvelope, publish on the lobby rendezvous, and re-publish on RouteChanged. Pair with serve_share.
-    signature: "pub async fn publish_share(&self, owner_seed: [u8; 32], share_id: String, sealed_announcement: Vec<u8>, signer: Arc<dyn RouteAdvertSigner>) -> Result<()>"
+    description: Announce a public share to the lobby with an anti-swap SIGNED route advert — allocate a private route, sign the advert via signer, wrap it with the sealed announcement into a DiscoveryEnvelope, and publish on the lobby rendezvous. When persist is true the advert is remembered and re-published on RouteChanged; when false (a withdraw) it is a one-shot write that releases its own route and is never re-published (#163). Pair with serve_share.
+    signature: "pub async fn publish_share(&self, owner_seed: [u8; 32], share_id: String, sealed_announcement: Vec<u8>, signer: Arc<dyn RouteAdvertSigner>, persist: bool) -> Result<()>"
     parameters:
       - name: owner_seed
         type: "[u8; 32]"
@@ -480,6 +480,10 @@ functions:
         type: "Arc<dyn RouteAdvertSigner>"
         direction: in
         description: Least-authority capability signing `share_id ‖ route_blob`.
+      - name: persist
+        type: bool
+        direction: in
+        description: true for a live share (remembered + re-published on RouteChanged/watchdog); false for a one-shot withdraw, written exactly once and never re-lingered (#163).
     returns:
       type: "Result<()>"
       description: Ok once the advert is published.

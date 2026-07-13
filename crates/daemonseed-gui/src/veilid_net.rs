@@ -1849,7 +1849,13 @@ async fn publish_share(
     }
     let signer = IdentityRouteAdvertSigner::from_arc(signing).into_arc();
     if let Err(e) = handle
-        .publish_share(owner_seed, share_id.clone(), sealed, signer)
+        .publish_share(
+            owner_seed,
+            share_id.clone(),
+            sealed,
+            signer,
+            /* persist */ true,
+        )
         .await
     {
         let _ = evt_tx.send(NetEvent::PublishStopped {
@@ -1945,7 +1951,13 @@ async fn unpublish_share(
     };
     let signer = IdentityRouteAdvertSigner::from_arc(signing).into_arc();
     let _ = handle
-        .publish_share(owner_seed, share_id.to_owned(), sealed, signer)
+        .publish_share(
+            owner_seed,
+            share_id.to_owned(),
+            sealed,
+            signer,
+            /* persist */ false,
+        )
         .await;
 }
 

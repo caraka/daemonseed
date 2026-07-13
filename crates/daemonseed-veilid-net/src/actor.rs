@@ -169,13 +169,21 @@ enum Command {
     /// Announce a public share to the lobby with an anti-swap SIGNED route advert
     /// (D-3.5). The actor allocates a private inbound route, asks `signer` to sign
     /// `share_id ‖ route_blob`, wraps it with the sealed announcement into a
-    /// `DiscoveryEnvelope`, and publishes it on the lobby rendezvous; it remembers
-    /// the advert so a `RouteChanged` can re-allocate + re-sign + re-publish.
+    /// `DiscoveryEnvelope`, and publishes it on the lobby rendezvous. When `persist`
+    /// is true it remembers the advert so a `RouteChanged` can re-allocate, re-sign,
+    /// and re-publish. When `persist` is false (a withdraw) the advert is written
+    /// ONCE and NOT remembered: a RouteChanged/watchdog never re-publishes it, so a
+    /// withdraw cannot re-linger and re-race a later reshare on the same
+    /// (#156-deterministic) id (#163); its transient route is released once the
+    /// single write completes.
     PublishShare {
         owner_seed: [u8; 32],
         share_id: String,
         sealed_announcement: Vec<u8>,
         signer: Arc<dyn discovery::RouteAdvertSigner>,
+        /// Remember the advert for `RouteChanged`/watchdog re-publish (a live share)
+        /// vs. a one-shot withdraw that must never re-linger (#163).
+        persist: bool,
         reply: oneshot::Sender<Result<()>>,
     },
     /// Stop serving a share and drop its advert (the teeth of unpublish): removes
@@ -434,18 +442,23 @@ impl VeilidNetHandle {
     /// (`daemonseed_core::public_room::derive_room_veilid_owner_seed`). The advert is
     /// remembered and re-published on `RouteChanged`. Pair with [`Self::serve_share`],
     /// which registers the content this route serves.
+    ///
+    /// `persist` = true for a live share (remembered + re-published); false for a
+    /// one-shot withdraw, which is written exactly once and never re-lingered (#163).
     pub async fn publish_share(
         &self,
         owner_seed: [u8; 32],
         share_id: String,
         sealed_announcement: Vec<u8>,
         signer: Arc<dyn discovery::RouteAdvertSigner>,
+        persist: bool,
     ) -> Result<()> {
         self.send(|reply| Command::PublishShare {
             owner_seed,
             share_id,
             sealed_announcement,
             signer,
+            persist,
             reply,
         })
         .await?
@@ -925,6 +938,7 @@ async fn actor_loop(
                 share_id,
                 sealed_announcement,
                 signer,
+                persist,
                 reply,
             } => {
                 let advert = AdvertState {
@@ -932,18 +946,29 @@ async fn actor_loop(
                     sealed_announcement,
                     signer,
                 };
-                // Remember the advert now (so a RouteChanged / watchdog can refresh it,
-                // and a first-publish write failure self-heals on the next watchdog tick
-                // rather than being lost), then do the route alloc + funnel write OFF the
-                // command loop so it never parks (#154). The scheduler classes the advert
-                // write class-3 and coalesces same-share refreshes (I1/I3).
-                share_adverts.insert(share_id.clone(), advert.clone());
+                // A live share (`persist`) is remembered so a RouteChanged / watchdog
+                // can refresh it, and a first-publish write failure self-heals on the
+                // next watchdog tick rather than being lost. A withdraw (`!persist`) is
+                // a ONE-SHOT write: it is NOT remembered, so a RouteChanged/watchdog
+                // never re-publishes it — the withdraw cannot re-linger and re-race a
+                // later reshare on the same (#156-deterministic) id (#163). Either way
+                // the route alloc + funnel write runs OFF the command loop so it never
+                // parks (#154); the scheduler classes it class-3 and coalesces
+                // same-share refreshes (I1/I3).
+                if persist {
+                    share_adverts.insert(share_id.clone(), advert.clone());
+                }
                 let api = api.clone();
                 let sched = sched.clone();
                 let advert_routes = advert_routes.clone();
                 tokio::spawn(async move {
+                    // `persist` threads into publish_one_advert: a withdraw (false) is a
+                    // one-shot write that releases its OWN route (guarded against a
+                    // concurrent same-id reshare), so it is never remembered for a
+                    // RouteChanged/watchdog re-publish (#163).
                     let res =
-                        publish_one_advert(&api, &sched, &advert_routes, &share_id, &advert).await;
+                        publish_one_advert(&api, &sched, &advert_routes, &share_id, &advert, persist)
+                            .await;
                     let _ = reply.send(res);
                 });
             }
@@ -1436,6 +1461,10 @@ async fn publish_one_advert(
     advert_routes: &Mutex<HashMap<String, RouteId>>,
     share_id: &str,
     advert: &AdvertState,
+    // `false` for a one-shot withdraw: after the single write lands, release the route
+    // this call allocated (guarded so a concurrent reshare's live route is never freed)
+    // instead of leaving it remembered for a RouteChanged/watchdog re-publish (#163).
+    persist: bool,
 ) -> Result<()> {
     let route = api
         .new_private_route()
@@ -1497,6 +1526,24 @@ async fn publish_one_advert(
     });
     if res.is_err() {
         rollback_advert_route(api, advert_routes, share_id, route_id);
+    } else if !persist {
+        // One-shot withdraw: this write backs no remembered advert, so release the
+        // route we just allocated — but ONLY if it is still the entry we installed. A
+        // concurrent reshare (persist=true) on the same #156-deterministic share_id may
+        // have overwritten advert_routes[share_id] with its OWN live route (releasing
+        // ours as its `prev` already); a bare remove-by-key would tear down the
+        // reshare's LIVE route and silently break it (#163 review [0]). Compare-and-
+        // remove under the lock so we only ever free the route this call owns.
+        let mut routes = advert_routes.lock().unwrap();
+        if routes.get(share_id) == Some(&route_id) {
+            routes.remove(share_id);
+            drop(routes);
+            if let Err(e) = api.release_private_route(route_id) {
+                crate::vtrace!(
+                    "publish_one_advert withdraw: release route for {share_id} failed ({e})"
+                );
+            }
+        }
     }
     res
 }
@@ -1529,7 +1576,7 @@ async fn refresh_share_adverts(
     crate::vtrace!("refresh_share_adverts: {} advert(s)", adverts.len());
     let started = std::time::Instant::now();
     for (share_id, st) in adverts {
-        if let Err(e) = publish_one_advert(api, sched, advert_routes, share_id, st).await {
+        if let Err(e) = publish_one_advert(api, sched, advert_routes, share_id, st, true).await {
             crate::vtrace!("refresh_share_adverts: {share_id} ERR ({e})");
         }
     }
