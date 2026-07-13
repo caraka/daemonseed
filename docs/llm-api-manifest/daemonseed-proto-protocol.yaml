@@ -929,8 +929,9 @@ types:
       so the relay holds no share directory (A-S2, A-S1). Sealed under the public
       room key (public tier, server-readable) or a circle cot_key (members-only);
       only the ciphertext rides in CotFrame.payload (A-S16). Relay-agnostic —
-      carries share_id (S21), never server_id.
-    iscs: [A-S1, A-S2, A-S16, S21, C57]
+      carries share_id (S21), never server_id. share_id is receiver-verifiable
+      against sender_pubkey via root_commitment (#156).
+    iscs: [A-S1, A-S2, A-S16, S21, S32, A-S24, C57]
     fields:
       - name: room
         type: string
@@ -953,7 +954,8 @@ types:
         tag: 4
         description: >-
           The share's opaque id (S21); the fetcher derives the rendezvous address
-          public_share_asset_address(share_id, server_id) from it.
+          public_share_asset_address(share_id, server_id) from it. Receiver-verifiable
+          at #156: share_id == derive_share_id_v2(sender_pubkey, root_commitment).
       - name: name
         type: string
         tag: 5
@@ -979,7 +981,18 @@ types:
         tag: 9
         description: >-
           Detached ML-DSA-87 provenance signature over the domain-separated
-          input; a bad signature drops the announcement.
+          input (which binds root_commitment at #156); a bad signature drops the
+          announcement.
+      - name: root_commitment
+        type: bytes
+        tag: 10
+        description: >-
+          48-byte SHA-384 commitment to the shared folder root under a secret
+          identity-derived nonce (#156). A receiver recomputes share_id ==
+          derive_share_id_v2(sender_pubkey, root_commitment) and drops a
+          mismatch; an absent or non-48-byte value is hard-rejected with no
+          legacy arm. Hides the folder path (the nonce is secret). See
+          daemonseed-core share_announce, docs/design/share-id-binding.md.
 
   - name: ShareRollCall
     module: cot

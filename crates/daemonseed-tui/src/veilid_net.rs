@@ -88,7 +88,7 @@ use daemonseed_core::cot::{AssetAddr, asset_address};
 use daemonseed_core::crypto::suite::CNSA_2_0;
 use daemonseed_core::handle::{DisplayMode, Handle};
 use daemonseed_core::heartbeat::{HeartbeatFields, open_heartbeat, seal_public_heartbeat};
-use daemonseed_core::identity::keys::{Identity, SignKeypair, derive_identity_keys};
+use daemonseed_core::identity::keys::{Identity, ShareRootIkm, SignKeypair, derive_identity_keys};
 use daemonseed_core::identity::mnemonic::Mnemonic;
 use daemonseed_core::presence::{
     PRESENCE_TTL, PresenceTracker, REAP_CONGESTION_THRESHOLD, beacon_is_fresh,
@@ -100,7 +100,8 @@ use daemonseed_core::public_room::{
     seal_room_message,
 };
 use daemonseed_core::share_announce::{
-    AnnouncementFields, mint_share_id, open_announcement, seal_public_announcement,
+    AnnouncementFields, derive_root_commitment, derive_share_id_v2, derive_share_root_nonce,
+    open_announcement, seal_public_announcement, share_binding_is_valid,
 };
 use daemonseed_core::share_catalog::{CatalogChange, ShareCatalog, ShareListing};
 use daemonseed_core::share_envelope::ManifestEntry;
@@ -182,6 +183,9 @@ struct DiscoveredRoute {
 #[derive(Clone)]
 struct OwnShare {
     share_id: String,
+    /// (#156) The receiver-verifiable root commitment, so a withdraw carries the
+    /// SAME commitment the id derives from (else a receiver's binding check drops it).
+    root_commitment: Vec<u8>,
     name: String,
     rating: String,
     sharer_handle: String,
@@ -196,6 +200,9 @@ struct ShareState {
     /// `!Clone` yet is needed in two roles at once: sealing announcements
     /// (`&SignKeypair`) and the [`IdentityRouteAdvertSigner`] capability.
     signing: Option<Arc<SignKeypair>>,
+    /// (#156) The stable identity's share-root IKM, behind an `Arc` (secret bytes),
+    /// so a publish derives a receiver-verifiable `share_id`. `None` until Connect.
+    share_root_ikm: Option<Arc<ShareRootIkm>>,
     lobby: Option<LobbyRendezvous>,
     catalog: ShareCatalog,
     discovered: HashMap<String, DiscoveredRoute>,
@@ -210,6 +217,7 @@ impl ShareState {
     fn new() -> Self {
         Self {
             signing: None,
+            share_root_ikm: None,
             lobby: None,
             catalog: ShareCatalog::new(SHARE_CATALOG_TTL),
             discovered: HashMap::new(),
@@ -377,13 +385,18 @@ async fn handle_command(
 ) {
     match cmd {
         NetCommand::Connect {
-            stable_signing_key, ..
+            stable_signing_key,
+            stable_share_root_ikm,
+            ..
         } => {
             // Capture the stable identity key (least-authority: kept behind an Arc
             // for sealing announcements + minting the route-advert capability; the
             // raw key never enters veilid-net). `StableSigningKey` already wraps an
             // `Arc<SignKeypair>`.
             shares.signing = stable_signing_key.map(|k| k.0);
+            // (#156) Capture the share-root IKM (Arc — it holds secret bytes) so a
+            // publish derives a receiver-verifiable share_id from the same identity.
+            shares.share_root_ikm = stable_share_root_ikm.map(Arc::new);
             connect(evt_tx, net, ev_rx).await;
             if net.is_some() {
                 // Subscribe the world-derivable lobby so share announcements fold
@@ -887,6 +900,13 @@ async fn publish_share(
             None,
         );
     };
+    let Some(share_root_ikm) = shares.share_root_ikm.clone() else {
+        return publish_fail(
+            evt_tx,
+            "no identity to derive the share id".to_owned(),
+            None,
+        );
+    };
     // Copy the lobby's address material out so no borrow of `shares` is held
     // across an `.await` (and so the later `shares.own.push` is unobstructed). The
     // advert publishes on the SHARE record (#153), disjoint from the chat record.
@@ -915,13 +935,21 @@ async fn publish_share(
     let file_count = content.file_count();
     let content = Arc::new(content);
 
-    let share_id = mint_share_id();
+    // Receiver-verifiable deterministic id (#156): share_id =
+    // derive_share_id_v2(own_pubkey, root_commitment). The commitment hides the
+    // root under a secret per-share nonce; a republish re-asserts the SAME id and
+    // a v2 receiver rejects any non-derivable id.
+    let root_str = root.to_string_lossy();
+    let nonce = derive_share_root_nonce(share_root_ikm.as_bytes(), &root_str);
+    let root_commitment = derive_root_commitment(&root_str, &nonce);
+    let share_id = derive_share_id_v2(signing.public_key(), &root_commitment);
     let rating = String::new();
     let room_key = PublicRoomKey::from_bytes(room_key_bytes);
     let fields = AnnouncementFields {
         room: DEFAULT_ROOM,
         sender_handle: &sharer_handle,
         share_id: &share_id,
+        root_commitment: &root_commitment,
         name: &name,
         rating: &rating,
         withdraw: false,
@@ -961,6 +989,7 @@ async fn publish_share(
 
     shares.own.push(OwnShare {
         share_id: share_id.clone(),
+        root_commitment: root_commitment.to_vec(),
         name: name.clone(),
         rating,
         sharer_handle,
@@ -1010,6 +1039,10 @@ async fn unpublish_share(
     };
     let own = own.unwrap_or(OwnShare {
         share_id: share_id.to_owned(),
+        // #156: without the recorded commitment a withdraw cannot validate at
+        // receivers; only reached if the own-record was already lost, and
+        // discovery self-heals via the prune TTL regardless.
+        root_commitment: Vec::new(),
         name: String::new(),
         rating: String::new(),
         sharer_handle: String::new(),
@@ -1019,6 +1052,7 @@ async fn unpublish_share(
         room: DEFAULT_ROOM,
         sender_handle: &own.sharer_handle,
         share_id: &own.share_id,
+        root_commitment: &own.root_commitment,
         name: &own.name,
         rating: &own.rating,
         withdraw: true,
@@ -1562,9 +1596,20 @@ fn apply_discovery(
         );
         return true; // consumed: our own announcement is never a discovered share
     }
+    // #156 route-import gate (STANDALONE — not a reliance on the catalog wiring):
+    // never touch the route map for a share whose announcement fails the
+    // receiver-verifiable binding check. Drops a non-derivable announcement before
+    // it can reach either the route map or the catalog.
+    if !share_binding_is_valid(&ann) {
+        daemonseed_veilid_net::vtrace!(
+            "tui lobby: dropping discovery for {} — v2 share_id binding failed (#156)",
+            ann.share_id
+        );
+        return true; // consumed-and-dropped; no route, no catalog fold
+    }
     let now = Instant::now();
     if ann.withdraw {
-        let change = shares.catalog.apply(&ann, now);
+        let change = shares.catalog.apply_verified(&ann, now);
         // #152: gate the ROUTE map on the catalog decision — a forged withdraw
         // (foreign key → owner-mismatch → `Unchanged`) must not evict the owner's
         // route (the fetch path reads `discovered`, not the catalog).
@@ -1587,7 +1632,7 @@ fn apply_discovery(
         );
         return true; // consumed-and-dropped; do not fall through
     }
-    let change = shares.catalog.apply(&ann, now);
+    let change = shares.catalog.apply_verified(&ann, now);
     // #152: only trust the advertised route when the catalog ACCEPTED the announce.
     // An owner-mismatch hijack refresh returns `Unchanged` (first-writer-wins) —
     // skipping the insert prevents the fetch redirect.
@@ -1873,10 +1918,21 @@ mod tests {
     /// route advert signed over `share_id ‖ route_blob`. `blob_to_advertise` is
     /// what the envelope carries; `blob_to_sign` is what the signature commits to
     /// (equal for an honest item, differing to model a MITM route swap).
+    /// Derive a v2-valid `(share_id, root_commitment)` pair for `signer` publishing
+    /// `root` (#156), so an announcement built from them passes the ingest binding.
+    fn v2_ids(signer: &SignKeypair, root: &str) -> (String, Vec<u8>) {
+        let ikm = [0x5au8; 32];
+        let nonce = derive_share_root_nonce(&ikm, root);
+        let rc = derive_root_commitment(root, &nonce);
+        let share_id = derive_share_id_v2(signer.public_key(), &rc);
+        (share_id, rc.to_vec())
+    }
+
     fn discovery_bytes(
         room_key: &PublicRoomKey,
         signer: &SignKeypair,
         share_id: &str,
+        root_commitment: &[u8],
         blob_to_advertise: &[u8],
         blob_to_sign: &[u8],
     ) -> Vec<u8> {
@@ -1884,6 +1940,7 @@ mod tests {
             room: DEFAULT_ROOM,
             sender_handle: "tester",
             share_id,
+            root_commitment,
             name: "demo-share",
             rating: "",
             withdraw: false,
@@ -1904,12 +1961,18 @@ mod tests {
 
     /// A self-signed WITHDRAW envelope (the withdraw path never checks the route
     /// advert, so the route fields are inert); `sent_unix_ms` is fresh so a rejection
-    /// can only come from the owner-check.
-    fn withdraw_bytes(room_key: &PublicRoomKey, signer: &SignKeypair, share_id: &str) -> Vec<u8> {
+    /// can only come from the binding / owner-check.
+    fn withdraw_bytes(
+        room_key: &PublicRoomKey,
+        signer: &SignKeypair,
+        share_id: &str,
+        root_commitment: &[u8],
+    ) -> Vec<u8> {
         let fields = AnnouncementFields {
             room: DEFAULT_ROOM,
             sender_handle: "tester",
             share_id,
+            root_commitment,
             name: "demo-share",
             rating: "",
             withdraw: true,
@@ -1937,20 +2000,22 @@ mod tests {
         let room_key = derive_room_key(DEFAULT_ROOM, &CNSA_2_0).unwrap();
         shares.lobby = Some(lobby());
 
-        let share_id = mint_share_id();
+        let (share_id, rc) = v2_ids(&victim, "/victim/root");
         let vblob = vec![0x11; 96];
         let (evt_tx, mut evt_rx) = unbounded_channel();
         assert!(apply_discovery(
             &mut shares,
             &evt_tx,
-            &discovery_bytes(&room_key, &victim, &share_id, &vblob, &vblob)
+            &discovery_bytes(&room_key, &victim, &share_id, &rc, &vblob, &vblob)
         ));
         let _ = evt_rx.try_recv();
 
+        // Attacker pairs the victim's (share_id, rc) with its own key: the #156
+        // binding check fails → dropped before the withdraw branch, route survives.
         assert!(apply_discovery(
             &mut shares,
             &evt_tx,
-            &withdraw_bytes(&room_key, &attacker, &share_id)
+            &withdraw_bytes(&room_key, &attacker, &share_id, &rc)
         ));
         assert_eq!(shares.catalog.len(), 1, "the victim's share survives");
         assert_eq!(
@@ -1973,21 +2038,23 @@ mod tests {
         let room_key = derive_room_key(DEFAULT_ROOM, &CNSA_2_0).unwrap();
         shares.lobby = Some(lobby());
 
-        let share_id = mint_share_id();
+        let (share_id, rc) = v2_ids(&victim, "/victim/root");
         let vblob = vec![0x33; 96];
         let ablob = vec![0x44; 96];
         let (evt_tx, mut evt_rx) = unbounded_channel();
         assert!(apply_discovery(
             &mut shares,
             &evt_tx,
-            &discovery_bytes(&room_key, &victim, &share_id, &vblob, &vblob)
+            &discovery_bytes(&room_key, &victim, &share_id, &rc, &vblob, &vblob)
         ));
         let _ = evt_rx.try_recv();
 
+        // Attacker re-announces the victim's (share_id, rc) under its own key: the
+        // #156 binding check fails, so the route map is never touched.
         assert!(apply_discovery(
             &mut shares,
             &evt_tx,
-            &discovery_bytes(&room_key, &attacker, &share_id, &ablob, &ablob)
+            &discovery_bytes(&room_key, &attacker, &share_id, &rc, &ablob, &ablob)
         ));
         assert_eq!(
             shares
@@ -2008,9 +2075,9 @@ mod tests {
         let room_key = derive_room_key(DEFAULT_ROOM, &CNSA_2_0).unwrap();
         shares.lobby = Some(lobby());
 
-        let share_id = mint_share_id();
+        let (share_id, rc) = v2_ids(&signer, "/root");
         let blob = vec![0xAB; 96];
-        let bytes = discovery_bytes(&room_key, &signer, &share_id, &blob, &blob);
+        let bytes = discovery_bytes(&room_key, &signer, &share_id, &rc, &blob, &blob);
 
         let (evt_tx, mut evt_rx) = unbounded_channel();
         assert!(apply_discovery(&mut shares, &evt_tx, &bytes));
@@ -2044,10 +2111,10 @@ mod tests {
         shares.lobby = Some(lobby());
         shares.signing = Some(me.clone());
 
-        let share_id = mint_share_id();
+        let (share_id, rc) = v2_ids(me.as_ref(), "/root");
         let blob = vec![0xEF; 96];
         // An honest, well-formed announcement signed by our OWN identity key.
-        let bytes = discovery_bytes(&room_key, me.as_ref(), &share_id, &blob, &blob);
+        let bytes = discovery_bytes(&room_key, me.as_ref(), &share_id, &rc, &blob, &blob);
 
         let (evt_tx, mut evt_rx) = unbounded_channel();
         assert!(
@@ -2073,12 +2140,13 @@ mod tests {
         let room_key = derive_room_key(DEFAULT_ROOM, &CNSA_2_0).unwrap();
         shares.lobby = Some(lobby());
 
-        let share_id = mint_share_id();
+        let (share_id, rc) = v2_ids(&signer, "/root");
         let honest = vec![0x11; 96];
         let rogue = vec![0x22; 96];
         // A MITM keeps the signed announcement + the signature over `honest`, but
-        // swaps in `rogue` as the advertised route blob.
-        let bytes = discovery_bytes(&room_key, &signer, &share_id, &rogue, &honest);
+        // swaps in `rogue` as the advertised route blob. Binding passes (genuine id),
+        // then the route-advert verify fails on the swap.
+        let bytes = discovery_bytes(&room_key, &signer, &share_id, &rc, &rogue, &honest);
 
         let (evt_tx, mut evt_rx) = unbounded_channel();
         assert!(

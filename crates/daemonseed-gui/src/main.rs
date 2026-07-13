@@ -1476,7 +1476,14 @@ fn connect_now(
     match crypto {
         Ok(()) => {
             let (server_id, address) = relay_target();
-            let (display_handle, rejoin_circles, republish_roots, index_params, stable_signing_key) = {
+            let (
+                display_handle,
+                rejoin_circles,
+                republish_roots,
+                index_params,
+                stable_signing_key,
+                stable_share_root_ikm,
+            ) = {
                 let st = state.borrow();
                 (
                     st.display_handle(),
@@ -1489,6 +1496,9 @@ fn connect_now(
                     // (#92) Derive the stable identity signing key ONCE per connect
                     // and hand it to the net actor to hold for composer-gating + signing.
                     st.stable_signing_key(),
+                    // (#156) Derive the share-root IKM ONCE per connect (same
+                    // derivation) so a publish yields a receiver-verifiable share_id.
+                    st.stable_share_root_ikm(),
                 )
             };
             let _ = net.borrow().send(NetCommand::Connect {
@@ -1499,6 +1509,7 @@ fn connect_now(
                 republish_roots,
                 index_params,
                 stable_signing_key,
+                stable_share_root_ikm,
             });
             // #144: raise the "assembling network" startup mask for the cold-start
             // warmup; it is dismissed on the first real content (a Lobby/circle message

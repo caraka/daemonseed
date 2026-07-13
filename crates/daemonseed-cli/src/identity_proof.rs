@@ -30,7 +30,7 @@ use std::fmt;
 
 use daemonseed_core::handle::{DisplayMode, Handle};
 use daemonseed_core::identity::keys::{
-    Identity, SignKeypair, SignatureError, derive_identity_keys,
+    Identity, ShareRootIkm, SignKeypair, SignatureError, derive_identity_keys,
 };
 use daemonseed_core::identity::mnemonic::Mnemonic;
 use daemonseed_core::identity_proof::{
@@ -82,13 +82,23 @@ impl ChannelBindingSource for RustlsClientExporter<'_> {
 /// ML-DSA-87 keypair plus its canonical `<name>#<12hex>` handle.
 pub struct ClientIdentity {
     signing: SignKeypair,
+    /// (#156) The same identity's share-root IKM, so a share published on the
+    /// relay path derives a receiver-verifiable `share_id` from the SAME identity
+    /// the connection proved. Held alongside `signing` (both come from one
+    /// `derive_identity_keys`).
+    share_root_ikm: ShareRootIkm,
     handle: String,
 }
 
 impl ClientIdentity {
-    /// Build from an explicit signing keypair + verify-form handle.
-    pub fn new(signing: SignKeypair, handle: String) -> Self {
-        Self { signing, handle }
+    /// Build from an explicit signing keypair, its share-root IKM (#156), and a
+    /// verify-form handle.
+    pub fn new(signing: SignKeypair, share_root_ikm: ShareRootIkm, handle: String) -> Self {
+        Self {
+            signing,
+            share_root_ikm,
+            handle,
+        }
     }
 
     /// Generate a throwaway client identity: a fresh BIP-39 mnemonic →
@@ -105,6 +115,7 @@ impl ClientIdentity {
             .format(DisplayMode::Verify);
         Ok(Self {
             signing: keys.signing,
+            share_root_ikm: keys.share_root_ikm,
             handle,
         })
     }
@@ -112,6 +123,13 @@ impl ClientIdentity {
     /// The client's canonical verify-form handle.
     pub fn handle(&self) -> &str {
         &self.handle
+    }
+
+    /// (#156) Borrow the client's share-root IKM — the per-share hiding-nonce IKM
+    /// for `derive_share_root_nonce`, so a share published under this identity
+    /// yields a receiver-verifiable `share_id`.
+    pub fn share_root_ikm(&self) -> &ShareRootIkm {
+        &self.share_root_ikm
     }
 
     /// Borrow the client's long-term signing keypair. Used to self-sign

@@ -28,7 +28,8 @@ use daemonseed_core::crypto::suite::CNSA_2_0;
 use daemonseed_core::identity::keys::SignKeypair;
 use daemonseed_core::public_room::{DEFAULT_ROOM, derive_room_key, room_asset_address};
 use daemonseed_core::share_announce::{
-    AnnouncementFields, open_announcement, seal_public_announcement,
+    AnnouncementFields, derive_root_commitment, derive_share_id_v2, derive_share_root_nonce,
+    open_announcement, seal_public_announcement,
 };
 use daemonseed_core::share_catalog::{CatalogChange, ShareCatalog};
 use daemonseed_core::share_rollcall::{RollCallFields, open_rollcall, seal_public_rollcall};
@@ -128,7 +129,13 @@ async fn announce_withdraw_rollcall_round_trip_through_relay() {
         .into_inner();
 
     let sharer = SignKeypair::from_ml_dsa_seed(&[42u8; 32]).unwrap();
-    let share_id = "0123456789abcdef0123456789abcdef";
+    // #156: a receiver-verifiable share_id — derived from the sharer's key + a root
+    // commitment, so the round-trip exercises the full binding through the relay.
+    let root = "/trip/photos";
+    let nonce = derive_share_root_nonce(&[7u8; 32], root);
+    let root_commitment = derive_root_commitment(root, &nonce);
+    let share_id_owned = derive_share_id_v2(sharer.public_key(), &root_commitment);
+    let share_id = share_id_owned.as_str();
     let announce = seal_public_announcement(
         &room_key,
         &sharer,
@@ -136,6 +143,7 @@ async fn announce_withdraw_rollcall_round_trip_through_relay() {
             room: DEFAULT_ROOM,
             sender_handle: "river-otter#aabbccddeeff",
             share_id,
+            root_commitment: &root_commitment,
             name: "trip photos",
             rating: "PG",
             withdraw: false,
@@ -173,9 +181,9 @@ async fn announce_withdraw_rollcall_round_trip_through_relay() {
         "provenance binds the announcement to the sharer's own identity"
     );
     assert_eq!(
-        catalog.apply(&opened, Instant::now()),
+        catalog.apply_verified(&opened, Instant::now()),
         CatalogChange::Added,
-        "a previously-unknown share is added"
+        "a previously-unknown, receiver-verified share is added (#156)"
     );
     assert_eq!(catalog.len(), 1);
     let row = &catalog.entries()[0];
@@ -191,6 +199,7 @@ async fn announce_withdraw_rollcall_round_trip_through_relay() {
             room: DEFAULT_ROOM,
             sender_handle: "river-otter#aabbccddeeff",
             share_id,
+            root_commitment: &root_commitment,
             name: "trip photos",
             rating: "PG",
             withdraw: true,
@@ -205,9 +214,9 @@ async fn announce_withdraw_rollcall_round_trip_through_relay() {
         open_announcement(&room_key, &received.payload).expect("B opens + verifies the withdraw");
     assert!(opened.withdraw, "the withdraw flag survives the round-trip");
     assert_eq!(
-        catalog.apply(&opened, Instant::now()),
+        catalog.apply_verified(&opened, Instant::now()),
         CatalogChange::Removed,
-        "the withdraw drops the share from the catalog"
+        "the receiver-verified withdraw drops the share from the catalog (#156)"
     );
     assert!(
         catalog.is_empty(),

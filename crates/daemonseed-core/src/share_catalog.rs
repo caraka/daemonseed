@@ -44,6 +44,7 @@ use std::time::{Duration, Instant};
 use daemonseed_proto::v1 as wire;
 
 use crate::handle::pubkey_fingerprint;
+use crate::share_announce::share_binding_is_valid;
 
 /// One discovered share — the rendered row of the share browser, built from a
 /// verified [`wire::ShareAnnouncement`]. Carries `sender_pubkey` so the UI can
@@ -143,9 +144,32 @@ impl ShareCatalog {
         }
     }
 
+    /// Ingest gate (#156): fold an announcement ONLY if it passes the
+    /// receiver-verifiable binding check — `share_id ==
+    /// derive_share_id_v2(sender_pubkey, root_commitment)` with a 48-byte
+    /// commitment ([`share_binding_is_valid`]) — else it is a no-op. This is THE
+    /// catalog ingest point every consumer folds through (relay + veilid), so the
+    /// check runs BEFORE either the announce fold or the withdraw branch, on both.
+    /// An absent / non-48-byte / non-derivable announcement folds nothing, with no
+    /// legacy or owner-binding fallback arm (design §2/§3/§5 anti-requirement): an
+    /// attacker can no longer occupy or censor a scraped victim `share_id` by
+    /// pairing it with its own key. Callers MUST use this (not the raw [`apply`],
+    /// which is the pure catalog logic and does NOT check the binding).
+    pub fn apply_verified(&mut self, ann: &wire::ShareAnnouncement, now: Instant) -> CatalogChange {
+        if !share_binding_is_valid(ann) {
+            return CatalogChange::Unchanged;
+        }
+        self.apply(ann, now)
+    }
+
     /// Fold a verified announcement into the catalog. The caller has already
     /// `open_announcement`'d it (so provenance is verified) and confirmed it
     /// belongs to this catalog's room. `now` is the local monotonic receive time.
+    ///
+    /// **The v2 binding is NOT checked here — call [`apply_verified`] at every
+    /// ingest point (#156).** This is the pure catalog state machine (continuity /
+    /// ordering / TTL), left directly callable for unit tests that exercise that
+    /// logic without constructing a fully-derived announcement.
     ///
     /// - `withdraw = true` → remove the share (if the withdraw is at least as new
     ///   as what we hold).
@@ -172,13 +196,16 @@ impl ShareCatalog {
             }
         } else {
             match self.entries.get_mut(&ann.share_id) {
-                // First-writer-wins on identity (#152): a refresh may NOT change the
-                // owner of a known `share_id`. Blocks the takeover/redirect exploit
-                // where a foreign peer re-announces a victim's `share_id` under its
-                // own key + route, so a fetcher intending the victim's share is
-                // redirected. An honest owner always re-derives the same
-                // `share_id = derive_share_id(sender_pubkey, root)`, so a differing
-                // `sender_pubkey` for a live id is never legitimate.
+                // First-writer-wins CONTINUITY (#152, demoted at #156): a refresh may
+                // NOT change the owner of a known `share_id`. Since #156 the security
+                // rests on the ingest binding check (`apply_verified`): a differing
+                // `sender_pubkey` cannot even reach here with a valid id, because
+                // `share_id == derive_share_id_v2(sender_pubkey, root_commitment)`
+                // bakes the key in — a foreign key recomputes to a different id. This
+                // clause is therefore now a pure continuity rule (a known id keeps its
+                // first-seen key), NOT load-bearing for security. NB: no
+                // "id-not-derivable ⇒ accept under owner-binding" escape may be added
+                // here — that is exactly the reopening the binding check closes.
                 Some(cur) if ann.sender_pubkey != cur.sender_pubkey => CatalogChange::Unchanged,
                 Some(cur) if ann.sent_unix_ms < cur.announced_unix_ms => CatalogChange::Unchanged,
                 Some(cur) => {
@@ -333,6 +360,10 @@ mod tests {
             sender_pubkey: vec![1, 2, 3],
             sender_handle: "river-otter#aabbccddeeff".to_owned(),
             share_id: share_id.to_owned(),
+            // The pure-`apply` tests do not exercise the #156 binding (that is
+            // `apply_verified`'s job, tested separately below); an arbitrary
+            // commitment keeps the message well-formed.
+            root_commitment: vec![0u8; 48],
             name: name.to_owned(),
             rating: "PG".to_owned(),
             withdraw,
@@ -457,6 +488,129 @@ mod tests {
         assert_eq!(e.sender_pubkey, vec![1, 2, 3], "owner key must not change");
         assert_eq!(e.name, "real", "hijacker metadata must not overwrite");
         assert_eq!(e.sender_handle, "river-otter#aabbccddeeff");
+    }
+
+    // ── #156 ingest binding gate (apply_verified) ───────────────────────────
+
+    use crate::identity::keys::SignKeypair;
+    use crate::share_announce::{
+        derive_root_commitment, derive_share_id_v2, derive_share_root_nonce,
+    };
+
+    fn signer(seed: u8) -> SignKeypair {
+        let _ = oxicrypt_module::initialize();
+        SignKeypair::from_ml_dsa_seed(&[seed; 32]).unwrap()
+    }
+
+    /// Build a genuinely v2-bound announcement for `(kp, root)`: derive the nonce,
+    /// commitment, and id so `apply_verified` accepts it.
+    fn verified_ann(
+        kp: &SignKeypair,
+        ikm: &[u8],
+        root: &str,
+        name: &str,
+        withdraw: bool,
+        sent_unix_ms: i64,
+    ) -> wire::ShareAnnouncement {
+        let nonce = derive_share_root_nonce(ikm, root);
+        let rc = derive_root_commitment(root, &nonce);
+        let share_id = derive_share_id_v2(kp.public_key(), &rc);
+        wire::ShareAnnouncement {
+            room: "lobby".to_owned(),
+            sender_pubkey: kp.public_key().to_vec(),
+            sender_handle: "river-otter#aabbccddeeff".to_owned(),
+            share_id,
+            root_commitment: rc.to_vec(),
+            name: name.to_owned(),
+            rating: "PG".to_owned(),
+            withdraw,
+            sent_unix_ms,
+            signature: vec![9, 9, 9],
+        }
+    }
+
+    /// #156: a genuine v2 announcement folds; a forged pairing (victim id under
+    /// the attacker's key) folds NOTHING — on both the announce and the withdraw
+    /// branch.
+    #[test]
+    fn apply_verified_folds_genuine_rejects_forged_pairing_both_branches() {
+        let victim = signer(1);
+        let attacker = signer(2);
+        let ikm = [3u8; 32];
+        let mut cat = ShareCatalog::new(Duration::from_secs(60));
+        let t0 = Instant::now();
+
+        let genuine = verified_ann(&victim, &ikm, "/srv/docs", "docs", false, 100);
+        assert_eq!(cat.apply_verified(&genuine, t0), CatalogChange::Added);
+        assert_eq!(cat.len(), 1);
+
+        // Attacker scrapes the victim's id + rc, re-announces under its OWN key.
+        let mut forged = genuine.clone();
+        forged.sender_pubkey = attacker.public_key().to_vec();
+        forged.name = "evil".to_owned();
+        forged.sent_unix_ms = 1_000_000;
+        assert_eq!(
+            cat.apply_verified(&forged, t0 + Duration::from_secs(1)),
+            CatalogChange::Unchanged,
+            "a victim id under the attacker's key must not fold (binding check)"
+        );
+        assert_eq!(cat.entries()[0].name, "docs");
+
+        // Same forged pairing on the WITHDRAW branch is equally inert.
+        let mut forged_withdraw = forged.clone();
+        forged_withdraw.withdraw = true;
+        assert_eq!(
+            cat.apply_verified(&forged_withdraw, t0 + Duration::from_secs(2)),
+            CatalogChange::Unchanged
+        );
+        assert_eq!(
+            cat.len(),
+            1,
+            "the victim's share survives a forged withdraw"
+        );
+    }
+
+    /// #156 (unconditional reject): an announcement with an absent / non-48-byte
+    /// commitment for a scraped victim id folds nothing — no fallback arm.
+    #[test]
+    fn apply_verified_rejects_absent_commitment_for_scraped_id() {
+        let victim = signer(4);
+        let ikm = [5u8; 32];
+        let genuine = verified_ann(&victim, &ikm, "/data", "data", false, 100);
+        let mut cat = ShareCatalog::new(Duration::from_secs(60));
+        // Same id, but the commitment is stripped (proto3 empty-bytes default).
+        let mut stripped = genuine.clone();
+        stripped.root_commitment = Vec::new();
+        assert_eq!(
+            cat.apply_verified(&stripped, Instant::now()),
+            CatalogChange::Unchanged
+        );
+        assert!(cat.is_empty());
+    }
+
+    /// #156 (circle-path parity): the binding gate is tier-independent — a circle
+    /// share folds through the SAME `apply_verified`, so an insider forging a
+    /// circle `share_id` under its own key folds nothing, exactly as on the lobby.
+    #[test]
+    fn apply_verified_circle_path_rejects_insider_forgery() {
+        let owner = signer(6);
+        let insider = signer(7);
+        let ikm = [8u8; 32];
+        let genuine = verified_ann(&owner, &ikm, "/circle/share", "cs", false, 100);
+        let mut cat = ShareCatalog::new(Duration::from_secs(60));
+        assert_eq!(
+            cat.apply_verified(&genuine, Instant::now()),
+            CatalogChange::Added
+        );
+        // An insider (circle member) forges the owner's id under its own key.
+        let mut forged = genuine.clone();
+        forged.sender_pubkey = insider.public_key().to_vec();
+        forged.sent_unix_ms = 1_000_000;
+        assert_eq!(
+            cat.apply_verified(&forged, Instant::now()),
+            CatalogChange::Unchanged
+        );
+        assert_eq!(cat.entries()[0].sender_pubkey, owner.public_key().to_vec());
     }
 
     #[test]

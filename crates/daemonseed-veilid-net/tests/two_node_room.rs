@@ -27,7 +27,8 @@ use daemonseed_core::identity::keys::{derive_identity_keys, Identity, SignKeypai
 use daemonseed_core::identity::mnemonic::Mnemonic;
 use daemonseed_core::public_room::{derive_room_key, derive_room_veilid_owner_seed};
 use daemonseed_core::share_announce::{
-    mint_share_id, open_announcement, seal_public_announcement, AnnouncementFields,
+    derive_root_commitment, derive_share_id_v2, derive_share_root_nonce, open_announcement,
+    seal_public_announcement, AnnouncementFields,
 };
 use daemonseed_veilid_net::{VeilidNet, VeilidNetConfig, VeilidNetEvent};
 
@@ -86,11 +87,19 @@ async fn sealed_share_announcement_reaches_a_second_node() {
     // Seal a real ShareAnnouncement under the public room key; the wire carries
     // only these opaque bytes (server-readable by design, but never cleartext).
     let announcer = SignKeypair::from_ml_dsa_seed(&[7u8; 32]).expect("announcer keypair");
-    let share_id = mint_share_id();
+    // #156: a receiver-verifiable v2 binding — derive share_id from a real
+    // root_commitment (secret-nonce-hidden folder root) so node B's
+    // apply_verified accepts it. A random mint_share_id would be dropped.
+    let share_ikm = [9u8; 32];
+    let share_root = "/srv/vacation-photos";
+    let nonce = derive_share_root_nonce(&share_ikm, share_root);
+    let root_commitment = derive_root_commitment(share_root, &nonce);
+    let share_id = derive_share_id_v2(announcer.public_key(), &root_commitment);
     let fields = AnnouncementFields {
         room: &room,
         sender_handle: "river-otter#aabbccddeeff",
         share_id: &share_id,
+        root_commitment: &root_commitment,
         name: "vacation-photos",
         rating: "",
         withdraw: false,

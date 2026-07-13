@@ -399,7 +399,7 @@ functions:
       - name: share_id
         type: String
         direction: in
-        description: The share's stable id (daemonseed_core::share_announce::derive_share_id).
+        description: The share's stable id (daemonseed_core::share_announce::derive_share_id_v2).
       - name: content
         type: "Arc<ShareContent>"
         direction: in

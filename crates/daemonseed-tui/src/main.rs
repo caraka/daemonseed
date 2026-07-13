@@ -179,11 +179,15 @@ fn run(
             let stable_signing_key = app
                 .stable_signing_key()
                 .map(|k| daemonseed_tui::net::StableSigningKey(std::sync::Arc::new(k)));
+            // (#156) Derive the share-root IKM once here too (same derivation) so
+            // the veilid actor derives a receiver-verifiable share_id on publish.
+            let stable_share_root_ikm = app.stable_share_root_ikm();
             let _ = net.send(NetCommand::Connect {
                 server_id: req.server_id,
                 address: req.address,
                 trusted: req.trusted,
                 stable_signing_key,
+                stable_share_root_ikm,
             });
         }
         if let Some(phrase) = app.take_pending_join() {

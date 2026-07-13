@@ -17,8 +17,10 @@
 //!
 //! Count invariants (kept aligned with `ISA.md` `## Criteria`):
 //!
-//! - 57 server-side: 32 positive (`ISC-S*`) + 25 negative (`ISC-A-S*`)
-//!   (S31 added the #89 UploadMotd in-band signer-set MOTD)
+//! - 63 server-side: 35 positive (`ISC-S*`) + 28 negative (`ISC-A-S*`)
+//!   (S31 added the #89 UploadMotd in-band signer-set MOTD; #156 added
+//!   ISC-S32/S33/S34 pos + ISC-A-S24/A-S25/A-S26 neg — the receiver-verifiable
+//!   share_id binding)
 //! - 123 client-side: 87 positive (`ISC-C*`) + 36 negative (`ISC-A-C*`)
 //!   (M16 A1 added C66 manifest-preview + A-C33 no-blind-download, A2 added C67 selective-fetch,
 //!   A3 added C68 choose-download-dir, A4 added C72 collapsible-folder-tree preview, C1 added C69
@@ -45,7 +47,7 @@
 //!   C98 GUI share-name persistence;
 //!   WB-ISC-9/10/13 pos + WB-ISC-11/12 neg — the WB-3 write scheduler, #159;
 //!   WB-ISC-3/4/5/6/7 pos + WB-ISC-1/2/8 neg — the WB-1 presence model, #159.)
-//! - 193 total
+//! - 200 total
 //!
 //! Deliberately EXCLUDED from [`ISCS`] (and therefore from [`TOTAL`]) because
 //! they are not built: the deferred direct-messaging family
@@ -106,6 +108,13 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-S30", IscClass::Positive),
     // ── server positive (#89 UploadMotd: in-band signer-set MOTD) ────────
     ("ISC-S31", IscClass::Positive),
+    // ── server positive (#156 receiver-verifiable share_id binding; docs/design/
+    //    share-id-binding.md) — three ingest derive-check gates. ────────────────
+    // ISC-S32 catalog fold (announce + withdraw); ISC-S33 route-import gate;
+    // ISC-S34 circle-path parity.
+    ("ISC-S32", IscClass::Positive),
+    ("ISC-S33", IscClass::Positive),
+    ("ISC-S34", IscClass::Positive),
     // ── server negative (24) ────────────────────────────────────────────
     ("ISC-A-S1", IscClass::Negative),
     ("ISC-A-S2", IscClass::Negative),
@@ -133,6 +142,15 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-A-S22", IscClass::Negative),
     // ── server negative (presence heartbeat #74: relay does no heartbeat handling) ──
     ("ISC-A-S23", IscClass::Negative),
+    // ── server negative (#156 receiver-verifiable share_id binding anti-ISCs;
+    //    docs/design/share-id-binding.md). ISC-A-S24 unconditional-reject (absent /
+    //    non-48-byte commitment folds nothing, no fallback arm); ISC-A-S25
+    //    no-random-id-on-publish (no publish path emits a non-derivable id); ISC-A-S26
+    //    path-secrecy (no wire field carries root cleartext; commitment unconfirmable
+    //    without the identity-derived nonce). ──────────────────────────────────────
+    ("ISC-A-S24", IscClass::Negative),
+    ("ISC-A-S25", IscClass::Negative),
+    ("ISC-A-S26", IscClass::Negative),
     // ── client positive (42) — C5 intentionally vacant (R5) ─────────────
     ("ISC-C1", IscClass::Positive),
     ("ISC-C2", IscClass::Positive),
@@ -317,7 +335,7 @@ pub const ISCS: &[(&str, IscClass)] = &[
 /// of truth for the coverage denominator, read live by `xtask isc-coverage`.
 /// Recount on every ISC add/remove (the `const _` assert below guards it
 /// against [`ISCS`]).
-pub const TOTAL: usize = 194;
+pub const TOTAL: usize = 200;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -492,10 +510,15 @@ mod tests {
         //                                  WB-ISC-11/12 neg, #159;
         //                                  WB-1 presence model WB-ISC-3/4/5/6/7 pos +
         //                                  WB-ISC-1/2/8 neg, #159;
-        //                                  WB-4 steady-state re-surfacing WB-ISC-14 neg, #157)
-        //   total   127 pos + 67 neg = 194
-        assert_eq!(pos, 127, "positive count drift");
-        assert_eq!(neg, 67, "negative count drift");
+        //                                  WB-4 steady-state re-surfacing WB-ISC-14 neg, #157;
+        //                                  #156 receiver-verifiable share_id binding:
+        //                                  ISC-S32/S33/S34 pos (catalog / route-import /
+        //                                  circle-path derive-check gates) +
+        //                                  ISC-A-S24/A-S25/A-S26 neg (unconditional-reject /
+        //                                  no-random-id-on-publish / path-secrecy))
+        //   total   130 pos + 70 neg = 200
+        assert_eq!(pos, 130, "positive count drift");
+        assert_eq!(neg, 70, "negative count drift");
     }
 
     /// COVERED is single-sourced and must agree with the per-milestone

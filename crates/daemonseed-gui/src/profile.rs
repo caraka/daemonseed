@@ -23,7 +23,7 @@ use std::path::PathBuf;
 
 use daemonseed_core::first_start::SessionMaterials;
 use daemonseed_core::identity::keys::{
-    Identity, KeyDerivationError, SignKeypair, derive_identity_keys,
+    Identity, KeyDerivationError, ShareRootIkm, SignKeypair, derive_identity_keys,
 };
 use daemonseed_core::profile::persist::{load_for_unlock, write_seeds_blob};
 use daemonseed_core::storage::seeds::{self, IndexKey, SealingKey, Seeds};
@@ -88,6 +88,15 @@ impl Profile {
     /// hold — never per keystroke.
     pub fn stable_signing_key(&self) -> Result<SignKeypair, KeyDerivationError> {
         derive_identity_keys(&self.seeds.mnemonic, Identity::Primary).map(|k| k.signing)
+    }
+
+    /// (#156) Derive the STABLE share-root IKM from the unlocked profile's
+    /// mnemonic — `derive_identity_keys(.., Identity::Primary).share_root_ikm`, the
+    /// fourth expansion of the same identity PRK behind `stable_signing_key`. The
+    /// net actor holds it so a published share derives a receiver-verifiable
+    /// `share_id` (deterministic per (identity, root), stable across republish).
+    pub fn stable_share_root_ikm(&self) -> Result<ShareRootIkm, KeyDerivationError> {
+        derive_identity_keys(&self.seeds.mnemonic, Identity::Primary).map(|k| k.share_root_ikm)
     }
 
     /// (#81) The persisted-index home + key the net actor opens per-share indexes

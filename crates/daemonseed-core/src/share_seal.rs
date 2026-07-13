@@ -304,6 +304,7 @@ mod tests {
                 room: DEFAULT_ROOM,
                 sender_handle: "a#000000000000",
                 share_id: "sid",
+                root_commitment: &[0u8; 48],
                 name: "n",
                 rating: "PG",
                 withdraw: false,

@@ -211,10 +211,47 @@ impl core::fmt::Debug for KemKeypair {
     }
 }
 
+/// Length of the share-root identity IKM (#156). A dedicated 32-byte secret,
+/// the FOURTH expansion of the identity PRK, from which per-share hiding nonces
+/// (`share_announce::derive_share_root_nonce`) are derived. Pinned length —
+/// a second implementation must reproduce it exactly or every `share_id` re-mints.
+pub const SHARE_ROOT_IKM_LEN: usize = 32;
+
 /// Length of the Veilid node identity seed — VLD0 is Ed25519, so these 32
 /// bytes ARE the node's secret seed and the public node key is its Ed25519
 /// verifying key (D3).
 pub const VEILID_NODE_SEED_LEN: usize = 32;
+
+/// The share-root identity IKM (#156). A dedicated secret derived from the same
+/// mnemonic as the ML-DSA/ML-KEM identity but under a domain-separated HKDF label
+/// (`info::DOMAIN_SHARE_ROOT_IKM`), a sibling of [`VeilidNodeSeed`]. It is the ONE
+/// normative IKM for the receiver-verifiable `share_id` binding: every publish
+/// re-derives the per-share hiding nonce from `(this IKM, root)`, so a republish
+/// re-asserts the SAME `share_id` (no `#112`/`#118` ghost-share re-mint). The
+/// ML-DSA secret key is deliberately NOT this IKM — an SK-vs-entropy or GUI-vs-TUI
+/// split would fork the nonce and re-mint the id (both crypto reviews' top risk).
+/// It is identity-scoped (via `info_for`), so a Primary and a Device presentation
+/// of the same folder yield DIFFERENT commitments (no cross-presentation
+/// folder-linkage). Content NEVER derives from this — it binds only the share-id
+/// commitment nonce. Zeroizes on drop; never persisted, never on the wire.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct ShareRootIkm([u8; SHARE_ROOT_IKM_LEN]);
+
+impl ShareRootIkm {
+    /// The raw 32-byte IKM, for deriving a per-share nonce
+    /// (`share_announce::derive_share_root_nonce`).
+    pub fn as_bytes(&self) -> &[u8; SHARE_ROOT_IKM_LEN] {
+        &self.0
+    }
+}
+
+impl core::fmt::Debug for ShareRootIkm {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ShareRootIkm")
+            .field("ikm", &"<redacted>")
+            .finish()
+    }
+}
 
 /// The Veilid node identity seed (D3). Derived from the same mnemonic as the
 /// ML-DSA/ML-KEM identity but under a domain-separated HKDF label
@@ -248,6 +285,8 @@ pub struct IdentityKeys {
     pub kem: KemKeypair,
     /// Veilid node identity seed (D3) — see [`VeilidNodeSeed`].
     pub veilid_node_seed: VeilidNodeSeed,
+    /// Share-root identity IKM (#156) — see [`ShareRootIkm`].
+    pub share_root_ikm: ShareRootIkm,
 }
 
 /// Derive the signing + KEM keypair for one [`Identity`] from a mnemonic.
@@ -314,11 +353,27 @@ pub fn derive_identity_keys(
     .map_err(KeyDerivationError::Hkdf)?;
     let veilid_node_seed = VeilidNodeSeed(*veilid_seed);
 
+    // Share-root IKM (#156): a FOURTH expansion of the SAME PRK under a
+    // domain-separated, identity-scoped label. This 32-byte secret is the ONE
+    // normative IKM for per-share hiding nonces (share_announce), so GUI and TUI
+    // — both re-deriving from the same (mnemonic, identity) — produce the
+    // byte-identical nonce, and a republish re-asserts the same share_id. It
+    // shares no key material with the content/identity keys. Copied into a
+    // self-zeroizing wrapper before the transient buffer drops and zeroes.
+    let mut share_root_ikm_buf = SecretBuffer::<SHARE_ROOT_IKM_LEN>::zero();
+    hkdf.expand(
+        identity.info_for(info::DOMAIN_SHARE_ROOT_IKM).as_bytes(),
+        &mut *share_root_ikm_buf,
+    )
+    .map_err(KeyDerivationError::Hkdf)?;
+    let share_root_ikm = ShareRootIkm(*share_root_ikm_buf);
+
     Ok(IdentityKeys {
         identity,
         signing,
         kem,
         veilid_node_seed,
+        share_root_ikm,
     })
 }
 
@@ -556,5 +611,55 @@ mod tests {
         let a = derive_identity_keys(&m1, Identity::Primary).unwrap();
         let b = derive_identity_keys(&m2, Identity::Primary).unwrap();
         assert_ne!(a.veilid_node_seed.as_bytes(), b.veilid_node_seed.as_bytes());
+    }
+
+    /// #156: the share-root IKM is deterministic for a given (mnemonic, identity)
+    /// — the property the receiver-verifiable `share_id` binding rests on (a
+    /// republish re-derives the SAME nonce → SAME id). It is a real expansion (not
+    /// a left-over zeroed buffer) and never collides with the node seed.
+    #[test]
+    fn share_root_ikm_is_deterministic_derived_and_distinct() {
+        ensure_oxicrypt_initialized();
+        let m = Mnemonic::from_phrase(ALL_ZEROS_PHRASE).unwrap();
+        let a = derive_identity_keys(&m, Identity::Primary).unwrap();
+        let b = derive_identity_keys(&m, Identity::Primary).unwrap();
+        assert_eq!(a.share_root_ikm.as_bytes(), b.share_root_ikm.as_bytes());
+        assert_ne!(a.share_root_ikm.as_bytes(), &[0u8; SHARE_ROOT_IKM_LEN]);
+        // Domain separation: the share-root IKM is NOT the node seed.
+        assert_ne!(
+            a.share_root_ikm.as_bytes().as_slice(),
+            a.veilid_node_seed.as_bytes().as_slice()
+        );
+    }
+
+    /// #156: distinct mnemonics AND distinct identities (Primary vs Device) both
+    /// diverge — so the same folder shared under two presentations yields two
+    /// different commitments (no cross-presentation folder-linkage), and no two
+    /// users ever share a nonce.
+    #[test]
+    fn share_root_ikm_diverges_by_mnemonic_and_identity() {
+        ensure_oxicrypt_initialized();
+        let m1 = Mnemonic::generate().unwrap();
+        let m2 = Mnemonic::generate().unwrap();
+        let a = derive_identity_keys(&m1, Identity::Primary).unwrap();
+        let b = derive_identity_keys(&m2, Identity::Primary).unwrap();
+        assert_ne!(a.share_root_ikm.as_bytes(), b.share_root_ikm.as_bytes());
+
+        let primary = derive_identity_keys(&m1, Identity::Primary).unwrap();
+        let device = derive_identity_keys(&m1, Identity::Device { uuid: Uuid::nil() }).unwrap();
+        assert_ne!(
+            primary.share_root_ikm.as_bytes(),
+            device.share_root_ikm.as_bytes()
+        );
+    }
+
+    #[test]
+    fn debug_redacts_share_root_ikm() {
+        ensure_oxicrypt_initialized();
+        let m = Mnemonic::from_phrase(ALL_ZEROS_PHRASE).unwrap();
+        let keys = derive_identity_keys(&m, Identity::Primary).unwrap();
+        let dbg = format!("{:?}", keys.share_root_ikm);
+        assert!(dbg.contains("<redacted>"));
+        assert!(!dbg.contains("0x"));
     }
 }

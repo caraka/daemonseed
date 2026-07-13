@@ -195,6 +195,12 @@ pub struct ShareAnnouncement {
     /// server_id) for a public share (daemonseed-core cot). This is what the old
     /// PublicShareListing.share_id carried; the announcement hands it out in-band
     /// instead of via the relay registry.
+    ///
+    /// At #156 this is RECEIVER-VERIFIABLE: share_id ==
+    /// derive_share_id_v2(sender_pubkey, root_commitment). Every ingest point
+    /// recomputes it and drops a mismatch, so an attacker can no longer pair a
+    /// scraped victim share_id with its own key (occupation/censorship). See
+    /// daemonseed-core share_announce and docs/design/share-id-binding.md.
     #[prost(string, tag = "4")]
     pub share_id: ::prost::alloc::string::String,
     /// Display name of the shared folder (was PublicShareListing.name).
@@ -216,11 +222,22 @@ pub struct ShareAnnouncement {
     #[prost(int64, tag = "8")]
     pub sent_unix_ms: i64,
     /// Detached ML-DSA-87 provenance signature over the domain-separated signed
-    /// input (room ‖ sender_pubkey ‖ share_id ‖ name ‖ rating ‖ withdraw ‖
-    /// sent_unix_ms). Verified client-side under sender_pubkey; a bad signature
-    /// drops the announcement.
+    /// input (room ‖ sender_pubkey ‖ share_id ‖ root_commitment ‖ name ‖ rating ‖
+    /// withdraw ‖ sent_unix_ms). Verified client-side under sender_pubkey; a bad
+    /// signature drops the announcement. (#156 adds root_commitment to the input.)
     #[prost(bytes = "vec", tag = "9")]
     pub signature: ::prost::alloc::vec::Vec<u8>,
+    /// The receiver-verifiable root commitment (#156): a 48-byte SHA-384 digest
+    /// (daemonseed-core share_announce::derive_root_commitment) binding the share's
+    /// local root path under a secret, identity-derived per-share nonce. It keeps
+    /// the raw path OFF the wire (ISC-A-S2) while letting a receiver recompute
+    /// share_id == derive_share_id_v2(sender_pubkey, root_commitment). Proto3 has no
+    /// `required`, so an omitted field decodes as empty bytes — the binding rests
+    /// ENTIRELY on ingest: an absent or non-48-byte commitment is HARD-REJECTED with
+    /// no legacy / owner-binding-only fallback. Breaking daemonseed-proto change
+    /// (SemVer MAJOR); no live pre-cutover shares exist, so no dual-accept window.
+    #[prost(bytes = "vec", tag = "10")]
+    pub root_commitment: ::prost::alloc::vec::Vec<u8>,
 }
 /// A SHARE ROLL-CALL — the late-join discovery request that pairs with
 /// ShareAnnouncement (design-of-record: docs/design/unified-share-model.md).

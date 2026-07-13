@@ -860,10 +860,13 @@ modules:
 
   - name: daemonseed_core::share_announce
     description: >-
-      Share-announcement sealing. mint_share_id draws a random 128-bit
-      client-side share_id (S21/A-S15); derive_share_id computes a deterministic
-      128-bit share_id from (sender_pubkey, root) so a republish re-asserts the
-      same id (same hex shape, 32 chars). seal_public_announcement / seal_circle_announcement
+      Share-announcement sealing. share_id is the receiver-verifiable v2
+      derivation: derive_share_root_nonce (from the identity-scoped ShareRootIkm)
+      → derive_root_commitment → derive_share_id_v2(sender_pubkey,
+      root_commitment) — a deterministic 128-bit id (32 hex) a republish
+      re-asserts and any receiver recomputes to reject a forged pairing
+      (S21, S32/S33/S34, A-S24/A-S25/A-S26). mint_share_id (random) is retained
+      for tests only, off every publish path. seal_public_announcement / seal_circle_announcement
       self-sign a ShareAnnouncement (ML-DSA, C57) then AES-256-GCM-seal it under
       the public room key or a circle cot_key respectively (the typed key is the
       tier guard — wrong tier is a compile error); AAD = SHARE_ANNOUNCE_AAD,
@@ -907,9 +910,12 @@ modules:
 
   - name: daemonseed_core::share_catalog
     description: >-
-      Client-side catalog of shares discovered in one room/circle. apply() folds
-      a verified ShareAnnouncement: an announce inserts or refreshes, a withdraw
-      removes, an older sent_unix_ms for a known share is ignored. prune() ages
+      Client-side catalog of shares discovered in one room/circle.
+      apply_verified() is the ingest gate — it folds an announcement only after the
+      #156 binding check (share_id == derive_share_id_v2(sender_pubkey,
+      root_commitment)); apply() is the raw fold WITHOUT the check and must not be
+      called at ingest. An announce inserts or refreshes, a withdraw removes, an
+      older sent_unix_ms for a known share is ignored. prune() ages
       entries out past a receive-time TTL; remove() drops one explicitly.
       reconcile_sharer() folds a heartbeat's live-share digest (#76: refresh
       in-digest shares, drop a sharer's shares absent from it); prune_sharer()
@@ -2879,6 +2885,12 @@ types:
       - name: sent_unix_ms
         type: i64
         description: Announcer wall-clock at announce time, unix milliseconds. Advisory.
+      - name: root_commitment
+        type: "&'a [u8]"
+        description: >-
+          48-byte SHA-384 commitment (#156) binding share_id to the folder root
+          under a secret identity-derived nonce; receivers recompute
+          derive_share_id_v2(sender_pubkey, root_commitment) and reject a mismatch.
 
   # ── share_rollcall ──────────────────────────────────────────────────
   - name: RollCallFields
@@ -2906,7 +2918,10 @@ types:
     description: >-
       The live set of shares discovered in one room/circle. new(ttl) constructs
       an empty catalog pruning entries older than ttl (receive-time-measured);
-      apply folds a verified ShareAnnouncement; prune ages entries out; remove
+      apply_verified is the ingest gate — it folds an announcement ONLY after the
+      #156 receiver-verifiable binding check (share_id ==
+      derive_share_id_v2(sender_pubkey, root_commitment)); apply is the raw fold
+      WITHOUT that check and must not be called at ingest. prune ages entries out; remove
       drops one explicitly; entries returns the live shares sorted by name then
       share_id; len / is_empty report size. The caller scopes it to one room
       (it does not re-check the announcement's room field).

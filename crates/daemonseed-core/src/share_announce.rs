@@ -47,6 +47,7 @@
 
 use daemonseed_proto::v1 as wire;
 use oxicrypt_aes::{Aes256Key, ModeError, gcm_decrypt, gcm_encrypt};
+use oxicrypt_kdf::HkdfSha384;
 use oxicrypt_module::Error as OxicryptError;
 use oxicrypt_sha::sha384;
 use prost::Message;
@@ -59,22 +60,27 @@ use crate::public_room::PublicRoomKey;
 use oxicrypt_ml_dsa as ml_dsa;
 
 /// Domain-separation tag bound as AEAD additional-authenticated-data for the
-/// share-announcement seal, distinct from [`crate::circle::message::MESSAGE_AAD`]
-/// and [`crate::public_room::ROOM_MESSAGE_AAD`] so an announcement can never be
-/// opened/confused as a chat or public-room message under an equal key.
-pub const SHARE_ANNOUNCE_AAD: &[u8] = b"daemonseed/share/announce/v1";
+/// share-announcement seal, distinct from [`crate::circle::message::MESSAGE_AAD`],
+/// [`crate::public_room::ROOM_MESSAGE_AAD`], AND from
+/// [`SHARE_ANNOUNCE_PROVENANCE_DOMAIN`] (the #156 v2 split — the two were an
+/// identical string under v1) so an announcement can never be opened/confused as
+/// a chat or public-room message, nor its AEAD-AAD confused with its provenance
+/// domain, under an equal key.
+pub const SHARE_ANNOUNCE_AAD: &[u8] = b"daemonseed/share/announce/aad/v2";
 
 /// Domain-separation prefix for the announcement's provenance signature, bound
 /// first so a share-announcement signature can never be replayed as any other
-/// ML-DSA-87 signature daemonseed produces.
-pub const SHARE_ANNOUNCE_PROVENANCE_DOMAIN: &[u8] = b"daemonseed/share/announce/v1";
+/// ML-DSA-87 signature daemonseed produces. Distinct from [`SHARE_ANNOUNCE_AAD`]
+/// (the #156 v2 split — they were the same string under v1).
+pub const SHARE_ANNOUNCE_PROVENANCE_DOMAIN: &[u8] = b"daemonseed/share/announce/provenance/v2";
 
 /// Mint an opaque, unpredictable `share_id`: 128 bits from the OS CSPRNG,
-/// lowercase-hex encoded (32 chars), so ids are not order-derived and the
-/// published-share space is not enumerable (ISC-S21 / ISC-A-S15). The publisher
-/// mints it client-side and the announcement hands it out in-band. An OS-entropy
-/// failure is unrecoverable (the same posture as every key/nonce draw in the
-/// process), so this panics rather than degrade to a predictable id.
+/// lowercase-hex encoded (32 chars). **Retired from every publish path at #156**
+/// (a randomly-minted id is not receiver-verifiable — a v2 receiver rejects it, an
+/// availability cliff): publishers MUST derive via [`derive_share_id_v2`]. Retained
+/// only as a test helper (an opaque-but-arbitrary / deliberately-non-derivable id);
+/// it appears at NO production publish site. An OS-entropy failure is unrecoverable,
+/// so this panics rather than degrade to a predictable id.
 pub fn mint_share_id() -> String {
     let mut buf = [0u8; 16];
     getrandom::fill(&mut buf).expect("OS CSPRNG entropy for share_id");
@@ -85,6 +91,100 @@ pub fn mint_share_id() -> String {
 /// the identity key material feeds, so the derivation can't collide with another
 /// protocol input.
 const SHARE_ID_DERIVE_DOMAIN: &[u8] = b"daemonseed/share-id/v1";
+
+// ── Receiver-verifiable v2 binding (#156; docs/design/share-id-binding.md) ────
+//
+// FROZEN constants — a second implementation MUST reproduce every value below
+// byte-for-byte, or a republish re-mints the `share_id` (the #112/#118
+// ghost-share bug). Do not change without a coordinated cutover.
+
+/// Pinned, non-empty HKDF-Extract salt for the per-share hiding nonce (#156). No
+/// implicit zero-salt: the salt is normative. FROZEN.
+pub const SHARE_NONCE_SALT: &[u8] = b"daemonseed/share-root-nonce-salt/v2";
+
+/// HKDF-Expand `info` domain-label for the per-share hiding nonce. FROZEN.
+const SHARE_ROOT_NONCE_DOMAIN: &[u8] = b"daemonseed/share-root-nonce/v2";
+
+/// Domain label for the SHA-384 `root_commitment`. FROZEN.
+const SHARE_ROOT_COMMITMENT_DOMAIN: &[u8] = b"daemonseed/share-root-commitment/v2";
+
+/// Domain label for the v2 `share_id` derivation. FROZEN.
+const SHARE_ID_V2_DOMAIN: &[u8] = b"daemonseed/share-id/v2";
+
+/// Byte length of the per-share hiding nonce. Normative / FROZEN.
+pub const SHARE_ROOT_NONCE_LEN: usize = 32;
+
+/// Byte length of the `root_commitment` carried on the wire (a SHA-384 digest).
+/// Normative / FROZEN — ingest hard-rejects any other length.
+pub const ROOT_COMMITMENT_LEN: usize = 48;
+
+/// Length-prefix helper: append `len(bytes) as u64 BE ‖ bytes`, so every
+/// variable-length input is unambiguously bounded (matches [`provenance_input`]'s
+/// `push_field`). `lp(x)` in the design.
+fn push_lp(buf: &mut Vec<u8>, bytes: &[u8]) {
+    buf.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+    buf.extend_from_slice(bytes);
+}
+
+/// Derive the per-share hiding nonce (#156): `HKDF-SHA-384(salt =
+/// [`SHARE_NONCE_SALT`], ikm = the identity's [`crate::identity::keys::ShareRootIkm`]
+/// bytes, info = lp([`SHARE_ROOT_NONCE_DOMAIN`]) ‖ lp(root))` → exactly
+/// [`SHARE_ROOT_NONCE_LEN`] bytes. Deterministic per `(identity, root)`, secret,
+/// never persisted, never on the wire — re-derivable at every republish so the
+/// `share_id` is stable. Panics only on an unrecoverable crypto-module failure.
+pub fn derive_share_root_nonce(ikm: &[u8], root: &str) -> [u8; SHARE_ROOT_NONCE_LEN] {
+    let hkdf = HkdfSha384::extract(Some(SHARE_NONCE_SALT), ikm)
+        .expect("HKDF-Extract for share-root nonce");
+    let mut info = Vec::new();
+    push_lp(&mut info, SHARE_ROOT_NONCE_DOMAIN);
+    push_lp(&mut info, root.as_bytes());
+    let mut out = [0u8; SHARE_ROOT_NONCE_LEN];
+    hkdf.expand(&info, &mut out)
+        .expect("HKDF-Expand for share-root nonce");
+    out
+}
+
+/// Derive the `root_commitment` (#156): `SHA-384(lp([`SHARE_ROOT_COMMITMENT_DOMAIN`])
+/// ‖ lp(root) ‖ lp(nonce))` → [`ROOT_COMMITMENT_LEN`] bytes. An opaque per-share
+/// witness that keeps `root` off the wire while making `share_id` receiver-
+/// recomputable. Hiding, because `nonce` is secret-derived. Panics only on an
+/// unrecoverable crypto-module failure.
+pub fn derive_root_commitment(root: &str, nonce: &[u8]) -> [u8; ROOT_COMMITMENT_LEN] {
+    let mut input = Vec::new();
+    push_lp(&mut input, SHARE_ROOT_COMMITMENT_DOMAIN);
+    push_lp(&mut input, root.as_bytes());
+    push_lp(&mut input, nonce);
+    sha384(&input).expect("crypto module for root_commitment derivation")
+}
+
+/// Derive the receiver-verifiable v2 `share_id` (#156): `SHA-384(lp(
+/// [`SHARE_ID_V2_DOMAIN`]) ‖ lp(sender_pubkey) ‖ lp(root_commitment))[..16]`,
+/// lowercase-hex (32 chars). The id bakes the publisher key in, so occupying a
+/// *specific* victim id is a fixed-target truncated-SHA-384 second preimage (2^128,
+/// no birthday shortcut). A receiver recomputes this from the announcement's own
+/// `sender_pubkey` + `root_commitment` (no secret needed) and rejects any
+/// mismatch. Panics only on an unrecoverable crypto-module failure.
+pub fn derive_share_id_v2(sender_pubkey: &[u8], root_commitment: &[u8]) -> String {
+    let mut input = Vec::new();
+    push_lp(&mut input, SHARE_ID_V2_DOMAIN);
+    push_lp(&mut input, sender_pubkey);
+    push_lp(&mut input, root_commitment);
+    let digest = sha384(&input).expect("crypto module for share_id v2 derivation");
+    digest[..16].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The receiver-side v2 binding check (#156) — the single self-contained predicate
+/// every ingest point gates on: the `root_commitment` MUST be exactly
+/// [`ROOT_COMMITMENT_LEN`] bytes AND `share_id == derive_share_id_v2(sender_pubkey,
+/// root_commitment)`. Needs ONLY wire fields (no IKM), so it runs identically at
+/// the catalog fold, the route-import gate, and the circle path. There is NO
+/// legacy / owner-binding fallback for an absent or malformed commitment — proto3
+/// decodes an omitted `root_commitment` as empty bytes, and this rejects it
+/// (design §2/§5 anti-requirement).
+pub fn share_binding_is_valid(ann: &wire::ShareAnnouncement) -> bool {
+    ann.root_commitment.len() == ROOT_COMMITMENT_LEN
+        && ann.share_id == derive_share_id_v2(&ann.sender_pubkey, &ann.root_commitment)
+}
 
 /// Derive a DETERMINISTIC `share_id` for `root` under the publisher's stable
 /// identity public key `sender_pubkey`. Unlike [`mint_share_id`], the same
@@ -98,6 +198,11 @@ const SHARE_ID_DERIVE_DOMAIN: &[u8] = b"daemonseed/share-id/v1";
 /// already tie the publisher to the share (Demonsaw lineage: a derived, stable
 /// share id). Panics only on an unrecoverable crypto-module failure, the same
 /// posture as `mint_share_id`'s entropy draw.
+/// **Superseded by [`derive_share_id_v2`] (#156).** No publish path calls this —
+/// every publisher moved to the receiver-verifiable v2 derivation. Retained only
+/// for its own unit tests; a v2 receiver rejects any id this produces. Do NOT wire
+/// it into a publish path (that would re-open the #112/#118 re-mint / availability
+/// cliff).
 pub fn derive_share_id(sender_pubkey: &[u8], root: &str) -> String {
     let mut input =
         Vec::with_capacity(SHARE_ID_DERIVE_DOMAIN.len() + 16 + sender_pubkey.len() + root.len());
@@ -119,8 +224,13 @@ pub struct AnnouncementFields<'a> {
     /// The announcer's self-asserted display handle (`name#12hex`). Advisory.
     pub sender_handle: &'a str,
     /// The share's opaque id (ISC-S21) — the fetcher derives the rendezvous
-    /// address from it.
+    /// address from it. At #156 this MUST be
+    /// [`derive_share_id_v2`]`(announcer_pubkey, root_commitment)`.
     pub share_id: &'a str,
+    /// The receiver-verifiable root commitment (#156), exactly
+    /// [`ROOT_COMMITMENT_LEN`] bytes ([`derive_root_commitment`]). Carried on the
+    /// wire; the receiver recomputes `share_id` from `(announcer_pubkey, this)`.
+    pub root_commitment: &'a [u8],
     /// Display name of the shared folder.
     pub name: &'a str,
     /// Sharer-assigned rating label (advisory, never relay-enforced).
@@ -138,10 +248,12 @@ pub struct AnnouncementFields<'a> {
 /// rating, withdraw, time) tuple and cannot be replayed into another room or
 /// flipped from announce to withdraw. Length-prefixing each field makes the
 /// concatenation unambiguous.
+#[allow(clippy::too_many_arguments)]
 fn provenance_input(
     room: &str,
     sender_pubkey: &[u8],
     share_id: &str,
+    root_commitment: &[u8],
     name: &str,
     rating: &str,
     withdraw: bool,
@@ -156,6 +268,11 @@ fn provenance_input(
     push_field(room.as_bytes());
     push_field(sender_pubkey);
     push_field(share_id.as_bytes());
+    // #156: bind the root_commitment into the signed transcript (defense-in-depth
+    // — the id already commits to it transitively, but signing it directly means a
+    // valid signature never covers a mismatched commitment even before the ingest
+    // derive-check runs).
+    push_field(root_commitment);
     push_field(name.as_bytes());
     push_field(rating.as_bytes());
     push_field(&[withdraw as u8]);
@@ -202,6 +319,7 @@ fn seal_announcement_with(
         fields.room,
         &sender_pubkey,
         fields.share_id,
+        fields.root_commitment,
         fields.name,
         fields.rating,
         fields.withdraw,
@@ -217,6 +335,7 @@ fn seal_announcement_with(
         sender_pubkey,
         sender_handle: fields.sender_handle.to_owned(),
         share_id: fields.share_id.to_owned(),
+        root_commitment: fields.root_commitment.to_vec(),
         name: fields.name.to_owned(),
         rating: fields.rating.to_owned(),
         withdraw: fields.withdraw,
@@ -311,6 +430,7 @@ pub fn open_announcement<K: AeadKey256>(
         &message.room,
         &message.sender_pubkey,
         &message.share_id,
+        &message.root_commitment,
         &message.name,
         &message.rating,
         message.withdraw,
@@ -370,6 +490,10 @@ mod tests {
     use crate::identity::keys::SignKeypair;
     use crate::public_room::{DEFAULT_ROOM, derive_room_key};
 
+    /// A fixed 48-byte commitment for round-trip tests that don't exercise the
+    /// binding derivation (seal never validates the commitment; ingest does).
+    const TEST_RC: &[u8] = &[7u8; ROOT_COMMITMENT_LEN];
+
     fn announcer(seed: u8) -> SignKeypair {
         let _ = oxicrypt_module::initialize();
         SignKeypair::from_ml_dsa_seed(&[seed; 32]).unwrap()
@@ -380,6 +504,7 @@ mod tests {
             room: DEFAULT_ROOM,
             sender_handle: "river-otter#aabbccddeeff",
             share_id,
+            root_commitment: TEST_RC,
             name,
             rating: "PG",
             withdraw,
@@ -427,6 +552,123 @@ mod tests {
         assert_ne!(a, derive_share_id(pk, "/srv/other"));
         // A different identity → a different id (no cross-publisher collision).
         assert_ne!(a, derive_share_id(announcer(8).public_key(), "/srv/docs"));
+    }
+
+    /// #156: the full v2 pipeline is self-consistent — a nonce derived from an
+    /// IKM + root yields a commitment, the commitment + pubkey yield an id, and
+    /// `share_binding_is_valid` accepts exactly that (announcer_pubkey, id, rc)
+    /// triple. Deterministic across calls (the stable-republish property).
+    #[test]
+    fn v2_derivation_round_trips_and_binding_validates() {
+        let kp = announcer(3);
+        let pk = kp.public_key();
+        let ikm = [42u8; 32];
+        let root = "/srv/photos";
+        let nonce = derive_share_root_nonce(&ikm, root);
+        assert_eq!(nonce.len(), SHARE_ROOT_NONCE_LEN);
+        // Deterministic: the whole chain re-derives identically (kills #112/#118).
+        assert_eq!(nonce, derive_share_root_nonce(&ikm, root));
+        let rc = derive_root_commitment(root, &nonce);
+        assert_eq!(rc.len(), ROOT_COMMITMENT_LEN);
+        let id = derive_share_id_v2(pk, &rc);
+        assert_eq!(id.len(), 32);
+        assert!(
+            id.bytes()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+        let ann = wire::ShareAnnouncement {
+            room: DEFAULT_ROOM.to_owned(),
+            sender_pubkey: pk.to_vec(),
+            sender_handle: String::new(),
+            share_id: id.clone(),
+            root_commitment: rc.to_vec(),
+            name: "photos".to_owned(),
+            rating: String::new(),
+            withdraw: false,
+            sent_unix_ms: 1,
+            signature: Vec::new(),
+        };
+        assert!(
+            share_binding_is_valid(&ann),
+            "genuine derived triple validates"
+        );
+    }
+
+    /// #156 (occupation resistance): an attacker pairing a victim's `share_id`
+    /// with the attacker's OWN key fails the binding check — the id bakes the key
+    /// in, so a different pubkey never recomputes to the same id.
+    #[test]
+    fn v2_binding_rejects_forged_pairing() {
+        let victim = announcer(4);
+        let attacker = announcer(5);
+        let ikm = [1u8; 32];
+        let root = "/victim/secret";
+        let nonce = derive_share_root_nonce(&ikm, root);
+        let rc = derive_root_commitment(root, &nonce);
+        let victim_id = derive_share_id_v2(victim.public_key(), &rc);
+        // Attacker scrapes victim_id + rc and announces under its own key.
+        let forged = wire::ShareAnnouncement {
+            room: DEFAULT_ROOM.to_owned(),
+            sender_pubkey: attacker.public_key().to_vec(),
+            sender_handle: String::new(),
+            share_id: victim_id,
+            root_commitment: rc.to_vec(),
+            name: "evil".to_owned(),
+            rating: String::new(),
+            withdraw: false,
+            sent_unix_ms: 1,
+            signature: Vec::new(),
+        };
+        assert!(
+            !share_binding_is_valid(&forged),
+            "a victim id under the attacker's key must not validate"
+        );
+    }
+
+    /// #156 (unconditional reject): an absent or non-48-byte `root_commitment`
+    /// fails the binding check outright — no legacy / owner-binding fallback arm.
+    #[test]
+    fn v2_binding_rejects_absent_or_malformed_commitment() {
+        let kp = announcer(6);
+        let ikm = [9u8; 32];
+        let root = "/some/path";
+        let nonce = derive_share_root_nonce(&ikm, root);
+        let rc = derive_root_commitment(root, &nonce);
+        let id = derive_share_id_v2(kp.public_key(), &rc);
+        let base = |root_commitment: Vec<u8>| wire::ShareAnnouncement {
+            room: DEFAULT_ROOM.to_owned(),
+            sender_pubkey: kp.public_key().to_vec(),
+            sender_handle: String::new(),
+            share_id: id.clone(),
+            root_commitment,
+            name: "n".to_owned(),
+            rating: String::new(),
+            withdraw: false,
+            sent_unix_ms: 1,
+            signature: Vec::new(),
+        };
+        // Empty (the proto3-default for an omitted field) is rejected.
+        assert!(!share_binding_is_valid(&base(Vec::new())));
+        // Wrong length is rejected even if it is a prefix of the real commitment.
+        assert!(!share_binding_is_valid(&base(rc[..47].to_vec())));
+        assert!(!share_binding_is_valid(&base(vec![
+            0u8;
+            ROOT_COMMITMENT_LEN + 1
+        ])));
+    }
+
+    /// #156 (path-secrecy): the commitment for the SAME root differs across two
+    /// identities' IKMs — the nonce is secret-derived, so a peer cannot confirm a
+    /// guessed folder path by recomputing the commitment.
+    #[test]
+    fn v2_commitment_differs_across_identities_for_same_root() {
+        let root = "/shared/name";
+        let rc_a = derive_root_commitment(root, &derive_share_root_nonce(&[1u8; 32], root));
+        let rc_b = derive_root_commitment(root, &derive_share_root_nonce(&[2u8; 32], root));
+        assert_ne!(
+            rc_a, rc_b,
+            "distinct IKMs → distinct commitments for one root"
+        );
     }
 
     /// Round-trip under the PUBLIC room key: seal, open, and the embedded
@@ -497,6 +739,7 @@ mod tests {
             DEFAULT_ROOM,
             me.public_key().as_ref(),
             "sid",
+            TEST_RC,
             "n",
             "PG",
             false,
@@ -508,6 +751,7 @@ mod tests {
             sender_pubkey: me.public_key().to_vec(),
             sender_handle: "a#000000000000".to_owned(),
             share_id: "sid".to_owned(),
+            root_commitment: TEST_RC.to_vec(),
             name: "n".to_owned(),
             rating: "PG".to_owned(),
             withdraw: true, // signature does not cover this

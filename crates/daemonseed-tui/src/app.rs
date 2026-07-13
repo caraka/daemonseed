@@ -2134,6 +2134,21 @@ impl App {
         .map(|k| k.signing)
     }
 
+    /// (#156) Derive the STABLE share-root IKM from the unlocked profile's
+    /// mnemonic — the fourth expansion of the same identity PRK as
+    /// [`stable_signing_key`] — for the binary to hand to the veilid actor on
+    /// Connect, so a published share derives a receiver-verifiable `share_id`.
+    /// `None` on the ephemeral / no-profile path or if derivation fails.
+    pub fn stable_share_root_ikm(&self) -> Option<daemonseed_core::identity::keys::ShareRootIkm> {
+        let seeds = self.seeds.as_ref()?;
+        daemonseed_core::identity::keys::derive_identity_keys(
+            &seeds.mnemonic,
+            daemonseed_core::identity::keys::Identity::Primary,
+        )
+        .ok()
+        .map(|k| k.share_root_ikm)
+    }
+
     /// Latest deprecation-warning rows (ISC-C25), for the Deprecation view. One
     /// row per in-use suite the verified policy schedules for retirement.
     pub fn deprecation_warnings(&self) -> &[DeprecationWarningRow] {

@@ -1,6 +1,6 @@
 # Receiver-verifiable `share_id` ↔ publisher binding (#156)
 
-**Status: DRAFT — pending ratification.** Design-of-record for the #156 residual of the
+**Status: BUILT — branch `feat/veilid-migration`, gate GREEN (VM-side), RATIFIED + built 2026-07-12.** Design-of-record for the #156 residual of the
 #152 pre-cutover review. Scope: v0.33.0 cutover (breaking `daemonseed-proto` change);
 not alpha-gating. Companion invariants: ISC-S21, ISC-S30, ISC-A-S2, ISC-A-S22.
 
@@ -42,6 +42,15 @@ share_id        = SHA-384(lp("daemonseed/share-id/v2") ‖ lp(pk) ‖ lp(root_co
 ```
 
 where `lp(x) = len(x) as u64 big-endian ‖ x`.
+
+**Frozen constants (as-built 2026-07-12 — a second implementation MUST reproduce them byte-for-byte or every `share_id` re-mints):**
+
+- **IKM:** `ShareRootIkm` = HKDF-SHA-384-Expand of the identity PRK under info `daemonseed/identity/{primary|device-<uuid>}/share-root-ikm/v2`, **32 bytes** (`identity::keys`, a fourth sibling of `sign`/`kem-d`/`kem-z`/`veilid-node`; the identity entropy, NOT the ML-DSA-87 SK).
+- **`SHARE_NONCE_SALT`** = `b"daemonseed/share-root-nonce-salt/v2"` (non-empty, normative — no implicit zero-salt).
+- **nonce** info label `daemonseed/share-root-nonce/v2`, length **32 bytes**.
+- **`root_commitment`** domain `daemonseed/share-root-commitment/v2`, length **48 bytes**.
+- **`share_id`** domain `daemonseed/share-id/v2`, first **16 bytes** → 32 lowercase-hex.
+- **AAD/provenance split:** AEAD AAD `daemonseed/share/announce/aad/v2`; provenance domain `daemonseed/share/announce/provenance/v2` (distinct at v2).
 
 `root_commitment` (48 bytes) travels as a new `ShareAnnouncement` field. A receiver
 verifies, before folding **and** on the withdraw branch **and** before importing any

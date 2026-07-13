@@ -20,7 +20,7 @@ use daemonseed_cli::public_space::{
 use daemonseed_core::circle::key::{CircleKey, CircleKeyError, circle_fingerprint, derive_cot_key};
 use daemonseed_core::cot::AssetAddr;
 use daemonseed_core::crypto::suite::CNSA_2_0;
-use daemonseed_core::identity::keys::SignKeypair;
+use daemonseed_core::identity::keys::{ShareRootIkm, SignKeypair};
 use daemonseed_core::passphrase::strength::{self, DicewareError};
 use daemonseed_core::storage::seeds::IndexKey;
 use daemonseed_proto::v1 as wire;
@@ -487,6 +487,17 @@ impl GuiState {
         self.profile
             .as_ref()
             .and_then(|p| p.stable_signing_key().ok())
+    }
+
+    /// (#156) The unlocked profile's share-root IKM
+    /// (`Profile::stable_share_root_ikm`), or `None` on the ephemeral / no-profile
+    /// path or if derivation fails. Passed to `NetCommand::Connect` so the net
+    /// actor derives a receiver-verifiable `share_id` for any published share.
+    /// Derived once here per connect (same derivation as the signing key).
+    pub fn stable_share_root_ikm(&self) -> Option<ShareRootIkm> {
+        self.profile
+            .as_ref()
+            .and_then(|p| p.stable_share_root_ikm().ok())
     }
 
     /// (#93) The per-relay last-seen announcements/MOTD content hash for

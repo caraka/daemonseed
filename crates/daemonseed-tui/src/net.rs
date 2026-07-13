@@ -64,7 +64,7 @@ use daemonseed_core::handle::{DisplayMode, Handle};
 use daemonseed_core::heartbeat::{
     HeartbeatFields, open_heartbeat, seal_circle_heartbeat, seal_public_heartbeat,
 };
-use daemonseed_core::identity::keys::SignKeypair;
+use daemonseed_core::identity::keys::{ShareRootIkm, SignKeypair};
 use daemonseed_core::indexer::{CachedHashError, cached_or_hash, reconcile_into};
 use daemonseed_core::presence::{
     HEARTBEAT_INTERVAL_MAX, HEARTBEAT_MISS_COUNT, PresenceTracker, beacon_is_fresh,
@@ -75,7 +75,8 @@ use daemonseed_core::public_room::{
     seal_room_message,
 };
 use daemonseed_core::share_announce::{
-    AnnouncementFields, mint_share_id, open_announcement, seal_public_announcement,
+    AnnouncementFields, derive_root_commitment, derive_share_id_v2, derive_share_root_nonce,
+    open_announcement, seal_public_announcement,
 };
 use daemonseed_core::share_catalog::{CatalogChange, ShareCatalog, ShareListing};
 use daemonseed_core::share_envelope::{ManifestEntry, ShareFrame};
@@ -129,6 +130,13 @@ pub enum NetCommand {
         /// ephemeral connection key. `None` on the ephemeral / no-profile path
         /// (read-only public space, no composer).
         stable_signing_key: Option<StableSigningKey>,
+        /// (#156) the unlocked profile's share-root IKM (the fourth expansion of
+        /// the identity PRK, same `derive_identity_keys` as `stable_signing_key`).
+        /// The veilid actor holds it so a publish derives a receiver-verifiable
+        /// `share_id`. `None` on the ephemeral / no-profile path. (`ShareRootIkm`
+        /// is `Clone` + redacted `Debug`, so it rides the enum directly — no
+        /// wrapper needed.)
+        stable_share_root_ikm: Option<ShareRootIkm>,
     },
     /// Join a circle by its shared phrase: derive the circle key, subscribe to
     /// the rendezvous asset on the connected relay, and stream chat (ISC-15/16).
@@ -766,6 +774,9 @@ struct PublicRoom {
 #[derive(Clone)]
 struct OwnShare {
     share_id: String,
+    /// (#156) The receiver-verifiable root commitment, so a re-announce / roll-call
+    /// answer / withdraw carries the SAME commitment the id derives from.
+    root_commitment: Vec<u8>,
     name: String,
     rating: String,
     sharer_handle: String,
@@ -931,6 +942,10 @@ async fn net_actor(
                 address,
                 trusted,
                 stable_signing_key,
+                // (#156) The relay share path signs + derives from the ephemeral
+                // `ClientIdentity` (which carries its own IKM); the stable IKM is
+                // consumed only by the veilid actor.
+                stable_share_root_ikm: _,
             } => {
                 actor
                     .handle_connect(&server_id, &address, trusted, stable_signing_key)
@@ -1063,23 +1078,29 @@ impl Actor {
                 root: None,
             });
         };
-        // Mint the share id CLIENT-side (unified share model): the relay no
-        // longer assigns it, which makes it relay-portable (a future cross-relay
-        // path) and removes the last relay-held share state.
-        let share_id = mint_share_id();
+        // Derive the receiver-verifiable share id CLIENT-side (#156, unified share
+        // model): share_id = derive_share_id_v2(own_pubkey, root_commitment). The
+        // commitment hides the root under a secret, identity-derived per-share
+        // nonce; deterministic per (identity, root) so a republish re-asserts the
+        // SAME id, relay-portable, and a v2 receiver rejects a randomly-minted id.
+        let root_str = root.to_string_lossy();
+        let nonce = derive_share_root_nonce(identity.share_root_ikm().as_bytes(), &root_str);
+        let root_commitment = derive_root_commitment(&root_str, &nonce);
+        let share_id = derive_share_id_v2(identity.signing().public_key(), &root_commitment);
         let own_shares = Rc::clone(&self.own_shares);
 
         // Seal the announcement NOW, while `identity` (which is `!Clone` —
         // `SignKeypair` zeroes on drop and has no clone) is still borrowable from
         // `&self`. The detached flow only moves the finished `Vec<u8>` + the
         // lobby address/sender, never the signing key. The announcement does not
-        // depend on the hash result: the share id is already minted and the
+        // depend on the hash result: the share id is already derived and the
         // listing metadata is known up front. Empty rating (advisory).
         let rating = String::new();
         let announce_fields = AnnouncementFields {
             room: &room.room,
             sender_handle: &sharer_handle,
             share_id: &share_id,
+            root_commitment: &root_commitment,
             name: &name,
             rating: &rating,
             withdraw: false,
@@ -1223,6 +1244,7 @@ impl Actor {
             // for the relay's owner-scoped registry record).
             own_shares.borrow_mut().push(OwnShare {
                 share_id: share_id.clone(),
+                root_commitment: root_commitment.to_vec(),
                 name: name.clone(),
                 rating,
                 sharer_handle,
@@ -1313,6 +1335,9 @@ impl Actor {
             room: &room.room,
             sender_handle: &own.sharer_handle,
             share_id: &own.share_id,
+            // #156: carry the stored commitment so the re-announce / withdraw
+            // recomputes to the same id at every receiver.
+            root_commitment: &own.root_commitment,
             name: &own.name,
             rating: &own.rating,
             withdraw,
@@ -1345,7 +1370,10 @@ impl Actor {
     /// catalog mutation runs here on `&mut self`; the inbound reader only opens
     /// the frame and posts the command.
     fn handle_apply_announcement(&mut self, ann: &wire::ShareAnnouncement) {
-        let change = self.share_catalog.apply(ann, Instant::now());
+        // #156: `apply_verified` runs the receiver-verifiable binding check before
+        // folding (both announce + withdraw), dropping a scraped victim id under a
+        // foreign key here.
+        let change = self.share_catalog.apply_verified(ann, Instant::now());
         if change != CatalogChange::Unchanged {
             self.emit_shares_snapshot();
         }

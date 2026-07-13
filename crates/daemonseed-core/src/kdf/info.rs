@@ -44,9 +44,20 @@ pub const DOMAIN_KEM_Z: &str = "kem-z";
 /// from this — it binds only the node/transport identity.
 pub const DOMAIN_VEILID_NODE: &str = "veilid-node";
 
+/// Domain separator for the share-root identity IKM (#156). The FOURTH expansion
+/// of the identity PRK (sibling of `sign` / `kem-d` / `kem-z` / `veilid-node`),
+/// yielding the ONE normative 32-byte secret from which per-share hiding nonces
+/// derive (`share_announce::derive_share_root_nonce`). Passed through
+/// [`primary`]/[`device`] so the IKM is identity-scoped — a Primary and a Device
+/// presentation of the same folder produce different share-id commitments. The
+/// ML-DSA secret key is NOT this IKM (an SK-vs-entropy split would fork the nonce
+/// and re-mint the id). Content NEVER derives from this — it binds only the
+/// share-id commitment nonce.
+pub const DOMAIN_SHARE_ROOT_IKM: &str = "share-root-ikm/v2";
+
 /// Build the full HKDF info string for the primary identity's given domain.
 /// `domain` is one of `DOMAIN_SIGN`, `DOMAIN_KEM_D`, `DOMAIN_KEM_Z`,
-/// `DOMAIN_VEILID_NODE`.
+/// `DOMAIN_VEILID_NODE`, `DOMAIN_SHARE_ROOT_IKM`.
 pub fn primary(domain: &str) -> String {
     format!("{PRIMARY_PREFIX}/{domain}")
 }
@@ -280,6 +291,12 @@ mod tests {
         assert_eq!(primary(DOMAIN_SIGN), "daemonseed/identity/primary/sign");
         assert_eq!(primary(DOMAIN_KEM_D), "daemonseed/identity/primary/kem-d");
         assert_eq!(primary(DOMAIN_KEM_Z), "daemonseed/identity/primary/kem-z");
+        // #156: the share-root IKM label (frozen — a second implementation must
+        // reproduce it byte-for-byte or every share_id re-mints).
+        assert_eq!(
+            primary(DOMAIN_SHARE_ROOT_IKM),
+            "daemonseed/identity/primary/share-root-ikm/v2"
+        );
         assert_eq!(
             device("123e4567-e89b-12d3-a456-426614174000", DOMAIN_SIGN),
             "daemonseed/identity/device-123e4567-e89b-12d3-a456-426614174000/sign"
