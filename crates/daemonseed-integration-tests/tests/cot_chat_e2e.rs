@@ -20,6 +20,7 @@ use daemonseed_core::circle::key::{EXAMPLE_ENTROPY, derive_cot_key};
 use daemonseed_core::circle::message::{open_message, seal_message};
 use daemonseed_core::cot::asset_address;
 use daemonseed_core::crypto::suite::CNSA_2_0;
+use daemonseed_integration_tests::isc_coverage::Coverage;
 use daemonseed_proto::v1 as wire;
 use daemonseed_server::cot::CotRegistry;
 use daemonseed_server::public_space::{PublicSpaceService, PublicSpaceState, serve_application};
@@ -154,5 +155,25 @@ async fn two_members_chat_through_relay_with_sealed_envelope() {
     assert!(
         open_message(&outsider, &received.payload).is_err(),
         "a non-member cannot decrypt the circle chat"
+    );
+}
+
+#[test]
+fn isc_c99_covered() {
+    // ISC-C99: a circle chat message is self-signed for per-sender authorship
+    // (the circle analog of ISC-S24 / ISC-C57), exercised end-to-end above by
+    // `two_members_chat_through_relay_with_sealed_envelope`, which opens the
+    // relayed message and asserts its `sender_pubkey` matches the signer. #150
+    // registers the integration coverage the criterion had only at the unit
+    // level (daemonseed_core::room_message::cannot_forge_authorship_as_another_member).
+    let mut c = Coverage::empty();
+    c.register(
+        "ISC-C99",
+        "two_members_chat_through_relay_with_sealed_envelope",
+    );
+    assert_eq!(
+        c.covered_count(),
+        1,
+        "ISC-C99 registered (#150 circle-chat per-sender authorship)"
     );
 }

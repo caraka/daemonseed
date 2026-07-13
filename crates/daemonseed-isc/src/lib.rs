@@ -21,7 +21,7 @@
 //!   (S31 added the #89 UploadMotd in-band signer-set MOTD; #156 added
 //!   ISC-S32/S33/S34 pos + ISC-A-S24/A-S25/A-S26 neg — the receiver-verifiable
 //!   share_id binding)
-//! - 123 client-side: 87 positive (`ISC-C*`) + 36 negative (`ISC-A-C*`)
+//! - 124 client-side: 88 positive (`ISC-C*`) + 36 negative (`ISC-A-C*`)
 //!   (M16 A1 added C66 manifest-preview + A-C33 no-blind-download, A2 added C67 selective-fetch,
 //!   A3 added C68 choose-download-dir, A4 added C72 collapsible-folder-tree preview, C1 added C69
 //!   multi-share-publish, C2 added C70 status-auto-clear, C3 added C71 generate-circle-phrase;
@@ -261,6 +261,8 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-C97", IscClass::Positive),
     // ── client positive (#41: GUI share-name persistence — a named share auto-republishes under it) ──
     ("ISC-C98", IscClass::Positive),
+    // ── client positive (#150: circle-chat per-sender authorship, room↔circle convergence) ──
+    ("ISC-C99", IscClass::Positive),
     // ── client negative (20) ────────────────────────────────────────────
     ("ISC-A-C1", IscClass::Negative),
     ("ISC-A-C2", IscClass::Negative),
@@ -335,7 +337,7 @@ pub const ISCS: &[(&str, IscClass)] = &[
 /// of truth for the coverage denominator, read live by `xtask isc-coverage`.
 /// Recount on every ISC add/remove (the `const _` assert below guards it
 /// against [`ISCS`]).
-pub const TOTAL: usize = 200;
+pub const TOTAL: usize = 201;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -364,14 +366,14 @@ pub const MILESTONE_COVERED: &[(&str, usize)] = &[
     ("M7", 5),
     ("M12", 0),
     ("alpha2", 28),
-    ("alpha3", 10),
+    ("alpha3", 11),
 ];
 
 /// Distinct ISCs covered by a registered integration test — the SINGLE source
 /// of truth for the coverage numerator, read live by `xtask isc-coverage`
 /// (it replaced a hand-maintained `COVERED_ISCS` mirror in xtask). Equals the
 /// sum of [`MILESTONE_COVERED`] (guarded by `covered_sum_matches`).
-pub const COVERED: usize = 110;
+pub const COVERED: usize = 111;
 
 const _: () = assert!(
     COVERED <= TOTAL,
@@ -506,6 +508,8 @@ mod tests {
         //                                  GUI circle-detail name vectors C96 pos, #36;
         //                                  right-click clipboard context menu C97 pos, #67;
         //                                  GUI share-name persistence C98 pos, #41;
+        //                                  circle-chat per-sender authorship C99 pos, #150
+        //                                  (room↔circle convergence #145-147);
         //                                  WB-3 write scheduler WB-ISC-9/10/13 pos +
         //                                  WB-ISC-11/12 neg, #159;
         //                                  WB-1 presence model WB-ISC-3/4/5/6/7 pos +
@@ -516,8 +520,8 @@ mod tests {
         //                                  circle-path derive-check gates) +
         //                                  ISC-A-S24/A-S25/A-S26 neg (unconditional-reject /
         //                                  no-random-id-on-publish / path-secrecy))
-        //   total   130 pos + 70 neg = 200
-        assert_eq!(pos, 130, "positive count drift");
+        //   total   131 pos + 70 neg = 201
+        assert_eq!(pos, 131, "positive count drift");
         assert_eq!(neg, 70, "negative count drift");
     }
 
