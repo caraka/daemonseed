@@ -32,19 +32,31 @@
 //!   same-id current-state write, and any same-id current-state enqueued while a
 //!   withdraw is pending is dropped (the #121/#118 share-resurrection guard). Chat ring
 //!   writes are never coalesced or dropped.
-//! - **I4 — chat latency bound.** A chat write to an idle record dispatches immediately
-//!   (well under 2s at any queue depth); chat holds a reserved dispatch slot and is
-//!   never counted against I5's non-chat cap.
-//! - **I5 — bounded in-flight.** Non-chat in-flight sets are capped by the
-//!   [`crate::aimd::AimdWindow`] pacer, fed enqueue-to-ack latency; the queue
-//!   rate-limits, not merely orders.
-//! - **I6b — deadline override.** A write with a hard DHT expiry (operator MOTD/
-//!   announcement keepalive, #158) dispatches ahead of class order once its deadline
-//!   passes.
+//! - **I4 — chat latency bound (WB-5.1 / I5″.4 re-scope).** Chat writes draw the
+//!   dedicated 2-permit chat pool: up to two concurrent cross-record chats dispatch
+//!   ≤ 2s at any non-chat queue depth; a third waits only on chat, never on non-chat.
+//!   Never counted against the window.
+//! - **I5 / I5″ — partitioned lanes (WB-5.1 amendment, 2026-07-13).** The §I5′.2
+//!   acquire-wait window CONTROLLER is **retired** — under the four DEDICATED
+//!   [`crate::dht_gate::DhtGate`] pools (chat / floor / write / read) the window equals
+//!   the write partition size, so it carries no acquire-wait signal to control on. The
+//!   non-chat window is the STATIC `min(distinct pending non-chat records, W_max)` and
+//!   never varies with any latency signal (WB-ISC-16). `W_max` is the frozen constant 2
+//!   (a step-up is gated on WB-ISC-19). Reads never draw the write pool, so reads and
+//!   writes cannot starve each other; genuine offered load stays priced by the WB-1/WB-2
+//!   rate ceilings, not a controller.
+//! - **I6b — deadline override (WB-5.1 / I5″.5 re-home).** A write with a hard DHT
+//!   expiry (operator MOTD/announcement keepalive, #158) dispatches via the FLOOR lane
+//!   ahead of all age-based floor candidates, its permit wait bounded by one in-flight
+//!   floor set (`slack ≥ 660s` guarantees it lands inside the TTL).
 //! - **I7 — shutdown flush + shed.** On graceful close, pending chat + tombstones/
 //!   withdraws flush within the close budget; class-3/4/5 current-state writes are shed.
-//! - **I8 — starvation floor.** A write older than its class's age bound escalates one
-//!   class (bounds class-5 starvation → the #157 zero-discovery symptom).
+//! - **I8 — starvation floor (WB-5.1 / I5″.5).** I8's "escalates one class" stays the
+//!   window-lane ordering rule; additionally a non-chat write whose `starved_since` age
+//!   exceeds `FLOOR_AGE = 2 × age_bounds[class]` becomes eligible for the dedicated
+//!   capacity-1 FLOOR lane — an ADDITIONAL guaranteed slot, so saturated aggregate write
+//!   concurrency is `W_max + 1`, never 1 (bounds class-5 starvation → the #157 symptom).
+//!   `starved_since` survives I3 coalescing so a cadence-refreshed id still ages.
 //! - **I9 — no read-triggered writes.** The enqueue surface accepts only write intents;
 //!   no read/render/reap path can reach it (WB-0's derived rule, enforced structurally
 //!   by there being no write-emitting call from the read side).
@@ -62,28 +74,71 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
-use crate::aimd::AimdWindow;
 use crate::error::{Result, VeilidNetError};
 
 /// A DHT record's identity for FIFO + coalescing scope — the rendezvous owner seed
 /// (a `set_dht_value` targets one record derived from one owner seed).
 pub type RecordId = [u8; 32];
 
+/// Which DHT-gate pool a dispatched write draws (WB-5.1 / I5″.1). The scheduler picks
+/// the lane; the sink acquires the matching pool (chat → `acquire_chat`, floor →
+/// `acquire_floor`, window → `acquire_write`). There is no cross-pool fallback, so the
+/// combined-in-flight proof is pool arithmetic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DispatchLane {
+    /// Chat / user-action write (I4) — the 2-permit chat pool, never waits on non-chat.
+    Chat,
+    /// The I8 starvation-floor + I6b deadline lane (I5″.5) — the 1-permit floor pool,
+    /// an ADDITIONAL guaranteed write slot.
+    Floor,
+    /// The non-chat window lane (I5) — the `W_max`-permit write pool.
+    Window,
+}
+
+/// The result of one [`WriteSink`] dispatch: the write's outcome plus the
+/// permit-acquire-wait the sink observed acquiring its [`crate::dht_gate::DhtGate`]
+/// permit.
+pub struct DispatchOutcome {
+    /// The DHT write result.
+    pub result: Result<()>,
+    /// Permit-acquire-wait — the delay between requesting the DHT-gate permit and
+    /// getting one. Under WB-5.1's dedicated pools the window equals the write-pool
+    /// size, so a window-dispatched write acquires immediately and this is ~zero; it is
+    /// **telemetry only** (WB-5.1 / I5″.3, WB-ISC-27) — the §I5′.2 acquire-wait window
+    /// controller is retired, and no scheduler/gate/window logic consumes it. `None`
+    /// when the transport cannot surface it.
+    pub acquire_wait: Option<Duration>,
+}
+
+impl DispatchOutcome {
+    /// An outcome with no acquire-wait signal (the I5′.2 fallback shape).
+    pub fn bare(result: Result<()>) -> Self {
+        Self {
+            result,
+            acquire_wait: None,
+        }
+    }
+}
+
 /// The future a [`WriteSink`] returns for one dispatch: owns its data so the
 /// scheduler can spawn it off the driver loop.
-pub type DispatchFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
+pub type DispatchFuture = Pin<Box<dyn Future<Output = DispatchOutcome> + Send>>;
 
 /// The seam over the physical DHT write (WB-2 oracle requirement). The scheduler
-/// decides WHEN and IN WHAT ORDER to write; the sink performs one write and returns
-/// its result. Production wires this to the existing per-record dispatch functions
-/// (so #131 + ring-seq-in-`record_lock` stay untouched); the oracle wires a counting
-/// mock with an injected clock, so the whole scheduler is testable in paused time
-/// with no live DHT.
+/// decides WHEN and IN WHAT ORDER to write and on WHICH [`DispatchLane`]; the sink
+/// acquires the matching [`crate::dht_gate::DhtGate`] pool (chat / floor / write —
+/// WB-5.1 / I5″.1), performs one write, and returns its [`DispatchOutcome`]. Production
+/// wires this to the existing per-record dispatch functions (so #131 + ring-seq-in-
+/// `record_lock` stay untouched); the oracle wires a counting mock with an injected
+/// clock, so the whole scheduler is testable in paused time with no live DHT.
 pub trait WriteSink: Send + Sync + 'static {
     /// The opaque per-write dispatch token the scheduler carries and hands back.
     type Item: Send + 'static;
-    /// Perform one DHT write. The returned future is spawned off the driver loop.
-    fn dispatch(&self, item: Self::Item) -> DispatchFuture;
+    /// Perform one DHT write on `lane` — the sink acquires that pool's permit (chat
+    /// draws the chat pool and never waits on non-chat, floor draws the 1-permit floor
+    /// pool, window draws the `W_max` pool; no cross-pool fallback — WB-5.1 / I5″.1).
+    /// The returned future is spawned off the driver loop.
+    fn dispatch(&self, item: Self::Item, lane: DispatchLane) -> DispatchFuture;
 }
 
 /// Priority class (WB-3.I1), highest priority first. `rank()` is the sort key
@@ -168,28 +223,26 @@ pub struct WriteRequest<D> {
     pub reply: Option<oneshot::Sender<Result<()>>>,
 }
 
-/// Tunable scheduler parameters. Defaults track the WB-2 freeze.
+/// Tunable scheduler parameters. Defaults track the WB-2/WB-5.1 freeze.
 #[derive(Clone, Copy, Debug)]
 pub struct SchedulerConfig {
-    /// AIMD floor — at least one non-chat write may always be in flight (I5).
-    pub nonchat_floor: usize,
-    /// AIMD ceiling / initial non-chat in-flight cap (I5 = 2).
+    /// `W_max` — the frozen non-chat window ceiling (WB-5.1 / I5″.1 = 2). The window
+    /// is the STATIC `min(distinct pending non-chat records, W_max)` — the §I5′.2
+    /// acquire-wait controller is retired, so there is no dynamic guard state. A
+    /// step-up is gated on the WB-ISC-19 single-client orinoco control; do NOT raise it
+    /// here.
     pub nonchat_cap: usize,
-    /// Enqueue-to-ack latency at/above which the AIMD window halves (I5 breach).
-    pub latency_threshold: Duration,
-    /// Per-class starvation age bound (I8), indexed by `rank()-1`. A queued write
-    /// older than its class's bound escalates one class.
+    /// Per-class starvation age bound (I8), indexed by `rank()-1`. Used for I8 window
+    /// escalation (a write older than its bound escalates one class) AND, doubled, for
+    /// the floor-lane eligibility predicate `FLOOR_AGE = 2 × age_bounds[class]`
+    /// (WB-5.1 / I5″.5). Both measured against `starved_since` (survives coalescing).
     pub age_bounds: [Duration; 5],
 }
 
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
-            nonchat_floor: 1,
             nonchat_cap: 2,
-            // Healthy DHT writes are single-digit seconds (WB-2); a sustained
-            // enqueue-to-ack past 10s is congestion → shrink the window.
-            latency_threshold: Duration::from_secs(10),
             // chat(unused) / session / advert / keepalive / republish.
             age_bounds: [
                 Duration::from_secs(2),
@@ -255,14 +308,27 @@ enum SchedMsg<D> {
 /// the single-threaded driver so all state mutation stays in one place.
 struct Done {
     record: RecordId,
-    is_chat: bool,
-    /// Enqueue-to-ack latency — the AIMD congestion signal (WB-1.10 / I5).
+    /// Which lane this write drew (WB-5.1 / I5″.1) — `on_done` decrements the matching
+    /// counter (`window_in_flight` / `floor_in_flight`; chat draws neither).
+    lane: DispatchLane,
+    /// Enqueue-to-ack latency — the WB-1.10 reaper congestion signal, fed to the
+    /// median-of-5 DHT-weather estimator (WB-5.1 / I5″.6) published to the reaper.
     latency: Duration,
+    /// Permit-acquire-wait — telemetry ONLY (WB-5.1 / I5″.3, WB-ISC-27); no control
+    /// decision consumes it. `None` when the sink could not surface it.
+    acquire_wait: Option<Duration>,
 }
 
 struct Pending<D> {
     seq: u64,
+    /// Enqueue instant — stays fresh on every (re)enqueue, so enqueue-to-ack latency
+    /// measures the actual wait of the write that dispatched.
     enqueued: Instant,
+    /// Starvation clock (WB-5.1 / I5″.5): set to `enqueued` on first enqueue, but
+    /// INHERITED from the elder across I3 coalescing (`drop_same_id_current_state`) so a
+    /// perpetually-refreshed id still ages to the I8 escalation and the floor lane.
+    /// Distinct from `enqueued`, which resets on each coalescing supersession.
+    starved_since: Instant,
     class: WriteClass,
     kind: WriteKind,
     deadline: Option<Instant>,
@@ -284,11 +350,13 @@ impl WriteScheduler {
         Self::spawn_with_probe(sink, cfg, Arc::new(AtomicU64::new(0)))
     }
 
-    /// As [`Self::spawn`], but publishes each non-chat write's enqueue-to-ack
-    /// latency (millis) into `latency_probe` on completion — the WB-1.10 /
-    /// WB-ISC-5 congestion signal the presence reaper reads to suspend reaping
-    /// while the local funnel is backed up. The probe is the SAME signal feeding
-    /// the AIMD pacer (I5); exposing it costs one relaxed store per write.
+    /// As [`Self::spawn`], but publishes the **DHT-weather regime estimator** (WB-5.1 /
+    /// I5″.6) into `latency_probe` on each non-chat completion — the MEDIAN (millis) of
+    /// the last [`LATENCY_WINDOW`] enqueue-to-ack latencies. The presence reaper reads
+    /// it (through the `ReapGate` hysteresis band + resume grace) to suspend reaping
+    /// while the DHT regime is elevated (WB-1.10 / WB-ISC-5), and the UI honesty state
+    /// consumes it for the "presence may be stale" signal. Observable only — no consumer
+    /// enqueues writes from it (I9).
     pub fn spawn_with_probe<S: WriteSink>(
         sink: Arc<S>,
         cfg: SchedulerConfig,
@@ -313,26 +381,59 @@ struct State<D> {
     /// tombstone is mid-write is dominated exactly like a queued one (WB-ISC-12),
     /// closing the window where a keepalive resurrects a just-departed member.
     in_flight_tombstone: HashMap<RecordId, String>,
-    /// Count of NON-chat writes in flight (the I5 cap subject; chat is uncapped).
-    nonchat_in_flight: usize,
-    /// AIMD pacer for the non-chat in-flight window (I5).
-    window: AimdWindow,
-    /// Most-recent non-chat enqueue-to-ack latency in millis (WB-1.10 congestion
-    /// signal), published for the presence reaper via the handle.
+    /// Window-lane writes in flight (WB-5.1 / I5″.1): the I5 window subject, capped at
+    /// `min(distinct pending non-chat records, W_max)`. Chat and floor draw their own
+    /// pools and are counted separately.
+    window_in_flight: usize,
+    /// Floor-lane writes in flight (WB-5.1 / I5″.5): capacity 1, the ADDITIONAL
+    /// guaranteed slot for deadline-due + floor-age-eligible writes. A floor dispatch
+    /// neither consumes nor releases a window slot.
+    floor_in_flight: usize,
+    /// The published **DHT-weather regime estimator** (WB-5.1 / I5″.6): the **median**
+    /// (millis) of the last [`LATENCY_WINDOW`] non-chat enqueue-to-ack latencies,
+    /// exposed for the presence reaper (WB-1.10 reap-in-calm, via the `ReapGate`
+    /// band+grace) and the UI honesty state. OBSERVABLE only — no consumer may enqueue
+    /// writes from it (I9 stands). A median needs 3 of 5 recent completions on the far
+    /// side to cross, so it is robust to a single outlier in both directions.
     latency_probe: Arc<AtomicU64>,
+    /// The rolling window of the last [`LATENCY_WINDOW`] non-chat latencies behind
+    /// [`Self::latency_probe`] (WB-5.1 / I5″.6 median-of-5, replacing the EMA).
+    latency_ring: VecDeque<u64>,
     seq: u64,
+}
+
+/// The DHT-weather estimator window (WB-5.1 / I5″.6): the published regime signal is
+/// the median of the last 5 non-chat enqueue-to-ack latencies. Replaces the §I5′.3 EMA
+/// — a median-of-5 needs 3 of 5 completions on the far side to cross, so it rejects a
+/// single fast straggler (the EMA-fast-exit chatter the freeze refuted) and recovers in
+/// ~3 fast completions.
+const LATENCY_WINDOW: usize = 5;
+
+/// The median of the current latency window (millis). Fewer than a full window uses
+/// what is present; an empty window reads 0 (no regime signal yet).
+fn median_ms(ring: &VecDeque<u64>) -> u64 {
+    // Median over a FULL window of LATENCY_WINDOW samples: a partial (warmup) window is
+    // padded with calm (0) samples, so a single slow outlier cannot cross the band
+    // before LATENCY_WINDOW real samples accumulate — the 3-of-5 robustness (WB-5.1 /
+    // I5″.6) holds from the first sample, not only once the ring fills. Reaping runs
+    // calm through warmup, which is safe: no member is TTL-stale (600s) that early.
+    let mut v: Vec<u64> = ring.iter().copied().collect();
+    v.resize(LATENCY_WINDOW.max(v.len()), 0);
+    v.sort_unstable();
+    v[v.len() / 2]
 }
 
 impl<D: Send + 'static> State<D> {
     fn new(cfg: SchedulerConfig, latency_probe: Arc<AtomicU64>) -> Self {
         Self {
-            window: AimdWindow::new(cfg.nonchat_floor, cfg.nonchat_cap),
             cfg,
             queues: HashMap::new(),
             in_flight: HashSet::new(),
             in_flight_tombstone: HashMap::new(),
-            nonchat_in_flight: 0,
+            window_in_flight: 0,
+            floor_in_flight: 0,
             latency_probe,
+            latency_ring: VecDeque::with_capacity(LATENCY_WINDOW),
             seq: 0,
         }
     }
@@ -340,6 +441,9 @@ impl<D: Send + 'static> State<D> {
     /// Apply the I3 coalescing + dominance rules and enqueue (or drop) the request.
     fn enqueue(&mut self, req: WriteRequest<D>) {
         let now = Instant::now();
+        // Starvation clock (WB-5.1 / I5″.5): fresh for a genuinely new write, inherited
+        // from the coalesced elder for a refreshed current-state (set below).
+        let mut starved_since = now;
         // An in-flight tombstone dominates a same-id current-state exactly like a
         // queued one (#164 / WB-ISC-12); capture it before borrowing the record queue.
         let in_flight_tomb = self.in_flight_tombstone.get(&req.record).cloned();
@@ -360,8 +464,13 @@ impl<D: Send + 'static> State<D> {
                     resolve_ok(req.reply);
                     return;
                 }
-                // Last-writer-wins coalescing: drop the older same-id current-state.
-                drop_same_id_current_state(q, logical_id);
+                // Last-writer-wins coalescing: drop the older same-id current-state,
+                // INHERITING its starvation clock (WB-5.1 / I5″.5) so a keepalive/advert
+                // re-enqueued every cadence still ages to the I8 escalation + floor lane
+                // instead of resetting below the bound forever.
+                if let Some(elder) = drop_same_id_current_state(q, logical_id) {
+                    starved_since = elder;
+                }
             }
             WriteKind::Tombstone { logical_id } => {
                 // A tombstone supersedes any queued same-id current-state (they must
@@ -384,6 +493,7 @@ impl<D: Send + 'static> State<D> {
         let pending = Pending {
             seq: self.seq,
             enqueued: now,
+            starved_since,
             class: req.class,
             kind: req.kind,
             deadline: req.deadline,
@@ -394,7 +504,12 @@ impl<D: Send + 'static> State<D> {
         q.push_back(pending);
     }
 
-    /// Dispatch as many eligible writes as the invariants allow (I1/I2/I4/I5/I6b/I8).
+    /// Dispatch as many eligible writes as the invariants allow across the three write
+    /// lanes (WB-5.1 / I5″). Each lane draws its own DHT-gate pool; per-record
+    /// single-flight (I2) is shared — a record dispatched on ANY lane leaves `in_flight`,
+    /// so the other lanes will not re-pick it (selection + marking is atomic because the
+    /// scheduler driver is single-threaded — `dispatch` inserts `in_flight`
+    /// synchronously before spawning). Lane order per pass: floor, chat, window.
     fn try_dispatch<S: WriteSink<Item = D>>(
         &mut self,
         sink: &Arc<S>,
@@ -402,28 +517,55 @@ impl<D: Send + 'static> State<D> {
     ) {
         let now = Instant::now();
         loop {
-            // (I6b) Deadline override: a write past its hard expiry dispatches ahead
-            // of class order and bypasses the I5 cap — expiry is data loss, not
-            // staleness. Still respects per-record single-flight.
-            if let Some(rec) = self.pick_deadline_due(now) {
-                self.dispatch(rec, sink, done_tx);
-                continue;
+            // Floor lane (WB-5.1 / I5″.5), capacity 1 — the ADDITIONAL guaranteed slot:
+            // a deadline-due write (I6b) or a non-chat write whose starved-age exceeds
+            // FLOOR_AGE, from an idle record. Deadline-first, then (class rank,
+            // starved-age). This is a priority dispatch path WITHIN the one funnel (I1),
+            // not a second funnel.
+            if self.floor_in_flight < 1 {
+                if let Some(rec) = self.pick_floor(now) {
+                    self.dispatch(rec, DispatchLane::Floor, sink, done_tx);
+                    continue;
+                }
             }
-            // (I4) Chat: an idle record whose head is chat dispatches immediately on a
-            // reserved slot, never counted against the I5 cap, at any queue depth.
+            // Chat lane (I4): an idle record whose head is chat dispatches on the chat
+            // pool at any depth, never counted against the window (WB-ISC-10). Two
+            // concurrent cross-record chats proceed; a third waits only on chat.
             if let Some(rec) = self.pick_chat_ready() {
-                self.dispatch(rec, sink, done_tx);
+                self.dispatch(rec, DispatchLane::Chat, sink, done_tx);
                 continue;
             }
-            // (I1/I5/I8) Non-chat under the AIMD window: highest effective priority.
-            if self.nonchat_in_flight < self.window.window() {
+            // Window lane (I5): non-chat under the STATIC record-scaled window
+            // min(distinct pending non-chat records, W_max) — never varies with any
+            // latency signal (WB-ISC-16; the §I5′.2 acquire-wait controller is retired).
+            // Floor-eligible heads remain window candidates too (dual eligibility), so
+            // saturated aggregate write concurrency is W_max + 1, never 1.
+            let window = self.distinct_pending_nonchat().min(self.cfg.nonchat_cap);
+            if self.window_in_flight < window {
                 if let Some(rec) = self.pick_best_nonchat(now) {
-                    self.dispatch(rec, sink, done_tx);
+                    self.dispatch(rec, DispatchLane::Window, sink, done_tx);
                     continue;
                 }
             }
             break;
         }
+    }
+
+    /// Distinct records that could occupy a WINDOW slot (WB-5.1 / I5″.1): idle records
+    /// whose head is a non-chat write, plus the records already holding a window-lane
+    /// write. `min(this, W_max)` is the window — no point widening past the number of
+    /// records that can use it, and per-record single-flight (I2) caps each at one
+    /// in-flight write. Floor-lane in-flight records are busy (via the floor pool), not
+    /// competing for window slots, so they are NOT counted here.
+    fn distinct_pending_nonchat(&self) -> usize {
+        let idle_nonchat = self
+            .queues
+            .iter()
+            .filter(|(rec, q)| {
+                self.idle(rec) && q.front().is_some_and(|p| p.class != WriteClass::Chat)
+            })
+            .count();
+        idle_nonchat + self.window_in_flight
     }
 
     /// A record is dispatchable only when it has no write in flight (per-record
@@ -433,18 +575,51 @@ impl<D: Send + 'static> State<D> {
         !self.in_flight.contains(rec)
     }
 
-    fn pick_deadline_due(&self, now: Instant) -> Option<RecordId> {
-        self.queues
+    /// FLOOR_AGE for a class (WB-5.1 / I5″.5) = 2 × its I8 age bound. A non-chat write
+    /// whose starved-age exceeds this is floor-lane eligible.
+    fn floor_age(&self, class: WriteClass) -> Duration {
+        self.cfg.age_bounds[(class.rank() - 1) as usize] * 2
+    }
+
+    /// The floor picker (WB-5.1 / I5″.5): among IDLE records' non-chat heads (I2 — the
+    /// picker skips records with a write in flight, so a busy-record elder can never
+    /// head-of-line-block the floor permit), select deadline-due writes first (by
+    /// deadline, then seq — I6b re-homed onto the floor lane), else floor-age-eligible
+    /// writes by (class rank, oldest `starved_since`, seq): class before age, so a
+    /// confidentiality-relevant class-2 withdraw is never queued behind an older cosmetic
+    /// class-5 republish on the capacity-1 lane.
+    fn pick_floor(&self, now: Instant) -> Option<RecordId> {
+        let deadline_due = self
+            .queues
             .iter()
             .filter(|(rec, q)| self.idle(rec) && !q.is_empty())
             .filter_map(|(rec, q)| {
                 let head = q.front().unwrap();
+                if head.class == WriteClass::Chat {
+                    return None;
+                }
                 head.deadline
                     .filter(|d| *d <= now)
                     .map(|d| (*rec, d, head.seq))
             })
             .min_by(|a, b| a.1.cmp(&b.1).then(a.2.cmp(&b.2)))
-            .map(|(rec, _, _)| rec)
+            .map(|(rec, _, _)| rec);
+        if deadline_due.is_some() {
+            return deadline_due;
+        }
+        self.queues
+            .iter()
+            .filter(|(rec, q)| self.idle(rec) && !q.is_empty())
+            .filter_map(|(rec, q)| {
+                let head = q.front().unwrap();
+                if head.class == WriteClass::Chat {
+                    return None;
+                }
+                (now.saturating_duration_since(head.starved_since) >= self.floor_age(head.class))
+                    .then_some((*rec, head.class.rank(), head.starved_since, head.seq))
+            })
+            .min_by(|a, b| a.1.cmp(&b.1).then(a.2.cmp(&b.2)).then(a.3.cmp(&b.3)))
+            .map(|(rec, _, _, _)| rec)
     }
 
     fn pick_chat_ready(&self) -> Option<RecordId> {
@@ -469,14 +644,15 @@ impl<D: Send + 'static> State<D> {
             .map(|(rec, _, _)| rec)
     }
 
-    /// I8: a write older than its class's age bound escalates one class (a smaller
-    /// rank sorts ahead). Escalation only reorders within the non-chat pool — it
-    /// never grants the chat reserved slot / I5 bypass (that is keyed on the
-    /// original class, not the escalated rank).
+    /// I8: a write whose starved-age exceeds its class's age bound escalates one class
+    /// (a smaller rank sorts ahead). Measured against `starved_since` (survives
+    /// coalescing — WB-5.1 / I5″.5), NOT `enqueued`, so a cadence-refreshed keepalive
+    /// still escalates. Escalation only reorders the window pool; it never grants the
+    /// chat lane (keyed on the original class).
     fn effective_rank(&self, p: &Pending<D>, now: Instant) -> u8 {
         let rank = p.class.rank();
         let bound = self.cfg.age_bounds[(rank - 1) as usize];
-        if now.saturating_duration_since(p.enqueued) >= bound {
+        if now.saturating_duration_since(p.starved_since) >= bound {
             rank.saturating_sub(1).max(1)
         } else {
             rank
@@ -486,6 +662,7 @@ impl<D: Send + 'static> State<D> {
     fn dispatch<S: WriteSink<Item = D>>(
         &mut self,
         rec: RecordId,
+        lane: DispatchLane,
         sink: &Arc<S>,
         done_tx: &mpsc::UnboundedSender<Done>,
     ) {
@@ -496,15 +673,19 @@ impl<D: Send + 'static> State<D> {
         if q.is_empty() {
             self.queues.remove(&rec);
         }
-        let is_chat = p.class == WriteClass::Chat;
         self.in_flight.insert(rec);
         // Track an in-flight tombstone so a same-id current-state enqueued before it
         // acks is dominated (#164). Cleared in `on_done`.
         if let WriteKind::Tombstone { logical_id } = &p.kind {
             self.in_flight_tombstone.insert(rec, logical_id.clone());
         }
-        if !is_chat {
-            self.nonchat_in_flight += 1;
+        // Split lane counters (WB-5.1 / I5″.5): `on_done` decrements the matching one via
+        // the `Done.lane` tag. A floor dispatch neither consumes nor releases a window
+        // slot. Chat draws neither.
+        match lane {
+            DispatchLane::Window => self.window_in_flight += 1,
+            DispatchLane::Floor => self.floor_in_flight += 1,
+            DispatchLane::Chat => {}
         }
         let sink = sink.clone();
         let done_tx = done_tx.clone();
@@ -515,17 +696,32 @@ impl<D: Send + 'static> State<D> {
             ..
         } = p;
         tokio::spawn(async move {
-            let res = sink.dispatch(item).await;
-            // Enqueue-to-ack (queue wait + lock wait + set RTT) — the WB-1.10 / I5
-            // congestion signal, NOT set-RTT alone.
+            // #168 panic supervision (WB-5.1 / I5″.8, WB-ISC-26). The sink's write future
+            // is BUILT AND run in an INNER task — the `sink.dispatch(...)` construction is
+            // moved INSIDE the spawn, so a SYNCHRONOUS panic during future construction is
+            // caught by the join exactly like a panic in the async body. Either path
+            // returns here and still sends a `Done`, so `on_done` releases the in-flight
+            // slot AND the lane counter (`window_in_flight` / `floor_in_flight` → 0), and
+            // the sink's RAII DHT-gate permit unwinds. Without this a panicked write never
+            // sent `Done` → a leaked lane counter silently wedges the capacity-1 floor
+            // lane (build-1's silent-starvation class).
+            let outcome = match tokio::spawn(async move { sink.dispatch(item, lane).await }).await {
+                Ok(o) => o,
+                Err(_join_err) => DispatchOutcome::bare(Err(VeilidNetError::Actor(
+                    "write dispatch task panicked".into(),
+                ))),
+            };
+            // Enqueue-to-ack (queue wait + lock wait + set RTT) — the WB-1.10 reaper
+            // congestion signal fed to the median estimator, NOT set-RTT alone.
             let latency = enqueued.elapsed();
             if let Some(reply) = reply {
-                let _ = reply.send(res);
+                let _ = reply.send(outcome.result);
             }
             let _ = done_tx.send(Done {
                 record: rec,
-                is_chat,
+                lane,
                 latency,
+                acquire_wait: outcome.acquire_wait,
             });
         });
     }
@@ -533,16 +729,32 @@ impl<D: Send + 'static> State<D> {
     fn on_done(&mut self, d: Done) {
         self.in_flight.remove(&d.record);
         self.in_flight_tombstone.remove(&d.record);
-        if !d.is_chat {
-            self.nonchat_in_flight = self.nonchat_in_flight.saturating_sub(1);
-            // Feed the AIMD pacer: a slow enqueue-to-ack shrinks the non-chat window
-            // (I5 rate-limits, not merely orders).
-            self.window.observe(d.latency, self.cfg.latency_threshold);
-            // Publish the same signal for the presence reaper (WB-1.10 / WB-ISC-5).
-            self.latency_probe.store(
-                u64::try_from(d.latency.as_millis()).unwrap_or(u64::MAX),
-                Ordering::Relaxed,
-            );
+        // Release the lane counter the write drew (WB-5.1 / I5″.5). A leaked counter
+        // here silently wedges the capacity-1 floor lane — the `Done.lane` tag makes
+        // decrement unambiguous even on the panic path (WB-ISC-26).
+        match d.lane {
+            DispatchLane::Window => self.window_in_flight = self.window_in_flight.saturating_sub(1),
+            DispatchLane::Floor => self.floor_in_flight = self.floor_in_flight.saturating_sub(1),
+            DispatchLane::Chat => {}
+        }
+        // Feed the median-of-5 DHT-weather estimator on non-chat completions (WB-5.1 /
+        // I5″.6): push the enqueue-to-ack latency into the rolling window and publish the
+        // MEDIAN (millis) for the presence reaper (via the `ReapGate` band+grace) and the
+        // UI honesty state. Observable only — no write is enqueued from it (I9). The
+        // `acquire_wait` field is telemetry only now (WB-ISC-27); no guard consumes it.
+        if d.lane != DispatchLane::Chat {
+            // acquire_wait is TRACE telemetry only (WB-ISC-27): recorded, never fed to a
+            // control decision — the §I5′.2 window controller that consumed it is retired.
+            if let Some(aw) = d.acquire_wait {
+                crate::vtrace!("dispatch acquire_wait={aw:?} (telemetry only, WB-ISC-27)");
+            }
+            let sample = d.latency.as_millis().min(u128::from(u64::MAX)) as u64;
+            self.latency_ring.push_back(sample);
+            while self.latency_ring.len() > LATENCY_WINDOW {
+                self.latency_ring.pop_front();
+            }
+            self.latency_probe
+                .store(median_ms(&self.latency_ring), Ordering::Relaxed);
         }
     }
 
@@ -555,19 +767,31 @@ impl<D: Send + 'static> State<D> {
             .filter(|(rec, q)| self.idle(rec) && !q.is_empty())
             .flat_map(|(_, q)| {
                 let head = q.front().unwrap();
-                let rank = head.class.rank();
-                let esc = head.enqueued + self.cfg.age_bounds[(rank - 1) as usize];
-                // A deadline (I6b) wakes immediately when due: `pick_deadline_due`
-                // dispatches it bypassing the I5 cap, so it clears the queue — no spin.
-                // An escalation crossing (I8) only reorders the non-chat pool; it does
-                // NOT bypass the cap, so once it has passed there is nothing new to wake
-                // for — the head already sorts at its escalated rank (`effective_rank`)
-                // and dispatches on the next `on_done`. Re-arming the timer for a
-                // past-due crossing was the 100% CPU busy-spin (#162); include the
-                // crossing only while it is still in the future.
-                let deadline = head.deadline.map(|d| d.max(now));
-                let esc = (esc > now).then_some(esc);
-                [deadline, esc].into_iter().flatten()
+                // A deadline (I6b) wakes when due: `pick_floor` dispatches it on the
+                // floor lane, which clears the queue — no spin. The I8 escalation
+                // crossing and the FLOOR_AGE crossing are both measured from
+                // `starved_since` (WB-5.1 / I5″.5). The FLOOR_AGE crossing IS actionable
+                // — it makes the write floor-lane-eligible (an ADDITIONAL slot) — so we
+                // must wake to dispatch it via the floor if that lane is free. Both
+                // crossings are included ONLY while still future: once passed, the head
+                // sorts at its escalated rank / is floor-eligible and dispatches on the
+                // next `on_done`; re-arming for a past crossing was the 100% CPU
+                // busy-spin (#162).
+                // Include a deadline only while it is still FUTURE. A past-due deadline
+                // that cannot dispatch (floor lane busy AND window full) would otherwise
+                // clamp to `now` and hot-spin the driver (the #162 class the esc/floor
+                // crossings below guard identically); once past, `pick_floor` dispatches
+                // it deadline-first on the next lane-freeing `on_done`.
+                let deadline = head.deadline.filter(|d| *d > now);
+                let (esc, floor) = if head.class == WriteClass::Chat {
+                    (None, None)
+                } else {
+                    let bound = self.cfg.age_bounds[(head.class.rank() - 1) as usize];
+                    let esc = head.starved_since + bound;
+                    let floor = head.starved_since + bound * 2;
+                    ((esc > now).then_some(esc), (floor > now).then_some(floor))
+                };
+                [deadline, esc, floor].into_iter().flatten()
             })
             .min()
     }
@@ -595,10 +819,18 @@ impl<D: Send + 'static> State<D> {
                 .iter()
                 .filter(|(rec, q)| self.idle(rec) && !q.is_empty())
                 .min_by_key(|(_, q)| q.front().unwrap().seq)
-                .map(|(rec, _)| *rec);
+                .map(|(rec, q)| (*rec, q.front().unwrap().class));
             match pick {
-                Some(rec) => {
-                    self.dispatch(rec, sink, done_tx);
+                Some((rec, class)) => {
+                    // Flush order bounds the damage (I7); the shutdown budget bounds the
+                    // close. Chat draws the chat pool, tombstones the window pool — the
+                    // lane tag keeps `on_done`'s counter release correct.
+                    let lane = if class == WriteClass::Chat {
+                        DispatchLane::Chat
+                    } else {
+                        DispatchLane::Window
+                    };
+                    self.dispatch(rec, lane, sink, done_tx);
                     dispatched = true;
                 }
                 None => break,
@@ -623,20 +855,28 @@ fn resolve_ok(reply: Option<oneshot::Sender<Result<()>>>) {
     }
 }
 
-/// Drop the queued same-id current-state write (last-writer-wins), resolving its
-/// reply `Ok` — the newer write subsumes it.
-fn drop_same_id_current_state<D>(q: &mut VecDeque<Pending<D>>, logical_id: &str) {
+/// Drop the queued same-id current-state write(s) (last-writer-wins), resolving each
+/// reply `Ok` — the newer write subsumes them. Returns the OLDEST dropped
+/// `starved_since` (if any), so the winning write can inherit the elder's starvation
+/// clock (WB-5.1 / I5″.5).
+fn drop_same_id_current_state<D>(
+    q: &mut VecDeque<Pending<D>>,
+    logical_id: &str,
+) -> Option<Instant> {
+    let mut oldest: Option<Instant> = None;
     let mut i = 0;
     while i < q.len() {
         let matches =
             matches!(&q[i].kind, WriteKind::CurrentState { logical_id: id } if id == logical_id);
         if matches {
             let dropped = q.remove(i).expect("index in range");
+            oldest = Some(oldest.map_or(dropped.starved_since, |o| o.min(dropped.starved_since)));
             resolve_ok(dropped.reply);
         } else {
             i += 1;
         }
     }
+    oldest
 }
 
 async fn run<S: WriteSink>(
@@ -727,23 +967,32 @@ mod tests {
 
     /// A counting mock sink (the WB-2 oracle seam): records every dispatched write
     /// (label + timestamp) and simulates a DHT round-trip by sleeping `latency` in
-    /// paused virtual time.
+    /// paused virtual time. `acquire_wait_ms` injects the synthetic permit-acquire-wait
+    /// the WB-5 guard consumes (`u64::MAX` = `None`, the I5′.2 transport-can't-surface
+    /// fallback); it is settable mid-run so an oracle can switch regimes.
     struct MockSink {
         log: Arc<Mutex<Vec<Rec>>>,
         latency: Duration,
         dispatched: AtomicU64,
+        acquire_wait_ms: Arc<AtomicU64>,
     }
 
     struct MockItem {
         label: String,
     }
 
+    const AW_NONE: u64 = u64::MAX;
+
     impl MockSink {
         fn new(latency: Duration) -> Arc<Self> {
+            Self::with_acquire_wait(latency, AW_NONE)
+        }
+        fn with_acquire_wait(latency: Duration, acquire_wait_ms: u64) -> Arc<Self> {
             Arc::new(Self {
                 log: Arc::new(Mutex::new(Vec::new())),
                 latency,
                 dispatched: AtomicU64::new(0),
+                acquire_wait_ms: Arc::new(AtomicU64::new(acquire_wait_ms)),
             })
         }
         fn log(&self) -> Vec<Rec> {
@@ -753,9 +1002,10 @@ mod tests {
 
     impl WriteSink for MockSink {
         type Item = MockItem;
-        fn dispatch(&self, item: MockItem) -> DispatchFuture {
+        fn dispatch(&self, item: MockItem, _lane: DispatchLane) -> DispatchFuture {
             let log = self.log.clone();
             let latency = self.latency;
+            let aw = self.acquire_wait_ms.load(Ordering::SeqCst);
             self.dispatched.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
                 log.lock().unwrap().push(Rec {
@@ -763,7 +1013,11 @@ mod tests {
                     at: Instant::now(),
                 });
                 tokio::time::sleep(latency).await;
-                Ok(())
+                let acquire_wait = (aw != AW_NONE).then(|| Duration::from_millis(aw));
+                DispatchOutcome {
+                    result: Ok(()),
+                    acquire_wait,
+                }
             })
         }
     }
@@ -792,6 +1046,25 @@ mod tests {
 
     fn rec_id(n: u8) -> RecordId {
         [n; 32]
+    }
+
+    /// A request carrying a hard `deadline` (I6b) — dispatches via the floor lane once
+    /// the deadline is due (WB-5.1 / I5″.5). For floor-lane oracles.
+    fn req_deadline(
+        record: RecordId,
+        class: WriteClass,
+        kind: WriteKind,
+        label: &str,
+        deadline: Instant,
+    ) -> (WriteRequest<MockItem>, oneshot::Receiver<Result<()>>) {
+        let (rq, rx) = req(record, class, kind, label);
+        (
+            WriteRequest {
+                deadline: Some(deadline),
+                ..rq
+            },
+            rx,
+        )
     }
 
     // ── WB-ISC-9 ────────────────────────────────────────────────────────────
@@ -1120,7 +1393,7 @@ mod tests {
         }
         impl WriteSink for SerialSink {
             type Item = (RecordId, u64);
-            fn dispatch(&self, item: (RecordId, u64)) -> DispatchFuture {
+            fn dispatch(&self, item: (RecordId, u64), _lane: DispatchLane) -> DispatchFuture {
                 let (rec, seq) = item;
                 let active = self.active.clone();
                 let order = self.order.clone();
@@ -1133,7 +1406,7 @@ mod tests {
                     order.lock().unwrap().push(seq);
                     tokio::time::sleep(Duration::from_millis(20)).await;
                     active.lock().unwrap().remove(&rec);
-                    Ok(())
+                    DispatchOutcome::bare(Ok(()))
                 })
             }
         }
@@ -1297,9 +1570,11 @@ mod tests {
         );
     }
 
-    /// The latency probe (WB-1.10 congestion signal) reflects non-chat
-    /// enqueue-to-ack: after a slow non-chat write completes, the probe holds a
-    /// latency at/above the sink's simulated RTT; chat completions never write it.
+    /// The latency probe (WB-1.10 congestion signal) reflects non-chat enqueue-to-ack:
+    /// after a FULL window of slow non-chat writes completes, the published median holds
+    /// a latency at/above the sink's simulated RTT; chat completions never write it.
+    /// (A partial window calm-pads to 0 — WB-5.1 / I5″.6 warmup robustness — so the
+    /// window must be filled before the median crosses.)
     #[tokio::test(start_paused = true)]
     async fn latency_probe_tracks_nonchat_enqueue_to_ack() {
         let sink = MockSink::new(Duration::from_secs(3));
@@ -1309,19 +1584,24 @@ mod tests {
             SchedulerConfig::default(),
             probe.clone(),
         );
-        let (rq, _rx) = req(
-            rec_id(1),
-            WriteClass::Keepalive,
-            WriteKind::CurrentState {
-                logical_id: "m".into(),
-            },
-            "ka",
-        );
-        h.enqueue(rq);
-        tokio::time::sleep(Duration::from_secs(4)).await;
+        // Fill the median window (LATENCY_WINDOW = 5) with slow non-chat writes on
+        // distinct records so the padded median crosses to the true ~3s latency.
+        for r in 0..5u8 {
+            let (rq, _rx) = req(
+                rec_id(r),
+                WriteClass::Keepalive,
+                WriteKind::CurrentState {
+                    logical_id: format!("m-{r}"),
+                },
+                &format!("ka-{r}"),
+            );
+            h.enqueue(rq);
+        }
+        // 5 writes at W_max=2 concurrency = 3 waves × 3s; give ample settle time.
+        tokio::time::sleep(Duration::from_secs(15)).await;
         assert!(
             probe.load(Ordering::Relaxed) >= 3000,
-            "probe must reflect the ≥3s enqueue-to-ack latency"
+            "after a full window the median reflects the ≥3s enqueue-to-ack latency"
         );
     }
 
@@ -1352,13 +1632,54 @@ mod tests {
             st.next_wakeup(Instant::now()).is_some(),
             "a pending escalation crossing arms a future wakeup"
         );
-        // Advance past the crossing without dispatching (window stays saturated in
-        // production); the record is still idle and queued.
-        tokio::time::advance(bound + Duration::from_secs(1)).await;
+        // Advance past BOTH the escalation crossing (bound) and the FLOOR_AGE crossing
+        // (2×bound, WB-5.1 / I5″.5) without dispatching (window stays saturated in
+        // production); the record is still idle and queued. Once both are past, the head
+        // is escalated + floor-eligible and dispatches on the next `on_done`/enqueue — no
+        // wakeup re-arm.
+        tokio::time::advance(bound * 2 + Duration::from_secs(1)).await;
         assert_eq!(
             st.next_wakeup(Instant::now()),
             None,
-            "a past-due escalation crossing must not re-arm the timer (#162 busy-spin)"
+            "past-due escalation + floor crossings must not re-arm the timer (#162 busy-spin)"
+        );
+    }
+
+    // ── #162 class — past-due DEADLINE must not busy-spin (review finding) ─────
+    /// A past-due I6b deadline that cannot dispatch (floor lane busy AND window full)
+    /// must NOT clamp its wakeup to `now` and hot-spin the driver — the same #162 class
+    /// as the escalation/floor crossings. `next_wakeup` drops a past deadline (once due,
+    /// `pick_floor` dispatches it deadline-first on the next lane-freeing `on_done`).
+    #[tokio::test(start_paused = true)]
+    async fn issue_162_past_due_deadline_does_not_busy_spin() {
+        let cfg = SchedulerConfig::default();
+        let bound = cfg.age_bounds[WriteClass::Keepalive.rank() as usize - 1];
+        let probe = Arc::new(AtomicU64::new(0));
+        let mut st = State::<MockItem>::new(cfg, probe);
+        // A keepalive whose hard deadline is 1s out (the operator MOTD/announcement
+        // class, #158) on an idle record, never dispatched (no sink runs here — as if
+        // the floor lane and window were both saturated in production).
+        let (rq, _rx) = req_deadline(
+            rec_id(1),
+            WriteClass::Keepalive,
+            WriteKind::CurrentState {
+                logical_id: "m1".into(),
+            },
+            "motd",
+            Instant::now() + Duration::from_secs(1),
+        );
+        st.enqueue(rq);
+        assert!(
+            st.next_wakeup(Instant::now()).is_some(),
+            "a future deadline arms a wakeup"
+        );
+        // Advance past the deadline AND both age crossings (floor = 2×bound); with the
+        // deadline correctly DROPPED (not clamped to `now`), no wakeup re-arms.
+        tokio::time::advance(bound * 2 + Duration::from_secs(2)).await;
+        assert_eq!(
+            st.next_wakeup(Instant::now()),
+            None,
+            "a past-due deadline must not clamp to `now` and hot-spin the driver"
         );
     }
 
@@ -1411,6 +1732,366 @@ mod tests {
         assert!(
             ka_reply.await.unwrap().is_ok(),
             "the dominated keepalive resolves Ok (intent superseded)"
+        );
+    }
+
+    // ── WB-ISC-18: median-of-5 DHT-weather estimator ─────────────────────────
+    /// The published regime signal is the MEDIAN of the last [`LATENCY_WINDOW`] non-chat
+    /// latencies (WB-5.1 / I5″.6), so a single fast (or slow) straggler amid a run cannot
+    /// cross the band, and recovery takes 3 of 5 fast completions — replacing the EMA
+    /// fast-exit chatter the freeze refuted.
+    #[test]
+    fn wb_isc_18_median_of_5_rejects_single_outlier_and_recovers_in_three() {
+        fn push(ring: &mut VecDeque<u64>, v: u64) {
+            ring.push_back(v);
+            while ring.len() > LATENCY_WINDOW {
+                ring.pop_front();
+            }
+        }
+        assert_eq!(
+            median_ms(&VecDeque::new()),
+            0,
+            "empty window has no signal yet"
+        );
+
+        let mut ring: VecDeque<u64> = VecDeque::new();
+        // Establish an elevated regime: five slow completions → elevated median.
+        for _ in 0..5 {
+            push(&mut ring, 20_000);
+        }
+        assert_eq!(median_ms(&ring), 20_000, "five slow → elevated median");
+        // One, then two fast completions amid the slow run do NOT cross to calm.
+        push(&mut ring, 500);
+        assert_eq!(median_ms(&ring), 20_000, "one fast of five does not cross");
+        push(&mut ring, 500);
+        assert_eq!(median_ms(&ring), 20_000, "two fast of five does not cross");
+        // The THIRD fast completion crosses: ring = [20000,20000,500,500,500] → median 500.
+        push(&mut ring, 500);
+        assert_eq!(median_ms(&ring), 500, "three fast of five cross to calm");
+        // A single slow straggler during recovery does NOT bounce back to elevated.
+        push(&mut ring, 20_000);
+        assert_eq!(
+            median_ms(&ring),
+            500,
+            "a single slow outlier does not re-elevate"
+        );
+
+        // Warmup (partial window): the window is calm-padded to LATENCY_WINDOW, so a
+        // single slow sample cannot cross the band before 3 real slow samples — the
+        // 3-of-5 robustness holds from the first sample, not only once the ring fills.
+        let mut warm: VecDeque<u64> = VecDeque::new();
+        push(&mut warm, 20_000);
+        assert_eq!(
+            median_ms(&warm),
+            0,
+            "one slow sample of a padded window stays calm"
+        );
+        push(&mut warm, 20_000);
+        assert_eq!(median_ms(&warm), 0, "two slow of five (padded) stays calm");
+        push(&mut warm, 20_000);
+        assert_eq!(
+            median_ms(&warm),
+            20_000,
+            "three slow of five crosses to elevated even at warmup"
+        );
+    }
+
+    /// Max concurrent non-chat dispatches over the log, given each write occupies
+    /// `[at, at + latency]` (the MockSink's simulated DHT round-trip).
+    fn max_concurrency(log: &[Rec], latency: Duration) -> usize {
+        let mut events: Vec<(Instant, i32)> = Vec::new();
+        for r in log {
+            events.push((r.at, 1));
+            events.push((r.at + latency, -1));
+        }
+        events.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        let (mut cur, mut max) = (0i32, 0i32);
+        for (_, d) in events {
+            cur += d;
+            max = max.max(cur);
+        }
+        max as usize
+    }
+
+    // ── WB-ISC-16 (sink-level): static window, invariant to latency ───────────
+    /// The non-chat window equals `min(distinct pending records, W_max)` and NEVER
+    /// varies with any latency signal — the §I5′.2 acquire-wait controller is retired
+    /// (WB-5.1 / I5″.3). Under BOTH a fast and a slow (30s exogenous-floor) write regime
+    /// the max concurrent non-chat dispatch count is W_max=2 with ≥2 pending records; it
+    /// never collapses (the pre-WB-5.1 controller would have shrunk it under load).
+    #[tokio::test(start_paused = true)]
+    async fn wb_isc_16_window_is_static_and_never_shrinks_with_latency() {
+        async fn max_nonchat_concurrency(rtt: Duration) -> usize {
+            let sink = MockSink::new(rtt);
+            let h = WriteScheduler::spawn(sink.clone(), SchedulerConfig::default());
+            for r in 0..6u8 {
+                let (rq, _rx) = req(
+                    rec_id(r),
+                    WriteClass::Keepalive,
+                    WriteKind::CurrentState {
+                        logical_id: format!("m-{r}"),
+                    },
+                    &format!("ka-{r}"),
+                );
+                h.enqueue(rq);
+            }
+            // Long enough for every write to dispatch (6 writes at 2-concurrency = 3
+            // waves) under either regime.
+            tokio::time::sleep(rtt * 10).await;
+            max_concurrency(&sink.log(), rtt)
+        }
+
+        assert_eq!(
+            max_nonchat_concurrency(Duration::from_millis(50)).await,
+            2,
+            "fast writes: the window sits at W_max=2"
+        );
+        assert_eq!(
+            max_nonchat_concurrency(Duration::from_secs(30)).await,
+            2,
+            "slow (exogenous-floor) writes: the RETIRED controller must NOT collapse the \
+             window — it stays static at W_max=2"
+        );
+    }
+
+    // ── WB-ISC-26 (Anti): panic never wedges the funnel nor leaks a lane counter ──
+    /// A panic in a dispatched write — whether a SYNCHRONOUS panic during dispatch-future
+    /// CONSTRUCTION or a panic in the async body — must never wedge the scheduler nor
+    /// leak a lane counter (WB-5.1 / I5″.8). The panicking write resolves `Err`, the lane
+    /// counter it drew (`window_in_flight` / `floor_in_flight`) returns to 0, and
+    /// subsequent writes dispatch. The sync-construction path is the new coverage: the
+    /// fix moves `sink.dispatch(...)` construction INSIDE the supervised inner spawn, so a
+    /// sync panic is caught by the join instead of crashing the driver. The FLOOR lane is
+    /// exercised distinctly (capacity 1 — a leaked floor counter is silent starvation).
+    #[tokio::test(start_paused = true)]
+    async fn wb_isc_26_panic_recovers_lane_counters_sync_and_async() {
+        /// Panics synchronously (before returning the future) for `"boom-sync"`; panics
+        /// in the async body for `"boom-async"`; `"hold"` occupies its lane for 10s;
+        /// everything else succeeds immediately.
+        struct LanePanicSink {
+            log: Arc<Mutex<Vec<Rec>>>,
+        }
+        impl WriteSink for LanePanicSink {
+            type Item = MockItem;
+            fn dispatch(&self, item: MockItem, _lane: DispatchLane) -> DispatchFuture {
+                // SYNCHRONOUS construction panic — escapes to the driver thread unless the
+                // fix runs construction inside the supervised inner spawn (WB-ISC-26).
+                assert_ne!(item.label, "boom-sync", "simulated sync construction panic");
+                let log = self.log.clone();
+                Box::pin(async move {
+                    assert_ne!(item.label, "boom-async", "simulated async write-path panic");
+                    if item.label == "hold" {
+                        tokio::time::sleep(Duration::from_secs(10)).await; // pin the lane
+                    }
+                    log.lock().unwrap().push(Rec {
+                        label: item.label,
+                        at: Instant::now(),
+                    });
+                    DispatchOutcome::bare(Ok(()))
+                })
+            }
+        }
+        let sink = Arc::new(LanePanicSink {
+            log: Arc::new(Mutex::new(Vec::new())),
+        });
+        // W_max = 1 so a leaked window slot wedges the window shut entirely.
+        let cfg = SchedulerConfig {
+            nonchat_cap: 1,
+            ..SchedulerConfig::default()
+        };
+        let h = WriteScheduler::spawn(sink.clone(), cfg);
+        let ka = |rec: u8, id: &str, label: &str| {
+            req(
+                rec_id(rec),
+                WriteClass::Keepalive,
+                WriteKind::CurrentState {
+                    logical_id: id.into(),
+                },
+                label,
+            )
+        };
+
+        // (1) Async-body panic on the WINDOW lane → reply Err; the window slot releases.
+        let (boom, boom_rx) = ka(1, "m1", "boom-async");
+        h.enqueue(boom);
+        let r = tokio::time::timeout(Duration::from_secs(5), boom_rx)
+            .await
+            .expect("async panic resolves its reply, not a hang")
+            .expect("reply channel intact");
+        assert!(r.is_err(), "an async-body panic resolves Err");
+        // A fresh window write dispatches — the window counter recovered (not wedged).
+        let (ok1, ok1_rx) = ka(2, "m2", "ok1");
+        h.enqueue(ok1);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), ok1_rx)
+                .await
+                .expect("window not wedged")
+                .expect("chan")
+                .is_ok(),
+            "the follow-up window write dispatched (window_in_flight returned to 0)"
+        );
+
+        // (2) SYNC-construction panic → the driver must NOT crash; reply Err, and the
+        // scheduler survives to dispatch the next write.
+        let (bs, bs_rx) = ka(3, "m3", "boom-sync");
+        h.enqueue(bs);
+        let r = tokio::time::timeout(Duration::from_secs(5), bs_rx)
+            .await
+            .expect("driver survives a synchronous construction panic (does not crash)")
+            .expect("chan");
+        assert!(
+            r.is_err(),
+            "a sync-construction panic resolves Err, not a crash"
+        );
+
+        // (3) FLOOR-lane recovery. Pin the single window slot with a slow "hold" write,
+        // then a deadline-due write dispatches via the FLOOR lane (window busy) and
+        // panics; a following deadline-due write MUST still dispatch via the floor while
+        // the window remains held — proving `floor_in_flight` returned to 0 (a leak would
+        // block it, since the window is unavailable — the capacity-1 silent-starvation).
+        let (hold, _hold_rx) = ka(4, "m4", "hold");
+        h.enqueue(hold);
+        tokio::time::sleep(Duration::from_millis(50)).await; // let it take the window slot
+        let now = Instant::now();
+        let (fboom, fboom_rx) = req_deadline(
+            rec_id(5),
+            WriteClass::Keepalive,
+            WriteKind::CurrentState {
+                logical_id: "m5".into(),
+            },
+            "boom-async",
+            now,
+        );
+        h.enqueue(fboom);
+        assert!(tokio::time::timeout(Duration::from_secs(5), fboom_rx)
+            .await
+            .expect("floor panic no hang")
+            .expect("chan")
+            .is_err());
+        let (fok, fok_rx) = req_deadline(
+            rec_id(6),
+            WriteClass::Keepalive,
+            WriteKind::CurrentState {
+                logical_id: "m6".into(),
+            },
+            "ok2",
+            Instant::now(),
+        );
+        h.enqueue(fok);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), fok_rx)
+                .await
+                .expect("floor lane not wedged: a deadline-due write dispatches while the window is held")
+                .expect("chan")
+                .is_ok(),
+            "the floor lane recovered after the panic (floor_in_flight returned to 0)"
+        );
+    }
+
+    // ── WB-ISC-23: floor lane — coalesced-refreshed write ages via inherited clock ──
+    /// A non-chat write whose queue entry was REPLACED by I3 coalescing still ages to the
+    /// floor because the winning write inherits the elder's `starved_since` (WB-5.1 /
+    /// I5″.5). With the single window slot pinned by a slow write, a keepalive that is
+    /// refreshed (coalesced) partway through its life still dispatches via the FLOOR lane
+    /// once its INHERITED starved-age crosses FLOOR_AGE — an ADDITIONAL slot beyond the
+    /// saturated window. Had `starved_since` reset on coalescing, it would never reach the
+    /// floor and would starve behind the pinned window.
+    #[tokio::test(start_paused = true)]
+    async fn wb_isc_23_floor_dispatches_coalesced_refreshed_write_as_additional_slot() {
+        struct HoldSink {
+            log: Arc<Mutex<Vec<Rec>>>,
+        }
+        impl WriteSink for HoldSink {
+            type Item = MockItem;
+            fn dispatch(&self, item: MockItem, _lane: DispatchLane) -> DispatchFuture {
+                let log = self.log.clone();
+                Box::pin(async move {
+                    if item.label == "hold" {
+                        tokio::time::sleep(Duration::from_secs(600)).await; // pin the window
+                    }
+                    log.lock().unwrap().push(Rec {
+                        label: item.label,
+                        at: Instant::now(),
+                    });
+                    DispatchOutcome::bare(Ok(()))
+                })
+            }
+        }
+        let sink = Arc::new(HoldSink {
+            log: Arc::new(Mutex::new(Vec::new())),
+        });
+        let cfg = SchedulerConfig {
+            nonchat_cap: 1,
+            ..SchedulerConfig::default()
+        };
+        // FLOOR_AGE(keepalive) = 2 × age_bounds[3] = 240s.
+        let floor_age = cfg.age_bounds[WriteClass::Keepalive.rank() as usize - 1] * 2;
+        let h = WriteScheduler::spawn(sink.clone(), cfg);
+
+        // Pin the single window slot for the whole test.
+        let (hold, _hold_rx) = req(
+            rec_id(1),
+            WriteClass::Keepalive,
+            WriteKind::CurrentState {
+                logical_id: "m1".into(),
+            },
+            "hold",
+        );
+        h.enqueue(hold);
+        tokio::time::sleep(Duration::from_millis(50)).await; // let it take the window slot
+
+        // A keepalive on record 2 — window is full, not yet floor-eligible → queued. Its
+        // starvation clock starts now (~t=50ms).
+        let (b1, _b1_rx) = req(
+            rec_id(2),
+            WriteClass::Keepalive,
+            WriteKind::CurrentState {
+                logical_id: "m2".into(),
+            },
+            "b1",
+        );
+        h.enqueue(b1);
+
+        // Halfway through its life, refresh it (I3 coalescing): a NEW entry with a fresh
+        // `enqueued` but the elder's INHERITED `starved_since`.
+        tokio::time::sleep(floor_age / 2).await;
+        let (b2, b2_rx) = req(
+            rec_id(2),
+            WriteClass::Keepalive,
+            WriteKind::CurrentState {
+                logical_id: "m2".into(),
+            },
+            "b2",
+        );
+        h.enqueue(b2);
+
+        // Advance just past FLOOR_AGE measured from the INHERITED clock. The window is
+        // still pinned by "hold", so the ONLY path for b2 is the floor lane — and it
+        // dispatches BECAUSE the inherited clock (not the fresh `enqueued`) crossed
+        // FLOOR_AGE.
+        tokio::time::sleep(floor_age / 2 + Duration::from_secs(1)).await;
+        let r = tokio::time::timeout(Duration::from_secs(5), b2_rx)
+            .await
+            .expect("the coalesced-refreshed write ages to the floor via the inherited clock")
+            .expect("reply channel intact");
+        assert!(
+            r.is_ok(),
+            "b2 dispatched via the floor lane while the window was pinned"
+        );
+        let labels: Vec<String> = sink
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.label.clone())
+            .collect();
+        assert!(
+            labels.contains(&"b2".to_string()),
+            "the refreshed write reached the sink via the additional floor slot: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"b1".to_string()),
+            "the coalesced-away elder never dispatched (its intent was superseded)"
         );
     }
 }

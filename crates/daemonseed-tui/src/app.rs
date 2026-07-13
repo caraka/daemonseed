@@ -1533,6 +1533,23 @@ impl App {
             NetEvent::ConnectFailed { message } => {
                 self.connection = ConnectionStatus::Failed(message);
             }
+            // (WB-5.1 / I5″.7, WB-ISC-20) The reaper is suspended under an elevated DHT
+            // regime, so the roster may show a departed member — surface it on the
+            // status line so a sharing decision that trusts roster-as-presence sees the
+            // caveat. Cleared once the regime calms and the resume grace elapses.
+            NetEvent::PresenceStale { stale } => {
+                // The status line is SHARED (ChatError, SharesError, …), so this is
+                // lowest-priority: set the caveat only when the line is free, clear only
+                // our own message — never clobbering an unrelated status.
+                const STALE_MSG: &str = "presence may be stale — network congested";
+                if stale {
+                    if self.status.is_none() {
+                        self.set_status(STALE_MSG);
+                    }
+                } else if self.status.as_deref() == Some(STALE_MSG) {
+                    self.status = None;
+                }
+            }
             // A circle joined (ISC-C59): ADD it to the membership set (never evict
             // an existing one) and select it active (ISC-C60). An idempotent
             // re-join — the actor re-emits an id already in the set — only

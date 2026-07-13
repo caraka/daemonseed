@@ -20,11 +20,12 @@ use daemonseed_core::share_serve::ShareContent;
 use daemonseed_core::storage::cas::ChunkAddr;
 
 use crate::config::VeilidNetConfig;
+use crate::dht_gate::DhtGate;
 use crate::error::{Result, VeilidNetError};
 use crate::event::VeilidNetEvent;
 use crate::schedule::{
-    DispatchFuture, SchedulerConfig, WriteClass, WriteKind, WriteRequest, WriteScheduler,
-    WriteSchedulerHandle, WriteSink,
+    DispatchFuture, DispatchLane, DispatchOutcome, SchedulerConfig, WriteClass, WriteKind,
+    WriteRequest, WriteScheduler, WriteSchedulerHandle, WriteSink,
 };
 use crate::{discovery, identity, rendezvous, share};
 
@@ -803,6 +804,11 @@ async fn actor_loop(
     // on the record's `record_lock`. The append-ring cursor lives in the sink because
     // only the write path touches it. The write commands below enqueue and return, so
     // a slow DHT set never parks this loop (#154 retired).
+    // The shared DHT permit accountant (WB-5 / I5′.1): the write lane (via the sink)
+    // and the read lane (sweeps/resweeps) both draw permits here, so daemonseed's own
+    // combined in-flight DHT ops stay provably under veilid's 16-permit gate, and chat
+    // keeps a reserved permit it never has to queue behind a non-chat backlog for.
+    let dht_gate = DhtGate::new();
     let sched: WriteSchedulerHandle<ProdWrite> = WriteScheduler::spawn_with_probe(
         Arc::new(ProductionSink {
             api: api.clone(),
@@ -811,6 +817,7 @@ async fn actor_loop(
             ring_seq: Arc::new(Mutex::new(HashMap::new())),
             opened: opened.clone(),
             record_locks: record_locks.clone(),
+            gate: dht_gate.clone(),
         }),
         SchedulerConfig::default(),
         write_latency,
@@ -866,8 +873,16 @@ async fn actor_loop(
             }
             Command::SubscribeRendezvous { owner_seed, reply } => {
                 let _ = reply.send(
-                    subscribe_rendezvous(&api, &rc, &ev_tx, &opened, &record_locks, owner_seed)
-                        .await,
+                    subscribe_rendezvous(
+                        &api,
+                        &rc,
+                        &ev_tx,
+                        &opened,
+                        &record_locks,
+                        &dht_gate,
+                        owner_seed,
+                    )
+                    .await,
                 );
             }
             Command::PublishCurrentState {
@@ -900,7 +915,16 @@ async fn actor_loop(
             }
             Command::ResweepRendezvous { owner_seed, reply } => {
                 let _ = reply.send(
-                    resweep_rendezvous(&api, &rc, &ev_tx, &opened, &record_locks, owner_seed).await,
+                    resweep_rendezvous(
+                        &api,
+                        &rc,
+                        &ev_tx,
+                        &opened,
+                        &record_locks,
+                        &dht_gate,
+                        owner_seed,
+                    )
+                    .await,
                 );
             }
             Command::ServeShare {
@@ -966,9 +990,15 @@ async fn actor_loop(
                     // one-shot write that releases its OWN route (guarded against a
                     // concurrent same-id reshare), so it is never remembered for a
                     // RouteChanged/watchdog re-publish (#163).
-                    let res =
-                        publish_one_advert(&api, &sched, &advert_routes, &share_id, &advert, persist)
-                            .await;
+                    let res = publish_one_advert(
+                        &api,
+                        &sched,
+                        &advert_routes,
+                        &share_id,
+                        &advert,
+                        persist,
+                    )
+                    .await;
                     let _ = reply.send(res);
                 });
             }
@@ -1218,7 +1248,10 @@ async fn publish_rendezvous(
     // Lock only for the synchronous cursor bump — never across an await — so the
     // main loop and a spawned refresh can interleave ring writes safely.
     let seq = {
-        let mut seqs = ring_seq.lock().unwrap();
+        // Side-step std-Mutex poisoning: a panic in another dispatch task must not
+        // wedge every subsequent ring write (#168 — the panic-wedge cascade). The
+        // cursor map is plain data; recover the guard and carry on.
+        let mut seqs = ring_seq.lock().unwrap_or_else(|e| e.into_inner());
         let cur = seqs.entry(key.clone()).or_insert(0);
         let s = *cur;
         *cur = cur.wrapping_add(1);
@@ -1300,20 +1333,39 @@ struct ProductionSink {
     ring_seq: Arc<Mutex<HashMap<RecordKey, u32>>>,
     opened: Arc<rendezvous::OpenCache>,
     record_locks: Arc<rendezvous::RecordLocks>,
+    // The shared four-pool DHT permit accountant (WB-5.1 / I5″.1). Every write acquires
+    // a permit from its lane's pool here before touching the DHT; the read lane draws
+    // its own pool, so daemonseed's combined in-flight DHT ops are provably ≤ the
+    // budget. The measured acquire-wait is trace-only telemetry (WB-ISC-27) — the
+    // §I5′.2 window controller that consumed it is retired.
+    gate: Arc<DhtGate>,
 }
 
 impl WriteSink for ProductionSink {
     type Item = ProdWrite;
 
-    fn dispatch(&self, item: ProdWrite) -> DispatchFuture {
+    fn dispatch(&self, item: ProdWrite, lane: DispatchLane) -> DispatchFuture {
         let api = self.api.clone();
         let rc = self.rc.clone();
         let node_pub = self.node_pub;
         let ring_seq = self.ring_seq.clone();
         let opened = self.opened.clone();
         let record_locks = self.record_locks.clone();
+        let gate = self.gate.clone();
         Box::pin(async move {
-            match item {
+            // WB-5.1 / I5″.1: acquire the matching DHT-gate pool before touching the
+            // network — chat draws the chat pool (never waits on non-chat), floor the
+            // 1-permit floor pool, window the W_max pool. No cross-pool fallback. The
+            // permit is an RAII guard held across the whole write, so it releases even on
+            // a panic-unwind (#168). This write path issues NO gated GET (single-permit
+            // rule, WB-ISC-28): it only opens (un-gated/margin) + sets.
+            let permit = match lane {
+                DispatchLane::Chat => gate.acquire_chat().await,
+                DispatchLane::Floor => gate.acquire_floor().await,
+                DispatchLane::Window => gate.acquire_write().await,
+            };
+            let acquire_wait = Some(permit.acquire_wait);
+            let result = match item {
                 ProdWrite::Rendezvous { owner_seed, sealed } => {
                     publish_rendezvous(
                         &api,
@@ -1343,6 +1395,11 @@ impl WriteSink for ProductionSink {
                     )
                     .await
                 }
+            };
+            drop(permit);
+            DispatchOutcome {
+                result,
+                acquire_wait,
             }
         })
     }
@@ -1357,6 +1414,7 @@ async fn subscribe_rendezvous(
     ev_tx: &mpsc::UnboundedSender<VeilidNetEvent>,
     opened: &rendezvous::OpenCache,
     record_locks: &rendezvous::RecordLocks,
+    gate: &Arc<DhtGate>,
     owner_seed: [u8; 32],
 ) -> Result<()> {
     crate::vtrace!("subscribe_rendezvous: open (cached) rendezvous");
@@ -1378,8 +1436,30 @@ async fn subscribe_rendezvous(
         .await
         .map_err(|e| VeilidNetError::Routing(e.to_string()))?;
     crate::vtrace!("subscribe_rendezvous: watch ok; spawning backlog sweep -> Ok");
-    tokio::spawn(rendezvous::sweep(rc.clone(), key, ev_tx.clone()));
+    // Read lane (WB-5 / I5′.1): the backlog sweep is a burst of DHT GETs; hold a
+    // read permit from the shared accountant for its duration so reads and writes
+    // draw on one budget.
+    spawn_gated_sweep(gate, rc, key, ev_tx);
     Ok(())
+}
+
+/// Spawn a backlog sweep. The read permits are acquired PER-GET inside
+/// [`rendezvous::sweep`] (WB-5.1 / I5″.2) — the spawn no longer holds one whole-sweep
+/// permit (the first WB-5 build's defect: ≥13 cold-start sweeps each pinned a permit
+/// for its full multi-minute run and drained the pool, starving writes). Read
+/// occupancy is now bounded by the read partition regardless of live sweep count.
+fn spawn_gated_sweep(
+    gate: &Arc<DhtGate>,
+    rc: &RoutingContext,
+    key: RecordKey,
+    ev_tx: &mpsc::UnboundedSender<VeilidNetEvent>,
+) {
+    let gate = gate.clone();
+    let rc = rc.clone();
+    let ev_tx = ev_tx.clone();
+    tokio::spawn(async move {
+        rendezvous::sweep(gate, rc, key, ev_tx).await;
+    });
 }
 
 /// Re-open an already-known rendezvous record and kick off a fresh one-shot sweep,
@@ -1393,6 +1473,7 @@ async fn resweep_rendezvous(
     ev_tx: &mpsc::UnboundedSender<VeilidNetEvent>,
     opened: &rendezvous::OpenCache,
     record_locks: &rendezvous::RecordLocks,
+    gate: &Arc<DhtGate>,
     owner_seed: [u8; 32],
 ) -> Result<()> {
     crate::vtrace!("resweep_rendezvous: open (cached) rendezvous");
@@ -1410,7 +1491,8 @@ async fn resweep_rendezvous(
         .await?
     };
     crate::vtrace!("resweep_rendezvous: record open key={key:?}; spawning backlog sweep -> Ok");
-    tokio::spawn(rendezvous::sweep(rc.clone(), key, ev_tx.clone()));
+    // Read lane (WB-5 / I5′.1): hold a shared-accountant read permit for the sweep.
+    spawn_gated_sweep(gate, rc, key, ev_tx);
     Ok(())
 }
 

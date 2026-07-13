@@ -80,14 +80,29 @@ pub const KEEPALIVE_INTERVAL_MAX: Duration = Duration::from_secs(220);
 /// TTL backstop (one liveness doctrine). Graceful close disappears immediately via
 /// the leave tombstone; this TTL is the crash/network-loss backstop only.
 pub const PRESENCE_TTL: Duration = Duration::from_secs(600);
-/// Enqueue-to-ack latency at/above which reaping is suspended (WB-1.10 /
-/// WB-ISC-5). Presence reaping is calibrated to emit cadence, but its input
-/// (keepalive arrival) is latency-dependent; under a deep local write funnel a
-/// member's keepalive can sit queued past its TTL, so a receiver whose own
-/// enqueue-to-ack latency is elevated suspends reaping (bias-to-forgiveness —
-/// suspension only ever *delays* disappearance). Slightly below the scheduler's
-/// AIMD breach threshold so reaping goes conservative before the window shrinks.
+/// DHT-weather regime (median millis, WB-5.1 / I5″.6) at/above which the [`ReapGate`]
+/// enters the elevated (reap-suspended) state — the UPPER hysteresis band (WB-1.10 /
+/// WB-ISC-5). Presence reaping is calibrated to emit cadence, but its input (keepalive
+/// arrival) is latency-dependent; under an elevated DHT regime a member's keepalive can
+/// sit queued past its TTL, so a receiver whose own published regime estimator is
+/// elevated suspends reaping (bias-to-forgiveness — suspension only ever *delays*
+/// disappearance) and surfaces the WB-ISC-20 "presence may be stale" signal
+/// ([`PresenceTracker::stale_suspected`]). The scheduler publishes the estimator as the
+/// MEDIAN of the last 5 non-chat enqueue-to-ack latencies; the [`ReapGate`] applies this
+/// band ([`REAP_CALM_THRESHOLD`] is the lower band) plus a [`REAP_RESUME_GRACE`].
 pub const REAP_CONGESTION_THRESHOLD: Duration = Duration::from_secs(8);
+/// Hysteresis LOWER band (WB-5.1 / I5″.6): once elevated, the [`ReapGate`] stays
+/// elevated until the median weather drops to/below this — so a single fast straggler
+/// (or a value in the [4s, 8s] dead-band) cannot flap reaping back on. Paired with the
+/// [`REAP_CONGESTION_THRESHOLD`] upper band.
+pub const REAP_CALM_THRESHOLD: Duration = Duration::from_secs(4);
+/// Reap-resume grace (WB-5.1 / I5″.6): after an elevated→calm crossing, reaping stays
+/// suspended a further this-long. Freshness inputs LAG the regime — a member whose
+/// beacons were lost during the elevated window re-freshens only on its next keepalive
+/// — so resuming at the crossing would false-reap live members against stale
+/// timestamps. One keepalive-band maximum ([`KEEPALIVE_INTERVAL_MAX`]) covers the
+/// in-flight-beacon tail.
+pub const REAP_RESUME_GRACE: Duration = Duration::from_secs(220);
 
 /// Draw the next jittered **keepalive** interval, uniformly random in
 /// `[KEEPALIVE_INTERVAL_MIN, KEEPALIVE_INTERVAL_MAX]` (WB-1.2). Fresh per emission
@@ -400,6 +415,20 @@ impl PresenceTracker {
         reaped
     }
 
+    /// Whether the roster may be showing stale presence (WB-5 / I5′.4, WB-ISC-20): the
+    /// DHT regime is elevated (`congested`) AND at least one member is past its TTL and
+    /// would be reaped were reaping not suspended. Roster-as-presence is a trust input
+    /// for sharing decisions, so a suspended reaper that keeps a departed member visible
+    /// must be surfaced ("presence may be stale"), not silent. A pure local computation
+    /// — it emits nothing and mutates nothing (WB-ISC-8 holds).
+    pub fn stale_suspected(&self, now: Instant, congested: bool) -> bool {
+        congested
+            && self
+                .members
+                .values()
+                .any(|m| now.saturating_duration_since(m.last_seen) >= self.ttl)
+    }
+
     /// The live members, sorted by display handle then pubkey for a stable roster
     /// order.
     pub fn members(&self) -> Vec<LiveMember> {
@@ -420,6 +449,88 @@ impl PresenceTracker {
     /// Whether the roster is empty.
     pub fn is_empty(&self) -> bool {
         self.members.is_empty()
+    }
+}
+
+/// The reap-suspension gate (WB-5.1 / I5″.6): converts the scheduler's published
+/// median DHT-weather signal into the boolean "should reaping be suspended right now",
+/// applying a hysteresis band and a reap-resume grace. Transport-free and owned by
+/// each frontend net actor alongside its [`PresenceTracker`], so the gui and tui share
+/// one shape (the design's presence-transport-free rationale) and it is unit-testable
+/// without the scheduler.
+///
+/// Fed the published median (millis) once per reap tick (`observe`). **Sampling is
+/// coarse:** the reap tick runs at roughly the keepalive cadence
+/// ([`KEEPALIVE_INTERVAL_MAX`]), NOT sub-second, so a transient elevated regime that
+/// arises and recedes entirely within one inter-tick gap can be missed and `calm_since`
+/// is stamped at tick granularity. The bounded consequence: a member is only
+/// false-reaped if its keepalive is already TTL-stale (600s) AT a tick that happens to
+/// read calm, and it self-heals on the member's next keepalive (WB-1.10
+/// bias-to-forgiveness) — the median-of-5 + calm-padding already make the signal sticky
+/// (3 fast completions to recede). A finer decoupled observe timer (sampling the probe
+/// on a seconds cadence, independent of the reap tick) is a felt-test-gated follow-up.
+/// The median never staleness-freezes for longer than one keepalive interval (a
+/// connected client emits a non-chat keepalive ≤ every [`KEEPALIVE_INTERVAL_MAX`],
+/// updating the estimator); a disconnected client is not reaping.
+#[derive(Debug, Clone)]
+pub struct ReapGate {
+    /// Hysteresis state: `true` once the median crossed the upper band, until it drops
+    /// to the lower band.
+    elevated: bool,
+    /// The instant of the most recent elevated→calm crossing, for the resume grace.
+    /// `None` while elevated or before any crossing.
+    calm_since: Option<Instant>,
+}
+
+impl Default for ReapGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ReapGate {
+    /// A fresh gate — starts calm (not elevated), so a client that never sees an
+    /// elevated regime reaps normally.
+    pub fn new() -> Self {
+        Self {
+            elevated: false,
+            calm_since: None,
+        }
+    }
+
+    /// Fold the current published median DHT-weather (`weather_ms`) at reap time
+    /// `now`, applying the hysteresis band: become elevated at
+    /// `≥ REAP_CONGESTION_THRESHOLD`, and return to calm only at
+    /// `≤ REAP_CALM_THRESHOLD` — a value in the dead-band holds the current state. On
+    /// the elevated→calm crossing the resume grace clock is stamped; a re-elevation
+    /// clears it.
+    pub fn observe(&mut self, weather_ms: u64, now: Instant) {
+        let elevated_ms = REAP_CONGESTION_THRESHOLD.as_millis() as u64;
+        let calm_ms = REAP_CALM_THRESHOLD.as_millis() as u64;
+        if self.elevated {
+            if weather_ms <= calm_ms {
+                self.elevated = false;
+                self.calm_since = Some(now); // start the reap-resume grace
+            }
+        } else if weather_ms >= elevated_ms {
+            self.elevated = true;
+            self.calm_since = None; // re-elevated — the grace no longer applies
+        }
+    }
+
+    /// Whether reaping should be suspended at `now` (WB-1.10 reap-in-calm): while the
+    /// regime is elevated, OR within [`REAP_RESUME_GRACE`] of the elevated→calm
+    /// crossing. Pass this to both [`PresenceTracker::reap`] and
+    /// [`PresenceTracker::stale_suspected`] so the "presence may be stale" signal shows
+    /// exactly while the suspension holds a departed member visible.
+    pub fn suspend_reaping(&self, now: Instant) -> bool {
+        if self.elevated {
+            return true;
+        }
+        match self.calm_since {
+            Some(c) => now.saturating_duration_since(c) < REAP_RESUME_GRACE,
+            None => false,
+        }
     }
 }
 
@@ -723,6 +834,42 @@ mod tests {
         assert!(t.is_empty());
     }
 
+    /// WB-ISC-20: when reaping is suspended under an elevated regime, the roster
+    /// surfaces a "presence may be stale" signal — set exactly while a past-TTL member
+    /// is held visible by the suspension, and clear otherwise.
+    #[test]
+    fn wb_isc_20_presence_stale_signal_tracks_suspended_reaping() {
+        let mut t = PresenceTracker::for_room("lobby", PRESENCE_TTL);
+        let t0 = Instant::now();
+        t.apply(&heartbeat(b"pk", "a#0", 1_000_000_000_000), t0);
+        let fresh = t0 + Duration::from_secs(1);
+        let past_ttl = t0 + PRESENCE_TTL + Duration::from_secs(60);
+
+        // Fresh member: no staleness even under an elevated regime (nothing overdue).
+        assert!(
+            !t.stale_suspected(fresh, true),
+            "a fresh roster is never stale, congested or not"
+        );
+        // Past-TTL member + calm: reaping runs, so nothing is being held stale.
+        assert!(
+            !t.stale_suspected(past_ttl, false),
+            "in calm the reaper removes overdue members — not 'stale', just reaped"
+        );
+        // Past-TTL member + elevated regime: reaping is suspended, so the overdue
+        // member is held VISIBLE — the roster is knowingly stale, and says so.
+        assert!(
+            t.stale_suspected(past_ttl, true),
+            "a suspended reaper holding a past-TTL member surfaces the stale signal"
+        );
+        // The signal never mutated state — the member is still present, reap still works.
+        assert_eq!(t.len(), 1, "the staleness check emits/mutates nothing");
+        assert_eq!(
+            t.reap(past_ttl, false).len(),
+            1,
+            "calm reap still works after"
+        );
+    }
+
     /// WB-ISC-7: a leave tombstone dominates freshness — no same-room write with
     /// `sent_unix_ms ≤ leave_ms` re-freshens a departed member (a final chat racing
     /// the tombstone cannot flicker it back), while a genuinely newer write rejoins.
@@ -788,5 +935,73 @@ mod tests {
         let _: PresenceChange = t.apply(&leave(b"pk", "a#0", 300), t0 + Duration::from_secs(1));
         let reaped: Vec<LiveMember> = t.reap(t0 + PRESENCE_TTL * 2, false);
         assert!(reaped.is_empty() && t.is_empty());
+    }
+
+    /// WB-ISC-25: the [`ReapGate`] hysteresis band + resume grace. An elevated regime
+    /// suspends reaping; a value in the [4s, 8s] dead-band holds elevated (hysteresis);
+    /// on the elevated→calm crossing reaping stays suspended for
+    /// [`REAP_RESUME_GRACE`], then resumes — and a past-TTL member is held visible
+    /// throughout the suspension, then reaped.
+    #[test]
+    fn wb_isc_25_reap_gate_band_and_resume_grace() {
+        let mut t = PresenceTracker::for_room("lobby", PRESENCE_TTL);
+        let t0 = Instant::now();
+        t.apply(&heartbeat(b"pk", "a#0", 1_000_000_000_000), t0);
+        let past_ttl = t0 + PRESENCE_TTL + Duration::from_secs(60);
+
+        let mut gate = ReapGate::new();
+        assert!(
+            !gate.suspend_reaping(t0),
+            "a fresh gate is calm — reaping runs"
+        );
+
+        // Elevated median (≥ 8s) → suspend; the past-TTL member is held + flagged stale.
+        gate.observe(9_000, past_ttl);
+        assert!(
+            gate.suspend_reaping(past_ttl),
+            "elevated regime suspends reaping"
+        );
+        assert!(t.reap(past_ttl, gate.suspend_reaping(past_ttl)).is_empty());
+        assert_eq!(t.len(), 1, "a suspended reaper holds the past-TTL member");
+        assert!(
+            t.stale_suspected(past_ttl, gate.suspend_reaping(past_ttl)),
+            "the roster surfaces 'presence may be stale' while suspended"
+        );
+
+        // A dead-band value (6s, between calm 4s and elevated 8s) HOLDS elevated.
+        let t_deadband = past_ttl + Duration::from_secs(1);
+        gate.observe(6_000, t_deadband);
+        assert!(
+            gate.suspend_reaping(t_deadband),
+            "a dead-band value holds elevated (hysteresis — no flap)"
+        );
+
+        // Calm crossing (≤ 4s) → still suspended through the resume grace.
+        let crossing = past_ttl + Duration::from_secs(2);
+        gate.observe(1_000, crossing);
+        assert!(
+            gate.suspend_reaping(crossing),
+            "still suspended at the crossing"
+        );
+        let near_end = crossing + REAP_RESUME_GRACE - Duration::from_secs(1);
+        assert!(
+            gate.suspend_reaping(near_end),
+            "suspended for the full resume grace after the crossing"
+        );
+        assert!(
+            t.reap(near_end, gate.suspend_reaping(near_end)).is_empty(),
+            "the member is still held within the grace"
+        );
+        assert_eq!(t.len(), 1);
+
+        // After the grace elapses → reaping resumes → the past-TTL member is reaped.
+        let resumed = crossing + REAP_RESUME_GRACE + Duration::from_secs(1);
+        assert!(
+            !gate.suspend_reaping(resumed),
+            "reaping resumes once the grace elapses"
+        );
+        let reaped = t.reap(resumed, gate.suspend_reaping(resumed));
+        assert_eq!(reaped.len(), 1, "the overdue member is finally reaped");
+        assert!(t.is_empty());
     }
 }

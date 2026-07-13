@@ -61,16 +61,24 @@
 //! signer-gated composer, the app publish wiring, and the rollback-freshness
 //! version field are follow-ons.
 //!
-//! ## Write scheduler (WB-3)
+//! ## Write scheduler (WB-3 + WB-5.1)
 //! Every `set_dht_value` funnels through one prioritized, rate-limited queue
 //! ([`schedule`], design `docs/design/veilid-write-budget.md`): chat >
 //! session-boundary > advert-refresh > keepalive > republish, per-record FIFO,
 //! last-writer-wins current-state coalescing with non-coalescible dominant
-//! tombstones, an AIMD-bounded non-chat in-flight window, deadline override,
-//! shutdown flush/shed, and no read-triggered writes. The actor's write commands
-//! and the advert-refresh path enqueue and return, so a slow DHT set never parks
-//! the command loop (#154). The scheduler dispatches through the existing
-//! per-record write functions, so #131 clamp-at-insert and ring-seq-inside-
+//! tombstones, deadline override, shutdown flush/shed, and no read-triggered writes.
+//! Concurrency is the WB-5.1 **four-pool partitioned [`dht_gate::DhtGate`]** (chat 2 /
+//! I8-floor 1 / write `W_max`=2 / read 9) shared with the read lane, so daemonseed's
+//! combined in-flight DHT ops stay provably under veilid's 16-permit gate and reads
+//! never drain the write lanes. The non-chat window is the STATIC
+//! `min(distinct pending non-chat records, W_max)` — the §I5′.2 acquire-wait controller
+//! is retired (under dedicated pools it carries no signal); a dedicated capacity-1 floor
+//! lane guarantees starved (`starved_since` past `FLOOR_AGE`) + deadline-due writes
+//! forward progress. The actor's write commands and the advert-refresh path enqueue and
+//! return, so a slow DHT set never parks the command loop (#154), and a panicked write —
+//! including a synchronous dispatch-construction panic — is supervised so it can never
+//! wedge the funnel nor leak a lane counter (#168). The scheduler dispatches through the
+//! existing per-record write functions, so #131 clamp-at-insert and ring-seq-inside-
 //! `record_lock` are untouched; a [`WriteSink`] seam makes it paused-time testable.
 //!
 //! ## Invariant
@@ -116,6 +124,7 @@ pub fn trace_elapsed_secs() -> f64 {
 pub mod actor;
 pub mod aimd;
 pub mod config;
+pub mod dht_gate;
 pub mod discovery;
 pub mod error;
 pub mod event;
@@ -128,6 +137,10 @@ pub mod share;
 pub use actor::{PresenceBoundary, VeilidNet, VeilidNetHandle};
 pub use aimd::AimdWindow;
 pub use config::VeilidNetConfig;
+pub use dht_gate::{
+    DhtGate, GatePermit, CHAT_PERMITS, DHT_BUDGET, DHT_GATE_MARGIN, DHT_GATE_PERMITS,
+    FLOOR_PERMITS, READ_PERMITS, R_MIN, W_MAX,
+};
 pub use discovery::{
     route_provenance_input, verify_route_advert, DiscoveryEnvelope, RouteAdvertSigner,
 };
@@ -135,6 +148,6 @@ pub use error::{Result, VeilidNetError};
 pub use event::VeilidNetEvent;
 pub use resweep::next_resweep_seed;
 pub use schedule::{
-    SchedulerConfig, WriteClass, WriteKind, WriteRequest, WriteScheduler, WriteSchedulerHandle,
-    WriteSink,
+    DispatchOutcome, SchedulerConfig, WriteClass, WriteKind, WriteRequest, WriteScheduler,
+    WriteSchedulerHandle, WriteSink,
 };

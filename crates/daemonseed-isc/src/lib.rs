@@ -331,13 +331,31 @@ pub const ISCS: &[(&str, IscClass)] = &[
     // (a late-converging client still discovers a share) is DEFERRED to its two-node
     // orinoco oracle and is NOT registered until that live probe lands (ISA Criteria).
     ("WB-ISC-14", IscClass::Negative),
+    // WB-5.1 per-GET partitioned DHT gate (2026-07-13, docs/design/veilid-write-budget.md
+    // §WB-5.1). The read-lane cure: four dedicated permit pools, per-GET read permits, a
+    // retired acquire-wait controller, a dedicated floor lane, a median-of-5 weather
+    // estimator + ReapGate band/grace, and panic-safety. WB-ISC-15 (late-converging share
+    // discovery) and WB-ISC-19 (single-client orinoco W_max step-up control) stay DEFERRED
+    // to their live probes and are NOT registered (ISA Criteria `[DEFERRED-VERIFY]`).
+    ("WB-ISC-16", IscClass::Positive), // static window, invariant to latency
+    ("WB-ISC-17", IscClass::Negative), // anti: combined in-flight ≤ budget; per-pool caps
+    ("WB-ISC-18", IscClass::Positive), // median-of-5 estimator, outlier-robust
+    ("WB-ISC-20", IscClass::Positive), // roster surfaces "presence may be stale"
+    ("WB-ISC-21", IscClass::Positive), // per-GET read-permit granularity
+    ("WB-ISC-22", IscClass::Positive), // read occupancy ≤ partition (N-independence)
+    ("WB-ISC-23", IscClass::Positive), // floor lane dispatches starved/coalesced writes
+    ("WB-ISC-24", IscClass::Negative), // anti: chat never waits on a non-chat pool
+    ("WB-ISC-25", IscClass::Positive), // reap gate band + resume grace
+    ("WB-ISC-26", IscClass::Negative), // anti: panic never wedges/leaks a lane counter
+    ("WB-ISC-27", IscClass::Negative), // anti: acquire_wait feeds no control decision
+    ("WB-ISC-28", IscClass::Negative), // anti: single-permit rule (no cross-pool hold)
 ];
 
 /// Total built, non-deferred ISCs tracked by this registry — the SINGLE source
 /// of truth for the coverage denominator, read live by `xtask isc-coverage`.
 /// Recount on every ISC add/remove (the `const _` assert below guards it
 /// against [`ISCS`]).
-pub const TOTAL: usize = 201;
+pub const TOTAL: usize = 213;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -519,10 +537,18 @@ mod tests {
         //                                  ISC-S32/S33/S34 pos (catalog / route-import /
         //                                  circle-path derive-check gates) +
         //                                  ISC-A-S24/A-S25/A-S26 neg (unconditional-reject /
-        //                                  no-random-id-on-publish / path-secrecy))
-        //   total   131 pos + 70 neg = 201
-        assert_eq!(pos, 131, "positive count drift");
-        assert_eq!(neg, 70, "negative count drift");
+        //                                  no-random-id-on-publish / path-secrecy));
+        //                                  WB-5.1 per-GET partitioned gate:
+        //                                  WB-ISC-16/18/20/21/22/23/25 pos (static window /
+        //                                  median estimator / stale signal / per-GET
+        //                                  granularity / read N-independence / floor lane /
+        //                                  reap band+grace) +
+        //                                  WB-ISC-17/24/26/27/28 neg (accountant bound /
+        //                                  chat-never-waits / panic-recovery /
+        //                                  telemetry-only / single-permit), #159/#168/#157)
+        //   total   138 pos + 75 neg = 213
+        assert_eq!(pos, 138, "positive count drift");
+        assert_eq!(neg, 75, "negative count drift");
     }
 
     /// COVERED is single-sourced and must agree with the per-milestone

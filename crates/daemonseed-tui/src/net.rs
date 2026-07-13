@@ -403,6 +403,12 @@ pub enum NetEvent {
     },
     /// The connection attempt failed; `message` is a human-readable cause.
     ConnectFailed { message: String },
+    /// (WB-5.1 / I5″.7, WB-ISC-20) The aggregate "presence may be stale" signal
+    /// toggled: an elevated DHT regime has the reaper suspended, holding a past-TTL
+    /// member visible on the roster. The status line surfaces the caveat while `stale`
+    /// is true. Emitted only on a change; the relay path never emits it.
+    #[cfg_attr(not(feature = "veilid"), allow(dead_code))]
+    PresenceStale { stale: bool },
     /// A circle subscribe stream is live; chat can flow (ISC-16 / ISC-C59). The
     /// circle is ADDED to the membership set (it never evicts an existing one);
     /// `circle_id` is the stable per-session id the app keys its membership and

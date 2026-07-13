@@ -179,6 +179,7 @@ pub enum NetCommand {
         /// `stable_signing_key`. The veilid actor holds it so a publish derives a
         /// receiver-verifiable `share_id`. `None` on the ephemeral / no-profile
         /// path (no publish under a stable identity).
+        #[cfg_attr(not(feature = "veilid"), allow(dead_code))]
         stable_share_root_ikm: Option<ShareRootIkm>,
     },
     /// (#66) Update the presented display handle in place after a rename, without a
@@ -418,6 +419,13 @@ pub enum NetEvent {
     /// Relay-mode never emits it, so it is unconstructed in a non-veilid build.
     #[cfg_attr(not(feature = "veilid"), allow(dead_code))]
     PeerCount { reliable: u32, live: u32 },
+    /// (WB-5.1 / I5″.7, WB-ISC-20) The aggregate "presence may be stale" signal
+    /// toggled: the DHT regime is elevated and the reaper is suspended, holding a
+    /// past-TTL member visible on some roster. The UI surfaces a "presence may be
+    /// stale" indicator while `stale` is true. Emitted only on a change; relay-mode
+    /// never emits it.
+    #[cfg_attr(not(feature = "veilid"), allow(dead_code))]
+    PresenceStale { stale: bool },
     /// The connection attempt failed; `reason` is human-readable.
     ConnectFailed { reason: String },
     /// A live connection dropped — a subscribe stream ended (`Ok(None)`) or

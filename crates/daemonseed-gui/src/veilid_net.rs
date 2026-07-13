@@ -70,7 +70,7 @@ use daemonseed_core::heartbeat::{
 use daemonseed_core::identity::keys::{Identity, ShareRootIkm, SignKeypair, derive_identity_keys};
 use daemonseed_core::identity::mnemonic::Mnemonic;
 use daemonseed_core::presence::{
-    PRESENCE_TTL, PresenceChange, PresenceTracker, REAP_CONGESTION_THRESHOLD, beacon_is_fresh,
+    PRESENCE_TTL, PresenceChange, PresenceTracker, ReapGate, beacon_is_fresh,
     next_keepalive_interval,
 };
 use daemonseed_core::public_room::{
@@ -331,6 +331,14 @@ struct ShareState {
     /// The subscribed operator announce/MOTD record (Phase 4 A-c), set on Connect
     /// after the owner seed derives + the record subscribes. `None` until connected.
     operator: Option<OperatorSpace>,
+    /// The reap-suspension gate (WB-5.1 / I5″.6/.7): folds the scheduler's published
+    /// median DHT-weather (hysteresis band + resume grace) into "suspend reaping now",
+    /// so the reaper does not false-reap members whose keepalives are merely queued in
+    /// an elevated regime. Persists across reap ticks.
+    reap_gate: ReapGate,
+    /// Last-emitted "presence may be stale" signal (WB-5.1 / I5″.7, WB-ISC-20), so a
+    /// `NetEvent::PresenceStale` is emitted only on a change.
+    prev_presence_stale: bool,
 }
 
 impl ShareState {
@@ -343,6 +351,8 @@ impl ShareState {
             discovered: HashMap::new(),
             own: Vec::new(),
             operator: None,
+            reap_gate: ReapGate::new(),
+            prev_presence_stale: false,
         }
     }
 
@@ -677,22 +687,13 @@ async fn publish_circle_leave(
     }
 }
 
-/// Whether the local write funnel is congested (WB-1.10 / WB-ISC-5): the
-/// scheduler's most-recent non-chat enqueue-to-ack latency is at/above
-/// [`REAP_CONGESTION_THRESHOLD`]. While congested, the presence reaper is suspended
-/// so a keepalive merely queued in the funnel does not false-reap its member.
-fn write_congested(net: &Option<VeilidNetHandle>) -> bool {
-    net.as_ref()
-        .map(|h| h.last_write_latency_ms() >= REAP_CONGESTION_THRESHOLD.as_millis() as u64)
-        .unwrap_or(false)
-}
-
 /// Emit one sealed presence KEEPALIVE (WB-1.2) per joined room to its presence
 /// record, then `reap` each roster so members past their TTL age out — but only in
-/// calm (WB-1.10): while the local write funnel is congested, reaping is suspended.
-/// A missing identity/lobby, a seal failure, or a closed transport is non-fatal —
-/// presence self-heals on the next tick. A reap that changed a set pushes a fresh
-/// (possibly empty) Roster.
+/// calm (WB-1.10): while the DHT regime is elevated, reaping is suspended via the
+/// [`ReapGate`]. A missing identity/lobby, a seal failure, or a closed transport is
+/// non-fatal — presence self-heals on the next tick. A reap that changed a set pushes a
+/// fresh (possibly empty) Roster; a change in the aggregate "presence may be stale"
+/// signal pushes a `NetEvent::PresenceStale` (WB-ISC-20).
 fn emit_and_reap_presence(
     evt_tx: &UnboundedSender<NetEvent>,
     net: &Option<VeilidNetHandle>,
@@ -700,9 +701,14 @@ fn emit_and_reap_presence(
     shares: &mut ShareState,
     circles: &mut [VeilidCircle],
 ) {
-    // WB-1.10: suspend reaping while the local funnel is backed up (a keepalive may
-    // simply be queued). Sampled once per tick for the whole reap pass.
-    let congested = write_congested(net);
+    // WB-5.1 / I5″.6/.7: fold the scheduler's published median DHT-weather through the
+    // ReapGate (hysteresis band 8s/4s + 220s resume grace) into "suspend reaping now".
+    // Sampled once per tick for the whole reap pass; while suspended a keepalive merely
+    // queued in an elevated regime does not false-reap its member.
+    let now = Instant::now();
+    let weather_ms = net.as_ref().map(|h| h.last_write_latency_ms()).unwrap_or(0);
+    shares.reap_gate.observe(weather_ms, now);
+    let suspend = shares.reap_gate.suspend_reaping(now);
     // EMIT the lobby keepalive — needs an identity to self-sign with (ISC-C57), a
     // live transport, and a subscribed lobby.
     if let (Some(handle), Some(signing)) = (net.as_ref(), shares.signing.clone())
@@ -721,7 +727,7 @@ fn emit_and_reap_presence(
     // roster only when a reap actually removed someone (a reap-to-empty still pushes
     // an empty roster so the UI clears).
     if let Some(lobby) = shares.lobby.as_mut()
-        && !lobby.presence.reap(Instant::now(), congested).is_empty()
+        && !lobby.presence.reap(now, suspend).is_empty()
     {
         let entries = roster_from_members(&lobby.presence.members());
         let _ = evt_tx.send(NetEvent::Roster {
@@ -746,15 +752,30 @@ fn emit_and_reap_presence(
     }
     // Reap each circle's tracker on the same tick (in calm); push a fresh (possibly
     // empty) roster tagged with that circle for any tracker a reap changed.
-    let now = Instant::now();
     for circle in circles.iter_mut() {
-        if !circle.presence.reap(now, congested).is_empty() {
+        if !circle.presence.reap(now, suspend).is_empty() {
             let entries = roster_from_members(&circle.presence.members());
             let _ = evt_tx.send(NetEvent::Roster {
                 circle_id: Some(circle.circle_id),
                 entries,
             });
         }
+    }
+
+    // WB-5.1 / I5″.7 (WB-ISC-20): "presence may be stale" — computed AFTER the reaps
+    // (in calm the reaper removed overdue members, so nothing reads stale). True while
+    // the suspension holds a past-TTL member visible on ANY roster; emitted only on a
+    // change so the UI toggles the indicator without per-tick churn.
+    let stale = shares
+        .lobby
+        .as_ref()
+        .is_some_and(|l| l.presence.stale_suspected(now, suspend))
+        || circles
+            .iter()
+            .any(|c| c.presence.stale_suspected(now, suspend));
+    if stale != shares.prev_presence_stale {
+        shares.prev_presence_stale = stale;
+        let _ = evt_tx.send(NetEvent::PresenceStale { stale });
     }
 }
 

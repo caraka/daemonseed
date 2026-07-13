@@ -91,8 +91,7 @@ use daemonseed_core::heartbeat::{HeartbeatFields, open_heartbeat, seal_public_he
 use daemonseed_core::identity::keys::{Identity, ShareRootIkm, SignKeypair, derive_identity_keys};
 use daemonseed_core::identity::mnemonic::Mnemonic;
 use daemonseed_core::presence::{
-    PRESENCE_TTL, PresenceTracker, REAP_CONGESTION_THRESHOLD, beacon_is_fresh,
-    next_keepalive_interval,
+    PRESENCE_TTL, PresenceTracker, ReapGate, beacon_is_fresh, next_keepalive_interval,
 };
 use daemonseed_core::public_room::{
     DEFAULT_ROOM, PublicRoomKey, derive_room_key, derive_room_presence_veilid_owner_seed,
@@ -211,6 +210,13 @@ struct ShareState {
     /// `SharesSnapshot` (the relay's `remote` rows are the discovered catalog
     /// alone; the publisher's own list rides `PublishStarted`/`PublishStopped`).
     own: Vec<OwnShare>,
+    /// The reap-suspension gate (WB-5.1 / I5″.6/.7): folds the scheduler's published
+    /// median DHT-weather (hysteresis band + resume grace) into "suspend reaping now".
+    /// Persists across reap ticks.
+    reap_gate: ReapGate,
+    /// Last-emitted "presence may be stale" signal (WB-ISC-20), so a
+    /// `NetEvent::PresenceStale` is emitted only on a change.
+    prev_presence_stale: bool,
 }
 
 impl ShareState {
@@ -222,6 +228,8 @@ impl ShareState {
             catalog: ShareCatalog::new(SHARE_CATALOG_TTL),
             discovered: HashMap::new(),
             own: Vec::new(),
+            reap_gate: ReapGate::new(),
+            prev_presence_stale: false,
         }
     }
 }
@@ -322,7 +330,7 @@ pub async fn veilid_net_actor(
             // Emit one lobby presence beacon + reap the tracker, then re-arm with a
             // fresh jittered deadline.
             () = heartbeat.as_mut() => {
-                emit_and_reap_lobby_presence(&net, &my_handle, &mut shares);
+                emit_and_reap_lobby_presence(&evt_tx, &net, &my_handle, &mut shares);
                 heartbeat
                     .as_mut()
                     .reset(tokio::time::Instant::now() + veilid_keepalive_interval());
@@ -1533,21 +1541,19 @@ fn spawn_public_beacon(
     }
 }
 
-/// Whether the local write funnel is congested (WB-1.10 / WB-ISC-5): the
-/// scheduler's most-recent non-chat enqueue-to-ack latency is at/above
-/// [`REAP_CONGESTION_THRESHOLD`]. While congested, presence reaping is suspended.
-fn write_congested(net: &Option<VeilidNetHandle>) -> bool {
-    net.as_ref()
-        .map(|h| h.last_write_latency_ms() >= REAP_CONGESTION_THRESHOLD.as_millis() as u64)
-        .unwrap_or(false)
-}
-
 fn emit_and_reap_lobby_presence(
+    evt_tx: &UnboundedSender<NetEvent>,
     net: &Option<VeilidNetHandle>,
     my_handle: &Option<String>,
     shares: &mut ShareState,
 ) {
-    let congested = write_congested(net);
+    // WB-5.1 / I5″.6/.7: fold the scheduler's published median DHT-weather through the
+    // ReapGate (hysteresis band 8s/4s + 220s resume grace) into "suspend reaping now",
+    // so a keepalive merely queued in an elevated regime does not false-reap its member.
+    let now = Instant::now();
+    let weather_ms = net.as_ref().map(|h| h.last_write_latency_ms()).unwrap_or(0);
+    shares.reap_gate.observe(weather_ms, now);
+    let suspend = shares.reap_gate.suspend_reaping(now);
     if let (Some(handle), Some(signing)) = (net.as_ref(), shares.signing.clone())
         && let Some(lobby) = shares.lobby.as_ref()
     {
@@ -1560,9 +1566,18 @@ fn emit_and_reap_lobby_presence(
             PresenceBoundary::Keepalive,
         );
     }
-    // WB-1.10: reap only in calm (the timer is the reap clock).
+    // Reap only in calm (the timer is the reap clock).
     if let Some(lobby) = shares.lobby.as_mut() {
-        let _ = lobby.presence.reap(Instant::now(), congested);
+        let _ = lobby.presence.reap(now, suspend);
+    }
+    // WB-ISC-20: "presence may be stale" — computed after the reap, emitted on change.
+    let stale = shares
+        .lobby
+        .as_ref()
+        .is_some_and(|l| l.presence.stale_suspected(now, suspend));
+    if stale != shares.prev_presence_stale {
+        shares.prev_presence_stale = stale;
+        let _ = evt_tx.send(NetEvent::PresenceStale { stale });
     }
 }
 

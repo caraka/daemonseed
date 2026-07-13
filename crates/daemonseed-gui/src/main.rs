@@ -1934,6 +1934,24 @@ fn apply_net_event(
             ui.set_download_progress(0.0);
             ui.set_download_label(SharedString::from(format!("Download failed: {message}")));
         }
+        // (WB-5.1 / I5″.7, WB-ISC-20) The reaper is suspended under an elevated DHT
+        // regime, so the roster may be showing a departed member — surface it as a
+        // notice so a sharing decision that trusts roster-as-presence sees the caveat.
+        // The `connect_notice` slot is SHARED (Error / connect-flow notices), so this is
+        // lowest-priority: it sets the caveat only when the slot is free and clears only
+        // its own message — never clobbering an unrelated notice. The polished
+        // roster-header render is a `.slint` follow-up (felt-test-verified).
+        NetEvent::PresenceStale { stale } => {
+            const STALE_NOTICE: &str = "Presence may be stale — network congested";
+            let cur = ui.get_connect_notice();
+            if stale {
+                if cur.is_empty() {
+                    ui.set_connect_notice(SharedString::from(STALE_NOTICE));
+                }
+            } else if cur.as_str() == STALE_NOTICE {
+                ui.set_connect_notice(SharedString::from(""));
+            }
+        }
         NetEvent::Roster { circle_id, entries } => {
             // #144: real presence (a peer is online) → settle-dismiss the mask.
             if !entries.is_empty() {

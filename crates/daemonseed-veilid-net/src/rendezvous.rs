@@ -23,6 +23,7 @@
 //! non-derivable owner keypair is the write-gate.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
@@ -31,6 +32,7 @@ use veilid_core::{
 };
 
 use crate::actor::APP_MESSAGE_CAP;
+use crate::dht_gate::DhtGate;
 use crate::error::{Result, VeilidNetError};
 use crate::event::VeilidNetEvent;
 
@@ -141,11 +143,23 @@ pub async fn open_cached<K: Clone>(
     owner_seed: &[u8; 32],
     open: impl std::future::Future<Output = Result<K>>,
 ) -> Result<K> {
-    if let Some(k) = cache.lock().unwrap().get(owner_seed).cloned() {
+    // Poison-recovery idiom (WB-5.1 / I5″.8, mirroring `ring_seq`): the guarded state
+    // is a plain key→key cache whose per-entry invariants survive an unwind, so a
+    // panic elsewhere while holding this brief map guard must NOT poison-cascade and
+    // wedge every subsequent record open (#168 failure class). Recover the inner map.
+    if let Some(k) = cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(owner_seed)
+        .cloned()
+    {
         return Ok(k);
     }
     let k = open.await?;
-    cache.lock().unwrap().insert(*owner_seed, k.clone());
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(*owner_seed, k.clone());
     Ok(k)
 }
 
@@ -166,9 +180,13 @@ pub type RecordLocks = Mutex<HashMap<[u8; 32], Arc<tokio::sync::Mutex<()>>>>;
 /// `Arc` is `.lock().await`-ed by the caller; the brief `std::sync::Mutex` guard on
 /// the map itself is never held across an await.
 pub fn record_lock(locks: &RecordLocks, owner_seed: &[u8; 32]) -> Arc<tokio::sync::Mutex<()>> {
+    // Poison-recovery idiom (WB-5.1 / I5″.8, mirroring `ring_seq`): the guarded state
+    // is a map of per-record lock handles whose invariants survive an unwind; a
+    // poisoned-mutex cascade wedging every subsequent record open is the #168 failure
+    // class with a different door, so recover the inner map rather than propagate.
     locks
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .entry(*owner_seed)
         .or_default()
         .clone()
@@ -245,35 +263,80 @@ pub async fn publish_at_subkey(
 }
 
 /// Sweep every subkey once for the login backlog, emitting an [`VeilidNetEvent::Inbound`]
-/// per populated slot. `force_refresh` pulls from the network (DHT reads are
-/// eventually consistent). Bounded by [`SUBKEY_COUNT`]; runs as a background task.
+/// per populated slot. Each `get_dht_value` `force_refresh`es from the network (DHT
+/// reads are eventually consistent) under a **per-GET** read permit from the shared
+/// [`DhtGate`] (WB-5.1 / I5″.2): the permit is held around ONE GET and released before
+/// the next, so read occupancy never exceeds the read partition no matter how many
+/// sweeps run concurrently (WB-ISC-21/22) — the fix for the first WB-5 build, whose
+/// whole-sweep permit let ≥13 cold-start sweeps drain the pool and starve writes.
+/// Bounded by [`SUBKEY_COUNT`]; runs as a background task.
 pub async fn sweep(
+    gate: Arc<DhtGate>,
     rc: RoutingContext,
     key: RecordKey,
     ev_tx: mpsc::UnboundedSender<VeilidNetEvent>,
 ) {
+    let found = sweep_gated(
+        &gate,
+        SUBKEY_COUNT,
+        |bytes| ev_tx.send(VeilidNetEvent::Inbound { bytes }).is_ok(),
+        |subkey| {
+            let rc = rc.clone();
+            let key = key.clone();
+            async move {
+                rc.get_dht_value(key, subkey, true)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|v| v.data().to_vec())
+            }
+        },
+    )
+    .await;
+    crate::vtrace!("sweep: done, {found} backlog slot(s) emitted");
+}
+
+/// The testable per-GET sweep core (WB-5.1 / I5″.2). For each subkey it acquires ONE
+/// read permit from `gate`, runs `get` (one DHT GET), releases the permit, then hands
+/// any populated slot's bytes to `on_bytes`. The permit is held across the GET only —
+/// never across the whole sweep and never across `on_bytes` (the emit is not a DHT op)
+/// — so `gate`'s read pool bounds instantaneous read concurrency regardless of live
+/// sweep count. `on_bytes` returns `false` to stop early (the receiver dropped).
+/// Generic over `get` so the per-GET permit discipline is unit-testable without veilid
+/// types (WB-ISC-21/22).
+pub async fn sweep_gated<Fut>(
+    gate: &Arc<DhtGate>,
+    subkey_count: u16,
+    mut on_bytes: impl FnMut(Vec<u8>) -> bool,
+    get: impl Fn(u32) -> Fut,
+) -> u32
+where
+    Fut: Future<Output = Option<Vec<u8>>>,
+{
     let mut found = 0u32;
-    for subkey in 0..u32::from(SUBKEY_COUNT) {
-        if let Ok(Some(v)) = rc.get_dht_value(key.clone(), subkey, true).await {
+    for subkey in 0..u32::from(subkey_count) {
+        let got = {
+            // The read permit is scoped to THIS GET: acquired here, dropped at the end
+            // of the block before the next iteration (RAII — releases even on unwind,
+            // #168). This is the per-GET granularity that bounds read occupancy.
+            let _read_permit = gate.acquire_read().await;
+            get(subkey).await
+        };
+        if let Some(bytes) = got {
             found += 1;
-            if ev_tx
-                .send(VeilidNetEvent::Inbound {
-                    bytes: v.data().to_vec(),
-                })
-                .is_err()
-            {
-                return; // receiver dropped — stop sweeping
+            if !on_bytes(bytes) {
+                return found; // receiver dropped — stop sweeping
             }
         }
     }
-    crate::vtrace!("sweep: done, {found} backlog slot(s) emitted");
+    found
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
     /// Counting stand-in for [`open_or_create`]'s network round-trip: increments on
     /// every actual open, so a test can assert the cache collapsed N calls to one.
@@ -405,5 +468,114 @@ mod tests {
                 "one record's critical section stays atomic across the await"
             );
         }
+    }
+
+    // ── WB-ISC-21: per-GET read-permit granularity ────────────────────────────
+    /// A read permit is held across ONE `get_dht_value` and released before the next,
+    /// so a *different* acquirer obtains the shared permit BETWEEN two GETs of one
+    /// active sweep — impossible if the sweep held the permit across its whole run.
+    /// With a 1-permit read pool and FIFO fairness the permit ping-pongs, so a
+    /// competitor's acquisition interleaves before the sweep finishes.
+    #[tokio::test]
+    async fn wb_isc_21_read_permit_is_per_get_not_per_sweep() {
+        let gate = DhtGate::with_pools(2, 1, 2, 1); // read pool = 1 (the contended permit)
+        let log: Arc<Mutex<Vec<char>>> = Arc::new(Mutex::new(Vec::new()));
+
+        // Competitor: two acquisitions of the single read permit, yielding while held.
+        let comp = {
+            let gate = gate.clone();
+            let log = log.clone();
+            tokio::spawn(async move {
+                for _ in 0..2 {
+                    let _p = gate.acquire_read().await;
+                    log.lock().unwrap().push('c');
+                    tokio::task::yield_now().await;
+                    drop(_p);
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+
+        // Sweep: three GETs, each records 's' while holding the read permit, yielding
+        // so the FIFO-queued competitor can take the permit once it is released.
+        let found = sweep_gated(
+            &gate,
+            3,
+            |_bytes| true,
+            |_subkey| {
+                let log = log.clone();
+                async move {
+                    log.lock().unwrap().push('s');
+                    tokio::task::yield_now().await;
+                    Some(vec![1u8])
+                }
+            },
+        )
+        .await;
+        comp.await.unwrap();
+        assert_eq!(found, 3, "all three slots populated");
+
+        let log = log.lock().unwrap();
+        let first_c = log.iter().position(|&c| c == 'c');
+        let last_s = log.iter().rposition(|&c| c == 's');
+        assert!(
+            log.contains(&'c') && log.contains(&'s'),
+            "both the sweep and the competitor made progress"
+        );
+        assert!(
+            first_c.unwrap() < last_s.unwrap(),
+            "a competitor acquired the shared read permit BETWEEN sweep GETs \
+             (per-GET release), not only after the whole sweep finished: {log:?}"
+        );
+    }
+
+    // ── WB-ISC-22: read-lane occupancy is N-independent ───────────────────────
+    /// Read-lane occupancy never exceeds the read partition regardless of how many
+    /// sweeps run concurrently, and every sweep completes. `2 × partition` concurrent
+    /// sweeps against a 2-permit read pool: max observed read-in-flight stays ≤ 2, and
+    /// all four sweeps finish (a whole-sweep hold would let record-count growth erode
+    /// the budget — this closes it at the read layer).
+    #[tokio::test]
+    async fn wb_isc_22_read_occupancy_bounded_by_partition() {
+        const READ_POOL: usize = 2;
+        let gate = DhtGate::with_pools(2, 1, 2, READ_POOL);
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..(2 * READ_POOL) {
+            let gate = gate.clone();
+            let max_in_flight = max_in_flight.clone();
+            handles.push(tokio::spawn(async move {
+                sweep_gated(
+                    &gate,
+                    8,
+                    |_bytes| true,
+                    |_subkey| {
+                        let gate = gate.clone();
+                        let max_in_flight = max_in_flight.clone();
+                        async move {
+                            let in_flight = READ_POOL - gate.available_read();
+                            max_in_flight.fetch_max(in_flight, Ordering::SeqCst);
+                            tokio::task::yield_now().await;
+                            Some(vec![1u8])
+                        }
+                    },
+                )
+                .await
+            }));
+        }
+        let mut total_found = 0u32;
+        for h in handles {
+            total_found += h.await.unwrap(); // every sweep completes (no deadlock/hang)
+        }
+        assert_eq!(
+            total_found,
+            8 * (2 * READ_POOL) as u32,
+            "all sweeps swept all slots"
+        );
+        assert!(
+            max_in_flight.load(Ordering::SeqCst) <= READ_POOL,
+            "read occupancy never exceeds the read partition regardless of live sweep count"
+        );
     }
 }
