@@ -1634,15 +1634,28 @@ async fn publish_one_advert(
 /// RouteMaintenance relevance filter reads that map, so an entry must only ever
 /// name a route backing a PUBLISHED advert — and the never-published route is
 /// released rather than leaked.
+///
+/// Compare-and-remove under the lock, exactly like the one-shot withdraw path:
+/// both `PublishShare` handlers run `publish_one_advert` in a spawned task, so a
+/// concurrent reshare (persist=true) on the same #156-deterministic `share_id`
+/// may already have overwritten `advert_routes[share_id]` with its OWN live route
+/// (releasing ours as its `prev` in the process). A bare remove-by-key would then
+/// wipe the reshare's live entry — leaking its route and blinding RouteMaintenance
+/// to that route's death — and double-free our already-freed route (#163 review).
+/// Only ever free the route this call still owns.
 fn rollback_advert_route(
     api: &VeilidAPI,
     advert_routes: &Mutex<HashMap<String, RouteId>>,
     share_id: &str,
     route_id: RouteId,
 ) {
-    advert_routes.lock().unwrap().remove(share_id);
-    if let Err(e) = api.release_private_route(route_id) {
-        crate::vtrace!("publish_one_advert: rollback release for {share_id} failed ({e})");
+    let mut routes = advert_routes.lock().unwrap();
+    if routes.get(share_id) == Some(&route_id) {
+        routes.remove(share_id);
+        drop(routes);
+        if let Err(e) = api.release_private_route(route_id) {
+            crate::vtrace!("publish_one_advert: rollback release for {share_id} failed ({e})");
+        }
     }
 }
 
