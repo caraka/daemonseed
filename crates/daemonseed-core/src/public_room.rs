@@ -54,6 +54,7 @@ use crate::crypto::suite::Suite;
 use crate::identity::keys::SignKeypair;
 use crate::kdf::info;
 use crate::room_message::{open_signed_room_message, seal_signed_room_message};
+use crate::secret_seed::{derive_boxed_seed, redacted_secret_newtype};
 
 pub use crate::room_message::RoomMessageError;
 
@@ -146,29 +147,16 @@ pub fn derive_room_key(room: &str, suite: &Suite) -> Result<PublicRoomKey, RoomK
 /// (VLD0) secret seed.
 pub const ROOM_VEILID_OWNER_SEED_LEN: usize = 32;
 
-/// A public room's Veilid **rendezvous-owner** seed (Phase 3/4 transport) — the
-/// deterministic DHT-address sibling of [`derive_room_key`], the public-room
-/// analog of [`crate::circle::key::CircleVeilidOwnerSeed`]. Every input is
-/// public, so every participant derives the byte-identical owner keypair and
-/// thus the same lobby/public-room rendezvous record key, with no relay and no
-/// key exchange (the DHT analog of [`room_asset_address`]). Zeroes on drop;
-/// `Debug` is redacted (ISC-A-C1). Content NEVER derives from this — it binds
-/// only the DHT record-owner / rendezvous address.
-#[derive(zeroize::ZeroizeOnDrop)]
-pub struct RoomVeilidOwnerSeed(Box<[u8; ROOM_VEILID_OWNER_SEED_LEN]>);
-
-impl RoomVeilidOwnerSeed {
-    /// Borrow the raw seed bytes to build a VLD0 keypair. Callers must not copy
-    /// these into a non-zeroizing buffer.
-    pub fn as_bytes(&self) -> &[u8; ROOM_VEILID_OWNER_SEED_LEN] {
-        &self.0
-    }
-}
-
-impl core::fmt::Debug for RoomVeilidOwnerSeed {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("RoomVeilidOwnerSeed(<redacted>)")
-    }
+redacted_secret_newtype! {
+    /// A public room's Veilid **rendezvous-owner** seed (Phase 3/4 transport) — the
+    /// deterministic DHT-address sibling of [`derive_room_key`], the public-room
+    /// analog of [`crate::circle::key::CircleVeilidOwnerSeed`]. Every input is
+    /// public, so every participant derives the byte-identical owner keypair and
+    /// thus the same lobby/public-room rendezvous record key, with no relay and no
+    /// key exchange (the DHT analog of [`room_asset_address`]). Zeroes on drop;
+    /// `Debug` is redacted (ISC-A-C1). Content NEVER derives from this — it binds
+    /// only the DHT record-owner / rendezvous address.
+    boxed pub struct RoomVeilidOwnerSeed([u8; ROOM_VEILID_OWNER_SEED_LEN]);
 }
 
 /// Derive a public room's Veilid rendezvous-owner seed from its public inputs —
@@ -195,14 +183,7 @@ fn expand_room_owner_seed(
     let family = suite.family_token();
     let extract = HkdfSha384::extract(Some(info::PUBLIC_ROOM_KEY_SALT), family.as_bytes())
         .map_err(RoomKeyError::Hkdf)?;
-    let mut seed = [0u8; ROOM_VEILID_OWNER_SEED_LEN];
-    if let Err(e) = extract.expand(info_str.as_bytes(), &mut seed) {
-        seed.zeroize();
-        return Err(RoomKeyError::Hkdf(e));
-    }
-    let boxed = Box::new(seed);
-    seed.zeroize();
-    Ok(boxed)
+    derive_boxed_seed(&extract, info_str.as_bytes()).map_err(RoomKeyError::Hkdf)
 }
 
 pub fn derive_room_veilid_owner_seed(
@@ -215,27 +196,14 @@ pub fn derive_room_veilid_owner_seed(
     )?))
 }
 
-/// A public room's **presence** Veilid rendezvous-owner seed (Phase 4) — a
-/// second, distinct sibling of [`derive_room_key`], separate from the chat
-/// rendezvous owner ([`RoomVeilidOwnerSeed`]). Presence beacons ride their OWN
-/// world-derivable DHT record so a ~15 s heartbeat can never evict the room
-/// chat's 2-slot append-ring (P1). Same shape/hygiene as its sibling: 32-byte
-/// VLD0 seed, zeroes on drop, redacted `Debug`. Content NEVER derives from this.
-#[derive(zeroize::ZeroizeOnDrop)]
-pub struct RoomPresenceVeilidOwnerSeed(Box<[u8; ROOM_VEILID_OWNER_SEED_LEN]>);
-
-impl RoomPresenceVeilidOwnerSeed {
-    /// Borrow the raw seed bytes to build a VLD0 keypair. Callers must not copy
-    /// these into a non-zeroizing buffer.
-    pub fn as_bytes(&self) -> &[u8; ROOM_VEILID_OWNER_SEED_LEN] {
-        &self.0
-    }
-}
-
-impl core::fmt::Debug for RoomPresenceVeilidOwnerSeed {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("RoomPresenceVeilidOwnerSeed(<redacted>)")
-    }
+redacted_secret_newtype! {
+    /// A public room's **presence** Veilid rendezvous-owner seed (Phase 4) — a
+    /// second, distinct sibling of [`derive_room_key`], separate from the chat
+    /// rendezvous owner ([`RoomVeilidOwnerSeed`]). Presence beacons ride their OWN
+    /// world-derivable DHT record so a ~15 s heartbeat can never evict the room
+    /// chat's 2-slot append-ring (P1). Same shape/hygiene as its sibling: 32-byte
+    /// VLD0 seed, zeroes on drop, redacted `Debug`. Content NEVER derives from this.
+    boxed pub struct RoomPresenceVeilidOwnerSeed([u8; ROOM_VEILID_OWNER_SEED_LEN]);
 }
 
 /// Derive a public room's **presence** Veilid rendezvous-owner seed from its
@@ -255,29 +223,16 @@ pub fn derive_room_presence_veilid_owner_seed(
     )?))
 }
 
-/// A public room's **share-discovery** Veilid rendezvous-owner seed (#153) — a
-/// third, distinct sibling of [`derive_room_key`], separate from BOTH the chat
-/// rendezvous owner ([`RoomVeilidOwnerSeed`]) and the presence owner
-/// ([`RoomPresenceVeilidOwnerSeed`]). Public-share announcements ride their OWN
-/// world-derivable DHT record so a share advert (a current-state writer) can never
-/// silently overwrite the room chat's append-ring, and vice versa — the collision
-/// #153 documents. Same shape/hygiene as its siblings: 32-byte VLD0 seed, zeroes
-/// on drop, redacted `Debug`. Content NEVER derives from this.
-#[derive(zeroize::ZeroizeOnDrop)]
-pub struct RoomShareVeilidOwnerSeed(Box<[u8; ROOM_VEILID_OWNER_SEED_LEN]>);
-
-impl RoomShareVeilidOwnerSeed {
-    /// Borrow the raw seed bytes to build a VLD0 keypair. Callers must not copy
-    /// these into a non-zeroizing buffer.
-    pub fn as_bytes(&self) -> &[u8; ROOM_VEILID_OWNER_SEED_LEN] {
-        &self.0
-    }
-}
-
-impl core::fmt::Debug for RoomShareVeilidOwnerSeed {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("RoomShareVeilidOwnerSeed(<redacted>)")
-    }
+redacted_secret_newtype! {
+    /// A public room's **share-discovery** Veilid rendezvous-owner seed (#153) — a
+    /// third, distinct sibling of [`derive_room_key`], separate from BOTH the chat
+    /// rendezvous owner ([`RoomVeilidOwnerSeed`]) and the presence owner
+    /// ([`RoomPresenceVeilidOwnerSeed`]). Public-share announcements ride their OWN
+    /// world-derivable DHT record so a share advert (a current-state writer) can never
+    /// silently overwrite the room chat's append-ring, and vice versa — the collision
+    /// #153 documents. Same shape/hygiene as its siblings: 32-byte VLD0 seed, zeroes
+    /// on drop, redacted `Debug`. Content NEVER derives from this.
+    boxed pub struct RoomShareVeilidOwnerSeed([u8; ROOM_VEILID_OWNER_SEED_LEN]);
 }
 
 /// Derive a public room's **share-discovery** Veilid rendezvous-owner seed from
@@ -659,5 +614,66 @@ mod tests {
             "shares must ride their own record, not the chat rendezvous (#153)"
         );
         assert_ne!(a.as_bytes(), presence.as_bytes());
+    }
+
+    /// #135 KAT — byte-identity guard for the shared boxed-seed derivation
+    /// helper across all three room rendezvous-owner seeds. Fixed (room, suite) →
+    /// fixed seed bytes, captured from the pre-refactor code; a drift in the
+    /// consolidated extract/expand/zeroize/Box path fails the test.
+    #[test]
+    fn owner_seed_kat_byte_identity() {
+        let _ = oxicrypt_module::initialize();
+        assert_eq!(
+            hex::encode(
+                derive_room_veilid_owner_seed("lobby", &CNSA_2_0)
+                    .unwrap()
+                    .as_bytes()
+            ),
+            "3661a748b4f2be482fc102fb280ad7b1468e4ad53d6d94ae6e348ff119935fa0",
+        );
+        assert_eq!(
+            hex::encode(
+                derive_room_presence_veilid_owner_seed("lobby", &CNSA_2_0)
+                    .unwrap()
+                    .as_bytes()
+            ),
+            "ed2b79d6d9c95af648024aa23d8869ff6674796ffa2b78d15948df3bf1edda5f",
+        );
+        assert_eq!(
+            hex::encode(
+                derive_room_share_veilid_owner_seed("lobby", &CNSA_2_0)
+                    .unwrap()
+                    .as_bytes()
+            ),
+            "d7c24a174e5f38669242cdaf7d74da7c2e4bca0dce015345d3793a72be4b18d2",
+        );
+    }
+
+    /// #135 — the shared macro's redacted `Debug` renders `"<Name>(<redacted>)"`
+    /// byte-identically for each room seed newtype (ISC-A-C1 log-surface hygiene).
+    #[test]
+    fn owner_seed_debug_is_redacted() {
+        let _ = oxicrypt_module::initialize();
+        assert_eq!(
+            format!(
+                "{:?}",
+                derive_room_veilid_owner_seed("lobby", &CNSA_2_0).unwrap()
+            ),
+            "RoomVeilidOwnerSeed(<redacted>)",
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                derive_room_presence_veilid_owner_seed("lobby", &CNSA_2_0).unwrap()
+            ),
+            "RoomPresenceVeilidOwnerSeed(<redacted>)",
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                derive_room_share_veilid_owner_seed("lobby", &CNSA_2_0).unwrap()
+            ),
+            "RoomShareVeilidOwnerSeed(<redacted>)",
+        );
     }
 }

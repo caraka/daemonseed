@@ -30,11 +30,11 @@ use oxicrypt_kdf::HkdfSha384;
 use oxicrypt_ml_dsa as ml_dsa;
 use oxicrypt_module::Error as OxicryptError;
 use oxicrypt_sha::sha384;
-use zeroize::Zeroize;
 
 use crate::handle::{Handle, HandleParseError};
 use crate::identity::keys::{KeyDerivationError, SignKeypair, verify_signature};
 use crate::kdf::info;
+use crate::secret_seed::{derive_boxed_seed, redacted_secret_newtype};
 
 /// Length of a SHA-384 content address, in bytes.
 pub const CONTENT_ADDRESS_LEN: usize = 48;
@@ -208,32 +208,19 @@ pub fn dev_project_release_keypair() -> Result<SignKeypair, KeyDerivationError> 
 /// Ed25519 secret seed).
 pub const PROJECT_ANNOUNCE_VEILID_OWNER_SEED_LEN: usize = 32;
 
-/// The project-announce channel's Veilid **rendezvous-owner** seed (Phase 4 A1) —
-/// the DHT write-gate for the single project announcements/MOTD channel (A0). A
-/// **sibling** of the F17 content-signing key: both derive from the one
-/// maintainer-held project-release seed, but the content key uses it as an ML-DSA
-/// seed directly while this HKDF-expands it under a distinct label
-/// ([`info::PROJECT_ANNOUNCE_VEILID_OWNER`]), so transport-owner and
-/// content-signing material are domain-separated — possessing one never yields the
-/// other. Held ONLY by the maintainer (the single-owner DHT constraint IS the
-/// write-gate, A1); clients hold only the derived owner PUBKEY, from which they
-/// compute the record address to read / watch / verify — they cannot write. Zeroes
-/// on drop; `Debug` is redacted (ISC-A-C1). Content NEVER derives from this.
-#[derive(zeroize::ZeroizeOnDrop)]
-pub struct ProjectAnnounceVeilidOwnerSeed(Box<[u8; PROJECT_ANNOUNCE_VEILID_OWNER_SEED_LEN]>);
-
-impl ProjectAnnounceVeilidOwnerSeed {
-    /// Borrow the raw seed bytes to build a VLD0 keypair. Callers must not copy
-    /// these into a non-zeroizing buffer.
-    pub fn as_bytes(&self) -> &[u8; PROJECT_ANNOUNCE_VEILID_OWNER_SEED_LEN] {
-        &self.0
-    }
-}
-
-impl fmt::Debug for ProjectAnnounceVeilidOwnerSeed {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("ProjectAnnounceVeilidOwnerSeed(<redacted>)")
-    }
+redacted_secret_newtype! {
+    /// The project-announce channel's Veilid **rendezvous-owner** seed (Phase 4 A1) —
+    /// the DHT write-gate for the single project announcements/MOTD channel (A0). A
+    /// **sibling** of the F17 content-signing key: both derive from the one
+    /// maintainer-held project-release seed, but the content key uses it as an ML-DSA
+    /// seed directly while this HKDF-expands it under a distinct label
+    /// ([`info::PROJECT_ANNOUNCE_VEILID_OWNER`]), so transport-owner and
+    /// content-signing material are domain-separated — possessing one never yields the
+    /// other. Held ONLY by the maintainer (the single-owner DHT constraint IS the
+    /// write-gate, A1); clients hold only the derived owner PUBKEY, from which they
+    /// compute the record address to read / watch / verify — they cannot write. Zeroes
+    /// on drop; `Debug` is redacted (ISC-A-C1). Content NEVER derives from this.
+    boxed pub struct ProjectAnnounceVeilidOwnerSeed([u8; PROJECT_ANNOUNCE_VEILID_OWNER_SEED_LEN]);
 }
 
 /// Failure deriving the project-announce Veilid rendezvous-owner seed.
@@ -273,14 +260,10 @@ pub fn derive_project_announce_veilid_owner_seed(
 ) -> Result<ProjectAnnounceVeilidOwnerSeed, AnnounceOwnerError> {
     let extract = HkdfSha384::extract(Some(info::PROJECT_ANNOUNCE_OWNER_SALT), project_seed)
         .map_err(AnnounceOwnerError::Hkdf)?;
-    let mut seed = [0u8; PROJECT_ANNOUNCE_VEILID_OWNER_SEED_LEN];
-    if let Err(e) = extract.expand(info::PROJECT_ANNOUNCE_VEILID_OWNER.as_bytes(), &mut seed) {
-        seed.zeroize();
-        return Err(AnnounceOwnerError::Hkdf(e));
-    }
-    let boxed = Box::new(seed);
-    seed.zeroize();
-    Ok(ProjectAnnounceVeilidOwnerSeed(boxed))
+    Ok(ProjectAnnounceVeilidOwnerSeed(
+        derive_boxed_seed(&extract, info::PROJECT_ANNOUNCE_VEILID_OWNER.as_bytes())
+            .map_err(AnnounceOwnerError::Hkdf)?,
+    ))
 }
 
 /// The **development** project-announce owner seed, derived from the in-source
@@ -858,5 +841,22 @@ mod tests {
         let fresh = AnnounceFreshness::new();
         assert_eq!(fresh.last_seen(), 0);
         assert!(fresh.accepts(1));
+    }
+
+    /// #135 KAT — byte-identity guard for the shared boxed-seed derivation
+    /// helper. Fixed project seed → fixed owner-seed bytes, captured from the
+    /// pre-refactor code; a drift in the consolidated extract/expand/zeroize/Box
+    /// path fails the test.
+    #[test]
+    fn announce_owner_seed_kat_byte_identity() {
+        let _ = oxicrypt_module::initialize();
+        assert_eq!(
+            hex::encode(
+                derive_project_announce_veilid_owner_seed(&[0x5d; 32])
+                    .unwrap()
+                    .as_bytes()
+            ),
+            "8a91f109d3ddf7be67e9de694491f641c1a2bff408a6e08a673a235796848ba7",
+        );
     }
 }

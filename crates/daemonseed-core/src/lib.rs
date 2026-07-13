@@ -68,6 +68,7 @@ pub mod public_room;
 pub mod public_space;
 pub mod release;
 pub mod room_message;
+pub(crate) mod secret_seed;
 pub mod share_announce;
 pub mod share_catalog;
 pub mod share_envelope;

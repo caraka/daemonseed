@@ -35,6 +35,7 @@ use zeroize::Zeroize;
 use crate::crypto::suite::Suite;
 use crate::kdf::info;
 use crate::passphrase::circle_canonicalize;
+use crate::secret_seed::{derive_boxed_seed, redacted_secret_newtype};
 
 /// Length of a circle-of-trust key — 32 bytes for AES-256-GCM (ISC-C8).
 pub const COT_KEY_LEN: usize = 32;
@@ -153,35 +154,22 @@ pub fn derive_cot_key(entropy: &str, suite: &Suite) -> Result<CircleKey, CircleK
 /// Ed25519 seed).
 pub const CIRCLE_VEILID_OWNER_SEED_LEN: usize = 32;
 
-/// A circle's deterministic Veilid **rendezvous-owner** seed (Phase 2
-/// transport): the 32-byte VLD0 (Ed25519) seed every member derives from the
-/// shared circle entropy, so all members independently compute the SAME DHT
-/// record key — the circle's relay-free rendezvous address (the DHT analog of
-/// the relay-era `SHA-384(cot_key ‖ server_id)`). Zeroes on drop; `Debug` is
-/// redacted (ISC-A-C1).
-///
-/// It is a **sibling** of [`derive_cot_key`]: both expand the same circle PRK
-/// but under different `info` labels, so the rendezvous address is not a
-/// function of the content key and vice versa. Every circle member can derive
-/// it, and therefore every member can act as the DHT record owner — the trust
-/// set is identical to the one that already holds `cot_key`, so this opens no
-/// new boundary. The content key is unaffected: content NEVER derives from
-/// transport material.
-#[derive(zeroize::ZeroizeOnDrop)]
-pub struct CircleVeilidOwnerSeed(Box<[u8; CIRCLE_VEILID_OWNER_SEED_LEN]>);
-
-impl CircleVeilidOwnerSeed {
-    /// Borrow the raw seed bytes to build a VLD0 keypair. Callers must not copy
-    /// these into a non-zeroizing buffer.
-    pub fn as_bytes(&self) -> &[u8; CIRCLE_VEILID_OWNER_SEED_LEN] {
-        &self.0
-    }
-}
-
-impl core::fmt::Debug for CircleVeilidOwnerSeed {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("CircleVeilidOwnerSeed(<redacted>)")
-    }
+redacted_secret_newtype! {
+    /// A circle's deterministic Veilid **rendezvous-owner** seed (Phase 2
+    /// transport): the 32-byte VLD0 (Ed25519) seed every member derives from the
+    /// shared circle entropy, so all members independently compute the SAME DHT
+    /// record key — the circle's relay-free rendezvous address (the DHT analog of
+    /// the relay-era `SHA-384(cot_key ‖ server_id)`). Zeroes on drop; `Debug` is
+    /// redacted (ISC-A-C1).
+    ///
+    /// It is a **sibling** of [`derive_cot_key`]: both expand the same circle PRK
+    /// but under different `info` labels, so the rendezvous address is not a
+    /// function of the content key and vice versa. Every circle member can derive
+    /// it, and therefore every member can act as the DHT record owner — the trust
+    /// set is identical to the one that already holds `cot_key`, so this opens no
+    /// new boundary. The content key is unaffected: content NEVER derives from
+    /// transport material.
+    boxed pub struct CircleVeilidOwnerSeed([u8; CIRCLE_VEILID_OWNER_SEED_LEN]);
 }
 
 /// Derive a circle's Veilid rendezvous-owner seed from shared entropy — the
@@ -203,38 +191,19 @@ pub fn derive_circle_veilid_owner_seed(
     let hkdf = extract.map_err(CircleKeyError::Hkdf)?;
 
     let info_str = info::circle_veilid_owner(suite.family_token());
-
-    let mut seed = [0u8; CIRCLE_VEILID_OWNER_SEED_LEN];
-    if let Err(e) = hkdf.expand(info_str.as_bytes(), &mut seed) {
-        seed.zeroize();
-        return Err(CircleKeyError::Hkdf(e));
-    }
-    let boxed = Box::new(seed);
-    seed.zeroize();
-    Ok(CircleVeilidOwnerSeed(boxed))
+    Ok(CircleVeilidOwnerSeed(
+        derive_boxed_seed(&hkdf, info_str.as_bytes()).map_err(CircleKeyError::Hkdf)?,
+    ))
 }
 
-/// A circle's **presence** Veilid rendezvous-owner seed (Phase 4) — a second,
-/// distinct sibling of [`derive_cot_key`], separate from the chat rendezvous
-/// owner ([`CircleVeilidOwnerSeed`]). Presence beacons ride their OWN DHT record
-/// so a ~15 s heartbeat can never evict the circle chat's 2-slot append-ring
-/// (P1). Same shape/hygiene as its sibling: 32-byte VLD0 seed, zeroes on drop,
-/// redacted `Debug`. Content NEVER derives from this.
-#[derive(zeroize::ZeroizeOnDrop)]
-pub struct CirclePresenceVeilidOwnerSeed(Box<[u8; CIRCLE_VEILID_OWNER_SEED_LEN]>);
-
-impl CirclePresenceVeilidOwnerSeed {
-    /// Borrow the raw seed bytes to build a VLD0 keypair. Callers must not copy
-    /// these into a non-zeroizing buffer.
-    pub fn as_bytes(&self) -> &[u8; CIRCLE_VEILID_OWNER_SEED_LEN] {
-        &self.0
-    }
-}
-
-impl core::fmt::Debug for CirclePresenceVeilidOwnerSeed {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("CirclePresenceVeilidOwnerSeed(<redacted>)")
-    }
+redacted_secret_newtype! {
+    /// A circle's **presence** Veilid rendezvous-owner seed (Phase 4) — a second,
+    /// distinct sibling of [`derive_cot_key`], separate from the chat rendezvous
+    /// owner ([`CircleVeilidOwnerSeed`]). Presence beacons ride their OWN DHT record
+    /// so a ~15 s heartbeat can never evict the circle chat's 2-slot append-ring
+    /// (P1). Same shape/hygiene as its sibling: 32-byte VLD0 seed, zeroes on drop,
+    /// redacted `Debug`. Content NEVER derives from this.
+    boxed pub struct CirclePresenceVeilidOwnerSeed([u8; CIRCLE_VEILID_OWNER_SEED_LEN]);
 }
 
 /// Derive a circle's **presence** Veilid rendezvous-owner seed from shared
@@ -255,15 +224,9 @@ pub fn derive_circle_presence_veilid_owner_seed(
     let hkdf = extract.map_err(CircleKeyError::Hkdf)?;
 
     let info_str = info::circle_presence_veilid_owner(suite.family_token());
-
-    let mut seed = [0u8; CIRCLE_VEILID_OWNER_SEED_LEN];
-    if let Err(e) = hkdf.expand(info_str.as_bytes(), &mut seed) {
-        seed.zeroize();
-        return Err(CircleKeyError::Hkdf(e));
-    }
-    let boxed = Box::new(seed);
-    seed.zeroize();
-    Ok(CirclePresenceVeilidOwnerSeed(boxed))
+    Ok(CirclePresenceVeilidOwnerSeed(
+        derive_boxed_seed(&hkdf, info_str.as_bytes()).map_err(CircleKeyError::Hkdf)?,
+    ))
 }
 
 /// Length of the hex fingerprint body (excluding the leading `#`). 12 hex chars
@@ -533,6 +496,31 @@ mod tests {
         assert_eq!(
             format!("{s:?}"),
             "CirclePresenceVeilidOwnerSeed(<redacted>)"
+        );
+    }
+
+    /// #135 KAT — byte-identity guard for the shared boxed-seed derivation
+    /// helper. Fixed (entropy, suite) → fixed seed bytes, captured from the
+    /// pre-refactor code. A drift in the consolidated extract/expand/zeroize/Box
+    /// path (or the info label) changes these bytes and fails the test.
+    #[test]
+    fn owner_seed_kat_byte_identity() {
+        let _ = oxicrypt_module::initialize();
+        assert_eq!(
+            hex::encode(
+                derive_circle_veilid_owner_seed(EXAMPLE_ENTROPY, &CNSA_2_0)
+                    .unwrap()
+                    .as_bytes()
+            ),
+            "21d5f2d0cebf1720df9ef5476f539544ba02dd4551976313e8f605bf07c4a0cf",
+        );
+        assert_eq!(
+            hex::encode(
+                derive_circle_presence_veilid_owner_seed(EXAMPLE_ENTROPY, &CNSA_2_0)
+                    .unwrap()
+                    .as_bytes()
+            ),
+            "3a1343f27b56177cdf82b96321c80c3daebdcdd86444b1ed0bd4cb6c2ee2413e",
         );
     }
 }

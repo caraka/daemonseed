@@ -25,6 +25,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::identity::mnemonic::Mnemonic;
 use crate::kdf::info;
+use crate::secret_seed::redacted_secret_newtype;
 
 /// ML-DSA-87 seed length in bytes (FIPS 204 §5.1). The raw seed a server
 /// persists (see `daemonseed-server::identity`) is exactly this long, which
@@ -222,58 +223,39 @@ pub const SHARE_ROOT_IKM_LEN: usize = 32;
 /// verifying key (D3).
 pub const VEILID_NODE_SEED_LEN: usize = 32;
 
-/// The share-root identity IKM (#156). A dedicated secret derived from the same
-/// mnemonic as the ML-DSA/ML-KEM identity but under a domain-separated HKDF label
-/// (`info::DOMAIN_SHARE_ROOT_IKM`), a sibling of [`VeilidNodeSeed`]. It is the ONE
-/// normative IKM for the receiver-verifiable `share_id` binding: every publish
-/// re-derives the per-share hiding nonce from `(this IKM, root)`, so a republish
-/// re-asserts the SAME `share_id` (no `#112`/`#118` ghost-share re-mint). The
-/// ML-DSA secret key is deliberately NOT this IKM — an SK-vs-entropy or GUI-vs-TUI
-/// split would fork the nonce and re-mint the id (both crypto reviews' top risk).
-/// It is identity-scoped (via `info_for`), so a Primary and a Device presentation
-/// of the same folder yield DIFFERENT commitments (no cross-presentation
-/// folder-linkage). Content NEVER derives from this — it binds only the share-id
-/// commitment nonce. Zeroizes on drop; never persisted, never on the wire.
-#[derive(Clone, Zeroize, ZeroizeOnDrop)]
-pub struct ShareRootIkm([u8; SHARE_ROOT_IKM_LEN]);
-
-impl ShareRootIkm {
-    /// The raw 32-byte IKM, for deriving a per-share nonce
-    /// (`share_announce::derive_share_root_nonce`).
-    pub fn as_bytes(&self) -> &[u8; SHARE_ROOT_IKM_LEN] {
-        &self.0
-    }
+redacted_secret_newtype! {
+    /// The share-root identity IKM (#156). A dedicated secret derived from the same
+    /// mnemonic as the ML-DSA/ML-KEM identity but under a domain-separated HKDF label
+    /// (`info::DOMAIN_SHARE_ROOT_IKM`), a sibling of [`VeilidNodeSeed`]. It is the ONE
+    /// normative IKM for the receiver-verifiable `share_id` binding: every publish
+    /// re-derives the per-share hiding nonce from `(this IKM, root)`, so a republish
+    /// re-asserts the SAME `share_id` (no `#112`/`#118` ghost-share re-mint). The
+    /// ML-DSA secret key is deliberately NOT this IKM — an SK-vs-entropy or GUI-vs-TUI
+    /// split would fork the nonce and re-mint the id (both crypto reviews' top risk).
+    /// It is identity-scoped (via `info_for`), so a Primary and a Device presentation
+    /// of the same folder yield DIFFERENT commitments (no cross-presentation
+    /// folder-linkage). Content NEVER derives from this — it binds only the share-id
+    /// commitment nonce. Zeroizes on drop; never persisted, never on the wire.
+    ///
+    /// Its newtype hygiene (inline `[u8; 32]`, `Clone`, zeroize-on-drop, redacted
+    /// `Debug`) is the shared `redacted_secret_newtype!` `inline` shape; its
+    /// DERIVATION is distinct (the fourth expansion of the identity PRK, in
+    /// [`derive_identity_keys`]) and is NOT shared with the boxed rendezvous-owner
+    /// seeds.
+    inline pub struct ShareRootIkm([u8; SHARE_ROOT_IKM_LEN]);
 }
 
-impl core::fmt::Debug for ShareRootIkm {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("ShareRootIkm")
-            .field("ikm", &"<redacted>")
-            .finish()
-    }
-}
-
-/// The Veilid node identity seed (D3). Derived from the same mnemonic as the
-/// ML-DSA/ML-KEM identity but under a domain-separated HKDF label
-/// (`info::DOMAIN_VEILID_NODE`), so one recovery phrase yields one identity
-/// across both the content layer and the Veilid transport layer while sharing
-/// no key material with the content/identity keys. Zeroizes on drop.
-#[derive(Clone, Zeroize, ZeroizeOnDrop)]
-pub struct VeilidNodeSeed([u8; VEILID_NODE_SEED_LEN]);
-
-impl VeilidNodeSeed {
-    /// The raw 32-byte Ed25519 secret seed, for building the VLD0 node keypair.
-    pub fn as_bytes(&self) -> &[u8; VEILID_NODE_SEED_LEN] {
-        &self.0
-    }
-}
-
-impl core::fmt::Debug for VeilidNodeSeed {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("VeilidNodeSeed")
-            .field("seed", &"<redacted>")
-            .finish()
-    }
+redacted_secret_newtype! {
+    /// The Veilid node identity seed (D3). Derived from the same mnemonic as the
+    /// ML-DSA/ML-KEM identity but under a domain-separated HKDF label
+    /// (`info::DOMAIN_VEILID_NODE`), so one recovery phrase yields one identity
+    /// across both the content layer and the Veilid transport layer while sharing
+    /// no key material with the content/identity keys. Zeroizes on drop.
+    ///
+    /// Shares the `redacted_secret_newtype!` `inline` newtype hygiene with
+    /// [`ShareRootIkm`]; its derivation (the node-seed expansion in
+    /// [`derive_identity_keys`]) is its own.
+    inline pub struct VeilidNodeSeed([u8; VEILID_NODE_SEED_LEN]);
 }
 
 /// Both keypairs an [`Identity`] produces, derived deterministically from a
@@ -661,5 +643,46 @@ mod tests {
         let dbg = format!("{:?}", keys.share_root_ikm);
         assert!(dbg.contains("<redacted>"));
         assert!(!dbg.contains("0x"));
+    }
+
+    /// #135 KAT — byte-identity guard for the two identity-rooted inline secrets
+    /// after migrating their newtype boilerplate to the shared macro. Fixed
+    /// (mnemonic, identity) → fixed bytes, captured from the pre-refactor code. The
+    /// derivation itself is unchanged (only the newtype hygiene was consolidated),
+    /// so a drift here would flag an accidental change to the identity chain.
+    #[test]
+    fn identity_secret_kat_byte_identity() {
+        ensure_oxicrypt_initialized();
+        let m = Mnemonic::from_phrase(ALL_ZEROS_PHRASE).unwrap();
+        let keys = derive_identity_keys(&m, Identity::Primary).unwrap();
+        assert_eq!(
+            hex::encode(keys.veilid_node_seed.as_bytes()),
+            "0c874e8deb6413ba9f6f8457fdcb89a57741812a8936dde45f23e7b64e5ec837",
+        );
+        assert_eq!(
+            hex::encode(keys.share_root_ikm.as_bytes()),
+            "e7d6ad2e24b9248f5e12c1b81a8c0a99eccae11c61d8213552cad7e91dc26c32",
+        );
+    }
+
+    /// #135 — the shared macro's `inline` redacted `Debug` renders
+    /// `"<Name>(<redacted>)"` for both identity-rooted secrets (ISC-A-C1). This is
+    /// the one observable change from the consolidation: the previous
+    /// `debug_struct` rendering (`ShareRootIkm { ikm: "<redacted>" }` /
+    /// `VeilidNodeSeed { seed: "<redacted>" }`) is now the uniform tuple form the
+    /// six rendezvous-owner seeds already used. Both remain fully redacted.
+    #[test]
+    fn identity_secret_debug_is_redacted_tuple_form() {
+        ensure_oxicrypt_initialized();
+        let m = Mnemonic::from_phrase(ALL_ZEROS_PHRASE).unwrap();
+        let keys = derive_identity_keys(&m, Identity::Primary).unwrap();
+        assert_eq!(
+            format!("{:?}", keys.veilid_node_seed),
+            "VeilidNodeSeed(<redacted>)"
+        );
+        assert_eq!(
+            format!("{:?}", keys.share_root_ikm),
+            "ShareRootIkm(<redacted>)"
+        );
     }
 }
