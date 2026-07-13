@@ -1151,24 +1151,31 @@ export component AppWindow inherits Window {
             Text { text: "members — identity only, no presence"; color: #5b6472; font-size: 12px; }
 
             // ── #36 name vectors (hidden for the Lobby — all three blank) ──
-            if root.circle-name != "" : VerticalLayout {
+            VerticalLayout {
+                // #176: `visible:` not `if` — an `if` tears down this subtree when the
+                // circle-name prop flips to "" on leave, re-entering Slint's partial
+                // renderer mid-pass ("RefCell already borrowed"). Mirrors line ~1175.
+                visible: root.circle-name != "";
                 spacing: 2px;
                 Text { text: "Name"; color: #5b6472; font-size: 11px; }
                 Text { text: root.circle-name; color: #cfd5dd; font-size: 13px; }
             }
-            if root.circle-relay-label != "" : VerticalLayout {
+            VerticalLayout {
+                visible: root.circle-relay-label != ""; // #176: visible-gate, see above
                 spacing: 2px;
                 Text { text: "Relay name (matches only on this relay)"; color: #5b6472; font-size: 11px; wrap: word-wrap; }
                 Text { text: root.circle-relay-label; color: #cfd5dd; font-size: 13px; }
             }
-            if root.circle-fingerprint != "" : VerticalLayout {
+            VerticalLayout {
+                visible: root.circle-fingerprint != ""; // #176: visible-gate, see above
                 spacing: 2px;
                 Text { text: "Fingerprint (verify out-of-band — same everywhere)"; color: #5b6472; font-size: 11px; wrap: word-wrap; }
                 Text { text: root.circle-fingerprint; color: #cfd5dd; font-size: 13px; }
             }
 
             // ── #115 phrase reveal (passphrase-gated) + leave (real circles only) ──
-            if root.circle-fingerprint != "" : VerticalLayout {
+            VerticalLayout {
+                visible: root.circle-fingerprint != ""; // #176: visible-gate, see above
                 spacing: 8px;
                 Rectangle { height: 1px; background: #ffffff12; }
                 // The revealed phrase — Rust sets it ONLY after a verified passphrase.
