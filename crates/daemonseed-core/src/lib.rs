@@ -42,6 +42,7 @@
 
 #![forbid(unsafe_code)]
 
+pub(crate) mod aead_envelope;
 pub mod autostart;
 pub mod backoff;
 pub mod biometric;

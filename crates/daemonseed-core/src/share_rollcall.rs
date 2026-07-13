@@ -31,6 +31,12 @@
 //!   authority — any member may ask — but the signature proves WHO asked, in
 //!   keeping with the room's "every posted message is self-signed" property.
 //!
+//! The AES-256-GCM envelope (nonce ‖ ct ‖ tag) is the shared
+//! `crate::aead_envelope` primitive; this module supplies its own
+//! [`SHARE_ROLLCALL_AAD`] and maps that helper's `EnvelopeError` onto
+//! [`ShareRollCallError`], so the wire bytes and this module's public error
+//! surface are unchanged.
+//!
 //! A distinct AAD ([`SHARE_ROLLCALL_AAD`]) and a distinct provenance domain
 //! ([`SHARE_ROLLCALL_PROVENANCE_DOMAIN`]) keep a roll-call from ever being
 //! confused with — or substituted from — a chat message
@@ -39,13 +45,13 @@
 //! ([`crate::share_seal`]) even under a coincidentally-equal key.
 
 use daemonseed_proto::v1 as wire;
-use oxicrypt_aes::{Aes256Key, ModeError, gcm_decrypt, gcm_encrypt};
+use oxicrypt_aes::{Aes256Key, ModeError};
 use oxicrypt_module::Error as OxicryptError;
 use prost::Message;
 use zeroize::Zeroize;
 
+use crate::aead_envelope::{EnvelopeError, open_envelope, seal_envelope};
 use crate::circle::key::{AeadKey256, COT_KEY_LEN, CircleKey};
-use crate::circle::message::{NONCE_LEN, TAG_LEN};
 use crate::identity::keys::{SignKeypair, verify_signature};
 use crate::public_room::PublicRoomKey;
 use oxicrypt_ml_dsa as ml_dsa;
@@ -138,29 +144,14 @@ fn seal_rollcall_with(
         signature,
     };
 
+    // AES-256-GCM-seal the prost-encoded plaintext into `nonce ‖ ct ‖ tag` via
+    // the shared envelope helper, binding this kind's own SHARE_ROLLCALL_AAD. The
+    // plaintext is zeroed once GCM has consumed it.
     let aes = Aes256Key::new(key_bytes).map_err(ShareRollCallError::KeyInit)?;
-    let mut nonce = [0u8; NONCE_LEN];
-    getrandom::fill(&mut nonce).map_err(ShareRollCallError::EntropySource)?;
-
     let mut plaintext = message.encode_to_vec();
-    let mut ciphertext = vec![0u8; plaintext.len()];
-    let mut tag = [0u8; TAG_LEN];
-    let result = gcm_encrypt(
-        &aes,
-        &nonce,
-        SHARE_ROLLCALL_AAD,
-        &plaintext,
-        &mut ciphertext,
-        &mut tag,
-    );
+    let result = seal_envelope(&aes, SHARE_ROLLCALL_AAD, &plaintext);
     plaintext.zeroize();
-    result.map_err(ShareRollCallError::Aead)?;
-
-    let mut sealed = Vec::with_capacity(NONCE_LEN + ciphertext.len() + TAG_LEN);
-    sealed.extend_from_slice(&nonce);
-    sealed.extend_from_slice(&ciphertext);
-    sealed.extend_from_slice(&tag);
-    Ok(sealed)
+    Ok(result?)
 }
 
 /// Open + VERIFY a sealed roll-call (the request-side analogue of
@@ -179,32 +170,11 @@ pub fn open_rollcall<K: AeadKey256>(
     key: &K,
     sealed: &[u8],
 ) -> Result<wire::ShareRollCall, ShareRollCallError> {
-    if sealed.len() < NONCE_LEN + TAG_LEN {
-        return Err(ShareRollCallError::Truncated);
-    }
-    let nonce: &[u8; NONCE_LEN] = sealed[..NONCE_LEN].try_into().expect("checked length");
-    let after_nonce = &sealed[NONCE_LEN..];
-    let ciphertext_len = after_nonce.len() - TAG_LEN;
-    let ciphertext = &after_nonce[..ciphertext_len];
-    let tag: &[u8; TAG_LEN] = after_nonce[ciphertext_len..]
-        .try_into()
-        .expect("checked length");
-
+    // AES-256-GCM open via the shared envelope helper; a too-short buffer is
+    // rejected before decrypt, and a wrong key or wrong AAD fails authentication.
+    // The recovered plaintext is zeroed once prost has consumed it.
     let aes = Aes256Key::new(key.aead_key_bytes()).map_err(ShareRollCallError::KeyInit)?;
-    let mut plaintext = vec![0u8; ciphertext_len];
-    gcm_decrypt(
-        &aes,
-        nonce,
-        SHARE_ROLLCALL_AAD,
-        ciphertext,
-        tag,
-        &mut plaintext,
-    )
-    .map_err(|e| match e {
-        ModeError::TagMismatch => ShareRollCallError::Authentication,
-        other => ShareRollCallError::Aead(other),
-    })?;
-
+    let mut plaintext = open_envelope(&aes, SHARE_ROLLCALL_AAD, sealed)?;
     let decoded = wire::ShareRollCall::decode(plaintext.as_slice());
     plaintext.zeroize();
     let message = decoded.map_err(ShareRollCallError::Decode)?;
@@ -271,14 +241,31 @@ impl core::fmt::Display for ShareRollCallError {
 
 impl core::error::Error for ShareRollCallError {}
 
+/// Map the shared envelope error onto this module's own error type so the public
+/// error surface is unchanged: too-short → [`ShareRollCallError::Truncated`] and
+/// `TagMismatch` → [`ShareRollCallError::Authentication`] are preserved exactly.
+impl From<EnvelopeError> for ShareRollCallError {
+    fn from(e: EnvelopeError) -> Self {
+        match e {
+            EnvelopeError::EntropySource(e) => Self::EntropySource(e),
+            EnvelopeError::Encrypt(m) => Self::Aead(m),
+            EnvelopeError::TooShort => Self::Truncated,
+            EnvelopeError::Decrypt(ModeError::TagMismatch) => Self::Authentication,
+            EnvelopeError::Decrypt(other) => Self::Aead(other),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::circle::key::{EXAMPLE_ENTROPY, derive_cot_key};
+    use crate::circle::message::{NONCE_LEN, TAG_LEN};
     use crate::crypto::suite::CNSA_2_0;
     use crate::identity::keys::SignKeypair;
     use crate::public_room::{DEFAULT_ROOM, derive_room_key};
     use crate::share_announce::{AnnouncementFields, open_announcement, seal_public_announcement};
+    use oxicrypt_aes::gcm_encrypt;
 
     fn requester(seed: u8) -> SignKeypair {
         let _ = oxicrypt_module::initialize();

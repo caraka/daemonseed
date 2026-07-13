@@ -30,6 +30,12 @@
 //!   verifies it and returns the message only on success — a bad signature is
 //!   dropped.
 //!
+//! The AES-256-GCM envelope itself (nonce ‖ ct ‖ tag) is the shared
+//! `crate::aead_envelope` primitive; this module wraps it with its own
+//! [`HEARTBEAT_AAD`] and its caller-side fixed-length padding (below), and maps
+//! that helper's `EnvelopeError` onto [`HeartbeatError`] — the wire bytes and
+//! this module's public error surface are unchanged.
+//!
 //! A distinct AAD ([`HEARTBEAT_AAD`]) and provenance domain
 //! ([`HEARTBEAT_PROVENANCE_DOMAIN`]) keep a heartbeat from ever being confused
 //! with — or substituted from — a chat message, a public-room message, a share
@@ -52,11 +58,12 @@
 //! and, being fixed-length, is byte-indistinguishable from a keepalive on the wire.
 
 use daemonseed_proto::v1 as wire;
-use oxicrypt_aes::{Aes256Key, ModeError, gcm_decrypt, gcm_encrypt};
+use oxicrypt_aes::{Aes256Key, ModeError};
 use oxicrypt_module::Error as OxicryptError;
 use prost::Message;
 use zeroize::Zeroize;
 
+use crate::aead_envelope::{EnvelopeError, open_envelope, seal_envelope};
 use crate::circle::key::{AeadKey256, COT_KEY_LEN, CircleKey};
 use crate::circle::message::{NONCE_LEN, TAG_LEN};
 use crate::identity::keys::{SignKeypair, verify_signature};
@@ -249,31 +256,17 @@ fn seal_heartbeat_with(
     };
 
     let aes = Aes256Key::new(key_bytes).map_err(HeartbeatError::KeyInit)?;
-    let mut nonce = [0u8; NONCE_LEN];
-    getrandom::fill(&mut nonce).map_err(HeartbeatError::EntropySource)?;
 
-    // Fixed-length padding (WB-ISC-6): frame `len(4, LE) ‖ protobuf ‖ zeros` to
-    // exactly HEARTBEAT_PADDED_PLAINTEXT_LEN so every beacon — join, keepalive,
-    // and leave — seals to one constant size and ciphertext length leaks nothing.
+    // Fixed-length padding (WB-ISC-6) stays CALLER-side: frame
+    // `len(4, LE) ‖ protobuf ‖ zeros` to exactly HEARTBEAT_PADDED_PLAINTEXT_LEN
+    // BEFORE the shared envelope helper, so every beacon — join, keepalive, and
+    // leave — seals to one constant size (HEARTBEAT_SEALED_LEN) and ciphertext
+    // length leaks nothing. The helper is length-preserving and unaware of the
+    // framing. The padded plaintext is zeroed once GCM has consumed it.
     let mut plaintext = pad_plaintext(&message)?;
-    let mut ciphertext = vec![0u8; plaintext.len()];
-    let mut tag = [0u8; TAG_LEN];
-    let result = gcm_encrypt(
-        &aes,
-        &nonce,
-        HEARTBEAT_AAD,
-        &plaintext,
-        &mut ciphertext,
-        &mut tag,
-    );
+    let result = seal_envelope(&aes, HEARTBEAT_AAD, &plaintext);
     plaintext.zeroize();
-    result.map_err(HeartbeatError::Aead)?;
-
-    let mut sealed = Vec::with_capacity(NONCE_LEN + ciphertext.len() + TAG_LEN);
-    sealed.extend_from_slice(&nonce);
-    sealed.extend_from_slice(&ciphertext);
-    sealed.extend_from_slice(&tag);
-    Ok(sealed)
+    Ok(result?)
 }
 
 /// Open + VERIFY a sealed heartbeat (the presence-tier analogue of
@@ -292,27 +285,11 @@ pub fn open_heartbeat<K: AeadKey256>(
     key: &K,
     sealed: &[u8],
 ) -> Result<wire::MemberHeartbeat, HeartbeatError> {
-    if sealed.len() < NONCE_LEN + TAG_LEN {
-        return Err(HeartbeatError::Truncated);
-    }
-    let nonce: &[u8; NONCE_LEN] = sealed[..NONCE_LEN].try_into().expect("checked length");
-    let after_nonce = &sealed[NONCE_LEN..];
-    let ciphertext_len = after_nonce.len() - TAG_LEN;
-    let ciphertext = &after_nonce[..ciphertext_len];
-    let tag: &[u8; TAG_LEN] = after_nonce[ciphertext_len..]
-        .try_into()
-        .expect("checked length");
-
+    // AES-256-GCM open via the shared envelope helper; a too-short buffer is
+    // rejected before decrypt. The fixed-length padding (WB-ISC-6) is stripped
+    // CALLER-side AFTER open — the helper knows nothing of the framing.
     let aes = Aes256Key::new(key.aead_key_bytes()).map_err(HeartbeatError::KeyInit)?;
-    let mut plaintext = vec![0u8; ciphertext_len];
-    gcm_decrypt(&aes, nonce, HEARTBEAT_AAD, ciphertext, tag, &mut plaintext).map_err(
-        |e| match e {
-            ModeError::TagMismatch => HeartbeatError::Authentication,
-            other => HeartbeatError::Aead(other),
-        },
-    )?;
-
-    // Strip the fixed-length padding (WB-ISC-6) before decoding.
+    let mut plaintext = open_envelope(&aes, HEARTBEAT_AAD, sealed)?;
     let decoded = unpad_plaintext(&plaintext)
         .and_then(|pb| wire::MemberHeartbeat::decode(pb).map_err(HeartbeatError::Decode));
     plaintext.zeroize();
@@ -394,6 +371,21 @@ impl core::fmt::Display for HeartbeatError {
 
 impl core::error::Error for HeartbeatError {}
 
+/// Map the shared envelope error onto this module's own error type so the public
+/// error surface is unchanged: too-short → [`HeartbeatError::Truncated`] and
+/// `TagMismatch` → [`HeartbeatError::Authentication`] are preserved exactly.
+impl From<EnvelopeError> for HeartbeatError {
+    fn from(e: EnvelopeError) -> Self {
+        match e {
+            EnvelopeError::EntropySource(e) => Self::EntropySource(e),
+            EnvelopeError::Encrypt(m) => Self::Aead(m),
+            EnvelopeError::TooShort => Self::Truncated,
+            EnvelopeError::Decrypt(ModeError::TagMismatch) => Self::Authentication,
+            EnvelopeError::Decrypt(other) => Self::Aead(other),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,6 +393,7 @@ mod tests {
     use crate::crypto::suite::CNSA_2_0;
     use crate::identity::keys::SignKeypair;
     use crate::public_room::{DEFAULT_ROOM, derive_room_key};
+    use oxicrypt_aes::gcm_encrypt;
 
     fn member(seed: u8) -> SignKeypair {
         let _ = oxicrypt_module::initialize();

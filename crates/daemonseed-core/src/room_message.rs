@@ -23,6 +23,12 @@
 //!                ──AES-256-GCM(key, aad)────────────────────────────────────▶ sealed = nonce ‖ ct ‖ tag
 //! ```
 //!
+//! The final AES-256-GCM step — draw a nonce, encrypt, assemble
+//! `nonce ‖ ct ‖ tag` (and its inverse on open) — is the shared
+//! `crate::aead_envelope` primitive; this module supplies its own `aad` and maps
+//! that helper's `EnvelopeError` onto [`RoomMessageError`], so the byte layout
+//! and this module's public error surface are unchanged.
+//!
 //! **The verifier never trusts the carried `room_id` for crypto.** [`open_signed_room_message`]
 //! always verifies the signature against an `expected_room_id` the *caller*
 //! supplies (a public room passes the room name it subscribed to; a circle
@@ -36,13 +42,13 @@
 //! reject — an empty pubkey never equals anyone.
 
 use daemonseed_proto::v1 as wire;
-use oxicrypt_aes::{Aes256Key, ModeError, gcm_decrypt, gcm_encrypt};
+use oxicrypt_aes::{Aes256Key, ModeError};
 use oxicrypt_module::Error as OxicryptError;
 use prost::Message;
 use zeroize::Zeroize;
 
+use crate::aead_envelope::{EnvelopeError, open_envelope, seal_envelope};
 use crate::circle::key::AeadKey256;
-use crate::circle::message::{NONCE_LEN, TAG_LEN};
 use crate::identity::keys::{SignKeypair, verify_signature};
 use oxicrypt_ml_dsa as ml_dsa;
 
@@ -114,22 +120,15 @@ pub fn seal_signed_room_message<K: AeadKey256>(
         signature,
     };
 
+    // AES-256-GCM-seal the prost-encoded plaintext into `nonce ‖ ct ‖ tag` via
+    // the shared envelope helper. The plaintext is zeroed the moment GCM has
+    // consumed it (regardless of the helper's success), and `aad` stays this
+    // surface's own domain-separated tag.
     let aes = Aes256Key::new(key.aead_key_bytes()).map_err(RoomMessageError::KeyInit)?;
-    let mut nonce = [0u8; NONCE_LEN];
-    getrandom::fill(&mut nonce).map_err(RoomMessageError::EntropySource)?;
-
     let mut plaintext = message.encode_to_vec();
-    let mut ciphertext = vec![0u8; plaintext.len()];
-    let mut tag = [0u8; TAG_LEN];
-    let result = gcm_encrypt(&aes, &nonce, aad, &plaintext, &mut ciphertext, &mut tag);
+    let result = seal_envelope(&aes, aad, &plaintext);
     plaintext.zeroize();
-    result.map_err(RoomMessageError::Aead)?;
-
-    let mut sealed = Vec::with_capacity(NONCE_LEN + ciphertext.len() + TAG_LEN);
-    sealed.extend_from_slice(&nonce);
-    sealed.extend_from_slice(&ciphertext);
-    sealed.extend_from_slice(&tag);
-    Ok(sealed)
+    Ok(result?)
 }
 
 /// Open + VERIFY a sealed [`wire::RoomMessage`] (ISC-A-S16 / ISC-A-S17).
@@ -155,24 +154,13 @@ pub fn open_signed_room_message<K: AeadKey256>(
     sealed: &[u8],
     expected_room_id: &str,
 ) -> Result<wire::RoomMessage, RoomMessageError> {
-    if sealed.len() < NONCE_LEN + TAG_LEN {
-        return Err(RoomMessageError::Truncated);
-    }
-    let nonce: &[u8; NONCE_LEN] = sealed[..NONCE_LEN].try_into().expect("checked length");
-    let after_nonce = &sealed[NONCE_LEN..];
-    let ciphertext_len = after_nonce.len() - TAG_LEN;
-    let ciphertext = &after_nonce[..ciphertext_len];
-    let tag: &[u8; TAG_LEN] = after_nonce[ciphertext_len..]
-        .try_into()
-        .expect("checked length");
-
+    // AES-256-GCM open under `key` + `aad` via the shared envelope helper (this
+    // is where the sealed form becomes plaintext locally). A wrong key or wrong
+    // AAD — including a payload from the OTHER surface — fails here; a too-short
+    // buffer is rejected before decrypt. The recovered plaintext is zeroed the
+    // moment prost has consumed it.
     let aes = Aes256Key::new(key.aead_key_bytes()).map_err(RoomMessageError::KeyInit)?;
-    let mut plaintext = vec![0u8; ciphertext_len];
-    gcm_decrypt(&aes, nonce, aad, ciphertext, tag, &mut plaintext).map_err(|e| match e {
-        ModeError::TagMismatch => RoomMessageError::Authentication,
-        other => RoomMessageError::Aead(other),
-    })?;
-
+    let mut plaintext = open_envelope(&aes, aad, sealed)?;
     let decoded = wire::RoomMessage::decode(plaintext.as_slice());
     plaintext.zeroize();
     let message = decoded.map_err(RoomMessageError::Decode)?;
@@ -249,12 +237,30 @@ impl core::fmt::Display for RoomMessageError {
 
 impl core::error::Error for RoomMessageError {}
 
+/// Map the shared envelope error onto this module's own error type so the public
+/// error surface is unchanged: the too-short → [`RoomMessageError::Truncated`]
+/// and `TagMismatch` → [`RoomMessageError::Authentication`] mappings the inlined
+/// code carried are preserved exactly.
+impl From<EnvelopeError> for RoomMessageError {
+    fn from(e: EnvelopeError) -> Self {
+        match e {
+            EnvelopeError::EntropySource(e) => Self::EntropySource(e),
+            EnvelopeError::Encrypt(m) => Self::Aead(m),
+            EnvelopeError::TooShort => Self::Truncated,
+            EnvelopeError::Decrypt(ModeError::TagMismatch) => Self::Authentication,
+            EnvelopeError::Decrypt(other) => Self::Aead(other),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::circle::key::{CircleKey, EXAMPLE_ENTROPY, circle_room_id, derive_cot_key};
+    use crate::circle::message::{NONCE_LEN, TAG_LEN};
     use crate::crypto::suite::CNSA_2_0;
     use crate::public_room::{ROOM_MESSAGE_AAD, ROOM_PROVENANCE_DOMAIN};
+    use oxicrypt_aes::gcm_encrypt;
 
     const CIRCLE_AAD: &[u8] = crate::circle::message::MESSAGE_AAD;
     const CIRCLE_DOMAIN: &[u8] = crate::circle::message::CIRCLE_PROVENANCE_DOMAIN;
