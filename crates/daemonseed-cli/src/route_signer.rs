@@ -1,11 +1,11 @@
-//! Least-authority [`RouteAdvertSigner`] — wraps the profile's stable ML-DSA-87
+//! Least-authority `RouteAdvertSigner` — wraps the profile's stable ML-DSA-87
 //! identity key and signs ONLY share route adverts (D-3.5).
 //!
 //! The identity secret stays in the app: veilid-net receives this as an
 //! `Arc<dyn RouteAdvertSigner>` and can invoke route-advert signing (e.g. to
 //! re-sign on `RouteChanged`), but never holds or reads the key, and the
 //! capability is scoped to route adverts alone — not a general signing oracle.
-//! The signed bytes are defined once in veilid-net ([`route_provenance_input`]);
+//! The signed bytes are defined once in veilid-net (`route_provenance_input`);
 //! this type only applies the key, so sign and verify can never drift.
 
 use std::sync::Arc;

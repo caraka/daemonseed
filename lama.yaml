@@ -311,25 +311,6 @@ capabilities:
       - daemonseed_proto::v1
     iscs: [S14, A-S9, C23, C24, S4, A-S2, C15, C17]
 
-  - category: "Abuse / DoS rate limiting (server)"
-    summary: >-
-      Multi-granularity, RAM-only rate limits (S17). Per-connection
-      ConnectionLimiter: a request token bucket (capacity + refill) plus
-      concurrent-subscription and signature-verify caps. Per-identity-key
-      PerKeyRateTable: an Arc<Mutex<HashMap<pubkey,count>>> (same shape as
-      the M4b SeenMap) capping concurrent connections per signing key, wired
-      into runtime::serve_connection — admitted after identity-proof, GC'd to
-      empty on disconnect. RateLimitConfig defaults are the Pi-4 civility
-      floor (per-key cap 4 matches the client A-C10 self-cap). No state is
-      serialized (A-S12); RateLimitTrip is a server-side diagnostic with no
-      wire form — every trip maps to the same uniform silent close as an
-      identity-proof failure. The OS/per-IP layer stays operator-owned outside
-      the binary (A-S1 carve-out).
-    crate: daemonseed-server
-    modules:
-      - daemonseed_server::rate_limit
-    iscs: [S17, A-S12, A-S1]
-
   - category: "Chat affordances: backoff, mute/hide, mentions (client)"
     summary: >-
       Client-side abuse-resilience + chat surfaces, all pure/local. backoff:
@@ -358,8 +339,7 @@ capabilities:
       ceremony) and verify_multisig, which accepts iff >= threshold DISTINCT
       anchor keys each signed validly — no verify-bypass, each key counted once,
       a non-anchor signature is a hard refusal, a wrong-length blob is rejected
-      without panic (S18/A-C11). daemonseed_server::boot_gate maps that verify to
-      Boot / RefuseToBoot with no boot-with-warning variant (A-S13).
+      without panic (S18/A-C11).
       daemonseed_core::release::update is the client update-lifecycle FSM that
       verifies before applying, never auto-installs (even emergencies), refuses
       silent downgrades, and wipes+logs on failure — emitting the existing M7
@@ -369,8 +349,7 @@ capabilities:
     crate: daemonseed-core
     modules:
       - daemonseed_core::release
-      - daemonseed_server::boot_gate
-    iscs: [S18, A-S13, C27, A-C11]
+    iscs: [S18, C27, A-C11]
 
   - category: "Platform-feature scaffolds — biometric unlock + autostart"
     summary: >-

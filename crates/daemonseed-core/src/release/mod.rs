@@ -16,7 +16,7 @@
 //! relay fetch are infrastructure, accounts, and a key ceremony — not pure
 //! logic — and are out of scope for this module. The anchor ships its 1-of-1
 //! shape unpopulated so that landing those is additive (see
-//! [`anchor`]'s pre-public-phase note).
+//! `anchor`'s pre-public-phase note).
 
 mod anchor;
 mod update;

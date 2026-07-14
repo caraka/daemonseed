@@ -1,15 +1,16 @@
 # ─────────────────────────────────────────────────────────────────────
-# daemonseed-cli — LAMA API Manifest (CLI surface current through M12)
+# daemonseed-cli — LAMA API Manifest
 #
-# Binary subcommands: `connect` (TLS-1.3 + APP_HELLO M4a, full client
-# identity-proof to Authenticated M4b, C22 trust slider M5). Its library
-# surface also carries M6 public-space client plumbing and the M12 introducer
-# refresh (session).
+# A library (no binary): the Veilid clients' shared, transport-independent
+# authoring surface. Two modules — `route_signer` (the least-authority
+# route-advert signing capability handed to daemonseed-veilid-net) and
+# `public_space` (announcement / MOTD authoring, render, and client-side
+# re-verification helpers).
 #
 # Cross-references:
 # - Repository root: ../../lama.yaml
 # - Core crate: ./daemonseed-core-api.yaml
-# - Server crate: ./daemonseed-server-api.yaml
+# - Veilid transport: ./daemonseed-veilid-net-api.yaml
 # ─────────────────────────────────────────────────────────────────────
 
 lama: "0.1"
@@ -17,274 +18,49 @@ lama: "0.1"
 library:
   name: daemonseed-cli
   version: "0.1.0"
-  description: "Non-interactive scriptable client. `connect <server-id>` does TLS-1.3 + APP_HELLO (M4a) and, as of M4b, the full client-side identity-proof exchange — returning only after the connection reaches Authenticated, then applying the C22 trust slider (M5)."
+  description: "The Veilid clients' shared authoring library: least-authority route-advert signing (`route_signer`) plus announcement/MOTD authoring, render, and re-verification helpers (`public_space`). No binary; no transport."
   license: "AGPL-3.0-or-later"
   manifest_for: "crates/daemonseed-cli"
-  status: "CLI surface: connect; M7–M10 added no CLI surface"
-  subcommands:
-    - name: connect
-      summary: "TLS-1.3 + APP_HELLO + identity-proof to Authenticated; prints wire version (M4a/M4b/M5)."
 
 # ─────────────────────────────────────────────────────────────────────
-# Modules — logical groupings inside the crate. Canonical LAMA carries
-# only {name, description, no_std, depends_on}; `iscs` is preserved as an
-# extra breadcrumb field.
+# Modules
 # ─────────────────────────────────────────────────────────────────────
 
 modules:
-  - name: daemonseed_cli::identity_proof
+  - name: daemonseed_cli::route_signer
     description: >-
-      Client-side identity-proof orchestration (ISC-S19 / A-C18), the
-      mirror of `daemonseed_server::identity_proof`. RustlsClientExporter
-      adapts the live rustls::ClientConnection to core's ChannelBindingSource
-      (no constant path). run_client_identity_proof sends the client's signed
-      envelope, reads and verifies the server's via core verify_envelope
-      (self-consistency only). M5: the dialed-identity decision (A-C18) moved
-      OUT to the C22 trust layer (`connect` → apply_trust) so a trusted-mode
-      key rotation surfaces a notice instead of being refused here. Fails
-      closed with no partial trust (ISC-45). Counter via
-      CounterState::next_send (ISC-19 mechanism); ephemeral identity for now
-      (D8 — persistence deferred).
+      The least-authority RouteAdvertSigner adapter. Wraps the profile's
+      stable ML-DSA-87 identity key and signs ONLY share route adverts;
+      daemonseed-veilid-net receives it as an Arc<dyn RouteAdvertSigner> and
+      can invoke route-advert signing without ever holding or reading the key.
     no_std: false
-    depends_on: [daemonseed-core, daemonseed-server, daemonseed-proto]
-    iscs: [S19, "43", "44", "45", "46", "47", "17", "18", "19", A-C18]
-    added_in: "M4b commit 6"
-
-  - name: daemonseed_cli::connect
-    description: >-
-      End-to-end client-side connect path. resolve_address picks the dial
-      address from the bundled bootstrap anchor or an explicit --address
-      override (ISC-C37). build_client_config constructs the rustls
-      ClientConfig with TLS 1.3 only, ALPN h2, and the AcceptAnyServerCert
-      verifier (TLS-chain trust is bypassed; the application-layer
-      identity-proof is the real authentication boundary). connect does
-      TCP + TLS + AppHello + Ack/Reject (ISC-C23 client-side via verify_ack),
-      derives the channel binding off the live TLS session, runs the
-      identity-proof exchange to Authenticated (ISC-47), then applies the C22
-      trust slider against the trust store.
-    no_std: false
-    depends_on: [daemonseed-core, daemonseed-server, daemonseed-proto, daemonseed_cli::identity_proof, daemonseed_cli::tofu_stub]
-    iscs: [C23, C37, S14, A-S9, S19, "47", A-C18]
-    added_in: "M4a commit 5; identity-proof wiring M4b commit 6; C22 trust slider M5"
-
-  - name: daemonseed_cli::tofu_stub
-    description: >-
-      M4a-only placeholder ServerCertVerifier. Accepts any server cert at the
-      chain level; still routes the per-handshake TLS-1.3 CertificateVerify
-      signature through the installed provider's verify_tls13_signature so the
-      ML-DSA-87 codepoint (0x0906) is exercised end-to-end. Deletes wholesale
-      in M4b when the TOFU + identity-proof envelope lands.
-    no_std: false
-    depends_on: []
-    iscs: ["M4b-pending"]
-    added_in: "M4a commit 5"
+    depends_on: [daemonseed-core, daemonseed-veilid-net]
+    iscs: [S27, S28]
 
   - name: daemonseed_cli::public_space
     description: >-
-      Client-side public-space data plumbing (M6, "plumbing only" per D-M6-1).
-      Transport (opening a PublicSpaceClient over the post-Authenticated
-      connection) is the thin layer the server crate's duplex round-trip test
-      already validates; this module is the transport-independent data
-      handling: render a signed MOTD as inert plaintext, choose a rating from
-      the active server's taxonomy, the rating-filter predicate, and the
-      client half of verify-and-serve re-verification.
+      Transport-independent announcement/MOTD data plumbing: author signed
+      MOTDs and posts, render a signed MOTD as inert plaintext, re-verify
+      served artifacts client-side, gate the composer on the signer whitelist,
+      and select/filter share listings.
     no_std: false
     depends_on: [daemonseed-core, daemonseed-proto]
-    iscs: [C19, "25", "30", "31", "32", A-C5, A-S3]
-    added_in: "v0.8.0 (M6)"
-
-  - name: daemonseed_cli::session
-    description: >-
-      Live application session over a post-Authenticated stream (M11). The
-      client mirror of daemonseed_server::public_space::serve_application:
-      AppSession::open builds ONE tonic Channel over the single
-      already-established AppStream (Endpoint::connect_with_connector +
-      hyper_util TokioIo; connector invoked once, no second dial), then mints
-      PublicSpaceClient / CircleOfTrustClient on demand. HTTP/2 multiplexes
-      every RPC and the long-lived Subscribe stream over that one connection.
-      Generic over the stream type so production (AppStream) and tests
-      (tokio::io::duplex) share the path. M12 (gate step 6) adds introducer():
-      a FederationIntroducerClient over the same channel, and refresh_introducer():
-      it calls the relay's Introduce RPC and merges the result into a
-      DiscoveredPeers candidate cache, reading the active TrustStore only to skip
-      already-known servers and NEVER mutating it (ISC-C22 / ISC-A-C19).
-    no_std: false
-    depends_on: [daemonseed-proto, daemonseed-server, daemonseed-core, daemonseed_cli::connect]
-    iscs: ["10", "36", C22, A-C19, S6]
-    added_in: "v0.13.0 (M11); introducer refresh M12"
+    iscs: [S7, S8, S9, "25", "26", "30", "31", "32", C16, A-C3, A-C5, A-S3]
 
 # ─────────────────────────────────────────────────────────────────────
-# Types — every struct/enum/trait/alias the crate exposes, hoisted out of
-# the dialect's per-module `public:` lists.
+# Types
 # ─────────────────────────────────────────────────────────────────────
 
 types:
-  - name: "RustlsClientExporter<'a>"
-    module: daemonseed_cli::identity_proof
+  - name: IdentityRouteAdvertSigner
+    module: daemonseed_cli::route_signer
     kind: struct
     description: >-
-      Wraps a borrowed &rustls::ClientConnection and implements core's
-      ChannelBindingSource so the channel binding is derived from the live
-      client-side TLS exporter (ISC-A-C18). There is no constructor that
-      fabricates a constant.
-    fields:
-      - name: "0"
-        type: "&'a rustls::ClientConnection"
-        description: The borrowed live client-side TLS connection.
-
-  - name: ClientIdentity
-    module: daemonseed_cli::identity_proof
-    kind: struct
-    description: >-
-      The client's signing identity for the identity-proof envelope: its
-      ML-DSA-87 SignKeypair plus its canonical verify-form handle. ephemeral()
-      generates a throwaway identity (D8); new(signing, handle) builds from an
-      injected one.
-    fields:
-      - name: signing
-        type: SignKeypair
-        description: The client's ML-DSA-87 signing keypair.
-      - name: handle
-        type: String
-        description: The client's canonical "<name>#<12hex>" verify-form handle.
-
-  - name: ClientIdentityError
-    module: daemonseed_cli::identity_proof
-    kind: struct
-    description: >-
-      Stringified failure constructing an ephemeral ClientIdentity. Bridges
-      three unrelated core error types (mnemonic, key derivation, handle
-      construction) for an MVP-only helper.
-    fields:
-      - name: "0"
-        type: String
-        description: The bridged failure message.
-
-  - name: ClientProofError
-    module: daemonseed_cli::identity_proof
-    kind: enum
-    description: >-
-      Failure modes of the client identity-proof exchange. Diagnostic only —
-      `connect` collapses every variant to ConnectError::IdentityProofRefused
-      (ISC-46). M5 removed the WrongServer variant: dialed-identity is now
-      decided by the C22 trust layer (connect → apply_trust), not here.
-    variants:
-      - name: "Sign(SignatureError)"
-        description: Signing the client's envelope failed (module not operational).
-      - name: "Frame(HelloError)"
-        description: Frame read/write or decode failed on the transport.
-      - name: "Verify(VerifyRejection)"
-        description: >-
-          The server's envelope failed verification (uniform — sub-cause is
-          deliberately opaque).
-
-  - name: AppStream
-    module: daemonseed_cli::connect
-    kind: type-alias
-    description: >-
-      The live post-Authenticated TLS stream returned by connect_session
-      (tokio_rustls::client::TlsStream<TcpStream>). The exact stream type
-      daemonseed_server::public_space::serve_application consumes on the server
-      side; the client builds a tonic channel over it to reach PublicSpace +
-      CircleOfTrust on the one already-authenticated connection.
-
-  - name: ConnectOutcome
-    module: daemonseed_cli::connect
-    kind: struct
-    description: >-
-      Outcome of a successful connect. Reaching this value means the
-      connection completed the full identity-proof exchange and is
-      Authenticated (ISC-47) — there is no "negotiated but unauthenticated"
-      success.
-    fields:
-      - name: version
-        type: ProtocolVersion
-        description: The version both sides agreed to use.
-      - name: dialled
-        type: String
-        description: The address actually dialled — useful for log lines.
-      - name: server_handle
-        type: String
-        description: >-
-          The verified server handle (its identity-proof envelope's
-          claimed_handle, proven self-consistent).
-      - name: rotation_notice
-        type: "Option<String>"
-        description: >-
-          Some(fingerprint) when a trusted-mode server presented a new,
-          undismissed key (ISC-C22) — the connection still succeeded; None
-          otherwise.
-
-  - name: ConnectError
-    module: daemonseed_cli::connect
-    kind: enum
-    description: >-
-      connect failure modes. IdentityProofRefused is opaque (ISC-46).
-      TrustRefused is the C22 slider refusal (wrong server-id / MITM /
-      untrusted key change / unknown server) — deliberately actionable, not
-      opaque.
-    variants:
-      - name: "NoAddress { server_id }"
-        description: >-
-          server-id didn't match the bundled canonical anchor and no
-          --address override was supplied.
-      - name: "Tcp { address, source }"
-        description: TCP dial failed.
-      - name: "Rustls(String)"
-        description: rustls ClientConfig build failed.
-      - name: "TlsHandshake(String)"
-        description: TLS handshake failed.
-      - name: "HelloWrite(HelloError)"
-        description: AppHello write failed (length-prefix or body).
-      - name: "HelloDecode(String)"
-        description: Prost decode of the response body failed.
-      - name: "OutOfSetAck { claimed }"
-        description: >-
-          Responder's AppHelloAck carried a version not in our offer —
-          protocol violation per ISC-C23.
-      - name: "NoCommonVersion { server_supported }"
-        description: >-
-          Responder's AppHelloReject carried NO_COMMON_VERSION plus a
-          non-empty server_supported — actionable upgrade message.
-      - name: "UnknownRejectCode { code }"
-        description: >-
-          Responder's AppHelloReject carried an unrecognized code
-          (forward-compat path for newer responders).
-      - name: "WireOutOfRange(VersionError)"
-        description: Responder's wire-shape ProtocolVersion had a u32 field out of u16 range.
-      - name: "ChannelBinding(ChannelBindingError)"
-        description: >-
-          Deriving the identity-proof channel binding from the client TLS
-          session failed.
-      - name: IdentityProofRefused
-        description: >-
-          The post-HELLO identity-proof exchange failed. Carries no sub-cause:
-          bad server signature, stale timestamp, counter replay,
-          channel-binding mismatch all collapse here (ISC-46 / ISC-A-C18).
-          Fails closed with no partial-trust continuation (ISC-45).
-      - name: BadServerId
-        description: server-id could not be parsed as a "<name>#<12hex>" handle.
-      - name: TrustRefused
-        description: >-
-          The C22 trust slider refused the server's key: trusted-mode
-          first-contact hash mismatch (wrong server-id or MITM), untrusted-mode
-          key mismatch (including a legitimate rotation needing re-import), or
-          an unknown server. Actionable, not opaque.
-
-  - name: AcceptAnyServerCert
-    module: daemonseed_cli::tofu_stub
-    kind: struct
-    description: >-
-      M4a-only ServerCertVerifier that accepts every server cert at the chain
-      level. Carries the installed provider's supported signature schemes and
-      still routes the per-handshake TLS-1.3 CertificateVerify through
-      verify_tls13_signature so the ML-DSA-87 codepoint (0x0906) is exercised.
-      Chain validation is bypassed.
-    implements: [ServerCertVerifier]
-    fields:
-      - name: signature_schemes
-        type: "Vec<SignatureScheme>"
-        description: The installed CryptoProvider's supported signature schemes.
+      Signs a share's route advert with the held stable identity key. Holds
+      the key behind an Arc so the single non-Clone SignKeypair can serve both
+      announcement sealing and this route-advert capability without a second
+      copy of the secret.
+    implements: [RouteAdvertSigner]
 
   - name: RatingError
     module: daemonseed_cli::public_space
@@ -297,9 +73,7 @@ types:
   - name: WhitelistConvertError
     module: daemonseed_cli::public_space
     kind: enum
-    description: >-
-      whitelist_from_wire failure converting fetched SignerWhitelistEntry wire
-      entries to a core Whitelist.
+    description: whitelist_from_wire failure converting fetched SignerWhitelistEntry wire entries to a core Whitelist.
     variants:
       - name: EmptyEntry
         description: A SignerWhitelistEntry had no `entry` oneof set.
@@ -311,7 +85,7 @@ types:
   - name: ServedVerifyError
     module: daemonseed_cli::public_space
     kind: enum
-    description: Client re-verification failure for a server-served post or MOTD.
+    description: Client re-verification failure for a served post or MOTD.
     variants:
       - name: Missing
         description: A Post carried no `artifact`.
@@ -320,340 +94,81 @@ types:
       - name: AddressMismatch
         description: The server-asserted content address didn't match the client-derived one.
 
-  - name: AppSession
-    module: daemonseed_cli::session
-    kind: struct
-    description: >-
-      A live application session: one tonic Channel multiplexed over a single
-      post-Authenticated stream. Clone (Channel is reference-counted);
-      public_space() / circle_of_trust() mint generated service clients.
-
-  - name: SessionError
-    module: daemonseed_cli::session
+  - name: MotdAuthorError
+    module: daemonseed_cli::public_space
     kind: enum
-    description: AppSession::open failure.
+    description: sign_motd failure — invalid MOTD text or a signing failure.
     variants:
-      - name: "Transport(tonic::transport::Error)"
-        description: The tonic channel failed to come up over the stream.
+      - name: NotPlaintext
+        description: The text is not single-line plaintext (ISC-S9).
+      - name: "Sign(SignatureError)"
+        description: Signing the payload with the local identity key failed.
 
 # ─────────────────────────────────────────────────────────────────────
-# Functions — every public function plus the binary's `connect` subcommand
-# entry point. Per-function `iscs` is preserved as an extra breadcrumb field.
+# Functions
 # ─────────────────────────────────────────────────────────────────────
 
 functions:
 
-  # ── daemonseed_cli::identity_proof ────────────────────────────────
+  # ── daemonseed_cli::route_signer ──────────────────────────────────
 
-  - name: "ClientIdentity::ephemeral"
-    module: daemonseed_cli::identity_proof
-    description: >-
-      Generate a throwaway client identity: fresh BIP-39 mnemonic → Primary
-      SignKeypair → floor-form handle. The MVP path until persisted client
-      identity lands (D8); the handle is not stable across runs.
-    signature: "pub fn ephemeral() -> Result<Self, ClientIdentityError>"
-    parameters: []
-    returns:
-      type: "Result<Self, ClientIdentityError>"
-      description: A fresh in-memory ClientIdentity, or a stringified construction failure.
-      error_variants:
-        - name: ClientIdentityError
-          condition: Mnemonic generation, key derivation, or handle construction failed.
-    preconditions:
-      - description: The oxicrypt module must be operational (keygen requires it).
-        check: "oxicrypt_module::state() == State::Operational"
-    iscs: ["D8"]
-
-  - name: "ClientIdentity::new"
-    module: daemonseed_cli::identity_proof
-    description: Build a ClientIdentity from an explicit signing keypair and verify-form handle.
-    signature: "pub fn new(signing: SignKeypair, handle: String) -> Self"
+  - name: "IdentityRouteAdvertSigner::new"
+    module: daemonseed_cli::route_signer
+    description: Wrap the profile's stable signing key as a route-advert capability, taking sole ownership of the key.
+    signature: "pub fn new(key: SignKeypair) -> Self"
     parameters:
-      - name: signing
+      - name: key
         type: SignKeypair
         direction: in
-        description: The client's ML-DSA-87 signing keypair.
-      - name: handle
-        type: String
-        direction: in
-        description: The client's canonical verify-form handle.
+        description: The profile's stable ML-DSA-87 identity keypair.
     returns:
       type: Self
-      description: A ClientIdentity wrapping the supplied keypair and handle.
+      description: A route-advert signer owning the key behind an Arc.
 
-  - name: "ClientIdentity::handle"
-    module: daemonseed_cli::identity_proof
-    description: Borrow the client's canonical verify-form handle.
-    signature: "pub fn handle(&self) -> &str"
-    parameters: []
-    returns:
-      type: "&str"
-      description: The client's "<name>#<12hex>" verify-form handle.
-
-  - name: "RustlsClientExporter::new"
-    module: daemonseed_cli::identity_proof
+  - name: "IdentityRouteAdvertSigner::from_arc"
+    module: daemonseed_cli::route_signer
     description: >-
-      Wrap a live client-side rustls connection as a ChannelBindingSource.
-      Obtain the reference via tokio_rustls::client::TlsStream::get_ref().1.
-    signature: "pub fn new(conn: &'a rustls::ClientConnection) -> Self"
+      Wrap a SHARED reference to the stable signing key — for a caller (the GUI
+      / TUI net actor) that retains the same Arc<SignKeypair> to seal share
+      announcements with. Cheap Arc clone, no second copy of the secret.
+    signature: "pub fn from_arc(key: Arc<SignKeypair>) -> Self"
     parameters:
-      - name: conn
-        type: "&'a rustls::ClientConnection"
+      - name: key
+        type: "Arc<SignKeypair>"
         direction: in
-        description: The live client-side TLS connection to derive channel bindings from.
+        description: The shared stable identity keypair the caller also seals with.
     returns:
       type: Self
-      description: A RustlsClientExporter borrowing the connection.
+      description: A route-advert signer sharing the caller's key Arc.
 
-  - name: run_client_identity_proof
-    module: daemonseed_cli::identity_proof
-    description: >-
-      Run the client's side of the identity-proof exchange over the
-      already-Versioned stream. Sends the client envelope, verifies the
-      server's envelope is self-consistent, records the server counter as
-      highest-seen. Does NOT gate on dialed-identity — that moved to the C22
-      trust layer (apply_trust) so trusted-mode rotation is reachable.
-    signature: "pub async fn run_client_identity_proof<S>(stream: &mut S, channel_binding: [u8; CHANNEL_BINDING_LEN], negotiated_version: wire::ProtocolVersion, identity: &ClientIdentity, now_unix_ms: u64, counters: &mut CounterState, expected_server_id: &str) -> Result<VerifiedPeer, ClientProofError> where S: AsyncRead + AsyncWrite + Unpin"
-    parameters:
-      - name: stream
-        type: "&mut S"
-        direction: in-out
-        description: The Versioned TLS stream the envelope I/O runs over.
-      - name: channel_binding
-        type: "[u8; CHANNEL_BINDING_LEN]"
-        direction: in
-        description: >-
-          This side's locally-derived channel binding (never read off the
-          wire), so a captured envelope from another session fails closed.
-      - name: negotiated_version
-        type: "wire::ProtocolVersion"
-        direction: in
-        description: The version both sides negotiated; bound into the envelope verification.
-      - name: identity
-        type: "&ClientIdentity"
-        direction: in
-        description: The client's signing identity supplying handle, keypair, and timestamp source.
-      - name: now_unix_ms
-        type: u64
-        direction: in
-        description: >-
-          Supplies the client envelope's timestamp (ISC-18) and the
-          server-envelope skew check.
-      - name: counters
-        type: "&mut CounterState"
-        direction: in-out
-        description: >-
-          Provides the monotonic send counter (ISC-19) and the per-server
-          highest-seen counter (ISC-34).
-      - name: expected_server_id
-        type: "&str"
-        direction: in
-        description: >-
-          Keys the per-server replay counter only (ISC-34) — NOT an identity
-          gate; dialed-identity is decided by the trust layer.
-    returns:
-      type: "Result<VerifiedPeer, ClientProofError>"
-      description: >-
-        A self-consistent VerifiedPeer on success; fails closed with no
-        partial-trust branch on any failure (ISC-45).
-      error_variants:
-        - name: "Sign(SignatureError)"
-          condition: Signing the client's envelope failed (module not operational).
-        - name: "Frame(HelloError)"
-          condition: Frame read/write or decode failed on the transport.
-        - name: "Verify(VerifyRejection)"
-          condition: >-
-            The server's envelope failed self-consistency verification (uniform,
-            sub-cause opaque).
-    iscs: [S19, "43", "44", "45", "46", "47", "17", "18", "19", A-C18]
-
-  # ── daemonseed_cli::connect ───────────────────────────────────────
-
-  - name: resolve_address
-    module: daemonseed_cli::connect
-    description: >-
-      Resolve a server-id to a dial address. Override wins; the bundled-anchor
-      server-id match is the fallback; an empty anchor with no override
-      surfaces NoAddress.
-    signature: "pub fn resolve_address(server_id: &str, address_override: Option<&str>) -> Result<String, ConnectError>"
-    parameters:
-      - name: server_id
-        type: "&str"
-        direction: in
-        description: Target server-id in canonical "<name>#<12hex>" form.
-      - name: address_override
-        type: "Option<&str>"
-        direction: in
-        description: The CLI's --address flag; if Some, it wins unconditionally.
-    returns:
-      type: "Result<String, ConnectError>"
-      description: The resolved "host:port" dial address.
-      error_variants:
-        - name: NoAddress
-          condition: No override supplied and the bundled anchor is empty or its server_id mismatched.
-    iscs: [C37]
-
-  - name: build_client_config
-    module: daemonseed_cli::connect
-    description: >-
-      Build the client-side rustls ClientConfig: CNSA 2.0 hybrid provider,
-      TLS 1.3 only, ALPN exactly h2, AcceptAnyServerCert verifier (chain
-      validation bypassed).
-    signature: "pub fn build_client_config() -> Result<rustls::ClientConfig, rustls::Error>"
+  - name: "IdentityRouteAdvertSigner::into_arc"
+    module: daemonseed_cli::route_signer
+    description: As the Arc<dyn RouteAdvertSigner> that VeilidNetHandle::publish_share takes.
+    signature: "pub fn into_arc(self) -> Arc<dyn RouteAdvertSigner>"
     parameters: []
     returns:
-      type: "Result<rustls::ClientConfig, rustls::Error>"
-      description: A configured ClientConfig, or a rustls build error.
-      error_variants:
-        - name: "rustls::Error"
-          condition: rustls config assembly failed.
-    preconditions:
-      - description: install_provider() must have returned Ok before this call.
-        check: "CryptoProvider::get_default().is_some()"
+      type: "Arc<dyn RouteAdvertSigner>"
+      description: The signer as the trait object the transport crate consumes.
 
-  - name: connect
-    module: daemonseed_cli::connect
+  - name: "IdentityRouteAdvertSigner::sign_route_advert"
+    module: daemonseed_cli::route_signer
     description: >-
-      Run the end-to-end connect: TCP → TLS → AppHello → AppHelloAck →
-      channel binding → identity-proof → Authenticated → C22 trust slider.
-      Returns Ok only after reaching Authenticated (ISC-47); trusted-mode
-      TOFU-pins the server key, untrusted-mode requires a byte-exact key,
-      rotation surfaces via rotation_notice, refusal → TrustRefused.
-    signature: "pub async fn connect(server_id: &str, address: &str, identity: &ClientIdentity, counters: &mut CounterState, store: &mut dyn TrustStore) -> Result<ConnectOutcome, ConnectError>"
+      Sign share_id ‖ route_blob (via veilid-net's route_provenance_input) with
+      the held key. The RouteAdvertSigner trait impl daemonseed-veilid-net calls.
+    signature: "fn sign_route_advert(&self, share_id: &str, route_blob: &[u8]) -> daemonseed_veilid_net::Result<Vec<u8>>"
     parameters:
-      - name: server_id
+      - name: share_id
         type: "&str"
         direction: in
-        description: Target server-id in canonical "<name>#<12hex>" form.
-      - name: address
-        type: "&str"
+        description: The share whose route advert is being signed.
+      - name: route_blob
+        type: "&[u8]"
         direction: in
-        description: The resolved "host:port" dial address.
-      - name: identity
-        type: "&ClientIdentity"
-        direction: in
-        description: The client's signing identity (D8 — the binary injects an ephemeral one).
-      - name: counters
-        type: "&mut CounterState"
-        direction: in-out
-        description: >-
-          The monotonic send counter (ISC-19) and per-server highest-seen
-          counter (ISC-34).
-      - name: store
-        type: "&mut dyn TrustStore"
-        direction: in-out
-        description: >-
-          Must hold an entry for the dialed server; the C22 trust slider runs
-          against it after Authenticated.
+        description: The route advertisement bytes to bind under the signature.
     returns:
-      type: "Result<ConnectOutcome, ConnectError>"
-      description: The Authenticated outcome (version, dialled, handle, optional rotation notice).
-      error_variants:
-        - name: NoAddress
-          condition: Server-id unresolved and no override.
-        - name: Tcp
-          condition: TCP dial failed.
-        - name: Rustls
-          condition: ClientConfig build failed.
-        - name: TlsHandshake
-          condition: TLS handshake failed.
-        - name: HelloWrite
-          condition: AppHello frame write failed.
-        - name: HelloDecode
-          condition: Response body prost decode failed.
-        - name: OutOfSetAck
-          condition: Server picked a version not in the client's offer (ISC-C23).
-        - name: NoCommonVersion
-          condition: Server rejected with NO_COMMON_VERSION and its supported list.
-        - name: UnknownRejectCode
-          condition: Server sent an unrecognized reject code.
-        - name: WireOutOfRange
-          condition: Server wire-shape ProtocolVersion field out of u16 range.
-        - name: ChannelBinding
-          condition: Channel-binding derivation from the client TLS session failed.
-        - name: IdentityProofRefused
-          condition: The identity-proof exchange failed (opaque cause, ISC-46).
-        - name: BadServerId
-          condition: server-id is not a valid "<name>#<12hex>" handle.
-        - name: TrustRefused
-          condition: The C22 trust slider refused the server's key.
-    preconditions:
-      - description: >-
-          install_provider() and initialize_with_profile(.., Cnsa2) must both
-          have returned Ok before this call.
-        check: "CryptoProvider::get_default().is_some() && oxicrypt_module::state() == State::Operational"
-      - description: The trust store must already hold an entry for the dialed server-id.
-        check: "store.get(&server_handle).is_some()"
-    iscs: [C23, C37, S14, A-S9, S19, "47", A-C18, C22]
-
-  - name: connect_session
-    module: daemonseed_cli::connect
-    description: >-
-      Like connect, but KEEPS the live post-Authenticated stream: returns
-      (ConnectOutcome, AppStream) instead of dropping the connection. The
-      substrate for any client that runs application traffic (the M11 TUI's
-      chat / circle / share / public-space) — build a tonic client channel
-      over the returned AppStream via Endpoint::connect_with_connector +
-      hyper_util TokioIo. `connect` is the thin wrapper that delegates here and
-      drops the stream. Same parameters and error variants as connect.
-    signature: "pub async fn connect_session(server_id: &str, address: &str, identity: &ClientIdentity, counters: &mut CounterState, store: &mut dyn TrustStore) -> Result<(ConnectOutcome, AppStream), ConnectError>"
-    parameters:
-      - name: server_id
-        type: "&str"
-        direction: in
-        description: Target server-id in canonical "<name>#<12hex>" form.
-      - name: address
-        type: "&str"
-        direction: in
-        description: The resolved "host:port" dial address.
-      - name: identity
-        type: "&ClientIdentity"
-        direction: in
-        description: The client's signing identity.
-      - name: counters
-        type: "&mut CounterState"
-        direction: in-out
-        description: Monotonic send + per-server highest-seen counters.
-      - name: store
-        type: "&mut dyn TrustStore"
-        direction: in-out
-        description: Must hold an entry for the dialed server; C22 runs against it.
-    returns:
-      type: "Result<(ConnectOutcome, AppStream), ConnectError>"
-      description: The Authenticated outcome paired with the live TLS stream.
-    preconditions:
-      - description: >-
-          install_provider() and initialize_with_profile(.., Cnsa2) must both
-          have returned Ok before this call.
-        check: "CryptoProvider::get_default().is_some() && oxicrypt_module::state() == State::Operational"
-      - description: The trust store must already hold an entry for the dialed server-id.
-    iscs: [C23, C37, S19, "47", A-C18, C22, "10"]
-
-  # ── daemonseed_cli::tofu_stub ─────────────────────────────────────
-
-  - name: "AcceptAnyServerCert::from_installed_provider"
-    module: daemonseed_cli::tofu_stub
-    description: >-
-      Construct the M4a placeholder verifier from the process-wide installed
-      CryptoProvider, capturing its supported signature schemes. Chain
-      validation is bypassed; the per-handshake CertificateVerify still runs.
-    signature: "pub fn from_installed_provider() -> Arc<Self>"
-    parameters: []
-    returns:
-      type: "Arc<Self>"
-      description: A shared verifier carrying the installed provider's signature schemes.
-    preconditions:
-      - description: install_provider() must have been driven first (panics otherwise).
-        check: "CryptoProvider::get_default().is_some()"
-    security:
-      handles_secrets: false
-    pitfalls:
-      - description: >-
-          M4a-only placeholder — accepts any server cert chain; a
-          network-position MITM is not detectable at the TLS layer. The M4b
-          identity-proof envelope closes that gap.
-        wrong: "Treating AcceptAnyServerCert as production server-cert verification."
-        right: "Rely on the application-layer identity-proof for authentication; this verifier is a stub."
+      type: "daemonseed_veilid_net::Result<Vec<u8>>"
+      description: The detached ML-DSA-87 signature, or a Send error if the module was not operational.
+    iscs: [S27, S28]
 
   # ── daemonseed_cli::public_space ──────────────────────────────────
 
@@ -662,8 +177,7 @@ functions:
     description: >-
       Render a signed MOTD as inert plaintext (ISC-25): decode the MotdPayload
       and return its text with terminal control sequences stripped (ESC and
-      other C0/C1, keeping newline and tab), so a signed MOTD can't inject
-      ANSI escapes. No markup or link interpretation.
+      other C0/C1, keeping newline and tab). No markup or link interpretation.
     signature: "pub fn render_motd(motd: &wire::SignedArtifact) -> String"
     parameters:
       - name: motd
@@ -680,8 +194,7 @@ functions:
     description: >-
       Decode a served post's inner payload into (topic, body, signed_timestamp_ms)
       for client rendering (ISC-S7). A payload that fails to decode renders as
-      empty so a malformed post can never panic a rendering client; provenance
-      is a separate concern (pair with verify_served_post).
+      empty; provenance is a separate concern (pair with verify_served_post).
     signature: "pub fn post_render_fields(post: &wire::Post) -> (String, String, i64)"
     parameters:
       - name: post
@@ -696,9 +209,8 @@ functions:
   - name: select_rating
     module: daemonseed_cli::public_space
     description: >-
-      Choose a rating only from the active (connected-host) server's taxonomy
-      (ISC-30 / ISC-31); out-of-taxonomy is rejected — the public-space half
-      of active-server scoping.
+      Choose a rating only from the active server's taxonomy (ISC-30 / ISC-31);
+      out-of-taxonomy is rejected.
     signature: "pub fn select_rating(taxonomy: &[String], choice: &str) -> Result<String, RatingError>"
     parameters:
       - name: taxonomy
@@ -720,9 +232,9 @@ functions:
   - name: filter_shares_by_rating
     module: daemonseed_cli::public_space
     description: >-
-      The client's rating filter, applied at render AND fetch time (the server
-      never filters, ISC-A-S5b). None returns everything; Some(label) keeps
-      only shares carrying that advisory rating. Share content arrives at M8.
+      The client's rating filter, applied at render AND fetch time (ISC-A-S5b).
+      None returns everything; Some(label) keeps only shares carrying that
+      advisory rating.
     signature: "pub fn filter_shares_by_rating<'a>(shares: &'a [ShareListing], rating: Option<&str>) -> Vec<&'a ShareListing>"
     parameters:
       - name: shares
@@ -742,13 +254,8 @@ functions:
     module: daemonseed_cli::public_space
     description: >-
       The client's hidden-shares filter (ISC-C16 / ISC-A-C3): drop listings
-      whose sharer_handle is in the recipient's BTreeSet<String> hide set.
-      Mirrors filter_shares_by_rating in shape but reads the recipient-
-      private hide set rather than an operator-published taxonomy. Listings
-      with an empty sharer_handle are always kept (legacy / operator-pinned
-      entries predate the additive-MINOR sharer_handle field). The set is
-      Seeds::hidden_shares; nothing leaves the client (no wire field carries
-      it).
+      whose sharer_handle is in the recipient's hide set. Listings with an empty
+      sharer_handle are always kept. Nothing leaves the client.
     signature: "pub fn filter_shares_excluding_hidden<'a>(shares: &'a [ShareListing], hidden: &std::collections::BTreeSet<String>) -> Vec<&'a ShareListing>"
     parameters:
       - name: shares
@@ -767,10 +274,9 @@ functions:
   - name: whitelist_from_wire
     module: daemonseed_cli::public_space
     description: >-
-      Rebuild a core Whitelist from the published wire entries a client fetched
-      via GetSignerWhitelist (ISC-S8 / ISC-6). server_pubkey=Some(..) adds the
-      server's own key for MOTD verification (ISC-26); None for the post
-      whitelist.
+      Rebuild a core Whitelist from published wire entries (ISC-S8 / ISC-6).
+      server_pubkey=Some(..) adds the server's own key for MOTD verification
+      (ISC-26); None for the post whitelist.
     signature: "pub fn whitelist_from_wire(entries: &[wire::SignerWhitelistEntry], server_pubkey: Option<&[u8]>) -> Result<Whitelist, WhitelistConvertError>"
     parameters:
       - name: entries
@@ -796,10 +302,9 @@ functions:
   - name: verify_served_post
     module: daemonseed_cli::public_space
     description: >-
-      Client half of verify-and-serve (ISC-A-S3): re-run verify_artifact
-      against the published whitelist AND re-derive the content address,
-      rejecting any server-asserted-address mismatch. Trusts nothing the server
-      asserts.
+      Client half of verify-and-serve (ISC-A-S3): re-run verify_artifact against
+      the published whitelist AND re-derive the content address, rejecting any
+      server-asserted-address mismatch.
     signature: "pub fn verify_served_post(post: &wire::Post, whitelist: &Whitelist) -> Result<(), ServedVerifyError>"
     parameters:
       - name: post
@@ -850,9 +355,8 @@ functions:
     module: daemonseed_cli::public_space
     description: >-
       Author a signed announcement post (ISC-S7): build the inner PostPayload,
-      prost-encode it, and sign with the local identity key into a
-      SignedArtifact that re-verifies against the signer whitelist (authoring
-      counterpart to verify_served_post).
+      prost-encode it, and sign with the local identity key into a SignedArtifact
+      that re-verifies against the signer whitelist.
     signature: "pub fn sign_post(kp: &SignKeypair, topic: &str, body: &str, signed_timestamp_ms: i64) -> Result<wire::SignedArtifact, SignatureError>"
     parameters:
       - name: kp
@@ -883,8 +387,7 @@ functions:
     module: daemonseed_cli::public_space
     description: >-
       Author a signed MOTD (ISC-S9): enforce the shared single-line-plaintext
-      rule (motd_text_is_valid) before encoding and signing the inner
-      MotdPayload, so composer and relay agree on one definition of the rule.
+      rule (motd_text_is_valid) before encoding and signing the inner MotdPayload.
     signature: "pub fn sign_motd(kp: &SignKeypair, text: &str, signed_timestamp_ms: i64) -> Result<wire::SignedArtifact, MotdAuthorError>"
     parameters:
       - name: kp
@@ -913,9 +416,7 @@ functions:
     module: daemonseed_cli::public_space
     description: >-
       Author a signed delete of one's own post (ISC-S7): build and sign a
-      PostDeletePayload over the target post's content address. Server-side
-      author-match enforcement lives in delete_post; this is the client
-      authoring of the delete artifact.
+      PostDeletePayload over the target post's content address.
     signature: "pub fn sign_post_delete(kp: &SignKeypair, content_address: &[u8], signed_timestamp_ms: i64) -> Result<wire::SignedArtifact, SignatureError>"
     parameters:
       - name: kp
@@ -941,10 +442,9 @@ functions:
   - name: local_key_is_whitelisted
     module: daemonseed_cli::public_space
     description: >-
-      Signer self-determination (ISC-S8): true iff the local pubkey is
-      authorized by the relay's published whitelist (GetSignerWhitelist),
-      gating the in-client authoring composer cryptographically with no admin
-      login. Whitelist membership stays operator-only / out-of-band.
+      Signer self-determination (ISC-S8): true iff the local pubkey is authorized
+      by the published whitelist, gating the in-client authoring composer with no
+      admin login.
     signature: "pub fn local_key_is_whitelisted(local_pubkey: &[u8], entries: &[wire::SignerWhitelistEntry]) -> Result<bool, WhitelistConvertError>"
     parameters:
       - name: local_pubkey
@@ -954,7 +454,7 @@ functions:
       - name: entries
         type: "&[wire::SignerWhitelistEntry]"
         direction: in
-        description: The relay's published whitelist wire entries.
+        description: The published whitelist wire entries.
     returns:
       type: "Result<bool, WhitelistConvertError>"
       description: Whether the local key is authorized, or a conversion / authorization failure.
@@ -973,10 +473,9 @@ functions:
     module: daemonseed_cli::public_space
     description: >-
       The composer-gating decision (ISC-S8 / D3): true iff the local stable
-      identity key is on the relay's published signer whitelist. Fail-closed —
-      any conversion / authorization error yields false. The shared boolean both
-      the GUI and TUI gate the MOTD/announcement composer affordance on; a
-      non-signer key gets the read-only pane.
+      identity key is on the published signer whitelist. Fail-closed — any
+      conversion / authorization error yields false. Both the GUI and TUI gate
+      the MOTD/announcement composer affordance on this.
     signature: "pub fn composer_visible(local_pubkey: &[u8], entries: &[wire::SignerWhitelistEntry]) -> bool"
     parameters:
       - name: local_pubkey
@@ -986,219 +485,8 @@ functions:
       - name: entries
         type: "&[wire::SignerWhitelistEntry]"
         direction: in
-        description: The relay's published whitelist wire entries.
+        description: The published whitelist wire entries.
     returns:
       type: bool
       description: Whether to show the composer (true) or keep the pane read-only (false, incl. on any whitelist error).
     iscs: [S8]
-
-  # ── daemonseed_cli::session ───────────────────────────────────────
-  - name: "AppSession::open"
-    module: daemonseed_cli::session
-    description: >-
-      Build a session over an already-Authenticated stream. The stream is
-      consumed once by the tonic connector; the placeholder authority is never
-      resolved (no dial happens). Generic over the stream so production
-      (AppStream) and tests (tokio::io::duplex) share the path.
-    signature: "pub async fn open<S>(stream: S) -> Result<AppSession, SessionError> where S: AsyncRead + AsyncWrite + Send + Unpin + 'static"
-    parameters:
-      - name: stream
-        type: S
-        direction: in
-        description: The post-Authenticated stream (production AppStream, or a test duplex half).
-    returns:
-      type: "Result<AppSession, SessionError>"
-      description: A live session whose channel rides the supplied stream.
-      error_variants:
-        - name: Transport
-          condition: The tonic channel failed to come up over the stream.
-    iscs: ["10", "36"]
-
-  - name: "AppSession::public_space"
-    module: daemonseed_cli::session
-    description: A PublicSpaceClient over this session (MOTD, posts, taxonomy, whitelist, shares, deprecation).
-    signature: "pub fn public_space(&self) -> PublicSpaceClient<tonic::transport::Channel>"
-    parameters: []
-    returns:
-      type: "PublicSpaceClient<Channel>"
-      description: A public-space client sharing the session channel.
-    iscs: ["36"]
-
-  - name: "AppSession::circle_of_trust"
-    module: daemonseed_cli::session
-    description: A CircleOfTrustClient over this session (the bidirectional Subscribe live relay).
-    signature: "pub fn circle_of_trust(&self) -> CircleOfTrustClient<tonic::transport::Channel>"
-    parameters: []
-    returns:
-      type: "CircleOfTrustClient<Channel>"
-      description: A circle-of-trust client sharing the session channel.
-    iscs: ["10", S20]
-
-  - name: "AppSession::serve_share"
-    module: daemonseed_cli::session
-    description: >-
-      Serve a published share for the life of the session (D, M15): one
-      Subscribe stream on the share's CoT fetch-asset; the relay fans every
-      fetcher's ManifestRequest / ChunkRequest into it and our responses back
-      out, so one loop handles arbitrarily many concurrent fetchers (bounded
-      by the relay's per-connection limiter, ISC-S17). M16 (serve-from-disk):
-      generic over any core ChunkSource (the in-RAM ShareContent or the
-      disk-backed DiskShareContent), taken as Arc<C>; every inbound frame is
-      answered via tokio::task::spawn_blocking, NEVER inline — answer() does
-      synchronous file I/O for a disk-backed chunk, and this loop may run as
-      a spawn_local task on the TUI net actor's single-threaded LocalSet, so
-      an inline answer would park the entire actor for the duration of each
-      disk read (a 1 MiB chunk-range seek+read since the M16 chunking
-      completion; potentially multi-GB before it — ISC-A-C35). The source
-      never fabricates a chunk it does
-      not hold (ISC-A-S21); bytes hash to the advertised address by receiver
-      re-derivation (ISC-S28).
-    signature: "pub async fn serve_share<C>(&self, server_id: &str, share_id: &str, content: Arc<C>) -> Result<(), ServeShareError> where C: ChunkSource + Send + Sync + 'static"
-    parameters:
-      - name: server_id
-        type: "&str"
-        direction: in
-        description: The connected relay's server-id (namespaces the asset address).
-      - name: share_id
-        type: "&str"
-        direction: in
-        description: The server-assigned opaque share id being served.
-      - name: content
-        type: "Arc<C>"
-        direction: in
-        description: The shared ChunkSource answering manifest/chunk requests (shared with per-request blocking-pool tasks).
-    returns:
-      type: "Result<(), ServeShareError>"
-      description: Ok when the serve stream ends (relay reaped the asset or peer closed).
-    iscs: [S27, S28, A-S21, A-C35]
-
-  # ── binary subcommand entry point ─────────────────────────────────
-
-  - name: "daemonseed-cli connect"
-    module: daemonseed_cli::connect
-    description: >-
-      The binary's `connect <server-id> [--address HOST:PORT]` subcommand.
-      Boots the crypto module + TLS provider, resolves the address, builds an
-      ephemeral identity + in-memory trust store (D8 / M5), drives connect to
-      Authenticated, prints the authenticated-success line (and any rotation
-      notice), and exits 0 only after reaching Authenticated (ISC-47).
-    signature: "daemonseed-cli connect <server-id> [--address HOST:PORT]"
-    parameters:
-      - name: server-id
-        type: String
-        direction: in
-        description: Target server-id in canonical "<name>#<12hex>" form.
-      - name: --address
-        type: "Option<String>"
-        direction: in
-        description: >-
-          Override the bootstrap-anchor address resolution as HOST:PORT.
-          Required when the bundled anchor is empty or doesn't match server-id.
-    returns:
-      type: ExitCode
-      description: 0 on Authenticated success; 1 on any failure (message to stderr).
-    iscs: ["47", C22, C37, "D8"]
-
-# ─────────────────────────────────────────────────────────────────────
-# Constants — hoisted from the dialect's per-module `public:` const items.
-# ─────────────────────────────────────────────────────────────────────
-
-constants:
-  - name: MVP_SUITE_ID
-    module: daemonseed_cli::identity_proof
-    type: u32
-    value: "1"
-    description: >-
-      MVP cryptographic suite id carried by the client envelope (1 = CNSA 2.0).
-      Mirrors daemonseed_server::identity_proof::MVP_SUITE_ID.
-
-  - name: DEFAULT_PORT
-    module: daemonseed_cli::connect
-    type: u16
-    value: "443"
-    description: Default port the M4a server binds (per ISC-S5).
-
-  - name: MAX_CONCURRENT_CONNECTIONS_PER_SERVER
-    module: daemonseed_cli::connect
-    type: usize
-    value: "4"
-    description: >-
-      Reference-client per-server concurrent-connection cap (ISC-A-C10). A
-      commitment, not protocol-enforced; not enforceable against a hostile
-      client (Sybil resistance is post-MVP).
-
-# ─────────────────────────────────────────────────────────────────────
-# Planned subcommands (forward-looking; not yet built) — extra,
-# non-canonical breadcrumb section.
-# ─────────────────────────────────────────────────────────────────────
-
-planned_subcommands:
-  - milestone: "M4b commit 6 (landed)"
-    note: >-
-      `connect` now runs the full client-side identity-proof; it returns only
-      after Authenticated. The dedicated real-TLS e2e test (ISC-53) plus
-      replay/skew/uniform-close fixtures land at commit 7. Persisted client
-      identity (passphrase + sealed seeds blob, replacing the ephemeral D8
-      identity) is a later commit.
-  - milestone: "M4b/M5 (remaining)"
-    commands:
-      - name: first-start
-        purpose: >-
-          Run the daemonseed-core first_start orchestrator end-to-end —
-          scriptable enrollment (passphrase via stdin or env-var). Replaces the
-          ephemeral D8 client identity with a persisted, passphrase-sealed one.
-  - milestone: M5
-    commands:
-      - name: "trust set <server-id> {trusted|untrusted}"
-        purpose: Flip the federation trust slider for a server per ISC-C22.
-      - name: "introducer query <server-id>"
-        purpose: >-
-          Fetch the introducer's known-server list. Does NOT auto-add — output
-          is for user inspection per the no-keys-in-introducer invariant.
-  - milestone: M6
-    commands:
-      - name: "post <text>"
-        purpose: Post to the public space.
-      - name: "motd set <text>"
-        purpose: Set the daemon's MOTD.
-  - milestone: M7
-    commands:
-      - name: "suite status"
-        purpose: List local registry plus per-server deprecation policy state.
-      - name: "suite migrate"
-        purpose: Explicit user-triggered migration to a newer suite. Never automatic per ISC-A-C9.
-  - milestone: M8
-    commands:
-      - name: "share add <path>"
-        purpose: Add a file or directory to the share index.
-      - name: "share list"
-        purpose: List indexed shares.
-      - name: "fetch <hash>"
-        purpose: Fetch a content-addressed chunk.
-
-# ─────────────────────────────────────────────────────────────────────
-# Discovery semantics — extra, non-canonical breadcrumb section.
-# ─────────────────────────────────────────────────────────────────────
-
-profile_discovery:
-  status: >-
-    M4a commit 5: `connect` doesn't yet read a profile (no per-client state to
-    load); profile-aware subcommands land in M4b.
-  priority:
-    - "--config <path> CLI flag (planned for M4b profile-aware subcommands)"
-    - "CWD-discovery (daemonseed.toml in current directory)"
-    - "XDG fallback ($XDG_CONFIG_HOME/daemonseed/daemonseed.toml)"
-  iscs: [C35]
-
-# ─────────────────────────────────────────────────────────────────────
-# Output conventions — extra, non-canonical breadcrumb section.
-# ─────────────────────────────────────────────────────────────────────
-
-output_conventions:
-  status: "M4a commit 5: `connect` follows these rules; subsequent subcommands inherit."
-  rules:
-    - "All commands MUST be scriptable — no required interactive prompts."
-    - "Passphrase input via stdin (line-buffered) or DAEMONSEED_PASSPHRASE env var. Never via argv (would leak via /proc)."
-    - "Default output is human-readable plain text. --json switches to structured JSON for scripting (planned)."
-    - "No emoji in output (compatibility with non-Unicode terminals)."
-    - "Exit codes: 0 success, 1 user error, 2 config error, 3 network error, 4 protocol error."

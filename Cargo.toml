@@ -45,11 +45,11 @@ prost-types = "=0.13.4"
 tonic = { version = "=0.12.3", default-features = false, features = ["transport", "codegen", "prost"] }
 tonic-build = { version = "=0.12.3", default-features = false, features = ["prost"] }
 tokio = { version = "1.43", default-features = false, features = ["rt", "macros", "io-util", "net"] }
-# Tokio-side rustls adapter for `TlsAcceptor`. Server-only in M4a; no crypto
-# feature flag because rustls's CryptoProvider is installed process-wide via
-# oxitls (see daemonseed-server::tls::install_provider). `tls12` feature
-# omitted — daemonseed is TLS 1.3 only by construction (rustls config is built
-# with `&[&TLS13]`).
+# Tokio-side rustls adapter for TLS streams. No crypto feature flag because
+# rustls's CryptoProvider is installed process-wide via oxitls (see
+# `daemonseed_core::tls::install_provider`). `tls12` feature omitted —
+# daemonseed is TLS 1.3 only by construction (rustls config is built with
+# `&[&TLS13]`).
 tokio-rustls = { version = "0.26", default-features = false, features = ["logging"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
 # Single-connection incoming stream for serving the post-Authenticated tonic
@@ -92,13 +92,13 @@ oxicrypt-aes = { path = "../oxicrypt/crates/oxicrypt-aes", features = ["accel-ae
 oxicrypt-kdf = { path = "../oxicrypt/crates/oxicrypt-kdf" }
 oxicrypt-sha = { path = "../oxicrypt/crates/oxicrypt-sha" }
 oxicrypt-zeroize = { path = "../oxicrypt/crates/oxicrypt-zeroize" }
-# Additional oxicrypt primitives reached by daemonseed-server in M4a for
-# assembling the production KATS slice that drives
-# `oxicrypt_module::initialize_with_profile`.
+# Additional oxicrypt primitives reached by daemonseed-core for assembling the
+# production KATS slice that drives `oxicrypt_module::initialize_with_profile`.
 oxicrypt-hmac = { path = "../oxicrypt/crates/oxicrypt-hmac" }
 oxicrypt-drbg = { path = "../oxicrypt/crates/oxicrypt-drbg" }
 oxicrypt-ecdh = { path = "../oxicrypt/crates/oxicrypt-ecdh" }
-# oxitls TLS-stack glue. Consumed by daemonseed-server in M4a commit 3+.
+# oxitls TLS-stack glue. Consumed by daemonseed-core for the process-wide
+# rustls CryptoProvider install.
 oxitls-rustls-provider = { path = "../oxitls/crates/oxitls-rustls-provider" }
 oxitls-webpki-mldsa = { path = "../oxitls/crates/oxitls-webpki-mldsa" }
 # rustls — exact-pinned to match oxitls's lock at `=0.23.37`.

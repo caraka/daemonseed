@@ -36,7 +36,7 @@
 //! *write*. The WB-1 model moves the intelligence to the read side under the WB-0
 //! invariant (*user activity may influence only local computation, never the timing,
 //! size, or existence of a presence-class network emission*). Write side: a
-//! [`next_keepalive_interval`] keepalive every [180,220]s that takes no input from
+//! [`next_keepalive_interval`] keepalive every \[180,220\]s that takes no input from
 //! activity, plus session-boundary join/leave writes. Read side (here, emission-free):
 //! [`PresenceTracker::apply`] folds beacons (incl. leave tombstones with
 //! [`PresenceTracker::apply_member_write`]-style dominance), a same-room chat write
@@ -724,7 +724,7 @@ mod tests {
     }
 
     /// WB-ISC-1 (partial, timing): the keepalive interval takes no input from
-    /// activity — it is a pure CSPRNG draw in the [180,220]s band and varies across
+    /// activity — it is a pure CSPRNG draw in the \[180,220\]s band and varies across
     /// draws (the dispatch-independence half is the scheduler oracle WB-ISC-1 in
     /// `daemonseed-veilid-net::schedule`).
     #[test]
@@ -773,7 +773,7 @@ mod tests {
         let mut t = PresenceTracker::for_room("lobby", PRESENCE_TTL);
         let t0 = Instant::now();
         let horizon = PRESENCE_TTL * 3;
-        let step = Duration::from_secs(200); // inside the [180,220]s band
+        let step = Duration::from_secs(200); // inside the \[180,220\]s band
         let mut now = t0;
         let mut ms = 1_000_000_000_000_i64;
         t.apply(&heartbeat(b"pk", "quiet#0", ms), now);

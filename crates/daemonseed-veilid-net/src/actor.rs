@@ -129,7 +129,7 @@ enum Command {
     /// Write a SEALED payload to a stable-identity slot on a rendezvous record —
     /// the current-state (last-writer-wins) counterpart to [`Command::PublishRendezvous`]'s
     /// append-ring write. Presence beacons use it: one fixed slot per member
-    /// (keyed by `stable_id` via [`rendezvous::current_state_subkey`]), so a
+    /// (keyed by `stable_id` via `rendezvous::current_state_subkey`), so a
     /// re-beacon overwrites in place instead of filling the ring (P1). `owner_seed`
     /// is the presence sibling record's owner seed; the engine treats `sealed` as
     /// opaque.
@@ -483,11 +483,11 @@ impl VeilidNetHandle {
     /// can never evict the chat append-ring (P1). `member_pubkey` is the beacon's
     /// stable identity key; this owns the stable-id encoding
     /// ([`member_slot_id`], hex) so both the gui and tui callers derive the SAME
-    /// slot, and the write lands in that member's [`rendezvous::current_state_subkey`]
+    /// slot, and the write lands in that member's `rendezvous::current_state_subkey`
     /// slot — last-writer-wins.
     ///
     /// **Slot-collision ceiling (bounded, degrades not-crashes).** The current-state
-    /// scheme has only [`rendezvous::SUBKEY_COUNT`] slots (sized for a handful of
+    /// scheme has only `rendezvous::SUBKEY_COUNT` slots (sized for a handful of
     /// shares). Presence membership is UNBOUNDED, so two members whose ids collide to
     /// one slot slot-share (last-writer-wins) — the loser is transiently missing from
     /// rosters. Bounded, self-healing (the next beacon may win the race back), but a
@@ -549,7 +549,7 @@ impl VeilidNetHandle {
 
 /// A stable presence-slot id for a member — its identity pubkey, hex-encoded. A
 /// pure function of the member's stable identity, so a re-beacon overwrites the
-/// SAME [`rendezvous::current_state_subkey`] slot (last-writer-wins) and the gui +
+/// SAME `rendezvous::current_state_subkey` slot (last-writer-wins) and the gui +
 /// tui callers agree byte-for-byte. Owned here (not duplicated per caller) so the
 /// slot encoding has one home.
 pub fn member_slot_id(member_pubkey: &[u8]) -> String {

@@ -197,7 +197,7 @@ pub fn project_release_pubkey() -> &'static [u8; ml_dsa::PK_LEN] {
 }
 
 /// The **development** project-release SIGNING keypair (F17), from the in-source
-/// [`PROJECT_RELEASE_SEED`] — the dev analog of [`project_release_pubkey`], exposing
+/// `PROJECT_RELEASE_SEED` — the dev analog of [`project_release_pubkey`], exposing
 /// the key the dev composer signs MOTD/announcements with. Dev-only: retired when the
 /// seed becomes a baked-in pubkey with an offline secret. See ISA A0/A1.
 pub fn dev_project_release_keypair() -> Result<SignKeypair, KeyDerivationError> {
@@ -253,7 +253,7 @@ impl std::error::Error for AnnounceOwnerError {}
 /// Domain-separated from the F17 content-signing key (which uses `project_seed`
 /// as an ML-DSA seed directly), so a holder of one cannot derive the other. In
 /// production `project_seed` stays OFFLINE (maintainer-held) and only the derived
-/// owner PUBKEY is baked into clients; the in-source [`PROJECT_RELEASE_SEED`] is a
+/// owner PUBKEY is baked into clients; the in-source `PROJECT_RELEASE_SEED` is a
 /// dev placeholder (see [`dev_project_announce_veilid_owner_seed`]).
 pub fn derive_project_announce_veilid_owner_seed(
     project_seed: &[u8; 32],
@@ -267,7 +267,7 @@ pub fn derive_project_announce_veilid_owner_seed(
 }
 
 /// The **development** project-announce owner seed, derived from the in-source
-/// [`PROJECT_RELEASE_SEED`] placeholder (F17). The dev analog of
+/// `PROJECT_RELEASE_SEED` placeholder (F17). The dev analog of
 /// [`project_release_pubkey`]: during the private phase the project seed is
 /// in-source, so this exposes the dev channel's write-gate for the client composer
 /// and felt-tests. **Dev-only** — before the public repo opens, `PROJECT_RELEASE_SEED`
@@ -470,7 +470,7 @@ pub fn verify_artifact(
 // ── MOTD plaintext rule (ISC-S9) ─────────────────────────────────────────
 
 /// True if `text` is a valid single-line plaintext MOTD (ISC-S9 anti-injection):
-/// no forbidden character (see [`is_motd_forbidden_char`]). This enforces a
+/// no forbidden character (see `is_motd_forbidden_char`). This enforces a
 /// single line with no embedded control / line-break / direction-spoofing
 /// sequences. Markdown/HTML/link *rendering* is the client's verbatim-render
 /// obligation, not server-detectable.

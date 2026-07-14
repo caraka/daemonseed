@@ -25,7 +25,7 @@
 //! sharer's stable identity), the sharer's Veilid private-route blob, and an
 //! ML-DSA-87 signature binding `share_id ‖ route_blob`. A fetcher
 //! `open_announcement`s the item (provenance → announcer pubkey + share_id), THEN
-//! [`verify_route_advert`](daemonseed_veilid_net::verify_route_advert)s the route
+//! [`verify_route_advert`]s the route
 //! against that pubkey before importing it — a man-in-the-middle on the
 //! world-writable lobby record cannot redirect a fetch onto a rogue route. Content
 //! chunks are SHA-384-verified inside `fetch_chunk` (ISC-S28).

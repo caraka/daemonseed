@@ -17,11 +17,9 @@
 //! - `install-hooks` — install the workspace's git pre-push hook into the
 //!   active checkout's `.git/hooks/` (or into a `--target` directory).
 //!   Idempotent; overwrites a previously-installed hook in-place.
-//! - `mvp-gate` — run the M11 MVP-gate scenario end-to-end. Builds the
-//!   server + TUI binaries in release mode, then drives the 4-daemon PTY
-//!   harness in `daemonseed-integration-tests::tests::subprocess_gate`
-//!   and propagates its pass/fail bit as the xtask exit code
-//!   (ISC-42, 44).
+//! - `release-gate` — run the full Definition-of-Done gate and refuse a
+//!   non-zero exit if any check is red, so a release tag is never cut on a
+//!   red tree. Run before `git tag`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -71,28 +69,6 @@ enum Cmd {
         #[arg(long)]
         target: Option<PathBuf>,
     },
-    /// Run the M11 MVP-gate scenario. Builds `daemonseed-server` and
-    /// `daemonseed-tui` in release mode, then runs the 4-daemon PTY
-    /// harness `subprocess_gate` (an `#[ignore]`-gated integration test).
-    /// Exit code propagates the gate's pass/fail bit (ISC-42 / 44).
-    MvpGate {
-        /// Skip the release build step and assume the binaries are already
-        /// built. Useful when iterating on the harness itself; the harness
-        /// surfaces a friendly error if the binaries are missing.
-        #[arg(long)]
-        skip_build: bool,
-    },
-    /// Run the M11 wire-shape regression: spawns a real
-    /// `daemonseed-server`, drives a TLS 1.3 handshake, captures the
-    /// observable wire features, and runs them through the Wu et al.
-    /// (USENIX Security 2023) negative-allowlist classifier (ISC-49 / 50).
-    /// Exit code propagates the classifier's verdict.
-    WireShape {
-        /// Skip the release build step and assume the server binary is
-        /// already built.
-        #[arg(long)]
-        skip_build: bool,
-    },
     /// Run the full Definition-of-Done gate (fmt, clippy workspace +
     /// gui/desktop, test --workspace, check-proto, isc-coverage) and refuse
     /// (non-zero exit) if any check is red — so a release tag is never cut on a
@@ -107,8 +83,6 @@ fn main() -> Result<()> {
         Cmd::IscCoverage { min } => isc_coverage(min),
         Cmd::FindingsResolved { draft } => findings_resolved(draft),
         Cmd::InstallHooks { target } => install_hooks(target),
-        Cmd::MvpGate { skip_build } => mvp_gate(skip_build),
-        Cmd::WireShape { skip_build } => wire_shape(skip_build),
         Cmd::ReleaseGate => release_gate(),
     }
 }
@@ -463,7 +437,7 @@ fn diff_generated_dirs(snapshot: &Path, fresh: &Path) -> Result<Vec<String>> {
     Ok(diffs)
 }
 
-// ── mvp-gate ────────────────────────────────────────────────────────
+// ── release-gate helpers ─────────────────────────────────────────────
 
 /// Locate the workspace root from xtask's own manifest dir. xtask lives
 /// at `<repo>/xtask/`, so the repo root is `parent()` — kept local
@@ -476,100 +450,11 @@ fn workspace_root_from_xtask() -> Result<PathBuf> {
         .context("xtask manifest dir has no parent")
 }
 
-/// Cargo binary the operator's `cargo xtask mvp-gate` invocation ran
-/// through. Cargo sets `CARGO` for subcommands; falling back to plain
-/// `"cargo"` keeps the path manual-invoke-friendly.
+/// Cargo binary the operator's `cargo xtask` invocation ran through. Cargo
+/// sets `CARGO` for subcommands; falling back to plain `"cargo"` keeps the
+/// path manual-invoke-friendly.
 fn cargo_bin() -> std::ffi::OsString {
     std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into())
-}
-
-fn mvp_gate(skip_build: bool) -> Result<()> {
-    let repo = workspace_root_from_xtask()?;
-    let cargo = cargo_bin();
-
-    if !skip_build {
-        println!("mvp-gate: building release binaries (server + tui)…");
-        let status = Command::new(&cargo)
-            .current_dir(&repo)
-            .args([
-                "build",
-                "--release",
-                "--bin",
-                "daemonseed-server",
-                "--bin",
-                "daemonseed-tui",
-            ])
-            .status()
-            .context("spawn cargo build")?;
-        if !status.success() {
-            bail!("mvp-gate: release build failed (exit {status})");
-        }
-    } else {
-        println!("mvp-gate: --skip-build set, assuming binaries already exist");
-    }
-
-    println!("mvp-gate: running subprocess_gate harness (4 daemons × 1 server)…");
-    let status = Command::new(&cargo)
-        .current_dir(&repo)
-        .args([
-            "test",
-            "--release",
-            "-p",
-            "daemonseed-integration-tests",
-            "--test",
-            "subprocess_gate",
-            "--",
-            "--ignored",
-            "--nocapture",
-        ])
-        .status()
-        .context("spawn cargo test for subprocess_gate")?;
-    if !status.success() {
-        bail!("mvp-gate: FAIL (exit {status}) — see structured report above");
-    }
-    println!("mvp-gate: PASS");
-    Ok(())
-}
-
-fn wire_shape(skip_build: bool) -> Result<()> {
-    let repo = workspace_root_from_xtask()?;
-    let cargo = cargo_bin();
-
-    if !skip_build {
-        println!("wire-shape: building release server binary…");
-        let status = Command::new(&cargo)
-            .current_dir(&repo)
-            .args(["build", "--release", "--bin", "daemonseed-server"])
-            .status()
-            .context("spawn cargo build")?;
-        if !status.success() {
-            bail!("wire-shape: release build failed (exit {status})");
-        }
-    } else {
-        println!("wire-shape: --skip-build set, assuming server binary exists");
-    }
-
-    println!("wire-shape: running usenix_wire_shape classifier against real handshake…");
-    let status = Command::new(&cargo)
-        .current_dir(&repo)
-        .args([
-            "test",
-            "--release",
-            "-p",
-            "daemonseed-integration-tests",
-            "--test",
-            "usenix_wire_shape",
-            "--",
-            "--ignored",
-            "--nocapture",
-        ])
-        .status()
-        .context("spawn cargo test for usenix_wire_shape")?;
-    if !status.success() {
-        bail!("wire-shape: FAIL (exit {status}) — classifier rejected the handshake");
-    }
-    println!("wire-shape: PASS");
-    Ok(())
 }
 
 // ── release-gate ─────────────────────────────────────────────────────

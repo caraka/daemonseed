@@ -15,15 +15,15 @@
 //!
 //! - The transport contract: [`StableSigningKey`], [`NetCommand`], [`NetEvent`],
 //!   [`ShareManifestEntry`], and [`NetHandle`] — shared by the binary, [`crate::app`],
-//!   and the Veilid actor ([`crate::veilid_net`]).
+//!   and the Veilid actor (`crate::veilid_net`).
 //! - The transport-agnostic helpers the Veilid actor and the app reuse:
-//!   [`now_unix_ms`], and the share-download path helpers [`resolve_share_folder`],
-//!   [`sanitize_rel_path`], [`render_downloads_idx`], and [`cleanup_written`].
+//!   `now_unix_ms`, and the share-download path helpers `resolve_share_folder`,
+//!   `sanitize_rel_path`, `render_downloads_idx`, and `cleanup_written`.
 //!
 //! ## Transport
 //!
 //! Veilid is the only transport. [`NetHandle::new`] spawns
-//! [`crate::veilid_net::veilid_net_actor`]; the UI drives the same
+//! `crate::veilid_net::veilid_net_actor`; the UI drives the same
 //! `NetCommand`/`NetEvent` contract over Veilid.
 
 use std::path::PathBuf;
@@ -103,7 +103,7 @@ pub enum NetCommand {
     /// with `SendChat`). The relay never sees it in cleartext (ISC-A-S16).
     SendPublicRoom { body: String, sender_handle: String },
     /// Define (activate) a local share root (M14, ISC-C21 / ISC-A-C7). Opens
-    /// the redb [`ShareIndex`] at `index_path` under `index_key` (the
+    /// the redb `ShareIndex` at `index_path` under `index_key` (the
     /// share-index key derived as a sibling of the at-rest key — the actor never
     /// re-derives it), retains it for foreground queries, and runs a cold scan
     /// of `root` on a dedicated blocking thread so the net task is never blocked.
@@ -126,10 +126,10 @@ pub enum NetCommand {
     /// In the unified share model this also posts a sealed [`wire::ShareRollCall`]
     /// to the lobby (the single late-join hook — startup, the Refresh action, and
     /// the reconcile timer all route through here) so live sharers re-announce,
-    /// then snapshots the in-band [`ShareCatalog`] as the `remote` rows.
+    /// then snapshots the in-band `ShareCatalog` as the `remote` rows.
     RefreshShares,
     /// Internal: a verified lobby [`wire::ShareAnnouncement`] the inbound reader
-    /// opened, to fold into the actor's [`ShareCatalog`] (all catalog mutation
+    /// opened, to fold into the actor's `ShareCatalog` (all catalog mutation
     /// stays on `&mut self`). Posted by the inbound reader; never sent
     /// by the binary. Emits a fresh [`NetEvent::SharesSnapshot`] on a real change.
     ApplyAnnouncement(Box<wire::ShareAnnouncement>),
@@ -144,10 +144,10 @@ pub enum NetCommand {
     /// Internal: the presence-heartbeat tick (#74) — emit one sealed member
     /// beacon into the lobby and each joined circle, then `reap` every tracker so
     /// members past their TTL age out (the timer is the reap clock too).
-    /// Self-scheduled on [`next_heartbeat_interval`]; never sent by the binary.
+    /// Self-scheduled on `next_heartbeat_interval`; never sent by the binary.
     EmitHeartbeat,
     /// Internal: a verified member heartbeat the inbound reader opened, to fold
-    /// into the matching room/circle's [`PresenceTracker`] (all tracker mutation
+    /// into the matching room/circle's `PresenceTracker` (all tracker mutation
     /// stays on `&mut self`). `room` is the session-local routing key — the lobby
     /// room name for a lobby beacon, the circle's label for a circle beacon.
     /// Boxed because [`wire::MemberHeartbeat`] is large (mirrors
@@ -159,23 +159,23 @@ pub enum NetCommand {
     },
     /// Refresh the public-space snapshot (ISC-25 / ISC-S7 / ISC-A-S3): fetch the
     /// connected relay's MOTD, announcement posts, and published signer
-    /// whitelist over the live [`AppSession`], render the MOTD as inert text,
+    /// whitelist over the live `AppSession`, render the MOTD as inert text,
     /// and re-verify each post against the whitelist client-side. A read-only
     /// operation emitted as a single [`NetEvent::PublicSpaceSnapshot`].
     RefreshPublicSpace,
     /// (#92) Signer authoring: sign an announcement post with the held stable
-    /// identity key ([`sign_post`]) and upload it via `UploadPost`, then refresh.
+    /// identity key (`sign_post`) and upload it via `UploadPost`, then refresh.
     /// A no-op surfaced as [`NetEvent::PublicSpaceError`] when no stable key is held
     /// (non-signer / ephemeral) or no session is live; the relay independently
     /// re-verifies the signature against the published whitelist (ISC-S8).
     UploadAnnouncement { topic: String, body: String },
     /// (#92) Signer authoring: sign a MOTD with the held stable identity key
-    /// ([`sign_motd`], which enforces the ISC-S9 single-line-plaintext rule) and
+    /// (`sign_motd`, which enforces the ISC-S9 single-line-plaintext rule) and
     /// upload it via `UploadMotd` (#89), then refresh. Non-plaintext text is
     /// rejected BEFORE upload and surfaced as [`NetEvent::PublicSpaceError`].
     SetMotd { text: String },
     /// Refresh the suite-deprecation policy (ISC-C25 / ISC-A-S11 / ISC-C28):
-    /// fetch the connected relay's signed policy over the live [`AppSession`],
+    /// fetch the connected relay's signed policy over the live `AppSession`,
     /// verify its ML-DSA-87 signature against the pinned server-wide key,
     /// anti-rollback-check it against the cached version, and surface a warning
     /// row for each in-use suite the policy schedules for retirement. A
@@ -199,7 +199,7 @@ pub enum NetCommand {
     /// `name` is the sharer-advertised listing name, recorded in the fetched
     /// manifest. `fetched_root` is the on-disk landing zone (the binary supplies
     /// `<profile-root>/fetched`); on a fully-verified fetch the actor persists
-    /// every file there via [`FetchedStore`] and emits a fresh
+    /// every file there via `FetchedStore` and emits a fresh
     /// [`NetEvent::FetchedShares`] (M15 C; ISC-C63 / C64). A fetch that fails
     /// verification never persists (ISC-A-C31).
     FetchShare {
@@ -226,7 +226,7 @@ pub enum NetCommand {
         selected: Option<Vec<usize>>,
         /// True when `fetched_root` is an explicit user-chosen destination
         /// (ISC-C68): files land directly under it, rebased so the selected
-        /// item is the top-level entry ([`rebase_to_selection_root`]), with no
+        /// item is the top-level entry (`rebase_to_selection_root`), with no
         /// per-share folder and no `downloads.idx` written into the user's
         /// directory. False for the managed downloads dir, which keeps the
         /// namespaced `<share>/<rel_path>` layout and the browse manifest.
@@ -239,14 +239,14 @@ pub enum NetCommand {
     /// Refresh the introducer-discovered candidate peers for the Servers pane
     /// (M12 gate step 6, ISC-C22 / ISC-S6 / ISC-A-C19). Ask the connected
     /// relay's `FederationIntroducer` for its peer list over the live
-    /// [`AppSession`] and merge the result into the actor's [`DiscoveredPeers`]
+    /// `AppSession` and merge the result into the actor's `DiscoveredPeers`
     /// cache as candidates, then emit the candidate `(server_id, address)`
     /// pairs as a single [`NetEvent::IntroducerSnapshot`].
     ///
     /// Precautionary by construction: discovery records *candidates only* and
     /// NEVER writes the trust set (ISC-A-C19) — promotion to a trusted/untrusted
-    /// server stays the explicit user action ([`DiscoveredPeers::promote_trusted`]
-    /// / [`DiscoveredPeers::promote_untrusted`]). The introducer response carries
+    /// server stays the explicit user action (`DiscoveredPeers::promote_trusted`
+    /// / `DiscoveredPeers::promote_untrusted`). The introducer response carries
     /// no key material (ISC-S6), so the snapshot it produces is server-id +
     /// address only. A read-only operation against an already-shipped gRPC
     /// service — no new wire protocol.
@@ -254,13 +254,13 @@ pub enum NetCommand {
     /// Publish a defined share to the connected relay and serve its content
     /// from disk (D, M15 → serve-from-disk, M16; ISC-S27 / ISC-S29 / F25).
     /// Hashes `root` into a manifest on a dedicated blocking thread —
-    /// [`cached_or_hash`] reuses redb-cached chunk addresses when the actor's
-    /// single-active [`ShareIndex`] is for this root, hashing only the misses —
+    /// `cached_or_hash` reuses redb-cached chunk addresses when the actor's
+    /// single-active `ShareIndex` is for this root, hashing only the misses —
     /// so the actor keeps draining commands while a large share hashes.
     /// Per-file progress arrives as `NetEvent::PublishProgress`; the hash is
     /// cancellable via [`NetCommand::CancelPublish`]. On success the listing is
     /// published via `PublishShare` to learn the server-assigned `share_id`,
-    /// then a `serve_share` task holding a [`DiskShareContent`] (manifest in
+    /// then a `serve_share` task holding a `DiskShareContent` (manifest in
     /// RAM, file bytes read from disk per request) answers fetchers'
     /// manifest/chunk requests over the share's CoT fetch-asset for as long as
     /// the session is up ("you must be online to share" — the relay reaps the
@@ -275,8 +275,8 @@ pub enum NetCommand {
         sharer_handle: String,
     },
     /// Cancel an in-flight publish hash for `root` (M16 serve-from-disk).
-    /// Sets that publish's cancel flag so the blocking [`cached_or_hash`]
-    /// returns [`ServeError::Cancelled`] at its next per-file check and the
+    /// Sets that publish's cancel flag so the blocking `cached_or_hash`
+    /// returns `ServeError::Cancelled` at its next per-file check and the
     /// publish flow emits `NetEvent::PublishCancelled` instead of proceeding
     /// to the RPC. A no-op when no hash for `root` is in flight (the cancel
     /// raced a completion, or the share is already serving — stopping a
@@ -433,7 +433,7 @@ pub enum NetEvent {
     PublicSpaceSnapshot {
         motd: Option<String>,
         posts: Vec<PublicPostRow>,
-        /// (#92) signer-gating verdict ([`composer_visible`]): true iff the held
+        /// (#92) signer-gating verdict (`composer_visible`): true iff the held
         /// stable identity key is on the relay's published whitelist, gating the
         /// composer affordance. False for a non-signer or the ephemeral path.
         can_compose: bool,
@@ -535,7 +535,7 @@ pub enum NetEvent {
         file_count: usize,
     },
     /// Per-file progress on an in-flight publish hash (M16 serve-from-disk).
-    /// Emitted from the blocking [`cached_or_hash`] thread once per file
+    /// Emitted from the blocking `cached_or_hash` thread once per file
     /// (`done` strictly advances — the throttle), so the app can render a
     /// "hashing N/M" status and offer `[u]` as the cancel affordance while the
     /// actor stays responsive. `root` is the defined-root key (client-local
@@ -581,10 +581,10 @@ impl NetHandle {
     /// Spawn a dedicated network thread running a current-thread tokio runtime
     /// (inside a [`tokio::task::LocalSet`]) and the actor loop.
     ///
-    /// A *current-thread* runtime + `LocalSet` is deliberate: [`connect_session`]
+    /// A *current-thread* runtime + `LocalSet` is deliberate: `connect_session`
     /// takes `&mut dyn TrustStore`, which is not `Send`, so its future cannot be
     /// `tokio::spawn`ed onto a multi-thread runtime; and the circle inbound-reader
-    /// task holds an [`Rc`] of the circle key. Driving everything on one thread
+    /// task holds an `Rc` of the circle key. Driving everything on one thread
     /// via `block_on` + `spawn_local` sidesteps both `Send` bounds.
     ///
     /// Caller contract: the process-wide CryptoProvider must already be

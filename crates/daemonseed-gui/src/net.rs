@@ -133,7 +133,7 @@ pub enum NetCommand {
     ///
     /// `#[cfg_attr(not(test), allow(dead_code))]`: constructed by the in-process
     /// round-trip oracle today; the attended Shares-tab wiring constructs it in the
-    /// bin (same convention as [`NetCommand::JoinRoom`]).
+    /// bin (same convention as [`NetCommand::JoinCircle`]).
     #[cfg_attr(not(test), allow(dead_code))]
     PublishShare {
         root: PathBuf,
@@ -142,7 +142,7 @@ pub enum NetCommand {
     },
     /// Stop serving and unpublish a share published this session. Aborts the serve
     /// task and posts a withdraw `wire::ShareAnnouncement` to the lobby so
-    /// listeners drop the share from their [`ShareCatalog`] (unified share model).
+    /// listeners drop the share from their [`daemonseed_core::share_catalog::ShareCatalog`] (unified share model).
     #[cfg_attr(not(test), allow(dead_code))]
     UnpublishShare { share_id: String },
     /// Graceful-close (business-as-usual on quit): withdraw EVERY owned share, then
@@ -159,7 +159,7 @@ pub enum NetCommand {
     /// The single late-join hook (unified share model): post a sealed
     /// `wire::ShareRollCall` to the lobby (startup, the Refresh action, and the
     /// reconcile timer all route through here) so live sharers re-announce, then
-    /// snapshot the in-band [`ShareCatalog`] as the `remote` rows of a single
+    /// snapshot the in-band [`daemonseed_core::share_catalog::ShareCatalog`] as the `remote` rows of a single
     /// [`NetEvent::SharesSnapshot`]. Read-only; no scan. Rides the ~3 s liveness
     /// auto-poll, so it stays a cheap local re-render (no DHT work).
     #[cfg_attr(not(test), allow(dead_code))]
@@ -180,7 +180,7 @@ pub enum NetCommand {
     #[cfg_attr(not(test), allow(dead_code))]
     RefreshPublicSpace,
     /// (#92) Signer authoring: sign an announcement post with the held stable
-    /// identity key ([`sign_post`]) and upload it via `UploadPost`, then refresh
+    /// identity key ([`daemonseed_cli::public_space::sign_post`]) and upload it via `UploadPost`, then refresh
     /// the public space so the new post appears. A no-op (surfaced as
     /// [`NetEvent::PublicSpaceError`]) when no stable key is held (non-signer /
     /// ephemeral) or no session is live. The relay re-verifies the signature
@@ -189,7 +189,7 @@ pub enum NetCommand {
     #[cfg_attr(not(test), allow(dead_code))]
     UploadAnnouncement { topic: String, body: String },
     /// (#92) Signer authoring: sign a MOTD with the held stable identity key
-    /// ([`sign_motd`], which enforces the ISC-S9 single-line-plaintext rule) and
+    /// ([`daemonseed_cli::public_space::sign_motd`], which enforces the ISC-S9 single-line-plaintext rule) and
     /// upload it via `UploadMotd` (#89), then refresh. Non-plaintext text is
     /// rejected BEFORE upload and surfaced as [`NetEvent::PublicSpaceError`]. Same
     /// no-stable-key / no-session guard as [`NetCommand::UploadAnnouncement`].
@@ -311,7 +311,7 @@ pub enum NetEvent {
     /// MOTD (if present and verified) and the verified announcement rows — assembled
     /// client-side from verified artifacts (ISC-A-S3: nothing the relay
     /// asserts is trusted). `can_compose` (#92) is the signer-gating verdict
-    /// ([`composer_visible`]): true iff the held stable identity key is on the
+    /// ([`daemonseed_cli::public_space::composer_visible`]): true iff the held stable identity key is on the
     /// relay's published whitelist, gating the composer affordance — false for a
     /// non-signer or the ephemeral / no-profile path. The `main.rs` arm renders the
     /// `view` into the announcements pane and shows/hides the composer. The client
@@ -594,7 +594,7 @@ pub(crate) fn roster_render_changed(
 }
 
 /// Build the roster rows from a presence tracker's current members. Mirrors
-/// [`PresenceTracker::members`] ordering (handle, then pubkey) for a stable view,
+/// [`daemonseed_core::presence::PresenceTracker::members`] ordering (handle, then pubkey) for a stable view,
 /// and binds each row's `fingerprint` to the verified pubkey via
 /// [`member_fingerprint`]. Keying lives in the tracker (by pubkey), so two members
 /// sharing a display name yield two distinct rows here.

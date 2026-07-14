@@ -153,7 +153,7 @@ impl ShareCatalog {
     /// An absent / non-48-byte / non-derivable announcement folds nothing, with no
     /// legacy or owner-binding fallback arm (design §2/§3/§5 anti-requirement): an
     /// attacker can no longer occupy or censor a scraped victim `share_id` by
-    /// pairing it with its own key. Callers MUST use this (not the raw [`apply`],
+    /// pairing it with its own key. Callers MUST use this (not the raw `apply`,
     /// which is the pure catalog logic and does NOT check the binding).
     pub fn apply_verified(&mut self, ann: &wire::ShareAnnouncement, now: Instant) -> CatalogChange {
         if !share_binding_is_valid(ann) {
@@ -166,7 +166,7 @@ impl ShareCatalog {
     /// `open_announcement`'d it (so provenance is verified) and confirmed it
     /// belongs to this catalog's room. `now` is the local monotonic receive time.
     ///
-    /// **The v2 binding is NOT checked here — call [`apply_verified`] at every
+    /// **The v2 binding is NOT checked here — call `apply_verified` at every
     /// ingest point (#156).** This is the pure catalog state machine (continuity /
     /// ordering / TTL), left directly callable for unit tests that exercise that
     /// logic without constructing a fully-derived announcement.

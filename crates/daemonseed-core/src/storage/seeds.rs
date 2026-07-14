@@ -787,7 +787,7 @@ pub struct Opened {
     pub key: SealingKey,
     /// The share-index key (M14), derived as a sibling of `key` from the *same*
     /// Argon2id run via a second domain-separated HKDF-Expand. The Unlock path
-    /// hands this to the running client to open the redb [`ShareIndex`]
+    /// hands this to the running client to open the redb `ShareIndex`
     /// (`crate::storage::share_index`) for free — no extra Argon2id.
     pub index_key: IndexKey,
 }
@@ -923,7 +923,7 @@ impl core::fmt::Debug for SealingKey {
 /// A cached share-index key (M14) derived as a sibling of the at-rest
 /// [`SealingKey`] from the *same* single Argon2id run — one expensive KDF, two
 /// domain-separated HKDF-Expand outputs. Opens the redb
-/// [`ShareIndex`](crate::storage::share_index::ShareIndex). Zeroizes on drop; it
+/// `ShareIndex`(crate::storage::share_index::ShareIndex). Zeroizes on drop; it
 /// is a session secret on par with the at-rest key — never log or persist it.
 #[derive(Clone)]
 pub struct IndexKey(Zeroizing<[u8; INDEX_KEY_LEN]>);

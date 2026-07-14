@@ -343,7 +343,7 @@ fn sanitize_rel_path(rel: &str) -> Result<PathBuf, FetchedError> {
 ///
 /// Inputs are `/`-separated wire paths; outputs are `/`-separated and still
 /// strictly relative (only leading components are dropped), so the per-file
-/// [`sanitize_rel_path`] guard at write time remains the traversal authority.
+/// `sanitize_rel_path` guard at write time remains the traversal authority.
 pub fn rebase_to_selection_root(rel_paths: &[&str]) -> Vec<String> {
     match rel_paths {
         [] => Vec::new(),

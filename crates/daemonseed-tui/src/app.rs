@@ -267,7 +267,7 @@ pub enum IndexerStatus {
 
 /// A user request to define (add) a local share root (M14, ISC-C21).
 ///
-/// Produced by [`App::on_key_define_share`] when the user enters a valid
+/// Produced by `App::on_key_define_share` when the user enters a valid
 /// directory path in the Define-Share box, drained by the binary via
 /// [`App::take_pending_share_define`]. The binary derives the redb index-file
 /// path and the share-index key (the [`daemonseed_core::storage::seeds::IndexKey`]
@@ -673,8 +673,8 @@ pub struct ChatSend {
 /// A joined circle (the private opt-in, ISC-14) wins over a joined public room
 /// (the default surface, ISC-S22 / ISC-C56). [`App::active_chat_surface`] is the
 /// single source of truth for this precedence: both the Enter handler
-/// ([`App::on_key_chat`]) and the compose-box indicator
-/// ([`crate::ui::render_main_input`]) resolve the target through it, so the
+/// (`App::on_key_chat`) and the compose-box indicator
+/// (`crate::ui::render_main_input`) resolve the target through it, so the
 /// indicator can never claim a different surface than the one a post lands on.
 /// That divergence — the handler posting to the auto-joined lobby while the user
 /// believed they were posting to their joined circle — was the v0.15.1
@@ -2153,7 +2153,7 @@ impl App {
 
     /// (#156) Derive the STABLE share-root IKM from the unlocked profile's
     /// mnemonic — the fourth expansion of the same identity PRK as
-    /// [`stable_signing_key`] — for the binary to hand to the veilid actor on
+    /// `stable_signing_key` — for the binary to hand to the veilid actor on
     /// Connect, so a published share derives a receiver-verifiable `share_id`.
     /// `None` on the ephemeral / no-profile path or if derivation fails.
     pub fn stable_share_root_ikm(&self) -> Option<daemonseed_core::identity::keys::ShareRootIkm> {

@@ -1,7 +1,7 @@
 //! First-start flow component (ISC-C29 family).
 //!
 //! Drives the core type-state machine
-//! [`daemonseed_core::first_start::orchestrator::FirstStart`] through the cold
+//! `daemonseed_core::first_start::orchestrator::FirstStart` through the cold
 //! first-start: passphrase (with a live C12 strength meter) → 24-word mnemonic
 //! display → backup verification. The DEFAULT backup verification (Item C /
 //! ISC-C47) is the 3-word random type-back (C34); the full-24 re-type

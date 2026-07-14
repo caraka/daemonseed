@@ -2,7 +2,7 @@
 //! discovery; design-of-record: `docs/design/unified-share-model.md`).
 //!
 //! A [`wire::ShareRollCall`] is the *request* half of in-band discovery; a
-//! [`crate::share_announce::wire::ShareAnnouncement`] is the *response*. Because
+//! `crate::share_announce::wire::ShareAnnouncement` is the *response*. Because
 //! the relay is a pure blind forwarder it cannot tell live sharers that a new
 //! member subscribed, so fast late-join is pull-based: a joining or refreshing
 //! client posts a sealed roll-call into the room, and every currently-connected

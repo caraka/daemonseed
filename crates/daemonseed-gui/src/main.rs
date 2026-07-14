@@ -1,16 +1,15 @@
-//! daemonseed-gui — Slint client.
+//! daemonseed-gui — Slint client for the Veilid-native daemonseed.
 //!
-//! Round 2 made the shell **interactive** over a RAM-only per-circle [`state`]
-//! layer (click-to-switch rail; each circle keeps its own draft + scroll). Round 3
-//! wired the **public Lobby room to real networking** (the [`net`] actor). Round 4
-//! adds **circle plumbing**: Join-a-circle and New-circle flows that *materialize*
-//! a circle into the rail at runtime, each carrying the net contract (phrase →
-//! `derive_cot_key` → `CotKey` + a rendezvous slot). Round 5 **wires those circles
-//! to the network**: materialize fires `NetCommand::JoinCircle{circle_id, phrase}`
-//! and the composer Send on a materialized circle fires `SendCircle{circle_id}` —
-//! real sealed circle chat over the relay (mirroring the Lobby path), routed back
-//! into the right circle by `circle_id`. The binary seeds **Lobby-only**
-//! (empty-state for circles; the Lobby stays pinned + real).
+//! A serverless, end-to-end-encrypted client: there is no relay and no TLS
+//! handshake — all transport rides the Veilid DHT via the [`veilid_net`] actor
+//! (behind the [`net`] `NetCommand`/`NetEvent` contract). The shell is
+//! interactive over a RAM-only per-circle [`state`] layer (click-to-switch
+//! rail; each circle keeps its own draft + scroll): a pinned public **Lobby**
+//! room, plus **circles** that materialize into the rail at runtime (phrase →
+//! `derive_cot_key` → `CotKey` + a world-derivable Veilid rendezvous). Each
+//! surface carries member **presence**, in-band **share** discovery, and
+//! operator **announcements / MOTD**; sealed messages route back into the
+//! right circle by `circle_id`.
 //!
 //! Two run modes. **Windowed** (the `desktop` feature) opens a real winit window,
 //! software-rendered (no GL) — the felt-test surface. **Offscreen** renders the

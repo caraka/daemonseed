@@ -1,12 +1,11 @@
-//! daemonseed-tui — interactive terminal client (M11 MVP gate).
+//! daemonseed-tui — interactive terminal client for the Veilid-native daemonseed.
 //!
-//! The TUI is the product surface for the MVP: a [`ratatui`] client that
-//! drives the full daemonseed transaction — first-start (mnemonic, passphrase,
-//! recovery), connect + identity-proof,
-//! public-space, circle-of-trust chat, file share/fetch, the C22 per-server
-//! trust slider, the C28 trust-event taxonomy, and the F22 server-management
-//! screen (which also surfaces introducer-discovered candidate peers read-only,
-//! M12 gate step 6 — discovery never auto-trusts, ISC-A-C19).
+//! A serverless, end-to-end-encrypted [`ratatui`] client: no relay and no TLS
+//! handshake — all transport rides the Veilid DHT via the crate's `veilid_net`
+//! actor (behind the [`net`] `NetCommand`/`NetEvent` contract). It drives
+//! first-start (mnemonic, passphrase, recovery) and then the live session — the
+//! public **Lobby** room, **circles** of trust, member **presence**, in-band
+//! **share** discovery/fetch, and operator **announcements / MOTD**.
 //!
 //! ## Multi-circle carousel (ISC-C59..C62 / A-C29 / A-C30)
 //!
@@ -29,8 +28,8 @@
 //!
 //! ## Architecture
 //!
-//! The interactive logic is split out of the binary so the M11 gate harness
-//! and unit tests can drive it without a real terminal:
+//! The interactive logic is split out of the binary so unit tests can drive
+//! it without a real terminal:
 //!
 //! - [`app::App`] — the screen state machine. Pure state + key handling; no
 //!   terminal I/O. Every navigation and input transition is unit-testable.
@@ -40,7 +39,7 @@
 //!   alternate screen) and the event loop, and hosts the tokio runtime that
 //!   runs network operations off the render thread.
 //!
-//! Keeping `App` terminal-free is what makes the PTY gate harness deterministic:
+//! Keeping `App` terminal-free is what makes it deterministically testable:
 //! the render is a pure function of state, and state advances only through
 //! [`app::App::on_key`] (and, later, network-result messages).
 

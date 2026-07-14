@@ -48,7 +48,7 @@ pub struct AnnouncementRow {
 }
 
 /// The verified display model for the announcements/MOTD pane (#91). `motd` is the
-/// connected relay's inert verbatim MOTD ([`render_motd`]) and is `None` both when
+/// connected relay's inert verbatim MOTD ([`daemonseed_cli::public_space::render_motd`]) and is `None` both when
 /// the relay serves no MOTD AND when a served MOTD fails re-verification (display
 /// only what verifies, ISC-A-S3). `posts` are the verified announcement rows, in
 /// served order.

@@ -352,7 +352,7 @@ impl WriteScheduler {
 
     /// As [`Self::spawn`], but publishes the **DHT-weather regime estimator** (WB-5.1 /
     /// I5″.6) into `latency_probe` on each non-chat completion — the MEDIAN (millis) of
-    /// the last [`LATENCY_WINDOW`] enqueue-to-ack latencies. The presence reaper reads
+    /// the last `LATENCY_WINDOW` enqueue-to-ack latencies. The presence reaper reads
     /// it (through the `ReapGate` hysteresis band + resume grace) to suspend reaping
     /// while the DHT regime is elevated (WB-1.10 / WB-ISC-5), and the UI honesty state
     /// consumes it for the "presence may be stale" signal. Observable only — no consumer
@@ -390,13 +390,13 @@ struct State<D> {
     /// neither consumes nor releases a window slot.
     floor_in_flight: usize,
     /// The published **DHT-weather regime estimator** (WB-5.1 / I5″.6): the **median**
-    /// (millis) of the last [`LATENCY_WINDOW`] non-chat enqueue-to-ack latencies,
+    /// (millis) of the last `LATENCY_WINDOW` non-chat enqueue-to-ack latencies,
     /// exposed for the presence reaper (WB-1.10 reap-in-calm, via the `ReapGate`
     /// band+grace) and the UI honesty state. OBSERVABLE only — no consumer may enqueue
     /// writes from it (I9 stands). A median needs 3 of 5 recent completions on the far
     /// side to cross, so it is robust to a single outlier in both directions.
     latency_probe: Arc<AtomicU64>,
-    /// The rolling window of the last [`LATENCY_WINDOW`] non-chat latencies behind
+    /// The rolling window of the last `LATENCY_WINDOW` non-chat latencies behind
     /// [`Self::latency_probe`] (WB-5.1 / I5″.6 median-of-5, replacing the EMA).
     latency_ring: VecDeque<u64>,
     seq: u64,
@@ -1736,7 +1736,7 @@ mod tests {
     }
 
     // ── WB-ISC-18: median-of-5 DHT-weather estimator ─────────────────────────
-    /// The published regime signal is the MEDIAN of the last [`LATENCY_WINDOW`] non-chat
+    /// The published regime signal is the MEDIAN of the last `LATENCY_WINDOW` non-chat
     /// latencies (WB-5.1 / I5″.6), so a single fast (or slow) straggler amid a run cannot
     /// cross the band, and recovery takes 3 of 5 fast completions — replacing the EMA
     /// fast-exit chatter the freeze refuted.

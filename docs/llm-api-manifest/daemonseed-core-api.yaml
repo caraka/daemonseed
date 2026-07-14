@@ -4990,7 +4990,7 @@ functions:
     module: daemonseed_core::connection
     description: >-
       Consuming transition. Caller drives APP_HELLO frame I/O against the
-      transport via daemonseed_server::hello helpers before calling this.
+      transport before calling this.
     signature: "pub fn advance_to_versioned(self) -> Connection<Versioned, T>"
     parameters: []
     returns:

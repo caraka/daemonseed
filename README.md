@@ -50,10 +50,10 @@ daemonseed/
 │       └── daemonseed-gui-api.yaml
 │
 └── xtask/                                  workspace task runner: gen-proto, check-proto,
-                                            isc-coverage, findings-resolved, install-hooks
+                                            isc-coverage, findings-resolved, install-hooks, release-gate
 ```
 
-All six crates are substantive as of the alpha1 MVP (M12). The `tui` crate — the MVP product surface — is a ratatui client whose interactive logic is a terminal-free, unit-testable screen state machine reused over the proven cli client stack, exercised end-to-end by the 4-daemon PTY gate.
+The `tui` (ratatui) and `gui` (Slint) crates are the product surfaces; their interactive logic is a terminal-free / RAM-only, unit-testable screen state machine over the shared authoring library (`cli`) and the Veilid DHT transport (`daemonseed-veilid-net`). There is no relay — every client is a Veilid node.
 
 ## Status
 
