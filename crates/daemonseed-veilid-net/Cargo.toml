@@ -1,10 +1,8 @@
-# daemonseed Veilid transport — Phase 1.
+# daemonseed Veilid transport.
 #
-# In-tree on the veilid-migration branch but held in [workspace] exclude (its
-# own Cargo.lock) so veilid-core's dep tree never perturbs the frozen v0.32.0
-# relay lock. Productizes the PROVEN 1:1 path from veilid-ds-spike into a real
-# actor; circles/shares/presence are Phase 2+ stubs. Joins [workspace] members
-# at the v0.33.0 cutover, when daemonseed-server is disconnected.
+# A first-class [workspace] member sharing the unified workspace lock.
+# Productizes the PROVEN 1:1 path from veilid-ds-spike into a real actor; the
+# transport the GUI/TUI drive now that the relay (daemonseed-server) is gone.
 [package]
 name = "daemonseed-veilid-net"
 version = "0.1.0"

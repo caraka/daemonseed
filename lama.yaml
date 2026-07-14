@@ -75,12 +75,6 @@ crates:
     status: active
     manifest: "docs/llm-api-manifest/daemonseed-proto-protocol.yaml"
 
-  - name: daemonseed-server
-    purpose: "Relay daemon binary + library. TLS 1.3 termination, APP_HELLO negotiation, the post-HELLO identity-proof exchange that lands a connection at Authenticated (M4b), federation introducer/peering (M5), the post-Authenticated PublicSpace application-stream service (M6, gRPC-over-h2 via daemonseed_server::public_space), and the M8 CircleOfTrust live relay (daemonseed_server::cot) — refcounted bidirectional Subscribe fan-out keyed by rendezvous address, served alongside public-space with h2 keepalive driving reap-at-zero — the M9 RAM-only rate limiter (daemonseed_server::rate_limit) wired into the per-connection path with per-identity-key admission released via an RAII drop-guard on disconnect, and the M10 release boot-gate (daemonseed_server::boot_gate) that refuses to boot on failed release-signature verify (wiring into real startup deferred to M10-infra). M12 adds the FederationIntroducer gRPC endpoint (gate step 6); serve_application serves a single connection until real peer close (once().chain(pending()) + CloseNotify-driven shutdown). Public shares are discovered in-band over the subscribe stream — the relay holds no share registry."
-    license: AGPL-3.0-or-later
-    status: active
-    manifest: "docs/llm-api-manifest/daemonseed-server-api.yaml"
-
   - name: daemonseed-cli
     purpose: "Non-interactive scriptable client binary + library. `connect <server-id>` does TLS-1.3 + APP_HELLO + (M4b) client-side identity-proof, returning only after Authenticated. M12 adds the user-publish share subcommands `publish` / `unpublish` / `list-shares` over the PublicSpace RPCs (gate step 5); `publish` holds the connection open until Ctrl-C (you-must-be-online-to-share), and the share is RAM-only — reaped on disconnect (ISC-A-S1). The library side also carries the M6 public-space client plumbing and the M12 introducer refresh."
     license: AGPL-3.0-or-later
@@ -108,7 +102,7 @@ crates:
     manifest: "docs/llm-api-manifest/daemonseed-gui-api.yaml"
 
   - name: daemonseed-veilid-net
-    purpose: "Veilid transport layer — the AppSession replacement the GUI/TUI drive behind their `veilid` feature. An identity-bound Veilid node (VeilidNet::start) driven through a command-channel handle (VeilidNetHandle): sealed 1:1 messaging over a private route; circles + lobby / public rooms over a shared-owner DFLT DHT rendezvous (append-ring fan-out + backlog sweep + re-sweep recovery); public-share discovery via an anti-swap SIGNED route advert on the lobby rendezvous (DiscoveryEnvelope + verify_route_advert); and public-share content transfer owner-on-demand over app_call, fragment-reassembled and SHA-384-verified per chunk. Moves only opaque cot-sealed bytes (ISC-A-S2). Presence / announcements are Phase 4. Workspace-excluded until the v0.33.0 cutover."
+    purpose: "Veilid transport layer — the AppSession replacement the GUI/TUI drive behind their `veilid` feature. An identity-bound Veilid node (VeilidNet::start) driven through a command-channel handle (VeilidNetHandle): sealed 1:1 messaging over a private route; circles + lobby / public rooms over a shared-owner DFLT DHT rendezvous (append-ring fan-out + backlog sweep + re-sweep recovery); public-share discovery via an anti-swap SIGNED route advert on the lobby rendezvous (DiscoveryEnvelope + verify_route_advert); and public-share content transfer owner-on-demand over app_call, fragment-reassembled and SHA-384-verified per chunk. Moves only opaque cot-sealed bytes (ISC-A-S2). Presence / announcements are Phase 4."
     license: AGPL-3.0-or-later
     status: active
     manifest: "docs/llm-api-manifest/daemonseed-veilid-net-api.yaml"

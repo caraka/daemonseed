@@ -36,49 +36,7 @@ tower = { workspace = true }
 oxicrypt-module = { workspace = true }
 uuid = { workspace = true }
 
-# M4a commit 6 — full end-to-end TCP + TLS + APP_HELLO round-trip between
-# the real server runtime and the real CLI connect path. Both crates gain
-# `[lib]` targets in commits 4 and 5 so the harness drives them in-process.
-daemonseed-server = { path = "../daemonseed-server" }
-daemonseed-cli = { path = "../daemonseed-cli" }
-oxitls-rustls-provider = { workspace = true, features = ["testing"] }
-prost = { workspace = true }
+# On-disk temp layouts for the core-surface coverage tests.
 tempfile = { workspace = true }
-# M6 — content-address hex for post-file names in the public-space coverage test.
-hex = { workspace = true }
-# M11 — CoT chat round-trip e2e wraps the client's outbound subscribe mpsc as a
-# Stream for the bidirectional Subscribe RPC.
-tokio-stream = { workspace = true }
-
-# M11 — MVP-gate PTY harness (tests/common/gate.rs). Drives 4 real
-# `daemonseed-tui` subprocesses through PTY pairs + 1 plain
-# `daemonseed-server` subprocess. portable-pty is the only PTY-touching dep
-# anywhere in the workspace; it's confined to `[dev-dependencies]` so no
-# shipping crate compiles it — ISC-A1 (no test-only surface in ship
-# binaries) survives at the dependency layer too. vt100 wraps the raw PTY
-# byte stream into a terminal-emulated screen model so the gate's
-# assertions can match multi-word strings (mnemonic re-type, bootstrap
-# address, etc.) that ratatui's per-word cursor-positioning interleaves
-# with control sequences.
-portable-pty = { workspace = true }
-vt100 = { workspace = true }
-anyhow = { workspace = true }
-# BIP-39 wordlist for the gate's mnemonic-extractor — validates that
-# words pulled from the rendered ShowMnemonic body are real BIP-39
-# entries before the harness types them back at VerifyRoundTrip. The
-# shipping crates already pull this version through `daemonseed-core`,
-# so no new lockfile entry.
-bip39 = { workspace = true }
-# M11 workstream D — wire-shape regression. The wire-shape classifier
-# inspects the negotiated rustls `ProtocolVersion`; the live test in
-# tests/usenix_wire_shape.rs drives a real TLS 1.3 handshake against the
-# subprocess server via the production `build_client_config` and reads
-# back the observable wire features. Both already-workspace deps.
-rustls = { workspace = true }
-rustls-pki-types = { workspace = true }
-# alpha2 — public-room e2e: the forged-provenance test crafts a sealed envelope
-# directly (the global room key is public, so anyone can SEAL), and posts use a
-# raw ML-DSA-87 keypair as the posting identity.
-oxicrypt-aes = { workspace = true }
-oxicrypt-ml-dsa = { workspace = true }
+# CSPRNG draw for the alpha2 share-download coverage identities.
 getrandom = { workspace = true }

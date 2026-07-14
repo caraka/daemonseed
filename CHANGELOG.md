@@ -102,6 +102,7 @@ work lives in the project lead's vault manifest, not here.
 - `daemonseed-gui`: `state::build_announcements_view` (the relay-path client re-verification of served announcements/MOTD); the Veilid actor verifies operator content at ingest and builds the view directly.
 - `daemonseed-{gui,tui}`: the `daemonseed-server` dependency — crypto init (`kats` + TLS provider install) now rides `daemonseed-core`.
 - `daemonseed-cli`: the relay client — the `connect` / `session` / `identity_proof` modules (TLS handshake, `AppSession` gRPC-over-h2, and the identity-proof exchange) and the `main` binary (its only subcommand was the relay `connect`). `daemonseed-cli` is now a library-only crate exposing the Veilid route-advert signer (`route_signer`) and the announcements/MOTD authoring + render helpers (`public_space`); the `daemonseed-server`, TLS-stack (`rustls`, `tokio-rustls`, `oxitls-rustls-provider`), tonic-client, `tokio`, and `clap` dependencies came off with it.
+- The `daemonseed-server` relay crate and its server-only integration suite (the `announcements_motd` / `m6` / `m9` / `m10` / `public_rooms` / `alpha2_opaque_share_id` ISC-coverage tests, the `subprocess_gate` PTY harness, and the `tests/common/` relay-spawning harness). `daemonseed-veilid-net` joins the workspace as the transport; its standalone `Cargo.lock` folds into the workspace lock.
 
 ### Fixed
 

@@ -4,18 +4,13 @@ members = [
     "crates/daemonseed-isc",
     "crates/daemonseed-core",
     "crates/daemonseed-proto",
-    "crates/daemonseed-server",
     "crates/daemonseed-cli",
     "crates/daemonseed-tui",
+    "crates/daemonseed-veilid-net",
     "crates/daemonseed-integration-tests",
     "crates/daemonseed-gui",
     "xtask",
 ]
-# Held out of the unified workspace lock until the v0.33.0 cutover: veilid-core's
-# dependency tree must not perturb the frozen v0.32.0 relay resolution. This
-# crate carries its own Cargo.lock and builds independently; it joins `members`
-# when daemonseed-server is disconnected at cutover.
-exclude = ["crates/daemonseed-veilid-net"]
 
 # Crypto runs at full optimization even in dev builds. oxicrypt's portable
 # constant-time paths (accelerated backends are off by default) are unusable at

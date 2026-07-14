@@ -10,7 +10,7 @@ Daemonseed is a federated, end-to-end-encrypted communication and file-sharing p
 
 - **Repo:** this repository — <https://github.com/caraka/daemonseed>
 - **Sibling crypto foundation:** <https://github.com/oxiforge/oxicrypt> — currently private; goes public before daemonseed does. daemonseed depends on it for CNSA 2.0 primitives, AEAD, and KDF.
-- **Sibling TLS-stack glue:** <https://github.com/oxiforge/oxitls> — currently private; goes public before daemonseed does. Provides the rustls `CryptoProvider` and the ML-DSA webpki verifier (`oxitls-rustls-provider`, `oxitls-webpki-mldsa`); consumed by daemonseed-server, -cli, and -tui.
+- **Sibling TLS-stack glue:** <https://github.com/oxiforge/oxitls> — currently private; goes public before daemonseed does. Provides the rustls `CryptoProvider` and the ML-DSA webpki verifier (`oxitls-rustls-provider`, `oxitls-webpki-mldsa`); consumed by daemonseed-cli and -tui.
 - **LAMA spec (API-manifest format):** <https://github.com/lamaspec/lama> — the specification (`SPEC.md`) that this repo's `lama.yaml` and `docs/llm-api-manifest/*-api.yaml` MUST conform to. Re-checked at every doc-sync.
 
 ## Session bootstrap
@@ -98,7 +98,7 @@ At every commit, reconcile every one of the following that the change affects �
 
 ## License posture
 
-- **Code crates** (`daemonseed-core`, `daemonseed-server`, `daemonseed-cli`, `daemonseed-tui`, `xtask`): **AGPL-3.0-or-later**.
+- **Code crates** (`daemonseed-core`, `daemonseed-cli`, `daemonseed-tui`, `daemonseed-veilid-net`, `xtask`): **AGPL-3.0-or-later**.
 - **Schema crate** (`daemonseed-proto`): **Apache-2.0 OR MIT dual** (Rust-ecosystem default).
 
 When adding a new crate, set its `Cargo.toml` `license` field per this split. The schema carve-out exists so cross-language client implementations can exist freely without copyleft viral concerns. Repo root carries three LICENSE files (`LICENSE-AGPL`, `LICENSE-APACHE`, `LICENSE-MIT`); per-crate `license` fields select the correct one(s) for each crate.
