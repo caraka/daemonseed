@@ -1060,9 +1060,7 @@ async fn connect(
     ev_rx: &mut Option<UnboundedReceiver<VeilidNetEvent>>,
 ) {
     if net.is_some() {
-        let _ = evt_tx.send(NetEvent::Connected {
-            server_handle: "veilid".to_owned(),
-        });
+        let _ = evt_tx.send(NetEvent::Connected);
         return;
     }
     // The node identity is per-launch; circle membership derives from the phrase,
@@ -1106,9 +1104,7 @@ async fn connect(
             Ok(()) => {
                 *net = Some(handle);
                 *ev_rx = Some(rx);
-                let _ = evt_tx.send(NetEvent::Connected {
-                    server_handle: "veilid".to_owned(),
-                });
+                let _ = evt_tx.send(NetEvent::Connected);
             }
             Err(e) => fail(evt_tx, format!("veilid attach: {e}")),
         },
@@ -1212,9 +1208,7 @@ async fn subscribe_lobby(
     // The lobby rendezvous is live: tell the UI the public room is joined so its
     // Lobby chat box is enabled (relay-path parity — the relay emits RoomJoined on
     // its connect-time auto-join).
-    let _ = evt_tx.send(NetEvent::RoomJoined {
-        room: DEFAULT_ROOM.to_owned(),
-    });
+    let _ = evt_tx.send(NetEvent::RoomJoined);
 }
 
 /// Join a circle: derive the content key + the shared rendezvous-owner seed from

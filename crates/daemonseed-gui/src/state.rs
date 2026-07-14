@@ -18,6 +18,8 @@ use daemonseed_core::circle::key::{CircleKey, CircleKeyError, circle_fingerprint
 use daemonseed_core::cot::AssetAddr;
 use daemonseed_core::crypto::suite::CNSA_2_0;
 use daemonseed_core::identity::keys::{ShareRootIkm, SignKeypair};
+
+use crate::net::RosterEntry;
 use daemonseed_core::passphrase::strength::{self, DicewareError};
 
 use crate::profile::Profile;
@@ -310,6 +312,13 @@ pub struct CircleState {
     /// once (genuinely new to the session), but a reconnect after catching up will
     /// not. Lobby keeps it at 0 (the public room has no per-circle dot semantics).
     pub high_water_ms: i64,
+    /// Option A HERE-NOW cache (#77 follow-up): the last roster the net layer surfaced
+    /// for THIS room. `NetEvent::Roster` folds every room's roster here — active or not —
+    /// so a rail switch repaints the people column from the destination's snapshot
+    /// immediately. A beacon repaint only fires on a content change for the *active*
+    /// room, so a switch alone never updated the pane. Plain data (a `net` domain type,
+    /// no live-networking coupling); RAM-only like the rest of this layer.
+    pub roster: Vec<RosterEntry>,
 }
 
 /// First circle id handed out (0 is reserved/unused so a missing id is obvious).
@@ -355,6 +364,7 @@ impl GuiState {
             net: None,
             unread: false,
             high_water_ms: 0,
+            roster: Vec::new(),
         }];
         GuiState {
             circles,
@@ -690,6 +700,7 @@ impl GuiState {
             }),
             unread: false,
             high_water_ms: 0,
+            roster: Vec::new(),
         };
         self.circles.push(circle);
         Ok(self.circles.len() - 1)
@@ -794,6 +805,30 @@ impl GuiState {
         self.circles
             .iter()
             .position(|c| c.net.as_ref().is_some_and(|n| n.circle_id == circle_id))
+    }
+
+    /// Option A (#77 follow-up): cache the roster the net layer surfaced for
+    /// `circle_id`'s room. `None` is the pinned Lobby (index 0); `Some(id)` maps via
+    /// [`Self::index_of_circle_id`]. Called for EVERY `NetEvent::Roster` — active room
+    /// or not — so a later rail switch can repaint the people column from the snapshot.
+    /// A roster for an unknown id (a circle already left the rail) is dropped.
+    pub fn set_room_roster(&mut self, circle_id: Option<u64>, roster: Vec<RosterEntry>) {
+        let idx = match circle_id {
+            None => 0,
+            Some(id) => match self.index_of_circle_id(id) {
+                Some(i) => i,
+                None => return,
+            },
+        };
+        if let Some(c) = self.circles.get_mut(idx) {
+            c.roster = roster;
+        }
+    }
+
+    /// The active room's cached HERE-NOW roster (option A) — repainted into the people
+    /// column on every rail switch so the pane follows the switch.
+    pub fn active_roster(&self) -> &[RosterEntry] {
+        &self.circles[self.active].roster
     }
 
     /// The currently active circle's state.
@@ -992,6 +1027,7 @@ impl GuiState {
                 net: None,
                 unread: false,
                 high_water_ms: 0,
+                roster: Vec::new(),
             }
         };
         let circles = vec![
@@ -2385,5 +2421,54 @@ mod tests {
             .expect("persist is a no-op without a profile");
         // The circle is in RAM this session, but there is no persistence surface.
         assert!(!st.only_lobby());
+    }
+
+    // ── option A (#77 follow-up): per-room roster cache + repaint-on-switch ────
+
+    #[test]
+    fn set_room_roster_caches_to_the_lobby_and_active_roster_reads_it() {
+        let mut st = GuiState::lobby_only();
+        // The Lobby (circle_id None) is the active room at index 0.
+        let roster = vec![crate::net::RosterEntry {
+            handle: "alice#aabbccddeeff".into(),
+            fingerprint: "#aabbccddeeff".into(),
+        }];
+        st.set_room_roster(None, roster.clone());
+        assert_eq!(st.active_roster(), roster.as_slice());
+    }
+
+    #[test]
+    fn set_room_roster_routes_to_the_matching_circle_not_the_lobby() {
+        let _ = oxicrypt_module::initialize();
+        let mut st = GuiState::lobby_only();
+        let idx = st.materialize_from_phrase(STRONG).expect("materialize");
+        st.switch_to(idx, String::new(), 0.0);
+        let cid = st
+            .active_circle_id()
+            .expect("a materialized circle has a net id");
+        let roster = vec![crate::net::RosterEntry {
+            handle: "bob".into(),
+            fingerprint: "#001122334455".into(),
+        }];
+        st.set_room_roster(Some(cid), roster.clone());
+        // Active room is the circle → its cached roster is returned.
+        assert_eq!(st.active_roster(), roster.as_slice());
+        // A circle-scoped roster never leaked into the Lobby's cache.
+        st.switch_to(0, String::new(), 0.0);
+        assert!(st.active_roster().is_empty());
+    }
+
+    #[test]
+    fn set_room_roster_drops_an_unknown_circle_id() {
+        let mut st = GuiState::lobby_only();
+        // No circle carries id 9999 — the roster is dropped (no panic), lobby untouched.
+        st.set_room_roster(
+            Some(9999),
+            vec![crate::net::RosterEntry {
+                handle: "ghost".into(),
+                fingerprint: "#ffeeddccbbaa".into(),
+            }],
+        );
+        assert!(st.active_roster().is_empty());
     }
 }

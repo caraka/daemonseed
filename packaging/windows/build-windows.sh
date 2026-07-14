@@ -30,7 +30,7 @@ OUTPUT_DIR="${1:-$REPO_ROOT/dist}"
 
 echo "[windows] cross-building $BIN for $TARGET …"
 cargo zigbuild --manifest-path "$REPO_ROOT/Cargo.toml" \
-  -p daemonseed-gui --release --features "desktop veilid" --target "$TARGET"
+  -p daemonseed-gui --release --features "desktop" --target "$TARGET"
 
 SRC="$REPO_ROOT/target/$TARGET/release/$BIN"
 mkdir -p "$OUTPUT_DIR"

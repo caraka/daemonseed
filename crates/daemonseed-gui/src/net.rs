@@ -217,9 +217,9 @@ pub enum NetCommand {
 /// An event from the network actor to the UI thread.
 #[derive(Debug, Clone)]
 pub enum NetEvent {
-    /// The connection reached Authenticated; `server_handle` is the verified
-    /// relay handle.
-    Connected { server_handle: String },
+    /// The connection reached Authenticated — the client is attached to the Veilid
+    /// network (there is no relay handle post-cutover).
+    Connected,
     /// (#144) The Veilid attach peer counts, emitted as they climb during the
     /// cold-start DHT warmup — drives the startup mask's counting-up progress.
     PeerCount { reliable: u32, live: u32 },
@@ -230,8 +230,8 @@ pub enum NetEvent {
     PresenceStale { stale: bool },
     /// The connection attempt failed; `reason` is human-readable.
     ConnectFailed { reason: String },
-    /// A public room is subscribed and chat can flow; `room` is the joined name.
-    RoomJoined { room: String },
+    /// A public room is subscribed and chat can flow.
+    RoomJoined,
     /// A message to render: a verified inbound frame, or a local echo of the
     /// user's own just-sent message. `mine` is true when `who == my_handle`.
     Message {

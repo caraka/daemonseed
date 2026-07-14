@@ -27,6 +27,12 @@
 //! `--show-circle-detail` materializes a circle, applies a synthetic rendezvous,
 //! and slides the context sheet open showing the three name vectors (#36).
 
+// The windowed (`desktop`) build must not spawn a console. Without this attribute the
+// GUI links as a console-subsystem executable and Windows attaches a stray terminal
+// window alongside it. Gated on `desktop` so the base offscreen build (no feature)
+// keeps stdout for the `--self-check` / PNG headless-verification path. No-op off Windows.
+#![cfg_attr(feature = "desktop", windows_subsystem = "windows")]
+
 mod desktop_integration;
 mod net;
 mod profile;
@@ -127,7 +133,7 @@ const H: u32 = 680;
 /// Released build version shown in-app (auth-screen readout, issue #59 surface).
 /// Stamped at release from the git tag — like `lama.yaml` `version` and the README
 /// Status line — NOT Cargo's tag-driven `0.1.0`.
-const APP_VERSION: &str = "v0.32.0";
+const APP_VERSION: &str = "v0.33.1";
 
 /// Run `f` on the next event-loop tick instead of synchronously. Used to move
 /// `.focus()` calls OUT of key-event handlers: focusing an element while Slint is
@@ -209,15 +215,35 @@ fn type_back_precheck(challenge: &TypeBackChallenge, mnemonic: &str, answers: &[
         })
 }
 
+/// Strip the `#<12hex>` verification suffix from a wire handle for the inline roster
+/// row (#173): the row shows the display name alone, and the fingerprint is revealed
+/// on hover (the separate `fingerprint` field / `RosterRowView`, the ISC-C4 trust
+/// anchor). Floor handles (`#<hex>`, no name) and hash-less handles are shown
+/// unchanged. Applied at this single chokepoint so lobby and circle rows are uniform.
+///
+/// Deliberately NOT `Handle::format(DisplayMode::Default)`: this stays lenient for a
+/// non-canonical handle — a bare `guest` (no `#hex`) is shown verbatim, where `Handle`
+/// parsing would floor it to `#hex`. Collision-aware inline disambiguation (rendering
+/// `name#hex` when two display names clash) is deferred to #186; hover reveals the
+/// fingerprint in the meantime.
+fn strip_handle_hash(handle: &str) -> &str {
+    match handle.rsplit_once('#') {
+        Some(("", _)) => handle, // floor form `#<hex>` — no name to show, keep as-is
+        Some((name, _)) => name, // `name#<hex>` — drop the hash for the inline row
+        None => handle,          // no hash present
+    }
+}
+
 /// Convert the live-roster entries (#75) into a Slint `ModelRc<RosterRow>`. The
 /// whole model is replaced on each presence change (the `for` re-renders) — entries
 /// are OTHER live members only (own beacon is filtered net-side). `handle` → the
-/// row name; the `#12hex` fingerprint rides along for the on-hover verification cue.
+/// row name (name only, #173); the `#12hex` fingerprint rides along for the on-hover
+/// verification cue.
 fn roster_model(entries: &[RosterEntry]) -> ModelRc<RosterRow> {
     let rows: Vec<RosterRow> = entries
         .iter()
         .map(|e| RosterRow {
-            name: SharedString::from(e.handle.as_str()),
+            name: SharedString::from(strip_handle_hash(&e.handle)),
             fingerprint: SharedString::from(e.fingerprint.as_str()),
         })
         .collect();
@@ -494,6 +520,11 @@ fn build_ui() -> BuiltUi {
                 rebuild_rail(&ui, &st);
                 apply_view(&ui, st.current(), active as i32);
                 apply_circle_detail(&ui, &st, active);
+                // Option A (#77 follow-up): repaint HERE NOW from the destination room's
+                // cached roster so the people column follows the switch. A beacon-driven
+                // repaint only fires on a roster CONTENT change for the active room, so a
+                // switch alone previously left the pane showing the prior room's roster.
+                ui.set_roster(roster_model(st.active_roster()));
                 // Tidiness: keep the shares view coherent with the room. If already
                 // on a shares tab, show the one that matches the destination — a
                 // circle's "Circle shares" (tab 2) or the Lobby's public "Shares"
@@ -1547,8 +1578,11 @@ fn apply_net_event(
     evt: NetEvent,
 ) {
     match evt {
-        NetEvent::Connected { server_handle } => {
-            ui.set_connection_status(SharedString::from(format!("connected · {server_handle}")));
+        NetEvent::Connected => {
+            // #182: transport-level status — a client attaches to the Veilid network,
+            // not to a room. Room-scoped phrasing ("connected · lobby") was relay-era
+            // and misleading when viewing a circle; "veilid" is always accurate.
+            ui.set_connection_status(SharedString::from("connected · veilid"));
             ui.set_connected(true);
         }
         // #144: the attach peer count climbing during the cold-start warmup — shown
@@ -1564,8 +1598,10 @@ fn apply_net_event(
             };
             ui.set_mask_peer_count(SharedString::from(label));
         }
-        NetEvent::RoomJoined { room } => {
-            ui.set_connection_status(SharedString::from(format!("connected · {room}")));
+        NetEvent::RoomJoined => {
+            // #182: static transport-level status (see NetEvent::Connected) — never the
+            // joined room name, which read as "connected · lobby" even inside a circle.
+            ui.set_connection_status(SharedString::from("connected · veilid"));
             ui.set_connected(true);
         }
         NetEvent::ConnectFailed { reason } => {
@@ -1941,16 +1977,21 @@ fn apply_net_event(
             if !entries.is_empty() {
                 settle_dismiss_mask(ui);
             }
-            // Replace the roster model for the ACTIVE room only (#75 lobby / #77
-            // circles). A roster is room-scoped: the lobby is `None`, a circle is
-            // `Some(circle_id)`. The active room is `state.active_circle_id()` (None
-            // for the Lobby). A roster for a background room updated its tracker
-            // net-side but must not change the visible column. Runs on the UI thread
-            // (the Timer drains events here), so a direct set is correct — no
-            // cross-thread hop. The column renders/collapses by Chat visibility
-            // Slint-side.
-            if state.borrow().active_circle_id() == circle_id {
-                ui.set_roster(roster_model(&entries));
+            // A roster is room-scoped: the lobby is `None`, a circle is `Some(circle_id)`;
+            // the active room is `state.active_circle_id()` (None for the Lobby). Runs on
+            // the UI thread (the Timer drains events here), so a direct set is correct —
+            // no cross-thread hop. Two steps (option A, #77 follow-up):
+            // 1. Cache EVERY room's roster (active or not) so a later rail switch can
+            //    repaint the people column from the snapshot instead of waiting for the
+            //    next content-changing beacon.
+            // 2. Repaint the visible column only when this roster is the active room's —
+            //    a background room must not change what HERE NOW shows. The column
+            //    renders/collapses by Chat visibility Slint-side.
+            let mut st = state.borrow_mut();
+            let is_active = st.active_circle_id() == circle_id;
+            st.set_room_roster(circle_id, entries); // move into the cache (no clone)
+            if is_active {
+                ui.set_roster(roster_model(st.active_roster()));
             }
         }
     }

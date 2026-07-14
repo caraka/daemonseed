@@ -39,9 +39,9 @@ command -v zig >/dev/null || die "zig not found"
 [ -n "${APPIMAGETOOL}" ] || die "appimagetool not found on PATH (set APPIMAGETOOL=...)"
 rustup target list --installed 2>/dev/null | grep -qx "${TARGET}" || die "rust target ${TARGET} not installed (rustup target add ${TARGET})"
 
-log "building ${BIN} (release, --features \"desktop veilid\") for ${ZIG_TARGET}"
+log "building ${BIN} (release, --features \"desktop\") for ${ZIG_TARGET}"
 cargo zigbuild --release --locked \
-  -p "${BIN}" --features "desktop veilid" \
+  -p "${BIN}" --features "desktop" \
   --target "${ZIG_TARGET}"
 
 # cargo-zigbuild emits artifacts under the base triple directory (no glibc suffix).

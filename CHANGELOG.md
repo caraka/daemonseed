@@ -24,6 +24,18 @@ next release this block is renamed to its version + date and a fresh
 `[Unreleased]` is opened (see `AGENTS.md` doc-sync). Planning for *unstarted*
 work lives in the project lead's vault manifest, not here.
 
+### Fixed
+
+- `daemonseed-gui`: the windowed (`desktop`) build no longer opens a stray console window on Windows — the crate sets the `windows` subsystem under the `desktop` feature; the offscreen build keeps stdout for headless verification.
+- `daemonseed-gui`: the HERE NOW roster follows a rail switch — each room's roster is cached and repainted on switch, not only on the next content-changing beacon (#138).
+- `daemonseed-gui`: the presence roster shows the member name inline with the `#<12hex>` fingerprint revealed on hover only, uniform for lobby and circle rows (#173).
+- `daemonseed-gui`: the in-app version label matches the release tag.
+- `packaging`: the AppImage and Windows build scripts build `--features desktop` (the removed `veilid` feature flag is dropped).
+
+### Changed
+
+- `daemonseed-gui`: the connection-status line reads `connected · veilid` — transport-level, not the joined room name (#182).
+
 ## [0.33.0] — 2026-07-14
 
 ### Added
