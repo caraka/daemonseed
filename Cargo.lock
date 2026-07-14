@@ -1717,22 +1717,11 @@ dependencies = [
 name = "daemonseed-cli"
 version = "0.1.0"
 dependencies = [
- "clap",
  "daemonseed-core",
  "daemonseed-proto",
- "daemonseed-server",
  "daemonseed-veilid-net",
- "hyper-util",
  "oxicrypt-module",
- "oxitls-rustls-provider",
  "prost",
- "rustls 0.23.37",
- "rustls-pki-types",
- "tokio",
- "tokio-rustls",
- "tokio-stream",
- "tonic",
- "tower 0.5.3",
 ]
 
 [[package]]

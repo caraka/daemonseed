@@ -9,46 +9,16 @@ license = "AGPL-3.0-or-later"
 description = "daemonseed scriptable client"
 
 [dependencies]
-# Sibling crates — bootstrap anchor + version policy live in core;
-# AppHello prost types in proto; HELLO framing + KATS in server.
+# Sibling crates — bootstrap anchor + version policy + crypto live in core;
+# the announcements/MOTD wire types (SignedArtifact, Post) in proto.
 daemonseed-core = { path = "../daemonseed-core" }
 daemonseed-proto = { path = "../daemonseed-proto" }
-daemonseed-server = { path = "../daemonseed-server" }
 prost = { workspace = true }
 
 # Veilid transport — home of the least-authority RouteAdvertSigner adapter
 # (`route_signer`) the share-publish path hands veilid-net.
 daemonseed-veilid-net = { path = "../daemonseed-veilid-net" }
 
-# oxicrypt + oxitls — the CLI installs the same process-wide
-# CryptoProvider as the server so a single binary can act as
-# either side without re-installing.
+# oxicrypt — the ML-DSA signing/verification error type surfaced by the
+# public_space authoring helpers + the route_signer provenance path.
 oxicrypt-module = { workspace = true }
-oxitls-rustls-provider = { workspace = true }
-
-# TLS stack — client-side ClientConfig is built against the same
-# provider; tokio-rustls drives the handshake.
-rustls = { workspace = true }
-rustls-pki-types = { workspace = true }
-tokio-rustls = { workspace = true }
-
-# Runtime — multi-thread isn't needed for a one-shot CLI; the
-# workspace base (rt, macros, io-util, net) plus `time` is plenty.
-tokio = { workspace = true, features = ["time"] }
-
-# tonic client stack — once a connection reaches Authenticated, the live
-# AppStream carries gRPC-over-h2 to the PublicSpace + CircleOfTrust services.
-# AppSession builds a tonic Channel over that one already-established stream via
-# Endpoint::connect_with_connector + hyper_util TokioIo (mirrors the server's
-# serve_application incoming wrapper). hyper-util pinned to the version tonic
-# 0.12.3 already pulls (matches the server dev-dep pin).
-tonic = { workspace = true }
-tokio-stream = { workspace = true }
-tower = { workspace = true }
-hyper-util = "=0.1.20"
-
-# Argument parsing.
-clap = { workspace = true }
-
-[dev-dependencies]
-oxitls-rustls-provider = { workspace = true, features = ["testing"] }

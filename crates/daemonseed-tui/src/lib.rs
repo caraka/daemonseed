@@ -2,7 +2,7 @@
 //!
 //! The TUI is the product surface for the MVP: a [`ratatui`] client that
 //! drives the full daemonseed transaction — first-start (mnemonic, passphrase,
-//! recovery), connect + identity-proof (reusing [`daemonseed_cli::connect`]),
+//! recovery), connect + identity-proof,
 //! public-space, circle-of-trust chat, file share/fetch, the C22 per-server
 //! trust slider, the C28 trust-event taxonomy, and the F22 server-management
 //! screen (which also surfaces introducer-discovered candidate peers read-only,

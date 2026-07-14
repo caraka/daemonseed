@@ -1,45 +1,27 @@
-//! daemonseed-cli library — exposes the `connect` happy path so the
-//! commit-6 integration test can exercise the full client→server
-//! round-trip in-process rather than spawning a subprocess.
+//! daemonseed-cli library — the Veilid clients' shared authoring surface.
 //!
-//! The binary entry point is `main.rs`; this module is the seam that
-//! both `main` and the integration test call.
+//! Once the relay transport was retired at the v0.33.0 Veilid cutover the
+//! crate stopped being a runnable binary (its only subcommand was the relay
+//! `connect`) and became a library the gui/tui import. Two capabilities
+//! remain, both transport-independent:
 //!
-//! ## M4a scope
-//!
-//! `connect` is intentionally narrow:
-//!
-//! - Resolves `<server-id>` to an address from the bundled bootstrap
-//!   anchor or an explicit `--address` override (ISC-C37)
-//! - Builds a `rustls::ClientConfig` against the same process-wide
-//!   `cnsa_2_0_hybrid_provider` the server uses (`install_provider`
-//!   is idempotent via `OnceLock`)
-//! - Initiates the TLS 1.3 handshake with ALPN `h2`
-//! - Sends `APP_HELLO` (length-prefixed prost via
-//!   `daemonseed_server::hello::write_frame`)
-//! - Reads `APP_HELLO_ACK` or `APP_HELLO_REJECT`
-//! - On Ack: verifies the responder's pick is in our offer (ISC-C23)
-//!   via `DefaultNegotiator::verify_ack`, returns Ok(version)
-//! - On Reject `NO_COMMON_VERSION`: returns
-//!   [`connect::ConnectError::NoCommonVersion`] with the responder's
-//!   full list
-//!
-//! ## What's NOT in M4a
-//!
-//! - Real TOFU server-cert verification — the M4a CLI accepts any
-//!   cert. Real verification (TOFU + identity-proof) lands in M4b.
-//!   This is loud in the code (`AcceptAnyServerCert` verifier) and
-//!   documented as such so it can't be mistaken for production-ready
-//!   behaviour.
-//! - Any subcommand other than `connect`
-//! - Profile management, MOTD, posts, file sharing — all M5+ scope.
+//! - [`route_signer`] — the least-authority `RouteAdvertSigner` adapter the
+//!   share-publish path hands `daemonseed-veilid-net`, so a Veilid route
+//!   advertisement is signed with the node's identity key without exposing
+//!   the key material to the transport crate.
+//! - [`public_space`] — the announcements/MOTD **authoring and render**
+//!   helpers: sign a MOTD / post ([`public_space::sign_motd`],
+//!   [`public_space::sign_post`]), render a signed MOTD as inert plaintext
+//!   ([`public_space::render_motd`]), re-verify served artifacts client-side
+//!   ([`public_space::verify_served_motd`] / [`public_space::verify_served_post`]),
+//!   gate the composer on the signer whitelist
+//!   ([`public_space::composer_visible`]), and filter/select share listings
+//!   ([`public_space::filter_shares_excluding_hidden`],
+//!   [`public_space::filter_shares_by_rating`], [`public_space::select_rating`]).
+//!   All pure data plumbing, independent of any transport.
 
 #![forbid(unsafe_code)]
 
-pub mod connect;
-pub mod identity_proof;
 pub mod public_space;
 /// Veilid-transport route-advert signing capability.
 pub mod route_signer;
-pub mod session;
-pub mod tofu_stub;
