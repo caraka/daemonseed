@@ -34,7 +34,6 @@ mod profile;
 mod share_browser;
 mod single_instance;
 mod state;
-#[cfg(feature = "veilid")]
 mod veilid_net;
 
 slint::include_modules!();
@@ -1475,12 +1474,10 @@ fn connect_now(
 ) {
     match crypto {
         Ok(()) => {
-            let (server_id, address) = relay_target();
             let (
                 display_handle,
                 rejoin_circles,
                 republish_roots,
-                index_params,
                 stable_signing_key,
                 stable_share_root_ikm,
             ) = {
@@ -1492,7 +1489,6 @@ fn connect_now(
                         .into_iter()
                         .map(|(root, name)| (PathBuf::from(root), name))
                         .collect::<Vec<_>>(),
-                    st.persisted_index_params(),
                     // (#92) Derive the stable identity signing key ONCE per connect
                     // and hand it to the net actor to hold for composer-gating + signing.
                     st.stable_signing_key(),
@@ -1502,12 +1498,9 @@ fn connect_now(
                 )
             };
             let _ = net.borrow().send(NetCommand::Connect {
-                server_id,
-                address,
                 display_handle,
                 rejoin_circles,
                 republish_roots,
-                index_params,
                 stable_signing_key,
                 stable_share_root_ikm,
             });
@@ -1590,14 +1583,6 @@ fn apply_net_event(
             if reason != "not yet on Veilid" {
                 ui.set_connect_notice(SharedString::from(reason));
             }
-        }
-        // #72: a live connection dropped. The actor already cleared its stale
-        // session and (when a connect plan exists, #71) armed auto-reconnect, so
-        // the UI just reflects offline + "reconnecting"; no UI-side reconnect is
-        // issued (that would double-dial and bypass the actor's backoff).
-        NetEvent::Disconnected { reason } => {
-            ui.set_connection_status(SharedString::from(format!("reconnecting · {reason}")));
-            ui.set_connected(false);
         }
         NetEvent::Message {
             who,
@@ -1969,12 +1954,6 @@ fn apply_net_event(
                 ui.set_roster(roster_model(&entries));
             }
         }
-        // Test-only probes (net.rs in-process oracle); never produced in a running
-        // binary, so they carry no UI effect.
-        #[cfg(test)]
-        NetEvent::ConnectedProbe { .. } => {}
-        #[cfg(test)]
-        NetEvent::CachedAddrProbe { .. } => {}
     }
 }
 

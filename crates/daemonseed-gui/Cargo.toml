@@ -31,24 +31,15 @@ i-slint-backend-winit = { version = "1.13", optional = true }
 daemonseed-cli = { path = "../daemonseed-cli" }
 daemonseed-core = { path = "../daemonseed-core" }
 daemonseed-proto = { path = "../daemonseed-proto" }
-# Process-wide CryptoProvider install + KATs — symmetric with cli/tui. The GUI
-# initializes the same oxicrypt module + rustls provider before connecting
-# (`daemonseed_server::tls::install_provider`, `::kats::CNSA_2_0_KATS`).
-daemonseed-server = { path = "../daemonseed-server" }
 
-# Veilid transport (#98 / Phase 2), behind the `veilid` feature. Optional + a
-# plain path dep on the `[workspace] exclude`d crate: default builds never
-# compile it (the frozen relay BUILD stays unperturbed), while `--features
-# veilid` selects the parallel Veilid net actor (circles-only today). veilid-core
-# enters the workspace Cargo.lock as inert resolution only. The exclude + this
-# crate's relay actor are both deleted at the v0.33.0 cutover.
-daemonseed-veilid-net = { path = "../daemonseed-veilid-net", optional = true }
+# Veilid transport (#98) — the only transport. Backs the net actor
+# (`src/veilid_net.rs`) that `net::NetHandle::new` spawns.
+daemonseed-veilid-net = { path = "../daemonseed-veilid-net" }
 
 # Bounded-concurrency stream combinator (`StreamExt::buffered`) for parallelizing
 # public-share chunk downloads (#113) — same dep + spec the veilid-net fragment
-# pipeline (#109) uses; already in the workspace lock. Optional + veilid-gated: the
-# download path is `#[cfg(feature = "veilid")]`, so default builds never pull it.
-futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
+# pipeline (#109) uses.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 # Process-wide CryptoProvider install — symmetric with cli/tui/server. The GUI
 # initializes the same oxicrypt module + rustls provider before connecting.
@@ -83,23 +74,17 @@ arboard = "3"
 
 # Encode/decode the operator announce-record item envelope (Phase 4 A-c): the
 # 1-byte-tagged `SignedArtifact` (MOTD) / `Post` (announcement) values the Veilid
-# composer publishes + the inbound reader verifies. Optional + veilid-gated — the
-# operator-space path is `#[cfg(feature = "veilid")]`, so default builds never pull
-# them; `hex` keys announcement items by their content-address slot.
-prost = { workspace = true, optional = true }
-hex = { workspace = true, optional = true }
+# composer publishes + the inbound reader verifies; `hex` keys announcement items
+# by their content-address slot.
+prost = { workspace = true }
+hex = { workspace = true }
 
 [build-dependencies]
 slint-build = { workspace = true }
 
 [dev-dependencies]
-# In-process relay round-trip test (mirrors daemonseed-integration-tests'
-# cot_chat_e2e): a CotRegistry + serve_application over tokio::io::duplex, two
-# AppSessions fed to two actor instances via the AttachSession test seam.
-# (daemonseed-server itself is a regular dep above for crypto init; the relay
-# types it also exposes are used here in tests.)
-oxitls-rustls-provider = { workspace = true, features = ["testing"] }
-# Share publish→fetch round-trip oracle: a temp share directory + a temp fetch root.
+# Share publish→fetch round-trip oracle (veilid_net tests): a temp share directory
+# + a temp fetch root.
 tempfile = { workspace = true }
 
 [features]
@@ -109,15 +94,3 @@ default = []
 # daemonseed-gui --features desktop` opens a window. Base build (no features) stays
 # offscreen-only so it compiles/verifies from a headless terminal.
 desktop = ["slint/backend-winit", "dep:i-slint-backend-winit"]
-# Veilid transport backend (#98). Off by default (relay path); when on, the net
-# actor selects `VeilidNetHandle` for circle traffic. Flips to default at v0.33.0.
-# Also turns on `daemonseed-cli/veilid` so the least-authority
-# `IdentityRouteAdvertSigner` route-advert capability is in scope for the
-# public-share publish path (Phase 3 Slice 2b).
-veilid = [
-    "dep:daemonseed-veilid-net",
-    "dep:futures-util",
-    "dep:prost",
-    "dep:hex",
-    "daemonseed-cli/veilid",
-]

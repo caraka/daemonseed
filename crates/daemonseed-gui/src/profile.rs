@@ -26,7 +26,7 @@ use daemonseed_core::identity::keys::{
     Identity, KeyDerivationError, ShareRootIkm, SignKeypair, derive_identity_keys,
 };
 use daemonseed_core::profile::persist::{load_for_unlock, write_seeds_blob};
-use daemonseed_core::storage::seeds::{self, IndexKey, SealingKey, Seeds};
+use daemonseed_core::storage::seeds::{self, SealingKey, Seeds};
 
 /// An unlocked identity + its on-disk profile root, with the write-through path.
 pub struct Profile {
@@ -41,13 +41,6 @@ pub struct Profile {
     /// handle for a legacy profile with none). Decoupled from the ephemeral
     /// connection key — this is the *display* identity that survives relaunch.
     display_handle: String,
-    /// (#81) the share-index key from [`SessionMaterials`] — the sibling of the
-    /// at-rest [`SealingKey`] that opens the persisted redb share index under the
-    /// profile root. Retained so the net actor can open the SAME index across
-    /// launches and reuse its chunk-address cache (no from-scratch re-hash on
-    /// publish / connect-time republish). A session secret on par with the at-rest
-    /// key — never logged or persisted on its own (it is re-derived each unlock).
-    index_key: IndexKey,
 }
 
 /// A persisted circle to silently re-join: its canonicalized phrase + client-local
@@ -69,7 +62,6 @@ impl Profile {
             seeds: materials.seeds,
             seal_key: materials.seal_key,
             display_handle,
-            index_key: materials.index_key,
         }
     }
 
@@ -97,16 +89,6 @@ impl Profile {
     /// `share_id` (deterministic per (identity, root), stable across republish).
     pub fn stable_share_root_ikm(&self) -> Result<ShareRootIkm, KeyDerivationError> {
         derive_identity_keys(&self.seeds.mnemonic, Identity::Primary).map(|k| k.share_root_ikm)
-    }
-
-    /// (#81) The persisted-index home + key the net actor opens per-share indexes
-    /// under: `(profile_root_dir, index_key)`. The net actor derives a per-share
-    /// filename (`share-index-<12hex(root)>.redb`) under this DIR for each published
-    /// share — one redb file per share — so a share's cache pass never evicts
-    /// another's. The key is cloned (a `Zeroizing` newtype on par with the at-rest
-    /// key — the caller zeroizes its copy after opening the index).
-    pub fn index_params(&self) -> (PathBuf, IndexKey) {
-        (self.root.clone(), self.index_key.clone())
     }
 
     /// Circles recorded in the blob (canonical phrase + label) — the rejoin set.

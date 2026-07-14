@@ -14,16 +14,11 @@
 //! it stays Slint-free and network-free. Materialized circles are RAM-only and
 //! gone on relaunch — config persistence is a separate milestone.
 
-use daemonseed_cli::public_space::{
-    post_render_fields, render_motd, verify_served_motd, verify_served_post, whitelist_from_wire,
-};
 use daemonseed_core::circle::key::{CircleKey, CircleKeyError, circle_fingerprint, derive_cot_key};
 use daemonseed_core::cot::AssetAddr;
 use daemonseed_core::crypto::suite::CNSA_2_0;
 use daemonseed_core::identity::keys::{ShareRootIkm, SignKeypair};
 use daemonseed_core::passphrase::strength::{self, DicewareError};
-use daemonseed_core::storage::seeds::IndexKey;
-use daemonseed_proto::v1 as wire;
 
 use crate::profile::Profile;
 
@@ -40,10 +35,10 @@ pub fn generate_circle_phrase() -> Result<String, DicewareError> {
 // ── Announcements + MOTD display model (#91) ─────────────────────────────────
 
 /// One verified announcement row for the GUI announcements pane (#91 / ISC-S7).
-/// Built from a relay-served [`wire::Post`] that PASSED client re-verification
-/// against the published signer whitelist ([`verify_served_post`]); an
+/// Built from a served `wire::Post` that PASSED client re-verification
+/// against the published signer whitelist (`verify_served_post`); an
 /// unverifiable post never becomes a row. The fields are the inert
-/// [`post_render_fields`] decode — `topic`/`body` render verbatim, `sent_unix_ms`
+/// `post_render_fields` decode — `topic`/`body` render verbatim, `sent_unix_ms`
 /// is the signer's advisory signing wall-clock (ISC-S7).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AnnouncementRow {
@@ -61,61 +56,6 @@ pub struct AnnouncementRow {
 pub struct AnnouncementsView {
     pub motd: Option<String>,
     pub posts: Vec<AnnouncementRow>,
-}
-
-/// Build the verified announcements/MOTD display model (#91 — the testable
-/// data-prep + client re-verification half, ISC-C91 / ISC-A-S3).
-///
-/// Trusts NOTHING the relay asserts: the published signer whitelist
-/// ([`wire::GetSignerWhitelistResponse`]) is rebuilt locally, then every served
-/// post is re-verified against it ([`verify_served_post`] — signature AND content
-/// address) and DROPPED if it fails; the MOTD is re-verified
-/// ([`verify_served_motd`]) and shown only if it passes. The MOTD whitelist
-/// additionally carries the connected relay's own `server_pubkey` (a MOTD may be
-/// server-signed, ISC-26); the post whitelist does NOT, so post authorship stays
-/// the strict signer set (ISC-S8). A malformed published whitelist fails closed:
-/// nothing is trusted, so the view is empty.
-pub fn build_announcements_view(
-    motd: &wire::GetMotdResponse,
-    posts: &wire::ListPostsResponse,
-    whitelist: &wire::GetSignerWhitelistResponse,
-    server_pubkey: &[u8],
-) -> AnnouncementsView {
-    // Posts: the strict signer whitelist (no server key — ISC-S8 authorship).
-    let post_wl = match whitelist_from_wire(&whitelist.entries, None) {
-        Ok(wl) => wl,
-        Err(_) => return AnnouncementsView::default(),
-    };
-    // MOTD: same whitelist PLUS the relay's own key (ISC-26 server-signed MOTD).
-    let motd_wl = match whitelist_from_wire(&whitelist.entries, Some(server_pubkey)) {
-        Ok(wl) => wl,
-        Err(_) => return AnnouncementsView::default(),
-    };
-
-    let motd_text = motd
-        .motd
-        .as_ref()
-        .filter(|m| verify_served_motd(m, &motd_wl).is_ok())
-        .map(render_motd);
-
-    let posts = posts
-        .posts
-        .iter()
-        .filter(|p| verify_served_post(p, &post_wl).is_ok())
-        .map(|p| {
-            let (topic, body, sent_unix_ms) = post_render_fields(p);
-            AnnouncementRow {
-                topic,
-                body,
-                sent_unix_ms,
-            }
-        })
-        .collect();
-
-    AnnouncementsView {
-        motd: motd_text,
-        posts,
-    }
 }
 
 // ── Unread-gated landing (#93 / D5) ──────────────────────────────────────────
@@ -583,16 +523,6 @@ impl GuiState {
             .as_ref()
             .map(Profile::published)
             .unwrap_or_default()
-    }
-
-    /// (#81) The unlocked profile's persisted-index home + key —
-    /// `(profile_root_dir, index_key)` — passed to `NetCommand::Connect` so the net
-    /// actor opens a PER-SHARE index file under the dir for each published share and
-    /// reuses its chunk-address cache across launches instead of re-hashing from
-    /// scratch. `None` on the ephemeral (no-profile) path, where there is no profile
-    /// root to persist a cache under.
-    pub fn persisted_index_params(&self) -> Option<(std::path::PathBuf, IndexKey)> {
-        self.profile.as_ref().map(Profile::index_params)
     }
 
     /// Write-through (M16): remember a published share root with its optional
@@ -1112,99 +1042,6 @@ impl GuiState {
 mod tests {
     use super::*;
     use std::time::Instant;
-
-    // ── build_announcements_view (#91 / ISC-C91 / ISC-A-S3) ──────────────────
-    //
-    // Fixtures reuse the #90 cli authoring helpers (`sign_post`/`sign_motd`) so the
-    // test stays dependency-free (the gui crate has no direct `prost`) and exercises
-    // the authoring↔verify round-trip the production path relies on.
-
-    use daemonseed_cli::public_space::{sign_motd, sign_post};
-    use daemonseed_core::identity::keys::SignKeypair;
-
-    fn ann_keypair(seed: u8) -> SignKeypair {
-        let _ = oxicrypt_module::initialize();
-        SignKeypair::from_ml_dsa_seed(&[seed; 32]).unwrap()
-    }
-
-    fn full_key_entry(signer: &SignKeypair) -> wire::SignerWhitelistEntry {
-        wire::SignerWhitelistEntry {
-            entry: Some(wire::signer_whitelist_entry::Entry::FullPubkey(
-                signer.public_key().to_vec(),
-            )),
-        }
-    }
-
-    /// A served post signed by `signer` with a correctly-derived content address.
-    fn served_post(signer: &SignKeypair, topic: &str, body: &str, ts: i64) -> wire::Post {
-        let artifact = sign_post(signer, topic, body, ts).unwrap();
-        let address =
-            daemonseed_core::public_space::content_address(&artifact.signed_payload).unwrap();
-        wire::Post {
-            artifact: Some(artifact),
-            content_address: address.as_bytes().to_vec(),
-        }
-    }
-
-    fn signed_motd(signer: &SignKeypair, text: &str, ts: i64) -> wire::SignedArtifact {
-        sign_motd(signer, text, ts).unwrap()
-    }
-
-    #[test]
-    fn build_announcements_view_verifies_motd_and_drops_unverifiable_post() {
-        let signer = ann_keypair(40);
-        let stranger = ann_keypair(41);
-        let server = ann_keypair(42);
-
-        let whitelist = wire::GetSignerWhitelistResponse {
-            entries: vec![full_key_entry(&signer)],
-        };
-        // A whitelisted signer's MOTD verifies (here signed by a whitelist member,
-        // so it passes via the entry; the server key rides the MOTD whitelist too).
-        let motd = wire::GetMotdResponse {
-            motd: Some(signed_motd(&signer, "relay is up", 7)),
-        };
-        // Two posts: one by the whitelisted signer (kept), one by a stranger the
-        // whitelist does not authorize (must be dropped — ISC-A-S3).
-        let posts = wire::ListPostsResponse {
-            posts: vec![
-                served_post(&signer, "announcements", "v2 shipped", 11),
-                served_post(&stranger, "announcements", "forged-by-relay", 12),
-            ],
-        };
-
-        let view = build_announcements_view(&motd, &posts, &whitelist, server.public_key());
-
-        assert_eq!(
-            view.motd.as_deref(),
-            Some("relay is up"),
-            "a verified MOTD renders verbatim"
-        );
-        assert_eq!(view.posts.len(), 1, "the unverifiable post is dropped");
-        assert_eq!(view.posts[0].topic, "announcements");
-        assert_eq!(view.posts[0].body, "v2 shipped");
-        assert_eq!(view.posts[0].sent_unix_ms, 11);
-    }
-
-    #[test]
-    fn build_announcements_view_hides_unverifiable_motd() {
-        // A MOTD signed by a key NOT on the whitelist and NOT the server key fails
-        // re-verification → it is not displayed (display only what verifies).
-        let signer = ann_keypair(43);
-        let stranger = ann_keypair(44);
-        let server = ann_keypair(45);
-        let whitelist = wire::GetSignerWhitelistResponse {
-            entries: vec![full_key_entry(&signer)],
-        };
-        let motd = wire::GetMotdResponse {
-            motd: Some(signed_motd(&stranger, "spoofed motd", 1)),
-        };
-        let posts = wire::ListPostsResponse { posts: vec![] };
-
-        let view = build_announcements_view(&motd, &posts, &whitelist, server.public_key());
-        assert!(view.motd.is_none(), "an unverifiable MOTD is hidden");
-        assert!(view.posts.is_empty());
-    }
 
     // ── #93 unread-gated landing (ISC-C93) ───────────────────────────────────
 

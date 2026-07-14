@@ -31,15 +31,10 @@ ratatui = { workspace = true }
 daemonseed-cli = { path = "../daemonseed-cli" }
 daemonseed-core = { path = "../daemonseed-core" }
 daemonseed-proto = { path = "../daemonseed-proto" }
-daemonseed-server = { path = "../daemonseed-server" }
 
-# Veilid transport (#98 / Phase 2), behind the `veilid` feature. Optional + a
-# plain path dep on the `[workspace] exclude`d crate: default builds never
-# compile it (the frozen relay BUILD stays unperturbed), while `--features
-# veilid` selects the parallel Veilid net actor (circles-only today). veilid-core
-# enters the workspace Cargo.lock as inert resolution only. The exclude + this
-# crate's relay actor are both deleted at the v0.33.0 cutover.
-daemonseed-veilid-net = { path = "../daemonseed-veilid-net", optional = true }
+# Veilid transport (#98) — the only transport. Backs the net actor
+# (`src/veilid_net.rs`) that `net::NetHandle::new` spawns.
+daemonseed-veilid-net = { path = "../daemonseed-veilid-net" }
 
 # Process-wide CryptoProvider install — symmetric with cli/server. The TUI
 # initializes the same oxicrypt module + rustls provider before connecting.
@@ -64,15 +59,6 @@ anyhow = { workspace = true }
 # (ISC-C68 / A3). Replaces the hand-rolled `$XDG_DOWNLOAD_DIR` / `$HOME/Downloads`
 # probe in `main::os_downloads_dir`.
 dirs = { workspace = true }
-
-[features]
-default = []
-# Veilid transport backend (#98). Off by default (relay path); when on, the net
-# actor selects `VeilidNetHandle` for circle + public-share traffic (Phase 3
-# Slice 2b). Also turns on `daemonseed-cli/veilid` so the least-authority
-# `IdentityRouteAdvertSigner` (the `Arc<dyn RouteAdvertSigner>` the share-publish
-# path hands veilid-net) is in scope. Flips to default at v0.33.0.
-veilid = ["dep:daemonseed-veilid-net", "daemonseed-cli/veilid"]
 
 [dev-dependencies]
 oxitls-rustls-provider = { workspace = true, features = ["testing"] }

@@ -1,9 +1,7 @@
-//! Parallel Veilid-backed net actor (#98 S2 + Phase 3 Slice 2b), compiled only
-//! under the `veilid` feature.
+//! Veilid-backed net actor (#98 S2 + Phase 3 Slice 2b) — the only transport.
 //!
-//! It implements the SAME `NetCommand` / `NetEvent` contract the relay actor in
-//! [`crate::net`] does, so the UI is unchanged — the only switch is which actor
-//! [`crate::net::NetHandle::new`] spawns (a `#[cfg(feature = "veilid")]` branch).
+//! It implements the `NetCommand` / `NetEvent` contract defined in [`crate::net`],
+//! which [`crate::net::NetHandle::new`] spawns unconditionally.
 //! Backed by [`daemonseed_veilid_net::VeilidNetHandle`].
 //!
 //! **Circles, public shares, lobby chat, lobby presence + operator
@@ -1040,18 +1038,6 @@ async fn handle_command(
         }
 
         // ── Public-room (Lobby) chat ──
-        NetCommand::JoinRoom { room } => {
-            // The lobby is world-derivable and already subscribed on Connect; a
-            // JoinRoom just re-affirms it so the UI marks the room ready. Only the
-            // default lobby is wired (named public rooms are Phase 4).
-            if shares.lobby.is_some() {
-                let _ = evt_tx.send(NetEvent::RoomJoined { room });
-            } else {
-                let _ = evt_tx.send(NetEvent::Error {
-                    reason: "lobby not subscribed yet".to_owned(),
-                });
-            }
-        }
         NetCommand::SendRoom { text } => {
             send_room(&text, evt_tx, net, my_handle, shares).await;
         }
@@ -1062,12 +1048,6 @@ async fn handle_command(
         NetCommand::UploadAnnouncement { topic, body } => {
             upload_announcement(shares, evt_tx, net, &topic, &body).await;
         }
-
-        // Internal / timer-driven commands the relay actor self-sends. None are
-        // generated in Veilid mode (no relay heartbeat/reconnect machinery runs),
-        // so they are silent no-ops; the catch-all also covers `#[cfg(test)]`
-        // seam variants that do not exist in this build.
-        _ => {}
     }
 }
 
@@ -2043,7 +2023,6 @@ async fn fetch_share(
                 .map(|e| ShareManifestEntry {
                     rel_path: e.rel_path.clone(),
                     size: e.size,
-                    chunk_count: e.chunks.len() as u32,
                 })
                 .collect();
             let _ = evt_tx.send(NetEvent::FetchManifest {

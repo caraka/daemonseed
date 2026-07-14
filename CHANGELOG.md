@@ -75,6 +75,7 @@ work lives in the project lead's vault manifest, not here.
 
 ### Changed
 
+- `daemonseed-{gui,tui}`: the client net actors run Veilid-only. `net::NetHandle::new` spawns the Veilid actor unconditionally (the `#[cfg(feature = "veilid")]` selection is gone), and `net` is now the transport contract (`NetCommand` / `NetEvent` / `NetHandle` / `RosterEntry` / `ShareManifestEntry`) plus the transport-agnostic helpers the Veilid actor and the UI share (roster building, handle canonicalization, share-path hygiene). The `veilid` cargo feature is removed across `daemonseed-{gui,tui,cli}`; `daemonseed-veilid-net` is a non-optional dependency; `daemonseed-cli`'s `route_signer` module is unconditional.
 - `daemonseed-{core,server}`: `kats` and the TLS `CryptoProvider` install move from `daemonseed-server` to `daemonseed-core`.
 - `daemonseed-core`: the redacted-zeroizing secret-seed newtype boilerplate is consolidated behind one crate-internal `secret_seed::redacted_secret_newtype!` macro (`boxed` / `inline` shapes) and the six boxed rendezvous-owner-seed derivations share one `secret_seed::derive_boxed_seed` HKDF-expand/stack-zeroize/`Box` helper — the six `*VeilidOwnerSeed` types plus `ShareRootIkm` / `VeilidNodeSeed` now carry their zeroize-on-drop + redacted `Debug` + both-path stack-zeroize hygiene from one place; the per-context HKDF-extract, the distinct key-class newtypes, and every public signature and error variant are unchanged (byte-identity KATs guard the derivations). `ShareRootIkm` / `VeilidNodeSeed` `Debug` normalizes to the tuple form `Name(<redacted>)` used by the other secrets (both stay fully redacted) (#135).
 - `daemonseed-core`: the AES-256-GCM `nonce ‖ ct ‖ tag` envelope invariant is extracted to one crate-internal `aead_envelope::{seal_envelope, open_envelope}` primitive shared by `room_message`, `heartbeat`, and `share_rollcall`, which previously inlined it three times; each call site keeps its own AAD, the heartbeat keeps its caller-side fixed-length padding, and each maps the internal `EnvelopeError` onto its existing error type so no public signature or wire byte changes (#149).
@@ -94,6 +95,12 @@ work lives in the project lead's vault manifest, not here.
 - `daemonseed-gui`: the restore banner now leads the connect-time republish — a single "Restoring N shares from last session…" notice fires (via `NetEvent::RestoreStarted`) before any share is re-served, instead of a per-share completion notice that arrived coincident with the share going live and read as redundant (#122).
 - `daemonseed-veilid-net`: the public-share fetcher pulls fragments in a bounded-concurrency pipeline (`buffered`, in request order) instead of one `app_call` at a time, with each fragment size-capped at `FRAGMENT_SIZE` to bound reassembly memory (#109).
 - `daemonseed-gui`: public-share downloads fetch a file's chunks with bounded concurrency (`fetch_chunks_ordered`, `buffered` window `CHUNK_FETCH_CONCURRENCY`) instead of one chunk at a time, preserving manifest order for byte-for-byte reassembly and per-chunk progress; the higher level above #109's within-chunk fragment pipeline (#113).
+
+### Removed
+
+- `daemonseed-{gui,tui}`: the relay net actors (`net::net_actor` + the `Actor` relay implementation and its in-process relay round-trip tests) and the `veilid` feature gate; the relay-only `NetCommand` / `NetEvent` variants (the actor self-commands and the session/probe test seams) and the `NetCommand::Connect` relay fields (`server_id`, `address`, `index_params`) together with their `Profile::index_params` / `GuiState::persisted_index_params` / `Profile::index_key` plumbing.
+- `daemonseed-gui`: `state::build_announcements_view` (the relay-path client re-verification of served announcements/MOTD); the Veilid actor verifies operator content at ingest and builds the view directly.
+- `daemonseed-{gui,tui}`: the `daemonseed-server` dependency — crypto init (`kats` + TLS provider install) now rides `daemonseed-core`.
 
 ### Fixed
 

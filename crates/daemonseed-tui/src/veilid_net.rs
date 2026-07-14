@@ -1,9 +1,7 @@
-//! Parallel Veilid-backed net actor (#98 S2 + Phase 3 Slice 2b), compiled only
-//! under the `veilid` feature.
+//! Veilid-backed net actor (#98 S2 + Phase 3 Slice 2b) — the only transport.
 //!
-//! It implements the SAME `NetCommand` / `NetEvent` contract the relay actor in
-//! [`crate::net`] does, so the UI is unchanged — the only switch is which actor
-//! [`crate::net::NetHandle::new`] spawns (a `#[cfg(feature = "veilid")]` branch).
+//! It implements the `NetCommand` / `NetEvent` contract defined in [`crate::net`],
+//! which [`crate::net::NetHandle::new`] spawns unconditionally.
 //! Backed by [`daemonseed_veilid_net::VeilidNetHandle`]. This is the TUI mirror
 //! of `daemonseed-gui`'s `veilid_net` module, adapted to the TUI's command
 //! surface (the GUI and TUI `NetCommand`/`NetEvent` enums diverge — see below).
@@ -1675,7 +1673,7 @@ fn apply_discovery(
     true
 }
 
-#[cfg(all(test, feature = "veilid"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use daemonseed_veilid_net::route_provenance_input;
