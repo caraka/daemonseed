@@ -24,6 +24,8 @@ next release this block is renamed to its version + date and a fresh
 `[Unreleased]` is opened (see `AGENTS.md` doc-sync). Planning for *unstarted*
 work lives in the project lead's vault manifest, not here.
 
+## [0.33.0] — 2026-07-14
+
 ### Added
 
 - `daemonseed-{veilid-net,core,gui,tui}`: the WB-5.1 read-lane cure (`docs/design/veilid-write-budget.md` §WB-5.1) — the four-pool partitioned `dht_gate::DhtGate` (chat 2 / I8-floor 1 / write `W_max` / read remainder, no cross-pool fallback, `acquire_wait` demoted to trace-only telemetry); per-GET read permits in `rendezvous::sweep` so read occupancy is bounded by the read partition regardless of live sweep count; the acquire-wait window controller retired for a static `min(distinct pending non-chat records, W_max)` window; a dedicated capacity-1 floor lane with a direct starved-age eligibility predicate that survives I3 coalescing (`starved_since` inheritance) and I6b riding it deadline-first; a median-of-5 DHT-weather estimator replacing the EMA; the transport-free `presence::ReapGate` (8s/4s hysteresis band + 220s reap-resume grace) wired into both frontend reapers with a "presence may be stale" indicator; `#168` dispatch-future-construction panic supervision plus `record_locks`/`OpenCache` poison-recovery. Registers WB-ISC-16/17/18/20/21–28; WB-ISC-15/19 stay live-probe-deferred (#159, #168, #157).
