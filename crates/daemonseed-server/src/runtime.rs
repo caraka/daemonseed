@@ -93,8 +93,8 @@ struct ServerContext {
 /// outcome before the per-connection task exits.
 ///
 /// **Idempotent precondition contract:** the caller MUST have driven
-/// [`crate::tls::install_provider`] to `Ok(())` and
-/// `oxicrypt_module::initialize_with_profile(&kats::CNSA_2_0_KATS,
+/// [`daemonseed_core::tls::install_provider`] to `Ok(())` and
+/// `oxicrypt_module::initialize_with_profile(&daemonseed_core::kats::CNSA_2_0_KATS,
 /// AlgorithmProfile::Cnsa2)` to `Ok(())` before calling this.
 /// `tls_config` will fail to build otherwise; we don't redundantly
 /// gate here.

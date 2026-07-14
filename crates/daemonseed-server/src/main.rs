@@ -28,15 +28,16 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::Parser;
+use daemonseed_core::kats::CNSA_2_0_KATS;
+use daemonseed_core::tls::{TlsError, install_provider};
 use daemonseed_server::{
     config::{ConfigError, ServerConfig as DseedConfig, resolve_config_path},
     deprecation::{DeprecationBuildError, build_signed_deprecation_policy},
     identity::{IdentityError, derive_server_id, load_or_generate},
     identity_proof::{IdentityProofError, ServerIdentity, now_unix_ms},
-    kats::CNSA_2_0_KATS,
     public_space::{LoadError, PublicSpaceConfig, PublicSpaceState},
     runtime::{noop_observer, parse_listen_addr, run, shutdown_signal},
-    tls::{DEFAULT_CERT_VALIDITY, TlsError, build_server_config, install_provider},
+    tls::{DEFAULT_CERT_VALIDITY, build_server_config},
 };
 use oxicrypt_module::{AlgorithmProfile, initialize_with_profile};
 

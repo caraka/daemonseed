@@ -11,14 +11,14 @@ use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use daemonseed_core::kats::CNSA_2_0_KATS;
 use daemonseed_core::profile::resolve::resolve;
 use daemonseed_core::profile::{
     ResolveArgs, ResolvedProfileRoot, load_for_unlock, session_materials_from_unlock,
     write_first_start, write_seeds_blob,
 };
 use daemonseed_core::storage::seeds;
-use daemonseed_server::kats::CNSA_2_0_KATS;
-use daemonseed_server::tls::install_provider;
+use daemonseed_core::tls::install_provider;
 use daemonseed_tui::app::App;
 use daemonseed_tui::net::{NetCommand, NetHandle};
 use daemonseed_tui::ui;

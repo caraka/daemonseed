@@ -19,9 +19,9 @@ use daemonseed_cli::connect::{ConnectError, connect, resolve_address};
 use daemonseed_cli::identity_proof::{ClientIdentity, ClientIdentityError};
 use daemonseed_core::federation::store::{InMemoryTrustStore, ServerEntry, TrustStore};
 use daemonseed_core::handle::Handle;
+use daemonseed_core::kats::CNSA_2_0_KATS;
 use daemonseed_core::storage::seeds::CounterState;
-use daemonseed_server::kats::CNSA_2_0_KATS;
-use daemonseed_server::tls::install_provider;
+use daemonseed_core::tls::install_provider;
 use oxicrypt_module::{AlgorithmProfile, initialize_with_profile};
 
 #[derive(Parser, Debug)]
@@ -125,7 +125,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
 #[derive(Debug)]
 enum CliError {
     ModuleInit(oxicrypt_module::Error),
-    ProviderInstall(daemonseed_server::tls::TlsError),
+    ProviderInstall(daemonseed_core::tls::TlsError),
     Runtime(std::io::Error),
     Identity(ClientIdentityError),
     Connect(ConnectError),

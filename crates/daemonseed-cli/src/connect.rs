@@ -511,7 +511,7 @@ mod tests {
     #[test]
     fn build_client_config_pins_alpn_h2() {
         oxitls_rustls_provider::testing::ensure_module_operational();
-        let _ = daemonseed_server::tls::install_provider();
+        let _ = daemonseed_core::tls::install_provider();
         let cfg = build_client_config().expect("ClientConfig build");
         assert_eq!(cfg.alpn_protocols, vec![b"h2".to_vec()]);
     }

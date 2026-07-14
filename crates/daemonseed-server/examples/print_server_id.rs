@@ -8,7 +8,7 @@
 use std::path::Path;
 use std::process::exit;
 
-use daemonseed_server::kats::CNSA_2_0_KATS;
+use daemonseed_core::kats::CNSA_2_0_KATS;
 use oxicrypt_module::{AlgorithmProfile, initialize_with_profile};
 
 fn main() {

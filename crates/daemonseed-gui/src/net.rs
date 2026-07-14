@@ -4379,8 +4379,8 @@ mod tests {
     #[test]
     #[ignore = "live relay; run explicitly with DAEMONSEED_RELAY_* set"]
     fn live_fra1_round_trip() {
-        use daemonseed_server::kats::CNSA_2_0_KATS;
-        use daemonseed_server::tls::install_provider;
+        use daemonseed_core::kats::CNSA_2_0_KATS;
+        use daemonseed_core::tls::install_provider;
         use oxicrypt_module::{AlgorithmProfile, initialize_with_profile};
 
         let server_id =
@@ -5147,8 +5147,8 @@ mod tests {
     #[test]
     #[ignore = "live relay; run explicitly with DAEMONSEED_RELAY_* set"]
     fn live_fra1_circle_round_trip() {
-        use daemonseed_server::kats::CNSA_2_0_KATS;
-        use daemonseed_server::tls::install_provider;
+        use daemonseed_core::kats::CNSA_2_0_KATS;
+        use daemonseed_core::tls::install_provider;
         use oxicrypt_module::{AlgorithmProfile, initialize_with_profile};
 
         let server_id =
@@ -5265,8 +5265,8 @@ mod tests {
     #[test]
     #[ignore = "live relay; run explicitly with DAEMONSEED_RELAY_* set"]
     fn live_fra1_share_round_trip() {
-        use daemonseed_server::kats::CNSA_2_0_KATS;
-        use daemonseed_server::tls::install_provider;
+        use daemonseed_core::kats::CNSA_2_0_KATS;
+        use daemonseed_core::tls::install_provider;
         use oxicrypt_module::{AlgorithmProfile, initialize_with_profile};
 
         let server_id =

@@ -16,10 +16,9 @@
 //!   (ISC-A-S7)
 //! - [`identity`] — long-term ML-DSA-87 server keypair + server-id
 //!   construction (ISC-S11)
-//! - [`kats`] — assembled CNSA 2.0 KATS slice for production
-//!   `oxicrypt_module::initialize_with_profile`
-//! - [`tls`] — rustls `ServerConfig` builder + provider install
-//!   (ISC-S2a / S2b / S5 / A-S9 / A6)
+//! - [`tls`] — rustls `ServerConfig` builder (ISC-S2a / S2b / S5 /
+//!   A-S9); the process-wide provider install lives in
+//!   `daemonseed_core::tls`
 //! - [`hello`] — length-prefixed prost framing for `APP_HELLO` /
 //!   `APP_HELLO_ACK` / `APP_HELLO_REJECT` (ISC-S14)
 //! - [`identity_proof`] — post-HELLO identity-proof orchestration:
@@ -45,7 +44,6 @@ pub mod federation;
 pub mod hello;
 pub mod identity;
 pub mod identity_proof;
-pub mod kats;
 pub mod public_space;
 pub mod rate_limit;
 pub mod runtime;

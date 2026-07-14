@@ -39,6 +39,11 @@
 //! guard). Design-of-record: `docs/design/unified-share-model.md`.
 //!
 //! [`ShareContent`]: share_serve::ShareContent
+//!
+//! Startup crypto-init shared with the frontends lives here too:
+//! [`kats`] assembles the CNSA 2.0 KATS slice for
+//! `oxicrypt_module::initialize_with_profile`, and [`tls`] installs the
+//! process-wide rustls `CryptoProvider` (`tls::install_provider`).
 
 #![forbid(unsafe_code)]
 
@@ -59,6 +64,7 @@ pub mod heartbeat;
 pub mod identity;
 pub mod identity_proof;
 pub mod indexer;
+pub mod kats;
 pub mod kdf;
 pub mod mention;
 pub mod passphrase;
@@ -76,6 +82,7 @@ pub mod share_rollcall;
 pub mod share_seal;
 pub mod share_serve;
 pub mod storage;
+pub mod tls;
 pub mod transcript;
 pub mod trust_events;
 pub mod version;

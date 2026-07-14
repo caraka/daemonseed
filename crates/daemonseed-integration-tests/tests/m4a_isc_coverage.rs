@@ -36,6 +36,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use daemonseed_core::tls::install_provider;
 use daemonseed_core::version::{ProtocolVersion, SUPPORTED};
 use daemonseed_integration_tests::isc_coverage::Coverage;
 use daemonseed_proto::v1 as wire;
@@ -45,7 +46,7 @@ use daemonseed_server::identity::{Seed, derive_server_id, generate_seed};
 use daemonseed_server::identity_proof::ServerIdentity;
 use daemonseed_server::public_space::PublicSpaceState;
 use daemonseed_server::runtime;
-use daemonseed_server::tls::{DEFAULT_CERT_VALIDITY, build_server_config, install_provider};
+use daemonseed_server::tls::{DEFAULT_CERT_VALIDITY, build_server_config};
 use prost::Message;
 use tokio::sync::oneshot;
 

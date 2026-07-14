@@ -28,7 +28,7 @@ use std::time::Duration;
 use common::gate::{ServerProcess, ensure_module_operational};
 use common::wire_shape::{Classification, WireShape, classify};
 use daemonseed_cli::connect::build_client_config;
-use daemonseed_server::tls::install_provider;
+use daemonseed_core::tls::install_provider;
 use rustls::ClientConnection;
 use rustls_pki_types::ServerName;
 

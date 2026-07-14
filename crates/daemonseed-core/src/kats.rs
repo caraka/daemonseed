@@ -9,7 +9,7 @@
 //! For the CNSA 2.0 transitional provider, the gated primitives are:
 //!
 //! - **SHA** — used by HMAC, KDF, transcript hashing, and the
-//!   server-id derivation in [`crate::identity::derive_server_id`].
+//!   server-id derivation.
 //! - **HMAC** — record-protection KDF salt path (HKDF inside oxicrypt-kdf).
 //! - **AES** — `TLS_AES_256_GCM_SHA384` record protection.
 //! - **KDF** — HKDF-SHA-384 expand/extract for TLS 1.3 key schedule.
