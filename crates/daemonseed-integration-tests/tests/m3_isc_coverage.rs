@@ -1,12 +1,14 @@
-//! End-to-end exercise of the 5 M3 spec-ISCs.
+//! End-to-end exercise of the 4 surviving M3 spec-ISCs.
 //!
 //! Per `ds-mvp-implementation-plan.md:68-73`, M3 closes ISC-C24, A-C8,
-//! S15, A-S10, A-C9 — the suite registry + crypto-agility primitives.
+//! S15, A-C9 — the suite registry + crypto-agility primitives.
+//! (M3 also originally registered ISC-A-S10 server-src suite-transparency;
+//! that anti-criterion was withdrawn at the v0.33.0 Veilid cutover — the
+//! relay crate is gone — so its structural grep block was removed and its
+//! coverage subsumes into ISC-A-S2 / ISC-C24.)
 //! This test walks the public surface introduced by M3's four commits
-//! and registers one coverage entry per spec-ISC. The final assertion
-//! pins the registered count to 5.
-
-use std::path::{Path, PathBuf};
+//! and registers one coverage entry per surviving spec-ISC. The final
+//! assertion pins the registered count to 4.
 
 use daemonseed_core::crypto::policy::WritePolicy;
 use daemonseed_core::crypto::suite::{CNSA_2_0, LifecycleState, Registry, SuiteId, WriteRefusal};
@@ -119,33 +121,6 @@ fn m3_iscs_exercise_end_to_end() {
         "m3_iscs::flat_circle_write_policy_and_family_anchor",
     );
 
-    // ── ISC-A-S10: server is suite-transparent on CoT relay. Negative
-    // structural anchor: daemonseed-server (and its only file at M3,
-    // src/main.rs) MUST NOT import or call `Registry::lookup` /
-    // `resolve_for_write` / `Suite::same_family` on any CoT-relay path.
-    // At M3 daemonseed-server is the placeholder `fn main() {}`, so the
-    // grep is vacuously satisfied; the assertion's value is the
-    // regression anchor it becomes when M5/M6 add CoT-relay code.
-    // ─────────────────────────────────────────────────────────────────────
-    let server_src = repo_root().join("crates/daemonseed-server/src");
-    let banned = [
-        "Registry::lookup",
-        "Registry::resolve",
-        "Suite::same_family",
-    ];
-    for entry in walk_rs(&server_src) {
-        let text = std::fs::read_to_string(&entry).expect("read server src");
-        for needle in banned {
-            assert!(
-                !text.contains(needle),
-                "ISC-A-S10 regression: {} contains `{}`; server must stay suite-transparent on CoT paths",
-                entry.display(),
-                needle
-            );
-        }
-    }
-    coverage.register("ISC-A-S10", "m3_iscs::server_suite_transparency");
-
     // ── ISC-A-C9: client must not silently bypass / auto-rotate identity
     // to escape a deprecation cutoff. At M3 no cutoff policy ships
     // (ISC-S16 / C25 land at M7), so the structural verification is:
@@ -169,47 +144,15 @@ fn m3_iscs_exercise_end_to_end() {
     assert_eq!(resealed_open.suite_id, Registry::default_write_suite());
     coverage.register("ISC-A-C9", "m3_iscs::no_silent_suite_downgrade");
 
-    // ── Final assertion: 5 M3 spec-ISCs registered. ───────────────────────
+    // ── Final assertion: 4 surviving M3 spec-ISCs registered. ─────────────
     assert_eq!(
         coverage.covered_count(),
-        5,
-        "expected 5 M3 ISCs registered, got {}",
+        4,
+        "expected 4 M3 ISCs registered, got {}",
         coverage.covered_count()
     );
-    // 2 positive (C24, S15) + 3 negative (A-C8, A-S10, A-C9) = 5 total.
+    // 2 positive (C24, S15) + 2 negative (A-C8, A-C9) = 4 total.
+    // (ISC-A-S10 was withdrawn at the v0.33.0 Veilid cutover.)
     assert_eq!(coverage.positive_tests.len(), 2);
-    assert_eq!(coverage.negative_tests.len(), 3);
-}
-
-/// Resolve the repository root by walking up from the integration-tests
-/// crate's `CARGO_MANIFEST_DIR`. Used by the ISC-A-S10 grep assertion
-/// so the test works from any worktree placement.
-fn repo_root() -> PathBuf {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    // CARGO_MANIFEST_DIR = <repo>/crates/daemonseed-integration-tests
-    manifest
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("repo root resolves via two parents of integration-tests CARGO_MANIFEST_DIR")
-        .to_path_buf()
-}
-
-/// Recursively yield all `.rs` files under `root`.
-fn walk_rs(root: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(read) = std::fs::read_dir(&dir) else {
-            return out;
-        };
-        for entry in read.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
-                out.push(path);
-            }
-        }
-    }
-    out
+    assert_eq!(coverage.negative_tests.len(), 2);
 }

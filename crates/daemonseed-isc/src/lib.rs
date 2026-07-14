@@ -17,10 +17,13 @@
 //!
 //! Count invariants (kept aligned with `ISA.md` `## Criteria`):
 //!
-//! - 63 server-side: 35 positive (`ISC-S*`) + 28 negative (`ISC-A-S*`)
-//!   (S31 added the #89 UploadMotd in-band signer-set MOTD; #156 added
-//!   ISC-S32/S33/S34 pos + ISC-A-S24/A-S25/A-S26 neg — the receiver-verifiable
-//!   share_id binding)
+//! - 39 server-side: 21 positive (`ISC-S*`) + 18 negative (`ISC-A-S*`)
+//!   (the v0.33.0 Veilid cutover withdrew the relay/TLS/federation/rate-limit
+//!   ISCs — S1/S2a/S3/S5/S6/S10-S14/S16-S19 pos + A-S1/A-S4b/A-S6-A-S9/
+//!   A-S11-A-S14 neg — as ISA tombstones; the surviving public-space/CoT/room/
+//!   share ones re-scoped to the Veilid DHT. S31 added the #89 UploadMotd
+//!   in-band signer-set MOTD; #156 added ISC-S32/S33/S34 pos + ISC-A-S24/A-S25/
+//!   A-S26 neg — the receiver-verifiable share_id binding)
 //! - 124 client-side: 88 positive (`ISC-C*`) + 36 negative (`ISC-A-C*`)
 //!   (M16 A1 added C66 manifest-preview + A-C33 no-blind-download, A2 added C67 selective-fetch,
 //!   A3 added C68 choose-download-dir, A4 added C72 collapsible-folder-tree preview, C1 added C69
@@ -47,7 +50,7 @@
 //!   C98 GUI share-name persistence;
 //!   WB-ISC-9/10/13 pos + WB-ISC-11/12 neg — the WB-3 write scheduler, #159;
 //!   WB-ISC-3/4/5/6/7 pos + WB-ISC-1/2/8 neg — the WB-1 presence model, #159.)
-//! - 200 total
+//! - 189 total
 //!
 //! Deliberately EXCLUDED from [`ISCS`] (and therefore from [`TOTAL`]) because
 //! they are not built: the deferred direct-messaging family
@@ -74,27 +77,16 @@ pub enum IscClass {
 /// Every ISC known to this MVP, in declaration order from `ds-isc-draft.md`.
 /// Length is [`TOTAL`].
 pub const ISCS: &[(&str, IscClass)] = &[
-    // ── server positive (32) ────────────────────────────────────────────
-    ("ISC-S1", IscClass::Positive),
-    ("ISC-S2a", IscClass::Positive),
+    // ── server positive (21 — the relay/TLS/federation ISCs S1/S2a/S3/S5/S6/
+    //    S10-S14/S16-S19 were withdrawn as tombstones at the v0.33.0 Veilid
+    //    cutover; the surviving public-space/CoT/room/share ones re-scoped to
+    //    the Veilid DHT) ───────────────────────────────────────────────────
     ("ISC-S2b", IscClass::Positive),
-    ("ISC-S3", IscClass::Positive),
     ("ISC-S4", IscClass::Positive),
-    ("ISC-S5", IscClass::Positive),
-    ("ISC-S6", IscClass::Positive),
     ("ISC-S7", IscClass::Positive),
     ("ISC-S8", IscClass::Positive),
     ("ISC-S9", IscClass::Positive),
-    ("ISC-S10", IscClass::Positive),
-    ("ISC-S11", IscClass::Positive),
-    ("ISC-S12", IscClass::Positive),
-    ("ISC-S13", IscClass::Positive),
-    ("ISC-S14", IscClass::Positive),
     ("ISC-S15", IscClass::Positive),
-    ("ISC-S16", IscClass::Positive),
-    ("ISC-S17", IscClass::Positive),
-    ("ISC-S18", IscClass::Positive),
-    ("ISC-S19", IscClass::Positive),
     ("ISC-S20", IscClass::Positive),
     ("ISC-S21", IscClass::Positive),
     ("ISC-S22", IscClass::Positive),
@@ -115,23 +107,15 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-S32", IscClass::Positive),
     ("ISC-S33", IscClass::Positive),
     ("ISC-S34", IscClass::Positive),
-    // ── server negative (24) ────────────────────────────────────────────
-    ("ISC-A-S1", IscClass::Negative),
+    // ── server negative (18 — the relay/federation/rate-limit anti-ISCs
+    //    A-S1/A-S4b/A-S6-A-S9/A-S11-A-S14 were withdrawn as tombstones at the
+    //    v0.33.0 Veilid cutover) ─────────────────────────────────────────
     ("ISC-A-S2", IscClass::Negative),
     ("ISC-A-S3", IscClass::Negative),
     ("ISC-A-S4", IscClass::Negative),
-    ("ISC-A-S4b", IscClass::Negative),
     ("ISC-A-S5", IscClass::Negative),
     ("ISC-A-S5b", IscClass::Negative),
-    ("ISC-A-S6", IscClass::Negative),
-    ("ISC-A-S7", IscClass::Negative),
-    ("ISC-A-S8", IscClass::Negative),
-    ("ISC-A-S9", IscClass::Negative),
     ("ISC-A-S10", IscClass::Negative),
-    ("ISC-A-S11", IscClass::Negative),
-    ("ISC-A-S12", IscClass::Negative),
-    ("ISC-A-S13", IscClass::Negative),
-    ("ISC-A-S14", IscClass::Negative),
     ("ISC-A-S15", IscClass::Negative),
     ("ISC-A-S16", IscClass::Negative),
     ("ISC-A-S17", IscClass::Negative),
@@ -355,7 +339,7 @@ pub const ISCS: &[(&str, IscClass)] = &[
 /// of truth for the coverage denominator, read live by `xtask isc-coverage`.
 /// Recount on every ISC add/remove (the `const _` assert below guards it
 /// against [`ISCS`]).
-pub const TOTAL: usize = 213;
+pub const TOTAL: usize = 189;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -376,7 +360,7 @@ const _: () = assert!(
 pub const MILESTONE_COVERED: &[(&str, usize)] = &[
     ("M1", 17),
     ("M2", 12),
-    ("M3", 5),
+    ("M3", 4),
     ("M4a", 9),
     ("M4b", 5),
     ("M5", 7),
@@ -391,7 +375,7 @@ pub const MILESTONE_COVERED: &[(&str, usize)] = &[
 /// of truth for the coverage numerator, read live by `xtask isc-coverage`
 /// (it replaced a hand-maintained `COVERED_ISCS` mirror in xtask). Equals the
 /// sum of [`MILESTONE_COVERED`] (guarded by `covered_sum_matches`).
-pub const COVERED: usize = 111;
+pub const COVERED: usize = 110;
 
 const _: () = assert!(
     COVERED <= TOTAL,
@@ -546,9 +530,11 @@ mod tests {
         //                                  WB-ISC-17/24/26/27/28 neg (accountant bound /
         //                                  chat-never-waits / panic-recovery /
         //                                  telemetry-only / single-permit), #159/#168/#157)
-        //   total   138 pos + 75 neg = 213
-        assert_eq!(pos, 138, "positive count drift");
-        assert_eq!(neg, 75, "negative count drift");
+        //   total   124 pos + 65 neg = 189
+        //   (the v0.33.0 Veilid cutover retired 14 server-positive + 10
+        //    server-negative relay/TLS/federation/rate-limit ISCs.)
+        assert_eq!(pos, 124, "positive count drift");
+        assert_eq!(neg, 65, "negative count drift");
     }
 
     /// COVERED is single-sourced and must agree with the per-milestone
@@ -569,10 +555,10 @@ mod tests {
     #[test]
     fn register_routes_to_correct_half() {
         let mut c = Coverage::empty();
-        c.register("ISC-S1", "smoke_test_s1");
-        c.register("ISC-A-S1", "smoke_negative_a_s1");
-        assert!(c.positive_tests.contains_key("ISC-S1"));
-        assert!(c.negative_tests.contains_key("ISC-A-S1"));
+        c.register("ISC-S2b", "smoke_test_s2b");
+        c.register("ISC-A-S2", "smoke_negative_a_s2");
+        assert!(c.positive_tests.contains_key("ISC-S2b"));
+        assert!(c.negative_tests.contains_key("ISC-A-S2"));
         assert_eq!(c.covered_count(), 2);
     }
 
