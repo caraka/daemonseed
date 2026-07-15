@@ -97,6 +97,7 @@ use daemonseed_core::public_room::{
     derive_room_share_veilid_owner_seed, derive_room_veilid_owner_seed, open_room_message,
     seal_room_message,
 };
+use daemonseed_core::route_guard::ImportedRouteGuard;
 use daemonseed_core::session_health::{
     RepairDecision, SessionHealthTracker, SweepHealthInput, WatchState, Weather,
 };
@@ -237,6 +238,14 @@ struct ShareState {
     /// Last-emitted "presence may be stale" signal (WB-ISC-20), so a
     /// `NetEvent::PresenceStale` is emitted only on a change.
     prev_presence_stale: bool,
+    /// (#180 §RS-3, CRSH-ISC-10) The in-use guard over each discovered share's last-imported
+    /// private route: defers a superseded route's release until no in-flight fetch is still
+    /// streaming over it. Fed by fetch spawn/finish and advert-replacement folds; the actor
+    /// loop drains `pending_route_releases` through the net handle.
+    route_guard: ImportedRouteGuard<String, RouteId>,
+    /// (#180 §RS-3) Imported routes the guard has cleared for release, drained and released
+    /// (spawned) by the actor loop each iteration.
+    pending_route_releases: Vec<RouteId>,
 }
 
 impl ShareState {
@@ -252,6 +261,8 @@ impl ShareState {
             own: Vec::new(),
             reap_gate: ReapGate::new(),
             prev_presence_stale: false,
+            route_guard: ImportedRouteGuard::new(),
+            pending_route_releases: Vec::new(),
         }
     }
 }
@@ -342,10 +353,8 @@ pub async fn veilid_net_actor(
     // the whole loop, so the receiver never closes while the actor lives.
     let (fetch_outcome_tx, mut fetch_outcome_rx) =
         tokio::sync::mpsc::unbounded_channel::<FetchOutcome>();
-    // (#180 §RS-3) The on-loop map of each discovered share's last-imported private RouteId,
-    // fed by folded fetch outcomes. Authoritative on-loop; step 6 (CRSH-ISC-10) attaches the
-    // in-use guard + `release_tolerant` release. This step only records the id.
-    let mut imported_share_routes: HashMap<String, RouteId> = HashMap::new();
+    // (#180 §RS-3, CRSH-ISC-10) The in-use guard over discovered shares' imported routes
+    // lives on `shares.route_guard`; the loop drains `shares.pending_route_releases` below.
 
     loop {
         tokio::select! {
@@ -367,7 +376,7 @@ pub async fn veilid_net_actor(
             // stale-generation outcome no-ops. Cheap and synchronous — no fetch is awaited
             // here (the await already happened in the spawned task).
             Some(outcome) = fetch_outcome_rx.recv() => {
-                fold_fetch_outcome(&mut shares, &evt_tx, &mut imported_share_routes, outcome);
+                fold_fetch_outcome(&mut shares, &evt_tx, outcome);
             }
             // Only poll the Veilid event stream once connected.
             Some(ev) = recv_opt(&mut ev_rx), if ev_rx.is_some() => {
@@ -521,6 +530,30 @@ pub async fn veilid_net_actor(
                 }
             }
         }
+        // (#180 §RS-3, CRSH-ISC-10) Release any imported route the in-use guard cleared this
+        // iteration (superseded advert + no in-flight fetch), off the loop.
+        drain_route_releases(&mut shares, &net);
+    }
+}
+
+/// (#180 §RS-3, CRSH-ISC-10) Release, off the loop, every imported route the in-use guard
+/// cleared this iteration. Each release is spawned (fire-and-forget) through the net handle,
+/// which routes it via `release_tolerant` — so an already-evicted id is a benign no-op. When
+/// disconnected there is no handle; the drained ids fall to the transport LRU/expiry backstop
+/// (design Evidence 2).
+fn drain_route_releases(shares: &mut ShareState, net: &Option<VeilidNetHandle>) {
+    if shares.pending_route_releases.is_empty() {
+        return;
+    }
+    let routes = std::mem::take(&mut shares.pending_route_releases);
+    let Some(handle) = net.as_ref() else {
+        return;
+    };
+    for route in routes {
+        let handle = handle.clone();
+        tokio::spawn(async move {
+            handle.release_route(route).await;
+        });
     }
 }
 
@@ -1371,7 +1404,7 @@ async fn run_fetch(
 /// Immediate local failures (not connected, lobby not subscribed, share not discovered)
 /// still fail inline — they touch no network and need no spawn.
 fn spawn_fetch_share(
-    shares: &ShareState,
+    shares: &mut ShareState,
     evt_tx: &UnboundedSender<NetEvent>,
     net: &Option<VeilidNetHandle>,
     outcome_tx: &UnboundedSender<FetchOutcome>,
@@ -1396,6 +1429,9 @@ fn spawn_fetch_share(
     let handle = handle.clone();
     let share_id = share_id.to_owned();
     let name = name.to_owned();
+    // (#180 §RS-3, CRSH-ISC-10) In flight over the imported route until its outcome folds —
+    // a concurrent advert-replacement defers the old route's release until this completes.
+    shares.route_guard.note_fetch_started(share_id.clone());
     spawn_fetch_task(outcome_tx.clone(), async move {
         run_fetch(
             &handle,
@@ -1428,13 +1464,14 @@ where
 /// advert folded while the fetch was in flight — CRSH-ISC-19), so a dead manifest never
 /// renders and a route fetched over a superseded advert never drives UI. On a live outcome:
 /// success clears the Unresolved mark + emits `FetchManifest`; either failure marks the
-/// share Unresolved (local only, never a prune). The imported `RouteId` is recorded in the
-/// on-loop `imported_routes` map — step 6 (CRSH-ISC-10) attaches the in-use guard +
-/// `release_tolerant` release here; this step only records it.
+/// share Unresolved (local only, never a prune). Every folded outcome closes out the fetch
+/// on the in-use guard (`note_fetch_finished`, CRSH-ISC-10): the imported route is recorded
+/// so a later advert-replacement can release it, and any route a prior advert-replacement
+/// left pending is released once this share goes idle (buffered into
+/// `pending_route_releases` for the loop's off-loop release).
 fn fold_fetch_outcome(
     shares: &mut ShareState,
     evt_tx: &UnboundedSender<NetEvent>,
-    imported_routes: &mut HashMap<String, RouteId>,
     outcome: FetchOutcome,
 ) {
     let (share_id, generation) = match &outcome {
@@ -1457,8 +1494,11 @@ fn fold_fetch_outcome(
     // CRSH-ISC-19: the outcome is valid only against the exact discovered-entry generation
     // it was fetched over. A withdraw (entry gone) or a fresh advert fold (generation
     // advanced) mid-fetch makes the outcome stale → drop it, including any imported route
-    // (the LRU/expiry is the backstop; step 6 releases live-tracked routes).
+    // (the LRU/expiry is the backstop). The fetch still closes on the guard so its in-flight
+    // count is released (else a deferred route would never flush).
     if shares.discovered.get(&share_id).map(|d| d.generation) != Some(generation) {
+        let released = shares.route_guard.note_fetch_finished(&share_id, None);
+        shares.pending_route_releases.extend(released);
         daemonseed_veilid_net::vtrace!(
             "tui fetch outcome for {share_id} is stale (gen {generation}) — no-op"
         );
@@ -1472,8 +1512,12 @@ fn fold_fetch_outcome(
             entries,
             ..
         } => {
-            // The imported route returns on-loop for step 6's release map (§RS-3).
-            imported_routes.insert(share_id.clone(), route);
+            // Record the imported route on the guard (§RS-3); flush any route a prior
+            // advert-replacement deferred now that this fetch is done.
+            let released = shares
+                .route_guard
+                .note_fetch_finished(&share_id, Some(route));
+            shares.pending_route_releases.extend(released);
             // A successful re-resolve: clear any Unresolved mark + drop a parked retry.
             clear_share_unresolved(shares, evt_tx, &share_id);
             let _ = evt_tx.send(NetEvent::FetchManifest {
@@ -1489,9 +1533,12 @@ fn fold_fetch_outcome(
             message,
             ..
         } => {
-            // The route imported but the manifest fetch failed — record the route on-loop
-            // (step 6 releases it), then the local-only reactive path (§RS-1.4/§RS-1.5).
-            imported_routes.insert(share_id.clone(), route);
+            // The route imported but the manifest fetch failed — record it on the guard,
+            // then the local-only reactive path (§RS-1.4/§RS-1.5).
+            let released = shares
+                .route_guard
+                .note_fetch_finished(&share_id, Some(route));
+            shares.pending_route_releases.extend(released);
             mark_share_unresolved(shares, evt_tx, &share_id, &name);
             fetch_fail(evt_tx, message);
         }
@@ -1501,7 +1548,10 @@ fn fold_fetch_outcome(
             message,
             ..
         } => {
-            // No route imported — mark Unresolved + park a one-shot retry, never prune.
+            // No route imported — close the fetch on the guard, mark Unresolved + park a
+            // one-shot retry, never prune.
+            let released = shares.route_guard.note_fetch_finished(&share_id, None);
+            shares.pending_route_releases.extend(released);
             mark_share_unresolved(shares, evt_tx, &share_id, &name);
             fetch_fail(evt_tx, message);
         }
@@ -1605,7 +1655,7 @@ fn process_parked_browse_retries(
 /// clean-partial cleanup on failure, ISC-A-C31) while sourcing bytes over Veilid.
 #[allow(clippy::too_many_arguments)]
 async fn confirm_fetch(
-    shares: &ShareState,
+    shares: &mut ShareState,
     evt_tx: &UnboundedSender<NetEvent>,
     net: &Option<VeilidNetHandle>,
     share_id: &str,
@@ -1617,19 +1667,29 @@ async fn confirm_fetch(
     let Some(handle) = net.as_ref() else {
         return fetch_fail(evt_tx, "not connected to Veilid yet".to_owned());
     };
-    let Some(lobby) = shares.lobby.as_ref() else {
-        return fetch_fail(evt_tx, "lobby not subscribed yet".to_owned());
+    // Copy the route blob + room key out, dropping the immutable borrows so a fetch-stage
+    // failure can mark the share Unresolved (&mut) below (#180 §RS-1.4 — a download-fail is
+    // route-death, never a prune). `handle` rides `net`, disjoint from `shares`.
+    let (route_blob, room_key_bytes) = {
+        let Some(lobby) = shares.lobby.as_ref() else {
+            return fetch_fail(evt_tx, "lobby not subscribed yet".to_owned());
+        };
+        let Some(disc) = shares.discovered.get(share_id) else {
+            return fetch_fail(
+                evt_tx,
+                "share not discovered yet — refresh the list".to_owned(),
+            );
+        };
+        (disc.route_blob.clone(), *lobby.room_key.as_bytes())
     };
-    let Some(disc) = shares.discovered.get(share_id) else {
-        return fetch_fail(
-            evt_tx,
-            "share not discovered yet — refresh the list".to_owned(),
-        );
-    };
-    let room_key_bytes = *lobby.room_key.as_bytes();
-    let route = match handle.import_route(disc.route_blob.clone()).await {
+    let route = match handle.import_route(route_blob).await {
         Ok(r) => r,
-        Err(e) => return fetch_fail(evt_tx, format!("could not import the sharer's route: {e}")),
+        Err(e) => {
+            // (#180 §RS-1.4/§RS-1.5, CRSH-ISC-5) A download import-fail is route-death — keep
+            // the share listed Unresolved + park a one-shot retry; never prune.
+            mark_share_unresolved(shares, evt_tx, share_id, name);
+            return fetch_fail(evt_tx, format!("could not import the sharer's route: {e}"));
+        }
     };
     let manifest = match handle
         .fetch_manifest(route.clone(), share_id, room_key_bytes)
@@ -1637,6 +1697,8 @@ async fn confirm_fetch(
     {
         Ok(m) => m,
         Err(e) => {
+            // (#180 §RS-1.4/§RS-1.5, CRSH-ISC-5) A download manifest-fail is route-death.
+            mark_share_unresolved(shares, evt_tx, share_id, name);
             return fetch_fail(
                 evt_tx,
                 fetch_error_message("could not fetch the share manifest", e),
@@ -1793,6 +1855,11 @@ async fn confirm_fetch(
                     render_downloads_idx(&recorded_shares),
                 );
             }
+            // (#180 §RS-1.4/§RS-1.5, CRSH-ISC-5) A download-stage failure — chiefly a
+            // chunk-fetch route-death — keeps the share listed Unresolved + parks a one-shot
+            // retry; never a prune. (A rarer local-disk failure funnels here too and is
+            // treated identically and harmlessly: the parked retry just re-resolves cleanly.)
+            mark_share_unresolved(shares, evt_tx, share_id, name);
             return fetch_fail(evt_tx, message);
         }
     };
@@ -2139,10 +2206,14 @@ fn apply_discovery(
         // browse retry (CRSH-ISC-6) — and preserve the `unresolved` re-resolve flag across
         // a refresh (a fresh advert arms the retry but does not itself resolve the share).
         // This fold never fires the retry (CRSH-ISC-15 — dispatch rides the cursor tick).
-        let unresolved = shares
-            .discovered
-            .get(&ann.share_id)
-            .is_some_and(|d| d.unresolved);
+        // (#180 §RS-3, CRSH-ISC-10) Read the prior entry BEFORE mutating: the re-resolve
+        // flag, and whether this advert CHANGES the route blob — only a real blob change
+        // supersedes the imported route (an identical re-advert re-imports to the same id,
+        // Evidence 2).
+        let (unresolved, route_replaced) = match shares.discovered.get(&ann.share_id) {
+            Some(d) => (d.unresolved, d.route_blob != env.route_blob),
+            None => (false, false),
+        };
         shares.next_generation += 1;
         let generation = shares.next_generation;
         shares.discovered.insert(
@@ -2153,6 +2224,13 @@ fn apply_discovery(
                 unresolved,
             },
         );
+        // The superseded route releases on the later of now or the completion of any
+        // in-flight fetch still streaming over it — the guard decides; the loop releases.
+        if route_replaced
+            && let Some(route) = shares.route_guard.note_advert_replaced(&ann.share_id)
+        {
+            shares.pending_route_releases.push(route);
+        }
         emit_shares_snapshot(shares, evt_tx);
     }
     true
@@ -2657,6 +2735,39 @@ mod tests {
         );
     }
 
+    // ── CRSH-ISC-5 (download-fail variant): a failed DOWNLOAD keeps the share listed ──────
+    /// `confirm_fetch`'s import-fail, manifest-fail, and download-stage (chunk-fetch)
+    /// failures all mark the share Unresolved instead of pruning — a download-fail is
+    /// route-death, not an authoritative removal. The share stays listed with its route
+    /// intact (the parked retry re-resolves it); only a verified withdraw / catalog TTL
+    /// removes it.
+    #[test]
+    fn crsh_isc_5_download_fail_keeps_share_listed_with_route() {
+        let (mut shares, share_id, room_key, signer, rc) = folded_share(13);
+        let (evt_tx, _rx) = unbounded_channel();
+
+        // The download path's failure effect (import / manifest / chunk-fetch fail all funnel
+        // through `mark_share_unresolved` now that the prunes are retired).
+        mark_share_unresolved(&mut shares, &evt_tx, &share_id, "demo-share");
+        assert_eq!(
+            shares.catalog.len(),
+            1,
+            "a failed download keeps the share listed"
+        );
+        assert!(
+            shares.discovered.contains_key(&share_id),
+            "the discovered route is retained so the parked retry can re-resolve"
+        );
+        assert!(shares.parked_retries.contains_key(&share_id));
+
+        assert!(apply_discovery(
+            &mut shares,
+            &evt_tx,
+            &withdraw_bytes(&room_key, &signer, &share_id, &rc)
+        ));
+        assert_eq!(shares.catalog.len(), 0, "a verified withdraw removes it");
+    }
+
     // ── CRSH-ISC-19: a verified withdraw drops the parked retry ────────────────────────
     #[test]
     fn crsh_isc_19_verified_withdraw_drops_the_parked_retry() {
@@ -2805,13 +2916,11 @@ mod tests {
     fn crsh_isc_19_stale_generation_fetch_outcome_no_ops() {
         let (mut shares, share_id, _rk, _signer, _rc) = folded_share(36);
         let (evt_tx, mut evt_rx) = unbounded_channel();
-        let mut imported_routes: HashMap<String, RouteId> = HashMap::new();
         let live_gen = shares.discovered.get(&share_id).unwrap().generation;
 
         fold_fetch_outcome(
             &mut shares,
             &evt_tx,
-            &mut imported_routes,
             FetchOutcome::ImportFailed {
                 share_id: share_id.clone(),
                 name: "demo".to_owned(),
@@ -2832,7 +2941,6 @@ mod tests {
         fold_fetch_outcome(
             &mut shares,
             &evt_tx,
-            &mut imported_routes,
             FetchOutcome::ImportFailed {
                 share_id: share_id.clone(),
                 name: "demo".to_owned(),

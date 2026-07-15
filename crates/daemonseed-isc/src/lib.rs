@@ -350,13 +350,14 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("CRSH-ISC-19", IscClass::Positive), // generation tag on fetch outcomes/parked retries; stale dropped (§RS-1.4)
     ("CRSH-ISC-8", IscClass::Positive), // chat NetCommand processed before an in-flight FetchShare resolves (§RS-2)
     ("CRSH-ISC-7", IscClass::Negative), // anti: self-heal retry never delays chat past the I4 bound (§RS-2)
+    ("CRSH-ISC-10", IscClass::Positive), // consumer route in-use guard + release_tolerant + dead_routes hygiene (§RS-3)
 ];
 
 /// Total built, non-deferred ISCs tracked by this registry — the SINGLE source
 /// of truth for the coverage denominator, read live by `xtask isc-coverage`.
 /// Recount on every ISC add/remove (the `const _` assert below guards it
 /// against [`ISCS`]).
-pub const TOTAL: usize = 204;
+pub const TOTAL: usize = 205;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -548,19 +549,19 @@ mod tests {
         //                                  chat-never-waits / panic-recovery /
         //                                  telemetry-only / single-permit), #159/#168/#157)
         //                                  consumer route self-heal (#180):
-        //                                  CRSH-ISC-1/2/9/3/18/5/6/19/8 pos (sweep
+        //                                  CRSH-ISC-1/2/9/3/18/5/6/19/8/10 pos (sweep
         //                                  accounting, K-detection, weather gating,
         //                                  record_lock repair, chat serialization,
         //                                  Unresolved-not-prune, parked retry, generation,
-        //                                  chat-before-fetch) +
+        //                                  chat-before-fetch, route-release hygiene) +
         //                                  CRSH-ISC-11/14/17/4/15/7 neg (network-state-only
         //                                  input, margin limiter, no-nested-permit,
         //                                  zero-network reactive, retry decorrelation,
         //                                  fetch-never-delays-chat)
-        //   total   133 pos + 71 neg = 204
+        //   total   134 pos + 71 neg = 205
         //   (the v0.33.0 Veilid cutover retired 14 server-positive + 10
         //    server-negative relay/TLS/federation/rate-limit ISCs.)
-        assert_eq!(pos, 133, "positive count drift");
+        assert_eq!(pos, 134, "positive count drift");
         assert_eq!(neg, 71, "negative count drift");
     }
 

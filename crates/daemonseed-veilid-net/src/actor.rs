@@ -225,6 +225,13 @@ enum Command {
     RouteMaintenance {
         dead_routes: Vec<RouteId>,
     },
+    /// Release a private route this node imported for a discovered share (the
+    /// consumer-side counterpart to the sharer's advert-route release — §RS-3,
+    /// CRSH-ISC-10). Fire-and-forget: the actor releases through `release_tolerant`,
+    /// so an id veilid already evicted is a benign no-op, no reply is awaited.
+    ReleaseRoute {
+        route_id: RouteId,
+    },
     /// Periodic slow-cadence advert refresh (the #124 watchdog). Unlike
     /// [`Command::RouteMaintenance`], which fires only on an OBSERVED route death,
     /// this fires on a timer and refreshes every advert unconditionally — the sole
@@ -283,6 +290,14 @@ impl VeilidNetHandle {
     pub async fn import_route(&self, blob: Vec<u8>) -> Result<RouteId> {
         self.send(|reply| Command::ImportRoute { blob, reply })
             .await?
+    }
+
+    /// Release a private route previously imported via [`Self::import_route`] (§RS-3,
+    /// CRSH-ISC-10). Fire-and-forget — the actor releases tolerantly, treating an
+    /// already-evicted route as a benign no-op (design Evidence 3), so no reply is
+    /// awaited. A closed command channel just means the actor is gone.
+    pub async fn release_route(&self, route_id: RouteId) {
+        let _ = self.cmd_tx.send(Command::ReleaseRoute { route_id }).await;
     }
 
     /// Send a SEALED message over a private route (the proven 1:1 path).
@@ -1094,9 +1109,7 @@ async fn actor_loop(
                 // Release this share's current private route (route-leak fix): once
                 // unpublished it serves nothing, so the route is dead weight.
                 if let Some(route_id) = advert_routes.lock().unwrap().remove(&share_id) {
-                    if let Err(e) = api.release_private_route(route_id) {
-                        crate::vtrace!("stop_serve: release route for {share_id} failed ({e})");
-                    }
+                    release_tolerant(&api, route_id, &format!("stop_serve {share_id}"));
                 }
                 let _ = reply.send(Ok(()));
             }
@@ -1127,7 +1140,7 @@ async fn actor_loop(
                 // if a refresh is in flight or one completed within the interval; the
                 // refresh is SPAWNED so re-allocating a route per advert never blocks
                 // the loop for the whole wave (head-of-line).
-                if !spawn_refresh_if_due(
+                if spawn_refresh_if_due(
                     &api,
                     &sched,
                     &advert_routes,
@@ -1135,6 +1148,20 @@ async fn actor_loop(
                     &refresh_in_flight,
                     &last_advert_refresh,
                 ) {
+                    // (#180 §RS-3, CRSH-ISC-10d) A refresh is scheduled: drop the now-dead
+                    // entries by value so the spawned re-publish inserts a fresh route with
+                    // no stale prev to release — removing the most common source of the
+                    // benign `InvalidArgument` rather than merely silencing it. Compare-by-
+                    // value leaves a concurrent reshare's own live route untouched. Deferred
+                    // to the scheduled branch: dropping when the gate is busy would blind the
+                    // redelivery's relevance re-check and strand a genuinely dead advert.
+                    let dropped = drop_dead_advert_routes(&advert_routes, &dead_routes);
+                    if dropped > 0 {
+                        crate::vtrace!(
+                            "route_maintenance: dropped {dropped} dead advert-route entry(ies)"
+                        );
+                    }
+                } else {
                     // A relevant death is ONE-SHOT under the filter, so a busy
                     // gate (refresh in flight, or inside the coalesce window)
                     // must not consume it silently: re-deliver the same command
@@ -1150,6 +1177,11 @@ async fn actor_loop(
                         }
                     });
                 }
+            }
+            Command::ReleaseRoute { route_id } => {
+                // (#180 §RS-3, CRSH-ISC-10) Consumer-side release of an imported route the
+                // frontend's in-use guard cleared (superseded advert + no in-flight fetch).
+                release_tolerant(&api, route_id, "consumer release");
             }
             Command::AdvertWatchdog => {
                 // The silently-dead-route recovery path (#124): re-publish IDLE adverts
@@ -1714,9 +1746,7 @@ async fn publish_one_advert(
         .unwrap()
         .insert(share_id.to_owned(), route.route_id.clone());
     if let Some(prev) = prev {
-        if let Err(e) = api.release_private_route(prev) {
-            crate::vtrace!("publish_one_advert: release prev route for {share_id} failed ({e})");
-        }
+        release_tolerant(api, prev, &format!("publish_one_advert prev {share_id}"));
     }
     let route_sig = match advert.signer.sign_route_advert(share_id, &route.blob) {
         Ok(sig) => sig,
@@ -1774,11 +1804,11 @@ async fn publish_one_advert(
         if routes.get(share_id) == Some(&route_id) {
             routes.remove(share_id);
             drop(routes);
-            if let Err(e) = api.release_private_route(route_id) {
-                crate::vtrace!(
-                    "publish_one_advert withdraw: release route for {share_id} failed ({e})"
-                );
-            }
+            release_tolerant(
+                api,
+                route_id,
+                &format!("publish_one_advert withdraw {share_id}"),
+            );
         }
     }
     res
@@ -1807,10 +1837,43 @@ fn rollback_advert_route(
     if routes.get(share_id) == Some(&route_id) {
         routes.remove(share_id);
         drop(routes);
-        if let Err(e) = api.release_private_route(route_id) {
-            crate::vtrace!("publish_one_advert: rollback release for {share_id} failed ({e})");
-        }
+        release_tolerant(
+            api,
+            route_id,
+            &format!("publish_one_advert rollback {share_id}"),
+        );
     }
+}
+
+/// (#180 §RS-3, CRSH-ISC-10b/10c) The single private-route release path for this actor.
+/// Veilid returns `InvalidArgument` for a route id that is "unknown, already released, or
+/// malformed" and evicts dead routes itself (`take_dead_routes`), so releasing a route the
+/// transport already GC'd is a benign race (design Evidence 3) — traced, not surfaced as an
+/// error. Every allocation/import release routes through here; a raw `release_private_route`
+/// call outside this helper fails CRSH-ISC-10c's grep probe.
+fn release_tolerant(api: &VeilidAPI, route_id: RouteId, ctx: &str) {
+    match api.release_private_route(route_id) {
+        Ok(()) => {}
+        Err(veilid_core::VeilidAPIError::InvalidArgument { .. }) => {
+            crate::vtrace!("{ctx}: route already evicted (InvalidArgument) — benign");
+        }
+        Err(e) => crate::vtrace!("{ctx}: release route failed ({e})"),
+    }
+}
+
+/// (#180 §RS-3, CRSH-ISC-10d) Drop every `advert_routes` entry whose route is in `dead`, so a
+/// later re-publish never attempts to release an id veilid already evicted. Compare-by-value
+/// (not by share id): a concurrent reshare that swapped in its OWN live route is left intact,
+/// exactly as the withdraw/rollback compare-and-remove guards require. Returns the count
+/// dropped.
+fn drop_dead_advert_routes<R: PartialEq>(
+    advert_routes: &Mutex<HashMap<String, R>>,
+    dead: &[R],
+) -> usize {
+    let mut routes = advert_routes.lock().unwrap();
+    let before = routes.len();
+    routes.retain(|_share, route| !dead.contains(route));
+    before - routes.len()
 }
 
 /// Re-publish every active share advert with a fresh route + signature (called on
@@ -1979,6 +2042,37 @@ fn map_update(u: VeilidUpdate) -> Option<VeilidNetEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // CRSH-ISC-10c: every private-route release routes through `release_tolerant`. Build
+    // the needle from fragments so this assertion's own source text does not self-match.
+    #[test]
+    fn release_private_route_only_called_through_release_tolerant() {
+        let needle: String = [".release", "_private_route("].concat();
+        let src = include_str!("actor.rs");
+        let count = src.matches(needle.as_str()).count();
+        assert_eq!(
+            count, 1,
+            "exactly one raw release_private_route call must remain — inside release_tolerant"
+        );
+    }
+
+    // CRSH-ISC-10d: a dead-route sweep drops only the entries whose route is dead, by value,
+    // leaving a share whose route was replaced (concurrent reshare) untouched.
+    #[test]
+    fn drop_dead_advert_routes_removes_only_dead_by_value() {
+        let map: Mutex<HashMap<String, u32>> = Mutex::new(HashMap::from([
+            ("live".to_owned(), 1u32),
+            ("dead".to_owned(), 2u32),
+        ]));
+        let dropped = drop_dead_advert_routes(&map, &[2, 99]);
+        assert_eq!(
+            dropped, 1,
+            "only the one matching-by-value entry is dropped"
+        );
+        let routes = map.lock().unwrap();
+        assert!(routes.contains_key("live"), "a live route survives");
+        assert!(!routes.contains_key("dead"), "the dead route is gone");
+    }
 
     #[tokio::test]
     async fn refresh_due_gates_on_adverts_and_interval() {
