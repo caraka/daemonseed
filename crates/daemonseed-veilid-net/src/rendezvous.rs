@@ -306,8 +306,28 @@ pub async fn sweep(
     key: RecordKey,
     ev_tx: mpsc::UnboundedSender<VeilidNetEvent>,
 ) {
+    let outcome = sweep_collect(&gate, &rc, key.clone(), &ev_tx).await;
+    // Surface the per-record outcome to the frontend net actor's session-health tracker
+    // (CRSH-ISC-1). A closed receiver (actor shut down) is non-fatal — the sweep is a
+    // fire-and-forget background task and its `Inbound` sends tolerate the same drop.
+    let _ = ev_tx.send(VeilidNetEvent::SweepHealth { key, outcome });
+}
+
+/// The full 0..[`SUBKEY_COUNT`] sweep body, emitting an [`VeilidNetEvent::Inbound`] per
+/// populated slot and **returning** the [`SweepOutcome`] to the caller — WITHOUT emitting
+/// [`VeilidNetEvent::SweepHealth`]. [`sweep`] is this plus the SweepHealth emission (the
+/// steady/backlog path that drives the detection tracker). The repair arm ([`repair_gated`])
+/// uses this directly: it awaits the re-sweep under the record lock and resets the tracker
+/// itself at dispatch, so a duplicate SweepHealth from the repair's own sweep would only
+/// muddy the K-consecutive stream. Each GET rides a per-GET read permit (WB-5.1 / I5″.2).
+pub async fn sweep_collect(
+    gate: &Arc<DhtGate>,
+    rc: &RoutingContext,
+    key: RecordKey,
+    ev_tx: &mpsc::UnboundedSender<VeilidNetEvent>,
+) -> SweepOutcome {
     let outcome = sweep_gated(
-        &gate,
+        gate,
         SUBKEY_COUNT,
         |bytes| ev_tx.send(VeilidNetEvent::Inbound { bytes }).is_ok(),
         |subkey| {
@@ -336,10 +356,7 @@ pub async fn sweep(
         outcome.attempted,
         outcome.failed
     );
-    // Surface the per-record outcome to the frontend net actor's session-health tracker
-    // (CRSH-ISC-1). A closed receiver (actor shut down) is non-fatal — the sweep is a
-    // fire-and-forget background task and its `Inbound` sends tolerate the same drop.
-    let _ = ev_tx.send(VeilidNetEvent::SweepHealth { key, outcome });
+    outcome
 }
 
 /// The testable per-GET sweep core (WB-5.1 / I5″.2). For each subkey it acquires ONE
@@ -391,6 +408,96 @@ where
         }
     }
     outcome
+}
+
+/// Whether the repair arm closes the record before re-opening it (§RS-1.2 / §RS-1.3
+/// open question, **repro-gated**). `close_dht_record` cancels the desired watch
+/// (`close_record.rs:117-119`), so a close-first yields a guaranteed-fresh session +
+/// re-watch — the closest analog to the consumer *restart* that empirically heals the
+/// felt-tested dead session; open-in-place (veilid updates an already-open record in
+/// place, `open_record.rs:155-170`) is cheaper but may not clear a death that lives in
+/// the opened-record session. Defaulted **`true`** (mirror the restart that is known to
+/// work) pending the two-client reproduction (§RS-1.3); caraka flips it against the
+/// repro. Either path satisfies CRSH-ISC-3's lock span — the close (when enabled) runs
+/// inside the same `record_lock`-held span as the re-open/re-watch/re-sweep.
+pub const REPAIR_CLOSE_FIRST: bool = true;
+
+/// The testable **session re-establishment core** (§RS-1.2, CRSH-ISC-3/17/18) — the
+/// heart of step 3b's repair arm. It runs, **all while holding `record_lock`**:
+///
+///   1. invalidate the [`open_cached`] entry for `owner_seed` (drop the dead handle);
+///   2. optionally `close` the old record first (when `close_first` — [`REPAIR_CLOSE_FIRST`]);
+///   3. `open` a fresh record session and re-cache its key;
+///   4. `watch` the fresh session;
+///   5. `sweep` it fully (0..[`SUBKEY_COUNT`]) to drain the backlog the dead session missed.
+///
+/// **Lock span (CRSH-ISC-3/18).** The `record_lock` guard is held across the *entire*
+/// sequence, so a concurrent same-record write (a lobby chat publish, a share advert)
+/// serializes behind it and, on acquiring the lock, reads the freshly re-cached key —
+/// never a torn-down handle, never the invalidated empty cache.
+///
+/// **Permit discipline (CRSH-ISC-17).** `open`/`watch` acquire the §RS-2 un-gated-op
+/// limiter; the `sweep`'s GETs acquire per-GET read permits. They are never nested:
+/// open/watch complete (limiter dropped) before the sweep begins, so no task holds a
+/// read permit while acquiring the limiter or vice versa. This is enforced by the phase
+/// ordering here, not by inspection — the closures own their own permit acquisition and
+/// this core simply sequences the phases.
+///
+/// Generic over the veilid ops (`close`/`open`/`watch`/`sweep` are caller-supplied
+/// futures) so the ordering + lock span are unit-testable with an instrumented gate/lock
+/// stand-in and no live veilid attach — exactly as [`sweep_gated`] makes the per-GET
+/// permit discipline testable. Returns the re-sweep's [`SweepOutcome`].
+#[allow(clippy::too_many_arguments)]
+pub async fn repair_gated<K, CloseFut, OpenFut, WatchFut, SweepFut>(
+    record_lock: &Arc<tokio::sync::Mutex<()>>,
+    cache: &Mutex<HashMap<[u8; 32], K>>,
+    owner_seed: &[u8; 32],
+    close_first: bool,
+    close: impl FnOnce(K) -> CloseFut,
+    open: impl FnOnce() -> OpenFut,
+    watch: impl FnOnce(K) -> WatchFut,
+    sweep: impl FnOnce(K) -> SweepFut,
+) -> Result<SweepOutcome>
+where
+    K: Clone,
+    CloseFut: std::future::Future<Output = ()>,
+    OpenFut: std::future::Future<Output = Result<K>>,
+    WatchFut: std::future::Future<Output = Result<()>>,
+    SweepFut: std::future::Future<Output = SweepOutcome>,
+{
+    // Hold the record's serialization lock across the WHOLE re-establishment — this is
+    // what makes deliberate eviction safe where ad-hoc eviction was not (CRSH-ISC-3/18).
+    let _guard = record_lock.lock().await;
+
+    // 1. Invalidate the open-cache entry. Keep the old key for a close-first. The brief
+    //    map guard is never held across an await (poison-recovered, mirroring open_cached).
+    let old_key = cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(owner_seed);
+
+    // 2. Optionally close the old session first (cancels the desired watch → clean
+    //    re-watch). Best-effort: `close`'s own body swallows a close error (releasing a
+    //    session veilid already GC'd is a benign race, Evidence 3 sibling).
+    if close_first {
+        if let Some(k) = old_key {
+            close(k).await;
+        }
+    }
+
+    // 3. Re-open a fresh session (the `open` closure acquires the un-gated limiter) and
+    //    re-cache its key so a subsequent same-record publish/subscribe reuses it.
+    let key = open().await?;
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(*owner_seed, key.clone());
+
+    // 4. Re-watch the fresh session (the `watch` closure acquires the un-gated limiter).
+    watch(key.clone()).await?;
+
+    // 5. Full re-sweep (per-GET read permits inside `sweep`) to drain the missed backlog.
+    Ok(sweep(key).await)
 }
 
 #[cfg(test)]
@@ -670,5 +777,256 @@ mod tests {
             "subkeys 0,3,6 errored (not counted as empty)"
         );
         assert_eq!(outcome.found, 3, "subkeys 1,4,7 populated");
+    }
+
+    // ── CRSH-ISC-3 (+ CRSH-ISC-17): repair op ordering, lock span, permit discipline ──
+    /// The instrumented-gate oracle for the re-establishment core. It asserts, without a
+    /// live veilid attach:
+    /// - **op ordering** — invalidate (implicit) → close → open → watch → the 0..N re-sweep
+    ///   GETs, in exactly that sequence;
+    /// - **lock span (CRSH-ISC-3)** — a competitor contending on the SAME `record_lock`
+    ///   acquires it only AFTER the entire repair sequence (its trace entry lands last),
+    ///   and then observes the FRESHLY re-cached key (the sibling of CRSH-ISC-18);
+    /// - **permit discipline (CRSH-ISC-17)** — open/watch hold the un-gated limiter with NO
+    ///   read permit held; each re-sweep GET holds a per-GET read permit with the limiter
+    ///   NOT held. The two permit classes are never nested, by phase ordering.
+    #[tokio::test]
+    async fn crsh_isc_3_repair_ordered_trace_lock_span_and_permit_discipline() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const SEED: [u8; 32] = [7u8; 32];
+        const MARGIN: usize = crate::dht_gate::DHT_GATE_MARGIN;
+
+        let gate = DhtGate::new(); // real pools (read 9, un-gated limiter = margin 2)
+        let full_read = gate.available_read();
+        let record_lock: Arc<tokio::sync::Mutex<()>> = Arc::new(tokio::sync::Mutex::new(()));
+        let cache: Arc<Mutex<HashMap<[u8; 32], u32>>> = Arc::new(Mutex::new(HashMap::new()));
+        cache.lock().unwrap().insert(SEED, 111); // the dead handle in-cache
+        let trace: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let competitor_key = Arc::new(AtomicUsize::new(0));
+
+        // A competitor on the SAME record lock: signalled once repair is inside its
+        // critical section, it must block until repair releases and then read the fresh key.
+        let competitor = {
+            let (lock, trace, notify, cache, ck) = (
+                record_lock.clone(),
+                trace.clone(),
+                notify.clone(),
+                cache.clone(),
+                competitor_key.clone(),
+            );
+            tokio::spawn(async move {
+                notify.notified().await; // repair holds the lock
+                let _g = lock.lock().await; // serializes strictly behind repair
+                trace.lock().unwrap().push("competitor");
+                ck.store(
+                    *cache.lock().unwrap().get(&SEED).unwrap() as usize,
+                    Ordering::SeqCst,
+                );
+            })
+        };
+
+        let gets = Arc::new(AtomicUsize::new(0));
+        let outcome = repair_gated(
+            &record_lock,
+            &cache,
+            &SEED,
+            true, // close_first (REPAIR_CLOSE_FIRST default)
+            // close: tears down the OLD dead handle; no read permit held.
+            |old| {
+                let (trace, gate) = (trace.clone(), gate.clone());
+                async move {
+                    assert_eq!(old, 111, "close targets the OLD dead handle");
+                    assert_eq!(
+                        gate.available_read(),
+                        full_read,
+                        "no read permit held at close"
+                    );
+                    trace.lock().unwrap().push("close");
+                }
+            },
+            // open: acquires the un-gated limiter; CRSH-ISC-17 — no read permit held.
+            || {
+                let (trace, gate, notify) = (trace.clone(), gate.clone(), notify.clone());
+                async move {
+                    let _ungated = gate.acquire_ungated().await;
+                    assert_eq!(
+                        gate.available_read(),
+                        full_read,
+                        "CRSH-ISC-17: no read permit held while holding the limiter (open)"
+                    );
+                    trace.lock().unwrap().push("open");
+                    notify.notify_one(); // repair is now inside its critical section
+                    Ok(999u32) // the fresh handle
+                }
+            },
+            // watch: acquires the limiter on the FRESH handle; again no read permit held.
+            |k| {
+                let (trace, gate) = (trace.clone(), gate.clone());
+                async move {
+                    assert_eq!(k, 999, "watch targets the FRESH handle");
+                    let _ungated = gate.acquire_ungated().await;
+                    assert_eq!(
+                        gate.available_read(),
+                        full_read,
+                        "CRSH-ISC-17: no read permit held while holding the limiter (watch)"
+                    );
+                    trace.lock().unwrap().push("watch");
+                    Ok(())
+                }
+            },
+            // sweep: per-GET read permits on the FRESH handle; CRSH-ISC-17 — limiter free.
+            |k| {
+                let (trace, gate, gets) = (trace.clone(), gate.clone(), gets.clone());
+                async move {
+                    assert_eq!(k, 999, "the re-sweep runs on the FRESH handle");
+                    let get_gate = gate.clone(); // moved into the per-GET closure
+                    sweep_gated(
+                        &gate,
+                        4,
+                        |_b| true,
+                        move |_subkey| {
+                            let (trace, gate, gets) =
+                                (trace.clone(), get_gate.clone(), gets.clone());
+                            async move {
+                                assert!(
+                                    gate.available_read() < full_read,
+                                    "a per-GET read permit IS held during the GET"
+                                );
+                                assert_eq!(
+                                gate.available_ungated(),
+                                MARGIN,
+                                "CRSH-ISC-17: the un-gated limiter is NOT held during a read GET"
+                            );
+                                gets.fetch_add(1, Ordering::SeqCst);
+                                trace.lock().unwrap().push("get");
+                                Ok(Some(vec![1u8]))
+                            }
+                        },
+                    )
+                    .await
+                }
+            },
+        )
+        .await
+        .expect("repair completes");
+
+        competitor.await.unwrap();
+        assert_eq!(outcome.found, 4);
+        assert_eq!(gets.load(Ordering::SeqCst), 4);
+        // The fresh key is re-cached; the old dead handle is gone.
+        assert_eq!(*cache.lock().unwrap().get(&SEED).unwrap(), 999);
+        // Ordered op trace, then the competitor last (never interleaved in the lock span).
+        let t = trace.lock().unwrap().clone();
+        assert_eq!(
+            t,
+            vec![
+                "close",
+                "open",
+                "watch",
+                "get",
+                "get",
+                "get",
+                "get",
+                "competitor"
+            ],
+            "repair op trace + lock-span: {t:?}"
+        );
+        // The competitor observed the FRESH re-cached key, not the dead one (CRSH-ISC-18 sibling).
+        assert_eq!(competitor_key.load(Ordering::SeqCst), 999);
+    }
+
+    // ── CRSH-ISC-18: a same-record chat write serializes behind repair, fresh session ──
+    /// Paused-time interleave of a chat write with a same-record repair. The chat write
+    /// takes the SAME `record_lock` the production sink takes and resolves the record via
+    /// [`open_cached`] — exactly the sink's path. It must (a) block until repair releases
+    /// the lock (never target the torn-down handle), and (b) dispatch against the FRESH
+    /// re-cached session (999), reusing repair's insert rather than re-opening its own or
+    /// reading the dead 111.
+    #[tokio::test(start_paused = true)]
+    async fn crsh_isc_18_chat_write_serializes_behind_repair_and_targets_fresh_session() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        use std::time::Duration;
+        const SEED: [u8; 32] = [3u8; 32];
+
+        let record_lock: Arc<tokio::sync::Mutex<()>> = Arc::new(tokio::sync::Mutex::new(()));
+        let cache: Arc<Mutex<HashMap<[u8; 32], u32>>> = Arc::new(Mutex::new(HashMap::new()));
+        cache.lock().unwrap().insert(SEED, 111); // the dead handle in-cache
+        let order: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let chat_key = Arc::new(AtomicU32::new(0));
+        let chat_opened_its_own = Arc::new(AtomicBool::new(false));
+
+        let chat = {
+            let (lock, cache, order, notify, ck, own) = (
+                record_lock.clone(),
+                cache.clone(),
+                order.clone(),
+                notify.clone(),
+                chat_key.clone(),
+                chat_opened_its_own.clone(),
+            );
+            tokio::spawn(async move {
+                notify.notified().await; // repair is mid-repair, holding the lock
+                let _g = lock.lock().await; // the sink's record_lock — serializes behind repair
+                let own2 = own.clone();
+                let k = open_cached(&cache, &SEED, async move {
+                    // Runs ONLY on a cache miss — a torn-down/invalidated handle. A hit
+                    // (repair re-cached the fresh key) drops this future un-awaited.
+                    own2.store(true, Ordering::SeqCst);
+                    Ok(777u32)
+                })
+                .await
+                .unwrap();
+                ck.store(k, Ordering::SeqCst);
+                order.lock().unwrap().push("chat-write");
+            })
+        };
+
+        let outcome = repair_gated(
+            &record_lock,
+            &cache,
+            &SEED,
+            true,
+            |_old| async {}, // close
+            {
+                let (order, notify) = (order.clone(), notify.clone());
+                move || async move {
+                    notify.notify_one(); // let the chat write begin contending on the lock
+                    tokio::time::sleep(Duration::from_secs(3)).await; // a slow re-open
+                    order.lock().unwrap().push("repair-open");
+                    Ok(999u32)
+                }
+            },
+            |_k| async { Ok(()) }, // watch
+            {
+                let order = order.clone();
+                move |_k| async move {
+                    order.lock().unwrap().push("repair-sweep");
+                    SweepOutcome {
+                        attempted: 1,
+                        failed: 0,
+                        found: 1,
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        chat.await.unwrap();
+        assert_eq!(outcome.found, 1);
+        // Repair fully completed BEFORE the chat write ran — no interleave in the lock span.
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["repair-open", "repair-sweep", "chat-write"]
+        );
+        // The chat write dispatched against the FRESH re-cached session (999), never the
+        // dead 111, and reused repair's handle (did not re-open its own).
+        assert_eq!(chat_key.load(Ordering::SeqCst), 999);
+        assert!(
+            !chat_opened_its_own.load(Ordering::SeqCst),
+            "the chat write reused repair's fresh session, not a torn-down/re-opened one"
+        );
     }
 }

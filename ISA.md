@@ -414,6 +414,10 @@ The write-budget family takes permanent `WB-ISC-N` IDs from the FROZEN 2026-07-0
 - [x] CRSH-ISC-9: a repair-due transition is suppressed while the WB-5.1 weather estimator reads elevated and resumes (not cancels) in calm — the streak is retained across the elevated regime (#180 §RS-1.2) (probe: `session_health::crsh_isc_9_elevated_suppresses_then_calm_resumes`).
 - [x] CRSH-ISC-11: Anti — the repair-due decision input (`SweepHealthInput`) carries only network-state fields (sweep-result counts, watch state, weather); no user-event-derived value can enter, so the signal is a pure function of network state (#180 §RS-0/§RS-1.2) (probe: `session_health::crsh_isc_11_*`, type-level + unit assertion).
 
+- [x] CRSH-ISC-3: The repair re-establishes a record session (invalidate open-cache → optional close-first → re-open → re-watch → full 0..64 sweep) **holding the record's `record_lock` across the entire span**, open/watch on the margin limiter and each re-sweep GET on a per-GET read permit (#180 §RS-1.2) (probe: `rendezvous::crsh_isc_3_repair_ordered_trace_lock_span_and_permit_discipline`; `REPAIR_CLOSE_FIRST` default true, repro-gated §RS-1.3).
+- [x] CRSH-ISC-18: A same-record write concurrent with a repair serializes behind the repair's `record_lock` — never lost, never targeting a torn-down handle; on acquiring the lock it reads the freshly re-cached session (#180 §RS-1.2) (probe: `rendezvous::crsh_isc_18_chat_write_serializes_behind_repair_and_targets_fresh_session`, paused-time).
+- [x] CRSH-ISC-17: Anti — no site holds a read-pool permit while acquiring the un-gated-op limiter, or vice versa; the repair's open/watch (limiter) and re-sweep GETs (read pool) are separate phases (#180 §RS-2) (probe: the CRSH-ISC-3 trace assertions + acquire-site inspection; Refresh sites at step 7 are bound by the same rule).
+
 ## Test Strategy
 
 | surface | check | tool / probe |

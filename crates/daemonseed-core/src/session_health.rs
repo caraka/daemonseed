@@ -28,6 +28,15 @@ use std::hash::Hash;
 /// knob that move touches.
 pub const REPAIR_K_THRESHOLD: u32 = 2;
 
+/// Cap on the per-record decaying-backoff multiplier (§RS-1.2 advisor rule). A record
+/// whose repair does not restore service doubles its effective K-threshold per
+/// consecutive failed repair (`1 → 2 → 4 → 8`), capped here, then holds — so a
+/// permanently-dead record (abandoned circle, sharer gone forever) settles to one
+/// bounded re-establishment attempt per `base_K × cap` cursor rounds instead of every
+/// `base_K` rounds indefinitely (~52 min at the current census). The first successful
+/// pass resets the multiplier to 1. `8` matches the design's initial cap.
+pub const REPAIR_BACKOFF_CAP: u32 = 8;
+
 /// The DHT-weather reading gating a repair-due transition (CRSH-ISC-9). Sourced from
 /// the existing WB-5.1 estimator (median-of-5 + hysteresis) via
 /// [`crate::presence::ReapGate::suspend_reaping`] — consumed, never re-derived here:
@@ -107,15 +116,35 @@ pub enum RepairDecision {
 }
 
 /// Per-record detection state.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 struct RecordHealth {
     /// Consecutive all-failed passes observed. Reset to 0 by any successful pass.
     consecutive_failed: u32,
     /// Latched once repair-due has been signalled, so the tracker signals `RepairDue`
     /// exactly once per death episode (CRSH-ISC-2) rather than on every subsequent
-    /// failed pass. Cleared by a successful pass or by [`SessionHealthTracker::clear`]
-    /// (the 3b repair-completion hook).
+    /// failed pass. Cleared by a successful pass or by
+    /// [`SessionHealthTracker::note_repair_dispatched`] (the 3b repair-dispatch hook).
     repair_due_latched: bool,
+    /// Decaying-backoff multiplier on the K-threshold (§RS-1.2, capped at
+    /// [`REPAIR_BACKOFF_CAP`]). The record's *effective* threshold is
+    /// `base_K × backoff_mult`. Starts at 1; doubled by each repair dispatch
+    /// ([`SessionHealthTracker::note_repair_dispatched`]) so a repair that fails to
+    /// restore service costs the next death episode `× backoff_mult` more cadence
+    /// rounds to re-detect; a successful pass resets it to 1.
+    backoff_mult: u32,
+}
+
+impl Default for RecordHealth {
+    fn default() -> Self {
+        // `backoff_mult` MUST default to 1, not 0 — it multiplies the K-threshold, and a
+        // 0 would make the effective threshold 0 and fire a repair on the first failed
+        // pass. `derive(Default)` would give 0, so Default is hand-written.
+        Self {
+            consecutive_failed: 0,
+            repair_due_latched: false,
+            backoff_mult: 1,
+        }
+    }
 }
 
 /// The per-record session-health tracker (§RS-1.2). Generic over the record-key type so
@@ -159,16 +188,22 @@ impl<K: Eq + Hash + Clone> SessionHealthTracker<K> {
     /// calm resumes — never cancels). A successful pass resets the counter and clears
     /// the latch.
     pub fn observe(&mut self, key: K, input: SweepHealthInput) -> RepairDecision {
-        let k = self.k_threshold;
+        let base_k = self.k_threshold;
         let entry = self.records.entry(key).or_default();
         if !input.is_failed_pass() {
-            // Successful pass: the session is serving. Reset the streak and clear the
-            // latch (a healed record must be able to re-arm if it dies again). Step 3b's
-            // decaying backoff also resets here.
+            // Successful pass: the session is serving. Reset the streak, clear the latch
+            // (a healed record must be able to re-arm if it dies again), and reset the
+            // decaying backoff — service restored means the last repair (if any) worked,
+            // so the next death episode starts from the base K again (§RS-1.2).
             entry.consecutive_failed = 0;
             entry.repair_due_latched = false;
+            entry.backoff_mult = 1;
             return RepairDecision::NotDue;
         }
+        // The effective threshold is the base K scaled by this record's decaying backoff
+        // (§RS-1.2): a record whose prior repair did not restore service needs
+        // proportionally more failed passes before it is repair-due again.
+        let k = base_k.saturating_mul(entry.backoff_mult);
         entry.consecutive_failed = entry.consecutive_failed.saturating_add(1);
         if entry.consecutive_failed < k {
             return RepairDecision::NotDue;
@@ -189,10 +224,30 @@ impl<K: Eq + Hash + Clone> SessionHealthTracker<K> {
         }
     }
 
-    /// Drop `key`'s detection state — the **step-3b repair-completion hook**: once a
-    /// repair has re-established the record's session, the caller clears its history so
-    /// the streak starts fresh. (A subsequent successful sweep would reset it anyway;
-    /// this lets 3b reset immediately at repair time.) No-op for an untracked key.
+    /// The **step-3b repair-dispatch hook** (§RS-1.2). Once a repair has been dispatched
+    /// for `key`, the caller calls this to (a) reset the detection streak and clear the
+    /// repair-due latch, so a still-dead record can re-detect on a fresh streak, and (b)
+    /// **double the decaying-backoff multiplier** (capped at [`REPAIR_BACKOFF_CAP`]) so a
+    /// repair that fails to restore service costs the next death episode proportionally
+    /// more cadence rounds to re-detect. A subsequent *successful* pass ([`Self::observe`])
+    /// resets the multiplier back to 1. No-op for an untracked key.
+    ///
+    /// This replaces a bare `clear` at the repair-due arm precisely because the backoff
+    /// state must **survive** the streak reset — dropping the record entirely (as
+    /// [`Self::clear`] does) would forget the backoff and let a permanently-dead record
+    /// re-attempt every `base_K` rounds forever.
+    pub fn note_repair_dispatched(&mut self, key: &K) {
+        if let Some(entry) = self.records.get_mut(key) {
+            entry.consecutive_failed = 0;
+            entry.repair_due_latched = false;
+            entry.backoff_mult = entry.backoff_mult.saturating_mul(2).min(REPAIR_BACKOFF_CAP);
+        }
+    }
+
+    /// Drop `key`'s detection state entirely (backoff included) — for a record that is no
+    /// longer tracked at all (e.g. an unsubscribed circle). Distinct from
+    /// [`Self::note_repair_dispatched`], which preserves and bumps the backoff. No-op for
+    /// an untracked key.
     pub fn clear(&mut self, key: &K) {
         self.records.remove(key);
     }
@@ -372,6 +427,50 @@ mod tests {
             tracker.observe(key, failed(Weather::Calm)),
             RepairDecision::RepairDue
         );
+    }
+
+    // ── §RS-1.2 decaying backoff: a failed repair doubles K (cap 8×), success resets ──
+    /// Each `note_repair_dispatched` (a repair that did NOT restore service, since the
+    /// sweeps keep failing) doubles the effective K-threshold: base 2 → 4 → 8 → 16, then
+    /// the multiplier caps at [`REPAIR_BACKOFF_CAP`] (8×) so it holds at effective 16. A
+    /// single successful pass resets the multiplier, so the next episode is back to base K.
+    #[test]
+    fn crsh_backoff_doubles_k_on_failed_repair_caps_and_resets_on_success() {
+        assert_eq!(REPAIR_K_THRESHOLD, 2, "test written for base K=2");
+        assert_eq!(REPAIR_BACKOFF_CAP, 8, "test written for an 8× cap");
+
+        /// Drive exactly `effective_k` failed passes: the first `effective_k − 1` are
+        /// NotDue, the `effective_k`-th is RepairDue. Then dispatch a (failing) repair.
+        fn run_episode(t: &mut SessionHealthTracker<u64>, key: u64, effective_k: u32) {
+            for _ in 1..effective_k {
+                assert_eq!(
+                    t.observe(key, failed(Weather::Calm)),
+                    RepairDecision::NotDue,
+                    "below the effective threshold {effective_k}"
+                );
+            }
+            assert_eq!(
+                t.observe(key, failed(Weather::Calm)),
+                RepairDecision::RepairDue,
+                "repair-due at the effective threshold {effective_k}"
+            );
+            t.note_repair_dispatched(&key);
+        }
+
+        let mut t: SessionHealthTracker<u64> = SessionHealthTracker::new(); // base K = 2
+        let key = 5u64;
+        run_episode(&mut t, key, 2); // mult 1 → effective 2;  after dispatch mult→2
+        run_episode(&mut t, key, 4); // mult 2 → effective 4;  after dispatch mult→4
+        run_episode(&mut t, key, 8); // mult 4 → effective 8;  after dispatch mult→8
+        run_episode(&mut t, key, 16); // mult 8 → effective 16; after dispatch mult→min(16,8)=8
+        run_episode(&mut t, key, 16); // mult 8 (capped) → effective 16 again
+
+        // A successful pass restores service → the backoff resets to 1.
+        assert_eq!(
+            t.observe(key, ok_pass(Weather::Calm)),
+            RepairDecision::NotDue
+        );
+        run_episode(&mut t, key, 2); // back to base K = 2
     }
 
     /// Distinct records track independently — one dead record does not flag another.

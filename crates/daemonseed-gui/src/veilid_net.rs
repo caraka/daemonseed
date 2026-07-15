@@ -44,7 +44,7 @@
 //! matching open succeeds. Own circle/lobby messages are emitted `mine:true` and
 //! deduped against the optimistic local echo in `push_message` (#143).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -437,6 +437,16 @@ pub async fn veilid_net_actor(
     // one sweep pass; K consecutive all-failed passes in calm weather flag the record
     // repair-due. Detection only — step 3b attaches repair execution at the repair-due arm.
     let mut session_health: SessionHealthTracker<RecordKey> = SessionHealthTracker::new();
+    // §RS-1.2 repair resolution: the tracker keys by `RecordKey`, but the repair works in
+    // `owner_seed`. This map (fed at resweep dispatch — the key is deterministic per seed)
+    // resolves a repair-due `RecordKey` back to its owner seed. `resolved_seeds` avoids a
+    // redundant resolve round-trip once a seed's key is known.
+    let mut record_key_owners: HashMap<RecordKey, [u8; 32]> = HashMap::new();
+    let mut resolved_seeds: HashSet<[u8; 32]> = HashSet::new();
+    // Records detected repair-due while a repair/resweep is already in flight or during
+    // warmup: enqueued here (dedup by the tracker's latch) and drained one-at-a-time at
+    // the cadence tick. One repair in flight at a time via `resweep_busy` (§RS-1.2).
+    let mut pending_repairs: VecDeque<RecordKey> = VecDeque::new();
 
     loop {
         tokio::select! {
@@ -486,18 +496,46 @@ pub async fn veilid_net_actor(
                             watch: WatchState::Unknown,
                             weather,
                         };
-                        match session_health.observe(key, input) {
+                        match session_health.observe(key.clone(), input) {
                             RepairDecision::RepairDue => {
-                                // TODO(#180 step 3b): attach repair execution here — under the
-                                // record's `record_lock`, invalidate the `open_cached` entry,
-                                // re-open, re-watch, and full-sweep the record (CRSH-ISC-3),
-                                // then `session_health.clear(&key)`. Detection stops here in 3a.
-                                daemonseed_veilid_net::vtrace!(
-                                    "gui session-health: record repair-due ({} attempted, \
-                                     {} failed) — repair execution lands in step 3b",
-                                    input.attempted,
-                                    input.failed
-                                );
+                                // Step 3b: re-establish the record's session (§RS-1.2). The
+                                // SweepHealth carrying the K-th failed pass IS a cadence
+                                // (resweep-completion) tick, so an immediate dispatch here is
+                                // still cadence-timed (CRSH-ISC-2). Warmup guard (§RS-1.3): no
+                                // repair before the resweep warmup hand-off. One repair in
+                                // flight at a time via `resweep_busy`; if busy or still
+                                // warming, queue for the next cadence drain (the tracker's
+                                // latch de-dupes the enqueue).
+                                let warmed = connected_at.is_some_and(|t| {
+                                    t.elapsed() >= STEADY_RESWEEP_WARMUP_HANDOFF
+                                });
+                                match record_key_owners.get(&key).copied() {
+                                    Some(owner_seed) => {
+                                        let free = !resweep_busy
+                                            .load(std::sync::atomic::Ordering::Acquire);
+                                        if let (true, true, Some(handle)) =
+                                            (warmed, free, net.as_ref())
+                                        {
+                                            session_health.note_repair_dispatched(&key);
+                                            spawn_repair(handle, &resweep_busy, owner_seed);
+                                            daemonseed_veilid_net::vtrace!(
+                                                "gui session-health: repairing dead record \
+                                                 ({} failed) — re-establishing session",
+                                                input.failed
+                                            );
+                                        } else if !pending_repairs.contains(&key) {
+                                            pending_repairs.push_back(key);
+                                            daemonseed_veilid_net::vtrace!(
+                                                "gui session-health: record repair-due — \
+                                                 queued (busy or warming)"
+                                            );
+                                        }
+                                    }
+                                    None => daemonseed_veilid_net::vtrace!(
+                                        "gui session-health: repair-due for an unmapped \
+                                         record key — cannot resolve owner seed"
+                                    ),
+                                }
                             }
                             RepairDecision::Suppressed => {
                                 daemonseed_veilid_net::vtrace!(
@@ -571,31 +609,74 @@ pub async fn veilid_net_actor(
                     .is_some_and(|t| t.elapsed() >= STEADY_RESWEEP_WARMUP_HANDOFF)
                     && !resweep_busy.load(std::sync::atomic::Ordering::Acquire);
                 if let Some(handle) = net.as_ref().filter(|_| ready) {
-                    let mut seeds: Vec<[u8; 32]> = Vec::new();
-                    seeds.extend(shares.operator.as_ref().map(|op| op.announce_owner_seed));
-                    if let Some(lobby) = shares.lobby.as_ref() {
-                        seeds.push(lobby.owner_seed);
-                        seeds.push(lobby.share_owner_seed);
-                    }
-                    seeds.extend(circles.iter().map(|c| c.owner_seed));
-                    if let Some(seed) = next_resweep_seed(&mut seeds, resweep_cursor) {
-                        resweep_cursor = Some(seed);
-                        resweep_busy.store(true, std::sync::atomic::Ordering::Release);
-                        daemonseed_veilid_net::vtrace!(
-                            "gui steady-resweep: re-sweeping 1 of {} record(s)",
-                            seeds.len()
-                        );
-                        let handle = handle.clone();
-                        let busy = resweep_busy.clone();
-                        tokio::spawn(async move {
-                            let _ = handle.resweep_rendezvous(seed).await;
-                            busy.store(false, std::sync::atomic::Ordering::Release);
-                        });
+                    // Repairs take priority over resweeps (§RS-1.2): heal a dead record
+                    // before spending cadence ticks resweeping healthy ones. Drained one at
+                    // a time, serialized with the resweep via `resweep_busy`.
+                    if let Some(key) = pending_repairs.pop_front() {
+                        if let Some(&owner_seed) = record_key_owners.get(&key) {
+                            session_health.note_repair_dispatched(&key);
+                            spawn_repair(handle, &resweep_busy, owner_seed);
+                            daemonseed_veilid_net::vtrace!(
+                                "gui steady-resweep: draining a queued repair"
+                            );
+                        }
+                    } else {
+                        let mut seeds: Vec<[u8; 32]> = Vec::new();
+                        seeds.extend(shares.operator.as_ref().map(|op| op.announce_owner_seed));
+                        if let Some(lobby) = shares.lobby.as_ref() {
+                            seeds.push(lobby.owner_seed);
+                            seeds.push(lobby.share_owner_seed);
+                        }
+                        seeds.extend(circles.iter().map(|c| c.owner_seed));
+                        if let Some(seed) = next_resweep_seed(&mut seeds, resweep_cursor) {
+                            resweep_cursor = Some(seed);
+                            // Feed the RecordKey→owner_seed map once per seed (§RS-1.2): the
+                            // key is deterministic per seed (local crypto), so resolve it the
+                            // first time this seed is swept and cache it for repair resolution.
+                            if resolved_seeds.insert(seed) {
+                                if let Ok(rk) = handle.rendezvous_record_key(seed).await {
+                                    record_key_owners.insert(rk, seed);
+                                } else {
+                                    resolved_seeds.remove(&seed); // retry next round
+                                }
+                            }
+                            resweep_busy.store(true, std::sync::atomic::Ordering::Release);
+                            daemonseed_veilid_net::vtrace!(
+                                "gui steady-resweep: re-sweeping 1 of {} record(s)",
+                                seeds.len()
+                            );
+                            let handle = handle.clone();
+                            let busy = resweep_busy.clone();
+                            tokio::spawn(async move {
+                                let _ = handle.resweep_rendezvous(seed).await;
+                                busy.store(false, std::sync::atomic::Ordering::Release);
+                            });
+                        }
                     }
                 }
             }
         }
     }
+}
+
+/// Spawn a one-shot **repair** of a dead rendezvous record session (§RS-1.2 step 3b),
+/// serialized with the steady resweep via `resweep_busy` (one repair/resweep in flight at
+/// a time). Fire-and-forget: the re-established backlog arrives as inbound events, and a
+/// transport error self-heals on the next detection cycle. The caller resets the
+/// session-health tracker (`note_repair_dispatched`) before this so the record re-detects
+/// on a fresh streak if the repair does not restore service.
+fn spawn_repair(
+    handle: &VeilidNetHandle,
+    resweep_busy: &Arc<std::sync::atomic::AtomicBool>,
+    owner_seed: [u8; 32],
+) {
+    resweep_busy.store(true, std::sync::atomic::Ordering::Release);
+    let handle = handle.clone();
+    let busy = resweep_busy.clone();
+    tokio::spawn(async move {
+        let _ = handle.repair_rendezvous(owner_seed).await;
+        busy.store(false, std::sync::atomic::Ordering::Release);
+    });
 }
 
 /// Seal and publish ONE presence beacon for a PUBLIC room (lobby) — a WB-1 join,

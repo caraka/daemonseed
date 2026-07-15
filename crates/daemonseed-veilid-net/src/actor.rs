@@ -150,6 +150,28 @@ enum Command {
         owner_seed: [u8; 32],
         reply: oneshot::Sender<Result<()>>,
     },
+    /// **Repair** a dead rendezvous record session (consumer-route self-heal §RS-1.2,
+    /// step 3b). Re-establishes the record — invalidate the open-cache entry, (optionally
+    /// close), re-open, re-watch, full 0..64 re-sweep — **holding the record's
+    /// `record_lock` across the whole sequence** (CRSH-ISC-3/18), so a concurrent
+    /// same-record write can never target a torn-down handle. `owner_seed` is the same
+    /// rendezvous-owner seed as [`Command::SubscribeRendezvous`] /
+    /// [`Command::ResweepRendezvous`]. Re-swept backlog arrives as
+    /// [`VeilidNetEvent::Inbound`]; the frontend dispatches this only for a repair-due
+    /// record and resets its session-health tracker at dispatch.
+    RepairRendezvous {
+        owner_seed: [u8; 32],
+        reply: oneshot::Sender<Result<()>>,
+    },
+    /// Resolve a rendezvous record's deterministic [`RecordKey`] from its `owner_seed` —
+    /// local crypto only, no network round-trip. Feeds the frontend's
+    /// `RecordKey → owner_seed` map (§RS-1.2) so a repair-due signal (which the tracker
+    /// keys by `RecordKey`) can be dispatched as a [`Command::RepairRendezvous`] on the
+    /// record's owner seed.
+    RendezvousKey {
+        owner_seed: [u8; 32],
+        reply: oneshot::Sender<Result<RecordKey>>,
+    },
     // ── Public-share content (Phase 3) ──
     /// Register an indexed share to serve owner-on-demand (`share_id` → content
     /// + the `PublicRoomKey` bytes responses seal under).
@@ -358,6 +380,27 @@ impl VeilidNetHandle {
     /// [`VeilidNetEvent::Inbound`] and are deduped downstream.
     pub async fn resweep_rendezvous(&self, owner_seed: [u8; 32]) -> Result<()> {
         self.send(|reply| Command::ResweepRendezvous { owner_seed, reply })
+            .await?
+    }
+
+    /// Repair a dead rendezvous record session (consumer-route self-heal §RS-1.2, step
+    /// 3b): re-establish the record under its `record_lock` — invalidate the open-cache
+    /// entry, (optionally) close, re-open, re-watch, and full 0..64 re-sweep (CRSH-ISC-3).
+    /// `owner_seed` is the circle or public-room rendezvous-owner seed (same as
+    /// [`Self::subscribe_room`] / [`Self::resweep_rendezvous`]). The frontend dispatches
+    /// this ONLY for a repair-due record, one at a time (serialized with the steady
+    /// resweep). Re-swept backlog arrives as [`VeilidNetEvent::Inbound`].
+    pub async fn repair_rendezvous(&self, owner_seed: [u8; 32]) -> Result<()> {
+        self.send(|reply| Command::RepairRendezvous { owner_seed, reply })
+            .await?
+    }
+
+    /// Resolve a rendezvous record's deterministic [`RecordKey`] from its `owner_seed` —
+    /// local crypto only (no network round-trip). The frontend feeds this into its
+    /// `RecordKey → owner_seed` map so a repair-due signal (keyed by `RecordKey`) resolves
+    /// to the seed [`Self::repair_rendezvous`] needs (§RS-1.2).
+    pub async fn rendezvous_record_key(&self, owner_seed: [u8; 32]) -> Result<RecordKey> {
+        self.send(|reply| Command::RendezvousKey { owner_seed, reply })
             .await?
     }
 
@@ -938,6 +981,29 @@ async fn actor_loop(
                     )
                     .await,
                 );
+            }
+            Command::RepairRendezvous { owner_seed, reply } => {
+                let _ = reply.send(
+                    repair_rendezvous(
+                        &api,
+                        &rc,
+                        &ev_tx,
+                        &opened,
+                        &record_locks,
+                        &dht_gate,
+                        owner_seed,
+                    )
+                    .await,
+                );
+            }
+            Command::RendezvousKey { owner_seed, reply } => {
+                // Local crypto only (no network): derive the owner keypair, compute the
+                // deterministic record key. Feeds the frontend's RecordKey→owner_seed map.
+                let res = match identity::rendezvous_owner_keypair(&owner_seed) {
+                    Ok(owner) => rendezvous::rendezvous_key(&api, &owner).await,
+                    Err(e) => Err(e),
+                };
+                let _ = reply.send(res);
             }
             Command::ServeShare {
                 share_id,
@@ -1521,6 +1587,66 @@ async fn resweep_rendezvous(
     crate::vtrace!("resweep_rendezvous: record open key={key:?}; spawning backlog sweep -> Ok");
     // Read lane (WB-5 / I5′.1): hold a shared-accountant read permit for the sweep.
     spawn_gated_sweep(gate, rc, key, ev_tx);
+    Ok(())
+}
+
+/// **Repair** a dead rendezvous record session (consumer-route self-heal §RS-1.2, step
+/// 3b). Re-establishes the record under its `record_lock` held across the WHOLE sequence
+/// (CRSH-ISC-3/18): invalidate the open-cache entry, optionally
+/// [`rendezvous::REPAIR_CLOSE_FIRST`]-close the old handle, re-open, re-watch, and full
+/// 0..64 re-sweep. The open/watch acquire the §RS-2 un-gated limiter; the re-sweep GETs
+/// take per-GET read permits — never nested (CRSH-ISC-17), since open/watch complete
+/// before the sweep starts. Unlike [`subscribe_rendezvous`], the re-sweep is **awaited
+/// under the lock** (via [`rendezvous::sweep_collect`]) rather than spawned, so the whole
+/// re-establishment is atomic against a concurrent same-record write; it emits backlog
+/// [`VeilidNetEvent::Inbound`]s but NOT a [`VeilidNetEvent::SweepHealth`] (the frontend
+/// resets the tracker at dispatch, so a repair-sweep health event would muddy detection).
+async fn repair_rendezvous(
+    api: &VeilidAPI,
+    rc: &RoutingContext,
+    ev_tx: &mpsc::UnboundedSender<VeilidNetEvent>,
+    opened: &rendezvous::OpenCache,
+    record_locks: &rendezvous::RecordLocks,
+    gate: &Arc<DhtGate>,
+    owner_seed: [u8; 32],
+) -> Result<()> {
+    crate::vtrace!("repair_rendezvous: re-establishing dead record session");
+    let owner = identity::rendezvous_owner_keypair(&owner_seed)?;
+    let record_lock = rendezvous::record_lock(record_locks, &owner_seed);
+    let outcome = rendezvous::repair_gated(
+        &record_lock,
+        opened,
+        &owner_seed,
+        rendezvous::REPAIR_CLOSE_FIRST,
+        // close (repro-gated): best-effort — a close on a session veilid already GC'd is a
+        // benign race (Evidence 3 sibling), so the error is swallowed.
+        |key| async move {
+            if let Err(e) = rc.close_dht_record(key).await {
+                crate::vtrace!("repair_rendezvous: close_dht_record (pre-reopen) failed ({e})");
+            }
+        },
+        // open: `open_or_create` acquires the un-gated limiter around each raw open
+        // (CRSH-ISC-14/17); no read permit is held across it.
+        || rendezvous::open_or_create(gate, api, rc, &owner),
+        // watch: un-gated limiter around the raw watch; no read permit held (CRSH-ISC-17).
+        |key| async move {
+            let _ungated = gate.acquire_ungated().await;
+            rc.watch_dht_values(key, None, None, None)
+                .await
+                .map(|_| ())
+                .map_err(|e| VeilidNetError::Routing(e.to_string()))
+        },
+        // sweep: full 0..64 re-sweep, per-GET read permits (WB-5.1 / I5″.2), awaited under
+        // the lock. No SweepHealth emission (the frontend owns the tracker reset).
+        |key| rendezvous::sweep_collect(gate, rc, key, ev_tx),
+    )
+    .await?;
+    crate::vtrace!(
+        "repair_rendezvous: re-established ({} slot(s) re-swept, {} attempted, {} failed) -> Ok",
+        outcome.found,
+        outcome.attempted,
+        outcome.failed
+    );
     Ok(())
 }
 

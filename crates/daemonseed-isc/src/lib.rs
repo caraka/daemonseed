@@ -340,13 +340,16 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("CRSH-ISC-2", IscClass::Positive), // K consecutive all-failed → one repair at the K-th tick (§RS-1.2)
     ("CRSH-ISC-9", IscClass::Positive), // repair suppressed in elevated weather, resumes in calm (§RS-1.2)
     ("CRSH-ISC-11", IscClass::Negative), // anti: no repair-due input derives from a user event (§RS-1.2)
+    ("CRSH-ISC-3", IscClass::Positive), // repair re-establishes under record_lock, per-GET read permits (§RS-1.2)
+    ("CRSH-ISC-18", IscClass::Positive), // chat write under repair serializes behind lock → fresh session (§RS-1.2)
+    ("CRSH-ISC-17", IscClass::Negative), // anti: never hold read permit while acquiring the limiter (§RS-2)
 ];
 
 /// Total built, non-deferred ISCs tracked by this registry — the SINGLE source
 /// of truth for the coverage denominator, read live by `xtask isc-coverage`.
 /// Recount on every ISC add/remove (the `const _` assert below guards it
 /// against [`ISCS`]).
-pub const TOTAL: usize = 194;
+pub const TOTAL: usize = 197;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -538,15 +541,16 @@ mod tests {
         //                                  chat-never-waits / panic-recovery /
         //                                  telemetry-only / single-permit), #159/#168/#157)
         //                                  consumer route self-heal (#180):
-        //                                  CRSH-ISC-1/2/9 pos (sweep accounting,
-        //                                  K-consecutive detection, weather gating) +
-        //                                  CRSH-ISC-11/14 neg (network-state-only input,
-        //                                  un-gated margin limiter)
-        //   total   127 pos + 67 neg = 194
+        //                                  CRSH-ISC-1/2/9/3/18 pos (sweep accounting,
+        //                                  K-consecutive detection, weather gating,
+        //                                  record_lock repair, chat-write serialization) +
+        //                                  CRSH-ISC-11/14/17 neg (network-state-only input,
+        //                                  un-gated margin limiter, no-nested-permit)
+        //   total   129 pos + 68 neg = 197
         //   (the v0.33.0 Veilid cutover retired 14 server-positive + 10
         //    server-negative relay/TLS/federation/rate-limit ISCs.)
-        assert_eq!(pos, 127, "positive count drift");
-        assert_eq!(neg, 67, "negative count drift");
+        assert_eq!(pos, 129, "positive count drift");
+        assert_eq!(neg, 68, "negative count drift");
     }
 
     /// COVERED is single-sourced and must agree with the per-milestone
