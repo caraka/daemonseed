@@ -23,13 +23,24 @@
 //!   between GETs, so read occupancy ≤ the read partition regardless of live sweep
 //!   count (N-independence — WB-ISC-22), and reads cannot be starved by writes at all.
 //!
-//! # The margin (WB-5.1 / I5″.1) — an invariant, not decoration
+//! # The margin (WB-5.1 / I5″.1) — an enforced invariant, not a census
 //! [`DHT_GATE_MARGIN`] is reserved for daemonseed's *un-gated* DHT ops —
-//! `open_dht_record` and `watch_dht_values`, both issued inline in the serial actor
-//! command loop and therefore ≤ 1 in flight. The invariant: **no un-gated DHT-op
-//! class may ever exceed the margin concurrently.** Any new un-gated call site, or any
-//! spawn that parallelizes open/watch, re-opens this clause. (The one-time margin
-//! audit against veilid-core 0.5.4's `allow_offline` background flush is recorded in
+//! `open_dht_record` and `watch_dht_values`. The invariant: **no un-gated DHT-op
+//! class may ever exceed the margin concurrently.** Originally this held by a census
+//! argument (open/watch were issued inline in the serial actor command loop, ≤ 1 in
+//! flight); the consumer-route self-heal (`docs/design/consumer-route-self-heal.md`
+//! §RS-2) adds un-gated call sites in *spawned* contexts (repair, Refresh), which the
+//! frozen §I5″.1 clause says re-opens the argument. It is now discharged **by
+//! construction**: a capacity-[`DHT_GATE_MARGIN`] semaphore (the un-gated-op limiter),
+//! acquired via [`acquire_ungated`](DhtGate::acquire_ungated), that **every**
+//! `open_dht_record` / `watch_dht_values` site holds across its raw veilid call. Peak
+//! un-gated concurrency ≤ margin(2) is thus enforced, not asserted, under any
+//! composition of concurrent connect + repair + Refresh (CRSH-ISC-14). The limiter is
+//! separate from the four gated pools and draws on the reserved margin, so a task may
+//! hold a chat/floor/write permit while acquiring it (the publish path opens a record
+//! under its write permit) — but the single-permit rule below still forbids nesting it
+//! with a *read* permit (CRSH-ISC-17). (The one-time margin audit against veilid-core
+//! 0.5.4's `allow_offline` background flush is recorded in
 //! `docs/design/veilid-write-budget.md` §I5″.1 / the margin-audit decision; if that
 //! flush drew the operation gate, `DHT_GATE_MARGIN` would rise to 3 and the READ pool
 //! would yield one permit — no other pool moves.)
@@ -121,6 +132,13 @@ pub struct DhtGate {
     floor: Arc<Semaphore>,
     write: Arc<Semaphore>,
     read: Arc<Semaphore>,
+    /// The un-gated-op limiter (WB-5.1 / I5″.1, consumer-route self-heal §RS-2):
+    /// capacity [`DHT_GATE_MARGIN`], drawing on the reserved margin below veilid's gate
+    /// rather than on any of the four budgeted pools. Every `open_dht_record` /
+    /// `watch_dht_values` call site holds one of these permits across its raw veilid
+    /// call, so peak un-gated concurrency is bounded to the margin by construction
+    /// (CRSH-ISC-14), not by a census argument.
+    ungated: Arc<Semaphore>,
 }
 
 impl DhtGate {
@@ -139,6 +157,10 @@ impl DhtGate {
             floor: Arc::new(Semaphore::new(floor.max(1))),
             write: Arc::new(Semaphore::new(write.max(1))),
             read: Arc::new(Semaphore::new(read.max(1))),
+            // The un-gated-op limiter is fixed at the margin constant for every gate —
+            // it is the enforced §I5″.1 invariant, not a tunable partition, so it takes
+            // no constructor parameter (see the module docs / §RS-2).
+            ungated: Arc::new(Semaphore::new(DHT_GATE_MARGIN.max(1))),
         })
     }
 
@@ -185,6 +207,25 @@ impl DhtGate {
         Self::acquire(&self.read).await
     }
 
+    /// Acquire an un-gated-op permit from the margin-sized limiter (WB-5.1 / I5″.1,
+    /// consumer-route self-heal §RS-2). **Every** `open_dht_record` /
+    /// `watch_dht_values` call site MUST hold this permit across the raw veilid call —
+    /// the subscribe path, the publish-path record open, and (as they land) the repair
+    /// arm and Refresh alike — so peak un-gated concurrency is `≤ DHT_GATE_MARGIN`,
+    /// enforced rather than asserted (CRSH-ISC-14). The permit draws on the reserved
+    /// margin, not on any of the four budgeted pools; hold it around ONE open (or one
+    /// watch) and drop it before the next so the margin is occupied only for the raw
+    /// call's duration. **Single-permit rule (CRSH-ISC-17):** a caller must never hold a
+    /// read-pool permit while acquiring this, or acquire a read permit while holding
+    /// this — repair/Refresh acquire their per-GET read permits strictly outside the
+    /// limiter's span. (Holding a chat/floor/write permit across an `acquire_ungated`
+    /// is permitted: the publish path opens a record under its write permit, and the
+    /// limiter draws separate margin, so no pool is over-subscribed and the acquire
+    /// ordering — pool then limiter, never the reverse — admits no cycle.)
+    pub async fn acquire_ungated(self: &Arc<Self>) -> GatePermit {
+        Self::acquire(&self.ungated).await
+    }
+
     /// Currently-available chat-pool permits. For the WB-ISC-17 partition oracle.
     pub fn available_chat(&self) -> usize {
         self.chat.available_permits()
@@ -204,6 +245,13 @@ impl DhtGate {
     /// Currently-available read-pool permits. For the WB-ISC-17/22 oracles.
     pub fn available_read(&self) -> usize {
         self.read.available_permits()
+    }
+
+    /// Currently-available un-gated-op limiter permits. For the CRSH-ISC-14 live
+    /// concurrency probe (`DHT_GATE_MARGIN − available_ungated()` = un-gated ops in
+    /// flight).
+    pub fn available_ungated(&self) -> usize {
+        self.ungated.available_permits()
     }
 
     /// Total in-flight DHT ops across ALL four pools — the budgeted quantity. The
@@ -374,5 +422,52 @@ mod tests {
         assert_eq!(gate.available_write(), W_MAX - 1);
         assert_eq!(gate.available_floor(), FLOOR_PERMITS - 1);
         assert_eq!(gate.available_read(), READ_PERMITS - 1);
+    }
+
+    // CRSH-ISC-14 (limiter core; full connect+repair+Refresh composition probe lands
+    // with steps 3/7) ──────────────────────────────────────────────────────────
+    /// The un-gated-op limiter caps concurrent open/watch ops at [`DHT_GATE_MARGIN`].
+    /// Spawn well over the margin of concurrent `acquire_ungated` holders; each records
+    /// peak in-flight while holding its permit and yields so the scheduler can attempt
+    /// to over-subscribe. Max-in-flight never exceeds the margin, and every holder
+    /// completes (no deadlock/starve). This is the limiter's own bound; the live
+    /// connect+repair+Refresh composition probe arrives with steps 3/7.
+    #[tokio::test]
+    async fn crsh_isc_14_ungated_ops_bounded_by_margin() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let gate = DhtGate::new();
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+
+        const HOLDERS: usize = 4 * DHT_GATE_MARGIN; // well over the margin
+        let mut handles = Vec::new();
+        for _ in 0..HOLDERS {
+            let gate = gate.clone();
+            let max_in_flight = max_in_flight.clone();
+            let completed = completed.clone();
+            handles.push(tokio::spawn(async move {
+                let permit = gate.acquire_ungated().await;
+                let in_flight = DHT_GATE_MARGIN - gate.available_ungated();
+                max_in_flight.fetch_max(in_flight, Ordering::SeqCst);
+                // Hold across a yield so peers pile onto the limiter — the window in
+                // which an unbounded limiter would over-subscribe the margin.
+                tokio::task::yield_now().await;
+                drop(permit);
+                completed.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert!(
+            max_in_flight.load(Ordering::SeqCst) <= DHT_GATE_MARGIN,
+            "un-gated op concurrency never exceeds the margin ({DHT_GATE_MARGIN}) \
+             regardless of how many sites contend"
+        );
+        assert_eq!(
+            completed.load(Ordering::SeqCst),
+            HOLDERS,
+            "every un-gated holder acquired and completed (no deadlock/starve)"
+        );
     }
 }

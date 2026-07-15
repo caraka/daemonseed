@@ -31,6 +31,7 @@ work lives in the project lead's vault manifest, not here.
 ### Changed
 
 - `veilid-core`: 0.5.4 → 0.5.6 (transitive x25519-dalek 2 → 3).
+- `daemonseed-veilid-net`: the §I5″.1 margin (≤ 2 concurrent un-gated `open_dht_record`/`watch_dht_values`) is enforced by a semaphore every open/watch site acquires, rather than held by a census argument — so spawned open/watch sites cannot breach it (#180, CRSH-ISC-14).
 
 ### Fixed
 

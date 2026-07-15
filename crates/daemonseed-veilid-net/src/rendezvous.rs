@@ -81,13 +81,25 @@ pub async fn rendezvous_key(api: &VeilidAPI, owner: &KeyPair) -> Result<RecordKe
 /// decoupled from Veilid's (classical) transport crypto — so adopting a future
 /// Veilid PQC suite is a free, content-independent change.
 pub async fn open_or_create(
+    gate: &Arc<DhtGate>,
     api: &VeilidAPI,
     rc: &RoutingContext,
     owner: &KeyPair,
 ) -> Result<RecordKey> {
     let key = rendezvous_key(api, owner).await?;
     crate::vtrace!("open_or_create: rendezvous key={key:?}; trying open#1");
-    match rc.open_dht_record(key.clone(), Some(owner.clone())).await {
+    // §RS-2 margin limiter: each raw `open_dht_record` is an un-gated DHT op, so it
+    // holds an un-gated-op permit across the call — peak open concurrency ≤ margin(2)
+    // by construction (CRSH-ISC-14), never a census argument. Acquired at raw-call
+    // granularity (not spanning the whole fn) so the margin is occupied only for the
+    // open RPC, and `create_dht_record` between the two opens runs without it.
+    // CRSH-ISC-17: `open_or_create` issues no gated GET, so no read-pool permit is ever
+    // held while this limiter permit is acquired (the single-permit rule is respected).
+    let open1 = {
+        let _ungated = gate.acquire_ungated().await;
+        rc.open_dht_record(key.clone(), Some(owner.clone())).await
+    };
+    match open1 {
         Ok(_) => {
             crate::vtrace!("open_or_create: open#1 ok (record already on net) -> Ok");
             return Ok(key);
@@ -105,11 +117,12 @@ pub async fn open_or_create(
         Ok(_) => crate::vtrace!("open_or_create: create ok"),
         Err(e) => crate::vtrace!("open_or_create: create failed ({e}) (lost race? reopen anyway)"),
     }
-    let r = rc
-        .open_dht_record(key.clone(), Some(owner.clone()))
-        .await
-        .map(|_| key)
-        .map_err(|e| VeilidNetError::Routing(e.to_string()));
+    let r = {
+        let _ungated = gate.acquire_ungated().await;
+        rc.open_dht_record(key.clone(), Some(owner.clone())).await
+    }
+    .map(|_| key)
+    .map_err(|e| VeilidNetError::Routing(e.to_string()));
     crate::vtrace!(
         "open_or_create: reopen {}",
         if r.is_ok() { "ok -> Ok" } else { "ERR" }

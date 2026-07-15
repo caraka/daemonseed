@@ -408,6 +408,8 @@ The write-budget family takes permanent `WB-ISC-N` IDs from the FROZEN 2026-07-0
 
 - [x] CRSH-ISC-1: The steady resweep's GET accounting surfaces per-record attempted/failed/found counts — a failed GET is distinct from an empty slot (no longer swallowed by `.ok().flatten()`), the enabling observability for consumer-side session-health tracking (#180 §RS-1.1) (probe: `rendezvous::crsh_isc_1_sweep_outcome_accounts_failed_empty_and_found_separately`; existing #157 resweep behavior regression-guarded).
 
+- [ ] CRSH-ISC-14: Anti — peak un-gated DHT-op concurrency (open + watch) never exceeds margin(2) under any composition of connect, repair, and Refresh; every un-gated site acquires the enforced limiter (#180 §RS-2). Limiter core + connect-path wiring landed (probe: `dht_gate::crsh_isc_14_ungated_ops_bounded_by_margin`); the full connect+repair+Refresh composition probe completes with steps 3/7.
+
 ## Test Strategy
 
 | surface | check | tool / probe |

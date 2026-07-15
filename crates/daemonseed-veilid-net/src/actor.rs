@@ -1228,11 +1228,12 @@ async fn serve_loop(
 /// Open/create the rendezvous record (a circle's, or a public room's / lobby's)
 /// and write `sealed` into this node's append-ring slot, advancing the local
 /// cursor. Identical for every consumer — only the caller's `owner_seed` differs.
-// All eight parameters are distinct threaded actor state (three shared caches, the
-// node id, the owner seed, and the payload); bundling them into a struct would only
+// All nine parameters are distinct threaded actor state (the gate, three shared caches,
+// the node id, the owner seed, and the payload); bundling them into a struct would only
 // move the coupling, not remove it, on a single private helper.
 #[allow(clippy::too_many_arguments)]
 async fn publish_rendezvous(
+    gate: &Arc<DhtGate>,
     api: &VeilidAPI,
     rc: &RoutingContext,
     node_pub: &[u8; 32],
@@ -1253,7 +1254,7 @@ async fn publish_rendezvous(
     let key = rendezvous::open_cached(
         opened,
         &owner_seed,
-        rendezvous::open_or_create(api, rc, &owner),
+        rendezvous::open_or_create(gate, api, rc, &owner),
     )
     .await?;
     let base = rendezvous::member_base_subkey(node_pub);
@@ -1287,7 +1288,11 @@ async fn publish_rendezvous(
 /// `stable_id` overwrites in place (last-writer-wins), so a share's dead-route advert
 /// never orphans across a restart (#118) and a withdraw cancels it in the same slot.
 /// The public-share advert path uses this; circles / lobby-chat keep the append-ring.
+// Distinct threaded actor state (the gate, two shared caches, the owner seed, the
+// stable id, and the payload); bundling them would move the coupling, not remove it.
+#[allow(clippy::too_many_arguments)]
 async fn publish_current_state(
+    gate: &Arc<DhtGate>,
     api: &VeilidAPI,
     rc: &RoutingContext,
     opened: &rendezvous::OpenCache,
@@ -1304,7 +1309,7 @@ async fn publish_current_state(
     let key = rendezvous::open_cached(
         opened,
         &owner_seed,
-        rendezvous::open_or_create(api, rc, &owner),
+        rendezvous::open_or_create(gate, api, rc, &owner),
     )
     .await?;
     let subkey = rendezvous::current_state_subkey(stable_id);
@@ -1380,6 +1385,7 @@ impl WriteSink for ProductionSink {
             let result = match item {
                 ProdWrite::Rendezvous { owner_seed, sealed } => {
                     publish_rendezvous(
+                        &gate,
                         &api,
                         &rc,
                         &node_pub,
@@ -1397,6 +1403,7 @@ impl WriteSink for ProductionSink {
                     sealed,
                 } => {
                     publish_current_state(
+                        &gate,
                         &api,
                         &rc,
                         &opened,
@@ -1439,14 +1446,23 @@ async fn subscribe_rendezvous(
         rendezvous::open_cached(
             opened,
             &owner_seed,
-            rendezvous::open_or_create(api, rc, &owner),
+            rendezvous::open_or_create(gate, api, rc, &owner),
         )
         .await?
     };
     crate::vtrace!("subscribe_rendezvous: record open key={key:?}; registering watch");
-    rc.watch_dht_values(key.clone(), None, None, None)
-        .await
-        .map_err(|e| VeilidNetError::Routing(e.to_string()))?;
+    // §RS-2 margin limiter: `watch_dht_values` is an un-gated DHT op, so hold an
+    // un-gated-op permit across the raw watch — peak open+watch concurrency ≤ margin(2)
+    // by construction (CRSH-ISC-14). CRSH-ISC-17: no read-pool permit is held across
+    // this acquire; the backlog sweep's per-GET read permits are taken later, inside
+    // the spawned `sweep`, strictly outside the limiter's span. The `record_lock` open
+    // guard above is already dropped, so only the watch RPC sits under the limiter.
+    {
+        let _ungated = gate.acquire_ungated().await;
+        rc.watch_dht_values(key.clone(), None, None, None)
+            .await
+            .map_err(|e| VeilidNetError::Routing(e.to_string()))?;
+    }
     crate::vtrace!("subscribe_rendezvous: watch ok; spawning backlog sweep -> Ok");
     // Read lane (WB-5 / I5′.1): the backlog sweep is a burst of DHT GETs; hold a
     // read permit from the shared accountant for its duration so reads and writes
@@ -1498,7 +1514,7 @@ async fn resweep_rendezvous(
         rendezvous::open_cached(
             opened,
             &owner_seed,
-            rendezvous::open_or_create(api, rc, &owner),
+            rendezvous::open_or_create(gate, api, rc, &owner),
         )
         .await?
     };
