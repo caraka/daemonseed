@@ -28,6 +28,10 @@ work lives in the project lead's vault manifest, not here.
 
 - `docs/design/consumer-route-self-heal.md` — frozen design-of-record for the consumer-side share route self-heal: sweep error accounting, cadence-timed session repair, fetch-path prune retirement, off-loop fetch, route-release hygiene, sweep-first Refresh; spawns CRSH-ISC-1..20 (#180).
 
+### Changed
+
+- `veilid-core`: 0.5.4 → 0.5.6 (transitive x25519-dalek 2 → 3).
+
 ### Fixed
 
 - `daemonseed-gui`: Windows reclaims a stale single-instance lock via a per-root `Global` named mutex, and surfaces a native recovery dialog on the no-console build instead of failing to start silently (#196).
