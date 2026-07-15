@@ -418,6 +418,12 @@ The write-budget family takes permanent `WB-ISC-N` IDs from the FROZEN 2026-07-0
 - [x] CRSH-ISC-18: A same-record write concurrent with a repair serializes behind the repair's `record_lock` — never lost, never targeting a torn-down handle; on acquiring the lock it reads the freshly re-cached session (#180 §RS-1.2) (probe: `rendezvous::crsh_isc_18_chat_write_serializes_behind_repair_and_targets_fresh_session`, paused-time).
 - [x] CRSH-ISC-17: Anti — no site holds a read-pool permit while acquiring the un-gated-op limiter, or vice versa; the repair's open/watch (limiter) and re-sweep GETs (read pool) are separate phases (#180 §RS-2) (probe: the CRSH-ISC-3 trace assertions + acquire-site inspection; Refresh sites at step 7 are bound by the same rule).
 
+- [x] CRSH-ISC-4: Anti — a fetch failure, browse, render, or roster event enqueues no DHT op (write/GET/open/watch) and no `app_call`; error paths mutate local state only (#180 §RS-0) (probe: gui `crsh_isc_4_*` — the reactive path takes no network handle; `mark_share_unresolved` mutates local state + one `SharesSnapshot`).
+- [x] CRSH-ISC-5: A share whose fetch fails (import-fail AND manifest-fail) stays listed `Unresolved`; it is removed from `discovered`/catalog only on verified withdraw or catalog TTL, never by the fetch-failure path (#180 §RS-1.5) (probe: gui/tui `crsh_isc_5_*`).
+- [x] CRSH-ISC-6: A parked browse retry fires exactly once, on the first cursor tick after a fresh advert for that share folds inside the window (`BROWSE_RETRY_WINDOW` = 600s); on window expiry it surfaces failure without pruning (#180 §RS-1.4) (probe: `daemonseed_core::browse_retry::crsh_isc_6_*` + gui/tui).
+- [x] CRSH-ISC-15: Anti — parked-retry dispatch is decorrelated from the advert-fold event: the decision is queried only at a cursor tick, never inside `apply_discovery`, so it never fires in the fold's event-turn (#180 §RS-1.4) (probe: `browse_retry::crsh_isc_15_*`, architectural).
+- [x] CRSH-ISC-19: Parked retries carry a `(share_id, discovered-generation)` tag; a withdraw/re-add mid-park drops the stale retry so it never fires against a new advert's route (#180 §RS-1.4) (probe: `browse_retry::crsh_isc_19_*` + gui/tui).
+
 ## Test Strategy
 
 | surface | check | tool / probe |

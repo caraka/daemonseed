@@ -93,6 +93,13 @@ pub struct ShareListing {
     /// the attribution (#114). Own shares are the caller's own, so their handle is
     /// not a discovery attribution.
     pub mine: bool,
+    /// (#180 §RS-1.4) A discovered share whose last fetch failed and which is now
+    /// **re-resolving**: the frontend marks its route `Unresolved` and keeps the share
+    /// listed while a parked one-shot retry waits for a fresh advert. The UI renders it as
+    /// "re-resolving" rather than removing it — the reactive path never prunes on a fetch
+    /// failure (CRSH-ISC-5). Set by the frontend from its local discovered-route state;
+    /// always `false` on a fresh listing and on own shares.
+    pub unresolved: bool,
 }
 
 impl From<&DiscoveredShare> for ShareListing {
@@ -106,6 +113,9 @@ impl From<&DiscoveredShare> for ShareListing {
             // UI reveals on hover (the advisory `sender_handle` carries no hash).
             sharer_fingerprint: pubkey_fingerprint(&d.sender_pubkey),
             mine: false, // a discovered share is a foreign announcer's
+            // The catalog does not know the frontend's re-resolve state; the frontend
+            // overlays it from its local discovered-route map (#180 §RS-1.4).
+            unresolved: false,
         }
     }
 }

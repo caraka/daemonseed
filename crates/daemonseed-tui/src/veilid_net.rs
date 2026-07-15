@@ -79,6 +79,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use daemonseed_cli::route_signer::IdentityRouteAdvertSigner;
+use daemonseed_core::browse_retry::{ParkedBrowseRetry, ParkedRetryAction, parked_retry_action};
 use daemonseed_core::circle::default_circle_label;
 use daemonseed_core::circle::key::{CircleKey, derive_circle_veilid_owner_seed, derive_cot_key};
 use daemonseed_core::circle::message::{open_message, seal_message};
@@ -175,6 +176,15 @@ struct LobbyRendezvous {
 /// the route was verified against lives in the catalog entry.
 struct DiscoveredRoute {
     route_blob: Vec<u8>,
+    /// (#180 §RS-1.4) A strictly-increasing generation stamped on every accepted advert
+    /// fold for this share (from [`ShareState::next_generation`]). A parked browse retry
+    /// captures this at fetch-fail time; a later fold bumps it strictly above the parked
+    /// value, the retry's fire signal (CRSH-ISC-6/19).
+    generation: u64,
+    /// (#180 §RS-1.4) `true` once a fetch of this share failed and it is **re-resolving**:
+    /// the share stays listed (never pruned on a fetch failure, CRSH-ISC-5) with a parked
+    /// one-shot retry. Cleared by a successful fetch; preserved across a fresh advert fold.
+    unresolved: bool,
 }
 
 /// A share this node published this session — enough to post a
@@ -206,6 +216,15 @@ struct ShareState {
     lobby: Option<LobbyRendezvous>,
     catalog: ShareCatalog,
     discovered: HashMap<String, DiscoveredRoute>,
+    /// (#180 §RS-1.4) Monotonic generation counter, stamped onto a [`DiscoveredRoute`] on
+    /// every accepted advert fold, so a parked browse retry can detect a fresh advert and
+    /// a withdraw/re-add never reuses a stale generation (CRSH-ISC-6/19).
+    next_generation: u64,
+    /// (#180 §RS-1.4) Parked one-shot browse retries, keyed by `share_id`. A fetch failure
+    /// marks the share `Unresolved` and parks a retry here (local only, no network); it
+    /// fires at the next cursor tick after a fresh advert folds (CRSH-ISC-6/15), or clears
+    /// on window expiry / withdraw (CRSH-ISC-19) — never a prune.
+    parked_retries: HashMap<String, ParkedBrowseRetry>,
     /// Shares published this session — held ONLY to post a matching withdraw on
     /// unpublish. Unlike the GUI mirror, own shares are NOT folded into the
     /// `SharesSnapshot` (the relay's `remote` rows are the discovered catalog
@@ -228,6 +247,8 @@ impl ShareState {
             lobby: None,
             catalog: ShareCatalog::new(SHARE_CATALOG_TTL),
             discovered: HashMap::new(),
+            next_generation: 0,
+            parked_retries: HashMap::new(),
             own: Vec::new(),
             reap_gate: ReapGate::new(),
             prev_presence_stale: false,
@@ -426,6 +447,11 @@ pub async fn veilid_net_actor(
             // re-writes, WB-4). Spawned off the loop so its record-open await never
             // stalls commands/chat; the cursor advance is synchronous.
             _ = steady_resweep.tick() => {
+                // (#180 §RS-1.4, CRSH-ISC-6/15) Dispatch parked browse retries on the
+                // consumer's own cursor tick (decorrelated from the sharer's re-announce),
+                // independent of the resweep `ready` gate — the retry is an off-DHT content
+                // fetch, not a sweep.
+                process_parked_browse_retries(&mut shares, &evt_tx, &net).await;
                 // Ready once the hand-off window has elapsed, we are attached, and no
                 // prior resweep is still in flight (the WB-2 one-sweep-at-a-time bound).
                 let ready = connected_at
@@ -972,7 +998,17 @@ fn emit_shares_snapshot(shares: &ShareState, evt_tx: &UnboundedSender<NetEvent>)
         .catalog
         .entries()
         .iter()
-        .map(ShareListing::from)
+        .map(|s| {
+            let mut listing = ShareListing::from(s);
+            // (#180 §RS-1.4) Overlay the frontend-local re-resolve state: a share whose
+            // fetch failed stays listed, marked `unresolved`, until a parked retry
+            // resolves it (CRSH-ISC-5).
+            listing.unresolved = shares
+                .discovered
+                .get(&s.share_id)
+                .is_some_and(|d| d.unresolved);
+            listing
+        })
         .collect();
     let _ = evt_tx.send(NetEvent::SharesSnapshot {
         local: Vec::new(),
@@ -1211,7 +1247,7 @@ fn fetch_error_message(context: &str, e: VeilidNetError) -> String {
 /// No bytes are fetched. The route is anti-swap-verified at discovery time, before
 /// it ever enters `shares.discovered`.
 async fn fetch_share(
-    shares: &ShareState,
+    shares: &mut ShareState,
     evt_tx: &UnboundedSender<NetEvent>,
     net: &Option<VeilidNetHandle>,
     share_id: &str,
@@ -1220,22 +1256,40 @@ async fn fetch_share(
     let Some(handle) = net.as_ref() else {
         return fetch_fail(evt_tx, "not connected to Veilid yet".to_owned());
     };
-    let Some(lobby) = shares.lobby.as_ref() else {
-        return fetch_fail(evt_tx, "lobby not subscribed yet".to_owned());
+    // Copy the route + room key out, dropping the immutable borrow so a fetch failure
+    // can mark the share Unresolved (&mut) below.
+    let (route_blob, room_key_bytes) = {
+        let Some(lobby) = shares.lobby.as_ref() else {
+            return fetch_fail(evt_tx, "lobby not subscribed yet".to_owned());
+        };
+        let Some(disc) = shares.discovered.get(share_id) else {
+            return fetch_fail(
+                evt_tx,
+                "share not discovered yet — refresh the list".to_owned(),
+            );
+        };
+        (disc.route_blob.clone(), *lobby.room_key.as_bytes())
     };
-    let Some(disc) = shares.discovered.get(share_id) else {
-        return fetch_fail(
-            evt_tx,
-            "share not discovered yet — refresh the list".to_owned(),
-        );
-    };
-    let room_key_bytes = *lobby.room_key.as_bytes();
-    let route = match handle.import_route(disc.route_blob.clone()).await {
+    let route = match handle.import_route(route_blob).await {
         Ok(r) => r,
-        Err(e) => return fetch_fail(evt_tx, format!("could not import the sharer's route: {e}")),
+        Err(e) => {
+            // (#180 §RS-1.4/§RS-1.5, CRSH-ISC-4/5) The route won't import — route-death,
+            // NOT a malformed blob (verified at discovery). Reactive path is local-only:
+            // mark Unresolved + park a one-shot retry, never prune; the share stays listed.
+            mark_share_unresolved(shares, evt_tx, share_id, name);
+            return fetch_fail(
+                evt_tx,
+                format!(
+                    "could not import the sharer's route: {e} — re-resolving; the share \
+                     stays listed"
+                ),
+            );
+        }
     };
     match handle.fetch_manifest(route, share_id, room_key_bytes).await {
         Ok(manifest) => {
+            // A successful re-resolve: clear any Unresolved mark + drop a parked retry.
+            clear_share_unresolved(shares, evt_tx, share_id);
             let entries = manifest
                 .iter()
                 .map(|e| ShareManifestEntry {
@@ -1250,10 +1304,104 @@ async fn fetch_share(
                 entries,
             });
         }
-        Err(e) => fetch_fail(
+        Err(e) => {
+            // (#180 §RS-1.4/§RS-1.5, CRSH-ISC-4/5) Manifest fetch failed (dead route /
+            // withdraw / transport). Reactive path is local-only: mark Unresolved + park a
+            // retry, never prune (prune keys only on verified withdraw or catalog TTL).
+            mark_share_unresolved(shares, evt_tx, share_id, name);
+            fetch_fail(
+                evt_tx,
+                fetch_error_message("could not fetch the share manifest — re-resolving", e),
+            );
+        }
+    }
+}
+
+/// (#180 §RS-1.4, CRSH-ISC-4/5) Mark a share's route **Unresolved** after a fetch failure
+/// and park a one-shot, generation-tagged browse retry — **local computation only, ZERO
+/// network** (§RS-0). The share stays listed (never pruned on a fetch failure); the parked
+/// retry fires at the next cursor tick after a fresh advert folds (CRSH-ISC-6), or clears
+/// on window expiry / withdraw. Takes no network handle by construction. No-op if the route
+/// is already gone.
+fn mark_share_unresolved(
+    shares: &mut ShareState,
+    evt_tx: &UnboundedSender<NetEvent>,
+    share_id: &str,
+    name: &str,
+) {
+    let generation = match shares.discovered.get_mut(share_id) {
+        Some(disc) => {
+            disc.unresolved = true;
+            disc.generation
+        }
+        None => return,
+    };
+    shares.parked_retries.insert(
+        share_id.to_owned(),
+        ParkedBrowseRetry::park(name.to_owned(), generation, Instant::now()),
+    );
+    emit_shares_snapshot(shares, evt_tx);
+}
+
+/// (#180 §RS-1.4) A successful fetch resolves the share: clear the Unresolved mark and drop
+/// any parked retry, snapshotting only if something changed.
+fn clear_share_unresolved(
+    shares: &mut ShareState,
+    evt_tx: &UnboundedSender<NetEvent>,
+    share_id: &str,
+) {
+    let mut changed = shares.parked_retries.remove(share_id).is_some();
+    if let Some(disc) = shares.discovered.get_mut(share_id)
+        && disc.unresolved
+    {
+        disc.unresolved = false;
+        changed = true;
+    }
+    if changed {
+        emit_shares_snapshot(shares, evt_tx);
+    }
+}
+
+/// (#180 §RS-1.4, CRSH-ISC-6/15) Dispatch parked browse retries **at the consumer's own
+/// cursor tick** — never at the advert-fold event. A share whose advert re-folded since
+/// park (its discovered generation advanced) is re-fetched via a normal consented content
+/// fetch (the ONE network action of the reactive path); an expired-window retry surfaces
+/// failure and clears WITHOUT pruning; a withdrawn share's retry drops silently.
+async fn process_parked_browse_retries(
+    shares: &mut ShareState,
+    evt_tx: &UnboundedSender<NetEvent>,
+    net: &Option<VeilidNetHandle>,
+) {
+    if shares.parked_retries.is_empty() {
+        return;
+    }
+    let now = Instant::now();
+    let mut fire: Vec<(String, String)> = Vec::new();
+    let mut expire: Vec<String> = Vec::new();
+    let mut drop_ids: Vec<String> = Vec::new();
+    for (share_id, parked) in &shares.parked_retries {
+        let current = shares.discovered.get(share_id).map(|d| d.generation);
+        match parked_retry_action(parked, current, now) {
+            ParkedRetryAction::Fire => fire.push((share_id.clone(), parked.name.clone())),
+            ParkedRetryAction::Expire => expire.push(share_id.clone()),
+            ParkedRetryAction::Drop => drop_ids.push(share_id.clone()),
+            ParkedRetryAction::Wait => {}
+        }
+    }
+    for id in &drop_ids {
+        shares.parked_retries.remove(id);
+    }
+    for id in &expire {
+        shares.parked_retries.remove(id);
+        fetch_fail(
             evt_tx,
-            fetch_error_message("could not fetch the share manifest", e),
-        ),
+            "re-resolve window elapsed — the share stays listed; browse it again to retry"
+                .to_owned(),
+        );
+    }
+    for (id, name) in fire {
+        shares.parked_retries.remove(&id);
+        fetch_share(shares, evt_tx, net, &id, &name).await;
     }
 }
 
@@ -1769,6 +1917,9 @@ fn apply_discovery(
         // route (the fetch path reads `discovered`, not the catalog).
         if change == CatalogChange::Removed {
             shares.discovered.remove(&ann.share_id);
+            // (#180 §RS-1.4, CRSH-ISC-19) A verified withdraw drops any parked browse
+            // retry: the episode is over, so a later re-add never fires a stale retry.
+            shares.parked_retries.remove(&ann.share_id);
             emit_shares_snapshot(shares, evt_tx);
         }
         return true;
@@ -1791,10 +1942,22 @@ fn apply_discovery(
     // An owner-mismatch hijack refresh returns `Unchanged` (first-writer-wins) —
     // skipping the insert prevents the fetch redirect.
     if change != CatalogChange::Unchanged {
+        // (#180 §RS-1.4) Stamp a fresh monotonic generation — the fire signal for a parked
+        // browse retry (CRSH-ISC-6) — and preserve the `unresolved` re-resolve flag across
+        // a refresh (a fresh advert arms the retry but does not itself resolve the share).
+        // This fold never fires the retry (CRSH-ISC-15 — dispatch rides the cursor tick).
+        let unresolved = shares
+            .discovered
+            .get(&ann.share_id)
+            .is_some_and(|d| d.unresolved);
+        shares.next_generation += 1;
+        let generation = shares.next_generation;
         shares.discovered.insert(
             ann.share_id.clone(),
             DiscoveredRoute {
                 route_blob: env.route_blob.clone(),
+                generation,
+                unresolved,
             },
         );
         emit_shares_snapshot(shares, evt_tx);
@@ -2250,6 +2413,101 @@ mod tests {
                 Ok(NetEvent::SharesSnapshot { remote, .. }) if remote.len() == 1
             ),
             "a SharesSnapshot listing the share is emitted"
+        );
+    }
+
+    /// Fold one honest share ready for the reactive-path tests.
+    fn folded_share(seed: u8) -> (ShareState, String, PublicRoomKey, SignKeypair, Vec<u8>) {
+        let signer = announcer(seed);
+        let mut shares = ShareState::new();
+        let room_key = derive_room_key(DEFAULT_ROOM, &CNSA_2_0).unwrap();
+        shares.lobby = Some(lobby());
+        let (share_id, rc) = v2_ids(&signer, "/root");
+        let blob = vec![0xAB; 96];
+        let bytes = discovery_bytes(&room_key, &signer, &share_id, &rc, &blob, &blob);
+        let (evt_tx, _rx) = unbounded_channel();
+        assert!(apply_discovery(&mut shares, &evt_tx, &bytes));
+        (shares, share_id, room_key, signer, rc)
+    }
+
+    // ── CRSH-ISC-4/5: a fetch failure marks the share Unresolved (local only), keeps it
+    //    listed, and never prunes; a verified withdraw is what removes it ───────────────
+    #[test]
+    fn crsh_isc_5_fetch_fail_stays_listed_until_verified_withdraw() {
+        let (mut shares, share_id, room_key, signer, rc) = folded_share(32);
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+
+        // Fetch failed → Unresolved, still listed, parked retry, NOT pruned. The reactive
+        // helper takes no network handle, so it cannot emit a DHT op (CRSH-ISC-4).
+        mark_share_unresolved(&mut shares, &evt_tx, &share_id, "demo-share");
+        assert!(shares.discovered.get(&share_id).unwrap().unresolved);
+        assert!(shares.parked_retries.contains_key(&share_id));
+        assert_eq!(shares.catalog.len(), 1, "the share is NOT pruned");
+        match evt_rx.try_recv() {
+            Ok(NetEvent::SharesSnapshot { remote, .. }) => {
+                let row = remote.iter().find(|s| s.share_id == share_id).unwrap();
+                assert!(row.unresolved, "listed, marked re-resolving");
+            }
+            other => panic!("expected a SharesSnapshot, got {other:?}"),
+        }
+
+        // The owner's verified withdraw removes it.
+        assert!(apply_discovery(
+            &mut shares,
+            &evt_tx,
+            &withdraw_bytes(&room_key, &signer, &share_id, &rc)
+        ));
+        assert_eq!(
+            shares.catalog.len(),
+            0,
+            "a verified withdraw removes the share"
+        );
+    }
+
+    // ── CRSH-ISC-19: a verified withdraw drops the parked retry ────────────────────────
+    #[test]
+    fn crsh_isc_19_verified_withdraw_drops_the_parked_retry() {
+        let (mut shares, share_id, room_key, signer, rc) = folded_share(34);
+        let (evt_tx, _rx) = unbounded_channel();
+        mark_share_unresolved(&mut shares, &evt_tx, &share_id, "demo-share");
+        assert!(shares.parked_retries.contains_key(&share_id));
+
+        assert!(apply_discovery(
+            &mut shares,
+            &evt_tx,
+            &withdraw_bytes(&room_key, &signer, &share_id, &rc)
+        ));
+        assert!(
+            !shares.parked_retries.contains_key(&share_id),
+            "the withdraw dropped the parked retry (CRSH-ISC-19)"
+        );
+    }
+
+    // ── CRSH-ISC-6: window expiry surfaces failure without pruning ─────────────────────
+    #[tokio::test]
+    async fn crsh_isc_6_window_expiry_surfaces_error_without_pruning() {
+        let (mut shares, share_id, _rk, _signer, _rc) = folded_share(35);
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        shares.discovered.get_mut(&share_id).unwrap().unresolved = true;
+        shares.parked_retries.insert(
+            share_id.clone(),
+            ParkedBrowseRetry {
+                name: "demo-share".to_owned(),
+                parked_generation: shares.discovered.get(&share_id).unwrap().generation,
+                deadline: Instant::now() - Duration::from_secs(1),
+            },
+        );
+
+        process_parked_browse_retries(&mut shares, &evt_tx, &None).await;
+
+        assert!(
+            !shares.parked_retries.contains_key(&share_id),
+            "the expired retry is cleared"
+        );
+        assert_eq!(shares.catalog.len(), 1, "expiry NEVER prunes the share");
+        assert!(
+            matches!(evt_rx.try_recv(), Ok(NetEvent::FetchError { .. })),
+            "expiry surfaces a failure to the UI"
         );
     }
 

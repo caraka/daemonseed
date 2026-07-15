@@ -6287,6 +6287,7 @@ mod tests {
             sharer_handle: sharer.to_owned(),
             sharer_fingerprint: String::new(),
             mine: false,
+            unresolved: false,
         }
     }
 

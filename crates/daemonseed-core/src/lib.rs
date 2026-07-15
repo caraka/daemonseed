@@ -52,6 +52,7 @@ pub mod autostart;
 pub mod backoff;
 pub mod biometric;
 pub mod bootstrap;
+pub mod browse_retry;
 pub mod circle;
 pub mod connection;
 pub mod cot;

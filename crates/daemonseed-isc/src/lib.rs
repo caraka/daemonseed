@@ -343,13 +343,18 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("CRSH-ISC-3", IscClass::Positive), // repair re-establishes under record_lock, per-GET read permits (§RS-1.2)
     ("CRSH-ISC-18", IscClass::Positive), // chat write under repair serializes behind lock → fresh session (§RS-1.2)
     ("CRSH-ISC-17", IscClass::Negative), // anti: never hold read permit while acquiring the limiter (§RS-2)
+    ("CRSH-ISC-4", IscClass::Negative), // anti: reactive fetch-fail path enqueues zero DHT ops (§RS-0)
+    ("CRSH-ISC-5", IscClass::Positive), // fetch-fail share stays Unresolved; removed only on withdraw/TTL (§RS-1.5)
+    ("CRSH-ISC-6", IscClass::Positive), // parked retry fires once on tick after fold; errors, no prune, on expiry (§RS-1.4)
+    ("CRSH-ISC-15", IscClass::Negative), // anti: parked-retry dispatch decorrelated from the advert fold (§RS-1.4)
+    ("CRSH-ISC-19", IscClass::Positive), // generation tag on fetch outcomes/parked retries; stale dropped (§RS-1.4)
 ];
 
 /// Total built, non-deferred ISCs tracked by this registry — the SINGLE source
 /// of truth for the coverage denominator, read live by `xtask isc-coverage`.
 /// Recount on every ISC add/remove (the `const _` assert below guards it
 /// against [`ISCS`]).
-pub const TOTAL: usize = 197;
+pub const TOTAL: usize = 202;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -541,16 +546,18 @@ mod tests {
         //                                  chat-never-waits / panic-recovery /
         //                                  telemetry-only / single-permit), #159/#168/#157)
         //                                  consumer route self-heal (#180):
-        //                                  CRSH-ISC-1/2/9/3/18 pos (sweep accounting,
-        //                                  K-consecutive detection, weather gating,
-        //                                  record_lock repair, chat-write serialization) +
-        //                                  CRSH-ISC-11/14/17 neg (network-state-only input,
-        //                                  un-gated margin limiter, no-nested-permit)
-        //   total   129 pos + 68 neg = 197
+        //                                  CRSH-ISC-1/2/9/3/18/5/6/19 pos (sweep
+        //                                  accounting, K-detection, weather gating,
+        //                                  record_lock repair, chat serialization,
+        //                                  Unresolved-not-prune, parked retry, generation) +
+        //                                  CRSH-ISC-11/14/17/4/15 neg (network-state-only
+        //                                  input, margin limiter, no-nested-permit,
+        //                                  zero-network reactive, retry decorrelation)
+        //   total   132 pos + 70 neg = 202
         //   (the v0.33.0 Veilid cutover retired 14 server-positive + 10
         //    server-negative relay/TLS/federation/rate-limit ISCs.)
-        assert_eq!(pos, 129, "positive count drift");
-        assert_eq!(neg, 68, "negative count drift");
+        assert_eq!(pos, 132, "positive count drift");
+        assert_eq!(neg, 70, "negative count drift");
     }
 
     /// COVERED is single-sourced and must agree with the per-milestone

@@ -34,6 +34,7 @@ work lives in the project lead's vault manifest, not here.
 
 - `veilid-core`: 0.5.4 → 0.5.6 (transitive x25519-dalek 2 → 3).
 - `daemonseed-veilid-net`: the §I5″.1 margin (≤ 2 concurrent un-gated `open_dht_record`/`watch_dht_values`) is enforced by a semaphore every open/watch site acquires, rather than held by a census argument — so spawned open/watch sites cannot breach it (#180, CRSH-ISC-14).
+- `daemonseed-{gui,tui}`: a browse-fetch failure marks the share `Unresolved` (it stays listed) and parks a generation-tagged retry that fires at the next steady-resweep cursor tick after a fresh advert folds, issuing zero network ops on the failure path; both fetch-preview prune sites are retired, so a share is removed only on verified withdraw or catalog TTL (#180, CRSH-ISC-4/5/6/15/19).
 
 ### Fixed
 
