@@ -75,6 +75,7 @@ pub mod public_space;
 pub mod release;
 pub mod room_message;
 pub(crate) mod secret_seed;
+pub mod session_health;
 pub mod share_announce;
 pub mod share_catalog;
 pub mod share_envelope;

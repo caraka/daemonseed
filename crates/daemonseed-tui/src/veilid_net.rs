@@ -96,6 +96,9 @@ use daemonseed_core::public_room::{
     derive_room_share_veilid_owner_seed, derive_room_veilid_owner_seed, open_room_message,
     seal_room_message,
 };
+use daemonseed_core::session_health::{
+    RepairDecision, SessionHealthTracker, SweepHealthInput, WatchState, Weather,
+};
 use daemonseed_core::share_announce::{
     AnnouncementFields, derive_root_commitment, derive_share_id_v2, derive_share_root_nonce,
     open_announcement, seal_public_announcement, share_binding_is_valid,
@@ -107,7 +110,7 @@ use daemonseed_core::storage::fetched::{
     FetchedFile, FetchedShare, FetchedStore, rebase_to_selection_root,
 };
 use daemonseed_veilid_net::{
-    DiscoveryEnvelope, PresenceBoundary, VeilidNet, VeilidNetConfig, VeilidNetError,
+    DiscoveryEnvelope, PresenceBoundary, RecordKey, VeilidNet, VeilidNetConfig, VeilidNetError,
     VeilidNetEvent, VeilidNetHandle, next_resweep_seed, verify_route_advert,
 };
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -297,6 +300,11 @@ pub async fn veilid_net_actor(
     // In-flight guard: skip a tick while a prior resweep is still running, so a slow
     // resweep can't overlap the next one (keeps the WB-2 read burst at one sweep).
     let resweep_busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Consumer-route self-heal detection (§RS-1.2, CRSH-ISC-2): per-record session-health
+    // tracker keyed by the swept record's key. Each `VeilidNetEvent::SweepHealth` folds in
+    // one sweep pass; K consecutive all-failed passes in calm weather flag a record
+    // repair-due. Detection only — step 3b attaches repair execution at the repair-due arm.
+    let mut session_health: SessionHealthTracker<RecordKey> = SessionHealthTracker::new();
 
     loop {
         tokio::select! {
@@ -315,7 +323,49 @@ pub async fn veilid_net_actor(
             }
             // Only poll the Veilid event stream once connected.
             Some(ev) = recv_opt(&mut ev_rx), if ev_rx.is_some() => {
-                handle_inbound(ev, &evt_tx, &circles, &mut shares);
+                // CRSH-ISC-1/2: fold one completed sweep's per-record outcome into the
+                // session-health tracker. Weather is the WB-5.1 estimator, consumed via the
+                // shared ReapGate (`suspend_reaping` == elevated) — no new estimator
+                // (§RS-1.2). L2 watch state is not yet transport-surfaced, so the L1-only
+                // path supplies `Unknown` (§RS-1.3 open question). Everything else demuxes
+                // in handle_inbound (which only acts on Inbound).
+                if let VeilidNetEvent::SweepHealth { key, outcome } = ev {
+                    let weather = if shares.reap_gate.suspend_reaping(Instant::now()) {
+                        Weather::Elevated
+                    } else {
+                        Weather::Calm
+                    };
+                    let input = SweepHealthInput {
+                        attempted: outcome.attempted,
+                        failed: outcome.failed,
+                        found: outcome.found,
+                        watch: WatchState::Unknown,
+                        weather,
+                    };
+                    match session_health.observe(key, input) {
+                        RepairDecision::RepairDue => {
+                            // TODO(#180 step 3b): attach repair execution here — under the
+                            // record's `record_lock`, invalidate the `open_cached` entry,
+                            // re-open, re-watch, and full-sweep the record (CRSH-ISC-3),
+                            // then `session_health.clear(&key)`. Detection stops here in 3a.
+                            daemonseed_veilid_net::vtrace!(
+                                "tui session-health: record repair-due ({} attempted, \
+                                 {} failed) — repair execution lands in step 3b",
+                                input.attempted,
+                                input.failed
+                            );
+                        }
+                        RepairDecision::Suppressed => {
+                            daemonseed_veilid_net::vtrace!(
+                                "tui session-health: repair-due suppressed (elevated \
+                                 weather) — will resume in calm"
+                            );
+                        }
+                        RepairDecision::NotDue => {}
+                    }
+                } else {
+                    handle_inbound(ev, &evt_tx, &circles, &mut shares);
+                }
             }
             // Age out discovered shares not reheard within the TTL (Shape B liveness),
             // mirroring the GUI Veilid actor. Own shares ride PublishStarted/Stopped,

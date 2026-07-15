@@ -295,9 +295,11 @@ pub struct SweepOutcome {
 /// the next, so read occupancy never exceeds the read partition no matter how many
 /// sweeps run concurrently (WB-ISC-21/22) — the fix for the first WB-5 build, whose
 /// whole-sweep permit let ≥13 cold-start sweeps drain the pool and starve writes.
-/// Bounded by [`SUBKEY_COUNT`]; runs as a background task. Produces a [`SweepOutcome`]
-/// and traces its counts (CRSH-ISC-1); the session-health tracker that consumes them
-/// is a later build step.
+/// Bounded by [`SUBKEY_COUNT`]; runs as a background task. Produces a [`SweepOutcome`],
+/// traces its counts, and surfaces it per-record to the caller as a
+/// [`VeilidNetEvent::SweepHealth`] so each frontend net actor can drive a session-health
+/// tracker (CRSH-ISC-1; `docs/design/consumer-route-self-heal.md` §RS-1.1). Emitting the
+/// health event changes no network behaviour and no on-slot `Inbound` emission.
 pub async fn sweep(
     gate: Arc<DhtGate>,
     rc: RoutingContext,
@@ -334,6 +336,10 @@ pub async fn sweep(
         outcome.attempted,
         outcome.failed
     );
+    // Surface the per-record outcome to the frontend net actor's session-health tracker
+    // (CRSH-ISC-1). A closed receiver (actor shut down) is non-fatal — the sweep is a
+    // fire-and-forget background task and its `Inbound` sends tolerate the same drop.
+    let _ = ev_tx.send(VeilidNetEvent::SweepHealth { key, outcome });
 }
 
 /// The testable per-GET sweep core (WB-5.1 / I5″.2). For each subkey it acquires ONE

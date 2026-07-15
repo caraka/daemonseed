@@ -410,6 +410,10 @@ The write-budget family takes permanent `WB-ISC-N` IDs from the FROZEN 2026-07-0
 
 - [ ] CRSH-ISC-14: Anti — peak un-gated DHT-op concurrency (open + watch) never exceeds margin(2) under any composition of connect, repair, and Refresh; every un-gated site acquires the enforced limiter (#180 §RS-2). Limiter core + connect-path wiring landed (probe: `dht_gate::crsh_isc_14_ungated_ops_bounded_by_margin`); the full connect+repair+Refresh composition probe completes with steps 3/7.
 
+- [x] CRSH-ISC-2: K consecutive all-failed sweep passes in calm weather flag a record repair-due exactly once, at the K-th pass's own cursor tick (latched, no duplicate) — #180 §RS-1.2 (probe: `daemonseed_core::session_health` paused-time `crsh_isc_2_*`; K = `REPAIR_K_THRESHOLD`, repro-tunable).
+- [x] CRSH-ISC-9: a repair-due transition is suppressed while the WB-5.1 weather estimator reads elevated and resumes (not cancels) in calm — the streak is retained across the elevated regime (#180 §RS-1.2) (probe: `session_health::crsh_isc_9_elevated_suppresses_then_calm_resumes`).
+- [x] CRSH-ISC-11: Anti — the repair-due decision input (`SweepHealthInput`) carries only network-state fields (sweep-result counts, watch state, weather); no user-event-derived value can enter, so the signal is a pure function of network state (#180 §RS-0/§RS-1.2) (probe: `session_health::crsh_isc_11_*`, type-level + unit assertion).
+
 ## Test Strategy
 
 | surface | check | tool / probe |

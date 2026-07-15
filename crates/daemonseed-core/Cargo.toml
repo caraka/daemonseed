@@ -46,3 +46,7 @@ notify = { workspace = true }
 tempfile = { workspace = true }
 # Test-only: oxitls's module-init shim for the `tls::install_provider` test.
 oxitls-rustls-provider = { workspace = true, features = ["testing"] }
+# Test-only: paused-time (`start_paused`) for the session-health cursor-tick oracles
+# (CRSH-ISC-2/9), as the WB scheduler oracles use it. Merges additively with the
+# non-dev tokio features.
+tokio = { workspace = true, features = ["test-util", "time"] }

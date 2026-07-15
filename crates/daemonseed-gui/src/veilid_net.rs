@@ -79,6 +79,9 @@ use daemonseed_core::public_room::{
 use daemonseed_core::public_space::{
     Whitelist, content_address, dev_project_announce_veilid_owner_seed, dev_project_release_keypair,
 };
+use daemonseed_core::session_health::{
+    RepairDecision, SessionHealthTracker, SweepHealthInput, WatchState, Weather,
+};
 use daemonseed_core::share_announce::{
     AnnouncementFields, derive_root_commitment, derive_share_id_v2, derive_share_root_nonce,
     open_announcement, seal_public_announcement, share_binding_is_valid,
@@ -89,8 +92,8 @@ use daemonseed_core::storage::cas::ChunkAddr;
 use daemonseed_core::storage::fetched::rebase_to_selection_root;
 use daemonseed_proto::v1 as wire;
 use daemonseed_veilid_net::{
-    AimdWindow, DiscoveryEnvelope, PresenceBoundary, VeilidNet, VeilidNetConfig, VeilidNetError,
-    VeilidNetEvent, VeilidNetHandle, next_resweep_seed, verify_route_advert,
+    AimdWindow, DiscoveryEnvelope, PresenceBoundary, RecordKey, VeilidNet, VeilidNetConfig,
+    VeilidNetError, VeilidNetEvent, VeilidNetHandle, next_resweep_seed, verify_route_advert,
 };
 use prost::Message as _;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -429,6 +432,11 @@ pub async fn veilid_net_actor(
     // that outlasts the tick on a slow DHT can't overlap the next one — keeps the WB-2
     // read burst at one 64-GET sweep at a time (review finding).
     let resweep_busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Consumer-route self-heal detection (§RS-1.2, CRSH-ISC-2): per-record session-health
+    // tracker keyed by the swept record's key. Each `VeilidNetEvent::SweepHealth` folds in
+    // one sweep pass; K consecutive all-failed passes in calm weather flag the record
+    // repair-due. Detection only — step 3b attaches repair execution at the repair-due arm.
+    let mut session_health: SessionHealthTracker<RecordKey> = SessionHealthTracker::new();
 
     loop {
         tokio::select! {
@@ -447,21 +455,61 @@ pub async fn veilid_net_actor(
             }
             // Only poll the Veilid event stream once connected.
             Some(ev) = recv_opt(&mut ev_rx), if ev_rx.is_some() => {
-                // #144: surface the attach peer counts to the startup mask as they
-                // climb during the cold-start warmup; everything else demuxes in
-                // handle_inbound (which only acts on Inbound).
-                if let VeilidNetEvent::Attachment {
-                    reliable_peers,
-                    live_peers,
-                    ..
-                } = ev
-                {
-                    let _ = evt_tx.send(NetEvent::PeerCount {
-                        reliable: reliable_peers,
-                        live: live_peers,
-                    });
-                } else {
-                    handle_inbound(ev, &evt_tx, &mut circles, &mut shares);
+                match ev {
+                    // #144: surface the attach peer counts to the startup mask as they
+                    // climb during the cold-start warmup.
+                    VeilidNetEvent::Attachment {
+                        reliable_peers,
+                        live_peers,
+                        ..
+                    } => {
+                        let _ = evt_tx.send(NetEvent::PeerCount {
+                            reliable: reliable_peers,
+                            live: live_peers,
+                        });
+                    }
+                    // CRSH-ISC-1/2: fold one completed sweep's per-record outcome into the
+                    // session-health tracker. Weather is the WB-5.1 estimator, consumed via
+                    // the shared ReapGate (`suspend_reaping` == elevated) — no new estimator
+                    // (§RS-1.2). L2 watch state is not yet surfaced by the transport, so the
+                    // L1-only path supplies `Unknown` (§RS-1.3 open question).
+                    VeilidNetEvent::SweepHealth { key, outcome } => {
+                        let weather = if shares.reap_gate.suspend_reaping(Instant::now()) {
+                            Weather::Elevated
+                        } else {
+                            Weather::Calm
+                        };
+                        let input = SweepHealthInput {
+                            attempted: outcome.attempted,
+                            failed: outcome.failed,
+                            found: outcome.found,
+                            watch: WatchState::Unknown,
+                            weather,
+                        };
+                        match session_health.observe(key, input) {
+                            RepairDecision::RepairDue => {
+                                // TODO(#180 step 3b): attach repair execution here — under the
+                                // record's `record_lock`, invalidate the `open_cached` entry,
+                                // re-open, re-watch, and full-sweep the record (CRSH-ISC-3),
+                                // then `session_health.clear(&key)`. Detection stops here in 3a.
+                                daemonseed_veilid_net::vtrace!(
+                                    "gui session-health: record repair-due ({} attempted, \
+                                     {} failed) — repair execution lands in step 3b",
+                                    input.attempted,
+                                    input.failed
+                                );
+                            }
+                            RepairDecision::Suppressed => {
+                                daemonseed_veilid_net::vtrace!(
+                                    "gui session-health: repair-due suppressed (elevated \
+                                     weather) — will resume in calm"
+                                );
+                            }
+                            RepairDecision::NotDue => {}
+                        }
+                    }
+                    // Everything else demuxes in handle_inbound (which only acts on Inbound).
+                    other => handle_inbound(other, &evt_tx, &mut circles, &mut shares),
                 }
             }
             // Age out discovered shares not reheard within the TTL (Shape B liveness):

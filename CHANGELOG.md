@@ -27,6 +27,7 @@ work lives in the project lead's vault manifest, not here.
 ### Added
 
 - `docs/design/consumer-route-self-heal.md` — frozen design-of-record for the consumer-side share route self-heal: sweep error accounting, cadence-timed session repair, fetch-path prune retirement, off-loop fetch, route-release hygiene, sweep-first Refresh; spawns CRSH-ISC-1..20 (#180).
+- `daemonseed-core`: a consumer-side per-record session-health tracker (`session_health`) that flags a record repair-due after K consecutive all-failed steady-resweep passes in calm weather, from network-state evidence only — the detection half of the share-route self-heal (#180, CRSH-ISC-2/9/11).
 
 ### Changed
 
