@@ -358,6 +358,12 @@ component MenuTextInput inherits Rectangle {
     // wrapper's padding still lands in the input.
     min-width: 1px;
     forward-focus: ti;
+    // #190: single-line fields clip so a long entry scrolls WITHIN the box (the
+    // `ti.x` offset below does the scrolling). Multi-line fields (`single-line:
+    // false`, word-wrap) do NOT clip, so their overflow renders exactly as before —
+    // no regression to the seed-phrase field. The right-click Menu is a popup and is
+    // unaffected by this clip.
+    clip: root.single-line;
     // A real builtin ContextMenuArea (NOT inherited — the menu-lowering pass
     // requires a builtin here, not a user component), with the field as content
     // and the right-click menu as its Menu. Mirrors LineEditBase.
@@ -373,8 +379,22 @@ component MenuTextInput inherits Rectangle {
             }
             MenuItem { title: "Select all"; enabled: !root.text.is-empty; activated => { ti.select-all(); } }
         }
+        // #190: horizontal cursor-follow for single-line fields, mirroring Slint's
+        // own LineEditBase. A raw single-line/no-wrap TextInput clips at its right
+        // edge instead of scrolling, so long input is typed blind. When single-line,
+        // the input grows to its content width and offsets its `x` so
+        // `cursor-position-changed` keeps the caret on-screen; the root's
+        // `clip: single-line` contains it. Multi-line fields (`single-line: false`,
+        // word-wrap) are untouched — `x` stays 0, the width fills, and the root does
+        // NOT clip, so word-wrap overflow renders exactly as before.
         ti := TextInput {
-            width: 100%; height: 100%;
+            // scroll offset the `x` binding clamps to content bounds (single-line).
+            property <length> computed-x;
+            // grow past the box (single-line) so long text can scroll; fill it
+            // (multi-line) so word-wrap lays out as before.
+            width: root.single-line ? max(root.width, self.preferred-width) : root.width;
+            x: root.single-line ? min(0px, max(root.width - self.width, self.computed-x)) : 0px;
+            height: 100%;
             text <=> root.text;
             single-line: root.single-line;
             font-size: root.font-size;
@@ -384,6 +404,16 @@ component MenuTextInput inherits Rectangle {
             vertical-alignment: center;
             accepted => { root.accepted(); }
             edited => { root.edited(); }
+            // keep the caret inside the box by scrolling to track it (single-line).
+            cursor-position-changed(cpos) => {
+                if (root.single-line) {
+                    if (cpos.x + self.computed-x < self.font-size) {
+                        self.computed-x = self.font-size - cpos.x;
+                    } else if (cpos.x + self.computed-x > root.width - self.font-size) {
+                        self.computed-x = root.width - cpos.x - self.font-size;
+                    }
+                }
+            }
         }
     }
 }

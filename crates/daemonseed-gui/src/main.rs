@@ -349,6 +349,22 @@ fn apply_view(ui: &AppWindow, c: &CircleState, active: i32) {
     ui.set_scroll_y(c.scroll_y);
 }
 
+/// Re-render variant of [`apply_view`] for events that are NOT a rail switch — an
+/// inbound message or a [`NetEvent::CircleJoined`] label upgrade — where the
+/// composer's live in-progress text must survive. Mirrors `apply_view` EXCEPT it
+/// never writes the `draft` property: that text lives only in the UI `draft`
+/// property until a switch/send persists it into `CircleState::draft`, so
+/// re-applying the stored draft here would wipe what the user is typing. Header /
+/// active / scroll ARE refreshed (a `CircleJoined` upgrades the header label).
+/// Keep the non-draft writes below in sync with `apply_view`.
+fn apply_view_preserving_draft(ui: &AppWindow, c: &CircleState, active: i32) {
+    ui.set_messages(messages_model(&c.messages));
+    ui.set_header_name(SharedString::from(c.name.as_str()));
+    ui.set_header_sub(SharedString::from(c.header_sub.as_str()));
+    ui.set_active(active);
+    ui.set_scroll_y(c.scroll_y);
+}
+
 /// #36: push the active circle's three name vectors into the context-sheet props.
 ///
 /// All three are blank for the Lobby (no net contract), which hides the sheet's
@@ -1653,7 +1669,7 @@ fn apply_net_event(
                 // loopback (inserted:false) must not yank the reader to the bottom.
                 if out.inserted {
                     st.set_scroll(LOBBY, if stick { STICK_BOTTOM } else { live });
-                    apply_view(ui, st.current(), active as i32);
+                    apply_view_preserving_draft(ui, st.current(), active as i32);
                 }
             } else if out.unread_raised {
                 // #64: the Lobby got a message while unfocused — show its dot.
@@ -1673,7 +1689,10 @@ fn apply_net_event(
             if let Some(idx) = st.set_circle_rendezvous(circle_id, asset_addr) {
                 rebuild_rail(ui, &st);
                 if st.active() == idx {
-                    apply_view(ui, st.current(), idx as i32);
+                    // Preserve the live composer text: a rendezvous upgrade must not
+                    // wipe what the user is typing (same clobber class as an inbound
+                    // message). The header label IS still refreshed.
+                    apply_view_preserving_draft(ui, st.current(), idx as i32);
                     // #36: the relay-derived label just replaced the fingerprint
                     // placeholder — refresh the detail sheet's vectors too.
                     apply_circle_detail(ui, &st, idx);
@@ -1710,7 +1729,7 @@ fn apply_net_event(
                     // own loopback (inserted:false) must not yank the reader to bottom.
                     if out.inserted {
                         st.set_scroll(idx, if stick { STICK_BOTTOM } else { live });
-                        apply_view(ui, st.current(), active as i32);
+                        apply_view_preserving_draft(ui, st.current(), active as i32);
                     }
                 } else if out.unread_raised {
                     // #64: a circle got a message while unfocused — show its dot.

@@ -1094,6 +1094,20 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   an unsolved governance problem needing its own design pass, not the cutover. A1–A4 hold for the one
   project channel and are the substrate a future B parameterizes. (Sanjay, 2026-07-07, A0.)
 
+- **v0.33.1 GUI felt-test fixes (2026-07-15).** #188: with `DAEMONSEED_VEILID_PORT` unset the GUI binds an
+  OS-assigned free Veilid listen port instead of veilid's fixed default, so a co-resident client stops
+  clashing on the bind (a listen-bind failure now names the port cause; the storage-dir create error
+  propagates rather than surfacing as the misleading keyring error). The namespace stays the stable default
+  so per-launch veilid store partitions are not stranded — only the explicit-port path keeps a distinct
+  namespace, for a deliberately-coexisting node. A GUI client is relay-reached, so an ephemeral listen port
+  does not affect reachability and also removes a static listen-port fingerprint. **Interim MOTD write-gate
+  (ISC-15 precursor):** `operator_write_enabled()` — debug world-writable, release read-only except an
+  operator instance (`DAEMONSEED_OPERATOR=1`) — gates `set_motd`/`upload_announcement` and `can_compose`.
+  The dev owner seed is STILL baked, so this is an app-capability gate, NOT the ISC-15 crypto write-gate
+  (retire the dev seed, read-only-by-pubkey subscribe, maintainer-held offline seed), which remains the
+  tracked follow-up. #191 filed for operator delete/tombstone of announcement posts (compose is
+  insert-only). (Sanjay, 2026-07-15.)
+
 ## Changelog
 
 - **conjectured:** the multi-circle carousel (ISC-C60) lets the active surface span the lobby and the

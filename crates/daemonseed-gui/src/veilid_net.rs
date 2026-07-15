@@ -1052,6 +1052,20 @@ async fn handle_command(
 }
 
 /// Start a Veilid node bound to a fresh daemonseed-derived identity (D3) and
+/// #188: reserve an OS-assigned free port, then release it, so the Veilid node can
+/// bind udp/tcp/ws there without clashing with a co-resident instance. Binding
+/// `0.0.0.0:0` lets the kernel pick a free port; we read it back and drop the probe
+/// socket. Reusing a concrete `:{port}` (rather than literal `:0`) keeps us on the
+/// proven explicit-port path. The probe→veilid-bind gap is a negligible race on the
+/// dev multi-instance path this serves; a residual clash still surfaces as the
+/// (now port-clash-aware) start error.
+fn pick_free_port() -> Option<u16> {
+    std::net::TcpListener::bind("0.0.0.0:0")
+        .ok()
+        .and_then(|l| l.local_addr().ok())
+        .map(|a| a.port())
+}
+
 /// attach to the public network. No relay address / handshake (D1/D4): the
 /// bootstrap is baked into the node config.
 async fn connect(
@@ -1091,6 +1105,25 @@ async fn connect(
         // Distinct program namespace per instance too; veilid keys process/host
         // coexistence state on it (#99's two_node_circle does the same).
         cfg.namespace = format!("daemonseed-{port}");
+    } else if let Some(port) = pick_free_port() {
+        // #188: with no explicit port, DON'T leave listen_address None — that binds
+        // veilid's FIXED default port, so a second co-resident client (a `--portable`
+        // instance beside the desktop one) clashes on the bind and aborts startup with
+        // the misleading "failed to create insecure keyring". Bind an OS-assigned free
+        // port instead. A GUI client is relay-reached (not a public node), so a
+        // non-default listen port does not affect reachability; an ephemeral port also
+        // removes a static listen-port fingerprint. A concrete `:{port}` (not literal
+        // `:0`) reuses the proven explicit-port path and avoids depending on veilid's
+        // port-0 handling.
+        //
+        // The namespace stays the stable default "daemonseed" — do NOT key it on the
+        // ephemeral port. veilid partitions its protected/table store by namespace, so
+        // a per-launch namespace would cold-bootstrap every launch (no reused routing/
+        // DHT cache) and strand one orphaned store partition per run. Only the LISTEN
+        // PORT needs to vary; the store identity must stay stable across launches. The
+        // explicit-port path DOES set a distinct namespace — there the operator is
+        // deliberately standing up a second coexisting node and wants store isolation.
+        cfg.listen_address = Some(format!(":{port}"));
     }
 
     daemonseed_veilid_net::vtrace!(
@@ -1099,6 +1132,7 @@ async fn connect(
         cfg.listen_address,
         std::env::var("DAEMONSEED_VEILID_DIR").ok()
     );
+    let listen = cfg.listen_address.clone();
     match VeilidNet::start(cfg).await {
         Ok((handle, rx)) => match handle.attach_and_wait(180).await {
             Ok(()) => {
@@ -1108,7 +1142,19 @@ async fn connect(
             }
             Err(e) => fail(evt_tx, format!("veilid attach: {e}")),
         },
-        Err(e) => fail(evt_tx, format!("veilid start: {e}")),
+        // #188 guardrail: a listen-bind clash aborts veilid startup and surfaces as
+        // the misleading keyring error. When a listen address was in play, name the
+        // likely cause + the escape hatch instead of the raw internal string.
+        Err(e) => fail(
+            evt_tx,
+            match &listen {
+                Some(a) => format!(
+                    "veilid start: {e} — listen {a} may already be in use by another \
+                     instance; set DAEMONSEED_VEILID_PORT to a free port"
+                ),
+                None => format!("veilid start: {e}"),
+            },
+        ),
     }
 }
 
@@ -1484,8 +1530,9 @@ async fn subscribe_operator_space(shares: &mut ShareState, net: &Option<VeilidNe
 /// `build_announcements_view` uses, minus the re-verification. Building the view
 /// through `build_announcements_view` here would re-run the ML-DSA-87 signature check
 /// on every stored post on every inbound item — O(N²) post-quantum work on the event
-/// path during a backlog sweep (review finding). `can_compose = true` is the dev
-/// possession gate.
+/// path during a backlog sweep (review finding). `can_compose` follows
+/// [`operator_write_enabled`] — the interim write-gate (dev possession in debug;
+/// operator-only in release).
 fn public_space_snapshot_event(op: &OperatorSpace) -> NetEvent {
     let motd = op.motd.as_ref().map(render_motd);
     let posts = op
@@ -1502,7 +1549,10 @@ fn public_space_snapshot_event(op: &OperatorSpace) -> NetEvent {
         .collect();
     NetEvent::PublicSpaceSnapshot {
         view: AnnouncementsView { motd, posts },
-        can_compose: true,
+        // Interim write-gate (ISC-15 precursor): the composer shows in debug (dev
+        // possession) and, in release, ONLY for an operator instance
+        // (`DAEMONSEED_OPERATOR=1`). Non-operator release clients get a read-only pane.
+        can_compose: operator_write_enabled(),
     }
 }
 
@@ -1540,6 +1590,32 @@ async fn refresh_public_space(
     }
 }
 
+/// Interim MOTD/announce write-gate (ISC-15 precursor). Debug builds stay
+/// world-writable (felt-test convenience). Release builds are **read-only for
+/// everyone** except an operator instance launched with `DAEMONSEED_OPERATOR=1`, so a
+/// tester on a release bundle can no longer overwrite the operator record. This is an
+/// app-level capability gate, NOT the crypto write-gate: the dev owner seed is still
+/// baked, so it does not yet satisfy ISC-15 (retire the dev seed, clients hold only
+/// the pubkey, real operator key stays offline). It stops the casual write path today;
+/// ISC-15 makes it cryptographic.
+fn operator_write_enabled() -> bool {
+    cfg!(debug_assertions) || operator_flag_enables(std::env::var_os("DAEMONSEED_OPERATOR"))
+}
+
+/// Whether a `DAEMONSEED_OPERATOR` value ENABLES operator writes. Presence alone is
+/// not enough — a stray `DAEMONSEED_OPERATOR=0` (or empty) must keep the pane
+/// read-only — so the value must be explicitly truthy. Pure over its input so the
+/// release branch (which `cfg!(debug_assertions)` masks in tests) is unit-testable.
+fn operator_flag_enables(var: Option<std::ffi::OsString>) -> bool {
+    match var.as_deref().and_then(|v| v.to_str()) {
+        Some(v) => {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
+        }
+        None => false,
+    }
+}
+
 /// (#92 / A-c) Sign a MOTD with the F17 project-release key ([`sign_motd`] enforces the
 /// ISC-S9 single-line-plaintext rule BEFORE signing), publish it to the operator
 /// record's fixed `"motd"` slot, then fold it in locally + refresh. Guards mirror the
@@ -1558,6 +1634,10 @@ async fn set_motd(
     let err = |message: String| {
         let _ = evt_tx.send(NetEvent::PublicSpaceError { message });
     };
+    // Interim write-gate: read-only in release except an operator instance.
+    if !operator_write_enabled() {
+        return err("the MOTD is read-only in this build".to_owned());
+    }
     let Some(owner_seed) = shares.operator.as_ref().map(|o| o.announce_owner_seed) else {
         return err(operator_unavailable_message(net));
     };
@@ -1604,6 +1684,10 @@ async fn upload_announcement(
     let err = |message: String| {
         let _ = evt_tx.send(NetEvent::PublicSpaceError { message });
     };
+    // Interim write-gate: read-only in release except an operator instance.
+    if !operator_write_enabled() {
+        return err("announcements are read-only in this build".to_owned());
+    }
     let Some(owner_seed) = shares.operator.as_ref().map(|o| o.announce_owner_seed) else {
         return err(operator_unavailable_message(net));
     };
@@ -2613,6 +2697,27 @@ mod tests {
     use super::*;
     use daemonseed_veilid_net::route_provenance_input;
     use tokio::sync::mpsc::unbounded_channel;
+
+    /// The interim MOTD write-gate keys on the operator flag's VALUE, not its mere
+    /// presence — `DAEMONSEED_OPERATOR=0`/empty must keep a release build read-only.
+    /// Exercises the release branch that `cfg!(debug_assertions)` masks in-process.
+    #[test]
+    fn operator_flag_requires_a_truthy_value() {
+        use std::ffi::OsString;
+        for on in ["1", "true", "TRUE", "yes", " 1 "] {
+            assert!(
+                operator_flag_enables(Some(OsString::from(on))),
+                "{on:?} should enable"
+            );
+        }
+        for off in ["0", "", "false", "no", "off", "2"] {
+            assert!(
+                !operator_flag_enables(Some(OsString::from(off))),
+                "{off:?} must NOT enable"
+            );
+        }
+        assert!(!operator_flag_enables(None), "unset must NOT enable");
+    }
 
     /// Derive a v2-valid `(share_id, root_commitment)` pair for `signer` publishing
     /// `root` (#156), so an announcement built from them passes the ingest binding

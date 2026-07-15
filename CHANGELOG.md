@@ -31,10 +31,17 @@ work lives in the project lead's vault manifest, not here.
 - `daemonseed-gui`: the presence roster shows the member name inline with the `#<12hex>` fingerprint revealed on hover only, uniform for lobby and circle rows (#173).
 - `daemonseed-gui`: the in-app version label matches the release tag.
 - `packaging`: the AppImage and Windows build scripts build `--features desktop` (the removed `veilid` feature flag is dropped).
+- `daemonseed-gui`: an inbound message or `CircleJoined` re-render no longer clears the in-progress composer draft (#189).
+- `daemonseed-gui`: the single-line composer scrolls horizontally to follow the caret, so long input is no longer typed blind (#190).
+- `daemonseed-gui`: with `DAEMONSEED_VEILID_PORT` unset the node binds an OS-assigned free listen port instead of veilid's fixed default, so a co-resident client no longer aborts startup; a listen-bind failure names the port-clash cause and the storage-dir create error propagates instead of being swallowed (#188).
 
 ### Changed
 
 - `daemonseed-gui`: the connection-status line reads `connected · veilid` — transport-level, not the joined room name (#182).
+
+### Security
+
+- `daemonseed-gui`: the operator MOTD/announce composer is read-only in release builds except an operator instance (`DAEMONSEED_OPERATOR=1`); debug builds stay world-writable.
 
 ## [0.33.0] — 2026-07-14
 

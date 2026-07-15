@@ -576,7 +576,19 @@ impl VeilidNet {
     pub async fn start(
         cfg: VeilidNetConfig,
     ) -> Result<(VeilidNetHandle, mpsc::UnboundedReceiver<VeilidNetEvent>)> {
-        std::fs::create_dir_all(&cfg.storage_dir).ok();
+        // The storage dir is a hard prerequisite: veilid's protected store + insecure
+        // keyring are created INSIDE it. Swallowing a create failure here (`.ok()`)
+        // let a missing/unwritable dir surface downstream as the misleading
+        // "internal failed to create insecure keyring" (#188) — a silent-looking
+        // launch failure. Propagate the real cause + path instead so the GUI's
+        // `ConnectFailed` shows what actually went wrong. An existing dir returns
+        // `Ok`, so the working (id-already-exists) path is unaffected.
+        std::fs::create_dir_all(&cfg.storage_dir).map_err(|e| {
+            VeilidNetError::Startup(format!(
+                "could not create veilid storage dir {:?}: {e}",
+                cfg.storage_dir
+            ))
+        })?;
 
         let (ev_tx, ev_rx) = mpsc::unbounded_channel::<VeilidNetEvent>();
         let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(64);
