@@ -1097,10 +1097,14 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
 - **v0.33.1 GUI felt-test fixes (2026-07-15).** #188: with `DAEMONSEED_VEILID_PORT` unset the GUI binds an
   OS-assigned free Veilid listen port instead of veilid's fixed default, so a co-resident client stops
   clashing on the bind (a listen-bind failure now names the port cause; the storage-dir create error
-  propagates rather than surfacing as the misleading keyring error). The namespace stays the stable default
-  so per-launch veilid store partitions are not stranded — only the explicit-port path keeps a distinct
-  namespace, for a deliberately-coexisting node. A GUI client is relay-reached, so an ephemeral listen port
-  does not affect reachability and also removes a static listen-port fingerprint. **Interim MOTD write-gate
+  propagates rather than surfacing as the misleading keyring error). The no-env namespace is keyed on the
+  unlocked PROFILE identity (hex of the identity pubkey prefix), NOT the ephemeral port: distinct across
+  profiles so two co-resident no-env instances get isolated veilid protected stores in the shared dir, yet
+  stable across a profile's launches so the store is reused. (A felt-test caught the interim design here —
+  a port-keyed namespace churned every launch; a stable-default namespace reintroduced the co-resident
+  store collision the port fix was meant to remove. The profile identity satisfies both.) A GUI client is
+  relay-reached, so an ephemeral listen port does not affect reachability and also removes a static
+  listen-port fingerprint. **Interim MOTD write-gate
   (ISC-15 precursor):** `operator_write_enabled()` — debug world-writable, release read-only except an
   operator instance (`DAEMONSEED_OPERATOR=1`) — gates `set_motd`/`upload_announcement` and `can_compose`.
   The dev owner seed is STILL baked, so this is an app-capability gate, NOT the ISC-15 crypto write-gate

@@ -816,7 +816,15 @@ async fn handle_command(
             // (#156) Capture the share-root IKM (Arc — it holds secret bytes) so a
             // publish derives a receiver-verifiable share_id from the same identity.
             shares.share_root_ikm = stable_share_root_ikm.map(Arc::new);
-            connect(evt_tx, net, ev_rx).await;
+            // #188: a STABLE per-profile veilid namespace discriminator from the
+            // unlocked identity pubkey — distinct across profiles (co-resident store
+            // isolation), stable across a profile's launches (store reuse). `None` on
+            // the ephemeral no-profile path.
+            let ns_key = shares.signing.as_ref().map(|k| {
+                let pk = k.public_key().to_vec();
+                hex::encode(&pk[..pk.len().min(8)])
+            });
+            connect(evt_tx, net, ev_rx, ns_key).await;
             if net.is_some() {
                 // Subscribe the world-derivable lobby so share announcements fold
                 // into the catalog as they arrive (Phase 3 discovery).
@@ -1072,6 +1080,9 @@ async fn connect(
     evt_tx: &UnboundedSender<NetEvent>,
     net: &mut Option<VeilidNetHandle>,
     ev_rx: &mut Option<UnboundedReceiver<VeilidNetEvent>>,
+    // #188: stable per-profile veilid namespace discriminator (hex of the unlocked
+    // identity pubkey prefix); `None` on the ephemeral no-profile path.
+    ns_key: Option<String>,
 ) {
     if net.is_some() {
         let _ = evt_tx.send(NetEvent::Connected);
@@ -1115,15 +1126,17 @@ async fn connect(
         // removes a static listen-port fingerprint. A concrete `:{port}` (not literal
         // `:0`) reuses the proven explicit-port path and avoids depending on veilid's
         // port-0 handling.
-        //
-        // The namespace stays the stable default "daemonseed" — do NOT key it on the
-        // ephemeral port. veilid partitions its protected/table store by namespace, so
-        // a per-launch namespace would cold-bootstrap every launch (no reused routing/
-        // DHT cache) and strand one orphaned store partition per run. Only the LISTEN
-        // PORT needs to vary; the store identity must stay stable across launches. The
-        // explicit-port path DOES set a distinct namespace — there the operator is
-        // deliberately standing up a second coexisting node and wants store isolation.
         cfg.listen_address = Some(format!(":{port}"));
+        // #188: a distinct-per-PROFILE, stable-across-launches namespace so two
+        // co-resident no-env instances (distinct profiles) get isolated veilid
+        // protected stores in the shared dir. Keyed on the unlocked identity — NOT the
+        // ephemeral port (a port-keyed namespace churned every launch, cold-
+        // bootstrapping and stranding a store partition per run). Same profile → same
+        // namespace (store reuse); different profiles → different namespaces (co-
+        // resident isolation). `None` (ephemeral / no-profile reader) keeps the default.
+        if let Some(k) = &ns_key {
+            cfg.namespace = format!("daemonseed-{k}");
+        }
     }
 
     daemonseed_veilid_net::vtrace!(

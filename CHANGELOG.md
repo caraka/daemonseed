@@ -33,7 +33,7 @@ work lives in the project lead's vault manifest, not here.
 - `packaging`: the AppImage and Windows build scripts build `--features desktop` (the removed `veilid` feature flag is dropped).
 - `daemonseed-gui`: an inbound message or `CircleJoined` re-render no longer clears the in-progress composer draft (#189).
 - `daemonseed-gui`: the single-line composer scrolls horizontally to follow the caret, so long input is no longer typed blind (#190).
-- `daemonseed-gui`: with `DAEMONSEED_VEILID_PORT` unset the node binds an OS-assigned free listen port instead of veilid's fixed default, so a co-resident client no longer aborts startup; a listen-bind failure names the port-clash cause and the storage-dir create error propagates instead of being swallowed (#188).
+- `daemonseed-gui`: with `DAEMONSEED_VEILID_PORT` unset the node binds an OS-assigned free listen port instead of veilid's fixed default, and keys its veilid namespace on the profile identity, so two co-resident no-env instances no longer abort startup on a port or protected-store clash; a listen-bind failure names the cause and the storage-dir create error propagates instead of being swallowed (#188).
 
 ### Changed
 
