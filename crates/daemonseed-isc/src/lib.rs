@@ -333,13 +333,16 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("WB-ISC-26", IscClass::Negative), // anti: panic never wedges/leaks a lane counter
     ("WB-ISC-27", IscClass::Negative), // anti: acquire_wait feeds no control decision
     ("WB-ISC-28", IscClass::Negative), // anti: single-permit rule (no cross-pool hold)
+    // Consumer-side share route self-heal (#180). Unit/paused-time probes in
+    // veilid-net / the frontends; not integration-registered (like WB-ISC-21/22).
+    ("CRSH-ISC-1", IscClass::Positive), // sweep GET accounting: failed/empty/found (§RS-1.1)
 ];
 
 /// Total built, non-deferred ISCs tracked by this registry — the SINGLE source
 /// of truth for the coverage denominator, read live by `xtask isc-coverage`.
 /// Recount on every ISC add/remove (the `const _` assert below guards it
 /// against [`ISCS`]).
-pub const TOTAL: usize = 189;
+pub const TOTAL: usize = 190;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -530,10 +533,11 @@ mod tests {
         //                                  WB-ISC-17/24/26/27/28 neg (accountant bound /
         //                                  chat-never-waits / panic-recovery /
         //                                  telemetry-only / single-permit), #159/#168/#157)
-        //   total   124 pos + 65 neg = 189
+        //                                  consumer route self-heal (#180): CRSH-ISC-1 pos
+        //   total   125 pos + 65 neg = 190
         //   (the v0.33.0 Veilid cutover retired 14 server-positive + 10
         //    server-negative relay/TLS/federation/rate-limit ISCs.)
-        assert_eq!(pos, 124, "positive count drift");
+        assert_eq!(pos, 125, "positive count drift");
         assert_eq!(neg, 65, "negative count drift");
     }
 

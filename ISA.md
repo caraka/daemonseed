@@ -406,6 +406,8 @@ The write-budget family takes permanent `WB-ISC-N` IDs from the FROZEN 2026-07-0
 - [x] WB-ISC-14: Anti — no discovery-class surface relies on warmup-only sweeps plus a passive watch; every subscribed chat/discovery record (lobby chat, share-advert, circle chat, operator) has a declared steady-state re-surfacing mechanism (probe: code inspection of the gui/tui net-actor `steady_resweep` arm — a post-warmup round-robin reader resweep over the current subscribed set, presence excluded as it self-heals via keepalive re-writes — plus `next_resweep_seed_is_key_based_and_survives_set_changes`, the key-based round-robin cursor oracle proving a join/leave never skips a record).
 - [DEFERRED-VERIFY] WB-ISC-15: Share adverts (and lobby/circle chat) are discoverable by a client that holds only the room secret and converged AFTER the write, with no prior knowledge of any `share_id` and no reliance on warmup timing (probe: the two-node orinoco oracle — B joins and settles first, A publishes/sends after B's warmup window closes, B still discovers/receives. Follow-up: the orinoco re-test of `feat/veilid-migration` after this commit; live Veilid attach is impossible on the build VM's SLIRP NAT).
 
+- [x] CRSH-ISC-1: The steady resweep's GET accounting surfaces per-record attempted/failed/found counts — a failed GET is distinct from an empty slot (no longer swallowed by `.ok().flatten()`), the enabling observability for consumer-side session-health tracking (#180 §RS-1.1) (probe: `rendezvous::crsh_isc_1_sweep_outcome_accounts_failed_empty_and_found_separately`; existing #157 resweep behavior regression-guarded).
+
 ## Test Strategy
 
 | surface | check | tool / probe |

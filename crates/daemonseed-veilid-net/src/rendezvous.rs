@@ -262,6 +262,19 @@ pub async fn publish_at_subkey(
     .map_err(|e| VeilidNetError::Send(e.to_string()))
 }
 
+/// Per-sweep GET accounting. `attempted` counts every subkey GET issued; `failed`
+/// counts GETs that errored (distinct from an empty slot — the observability the old
+/// `.ok().flatten()` swallowed); `found` counts populated slots handed to `on_bytes`.
+/// Surfacing `failed` separately from empty/`found` is the enabling signal for
+/// consumer-side session-health tracking (CRSH-ISC-1): an erroring record session
+/// produces `failed > 0` sweeps instead of silent zero-yield ones.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SweepOutcome {
+    pub attempted: u32,
+    pub failed: u32,
+    pub found: u32,
+}
+
 /// Sweep every subkey once for the login backlog, emitting an [`VeilidNetEvent::Inbound`]
 /// per populated slot. Each `get_dht_value` `force_refresh`es from the network (DHT
 /// reads are eventually consistent) under a **per-GET** read permit from the shared
@@ -269,14 +282,16 @@ pub async fn publish_at_subkey(
 /// the next, so read occupancy never exceeds the read partition no matter how many
 /// sweeps run concurrently (WB-ISC-21/22) — the fix for the first WB-5 build, whose
 /// whole-sweep permit let ≥13 cold-start sweeps drain the pool and starve writes.
-/// Bounded by [`SUBKEY_COUNT`]; runs as a background task.
+/// Bounded by [`SUBKEY_COUNT`]; runs as a background task. Produces a [`SweepOutcome`]
+/// and traces its counts (CRSH-ISC-1); the session-health tracker that consumes them
+/// is a later build step.
 pub async fn sweep(
     gate: Arc<DhtGate>,
     rc: RoutingContext,
     key: RecordKey,
     ev_tx: mpsc::UnboundedSender<VeilidNetEvent>,
 ) {
-    let found = sweep_gated(
+    let outcome = sweep_gated(
         &gate,
         SUBKEY_COUNT,
         |bytes| ev_tx.send(VeilidNetEvent::Inbound { bytes }).is_ok(),
@@ -284,16 +299,28 @@ pub async fn sweep(
             let rc = rc.clone();
             let key = key.clone();
             async move {
-                rc.get_dht_value(key, subkey, true)
-                    .await
-                    .ok()
-                    .flatten()
-                    .map(|v| v.data().to_vec())
+                match rc.get_dht_value(key, subkey, true).await {
+                    Ok(Some(v)) => Ok(Some(v.data().to_vec())),
+                    Ok(None) => Ok(None),
+                    Err(e) => {
+                        // The GET errored — distinct from an empty slot. Keep the error
+                        // string visible in traces (the old `.ok().flatten()` dropped it
+                        // silently, the primary observability gap per §RS-1.1) and report
+                        // it up as a per-record failure rather than an empty slot.
+                        crate::vtrace!("sweep: get_dht_value error on subkey {subkey}: {e}");
+                        Err(())
+                    }
+                }
             }
         },
     )
     .await;
-    crate::vtrace!("sweep: done, {found} backlog slot(s) emitted");
+    crate::vtrace!(
+        "sweep: done, {} backlog slot(s) emitted ({} attempted, {} failed)",
+        outcome.found,
+        outcome.attempted,
+        outcome.failed
+    );
 }
 
 /// The testable per-GET sweep core (WB-5.1 / I5″.2). For each subkey it acquires ONE
@@ -304,16 +331,26 @@ pub async fn sweep(
 /// sweep count. `on_bytes` returns `false` to stop early (the receiver dropped).
 /// Generic over `get` so the per-GET permit discipline is unit-testable without veilid
 /// types (WB-ISC-21/22).
+///
+/// `get` returns `Result<Option<Vec<u8>>, ()>`: `Err(())` is a failed GET, `Ok(None)`
+/// an empty slot, `Ok(Some(bytes))` a populated one — the three cases the old
+/// `Option`-only surface conflated (CRSH-ISC-1). A per-subkey GET error increments
+/// `failed` and the sweep continues (a GET error is per-record health signal, not a
+/// reason to abort the sweep); the receiver-dropped early return still applies only via
+/// `on_bytes` returning `false`. Returns a [`SweepOutcome`] with `attempted`/`failed`/
+/// `found` counts.
 pub async fn sweep_gated<Fut>(
     gate: &Arc<DhtGate>,
     subkey_count: u16,
     mut on_bytes: impl FnMut(Vec<u8>) -> bool,
     get: impl Fn(u32) -> Fut,
-) -> u32
+) -> SweepOutcome
 where
-    Fut: Future<Output = Option<Vec<u8>>>,
+    // `std::result::Result` (not the crate's one-param `Result` alias): `Err(())` is a
+    // failed GET, distinct from `Ok(None)` (empty slot) and `Ok(Some(_))` (populated).
+    Fut: Future<Output = std::result::Result<Option<Vec<u8>>, ()>>,
 {
-    let mut found = 0u32;
+    let mut outcome = SweepOutcome::default();
     for subkey in 0..u32::from(subkey_count) {
         let got = {
             // The read permit is scoped to THIS GET: acquired here, dropped at the end
@@ -322,14 +359,19 @@ where
             let _read_permit = gate.acquire_read().await;
             get(subkey).await
         };
-        if let Some(bytes) = got {
-            found += 1;
-            if !on_bytes(bytes) {
-                return found; // receiver dropped — stop sweeping
+        outcome.attempted += 1;
+        match got {
+            Ok(Some(bytes)) => {
+                outcome.found += 1;
+                if !on_bytes(bytes) {
+                    return outcome; // receiver dropped — stop sweeping
+                }
             }
+            Ok(None) => {}
+            Err(()) => outcome.failed += 1, // failed GET: per-record health signal, keep sweeping
         }
     }
-    found
+    outcome
 }
 
 #[cfg(test)]
@@ -498,7 +540,7 @@ mod tests {
 
         // Sweep: three GETs, each records 's' while holding the read permit, yielding
         // so the FIFO-queued competitor can take the permit once it is released.
-        let found = sweep_gated(
+        let outcome = sweep_gated(
             &gate,
             3,
             |_bytes| true,
@@ -507,13 +549,13 @@ mod tests {
                 async move {
                     log.lock().unwrap().push('s');
                     tokio::task::yield_now().await;
-                    Some(vec![1u8])
+                    Ok(Some(vec![1u8]))
                 }
             },
         )
         .await;
         comp.await.unwrap();
-        assert_eq!(found, 3, "all three slots populated");
+        assert_eq!(outcome.found, 3, "all three slots populated");
 
         let log = log.lock().unwrap();
         let first_c = log.iter().position(|&c| c == 'c');
@@ -557,7 +599,7 @@ mod tests {
                             let in_flight = READ_POOL - gate.available_read();
                             max_in_flight.fetch_max(in_flight, Ordering::SeqCst);
                             tokio::task::yield_now().await;
-                            Some(vec![1u8])
+                            Ok(Some(vec![1u8]))
                         }
                     },
                 )
@@ -566,7 +608,7 @@ mod tests {
         }
         let mut total_found = 0u32;
         for h in handles {
-            total_found += h.await.unwrap(); // every sweep completes (no deadlock/hang)
+            total_found += h.await.unwrap().found; // every sweep completes (no deadlock/hang)
         }
         assert_eq!(
             total_found,
@@ -577,5 +619,37 @@ mod tests {
             max_in_flight.load(Ordering::SeqCst) <= READ_POOL,
             "read occupancy never exceeds the read partition regardless of live sweep count"
         );
+    }
+
+    // ── CRSH-ISC-1: sweep GET accounting distinguishes failed / empty / found ──
+    /// A `get` closure that errors on some subkeys, returns empty on others, and
+    /// populates the rest must surface the three cases separately in [`SweepOutcome`]:
+    /// `failed` counts the `Err(())` GETs (no longer swallowed into the empty-slot path
+    /// by the old `.ok().flatten()`), `found` counts `Ok(Some)`, and `attempted` counts
+    /// every subkey. This is the enabling observability for consumer-side session-health
+    /// tracking (§RS-1.1).
+    #[tokio::test]
+    async fn crsh_isc_1_sweep_outcome_accounts_failed_empty_and_found_separately() {
+        let gate = DhtGate::with_pools(2, 1, 2, 4);
+        // 9 subkeys by `subkey % 3`: 0,3,6 error; 1,4,7 populated; 2,5,8 empty.
+        let outcome = sweep_gated(
+            &gate,
+            9,
+            |_bytes| true,
+            |subkey| async move {
+                match subkey % 3 {
+                    0 => Err(()),
+                    1 => Ok(Some(vec![1u8])),
+                    _ => Ok(None),
+                }
+            },
+        )
+        .await;
+        assert_eq!(outcome.attempted, 9, "every subkey is attempted");
+        assert_eq!(
+            outcome.failed, 3,
+            "subkeys 0,3,6 errored (not counted as empty)"
+        );
+        assert_eq!(outcome.found, 3, "subkeys 1,4,7 populated");
     }
 }
