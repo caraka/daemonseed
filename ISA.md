@@ -424,6 +424,9 @@ The write-budget family takes permanent `WB-ISC-N` IDs from the FROZEN 2026-07-0
 - [x] CRSH-ISC-15: Anti — parked-retry dispatch is decorrelated from the advert-fold event: the decision is queried only at a cursor tick, never inside `apply_discovery`, so it never fires in the fold's event-turn (#180 §RS-1.4) (probe: `browse_retry::crsh_isc_15_*`, architectural).
 - [x] CRSH-ISC-19: Parked retries carry a `(share_id, discovered-generation)` tag; a withdraw/re-add mid-park drops the stale retry so it never fires against a new advert's route (#180 §RS-1.4) (probe: `browse_retry::crsh_isc_19_*` + gui/tui).
 
+- [x] CRSH-ISC-8: A chat `NetCommand` (SendLobby/SendCircle) enqueued while a `FetchShare` is in flight is processed before the fetch resolves — the net actor loop spawns the fetch and never awaits it inline (#180 §RS-2) (probe: gui/tui `crsh_isc_8_actor_never_awaits_a_fetch_inline`).
+- [x] CRSH-ISC-7: Anti — a failing-fetch storm never delays a chat write past the WB-3 I4 bound (≤ 2s); the self-heal retry path is off the actor loop (#180 §RS-2) (probe: gui/tui `crsh_isc_7_failing_fetch_storm_never_delays_chat`, paused-time).
+
 ## Test Strategy
 
 | surface | check | tool / probe |

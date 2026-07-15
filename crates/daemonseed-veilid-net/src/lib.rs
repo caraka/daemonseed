@@ -155,4 +155,4 @@ pub use schedule::{
 // Re-export the veilid record-key type at the transport boundary so frontends can key a
 // [`daemonseed_core::session_health::SessionHealthTracker`] on the record identity carried
 // by [`VeilidNetEvent::SweepHealth`] without depending on `veilid-core` directly.
-pub use veilid_core::RecordKey;
+pub use veilid_core::{RecordKey, RouteId};

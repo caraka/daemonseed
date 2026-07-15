@@ -93,8 +93,9 @@ use daemonseed_core::storage::cas::ChunkAddr;
 use daemonseed_core::storage::fetched::rebase_to_selection_root;
 use daemonseed_proto::v1 as wire;
 use daemonseed_veilid_net::{
-    AimdWindow, DiscoveryEnvelope, PresenceBoundary, RecordKey, VeilidNet, VeilidNetConfig,
-    VeilidNetError, VeilidNetEvent, VeilidNetHandle, next_resweep_seed, verify_route_advert,
+    AimdWindow, DiscoveryEnvelope, PresenceBoundary, RecordKey, RouteId, VeilidNet,
+    VeilidNetConfig, VeilidNetError, VeilidNetEvent, VeilidNetHandle, next_resweep_seed,
+    verify_route_advert,
 };
 use prost::Message as _;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -479,6 +480,16 @@ pub async fn veilid_net_actor(
     // warmup: enqueued here (dedup by the tracker's latch) and drained one-at-a-time at
     // the cadence tick. One repair in flight at a time via `resweep_busy` (§RS-1.2).
     let mut pending_repairs: VecDeque<RecordKey> = VecDeque::new();
+    // (#180 §RS-2, CRSH-ISC-8) Spawned share fetches report their generation-tagged outcome
+    // here; the loop folds them on-loop (`fold_fetch_outcome`) so a slow/failing fetch never
+    // parks the command loop and starves chat (#180 item 3). The actor holds a sender for
+    // the whole loop, so the receiver never closes while the actor lives.
+    let (fetch_outcome_tx, mut fetch_outcome_rx) =
+        tokio::sync::mpsc::unbounded_channel::<FetchOutcome>();
+    // (#180 §RS-3) The on-loop map of each discovered share's last-imported private RouteId,
+    // fed by folded fetch outcomes. Authoritative on-loop; step 6 (CRSH-ISC-10) attaches the
+    // in-use guard + `release_tolerant` release. This step only records the id.
+    let mut imported_share_routes: HashMap<String, RouteId> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -492,8 +503,15 @@ pub async fn veilid_net_actor(
                 }
                 handle_command(
                     cmd, &evt_tx, &cmd_tx, &mut net, &mut ev_rx, &mut circles, &mut my_handle,
-                    &mut shares,
+                    &mut shares, &fetch_outcome_tx,
                 ).await;
+            }
+            // (#180 §RS-2, CRSH-ISC-8/19) Fold a spawned fetch's generation-tagged outcome
+            // on-loop: render the manifest / mark Unresolved / record the imported route. A
+            // stale-generation outcome no-ops. Cheap and synchronous — no fetch is awaited
+            // here (the await already happened in the spawned task).
+            Some(outcome) = fetch_outcome_rx.recv() => {
+                fold_fetch_outcome(&mut shares, &evt_tx, &mut imported_share_routes, outcome);
             }
             // Only poll the Veilid event stream once connected.
             Some(ev) = recv_opt(&mut ev_rx), if ev_rx.is_some() => {
@@ -637,8 +655,8 @@ pub async fn veilid_net_actor(
                 // (#180 §RS-1.4, CRSH-ISC-6/15) Dispatch parked browse retries on the
                 // consumer's own cursor tick (decorrelated from the sharer's re-announce).
                 // Independent of the resweep `ready` gate below: the retry is an off-DHT
-                // content fetch, not a sweep.
-                process_parked_browse_retries(&mut shares, &evt_tx, &net).await;
+                // content fetch, not a sweep, and (§RS-2) is spawned off-loop.
+                process_parked_browse_retries(&mut shares, &evt_tx, &net, &fetch_outcome_tx);
                 // Ready once the warmup hand-off window has elapsed, we are attached, and
                 // no prior resweep is still in flight (the WB-2 one-sweep-at-a-time bound
                 // — a resweep can outlast the tick on a slow DHT).
@@ -962,6 +980,9 @@ async fn handle_command(
     circles: &mut Vec<VeilidCircle>,
     my_handle: &mut String,
     shares: &mut ShareState,
+    // (#180 §RS-2) Where a spawned `FetchShare` reports its generation-tagged outcome for
+    // on-loop folding — the fetch never blocks this command loop (CRSH-ISC-8).
+    fetch_outcome_tx: &UnboundedSender<FetchOutcome>,
 ) {
     match cmd {
         NetCommand::Connect {
@@ -1189,7 +1210,9 @@ async fn handle_command(
             }
         }
         NetCommand::FetchShare { share_id, name } => {
-            fetch_share(shares, evt_tx, net, &share_id, &name).await;
+            // (#180 §RS-2, CRSH-ISC-8) Spawn the fetch off-loop and return immediately — a
+            // slow/failing fetch can never park this loop and starve chat (#180 item 3).
+            spawn_fetch_share(shares, evt_tx, net, fetch_outcome_tx, &share_id, &name);
         }
         NetCommand::ConfirmFetch {
             share_id,
@@ -2236,14 +2259,115 @@ fn fetch_error_message(context: &str, e: VeilidNetError) -> String {
     }
 }
 
-/// A1 fetch-preview: import the discovered share's private route, fetch +
-/// reassemble + open its manifest, and emit `FetchManifest` (file names + sizes).
-/// No bytes are fetched. The route is anti-swap-verified at discovery time, before
-/// it ever enters `shares.discovered`.
-async fn fetch_share(
-    shares: &mut ShareState,
+/// (#180 §RS-2, CRSH-ISC-7/8/19) The generation-tagged outcome of a share fetch that ran
+/// in a spawned task **off** the net-actor loop. Folded back on-loop by
+/// [`fold_fetch_outcome`], which is where the `&mut ShareState` mutations (mark/clear
+/// Unresolved) and the UI emissions happen — never inside the spawned task. Every variant
+/// carries the `generation` captured at spawn time so a stale outcome (the share was
+/// withdrawn / re-added while the fetch was in flight) no-ops on fold (CRSH-ISC-19). The
+/// imported `RouteId` rides the `route`-bearing variants back on-loop so step 6's release
+/// map can attach (§RS-3) — the spawned task never releases a route itself.
+enum FetchOutcome {
+    /// Import + manifest fetch both succeeded: render the preview and clear any Unresolved
+    /// mark. `route` is the imported private route (release-tracked on-loop).
+    Manifest {
+        share_id: String,
+        name: String,
+        generation: u64,
+        route: RouteId,
+        entries: Vec<ShareManifestEntry>,
+    },
+    /// `import_route` failed — the sharer's route is dead, NOT a malformed blob (the advert
+    /// was binding + signature verified at discovery). No route was imported. Mark the share
+    /// Unresolved (local only) and park a one-shot retry; never prune (§RS-1.4/§RS-1.5).
+    ImportFailed {
+        share_id: String,
+        name: String,
+        generation: u64,
+        message: String,
+    },
+    /// The route imported but the manifest fetch failed (dead route / withdraw / transport).
+    /// Same local-only reactive handling as [`Self::ImportFailed`]; `route` was imported and
+    /// rides back on-loop for release tracking.
+    ManifestFailed {
+        share_id: String,
+        name: String,
+        generation: u64,
+        route: RouteId,
+        message: String,
+    },
+}
+
+/// (#180 §RS-2, CRSH-ISC-8) The network half of a share fetch — import the route, fetch +
+/// reassemble + open the manifest — run **inside a spawned task**, never on the actor loop.
+/// Returns a generation-tagged [`FetchOutcome`]; all state mutation and UI emission is
+/// deferred to [`fold_fetch_outcome`] on-loop. No bytes are fetched (preview only).
+async fn run_fetch(
+    handle: &VeilidNetHandle,
+    share_id: String,
+    name: String,
+    generation: u64,
+    route_blob: Vec<u8>,
+    room_key_bytes: [u8; 32],
+) -> FetchOutcome {
+    let route = match handle.import_route(route_blob).await {
+        Ok(r) => r,
+        Err(e) => {
+            return FetchOutcome::ImportFailed {
+                share_id,
+                name,
+                generation,
+                message: format!(
+                    "could not import the sharer's route: {e} — re-resolving; the share stays listed"
+                ),
+            };
+        }
+    };
+    // Keep a copy of the imported route for the outcome — `fetch_manifest` consumes it and
+    // the on-loop release map (step 6) needs the id (RouteId is Clone, not Copy).
+    let route_for_outcome = route.clone();
+    match handle
+        .fetch_manifest(route, &share_id, room_key_bytes)
+        .await
+    {
+        Ok(manifest) => {
+            let entries = manifest
+                .iter()
+                .map(|e| ShareManifestEntry {
+                    rel_path: e.rel_path.clone(),
+                    size: e.size,
+                })
+                .collect();
+            FetchOutcome::Manifest {
+                share_id,
+                name,
+                generation,
+                route: route_for_outcome,
+                entries,
+            }
+        }
+        Err(e) => FetchOutcome::ManifestFailed {
+            share_id,
+            name,
+            generation,
+            route: route_for_outcome,
+            message: fetch_error_message("could not fetch the share manifest — re-resolving", e),
+        },
+    }
+}
+
+/// (#180 §RS-2, CRSH-ISC-7/8) Dispatch an A1 fetch-preview **off** the net-actor loop: copy
+/// the route blob + room key + current discovered-generation out of share state, spawn
+/// [`run_fetch`] as a task, and return immediately so the actor loop returns to its
+/// `select!` without ever awaiting the fetch (the #180 item-3 chat-starvation fix). The
+/// outcome returns via `outcome_tx` and is folded on-loop by [`fold_fetch_outcome`].
+/// Immediate local failures (not connected, lobby not subscribed, share not discovered)
+/// still fail inline — they touch no network and need no spawn.
+fn spawn_fetch_share(
+    shares: &ShareState,
     evt_tx: &UnboundedSender<NetEvent>,
     net: &Option<VeilidNetHandle>,
+    outcome_tx: &UnboundedSender<FetchOutcome>,
     share_id: &str,
     name: &str,
 ) {
@@ -2253,56 +2377,126 @@ async fn fetch_share(
     let Some(handle) = net.as_ref() else {
         return fail("not connected to Veilid yet".to_owned());
     };
-    // Copy the route + room key out, dropping the immutable borrow so a fetch
-    // failure can mark the share Unresolved (&mut) below.
-    let (route_blob, room_key_bytes) = {
-        let Some(lobby) = shares.lobby.as_ref() else {
-            return fail("lobby not subscribed yet".to_owned());
-        };
-        let Some(disc) = shares.discovered.get(share_id) else {
-            return fail("share not discovered yet — refresh the list".to_owned());
-        };
-        (disc.route_blob.clone(), *lobby.room_key.as_bytes())
+    let Some(lobby) = shares.lobby.as_ref() else {
+        return fail("lobby not subscribed yet".to_owned());
     };
-    let route = match handle.import_route(route_blob).await {
-        Ok(r) => r,
-        Err(e) => {
-            // (#180 §RS-1.4/§RS-1.5, CRSH-ISC-4/5) The route won't import — the sharer's
-            // route is dead, NOT a malformed blob (the advert was binding + signature
-            // verified at discovery). Do NOT prune: mark the share Unresolved (local only,
-            // zero network) and park a one-shot retry; the share stays listed.
-            mark_share_unresolved(shares, evt_tx, share_id, name);
-            return fail(format!(
-                "could not import the sharer's route: {e} — re-resolving; the share stays listed"
-            ));
+    let Some(disc) = shares.discovered.get(share_id) else {
+        return fail("share not discovered yet — refresh the list".to_owned());
+    };
+    let route_blob = disc.route_blob.clone();
+    let generation = disc.generation;
+    let room_key_bytes = *lobby.room_key.as_bytes();
+    let handle = handle.clone();
+    let share_id = share_id.to_owned();
+    let name = name.to_owned();
+    spawn_fetch_task(outcome_tx.clone(), async move {
+        run_fetch(
+            &handle,
+            share_id,
+            name,
+            generation,
+            route_blob,
+            room_key_bytes,
+        )
+        .await
+    });
+}
+
+/// (#180 §RS-2, CRSH-ISC-7/8) The spawn seam shared by [`spawn_fetch_share`] and the actor
+/// tests: run `fetch` as a detached task and report its [`FetchOutcome`] to `outcome_tx`,
+/// returning immediately. This is the single point guaranteeing no fetch is ever awaited on
+/// the caller (the actor loop) — testable without a live veilid attach (§RS-1.3).
+fn spawn_fetch_task<F>(outcome_tx: UnboundedSender<FetchOutcome>, fetch: F)
+where
+    F: std::future::Future<Output = FetchOutcome> + Send + 'static,
+{
+    tokio::spawn(async move {
+        // A closed channel just means the actor shut down mid-fetch — the outcome is moot.
+        let _ = outcome_tx.send(fetch.await);
+    });
+}
+
+/// (#180 §RS-2, CRSH-ISC-8/19, §RS-3) Fold a spawned fetch's outcome back on the actor loop.
+/// A **stale-generation** outcome no-ops (the discovered entry was withdrawn or a fresh
+/// advert folded while the fetch was in flight — CRSH-ISC-19), so a dead manifest never
+/// renders and a route fetched over a superseded advert never drives UI. On a live outcome:
+/// success clears the Unresolved mark + emits `FetchManifest`; either failure marks the
+/// share Unresolved (local only, never a prune). The imported `RouteId` is recorded in the
+/// on-loop `imported_routes` map — step 6 (CRSH-ISC-10) attaches the in-use guard +
+/// `release_tolerant` release here; this step only records it.
+fn fold_fetch_outcome(
+    shares: &mut ShareState,
+    evt_tx: &UnboundedSender<NetEvent>,
+    imported_routes: &mut HashMap<String, RouteId>,
+    outcome: FetchOutcome,
+) {
+    let (share_id, generation) = match &outcome {
+        FetchOutcome::Manifest {
+            share_id,
+            generation,
+            ..
         }
+        | FetchOutcome::ImportFailed {
+            share_id,
+            generation,
+            ..
+        }
+        | FetchOutcome::ManifestFailed {
+            share_id,
+            generation,
+            ..
+        } => (share_id.clone(), *generation),
     };
-    match handle.fetch_manifest(route, share_id, room_key_bytes).await {
-        Ok(manifest) => {
+    // CRSH-ISC-19: the outcome is valid only against the exact discovered-entry generation
+    // it was fetched over. A withdraw (entry gone) or a fresh advert fold (generation
+    // advanced) mid-fetch makes the outcome stale → drop it, including any imported route
+    // (the LRU/expiry is the backstop; step 6 releases live-tracked routes).
+    if shares.discovered.get(&share_id).map(|d| d.generation) != Some(generation) {
+        daemonseed_veilid_net::vtrace!(
+            "gui fetch outcome for {share_id} is stale (gen {generation}) — no-op"
+        );
+        return;
+    }
+    match outcome {
+        FetchOutcome::Manifest {
+            share_id,
+            name,
+            route,
+            entries,
+            ..
+        } => {
+            // The imported route returns on-loop for step 6's release map (§RS-3).
+            imported_routes.insert(share_id.clone(), route);
             // A successful re-resolve: clear any Unresolved mark + drop a parked retry.
-            clear_share_unresolved(shares, evt_tx, share_id);
-            let entries = manifest
-                .iter()
-                .map(|e| ShareManifestEntry {
-                    rel_path: e.rel_path.clone(),
-                    size: e.size,
-                })
-                .collect();
+            clear_share_unresolved(shares, evt_tx, &share_id);
             let _ = evt_tx.send(NetEvent::FetchManifest {
-                share_id: share_id.to_owned(),
-                name: name.to_owned(),
+                share_id,
+                name,
                 entries,
             });
         }
-        Err(e) => {
-            // (#180 §RS-1.4/§RS-1.5, CRSH-ISC-4/5) Manifest fetch failed (dead route /
-            // withdraw / transport). Reactive path is local-only: mark Unresolved + park a
-            // retry, never prune (prune keys only on verified withdraw or catalog TTL).
-            mark_share_unresolved(shares, evt_tx, share_id, name);
-            fail(fetch_error_message(
-                "could not fetch the share manifest — re-resolving",
-                e,
-            ));
+        FetchOutcome::ManifestFailed {
+            share_id,
+            name,
+            route,
+            message,
+            ..
+        } => {
+            // The route imported but the manifest fetch failed — record the route on-loop
+            // (step 6 releases it), then the local-only reactive path (§RS-1.4/§RS-1.5).
+            imported_routes.insert(share_id.clone(), route);
+            mark_share_unresolved(shares, evt_tx, &share_id, &name);
+            let _ = evt_tx.send(NetEvent::FetchError { message });
+        }
+        FetchOutcome::ImportFailed {
+            share_id,
+            name,
+            message,
+            ..
+        } => {
+            // No route imported — mark Unresolved + park a one-shot retry, never prune.
+            mark_share_unresolved(shares, evt_tx, &share_id, &name);
+            let _ = evt_tx.send(NetEvent::FetchError { message });
         }
     }
 }
@@ -2360,16 +2554,18 @@ fn clear_share_unresolved(
     }
 }
 
-/// (#180 §RS-1.4, CRSH-ISC-6/15) Dispatch parked browse retries **at the consumer's own
-/// cursor tick** — never at the advert-fold event. For each parked retry: a share whose
+/// (#180 §RS-1.4/§RS-2, CRSH-ISC-6/8/15) Dispatch parked browse retries **at the consumer's
+/// own cursor tick** — never at the advert-fold event. For each parked retry: a share whose
 /// advert has re-folded since the park (its discovered generation advanced) is re-fetched
-/// via a normal consented content fetch (the ONE network action of the reactive path, a
-/// user-consented `app_call`); an expired-window retry surfaces failure and clears WITHOUT
-/// pruning; a withdrawn share's retry drops silently. Called once per steady-resweep tick.
-async fn process_parked_browse_retries(
+/// via a normal consented content fetch — **spawned off-loop** (CRSH-ISC-8), exactly like a
+/// fresh browse, so a slow retry never blocks the actor loop; an expired-window retry
+/// surfaces failure and clears WITHOUT pruning; a withdrawn share's retry drops silently.
+/// Called once per steady-resweep tick — synchronous (it only spawns, never awaits a fetch).
+fn process_parked_browse_retries(
     shares: &mut ShareState,
     evt_tx: &UnboundedSender<NetEvent>,
     net: &Option<VeilidNetHandle>,
+    fetch_outcome_tx: &UnboundedSender<FetchOutcome>,
 ) {
     if shares.parked_retries.is_empty() {
         return;
@@ -2400,9 +2596,9 @@ async fn process_parked_browse_retries(
     }
     for (id, name) in fire {
         // One-shot: consume the park before re-attempting (a failed re-attempt re-parks
-        // via `fetch_share`, needing another fresh advert to fire again).
+        // when its outcome folds, needing another fresh advert to fire again).
         shares.parked_retries.remove(&id);
-        fetch_share(shares, evt_tx, net, &id, &name).await;
+        spawn_fetch_share(shares, evt_tx, net, fetch_outcome_tx, &id, &name);
     }
 }
 
@@ -3422,10 +3618,11 @@ mod tests {
 
     /// The parked-retry tick processor surfaces failure (no prune) on window expiry and
     /// clears the entry — the local, no-network half of CRSH-ISC-6.
-    #[tokio::test]
-    async fn crsh_isc_6_window_expiry_surfaces_error_without_pruning() {
+    #[test]
+    fn crsh_isc_6_window_expiry_surfaces_error_without_pruning() {
         let (mut shares, share_id, _rk, _signer, _rc) = folded_share(35);
         let (evt_tx, mut evt_rx) = unbounded_channel();
+        let (fetch_outcome_tx, _outcome_rx) = unbounded_channel();
         // Park a retry whose window is already elapsed (deadline in the past).
         shares.discovered.get_mut(&share_id).unwrap().unresolved = true;
         shares.parked_retries.insert(
@@ -3437,7 +3634,7 @@ mod tests {
             },
         );
 
-        process_parked_browse_retries(&mut shares, &evt_tx, &None).await;
+        process_parked_browse_retries(&mut shares, &evt_tx, &None, &fetch_outcome_tx);
 
         assert!(
             !shares.parked_retries.contains_key(&share_id),
@@ -3447,6 +3644,167 @@ mod tests {
         assert!(
             matches!(evt_rx.try_recv(), Ok(NetEvent::FetchError { .. })),
             "expiry surfaces a failure to the UI"
+        );
+    }
+
+    // ── CRSH-ISC-8: the actor loop never awaits a fetch inline ─────────────────────────
+    /// A chat command enqueued while a fetch is in flight is processed BEFORE the fetch
+    /// resolves. Modelled on the spawn seam (`spawn_fetch_task`) that the actor's
+    /// `FetchShare` dispatch uses: a fetch that blocks on a gate is spawned, then the
+    /// "chat" work runs synchronously to completion while the fetch outcome has NOT yet
+    /// arrived — proving the dispatch returned immediately rather than awaiting the fetch.
+    /// No live veilid attach is required.
+    #[tokio::test]
+    async fn crsh_isc_8_actor_never_awaits_a_fetch_inline() {
+        let (outcome_tx, mut outcome_rx) = unbounded_channel::<FetchOutcome>();
+        let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        let gate_fetch = gate.clone();
+
+        // Dispatch a "FetchShare" whose fetch blocks until the gate is released.
+        spawn_fetch_task(outcome_tx, async move {
+            gate_fetch.notified().await;
+            FetchOutcome::ImportFailed {
+                share_id: "s".to_owned(),
+                name: "demo".to_owned(),
+                generation: 1,
+                message: "blocked fetch released".to_owned(),
+            }
+        });
+
+        // The actor loop is free to process a chat command right away: the fetch is still
+        // parked on the gate, so its outcome must not be available yet.
+        let mut order: Vec<&str> = vec!["dispatched-fetch"];
+        order.push("chat"); // stands in for handle_command(SendLobby/SendCircle)
+        assert_eq!(
+            order,
+            ["dispatched-fetch", "chat"],
+            "chat is processed inline while the fetch is still in flight"
+        );
+        assert!(
+            matches!(
+                outcome_rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "the fetch has NOT resolved — the loop did not await it inline"
+        );
+
+        // Releasing the gate lets the spawned fetch complete and its outcome arrive on-loop.
+        gate.notify_one();
+        let outcome = outcome_rx.recv().await.expect("the fetch outcome arrives");
+        assert!(
+            matches!(outcome, FetchOutcome::ImportFailed { .. }),
+            "the spawned fetch reports its outcome back for on-loop folding"
+        );
+    }
+
+    // ── CRSH-ISC-7: a failing-fetch storm never delays chat past the I4 bound ──────────
+    /// Anti (paused-time): a storm of slow failing fetches is dispatched, then a chat
+    /// dispatch runs — and completes within the WB-3 I4 chat bound (≤ 2s), because every
+    /// fetch is spawned off-loop and none is awaited on the dispatch path. The storm's
+    /// outcomes are still pending when chat dispatches (they resolve only after their long
+    /// simulated latency elapses).
+    #[tokio::test(start_paused = true)]
+    async fn crsh_isc_7_failing_fetch_storm_never_delays_chat() {
+        const I4_BOUND: Duration = Duration::from_secs(2);
+        let (outcome_tx, mut outcome_rx) = unbounded_channel::<FetchOutcome>();
+
+        // A ~60s failing-fetch storm (the felt-test's retry window), all spawned off-loop.
+        let start = Instant::now();
+        for i in 0..16 {
+            let tx = outcome_tx.clone();
+            spawn_fetch_task(tx, async move {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                FetchOutcome::ImportFailed {
+                    share_id: format!("s{i}"),
+                    name: "demo".to_owned(),
+                    generation: 1,
+                    message: "storm".to_owned(),
+                }
+            });
+        }
+        // The chat dispatch happens on-loop immediately after the storm is spawned.
+        let chat_dispatch_elapsed = start.elapsed();
+        assert!(
+            chat_dispatch_elapsed <= I4_BOUND,
+            "chat dispatched within the I4 bound ({chat_dispatch_elapsed:?} ≤ {I4_BOUND:?})"
+        );
+        // None of the storm's outcomes has resolved yet — chat did not wait on them.
+        assert!(
+            matches!(
+                outcome_rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "the storm is still in flight when chat dispatches"
+        );
+
+        // Advancing past the simulated latency lets the storm drain — bounded, not leaked.
+        tokio::time::advance(Duration::from_secs(61)).await;
+        for _ in 0..16 {
+            assert!(
+                matches!(
+                    outcome_rx.recv().await,
+                    Some(FetchOutcome::ImportFailed { .. })
+                ),
+                "every spawned fetch eventually reports its outcome"
+            );
+        }
+    }
+
+    // ── CRSH-ISC-19: a stale-generation fetch outcome no-ops on fold ───────────────────
+    /// The generation gate in `fold_fetch_outcome` runs before the variant match, so a
+    /// stale outcome (its captured generation no longer matches the discovered entry — a
+    /// withdraw/re-add or a fresh advert fold happened mid-fetch) is dropped for EVERY
+    /// variant: no Unresolved mark, no manifest render, no event. A live-generation outcome
+    /// takes effect. Exercised via the route-free `ImportFailed` variant (the gate is
+    /// variant-independent; the route-bearing variants share it).
+    #[test]
+    fn crsh_isc_19_stale_generation_fetch_outcome_no_ops() {
+        let (mut shares, share_id, _rk, _signer, _rc) = folded_share(36);
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        let mut imported_routes: HashMap<String, RouteId> = HashMap::new();
+        let live_gen = shares.discovered.get(&share_id).unwrap().generation;
+
+        // A stale outcome (captured a generation the entry no longer carries) no-ops.
+        fold_fetch_outcome(
+            &mut shares,
+            &evt_tx,
+            &mut imported_routes,
+            FetchOutcome::ImportFailed {
+                share_id: share_id.clone(),
+                name: "demo".to_owned(),
+                generation: live_gen.wrapping_sub(1),
+                message: "stale".to_owned(),
+            },
+        );
+        assert!(
+            !shares.discovered.get(&share_id).unwrap().unresolved,
+            "a stale outcome does not mark the share Unresolved"
+        );
+        assert!(
+            !shares.parked_retries.contains_key(&share_id),
+            "a stale outcome parks no retry"
+        );
+        assert!(evt_rx.try_recv().is_err(), "a stale outcome emits no event");
+
+        // A live-generation outcome takes effect: mark Unresolved + surface the error.
+        fold_fetch_outcome(
+            &mut shares,
+            &evt_tx,
+            &mut imported_routes,
+            FetchOutcome::ImportFailed {
+                share_id: share_id.clone(),
+                name: "demo".to_owned(),
+                generation: live_gen,
+                message: "route dead".to_owned(),
+            },
+        );
+        assert!(
+            shares.discovered.get(&share_id).unwrap().unresolved,
+            "a live outcome marks the share Unresolved"
+        );
+        assert!(
+            shares.parked_retries.contains_key(&share_id),
+            "a live failure outcome parks a one-shot retry"
         );
     }
 
@@ -3569,6 +3927,7 @@ mod tests {
         let mut shares = ShareState::new();
         let (evt_tx, mut evt_rx) = unbounded_channel();
         let (cmd_tx, _cmd_rx) = unbounded_channel::<NetCommand>();
+        let (fetch_outcome_tx, _fetch_rx) = unbounded_channel();
 
         handle_command(
             NetCommand::PublishShare {
@@ -3583,6 +3942,7 @@ mod tests {
             &mut circles,
             &mut my_handle,
             &mut shares,
+            &fetch_outcome_tx,
         )
         .await;
 
@@ -3608,6 +3968,7 @@ mod tests {
         let mut shares = ShareState::new(); // operator = None
         let (evt_tx, mut evt_rx) = unbounded_channel();
         let (cmd_tx, _cmd_rx) = unbounded_channel::<NetCommand>();
+        let (fetch_outcome_tx, _fetch_rx) = unbounded_channel();
 
         handle_command(
             NetCommand::RefreshPublicSpace,
@@ -3618,6 +3979,7 @@ mod tests {
             &mut circles,
             &mut my_handle,
             &mut shares,
+            &fetch_outcome_tx,
         )
         .await;
 
@@ -3640,6 +4002,7 @@ mod tests {
         let mut shares = ShareState::new();
         let (evt_tx, mut evt_rx) = unbounded_channel();
         let (cmd_tx, _cmd_rx) = unbounded_channel::<NetCommand>();
+        let (fetch_outcome_tx, _fetch_rx) = unbounded_channel();
         handle_command(
             NetCommand::SetMotd {
                 text: "hello".to_owned(),
@@ -3651,6 +4014,7 @@ mod tests {
             &mut circles,
             &mut my_handle,
             &mut shares,
+            &fetch_outcome_tx,
         )
         .await;
         assert!(matches!(
@@ -3670,6 +4034,7 @@ mod tests {
         let mut shares = ShareState::new();
         let (evt_tx, mut evt_rx) = unbounded_channel();
         let (cmd_tx, _cmd_rx) = unbounded_channel::<NetCommand>();
+        let (fetch_outcome_tx, _fetch_rx) = unbounded_channel();
         handle_command(
             NetCommand::UploadAnnouncement {
                 topic: "t".to_owned(),
@@ -3682,6 +4047,7 @@ mod tests {
             &mut circles,
             &mut my_handle,
             &mut shares,
+            &fetch_outcome_tx,
         )
         .await;
         assert!(matches!(
@@ -4106,6 +4472,7 @@ mod tests {
         let mut shares = ShareState::new(); // lobby = None
         let (evt_tx, mut evt_rx) = unbounded_channel();
         let (cmd_tx, _cmd_rx) = unbounded_channel::<NetCommand>();
+        let (fetch_outcome_tx, _fetch_rx) = unbounded_channel();
         handle_command(
             NetCommand::SendRoom {
                 text: "hi".to_owned(),
@@ -4117,6 +4484,7 @@ mod tests {
             &mut circles,
             &mut my_handle,
             &mut shares,
+            &fetch_outcome_tx,
         )
         .await;
         match evt_rx.try_recv() {

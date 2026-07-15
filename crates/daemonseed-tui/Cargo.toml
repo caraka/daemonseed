@@ -65,3 +65,6 @@ oxitls-rustls-provider = { workspace = true, features = ["testing"] }
 # Throwaway dirs for the M16 streaming-fetch persistence tests (the
 # downloads.idx round-trip and the abort-time partial-file cleanup).
 tempfile = { workspace = true }
+# Test-only: paused virtual time (`start_paused`) for the #180 §RS-2 off-loop fetch
+# oracle (CRSH-ISC-7 — a failing-fetch storm must not delay chat past the I4 bound).
+tokio = { workspace = true, features = ["test-util", "time"] }

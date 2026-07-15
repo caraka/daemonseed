@@ -103,6 +103,9 @@ slint-build = { workspace = true }
 # Share publish→fetch round-trip oracle (veilid_net tests): a temp share directory
 # + a temp fetch root.
 tempfile = { workspace = true }
+# Test-only: paused virtual time (`start_paused`) for the #180 §RS-2 off-loop fetch
+# oracle (CRSH-ISC-7 — a failing-fetch storm must not delay chat past the I4 bound).
+tokio = { workspace = true, features = ["test-util", "time"] }
 
 [features]
 default = []
