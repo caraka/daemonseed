@@ -24,6 +24,8 @@ next release this block is renamed to its version + date and a fresh
 `[Unreleased]` is opened (see `AGENTS.md` doc-sync). Planning for *unstarted*
 work lives in the project lead's vault manifest, not here.
 
+## [0.33.1] — 2026-07-15
+
 ### Fixed
 
 - `daemonseed-gui`: the windowed (`desktop`) build no longer opens a stray console window on Windows — the crate sets the `windows` subsystem under the `desktop` feature; the offscreen build keeps stdout for headless verification.
