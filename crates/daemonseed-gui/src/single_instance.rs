@@ -5,14 +5,30 @@
 //! (`cd alice && … ; cd bob && …`) and prevents same-root double-open of the
 //! single-writer storage layer (redb + seeds + CAS).
 //!
-//! Dep-free (std only). **Refuse-to-start only** — focusing the existing window
+//! Std-only on Linux/macOS. **Refuse-to-start only** — focusing the existing window
 //! needs cross-process IPC and is the harder half (deferred). A clean exit drops
 //! the [`InstanceLock`] and removes the lockfile; a crash skips the drop, leaving a
 //! stale lockfile that the next launch reclaims by a PID-liveness check.
+//!
+//! On Windows (#196) the lockfile is *not* the liveness authority: `pid_alive` had no
+//! Windows implementation (`-> true`), so a lockfile left by a crash/ungraceful-close
+//! was never reclaimed and every later launch on that root refused to start —
+//! invisibly on the no-console build. Windows instead keys liveness on a `Global`
+//! named mutex, which the OS releases on process death; if we acquire it cleanly, any
+//! leftover lockfile on that root is definitionally stale and is reclaimed.
 
 use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
+// `Read` is only used by the non-Windows PID-liveness path (`read_pid`); on Windows
+// the named mutex is the liveness authority, so the import would be dead there.
+#[cfg(not(windows))]
+use std::io::Read;
 use std::path::{Path, PathBuf};
+
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::CreateMutexW;
 
 /// Lockfile name inside the resolved profile root.
 const LOCK_FILE: &str = "daemonseed.lock";
@@ -21,12 +37,24 @@ const LOCK_FILE: &str = "daemonseed.lock";
 #[derive(Debug)]
 pub struct InstanceLock {
     path: PathBuf,
+    /// Windows named-mutex handle (#196) — the authoritative liveness token. The OS
+    /// auto-releases the mutex on process death; closing the handle on drop is the
+    /// clean path. Kept on the main (UI) thread for the whole session.
+    #[cfg(windows)]
+    mutex: HANDLE,
 }
 
 impl Drop for InstanceLock {
     fn drop(&mut self) {
         // Best-effort: a failure here only leaves a stale lock the next launch reclaims.
         let _ = fs::remove_file(&self.path);
+        // Release the named mutex (#196). The OS would also drop it on process exit,
+        // but closing the handle is the clean path for a graceful shutdown.
+        #[cfg(windows)]
+        // SAFETY: `mutex` is a live handle from `CreateMutexW`, closed exactly once here.
+        unsafe {
+            CloseHandle(self.mutex);
+        }
     }
 }
 
@@ -62,33 +90,127 @@ impl std::error::Error for LockError {}
 pub fn acquire(root: &Path) -> Result<InstanceLock, LockError> {
     fs::create_dir_all(root).map_err(LockError::Io)?;
     let path = root.join(LOCK_FILE);
-    loop {
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(mut f) => {
-                // Best-effort PID stamp — only ever read by a later launch's liveness
-                // check; an empty/short write just makes the lock look reclaimable.
-                let _ = write!(f, "{}", std::process::id());
-                return Ok(InstanceLock { path });
+
+    // Windows (#196): the named mutex — not the lockfile — is the liveness authority.
+    // A clean acquisition proves no live process holds this root, so any leftover
+    // lockfile is stale by definition: reclaim it (remove + rewrite our PID) instead
+    // of consulting `pid_alive`. The lockfile is kept only as a human-visible marker.
+    #[cfg(windows)]
+    {
+        let mutex = acquire_root_mutex(root)?;
+        let _ = fs::remove_file(&path);
+        let mut f = match OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                // SAFETY: `mutex` is the live handle we just acquired; close it once.
+                unsafe { CloseHandle(mutex) };
+                return Err(LockError::Io(e));
             }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                if holder_is_alive(&path) {
-                    return Err(LockError::AlreadyRunning);
+        };
+        let _ = write!(f, "{}", std::process::id());
+        return Ok(InstanceLock { path, mutex });
+    }
+
+    #[cfg(not(windows))]
+    {
+        loop {
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut f) => {
+                    // Best-effort PID stamp — only ever read by a later launch's
+                    // liveness check; an empty/short write just makes the lock look
+                    // reclaimable.
+                    let _ = write!(f, "{}", std::process::id());
+                    return Ok(InstanceLock { path });
                 }
-                // Stale holder: remove and retry. A NotFound means another launch
-                // already reclaimed it — re-loop and re-contend cleanly.
-                match fs::remove_file(&path) {
-                    Ok(()) => continue,
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                    Err(e) => return Err(LockError::Io(e)),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    if holder_is_alive(&path) {
+                        return Err(LockError::AlreadyRunning);
+                    }
+                    // Stale holder: remove and retry. A NotFound means another launch
+                    // already reclaimed it — re-loop and re-contend cleanly.
+                    match fs::remove_file(&path) {
+                        Ok(()) => continue,
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                        Err(e) => return Err(LockError::Io(e)),
+                    }
                 }
+                Err(e) => return Err(LockError::Io(e)),
             }
-            Err(e) => return Err(LockError::Io(e)),
         }
     }
 }
 
+/// The single-instance lockfile path for `root` — for user-facing diagnostics: naming
+/// the file to delete in the Windows stale-lock recovery dialog (#196). Windows-only,
+/// as that is its only consumer; the `desktop` gate mirrors its call site.
+#[cfg(windows)]
+#[cfg_attr(not(feature = "desktop"), allow(dead_code))]
+pub fn lock_path(root: &Path) -> PathBuf {
+    root.join(LOCK_FILE)
+}
+
+/// Create/acquire the `Global` named mutex keyed on `root` (#196). Returns the owned
+/// handle on a clean acquisition; [`LockError::AlreadyRunning`] when a live process
+/// already holds it (`ERROR_ALREADY_EXISTS`); [`LockError::Io`] if the OS call fails.
+#[cfg(windows)]
+fn acquire_root_mutex(root: &Path) -> Result<HANDLE, LockError> {
+    let name = root_mutex_name(root);
+    // SAFETY: `name` is a valid NUL-terminated UTF-16 buffer that outlives the call;
+    // a null security-attributes pointer and `0` (not initial owner) are the documented
+    // defaults for a plain named mutex.
+    let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+    if handle.is_null() {
+        return Err(LockError::Io(io::Error::last_os_error()));
+    }
+    // CreateMutexW returns a handle to the *existing* mutex (and sets last-error to
+    // ERROR_ALREADY_EXISTS) when another live process holds it — the OS having not yet
+    // released it proves that process is alive. Close our extra handle and refuse.
+    // SAFETY: called immediately after CreateMutexW with no intervening Win32 calls.
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        // SAFETY: `handle` is the live handle just returned; close it once.
+        unsafe { CloseHandle(handle) };
+        return Err(LockError::AlreadyRunning);
+    }
+    Ok(handle)
+}
+
+/// A per-root `Global` mutex name: `Global\daemonseed-<fnv1a64(path)>`. Distinct roots
+/// hash to distinct names, so the portable multi-instance story (different roots may
+/// run concurrently) is preserved. Canonicalize best-effort; fall back to the raw path.
+/// Returns a NUL-terminated UTF-16 buffer ready for `CreateMutexW`.
+#[cfg(windows)]
+fn root_mutex_name(root: &Path) -> Vec<u16> {
+    let canonical = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let h = fnv1a64(canonical.as_os_str().as_encoded_bytes());
+    let name = format!("Global\\daemonseed-{h:016x}");
+    name.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// FNV-1a 64-bit hash (std-only). Used solely to derive a stable, collision-resistant
+/// mutex name from a canonicalized path — not a security primitive.
+#[cfg(windows)]
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET_BASIS;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
 /// Whether the process named in the lockfile at `path` is alive. A
 /// missing/empty/unparseable lockfile is treated as NOT alive (reclaimable).
+///
+/// Non-Windows only: Windows keys liveness on the named mutex (#196), not the PID in
+/// the lockfile, and short-circuits before reaching this path.
+#[cfg(not(windows))]
 fn holder_is_alive(path: &Path) -> bool {
     match read_pid(path) {
         Some(pid) if pid == std::process::id() => true, // our own (shouldn't happen)
@@ -97,6 +219,7 @@ fn holder_is_alive(path: &Path) -> bool {
     }
 }
 
+#[cfg(not(windows))]
 fn read_pid(path: &Path) -> Option<u32> {
     let mut s = String::new();
     OpenOptions::new()
@@ -116,7 +239,9 @@ fn pid_alive(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }
 
-#[cfg(not(target_os = "linux"))]
+// macOS and other non-Linux, non-Windows targets. Windows uses the named mutex
+// (#196) and never reaches this; Linux uses `/proc` above.
+#[cfg(all(not(target_os = "linux"), not(windows)))]
 fn pid_alive(_pid: u32) -> bool {
     true
 }

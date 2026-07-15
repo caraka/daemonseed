@@ -79,6 +79,23 @@ arboard = "3"
 prost = { workspace = true }
 hex = { workspace = true }
 
+# Windows single-instance liveness (#196): a Global named mutex is the authoritative
+# "am I already running?" signal — the OS releases it on process death, so a lockfile
+# left by an unclean close is reclaimable (unlike the std-only `pid_alive -> true`
+# stub, which never reclaimed and silently blocked every later launch). Also
+# MessageBoxW to surface the stale-lock recovery hint on the no-console build. Pinned
+# to 0.61 to reuse the version already dominant in the lock tree.
+[target.'cfg(windows)'.dependencies]
+# `Win32_Security` is required in addition to `Win32_System_Threading`: windows-sys
+# only emits `CreateMutexW` when every type in its signature is enabled, and its
+# `*const SECURITY_ATTRIBUTES` parameter lives behind `Win32_Security`.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
 [build-dependencies]
 slint-build = { workspace = true }
 

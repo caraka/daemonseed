@@ -2414,12 +2414,54 @@ fn acquire_or_refuse(root: &std::path::Path) -> Option<single_instance::Instance
                 "daemonseed is already running for this profile root ({}); refusing to start a second instance.",
                 root.display()
             );
+            // On the Windows no-console build the eprintln above is invisible, so a
+            // stale lock (#196) reads as a silent no-start. Surface a native dialog
+            // naming the root, the lockfile, and the two recovery paths.
+            #[cfg(windows)]
+            show_already_running_dialog(root, &single_instance::lock_path(root));
             std::process::exit(1);
         }
         Err(e) => {
             eprintln!("single-instance guard unavailable, proceeding unguarded: {e}");
             None
         }
+    }
+}
+
+/// Native error dialog for a refused same-root launch (#196). The no-console Windows
+/// build has no visible stderr, so a stale lock left by an unclean close would read as
+/// a silent failure to start; this names the profile root, the `daemonseed.lock` path,
+/// that no other instance may actually be running, and the two recovery escapes.
+#[cfg(windows)]
+#[cfg_attr(not(feature = "desktop"), allow(dead_code))]
+fn show_already_running_dialog(root: &std::path::Path, lock: &std::path::Path) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
+
+    let body = format!(
+        "daemonseed appears to already be running for this profile:\n\n{}\n\n\
+         If no other daemonseed window is open, this is most likely a stale lock left \
+         by a previous session that closed uncleanly — no second instance is actually \
+         running.\n\n\
+         To recover, either:\n\n\
+         \u{2022}  delete the lock file:\n        {}\n\n\
+         \u{2022}  or start daemonseed with the  --portable  flag.",
+        root.display(),
+        lock.display(),
+    );
+    let text: Vec<u16> = body.encode_utf16().chain(std::iter::once(0)).collect();
+    let title: Vec<u16> = "daemonseed"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: both buffers are NUL-terminated and outlive the call; a null owner HWND
+    // is a valid ownerless message box. Return value (which button) is irrelevant.
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            text.as_ptr(),
+            title.as_ptr(),
+            MB_OK | MB_ICONERROR,
+        );
     }
 }
 
