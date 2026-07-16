@@ -1532,13 +1532,16 @@ fn fold_fetch_outcome(
         // `parked_retry_action` Fires on the next cursor tick against the newer advert's route
         // (current > parked). Without this the share strands Unresolved with an empty
         // `parked_retries` and never re-resolves — the F2 defect.
-        let re_parked = match shares.discovered.get_mut(&share_id) {
-            Some(disc) => {
-                disc.unresolved = true;
-                true
-            }
-            None => false,
-        };
+        // (#180 R4, CRSH-ISC-23) Re-park ONLY a share that is still Unresolved. A share a
+        // newer fetch already RESOLVED (unresolved == false) must be left resolved — a late
+        // stale outcome from an earlier-generation overlapping fetch must not revert it (the R4
+        // regression). A withdrawn share (absent) drops outright (CRSH-ISC-19). Do NOT set
+        // `unresolved = true` here: it is already true in the re-park case, and setting it is
+        // exactly what reverted an already-resolved share.
+        let re_parked = matches!(
+            shares.discovered.get(&share_id),
+            Some(disc) if disc.unresolved
+        );
         if re_parked {
             shares.parked_retries.insert(
                 share_id.clone(),
@@ -1551,7 +1554,8 @@ fn fold_fetch_outcome(
             );
         } else {
             daemonseed_veilid_net::vtrace!(
-                "tui fetch outcome for {share_id} stale via withdraw (gen {generation}) — dropped"
+                "tui fetch outcome for {share_id} stale (gen {generation}) — dropped \
+                 (share already resolved by a newer fetch, or withdrawn)"
             );
         }
         return;
@@ -3136,6 +3140,55 @@ mod tests {
         assert!(
             matches!(evt_rx.try_recv(), Ok(NetEvent::SharesSnapshot { .. })),
             "the re-park snapshots the still-Unresolved share to the UI"
+        );
+    }
+
+    // ── CRSH-ISC-23 (#180 R4): a resolved share is NOT reverted by a late stale outcome ──
+    /// R4 regression. Two overlapping different-generation browse fetches: a fetch at G+1 has
+    /// already SUCCEEDED, cleared Unresolved, and rendered the manifest; a slower earlier fetch
+    /// tagged G then folds stale. Pre-fix the stale branch unconditionally set `unresolved =
+    /// true` and re-parked, flipping the resolved share back to Unresolved and firing a
+    /// redundant fetch. Post-fix a stale outcome re-parks ONLY a still-unresolved share — a
+    /// resolved one is left resolved and the stale outcome is dropped.
+    #[test]
+    fn crsh_isc_23_resolved_share_is_not_reverted_by_a_late_stale_outcome() {
+        let (mut shares, share_id, _rk, _signer, _rc) = folded_share(38);
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+
+        // A newer fetch at G+1 already resolved the share: unresolved == false, generation G+1,
+        // no parked retry outstanding.
+        let g = shares.discovered.get(&share_id).unwrap().generation;
+        {
+            let disc = shares.discovered.get_mut(&share_id).unwrap();
+            disc.unresolved = false;
+            disc.generation = g + 1;
+        }
+        shares.parked_retries.remove(&share_id);
+
+        // The slower earlier fetch (tagged the OLD generation G) folds stale.
+        fold_fetch_outcome(
+            &mut shares,
+            &evt_tx,
+            FetchOutcome::ImportFailed {
+                share_id: share_id.clone(),
+                name: "demo-share".to_owned(),
+                generation: g, // stale: discovered is now g+1
+                message: "route dead".to_owned(),
+            },
+        );
+
+        // The resolved share is left resolved: NOT reverted, NO parked retry, NO snapshot.
+        assert!(
+            !shares.discovered.get(&share_id).unwrap().unresolved,
+            "a late stale outcome does not revert a share a newer fetch already resolved (R4)"
+        );
+        assert!(
+            !shares.parked_retries.contains_key(&share_id),
+            "no browse retry is re-parked for an already-resolved share"
+        );
+        assert!(
+            evt_rx.try_recv().is_err(),
+            "a resolved-stale outcome emits no snapshot"
         );
     }
 

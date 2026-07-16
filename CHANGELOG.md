@@ -51,6 +51,8 @@ work lives in the project lead's vault manifest, not here.
 - `daemonseed-{core,gui,tui}`: a verified withdraw releases the share's imported route (deferred past any in-flight download) and drops its route-guard entry, so no imported route leaks past withdraw and `route_guard` does not grow unbounded (#180, CRSH-ISC-26).
 - `daemonseed-core`: an identical advert re-read now refreshes `received_at` (while still folding `Unchanged`) so a continuously-reheard live share is not aged out by the catalog TTL prune (#180).
 - `daemonseed-veilid-net`: the spawned repair clears its in-flight marker via RAII (Drop) so a panic in the spawned repair cannot permanently disable a record's self-heal (#180).
+- `daemonseed-gui`: a manual Refresh queued during a busy/warmup window now heals the dead record when the repair queue drains — the Refresh arm survives the enqueue instead of being dropped as "recovered" (#180, CRSH-ISC-13).
+- `daemonseed-{gui,tui}`: a late stale fetch outcome no longer reverts a share that a newer overlapping fetch already resolved — a stale outcome re-parks only a still-unresolved share (#180, CRSH-ISC-23).
 
 ## [0.33.1] — 2026-07-15
 

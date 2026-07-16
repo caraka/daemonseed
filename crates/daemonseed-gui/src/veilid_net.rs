@@ -576,13 +576,15 @@ pub async fn veilid_net_actor(
                             weather,
                         };
                         let decision = session_health.observe(key.clone(), input);
-                        // (#180 §RS-4, CRSH-ISC-13/16) Consume this record's Refresh arm on
-                        // EVERY swept key: an armed record re-establishes on a SINGLE failed
-                        // pass in calm weather (evidence-gated, K lowered to 1 for the arm
-                        // only); an armed HEALTHY record clears the arm and re-establishes
-                        // nothing (anti-criterion CRSH-ISC-16). Un-armed cadence keeps the
-                        // K-consecutive path unchanged.
-                        let armed = refresh_armed.remove(&key);
+                        // (#180 §RS-4, CRSH-ISC-13/16) PEEK this record's Refresh arm — do NOT
+                        // consume it here. The arm's lifecycle is decided by the branch taken
+                        // (R1): consumed on immediate dispatch or on a not-due pass, but LEFT
+                        // IN PLACE when the repair is enqueued busy/warming so the drain can
+                        // honor it. An armed record re-establishes on a SINGLE failed pass in
+                        // calm weather (evidence-gated, K lowered to 1 for the arm only); an
+                        // armed HEALTHY record clears the arm and re-establishes nothing
+                        // (anti-criterion CRSH-ISC-16). Un-armed cadence is unchanged.
+                        let armed = refresh_armed.contains(&key);
                         if refresh_or_cadence_due(decision, armed, &input) {
                             // Step 3b re-establishment (§RS-1.2), shared verbatim by the
                             // cadence repair-due path and the §RS-4 single-failure override.
@@ -591,7 +593,7 @@ pub async fn veilid_net_actor(
                             // cadence-timed (CRSH-ISC-2). Warmup guard (§RS-1.3): no repair
                             // before the resweep warmup hand-off. One repair in flight at a
                             // time via `resweep_busy`; if busy or still warming, queue for the
-                            // next cadence drain (the tracker's latch de-dupes the enqueue).
+                            // next cadence drain.
                             let warmed = connected_at.is_some_and(|t| {
                                 t.elapsed() >= STEADY_RESWEEP_WARMUP_HANDOFF
                             });
@@ -602,6 +604,8 @@ pub async fn veilid_net_actor(
                                     if let (true, true, Some(handle)) =
                                         (warmed, free, net.as_ref())
                                     {
+                                        // Immediate dispatch: consume the arm now.
+                                        refresh_armed.remove(&key);
                                         session_health.note_repair_dispatched(&key);
                                         // (#180 F5, CRSH-ISC-24) If this key was already
                                         // enqueued on a prior busy tick, drop the stale copy
@@ -618,23 +622,42 @@ pub async fn veilid_net_actor(
                                             input.failed
                                         );
                                     } else if !pending_repairs.contains(&key) {
+                                        // (#180 R1) Busy/warming: queue the repair and LEAVE
+                                        // the arm in place — a §RS-4 armed record is not
+                                        // latched repair-due, so the drain must honor the
+                                        // surviving arm (else the queued repair is dropped as
+                                        // "recovered" and the dead record never heals).
                                         pending_repairs.push_back(key);
                                         daemonseed_veilid_net::vtrace!(
                                             "gui session-health: record repair-due — \
                                              queued (busy or warming)"
                                         );
                                     }
+                                    // else: already queued — the surviving arm (if any) stays
+                                    // in place for the existing entry's drain.
                                 }
-                                None => daemonseed_veilid_net::vtrace!(
-                                    "gui session-health: repair-due for an unmapped \
-                                     record key — cannot resolve owner seed"
-                                ),
+                                None => {
+                                    // Unmapped owner: cannot dispatch or enqueue, so the arm
+                                    // (if any) is consumed rather than left dangling.
+                                    refresh_armed.remove(&key);
+                                    daemonseed_veilid_net::vtrace!(
+                                        "gui session-health: repair-due for an unmapped \
+                                         record key — cannot resolve owner seed"
+                                    );
+                                }
                             }
-                        } else if matches!(decision, RepairDecision::Suppressed) {
-                            daemonseed_veilid_net::vtrace!(
-                                "gui session-health: repair-due suppressed (elevated \
-                                 weather) — will resume in calm"
-                            );
+                        } else {
+                            // (#180 R1) Not due (healthy pass, or elevated/Suppressed): consume
+                            // the arm. A healthy armed record clears its arm and re-establishes
+                            // nothing (CRSH-ISC-16); a weather-suppressed armed record likewise
+                            // clears and re-arms nothing.
+                            refresh_armed.remove(&key);
+                            if matches!(decision, RepairDecision::Suppressed) {
+                                daemonseed_veilid_net::vtrace!(
+                                    "gui session-health: repair-due suppressed (elevated \
+                                     weather) — will resume in calm"
+                                );
+                            }
                         }
                     }
                     // Everything else demuxes in handle_inbound (which only acts on Inbound).
@@ -709,17 +732,21 @@ pub async fn veilid_net_actor(
                     // before spending cadence ticks resweeping healthy ones. Drained one at
                     // a time, serialized with the resweep via `resweep_busy`.
                     if let Some(key) = pending_repairs.pop_front() {
-                        // (#180 F4/F5, CRSH-ISC-24) Re-check at drain: a record queued while
-                        // busy/warming may have RECOVERED before the queue drained (a
+                        // (#180 F4/F5/R1, CRSH-ISC-13/24) Re-check at drain. A record queued
+                        // while busy/warming may have RECOVERED before the queue drained (a
                         // successful sweep cleared its streak + latch), or already been
                         // dispatched by the immediate fold arm (which cleared its latch).
-                        // Either way the latch is now clear, so dispatching would needlessly
-                        // tear down and re-establish a healthy record (with REPAIR_CLOSE_FIRST
-                        // this closes a live record and can drop a message in the re-watch
-                        // gap). Dispatch only if it is STILL repair-due; otherwise the popped
-                        // entry is stale — drop it (pop_front already removed it from the
-                        // queue).
-                        if session_health.is_repair_due(&key) {
+                        // Either way, dispatching a recovered record would needlessly tear it
+                        // down and re-establish (with REPAIR_CLOSE_FIRST this closes a live
+                        // record and can drop a message in the re-watch gap). BUT a §RS-4
+                        // manual-Refresh arm is NOT latched repair-due (it lowers K to 1 for a
+                        // single failed pass), so a queued armed repair must also be honored
+                        // via its surviving arm — else the manual Refresh silently fails to
+                        // heal a dead record during busy/warmup (R1). Consume the arm here and
+                        // dispatch iff STILL latched cadence-repair-due OR armed; otherwise the
+                        // popped entry is stale — drop it (pop_front already removed it).
+                        let armed = refresh_armed.remove(&key);
+                        if drain_should_dispatch(session_health.is_repair_due(&key), armed) {
                             if let Some(&owner_seed) = record_key_owners.get(&key) {
                                 session_health.note_repair_dispatched(&key);
                                 spawn_repair(handle, &resweep_busy, owner_seed);
@@ -807,6 +834,17 @@ fn drain_route_releases(shares: &mut ShareState, net: &Option<VeilidNetHandle>) 
 fn refresh_or_cadence_due(decision: RepairDecision, armed: bool, input: &SweepHealthInput) -> bool {
     matches!(decision, RepairDecision::RepairDue)
         || (armed && input.is_failed_pass() && matches!(input.weather, Weather::Calm))
+}
+
+/// (#180 R1, CRSH-ISC-13/24) The `pending_repairs` drain dispatch gate: a queued repair is
+/// dispatched iff the record is STILL latched cadence-repair-due (the K-consecutive path
+/// survived the queue wait) **or** it carried a surviving §RS-4 Refresh `armed` flag. The arm
+/// is the second disjunct because a manual-Refresh-armed record is never latched repair-due
+/// (the arm lowers K to 1 for a single failed pass); without honoring it the drain drops an
+/// armed queued repair as "recovered" and the dead record never heals during a busy/warmup
+/// window — the R1 regression. `false` drops the popped entry (recovered AND un-armed).
+fn drain_should_dispatch(is_repair_due: bool, armed: bool) -> bool {
+    is_repair_due || armed
 }
 
 /// (#180 §RS-4, CRSH-ISC-13/16/20) The manual Refresh contract — the user-consented
@@ -2659,13 +2697,16 @@ fn fold_fetch_outcome(
         // `parked_retry_action` Fires on the next cursor tick against the newer advert's route
         // (current > parked). Without this the share strands Unresolved with an empty
         // `parked_retries` and never re-resolves — the F2 defect.
-        let re_parked = match shares.discovered.get_mut(&share_id) {
-            Some(disc) => {
-                disc.unresolved = true;
-                true
-            }
-            None => false,
-        };
+        // (#180 R4, CRSH-ISC-23) Re-park ONLY a share that is still Unresolved. A share a
+        // newer fetch already RESOLVED (unresolved == false) must be left resolved — a late
+        // stale outcome from an earlier-generation overlapping fetch must not revert it (the R4
+        // regression). A withdrawn share (absent) drops outright (CRSH-ISC-19). Do NOT set
+        // `unresolved = true` here: it is already true in the re-park case, and setting it is
+        // exactly what reverted an already-resolved share.
+        let re_parked = matches!(
+            shares.discovered.get(&share_id),
+            Some(disc) if disc.unresolved
+        );
         if re_parked {
             shares.parked_retries.insert(
                 share_id.clone(),
@@ -2680,7 +2721,8 @@ fn fold_fetch_outcome(
             );
         } else {
             daemonseed_veilid_net::vtrace!(
-                "gui fetch outcome for {share_id} stale via withdraw (gen {generation}) — dropped"
+                "gui fetch outcome for {share_id} stale (gen {generation}) — dropped \
+                 (share already resolved by a newer fetch, or withdrawn)"
             );
         }
         return;
@@ -4174,6 +4216,55 @@ mod tests {
         );
     }
 
+    // ── CRSH-ISC-23 (#180 R4): a resolved share is NOT reverted by a late stale outcome ──
+    /// R4 regression. Two overlapping different-generation browse fetches: a fetch at G+1 has
+    /// already SUCCEEDED, cleared Unresolved, and rendered the manifest; a slower earlier fetch
+    /// tagged G then folds stale. Pre-fix the stale branch unconditionally set `unresolved =
+    /// true` and re-parked, flipping the resolved share back to Unresolved and firing a
+    /// redundant fetch. Post-fix a stale outcome re-parks ONLY a still-unresolved share — a
+    /// resolved one is left resolved and the stale outcome is dropped.
+    #[test]
+    fn crsh_isc_23_resolved_share_is_not_reverted_by_a_late_stale_outcome() {
+        let (mut shares, share_id, _rk, _signer, _rc) = folded_share(38);
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+
+        // A newer fetch at G+1 already resolved the share: unresolved == false, generation G+1,
+        // no parked retry outstanding.
+        let g = shares.discovered.get(&share_id).unwrap().generation;
+        {
+            let disc = shares.discovered.get_mut(&share_id).unwrap();
+            disc.unresolved = false;
+            disc.generation = g + 1;
+        }
+        shares.parked_retries.remove(&share_id);
+
+        // The slower earlier fetch (tagged the OLD generation G) folds stale.
+        fold_fetch_outcome(
+            &mut shares,
+            &evt_tx,
+            FetchOutcome::ImportFailed {
+                share_id: share_id.clone(),
+                name: "demo-share".to_owned(),
+                generation: g, // stale: discovered is now g+1
+                message: "route dead".to_owned(),
+            },
+        );
+
+        // The resolved share is left resolved: NOT reverted, NO parked retry, NO snapshot.
+        assert!(
+            !shares.discovered.get(&share_id).unwrap().unresolved,
+            "a late stale outcome does not revert a share a newer fetch already resolved (R4)"
+        );
+        assert!(
+            !shares.parked_retries.contains_key(&share_id),
+            "no browse retry is re-parked for an already-resolved share"
+        );
+        assert!(
+            evt_rx.try_recv().is_err(),
+            "a resolved-stale outcome emits no snapshot"
+        );
+    }
+
     // ── CRSH-ISC-13/16: the §RS-4 Refresh re-establishment gate ───────────────────────
     /// [`refresh_or_cadence_due`] is the fold-arm core of the manual-Refresh contract and
     /// the CRSH-ISC-16 anti-criterion: an armed record re-establishes on a SINGLE failed
@@ -4245,6 +4336,131 @@ mod tests {
             false,
             &failed_calm
         ));
+    }
+
+    // ── CRSH-ISC-13 (#180 R1): an armed Refresh survives a busy enqueue; the drain honors it ──
+    /// R1 regression. A §RS-4 manual Refresh arms a record that is NOT latched repair-due (the
+    /// arm lowers K to 1 for a single failed pass). If the fold enqueues the repair because a
+    /// sweep is busy/warming, the arm must SURVIVE into `pending_repairs` so the drain
+    /// dispatches it — else `is_repair_due` (false) drops it as "recovered" and the dead record
+    /// never heals ("one action, no restart"). The fold/drain are inline in the actor loop; this
+    /// exercises the pure seams they compose — `refresh_or_cadence_due`, the
+    /// `SessionHealthTracker` latch, `drain_should_dispatch` — plus the `refresh_armed`
+    /// lifecycle (peek-on-fold, keep-on-enqueue, consume-on-dispatch/not-due, consume-at-drain).
+    /// Live end-to-end coverage is CRSH-ISC-12/13.
+    #[test]
+    fn crsh_isc_13_armed_refresh_survives_a_busy_enqueue_and_the_drain_honors_it() {
+        let failed_calm = SweepHealthInput {
+            attempted: 64,
+            failed: 64,
+            found: 0,
+            watch: WatchState::Unknown,
+            weather: Weather::Calm,
+        };
+        let healthy_calm = SweepHealthInput {
+            attempted: 64,
+            failed: 0,
+            found: 1,
+            watch: WatchState::Unknown,
+            weather: Weather::Calm,
+        };
+        let key = 0xD00Du64;
+
+        // (1) Armed dead record, sweep BUSY → fold enqueues, arm SURVIVES, drain dispatches.
+        {
+            let mut tracker: SessionHealthTracker<u64> = SessionHealthTracker::new();
+            let mut refresh_armed: HashSet<u64> = HashSet::new();
+            let mut pending_repairs: VecDeque<u64> = VecDeque::new();
+            refresh_armed.insert(key);
+            let decision = tracker.observe(key, failed_calm); // one failed pass < K
+            assert_eq!(
+                decision,
+                RepairDecision::NotDue,
+                "a single failed pass is below K — the record is never latched repair-due"
+            );
+            // Fold arm PEEKs the arm and finds the record due via the single-failure override.
+            let armed = refresh_armed.contains(&key);
+            assert!(refresh_or_cadence_due(decision, armed, &failed_calm));
+            // Busy/warming enqueue: push and LEAVE the arm in place (the R1 fix).
+            pending_repairs.push_back(key);
+            assert!(
+                refresh_armed.contains(&key),
+                "the arm SURVIVES the busy enqueue (R1) — not consumed at fold"
+            );
+            // Drain: consume the arm, dispatch iff still-due OR armed.
+            let popped = pending_repairs.pop_front().unwrap();
+            let armed_at_drain = refresh_armed.remove(&popped);
+            assert!(armed_at_drain, "the drain sees the surviving arm");
+            assert!(
+                !tracker.is_repair_due(&popped),
+                "the armed record was never latched cadence-repair-due"
+            );
+            assert!(
+                drain_should_dispatch(tracker.is_repair_due(&popped), armed_at_drain),
+                "the drain dispatches the armed repair (R1 restored)"
+            );
+        }
+
+        // (2) A recovered armed record (a successful sweep consumed the arm at the not-due
+        //     fold) is NOT dispatched at drain — Q4/F4 preserved.
+        {
+            let mut tracker: SessionHealthTracker<u64> = SessionHealthTracker::new();
+            let mut refresh_armed: HashSet<u64> = HashSet::new();
+            let mut pending_repairs: VecDeque<u64> = VecDeque::new();
+            refresh_armed.insert(key);
+            // A failed pass enqueues it, arm surviving.
+            let d1 = tracker.observe(key, failed_calm);
+            assert!(refresh_or_cadence_due(
+                d1,
+                refresh_armed.contains(&key),
+                &failed_calm
+            ));
+            pending_repairs.push_back(key); // arm left in place
+            // Then a SUCCESSFUL sweep folds not-due: the not-due fold arm consumes the arm.
+            let d2 = tracker.observe(key, healthy_calm);
+            assert!(!refresh_or_cadence_due(
+                d2,
+                refresh_armed.contains(&key),
+                &healthy_calm
+            ));
+            refresh_armed.remove(&key); // not-due branch consumes the arm
+            // Drain pops the stale queued entry: latch clear AND arm consumed → dropped.
+            let popped = pending_repairs.pop_front().unwrap();
+            let armed_at_drain = refresh_armed.remove(&popped);
+            assert!(
+                !armed_at_drain,
+                "a recovered record's arm was consumed by the not-due fold"
+            );
+            assert!(!tracker.is_repair_due(&popped));
+            assert!(
+                !drain_should_dispatch(tracker.is_repair_due(&popped), armed_at_drain),
+                "the drain drops the recovered queued repair (Q4/F4 preserved)"
+            );
+        }
+
+        // (3) A healthy armed record → arm consumed at the not-due fold, nothing enqueued
+        //     (CRSH-ISC-16: a Refresh over a healthy record emits no open/watch).
+        {
+            let mut tracker: SessionHealthTracker<u64> = SessionHealthTracker::new();
+            let mut refresh_armed: HashSet<u64> = HashSet::new();
+            let pending_repairs: VecDeque<u64> = VecDeque::new();
+            refresh_armed.insert(key);
+            let d = tracker.observe(key, healthy_calm);
+            assert_eq!(d, RepairDecision::NotDue);
+            assert!(
+                !refresh_or_cadence_due(d, refresh_armed.contains(&key), &healthy_calm),
+                "a healthy armed record is NOT due"
+            );
+            refresh_armed.remove(&key); // not-due branch consumes
+            assert!(
+                refresh_armed.is_empty(),
+                "a healthy Refresh consumes the arm (no re-establishment)"
+            );
+            assert!(
+                pending_repairs.is_empty(),
+                "and enqueues no repair (CRSH-ISC-16)"
+            );
+        }
     }
 
     // ── CRSH-ISC-5 (download-fail variant): a failed DOWNLOAD keeps the share listed ──────
