@@ -43,6 +43,7 @@ work lives in the project lead's vault manifest, not here.
 - `daemonseed-gui`: Windows reclaims a stale single-instance lock via a per-root `Global` named mutex, and surfaces a native recovery dialog on the no-console build instead of failing to start silently (#196).
 - `daemonseed-veilid-net`: the steady resweep surfaces per-record GET accounting (attempted/failed/found) instead of swallowing GET errors into the empty-slot path — the enabling observability for consumer-side session-health (#180, CRSH-ISC-1).
 - `daemonseed-{gui,tui}`: a share fetch runs off the net-actor loop — spawned, with its outcome folded back on-loop as a generation-tagged event — so a slow or failing fetch can no longer starve chat delivery (#180, CRSH-ISC-7/8).
+- `daemonseed-core`: an identical advert re-read (same owner, timestamp, and metadata) now folds as `CatalogChange::Unchanged`, so the consumer's steady resweep no longer spuriously bumps the discovered-entry generation; a same-metadata newer-timestamp re-announce still folds `Updated` (#180, CRSH-ISC-21).
 
 ## [0.33.1] — 2026-07-15
 

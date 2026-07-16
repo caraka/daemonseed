@@ -218,6 +218,22 @@ impl ShareCatalog {
                 // here — that is exactly the reopening the binding check closes.
                 Some(cur) if ann.sender_pubkey != cur.sender_pubkey => CatalogChange::Unchanged,
                 Some(cur) if ann.sent_unix_ms < cur.announced_unix_ms => CatalogChange::Unchanged,
+                // (#180 F3) An identical re-read — same owner, same timestamp, same
+                // metadata — carries no new information (a genuine re-announce/route
+                // rotation always bumps the timestamp, published atomically with the
+                // route blob), so fold it as Unchanged to stop the consumer's steady
+                // resweep spuriously bumping the discovered-entry generation. The pubkey
+                // is already proven equal by the arm above; a NEWER-timestamp re-announce
+                // (same metadata) still falls through to the Updated arm below — that is
+                // the self-heal's re-advertise trigger and MUST keep folding Updated.
+                Some(cur)
+                    if ann.sent_unix_ms == cur.announced_unix_ms
+                        && ann.name == cur.name
+                        && ann.rating == cur.rating
+                        && ann.sender_handle == cur.sender_handle =>
+                {
+                    CatalogChange::Unchanged
+                }
                 Some(cur) => {
                     cur.name = ann.name.clone();
                     cur.rating = ann.rating.clone();
@@ -399,6 +415,82 @@ mod tests {
         );
         assert_eq!(cat.len(), 1);
         assert_eq!(cat.entries()[0].name, "docs v2");
+    }
+
+    /// #180 F3: an identical re-read (same owner + timestamp + metadata) folds as
+    /// Unchanged — the consumer's steady resweep re-reading the same advert every
+    /// cycle must not spuriously bump the discovered-entry generation.
+    #[test]
+    fn identical_reread_folds_unchanged() {
+        let mut cat = ShareCatalog::new(Duration::from_secs(60));
+        let t0 = Instant::now();
+        assert_eq!(
+            cat.apply(&announcement("a", "docs", false, 100), t0),
+            CatalogChange::Added
+        );
+        // Re-reading the exact same advert (same sent_unix_ms + metadata) later in
+        // wall-clock time is a no-op — no new information, no state mutation.
+        let before = cat.entries()[0].received_at;
+        assert_eq!(
+            cat.apply(
+                &announcement("a", "docs", false, 100),
+                t0 + Duration::from_secs(1)
+            ),
+            CatalogChange::Unchanged
+        );
+        // Unchanged must not mutate state — received_at is untouched.
+        assert_eq!(cat.entries()[0].received_at, before);
+        assert_eq!(cat.len(), 1);
+    }
+
+    /// #180 F3 (crux): a genuine re-announce carries the SAME metadata with a
+    /// FRESHER timestamp and MUST still fold as Updated — that is the self-heal's
+    /// re-advertise trigger. The identity gate keys on timestamp equality, not
+    /// metadata-only.
+    #[test]
+    fn same_metadata_newer_timestamp_reannounce_folds_updated() {
+        let mut cat = ShareCatalog::new(Duration::from_secs(60));
+        let t0 = Instant::now();
+        cat.apply(&announcement("a", "docs", false, 100), t0);
+        assert_eq!(
+            cat.apply(
+                &announcement("a", "docs", false, 200),
+                t0 + Duration::from_secs(1)
+            ),
+            CatalogChange::Updated
+        );
+        assert_eq!(cat.entries()[0].announced_unix_ms, 200);
+    }
+
+    /// #180 F3: at an EQUAL timestamp, any real metadata difference (name, rating,
+    /// or sender_handle) still folds as Updated — only a total identity is Unchanged.
+    #[test]
+    fn equal_timestamp_differing_metadata_folds_updated() {
+        let t0 = Instant::now();
+        // Differing name.
+        let mut cat = ShareCatalog::new(Duration::from_secs(60));
+        cat.apply(&announcement("a", "docs", false, 100), t0);
+        assert_eq!(
+            cat.apply(&announcement("a", "docs v2", false, 100), t0),
+            CatalogChange::Updated
+        );
+        assert_eq!(cat.entries()[0].name, "docs v2");
+
+        // Differing rating (same name + timestamp).
+        let mut cat = ShareCatalog::new(Duration::from_secs(60));
+        cat.apply(&announcement("a", "docs", false, 100), t0);
+        let mut diff_rating = announcement("a", "docs", false, 100);
+        diff_rating.rating = "R".to_owned();
+        assert_eq!(cat.apply(&diff_rating, t0), CatalogChange::Updated);
+        assert_eq!(cat.entries()[0].rating, "R");
+
+        // Differing sender_handle (same name + rating + timestamp + owner pubkey).
+        let mut cat = ShareCatalog::new(Duration::from_secs(60));
+        cat.apply(&announcement("a", "docs", false, 100), t0);
+        let mut diff_handle = announcement("a", "docs", false, 100);
+        diff_handle.sender_handle = "river-otter#112233445566".to_owned();
+        assert_eq!(cat.apply(&diff_handle, t0), CatalogChange::Updated);
+        assert_eq!(cat.entries()[0].sender_handle, "river-otter#112233445566");
     }
 
     #[test]
