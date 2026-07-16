@@ -45,6 +45,7 @@ work lives in the project lead's vault manifest, not here.
 - `daemonseed-{gui,tui}`: a share fetch runs off the net-actor loop — spawned, with its outcome folded back on-loop as a generation-tagged event — so a slow or failing fetch can no longer starve chat delivery (#180, CRSH-ISC-7/8).
 - `daemonseed-veilid-net`: a `RepairRendezvous` is dispatched off the transport actor loop (spawned, not awaited inline) so a slow repair's close/open/watch/sweep no longer stalls chat and joins; a per-record in-flight guard skips a re-dispatch for a record already repairing (#180, CRSH-ISC-22).
 - `daemonseed-core`: an identical advert re-read (same owner, timestamp, and metadata) now folds as `CatalogChange::Unchanged`, so the consumer's steady resweep no longer spuriously bumps the discovered-entry generation; a same-metadata newer-timestamp re-announce still folds `Updated` (#180, CRSH-ISC-21).
+- `daemonseed-{gui,tui}`: a fetch outcome that goes stale because a fresh advert advanced the discovered-entry generation now re-parks a browse retry at the outcome's generation (it was dropped, stranding the share permanently `Unresolved`); a stale outcome for a withdrawn share still drops (#180, CRSH-ISC-23).
 
 ## [0.33.1] — 2026-07-15
 

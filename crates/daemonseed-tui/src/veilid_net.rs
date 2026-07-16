@@ -1459,10 +1459,14 @@ where
     });
 }
 
-/// (#180 §RS-2, CRSH-ISC-8/19, §RS-3) Fold a spawned fetch's outcome back on the actor loop.
-/// A **stale-generation** outcome no-ops (the discovered entry was withdrawn or a fresh
-/// advert folded while the fetch was in flight — CRSH-ISC-19), so a dead manifest never
-/// renders and a route fetched over a superseded advert never drives UI. On a live outcome:
+/// (#180 §RS-2, CRSH-ISC-8/19/23, §RS-3) Fold a spawned fetch's outcome back on the actor
+/// loop. A **stale-generation** outcome drops its manifest/route (a dead manifest never
+/// renders and a route fetched over a superseded advert never drives UI), but the two
+/// staleness causes diverge on the parked retry (CRSH-ISC-23, #180 F2): a WITHDRAWN entry
+/// (gone from `discovered`) drops outright, while a fresh advert advancing the generation
+/// mid-fetch re-parks a one-shot retry at the outcome's generation so a cursor tick fires it
+/// against the newer advert — the share is never stranded Unresolved-without-a-retry. On a
+/// live outcome:
 /// success clears the Unresolved mark + emits `FetchManifest`; either failure marks the
 /// share Unresolved (local only, never a prune). Every folded outcome closes out the fetch
 /// on the in-use guard (`note_fetch_finished`, CRSH-ISC-10): the imported route is recorded
@@ -1474,34 +1478,64 @@ fn fold_fetch_outcome(
     evt_tx: &UnboundedSender<NetEvent>,
     outcome: FetchOutcome,
 ) {
-    let (share_id, generation) = match &outcome {
+    let (share_id, generation, name) = match &outcome {
         FetchOutcome::Manifest {
             share_id,
             generation,
+            name,
             ..
         }
         | FetchOutcome::ImportFailed {
             share_id,
             generation,
+            name,
             ..
         }
         | FetchOutcome::ManifestFailed {
             share_id,
             generation,
+            name,
             ..
-        } => (share_id.clone(), *generation),
+        } => (share_id.clone(), *generation, name.clone()),
     };
-    // CRSH-ISC-19: the outcome is valid only against the exact discovered-entry generation
-    // it was fetched over. A withdraw (entry gone) or a fresh advert fold (generation
-    // advanced) mid-fetch makes the outcome stale → drop it, including any imported route
-    // (the LRU/expiry is the backstop). The fetch still closes on the guard so its in-flight
-    // count is released (else a deferred route would never flush).
+    // CRSH-ISC-19/23 (#180 F2): the outcome is valid only against the exact discovered-entry
+    // generation it was fetched over. A withdraw (entry gone) or a fresh advert fold
+    // (generation advanced) mid-fetch makes the outcome stale → drop the outcome + any
+    // imported route (the LRU/expiry is the backstop). The fetch still closes on the guard so
+    // its in-flight count is released (else a deferred route would never flush).
     if shares.discovered.get(&share_id).map(|d| d.generation) != Some(generation) {
         let released = shares.route_guard.note_fetch_finished(&share_id, None);
         shares.pending_route_releases.extend(released);
-        daemonseed_veilid_net::vtrace!(
-            "tui fetch outcome for {share_id} is stale (gen {generation}) — no-op"
-        );
+        // CRSH-ISC-23 (#180 F2): staleness has two causes and they diverge. If the entry is
+        // GONE (withdrawn) the drop is correct — the share is removed (CRSH-ISC-19). But if
+        // the entry is STILL discovered and only its generation advanced (a FRESH ADVERT
+        // folded mid-fetch), the share is genuinely still Unresolved: re-park a one-shot retry
+        // at the OUTCOME's `generation` (strictly below the current generation) so
+        // `parked_retry_action` Fires on the next cursor tick against the newer advert's route
+        // (current > parked). Without this the share strands Unresolved with an empty
+        // `parked_retries` and never re-resolves — the F2 defect.
+        let re_parked = match shares.discovered.get_mut(&share_id) {
+            Some(disc) => {
+                disc.unresolved = true;
+                true
+            }
+            None => false,
+        };
+        if re_parked {
+            shares.parked_retries.insert(
+                share_id.clone(),
+                ParkedBrowseRetry::park(name, generation, Instant::now()),
+            );
+            emit_shares_snapshot(shares, evt_tx);
+            daemonseed_veilid_net::vtrace!(
+                "tui fetch outcome for {share_id} stale via fresh advert (gen {generation}) \
+                 — re-parked one-shot retry (still Unresolved)"
+            );
+        } else {
+            daemonseed_veilid_net::vtrace!(
+                "tui fetch outcome for {share_id} stale via withdraw (gen {generation}) — dropped"
+            );
+        }
         return;
     }
     match outcome {
@@ -2908,36 +2942,17 @@ mod tests {
         }
     }
 
-    // ── CRSH-ISC-19: a stale-generation fetch outcome no-ops on fold ───────────────────
-    /// The generation gate in `fold_fetch_outcome` runs before the variant match, so a
-    /// stale outcome (its captured generation no longer matches the discovered entry) is
-    /// dropped: no Unresolved mark, no event. A live-generation outcome takes effect.
+    // ── CRSH-ISC-19: a WITHDRAW-stale fetch outcome drops, never re-parks ──────────────
+    /// A live-generation failure takes effect (Unresolved + parked retry); then the share is
+    /// WITHDRAWN and a stale outcome folds — it MUST drop: no re-park against a gone share, no
+    /// resurrection, no event. The fresh-advert half (which now re-parks) is CRSH-ISC-23.
     #[test]
-    fn crsh_isc_19_stale_generation_fetch_outcome_no_ops() {
+    fn crsh_isc_19_withdraw_staleness_drops_without_re_parking() {
         let (mut shares, share_id, _rk, _signer, _rc) = folded_share(36);
         let (evt_tx, mut evt_rx) = unbounded_channel();
         let live_gen = shares.discovered.get(&share_id).unwrap().generation;
 
-        fold_fetch_outcome(
-            &mut shares,
-            &evt_tx,
-            FetchOutcome::ImportFailed {
-                share_id: share_id.clone(),
-                name: "demo".to_owned(),
-                generation: live_gen.wrapping_sub(1),
-                message: "stale".to_owned(),
-            },
-        );
-        assert!(
-            !shares.discovered.get(&share_id).unwrap().unresolved,
-            "a stale outcome does not mark the share Unresolved"
-        );
-        assert!(
-            !shares.parked_retries.contains_key(&share_id),
-            "a stale outcome parks no retry"
-        );
-        assert!(evt_rx.try_recv().is_err(), "a stale outcome emits no event");
-
+        // A live-generation outcome takes effect: mark Unresolved + park a one-shot retry.
         fold_fetch_outcome(
             &mut shares,
             &evt_tx,
@@ -2955,6 +2970,91 @@ mod tests {
         assert!(
             shares.parked_retries.contains_key(&share_id),
             "a live failure outcome parks a one-shot retry"
+        );
+        while evt_rx.try_recv().is_ok() {} // drain the live-path events (SharesSnapshot + FetchError)
+
+        // The share is WITHDRAWN mid-flight; a stale outcome folds. The entry is gone, so the
+        // drop is correct: NO re-park, no resurrection, no event.
+        shares.parked_retries.remove(&share_id);
+        shares.discovered.remove(&share_id);
+        fold_fetch_outcome(
+            &mut shares,
+            &evt_tx,
+            FetchOutcome::ImportFailed {
+                share_id: share_id.clone(),
+                name: "demo".to_owned(),
+                generation: live_gen,
+                message: "stale-withdrawn".to_owned(),
+            },
+        );
+        assert!(
+            !shares.parked_retries.contains_key(&share_id),
+            "a withdrawn share's stale outcome re-parks NOTHING (CRSH-ISC-19)"
+        );
+        assert!(
+            !shares.discovered.contains_key(&share_id),
+            "the stale fold does not resurrect the withdrawn entry"
+        );
+        assert!(
+            evt_rx.try_recv().is_err(),
+            "a withdrawn-stale outcome emits no snapshot"
+        );
+    }
+
+    // ── CRSH-ISC-23 (#180 F2): fresh-advert staleness re-parks the browse retry ────────
+    /// A parked retry FIRED at generation G (removing itself) and re-fetched; while that fetch
+    /// was in flight a FRESH ADVERT folded, advancing the discovered generation to G+1. The
+    /// in-flight outcome folds stale (tagged G, entry now G+1). Pre-fix it was dropped,
+    /// stranding the share Unresolved-with-no-retry forever. Post-fix it re-parks at the
+    /// OUTCOME's generation G so a cursor tick Fires it against the newer advert (G+1 > G).
+    #[test]
+    fn crsh_isc_23_fresh_advert_staleness_re_parks_the_browse_retry() {
+        let (mut shares, share_id, _rk, _signer, _rc) = folded_share(37);
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+
+        let g = shares.discovered.get(&share_id).unwrap().generation;
+        {
+            let disc = shares.discovered.get_mut(&share_id).unwrap();
+            disc.unresolved = true;
+            disc.generation = g + 1;
+        }
+        assert!(
+            shares.parked_retries.is_empty(),
+            "precondition: the fired retry left parked_retries empty"
+        );
+
+        fold_fetch_outcome(
+            &mut shares,
+            &evt_tx,
+            FetchOutcome::ImportFailed {
+                share_id: share_id.clone(),
+                name: "demo-share".to_owned(),
+                generation: g, // stale: discovered is now g+1
+                message: "route dead".to_owned(),
+            },
+        );
+
+        let disc = shares.discovered.get(&share_id).unwrap();
+        assert!(
+            disc.unresolved,
+            "the share stays Unresolved after the stale fold"
+        );
+        let parked = shares
+            .parked_retries
+            .get(&share_id)
+            .expect("a browse retry was re-parked (dropped pre-fix, stranding the share)");
+        assert_eq!(
+            parked.parked_generation, g,
+            "re-parked at the OUTCOME's generation, not the current"
+        );
+        assert_eq!(
+            parked_retry_action(parked, Some(disc.generation), Instant::now()),
+            ParkedRetryAction::Fire,
+            "process_parked_browse_retries Fires it next tick against the newer advert (g+1 > g)"
+        );
+        assert!(
+            matches!(evt_rx.try_recv(), Ok(NetEvent::SharesSnapshot { .. })),
+            "the re-park snapshots the still-Unresolved share to the UI"
         );
     }
 
