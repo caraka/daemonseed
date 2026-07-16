@@ -232,6 +232,16 @@ impl ShareCatalog {
                         && ann.rating == cur.rating
                         && ann.sender_handle == cur.sender_handle =>
                 {
+                    // (#180 R2) Re-hearing keeps the share alive for the TTL prune
+                    // (`received_at` is the liveness clock the prune ages against), but it
+                    // carries no new content — refresh `received_at` yet fold `Unchanged` so
+                    // the frontend skips the generation bump. The two behaviours (liveness
+                    // re-hearing vs content-change signalling) are separated: a sharer's
+                    // watchdog republishes the SAME sealed advert (only the route blob
+                    // rotates) every ~150s, so without this the steady resweep always folds
+                    // `Unchanged`, `received_at` freezes at discovery time, and the ~600s TTL
+                    // prune ages out a live, actively-reswept share.
+                    cur.received_at = now;
                     CatalogChange::Unchanged
                 }
                 Some(cur) => {
@@ -417,30 +427,72 @@ mod tests {
         assert_eq!(cat.entries()[0].name, "docs v2");
     }
 
-    /// #180 F3: an identical re-read (same owner + timestamp + metadata) folds as
+    /// #180 F3/R2: an identical re-read (same owner + timestamp + metadata) folds as
     /// Unchanged — the consumer's steady resweep re-reading the same advert every
-    /// cycle must not spuriously bump the discovered-entry generation.
+    /// cycle must not spuriously bump the discovered-entry generation — BUT it
+    /// refreshes `received_at` (re-hearing keeps the share alive for the TTL prune).
     #[test]
-    fn identical_reread_folds_unchanged() {
+    fn identical_reread_refreshes_received_at_but_folds_unchanged() {
         let mut cat = ShareCatalog::new(Duration::from_secs(60));
         let t0 = Instant::now();
         assert_eq!(
             cat.apply(&announcement("a", "docs", false, 100), t0),
             CatalogChange::Added
         );
-        // Re-reading the exact same advert (same sent_unix_ms + metadata) later in
-        // wall-clock time is a no-op — no new information, no state mutation.
         let before = cat.entries()[0].received_at;
+        // Re-reading the exact same advert (same sent_unix_ms + metadata) later in
+        // wall-clock time folds Unchanged (no generation bump)…
+        let t1 = t0 + Duration::from_secs(1);
         assert_eq!(
-            cat.apply(
-                &announcement("a", "docs", false, 100),
-                t0 + Duration::from_secs(1)
-            ),
+            cat.apply(&announcement("a", "docs", false, 100), t1),
             CatalogChange::Unchanged
         );
-        // Unchanged must not mutate state — received_at is untouched.
-        assert_eq!(cat.entries()[0].received_at, before);
+        // …but received_at IS advanced to the re-read's `now` — re-hearing keeps the
+        // share alive for the TTL prune (R2). Without this the prune would age out a
+        // continuously-reheard live share.
+        assert_eq!(cat.entries()[0].received_at, t1);
+        assert!(cat.entries()[0].received_at > before);
         assert_eq!(cat.len(), 1);
+    }
+
+    /// #180 R2: a continuously-reheard live share is NOT aged out by the TTL prune.
+    /// The identical re-read refreshes `received_at` (folding Unchanged), so a share
+    /// reheard within the TTL survives a prune whose window since discovery exceeds
+    /// the TTL — while a share never reheard is pruned after the TTL.
+    #[test]
+    fn reheard_share_survives_ttl_prune() {
+        let ttl = Duration::from_secs(60);
+        let mut cat = ShareCatalog::new(ttl);
+        let t0 = Instant::now();
+        cat.apply(&announcement("a", "docs", false, 100), t0);
+
+        // Re-hear the identical advert just under the TTL (folds Unchanged, refreshes
+        // received_at to t_reread).
+        let t_reread = t0 + Duration::from_secs(50);
+        assert_eq!(
+            cat.apply(&announcement("a", "docs", false, 100), t_reread),
+            CatalogChange::Unchanged
+        );
+
+        // Now prune at a time where elapsed since DISCOVERY > TTL (70s > 60s) but
+        // elapsed since the RE-READ < TTL (20s < 60s): the reheard share must survive.
+        let t_prune = t0 + Duration::from_secs(70);
+        assert_eq!(
+            cat.prune(t_prune),
+            0,
+            "a reheard live share must not be pruned"
+        );
+        assert_eq!(cat.len(), 1);
+
+        // Contrast: an identical share never reheard IS pruned once the TTL elapses.
+        let mut cold = ShareCatalog::new(ttl);
+        cold.apply(&announcement("a", "docs", false, 100), t0);
+        assert_eq!(
+            cold.prune(t_prune),
+            1,
+            "a share never reheard is aged out after the TTL"
+        );
+        assert!(cold.is_empty());
     }
 
     /// #180 F3 (crux): a genuine re-announce carries the SAME metadata with a

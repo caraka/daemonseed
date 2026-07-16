@@ -49,6 +49,8 @@ work lives in the project lead's vault manifest, not here.
 - `daemonseed-{gui,tui}`: a queued repair is re-checked when the queue drains — a record whose session recovered while queued is dropped rather than spuriously re-established — and an immediately-dispatched record is removed from the queue so it is never double-repaired (#180, CRSH-ISC-24).
 - `daemonseed-{gui,tui}`: a successful download now clears the share's `Unresolved` mark and its parked browse retry (it was left stranded "re-resolving", and the stale retry fired a redundant browse fetch) (#180, CRSH-ISC-25).
 - `daemonseed-{core,gui,tui}`: a verified withdraw releases the share's imported route (deferred past any in-flight download) and drops its route-guard entry, so no imported route leaks past withdraw and `route_guard` does not grow unbounded (#180, CRSH-ISC-26).
+- `daemonseed-core`: an identical advert re-read now refreshes `received_at` (while still folding `Unchanged`) so a continuously-reheard live share is not aged out by the catalog TTL prune (#180).
+- `daemonseed-veilid-net`: the spawned repair clears its in-flight marker via RAII (Drop) so a panic in the spawned repair cannot permanently disable a record's self-heal (#180).
 
 ## [0.33.1] — 2026-07-15
 

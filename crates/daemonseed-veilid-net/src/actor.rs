@@ -29,6 +29,26 @@ use crate::schedule::{
 };
 use crate::{discovery, identity, rendezvous, share};
 
+/// RAII guard clearing a record's repair-in-flight marker on Drop (#180 CRSH-ISC-22).
+/// Held by the spawned `RepairRendezvous` task; its Drop runs on BOTH normal
+/// completion AND panic-unwind, so a panic inside `repair_rendezvous` (or the veilid
+/// code it awaits) cannot leave `owner_seed` stuck in the in-flight set — which would
+/// make every future `RepairRendezvous` for that record hit `!set.insert(..)` and be
+/// skipped, permanently disabling that record's self-heal until app restart.
+struct RepairInFlightGuard {
+    set: Arc<Mutex<HashSet<[u8; 32]>>>,
+    key: [u8; 32],
+}
+
+impl Drop for RepairInFlightGuard {
+    fn drop(&mut self) {
+        self.set
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.key);
+    }
+}
+
 /// How a presence current-state write is classified in the WB-3 funnel (WB-1).
 /// The write itself is always a last-writer-wins current-state beacon at the
 /// member's slot; the boundary decides its priority class and whether it dominates
@@ -1039,6 +1059,14 @@ async fn actor_loop(
                 let dht_gate = dht_gate.clone();
                 let repair_in_flight = repair_in_flight.clone();
                 tokio::spawn(async move {
+                    // RAII: the guard clears the in-flight marker on Drop, which runs on
+                    // BOTH normal completion AND panic-unwind (CRSH-ISC-22) — so a panic in
+                    // `repair_rendezvous` cannot leave a stale marker that permanently skips
+                    // (disables) this record's future self-heal.
+                    let _guard = RepairInFlightGuard {
+                        set: repair_in_flight,
+                        key: owner_seed,
+                    };
                     let res = repair_rendezvous(
                         &api,
                         &rc,
@@ -1049,13 +1077,9 @@ async fn actor_loop(
                         owner_seed,
                     )
                     .await;
-                    // Clear the in-flight marker before replying so a later repair for this
-                    // record is never spuriously skipped by a stale marker.
-                    repair_in_flight
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .remove(&owner_seed);
                     let _ = reply.send(res);
+                    // `_guard` drops here on normal return, or on panic-unwind — the marker
+                    // is cleared either way.
                 });
             }
             Command::RendezvousKey { owner_seed, reply } => {
@@ -2180,6 +2204,51 @@ mod tests {
         assert!(
             guard.lock().unwrap().insert(seed),
             "after the marker clears, a later repair for the record proceeds again"
+        );
+    }
+
+    // CRSH-ISC-22 (R2 re-review): the RAII guard clears the record's marker on Drop —
+    // the mechanism that survives a panic in the spawned repair.
+    #[test]
+    fn repair_in_flight_guard_clears_marker_on_drop() {
+        let set: Arc<Mutex<HashSet<[u8; 32]>>> = Arc::new(Mutex::new(HashSet::new()));
+        let key = [9u8; 32];
+        set.lock().unwrap().insert(key);
+        {
+            let _guard = RepairInFlightGuard {
+                set: set.clone(),
+                key,
+            };
+            assert!(
+                set.lock().unwrap().contains(&key),
+                "marker present while guard lives"
+            );
+        } // guard drops here
+        assert!(
+            !set.lock().unwrap().contains(&key),
+            "Drop must clear the record's in-flight marker"
+        );
+    }
+
+    // CRSH-ISC-22 (R2 re-review): a PANIC in the spawned closure still clears the
+    // marker, because Rust runs Drop on unwind — so a panicking repair cannot
+    // permanently disable a record's self-heal. The `JoinHandle` returns `Err`
+    // (panic isolated to the task), yet the marker is gone.
+    #[tokio::test]
+    async fn repair_in_flight_guard_clears_marker_on_panic() {
+        let set: Arc<Mutex<HashSet<[u8; 32]>>> = Arc::new(Mutex::new(HashSet::new()));
+        let key = [11u8; 32];
+        set.lock().unwrap().insert(key);
+        let set2 = set.clone();
+        let handle = tokio::spawn(async move {
+            let _guard = RepairInFlightGuard { set: set2, key };
+            panic!("simulated repair_rendezvous panic");
+        });
+        let joined = handle.await;
+        assert!(joined.is_err(), "the spawned task panicked");
+        assert!(
+            !set.lock().unwrap().contains(&key),
+            "Drop-on-unwind must clear the marker despite the panic"
         );
     }
 
