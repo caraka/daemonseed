@@ -93,7 +93,11 @@ impl SweepHealthInput {
     /// dead-session signature, distinct from a merely empty record. A dead watch
     /// (L2) counts the same. Any populated slot, or a clean pass with zero GET errors,
     /// is a *successful* pass (`!is_failed_pass`) and resets the streak.
-    fn is_failed_pass(&self) -> bool {
+    ///
+    /// **Public** so the §RS-4 manual-Refresh fold arm can reuse the exact failed-pass
+    /// predicate (CRSH-ISC-16): a Refresh-armed record re-establishes on a single failed
+    /// pass, and the gate must not duplicate this expression.
+    pub fn is_failed_pass(&self) -> bool {
         matches!(self.watch, WatchState::Dead)
             || (self.attempted > 0 && self.found == 0 && self.failed > 0)
     }
@@ -471,6 +475,57 @@ mod tests {
             RepairDecision::NotDue
         );
         run_episode(&mut t, key, 2); // back to base K = 2
+    }
+
+    /// `is_failed_pass` is part of the public surface (the gui §RS-4 Refresh fold arm
+    /// calls it — CRSH-ISC-16) and returns the documented values: a reached-but-empty
+    /// erroring pass and a dead watch are failed; a populated or clean pass is not.
+    #[test]
+    fn is_failed_pass_is_public_and_matches_the_documented_signature() {
+        // Reached, zero found, at least one GET error → failed pass (L1).
+        assert!(
+            SweepHealthInput {
+                attempted: 64,
+                failed: 64,
+                found: 0,
+                watch: WatchState::Unknown,
+                weather: Weather::Calm,
+            }
+            .is_failed_pass()
+        );
+        // Dead watch → failed pass (L2) regardless of the GET counts.
+        assert!(
+            SweepHealthInput {
+                attempted: 0,
+                failed: 0,
+                found: 0,
+                watch: WatchState::Dead,
+                weather: Weather::Calm,
+            }
+            .is_failed_pass()
+        );
+        // A populated slot → successful pass even with a stray GET error.
+        assert!(
+            !SweepHealthInput {
+                attempted: 64,
+                failed: 1,
+                found: 1,
+                watch: WatchState::Unknown,
+                weather: Weather::Calm,
+            }
+            .is_failed_pass()
+        );
+        // A clean pass with zero GET errors → successful pass.
+        assert!(
+            !SweepHealthInput {
+                attempted: 64,
+                failed: 0,
+                found: 0,
+                watch: WatchState::Unknown,
+                weather: Weather::Calm,
+            }
+            .is_failed_pass()
+        );
     }
 
     /// Distinct records track independently — one dead record does not flag another.

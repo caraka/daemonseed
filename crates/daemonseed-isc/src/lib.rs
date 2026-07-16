@@ -351,13 +351,16 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("CRSH-ISC-8", IscClass::Positive), // chat NetCommand processed before an in-flight FetchShare resolves (§RS-2)
     ("CRSH-ISC-7", IscClass::Negative), // anti: self-heal retry never delays chat past the I4 bound (§RS-2)
     ("CRSH-ISC-10", IscClass::Positive), // consumer route in-use guard + release_tolerant + dead_routes hygiene (§RS-3)
+    ("CRSH-ISC-13", IscClass::Positive), // manual Refresh runs the §RS-4 sweep-first + evidence-gated re-establishment contract (§RS-4)
+    ("CRSH-ISC-16", IscClass::Negative), // anti: Refresh over a healthy record emits only sweep GETs — no open/watch (§RS-4)
+    ("CRSH-ISC-20", IscClass::Negative), // anti: Refresh is exclusively user-initiated — no render/timer/tab path sends it (§RS-4)
 ];
 
 /// Total built, non-deferred ISCs tracked by this registry — the SINGLE source
 /// of truth for the coverage denominator, read live by `xtask isc-coverage`.
 /// Recount on every ISC add/remove (the `const _` assert below guards it
 /// against [`ISCS`]).
-pub const TOTAL: usize = 205;
+pub const TOTAL: usize = 208;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -549,20 +552,22 @@ mod tests {
         //                                  chat-never-waits / panic-recovery /
         //                                  telemetry-only / single-permit), #159/#168/#157)
         //                                  consumer route self-heal (#180):
-        //                                  CRSH-ISC-1/2/9/3/18/5/6/19/8/10 pos (sweep
+        //                                  CRSH-ISC-1/2/9/3/18/5/6/19/8/10/13 pos (sweep
         //                                  accounting, K-detection, weather gating,
         //                                  record_lock repair, chat serialization,
         //                                  Unresolved-not-prune, parked retry, generation,
-        //                                  chat-before-fetch, route-release hygiene) +
-        //                                  CRSH-ISC-11/14/17/4/15/7 neg (network-state-only
+        //                                  chat-before-fetch, route-release hygiene,
+        //                                  §RS-4 Refresh contract) +
+        //                                  CRSH-ISC-11/14/17/4/15/7/16/20 neg (network-state-only
         //                                  input, margin limiter, no-nested-permit,
         //                                  zero-network reactive, retry decorrelation,
-        //                                  fetch-never-delays-chat)
-        //   total   134 pos + 71 neg = 205
+        //                                  fetch-never-delays-chat, Refresh-healthy-sweep-only,
+        //                                  Refresh-user-initiated-only)
+        //   total   135 pos + 73 neg = 208
         //   (the v0.33.0 Veilid cutover retired 14 server-positive + 10
         //    server-negative relay/TLS/federation/rate-limit ISCs.)
-        assert_eq!(pos, 134, "positive count drift");
-        assert_eq!(neg, 71, "negative count drift");
+        assert_eq!(pos, 135, "positive count drift");
+        assert_eq!(neg, 73, "negative count drift");
     }
 
     /// COVERED is single-sourced and must agree with the per-milestone

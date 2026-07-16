@@ -494,6 +494,12 @@ pub async fn veilid_net_actor(
     // warmup: enqueued here (dedup by the tracker's latch) and drained one-at-a-time at
     // the cadence tick. One repair in flight at a time via `resweep_busy` (§RS-1.2).
     let mut pending_repairs: VecDeque<RecordKey> = VecDeque::new();
+    // (#180 §RS-4, CRSH-ISC-13/16) Records armed by the last manual Refresh for
+    // evidence-gated re-establishment: the SweepHealth fold arm consumes an arm on the
+    // record's next swept pass and re-establishes on a SINGLE failed pass in calm weather
+    // (lowering K to 1 for the arm only). A healthy armed record clears its arm and
+    // re-establishes nothing (CRSH-ISC-16). Filled only by `handle_refresh_shares`.
+    let mut refresh_armed: HashSet<RecordKey> = HashSet::new();
     // (#180 §RS-2, CRSH-ISC-8) Spawned share fetches report their generation-tagged outcome
     // here; the loop folds them on-loop (`fold_fetch_outcome`) so a slow/failing fetch never
     // parks the command loop and starves chat (#180 item 3). The actor holds a sender for
@@ -513,10 +519,21 @@ pub async fn veilid_net_actor(
                     connected_at = Some(Instant::now());
                     resweep_cursor = None;
                 }
-                handle_command(
-                    cmd, &evt_tx, &cmd_tx, &mut net, &mut ev_rx, &mut circles, &mut my_handle,
-                    &mut shares, &fetch_outcome_tx,
-                ).await;
+                // (#180 §RS-4, CRSH-ISC-13) The manual Refresh button drives loop-local
+                // state (resweep_busy, the record-key maps, refresh_armed) that the stateless
+                // command dispatcher cannot reach, so its §RS-4 contract runs here — the only
+                // path into the Refresh contract (CRSH-ISC-20).
+                if matches!(cmd, NetCommand::ResweepShares) {
+                    handle_refresh_shares(
+                        &evt_tx, &net, &shares, &circles, &resweep_busy,
+                        &mut record_key_owners, &mut resolved_seeds, &mut refresh_armed,
+                    ).await;
+                } else {
+                    handle_command(
+                        cmd, &evt_tx, &cmd_tx, &mut net, &mut ev_rx, &mut circles, &mut my_handle,
+                        &mut shares, &fetch_outcome_tx,
+                    ).await;
+                }
             }
             // (#180 §RS-2, CRSH-ISC-8/19) Fold a spawned fetch's generation-tagged outcome
             // on-loop: render the manifest / mark Unresolved / record the imported route. A
@@ -558,54 +575,58 @@ pub async fn veilid_net_actor(
                             watch: WatchState::Unknown,
                             weather,
                         };
-                        match session_health.observe(key.clone(), input) {
-                            RepairDecision::RepairDue => {
-                                // Step 3b: re-establish the record's session (§RS-1.2). The
-                                // SweepHealth carrying the K-th failed pass IS a cadence
-                                // (resweep-completion) tick, so an immediate dispatch here is
-                                // still cadence-timed (CRSH-ISC-2). Warmup guard (§RS-1.3): no
-                                // repair before the resweep warmup hand-off. One repair in
-                                // flight at a time via `resweep_busy`; if busy or still
-                                // warming, queue for the next cadence drain (the tracker's
-                                // latch de-dupes the enqueue).
-                                let warmed = connected_at.is_some_and(|t| {
-                                    t.elapsed() >= STEADY_RESWEEP_WARMUP_HANDOFF
-                                });
-                                match record_key_owners.get(&key).copied() {
-                                    Some(owner_seed) => {
-                                        let free = !resweep_busy
-                                            .load(std::sync::atomic::Ordering::Acquire);
-                                        if let (true, true, Some(handle)) =
-                                            (warmed, free, net.as_ref())
-                                        {
-                                            session_health.note_repair_dispatched(&key);
-                                            spawn_repair(handle, &resweep_busy, owner_seed);
-                                            daemonseed_veilid_net::vtrace!(
-                                                "gui session-health: repairing dead record \
-                                                 ({} failed) — re-establishing session",
-                                                input.failed
-                                            );
-                                        } else if !pending_repairs.contains(&key) {
-                                            pending_repairs.push_back(key);
-                                            daemonseed_veilid_net::vtrace!(
-                                                "gui session-health: record repair-due — \
-                                                 queued (busy or warming)"
-                                            );
-                                        }
+                        let decision = session_health.observe(key.clone(), input);
+                        // (#180 §RS-4, CRSH-ISC-13/16) Consume this record's Refresh arm on
+                        // EVERY swept key: an armed record re-establishes on a SINGLE failed
+                        // pass in calm weather (evidence-gated, K lowered to 1 for the arm
+                        // only); an armed HEALTHY record clears the arm and re-establishes
+                        // nothing (anti-criterion CRSH-ISC-16). Un-armed cadence keeps the
+                        // K-consecutive path unchanged.
+                        let armed = refresh_armed.remove(&key);
+                        if refresh_or_cadence_due(decision, armed, &input) {
+                            // Step 3b re-establishment (§RS-1.2), shared verbatim by the
+                            // cadence repair-due path and the §RS-4 single-failure override.
+                            // The SweepHealth carrying the triggering failed pass IS a cadence
+                            // (resweep-completion) tick, so an immediate dispatch here is still
+                            // cadence-timed (CRSH-ISC-2). Warmup guard (§RS-1.3): no repair
+                            // before the resweep warmup hand-off. One repair in flight at a
+                            // time via `resweep_busy`; if busy or still warming, queue for the
+                            // next cadence drain (the tracker's latch de-dupes the enqueue).
+                            let warmed = connected_at.is_some_and(|t| {
+                                t.elapsed() >= STEADY_RESWEEP_WARMUP_HANDOFF
+                            });
+                            match record_key_owners.get(&key).copied() {
+                                Some(owner_seed) => {
+                                    let free = !resweep_busy
+                                        .load(std::sync::atomic::Ordering::Acquire);
+                                    if let (true, true, Some(handle)) =
+                                        (warmed, free, net.as_ref())
+                                    {
+                                        session_health.note_repair_dispatched(&key);
+                                        spawn_repair(handle, &resweep_busy, owner_seed);
+                                        daemonseed_veilid_net::vtrace!(
+                                            "gui session-health: repairing dead record \
+                                             ({} failed) — re-establishing session",
+                                            input.failed
+                                        );
+                                    } else if !pending_repairs.contains(&key) {
+                                        pending_repairs.push_back(key);
+                                        daemonseed_veilid_net::vtrace!(
+                                            "gui session-health: record repair-due — \
+                                             queued (busy or warming)"
+                                        );
                                     }
-                                    None => daemonseed_veilid_net::vtrace!(
-                                        "gui session-health: repair-due for an unmapped \
-                                         record key — cannot resolve owner seed"
-                                    ),
                                 }
+                                None => daemonseed_veilid_net::vtrace!(
+                                    "gui session-health: repair-due for an unmapped \
+                                     record key — cannot resolve owner seed"
+                                ),
                             }
-                            RepairDecision::Suppressed => {
-                                daemonseed_veilid_net::vtrace!(
-                                    "gui session-health: repair-due suppressed (elevated \
-                                     weather) — will resume in calm"
-                                );
-                            }
-                            RepairDecision::NotDue => {}
+                        } else if matches!(decision, RepairDecision::Suppressed) {
+                            daemonseed_veilid_net::vtrace!(
+                                "gui session-health: repair-due suppressed (elevated \
+                                 weather) — will resume in calm"
+                            );
                         }
                     }
                     // Everything else demuxes in handle_inbound (which only acts on Inbound).
@@ -748,6 +769,120 @@ fn drain_route_releases(shares: &mut ShareState, net: &Option<VeilidNetHandle>) 
             handle.release_route(route).await;
         });
     }
+}
+
+/// (#180 §RS-4, CRSH-ISC-13/16) The SweepHealth fold-arm re-establishment gate: whether a
+/// swept record should be re-established now. `true` iff the tracker flagged it repair-due
+/// (the K-consecutive cadence path, [`RepairDecision::RepairDue`]) **or** it was manually
+/// Refresh-`armed` AND this pass just failed ([`SweepHealthInput::is_failed_pass`]) in calm
+/// weather — the §RS-4 single-failure override, which lowers the K threshold to 1 for an
+/// armed record only. An armed **healthy** record (a non-failed pass) returns `false`, so a
+/// Refresh over a healthy record re-establishes nothing and emits only sweep-shaped GETs
+/// (anti-criterion CRSH-ISC-16). Un-armed records keep the cadence path unchanged.
+fn refresh_or_cadence_due(decision: RepairDecision, armed: bool, input: &SweepHealthInput) -> bool {
+    matches!(decision, RepairDecision::RepairDue)
+        || (armed && input.is_failed_pass() && matches!(input.weather, Weather::Calm))
+}
+
+/// (#180 §RS-4, CRSH-ISC-13/16/20) The manual Refresh contract — the user-consented
+/// accelerant, sent only by the UI Refresh button (`NetCommand::ResweepShares`). Steps:
+///
+/// 1. **Immediate re-render** from the current catalog (`SharesSnapshot`) — instant
+///    feedback; the swept adverts fold in later via `apply_discovery`.
+/// 2. **Arm** every share-bearing subscribed record (operator announce + lobby chat/share
+///    records + every circle) in `refresh_armed`, resolving each seed to its deterministic
+///    `RecordKey` (reusing the cadence-populated reverse map, else a one-shot local-crypto
+///    resolve). The SweepHealth fold arm then re-establishes an armed record on a single
+///    failed pass in calm weather ([`refresh_or_cadence_due`]).
+/// 3. **Sweep-first wave** over the same records — traffic-shaped identically to the steady
+///    resweep (GETs on existing sessions via `resweep_rendezvous`; NO open, NO watch, so a
+///    healthy record is indistinguishable from a coincident cadence resweep — CRSH-ISC-16),
+///    spawned off the actor loop so a multi-record wave never starves chat, and serialized
+///    behind `resweep_busy` so it never overlaps a cadence sweep (WB-2 one-sweep-at-a-time).
+///
+/// If a cadence sweep/repair is already in flight, the wave is skipped this Refresh — the
+/// arms persist and the following cadence resweeps sweep each armed record, so the fold arm
+/// still applies the single-failure override (CRSH-ISC-13: "one action, no restart").
+#[allow(clippy::too_many_arguments)]
+async fn handle_refresh_shares(
+    evt_tx: &UnboundedSender<NetEvent>,
+    net: &Option<VeilidNetHandle>,
+    shares: &ShareState,
+    circles: &[VeilidCircle],
+    resweep_busy: &Arc<std::sync::atomic::AtomicBool>,
+    record_key_owners: &mut HashMap<RecordKey, [u8; 32]>,
+    resolved_seeds: &mut HashSet<[u8; 32]>,
+    refresh_armed: &mut HashSet<RecordKey>,
+) {
+    // 1. Immediate local re-render (§RS-4.4).
+    let _ = evt_tx.send(NetEvent::SharesSnapshot {
+        shares: shares.listings(),
+    });
+    let Some(handle) = net.as_ref() else {
+        return;
+    };
+    // Build the same share-bearing subscribed record set the steady resweep round-robins.
+    let mut seeds: Vec<[u8; 32]> = Vec::new();
+    seeds.extend(shares.operator.as_ref().map(|op| op.announce_owner_seed));
+    if let Some(lobby) = shares.lobby.as_ref() {
+        seeds.push(lobby.owner_seed);
+        seeds.push(lobby.share_owner_seed);
+    }
+    seeds.extend(circles.iter().map(|c| c.owner_seed));
+    if seeds.is_empty() {
+        return;
+    }
+    // 2. Arm every record (§RS-4.2). Resolve each seed → RecordKey via the cadence-populated
+    //    reverse map first (no round-trip); else resolve once (local crypto, no network — the
+    //    same call the tick uses) and cache it so the fold arm can map a failed pass back to
+    //    its owner seed.
+    for &seed in &seeds {
+        let key = match record_key_owners
+            .iter()
+            .find(|(_, s)| **s == seed)
+            .map(|(k, _)| k.clone())
+        {
+            Some(k) => Some(k),
+            None => match handle.rendezvous_record_key(seed).await {
+                Ok(rk) => {
+                    record_key_owners.insert(rk.clone(), seed);
+                    resolved_seeds.insert(seed);
+                    Some(rk)
+                }
+                Err(_) => None,
+            },
+        };
+        if let Some(k) = key {
+            refresh_armed.insert(k);
+        }
+    }
+    // 3. Sweep-first wave (§RS-4.1), off-loop and serialized behind `resweep_busy`. Acquire
+    //    the guard by CAS so the wave never overlaps a cadence sweep/repair; if it is already
+    //    held, skip the wave (the arms above still drive the single-failure override on the
+    //    following cadence resweeps).
+    if resweep_busy
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return;
+    }
+    daemonseed_veilid_net::vtrace!(
+        "gui refresh: sweep-first wave over {} record(s)",
+        seeds.len()
+    );
+    let handle = handle.clone();
+    let busy = resweep_busy.clone();
+    tokio::spawn(async move {
+        for seed in seeds {
+            let _ = handle.resweep_rendezvous(seed).await;
+        }
+        busy.store(false, std::sync::atomic::Ordering::Release);
+    });
 }
 
 /// Spawn a one-shot **repair** of a dead rendezvous record session (§RS-1.2 step 3b),
@@ -1227,23 +1362,11 @@ async fn handle_command(
             });
         }
         NetCommand::ResweepShares => {
-            // User-initiated (the Refresh button): re-render locally AND re-sweep the
-            // SHARE rendezvous to surface an announcement the watch missed during the
-            // warmup window (#133). Share adverts ride the share record (#153), so the
-            // Refresh re-sweeps THAT record, not the chat one. Swept ShareAnnouncements
-            // arrive as inbound events → apply_discovery folds them → a fresh
-            // SharesSnapshot. NOT on the auto-poll cadence — a manual click is rare, so
-            // the re-sweep cost is acceptable.
-            let _ = evt_tx.send(NetEvent::SharesSnapshot {
-                shares: shares.listings(),
-            });
-            if let (Some(lobby), Some(handle)) = (shares.lobby.as_ref(), net.as_ref()) {
-                let owner_seed = lobby.share_owner_seed;
-                daemonseed_veilid_net::vtrace!("gui resweep: re-sweeping share record");
-                if let Err(e) = handle.resweep_rendezvous(owner_seed).await {
-                    daemonseed_veilid_net::vtrace!("gui resweep: share re-sweep failed: {e}");
-                }
-            }
+            // (#180 §RS-4) The manual Refresh contract runs in the actor loop
+            // (`handle_refresh_shares`), which owns the loop-local state it needs
+            // (resweep_busy, the record-key maps, refresh_armed). ResweepShares is
+            // intercepted before this dispatcher, so this arm is never reached.
+            unreachable!("ResweepShares is handled in the actor loop (§RS-4)");
         }
         NetCommand::FetchShare { share_id, name } => {
             // (#180 §RS-2, CRSH-ISC-8) Spawn the fetch off-loop and return immediately — a
@@ -3855,6 +3978,79 @@ mod tests {
             shares.parked_retries.contains_key(&share_id),
             "a live failure outcome parks a one-shot retry"
         );
+    }
+
+    // ── CRSH-ISC-13/16: the §RS-4 Refresh re-establishment gate ───────────────────────
+    /// [`refresh_or_cadence_due`] is the fold-arm core of the manual-Refresh contract and
+    /// the CRSH-ISC-16 anti-criterion: an armed record re-establishes on a SINGLE failed
+    /// pass in calm weather; an armed HEALTHY record re-establishes nothing (only sweep
+    /// GETs); RepairDue (the cadence K-consecutive path) always re-establishes; and an
+    /// un-armed sub-K failure keeps the cadence path unchanged.
+    #[test]
+    fn crsh_isc_16_refresh_gate_reestablishes_only_on_failure_evidence() {
+        let failed_calm = SweepHealthInput {
+            attempted: 64,
+            failed: 64,
+            found: 0,
+            watch: WatchState::Unknown,
+            weather: Weather::Calm,
+        };
+        let failed_elevated = SweepHealthInput {
+            weather: Weather::Elevated,
+            ..failed_calm
+        };
+        let healthy_calm = SweepHealthInput {
+            attempted: 64,
+            failed: 0,
+            found: 1,
+            watch: WatchState::Unknown,
+            weather: Weather::Calm,
+        };
+
+        // (a) healthy + armed → NO re-establish (CRSH-ISC-16): a Refresh over a healthy
+        //     record emits only sweep-shaped GETs, never an open/watch.
+        assert!(!refresh_or_cadence_due(
+            RepairDecision::NotDue,
+            true,
+            &healthy_calm
+        ));
+        // (b) failed + armed + calm → re-establish on a single failure (§RS-4 override).
+        assert!(refresh_or_cadence_due(
+            RepairDecision::NotDue,
+            true,
+            &failed_calm
+        ));
+        // (c) failed + armed + elevated → weather gate suppresses; no re-establish.
+        assert!(!refresh_or_cadence_due(
+            RepairDecision::NotDue,
+            true,
+            &failed_elevated
+        ));
+        // (d) failed + UN-armed below K → cadence K-consecutive path unchanged.
+        assert!(!refresh_or_cadence_due(
+            RepairDecision::NotDue,
+            false,
+            &failed_calm
+        ));
+        // (e) RepairDue (cadence K reached) → always re-establish, armed or not, and
+        //     regardless of this single pass's shape.
+        assert!(refresh_or_cadence_due(
+            RepairDecision::RepairDue,
+            false,
+            &healthy_calm
+        ));
+        assert!(refresh_or_cadence_due(
+            RepairDecision::RepairDue,
+            true,
+            &failed_calm
+        ));
+        // A Suppressed decision on its own (un-armed) never re-establishes — the streak is
+        // retained for a later calm pass, not acted on now.
+        assert!(!refresh_or_cadence_due(
+            RepairDecision::Suppressed,
+            false,
+            &failed_calm
+        ));
     }
 
     // ── CRSH-ISC-5 (download-fail variant): a failed DOWNLOAD keeps the share listed ──────
