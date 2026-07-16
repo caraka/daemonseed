@@ -256,9 +256,18 @@ impl<K: Eq + Hash + Clone> SessionHealthTracker<K> {
         self.records.remove(key);
     }
 
-    /// Whether `key` is currently latched repair-due (test/introspection helper).
-    #[cfg(test)]
-    fn is_repair_due(&self, key: &K) -> bool {
+    /// Whether `key` is currently latched repair-due.
+    ///
+    /// This is the **drain-time re-check** (CRSH-ISC-24): before a queued repair is
+    /// dispatched off `pending_repairs`, the frontend calls this to confirm the record is
+    /// still repair-due, so a record that recovered *after* being queued is dropped from
+    /// the queue rather than needlessly torn down and re-established. It returns `false` in
+    /// exactly the two cases the drain must skip: (a) the record recovered — a successful
+    /// [`Self::observe`] reset its streak and cleared the latch; (b) the repair was already
+    /// dispatched — [`Self::note_repair_dispatched`] cleared the latch. It returns `true`
+    /// only while the record is latched repair-due (after the K-th failed pass in calm),
+    /// and `false` for an untracked key.
+    pub fn is_repair_due(&self, key: &K) -> bool {
         self.records.get(key).is_some_and(|r| r.repair_due_latched)
     }
 }
@@ -525,6 +534,67 @@ mod tests {
                 weather: Weather::Calm,
             }
             .is_failed_pass()
+        );
+    }
+
+    // ── CRSH-ISC-24: `is_repair_due` is the pub drain-time re-check (#180 F4/F5) ───────
+    /// `is_repair_due` is public (callable outside `#[cfg(test)]` — the frontends' drain
+    /// calls it) and returns the documented values across the recover/dispatch transitions
+    /// the drain relies on: an untracked key is not due; after K failed passes in calm the
+    /// record is latched repair-due (`true`); a subsequent successful `observe` — the
+    /// record recovered while it sat queued (F4) — clears the latch (`false`), so the drain
+    /// drops the stale entry; and `note_repair_dispatched` — an immediate dispatch (F5) —
+    /// also clears the latch (`false`), so the drain will not pop-and-repair the same key a
+    /// second time.
+    #[test]
+    fn crsh_isc_24_is_repair_due_tracks_recover_and_dispatch() {
+        assert_eq!(REPAIR_K_THRESHOLD, 2, "test written for K=2");
+        let mut tracker: SessionHealthTracker<u64> = SessionHealthTracker::new();
+        let key = 0x24u64;
+
+        // An untracked key is never repair-due.
+        assert!(!tracker.is_repair_due(&key));
+
+        // K=2 failed passes in calm → latched repair-due.
+        assert_eq!(
+            tracker.observe(key, failed(Weather::Calm)),
+            RepairDecision::NotDue
+        );
+        assert_eq!(
+            tracker.observe(key, failed(Weather::Calm)),
+            RepairDecision::RepairDue
+        );
+        assert!(
+            tracker.is_repair_due(&key),
+            "latched repair-due after the K-th failed pass"
+        );
+
+        // F4: the record recovers while queued — a successful pass clears the latch, so a
+        // drain re-check drops the stale queue entry instead of re-establishing it.
+        assert_eq!(
+            tracker.observe(key, ok_pass(Weather::Calm)),
+            RepairDecision::NotDue
+        );
+        assert!(
+            !tracker.is_repair_due(&key),
+            "recovered → drain must drop the stale queued entry"
+        );
+
+        // Re-latch, then F5: an immediate dispatch clears the latch, so the drain will not
+        // pop-and-dispatch the same key a second time.
+        assert_eq!(
+            tracker.observe(key, failed(Weather::Calm)),
+            RepairDecision::NotDue
+        );
+        assert_eq!(
+            tracker.observe(key, failed(Weather::Calm)),
+            RepairDecision::RepairDue
+        );
+        assert!(tracker.is_repair_due(&key));
+        tracker.note_repair_dispatched(&key);
+        assert!(
+            !tracker.is_repair_due(&key),
+            "dispatched → drain must not double-repair"
         );
     }
 

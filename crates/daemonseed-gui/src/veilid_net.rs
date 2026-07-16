@@ -603,6 +603,14 @@ pub async fn veilid_net_actor(
                                         (warmed, free, net.as_ref())
                                     {
                                         session_health.note_repair_dispatched(&key);
+                                        // (#180 F5, CRSH-ISC-24) If this key was already
+                                        // enqueued on a prior busy tick, drop the stale copy
+                                        // so the next drain cannot pop and dispatch it a
+                                        // second time. Defense-in-depth with the drain
+                                        // re-check (note_repair_dispatched cleared the latch,
+                                        // so the drain would also skip it) — both are cheap;
+                                        // keep the queue clean.
+                                        pending_repairs.retain(|k| k != &key);
                                         spawn_repair(handle, &resweep_busy, owner_seed);
                                         daemonseed_veilid_net::vtrace!(
                                             "gui session-health: repairing dead record \
@@ -701,11 +709,28 @@ pub async fn veilid_net_actor(
                     // before spending cadence ticks resweeping healthy ones. Drained one at
                     // a time, serialized with the resweep via `resweep_busy`.
                     if let Some(key) = pending_repairs.pop_front() {
-                        if let Some(&owner_seed) = record_key_owners.get(&key) {
-                            session_health.note_repair_dispatched(&key);
-                            spawn_repair(handle, &resweep_busy, owner_seed);
+                        // (#180 F4/F5, CRSH-ISC-24) Re-check at drain: a record queued while
+                        // busy/warming may have RECOVERED before the queue drained (a
+                        // successful sweep cleared its streak + latch), or already been
+                        // dispatched by the immediate fold arm (which cleared its latch).
+                        // Either way the latch is now clear, so dispatching would needlessly
+                        // tear down and re-establish a healthy record (with REPAIR_CLOSE_FIRST
+                        // this closes a live record and can drop a message in the re-watch
+                        // gap). Dispatch only if it is STILL repair-due; otherwise the popped
+                        // entry is stale — drop it (pop_front already removed it from the
+                        // queue).
+                        if session_health.is_repair_due(&key) {
+                            if let Some(&owner_seed) = record_key_owners.get(&key) {
+                                session_health.note_repair_dispatched(&key);
+                                spawn_repair(handle, &resweep_busy, owner_seed);
+                                daemonseed_veilid_net::vtrace!(
+                                    "gui steady-resweep: draining a queued repair"
+                                );
+                            }
+                        } else {
                             daemonseed_veilid_net::vtrace!(
-                                "gui steady-resweep: draining a queued repair"
+                                "gui steady-resweep: dropping a stale queued repair \
+                                 (record recovered or already dispatched)"
                             );
                         }
                     } else {

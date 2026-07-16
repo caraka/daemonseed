@@ -418,6 +418,10 @@ pub async fn veilid_net_actor(
                                         (warmed, free, net.as_ref())
                                     {
                                         session_health.note_repair_dispatched(&key);
+                                        // (#180 F5, CRSH-ISC-24) Drop any stale enqueued copy
+                                        // so the next drain cannot double-dispatch this key.
+                                        // Defense-in-depth with the drain re-check.
+                                        pending_repairs.retain(|k| k != &key);
                                         spawn_repair(handle, &resweep_busy, owner_seed);
                                         daemonseed_veilid_net::vtrace!(
                                             "tui session-health: repairing dead record \
@@ -488,11 +492,25 @@ pub async fn veilid_net_actor(
                     // before spending cadence ticks resweeping healthy ones. Drained one at
                     // a time, serialized with the resweep via `resweep_busy`.
                     if let Some(key) = pending_repairs.pop_front() {
-                        if let Some(&owner_seed) = record_key_owners.get(&key) {
-                            session_health.note_repair_dispatched(&key);
-                            spawn_repair(handle, &resweep_busy, owner_seed);
+                        // (#180 F4/F5, CRSH-ISC-24) Re-check at drain: a record queued while
+                        // busy/warming may have RECOVERED before the queue drained (a
+                        // successful sweep cleared its streak + latch), or already been
+                        // dispatched by the immediate fold arm (which cleared its latch).
+                        // Dispatch only if it is STILL repair-due; otherwise the popped entry
+                        // is stale — drop it (pop_front already removed it) rather than
+                        // re-establish a healthy record.
+                        if session_health.is_repair_due(&key) {
+                            if let Some(&owner_seed) = record_key_owners.get(&key) {
+                                session_health.note_repair_dispatched(&key);
+                                spawn_repair(handle, &resweep_busy, owner_seed);
+                                daemonseed_veilid_net::vtrace!(
+                                    "tui steady-resweep: draining a queued repair"
+                                );
+                            }
+                        } else {
                             daemonseed_veilid_net::vtrace!(
-                                "tui steady-resweep: draining a queued repair"
+                                "tui steady-resweep: dropping a stale queued repair \
+                                 (record recovered or already dispatched)"
                             );
                         }
                     } else {
