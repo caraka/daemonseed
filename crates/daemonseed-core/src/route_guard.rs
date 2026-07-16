@@ -37,6 +37,13 @@ struct GuardEntry<R> {
     /// completion). At most one — a second mid-flight supersede leaves the older route
     /// to the transport LRU backstop (Evidence 2), which is bounded, not a leak.
     pending_release: Option<R>,
+    /// The share was withdrawn while a fetch was still in flight (CRSH-ISC-26): its
+    /// `route` must be released and the whole entry dropped once the last in-flight
+    /// fetch completes — releasing mid-download would kill the stream. Cleared by
+    /// `note_fetch_started` (a fresh fetch means the share is live for us again, so a
+    /// stale withdraw mark on a since-re-added share is void). When idle, withdrawal
+    /// releases + removes immediately and this never persists on a stored entry.
+    withdrawn: bool,
 }
 
 impl<R> Default for GuardEntry<R> {
@@ -45,6 +52,7 @@ impl<R> Default for GuardEntry<R> {
             route: None,
             in_flight: 0,
             pending_release: None,
+            withdrawn: false,
         }
     }
 }
@@ -82,7 +90,12 @@ impl<S: Eq + Hash + Clone, R: Clone> ImportedRouteGuard<S, R> {
     /// id is not yet known on-loop; the in-flight count rises now so a concurrent
     /// advert-replacement defers its release until this fetch finishes.
     pub fn note_fetch_started(&mut self, share: S) {
-        self.entries.entry(share).or_default().in_flight += 1;
+        let entry = self.entries.entry(share).or_default();
+        entry.in_flight += 1;
+        // A fresh fetch means the share is live for us again — void any stale withdraw
+        // mark left by a since-re-added share so its re-imported route is never released
+        // out from under the new fetch (CRSH-ISC-26, the withdraw-racing-re-import case).
+        entry.withdrawn = false;
     }
 
     /// A fetch/download for `share` finished. `imported` is the route it imported
@@ -104,6 +117,7 @@ impl<S: Eq + Hash + Clone, R: Clone> ImportedRouteGuard<S, R> {
                         route: Some(route),
                         in_flight: 0,
                         pending_release: None,
+                        withdrawn: false,
                     },
                 );
             }
@@ -113,10 +127,19 @@ impl<S: Eq + Hash + Clone, R: Clone> ImportedRouteGuard<S, R> {
         if let Some(route) = imported {
             entry.route = Some(route);
         }
-        if entry.in_flight == 0
-            && let Some(pending) = entry.pending_release.take()
-        {
-            release.push(pending);
+        if entry.in_flight == 0 {
+            if let Some(pending) = entry.pending_release.take() {
+                release.push(pending);
+            }
+            // (CRSH-ISC-26) A withdraw that arrived mid-fetch deferred its release to
+            // here: now that the last in-flight fetch is done, release the share's
+            // imported route and let `gc` drop the now-empty entry (no lingering
+            // `{route: Some, in_flight: 0}` leaked until the transport LRU evicts it).
+            if entry.withdrawn
+                && let Some(route) = entry.route.take()
+            {
+                release.push(route);
+            }
         }
         self.gc(share);
         release
@@ -142,6 +165,42 @@ impl<S: Eq + Hash + Clone, R: Clone> ImportedRouteGuard<S, R> {
         if entry.pending_release.is_none() {
             entry.pending_release = Some(superseded);
         }
+        None
+    }
+
+    /// A verified withdraw removed `share` from discovery, so its imported route should
+    /// be released and the guard entry dropped — otherwise `note_fetch_finished` leaves a
+    /// `{route: Some, in_flight: 0}` entry that no `gc` reclaims and no supersede releases,
+    /// leaking the route until the transport LRU evicts it and growing `entries` unbounded
+    /// across a long session of share-discovery churn (CRSH-ISC-26, §RS-3).
+    ///
+    /// If the share is idle (no in-flight fetch) the imported route is returned for
+    /// immediate release and the entry is dropped now. If a fetch is still in flight a
+    /// download may be streaming over the route, so the release is deferred to the
+    /// **later** completion of that fetch (`note_fetch_finished` releases the route and
+    /// drops the entry once `in_flight` reaches 0) and `None` is returned now — the same
+    /// "whichever is later" discipline as `note_advert_replaced`.
+    ///
+    /// Idempotent: a second call for an already-withdrawn or absent share returns `None`,
+    /// never handing the same route out twice. `entries` values are `take`n before being
+    /// returned, and an actual double-release at the transport is itself a benign no-op
+    /// (`release_tolerant` maps veilid's `InvalidArgument` to a trace), so a withdraw
+    /// racing a concurrent re-import cannot double-free a route.
+    #[must_use]
+    pub fn note_share_withdrawn(&mut self, share: &S) -> Option<R> {
+        let entry = self.entries.get_mut(share)?;
+        if entry.in_flight == 0 {
+            // Idle: release the current route now and drop the entry outright. When idle,
+            // `pending_release` is always empty (a prior supersede released immediately or
+            // was flushed by the fetch that reached idle), so `route` is the whole state.
+            let route = entry.route.take();
+            self.entries.remove(share);
+            return route;
+        }
+        // In flight: defer. Mark the entry so the fetch's completion releases whatever
+        // route it holds at idle and drops the entry (see `note_fetch_finished`). Marking
+        // is idempotent; the route is not handed out here, so a re-withdraw returns `None`.
+        entry.withdrawn = true;
         None
     }
 
@@ -241,5 +300,103 @@ mod tests {
         // The last in-flight fetch finishing flushes exactly one deferred route.
         let released = guard.note_fetch_finished(&"s", None);
         assert_eq!(released.len(), 1, "one deferred route flushed on idle");
+    }
+
+    // CRSH-ISC-26: a withdraw of an IDLE share releases its imported route and drops the
+    // entry immediately — no lingering `{route: Some, in_flight: 0}` leaked to the LRU.
+    #[test]
+    fn withdraw_releases_route_and_drops_entry_when_idle() {
+        let mut guard: ImportedRouteGuard<&str, u32> = ImportedRouteGuard::new();
+        guard.note_fetch_started("s");
+        assert!(guard.note_fetch_finished(&"s", Some(9)).is_empty());
+        assert_eq!(guard.route_for(&"s"), Some(&9));
+        assert_eq!(
+            guard.tracked_len(),
+            1,
+            "idle fetch leaves the route tracked"
+        );
+        // Withdraw while idle → route returned for release AND the entry is gone.
+        assert_eq!(guard.note_share_withdrawn(&"s"), Some(9));
+        assert_eq!(guard.tracked_len(), 0, "withdrawn idle entry is dropped");
+    }
+
+    // CRSH-ISC-26: a withdraw arriving mid-fetch does NOT release the route now (a
+    // download may be streaming over it); the release + entry-drop fire on the LATER
+    // completion of the in-flight fetch.
+    #[test]
+    fn withdraw_defers_release_to_in_flight_fetch_completion() {
+        let mut guard: ImportedRouteGuard<&str, u32> = ImportedRouteGuard::new();
+        guard.note_fetch_started("s");
+        assert!(guard.note_fetch_finished(&"s", Some(4)).is_empty());
+        // A new fetch is streaming over route 4 …
+        guard.note_fetch_started("s");
+        // … when the share is withdrawn: MUST NOT release mid-download.
+        assert_eq!(
+            guard.note_share_withdrawn(&"s"),
+            None,
+            "route in use — withdraw release deferred"
+        );
+        assert_eq!(
+            guard.tracked_len(),
+            1,
+            "entry held until the fetch finishes"
+        );
+        // The in-flight fetch completing is the later event → route 4 releases + drops.
+        assert_eq!(guard.note_fetch_finished(&"s", None), vec![4]);
+        assert_eq!(
+            guard.tracked_len(),
+            0,
+            "withdrawn entry dropped on completion"
+        );
+    }
+
+    // CRSH-ISC-26 idempotency: a second withdraw hands out no route (idle: entry already
+    // gone; in-flight: already marked) — the same route is never released twice.
+    #[test]
+    fn withdraw_is_idempotent() {
+        let mut guard: ImportedRouteGuard<&str, u32> = ImportedRouteGuard::new();
+        // Absent share → None.
+        assert_eq!(guard.note_share_withdrawn(&"s"), None);
+        // Idle share: first withdraw releases, second finds nothing.
+        guard.note_fetch_started("s");
+        assert!(guard.note_fetch_finished(&"s", Some(2)).is_empty());
+        assert_eq!(guard.note_share_withdrawn(&"s"), Some(2));
+        assert_eq!(guard.note_share_withdrawn(&"s"), None, "no double release");
+        // In-flight share: first withdraw marks, second is a no-op, completion releases once.
+        guard.note_fetch_started("t");
+        assert!(guard.note_fetch_finished(&"t", Some(3)).is_empty());
+        guard.note_fetch_started("t");
+        assert_eq!(guard.note_share_withdrawn(&"t"), None);
+        assert_eq!(
+            guard.note_share_withdrawn(&"t"),
+            None,
+            "re-withdraw is a no-op"
+        );
+        assert_eq!(guard.note_fetch_finished(&"t", None), vec![3]);
+        assert_eq!(guard.tracked_len(), 0);
+    }
+
+    // CRSH-ISC-26: a withdraw racing a concurrent re-import. The share is withdrawn while
+    // a fetch is in flight, then a fresh fetch starts (a re-added share) BEFORE the first
+    // completes. `note_fetch_started` voids the stale withdraw mark, so the re-imported
+    // route is retained, not released out from under the live fetch.
+    #[test]
+    fn withdraw_then_reimport_retains_the_new_route() {
+        let mut guard: ImportedRouteGuard<&str, u32> = ImportedRouteGuard::new();
+        // Fetch A imports route 1 and is still in flight.
+        guard.note_fetch_started("s");
+        // Withdraw arrives mid-fetch → deferred.
+        assert_eq!(guard.note_share_withdrawn(&"s"), None);
+        // The share is re-added and a new fetch B starts → the withdraw mark is void.
+        guard.note_fetch_started("s"); // in_flight now 2, withdrawn cleared
+        // Fetch A completes (imports nothing) → not idle yet, nothing released.
+        assert!(guard.note_fetch_finished(&"s", None).is_empty());
+        // Fetch B completes importing the re-added route 5 → NOT released; share is live.
+        assert!(guard.note_fetch_finished(&"s", Some(5)).is_empty());
+        assert_eq!(
+            guard.route_for(&"s"),
+            Some(&5),
+            "re-imported route retained"
+        );
     }
 }

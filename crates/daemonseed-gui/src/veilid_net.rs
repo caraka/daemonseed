@@ -3372,6 +3372,15 @@ fn apply_discovery(
             // retry for this share: the discovery episode is over, so a later re-add is a
             // fresh episode and the stale-generation retry never fires against a new route.
             shares.parked_retries.remove(&ann.share_id);
+            // (#180 §RS-3, CRSH-ISC-26) Release the withdrawn share's imported route and
+            // drop its guard entry — immediately when idle, or deferred to any in-flight
+            // fetch's completion. Without this the route leaks until the veilid LRU evicts
+            // it and `route_guard` grows unbounded across discovery churn. The loop drains
+            // `pending_route_releases` via `release_tolerant`, exactly like the
+            // advert-replacement path.
+            if let Some(route) = shares.route_guard.note_share_withdrawn(&ann.share_id) {
+                shares.pending_route_releases.push(route);
+            }
             let _ = evt_tx.send(NetEvent::SharesSnapshot {
                 shares: shares.listings(),
             });

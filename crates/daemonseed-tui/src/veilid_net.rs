@@ -2240,6 +2240,14 @@ fn apply_discovery(
             // (#180 §RS-1.4, CRSH-ISC-19) A verified withdraw drops any parked browse
             // retry: the episode is over, so a later re-add never fires a stale retry.
             shares.parked_retries.remove(&ann.share_id);
+            // (#180 §RS-3, CRSH-ISC-26) Release the withdrawn share's imported route and
+            // drop its guard entry — immediately when idle, or deferred to any in-flight
+            // fetch's completion. Without this the route leaks until the veilid LRU evicts
+            // it and `route_guard` grows unbounded across discovery churn. The loop drains
+            // `pending_route_releases` via `release_tolerant`, like the advert-replace path.
+            if let Some(route) = shares.route_guard.note_share_withdrawn(&ann.share_id) {
+                shares.pending_route_releases.push(route);
+            }
             emit_shares_snapshot(shares, evt_tx);
         }
         return true;
