@@ -257,6 +257,18 @@ functions:
     returns:
       type: "Result<RouteId>"
       description: The imported route id.
+  - name: VeilidNetHandle::release_route
+    module: daemonseed_veilid_net::actor
+    description: Release a previously imported peer route.
+    signature: "pub async fn release_route(&self, route_id: RouteId)"
+    parameters:
+      - name: route_id
+        type: RouteId
+        direction: in
+        description: The imported route id to release.
+    returns:
+      type: "()"
+      description: None.
   - name: VeilidNetHandle::send_sealed
     module: daemonseed_veilid_net::actor
     description: Send a sealed 1:1 payload over a peer's private route.
