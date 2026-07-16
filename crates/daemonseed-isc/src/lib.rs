@@ -355,13 +355,14 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("CRSH-ISC-16", IscClass::Negative), // anti: Refresh over a healthy record emits only sweep GETs — no open/watch (§RS-4)
     ("CRSH-ISC-20", IscClass::Negative), // anti: Refresh is exclusively user-initiated — no render/timer/tab path sends it (§RS-4)
     ("CRSH-ISC-21", IscClass::Positive), // identical advert re-read (owner+timestamp+metadata) folds Unchanged — no spurious generation bump (§RS-1.4, #180 F3)
+    ("CRSH-ISC-22", IscClass::Positive), // RepairRendezvous dispatched OFF the actor loop (spawned, never awaited inline), record_lock still spans the whole re-establishment; per-record in-flight guard skips a re-dispatch (§RS-1.2, #180 F1)
 ];
 
 /// Total built, non-deferred ISCs tracked by this registry — the SINGLE source
 /// of truth for the coverage denominator, read live by `xtask isc-coverage`.
 /// Recount on every ISC add/remove (the `const _` assert below guards it
 /// against [`ISCS`]).
-pub const TOTAL: usize = 209;
+pub const TOTAL: usize = 210;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -553,21 +554,22 @@ mod tests {
         //                                  chat-never-waits / panic-recovery /
         //                                  telemetry-only / single-permit), #159/#168/#157)
         //                                  consumer route self-heal (#180):
-        //                                  CRSH-ISC-1/2/9/3/18/5/6/19/8/10/13/21 pos (sweep
+        //                                  CRSH-ISC-1/2/9/3/18/5/6/19/8/10/13/21/22 pos (sweep
         //                                  accounting, K-detection, weather gating,
         //                                  record_lock repair, chat serialization,
         //                                  Unresolved-not-prune, parked retry, generation,
         //                                  chat-before-fetch, route-release hygiene,
-        //                                  §RS-4 Refresh contract, identical-re-read-Unchanged) +
+        //                                  §RS-4 Refresh contract, identical-re-read-Unchanged,
+        //                                  repair-off-loop dispatch) +
         //                                  CRSH-ISC-11/14/17/4/15/7/16/20 neg (network-state-only
         //                                  input, margin limiter, no-nested-permit,
         //                                  zero-network reactive, retry decorrelation,
         //                                  fetch-never-delays-chat, Refresh-healthy-sweep-only,
         //                                  Refresh-user-initiated-only)
-        //   total   136 pos + 73 neg = 209
+        //   total   137 pos + 73 neg = 210
         //   (the v0.33.0 Veilid cutover retired 14 server-positive + 10
         //    server-negative relay/TLS/federation/rate-limit ISCs.)
-        assert_eq!(pos, 136, "positive count drift");
+        assert_eq!(pos, 137, "positive count drift");
         assert_eq!(neg, 73, "negative count drift");
     }
 

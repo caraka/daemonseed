@@ -3,7 +3,7 @@
 //! Inbound `VeilidUpdate`s are mapped to typed [`VeilidNetEvent`]s on a
 //! separate stream the app/UI consumes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -866,6 +866,14 @@ async fn actor_loop(
     // completion time and clears the in-flight flag when it finishes.
     let refresh_in_flight = Arc::new(AtomicBool::new(false));
     let last_advert_refresh: Arc<Mutex<Option<tokio::time::Instant>>> = Arc::new(Mutex::new(None));
+    // Per-record repair-in-flight guard (F1 / CRSH-ISC-22). A `RepairRendezvous` is
+    // dispatched OFF this loop (spawned), so the loop can receive a second repair for the
+    // SAME record — from a re-dispatch the frontend dedup can't reach — while the first is
+    // still running. This set holds the records with a repair in flight; a re-dispatch for
+    // a record already present is skipped rather than double-run. The `std::sync::Mutex` is
+    // only ever held briefly (insert on dispatch, remove on completion), never across an
+    // await. Shared with each spawned repair task, which clears its marker when it finishes.
+    let repair_in_flight: Arc<Mutex<HashSet<[u8; 32]>>> = Arc::new(Mutex::new(HashSet::new()));
 
     // The WB-3 write funnel (I1): every `set_dht_value` in this actor is dispatched
     // through this one prioritized, rate-limited scheduler. The production sink holds
@@ -998,8 +1006,40 @@ async fn actor_loop(
                 );
             }
             Command::RepairRendezvous { owner_seed, reply } => {
-                let _ = reply.send(
-                    repair_rendezvous(
+                // F1 (#180): dispatch the repair OFF the actor loop. `repair_rendezvous`
+                // awaits a close/open/watch + full 0..64 re-sweep; on a DEAD record each
+                // GET hits the veilid timeout, so awaiting it INLINE (as this arm once did)
+                // parks the single-tasked loop for seconds→tens of seconds and starves every
+                // other inline command (SendSealed 1:1 sends, SubscribeRendezvous joins) —
+                // the exact chat-starvation class #180 exists to kill. Spawning it returns
+                // the loop to `recv()` immediately. Atomicity vs a concurrent same-record
+                // write is provided by the `record_lock` (acquired inside `repair_gated` and
+                // held across the WHOLE re-establishment, CRSH-ISC-3/18), NOT by the inline
+                // await — so moving the await into a spawned task preserves atomicity while
+                // freeing the loop.
+                //
+                // Per-record in-flight guard (CRSH-ISC-22): the transport can legitimately
+                // receive two RepairRendezvous for the same record (a re-dispatch the
+                // frontend dedup can't reach), so a repair already in flight for this record
+                // is skipped — dedup — rather than double-run. The std::sync::Mutex is only
+                // held briefly (insert here, remove in the spawned task), never across an await.
+                {
+                    let mut set = repair_in_flight.lock().unwrap_or_else(|e| e.into_inner());
+                    if !set.insert(owner_seed) {
+                        // A repair for this record is already in flight — skip, don't spawn.
+                        let _ = reply.send(Ok(()));
+                        continue;
+                    }
+                }
+                let api = api.clone();
+                let rc = rc.clone();
+                let ev_tx = ev_tx.clone();
+                let opened = opened.clone();
+                let record_locks = record_locks.clone();
+                let dht_gate = dht_gate.clone();
+                let repair_in_flight = repair_in_flight.clone();
+                tokio::spawn(async move {
+                    let res = repair_rendezvous(
                         &api,
                         &rc,
                         &ev_tx,
@@ -1008,8 +1048,15 @@ async fn actor_loop(
                         &dht_gate,
                         owner_seed,
                     )
-                    .await,
-                );
+                    .await;
+                    // Clear the in-flight marker before replying so a later repair for this
+                    // record is never spuriously skipped by a stale marker.
+                    repair_in_flight
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&owner_seed);
+                    let _ = reply.send(res);
+                });
             }
             Command::RendezvousKey { owner_seed, reply } => {
                 // Local crypto only (no network): derive the owner keypair, compute the
@@ -2097,6 +2144,42 @@ mod tests {
         assert!(
             ADVERT_WATCHDOG_INTERVAL >= ADVERT_REFRESH_MIN_INTERVAL * 10,
             "watchdog interval must dwarf the coalesce window"
+        );
+    }
+
+    // CRSH-ISC-22: the per-record repair-in-flight guard dedups a re-dispatched repair.
+    // Pure test on the guard semantics the RepairRendezvous arm relies on — same
+    // `Arc<Mutex<HashSet<[u8; 32]>>>` type and insert/remove operations the arm uses.
+    #[test]
+    fn repair_in_flight_guard_dedups_same_record_until_cleared() {
+        let guard: Arc<Mutex<HashSet<[u8; 32]>>> = Arc::new(Mutex::new(HashSet::new()));
+        let seed = [7u8; 32];
+        let other = [8u8; 32];
+
+        // First dispatch for a record proceeds (marker inserted → spawn).
+        assert!(
+            guard.lock().unwrap().insert(seed),
+            "first repair for a record proceeds"
+        );
+        // A second dispatch for the SAME record while the first is in flight is skipped.
+        assert!(
+            !guard.lock().unwrap().insert(seed),
+            "a repair already in flight for this record is skipped (dedup)"
+        );
+        // A DISTINCT record is unaffected — its repair proceeds concurrently.
+        assert!(
+            guard.lock().unwrap().insert(other),
+            "a distinct record's repair is not blocked by another record's in-flight repair"
+        );
+        // The in-flight repair completes and clears its marker.
+        assert!(
+            guard.lock().unwrap().remove(&seed),
+            "completing the repair clears the record's in-flight marker"
+        );
+        // A later repair for that record proceeds again.
+        assert!(
+            guard.lock().unwrap().insert(seed),
+            "after the marker clears, a later repair for the record proceeds again"
         );
     }
 
