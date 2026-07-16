@@ -1916,6 +1916,14 @@ async fn confirm_fetch(
         }
     };
 
+    // (#180 §RS-1.4, CRSH-ISC-25 F6) A completed download resolves the share: clear any
+    // Unresolved mark + drop the parked browse retry — symmetric with the download-failure
+    // `mark_share_unresolved` above and the browse-preview-success clear in `fold_fetch_outcome`.
+    // Placed before BOTH FetchComplete emissions (flat-dest and managed-dir) so either
+    // success path clears the mark. Without this a failed-then-retried-and-succeeded download
+    // strands "re-resolving" and its stale parked retry fires a redundant browse fetch.
+    clear_share_unresolved(shares, evt_tx, share_id);
+
     // A user-chosen dest (ISC-C68): the files were placed directly under the
     // user's directory. Do not write a `downloads.idx` into it and do not touch
     // the managed browse manifest — the browse pane tracks only the managed dir.
@@ -2818,6 +2826,53 @@ mod tests {
             &withdraw_bytes(&room_key, &signer, &share_id, &rc)
         ));
         assert_eq!(shares.catalog.len(), 0, "a verified withdraw removes it");
+    }
+
+    // ── CRSH-ISC-25 (#180 F6): a completed download clears the Unresolved mark + parked retry ──
+    /// A failed-then-retried download that SUCCEEDS must resolve the share — symmetric with the
+    /// download-failure `mark_share_unresolved` and the browse-preview-success clear in
+    /// `fold_fetch_outcome`. `confirm_fetch`'s success tail calls `clear_share_unresolved` before
+    /// BOTH `FetchComplete` emissions (flat-dest and managed-dir); that clear seam is exercised
+    /// here directly (the full `confirm_fetch` needs a live veilid handle + real chunk I/O to
+    /// reach the tail, so the byte-transfer portion is live-only). Without the clear the share
+    /// strands "re-resolving" and its stale parked retry fires a redundant browse fetch.
+    #[test]
+    fn crsh_isc_25_download_success_clears_unresolved_and_parked_retry() {
+        let (mut shares, share_id, _rk, _signer, _rc) = folded_share(37);
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+
+        // Precondition: a prior download failed → Unresolved + a parked browse retry.
+        mark_share_unresolved(&mut shares, &evt_tx, &share_id, "demo-share");
+        assert!(shares.discovered.get(&share_id).unwrap().unresolved);
+        assert!(shares.parked_retries.contains_key(&share_id));
+        let _ = evt_rx.try_recv(); // drain the mark's SharesSnapshot
+
+        // The retried download completes: the success tail clears the mark + drops the retry.
+        clear_share_unresolved(&mut shares, &evt_tx, &share_id);
+
+        assert!(
+            !shares.discovered.get(&share_id).unwrap().unresolved,
+            "a completed download clears the Unresolved mark"
+        );
+        assert!(
+            !shares.parked_retries.contains_key(&share_id),
+            "a completed download drops the parked browse retry"
+        );
+        assert_eq!(
+            shares.catalog.len(),
+            1,
+            "the share stays listed, now resolved"
+        );
+        match evt_rx.try_recv() {
+            Ok(NetEvent::SharesSnapshot { remote, .. }) => {
+                let row = remote.iter().find(|s| s.share_id == share_id).unwrap();
+                assert!(
+                    !row.unresolved,
+                    "the listed share is no longer re-resolving"
+                );
+            }
+            other => panic!("expected a SharesSnapshot, got {other:?}"),
+        }
     }
 
     // ── CRSH-ISC-19: a verified withdraw drops the parked retry ────────────────────────
