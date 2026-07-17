@@ -2270,10 +2270,21 @@ fn apply_discovery(
         return true; // consumed-and-dropped; do not fall through
     }
     let change = shares.catalog.apply_verified(&ann, now);
-    // #152: only trust the advertised route when the catalog ACCEPTED the announce.
-    // An owner-mismatch hijack refresh returns `Unchanged` (first-writer-wins) —
-    // skipping the insert prevents the fetch redirect.
-    if change != CatalogChange::Unchanged {
+    // (#180 route-rotation self-heal, CRSH-ISC-12) A route rotation must re-import even
+    // when the catalog folds `Unchanged`. After a sharer restart / route-death its
+    // watchdog re-advertises the SAME sealed advert — same `sent_unix_ms` + metadata,
+    // only the `route_blob` rotated — which the F3 Unchanged arm folds `Unchanged`
+    // (`route_blob` lives in `discovered`, not the catalog). Without an independent blob
+    // check the rotated route is dropped and the consumer stays wedged on the dead route
+    // until it restarts. Security (#152/#156): honoring this does NOT reopen the hijack
+    // path — an announce only reaches here after `share_binding_is_valid` (#156:
+    // `share_id == derive_share_id_v2(sender_pubkey, ...)`) AND `verify_route_advert`, so
+    // `env.route_blob` is provably the id's verified owner's rotated route.
+    let route_changed = shares
+        .discovered
+        .get(&ann.share_id)
+        .is_some_and(|d| d.route_blob != env.route_blob);
+    if change != CatalogChange::Unchanged || route_changed {
         // (#180 §RS-1.4) Stamp a fresh monotonic generation — the fire signal for a parked
         // browse retry (CRSH-ISC-6) — and preserve the `unresolved` re-resolve flag across
         // a refresh (a fresh advert arms the retry but does not itself resolve the share).
@@ -2838,6 +2849,71 @@ mod tests {
             &withdraw_bytes(&room_key, &signer, &share_id, &rc)
         ));
         assert_eq!(shares.catalog.len(), 0, "a verified withdraw removes it");
+    }
+
+    // ── CRSH-ISC-27 (#180 route-rotation self-heal): a rotated route re-imports on catalog Unchanged ──
+    /// Mirror of the GUI probe: after a sharer restart / route-death the watchdog re-advertises
+    /// the SAME sealed advert (same `sent_unix_ms` + metadata) with only the `route_blob` rotated,
+    /// which folds `Unchanged`. The consumer STILL re-imports the rotated route (un-wedging without
+    /// restart), stamps a fresh generation to arm the parked retry, and keeps the share Unresolved;
+    /// an identical re-read (no rotation) still folds with no generation churn (F3 preserved).
+    #[test]
+    fn crsh_isc_27_route_rotation_reimports_on_catalog_unchanged() {
+        let (mut shares, share_id, room_key, signer, rc) = folded_share(43);
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+
+        // The consumer's fetch died on the old route → Unresolved + a parked browse retry.
+        mark_share_unresolved(&mut shares, &evt_tx, &share_id, "demo-share");
+        while evt_rx.try_recv().is_ok() {} // drain the mark's snapshot(s)
+        let gen_before = shares.discovered.get(&share_id).unwrap().generation;
+        let old_blob = shares.discovered.get(&share_id).unwrap().route_blob.clone();
+
+        // Same advert (sent_unix_ms=1000 + metadata), ROTATED route blob — the restart shape.
+        let new_blob = vec![0xCD; 96];
+        assert_ne!(
+            new_blob, old_blob,
+            "the rotated blob differs from the dead one"
+        );
+        let bytes = discovery_bytes(&room_key, &signer, &share_id, &rc, &new_blob, &new_blob);
+        assert!(apply_discovery(&mut shares, &evt_tx, &bytes));
+
+        assert_eq!(
+            shares.catalog.len(),
+            1,
+            "the catalog folds Unchanged, no new entry"
+        );
+        let d = shares.discovered.get(&share_id).unwrap();
+        assert_eq!(
+            d.route_blob, new_blob,
+            "the rotated route is re-imported on Unchanged"
+        );
+        assert!(
+            d.generation > gen_before,
+            "a fresh generation arms the parked retry"
+        );
+        assert!(
+            d.unresolved,
+            "the share stays Unresolved until a fetch succeeds"
+        );
+        assert!(
+            evt_rx.try_recv().is_ok(),
+            "a shares snapshot is emitted on the re-import"
+        );
+        while evt_rx.try_recv().is_ok() {}
+
+        // F3 no-churn preserved: an identical re-read (same blob) bumps nothing, emits nothing.
+        let gen_after = shares.discovered.get(&share_id).unwrap().generation;
+        let bytes_same = discovery_bytes(&room_key, &signer, &share_id, &rc, &new_blob, &new_blob);
+        assert!(apply_discovery(&mut shares, &evt_tx, &bytes_same));
+        assert_eq!(
+            shares.discovered.get(&share_id).unwrap().generation,
+            gen_after,
+            "an identical re-read does not bump the generation (F3 preserved)"
+        );
+        assert!(
+            evt_rx.try_recv().is_err(),
+            "an identical re-read emits no snapshot"
+        );
     }
 
     // ── CRSH-ISC-25 (#180 F6): a completed download clears the Unresolved mark + parked retry ──

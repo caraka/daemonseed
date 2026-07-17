@@ -52,6 +52,7 @@ work lives in the project lead's vault manifest, not here.
 - `daemonseed-core`: an identical advert re-read now refreshes `received_at` (while still folding `Unchanged`) so a continuously-reheard live share is not aged out by the catalog TTL prune (#180).
 - `daemonseed-veilid-net`: the spawned repair clears its in-flight marker via RAII (Drop) so a panic in the spawned repair cannot permanently disable a record's self-heal (#180).
 - `daemonseed-gui`: a manual Refresh queued during a busy/warmup window now heals the dead record when the repair queue drains — the Refresh arm survives the enqueue instead of being dropped as "recovered" (#180, CRSH-ISC-13).
+- `daemonseed-{gui,tui}`: a consumer re-imports a share's rotated route when the re-advert folds catalog-`Unchanged` — a sharer restart / route-death re-advertises the same sealed advert with only the `route_blob` rotated (same `sent_unix_ms`), which folded `Unchanged` and skipped the route-import gated behind that verdict, leaving the consumer wedged on the dead route (share listed, `Unresolved`) until restart; the blob change is now detected independently of the catalog verdict, re-imports the route, and arms the parked retry (#180, CRSH-ISC-27).
 - `daemonseed-{gui,tui}`: a late stale fetch outcome no longer reverts a share that a newer overlapping fetch already resolved — a stale outcome re-parks only a still-unresolved share (#180, CRSH-ISC-23).
 
 ## [0.33.1] — 2026-07-15
