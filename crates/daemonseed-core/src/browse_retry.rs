@@ -3,13 +3,19 @@
 //!
 //! When a browse-triggered manifest fetch fails, the reactive path performs **ZERO
 //! network actions** (§RS-0, the design keystone): it marks the share's route
-//! `Unresolved` and parks a **one-shot, generation-tagged** deferred retry here. The
-//! retry does NOT fire when a fresh advert folds — it fires at the consumer's next
-//! steady-resweep **cursor tick** (the same cadence-dispatch discipline as the repair
-//! arm), decorrelating its timing from the sharer's re-announce (CRSH-ISC-15). The share
-//! is **never pruned** by this path; on window expiry the retry is cleared and failure
-//! surfaced (CRSH-ISC-6). A withdraw/re-add while parked drops the stale retry
-//! (CRSH-ISC-19).
+//! `Unresolved` and parks a **one-shot, generation-tagged** deferred retry here.
+//!
+//! Reframe (#180, 2026-07-17): the mark-fetchable-again is now owned by the
+//! route-rotation fold (the frontend's `apply_discovery` clears `Unresolved` when the
+//! route blob actually rotates — a purely-local no-network op, so no cursor-tick
+//! decorrelation is owed and it works however long the sharer is away). This park is
+//! therefore **housekeeping only** — it no longer re-fetches or clears `Unresolved`. It
+//! is queried at the consumer's next steady-resweep **cursor tick** (never at the fold,
+//! CRSH-ISC-15): a park whose generation advanced without a route rotation (a
+//! content-only re-advert) is dropped as stale; on window expiry the retry is cleared and
+//! a give-up hint surfaced — **never a prune** (CRSH-ISC-6, the share stays listed and
+//! still recovers on a later rotation). A withdraw/re-add while parked drops the stale
+//! retry (CRSH-ISC-19).
 //!
 //! This module is transport-free (no veilid types) and holds only local state, so it
 //! lives in `daemonseed-core` alongside [`crate::session_health`] and is shared verbatim
@@ -24,13 +30,13 @@ use std::time::{Duration, Instant};
 pub const BROWSE_RETRY_WINDOW: Duration = Duration::from_secs(600);
 
 /// A parked one-shot browse retry (§RS-1.4). Keyed in the frontend by `share_id`; carries
-/// the discovered entry's **generation at park time** so a fresh advert fold — which bumps
-/// the entry's generation strictly above this — is the fire signal (CRSH-ISC-6), and the
-/// fetch preview's `name` so the re-attempt renders. Local state only: parking and firing
-/// touch no network directly (the fire re-dispatches an ordinary consented content fetch).
+/// the discovered entry's **generation at park time** to detect a later advert fold, and
+/// the share's `name` for the window-expiry give-up toast. Local state only — no network
+/// (post-reframe #180 the park never re-fetches; the route-rotation fold marks the share
+/// fetchable-again).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParkedBrowseRetry {
-    /// The share's display name, carried so the re-attempted fetch preview renders.
+    /// The share's display name, carried so the window-expiry give-up toast names the share.
     pub name: String,
     /// The discovered entry's generation when the retry was parked. A later accepted
     /// advert fold bumps the entry's generation strictly above this — the fire signal
@@ -58,8 +64,9 @@ impl ParkedBrowseRetry {
 /// (CRSH-ISC-15).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParkedRetryAction {
-    /// A fresh advert has folded since the park (the entry's generation advanced): fire
-    /// the one-shot retry at this tick, then clear the parked entry (CRSH-ISC-6).
+    /// A fresh advert has folded since the park (the entry's generation advanced). Post-reframe
+    /// (#180) this is not itself a route refresh — a route rotation clears `Unresolved` at the
+    /// fold — so the frontend drops this now-stale park at the tick (CRSH-ISC-6).
     Fire,
     /// The window elapsed with no fresh advert: surface failure and clear the parked
     /// entry — **no prune** (CRSH-ISC-6).

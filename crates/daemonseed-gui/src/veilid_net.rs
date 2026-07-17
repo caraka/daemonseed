@@ -718,9 +718,9 @@ pub async fn veilid_net_actor(
             _ = steady_resweep.tick() => {
                 // (#180 §RS-1.4, CRSH-ISC-6/15) Dispatch parked browse retries on the
                 // consumer's own cursor tick (decorrelated from the sharer's re-announce).
-                // Independent of the resweep `ready` gate below: the retry is an off-DHT
-                // content fetch, not a sweep, and (§RS-2) is spawned off-loop.
-                process_parked_browse_retries(&mut shares, &evt_tx, &net, &fetch_outcome_tx);
+                // Independent of the resweep `ready` gate below: it only marks route-refreshed
+                // shares fetchable-again (reframe #180) — no sweep, no network op.
+                process_parked_browse_retries(&mut shares, &evt_tx);
                 // Ready once the warmup hand-off window has elapsed, we are attached, and
                 // no prior resweep is still in flight (the WB-2 one-sweep-at-a-time bound
                 // — a resweep can outlast the tick on a slow DHT).
@@ -2834,30 +2834,28 @@ fn clear_share_unresolved(
     }
 }
 
-/// (#180 §RS-1.4/§RS-2, CRSH-ISC-6/8/15) Dispatch parked browse retries **at the consumer's
-/// own cursor tick** — never at the advert-fold event. For each parked retry: a share whose
-/// advert has re-folded since the park (its discovered generation advanced) is re-fetched
-/// via a normal consented content fetch — **spawned off-loop** (CRSH-ISC-8), exactly like a
-/// fresh browse, so a slow retry never blocks the actor loop; an expired-window retry
-/// surfaces failure and clears WITHOUT pruning; a withdrawn share's retry drops silently.
-/// Called once per steady-resweep tick — synchronous (it only spawns, never awaits a fetch).
-fn process_parked_browse_retries(
-    shares: &mut ShareState,
-    evt_tx: &UnboundedSender<NetEvent>,
-    net: &Option<VeilidNetHandle>,
-    fetch_outcome_tx: &UnboundedSender<FetchOutcome>,
-) {
+/// (#180 §RS-1.4/§RS-2, CRSH-ISC-6/15) House-keep the parked browse retries **at the consumer's
+/// own cursor tick** — never at the advert-fold event. Under the reframe (#180, 2026-07-17) the
+/// actual mark-fetchable happens at the route-rotation fold (`apply_discovery`, a local
+/// no-network op), so this tick no longer re-fetches or clears `Unresolved`: it only expires
+/// stale parks. A park whose share saw a fresh advert fold since the park (its discovered
+/// generation advanced) but no route rotation (a content-only re-advert — `apply_discovery`
+/// left it parked) is dropped, since the route is not refreshed and a real rotation will mark it
+/// fetchable at the fold; an expired-window retry surfaces failure WITHOUT pruning (the share
+/// stays listed and still recovers on a later rotation); a withdrawn share's retry drops
+/// silently. Synchronous, no network op.
+fn process_parked_browse_retries(shares: &mut ShareState, evt_tx: &UnboundedSender<NetEvent>) {
     if shares.parked_retries.is_empty() {
         return;
     }
     let now = Instant::now();
-    let mut fire: Vec<(String, String)> = Vec::new();
+    let mut fire: Vec<String> = Vec::new();
     let mut expire: Vec<String> = Vec::new();
     let mut drop_ids: Vec<String> = Vec::new();
     for (share_id, parked) in &shares.parked_retries {
         let current = shares.discovered.get(share_id).map(|d| d.generation);
         match parked_retry_action(parked, current, now) {
-            ParkedRetryAction::Fire => fire.push((share_id.clone(), parked.name.clone())),
+            ParkedRetryAction::Fire => fire.push(share_id.clone()),
             ParkedRetryAction::Expire => expire.push(share_id.clone()),
             ParkedRetryAction::Drop => drop_ids.push(share_id.clone()),
             ParkedRetryAction::Wait => {}
@@ -2867,18 +2865,27 @@ fn process_parked_browse_retries(
         shares.parked_retries.remove(id);
     }
     for id in &expire {
-        shares.parked_retries.remove(id);
+        // Name the share in the give-up toast so the user knows which browse to re-initiate;
+        // the share stays listed and still recovers automatically on a later route rotation.
+        let name = shares
+            .parked_retries
+            .remove(id)
+            .map(|p| p.name)
+            .unwrap_or_default();
         let _ = evt_tx.send(NetEvent::FetchError {
-            message: "re-resolve window elapsed — the share stays listed; browse it again \
-                      to retry"
-                .to_owned(),
+            message: format!(
+                "re-resolve window elapsed for '{name}' — the share stays listed; \
+                 browse it again to retry"
+            ),
         });
     }
-    for (id, name) in fire {
-        // One-shot: consume the park before re-attempting (a failed re-attempt re-parks
-        // when its outcome folds, needing another fresh advert to fire again).
-        shares.parked_retries.remove(&id);
-        spawn_fetch_share(shares, evt_tx, net, fetch_outcome_tx, &id, &name);
+    for id in &fire {
+        // Reframe (#180, 2026-07-17): the mark-fetchable lives at the route-rotation fold
+        // (`apply_discovery`), which also drops the park. A park reaching Fire here saw a
+        // generation bump WITHOUT a route rotation (a content-only re-advert), so the route is
+        // NOT refreshed — drop the stale park without clearing; a real rotation marks it
+        // fetchable at the fold.
+        shares.parked_retries.remove(id);
     }
 }
 
@@ -3466,18 +3473,25 @@ fn apply_discovery(
         .get(&ann.share_id)
         .is_some_and(|d| d.route_blob != env.route_blob);
     if change != CatalogChange::Unchanged || route_changed {
-        // (#180 §RS-1.4) Stamp a fresh monotonic generation on the entry — the fire signal
-        // for a parked browse retry (CRSH-ISC-6). Preserve the `unresolved` re-resolve
-        // flag across a refresh: a fresh advert arms the retry but does not itself resolve
-        // the share, so it stays "re-resolving" until a fetch actually succeeds. This fold
-        // never fires the retry (CRSH-ISC-15 — dispatch rides the cursor tick, not here).
-        // (#180 §RS-3, CRSH-ISC-10) Read the prior entry BEFORE mutating: whether the share
-        // is still re-resolving, and whether this advert CHANGES the route blob — an
-        // identical re-advert re-imports to the same route id (Evidence 2), so only a real
-        // blob change supersedes the imported route.
-        let (unresolved, route_replaced) = match shares.discovered.get(&ann.share_id) {
+        // (#180 §RS-3, CRSH-ISC-10) Read the prior entry BEFORE mutating: whether the share is
+        // still re-resolving, and whether this advert CHANGES the route blob — an identical
+        // re-advert re-imports to the same route id (Evidence 2), so only a real blob change
+        // supersedes the imported route.
+        let (was_unresolved, route_replaced) = match shares.discovered.get(&ann.share_id) {
             Some(d) => (d.unresolved, d.route_blob != env.route_blob),
             None => (false, false),
+        };
+        // Reframe (#180, 2026-07-17, CRSH-ISC-6): a ROUTE ROTATION *is* the route refresh, so it
+        // marks the share fetchable-again (clears the re-resolve flag). Clearing is a purely
+        // local no-network op, so it happens right here at the fold — no cursor-tick
+        // decorrelation is owed (CRSH-ISC-15 preserved: nothing is emitted to the network) — and
+        // it is keyed on the route blob rotating, NOT the parked-retry window, so a share
+        // recovers however long the sharer is away. A content-only re-advert (route blob
+        // unchanged) is NOT a refresh: the share stays "re-resolving" until its route rotates.
+        let unresolved = if route_replaced {
+            false
+        } else {
+            was_unresolved
         };
         shares.next_generation += 1;
         let generation = shares.next_generation;
@@ -3489,12 +3503,15 @@ fn apply_discovery(
                 unresolved,
             },
         );
-        // The superseded route releases on the later of now or the completion of any
-        // in-flight fetch still streaming over it — the guard decides; the loop releases.
-        if route_replaced
-            && let Some(route) = shares.route_guard.note_advert_replaced(&ann.share_id)
-        {
-            shares.pending_route_releases.push(route);
+        if route_replaced {
+            // The route refreshed: drop the fetch-failure park (its recovery job is now done —
+            // the share is fetchable-again) and release the superseded route on the later of now
+            // or the completion of any in-flight fetch still streaming over it — the guard
+            // decides; the loop releases.
+            shares.parked_retries.remove(&ann.share_id);
+            if let Some(route) = shares.route_guard.note_advert_replaced(&ann.share_id) {
+                shares.pending_route_releases.push(route);
+            }
         }
         let _ = evt_tx.send(NetEvent::SharesSnapshot {
             shares: shares.listings(),
@@ -3861,7 +3878,8 @@ mod tests {
     /// `route_blob` rotated. The F3 Unchanged arm excludes `route_blob` (it lives in
     /// `discovered`, not the catalog), so the fold returns `Unchanged`. This proves the
     /// consumer STILL re-imports the rotated route (un-wedging without restart), stamps a
-    /// fresh generation to arm the parked retry, and keeps the share Unresolved — while an
+    /// fresh generation, and — per the reframe (CRSH-ISC-6) — marks the share fetchable-again
+    /// (clears Unresolved, drops the park) since a route rotation IS the route refresh; an
     /// identical re-read (no rotation) still folds with no generation churn (F3 preserved).
     #[test]
     fn crsh_isc_27_route_rotation_reimports_on_catalog_unchanged() {
@@ -3896,15 +3914,20 @@ mod tests {
             d.route_blob, new_blob,
             "the rotated route is re-imported on Unchanged"
         );
-        // A fresh generation is stamped so the parked retry fires on the next cursor tick.
+        // A fresh generation is stamped, superseding the dead route.
         assert!(
             d.generation > gen_before,
-            "a fresh generation arms the parked retry"
+            "a fresh generation supersedes the dead route"
         );
-        // Arm ≠ resolve: the share stays re-resolving until a fetch actually succeeds.
+        // Reframe (CRSH-ISC-6): a route rotation IS the route refresh, so the share is marked
+        // fetchable-again — Unresolved cleared, the fetch-failure park dropped.
         assert!(
-            d.unresolved,
-            "the share stays Unresolved until a fetch succeeds"
+            !d.unresolved,
+            "the route rotation marks the share fetchable-again (Unresolved cleared)"
+        );
+        assert!(
+            !shares.parked_retries.contains_key(&share_id),
+            "the route rotation drops the fetch-failure park"
         );
         assert!(
             matches!(evt_rx.try_recv(), Ok(NetEvent::SharesSnapshot { .. })),
@@ -4052,7 +4075,6 @@ mod tests {
     fn crsh_isc_6_window_expiry_surfaces_error_without_pruning() {
         let (mut shares, share_id, _rk, _signer, _rc) = folded_share(35);
         let (evt_tx, mut evt_rx) = unbounded_channel();
-        let (fetch_outcome_tx, _outcome_rx) = unbounded_channel();
         // Park a retry whose window is already elapsed (deadline in the past).
         shares.discovered.get_mut(&share_id).unwrap().unresolved = true;
         shares.parked_retries.insert(
@@ -4064,7 +4086,7 @@ mod tests {
             },
         );
 
-        process_parked_browse_retries(&mut shares, &evt_tx, &None, &fetch_outcome_tx);
+        process_parked_browse_retries(&mut shares, &evt_tx);
 
         assert!(
             !shares.parked_retries.contains_key(&share_id),
@@ -4074,6 +4096,109 @@ mod tests {
         assert!(
             matches!(evt_rx.try_recv(), Ok(NetEvent::FetchError { .. })),
             "expiry surfaces a failure to the UI"
+        );
+    }
+
+    /// Reframe (#180, 2026-07-17) finding-1 guard: a content-only re-advert (fresher timestamp,
+    /// SAME route blob) folds `Updated` and bumps the discovered generation, but it is NOT a
+    /// route refresh — so the share must STAY `Unresolved` (re-resolving), not flip to
+    /// fetchable-looking against a route that never changed. Only an actual route rotation
+    /// (`route_replaced`, `crsh_isc_27_*`) clears `Unresolved`.
+    #[test]
+    fn crsh_isc_6_content_readvert_does_not_mark_fetchable() {
+        let (mut shares, share_id, room_key, signer, rc) = folded_share(36);
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+
+        // The consumer's fetch died → Unresolved + a parked browse retry (same route blob 0xAB).
+        mark_share_unresolved(&mut shares, &evt_tx, &share_id, "demo-share");
+        let _ = evt_rx.try_recv(); // drain the mark's snapshot
+        let same_blob = shares.discovered.get(&share_id).unwrap().route_blob.clone();
+        let gen_before = shares.discovered.get(&share_id).unwrap().generation;
+
+        // A content-only re-advert: a FRESHER timestamp (folds Updated) over the SAME route blob.
+        let fields = AnnouncementFields {
+            room: DEFAULT_ROOM,
+            sender_handle: "tester",
+            share_id: &share_id,
+            root_commitment: &rc,
+            name: "demo-share",
+            rating: "",
+            withdraw: false,
+            sent_unix_ms: 9_000, // fresher than folded_share's 1_000 → catalog Updated
+        };
+        let sealed = seal_public_announcement(&room_key, &signer, &fields).unwrap();
+        let route_sig = signer
+            .sign(&route_provenance_input(&share_id, &same_blob))
+            .unwrap()
+            .to_vec();
+        let bytes = DiscoveryEnvelope {
+            sealed_announcement: sealed,
+            route_blob: same_blob.clone(),
+            route_sig,
+        }
+        .encode();
+        assert!(apply_discovery(&mut shares, &evt_tx, &bytes));
+
+        let d = shares.discovered.get(&share_id).unwrap();
+        assert!(
+            d.generation > gen_before,
+            "the fresher-timestamp re-advert bumps the generation (folds Updated)"
+        );
+        assert_eq!(d.route_blob, same_blob, "the route blob did NOT rotate");
+        assert!(
+            d.unresolved,
+            "a content-only re-advert is NOT a route refresh — the share stays re-resolving"
+        );
+        assert!(
+            shares.parked_retries.contains_key(&share_id),
+            "the park survives a non-rotating re-advert"
+        );
+    }
+
+    /// Reframe (#180, 2026-07-17): with the mark-fetchable now owned by the route-rotation fold
+    /// (`apply_discovery`), a park reaching `Fire` at a cursor tick saw a generation bump WITHOUT
+    /// a route rotation (a content-only re-advert) — so the tick drops the stale park and does
+    /// NOT clear `Unresolved` (a real rotation would already have cleared it at the fold).
+    #[test]
+    fn crsh_isc_6_fire_drops_stale_park_without_clearing() {
+        let (mut shares, share_id, _rk, _signer, _rc) = folded_share(46);
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        // Park a live-window retry, then advance the generation past it (a content re-advert
+        // folded) so the tick classifies Fire — but the route was never refreshed.
+        let g = shares.discovered.get(&share_id).unwrap().generation;
+        shares.discovered.get_mut(&share_id).unwrap().unresolved = true;
+        shares.parked_retries.insert(
+            share_id.clone(),
+            ParkedBrowseRetry {
+                name: "demo-share".to_owned(),
+                parked_generation: g,
+                deadline: Instant::now() + Duration::from_secs(60),
+            },
+        );
+        shares.discovered.get_mut(&share_id).unwrap().generation = g + 1;
+        assert_eq!(
+            parked_retry_action(
+                shares.parked_retries.get(&share_id).unwrap(),
+                Some(g + 1),
+                Instant::now()
+            ),
+            ParkedRetryAction::Fire,
+            "precondition: the advanced generation classifies as Fire"
+        );
+
+        process_parked_browse_retries(&mut shares, &evt_tx);
+
+        assert!(
+            !shares.parked_retries.contains_key(&share_id),
+            "the Fire tick drops the stale park"
+        );
+        assert!(
+            shares.discovered.get(&share_id).unwrap().unresolved,
+            "the tick does NOT clear Unresolved — clearing is the route-rotation fold's job"
+        );
+        assert!(
+            evt_rx.try_recv().is_err(),
+            "dropping a stale park emits no event"
         );
     }
 
