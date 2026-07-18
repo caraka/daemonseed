@@ -921,11 +921,37 @@ fn build_ui() -> BuiltUi {
     // collapses it — a share's first expand lazily fetches its manifest preview.
     ui.on_refresh_shares({
         let net = net.clone();
+        let state = state.clone();
+        let weak = ui.as_weak();
         move || {
             // The manual Refresh button re-discovers: on Veilid this re-sweeps the
             // lobby (#133). The ~3 s liveness auto-poll keeps sending the cheap
             // local-only RefreshShares (see start_drain) — never ResweepShares.
             let _ = net.borrow().send(NetCommand::ResweepShares);
+            // #195: the manual Refresh also RE-INDEXES our own published shares. The
+            // Veilid publish path hashes a root once at publish (`ShareContent::index_dir`),
+            // so a file added to a shared folder mid-session is invisible to peers until
+            // the next launch's auto-republish. Re-send `PublishShare` per persisted root:
+            // `publish_share` re-runs `index_dir` and re-announces under the SAME
+            // deterministic `share_id` (#156), so peers fold the fresh manifest onto the
+            // existing catalog entry (no duplicate / dead second copy). Gated on Connected
+            // to avoid a spurious "not connected" toast per root, and it rides only the
+            // user-initiated Refresh — never the 3 s poll (which sends RefreshShares).
+            let connected = weak.upgrade().map(|ui| ui.get_connected()).unwrap_or(false);
+            if connected {
+                let sharer_handle = state.borrow().display_handle().unwrap_or_default();
+                let published = state.borrow().persisted_published();
+                let net = net.borrow();
+                for (root, name) in published {
+                    let root = std::path::PathBuf::from(&root);
+                    let wire_name = crate::net::republish_name(&root, name.as_deref());
+                    let _ = net.send(NetCommand::PublishShare {
+                        root,
+                        name: wire_name,
+                        sharer_handle: sharer_handle.clone(),
+                    });
+                }
+            }
         }
     });
     // #91: opening (or Refresh-ing) the Announcements pane fetches the connected

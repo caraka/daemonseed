@@ -2248,6 +2248,15 @@ fn apply_operator_item(
 /// onto the lobby rendezvous with a SIGNED route advert (anti-swap, D-3.5).
 /// Mirrors the relay actor's `handle_publish_share` (minus the redb chunk-addr
 /// cache — the RAM index is the no-cache path).
+/// Insert or replace an own-share entry, keyed by its deterministic `share_id`
+/// (#156, #195). A mid-session re-index (manual Refresh) republishes the same root
+/// under the same id, so this upserts rather than appends — `own` never carries a
+/// duplicate entry for one root.
+fn upsert_own_share(own: &mut Vec<OwnShare>, entry: OwnShare) {
+    own.retain(|s| s.share_id != entry.share_id);
+    own.push(entry);
+}
+
 async fn publish_share(
     shares: &mut ShareState,
     evt_tx: &UnboundedSender<NetEvent>,
@@ -2367,13 +2376,20 @@ async fn publish_share(
         return err(format!("could not announce share: {e}"));
     }
 
-    shares.own.push(OwnShare {
-        share_id: share_id.clone(),
-        root_commitment: root_commitment.to_vec(),
-        name: name.clone(),
-        rating,
-        sharer_handle,
-    });
+    // #195: a mid-session re-index (manual Refresh) republishes under the SAME
+    // deterministic share_id, so upsert (replace) any existing own-entry rather
+    // than appending a duplicate. At connect-time restore `own` is empty, so this
+    // is a plain push there; the upsert is the mid-session idempotency guard.
+    upsert_own_share(
+        &mut shares.own,
+        OwnShare {
+            share_id: share_id.clone(),
+            root_commitment: root_commitment.to_vec(),
+            name: name.clone(),
+            rating,
+            sharer_handle,
+        },
+    );
     // Reflect the new own-share immediately (the lobby never echoes it back).
     let _ = evt_tx.send(NetEvent::SharesSnapshot {
         shares: shares.listings(),
@@ -4823,6 +4839,33 @@ mod tests {
             }
             other => panic!("expected PublishError, got {other:?}"),
         }
+    }
+
+    /// #195 (CRSH-ISC-28): a mid-session re-index republishes a root under its SAME
+    /// deterministic `share_id`, so the own-share list upserts in place — one entry
+    /// per root, never a growing pile of duplicates on repeated Refresh.
+    #[test]
+    fn upsert_own_share_replaces_same_id_without_duplicating() {
+        let mk = |sid: &str, name: &str| OwnShare {
+            share_id: sid.to_owned(),
+            root_commitment: vec![1, 2, 3],
+            name: name.to_owned(),
+            rating: String::new(),
+            sharer_handle: "tester".to_owned(),
+        };
+        let mut own: Vec<OwnShare> = Vec::new();
+
+        upsert_own_share(&mut own, mk("sid-1", "v1"));
+        assert_eq!(own.len(), 1);
+
+        // Re-index of the SAME root (same share_id) with a refreshed manifest/name.
+        upsert_own_share(&mut own, mk("sid-1", "v2"));
+        assert_eq!(own.len(), 1, "same share_id must not duplicate");
+        assert_eq!(own[0].name, "v2", "the re-index replaces in place");
+
+        // A genuinely different share keeps its own slot.
+        upsert_own_share(&mut own, mk("sid-2", "other"));
+        assert_eq!(own.len(), 2);
     }
 
     /// A-c: `RefreshPublicSpace` with no operator record subscribed (not connected)

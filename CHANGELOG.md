@@ -30,6 +30,7 @@ work lives in the project lead's vault manifest, not here.
 - `daemonseed-core`: a consumer-side per-record session-health tracker (`session_health`) that flags a record repair-due after K consecutive all-failed steady-resweep passes in calm weather, from network-state evidence only — the detection half of the share-route self-heal (#180, CRSH-ISC-2/9/11).
 - `daemonseed-veilid-net`: a `RepairDue` record is re-established under its `record_lock` (invalidate open-cache → re-open → re-watch → full sweep), dispatched on cadence past warmup, with per-record decaying backoff for a permanently-dead record; a same-record write serializes behind the repair and reads the fresh session (#180, CRSH-ISC-3/17/18).
 - `daemonseed-gui`: the manual Refresh button is now sweep-first over every share-bearing subscribed record (traffic-shaped like the steady resweep, off the actor loop) with evidence-gated re-establishment — a record whose Refresh sweep just failed in calm weather re-establishes its session in one action, while a healthy record emits only sweep GETs (#180, CRSH-ISC-13/16/20).
+- `daemonseed-gui`: the manual Refresh re-indexes each own published root (`ShareContent::index_dir`) and re-announces it under the same deterministic `share_id`, so a file added to a shared folder mid-session becomes fetchable without a relaunch; the own-share list upserts by `share_id` and the re-index is gated on Connected and rides only the user-initiated Refresh, never the 3 s liveness poll (#195, CRSH-ISC-28).
 
 ### Changed
 

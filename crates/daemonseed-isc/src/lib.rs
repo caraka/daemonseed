@@ -361,13 +361,14 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("CRSH-ISC-25", IscClass::Positive), // a successful download (confirm_fetch success) clears the share's Unresolved mark + its parked browse retry — symmetric with the download-failure mark and the browse-preview-success clear; no share stays "re-resolving" after a completed download (§RS-1.4, #180 F6)
     ("CRSH-ISC-26", IscClass::Positive), // a verified withdraw releases the share's imported route — immediately when idle, or deferred to in-flight-fetch completion — and drops its route_guard entry, so no imported route leaks past withdraw and route_guard does not grow unbounded; the release is idempotent (§RS-3, #180 F7)
     ("CRSH-ISC-27", IscClass::Positive), // a rotated route re-imports even when the catalog folds Unchanged: a same-timestamp re-advert (sharer restart/route-death, only route_blob rotated) re-imports the new blob, stamps a fresh generation to arm the parked retry, and keeps the share Unresolved — un-wedging the consumer without a restart; an identical re-read (no rotation) still folds with no generation churn (§RS-1.4/§RS-3, #180 — the CRSH-ISC-12 wedge)
+    ("CRSH-ISC-28", IscClass::Positive), // manual Refresh re-indexes each own published root (ShareContent::index_dir) and re-announces under the SAME deterministic share_id, so a file added mid-session becomes fetchable without a relaunch; the own-share list upserts by share_id (no duplicate on repeated Refresh); gated on Connected, never on the 3 s liveness poll (#195)
 ];
 
 /// Total built, non-deferred ISCs tracked by this registry — the SINGLE source
 /// of truth for the coverage denominator, read live by `xtask isc-coverage`.
 /// Recount on every ISC add/remove (the `const _` assert below guards it
 /// against [`ISCS`]).
-pub const TOTAL: usize = 215;
+pub const TOTAL: usize = 216;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -559,7 +560,7 @@ mod tests {
         //                                  chat-never-waits / panic-recovery /
         //                                  telemetry-only / single-permit), #159/#168/#157)
         //                                  consumer route self-heal (#180):
-        //                                  CRSH-ISC-1/2/9/3/18/5/6/19/8/10/13/21/22/23/24/25/26/27 pos (sweep
+        //                                  CRSH-ISC-1/2/9/3/18/5/6/19/8/10/13/21/22/23/24/25/26/27/28 pos (sweep
         //                                  accounting, K-detection, weather gating,
         //                                  record_lock repair, chat serialization,
         //                                  Unresolved-not-prune, parked retry, generation,
@@ -568,16 +569,17 @@ mod tests {
         //                                  repair-off-loop dispatch, fresh-advert-stale re-park,
         //                                  queued-repair drain re-check, download-success clears
         //                                  Unresolved, withdraw releases+drops imported route,
-        //                                  route-rotation re-import on catalog-Unchanged) +
+        //                                  route-rotation re-import on catalog-Unchanged,
+        //                                  Refresh re-indexes own roots) +
         //                                  CRSH-ISC-11/14/17/4/15/7/16/20 neg (network-state-only
         //                                  input, margin limiter, no-nested-permit,
         //                                  zero-network reactive, retry decorrelation,
         //                                  fetch-never-delays-chat, Refresh-healthy-sweep-only,
         //                                  Refresh-user-initiated-only)
-        //   total   142 pos + 73 neg = 215
+        //   total   143 pos + 73 neg = 216
         //   (the v0.33.0 Veilid cutover retired 14 server-positive + 10
         //    server-negative relay/TLS/federation/rate-limit ISCs.)
-        assert_eq!(pos, 142, "positive count drift");
+        assert_eq!(pos, 143, "positive count drift");
         assert_eq!(neg, 73, "negative count drift");
     }
 
