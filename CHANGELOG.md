@@ -42,6 +42,7 @@ work lives in the project lead's vault manifest, not here.
 ### Fixed
 
 - `daemonseed-gui`: Windows reclaims a stale single-instance lock via a per-root `Global` named mutex, and surfaces a native recovery dialog on the no-console build instead of failing to start silently (#196).
+- `daemonseed-gui`: a long connect-error message in the startup mask word-wraps within a capped width instead of overflowing off-screen (#193).
 - `daemonseed-veilid-net`: the steady resweep surfaces per-record GET accounting (attempted/failed/found) instead of swallowing GET errors into the empty-slot path — the enabling observability for consumer-side session-health (#180, CRSH-ISC-1).
 - `daemonseed-{gui,tui}`: a share fetch runs off the net-actor loop — spawned, with its outcome folded back on-loop as a generation-tagged event — so a slow or failing fetch can no longer starve chat delivery (#180, CRSH-ISC-7/8).
 - `daemonseed-veilid-net`: a `RepairRendezvous` is dispatched off the transport actor loop (spawned, not awaited inline) so a slow repair's close/open/watch/sweep no longer stalls chat and joins; a per-record in-flight guard skips a re-dispatch for a record already repairing (#180, CRSH-ISC-22).
