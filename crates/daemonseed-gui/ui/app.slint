@@ -1342,19 +1342,7 @@ export component AppWindow inherits Window {
             Text { text: "No servers — just peers. This can take a moment on a cold start."; color: #8b93a1; font-size: 13px; horizontal-alignment: center; }
             // #144: the attach peer count climbing gives the wait live motion; blank until the first count arrives.
             Text { text: root.mask-peer-count; visible: root.mask-peer-count != ""; color: #6fb3a4; font-size: 14px; horizontal-alignment: center; }
-            Text {
-                text: root.connection-status;
-                color: #5b6472;
-                font-size: 12px;
-                horizontal-alignment: center;
-                // #193: wrap long connect errors instead of overflowing off-screen. A
-                // constant `max-width` caps the wrap width for readability without reading
-                // `root.width` (which formed a `width -> layoutinfo-h -> root.width` binding
-                // loop) and without a `min-width` that would lock the window width; on a
-                // window narrower than the cap the layout wraps to the available width.
-                wrap: word-wrap;
-                max-width: 560px;
-            }
+            Text { text: root.connection-status; color: #5b6472; font-size: 12px; horizontal-alignment: center; }
             Rectangle { height: 6px; }
             HorizontalLayout {
                 alignment: center;
