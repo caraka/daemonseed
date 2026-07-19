@@ -133,7 +133,7 @@ const H: u32 = 680;
 /// Released build version shown in-app (auth-screen readout, issue #59 surface).
 /// Stamped at release from the git tag — like `lama.yaml` `version` and the README
 /// Status line — NOT Cargo's tag-driven `0.1.0`.
-const APP_VERSION: &str = "v0.34.0";
+const APP_VERSION: &str = "v0.35.0";
 
 /// Run `f` on the next event-loop tick instead of synchronously. Used to move
 /// `.focus()` calls OUT of key-event handlers: focusing an element while Slint is
