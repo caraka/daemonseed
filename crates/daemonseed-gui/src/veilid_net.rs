@@ -118,11 +118,20 @@ const SHARE_CATALOG_TTL: Duration = Duration::from_secs(600);
 /// How often the recipient ages out shares it has not reheard within the TTL.
 const SHARE_CATALOG_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Max chunk fetches in flight at once during a download (#113). Bounds the
+/// Ceiling for chunk fetches in flight at once during a download (#113). Bounds the
 /// parallelism so a many-chunk file saturates the link without an unbounded fan-out
 /// of `app_call`s; mirrors the veilid-net fragment pipeline window (#109). Chunks
-/// still reassemble in manifest order (`buffered` preserves order).
+/// still reassemble in manifest order (`buffered` preserves order). This is the
+/// MAXIMUM the adaptive chunk window ([`CHUNK_SLOW_START`], #128 D-2) climbs to.
 const CHUNK_FETCH_CONCURRENCY: usize = 8;
+
+/// The chunk window a download OPENS at before climbing (#128 D-2 / #204). A cold
+/// open at the full [`CHUNK_FETCH_CONCURRENCY`] ceiling drives a sustained
+/// chunk×fragment fanout (up to 8×2) that killed the fetch route mid-folder on
+/// Windows before the adaptive controller ever saw a healthy sample. Slow-starting
+/// gentle and climbing by one per healthy chunk keeps the route alive; a folder
+/// with many chunks still reaches the ceiling within a few files.
+const CHUNK_SLOW_START: usize = 2;
 
 // ── Operator announce-record item envelope (Phase 4 A-c) ─────────────────────
 //
@@ -3053,17 +3062,29 @@ async fn confirm_fetch_inner(
     let mut bytes_received: u64 = 0;
     let mut files_written: u32 = 0;
 
-    // #128 D-1: ONE adaptive fragment-concurrency window for the whole download,
-    // shared across every chunk fetch (chunks still run concurrently — #113).
-    // It starts fully open at FRAGMENT_FETCH_CONCURRENCY (safe-by-default: a
-    // healthy download is unchanged) and only narrows, floored at 1, when a
-    // chunk's fragment `app_call`s breach FRAGMENT_LATENCY_THRESHOLD — yielding
-    // bandwidth back to interactive chat under fat-link congestion, then climbing
-    // back as latency recovers. `Arc<Mutex>` because concurrent chunk fetches read
-    // and update it (the guard is never held across an await).
+    // TWO adaptive concurrency windows for the whole download, each shared across
+    // every chunk fetch, both fed the per-chunk max-fragment latency against
+    // FRAGMENT_LATENCY_THRESHOLD. `Arc<Mutex>` because concurrent chunk fetches read
+    // and update them (the guard is never held across an await).
+    //
+    // #128 D-1: the FRAGMENT window — opens fully at FRAGMENT_FETCH_CONCURRENCY
+    // (safe-by-default: a healthy download is unchanged), narrows floored at 1 on a
+    // latency breach, yielding bandwidth back to interactive chat under fat-link
+    // congestion and climbing back as latency recovers.
     let aimd = std::sync::Arc::new(std::sync::Mutex::new(AimdWindow::new(
         1,
         daemonseed_veilid_net::share::FRAGMENT_FETCH_CONCURRENCY,
+    )));
+    // #128 D-2 / #204: the CHUNK window — the dominant folder fanout (chunks per
+    // file). It SLOW-STARTS at CHUNK_SLOW_START and climbs by one per healthy chunk
+    // up to the CHUNK_FETCH_CONCURRENCY ceiling, so the fetch route is never hit
+    // with the cold sustained wide fanout that killed Windows folder downloads. It
+    // carries its learned window across files (read once per file, below), so
+    // backoff learned early in a folder persists.
+    let chunk_aimd = std::sync::Arc::new(std::sync::Mutex::new(AimdWindow::slow_start(
+        CHUNK_SLOW_START,
+        1,
+        CHUNK_FETCH_CONCURRENCY,
     )));
 
     for (pos, &i) in indices.iter().enumerate() {
@@ -3087,24 +3108,34 @@ async fn confirm_fetch_inner(
         // manifest order for byte-for-byte reassembly. Each `fetch_chunk` reassembles
         // its transport fragments and SHA-384-verifies the chunk against its address
         // (ISC-S28 / ISC-A-S20); the first failure prunes the stale share and aborts.
+        // Open this file at the chunk window learned so far (slow-start on the
+        // first file, then whatever the running download has climbed/backed off to
+        // — #128 D-2). The window is read once per file: `buffered` fixes its
+        // concurrency for the file, and the per-chunk `observe` below adapts the
+        // window the NEXT file opens at.
+        let cap = chunk_aimd.lock().expect("chunk aimd mutex").window();
         let chunks = match fetch_chunks_ordered(
             &entry.chunks,
-            CHUNK_FETCH_CONCURRENCY,
+            cap,
             |addr| {
-                // Fetch this chunk's fragments at the current adaptive window, then
-                // feed the max observed fragment latency back so the NEXT chunk's
-                // window backs off (or recovers) — #128 D-1.
+                // Fetch this chunk's fragments at the current adaptive fragment
+                // window, then feed the max observed fragment latency back to BOTH
+                // controllers — the fragment window for the next chunk (#128 D-1)
+                // and the chunk window for the next file (#128 D-2).
                 let aimd = aimd.clone();
+                let chunk_aimd = chunk_aimd.clone();
                 let route = route.clone();
                 let window = aimd.lock().expect("aimd mutex").window();
                 async move {
                     let (data, latency) = handle
                         .fetch_chunk(route, share_id, addr, room_key_bytes, window)
                         .await?;
-                    aimd.lock().expect("aimd mutex").observe(
-                        latency,
-                        daemonseed_veilid_net::share::FRAGMENT_LATENCY_THRESHOLD,
-                    );
+                    let threshold = daemonseed_veilid_net::share::FRAGMENT_LATENCY_THRESHOLD;
+                    aimd.lock().expect("aimd mutex").observe(latency, threshold);
+                    chunk_aimd
+                        .lock()
+                        .expect("chunk aimd mutex")
+                        .observe(latency, threshold);
                     Ok::<Vec<u8>, VeilidNetError>(data)
                 }
             },

@@ -31,6 +31,7 @@ work lives in the project lead's vault manifest, not here.
 ### Fixed
 
 - `daemonseed-veilid-net`: fetch fragment concurrency lowered 8 → 2 so a multi-file folder download no longer kills the serving private route mid-fetch (#204).
+- `daemonseed-gui`: the folder-download chunk-fetch window slow-starts and adapts to route health (`AimdWindow::slow_start`, #128 D-2) rather than opening at the fixed 8-wide chunk fanout, keeping multi-file folder downloads from killing the serving private route mid-fetch on Windows (#204).
 
 ## [0.34.0] — 2026-07-19
 

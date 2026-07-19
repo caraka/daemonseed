@@ -11,13 +11,17 @@
 //! synthetic samples — no fake-clock harness needed, the injected `Duration` *is*
 //! the fake clock.
 //!
-//! **Not yet live-wired (deliberate).** #128's ratification mandates
-//! *measure-then-confirm*: the morning fat-link felt-test decides whether D-0a
-//! (open-handle cache) + D-0b (publishes off the FIFO) alone dissolved the chat
-//! starvation before the adaptive yield is engaged, and *measure before choosing*
-//! the signal source and threshold. So this primitive ships tested and ready; the
-//! live wiring (which fetch level, which interactive-latency signal, which
-//! threshold) is the follow-on gated on that measurement.
+//! **Live-wired at two fetch levels.** The GUI share fetcher drives one
+//! controller per download at each level, both fed the per-chunk max-fragment
+//! latency against `FRAGMENT_LATENCY_THRESHOLD`:
+//!   - the **fragment** window (`new`, opens at the static ceiling — #128 D-1,
+//!     commit `4e4aba6`), and
+//!   - the **chunk** window (`slow_start`, opens gentle and climbs — #128 D-2,
+//!     #204): a folder download's dominant fanout is chunks-per-file, and a cold
+//!     open at the full ceiling can kill the fetch route under a sustained wide
+//!     fanout before the controller ever sees a healthy sample (observed on
+//!     Windows folder downloads). Slow-start opens below the ceiling so the route
+//!     is never hit with a fanout it can't survive.
 
 use std::time::Duration;
 
@@ -39,6 +43,24 @@ impl AimdWindow {
         let floor = floor.clamp(1, ceiling);
         Self {
             window: ceiling,
+            floor,
+            ceiling,
+        }
+    }
+
+    /// A *slow-starting* controller: it opens at `start` (clamped into
+    /// `[floor, ceiling]`) rather than at the ceiling, then climbs additively
+    /// while healthy. Use this where a cold fanout at the full ceiling would
+    /// itself cause the breach it should avoid — a fetch route that dies under a
+    /// sustained wide fanout before the controller ever observes a healthy sample
+    /// (#204: Windows folder downloads). `new` (open-at-ceiling) stays the default
+    /// where the ceiling is known-safe and slow-start would only cost warm-up.
+    pub fn slow_start(start: usize, floor: usize, ceiling: usize) -> Self {
+        let ceiling = ceiling.max(1);
+        let floor = floor.clamp(1, ceiling);
+        let window = start.clamp(floor, ceiling);
+        Self {
+            window,
             floor,
             ceiling,
         }
@@ -136,5 +158,32 @@ mod tests {
         // Under the threshold climbs.
         w.observe(Duration::from_millis(10), threshold);
         assert_eq!(w.window(), 3);
+    }
+
+    #[test]
+    fn slow_start_opens_below_the_ceiling_and_climbs() {
+        let mut w = AimdWindow::slow_start(2, 1, 8);
+        assert_eq!(
+            w.window(),
+            2,
+            "opens at the slow-start value, not the ceiling"
+        );
+        w.on_healthy();
+        assert_eq!(w.window(), 3, "climbs additively from the slow start");
+        // `start` is clamped into `[floor, ceiling]`.
+        assert_eq!(
+            AimdWindow::slow_start(0, 1, 8).window(),
+            1,
+            "a start below the floor is clamped up to the floor"
+        );
+        assert_eq!(
+            AimdWindow::slow_start(99, 1, 8).window(),
+            8,
+            "a start above the ceiling is clamped down to the ceiling"
+        );
+        // A breach still halves and the floor still holds from a slow start.
+        let mut w = AimdWindow::slow_start(4, 1, 8);
+        w.on_breach();
+        assert_eq!(w.window(), 2);
     }
 }
