@@ -24,6 +24,10 @@ next release this block is renamed to its version + date and a fresh
 `[Unreleased]` is opened (see `AGENTS.md` doc-sync). Planning for *unstarted*
 work lives in the project lead's vault manifest, not here.
 
+### Changed
+
+- `daemonseed-veilid-net`: veilid-core 0.5.6 → 0.5.7.
+
 ## [0.34.0] — 2026-07-19
 
 ### Added

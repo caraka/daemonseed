@@ -13,7 +13,7 @@ description = "Veilid transport layer for daemonseed (Phase 1 skeleton): identit
 [dependencies]
 # D4: join the PUBLIC Veilid network (no network_key_password). Private routes
 # (the proven path) need no footgun feature.
-veilid-core = { version = "0.5.6", default-features = false, features = ["default-tokio"] }
+veilid-core = { version = "0.5.7", default-features = false, features = ["default-tokio"] }
 
 # D3 identity binding: VeilidNodeSeed lives in daemonseed-core (keys.rs).
 # In-tree sibling crate (this crate is workspace-excluded, so a plain path dep).
