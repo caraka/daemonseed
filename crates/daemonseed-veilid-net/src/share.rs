@@ -60,15 +60,24 @@ const FRAGMENT_RETRY_BACKOFF_MS: u64 = 250;
 /// Fragment 0 is fetched alone to learn `total`; fragments `1..total` are then
 /// pipelined — up to this many concurrent round-trips within the one fetch task
 /// (`StreamExt::buffered`, no spawn, so the in-process `call` closures need not
-/// be `Send`/`'static`). A 1 MiB chunk is ~34 fragments; a window of 8 collapses
-/// ~34 serial round-trips into ~5 waves — the wall-clock win behind #109 — while
-/// a bounded window avoids hammering a work-in-progress private route.
+/// be `Send`/`'static`). Pipelining still collapses a chunk's serial round-trips
+/// into fewer waves (the wall-clock win behind #109), just at a lower concurrency.
+///
+/// Set to 2 (#204): a multi-file folder download sustains this window across many
+/// fragments, and a 2-client felt-test on veilid 0.5.7 showed a wider window kills
+/// the serving private route mid-fetch — the whole folder fails with
+/// `could not get remote private route`, while single files (one brief wave)
+/// succeed. A bisect landed 2 as the widest window a folder downloads cleanly at
+/// (8 and 4 both killed the route; 1 and 2 held). The route tolerates almost no
+/// fetch-side concurrency on 0.5.7, so this stays conservative until the adaptive
+/// window below is live-wired (the real fix — climb only while the route stays
+/// healthy; #128 D-1 wiring, motivated by #204).
 ///
 /// This is also the CEILING (and the safe-by-default starting value) of the
 /// fetcher-side [`crate::AimdWindow`] adaptive window (#128 D-1): a healthy
 /// download runs fully open at this cap, and the controller only narrows below it
 /// on a latency breach.
-pub const FRAGMENT_FETCH_CONCURRENCY: usize = 8;
+pub const FRAGMENT_FETCH_CONCURRENCY: usize = 2;
 
 /// Per-fragment `app_call` round-trip latency at or above which the fetcher-side
 /// AIMD window treats the link as congested and backs off (#128 D-1). INITIAL,

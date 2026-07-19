@@ -28,6 +28,10 @@ work lives in the project lead's vault manifest, not here.
 
 - `daemonseed-veilid-net`: veilid-core 0.5.6 → 0.5.7.
 
+### Fixed
+
+- `daemonseed-veilid-net`: fetch fragment concurrency lowered 8 → 2 so a multi-file folder download no longer kills the serving private route mid-fetch (#204).
+
 ## [0.34.0] — 2026-07-19
 
 ### Added
