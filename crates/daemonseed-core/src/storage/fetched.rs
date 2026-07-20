@@ -324,8 +324,14 @@ fn sanitize_rel_path(rel: &str) -> Result<PathBuf, FetchedError> {
         }
         // The staging namespace is reserved — no manifest path may name it, so a
         // hostile `rel_path` can neither reach into the quarantine nor collide
-        // with an in-progress partial (DL-ISC-18).
-        if seg == STAGING_DIR {
+        // with an in-progress partial (DL-ISC-18). Case-fold and strip trailing
+        // dots/spaces first: Windows/macOS lookups are case-insensitive and Win32
+        // strips trailing dots/spaces, so `.DSPART`, `.dspart.`, and `.dspart `
+        // all alias the reserved dir on the target platforms.
+        if seg
+            .trim_end_matches(['.', ' '])
+            .eq_ignore_ascii_case(STAGING_DIR)
+        {
             return Err(FetchedError::UnsafePath(rel.to_owned()));
         }
         let p = Path::new(seg);
@@ -624,27 +630,51 @@ fn pwrite_all(f: &std::fs::File, offset: u64, bytes: &[u8]) -> std::io::Result<(
     }
 }
 
-/// The first non-existing path at or suffixed from `path`: `name.ext`, then
-/// `name-2.ext`, `name-3.ext`, … — an existing file is never overwritten
-/// (DL-ISC-21). The suffix goes before the extension so the file keeps its type.
-fn no_clobber_target(path: &Path) -> PathBuf {
-    if !path.exists() {
-        return path.to_path_buf();
-    }
-    let parent = path.parent().unwrap_or_else(|| Path::new(""));
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
-    let ext = path.extension().and_then(|s| s.to_str());
-    let mut n = 2usize;
+/// The injective, always-safe staging directory component for a `share_id`: hex
+/// of its bytes. Two distinct share_ids can never collide onto one staging area
+/// (the lossy [`safe_folder_name`] is many-to-one — `a/b` and `a_b` both fold to
+/// `a_b`, all-dots to `share` — which would let two fetches share one quarantine
+/// and cross-contaminate their partials).
+fn staging_component(share_id: &str) -> String {
+    hex::encode(share_id.as_bytes())
+}
+
+/// Atomically reserve the first free `name`/`name-N.ext` slot at `intended` by an
+/// `O_EXCL` create, and return it — never overwriting a pre-existing file
+/// (DL-ISC-21). Reserving with `create_new` closes the check-then-rename TOCTOU:
+/// the caller renames the staged file ONTO this reservation (which it now
+/// exclusively owns), so a concurrent promote that picks the same name loses the
+/// `create_new` race and advances to the next suffix instead of clobbering. The
+/// suffix goes before the extension so the file keeps its type.
+fn reserve_no_clobber_target(intended: &Path) -> Result<PathBuf, FetchedError> {
+    let parent = intended.parent().unwrap_or_else(|| Path::new("."));
+    let stem = intended
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file");
+    let ext = intended.extension().and_then(|s| s.to_str());
+    let mut n = 1usize;
     loop {
-        let name = match ext {
-            Some(e) => format!("{stem}-{n}.{e}"),
-            None => format!("{stem}-{n}"),
+        let candidate = if n == 1 {
+            intended.to_path_buf()
+        } else {
+            let name = match ext {
+                Some(e) => format!("{stem}-{n}.{e}"),
+                None => format!("{stem}-{n}"),
+            };
+            parent.join(name)
         };
-        let cand = parent.join(name);
-        if !cand.exists() {
-            return cand;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(_) => return Ok(candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                n = if n == 1 { 2 } else { n + 1 };
+            }
+            Err(e) => return Err(FetchedError::Io(e)),
         }
-        n += 1;
     }
 }
 
@@ -667,7 +697,7 @@ impl StagingArea {
     /// Open (creating) the staging area for `share_id` under `root`.
     pub fn open(root: impl Into<PathBuf>, share_id: &str) -> Result<Self, FetchedError> {
         let root = root.into();
-        let dir = root.join(STAGING_DIR).join(safe_folder_name(share_id));
+        let dir = root.join(STAGING_DIR).join(staging_component(share_id));
         std::fs::create_dir_all(&dir)?;
         Ok(Self { root, dir })
     }
@@ -710,6 +740,20 @@ impl StagingArea {
     ) -> Result<(), FetchedError> {
         let path = self.staging_path(final_rel)?;
         let f = std::fs::OpenOptions::new().write(true).open(&path)?;
+        // Defence-in-depth: a chunk must land within the pre-sized file — never
+        // extend it past the confirmed manifest's size (a hostile/mis-derived
+        // offset must not silently grow the staged file). The caller supplies a
+        // manifest-derived offset; verification is content-only, not positional.
+        let allocated = f.metadata()?.len();
+        if offset
+            .checked_add(bytes.len() as u64)
+            .is_none_or(|end| end > allocated)
+        {
+            return Err(FetchedError::Corrupt(format!(
+                "chunk at offset {offset} (+{} bytes) exceeds the {allocated}-byte staged file",
+                bytes.len()
+            )));
+        }
         pwrite_all(&f, offset, bytes)?;
         Ok(())
     }
@@ -725,7 +769,7 @@ impl StagingArea {
         if let Some(parent) = intended.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let target = no_clobber_target(&intended);
+        let target = reserve_no_clobber_target(&intended)?;
         std::fs::rename(&staging, &target)?;
         Ok(target)
     }
@@ -1124,6 +1168,85 @@ mod tests {
         staging.destroy().unwrap();
         assert!(!staging.dir().exists(), "staging erased");
         staging.destroy().unwrap(); // idempotent
+    }
+
+    /// DL-ISC-18 (review): the `.dspart` refusal is case-insensitive and strips
+    /// trailing dots/spaces, so a hostile manifest cannot alias the reserved
+    /// quarantine on Windows/macOS (`.DSPART`, `.dspart.`, `.dspart `).
+    #[test]
+    fn staging_guard_rejects_case_and_trailing_dot_variants() {
+        for hostile in [
+            ".DSPART/evil.txt",
+            ".DsPart/evil.txt",
+            ".dspart./evil.txt",
+            ".dspart /evil.txt",
+            "sub/.DSPART/evil.txt",
+            ".dspart",
+        ] {
+            assert!(
+                sanitize_rel_path(hostile).is_err(),
+                "must refuse {hostile:?}"
+            );
+        }
+        // A name that merely resembles it (different component) is still fine.
+        assert!(sanitize_rel_path(".dspartx/notes.txt").is_ok());
+        assert!(sanitize_rel_path("my.dspart.backup/notes.txt").is_ok());
+    }
+
+    /// Review finding: two distinct share_ids that the lossy `safe_folder_name`
+    /// would fold together get DISTINCT staging areas (injective hex component),
+    /// so their partials can never cross-contaminate.
+    #[test]
+    fn distinct_share_ids_get_distinct_staging() {
+        // `a/b` and `a_b` both fold to `a_b` under safe_folder_name.
+        assert_eq!(safe_folder_name("a/b"), safe_folder_name("a_b"));
+        assert_ne!(
+            staging_component("a/b"),
+            staging_component("a_b"),
+            "hex component is injective"
+        );
+        let dir = tempfile::TempDir::new().unwrap();
+        let a = StagingArea::open(dir.path(), "a/b").unwrap();
+        let b = StagingArea::open(dir.path(), "a_b").unwrap();
+        assert_ne!(a.dir(), b.dir(), "distinct staging dirs");
+    }
+
+    /// Review finding: a chunk write is refused if its offset+len would extend the
+    /// staged file past the preallocated (confirmed-manifest) size.
+    #[test]
+    fn write_rejects_out_of_range_offset() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let staging = StagingArea::open(dir.path(), "share3").unwrap();
+        staging.preallocate("f.bin", 10).unwrap();
+        assert!(
+            staging
+                .write_verified_chunk("f.bin", 0, b"0123456789")
+                .is_ok()
+        );
+        assert!(staging.write_verified_chunk("f.bin", 6, b"6789").is_ok());
+        // offset+len past the end is refused.
+        assert!(matches!(
+            staging.write_verified_chunk("f.bin", 8, b"88888"),
+            Err(FetchedError::Corrupt(_))
+        ));
+        assert!(matches!(
+            staging.write_verified_chunk("f.bin", 10, b"x"),
+            Err(FetchedError::Corrupt(_))
+        ));
+    }
+
+    /// A promote onto a FRESH name lands directly (the `create_new` reservation at
+    /// n=1 succeeds and the staged file renames onto it).
+    #[test]
+    fn promote_to_a_fresh_name_lands_directly() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let staging = StagingArea::open(root, "share4").unwrap();
+        staging.preallocate("out.bin", 3).unwrap();
+        staging.write_verified_chunk("out.bin", 0, b"abc").unwrap();
+        let final_path = staging.promote("out.bin").unwrap();
+        assert_eq!(final_path, root.join("out.bin"));
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"abc");
     }
 
     /// ISC-C63 / ISC-C65 — a recorded fetch writes named files (real names,
