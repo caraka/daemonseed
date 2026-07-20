@@ -386,13 +386,16 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("DL-ISC-11", IscClass::Positive), // chunk bytes reach disk only post-verify, in the reserved staging namespace, at manifest offsets; promote only after full-file completion
     ("DL-ISC-18", IscClass::Negative), // anti: the full computed dest path passes the guard as one unit, and the reserved .dspart staging component is refused in any manifest rel_path
     ("DL-ISC-21", IscClass::Negative), // anti: promotion at a chosen dest never overwrites a pre-existing unrelated path — it collision-suffixes instead
+    // Live-fetch registry + staging sweep (step 4c). Unit probes in
+    // daemonseed-core::storage::fetched (sweep_staging + LiveFetchRegistry).
+    ("DL-ISC-22", IscClass::Negative), // anti: the staging sweep deletes only state absent from the live-fetch registry (and not resumable)
 ];
 
 /// Total built, non-deferred ISCs tracked by this registry — the SINGLE source
 /// of truth for the coverage denominator, read live by `xtask isc-coverage`.
 /// Recount on every ISC add/remove (the `const _` assert below guards it
 /// against [`ISCS`]).
-pub const TOTAL: usize = 232;
+pub const TOTAL: usize = 233;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -609,13 +612,15 @@ mod tests {
         //                                  concurrency budget + controller);
         //                                  DL-ISC-7 pos (step 4a placement total
         //                                  function); DL-ISC-11 pos + DL-ISC-18/21
-        //                                  neg (step 4b stage-then-promote writer) —
+        //                                  neg (step 4b stage-then-promote writer);
+        //                                  DL-ISC-22 neg (step 4c live-fetch
+        //                                  registry + staging sweep) —
         //                                  the DL-ISC-* family registers per build step.
-        //   total   155 pos + 77 neg = 232
+        //   total   155 pos + 78 neg = 233
         //   (the v0.33.0 Veilid cutover retired 14 server-positive + 10
         //    server-negative relay/TLS/federation/rate-limit ISCs.)
         assert_eq!(pos, 155, "positive count drift");
-        assert_eq!(neg, 77, "negative count drift");
+        assert_eq!(neg, 78, "negative count drift");
     }
 
     /// COVERED is single-sourced and must agree with the per-milestone

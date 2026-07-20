@@ -1910,6 +1910,20 @@ types:
       the whole area (integrity abort / post-completion). The reserved `.dspart`
       component is refused by sanitize_rel_path.
 
+  - name: LiveFetchRegistry
+    module: daemonseed_core::storage::fetched
+    kind: struct
+    description: >-
+      The set of share_ids whose fetches are in-flight or resuming in this
+      process (cheap-to-clone shared set). register(share_id) returns a
+      LiveFetchGuard that unregisters on drop; is_active(share_id) queries it.
+      sweep_staging consults it so a registered fetch's staging is never reclaimed.
+
+  - name: LiveFetchGuard
+    module: daemonseed_core::storage::fetched
+    kind: struct
+    description: Keeps a share_id registered as an active fetch for its lifetime; unregisters on drop.
+
   - name: FetchedError
     module: daemonseed_core::storage::fetched
     kind: enum
@@ -4547,6 +4561,31 @@ functions:
       error_variants:
         - name: UnsafePath
           condition: a computed dest-relative path fails the traversal guard, or a file is under no selected root.
+
+  - name: sweep_staging
+    module: daemonseed_core::storage::fetched
+    description: >-
+      Reclaim unresumable staging debris under <root>/.dspart/: delete each
+      <hex-share_id> dir that is NEITHER registered as active (registry) NOR
+      resumable (is_resumable(share_id)). A registered/resumable fetch is kept; a
+      foreign (non-hex) dir is left untouched. Returns the deleted staging dirs.
+    signature: "pub fn sweep_staging(root: &Path, registry: &LiveFetchRegistry, is_resumable: impl Fn(&str) -> bool) -> Result<Vec<PathBuf>, FetchedError>"
+    parameters:
+      - name: root
+        type: "&Path"
+        direction: in
+        description: The downloads/destination root whose .dspart is swept.
+      - name: registry
+        type: "&LiveFetchRegistry"
+        direction: in
+        description: Active fetches whose staging must be kept.
+      - name: is_resumable
+        type: "impl Fn(&str) -> bool"
+        direction: in
+        description: Whether a share_id has a stored confirmed manifest (resumable — kept).
+    returns:
+      type: "Result<Vec<PathBuf>, FetchedError>"
+      description: The staging dirs deleted.
 
   # ── indexer ─────────────────────────────────────────────────────────
   - name: Indexer::cold_scan

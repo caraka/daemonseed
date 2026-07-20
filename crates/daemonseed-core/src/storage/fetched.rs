@@ -55,7 +55,9 @@
 //! S ...
 //! ```
 
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 /// Manifest header — bumped if the on-disk format changes incompatibly.
 const MANIFEST_HEADER: &str = "# daemonseed downloads manifest v2";
@@ -786,6 +788,102 @@ impl StagingArea {
     }
 }
 
+// ── Live-fetch registry + staging sweep (download-subsystem redesign, step 4c) ──
+//
+// A startup/idle sweep reclaims UNRESUMABLE staging debris (e.g. a crash before
+// the confirmed manifest persisted) but must never delete state belonging to a
+// registered in-flight or resuming fetch. A resume registers its share_id BEFORE
+// the sweep can run, closing the TOCTOU (design §Part 3; DL-ISC-22). The sweep
+// is gated on the registry + a caller-supplied resumable predicate, never on a
+// name pattern alone.
+
+/// The set of `share_id`s whose fetches are in-flight or resuming in THIS
+/// process. Cheap to clone (shared inner set); the staging sweep consults it.
+#[derive(Clone, Default)]
+pub struct LiveFetchRegistry {
+    active: Arc<Mutex<HashSet<String>>>,
+}
+
+impl LiveFetchRegistry {
+    /// A new, empty registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register `share_id` as an active fetch; the returned guard unregisters it
+    /// on drop. A resume registers before the sweep can run.
+    pub fn register(&self, share_id: &str) -> LiveFetchGuard {
+        self.active.lock().unwrap().insert(share_id.to_owned());
+        LiveFetchGuard {
+            registry: self.clone(),
+            share_id: share_id.to_owned(),
+        }
+    }
+
+    /// Whether `share_id` is currently registered as active.
+    pub fn is_active(&self, share_id: &str) -> bool {
+        self.active.lock().unwrap().contains(share_id)
+    }
+}
+
+/// Keeps a `share_id` registered as an active fetch for its lifetime; drops the
+/// registration (so the sweep may later reclaim its staging) on drop.
+pub struct LiveFetchGuard {
+    registry: LiveFetchRegistry,
+    share_id: String,
+}
+
+impl Drop for LiveFetchGuard {
+    fn drop(&mut self) {
+        self.registry.active.lock().unwrap().remove(&self.share_id);
+    }
+}
+
+/// Decode a staging directory component (`hex(share_id)`) back to its raw
+/// `share_id`, or `None` if the component is not one of our staging dirs.
+fn decode_staging_component(component: &str) -> Option<String> {
+    let bytes = hex::decode(component).ok()?;
+    String::from_utf8(bytes).ok()
+}
+
+/// Reclaim UNRESUMABLE staging debris under `<root>/.dspart/`: delete every
+/// `<share_id>` staging dir that is NEITHER registered as an active fetch
+/// (`registry`) NOR resumable (`is_resumable(share_id)` — the caller's check
+/// that a stored confirmed manifest exists for it). A directory whose name is
+/// not a valid staging component is foreign and left untouched. Returns the
+/// deleted staging dirs (DL-ISC-22).
+pub fn sweep_staging(
+    root: &Path,
+    registry: &LiveFetchRegistry,
+    is_resumable: impl Fn(&str) -> bool,
+) -> Result<Vec<PathBuf>, FetchedError> {
+    let staging_root = root.join(STAGING_DIR);
+    let entries = match std::fs::read_dir(&staging_root) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(FetchedError::Io(e)),
+    };
+    let mut deleted = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(share_id) = decode_staging_component(&name.to_string_lossy()) else {
+            // Not one of our staging dirs (foreign / not hex) — never delete on a
+            // name pattern alone.
+            continue;
+        };
+        if registry.is_active(&share_id) || is_resumable(&share_id) {
+            continue;
+        }
+        std::fs::remove_dir_all(entry.path())?;
+        deleted.push(entry.path());
+    }
+    Ok(deleted)
+}
+
 fn parse_manifest(raw: &str) -> Result<Vec<FetchedShare>, FetchedError> {
     let mut shares = Vec::new();
     let mut lines = raw.lines();
@@ -1247,6 +1345,82 @@ mod tests {
         let final_path = staging.promote("out.bin").unwrap();
         assert_eq!(final_path, root.join("out.bin"));
         assert_eq!(std::fs::read(&final_path).unwrap(), b"abc");
+    }
+
+    // ── Live-fetch registry + sweep (step 4c, DL-ISC-22) ──
+
+    /// DL-ISC-22: the sweep reclaims only staging that is NEITHER registered as an
+    /// active fetch NOR resumable — a registered fetch and a resumable one are both
+    /// kept; only unregistered, unresumable debris is deleted.
+    #[test]
+    fn sweep_reclaims_only_unregistered_unresumable_debris() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let stage_path = |sid: &str| root.join(STAGING_DIR).join(staging_component(sid));
+
+        StagingArea::open(root, "shareA").unwrap(); // registered (active)
+        StagingArea::open(root, "shareB").unwrap(); // unregistered, unresumable → debris
+        StagingArea::open(root, "shareC").unwrap(); // resumable (has stored manifest)
+
+        let registry = LiveFetchRegistry::new();
+        let _guard = registry.register("shareA");
+
+        let deleted = sweep_staging(root, &registry, |sid| sid == "shareC").unwrap();
+
+        assert_eq!(deleted, vec![stage_path("shareB")], "only debris reclaimed");
+        assert!(stage_path("shareA").exists(), "registered kept");
+        assert!(!stage_path("shareB").exists(), "debris reclaimed");
+        assert!(stage_path("shareC").exists(), "resumable kept");
+    }
+
+    /// DL-ISC-22 (TOCTOU close): a registered resume's staging is never swept, even
+    /// when the resumable predicate says false — registration is the guard.
+    #[test]
+    fn sweep_keeps_a_registered_resume() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        StagingArea::open(root, "resuming").unwrap();
+        let registry = LiveFetchRegistry::new();
+        let _guard = registry.register("resuming");
+        let deleted = sweep_staging(root, &registry, |_| false).unwrap();
+        assert!(deleted.is_empty(), "a registered fetch is never swept");
+        assert!(
+            root.join(STAGING_DIR)
+                .join(staging_component("resuming"))
+                .exists()
+        );
+    }
+
+    /// A foreign directory under `.dspart/` (not a valid staging component) is left
+    /// untouched — the sweep never deletes on a name pattern alone.
+    #[test]
+    fn sweep_leaves_foreign_dirs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let foreign = root.join(STAGING_DIR).join("not-a-hex-component");
+        std::fs::create_dir_all(&foreign).unwrap();
+        let deleted = sweep_staging(root, &LiveFetchRegistry::new(), |_| false).unwrap();
+        assert!(deleted.is_empty());
+        assert!(foreign.exists(), "foreign dir untouched");
+    }
+
+    /// Sweeping a root with no `.dspart` is a no-op.
+    #[test]
+    fn sweep_empty_root_is_noop() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let deleted = sweep_staging(dir.path(), &LiveFetchRegistry::new(), |_| false).unwrap();
+        assert!(deleted.is_empty());
+    }
+
+    /// The registry guard unregisters on drop.
+    #[test]
+    fn registry_guard_unregisters_on_drop() {
+        let registry = LiveFetchRegistry::new();
+        {
+            let _g = registry.register("s");
+            assert!(registry.is_active("s"));
+        }
+        assert!(!registry.is_active("s"), "unregistered on drop");
     }
 
     /// ISC-C63 / ISC-C65 — a recorded fetch writes named files (real names,
