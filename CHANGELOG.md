@@ -24,6 +24,10 @@ next release this block is renamed to its version + date and a fresh
 `[Unreleased]` is opened (see `AGENTS.md` doc-sync). Planning for *unstarted*
 work lives in the project lead's vault manifest, not here.
 
+### Fixed
+
+- Downloading a share no longer starves the downloader's own chat: `ConfirmFetch` runs off the net-actor loop, so chat sends/receives while a download is in flight (#197).
+
 ## [0.35.0] — 2026-07-19
 
 ### Changed

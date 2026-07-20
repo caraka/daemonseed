@@ -515,6 +515,13 @@ pub async fn veilid_net_actor(
     // the whole loop, so the receiver never closes while the actor lives.
     let (fetch_outcome_tx, mut fetch_outcome_rx) =
         tokio::sync::mpsc::unbounded_channel::<FetchOutcome>();
+    // (#197, mirroring #180 §RS-2 / CRSH-ISC-29) Spawned chunk DOWNLOADS (`ConfirmFetch`)
+    // report their terminal outcome here; the loop folds them on-loop (`fold_confirm_outcome`)
+    // so a slow/large download never parks the command loop and starves chat. Separate from
+    // the browse `fetch_outcome` channel because the download fold (Complete / route-death /
+    // local-disk) is disjoint from the browse fold's staleness dance.
+    let (confirm_outcome_tx, mut confirm_outcome_rx) =
+        tokio::sync::mpsc::unbounded_channel::<ConfirmOutcome>();
     // (#180 §RS-3, CRSH-ISC-10) The in-use guard over discovered shares' imported routes
     // lives on `shares.route_guard`; the loop drains `shares.pending_route_releases` below.
 
@@ -540,7 +547,7 @@ pub async fn veilid_net_actor(
                 } else {
                     handle_command(
                         cmd, &evt_tx, &cmd_tx, &mut net, &mut ev_rx, &mut circles, &mut my_handle,
-                        &mut shares, &fetch_outcome_tx,
+                        &mut shares, &fetch_outcome_tx, &confirm_outcome_tx,
                     ).await;
                 }
             }
@@ -550,6 +557,13 @@ pub async fn veilid_net_actor(
             // here (the await already happened in the spawned task).
             Some(outcome) = fetch_outcome_rx.recv() => {
                 fold_fetch_outcome(&mut shares, &evt_tx, outcome);
+            }
+            // (#197, CRSH-ISC-29) Fold a spawned download's terminal outcome on-loop: clear
+            // Unresolved on success / mark Unresolved on route-death / neither on a local-disk
+            // failure, and emit the terminal FetchComplete/FetchError. Cheap and synchronous —
+            // the download itself already ran in the spawned task, never awaited here.
+            Some(outcome) = confirm_outcome_rx.recv() => {
+                fold_confirm_outcome(&mut shares, &evt_tx, outcome);
             }
             // Only poll the Veilid event stream once connected.
             Some(ev) = recv_opt(&mut ev_rx), if ev_rx.is_some() => {
@@ -1226,6 +1240,9 @@ async fn handle_command(
     // (#180 §RS-2) Where a spawned `FetchShare` reports its generation-tagged outcome for
     // on-loop folding — the fetch never blocks this command loop (CRSH-ISC-8).
     fetch_outcome_tx: &UnboundedSender<FetchOutcome>,
+    // (#197, CRSH-ISC-29) Where a spawned `ConfirmFetch` download reports its terminal
+    // outcome for on-loop folding — the download never blocks this command loop either.
+    confirm_outcome_tx: &UnboundedSender<ConfirmOutcome>,
 ) {
     match cmd {
         NetCommand::Connect {
@@ -1452,17 +1469,20 @@ async fn handle_command(
             selected,
             flat_dest,
         } => {
-            confirm_fetch(
+            // (#197, CRSH-ISC-29) Spawn the download off-loop and return immediately — a
+            // slow/large download can never park this loop and starve chat (mirrors the #180
+            // §RS-2 FetchShare restructure). The terminal outcome folds on-loop.
+            spawn_confirm_fetch(
                 shares,
                 evt_tx,
                 net,
+                confirm_outcome_tx,
                 &share_id,
                 &name,
                 fetched_root,
                 selected,
                 flat_dest,
-            )
-            .await;
+            );
         }
 
         // ── Public-room (Lobby) chat ──
@@ -2947,241 +2967,338 @@ where
 /// A2 download: import the route, fetch the selected files' chunks (each
 /// SHA-384-verified inside `fetch_chunk`, ISC-S28), and write them under
 /// `fetched_root`. On any failure the partial files are deleted (ISC-A-C31).
-/// Mirrors the relay actor's `handle_confirm_fetch`.
+/// (#197, CRSH-ISC-29) The terminal outcome of a chunk download that ran in a spawned task
+/// **off** the net-actor loop. Folded back on-loop by [`fold_confirm_outcome`], which is
+/// where the `&mut ShareState` mark/clear-Unresolved mutation and the terminal
+/// `FetchComplete`/`FetchError` emission happen — never inside the spawned task.
+/// `FetchProgress` events still stream from the worker via the cloned `evt_tx`.
+enum ConfirmOutcome {
+    /// Every selected file was fetched, verified, and written. Fold: clear any Unresolved
+    /// mark + drop the parked retry (CRSH-ISC-25 F6), then emit `FetchComplete`.
+    Complete {
+        share_id: String,
+        files_written: u32,
+        bytes_written: u64,
+    },
+    /// A route-death failure (import / manifest / chunk fetch). Fold: mark the share
+    /// Unresolved + park a one-shot retry (#180 §RS-1.4/§RS-1.5, CRSH-ISC-5) — never a prune —
+    /// then emit `FetchError`. Any partial bytes were already cleaned in the worker (ISC-A-C31).
+    RouteFailed {
+        share_id: String,
+        name: String,
+        message: String,
+    },
+    /// A local failure (path sanitize / disk write) that must NOT mark the share Unresolved —
+    /// the sharer's route is fine. Fold: emit `FetchError` only. Partials already cleaned.
+    LocalFailed { message: String },
+}
+
+/// Internal: which fold action a download-worker failure implies. Keeps the failure sites in
+/// the worker terse (`.map_err`) while carrying the route-death-vs-local distinction that the
+/// prior inline code expressed by calling (or not calling) `mark_share_unresolved`.
+enum ConfirmFail {
+    /// Import / manifest / chunk-fetch failure — the sharer's route is dead: mark Unresolved.
+    RouteDeath(String),
+    /// Path-sanitize / local-disk failure — the route is fine: do not mark Unresolved.
+    Local(String),
+}
+
+/// (#197, CRSH-ISC-29) Dispatch an A1/A2 chunk download **off** the net-actor loop: copy the
+/// route blob + room key out of share state, spawn [`run_confirm_download`], and return
+/// immediately so the actor loop returns to its `select!` without ever awaiting the download
+/// (the chat-starvation fix, mirroring the #180 §RS-2 `spawn_fetch_share` restructure). The
+/// terminal outcome returns via `outcome_tx` and is folded on-loop by [`fold_confirm_outcome`].
+/// Immediate local failures (not connected, lobby not subscribed, share not discovered) still
+/// fail inline — they touch no network, need no spawn, and (matching the prior inline behavior)
+/// never mark the share Unresolved.
 #[allow(clippy::too_many_arguments)]
-async fn confirm_fetch(
+fn spawn_confirm_fetch(
     shares: &mut ShareState,
     evt_tx: &UnboundedSender<NetEvent>,
     net: &Option<VeilidNetHandle>,
+    outcome_tx: &UnboundedSender<ConfirmOutcome>,
     share_id: &str,
     name: &str,
     fetched_root: PathBuf,
     selected: Option<Vec<usize>>,
     flat_dest: bool,
 ) {
-    let mut written: Vec<PathBuf> = Vec::new();
-    if let Err(message) = confirm_fetch_inner(
-        shares,
-        evt_tx,
-        net,
-        share_id,
-        name,
-        fetched_root,
-        selected,
-        flat_dest,
-        &mut written,
-    )
-    .await
-    {
-        for p in &written {
-            let _ = std::fs::remove_file(p);
-        }
+    let fail = |message: String| {
         let _ = evt_tx.send(NetEvent::FetchError { message });
-    }
+    };
+    let Some(handle) = net.as_ref() else {
+        return fail("not connected to Veilid yet".to_owned());
+    };
+    // Copy the route + room key out under an immutable borrow, dropping it before the spawn.
+    let (route_blob, room_key_bytes) = {
+        let Some(lobby) = shares.lobby.as_ref() else {
+            return fail("lobby not subscribed yet".to_owned());
+        };
+        let Some(disc) = shares.discovered.get(share_id) else {
+            return fail("share not discovered yet — refresh the list".to_owned());
+        };
+        (disc.route_blob.clone(), *lobby.room_key.as_bytes())
+    };
+    let handle = handle.clone();
+    let evt_tx = evt_tx.clone();
+    let share_id = share_id.to_owned();
+    let name = name.to_owned();
+    spawn_confirm_task(outcome_tx.clone(), async move {
+        run_confirm_download(
+            &handle,
+            &evt_tx,
+            share_id,
+            name,
+            route_blob,
+            room_key_bytes,
+            fetched_root,
+            selected,
+            flat_dest,
+        )
+        .await
+    });
 }
 
+/// (#197, CRSH-ISC-29) The spawn seam shared by [`spawn_confirm_fetch`] and the actor tests:
+/// run `download` as a detached task and report its [`ConfirmOutcome`] to `outcome_tx`,
+/// returning immediately. This is the single point guaranteeing no download is ever awaited on
+/// the caller (the actor loop) — testable without a live veilid attach.
+fn spawn_confirm_task<F>(outcome_tx: UnboundedSender<ConfirmOutcome>, download: F)
+where
+    F: std::future::Future<Output = ConfirmOutcome> + Send + 'static,
+{
+    tokio::spawn(async move {
+        // A closed channel just means the actor shut down mid-download — the outcome is moot.
+        let _ = outcome_tx.send(download.await);
+    });
+}
+
+/// (#197, CRSH-ISC-29) The network+disk half of a download — import the route, then fetch,
+/// verify, and reassemble each selected file's chunks and write them to disk — run **inside a
+/// spawned task**, never on the actor loop. Streams `FetchProgress` via the cloned `evt_tx`; all
+/// `&mut ShareState` mutation and the terminal event are deferred to [`fold_confirm_outcome`]
+/// via the returned [`ConfirmOutcome`]. On any failure the partial bytes this download wrote
+/// are removed here (clean-partial, ISC-A-C31) before the outcome returns.
 #[allow(clippy::too_many_arguments)]
-async fn confirm_fetch_inner(
-    shares: &mut ShareState,
+async fn run_confirm_download(
+    handle: &VeilidNetHandle,
     evt_tx: &UnboundedSender<NetEvent>,
-    net: &Option<VeilidNetHandle>,
-    share_id: &str,
-    name: &str,
+    share_id: String,
+    name: String,
+    route_blob: Vec<u8>,
+    room_key_bytes: [u8; 32],
     fetched_root: PathBuf,
     selected: Option<Vec<usize>>,
     flat_dest: bool,
-    written: &mut Vec<PathBuf>,
-) -> Result<(), String> {
-    let handle = net
-        .as_ref()
-        .ok_or_else(|| "not connected to Veilid yet".to_owned())?;
-    // Copy the route + room key out, dropping the immutable borrow so a fetch-stage failure
-    // can mark the share Unresolved (&mut) below (#180 §RS-1.4 — a download-fail is
-    // route-death, never a prune).
-    let (route_blob, room_key_bytes) = {
-        let lobby = shares
-            .lobby
-            .as_ref()
-            .ok_or_else(|| "lobby not subscribed yet".to_owned())?;
-        let disc = shares
-            .discovered
-            .get(share_id)
-            .ok_or_else(|| "share not discovered yet — refresh the list".to_owned())?;
-        (disc.route_blob.clone(), *lobby.room_key.as_bytes())
-    };
-    let route = match handle.import_route(route_blob).await {
-        Ok(r) => r,
-        Err(e) => {
-            // (#180 §RS-1.4/§RS-1.5, CRSH-ISC-5) A download import-fail is route-death, not an
-            // authoritative removal — keep the share listed Unresolved + park a one-shot
-            // retry (never prune); withdraw/TTL are the only prune signals.
-            mark_share_unresolved(shares, evt_tx, share_id, name);
-            return Err(format!("could not import the sharer's route: {e}"));
-        }
-    };
-    let manifest = match handle
-        .fetch_manifest(route.clone(), share_id, room_key_bytes)
-        .await
-    {
-        Ok(m) => m,
-        Err(e) => {
-            // (#180 §RS-1.4/§RS-1.5, CRSH-ISC-5) A download manifest-fail is route-death —
-            // mark Unresolved, keep listed, park a retry; never prune.
-            mark_share_unresolved(shares, evt_tx, share_id, name);
-            return Err(fetch_error_message("could not fetch the share manifest", e));
-        }
-    };
-
-    // Resolve the selected file set (None → all; out-of-range indices ignored).
-    let indices: Vec<usize> = match &selected {
-        None => (0..manifest.len()).collect(),
-        Some(sel) => sel
-            .iter()
-            .copied()
-            .filter(|&i| i < manifest.len())
-            .collect(),
-    };
-    // `flat_dest` (choose-download-dir): rebase the selection to the dest root.
-    let rel_paths: Vec<&str> = indices
-        .iter()
-        .map(|&i| manifest[i].rel_path.as_str())
-        .collect();
-    let rebased: Option<Vec<String>> = flat_dest.then(|| rebase_to_selection_root(&rel_paths));
-
-    let total_chunks: u32 = indices
-        .iter()
-        .map(|&i| manifest[i].chunks.len() as u32)
-        .sum();
-    let _ = evt_tx.send(NetEvent::FetchProgress {
-        total_chunks: Some(total_chunks),
-        chunks_received: 0,
-        bytes_received: 0,
-    });
-
+) -> ConfirmOutcome {
+    let mut written: Vec<PathBuf> = Vec::new();
     let mut chunks_received: u32 = 0;
     let mut bytes_received: u64 = 0;
     let mut files_written: u32 = 0;
 
-    // TWO adaptive concurrency windows for the whole download, each shared across
-    // every chunk fetch, both fed the per-chunk max-fragment latency against
-    // FRAGMENT_LATENCY_THRESHOLD. `Arc<Mutex>` because concurrent chunk fetches read
-    // and update them (the guard is never held across an await).
-    //
-    // #128 D-1: the FRAGMENT window — opens fully at FRAGMENT_FETCH_CONCURRENCY
-    // (safe-by-default: a healthy download is unchanged), narrows floored at 1 on a
-    // latency breach, yielding bandwidth back to interactive chat under fat-link
-    // congestion and climbing back as latency recovers.
-    let aimd = std::sync::Arc::new(std::sync::Mutex::new(AimdWindow::new(
-        1,
-        daemonseed_veilid_net::share::FRAGMENT_FETCH_CONCURRENCY,
-    )));
-    // #128 D-2 / #204: the CHUNK window — the dominant folder fanout (chunks per
-    // file). It SLOW-STARTS at CHUNK_SLOW_START and climbs by one per healthy chunk
-    // up to the CHUNK_FETCH_CONCURRENCY ceiling, so the fetch route is never hit
-    // with the cold sustained wide fanout that killed Windows folder downloads. It
-    // carries its learned window across files (read once per file, below), so
-    // backoff learned early in a folder persists.
-    let chunk_aimd = std::sync::Arc::new(std::sync::Mutex::new(AimdWindow::slow_start(
-        CHUNK_SLOW_START,
-        1,
-        CHUNK_FETCH_CONCURRENCY,
-    )));
+    // The whole download funnels through ONE async block returning `Result` so every failure
+    // site routes to the single clean-partial + outcome-mapping tail below.
+    let result: Result<(), ConfirmFail> = async {
+        let sid: &str = &share_id;
+        let name_ref: &str = &name;
+        let route = handle.import_route(route_blob).await.map_err(|e| {
+            ConfirmFail::RouteDeath(format!("could not import the sharer's route: {e}"))
+        })?;
+        let manifest = handle
+            .fetch_manifest(route.clone(), sid, room_key_bytes)
+            .await
+            .map_err(|e| {
+                ConfirmFail::RouteDeath(fetch_error_message(
+                    "could not fetch the share manifest",
+                    e,
+                ))
+            })?;
 
-    for (pos, &i) in indices.iter().enumerate() {
-        let entry = &manifest[i];
-        let rel = match &rebased {
-            Some(r) => r[pos].as_str(),
-            None => entry.rel_path.as_str(),
+        // Resolve the selected file set (None → all; out-of-range indices ignored).
+        let indices: Vec<usize> = match &selected {
+            None => (0..manifest.len()).collect(),
+            Some(sel) => sel
+                .iter()
+                .copied()
+                .filter(|&i| i < manifest.len())
+                .collect(),
         };
-        let safe =
-            sanitize_rel_path(rel).ok_or_else(|| format!("unsafe path in manifest: {rel:?}"))?;
-        let dest = if flat_dest {
-            fetched_root.join(&safe)
-        } else {
-            fetched_root.join(safe_folder_name(name)).join(&safe)
-        };
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
-        }
-        // Fetch this file's chunks with bounded concurrency (#113), preserving
-        // manifest order for byte-for-byte reassembly. Each `fetch_chunk` reassembles
-        // its transport fragments and SHA-384-verifies the chunk against its address
-        // (ISC-S28 / ISC-A-S20); the first failure prunes the stale share and aborts.
-        // Open this file at the chunk window learned so far (slow-start on the
-        // first file, then whatever the running download has climbed/backed off to
-        // — #128 D-2). The window is read once per file: `buffered` fixes its
-        // concurrency for the file, and the per-chunk `observe` below adapts the
-        // window the NEXT file opens at.
-        let cap = chunk_aimd.lock().expect("chunk aimd mutex").window();
-        let chunks = match fetch_chunks_ordered(
-            &entry.chunks,
-            cap,
-            |addr| {
-                // Fetch this chunk's fragments at the current adaptive fragment
-                // window, then feed the max observed fragment latency back to BOTH
-                // controllers — the fragment window for the next chunk (#128 D-1)
-                // and the chunk window for the next file (#128 D-2).
-                let aimd = aimd.clone();
-                let chunk_aimd = chunk_aimd.clone();
-                let route = route.clone();
-                let window = aimd.lock().expect("aimd mutex").window();
-                async move {
-                    let (data, latency) = handle
-                        .fetch_chunk(route, share_id, addr, room_key_bytes, window)
-                        .await?;
-                    let threshold = daemonseed_veilid_net::share::FRAGMENT_LATENCY_THRESHOLD;
-                    aimd.lock().expect("aimd mutex").observe(latency, threshold);
-                    chunk_aimd
-                        .lock()
-                        .expect("chunk aimd mutex")
-                        .observe(latency, threshold);
-                    Ok::<Vec<u8>, VeilidNetError>(data)
-                }
-            },
-            |data| {
-                chunks_received += 1;
-                bytes_received += data.len() as u64;
-                let _ = evt_tx.send(NetEvent::FetchProgress {
-                    total_chunks: Some(total_chunks),
-                    chunks_received,
-                    bytes_received,
-                });
-            },
-        )
-        .await
-        {
-            Ok(c) => c,
-            Err(e) => {
-                // (#180 §RS-1.4/§RS-1.5, CRSH-ISC-5) A mid-download chunk-fetch-fail is
-                // route-death — mark Unresolved, keep listed, park a retry; never prune. The
-                // caller's clean-partial cleanup (ISC-A-C31) still deletes any bytes written.
-                mark_share_unresolved(shares, evt_tx, share_id, name);
-                return Err(fetch_error_message("chunk fetch failed", e));
+        // `flat_dest` (choose-download-dir): rebase the selection to the dest root.
+        let rel_paths: Vec<&str> = indices
+            .iter()
+            .map(|&i| manifest[i].rel_path.as_str())
+            .collect();
+        let rebased: Option<Vec<String>> = flat_dest.then(|| rebase_to_selection_root(&rel_paths));
+
+        let total_chunks: u32 = indices
+            .iter()
+            .map(|&i| manifest[i].chunks.len() as u32)
+            .sum();
+        let _ = evt_tx.send(NetEvent::FetchProgress {
+            total_chunks: Some(total_chunks),
+            chunks_received: 0,
+            bytes_received: 0,
+        });
+
+        // TWO adaptive concurrency windows for the whole download, each shared across every
+        // chunk fetch, both fed the per-chunk max-fragment latency against
+        // FRAGMENT_LATENCY_THRESHOLD. `Arc<Mutex>` because concurrent chunk fetches read and
+        // update them (the guard is never held across an await).
+        //
+        // #128 D-1: the FRAGMENT window — opens fully at FRAGMENT_FETCH_CONCURRENCY
+        // (safe-by-default: a healthy download is unchanged), narrows floored at 1 on a latency
+        // breach, yielding bandwidth back to interactive chat under fat-link congestion and
+        // climbing back as latency recovers.
+        let aimd = std::sync::Arc::new(std::sync::Mutex::new(AimdWindow::new(
+            1,
+            daemonseed_veilid_net::share::FRAGMENT_FETCH_CONCURRENCY,
+        )));
+        // #128 D-2 / #204: the CHUNK window — the dominant folder fanout (chunks per file). It
+        // SLOW-STARTS at CHUNK_SLOW_START and climbs by one per healthy chunk up to the
+        // CHUNK_FETCH_CONCURRENCY ceiling, so the fetch route is never hit with the cold
+        // sustained wide fanout that killed Windows folder downloads. It carries its learned
+        // window across files (read once per file, below), so backoff learned early persists.
+        let chunk_aimd = std::sync::Arc::new(std::sync::Mutex::new(AimdWindow::slow_start(
+            CHUNK_SLOW_START,
+            1,
+            CHUNK_FETCH_CONCURRENCY,
+        )));
+
+        for (pos, &i) in indices.iter().enumerate() {
+            let entry = &manifest[i];
+            let rel = match &rebased {
+                Some(r) => r[pos].as_str(),
+                None => entry.rel_path.as_str(),
+            };
+            let safe = sanitize_rel_path(rel)
+                .ok_or_else(|| ConfirmFail::Local(format!("unsafe path in manifest: {rel:?}")))?;
+            let dest = if flat_dest {
+                fetched_root.join(&safe)
+            } else {
+                fetched_root.join(safe_folder_name(name_ref)).join(&safe)
+            };
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    ConfirmFail::Local(format!("could not create {}: {e}", parent.display()))
+                })?;
             }
-        };
-        let mut file_bytes: Vec<u8> = Vec::with_capacity(entry.size as usize);
-        for data in &chunks {
-            file_bytes.extend_from_slice(data);
+            // Fetch this file's chunks with bounded concurrency (#113), preserving manifest
+            // order for byte-for-byte reassembly. Each `fetch_chunk` reassembles its transport
+            // fragments and SHA-384-verifies the chunk against its address (ISC-S28 /
+            // ISC-A-S20). Open this file at the chunk window learned so far (slow-start on the
+            // first file, then whatever the running download has climbed/backed off to — #128
+            // D-2). The window is read once per file; the per-chunk `observe` adapts the window
+            // the NEXT file opens at.
+            let cap = chunk_aimd.lock().expect("chunk aimd mutex").window();
+            let chunks = fetch_chunks_ordered(
+                &entry.chunks,
+                cap,
+                |addr| {
+                    // Fetch this chunk's fragments at the current adaptive fragment window, then
+                    // feed the max observed fragment latency back to BOTH controllers — the
+                    // fragment window for the next chunk (#128 D-1) and the chunk window for the
+                    // next file (#128 D-2).
+                    let aimd = aimd.clone();
+                    let chunk_aimd = chunk_aimd.clone();
+                    let route = route.clone();
+                    let window = aimd.lock().expect("aimd mutex").window();
+                    async move {
+                        let (data, latency) = handle
+                            .fetch_chunk(route, sid, addr, room_key_bytes, window)
+                            .await?;
+                        let threshold = daemonseed_veilid_net::share::FRAGMENT_LATENCY_THRESHOLD;
+                        aimd.lock().expect("aimd mutex").observe(latency, threshold);
+                        chunk_aimd
+                            .lock()
+                            .expect("chunk aimd mutex")
+                            .observe(latency, threshold);
+                        Ok::<Vec<u8>, VeilidNetError>(data)
+                    }
+                },
+                |data| {
+                    chunks_received += 1;
+                    bytes_received += data.len() as u64;
+                    let _ = evt_tx.send(NetEvent::FetchProgress {
+                        total_chunks: Some(total_chunks),
+                        chunks_received,
+                        bytes_received,
+                    });
+                },
+            )
+            .await
+            .map_err(|e| ConfirmFail::RouteDeath(fetch_error_message("chunk fetch failed", e)))?;
+            let mut file_bytes: Vec<u8> = Vec::with_capacity(entry.size as usize);
+            for data in &chunks {
+                file_bytes.extend_from_slice(data);
+            }
+            std::fs::write(&dest, &file_bytes).map_err(|e| {
+                ConfirmFail::Local(format!("could not write {}: {e}", dest.display()))
+            })?;
+            written.push(dest);
+            files_written += 1;
         }
-        std::fs::write(&dest, &file_bytes)
-            .map_err(|e| format!("could not write {}: {e}", dest.display()))?;
-        written.push(dest);
-        files_written += 1;
+        Ok(())
     }
+    .await;
 
-    // (#180 §RS-1.4, CRSH-ISC-25 F6) A completed download resolves the share: clear any
-    // Unresolved mark + drop the parked browse retry — symmetric with the download-failure
-    // `mark_share_unresolved` above and the browse-preview-success clear in `fold_fetch_outcome`.
-    // Without this a failed-then-retried-and-succeeded download strands "re-resolving" and its
-    // stale parked retry fires a redundant browse fetch on the next advert fold.
-    clear_share_unresolved(shares, evt_tx, share_id);
-    let _ = evt_tx.send(NetEvent::FetchComplete {
-        share_id: share_id.to_owned(),
-        files_written,
-        bytes_written: bytes_received,
-    });
-    Ok(())
+    match result {
+        Ok(()) => ConfirmOutcome::Complete {
+            share_id,
+            files_written,
+            bytes_written: bytes_received,
+        },
+        Err(fail) => {
+            // Clean-partial (ISC-A-C31): a failed download persists nothing.
+            for p in &written {
+                let _ = std::fs::remove_file(p);
+            }
+            match fail {
+                ConfirmFail::RouteDeath(message) => ConfirmOutcome::RouteFailed {
+                    share_id,
+                    name,
+                    message,
+                },
+                ConfirmFail::Local(message) => ConfirmOutcome::LocalFailed { message },
+            }
+        }
+    }
+}
+
+/// (#197, CRSH-ISC-29) Fold a spawned download's terminal outcome on the actor loop — the only
+/// place the download's `&mut ShareState` mutation happens. Success clears the Unresolved mark
+/// and drops the parked retry (CRSH-ISC-25 F6) and emits `FetchComplete`; a route-death failure
+/// marks the share Unresolved and parks a one-shot retry (never a prune) and emits `FetchError`;
+/// a local-disk failure emits `FetchError` only (the sharer's route is fine, so no mark).
+fn fold_confirm_outcome(
+    shares: &mut ShareState,
+    evt_tx: &UnboundedSender<NetEvent>,
+    outcome: ConfirmOutcome,
+) {
+    match outcome {
+        ConfirmOutcome::Complete {
+            share_id,
+            files_written,
+            bytes_written,
+        } => {
+            clear_share_unresolved(shares, evt_tx, &share_id);
+            let _ = evt_tx.send(NetEvent::FetchComplete {
+                share_id,
+                files_written,
+                bytes_written,
+            });
+        }
+        ConfirmOutcome::RouteFailed {
+            share_id,
+            name,
+            message,
+        } => {
+            mark_share_unresolved(shares, evt_tx, &share_id, &name);
+            let _ = evt_tx.send(NetEvent::FetchError { message });
+        }
+        ConfirmOutcome::LocalFailed { message } => {
+            let _ = evt_tx.send(NetEvent::FetchError { message });
+        }
+    }
 }
 
 /// Translate a `VeilidNetEvent` into the `NetEvent` contract. Inbound sealed bytes
@@ -4299,6 +4416,145 @@ mod tests {
         );
     }
 
+    // ── CRSH-ISC-29 (#197): the actor loop never awaits a DOWNLOAD inline ──────────────
+    /// A chat command enqueued while a download is in flight is processed BEFORE the download
+    /// resolves. Modelled on the spawn seam (`spawn_confirm_task`) that the actor's
+    /// `ConfirmFetch` dispatch uses: a download that blocks on a gate is spawned, then its
+    /// outcome has NOT yet arrived when the loop is free to process chat — proving the dispatch
+    /// returned immediately rather than awaiting the download. No live veilid attach required.
+    #[tokio::test]
+    async fn crsh_isc_29_actor_never_awaits_a_download_inline() {
+        let (outcome_tx, mut outcome_rx) = unbounded_channel::<ConfirmOutcome>();
+        let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        let gate_dl = gate.clone();
+
+        // Dispatch a "ConfirmFetch" whose download blocks until the gate is released.
+        spawn_confirm_task(outcome_tx, async move {
+            gate_dl.notified().await;
+            ConfirmOutcome::Complete {
+                share_id: "s".to_owned(),
+                files_written: 1,
+                bytes_written: 42,
+            }
+        });
+
+        // The actor loop is free to process a chat command right away: the download is still
+        // parked on the gate, so its outcome must not be available yet.
+        assert!(
+            matches!(
+                outcome_rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "the download has NOT resolved — the loop did not await it inline"
+        );
+
+        // Releasing the gate lets the spawned download complete and its outcome arrive on-loop.
+        gate.notify_one();
+        let outcome = outcome_rx
+            .recv()
+            .await
+            .expect("the download outcome arrives");
+        assert!(
+            matches!(outcome, ConfirmOutcome::Complete { .. }),
+            "the spawned download reports its outcome back for on-loop folding"
+        );
+    }
+
+    // ── CRSH-ISC-29 fold: mark/clear-Unresolved is applied on-loop, per outcome kind ───
+    /// `Complete` clears any Unresolved mark + emits FetchComplete; `RouteFailed` marks the
+    /// share Unresolved + parks a retry + emits FetchError; `LocalFailed` touches ShareState
+    /// not at all + emits FetchError only. This is the semantic-parity guard for the off-loop
+    /// move: the fold applies exactly the mutation the prior inline code applied at each site.
+    #[test]
+    fn crsh_isc_29_fold_applies_mark_clear_per_outcome() {
+        // Complete → clears a prior Unresolved mark + drops the parked retry + FetchComplete.
+        let (mut shares, share_id, _rk, _s, _rc) = folded_share(29);
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        mark_share_unresolved(&mut shares, &evt_tx, &share_id, "demo");
+        while evt_rx.try_recv().is_ok() {}
+        assert!(shares.discovered.get(&share_id).unwrap().unresolved);
+        fold_confirm_outcome(
+            &mut shares,
+            &evt_tx,
+            ConfirmOutcome::Complete {
+                share_id: share_id.clone(),
+                files_written: 2,
+                bytes_written: 100,
+            },
+        );
+        assert!(
+            !shares.discovered.get(&share_id).unwrap().unresolved,
+            "Complete clears the Unresolved mark"
+        );
+        assert!(
+            !shares.parked_retries.contains_key(&share_id),
+            "Complete drops the parked retry"
+        );
+        assert!(
+            std::iter::from_fn(|| evt_rx.try_recv().ok())
+                .any(|e| matches!(e, NetEvent::FetchComplete { .. })),
+            "Complete emits FetchComplete"
+        );
+
+        // RouteFailed → marks Unresolved + parks a one-shot retry + FetchError.
+        let (mut shares, share_id, _rk, _s, _rc) = folded_share(30);
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        assert!(!shares.discovered.get(&share_id).unwrap().unresolved);
+        fold_confirm_outcome(
+            &mut shares,
+            &evt_tx,
+            ConfirmOutcome::RouteFailed {
+                share_id: share_id.clone(),
+                name: "demo".to_owned(),
+                message: "route dead".to_owned(),
+            },
+        );
+        assert!(
+            shares.discovered.get(&share_id).unwrap().unresolved,
+            "RouteFailed marks the share Unresolved"
+        );
+        assert!(
+            shares.parked_retries.contains_key(&share_id),
+            "RouteFailed parks a one-shot retry"
+        );
+        assert!(
+            std::iter::from_fn(|| evt_rx.try_recv().ok())
+                .any(|e| matches!(e, NetEvent::FetchError { .. })),
+            "RouteFailed emits FetchError"
+        );
+
+        // LocalFailed → no ShareState mutation, FetchError only.
+        let (mut shares, share_id, _rk, _s, _rc) = folded_share(28);
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        fold_confirm_outcome(
+            &mut shares,
+            &evt_tx,
+            ConfirmOutcome::LocalFailed {
+                message: "disk full".to_owned(),
+            },
+        );
+        assert!(
+            !shares.discovered.get(&share_id).unwrap().unresolved,
+            "LocalFailed does NOT mark the share Unresolved"
+        );
+        assert!(
+            shares.parked_retries.is_empty(),
+            "LocalFailed parks nothing"
+        );
+        let evts: Vec<_> = std::iter::from_fn(|| evt_rx.try_recv().ok()).collect();
+        assert!(
+            evts.iter()
+                .any(|e| matches!(e, NetEvent::FetchError { .. })),
+            "LocalFailed emits FetchError"
+        );
+        assert!(
+            !evts
+                .iter()
+                .any(|e| matches!(e, NetEvent::SharesSnapshot { .. })),
+            "LocalFailed emits no SharesSnapshot (no state change)"
+        );
+    }
+
     // ── CRSH-ISC-7: a failing-fetch storm never delays chat past the I4 bound ──────────
     /// Anti (paused-time): a storm of slow failing fetches is dispatched, then a chat
     /// dispatch runs — and completes within the WB-3 I4 chat bound (≤ 2s), because every
@@ -4843,6 +5099,7 @@ mod tests {
         let (evt_tx, mut evt_rx) = unbounded_channel();
         let (cmd_tx, _cmd_rx) = unbounded_channel::<NetCommand>();
         let (fetch_outcome_tx, _fetch_rx) = unbounded_channel();
+        let (confirm_outcome_tx, _confirm_rx) = unbounded_channel::<ConfirmOutcome>();
 
         handle_command(
             NetCommand::PublishShare {
@@ -4858,6 +5115,7 @@ mod tests {
             &mut my_handle,
             &mut shares,
             &fetch_outcome_tx,
+            &confirm_outcome_tx,
         )
         .await;
 
@@ -4911,6 +5169,7 @@ mod tests {
         let (evt_tx, mut evt_rx) = unbounded_channel();
         let (cmd_tx, _cmd_rx) = unbounded_channel::<NetCommand>();
         let (fetch_outcome_tx, _fetch_rx) = unbounded_channel();
+        let (confirm_outcome_tx, _confirm_rx) = unbounded_channel::<ConfirmOutcome>();
 
         handle_command(
             NetCommand::RefreshPublicSpace,
@@ -4922,6 +5181,7 @@ mod tests {
             &mut my_handle,
             &mut shares,
             &fetch_outcome_tx,
+            &confirm_outcome_tx,
         )
         .await;
 
@@ -4945,6 +5205,7 @@ mod tests {
         let (evt_tx, mut evt_rx) = unbounded_channel();
         let (cmd_tx, _cmd_rx) = unbounded_channel::<NetCommand>();
         let (fetch_outcome_tx, _fetch_rx) = unbounded_channel();
+        let (confirm_outcome_tx, _confirm_rx) = unbounded_channel::<ConfirmOutcome>();
         handle_command(
             NetCommand::SetMotd {
                 text: "hello".to_owned(),
@@ -4957,6 +5218,7 @@ mod tests {
             &mut my_handle,
             &mut shares,
             &fetch_outcome_tx,
+            &confirm_outcome_tx,
         )
         .await;
         assert!(matches!(
@@ -4977,6 +5239,7 @@ mod tests {
         let (evt_tx, mut evt_rx) = unbounded_channel();
         let (cmd_tx, _cmd_rx) = unbounded_channel::<NetCommand>();
         let (fetch_outcome_tx, _fetch_rx) = unbounded_channel();
+        let (confirm_outcome_tx, _confirm_rx) = unbounded_channel::<ConfirmOutcome>();
         handle_command(
             NetCommand::UploadAnnouncement {
                 topic: "t".to_owned(),
@@ -4990,6 +5253,7 @@ mod tests {
             &mut my_handle,
             &mut shares,
             &fetch_outcome_tx,
+            &confirm_outcome_tx,
         )
         .await;
         assert!(matches!(
@@ -5415,6 +5679,7 @@ mod tests {
         let (evt_tx, mut evt_rx) = unbounded_channel();
         let (cmd_tx, _cmd_rx) = unbounded_channel::<NetCommand>();
         let (fetch_outcome_tx, _fetch_rx) = unbounded_channel();
+        let (confirm_outcome_tx, _confirm_rx) = unbounded_channel::<ConfirmOutcome>();
         handle_command(
             NetCommand::SendRoom {
                 text: "hi".to_owned(),
@@ -5427,6 +5692,7 @@ mod tests {
             &mut my_handle,
             &mut shares,
             &fetch_outcome_tx,
+            &confirm_outcome_tx,
         )
         .await;
         match evt_rx.try_recv() {
