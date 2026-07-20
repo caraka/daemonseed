@@ -130,6 +130,18 @@ modules:
       admission via RouteLease/BudgetPermit; clock-free, injected observations.
     no_std: false
     depends_on: []
+  - name: daemonseed_veilid_net::download
+    description: >-
+      The shared download engine both frontends drive (run_download): fetches a set
+      of placed files' chunks in parallel under one RouteLease, writes each verified
+      chunk into a StagingArea at its manifest offset, promotes each file on
+      completion, and disposes staging by failure class (integrity → destroy;
+      transient/not-served/local → retain verified units). Frontend-agnostic and
+      network-free (the fetch closure carries the budget).
+    no_std: false
+    depends_on:
+      - daemonseed_veilid_net::error
+      - daemonseed_veilid_net::route_budget
 
 # ─────────────────────────────────────────────────────────────────────
 # Types
@@ -163,6 +175,17 @@ types:
     module: daemonseed_veilid_net::route_budget
     kind: struct
     description: Sharer identity (verified long-term announcer pubkey bytes, #156) — the learned-ceiling key, stable across route rotation.
+  - name: PlannedFile
+    module: daemonseed_veilid_net::download
+    kind: struct
+    description: One file the engine fetches — dest_rel (promote target), size (staging pre-size), and the ordered chunk addresses (chunk i writes at offset i*CHUNK_SIZE).
+  - name: DownloadOutcome
+    module: daemonseed_veilid_net::download
+    kind: enum
+    description: >-
+      The engine's terminal outcome the frontend folds — Complete{files,bytes},
+      TransientFailed (retain + mark Unresolved + park), IntegrityFailed (staging
+      destroyed + poison flag; no mark/park), LocalFailed (retain; surface only).
   - name: VeilidNet
     module: daemonseed_veilid_net::actor
     kind: struct
@@ -533,6 +556,82 @@ functions:
     returns:
       type: "Result<(Vec<u8>, Duration)>"
       description: The verified chunk bytes and the max per-fragment latency observed.
+  - name: VeilidNetHandle::fetch_manifest_budgeted
+    module: daemonseed_veilid_net::actor
+    description: Budget-admitted fetch_manifest — every fragment app_call is admitted through the shared per-route RouteBudget via lease. The scheduler leases once per download and shares the lease across the manifest + every chunk (#204).
+    signature: "pub async fn fetch_manifest_budgeted(&self, route: RouteId, share_id: &str, room_key: [u8; 32], lease: &RouteLease<RouteId>) -> Result<Vec<ManifestEntry>>"
+    parameters:
+      - name: route
+        type: RouteId
+        direction: in
+        description: The imported sharer route.
+      - name: share_id
+        type: "&str"
+        direction: in
+        description: The share id.
+      - name: room_key
+        type: "[u8; 32]"
+        direction: in
+        description: The share's PublicRoomKey bytes.
+      - name: lease
+        type: "&RouteLease<RouteId>"
+        direction: in
+        description: The download's shared per-route budget lease.
+    returns:
+      type: "Result<Vec<ManifestEntry>>"
+      description: The manifest entries, or a classified fetch error.
+  - name: VeilidNetHandle::fetch_chunk_budgeted
+    module: daemonseed_veilid_net::actor
+    description: Budget-admitted fetch_chunk — SHA-384-verifies the chunk (ISC-S28 / ISC-A-S20) and admits every fragment app_call through the shared per-route budget via lease; the controller's observations are fed internally (the caller never calls observe).
+    signature: "pub async fn fetch_chunk_budgeted(&self, route: RouteId, share_id: &str, chunk_addr: ChunkAddr, room_key: [u8; 32], lease: &RouteLease<RouteId>) -> Result<(Vec<u8>, Duration)>"
+    parameters:
+      - name: route
+        type: RouteId
+        direction: in
+        description: The imported sharer route.
+      - name: share_id
+        type: "&str"
+        direction: in
+        description: The share id.
+      - name: chunk_addr
+        type: ChunkAddr
+        direction: in
+        description: The content-address of the chunk to fetch.
+      - name: room_key
+        type: "[u8; 32]"
+        direction: in
+        description: The share's PublicRoomKey bytes.
+      - name: lease
+        type: "&RouteLease<RouteId>"
+        direction: in
+        description: The download's shared per-route budget lease.
+    returns:
+      type: "Result<(Vec<u8>, Duration)>"
+      description: The verified chunk bytes and the max per-fragment latency observed.
+  - name: run_download
+    module: daemonseed_veilid_net::download
+    description: The shared download engine — fetch a set of PlannedFiles' chunks in parallel under the budget behind fetch_chunk, write each verified chunk into staging at its offset, promote each file on completion, and dispose staging by failure class. progress(chunks_done, bytes_done) reports cumulative totals.
+    signature: "pub async fn run_download<FetchChunk, Fut, Prog>(files: &[PlannedFile], staging: &StagingArea, fetch_chunk: &FetchChunk, progress: &Prog) -> DownloadOutcome"
+    parameters:
+      - name: files
+        type: "&[PlannedFile]"
+        direction: in
+        description: The placed files to fetch (dest_rel + size + chunk addresses).
+      - name: staging
+        type: "&StagingArea"
+        direction: in
+        description: The fetch's reserved staging area (daemonseed_core::storage::fetched).
+      - name: fetch_chunk
+        type: "&FetchChunk"
+        direction: in
+        description: Fn(ChunkAddr) -> Future<Result<Vec<u8>, VeilidNetError>> returning already-verified bytes — bind to fetch_chunk_budgeted on one lease.
+      - name: progress
+        type: "&Prog"
+        direction: in
+        description: Fn(u32, u64) + Sync called with cumulative (chunks, bytes) after each verified chunk.
+    returns:
+      type: DownloadOutcome
+      description: The terminal outcome; staging is disposed by class before returning.
   - name: VeilidNetHandle::publish_share
     module: daemonseed_veilid_net::actor
     description: Announce a public share to the lobby with an anti-swap SIGNED route advert — allocate a private route, sign the advert via signer, wrap it with the sealed announcement into a DiscoveryEnvelope, and publish on the lobby rendezvous. When persist is true the advert is remembered and re-published on RouteChanged; when false (a withdraw) it is a one-shot write that releases its own route and is never re-published (#163). Pair with serve_share.

@@ -126,6 +126,7 @@ pub mod aimd;
 pub mod config;
 pub mod dht_gate;
 pub mod discovery;
+pub mod download;
 pub mod error;
 pub mod event;
 pub mod identity;

@@ -32,6 +32,7 @@ work lives in the project lead's vault manifest, not here.
 - `daemonseed-core`: `storage::fetched::StagingArea` stages a download's verified chunks at their offsets in a reserved `.dspart/<share_id>/` namespace and promotes each file (no-clobber) only when complete; `sanitize_rel_path` refuses the reserved `.dspart` component (`docs/design/download-subsystem.md` Part 3).
 - `daemonseed-core`: `storage::fetched::sweep_staging` reclaims unresumable staging debris, gated on a `LiveFetchRegistry` so a registered or resumable fetch's partials are never swept (`docs/design/download-subsystem.md` Part 3).
 - `daemonseed-core`: `storage::fetched::FetchedStore::record_share` serializes its `downloads.idx` read-modify-write with an OS advisory file lock (`fs4`), so concurrent downloads across the GUI and TUI processes never lose an index entry (#208).
+- `daemonseed-veilid-net`: a shared, frontend-agnostic download engine (`download::run_download` over `PlannedFile` → `DownloadOutcome`) that fetches placed files' chunks in parallel under one `RouteLease`, stages each verified chunk at its offset, promotes on completion, and disposes staging by failure class (integrity → destroy; transient/not-served/local → retain); plus the budget-admitted handle methods `VeilidNetHandle::fetch_manifest_budgeted` / `fetch_chunk_budgeted` (`docs/design/download-subsystem.md` step 5).
 
 ### Changed
 

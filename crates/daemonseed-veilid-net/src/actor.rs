@@ -502,6 +502,53 @@ impl VeilidNetHandle {
         .await
     }
 
+    /// Budget-admitted manifest fetch (download-subsystem redesign, step 5). Same
+    /// as [`fetch_manifest`](Self::fetch_manifest) but every fragment `app_call`
+    /// is admitted through the shared per-route [`crate::RouteBudget`] via `lease`,
+    /// so a folder's parallel fetches never exceed the sharer's route ceiling
+    /// (#204). The scheduler leases once per download and shares the lease across
+    /// the manifest + every chunk.
+    pub async fn fetch_manifest_budgeted(
+        &self,
+        route: RouteId,
+        share_id: &str,
+        room_key: [u8; 32],
+        lease: &crate::RouteLease<RouteId>,
+    ) -> Result<Vec<ManifestEntry>> {
+        let rk = PublicRoomKey::from_bytes(room_key);
+        let this = self.clone();
+        share::fetch_manifest_budgeted(share_id, &rk, lease, move |req| {
+            let this = this.clone();
+            let route = route.clone();
+            async move { this.app_call(route, req).await }
+        })
+        .await
+    }
+
+    /// Budget-admitted chunk fetch (download-subsystem redesign, step 5). Same as
+    /// [`fetch_chunk`](Self::fetch_chunk) — reassemble + open + SHA-384-VERIFY one
+    /// chunk (ISC-S28 / ISC-A-S20) — but every fragment `app_call` is admitted
+    /// through the shared per-route budget via `lease`, and the controller's
+    /// `Failed`/`Completed` observations are fed INTERNALLY (the caller never calls
+    /// `observe`). Returns the verified bytes + the max per-fragment latency.
+    pub async fn fetch_chunk_budgeted(
+        &self,
+        route: RouteId,
+        share_id: &str,
+        chunk_addr: ChunkAddr,
+        room_key: [u8; 32],
+        lease: &crate::RouteLease<RouteId>,
+    ) -> Result<(Vec<u8>, Duration)> {
+        let rk = PublicRoomKey::from_bytes(room_key);
+        let this = self.clone();
+        share::fetch_chunk_budgeted(share_id, &chunk_addr, &rk, lease, move |req| {
+            let this = this.clone();
+            let route = route.clone();
+            async move { this.app_call(route, req).await }
+        })
+        .await
+    }
+
     /// One outbound `app_call` over a peer's private route (a fetch fragment
     /// round-trip).
     async fn app_call(&self, route: RouteId, request: Vec<u8>) -> Result<Vec<u8>> {
