@@ -369,6 +369,201 @@ pub fn rebase_to_selection_root(rel_paths: &[&str]) -> Vec<String> {
     }
 }
 
+// ── Placement as a stated total function (download-subsystem redesign, step 4a) ──
+//
+// The old `rebase_to_selection_root` GUESSES the user's intent from path shapes
+// (longest common prefix), which discards the actual selection: a folder holding
+// exactly one file collapses to the bare filename, and a scattered selection
+// recreates the full share-internal ancestry. The fix is at ingestion — carry the
+// user's *selection roots* (the tree nodes actually toggled, ISC-C72) and make
+// placement a total function of them (design `docs/design/download-subsystem.md`
+// §Part 2). This is the user-chosen-dest layout; the managed downloads dir keeps
+// the full `<share-folder>/<rel_path>` layout (`record_share`).
+
+/// A node the user toggled in the fetch-preview tree — the unit "placement is a
+/// function of" (ISC-C72). Share-relative, `/`-separated wire paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectionRoot {
+    /// A single selected file (its share `rel_path`).
+    File(String),
+    /// A selected directory subtree (its share `rel_path`). The empty string is
+    /// the share root — "the whole share is selected".
+    Dir(String),
+}
+
+impl SelectionRoot {
+    fn path(&self) -> &str {
+        match self {
+            SelectionRoot::File(p) | SelectionRoot::Dir(p) => p,
+        }
+    }
+}
+
+/// Where one selected file lands: its share `rel_path` (what to fetch) and its
+/// path relative to the user's chosen destination (`/`-separated, guard-checked).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacedFile {
+    /// The file's share-relative `rel_path`.
+    pub share_rel: String,
+    /// Where it lands, relative to the chosen destination.
+    pub dest_rel: String,
+}
+
+/// `true` iff directory `d` is a strict ancestor of path `p` (component-wise).
+/// The empty `d` (share root) is an ancestor of every non-empty path.
+fn is_strict_ancestor(d: &str, p: &str) -> bool {
+    if d == p {
+        return false;
+    }
+    if d.is_empty() {
+        return !p.is_empty();
+    }
+    p.strip_prefix(d).is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Everything up to and including a path's last `/` (its parent prefix), or ""
+/// when the path has no `/` (a top-level name) or is the share root.
+fn parent_prefix(dir: &str) -> &str {
+    match dir.rfind('/') {
+        Some(i) => &dir[..=i],
+        None => "",
+    }
+}
+
+fn basename(p: &str) -> String {
+    p.rsplit('/').next().unwrap_or(p).to_owned()
+}
+
+/// Drop any root nested inside another selected `Dir` root, and drop exact
+/// duplicates — so overlapping selections (a dir plus a file within it, nested
+/// dirs) are well-defined. Input order of the survivors is preserved (collision
+/// suffixing depends on it).
+fn normalize_roots(roots: &[SelectionRoot]) -> Vec<SelectionRoot> {
+    let mut seen: std::collections::BTreeSet<(&str, &str)> = std::collections::BTreeSet::new();
+    roots
+        .iter()
+        .filter(|r| {
+            // strict-ancestor subsumption
+            if roots.iter().any(|other| match other {
+                SelectionRoot::Dir(d) => is_strict_ancestor(d, r.path()),
+                SelectionRoot::File(_) => false,
+            }) {
+                return false;
+            }
+            // exact-duplicate dedup (keep first)
+            let tag = match r {
+                SelectionRoot::File(p) => ("F", p.as_str()),
+                SelectionRoot::Dir(p) => ("D", p.as_str()),
+            };
+            seen.insert(tag)
+        })
+        .cloned()
+        .collect()
+}
+
+/// The destination-relative path a file lands at under its governing root: a
+/// `File` root drops to its basename; a `Dir` root keeps the root's own name and
+/// everything below it (i.e. strips the root's parent prefix), so a selected
+/// folder arrives whole (ratified item 2).
+fn dest_rel_for(file_rel: &str, root: &SelectionRoot) -> String {
+    match root {
+        SelectionRoot::File(_) => basename(file_rel),
+        SelectionRoot::Dir(d) => file_rel
+            .strip_prefix(parent_prefix(d))
+            .unwrap_or(file_rel)
+            .to_owned(),
+    }
+}
+
+/// The single top-level output name a root contributes under the dest, or `None`
+/// for the whole-share root (which spreads to many top-level entries).
+fn top_name_of(root: &SelectionRoot) -> Option<String> {
+    match root {
+        SelectionRoot::File(f) => Some(basename(f)),
+        SelectionRoot::Dir(d) if d.is_empty() => None,
+        SelectionRoot::Dir(d) => Some(basename(d)),
+    }
+}
+
+fn governs(root: &SelectionRoot, file: &str) -> bool {
+    match root {
+        SelectionRoot::File(f) => f == file,
+        SelectionRoot::Dir(d) => d.is_empty() || is_strict_ancestor(d, file),
+    }
+}
+
+/// Reserve `base` in `taken`, or the first free `base-N` (N ≥ 2) — the between-
+/// roots collision suffix (design table: `name-2`).
+fn uniquify(base: &str, taken: &mut std::collections::BTreeSet<String>) -> String {
+    if taken.insert(base.to_owned()) {
+        return base.to_owned();
+    }
+    let mut n = 2usize;
+    loop {
+        let cand = format!("{base}-{n}");
+        if taken.insert(cand.clone()) {
+            return cand;
+        }
+        n += 1;
+    }
+}
+
+fn replace_top(dest_rel: &str, new_top: &str) -> String {
+    match dest_rel.split_once('/') {
+        Some((_, rest)) => format!("{new_top}/{rest}"),
+        None => new_top.to_owned(),
+    }
+}
+
+/// Place each selected file under the user's chosen destination as a total
+/// function of the selection roots (design §Part 2). Roots are normalized first
+/// (nested subsumed, duplicates dropped); each file maps to its deepest governing
+/// root; between-roots top-level name collisions suffix the later root (`name-2`).
+/// Every computed destination-relative path passes the traversal guard as ONE
+/// unit before it is returned (DL-ISC-18), so no root basename + subpath can
+/// combine into an escape.
+///
+/// `selected_files` are the concrete share `rel_path`s being fetched (a `Dir`
+/// root's subtree already expanded by the caller). Returns one [`PlacedFile`] per
+/// selected file, in input order.
+pub fn place_at_dest(
+    roots: &[SelectionRoot],
+    selected_files: &[&str],
+) -> Result<Vec<PlacedFile>, FetchedError> {
+    let roots = normalize_roots(roots);
+    // Assign each root its unique top-level output name (whole-share root → None).
+    let mut taken: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let assigned: Vec<Option<String>> = roots
+        .iter()
+        .map(|r| top_name_of(r).map(|base| uniquify(&base, &mut taken)))
+        .collect();
+
+    let mut out = Vec::with_capacity(selected_files.len());
+    for &file in selected_files {
+        let (idx, root) = roots
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| governs(r, file))
+            .max_by_key(|(_, r)| r.path().len())
+            .ok_or_else(|| {
+                FetchedError::UnsafePath(format!("selected file {file} is under no selected root"))
+            })?;
+        let raw = dest_rel_for(file, root);
+        let dest_rel = match &assigned[idx] {
+            Some(top) => replace_top(&raw, top),
+            None => raw, // whole-share: full rel_path, many top-level entries
+        };
+        // DL-ISC-18: the whole computed destination-relative path is guard-checked
+        // as one unit before it can be joined under the dest.
+        sanitize_rel_path(&dest_rel)?;
+        out.push(PlacedFile {
+            share_rel: file.to_owned(),
+            dest_rel,
+        });
+    }
+    Ok(out)
+}
+
 fn parse_manifest(raw: &str) -> Result<Vec<FetchedShare>, FetchedError> {
     let mut shares = Vec::new();
     let mut lines = raw.lines();
@@ -518,6 +713,134 @@ mod tests {
     #[test]
     fn rebase_empty_selection_is_empty() {
         assert!(rebase_to_selection_root(&[]).is_empty());
+    }
+
+    // ── place_at_dest — the selection-root total function (step 4a, DL-ISC-7/18) ──
+
+    fn dests(placed: &[PlacedFile]) -> Vec<String> {
+        placed.iter().map(|p| p.dest_rel.clone()).collect()
+    }
+
+    /// DL-ISC-7: a single selected file lands as its bare basename.
+    #[test]
+    fn place_single_file_is_basename() {
+        let placed = place_at_dest(
+            &[SelectionRoot::File(
+                "Music/Artist/Album/track.mp3".to_owned(),
+            )],
+            &["Music/Artist/Album/track.mp3"],
+        )
+        .unwrap();
+        assert_eq!(dests(&placed), vec!["track.mp3".to_owned()]);
+    }
+
+    /// DL-ISC-7: a folder holding exactly ONE file keeps its folder (the reproduced
+    /// case the old shape-guessing `rebase_to_selection_root` collapsed to a bare
+    /// filename).
+    #[test]
+    fn place_one_file_folder_keeps_its_folder() {
+        let placed = place_at_dest(
+            &[SelectionRoot::Dir("Music/Artist/Album".to_owned())],
+            &["Music/Artist/Album/only.mp3"],
+        )
+        .unwrap();
+        assert_eq!(dests(&placed), vec!["Album/only.mp3".to_owned()]);
+        // Contrast: the legacy shape-guesser collapsed this to the bare basename.
+        assert_eq!(
+            rebase_to_selection_root(&["Music/Artist/Album/only.mp3"]),
+            vec!["only.mp3".to_owned()]
+        );
+    }
+
+    /// DL-ISC-7: a scattered selection (two folders from different parents) lands
+    /// each selected folder as a top-level entry — NOT recreating the full
+    /// share-internal ancestry (the reproduced scattered-selection defect).
+    #[test]
+    fn place_scattered_folders_each_top_level() {
+        let placed = place_at_dest(
+            &[
+                SelectionRoot::Dir("Music/RockBand".to_owned()),
+                SelectionRoot::Dir("Podcasts/SciShow".to_owned()),
+            ],
+            &["Music/RockBand/01.mp3", "Podcasts/SciShow/ep1.mp3"],
+        )
+        .unwrap();
+        assert_eq!(
+            dests(&placed),
+            vec!["RockBand/01.mp3".to_owned(), "SciShow/ep1.mp3".to_owned()]
+        );
+    }
+
+    /// DL-ISC-7: the whole-share root keeps every file's full rel_path (top-level
+    /// entries of the share land directly under the dest).
+    #[test]
+    fn place_whole_share_keeps_full_paths() {
+        let placed = place_at_dest(
+            &[SelectionRoot::Dir(String::new())],
+            &["a/x.txt", "b/y.txt", "top.md"],
+        )
+        .unwrap();
+        assert_eq!(
+            dests(&placed),
+            vec![
+                "a/x.txt".to_owned(),
+                "b/y.txt".to_owned(),
+                "top.md".to_owned()
+            ]
+        );
+    }
+
+    /// DL-ISC-7: overlapping roots are normalized — a file root nested inside a
+    /// selected dir root is subsumed, so the dir governs all its files (the folder
+    /// arrives whole).
+    #[test]
+    fn place_normalizes_nested_roots() {
+        let placed = place_at_dest(
+            &[
+                SelectionRoot::Dir("Music".to_owned()),
+                SelectionRoot::File("Music/Artist/track.mp3".to_owned()),
+            ],
+            &["Music/Artist/track.mp3", "Music/other.mp3"],
+        )
+        .unwrap();
+        assert_eq!(
+            dests(&placed),
+            vec![
+                "Music/Artist/track.mp3".to_owned(),
+                "Music/other.mp3".to_owned()
+            ]
+        );
+    }
+
+    /// DL-ISC-7: two roots whose basenames collide suffix the LATER root (`name-2`),
+    /// so they stay disambiguated under the dest.
+    #[test]
+    fn place_suffixes_between_root_collisions() {
+        let placed = place_at_dest(
+            &[
+                SelectionRoot::Dir("A/Live".to_owned()),
+                SelectionRoot::Dir("B/Live".to_owned()),
+            ],
+            &["A/Live/1.mp3", "B/Live/2.mp3"],
+        )
+        .unwrap();
+        assert_eq!(
+            dests(&placed),
+            vec!["Live/1.mp3".to_owned(), "Live-2/2.mp3".to_owned()]
+        );
+    }
+
+    /// DL-ISC-18: the WHOLE computed destination-relative path is guard-checked as
+    /// one unit — a hostile file `rel_path` under a selected dir that would combine
+    /// into an escape is refused, not written.
+    #[test]
+    fn place_guards_the_full_computed_path() {
+        let err = place_at_dest(
+            &[SelectionRoot::Dir("Music".to_owned())],
+            &["Music/../../etc/passwd"],
+        )
+        .unwrap_err();
+        assert!(matches!(err, FetchedError::UnsafePath(_)));
     }
 
     /// ISC-C63 / ISC-C65 — a recorded fetch writes named files (real names,

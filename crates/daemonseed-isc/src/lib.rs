@@ -378,13 +378,16 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("DL-ISC-16", IscClass::Positive), // liveness: N units on one healthy route parallelize above W_floor
     ("DL-ISC-17", IscClass::Positive), // latency valve steps down on 3-of-5 sustained breach, not a single slow sample
     ("DL-ISC-19", IscClass::Negative), // anti: W_ceil < G, and no single route ever holds more than W_ceil global slots
+    // Placement as a stated total function (step 4a). Unit probes in
+    // daemonseed-core::storage::fetched (place_at_dest over the selection roots).
+    ("DL-ISC-7", IscClass::Positive), // each (selection × dest) case lands per the placement table, incl. normalized overlapping roots
 ];
 
 /// Total built, non-deferred ISCs tracked by this registry — the SINGLE source
 /// of truth for the coverage denominator, read live by `xtask isc-coverage`.
 /// Recount on every ISC add/remove (the `const _` assert below guards it
 /// against [`ISCS`]).
-pub const TOTAL: usize = 228;
+pub const TOTAL: usize = 229;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -598,12 +601,14 @@ mod tests {
         //                                  (step 1 fetch-failure taxonomy, #205);
         //                                  DL-ISC-1/2/3/4/5/15/16/17 pos +
         //                                  DL-ISC-6/19 neg (step 2 per-route
-        //                                  concurrency budget + controller) —
+        //                                  concurrency budget + controller);
+        //                                  DL-ISC-7 pos (step 4a placement total
+        //                                  function) —
         //                                  the DL-ISC-* family registers per build step.
-        //   total   153 pos + 75 neg = 228
+        //   total   154 pos + 75 neg = 229
         //   (the v0.33.0 Veilid cutover retired 14 server-positive + 10
         //    server-negative relay/TLS/federation/rate-limit ISCs.)
-        assert_eq!(pos, 153, "positive count drift");
+        assert_eq!(pos, 154, "positive count drift");
         assert_eq!(neg, 75, "negative count drift");
     }
 

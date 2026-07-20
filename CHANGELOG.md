@@ -28,6 +28,7 @@ work lives in the project lead's vault manifest, not here.
 
 - `daemonseed-veilid-net`: a per-route concurrency budget (`route_budget::RouteBudget`) capping total in-flight fragment `app_call`s to one serving route, with a global cap and an error-primary window controller (collapse-on-failure + sharer-keyed learned ceiling; latency a secondary 3-of-5 valve) — not yet wired into the fetch path (`docs/design/download-subsystem.md` Part 1).
 - `daemonseed-veilid-net`: budget-admitted fetch variants (`share::fetch_manifest_budgeted` / `fetch_chunk_budgeted`) admitting every fragment through the shared per-route budget, alongside the legacy window-parameter path (`docs/design/download-subsystem.md` step 3).
+- `daemonseed-core`: `storage::fetched::place_at_dest` places a fetch's selected files under a user-chosen destination as a total function of the selection roots (`SelectionRoot`), fixing the one-file-folder collapse and scattered-selection ancestry of the shape-guessing `rebase_to_selection_root` (`docs/design/download-subsystem.md` Part 2).
 
 ### Changed
 

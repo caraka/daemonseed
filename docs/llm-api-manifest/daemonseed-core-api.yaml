@@ -1873,6 +1873,30 @@ types:
         type: "Vec<u8>"
         description: Verified plaintext file bytes.
 
+  - name: SelectionRoot
+    module: daemonseed_core::storage::fetched
+    kind: enum
+    description: >-
+      A node the user toggled in the fetch-preview tree (ISC-C72) — what
+      place_at_dest is a total function of. Share-relative, `/`-separated.
+    variants:
+      - name: File
+        description: "File(String) — a single selected file's share rel_path."
+      - name: Dir
+        description: "Dir(String) — a selected directory subtree; the empty string is the whole share."
+
+  - name: PlacedFile
+    module: daemonseed_core::storage::fetched
+    kind: struct
+    description: Where one selected file lands — its share rel_path and its guard-checked path relative to the chosen destination.
+    fields:
+      - name: share_rel
+        type: String
+        description: The file's share-relative rel_path (what to fetch).
+      - name: dest_rel
+        type: String
+        description: Where it lands, relative to the chosen destination (`/`-separated).
+
   - name: FetchedError
     module: daemonseed_core::storage::fetched
     kind: enum
@@ -4483,6 +4507,33 @@ functions:
     returns:
       type: u64
       description: Total bytes of all files in the share.
+
+  - name: place_at_dest
+    module: daemonseed_core::storage::fetched
+    description: >-
+      Place a fetch's selected files under a user-chosen destination as a total
+      function of the selection roots. Roots are normalized (nested subsumed,
+      duplicates dropped); a File root -> its basename, a Dir root keeps its own
+      name + subpath (arrives whole), the whole-share root -> full rel_paths;
+      between-roots basename collisions suffix the later root (name-2). Every
+      computed dest-relative path passes the traversal guard as one unit. Replaces
+      the shape-guessing rebase_to_selection_root.
+    signature: "pub fn place_at_dest(roots: &[SelectionRoot], selected_files: &[&str]) -> Result<Vec<PlacedFile>, FetchedError>"
+    parameters:
+      - name: roots
+        type: "&[SelectionRoot]"
+        direction: in
+        description: The tree nodes the user toggled (ISC-C72).
+      - name: selected_files
+        type: "&[&str]"
+        direction: in
+        description: The concrete share rel_paths being fetched (Dir subtrees already expanded).
+    returns:
+      type: "Result<Vec<PlacedFile>, FetchedError>"
+      description: One PlacedFile per selected file, in input order.
+      error_variants:
+        - name: UnsafePath
+          condition: a computed dest-relative path fails the traversal guard, or a file is under no selected root.
 
   # ── indexer ─────────────────────────────────────────────────────────
   - name: Indexer::cold_scan
