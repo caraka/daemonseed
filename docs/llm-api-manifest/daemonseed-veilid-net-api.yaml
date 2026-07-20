@@ -121,12 +121,48 @@ modules:
     description: An additive-increase/multiplicative-decrease fragment-concurrency window (AimdWindow) that narrows under fragment-latency congestion and recovers as it clears (#128 D-1).
     no_std: false
     depends_on: []
+  - name: daemonseed_veilid_net::route_budget
+    description: >-
+      A single per-route concurrency budget (RouteBudget) capping total in-flight
+      fragment app_calls to one serving route, with a global cap and an
+      error-primary window controller (collapse on failure + a sharer-keyed
+      learned ceiling; latency only a secondary 3-of-5 valve). Counter-gated
+      admission via RouteLease/BudgetPermit; clock-free, injected observations.
+    no_std: false
+    depends_on: []
 
 # ─────────────────────────────────────────────────────────────────────
 # Types
 # ─────────────────────────────────────────────────────────────────────
 
 types:
+  - name: RouteBudget
+    module: daemonseed_veilid_net::route_budget
+    kind: struct
+    description: >-
+      Per-route concurrency budget (generic over the route key; production keys on
+      RouteId). `lease(route, sharer)` returns a RouteLease; admission is
+      counter-gated at `in_flight(route) < W(route)` and `in_flight(global) < G`.
+  - name: RouteLease
+    module: daemonseed_veilid_net::route_budget
+    kind: struct
+    description: >-
+      A download's lease on a route's budget; `acquire().await` yields a
+      BudgetPermit, `observe(outcome)` feeds the window controller. Dropping the
+      last lease drops the route's live accounting; the sharer's learned ceiling
+      persists.
+  - name: BudgetPermit
+    module: daemonseed_veilid_net::route_budget
+    kind: struct
+    description: A granted admission for one fragment app_call; releases its route and global slot on drop (so a retry-backoff release frees the global pool).
+  - name: FragmentOutcome
+    module: daemonseed_veilid_net::route_budget
+    kind: enum
+    description: One completed-fragment observation fed to the controller — Completed{over_threshold} or Failed.
+  - name: SharerKey
+    module: daemonseed_veilid_net::route_budget
+    kind: struct
+    description: Sharer identity (verified long-term announcer pubkey bytes, #156) — the learned-ceiling key, stable across route rotation.
   - name: VeilidNet
     module: daemonseed_veilid_net::actor
     kind: struct
@@ -879,6 +915,26 @@ constants:
     type: Duration
     value: "2s"
     description: Per-fragment latency above which the AIMD window narrows (#128 D-1).
+  - name: W_FLOOR
+    module: daemonseed_veilid_net::route_budget
+    type: usize
+    value: "2"
+    description: Per-route budget slow-start / collapse width.
+  - name: W_CEIL
+    module: daemonseed_veilid_net::route_budget
+    type: usize
+    value: "8"
+    description: Widest a single route's budget opens; W_CEIL < G_GLOBAL is a design invariant.
+  - name: G_GLOBAL
+    module: daemonseed_veilid_net::route_budget
+    type: usize
+    value: "12"
+    description: Fetcher-global cap on total in-flight fragment app_calls across all routes.
+  - name: F_FILES
+    module: daemonseed_veilid_net::route_budget
+    type: usize
+    value: "4"
+    description: Per-download in-flight file cap (bookkeeping, not route protection).
   - name: ROUTE_ADVERT_DOMAIN
     module: daemonseed_veilid_net::discovery
     type: "&[u8]"

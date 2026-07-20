@@ -131,6 +131,7 @@ pub mod event;
 pub mod identity;
 mod rendezvous;
 pub mod resweep;
+pub mod route_budget;
 pub mod schedule;
 pub mod share;
 
@@ -148,6 +149,10 @@ pub use error::{FetchErrorClass, Result, VeilidNetError};
 pub use event::VeilidNetEvent;
 pub use rendezvous::SweepOutcome;
 pub use resweep::next_resweep_seed;
+pub use route_budget::{
+    BudgetPermit, FragmentOutcome, RouteBudget, RouteLease, SharerKey, F_FILES, G_GLOBAL, W_CEIL,
+    W_FLOOR,
+};
 pub use schedule::{
     DispatchOutcome, SchedulerConfig, WriteClass, WriteKind, WriteRequest, WriteScheduler,
     WriteSchedulerHandle, WriteSink,

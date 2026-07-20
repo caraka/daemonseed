@@ -366,13 +366,25 @@ pub const ISCS: &[(&str, IscClass)] = &[
     // Download-subsystem redesign (docs/design/download-subsystem.md). The
     // DL-ISC-* family registers incrementally as each step builds its slice.
     ("DL-ISC-10", IscClass::Positive), // the share-fetch boundary types transient / integrity / not-served / local failures apart; SHA-384 mismatch is Integrity (step 1 error taxonomy, #205)
+    // Per-route concurrency budget + error-primary controller (step 2). Unit
+    // (counting-fake + controller state-machine) probes in veilid-net::route_budget.
+    ("DL-ISC-1", IscClass::Positive), // peak in-flight fragment app_calls to one route never exceeds the route window
+    ("DL-ISC-2", IscClass::Positive), // failure collapses to floor + records learned ceiling (half killing width) keyed by sharer; survives route rotation
+    ("DL-ISC-3", IscClass::Positive), // additive increase is window-clocked (≤ +1 per full window of clean completions); resets on decrease
+    ("DL-ISC-4", IscClass::Positive), // distinct routes hold independent budgets and progress concurrently
+    ("DL-ISC-5", IscClass::Positive), // total in-flight across all routes never exceeds the global cap G
+    ("DL-ISC-6", IscClass::Negative), // anti: no fragment app_call without budget admission; no admission held across a retry backoff sleep
+    ("DL-ISC-15", IscClass::Positive), // liveness: sustained health reaches W_ceil within bounded windows
+    ("DL-ISC-16", IscClass::Positive), // liveness: N units on one healthy route parallelize above W_floor
+    ("DL-ISC-17", IscClass::Positive), // latency valve steps down on 3-of-5 sustained breach, not a single slow sample
+    ("DL-ISC-19", IscClass::Negative), // anti: W_ceil < G, and no single route ever holds more than W_ceil global slots
 ];
 
 /// Total built, non-deferred ISCs tracked by this registry — the SINGLE source
 /// of truth for the coverage denominator, read live by `xtask isc-coverage`.
 /// Recount on every ISC add/remove (the `const _` assert below guards it
 /// against [`ISCS`]).
-pub const TOTAL: usize = 218;
+pub const TOTAL: usize = 228;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -583,13 +595,16 @@ mod tests {
         //                                  Refresh-user-initiated-only)
         //                                  download-subsystem redesign (docs/design/
         //                                  download-subsystem.md): DL-ISC-10 pos
-        //                                  (step 1 fetch-failure taxonomy, #205) —
+        //                                  (step 1 fetch-failure taxonomy, #205);
+        //                                  DL-ISC-1/2/3/4/5/15/16/17 pos +
+        //                                  DL-ISC-6/19 neg (step 2 per-route
+        //                                  concurrency budget + controller) —
         //                                  the DL-ISC-* family registers per build step.
-        //   total   145 pos + 73 neg = 218
+        //   total   153 pos + 75 neg = 228
         //   (the v0.33.0 Veilid cutover retired 14 server-positive + 10
         //    server-negative relay/TLS/federation/rate-limit ISCs.)
-        assert_eq!(pos, 145, "positive count drift");
-        assert_eq!(neg, 73, "negative count drift");
+        assert_eq!(pos, 153, "positive count drift");
+        assert_eq!(neg, 75, "negative count drift");
     }
 
     /// COVERED is single-sourced and must agree with the per-milestone

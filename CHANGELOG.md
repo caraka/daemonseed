@@ -24,6 +24,10 @@ next release this block is renamed to its version + date and a fresh
 `[Unreleased]` is opened (see `AGENTS.md` doc-sync). Planning for *unstarted*
 work lives in the project lead's vault manifest, not here.
 
+### Added
+
+- `daemonseed-veilid-net`: a per-route concurrency budget (`route_budget::RouteBudget`) capping total in-flight fragment `app_call`s to one serving route, with a global cap and an error-primary window controller (collapse-on-failure + sharer-keyed learned ceiling; latency a secondary 3-of-5 valve) — not yet wired into the fetch path (`docs/design/download-subsystem.md` Part 1).
+
 ### Changed
 
 - `daemonseed-veilid-net`: the share-fetch boundary types failures via `FetchErrorClass` (transient / integrity / not-served / local); content-address and malformed-frame failures classify as `Integrity`, distinct from transient transport (#205, `docs/design/download-subsystem.md`).
