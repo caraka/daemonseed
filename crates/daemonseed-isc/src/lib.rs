@@ -389,13 +389,16 @@ pub const ISCS: &[(&str, IscClass)] = &[
     // Live-fetch registry + staging sweep (step 4c). Unit probes in
     // daemonseed-core::storage::fetched (sweep_staging + LiveFetchRegistry).
     ("DL-ISC-22", IscClass::Negative), // anti: the staging sweep deletes only state absent from the live-fetch registry (and not resumable)
+    // downloads.idx cross-process file lock (step 4d, #208). fs4 flock on a
+    // .idx.lock sibling; probe in daemonseed-core::storage::fetched.
+    ("DL-ISC-9", IscClass::Negative), // anti: concurrent record_share (one process or two) never loses a downloads.idx entry
 ];
 
 /// Total built, non-deferred ISCs tracked by this registry — the SINGLE source
 /// of truth for the coverage denominator, read live by `xtask isc-coverage`.
 /// Recount on every ISC add/remove (the `const _` assert below guards it
 /// against [`ISCS`]).
-pub const TOTAL: usize = 233;
+pub const TOTAL: usize = 234;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -614,13 +617,14 @@ mod tests {
         //                                  function); DL-ISC-11 pos + DL-ISC-18/21
         //                                  neg (step 4b stage-then-promote writer);
         //                                  DL-ISC-22 neg (step 4c live-fetch
-        //                                  registry + staging sweep) —
+        //                                  registry + staging sweep); DL-ISC-9 neg
+        //                                  (step 4d downloads.idx file lock) —
         //                                  the DL-ISC-* family registers per build step.
-        //   total   155 pos + 78 neg = 233
+        //   total   155 pos + 79 neg = 234
         //   (the v0.33.0 Veilid cutover retired 14 server-positive + 10
         //    server-negative relay/TLS/federation/rate-limit ISCs.)
         assert_eq!(pos, 155, "positive count drift");
-        assert_eq!(neg, 78, "negative count drift");
+        assert_eq!(neg, 79, "negative count drift");
     }
 
     /// COVERED is single-sourced and must agree with the per-milestone

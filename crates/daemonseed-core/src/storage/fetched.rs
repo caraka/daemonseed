@@ -165,6 +165,30 @@ pub struct FetchedStore {
     root: PathBuf,
 }
 
+/// An exclusive OS advisory lock over a downloads root's `downloads.idx`
+/// read-modify-write. The GUI and TUI are separate binaries that can share one
+/// non-portable downloads root, so an in-process mutex would not serialize them
+/// (#208 / DL-ISC-9) — a `flock`/`LockFileEx` on a `.idx.lock` sibling does, and
+/// the OS releases it if the holder dies (a crash mid-write cannot wedge it).
+/// Held for the whole `record_share` RMW; released on drop.
+struct IdxLock {
+    _file: std::fs::File,
+}
+
+impl IdxLock {
+    /// Block until the exclusive advisory lock on `<root>/.idx.lock` is held.
+    fn acquire(root: &Path) -> Result<Self, FetchedError> {
+        use fs4::fs_std::FileExt;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(root.join(".idx.lock"))?;
+        file.lock_exclusive()?;
+        Ok(Self { _file: file })
+    }
+}
+
 impl FetchedStore {
     /// Open (creating if absent) the downloads store rooted at `root`.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, FetchedError> {
@@ -199,6 +223,10 @@ impl FetchedStore {
         name: &str,
         files: &[VerifiedFile],
     ) -> Result<FetchedShare, FetchedError> {
+        // Serialize the whole idx read-modify-write across processes (#208):
+        // re-read UNDER the lock so a concurrent record_share cannot lose an
+        // entry via a stale snapshot. Released when this guard drops.
+        let _idx_lock = IdxLock::acquire(&self.root)?;
         let mut shares = self.list_shares()?;
 
         // Reuse this share's existing folder on a re-fetch; otherwise derive a
@@ -1421,6 +1449,42 @@ mod tests {
             assert!(registry.is_active("s"));
         }
         assert!(!registry.is_active("s"), "unregistered on drop");
+    }
+
+    /// DL-ISC-9: concurrent `record_share` on one downloads root — separate
+    /// stores/handles, as the GUI and TUI would be — never loses a `downloads.idx`
+    /// entry, because the idx read-modify-write is serialized by the OS advisory
+    /// file lock. Without the lock, interleaved read-mutate-write would drop
+    /// entries via a stale snapshot.
+    #[test]
+    fn concurrent_record_share_never_loses_an_entry() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+        let n = 8usize;
+        let handles: Vec<_> = (0..n)
+            .map(|i| {
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    let mut store = FetchedStore::open(&root).unwrap();
+                    store
+                        .record_share(
+                            &format!("share{i:02}"),
+                            &format!("name{i}"),
+                            &[vf("f", b"x")],
+                        )
+                        .unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let shares = FetchedStore::open(&root).unwrap().list_shares().unwrap();
+        assert_eq!(
+            shares.len(),
+            n,
+            "no idx entry lost under concurrent record_share"
+        );
     }
 
     /// ISC-C63 / ISC-C65 — a recorded fetch writes named files (real names,

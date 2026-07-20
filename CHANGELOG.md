@@ -31,6 +31,7 @@ work lives in the project lead's vault manifest, not here.
 - `daemonseed-core`: `storage::fetched::place_at_dest` places a fetch's selected files under a user-chosen destination as a total function of the selection roots (`SelectionRoot`), fixing the one-file-folder collapse and scattered-selection ancestry of the shape-guessing `rebase_to_selection_root` (`docs/design/download-subsystem.md` Part 2).
 - `daemonseed-core`: `storage::fetched::StagingArea` stages a download's verified chunks at their offsets in a reserved `.dspart/<share_id>/` namespace and promotes each file (no-clobber) only when complete; `sanitize_rel_path` refuses the reserved `.dspart` component (`docs/design/download-subsystem.md` Part 3).
 - `daemonseed-core`: `storage::fetched::sweep_staging` reclaims unresumable staging debris, gated on a `LiveFetchRegistry` so a registered or resumable fetch's partials are never swept (`docs/design/download-subsystem.md` Part 3).
+- `daemonseed-core`: `storage::fetched::FetchedStore::record_share` serializes its `downloads.idx` read-modify-write with an OS advisory file lock (`fs4`), so concurrent downloads across the GUI and TUI processes never lose an index entry (#208).
 
 ### Changed
 

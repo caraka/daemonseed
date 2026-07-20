@@ -133,6 +133,10 @@ serde = { version = "1", features = ["derive"] }
 unicode-normalization = "0.1"
 # Hex codec for the 12-char hash prefix in the handle format (ISC-C4).
 hex = "0.4"
+# Cross-platform OS advisory file lock (flock / LockFileEx) — serializes the
+# downloads.idx read-modify-write across the separate GUI and TUI processes
+# (#208 / DL-ISC-9).
+fs4 = { version = "0.13", features = ["sync"] }
 # Per-platform user-directory resolver. daemonseed-tui uses it for the OS
 # default Downloads directory (ISC-C68) instead of a hand-rolled
 # `$XDG_DOWNLOAD_DIR` / `$HOME/Downloads` probe.
