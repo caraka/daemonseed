@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use daemonseed_core::share_serve::CHUNK_SIZE;
 use daemonseed_core::storage::cas::ChunkAddr;
 use daemonseed_core::storage::fetched::{FetchedError, StagingArea};
-use futures_util::stream::{self, StreamExt};
+use futures_util::stream::StreamExt;
 
 use crate::error::{FetchErrorClass, VeilidNetError};
 use crate::route_budget::F_FILES;
@@ -83,8 +83,9 @@ pub enum DownloadOutcome {
     },
 }
 
-/// Internal abort carrier: the first failure that stops the download, tagged with
-/// the disposition class so the tail can wipe-or-retain correctly.
+/// Internal abort carrier: the failure that stops the download (the worst class
+/// among concurrently in-flight failures — see [`merge_stop`]), tagged with its
+/// disposition class so the tail can wipe-or-retain correctly.
 struct Stop {
     class: FetchErrorClass,
     message: String,
@@ -102,6 +103,99 @@ impl Stop {
             class: FetchErrorClass::Local,
             message,
         }
+    }
+    fn integrity(message: String) -> Self {
+        Stop {
+            class: FetchErrorClass::Integrity,
+            message,
+        }
+    }
+    /// Map a staging *write* failure. A [`FetchedError::Corrupt`] means the served
+    /// bytes do not fit the confirmed manifest's byte layout (the presized-file
+    /// bounds check) — malformed content, classed `Integrity`, not a local disk
+    /// fault. Any other staging fault (disk/path) is `Local`. Defensive: the
+    /// coverage + exact-length guards below make the bounds path unreachable for a
+    /// well-formed manifest.
+    fn from_staging_write(context: &str, dest_rel: &str, e: FetchedError) -> Self {
+        let class = match &e {
+            FetchedError::Corrupt(_) => FetchErrorClass::Integrity,
+            _ => FetchErrorClass::Local,
+        };
+        Stop {
+            class,
+            message: staging_error(context, dest_rel, e),
+        }
+    }
+}
+
+/// Keep an `Integrity` stop over any other class; otherwise keep the FIRST recorded
+/// failure. An integrity failure must quarantine the share even when a transient
+/// route-death races ahead of it (DL-ISC-13 / ISC-A-C31) — the poison-flag +
+/// no-auto-resume guarantee must not be defeatable by completion timing.
+fn merge_stop(current: Option<Stop>, incoming: Stop) -> Stop {
+    match current {
+        Some(c) if c.class == FetchErrorClass::Integrity => c,
+        Some(_) if incoming.class == FetchErrorClass::Integrity => incoming,
+        Some(c) => c,
+        None => incoming,
+    }
+}
+
+/// Drive `futures` at most `concurrency` at a time, aborting on failure but
+/// selecting the WORST failure class rather than the first to complete. On the
+/// first failure we stop pulling NEW futures and drain the already-in-flight window
+/// (bounded by `concurrency`), upgrading the recorded stop to any `Integrity` that
+/// surfaces among them; once an `Integrity` is held we return immediately. The
+/// budget behind the fetch closure is the true admission cap — `concurrency` only
+/// bounds the polled future set. Dropping the remaining futures on return cancels
+/// their in-flight fetches, releasing budget permits via RAII.
+async fn drive_bounded<I, Fut>(futures: I, concurrency: usize) -> Result<(), Stop>
+where
+    I: IntoIterator<Item = Fut>,
+    Fut: std::future::Future<Output = Result<(), Stop>>,
+{
+    let mut pending = futures.into_iter();
+    let mut inflight = futures_util::stream::FuturesUnordered::new();
+    for f in pending.by_ref().take(concurrency.max(1)) {
+        inflight.push(f);
+    }
+    let mut worst: Option<Stop> = None;
+    while let Some(res) = inflight.next().await {
+        match res {
+            Ok(()) => {
+                // Refill the window only while healthy; once aborting, stop pulling
+                // new work and just drain the in-flight set.
+                if worst.is_none() {
+                    if let Some(f) = pending.next() {
+                        inflight.push(f);
+                    }
+                }
+            }
+            Err(s) => {
+                let dominant = s.class == FetchErrorClass::Integrity;
+                worst = Some(merge_stop(worst.take(), s));
+                if dominant {
+                    break;
+                }
+            }
+        }
+    }
+    match worst {
+        Some(s) => Err(s),
+        None => Ok(()),
+    }
+}
+
+/// The verified byte length chunk `index` must have, given the confirmed manifest
+/// tiles `[0, size)` at `CHUNK_SIZE`: every non-last chunk is exactly `CHUNK_SIZE`;
+/// the last chunk is the remainder. `last` is `chunk_count - 1` and the caller has
+/// already checked the count matches `size.div_ceil(CHUNK_SIZE)`, so the remainder
+/// is in `(0, CHUNK_SIZE]` and never underflows.
+fn expected_chunk_len(index: usize, last: usize, size: u64) -> u64 {
+    if index < last {
+        CHUNK_SIZE as u64
+    } else {
+        size - (last as u64 * CHUNK_SIZE as u64)
     }
 }
 
@@ -139,34 +233,24 @@ where
 
     // Files run F_FILES-concurrent; each file's chunks run CHUNK_POLL_CAP-polled.
     // The budget behind `fetch_chunk` caps the true per-route in-flight total
-    // across ALL of them, so this nested concurrency is safe (DL-ISC-1).
-    let mut file_stream = stream::iter(
-        files
-            .iter()
-            .map(|f| fetch_one_file(f, staging, fetch_chunk, progress, &chunks_done, &bytes_done)),
-    )
-    .buffer_unordered(F_FILES.max(1));
+    // across ALL of them, so this nested concurrency is safe (DL-ISC-1). The driver
+    // selects the WORST failure class (Integrity dominant), so a poisoned file is
+    // never masked by a transient sibling that completes first.
+    let file_futures = files.iter().map(|f| {
+        fetch_one_file(
+            f,
+            staging,
+            fetch_chunk,
+            progress,
+            &chunks_done,
+            &bytes_done,
+            &files_done,
+        )
+    });
+    let result = drive_bounded(file_futures, F_FILES).await;
 
-    let mut stop: Option<Stop> = None;
-    while let Some(res) = file_stream.next().await {
-        match res {
-            Ok(()) => {
-                files_done.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(s) => {
-                // First failure aborts: drop the remaining file futures (cancels
-                // their in-flight chunk fetches, releasing budget permits on drop)
-                // and stop consuming the stream.
-                stop = Some(s);
-                break;
-            }
-        }
-    }
-    // Ensure the in-flight futures are dropped (permits released) before disposition.
-    drop(file_stream);
-
-    match stop {
-        None => {
+    match result {
+        Ok(()) => {
             // Success: promotions moved every completed file out of staging; sweep
             // away the now-empty staging tree (best-effort — a stray staging dir is
             // reclaimed by the sweep, never surfaced).
@@ -176,7 +260,7 @@ where
                 bytes: bytes_done.load(Ordering::Relaxed),
             }
         }
-        Some(s) => match s.class {
+        Err(s) => match s.class {
             FetchErrorClass::Integrity => {
                 // The poison boundary is the WHOLE fetch's unpromoted state.
                 // Already-promoted files stay (self-authenticating). A destroy
@@ -200,8 +284,9 @@ where
 }
 
 /// Fetch every chunk of ONE file (bounded-concurrent), writing each verified chunk
-/// into staging at its offset, then promote the completed file. Returns the first
-/// failure as a classified [`Stop`].
+/// into staging at its offset, then promote the completed file (incrementing
+/// `files_done` on success). Returns the worst failure as a classified [`Stop`].
+#[allow(clippy::too_many_arguments)]
 async fn fetch_one_file<FetchChunk, Fut, Prog>(
     file: &PlannedFile,
     staging: &StagingArea,
@@ -209,20 +294,42 @@ async fn fetch_one_file<FetchChunk, Fut, Prog>(
     progress: &Prog,
     chunks_done: &AtomicU32,
     bytes_done: &AtomicU64,
+    files_done: &AtomicU32,
 ) -> Result<(), Stop>
 where
     FetchChunk: Fn(ChunkAddr) -> Fut,
     Fut: std::future::Future<Output = Result<Vec<u8>, VeilidNetError>>,
     Prog: Fn(u32, u64) + Sync,
 {
+    // Coverage guard (full-file verification, DL-ISC-11): the confirmed manifest's
+    // chunk list must EXACTLY tile `[0, size)` at CHUNK_SIZE. Without this, a
+    // hostile manifest that lists fewer chunks than its advisory `size` implies
+    // (e.g. `size: 10 MiB, chunks: [one 1 MiB chunk]`) would preallocate a 10 MiB
+    // sparse file, write the one verified chunk, and promote 9 MiB of UNVERIFIED
+    // zero-fill as a completed download. Reject the mismatch as `Integrity`
+    // (malformed content) BEFORE any allocation or fetch — this also refuses a
+    // `size: u64::MAX` `set_len` DoS (no real manifest carries 2^44 chunk addrs).
+    let expected_chunks = file.size.div_ceil(CHUNK_SIZE as u64);
+    if file.chunks.len() as u64 != expected_chunks {
+        return Err(Stop::integrity(format!(
+            "manifest for {} lists {} chunk(s) but its {}-byte size requires {}",
+            file.dest_rel,
+            file.chunks.len(),
+            file.size,
+            expected_chunks
+        )));
+    }
+
     // Pre-size the sparse staging file so verified chunks can land at their
     // offsets in any order (set-not-prefix partial state).
     staging
         .preallocate(&file.dest_rel, file.size)
         .map_err(|e| Stop::local(staging_error("could not stage", &file.dest_rel, e)))?;
 
-    let mut chunk_stream = stream::iter(file.chunks.iter().enumerate().map(|(i, addr)| {
+    let last = file.chunks.len().saturating_sub(1);
+    let chunk_futures = file.chunks.iter().enumerate().map(|(i, addr)| {
         let offset = i as u64 * CHUNK_SIZE as u64;
+        let expected_len = expected_chunk_len(i, last, file.size);
         let addr = *addr;
         async move {
             // The bytes come back already SHA-384-verified (fetch_chunk_budgeted);
@@ -230,27 +337,35 @@ where
             let bytes = fetch_chunk(addr)
                 .await
                 .map_err(|e| Stop::from_fetch("chunk fetch failed", e))?;
+            // Exact-length guard (DL-ISC-11): a verified chunk whose length does not
+            // fill its manifest slot would leave an unverified zero gap in the
+            // promoted file. The bytes are authentic to their content-address, but a
+            // short/long chunk means the manifest's byte layout is malformed →
+            // `Integrity`, not a resumable transient.
+            if bytes.len() as u64 != expected_len {
+                return Err(Stop::integrity(format!(
+                    "chunk {i} of {} verified but is {} bytes, not the manifest's {expected_len}",
+                    file.dest_rel,
+                    bytes.len()
+                )));
+            }
             staging
                 .write_verified_chunk(&file.dest_rel, offset, &bytes)
-                .map_err(|e| Stop::local(staging_error("could not write", &file.dest_rel, e)))?;
+                .map_err(|e| Stop::from_staging_write("could not write", &file.dest_rel, e))?;
             let c = chunks_done.fetch_add(1, Ordering::Relaxed) + 1;
             let b =
                 bytes_done.fetch_add(bytes.len() as u64, Ordering::Relaxed) + bytes.len() as u64;
             progress(c, b);
             Ok::<(), Stop>(())
         }
-    }))
-    .buffer_unordered(CHUNK_POLL_CAP.max(1));
+    });
+    drive_bounded(chunk_futures, CHUNK_POLL_CAP).await?;
 
-    while let Some(res) = chunk_stream.next().await {
-        res?;
-    }
-    drop(chunk_stream);
-
-    // Every chunk verified and landed: promote (no-clobber) to the final path.
+    // Every chunk verified, exactly tiled, and landed: promote (no-clobber).
     staging
         .promote(&file.dest_rel)
         .map_err(|e| Stop::local(staging_error("could not finalize", &file.dest_rel, e)))?;
+    files_done.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
 
@@ -441,5 +556,104 @@ mod tests {
             std::fs::read(root.join("empty.dat")).unwrap(),
             Vec::<u8>::new()
         );
+    }
+
+    /// DL-ISC-11 coverage guard: a manifest whose chunk list does not tile its
+    /// advisory `size` is rejected as `Integrity` (never promotes zero-fill), and
+    /// nothing is fetched. Models the hostile `size: N, chunks: [one small chunk]`.
+    #[tokio::test]
+    async fn undersized_chunk_list_is_integrity_not_zero_fill() {
+        let root = tmp("undersized");
+        let staging = StagingArea::open(&root, "liar").unwrap();
+        // Claim 10 MiB but list a single 11-byte chunk.
+        let (mut f, map) = plan_file("archive.bin", b"hello world");
+        f.size = 10 * 1024 * 1024;
+        let seen = AtomicUsize::new(0);
+        let fetch = |addr: ChunkAddr| {
+            seen.fetch_add(1, Ordering::Relaxed);
+            let bytes = map.get(&addr).cloned();
+            async move { bytes.ok_or(VeilidNetError::NotServed) }
+        };
+        let progress = |_c: u32, _b: u64| {};
+        let outcome = run_download(&[f], &staging, &fetch, &progress).await;
+        assert!(
+            matches!(outcome, DownloadOutcome::IntegrityFailed { .. }),
+            "got {outcome:?}"
+        );
+        assert_eq!(
+            seen.load(Ordering::Relaxed),
+            0,
+            "must reject before fetching"
+        );
+        assert!(!root.join("archive.bin").exists(), "no zero-fill promotion");
+    }
+
+    /// DL-ISC-11 exact-length guard: a verified chunk that is SHORTER than its
+    /// manifest slot (a gap that would zero-fill) is rejected as `Integrity`.
+    #[tokio::test]
+    async fn a_short_verified_chunk_is_integrity() {
+        let root = tmp("shortchunk");
+        let staging = StagingArea::open(&root, "gap").unwrap();
+        // A 2-chunk file (size = CHUNK_SIZE + 10); serve chunk 0 SHORT (10 bytes,
+        // not the full CHUNK_SIZE slot). The count matches, so only the per-chunk
+        // length guard can catch it.
+        let big = vec![0x22u8; CHUNK_SIZE + 10];
+        let (f, mut map) = plan_file("clip.bin", &big);
+        assert_eq!(f.chunks.len(), 2);
+        let chunk0 = f.chunks[0];
+        map.insert(chunk0, vec![0x22u8; 10]); // serve a short (but "verified") chunk 0
+        let fetch = move |addr: ChunkAddr| {
+            let bytes = map.get(&addr).cloned();
+            async move { bytes.ok_or(VeilidNetError::NotServed) }
+        };
+        let progress = |_c: u32, _b: u64| {};
+        let outcome = run_download(&[f], &staging, &fetch, &progress).await;
+        assert!(
+            matches!(outcome, DownloadOutcome::IntegrityFailed { .. }),
+            "got {outcome:?}"
+        );
+        assert!(!root.join("clip.bin").exists());
+    }
+
+    /// Integrity dominates a racing transient (bug-lens finding): a fetch where one
+    /// file route-deaths (transient) and another serves poison (integrity) always
+    /// resolves to IntegrityFailed + destroyed staging, regardless of which failure
+    /// completes first — the poison-quarantine guarantee is not timing-defeatable.
+    #[tokio::test]
+    async fn integrity_dominates_a_racing_transient() {
+        let root = tmp("race");
+        let staging = StagingArea::open(&root, "mix").unwrap();
+        let (f_transient, _mt) = plan_file("a.bin", b"eleven byte"); // 11 bytes, 1 chunk
+        let (f_poison, _mp) = plan_file("b.bin", b"twelve bytes"); // 12 bytes, 1 chunk
+        let t_addr = f_transient.chunks[0];
+        let p_addr = f_poison.chunks[0];
+        let fetch = move |addr: ChunkAddr| {
+            let is_transient = addr == t_addr;
+            let is_poison = addr == p_addr;
+            async move {
+                if is_transient {
+                    Err(VeilidNetError::Send("route died".into()))
+                } else if is_poison {
+                    Err(VeilidNetError::Integrity("sha-384 mismatch".into()))
+                } else {
+                    Err(VeilidNetError::NotServed)
+                }
+            }
+        };
+        let progress = |_c: u32, _b: u64| {};
+        // Run both orderings (file order does not change the dominance outcome).
+        for files in [
+            vec![f_transient.clone(), f_poison.clone()],
+            vec![f_poison.clone(), f_transient.clone()],
+        ] {
+            let st = StagingArea::open(&root, "mix").unwrap();
+            let outcome = run_download(&files, &st, &fetch, &progress).await;
+            assert!(
+                matches!(outcome, DownloadOutcome::IntegrityFailed { .. }),
+                "integrity must dominate; got {outcome:?}"
+            );
+            assert!(!st.dir().exists(), "poison destroys staging");
+        }
+        let _ = staging;
     }
 }
