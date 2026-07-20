@@ -1897,6 +1897,19 @@ types:
         type: String
         description: Where it lands, relative to the chosen destination (`/`-separated).
 
+  - name: StagingArea
+    module: daemonseed_core::storage::fetched
+    kind: struct
+    description: >-
+      A download's reserved staging quarantine at `<root>/.dspart/<share_id>/`.
+      open(root, share_id); preallocate(final_rel, size) pre-sizes a sparse file;
+      write_verified_chunk(final_rel, offset, bytes) positional-writes a verified
+      chunk at its manifest offset (concurrent chunks at distinct offsets are
+      race-free); promote(final_rel) moves a completed file to `<root>/<final_rel>`
+      no-clobber (first free name/name-N, suffix before extension); destroy() erases
+      the whole area (integrity abort / post-completion). The reserved `.dspart`
+      component is refused by sanitize_rel_path.
+
   - name: FetchedError
     module: daemonseed_core::storage::fetched
     kind: enum

@@ -60,6 +60,13 @@ use std::path::{Component, Path, PathBuf};
 /// Manifest header — bumped if the on-disk format changes incompatibly.
 const MANIFEST_HEADER: &str = "# daemonseed downloads manifest v2";
 
+/// The reserved staging directory component under a downloads/destination root
+/// (`<root>/.dspart/<share_id>/…`). No manifest `rel_path` may name it —
+/// [`sanitize_rel_path`] refuses it — so a hostile sharer can neither collide
+/// with an in-progress partial nor plant a file the sweep would delete
+/// (download-subsystem redesign §Part 3; DL-ISC-18).
+pub const STAGING_DIR: &str = ".dspart";
+
 /// One downloaded file inside a [`FetchedShare`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchedFile {
@@ -315,6 +322,12 @@ fn sanitize_rel_path(rel: &str) -> Result<PathBuf, FetchedError> {
         if seg.is_empty() {
             continue;
         }
+        // The staging namespace is reserved — no manifest path may name it, so a
+        // hostile `rel_path` can neither reach into the quarantine nor collide
+        // with an in-progress partial (DL-ISC-18).
+        if seg == STAGING_DIR {
+            return Err(FetchedError::UnsafePath(rel.to_owned()));
+        }
         let p = Path::new(seg);
         let mut comps = p.components();
         match (comps.next(), comps.next()) {
@@ -562,6 +575,171 @@ pub fn place_at_dest(
         });
     }
     Ok(out)
+}
+
+// ── Stage-then-promote staging writer (download-subsystem redesign, step 4b) ──
+//
+// A download writes each verified chunk into a reserved staging file at its
+// manifest-derived byte OFFSET (files are pre-sized sparse; partial state is a
+// SET of verified chunks, never a prefix), then PROMOTES the file to its final
+// name only once every chunk has verified and the size matches. Unverified bytes
+// never touch a final filename, even mid-download (design §Part 3). Promotion
+// targets a no-clobber path (an existing unrelated file is never overwritten —
+// DL-ISC-21), so a plain cross-platform `rename` to a fresh target suffices here;
+// the overwrite-if-ours replace path (Windows `ReplaceFileW`) lands with resume
+// (step 8), where a promote may legitimately replace its own prior partial.
+
+/// Positional write of `bytes` at `offset` into `f` — a `pwrite`, so concurrent
+/// writes of a file's chunks at distinct offsets are race-free (they do not share
+/// a seek position).
+fn pwrite_all(f: &std::fs::File, offset: u64, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        f.write_all_at(bytes, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let (mut rest, mut pos) = (bytes, offset);
+        while !rest.is_empty() {
+            let n = f.seek_write(rest, pos)?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "seek_write wrote 0 bytes",
+                ));
+            }
+            rest = &rest[n..];
+            pos += n as u64;
+        }
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut fc = f.try_clone()?;
+        fc.seek(SeekFrom::Start(offset))?;
+        fc.write_all(bytes)
+    }
+}
+
+/// The first non-existing path at or suffixed from `path`: `name.ext`, then
+/// `name-2.ext`, `name-3.ext`, … — an existing file is never overwritten
+/// (DL-ISC-21). The suffix goes before the extension so the file keeps its type.
+fn no_clobber_target(path: &Path) -> PathBuf {
+    if !path.exists() {
+        return path.to_path_buf();
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
+    let ext = path.extension().and_then(|s| s.to_str());
+    let mut n = 2usize;
+    loop {
+        let name = match ext {
+            Some(e) => format!("{stem}-{n}.{e}"),
+            None => format!("{stem}-{n}"),
+        };
+        let cand = parent.join(name);
+        if !cand.exists() {
+            return cand;
+        }
+        n += 1;
+    }
+}
+
+/// A fetch's reserved staging area under a destination root:
+/// `<root>/.dspart/<share_id>/<final-rel>`. Chunks are written verified at their
+/// offsets ([`write_verified_chunk`](Self::write_verified_chunk)); a completed
+/// file is [`promote`](Self::promote)d to `<root>/<final-rel>` (no-clobber); the
+/// whole area is [`destroy`](Self::destroy)ed on an integrity abort or after
+/// every file promotes. `<final-rel>` is what the caller computed for the
+/// destination — the managed dir's `<share-folder>/<rel>` or a chosen dest's
+/// [`PlacedFile::dest_rel`].
+pub struct StagingArea {
+    /// The destination root a completed file promotes under.
+    root: PathBuf,
+    /// `<root>/.dspart/<share_id>` — the quarantine for this fetch's partials.
+    dir: PathBuf,
+}
+
+impl StagingArea {
+    /// Open (creating) the staging area for `share_id` under `root`.
+    pub fn open(root: impl Into<PathBuf>, share_id: &str) -> Result<Self, FetchedError> {
+        let root = root.into();
+        let dir = root.join(STAGING_DIR).join(safe_folder_name(share_id));
+        std::fs::create_dir_all(&dir)?;
+        Ok(Self { root, dir })
+    }
+
+    /// This fetch's staging directory (`<root>/.dspart/<share_id>`).
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    fn staging_path(&self, final_rel: &str) -> Result<PathBuf, FetchedError> {
+        Ok(self.dir.join(sanitize_rel_path(final_rel)?))
+    }
+
+    /// Pre-size a sparse staging file for `final_rel` at `size` bytes, so verified
+    /// chunks can be written at their offsets in any order. Idempotent.
+    pub fn preallocate(&self, final_rel: &str, size: u64) -> Result<(), FetchedError> {
+        let path = self.staging_path(final_rel)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)?;
+        f.set_len(size)?;
+        Ok(())
+    }
+
+    /// Write one VERIFIED chunk's bytes into the staging file at its
+    /// manifest-derived `offset`. The caller invokes this only after the chunk
+    /// has passed its SHA-384 content-address check, so no unverified byte ever
+    /// reaches disk (ISC-A-C31 intent). The file must have been
+    /// [`preallocate`](Self::preallocate)d.
+    pub fn write_verified_chunk(
+        &self,
+        final_rel: &str,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<(), FetchedError> {
+        let path = self.staging_path(final_rel)?;
+        let f = std::fs::OpenOptions::new().write(true).open(&path)?;
+        pwrite_all(&f, offset, bytes)?;
+        Ok(())
+    }
+
+    /// Promote a completed staging file to its final path under the destination
+    /// root, never overwriting a pre-existing unrelated file (DL-ISC-21): the
+    /// target is the first free `name`/`name-N` slot. Returns the final path.
+    /// The caller promotes only once every chunk of the file has verified and the
+    /// size matches the confirmed manifest.
+    pub fn promote(&self, final_rel: &str) -> Result<PathBuf, FetchedError> {
+        let staging = self.staging_path(final_rel)?;
+        let intended = self.root.join(sanitize_rel_path(final_rel)?);
+        if let Some(parent) = intended.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let target = no_clobber_target(&intended);
+        std::fs::rename(&staging, &target)?;
+        Ok(target)
+    }
+
+    /// Destroy this fetch's entire staging area — the integrity-abort disposition
+    /// (every unpromoted partial of the fetch is erased) and the post-completion
+    /// cleanup. Idempotent (a missing area is success).
+    pub fn destroy(&self) -> Result<(), FetchedError> {
+        match std::fs::remove_dir_all(&self.dir) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(FetchedError::Io(e)),
+        }
+    }
 }
 
 fn parse_manifest(raw: &str) -> Result<Vec<FetchedShare>, FetchedError> {
@@ -841,6 +1019,111 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, FetchedError::UnsafePath(_)));
+    }
+
+    // ── StagingArea — stage-then-promote (step 4b, DL-ISC-11/18/21) ──
+
+    /// DL-ISC-11: chunks are written at their offsets into the reserved staging
+    /// namespace (in ANY order — a set, not a prefix); the final name appears only
+    /// on promote, after the file is complete. Mid-download nothing sits under a
+    /// final name.
+    #[test]
+    fn staging_writes_at_offsets_then_promotes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let staging = StagingArea::open(root, "abc123share").unwrap();
+        staging.preallocate("sub/f.bin", 10).unwrap();
+        // Write the two halves out of order — offsets, not a prefix.
+        staging
+            .write_verified_chunk("sub/f.bin", 5, b"BBBBB")
+            .unwrap();
+        staging
+            .write_verified_chunk("sub/f.bin", 0, b"AAAAA")
+            .unwrap();
+
+        // Mid-download: bytes live ONLY in the staging namespace, never under the
+        // final name.
+        assert!(
+            !root.join("sub/f.bin").exists(),
+            "no final name mid-download"
+        );
+        assert!(
+            staging.dir().join("sub/f.bin").exists(),
+            "staged under .dspart"
+        );
+        assert!(root.join(STAGING_DIR).is_dir());
+
+        let final_path = staging.promote("sub/f.bin").unwrap();
+        assert_eq!(final_path, root.join("sub/f.bin"));
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"AAAAABBBBB");
+        // The staging copy is gone after promotion (renamed, not copied).
+        assert!(!staging.dir().join("sub/f.bin").exists());
+    }
+
+    /// DL-ISC-18 (full): the reserved `.dspart` staging component is refused in any
+    /// manifest `rel_path` — via `sanitize_rel_path`, `record_share`, and
+    /// `place_at_dest` — so no manifest can reach into the quarantine.
+    #[test]
+    fn staging_namespace_is_refused_in_manifest_paths() {
+        assert!(sanitize_rel_path(".dspart").is_err());
+        assert!(sanitize_rel_path(".dspart/evil.txt").is_err());
+        assert!(sanitize_rel_path("sub/.dspart/evil.txt").is_err());
+        // A normal dotfile that merely CONTAINS the string is fine.
+        assert!(sanitize_rel_path("my.dspartner/notes.txt").is_ok());
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut store = FetchedStore::open(dir.path()).unwrap();
+        let err = store
+            .record_share("s", "s", &[vf(".dspart/x", b"pwn")])
+            .unwrap_err();
+        assert!(matches!(err, FetchedError::UnsafePath(_)));
+
+        let err =
+            place_at_dest(&[SelectionRoot::Dir(String::new())], &[".dspart/planted"]).unwrap_err();
+        assert!(matches!(err, FetchedError::UnsafePath(_)));
+    }
+
+    /// DL-ISC-21: promotion never overwrites a pre-existing unrelated file — it
+    /// lands at the first free `name-N` slot (suffix before the extension), and the
+    /// pre-existing file is untouched.
+    #[test]
+    fn promote_never_clobbers_a_preexisting_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("track.mp3"), b"ORIGINAL").unwrap();
+
+        let staging = StagingArea::open(root, "share1").unwrap();
+        staging.preallocate("track.mp3", 3).unwrap();
+        staging
+            .write_verified_chunk("track.mp3", 0, b"NEW")
+            .unwrap();
+        let final_path = staging.promote("track.mp3").unwrap();
+
+        assert_eq!(
+            final_path,
+            root.join("track-2.mp3"),
+            "suffix before the extension"
+        );
+        assert_eq!(
+            std::fs::read(root.join("track.mp3")).unwrap(),
+            b"ORIGINAL",
+            "untouched"
+        );
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"NEW");
+    }
+
+    /// The integrity-abort disposition: `destroy` erases the whole staging area
+    /// (every unpromoted partial), and is idempotent.
+    #[test]
+    fn destroy_erases_the_staging_area() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let staging = StagingArea::open(dir.path(), "share2").unwrap();
+        staging.preallocate("a.bin", 4).unwrap();
+        staging.write_verified_chunk("a.bin", 0, b"data").unwrap();
+        assert!(staging.dir().exists());
+        staging.destroy().unwrap();
+        assert!(!staging.dir().exists(), "staging erased");
+        staging.destroy().unwrap(); // idempotent
     }
 
     /// ISC-C63 / ISC-C65 — a recorded fetch writes named files (real names,
