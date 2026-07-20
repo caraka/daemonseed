@@ -295,7 +295,7 @@ impl<R: Clone + Eq + Hash> RouteBudget<R> {
 
     /// Test/inspection: the learned ceiling recorded for a sharer, if any.
     #[cfg(test)]
-    fn learned_ceiling(&self, sharer: &SharerKey) -> Option<usize> {
+    pub(crate) fn learned_ceiling(&self, sharer: &SharerKey) -> Option<usize> {
         self.state.lock().unwrap().ceilings.get(sharer).copied()
     }
 }

@@ -32,7 +32,7 @@ use daemonseed_core::share_seal::{open_share_frame, seal_public_share_frame};
 use daemonseed_core::share_serve::{ShareContent, MANIFEST_FRAME_BUDGET};
 use daemonseed_core::storage::cas::{chunk_addr, ChunkAddr, CHUNK_ADDR_LEN};
 
-use crate::error::{Result, VeilidNetError};
+use crate::error::{FetchErrorClass, Result, VeilidNetError};
 use crate::route_budget::{FragmentOutcome, RouteLease, W_CEIL};
 
 /// Max sealed-content bytes per `app_call` fragment. The response frame is
@@ -592,14 +592,16 @@ where
 /// Pull every fragment of `target` under the per-route budget and concatenate
 /// into the full sealed blob. Every fragment `app_call` is admitted through
 /// `lease` (the single per-route limiter — no per-fetch window), and each
-/// fragment's outcome feeds the window controller: a completion as
+/// fragment's outcome feeds the window controller: each completion as
 /// [`FragmentOutcome::Completed`] (its latency vs [`FRAGMENT_LATENCY_THRESHOLD`]
-/// is the coexistence-valve signal), a terminal transport failure as
-/// [`FragmentOutcome::Failed`] (window collapse). Content-integrity errors
-/// (malformed / oversized / verify) abort the fetch but do NOT signal the
-/// controller — the route is fine, the content is hostile. The stream yields in
-/// request order for a simple in-order concat.
-async fn fetch_sealed_budgeted<R, F, Fut>(
+/// is the coexistence-valve signal). The `Failed` collapse is NOT observed here —
+/// a route death makes up to `W` in-flight fragments fail at once, and observing
+/// `Failed` per fragment would collapse the window many times over and ratchet
+/// the sharer's learned ceiling all the way to floor; the wrapper
+/// [`fetch_sealed_budgeted`] observes `Failed` exactly ONCE per fetch, gated on
+/// the failure class. The stream yields in request order for a simple in-order
+/// concat.
+async fn fetch_sealed_budgeted_inner<R, F, Fut>(
     share_id: &str,
     target: &FetchTarget,
     lease: &RouteLease<R>,
@@ -611,14 +613,7 @@ where
     Fut: std::future::Future<Output = Result<Vec<u8>>>,
 {
     let frag0_started = Instant::now();
-    let first =
-        match call_fragment_budgeted(lease, call, encode_request(share_id, target, 0)?).await {
-            Ok(r) => r,
-            Err(e) => {
-                lease.observe(FragmentOutcome::Failed);
-                return Err(e);
-            }
-        };
+    let first = call_fragment_budgeted(lease, call, encode_request(share_id, target, 0)?).await?;
     let frag0_latency = frag0_started.elapsed();
     lease.observe(FragmentOutcome::Completed {
         over_threshold: frag0_latency >= FRAGMENT_LATENCY_THRESHOLD,
@@ -639,15 +634,7 @@ where
         .map(|i| async move {
             let started = Instant::now();
             let reply =
-                match call_fragment_budgeted(lease, call, encode_request(share_id, target, i)?)
-                    .await
-                {
-                    Ok(r) => r,
-                    Err(e) => {
-                        lease.observe(FragmentOutcome::Failed);
-                        return Err(e);
-                    }
-                };
+                call_fragment_budgeted(lease, call, encode_request(share_id, target, i)?).await?;
             let latency = started.elapsed();
             lease.observe(FragmentOutcome::Completed {
                 over_threshold: latency >= FRAGMENT_LATENCY_THRESHOLD,
@@ -671,6 +658,34 @@ where
         ));
     }
     Ok((buf, max_latency))
+}
+
+/// Pull every fragment of `target` under the per-route budget (see
+/// [`fetch_sealed_budgeted_inner`]) and signal the window controller's `Failed`
+/// collapse EXACTLY ONCE per fetch. A route death fails up to `W` concurrent
+/// in-flight fragments; collapsing per fragment would over-ratchet the sharer's
+/// learned ceiling to floor (it should record half the killing width). So the
+/// collapse is observed here, once, and ONLY for a transport-class failure
+/// ([`FetchErrorClass::Transient`]) — a content-integrity failure or an
+/// authoritative not-served never signal the controller (the route is fine).
+async fn fetch_sealed_budgeted<R, F, Fut>(
+    share_id: &str,
+    target: &FetchTarget,
+    lease: &RouteLease<R>,
+    call: &F,
+) -> Result<(Vec<u8>, Duration)>
+where
+    R: Clone + Eq + std::hash::Hash,
+    F: Fn(Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>>>,
+{
+    let result = fetch_sealed_budgeted_inner(share_id, target, lease, call).await;
+    if let Err(e) = &result {
+        if e.fetch_class() == FetchErrorClass::Transient {
+            lease.observe(FragmentOutcome::Failed);
+        }
+    }
+    result
 }
 
 /// Budget-admitted manifest fetch — the [`fetch_manifest`] replacement that
@@ -1063,5 +1078,53 @@ mod tests {
             "the controller climbed as fragments completed (observe wired)"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F1 regression: a route death fails many in-flight fragments at once, but
+    /// the window must collapse ONCE — the sharer's learned ceiling records half
+    /// the killing width, not floor. (Observing `Failed` per fragment would
+    /// ratchet the ceiling down to floor; the fix observes it once at the fetch
+    /// boundary, gated on the transport failure class.)
+    #[tokio::test]
+    async fn a_route_death_collapses_the_window_once_not_per_fragment() {
+        use crate::route_budget::{RouteBudget, SharerKey, W_CEIL, W_FLOOR};
+        let _ = oxicrypt_module::initialize();
+        let budget = Arc::new(RouteBudget::<u32>::new());
+        let lease = budget.lease(1, SharerKey(vec![1]));
+        // Climb the window to the ceiling so the killing width is W_CEIL.
+        for _ in 0..64 {
+            lease.observe(FragmentOutcome::Completed {
+                over_threshold: false,
+            });
+        }
+        assert_eq!(budget.route_width(&1), W_CEIL);
+        // A valid frag0 (total=10) so the stream launches, then a route death
+        // (Err) for every subsequent fragment — many fragments fail concurrently.
+        let call = |req: Vec<u8>| {
+            let (_sid, _t, frag) = decode_request(&req).unwrap();
+            async move {
+                if frag == 0 {
+                    Ok(encode_response_ok(10, &[0u8; 16]))
+                } else {
+                    Err::<Vec<u8>, VeilidNetError>(VeilidNetError::Send("route dead".to_owned()))
+                }
+            }
+        };
+        let want = chunk_addr(&[0u8; 32]).unwrap();
+        let err = fetch_sealed_budgeted(
+            "dddddddddddddddddddddddddddddddd",
+            &FetchTarget::Chunk(want),
+            &lease,
+            &call,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.fetch_class(), FetchErrorClass::Transient);
+        assert_eq!(
+            budget.learned_ceiling(&SharerKey(vec![1])),
+            Some(W_CEIL / 2),
+            "a route death collapses ONCE: learned ceiling is half the killing width, not floor"
+        );
+        assert_eq!(budget.route_width(&1), W_FLOOR, "window collapsed to floor");
     }
 }
