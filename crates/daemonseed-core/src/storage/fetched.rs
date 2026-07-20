@@ -55,7 +55,7 @@
 //! S ...
 //! ```
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -179,11 +179,23 @@ impl IdxLock {
     /// Block until the exclusive advisory lock on `<root>/.idx.lock` is held.
     fn acquire(root: &Path) -> Result<Self, FetchedError> {
         use fs4::fs_std::FileExt;
+        let path = root.join(".idx.lock");
+        // Refuse a symlink at the lock path: a co-resident attacker could point
+        // it at a different inode so the GUI and TUI end up locking different
+        // files, defeating the cross-process serialization. (An atomic
+        // `O_NOFOLLOW` open would close the residual check-then-open window
+        // without a platform-specific dependency; that hardening is tracked.)
+        if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(FetchedError::UnsafePath(format!(
+                "{} is a symlink; refusing to take the idx lock through it",
+                path.display()
+            )));
+        }
         let file = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(false)
-            .open(root.join(".idx.lock"))?;
+            .open(&path)?;
         file.lock_exclusive()?;
         Ok(Self { _file: file })
     }
@@ -820,16 +832,24 @@ impl StagingArea {
 //
 // A startup/idle sweep reclaims UNRESUMABLE staging debris (e.g. a crash before
 // the confirmed manifest persisted) but must never delete state belonging to a
-// registered in-flight or resuming fetch. A resume registers its share_id BEFORE
-// the sweep can run, closing the TOCTOU (design §Part 3; DL-ISC-22). The sweep
-// is gated on the registry + a caller-supplied resumable predicate, never on a
-// name pattern alone.
+// registered in-flight or resuming fetch. The sweep skips any share_id in the
+// registry or that the caller's resumable predicate keeps — never deletes on a
+// name pattern alone (design §Part 3; DL-ISC-22).
+//
+// CALLER CONTRACT (not enforced here): the registry check and the delete are not
+// one atomic step, so a `register()` that races an in-flight sweep is not ordered
+// by this code. The caller must ensure a resume registers BEFORE a sweep can see
+// its staging — run the sweep at startup / idle when no fetch is registering, or
+// coordinate them externally. The step-5/6 wiring owns that ordering.
 
-/// The set of `share_id`s whose fetches are in-flight or resuming in THIS
-/// process. Cheap to clone (shared inner set); the staging sweep consults it.
+/// The `share_id`s whose fetches are in-flight or resuming in THIS process,
+/// REFERENCE-COUNTED so overlapping registrations of one id (a re-fetch that
+/// starts before the prior fetch's guard drops) each hold it active until the
+/// LAST guard drops. Cheap to clone (shared inner map); the staging sweep
+/// consults it.
 #[derive(Clone, Default)]
 pub struct LiveFetchRegistry {
-    active: Arc<Mutex<HashSet<String>>>,
+    active: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 impl LiveFetchRegistry {
@@ -838,24 +858,34 @@ impl LiveFetchRegistry {
         Self::default()
     }
 
-    /// Register `share_id` as an active fetch; the returned guard unregisters it
-    /// on drop. A resume registers before the sweep can run.
+    /// Register `share_id` as an active fetch; the returned guard drops its
+    /// reference on drop (the id stays active while any guard for it lives).
     pub fn register(&self, share_id: &str) -> LiveFetchGuard {
-        self.active.lock().unwrap().insert(share_id.to_owned());
+        *self
+            .active
+            .lock()
+            .unwrap()
+            .entry(share_id.to_owned())
+            .or_insert(0) += 1;
         LiveFetchGuard {
             registry: self.clone(),
             share_id: share_id.to_owned(),
         }
     }
 
-    /// Whether `share_id` is currently registered as active.
+    /// Whether `share_id` has any active registration.
     pub fn is_active(&self, share_id: &str) -> bool {
-        self.active.lock().unwrap().contains(share_id)
+        self.active
+            .lock()
+            .unwrap()
+            .get(share_id)
+            .is_some_and(|&c| c > 0)
     }
 }
 
-/// Keeps a `share_id` registered as an active fetch for its lifetime; drops the
-/// registration (so the sweep may later reclaim its staging) on drop.
+/// Keeps one reference to a `share_id`'s active registration for its lifetime;
+/// drops that reference (freeing the id for the sweep only once the last guard
+/// drops) on drop.
 pub struct LiveFetchGuard {
     registry: LiveFetchRegistry,
     share_id: String,
@@ -863,7 +893,13 @@ pub struct LiveFetchGuard {
 
 impl Drop for LiveFetchGuard {
     fn drop(&mut self) {
-        self.registry.active.lock().unwrap().remove(&self.share_id);
+        let mut active = self.registry.active.lock().unwrap();
+        if let Some(count) = active.get_mut(&self.share_id) {
+            *count -= 1;
+            if *count == 0 {
+                active.remove(&self.share_id);
+            }
+        }
     }
 }
 
@@ -1449,6 +1485,41 @@ mod tests {
             assert!(registry.is_active("s"));
         }
         assert!(!registry.is_active("s"), "unregistered on drop");
+    }
+
+    /// Review fix: overlapping registrations of one share_id are reference-counted
+    /// — dropping one guard while another lives keeps the id active, so a sweep
+    /// can't delete a still-in-flight re-fetch's staging.
+    #[test]
+    fn registry_refcounts_overlapping_registrations() {
+        let registry = LiveFetchRegistry::new();
+        let g1 = registry.register("shareA");
+        let g2 = registry.register("shareA");
+        assert!(registry.is_active("shareA"));
+        drop(g1);
+        assert!(
+            registry.is_active("shareA"),
+            "still active while a second guard lives"
+        );
+        drop(g2);
+        assert!(
+            !registry.is_active("shareA"),
+            "inactive once the last guard drops"
+        );
+    }
+
+    /// Review fix: the idx lock refuses to open through a symlink at `.idx.lock`,
+    /// so a co-resident attacker cannot redirect it to a different inode and
+    /// defeat the cross-process serialization.
+    #[cfg(unix)]
+    #[test]
+    fn idx_lock_refuses_a_symlink() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::os::unix::fs::symlink(root.join("elsewhere"), root.join(".idx.lock")).unwrap();
+        let mut store = FetchedStore::open(root).unwrap();
+        let err = store.record_share("s", "n", &[vf("f", b"x")]).unwrap_err();
+        assert!(matches!(err, FetchedError::UnsafePath(_)));
     }
 
     /// DL-ISC-9: concurrent `record_share` on one downloads root — separate
