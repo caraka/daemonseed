@@ -277,7 +277,7 @@ impl<R: Clone + Eq + Hash> RouteBudget<R> {
 
     /// Test/inspection: the current window width for a route (0 if unleased).
     #[cfg(test)]
-    fn route_width(&self, route: &R) -> usize {
+    pub(crate) fn route_width(&self, route: &R) -> usize {
         self.state
             .lock()
             .unwrap()

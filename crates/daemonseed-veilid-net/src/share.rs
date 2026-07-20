@@ -33,6 +33,7 @@ use daemonseed_core::share_serve::{ShareContent, MANIFEST_FRAME_BUDGET};
 use daemonseed_core::storage::cas::{chunk_addr, ChunkAddr, CHUNK_ADDR_LEN};
 
 use crate::error::{Result, VeilidNetError};
+use crate::route_budget::{FragmentOutcome, RouteLease, W_CEIL};
 
 /// Max sealed-content bytes per `app_call` fragment. The response frame is
 /// `[status(1)][total(4)][fragment]`; 30 KiB leaves comfortable headroom under
@@ -335,27 +336,11 @@ pub fn serve(shares: &mut HashMap<String, ServedShare>, request: &[u8]) -> Vec<u
 
 // ── Fetch side (reassembly + verification) ───────────────────────────────────
 
-/// Reassemble + open the manifest for `share_id`, pulling fragments via `call`
-/// (one `app_call` round-trip per fragment).
-pub async fn fetch_manifest<F, Fut>(
-    share_id: &str,
-    room_key: &PublicRoomKey,
-    call: F,
-) -> Result<Vec<ManifestEntry>>
-where
-    F: Fn(Vec<u8>) -> Fut,
-    Fut: std::future::Future<Output = Result<Vec<u8>>>,
-{
-    // The manifest is one small fetch, fetched fully open at the ceiling; its
-    // latency does not feed the adaptive window (that adapts across content chunks).
-    let (sealed, _lat) = fetch_sealed(
-        share_id,
-        &FetchTarget::Manifest,
-        FRAGMENT_FETCH_CONCURRENCY,
-        &call,
-    )
-    .await?;
-    match open_share_frame(room_key, &sealed)
+/// Open a reassembled sealed MANIFEST response frame. A malformed frame or the
+/// wrong frame type is an [`VeilidNetError::Integrity`] (hostile / corrupt
+/// sharer), fatal for the share.
+fn open_manifest_frame(room_key: &PublicRoomKey, sealed: &[u8]) -> Result<Vec<ManifestEntry>> {
+    match open_share_frame(room_key, sealed)
         .map_err(|e| VeilidNetError::Integrity(e.to_string()))?
     {
         ShareFrame::ManifestResponse { entries } => Ok(entries),
@@ -365,29 +350,17 @@ where
     }
 }
 
-/// Reassemble + open + VERIFY one content chunk: re-derive SHA-384 over the
-/// recovered bytes and reject any mismatch with the requested address
-/// (ISC-S28 / ISC-A-S20). A faithful sharer passes by construction; a tampered
-/// chunk fails closed.
-///
-/// `window` caps how many fragment `app_call`s run in flight for this chunk (the
-/// fetcher-side AIMD window, #128 D-1). Returns the chunk bytes plus the MAX
-/// per-fragment round-trip latency observed, the congestion signal the caller
-/// feeds back into its [`crate::AimdWindow`] to size the NEXT chunk's window.
-pub async fn fetch_chunk<F, Fut>(
-    share_id: &str,
-    want: &ChunkAddr,
+/// Open + VERIFY one reassembled sealed CHUNK response against `want`: re-derive
+/// SHA-384 over the recovered bytes and reject any mismatch with the requested
+/// address (ISC-S28 / ISC-A-S20). A faithful sharer passes by construction; a
+/// tampered chunk, an address mismatch, or a wrong frame is an
+/// [`VeilidNetError::Integrity`], fatal for the share.
+fn open_and_verify_chunk(
     room_key: &PublicRoomKey,
-    window: usize,
-    call: F,
-) -> Result<(Vec<u8>, Duration)>
-where
-    F: Fn(Vec<u8>) -> Fut,
-    Fut: std::future::Future<Output = Result<Vec<u8>>>,
-{
-    let (sealed, max_latency) =
-        fetch_sealed(share_id, &FetchTarget::Chunk(*want), window, &call).await?;
-    let data = match open_share_frame(room_key, &sealed)
+    want: &ChunkAddr,
+    sealed: &[u8],
+) -> Result<Vec<u8>> {
+    let data = match open_share_frame(room_key, sealed)
         .map_err(|e| VeilidNetError::Integrity(e.to_string()))?
     {
         ShareFrame::ChunkResponse {
@@ -413,7 +386,56 @@ where
             "chunk failed SHA-384 content-address verification (ISC-S28)".to_owned(),
         ));
     }
-    Ok((data, max_latency))
+    Ok(data)
+}
+
+/// Reassemble + open the manifest for `share_id`, pulling fragments via `call`
+/// (one `app_call` round-trip per fragment).
+///
+/// **Legacy window-parameter path** (retired at design step 7). New callers use
+/// [`fetch_manifest_budgeted`], which admits every fragment through a shared
+/// per-route [`crate::RouteBudget`] instead of a per-fetch window.
+pub async fn fetch_manifest<F, Fut>(
+    share_id: &str,
+    room_key: &PublicRoomKey,
+    call: F,
+) -> Result<Vec<ManifestEntry>>
+where
+    F: Fn(Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>>>,
+{
+    // The manifest is one small fetch, fetched fully open at the ceiling; its
+    // latency does not feed the adaptive window (that adapts across content chunks).
+    let (sealed, _lat) = fetch_sealed(
+        share_id,
+        &FetchTarget::Manifest,
+        FRAGMENT_FETCH_CONCURRENCY,
+        &call,
+    )
+    .await?;
+    open_manifest_frame(room_key, &sealed)
+}
+
+/// Reassemble + open + VERIFY one content chunk (ISC-S28 / ISC-A-S20).
+///
+/// **Legacy window-parameter path** (retired at design step 7). `window` caps
+/// how many fragment `app_call`s run in flight for this chunk (the fetcher-side
+/// AIMD window, #128 D-1). New callers use [`fetch_chunk_budgeted`]. Returns the
+/// chunk bytes plus the MAX per-fragment round-trip latency observed.
+pub async fn fetch_chunk<F, Fut>(
+    share_id: &str,
+    want: &ChunkAddr,
+    room_key: &PublicRoomKey,
+    window: usize,
+    call: F,
+) -> Result<(Vec<u8>, Duration)>
+where
+    F: Fn(Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>>>,
+{
+    let (sealed, max_latency) =
+        fetch_sealed(share_id, &FetchTarget::Chunk(*want), window, &call).await?;
+    Ok((open_and_verify_chunk(room_key, want, &sealed)?, max_latency))
 }
 
 /// Pull every fragment of a target via `call` and concatenate into the full
@@ -518,6 +540,176 @@ where
         ));
     }
     Ok((buf, max_latency))
+}
+
+// ── Budget-backed fetch seam (download-subsystem redesign, step 3) ────────────
+//
+// The per-route [`crate::RouteBudget`] replaces the per-fetch `window`: every
+// fragment `app_call` is admitted through a shared `RouteLease`, so files,
+// chunks, and fragments parallelize freely underneath ONE per-route cap. The
+// legacy window-parameter path above stays until design step 7 retires it, so
+// both frontends keep compiling at every commit.
+
+/// One fragment `app_call`, admitted through `lease`'s per-route budget and
+/// retried on a transient transport error up to [`FRAGMENT_RETRIES`] times. The
+/// permit is acquired for each attempt and DROPPED before any backoff sleep
+/// (DL-ISC-6: no admission is held across the sleep, so a dying route's doomed
+/// retries never pin the global pool). Returns the reply, or the last transport
+/// error after the retry budget is exhausted.
+async fn call_fragment_budgeted<R, F, Fut>(
+    lease: &RouteLease<R>,
+    call: &F,
+    request: Vec<u8>,
+) -> Result<Vec<u8>>
+where
+    R: Clone + Eq + std::hash::Hash,
+    F: Fn(Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>>>,
+{
+    let mut last: Option<VeilidNetError> = None;
+    for attempt in 0..=FRAGMENT_RETRIES {
+        let permit = lease.acquire().await;
+        let result = call(request.clone()).await;
+        drop(permit); // release BEFORE any backoff sleep (DL-ISC-6)
+        match result {
+            Ok(reply) => return Ok(reply),
+            Err(e) => {
+                crate::vtrace!(
+                    "fetch fragment app_call attempt {} failed: {e}",
+                    attempt + 1
+                );
+                last = Some(e);
+                if attempt < FRAGMENT_RETRIES {
+                    tokio::time::sleep(std::time::Duration::from_millis(FRAGMENT_RETRY_BACKOFF_MS))
+                        .await;
+                }
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| VeilidNetError::Send("fragment fetch failed".to_owned())))
+}
+
+/// Pull every fragment of `target` under the per-route budget and concatenate
+/// into the full sealed blob. Every fragment `app_call` is admitted through
+/// `lease` (the single per-route limiter — no per-fetch window), and each
+/// fragment's outcome feeds the window controller: a completion as
+/// [`FragmentOutcome::Completed`] (its latency vs [`FRAGMENT_LATENCY_THRESHOLD`]
+/// is the coexistence-valve signal), a terminal transport failure as
+/// [`FragmentOutcome::Failed`] (window collapse). Content-integrity errors
+/// (malformed / oversized / verify) abort the fetch but do NOT signal the
+/// controller — the route is fine, the content is hostile. The stream yields in
+/// request order for a simple in-order concat.
+async fn fetch_sealed_budgeted<R, F, Fut>(
+    share_id: &str,
+    target: &FetchTarget,
+    lease: &RouteLease<R>,
+    call: &F,
+) -> Result<(Vec<u8>, Duration)>
+where
+    R: Clone + Eq + std::hash::Hash,
+    F: Fn(Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>>>,
+{
+    let frag0_started = Instant::now();
+    let first =
+        match call_fragment_budgeted(lease, call, encode_request(share_id, target, 0)?).await {
+            Ok(r) => r,
+            Err(e) => {
+                lease.observe(FragmentOutcome::Failed);
+                return Err(e);
+            }
+        };
+    let frag0_latency = frag0_started.elapsed();
+    lease.observe(FragmentOutcome::Completed {
+        over_threshold: frag0_latency >= FRAGMENT_LATENCY_THRESHOLD,
+    });
+    let mut max_latency = frag0_latency;
+    let (total, frag0) = decode_response(&first)?.ok_or(VeilidNetError::NotServed)?;
+    if total > MAX_FRAGMENTS {
+        return Err(VeilidNetError::Integrity(format!(
+            "sharer claims {total} fragments, over the {MAX_FRAGMENTS} cap (malicious?)"
+        )));
+    }
+    check_fragment_size(&frag0)?;
+    // Poll up to W_CEIL fragment futures at once for in-order yield; the BUDGET
+    // (not this bound) is the real concurrency limiter — each future blocks on
+    // admission, so total in-flight app_calls to the route stay ≤ W(route), and
+    // fragments across concurrent chunks/files on the same lease share that cap.
+    let rest: Vec<(Vec<u8>, Duration)> = stream::iter(1..total)
+        .map(|i| async move {
+            let started = Instant::now();
+            let reply =
+                match call_fragment_budgeted(lease, call, encode_request(share_id, target, i)?)
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        lease.observe(FragmentOutcome::Failed);
+                        return Err(e);
+                    }
+                };
+            let latency = started.elapsed();
+            lease.observe(FragmentOutcome::Completed {
+                over_threshold: latency >= FRAGMENT_LATENCY_THRESHOLD,
+            });
+            let (_t, frag) = decode_response(&reply)?
+                .ok_or_else(|| VeilidNetError::Send("fragment vanished mid-fetch".to_owned()))?;
+            check_fragment_size(&frag)?;
+            Ok::<(Vec<u8>, Duration), VeilidNetError>((frag, latency))
+        })
+        .buffered(W_CEIL)
+        .try_collect()
+        .await?;
+    let mut buf = frag0;
+    for (frag, latency) in rest {
+        max_latency = max_latency.max(latency);
+        buf.extend_from_slice(&frag);
+    }
+    if buf.len() > MAX_REASSEMBLED_LEN {
+        return Err(VeilidNetError::Integrity(
+            "reassembled share response exceeds the size cap (malicious?)".to_owned(),
+        ));
+    }
+    Ok((buf, max_latency))
+}
+
+/// Budget-admitted manifest fetch — the [`fetch_manifest`] replacement that
+/// admits every fragment through the shared per-route [`crate::RouteBudget`].
+pub async fn fetch_manifest_budgeted<R, F, Fut>(
+    share_id: &str,
+    room_key: &PublicRoomKey,
+    lease: &RouteLease<R>,
+    call: F,
+) -> Result<Vec<ManifestEntry>>
+where
+    R: Clone + Eq + std::hash::Hash,
+    F: Fn(Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>>>,
+{
+    let (sealed, _lat) =
+        fetch_sealed_budgeted(share_id, &FetchTarget::Manifest, lease, &call).await?;
+    open_manifest_frame(room_key, &sealed)
+}
+
+/// Budget-admitted chunk fetch — the [`fetch_chunk`] replacement (ISC-S28 /
+/// ISC-A-S20). Returns the verified chunk bytes plus the MAX per-fragment
+/// latency observed (kept for telemetry; the controller is fed live via
+/// `lease.observe` inside the fetch).
+pub async fn fetch_chunk_budgeted<R, F, Fut>(
+    share_id: &str,
+    want: &ChunkAddr,
+    room_key: &PublicRoomKey,
+    lease: &RouteLease<R>,
+    call: F,
+) -> Result<(Vec<u8>, Duration)>
+where
+    R: Clone + Eq + std::hash::Hash,
+    F: Fn(Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>>>,
+{
+    let (sealed, max_latency) =
+        fetch_sealed_budgeted(share_id, &FetchTarget::Chunk(*want), lease, &call).await?;
+    Ok((open_and_verify_chunk(room_key, want, &sealed)?, max_latency))
 }
 
 #[cfg(test)]
@@ -800,6 +992,76 @@ mod tests {
             "a touched entry is not the next evicted"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// DL-ISC-6 (seam): the budget-backed fetch admits every fragment `app_call`
+    /// through the shared per-route budget — a multi-fragment chunk reassembles
+    /// byte-for-byte, fragments overlap (peak > 1), peak in-flight never exceeds
+    /// the route ceiling W_CEIL, and the controller climbed as fragments
+    /// completed (observe feedback is wired).
+    #[tokio::test]
+    async fn budgeted_fetch_reassembles_and_admits_through_the_route_budget() {
+        use crate::route_budget::{RouteBudget, SharerKey, W_CEIL, W_FLOOR};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let _ = oxicrypt_module::initialize();
+        let dir = std::env::temp_dir().join(format!("ds-share-budget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // One file spanning ~20 fragments as a single content chunk.
+        let payload = vec![0xABu8; FRAGMENT_SIZE * 20 + 7];
+        std::fs::write(dir.join("blob.bin"), &payload).unwrap();
+        let content = Arc::new(ShareContent::index_dir(&dir).unwrap());
+        let rk = room_key();
+        let mut shares: HashMap<String, ServedShare> = HashMap::new();
+        let share_id = "cccccccccccccccccccccccccccccccc".to_owned();
+        shares.insert(
+            share_id.clone(),
+            ServedShare::new(content.clone(), room_key()),
+        );
+        let shares = std::sync::Mutex::new(shares);
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let call = |req: Vec<u8>| {
+            let reply = serve(&mut shares.lock().unwrap(), &req);
+            let (in_flight, peak) = (in_flight.clone(), peak.clone());
+            async move {
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                Ok(reply)
+            }
+        };
+
+        let budget = Arc::new(RouteBudget::<u32>::new());
+        let lease = budget.lease(7, SharerKey(vec![7]));
+
+        let manifest = fetch_manifest_budgeted(&share_id, &rk, &lease, &call)
+            .await
+            .unwrap();
+        assert_eq!(manifest[0].chunks.len(), 1, "600 KB < 1 MiB ⇒ one chunk");
+        peak.store(0, Ordering::SeqCst); // measure the chunk fetch, not the manifest
+
+        let (data, _lat) =
+            fetch_chunk_budgeted(&share_id, &manifest[0].chunks[0], &rk, &lease, &call)
+                .await
+                .unwrap();
+        assert_eq!(data, payload, "budgeted fetch reassembles byte-for-byte");
+        let observed = peak.load(Ordering::SeqCst);
+        assert!(
+            observed > 1,
+            "fragments admitted concurrently (peak {observed})"
+        );
+        assert!(
+            observed <= W_CEIL,
+            "never exceeds the route ceiling (peak {observed})"
+        );
+        assert!(
+            budget.route_width(&7) > W_FLOOR,
+            "the controller climbed as fragments completed (observe wired)"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

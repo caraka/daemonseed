@@ -771,6 +771,58 @@ functions:
     returns:
       type: "Result<(Vec<u8>, Duration)>"
       description: The SHA-384-verified chunk bytes and the max per-fragment latency.
+  - name: share::fetch_manifest_budgeted
+    module: daemonseed_veilid_net::share
+    description: Fetch + reassemble + open a manifest, admitting every fragment app_call through a shared per-route RouteBudget (no per-fetch window). Replaces fetch_manifest.
+    signature: "pub async fn fetch_manifest_budgeted<R, F, Fut>(share_id: &str, room_key: &PublicRoomKey, lease: &RouteLease<R>, call: F) -> Result<Vec<ManifestEntry>>"
+    parameters:
+      - name: share_id
+        type: "&str"
+        direction: in
+        description: The share id.
+      - name: room_key
+        type: "&PublicRoomKey"
+        direction: in
+        description: The share's room key.
+      - name: lease
+        type: "&RouteLease<R>"
+        direction: in
+        description: The download's lease on the serving route's budget.
+      - name: call
+        type: "F: Fn(Vec<u8>) -> Fut"
+        direction: in
+        description: A per-fragment app_call round-trip.
+    returns:
+      type: "Result<Vec<ManifestEntry>>"
+      description: The reassembled, opened manifest.
+  - name: share::fetch_chunk_budgeted
+    module: daemonseed_veilid_net::share
+    description: Fetch + reassemble + open + SHA-384-verify one chunk, admitting every fragment app_call through a shared per-route RouteBudget and feeding each fragment's outcome to the window controller. Replaces fetch_chunk.
+    signature: "pub async fn fetch_chunk_budgeted<R, F, Fut>(share_id: &str, chunk_addr: &ChunkAddr, room_key: &PublicRoomKey, lease: &RouteLease<R>, call: F) -> Result<(Vec<u8>, Duration)>"
+    parameters:
+      - name: share_id
+        type: "&str"
+        direction: in
+        description: The share id.
+      - name: chunk_addr
+        type: "&ChunkAddr"
+        direction: in
+        description: The content-address of the chunk.
+      - name: room_key
+        type: "&PublicRoomKey"
+        direction: in
+        description: The share's room key.
+      - name: lease
+        type: "&RouteLease<R>"
+        direction: in
+        description: The download's lease on the serving route's budget.
+      - name: call
+        type: "F: Fn(Vec<u8>) -> Fut"
+        direction: in
+        description: A per-fragment app_call round-trip.
+    returns:
+      type: "Result<(Vec<u8>, Duration)>"
+      description: The SHA-384-verified chunk bytes and the max per-fragment latency.
   - name: ServedShare::new
     module: daemonseed_veilid_net::share
     description: Register a share's content + room key for owner-on-demand serving.
