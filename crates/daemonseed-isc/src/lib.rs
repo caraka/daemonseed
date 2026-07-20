@@ -363,13 +363,16 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("CRSH-ISC-27", IscClass::Positive), // a rotated route re-imports even when the catalog folds Unchanged: a same-timestamp re-advert (sharer restart/route-death, only route_blob rotated) re-imports the new blob, stamps a fresh generation to arm the parked retry, and keeps the share Unresolved — un-wedging the consumer without a restart; an identical re-read (no rotation) still folds with no generation churn (§RS-1.4/§RS-3, #180 — the CRSH-ISC-12 wedge)
     ("CRSH-ISC-28", IscClass::Positive), // manual Refresh re-indexes each own published root (ShareContent::index_dir) and re-announces under the SAME deterministic share_id, so a file added mid-session becomes fetchable without a relaunch; the own-share list upserts by share_id (no duplicate on repeated Refresh); gated on Connected, never on the 3 s liveness poll (#195)
     ("CRSH-ISC-29", IscClass::Positive), // chat NetCommand processed before an in-flight ConfirmFetch (chunk download) resolves — the download is spawned off the actor loop and folded on-loop (mark/clear-Unresolved), mirroring the CRSH-ISC-8 FetchShare restructure (#197, §RS-2)
+    // Download-subsystem redesign (docs/design/download-subsystem.md). The
+    // DL-ISC-* family registers incrementally as each step builds its slice.
+    ("DL-ISC-10", IscClass::Positive), // the share-fetch boundary types transient / integrity / not-served / local failures apart; SHA-384 mismatch is Integrity (step 1 error taxonomy, #205)
 ];
 
 /// Total built, non-deferred ISCs tracked by this registry — the SINGLE source
 /// of truth for the coverage denominator, read live by `xtask isc-coverage`.
 /// Recount on every ISC add/remove (the `const _` assert below guards it
 /// against [`ISCS`]).
-pub const TOTAL: usize = 217;
+pub const TOTAL: usize = 218;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -578,10 +581,14 @@ mod tests {
         //                                  zero-network reactive, retry decorrelation,
         //                                  fetch-never-delays-chat, Refresh-healthy-sweep-only,
         //                                  Refresh-user-initiated-only)
-        //   total   144 pos + 73 neg = 217
+        //                                  download-subsystem redesign (docs/design/
+        //                                  download-subsystem.md): DL-ISC-10 pos
+        //                                  (step 1 fetch-failure taxonomy, #205) —
+        //                                  the DL-ISC-* family registers per build step.
+        //   total   145 pos + 73 neg = 218
         //   (the v0.33.0 Veilid cutover retired 14 server-positive + 10
         //    server-negative relay/TLS/federation/rate-limit ISCs.)
-        assert_eq!(pos, 144, "positive count drift");
+        assert_eq!(pos, 145, "positive count drift");
         assert_eq!(neg, 73, "negative count drift");
     }
 

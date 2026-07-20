@@ -144,7 +144,7 @@ pub use dht_gate::{
 pub use discovery::{
     route_provenance_input, verify_route_advert, DiscoveryEnvelope, RouteAdvertSigner,
 };
-pub use error::{Result, VeilidNetError};
+pub use error::{FetchErrorClass, Result, VeilidNetError};
 pub use event::VeilidNetEvent;
 pub use rendezvous::SweepOutcome;
 pub use resweep::next_resweep_seed;

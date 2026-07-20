@@ -24,6 +24,10 @@ next release this block is renamed to its version + date and a fresh
 `[Unreleased]` is opened (see `AGENTS.md` doc-sync). Planning for *unstarted*
 work lives in the project lead's vault manifest, not here.
 
+### Changed
+
+- `daemonseed-veilid-net`: the share-fetch boundary types failures via `FetchErrorClass` (transient / integrity / not-served / local); content-address and malformed-frame failures classify as `Integrity`, distinct from transient transport (#205, `docs/design/download-subsystem.md`).
+
 ## [0.35.1] — 2026-07-20
 
 ### Fixed

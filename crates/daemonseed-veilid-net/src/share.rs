@@ -97,7 +97,7 @@ pub const FRAGMENT_LATENCY_THRESHOLD: Duration = Duration::from_secs(2);
 /// a strictly stronger bound than the prior cumulative-only check.
 fn check_fragment_size(frag: &[u8]) -> Result<()> {
     if frag.len() > FRAGMENT_SIZE {
-        return Err(VeilidNetError::Send(format!(
+        return Err(VeilidNetError::Integrity(format!(
             "fragment is {} bytes, over the {FRAGMENT_SIZE}-byte cap (malicious?)",
             frag.len()
         )));
@@ -205,7 +205,7 @@ fn encode_response_not_found() -> Vec<u8> {
 /// Decode a reply to `Some((total_fragments, fragment_bytes))`, or `None` when
 /// the sharer holds no such share/chunk (offline-equivalent — ISC-A-S21).
 pub fn decode_response(bytes: &[u8]) -> Result<Option<(u32, Vec<u8>)>> {
-    let bad = || VeilidNetError::Send("malformed share fetch response".to_owned());
+    let bad = || VeilidNetError::Integrity("malformed share fetch response".to_owned());
     match *bytes.first().ok_or_else(bad)? {
         RESP_NOT_FOUND => Ok(None),
         RESP_OK => {
@@ -355,9 +355,11 @@ where
         &call,
     )
     .await?;
-    match open_share_frame(room_key, &sealed).map_err(|e| VeilidNetError::Send(e.to_string()))? {
+    match open_share_frame(room_key, &sealed)
+        .map_err(|e| VeilidNetError::Integrity(e.to_string()))?
+    {
         ShareFrame::ManifestResponse { entries } => Ok(entries),
-        _ => Err(VeilidNetError::Send(
+        _ => Err(VeilidNetError::Integrity(
             "expected a ManifestResponse".to_owned(),
         )),
     }
@@ -386,24 +388,28 @@ where
     let (sealed, max_latency) =
         fetch_sealed(share_id, &FetchTarget::Chunk(*want), window, &call).await?;
     let data = match open_share_frame(room_key, &sealed)
-        .map_err(|e| VeilidNetError::Send(e.to_string()))?
+        .map_err(|e| VeilidNetError::Integrity(e.to_string()))?
     {
         ShareFrame::ChunkResponse {
             chunk_addr: got,
             data,
         } => {
             if &got != want {
-                return Err(VeilidNetError::Send(
+                return Err(VeilidNetError::Integrity(
                     "chunk address mismatch in response".to_owned(),
                 ));
             }
             data
         }
-        _ => return Err(VeilidNetError::Send("expected a ChunkResponse".to_owned())),
+        _ => {
+            return Err(VeilidNetError::Integrity(
+                "expected a ChunkResponse".to_owned(),
+            ))
+        }
     };
-    let derived = chunk_addr(&data).map_err(|e| VeilidNetError::Send(e.to_string()))?;
+    let derived = chunk_addr(&data).map_err(|e| VeilidNetError::Integrity(e.to_string()))?;
     if &derived != want {
-        return Err(VeilidNetError::Send(
+        return Err(VeilidNetError::Integrity(
             "chunk failed SHA-384 content-address verification (ISC-S28)".to_owned(),
         ));
     }
@@ -472,7 +478,7 @@ where
     // fragment `≤ FRAGMENT_SIZE` bounds reassembly at MAX_REASSEMBLED_LEN even
     // though the pipelined fetch can't abort mid-stream like the serial loop did.
     if total > MAX_FRAGMENTS {
-        return Err(VeilidNetError::Send(format!(
+        return Err(VeilidNetError::Integrity(format!(
             "sharer claims {total} fragments, over the {MAX_FRAGMENTS} cap (malicious?)"
         )));
     }
@@ -507,7 +513,7 @@ where
     // Backstop the per-fragment cap: even within bounds the concat must not exceed
     // the largest legitimate reassembled response.
     if buf.len() > MAX_REASSEMBLED_LEN {
-        return Err(VeilidNetError::Send(
+        return Err(VeilidNetError::Integrity(
             "reassembled share response exceeds the size cap (malicious?)".to_owned(),
         ));
     }
@@ -660,7 +666,7 @@ mod tests {
         let err = fetch_manifest("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", &rk, &call)
             .await
             .unwrap_err();
-        assert!(matches!(err, VeilidNetError::Send(_)));
+        assert!(matches!(err, VeilidNetError::Integrity(_)));
     }
 
     /// #109 — fragments after fragment 0 are pulled CONCURRENTLY, and the
@@ -760,7 +766,7 @@ mod tests {
         let err = fetch_manifest("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", &rk, &call)
             .await
             .unwrap_err();
-        assert!(matches!(err, VeilidNetError::Send(_)));
+        assert!(matches!(err, VeilidNetError::Integrity(_)));
     }
 
     /// The serve-side seal cache is LRU-bounded: more distinct targets than

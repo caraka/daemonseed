@@ -820,7 +820,7 @@ error_types:
   - name: VeilidNetError
     module: daemonseed_veilid_net::error
     kind: enum
-    description: Errors from bringing up or operating the daemonseed Veilid node.
+    description: Errors from bringing up or operating the daemonseed Veilid node. `fetch_class(&self) -> FetchErrorClass` classifies a fetch-path failure so the download engine decides resume vs abort vs surface without switching on message strings.
     variants:
       - name: Startup
         condition: veilid startup failed.
@@ -832,12 +832,27 @@ error_types:
         condition: A send / transport failure (offline / slow / dead route).
       - name: NotServed
         condition: The peer answered but does not serve the requested share/chunk (withdrawn or never offered) — an authoritative negative distinct from a transport error.
+      - name: Integrity
+        condition: The sharer served content that failed verification — SHA-384 content-address mismatch, chunk-address mismatch, or a malformed/oversized frame. The route is fine; the content is hostile.
       - name: Identity
         condition: Invalid node identity.
       - name: Actor
         condition: The actor task is gone or dropped a reply.
       - name: Unimplemented
         condition: A Phase 4 surface (presence / announcements) not yet implemented.
+  - name: FetchErrorClass
+    module: daemonseed_veilid_net::error
+    kind: enum
+    description: Coarse class of a fetch-path failure, returned by `VeilidNetError::fetch_class`. The download engine switches on it to decide resume vs abort vs surface.
+    variants:
+      - name: Transient
+        condition: Transport / route failure — resumable; verified units are retained and the share stays Unresolved.
+      - name: Integrity
+        condition: Content failed verification — fatal for the share; never persisted, never resumed past.
+      - name: NotServed
+        condition: The reachable owner does not serve this share/chunk — an authoritative negative.
+      - name: Local
+        condition: A local fetcher fault (path sanitize, disk write, index write) contributed by the download engine; `fetch_class` never returns it.
 
 # ─────────────────────────────────────────────────────────────────────
 # Constants
