@@ -725,7 +725,13 @@ fn reserve_no_clobber_target(intended: &Path) -> Result<PathBuf, FetchedError> {
 /// differing byte returns `false` — the caller then reserves a no-clobber slot.
 /// Streams a bounded buffer, so a large file never loads whole into memory.
 fn files_have_identical_content(existing: &Path, candidate: &Path) -> Result<bool, FetchedError> {
-    let (em, cm) = match (std::fs::metadata(existing), std::fs::metadata(candidate)) {
+    // `symlink_metadata` on `existing` does NOT follow the link, so a symlink at the
+    // (co-resident-writable) destination fails the `is_file()` check below and is treated
+    // as NOT our own artifact — the caller then suffixes rather than preserving it. Without
+    // this, an attacker-planted byte-identical symlink would be kept in place, and a
+    // post-promote swap of its target would silently redefine "the download" (F4 hardening,
+    // DL-ISC-21). `candidate` is our own just-written staging file, so plain metadata is fine.
+    let (em, cm) = match (std::fs::symlink_metadata(existing), std::fs::metadata(candidate)) {
         (Ok(em), Ok(cm)) => (em, cm),
         _ => return Ok(false),
     };
@@ -1747,6 +1753,41 @@ mod tests {
         );
         assert_eq!(std::fs::read(&final_path).unwrap(), b"SAME-BYTES");
         assert!(!root.join("track-2.mp3").exists(), "no orphaned duplicate");
+    }
+
+    /// (F4 hardening / DL-ISC-21) A co-resident-planted SYMLINK at the destination
+    /// whose target content matches the manifest must NOT be recognized as our own
+    /// artifact (else a post-promote target swap would redefine the download). The
+    /// symlink is left untouched and the download suffixes to `name-2`.
+    #[cfg(unix)]
+    #[test]
+    fn promote_does_not_treat_a_symlink_as_its_own_artifact() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let target = root.join("attacker-target");
+        std::fs::write(&target, b"SAME-BYTES").unwrap();
+        std::os::unix::fs::symlink(&target, root.join("track.mp3")).unwrap();
+
+        let staging = StagingArea::open(root, "share-sym").unwrap();
+        staging.preallocate("track.mp3", 10).unwrap();
+        staging
+            .write_verified_chunk("track.mp3", 0, b"SAME-BYTES")
+            .unwrap();
+        let final_path = staging.promote("track.mp3").unwrap();
+
+        assert_eq!(
+            final_path,
+            root.join("track-2.mp3"),
+            "a symlink is not our own artifact — suffix, never preserve it"
+        );
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"SAME-BYTES");
+        // The planted link is untouched and still a symlink (not replaced by our file).
+        assert!(
+            std::fs::symlink_metadata(root.join("track.mp3"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     /// The integrity-abort disposition: `destroy` erases the whole staging area
