@@ -836,6 +836,7 @@ impl StagingArea {
             )));
         }
         pwrite_all(&f, offset, bytes)?;
+        self.mark_progress()?;
         Ok(())
     }
 
@@ -918,6 +919,45 @@ impl StagingArea {
     pub fn read_stored_manifest(&self) -> Result<Vec<ManifestEntry>, FetchedError> {
         let bytes = std::fs::read(self.stored_manifest_path())?;
         deserialize_stored_manifest(&bytes)
+    }
+
+    /// Progress marker path, in the reserved `.dspart` sidecar next to the stored
+    /// manifest (`<root>/.dspart/<share_id>/.dspart/progress`). Present iff ≥1
+    /// verified chunk has been staged; cleaned with the area by [`destroy`] / the
+    /// sweep, and no staged `final_rel` can alias it ([`sanitize_rel_path`] refuses
+    /// a `.dspart` segment).
+    ///
+    /// [`destroy`]: Self::destroy
+    fn progress_marker_path(&self) -> PathBuf {
+        self.dir.join(STAGING_DIR).join("progress")
+    }
+
+    /// Record that this fetch has staged verified data (idempotent). Called after a
+    /// verified chunk lands so the sweep can tell a resumable partial with real
+    /// progress from a preallocated-but-empty failure (A1 / DL-ISC-22).
+    fn mark_progress(&self) -> Result<(), FetchedError> {
+        let marker = self.progress_marker_path();
+        if marker.exists() {
+            return Ok(());
+        }
+        if let Some(parent) = marker.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false) // an empty marker — never overwrite, presence is the signal
+            .open(&marker)?;
+        Ok(())
+    }
+
+    /// True once ≥1 verified chunk has been staged. A preallocated-but-empty failure
+    /// (the confirmed manifest persisted but the fetch died before any chunk landed)
+    /// reports false, so the start-of-download sweep reclaims it instead of retaining
+    /// an empty "resumable" area indefinitely (A1 / DL-ISC-22). A partial WITH
+    /// progress reports true and is kept for a later resume.
+    pub fn has_verified_progress(&self) -> bool {
+        self.progress_marker_path().exists()
     }
 }
 
@@ -2315,6 +2355,43 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let staging = StagingArea::open(dir.path(), "share-x").unwrap();
         assert!(staging.read_stored_manifest().is_err());
+    }
+
+    /// A1 (DL-ISC-22): `has_verified_progress` flips false→true on the first staged
+    /// chunk, and the sweep — with the frontends' keep-predicate (resumable AND
+    /// progress) — reclaims a preallocated-but-empty resumable area (a failed fetch
+    /// that staged nothing) while keeping one that staged real bytes.
+    #[test]
+    fn sweep_reclaims_a_resumable_area_with_no_verified_progress() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let manifest = vec![fake_entry("a.bin", 8, 1, 1)];
+
+        // Empty: manifest persisted (resumable in name) but no chunk ever staged.
+        let empty = StagingArea::open(root, "empty").unwrap();
+        empty.persist_manifest(&manifest).unwrap();
+        assert!(!empty.has_verified_progress(), "no chunk staged yet");
+
+        // Progressed: manifest persisted AND one verified chunk staged.
+        let staged = StagingArea::open(root, "staged").unwrap();
+        staged.persist_manifest(&manifest).unwrap();
+        staged.preallocate("a.bin", 8).unwrap();
+        staged.write_verified_chunk("a.bin", 0, &[0xAB; 8]).unwrap();
+        assert!(
+            staged.has_verified_progress(),
+            "a staged chunk marks progress"
+        );
+
+        // The frontends' keep-predicate: resumable AND has progress.
+        let keep = |sid: &str| {
+            let s = StagingArea::open(root, sid).unwrap();
+            s.read_stored_manifest().is_ok() && s.has_verified_progress()
+        };
+        let deleted = sweep_staging(root, &LiveFetchRegistry::new(), keep).unwrap();
+
+        assert!(!empty.dir().exists(), "empty resumable area reclaimed (A1)");
+        assert!(staged.dir().exists(), "progressed area kept for resume");
+        assert_eq!(deleted.len(), 1, "only the empty area was reclaimed");
     }
 
     /// DL-ISC-20: `verify_stored_manifest` returns the manifest only when the

@@ -439,7 +439,7 @@ The write-budget family takes permanent `WB-ISC-N` IDs from the FROZEN 2026-07-0
 - [x] DL-ISC-17: The latency valve steps the window down on a sustained breach (≥3 of the last 5 completions at/over `FRAGMENT_LATENCY_THRESHOLD`) and NOT on a single slow sample (probe: `route_budget::tests::latency_valve_steps_down_only_on_sustained_breach`).
 - [x] DL-ISC-19: Anti: `W_CEIL < G_GLOBAL` (compile-time `const _` assert) and no single route ever holds more than `W_CEIL` global slots, so a route at its ceiling never blocks another route from admitting (probe: the compile-time assert + `route_budget::tests::a_saturated_route_never_blocks_another`).
 - [x] DL-ISC-9: Anti: two concurrent managed-dir downloads — in one process or two — never lose a `downloads.idx` entry; the idx read-modify-write is serialized by an OS advisory file lock (`flock`/`LockFileEx` on a `.idx.lock` sibling, `fs4`), re-reading under the lock so no entry is dropped via a stale snapshot (probe: `storage::fetched::tests::concurrent_record_share_never_loses_an_entry` — 8 concurrent `record_share`s on one root via separate stores, all entries land).
-- [x] DL-ISC-22: Anti: the staging sweep deletes only staging state that is NEITHER registered as an active fetch (the live-fetch registry) NOR resumable (has a stored confirmed manifest) — the sweep skips any registered id, and a directory whose name is not a valid staging component is never deleted on a name pattern alone (probe: `storage::fetched::tests::sweep_reclaims_only_unregistered_unresumable_debris` + `sweep_keeps_a_registered_resume` + `sweep_leaves_foreign_dirs`). The registry↔sweep happens-before is a **caller-ordering contract** (the sweep runs at startup/idle when nothing is registering), not a code-atomic guarantee — the step-5/6 wiring owns that ordering.
+- [x] DL-ISC-22: Anti: the staging sweep deletes only staging state that is NEITHER registered as an active fetch (the live-fetch registry) NOR resumable-with-progress (the frontend keep-predicate: a stored confirmed manifest is present AND ≥1 verified chunk was staged — A1/#214: a preallocated-but-empty failure, manifest persisted but no chunk fetched, has nothing to resume and IS reclaimed rather than surfaced as a phantom 0% partial) — the sweep skips any registered id, and a directory whose name is not a valid staging component is never deleted on a name pattern alone (probe: `storage::fetched::tests::sweep_reclaims_only_unregistered_unresumable_debris` + `sweep_keeps_a_registered_resume` + `sweep_leaves_foreign_dirs` + `sweep_reclaims_a_resumable_area_with_no_verified_progress`). The registry↔sweep happens-before is a **caller-ordering contract** (the sweep runs at startup/idle when nothing is registering), not a code-atomic guarantee — the step-5/6 wiring owns that ordering.
 - [x] DL-ISC-11: Chunk bytes reach disk only after verification, only inside the reserved `.dspart/<share_id>/` staging namespace, written at their manifest-derived byte offsets (files pre-sized sparse; partial state is a SET of verified chunks, not a prefix); a file appears under its real name only by promotion, after every chunk has verified. Mid-download no bytes sit under a final name (probe: `storage::fetched::tests::staging_writes_at_offsets_then_promotes` — out-of-order offset writes + fs inspection + promote).
 - [x] DL-ISC-18: Anti: the full computed destination-relative path (selection-root basename + subpath) passes the traversal guard as ONE unit, and the reserved `.dspart` staging component is refused in any manifest `rel_path`, so no hostile manifest or selection can write outside the dest or into the staging namespace (probe: `storage::fetched::tests::place_guards_the_full_computed_path` + `staging_namespace_is_refused_in_manifest_paths` — `sanitize_rel_path`/`record_share`/`place_at_dest` all refuse `.dspart`).
 - [x] DL-ISC-21: Anti: at a user-chosen dest, promotion never overwrites a pre-existing path that is not provably this download's own artifact — the incoming file collision-suffixes (`name-N`, before the extension) instead (probe: `storage::fetched::tests::promote_never_clobbers_a_preexisting_file`). (The overwrite-if-provably-ours case is a step-8 resume refinement.)
@@ -1227,6 +1227,19 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   `W_CEIL`. Re-enable by raising the one const. DL-ISC-15's probe
   (`window_climbs_to_ceiling_under_sustained_health`) is controller-level and still passes — production
   merely configures a lower ceiling. (Sanjay, 2026-07-21.)
+- 2026-07-21: **`.dspart` stranded-partial cleanup (#214, fix A1 — caraka-approved).** A felt-test found
+  a completed download coexisting with a full-looking copy under `~/Downloads/.dspart/<share_id>/`: a
+  *failed* download (transient route-death) had persisted its confirmed manifest and preallocated sparse
+  files, so it counted as "resumable" and the start-of-download sweep spared it indefinitely — never
+  reclaimed because no later fetch reused that exact `share_id`+dest. **Refines Ratification item 4**
+  ("resumable staging is never auto-deleted"): a resumable area with ZERO verified progress (manifest
+  persisted, no chunk staged) has nothing to resume, so it is reclaimed rather than retained/surfaced.
+  Mechanism: a cross-platform progress marker (`.dspart/<share_id>/.dspart/progress`) written on the
+  first verified chunk (`StagingArea::write_verified_chunk` → `mark_progress`); `has_verified_progress()`
+  exposes it; both frontends' sweep keep-predicate becomes `resumable AND has_verified_progress`. A
+  partial WITH progress is untouched (kept for resume → the deferred incomplete-downloads surface).
+  Rejected: A2 (age-out — arbitrary threshold, delayed) and destroy-on-any-transient (kills resume).
+  Chose a marker over Unix `st_blocks` for the Windows build. (Sanjay, 2026-07-21.)
 
 ## Changelog
 
@@ -1824,3 +1837,10 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   chat OK; downloads from ds1 and frank both complete into their folders; `~/build/dsB.log` shows 0
   `could not get remote private route` + 0 `fetch fragment … failed` (broken build: 584 / 587). Rule-1
   live-probe: PASS. (Sanjay, 2026-07-21.)
+- GATE-GREEN 2026-07-21: **`.dspart` A1 cleanup (#214).** `daemonseed-core` fmt clean; `clippy
+  --all-targets -- -D warnings` clean (core + `daemonseed-tui` + `daemonseed-gui --features desktop`);
+  `cargo test -p daemonseed-core --lib` 733/733 incl.
+  `sweep_reclaims_a_resumable_area_with_no_verified_progress` (empty resumable area reclaimed, progressed
+  area kept). No runnable bin built (VM). **DEFERRED-VERIFY → orinoco:** a download that fails after 0
+  chunks leaves no `.dspart` residue after the next download's sweep; a partially-progressed failure's
+  staging is retained. (Sanjay, 2026-07-21.)

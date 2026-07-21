@@ -1914,6 +1914,9 @@ types:
       collide with it; read_stored_manifest() -> Vec<ManifestEntry> reads it back,
       fail-closed (missing/unparseable is a typed error, never a silent empty). A
       resume verifies the stored copy via verify_stored_manifest before reuse.
+      has_verified_progress() -> bool is true once >=1 verified chunk was staged (a
+      progress marker in the reserved sidecar); the start-of-download sweep keeps a
+      resumable area only WITH progress, reclaiming a preallocated-but-empty failure.
 
   - name: ManifestDigestStore
     module: daemonseed_core::storage::manifest_digest

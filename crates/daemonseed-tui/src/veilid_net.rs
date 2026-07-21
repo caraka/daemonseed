@@ -2091,13 +2091,17 @@ async fn run_confirm_download(
     // before fetching — a crash before the confirmed manifest persisted leaves a
     // `.dspart/<share_id>` tree that is neither registered nor resumable, and nothing
     // else ever deletes it. Best-effort: the current fetch is registered (`_live`), so
-    // its own staging is kept, and a resumable sibling (its stored confirmed manifest
-    // is present) is kept; sweep_staging never deletes on a name pattern alone, so a
-    // foreign `.dspart`-adjacent dir under a chosen dest is left untouched.
+    // its own staging is kept, and a resumable sibling WITH verified progress (its
+    // stored confirmed manifest is present AND ≥1 chunk was staged) is kept; a
+    // preallocated-but-empty failure (manifest persisted, zero chunks fetched — A1)
+    // has nothing to resume and IS reclaimed. sweep_staging never deletes on a name
+    // pattern alone, so a foreign `.dspart`-adjacent dir under a chosen dest is left
+    // untouched.
     let _ = sweep_staging(&dest_root, &live_fetches, |sid| {
-        StagingArea::open(&dest_root, sid)
-            .and_then(|s| s.read_stored_manifest())
-            .is_ok()
+        let Ok(s) = StagingArea::open(&dest_root, sid) else {
+            return false;
+        };
+        s.read_stored_manifest().is_ok() && s.has_verified_progress()
     });
 
     // Place the SELECTED files at their destination-relative paths from a source

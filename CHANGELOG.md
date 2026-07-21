@@ -66,6 +66,7 @@ work lives in the project lead's vault manifest, not here.
 ### Fixed
 
 - Downloading a share no longer starves the downloader's own chat: `ConfirmFetch` runs off the net-actor loop, so chat sends/receives while a download is in flight (#197).
+- A failed download no longer strands a full-looking copy under `.dspart`: a preallocated-but-empty staging area (the confirmed manifest persisted, but the fetch died before any chunk landed) is reclaimed by the start-of-download sweep instead of being retained as a phantom "resumable" partial; a partial with real staged progress is still kept for resume (#214).
 
 ## [0.35.0] — 2026-07-19
 
