@@ -416,28 +416,6 @@ where
     open_manifest_frame(room_key, &sealed)
 }
 
-/// Reassemble + open + VERIFY one content chunk (ISC-S28 / ISC-A-S20).
-///
-/// **Legacy window-parameter path** (retired at design step 7). `window` caps
-/// how many fragment `app_call`s run in flight for this chunk (the fetcher-side
-/// AIMD window, #128 D-1). New callers use [`fetch_chunk_budgeted`]. Returns the
-/// chunk bytes plus the MAX per-fragment round-trip latency observed.
-pub async fn fetch_chunk<F, Fut>(
-    share_id: &str,
-    want: &ChunkAddr,
-    room_key: &PublicRoomKey,
-    window: usize,
-    call: F,
-) -> Result<(Vec<u8>, Duration)>
-where
-    F: Fn(Vec<u8>) -> Fut,
-    Fut: std::future::Future<Output = Result<Vec<u8>>>,
-{
-    let (sealed, max_latency) =
-        fetch_sealed(share_id, &FetchTarget::Chunk(*want), window, &call).await?;
-    Ok((open_and_verify_chunk(room_key, want, &sealed)?, max_latency))
-}
-
 /// Pull every fragment of a target via `call` and concatenate into the full
 /// sealed blob. `total_fragments` comes from the first reply.
 /// One fragment `app_call`, retried on a transient transport error (e.g. Timeout)
@@ -764,53 +742,6 @@ mod tests {
         assert!(decode_request(b"\x00short").is_err());
     }
 
-    /// End-to-end in-process: serve a real indexed share through the fragment
-    /// protocol and fetch the manifest + every chunk back, verifying SHA-384 —
-    /// no Veilid, the `call` closure routes straight to `serve()`. A >FRAGMENT_SIZE
-    /// chunk exercises real multi-fragment reassembly.
-    #[tokio::test]
-    async fn serve_then_fetch_round_trip_with_fragmentation() {
-        let _ = oxicrypt_module::initialize();
-        let dir = std::env::temp_dir().join(format!("ds-share-frag-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        // A file larger than FRAGMENT_SIZE so the sealed chunk spans >1 fragment.
-        let payload = vec![0xABu8; FRAGMENT_SIZE * 2 + 123];
-        std::fs::write(dir.join("blob.bin"), &payload).unwrap();
-
-        let content = Arc::new(ShareContent::index_dir(&dir).unwrap());
-        let rk = room_key();
-        let mut shares: HashMap<String, ServedShare> = HashMap::new();
-        let share_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned();
-        shares.insert(
-            share_id.clone(),
-            ServedShare::new(content.clone(), room_key()),
-        );
-        let shares = std::sync::Mutex::new(shares);
-
-        // The transport: route a request straight into serve().
-        let call = |req: Vec<u8>| {
-            let reply = serve(&mut shares.lock().unwrap(), &req);
-            async move { Ok(reply) }
-        };
-
-        let manifest = fetch_manifest(&share_id, &rk, &call).await.unwrap();
-        assert_eq!(manifest.len(), 1);
-        assert_eq!(manifest[0].rel_path, "blob.bin");
-
-        // Fetch + verify every chunk, reassemble the file, compare to the source.
-        let mut recovered = Vec::new();
-        for addr in &manifest[0].chunks {
-            let (data, _lat) = fetch_chunk(&share_id, addr, &rk, FRAGMENT_FETCH_CONCURRENCY, &call)
-                .await
-                .unwrap();
-            recovered.extend_from_slice(&data);
-        }
-        assert_eq!(recovered, payload, "fetched bytes match the served file");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     #[tokio::test]
     async fn fetch_unknown_share_is_not_found() {
         let _ = oxicrypt_module::initialize();
@@ -874,83 +805,6 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, VeilidNetError::Integrity(_)));
-    }
-
-    /// #109 — fragments after fragment 0 are pulled CONCURRENTLY, and the
-    /// out-of-order completion still reassembles in request order. A real
-    /// multi-fragment chunk is served through an instrumented transport that
-    /// records the peak number of fragment `app_call`s in flight at once and
-    /// forces overlap with a small async delay. Pipelining is proven iff the
-    /// peak exceeds 1 (a serial fetcher could never exceed 1); correctness is
-    /// proven by the byte-for-byte recovery.
-    #[tokio::test]
-    async fn fragments_pipeline_concurrently_and_reassemble_in_order() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let _ = oxicrypt_module::initialize();
-        let dir = std::env::temp_dir().join(format!("ds-share-pipe-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        // One file well over FRAGMENT_SIZE but under the 1 MiB chunk size, so it
-        // is a single content chunk whose SEALED form spans ~20 fragments —
-        // comfortably more than FRAGMENT_FETCH_CONCURRENCY, so the window fills.
-        let payload = vec![0xCDu8; FRAGMENT_SIZE * 20 + 7];
-        std::fs::write(dir.join("blob.bin"), &payload).unwrap();
-
-        let content = Arc::new(ShareContent::index_dir(&dir).unwrap());
-        let rk = room_key();
-        let mut shares: HashMap<String, ServedShare> = HashMap::new();
-        let share_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned();
-        shares.insert(
-            share_id.clone(),
-            ServedShare::new(content.clone(), room_key()),
-        );
-        let shares = std::sync::Mutex::new(shares);
-
-        let in_flight = Arc::new(AtomicUsize::new(0));
-        let peak = Arc::new(AtomicUsize::new(0));
-        let call = |req: Vec<u8>| {
-            // serve() is synchronous; run it up front (the lock is released before
-            // the future is awaited, so reassembly concurrency isn't serialized by
-            // the test's own mutex).
-            let reply = serve(&mut shares.lock().unwrap(), &req);
-            let in_flight = in_flight.clone();
-            let peak = peak.clone();
-            async move {
-                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-                peak.fetch_max(now, Ordering::SeqCst);
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                in_flight.fetch_sub(1, Ordering::SeqCst);
-                Ok(reply)
-            }
-        };
-
-        let manifest = fetch_manifest(&share_id, &rk, &call).await.unwrap();
-        assert_eq!(manifest[0].chunks.len(), 1, "600 KB < 1 MiB ⇒ one chunk");
-        peak.store(0, Ordering::SeqCst); // measure the chunk fetch, not the manifest
-
-        let (data, _lat) = fetch_chunk(
-            &share_id,
-            &manifest[0].chunks[0],
-            &rk,
-            FRAGMENT_FETCH_CONCURRENCY,
-            &call,
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            data, payload,
-            "reassembled chunk is byte-for-byte the source"
-        );
-        let observed = peak.load(Ordering::SeqCst);
-        assert!(
-            observed > 1,
-            "fragments must overlap (peak in-flight {observed}, serial would be 1)"
-        );
-        assert!(
-            observed <= FRAGMENT_FETCH_CONCURRENCY,
-            "concurrency stays bounded by the window (peak {observed})"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A single oversized fragment (beyond [`FRAGMENT_SIZE`]) is rejected, holding

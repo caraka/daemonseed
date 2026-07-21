@@ -479,29 +479,6 @@ impl VeilidNetHandle {
         .await
     }
 
-    /// Fetch + reassemble + open + SHA-384-VERIFY one content chunk (ISC-S28 /
-    /// ISC-A-S20) from the sharer at private-route `route`. `window` caps how many
-    /// fragment `app_call`s run in flight (the caller's AIMD window, #128 D-1);
-    /// returns the chunk bytes plus the MAX per-fragment latency observed — the
-    /// congestion signal the caller feeds back to size the next chunk's window.
-    pub async fn fetch_chunk(
-        &self,
-        route: RouteId,
-        share_id: &str,
-        chunk_addr: ChunkAddr,
-        room_key: [u8; 32],
-        window: usize,
-    ) -> Result<(Vec<u8>, Duration)> {
-        let rk = PublicRoomKey::from_bytes(room_key);
-        let this = self.clone();
-        share::fetch_chunk(share_id, &chunk_addr, &rk, window, move |req| {
-            let this = this.clone();
-            let route = route.clone();
-            async move { this.app_call(route, req).await }
-        })
-        .await
-    }
-
     /// Budget-admitted manifest fetch (download-subsystem redesign, step 5). Same
     /// as [`fetch_manifest`](Self::fetch_manifest) but every fragment `app_call`
     /// is admitted through the shared per-route [`crate::RouteBudget`] via `lease`,

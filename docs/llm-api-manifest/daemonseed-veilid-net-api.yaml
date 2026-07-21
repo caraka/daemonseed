@@ -528,34 +528,6 @@ functions:
     returns:
       type: "Result<Vec<ManifestEntry>>"
       description: The manifest entries, or a transport / NotServed error.
-  - name: VeilidNetHandle::fetch_chunk
-    module: daemonseed_veilid_net::actor
-    description: Fetch + reassemble + open + SHA-384-verify one content chunk (ISC-S28 / ISC-A-S20) from the sharer; returns the chunk bytes plus the max per-fragment latency observed (the congestion signal for the caller's AIMD window, #128 D-1).
-    signature: "pub async fn fetch_chunk(&self, route: RouteId, share_id: &str, chunk_addr: ChunkAddr, room_key: [u8; 32], window: usize) -> Result<(Vec<u8>, Duration)>"
-    parameters:
-      - name: route
-        type: RouteId
-        direction: in
-        description: The imported sharer route.
-      - name: share_id
-        type: "&str"
-        direction: in
-        description: The share id.
-      - name: chunk_addr
-        type: ChunkAddr
-        direction: in
-        description: The content-address of the chunk to fetch.
-      - name: room_key
-        type: "[u8; 32]"
-        direction: in
-        description: The share's PublicRoomKey bytes.
-      - name: window
-        type: usize
-        direction: in
-        description: Max concurrent fragment app_calls (the caller's AIMD window).
-    returns:
-      type: "Result<(Vec<u8>, Duration)>"
-      description: The verified chunk bytes and the max per-fragment latency observed.
   - name: VeilidNetHandle::fetch_manifest_budgeted
     module: daemonseed_veilid_net::actor
     description: Budget-admitted fetch_manifest — every fragment app_call is admitted through the shared per-route RouteBudget via lease. The scheduler leases once per download and shares the lease across the manifest + every chunk (#204).
@@ -842,34 +814,6 @@ functions:
     returns:
       type: "Result<Vec<ManifestEntry>>"
       description: The reassembled, opened manifest.
-  - name: share::fetch_chunk
-    module: daemonseed_veilid_net::share
-    description: Fetch + reassemble (bounded-concurrency fragment pipeline) + open + SHA-384-verify one chunk via a caller-supplied app_call closure; returns the bytes + max fragment latency. Used by VeilidNetHandle::fetch_chunk.
-    signature: "pub async fn fetch_chunk<F, Fut>(share_id: &str, chunk_addr: &ChunkAddr, room_key: &PublicRoomKey, window: usize, call: F) -> Result<(Vec<u8>, Duration)>"
-    parameters:
-      - name: share_id
-        type: "&str"
-        direction: in
-        description: The share id.
-      - name: chunk_addr
-        type: "&ChunkAddr"
-        direction: in
-        description: The content-address of the chunk.
-      - name: room_key
-        type: "&PublicRoomKey"
-        direction: in
-        description: The share's room key.
-      - name: window
-        type: usize
-        direction: in
-        description: Max concurrent fragment app_calls.
-      - name: call
-        type: "F: Fn(Vec<u8>) -> Fut"
-        direction: in
-        description: A per-fragment app_call round-trip.
-    returns:
-      type: "Result<(Vec<u8>, Duration)>"
-      description: The SHA-384-verified chunk bytes and the max per-fragment latency.
   - name: share::fetch_manifest_budgeted
     module: daemonseed_veilid_net::share
     description: Fetch + reassemble + open a manifest, admitting every fragment app_call through a shared per-route RouteBudget (no per-fetch window). Replaces fetch_manifest.

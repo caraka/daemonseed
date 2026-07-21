@@ -41,6 +41,10 @@ work lives in the project lead's vault manifest, not here.
 - `daemonseed-gui`: the download path (`veilid_net::run_confirm_download`) now drives the shared engine — selection roots carried on `ConfirmFetch` (`RootKind`) make placement a function of the toggled node (a scattered selection lands each root top-level, a one-file folder keeps its folder), verified chunks stage-then-promote (whole-file RAM buffering retired), an integrity failure poisons the share without marking it Unresolved or parking a retry, and a panicking worker still yields a terminal outcome (`docs/design/download-subsystem.md` step 5; folds #207).
 - `daemonseed-tui`: the download path (`veilid_net::run_confirm_download`) now drives the same shared engine, mirroring the GUI — selection roots carried on `ConfirmFetch` (`RootKind`, derived from the flat preview's selection cardinality) replace the shape-guessing `rebase_to_selection_root`, verified chunks stage-then-promote (the per-chunk RAM/`sanitize`/`cleanup_written` loop and static fragment window retired), fetches run in parallel under one per-route budget lease, an integrity failure poisons the share without marking it Unresolved or parking a retry, and both spawn seams (download + browse) yield a terminal outcome on a worker panic (`docs/design/download-subsystem.md` step 6; folds #207).
 
+### Removed
+
+- `daemonseed-veilid-net`: the legacy window-parameter chunk-fetch path (`VeilidNetHandle::fetch_chunk` / `share::fetch_chunk`) is removed — both frontends now fetch through the budget-admitted seam (`docs/design/download-subsystem.md` step 7).
+
 ## [0.35.1] — 2026-07-20
 
 ### Fixed
