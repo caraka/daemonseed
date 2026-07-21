@@ -53,6 +53,7 @@ work lives in the project lead's vault manifest, not here.
 
 - `daemonseed-veilid-net`: an integrity failure dominates a concurrent transient across any file and chunk set size — a poisoned unit beyond the in-flight window is driven to a terminal result and poisons the share (DL-ISC-13).
 - `daemonseed-gui` + `daemonseed-tui`: a hostile or malformed share manifest is classified `Integrity` and poisons the share; only transport failures mark it Unresolved and park a retry (DL-ISC-13).
+- `daemonseed-veilid-net`: a route death records the sharer's learned ceiling once, at half the killing width, instead of ratcheting it to floor when the death's concurrent in-flight fragments each report the failure (DL-ISC-2).
 
 ## [0.35.1] — 2026-07-20
 

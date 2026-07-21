@@ -124,6 +124,10 @@ struct RouteWindow {
     healthy_since_increase: usize,
     /// Breach ring for the 3-of-5 latency valve (true = at/over threshold).
     recent_breaches: VecDeque<bool>,
+    /// True once this collapse episode's learned ceiling has been recorded, so the
+    /// SAME route death's remaining concurrent failures do not re-halve the ceiling
+    /// down to floor (F6). Cleared when the route recovers enough to widen again.
+    collapsed: bool,
 }
 
 impl RouteWindow {
@@ -136,6 +140,7 @@ impl RouteWindow {
             ceiling,
             healthy_since_increase: 0,
             recent_breaches: VecDeque::with_capacity(LATENCY_VALVE_WINDOW),
+            collapsed: false,
         }
     }
 
@@ -150,17 +155,28 @@ impl RouteWindow {
     fn observe(&mut self, outcome: FragmentOutcome) -> Option<usize> {
         match outcome {
             FragmentOutcome::Failed => {
-                // Error is the primary decrease: collapse to floor and hand back
-                // a learned ceiling of half the killing width (never below floor,
-                // never above the current ceiling). The live window ALSO lowers
-                // its own ceiling to the learned value, so a surviving account
-                // cannot climb back to the lethal width — not only a rotated
-                // route (the caller keys the same value by sharer for that).
+                self.healthy_since_increase = 0;
+                self.recent_breaches.clear();
+                // A route death fails up to `width` concurrent in-flight fragments,
+                // each fed here. Record the learned ceiling ONCE per death — from the
+                // KILLING width of the FIRST failure — then ignore the same death's
+                // remaining failures, which arrive at the already-collapsed floor
+                // width and would otherwise ratchet the sharer's learned ceiling down
+                // to floor (F6 / DL-ISC-2: the ceiling is half the KILLING width, not
+                // floor). The episode clears when the route recovers enough to widen.
+                if self.collapsed {
+                    return None;
+                }
+                // Error is the primary decrease: collapse to floor and hand back a
+                // learned ceiling of half the killing width (never below floor, never
+                // above the current ceiling). The live window ALSO lowers its own
+                // ceiling to the learned value, so a surviving account cannot climb
+                // back to the lethal width — not only a rotated route (the caller keys
+                // the same value by sharer for that).
                 let learned = (self.width / 2).max(W_FLOOR).min(self.ceiling);
                 self.ceiling = learned;
                 self.width = W_FLOOR.min(self.ceiling);
-                self.healthy_since_increase = 0;
-                self.recent_breaches.clear();
+                self.collapsed = true;
                 Some(learned)
             }
             FragmentOutcome::Completed { over_threshold } => {
@@ -187,6 +203,9 @@ impl RouteWindow {
                     if self.healthy_since_increase >= self.width {
                         if self.width < self.ceiling {
                             self.width += 1;
+                            // Recovered above the collapsed floor — a future failure is
+                            // a NEW death whose killing width must be recorded (F6).
+                            self.collapsed = false;
                         }
                         self.healthy_since_increase = 0;
                     }
@@ -502,6 +521,58 @@ mod tests {
             "learned ceiling = half the killing width"
         );
         assert_eq!(w.width(), W_FLOOR, "collapses to floor");
+    }
+
+    /// (F6 / DL-ISC-2) A route death fails many concurrent in-flight fragments, each
+    /// observed. Only the FIRST records the learned ceiling (half the killing width);
+    /// the same death's remaining failures — arriving at the collapsed floor width —
+    /// must NOT re-halve it down to floor. The ceiling reflects the killing width, not
+    /// the count of concurrent failures. Pre-fix, the 2nd concurrent failure ratcheted
+    /// the sharer's ceiling to W_FLOOR.
+    #[test]
+    fn concurrent_failures_of_one_death_do_not_ratchet_below_half_the_killing_width() {
+        let mut w = RouteWindow::new(W_CEIL);
+        for _ in 0..64 {
+            w.observe(FragmentOutcome::Completed {
+                over_threshold: false,
+            });
+        }
+        assert_eq!(w.width(), W_CEIL);
+        // The route dies with W_CEIL fragments in flight: the FIRST failure records
+        // the ceiling; the rest are the SAME death and must record nothing.
+        let first = w.observe(FragmentOutcome::Failed);
+        assert_eq!(
+            first,
+            Some(W_CEIL / 2),
+            "first failure learns half the killing width"
+        );
+        for _ in 0..(W_CEIL - 1) {
+            assert_eq!(
+                w.observe(FragmentOutcome::Failed),
+                None,
+                "the same death's remaining failures record nothing (no re-ratchet)"
+            );
+        }
+        assert_eq!(w.width(), W_FLOOR, "stays at floor");
+        // Recover: clean completions climb the window back up to the LEARNED ceiling.
+        for _ in 0..64 {
+            w.observe(FragmentOutcome::Completed {
+                over_threshold: false,
+            });
+        }
+        assert_eq!(
+            w.width(),
+            W_CEIL / 2,
+            "recovers only up to the learned ceiling"
+        );
+        // A genuine NEW death after recovery IS recorded again (episode cleared on the
+        // widen) — half the new killing width, not skipped.
+        let second = w.observe(FragmentOutcome::Failed);
+        assert_eq!(
+            second,
+            Some((W_CEIL / 2) / 2),
+            "a new death after recovery learns half the NEW killing width"
+        );
     }
 
     /// DL-ISC-17: the latency valve steps down on a sustained breach (3 of the
