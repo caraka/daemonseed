@@ -285,6 +285,39 @@ impl FetchedStore {
         Ok(share)
     }
 
+    /// Register an ALREADY-PROMOTED managed download in `downloads.idx` without
+    /// writing any file bytes (download-subsystem redesign, step 5). The shared
+    /// engine ([`daemonseed_veilid_net::download::run_download`]) has already
+    /// staged + promoted every file to `<root>/<folder>/<rel_path>`, so this only
+    /// records the idx entry — unlike [`record_share`](Self::record_share), which
+    /// writes bytes from an in-RAM [`VerifiedFile`] buffer (the pattern #207
+    /// retired). `folder` is the caller's pre-resolved share folder (the
+    /// `resolve_share_folder` policy: reuse the share's existing folder on a
+    /// re-fetch, else collision-suffix), passed in so the on-disk promote target
+    /// and the idx entry never disagree. The idx read-modify-write is serialized by
+    /// the same cross-process advisory lock `record_share` uses (#208 / DL-ISC-9):
+    /// re-read under the lock, replace this share's entry, write.
+    pub fn register_share(
+        &mut self,
+        share_id: &str,
+        name: &str,
+        folder: &str,
+        files: &[FetchedFile],
+    ) -> Result<FetchedShare, FetchedError> {
+        let _idx_lock = IdxLock::acquire(&self.root)?;
+        let mut shares = self.list_shares()?;
+        shares.retain(|s| s.share_id != share_id);
+        let share = FetchedShare {
+            share_id: share_id.to_owned(),
+            name: name.to_owned(),
+            folder: folder.to_owned(),
+            files: files.to_vec(),
+        };
+        shares.push(share.clone());
+        self.write_manifest(&shares)?;
+        Ok(share)
+    }
+
     /// Enumerate every fetched share, in manifest order. `Ok(vec![])` when
     /// nothing has been fetched.
     pub fn list_shares(&self) -> Result<Vec<FetchedShare>, FetchedError> {
@@ -1616,6 +1649,40 @@ mod tests {
         assert_eq!(shares[0].files.len(), 2);
         assert_eq!(shares[0].total_bytes(), 11);
         assert_eq!(reopened.share_dir(&shares[0]), dir.path().join("docs"));
+    }
+
+    /// `register_share` records the idx entry for an already-promoted managed
+    /// download WITHOUT writing bytes (the #207 RAM-buffer retirement): the entry
+    /// lists back with the caller-supplied folder + files, and no file bytes were
+    /// written by the call itself.
+    #[test]
+    fn register_records_idx_without_writing_bytes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut store = FetchedStore::open(dir.path()).unwrap();
+        let files = vec![
+            FetchedFile {
+                rel_path: "song.mp3".into(),
+                size: 4096,
+            },
+            FetchedFile {
+                rel_path: "art/cover.png".into(),
+                size: 128,
+            },
+        ];
+        let share = store
+            .register_share("sid42", "Album", "Album", &files)
+            .unwrap();
+        assert_eq!(share.folder, "Album");
+
+        let reopened = FetchedStore::open(dir.path()).unwrap();
+        let shares = reopened.list_shares().unwrap();
+        assert_eq!(shares.len(), 1);
+        assert_eq!(shares[0].share_id, "sid42");
+        assert_eq!(shares[0].files.len(), 2);
+        assert_eq!(shares[0].total_bytes(), 4096 + 128);
+        // register_share never wrote file bytes (the engine promotes them; this
+        // call only touched the idx).
+        assert!(!dir.path().join("Album/song.mp3").exists());
     }
 
     /// ISC-A-C32 — a manifest entry whose rel_path escapes the folder is

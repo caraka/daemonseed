@@ -373,7 +373,15 @@ impl<R: Clone + Eq + Hash> RouteLease<R> {
 
 impl<R: Clone + Eq + Hash> Drop for RouteLease<R> {
     fn drop(&mut self) {
-        let mut st = self.budget.state.lock().unwrap();
+        // Poison-tolerant: this Drop can run during a panic unwind (a download worker
+        // panicked). If the budget mutex were poisoned, `.lock().unwrap()` here would
+        // double-panic during the unwind → process `abort()`, defeating the DL-ISC-14
+        // panic-survival guarantee. Recover the guard instead — degrade, never abort.
+        let mut st = self
+            .budget
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(acct) = st.routes.get_mut(&self.route) {
             acct.refs = acct.refs.saturating_sub(1);
             if acct.refs == 0 {
@@ -396,7 +404,12 @@ pub struct BudgetPermit<R: Clone + Eq + Hash> {
 impl<R: Clone + Eq + Hash> Drop for BudgetPermit<R> {
     fn drop(&mut self) {
         {
-            let mut st = self.budget.state.lock().unwrap();
+            // Poison-tolerant (see `RouteLease::drop`) — never double-panic during unwind.
+            let mut st = self
+                .budget
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(acct) = st.routes.get_mut(&self.route) {
                 acct.in_flight = acct.in_flight.saturating_sub(1);
             }

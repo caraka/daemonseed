@@ -33,10 +33,12 @@ work lives in the project lead's vault manifest, not here.
 - `daemonseed-core`: `storage::fetched::sweep_staging` reclaims unresumable staging debris, gated on a `LiveFetchRegistry` so a registered or resumable fetch's partials are never swept (`docs/design/download-subsystem.md` Part 3).
 - `daemonseed-core`: `storage::fetched::FetchedStore::record_share` serializes its `downloads.idx` read-modify-write with an OS advisory file lock (`fs4`), so concurrent downloads across the GUI and TUI processes never lose an index entry (#208).
 - `daemonseed-veilid-net`: a shared, frontend-agnostic download engine (`download::run_download` over `PlannedFile` → `DownloadOutcome`) that fetches placed files' chunks in parallel under one `RouteLease`, stages each verified chunk at its offset, promotes on completion, and disposes staging by failure class (integrity → destroy; transient/not-served/local → retain); plus the budget-admitted handle methods `VeilidNetHandle::fetch_manifest_budgeted` / `fetch_chunk_budgeted` (`docs/design/download-subsystem.md` step 5).
+- `daemonseed-core`: `storage::fetched::FetchedStore::register_share` records a `downloads.idx` entry for an already-promoted managed download WITHOUT re-writing bytes (the engine promotes them), under the same cross-process idx lock as `record_share` (`docs/design/download-subsystem.md` step 5).
 
 ### Changed
 
 - `daemonseed-veilid-net`: the share-fetch boundary types failures via `FetchErrorClass` (transient / integrity / not-served / local); content-address and malformed-frame failures classify as `Integrity`, distinct from transient transport (#205, `docs/design/download-subsystem.md`).
+- `daemonseed-gui`: the download path (`veilid_net::run_confirm_download`) now drives the shared engine — selection roots carried on `ConfirmFetch` (`RootKind`) make placement a function of the toggled node (a scattered selection lands each root top-level, a one-file folder keeps its folder), verified chunks stage-then-promote (whole-file RAM buffering retired), an integrity failure poisons the share without marking it Unresolved or parking a retry, and a panicking worker still yields a terminal outcome (`docs/design/download-subsystem.md` step 5; folds #207).
 
 ## [0.35.1] — 2026-07-20
 

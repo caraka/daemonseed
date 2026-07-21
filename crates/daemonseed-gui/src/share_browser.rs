@@ -88,6 +88,11 @@ pub struct FetchTarget {
     pub share_id: String,
     pub name: String,
     pub selected: Option<Vec<usize>>,
+    /// (download-subsystem redesign, step 5 / DL-ISC-8) Which kind of node the user
+    /// toggled — the placement selection root. A share root → `RootKind::Share`, a
+    /// file → `RootKind::File`, a folder → `RootKind::Dir`. `main.rs` passes it into
+    /// `NetCommand::ConfirmFetch`.
+    pub root_kind: crate::net::RootKind,
 }
 
 /// One manifest row as handed in by `main.rs` from a `NetEvent::FetchManifest`
@@ -363,13 +368,23 @@ impl ShareBrowser {
                     share_id: share.share_id.clone(),
                     name: share.name.clone(),
                     selected: None,
+                    root_kind: crate::net::RootKind::Share,
                 });
             }
-            if let Some(indices) = indices_under(&share.children, id) {
+            if let Some((is_dir, indices)) = indices_under(&share.children, id) {
                 return Some(FetchTarget {
                     share_id: share.share_id.clone(),
                     name: share.name.clone(),
                     selected: Some(indices),
+                    // A folder subtree → Dir; a single file → File (DL-ISC-8): the
+                    // placement resolver treats a one-file folder (Dir) differently
+                    // from that same file selected alone (File), so the node kind —
+                    // not the index count — is authoritative.
+                    root_kind: if is_dir {
+                        crate::net::RootKind::Dir
+                    } else {
+                        crate::net::RootKind::File
+                    },
                 });
             }
         }
@@ -377,19 +392,21 @@ impl ShareBrowser {
     }
 }
 
-/// If `id` names a node within `level`, return its file manifest indices: a file →
-/// `[its index]`; a folder → all descendant file indices in tree order. `None` if the
-/// id is not in this subtree.
-fn indices_under(level: &[Node], id: u64) -> Option<Vec<usize>> {
+/// If `id` names a node within `level`, return `(is_dir, manifest indices)`: a file
+/// → `(false, [its index])`; a folder → `(true, all descendant file indices in tree
+/// order)`. `None` if the id is not in this subtree. The `is_dir` flag lets
+/// `fetch_target` set the selection [`crate::net::RootKind`] — a one-file folder
+/// stays a `Dir`, distinct from that file selected alone.
+fn indices_under(level: &[Node], id: u64) -> Option<(bool, Vec<usize>)> {
     for node in level {
         match node {
-            Node::File(file) if file.id == id => return Some(vec![file.manifest_index]),
+            Node::File(file) if file.id == id => return Some((false, vec![file.manifest_index])),
             Node::File(_) => {}
             Node::Dir(dir) => {
                 if dir.id == id {
                     let mut acc = Vec::new();
                     collect_file_indices(&dir.children, &mut acc);
-                    return Some(acc);
+                    return Some((true, acc));
                 }
                 if let Some(found) = indices_under(&dir.children, id) {
                     return Some(found);
@@ -781,6 +798,7 @@ mod tests {
         let t = b.fetch_target(share_id).expect("share resolves");
         assert_eq!(t.share_id, "id-a");
         assert_eq!(t.selected, None, "a share root downloads everything");
+        assert_eq!(t.root_kind, crate::net::RootKind::Share);
     }
 
     #[test]
@@ -789,6 +807,7 @@ mod tests {
         let readme = b.rows().iter().find(|r| r.label == "README.md").unwrap().id;
         let t = b.fetch_target(readme).expect("file resolves");
         assert_eq!(t.selected, Some(vec![2]), "README.md is manifest index 2");
+        assert_eq!(t.root_kind, crate::net::RootKind::File);
     }
 
     #[test]
@@ -802,6 +821,7 @@ mod tests {
         got.sort_unstable();
         assert_eq!(got, vec![0, 1], "folder pulls every descendant file");
         assert_eq!(t.share_id, "id-a");
+        assert_eq!(t.root_kind, crate::net::RootKind::Dir);
     }
 
     #[test]

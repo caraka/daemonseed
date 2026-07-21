@@ -392,13 +392,18 @@ pub const ISCS: &[(&str, IscClass)] = &[
     // downloads.idx cross-process file lock (step 4d, #208). fs4 flock on a
     // .idx.lock sibling; probe in daemonseed-core::storage::fetched.
     ("DL-ISC-9", IscClass::Negative), // anti: concurrent record_share (one process or two) never loses a downloads.idx entry
+    // GUI engine adoption (step 5). Unit probes in daemonseed-gui::veilid_net
+    // (selection-root computation, DownloadOutcome→ConfirmOutcome mapping, panic seam).
+    ("DL-ISC-8", IscClass::Positive), // ConfirmFetch carries the selection roots + placement is a function of them: a scattered selection lands each root top-level, a one-file folder keeps its folder
+    ("DL-ISC-13", IscClass::Negative), // anti: an integrity failure destroys every staged partial, keeps promoted files, sets the durable poison flag, never parks a retry, never marks Unresolved, is never resumed past
+    ("DL-ISC-14", IscClass::Positive), // a panicking download worker still yields a terminal outcome (JoinError → terminal LocalFailed) and leaves only staged (quarantined) state
 ];
 
 /// Total built, non-deferred ISCs tracked by this registry — the SINGLE source
 /// of truth for the coverage denominator, read live by `xtask isc-coverage`.
 /// Recount on every ISC add/remove (the `const _` assert below guards it
 /// against [`ISCS`]).
-pub const TOTAL: usize = 234;
+pub const TOTAL: usize = 237;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -618,13 +623,17 @@ mod tests {
         //                                  neg (step 4b stage-then-promote writer);
         //                                  DL-ISC-22 neg (step 4c live-fetch
         //                                  registry + staging sweep); DL-ISC-9 neg
-        //                                  (step 4d downloads.idx file lock) —
+        //                                  (step 4d downloads.idx file lock);
+        //                                  DL-ISC-8 pos + DL-ISC-14 pos + DL-ISC-13
+        //                                  neg (step 5 GUI engine adoption:
+        //                                  selection-root placement, panic seam,
+        //                                  integrity-abort fold) —
         //                                  the DL-ISC-* family registers per build step.
-        //   total   155 pos + 79 neg = 234
+        //   total   157 pos + 80 neg = 237
         //   (the v0.33.0 Veilid cutover retired 14 server-positive + 10
         //    server-negative relay/TLS/federation/rate-limit ISCs.)
-        assert_eq!(pos, 155, "positive count drift");
-        assert_eq!(neg, 79, "negative count drift");
+        assert_eq!(pos, 157, "positive count drift");
+        assert_eq!(neg, 80, "negative count drift");
     }
 
     /// COVERED is single-sourced and must agree with the per-milestone

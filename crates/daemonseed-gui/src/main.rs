@@ -1287,6 +1287,7 @@ fn pick_dir_and_fetch(net: &Rc<RefCell<NetHandle>>, target: FetchTarget) {
                 fetched_root: dir,
                 selected: target.selected,
                 flat_dest: true,
+                root_kind: target.root_kind,
             });
         }
     });

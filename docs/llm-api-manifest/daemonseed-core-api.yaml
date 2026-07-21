@@ -4494,6 +4494,46 @@ functions:
         - name: UnsafePath
           condition: A file's rel_path is absolute, contains `..`, or has a non-Normal component.
 
+  - name: FetchedStore::register_share
+    module: daemonseed_core::storage::fetched
+    description: >-
+      Register an already-promoted managed download in downloads.idx WITHOUT
+      writing any file bytes: the download-subsystem engine (run_download) has
+      already staged + promoted every file to <root>/<folder>/<rel_path>, so
+      this only records the idx entry (the #207 RAM-buffer retirement, unlike
+      record_share which writes bytes from an in-RAM VerifiedFile buffer).
+      `folder` is the caller's pre-resolved share folder (resolve_share_folder
+      policy — reuse on re-fetch, else collision-suffix), passed in so the
+      promote target and the idx entry agree. The idx read-modify-write is
+      serialized by the same cross-process advisory lock record_share uses
+      (#208 / DL-ISC-9).
+    signature: "pub fn register_share(&mut self, share_id: &str, name: &str, folder: &str, files: &[FetchedFile]) -> Result<FetchedShare, FetchedError>"
+    parameters:
+      - name: share_id
+        type: "&str"
+        direction: in
+        description: Server-assigned opaque share id.
+      - name: name
+        type: "&str"
+        direction: in
+        description: Sharer-advertised display name (recorded in the idx entry).
+      - name: folder
+        type: "&str"
+        direction: in
+        description: Pre-resolved share folder the engine promoted the files under.
+      - name: files
+        type: "&[FetchedFile]"
+        direction: in
+        description: The promoted files' rel_paths + sizes (no bytes; already on disk).
+    returns:
+      type: "Result<FetchedShare, FetchedError>"
+      description: The recorded manifest entry (carries the supplied folder name).
+      error_variants:
+        - name: Io
+          condition: idx lock acquisition, manifest read, or manifest write failed.
+        - name: Corrupt
+          condition: the existing manifest failed to parse.
+
   - name: FetchedStore::list_shares
     module: daemonseed_core::storage::fetched
     description: >-

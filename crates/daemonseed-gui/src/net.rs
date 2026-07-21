@@ -18,7 +18,7 @@
 //!   building ([`roster_from_members`], [`roster_render_changed`],
 //!   [`member_fingerprint`], [`beacon_is_own`]), handle canonicalization
 //!   ([`canonical_wire_handle`], [`republish_name`]), and share-path path hygiene
-//!   ([`sanitize_rel_path`], [`safe_folder_name`], [`is_unsafe_publish_root`]).
+//!   ([`safe_folder_name`], [`is_unsafe_publish_root`]).
 //!
 //! ## Transport
 //!
@@ -211,7 +211,26 @@ pub enum NetCommand {
         fetched_root: PathBuf,
         selected: Option<Vec<usize>>,
         flat_dest: bool,
+        /// (download-subsystem redesign, step 5) The kind of tree node the user
+        /// toggled — the selection root the placement resolver maps to (ISC-C72 /
+        /// DL-ISC-8). `Share` = the whole share; `File` = one file; `Dir` = a
+        /// folder subtree. Drives `veilid_net::selection_roots`.
+        root_kind: RootKind,
     },
+}
+
+/// (download-subsystem redesign, step 5 / DL-ISC-8) The kind of selection root a
+/// `ConfirmFetch` targets — which tree node the user actually toggled, carried so
+/// placement is a function of the selection (not guessed from path shapes). An
+/// in-process `NetCommand` field only (main ↔ actor mpsc); never on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootKind {
+    /// The share root — the whole share (every file), `selected: None`.
+    Share,
+    /// A single selected file (`selected: Some([one index])`).
+    File,
+    /// A selected directory subtree (`selected: Some([its descendant indices])`).
+    Dir,
 }
 
 /// An event from the network actor to the UI thread.
@@ -485,22 +504,6 @@ pub(crate) fn is_unsafe_publish_root(root: &std::path::Path) -> bool {
         }
     }
     false
-}
-
-/// Map a wire `/`-separated rel_path to a safe relative path under the fetch root,
-/// or `None` if it escapes (absolute, `.`/`..`, backslash, or empty). ISC-A-C32.
-pub(crate) fn sanitize_rel_path(rel: &str) -> Option<PathBuf> {
-    if rel.is_empty() {
-        return None;
-    }
-    let mut out = PathBuf::new();
-    for comp in rel.split('/') {
-        if comp.is_empty() || comp == "." || comp == ".." || comp.contains('\\') {
-            return None;
-        }
-        out.push(comp);
-    }
-    (!out.as_os_str().is_empty()).then_some(out)
 }
 
 /// A safe single-component folder name derived from a share's display name: path
