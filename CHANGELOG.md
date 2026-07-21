@@ -58,6 +58,8 @@ work lives in the project lead's vault manifest, not here.
 - `daemonseed-gui`: a selected folder keeps its own name at a user-chosen destination — the placement root carries the toggled folder's path (DL-ISC-8).
 - `daemonseed-core`: promoting onto a byte-identical pre-existing file keeps it in place rather than writing a `name-2` duplicate (DL-ISC-21).
 - `daemonseed-gui`: a downloads-index read error while resolving a managed download's folder fails the download closed.
+- `daemonseed-gui` + `daemonseed-tui`: a download reclaims unresumable `.dspart` staging debris under its destination root before starting, so a crash before the confirmed manifest persisted no longer strands an orphaned staging tree indefinitely (DL-ISC-22).
+- `daemonseed-core`: `storage::manifest_digest::ManifestDigestStore` serializes concurrent opens with an advisory file lock, so parallel downloads — in one process, or a co-resident GUI and TUI — no longer collide on redb's exclusive lock and spuriously fail.
 
 ## [0.35.1] — 2026-07-20
 

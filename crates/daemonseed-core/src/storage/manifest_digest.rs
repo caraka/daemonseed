@@ -20,7 +20,7 @@
 //! `rel_path`s in the clear). The share index encrypts because it protects the
 //! *sharer's* passive index of a private folder — a different concern.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use redb::{Database, TableDefinition};
 
@@ -40,6 +40,10 @@ pub enum DigestStoreError {
     /// store or a value written by an incompatible version. Fails closed rather
     /// than returning a truncated/garbage digest.
     Corrupt,
+    /// Failed to acquire (or open) the advisory lock that serializes store access
+    /// across concurrent openers (F8). The store is not opened rather than risk a
+    /// racing `DatabaseAlreadyOpen`, or a split-brain lock through a tampered symlink.
+    Lock(String),
 }
 
 impl core::fmt::Display for DigestStoreError {
@@ -49,6 +53,7 @@ impl core::fmt::Display for DigestStoreError {
             DigestStoreError::Corrupt => {
                 f.write_str("manifest-digest store value is not a 48-byte digest")
             }
+            DigestStoreError::Lock(m) => write!(f, "manifest-digest store lock error: {m}"),
         }
     }
 }
@@ -57,7 +62,7 @@ impl core::error::Error for DigestStoreError {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             DigestStoreError::Db(e) => Some(e.as_ref()),
-            DigestStoreError::Corrupt => None,
+            DigestStoreError::Corrupt | DigestStoreError::Lock(_) => None,
         }
     }
 }
@@ -66,18 +71,68 @@ fn db_err(e: impl Into<redb::Error>) -> DigestStoreError {
     DigestStoreError::Db(Box::new(e.into()))
 }
 
+/// Blocks until an exclusive advisory lock on `<db_path>.lock` is held, serializing
+/// opens of the redb digest store (F8). `Database::create` takes an exclusive OS lock
+/// and FAILS FAST (`DatabaseAlreadyOpen`) on a second opener, so without this two
+/// concurrent downloads in one process — or a co-resident GUI and TUI sharing one
+/// profile — would spuriously fail a healthy download. The blocking flock turns that
+/// fail-fast into a serialized wait. Mirrors `super::fetched`'s `IdxLock`.
+struct StoreLock {
+    _file: std::fs::File,
+}
+
+impl StoreLock {
+    fn acquire(db_path: &Path) -> Result<Self, DigestStoreError> {
+        use fs4::fs_std::FileExt;
+        let mut lock_path = db_path.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        let lock_path = PathBuf::from(lock_path);
+        // Refuse a symlink at the lock path: a co-resident attacker could point it at a
+        // different inode so two openers lock different files, defeating serialization.
+        // (An atomic `O_NOFOLLOW` open would close the residual check-then-open window;
+        // that hardening is tracked, as for `IdxLock`.)
+        if std::fs::symlink_metadata(&lock_path).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(DigestStoreError::Lock(format!(
+                "{} is a symlink; refusing to lock through it",
+                lock_path.display()
+            )));
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|e| DigestStoreError::Lock(format!("open {}: {e}", lock_path.display())))?;
+        file.lock_exclusive()
+            .map_err(|e| DigestStoreError::Lock(format!("lock {}: {e}", lock_path.display())))?;
+        Ok(Self { _file: file })
+    }
+}
+
 /// An open, redb-backed store mapping `share_id` → the 48-byte SHA-384 of the
 /// fetch's confirmed manifest. Kept under the profile dir (the client's own
 /// trusted state), so it anchors the manifest's integrity independently of the
 /// co-resident-writable downloads root.
+///
+/// Access is serialized by a `<path>.lock` advisory flock held for the store's
+/// lifetime (F8). Field order is load-bearing: `db` is declared before `_lock`, so on
+/// drop the redb `Database` (releasing redb's own exclusive lock) drops BEFORE the
+/// advisory flock releases — a waiter blocked on the flock therefore always finds the
+/// redb lock already free when its own `Database::create` runs.
 pub struct ManifestDigestStore {
     db: Database,
+    _lock: StoreLock,
 }
 
 impl ManifestDigestStore {
     /// Open (creating if absent) the digest store at `path`. Reopening recovers
-    /// every digest written before.
+    /// every digest written before. Blocks while another opener holds the store's
+    /// advisory lock (F8), then proceeds — concurrent opens serialize, never collide.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DigestStoreError> {
+        let path = path.as_ref();
+        // Acquire the advisory lock BEFORE Database::create so a concurrent opener
+        // blocks here instead of hitting redb's fail-fast DatabaseAlreadyOpen.
+        let lock = StoreLock::acquire(path)?;
         let db = Database::create(path).map_err(db_err)?;
         // Materialize the table so a fresh DB has it before any read txn.
         let wtxn = db.begin_write().map_err(db_err)?;
@@ -85,7 +140,7 @@ impl ManifestDigestStore {
             wtxn.open_table(TABLE).map_err(db_err)?;
         }
         wtxn.commit().map_err(db_err)?;
-        Ok(Self { db })
+        Ok(Self { db, _lock: lock })
     }
 
     /// Record (insert or replace) the confirmed-manifest digest for `share_id`.
@@ -207,5 +262,37 @@ mod tests {
         }
         let store = ManifestDigestStore::open(&path).unwrap();
         assert_eq!(store.get_digest("persist").unwrap(), Some(d));
+    }
+
+    #[test]
+    fn concurrent_opens_serialize_rather_than_collide() {
+        // Four threads open the SAME store path concurrently. With the advisory flock
+        // they serialize (each blocks until the prior drops) and ALL succeed; pre-fix,
+        // a second `Database::create` on the still-open file returned
+        // `DatabaseAlreadyOpen` and the thread would have panicked here (F8).
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = std::sync::Arc::new(dir.path().join("digests.redb"));
+        let mut handles = Vec::new();
+        for i in 0..4u8 {
+            let path = path.clone();
+            handles.push(std::thread::spawn(move || {
+                let store = ManifestDigestStore::open(path.as_ref()).unwrap();
+                store
+                    .record_digest(&format!("s{i}"), &[i; MANIFEST_DIGEST_LEN])
+                    .unwrap();
+                // store (db + flock) drops here, freeing the next waiter.
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        // Every thread got exclusive access in turn, so all four writes landed.
+        let store = ManifestDigestStore::open(path.as_ref()).unwrap();
+        for i in 0..4u8 {
+            assert_eq!(
+                store.get_digest(&format!("s{i}")).unwrap(),
+                Some([i; MANIFEST_DIGEST_LEN])
+            );
+        }
     }
 }

@@ -94,7 +94,7 @@ use daemonseed_core::share_serve::ShareContent;
 use daemonseed_core::storage::cas::ChunkAddr;
 use daemonseed_core::storage::fetched::{
     FetchedFile, FetchedStore, LiveFetchRegistry, SelectionRoot, StagingArea, derive_resume_state,
-    manifest_digest, place_at_dest, verify_stored_manifest,
+    manifest_digest, place_at_dest, sweep_staging, verify_stored_manifest,
 };
 use daemonseed_core::storage::manifest_digest::ManifestDigestStore;
 use daemonseed_proto::v1 as wire;
@@ -3313,6 +3313,19 @@ async fn run_confirm_download(
             };
         }
     };
+
+    // (F7 / DL-ISC-22) Reclaim any UNRESUMABLE staging debris under this dest root
+    // before fetching — a crash before the confirmed manifest persisted leaves a
+    // `.dspart/<share_id>` tree that is neither registered nor resumable, and nothing
+    // else ever deletes it. Best-effort: the current fetch is registered (`_live`), so
+    // its own staging is kept, and a resumable sibling (its stored confirmed manifest
+    // is present) is kept; sweep_staging never deletes on a name pattern alone, so a
+    // foreign `.dspart`-adjacent dir under a chosen dest is left untouched.
+    let _ = sweep_staging(&dest_root, &live_fetches, |sid| {
+        StagingArea::open(&dest_root, sid)
+            .and_then(|s| s.read_stored_manifest())
+            .is_ok()
+    });
 
     // Place the SELECTED files at their destination-relative paths from a source
     // manifest — identical placement for a fresh confirm and a resume (DL-ISC-8 /
