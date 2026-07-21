@@ -100,9 +100,9 @@ use daemonseed_core::storage::manifest_digest::ManifestDigestStore;
 use daemonseed_proto::v1 as wire;
 use daemonseed_veilid_net::download::{DownloadOutcome, PlannedFile, run_download};
 use daemonseed_veilid_net::{
-    DiscoveryEnvelope, PresenceBoundary, RecordKey, RouteBudget, RouteId, SharerKey, VeilidNet,
-    VeilidNetConfig, VeilidNetError, VeilidNetEvent, VeilidNetHandle, next_resweep_seed,
-    verify_route_advert,
+    DiscoveryEnvelope, FetchErrorClass, PresenceBoundary, RecordKey, RouteBudget, RouteId,
+    SharerKey, VeilidNet, VeilidNetConfig, VeilidNetError, VeilidNetEvent, VeilidNetHandle,
+    next_resweep_seed, verify_route_advert,
 };
 use prost::Message as _;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -3273,10 +3273,21 @@ async fn run_confirm_download(
     {
         Ok(m) => m,
         Err(e) => {
-            return ConfirmOutcome::RouteFailed {
-                share_id,
-                name,
-                message: fetch_error_message("could not fetch the share manifest", e),
+            // (F1 / DL-ISC-13) Classify the manifest-fetch failure like the chunk path: a
+            // hostile / malformed / oversized manifest frame is `Integrity` → poison the
+            // share (no Unresolved mark, no parked retry), never a transient route-death
+            // that parks a retry re-fetching the same hostile manifest forever. No staging
+            // exists yet at this stage, so there is nothing to destroy. Everything else
+            // (transport / not-served) stays a route-death (#180 §RS-1.4/§RS-1.5).
+            let class = e.fetch_class();
+            let message = fetch_error_message("could not fetch the share manifest", e);
+            return match class {
+                FetchErrorClass::Integrity => ConfirmOutcome::IntegrityFailed { share_id, message },
+                _ => ConfirmOutcome::RouteFailed {
+                    share_id,
+                    name,
+                    message,
+                },
             };
         }
     };

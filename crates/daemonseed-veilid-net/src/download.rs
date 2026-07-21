@@ -150,13 +150,19 @@ fn merge_stop(current: Option<Stop>, incoming: Stop) -> Stop {
     }
 }
 
-/// Drive `futures` at most `concurrency` at a time, aborting on failure but
-/// selecting the WORST failure class rather than the first to complete. On the
-/// first failure we stop pulling NEW futures and drain the already-in-flight window
-/// (bounded by `concurrency`), upgrading the recorded stop to any `Integrity` that
-/// surfaces among them; once an `Integrity` is held we return immediately. The
-/// budget behind the fetch closure is the true admission cap — `concurrency` only
-/// bounds the polled future set. Dropping the remaining futures on return cancels
+/// Drive `futures` at most `concurrency` at a time, returning the WORST failure
+/// class among them rather than the first to complete. A non-`Integrity` failure
+/// (transient / not-served / local) does NOT stop the driver: every remaining
+/// future is still driven to a terminal result, so an `Integrity` anywhere in the
+/// set — even on a unit that had not begun polling when an earlier transient
+/// completed — still surfaces and dominates. This is load-bearing: with more files
+/// than the in-flight window (`F_FILES`), gating refill on "no failure yet" would
+/// leave a poisoned late file unpolled, and the fetch would mis-report transient
+/// (retain + park) instead of integrity (destroy + poison) — DL-ISC-13's poison-flag
+/// guarantee must not be defeatable by completion timing OR set size. Only an
+/// `Integrity` short-circuits: once one is held we return immediately, dropping the
+/// rest. The budget behind the fetch closure is the true admission cap — `concurrency`
+/// only bounds the polled future set; dropping the remaining futures on return cancels
 /// their in-flight fetches, releasing budget permits via RAII.
 async fn drive_bounded<I, Fut>(futures: I, concurrency: usize) -> Result<(), Stop>
 where
@@ -170,23 +176,21 @@ where
     }
     let mut worst: Option<Stop> = None;
     while let Some(res) = inflight.next().await {
-        match res {
-            Ok(()) => {
-                // Refill the window only while healthy; once aborting, stop pulling
-                // new work and just drain the in-flight set.
-                if worst.is_none() {
-                    if let Some(f) = pending.next() {
-                        inflight.push(f);
-                    }
-                }
+        if let Err(s) = res {
+            let dominant = s.class == FetchErrorClass::Integrity;
+            worst = Some(merge_stop(worst.take(), s));
+            // An Integrity failure quarantines the whole fetch — return at once,
+            // dropping the remaining futures (RAII releases their permits). Any
+            // other class keeps draining so a later Integrity can still dominate.
+            if dominant {
+                break;
             }
-            Err(s) => {
-                let dominant = s.class == FetchErrorClass::Integrity;
-                worst = Some(merge_stop(worst.take(), s));
-                if dominant {
-                    break;
-                }
-            }
+        }
+        // Refill on EVERY completion (success OR non-Integrity failure) until the
+        // set is exhausted, so every unit is driven to a terminal result and a
+        // poisoned unit beyond the initial window is never left unpolled.
+        if let Some(f) = pending.next() {
+            inflight.push(f);
         }
     }
     match worst {
@@ -704,6 +708,92 @@ mod tests {
             assert!(!st.dir().exists(), "poison destroys staging");
         }
         let _ = staging;
+    }
+
+    /// (F2 / DL-ISC-13) Integrity must dominate a transient even when the poisoned
+    /// file sits BEYOND the initial in-flight window (`F_FILES`). The 2-file test
+    /// above only covers the in-window race; with more files than the window, an
+    /// early transient must NOT stop the driver from reaching a later poison — else
+    /// the fetch mis-reports TransientFailed (retain + park) instead of IntegrityFailed
+    /// (destroy + poison). The pre-fix refill gate ("stop pulling new futures on the
+    /// first failure") left the late poison unpolled; this pins that it no longer can.
+    #[tokio::test]
+    async fn integrity_dominates_a_transient_beyond_the_inflight_window() {
+        let root = tmp("race-window");
+        let staging = StagingArea::open(&root, "win").unwrap();
+
+        // F_FILES + 4 files, each with unique bytes (so chunk addresses never
+        // collide). The LAST file (index F_FILES + 3, well beyond the initial
+        // window) serves poison; every other file route-deaths (transient). Under the
+        // fixed driver all files are driven to a terminal result, so the single poison
+        // surfaces and dominates the sea of transients regardless of completion order.
+        let total = F_FILES + 4;
+        let mut files = Vec::new();
+        for i in 0..total {
+            let body = format!("file-{i:02}-unique-body");
+            let (f, _m) = plan_file(&format!("f{i:02}.bin"), body.as_bytes());
+            files.push(f);
+        }
+        let poison_addr = files[total - 1].chunks[0];
+        let fetch = move |addr: ChunkAddr| {
+            let out: std::result::Result<Vec<u8>, VeilidNetError> = if addr == poison_addr {
+                Err(VeilidNetError::Integrity("sha-384 mismatch".into()))
+            } else {
+                Err(VeilidNetError::Send("route died".into()))
+            };
+            async move { out }
+        };
+        let progress = |_c: u32, _b: u64| {};
+        let outcome = run_download(&files, &staging, &fetch, &progress).await;
+        assert!(
+            matches!(outcome, DownloadOutcome::IntegrityFailed { .. }),
+            "poison beyond the in-flight window must still dominate; got {outcome:?}"
+        );
+        assert!(
+            !staging.dir().exists(),
+            "poison destroys the whole fetch's staging"
+        );
+    }
+
+    /// (F2 / DL-ISC-13) The same dominance must hold at the CHUNK level within one
+    /// file: a poisoned chunk BEYOND the chunk poll window (`CHUNK_POLL_CAP` = 8) must
+    /// still dominate a transient chunk that completed first. This proves the uniform
+    /// driver fix reaches chunk-level dominance, not just file-level — the pre-fix
+    /// refill gate left a late chunk unpolled once an early chunk failed transient.
+    #[tokio::test]
+    async fn integrity_dominates_a_transient_chunk_beyond_the_poll_window() {
+        let root = tmp("race-chunks");
+        let staging = StagingArea::open(&root, "cwin").unwrap();
+        // A 12-chunk file (> CHUNK_POLL_CAP = 8), each chunk a DISTINCT fill so the
+        // content-addresses differ. Chunk 0 route-deaths (transient, in the poll
+        // window); chunk 10 (beyond the window) serves poison. The fixed chunk driver
+        // drives every chunk to terminal, so the poison surfaces and dominates.
+        let n_chunks = 12usize;
+        let mut body = Vec::new();
+        for i in 0..n_chunks {
+            body.extend(std::iter::repeat_n(0xB0u8 + i as u8, CHUNK_SIZE));
+        }
+        let (f, map) = plan_file("reel.bin", &body);
+        assert_eq!(f.chunks.len(), n_chunks);
+        let transient_addr = f.chunks[0];
+        let poison_addr = f.chunks[10];
+        let fetch = move |addr: ChunkAddr| {
+            let out: std::result::Result<Vec<u8>, VeilidNetError> = if addr == transient_addr {
+                Err(VeilidNetError::Send("route died".into()))
+            } else if addr == poison_addr {
+                Err(VeilidNetError::Integrity("sha-384 mismatch".into()))
+            } else {
+                map.get(&addr).cloned().ok_or(VeilidNetError::NotServed)
+            };
+            async move { out }
+        };
+        let progress = |_c: u32, _b: u64| {};
+        let outcome = run_download(&[f], &staging, &fetch, &progress).await;
+        assert!(
+            matches!(outcome, DownloadOutcome::IntegrityFailed { .. }),
+            "a poisoned chunk beyond the poll window must dominate; got {outcome:?}"
+        );
+        assert!(!staging.dir().exists(), "poison destroys staging");
     }
 
     /// (step 8b / DL-ISC-12) A resume plan with `already_verified = [0, 2]` on a

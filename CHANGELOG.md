@@ -49,6 +49,11 @@ work lives in the project lead's vault manifest, not here.
 
 - `daemonseed-veilid-net`: the legacy window-parameter chunk-fetch path (`VeilidNetHandle::fetch_chunk` / `share::fetch_chunk`) is removed — both frontends now fetch through the budget-admitted seam (`docs/design/download-subsystem.md` step 7).
 
+### Fixed
+
+- `daemonseed-veilid-net`: an integrity failure dominates a concurrent transient across any file and chunk set size — a poisoned unit beyond the in-flight window is driven to a terminal result and poisons the share (DL-ISC-13).
+- `daemonseed-gui` + `daemonseed-tui`: a hostile or malformed share manifest is classified `Integrity` and poisons the share; only transport failures mark it Unresolved and park a retry (DL-ISC-13).
+
 ## [0.35.1] — 2026-07-20
 
 ### Fixed
