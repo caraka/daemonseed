@@ -17,9 +17,14 @@
 //!   content: a content-addressed store plus a manifest of explicit downloads,
 //!   so a fetched share can be browsed and extracted after the fetch
 //!   (ISC-C63 / C64 / C65, ISC-A-C31 / A-C32).
+//! - [`manifest_digest`] (download-subsystem redesign, step 8) — a profile-local
+//!   redb store mapping `share_id` → the confirmed manifest's SHA-384 digest, the
+//!   trusted anchor a verified resume checks the staging manifest against
+//!   (DL-ISC-20).
 
 pub mod cas;
 pub mod fetched;
+pub mod manifest_digest;
 pub mod recovery_file;
 pub mod seeds;
 pub mod share_index;

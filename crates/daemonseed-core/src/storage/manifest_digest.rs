@@ -1,0 +1,211 @@
+//! Profile-local store of confirmed-manifest digests (download-subsystem
+//! redesign, step 8 — `docs/design/download-subsystem.md` §Part 3).
+//!
+//! A verified resume binds to the *stored confirmed* manifest (DL-ISC-20). The
+//! manifest itself is persisted inside the fetch's staging area
+//! ([`super::fetched::StagingArea::persist_manifest`]), but the downloads root is
+//! co-resident-writable, so its integrity cannot anchor there. This store keeps
+//! the manifest's SHA-384 digest in the **client's own trusted state** (a redb
+//! file under the profile dir, like [`super::share_index`]): before any reuse the
+//! staging copy is re-serialized, re-digested, and compared to the digest stored
+//! here ([`super::fetched::verify_stored_manifest`]). Without the profile-anchored
+//! digest, a co-resident tamper of the staging manifest plus a colluding sharer
+//! serving the matching manifest would bypass the confirm gate.
+//!
+//! The value is a bare 48-byte digest — no encryption (unlike the share index): a
+//! digest is not secret, and the store's job is integrity anchoring, not
+//! confidentiality. Keyed by `share_id` — also plaintext, which leaks no more than
+//! the fetcher already exposes at rest by design (the `downloads.idx` manifest and
+//! the `.dspart/<hex(share_id)>/` staging tree both carry the `share_id` +
+//! `rel_path`s in the clear). The share index encrypts because it protects the
+//! *sharer's* passive index of a private folder — a different concern.
+
+use std::path::Path;
+
+use redb::{Database, TableDefinition};
+
+use super::fetched::MANIFEST_DIGEST_LEN;
+
+/// The digest table. Bump the version suffix (abandoning any prior table) on an
+/// incompatible value-format change, mirroring [`super::share_index`]'s discipline.
+const TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("download-manifest-digests-v1");
+
+/// Why a [`ManifestDigestStore`] operation failed.
+#[derive(Debug)]
+pub enum DigestStoreError {
+    /// A redb storage / transaction / table error. Boxed because `redb::Error` is
+    /// large and would bloat every `Result` otherwise.
+    Db(Box<redb::Error>),
+    /// A stored value was not exactly [`MANIFEST_DIGEST_LEN`] bytes — a corrupt
+    /// store or a value written by an incompatible version. Fails closed rather
+    /// than returning a truncated/garbage digest.
+    Corrupt,
+}
+
+impl core::fmt::Display for DigestStoreError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            DigestStoreError::Db(e) => write!(f, "manifest-digest store error: {e}"),
+            DigestStoreError::Corrupt => {
+                f.write_str("manifest-digest store value is not a 48-byte digest")
+            }
+        }
+    }
+}
+
+impl core::error::Error for DigestStoreError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            DigestStoreError::Db(e) => Some(e.as_ref()),
+            DigestStoreError::Corrupt => None,
+        }
+    }
+}
+
+fn db_err(e: impl Into<redb::Error>) -> DigestStoreError {
+    DigestStoreError::Db(Box::new(e.into()))
+}
+
+/// An open, redb-backed store mapping `share_id` → the 48-byte SHA-384 of the
+/// fetch's confirmed manifest. Kept under the profile dir (the client's own
+/// trusted state), so it anchors the manifest's integrity independently of the
+/// co-resident-writable downloads root.
+pub struct ManifestDigestStore {
+    db: Database,
+}
+
+impl ManifestDigestStore {
+    /// Open (creating if absent) the digest store at `path`. Reopening recovers
+    /// every digest written before.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, DigestStoreError> {
+        let db = Database::create(path).map_err(db_err)?;
+        // Materialize the table so a fresh DB has it before any read txn.
+        let wtxn = db.begin_write().map_err(db_err)?;
+        {
+            wtxn.open_table(TABLE).map_err(db_err)?;
+        }
+        wtxn.commit().map_err(db_err)?;
+        Ok(Self { db })
+    }
+
+    /// Record (insert or replace) the confirmed-manifest digest for `share_id`.
+    pub fn record_digest(
+        &self,
+        share_id: &str,
+        digest: &[u8; MANIFEST_DIGEST_LEN],
+    ) -> Result<(), DigestStoreError> {
+        let wtxn = self.db.begin_write().map_err(db_err)?;
+        {
+            let mut table = wtxn.open_table(TABLE).map_err(db_err)?;
+            table
+                .insert(share_id.as_bytes(), digest.as_slice())
+                .map_err(db_err)?;
+        }
+        wtxn.commit().map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Fetch the stored digest for `share_id`. `Ok(None)` if none was recorded;
+    /// [`DigestStoreError::Corrupt`] if a stored value is not 48 bytes.
+    ///
+    /// A resume MUST treat `Ok(None)` as HALT — never synthesize a digest or proceed
+    /// to verify without one. With no recorded digest there is no anchor, so a
+    /// co-resident tamper of the staging manifest (plus a colluding sharer serving the
+    /// matching manifest) would bypass the confirm gate. Fail closed on a store miss.
+    pub fn get_digest(
+        &self,
+        share_id: &str,
+    ) -> Result<Option<[u8; MANIFEST_DIGEST_LEN]>, DigestStoreError> {
+        let rtxn = self.db.begin_read().map_err(db_err)?;
+        let table = rtxn.open_table(TABLE).map_err(db_err)?;
+        match table.get(share_id.as_bytes()).map_err(db_err)? {
+            Some(guard) => {
+                let value = guard.value();
+                if value.len() != MANIFEST_DIGEST_LEN {
+                    return Err(DigestStoreError::Corrupt);
+                }
+                let mut out = [0u8; MANIFEST_DIGEST_LEN];
+                out.copy_from_slice(value);
+                Ok(Some(out))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Remove the stored digest for `share_id`. Removing an absent entry is a
+    /// no-op.
+    pub fn remove(&self, share_id: &str) -> Result<(), DigestStoreError> {
+        let wtxn = self.db.begin_write().map_err(db_err)?;
+        {
+            let mut table = wtxn.open_table(TABLE).map_err(db_err)?;
+            table.remove(share_id.as_bytes()).map_err(db_err)?;
+        }
+        wtxn.commit().map_err(db_err)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store() -> (tempfile::TempDir, ManifestDigestStore) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = ManifestDigestStore::open(dir.path().join("digests.redb")).unwrap();
+        (dir, store)
+    }
+
+    #[test]
+    fn record_then_get_round_trips_the_digest() {
+        let (_dir, store) = store();
+        let d = [7u8; MANIFEST_DIGEST_LEN];
+        store.record_digest("share-a", &d).unwrap();
+        assert_eq!(store.get_digest("share-a").unwrap(), Some(d));
+    }
+
+    #[test]
+    fn get_absent_is_none() {
+        let (_dir, store) = store();
+        assert_eq!(store.get_digest("nope").unwrap(), None);
+    }
+
+    #[test]
+    fn record_replaces_an_existing_digest() {
+        let (_dir, store) = store();
+        store
+            .record_digest("s", &[1u8; MANIFEST_DIGEST_LEN])
+            .unwrap();
+        store
+            .record_digest("s", &[2u8; MANIFEST_DIGEST_LEN])
+            .unwrap();
+        assert_eq!(
+            store.get_digest("s").unwrap(),
+            Some([2u8; MANIFEST_DIGEST_LEN])
+        );
+    }
+
+    #[test]
+    fn remove_deletes_the_entry() {
+        let (_dir, store) = store();
+        store
+            .record_digest("s", &[9u8; MANIFEST_DIGEST_LEN])
+            .unwrap();
+        store.remove("s").unwrap();
+        assert_eq!(store.get_digest("s").unwrap(), None);
+        // Removing an absent entry is a no-op.
+        store.remove("s").unwrap();
+    }
+
+    #[test]
+    fn digests_reopen_across_store_instances() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("digests.redb");
+        let d = [3u8; MANIFEST_DIGEST_LEN];
+        {
+            let store = ManifestDigestStore::open(&path).unwrap();
+            store.record_digest("persist", &d).unwrap();
+        }
+        let store = ManifestDigestStore::open(&path).unwrap();
+        assert_eq!(store.get_digest("persist").unwrap(), Some(d));
+    }
+}

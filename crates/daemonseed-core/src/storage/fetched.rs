@@ -59,6 +59,12 @@ use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use oxicrypt_sha::sha384;
+
+use crate::share_envelope::ManifestEntry;
+use crate::share_serve::CHUNK_SIZE;
+use crate::storage::cas::{CHUNK_ADDR_LEN, ChunkAddr, chunk_addr};
+
 /// Manifest header — bumped if the on-disk format changes incompatibly.
 const MANIFEST_HEADER: &str = "# daemonseed downloads manifest v2";
 
@@ -859,6 +865,405 @@ impl StagingArea {
             Err(e) => Err(FetchedError::Io(e)),
         }
     }
+
+    /// The stored-confirmed-manifest path for this fetch. It lives INSIDE the
+    /// staging dir under the reserved [`STAGING_DIR`] component
+    /// (`<root>/.dspart/<share_id>/.dspart/manifest`) — a path no staged file can
+    /// ever occupy, since [`sanitize_rel_path`] refuses a `.dspart` segment in any
+    /// `final_rel` (DL-ISC-18). So a hostile manifest `rel_path` (even one named
+    /// to alias the manifest) can neither collide with nor overwrite the stored
+    /// manifest, and [`destroy`](Self::destroy) / the sweep clean it with the area.
+    fn stored_manifest_path(&self) -> PathBuf {
+        self.dir.join(STAGING_DIR).join("manifest")
+    }
+
+    /// Persist the user-confirmed manifest into this fetch's staging area (the
+    /// deterministic canonical serialization — [`serialize_stored_manifest`]). A
+    /// resume binds to this stored copy (DL-ISC-20): its digest is anchored in the
+    /// profile's [`super::manifest_digest::ManifestDigestStore`] and re-verified
+    /// before any reuse. Written via a temp sibling + rename so a crash mid-write
+    /// cannot leave a half-written manifest.
+    pub fn persist_manifest(&self, manifest: &[ManifestEntry]) -> Result<(), FetchedError> {
+        let path = self.stored_manifest_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let bytes = serialize_stored_manifest(manifest);
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, &bytes)?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+
+    /// Read + deserialize the stored confirmed manifest. A missing file (no
+    /// manifest was ever persisted) surfaces as [`FetchedError::Io`]
+    /// (`NotFound`) and an unparseable one as [`FetchedError::Corrupt`] — never a
+    /// silent empty manifest (fail-closed). Callers that must additionally prove
+    /// the copy is untampered use [`verify_stored_manifest`], which chains this to
+    /// the profile-anchored digest.
+    pub fn read_stored_manifest(&self) -> Result<Vec<ManifestEntry>, FetchedError> {
+        let bytes = std::fs::read(self.stored_manifest_path())?;
+        deserialize_stored_manifest(&bytes)
+    }
+}
+
+// ── Verified resume — fail-closed (download-subsystem redesign, step 8a) ──
+//
+// A resume is RE-DERIVATION, never trust (design §Part 3). The confirmed manifest
+// is persisted into the fetch's staging area and its digest anchored in the
+// profile's own trusted state (`super::manifest_digest`). Before any reuse the
+// staging copy is re-verified against that digest (DL-ISC-20), and every retained
+// byte on disk is re-hashed against its content address before it counts as
+// present (DL-ISC-12). No sidecar/journal is trusted for content — only bytes that
+// re-verify are kept; everything else is re-fetched.
+
+/// The 48-byte SHA-384 that anchors a stored confirmed manifest's integrity.
+pub const MANIFEST_DIGEST_LEN: usize = 48;
+
+/// Magic + one-byte version prefix on the stored-manifest serialization. Bump the
+/// trailing version byte on any incompatible format change so an old file fails
+/// [`deserialize_stored_manifest`] closed rather than mis-parsing.
+const STORED_MANIFEST_MAGIC: &[u8] = b"dsmanifest\x01";
+
+/// Serialize a confirmed manifest to its DETERMINISTIC canonical bytes — the exact
+/// byte string the [`manifest_digest`] covers. Deterministic because the field
+/// order is fixed, every integer is big-endian and length-prefixed, and entries
+/// (and each entry's chunk list) are emitted in slice order with no map iteration,
+/// so an identical `&[ManifestEntry]` always serializes byte-identically.
+///
+/// Layout: `MAGIC | count(u32 BE) | entry×count`, where
+/// `entry := rel_path_len(u32 BE) | rel_path_utf8 | size(u64 BE) |
+/// chunk_count(u32 BE) | chunk_addr(48)×chunk_count`.
+pub(crate) fn serialize_stored_manifest(manifest: &[ManifestEntry]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(STORED_MANIFEST_MAGIC);
+    out.extend_from_slice(&(manifest.len() as u32).to_be_bytes());
+    for e in manifest {
+        let path = e.rel_path.as_bytes();
+        out.extend_from_slice(&(path.len() as u32).to_be_bytes());
+        out.extend_from_slice(path);
+        out.extend_from_slice(&e.size.to_be_bytes());
+        out.extend_from_slice(&(e.chunks.len() as u32).to_be_bytes());
+        for addr in &e.chunks {
+            out.extend_from_slice(addr.as_bytes());
+        }
+    }
+    out
+}
+
+/// Deserialize a stored manifest — fail-closed: a bad magic/version, a truncated
+/// buffer, a length prefix past the buffer, a non-UTF-8 `rel_path`, or trailing
+/// bytes all return [`FetchedError::Corrupt`], never a partial or empty parse.
+pub(crate) fn deserialize_stored_manifest(
+    bytes: &[u8],
+) -> Result<Vec<ManifestEntry>, FetchedError> {
+    fn take<'a>(cur: &mut &'a [u8], n: usize) -> Result<&'a [u8], FetchedError> {
+        if cur.len() < n {
+            return Err(FetchedError::Corrupt(
+                "stored manifest truncated".to_owned(),
+            ));
+        }
+        let (head, tail) = cur.split_at(n);
+        *cur = tail;
+        Ok(head)
+    }
+    fn be_u32(cur: &mut &[u8]) -> Result<u32, FetchedError> {
+        Ok(u32::from_be_bytes(take(cur, 4)?.try_into().unwrap()))
+    }
+
+    let mut cur = bytes;
+    if take(&mut cur, STORED_MANIFEST_MAGIC.len())? != STORED_MANIFEST_MAGIC {
+        return Err(FetchedError::Corrupt(
+            "stored manifest bad magic/version".to_owned(),
+        ));
+    }
+    let count = be_u32(&mut cur)? as usize;
+    // Pre-alloc is capped so a hostile count field cannot force a giant Vec before
+    // the (fail-fast) `take` calls run out of bytes; the loop still parses exactly
+    // `count` entries or errors.
+    let mut out = Vec::with_capacity(count.min(1024));
+    for _ in 0..count {
+        let plen = be_u32(&mut cur)? as usize;
+        let rel_path = String::from_utf8(take(&mut cur, plen)?.to_vec())
+            .map_err(|_| FetchedError::Corrupt("stored manifest rel_path not UTF-8".to_owned()))?;
+        let size = u64::from_be_bytes(take(&mut cur, 8)?.try_into().unwrap());
+        let chunk_count = be_u32(&mut cur)? as usize;
+        let mut chunks = Vec::with_capacity(chunk_count.min(4096));
+        for _ in 0..chunk_count {
+            let mut arr = [0u8; CHUNK_ADDR_LEN];
+            arr.copy_from_slice(take(&mut cur, CHUNK_ADDR_LEN)?);
+            chunks.push(ChunkAddr::from_bytes(arr));
+        }
+        out.push(ManifestEntry {
+            rel_path,
+            size,
+            chunks,
+        });
+    }
+    if !cur.is_empty() {
+        return Err(FetchedError::Corrupt(
+            "stored manifest has trailing bytes".to_owned(),
+        ));
+    }
+    Ok(out)
+}
+
+/// SHA-384 over the [`serialize_stored_manifest`] bytes — the digest a resume
+/// re-derives and compares against the profile-anchored copy (DL-ISC-20). The
+/// only failure is SHA-384's power-up self-test not having passed (never on a real
+/// download path).
+pub fn manifest_digest(
+    manifest: &[ManifestEntry],
+) -> Result<[u8; MANIFEST_DIGEST_LEN], FetchedError> {
+    let bytes = serialize_stored_manifest(manifest);
+    let digest = sha384(&bytes)
+        .map_err(|_| FetchedError::Corrupt("SHA-384 unavailable (self-test)".to_owned()))?;
+    let mut out = [0u8; MANIFEST_DIGEST_LEN];
+    out.copy_from_slice(&digest[..MANIFEST_DIGEST_LEN]);
+    Ok(out)
+}
+
+/// Constant-time equality over two manifest digests — no data-dependent early
+/// return (every byte folds into one accumulator).
+fn digest_ct_eq(a: &[u8; MANIFEST_DIGEST_LEN], b: &[u8; MANIFEST_DIGEST_LEN]) -> bool {
+    let mut acc = 0u8;
+    for i in 0..MANIFEST_DIGEST_LEN {
+        acc |= a[i] ^ b[i];
+    }
+    core::hint::black_box(acc) == 0
+}
+
+/// Verify a fetch's stored staging manifest against the profile-anchored digest,
+/// FAIL-CLOSED (DL-ISC-20). Reads the staging copy, re-serializes + re-digests it,
+/// and constant-time-compares to `expected_digest`. Any mismatch — a tampered or
+/// swapped staging manifest, a missing staging manifest, or an unparseable one —
+/// returns [`Err`]; a resume MUST halt on `Err` (re-gate on a fresh preview/
+/// confirm) and never proceed on an unverified stored manifest. Returns the parsed
+/// confirmed manifest only on a digest match.
+pub fn verify_stored_manifest(
+    staging: &StagingArea,
+    expected_digest: &[u8; MANIFEST_DIGEST_LEN],
+) -> Result<Vec<ManifestEntry>, FetchedError> {
+    let manifest = staging.read_stored_manifest()?;
+    let actual = manifest_digest(&manifest)?;
+    if !digest_ct_eq(&actual, expected_digest) {
+        return Err(FetchedError::Corrupt(
+            "stored manifest digest does not match the profile-anchored digest".to_owned(),
+        ));
+    }
+    Ok(manifest)
+}
+
+/// The byte region chunk `index` covers for a file of `size` bytes:
+/// `[index*CHUNK_SIZE, min((index+1)*CHUNK_SIZE, size))`. Returns `(offset, len)`;
+/// `len` is 0 for an out-of-range index (offset ≥ size).
+fn chunk_region(index: usize, size: u64) -> (u64, u64) {
+    let cs = CHUNK_SIZE as u64;
+    let offset = (index as u64).saturating_mul(cs);
+    if offset >= size {
+        return (offset, 0);
+    }
+    (offset, offset.saturating_add(cs).min(size) - offset)
+}
+
+/// Positional read of exactly `buf.len()` bytes at `offset` — a `pread`, so it
+/// shares no seek position with concurrent writers.
+fn pread_exact(f: &std::fs::File, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        f.read_exact_at(buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let (mut rest, mut pos) = (buf, offset);
+        while !rest.is_empty() {
+            match f.seek_read(rest, pos)? {
+                0 => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "seek_read returned 0 before filling the buffer",
+                    ));
+                }
+                n => {
+                    rest = &mut rest[n..];
+                    pos += n as u64;
+                }
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut fc = f.try_clone()?;
+        fc.seek(SeekFrom::Start(offset))?;
+        fc.read_exact(buf)
+    }
+}
+
+/// Read the exact `[offset, offset+len)` region from `path`, or `Err` if the file
+/// is shorter than the region (a sparse/truncated tail) or unreadable.
+fn read_region(path: &Path, offset: u64, len: u64) -> std::io::Result<Vec<u8>> {
+    let f = std::fs::File::open(path)?;
+    let file_len = f.metadata()?.len();
+    if offset.checked_add(len).is_none_or(|end| end > file_len) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "chunk region past end of file",
+        ));
+    }
+    let mut buf = vec![0u8; len as usize];
+    pread_exact(&f, offset, &mut buf)?;
+    Ok(buf)
+}
+
+/// Whether the bytes of chunk `(offset, len)` at `path` re-hash to `addr`. A
+/// missing path, a short/sparse region, an unreadable file, or a hash mismatch
+/// all read as "does not verify" — never as verified.
+fn chunk_verifies(path: Option<&Path>, offset: u64, len: u64, addr: &ChunkAddr) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    let Ok(bytes) = read_region(path, offset, len) else {
+        return false;
+    };
+    chunk_addr(&bytes).is_ok_and(|a| &a == addr)
+}
+
+/// One file's resume state, RE-DERIVED from bytes on disk (never from
+/// bookkeeping). `verified` and `missing` partition `0..total_chunks` as a SET —
+/// there is NO prefix assumption, so a later chunk can be present while an earlier
+/// one is missing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileResume {
+    /// The file's placement-resolved on-disk path (relative to the dest root for a
+    /// promoted file, and to the staging dir for a partial).
+    pub rel_path: String,
+    /// The file's confirmed size in bytes.
+    pub size: u64,
+    /// The file's total chunk count (the stored manifest's chunk-list length).
+    pub total_chunks: usize,
+    /// Chunk indices whose on-disk bytes re-verify against their content address
+    /// (kept, not re-fetched). Sorted ascending.
+    pub verified: Vec<usize>,
+    /// Chunk indices to (re-)fetch — mismatched, short, sparse/unwritten, or
+    /// unreadable. Sorted ascending.
+    pub missing: Vec<usize>,
+}
+
+impl FileResume {
+    /// Whether every chunk of the file verified on disk (already complete —
+    /// nothing to fetch).
+    pub fn is_complete(&self) -> bool {
+        self.missing.is_empty() && self.verified.len() == self.total_chunks
+    }
+}
+
+/// A resume's per-file plan: which chunks verify on disk and which must be
+/// (re-)fetched, for every file in the confirmed manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumePlan {
+    /// One entry per manifest file, in manifest order.
+    pub files: Vec<FileResume>,
+}
+
+impl ResumePlan {
+    /// Whether every file is already complete (a resume would fetch nothing).
+    pub fn is_complete(&self) -> bool {
+        self.files.iter().all(FileResume::is_complete)
+    }
+
+    /// Total chunks that re-verified on disk across all files (feeds resumed
+    /// progress — the bar resumes ahead rather than restarting).
+    pub fn verified_chunk_count(&self) -> usize {
+        self.files.iter().map(|f| f.verified.len()).sum()
+    }
+
+    /// Total chunks that must be (re-)fetched across all files.
+    pub fn missing_chunk_count(&self) -> usize {
+        self.files.iter().map(|f| f.missing.len()).sum()
+    }
+}
+
+/// Re-derive a resume plan for `manifest` from bytes on disk (DL-ISC-12). For each
+/// file, each chunk region (`[i*CHUNK_SIZE, min((i+1)*CHUNK_SIZE, size))`,
+/// boundaries from `CHUNK_SIZE` + the stored `size`, never from the file
+/// self-describing) is re-hashed against the stored content address at BOTH
+/// candidate locations — the promoted final file (`dest_root/<rel_path>`) and the
+/// staged partial (`staging/<rel_path>`) — and counts as present iff either
+/// re-verifies. A chunk that mismatches, is short/sparse, or is unreadable is
+/// MISSING (discard + re-fetch); a file whose every chunk verifies is already
+/// Complete. No on-disk byte is ever reused without re-verifying its content
+/// address, so a resume can never be tricked past an integrity check by tampered
+/// at-rest state.
+///
+/// `manifest`'s entries must carry the file's placement-resolved on-disk
+/// `rel_path` (what the download staged/promoted under); the caller re-paths the
+/// digest-verified confirmed manifest into placement space before calling.
+pub fn derive_resume_state(
+    manifest: &[ManifestEntry],
+    dest_root: &Path,
+    staging: &StagingArea,
+) -> ResumePlan {
+    let file_len = |p: &Path| std::fs::metadata(p).ok().map(|m| m.len());
+    let files = manifest
+        .iter()
+        .map(|entry| {
+            // Coverage guard (mirrors the engine's DL-ISC-11 fresh-download check): the
+            // chunk list MUST exactly tile `[0, size)` — `chunks.len() ==
+            // ceil(size / CHUNK_SIZE)`. A malformed entry (a hostile `{size: 2*CS,
+            // chunks: [one]}` leaves `[CS, 2*CS)` uncovered) is NEVER resumed-as-complete:
+            // every chunk is marked missing so the re-fetch path re-derives it and the
+            // engine's coverage guard rejects a hostile manifest. Without this, a
+            // "fully verified" file could carry an unverified sparse tail (xhigh review F1).
+            let expected_chunks = entry.size.div_ceil(CHUNK_SIZE as u64) as usize;
+            if entry.chunks.len() != expected_chunks {
+                return FileResume {
+                    rel_path: entry.rel_path.clone(),
+                    size: entry.size,
+                    total_chunks: entry.chunks.len(),
+                    verified: Vec::new(),
+                    missing: (0..entry.chunks.len()).collect(),
+                };
+            }
+            // Exact-length gate: a candidate file is trusted only if it is EXACTLY
+            // `size` bytes. A co-resident append past `size` (`file_len > size`) would
+            // otherwise ride along as unverified content beyond the last chunk's region
+            // (chunk regions cover only `[0, size)`); a short file fails the last chunk's
+            // read anyway. Applied to BOTH the promoted final and the staged partial —
+            // both live under co-resident-writable roots (xhigh review F1).
+            let promoted = sanitize_rel_path(&entry.rel_path)
+                .ok()
+                .map(|rel| dest_root.join(rel))
+                .filter(|p| file_len(p) == Some(entry.size));
+            let staged = staging
+                .staging_path(&entry.rel_path)
+                .ok()
+                .filter(|p| file_len(p) == Some(entry.size));
+            let mut verified = Vec::new();
+            let mut missing = Vec::new();
+            for (i, addr) in entry.chunks.iter().enumerate() {
+                let (offset, len) = chunk_region(i, entry.size);
+                let present = chunk_verifies(promoted.as_deref(), offset, len, addr)
+                    || chunk_verifies(staged.as_deref(), offset, len, addr);
+                if present {
+                    verified.push(i);
+                } else {
+                    missing.push(i);
+                }
+            }
+            FileResume {
+                rel_path: entry.rel_path.clone(),
+                size: entry.size,
+                total_chunks: entry.chunks.len(),
+                verified,
+                missing,
+            }
+        })
+        .collect();
+    ResumePlan { files }
 }
 
 // ── Live-fetch registry + staging sweep (download-subsystem redesign, step 4c) ──
@@ -1772,5 +2177,342 @@ mod tests {
         assert!(store.list_shares().unwrap().is_empty());
         std::fs::write(store.manifest_path(), "S nothex nothex nothex 1\n").unwrap();
         assert!(matches!(store.list_shares(), Err(FetchedError::Corrupt(_))));
+    }
+
+    // ── Verified resume — stored manifest, digest, re-derivation (step 8a) ──
+
+    /// A [`ManifestEntry`] with `n` deterministic fake chunk addresses — enough to
+    /// exercise serialization / digest / persist without materializing bytes.
+    fn fake_entry(rel: &str, size: u64, seed: u8, n: usize) -> ManifestEntry {
+        let chunks = (0..n)
+            .map(|i| ChunkAddr::from_bytes([seed ^ (i as u8); CHUNK_ADDR_LEN]))
+            .collect();
+        ManifestEntry {
+            rel_path: rel.to_owned(),
+            size,
+            chunks,
+        }
+    }
+
+    /// `size` deterministic content bytes plus the REAL per-chunk addresses over
+    /// [`CHUNK_SIZE`] windows — the fixtures the re-derivation oracles hash against.
+    fn real_content(size: u64) -> (Vec<u8>, Vec<ChunkAddr>) {
+        let _ = oxicrypt_module::initialize();
+        let mut bytes = vec![0u8; size as usize];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(31).wrapping_add(7);
+        }
+        let mut addrs = Vec::new();
+        let mut off = 0usize;
+        while off < bytes.len() {
+            let end = (off + CHUNK_SIZE).min(bytes.len());
+            addrs.push(chunk_addr(&bytes[off..end]).unwrap());
+            off = end;
+        }
+        (bytes, addrs)
+    }
+
+    /// Round-trip determinism: persist→read is byte-identical, serialization is
+    /// stable, and the digest is reproducible (the DL-ISC-20 anchor).
+    #[test]
+    fn stored_manifest_serialization_is_deterministic_and_round_trips() {
+        let _ = oxicrypt_module::initialize();
+        let manifest = vec![
+            fake_entry("a/b.txt", 3, 0x11, 2),
+            fake_entry("c.bin", 1_048_577, 0x22, 3),
+            fake_entry("empty", 0, 0x00, 0),
+        ];
+        let s1 = serialize_stored_manifest(&manifest);
+        let s2 = serialize_stored_manifest(&manifest);
+        assert_eq!(
+            s1, s2,
+            "serialization must be byte-identical for equal input"
+        );
+        assert_eq!(deserialize_stored_manifest(&s1).unwrap(), manifest);
+        assert_eq!(
+            manifest_digest(&manifest).unwrap(),
+            manifest_digest(&manifest).unwrap(),
+            "digest is stable"
+        );
+    }
+
+    /// Deserialization is fail-closed: bad magic, truncation, and trailing bytes
+    /// each error rather than yield a partial/empty manifest.
+    #[test]
+    fn stored_manifest_deserialize_is_fail_closed() {
+        assert!(matches!(
+            deserialize_stored_manifest(b"not-a-manifest"),
+            Err(FetchedError::Corrupt(_))
+        ));
+        let good = serialize_stored_manifest(&[fake_entry("x", 1, 9, 1)]);
+        assert!(matches!(
+            deserialize_stored_manifest(&good[..good.len() - 3]),
+            Err(FetchedError::Corrupt(_))
+        ));
+        let mut trailing = good.clone();
+        trailing.push(0xFF);
+        assert!(matches!(
+            deserialize_stored_manifest(&trailing),
+            Err(FetchedError::Corrupt(_))
+        ));
+    }
+
+    /// `persist_manifest` → `read_stored_manifest` recovers the exact manifest, and
+    /// the stored copy lives under the reserved `.dspart` component (collision-proof
+    /// against any staged file).
+    #[test]
+    fn persist_and_read_stored_manifest_round_trips() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let staging = StagingArea::open(dir.path(), "share-x").unwrap();
+        let manifest = vec![fake_entry("a.txt", 5, 1, 1), fake_entry("b/c.bin", 9, 2, 2)];
+        staging.persist_manifest(&manifest).unwrap();
+        assert_eq!(staging.read_stored_manifest().unwrap(), manifest);
+        // The stored manifest is under `<dir>/.dspart/manifest` — a path no staged
+        // final_rel can name (`sanitize_rel_path` refuses a `.dspart` segment).
+        assert!(staging.dir().join(STAGING_DIR).join("manifest").is_file());
+    }
+
+    /// A missing stored manifest is a typed error, never a silent empty manifest.
+    #[test]
+    fn read_stored_manifest_missing_is_an_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let staging = StagingArea::open(dir.path(), "share-x").unwrap();
+        assert!(staging.read_stored_manifest().is_err());
+    }
+
+    /// DL-ISC-20: `verify_stored_manifest` returns the manifest only when the
+    /// staging copy's digest matches the profile-anchored digest.
+    #[test]
+    fn verify_stored_manifest_accepts_the_matching_digest() {
+        let _ = oxicrypt_module::initialize();
+        let dir = tempfile::TempDir::new().unwrap();
+        let staging = StagingArea::open(dir.path(), "s").unwrap();
+        let manifest = vec![fake_entry("a.txt", 5, 1, 2)];
+        staging.persist_manifest(&manifest).unwrap();
+        let digest = manifest_digest(&manifest).unwrap();
+        assert_eq!(verify_stored_manifest(&staging, &digest).unwrap(), manifest);
+    }
+
+    /// DL-ISC-20 (tampered staging manifest): tampering the on-disk staging
+    /// manifest bytes makes `verify_stored_manifest` halt — the resume must not
+    /// proceed on an unverified stored manifest.
+    #[test]
+    fn verify_stored_manifest_rejects_a_tampered_staging_manifest() {
+        let _ = oxicrypt_module::initialize();
+        let dir = tempfile::TempDir::new().unwrap();
+        let staging = StagingArea::open(dir.path(), "s").unwrap();
+        let manifest = vec![fake_entry("a.txt", 5, 1, 2)];
+        staging.persist_manifest(&manifest).unwrap();
+        let digest = manifest_digest(&manifest).unwrap();
+        // Flip a byte in the persisted manifest (keep it parseable so the failure
+        // is the DIGEST check, not a parse error).
+        let path = staging.dir().join(STAGING_DIR).join("manifest");
+        let mut raw = std::fs::read(&path).unwrap();
+        *raw.last_mut().unwrap() ^= 0xFF;
+        std::fs::write(&path, &raw).unwrap();
+        assert!(verify_stored_manifest(&staging, &digest).is_err());
+    }
+
+    /// DL-ISC-20 (swapped manifest): a DIFFERENT manifest in staging fails the
+    /// digest compare against the original's anchored digest.
+    #[test]
+    fn verify_stored_manifest_rejects_a_swapped_manifest() {
+        let _ = oxicrypt_module::initialize();
+        let dir = tempfile::TempDir::new().unwrap();
+        let staging = StagingArea::open(dir.path(), "s").unwrap();
+        let original = vec![fake_entry("a.txt", 5, 1, 2)];
+        let digest = manifest_digest(&original).unwrap();
+        // Persist a different manifest (a colluding sharer's swap).
+        let swapped = vec![fake_entry("a.txt", 5, 2, 2)];
+        staging.persist_manifest(&swapped).unwrap();
+        assert!(verify_stored_manifest(&staging, &digest).is_err());
+    }
+
+    /// DL-ISC-20 (missing staging manifest): no persisted manifest → halt, never a
+    /// silent proceed.
+    #[test]
+    fn verify_stored_manifest_rejects_a_missing_staging_manifest() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let staging = StagingArea::open(dir.path(), "s").unwrap();
+        assert!(verify_stored_manifest(&staging, &[0u8; MANIFEST_DIGEST_LEN]).is_err());
+    }
+
+    /// Stage a subset of `present` chunk indices of a multi-chunk file into
+    /// `staging`, pre-sized to `size`. The rest stay sparse/unwritten.
+    fn stage_chunks(staging: &StagingArea, rel: &str, content: &[u8], present: &[usize]) {
+        staging.preallocate(rel, content.len() as u64).unwrap();
+        for &i in present {
+            let (off, len) = chunk_region(i, content.len() as u64);
+            let (off, len) = (off as usize, len as usize);
+            staging
+                .write_verified_chunk(rel, off as u64, &content[off..off + len])
+                .unwrap();
+        }
+    }
+
+    /// DL-ISC-12 (kill-mid-download, set semantics): a non-prefix subset of a
+    /// 4-chunk file's chunks staged ({0,2}) re-derives as exactly verified {0,2},
+    /// missing {1,3} — no prefix assumption.
+    #[test]
+    fn derive_resume_returns_verified_and_missing_as_a_set() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let dest_root = tempfile::TempDir::new().unwrap();
+        let staging = StagingArea::open(dir.path(), "s").unwrap();
+        let size = (3 * CHUNK_SIZE + 1000) as u64; // 4 chunks, short last
+        let (content, addrs) = real_content(size);
+        assert_eq!(addrs.len(), 4);
+        stage_chunks(&staging, "f.bin", &content, &[0, 2]);
+        let manifest = vec![ManifestEntry {
+            rel_path: "f.bin".to_owned(),
+            size,
+            chunks: addrs,
+        }];
+        let plan = derive_resume_state(&manifest, dest_root.path(), &staging);
+        assert_eq!(plan.files.len(), 1);
+        assert_eq!(plan.files[0].verified, vec![0, 2]);
+        assert_eq!(plan.files[0].missing, vec![1, 3]);
+        assert!(!plan.files[0].is_complete());
+        assert!(!plan.is_complete());
+        assert_eq!(plan.verified_chunk_count(), 2);
+        assert_eq!(plan.missing_chunk_count(), 2);
+    }
+
+    /// DL-ISC-12 (tamper-a-partial): a staged chunk whose bytes are corrupted
+    /// re-hashes to a mismatch and is classified MISSING, not verified.
+    #[test]
+    fn derive_resume_classifies_a_tampered_partial_as_missing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let dest_root = tempfile::TempDir::new().unwrap();
+        let staging = StagingArea::open(dir.path(), "s").unwrap();
+        let size = (CHUNK_SIZE + 500) as u64; // 2 chunks
+        let (content, addrs) = real_content(size);
+        assert_eq!(addrs.len(), 2);
+        stage_chunks(&staging, "f.bin", &content, &[0, 1]);
+        // Corrupt one byte of chunk 0 on disk, bypassing the verify path.
+        let staged_path = staging.staging_path("f.bin").unwrap();
+        let mut raw = std::fs::read(&staged_path).unwrap();
+        raw[10] ^= 0xFF;
+        std::fs::write(&staged_path, &raw).unwrap();
+        let manifest = vec![ManifestEntry {
+            rel_path: "f.bin".to_owned(),
+            size,
+            chunks: addrs,
+        }];
+        let plan = derive_resume_state(&manifest, dest_root.path(), &staging);
+        assert_eq!(plan.files[0].verified, vec![1]);
+        assert_eq!(plan.files[0].missing, vec![0]);
+    }
+
+    /// DL-ISC-12 (fully-verified file): every chunk staged → zero missing, complete.
+    #[test]
+    fn derive_resume_on_a_fully_staged_file_is_complete() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let dest_root = tempfile::TempDir::new().unwrap();
+        let staging = StagingArea::open(dir.path(), "s").unwrap();
+        let size = (CHUNK_SIZE + 500) as u64;
+        let (content, addrs) = real_content(size);
+        stage_chunks(&staging, "f.bin", &content, &[0, 1]);
+        let manifest = vec![ManifestEntry {
+            rel_path: "f.bin".to_owned(),
+            size,
+            chunks: addrs,
+        }];
+        let plan = derive_resume_state(&manifest, dest_root.path(), &staging);
+        assert!(plan.files[0].is_complete());
+        assert!(plan.is_complete());
+        assert!(plan.files[0].missing.is_empty());
+    }
+
+    /// xhigh review F1 (coverage guard): a manifest entry whose chunk list does NOT
+    /// tile `[0, size)` (a hostile `{size: 2*CHUNK_SIZE, chunks: [one]}`) is NEVER
+    /// resumed-as-complete even though the one listed chunk verifies — the uncovered
+    /// `[CHUNK_SIZE, 2*CHUNK_SIZE)` tail would otherwise ride along as unverified
+    /// sparse zeros.
+    #[test]
+    fn derive_resume_rejects_an_undersized_chunk_list() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let dest_root = tempfile::TempDir::new().unwrap();
+        let staging = StagingArea::open(dir.path(), "s").unwrap();
+        let size = (2 * CHUNK_SIZE) as u64; // the size implies 2 chunks
+        let (content, addrs) = real_content(size);
+        assert_eq!(addrs.len(), 2);
+        stage_chunks(&staging, "f.bin", &content, &[0]); // chunk 0 verifies on disk
+        // The hostile manifest lists ONLY chunk 0 but claims the 2-chunk size.
+        let manifest = vec![ManifestEntry {
+            rel_path: "f.bin".to_owned(),
+            size,
+            chunks: vec![addrs[0]],
+        }];
+        let plan = derive_resume_state(&manifest, dest_root.path(), &staging);
+        assert!(
+            !plan.files[0].is_complete(),
+            "an undersized chunk list must never be Complete"
+        );
+        assert!(plan.files[0].verified.is_empty());
+        assert_eq!(plan.files[0].missing, vec![0]);
+    }
+
+    /// xhigh review F1 (exact-length gate): a promoted file APPENDED past `size` by a
+    /// co-resident (every in-bounds chunk still re-hashes correctly) is NOT trusted —
+    /// the unverified trailing bytes must not ride along as content; the file is
+    /// treated as absent and its chunks re-fetch.
+    #[test]
+    fn derive_resume_rejects_an_appended_promoted_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let dest_root = tempfile::TempDir::new().unwrap();
+        let staging = StagingArea::open(dir.path(), "s").unwrap();
+        let size = 5_000u64; // one chunk (< CHUNK_SIZE)
+        let (content, addrs) = real_content(size);
+        assert_eq!(addrs.len(), 1);
+        // Promote the correct content, then a co-resident appends extra bytes.
+        let mut tampered = content.clone();
+        tampered.extend_from_slice(b"evil trailing payload");
+        std::fs::write(dest_root.path().join("f.bin"), &tampered).unwrap();
+        let manifest = vec![ManifestEntry {
+            rel_path: "f.bin".to_owned(),
+            size,
+            chunks: addrs,
+        }];
+        let plan = derive_resume_state(&manifest, dest_root.path(), &staging);
+        assert!(
+            !plan.files[0].is_complete(),
+            "an appended promoted file must not be Complete"
+        );
+        assert_eq!(plan.files[0].missing, vec![0]);
+    }
+
+    /// DL-ISC-12 (promoted source): a completed file at `dest_root/<rel>` re-derives
+    /// as fully verified from the promoted bytes, with nothing in staging.
+    #[test]
+    fn derive_resume_reads_a_promoted_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let dest_root = tempfile::TempDir::new().unwrap();
+        let staging = StagingArea::open(dir.path(), "s").unwrap();
+        let size = (CHUNK_SIZE + 500) as u64;
+        let (content, addrs) = real_content(size);
+        std::fs::write(dest_root.path().join("f.bin"), &content).unwrap();
+        let manifest = vec![ManifestEntry {
+            rel_path: "f.bin".to_owned(),
+            size,
+            chunks: addrs,
+        }];
+        let plan = derive_resume_state(&manifest, dest_root.path(), &staging);
+        assert!(plan.files[0].is_complete());
+        assert!(plan.is_complete());
+    }
+
+    /// An empty file (size 0, no chunks) is trivially complete.
+    #[test]
+    fn derive_resume_empty_file_is_complete() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let dest_root = tempfile::TempDir::new().unwrap();
+        let staging = StagingArea::open(dir.path(), "s").unwrap();
+        let manifest = vec![ManifestEntry {
+            rel_path: "empty".to_owned(),
+            size: 0,
+            chunks: vec![],
+        }];
+        let plan = derive_resume_state(&manifest, dest_root.path(), &staging);
+        assert!(plan.files[0].is_complete());
     }
 }

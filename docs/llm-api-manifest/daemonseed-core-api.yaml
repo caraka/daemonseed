@@ -1908,7 +1908,57 @@ types:
       race-free); promote(final_rel) moves a completed file to `<root>/<final_rel>`
       no-clobber (first free name/name-N, suffix before extension); destroy() erases
       the whole area (integrity abort / post-completion). The reserved `.dspart`
-      component is refused by sanitize_rel_path.
+      component is refused by sanitize_rel_path. persist_manifest(manifest:
+      &[ManifestEntry]) stores the confirmed manifest (deterministic canonical
+      serialization) under the reserved `.dspart` component so no staged file can
+      collide with it; read_stored_manifest() -> Vec<ManifestEntry> reads it back,
+      fail-closed (missing/unparseable is a typed error, never a silent empty). A
+      resume verifies the stored copy via verify_stored_manifest before reuse.
+
+  - name: ManifestDigestStore
+    module: daemonseed_core::storage::manifest_digest
+    kind: struct
+    description: >-
+      A profile-local redb store mapping share_id to the confirmed manifest's
+      48-byte SHA-384 digest — the client's own trusted anchor a verified resume
+      checks the staging manifest against (DL-ISC-20), kept under the profile dir
+      (not the co-resident-writable downloads root). open(path); record_digest(
+      share_id, &[u8; 48]) inserts/replaces; get_digest(share_id) -> Option<[u8; 48]>
+      (Corrupt if a stored value is not 48 bytes); remove(share_id). The value is a
+      bare digest, unencrypted (integrity anchoring, not confidentiality). Table
+      `download-manifest-digests-v1`.
+
+  - name: DigestStoreError
+    module: daemonseed_core::storage::manifest_digest
+    kind: enum
+    description: Why a ManifestDigestStore operation failed.
+    variants:
+      - name: Db
+        description: "Db(Box<redb::Error>) — a redb storage/transaction/table error."
+      - name: Corrupt
+        description: >-
+          A stored value was not exactly 48 bytes — a corrupt store or an
+          incompatible-version value; fails closed rather than returning a
+          truncated digest.
+
+  - name: ResumePlan
+    module: daemonseed_core::storage::fetched
+    kind: struct
+    description: >-
+      A resume's per-file plan (files: Vec<FileResume>, one per manifest file in
+      order), produced by derive_resume_state. is_complete() (every file complete);
+      verified_chunk_count() / missing_chunk_count() (totals across files, feeding
+      resumed progress).
+
+  - name: FileResume
+    module: daemonseed_core::storage::fetched
+    kind: struct
+    description: >-
+      One file's resume state re-derived from bytes on disk: rel_path (the
+      placement-resolved on-disk path), size, total_chunks, verified (Vec<usize>
+      chunk indices that re-verify on disk, sorted), missing (Vec<usize> to
+      re-fetch, sorted). verified/missing partition 0..total_chunks as a SET (no
+      prefix assumption). is_complete() iff every chunk verified.
 
   - name: LiveFetchRegistry
     module: daemonseed_core::storage::fetched
@@ -4626,6 +4676,80 @@ functions:
     returns:
       type: "Result<Vec<PathBuf>, FetchedError>"
       description: The staging dirs deleted.
+
+  - name: manifest_digest
+    module: daemonseed_core::storage::fetched
+    description: >-
+      SHA-384 over a confirmed manifest's deterministic canonical serialization —
+      the 48-byte anchor recorded in a ManifestDigestStore and re-derived by a
+      resume (DL-ISC-20).
+    signature: "pub fn manifest_digest(manifest: &[ManifestEntry]) -> Result<[u8; MANIFEST_DIGEST_LEN], FetchedError>"
+    parameters:
+      - name: manifest
+        type: "&[ManifestEntry]"
+        direction: in
+        description: The confirmed manifest to digest.
+    returns:
+      type: "Result<[u8; 48], FetchedError>"
+      description: The 48-byte SHA-384 digest.
+      error_variants:
+        - name: Corrupt
+          condition: SHA-384's power-up self-test has not passed (never on a real download path).
+
+  - name: verify_stored_manifest
+    module: daemonseed_core::storage::fetched
+    description: >-
+      Verify a fetch's stored staging manifest against the profile-anchored digest,
+      FAIL-CLOSED (DL-ISC-20): read the staging copy, re-serialize + re-digest,
+      constant-time-compare to expected_digest, and return the parsed manifest ONLY
+      on a match. A tampered/swapped/missing staging manifest returns Err — a resume
+      MUST halt and re-gate on a fresh preview/confirm.
+    signature: "pub fn verify_stored_manifest(staging: &StagingArea, expected_digest: &[u8; MANIFEST_DIGEST_LEN]) -> Result<Vec<ManifestEntry>, FetchedError>"
+    parameters:
+      - name: staging
+        type: "&StagingArea"
+        direction: in
+        description: The fetch's staging area holding the persisted manifest.
+      - name: expected_digest
+        type: "&[u8; 48]"
+        direction: in
+        description: The profile-anchored digest (from ManifestDigestStore::get_digest).
+    returns:
+      type: "Result<Vec<ManifestEntry>, FetchedError>"
+      description: The verified confirmed manifest.
+      error_variants:
+        - name: Io
+          condition: No manifest was persisted (missing staging manifest).
+        - name: Corrupt
+          condition: The staging manifest is unparseable, or its digest does not match the anchor.
+
+  - name: derive_resume_state
+    module: daemonseed_core::storage::fetched
+    description: >-
+      Re-derive a resume plan from bytes on disk (DL-ISC-12): for each file, re-hash
+      each chunk region ([i*CHUNK_SIZE, min((i+1)*CHUNK_SIZE, size))) at both the
+      promoted final file (dest_root/<rel_path>) and the staged partial, counting a
+      chunk present iff either re-verifies against the stored content address
+      (per-chunk SET semantics, no prefix). Mismatched/short/sparse/unreadable
+      chunks are missing (re-fetch); an all-verified file is complete. Entries must
+      carry the placement-resolved on-disk rel_path.
+    signature: "pub fn derive_resume_state(manifest: &[ManifestEntry], dest_root: &Path, staging: &StagingArea) -> ResumePlan"
+    parameters:
+      - name: manifest
+        type: "&[ManifestEntry]"
+        direction: in
+        description: The confirmed manifest, entries keyed by placement-resolved on-disk rel_path.
+      - name: dest_root
+        type: "&Path"
+        direction: in
+        description: The destination root a promoted file lives under.
+      - name: staging
+        type: "&StagingArea"
+        direction: in
+        description: The fetch's staging area holding partials.
+    returns:
+      type: "ResumePlan"
+      description: Per-file verified/missing chunk sets (never errors — unreadable bytes read as missing).
 
   # ── indexer ─────────────────────────────────────────────────────────
   - name: Indexer::cold_scan

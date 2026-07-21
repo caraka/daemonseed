@@ -397,13 +397,17 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("DL-ISC-8", IscClass::Positive), // ConfirmFetch carries the selection roots + placement is a function of them: a scattered selection lands each root top-level, a one-file folder keeps its folder
     ("DL-ISC-13", IscClass::Negative), // anti: an integrity failure destroys every staged partial, keeps promoted files, sets the durable poison flag, never parks a retry, never marks Unresolved, is never resumed past
     ("DL-ISC-14", IscClass::Positive), // a panicking download worker still yields a terminal outcome (JoinError → terminal LocalFailed) and leaves only staged (quarantined) state
+    // Verified resume — fail-closed CORE (step 8a). Unit probes in
+    // daemonseed-core::storage::fetched (stored manifest + digest + re-derivation).
+    ("DL-ISC-12", IscClass::Positive), // a resume re-fetches only missing/unverified chunks; every retained byte re-verifies against its content address before reuse (per-chunk SET semantics, no prefix)
+    ("DL-ISC-20", IscClass::Negative), // anti: the stored staging manifest is used only after verifying against the profile-anchored digest; a tampered/swapped/missing manifest halts the resume
 ];
 
 /// Total built, non-deferred ISCs tracked by this registry — the SINGLE source
 /// of truth for the coverage denominator, read live by `xtask isc-coverage`.
 /// Recount on every ISC add/remove (the `const _` assert below guards it
 /// against [`ISCS`]).
-pub const TOTAL: usize = 237;
+pub const TOTAL: usize = 239;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -627,13 +631,16 @@ mod tests {
         //                                  DL-ISC-8 pos + DL-ISC-14 pos + DL-ISC-13
         //                                  neg (step 5 GUI engine adoption:
         //                                  selection-root placement, panic seam,
-        //                                  integrity-abort fold) —
+        //                                  integrity-abort fold); DL-ISC-12 pos +
+        //                                  DL-ISC-20 neg (step 8a verified-resume
+        //                                  core: stored-manifest digest binding +
+        //                                  re-derivation) —
         //                                  the DL-ISC-* family registers per build step.
-        //   total   157 pos + 80 neg = 237
+        //   total   158 pos + 81 neg = 239
         //   (the v0.33.0 Veilid cutover retired 14 server-positive + 10
         //    server-negative relay/TLS/federation/rate-limit ISCs.)
-        assert_eq!(pos, 157, "positive count drift");
-        assert_eq!(neg, 80, "negative count drift");
+        assert_eq!(pos, 158, "positive count drift");
+        assert_eq!(neg, 81, "negative count drift");
     }
 
     /// COVERED is single-sourced and must agree with the per-milestone
