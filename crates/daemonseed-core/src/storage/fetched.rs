@@ -428,57 +428,15 @@ fn sanitize_rel_path(rel: &str) -> Result<PathBuf, FetchedError> {
     Ok(safe)
 }
 
-/// Rebase a fetch's selected share-relative paths so the *thing the user
-/// selected* becomes the top-level entry under their chosen destination
-/// (ISC-C68 layout). Used only for an explicit user-chosen dest — the managed
-/// downloads dir keeps its namespaced `<share>/<rel_path>` layout.
-///
-/// The rule, derived from two pinned expectations:
-///  - **Exactly one file** → its basename. Picking a single file drops it
-///    directly in the dest, never recreating its share-internal folders.
-///  - **Many files** → drop the longest common leading path prefix *minus its
-///    last component*, i.e. keep the deepest directory common to the whole
-///    selection as the top entry and preserve everything below it. Selecting an
-///    `Artist/Album` folder lands `Album/<tracks…>`, not `Artist/Album/<tracks…>`.
-///
-/// Inputs are `/`-separated wire paths; outputs are `/`-separated and still
-/// strictly relative (only leading components are dropped), so the per-file
-/// `sanitize_rel_path` guard at write time remains the traversal authority.
-pub fn rebase_to_selection_root(rel_paths: &[&str]) -> Vec<String> {
-    match rel_paths {
-        [] => Vec::new(),
-        [only] => vec![only.rsplit('/').next().unwrap_or(only).to_owned()],
-        _ => {
-            let split: Vec<Vec<&str>> = rel_paths.iter().map(|p| p.split('/').collect()).collect();
-            let min_len = split.iter().map(Vec::len).min().unwrap_or(0);
-            // Longest run of leading components shared by every path.
-            let mut common: usize = 0;
-            'outer: for i in 0..min_len {
-                let head = split[0][i];
-                for s in &split[1..] {
-                    if s[i] != head {
-                        break 'outer;
-                    }
-                }
-                common += 1;
-            }
-            // Keep the deepest shared directory: drop all but its last component.
-            let drop = common.saturating_sub(1);
-            split.iter().map(|c| c[drop..].join("/")).collect()
-        }
-    }
-}
-
 // ── Placement as a stated total function (download-subsystem redesign, step 4a) ──
 //
-// The old `rebase_to_selection_root` GUESSES the user's intent from path shapes
-// (longest common prefix), which discards the actual selection: a folder holding
-// exactly one file collapses to the bare filename, and a scattered selection
-// recreates the full share-internal ancestry. The fix is at ingestion — carry the
-// user's *selection roots* (the tree nodes actually toggled, ISC-C72) and make
-// placement a total function of them (design `docs/design/download-subsystem.md`
-// §Part 2). This is the user-chosen-dest layout; the managed downloads dir keeps
-// the full `<share-folder>/<rel_path>` layout (`record_share`).
+// Placement for a user-chosen dest is a total function of the user's *selection
+// roots* — the tree nodes the user toggled (ISC-C72) — carried through
+// `ConfirmFetch` and resolved by `place_at_dest` (design
+// `docs/design/download-subsystem.md` §Part 2), NOT guessed from the selected
+// paths' shapes (which cannot recover a one-file folder or a scattered selection).
+// The managed downloads dir keeps the full `<share-folder>/<rel_path>` layout
+// (`record_share`).
 
 /// A node the user toggled in the fetch-preview tree — the unit "placement is a
 /// function of" (ISC-C72). Share-relative, `/`-separated wire paths.
@@ -759,6 +717,39 @@ fn reserve_no_clobber_target(intended: &Path) -> Result<PathBuf, FetchedError> {
     }
 }
 
+/// True iff `existing` is present and byte-for-byte identical to `candidate` — the
+/// "own artifact" test (DL-ISC-21 / F4): a pre-existing file whose content matches
+/// what this download produced (the verified staged bytes = the confirmed manifest)
+/// is this download's own prior copy, safe to keep in place rather than
+/// collision-suffix. A missing `existing`, a non-file, a size mismatch, or any
+/// differing byte returns `false` — the caller then reserves a no-clobber slot.
+/// Streams a bounded buffer, so a large file never loads whole into memory.
+fn files_have_identical_content(existing: &Path, candidate: &Path) -> Result<bool, FetchedError> {
+    let (em, cm) = match (std::fs::metadata(existing), std::fs::metadata(candidate)) {
+        (Ok(em), Ok(cm)) => (em, cm),
+        _ => return Ok(false),
+    };
+    if !em.is_file() || em.len() != cm.len() {
+        return Ok(false);
+    }
+    use std::io::Read;
+    let mut fe = std::io::BufReader::new(std::fs::File::open(existing)?);
+    let mut fc = std::io::BufReader::new(std::fs::File::open(candidate)?);
+    let mut be = [0u8; 64 * 1024];
+    let mut bc = [0u8; 64 * 1024];
+    let mut remaining = em.len();
+    while remaining > 0 {
+        let n = (remaining as usize).min(be.len());
+        fe.read_exact(&mut be[..n])?;
+        fc.read_exact(&mut bc[..n])?;
+        if be[..n] != bc[..n] {
+            return Ok(false);
+        }
+        remaining -= n as u64;
+    }
+    Ok(true)
+}
+
 /// A fetch's reserved staging area under a destination root:
 /// `<root>/.dspart/<share_id>/<final-rel>`. Chunks are written verified at their
 /// offsets ([`write_verified_chunk`](Self::write_verified_chunk)); a completed
@@ -840,15 +831,29 @@ impl StagingArea {
     }
 
     /// Promote a completed staging file to its final path under the destination
-    /// root, never overwriting a pre-existing unrelated file (DL-ISC-21): the
-    /// target is the first free `name`/`name-N` slot. Returns the final path.
-    /// The caller promotes only once every chunk of the file has verified and the
-    /// size matches the confirmed manifest.
+    /// root. Returns the final path. The caller promotes only once every chunk of
+    /// the file has verified and the size matches the confirmed manifest.
+    ///
+    /// Own-artifact recognition (DL-ISC-21 / F4): if the intended path already holds
+    /// a BYTE-IDENTICAL copy — this download's own prior promote, or a re-fetch of
+    /// unchanged content — the existing file is kept in place and the redundant
+    /// staged copy dropped (no suffix, so a re-download never orphans the fresh bytes
+    /// at `name-2` while an idx still names `name`). A pre-existing file with
+    /// DIFFERENT bytes is NOT this download's artifact and is never overwritten — the
+    /// promote lands at the first free `name`/`name-N` slot instead.
     pub fn promote(&self, final_rel: &str) -> Result<PathBuf, FetchedError> {
         let staging = self.staging_path(final_rel)?;
         let intended = self.root.join(sanitize_rel_path(final_rel)?);
         if let Some(parent) = intended.parent() {
             std::fs::create_dir_all(parent)?;
+        }
+        // A byte-identical pre-existing file IS this download's own artifact (its
+        // bytes match the confirmed manifest): keep it and drop the redundant staged
+        // copy. Otherwise reserve a no-clobber slot so an unrelated file is never
+        // overwritten (DL-ISC-21).
+        if files_have_identical_content(&intended, &staging)? {
+            std::fs::remove_file(&staging)?;
+            return Ok(intended);
         }
         let target = reserve_no_clobber_target(&intended)?;
         std::fs::rename(&staging, &target)?;
@@ -1505,69 +1510,6 @@ mod tests {
         }
     }
 
-    /// ISC-C68 layout — a single selected file lands as its bare basename, no
-    /// matter how deep it sat in the share.
-    #[test]
-    fn rebase_single_file_is_basename() {
-        assert_eq!(
-            rebase_to_selection_root(&["Music/Artist/Album/track.mp3"]),
-            vec!["track.mp3".to_owned()]
-        );
-        // A file already at the share root is unchanged.
-        assert_eq!(
-            rebase_to_selection_root(&["song.flac"]),
-            vec!["song.flac".to_owned()]
-        );
-    }
-
-    /// ISC-C68 layout — selecting a folder keeps the deepest folder common to
-    /// the selection as the top entry (`Album/…`), dropping its ancestors and
-    /// preserving structure below it.
-    #[test]
-    fn rebase_folder_keeps_deepest_common_dir() {
-        let out = rebase_to_selection_root(&[
-            "Music/Artist/Album/01.mp3",
-            "Music/Artist/Album/02.mp3",
-            "Music/Artist/Album/disc2/03.mp3",
-        ]);
-        assert_eq!(
-            out,
-            vec![
-                "Album/01.mp3".to_owned(),
-                "Album/02.mp3".to_owned(),
-                "Album/disc2/03.mp3".to_owned(),
-            ]
-        );
-    }
-
-    /// A messy multi-album selection keeps their shared parent (`Artist/…`) so
-    /// the two albums stay disambiguated under the dest.
-    #[test]
-    fn rebase_disjoint_selection_keeps_shared_parent() {
-        let out =
-            rebase_to_selection_root(&["Music/Artist/AlbumA/01.mp3", "Music/Artist/AlbumB/01.mp3"]);
-        assert_eq!(
-            out,
-            vec![
-                "Artist/AlbumA/01.mp3".to_owned(),
-                "Artist/AlbumB/01.mp3".to_owned(),
-            ]
-        );
-    }
-
-    /// Files sharing no leading directory land directly under the dest, each
-    /// keeping its own top folder (nothing to strip).
-    #[test]
-    fn rebase_no_common_prefix_is_untouched() {
-        let out = rebase_to_selection_root(&["a/x.txt", "b/y.txt"]);
-        assert_eq!(out, vec!["a/x.txt".to_owned(), "b/y.txt".to_owned()]);
-    }
-
-    #[test]
-    fn rebase_empty_selection_is_empty() {
-        assert!(rebase_to_selection_root(&[]).is_empty());
-    }
-
     // ── place_at_dest — the selection-root total function (step 4a, DL-ISC-7/18) ──
 
     fn dests(placed: &[PlacedFile]) -> Vec<String> {
@@ -1588,8 +1530,7 @@ mod tests {
     }
 
     /// DL-ISC-7: a folder holding exactly ONE file keeps its folder (the reproduced
-    /// case the old shape-guessing `rebase_to_selection_root` collapsed to a bare
-    /// filename).
+    /// case that shape-guessing from the selected paths collapsed to a bare filename).
     #[test]
     fn place_one_file_folder_keeps_its_folder() {
         let placed = place_at_dest(
@@ -1598,11 +1539,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(dests(&placed), vec!["Album/only.mp3".to_owned()]);
-        // Contrast: the legacy shape-guesser collapsed this to the bare basename.
-        assert_eq!(
-            rebase_to_selection_root(&["Music/Artist/Album/only.mp3"]),
-            vec!["only.mp3".to_owned()]
-        );
     }
 
     /// DL-ISC-7: a scattered selection (two folders from different parents) lands
@@ -1785,6 +1721,32 @@ mod tests {
             "untouched"
         );
         assert_eq!(std::fs::read(&final_path).unwrap(), b"NEW");
+    }
+
+    /// (F4 / DL-ISC-21) Promoting onto a byte-IDENTICAL pre-existing file (this
+    /// download's own prior copy, or a re-fetch of unchanged content) keeps it in
+    /// place — no `name-2` orphan — and drops the redundant staged copy. Contrast the
+    /// DIFFERENT-content case above, which collision-suffixes.
+    #[test]
+    fn promote_recognizes_an_identical_preexisting_own_artifact() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("track.mp3"), b"SAME-BYTES").unwrap();
+
+        let staging = StagingArea::open(root, "share-own").unwrap();
+        staging.preallocate("track.mp3", 10).unwrap();
+        staging
+            .write_verified_chunk("track.mp3", 0, b"SAME-BYTES")
+            .unwrap();
+        let final_path = staging.promote("track.mp3").unwrap();
+
+        assert_eq!(
+            final_path,
+            root.join("track.mp3"),
+            "own artifact kept in place — no suffix"
+        );
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"SAME-BYTES");
+        assert!(!root.join("track-2.mp3").exists(), "no orphaned duplicate");
     }
 
     /// The integrity-abort disposition: `destroy` erases the whole staging area

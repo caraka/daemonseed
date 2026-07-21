@@ -455,11 +455,11 @@ modules:
       no CAS layer, no hex filenames, no `.rc` sidecars) + `<root>/downloads.idx`.
       Because files land under real names at fetch time there is no separate
       "extract" step — the browse pane shows the folder directly. A user-chosen
-      destination (ISC-C68) instead writes the selection rebased to its own root
-      via `rebase_to_selection_root` (one file -> basename; a folder -> deepest
-      common dir kept, ancestors dropped), flat under the dest with no per-share
-      folder and no `downloads.idx`; the namespaced layout above is the managed
-      downloads dir only. At-rest posture
+      destination (ISC-C68) instead places the selection under its own root via
+      `place_at_dest` (a File root -> its basename; a Dir root keeps its own name +
+      subpath; the whole-share root -> full rel_paths), flat under the dest with no
+      per-share folder and no `downloads.idx`; the namespaced layout above is the
+      managed downloads dir only. At-rest posture
       is plaintext by design — fetched files are user-chosen explicit downloads,
       not message/post/session history (no-client-history invariant intact); this
       is the R-PANIC erasure target. Manifest encryption rejected as theatre while
@@ -4633,8 +4633,7 @@ functions:
       duplicates dropped); a File root -> its basename, a Dir root keeps its own
       name + subpath (arrives whole), the whole-share root -> full rel_paths;
       between-roots basename collisions suffix the later root (name-2). Every
-      computed dest-relative path passes the traversal guard as one unit. Replaces
-      the shape-guessing rebase_to_selection_root.
+      computed dest-relative path passes the traversal guard as one unit.
     signature: "pub fn place_at_dest(roots: &[SelectionRoot], selected_files: &[&str]) -> Result<Vec<PlacedFile>, FetchedError>"
     parameters:
       - name: roots

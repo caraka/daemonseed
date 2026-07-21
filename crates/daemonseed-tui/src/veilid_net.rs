@@ -2439,9 +2439,10 @@ fn confirm_outcome_from(
 /// (download-subsystem redesign, step 6 / DL-ISC-8) Compute the placement selection roots from the
 /// selection kind + the selected files' share `rel_path`s. `Share` → the whole-share root; `File`
 /// → the single selected file; `Dir` → the selected files' common parent-directory prefix (so a
-/// scattered selection collapses to its shared ancestor, replacing the old shape-guessing
-/// `rebase_to_selection_root`). `place_at_dest` then lands each root per the ratified placement
-/// table. Mirrors the GUI's `selection_roots`.
+/// scattered selection collapses to its shared ancestor). `place_at_dest` then lands each root per
+/// the ratified placement table. The GUI's `selection_roots` instead carries the toggled folder's
+/// path (F5); the TUI's cardinality-derived selection has no toggled node, so the common prefix is
+/// its best available root.
 fn selection_roots(root_kind: RootKind, selected_rels: &[&str]) -> Vec<SelectionRoot> {
     match root_kind {
         RootKind::Share => vec![SelectionRoot::Dir(String::new())],

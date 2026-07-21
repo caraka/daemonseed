@@ -3150,12 +3150,13 @@ fn spawn_confirm_task<F, Fut>(
     });
 }
 
-/// (download-subsystem redesign, step 5 / DL-ISC-8) Compute the placement selection roots from
-/// the toggled node kind + the selected files' share `rel_path`s. `Share` → the whole-share
-/// root; `File` → the single selected file; `Dir` → the selected files' common parent-directory
-/// prefix (so a one-file folder keeps its folder, the reproduced defect the design fixes).
-/// `place_at_dest` then lands each root per the ratified placement table.
-fn selection_roots(root_kind: crate::net::RootKind, selected_rels: &[&str]) -> Vec<SelectionRoot> {
+/// (download-subsystem redesign, step 5 / DL-ISC-8, F5) Compute the placement selection roots from
+/// the toggled node. `Share` → the whole-share root; `File` → the single selected file; `Dir` →
+/// the toggled folder's OWN manifest-relative path (carried on `RootKind::Dir`, NOT derived from
+/// the selected files' shape — so a folder whose contents nest deeper keeps its own name instead
+/// of collapsing to the deeper common prefix). `place_at_dest` then lands each root per the
+/// ratified placement table.
+fn selection_roots(root_kind: &crate::net::RootKind, selected_rels: &[&str]) -> Vec<SelectionRoot> {
     match root_kind {
         crate::net::RootKind::Share => vec![SelectionRoot::Dir(String::new())],
         crate::net::RootKind::File => match selected_rels.first() {
@@ -3163,37 +3164,8 @@ fn selection_roots(root_kind: crate::net::RootKind, selected_rels: &[&str]) -> V
             // Defensive: a File selection with no concrete file falls back to the whole share.
             None => vec![SelectionRoot::Dir(String::new())],
         },
-        crate::net::RootKind::Dir => vec![SelectionRoot::Dir(common_prefix_dir(selected_rels))],
+        crate::net::RootKind::Dir(path) => vec![SelectionRoot::Dir(path.clone())],
     }
-}
-
-/// The common parent-directory prefix of a set of share `rel_path`s (`/`-separated), used as the
-/// `Dir` selection root for a folder selection (DL-ISC-8). Each path's parent (everything before
-/// its last `/`) is taken, then their longest common leading component run — so a one-file folder
-/// keeps its folder (`a/b/only.mp3` → `a/b`), and scattered files under a shared ancestor collapse
-/// to it (`a/b/1`, `a/c/2` → `a`). An empty result is the share root.
-fn common_prefix_dir(rels: &[&str]) -> String {
-    let dirs: Vec<Vec<&str>> = rels
-        .iter()
-        .map(|p| {
-            let mut comps: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
-            comps.pop(); // drop the filename component; keep only the directory path
-            comps
-        })
-        .collect();
-    let Some((first, rest)) = dirs.split_first() else {
-        return String::new();
-    };
-    let mut common = first.clone();
-    for d in rest {
-        let n = common
-            .iter()
-            .zip(d.iter())
-            .take_while(|(a, b)| a == b)
-            .count();
-        common.truncate(n);
-    }
-    common.join("/")
 }
 
 /// (download-subsystem redesign, step 5) Resolve the managed downloads-dir folder for a share,
@@ -3316,9 +3288,19 @@ async fn run_confirm_download(
     let (dest_root, managed_folder): (PathBuf, Option<String>) = if flat_dest {
         (fetched_root.clone(), None)
     } else {
-        let existing = FetchedStore::open(&fetched_root)
-            .and_then(|s| s.list_shares())
-            .unwrap_or_default();
+        // (F3) Fail closed on an idx read error — mirror the TUI (its step-6 Fix #1).
+        // `.unwrap_or_default()` would treat a transient or corrupt read as "no shares",
+        // so `resolve_share_folder` could neither reuse this share's real folder on a
+        // re-fetch nor detect a collision with another share, silently mis-resolving the
+        // managed folder (and orphaning or conflating downloads).
+        let existing = match FetchedStore::open(&fetched_root).and_then(|s| s.list_shares()) {
+            Ok(shares) => shares,
+            Err(e) => {
+                return ConfirmOutcome::LocalFailed {
+                    message: format!("could not read the downloads index: {e}"),
+                };
+            }
+        };
         let folder = resolve_share_folder(&existing, &share_id, &name);
         (fetched_root.join(&folder), Some(folder))
     };
@@ -3342,7 +3324,7 @@ async fn run_confirm_download(
             .map(|&i| source[i].rel_path.as_str())
             .collect();
         if flat_dest {
-            let roots = selection_roots(root_kind, &sel_rels);
+            let roots = selection_roots(&root_kind, &sel_rels);
             let placed =
                 place_at_dest(&roots, &sel_rels).map_err(|e| ConfirmOutcome::LocalFailed {
                     message: format!("could not place the download under the chosen folder: {e}"),
@@ -6145,48 +6127,41 @@ mod tests {
         }
     }
 
-    /// (download-subsystem redesign, step 5 / DL-ISC-8) `selection_roots` maps the toggled node
-    /// kind to placement roots: a share → the whole-share root; a file → that one file; a folder
-    /// → the selected files' common parent-directory prefix (a one-file folder keeps its folder).
+    /// (download-subsystem redesign, step 5 / DL-ISC-8, F5) `selection_roots` maps the toggled node
+    /// to placement roots: a share → the whole-share root; a file → that one file; a folder → the
+    /// toggled folder's OWN path (carried on `RootKind::Dir`), so a folder whose contents nest
+    /// deeper keeps its own name rather than collapsing to the deeper common prefix.
     #[test]
     fn selection_roots_map_node_kind_to_placement_roots() {
         use daemonseed_core::storage::fetched::SelectionRoot;
 
         // Share → whole-share root, regardless of the selected rels.
         assert_eq!(
-            selection_roots(crate::net::RootKind::Share, &["a/1.txt", "b/2.txt"]),
+            selection_roots(&crate::net::RootKind::Share, &["a/1.txt", "b/2.txt"]),
             vec![SelectionRoot::Dir(String::new())]
         );
         // File → the single selected file.
         assert_eq!(
-            selection_roots(crate::net::RootKind::File, &["Artist/Album/song.mp3"]),
+            selection_roots(&crate::net::RootKind::File, &["Artist/Album/song.mp3"]),
             vec![SelectionRoot::File("Artist/Album/song.mp3".to_owned())]
         );
-        // Dir, one-file folder → keeps the folder (the reproduced defect the design fixes).
-        assert_eq!(
-            selection_roots(crate::net::RootKind::Dir, &["Artist/Album/only.mp3"]),
-            vec![SelectionRoot::Dir("Artist/Album".to_owned())]
-        );
-        // Dir, scattered files under a shared ancestor → collapse to it.
+        // Dir → the toggled folder itself, carried verbatim (the selected rels do not shape it).
         assert_eq!(
             selection_roots(
-                crate::net::RootKind::Dir,
+                &crate::net::RootKind::Dir("Artist".to_owned()),
                 &["Artist/A/1.mp3", "Artist/B/2.mp3"]
             ),
             vec![SelectionRoot::Dir("Artist".to_owned())]
         );
-    }
-
-    /// `common_prefix_dir` takes the longest common PARENT-dir component run (never the filename),
-    /// so a lone file keeps its directory and unrelated tops collapse to the share root.
-    #[test]
-    fn common_prefix_dir_is_the_parent_directory_prefix() {
-        assert_eq!(common_prefix_dir(&["a/b/c.txt"]), "a/b");
-        assert_eq!(common_prefix_dir(&["a/b/1", "a/b/2"]), "a/b");
-        assert_eq!(common_prefix_dir(&["a/b/1", "a/c/2"]), "a");
-        assert_eq!(common_prefix_dir(&["top.txt"]), "");
-        assert_eq!(common_prefix_dir(&["x/1", "y/2"]), "");
-        assert_eq!(common_prefix_dir(&[]), "");
+        // A folder whose sole file nests deeper keeps the FOLDER, not the deeper prefix (F5 — the
+        // defect: common_prefix would have dropped `Music`, landing `Beethoven/…`).
+        assert_eq!(
+            selection_roots(
+                &crate::net::RootKind::Dir("Music".to_owned()),
+                &["Music/Beethoven/Symphony5.mp3"]
+            ),
+            vec![SelectionRoot::Dir("Music".to_owned())]
+        );
     }
 
     /// (DL-ISC-13) The fold of an `IntegrityFailed` outcome sets the durable poison flag and emits

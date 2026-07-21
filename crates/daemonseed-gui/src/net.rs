@@ -231,14 +231,17 @@ pub enum NetCommand {
 /// `ConfirmFetch` targets — which tree node the user actually toggled, carried so
 /// placement is a function of the selection (not guessed from path shapes). An
 /// in-process `NetCommand` field only (main ↔ actor mpsc); never on the wire.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RootKind {
     /// The share root — the whole share (every file), `selected: None`.
     Share,
     /// A single selected file (`selected: Some([one index])`).
     File,
-    /// A selected directory subtree (`selected: Some([its descendant indices])`).
-    Dir,
+    /// A selected directory subtree — carries the toggled folder's own
+    /// manifest-relative path, so placement keeps that folder even when its
+    /// contents nest deeper (a folder must NOT collapse to the common descendant
+    /// prefix — F5 / DL-ISC-8). `selected: Some([its descendant indices])`.
+    Dir(String),
 }
 
 /// An event from the network actor to the UI thread.

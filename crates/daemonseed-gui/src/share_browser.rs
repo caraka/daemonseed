@@ -371,19 +371,20 @@ impl ShareBrowser {
                     root_kind: crate::net::RootKind::Share,
                 });
             }
-            if let Some((is_dir, indices)) = indices_under(&share.children, id) {
+            if let Some((dir_path, indices)) = indices_under(&share.children, id, "") {
                 return Some(FetchTarget {
                     share_id: share.share_id.clone(),
                     name: share.name.clone(),
                     selected: Some(indices),
-                    // A folder subtree → Dir; a single file → File (DL-ISC-8): the
-                    // placement resolver treats a one-file folder (Dir) differently
-                    // from that same file selected alone (File), so the node kind —
-                    // not the index count — is authoritative.
-                    root_kind: if is_dir {
-                        crate::net::RootKind::Dir
-                    } else {
-                        crate::net::RootKind::File
+                    // A folder subtree → Dir carrying the toggled folder's OWN path;
+                    // a single file → File (DL-ISC-8). The placement resolver treats a
+                    // one-file folder (Dir) differently from that same file selected
+                    // alone (File), and the carried path keeps the toggled folder even
+                    // when its files nest deeper (F5) — the node, not a derived prefix,
+                    // is authoritative.
+                    root_kind: match dir_path {
+                        Some(path) => crate::net::RootKind::Dir(path),
+                        None => crate::net::RootKind::File,
                     },
                 });
             }
@@ -392,23 +393,31 @@ impl ShareBrowser {
     }
 }
 
-/// If `id` names a node within `level`, return `(is_dir, manifest indices)`: a file
-/// → `(false, [its index])`; a folder → `(true, all descendant file indices in tree
-/// order)`. `None` if the id is not in this subtree. The `is_dir` flag lets
-/// `fetch_target` set the selection [`crate::net::RootKind`] — a one-file folder
-/// stays a `Dir`, distinct from that file selected alone.
-fn indices_under(level: &[Node], id: u64) -> Option<(bool, Vec<usize>)> {
+/// If `id` names a node within `level`, return `(dir_path, manifest indices)`: a
+/// file → `(None, [its index])`; a folder → `(Some(<its full manifest-relative
+/// path>), all descendant file indices in tree order)`. `None` if the id is not in
+/// this subtree. `prefix` is the accumulated ancestor-directory path (`""` at the
+/// share root). The returned dir path lets `fetch_target` carry the toggled folder
+/// itself into `RootKind::Dir` — a one-file folder keeps its folder, and a folder
+/// whose files nest deeper keeps its own name rather than collapsing to the deeper
+/// common prefix (F5 / DL-ISC-8).
+fn indices_under(level: &[Node], id: u64, prefix: &str) -> Option<(Option<String>, Vec<usize>)> {
     for node in level {
         match node {
-            Node::File(file) if file.id == id => return Some((false, vec![file.manifest_index])),
+            Node::File(file) if file.id == id => return Some((None, vec![file.manifest_index])),
             Node::File(_) => {}
             Node::Dir(dir) => {
+                let dir_path = if prefix.is_empty() {
+                    dir.name.clone()
+                } else {
+                    format!("{prefix}/{}", dir.name)
+                };
                 if dir.id == id {
                     let mut acc = Vec::new();
                     collect_file_indices(&dir.children, &mut acc);
-                    return Some((true, acc));
+                    return Some((Some(dir_path), acc));
                 }
-                if let Some(found) = indices_under(&dir.children, id) {
+                if let Some(found) = indices_under(&dir.children, id, &dir_path) {
                     return Some(found);
                 }
             }
@@ -812,8 +821,7 @@ mod tests {
 
     #[test]
     fn fetch_target_for_a_folder_is_all_its_descendant_files() {
-        let (b, _) = loaded_share();
-        // expand reports so its id is reachable, then target it.
+        let (mut b, _) = loaded_share();
         let reports = b.rows().iter().find(|r| r.label == "reports").unwrap().id;
         let t = b.fetch_target(reports).expect("folder resolves");
         // reports/ holds q3.pdf (idx 0) and img/chart.png (idx 1) — both descendants.
@@ -821,7 +829,20 @@ mod tests {
         got.sort_unstable();
         assert_eq!(got, vec![0, 1], "folder pulls every descendant file");
         assert_eq!(t.share_id, "id-a");
-        assert_eq!(t.root_kind, crate::net::RootKind::Dir);
+        // (F5) The toggled folder carries its OWN manifest-relative path.
+        assert_eq!(t.root_kind, crate::net::RootKind::Dir("reports".to_owned()));
+
+        // Expand `reports` so the nested `img` folder is a reachable row, then target
+        // it: its FULL path accumulates to `reports/img` (not the bare leaf `img`) —
+        // path accumulation is what keeps a nested folder's own place (F5).
+        b.toggle(reports);
+        let img = b.rows().iter().find(|r| r.label == "img").unwrap().id;
+        let ti = b.fetch_target(img).expect("nested folder resolves");
+        assert_eq!(ti.selected, Some(vec![1]), "img holds chart.png (idx 1)");
+        assert_eq!(
+            ti.root_kind,
+            crate::net::RootKind::Dir("reports/img".to_owned())
+        );
     }
 
     #[test]

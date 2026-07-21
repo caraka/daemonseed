@@ -310,8 +310,8 @@ pub enum NetCommand {
 
 /// (download-subsystem redesign, step 6 / DL-ISC-8) The kind of selection root a
 /// `ConfirmFetch` targets — carried so a user-chosen-dest placement is a function
-/// of the selection, not guessed from path shapes (replacing the old
-/// `rebase_to_selection_root`). Mirrors the GUI's `net::RootKind`. The TUI preview
+/// of the selection, not guessed from path shapes. Analogous to the GUI's
+/// `net::RootKind` (which carries the toggled folder's path); the TUI preview
 /// is a flat manifest-row list, so the binary derives the kind from the confirmed
 /// selection: none selected → `Share`, one row → `File`, several → `Dir`. Drives
 /// `veilid_net::selection_roots`. An in-process `NetCommand` field only, never on
