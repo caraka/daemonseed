@@ -73,7 +73,6 @@
 //! already echoed them on Enter).
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -106,22 +105,21 @@ use daemonseed_core::share_announce::{
     open_announcement, seal_public_announcement, share_binding_is_valid,
 };
 use daemonseed_core::share_catalog::{CatalogChange, ShareCatalog, ShareListing};
-use daemonseed_core::share_envelope::ManifestEntry;
 use daemonseed_core::share_serve::ShareContent;
+use daemonseed_core::storage::cas::ChunkAddr;
 use daemonseed_core::storage::fetched::{
-    FetchedFile, FetchedShare, FetchedStore, rebase_to_selection_root,
+    FetchedFile, FetchedStore, LiveFetchRegistry, SelectionRoot, StagingArea, place_at_dest,
 };
+use daemonseed_veilid_net::download::{DownloadOutcome, PlannedFile, run_download};
 use daemonseed_veilid_net::{
-    DiscoveryEnvelope, PresenceBoundary, RecordKey, RouteId, VeilidNet, VeilidNetConfig,
-    VeilidNetError, VeilidNetEvent, VeilidNetHandle, next_resweep_seed, verify_route_advert,
+    DiscoveryEnvelope, PresenceBoundary, RecordKey, RouteBudget, RouteId, SharerKey, VeilidNet,
+    VeilidNetConfig, VeilidNetError, VeilidNetEvent, VeilidNetHandle, next_resweep_seed,
+    verify_route_advert,
 };
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::app::IndexerStatus;
-use crate::net::{
-    NetCommand, NetEvent, ShareManifestEntry, cleanup_written, render_downloads_idx,
-    resolve_share_folder, sanitize_rel_path,
-};
+use crate::net::{NetCommand, NetEvent, RootKind, ShareManifestEntry, resolve_share_folder};
 
 /// Reported for [`NetEvent::Connected::version`]: the Veilid transport carries
 /// no negotiated wire version (unlike the relay's APP_HELLO handshake), so we
@@ -173,10 +171,15 @@ struct LobbyRendezvous {
 }
 
 /// A discovered share's anti-swap-verified route: the sharer's opaque Veilid
-/// private-route blob, kept so a fetch can `import_route` it. The announcer pubkey
-/// the route was verified against lives in the catalog entry.
+/// private-route blob, kept so a fetch can `import_route` it.
 struct DiscoveredRoute {
     route_blob: Vec<u8>,
+    /// (#156 / download-subsystem redesign, step 6) The verified announcer pubkey
+    /// this share's route was authenticated against (the accepted announcement's
+    /// `sender_pubkey`), copied out at fetch time as the [`SharerKey`] the per-route
+    /// budget keys its learned ceiling by — so a route rotation (fresh `RouteId`,
+    /// same sharer) does not discard the protective backoff memory (DL-ISC-2).
+    sender_pubkey: Vec<u8>,
     /// (#180 §RS-1.4) A strictly-increasing generation stamped on every accepted advert
     /// fold for this share (from [`ShareState::next_generation`]). A parked browse retry
     /// captures this at fetch-fail time; a later fold bumps it strictly above the parked
@@ -246,6 +249,21 @@ struct ShareState {
     /// (#180 §RS-3) Imported routes the guard has cleared for release, drained and released
     /// (spawned) by the actor loop each iteration.
     pending_route_releases: Vec<RouteId>,
+    /// (download-subsystem redesign, step 6, Part 1) The ONE session-lifetime per-route
+    /// concurrency budget every download leases from — the learned-ceiling map is
+    /// session-scoped by design, so this is held here (not per-download) and shared with
+    /// each spawned worker via a cheap `Arc` clone.
+    budget: Arc<RouteBudget<RouteId>>,
+    /// (download-subsystem redesign, step 6, Part 3) In-flight/resuming fetches, so a future
+    /// startup/idle staging sweep never reclaims a live download's staging. Cheap to clone;
+    /// each worker holds a registration guard for its lifetime.
+    live_fetches: LiveFetchRegistry,
+    /// (download-subsystem redesign, step 6 / DL-ISC-13) Shares flagged after an integrity
+    /// failure (`share_id`). Durable within the session, independent of the discovery
+    /// lifecycle — set by the `IntegrityFailed` fold. Per-chunk SHA-384 verification
+    /// (ISC-A-S20) is the always-on enforcement; this flag is the UX guard that a user
+    /// re-download of a poisoned share is warned about.
+    poisoned_shares: HashSet<String>,
 }
 
 impl ShareState {
@@ -263,6 +281,9 @@ impl ShareState {
             prev_presence_stale: false,
             route_guard: ImportedRouteGuard::new(),
             pending_route_releases: Vec::new(),
+            budget: Arc::new(RouteBudget::new()),
+            live_fetches: LiveFetchRegistry::new(),
+            poisoned_shares: HashSet::new(),
         }
     }
 }
@@ -681,6 +702,7 @@ async fn handle_command(
             fetched_root,
             selected,
             flat_dest,
+            root_kind,
             ..
         } => {
             // (#197, CRSH-ISC-29) Spawn the download off-loop and return immediately — a
@@ -696,6 +718,7 @@ async fn handle_command(
                 fetched_root,
                 selected,
                 flat_dest,
+                root_kind,
             );
         }
         NetCommand::ListFetched { fetched_root } => {
@@ -1471,7 +1494,17 @@ fn spawn_fetch_share(
     // (#180 §RS-3, CRSH-ISC-10) In flight over the imported route until its outcome folds —
     // a concurrent advert-replacement defers the old route's release until this completes.
     shares.route_guard.note_fetch_started(share_id.clone());
-    spawn_fetch_task(outcome_tx.clone(), async move {
+    // (#207 / DL-ISC-14) On a worker panic, emit a terminal outcome so the fetch still folds —
+    // closing the route guard's in-use count (else a superseded route would never release). No
+    // route was imported by a panicking preview, so ImportFailed (no route, marks Unresolved +
+    // parks) is the terminal fold that closes the guard.
+    let on_panic = FetchOutcome::ImportFailed {
+        share_id: share_id.clone(),
+        name: name.clone(),
+        generation,
+        message: "the share-preview fetch task panicked".to_owned(),
+    };
+    spawn_fetch_task(outcome_tx.clone(), on_panic, async move {
         run_fetch(
             &handle,
             share_id,
@@ -1488,13 +1521,23 @@ fn spawn_fetch_share(
 /// tests: run `fetch` as a detached task and report its [`FetchOutcome`] to `outcome_tx`,
 /// returning immediately. This is the single point guaranteeing no fetch is ever awaited on
 /// the caller (the actor loop) — testable without a live veilid attach (§RS-1.3).
-fn spawn_fetch_task<F>(outcome_tx: UnboundedSender<FetchOutcome>, fetch: F)
+///
+/// (#207 / DL-ISC-14) The browse fetch future IS `Send` (unlike the download engine), so it rides
+/// `tokio::spawn`; its `JoinHandle` is awaited on an outer detached task so a `JoinError` (the
+/// worker panicked) maps to `on_panic` — a terminal outcome — rather than stranding the share.
+/// Mirrors the GUI's browse seam.
+fn spawn_fetch_task<F>(outcome_tx: UnboundedSender<FetchOutcome>, on_panic: FetchOutcome, fetch: F)
 where
     F: std::future::Future<Output = FetchOutcome> + Send + 'static,
 {
+    let worker = tokio::spawn(fetch);
     tokio::spawn(async move {
+        let outcome = match worker.await {
+            Ok(outcome) => outcome,
+            Err(_join_err) => on_panic,
+        };
         // A closed channel just means the actor shut down mid-fetch — the outcome is moot.
-        let _ = outcome_tx.send(fetch.await);
+        let _ = outcome_tx.send(outcome);
     });
 }
 
@@ -1741,6 +1784,7 @@ fn process_parked_browse_retries(shares: &mut ShareState, evt_tx: &UnboundedSend
 /// the `&mut ShareState` mark/clear-Unresolved mutation and the terminal
 /// `FetchComplete`/`FetchError` emission happen — never inside the spawned task.
 /// `FetchProgress` events still stream from the worker via the cloned `evt_tx`.
+#[derive(Debug)]
 enum ConfirmOutcome {
     /// Every selected file was fetched, verified, and written (and, in managed mode, recorded
     /// in `downloads.idx` by the worker). Fold: clear any Unresolved mark + drop the parked
@@ -1759,20 +1803,26 @@ enum ConfirmOutcome {
         name: String,
         message: String,
     },
-    /// A local failure (downloads-folder open / manifest read / post-verify idx write) that
-    /// must NOT mark the share Unresolved — the sharer's route is fine. Fold: emit `FetchError`
-    /// only.
+    /// (download-subsystem redesign, step 6 / DL-ISC-13) The sharer served content that failed
+    /// verification. The engine has ALREADY destroyed the fetch's staged partials (poison
+    /// boundary = the whole fetch); already-promoted files stay (self-authenticating). Fold:
+    /// set the durable poison flag + emit `FetchError` — NO Unresolved mark, NO parked retry
+    /// (the route is fine, the content is hostile). The message names no chunk index.
+    IntegrityFailed { share_id: String, message: String },
+    /// A local failure (staging disk/path fault / post-verify idx write) that must NOT mark the
+    /// share Unresolved — the sharer's route is fine. Fold: emit `FetchError` only. Verified
+    /// units are retained (they verified — a disk blip must not wipe them).
     LocalFailed { message: String },
 }
 
 /// (#197, CRSH-ISC-29) Dispatch an A1/A2 chunk download **off** the net-actor loop: copy the
-/// route blob + room key out of share state, spawn [`run_confirm_download`], and return
-/// immediately so the actor loop returns to its `select!` without ever awaiting the download
-/// (the chat-starvation fix, mirroring the #180 §RS-2 `spawn_fetch_share` restructure). The
-/// terminal outcome returns via `outcome_tx` and is folded on-loop by [`fold_confirm_outcome`].
-/// Immediate local failures (not connected, lobby not subscribed, share not discovered) still
-/// fail inline — they touch no network, need no spawn, and (matching the prior inline behavior)
-/// never mark the share Unresolved.
+/// route blob + room key + verified announcer pubkey out of share state, spawn
+/// [`run_confirm_download`], and return immediately so the actor loop returns to its `select!`
+/// without ever awaiting the download (the chat-starvation fix, mirroring the #180 §RS-2
+/// `spawn_fetch_share` restructure). The terminal outcome returns via `outcome_tx` and is folded
+/// on-loop by [`fold_confirm_outcome`]. Immediate local failures (not connected, lobby not
+/// subscribed, share not discovered) still fail inline — they touch no network, need no spawn,
+/// and (matching the prior inline behavior) never mark the share Unresolved.
 #[allow(clippy::too_many_arguments)]
 fn spawn_confirm_fetch(
     shares: &mut ShareState,
@@ -1784,13 +1834,15 @@ fn spawn_confirm_fetch(
     fetched_root: PathBuf,
     selected: Option<Vec<usize>>,
     flat_dest: bool,
+    root_kind: RootKind,
 ) {
     let Some(handle) = net.as_ref() else {
         return fetch_fail(evt_tx, "not connected to Veilid yet".to_owned());
     };
-    // Copy the route blob + room key out under an immutable borrow, dropping it before the
-    // spawn. `handle` rides `net`, disjoint from `shares`.
-    let (route_blob, room_key_bytes) = {
+    // Copy the route blob + room key + verified announcer pubkey out under an immutable borrow,
+    // dropping it before the spawn. `handle` rides `net`, disjoint from `shares`. The pubkey is
+    // the budget's sharer key (DL-ISC-2).
+    let (route_blob, room_key_bytes, sender_pubkey) = {
         let Some(lobby) = shares.lobby.as_ref() else {
             return fetch_fail(evt_tx, "lobby not subscribed yet".to_owned());
         };
@@ -1800,63 +1852,131 @@ fn spawn_confirm_fetch(
                 "share not discovered yet — refresh the list".to_owned(),
             );
         };
-        (disc.route_blob.clone(), *lobby.room_key.as_bytes())
+        (
+            disc.route_blob.clone(),
+            *lobby.room_key.as_bytes(),
+            disc.sender_pubkey.clone(),
+        )
     };
+    // (DL-ISC-13) A user-initiated re-download of a share previously flagged for an integrity
+    // failure is ALLOWED (per-chunk verification, ISC-A-S20, is the always-on enforcement), but
+    // it is warned about — the poison flag is a UX guard, not a block.
+    if shares.poisoned_shares.contains(share_id) {
+        daemonseed_veilid_net::vtrace!(
+            "tui: re-downloading share {share_id} previously flagged for an integrity failure \
+             — per-chunk verification remains fail-closed"
+        );
+    }
+    let budget = shares.budget.clone();
+    let live_fetches = shares.live_fetches.clone();
     let handle = handle.clone();
     let evt_tx = evt_tx.clone();
     let share_id = share_id.to_owned();
     let name = name.to_owned();
-    spawn_confirm_task(outcome_tx.clone(), async move {
+    // (#207 / DL-ISC-14) A panic in the worker still yields a terminal outcome so the share is
+    // never stranded; staging-by-construction means a panic strands only quarantined state.
+    let on_panic = ConfirmOutcome::LocalFailed {
+        message: "the download task ended abnormally (panic or runtime failure)".to_owned(),
+    };
+    // A `FnOnce` that BUILDS the (non-`Send`) engine future on the download's own runtime — the
+    // seam runs it off the actor loop without ever needing it to be `Send` (see
+    // `spawn_confirm_task`).
+    spawn_confirm_task(outcome_tx.clone(), on_panic, move || {
         run_confirm_download(
-            &handle,
-            &evt_tx,
+            handle,
+            evt_tx,
+            budget,
+            live_fetches,
             share_id,
             name,
             route_blob,
             room_key_bytes,
+            sender_pubkey,
             fetched_root,
             selected,
             flat_dest,
+            root_kind,
         )
-        .await
     });
 }
 
-/// (#197, CRSH-ISC-29) The spawn seam shared by [`spawn_confirm_fetch`] and the actor tests:
-/// run `download` as a detached task and report its [`ConfirmOutcome`] to `outcome_tx`,
-/// returning immediately. This is the single point guaranteeing no download is ever awaited on
-/// the caller (the actor loop) — testable without a live veilid attach.
-fn spawn_confirm_task<F>(outcome_tx: UnboundedSender<ConfirmOutcome>, download: F)
-where
-    F: std::future::Future<Output = ConfirmOutcome> + Send + 'static,
+/// (#197, CRSH-ISC-29) The spawn seam shared by [`spawn_confirm_fetch`] and the actor tests: run
+/// the download to completion **off** the actor loop and report its [`ConfirmOutcome`] to
+/// `outcome_tx`, returning immediately. This is the single point guaranteeing no download is ever
+/// awaited on the caller (the actor loop) — testable without a live veilid attach.
+///
+/// `make_download` is a `FnOnce` that BUILDS the download future (rather than the future itself),
+/// because the shared engine ([`run_download`]) future is **not `Send`** — its internal
+/// `files.iter().map(|f| fetch_one_file(f, …))` trips the well-known rustc higher-ranked `Send`
+/// inference limitation (#99492), so it cannot ride `tokio::spawn` on the multi-thread net
+/// runtime. Instead a blocking thread builds a dedicated current-thread runtime and drives the
+/// future there: the actor's own worker threads keep serving the download's chunk `app_call`s
+/// concurrently, so the download is genuinely off-loop while never needing to be `Send`.
+///
+/// (#207 / DL-ISC-14) A panic while driving the download is caught and mapped to `on_panic` — a
+/// terminal outcome — so a panicking worker never strands the share. Staging-by-construction means
+/// the panic leaves only quarantined `.dspart` state, reclaimed by the sweep.
+fn spawn_confirm_task<F, Fut>(
+    outcome_tx: UnboundedSender<ConfirmOutcome>,
+    on_panic: ConfirmOutcome,
+    make_download: F,
+) where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ConfirmOutcome>,
 {
-    tokio::spawn(async move {
+    tokio::task::spawn_blocking(move || {
+        // Build a current-thread runtime on this blocking thread and drive the (non-`Send`)
+        // download future to completion; `enable_all` gives the fetch path its timers (retry
+        // backoff sleeps). A runtime-build failure or a worker panic yields the terminal outcome.
+        let outcome = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok()
+            .and_then(|rt| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    rt.block_on(make_download())
+                }))
+                .ok()
+            })
+            .unwrap_or(on_panic);
         // A closed channel just means the actor shut down mid-download — the outcome is moot.
-        let _ = outcome_tx.send(download.await);
+        let _ = outcome_tx.send(outcome);
     });
 }
 
-/// (#197, CRSH-ISC-29) A1 confirm, run **inside a spawned task** off the actor loop: import the
-/// route, fetch the selected files' chunks (each SHA-384-verified inside `fetch_chunk`,
-/// ISC-S28), stream them to disk, and persist the download into `downloads.idx` for the browse
-/// pane. Mirrors the relay actor's `handle_confirm_fetch` (FetchedStore policy, flat-dest
-/// rebasing, clean-partial cleanup on failure, ISC-A-C31) while sourcing bytes over Veilid.
-/// Streams `FetchProgress` via the cloned `evt_tx`; all `&mut ShareState` mutation and the
-/// terminal event are deferred to [`fold_confirm_outcome`] via the returned [`ConfirmOutcome`].
+/// (#197 / download-subsystem redesign step 6) The network+disk half of a download — run
+/// **inside a spawned task**, never on the actor loop. It leases the per-route budget once,
+/// imports the route, fetches the manifest (budget-admitted), computes each selected file's
+/// destination-relative placement (selection roots for a chosen dir, DL-ISC-8; `<share-folder>/
+/// <rel>` for the managed dir), then drives the shared [`run_download`] engine, which stages
+/// every VERIFIED chunk at its offset and promotes each completed file (RAM buffering + the
+/// per-chunk `sanitize`/`fetch_chunk`/`cleanup_written` loop retired, #207). Streams
+/// `FetchProgress` via the cloned `evt_tx`; all `&mut ShareState` mutation + the terminal event
+/// are deferred to [`fold_confirm_outcome`] via the returned [`ConfirmOutcome`]. Disposition on
+/// failure is the ENGINE's (integrity destroys staging; transient/local retain verified units,
+/// ISC-A-C31 reword) — no clean-partial wipe loop here.
 #[allow(clippy::too_many_arguments)]
 async fn run_confirm_download(
-    handle: &VeilidNetHandle,
-    evt_tx: &UnboundedSender<NetEvent>,
+    handle: VeilidNetHandle,
+    evt_tx: UnboundedSender<NetEvent>,
+    budget: Arc<RouteBudget<RouteId>>,
+    live_fetches: LiveFetchRegistry,
     share_id: String,
     name: String,
     route_blob: Vec<u8>,
     room_key_bytes: [u8; 32],
+    sender_pubkey: Vec<u8>,
     fetched_root: PathBuf,
     selected: Option<Vec<usize>>,
     flat_dest: bool,
+    root_kind: RootKind,
 ) -> ConfirmOutcome {
-    let sid: &str = &share_id;
-    let name_ref: &str = &name;
+    // Hold the live-fetch registration for the whole download so a future startup/idle staging
+    // sweep never reclaims this fetch's staging (DL-ISC-22 caller-ordering contract).
+    let _live = live_fetches.register(&share_id);
+
+    // Import the route, then lease the per-route budget ONCE — shared across the manifest fetch
+    // and every chunk fetch (Part 1). The sharer pubkey keys the learned ceiling (DL-ISC-2).
     let route = match handle.import_route(route_blob).await {
         Ok(r) => r,
         Err(e) => {
@@ -1869,8 +1989,13 @@ async fn run_confirm_download(
             };
         }
     };
+    // The lease is `Arc`-wrapped so each per-chunk future can hold an OWNED clone (a `RouteLease`
+    // is `!Clone` — it refcounts the route account), keeping the engine's `fetch_chunk` closure
+    // fully self-contained (it borrows nothing external).
+    let lease = Arc::new(budget.lease(route.clone(), SharerKey(sender_pubkey)));
+
     let manifest = match handle
-        .fetch_manifest(route.clone(), sid, room_key_bytes)
+        .fetch_manifest_budgeted(route.clone(), &share_id, room_key_bytes, &lease)
         .await
     {
         Ok(m) => m,
@@ -1884,225 +2009,261 @@ async fn run_confirm_download(
         }
     };
 
-    // Resolve the file set: an explicit selection (A2) or the whole manifest (A1
-    // confirm-all). Indices map onto the manifest's order; an out-of-range index
-    // is dropped (filter_map) rather than aborting.
-    let wanted: Vec<&ManifestEntry> = match &selected {
-        Some(idxs) => idxs.iter().filter_map(|&i| manifest.get(i)).collect(),
-        None => manifest.iter().collect(),
+    // Resolve the selected file set (None → all; out-of-range indices ignored).
+    let indices: Vec<usize> = match &selected {
+        None => (0..manifest.len()).collect(),
+        Some(sel) => sel
+            .iter()
+            .copied()
+            .filter(|&i| i < manifest.len())
+            .collect(),
     };
+    if indices.is_empty() {
+        // Nothing valid selected — a no-op success (no bytes to fetch, nothing to persist).
+        return ConfirmOutcome::Complete {
+            share_id,
+            files_written: 0,
+            bytes_written: 0,
+        };
+    }
+    let selected_rels: Vec<&str> = indices
+        .iter()
+        .map(|&i| manifest[i].rel_path.as_str())
+        .collect();
 
-    // Chunk-granular progress over the SELECTED set.
-    let total_chunks: u32 = wanted.iter().map(|e| e.chunks.len() as u32).sum();
+    // Compute the staging destination root + each planned file's destination-relative path.
+    //   flat_dest (user-chosen dir): placement is a function of the selection roots (DL-ISC-8);
+    //     no downloads.idx (a chosen dest is unmanaged).
+    //   managed dir: <fetched_root>/<share-folder>/<rel_path>; the idx is registered on Complete.
+    let managed_folder: Option<String>;
+    let dest_root: PathBuf;
+    let planned: Vec<PlannedFile>;
+    if flat_dest {
+        let roots = selection_roots(root_kind, &selected_rels);
+        let placed = match place_at_dest(&roots, &selected_rels) {
+            Ok(p) => p,
+            Err(e) => {
+                return ConfirmOutcome::LocalFailed {
+                    message: format!("could not place the download under the chosen folder: {e}"),
+                };
+            }
+        };
+        // `place_at_dest` returns one PlacedFile per selected file, in input (indices) order.
+        planned = indices
+            .iter()
+            .zip(placed.iter())
+            .map(|(&i, pf)| PlannedFile {
+                dest_rel: pf.dest_rel.clone(),
+                size: manifest[i].size,
+                chunks: manifest[i].chunks.clone(),
+            })
+            .collect();
+        dest_root = fetched_root.clone();
+        managed_folder = None;
+    } else {
+        // Managed downloads dir: resolve the share folder (reuse-on-re-fetch / collision-suffix),
+        // stage under it, dest_rel = the full share rel_path. Fix #1 (step 6): a store open/list
+        // failure while resolving the managed folder is a LocalFailed — never silently treat
+        // `existing` as empty (which would mis-resolve/orphan a re-fetch's folder).
+        let existing = match FetchedStore::open(&fetched_root).and_then(|s| s.list_shares()) {
+            Ok(e) => e,
+            Err(e) => {
+                return ConfirmOutcome::LocalFailed {
+                    message: format!("could not read the downloads manifest: {e}"),
+                };
+            }
+        };
+        let folder = resolve_share_folder(&existing, &share_id, &name);
+        dest_root = fetched_root.join(&folder);
+        planned = indices
+            .iter()
+            .map(|&i| PlannedFile {
+                dest_rel: manifest[i].rel_path.clone(),
+                size: manifest[i].size,
+                chunks: manifest[i].chunks.clone(),
+            })
+            .collect();
+        managed_folder = Some(folder);
+    }
+
+    let total_chunks: u32 = planned.iter().map(|p| p.chunks.len() as u32).sum();
     let _ = evt_tx.send(NetEvent::FetchProgress {
         total_chunks: Some(total_chunks),
         chunks_received: 0,
         bytes_received: 0,
     });
 
-    // Resolve the destination folder under the downloads root, mirroring core's
-    // `FetchedStore` policy (reuse this share's folder on a re-fetch; otherwise a
-    // safe name, collision-suffixed by share_id). The store open also creates root.
-    // A store/manifest failure here is local (the route is fine) → LocalFailed, no mark.
-    let store = match FetchedStore::open(&fetched_root) {
+    let staging = match StagingArea::open(&dest_root, &share_id) {
         Ok(s) => s,
         Err(e) => {
             return ConfirmOutcome::LocalFailed {
-                message: format!("could not open the downloads folder: {e}"),
+                message: format!("could not open the download staging area: {e}"),
             };
         }
     };
-    let mut recorded_shares = match store.list_shares() {
-        Ok(s) => s,
-        Err(e) => {
-            return ConfirmOutcome::LocalFailed {
-                message: format!("could not read the downloads manifest: {e}"),
-            };
-        }
-    };
-    let folder = resolve_share_folder(&recorded_shares, sid, name_ref);
-    let share_dir = fetched_root.join(&folder);
 
-    // Destination layout (ISC-C68). For a user-chosen dest, files land directly
-    // under it, rebased so the selected item is the top-level entry (no per-share
-    // folder). For the managed downloads dir, keep the namespaced
-    // `<share>/<rel_path>` layout. `rebased` is index-aligned with `wanted` and
-    // only populated in flat mode.
-    let base_dir = if flat_dest {
-        fetched_root.clone()
-    } else {
-        share_dir.clone()
+    // The engine's chunk closure: one budget-admitted, SHA-384-verified chunk fetch, discarding
+    // the latency Duration (the controller is fed INTERNALLY by `fetch_chunk_budgeted`). The one
+    // shared `lease` (Arc) funnels every fetch through the per-route budget (Part 1). Each future
+    // owns its captures (handle + share_id + route + the lease Arc), so it borrows nothing
+    // external.
+    let handle_dl = handle.clone();
+    let share_id_dl = share_id.clone();
+    let lease_dl = Arc::clone(&lease);
+    // Return a `'static + Send` boxed future (owns every capture — handle, share_id, route, and
+    // the lease Arc): a concrete, lifetime-free `Fut` type keeps the engine's `run_download`
+    // future provably `Send` across the crate boundary. An inline `async move` would give `Fut`
+    // a per-call lifetime the cross-crate HRTB `Send` check cannot generalize.
+    type ChunkFut = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<u8>, VeilidNetError>> + Send>,
+    >;
+    let fetch_chunk = move |addr: ChunkAddr| -> ChunkFut {
+        let handle = handle_dl.clone();
+        let share_id = share_id_dl.clone();
+        let lease = Arc::clone(&lease_dl);
+        let route = route.clone();
+        Box::pin(async move {
+            handle
+                .fetch_chunk_budgeted(route, &share_id, addr, room_key_bytes, &lease)
+                .await
+                .map(|(bytes, _latency)| bytes)
+        })
     };
-    let rebased: Vec<String> = if flat_dest {
-        rebase_to_selection_root(
-            &wanted
+    let progress_tx = evt_tx.clone();
+    let progress = move |chunks_done: u32, bytes_done: u64| {
+        let _ = progress_tx.send(NetEvent::FetchProgress {
+            total_chunks: Some(total_chunks),
+            chunks_received: chunks_done,
+            bytes_received: bytes_done,
+        });
+    };
+
+    let outcome = run_download(&planned, &staging, &fetch_chunk, &progress).await;
+
+    // Managed dir: on a completed download, register the downloads.idx entry for the
+    // already-promoted files — idx-only, no byte re-buffering (#207). Done off-loop here (a
+    // quick locked fs op), not in the fold, which has neither the promoted-file list nor a store
+    // handle. An idx-registration FAILURE downgrades the outcome to `LocalFailed`: the files are
+    // promoted on disk (retained) but not discoverable in the downloads list, so reporting
+    // `Complete` would be a silent success — surface the error instead. On success, refresh the
+    // browse pane (fs read → evt; no `&mut ShareState`, so it stays in the worker).
+    let outcome = match (outcome, &managed_folder) {
+        (DownloadOutcome::Complete { files, bytes }, Some(folder)) => {
+            let recs: Vec<FetchedFile> = planned
                 .iter()
-                .map(|e| e.rel_path.as_str())
-                .collect::<Vec<_>>(),
-        )
-    } else {
-        Vec::new()
+                .map(|p| FetchedFile {
+                    rel_path: p.dest_rel.clone(),
+                    size: p.size,
+                })
+                .collect();
+            match FetchedStore::open(&fetched_root)
+                .and_then(|mut store| store.register_share(&share_id, &name, folder, &recs))
+            {
+                Ok(_) => {
+                    emit_fetched_snapshot(&evt_tx, &fetched_root);
+                    DownloadOutcome::Complete { files, bytes }
+                }
+                Err(e) => DownloadOutcome::LocalFailed {
+                    message: format!(
+                        "download of {share_id} completed on disk but could not be recorded in \
+                         the downloads index: {e}"
+                    ),
+                },
+            }
+        }
+        (outcome, _) => outcome,
     };
 
-    let mut written_paths: Vec<PathBuf> = Vec::new();
-    let mut chunks_received: u32 = 0;
-    let mut bytes_received: u64 = 0;
+    confirm_outcome_from(outcome, share_id, name)
+}
 
-    // The streaming download loop. Factored as an async block returning `Result`
-    // so every failure site funnels through ONE cleanup path below.
-    let fetch_result: Result<Vec<FetchedFile>, String> = async {
-        let mut recorded: Vec<FetchedFile> = Vec::with_capacity(wanted.len());
-        for (i, entry) in wanted.iter().enumerate() {
-            // The on-disk relative path: the rebased selection-root path for a
-            // user-chosen dest (ISC-C68), else the share-relative path.
-            let write_rel = if flat_dest {
-                rebased[i].as_str()
-            } else {
-                entry.rel_path.as_str()
-            };
-            // Path-traversal guard (ISC-A-C32): a hostile manifest must never write
-            // outside the destination folder. Fail closed.
-            let Some(safe_rel) = sanitize_rel_path(write_rel) else {
-                return Err(format!(
-                    "refusing a download path escaping its folder: {}",
-                    entry.rel_path
-                ));
-            };
-            let dest = base_dir.join(&safe_rel);
-            if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("could not create download folder: {e}"))?;
-            }
-            // Create (truncating any previous copy — a re-fetch refreshes the
-            // download); chunks append through this held handle. An empty file
-            // (`chunks: []`) is complete as-is.
-            let mut file = std::fs::File::create(&dest)
-                .map_err(|e| format!("could not create {}: {e}", entry.rel_path))?;
-            written_paths.push(dest.clone());
-
-            let mut file_bytes: u64 = 0;
-            for addr in &entry.chunks {
-                // `fetch_chunk` reassembles fragments and SHA-384-verifies the
-                // chunk against its address before returning (ISC-S28 / ISC-A-S20),
-                // so no manual re-verify is needed here (unlike the relay's stream).
-                // TUI keeps the static fragment window for now (adaptive parity is
-                // a follow-up, #128 D-1); the latency signal is unused here.
-                let (data, _lat) = handle
-                    .fetch_chunk(
-                        route.clone(),
-                        sid,
-                        *addr,
-                        room_key_bytes,
-                        daemonseed_veilid_net::share::FRAGMENT_FETCH_CONCURRENCY,
-                    )
-                    .await
-                    .map_err(|e| fetch_error_message("chunk fetch failed", e))?;
-                file.write_all(&data)
-                    .map_err(|e| format!("could not write {}: {e}", entry.rel_path))?;
-                file_bytes += data.len() as u64;
-                chunks_received += 1;
-                bytes_received += data.len() as u64;
-                let _ = evt_tx.send(NetEvent::FetchProgress {
-                    total_chunks: Some(total_chunks),
-                    chunks_received,
-                    bytes_received,
-                });
-            }
-
-            // Size on record is the verified bytes actually on disk.
-            recorded.push(FetchedFile {
-                rel_path: entry.rel_path.clone(),
-                size: file_bytes,
-            });
-        }
-        Ok(recorded)
-    }
-    .await;
-
-    let recorded = match fetch_result {
-        Ok(recorded) => recorded,
-        Err(message) => {
-            // Clean partial handling: delete everything this fetch wrote and prune
-            // the directories that emptied — a failed fetch persists nothing
-            // (ISC-A-C31).
-            cleanup_written(&fetched_root, &base_dir, &written_paths);
-            // A failed RE-fetch already truncated the previous download's copies,
-            // so its idx entry now describes deleted files — prune it (best-effort)
-            // so the browse pane does not lie. Only the managed downloads dir
-            // carries a browse manifest; a user-chosen dest (flat) has none.
-            if !flat_dest && recorded_shares.iter().any(|s| s.share_id == sid) {
-                recorded_shares.retain(|s| s.share_id != sid);
-                let _ = std::fs::write(
-                    fetched_root.join("downloads.idx"),
-                    render_downloads_idx(&recorded_shares),
-                );
-            }
-            // (#180 §RS-1.4/§RS-1.5, CRSH-ISC-5) A download-stage failure — chiefly a
-            // chunk-fetch route-death — has the fold keep the share listed Unresolved + park a
-            // one-shot retry; never a prune. (A rarer local-disk failure funnels here too and is
-            // treated identically and harmlessly: the parked retry just re-resolves cleanly.)
-            return ConfirmOutcome::RouteFailed {
-                share_id,
-                name,
-                message,
-            };
-        }
-    };
-
-    // A user-chosen dest (ISC-C68): the files were placed directly under the
-    // user's directory. Do not write a `downloads.idx` into it and do not touch
-    // the managed browse manifest — the browse pane tracks only the managed dir.
-    // (#180 §RS-1.4, CRSH-ISC-25 F6) The fold clears any Unresolved mark + drops the parked
-    // browse retry on a completed download.
-    if flat_dest {
-        return ConfirmOutcome::Complete {
+/// (download-subsystem redesign, step 6 / DL-ISC-8) Map the engine's [`DownloadOutcome`] onto the
+/// frontend's [`ConfirmOutcome`] — the dictated 1:1 mapping (design §"Outcome + fold semantics"):
+/// `Complete` → `Complete`; `TransientFailed` → `RouteFailed` (mark Unresolved + park);
+/// `IntegrityFailed` → `IntegrityFailed` (poison, no mark/park); `LocalFailed` → `LocalFailed`.
+/// Disposition (staging destroy vs retain) already happened inside the engine.
+fn confirm_outcome_from(
+    outcome: DownloadOutcome,
+    share_id: String,
+    name: String,
+) -> ConfirmOutcome {
+    match outcome {
+        DownloadOutcome::Complete { files, bytes } => ConfirmOutcome::Complete {
             share_id,
-            files_written: recorded.len() as u32,
-            bytes_written: bytes_received,
-        };
+            files_written: files,
+            bytes_written: bytes,
+        },
+        // Transport / route-death / withdrawn: retained verified units, mark Unresolved + park.
+        DownloadOutcome::TransientFailed { message } => ConfirmOutcome::RouteFailed {
+            share_id,
+            name,
+            message,
+        },
+        // Hostile content: the engine already destroyed the staged partials — poison the share.
+        DownloadOutcome::IntegrityFailed { message } => {
+            ConfirmOutcome::IntegrityFailed { share_id, message }
+        }
+        // Local disk/path fault: verified units retained; surface the error, no Unresolved mark.
+        DownloadOutcome::LocalFailed { message } => ConfirmOutcome::LocalFailed { message },
     }
+}
 
-    // Record the fully-verified download in `downloads.idx` (M15 C; ISC-C63 /
-    // C64). Only a fetch that verified every chunk reaches here (ISC-A-C31). A
-    // bookkeeping failure surfaces as a fetch error — the user must not believe a
-    // download landed when the browse pane will not show it. This idx-write failure is local
-    // (all bytes verified + written; the route is fine) → LocalFailed, so the fold does not
-    // mark Unresolved. (Micro-divergence from the prior inline code, which cleared Unresolved
-    // just before this point; leaving the mark untouched is the safer choice — the download is
-    // absent from the browse manifest, so it did not fully land, and any Unresolved state
-    // self-heals via the parked-retry / route-rotation paths.)
-    let files_written = recorded.len() as u32;
-    recorded_shares.retain(|s| s.share_id != sid);
-    recorded_shares.push(FetchedShare {
-        share_id: share_id.clone(),
-        name: name.clone(),
-        folder,
-        files: recorded,
-    });
-    if let Err(e) = std::fs::write(
-        fetched_root.join("downloads.idx"),
-        render_downloads_idx(&recorded_shares),
-    ) {
-        return ConfirmOutcome::LocalFailed {
-            message: format!("verified but could not save download: {e}"),
-        };
+/// (download-subsystem redesign, step 6 / DL-ISC-8) Compute the placement selection roots from the
+/// selection kind + the selected files' share `rel_path`s. `Share` → the whole-share root; `File`
+/// → the single selected file; `Dir` → the selected files' common parent-directory prefix (so a
+/// scattered selection collapses to its shared ancestor, replacing the old shape-guessing
+/// `rebase_to_selection_root`). `place_at_dest` then lands each root per the ratified placement
+/// table. Mirrors the GUI's `selection_roots`.
+fn selection_roots(root_kind: RootKind, selected_rels: &[&str]) -> Vec<SelectionRoot> {
+    match root_kind {
+        RootKind::Share => vec![SelectionRoot::Dir(String::new())],
+        RootKind::File => match selected_rels.first() {
+            Some(rel) => vec![SelectionRoot::File((*rel).to_owned())],
+            // Defensive: a File selection with no concrete file falls back to the whole share.
+            None => vec![SelectionRoot::Dir(String::new())],
+        },
+        RootKind::Dir => vec![SelectionRoot::Dir(common_prefix_dir(selected_rels))],
     }
+}
 
-    // Refresh the browse pane with the newly-persisted download (fs read → evt; no `&mut
-    // ShareState`, so it stays in the worker).
-    emit_fetched_snapshot(evt_tx, &fetched_root);
-    ConfirmOutcome::Complete {
-        share_id,
-        files_written,
-        bytes_written: bytes_received,
+/// The common parent-directory prefix of a set of share `rel_path`s (`/`-separated), used as the
+/// `Dir` selection root for a folder/scattered selection (DL-ISC-8). Each path's parent
+/// (everything before its last `/`) is taken, then their longest common leading component run — so
+/// a one-file folder keeps its folder (`a/b/only.mp3` → `a/b`), and scattered files under a shared
+/// ancestor collapse to it (`a/b/1`, `a/c/2` → `a`). An empty result is the share root. Mirrors
+/// the GUI's `common_prefix_dir`.
+fn common_prefix_dir(rels: &[&str]) -> String {
+    let dirs: Vec<Vec<&str>> = rels
+        .iter()
+        .map(|p| {
+            let mut comps: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
+            comps.pop(); // drop the filename component; keep only the directory path
+            comps
+        })
+        .collect();
+    let Some((first, rest)) = dirs.split_first() else {
+        return String::new();
+    };
+    let mut common = first.clone();
+    for d in rest {
+        let n = common
+            .iter()
+            .zip(d.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        common.truncate(n);
     }
+    common.join("/")
 }
 
 /// (#197, CRSH-ISC-29) Fold a spawned download's terminal outcome on the actor loop — the only
 /// place the download's `&mut ShareState` mutation happens. Success clears the Unresolved mark
 /// and drops the parked retry (CRSH-ISC-25 F6) and emits `FetchComplete`; a route-death failure
 /// marks the share Unresolved and parks a one-shot retry (never a prune) and emits `FetchError`;
-/// a local-disk failure emits `FetchError` only (the sharer's route is fine, so no mark).
+/// an INTEGRITY failure (DL-ISC-13) sets the durable poison flag and emits `FetchError` with NO
+/// Unresolved mark and NO parked retry (the route is fine, the content is hostile — the engine
+/// already destroyed the staged partials); a local-disk failure emits `FetchError` only (the
+/// sharer's route is fine, so no mark).
 fn fold_confirm_outcome(
     shares: &mut ShareState,
     evt_tx: &UnboundedSender<NetEvent>,
@@ -2127,6 +2288,15 @@ fn fold_confirm_outcome(
             message,
         } => {
             mark_share_unresolved(shares, evt_tx, &share_id, &name);
+            fetch_fail(evt_tx, message);
+        }
+        ConfirmOutcome::IntegrityFailed { share_id, message } => {
+            // (DL-ISC-13) Poison the share against automatic re-fetch — durable within the
+            // session, independent of the discovery lifecycle. NO Unresolved mark, NO parked
+            // retry: the route is healthy, the content is hostile, and the engine already
+            // destroyed the fetch's staged partials. Per-chunk verification (ISC-A-S20) is the
+            // always-on enforcement; this flag is the UX guard.
+            shares.poisoned_shares.insert(share_id);
             fetch_fail(evt_tx, message);
         }
         ConfirmOutcome::LocalFailed { message } => {
@@ -2477,6 +2647,7 @@ fn apply_discovery(
             ann.share_id.clone(),
             DiscoveredRoute {
                 route_blob: env.route_blob.clone(),
+                sender_pubkey: ann.sender_pubkey.clone(),
                 generation,
                 unresolved,
             },
@@ -3304,7 +3475,13 @@ mod tests {
         let gate = std::sync::Arc::new(tokio::sync::Notify::new());
         let gate_fetch = gate.clone();
 
-        spawn_fetch_task(outcome_tx, async move {
+        let on_panic = FetchOutcome::ImportFailed {
+            share_id: "s".to_owned(),
+            name: "demo".to_owned(),
+            generation: 1,
+            message: "panic".to_owned(),
+        };
+        spawn_fetch_task(outcome_tx, on_panic, async move {
             gate_fetch.notified().await;
             FetchOutcome::ImportFailed {
                 share_id: "s".to_owned(),
@@ -3349,7 +3526,10 @@ mod tests {
         let gate = std::sync::Arc::new(tokio::sync::Notify::new());
         let gate_dl = gate.clone();
 
-        spawn_confirm_task(outcome_tx, async move {
+        let on_panic = ConfirmOutcome::LocalFailed {
+            message: "panic".to_owned(),
+        };
+        spawn_confirm_task(outcome_tx, on_panic, move || async move {
             gate_dl.notified().await;
             ConfirmOutcome::Complete {
                 share_id: "s".to_owned(),
@@ -3471,6 +3651,159 @@ mod tests {
         );
     }
 
+    // ── download-subsystem redesign, step 6: engine adoption (parity with the GUI) ──────
+    /// (DL-ISC-8) `selection_roots` maps the confirmed selection kind to placement roots: a share
+    /// → the whole-share root; a file → that one file; a folder/scattered selection → the selected
+    /// files' common parent-directory prefix (a one-file folder keeps its folder).
+    #[test]
+    fn selection_roots_map_node_kind_to_placement_roots() {
+        // Share → whole-share root, regardless of the selected rels.
+        assert_eq!(
+            selection_roots(RootKind::Share, &["a/1.txt", "b/2.txt"]),
+            vec![SelectionRoot::Dir(String::new())]
+        );
+        // File → the single selected file.
+        assert_eq!(
+            selection_roots(RootKind::File, &["Artist/Album/song.mp3"]),
+            vec![SelectionRoot::File("Artist/Album/song.mp3".to_owned())]
+        );
+        // Dir, one-file folder → keeps the folder (the reproduced defect the design fixes).
+        assert_eq!(
+            selection_roots(RootKind::Dir, &["Artist/Album/only.mp3"]),
+            vec![SelectionRoot::Dir("Artist/Album".to_owned())]
+        );
+        // Dir, scattered files under a shared ancestor → collapse to it.
+        assert_eq!(
+            selection_roots(RootKind::Dir, &["Artist/A/1.mp3", "Artist/B/2.mp3"]),
+            vec![SelectionRoot::Dir("Artist".to_owned())]
+        );
+    }
+
+    /// `common_prefix_dir` takes the longest common PARENT-dir component run (never the filename),
+    /// so a lone file keeps its directory and unrelated tops collapse to the share root.
+    #[test]
+    fn common_prefix_dir_is_the_parent_directory_prefix() {
+        assert_eq!(common_prefix_dir(&["a/b/c.txt"]), "a/b");
+        assert_eq!(common_prefix_dir(&["a/b/1", "a/b/2"]), "a/b");
+        assert_eq!(common_prefix_dir(&["a/b/1", "a/c/2"]), "a");
+        assert_eq!(common_prefix_dir(&["top.txt"]), "");
+        assert_eq!(common_prefix_dir(&["x/1", "y/2"]), "");
+        assert_eq!(common_prefix_dir(&[]), "");
+    }
+
+    /// (DL-ISC-8) `confirm_outcome_from` maps the four engine `DownloadOutcome` classes onto the
+    /// four `ConfirmOutcome` variants exactly, threading share id + name where each needs them —
+    /// `IntegrityFailed` carries the share id the poison fold keys on, `RouteFailed` carries both.
+    #[test]
+    fn download_outcome_maps_to_confirm_outcome() {
+        let complete = confirm_outcome_from(
+            DownloadOutcome::Complete {
+                files: 3,
+                bytes: 300,
+            },
+            "sid".to_owned(),
+            "Album".to_owned(),
+        );
+        assert!(matches!(
+            complete,
+            ConfirmOutcome::Complete {
+                files_written: 3,
+                bytes_written: 300,
+                ..
+            }
+        ));
+
+        let transient = confirm_outcome_from(
+            DownloadOutcome::TransientFailed {
+                message: "route died".to_owned(),
+            },
+            "sid".to_owned(),
+            "Album".to_owned(),
+        );
+        assert!(
+            matches!(transient, ConfirmOutcome::RouteFailed { ref share_id, ref name, .. } if share_id == "sid" && name == "Album")
+        );
+
+        let integrity = confirm_outcome_from(
+            DownloadOutcome::IntegrityFailed {
+                message: "sha-384 mismatch".to_owned(),
+            },
+            "sid".to_owned(),
+            "Album".to_owned(),
+        );
+        assert!(
+            matches!(integrity, ConfirmOutcome::IntegrityFailed { ref share_id, .. } if share_id == "sid")
+        );
+
+        let local = confirm_outcome_from(
+            DownloadOutcome::LocalFailed {
+                message: "disk full".to_owned(),
+            },
+            "sid".to_owned(),
+            "Album".to_owned(),
+        );
+        assert!(matches!(local, ConfirmOutcome::LocalFailed { .. }));
+    }
+
+    /// (DL-ISC-13) The fold of an `IntegrityFailed` outcome sets the durable poison flag and emits
+    /// `FetchError`, but does NOT mark the share Unresolved and does NOT park a one-shot retry —
+    /// the route is fine, the content is hostile (the engine already destroyed the staged
+    /// partials). Distinct from `RouteFailed` (which marks + parks) and `LocalFailed`.
+    #[test]
+    fn fold_integrity_failed_poisons_without_mark_or_park() {
+        let (mut shares, share_id, _rk, _s, _rc) = folded_share(31);
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        assert!(!shares.discovered.get(&share_id).unwrap().unresolved);
+        fold_confirm_outcome(
+            &mut shares,
+            &evt_tx,
+            ConfirmOutcome::IntegrityFailed {
+                share_id: share_id.clone(),
+                message: "the sharer served content that failed verification".to_owned(),
+            },
+        );
+        assert!(
+            shares.poisoned_shares.contains(&share_id),
+            "IntegrityFailed sets the durable poison flag"
+        );
+        assert!(
+            !shares.discovered.get(&share_id).unwrap().unresolved,
+            "IntegrityFailed does NOT mark the share Unresolved (the route is fine)"
+        );
+        assert!(
+            shares.parked_retries.is_empty(),
+            "IntegrityFailed parks no retry (the content is hostile, not the route)"
+        );
+        assert!(
+            std::iter::from_fn(|| evt_rx.try_recv().ok())
+                .any(|e| matches!(e, NetEvent::FetchError { .. })),
+            "IntegrityFailed emits FetchError"
+        );
+    }
+
+    /// (#207 / DL-ISC-14) A panicking download worker still yields a terminal outcome: the
+    /// `spawn_confirm_task` seam drives the (non-`Send`) future on a current-thread runtime under
+    /// `catch_unwind`, mapping a panic to the caller-supplied terminal `on_panic` outcome, so a
+    /// panicking worker never strands the share awaiting an outcome that never arrives.
+    #[tokio::test]
+    async fn a_panicking_download_worker_yields_a_terminal_outcome() {
+        let (outcome_tx, mut outcome_rx) = unbounded_channel::<ConfirmOutcome>();
+        let on_panic = ConfirmOutcome::LocalFailed {
+            message: "the download task panicked".to_owned(),
+        };
+        spawn_confirm_task(outcome_tx, on_panic, move || async move {
+            panic!("worker blew up mid-download");
+        });
+        let outcome = outcome_rx
+            .recv()
+            .await
+            .expect("a terminal outcome arrives despite the panic");
+        assert!(
+            matches!(outcome, ConfirmOutcome::LocalFailed { .. }),
+            "a JoinError folds to the terminal on_panic outcome (got {outcome:?})"
+        );
+    }
+
     // ── CRSH-ISC-7: a failing-fetch storm never delays chat past the I4 bound ──────────
     /// Anti (paused-time): a storm of slow failing fetches is dispatched, then a chat
     /// dispatch runs — and completes within the WB-3 I4 chat bound (≤ 2s), because every
@@ -3483,7 +3816,13 @@ mod tests {
         let start = Instant::now();
         for i in 0..16 {
             let tx = outcome_tx.clone();
-            spawn_fetch_task(tx, async move {
+            let on_panic = FetchOutcome::ImportFailed {
+                share_id: format!("s{i}"),
+                name: "demo".to_owned(),
+                generation: 1,
+                message: "panic".to_owned(),
+            };
+            spawn_fetch_task(tx, on_panic, async move {
                 tokio::time::sleep(Duration::from_secs(60)).await;
                 FetchOutcome::ImportFailed {
                     share_id: format!("s{i}"),

@@ -17,8 +17,9 @@
 //!   [`ShareManifestEntry`], and [`NetHandle`] — shared by the binary, [`crate::app`],
 //!   and the Veilid actor (`crate::veilid_net`).
 //! - The transport-agnostic helpers the Veilid actor and the app reuse:
-//!   `now_unix_ms`, and the share-download path helpers `resolve_share_folder`,
-//!   `sanitize_rel_path`, `render_downloads_idx`, and `cleanup_written`.
+//!   `now_unix_ms`, and the managed-download folder resolver
+//!   `resolve_share_folder` (the download write/placement path now lives in the
+//!   shared `daemonseed_veilid_net::download` engine + core `StagingArea`).
 //!
 //! ## Transport
 //!
@@ -225,12 +226,21 @@ pub enum NetCommand {
         fetched_root: PathBuf,
         selected: Option<Vec<usize>>,
         /// True when `fetched_root` is an explicit user-chosen destination
-        /// (ISC-C68): files land directly under it, rebased so the selected
-        /// item is the top-level entry (`rebase_to_selection_root`), with no
-        /// per-share folder and no `downloads.idx` written into the user's
-        /// directory. False for the managed downloads dir, which keeps the
-        /// namespaced `<share>/<rel_path>` layout and the browse manifest.
+        /// (ISC-C68): files land directly under it via the selection-root
+        /// placement resolver (`root_kind` → `SelectionRoot` → `place_at_dest`),
+        /// with no per-share folder and no `downloads.idx` written into the
+        /// user's directory. False for the managed downloads dir, which keeps
+        /// the namespaced `<share>/<rel_path>` layout and the browse manifest.
         flat_dest: bool,
+        /// (download-subsystem redesign, step 6 / DL-ISC-8) The kind of selection
+        /// the user confirmed — the placement selection root the net side maps to
+        /// a `SelectionRoot` (mirrors the GUI's `RootKind` on `ConfirmFetch`). The
+        /// TUI's preview is a FLAT manifest-row list (no folder tree), so the node
+        /// kind is a function of the selection cardinality, resolved by the binary:
+        /// `selected: None` → `Share`, one checked row → `File`, several → `Dir`.
+        /// Only consulted in the `flat_dest` branch; an in-process `NetCommand`
+        /// field (UI ↔ actor mpsc), never on the wire.
+        root_kind: RootKind,
     },
     /// List the fetched shares recorded under `fetched_root` for the browse
     /// pane (M15 C; ISC-C64). Emits a [`NetEvent::FetchedShares`] snapshot
@@ -287,6 +297,25 @@ pub enum NetCommand {
     /// the local serve task, emitting `NetEvent::PublishStopped`. No-op for an
     /// unknown id.
     UnpublishShare { share_id: String },
+}
+
+/// (download-subsystem redesign, step 6 / DL-ISC-8) The kind of selection root a
+/// `ConfirmFetch` targets — carried so a user-chosen-dest placement is a function
+/// of the selection, not guessed from path shapes (replacing the old
+/// `rebase_to_selection_root`). Mirrors the GUI's `net::RootKind`. The TUI preview
+/// is a flat manifest-row list, so the binary derives the kind from the confirmed
+/// selection: none selected → `Share`, one row → `File`, several → `Dir`. Drives
+/// `veilid_net::selection_roots`. An in-process `NetCommand` field only, never on
+/// the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootKind {
+    /// The whole share — every file (`selected: None`).
+    Share,
+    /// A single selected file (`selected: Some([one index])`).
+    File,
+    /// A scattered multi-file selection (`selected: Some([several indices])`) —
+    /// placed under the selected files' common parent-directory prefix.
+    Dir,
 }
 
 /// One file in an A1 fetch-preview ([`NetEvent::FetchManifest`]): the
@@ -649,6 +678,19 @@ pub(crate) fn now_unix_ms() -> i64 {
 /// `FetchedStore::record_share`: reuse the share's existing folder on a
 /// re-fetch; otherwise derive a safe name from the listing name,
 /// collision-suffixed by share_id if another share already claimed it.
+///
+/// KNOWN RACE (download-subsystem redesign, step 6 follow-up, tracked): two
+/// DISTINCT shares with IDENTICAL display names downloading concurrently both
+/// read `existing` before either has registered its `downloads.idx` entry, so
+/// each sees the base name un-taken and both pick the same unsuffixed folder —
+/// the collision suffix never fires. The window is the gap between this
+/// resolution and `register_share`. It is NOT silent data loss: `StagingArea`
+/// promotion is no-clobber (DL-ISC-21), so colliding files inside the shared
+/// folder collision-suffix rather than overwrite; only the folder *identity* is
+/// shared. A correct fix needs atomic folder reservation UNDER the idx lock
+/// (`register_share` reserving the folder as part of the same locked RMW that
+/// writes the entry), a non-trivial addition deliberately deferred — a
+/// half-baked reservation scheme is worse than the narrow, non-destructive race.
 pub(crate) fn resolve_share_folder(
     existing: &[FetchedShare],
     share_id: &str,
@@ -690,99 +732,10 @@ fn safe_folder_name(name: &str) -> String {
     }
 }
 
-/// Validate an untrusted wire `rel_path` and return the safe relative path to
-/// join under the share folder (mirror of core's `fetched::sanitize_rel_path`,
-/// ISC-A-C32). `None` = unsafe — rejects empty, absolute, `.`/`..`, and any
-/// non-Normal component; the wire form is `/`-separated on every platform.
-pub(crate) fn sanitize_rel_path(rel: &str) -> Option<PathBuf> {
-    use std::path::Component;
-    if rel.is_empty() || rel.starts_with('/') {
-        return None;
-    }
-    let mut safe = PathBuf::new();
-    for seg in rel.split('/') {
-        if seg.is_empty() {
-            continue;
-        }
-        let p = std::path::Path::new(seg);
-        let mut comps = p.components();
-        match (comps.next(), comps.next()) {
-            (Some(Component::Normal(c)), None) => safe.push(c),
-            _ => return None,
-        }
-    }
-    if safe.as_os_str().is_empty() {
-        return None;
-    }
-    Some(safe)
-}
-
-/// Render the `downloads.idx` manifest in core's documented v2 format
-/// (`fetched` module docs): hex-encoded variable fields so a name or path can
-/// never collide with the space delimiter. Must stay parseable by core's
-/// `FetchedStore::list_shares` — pinned by the round-trip test below.
-pub(crate) fn render_downloads_idx(shares: &[FetchedShare]) -> String {
-    let mut out = String::from("# daemonseed downloads manifest v2\n");
-    for s in shares {
-        out.push_str(&format!(
-            "S {} {} {} {}\n",
-            hex_lower(s.share_id.as_bytes()),
-            hex_lower(s.name.as_bytes()),
-            hex_lower(s.folder.as_bytes()),
-            s.files.len(),
-        ));
-        for f in &s.files {
-            out.push_str(&format!(
-                "F {} {}\n",
-                hex_lower(f.rel_path.as_bytes()),
-                f.size
-            ));
-        }
-    }
-    out
-}
-
-/// Dependency-free lowercase hex (the TUI carries no `hex` crate).
-fn hex_lower(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
-}
-
-/// Best-effort cleanup after an aborted fetch (M16 clean-partial handling):
-/// delete every file the fetch wrote — the in-progress partial AND its
-/// already-completed siblings (a failed fetch persists nothing, ISC-A-C31) —
-/// then prune now-empty directories bottom-up, up to and including the share
-/// folder. `remove_dir` refuses a non-empty dir, which is exactly the guard
-/// that keeps a pre-existing download's other files (and the downloads root)
-/// untouched. Errors are ignored: cleanup must never mask the fetch error.
-pub(crate) fn cleanup_written(
-    fetched_root: &std::path::Path,
-    share_dir: &std::path::Path,
-    written: &[PathBuf],
-) {
-    for p in written {
-        let _ = std::fs::remove_file(p);
-    }
-    for p in written {
-        let mut dir = p.parent();
-        while let Some(d) = dir {
-            if !d.starts_with(share_dir) || d == fetched_root {
-                break;
-            }
-            let _ = std::fs::remove_dir(d);
-            dir = d.parent();
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use daemonseed_core::cot::AssetAddr;
-    use daemonseed_core::storage::fetched::{FetchedFile, FetchedStore};
 
     #[test]
     fn net_event_variants_are_data() {
@@ -845,50 +798,12 @@ mod tests {
         assert!(default_circle_label(&a).contains('-'));
     }
 
-    /// The TUI-side `downloads.idx` writer (M16 streaming persistence) stays
-    /// parseable by core's `FetchedStore::list_shares` — the anti-drift pin on
-    /// the mirrored v2 format.
-    #[test]
-    fn downloads_idx_writer_roundtrips_through_core_store() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let shares = vec![FetchedShare {
-            share_id: "abc123".to_owned(),
-            name: "My Photos".to_owned(),
-            folder: "My Photos".to_owned(),
-            files: vec![
-                FetchedFile {
-                    rel_path: "readme.txt".to_owned(),
-                    size: 5,
-                },
-                FetchedFile {
-                    rel_path: "sub/pic with space.png".to_owned(),
-                    size: 7_340_032,
-                },
-            ],
-        }];
-        std::fs::write(
-            dir.path().join("downloads.idx"),
-            render_downloads_idx(&shares),
-        )
-        .unwrap();
-        let store = FetchedStore::open(dir.path()).unwrap();
-        let read_back = store.list_shares().unwrap();
-        assert_eq!(read_back, shares);
-    }
-
-    /// The path-hygiene mirrors (ISC-A-C32) fail closed exactly like core's:
-    /// absolute / `..` / empty rel_paths are rejected, nested normal paths
-    /// pass; hostile share names reduce to a single safe component.
+    /// The safe-folder-name mirror (ISC-A-C32) reduces a hostile share name to a
+    /// single safe component exactly like core's. (Wire `rel_path` hygiene now
+    /// lives in the shared engine's core `sanitize_rel_path`/`place_at_dest`; the
+    /// TUI no longer carries its own copy.)
     #[test]
     fn fetch_path_hygiene_mirrors_fail_closed() {
-        assert!(sanitize_rel_path("/etc/passwd").is_none());
-        assert!(sanitize_rel_path("..").is_none());
-        assert!(sanitize_rel_path("a/../../b").is_none());
-        assert!(sanitize_rel_path("").is_none());
-        assert_eq!(
-            sanitize_rel_path("sub/dir/file.txt"),
-            Some(PathBuf::from("sub").join("dir").join("file.txt"))
-        );
         assert_eq!(safe_folder_name(""), "share");
         assert_eq!(safe_folder_name("a/b\\c"), "a_b_c");
         for n in ["..", "../../etc", "/", ".", ""] {
@@ -920,51 +835,5 @@ mod tests {
         );
         // No collision → the safe base name.
         assert_eq!(resolve_share_folder(&existing, "cccccc33", "docs"), "docs");
-    }
-
-    /// Abort-time cleanup (M16 clean-partial handling): every file the fetch
-    /// wrote is deleted and the directories that emptied are pruned up to the
-    /// share folder — but a pre-existing sibling file (an earlier download in
-    /// a shared folder) and the downloads root survive.
-    #[test]
-    fn cleanup_written_deletes_partials_and_prunes_empty_dirs() {
-        let root = tempfile::TempDir::new().unwrap();
-        let share_dir = root.path().join("docs");
-        let nested = share_dir.join("sub").join("deep");
-        std::fs::create_dir_all(&nested).unwrap();
-        let partial = nested.join("big.bin");
-        let done = share_dir.join("small.txt");
-        std::fs::write(&partial, b"truncated").unwrap();
-        std::fs::write(&done, b"complete").unwrap();
-        // An unrelated pre-existing file in the same share folder.
-        let keep = share_dir.join("keep.txt");
-        std::fs::write(&keep, b"older download").unwrap();
-
-        cleanup_written(root.path(), &share_dir, &[partial.clone(), done.clone()]);
-
-        assert!(!partial.exists(), "in-progress partial deleted");
-        assert!(
-            !done.exists(),
-            "completed sibling of the aborted fetch deleted"
-        );
-        assert!(!nested.exists(), "emptied dirs pruned");
-        assert!(!share_dir.join("sub").exists());
-        assert!(keep.exists(), "pre-existing file untouched");
-        assert!(share_dir.exists(), "non-empty share folder kept");
-        assert!(root.path().exists(), "downloads root never removed");
-    }
-
-    /// Abort-time cleanup removes the share folder itself when the aborted
-    /// fetch was its only content (no empty husk folders).
-    #[test]
-    fn cleanup_written_removes_a_fully_emptied_share_folder() {
-        let root = tempfile::TempDir::new().unwrap();
-        let share_dir = root.path().join("solo");
-        std::fs::create_dir_all(&share_dir).unwrap();
-        let only = share_dir.join("only.bin");
-        std::fs::write(&only, b"x").unwrap();
-        cleanup_written(root.path(), &share_dir, &[only]);
-        assert!(!share_dir.exists(), "emptied share folder pruned");
-        assert!(root.path().exists());
     }
 }

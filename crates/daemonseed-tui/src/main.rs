@@ -20,7 +20,7 @@ use daemonseed_core::profile::{
 use daemonseed_core::storage::seeds;
 use daemonseed_core::tls::install_provider;
 use daemonseed_tui::app::App;
-use daemonseed_tui::net::{NetCommand, NetHandle};
+use daemonseed_tui::net::{NetCommand, NetHandle, RootKind};
 use daemonseed_tui::ui;
 use oxicrypt_module::{AlgorithmProfile, initialize_with_profile};
 use ratatui::crossterm::event::{self, Event};
@@ -259,6 +259,18 @@ fn run(
             } else {
                 expand_tilde(&dest)
             };
+            // (download-subsystem redesign, step 6 / DL-ISC-8) The TUI preview is a
+            // flat manifest-row list (no folder tree), so the selection root is a
+            // function of the confirmed selection: `None` = the whole share, one
+            // checked row = a single file, several = a scattered folder selection
+            // placed under their common parent-dir prefix. Only consulted net-side
+            // for a user-chosen dest (`flat_dest`); the managed dir keeps the full
+            // `<share>/<rel_path>` layout regardless.
+            let root_kind = match &selected {
+                None => RootKind::Share,
+                Some(idxs) if idxs.len() == 1 => RootKind::File,
+                Some(_) => RootKind::Dir,
+            };
             let _ = net.send(NetCommand::ConfirmFetch {
                 share_id,
                 sharer_handle,
@@ -266,6 +278,7 @@ fn run(
                 fetched_root,
                 selected,
                 flat_dest,
+                root_kind,
             });
         }
         // M15 C: browse — refresh the fetched-downloads list on demand.
