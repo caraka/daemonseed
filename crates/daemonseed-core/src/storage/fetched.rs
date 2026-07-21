@@ -731,7 +731,10 @@ fn files_have_identical_content(existing: &Path, candidate: &Path) -> Result<boo
     // this, an attacker-planted byte-identical symlink would be kept in place, and a
     // post-promote swap of its target would silently redefine "the download" (F4 hardening,
     // DL-ISC-21). `candidate` is our own just-written staging file, so plain metadata is fine.
-    let (em, cm) = match (std::fs::symlink_metadata(existing), std::fs::metadata(candidate)) {
+    let (em, cm) = match (
+        std::fs::symlink_metadata(existing),
+        std::fs::metadata(candidate),
+    ) {
         (Ok(em), Ok(cm)) => (em, cm),
         _ => return Ok(false),
     };
