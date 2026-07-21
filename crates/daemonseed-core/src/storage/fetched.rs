@@ -1145,19 +1145,31 @@ pub struct FileResume {
     pub size: u64,
     /// The file's total chunk count (the stored manifest's chunk-list length).
     pub total_chunks: usize,
-    /// Chunk indices whose on-disk bytes re-verify against their content address
-    /// (kept, not re-fetched). Sorted ascending.
+    /// Chunk indices whose bytes re-verify IN STAGING against their content address
+    /// — the chunks a resume can SKIP fetching. Staging-authoritative: the engine
+    /// promotes the staging file, so a skippable chunk MUST be present in staging,
+    /// NOT merely at the promoted dest (a promoted-only chunk would become a sparse
+    /// zero-hole on promote). Sorted ascending.
     pub verified: Vec<usize>,
-    /// Chunk indices to (re-)fetch — mismatched, short, sparse/unwritten, or
-    /// unreadable. Sorted ascending.
+    /// Chunk indices to (re-)fetch — not present+verified in staging (mismatched,
+    /// short, sparse/unwritten, unreadable, or present only at the promoted dest).
+    /// Sorted ascending.
     pub missing: Vec<usize>,
+    /// The file is ALREADY fully present + verified at its promoted dest path
+    /// (`dest_root/<rel_path>`) at the exact confirmed size — content-checked chunk
+    /// by chunk, not length-only. When true the resume keeps the dest file as-is (no
+    /// fetch, no re-promote). DISTINCT from `verified` (staging): the engine can only
+    /// skip chunks that live in staging, so a partially-good promoted file is not
+    /// trusted here — its chunks are re-fetched into staging.
+    pub promoted_complete: bool,
 }
 
 impl FileResume {
-    /// Whether every chunk of the file verified on disk (already complete —
-    /// nothing to fetch).
+    /// Whether the resume needs to fetch nothing for this file — it is already fully
+    /// present + verified, either at its promoted dest (`promoted_complete`) or as a
+    /// complete staging file (`missing.is_empty()`).
     pub fn is_complete(&self) -> bool {
-        self.missing.is_empty() && self.verified.len() == self.total_chunks
+        self.promoted_complete || self.missing.is_empty()
     }
 }
 
@@ -1187,21 +1199,26 @@ impl ResumePlan {
     }
 }
 
-/// Re-derive a resume plan for `manifest` from bytes on disk (DL-ISC-12). For each
-/// file, each chunk region (`[i*CHUNK_SIZE, min((i+1)*CHUNK_SIZE, size))`,
-/// boundaries from `CHUNK_SIZE` + the stored `size`, never from the file
-/// self-describing) is re-hashed against the stored content address at BOTH
-/// candidate locations — the promoted final file (`dest_root/<rel_path>`) and the
-/// staged partial (`staging/<rel_path>`) — and counts as present iff either
-/// re-verifies. A chunk that mismatches, is short/sparse, or is unreadable is
-/// MISSING (discard + re-fetch); a file whose every chunk verifies is already
-/// Complete. No on-disk byte is ever reused without re-verifying its content
-/// address, so a resume can never be tricked past an integrity check by tampered
-/// at-rest state.
+/// Re-derive a resume plan for `manifest` from bytes on disk (DL-ISC-12). Each chunk
+/// region (`[i*CHUNK_SIZE, min((i+1)*CHUNK_SIZE, size))`, boundaries from
+/// `CHUNK_SIZE` + the stored `size`, never from the file self-describing) is
+/// re-hashed against the stored content address. Two locations, two DISTINCT roles:
 ///
-/// `manifest`'s entries must carry the file's placement-resolved on-disk
-/// `rel_path` (what the download staged/promoted under); the caller re-paths the
-/// digest-verified confirmed manifest into placement space before calling.
+/// - `verified`/`missing` partition the chunks by their presence IN STAGING
+///   (`staging/<rel_path>`) — the chunks the engine can SKIP, because it promotes the
+///   staging file. A chunk verified only at the promoted dest is NOT skippable
+///   (skipping it would promote a sparse zero-hole), so it is `missing` and re-fetched.
+/// - `promoted_complete` is the fast-path: the file is ALREADY fully present +
+///   verified at `dest_root/<rel_path>` (every chunk content-checked, exact size), so
+///   the resume keeps it as-is.
+///
+/// A chunk that mismatches, is short/sparse, or is unreadable is MISSING. No on-disk
+/// byte is ever reused without re-verifying its content address AT USE — the engine
+/// skips only staging-present chunks, and `promoted_complete` re-hashes every chunk.
+///
+/// `manifest`'s entries must carry the file's placement-resolved on-disk `rel_path`
+/// (what the download staged/promoted under); the caller re-paths the digest-verified
+/// confirmed manifest into placement space before calling.
 pub fn derive_resume_state(
     manifest: &[ManifestEntry],
     dest_root: &Path,
@@ -1226,18 +1243,19 @@ pub fn derive_resume_state(
                     total_chunks: entry.chunks.len(),
                     verified: Vec::new(),
                     missing: (0..entry.chunks.len()).collect(),
+                    promoted_complete: false,
                 };
             }
             // Exact-length gate: a candidate file is trusted only if it is EXACTLY
-            // `size` bytes. A co-resident append past `size` (`file_len > size`) would
-            // otherwise ride along as unverified content beyond the last chunk's region
-            // (chunk regions cover only `[0, size)`); a short file fails the last chunk's
-            // read anyway. Applied to BOTH the promoted final and the staged partial —
-            // both live under co-resident-writable roots (xhigh review F1).
-            let promoted = sanitize_rel_path(&entry.rel_path)
-                .ok()
-                .map(|rel| dest_root.join(rel))
-                .filter(|p| file_len(p) == Some(entry.size));
+            // `size` bytes. A co-resident append past `size` would otherwise ride along
+            // as unverified content beyond the last chunk's region; a short file fails
+            // the last chunk's read anyway (xhigh review F1).
+            //
+            // STAGING-authoritative `verified`: the engine promotes the STAGING file,
+            // so a chunk is skippable (already_verified) ONLY if it re-verifies in
+            // staging. A chunk present only at the promoted dest is `missing` and
+            // re-fetched — skipping it would promote a sparse zero-hole (xhigh review,
+            // 8b-1 location-mismatch finding).
             let staged = staging
                 .staging_path(&entry.rel_path)
                 .ok()
@@ -1246,20 +1264,33 @@ pub fn derive_resume_state(
             let mut missing = Vec::new();
             for (i, addr) in entry.chunks.iter().enumerate() {
                 let (offset, len) = chunk_region(i, entry.size);
-                let present = chunk_verifies(promoted.as_deref(), offset, len, addr)
-                    || chunk_verifies(staged.as_deref(), offset, len, addr);
-                if present {
+                if chunk_verifies(staged.as_deref(), offset, len, addr) {
                     verified.push(i);
                 } else {
                     missing.push(i);
                 }
             }
+            // Promoted fast-path (CONTENT-checked, not length-only): the file is
+            // already complete at its dest path iff it exists at exact size AND every
+            // chunk re-verifies there. Separate from staging — a partially-good promoted
+            // file is not trusted here (its chunks re-fetch into staging).
+            let promoted_complete = sanitize_rel_path(&entry.rel_path)
+                .ok()
+                .map(|rel| dest_root.join(rel))
+                .filter(|p| file_len(p) == Some(entry.size))
+                .is_some_and(|p| {
+                    entry.chunks.iter().enumerate().all(|(i, addr)| {
+                        let (offset, len) = chunk_region(i, entry.size);
+                        chunk_verifies(Some(&p), offset, len, addr)
+                    })
+                });
             FileResume {
                 rel_path: entry.rel_path.clone(),
                 size: entry.size,
                 total_chunks: entry.chunks.len(),
                 verified,
                 missing,
+                promoted_complete,
             }
         })
         .collect();
@@ -2481,8 +2512,9 @@ mod tests {
         assert_eq!(plan.files[0].missing, vec![0]);
     }
 
-    /// DL-ISC-12 (promoted source): a completed file at `dest_root/<rel>` re-derives
-    /// as fully verified from the promoted bytes, with nothing in staging.
+    /// DL-ISC-12 (promoted fast-path): a completed file at `dest_root/<rel>` re-derives
+    /// as `promoted_complete` (content-checked) with nothing in staging — its
+    /// STAGING `verified` (skippable) set is empty (the engine keeps the dest file).
     #[test]
     fn derive_resume_reads_a_promoted_file() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -2497,8 +2529,72 @@ mod tests {
             chunks: addrs,
         }];
         let plan = derive_resume_state(&manifest, dest_root.path(), &staging);
+        assert!(
+            plan.files[0].promoted_complete,
+            "a full dest file is promoted_complete"
+        );
         assert!(plan.files[0].is_complete());
         assert!(plan.is_complete());
+        // STAGING-authoritative: nothing is in staging, so the skippable set is empty.
+        assert!(plan.files[0].verified.is_empty());
+    }
+
+    /// xhigh review (8b-1 location-mismatch): chunks good at the PROMOTED dest but
+    /// absent from staging are NOT `verified`/skippable — the engine promotes staging,
+    /// so skipping them would promote a sparse zero-hole. A partially-corrupt promoted
+    /// file with no staging yields an EMPTY skippable set (every chunk re-fetched) and
+    /// `promoted_complete == false`.
+    #[test]
+    fn derive_resume_does_not_skip_promoted_only_chunks() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let dest_root = tempfile::TempDir::new().unwrap();
+        let staging = StagingArea::open(dir.path(), "s").unwrap();
+        let size = (CHUNK_SIZE + 500) as u64; // 2 chunks
+        let (mut content, addrs) = real_content(size);
+        assert_eq!(addrs.len(), 2);
+        content[CHUNK_SIZE + 10] ^= 0xFF; // corrupt chunk 1's region; chunk 0 stays good
+        std::fs::write(dest_root.path().join("f.bin"), &content).unwrap(); // no staging exists
+        let manifest = vec![ManifestEntry {
+            rel_path: "f.bin".to_owned(),
+            size,
+            chunks: addrs,
+        }];
+        let plan = derive_resume_state(&manifest, dest_root.path(), &staging);
+        assert!(
+            !plan.files[0].promoted_complete,
+            "a partially-corrupt dest file is not complete"
+        );
+        // Nothing skippable (staging empty); every chunk re-fetches — no sparse hole.
+        assert!(plan.files[0].verified.is_empty());
+        assert_eq!(plan.files[0].missing, vec![0, 1]);
+        assert!(!plan.files[0].is_complete());
+    }
+
+    /// xhigh review (8b-1): a length-matched but content-GARBAGE promoted dest file is
+    /// NOT `promoted_complete`, even when staging holds the complete verified copy — so
+    /// the resume promotes the good STAGING bytes, never the garbage dest file.
+    #[test]
+    fn derive_resume_does_not_trust_a_garbage_dest_by_length() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let dest_root = tempfile::TempDir::new().unwrap();
+        let staging = StagingArea::open(dir.path(), "s").unwrap();
+        let size = (CHUNK_SIZE + 500) as u64;
+        let (content, addrs) = real_content(size);
+        stage_chunks(&staging, "f.bin", &content, &[0, 1]); // staging complete + verified
+        std::fs::write(dest_root.path().join("f.bin"), vec![0x00u8; size as usize]).unwrap(); // exact-size garbage
+        let manifest = vec![ManifestEntry {
+            rel_path: "f.bin".to_owned(),
+            size,
+            chunks: addrs,
+        }];
+        let plan = derive_resume_state(&manifest, dest_root.path(), &staging);
+        assert!(
+            !plan.files[0].promoted_complete,
+            "a length-matched garbage dest is not complete"
+        );
+        assert_eq!(plan.files[0].verified, vec![0, 1]); // staging authoritative + complete
+        assert!(plan.files[0].missing.is_empty());
+        assert!(plan.files[0].is_complete()); // via staging (the engine promotes it), not the dest garbage
     }
 
     /// An empty file (size 0, no chunks) is trivially complete.

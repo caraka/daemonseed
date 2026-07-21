@@ -427,6 +427,14 @@ impl GuiState {
         self.profile.as_ref().map(|p| p.display_handle().to_owned())
     }
 
+    /// (download-subsystem redesign, step 8b / DL-ISC-20) The unlocked profile's
+    /// on-disk ROOT (the client's own trusted state dir), or `None` on the ephemeral
+    /// path. Passed to `NetCommand::Connect` so the net actor anchors each fetch's
+    /// confirmed-manifest digest there for verified resume.
+    pub fn profile_root(&self) -> Option<std::path::PathBuf> {
+        self.profile.as_ref().map(|p| p.root().to_path_buf())
+    }
+
     /// (#92) The unlocked profile's STABLE persistent identity signing key
     /// (`Profile::stable_signing_key`), or `None` on the ephemeral / no-profile
     /// path or if derivation fails. Passed to `NetCommand::Connect` so the net

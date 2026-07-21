@@ -98,6 +98,14 @@ pub enum NetCommand {
         /// receiver-verifiable `share_id`. `None` on the ephemeral / no-profile
         /// path (no publish under a stable identity).
         stable_share_root_ikm: Option<ShareRootIkm>,
+        /// (download-subsystem redesign, step 8b / DL-ISC-20) the unlocked profile's
+        /// on-disk ROOT — the client's own trusted state dir. The actor holds it so a
+        /// verified resume can anchor each fetch's confirmed-manifest digest in
+        /// `storage::manifest_digest::ManifestDigestStore` under this dir (NOT the
+        /// co-resident-writable downloads root). `None` on the ephemeral / no-profile
+        /// path — that session persists nothing, so a download simply gets no resume
+        /// anchor (fail-closed: a later resume finds no digest and re-downloads fresh).
+        profile_root: Option<PathBuf>,
     },
     /// (#66) Update the presented display handle in place after a rename, without a
     /// reconnect. Sets the actor's `my_handle` exactly as a `Connect{display_handle}`

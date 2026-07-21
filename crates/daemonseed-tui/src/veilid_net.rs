@@ -2056,6 +2056,9 @@ async fn run_confirm_download(
                 dest_rel: pf.dest_rel.clone(),
                 size: manifest[i].size,
                 chunks: manifest[i].chunks.clone(),
+                // (step 8b) TUI resume wiring is 8b-2; a fresh download verifies every
+                // chunk (empty = fetch all), preserving today's behaviour.
+                already_verified: Vec::new(),
             })
             .collect();
         dest_root = fetched_root.clone();
@@ -2081,6 +2084,8 @@ async fn run_confirm_download(
                 dest_rel: manifest[i].rel_path.clone(),
                 size: manifest[i].size,
                 chunks: manifest[i].chunks.clone(),
+                // (step 8b) TUI resume wiring is 8b-2; empty = fetch all (fresh).
+                already_verified: Vec::new(),
             })
             .collect();
         managed_folder = Some(folder);

@@ -70,6 +70,14 @@ impl Profile {
         &self.display_handle
     }
 
+    /// The unlocked profile's on-disk ROOT (where `seeds.blob` lives) — the client's
+    /// own trusted state dir. Handed to the net actor at `Connect` so a verified
+    /// resume can anchor each fetch's confirmed-manifest digest there, off the
+    /// co-resident-writable downloads root (download-subsystem redesign, step 8b).
+    pub fn root(&self) -> &std::path::Path {
+        &self.root
+    }
+
     /// (#92) Derive the STABLE persistent identity signing keypair from the
     /// unlocked profile's mnemonic — `derive_identity_keys(.., Identity::Primary)`,
     /// the SAME key behind the `name#hash` handle an operator whitelists. This is

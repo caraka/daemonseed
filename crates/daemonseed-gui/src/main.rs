@@ -1553,6 +1553,7 @@ fn connect_now(
                 republish_roots,
                 stable_signing_key,
                 stable_share_root_ikm,
+                profile_root,
             ) = {
                 let st = state.borrow();
                 (
@@ -1568,6 +1569,10 @@ fn connect_now(
                     // (#156) Derive the share-root IKM ONCE per connect (same
                     // derivation) so a publish yields a receiver-verifiable share_id.
                     st.stable_share_root_ikm(),
+                    // (step 8b / DL-ISC-20) Hand the profile root to the actor so a
+                    // verified resume anchors each fetch's manifest digest in the
+                    // client's own trusted state (not the co-resident downloads root).
+                    st.profile_root(),
                 )
             };
             let _ = net.borrow().send(NetCommand::Connect {
@@ -1576,6 +1581,7 @@ fn connect_now(
                 republish_roots,
                 stable_signing_key,
                 stable_share_root_ikm,
+                profile_root,
             });
             // #144: raise the "assembling network" startup mask for the cold-start
             // warmup; it is dismissed on the first real content (a Lobby/circle message

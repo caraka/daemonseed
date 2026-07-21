@@ -47,6 +47,15 @@ pub struct PlannedFile {
     pub size: u64,
     /// The file's ordered chunk addresses; chunk `i` writes at offset `i*CHUNK_SIZE`.
     pub chunks: Vec<ChunkAddr>,
+    /// (download-subsystem redesign, step 8b / DL-ISC-12) Chunk indices already
+    /// verified on disk from a PRIOR attempt (a resume): their bytes are already
+    /// staged at their offsets, re-derived by
+    /// [`daemonseed_core::storage::fetched::derive_resume_state`]. The engine SKIPS
+    /// fetching and writing these — but still counts them toward progress and toward
+    /// the file's completeness (its promote requires every chunk present, skipped or
+    /// freshly fetched). A FRESH download leaves this EMPTY (every chunk is fetched),
+    /// preserving the pre-resume behaviour and every existing engine test.
+    pub already_verified: Vec<usize>,
 }
 
 /// The terminal outcome of a [`run_download`] — the class distinction the GUI/TUI
@@ -320,45 +329,83 @@ where
         )));
     }
 
+    // (step 8b / DL-ISC-12) Resume: chunk indices already verified on disk from a
+    // prior attempt are staged at their offsets — SKIP fetching+writing them, but
+    // still count them toward progress + completeness. Clamped to the valid index
+    // range (the plan is engine-internal, from `derive_resume_state`, but a
+    // defensive clamp keeps a stray index from mis-seeding the byte total). Empty
+    // on a fresh download → no skips, no seeding, identical behaviour.
+    let already: std::collections::HashSet<usize> = file
+        .already_verified
+        .iter()
+        .copied()
+        .filter(|&i| i < file.chunks.len())
+        .collect();
+
     // Pre-size the sparse staging file so verified chunks can land at their
-    // offsets in any order (set-not-prefix partial state).
+    // offsets in any order (set-not-prefix partial state). On RESUME this opens the
+    // existing partial WITHOUT discarding its staged bytes (`preallocate` is
+    // create-or-open + `set_len`, never a truncate), so the already-verified chunks
+    // survive into the promote.
     staging
         .preallocate(&file.dest_rel, file.size)
         .map_err(|e| Stop::local(staging_error("could not stage", &file.dest_rel, e)))?;
 
     let last = file.chunks.len().saturating_sub(1);
-    let chunk_futures = file.chunks.iter().enumerate().map(|(i, addr)| {
-        let offset = i as u64 * CHUNK_SIZE as u64;
-        let expected_len = expected_chunk_len(i, last, file.size);
-        let addr = *addr;
-        async move {
-            // The bytes come back already SHA-384-verified (fetch_chunk_budgeted);
-            // a verification failure surfaces as VeilidNetError::Integrity.
-            let bytes = fetch_chunk(addr)
-                .await
-                .map_err(|e| Stop::from_fetch("chunk fetch failed", e))?;
-            // Exact-length guard (DL-ISC-11): a verified chunk whose length does not
-            // fill its manifest slot would leave an unverified zero gap in the
-            // promoted file. The bytes are authentic to their content-address, but a
-            // short/long chunk means the manifest's byte layout is malformed →
-            // `Integrity`, not a resumable transient.
-            if bytes.len() as u64 != expected_len {
-                return Err(Stop::integrity(format!(
+
+    // Seed the already-verified chunks into the running totals BEFORE fetching, so
+    // the progress bar resumes ahead and the `Complete` byte count reflects the
+    // whole file (not just the freshly-fetched tail). The engine owns this seeding
+    // — the frontend forwards the cumulative totals verbatim (no separate seed), so
+    // a resumed chunk is counted exactly once.
+    if !already.is_empty() {
+        let seeded_bytes: u64 = already
+            .iter()
+            .map(|&i| expected_chunk_len(i, last, file.size))
+            .sum();
+        let c =
+            chunks_done.fetch_add(already.len() as u32, Ordering::Relaxed) + already.len() as u32;
+        let b = bytes_done.fetch_add(seeded_bytes, Ordering::Relaxed) + seeded_bytes;
+        progress(c, b);
+    }
+
+    let chunk_futures = file
+        .chunks
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !already.contains(i))
+        .map(|(i, addr)| {
+            let offset = i as u64 * CHUNK_SIZE as u64;
+            let expected_len = expected_chunk_len(i, last, file.size);
+            let addr = *addr;
+            async move {
+                // The bytes come back already SHA-384-verified (fetch_chunk_budgeted);
+                // a verification failure surfaces as VeilidNetError::Integrity.
+                let bytes = fetch_chunk(addr)
+                    .await
+                    .map_err(|e| Stop::from_fetch("chunk fetch failed", e))?;
+                // Exact-length guard (DL-ISC-11): a verified chunk whose length does not
+                // fill its manifest slot would leave an unverified zero gap in the
+                // promoted file. The bytes are authentic to their content-address, but a
+                // short/long chunk means the manifest's byte layout is malformed →
+                // `Integrity`, not a resumable transient.
+                if bytes.len() as u64 != expected_len {
+                    return Err(Stop::integrity(format!(
                     "chunk {i} of {} verified but is {} bytes, not the manifest's {expected_len}",
                     file.dest_rel,
                     bytes.len()
                 )));
+                }
+                staging
+                    .write_verified_chunk(&file.dest_rel, offset, &bytes)
+                    .map_err(|e| Stop::from_staging_write("could not write", &file.dest_rel, e))?;
+                let c = chunks_done.fetch_add(1, Ordering::Relaxed) + 1;
+                let b = bytes_done.fetch_add(bytes.len() as u64, Ordering::Relaxed)
+                    + bytes.len() as u64;
+                progress(c, b);
+                Ok::<(), Stop>(())
             }
-            staging
-                .write_verified_chunk(&file.dest_rel, offset, &bytes)
-                .map_err(|e| Stop::from_staging_write("could not write", &file.dest_rel, e))?;
-            let c = chunks_done.fetch_add(1, Ordering::Relaxed) + 1;
-            let b =
-                bytes_done.fetch_add(bytes.len() as u64, Ordering::Relaxed) + bytes.len() as u64;
-            progress(c, b);
-            Ok::<(), Stop>(())
-        }
-    });
+        });
     drive_bounded(chunk_futures, CHUNK_POLL_CAP).await?;
 
     // Every chunk verified, exactly tiled, and landed: promote (no-clobber).
@@ -397,6 +444,7 @@ mod tests {
                 dest_rel: dest_rel.to_owned(),
                 size: bytes.len() as u64,
                 chunks,
+                already_verified: Vec::new(),
             },
             map,
         )
@@ -544,6 +592,7 @@ mod tests {
             dest_rel: "empty.dat".into(),
             size: 0,
             chunks: vec![],
+            already_verified: vec![],
         };
         let fetch = |_addr: ChunkAddr| async { Ok::<Vec<u8>, VeilidNetError>(vec![]) };
         let progress = |_c: u32, _b: u64| {};
@@ -655,5 +704,100 @@ mod tests {
             assert!(!st.dir().exists(), "poison destroys staging");
         }
         let _ = staging;
+    }
+
+    /// (step 8b / DL-ISC-12) A resume plan with `already_verified = [0, 2]` on a
+    /// 4-chunk file fetches ONLY the missing {1, 3} (the verified chunks are never
+    /// requested) and promotes a byte-correct file from the staged + fetched bytes.
+    #[tokio::test]
+    async fn resume_fetches_only_missing_chunks_and_promotes() {
+        let root = tmp("resume-partial");
+        let staging = StagingArea::open(&root, "rsm").unwrap();
+        // A 4-chunk file (3 full chunks + a 100-byte tail), each chunk filled with a
+        // DISTINCT byte so the four content-addresses differ (a uniform fill would
+        // collapse identical chunks to one address and defeat the per-address assert).
+        let mut big = Vec::new();
+        big.extend(std::iter::repeat_n(0xA0u8, CHUNK_SIZE));
+        big.extend(std::iter::repeat_n(0xA1u8, CHUNK_SIZE));
+        big.extend(std::iter::repeat_n(0xA2u8, CHUNK_SIZE));
+        big.extend(std::iter::repeat_n(0xA3u8, 100));
+        let (mut f, map) = plan_file("vid.bin", &big);
+        assert_eq!(f.chunks.len(), 4);
+        // Simulate a prior attempt's staged partial: pre-size + write chunks 0 and 2.
+        staging.preallocate("vid.bin", f.size).unwrap();
+        let parts: Vec<&[u8]> = big.chunks(CHUNK_SIZE).collect();
+        for i in [0usize, 2] {
+            staging
+                .write_verified_chunk("vid.bin", i as u64 * CHUNK_SIZE as u64, parts[i])
+                .unwrap();
+        }
+        f.already_verified = vec![0, 2];
+
+        let addr0 = f.chunks[0];
+        let addr2 = f.chunks[2];
+        let requested = Arc::new(std::sync::Mutex::new(Vec::<ChunkAddr>::new()));
+        let requested2 = requested.clone();
+        let fetch = move |addr: ChunkAddr| {
+            requested2.lock().unwrap().push(addr);
+            let bytes = map.get(&addr).cloned();
+            async move { bytes.ok_or(VeilidNetError::NotServed) }
+        };
+        let progress = |_c: u32, _b: u64| {};
+        let outcome = run_download(&[f], &staging, &fetch, &progress).await;
+        match outcome {
+            DownloadOutcome::Complete { files, bytes } => {
+                assert_eq!(files, 1);
+                // Skipped bytes (0,2) + fetched bytes (1,3) = the whole file.
+                assert_eq!(bytes, big.len() as u64);
+            }
+            other => panic!("expected Complete, got {other:?}"),
+        }
+        // Only the missing chunks {1, 3} were fetched — {0, 2} were never requested.
+        let req = requested.lock().unwrap();
+        assert!(
+            !req.contains(&addr0) && !req.contains(&addr2),
+            "must not re-fetch already-verified chunks"
+        );
+        assert_eq!(req.len(), 2, "exactly the two missing chunks were fetched");
+        // The promoted file is byte-correct (staged + fetched bytes).
+        assert_eq!(std::fs::read(root.join("vid.bin")).unwrap(), big);
+    }
+
+    /// (step 8b / DL-ISC-12) A resume plan whose `already_verified` covers every
+    /// chunk promotes the staged file WITHOUT any fetch.
+    #[tokio::test]
+    async fn resume_with_all_chunks_verified_promotes_without_fetching() {
+        let root = tmp("resume-complete");
+        let staging = StagingArea::open(&root, "rsc").unwrap();
+        let data = vec![0x7Eu8; CHUNK_SIZE + 5]; // 2 chunks
+        let (mut f, _map) = plan_file("done.bin", &data);
+        assert_eq!(f.chunks.len(), 2);
+        // Stage every chunk (a fully-staged-but-unpromoted file — the aborted-just-
+        // before-promote case).
+        staging.preallocate("done.bin", f.size).unwrap();
+        for (i, p) in data.chunks(CHUNK_SIZE).enumerate() {
+            staging
+                .write_verified_chunk("done.bin", i as u64 * CHUNK_SIZE as u64, p)
+                .unwrap();
+        }
+        f.already_verified = (0..f.chunks.len()).collect();
+
+        let seen = AtomicUsize::new(0);
+        let fetch = |_addr: ChunkAddr| {
+            seen.fetch_add(1, Ordering::Relaxed);
+            async move { Ok::<Vec<u8>, VeilidNetError>(vec![]) }
+        };
+        let progress = |_c: u32, _b: u64| {};
+        let outcome = run_download(&[f], &staging, &fetch, &progress).await;
+        assert!(
+            matches!(outcome, DownloadOutcome::Complete { files: 1, .. }),
+            "got {outcome:?}"
+        );
+        assert_eq!(
+            seen.load(Ordering::Relaxed),
+            0,
+            "no chunk is fetched when every chunk is already verified"
+        );
+        assert_eq!(std::fs::read(root.join("done.bin")).unwrap(), data);
     }
 }

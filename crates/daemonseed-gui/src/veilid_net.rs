@@ -89,11 +89,14 @@ use daemonseed_core::share_announce::{
     open_announcement, seal_public_announcement, share_binding_is_valid,
 };
 use daemonseed_core::share_catalog::{CatalogChange, ShareCatalog, ShareListing};
+use daemonseed_core::share_envelope::ManifestEntry;
 use daemonseed_core::share_serve::ShareContent;
 use daemonseed_core::storage::cas::ChunkAddr;
 use daemonseed_core::storage::fetched::{
-    FetchedFile, FetchedStore, LiveFetchRegistry, SelectionRoot, StagingArea, place_at_dest,
+    FetchedFile, FetchedStore, LiveFetchRegistry, SelectionRoot, StagingArea, derive_resume_state,
+    manifest_digest, place_at_dest, verify_stored_manifest,
 };
+use daemonseed_core::storage::manifest_digest::ManifestDigestStore;
 use daemonseed_proto::v1 as wire;
 use daemonseed_veilid_net::download::{DownloadOutcome, PlannedFile, run_download};
 use daemonseed_veilid_net::{
@@ -392,6 +395,13 @@ struct ShareState {
     /// verification (ISC-A-S20) is the always-on enforcement; this flag is the UX
     /// guard that a user re-download of a poisoned share is warned about.
     poisoned_shares: HashSet<String>,
+    /// (download-subsystem redesign, step 8b / DL-ISC-20) The unlocked profile's
+    /// on-disk root — the client's own trusted state dir, set at `Connect`. A
+    /// verified resume anchors each fetch's confirmed-manifest digest in a
+    /// `ManifestDigestStore` under this dir (NOT the co-resident-writable downloads
+    /// root). `None` on the ephemeral / no-profile path — that session persists no
+    /// resume anchor, so a download simply re-fetches fresh on a later attempt.
+    profile_root: Option<PathBuf>,
 }
 
 impl ShareState {
@@ -413,6 +423,7 @@ impl ShareState {
             budget: Arc::new(RouteBudget::new()),
             live_fetches: LiveFetchRegistry::new(),
             poisoned_shares: HashSet::new(),
+            profile_root: None,
         }
     }
 
@@ -1263,11 +1274,16 @@ async fn handle_command(
             republish_roots,
             stable_signing_key,
             stable_share_root_ikm,
+            profile_root,
             ..
         } => {
             if let Some(h) = display_handle {
                 *my_handle = h;
             }
+            // (step 8b / DL-ISC-20) Hold the profile root for the session so a
+            // verified resume anchors each fetch's manifest digest in the client's
+            // own trusted state (a `ManifestDigestStore` under this dir).
+            shares.profile_root = profile_root;
             // Capture the stable identity key (least-authority: kept behind an Arc
             // for sealing announcements + minting the route-advert capability; the
             // raw key never enters veilid-net).
@@ -3055,6 +3071,9 @@ fn spawn_confirm_fetch(
     }
     let budget = shares.budget.clone();
     let live_fetches = shares.live_fetches.clone();
+    // (step 8b / DL-ISC-20) The profile root anchors this fetch's resume digest in
+    // the client's trusted state; `None` on the ephemeral path (no resume anchor).
+    let profile_root = shares.profile_root.clone();
     let handle = handle.clone();
     let evt_tx = evt_tx.clone();
     let share_id = share_id.to_owned();
@@ -3079,6 +3098,7 @@ fn spawn_confirm_fetch(
             room_key_bytes,
             sender_pubkey,
             fetched_root,
+            profile_root,
             selected,
             flat_dest,
             root_kind,
@@ -3220,6 +3240,7 @@ async fn run_confirm_download(
     room_key_bytes: [u8; 32],
     sender_pubkey: Vec<u8>,
     fetched_root: PathBuf,
+    profile_root: Option<PathBuf>,
     selected: Option<Vec<usize>>,
     flat_dest: bool,
     root_kind: crate::net::RootKind,
@@ -3277,65 +3298,19 @@ async fn run_confirm_download(
             bytes_written: 0,
         };
     }
-    let selected_rels: Vec<&str> = indices
-        .iter()
-        .map(|&i| manifest[i].rel_path.as_str())
-        .collect();
-
-    // Compute the staging destination root + each planned file's destination-relative path.
-    //   flat_dest (user-chosen dir): placement is a function of the selection roots (DL-ISC-8);
-    //     no downloads.idx (a chosen dest is unmanaged).
-    //   managed dir: <fetched_root>/<share-folder>/<rel_path>; the idx is registered on Complete.
-    let managed_folder: Option<String>;
-    let dest_root: PathBuf;
-    let planned: Vec<PlannedFile>;
-    if flat_dest {
-        let roots = selection_roots(root_kind, &selected_rels);
-        let placed = match place_at_dest(&roots, &selected_rels) {
-            Ok(p) => p,
-            Err(e) => {
-                return ConfirmOutcome::LocalFailed {
-                    message: format!("could not place the download under the chosen folder: {e}"),
-                };
-            }
-        };
-        // `place_at_dest` returns one PlacedFile per selected file, in input (indices) order.
-        planned = indices
-            .iter()
-            .zip(placed.iter())
-            .map(|(&i, pf)| PlannedFile {
-                dest_rel: pf.dest_rel.clone(),
-                size: manifest[i].size,
-                chunks: manifest[i].chunks.clone(),
-            })
-            .collect();
-        dest_root = fetched_root.clone();
-        managed_folder = None;
+    // Compute the staging destination root + managed-folder identity (independent of
+    // the per-file placement — resolved once, shared by fresh and resume).
+    //   flat_dest (user-chosen dir): the dest root IS the chosen dir; no downloads.idx.
+    //   managed dir: <fetched_root>/<share-folder>; the idx is registered on Complete.
+    let (dest_root, managed_folder): (PathBuf, Option<String>) = if flat_dest {
+        (fetched_root.clone(), None)
     } else {
-        // Managed downloads dir: resolve the share folder (reuse-on-re-fetch / collision-suffix),
-        // stage under it, dest_rel = the full share rel_path.
         let existing = FetchedStore::open(&fetched_root)
             .and_then(|s| s.list_shares())
             .unwrap_or_default();
         let folder = resolve_share_folder(&existing, &share_id, &name);
-        dest_root = fetched_root.join(&folder);
-        planned = indices
-            .iter()
-            .map(|&i| PlannedFile {
-                dest_rel: manifest[i].rel_path.clone(),
-                size: manifest[i].size,
-                chunks: manifest[i].chunks.clone(),
-            })
-            .collect();
-        managed_folder = Some(folder);
-    }
-
-    let total_chunks: u32 = planned.iter().map(|p| p.chunks.len() as u32).sum();
-    let _ = evt_tx.send(NetEvent::FetchProgress {
-        total_chunks: Some(total_chunks),
-        chunks_received: 0,
-        bytes_received: 0,
-    });
+        (fetched_root.join(&folder), Some(folder))
+    };
 
     let staging = match StagingArea::open(&dest_root, &share_id) {
         Ok(s) => s,
@@ -3345,6 +3320,233 @@ async fn run_confirm_download(
             };
         }
     };
+
+    // Place the SELECTED files at their destination-relative paths from a source
+    // manifest — identical placement for a fresh confirm and a resume (DL-ISC-8 /
+    // precondition D): `flat_dest` uses the selection roots; the managed dir keeps
+    // the full share rel_path. `already_verified` is filled later (resume only).
+    let build_planned = |source: &[ManifestEntry]| -> Result<Vec<PlannedFile>, ConfirmOutcome> {
+        let sel_rels: Vec<&str> = indices
+            .iter()
+            .map(|&i| source[i].rel_path.as_str())
+            .collect();
+        if flat_dest {
+            let roots = selection_roots(root_kind, &sel_rels);
+            let placed =
+                place_at_dest(&roots, &sel_rels).map_err(|e| ConfirmOutcome::LocalFailed {
+                    message: format!("could not place the download under the chosen folder: {e}"),
+                })?;
+            // `place_at_dest` returns one PlacedFile per selected file, in indices order.
+            Ok(indices
+                .iter()
+                .zip(placed.iter())
+                .map(|(&i, pf)| PlannedFile {
+                    dest_rel: pf.dest_rel.clone(),
+                    size: source[i].size,
+                    chunks: source[i].chunks.clone(),
+                    already_verified: Vec::new(),
+                })
+                .collect())
+        } else {
+            Ok(indices
+                .iter()
+                .map(|&i| PlannedFile {
+                    dest_rel: source[i].rel_path.clone(),
+                    size: source[i].size,
+                    chunks: source[i].chunks.clone(),
+                    already_verified: Vec::new(),
+                })
+                .collect())
+        }
+    };
+
+    // ── Resume detection (fail-closed, DL-ISC-20) ──
+    // A resume is a re-initiated ConfirmFetch for a share whose staging already
+    // carries a stored confirmed manifest. It proceeds ONLY through the full
+    // fail-closed chain and HALTS on any break — never resuming without the
+    // profile-anchored digest, never reinterpreting retained bytes under a
+    // different manifest. A fresh download has no stored manifest and skips this.
+    let stored_manifest_present = staging.read_stored_manifest().is_ok();
+    let resume: Option<Vec<ManifestEntry>> = if stored_manifest_present {
+        // Staging carries a persisted manifest → a resume. Without the profile store
+        // there is no trusted anchor to verify it against → HALT (precondition A).
+        let Some(profile_root) = profile_root.as_ref() else {
+            return ConfirmOutcome::LocalFailed {
+                message: "an incomplete download exists but no unlocked profile is available to \
+                          verify its integrity anchor — reconnect with your profile, or delete the \
+                          incomplete download and start over"
+                    .to_owned(),
+            };
+        };
+        // Read the profile-anchored digest, then DROP the store before the long
+        // download: redb::Database::create takes an EXCLUSIVE lock, so a long-lived
+        // handle would block the other frontend (precondition B).
+        let digest = {
+            let store = match ManifestDigestStore::open(profile_root.join(DIGEST_STORE_FILE)) {
+                Ok(s) => s,
+                Err(e) => {
+                    return ConfirmOutcome::LocalFailed {
+                        message: format!("could not open the resume integrity-anchor store: {e}"),
+                    };
+                }
+            };
+            match store.get_digest(&share_id) {
+                // [precondition A] Staging exists but no anchor → HALT. Never fall
+                // through to a fresh download that reuses/ignores staging unanchored.
+                Ok(None) => {
+                    return ConfirmOutcome::LocalFailed {
+                        message:
+                            "the incomplete download is missing its integrity anchor — delete \
+                                  it and start the download over"
+                                .to_owned(),
+                    };
+                }
+                Ok(Some(d)) => d,
+                Err(e) => {
+                    return ConfirmOutcome::LocalFailed {
+                        message: format!("could not read the resume integrity anchor: {e}"),
+                    };
+                }
+            }
+        };
+        // Verify the stored staging manifest against the anchor (DL-ISC-20). A
+        // tampered / swapped / missing manifest → HALT (re-gate).
+        let stored = match verify_stored_manifest(&staging, &digest) {
+            Ok(m) => m,
+            Err(e) => {
+                return ConfirmOutcome::LocalFailed {
+                    message: format!(
+                        "the incomplete download failed its integrity check — delete it and start \
+                         over: {e}"
+                    ),
+                };
+            }
+        };
+        // Compare the re-fetched LIVE manifest to the digest-verified STORED one
+        // (precondition C). If the sharer changed the content set, HALT + re-gate on
+        // preview/confirm — retained bytes are never reinterpreted under a different
+        // manifest, and the resume fetches ONLY against the stored chunk addresses.
+        // Surfaced as LocalFailed (a plain FetchError, NO Unresolved mark + NO parked
+        // retry): a content-set change is neither a route death (RouteFailed would
+        // park a doomed auto-retry) nor poison — the user re-opens the share to
+        // preview and re-confirm the new contents (ISC-A-C33/C66).
+        if manifest != stored {
+            // The sharer changed the content set. The stale partial cannot be reused
+            // under a different manifest (retained bytes are never reinterpreted), so
+            // DISCARD it + its anchor — a re-open then previews and downloads the NEW
+            // contents fresh (design §Part 3 re-gate). Without this, the stale stored
+            // manifest would re-trigger this same halt forever (xhigh review F1).
+            // Best-effort cleanup; the download halts regardless.
+            let _ = staging.destroy();
+            if let Ok(store) = ManifestDigestStore::open(profile_root.join(DIGEST_STORE_FILE)) {
+                let _ = store.remove(&share_id);
+            }
+            return ConfirmOutcome::LocalFailed {
+                message: "the share's contents changed since this download was confirmed — the \
+                          incomplete download was discarded; open the share again to download the \
+                          new contents"
+                    .to_owned(),
+            };
+        }
+        Some(stored)
+    } else {
+        None
+    };
+
+    // The placement source: the digest-verified STORED manifest on a resume (fetch
+    // only against stored chunk addresses), else the live manifest.
+    let source_manifest: &[ManifestEntry] = resume.as_deref().unwrap_or(&manifest);
+    let planned_all = match build_planned(source_manifest) {
+        Ok(p) => p,
+        Err(o) => return o,
+    };
+    // The managed-dir idx records EVERY selected file (done + to-run) on completion.
+    let idx_recs: Vec<FetchedFile> = planned_all
+        .iter()
+        .map(|p| FetchedFile {
+            rel_path: p.dest_rel.clone(),
+            size: p.size,
+        })
+        .collect();
+
+    // On a resume, re-derive per-file verified state from BYTES ON DISK (DL-ISC-12)
+    // and split: a file already promoted at the dest (complete + present at its
+    // confirmed size) is DONE; every other file runs (missing chunks, or complete
+    // only in staging — which the engine promotes). `already_verified` marks the
+    // chunks the engine SKIPS fetching.
+    let (to_run, done_files, done_bytes, resumed_verified_chunks) = if resume.is_some() {
+        let placement_manifest: Vec<ManifestEntry> = planned_all
+            .iter()
+            .map(|p| ManifestEntry {
+                rel_path: p.dest_rel.clone(),
+                size: p.size,
+                chunks: p.chunks.clone(),
+            })
+            .collect();
+        let plan = derive_resume_state(&placement_manifest, &dest_root, &staging);
+        let mut to_run: Vec<PlannedFile> = Vec::new();
+        let mut done_files: u32 = 0;
+        let mut done_bytes: u64 = 0;
+        let mut resumed_verified: usize = 0;
+        for (pf, fr) in planned_all.into_iter().zip(plan.files.iter()) {
+            // A file already complete + verified at its dest (content-checked in
+            // `derive_resume_state::promoted_complete`, not length-only) is kept as-is;
+            // everything else runs, skipping only its STAGING-verified chunks (never a
+            // promoted-only chunk — that would promote a sparse zero-hole).
+            let done_at_dest = fr.promoted_complete;
+            if done_at_dest {
+                done_files += 1;
+                done_bytes += pf.size;
+            } else {
+                resumed_verified += fr.verified.len();
+                to_run.push(PlannedFile {
+                    already_verified: fr.verified.clone(),
+                    ..pf
+                });
+            }
+        }
+        (to_run, done_files, done_bytes, resumed_verified)
+    } else {
+        (planned_all, 0u32, 0u64, 0usize)
+    };
+
+    // Fresh download: anchor the digest FIRST (then drop the store before the long
+    // download — precondition B), then persist the FULL confirmed manifest with
+    // SHARE rel_paths into staging (Part B) — so a failure never leaves a stored
+    // manifest without its anchor. Skipped on the ephemeral path (no profile store →
+    // no resume anchor; fail-closed — a later resume finds no anchor and re-downloads).
+    let fresh = resume.is_none();
+    if let Some(profile_root) = profile_root.as_ref().filter(|_| fresh) {
+        let digest = match manifest_digest(&manifest) {
+            Ok(d) => d,
+            Err(e) => {
+                return ConfirmOutcome::LocalFailed {
+                    message: format!("could not digest the confirmed manifest for resume: {e}"),
+                };
+            }
+        };
+        if let Err(e) = ManifestDigestStore::open(profile_root.join(DIGEST_STORE_FILE))
+            .and_then(|store| store.record_digest(&share_id, &digest))
+        {
+            return ConfirmOutcome::LocalFailed {
+                message: format!("could not record the resume integrity anchor: {e}"),
+            };
+        }
+        if let Err(e) = staging.persist_manifest(&manifest) {
+            return ConfirmOutcome::LocalFailed {
+                message: format!("could not persist the confirmed manifest for resume: {e}"),
+            };
+        }
+    }
+
+    let total_chunks: u32 = to_run.iter().map(|p| p.chunks.len() as u32).sum();
+    // Seed the bar with the chunks already re-verified this resume so it resumes
+    // ahead of zero; the engine then reports cumulative totals over `to_run`.
+    let _ = evt_tx.send(NetEvent::FetchProgress {
+        total_chunks: Some(total_chunks),
+        chunks_received: resumed_verified_chunks as u32,
+        bytes_received: 0,
+    });
 
     // The engine's chunk closure: one budget-admitted, SHA-384-verified chunk fetch, discarding
     // the latency Duration (the controller is fed INTERNALLY by `fetch_chunk_budgeted`). The one
@@ -3383,7 +3585,24 @@ async fn run_confirm_download(
         });
     };
 
-    let outcome = run_download(&planned, &staging, &fetch_chunk, &progress).await;
+    // Every selected file was already complete at the dest (a resume with nothing to
+    // do): finish without touching the network and clean up the spent staging. Else
+    // run the engine over the runnable files and fold in the already-complete count.
+    let outcome = if to_run.is_empty() {
+        let _ = staging.destroy();
+        DownloadOutcome::Complete {
+            files: done_files,
+            bytes: done_bytes,
+        }
+    } else {
+        match run_download(&to_run, &staging, &fetch_chunk, &progress).await {
+            DownloadOutcome::Complete { files, bytes } => DownloadOutcome::Complete {
+                files: files + done_files,
+                bytes: bytes + done_bytes,
+            },
+            other => other,
+        }
+    };
 
     // Managed dir: on a completed download, register the downloads.idx entry for the
     // already-promoted files — idx-only, no byte re-buffering (#207). Done off-loop here (a
@@ -3393,15 +3612,8 @@ async fn run_confirm_download(
     // `Complete` would be a silent success — surface the error instead (xhigh review finding).
     let outcome = match (outcome, &managed_folder) {
         (DownloadOutcome::Complete { files, bytes }, Some(folder)) => {
-            let recs: Vec<FetchedFile> = planned
-                .iter()
-                .map(|p| FetchedFile {
-                    rel_path: p.dest_rel.clone(),
-                    size: p.size,
-                })
-                .collect();
             match FetchedStore::open(&fetched_root)
-                .and_then(|mut store| store.register_share(&share_id, &name, folder, &recs))
+                .and_then(|mut store| store.register_share(&share_id, &name, folder, &idx_recs))
             {
                 Ok(_) => DownloadOutcome::Complete { files, bytes },
                 Err(e) => DownloadOutcome::LocalFailed {
@@ -3417,6 +3629,12 @@ async fn run_confirm_download(
 
     confirm_outcome_from(outcome, share_id, name)
 }
+
+/// (download-subsystem redesign, step 8b / DL-ISC-20) The profile-local redb file
+/// anchoring each fetch's confirmed-manifest digest for a verified resume. Lives
+/// under the private profile root (the client's own trusted state), NOT the
+/// co-resident-writable downloads root.
+const DIGEST_STORE_FILE: &str = "download-manifest-digests.redb";
 
 /// (download-subsystem redesign, step 5 / DL-ISC-8) Map the engine's [`DownloadOutcome`] onto
 /// the frontend's [`ConfirmOutcome`] — the dictated 1:1 mapping (design §"Outcome + fold
