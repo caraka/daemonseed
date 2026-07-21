@@ -684,7 +684,7 @@ where
     open_manifest_frame(room_key, &sealed)
 }
 
-/// Budget-admitted chunk fetch — the [`fetch_chunk`] replacement (ISC-S28 /
+/// Budget-admitted chunk fetch — replacing the retired window-parameter path (ISC-S28 /
 /// ISC-A-S20). Returns the verified chunk bytes plus the MAX per-fragment
 /// latency observed (kept for telemetry; the controller is fed live via
 /// `lease.observe` inside the fetch).

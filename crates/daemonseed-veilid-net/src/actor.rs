@@ -502,9 +502,9 @@ impl VeilidNetHandle {
         .await
     }
 
-    /// Budget-admitted chunk fetch (download-subsystem redesign, step 5). Same as
-    /// [`fetch_chunk`](Self::fetch_chunk) — reassemble + open + SHA-384-VERIFY one
-    /// chunk (ISC-S28 / ISC-A-S20) — but every fragment `app_call` is admitted
+    /// Budget-admitted chunk fetch (download-subsystem redesign, step 5). Reassembles,
+    /// opens, and SHA-384-VERIFIES one chunk (ISC-S28 / ISC-A-S20) — but every fragment
+    /// `app_call` is admitted
     /// through the shared per-route budget via `lease`, and the controller's
     /// `Failed`/`Completed` observations are fed INTERNALLY (the caller never calls
     /// `observe`). Returns the verified bytes + the max per-fragment latency.

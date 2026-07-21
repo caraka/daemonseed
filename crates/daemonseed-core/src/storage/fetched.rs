@@ -70,7 +70,7 @@ const MANIFEST_HEADER: &str = "# daemonseed downloads manifest v2";
 
 /// The reserved staging directory component under a downloads/destination root
 /// (`<root>/.dspart/<share_id>/…`). No manifest `rel_path` may name it —
-/// [`sanitize_rel_path`] refuses it — so a hostile sharer can neither collide
+/// `sanitize_rel_path` refuses it — so a hostile sharer can neither collide
 /// with an in-progress partial nor plant a file the sweep would delete
 /// (download-subsystem redesign §Part 3; DL-ISC-18).
 pub const STAGING_DIR: &str = ".dspart";
@@ -293,7 +293,7 @@ impl FetchedStore {
 
     /// Register an ALREADY-PROMOTED managed download in `downloads.idx` without
     /// writing any file bytes (download-subsystem redesign, step 5). The shared
-    /// engine ([`daemonseed_veilid_net::download::run_download`]) has already
+    /// engine (`daemonseed_veilid_net::download::run_download`) has already
     /// staged + promoted every file to `<root>/<folder>/<rel_path>`, so this only
     /// records the idx entry — unlike [`record_share`](Self::record_share), which
     /// writes bytes from an in-RAM [`VerifiedFile`] buffer (the pattern #207
@@ -883,7 +883,7 @@ impl StagingArea {
     }
 
     /// Persist the user-confirmed manifest into this fetch's staging area (the
-    /// deterministic canonical serialization — [`serialize_stored_manifest`]). A
+    /// deterministic canonical serialization — `serialize_stored_manifest`). A
     /// resume binds to this stored copy (DL-ISC-20): its digest is anchored in the
     /// profile's [`super::manifest_digest::ManifestDigestStore`] and re-verified
     /// before any reuse. Written via a temp sibling + rename so a crash mid-write
@@ -1013,7 +1013,7 @@ pub(crate) fn deserialize_stored_manifest(
     Ok(out)
 }
 
-/// SHA-384 over the [`serialize_stored_manifest`] bytes — the digest a resume
+/// SHA-384 over the `serialize_stored_manifest` bytes — the digest a resume
 /// re-derives and compares against the profile-anchored copy (DL-ISC-20). The
 /// only failure is SHA-384's power-up self-test not having passed (never on a real
 /// download path).

@@ -33,7 +33,7 @@
 //! A share's bytes move owner-on-demand over `app_call` + a private route:
 //! [`VeilidNetHandle::serve_share`] registers an indexed share, and a fetcher
 //! pulls it with [`VeilidNetHandle::fetch_manifest`] +
-//! [`VeilidNetHandle::fetch_chunk`]. The 1 MiB content-addressed chunks are
+//! [`VeilidNetHandle::fetch_chunk_budgeted`]. The 1 MiB content-addressed chunks are
 //! transport-fragmented to ≤32 KiB and reassembled, then SHA-384-verified
 //! against their address (ISC-S28). Content stays sealed under the
 //! `PublicRoomKey` (ISC-A-S22).
