@@ -1215,6 +1215,18 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   (retire the dev seed, read-only-by-pubkey subscribe, maintainer-held offline seed), which remains the
   tracked follow-up. #191 filed for operator delete/tombstone of announcement posts (compose is
   insert-only). (Sanjay, 2026-07-15.)
+- 2026-07-21: **Fetch route-window pinned to the floor on veilid 0.5.7 (redesign felt-test regression).**
+  A live 2-client felt-test (orinoco) failed every download from two independent sources with
+  `could not get remote private route`: the per-route AIMD window (`route_budget`) climbs to `W_CEIL=8`,
+  but veilid-0.5.7 serving routes die above ~2 concurrent fragment `app_call`s (the `share.rs` #204 bisect
+  — "8 and 4 both killed the route; 1 and 2 held"), and that death is terminal, so the climb-to-probe kills
+  the route it probes. The pre-redesign path used a static cap of 2; the redesign regressed it.
+  **Decision:** keep the full controller (caraka: "we may need the adaptive machinery when the network
+  matures") and pin only the *live starting ceiling* — new `DEFAULT_ROUTE_CEIL = W_FLOOR`, seeded by
+  `RouteBudget::new()`; `with_default_ceiling(c)` lets the oracle suite still exercise the climb to
+  `W_CEIL`. Re-enable by raising the one const. DL-ISC-15's probe
+  (`window_climbs_to_ceiling_under_sustained_health`) is controller-level and still passes — production
+  merely configures a lower ceiling. (Sanjay, 2026-07-21.)
 
 ## Changelog
 
@@ -1805,3 +1817,10 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   regression). No runnable bin built. **DEFERRED-VERIFY → orinoco (render):** the mask shows on Connect
   with the branded copy + live status, dismisses on the first Lobby/circle message or a peer appearing
   on the roster, and "Enter anyway" dismisses it manually. (Sanjay, 2026-07-08.)
+- GATE-GREEN + FELT-TEST 2026-07-21: **fetch route-window clamp (`DEFAULT_ROUTE_CEIL`).**
+  `daemonseed-veilid-net`: fmt clean; `clippy --all-targets -- -D warnings` clean; `cargo test --lib`
+  89/89 (machinery tests re-pointed to `with_default_ceiling(W_CEIL)`; added
+  `production_default_pins_the_window_at_the_floor`). **Live felt-test (orinoco, caraka):** lobby/circle
+  chat OK; downloads from ds1 and frank both complete into their folders; `~/build/dsB.log` shows 0
+  `could not get remote private route` + 0 `fetch fragment … failed` (broken build: 584 / 587). Rule-1
+  live-probe: PASS. (Sanjay, 2026-07-21.)

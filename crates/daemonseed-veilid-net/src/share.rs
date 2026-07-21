@@ -904,7 +904,7 @@ mod tests {
             }
         };
 
-        let budget = Arc::new(RouteBudget::<u32>::new());
+        let budget = Arc::new(RouteBudget::<u32>::with_default_ceiling(W_CEIL));
         let lease = budget.lease(7, SharerKey(vec![7]));
 
         let manifest = fetch_manifest_budgeted(&share_id, &rk, &lease, &call)
@@ -943,7 +943,7 @@ mod tests {
     async fn a_route_death_collapses_the_window_once_not_per_fragment() {
         use crate::route_budget::{RouteBudget, SharerKey, W_CEIL, W_FLOOR};
         let _ = oxicrypt_module::initialize();
-        let budget = Arc::new(RouteBudget::<u32>::new());
+        let budget = Arc::new(RouteBudget::<u32>::with_default_ceiling(W_CEIL));
         let lease = budget.lease(1, SharerKey(vec![1]));
         // Climb the window to the ceiling so the killing width is W_CEIL.
         for _ in 0..64 {

@@ -155,6 +155,8 @@ types:
       Per-route concurrency budget (generic over the route key; production keys on
       RouteId). `lease(route, sharer)` returns a RouteLease; admission is
       counter-gated at `in_flight(route) < W(route)` and `in_flight(global) < G`.
+      `new()` starts fresh routes at `DEFAULT_ROUTE_CEIL`; `with_default_ceiling(c)`
+      overrides the fresh-route starting ceiling.
   - name: RouteLease
     module: daemonseed_veilid_net::route_budget
     kind: struct
@@ -1020,6 +1022,11 @@ constants:
     type: usize
     value: "8"
     description: Widest a single route's budget opens; W_CEIL < G_GLOBAL is a design invariant.
+  - name: DEFAULT_ROUTE_CEIL
+    module: daemonseed_veilid_net::route_budget
+    type: usize
+    value: "2"
+    description: Fresh-route starting ceiling in production (= W_FLOOR); pins the fetch window on veilid 0.5.7, where a serving route dies above ~2 concurrent fragment app_calls.
   - name: G_GLOBAL
     module: daemonseed_veilid_net::route_budget
     type: usize

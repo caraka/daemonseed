@@ -61,6 +61,17 @@ pub const W_FLOOR: usize = 2;
 /// Widest a single route's budget ever opens (the ceiling of the climb). A
 /// healthy route reaches this under sustained clean completions (DL-ISC-15).
 pub const W_CEIL: usize = 8;
+/// The per-route ceiling a FRESH (unlearned) sharer's window starts at in
+/// production. Pinned to [`W_FLOOR`] on veilid 0.5.7: a serving private route
+/// dies above ~2 concurrent fragment `app_call`s (the `share.rs` #204 bisect —
+/// "8 and 4 both killed the route; 1 and 2 held"), and that death is TERMINAL
+/// (unrecoverable mid-download), so the AIMD's climb-to-probe would kill the very
+/// route it probes. The full controller (climb to [`W_CEIL`], collapse, latency
+/// valve) is RETAINED, exercised by the oracle suite via
+/// [`RouteBudget::with_default_ceiling`], and re-enabled in production by raising
+/// this back toward `W_CEIL` once Veilid route stability tolerates a wider fetch
+/// window.
+pub const DEFAULT_ROUTE_CEIL: usize = W_FLOOR;
 /// Fetcher-global cap: total in-flight fragment `app_call`s across ALL routes.
 /// The fetcher's own capacity. `W_CEIL < G_GLOBAL` is a design invariant
 /// (DL-ISC-19): one route at ceiling must never occupy the whole global pool, or
@@ -253,11 +264,25 @@ struct BudgetState<R: Eq + Hash> {
 pub struct RouteBudget<R: Clone + Eq + Hash> {
     state: Mutex<BudgetState<R>>,
     notify: Notify,
+    /// Ceiling a fresh (unlearned) route's window starts at. Production seeds this
+    /// from [`DEFAULT_ROUTE_CEIL`] (pinned to the floor on veilid 0.5.7); the test
+    /// suite raises it via [`RouteBudget::with_default_ceiling`] to exercise the
+    /// climb. Immutable after construction; a learned ceiling still overrides it.
+    default_ceiling: usize,
 }
 
 impl<R: Clone + Eq + Hash> RouteBudget<R> {
-    /// An empty registry.
+    /// An empty registry, fresh routes starting at the production
+    /// [`DEFAULT_ROUTE_CEIL`] (pinned to the floor on veilid 0.5.7).
     pub fn new() -> Self {
+        Self::with_default_ceiling(DEFAULT_ROUTE_CEIL)
+    }
+
+    /// As [`new`](Self::new), but fresh routes start at `default_ceiling` instead
+    /// of the production [`DEFAULT_ROUTE_CEIL`]. The oracle/integration suite uses
+    /// this to exercise the full climb to [`W_CEIL`]; production always uses
+    /// [`new`](Self::new). A learned ceiling still overrides the default per sharer.
+    pub fn with_default_ceiling(default_ceiling: usize) -> Self {
         Self {
             state: Mutex::new(BudgetState {
                 global_in_flight: 0,
@@ -265,6 +290,7 @@ impl<R: Clone + Eq + Hash> RouteBudget<R> {
                 ceilings: HashMap::new(),
             }),
             notify: Notify::new(),
+            default_ceiling,
         }
     }
 
@@ -273,8 +299,9 @@ impl<R: Clone + Eq + Hash> RouteBudget<R> {
     /// on first lease, seeded from the sharer's learned ceiling) and is where
     /// fragment admissions are acquired and completions observed.
     pub fn lease(self: &Arc<Self>, route: R, sharer: SharerKey) -> RouteLease<R> {
+        let default_ceiling = self.default_ceiling;
         let mut st = self.state.lock().unwrap();
-        let ceiling = st.ceilings.get(&sharer).copied().unwrap_or(W_CEIL);
+        let ceiling = st.ceilings.get(&sharer).copied().unwrap_or(default_ceiling);
         let acct = st
             .routes
             .entry(route.clone())
@@ -612,7 +639,7 @@ mod tests {
     /// under many concurrent acquirers.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn peak_in_flight_never_exceeds_the_route_window() {
-        let budget = Arc::new(RouteBudget::<u32>::new());
+        let budget = Arc::new(RouteBudget::<u32>::with_default_ceiling(W_CEIL));
         let lease = Arc::new(budget.lease(1, sharer(1)));
         // Fresh window is at W_FLOOR.
         assert_eq!(budget.route_width(&1), W_FLOOR);
@@ -640,11 +667,36 @@ mod tests {
         assert_eq!(budget.global_in_flight(), 0, "all permits released");
     }
 
+    /// Production clamp (veilid 0.5.7): the production constructor pins a fresh
+    /// route at the floor — even sustained clean completions never widen the
+    /// window past `W_FLOOR` (`DEFAULT_ROUTE_CEIL`). Regression guard for the #204
+    /// route-death clamp; the full climb machinery is retained and covered by the
+    /// `with_default_ceiling(W_CEIL)` tests above.
+    #[test]
+    fn production_default_pins_the_window_at_the_floor() {
+        assert_eq!(
+            DEFAULT_ROUTE_CEIL, W_FLOOR,
+            "the live default is the proven-safe floor on veilid 0.5.7"
+        );
+        let budget = Arc::new(RouteBudget::<u32>::new());
+        let lease = budget.lease(1, sharer(1));
+        for _ in 0..64 {
+            lease.observe(FragmentOutcome::Completed {
+                over_threshold: false,
+            });
+        }
+        assert_eq!(
+            budget.route_width(&1),
+            W_FLOOR,
+            "production default never climbs above the floor"
+        );
+    }
+
     /// DL-ISC-16 (liveness) + DL-ISC-1: with the window climbed, concurrent
     /// acquirers genuinely parallelize above the floor, still bounded by width.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn files_parallelize_under_a_climbed_window() {
-        let budget = Arc::new(RouteBudget::<u32>::new());
+        let budget = Arc::new(RouteBudget::<u32>::with_default_ceiling(W_CEIL));
         let lease = Arc::new(budget.lease(1, sharer(1)));
         for _ in 0..64 {
             lease.observe(FragmentOutcome::Completed {
@@ -682,7 +734,7 @@ mod tests {
     /// route (at W_CEIL) always leaves headroom for a second route to admit.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn distinct_routes_are_independent_and_bounded_by_g() {
-        let budget = Arc::new(RouteBudget::<u32>::new());
+        let budget = Arc::new(RouteBudget::<u32>::with_default_ceiling(W_CEIL));
         // Two routes from two sharers, each climbed to W_CEIL.
         let a = Arc::new(budget.lease(1, sharer(1)));
         let b = Arc::new(budget.lease(2, sharer(2)));
@@ -725,7 +777,7 @@ mod tests {
     /// route still admits (global headroom guaranteed by W_CEIL < G_GLOBAL).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_saturated_route_never_blocks_another() {
-        let budget = Arc::new(RouteBudget::<u32>::new());
+        let budget = Arc::new(RouteBudget::<u32>::with_default_ceiling(W_CEIL));
         let a = Arc::new(budget.lease(1, sharer(1)));
         for _ in 0..64 {
             a.observe(FragmentOutcome::Completed {
@@ -754,7 +806,7 @@ mod tests {
     /// the sleep.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn dropping_a_permit_frees_the_slot_and_wakes_a_waiter() {
-        let budget = Arc::new(RouteBudget::<u32>::new());
+        let budget = Arc::new(RouteBudget::<u32>::with_default_ceiling(W_CEIL));
         let lease = Arc::new(budget.lease(1, sharer(1)));
         // Fill the route to its floor window.
         let p1 = lease.acquire().await;
@@ -779,7 +831,7 @@ mod tests {
     /// re-leased route on that sharer cannot climb past the learned ceiling.
     #[tokio::test]
     async fn learned_ceiling_survives_route_rotation() {
-        let budget = Arc::new(RouteBudget::<u32>::new());
+        let budget = Arc::new(RouteBudget::<u32>::with_default_ceiling(W_CEIL));
         {
             let lease = budget.lease(10, sharer(9)); // route 10, sharer 9
             for _ in 0..64 {
@@ -809,7 +861,7 @@ mod tests {
     /// higher would-be ceiling never raises it back within the session.
     #[tokio::test]
     async fn learned_ceiling_only_ratchets_down() {
-        let budget = Arc::new(RouteBudget::<u32>::new());
+        let budget = Arc::new(RouteBudget::<u32>::with_default_ceiling(W_CEIL));
         let lease = budget.lease(1, sharer(1));
         for _ in 0..64 {
             lease.observe(FragmentOutcome::Completed {
@@ -837,7 +889,7 @@ mod tests {
     /// route-lifetime), while the sharer ceiling persists (DL-ISC-2 lifetime).
     #[tokio::test]
     async fn route_account_drops_with_its_last_lease() {
-        let budget = Arc::new(RouteBudget::<u32>::new());
+        let budget = Arc::new(RouteBudget::<u32>::with_default_ceiling(W_CEIL));
         let l1 = budget.lease(1, sharer(1));
         let l2 = budget.lease(1, sharer(1)); // same route, second reference
         assert_eq!(budget.route_width(&1), W_FLOOR);

@@ -26,7 +26,7 @@ work lives in the project lead's vault manifest, not here.
 
 ### Added
 
-- `daemonseed-veilid-net`: a per-route concurrency budget (`route_budget::RouteBudget`) capping in-flight fragment `app_call`s per serving route, with a global cap and an error-primary window controller (`docs/design/download-subsystem.md` Part 1).
+- `daemonseed-veilid-net`: a per-route concurrency budget (`route_budget::RouteBudget`) capping in-flight fragment `app_call`s per serving route, with a global cap and an error-primary window controller; the fresh-route ceiling is a constructor knob (`RouteBudget::with_default_ceiling`), pinned in production to `DEFAULT_ROUTE_CEIL` (the floor) on veilid 0.5.7 (`docs/design/download-subsystem.md` Part 1).
 - `daemonseed-veilid-net`: budget-admitted fetch variants (`share::fetch_manifest_budgeted` / `fetch_chunk_budgeted`) that admit every fragment through the per-route budget (`docs/design/download-subsystem.md` step 3).
 - `daemonseed-core`: `storage::fetched::place_at_dest` — placement of a fetch's selected files under a user-chosen destination as a total function of the selection roots (`SelectionRoot`) (`docs/design/download-subsystem.md` Part 2).
 - `daemonseed-core`: `storage::fetched::StagingArea` — stages a download's verified chunks at their offsets in a reserved `.dspart/<share_id>/` namespace and promotes each file (no-clobber) on completion (`docs/design/download-subsystem.md` Part 3).
