@@ -80,6 +80,15 @@ pub enum NetCommand {
         /// is `Clone` + redacted `Debug`, so it rides the enum directly — no
         /// wrapper needed.)
         stable_share_root_ikm: Option<ShareRootIkm>,
+        /// (download-subsystem redesign, step 8b-2 / DL-ISC-20) the unlocked
+        /// profile's on-disk ROOT — the client's own trusted state dir (where
+        /// `seeds.blob` / `share-index.redb` live). The actor holds it so a verified
+        /// resume can anchor each fetch's confirmed-manifest digest in
+        /// `storage::manifest_digest::ManifestDigestStore` under this dir (NOT the
+        /// co-resident-writable downloads root). `None` on the no-profile path — that
+        /// session persists no resume anchor, so a later resume finds no digest and
+        /// re-downloads fresh (fail-closed).
+        profile_root: Option<PathBuf>,
     },
     /// Join a circle by its shared phrase: derive the circle key, subscribe to
     /// the rendezvous asset on the connected relay, and stream chat (ISC-15/16).

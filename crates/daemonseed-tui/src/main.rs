@@ -188,6 +188,12 @@ fn run(
                 trusted: req.trusted,
                 stable_signing_key,
                 stable_share_root_ikm,
+                // (step 8b-2 / DL-ISC-20) Hand the profile root to the actor so a
+                // verified resume anchors each fetch's manifest digest in the
+                // client's own trusted state (not the co-resident downloads root).
+                // The TUI always runs under an unlocked profile root, so this is
+                // always available; the field stays `Option` for parity with the GUI.
+                profile_root: Some(profile_root.clone()),
             });
         }
         if let Some(phrase) = app.take_pending_join() {
