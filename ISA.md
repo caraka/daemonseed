@@ -1268,6 +1268,14 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   that gate (dev-possession, ISC-15-precursor `operator_write_enabled`), so debug builds are not handed to
   testers until the offline lockdown lands. (Sanjay, 2026-07-22.)
 
+- **Chat-bubble right-click Copy — affordance scope (2026-07-22).** The GUI now offers right-click
+  Copy on read-only chat message bubbles (the alpha entropy-sharing path). This extends the `#67`
+  context-menu work — whose remaining gap was message bubbles — beyond ISC-C97 (scoped to primary
+  text-entry fields: composer, Join-phrase). Deliberately **no new ISC**: it is a read-only
+  convenience with no boundary/state effect, verified by GUI felt-test (lobby + circles) and a
+  clipboard-mechanism harness, not a unit-testable client invariant. A formal `ISC-C*` can be minted
+  if the copy surface grows (selection, per-field menus). (Sanjay, 2026-07-22.)
+
 ## Changelog
 
 - **conjectured:** the multi-circle carousel (ISC-C60) lets the active surface span the lobby and the

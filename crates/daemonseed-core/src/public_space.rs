@@ -204,10 +204,12 @@ pub fn project_release_pubkey() -> &'static [u8; ml_dsa::PK_LEN] {
     })
 }
 
-/// The **development** project-release SIGNING keypair (F17), from the in-source
-/// `PROJECT_RELEASE_SEED` — the dev analog of [`project_release_pubkey`], exposing
-/// the key the dev composer signs MOTD/announcements with. Dev-only: retired when the
-/// seed becomes a baked-in pubkey with an offline secret. See ISA A0/A1.
+/// The in-source project-release SIGNING keypair (F17), derived from
+/// `PROJECT_RELEASE_SEED` — the companion of [`project_release_pubkey`], exposing the
+/// key the operator composer signs MOTD/announcements with. Interim ISC-15: the seed
+/// is the rotated maintainer value but still in-source; this convenience is retired at
+/// the offline lockdown (seed offline, only the pubkey baked). See the
+/// `PROJECT_RELEASE_SEED` doc above and ISA A0/A1.
 pub fn dev_project_release_keypair() -> Result<SignKeypair, KeyDerivationError> {
     SignKeypair::from_ml_dsa_seed(&PROJECT_RELEASE_SEED)
 }
@@ -261,8 +263,9 @@ impl std::error::Error for AnnounceOwnerError {}
 /// Domain-separated from the F17 content-signing key (which uses `project_seed`
 /// as an ML-DSA seed directly), so a holder of one cannot derive the other. In
 /// production `project_seed` stays OFFLINE (maintainer-held) and only the derived
-/// owner PUBKEY is baked into clients; the in-source `PROJECT_RELEASE_SEED` is a
-/// dev placeholder (see [`dev_project_announce_veilid_owner_seed`]).
+/// owner PUBKEY is baked into clients; the in-source `PROJECT_RELEASE_SEED` is the
+/// interim maintainer seed — still in-source pending the offline lockdown (see its doc
+/// above; consumed via [`dev_project_announce_veilid_owner_seed`]).
 pub fn derive_project_announce_veilid_owner_seed(
     project_seed: &[u8; 32],
 ) -> Result<ProjectAnnounceVeilidOwnerSeed, AnnounceOwnerError> {
@@ -274,14 +277,13 @@ pub fn derive_project_announce_veilid_owner_seed(
     ))
 }
 
-/// The **development** project-announce owner seed, derived from the in-source
-/// `PROJECT_RELEASE_SEED` placeholder (F17). The dev analog of
-/// [`project_release_pubkey`]: during the private phase the project seed is
-/// in-source, so this exposes the dev channel's write-gate for the client composer
-/// and felt-tests. **Dev-only** — before the public repo opens, `PROJECT_RELEASE_SEED`
-/// becomes a baked-in owner PUBKEY whose secret stays offline, and this convenience
-/// is retired (a client then holds only the pubkey and cannot write). The
-/// dev-vs-prod owner-key custody split is the named A1/A2 accepted cost (ISA
+/// The in-source project-announce owner seed, derived from `PROJECT_RELEASE_SEED`
+/// (F17) — the companion of [`project_release_pubkey`]. Interim ISC-15: the project
+/// seed is the rotated maintainer value but still in-source, so this exposes the
+/// channel's write-gate for the operator composer and felt-tests. Retired at the
+/// offline lockdown — `PROJECT_RELEASE_SEED` becomes a baked-in owner PUBKEY whose
+/// secret stays offline, and a client then holds only the pubkey and cannot write. The
+/// in-source-vs-offline owner-key custody split is the named A1/A2 accepted cost (ISA
 /// Decisions).
 pub fn dev_project_announce_veilid_owner_seed()
 -> Result<ProjectAnnounceVeilidOwnerSeed, AnnounceOwnerError> {
@@ -694,6 +696,48 @@ mod tests {
         assert!(
             wl.authorizes(project_release_pubkey().as_slice()).unwrap(),
             "the current project-release key remains non-removably authorized"
+        );
+    }
+
+    /// ISC-15 interim rotation, DHT half: the announce OWNER seed (write-gate /
+    /// record address) moved with the rotation, so the old dev announce record is
+    /// orphaned. Complements `former_dev_seed_no_longer_authorized` (the signing
+    /// half). A half-revert touching only the owner derivation, or an owner
+    /// derivation that dropped part of the seed, fails here.
+    #[test]
+    fn former_dev_owner_seed_record_orphaned() {
+        let _ = oxicrypt_module::initialize();
+        let current = derive_project_announce_veilid_owner_seed(&PROJECT_RELEASE_SEED).unwrap();
+        let old = derive_project_announce_veilid_owner_seed(&[0x5d; 32]).unwrap();
+        assert_ne!(
+            current.as_bytes(),
+            old.as_bytes(),
+            "rotation must move the announce owner record; the old dev record is orphaned"
+        );
+    }
+
+    /// ISC-15 trust-anchor KAT: pins the LIVE values clients actually trust — the
+    /// project-release pubkey (whitelist anchor, pinned by its SHA-384 since the raw
+    /// key is `PK_LEN` bytes) and the announce owner seed (DHT record address). The
+    /// `!= [0x5d; 32]` inequality in `former_dev_seed_no_longer_authorized` catches a
+    /// full revert; this catches silent DRIFT to any third value (a future seed edit,
+    /// an ML-DSA / HKDF derivation change).
+    #[test]
+    fn current_trust_anchors_kat() {
+        ensure_module();
+        assert_eq!(
+            hex::encode(sha384(project_release_pubkey().as_slice()).unwrap()),
+            "9867a1eb67c3875972e475ba3c05764d1122c7500f8807b4199ae106782f3ac3f1acc8eddfe7f0983e0ea63db6469f2f",
+            "the project-release pubkey (client whitelist anchor) changed unexpectedly"
+        );
+        assert_eq!(
+            hex::encode(
+                derive_project_announce_veilid_owner_seed(&PROJECT_RELEASE_SEED)
+                    .unwrap()
+                    .as_bytes()
+            ),
+            "fd5436378f7d85074eab45a1278740a9ebd5c06b255f0a6f0ee7b936c1e973ef",
+            "the announce owner record address changed unexpectedly"
         );
     }
 

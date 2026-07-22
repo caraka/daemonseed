@@ -26,7 +26,7 @@ work lives in the project lead's vault manifest, not here.
 
 ### Added
 
-- Right-click **Copy** on chat message bubbles (#67 extended to read-only content).
+- Right-click **Copy** on chat message bubbles (#67).
 
 ### Changed
 
