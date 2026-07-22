@@ -145,6 +145,13 @@ component MsgBubble inherits Rectangle {
     in property <string> text;
     in property <bool> mine;
     in property <string> age;
+    // Off-layout clipboard vehicle for the message text (#67 extended to chat
+    // bubbles): a read-only TextInput whose select-all()+copy() route through
+    // Slint's winit-backed clipboard — correct X11 selection ownership, per the
+    // MenuTextInput note — with no transient arboard::Clipboard drop. Zero-sized and
+    // outside the layout so it never affects the bubble size, hit area, or the chat
+    // Flickable scroll; the visible line stays a plain, non-selectable Text.
+    copy-src := TextInput { read-only: true; text: root.text; width: 0px; height: 0px; }
     HorizontalLayout {
         alignment: root.mine ? end : start;
         Rectangle {
@@ -167,7 +174,14 @@ component MsgBubble inherits Rectangle {
                     Text { text: root.who; color: root.mine ? #8b93a1 : #6fb3a4; font-size: 11px; vertical-alignment: center; }
                     Text { text: root.age; color: #5b6472; font-size: 11px; vertical-alignment: center; }
                 }
-                Text { text: root.text; color: #d6dae1; font-size: 13px; wrap: word-wrap; }
+                // Right-click the message to Copy its text (the alpha entropy-sharing
+                // path). Minimal menu this round; Copy routes through copy-src above.
+                ContextMenuArea {
+                    Menu {
+                        MenuItem { title: "Copy"; enabled: !root.text.is-empty; activated => { copy-src.select-all(); copy-src.copy(); } }
+                    }
+                    Text { text: root.text; color: #d6dae1; font-size: 13px; wrap: word-wrap; }
+                }
             }
         }
     }

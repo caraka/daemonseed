@@ -24,6 +24,10 @@ next release this block is renamed to its version + date and a fresh
 `[Unreleased]` is opened (see `AGENTS.md` doc-sync). Planning for *unstarted*
 work lives in the project lead's vault manifest, not here.
 
+### Added
+
+- Right-click **Copy** on chat message bubbles (#67 extended to read-only content).
+
 ### Changed
 
 - Project-release signer and announce write-gate derive from a rotated in-source
