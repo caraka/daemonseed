@@ -176,11 +176,15 @@ component MsgBubble inherits Rectangle {
                 }
                 // Right-click the message to Copy its text (the alpha entropy-sharing
                 // path). Minimal menu this round; Copy routes through copy-src above.
-                ContextMenuArea {
+                // A child of ContextMenuArea does NOT auto-fill (unlike a layout child),
+                // so the visible Text must bind its width to the menu-area width or
+                // word-wrap has no constraint and the line overflows the bubble (the
+                // v0.36.1 regression). Mirrors the multi-line MenuTextInput `ti` above.
+                msg_menu := ContextMenuArea {
                     Menu {
                         MenuItem { title: "Copy"; enabled: !root.text.is-empty; activated => { copy-src.select-all(); copy-src.copy(); } }
                     }
-                    Text { text: root.text; color: #d6dae1; font-size: 13px; wrap: word-wrap; }
+                    Text { width: msg_menu.width; text: root.text; color: #d6dae1; font-size: 13px; wrap: word-wrap; }
                 }
             }
         }
