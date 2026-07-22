@@ -136,9 +136,13 @@ struct ShareNode {
     share_id: String,
     name: String,
     mine: bool,
-    /// #114: the sharer's advisory display handle (name only — the wire
-    /// `sender_handle` carries no `#hash`), shown on the depth-0 row so a foreign
-    /// share is not anonymous.
+    /// #114: the sharer's **self-asserted** advisory display handle, shown on the
+    /// depth-0 row so a foreign share is not anonymous. It MAY carry a `#<12hex>`
+    /// (a TUI publisher sends its whole wire handle; a display-named GUI publisher
+    /// sends the bare name) — so it is stripped to name-only for the row via
+    /// [`daemonseed_core::handle::strip_handle_hash`]. It is a display label, not
+    /// identity: the verified attribution is `sharer_fingerprint` (from the signed
+    /// pubkey), revealed on hover.
     sharer_handle: String,
     /// #114: the sharer's `#12hex` fingerprint, derived from the VERIFIED announcer
     /// pubkey (not the spoofable handle) and revealed only on hover. Empty for own
@@ -328,10 +332,10 @@ impl ShareBrowser {
             // #114/#173: own shares are tagged "you" by the UI, so leave their sharer
             // fields empty; a foreign share shows its handle NAME-ONLY (the `#12hex`
             // stripped, mirroring the Lobby roster) and reveals the VERIFIED-pubkey
-            // fingerprint only on hover. The strip is required, not cosmetic: a TUI
-            // client publishes its full `name#hash` as `sharer_handle` (a GUI client
-            // publishes the bare display name), so without stripping a TUI sharer
-            // (e.g. a seed node) shows `name#hash` while GUI sharers show plain names.
+            // fingerprint only on hover. The strip is required, not cosmetic: a
+            // `sharer_handle` MAY be a full `name#hash` (a publisher whose display
+            // name is set to that whole wire handle — the TUI seed node) or a bare
+            // name; without stripping the former shows `name#hash` in the row.
             let (sharer, sharer_fingerprint) = if share.mine {
                 (String::new(), String::new())
             } else {
@@ -631,6 +635,22 @@ mod tests {
         assert_eq!(
             rows[0].sharer_fingerprint, "#a1b2c3d4e5f6",
             "verified fingerprint still revealed on hover"
+        );
+    }
+
+    #[test]
+    fn foreign_floor_form_sharer_handle_renders_verbatim() {
+        // A floor-form handle (`#<12hex>`, no display name) has no name to show —
+        // the strip must leave it verbatim, not blank the row.
+        let mut b = ShareBrowser::new();
+        b.set_shares(
+            [("id-anon", "mixtape", "#a1b2c3d4e5f6", "#a1b2c3d4e5f6")],
+            Some("me"),
+        );
+        let rows = b.rows();
+        assert_eq!(
+            rows[0].sharer, "#a1b2c3d4e5f6",
+            "a nameless floor handle renders unchanged, never empty"
         );
     }
 

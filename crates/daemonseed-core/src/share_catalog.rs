@@ -81,6 +81,13 @@ pub struct ShareListing {
     pub share_id: String,
     pub name: String,
     pub rating: String,
+    /// The announcer's **self-asserted** display handle, verbatim from the signed
+    /// `ShareAnnouncement`. It MAY be a bare name (a client with a display name set)
+    /// OR a full `name#<12hex>` (a client that publishes its whole wire handle, e.g.
+    /// the TUI). It is a DISPLAY label only — strip the `#<12hex>` for presentation
+    /// ([`crate::handle::strip_handle_hash`]). It is NOT the identity: the sharer is
+    /// authenticated by the announcement's ML-DSA-87 provenance signature over
+    /// `sender_pubkey`, and the verified attribution to show is `sharer_fingerprint`.
     pub sharer_handle: String,
     /// #114: the announcer's `#12hex` fingerprint, derived from the VERIFIED
     /// `sender_pubkey` (`SHA-384(pubkey)[:12]`) — NOT parsed from the advisory,
@@ -110,7 +117,9 @@ impl From<&DiscoveredShare> for ShareListing {
             rating: d.rating.clone(),
             sharer_handle: d.sender_handle.clone(),
             // #114: the verified-pubkey fingerprint, the anti-spoof attribution the
-            // UI reveals on hover (the advisory `sender_handle` carries no hash).
+            // UI reveals on hover — derived from the signed `sender_pubkey`, never
+            // parsed from the self-asserted `sender_handle` (which MAY carry a
+            // `#<12hex>` and is a display label, not identity).
             sharer_fingerprint: pubkey_fingerprint(&d.sender_pubkey),
             mine: false, // a discovered share is a foreign announcer's
             // The catalog does not know the frontend's re-resolve state; the frontend
