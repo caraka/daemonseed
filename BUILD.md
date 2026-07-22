@@ -5,6 +5,24 @@ How to produce every artifact — dev binaries, the Linux AppImage, the Windows
 separate and lives in [AGENTS.md → Definition of done](AGENTS.md#definition-of-done);
 this file is about producing runnable and distributable binaries.
 
+## Repository layout — clone the siblings first
+
+During the pre-1.0 private phase daemonseed **path-depends** on two sibling repos,
+so they must be checked out **next to** the daemonseed directory (`../oxicrypt`,
+`../oxitls`):
+
+```
+somedir/
+├── oxicrypt/     # CNSA 2.0 primitives, AEAD, KDF
+├── oxitls/       # rustls CryptoProvider + ML-DSA webpki verifier
+└── daemonseed/
+```
+
+`Cargo.toml` references them as `../oxicrypt/crates/...` and `../oxitls/crates/...`,
+so a daemonseed-only clone fails at the first `cargo build`. **Both are required to
+build any crate — the GUI included** — because `daemonseed-core` (which every crate
+depends on) hard-depends on both.
+
 ## Toolchain
 
 - Rust is pinned by `rust-toolchain.toml` (channel `1.96`, with `rustfmt` +
