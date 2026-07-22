@@ -4638,6 +4638,15 @@ functions:
       between-roots basename collisions suffix the later root (name-2). Every
       computed dest-relative path passes the traversal guard as one unit.
     signature: "pub fn place_at_dest(roots: &[SelectionRoot], selected_files: &[&str]) -> Result<Vec<PlacedFile>, FetchedError>"
+  - name: no_scatter
+    module: daemonseed_core::storage::fetched
+    description: >-
+      Never scatter a whole-share download into a chosen dest: if the placed
+      dest-rels do not all sit under one common top-level folder, re-root them under a
+      folder named after the share (sanitized to a safe component). A share's own
+      top-level folder name is not in its file rel_paths, so a single-depth share
+      would otherwise land loose; a nested share is returned unchanged.
+    signature: "pub fn no_scatter(dest_rels: Vec<String>, share_name: &str) -> Vec<String>"
     parameters:
       - name: roots
         type: "&[SelectionRoot]"

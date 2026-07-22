@@ -94,7 +94,7 @@ use daemonseed_core::share_serve::ShareContent;
 use daemonseed_core::storage::cas::ChunkAddr;
 use daemonseed_core::storage::fetched::{
     FetchedFile, FetchedStore, LiveFetchRegistry, SelectionRoot, StagingArea, derive_resume_state,
-    manifest_digest, place_at_dest, sweep_staging, verify_stored_manifest,
+    manifest_digest, no_scatter, place_at_dest, sweep_staging, verify_stored_manifest,
 };
 use daemonseed_core::storage::manifest_digest::ManifestDigestStore;
 use daemonseed_proto::v1 as wire;
@@ -3335,6 +3335,7 @@ async fn run_confirm_download(
     // manifest — identical placement for a fresh confirm and a resume (DL-ISC-8 /
     // precondition D): `flat_dest` uses the selection roots; the managed dir keeps
     // the full share rel_path. `already_verified` is filled later (resume only).
+    let share_name = name.clone();
     let build_planned = |source: &[ManifestEntry]| -> Result<Vec<PlannedFile>, ConfirmOutcome> {
         let sel_rels: Vec<&str> = indices
             .iter()
@@ -3346,12 +3347,22 @@ async fn run_confirm_download(
                 place_at_dest(&roots, &sel_rels).map_err(|e| ConfirmOutcome::LocalFailed {
                     message: format!("could not place the download under the chosen folder: {e}"),
                 })?;
-            // `place_at_dest` returns one PlacedFile per selected file, in indices order.
+            // Never scatter into the chosen dest: a whole-share download whose files
+            // aren't already under one common top-level folder is wrapped in the
+            // share's name (the share-root name isn't part of the file rel_paths, so a
+            // single-depth share would otherwise land loose). DL-ISC-8.
+            let dest_rels: Vec<String> = placed.iter().map(|p| p.dest_rel.clone()).collect();
+            let dest_rels = if matches!(root_kind, crate::net::RootKind::Share) {
+                no_scatter(dest_rels, &share_name)
+            } else {
+                dest_rels
+            };
+            // One PlannedFile per selected file, in indices order.
             Ok(indices
                 .iter()
-                .zip(placed.iter())
-                .map(|(&i, pf)| PlannedFile {
-                    dest_rel: pf.dest_rel.clone(),
+                .zip(dest_rels)
+                .map(|(&i, dest_rel)| PlannedFile {
+                    dest_rel,
                     size: source[i].size,
                     chunks: source[i].chunks.clone(),
                     already_verified: Vec::new(),

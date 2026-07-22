@@ -622,6 +622,44 @@ pub fn place_at_dest(
     Ok(out)
 }
 
+/// True iff every placed destination-relative path already sits under a single
+/// shared top-level folder — so a chosen-dest download would not scatter loose
+/// files into the dest. A top-level file (no `/`) or more than one distinct
+/// top-level segment returns false; empty input returns false.
+fn all_under_one_top_folder(dest_rels: &[String]) -> bool {
+    let mut top: Option<&str> = None;
+    for r in dest_rels {
+        let Some((first, _)) = r.split_once('/') else {
+            return false;
+        };
+        match top {
+            None => top = Some(first),
+            Some(t) if t == first => {}
+            Some(_) => return false,
+        }
+    }
+    top.is_some()
+}
+
+/// Never scatter a whole-share download into a chosen destination: a share's own
+/// top-level folder name is NOT part of its file rel_paths (they are relative to
+/// the share root), so placing them verbatim drops that name — and a single-depth
+/// share then lands as loose files in the dest. If the placed dest-rels do not all
+/// sit under one common top-level folder, re-root them under a folder named after
+/// the share (`share_name`, sanitized to a safe single component). A placement
+/// already under one top-level folder (a nested share) is returned unchanged.
+/// (DL-ISC-8.)
+pub fn no_scatter(dest_rels: Vec<String>, share_name: &str) -> Vec<String> {
+    if all_under_one_top_folder(&dest_rels) {
+        return dest_rels;
+    }
+    let wrapper = safe_folder_name(share_name);
+    dest_rels
+        .into_iter()
+        .map(|r| format!("{wrapper}/{r}"))
+        .collect()
+}
+
 // ── Stage-then-promote staging writer (download-subsystem redesign, step 4b) ──
 //
 // A download writes each verified chunk into a reserved staging file at its
@@ -874,11 +912,18 @@ impl StagingArea {
     /// (every unpromoted partial of the fetch is erased) and the post-completion
     /// cleanup. Idempotent (a missing area is success).
     pub fn destroy(&self) -> Result<(), FetchedError> {
-        match std::fs::remove_dir_all(&self.dir) {
+        let outcome = match std::fs::remove_dir_all(&self.dir) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(FetchedError::Io(e)),
+        };
+        // Best-effort: drop the now-possibly-empty `.dspart/` parent so a completed
+        // download leaves no empty staging root behind. `remove_dir` removes ONLY an
+        // empty dir, so a concurrent sibling fetch's staging is never touched.
+        if let Some(parent) = self.dir.parent() {
+            let _ = std::fs::remove_dir(parent);
         }
+        outcome
     }
 
     /// The stored-confirmed-manifest path for this fetch. It lives INSIDE the
@@ -1468,6 +1513,9 @@ pub fn sweep_staging(
         std::fs::remove_dir_all(entry.path())?;
         deleted.push(entry.path());
     }
+    // Drop the `.dspart/` root itself if the sweep emptied it (best-effort; only an
+    // empty dir is removed, so a concurrent fetch's staging survives).
+    let _ = std::fs::remove_dir(&staging_root);
     Ok(deleted)
 }
 
@@ -2392,6 +2440,33 @@ mod tests {
         assert!(!empty.dir().exists(), "empty resumable area reclaimed (A1)");
         assert!(staged.dir().exists(), "progressed area kept for resume");
         assert_eq!(deleted.len(), 1, "only the empty area was reclaimed");
+    }
+
+    /// DL-ISC-8: a whole-share download to a chosen dest never scatters — a
+    /// single-depth share (files at the share root) is wrapped in the share name,
+    /// while a nested share (already under one top-level folder) is left as-is.
+    #[test]
+    fn no_scatter_wraps_a_flat_share_and_leaves_a_nested_one() {
+        // Single-depth: files at the top → wrapped in the share name.
+        assert_eq!(
+            no_scatter(vec!["a.mp3".to_owned(), "b.mp3".to_owned()], "Album"),
+            vec!["Album/a.mp3".to_owned(), "Album/b.mp3".to_owned()]
+        );
+        // Nested: already under one common top-level folder → unchanged.
+        assert_eq!(
+            no_scatter(vec!["CD1/a.mp3".to_owned(), "CD1/b.mp3".to_owned()], "S"),
+            vec!["CD1/a.mp3".to_owned(), "CD1/b.mp3".to_owned()]
+        );
+        // Mixed / multiple top-level entries → wrapped (no loose files in the dest).
+        assert_eq!(
+            no_scatter(vec!["a.mp3".to_owned(), "CD1/b.mp3".to_owned()], "S"),
+            vec!["S/a.mp3".to_owned(), "S/CD1/b.mp3".to_owned()]
+        );
+        // An untrusted share name is sanitized to a safe single component.
+        assert_eq!(
+            no_scatter(vec!["a.mp3".to_owned()], "a/b"),
+            vec!["a_b/a.mp3".to_owned()]
+        );
     }
 
     /// DL-ISC-20: `verify_stored_manifest` returns the manifest only when the

@@ -445,7 +445,7 @@ The write-budget family takes permanent `WB-ISC-N` IDs from the FROZEN 2026-07-0
 - [x] DL-ISC-21: Anti: at a user-chosen dest, promotion never overwrites a pre-existing path that is not provably this download's own artifact — the incoming file collision-suffixes (`name-N`, before the extension) instead (probe: `storage::fetched::tests::promote_never_clobbers_a_preexisting_file`). (The overwrite-if-provably-ours case is a step-8 resume refinement.)
 - [x] DL-ISC-7: Each (selection × destination) case of the placement table lands exactly per the design §Part 2 table, including normalized overlapping roots. For a user-chosen dest, `place_at_dest` is a total function of the selection roots (`SelectionRoot::{File,Dir}`, ISC-C72): a single file → its basename; a folder (incl. exactly one file) → the folder's name + subpath (arrives whole); scattered folders → each as a top-level entry; the whole-share root → full rel_paths; nested roots subsumed; between-roots basename collisions suffix the later root (`name-2`). The managed downloads dir keeps the full `<share-folder>/<rel_path>` layout (`record_share`, unchanged). Replaces the shape-guessing `rebase_to_selection_root` (fixes the one-file-folder collapse and the scattered-selection ancestry) (probe: `storage::fetched::tests::place_*` — single/one-file-folder/scattered/whole-share/nested/collision, plus the `record_*` managed-dir tests).
 
-- [x] DL-ISC-8: `ConfirmFetch` carries the user's selection roots (a `RootKind` tag + the selected manifest indices), and the GUI download scheduler makes placement a function of them: the net-side `selection_roots` maps `RootKind::Share` → the whole-share root (`Dir("")`), `RootKind::File` → `File(rel_path)`, and `RootKind::Dir` → `Dir(common_prefix_dir(selected))` (the selected files' common parent-directory prefix, so a one-file folder keeps its folder), then `place_at_dest` lands each root per the DL-ISC-7 table — a scattered selection lands each root as a top-level entry, a one-file folder keeps its folder (probe: `veilid_net::tests::selection_roots_*`).
+- [x] DL-ISC-8: `ConfirmFetch` carries the user's selection roots (a `RootKind` tag + the selected manifest indices), and the GUI download scheduler makes placement a function of them: the net-side `selection_roots` maps `RootKind::Share` → the whole-share root (`Dir("")`), `RootKind::File` → `File(rel_path)`, and `RootKind::Dir` → `Dir(common_prefix_dir(selected))` (the selected files' common parent-directory prefix, so a one-file folder keeps its folder), then `place_at_dest` lands each root per the DL-ISC-7 table — a scattered selection lands each root as a top-level entry, a one-file folder keeps its folder. A **whole-share** download to a chosen dest additionally never scatters: the share-root folder name is NOT part of the file rel_paths (they are relative to the share root), so files not already under one common top-level folder are re-rooted under the share name (`no_scatter`) — a single-depth share lands as `<dest>/<ShareName>/…` rather than loose, a nested share is unchanged (probe: `veilid_net::tests::selection_roots_*` + `storage::fetched::tests::no_scatter_wraps_a_flat_share_and_leaves_a_nested_one`).
 - [x] DL-ISC-13: Anti: an integrity failure destroys every staged partial of the fetch, keeps already-promoted files, sets the durable poison flag (session state keyed by `share_id`), never parks a one-shot retry, never marks the share Unresolved, and is never resumed past — the engine's `DownloadOutcome::IntegrityFailed` folds to `ConfirmOutcome::IntegrityFailed` (staging already destroyed by the engine), whose fold emits `FetchError` + sets `poisoned_shares` and does NOT mark Unresolved or park (probe: `veilid_net::tests::download_outcome_maps_to_confirm_outcome` + `fold_integrity_failed_poisons_without_mark_or_park`).
 - [x] DL-ISC-14: A panicking download worker still yields a terminal outcome and leaves only staged (quarantined) state: the spawn seam (`spawn_confirm_task`, mirrored at the browse `spawn_fetch_task` seam) retains the worker's `JoinHandle` and maps a `JoinError` (panic) to a terminal `LocalFailed`-class outcome, so a panicking worker never strands the share (probe: `veilid_net::tests::a_panicking_download_worker_yields_a_terminal_outcome`).
 
@@ -1240,6 +1240,20 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   partial WITH progress is untouched (kept for resume → the deferred incomplete-downloads surface).
   Rejected: A2 (age-out — arbitrary threshold, delayed) and destroy-on-any-transient (kills resume).
   Chose a marker over Unix `st_blocks` for the Windows build. (Sanjay, 2026-07-21.)
+- 2026-07-21: **Whole-share chosen-dest download never scatters + empty `.dspart` cleanup (felt-test,
+  caraka-approved).** Felt-test: a single-folder album downloaded to `~/Downloads` landed as LOOSE
+  files, not in a folder. Root cause: the GUI download is always `flat_dest`; a whole share
+  (`RootKind::Share` → `SelectionRoot::Dir("")`) places files at their share-root-relative rel_paths
+  with no wrapper, and the share's own top-level folder name is NOT in those rel_paths (confirmed:
+  `share_index.rs` — rel_paths are "relative to the share root") — so a single-depth share scatters, a
+  nested share keeps only its internal subfolders. **Fix:** new core `no_scatter(dest_rels, share_name)`
+  — if the placed files don't all sit under one common top-level folder, re-root them under
+  `safe_folder_name(share_name)`; wired in the GUI `flat_dest` branch gated on `RootKind::Share`. A
+  nested share is untouched (caraka's stated-correct behavior). Also: `StagingArea::destroy` +
+  `sweep_staging` now `remove_dir` the now-empty `.dspart/` root (best-effort, empty-only). Extends
+  DL-ISC-8. The TUI has the identical scatter path (filed #216 — its `selection_roots` takes `RootKind`
+  by value, needs an `is_whole_share` bool + a TUI felt-test; core `no_scatter` is ready to wire).
+  (Sanjay, 2026-07-21.)
 
 ## Changelog
 
@@ -1844,3 +1858,10 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   area kept). No runnable bin built (VM). **DEFERRED-VERIFY → orinoco:** a download that fails after 0
   chunks leaves no `.dspart` residue after the next download's sweep; a partially-progressed failure's
   staging is retained. (Sanjay, 2026-07-21.)
+- GATE-GREEN 2026-07-21: **whole-share never-scatter + empty-`.dspart` cleanup.** `daemonseed-core` fmt
+  clean; `clippy --all-targets -- -D warnings` clean (core + `daemonseed-gui --features desktop` +
+  `daemonseed-tui`); `cargo test -p daemonseed-core --lib` 734/734 incl.
+  `no_scatter_wraps_a_flat_share_and_leaves_a_nested_one` (single-depth wrapped, nested unchanged, mixed
+  wrapped, untrusted name sanitized). No runnable bin built (VM). **DEFERRED-VERIFY → orinoco:** a
+  single-folder-share download lands as `~/Downloads/<ShareName>/…` (not loose); a nested share
+  unchanged; the `.dspart/` root is gone after completion. (Sanjay, 2026-07-21.)
