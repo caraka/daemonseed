@@ -30,9 +30,12 @@ work lives in the project lead's vault manifest, not here.
   `guest` fallback. The self-handle is learned at connect rather than only from
   the first chat send, so a publish-only or lurking client (e.g. a seed node
   that never chats) is named in the roster.
-- TUI share listings show the sharer's name without the `#<12hex>` fingerprint,
-  matching the GUI roster. The name-only display transform now lives in
-  `daemonseed-core::handle::strip_handle_hash`, shared by both UIs so they
+- Share listings (both TUI and GUI) show the sharer's name without the
+  `#<12hex>` fingerprint, matching the Lobby roster — the verified fingerprint
+  stays on hover. A TUI client publishes its full `name#hash` as the sharer
+  handle (a GUI client publishes the bare name), so the GUI browse row now
+  strips it too rather than assuming a name-only handle. The transform lives in
+  `daemonseed-core::handle::strip_handle_hash`, shared by all surfaces so they
   cannot drift.
 
 ## [0.36.1] — 2026-07-22

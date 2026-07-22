@@ -325,14 +325,18 @@ impl ShareBrowser {
     pub fn rows(&self) -> Vec<Row> {
         let mut out = Vec::new();
         for share in &self.shares {
-            // #114: own shares are tagged "you" by the UI, so leave their sharer
-            // fields empty; a foreign share shows its (hash-less) handle plainly and
-            // reveals the VERIFIED-pubkey fingerprint only on hover.
+            // #114/#173: own shares are tagged "you" by the UI, so leave their sharer
+            // fields empty; a foreign share shows its handle NAME-ONLY (the `#12hex`
+            // stripped, mirroring the Lobby roster) and reveals the VERIFIED-pubkey
+            // fingerprint only on hover. The strip is required, not cosmetic: a TUI
+            // client publishes its full `name#hash` as `sharer_handle` (a GUI client
+            // publishes the bare display name), so without stripping a TUI sharer
+            // (e.g. a seed node) shows `name#hash` while GUI sharers show plain names.
             let (sharer, sharer_fingerprint) = if share.mine {
                 (String::new(), String::new())
             } else {
                 (
-                    share.sharer_handle.clone(),
+                    daemonseed_core::handle::strip_handle_hash(&share.sharer_handle).to_owned(),
                     share.sharer_fingerprint.clone(),
                 )
             };
@@ -601,6 +605,32 @@ mod tests {
         assert!(
             rows[1].sharer.is_empty() && rows[1].sharer_fingerprint.is_empty(),
             "own shares render \"you\" — no attribution fields"
+        );
+    }
+
+    #[test]
+    fn foreign_tui_sharer_handle_is_stripped_to_name_only() {
+        // #173: a TUI client publishes its full `name#hash` as the share's
+        // `sharer_handle` (a GUI client publishes the bare name). The browse row
+        // must show name-only either way; the verified fingerprint rides on hover.
+        let mut b = ShareBrowser::new();
+        b.set_shares(
+            [(
+                "id-frank",
+                "frank_music",
+                "frank#a1b2c3d4e5f6",
+                "#a1b2c3d4e5f6",
+            )],
+            Some("me"),
+        );
+        let rows = b.rows();
+        assert_eq!(
+            rows[0].sharer, "frank",
+            "the #<12hex> is stripped from a name#hash sharer handle"
+        );
+        assert_eq!(
+            rows[0].sharer_fingerprint, "#a1b2c3d4e5f6",
+            "verified fingerprint still revealed on hover"
         );
     }
 
