@@ -12,6 +12,7 @@ Daemonseed is a federated, end-to-end-encrypted communication and file-sharing p
 - **Sibling crypto foundation:** <https://github.com/oxiforge/oxicrypt> — currently private; goes public before daemonseed does. daemonseed depends on it for CNSA 2.0 primitives, AEAD, and KDF.
 - **Sibling TLS-stack glue:** <https://github.com/oxiforge/oxitls> — currently private; goes public before daemonseed does. Provides the rustls `CryptoProvider` and the ML-DSA webpki verifier (`oxitls-rustls-provider`, `oxitls-webpki-mldsa`); consumed by daemonseed-cli and -tui.
 - **LAMA spec (API-manifest format):** <https://github.com/lamaspec/lama> — the specification (`SPEC.md`) that this repo's `lama.yaml` and `docs/llm-api-manifest/*-api.yaml` MUST conform to. Re-checked at every doc-sync.
+- **Build recipes:** [`BUILD.md`](BUILD.md) — how to produce every artifact (dev builds, the Linux AppImage, the Windows `.exe`, and glibc-portable server binaries), plus the glibc-floor gotcha. The CI gate itself is § Definition of done below.
 
 ## Session bootstrap
 
