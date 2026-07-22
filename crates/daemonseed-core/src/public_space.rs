@@ -171,14 +171,22 @@ impl FromStr for WhitelistEntry {
 
 // ── Project-release signer (F17 / ISC-15) ───────────────────────────────
 
-/// Fixed seed for the **development** project-release signer (F17).
+/// Seed for the project-release signer + announce write-gate (F17 / ISC-15).
 ///
-/// The matching secret is intentionally in-source during the private phase
-/// (the 4-daemon test group): it exists so the non-removable-entry mechanism
-/// is real and testable before there is a production release key. Before the
-/// public repo opens this placeholder is replaced by a baked-in real release
-/// public key whose secret stays offline (see ISC-15).
-const PROJECT_RELEASE_SEED: [u8; 32] = [0x5d; 32];
+/// Rotated off the former world-known dev placeholder (`[0x5d; 32]`) to a
+/// maintainer-generated value, so the old shared seed no longer signs or writes
+/// authorized operator content: its artifacts fail [`Whitelist::authorizes`], and
+/// its derived owner seed addresses a different, now-orphaned DHT record. This is
+/// the INTERIM ISC-15 step — the secret is still in-source during the private-alpha
+/// phase, NOT the final lockdown, which bakes only the public key into clients and
+/// keeps the signing secret offline (maintainer-held). Until that lands, the
+/// in-source secret means any build can in principle sign, so distributed bundles
+/// are release-only and the composer is capability-gated (`DAEMONSEED_OPERATOR`) —
+/// a casual gate, not a crypto boundary; the boundary is the offline lockdown.
+const PROJECT_RELEASE_SEED: [u8; 32] = [
+    0x23, 0x4c, 0x66, 0xb4, 0xef, 0x1b, 0x08, 0xa0, 0xde, 0x0f, 0x6c, 0x76, 0x75, 0xac, 0x87, 0x36,
+    0x63, 0x74, 0x96, 0xcb, 0x28, 0xf4, 0x23, 0x04, 0xc4, 0xc7, 0xf3, 0x49, 0x16, 0x93, 0xef, 0x8f,
+];
 
 /// The full ML-DSA-87 public key of the project-release signer (F17 / ISC-15).
 ///
@@ -665,6 +673,30 @@ mod tests {
         assert_eq!(kp.public_key(), project_release_pubkey());
     }
 
+    /// ISC-15 interim key rotation: the former world-known dev seed `[0x5d; 32]` no
+    /// longer yields an authorized signer. An artifact signed by the old dev
+    /// project-release key is rejected against an empty whitelist (the "graffiti
+    /// wiped" guarantee), while the current project-release key stays non-removably
+    /// authorized. A revert of `PROJECT_RELEASE_SEED` back to `[0x5d; 32]` fails here.
+    #[test]
+    fn former_dev_seed_no_longer_authorized() {
+        ensure_module();
+        assert_ne!(
+            PROJECT_RELEASE_SEED, [0x5d; 32],
+            "project-release seed must be rotated off the world-known dev placeholder"
+        );
+        let old_dev = SignKeypair::from_ml_dsa_seed(&[0x5d; 32]).unwrap();
+        let wl = Whitelist::from_entries(vec![]);
+        assert!(
+            !wl.authorizes(old_dev.public_key()).unwrap(),
+            "the former dev-seed signer must no longer authorize (old graffiti wiped)"
+        );
+        assert!(
+            wl.authorizes(project_release_pubkey().as_slice()).unwrap(),
+            "the current project-release key remains non-removably authorized"
+        );
+    }
+
     // ── verify_artifact (ISC-A-S3 / ISC-7 / ISC-17) ──────────────────────
 
     /// A whitelisted signer's correctly-signed payload verifies, and the
@@ -844,9 +876,10 @@ mod tests {
     }
 
     /// #135 KAT — byte-identity guard for the shared boxed-seed derivation
-    /// helper. Fixed project seed → fixed owner-seed bytes, captured from the
-    /// pre-refactor code; a drift in the consolidated extract/expand/zeroize/Box
-    /// path fails the test.
+    /// helper. A fixed input seed (the former dev placeholder `[0x5d; 32]`, kept
+    /// purely as a stable KAT vector after the ISC-15 rotation — no longer the
+    /// project seed) → fixed owner-seed bytes captured from the pre-refactor code;
+    /// a drift in the consolidated extract/expand/zeroize/Box path fails the test.
     #[test]
     fn announce_owner_seed_kat_byte_identity() {
         let _ = oxicrypt_module::initialize();

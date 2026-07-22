@@ -1255,6 +1255,19 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   by value, needs an `is_whole_share` bool + a TUI felt-test; core `no_scatter` is ready to wire).
   (Sanjay, 2026-07-21.)
 
+- **ISC-15 interim key rotation (2026-07-22).** `PROJECT_RELEASE_SEED` rotated off the world-known dev
+  placeholder `[0x5d; 32]` to a maintainer-generated value (still in-source, private-alpha). Effect: the
+  former shared seed no longer signs authorized operator content — artifacts under the old key fail
+  `Whitelist::authorizes` (the "graffiti wiped" guarantee, `former_dev_seed_no_longer_authorized`), and its
+  derived Veilid owner seed addresses a different, now-orphaned announce record. This is a STEP toward
+  ISC-15, **not** its satisfaction: the design-of-record (owner = the F17 anchor: maintainer-held OFFLINE
+  seed → ML-DSA content key + sibling Veilid owner keypair, only public keys baked into clients) still
+  stands as the open work — the interim secret remains in-source, so any build could in principle sign.
+  Distribution guard for the interim window: distributed bundles are release-only (AppImage/Windows build
+  `--release`) and the composer is capability-gated (`DAEMONSEED_OPERATOR`); a debug build still bypasses
+  that gate (dev-possession, ISC-15-precursor `operator_write_enabled`), so debug builds are not handed to
+  testers until the offline lockdown lands. (Sanjay, 2026-07-22.)
+
 ## Changelog
 
 - **conjectured:** the multi-circle carousel (ISC-C60) lets the active surface span the lobby and the
