@@ -24,6 +24,8 @@ next release this block is renamed to its version + date and a fresh
 `[Unreleased]` is opened (see `AGENTS.md` doc-sync). Planning for *unstarted*
 work lives in the project lead's vault manifest, not here.
 
+## [0.36.1] — 2026-07-22
+
 ### Added
 
 - Right-click **Copy** on chat message bubbles (#67).
