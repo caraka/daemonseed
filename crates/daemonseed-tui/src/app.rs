@@ -1893,10 +1893,13 @@ impl App {
         }
     }
 
-    /// The user's own full wire handle (`name#hash`), sealed into outgoing chat
-    /// as the sender so recipients can @mention / mute it (ISC-C17/C15). Falls
-    /// back to `"anon"` only if there is no session (pre-first-start).
-    fn own_handle(&self) -> String {
+    /// The user's own full wire handle (`name#<12hex>`): the value sealed into
+    /// outgoing chat / share announcements as the sender so recipients can
+    /// @mention / mute / attribute it (ISC-C17/C15/C4), and — since the presence
+    /// fix — the name the net actor seeds into the lobby beacon at connect. Falls
+    /// back to `"anon"` only if there is no session (pre-first-start). `pub` so the
+    /// binary can pass it as `NetCommand::Connect.self_handle`.
+    pub fn own_handle(&self) -> String {
         self.session
             .as_ref()
             .map(|s| s.handle.to_string())

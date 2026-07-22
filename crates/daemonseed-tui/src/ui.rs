@@ -164,6 +164,9 @@ fn render_fetch_overlay(f: &FetchUi, frame: &mut Frame, area: Rect) {
         Some(n) => n.to_string(),
         None => "?".to_owned(),
     };
+    // The fetch-confirmation popup is a trust-decision point: keep the FULL
+    // `name#<12hex>` here (unlike the browse list, which strips to name-only) so
+    // the user can verify the sharer's fingerprint before downloading. Do not strip.
     let sharer = if f.sharer_handle.is_empty() {
         "(operator)".to_owned()
     } else {
@@ -760,7 +763,10 @@ fn render_public_shares_pane(app: &App, frame: &mut Frame, area: Rect) {
                 let sharer = if s.sharer_handle.is_empty() {
                     "(operator)".to_owned()
                 } else {
-                    s.sharer_handle.clone()
+                    // Show the name only — drop the `#<12hex>` fingerprint (mirrors
+                    // the GUI roster, #173). Canonical helper so the two surfaces
+                    // never drift.
+                    daemonseed_core::handle::strip_handle_hash(&s.sharer_handle).to_owned()
                 };
                 let rating = if s.rating.is_empty() {
                     String::new()

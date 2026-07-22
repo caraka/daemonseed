@@ -89,6 +89,15 @@ pub enum NetCommand {
         /// session persists no resume anchor, so a later resume finds no digest and
         /// re-downloads fresh (fail-closed).
         profile_root: Option<PathBuf>,
+        /// Our own `name#<12hex>` display handle, captured at connect so the lobby
+        /// presence beacon carries the real name from its FIRST emit. Previously
+        /// `my_handle` was learned only from the first `SendChat`/`SendPublicRoom`,
+        /// so a publish-only or lurking session (e.g. a seed node that never chats)
+        /// stayed nameless and broadcast the `"guest"` fallback. In practice this is
+        /// always the session's real handle — every Connect dispatch runs under an
+        /// unlocked profile; the actor still guards `""`/`"anon"` (the no-session
+        /// `own_handle()` sentinel) and falls back to "guest" defensively.
+        self_handle: String,
     },
     /// Join a circle by its shared phrase: derive the circle key, subscribe to
     /// the rendezvous asset on the connected relay, and stream chat (ISC-15/16).
@@ -656,9 +665,12 @@ impl NetHandle {
         })
     }
 
-    /// Queue a command for the network actor. Fails only if the actor stopped.
-    pub fn send(&self, cmd: NetCommand) -> Result<(), NetCommand> {
-        self.cmd_tx.send(cmd).map_err(|e| e.0)
+    /// Queue a command for the network actor. Fails only if the actor stopped;
+    /// the rejected command is returned (boxed — `NetCommand` is large, so an
+    /// unboxed error would trip `clippy::result_large_err`) for the caller to
+    /// inspect or drop.
+    pub fn send(&self, cmd: NetCommand) -> Result<(), Box<NetCommand>> {
+        self.cmd_tx.send(cmd).map_err(|e| Box::new(e.0))
     }
 
     /// Drain all currently-available events without blocking. Called once per

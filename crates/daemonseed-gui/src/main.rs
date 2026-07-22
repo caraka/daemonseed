@@ -48,6 +48,7 @@ use daemonseed_core::first_start::{
     BackupVerified, FirstStart, FirstStartError, Sealed, TypeBackChallenge,
 };
 use daemonseed_core::handle::display_name::OsRng;
+use daemonseed_core::handle::strip_handle_hash;
 use daemonseed_core::passphrase::strength::{estimate, estimate_circle};
 use daemonseed_core::profile::config::ArgonParams;
 use daemonseed_core::profile::persist::{
@@ -216,24 +217,6 @@ fn type_back_precheck(challenge: &TypeBackChallenge, mnemonic: &str, answers: &[
 }
 
 /// Strip the `#<12hex>` verification suffix from a wire handle for the inline roster
-/// row (#173): the row shows the display name alone, and the fingerprint is revealed
-/// on hover (the separate `fingerprint` field / `RosterRowView`, the ISC-C4 trust
-/// anchor). Floor handles (`#<hex>`, no name) and hash-less handles are shown
-/// unchanged. Applied at this single chokepoint so lobby and circle rows are uniform.
-///
-/// Deliberately NOT `Handle::format(DisplayMode::Default)`: this stays lenient for a
-/// non-canonical handle — a bare `guest` (no `#hex`) is shown verbatim, where `Handle`
-/// parsing would floor it to `#hex`. Collision-aware inline disambiguation (rendering
-/// `name#hex` when two display names clash) is deferred to #186; hover reveals the
-/// fingerprint in the meantime.
-fn strip_handle_hash(handle: &str) -> &str {
-    match handle.rsplit_once('#') {
-        Some(("", _)) => handle, // floor form `#<hex>` — no name to show, keep as-is
-        Some((name, _)) => name, // `name#<hex>` — drop the hash for the inline row
-        None => handle,          // no hash present
-    }
-}
-
 /// Convert the live-roster entries (#75) into a Slint `ModelRc<RosterRow>`. The
 /// whole model is replaced on each presence change (the `for` re-renders) — entries
 /// are OTHER live members only (own beacon is filtered net-side). `handle` → the

@@ -24,6 +24,17 @@ next release this block is renamed to its version + date and a fresh
 `[Unreleased]` is opened (see `AGENTS.md` doc-sync). Planning for *unstarted*
 work lives in the project lead's vault manifest, not here.
 
+### Fixed
+
+- TUI lobby presence now carries the client's own display name instead of the
+  `guest` fallback. The self-handle is learned at connect rather than only from
+  the first chat send, so a publish-only or lurking client (e.g. a seed node
+  that never chats) is named in the roster.
+- TUI share listings show the sharer's name without the `#<12hex>` fingerprint,
+  matching the GUI roster. The name-only display transform now lives in
+  `daemonseed-core::handle::strip_handle_hash`, shared by both UIs so they
+  cannot drift.
+
 ## [0.36.1] — 2026-07-22
 
 ### Added

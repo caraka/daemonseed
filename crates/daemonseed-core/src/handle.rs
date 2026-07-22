@@ -216,6 +216,22 @@ pub fn pubkey_fingerprint(pubkey: &[u8]) -> String {
         .unwrap_or_default()
 }
 
+/// The name-only view of a display handle: drop the `#<12hex>` fingerprint so a
+/// row shows the name alone (#173). Floor handles (`#<hex>`, no name) and
+/// hash-less handles (a bare `guest`) are returned unchanged.
+///
+/// Deliberately lenient and string-based — NOT `Handle::format(DisplayMode::Default)`,
+/// which would parse-and-floor a non-canonical handle. The canonical home for this
+/// display transform (shared by the GUI roster and the TUI share browser) so the two
+/// surfaces can never drift.
+pub fn strip_handle_hash(handle: &str) -> &str {
+    match handle.rsplit_once('#') {
+        Some(("", _)) => handle, // floor form `#<hex>` — no name to show, keep as-is
+        Some((name, _)) => name, // `name#<hex>` — drop the hash for the inline row
+        None => handle,          // no hash present
+    }
+}
+
 impl fmt::Display for Handle {
     /// Canonical wire/storage form per ISC-C4: `<name>#<12hex>` or floor
     /// `#<12hex>` when no display name is set. Equivalent to
@@ -281,6 +297,18 @@ impl FromStr for Handle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_handle_hash_cases() {
+        // `name#<hex>` → name only
+        assert_eq!(strip_handle_hash("frank#aabbccddeeff"), "frank");
+        // floor form `#<hex>` → unchanged (no name to show)
+        assert_eq!(strip_handle_hash("#aabbccddeeff"), "#aabbccddeeff");
+        // hash-less / non-canonical → verbatim
+        assert_eq!(strip_handle_hash("guest"), "guest");
+        // multi-`#` name: only the last `#` splits the fingerprint
+        assert_eq!(strip_handle_hash("od#d#aabbccddeeff"), "od#d");
+    }
 
     const PREFIX_HEX: &str = "aabbccddeeff";
     const PREFIX_BYTES: [u8; 6] = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];

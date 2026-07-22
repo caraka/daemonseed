@@ -340,13 +340,12 @@ pub async fn veilid_net_actor(
     let mut shares = ShareState::new();
     // Monotonic id handed out at join — mirrors the relay actor's `next_circle_id`.
     let mut next_circle_id: u64 = 0;
-    // Our own display handle, learned from each `SendChat` (the TUI carries the
-    // handle per-message). `None` until the first send: used ONLY to suppress the
-    // DHT re-surface of our own circle write. Staying `None` pre-send means a
-    // genuine inbound from another member is never mistaken for our own, even if
-    // they share a default name (the over-suppression hazard); after a real
-    // `name#hash` is learned, a collision is identity-derived and astronomically
-    // unlikely.
+    // Our own `name#<12hex>` handle — the display name the lobby presence beacon
+    // broadcasts (see `emit_and_reap_lobby_presence`). Seeded at connect from the
+    // session identity and refreshed on each `SendChat`/`SendPublicRoom`. `None`
+    // only on the no-profile/ephemeral path (no session), where the beacon falls
+    // back to "guest". NOT used for own-message suppression — that keys on the
+    // stable identity pubkey (#143), never this mutable handle.
     let mut my_handle: Option<String> = None;
     let mut prune_timer = tokio::time::interval(SHARE_CATALOG_PRUNE_INTERVAL);
     // Presence keepalive + reap clock (WB-1.2): a jittered [180,220]s keepalive into
@@ -650,6 +649,7 @@ async fn handle_command(
             stable_signing_key,
             stable_share_root_ikm,
             profile_root,
+            self_handle,
             ..
         } => {
             // Capture the stable identity key (least-authority: kept behind an Arc
@@ -664,6 +664,16 @@ async fn handle_command(
             // verified resume anchors each fetch's manifest digest in the client's
             // own trusted state (a `ManifestDigestStore` under this dir).
             shares.profile_root = profile_root;
+            // (presence fix) Seed our own display handle at connect so the lobby
+            // presence beacon carries the real name from its first emit. A
+            // publish-only or lurking session never sends a chat — the only place
+            // `my_handle` was previously learned — so the beacon would otherwise
+            // broadcast the "guest" fallback. `own_handle()` yields "anon" only
+            // when there is no session (a path that does not Connect today); guard
+            // both it and "" so a future pre-session Connect can't beacon "anon".
+            if !self_handle.is_empty() && self_handle != "anon" {
+                *my_handle = Some(self_handle);
+            }
             connect(evt_tx, net, ev_rx).await;
             if net.is_some() {
                 // Subscribe the world-derivable lobby so share announcements fold

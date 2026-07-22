@@ -194,6 +194,11 @@ fn run(
                 // The TUI always runs under an unlocked profile root, so this is
                 // always available; the field stays `Option` for parity with the GUI.
                 profile_root: Some(profile_root.clone()),
+                // (presence fix) Hand our own `name#hash` to the actor at connect so
+                // the lobby presence beacon carries the real name immediately — a
+                // publish-only/lurking session never sends a chat (the old learn
+                // point) and would otherwise broadcast "guest".
+                self_handle: app.own_handle(),
             });
         }
         if let Some(phrase) = app.take_pending_join() {
