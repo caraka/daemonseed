@@ -50,6 +50,15 @@ So: an idea enters `ROADMAP.md`; if it needs design, it gets a `docs/design/` do
 
 **Cross-references are hard-bounded to repo-canonical artifacts.** An issue, `ROADMAP.md` entry, or `docs/design/` doc may freely cite the repo `ISA.md`'s `ISC-N` / `ISC-A-N` IDs and repo paths/docs — they are permanent, shared, and authoritative. It must **never** cite a contributor's own local / working-draft / PRD language or its private ISC numbering: those are personal scratch, may diverge from the repo, and mean nothing (or mislead) to anyone else. The test: **if a reference resolves inside the repo, it belongs; if it only resolves in someone's local notes, it does not.**
 
+## Branch & merge workflow
+
+Every change lands on `main` through a **pull request** — never a direct push or a local fast-forward to `main`, even for a single-author or trivial change.
+
+1. Branch from `main`; push the branch and open a PR (`gh pr create`).
+2. Review before merge. A trust-surface change — crypto, the signer whitelist / announce write-gate, provenance, identity/key derivation — warrants a thorough review pass called out in the PR.
+3. Merge by a **signature-preserving** path (this repo signs commits): a local fast-forward of the PR branch, or `gh pr merge --merge`. Never `--rebase` / `--squash` — they re-create the commits server-side and drop the SSH signature, landing an unsigned commit on `main`.
+4. The **release-chore** — version stamps (`lama.yaml`, `README.md` `## Status`, `daemonseed-gui`'s `APP_VERSION`) and the `CHANGELOG.md` `[Unreleased]` → `[vX.Y.Z]` rename — plus the signed tag are a **separate post-merge** step, never bundled into a feature PR (see *Cutting a release tag* below).
+
 ## Definition of done
 
 Every task is incomplete until all of these pass:
