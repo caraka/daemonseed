@@ -24,6 +24,8 @@ next release this block is renamed to its version + date and a fresh
 `[Unreleased]` is opened (see `AGENTS.md` doc-sync). Planning for *unstarted*
 work lives in the project lead's vault manifest, not here.
 
+## [0.36.0] — 2026-07-21
+
 ### Added
 
 - `daemonseed-veilid-net`: a per-route concurrency budget (`route_budget::RouteBudget`) capping in-flight fragment `app_call`s per serving route, with a global cap and an error-primary window controller; the fresh-route ceiling is a constructor knob (`RouteBudget::with_default_ceiling`), pinned in production to `DEFAULT_ROUTE_CEIL` (the floor) on veilid 0.5.7 (`docs/design/download-subsystem.md` Part 1).

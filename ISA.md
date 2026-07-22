@@ -1865,3 +1865,8 @@ Criteria, Out of Scope — that every milestone must honor. *What* shipped and
   wrapped, untrusted name sanitized). No runnable bin built (VM). **DEFERRED-VERIFY → orinoco:** a
   single-folder-share download lands as `~/Downloads/<ShareName>/…` (not loose); a nested share
   unchanged; the `.dspart/` root is gone after completion. (Sanjay, 2026-07-21.)
+- FELT-TEST CONFIRMED — orinoco 2-client GUI, caraka, 2026-07-21 (satisfies the DEFERRED-VERIFY →
+  orinoco items above): **scatter fix** — a single-folder share lands in its own folder, not loose;
+  **`.dspart` fully removed** on completion (not just emptied); **A1** — a failed download's residue is
+  reclaimed and a resume-then-complete cleans its staging; **route-window clamp** — 0
+  `could not get remote private route` across the session. Shipped as **v0.36.0**. (Sanjay, 2026-07-21.)
