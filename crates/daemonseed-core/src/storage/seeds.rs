@@ -175,10 +175,11 @@ impl CounterState {
 ///   re-index on next launch (ISC-C21 persistence, M14); both fields
 ///   hex-encoded (an empty label hex means "no label"). Client-local only —
 ///   no wire message carries it (ISC-A-C3).
-/// - `announce-seen <server_id> <hex_hash>` — the per-relay last-seen
-///   announcements/MOTD content hash (#93 unread-gating). Both tokens are
-///   whitespace-free, so the two-token split is unambiguous; a malformed line is
-///   skipped. Client-local only — no wire message carries it (ISC-A-C3).
+/// - `announce-seen <server_id> <marker>` — the per-relay announcements/MOTD seen
+///   marker (#93 unread-gating), OPAQUE to this store; the client owns its encoding.
+///   Both tokens are whitespace-free, so the two-token split is unambiguous; a
+///   malformed line is skipped. Client-local only — no wire message carries it
+///   (ISC-A-C3).
 ///
 /// A bare-phrase payload (no extra lines, the legacy form) parses with default
 /// counters and empty lists, so existing blobs open without re-enrollment.
@@ -627,12 +628,12 @@ impl Seeds {
                 None => s.push_str(&format!("\npublish {}", hex::encode(ps.root.as_bytes()))),
             }
         }
-        // Per-relay last-seen announcements/MOTD hash (#93): one line per entry,
-        // `announce-seen <server_id> <hex_hash>`. Both tokens are whitespace-free
+        // Per-relay announcements/MOTD seen marker (#93): one line per entry,
+        // `announce-seen <server_id> <marker>`. Both tokens are whitespace-free
         // (guarded at the setter), so a two-token split round-trips; the BTreeMap
         // iterates in deterministic key order. Client-local only (ISC-A-C3).
-        for (server_id, hash) in &self.announce_seen {
-            s.push_str(&format!("\nannounce-seen {server_id} {hash}"));
+        for (server_id, marker) in &self.announce_seen {
+            s.push_str(&format!("\nannounce-seen {server_id} {marker}"));
         }
         // Per-circle read high-water (#107): `circle-seen <hex(entropy)> <ms>`. The
         // entropy is hex-encoded (it is a phrase with spaces); `ms` is a plain i64.
@@ -729,13 +730,13 @@ impl Seeds {
                 published.push(PublishedShare { root, name });
                 continue;
             }
-            // Per-relay last-seen announcements/MOTD hash (#93):
-            // `announce-seen <server_id> <hex_hash>`. A malformed line (missing the
+            // Per-relay announcements/MOTD seen marker (#93):
+            // `announce-seen <server_id> <marker>`. A malformed line (missing the
             // second token) is SKIPPED, not fatal — matching the directive scheme's
             // additive tolerance; an older blob with no such line parses to empty.
             if let Some(rest) = line.strip_prefix("announce-seen ") {
-                if let Some((server_id, hash)) = rest.split_once(' ') {
-                    announce_seen.insert(server_id.to_string(), hash.to_string());
+                if let Some((server_id, marker)) = rest.split_once(' ') {
+                    announce_seen.insert(server_id.to_string(), marker.to_string());
                 }
                 continue;
             }
@@ -1565,8 +1566,28 @@ mod tests {
     }
 
     #[test]
+    fn clear_announce_seen_removes_the_entry() {
+        // #217: the rollback path in `Profile::persist_announce_seen` needs to restore
+        // "no entry at all" — distinct from an empty marker, which would round-trip
+        // through the blob as a real entry that covers nothing.
+        ensure_oxicrypt_initialized();
+        let mut seeds = fresh_seeds();
+        assert!(
+            !seeds.clear_announce_seen("fra1#06177b08dc06"),
+            "nothing to clear"
+        );
+        assert!(seeds.set_announce_seen("fra1#06177b08dc06", "aaaa,bbbb"));
+        assert!(seeds.clear_announce_seen("fra1#06177b08dc06"));
+        assert_eq!(seeds.announce_seen("fra1#06177b08dc06"), None);
+        assert!(
+            !seeds.clear_announce_seen("fra1#06177b08dc06"),
+            "idempotent"
+        );
+    }
+
+    #[test]
     fn announce_seen_round_trips_through_blob() {
-        // #93 oracle. A per-relay last-seen announcements/MOTD hash survives a
+        // #93 oracle. A per-relay announcements/MOTD seen marker survives a
         // seal/open round-trip, the setter is idempotent on an unchanged value,
         // and whitespace/line-break inputs are refused (blob-integrity).
         ensure_oxicrypt_initialized();

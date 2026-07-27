@@ -188,28 +188,32 @@ impl Profile {
         Ok(removed)
     }
 
-    /// (#93) The per-relay last-seen announcements/MOTD content hash for
-    /// `server_id`, or `None` if this relay was never marked seen.
+    /// (#93/#217) The per-relay announcements/MOTD seen marker for `server_id` — the
+    /// set of item hashes the user has read — or `None` if never marked seen.
     pub fn announce_seen(&self, server_id: &str) -> Option<&str> {
         self.seeds.announce_seen(server_id)
     }
 
-    /// (#93) Record `hash` as the last-seen announcements/MOTD content hash for
-    /// `server_id` and re-seal the blob to disk (unread-gating write-through).
-    /// Returns `Ok(true)` if the stored value changed, `Ok(false)` if unchanged
-    /// (idempotent — no re-seal). A disk / seal failure is surfaced as
-    /// `Err(reason)`; the unread state is non-critical, so the caller decides how
-    /// loud to be.
+    /// (#93/#217) Record `marker` as the announcements/MOTD seen set for `server_id`
+    /// and re-seal the blob to disk (unread-gating write-through). Returns `Ok(true)`
+    /// if the stored value changed, `Ok(false)` if unchanged (idempotent — no
+    /// re-seal). A disk / seal failure is surfaced as `Err(reason)`; the unread state
+    /// is non-critical, so the caller decides how loud to be.
     pub fn persist_announce_seen(&mut self, server_id: &str, marker: &str) -> Result<bool, String> {
         let previous = self.seeds.announce_seen(server_id).map(str::to_owned);
         let changed = self.seeds.set_announce_seen(server_id, marker);
         if changed && let Err(reason) = self.reseal() {
-            // Roll the in-memory map back to what is actually on disk. Without this the
-            // mutation outlives the failed write, so the NEXT call with the same value
-            // reports "unchanged", skips the reseal, and returns `Ok` — the error is
-            // surfaced exactly once and the marker silently never reaches disk for the
-            // rest of the session. Restoring it keeps the failure re-reporting until a
-            // write actually lands.
+            // Undo the in-memory mutation. Without this it outlives the failed write, so
+            // the NEXT call with the same value reports "unchanged", skips the re-seal,
+            // and returns `Ok` — the error surfaces exactly once and the marker silently
+            // never reaches disk again for the rest of the session. Restoring the prior
+            // value keeps the failure reportable until a write actually lands.
+            //
+            // This restores the value this process last believed was on disk, which is
+            // not quite the same as what IS on disk: `reseal` writes the blob
+            // non-atomically, so a failure part-way through leaves neither the old nor
+            // the new content there. Recovering from a torn blob is a storage-layer
+            // concern shared by every `persist_*` path, not something this can fix.
             match previous {
                 Some(p) => self.seeds.set_announce_seen(server_id, p),
                 None => self.seeds.clear_announce_seen(server_id),

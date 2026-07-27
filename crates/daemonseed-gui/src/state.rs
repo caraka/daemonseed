@@ -142,10 +142,6 @@ fn item_hash(kind: u8, fields: &[&[u8]], nums: &[i64]) -> String {
         .unwrap_or_default()
 }
 
-/// Ceiling on how many item hashes the persisted marker carries. See [`merge_seen`]
-/// for what happens at the ceiling and why dropping is safe there.
-const MAX_SEEN_ITEMS: usize = 512;
-
 /// Encode a seen-item set for persistence, joined by [`SEEN_SEPARATOR`].
 pub fn encode_seen<S: AsRef<str>>(items: &[S]) -> String {
     items
@@ -172,10 +168,18 @@ pub fn encode_seen<S: AsRef<str>>(items: &[S]) -> String {
 /// read-state. An empty view is not evidence that the user read nothing; it is
 /// evidence of nothing.
 ///
-/// Growth is bounded at [`MAX_SEEN_ITEMS`]. At the ceiling the items currently on
-/// display are always kept and the overflow is dropped from what remains: a dropped
-/// hash belongs to content no longer served, which cannot be displayed and therefore
-/// cannot raise a dot unless it is published again.
+/// **No ceiling.** An earlier cut capped the marker and evicted the overflow, on the
+/// argument that a dropped hash must belong to content no longer served. That argument
+/// is false precisely because of the partial convergence above: an item that IS served
+/// but has not folded in yet is absent from `current_items` and was therefore eligible
+/// for eviction, so a read during warmup could drop an already-read item and re-flag it
+/// when it arrived — the bug this function exists to prevent. The cap also truncated
+/// `current_items` itself once the view exceeded it, wedging the dot on permanently
+/// with no error anywhere. Both failures were silent, and both were worse than the
+/// growth they guarded against: the marker is bounded in practice by the number of
+/// distinct operator items ever published, at 97 bytes each, and only the operator can
+/// publish. If that ever becomes a real bound, the fix is to prune against a converged
+/// view — never against a partial one.
 pub fn merge_seen(current_items: &[String], stored: Option<&str>) -> Option<String> {
     // Drop any item whose hash could not be computed (the `item_hash` pre-init
     // fallback). An item we failed to hash is not evidence that anything was read, and
@@ -190,19 +194,12 @@ pub fn merge_seen(current_items: &[String], stored: Option<&str>) -> Option<Stri
     }
     let carried: BTreeSet<&str> = stored.map(decode_seen).unwrap_or_default();
 
-    // Displayed items claim the capacity FIRST, so the ceiling can only ever evict
-    // content that is no longer served. `current_items` is already sorted+deduped by
-    // `item_content_hashes`.
+    // `current_items` is already sorted+deduped by `item_content_hashes`, but this is
+    // `pub` and the sort below makes the result independent of that holding.
     let mut merged: Vec<&str> = current_items.clone();
-    merged.truncate(MAX_SEEN_ITEMS);
-    let room = MAX_SEEN_ITEMS.saturating_sub(merged.len());
-    merged.extend(
-        carried
-            .into_iter()
-            .filter(|h| !current_items.contains(h))
-            .take(room),
-    );
+    merged.extend(carried.into_iter().filter(|h| !current_items.contains(h)));
     merged.sort_unstable();
+    merged.dedup();
 
     Some(encode_seen(&merged))
 }
@@ -1359,28 +1356,100 @@ mod tests {
         assert_eq!(merge_seen(&[String::new()], Some(&stored)), None);
     }
 
-    /// The marker is bounded, and the ceiling can only evict content no longer served.
+    /// A read never narrows the marker, whatever the sizes involved. An earlier cut
+    /// capped it and evicted the overflow, which silently produced two failures: a view
+    /// larger than the cap had its own displayed items truncated away, wedging the dot
+    /// on forever; and at the cap a partially-converged read evicted already-read items
+    /// that simply had not folded in yet, re-flagging them when they arrived.
     #[test]
-    fn the_marker_is_bounded_and_never_evicts_displayed_items() {
+    fn a_read_never_drops_an_already_seen_item() {
         let _ = oxicrypt_module::initialize();
-        let carried: Vec<String> = (0..MAX_SEEN_ITEMS + 50)
-            .map(|i| format!("{i:096x}"))
-            .collect();
-        let stored = encode_seen(&carried);
 
+        // A large stored set plus a small converged view: everything survives.
+        let carried: Vec<String> = (0..600).map(|i| format!("{i:096x}")).collect();
+        let stored = encode_seen(&carried);
         let view = ann_view(Some("motd"), &[("a", "x", 1)]);
         let current = item_content_hashes(&view);
         let merged = merge_seen(&current, Some(&stored)).unwrap();
-
         let set = decode_seen(&merged);
-        assert_eq!(set.len(), MAX_SEEN_ITEMS, "capped");
-        for h in &current {
-            assert!(
-                set.contains(h.as_str()),
-                "displayed items are never evicted"
-            );
+        for h in carried
+            .iter()
+            .map(String::as_str)
+            .chain(current.iter().map(String::as_str))
+        {
+            assert!(set.contains(h), "nothing already seen may be dropped");
         }
         assert!(!announcements_unread(&view, &current, Some(&merged)));
+
+        // The partial-convergence case: read while only one of many items has folded in,
+        // then let the rest arrive. None of them may re-flag.
+        let full = ann_view(Some("motd"), &[("a", "x", 1), ("b", "y", 2), ("c", "z", 3)]);
+        let full_items = item_content_hashes(&full);
+        let settled = merge_seen(&full_items, Some(&stored)).unwrap();
+        let partial = ann_view(None, &[("b", "y", 2)]);
+        let after_partial_read =
+            merge_seen(&item_content_hashes(&partial), Some(&settled)).unwrap();
+        assert!(
+            !announcements_unread(&full, &full_items, Some(&after_partial_read)),
+            "a partial read must not evict the items still converging"
+        );
+
+        // A view larger than any previous cap keeps every one of its own items.
+        let big: Vec<(String, String, i64)> = (0..600)
+            .map(|i| (format!("t{i}"), format!("b{i}"), i as i64))
+            .collect();
+        let big_view = AnnouncementsView {
+            motd: None,
+            posts: big
+                .iter()
+                .map(|(t, b, ms)| AnnouncementRow {
+                    topic: t.clone(),
+                    body: b.clone(),
+                    sent_unix_ms: *ms,
+                })
+                .collect(),
+        };
+        let big_items = item_content_hashes(&big_view);
+        let big_marker = merge_seen(&big_items, None).unwrap();
+        assert!(
+            !announcements_unread(&big_view, &big_items, Some(&big_marker)),
+            "reading a large view must actually mark it read"
+        );
+    }
+
+    /// Re-reading unchanged content must produce a byte-identical marker, so
+    /// `set_announce_seen` reports "unchanged" and the ~30 s poll does not re-seal the
+    /// blob on every tick.
+    #[test]
+    fn merging_the_same_view_twice_is_idempotent() {
+        let _ = oxicrypt_module::initialize();
+        let view = ann_view(Some("motd"), &[("a", "x", 1), ("b", "y", 2)]);
+        let items = item_content_hashes(&view);
+        let first = merge_seen(&items, None).unwrap();
+        let second = merge_seen(&items, Some(&first)).unwrap();
+        assert_eq!(first, second);
+
+        // Unsorted / duplicated input must not change the result either — `merge_seen`
+        // is `pub` and documents the invariant rather than enforcing it.
+        let mut scrambled = items.clone();
+        scrambled.reverse();
+        scrambled.push(items[0].clone());
+        assert_eq!(merge_seen(&scrambled, Some(&first)).unwrap(), first);
+    }
+
+    /// A marker written by a pre-#217 client is a single whole-view hash. It matches no
+    /// item, so the pane reads unread once after upgrading; the read then carries the
+    /// stale hash forward as one inert entry rather than losing the new marker.
+    #[test]
+    fn a_pre_217_marker_reads_unread_once_then_migrates_itself() {
+        let _ = oxicrypt_module::initialize();
+        let view = ann_view(Some("motd"), &[("a", "x", 1)]);
+        let items = item_content_hashes(&view);
+        let stale = "0".repeat(96);
+
+        assert!(announcements_unread(&view, &items, Some(&stale)));
+        let migrated = merge_seen(&items, Some(&stale)).unwrap();
+        assert!(!announcements_unread(&view, &items, Some(&migrated)));
     }
 
     /// An empty MOTD is absent, not an item: `render_motd` yields `""` on a payload that
