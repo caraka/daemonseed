@@ -443,6 +443,14 @@ pub struct GuiState {
     /// `PublishStopped`. Drives the Publish overlay's "Your live shares" list and the
     /// Unpublish affordance. RAM-only; cleared on relaunch.
     my_shares: Vec<MyShare>,
+    /// The announcements/MOTD view currently ON SCREEN — the last one applied to the
+    /// pane (#229). Read-state has to follow what the user actually saw, not what the
+    /// network last delivered: opening the tab fires a refresh that answers with an
+    /// error rather than a snapshot whenever the operator record is unsubscribed, and
+    /// nothing clears the pane on disconnect, so the user reads content that no
+    /// subsequent event covers. Retaining it lets the tab-open handler mark exactly
+    /// what is displayed as seen, independent of whether any event arrives.
+    announcements_on_screen: AnnouncementsView,
 }
 
 impl GuiState {
@@ -473,6 +481,7 @@ impl GuiState {
             next_circle_id: FIRST_CIRCLE_ID,
             profile: None,
             my_shares: Vec::new(),
+            announcements_on_screen: AnnouncementsView::default(),
         }
     }
 
@@ -559,6 +568,35 @@ impl GuiState {
             .and_then(|p| p.stable_share_root_ikm().ok())
     }
 
+    /// (#229) Record the announcements/MOTD view now rendered in the pane.
+    pub fn set_announcements_on_screen(&mut self, view: AnnouncementsView) {
+        self.announcements_on_screen = view;
+    }
+
+    /// (#229) Mark everything currently ON SCREEN in the announcements pane as seen,
+    /// persisting the merged marker for `server_id`.
+    ///
+    /// This is the single place read-state is recorded, and it is driven by what is
+    /// displayed rather than by an inbound event. Binding it to the event instead meant
+    /// that opening the tab while the operator record was unsubscribed — a refresh that
+    /// answers `PublicSpaceError`, with the pane still showing the last content it
+    /// received — recorded nothing at all, and the dot re-fired later on content the
+    /// user had plainly read (#229).
+    ///
+    /// `Ok(false)` means there was nothing to record: an empty pane, or a marker that
+    /// already covers it. A persist failure is surfaced as `Err(reason)`.
+    pub fn mark_announcements_seen(&mut self, server_id: &str) -> Result<bool, String> {
+        let items = item_content_hashes(&self.announcements_on_screen);
+        let stored = self.announce_seen_hash(server_id);
+        match merge_seen(&items, stored.as_deref()) {
+            // `persist_announce_seen` reports whether the stored value actually moved,
+            // so an unchanged marker reports `false` and skips the re-seal — which is
+            // what keeps the ~30 s poll from re-sealing the blob on every tick.
+            Some(marker) => self.persist_announce_seen(server_id, &marker),
+            None => Ok(false),
+        }
+    }
+
     /// (#93/#217) The per-relay seen-item marker for `server_id`, read from the
     /// unlocked profile's blob — the [`encode_seen`] set of announcements/MOTD items
     /// the user has read. `None` on the ephemeral (no-profile) path or when this relay
@@ -572,12 +610,15 @@ impl GuiState {
 
     /// (#93/#217) Write-through: record `marker` as the seen-item set for `server_id`
     /// (an [`encode_seen`] value) and re-seal the blob, so the unread gate bypasses
-    /// those items next connect. A no-op (`Ok`) on the ephemeral (no-profile) path or
-    /// when the value is unchanged; a disk / seal failure is surfaced as `Err(reason)`.
-    pub fn persist_announce_seen(&mut self, server_id: &str, marker: &str) -> Result<(), String> {
+    /// those items next connect. `Ok(true)` when the stored value moved, `Ok(false)`
+    /// when it was unchanged or there is no profile (the ephemeral path); a disk / seal
+    /// failure is surfaced as `Err(reason)`. Callers want
+    /// [`Self::mark_announcements_seen`], which derives the marker from what is on
+    /// screen; this is the raw write-through beneath it.
+    fn persist_announce_seen(&mut self, server_id: &str, marker: &str) -> Result<bool, String> {
         match self.profile.as_mut() {
-            Some(p) => p.persist_announce_seen(server_id, marker).map(|_| ()),
-            None => Ok(()),
+            Some(p) => p.persist_announce_seen(server_id, marker),
+            None => Ok(false),
         }
     }
 
@@ -1178,6 +1219,7 @@ impl GuiState {
             next_circle_id: FIRST_CIRCLE_ID,
             profile: None,
             my_shares: Vec::new(),
+            announcements_on_screen: AnnouncementsView::default(),
         }
     }
 }
@@ -2847,6 +2889,88 @@ mod tests {
 
     /// The ephemeral path (no profile) never persists and never panics: joins work
     /// in RAM, `persist_circle` is a clean no-op, and there is nothing to rejoin.
+    /// #229: read-state must follow what was DISPLAYED, not what the network last
+    /// delivered. Opening the pane while the operator record is unsubscribed answers
+    /// with an error rather than a snapshot, and nothing clears the pane on
+    /// disconnect — so the user reads content that no event covers. Marking from the
+    /// retained on-screen view records it anyway.
+    #[test]
+    fn reading_the_pane_records_what_is_on_screen_without_a_snapshot() {
+        use daemonseed_core::bootstrap::BootstrapAnchor;
+        use daemonseed_core::first_start::FirstStart;
+        use daemonseed_core::profile::config::ArgonParams;
+        use daemonseed_core::profile::persist::write_first_start;
+
+        let _ = oxicrypt_module::initialize();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "ds-gui-announce-229-{}-{nonce}",
+            std::process::id()
+        ));
+        let fast = ArgonParams {
+            memory_kib: 8,
+            iterations: 1,
+            parallelism: 1,
+        };
+        let pass = "correct horse battery staple table mountain";
+        let sealed = FirstStart::new().initialize(pass, fast).unwrap();
+        let phrase = sealed.display_phrase();
+        let materials = sealed
+            .verify_round_trip(&phrase)
+            .unwrap()
+            .finalize(
+                Some("alice".to_string()),
+                BootstrapAnchor {
+                    server_id: "relay#aabbccddeeff".to_string(),
+                    address: "127.0.0.1:443".to_string(),
+                },
+            )
+            .unwrap()
+            .into_session_materials();
+        write_first_start(&root, &materials, None, false).unwrap();
+
+        let mut st = GuiState::lobby_only();
+        st.set_profile(Profile::from_materials(materials, root.clone()));
+        let server_id = "relay#aabbccddeeff";
+
+        // A snapshot arrives and is rendered while the user is elsewhere.
+        let view = ann_view(Some("motd"), &[("release", "v0.36.2", 7)]);
+        let items = item_content_hashes(&view);
+        st.set_announcements_on_screen(view.clone());
+        assert!(
+            announcements_unread(&view, &items, st.announce_seen_hash(server_id).as_deref()),
+            "unseen content raises the dot"
+        );
+
+        // The connection drops. The user opens the tab and reads what is still shown;
+        // no further snapshot ever arrives.
+        assert!(
+            st.mark_announcements_seen(server_id).unwrap(),
+            "reading the displayed pane records it"
+        );
+        assert!(
+            !announcements_unread(&view, &items, st.announce_seen_hash(server_id).as_deref()),
+            "content the user read must not re-flag when the snapshot returns"
+        );
+
+        // Re-reading unchanged content records nothing further.
+        assert!(!st.mark_announcements_seen(server_id).unwrap());
+
+        // An empty pane records nothing at all, rather than erasing the marker.
+        st.set_announcements_on_screen(AnnouncementsView::default());
+        assert!(!st.mark_announcements_seen(server_id).unwrap());
+        assert!(!announcements_unread(
+            &view,
+            &items,
+            st.announce_seen_hash(server_id).as_deref()
+        ));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn no_profile_means_no_persistence() {
         let _ = oxicrypt_module::initialize();

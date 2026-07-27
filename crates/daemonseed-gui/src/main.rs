@@ -64,7 +64,7 @@ use slint::platform::{Platform, PlatformError, WindowAdapter};
 use slint::{ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel};
 use state::{
     AnnouncementsView, CircleState, GuiState, Msg, announcements_unread, format_relative_age,
-    item_content_hashes, merge_seen,
+    item_content_hashes,
 };
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -942,12 +942,24 @@ fn build_ui() -> BuiltUi {
     ui.on_announcements_tab_opened({
         let net = net.clone();
         let ui = ui.as_weak();
+        let state = state.clone();
         move || {
             // #142: clear the unread dot on open (the tab also becomes active, which
             // already hides the dot via the `!active` gate; this keeps the flag
-            // truthful). The refresh below yields a snapshot that persists the seen-hash.
+            // truthful).
+            //
+            // #229: mark what is ON SCREEN seen right here, rather than relying on the
+            // refresh below to answer with a snapshot. It answers `PublicSpaceError`
+            // whenever the operator record is unsubscribed, and nothing clears the pane
+            // on disconnect — so the user reads content that no event covers, and the
+            // dot re-fires on it later. Persisting from the displayed view makes
+            // read-state follow what was read.
             if let Some(ui) = ui.upgrade() {
                 ui.set_announce_unread(false);
+                let server_id = relay_target().0;
+                if let Err(message) = state.borrow_mut().mark_announcements_seen(&server_id) {
+                    ui.set_announce_status(SharedString::from(message));
+                }
             }
             let _ = net.borrow().send(NetCommand::RefreshPublicSpace);
         }
@@ -1798,24 +1810,16 @@ fn apply_net_event(
             // the next arrival and re-trips the dot (#217).
             let current = item_content_hashes(&view);
             let server_id = relay_target().0;
+            // #229: this view is what the pane now shows, so it is what a read marks
+            // seen — retained rather than recomputed, since the tab may be opened when
+            // no further event will arrive.
+            state.borrow_mut().set_announcements_on_screen(view.clone());
             if ui.get_active_tab() == ANNOUNCEMENTS_TAB {
-                // The user is looking at the pane → mark every item on display seen
-                // (persist the marker + re-seal; idempotent, a no-op when unchanged or on
-                // the ephemeral no-profile path) and clear the dot. A persist failure is
-                // non-fatal; surface it quietly in the pane's status line.
-                //
-                // `merge_seen` UNIONS with what is already stored and declines to write
-                // at all for an empty view. Opening the tab fires a `RefreshPublicSpace`
-                // that snapshots whatever has converged so far — often nothing — so
-                // writing the displayed set straight out would narrow or erase the
-                // read-state mid-warmup and re-flag content the user has read.
+                // The user is looking at the pane → mark everything on display seen and
+                // clear the dot. A persist failure is non-fatal; surface it quietly in
+                // the pane's status line.
                 ui.set_announce_unread(false);
-                let stored = state.borrow().announce_seen_hash(&server_id);
-                if let Some(marker) = merge_seen(&current, stored.as_deref())
-                    && let Err(message) = state
-                        .borrow_mut()
-                        .persist_announce_seen(&server_id, &marker)
-                {
+                if let Err(message) = state.borrow_mut().mark_announcements_seen(&server_id) {
                     ui.set_announce_status(SharedString::from(message));
                 }
             } else {
