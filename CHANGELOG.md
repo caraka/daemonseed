@@ -24,7 +24,16 @@ next release this block is renamed to its version + date and a fresh
 `[Unreleased]` is opened (see `AGENTS.md` doc-sync). Planning for *unstarted*
 work lives in the project lead's vault manifest, not here.
 
+## [0.36.2] — 2026-07-27
+
 ### Fixed
+
+- The Announcements unread dot no longer re-fires on content already read. Operator
+  content folds in one item at a time, so the pane is routinely observed partially
+  converged; the seen-marker hashed the whole view, which every arrival invalidated.
+  It is now a set of per-item hashes, unioned on write and derived from what the pane
+  displays, so an item once read stays read whatever folds in beside it and however
+  slowly the DHT converges (#217, #158).
 
 - TUI lobby presence now carries the client's own display name instead of the
   `guest` fallback. The self-handle is learned at connect rather than only from
