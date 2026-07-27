@@ -235,12 +235,13 @@ pub struct Seeds {
     /// re-asserts each published root once reconnected, so ephemerality is
     /// unchanged. Mutate via [`Self::add_published`] / [`Self::remove_published`].
     pub published: Vec<PublishedShare>,
-    /// Per-relay last-seen announcements/MOTD content hash (#93 unread-gating),
-    /// keyed by `server_id` → the client-derived combined content hash (hex). On
-    /// connect the client compares the current relay content hash to this marker
-    /// to decide whether to auto-open the announcements pane (new news) or the
-    /// Lobby (already seen). Default empty. Client-local only — no wire message
-    /// carries it (ISC-A-C3); it is persistence of read-state, not of content.
+    /// Per-relay announcements/MOTD seen marker (#93 unread-gating), keyed by
+    /// `server_id` → a client-derived, whitespace-free value this store treats as
+    /// OPAQUE. The client compares the content on display against it to decide
+    /// whether the announcements tab shows an unread dot (#142 — the #93
+    /// connect-time auto-open it originally gated was retired in favour of the
+    /// dot). Default empty. Client-local only — no wire message carries it
+    /// (ISC-A-C3); it is persistence of read-state, not of content.
     /// Mutate via [`Self::set_announce_seen`] / read via [`Self::announce_seen`].
     pub announce_seen: BTreeMap<String, String>,
     /// Per-circle read high-water mark (#107), keyed by the canonicalized circle
@@ -510,36 +511,46 @@ impl Seeds {
         self.published.len() != before
     }
 
-    /// The per-relay last-seen announcements/MOTD content hash for `server_id`
-    /// (#93), or `None` if this relay was never marked seen.
+    /// The per-relay announcements/MOTD seen marker for `server_id` (#93), or `None`
+    /// if this relay was never marked seen. The value is **opaque here** — the client
+    /// owns its meaning and encoding (today, the set of item content hashes the user
+    /// has read); this store only guarantees it round-trips through the blob.
     pub fn announce_seen(&self, server_id: &str) -> Option<&str> {
         self.announce_seen.get(server_id).map(String::as_str)
     }
 
-    /// Record `hash` as the last-seen announcements/MOTD content hash for
-    /// `server_id` (#93 unread-gating). Returns `true` if the stored value
-    /// changed, `false` if unchanged (idempotent) or rejected.
+    /// Forget the announcements/MOTD seen marker for `server_id`. Returns `true` if one
+    /// was removed. Used to roll the in-memory map back to disk state when a re-seal
+    /// fails, so a failed write cannot masquerade as a completed one.
+    pub fn clear_announce_seen(&mut self, server_id: &str) -> bool {
+        self.announce_seen.remove(server_id).is_some()
+    }
+
+    /// Record `marker` as the announcements/MOTD seen marker for `server_id`
+    /// (#93 unread-gating). Returns `true` if the stored value changed, `false` if
+    /// unchanged (idempotent) or rejected.
     ///
-    /// Refuses a `server_id` or `hash` containing whitespace or a line break: the
-    /// `announce-seen <server_id> <hash>` directive is a single, two-token line, so
+    /// Refuses a `server_id` or `marker` containing whitespace or a line break: the
+    /// `announce-seen <server_id> <marker>` directive is a single, two-token line, so
     /// a space would make the split ambiguous and a `\n`/`\r` would inject a
     /// spurious directive and corrupt the blob on the next open — same integrity
-    /// rule as [`Self::add_mute`]. A server_id (`name#hex`) and a hex hash never
-    /// contain whitespace, so a well-formed marker is always accepted.
+    /// rule as [`Self::add_mute`]. This is the ONLY constraint the marker's encoding
+    /// must respect; a `name#hex` server_id and a whitespace-free marker are always
+    /// accepted.
     pub fn set_announce_seen(
         &mut self,
         server_id: impl Into<String>,
-        hash: impl Into<String>,
+        marker: impl Into<String>,
     ) -> bool {
         let server_id = server_id.into();
-        let hash = hash.into();
-        if server_id.contains([' ', '\t', '\n', '\r']) || hash.contains([' ', '\t', '\n', '\r']) {
+        let marker = marker.into();
+        if server_id.contains([' ', '\t', '\n', '\r']) || marker.contains([' ', '\t', '\n', '\r']) {
             return false;
         }
-        if self.announce_seen.get(&server_id).map(String::as_str) == Some(hash.as_str()) {
+        if self.announce_seen.get(&server_id).map(String::as_str) == Some(marker.as_str()) {
             return false;
         }
-        self.announce_seen.insert(server_id, hash);
+        self.announce_seen.insert(server_id, marker);
         true
     }
 

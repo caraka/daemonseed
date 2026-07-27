@@ -63,8 +63,8 @@ use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferTyp
 use slint::platform::{Platform, PlatformError, WindowAdapter};
 use slint::{ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel};
 use state::{
-    AnnouncementsView, CircleState, GuiState, Msg, announcements_unread, combined_content_hash,
-    format_relative_age,
+    AnnouncementsView, CircleState, GuiState, Msg, announcements_unread, format_relative_age,
+    item_content_hashes, merge_seen,
 };
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -1792,28 +1792,40 @@ fn apply_net_event(
         // ── Announcements + MOTD pane (#91/#92) + unread-gated landing (#93) ──
         NetEvent::PublicSpaceSnapshot { view, can_compose } => {
             apply_announcements(ui, &view, can_compose);
-            // #93/#142: the client-derived combined content hash is the unread marker.
-            let current = combined_content_hash(&view);
+            // #93/#142/#217: the client-derived PER-ITEM content hashes are the unread
+            // marker. Per item, not per view: operator content folds in one item at a
+            // time, so a whole-view marker persisted mid-convergence is invalidated by
+            // the next arrival and re-trips the dot (#217).
+            let current = item_content_hashes(&view);
             let server_id = relay_target().0;
             if ui.get_active_tab() == ANNOUNCEMENTS_TAB {
-                // The user is looking at the pane → mark this content seen (persist the
-                // hash + re-seal; idempotent, a no-op when unchanged or on the ephemeral
-                // no-profile path) and clear the dot. A persist failure is non-fatal;
-                // surface it quietly in the pane's status line.
+                // The user is looking at the pane → mark every item on display seen
+                // (persist the marker + re-seal; idempotent, a no-op when unchanged or on
+                // the ephemeral no-profile path) and clear the dot. A persist failure is
+                // non-fatal; surface it quietly in the pane's status line.
+                //
+                // `merge_seen` UNIONS with what is already stored and declines to write
+                // at all for an empty view. Opening the tab fires a `RefreshPublicSpace`
+                // that snapshots whatever has converged so far — often nothing — so
+                // writing the displayed set straight out would narrow or erase the
+                // read-state mid-warmup and re-flag content the user has read.
                 ui.set_announce_unread(false);
-                if let Err(message) = state
-                    .borrow_mut()
-                    .persist_announce_seen(&server_id, &current)
+                let stored = state.borrow().announce_seen_hash(&server_id);
+                if let Some(marker) = merge_seen(&current, stored.as_deref())
+                    && let Err(message) = state
+                        .borrow_mut()
+                        .persist_announce_seen(&server_id, &marker)
                 {
                     ui.set_announce_status(SharedString::from(message));
                 }
             } else {
                 // #142: NEVER force-open. Set the Announcements-tab unread dot when the
-                // verified content is non-empty AND changed since last seen (empty-view
-                // guard inside `announcements_unread`) — a non-intrusive indicator that
-                // behaves the same on connect and mid-session (mirrors the room dot #64).
+                // verified content is non-empty AND some item on display has not been seen
+                // (empty-view guard inside `announcements_unread`) — a non-intrusive
+                // indicator that behaves the same on connect and mid-session (mirrors the
+                // room dot #64).
                 let stored = state.borrow().announce_seen_hash(&server_id);
-                // #142: reuse the `current` hash already computed above — no second pass.
+                // #142: reuse the item hashes already computed above — no second pass.
                 ui.set_announce_unread(announcements_unread(&view, &current, stored.as_deref()));
             }
         }

@@ -200,10 +200,21 @@ impl Profile {
     /// (idempotent — no re-seal). A disk / seal failure is surfaced as
     /// `Err(reason)`; the unread state is non-critical, so the caller decides how
     /// loud to be.
-    pub fn persist_announce_seen(&mut self, server_id: &str, hash: &str) -> Result<bool, String> {
-        let changed = self.seeds.set_announce_seen(server_id, hash);
-        if changed {
-            self.reseal()?;
+    pub fn persist_announce_seen(&mut self, server_id: &str, marker: &str) -> Result<bool, String> {
+        let previous = self.seeds.announce_seen(server_id).map(str::to_owned);
+        let changed = self.seeds.set_announce_seen(server_id, marker);
+        if changed && let Err(reason) = self.reseal() {
+            // Roll the in-memory map back to what is actually on disk. Without this the
+            // mutation outlives the failed write, so the NEXT call with the same value
+            // reports "unchanged", skips the reseal, and returns `Ok` — the error is
+            // surfaced exactly once and the marker silently never reaches disk for the
+            // rest of the session. Restoring it keeps the failure re-reporting until a
+            // write actually lands.
+            match previous {
+                Some(p) => self.seeds.set_announce_seen(server_id, p),
+                None => self.seeds.clear_announce_seen(server_id),
+            };
+            return Err(reason);
         }
         Ok(changed)
     }
