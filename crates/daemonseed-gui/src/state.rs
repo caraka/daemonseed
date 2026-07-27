@@ -1492,6 +1492,11 @@ mod tests {
         assert!(announcements_unread(&view, &items, Some(&stale)));
         let migrated = merge_seen(&items, Some(&stale)).unwrap();
         assert!(!announcements_unread(&view, &items, Some(&migrated)));
+        // Carried forward, not dropped: `merge_seen` unions, and cannot tell a stale
+        // whole-view hash from an item hash it simply has not seen yet.
+        let set = decode_seen(&migrated);
+        assert!(set.contains(stale.as_str()));
+        assert_eq!(set.len(), items.len() + 1);
     }
 
     /// An empty MOTD is absent, not an item: `render_motd` yields `""` on a payload that
@@ -2887,13 +2892,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The ephemeral path (no profile) never persists and never panics: joins work
-    /// in RAM, `persist_circle` is a clean no-op, and there is nothing to rejoin.
-    /// #229: read-state must follow what was DISPLAYED, not what the network last
-    /// delivered. Opening the pane while the operator record is unsubscribed answers
-    /// with an error rather than a snapshot, and nothing clears the pane on
-    /// disconnect — so the user reads content that no event covers. Marking from the
-    /// retained on-screen view records it anyway.
+    /// #229: read-state follows what was DISPLAYED rather than what the network last
+    /// delivered, so a read is recorded whether or not any further event arrives.
+    ///
+    /// This is hardening, not a live fix. The state it guards — a populated pane whose
+    /// refresh answers with an error — is currently unreachable: the operator record is
+    /// subscribed once and never unsubscribed (`subscribe_operator_space` early-returns
+    /// when set, and nothing clears it), and the pane is only ever populated by a
+    /// snapshot, which requires that subscription. It becomes reachable the moment
+    /// anything resets the record on disconnect, and the coupling it removes — read
+    /// state depending on an inbound event — is worth not having regardless.
     #[test]
     fn reading_the_pane_records_what_is_on_screen_without_a_snapshot() {
         use daemonseed_core::bootstrap::BootstrapAnchor;
@@ -2971,6 +2979,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The ephemeral path (no profile) never persists and never panics: joins work
+    /// in RAM, `persist_circle` is a clean no-op, and there is nothing to rejoin.
     #[test]
     fn no_profile_means_no_persistence() {
         let _ = oxicrypt_module::initialize();

@@ -200,6 +200,16 @@ impl Profile {
     /// re-seal). A disk / seal failure is surfaced as `Err(reason)`; the unread state
     /// is non-critical, so the caller decides how loud to be.
     pub fn persist_announce_seen(&mut self, server_id: &str, marker: &str) -> Result<bool, String> {
+        // `Seeds::set_announce_seen` answers `false` for BOTH "unchanged" and
+        // "rejected as malformed", so a rejection would otherwise arrive here
+        // indistinguishable from a successful no-op: never written, never re-sealed,
+        // no error surfaced, and the dot re-firing forever on content the user read.
+        // The marker's encoding is the client's to choose (the store treats it as
+        // opaque), so the one constraint it must respect is checked here, where a
+        // violation can still be reported.
+        if marker.contains([' ', '\t', '\n', '\r']) {
+            return Err("announce marker contains whitespace — refusing to persist".to_owned());
+        }
         let previous = self.seeds.announce_seen(server_id).map(str::to_owned);
         let changed = self.seeds.set_announce_seen(server_id, marker);
         if changed && let Err(reason) = self.reseal() {
