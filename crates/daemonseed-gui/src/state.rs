@@ -14,6 +14,8 @@
 //! it stays Slint-free and network-free. Materialized circles are RAM-only and
 //! gone on relaunch — config persistence is a separate milestone.
 
+use std::collections::BTreeSet;
+
 use daemonseed_core::circle::key::{CircleKey, CircleKeyError, circle_fingerprint, derive_cot_key};
 use daemonseed_core::cot::AssetAddr;
 use daemonseed_core::crypto::suite::CNSA_2_0;
@@ -60,83 +62,182 @@ pub struct AnnouncementsView {
     pub posts: Vec<AnnouncementRow>,
 }
 
-// ── Unread-gated landing (#93 / D5) ──────────────────────────────────────────
+// ── Unread-gated landing (#93 / D5, per-item marker #217) ────────────────────
 
-/// Domain-separation prefix for the #93 combined content hash. Bump the tag on
-/// any change to the canonical encoding in [`combined_content_hash`].
-const ANNOUNCE_HASH_DOMAIN: &[u8] = b"daemonseed/announce-hash/v1\0";
+/// Domain-separation prefix for a per-item announcements/MOTD content hash (#217).
+/// Bump the tag on any change to the canonical encoding in [`item_content_hashes`].
+const ANNOUNCE_ITEM_DOMAIN: &[u8] = b"daemonseed/announce-item/v1\0";
 
-/// Compute the single combined content hash of a verified announcements/MOTD
-/// view (#93) — the client-derived unread marker.
+/// Kind tags inside the item hash, so a MOTD and a post whose rendered text happens
+/// to coincide never produce the same item hash.
+const ITEM_KIND_MOTD: u8 = 0;
+const ITEM_KIND_POST: u8 = 1;
+
+/// Separator between item hashes in the persisted marker. The seeds blob stores
+/// `announce-seen <server_id> <value>` as a single two-token line, so the separator
+/// MUST NOT be whitespace ([`Seeds::set_announce_seen`] rejects that outright).
+const SEEN_SEPARATOR: char = ',';
+
+/// The content hash of every item in a verified announcements/MOTD view (#217) —
+/// the client-derived unread marker, one entry per displayed item, sorted and
+/// deduplicated so the value is a deterministic set (the relay's served order never
+/// changes it).
 ///
-/// Deterministic and server-order-independent: the MOTD (the empty string when
-/// `None`) and the posts in a **canonical sort order** (`(topic, sent_unix_ms,
-/// body)`) are folded into a length-prefixed, domain-separated buffer so no field
-/// concatenation is ambiguous, then hashed with SHA-384
-/// ([`content_address`](daemonseed_core::public_space::content_address)) and
-/// rendered as lowercase hex. Identical content ⇒ identical hash; any change — a
-/// MOTD edit, a post added / removed / edited — ⇒ a different hash; a reorder of
-/// the relay's served posts ⇒ the **same** hash. The value is a stable,
-/// collision-resistant local marker only, never a wire artifact: it is compared
-/// solely to the per-relay marker persisted in
+/// **Per item, not per view.** Operator content folds in ONE ITEM AT A TIME — each
+/// verified announcement and the MOTD arrives as its own inbound and pushes its own
+/// `PublicSpaceSnapshot` — so during the startup warmup the view is observed in a
+/// sequence of partial states. A marker covering the whole view is invalidated by
+/// every one of those arrivals, so marking a partial view seen guarantees the dot
+/// re-trips when the next item lands (#217), and re-delivered already-read content
+/// re-fires it (#158). A per-item marker is monotone instead: an item already seen
+/// stays seen no matter what folds in beside it afterwards.
+///
+/// Each item is kind-tagged and length-prefixed inside a domain-separated buffer so
+/// no field concatenation is ambiguous, then hashed with SHA-384
+/// ([`content_address`](daemonseed_core::public_space::content_address)) and rendered
+/// as lowercase hex. The value is a local marker only, never a wire artifact: it is
+/// compared solely to the per-relay marker persisted in
 /// [`Seeds`](daemonseed_core::storage::seeds::Seeds).
-pub fn combined_content_hash(view: &AnnouncementsView) -> String {
-    let mut buf: Vec<u8> = Vec::new();
-    buf.extend_from_slice(ANNOUNCE_HASH_DOMAIN);
-
-    // MOTD: length-prefixed so an empty MOTD and an empty first post can't alias.
-    let motd = view.motd.as_deref().unwrap_or("");
-    buf.extend_from_slice(&(motd.len() as u64).to_le_bytes());
-    buf.extend_from_slice(motd.as_bytes());
-
-    // Posts in canonical order: the relay's served order must not change the hash.
-    let mut rows: Vec<&AnnouncementRow> = view.posts.iter().collect();
-    rows.sort_by(|a, b| {
-        a.topic
-            .cmp(&b.topic)
-            .then(a.sent_unix_ms.cmp(&b.sent_unix_ms))
-            .then(a.body.cmp(&b.body))
-    });
-    buf.extend_from_slice(&(rows.len() as u64).to_le_bytes());
-    for r in rows {
-        buf.extend_from_slice(&(r.topic.len() as u64).to_le_bytes());
-        buf.extend_from_slice(r.topic.as_bytes());
-        buf.extend_from_slice(&r.sent_unix_ms.to_le_bytes());
-        buf.extend_from_slice(&(r.body.len() as u64).to_le_bytes());
-        buf.extend_from_slice(r.body.as_bytes());
+pub fn item_content_hashes(view: &AnnouncementsView) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(view.posts.len() + 1);
+    // An empty MOTD is ABSENT, not an item. `render_motd` yields `""` when the payload
+    // fails to decode or sanitizes away entirely, and `verify_served_motd` checks only
+    // the signature — so `Some("")` is reachable, and `apply_announcements` hides the
+    // MOTD area for it. Hashing it would raise the dot for content the pane does not
+    // display.
+    if let Some(motd) = view.motd.as_deref().filter(|m| !m.is_empty()) {
+        out.push(item_hash(ITEM_KIND_MOTD, &[motd.as_bytes()], &[]));
     }
+    for p in &view.posts {
+        out.push(item_hash(
+            ITEM_KIND_POST,
+            &[p.topic.as_bytes(), p.body.as_bytes()],
+            &[p.sent_unix_ms],
+        ));
+    }
+    out.sort();
+    out.dedup();
+    out
+}
 
-    // `content_address` = SHA-384(buf); its `Display` is lowercase hex. The only
-    // error path is SHA-384's power-up self-test not having passed yet (the first
-    // crypto call in a fresh process) — unreachable once the client has initialized
-    // oxicrypt at startup. The empty fallback only appears pre-init and never
-    // collides with a real digest in practice.
+/// One item's hash: domain ‖ kind ‖ each length-prefixed field ‖ each numeric field.
+///
+/// The empty-string fallback is the same one `content_address` has always carried —
+/// its only error path is SHA-384's power-up self-test not having passed yet (the
+/// first crypto call in a fresh process), unreachable once the client has initialized
+/// oxicrypt at startup, and it never collides with a real digest in practice.
+fn item_hash(kind: u8, fields: &[&[u8]], nums: &[i64]) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(ANNOUNCE_ITEM_DOMAIN);
+    buf.push(kind);
+    for f in fields {
+        buf.extend_from_slice(&(f.len() as u64).to_le_bytes());
+        buf.extend_from_slice(f);
+    }
+    for n in nums {
+        buf.extend_from_slice(&n.to_le_bytes());
+    }
     daemonseed_core::public_space::content_address(&buf)
         .map(|a| a.to_string())
         .unwrap_or_default()
 }
 
-/// #142: whether the Announcements tab should show an unread dot — the verified content
-/// is non-empty AND `current_hash` (the caller's `combined_content_hash(view)`) differs
-/// from what was last seen (or was never seen). The caller passes the current hash in so
-/// it is computed once per snapshot (it also needs it for the seen-hash persist). The
-/// empty-view guard means an unconverged / genuinely-empty view never trips a spurious
-/// dot. Replaces the #93 connect-time auto-landing: the client NEVER force-opens the
-/// pane (a rude yank for rare operator content, and it could land on a not-yet-converged
-/// blank view); the dot is a non-intrusive indicator that behaves identically on connect
-/// and mid-session, mirroring the room unread dot (#64).
+/// Encode a seen-item set for persistence, joined by [`SEEN_SEPARATOR`].
+pub fn encode_seen<S: AsRef<str>>(items: &[S]) -> String {
+    items
+        .iter()
+        .map(AsRef::as_ref)
+        .collect::<Vec<_>>()
+        .join(&SEEN_SEPARATOR.to_string())
+}
+
+/// The marker to persist when the user reads the pane, or `None` when nothing should
+/// be written.
+///
+/// **Union, never replace.** Operator content folds in one item at a time, so the
+/// pane is routinely read while the view is still partially converged. Persisting
+/// just the items on display would then DROP items read earlier — the marker narrows,
+/// and when the missing item folds back in the dot fires on content the user has
+/// already read. That is the very bug this whole change exists to fix, and writing
+/// the displayed set straight out reintroduced it on the write side.
+///
+/// **Never write an empty marker.** `refresh_public_space` emits a snapshot of
+/// whatever `OperatorSpace` holds the moment the tab is opened, which during warmup is
+/// nothing at all; and a pre-init crypto failure degenerates every item hash to `""`.
+/// Either would otherwise persist an empty marker over a good one, wiping the
+/// read-state. An empty view is not evidence that the user read nothing; it is
+/// evidence of nothing.
+///
+/// **No ceiling.** An earlier cut capped the marker and evicted the overflow, on the
+/// argument that a dropped hash must belong to content no longer served. That argument
+/// is false precisely because of the partial convergence above: an item that IS served
+/// but has not folded in yet is absent from `current_items` and was therefore eligible
+/// for eviction, so a read during warmup could drop an already-read item and re-flag it
+/// when it arrived — the bug this function exists to prevent. The cap also truncated
+/// `current_items` itself once the view exceeded it, wedging the dot on permanently
+/// with no error anywhere. Both failures were silent, and both were worse than the
+/// growth they guarded against: the marker is bounded in practice by the number of
+/// distinct operator items ever published, at 97 bytes each, and only the operator can
+/// publish. If that ever becomes a real bound, the fix is to prune against a converged
+/// view — never against a partial one.
+pub fn merge_seen(current_items: &[String], stored: Option<&str>) -> Option<String> {
+    // Drop any item whose hash could not be computed (the `item_hash` pre-init
+    // fallback). An item we failed to hash is not evidence that anything was read, and
+    // a marker of nothing must never overwrite a good one.
+    let current_items: Vec<&str> = current_items
+        .iter()
+        .map(String::as_str)
+        .filter(|h| !h.is_empty())
+        .collect();
+    if current_items.is_empty() {
+        return None; // nothing verified on display — never overwrite a good marker
+    }
+    let carried: BTreeSet<&str> = stored.map(decode_seen).unwrap_or_default();
+
+    // `current_items` is already sorted+deduped by `item_content_hashes`, but this is
+    // `pub` and the sort below makes the result independent of that holding.
+    let mut merged: Vec<&str> = current_items.clone();
+    merged.extend(carried.into_iter().filter(|h| !current_items.contains(h)));
+    merged.sort_unstable();
+    merged.dedup();
+
+    Some(encode_seen(&merged))
+}
+
+/// Decode a persisted seen-item marker into the set of item hashes it covers.
+fn decode_seen(stored: &str) -> BTreeSet<&str> {
+    stored
+        .split(SEEN_SEPARATOR)
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// #142/#217: whether the Announcements tab should show an unread dot — the verified
+/// content is non-empty AND at least one item on display has not been seen. The caller
+/// passes `current_items` (its own [`item_content_hashes`] of the view) in, so they are
+/// computed once per snapshot — it also needs them for the seen-marker persist.
+///
+/// The empty-view guard means an unconverged / genuinely-empty view never trips a
+/// spurious dot. Replaces the #93 connect-time auto-landing: the client NEVER
+/// force-opens the pane (a rude yank for rare operator content, and it could land on a
+/// not-yet-converged blank view); the dot is a non-intrusive indicator that behaves
+/// identically on connect and mid-session, mirroring the room unread dot (#64).
 pub fn announcements_unread(
     view: &AnnouncementsView,
-    current_hash: &str,
-    stored_hash: Option<&str>,
+    current_items: &[String],
+    stored: Option<&str>,
 ) -> bool {
-    if view.motd.is_none() && view.posts.is_empty() {
-        return false; // empty-view guard — nothing to be unread about
+    // Empty-view guard — nothing to be unread about. An empty-string MOTD counts as
+    // absent here for the same reason `item_content_hashes` skips it: the pane does not
+    // display it.
+    if view.motd.as_deref().unwrap_or("").is_empty() && view.posts.is_empty() {
+        return false;
     }
-    match stored_hash {
-        Some(h) => h != current_hash,
-        None => true, // never seen → unread
-    }
+    let Some(stored) = stored else {
+        return true; // never seen → unread
+    };
+    let seen = decode_seen(stored);
+    current_items.iter().any(|h| !seen.contains(h.as_str()))
 }
 
 /// One chat message in a circle's stub transcript.
@@ -342,6 +443,14 @@ pub struct GuiState {
     /// `PublishStopped`. Drives the Publish overlay's "Your live shares" list and the
     /// Unpublish affordance. RAM-only; cleared on relaunch.
     my_shares: Vec<MyShare>,
+    /// The announcements/MOTD view currently ON SCREEN — the last one applied to the
+    /// pane (#229). Read-state has to follow what the user actually saw, not what the
+    /// network last delivered: opening the tab fires a refresh that answers with an
+    /// error rather than a snapshot whenever the operator record is unsubscribed, and
+    /// nothing clears the pane on disconnect, so the user reads content that no
+    /// subsequent event covers. Retaining it lets the tab-open handler mark exactly
+    /// what is displayed as seen, independent of whether any event arrives.
+    announcements_on_screen: AnnouncementsView,
 }
 
 impl GuiState {
@@ -372,6 +481,7 @@ impl GuiState {
             next_circle_id: FIRST_CIRCLE_ID,
             profile: None,
             my_shares: Vec::new(),
+            announcements_on_screen: AnnouncementsView::default(),
         }
     }
 
@@ -458,26 +568,57 @@ impl GuiState {
             .and_then(|p| p.stable_share_root_ikm().ok())
     }
 
-    /// (#93) The per-relay last-seen announcements/MOTD content hash for
-    /// `server_id`, read from the unlocked profile's blob. `None` on the ephemeral
-    /// (no-profile) path or when this relay has never been marked seen. Returns an
-    /// owned `String` so the caller does not hold a borrow across the subsequent
-    /// `persist_announce_seen` write-through.
+    /// (#229) Record the announcements/MOTD view now rendered in the pane.
+    pub fn set_announcements_on_screen(&mut self, view: AnnouncementsView) {
+        self.announcements_on_screen = view;
+    }
+
+    /// (#229) Mark everything currently ON SCREEN in the announcements pane as seen,
+    /// persisting the merged marker for `server_id`.
+    ///
+    /// This is the single place read-state is recorded, and it is driven by what is
+    /// displayed rather than by an inbound event. Binding it to the event instead meant
+    /// that opening the tab while the operator record was unsubscribed — a refresh that
+    /// answers `PublicSpaceError`, with the pane still showing the last content it
+    /// received — recorded nothing at all, and the dot re-fired later on content the
+    /// user had plainly read (#229).
+    ///
+    /// `Ok(false)` means there was nothing to record: an empty pane, or a marker that
+    /// already covers it. A persist failure is surfaced as `Err(reason)`.
+    pub fn mark_announcements_seen(&mut self, server_id: &str) -> Result<bool, String> {
+        let items = item_content_hashes(&self.announcements_on_screen);
+        let stored = self.announce_seen_hash(server_id);
+        match merge_seen(&items, stored.as_deref()) {
+            // `persist_announce_seen` reports whether the stored value actually moved,
+            // so an unchanged marker reports `false` and skips the re-seal — which is
+            // what keeps the ~30 s poll from re-sealing the blob on every tick.
+            Some(marker) => self.persist_announce_seen(server_id, &marker),
+            None => Ok(false),
+        }
+    }
+
+    /// (#93/#217) The per-relay seen-item marker for `server_id`, read from the
+    /// unlocked profile's blob — the [`encode_seen`] set of announcements/MOTD items
+    /// the user has read. `None` on the ephemeral (no-profile) path or when this relay
+    /// has never been marked seen. Returns an owned `String` so the caller does not
+    /// hold a borrow across the subsequent `persist_announce_seen` write-through.
     pub fn announce_seen_hash(&self, server_id: &str) -> Option<String> {
         self.profile
             .as_ref()
             .and_then(|p| p.announce_seen(server_id).map(str::to_owned))
     }
 
-    /// (#93) Write-through: record `hash` as the last-seen announcements/MOTD
-    /// content hash for `server_id` and re-seal the blob, so the unread gate
-    /// bypasses this exact content next connect. A no-op (`Ok`) on the ephemeral
-    /// (no-profile) path or when the value is unchanged; a disk / seal failure is
-    /// surfaced as `Err(reason)`.
-    pub fn persist_announce_seen(&mut self, server_id: &str, hash: &str) -> Result<(), String> {
+    /// (#93/#217) Write-through: record `marker` as the seen-item set for `server_id`
+    /// (an [`encode_seen`] value) and re-seal the blob, so the unread gate bypasses
+    /// those items next connect. `Ok(true)` when the stored value moved, `Ok(false)`
+    /// when it was unchanged or there is no profile (the ephemeral path); a disk / seal
+    /// failure is surfaced as `Err(reason)`. Callers want
+    /// [`Self::mark_announcements_seen`], which derives the marker from what is on
+    /// screen; this is the raw write-through beneath it.
+    fn persist_announce_seen(&mut self, server_id: &str, marker: &str) -> Result<bool, String> {
         match self.profile.as_mut() {
-            Some(p) => p.persist_announce_seen(server_id, hash).map(|_| ()),
-            None => Ok(()),
+            Some(p) => p.persist_announce_seen(server_id, marker),
+            None => Ok(false),
         }
     }
 
@@ -1078,6 +1219,7 @@ impl GuiState {
             next_circle_id: FIRST_CIRCLE_ID,
             profile: None,
             my_shares: Vec::new(),
+            announcements_on_screen: AnnouncementsView::default(),
         }
     }
 }
@@ -1107,32 +1249,39 @@ mod tests {
     fn announcements_unread_covers_all_cases() {
         let _ = oxicrypt_module::initialize();
         let empty = ann_view(None, &[]);
-        let empty_hash = combined_content_hash(&empty);
+        let empty_items = item_content_hashes(&empty);
         let content = ann_view(Some("relay is up"), &[("a", "x", 1)]);
-        let content_hash = combined_content_hash(&content);
-        // Empty view → never unread (empty-view guard), even with no stored hash — an
+        let content_items = item_content_hashes(&content);
+        let content_seen = encode_seen(&content_items);
+        // Empty view → never unread (empty-view guard), even with nothing stored — an
         // unconverged/blank view must not trip a spurious dot.
-        assert!(!announcements_unread(&empty, &empty_hash, None));
+        assert!(!announcements_unread(&empty, &empty_items, None));
         // Non-empty, never seen → unread.
-        assert!(announcements_unread(&content, &content_hash, None));
-        // Non-empty, stored != current → unread.
-        assert!(announcements_unread(&content, &content_hash, Some("stale")));
-        // Non-empty, stored == current (already seen) → not unread.
+        assert!(announcements_unread(&content, &content_items, None));
+        // Non-empty, stored marker covers none of the items → unread.
+        assert!(announcements_unread(
+            &content,
+            &content_items,
+            Some("stale")
+        ));
+        // An empty stored marker covers nothing.
+        assert!(announcements_unread(&content, &content_items, Some("")));
+        // Non-empty, every item seen → not unread.
         assert!(!announcements_unread(
             &content,
-            &content_hash,
-            Some(&content_hash)
+            &content_items,
+            Some(&content_seen)
         ));
     }
 
     #[test]
-    fn viewing_updates_stored_hash_then_clears_unread() {
-        // Mirrors the GUI write-through: a first arrival is unread; once the current
-        // hash is stored (the "viewing updates the stored hash" step), the SAME content
-        // is no longer unread (the dot clears).
+    fn viewing_updates_the_seen_marker_then_clears_unread() {
+        // Mirrors the GUI write-through: a first arrival is unread; once the displayed
+        // items are stored (the "viewing marks it seen" step), the SAME content is no
+        // longer unread (the dot clears).
         let _ = oxicrypt_module::initialize();
         let view = ann_view(Some("relay is up"), &[("announcements", "v2", 5)]);
-        let current = combined_content_hash(&view);
+        let current = item_content_hashes(&view);
 
         let mut seeds = daemonseed_core::storage::seeds::Seeds::new(
             daemonseed_core::identity::mnemonic::Mnemonic::generate().unwrap(),
@@ -1141,45 +1290,371 @@ mod tests {
             announcements_unread(&view, &current, seeds.announce_seen("fra1#abc")),
             "first arrival is unread"
         );
-        assert!(seeds.set_announce_seen("fra1#abc", current.clone()));
+        assert!(seeds.set_announce_seen("fra1#abc", encode_seen(&current)));
         assert!(
             !announcements_unread(&view, &current, seeds.announce_seen("fra1#abc")),
             "after viewing, the same content is no longer unread"
         );
     }
 
+    /// #217: the reported startup sequence. Operator content folds in one item at a
+    /// time, so the pane is observed partially converged; reading it there must not
+    /// arm a second dot when the remaining item lands. A marker hashing the whole view
+    /// cannot express this — the posts-only and posts-plus-MOTD views hash differently
+    /// by construction, so the MOTD's arrival always invalidated a marker persisted one
+    /// snapshot earlier, no matter that the post itself had been read.
     #[test]
-    fn combined_content_hash_is_stable_order_independent_and_change_sensitive() {
+    fn reading_a_partially_converged_view_is_not_re_flagged_by_the_rest_of_the_burst() {
+        let _ = oxicrypt_module::initialize();
+        let mut seeds = daemonseed_core::storage::seeds::Seeds::new(
+            daemonseed_core::identity::mnemonic::Mnemonic::generate().unwrap(),
+        );
+
+        // Snapshot 1 — the announcement folds in; the MOTD has not arrived yet.
+        let announcements_only = ann_view(None, &[("release", "v0.36.1 is out", 5)]);
+        let items_1 = item_content_hashes(&announcements_only);
+        assert!(
+            announcements_unread(
+                &announcements_only,
+                &items_1,
+                seeds.announce_seen("fra1#abc")
+            ),
+            "the first genuinely-new content raises the dot"
+        );
+        // The user opens the pane here — mid-convergence — so this partial view is seen.
+        seeds.set_announce_seen("fra1#abc", encode_seen(&items_1));
+
+        // Snapshot 2 — the MOTD arrives, carrying the same announcement alongside it.
+        let with_motd = ann_view(
+            Some("network is warming up"),
+            &[("release", "v0.36.1 is out", 5)],
+        );
+        let items_2 = item_content_hashes(&with_motd);
+        assert!(
+            announcements_unread(&with_motd, &items_2, seeds.announce_seen("fra1#abc")),
+            "the MOTD is genuinely unseen content, so it does raise the dot"
+        );
+        // ...and reading once more settles it. The already-seen announcement is NOT
+        // re-flagged by the MOTD's arrival — that re-flagging is #217.
+        seeds.set_announce_seen("fra1#abc", encode_seen(&items_2));
+        assert!(
+            !announcements_unread(&with_motd, &items_2, seeds.announce_seen("fra1#abc")),
+            "the converged view settles clear"
+        );
+
+        // The whole burst arriving with the pane NEVER opened raises the dot once and
+        // leaves it raised — no clear-then-re-raise flicker across the convergence.
+        let mut fresh = daemonseed_core::storage::seeds::Seeds::new(
+            daemonseed_core::identity::mnemonic::Mnemonic::generate().unwrap(),
+        );
+        for view in [&announcements_only, &with_motd] {
+            let items = item_content_hashes(view);
+            assert!(
+                announcements_unread(view, &items, fresh.announce_seen("fra1#abc")),
+                "every step of the burst reads unread — the dot never drops mid-convergence"
+            );
+        }
+        let _ = &mut fresh;
+    }
+
+    /// The persist path must never narrow the marker. Opening the pane fires a refresh
+    /// that snapshots whatever has converged so far, so a read routinely lands on a
+    /// partial view; writing just those items would drop already-read ones and re-flag
+    /// them when they fold back in.
+    #[test]
+    fn persisting_a_partial_view_keeps_items_read_earlier() {
+        let _ = oxicrypt_module::initialize();
+        let full = ann_view(Some("motd"), &[("a", "x", 1)]);
+        let stored = merge_seen(&item_content_hashes(&full), None).unwrap();
+
+        // A new process: the MOTD has folded in, the post has not.
+        let partial = ann_view(Some("motd"), &[]);
+        let narrowed = merge_seen(&item_content_hashes(&partial), Some(&stored)).unwrap();
+
+        // The post read last session survives, so its later arrival raises nothing.
+        assert!(!announcements_unread(
+            &full,
+            &item_content_hashes(&full),
+            Some(&narrowed)
+        ));
+    }
+
+    /// An empty or degenerate view must never overwrite a good marker. Two ways in: the
+    /// tab-open refresh snapshots an unconverged (empty) `OperatorSpace`, and a pre-init
+    /// crypto failure degenerates every item hash to `""`.
+    #[test]
+    fn an_empty_view_never_overwrites_the_stored_marker() {
+        let _ = oxicrypt_module::initialize();
+        let view = ann_view(Some("motd"), &[("a", "x", 1)]);
+        let stored = merge_seen(&item_content_hashes(&view), None).unwrap();
+
+        let empty = ann_view(None, &[]);
+        assert_eq!(
+            merge_seen(&item_content_hashes(&empty), Some(&stored)),
+            None,
+            "an unconverged view must decline to write"
+        );
+        // The degenerate all-empty-hash case reduces to the same nothing.
+        assert_eq!(merge_seen(&[String::new()], Some(&stored)), None);
+    }
+
+    /// A read never narrows the marker, whatever the sizes involved. An earlier cut
+    /// capped it and evicted the overflow, which silently produced two failures: a view
+    /// larger than the cap had its own displayed items truncated away, wedging the dot
+    /// on forever; and at the cap a partially-converged read evicted already-read items
+    /// that simply had not folded in yet, re-flagging them when they arrived.
+    #[test]
+    fn a_read_never_drops_an_already_seen_item() {
+        let _ = oxicrypt_module::initialize();
+
+        // A large stored set plus a small converged view: everything survives.
+        let carried: Vec<String> = (0..600).map(|i| format!("{i:096x}")).collect();
+        let stored = encode_seen(&carried);
+        let view = ann_view(Some("motd"), &[("a", "x", 1)]);
+        let current = item_content_hashes(&view);
+        let merged = merge_seen(&current, Some(&stored)).unwrap();
+        let set = decode_seen(&merged);
+        for h in carried
+            .iter()
+            .map(String::as_str)
+            .chain(current.iter().map(String::as_str))
+        {
+            assert!(set.contains(h), "nothing already seen may be dropped");
+        }
+        assert!(!announcements_unread(&view, &current, Some(&merged)));
+
+        // The partial-convergence case: read while only one of many items has folded in,
+        // then let the rest arrive. None of them may re-flag.
+        let full = ann_view(Some("motd"), &[("a", "x", 1), ("b", "y", 2), ("c", "z", 3)]);
+        let full_items = item_content_hashes(&full);
+        let settled = merge_seen(&full_items, Some(&stored)).unwrap();
+        let partial = ann_view(None, &[("b", "y", 2)]);
+        let after_partial_read =
+            merge_seen(&item_content_hashes(&partial), Some(&settled)).unwrap();
+        assert!(
+            !announcements_unread(&full, &full_items, Some(&after_partial_read)),
+            "a partial read must not evict the items still converging"
+        );
+
+        // A view larger than any previous cap keeps every one of its own items.
+        let big: Vec<(String, String, i64)> = (0..600)
+            .map(|i| (format!("t{i}"), format!("b{i}"), i as i64))
+            .collect();
+        let big_view = AnnouncementsView {
+            motd: None,
+            posts: big
+                .iter()
+                .map(|(t, b, ms)| AnnouncementRow {
+                    topic: t.clone(),
+                    body: b.clone(),
+                    sent_unix_ms: *ms,
+                })
+                .collect(),
+        };
+        let big_items = item_content_hashes(&big_view);
+        let big_marker = merge_seen(&big_items, None).unwrap();
+        assert!(
+            !announcements_unread(&big_view, &big_items, Some(&big_marker)),
+            "reading a large view must actually mark it read"
+        );
+    }
+
+    /// Re-reading unchanged content must produce a byte-identical marker, so
+    /// `set_announce_seen` reports "unchanged" and the ~30 s poll does not re-seal the
+    /// blob on every tick.
+    #[test]
+    fn merging_the_same_view_twice_is_idempotent() {
+        let _ = oxicrypt_module::initialize();
+        let view = ann_view(Some("motd"), &[("a", "x", 1), ("b", "y", 2)]);
+        let items = item_content_hashes(&view);
+        let first = merge_seen(&items, None).unwrap();
+        let second = merge_seen(&items, Some(&first)).unwrap();
+        assert_eq!(first, second);
+
+        // Unsorted / duplicated input must not change the result either — `merge_seen`
+        // is `pub` and documents the invariant rather than enforcing it.
+        let mut scrambled = items.clone();
+        scrambled.reverse();
+        scrambled.push(items[0].clone());
+        assert_eq!(merge_seen(&scrambled, Some(&first)).unwrap(), first);
+    }
+
+    /// A marker written by a pre-#217 client is a single whole-view hash. It matches no
+    /// item, so the pane reads unread once after upgrading; the read then carries the
+    /// stale hash forward as one inert entry rather than losing the new marker.
+    #[test]
+    fn a_pre_217_marker_reads_unread_once_then_migrates_itself() {
+        let _ = oxicrypt_module::initialize();
+        let view = ann_view(Some("motd"), &[("a", "x", 1)]);
+        let items = item_content_hashes(&view);
+        let stale = "0".repeat(96);
+
+        assert!(announcements_unread(&view, &items, Some(&stale)));
+        let migrated = merge_seen(&items, Some(&stale)).unwrap();
+        assert!(!announcements_unread(&view, &items, Some(&migrated)));
+        // Carried forward, not dropped: `merge_seen` unions, and cannot tell a stale
+        // whole-view hash from an item hash it simply has not seen yet.
+        let set = decode_seen(&migrated);
+        assert!(set.contains(stale.as_str()));
+        assert_eq!(set.len(), items.len() + 1);
+    }
+
+    /// An empty MOTD is absent, not an item: `render_motd` yields `""` on a payload that
+    /// fails to decode, and the pane hides the MOTD area for it, so hashing it would
+    /// raise the dot for content nothing displays.
+    #[test]
+    fn an_empty_motd_is_not_an_unread_item() {
+        let _ = oxicrypt_module::initialize();
+        let blank = ann_view(Some(""), &[]);
+        assert!(item_content_hashes(&blank).is_empty());
+        assert!(!announcements_unread(&blank, &[], None));
+        // And it hashes identically to an absent MOTD, so the two encodings agree.
+        let with = ann_view(Some(""), &[("a", "x", 1)]);
+        let without = ann_view(None, &[("a", "x", 1)]);
+        assert_eq!(item_content_hashes(&with), item_content_hashes(&without));
+    }
+
+    /// Markers are per relay and must not bleed across `server_id`s.
+    #[test]
+    fn seen_markers_are_independent_per_server_id() {
+        let _ = oxicrypt_module::initialize();
+        let view = ann_view(Some("motd"), &[("a", "x", 1)]);
+        let items = item_content_hashes(&view);
+        let mut seeds = daemonseed_core::storage::seeds::Seeds::new(
+            daemonseed_core::identity::mnemonic::Mnemonic::generate().unwrap(),
+        );
+        seeds.set_announce_seen("fra1#abc", encode_seen(&items));
+        assert!(!announcements_unread(
+            &view,
+            &items,
+            seeds.announce_seen("fra1#abc")
+        ));
+        assert!(announcements_unread(
+            &view,
+            &items,
+            seeds.announce_seen("nyc1#def")
+        ));
+    }
+
+    /// A malformed marker must degrade to "unread", never to "read".
+    #[test]
+    fn a_malformed_marker_reads_as_unread() {
+        let _ = oxicrypt_module::initialize();
+        let view = ann_view(Some("motd"), &[("a", "x", 1)]);
+        let items = item_content_hashes(&view);
+        for junk in [",", ",,", "not-hex", &format!(",{},", items[0])] {
+            let unread = announcements_unread(&view, &items, Some(junk));
+            // The last case legitimately covers one of the two items, so it stays unread
+            // via the other; every other case covers nothing at all.
+            assert!(unread, "marker {junk:?} must not mark the view read");
+        }
+    }
+
+    /// #158: already-read content re-delivered by a DHT re-sweep must not re-fire the
+    /// dot. Re-delivery reproduces identical items, so every one is already in the seen
+    /// set.
+    #[test]
+    fn re_delivered_already_read_content_does_not_re_fire_unread() {
+        let _ = oxicrypt_module::initialize();
+        let view = ann_view(Some("relay is up"), &[("a", "x", 1), ("b", "y", 2)]);
+        let seen = encode_seen(&item_content_hashes(&view));
+        // The re-sweep rebuilds the view from scratch, and in the relay's own order.
+        let redelivered = ann_view(Some("relay is up"), &[("b", "y", 2), ("a", "x", 1)]);
+        assert!(!announcements_unread(
+            &redelivered,
+            &item_content_hashes(&redelivered),
+            Some(&seen)
+        ));
+    }
+
+    #[test]
+    fn item_hashes_are_stable_order_independent_and_change_sensitive() {
         let _ = oxicrypt_module::initialize();
         let base = ann_view(Some("relay is up"), &[("a", "x", 1)]);
-        let h0 = combined_content_hash(&base);
-        // Same content (rebuilt) → identical hash.
-        assert_eq!(h0, combined_content_hash(&base.clone()));
+        let h0 = item_content_hashes(&base);
+        // Same content (rebuilt) → identical items.
+        assert_eq!(h0, item_content_hashes(&base.clone()));
+        assert_eq!(h0.len(), 2, "one MOTD item + one post item");
 
-        // MOTD edit → different hash.
-        let motd_edit = ann_view(Some("maintenance soon"), &[("a", "x", 1)]);
-        assert_ne!(h0, combined_content_hash(&motd_edit));
-        // MOTD removed → different hash.
-        let motd_gone = ann_view(None, &[("a", "x", 1)]);
-        assert_ne!(h0, combined_content_hash(&motd_gone));
+        // A MOTD edit changes the MOTD item, an added post adds an item, and an edited
+        // post replaces its own — in every case the seen set no longer covers the view.
+        for changed in [
+            ann_view(Some("maintenance soon"), &[("a", "x", 1)]), // MOTD edited
+            ann_view(Some("relay is up"), &[("a", "x", 1), ("b", "y", 2)]), // post added
+            ann_view(Some("relay is up"), &[("a", "x!", 1)]),     // post edited
+        ] {
+            let items = item_content_hashes(&changed);
+            assert!(
+                announcements_unread(&changed, &items, Some(&encode_seen(&h0))),
+                "a change the user has not seen must read unread"
+            );
+        }
 
-        // A post added → different hash.
-        let added = ann_view(Some("relay is up"), &[("a", "x", 1), ("b", "y", 2)]);
-        assert_ne!(h0, combined_content_hash(&added));
-        // A post removed → different hash.
-        let removed = ann_view(Some("relay is up"), &[]);
-        assert_ne!(h0, combined_content_hash(&removed));
-        // A post edited → different hash.
-        let edited = ann_view(Some("relay is up"), &[("a", "x!", 1)]);
-        assert_ne!(h0, combined_content_hash(&edited));
+        // REMOVAL is not new content. A view that lost its MOTD, or lost a post, holds
+        // only items the user already read, so it reads as read. This is the deliberate
+        // difference from the whole-view marker, which treated any delta — including a
+        // deletion — as something to re-flag.
+        for shrunk in [
+            ann_view(None, &[("a", "x", 1)]),   // MOTD removed
+            ann_view(Some("relay is up"), &[]), // post removed
+            ann_view(None, &[]),                // everything gone (empty-view guard)
+        ] {
+            let items = item_content_hashes(&shrunk);
+            assert!(
+                !announcements_unread(&shrunk, &items, Some(&encode_seen(&h0))),
+                "losing already-read content must not raise the dot"
+            );
+        }
 
-        // Reordered served posts (same set) → SAME hash (canonical sort).
+        // Reordered served posts (same set) → SAME items (sorted set).
         let ordered = ann_view(Some("relay is up"), &[("a", "x", 1), ("b", "y", 2)]);
         let reversed = ann_view(Some("relay is up"), &[("b", "y", 2), ("a", "x", 1)]);
         assert_eq!(
-            combined_content_hash(&ordered),
-            combined_content_hash(&reversed),
+            item_content_hashes(&ordered),
+            item_content_hashes(&reversed),
             "server post order must not change the unread marker"
+        );
+    }
+
+    /// The persisted marker must survive `Seeds`' single-line `announce-seen` directive:
+    /// the separator is not whitespace, so a multi-item marker is accepted, not rejected.
+    #[test]
+    fn a_multi_item_seen_marker_round_trips_through_seeds() {
+        let _ = oxicrypt_module::initialize();
+        let view = ann_view(Some("relay is up"), &[("a", "x", 1), ("b", "y", 2)]);
+        let items = item_content_hashes(&view);
+        let marker = encode_seen(&items);
+        assert_eq!(
+            marker.matches(SEEN_SEPARATOR).count(),
+            2,
+            "3 items, 2 separators"
+        );
+
+        let mut seeds = daemonseed_core::storage::seeds::Seeds::new(
+            daemonseed_core::identity::mnemonic::Mnemonic::generate().unwrap(),
+        );
+        assert!(
+            seeds.set_announce_seen("fra1#abc", marker.clone()),
+            "the marker must not be rejected as malformed"
+        );
+        assert_eq!(seeds.announce_seen("fra1#abc"), Some(marker.as_str()));
+        assert!(!announcements_unread(
+            &view,
+            &items,
+            seeds.announce_seen("fra1#abc")
+        ));
+    }
+
+    /// A MOTD and a post whose text coincides must not alias — the kind tag separates
+    /// them, so reading one does not silently mark the other seen.
+    #[test]
+    fn a_motd_and_a_post_with_the_same_text_do_not_alias() {
+        let _ = oxicrypt_module::initialize();
+        let motd_only = ann_view(Some("same words"), &[]);
+        let post_only = ann_view(None, &[("same words", "", 0)]);
+        assert_ne!(
+            item_content_hashes(&motd_only),
+            item_content_hashes(&post_only)
         );
     }
 
@@ -2413,6 +2888,93 @@ mod tests {
             ],
             "kept roots auto-republish with their persisted custom-name / basename-default forms"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #229: read-state follows what was DISPLAYED rather than what the network last
+    /// delivered, so a read is recorded whether or not any further event arrives.
+    ///
+    /// This is hardening, not a live fix. The state it guards — a populated pane whose
+    /// refresh answers with an error — is currently unreachable: the operator record is
+    /// subscribed once and never unsubscribed (`subscribe_operator_space` early-returns
+    /// when set, and nothing clears it), and the pane is only ever populated by a
+    /// snapshot, which requires that subscription. It becomes reachable the moment
+    /// anything resets the record on disconnect, and the coupling it removes — read
+    /// state depending on an inbound event — is worth not having regardless.
+    #[test]
+    fn reading_the_pane_records_what_is_on_screen_without_a_snapshot() {
+        use daemonseed_core::bootstrap::BootstrapAnchor;
+        use daemonseed_core::first_start::FirstStart;
+        use daemonseed_core::profile::config::ArgonParams;
+        use daemonseed_core::profile::persist::write_first_start;
+
+        let _ = oxicrypt_module::initialize();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "ds-gui-announce-229-{}-{nonce}",
+            std::process::id()
+        ));
+        let fast = ArgonParams {
+            memory_kib: 8,
+            iterations: 1,
+            parallelism: 1,
+        };
+        let pass = "correct horse battery staple table mountain";
+        let sealed = FirstStart::new().initialize(pass, fast).unwrap();
+        let phrase = sealed.display_phrase();
+        let materials = sealed
+            .verify_round_trip(&phrase)
+            .unwrap()
+            .finalize(
+                Some("alice".to_string()),
+                BootstrapAnchor {
+                    server_id: "relay#aabbccddeeff".to_string(),
+                    address: "127.0.0.1:443".to_string(),
+                },
+            )
+            .unwrap()
+            .into_session_materials();
+        write_first_start(&root, &materials, None, false).unwrap();
+
+        let mut st = GuiState::lobby_only();
+        st.set_profile(Profile::from_materials(materials, root.clone()));
+        let server_id = "relay#aabbccddeeff";
+
+        // A snapshot arrives and is rendered while the user is elsewhere.
+        let view = ann_view(Some("motd"), &[("release", "v0.36.2", 7)]);
+        let items = item_content_hashes(&view);
+        st.set_announcements_on_screen(view.clone());
+        assert!(
+            announcements_unread(&view, &items, st.announce_seen_hash(server_id).as_deref()),
+            "unseen content raises the dot"
+        );
+
+        // The connection drops. The user opens the tab and reads what is still shown;
+        // no further snapshot ever arrives.
+        assert!(
+            st.mark_announcements_seen(server_id).unwrap(),
+            "reading the displayed pane records it"
+        );
+        assert!(
+            !announcements_unread(&view, &items, st.announce_seen_hash(server_id).as_deref()),
+            "content the user read must not re-flag when the snapshot returns"
+        );
+
+        // Re-reading unchanged content records nothing further.
+        assert!(!st.mark_announcements_seen(server_id).unwrap());
+
+        // An empty pane records nothing at all, rather than erasing the marker.
+        st.set_announcements_on_screen(AnnouncementsView::default());
+        assert!(!st.mark_announcements_seen(server_id).unwrap());
+        assert!(!announcements_unread(
+            &view,
+            &items,
+            st.announce_seen_hash(server_id).as_deref()
+        ));
 
         let _ = std::fs::remove_dir_all(&root);
     }
