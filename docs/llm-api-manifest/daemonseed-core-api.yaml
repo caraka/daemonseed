@@ -92,7 +92,13 @@ modules:
       Derive ML-DSA-87 (signing) and ML-KEM-1024 (KEM) keypairs from
       a BIP-39 seed via HKDF-SHA-384 with domain-separated info strings.
       Distinguishes "primary" (cross-device root) from "per-device" (UUID-
-      keyed) identity branches per ISC-C1 / C13.
+      keyed) identity branches per ISC-C1 / C13. derive_identity_keys expands
+      the identity PRK six times under identity-scoped labels: sign, kem-d,
+      kem-z, veilid-node (VeilidNodeSeed), share-root-ikm (ShareRootIkm), and
+      dm-doorbell-slot (DmDoorbellSlotSecret, the input to
+      dm::doorbell::slot_for). The three non-keypair secrets share no key
+      material with the signing or KEM keys; each zeroizes on drop and redacts
+      its Debug.
     no_std: false
     depends_on:
       - daemonseed_core::identity::mnemonic
@@ -733,15 +739,27 @@ modules:
       epoch from the wall clock on both sides; it is published nowhere.
       DmKeyRecordError separates Signing (local, carries the cause) from
       Signature (verify-path, deliberately uniform — no oracle). Sub-module
-      dm::domain declares the daemonseed/dm/… label namespace, one distinct
-      prefix-free label per purpose.
+      dm::doorbell addresses the first-contact record: derive_owner_seed(
+      recipient_pubkey) is HKDF-SHA384(salt=daemonseed/dm/doorbell/salt/v1,
+      ikm=recipient ML-DSA-87 pubkey, info=daemonseed/dm/doorbell/addr/v4),
+      world-derivable and world-writable; slot_for(sender_secret,
+      recipient_pubkey) is HKDF-SHA384(salt=daemonseed/dm/doorbell/slot-salt/v1,
+      ikm=DmDoorbellSlotSecret, info=daemonseed/dm/doorbell/slot/v5||
+      lp(recipient_pubkey)) reduced mod DOORBELL_SLOTS (32, a power of two).
+      DmDoorbellSlotSecret is a mnemonic-derived, identity-scoped expansion of
+      the identity PRK; a writer builds its RecordShape from DOORBELL_SLOTS.
+      Sub-module dm::domain declares the
+      daemonseed/dm/… label namespace, one distinct prefix-free label per
+      purpose.
     no_std: false
     depends_on:
       - daemonseed_core::identity::keys
       - daemonseed_core::secret_seed
     iscs:
       - C40
+      - C41
       - A-C20
+      - A-C24
       - A-C22
       - A-C23
 

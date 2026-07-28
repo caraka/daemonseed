@@ -22,4 +22,5 @@
 //! slices do.
 
 pub mod domain;
+pub mod doorbell;
 pub mod keyrec;

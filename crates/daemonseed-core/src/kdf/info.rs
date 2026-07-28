@@ -55,6 +55,25 @@ pub const DOMAIN_VEILID_NODE: &str = "veilid-node";
 /// share-id commitment nonce.
 pub const DOMAIN_SHARE_ROOT_IKM: &str = "share-root-ikm/v2";
 
+/// Domain separator for the DM doorbell slot secret (#233). The FIFTH expansion
+/// of the identity PRK (sibling of `sign` / `kem-d` / `kem-z` / `veilid-node` /
+/// `share-root-ikm`), yielding the 32-byte secret that picks which of the
+/// recipient's 32 doorbell slots this sender knocks on
+/// (`dm::doorbell::slot_for`).
+///
+/// Being an expansion of the mnemonic PRK is the point: the slot survives a
+/// reinstall, so a retried first contact overwrites the sender's OWN previous
+/// entry instead of orphaning it in a second slot — the `#118` ephemeral-key
+/// ring bug class applied in reverse. And because it is a *secret*, a storage
+/// node co-hosting the doorbell cannot compute which slot a candidate pubkey
+/// maps to, so it cannot learn who is knocking.
+///
+/// Passed through [`primary`]/[`device`] like `share-root-ikm`, so the secret is
+/// identity-scoped. Two presentations of one mnemonic are two identities with
+/// different long-term keys, hence two distinct senders to a recipient; giving
+/// them one shared slot would make them clobber each other's knocks.
+pub const DOMAIN_DM_DOORBELL_SLOT: &str = "dm-doorbell-slot/v1";
+
 /// Build the full HKDF info string for the primary identity's given domain.
 /// `domain` is one of `DOMAIN_SIGN`, `DOMAIN_KEM_D`, `DOMAIN_KEM_Z`,
 /// `DOMAIN_VEILID_NODE`, `DOMAIN_SHARE_ROOT_IKM`.
@@ -296,6 +315,24 @@ mod tests {
         assert_eq!(
             primary(DOMAIN_SHARE_ROOT_IKM),
             "daemonseed/identity/primary/share-root-ikm/v2"
+        );
+        // #233: the DM doorbell slot label (frozen — a second implementation must
+        // reproduce it byte-for-byte or a reinstalled sender lands on a new slot
+        // and orphans its previous knock).
+        assert_eq!(
+            primary(DOMAIN_DM_DOORBELL_SLOT),
+            "daemonseed/identity/primary/dm-doorbell-slot/v1"
+        );
+        // The device form is asserted too: the slot secret being identity-SCOPED
+        // rather than mnemonic-global is a deliberate call (ISA Decisions,
+        // 2026-07-28), and this is the string that would silently stop diverging
+        // if the derivation were "simplified" back to a bare label.
+        assert_eq!(
+            device(
+                "123e4567-e89b-12d3-a456-426614174000",
+                DOMAIN_DM_DOORBELL_SLOT
+            ),
+            "daemonseed/identity/device-123e4567-e89b-12d3-a456-426614174000/dm-doorbell-slot/v1"
         );
         assert_eq!(
             device("123e4567-e89b-12d3-a456-426614174000", DOMAIN_SIGN),

@@ -30,8 +30,10 @@
 //! invariant — a cross-crate prefix-freeness test over every domain-label module
 //! is the durable fix and is follow-up work.
 
-/// HKDF-Extract salt for every DM derivation rooted in a published identity key.
-/// Non-empty and normative — no implicit zero-salt. FROZEN.
+/// HKDF-Extract salt for the KEY-RECORD derivation rooted in a published identity
+/// key. Non-empty and normative — no implicit zero-salt. The doorbell derives from
+/// the same kind of input under its own salt ([`DM_DOORBELL_SALT`]); the two must
+/// not share one. FROZEN.
 pub const DM_KEYREC_SALT: &[u8] = b"daemonseed/dm/keyrec/salt/v1";
 
 /// HKDF-Expand `info` for the key record's Veilid owner seed, derived from the
@@ -43,9 +45,36 @@ pub const DM_KEYREC_OWNER: &[u8] = b"daemonseed/dm/keyrec/owner/v1";
 /// signature. FROZEN.
 pub const DM_KEYREC_SIG: &[u8] = b"daemonseed/dm/keyrec/sig/v1";
 
+/// HKDF-Extract salt for the doorbell's owner-seed derivation, which is rooted in
+/// the RECIPIENT's published identity key. Distinct from [`DM_KEYREC_SALT`] so the
+/// two derivations over that same public input cannot collide. FROZEN.
+pub const DM_DOORBELL_SALT: &[u8] = b"daemonseed/dm/doorbell/salt/v1";
+
+/// HKDF-Expand `info` for the doorbell's Veilid owner seed, derived from the
+/// recipient's full ML-DSA-87 public key. World-derivable — and therefore
+/// world-WRITABLE — by design: a stranger holding no shared secret must be able
+/// to knock. That is what makes the doorbell the only unauthenticated write
+/// surface in DM, and why it carries a sealed entry rather than trust. FROZEN.
+pub const DM_DOORBELL_OWNER: &[u8] = b"daemonseed/dm/doorbell/addr/v4";
+
+/// HKDF-Extract salt for the sender's doorbell SLOT derivation. Rooted in the
+/// sender's secret slot IKM, not in any public key. FROZEN.
+pub const DM_DOORBELL_SLOT_SALT: &[u8] = b"daemonseed/dm/doorbell/slot-salt/v1";
+
+/// HKDF-Expand `info` for the sender's doorbell slot index. FROZEN.
+pub const DM_DOORBELL_SLOT: &[u8] = b"daemonseed/dm/doorbell/slot/v5";
+
 /// Every label in this namespace, for the prefix-freeness check.
 #[cfg(test)]
-const ALL: &[&[u8]] = &[DM_KEYREC_SALT, DM_KEYREC_OWNER, DM_KEYREC_SIG];
+const ALL: &[&[u8]] = &[
+    DM_KEYREC_SALT,
+    DM_KEYREC_OWNER,
+    DM_KEYREC_SIG,
+    DM_DOORBELL_SALT,
+    DM_DOORBELL_OWNER,
+    DM_DOORBELL_SLOT_SALT,
+    DM_DOORBELL_SLOT,
+];
 
 #[cfg(test)]
 mod tests {
@@ -58,6 +87,13 @@ mod tests {
         assert_eq!(DM_KEYREC_SALT, b"daemonseed/dm/keyrec/salt/v1");
         assert_eq!(DM_KEYREC_OWNER, b"daemonseed/dm/keyrec/owner/v1");
         assert_eq!(DM_KEYREC_SIG, b"daemonseed/dm/keyrec/sig/v1");
+        assert_eq!(DM_DOORBELL_SALT, b"daemonseed/dm/doorbell/salt/v1");
+        assert_eq!(DM_DOORBELL_OWNER, b"daemonseed/dm/doorbell/addr/v4");
+        assert_eq!(
+            DM_DOORBELL_SLOT_SALT,
+            b"daemonseed/dm/doorbell/slot-salt/v1"
+        );
+        assert_eq!(DM_DOORBELL_SLOT, b"daemonseed/dm/doorbell/slot/v5");
     }
 
     /// The frozen design's F11 requirement: no label may be a prefix of another.

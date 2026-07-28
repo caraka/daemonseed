@@ -87,12 +87,12 @@ pub struct SignKeypair {
 }
 
 impl SignKeypair {
-    /// 4896-byte ML-DSA-87 public key.
+    /// 2592-byte ML-DSA-87 public key.
     pub fn public_key(&self) -> &[u8; ml_dsa::PK_LEN] {
         &self.public_key
     }
 
-    /// 4032-byte ML-DSA-87 secret key. Caller must keep this in RAM only;
+    /// 4896-byte ML-DSA-87 secret key. Caller must keep this in RAM only;
     /// it zeroes when this struct drops.
     pub fn secret_key(&self) -> &[u8; ml_dsa::SK_LEN] {
         &self.secret_key
@@ -223,6 +223,9 @@ pub const SHARE_ROOT_IKM_LEN: usize = 32;
 /// verifying key (D3).
 pub const VEILID_NODE_SEED_LEN: usize = 32;
 
+/// Length of the DM doorbell slot secret (#233) — see [`DmDoorbellSlotSecret`].
+pub const DM_DOORBELL_SLOT_SECRET_LEN: usize = 32;
+
 redacted_secret_newtype! {
     /// The share-root identity IKM (#156). A dedicated secret derived from the same
     /// mnemonic as the ML-DSA/ML-KEM identity but under a domain-separated HKDF label
@@ -258,6 +261,28 @@ redacted_secret_newtype! {
     inline pub struct VeilidNodeSeed([u8; VEILID_NODE_SEED_LEN]);
 }
 
+redacted_secret_newtype! {
+    /// The DM doorbell slot secret (#233). Derived from the same mnemonic as the
+    /// ML-DSA/ML-KEM identity but under a domain-separated, identity-scoped label
+    /// (`info::DOMAIN_DM_DOORBELL_SLOT`), a sibling of [`VeilidNodeSeed`] and
+    /// [`ShareRootIkm`]. It is the sole input — with the recipient's public
+    /// identity key — to [`crate::dm::doorbell::slot_for`].
+    ///
+    /// Two properties make it load-bearing, and both come from what it is rather
+    /// than how it is used. Because it is **mnemonic-derived**, the sender's slot
+    /// is stable across reinstalls and restores, so a retried first contact
+    /// overwrites its own previous entry rather than orphaning it. Because it is
+    /// **secret**, the doorbell slot is not observer-computable: a storage node
+    /// co-hosting the record cannot test "slot 14 is occupied, and slot 14 is
+    /// where pubkey X would land", which is what keeps the doorbell sender-blind.
+    ///
+    /// Deriving it from the ML-DSA secret key instead would work cryptographically
+    /// and is deliberately NOT done — same key-separation reasoning as
+    /// [`ShareRootIkm`]. Content NEVER derives from this; it selects a slot index
+    /// and nothing else. Zeroizes on drop; never persisted, never on the wire.
+    inline pub struct DmDoorbellSlotSecret([u8; DM_DOORBELL_SLOT_SECRET_LEN]);
+}
+
 /// Both keypairs an [`Identity`] produces, derived deterministically from a
 /// mnemonic, plus the Veilid node identity seed (D3).
 #[derive(Debug)]
@@ -269,6 +294,8 @@ pub struct IdentityKeys {
     pub veilid_node_seed: VeilidNodeSeed,
     /// Share-root identity IKM (#156) — see [`ShareRootIkm`].
     pub share_root_ikm: ShareRootIkm,
+    /// DM doorbell slot secret (#233) — see [`DmDoorbellSlotSecret`].
+    pub dm_doorbell_slot_secret: DmDoorbellSlotSecret,
 }
 
 /// Derive the signing + KEM keypair for one [`Identity`] from a mnemonic.
@@ -350,12 +377,27 @@ pub fn derive_identity_keys(
     .map_err(KeyDerivationError::Hkdf)?;
     let share_root_ikm = ShareRootIkm(*share_root_ikm_buf);
 
+    // DM doorbell slot secret (#233): a FIFTH expansion of the SAME PRK under a
+    // domain-separated, identity-scoped label. Picks which of a recipient's 32
+    // doorbell slots this sender knocks on. Mnemonic-rooted so the slot survives a
+    // reinstall (a retry overwrites its own entry); secret so a doorbell co-host
+    // cannot map slots back to senders. Copied into a self-zeroizing wrapper
+    // before the transient buffer drops and zeroes.
+    let mut dm_doorbell_slot_buf = SecretBuffer::<DM_DOORBELL_SLOT_SECRET_LEN>::zero();
+    hkdf.expand(
+        identity.info_for(info::DOMAIN_DM_DOORBELL_SLOT).as_bytes(),
+        &mut *dm_doorbell_slot_buf,
+    )
+    .map_err(KeyDerivationError::Hkdf)?;
+    let dm_doorbell_slot_secret = DmDoorbellSlotSecret(*dm_doorbell_slot_buf);
+
     Ok(IdentityKeys {
         identity,
         signing,
         kem,
         veilid_node_seed,
         share_root_ikm,
+        dm_doorbell_slot_secret,
     })
 }
 
@@ -635,6 +677,66 @@ mod tests {
         );
     }
 
+    /// #233 — the DM doorbell slot secret must be deterministic in the mnemonic
+    /// (a reinstalled sender re-lands on its own doorbell slot rather than
+    /// orphaning the previous knock) and must not equal any sibling secret.
+    #[test]
+    fn dm_doorbell_slot_secret_is_deterministic_derived_and_distinct() {
+        ensure_oxicrypt_initialized();
+        let m = Mnemonic::from_phrase(ALL_ZEROS_PHRASE).unwrap();
+        let first = derive_identity_keys(&m, Identity::Primary).unwrap();
+        let second = derive_identity_keys(&m, Identity::Primary).unwrap();
+        assert_eq!(
+            first.dm_doorbell_slot_secret.as_bytes(),
+            second.dm_doorbell_slot_secret.as_bytes(),
+            "re-deriving from one phrase must reproduce the slot secret — this is \
+             what makes a retried first contact idempotent"
+        );
+        assert_ne!(first.dm_doorbell_slot_secret.as_bytes(), &[0u8; 32]);
+        assert_ne!(
+            first.dm_doorbell_slot_secret.as_bytes(),
+            first.share_root_ikm.as_bytes()
+        );
+        assert_ne!(
+            first.dm_doorbell_slot_secret.as_bytes(),
+            first.veilid_node_seed.as_bytes()
+        );
+    }
+
+    /// #233 — the slot secret is identity-SCOPED, not mnemonic-global. This is the
+    /// tripwire for the decision recorded in `ISA.md` (2026-07-28, the fifth
+    /// identity-PRK expansion): the frozen design's "multi-device-consistent"
+    /// wording, read literally, would bypass `Identity::info_for` so every
+    /// presentation of one mnemonic shared a slot. A Primary and a Device are two
+    /// identities with different long-term keys — hence two senders to a recipient
+    /// — so a shared slot would make them silently overwrite each other's knocks.
+    /// Without this test, "simplifying" the derivation back to a bare label passes
+    /// the whole workspace.
+    #[test]
+    fn dm_doorbell_slot_secret_diverges_by_mnemonic_and_identity() {
+        ensure_oxicrypt_initialized();
+        let m1 = Mnemonic::generate().unwrap();
+        let m2 = Mnemonic::generate().unwrap();
+        assert_ne!(
+            derive_identity_keys(&m1, Identity::Primary)
+                .unwrap()
+                .dm_doorbell_slot_secret
+                .as_bytes(),
+            derive_identity_keys(&m2, Identity::Primary)
+                .unwrap()
+                .dm_doorbell_slot_secret
+                .as_bytes()
+        );
+
+        let primary = derive_identity_keys(&m1, Identity::Primary).unwrap();
+        let device = derive_identity_keys(&m1, Identity::Device { uuid: Uuid::nil() }).unwrap();
+        assert_ne!(
+            primary.dm_doorbell_slot_secret.as_bytes(),
+            device.dm_doorbell_slot_secret.as_bytes(),
+            "Primary and Device are distinct senders and must not share a slot"
+        );
+    }
+
     #[test]
     fn debug_redacts_share_root_ikm() {
         ensure_oxicrypt_initialized();
@@ -663,6 +765,13 @@ mod tests {
             hex::encode(keys.share_root_ikm.as_bytes()),
             "e7d6ad2e24b9248f5e12c1b81a8c0a99eccae11c61d8213552cad7e91dc26c32",
         );
+        // #233 — the doorbell slot secret joins the guard. Its vector was captured
+        // from this implementation (it is new here, not pre-existing), so it pins
+        // the derivation against future drift rather than against a prior release.
+        assert_eq!(
+            hex::encode(keys.dm_doorbell_slot_secret.as_bytes()),
+            "ef02a92a7fa93125671e70e2922da90f5490e5709922e3245540ca767030c7d5",
+        );
     }
 
     /// #135 — the shared macro's `inline` redacted `Debug` renders
@@ -683,6 +792,10 @@ mod tests {
         assert_eq!(
             format!("{:?}", keys.share_root_ikm),
             "ShareRootIkm(<redacted>)"
+        );
+        assert_eq!(
+            format!("{:?}", keys.dm_doorbell_slot_secret),
+            "DmDoorbellSlotSecret(<redacted>)"
         );
     }
 }

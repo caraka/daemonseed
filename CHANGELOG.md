@@ -36,6 +36,13 @@ work lives in the project lead's vault manifest, not here.
 
 ### Added
 
+- DM doorbell address and slot derivation — `daemonseed_core::dm::doorbell`
+  (`derive_owner_seed`, `slot_for`, `DOORBELL_SLOTS`). The record, entry and
+  admission checks are not wired yet. (#233, ISC-C41)
+
+- `DmDoorbellSlotSecret` — a sixth identity-PRK expansion under the
+  identity-scoped label `dm-doorbell-slot/v1`, carried on `IdentityKeys`. (#233)
+
 - DM key records are published and re-seeded by both clients (ISC-C40). Each
   publishes its static ML-KEM-1024 encapsulation key once the session is live and
   re-seeds it against eviction on a jittered ~50-minute cadence (Veilid has no

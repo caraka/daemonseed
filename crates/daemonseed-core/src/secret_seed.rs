@@ -10,8 +10,9 @@
 //!   [`crate::public_room`], and [`crate::public_space`]. Each holds its seed in
 //!   a `Box<[u8; 32]>` and is built by [`derive_boxed_seed`] from a per-context
 //!   HKDF PRK (the `boxed` macro arm).
-//! - **Identity-rooted secrets** — [`crate::identity::keys::VeilidNodeSeed`] and
-//!   [`crate::identity::keys::ShareRootIkm`], held inline as `[u8; 32]` and
+//! - **Identity-rooted secrets** — [`crate::identity::keys::VeilidNodeSeed`],
+//!   [`crate::identity::keys::ShareRootIkm`] and
+//!   [`crate::identity::keys::DmDoorbellSlotSecret`], held inline as `[u8; 32]` and
 //!   additionally `Clone` + `Zeroize` (the `inline` macro arm). Their derivation
 //!   is NOT shared — each is a distinct expansion of the identity PRK — only the
 //!   newtype hygiene is.
