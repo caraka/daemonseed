@@ -36,6 +36,21 @@ work lives in the project lead's vault manifest, not here.
 
 ### Added
 
+- DM first-contact entry — `daemonseed_core::dm::firstcontact` (`build`, `open`,
+  `derive_channel_roots`, `bind_lt_input`, `msg_sig_input`, `FirstContactState`).
+  ML-KEM-1024 to the recipient's published static key; AES-256-GCM under a key
+  derived from the encapsulated secret, AAD binding the recipient's key-record
+  address and the first-contact epoch, current or previous accepted. The seal
+  carries a per-contact pseudonym, a `bind_lt` signature under the long-term key,
+  and a mandatory `msg_sig` under the pseudonym. `open` exact-length gates every
+  field, requires `seq == 0` and `key_selector == STATIC`, and verifies both
+  signatures. Padded to one of two buckets. `build` generates the opening ratchet
+  ephemeral and returns its secret half. Admission checks and transport are not
+  wired yet, nor is the established-channel replay rule (v6 minor invariant (b)).
+  (#233, ISC-C41)
+
+- Wire: `FirstContactEntry` and `FirstContactBody` (additive MINOR). (#233)
+
 - DM doorbell address and slot derivation — `daemonseed_core::dm::doorbell`
   (`derive_owner_seed`, `slot_for`, `DOORBELL_SLOTS`). The record, entry and
   admission checks are not wired yet. (#233, ISC-C41)

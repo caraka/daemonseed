@@ -1194,6 +1194,109 @@ functions:
           lp(kem_ek)||lp(invite_only), where lp(x) is u64-big-endian length ||
           bytes. Exact-length gated before any ML-DSA call.
 
+  - name: FirstContactEntry
+    module: dm
+    kind: message
+    description: >-
+      A sealed, self-contained first-contact entry, written to one slot of a
+      recipient's world-writable dflt(32) doorbell (ISC-C41). Padded to one of two
+      buckets before writing. Field 4 is reserved (token moved inside the seal).
+    fields:
+      - name: ct0
+        type: bytes
+        tag: 1
+        description: >-
+          ML-KEM-1024 ciphertext, exactly 1568 bytes, encapsulated to the
+          recipient's published static key. Decapsulates to ss0, the root of the
+          seal key, the address root AR, and chan_id.
+      - name: sealed
+        type: bytes
+        tag: 2
+        description: >-
+          nonce(12) || ciphertext || tag(16) over a padded FirstContactBody,
+          AES-256-GCM under HKDF-SHA384(salt=daemonseed/dm/fc/salt/v1, ikm=ss0,
+          info=daemonseed/dm/fc/seal/v1), AAD daemonseed/dm/fc/aad/v1||
+          lp(recipient_keyrec_owner_seed)||lp(fc_epoch_be). The recipient accepts
+          the current and previous fc_epoch.
+      - name: pow
+        type: bytes
+        tag: 3
+        description: >-
+          Proof-of-work bounding flood rate (admission option B). Not yet
+          populated.
+
+  - name: FirstContactBody
+    module: dm
+    kind: message
+    description: >-
+      The sealed contents of a FirstContactEntry: the sender's identity, the
+      pseudonym that will sign the conversation, the first message, and the
+      opening ratchet ephemeral. Unreadable without ss0.
+    fields:
+      - name: intended_recipient_hash
+        type: bytes
+        tag: 1
+        description: >-
+          SHA-384 of the recipient's ML-DSA-87 public key, 48 bytes. Rejected if
+          it is not the reader's own. Read only after decapsulation.
+      - name: pk_lt
+        type: bytes
+        tag: 2
+        description: The sender's long-term ML-DSA-87 public key, exactly 2592 bytes.
+      - name: pk_pc
+        type: bytes
+        tag: 3
+        description: >-
+          The sender's per-contact pseudonym ML-DSA-87 public key, exactly 2592
+          bytes. Random per correspondent, not mnemonic-derived.
+      - name: bind_lt
+        type: bytes
+        tag: 4
+        description: >-
+          ML-DSA-87 signature, exactly 4627 bytes, under the long-term key over
+          daemonseed/dm/bind/lt/v1||lp(pk_lt)||lp(pk_pc).
+      - name: key_selector
+        type: KeySelector
+        tag: 5
+        description: Which recipient key ct0 was encapsulated to. Alpha writes STATIC.
+      - name: seq
+        type: uint64
+        tag: 6
+        description: >-
+          Sequence number within the direction. Always zero for first contact;
+          any other value is rejected.
+      - name: sent_unix_ms
+        type: int64
+        tag: 7
+        description: Sender-asserted, signed. Display only.
+      - name: body
+        type: string
+        tag: 8
+        description: The first message, capped at DM_BODY_CAP (8192 bytes).
+      - name: eph_ek
+        type: bytes
+        tag: 9
+        description: >-
+          The sender's opening ratchet ephemeral ML-KEM-1024 encapsulation key,
+          exactly 1568 bytes. The recipient encapsulates to it in its reply, which
+          is where forward secrecy begins.
+      - name: msg_sig
+        type: bytes
+        tag: 10
+        description: >-
+          ML-DSA-87 signature, exactly 4627 bytes, under the pseudonym key over
+          daemonseed/dm/msg/sig/v6||lp(chan_id)||lp(dir)||lp(seq_be)||lp(eph_ek)||
+          lp(intended_recipient_hash)||lp(pk_pc)||lp(pk_lt)||lp(sent_unix_ms_be)||
+          lp(body), prefixed by lp(frame_kind). Mandatory and always verified;
+          the sole proof-of-possession path for the pseudonym key.
+      - name: token
+        type: bytes
+        tag: 11
+        description: >-
+          Grantee-bound one-time invite token for an invite_only recipient
+          (admission option C). Inside the seal, because it names the sender. Not
+          yet populated.
+
   - name: KeySelector
     module: dm
     kind: enum

@@ -64,9 +64,52 @@ pub const DM_DOORBELL_SLOT_SALT: &[u8] = b"daemonseed/dm/doorbell/slot-salt/v1";
 /// HKDF-Expand `info` for the sender's doorbell slot index. FROZEN.
 pub const DM_DOORBELL_SLOT: &[u8] = b"daemonseed/dm/doorbell/slot/v5";
 
+/// HKDF-Extract salt for the first-contact seal key, rooted in the encapsulated
+/// secret `ss0`. FROZEN.
+pub const DM_FC_SALT: &[u8] = b"daemonseed/dm/fc/salt/v1";
+
+/// HKDF-Expand `info` for the first-contact entry's AES-256-GCM seal key. FROZEN.
+pub const DM_FC_SEAL: &[u8] = b"daemonseed/dm/fc/seal/v1";
+
+/// AAD prefix for the first-contact seal. The recipient's key-record address and
+/// the current first-contact epoch follow it, which is what makes an entry
+/// un-openable at a different recipient or outside its epoch window. FROZEN.
+pub const DM_FC_AAD: &[u8] = b"daemonseed/dm/fc/aad/v1";
+
+/// Signature domain binding a per-contact pseudonym key to the long-term identity
+/// that vouches for it, signed under the LONG-TERM key. FROZEN.
+pub const DM_BIND_LT: &[u8] = b"daemonseed/dm/bind/lt/v1";
+
+/// Signature domain for a DM frame's authorship signature, signed under the
+/// PSEUDONYM key. The sole proof-of-possession path (the separate `bind_pop` was
+/// folded into it), so it binds both public keys as well as the message. FROZEN.
+pub const DM_MSG_SIG: &[u8] = b"daemonseed/dm/msg/sig/v6";
+
+/// HKDF-Extract salt for the two roots derived from `ss0`. FROZEN.
+pub const DM_ROOT_SALT: &[u8] = b"daemonseed/dm/root/salt/v1";
+
+/// HKDF-Expand `info` for the address root `AR`, from which every ongoing-channel
+/// address derives. Retained for the life of the conversation — addressing is
+/// deliberately NOT forward-secret, while content is. FROZEN.
+pub const DM_ADDR_ROOT: &[u8] = b"daemonseed/dm/addr/root/v3";
+
+/// HKDF-Expand `info` for `chan_id`, the conversation identifier bound into every
+/// signature and AAD. **Never serialized** — a receiver recomputes it from the
+/// record it derived. Putting it on the wire would collapse the address scatter
+/// it exists to protect. FROZEN.
+pub const DM_CHAN_ID: &[u8] = b"daemonseed/dm/chanid/v2";
+
 /// Every label in this namespace, for the prefix-freeness check.
 #[cfg(test)]
 const ALL: &[&[u8]] = &[
+    DM_FC_SALT,
+    DM_FC_SEAL,
+    DM_FC_AAD,
+    DM_BIND_LT,
+    DM_MSG_SIG,
+    DM_ROOT_SALT,
+    DM_ADDR_ROOT,
+    DM_CHAN_ID,
     DM_KEYREC_SALT,
     DM_KEYREC_OWNER,
     DM_KEYREC_SIG,
@@ -94,6 +137,14 @@ mod tests {
             b"daemonseed/dm/doorbell/slot-salt/v1"
         );
         assert_eq!(DM_DOORBELL_SLOT, b"daemonseed/dm/doorbell/slot/v5");
+        assert_eq!(DM_FC_SALT, b"daemonseed/dm/fc/salt/v1");
+        assert_eq!(DM_FC_SEAL, b"daemonseed/dm/fc/seal/v1");
+        assert_eq!(DM_FC_AAD, b"daemonseed/dm/fc/aad/v1");
+        assert_eq!(DM_BIND_LT, b"daemonseed/dm/bind/lt/v1");
+        assert_eq!(DM_MSG_SIG, b"daemonseed/dm/msg/sig/v6");
+        assert_eq!(DM_ROOT_SALT, b"daemonseed/dm/root/salt/v1");
+        assert_eq!(DM_ADDR_ROOT, b"daemonseed/dm/addr/root/v3");
+        assert_eq!(DM_CHAN_ID, b"daemonseed/dm/chanid/v2");
     }
 
     /// The frozen design's F11 requirement: no label may be a prefix of another.

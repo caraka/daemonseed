@@ -717,6 +717,112 @@ pub struct DmKeyRecord {
     #[prost(bytes = "vec", tag = "4")]
     pub signature: ::prost::alloc::vec::Vec<u8>,
 }
+/// A knock: everything the recipient needs to decide whether to accept a stranger
+/// and, on accept, to start the conversation (ISC-C41).
+///
+/// Written to one slot of the recipient's world-writable `dflt(32)` doorbell. The
+/// slot is derived from a SENDER secret, so a storage node co-hosting the record
+/// cannot map it back to a sender; the sender's identity is only inside the seal.
+///
+/// **Self-contained on purpose.** An earlier design put a pointer here and the
+/// payload elsewhere, which forced the recipient to fetch before it could judge —
+/// a read-amplification lever for anyone willing to write garbage. Carrying the
+/// whole thing means an unwanted entry costs exactly one decapsulation and one
+/// failed AEAD open, and nothing is fetched on a stranger's say-so. That is what
+/// makes the entry large, and the entry size is what forces the doorbell to
+/// `dflt(32)`.
+///
+/// Every entry is padded to one of a few bucket sizes before it is written, so
+/// the length reveals only a coarse size class rather than the message.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FirstContactEntry {
+    /// ML-KEM-1024 ciphertext, exactly 1568 bytes, encapsulated to the recipient's
+    /// published static key. Decapsulating it yields `ss0`, from which the seal
+    /// key, the channel address root, and the ratchet root all derive.
+    #[prost(bytes = "vec", tag = "1")]
+    pub ct0: ::prost::alloc::vec::Vec<u8>,
+    /// `nonce(12) ‖ ciphertext ‖ tag(16)` over a `FirstContactBody`, AES-256-GCM
+    /// under a key derived from `ss0`, binding the recipient's key-record address
+    /// and the current first-contact epoch as AAD. An entry replayed to a different
+    /// recipient, or outside its epoch window, fails to open.
+    #[prost(bytes = "vec", tag = "2")]
+    pub sealed: ::prost::alloc::vec::Vec<u8>,
+    /// Proof-of-work over the entry, bounding flood rate (admission option B).
+    /// Absent until the admission slice lands; a recipient that requires it drops
+    /// entries without one.
+    #[prost(bytes = "vec", tag = "3")]
+    pub pow: ::prost::alloc::vec::Vec<u8>,
+}
+/// The sealed contents of a `FirstContactEntry` — who is knocking, what they say,
+/// and the material to answer them.
+///
+/// Nothing here is readable without `ss0`, so the identities are protected by the
+/// encapsulation to the recipient rather than by the DHT.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FirstContactBody {
+    /// SHA-384 of the recipient's ML-DSA-87 public key, 48 bytes. The recipient
+    /// rejects an entry whose hash is not its own, which is what stops a ciphertext
+    /// meant for one identity being replayed at another. A hash rather than the
+    /// full key because the entry is size-constrained and the recipient already
+    /// knows its own key. Note the recipient reads this only AFTER decapsulating —
+    /// the alpha accepts that (no proof of decapsulation-key possession).
+    #[prost(bytes = "vec", tag = "1")]
+    pub intended_recipient_hash: ::prost::alloc::vec::Vec<u8>,
+    /// The sender's long-term ML-DSA-87 public key, exactly 2592 bytes. What the
+    /// recipient displays, blocks, and later recognises.
+    #[prost(bytes = "vec", tag = "2")]
+    pub pk_lt: ::prost::alloc::vec::Vec<u8>,
+    /// The sender's per-contact pseudonym ML-DSA-87 public key, exactly 2592 bytes.
+    /// Signs every message of this conversation, so wire authorship is never the
+    /// long-term key. Random per correspondent — hence unlinkable across
+    /// conversations, and unrecoverable from the recovery phrase.
+    #[prost(bytes = "vec", tag = "3")]
+    pub pk_pc: ::prost::alloc::vec::Vec<u8>,
+    /// ML-DSA-87 signature, exactly 4627 bytes, under the LONG-TERM key, binding
+    /// the pseudonym to the identity. This is what lets the recipient say "the
+    /// pseudonym signing this conversation belongs to that identity".
+    #[prost(bytes = "vec", tag = "4")]
+    pub bind_lt: ::prost::alloc::vec::Vec<u8>,
+    /// Which of the recipient's keys `ct0` was encapsulated to. Alpha always
+    /// `KEY_SELECTOR_STATIC`.
+    #[prost(enumeration = "KeySelector", tag = "5")]
+    pub key_selector: i32,
+    /// Sequence number within the direction. Always zero for first contact, and
+    /// rejected otherwise: the conversation pages messages at `seq / K`, so a large
+    /// value would start the recipient's collection cursor at an absurd page.
+    #[prost(uint64, tag = "6")]
+    pub seq: u64,
+    /// Unix milliseconds, sender-asserted and signed. Display only — never trusted
+    /// for ordering or freshness against an adversary.
+    #[prost(int64, tag = "7")]
+    pub sent_unix_ms: i64,
+    /// The first message. Bounded well below the padding bucket so the entry always
+    /// fits its doorbell subkey.
+    #[prost(string, tag = "8")]
+    pub body: ::prost::alloc::string::String,
+    /// The sender's first ratchet ephemeral ML-KEM-1024 encapsulation key, exactly
+    /// 1568 bytes. The recipient encapsulates to it in its reply, which is the first
+    /// ratchet step and the point at which the conversation becomes forward-secret.
+    /// Everything before it is not.
+    #[prost(bytes = "vec", tag = "9")]
+    pub eph_ek: ::prost::alloc::vec::Vec<u8>,
+    /// ML-DSA-87 signature, exactly 4627 bytes, under the PSEUDONYM key. Mandatory
+    /// and always verified: it proves possession of the pseudonym key and covers
+    /// the body, the ephemeral key, the recipient, the sequence, and both public
+    /// keys. It is the SOLE proof-of-possession path — an earlier draft carried a
+    /// separate `bind_pop` signature, folded into this one to save 4627 bytes — so
+    /// any future frame type must carry it or proof-of-possession silently
+    /// disappears there.
+    #[prost(bytes = "vec", tag = "10")]
+    pub msg_sig: ::prost::alloc::vec::Vec<u8>,
+    /// A grantee-bound one-time invite token the recipient issued (admission option
+    /// C), present only when knocking at an `invite_only` identity. Bound to the
+    /// sender's long-term key, so it is not a bearer secret and is useless if
+    /// intercepted. Inside the seal, because it names the sender. Absent until the
+    /// admission slice lands.
+    #[prost(bytes = "vec", tag = "11")]
+    pub token: ::prost::alloc::vec::Vec<u8>,
+}
 /// Which key an initiator encapsulated `ss0` to when opening a conversation.
 ///
 /// Alpha always writes `KEY_SELECTOR_STATIC`. The enum exists so that

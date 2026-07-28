@@ -748,9 +748,24 @@ modules:
       lp(recipient_pubkey)) reduced mod DOORBELL_SLOTS (32, a power of two).
       DmDoorbellSlotSecret is a mnemonic-derived, identity-scoped expansion of
       the identity PRK; a writer builds its RecordShape from DOORBELL_SLOTS.
-      Sub-module dm::domain declares the
-      daemonseed/dm/… label namespace, one distinct prefix-free label per
-      purpose.
+      Sub-module dm::firstcontact builds and opens the self-contained
+      first-contact entry: build(signing_lt, signing_pc, recipient_pk_lt,
+      kem_ek_b, eph_ek, fc_epoch, sent_unix_ms, body) encapsulates ss0 to the
+      recipient's static key, signs bind_lt under the long-term key and msg_sig
+      under the pseudonym, pads the encoded body to a PAD_BUCKETS entry, and
+      seals it; it returns the entry bytes and ss0, which the sender persists.
+      open(entry, recipient_dk, recipient_pk_lt, current_fc_epoch) decapsulates,
+      opens against the current then previous epoch, exact-length gates every
+      field, rejects a foreign intended_recipient_hash, and verifies bind_lt then
+      msg_sig before returning a VerifiedFirstContact, and requires seq == 0 and
+      key_selector == STATIC. msg_sig_input binds, each u64-BE length-prefixed,
+      frame_kind || chan_id || dir || seq || eph_ek || intended_recipient_hash ||
+      pk_pc || pk_lt || sent_unix_ms || body under daemonseed/dm/msg/sig/v6.
+      derive_channel_roots(ss0) yields AR and chan_id; chan_id is never
+      serialized. DM_BODY_CAP caps a body at 8192 bytes; MAX_ENTRY_LEN is the
+      dflt(32) subkey cap the PAD_BUCKETS ladder and POW_RESERVE are sized
+      against. Sub-module dm::domain declares the daemonseed/dm/… label namespace,
+      one distinct prefix-free label per purpose.
     no_std: false
     depends_on:
       - daemonseed_core::identity::keys
