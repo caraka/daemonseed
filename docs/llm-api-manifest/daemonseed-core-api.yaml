@@ -824,6 +824,20 @@ modules:
       UnknownEphemeral, MismatchedEphemeral, GenerationExhausted, NotYetEstablished,
       SkipTooLarge, Module and EntropySource. NOT YET AVAILABLE: a Ratchet cannot
       be serialized or restored, which the frozen design requires (#243).
+      Sub-module dm::paging addresses the ongoing channel: derive_owner_seed(AR,
+      dir, page) is HKDF-SHA-384(salt=daemonseed/dm/page/salt/v1, ikm=AR,
+      info=daemonseed/dm/page/addr/v4||lp(dir)||lp(page_be)). Only the two parties
+      can derive it, so DmPageOwnerSeed is a genuine secret unlike its
+      world-derivable siblings. The address separates the two STREAMS, not the two
+      authors — AR is symmetric — so authorship rests on msg_sig, never on the
+      address. position_of(seq) -> PagePosition is total and injective (page = seq /
+      PAGE_SLOTS, slot = seq % PAGE_SLOTS); PagePosition::new(page, slot) is the
+      checked slot-to-sequence direction and returns None outside the record or on
+      overflow; page(), slot(), seq() read it. PAGE_SLOTS (16) is the record's o_cnt
+      and part of its address — a writer builds its RecordShape from it (ISC-C100).
+      A collector must verify a frame's declared seq against the slot it was found
+      in. Addressing is not forward-secret: AR is retained for the conversation's
+      life.
       Sub-module dm::domain
       declares the daemonseed/dm/… label namespace, one distinct prefix-free label
       per purpose.

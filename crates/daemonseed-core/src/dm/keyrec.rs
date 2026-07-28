@@ -40,6 +40,13 @@ use crate::dm::domain;
 use crate::identity::keys::{SignKeypair, SignatureError, verify_signature};
 use crate::secret_seed::{derive_boxed_seed, redacted_secret_newtype};
 
+/// Slots in a key record — the `o_cnt` of its `dflt(o_cnt)` schema, and part of
+/// the record's address.
+///
+/// One: the record holds a single signed value and nothing else. A writer MUST
+/// build its `RecordShape` from this constant rather than a literal (ISC-C100).
+pub const KEY_RECORD_SLOTS: u16 = 1;
+
 /// Byte length of the Veilid owner seed this module derives.
 pub const DM_KEYREC_OWNER_SEED_LEN: usize = 32;
 

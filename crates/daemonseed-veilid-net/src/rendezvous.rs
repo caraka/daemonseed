@@ -78,6 +78,16 @@ pub const MAX_SUBKEY_COUNT: u16 = 1024;
 /// DRAFT v6) — so the engine takes the shape as a parameter rather than baking
 /// one in.
 ///
+/// **A surface's shape constant lives here and is derived from the same slot count
+/// its address derivation uses** — see [`RecordShape::DM_KEY_RECORD`]. That is
+/// deliberate: `o_cnt` is part of the address, so a shape hand-typed at a call
+/// site that disagreed with the deriving module would open a *different,
+/// perfectly valid record* — no error anywhere, and two participants who simply
+/// never see each other's writes. A shared constant makes that disagreement a
+/// compile error instead of a convention stated in prose (ISC-C100). The doorbell
+/// and channel-page shapes get theirs when their transport lands; adding them
+/// before there is anything to open would be an unused constant, not a check.
+///
 /// **The value cap is not a constant.** Veilid enforces
 /// `min(MAX_SUBKEY_SIZE, MAX_RECORD_DATA_SIZE / o_cnt)` per subkey
 /// (`veilid-core-0.5.7 src/storage_manager/schema.rs:61-63`), so slot count trades
@@ -94,6 +104,9 @@ pub struct RecordShape {
 impl RecordShape {
     /// The shape every pre-DM rendezvous record uses: `dflt(64)`, 16 KiB/subkey.
     pub const RENDEZVOUS: Self = Self::new(SUBKEY_COUNT);
+
+    /// Direct messaging's key record: `dflt(1)`.
+    pub const DM_KEY_RECORD: Self = Self::new(daemonseed_core::dm::keyrec::KEY_RECORD_SLOTS);
 
     /// A DFLT shape with `o_cnt` subkeys. **Panics** outside Veilid's accepted
     /// `1..=MAX_SUBKEY_COUNT` range.

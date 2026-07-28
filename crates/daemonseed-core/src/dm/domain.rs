@@ -99,6 +99,17 @@ pub const DM_ADDR_ROOT: &[u8] = b"daemonseed/dm/addr/root/v3";
 /// it exists to protect. FROZEN.
 pub const DM_CHAN_ID: &[u8] = b"daemonseed/dm/chanid/v2";
 
+/// HKDF-Extract salt for a channel page's owner-seed derivation, rooted in the
+/// conversation's secret address root `AR`. FROZEN.
+pub const DM_PAGE_SALT: &[u8] = b"daemonseed/dm/page/salt/v1";
+
+/// HKDF-Expand `info` prefix for a channel page's Veilid owner seed. The
+/// direction and page number follow it, length-prefixed. Unlike every other DM
+/// address this one is **not** world-derivable: it is rooted in a secret only the
+/// two parties hold, which is what makes the page owner-write-gated and therefore
+/// unforgeable and un-erasable by a third party. FROZEN.
+pub const DM_PAGE_ADDR: &[u8] = b"daemonseed/dm/page/addr/v4";
+
 /// HKDF-Expand `info` for the ratchet root `RK0` — the third sibling of the same
 /// extraction that yields [`DM_ADDR_ROOT`] and [`DM_CHAN_ID`]. Unlike those two,
 /// this one is ratcheted forward and deleted, which is the whole of DM's forward
@@ -137,6 +148,8 @@ pub const DM_CK: &[u8] = b"daemonseed/dm/ck/v2";
 /// Every label in this namespace, for the prefix-freeness check.
 #[cfg(test)]
 const ALL: &[&[u8]] = &[
+    DM_PAGE_SALT,
+    DM_PAGE_ADDR,
     DM_RATCHET_ROOT,
     DM_RATCHET_STEP,
     DM_CHAIN_SALT,
@@ -188,6 +201,8 @@ mod tests {
         assert_eq!(DM_ROOT_SALT, b"daemonseed/dm/root/salt/v1");
         assert_eq!(DM_ADDR_ROOT, b"daemonseed/dm/addr/root/v3");
         assert_eq!(DM_CHAN_ID, b"daemonseed/dm/chanid/v2");
+        assert_eq!(DM_PAGE_SALT, b"daemonseed/dm/page/salt/v1");
+        assert_eq!(DM_PAGE_ADDR, b"daemonseed/dm/page/addr/v4");
         assert_eq!(DM_RATCHET_ROOT, b"daemonseed/dm/ratchet/root/v2");
         assert_eq!(DM_RATCHET_STEP, b"daemonseed/dm/ratchet/step/v2");
         assert_eq!(DM_CHAIN_SALT, b"daemonseed/dm/chain/salt/v1");

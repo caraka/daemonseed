@@ -249,12 +249,7 @@ pub fn derive_channel_roots(ss0: &[u8; SS0_LEN]) -> Result<ChannelRoots, FirstCo
     outcome
 }
 
-/// Append a `u64` big-endian length prefix and the bytes, the repo's one
-/// preimage convention (`room_message::provenance_input`, `keyrec::signing_input`).
-fn push_lp(buf: &mut Vec<u8>, bytes: &[u8]) {
-    buf.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
-    buf.extend_from_slice(bytes);
-}
+use crate::dm::push_lp;
 
 /// The preimage binding a per-contact pseudonym to the long-term identity that
 /// vouches for it. Signed under the LONG-TERM key.

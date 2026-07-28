@@ -1,4 +1,4 @@
-//! The conversation's key schedule — a post-quantum double ratchet (ISC-C42).
+//! The conversation's key schedule — a post-quantum double ratchet (ISC-C38).
 //!
 //! This module is the arithmetic of forward secrecy: every key a DM message is
 //! sealed under, where it comes from, and when it is destroyed. It holds no wire

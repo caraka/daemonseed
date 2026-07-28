@@ -21,8 +21,22 @@
 //! Built in dependency order as GitHub issues #232–#236; modules land as their
 //! slices do.
 
+/// Append a `u64` big-endian length prefix and the bytes.
+///
+/// The repo's one preimage convention (`room_message::provenance_input`), and the
+/// single definition of it for direct messaging. Signature preimages and HKDF
+/// `info` strings are wire: two hand-rolled copies that drifted would surface only
+/// as two clients unable to verify each other's signatures or find each other's
+/// records, which is exactly the failure the frozen build notes record for the
+/// direction labels.
+pub(crate) fn push_lp(buf: &mut Vec<u8>, bytes: &[u8]) {
+    buf.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+    buf.extend_from_slice(bytes);
+}
+
 pub mod domain;
 pub mod doorbell;
 pub mod firstcontact;
 pub mod keyrec;
+pub mod paging;
 pub mod ratchet;

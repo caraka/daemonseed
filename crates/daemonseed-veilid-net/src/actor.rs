@@ -1752,7 +1752,7 @@ impl WriteSink for ProductionSink {
 /// The DM key record's schema: `dflt(1)`, one slot, the full 32 KiB per-subkey cap.
 /// Part of the record ADDRESS — every participant must derive with this shape or
 /// they compute a different record (`docs/design/direct-messaging.md` DRAFT v6).
-const DM_KEY_RECORD_SHAPE: rendezvous::RecordShape = rendezvous::RecordShape::new(1);
+const DM_KEY_RECORD_SHAPE: rendezvous::RecordShape = rendezvous::RecordShape::DM_KEY_RECORD;
 
 /// The only slot in the key record.
 const DM_KEY_RECORD_SUBKEY: u32 = 0;

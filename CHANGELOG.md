@@ -61,7 +61,7 @@ work lives in the project lead's vault manifest, not here.
   conversation onto its send and receive directions. `Direction::label` is the
   sole definition of the `a2b` / `b2a` wire literals. Every derivation zeroizes
   its transient buffer on both paths. The generation state machine, page
-  addressing and the wire frame are not wired yet. (#234, ISC-C42)
+  addressing and the wire frame are not wired yet. (#234, ISC-C38)
 
 - DM ratchet state machine — `daemonseed_core::dm::ratchet::Ratchet`
   (`initiator`, `recipient`, `send_next`, `receive`, `role`, `generation`,
@@ -87,9 +87,23 @@ work lives in the project lead's vault manifest, not here.
   distinguishes `AlreadyConsumed`, `GenerationTooOld`, `SeqBeforeChainBase`,
   `BacklogTooWide`, `MissingCiphertext`, `UnknownEphemeral`, `MismatchedEphemeral`,
   `GenerationExhausted` and `NotYetEstablished`. The wire frame and page
-  addressing are not wired yet. (#234, ISC-C42)
+  addressing are not wired yet. (#234, ISC-C38)
 
-- Domain labels `DM_RATCHET_ROOT`, `DM_RATCHET_STEP`, `DM_CHAIN_SALT`,
+- DM channel page addressing — `daemonseed_core::dm::paging` (`derive_owner_seed`,
+  `position_of`, `first_seq_of_page`, `PagePosition`, `PAGE_SLOTS`,
+  `DmPageOwnerSeed`). A page's Veilid owner seed is
+  `HKDF(salt = daemonseed/dm/page/salt/v1, ikm = AR, info = daemonseed/dm/page/addr/v4 || lp(dir) || lp(page_be))`,
+  so only the two parties can derive the address and therefore only they can
+  write it; the ongoing channel needs no admission control against strangers.
+  `AR` is symmetric, so the address separates the two streams and not the two
+  authors — authorship within the pair rests on `msg_sig`, never on the address. `PAGE_SLOTS` (16)
+  is the record's `o_cnt` and part of its address; a writer must build its
+  `RecordShape` from it. `position_of` maps a per-direction sequence number to
+  one page and slot, total and injective, so a message is written once and never
+  wrapped or overwritten. The page record, its transport and the wire frame are
+  not wired yet. (#234, ISC-C42, ISC-A-C24)
+
+- Domain labels `DM_PAGE_SALT`, `DM_PAGE_ADDR`, `DM_RATCHET_ROOT`, `DM_RATCHET_STEP`, `DM_CHAIN_SALT`,
   `DM_CHAIN_A2B`, `DM_CHAIN_B2A`, `DM_CHAIN_STEP_SALT`, `DM_MK`, `DM_CK`. (#234)
 
 - DM first-contact entry — `daemonseed_core::dm::firstcontact` (`build`, `open`,
