@@ -1,0 +1,79 @@
+// daemonseed wire protocol — direct messaging.
+//
+// Design of record: `docs/design/direct-messaging.md` (FROZEN, DRAFT v6).
+// Anchors ISC-C38-C46 and ISC-A-C20-A-C25.
+//
+// These messages are DHT record values, not gRPC payloads — there is no service
+// stanza. Each is written to a Veilid DFLT subkey and read back verbatim; the
+// only encryption is ours (AES-256-GCM inside), so the DHT and every storage
+// node see sealed bytes and no forgeable authorship (ISC-A-S2 / ISC-A-C20).
+//
+// Green-field additive MINOR on the frozen v0.36.2 wire: no existing message,
+// field, or record changes, and a pre-DM client never derives or sweeps a DM
+// record, so it neither sees nor breaks on any of this. MINOR bumps here MUST
+// stay additive-only. Never reuse field numbers, never repurpose enum values.
+
+syntax = "proto3";
+
+package daemonseed.v1;
+
+// Which key an initiator encapsulated `ss0` to when opening a conversation.
+//
+// Alpha always writes `KEY_SELECTOR_STATIC`. The enum exists so that
+// re-introducing one-time PQ prekeys later is a no-wire-change addition rather
+// than an additive proto bump: a future client could name a prekey and fall back
+// to `STATIC` against an older peer. Prekeys were dropped for alpha (and are
+// expected to stay dropped), which is why the opening burst before the
+// recipient's first reply has no forward secrecy — see ISC-C45's hello-grade
+// labeling requirement, which is the mitigation.
+enum KeySelector {
+  // Never written. Proto3 requires a zero default; treat it as `STATIC` on read
+  // so an unset field from a future client is not silently a different key.
+  KEY_SELECTOR_UNSPECIFIED = 0;
+
+  // The recipient's long-term ML-KEM-1024 encapsulation key, published in
+  // `DmKeyRecord.kem_ek`.
+  KEY_SELECTOR_STATIC = 1;
+}
+
+// An identity's published static ML-KEM-1024 encapsulation key — the thing that
+// makes an identity DM-able (ISC-C40).
+//
+// Lives alone in subkey 0 of a `dflt(1)` record whose owner is derived from the
+// identity's own ML-DSA-87 public key, so anyone holding that pubkey computes
+// the address. Every provenance-signed artifact already carries it (chat and
+// room messages, share announcements, presence beacons), so anyone visible on a
+// roster or in a transcript is reachable with no new discovery surface.
+//
+// The record is world-WRITABLE, because a world-derivable address under DFLT
+// implies a world-derivable owner. That is accepted and bounded: forgery is
+// impossible (the signature is verified against the identity pubkey the reader
+// already used to derive the address), so the only attack is erasure or
+// rollback, both denial-of-service. Readers cache the highest verified `version`
+// and never regress.
+//
+// The publish is presence-INDEPENDENT: written once and re-seeded against
+// eviction on a fixed slow schedule that takes no input from user activity, so
+// polling it reveals at most "this identity is DM-able", never an online rhythm.
+message DmKeyRecord {
+  // Monotonic. A reader accepts a record only if `version` is at least the
+  // highest it has already verified for this identity, so a replayed older
+  // signed blob cannot revert a key rotation.
+  uint64 version = 1;
+
+  // ML-KEM-1024 encapsulation key, exactly 1568 bytes. The public half of the
+  // mnemonic-derived identity KEM keypair; only this half is new to the wire.
+  bytes kem_ek = 2;
+
+  // Whether this identity requires a grantee-bound one-time invite token on a
+  // first-contact entry (admission option C). Advertised so a sender knows to
+  // include one; the recipient enforces it regardless of what it advertised.
+  bool invite_only = 3;
+
+  // ML-DSA-87 signature, exactly 4627 bytes, over the domain-separated
+  // preimage of (identity pubkey, version, kem_ek, invite_only). Verified
+  // against the identity pubkey the reader derived this record's address from —
+  // never against anything carried in the record, which carries no pubkey
+  // precisely so there is nothing to substitute.
+  bytes signature = 4;
+}

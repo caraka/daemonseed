@@ -1148,6 +1148,64 @@ functions:
           whitelist (ISC-S8), the signature must verify over signed_payload,
           and the MOTD text must be single-line plaintext (ISC-S9).
 
+  - name: DmKeyRecord
+    module: dm
+    kind: message
+    description: >-
+      An identity's published static ML-KEM-1024 encapsulation key — the whole of
+      DM discovery (ISC-C40). Written to subkey 0 of a dflt(1) Veilid record whose
+      owner is derived from the identity's ML-DSA-87 public key, so any holder of
+      that key computes the address; the key already rides on every
+      provenance-signed artifact, so no new discovery surface exists. The record
+      carries no identity pubkey: the reader verifies against the pubkey it
+      derived the address from, leaving no field to substitute. World-writable by
+      construction (a world-derivable address implies a world-derivable owner) —
+      forgery is impossible, erasure and rollback are denial-of-service only, and
+      readers cache the highest verified version and never regress. Publication is
+      presence-independent: written once, re-seeded on a fixed slow schedule that
+      takes no input from user activity.
+    fields:
+      - name: version
+        type: uint64
+        tag: 1
+        description: >-
+          Monotonic. A reader accepts only a version at least as high as the
+          highest it has verified, so a replayed older signed blob cannot revert a
+          key rotation.
+      - name: kem_ek
+        type: bytes
+        tag: 2
+        description: >-
+          ML-KEM-1024 encapsulation key, exactly 1568 bytes. Exact-length gated
+          before any signature check.
+      - name: invite_only
+        type: bool
+        tag: 3
+        description: >-
+          Whether first contact requires a grantee-bound one-time invite token.
+          Advertised so a sender knows to include one; the recipient enforces it
+          regardless of what it advertised.
+      - name: signature
+        type: bytes
+        tag: 4
+        description: >-
+          ML-DSA-87 signature, exactly 4627 bytes, over
+          daemonseed/dm/keyrec/sig/v1||lp(identity_pubkey)||lp(version_be)||
+          lp(kem_ek)||lp(invite_only), where lp(x) is u64-big-endian length ||
+          bytes. Exact-length gated before any ML-DSA call.
+
+  - name: KeySelector
+    module: dm
+    kind: enum
+    description: >-
+      Which key an initiator encapsulated ss0 to when opening a conversation.
+      Alpha always writes KEY_SELECTOR_STATIC, the recipient's long-term
+      encapsulation key from DmKeyRecord.kem_ek. The enum reserves the value
+      space so re-introducing one-time PQ prekeys later needs no wire change:
+      a future client could name a prekey index and fall back to STATIC against
+      an older peer. KEY_SELECTOR_UNSPECIFIED is the proto3 zero default and is
+      never written; read it as STATIC.
+
   - name: PublicSpace.DeletePost
     module: public_space
     description: >-

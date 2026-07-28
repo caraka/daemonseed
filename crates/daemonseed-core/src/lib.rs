@@ -57,6 +57,7 @@ pub mod circle;
 pub mod connection;
 pub mod cot;
 pub mod crypto;
+pub mod dm;
 pub mod federation;
 pub mod first_start;
 pub mod format;

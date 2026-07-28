@@ -29,7 +29,10 @@ pub mod v1 {
 mod tests {
     use prost::Message;
 
-    use crate::v1::{AppHello, AppHelloAck, AppHelloReject, CotFrame, ProtocolVersion, SuiteId};
+    use crate::v1::{
+        AppHello, AppHelloAck, AppHelloReject, CotFrame, DmKeyRecord, KeySelector, ProtocolVersion,
+        SuiteId,
+    };
 
     /// `SuiteId` round-trips through prost encode/decode preserving the
     /// `value` field. M3 adds `SuiteId` to the v1 module; this test exists
@@ -141,5 +144,33 @@ mod tests {
         assert_eq!(decoded, original);
         assert_eq!(decoded.asset_address.len(), 48);
         assert_eq!(decoded.payload, b"opaque-ciphertext");
+    }
+
+    /// `DmKeyRecord` round-trips at the proto-crate boundary. The two byte
+    /// fields are exact-length on the wire (ML-KEM-1024 EK = 1568, ML-DSA-87
+    /// signature = 4627); prost itself enforces neither, which is why
+    /// `daemonseed_core::dm::keyrec::verify` length-gates both before any
+    /// signature check.
+    #[test]
+    fn dm_key_record_round_trips() {
+        let original = DmKeyRecord {
+            version: 7,
+            kem_ek: vec![0xA5; 1568],
+            invite_only: true,
+            signature: vec![0x5A; 4627],
+        };
+        let bytes = original.encode_to_vec();
+        let decoded = DmKeyRecord::decode(bytes.as_slice()).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    /// The reserved key-selector space. Alpha always writes `Static`; the enum
+    /// exists so re-introducing one-time prekeys later needs no wire change.
+    /// `Unspecified` is the proto3 zero default and is never written.
+    #[test]
+    fn key_selector_reserves_the_prekey_space() {
+        assert_eq!(KeySelector::Unspecified as i32, 0);
+        assert_eq!(KeySelector::Static as i32, 1);
+        assert_eq!(KeySelector::default(), KeySelector::Unspecified);
     }
 }

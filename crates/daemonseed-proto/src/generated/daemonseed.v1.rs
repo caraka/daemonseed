@@ -674,6 +674,88 @@ pub mod circle_of_trust_server {
         const NAME: &'static str = SERVICE_NAME;
     }
 }
+/// An identity's published static ML-KEM-1024 encapsulation key — the thing that
+/// makes an identity DM-able (ISC-C40).
+///
+/// Lives alone in subkey 0 of a `dflt(1)` record whose owner is derived from the
+/// identity's own ML-DSA-87 public key, so anyone holding that pubkey computes
+/// the address. Every provenance-signed artifact already carries it (chat and
+/// room messages, share announcements, presence beacons), so anyone visible on a
+/// roster or in a transcript is reachable with no new discovery surface.
+///
+/// The record is world-WRITABLE, because a world-derivable address under DFLT
+/// implies a world-derivable owner. That is accepted and bounded: forgery is
+/// impossible (the signature is verified against the identity pubkey the reader
+/// already used to derive the address), so the only attack is erasure or
+/// rollback, both denial-of-service. Readers cache the highest verified `version`
+/// and never regress.
+///
+/// The publish is presence-INDEPENDENT: written once and re-seeded against
+/// eviction on a fixed slow schedule that takes no input from user activity, so
+/// polling it reveals at most "this identity is DM-able", never an online rhythm.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DmKeyRecord {
+    /// Monotonic. A reader accepts a record only if `version` is at least the
+    /// highest it has already verified for this identity, so a replayed older
+    /// signed blob cannot revert a key rotation.
+    #[prost(uint64, tag = "1")]
+    pub version: u64,
+    /// ML-KEM-1024 encapsulation key, exactly 1568 bytes. The public half of the
+    /// mnemonic-derived identity KEM keypair; only this half is new to the wire.
+    #[prost(bytes = "vec", tag = "2")]
+    pub kem_ek: ::prost::alloc::vec::Vec<u8>,
+    /// Whether this identity requires a grantee-bound one-time invite token on a
+    /// first-contact entry (admission option C). Advertised so a sender knows to
+    /// include one; the recipient enforces it regardless of what it advertised.
+    #[prost(bool, tag = "3")]
+    pub invite_only: bool,
+    /// ML-DSA-87 signature, exactly 4627 bytes, over the domain-separated
+    /// preimage of (identity pubkey, version, kem_ek, invite_only). Verified
+    /// against the identity pubkey the reader derived this record's address from —
+    /// never against anything carried in the record, which carries no pubkey
+    /// precisely so there is nothing to substitute.
+    #[prost(bytes = "vec", tag = "4")]
+    pub signature: ::prost::alloc::vec::Vec<u8>,
+}
+/// Which key an initiator encapsulated `ss0` to when opening a conversation.
+///
+/// Alpha always writes `KEY_SELECTOR_STATIC`. The enum exists so that
+/// re-introducing one-time PQ prekeys later is a no-wire-change addition rather
+/// than an additive proto bump: a future client could name a prekey and fall back
+/// to `STATIC` against an older peer. Prekeys were dropped for alpha (and are
+/// expected to stay dropped), which is why the opening burst before the
+/// recipient's first reply has no forward secrecy — see ISC-C45's hello-grade
+/// labeling requirement, which is the mitigation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum KeySelector {
+    /// Never written. Proto3 requires a zero default; treat it as `STATIC` on read
+    /// so an unset field from a future client is not silently a different key.
+    Unspecified = 0,
+    /// The recipient's long-term ML-KEM-1024 encapsulation key, published in
+    /// `DmKeyRecord.kem_ek`.
+    Static = 1,
+}
+impl KeySelector {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "KEY_SELECTOR_UNSPECIFIED",
+            Self::Static => "KEY_SELECTOR_STATIC",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "KEY_SELECTOR_UNSPECIFIED" => Some(Self::Unspecified),
+            "KEY_SELECTOR_STATIC" => Some(Self::Static),
+            _ => None,
+        }
+    }
+}
 /// A request for federation peers. An empty `target_server_id` requests the
 /// introducer's full (filtered) peer list; a populated `target_server_id`
 /// requests just that one peer's triple. Per ISC-A-S7 a by-id query for an

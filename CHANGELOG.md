@@ -36,6 +36,14 @@ work lives in the project lead's vault manifest, not here.
 
 ### Added
 
+- `daemonseed_core::dm` — direct-messaging core. The key record publishes an
+  identity's static ML-KEM-1024 encapsulation key at a `dflt(1)` Veilid record
+  whose owner is derived from the identity's ML-DSA-87 public key, so any holder
+  of that key computes the address. Sign/verify, a highest-verified-version-wins
+  rollback guard, the clock-derived first-contact epoch, and the
+  `daemonseed/dm/…` domain-label namespace. Wire: `DmKeyRecord` and the reserved
+  `KeySelector` enum (additive MINOR). (#232, ISC-C40)
+
 - Direct-messaging design-of-record **FROZEN** (`docs/design/direct-messaging.md`,
   DRAFT v6): hardened over 8 adversarial panel rounds (crypto/metadata/erasure)
   to a post-quantum double-ratchet DM over per-page scattered DHT records, a

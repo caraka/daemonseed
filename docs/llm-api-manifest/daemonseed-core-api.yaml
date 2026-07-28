@@ -712,6 +712,39 @@ modules:
       - A-C8
       - A-S2
 
+  - name: daemonseed_core::dm
+    description: >-
+      Direct messaging between two identities. Sub-module dm::keyrec publishes
+      and verifies an identity's static ML-KEM-1024 encapsulation key at a
+      dflt(1) Veilid record whose owner seed is HKDF-SHA384(salt=
+      daemonseed/dm/keyrec/salt/v1, ikm=identity ML-DSA-87 pubkey, info=
+      daemonseed/dm/keyrec/owner/v1) — world-derivable, so any holder of the
+      pubkey computes the address. build(signing, kem_ek, version, invite_only)
+      signs DmKeyRecord over daemonseed/dm/keyrec/sig/v1||lp(pubkey)||
+      lp(version_be)||lp(kem_ek)||lp(invite_only); verify(record,
+      identity_pubkey) exact-length-gates kem_ek (1568) and signature (4627)
+      BEFORE any ML-DSA call and verifies against the caller-supplied pubkey the
+      address was derived from — the record carries no pubkey. The record is
+      world-writable (a world-derivable address implies a world-derivable
+      owner), so forgery is impossible but erasure and rollback are not:
+      KeyRecordCache::accept keeps the highest verified version and returns
+      VersionRegression on an older one. fc_epoch(now_unix_secs) and
+      fc_epoch_is_current(offered, current) derive the first-contact anti-replay
+      epoch from the wall clock on both sides; it is published nowhere.
+      DmKeyRecordError separates Signing (local, carries the cause) from
+      Signature (verify-path, deliberately uniform — no oracle). Sub-module
+      dm::domain declares the daemonseed/dm/… label namespace, one distinct
+      prefix-free label per purpose.
+    no_std: false
+    depends_on:
+      - daemonseed_core::identity::keys
+      - daemonseed_core::secret_seed
+    iscs:
+      - C40
+      - A-C20
+      - A-C22
+      - A-C23
+
   - name: daemonseed_core::room_message
     description: >-
       The ONE signed room-message seal/open path shared by public rooms and
