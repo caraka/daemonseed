@@ -438,6 +438,34 @@ functions:
     returns:
       type: "Result<RecordKey>"
       description: The record's deterministic key.
+  - name: VeilidNetHandle::publish_dm_key_record
+    module: daemonseed_veilid_net::actor
+    description: Publish an identity's signed DM key record to subkey 0 of its dflt(1) record (ISC-C40). Bytes are opaque here — the caller signs with daemonseed_core::dm::keyrec::build and derives owner_seed with derive_owner_seed. Enqueued on the WB-3 funnel as a Keepalive-class coalescible current-state write, so slow anti-eviction re-seeds collapse to at most one queued write per record. The record is world-writable (a world-derivable address implies a world-derivable owner), so anyone can overwrite or erase it; forgery is impossible because the signature inside is verified against the address's own identity key, leaving erasure and rollback as denial-of-service only.
+    signature: "pub async fn publish_dm_key_record(&self, owner_seed: [u8; 32], record: Vec<u8>) -> Result<()>"
+    parameters:
+      - name: owner_seed
+        type: "[u8; 32]"
+        direction: in
+        description: The key record's owner seed, from daemonseed_core::dm::keyrec::derive_owner_seed over the identity's ML-DSA-87 public key.
+      - name: record
+        type: "Vec<u8>"
+        direction: in
+        description: The prost-encoded, already-signed DmKeyRecord.
+    returns:
+      type: "Result<()>"
+      description: Ok once the scheduler has dispatched the write.
+  - name: VeilidNetHandle::fetch_dm_key_record
+    module: daemonseed_veilid_net::actor
+    description: Fetch a correspondent's DM key record from subkey 0 of its dflt(1) record. Ok(None) is an empty slot — evicted, wiped, or never published — and is the caller's awaiting-key state, deliberately distinct from Err (a transport failure); conflating them would make an attacker's wipe indistinguishable from a network problem. The bytes are UNVERIFIED — only daemonseed_core::dm::keyrec::verify may decide a record is genuine, and it needs the identity public key this layer does not hold. One gated GET on the read lane; no write funnel involvement (WB-3 I9).
+    signature: "pub async fn fetch_dm_key_record(&self, owner_seed: [u8; 32]) -> Result<Option<Vec<u8>>>"
+    parameters:
+      - name: owner_seed
+        type: "[u8; 32]"
+        direction: in
+        description: The correspondent's key-record owner seed, derived from their ML-DSA-87 public key.
+    returns:
+      type: "Result<Option<Vec<u8>>>"
+      description: The unverified prost-encoded DmKeyRecord bytes, or None for an empty slot.
   - name: VeilidNetHandle::publish_presence
     module: daemonseed_veilid_net::actor
     description: Publish a sealed member-presence beacon to a per-member current-state slot on the presence sibling rendezvous record; a re-beacon overwrites the same slot (last-writer-wins). The presence record is distinct from the chat rendezvous, so a beacon never evicts chat backlog. member_pubkey owns the stable-slot-id encoding (member_slot_id, hex) so all callers agree. The slot count is bounded (SUBKEY_COUNT), so at unbounded membership two members can slot-share (a bounded, self-healing degradation). The app net actor holds the keys and runs the emit/ingest/reap loop; a receiver subscribes via subscribe_room on the same presence owner seed.

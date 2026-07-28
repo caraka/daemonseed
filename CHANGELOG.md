@@ -36,6 +36,13 @@ work lives in the project lead's vault manifest, not here.
 
 ### Added
 
+- DM key-record transport: `VeilidNetHandle::publish_dm_key_record` enqueues the
+  signed record on the WB-3 funnel as a coalescible `Keepalive` write to subkey 0
+  of its `dflt(1)` record; `fetch_dm_key_record` reads it back off the actor loop,
+  returning `Ok(None)` for an empty slot distinctly from a transport error. Bytes
+  stay opaque to the transport — verification needs the identity key only the
+  caller holds. (#232, ISC-C40)
+
 - `daemonseed_core::dm` — direct-messaging core. The key record publishes an
   identity's static ML-KEM-1024 encapsulation key at a `dflt(1)` Veilid record
   whose owner is derived from the identity's ML-DSA-87 public key, so any holder

@@ -192,6 +192,30 @@ enum Command {
         owner_seed: [u8; 32],
         reply: oneshot::Sender<Result<RecordKey>>,
     },
+    // ── Direct messaging (#232) ──
+    /// Publish this identity's DM key record — its static ML-KEM-1024 encapsulation
+    /// key — to subkey 0 of the `dflt(1)` record at `owner_seed`
+    /// (`daemonseed_core::dm::keyrec::derive_owner_seed`). `record` is the already
+    /// signed, prost-encoded `DmKeyRecord`; this layer moves opaque bytes and never
+    /// inspects them. Rides the WB-3 funnel as a coalescible `Keepalive`
+    /// current-state write: the publish is presence-independent, and a re-seed
+    /// against eviction supersedes any queued earlier one for the same record.
+    PublishDmKeyRecord {
+        owner_seed: [u8; 32],
+        record: Vec<u8>,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    /// Fetch a correspondent's DM key record from subkey 0 of the `dflt(1)` record
+    /// at `owner_seed`. `Ok(None)` means the slot is empty — evicted, wiped, or
+    /// never published — which the caller surfaces as *awaiting-key* and retries;
+    /// it is deliberately distinct from a transport error. The bytes are returned
+    /// unverified: `daemonseed_core::dm::keyrec::verify` is the only thing that may
+    /// decide a record is genuine, and it needs the identity pubkey this layer does
+    /// not hold.
+    FetchDmKeyRecord {
+        owner_seed: [u8; 32],
+        reply: oneshot::Sender<Result<Option<Vec<u8>>>>,
+    },
     // ── Public-share content (Phase 3) ──
     /// Register an indexed share to serve owner-on-demand (`share_id` → content
     /// + the `PublicRoomKey` bytes responses seal under).
@@ -436,6 +460,34 @@ impl VeilidNetHandle {
     /// to the seed [`Self::repair_rendezvous`] needs (§RS-1.2).
     pub async fn rendezvous_record_key(&self, owner_seed: [u8; 32]) -> Result<RecordKey> {
         self.send(|reply| Command::RendezvousKey { owner_seed, reply })
+            .await?
+    }
+
+    // ── Direct messaging (#232) ──
+
+    /// Publish this identity's signed DM key record (ISC-C40). `record` is the
+    /// prost-encoded `DmKeyRecord`; the caller signs it with
+    /// `daemonseed_core::dm::keyrec::build` and derives `owner_seed` with
+    /// `derive_owner_seed`. Enqueued as a coalescible `Keepalive` write, so
+    /// re-seeding on the slow anti-eviction schedule costs at most one queued
+    /// write per record no matter how often it is called.
+    pub async fn publish_dm_key_record(&self, owner_seed: [u8; 32], record: Vec<u8>) -> Result<()> {
+        self.send(|reply| Command::PublishDmKeyRecord {
+            owner_seed,
+            record,
+            reply,
+        })
+        .await?
+    }
+
+    /// Fetch a correspondent's DM key record. `Ok(None)` is an empty slot —
+    /// evicted, wiped by anyone (the record is world-writable), or never
+    /// published — and is the caller's *awaiting-key* state, distinct from a
+    /// transport failure. The bytes are UNVERIFIED; pass them to
+    /// `daemonseed_core::dm::keyrec::verify` with the identity pubkey the address
+    /// was derived from before trusting anything in them.
+    pub async fn fetch_dm_key_record(&self, owner_seed: [u8; 32]) -> Result<Option<Vec<u8>>> {
+        self.send(|reply| Command::FetchDmKeyRecord { owner_seed, reply })
             .await?
     }
 
@@ -993,6 +1045,56 @@ async fn actor_loop(
                     reply: Some(reply),
                 });
             }
+            Command::PublishDmKeyRecord {
+                owner_seed,
+                record,
+                reply,
+            } => {
+                // Class-4 Keepalive, coalescible last-writer-wins (WB-3 I1/I3,
+                // `docs/design/direct-messaging.md` § Fork 4 — "key-record keep-alive"
+                // is named there as a Keepalive-class writer). Coalescing is the point:
+                // the record is re-seeded against eviction on a slow schedule, and a
+                // newer re-seed always supersedes a queued older one for the same
+                // record. The logical id is a constant because there is exactly one
+                // key record per owner seed, so the coalescing key `(record, id)`
+                // collapses to the record — which is the intended behaviour.
+                sched.enqueue(WriteRequest {
+                    record: owner_seed,
+                    class: WriteClass::Keepalive,
+                    kind: WriteKind::CurrentState {
+                        logical_id: "dm-keyrec".to_string(),
+                    },
+                    deadline: None,
+                    item: ProdWrite::DmKeyRecord { owner_seed, record },
+                    reply: Some(reply),
+                });
+            }
+            Command::FetchDmKeyRecord { owner_seed, reply } => {
+                // A read, so it never touches the write funnel (I9: no read-triggered
+                // writes).
+                //
+                // SPAWNED, never awaited inline (D-0b / #128, CRSH-ISC-22). The GET
+                // itself is one subkey, but it is preceded by an `open_or_create` that
+                // costs ~6-10 s live-measured on a cold cache — and the caller fetches
+                // one key record PER correspondent, so a cold start walks C serial
+                // opens (`docs/design/direct-messaging.md` § Decision #4 prices C=20 at
+                // ~2-3 minutes). Awaiting that on the command loop would park every
+                // other command behind it for minutes: the exact #154 failure mode the
+                // off-loop dispatch rule exists to prevent. The `oneshot` reply is
+                // moved into the task, so the caller still gets exactly one answer.
+                let gate = dht_gate.clone();
+                let api = api.clone();
+                let rc = rc.clone();
+                let opened = opened.clone();
+                let record_locks = record_locks.clone();
+                tokio::spawn(async move {
+                    let r =
+                        fetch_dm_key_record(&gate, &api, &rc, &opened, &record_locks, owner_seed)
+                            .await;
+                    // A dropped receiver (caller gave up / shutting down) is benign.
+                    let _ = reply.send(r);
+                });
+            }
             Command::SubscribeRendezvous { owner_seed, reply } => {
                 let _ = reply.send(
                     subscribe_rendezvous(
@@ -1537,6 +1639,14 @@ enum ProdWrite {
         stable_id: String,
         sealed: Vec<u8>,
     },
+    /// A DM key-record write → [`publish_dm_key_record`]. Its own variant rather
+    /// than a `CurrentState` because the record has a different SHAPE (`dflt(1)`,
+    /// not `dflt(64)`) and a fixed slot, and shape is part of the record address —
+    /// routing it through the `dflt(64)` path would address a different record.
+    DmKeyRecord {
+        owner_seed: [u8; 32],
+        record: Vec<u8>,
+    },
 }
 
 /// The production [`WriteSink`] (WB-3.I1): the funnel's dispatch end. Holds the same
@@ -1617,6 +1727,18 @@ impl WriteSink for ProductionSink {
                     )
                     .await
                 }
+                ProdWrite::DmKeyRecord { owner_seed, record } => {
+                    publish_dm_key_record(
+                        &gate,
+                        &api,
+                        &rc,
+                        &opened,
+                        &record_locks,
+                        owner_seed,
+                        record,
+                    )
+                    .await
+                }
             };
             drop(permit);
             DispatchOutcome {
@@ -1624,6 +1746,104 @@ impl WriteSink for ProductionSink {
                 acquire_wait,
             }
         })
+    }
+}
+
+/// The DM key record's schema: `dflt(1)`, one slot, the full 32 KiB per-subkey cap.
+/// Part of the record ADDRESS — every participant must derive with this shape or
+/// they compute a different record (`docs/design/direct-messaging.md` DRAFT v6).
+const DM_KEY_RECORD_SHAPE: rendezvous::RecordShape = rendezvous::RecordShape::new(1);
+
+/// The only slot in the key record.
+const DM_KEY_RECORD_SUBKEY: u32 = 0;
+
+/// Publish a signed DM key record to subkey 0 of its `dflt(1)` record (ISC-C40).
+///
+/// `record` is opaque here: this layer never parses or verifies it. Verification
+/// needs the identity public key the address was derived from, which only the
+/// caller holds, and putting a second verification point here would create a
+/// second place for the rule to drift.
+///
+/// The record is world-writable by construction (a world-derivable address implies
+/// a world-derivable owner), so this write can be overwritten or erased by anyone.
+/// That is the accepted, DoS-only residual — forgery is impossible because the
+/// signature inside is checked against the address's own identity key — and it is
+/// why the caller re-seeds on a slow schedule.
+async fn publish_dm_key_record(
+    gate: &Arc<DhtGate>,
+    api: &VeilidAPI,
+    rc: &RoutingContext,
+    opened: &rendezvous::OpenCache,
+    record_locks: &rendezvous::RecordLocks,
+    owner_seed: [u8; 32],
+    record: Vec<u8>,
+) -> Result<()> {
+    let owner = identity::rendezvous_owner_keypair(&owner_seed)?;
+    // Single-flight the open and serialize against any concurrent op on this record,
+    // exactly as the rendezvous write paths do (CRSH-ISC-3).
+    let record_lock = rendezvous::record_lock(record_locks, &owner_seed);
+    let _write_guard = record_lock.lock().await;
+    let handle = rendezvous::open_cached(
+        opened,
+        &rendezvous::cached_record_id(&owner_seed, DM_KEY_RECORD_SHAPE),
+        rendezvous::open_or_create(gate, api, rc, &owner, DM_KEY_RECORD_SHAPE),
+    )
+    .await?;
+    crate::vtrace!(
+        "publish_dm_key_record: key={:?} bytes={}",
+        handle.key(),
+        record.len()
+    );
+    rendezvous::publish_at_subkey(rc, &handle, &owner, DM_KEY_RECORD_SUBKEY, record).await
+}
+
+/// Fetch a correspondent's DM key record from subkey 0 of its `dflt(1)` record.
+///
+/// Returns `Ok(None)` for an empty slot — evicted, wiped, or never published —
+/// which is a real and expected state for a world-writable record, and which the
+/// caller surfaces as *awaiting-key* and retries. It is deliberately distinct from
+/// `Err`, a transport failure: conflating them would make an attacker's wipe look
+/// like a network problem and vice versa.
+///
+/// The bytes come back UNVERIFIED. Only `daemonseed_core::dm::keyrec::verify` may
+/// decide a record is genuine, and it needs the identity pubkey this layer does
+/// not have.
+async fn fetch_dm_key_record(
+    gate: &Arc<DhtGate>,
+    api: &VeilidAPI,
+    rc: &RoutingContext,
+    opened: &rendezvous::OpenCache,
+    record_locks: &rendezvous::RecordLocks,
+    owner_seed: [u8; 32],
+) -> Result<Option<Vec<u8>>> {
+    let owner = identity::rendezvous_owner_keypair(&owner_seed)?;
+    // The open is serialized under the record lock; the GET is NOT, so a slow read
+    // never blocks a concurrent write to the same record. The lock guard is dropped
+    // before the read permit is acquired, which also keeps the single-permit rule
+    // (CRSH-ISC-17): no un-gated-op permit is held while acquiring a read permit.
+    let handle = {
+        let record_lock = rendezvous::record_lock(record_locks, &owner_seed);
+        let _open_guard = record_lock.lock().await;
+        rendezvous::open_cached(
+            opened,
+            &rendezvous::cached_record_id(&owner_seed, DM_KEY_RECORD_SHAPE),
+            rendezvous::open_or_create(gate, api, rc, &owner, DM_KEY_RECORD_SHAPE),
+        )
+        .await?
+    };
+    // Read lane (WB-5.1 / I5″.2): one read permit around the one GET.
+    let got = {
+        let _read_permit = gate.acquire_read().await;
+        rc.get_dht_value(handle.key().clone(), DM_KEY_RECORD_SUBKEY, true)
+            .await
+    };
+    match got {
+        Ok(Some(v)) => Ok(Some(v.data().to_vec())),
+        Ok(None) => {
+            crate::vtrace!("fetch_dm_key_record: slot empty (evicted, wiped, or never published)");
+            Ok(None)
+        }
+        Err(e) => Err(VeilidNetError::Routing(e.to_string())),
     }
 }
 
@@ -2314,5 +2534,35 @@ mod tests {
                 "concurrent replies are the tighter bound"
             );
         }
+    }
+
+    /// **Record kind → shape.** Now that more than one shape is live, a write site
+    /// that picked the wrong constant would address a *different record* and fail
+    /// silently, so the mapping is pinned rather than left to review. This is the
+    /// table the #232 review asked for once heterogeneous shapes existed.
+    #[test]
+    fn each_record_kind_uses_its_designed_shape() {
+        // Chat / lobby / rooms / share discovery — unchanged by the DM work.
+        assert_eq!(rendezvous::RecordShape::RENDEZVOUS.o_cnt(), 64);
+        assert_eq!(rendezvous::RecordShape::RENDEZVOUS.max_value_len(), 16384);
+
+        // The DM key record: one slot, full 32 KiB cap. A ~6.2 KiB signed record
+        // fits with ample headroom (`docs/design/direct-messaging.md` DRAFT v6).
+        assert_eq!(DM_KEY_RECORD_SHAPE.o_cnt(), 1);
+        assert_eq!(DM_KEY_RECORD_SHAPE.max_value_len(), 32768);
+        assert_eq!(DM_KEY_RECORD_SUBKEY, 0);
+        assert!(DM_KEY_RECORD_SUBKEY < u32::from(DM_KEY_RECORD_SHAPE.o_cnt()));
+
+        // The two shapes must stay distinct: sharing an owner seed across them
+        // would otherwise collapse in the open-cache.
+        assert_ne!(
+            rendezvous::RecordShape::RENDEZVOUS.o_cnt(),
+            DM_KEY_RECORD_SHAPE.o_cnt()
+        );
+        let seed = [3u8; 32];
+        assert_ne!(
+            rendezvous::cached_record_id(&seed, rendezvous::RecordShape::RENDEZVOUS),
+            rendezvous::cached_record_id(&seed, DM_KEY_RECORD_SHAPE)
+        );
     }
 }
