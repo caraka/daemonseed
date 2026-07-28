@@ -33,7 +33,8 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 use veilid_core::{
-    DHTSchema, KeyPair, RecordKey, RoutingContext, SetDHTValueOptions, VeilidAPI, CRYPTO_KIND_VLD0,
+    DHTSchema, KeyPair, PublicKey, RecordKey, RoutingContext, SetDHTValueOptions, VeilidAPI,
+    CRYPTO_KIND_VLD0,
 };
 
 use crate::dht_gate::DhtGate;
@@ -200,11 +201,29 @@ impl RendezvousHandle {
 /// catch. The pairing is not reachable today (every DM surface derives its owner
 /// seed under a distinct HKDF domain), which is precisely why it is worth closing
 /// now, while it is still theoretical.
-pub type CachedRecordId = ([u8; 32], u16);
+/// The seed half is a **digest of** the owner seed, never the seed itself (#244).
+/// Every record that existed when these caches were written had a world-derivable
+/// owner seed, so holding one cost nothing. A DM channel page is the first
+/// exception: its seed derives from the conversation secret `AR`, and under Veilid
+/// a derivable owner seed **is** write access to the conversation. Copying that
+/// into a process-lifetime, `Debug`-printable map key is exactly what
+/// `redacted_secret_newtype::as_bytes` forbids, and it would undo the
+/// zeroize-on-drop hygiene `DmPageOwnerSeed` carries. Hashing costs one SHA-384
+/// per open — nothing against a DHT round trip — and removes the class outright
+/// rather than threading a zeroizing type through every caller of the engine.
+pub type CachedRecordId = (PublicKey, u16);
 
-/// The cache/lock id for `owner_seed` at `shape`.
-pub fn cached_record_id(owner_seed: &[u8; 32], shape: RecordShape) -> CachedRecordId {
-    (*owner_seed, shape.o_cnt())
+/// The cache/lock id for a record owned by `owner`, at `shape`.
+///
+/// Keyed on the owner's PUBLIC key, not the seed it was derived from. The public
+/// key identifies the record at least as precisely — it is what
+/// [`rendezvous_key`] derives the DHT address from, so two seeds sharing a public
+/// key would be one record anyway — and it is public by nature, being the
+/// record's identity on the network. It is also already a one-way function of the
+/// seed, so no hashing step is needed and there is no fallible crypto call on the
+/// open path.
+pub fn cached_record_id(owner: &KeyPair, shape: RecordShape) -> CachedRecordId {
+    (owner.key().clone(), shape.o_cnt())
 }
 
 /// Distinct member regions; a member maps to one by hashing its node pubkey.
@@ -369,19 +388,21 @@ pub async fn open_cached<I: Eq + std::hash::Hash + Clone, K: Clone>(
 /// to one record never blocks another's traffic or the actor command loop. See ISA
 /// Decisions (2026-07-07, #128 xhigh review).
 ///
-/// **Deliberately keyed on the seed alone, unlike [`OpenCache`].** Where the open
-/// cache MUST distinguish shapes (returning a key derived for the wrong `o_cnt`
-/// would write to the wrong record), this lock only decides what serializes
-/// against what. Two differently-shaped records sharing an owner seed would share
-/// one lock — over-serializing, never under-serializing — so the seed-only key is
-/// the conservative choice and keeps the CRSH-ISC-3/18 lock-span invariants
-/// exactly as they were verified.
-pub type RecordLocks = Mutex<HashMap<[u8; 32], Arc<tokio::sync::Mutex<()>>>>;
+/// **Deliberately keyed on the seed's digest alone, unlike [`OpenCache`].** Where
+/// the open cache MUST distinguish shapes (returning a key derived for the wrong
+/// `o_cnt` would write to the wrong record), this lock only decides what
+/// serializes against what. Two differently-shaped records sharing an owner seed
+/// would share one lock — over-serializing, never under-serializing — so the
+/// seed-only key is the conservative choice and keeps the CRSH-ISC-3/18 lock-span
+/// invariants exactly as they were verified. It holds the owner's PUBLIC key
+/// rather than the seed, for the reason [`CachedRecordId`] gives (#244): a lock
+/// identity needs to tell records apart, not to carry write capability.
+pub type RecordLocks = Mutex<HashMap<PublicKey, Arc<tokio::sync::Mutex<()>>>>;
 
-/// The serialization lock for `owner_seed`, creating it on first use. The returned
+/// The serialization lock for the record owned by `owner`, creating it on first use. The returned
 /// `Arc` is `.lock().await`-ed by the caller; the brief `std::sync::Mutex` guard on
 /// the map itself is never held across an await.
-pub fn record_lock(locks: &RecordLocks, owner_seed: &[u8; 32]) -> Arc<tokio::sync::Mutex<()>> {
+pub fn record_lock(locks: &RecordLocks, owner: &KeyPair) -> Arc<tokio::sync::Mutex<()>> {
     // Poison-recovery idiom (WB-5.1 / I5″.8, mirroring `ring_seq`): the guarded state
     // is a map of per-record lock handles whose invariants survive an unwind; a
     // poisoned-mutex cascade wedging every subsequent record open is the #168 failure
@@ -389,7 +410,7 @@ pub fn record_lock(locks: &RecordLocks, owner_seed: &[u8; 32]) -> Arc<tokio::syn
     locks
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .entry(*owner_seed)
+        .entry(owner.key().clone())
         .or_default()
         .clone()
 }
@@ -875,15 +896,58 @@ mod tests {
     /// reads the shape back off the handle instead of re-supplying it — the
     /// derive/use mismatch the type exists to prevent.
     #[test]
-    fn cached_record_id_separates_the_same_seed_under_different_shapes() {
-        let seed = [7u8; 32];
-        let as_rendezvous = cached_record_id(&seed, RecordShape::RENDEZVOUS);
-        let as_doorbell = cached_record_id(&seed, RecordShape::new(32));
+    fn cached_record_id_separates_the_same_owner_under_different_shapes() {
+        let owner = crate::identity::rendezvous_owner_keypair(&[7u8; 32]).unwrap();
+        let as_rendezvous = cached_record_id(&owner, RecordShape::RENDEZVOUS);
+        let as_doorbell = cached_record_id(&owner, RecordShape::new(32));
         assert_ne!(
             as_rendezvous, as_doorbell,
-            "one seed under two shapes is two records — the cache must not conflate them"
+            "one owner under two shapes is two records — the cache must not conflate them"
         );
-        assert_eq!(as_rendezvous, cached_record_id(&seed, RecordShape::new(64)));
+        assert_eq!(
+            as_rendezvous,
+            cached_record_id(&owner, RecordShape::new(64))
+        );
+    }
+
+    /// The cache and lock identities must not carry the owner SEED (#244).
+    ///
+    /// Every record that existed when these caches were written had a
+    /// world-derivable seed, so holding one cost nothing. A DM channel page is the
+    /// first whose seed is the conversation secret, and under Veilid a derivable
+    /// owner seed IS write access — so a process-lifetime map holding one would
+    /// hand out the conversation. Keyed on the owner's public key instead, which
+    /// identifies the record just as precisely and is public by construction.
+    #[test]
+    fn cache_and_lock_identities_never_carry_the_owner_seed() {
+        let seed = [0xABu8; 32];
+        let owner = crate::identity::rendezvous_owner_keypair(&seed).unwrap();
+
+        let id = cached_record_id(&owner, RecordShape::RENDEZVOUS);
+        let id_bytes: Vec<u8> = id.0.value().as_ref().to_vec();
+        assert_ne!(
+            id_bytes.as_slice(),
+            &seed[..],
+            "the id must not BE the seed"
+        );
+        assert!(
+            !id_bytes.windows(seed.len()).any(|w| w == seed),
+            "the seed must not appear anywhere in the cache identity"
+        );
+
+        // And the lock map keys on the same public value.
+        let locks = RecordLocks::default();
+        let a = record_lock(&locks, &owner);
+        let b = record_lock(&locks, &owner);
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "the same owner must resolve to the same lock"
+        );
+        let other = crate::identity::rendezvous_owner_keypair(&[0xCDu8; 32]).unwrap();
+        assert!(
+            !Arc::ptr_eq(&a, &record_lock(&locks, &other)),
+            "distinct owners must not share a lock"
+        );
     }
 
     /// The three shapes the frozen DM design names (`docs/design/direct-messaging.md`
@@ -991,15 +1055,17 @@ mod tests {
     }
 
     #[test]
-    fn record_lock_is_per_seed_same_shares_distinct_separate() {
-        // Same owner seed → the SAME lock (same-record ops serialize); distinct
-        // seeds → distinct locks (different records run concurrently).
+    fn record_lock_is_per_owner_same_shares_distinct_separate() {
+        // Same owner → the SAME lock (same-record ops serialize); distinct owners
+        // → distinct locks (different records run concurrently).
         let locks: RecordLocks = Mutex::new(HashMap::new());
-        let a = record_lock(&locks, &[1u8; 32]);
-        let a2 = record_lock(&locks, &[1u8; 32]);
-        let b = record_lock(&locks, &[2u8; 32]);
-        assert!(Arc::ptr_eq(&a, &a2), "same seed reuses one lock");
-        assert!(!Arc::ptr_eq(&a, &b), "distinct seeds get distinct locks");
+        let one = crate::identity::rendezvous_owner_keypair(&[1u8; 32]).unwrap();
+        let two = crate::identity::rendezvous_owner_keypair(&[2u8; 32]).unwrap();
+        let a = record_lock(&locks, &one);
+        let a2 = record_lock(&locks, &one);
+        let b = record_lock(&locks, &two);
+        assert!(Arc::ptr_eq(&a, &a2), "same owner reuses one lock");
+        assert!(!Arc::ptr_eq(&a, &b), "distinct owners get distinct locks");
     }
 
     #[tokio::test]
@@ -1011,13 +1077,14 @@ mod tests {
         // between — the exact race that lets an older ring write land after a newer.
         let locks: Arc<RecordLocks> = Arc::new(Mutex::new(HashMap::new()));
         let log: Arc<Mutex<Vec<(u32, char)>>> = Arc::new(Mutex::new(Vec::new()));
-        let seed = [9u8; 32];
+        let owner = crate::identity::rendezvous_owner_keypair(&[9u8; 32]).unwrap();
         let mut handles = Vec::new();
         for i in 0..8u32 {
             let locks = locks.clone();
             let log = log.clone();
+            let owner = owner.clone();
             handles.push(tokio::spawn(async move {
-                let lock = record_lock(&locks, &seed);
+                let lock = record_lock(&locks, &owner);
                 let _guard = lock.lock().await;
                 log.lock().unwrap().push((i, 's'));
                 tokio::task::yield_now().await;

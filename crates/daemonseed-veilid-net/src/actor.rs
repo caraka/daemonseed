@@ -1550,11 +1550,11 @@ async fn publish_rendezvous(
     // for a later ring seq must not race an earlier one into the shared 2-slot ring
     // and lose the newer message (#128 xhigh review). Distinct records take distinct
     // locks and stay concurrent, so this never blocks another record or the loop.
-    let record_lock = rendezvous::record_lock(record_locks, &owner_seed);
+    let record_lock = rendezvous::record_lock(record_locks, &owner);
     let _write_guard = record_lock.lock().await;
     let handle = rendezvous::open_cached(
         opened,
-        &rendezvous::cached_record_id(&owner_seed, rendezvous::RecordShape::RENDEZVOUS),
+        &rendezvous::cached_record_id(&owner, rendezvous::RecordShape::RENDEZVOUS),
         rendezvous::open_or_create(gate, api, rc, &owner, rendezvous::RecordShape::RENDEZVOUS),
     )
     .await?;
@@ -1606,11 +1606,11 @@ async fn publish_current_state(
     let owner = identity::rendezvous_owner_keypair(&owner_seed)?;
     // Single-flight the record open and serialize the write against concurrent
     // same-record ops (chat publishes, other adverts) — see rendezvous::record_lock.
-    let record_lock = rendezvous::record_lock(record_locks, &owner_seed);
+    let record_lock = rendezvous::record_lock(record_locks, &owner);
     let _write_guard = record_lock.lock().await;
     let handle = rendezvous::open_cached(
         opened,
-        &rendezvous::cached_record_id(&owner_seed, rendezvous::RecordShape::RENDEZVOUS),
+        &rendezvous::cached_record_id(&owner, rendezvous::RecordShape::RENDEZVOUS),
         rendezvous::open_or_create(gate, api, rc, &owner, rendezvous::RecordShape::RENDEZVOUS),
     )
     .await?;
@@ -1781,11 +1781,11 @@ async fn publish_dm_key_record(
     let owner = identity::rendezvous_owner_keypair(&owner_seed)?;
     // Single-flight the open and serialize against any concurrent op on this record,
     // exactly as the rendezvous write paths do (CRSH-ISC-3).
-    let record_lock = rendezvous::record_lock(record_locks, &owner_seed);
+    let record_lock = rendezvous::record_lock(record_locks, &owner);
     let _write_guard = record_lock.lock().await;
     let handle = rendezvous::open_cached(
         opened,
-        &rendezvous::cached_record_id(&owner_seed, DM_KEY_RECORD_SHAPE),
+        &rendezvous::cached_record_id(&owner, DM_KEY_RECORD_SHAPE),
         rendezvous::open_or_create(gate, api, rc, &owner, DM_KEY_RECORD_SHAPE),
     )
     .await?;
@@ -1822,11 +1822,11 @@ async fn fetch_dm_key_record(
     // before the read permit is acquired, which also keeps the single-permit rule
     // (CRSH-ISC-17): no un-gated-op permit is held while acquiring a read permit.
     let handle = {
-        let record_lock = rendezvous::record_lock(record_locks, &owner_seed);
+        let record_lock = rendezvous::record_lock(record_locks, &owner);
         let _open_guard = record_lock.lock().await;
         rendezvous::open_cached(
             opened,
-            &rendezvous::cached_record_id(&owner_seed, DM_KEY_RECORD_SHAPE),
+            &rendezvous::cached_record_id(&owner, DM_KEY_RECORD_SHAPE),
             rendezvous::open_or_create(gate, api, rc, &owner, DM_KEY_RECORD_SHAPE),
         )
         .await?
@@ -1864,11 +1864,11 @@ async fn subscribe_rendezvous(
     // Single-flight the open against a concurrent same-record publish; the guard is
     // dropped before the watch registers (only the open needs serialization).
     let handle = {
-        let record_lock = rendezvous::record_lock(record_locks, &owner_seed);
+        let record_lock = rendezvous::record_lock(record_locks, &owner);
         let _open_guard = record_lock.lock().await;
         rendezvous::open_cached(
             opened,
-            &rendezvous::cached_record_id(&owner_seed, rendezvous::RecordShape::RENDEZVOUS),
+            &rendezvous::cached_record_id(&owner, rendezvous::RecordShape::RENDEZVOUS),
             rendezvous::open_or_create(gate, api, rc, &owner, rendezvous::RecordShape::RENDEZVOUS),
         )
         .await?
@@ -1935,11 +1935,11 @@ async fn resweep_rendezvous(
     // Single-flight the open against a concurrent same-record publish (mirrors
     // subscribe_rendezvous); no watch is registered here.
     let handle = {
-        let record_lock = rendezvous::record_lock(record_locks, &owner_seed);
+        let record_lock = rendezvous::record_lock(record_locks, &owner);
         let _open_guard = record_lock.lock().await;
         rendezvous::open_cached(
             opened,
-            &rendezvous::cached_record_id(&owner_seed, rendezvous::RecordShape::RENDEZVOUS),
+            &rendezvous::cached_record_id(&owner, rendezvous::RecordShape::RENDEZVOUS),
             rendezvous::open_or_create(gate, api, rc, &owner, rendezvous::RecordShape::RENDEZVOUS),
         )
         .await?
@@ -1975,11 +1975,11 @@ async fn repair_rendezvous(
 ) -> Result<()> {
     crate::vtrace!("repair_rendezvous: re-establishing dead record session");
     let owner = identity::rendezvous_owner_keypair(&owner_seed)?;
-    let record_lock = rendezvous::record_lock(record_locks, &owner_seed);
+    let record_lock = rendezvous::record_lock(record_locks, &owner);
     let outcome = rendezvous::repair_gated(
         &record_lock,
         opened,
-        &rendezvous::cached_record_id(&owner_seed, rendezvous::RecordShape::RENDEZVOUS),
+        &rendezvous::cached_record_id(&owner, rendezvous::RecordShape::RENDEZVOUS),
         rendezvous::REPAIR_CLOSE_FIRST,
         // close (repro-gated): best-effort — a close on a session veilid already GC'd is a
         // benign race (Evidence 3 sibling), so the error is swallowed.
@@ -2559,10 +2559,10 @@ mod tests {
             rendezvous::RecordShape::RENDEZVOUS.o_cnt(),
             DM_KEY_RECORD_SHAPE.o_cnt()
         );
-        let seed = [3u8; 32];
+        let owner = crate::identity::rendezvous_owner_keypair(&[3u8; 32]).unwrap();
         assert_ne!(
-            rendezvous::cached_record_id(&seed, rendezvous::RecordShape::RENDEZVOUS),
-            rendezvous::cached_record_id(&seed, DM_KEY_RECORD_SHAPE)
+            rendezvous::cached_record_id(&owner, rendezvous::RecordShape::RENDEZVOUS),
+            rendezvous::cached_record_id(&owner, DM_KEY_RECORD_SHAPE)
         );
     }
 }

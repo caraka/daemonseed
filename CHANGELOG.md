@@ -26,6 +26,14 @@ work lives in the project lead's vault manifest, not here.
 
 ### Fixed
 
+- The rendezvous open-cache and per-record locks key on the owner's PUBLIC key
+  rather than the owner seed. Every record that existed when those caches were
+  written had a world-derivable seed, so holding one cost nothing; a DM channel
+  page is the first whose seed is the conversation secret, and under Veilid a
+  derivable owner seed *is* write access to the conversation. The public key
+  identifies a record at least as precisely — it is what the DHT address derives
+  from — and is public by construction. (#244)
+
 - `FirstContactState` zeroizes `ss0` on drop and carries its opening ratchet
   decapsulation key as `ratchet::EphemeralDecapKey`, which zeroizes on drop; it
   was a bare `Box<[u8; DK_LEN]>` with no wrapper. (#234, #135)
