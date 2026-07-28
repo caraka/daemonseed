@@ -26,6 +26,11 @@ work lives in the project lead's vault manifest, not here.
 
 ### Fixed
 
+- `dm::firstcontact::derive_channel_roots` zeroizes its transient buffers on
+  every path and `ChannelRoots` is zeroize-on-drop: `[u8; N]` is `Copy` with no
+  `Drop`, so the originals were staying live in the stack frame after the struct
+  took its copies. (#234, #135)
+
 - The DFLT subkey write guard is schema-derived (`RecordShape`): the cap is
   `min(MAX_SUBKEY_SIZE, MAX_RECORD_DATA_SIZE / o_cnt)`, the bound `veilid-core`
   enforces. The rendezvous engine derives a record's key from its shape and
@@ -35,6 +40,27 @@ work lives in the project lead's vault manifest, not here.
   (#232, ISC-C100)
 
 ### Added
+
+- DM ratchet key schedule — `daemonseed_core::dm::ratchet` (`derive_root`,
+  `advance_root`, `chain_key`, `chain_step`, `skip`, `SkippedKeys`, `KeySlot`,
+  `Direction`, `Role`, and the `RootKey` / `ChainKey` / `MessageKey` newtypes).
+  `RK0` is a third sibling of the `ss0` extraction that yields `AR` and `chan_id`;
+  a generation step extracts under the previous root as salt with the freshly
+  encapsulated secret as IKM. Each direction derives its own chain key; `MK` and
+  the successor `CK` are siblings of one extraction. `advance_root` and
+  `chain_step` take their key by value, so a stepped key cannot be retained.
+  `skip` returns each derived key tagged with its `KeySlot` and refuses a request
+  past `MAX_SKIP` (64) rather than truncating. `SkippedKeys` holds
+  `SKIPPED_KEY_CAPACITY` (2 × `MAX_SKIP`, so one generation change cannot evict
+  the previous chain's tail), is insertion-ordered, replaces rather than
+  duplicates an occupied slot, and counts evictions. `Role` maps an end of the
+  conversation onto its send and receive directions. `Direction::label` is the
+  sole definition of the `a2b` / `b2a` wire literals. Every derivation zeroizes
+  its transient buffer on both paths. The generation state machine, page
+  addressing and the wire frame are not wired yet. (#234, ISC-C42)
+
+- Domain labels `DM_RATCHET_ROOT`, `DM_RATCHET_STEP`, `DM_CHAIN_SALT`,
+  `DM_CHAIN_A2B`, `DM_CHAIN_B2A`, `DM_CHAIN_STEP_SALT`, `DM_MK`, `DM_CK`. (#234)
 
 - DM first-contact entry — `daemonseed_core::dm::firstcontact` (`build`, `open`,
   `derive_channel_roots`, `bind_lt_input`, `msg_sig_input`, `FirstContactState`).

@@ -99,9 +99,52 @@ pub const DM_ADDR_ROOT: &[u8] = b"daemonseed/dm/addr/root/v3";
 /// it exists to protect. FROZEN.
 pub const DM_CHAN_ID: &[u8] = b"daemonseed/dm/chanid/v2";
 
+/// HKDF-Expand `info` for the ratchet root `RK0` — the third sibling of the same
+/// extraction that yields [`DM_ADDR_ROOT`] and [`DM_CHAN_ID`]. Unlike those two,
+/// this one is ratcheted forward and deleted, which is the whole of DM's forward
+/// secrecy. FROZEN.
+pub const DM_RATCHET_ROOT: &[u8] = b"daemonseed/dm/ratchet/root/v2";
+
+/// HKDF-Expand `info` for a ratchet generation step. The extraction that precedes
+/// it takes the PREVIOUS root as its salt and the freshly encapsulated secret as
+/// its IKM, so a generation depends on both its ancestor and new entropy — the
+/// standard double-ratchet root step, and what makes a compromise heal. FROZEN.
+pub const DM_RATCHET_STEP: &[u8] = b"daemonseed/dm/ratchet/step/v2";
+
+/// HKDF-Extract salt for deriving a direction's chain key from a ratchet root.
+/// FROZEN.
+pub const DM_CHAIN_SALT: &[u8] = b"daemonseed/dm/chain/salt/v1";
+
+/// HKDF-Expand `info` for the initiator-to-recipient chain key. FROZEN.
+pub const DM_CHAIN_A2B: &[u8] = b"daemonseed/dm/chain/a2b/v2";
+
+/// HKDF-Expand `info` for the recipient-to-initiator chain key. Distinct from
+/// [`DM_CHAIN_A2B`] so the two directions never share a message key — the defect
+/// that made the single-chain draft reuse an AES-GCM nonce. FROZEN.
+pub const DM_CHAIN_B2A: &[u8] = b"daemonseed/dm/chain/b2a/v2";
+
+/// HKDF-Extract salt for one symmetric step along a chain. FROZEN.
+pub const DM_CHAIN_STEP_SALT: &[u8] = b"daemonseed/dm/chain/step-salt/v1";
+
+/// HKDF-Expand `info` for the message key at a chain position. FROZEN.
+pub const DM_MK: &[u8] = b"daemonseed/dm/mk/v2";
+
+/// HKDF-Expand `info` for the successor chain key. Sibling of [`DM_MK`] under one
+/// extraction, so learning a message key never yields the chain it came from.
+/// FROZEN.
+pub const DM_CK: &[u8] = b"daemonseed/dm/ck/v2";
+
 /// Every label in this namespace, for the prefix-freeness check.
 #[cfg(test)]
 const ALL: &[&[u8]] = &[
+    DM_RATCHET_ROOT,
+    DM_RATCHET_STEP,
+    DM_CHAIN_SALT,
+    DM_CHAIN_A2B,
+    DM_CHAIN_B2A,
+    DM_CHAIN_STEP_SALT,
+    DM_MK,
+    DM_CK,
     DM_FC_SALT,
     DM_FC_SEAL,
     DM_FC_AAD,
@@ -145,6 +188,14 @@ mod tests {
         assert_eq!(DM_ROOT_SALT, b"daemonseed/dm/root/salt/v1");
         assert_eq!(DM_ADDR_ROOT, b"daemonseed/dm/addr/root/v3");
         assert_eq!(DM_CHAN_ID, b"daemonseed/dm/chanid/v2");
+        assert_eq!(DM_RATCHET_ROOT, b"daemonseed/dm/ratchet/root/v2");
+        assert_eq!(DM_RATCHET_STEP, b"daemonseed/dm/ratchet/step/v2");
+        assert_eq!(DM_CHAIN_SALT, b"daemonseed/dm/chain/salt/v1");
+        assert_eq!(DM_CHAIN_A2B, b"daemonseed/dm/chain/a2b/v2");
+        assert_eq!(DM_CHAIN_B2A, b"daemonseed/dm/chain/b2a/v2");
+        assert_eq!(DM_CHAIN_STEP_SALT, b"daemonseed/dm/chain/step-salt/v1");
+        assert_eq!(DM_MK, b"daemonseed/dm/mk/v2");
+        assert_eq!(DM_CK, b"daemonseed/dm/ck/v2");
     }
 
     /// The frozen design's F11 requirement: no label may be a prefix of another.
@@ -179,6 +230,46 @@ mod tests {
                 String::from_utf8_lossy(label)
             );
         }
+    }
+
+    /// `ALL` is hand-maintained, and the two checks above only ever see what is
+    /// in it — so a label added without a registry line would be silently exempt
+    /// from prefix-freeness forever, and no test would notice. This reads this
+    /// module's own source and holds the registry to it in both directions:
+    /// every declared label appears in `ALL`, and `ALL` contains nothing else.
+    #[test]
+    fn every_declared_label_is_registered_for_the_prefix_check() {
+        let source = include_str!("domain.rs");
+        let mut declared = Vec::new();
+
+        for line in source.lines() {
+            let Some(rest) = line.trim().strip_prefix("pub const DM_") else {
+                continue;
+            };
+            let Some((_, literal)) = rest.split_once("= b\"") else {
+                continue;
+            };
+            let value = literal
+                .trim_end()
+                .trim_end_matches(';')
+                .trim_end_matches('"')
+                .as_bytes()
+                .to_vec();
+            assert!(
+                ALL.contains(&value.as_slice()),
+                "{} is declared but missing from ALL, so nothing prefix-checks it",
+                String::from_utf8_lossy(&value)
+            );
+            declared.push(value);
+        }
+
+        assert_eq!(
+            declared.len(),
+            ALL.len(),
+            "ALL holds {} entries but {} labels are declared here",
+            ALL.len(),
+            declared.len()
+        );
     }
 
     #[test]

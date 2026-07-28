@@ -67,6 +67,7 @@ use daemonseed_proto::v1 as wire;
 use crate::aead_envelope::{EnvelopeError, open_envelope, seal_envelope};
 use crate::dm::domain;
 use crate::dm::keyrec;
+use crate::dm::ratchet;
 use crate::identity::keys::{SignKeypair, SignatureError, verify_signature};
 
 /// Length of an ML-KEM-1024 ciphertext.
@@ -113,9 +114,13 @@ pub const MAX_ENTRY_LEN: usize = 32768;
 pub const POW_RESERVE: usize = 64;
 
 /// The direction label bound into `msg_sig`. First contact is always
-/// initiator-to-recipient; the reverse direction is the ASCII literal `b2a` and
-/// arrives with the channel.
-const DIR_A2B: &[u8] = b"a2b";
+/// initiator-to-recipient.
+///
+/// Taken from [`ratchet::Direction`] rather than spelled out here: these are
+/// frozen wire bytes inside a signature preimage, so a second definition is a
+/// drift that would surface only as a signature two versions of this client
+/// could not verify for each other.
+const DIR_A2B: &[u8] = ratchet::Direction::AToB.label();
 
 /// The frame-kind label bound into `msg_sig`.
 ///
@@ -134,7 +139,7 @@ pub const FRAME_KIND_FIRST_CONTACT: &[u8] = b"fc";
 /// identifies the conversation inside signatures and AAD and is **never
 /// serialized**: a receiver recomputes it from the record it derived. Putting it
 /// on the wire would collapse the address scatter it exists to protect.
-#[derive(Clone)]
+#[derive(Clone, Zeroize, zeroize::ZeroizeOnDrop)]
 pub struct ChannelRoots {
     pub ar: [u8; ROOT_LEN],
     pub chan_id: [u8; ROOT_LEN],
@@ -229,13 +234,19 @@ impl From<EnvelopeError> for FirstContactError {
 pub fn derive_channel_roots(ss0: &[u8; SS0_LEN]) -> Result<ChannelRoots, FirstContactError> {
     let hkdf =
         HkdfSha384::extract(Some(domain::DM_ROOT_SALT), ss0).map_err(FirstContactError::Kdf)?;
+    // Both transients are cleared on every path: `[u8; N]` is `Copy` with no
+    // `Drop`, so the struct's `ZeroizeOnDrop` covers only the copies that moved
+    // into it and the originals would otherwise stay live in this frame (#135).
     let mut ar = [0u8; ROOT_LEN];
     let mut chan_id = [0u8; ROOT_LEN];
-    hkdf.expand(domain::DM_ADDR_ROOT, &mut ar)
-        .map_err(FirstContactError::Kdf)?;
-    hkdf.expand(domain::DM_CHAN_ID, &mut chan_id)
-        .map_err(FirstContactError::Kdf)?;
-    Ok(ChannelRoots { ar, chan_id })
+    let outcome = hkdf
+        .expand(domain::DM_ADDR_ROOT, &mut ar)
+        .and_then(|()| hkdf.expand(domain::DM_CHAN_ID, &mut chan_id))
+        .map(|()| ChannelRoots { ar, chan_id })
+        .map_err(FirstContactError::Kdf);
+    ar.zeroize();
+    chan_id.zeroize();
+    outcome
 }
 
 /// Append a `u64` big-endian length prefix and the bytes, the repo's one
@@ -1478,7 +1489,13 @@ mod tests {
         );
         assert_ne!(
             base,
-            sig(FRAME_KIND_FIRST_CONTACT, [1u8; ROOT_LEN], b"b2a", 0, "ab"),
+            sig(
+                FRAME_KIND_FIRST_CONTACT,
+                [1u8; ROOT_LEN],
+                ratchet::Direction::BToA.label(),
+                0,
+                "ab",
+            ),
             "the direction must be bound"
         );
         assert_ne!(

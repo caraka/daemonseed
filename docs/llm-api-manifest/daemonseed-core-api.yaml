@@ -750,10 +750,11 @@ modules:
       the identity PRK; a writer builds its RecordShape from DOORBELL_SLOTS.
       Sub-module dm::firstcontact builds and opens the self-contained
       first-contact entry: build(signing_lt, signing_pc, recipient_pk_lt,
-      kem_ek_b, eph_ek, fc_epoch, sent_unix_ms, body) encapsulates ss0 to the
-      recipient's static key, signs bind_lt under the long-term key and msg_sig
-      under the pseudonym, pads the encoded body to a PAD_BUCKETS entry, and
-      seals it; it returns the entry bytes and ss0, which the sender persists.
+      kem_ek_b, fc_epoch, sent_unix_ms, body) encapsulates ss0 to the recipient's
+      static key, generates the opening ratchet ephemeral itself, signs bind_lt
+      under the long-term key and msg_sig under the pseudonym, pads the encoded
+      body to a PAD_BUCKETS entry, and seals it; it returns the entry bytes and a
+      FirstContactState { ss0, eph_dk, roots } the sender persists.
       open(entry, recipient_dk, recipient_pk_lt, current_fc_epoch) decapsulates,
       opens against the current then previous epoch, exact-length gates every
       field, rejects a foreign intended_recipient_hash, and verifies bind_lt then
@@ -764,8 +765,36 @@ modules:
       derive_channel_roots(ss0) yields AR and chan_id; chan_id is never
       serialized. DM_BODY_CAP caps a body at 8192 bytes; MAX_ENTRY_LEN is the
       dflt(32) subkey cap the PAD_BUCKETS ladder and POW_RESERVE are sized
-      against. Sub-module dm::domain declares the daemonseed/dm/… label namespace,
-      one distinct prefix-free label per purpose.
+      against. Sub-module dm::ratchet is the conversation key schedule:
+      derive_root(ss0) expands daemonseed/dm/ratchet/root/v2 from the same
+      Extract(daemonseed/dm/root/salt/v1, ss0) that yields AR and chan_id;
+      advance_root(previous, encapsulated) is Extract(salt=previous_root,
+      ikm=encapsulated) expanded under daemonseed/dm/ratchet/step/v2, so a
+      generation depends on both its ancestor and fresh entropy; chain_key(root,
+      dir) is Extract(daemonseed/dm/chain/salt/v1, root) expanded under
+      daemonseed/dm/chain/{a2b,b2a}/v2; chain_step(ck) is Extract(
+      daemonseed/dm/chain/step-salt/v1, ck) expanded twice, under
+      daemonseed/dm/mk/v2 and daemonseed/dm/ck/v2, yielding the message key and
+      the successor chain key. advance_root and chain_step take their key BY
+      VALUE, so a stepped key cannot be retained. skip(ck, from, count) derives
+      count keys each tagged with its KeySlot and returns the chain key that
+      follows them; count == 0 is the in-order case and needs no special-casing;
+      it returns SkipTooLarge past MAX_SKIP (64) rather than truncating, because
+      the sequence number driving it is unauthenticated at that point. The caller
+      MUST commit skipped keys only after the arriving frame authenticates, and
+      MUST hold one SkippedKeys per conversation. SkippedKeys is bounded at
+      SKIPPED_KEY_CAPACITY (2 x MAX_SKIP, so one generation change — two catch-ups
+      for one message — cannot evict the previous chain's tail), insertion-ordered,
+      keyed on KeySlot { generation, direction, seq }; insert replaces an occupied
+      slot, insert_all takes a skip batch, take removes, evicted() counts
+      permanently lost messages. Role { Initiator, Recipient } maps an end of the
+      conversation onto send_dir()/recv_dir(). Direction::label() is the sole
+      definition of the a2b/b2a wire literals, consumed by dm::firstcontact.
+      RootKey, ChainKey and MessageKey are zeroize-on-drop redacting newtypes and
+      every derivation zeroizes its transient buffer on both paths. Sub-module
+      dm::domain
+      declares the daemonseed/dm/… label namespace, one distinct prefix-free label
+      per purpose.
     no_std: false
     depends_on:
       - daemonseed_core::identity::keys
@@ -773,6 +802,7 @@ modules:
     iscs:
       - C40
       - C41
+      - C42
       - A-C20
       - A-C24
       - A-C22

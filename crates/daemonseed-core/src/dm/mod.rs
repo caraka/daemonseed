@@ -25,3 +25,4 @@ pub mod domain;
 pub mod doorbell;
 pub mod firstcontact;
 pub mod keyrec;
+pub mod ratchet;
