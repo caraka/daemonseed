@@ -24,7 +24,7 @@ doc under `docs/design/`. When a design is accepted, its component deliverables
 become GitHub issues and the entry here is removed — but the design doc stays as
 the design-of-record.
 
-- **Direct messaging** — offline-capable, first-contact-capable 1:1 private messaging with a static ML-KEM key replacing the shared phrase. Design-of-record: [`docs/design/direct-messaging.md`](docs/design/direct-messaging.md) — **ADJUDICATED, not yet frozen** (2026-07-27): a 3-lens adversarial panel reopened the three-record candidate; the doc records the findings and the structural decisions to resolve. Needs a second design iteration + panel re-run before build slices graduate into issues. DM ISC family (ISC-C38–C46 / ISC-A-C20–A-C25) re-cut to the direction.
+- **Direct messaging** — FROZEN 2026-07-28 and decomposed into GitHub issues; the design-of-record [`docs/design/direct-messaging.md`](docs/design/direct-messaging.md) (DRAFT v6) persists as rationale. (Per convention a frozen+decomposed design leaves `Designs`; retained here only as a one-line pointer until the build slices land, then delete.)
 
 
 ## Features

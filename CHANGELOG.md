@@ -26,15 +26,13 @@ work lives in the project lead's vault manifest, not here.
 
 ### Added
 
-- Direct-messaging design-of-record (`docs/design/direct-messaging.md`):
-  adjudicated (Option C over A, schema sizing, keep-alive, WriteClass), then
-  stress-tested by a 3-lens adversarial panel that reopened the frozen
-  candidate — recorded as an adjudication record with the full findings and the
-  structural decisions to resolve before a build. Its ISC family
-  (ISC-C38–C46 / ISC-A-C20–A-C25) is re-cut in `ISA.md` to the Veilid direction
-  (offline store-and-forward with a static ML-KEM key), with the
-  three-record mechanics marked provisional pending the reopened decisions.
-  Design + criteria only; no code or wire change.
+- Direct-messaging design-of-record **FROZEN** (`docs/design/direct-messaging.md`,
+  DRAFT v6): hardened over 8 adversarial panel rounds (crypto/metadata/erasure)
+  to a post-quantum double-ratchet DM over per-page scattered DHT records, a
+  sender-blind first-contact doorbell, and fail-safe delivery (never claims
+  "delivered"). Its ISC family (ISC-C38–C46 / ISC-A-C20–A-C25) is re-cut in
+  `ISA.md` to v6; build slices are tracked as GitHub issues (forces #177).
+  Design + criteria only; the build carries the strictly-additive wire delta.
 
 ## [0.36.2] — 2026-07-27
 
