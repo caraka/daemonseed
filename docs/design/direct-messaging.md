@@ -1,0 +1,212 @@
+# Direct Messaging — Design of Record
+
+> Status: **ADJUDICATED — NOT FROZEN (2026-07-27).** The design space was mapped and the forks were adjudicated (Option C over A, schema sizing, keep-alive, WriteClass — all below and mostly surviving). Then a 3-lens adversarial panel (erasure/availability, correlation/metadata, crypto/replay) **refuted the frozen candidate**: all three lenses returned BLOCKER-class findings that trace to one root — the design priced *write authority* (who can forge, who can erase) but never *retention* (what the network keeps) or *read observability* (which records an adversary can choose to watch). Fork 1C's decisive argument, the stop-on-presence stopping condition, and the Fork-3 spam bound all rest on "no third party can erase the outbox," which is true of authorization and false of the other two. **This document is therefore an adjudication record, not a ratified freeze.** The § Adversarial-pass findings section at the foot is authoritative and SUPERSEDES any in-body claim it contradicts; the reopened decisions are listed in § What must be resolved before this can freeze. Re-cuts the relay-era DM ISC family (ISC-C38–C46 / ISC-A-C20–A-C25) in `ISA.md` to the Veilid *direction* (the relay-era `server_id`/no-offline content was unambiguously wrong); the specific three-record mechanics remain under the reopened questions. Partial progress on #177. Couples: #134 (presence slot ceiling — the schema-sizing answer below serves both), #136 (monotonic version), #225 (OS notifications).
+
+> **The valuable, durable output of this pass** (independent of the reopen): the schema-sizing facts (§ Schema sizing — answers #134 too), the fork *verdicts* that survive review (C over A; static-KEM over handshake; the WriteClass classification; the keep-alive/stopping-condition *shape*), the crypto-primitive sizing, and — above all — the enumerated adversarial findings that any next iteration must answer. The design was not ready to freeze; the pass is exactly what surfaced that, cheaply, before a build.
+
+## The design, in one sentence
+
+**A DM is a circle with one other person, where their published identity key replaces the shared phrase.**
+
+Every addition below was tested against whether that sentence survives it. The sender encapsulates to the recipient's published static ML-KEM-1024 key, seals the message under the encapsulated secret, and publishes it; the recipient decapsulates whenever they next come online. There is no handshake, no session, no ack, and no new transport — the same rendezvous engine, sealed frames, transcript, and rail carry it.
+
+## Problem
+
+There is no way to hand someone circle entropy privately inside daemonseed — private contact is currently bootstrapped by an *external* private channel. The fix is first-contact-capable, offline-capable direct messaging: A can message B without B being online, without prior arrangement, and without either party revealing the correspondence to the network.
+
+## Constraints (must hold)
+
+- **ISC-A-S2 posture** — DHT and storage nodes see only sealed frames; no content, no forgeable authorship.
+- **WB-2 write ceiling + WB-3 scheduler invariants** (`docs/design/veilid-write-budget.md`, FROZEN) — DM writes classify into the existing scheduler; **nothing here amends WB-3** (see § Write classification for the explicit statement).
+- **Frozen wire contract** — v0.36.2 is released to testers; the proto delta is strictly additive (see § Wire delta).
+- **No DHT TTL** — retention is capacity-eviction only (`RecordStoreLimits` has no expiration field; `remote_max_records` 64/128, `remote_max_storage_space_mb` 128/256). A stored value survives exactly as long as someone re-seeds it. Store-and-forward is something the **sender performs**, not something the network provides.
+- **Veilid write authority is all-or-nothing per DFLT record** — `value_data.writer() == owner` for every subkey; the subkey index takes no part in authorization (`veilid-core-0.5.7 src/storage_manager/schema.rs:48-88`). An inbox anyone can write is an inbox anyone can erase.
+
+## Schema sizing — the fact that shapes every record here (answers #134's blocking unknown too)
+
+Veilid's DFLT schema permits **`o_cnt` up to 1024** (`DHTSchema::MAX_SUBKEY_COUNT`, `veilid_api/types/dht/schema/mod.rs:24`; validated `dflt.rs:30-34`). But the per-subkey value cap is **not** a flat 32 KiB:
+
+```
+max_value_len = min(MAX_SUBKEY_SIZE = 32768, MAX_RECORD_DATA_SIZE = 1 MiB / o_cnt)
+```
+
+(`storage_manager/schema.rs:61-63`; constants `storage_manager/types/mod.rs:14-16`.) Slot count trades directly against slot capacity:
+
+| o_cnt | per-subkey cap |
+|---|---|
+| 1 | 32 KiB |
+| 32 | 32 KiB |
+| 64 (today's `dflt(64)`) | **16 KiB** |
+| 128 | 8 KiB |
+| 256 | 4 KiB |
+| 512 | 2 KiB |
+| 1024 | 1 KiB |
+
+Consequences:
+
+1. **Latent guard defect (pre-existing, file as its own issue):** `APP_MESSAGE_CAP = 32768` is used as the subkey-write guard (`rendezvous.rs:258-260`), but the true cap on the production `dflt(64)` records is **16384**. A sealed value of 16385–32768 bytes passes the local guard and is rejected by Veilid (`"value too big"`). Nothing ships that big today (share adverts ~12 KiB are the closest), but the guard should be schema-derived, not constant. The Phase-0 "32768 accepted" live probe used a smaller-`o_cnt` record and does not contradict this.
+2. **#134 (presence ceiling) is answered by formula, not by a number:** a dedicated presence schema takes `o_cnt ≤ 1 MiB / padded_beacon_size`. At the current `MemberHeartbeat` shape (~7.4 KiB unpadded: pubkey 2592 + sig 4627 + fields), padding to 8 KiB bounds presence at **o_cnt = 128**. Shrinking the beacon buys slots linearly. The #77/#134 build picks the padding constant first, then the count — in that order.
+3. **PQ signatures dominate every payload.** ML-DSA-87 signature = 4627 B, pubkey = 2592 B, ML-KEM-1024 ciphertext = 1568 B. Any schema past o_cnt ≈ 150 cannot carry a signed message at all. Big-slot-count schemas are for small unsigned-inside pointers only.
+
+## The three records
+
+DM delivery uses three record types. Only one of them is world-writable, and it carries pointers, not messages.
+
+### 1. The key record — one per identity, `dflt(1)`
+
+Publishes the identity's **static ML-KEM-1024 encapsulation key**. The keypair already exists on every identity, derived deterministically from the recovery phrase (`daemonseed-core/src/identity/keys.rs:267,280,307-320`; determinism test-locked) — only the public half is new to the wire.
+
+- **Address (world-derivable — that is the point):** owner seed = HKDF-SHA384 over the identity's full ML-DSA-87 public key, domain-separated (`daemonseed/dm/keyrec/v1/owner`, suite-family-anchored like the lobby derivation). Anyone holding the full pubkey computes the record key. The full pubkey is already carried by every provenance-signed artifact — chat/room messages (`cot.proto` `sender_pubkey`), share announcements, and presence beacons (`MemberHeartbeat.sender_pubkey`) — so **anyone visible on a roster or in a transcript is DM-able with zero new discovery surface.**
+- **Content:** `DmKeyRecord { version (u64, monotonic), kem_ek (1568 B), signature (ML-DSA-87 over domain ‖ identity_pubkey ‖ version ‖ kem_ek) }` ≈ 6.2 KiB — fits the 32 KiB `dflt(1)` subkey with 5× headroom.
+- **Write authority:** world-derivable owner (unavoidable — a discoverable address under DFLT is a derivable owner). Accepted: forgery is impossible (signature under the identity key; readers verify), so erasure is the only attack, and it is DoS-only. The owner keeps the record alive operator-style while online. The **monotonic `version`** exists so a future key rotation cannot be reverted by replaying an old signed blob — same newer-wins pattern as #136; readers cache the highest verified version and never regress.
+- **Residual (named):** an attacker can wipe the key record while the owner is offline, blocking **new** first contacts to that identity until they return (established correspondents cache the EK forever, per the contact cache). Eviction does the same thing without an attacker. The sender-side outbox therefore has an *awaiting-key* state with retry (below).
+
+### 2. The doorbell — one per identity, world-writable, `dflt(256)`
+
+The only unauthenticated write surface, and it carries only sealed fixed-size pointers.
+
+- **Address:** owner seed = HKDF over the recipient's identity pubkey (`daemonseed/dm/doorbell/v1/owner`) — lobby-parity world-writable, deliberately.
+- **Entry:** `kem_ct (1568 B) ‖ AEAD-sealed { outbox_record_key, sender_pubkey_hash (SHA-384, 48 B), proto_version }`, sealed under the encapsulated secret with AAD `daemonseed/dm/doorbell/v1`, **padded to one constant length ≤ 2 KiB** (WB-1.4 discipline: fixed-size or it becomes a metadata oracle). Fits the 4 KiB cap of `dflt(256)` with headroom. No signature inside — it wouldn't fit and isn't needed: a forged pointer costs the recipient one dead outbox fetch that fails verification there. The sender's *full* identity is proven at the outbox, not at the doorbell.
+- **Slot discipline — current-state, stable, blind:** `slot = HKDF(sender_dm_slot_secret, recipient_identity_pubkey) % 256`, where `sender_dm_slot_secret` is an HKDF expansion of the sender's own seed (`daemonseed/dm/doorbell/v1/slot`). Properties, each load-bearing:
+  - **Stable across restarts** — a re-seed overwrites the sender's own previous entry, never orphans it. This is #118's fix direction applied from birth: last-writer-wins surfaces key off stable ids; the ephemeral-node-key ring bug class cannot occur here.
+  - **Not observer-computable** — the slot derives from a sender *secret*, so a storage node co-hosting the doorbell cannot run a candidate-set attack ("slot 14 is active, and slot 14 is what pubkey X would map to") to learn who is knocking. The recipient doesn't need to compute it either: readers sweep the whole record (WB-4.L1).
+  - The #118 asymmetry it must not disturb is *preserved*: chat rings keep ephemeral node-key regions (that ephemerality is what prevents cross-session linkage of lobby writes); the doorbell gets stability without linkage by rooting in a secret instead of a public stable id.
+- **Collision math:** birthday over 256 slots is material around ~20 *concurrent unknown* first-contact senders. Colliders overwrite each other last-writer-wins; keep-alive alternation plus whole-record sweeps deliver both eventually; established correspondents leave the doorbell entirely (below), so steady-state occupancy stays low. Accepted for v1.
+- **Erasure:** anyone can wipe the doorbell. Cost: a *notification*, never a message — content lives elsewhere, and the sender's keep-alive restores the pointer. First-contact suppression residual is handled by the stopping-condition split (below).
+
+### 3. The outbox — one per (sender → recipient) pair, sender-owned, `dflt(64)`
+
+Where messages actually live. **No third party can write or erase it.**
+
+- **Address:** owner seed = HKDF expansion of the **sender's identity seed** with the recipient's identity pubkey folded into the info (`daemonseed/dm/outbox/v1/owner` ‖ recipient pubkey) — the sibling-expansion pattern of `circle/key.rs`. Only the sender can derive the owner secret; the record key is not computable by observers (it reaches the recipient only inside the sealed doorbell pointer, and the recipient caches it).
+- **Slot discipline:** single writer, so no member regions — a plain append ring, `slot = seq % 64`, seq persisted in the outbox state. Retention = the sender's last 64 messages to that correspondent (vs `RING_DEPTH = 2` on chat rings — "your third message overwrites your first" is not acceptable for offline delivery; 64 pending messages per correspondent is).
+- **Message:** `DmMessage { kem_ct (1568 B), sealed { sender_pubkey, sent_unix_ms, body, signature } }`, AAD `daemonseed/dm/msg/v1`. Fresh encapsulation per message. Seal key = HKDF-SHA384(ss, `daemonseed/dm/msg/v1` ‖ sender_pubkey ‖ recipient_pubkey) — binding both identities into the KDF info kills cross-pair replay by construction. Signature over domain ‖ recipient_pubkey ‖ sent_unix_ms ‖ body proves authorship inside the seal (relay-blind, ISC-A-S2 intact). Size arithmetic: 1568 + 16 (tag) + 4627 (sig) + 2592 (pubkey) + fields ≈ 8.9 KiB of overhead against the 16 KiB `dflt(64)` cap → **body cap ≈ 7 KiB; the build sets `DM_BODY_CAP` from this arithmetic and the compose UI enforces it.**
+- **Recipient dedup** is by content address of the sealed value — a message republished after reading is wasteful, not wrong (this is what makes the ack unnecessary at v1).
+
+### How the pieces meet
+
+**First contact:** sender fetches recipient's key record (address derived from their pubkey, learned from any signed artifact) → encapsulates → writes the message into the (new) outbox record → writes the sealed doorbell pointer. Recipient, next time online, sweeps their doorbell → decapsulates the pointer → fetches the outbox record → decapsulates messages → surfaces as a **contact request** (Fork 3, below).
+
+**Established contact:** the recipient's contact cache holds the correspondent's outbox record key (and EK). Their client sweeps/watches cached outbox records directly — **the doorbell is not consulted after first contact**, which is what makes doorbell erasure a first-contact-only nuisance. Outbox records join the steady-resweep rotation (WB-4.L2 — watches are lossy; sweep is the guarantee); per-record resweep latency grows linearly with record count, which at contact scale is the #171 tail-sweep's problem, named here as a scaling consideration, not a v1 blocker.
+
+## Fork 1 — write authority: adjudicated for Option C (doorbell + sender-owned content)
+
+**Option A (world-writable inbox, lobby parity) is REJECTED**, and the decisive argument is the interaction the brief flagged: under A, the erasure primitive **composes with the stopping condition into silent, targeted, cheap suppression at exactly the attacker's best moment.** The recipient comes online → the sender's stop-on-presence rule fires and re-seeding stops forever → the attacker's sustained wipe (trivial: they hold the owner key) wins the race against the recipient's sweep → the message is gone, the sender's UI honestly believes "they've been online, it's delivered," and neither party ever learns otherwise. Lobby parity does not transfer: the lobby is an ephemeral broadcast surface where erasure costs recent chatter; a DM inbox is targeted store-and-forward where erasure is a *silent, per-victim censorship primitive* whose worst case is invisible. A also has no answer that isn't an ack (ruled out) or a tombstone (an ack in a different hat).
+
+**Option C accepts A's only real advantage was fewer records, and buys:** content that cannot be erased by anyone but the sender; an unauthenticated write surface bounded to fixed-size sealed pointers (which is also the spam bound); and a stopping condition that is actually sound for established contacts (below). Costs, priced: two records per new correspondence, one extra fetch hop at first contact, and outbox-record count growing with correspondents (swept round-robin — linear, bounded by contact count).
+
+**Option B (SMPL) for the post-first-contact channel — structurally sound, deliberately deferred.** Verified against veilid-core: in SMPL, member-range writes are authorized against the *member's* key — the owner cannot write (hence cannot erase) member subkeys (`storage_manager/schema.rs:99-135`). A per-pair SMPL record (2 fixed members, writer set never changes — the open-membership objection from `veilid-migration.md:103` does not apply to a pair) would give a true single-record two-writer channel with erasure-proof member ranges: the closest literal realization of "a circle with one other person." It is not v1 because it needs machinery that doesn't exist in the workspace (an SMPL create/open path; stable per-identity DM writer keys, derived and exchanged) while Option C reuses the DFLT engine as-is. **Recorded as the v2 consolidation target** if the two-records-per-pair overhead ever bites.
+
+## Fork 3 — the spam surface: bounded, not designed away
+
+Anyone who can derive your doorbell address can knock. The bounds, ranked by where they bite:
+
+1. **The unauthenticated surface is pointer-sized and fixed-size.** Content never lands unbidden; the recipient fetches it by choice. A garbage entry costs one decapsulation (constant-time, cheap) and is dropped on AEAD failure.
+2. **One slot per sender.** A spammer's re-writes land on their own slot — volume does not spread across the record.
+3. **ISC-C45's explicit-accept SURVIVES the re-cut, demoted from wire handshake to local UI gate.** A first contact from an unknown sender surfaces as a **contact request**; the thread renders only on accept. Decline discards. This is the relay-era answer with the HELLO/ACCEPT machinery deleted — the *UX* was right, the wire protocol was the complexity this design exists to remove.
+4. **The block list (re-cut ISC-C46) drops a blocked sender's doorbell entries at sweep** (matched on the sealed `sender_pubkey_hash`) and stops sweeping their outbox. Silent and unilateral; the blocked sender's view is byte-identical to "never came online" — the old C46 goal now falls out of the sender-abandons-on-schedule structure for free.
+5. **Named residual, accepted at v1:** a Sybil flooder minting fresh identities can occupy many doorbell slots (each costs a sustained keep-alive to hold against eviction and real-sender overwrites). This degrades *first-contact* delivery under active attack; established contacts are untouched. Rate/PoW bounds are v2-if-ever; at alpha scale the fixed-size surface plus per-sender slots suffice.
+
+## Task 2 — the keep-alive (ratified, with one split)
+
+**Mechanism (ratified as stated):** no TTL, eviction-only retention → a message survives exactly as long as the sender re-seeds it. The sender performs store-and-forward.
+
+**Schedule (ratified):** geometric backoff per pending message — `1 min → 2 → 4 → 8 → 16 → 32 → 64 → hourly → daily` (~20 writes over a week vs ~5,000 at the operator's flat 120 s). Hard give-up at **7 days**; the message is marked **undelivered** in the UI, never silently abandoned.
+
+**Stopping condition (ratified for established contacts; split for first contact):**
+
+- **Established contact:** stop re-seeding once the recipient has been seen present (lobby roster, already swept continuously — a free local lookup) at any point after the publish. Sound *because of Fork 1C*: the recipient holds the outbox record key, their client sweeps it, the content cannot have been erased — presence-after-publish plus on-DHT genuinely exhausts the failure modes. Presence is a **stopping** condition, never a sending gate (the earlier draft that gated sending on presence reproduced the constraint this design removes).
+- **First contact:** presence does **not** stop re-seeding — the doorbell is erasable, so "they were online" does not imply "they saw the pointer." First-contact messages re-seed on the full schedule until either **evidence of establishment** (any inbound traffic from the recipient on this pair — a reply, or their doorbell entry to us) or the 7-day give-up. Cost of this insurance: ~20 writes over the week. This is the residual of the erasure attack under C, priced at almost nothing.
+- Dependency, named: presence is lobby-only today (#77 extends it to circles); everyone is in the pinned lobby by default, so it holds in practice.
+- Leak, named and accepted: an observer co-hosting an outbox record who watches re-seeding stop learns "the recipient appeared in the lobby" — information the lobby record already publishes.
+
+**Persisted outbox (ratified as a hard storage requirement):** pending DMs and their backoff position survive restart. The operator keep-alive tolerates in-memory state because it re-folds from the DHT; a DM has no such source — a restart before collection would silently lose the message from the sender's side. States: **awaiting-key** (recipient's key record unfetchable — evicted or wiped; retry key fetch on the same backoff), **awaiting-collection** (sealed, published, re-seeding), **presumed-delivered** (stopped on presence / establishment), **undelivered** (7-day give-up, surfaced). Ring seq per correspondent persists with it.
+
+## Fork 4 — write classification (uses WB-3; amends nothing)
+
+- **First dispatch of a user send is `Chat` (rank 1)** — the outbox write, plus the doorbell write when the send is a first contact. It is a user action wanting user-action latency (I4's 2-permit chat lane, never coalesced). This is one write (two at first contact) per user action — exactly what the chat lane is for.
+- **Every scheduler-driven re-dispatch is `Keepalive` (rank 4):** outbox re-seeds, doorbell keep-alive, key-record keep-alive. They compete in the non-chat window against presence and advert refreshes, coalesce per I3 on `(record, logical id)` — the logical id is the *message* (slot), so a superseded re-seed of the same message coalesces and distinct messages never do — and reach the floor lane via `FLOOR_AGE(4)` like any class-4 write.
+- **I6b does not apply.** There is no hard DHT expiry anywhere in the DM path — only eviction pressure — so no DM write carries a deadline. I6b stays scoped to the operator-TTL case it was built for.
+- **The retry loop lives in the persisted outbox, above the scheduler.** The scheduler has no retry machinery (verified: zero `retry`/`repeat` hits in `schedule.rs`) and **gains none**: the outbox owns the backoff timers and enqueues each re-seed as a fresh, ordinary write into the I1 funnel. **Explicit statement, as the freeze requires: WB-3 is not amended by this design.** New writers classified into existing classes is *use* of the scheduler; the one thing that would have been an amendment — scheduler-resident retries — is placed outside it by construction.
+- **WB-0 conformance:** DM sends and their re-seeds are chat-class consented emissions — the activity *is* the payload — not presence/discovery-class, so WB-0's activity-independence rule does not govern them. The two DM keep-alives that are *not* content (doorbell, key record) take no input from user activity: they run on their own cadence while pending/online. Budget: a pending message costs ~20 writes/week; steady-state DM keep-alives are noise under the WB-2 4/min ceiling.
+
+## Wire delta (additive; back-compat posture explicit)
+
+Three new `daemonseed.v1` messages — `DmKeyRecord`, `DmDoorbellEntry`, `DmMessage` — plus the three new record derivations. **No existing message, field, or record changes.** This is a green-field additive MINOR on the frozen wire: v0.36.2 clients never derive or sweep DM records, so they neither see nor break on any of it (contrast #136, which mutates an existing record's semantics — the expensive kind). Compatibility rule: DM requires both ends ≥ the shipping version; a DM sent to an old client simply ages to *undelivered* — indistinguishable from never-came-online, which is the honest answer. `cargo xtask check-proto` snapshot updates ride the build commits.
+
+## Out of scope (unchanged from the pre-freeze decisions, recorded so they are not re-litigated)
+
+- **Acks / delivery receipts** — dedup-by-content-address makes them an optimization; block semantics fall out of their absence.
+- **Forward secrecy** — the system has none anywhere; a static-KEM DM is *stronger* than a phrase-shared circle, not weaker. DHT decay is not PFS (a recording adversary keeps the ciphertext). If PFS ever becomes a requirement it is a whole-system conversation.
+- **Key agreement from ML-DSA keys** — no such operation exists; the Ed25519→X25519 intuition does not transfer to lattice schemes. Recorded so it is not re-proposed.
+- **Read-before-write as a stop condition** — "collected" and "evicted" are indistinguishable without a tombstone, and a tombstone is an ack.
+- **SMPL for open rendezvous** — rejected with structural reason at `veilid-migration.md:103`; only the per-pair post-contact case is live, and it is deferred (Fork 1B above).
+
+## UI
+
+Discord-style **DM overlay on the rail, sorted by recency** (ratified). The rail already carries unread dots (#64); recency-sort suits DMs where circles want stable ordering; #225 (OS notifications) gets its obvious home. Unknown-sender first contacts render as requests (Fork 3), with accept / decline / block.
+
+## Spawned work (build slices, in dependency order)
+
+1. **Key publication:** `DmKeyRecord` + derivations + keep-alive + fetch/verify/cache path (includes the schema-derived write guard fixing the `APP_MESSAGE_CAP` latency noted above, or that lands as its own prior fix).
+2. **Outbox + doorbell:** records, derivations, sealed formats, persisted outbox with backoff states, WriteClass wiring.
+3. **Collection path:** doorbell sweep, pointer decapsulation, outbox sweep/watch + steady-resweep registration, dedup, contact cache extension (re-cut C44).
+4. **UI:** rail overlay, requests, block list wiring (re-cut C45/C46).
+
+Each slice registers its ISCs in `crates/daemonseed-isc` at its build commit, per the WB pattern.
+
+**These slices do not proceed until the reopened decisions below are resolved** — several would build a refuted construction.
+
+## Adversarial-pass findings (2026-07-27, 3 independent lenses — authoritative; supersedes contradicted in-body claims)
+
+The one-line root, stated by all three lenses: **the design analyzes each record for write authority and never asks the prior questions — what does the network retain, and which records can an adversary choose to watch and at what cost.** Two of the three records are world-addressable from a stable identity for free.
+
+### BLOCKERs (freeze cannot stand)
+
+- **B1 (crypto) — the message seal key is underivable; first contact cannot decrypt.** The seal key binds `sender_pubkey` into its HKDF info, but `sender_pubkey` (2592 B) is placed *inside* the seal and cannot be moved into the doorbell pointer (over the 2 KiB pad and the 4 KiB `dflt(256)` cap). At first contact the recipient holds only the 48-B `sender_pubkey_hash`, a preimage-resistant hash. The construction does not close. *Likely-but-wrong build fix (silently dropping `sender_pubkey` from the KDF) deletes the property the doc calls load-bearing.* **Fix direction:** carry `sender_pubkey` as a cleartext envelope field (the `cot.proto` provenance pattern — see B8), sign over it, and let cross-pair replay resistance rest on `recipient_pubkey` in the KDF info alone (sufficient).
+- **B2 (crypto) — authentic messages replay from an attacker-owned outbox.** Nothing binds a sealed `DmMessage` to its carrier record/slot/seq. Anyone who scrapes a sealed message re-publishes it into their *own* outbox with a doorbell pointer carrying the real sender's hash; it AEAD-opens and the ML-DSA signature verifies — a genuine-looking message at an attacker-chosen time. The sole defence, dedup-by-content-address, is soft local state, empty on reinstall / recovery-from-mnemonic / second device. **Fix direction:** bind a per-conversation/outbox identifier (and ideally a monotonic counter) into the signed input; specify dedup durability.
+- **B3 (metadata) — world-derivable addresses are a targetable, stable-identity presence oracle.** Harvest any identity pubkey from a roster/transcript, derive its key-record and doorbell addresses, `watch_dht_values`, and read the key-record `seq` cadence as a sleep/wake time series bound to a *permanent* ML-DSA identity — plus doorbell in-degree and knock cadence. The write-budget doc accepted the slot-occupancy channel only because circle addresses are secret-gated and lobby identity is ephemeral; both mitigations are removed here. This is the first world-addressable, stable-identity, presence-correlated record class in the system.
+- **B4 (erasure) — the doorbell is a pre-consent read-amplification primitive.** Because identity is proven at the outbox (not the doorbell), collection is forced before the accept/decline gate: an attacker fills all 256 doorbell subkeys with *correctly-sealed* pointers to noise records for ~512 writes; the victim's first sweep then does 256 × (`open_or_create` ~6–10 s, inline-serial under the margin-2 limiter) ≈ 25–43 min of wedged actor loop + 16 k gated GETs — the exact read-lane starvation WB-5.1 exists to prevent, reachable unauthenticated. Fork 3.1's "one cheap decapsulation" bound is inverted (only AEAD-*failing* entries are cheap).
+- **B5 (erasure) — stop-on-presence certifies delivery on record B from liveness on record A.** Presence is observed in the *lobby*; the message lives in the *outbox*. Between re-seeds the outbox value can evict (no TTL, capacity-only), the record session can go dead-silent, or a GET can be lossy — and the sender, seeing lobby presence, stops re-seeding and marks `presumed-delivered`. This reintroduces the exact silent-loss-with-false-delivered failure Fork 1C rejected A to avoid, one layer down. Probability rises with recipient offline duration — the design's target case.
+
+### MAJORs
+
+- **M1 (crypto) — key-record rollback by re-writing an older *authentic* record.** World-*derivable* owner means anyone can *write*, not only erase. Replaying a correctly-signed `version:1` blob with a higher subkey `seq` downgrades every cold reader (new senders, reinstalls, second devices) — the highest-verified cache defends only warm readers. "Forgery impossible, erasure is DoS-only" is false; replacement-with-older-authentic is a third option. (BLOCKER if rotation is ever a compromise response.)
+- **M2 (crypto/erasure) — a losing `set_dht_value` re-propagates the attacker's value and returns `Ok(Some)`.** Verified in veilid-core 0.5.7 (`set_value.rs:487-497,637-641`): on a contested subkey the honest sender abandons its own bytes, fans out the attacker's value, stores it locally, and returns success. The keep-alive *repairs the erasure in the attacker's favour*, and the outbox state machine has no "my write lost the race" state and consumes no return value. Also: `Ok(None)`/`allow_offline` ≠ network-durable (WB-5 §evidence, not carried here).
+- **M3 (crypto/erasure) — "one slot per sender" is client convention, zero enforcement.** Every reader holds the world-derived doorbell owner secret, which under DFLT authorizes writing *every* subkey. An attacker writes 0..255 directly — whole-doorbell wipe/fill at 256 writes/cycle, no Sybil. Fork 3.2's spam bound holds only against conforming clients.
+- **M4 (crypto) — `sender_pubkey_hash` is attacker-chosen (unsigned doorbell): block bypass + cache poisoning.** Block matches a field the writer controls → set it to a non-blocked hash and blocking is defeated at zero cost; or name a *trusted* correspondent's hash with an attacker outbox key to redirect the victim's resweep. No rule is given for a known-hash pointer with a different outbox key. Plus resweep amplification if a record registers before verification.
+- **M5 (crypto/erasure) — doorbell pointer replay (no signature/timestamp/counter).** A scraped entry re-written verbatim is byte-identical to the sender's keep-alive (stable slot), resurrecting a declined request, defeating the 7-day give-up, and enabling a selective-freeze pin. Cross-recipient replay is correctly prevented (encapsulated to the EK); same-doorbell replay is not.
+- **M6 (crypto) — UKS on the doorbell.** `DmKeyRecord` proves no possession of the DK for its published EK. An attacker signs a record advertising a *victim's* EK under the attacker's own identity; a sender's ciphertext then decapsulates for both. The message seal absorbs it (identities in the KDF), the doorbell seal (bare `ss`, constant AAD, no recipient binding) does not.
+- **M7 (metadata) — the geometric backoff phase-locks the doorbell to the opaque outbox and violates WB-3 I6.** The schedule is deterministic and *unjittered*, so the two records fire in lockstep from one t0 — collapsing the outbox's address secrecy into a timing derivation, and creating exactly the stable cross-record phase relationship WB-3 I6 forbids. So "WB-3 not amended" is false in effect. **Fix:** per-emission jitter (WB-1.2 pattern), independent per-record.
+- **M8 (metadata) — outbox messages are unpadded.** Padding is specified for the doorbell and forgotten for the message; body length, message count, and inter-message intervals leak to any outbox co-host. WB-0's length-oracle rationale applies. **Fix:** pad `DmMessage` to a bucketed constant.
+- **M9 (metadata) — sender-secret slot is a durable per-correspondent pseudonym.** The secret defeats the *candidate-set naming* attack (correct, load-bearing) but not *tracking*: a co-host logs `(slot, seq, timestamp)` over months → a stable partition of R's unknown-correspondent set with first-seen, cadence, cessation — a contact graph in shape. Named for presence in the WB doc; not carried here.
+- **M10 (metadata) — the first/established stopping split timestamps tie-formation.** First contact re-seeds through presence events; established stops at the first — the transition is observable as an edge-creation event with timestamp, key-free.
+- **M11 (erasure) — recipient-side state loss permanently orphans every established correspondence, silently.** The outbox owner is derivable only by the sender; the recipient learns it only from the (now-evicted) doorbell pointer. Reinstall/second-device/recovery re-derives identity but not reachability; senders keep stopping on presence and reporting delivered. A supported user action → permanent one-way silent loss; the sender-side loss is fine (re-derives from its own seed) — an asymmetry the design never states.
+- **M12 (erasure) — WB-2 breach on the happy path.** 30 pending messages (10 each to 3 offline correspondents) ≈ 1.75/min of DM re-seeds in the dense backoff head, plus keep-alives → ~3.75–4+/min against the 4/min ceiling, from one ordinary session. Breaching WB-2 is what caused the write storm that starves the re-seeds themselves — self-amplifying.
+- **M13 (erasure) — WB-5.1 floor-lane census silently invalidated.** Up to 64 pending logical ids per correspondent vs the frozen "~12 total" premise → floor-lane worst-case drain rises from ~40 min to ~35 h in a 200 s regime; in the daily tail, re-seeds enqueue faster than the capacity-1 floor drains. Classification is unchanged but a frozen *quantitative* premise is not. (Also: the doc says logical id = "the message (slot)" — those differ under `seq % 64`; taking message-identity breaks I3 supersession.)
+- **M14 (erasure) — key-record eviction probability is monotone in recipient offline duration, and >7 days first contact is structurally impossible.** The `dflt(1)` key record's only keeper is the offline party; retention is capacity-only; `awaiting-key` gives up at 7 days. The identities most needing offline delivery have the least-refreshed key records. The design hands every reader the ability to keep the record alive (world-derivable owner, self-verifying blob) and uses none of it.
+- **M15 (erasure) — empty outbox records enter the CRSH health-tracked resweep and may self-DoS.** An idle outbox gets no re-seed → goes network-absent → the consumer-route-self-heal detector may fire repair (`close`+`open`+`watch`+64-GET) on records healthy-by-design. Benign vs self-inflicted turns on whether a force-refresh GET against an absent record returns `Ok(None)` (no repair) or `Err` (repair) — unspecified; population scales with contact count.
+
+### MINORs (recorded)
+
+- **m1 (crypto) — DM signature drops `sender_pubkey`**, the sole departure from the repo's provenance pattern (`cot.proto` `RoomMessage`/`ShareAnnouncement`/`MemberHeartbeat` all bind it) — DSKS setup; fix with B1.
+- **m2 (crypto) — `sent_unix_ms` is advisory, nothing enforces freshness**; amplifies B2/M5. Recency-sort UI surfaces a replayed old message at top.
+- **m3 (crypto) — `version` rotation is currently underivable**: `kem_ek` derivation is KAT-pinned with no rotation index (`keys.rs:307-320`), so one mnemonic → one EK forever; the newer-wins machinery is inert until a rotation counter is added to the HKDF info (a pre-freeze protocol-string decision).
+- **m4 (crypto) — domain-string hygiene**: `daemonseed/dm/*` is a clean namespace (no collision/shadow — verified against the full registry), but `daemonseed/dm/msg/v1` triples as HKDF-info + AAD + signature-domain (the repo splits these; e.g. `.../aad/v2` vs `.../provenance/v2`), and the doorbell AAD binds neither recipient nor record (the M6 gap). **State a nonce-derivation rule for all three seals** — ML-KEM implicit rejection means garbage never fails decap (B4 cost), and a cached-`ss` doorbell rewrite risks AES-GCM nonce reuse.
+- **m5 (metadata) — block is third-party-detectable** (writes continue, resweep GETs cease); **schema fingerprints are role-revealing** (`dflt(256)`~2 KiB = doorbell, `dflt(1)`~6.2 KiB = key record — enables B3 over a random sample with zero targeting); **key rotations are publicly timestamped**.
+- **m6 (erasure) — false `undelivered`** on the modal read-but-quiet first contact, and `undelivered` conflates five distinct facts (suppression / eviction / declined / read-quiet / old-build) into the one availability signal.
+- **Aside:** `keys.rs:90,95` doc-comments state ML-DSA-87 sizes wrong (pk listed 4896 — real 2592); the DM doc used the correct figures, but a builder sizing from those comments will err. Fix the comments.
+
+### What the panels tried and could NOT break (the surviving core)
+
+Cross-pair `DmMessage` replay resistance (both identities in the KDF info — holds, it was just mistaken for general anti-replay); outbox authorized-*erasure* resistance (sender-only owner derivation genuinely holds — it just doesn't imply availability or insertion resistance); key-record *forgery* under another identity (signature covers `domain‖pubkey‖version‖ek`, fixed-length, unambiguous); schema-squatting (schema binds into the record key); doorbell slot enumeration by a co-host (sender-secret rooting defeats candidate-set naming — correct and load-bearing); domain-string cross-lifting (no collision with any existing label); false-dedup on repeated text (fresh encapsulation per message). The **fork verdicts** — C over A on the *authorization* axis, static-KEM over handshake, the WriteClass classification, offline store-and-forward as the shape — survive; what fails is the *mechanism* built under them.
+
+## What must be resolved before this can freeze (the reopened decisions — caraka's call, above an overnight build)
+
+1. **The world-derivable-address oracle (B3, M1, M9).** Is a targetable stable-identity presence/activity oracle acceptable for alpha, or does the key record / doorbell need a non-derivable or secret-gated address? A secret-gated address defeats first contact (the recipient's pubkey is the only shared secret at first contact) — this is the central tension, the same one that rejected SMPL for open rendezvous. Options to weigh: accept-and-document for alpha (ephemeral-identity lobby limits blast radius but the *key record* is inherently long-term); a per-identity rotating address; or a fundamentally different first-contact channel.
+2. **Availability erasure of first contact (B4, B5, M2, M3, M5, M11, M14).** The doorbell being world-writable + world-derivable makes first-contact delivery deniable at trivial cost and makes stop-on-presence unsound. Does first contact need write-authenticated admission (which reintroduces a handshake), a proof-of-work / rate bound, or an accepted "first contact is best-effort under active attack" posture with the stopping condition changed to not falsely report delivery?
+3. **The crypto construction (B1, B2, M4, M6, m1–m4).** B1 must be fixed for the design to be buildable at all (cleartext `sender_pubkey` envelope + sign-over-it). B2/M4/M5/M6 need carrier-binding, a signed doorbell pointer or an accepted-and-scoped replay/UKS posture, and a stated nonce rule. This is bounded, mechanical design work — but it must precede any build.
+4. **Budget conformance (M7, M8, M12, M13).** Jitter the schedule (M7), pad the message (M8), re-derive the WB-2/WB-5.1 arithmetic against realistic pending-message counts (M12, M13) — and if that arithmetic doesn't close, the backoff schedule or the per-user pending cap is the lever.
+5. **Recovery / multi-device reachability (M11).** The recovery-phrase identity model recovers identity but not DM reachability. Decide whether that is an accepted alpha limit (documented) or needs a re-bootstrap signal.
+
+Recommended next step: a second design iteration answering 1–3 (the structural ones), then a re-run of the same 3-lens panel against the revision before any freeze. The fork verdicts and schema facts above carry forward unchanged.

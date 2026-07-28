@@ -24,6 +24,18 @@ next release this block is renamed to its version + date and a fresh
 `[Unreleased]` is opened (see `AGENTS.md` doc-sync). Planning for *unstarted*
 work lives in the project lead's vault manifest, not here.
 
+### Added
+
+- Direct-messaging design-of-record (`docs/design/direct-messaging.md`):
+  adjudicated (Option C over A, schema sizing, keep-alive, WriteClass), then
+  stress-tested by a 3-lens adversarial panel that reopened the frozen
+  candidate — recorded as an adjudication record with the full findings and the
+  structural decisions to resolve before a build. Its ISC family
+  (ISC-C38–C46 / ISC-A-C20–A-C25) is re-cut in `ISA.md` to the Veilid direction
+  (offline store-and-forward with a static ML-KEM key), with the
+  three-record mechanics marked provisional pending the reopened decisions.
+  Design + criteria only; no code or wire change.
+
 ## [0.36.2] — 2026-07-27
 
 ### Fixed
