@@ -413,8 +413,17 @@ fn exact<const N: usize>(field: &'static str, bytes: &[u8]) -> Result<[u8; N], F
 /// establish.
 pub struct FirstContactState {
     pub ss0: [u8; SS0_LEN],
-    pub eph_dk: Box<[u8; ml_kem::DK_LEN]>,
+    pub eph_dk: ratchet::EphemeralDecapKey,
     pub roots: ChannelRoots,
+}
+
+impl Drop for FirstContactState {
+    /// `ss0` is a bare array, so it has no `Drop` of its own and would otherwise
+    /// outlive this struct in whatever stack or heap slot held it. The other two
+    /// fields zeroize themselves. (#135)
+    fn drop(&mut self) {
+        self.ss0.zeroize();
+    }
 }
 
 impl std::fmt::Debug for FirstContactState {
@@ -538,7 +547,7 @@ pub fn build(
         entry,
         FirstContactState {
             ss0,
-            eph_dk: Box::new(eph_dk_arr),
+            eph_dk: ratchet::EphemeralDecapKey::new(Box::new(eph_dk_arr)),
             roots,
         },
     ))
@@ -894,7 +903,7 @@ mod tests {
         getrandom::fill(&mut m).unwrap();
         let (ss, ct) = ml_kem::encapsulate(&v.eph_ek, &m).unwrap();
         assert_eq!(
-            ml_kem::decapsulate(&k.state.eph_dk, &ct).unwrap(),
+            ml_kem::decapsulate(k.state.eph_dk.as_bytes(), &ct).unwrap(),
             ss,
             "the persisted eph_dk must decapsulate what a reply encapsulates to eph_ek"
         );

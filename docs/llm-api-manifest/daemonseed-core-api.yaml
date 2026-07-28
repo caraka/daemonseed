@@ -791,8 +791,40 @@ modules:
       conversation onto send_dir()/recv_dir(). Direction::label() is the sole
       definition of the a2b/b2a wire literals, consumed by dm::firstcontact.
       RootKey, ChainKey and MessageKey are zeroize-on-drop redacting newtypes and
-      every derivation zeroizes its transient buffer on both paths. Sub-module
-      dm::domain
+      every derivation zeroizes its transient buffer on both paths. Ratchet is the
+      live state machine: initiator(ss0, eph_ek, eph_dk) and recipient(ss0,
+      peer_eph_ek) open it from a verified first contact; send_next() takes a
+      generation step when the peer has published an ephemeral newer than the one
+      last stepped against, mints a fresh ephemeral, and returns Outbound { key,
+      header, eph_ct, eph_ek } — eph_ct repeats on EVERY message of a generation
+      so losing the message that opened it costs only that message. receive(
+      header, eph_ct, peer_eph_ek, open) takes the caller's open-and-verify as a
+      closure, computes every state change against clones, and applies them ONLY
+      if the closure returns Some; it runs the previous chain out to the arriving
+      chain_base so messages in flight across a step stay readable, and serves an
+      already-skipped position from the cache without touching anything else. A
+      frame at generation G decapsulates with the ephemeral published at G-1, so
+      no selector rides the wire; ephemerals are kept indexed by publishing
+      generation over EPHEMERAL_WINDOW (4). FrameHeader { generation, chain_base,
+      seq } states the frozen PN absolutely rather than as a count. Sequences are
+      monotonic per direction: FIRST_INITIATOR_CHANNEL_SEQ is 1 (sequence 0 is the
+      doorbell-carried first-contact entry), FIRST_RECIPIENT_CHANNEL_SEQ is 0.
+      MAX_SKIP bounds how many keys are kept; MAX_CATCH_UP (16 x MAX_SKIP) bounds
+      how far a chain is walked, so a receiver back from a long absence loses the
+      messages it missed rather than the whole direction, and a previous chain too
+      far behind to walk is retired outright at a ratchet step. losses() reports
+      DeliveryLosses { pending, evicted, abandoned } — the two loss counts are
+      permanent and distinct. send_direction()/recv_direction() give the frame
+      layer the direction to bind without re-deriving it per site; Outbound also
+      carries it. initiator() rejects an opening ephemeral whose halves are not a
+      keypair (EphemeralDecapKey::matches, a FIPS 203 embedded-ek memcmp) because
+      ML-KEM would never report it. RatchetError separates AlreadyConsumed and
+      GenerationTooOld (both expected under re-seeding — dedupe by content address
+      first) from SeqBeforeChainBase, BacklogTooWide, MissingCiphertext,
+      UnknownEphemeral, MismatchedEphemeral, GenerationExhausted, NotYetEstablished,
+      SkipTooLarge, Module and EntropySource. NOT YET AVAILABLE: a Ratchet cannot
+      be serialized or restored, which the frozen design requires (#243).
+      Sub-module dm::domain
       declares the daemonseed/dm/… label namespace, one distinct prefix-free label
       per purpose.
     no_std: false

@@ -90,6 +90,7 @@
 use std::collections::VecDeque;
 
 use oxicrypt_kdf::HkdfSha384;
+use oxicrypt_ml_kem as ml_kem;
 use zeroize::Zeroize;
 
 use crate::dm::domain;
@@ -144,6 +145,20 @@ pub const MAX_SKIP: usize = 64;
 /// One message arriving across a generation change causes two skip batches into
 /// this one cache; at `MAX_SKIP` the second batch would evict the first.
 pub const SKIPPED_KEY_CAPACITY: usize = 2 * MAX_SKIP;
+
+/// The furthest a receiver will step a chain in one call, retaining or not.
+///
+/// [`MAX_SKIP`] bounds how many keys are *kept*; this bounds how many are
+/// *derived*. The two differ because a chain cannot be indexed — reaching
+/// position `n` means stepping to it — so a receiver returning from a long
+/// absence has to walk past the messages it lost in order to read the ones it
+/// did not. Refusing instead would leave it unable to read anything on that
+/// chain, which is a far worse outcome than the loss the design already accepts.
+///
+/// Sixteen catch-ups' worth: enough to walk back into a conversation that ran on
+/// without us, small enough that a peer naming an absurd sequence number buys a
+/// bounded number of HKDF steps and nothing else.
+pub const MAX_CATCH_UP: u64 = 16 * MAX_SKIP as u64;
 
 /// Which way a message travels. Bound into the chain derivation, and into every
 /// authorship signature, so a frame can never be replayed back at its sender.
@@ -238,7 +253,7 @@ redacted_secret_newtype! {
 /// A key-schedule failure. Every variant here is a local condition: nothing in
 /// this module parses attacker-supplied bytes, so there is no authentication
 /// failure to report and no reason to make one uniform.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum RatchetError {
     /// HKDF failed — the module is not operational.
     Kdf(oxicrypt_kdf::KdfError),
@@ -250,6 +265,51 @@ pub enum RatchetError {
     /// it into "message did not open" would hide both, and truncating would hand
     /// back keys filed at positions no message will ever claim.
     SkipTooLarge { requested: u64, max: usize },
+    /// An ML-KEM or crypto-module operation failed at the module boundary.
+    Module(oxicrypt_module::Error),
+    /// The OS entropy source failed while minting an ephemeral or an
+    /// encapsulation.
+    EntropySource,
+    /// A frame claims a new generation but carries no ciphertext to root it in.
+    ///
+    /// Every message of a generation repeats that ciphertext precisely so this
+    /// cannot happen through ordinary loss; seeing it means a malformed or
+    /// truncated frame.
+    MissingCiphertext { generation: u32 },
+    /// A frame claims a generation whose step would need an ephemeral we no
+    /// longer hold — reordering deeper than [`EPHEMERAL_WINDOW`], or a frame that
+    /// could not have been produced by a peer following the protocol.
+    UnknownEphemeral { generation: u32 },
+    /// This position's key was used and destroyed, and it is not in the
+    /// skipped-key cache. Ordinary: re-seeding makes duplicates routine traffic,
+    /// and a caller should discard them by content address before asking. It can
+    /// also mean the key was evicted or abandoned, which is permanent loss — check
+    /// [`Ratchet::losses`] to tell a busy conversation from a lossy one.
+    AlreadyConsumed { generation: u32, seq: u64 },
+    /// The frame belongs to a generation behind the one we receive on, and its key
+    /// was not cached. Same practical handling as [`Self::AlreadyConsumed`], but
+    /// distinguishable because it means the peer is behind us rather than repeating
+    /// itself.
+    GenerationTooOld { frame: u32, current: u32 },
+    /// The frame claims a sequence number before its own chain begins. No honest
+    /// peer produces this; it is malformed or hostile, on a record only the two
+    /// parties can write.
+    SeqBeforeChainBase { chain_base: u64, seq: u64 },
+    /// The generation counter would overflow. Unreachable by any peer following
+    /// the protocol — reaching it needs 2^32 round trips — but the alternative is
+    /// a wrapping counter that collides two roots on one generation number.
+    GenerationExhausted,
+    /// A frame sits further ahead on its chain than [`MAX_CATCH_UP`] — further
+    /// than a receiver will walk in one step. Not recoverable by retrying the
+    /// same frame; the conversation re-anchors at the peer's next ratchet step.
+    BacklogTooWide { gap: u64, max: u64 },
+    /// The two halves of the opening ephemeral are not a keypair. Caught at
+    /// construction because ML-KEM would not catch it later: decapsulation never
+    /// fails, so the mismatch would surface as every reply being rejected forever.
+    MismatchedEphemeral,
+    /// The chain this operation needs does not exist yet — the initiator has had
+    /// no reply, or the recipient has not sent.
+    NotYetEstablished,
 }
 
 impl std::fmt::Display for RatchetError {
@@ -260,6 +320,39 @@ impl std::fmt::Display for RatchetError {
                 f,
                 "message skips {requested} keys ahead, more than the {max} one catch-up will derive"
             ),
+            Self::Module(e) => write!(f, "crypto module unavailable: {e:?}"),
+            Self::EntropySource => write!(f, "the entropy source failed"),
+            Self::MissingCiphertext { generation } => write!(
+                f,
+                "a frame at generation {generation} carries no ratchet ciphertext"
+            ),
+            Self::UnknownEphemeral { generation } => write!(
+                f,
+                "no ephemeral held for the step into generation {generation}"
+            ),
+            Self::AlreadyConsumed { generation, seq } => write!(
+                f,
+                "the key for generation {generation} sequence {seq} was already used or lost"
+            ),
+            Self::GenerationTooOld { frame, current } => write!(
+                f,
+                "a frame from generation {frame} arrived while receiving on {current}"
+            ),
+            Self::SeqBeforeChainBase { chain_base, seq } => write!(
+                f,
+                "sequence {seq} is before its own chain, which begins at {chain_base}"
+            ),
+            Self::GenerationExhausted => write!(f, "the ratchet generation counter is exhausted"),
+            Self::BacklogTooWide { gap, max } => write!(
+                f,
+                "a frame sits {gap} positions ahead, beyond the {max} one catch-up walks"
+            ),
+            Self::MismatchedEphemeral => {
+                write!(f, "the opening ephemeral's two halves are not a keypair")
+            }
+            Self::NotYetEstablished => {
+                write!(f, "the conversation has no chain in that direction yet")
+            }
         }
     }
 }
@@ -273,7 +366,7 @@ impl std::error::Error for RatchetError {}
 /// three are siblings rather than a chain so that no one of them is derivable
 /// from another: the retained addressing root must never yield the ratchet root
 /// it outlives. `the_three_roots_from_ss0_are_independent` is what holds that.
-pub fn derive_root(ss0: &[u8; 32]) -> Result<RootKey, RatchetError> {
+pub(crate) fn derive_root(ss0: &[u8; 32]) -> Result<RootKey, RatchetError> {
     let hkdf = HkdfSha384::extract(Some(domain::DM_ROOT_SALT), ss0).map_err(RatchetError::Kdf)?;
     expand_secret::<ROOT_KEY_LEN, _>(|b| hkdf.expand(domain::DM_RATCHET_ROOT, b), RootKey)
 }
@@ -285,7 +378,10 @@ pub fn derive_root(ss0: &[u8; 32]) -> Result<RootKey, RatchetError> {
 /// new secret cannot compute it without the old root, and one who holds the old
 /// root cannot compute it without the new secret. Losing either direction of that
 /// would cost the post-compromise heal this step exists for.
-pub fn advance_root(previous: RootKey, encapsulated: &[u8; 32]) -> Result<RootKey, RatchetError> {
+pub(crate) fn advance_root(
+    previous: RootKey,
+    encapsulated: &[u8; 32],
+) -> Result<RootKey, RatchetError> {
     let hkdf =
         HkdfSha384::extract(Some(previous.as_bytes()), encapsulated).map_err(RatchetError::Kdf)?;
     expand_secret::<ROOT_KEY_LEN, _>(|b| hkdf.expand(domain::DM_RATCHET_STEP, b), RootKey)
@@ -297,7 +393,7 @@ pub fn advance_root(previous: RootKey, encapsulated: &[u8; 32]) -> Result<RootKe
 /// the generation's sender uses one of them: a receiver never has to reason about
 /// which party owns which generation, it just derives the chain for the direction
 /// the frame declares.
-pub fn chain_key(root: &RootKey, dir: Direction) -> Result<ChainKey, RatchetError> {
+pub(crate) fn chain_key(root: &RootKey, dir: Direction) -> Result<ChainKey, RatchetError> {
     let hkdf = HkdfSha384::extract(Some(domain::DM_CHAIN_SALT), root.as_bytes())
         .map_err(RatchetError::Kdf)?;
     expand_secret::<CHAIN_KEY_LEN, _>(|b| hkdf.expand(dir.chain_info(), b), ChainKey)
@@ -311,7 +407,7 @@ pub fn chain_key(root: &RootKey, dir: Direction) -> Result<ChainKey, RatchetErro
 /// labels, so a compromised message key reveals neither its chain nor its
 /// successor — which is what makes deleting the chain key sufficient to protect
 /// everything before it.
-pub fn chain_step(ck: ChainKey) -> Result<(MessageKey, ChainKey), RatchetError> {
+pub(crate) fn chain_step(ck: ChainKey) -> Result<(MessageKey, ChainKey), RatchetError> {
     let hkdf = HkdfSha384::extract(Some(domain::DM_CHAIN_STEP_SALT), ck.as_bytes())
         .map_err(RatchetError::Kdf)?;
     // The message key is wrapped before the second expand runs, so if that one
@@ -346,11 +442,11 @@ pub fn chain_step(ck: ChainKey) -> Result<(MessageKey, ChainKey), RatchetError> 
 /// [`MAX_SKIP`] is what stops a peer naming `u64::MAX` and making us derive until
 /// the process dies. See the module docs for the other half of that defence,
 /// which is the caller's.
-pub fn skip(
+pub(crate) fn skip(
     ck: ChainKey,
     from: KeySlot,
     count: u64,
-) -> Result<(Vec<(KeySlot, MessageKey)>, ChainKey), RatchetError> {
+) -> Result<(SkippedBatch, ChainKey), RatchetError> {
     if count > MAX_SKIP as u64 {
         return Err(RatchetError::SkipTooLarge {
             requested: count,
@@ -372,6 +468,24 @@ pub fn skip(
     }
     Ok((derived, current))
 }
+
+/// Step a chain forward `count` times, discarding every key.
+///
+/// For positions a receiver has written off: the chain still has to be walked to
+/// get past them, but nothing is kept, so the derived keys never reach the cache
+/// and never reach a caller.
+fn burn(ck: ChainKey, count: u64) -> Result<ChainKey, RatchetError> {
+    let mut current = ck;
+    for _ in 0..count {
+        let (_discarded, next) = chain_step(current)?;
+        current = next;
+    }
+    Ok(current)
+}
+
+/// Message keys derived for positions that have not arrived, each tagged with
+/// the slot it must be filed under.
+pub type SkippedBatch = Vec<(KeySlot, MessageKey)>;
 
 /// Where a skipped key belongs: a generation, a direction, and a position.
 ///
@@ -475,9 +589,681 @@ impl SkippedKeys {
         self.entries.remove(at).map(|(_, k)| k)
     }
 
+    /// Borrow the key for a slot without consuming it.
+    ///
+    /// Separate from [`Self::take`] because a key must only be removed once the
+    /// frame that claimed it has authenticated; taking first and reinserting on
+    /// failure would make a failed open observable in the cache's ordering.
+    pub fn peek(&self, slot: &KeySlot) -> Option<&MessageKey> {
+        self.entries.iter().find(|(s, _)| s == slot).map(|(_, k)| k)
+    }
+
     /// Whether a slot is held, without consuming it.
     pub fn contains(&self, slot: &KeySlot) -> bool {
         self.entries.iter().any(|(s, _)| s == slot)
+    }
+}
+
+/// How many of our own ephemeral secrets to keep, indexed by the generation that
+/// published them.
+///
+/// **The lookup provably only ever matches the newest.** Our generations and the
+/// peer's are disjoint — they alternate — so an ephemeral tagged with the peer's
+/// generation cannot exist; and a step is taken only against a peer ephemeral we
+/// have not consumed, which pins the newest of ours at exactly one past the
+/// generation we receive on. An advancing frame is therefore always looking for
+/// the one at the back. An older frame never reaches the lookup at all: its key
+/// is in the skipped-key cache, and that path returns first.
+///
+/// The second is kept as a margin against that reasoning being wrong, not because
+/// any path needs it — a mistake there kills the conversation permanently, while
+/// the cost of being wrong in this direction is one retained decapsulation key.
+/// It is not, as an earlier comment here claimed, there to cover reordering.
+pub const EPHEMERAL_WINDOW: usize = 2;
+
+/// The first channel sequence number the initiator uses.
+///
+/// **One, not zero** — the initiator's sequence zero is the first-contact entry,
+/// which travels via the recipient's doorbell rather than the channel. Keeping
+/// one monotonic sequence per direction across the whole conversation is what
+/// lets the delivery acknowledgement's contiguous prefix confirm the opening
+/// message; a channel-local numbering would force it to special-case the one
+/// message that did not arrive by channel. The consequence is that the
+/// initiator's first page has an empty first slot, which is harmless because a
+/// page is judged reached by holding any populated slot, never by being full.
+pub const FIRST_INITIATOR_CHANNEL_SEQ: u64 = 1;
+
+/// The first channel sequence number the recipient uses — its opening reply,
+/// which is the first thing either party writes to the channel itself.
+pub const FIRST_RECIPIENT_CHANNEL_SEQ: u64 = 0;
+
+redacted_secret_newtype! {
+    /// The secret half of one of our ratchet ephemerals.
+    boxed pub struct EphemeralDecapKey([u8; ml_kem::DK_LEN]);
+}
+
+impl EphemeralDecapKey {
+    /// Take ownership of a decapsulation key.
+    ///
+    /// The macro that builds this newtype gives it a private field, which is
+    /// right for the seeds it was written for — those are only ever *produced*
+    /// inside their own module. This one is an *input*, so it needs a way in.
+    pub fn new(dk: Box<[u8; ml_kem::DK_LEN]>) -> Self {
+        Self(dk)
+    }
+
+    /// Whether this key is the secret half of `ek`.
+    ///
+    /// **Worth checking, because getting it wrong is silent.** ML-KEM
+    /// decapsulation never fails — a mismatched key yields a pseudorandom shared
+    /// secret rather than an error — so an initiator opened with two halves of
+    /// different keypairs would derive a wrong root at the first ratchet step and
+    /// then reject every reply forever, indistinguishably from tampering.
+    ///
+    /// FIPS 203 embeds the encapsulation key inside the decapsulation key
+    /// (`dk = dk_PKE ‖ ek ‖ H(ek) ‖ z`), so this is a memcmp against a slice we
+    /// already hold rather than a derivation.
+    pub fn matches(&self, ek: &[u8; ml_kem::EK_LEN]) -> bool {
+        const EK_OFFSET: usize = ml_kem::DK_LEN - ml_kem::EK_LEN - 64;
+        &self.as_bytes()[EK_OFFSET..EK_OFFSET + ml_kem::EK_LEN] == ek.as_slice()
+    }
+}
+
+/// One of our ephemeral keypairs, tagged with the generation that published it.
+struct Ephemeral {
+    generation: u32,
+    ek: Box<[u8; ml_kem::EK_LEN]>,
+    dk: EphemeralDecapKey,
+}
+
+impl std::fmt::Debug for Ephemeral {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Ephemeral(generation: {}, <redacted>)", self.generation)
+    }
+}
+
+/// One direction's chain under one root, and where along it we are.
+#[derive(Clone, Debug)]
+struct Chain {
+    generation: u32,
+    direction: Direction,
+    key: ChainKey,
+    /// The sequence number of this chain's first message.
+    base: u64,
+    /// The next sequence number this chain will produce a key for.
+    next: u64,
+}
+
+impl Chain {
+    fn slot(&self, seq: u64) -> KeySlot {
+        KeySlot {
+            generation: self.generation,
+            direction: self.direction,
+            seq,
+        }
+    }
+
+    /// Advance to `target`, returning the keys stepped over, the key at the
+    /// target, and the chain positioned after it.
+    /// Advance to `target`, returning the keys worth keeping, the key at the
+    /// target, the chain positioned after it, and how many keys were walked past
+    /// without being kept.
+    ///
+    /// **A gap wider than one catch-up loses its oldest keys rather than the
+    /// message that revealed it.** Refusing outright would be the safer-looking
+    /// choice and is the wrong one: a chain has no index, so a receiver that
+    /// refuses can never move its cursor, every later frame on that chain sits
+    /// further ahead still, and the whole inbound direction dies while continuing
+    /// to look alive from both ends. The frozen design's residual is bounded
+    /// per-message loss, never unbounded-downstream loss — so the oldest keys past
+    /// the retention bound are dropped, counted, and the arriving message opens.
+    fn advance_to(
+        self,
+        target: u64,
+    ) -> Result<(SkippedBatch, u64, MessageKey, Self), RatchetError> {
+        if target < self.next {
+            return Err(RatchetError::AlreadyConsumed {
+                generation: self.generation,
+                seq: target,
+            });
+        }
+        let Self {
+            generation,
+            direction,
+            base,
+            ..
+        } = self;
+        let gap = target - self.next;
+        if gap > MAX_CATCH_UP {
+            return Err(RatchetError::BacklogTooWide {
+                gap,
+                max: MAX_CATCH_UP,
+            });
+        }
+        let abandoned = gap.saturating_sub(MAX_SKIP as u64);
+        let from = self.slot(self.next + abandoned);
+        let key = if abandoned > 0 {
+            burn(self.key, abandoned)?
+        } else {
+            self.key
+        };
+        let (skipped, key) = skip(key, from, gap - abandoned)?;
+        let (message_key, next_key) = chain_step(key)?;
+        Ok((
+            skipped,
+            abandoned,
+            message_key,
+            Self {
+                key: next_key,
+                next: target + 1,
+                base,
+                generation,
+                direction,
+            },
+        ))
+    }
+
+    /// Derive every remaining key up to (but not including) `end` and discard the
+    /// chain — what a receiver does to the previous chain when the peer ratchets.
+    ///
+    /// Returns the keys derived and, when the gap is wider than one catch-up can
+    /// cover, how many were **abandoned** instead.
+    ///
+    /// **Abandoning rather than refusing is the whole point.** `end` arrives in a
+    /// frame we have not authenticated, so the work has to be bounded; but
+    /// refusing outright would drop the arriving message too, and every later
+    /// frame from that peer carries a wider gap still — so one long absence would
+    /// wedge the conversation permanently in a direction that still looks alive
+    /// from both ends. The frozen design already accepts losing keys past the
+    /// bound; it does not accept losing the conversation. So the old chain is let
+    /// go, the count is reported, and the message that triggered it still opens.
+    fn drain_to(self, end: u64) -> Result<(SkippedBatch, u64), RatchetError> {
+        let count = end.saturating_sub(self.next);
+        if count > MAX_CATCH_UP {
+            // Too far gone to walk. The chain is being retired anyway, so the
+            // whole of its remaining backlog is written off at no cost — which is
+            // what stops an unauthenticated `chain_base` buying unbounded work.
+            return Ok((Vec::new(), count));
+        }
+        let keep = count.min(MAX_SKIP as u64);
+        let abandoned = count - keep;
+        let from = self.slot(self.next + abandoned);
+        // Walking the whole gap would be unbounded work on an unauthenticated
+        // number, and the chain is discarded here anyway — so the oldest keys are
+        // written off without being derived at all. That is only sound because
+        // this chain is being retired: nothing downstream needs the positions it
+        // skips over.
+        let key = if abandoned > 0 {
+            burn(self.key, abandoned)?
+        } else {
+            self.key
+        };
+        let (drained, _spent) = skip(key, from, keep)?;
+        Ok((drained, abandoned))
+    }
+}
+
+/// What a frame carries about its place in the ratchet.
+///
+/// `chain_base` is the frozen design's `PN` stated absolutely rather than as a
+/// count. Sequence numbers here are monotonic per direction across the whole
+/// conversation — they address the page a message lives in — unlike a per-chain
+/// index that restarts at every ratchet step, so an absolute base is both
+/// unambiguous under loss and directly usable: it is exactly where the previous
+/// chain ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrameHeader {
+    /// Which root this message's chain hangs from.
+    pub generation: u32,
+    /// The sequence number of the first message of this chain.
+    pub chain_base: u64,
+    /// This message's sequence number.
+    pub seq: u64,
+}
+
+/// A message key to seal with, and everything the frame must carry to let the
+/// far end derive it.
+pub struct Outbound {
+    pub key: MessageKey,
+    pub header: FrameHeader,
+    /// The direction this message travels — what the authorship signature and the
+    /// page address must bind, taken from here rather than re-derived per site.
+    pub direction: Direction,
+    /// The ciphertext that created this generation, repeated on **every** message
+    /// of it. Without the repetition, losing the one message that opened a
+    /// generation would make the whole rest of the conversation undecryptable
+    /// rather than costing that single message. `None` only in the initiator's
+    /// opening burst, which hangs from the first-contact secret directly.
+    pub eph_ct: Option<Box<[u8; ml_kem::CT_LEN]>>,
+    /// Our current ephemeral. The far end encapsulates to it to take the next
+    /// generation step, which is the point at which our compromise heals.
+    pub eph_ek: Box<[u8; ml_kem::EK_LEN]>,
+}
+
+impl std::fmt::Debug for Outbound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Outbound")
+            .field("header", &self.header)
+            .field("has_eph_ct", &self.eph_ct.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// The conversation's live ratchet state.
+///
+/// Holds the current root, the two chains, our recent ephemerals and the
+/// skipped-key cache. One per conversation — [`KeySlot`] identifies a key within
+/// a channel, not across channels, so the cache inside must not be shared.
+///
+/// ## Generations alternate, and that is what makes the ephemeral lookup work
+///
+/// A generation belongs to exactly one sender: the initiator opens at generation
+/// zero, the recipient's reply is generation one, the initiator's next send is
+/// two. A party can only step by encapsulating to an ephemeral the other side
+/// published, and the only way to publish one is to send — so a peer can never be
+/// more than one generation ahead of our last send. A frame at generation `G`
+/// therefore always targets the ephemeral we published at `G-1`, which needs no
+/// selector on the wire, and skipping a whole generation is structurally
+/// impossible rather than merely unlikely.
+///
+/// ## Receiving never mutates on an unauthenticated frame
+///
+/// [`Self::receive`] takes the caller's open-and-verify as a closure and applies
+/// its state changes only if that closure succeeds. This is deliberate rather
+/// than convenient: a frame's sequence number cannot be checked before the key it
+/// names has been derived, so a peer could otherwise name a distant sequence
+/// number, make us fill the skipped-key cache with keys nobody will ever ask for,
+/// and permanently strand messages it has already published — one write, and the
+/// backlog is gone. Deriving the keys costs bounded work; *committing* them is
+/// what does damage, and that now cannot happen for a frame that did not open.
+pub struct Ratchet {
+    role: Role,
+    generation: u32,
+    root: RootKey,
+    send: Option<Chain>,
+    recv: Option<Chain>,
+    ephemerals: VecDeque<Ephemeral>,
+    /// The peer's latest ephemeral, tagged with the generation that published it.
+    peer_eph: Option<(u32, Box<[u8; ml_kem::EK_LEN]>)>,
+    /// The generation of the peer ephemeral we last stepped against.
+    ///
+    /// **This comparison is what stops a burst re-stepping the ratchet.** A
+    /// generation's ephemeral is repeated on every one of its messages, so
+    /// without it each arriving frame would look like a fresh ephemeral and our
+    /// next send would step again against a key we had already used —
+    /// encapsulating to an ephemeral the peer has moved past, leaving it unable
+    /// to derive the step at all. Only the generation tag distinguishes the
+    /// repeats; the ephemeral bytes are identical.
+    ///
+    /// An older frame arriving late cannot rewind this, because its key comes
+    /// from the skipped-key cache and that path returns before any ephemeral is
+    /// recorded.
+    consumed_peer_generation: Option<u32>,
+    gen_ct: Option<Box<[u8; ml_kem::CT_LEN]>>,
+    next_send_seq: u64,
+    skipped: SkippedKeys,
+    abandoned: u64,
+}
+
+/// What the ratchet has had to give up, and what it is still holding.
+///
+/// Named rather than a bare tuple of counts, which would be transposable at the
+/// call site — and these three mean very different things to a user interface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeliveryLosses {
+    /// Skipped keys currently held for messages that have not arrived.
+    pub pending: usize,
+    /// Keys dropped to stay inside the cache bound. Each is a message that can no
+    /// longer be read.
+    pub evicted: u64,
+    /// Keys never derived because a peer got further ahead in one generation than
+    /// a single catch-up covers. Each is likewise a message that can no longer be
+    /// read, but the cause is a long absence rather than a crowded cache.
+    pub abandoned: u64,
+}
+
+impl std::fmt::Debug for Ratchet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Ratchet")
+            .field("role", &self.role)
+            .field("generation", &self.generation)
+            .field("next_send_seq", &self.next_send_seq)
+            .field("skipped", &self.skipped.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Ratchet {
+    /// Open the ratchet as the party that sent the first-contact entry.
+    ///
+    /// `eph_ek` / `eph_dk` are the opening ratchet ephemeral the entry carried —
+    /// the recipient encapsulates to it in its reply, and without the secret half
+    /// that first step, and the forward secrecy it establishes, is lost.
+    pub fn initiator(
+        ss0: &[u8; 32],
+        eph_ek: Box<[u8; ml_kem::EK_LEN]>,
+        eph_dk: EphemeralDecapKey,
+    ) -> Result<Self, RatchetError> {
+        if !eph_dk.matches(&eph_ek) {
+            return Err(RatchetError::MismatchedEphemeral);
+        }
+        let root = derive_root(ss0)?;
+        let send = Chain {
+            generation: 0,
+            direction: Direction::AToB,
+            key: chain_key(&root, Direction::AToB)?,
+            base: FIRST_INITIATOR_CHANNEL_SEQ,
+            next: FIRST_INITIATOR_CHANNEL_SEQ,
+        };
+        let mut ephemerals = VecDeque::with_capacity(EPHEMERAL_WINDOW);
+        ephemerals.push_back(Ephemeral {
+            generation: 0,
+            ek: eph_ek,
+            dk: eph_dk,
+        });
+        Ok(Self {
+            role: Role::Initiator,
+            generation: 0,
+            root,
+            send: Some(send),
+            recv: None,
+            ephemerals,
+            peer_eph: None,
+            consumed_peer_generation: None,
+            gen_ct: None,
+            next_send_seq: FIRST_INITIATOR_CHANNEL_SEQ,
+            skipped: SkippedKeys::new(),
+            abandoned: 0,
+        })
+    }
+
+    /// Open the ratchet as the party that was knocked at, from the verified entry.
+    ///
+    /// `peer_eph_ek` is the initiator's opening ephemeral. Holding it is what lets
+    /// the first reply take the generation step that begins forward secrecy.
+    pub fn recipient(
+        ss0: &[u8; 32],
+        peer_eph_ek: Box<[u8; ml_kem::EK_LEN]>,
+    ) -> Result<Self, RatchetError> {
+        let root = derive_root(ss0)?;
+        let recv = Chain {
+            generation: 0,
+            direction: Direction::AToB,
+            key: chain_key(&root, Direction::AToB)?,
+            base: FIRST_INITIATOR_CHANNEL_SEQ,
+            next: FIRST_INITIATOR_CHANNEL_SEQ,
+        };
+        Ok(Self {
+            role: Role::Recipient,
+            generation: 0,
+            root,
+            send: None,
+            recv: Some(recv),
+            ephemerals: VecDeque::with_capacity(EPHEMERAL_WINDOW),
+            peer_eph: Some((0, peer_eph_ek)),
+            consumed_peer_generation: None,
+            gen_ct: None,
+            next_send_seq: FIRST_RECIPIENT_CHANNEL_SEQ,
+            skipped: SkippedKeys::new(),
+            abandoned: 0,
+        })
+    }
+
+    /// Which end of the conversation this is.
+    pub fn role(&self) -> Role {
+        self.role
+    }
+
+    /// The current root generation.
+    pub fn generation(&self) -> u32 {
+        self.generation
+    }
+
+    /// What this conversation is holding and what it has lost. Both loss counts
+    /// are permanent and belong in front of a user, not only in a log.
+    pub fn losses(&self) -> DeliveryLosses {
+        DeliveryLosses {
+            pending: self.skipped.len(),
+            evicted: self.skipped.evicted(),
+            abandoned: self.abandoned,
+        }
+    }
+
+    /// The direction we send on, and the one we receive on.
+    ///
+    /// Exposed because the frame layer needs the direction at three places per
+    /// message — the authorship signature, the page address, and the receive-side
+    /// signature reconstruction — and mapping a role onto a direction by hand at
+    /// each of them is exactly what [`Role`] exists to prevent.
+    pub fn send_direction(&self) -> Direction {
+        self.role.send_dir()
+    }
+
+    /// See [`Self::send_direction`].
+    pub fn recv_direction(&self) -> Direction {
+        self.role.recv_dir()
+    }
+
+    /// Mint the key for our next outbound message, taking a generation step first
+    /// if the peer has published a fresh ephemeral since our last one.
+    pub fn send_next(&mut self) -> Result<Outbound, RatchetError> {
+        if let Some((generation, _)) = self.peer_eph.as_ref()
+            && self.consumed_peer_generation != Some(*generation)
+        {
+            self.step_forward()?;
+        }
+        // Cloned rather than taken: `advance_to` consumes the chain, so taking it
+        // out and restoring it afterwards would destroy it on any failure in
+        // between and leave this conversation unable to send anything ever again
+        // — from a transient crypto-module fault, and reported as though the
+        // conversation had never been established.
+        let chain = self.send.clone().ok_or(RatchetError::NotYetEstablished)?;
+        let seq = self.next_send_seq;
+        let (skipped, abandoned, key, chain) = chain.advance_to(seq)?;
+        debug_assert!(skipped.is_empty(), "sending never skips its own chain");
+        debug_assert_eq!(abandoned, 0, "sending never walks past its own chain");
+
+        let header = FrameHeader {
+            generation: chain.generation,
+            chain_base: chain.base,
+            seq,
+        };
+        let eph_ek = self
+            .ephemerals
+            .back()
+            .ok_or(RatchetError::NotYetEstablished)?
+            .ek
+            .clone();
+
+        self.send = Some(chain);
+        self.next_send_seq += 1;
+        Ok(Outbound {
+            key,
+            header,
+            direction: self.role.send_dir(),
+            eph_ct: self.gen_ct.clone(),
+            eph_ek,
+        })
+    }
+
+    /// Take a generation step: encapsulate to the peer's latest ephemeral, re-root
+    /// the ratchet on the result, mint a fresh ephemeral of our own, and start a
+    /// new sending chain.
+    fn step_forward(&mut self) -> Result<(), RatchetError> {
+        let (peer_generation, peer_ek) = self
+            .peer_eph
+            .clone()
+            .ok_or(RatchetError::NotYetEstablished)?;
+
+        let mut m = [0u8; ml_kem::SEED_LEN];
+        getrandom::fill(&mut m).map_err(|_| RatchetError::EntropySource)?;
+        let encapsulated = ml_kem::encapsulate(&peer_ek, &m);
+        m.zeroize();
+        let (mut ss, ct) = encapsulated.map_err(RatchetError::Module)?;
+
+        // The clone is deliberate: `advance_root` consumes its input so a spent
+        // root cannot be reused, and the clone is zeroized when it is consumed
+        // while assigning the successor drops (and zeroizes) the original.
+        let advanced = advance_root(self.root.clone(), &ss);
+        ss.zeroize();
+        let root = advanced?;
+
+        let mut d = [0u8; ml_kem::SEED_LEN];
+        let mut z = [0u8; ml_kem::SEED_LEN];
+        getrandom::fill(&mut d).map_err(|_| RatchetError::EntropySource)?;
+        getrandom::fill(&mut z).map_err(|_| RatchetError::EntropySource)?;
+        let generated = ml_kem::keygen(&d, &z);
+        d.zeroize();
+        z.zeroize();
+        let (ek, mut dk) = generated.map_err(RatchetError::Module)?;
+
+        let generation = self
+            .generation
+            .checked_add(1)
+            .ok_or(RatchetError::GenerationExhausted)?;
+        let send = Chain {
+            generation,
+            direction: self.role.send_dir(),
+            key: chain_key(&root, self.role.send_dir())?,
+            base: self.next_send_seq,
+            next: self.next_send_seq,
+        };
+
+        self.root = root;
+        self.generation = generation;
+        self.send = Some(send);
+        self.gen_ct = Some(Box::new(ct));
+        self.consumed_peer_generation = Some(peer_generation);
+        self.ephemerals.push_back(Ephemeral {
+            generation,
+            ek: Box::new(ek),
+            dk: EphemeralDecapKey(Box::new(dk)),
+        });
+        dk.zeroize();
+        while self.ephemerals.len() > EPHEMERAL_WINDOW {
+            self.ephemerals.pop_front();
+        }
+        Ok(())
+    }
+
+    /// Derive the key for an inbound frame, hand it to `open`, and advance the
+    /// ratchet **only if `open` succeeds**.
+    ///
+    /// `open` returns `Err` for a frame that did not authenticate; the ratchet is
+    /// then untouched, including the skipped-key cache, and the caller's own error
+    /// comes back unchanged so it can still tell a bad tag from a bad signature.
+    /// See the type docs for why that ordering is load-bearing rather than tidy.
+    ///
+    /// A duplicate of a message already opened returns
+    /// [`RatchetError::AlreadyConsumed`]: its key was used once and destroyed.
+    /// Re-seeding means duplicates are ordinary traffic, so a caller is expected to
+    /// discard them by content address before reaching here.
+    pub fn receive<T, E>(
+        &mut self,
+        header: &FrameHeader,
+        eph_ct: Option<&[u8; ml_kem::CT_LEN]>,
+        peer_eph_ek: &[u8; ml_kem::EK_LEN],
+        open: impl FnOnce(&MessageKey) -> Result<T, E>,
+    ) -> Result<Result<T, E>, RatchetError> {
+        if header.seq < header.chain_base {
+            return Err(RatchetError::SeqBeforeChainBase {
+                chain_base: header.chain_base,
+                seq: header.seq,
+            });
+        }
+        let direction = self.role.recv_dir();
+        let slot = KeySlot {
+            generation: header.generation,
+            direction,
+            seq: header.seq,
+        };
+
+        // A message we had already stepped past. Its key is spoken for; nothing
+        // else about the ratchet moves.
+        if let Some(cached) = self.skipped.peek(&slot) {
+            let key = cached.clone();
+            let outcome = open(&key);
+            if outcome.is_ok() {
+                self.skipped.take(&slot);
+            }
+            return Ok(outcome);
+        }
+
+        let current = self.recv.as_ref().map(|c| c.generation);
+        let advancing = match current {
+            Some(g) if header.generation == g => false,
+            Some(g) if header.generation > g => true,
+            None => true,
+            Some(current) => {
+                return Err(RatchetError::GenerationTooOld {
+                    frame: header.generation,
+                    current,
+                });
+            }
+        };
+
+        // Everything below is computed against clones, so an unauthenticated
+        // frame leaves no trace.
+        let (drained, abandoned, next_root, chain) = if advancing {
+            let ct = eph_ct.ok_or(RatchetError::MissingCiphertext {
+                generation: header.generation,
+            })?;
+            let target =
+                header
+                    .generation
+                    .checked_sub(1)
+                    .ok_or(RatchetError::UnknownEphemeral {
+                        generation: header.generation,
+                    })?;
+            let eph = self
+                .ephemerals
+                .iter()
+                .find(|e| e.generation == target)
+                .ok_or(RatchetError::UnknownEphemeral {
+                    generation: header.generation,
+                })?;
+            let mut ss =
+                ml_kem::decapsulate(eph.dk.as_bytes(), ct).map_err(RatchetError::Module)?;
+            let advanced = advance_root(self.root.clone(), &ss);
+            ss.zeroize();
+            let next_root = advanced?;
+
+            // Run the previous chain out to where this one starts, so the messages
+            // still in flight behind the ratchet step stay readable.
+            let (drained, abandoned) = match self.recv.clone() {
+                Some(old) => old.drain_to(header.chain_base)?,
+                None => (Vec::new(), 0),
+            };
+            let chain = Chain {
+                generation: header.generation,
+                direction,
+                key: chain_key(&next_root, direction)?,
+                base: header.chain_base,
+                next: header.chain_base,
+            };
+            (drained, abandoned, Some(next_root), chain)
+        } else {
+            let chain = self.recv.clone().ok_or(RatchetError::NotYetEstablished)?;
+            (Vec::new(), 0, None, chain)
+        };
+
+        let (skipped, walked_past, key, chain) = chain.advance_to(header.seq)?;
+
+        let outcome = open(&key);
+        let Ok(_) = &outcome else {
+            return Ok(outcome);
+        };
+
+        if let Some(root) = next_root {
+            self.root = root;
+            self.generation = self.generation.max(header.generation);
+        }
+        self.abandoned += abandoned + walked_past;
+        self.skipped.insert_all(drained);
+        self.skipped.insert_all(skipped);
+        self.recv = Some(chain);
+        self.peer_eph = Some((header.generation, Box::new(*peer_eph_ek)));
+        Ok(outcome)
     }
 }
 
@@ -794,12 +1580,13 @@ mod tests {
         );
 
         let err = skip(a2b_chain(0x11), slot(0, 1), MAX_SKIP as u64 + 1).unwrap_err();
-        assert_eq!(
-            err,
-            RatchetError::SkipTooLarge {
-                requested: MAX_SKIP as u64 + 1,
-                max: MAX_SKIP,
-            }
+        assert!(
+            matches!(
+                err,
+                RatchetError::SkipTooLarge { requested, max }
+                    if requested == MAX_SKIP as u64 + 1 && max == MAX_SKIP
+            ),
+            "expected a refusal carrying both numbers, got {err:?}"
         );
     }
 
@@ -890,6 +1677,581 @@ mod tests {
             !rendered.contains("49"),
             "no decimal byte rendering: {rendered}"
         );
+    }
+
+    // ---- the live ratchet ----------------------------------------------------
+
+    /// A fresh ML-KEM keypair for the initiator's opening ephemeral.
+    fn opening_ephemeral() -> ([u8; ml_kem::EK_LEN], [u8; ml_kem::DK_LEN]) {
+        let _ = oxicrypt_module::initialize();
+        let mut d = [0u8; ml_kem::SEED_LEN];
+        let mut z = [0u8; ml_kem::SEED_LEN];
+        getrandom::fill(&mut d).unwrap();
+        getrandom::fill(&mut z).unwrap();
+        ml_kem::keygen(&d, &z).unwrap()
+    }
+
+    /// Two ratchets over one first-contact secret, as they stand the moment the
+    /// recipient has opened the entry.
+    fn pair() -> (Ratchet, Ratchet) {
+        let ss0 = ss(0x11);
+        let (ek, dk) = opening_ephemeral();
+        let initiator =
+            Ratchet::initiator(&ss0, Box::new(ek), EphemeralDecapKey::new(Box::new(dk))).unwrap();
+        let recipient = Ratchet::recipient(&ss0, Box::new(ek)).unwrap();
+        (initiator, recipient)
+    }
+
+    /// Hand a frame to the far end and return the key it derived.
+    fn deliver(to: &mut Ratchet, out: &Outbound) -> Result<Result<[u8; 32], ()>, RatchetError> {
+        to.receive(&out.header, out.eph_ct.as_deref(), &out.eph_ek, |k| {
+            Ok(*k.as_bytes())
+        })
+    }
+
+    /// Deliver and assert both ends agree on the key.
+    fn deliver_ok(to: &mut Ratchet, out: &Outbound) {
+        let got = deliver(to, out)
+            .expect("no key-schedule failure")
+            .expect("the frame opened");
+        assert_eq!(
+            &got,
+            out.key.as_bytes(),
+            "the two ends derived different keys"
+        );
+    }
+
+    /// The property the whole module exists for: whatever the sender sealed
+    /// under, the receiver independently derives.
+    #[test]
+    fn a_message_opens_at_the_far_end() {
+        let (mut a, mut b) = pair();
+        let out = a.send_next().unwrap();
+        deliver_ok(&mut b, &out);
+    }
+
+    /// The initiator's channel sequence starts at one because its sequence zero
+    /// is the first-contact entry, which travelled by doorbell. The recipient's
+    /// opening reply is the first thing written to the channel itself.
+    #[test]
+    fn the_two_directions_start_at_the_documented_sequence_numbers() {
+        let (mut a, mut b) = pair();
+        assert_eq!(
+            a.send_next().unwrap().header.seq,
+            FIRST_INITIATOR_CHANNEL_SEQ
+        );
+        assert_eq!(a.send_next().unwrap().header.seq, 2);
+
+        let reply = b.send_next().unwrap();
+        assert_eq!(reply.header.seq, FIRST_RECIPIENT_CHANNEL_SEQ);
+        assert_eq!(b.send_next().unwrap().header.seq, 1);
+    }
+
+    /// Generations belong to one sender each and alternate. This is what makes a
+    /// frame at generation `G` always target the ephemeral published at `G-1`,
+    /// with no selector on the wire.
+    #[test]
+    fn generations_alternate_between_the_two_parties() {
+        let (mut a, mut b) = pair();
+
+        let opening = a.send_next().unwrap();
+        assert_eq!(opening.header.generation, 0);
+        assert!(
+            opening.eph_ct.is_none(),
+            "the opening burst roots in the first-contact secret, not a step"
+        );
+        deliver_ok(&mut b, &opening);
+
+        let reply = b.send_next().unwrap();
+        assert_eq!(reply.header.generation, 1);
+        assert!(reply.eph_ct.is_some(), "a reply must carry its step");
+        deliver_ok(&mut a, &reply);
+
+        let second = a.send_next().unwrap();
+        assert_eq!(second.header.generation, 2);
+        deliver_ok(&mut b, &second);
+
+        let third = b.send_next().unwrap();
+        assert_eq!(third.header.generation, 3);
+        deliver_ok(&mut a, &third);
+    }
+
+    /// A run of messages in one direction must NOT keep stepping the ratchet: the
+    /// peer publishes one ephemeral per generation and repeats it on every frame,
+    /// so treating each repeat as fresh would encapsulate to a key the peer has
+    /// already moved past and leave it unable to derive the step at all.
+    #[test]
+    fn a_repeated_peer_ephemeral_does_not_step_the_ratchet_again() {
+        let (mut a, mut b) = pair();
+        for _ in 0..3 {
+            let out = a.send_next().unwrap();
+            deliver_ok(&mut b, &out);
+        }
+
+        let first = b.send_next().unwrap();
+        let second = b.send_next().unwrap();
+        let third = b.send_next().unwrap();
+        assert_eq!(first.header.generation, 1);
+        assert_eq!(second.header.generation, 1, "a burst is one generation");
+        assert_eq!(third.header.generation, 1);
+
+        deliver_ok(&mut a, &first);
+        deliver_ok(&mut a, &second);
+        deliver_ok(&mut a, &third);
+    }
+
+    /// Out-of-order arrival within one chain: the later message opens first, and
+    /// the ones it stepped over stay readable.
+    #[test]
+    fn messages_that_arrive_out_of_order_still_open() {
+        let (mut a, mut b) = pair();
+        let sent: Vec<_> = (0..4).map(|_| a.send_next().unwrap()).collect();
+
+        deliver_ok(&mut b, &sent[3]);
+        assert_eq!(b.losses().pending, 3, "the gap was kept");
+
+        deliver_ok(&mut b, &sent[0]);
+        deliver_ok(&mut b, &sent[2]);
+        deliver_ok(&mut b, &sent[1]);
+        assert_eq!(
+            b.losses(),
+            DeliveryLosses {
+                pending: 0,
+                evicted: 0,
+                abandoned: 0
+            },
+            "every gap was filled, none lost"
+        );
+    }
+
+    /// The case the two-bound cache sizing exists for: messages still in flight
+    /// from before a ratchet step must survive the step. The receiver runs the
+    /// previous chain out to where the new one begins.
+    #[test]
+    fn messages_in_flight_survive_a_generation_change() {
+        let (mut a, mut b) = pair();
+        let burst: Vec<_> = (0..5).map(|_| a.send_next().unwrap()).collect();
+
+        // Only the first of the burst gets through before the reply.
+        deliver_ok(&mut b, &burst[0]);
+        let reply = b.send_next().unwrap();
+        deliver_ok(&mut a, &reply);
+
+        // A ratchets and sends again; that frame reaches B before the stragglers.
+        let after_step = a.send_next().unwrap();
+        assert_eq!(after_step.header.generation, 2);
+        deliver_ok(&mut b, &after_step);
+
+        // The four stragglers from generation 0 still open.
+        for straggler in &burst[1..] {
+            deliver_ok(&mut b, straggler);
+        }
+        assert_eq!(b.losses().evicted, 0, "nothing was evicted");
+    }
+
+    /// Every message of a generation repeats the ciphertext that created it, so
+    /// losing the message that opened a generation costs that message and nothing
+    /// more. Without the repetition the whole downstream conversation would be
+    /// undecryptable.
+    #[test]
+    fn losing_the_first_message_of_a_generation_costs_only_that_message() {
+        let (mut a, mut b) = pair();
+        let opening = a.send_next().unwrap();
+        deliver_ok(&mut b, &opening);
+        let reply = b.send_next().unwrap();
+        deliver_ok(&mut a, &reply);
+
+        let first = a.send_next().unwrap();
+        let second = a.send_next().unwrap();
+        let third = a.send_next().unwrap();
+        assert_eq!(first.header.generation, 2);
+
+        // The generation's opening message never arrives; the second one carries
+        // the same ciphertext and establishes the generation on its own.
+        deliver_ok(&mut b, &second);
+        deliver_ok(&mut b, &third);
+        // And the lost one still opens if it turns up later.
+        deliver_ok(&mut b, &first);
+    }
+
+    /// The load-bearing ordering: a frame that does not authenticate must leave
+    /// the ratchet exactly as it was — including the skipped-key cache, which is
+    /// what a peer would otherwise be able to flush with one unauthenticated
+    /// write.
+    #[test]
+    fn a_frame_that_does_not_authenticate_changes_nothing() {
+        let (mut a, mut b) = pair();
+        let sent: Vec<_> = (0..3).map(|_| a.send_next().unwrap()).collect();
+        deliver_ok(&mut b, &sent[0]);
+
+        let before = (b.generation(), b.losses());
+
+        // A frame claiming a far-ahead sequence number, which fails to open.
+        let hostile = FrameHeader {
+            generation: 0,
+            chain_base: sent[0].header.chain_base,
+            seq: sent[0].header.seq + 40,
+        };
+        let rejected = b
+            .receive(&hostile, None, &sent[0].eph_ek, |_| Err::<(), ()>(()))
+            .expect("deriving is allowed; committing is not");
+        assert!(rejected.is_err());
+
+        assert_eq!(
+            (b.generation(), b.losses()),
+            before,
+            "an unauthenticated frame moved the ratchet"
+        );
+
+        // And the genuine backlog is still readable.
+        deliver_ok(&mut b, &sent[1]);
+        deliver_ok(&mut b, &sent[2]);
+    }
+
+    /// A rejected frame must not consume the cached key it named either.
+    #[test]
+    fn a_rejected_frame_does_not_consume_a_cached_key() {
+        let (mut a, mut b) = pair();
+        let sent: Vec<_> = (0..3).map(|_| a.send_next().unwrap()).collect();
+        deliver_ok(&mut b, &sent[2]);
+        assert_eq!(b.losses().pending, 2);
+
+        let rejected = b
+            .receive(
+                &sent[0].header,
+                None,
+                &sent[0].eph_ek,
+                |_| Err::<(), ()>(()),
+            )
+            .unwrap();
+        assert!(rejected.is_err());
+        assert_eq!(b.losses().pending, 2, "the cached key was consumed anyway");
+
+        deliver_ok(&mut b, &sent[0]);
+        assert_eq!(b.losses().pending, 1);
+    }
+
+    /// A message key is used once. Re-presenting an opened frame finds nothing,
+    /// which is what makes deleting keys meaningful.
+    #[test]
+    fn a_message_key_is_not_available_twice() {
+        let (mut a, mut b) = pair();
+        let out = a.send_next().unwrap();
+        deliver_ok(&mut b, &out);
+
+        let err = deliver(&mut b, &out).unwrap_err();
+        assert!(
+            matches!(err, RatchetError::AlreadyConsumed { .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// A frame claiming a new generation with no ciphertext to root it in cannot
+    /// arise from ordinary loss, since every frame of a generation repeats it.
+    #[test]
+    fn a_generation_step_without_its_ciphertext_is_refused() {
+        let (mut a, mut b) = pair();
+        deliver_ok(&mut b, &a.send_next().unwrap());
+        let reply = b.send_next().unwrap();
+
+        let mut a2 = pair().0;
+        let err = a2
+            .receive(&reply.header, None, &reply.eph_ek, |k| {
+                Ok::<_, ()>(*k.as_bytes())
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, RatchetError::MissingCiphertext { generation: 1 }),
+            "got {err:?}"
+        );
+    }
+
+    /// Reordering deeper than the ephemeral window is refused rather than served
+    /// a key derived from the wrong secret — ML-KEM decapsulation never fails, so
+    /// a wrong ephemeral would silently yield a wrong shared secret.
+    #[test]
+    fn a_step_needing_a_forgotten_ephemeral_is_refused() {
+        let (mut a, _b) = pair();
+        let out = a.send_next().unwrap();
+        let ct = [0u8; ml_kem::CT_LEN];
+        let far_future = FrameHeader {
+            generation: 99,
+            chain_base: 0,
+            seq: 0,
+        };
+        let err = a
+            .receive(&far_future, Some(&ct), &out.eph_ek, |k| {
+                Ok::<_, ()>(*k.as_bytes())
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, RatchetError::UnknownEphemeral { generation: 99 }),
+            "got {err:?}"
+        );
+    }
+
+    /// The recipient cannot send before it has a chain, and the ratchet says so
+    /// rather than inventing one.
+    #[test]
+    fn a_conversation_reports_what_it_cannot_do_yet() {
+        let (a, b) = pair();
+        assert_eq!(a.role(), Role::Initiator);
+        assert_eq!(b.role(), Role::Recipient);
+        assert_eq!(a.generation(), 0);
+        assert_eq!(b.generation(), 0);
+    }
+
+    /// Twenty messages each way, interleaved. Nothing accumulates, nothing is
+    /// lost, and the two ends never disagree about a key.
+    #[test]
+    fn a_long_conversation_stays_in_step() {
+        let (mut a, mut b) = pair();
+        for round in 0..20 {
+            let from_a = a.send_next().unwrap();
+            deliver_ok(&mut b, &from_a);
+            let from_b = b.send_next().unwrap();
+            deliver_ok(&mut a, &from_b);
+            assert_eq!(a.losses().pending, 0, "round {round}");
+            assert_eq!(b.losses().pending, 0, "round {round}");
+        }
+        // Two steps per round — one each way — and both ends land on the same
+        // generation because each adopts the other's on receipt.
+        assert_eq!(a.generation(), 39);
+        assert_eq!(b.generation(), 39);
+    }
+
+    /// An older message arriving after the ratchet has moved on is served from
+    /// the skipped-key cache, and that path must return before anything else
+    /// moves — in particular before the peer ephemeral is recorded. Otherwise the
+    /// straggler would reinstate a generation's ephemeral the peer has long since
+    /// replaced, and our next send would step against a key it cannot use.
+    #[test]
+    fn an_old_message_arriving_late_does_not_rewind_the_peer_ephemeral() {
+        let (mut a, mut b) = pair();
+        deliver_ok(&mut b, &a.send_next().unwrap());
+
+        let early = b.send_next().unwrap();
+        let later = b.send_next().unwrap();
+        assert_eq!(early.header.generation, 1);
+        deliver_ok(&mut a, &later);
+        assert_eq!(a.losses().pending, 1, "the straggler's key was kept");
+
+        deliver_ok(&mut b, &a.send_next().unwrap());
+        let from_b = b.send_next().unwrap();
+        assert_eq!(from_b.header.generation, 3);
+        deliver_ok(&mut a, &from_b);
+
+        // The straggler finally lands, out of the cache.
+        deliver_ok(&mut a, &early);
+
+        // The next send must be the step past generation 3, not a re-step against
+        // generation 1's ephemeral.
+        let next = a.send_next().unwrap();
+        assert_eq!(next.header.generation, 4);
+        deliver_ok(&mut b, &next);
+    }
+
+    /// The two halves of the opening ephemeral must be a keypair. ML-KEM never
+    /// reports a mismatch — decapsulation returns a pseudorandom secret — so
+    /// without this check the conversation would derive a wrong root at the first
+    /// step and reject every reply forever, looking exactly like tampering.
+    #[test]
+    fn an_opening_ephemeral_from_two_keypairs_is_refused() {
+        let ss0 = ss(0x11);
+        let (ek, _dk) = opening_ephemeral();
+        let (_other_ek, other_dk) = opening_ephemeral();
+
+        let err = Ratchet::initiator(
+            &ss0,
+            Box::new(ek),
+            EphemeralDecapKey::new(Box::new(other_dk)),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, RatchetError::MismatchedEphemeral),
+            "got {err:?}"
+        );
+    }
+
+    /// A receiver returning from a long absence must lose the messages it missed,
+    /// never the direction. Refusing the catch-up would leave its cursor frozen,
+    /// every later frame further ahead still, and the inbound half permanently
+    /// dead while both ends still looked healthy.
+    #[test]
+    fn a_backlog_wider_than_one_catch_up_loses_messages_not_the_channel() {
+        let (mut a, mut b) = pair();
+        let sent: Vec<_> = (0..(MAX_SKIP + 20))
+            .map(|_| a.send_next().unwrap())
+            .collect();
+
+        // B was away and only ever collects the newest.
+        let newest = sent.last().unwrap();
+        deliver_ok(&mut b, newest);
+
+        let losses = b.losses();
+        assert!(losses.abandoned > 0, "the walked-past keys were counted");
+        assert_eq!(
+            losses.abandoned + losses.pending as u64,
+            (MAX_SKIP + 19) as u64,
+            "every position before the newest is accounted for"
+        );
+
+        // And the channel keeps working in both directions.
+        let reply = b.send_next().unwrap();
+        deliver_ok(&mut a, &reply);
+        deliver_ok(&mut b, &a.send_next().unwrap());
+    }
+
+    /// The same, across a ratchet step: a previous chain too far gone to walk is
+    /// retired outright rather than blocking the step, so the conversation
+    /// re-anchors on the new chain instead of dying. This is the path where
+    /// refusing would have been permanent — every later frame carries a wider gap
+    /// still, so the inbound half would never recover.
+    #[test]
+    fn a_generation_step_over_an_unwalkable_backlog_re_anchors() {
+        let (mut a, mut b) = pair();
+        deliver_ok(&mut b, &a.send_next().unwrap());
+        deliver_ok(&mut a, &b.send_next().unwrap());
+
+        // One generation-2 frame gets through, so B can step later.
+        deliver_ok(&mut b, &a.send_next().unwrap());
+
+        // Then A runs far ahead on generation 2 and B hears none of it.
+        for _ in 0..(MAX_CATCH_UP + 100) {
+            let _unheard = a.send_next().unwrap();
+        }
+
+        // B replies, publishing a fresh ephemeral; A steps to generation 4.
+        deliver_ok(&mut a, &b.send_next().unwrap());
+        let after_step = a.send_next().unwrap();
+        assert_eq!(after_step.header.generation, 4);
+
+        // B's generation-2 chain is now unwalkably far behind. The step must land
+        // anyway.
+        deliver_ok(&mut b, &after_step);
+        assert!(
+            b.losses().abandoned > MAX_CATCH_UP,
+            "the retired chain's backlog was counted, not silently dropped"
+        );
+
+        // Both directions still work.
+        deliver_ok(&mut a, &b.send_next().unwrap());
+        deliver_ok(&mut b, &a.send_next().unwrap());
+    }
+
+    /// Beyond what one catch-up will walk, the frame is refused rather than
+    /// costing unbounded work — but with an error that says it is a backlog, not
+    /// an attack.
+    #[test]
+    fn a_frame_beyond_the_catch_up_bound_is_refused_by_distance() {
+        let (mut a, mut b) = pair();
+        let first = a.send_next().unwrap();
+        deliver_ok(&mut b, &first);
+
+        let far = FrameHeader {
+            generation: first.header.generation,
+            chain_base: first.header.chain_base,
+            seq: first.header.seq + MAX_CATCH_UP + 2,
+        };
+        let err = b
+            .receive(&far, None, &first.eph_ek, |k| Ok::<_, ()>(*k.as_bytes()))
+            .unwrap_err();
+        assert!(
+            matches!(err, RatchetError::BacklogTooWide { gap, max } if gap == MAX_CATCH_UP + 1 && max == MAX_CATCH_UP),
+            "got {err:?}"
+        );
+    }
+
+    /// A sequence number before its own chain begins is not something an honest
+    /// peer produces, and it is caught before any work is done.
+    #[test]
+    fn a_sequence_before_its_own_chain_is_rejected() {
+        let (mut a, mut b) = pair();
+        let out = a.send_next().unwrap();
+        let bad = FrameHeader {
+            generation: 0,
+            chain_base: 10,
+            seq: 4,
+        };
+        let err = b
+            .receive(&bad, None, &out.eph_ek, |k| Ok::<_, ()>(*k.as_bytes()))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RatchetError::SeqBeforeChainBase {
+                    chain_base: 10,
+                    seq: 4
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    /// A frame from behind the generation we receive on is distinguishable from a
+    /// duplicate — the peer is behind us, rather than repeating itself.
+    #[test]
+    fn a_frame_from_an_older_generation_says_so() {
+        let (mut a, mut b) = pair();
+        deliver_ok(&mut b, &a.send_next().unwrap());
+        let reply = b.send_next().unwrap();
+        deliver_ok(&mut a, &reply);
+        let second = a.send_next().unwrap();
+        deliver_ok(&mut b, &second);
+
+        // A frame at generation 0 now, whose position was never cached.
+        let stale = FrameHeader {
+            generation: 0,
+            chain_base: 1,
+            seq: 900,
+        };
+        let err = b
+            .receive(&stale, None, &second.eph_ek, |k| Ok::<_, ()>(*k.as_bytes()))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RatchetError::GenerationTooOld {
+                    frame: 0,
+                    current: 2
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    /// The caller's own failure reason survives the round trip, so a bad AEAD tag
+    /// and a bad signature stay distinguishable to the layer that can tell them
+    /// apart.
+    #[test]
+    fn the_callers_error_comes_back_unchanged() {
+        let (mut a, mut b) = pair();
+        let out = a.send_next().unwrap();
+
+        #[derive(Debug, PartialEq)]
+        enum Why {
+            BadSignature,
+        }
+        let outcome = b
+            .receive(&out.header, out.eph_ct.as_deref(), &out.eph_ek, |_| {
+                Err::<(), _>(Why::BadSignature)
+            })
+            .unwrap();
+        assert_eq!(outcome, Err(Why::BadSignature));
+
+        // And the frame is still openable afterwards, because nothing committed.
+        deliver_ok(&mut b, &out);
+    }
+
+    /// The ratchet holds keys and ephemerals; its `Debug` must not print them.
+    #[test]
+    fn the_ratchet_does_not_render_its_secrets() {
+        let (mut a, _b) = pair();
+        let out = a.send_next().unwrap();
+        let rendered = format!("{a:?}");
+        assert!(!rendered.contains(&hex::encode(out.key.as_bytes())));
+        assert!(rendered.contains("Initiator"));
+        assert!(!format!("{out:?}").contains(&hex::encode(out.key.as_bytes())));
     }
 
     // ---- the skipped-key cache -----------------------------------------------

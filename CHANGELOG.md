@@ -26,6 +26,10 @@ work lives in the project lead's vault manifest, not here.
 
 ### Fixed
 
+- `FirstContactState` zeroizes `ss0` on drop and carries its opening ratchet
+  decapsulation key as `ratchet::EphemeralDecapKey`, which zeroizes on drop; it
+  was a bare `Box<[u8; DK_LEN]>` with no wrapper. (#234, #135)
+
 - `dm::firstcontact::derive_channel_roots` zeroizes its transient buffers on
   every path and `ChannelRoots` is zeroize-on-drop: `[u8; N]` is `Copy` with no
   `Drop`, so the originals were staying live in the stack frame after the struct
@@ -58,6 +62,32 @@ work lives in the project lead's vault manifest, not here.
   sole definition of the `a2b` / `b2a` wire literals. Every derivation zeroizes
   its transient buffer on both paths. The generation state machine, page
   addressing and the wire frame are not wired yet. (#234, ISC-C42)
+
+- DM ratchet state machine — `daemonseed_core::dm::ratchet::Ratchet`
+  (`initiator`, `recipient`, `send_next`, `receive`, `role`, `generation`,
+  `skipped_stats`), with `FrameHeader`, `Outbound`, `EphemeralDecapKey`,
+  `EPHEMERAL_WINDOW`, `FIRST_INITIATOR_CHANNEL_SEQ`,
+  `FIRST_RECIPIENT_CHANNEL_SEQ`. `send_next` takes a generation step when the
+  peer has published an ephemeral newer than the one last stepped against, mints
+  a fresh ephemeral, and repeats the generation's ciphertext on every message of
+  it. `receive` takes the caller's open-and-verify as a closure, computes against
+  clones, and applies its state changes only if that closure succeeds; it runs
+  the previous chain out to the arriving chain's base so messages in flight
+  across a ratchet step stay readable, and serves an already-skipped position
+  from the cache without touching anything else. A frame at generation `G`
+  decapsulates with the ephemeral published at `G-1`, so no selector rides the
+  wire. The initiator's channel sequence starts at 1 (sequence 0 is the
+  first-contact entry, carried by doorbell); the recipient's starts at 0.
+  `MAX_SKIP` bounds how many keys are kept and `MAX_CATCH_UP` (16 x `MAX_SKIP`)
+  how far a chain is walked, so a receiver returning from a long absence loses
+  the messages it missed rather than the direction; a previous chain too far
+  behind to walk is retired outright at a ratchet step. `Ratchet::losses`
+  reports pending, evicted and abandoned counts separately. `initiator` rejects
+  an opening ephemeral whose halves are not a keypair. `RatchetError`
+  distinguishes `AlreadyConsumed`, `GenerationTooOld`, `SeqBeforeChainBase`,
+  `BacklogTooWide`, `MissingCiphertext`, `UnknownEphemeral`, `MismatchedEphemeral`,
+  `GenerationExhausted` and `NotYetEstablished`. The wire frame and page
+  addressing are not wired yet. (#234, ISC-C42)
 
 - Domain labels `DM_RATCHET_ROOT`, `DM_RATCHET_STEP`, `DM_CHAIN_SALT`,
   `DM_CHAIN_A2B`, `DM_CHAIN_B2A`, `DM_CHAIN_STEP_SALT`, `DM_MK`, `DM_CK`. (#234)
