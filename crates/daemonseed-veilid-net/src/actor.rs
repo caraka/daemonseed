@@ -1110,7 +1110,13 @@ async fn actor_loop(
                 // Local crypto only (no network): derive the owner keypair, compute the
                 // deterministic record key. Feeds the frontend's RecordKey→owner_seed map.
                 let res = match identity::rendezvous_owner_keypair(&owner_seed) {
-                    Ok(owner) => rendezvous::rendezvous_key(&api, &owner).await,
+                    Ok(owner) => rendezvous::rendezvous_key(
+                        &api,
+                        &owner,
+                        rendezvous::RecordShape::RENDEZVOUS,
+                    )
+                    .await
+                    .map(rendezvous::RendezvousHandle::into_key),
                     Err(e) => Err(e),
                 };
                 let _ = reply.send(res);
@@ -1444,12 +1450,13 @@ async fn publish_rendezvous(
     // locks and stay concurrent, so this never blocks another record or the loop.
     let record_lock = rendezvous::record_lock(record_locks, &owner_seed);
     let _write_guard = record_lock.lock().await;
-    let key = rendezvous::open_cached(
+    let handle = rendezvous::open_cached(
         opened,
-        &owner_seed,
-        rendezvous::open_or_create(gate, api, rc, &owner),
+        &rendezvous::cached_record_id(&owner_seed, rendezvous::RecordShape::RENDEZVOUS),
+        rendezvous::open_or_create(gate, api, rc, &owner, rendezvous::RecordShape::RENDEZVOUS),
     )
     .await?;
+    let key = handle.key().clone();
     let base = rendezvous::member_base_subkey(node_pub);
     // Lock only for the synchronous cursor bump — never across an await — so the
     // main loop and a spawned refresh can interleave ring writes safely.
@@ -1465,7 +1472,7 @@ async fn publish_rendezvous(
     };
     crate::vtrace!("publish_rendezvous: key={key:?} ring base={base} seq={seq}");
     let started = std::time::Instant::now();
-    let r = rendezvous::publish(rc, &key, &owner, base, seq, sealed).await;
+    let r = rendezvous::publish(rc, &handle, &owner, base, seq, sealed).await;
     // Runs on a spawned task off the actor command loop (D-0b, #128), so a slow
     // write never becomes queue latency for the commands behind it.
     crate::vtrace!(
@@ -1499,15 +1506,18 @@ async fn publish_current_state(
     // same-record ops (chat publishes, other adverts) — see rendezvous::record_lock.
     let record_lock = rendezvous::record_lock(record_locks, &owner_seed);
     let _write_guard = record_lock.lock().await;
-    let key = rendezvous::open_cached(
+    let handle = rendezvous::open_cached(
         opened,
-        &owner_seed,
-        rendezvous::open_or_create(gate, api, rc, &owner),
+        &rendezvous::cached_record_id(&owner_seed, rendezvous::RecordShape::RENDEZVOUS),
+        rendezvous::open_or_create(gate, api, rc, &owner, rendezvous::RecordShape::RENDEZVOUS),
     )
     .await?;
     let subkey = rendezvous::current_state_subkey(stable_id);
-    crate::vtrace!("publish_current_state: stable_id={stable_id} key={key:?} subkey={subkey}");
-    rendezvous::publish_at_subkey(rc, &key, &owner, subkey, sealed).await
+    crate::vtrace!(
+        "publish_current_state: stable_id={stable_id} key={:?} subkey={subkey}",
+        handle.key()
+    );
+    rendezvous::publish_at_subkey(rc, &handle, &owner, subkey, sealed).await
 }
 
 /// The dispatch token the write scheduler carries per queued write, matched by the
@@ -1633,17 +1643,20 @@ async fn subscribe_rendezvous(
     let owner = identity::rendezvous_owner_keypair(&owner_seed)?;
     // Single-flight the open against a concurrent same-record publish; the guard is
     // dropped before the watch registers (only the open needs serialization).
-    let key = {
+    let handle = {
         let record_lock = rendezvous::record_lock(record_locks, &owner_seed);
         let _open_guard = record_lock.lock().await;
         rendezvous::open_cached(
             opened,
-            &owner_seed,
-            rendezvous::open_or_create(gate, api, rc, &owner),
+            &rendezvous::cached_record_id(&owner_seed, rendezvous::RecordShape::RENDEZVOUS),
+            rendezvous::open_or_create(gate, api, rc, &owner, rendezvous::RecordShape::RENDEZVOUS),
         )
         .await?
     };
-    crate::vtrace!("subscribe_rendezvous: record open key={key:?}; registering watch");
+    crate::vtrace!(
+        "subscribe_rendezvous: record open key={:?}; registering watch",
+        handle.key()
+    );
     // §RS-2 margin limiter: `watch_dht_values` is an un-gated DHT op, so hold an
     // un-gated-op permit across the raw watch — peak open+watch concurrency ≤ margin(2)
     // by construction (CRSH-ISC-14). CRSH-ISC-17: no read-pool permit is held across
@@ -1652,7 +1665,7 @@ async fn subscribe_rendezvous(
     // guard above is already dropped, so only the watch RPC sits under the limiter.
     {
         let _ungated = gate.acquire_ungated().await;
-        rc.watch_dht_values(key.clone(), None, None, None)
+        rc.watch_dht_values(handle.key().clone(), None, None, None)
             .await
             .map_err(|e| VeilidNetError::Routing(e.to_string()))?;
     }
@@ -1660,7 +1673,7 @@ async fn subscribe_rendezvous(
     // Read lane (WB-5 / I5′.1): the backlog sweep is a burst of DHT GETs; hold a
     // read permit from the shared accountant for its duration so reads and writes
     // draw on one budget.
-    spawn_gated_sweep(gate, rc, key, ev_tx);
+    spawn_gated_sweep(gate, rc, handle, ev_tx);
     Ok(())
 }
 
@@ -1672,14 +1685,14 @@ async fn subscribe_rendezvous(
 fn spawn_gated_sweep(
     gate: &Arc<DhtGate>,
     rc: &RoutingContext,
-    key: RecordKey,
+    handle: rendezvous::RendezvousHandle,
     ev_tx: &mpsc::UnboundedSender<VeilidNetEvent>,
 ) {
     let gate = gate.clone();
     let rc = rc.clone();
     let ev_tx = ev_tx.clone();
     tokio::spawn(async move {
-        rendezvous::sweep(gate, rc, key, ev_tx).await;
+        rendezvous::sweep(gate, rc, handle, ev_tx).await;
     });
 }
 
@@ -1701,19 +1714,22 @@ async fn resweep_rendezvous(
     let owner = identity::rendezvous_owner_keypair(&owner_seed)?;
     // Single-flight the open against a concurrent same-record publish (mirrors
     // subscribe_rendezvous); no watch is registered here.
-    let key = {
+    let handle = {
         let record_lock = rendezvous::record_lock(record_locks, &owner_seed);
         let _open_guard = record_lock.lock().await;
         rendezvous::open_cached(
             opened,
-            &owner_seed,
-            rendezvous::open_or_create(gate, api, rc, &owner),
+            &rendezvous::cached_record_id(&owner_seed, rendezvous::RecordShape::RENDEZVOUS),
+            rendezvous::open_or_create(gate, api, rc, &owner, rendezvous::RecordShape::RENDEZVOUS),
         )
         .await?
     };
-    crate::vtrace!("resweep_rendezvous: record open key={key:?}; spawning backlog sweep -> Ok");
+    crate::vtrace!(
+        "resweep_rendezvous: record open key={:?}; spawning backlog sweep -> Ok",
+        handle.key()
+    );
     // Read lane (WB-5 / I5′.1): hold a shared-accountant read permit for the sweep.
-    spawn_gated_sweep(gate, rc, key, ev_tx);
+    spawn_gated_sweep(gate, rc, handle, ev_tx);
     Ok(())
 }
 
@@ -1743,29 +1759,29 @@ async fn repair_rendezvous(
     let outcome = rendezvous::repair_gated(
         &record_lock,
         opened,
-        &owner_seed,
+        &rendezvous::cached_record_id(&owner_seed, rendezvous::RecordShape::RENDEZVOUS),
         rendezvous::REPAIR_CLOSE_FIRST,
         // close (repro-gated): best-effort — a close on a session veilid already GC'd is a
         // benign race (Evidence 3 sibling), so the error is swallowed.
-        |key| async move {
-            if let Err(e) = rc.close_dht_record(key).await {
+        |handle: rendezvous::RendezvousHandle| async move {
+            if let Err(e) = rc.close_dht_record(handle.into_key()).await {
                 crate::vtrace!("repair_rendezvous: close_dht_record (pre-reopen) failed ({e})");
             }
         },
         // open: `open_or_create` acquires the un-gated limiter around each raw open
         // (CRSH-ISC-14/17); no read permit is held across it.
-        || rendezvous::open_or_create(gate, api, rc, &owner),
+        || rendezvous::open_or_create(gate, api, rc, &owner, rendezvous::RecordShape::RENDEZVOUS),
         // watch: un-gated limiter around the raw watch; no read permit held (CRSH-ISC-17).
-        |key| async move {
+        |handle: rendezvous::RendezvousHandle| async move {
             let _ungated = gate.acquire_ungated().await;
-            rc.watch_dht_values(key, None, None, None)
+            rc.watch_dht_values(handle.into_key(), None, None, None)
                 .await
                 .map(|_| ())
                 .map_err(|e| VeilidNetError::Routing(e.to_string()))
         },
-        // sweep: full 0..64 re-sweep, per-GET read permits (WB-5.1 / I5″.2), awaited under
+        // sweep: full 0..o_cnt re-sweep, per-GET read permits (WB-5.1 / I5″.2), awaited under
         // the lock. No SweepHealth emission (the frontend owns the tracker reset).
-        |key| rendezvous::sweep_collect(gate, rc, key, ev_tx),
+        |handle| rendezvous::sweep_collect(gate, rc, handle, ev_tx),
     )
     .await?;
     crate::vtrace!(

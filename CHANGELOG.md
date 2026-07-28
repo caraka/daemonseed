@@ -24,6 +24,16 @@ next release this block is renamed to its version + date and a fresh
 `[Unreleased]` is opened (see `AGENTS.md` doc-sync). Planning for *unstarted*
 work lives in the project lead's vault manifest, not here.
 
+### Fixed
+
+- The DFLT subkey write guard is schema-derived (`RecordShape`): the cap is
+  `min(MAX_SUBKEY_SIZE, MAX_RECORD_DATA_SIZE / o_cnt)`, the bound `veilid-core`
+  enforces. The rendezvous engine derives a record's key from its shape and
+  returns the two bound as a `RendezvousHandle`, so a write or sweep reads the
+  shape off the handle rather than re-supplying it. The open-cache is keyed on
+  `(owner_seed, o_cnt)`. An out-of-range `o_cnt` panics rather than clamping.
+  (#232, ISC-C100)
+
 ### Added
 
 - Direct-messaging design-of-record **FROZEN** (`docs/design/direct-messaging.md`,

@@ -24,7 +24,7 @@
 //!   share ones re-scoped to the Veilid DHT. S31 added the #89 UploadMotd
 //!   in-band signer-set MOTD; #156 added ISC-S32/S33/S34 pos + ISC-A-S24/A-S25/
 //!   A-S26 neg — the receiver-verifiable share_id binding)
-//! - 124 client-side: 88 positive (`ISC-C*`) + 36 negative (`ISC-A-C*`)
+//! - 125 client-side: 89 positive (`ISC-C*`) + 36 negative (`ISC-A-C*`)
 //!   (M16 A1 added C66 manifest-preview + A-C33 no-blind-download, A2 added C67 selective-fetch,
 //!   A3 added C68 choose-download-dir, A4 added C72 collapsible-folder-tree preview, C1 added C69
 //!   multi-share-publish, C2 added C70 status-auto-clear, C3 added C71 generate-circle-phrase;
@@ -48,9 +48,12 @@
 //!   C96 GUI circle-detail name vectors;
 //!   C97 right-click clipboard context menu on text fields;
 //!   C98 GUI share-name persistence;
+//!   C100 schema-derived DFLT subkey write guard (`RecordShape`), #232;
 //!   WB-ISC-9/10/13 pos + WB-ISC-11/12 neg — the WB-3 write scheduler, #159;
 //!   WB-ISC-3/4/5/6/7 pos + WB-ISC-1/2/8 neg — the WB-1 presence model, #159.)
-//! - 189 total
+//! - 240 total = 39 server + 125 client + 76 build-family
+//!   (WB-ISC 26, CRSH-ISC 28, DL-ISC 22). The per-family tallies above are the
+//!   authoritative breakdown; [`TOTAL`] is the compile-time-asserted sum.
 //!
 //! Deliberately EXCLUDED from [`ISCS`] (and therefore from [`TOTAL`]) because
 //! they are not built: the deferred direct-messaging family
@@ -247,6 +250,8 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-C98", IscClass::Positive),
     // ── client positive (#150: circle-chat per-sender authorship, room↔circle convergence) ──
     ("ISC-C99", IscClass::Positive),
+    // ── client positive (#232: schema-derived DFLT subkey write guard; RecordShape) ──
+    ("ISC-C100", IscClass::Positive),
     // ── client negative (20) ────────────────────────────────────────────
     ("ISC-A-C1", IscClass::Negative),
     ("ISC-A-C2", IscClass::Negative),
@@ -407,7 +412,7 @@ pub const ISCS: &[(&str, IscClass)] = &[
 /// of truth for the coverage denominator, read live by `xtask isc-coverage`.
 /// Recount on every ISC add/remove (the `const _` assert below guards it
 /// against [`ISCS`]).
-pub const TOTAL: usize = 239;
+pub const TOTAL: usize = 240;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -636,10 +641,14 @@ mod tests {
         //                                  core: stored-manifest digest binding +
         //                                  re-derivation) —
         //                                  the DL-ISC-* family registers per build step.
-        //   total   158 pos + 81 neg = 239
+        //                                  direct messaging (#232, docs/design/
+        //                                  direct-messaging.md): ISC-C100 pos
+        //                                  (schema-derived DFLT subkey write guard) —
+        //                                  the DM family registers per build slice.
+        //   total   159 pos + 81 neg = 240
         //   (the v0.33.0 Veilid cutover retired 14 server-positive + 10
         //    server-negative relay/TLS/federation/rate-limit ISCs.)
-        assert_eq!(pos, 158, "positive count drift");
+        assert_eq!(pos, 159, "positive count drift");
         assert_eq!(neg, 81, "negative count drift");
     }
 
