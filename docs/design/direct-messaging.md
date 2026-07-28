@@ -306,3 +306,105 @@ The revised direction was re-run through the same 3-lens panel (the check that s
 2. **No PFS is achievable with a static per-identity KEM key.** The ratchet was theatre. Real forward secrecy requires a rotating/ephemeral-KEM key layer (a PQ double-ratchet), which is a substantial redesign of the key layer, not a bolt-on.
 
 **Round-2 verdict:** the revised direction is the right *direction* — `ss`-gated ongoing-channel authority is a genuine, banked win — but it is not a freeze. #1 is capped by the lobby side-channel (F1), #2 is reopened by the ack's non-durability (E1/E2) and the unaddressed world-writable wipe (E5/E6), and #3 is not mechanical (no-FS F1, unwritten nonce/AAD spec F9/F10, binding gaps F4/F5). The next iteration must first make **scope/ambition calls** that are above a build — best-effort delivery vs a pinning node; no-PFS vs a key-layer redesign; unlinkability-vs-lobby vs cover traffic — and only then write the concrete crypto construction before a third panel. Fork verdicts and schema facts still carry forward unchanged.
+
+## Committed decisions (2026-07-27, caraka — post round-2) — the ambition line
+
+The round-2 scope/ambition calls are made. These convert two of the three "hard limits" into committed work.
+
+### D-PFS — take on a post-quantum ratchet key-layer redesign (committed)
+
+"No PFS" is the wrong landing for a pure-PQ project, so the static-KEM key layer is replaced by a PQ ratchet. Shape:
+
+- **Two chains.** A per-message **symmetric chain** (`CK_{n+1} = HKDF(CK_n)`, message key `MK_n = HKDF(CK_n)`, **delete `CK_n`/`MK_n` after use**) gives forward secrecy cheaply, every message. An **asymmetric KEM ratchet** advances on each round-trip: the replying party ships a fresh **ephemeral ML-KEM-1024** public key, the peer encapsulates to it → new root secret → new sending chain — giving post-compromise healing. Async degradation is the standard double-ratchet one: per-message FS is immediate; post-compromise recovery lags until the next reply.
+- **The F1 fix — decouple addressing from the deletable seal-key chain.** The rendezvous **address chain** derives from a retained **address root `AR`** (`addr_epoch = HKDF("…/dm/addr/v1", AR ‖ epoch)`); the **seal keys** derive from the ratcheted, forward-deleted chain. Both are seeded from the initial `ss0` at channel start, but only `AR` is retained. Compromise of current state then reveals addresses (metadata — past+future) and the *current* message chain (current message + until the next KEM-ratchet heals), but **not deleted past message keys**. Honest property: **content forward secrecy holds; address-linkability is not forward-secret** (addresses are metadata, and no ratchet hides metadata from an endpoint compromise). State exactly this — no overclaim.
+- **The cost to design around:** ML-KEM EK/CT are ~1568 B each, so every KEM-ratchet step is kilobytes on a 16 KB-subkey DHT under a tight write budget. Ratchet cadence vs write budget is the tuning axis (symmetric steps are cheap; KEM steps are the expensive ones, so heal on round-trips, not per message).
+- **Frontier note:** a fully-PQ *continuous* ratchet is not widely deployed (Signal's PQXDH is PQ only on the initial handshake; its ongoing ratchet is still classical). This is real design work, appropriate to the project's thesis.
+
+### D-DELIV — fail-safe ack handshake + generous ignorant hosting; pinning node rejected; overlay deferred (committed)
+
+Corrects the round-2 overclaim that "reliable collection confirmation is impossible" — it is impossible only if you *stop on a weak positive signal*. Fail-safe fixes it:
+
+- **Default not-delivered; confirm only on a genuine ack.** The sender keeps best-effort re-seeding and flips a message to *confirmed* only on an **authenticated monotonic high-water** ("I have collected up to seq S"), written on the `ss`-channel — unforgeable because only the two parties hold the channel owner secret (verified: Veilid rejects any write where `writer != owner`, `schema.rs:60,83`). This converts E1/E2 from *silent loss + false-delivered* into *extra re-seeding until convergence* — an eviction now only **delays and costs writes, never loses and never shows a false "delivered."** The one true-loss case (message evicts AND sender gone forever before recipient ever collects) is reported honestly as "not confirmed," so the UI is never *wrong*.
+- **Two-sided re-seed, self-terminating.** Sender re-seeds a message until high-water ≥ its seq; recipient re-seeds its high-water while it still sees unacked messages; when the sender stops (ack seen), the message evicts, the recipient stops seeing it, and stops acking. Fixes the E3 ack-of-ack regress by mutual observation. Epoch advance is **never** an ack (F2).
+- **Availability = generous ignorant hosting, no dedicated node.** Every Veilid node already stores records near its key ID; clients simply become **more generous storage nodes** (raise the remote-record-store limits — the `remote_max_records=64` dial). Sealed content, opaque keys, proximity-selected → zero-knowledge, no chokepoint, no permanent infra (dodges the pinning-node surveillance/coercion concerns). **Bound (verified):** a non-owner cannot *refresh* a record (`writer != owner` rejected), so generous hosts *lengthen* the eviction window but do not *guarantee* retention once the owner stops re-seeding — which is why the ack handshake, not the swarm, provides correctness.
+- **Rejected: a dedicated pinning/availability node** — it walks back the Veilid migration's no-always-on-dependency win and concentrates metadata into a single surveillance/coercion vantage.
+- **Deferred: a daemonseed replication *overlay*** (clients store + re-serve sealed blobs outside the owner-write DHT) — it could both refresh and echo, but it is a new subsystem ("distributed relay reborn") with its own reduced-but-real surface. Only if the retention window proves too short in practice.
+- **Not obtained: decorrelation cover from the swarm.** The owner-write rule that makes the ack unforgeable also blocks third parties from injecting write-timing cover on a channel they don't own — so F1 decorrelation must come from endpoint cover traffic (expensive) or stay an accepted cap. This stays under the unlinkability posture (decision #1's residual), NOT solved here.
+
+### The residual ambition call still open
+
+- **Unlinkability vs the lobby (F1).** Still capped: activity-timed DM writes are rhythm-correlatable to lobby-published online windows. Options remain: accept-and-document for alpha (recommended given the ongoing channel is otherwise pseudonymous), endpoint constant-cadence cover traffic (expensive, WB-budget hit), or reduce lobby co-residence. **Not yet decided.**
+
+## Concrete crypto construction (DRAFT v1 — 2026-07-27, for the third panel; NOT frozen)
+
+> First concrete pass, written so a panel has a fixed target instead of a direction. Every seal names its key, nonce, and AAD; every signature names its signed input; every derivation is a domain-labelled HKDF, never a bare hash/concat. **Sub-decisions flagged `‹OPEN›` need caraka or a panel.** This supersedes the sketch-level derivations scattered above.
+
+### Primitives & identities
+
+- **Primitives:** ML-KEM-1024 (KEM; EK/CT 1568 B), ML-DSA-87 (sig 4627 B, pk 2592 B), AES-256-GCM (96-bit nonce), HKDF-SHA384, SHA-384. All from oxicrypt.
+- **Long-term identity (mnemonic-derived, static):** ML-DSA sign keypair `(S_lt, PK_lt)`; ML-KEM keypair `(DK_lt, EK_lt)`. Both already exist (`keys.rs`).
+- **Per-contact pseudonym (random per correspondent, at-rest only):** a fresh ML-DSA sign keypair `(S_pc, PK_pc)` per correspondent — signs ongoing DM messages so wire authorship is not the long-term key. **Not** mnemonic-derived (so it is unlinkable and unrecoverable — accepted, tied to the M11 recovery limit).
+- **Ephemeral ratchet keys:** fresh ML-KEM keypairs generated per KEM-ratchet step (D-PFS).
+- **Domain-label namespace:** all HKDF `info` / AAD strings live under `daemonseed/dm/…`, length-prefixed, one distinct label per purpose (owner-seed ≠ seal-key ≠ addr-chain ≠ ratchet-KDF ≠ nonce ≠ each signature-domain ≠ each AAD). No label is a prefix of another. (F11)
+
+### Nonce rule (global — closes F9)
+
+Every AES-256-GCM seal carries its **96-bit nonce explicitly** in the envelope. Message keys are unique by construction (`MK_n` from a forward-advancing chain; `ss0`/ephemeral-KEM roots are single-use), so `(key, nonce)` never repeats. **Re-seed re-emits the byte-identical stored frame** (encapsulate+seal **once** at compose, persist the frame, re-seed verbatim) — never re-seals under the same key → no reuse, and it satisfies content-address dedup (closes the m7 tension). AAD is distinct per seal kind (closes F10).
+
+### Key record (per long-term identity, `dflt(1)`, world-derivable)
+
+```
+DmKeyRecord {
+  version:  u64                       // monotonic
+  ek_lt:    [1568]                    // long-term ML-KEM EK
+  invite_only: bool                   // admission policy advert (F7 leak accepted)
+  sig:      ML-DSA_{S_lt}( "daemonseed/dm/keyrec/sig/v1" ‖ PK_lt ‖ LE64(version) ‖ ek_lt ‖ invite_only )
+}
+```
+- Address owner seed = `HKDF("daemonseed/dm/keyrec/owner/v1", ikm = PK_lt)`. Readers cache highest verified `version`, never regress (rollback M1 = a cold reader accepts an old authentic record; residual accepted for alpha, or ‹OPEN› pin a floor via a second channel).
+- **UKS fix (F4) is at the message layer, not here:** rather than prove DK possession (hard for KEM non-interactively), the first-contact body binds the *intended recipient* (below), so a misdirected ciphertext is rejected by the wrong recipient.
+
+### First-contact entry (self-contained — option A; `dflt(64)`, 16 KB; world-writable)
+
+```
+FirstContactEntry {
+  pow:      [..]                      // PoW over ("daemonseed/dm/fc/pow/v1" ‖ recipient_keyrec_addr ‖ LE64(epoch) ‖ SHA384(ct0 ‖ sealed))  (option B)
+  ct0:      [1568]                    // ML-KEM.encaps(EK_lt_B) → (ct0, ss0)
+  nonce:    [12]
+  sealed:   AES-256-GCM(
+              key = HKDF("daemonseed/dm/fc/seal/v1", ikm = ss0),
+              nonce, aad = "daemonseed/dm/fc/aad/v1" ‖ recipient_keyrec_addr ‖ LE64(epoch),
+              plaintext = FirstContactBody )
+}
+FirstContactBody {
+  intended_recipient: PK_lt_B         // F4: B rejects if != own PK_lt
+  PK_lt_A, PK_pc_A
+  bind_lt:  ML-DSA_{S_lt_A}("daemonseed/dm/bind/lt/v1" ‖ PK_lt_A ‖ PK_pc_A)   // pseudonym↔identity
+  bind_pop: ML-DSA_{S_pc_A}("daemonseed/dm/bind/pop/v1" ‖ PK_pc_A ‖ PK_lt_A)  // F5: PoP of P_A
+  token?:   ML-DSA_{S_lt_B}("daemonseed/dm/token/v1" ‖ PK_lt_A ‖ nonce_t ‖ LE64(expiry))  // option C, if B invite-only
+  ar_seed:  [32]                      // address-root contribution (see channel)
+  eph_ek_A: [1568]                    // A's first ratchet ephemeral EK (so B can heal on its reply)
+  seq: u64 = 0, sent_ms, body
+  msg_sig:  ML-DSA_{S_pc_A}("daemonseed/dm/msg/v1" ‖ chan_id ‖ LE64(epoch) ‖ LE64(seq) ‖ sent_ms ‖ body)  // authorship under pseudonym; binds channel+epoch+seq (B2/F5)
+}
+```
+- **Replay:** PoW binds `epoch`; recipient persists seen `SHA384(entry)` for the current epoch (within-epoch dedup, F8); the slow first-contact epoch rotation rejects cross-epoch replay.
+- **Token one-time:** B persists spent `nonce_t` (residual: lost on recovery, F7/M11 — accepted).
+
+### The ongoing channel & ratchet
+
+- `ss0` (from first contact) seeds two independent roots: **`AR = HKDF("daemonseed/dm/addr/root/v1", ss0 ‖ ar_seed_A ‖ ar_seed_B)`** (retained) and the **send-chain root `RK0 = HKDF("daemonseed/dm/ratchet/root/v1", ss0)`** (ratcheted + deleted forward).
+- **Address per epoch:** `chan_addr(epoch) = HKDF("daemonseed/dm/addr/v1", AR ‖ LE64(epoch))` → Veilid owner keypair for a `dflt(N)` shared record. Both parties derive it; both are owners (owner-write ⇒ third parties can't forge/erase — the banked win). `chan_id = HKDF("daemonseed/dm/chanid/v1", AR)`.
+- **‹OPEN› epoch driver.** Wall-clock (`epoch = floor(now/period)`) → resync after any offline gap but a global synchronized reshuffle (metadata F3/F4) and a permanent-loss risk beyond the retained window (E9); interaction-counter → desync/no-passive-advance. Leaning wall-clock with a **wide window + several concurrent live epochs** for the store-and-forward tolerance, and accept the synchronized-reshuffle metadata cost. Needs a panel.
+- **Message:** per message advance the symmetric chain (`CK_{n+1}=HKDF("daemonseed/dm/chain/v1",CK_n)`, `MK_n=HKDF("daemonseed/dm/mk/v1",CK_n)`, delete). Optionally carry `eph_ek` to advance the KEM ratchet on a reply. Seal under `MK_n`, explicit nonce, AAD `"daemonseed/dm/msg/aad/v1" ‖ chan_id ‖ LE64(epoch)`; `msg_sig` as above (binds `chan_id‖epoch‖seq` — kills carrier/cross-epoch replay B2/F2).
+- **Ack (high-water):** `AckMarker { high_water: u64, sig = ML-DSA_{S_pc}("daemonseed/dm/ack/v1" ‖ chan_id ‖ LE64(epoch) ‖ LE64(high_water)) }`, sealed on the channel. Sender advances a message to *confirmed* only on a verified `high_water ≥ seq` (monotonic; a stale lower marker never regresses — F2). Epoch advance is not an ack.
+
+### What this construction still does NOT resolve (for the panel)
+
+- **Metadata F1** (lobby rhythm-intersection) — architectural, not a crypto-spec fix; stays the open unlinkability call.
+- **Rollback M1** (cold reader accepts an old authentic key record) — accepted for alpha or needs a second-channel version floor ‹OPEN›.
+- **Recovery M11** — pseudonym/`ss`/spent-token state is at-rest-only, lost on restore; `ss ∉ f(mnemonic)` by design, so only a re-bootstrap or re-first-contact restores reachability. Accepted-for-alpha or needs a re-bootstrap signal ‹OPEN›.
+- **Epoch driver ‹OPEN›** and the **wide-window metadata cost** (F3) — panel input wanted.
+- **Budget** — the two-sided ack handshake + KEM-ratchet kilobytes + generous hosting must be re-derived against WB-2/WB-5.1 (decision #4).
+
+**Status: DRAFT — not frozen.** Next: caraka's calls on the `‹OPEN›` items + the unlinkability residual, then a third 3-lens panel against this construction, then (if it survives) the WB budget arithmetic, then freeze.
