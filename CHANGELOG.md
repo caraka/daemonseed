@@ -24,6 +24,8 @@ next release this block is renamed to its version + date and a fresh
 `[Unreleased]` is opened (see `AGENTS.md` doc-sync). Planning for *unstarted*
 work lives in the project lead's vault manifest, not here.
 
+## [0.36.3] — 2026-07-28
+
 ### Added
 
 - Direct-messaging design-of-record **FROZEN** (`docs/design/direct-messaging.md`,
