@@ -226,6 +226,14 @@ work lives in the project lead's vault manifest, not here.
 
 ### Changed
 
+- `rendezvous::sweep_gated`'s callback receives the subkey index alongside the
+  bytes (`FnMut(u32, Vec<u8>) -> bool`). The index is the sweep loop's own
+  variable, so passing it costs nothing, and a record's slot can be load-bearing:
+  for a DM channel page it IS the message's sequence number, and the frame's own
+  declared `seq` has to be checked against it. The rendezvous backlog ignores it,
+  as it should — a rendezvous message lands wherever the ring put it. (#234)
+
+
 - Project-release signer and announce write-gate derive from a rotated in-source
   seed; artifacts signed by the former shared dev seed no longer verify.
 

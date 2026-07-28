@@ -511,7 +511,7 @@ pub async fn publish_at_subkey(
 
 /// Per-sweep GET accounting. `attempted` counts every subkey GET issued; `failed`
 /// counts GETs that errored (distinct from an empty slot — the observability the old
-/// `.ok().flatten()` swallowed); `found` counts populated slots handed to `on_bytes`.
+/// `.ok().flatten()` swallowed); `found` counts populated slots handed to `on_slot`.
 /// Surfacing `failed` separately from empty/`found` is the enabling signal for
 /// consumer-side session-health tracking (CRSH-ISC-1): an erroring record session
 /// produces `failed > 0` sweeps instead of silent zero-yield ones.
@@ -565,7 +565,9 @@ pub async fn sweep_collect(
     let outcome = sweep_gated(
         gate,
         handle.shape().o_cnt(),
-        |bytes| ev_tx.send(VeilidNetEvent::Inbound { bytes }).is_ok(),
+        // The backlog ignores its slot: a rendezvous message lands wherever the
+        // ring put it, so the position carries no meaning to the receiver.
+        |_subkey, bytes| ev_tx.send(VeilidNetEvent::Inbound { bytes }).is_ok(),
         |subkey| {
             let rc = rc.clone();
             let key = key.clone();
@@ -597,10 +599,19 @@ pub async fn sweep_collect(
 
 /// The testable per-GET sweep core (WB-5.1 / I5″.2). For each subkey it acquires ONE
 /// read permit from `gate`, runs `get` (one DHT GET), releases the permit, then hands
-/// any populated slot's bytes to `on_bytes`. The permit is held across the GET only —
-/// never across the whole sweep and never across `on_bytes` (the emit is not a DHT op)
+/// any populated slot's SUBKEY INDEX and bytes to `on_slot`. The permit is held across the GET only —
+/// never across the whole sweep and never across `on_slot` (the emit is not a DHT op)
 /// — so `gate`'s read pool bounds instantaneous read concurrency regardless of live
-/// sweep count. `on_bytes` returns `false` to stop early (the receiver dropped).
+/// sweep count. `on_slot` returns `false` to stop early (the receiver dropped).
+///
+/// **The subkey index is passed because a record's slot can be load-bearing.** For a
+/// rendezvous backlog it is not — a slot is just where a message happened to land, and
+/// that caller ignores it. For a DM channel page it is the message's sequence number
+/// (`dm::paging::position_of`), and the frame's own declared `seq` must be checked
+/// against it or the write-once mapping between the two is asserted by the writer and
+/// verified by nobody. The index is the sweep loop's own variable, so handing it over
+/// costs nothing; the alternative was every caller trusting the payload about where it
+/// was found.
 /// Generic over `get` so the per-GET permit discipline is unit-testable without veilid
 /// types (WB-ISC-21/22).
 ///
@@ -609,12 +620,12 @@ pub async fn sweep_collect(
 /// `Option`-only surface conflated (CRSH-ISC-1). A per-subkey GET error increments
 /// `failed` and the sweep continues (a GET error is per-record health signal, not a
 /// reason to abort the sweep); the receiver-dropped early return still applies only via
-/// `on_bytes` returning `false`. Returns a [`SweepOutcome`] with `attempted`/`failed`/
+/// `on_slot` returning `false`. Returns a [`SweepOutcome`] with `attempted`/`failed`/
 /// `found` counts.
 pub async fn sweep_gated<Fut>(
     gate: &Arc<DhtGate>,
     subkey_count: u16,
-    mut on_bytes: impl FnMut(Vec<u8>) -> bool,
+    mut on_slot: impl FnMut(u32, Vec<u8>) -> bool,
     get: impl Fn(u32) -> Fut,
 ) -> SweepOutcome
 where
@@ -635,7 +646,7 @@ where
         match got {
             Ok(Some(bytes)) => {
                 outcome.found += 1;
-                if !on_bytes(bytes) {
+                if !on_slot(subkey, bytes) {
                     return outcome; // receiver dropped — stop sweeping
                 }
             }
@@ -1137,7 +1148,7 @@ mod tests {
         let outcome = sweep_gated(
             &gate,
             3,
-            |_bytes| true,
+            |_subkey, _bytes| true,
             |_subkey| {
                 let log = log.clone();
                 async move {
@@ -1185,7 +1196,7 @@ mod tests {
                 sweep_gated(
                     &gate,
                     8,
-                    |_bytes| true,
+                    |_subkey, _bytes| true,
                     |_subkey| {
                         let gate = gate.clone();
                         let max_in_flight = max_in_flight.clone();
@@ -1229,7 +1240,7 @@ mod tests {
         let outcome = sweep_gated(
             &gate,
             9,
-            |_bytes| true,
+            |_subkey, _bytes| true,
             |subkey| async move {
                 match subkey % 3 {
                     0 => Err(()),
@@ -1245,6 +1256,43 @@ mod tests {
             "subkeys 0,3,6 errored (not counted as empty)"
         );
         assert_eq!(outcome.found, 3, "subkeys 1,4,7 populated");
+    }
+
+    /// The index handed to the callback is the slot the bytes were READ from, not a
+    /// count of emissions — the distinction only shows up when some slots are empty
+    /// or failed, which is the ordinary case for a sparsely-filled record.
+    ///
+    /// A DM channel page derives a message's sequence number from this index, so an
+    /// off-by-anything here files every message at the wrong position, and the frame
+    /// layer's seq-vs-slot check would reject honest traffic.
+    #[tokio::test]
+    async fn sweep_hands_the_callback_the_slot_the_bytes_came_from() {
+        let gate = DhtGate::with_pools(2, 1, 2, 4);
+        let mut seen: Vec<(u32, u8)> = Vec::new();
+        // Only 2, 5 and 6 are populated; 0,3 fail and 1,4,7 are empty, so an
+        // emission counter would report 0,1,2 where the slots are 2,5,6.
+        let outcome = sweep_gated(
+            &gate,
+            8,
+            |subkey, bytes| {
+                seen.push((subkey, bytes[0]));
+                true
+            },
+            |subkey| async move {
+                match subkey {
+                    0 | 3 => Err(()),
+                    2 | 5 | 6 => Ok(Some(vec![subkey as u8 * 10])),
+                    _ => Ok(None),
+                }
+            },
+        )
+        .await;
+        assert_eq!(outcome.found, 3);
+        assert_eq!(
+            seen,
+            vec![(2, 20), (5, 50), (6, 60)],
+            "each callback must receive its own slot index alongside that slot's bytes"
+        );
     }
 
     // ── CRSH-ISC-3 (+ CRSH-ISC-17): repair op ordering, lock span, permit discipline ──
@@ -1352,7 +1400,7 @@ mod tests {
                     sweep_gated(
                         &gate,
                         4,
-                        |_b| true,
+                        |_subkey, _b| true,
                         move |_subkey| {
                             let (trace, gate, gets) =
                                 (trace.clone(), get_gate.clone(), gets.clone());
