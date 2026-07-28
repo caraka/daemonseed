@@ -41,6 +41,14 @@ work lives in the project lead's vault manifest, not here.
   first emission (#238). Previously every subscribed client re-published every
   announcement every 120 seconds, so write load on the single announce record
   scaled with both the fleet size and the number of standing announcements.
+- The GUI and TUI serve a published share from disk, reading one `CHUNK_SIZE`
+  range per request, instead of holding every published byte in memory for the
+  session (#246). Publishing a multi-gigabyte folder no longer costs comparable
+  resident memory. Share ids, chunk addresses, and the wire form are unchanged.
+  A published file that is moved, deleted, truncated, or grown after publish now
+  stops serving instead of serving a publish-time copy; a same-length in-place
+  edit is served and rejected by the fetcher's per-chunk hash check. Re-publish
+  to serve changed content.
 
 ## [0.36.2] — 2026-07-27
 

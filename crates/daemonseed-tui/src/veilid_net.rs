@@ -106,7 +106,7 @@ use daemonseed_core::share_announce::{
 };
 use daemonseed_core::share_catalog::{CatalogChange, ShareCatalog, ShareListing};
 use daemonseed_core::share_envelope::ManifestEntry;
-use daemonseed_core::share_serve::ShareContent;
+use daemonseed_core::share_serve::{ChunkSource, DiskShareContent, hash_share};
 use daemonseed_core::storage::cas::ChunkAddr;
 use daemonseed_core::storage::fetched::{
     FetchedFile, FetchedStore, LiveFetchRegistry, SelectionRoot, StagingArea, derive_resume_state,
@@ -1209,14 +1209,23 @@ async fn publish_share(
         None => return publish_fail(evt_tx, "lobby not subscribed yet".to_owned(), None),
     };
 
-    // Index off the actor loop (the in-RAM `ShareContent`; no redb cache on the
-    // Veilid path). Clone the root for the blocking task so the original survives
-    // for the event + error reporting.
+    // Hash off the actor loop (no redb cache on the Veilid path). `hash_share`
+    // streams one CHUNK_SIZE buffer at a time, so indexing a multi-GB share never
+    // holds a file — and the manifest it produces is byte-identical to the in-RAM
+    // path's, so share ids and chunk addresses are unchanged (#246). Clone the
+    // root for the blocking task so the original survives for the event + error
+    // reporting.
     let index_root = root.clone();
-    let content = match tokio::task::spawn_blocking(move || ShareContent::index_dir(&index_root))
-        .await
+    let manifest = match tokio::task::spawn_blocking(move || {
+        hash_share(
+            &index_root,
+            &std::sync::atomic::AtomicBool::new(false),
+            &mut |_, _| {},
+        )
+    })
+    .await
     {
-        Ok(Ok(c)) => c,
+        Ok(Ok(m)) => m,
         Ok(Err(e)) => {
             return publish_fail(
                 evt_tx,
@@ -1226,8 +1235,11 @@ async fn publish_share(
         }
         Err(_) => return publish_fail(evt_tx, "share-index task failed".to_owned(), Some(root)),
     };
-    let file_count = content.file_count();
-    let content = Arc::new(content);
+    let file_count = manifest.entries.len();
+    // Serve from disk: one CHUNK_SIZE read per request rather than the whole
+    // share resident for the session (#246).
+    let content: Arc<dyn ChunkSource + Send + Sync> =
+        Arc::new(DiskShareContent::new(root.clone(), manifest));
 
     // Receiver-verifiable deterministic id (#156): share_id =
     // derive_share_id_v2(own_pubkey, root_commitment). The commitment hides the

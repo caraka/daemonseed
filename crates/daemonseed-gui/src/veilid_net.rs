@@ -92,7 +92,7 @@ use daemonseed_core::share_announce::{
 };
 use daemonseed_core::share_catalog::{CatalogChange, ShareCatalog, ShareListing};
 use daemonseed_core::share_envelope::ManifestEntry;
-use daemonseed_core::share_serve::ShareContent;
+use daemonseed_core::share_serve::{ChunkSource, DiskShareContent, hash_share};
 use daemonseed_core::storage::cas::ChunkAddr;
 use daemonseed_core::storage::fetched::{
     FetchedFile, FetchedStore, LiveFetchRegistry, SelectionRoot, StagingArea, derive_resume_state,
@@ -2453,15 +2453,29 @@ async fn publish_share(
     };
 
     let root_str = root.to_string_lossy().into_owned();
-    // Index off the actor loop (the in-RAM `ShareContent`; no redb cache on the
-    // Veilid path). The hashing stays off the async select loop.
-    let content = match tokio::task::spawn_blocking(move || ShareContent::index_dir(&root)).await {
-        Ok(Ok(c)) => c,
+    // Hash off the actor loop (no redb cache on the Veilid path). `hash_share`
+    // streams one CHUNK_SIZE buffer at a time, so indexing a multi-GB share never
+    // holds a file — and the manifest it produces is byte-identical to the in-RAM
+    // path's, so share ids and chunk addresses are unchanged (#246).
+    let hash_root = root.clone();
+    let manifest = match tokio::task::spawn_blocking(move || {
+        hash_share(
+            &hash_root,
+            &std::sync::atomic::AtomicBool::new(false),
+            &mut |_, _| {},
+        )
+    })
+    .await
+    {
+        Ok(Ok(m)) => m,
         Ok(Err(e)) => return err(format!("could not index {root_str}: {e}")),
         Err(_) => return err("share-index task failed".to_owned()),
     };
-    let file_count = content.file_count();
-    let content = Arc::new(content);
+    let file_count = manifest.entries.len();
+    // Serve from disk: one CHUNK_SIZE read per request rather than the whole
+    // share resident for the session (#246).
+    let content: Arc<dyn ChunkSource + Send + Sync> =
+        Arc::new(DiskShareContent::new(root, manifest));
 
     // Receiver-verifiable deterministic id (#156, not a fresh mint): share_id =
     // derive_share_id_v2(own_pubkey, root_commitment), where the commitment hides
