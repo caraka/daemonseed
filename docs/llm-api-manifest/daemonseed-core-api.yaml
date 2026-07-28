@@ -1629,7 +1629,8 @@ types:
       MemoryChunkStore + manifest (fails fast on a bad path — never advertise
       content you cannot serve); file_count() / manifest() / answer(&ShareFrame)
       (inherent, delegates to ChunkSource::answer). Caps a share at available
-      memory — the CLI/test path; the TUI publish path is DiskShareContent.
+      memory — the CLI/test path; both front-ends' publish path is
+      DiskShareContent.
 
   - name: ShareManifest
     module: daemonseed_core::share_serve

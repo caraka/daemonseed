@@ -16,7 +16,8 @@
 //!     cargo test --test two_node_share -- --ignored --nocapture
 //!
 //! It drives the productized path end-to-end through the `VeilidNetHandle` API,
-//! reusing the REAL daemonseed share stack (`ShareContent::index_dir` /
+//! reusing the REAL daemonseed share stack (`hash_share` + `DiskShareContent` —
+//! the same disk-backed source both front-ends publish through /
 //! `seal_public_share_frame` / `open_share_frame` / the SHA-384 content
 //! addressing) — no crypto is reimplemented.
 
@@ -28,7 +29,7 @@ use daemonseed_core::identity::keys::{derive_identity_keys, Identity};
 use daemonseed_core::identity::mnemonic::Mnemonic;
 use daemonseed_core::public_room::derive_room_key;
 use daemonseed_core::share_announce::mint_share_id;
-use daemonseed_core::share_serve::ShareContent;
+use daemonseed_core::share_serve::{hash_share, DiskShareContent};
 use daemonseed_veilid_net::{VeilidNet, VeilidNetConfig};
 
 fn node_config(port: &str, dir: &std::path::Path) -> VeilidNetConfig {
@@ -53,8 +54,17 @@ async fn public_share_content_crosses_app_call() {
     std::fs::create_dir_all(&share_dir).unwrap();
     let payload = vec![0x5Au8; 70_000];
     std::fs::write(share_dir.join("notes.bin"), &payload).unwrap();
-    let content = Arc::new(ShareContent::index_dir(&share_dir).unwrap());
-    let chunk0 = content.manifest()[0].chunks[0];
+    // Disk-backed, matching what a real client serves (#246) — the RAM source is
+    // no longer on any publish path, so an end-to-end oracle built on it would
+    // exercise a source nothing ships.
+    let manifest = hash_share(
+        &share_dir,
+        &std::sync::atomic::AtomicBool::new(false),
+        &mut |_, _| {},
+    )
+    .unwrap();
+    let chunk0 = manifest.entries[0].chunks[0];
+    let content = Arc::new(DiskShareContent::new(share_dir.clone(), manifest));
 
     // Public share: server-readable under the public room ("lobby") key.
     let room_key = derive_room_key("lobby", &CNSA_2_0).expect("room key");
