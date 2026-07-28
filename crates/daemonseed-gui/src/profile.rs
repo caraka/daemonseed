@@ -21,6 +21,7 @@
 
 use std::path::PathBuf;
 
+use daemonseed_core::dm::keyrec::KemEncapsulationKey;
 use daemonseed_core::first_start::SessionMaterials;
 use daemonseed_core::identity::keys::{
     Identity, KeyDerivationError, ShareRootIkm, SignKeypair, derive_identity_keys,
@@ -97,6 +98,21 @@ impl Profile {
     /// `share_id` (deterministic per (identity, root), stable across republish).
     pub fn stable_share_root_ikm(&self) -> Result<ShareRootIkm, KeyDerivationError> {
         derive_identity_keys(&self.seeds.mnemonic, Identity::Primary).map(|k| k.share_root_ikm)
+    }
+
+    /// (#232) Derive the STABLE ML-KEM-1024 **encapsulation** key from the unlocked
+    /// profile's mnemonic — the public half of the identity KEM keypair, the fifth
+    /// consumer of the same identity PRK behind [`Self::stable_signing_key`]. The
+    /// net actor holds it so it can publish the DM key record (ISC-C40) that makes
+    /// this identity reachable for direct messages.
+    ///
+    /// Only the PUBLIC half leaves this method. The decapsulation key stays inside
+    /// `IdentityKeys` and is dropped here — nothing in the publish path needs it,
+    /// and handing it to the net actor would widen that actor's authority for no
+    /// reason (the least-authority posture `stable_signing_key` already documents).
+    pub fn stable_kem_encapsulation_key(&self) -> Result<KemEncapsulationKey, KeyDerivationError> {
+        derive_identity_keys(&self.seeds.mnemonic, Identity::Primary)
+            .map(|k| Box::new(*k.kem.encapsulation_key()))
     }
 
     /// Circles recorded in the blob (canonical phrase + label) — the rejoin set.

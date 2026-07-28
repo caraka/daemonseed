@@ -182,12 +182,19 @@ fn run(
             // (#156) Derive the share-root IKM once here too (same derivation) so
             // the veilid actor derives a receiver-verifiable share_id on publish.
             let stable_share_root_ikm = app.stable_share_root_ikm();
+            // (#232) Derive the stable KEM encapsulation key so the actor can publish
+            // the DM key record that makes this identity reachable for direct
+            // messages. Public half only; wrapped for the Clone+Debug command enum.
+            let stable_kem_encapsulation_key = app
+                .stable_kem_encapsulation_key()
+                .map(|k| daemonseed_tui::net::StableKemEncapsulationKey(std::sync::Arc::new(k)));
             let _ = net.send(NetCommand::Connect {
                 server_id: req.server_id,
                 address: req.address,
                 trusted: req.trusted,
                 stable_signing_key,
                 stable_share_root_ikm,
+                stable_kem_encapsulation_key,
                 // (step 8b-2 / DL-ISC-20) Hand the profile root to the actor so a
                 // verified resume anchors each fetch's manifest digest in the
                 // client's own trusted state (not the co-resident downloads root).

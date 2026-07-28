@@ -19,6 +19,7 @@ use std::collections::BTreeSet;
 use daemonseed_core::circle::key::{CircleKey, CircleKeyError, circle_fingerprint, derive_cot_key};
 use daemonseed_core::cot::AssetAddr;
 use daemonseed_core::crypto::suite::CNSA_2_0;
+use daemonseed_core::dm::keyrec::KemEncapsulationKey;
 use daemonseed_core::identity::keys::{ShareRootIkm, SignKeypair};
 
 use crate::net::RosterEntry;
@@ -566,6 +567,16 @@ impl GuiState {
         self.profile
             .as_ref()
             .and_then(|p| p.stable_share_root_ikm().ok())
+    }
+
+    /// (#232) The unlocked profile's STABLE ML-KEM-1024 encapsulation key — the
+    /// public half the DM key record publishes (ISC-C40). `None` on the ephemeral /
+    /// no-profile path: that session has no persistent identity, so it is not
+    /// DM-reachable and must not publish a key record.
+    pub fn stable_kem_encapsulation_key(&self) -> Option<KemEncapsulationKey> {
+        self.profile
+            .as_ref()
+            .and_then(|p| p.stable_kem_encapsulation_key().ok())
     }
 
     /// (#229) Record the announcements/MOTD view now rendered in the pane.

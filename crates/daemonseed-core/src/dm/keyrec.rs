@@ -52,6 +52,69 @@ pub const DM_KEYREC_OWNER_SEED_LEN: usize = 32;
 /// when they collect it. FROZEN.
 pub const FC_PERIOD_SECS: u64 = 7 * 24 * 60 * 60;
 
+/// Byte length of an ML-KEM-1024 encapsulation key.
+///
+/// Re-exported so a frontend can name the type without taking a direct
+/// dependency on `oxicrypt-ml-kem`. The crypto crates are `daemonseed-core`'s
+/// concern; a UI crate should be able to carry the key without linking them.
+pub const KEM_EK_LEN: usize = ml_kem::EK_LEN;
+
+/// An identity's public ML-KEM-1024 encapsulation key — the half that is
+/// published. Boxed because it is 1568 bytes and gets moved through command
+/// channels; never the decapsulation key, which stays in `IdentityKeys`.
+pub type KemEncapsulationKey = Box<[u8; KEM_EK_LEN]>;
+
+/// The `version` every alpha client publishes.
+///
+/// The identity's KEM keypair is derived deterministically from the recovery
+/// phrase and never rotates in alpha, so there is exactly one key to publish and
+/// one version to publish it at. The monotonic field exists for the rotation this
+/// build does not yet do — a future rotation bumps it, and
+/// [`KeyRecordCache`]'s highest-verified-wins rule is what stops the pre-rotation
+/// record being replayed over it. Publishing a constant is therefore correct
+/// today and forward-compatible, not a placeholder.
+pub const DM_KEY_RECORD_VERSION: u64 = 1;
+
+/// Whether an alpha client advertises an invite-only first-contact policy.
+///
+/// `false`: there is no UI to set the policy and no invite-token issuance yet, so
+/// advertising `true` would promise an admission gate nothing can satisfy. The
+/// recipient enforces its real policy at admission regardless of what the record
+/// advertises, so this is an advert, never the enforcement point (ISC-C41).
+pub const DM_KEY_RECORD_INVITE_ONLY: bool = false;
+
+/// Lower bound of the jittered key-record re-seed interval.
+///
+/// Veilid has no TTL — retention is capacity-eviction only — so a published record
+/// survives exactly as long as its owner re-seeds it. The cadence is deliberately
+/// slow: the frozen design budgets the key-record keep-alive at ~0.02 writes/min
+/// against the WB-2 ceiling of 4/min, and this band's ~50-minute mean lands there.
+pub const RESEED_INTERVAL_MIN: std::time::Duration = std::time::Duration::from_secs(40 * 60);
+
+/// Upper bound of the jittered key-record re-seed interval.
+pub const RESEED_INTERVAL_MAX: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// A fresh re-seed delay drawn uniformly from
+/// `[RESEED_INTERVAL_MIN, RESEED_INTERVAL_MAX]`.
+///
+/// Jitter is drawn **per emission**, never once per session, and takes no input
+/// from user activity — the WB-1.2 pattern, and the fix the design's M7 finding
+/// asks for. A fixed period would give the record a recognisable cadence
+/// signature and, across records, a stable phase relationship that is itself a
+/// linkage channel (WB-3 I6). An entropy failure falls back to the midpoint: a
+/// re-seed is liveness, not a key, and the next draw recovers.
+pub fn next_reseed_interval() -> std::time::Duration {
+    let min_ms = RESEED_INTERVAL_MIN.as_millis() as u64;
+    let max_ms = RESEED_INTERVAL_MAX.as_millis() as u64;
+    let span = max_ms - min_ms;
+    let mut buf = [0u8; 8];
+    let offset = match getrandom::fill(&mut buf) {
+        Ok(()) => u64::from_le_bytes(buf) % (span + 1),
+        Err(_) => span / 2,
+    };
+    std::time::Duration::from_millis(min_ms + offset)
+}
+
 redacted_secret_newtype! {
     /// The Veilid record-owner seed for an identity's key record.
     ///
@@ -83,6 +146,10 @@ pub enum DmKeyRecordError {
     /// underlying cause before this module sees it. A LOCAL signing failure is
     /// [`Self::Signing`], never this.
     Signature,
+    /// The fetched bytes are not a decodable `DmKeyRecord`. The record is
+    /// world-writable, so arbitrary bytes in the slot are an expected input, not
+    /// an exceptional one — rejected exactly as a bad signature is.
+    Malformed,
     /// A local signing operation failed while BUILDING a record — the crypto
     /// module is not operational, or the active profile disallows ML-DSA
     /// signing. Carries the cause: there is no adversary on this path and no
@@ -108,6 +175,7 @@ impl PartialEq for DmKeyRecordError {
         match (self, other) {
             (Self::Kdf(a), Self::Kdf(b)) => a == b,
             (Self::Signature, Self::Signature) => true,
+            (Self::Malformed, Self::Malformed) => true,
             // Compared on the variant: the wrapped cause is diagnostic, and
             // `SignatureError` is not itself comparable.
             (Self::Signing(_), Self::Signing(_)) => true,
@@ -145,6 +213,7 @@ impl std::fmt::Display for DmKeyRecordError {
         match self {
             Self::Kdf(e) => write!(f, "key-record HKDF failed: {e:?}"),
             Self::Signature => write!(f, "key-record signature did not verify"),
+            Self::Malformed => write!(f, "key-record bytes are not a decodable DmKeyRecord"),
             Self::Signing(e) => write!(f, "key-record could not be signed locally: {e:?}"),
             Self::FieldLength {
                 field,
@@ -269,6 +338,36 @@ pub fn build(
         invite_only,
         signature: sig.to_vec(),
     })
+}
+
+/// Sign, assemble, and **encode** a key record ready for publication.
+///
+/// The wire-encoding wrapper over [`build`]. Frontends publish opaque bytes and
+/// should not have to know — or depend on a protobuf crate to express — how a
+/// record is serialised; that is this crate's business. `daemonseed-tui` has no
+/// `prost` dependency at all, and adding one so a UI crate could call
+/// `encode_to_vec` would be the wrong direction.
+pub fn build_encoded(
+    signing: &SignKeypair,
+    kem_ek: &[u8; ml_kem::EK_LEN],
+    version: u64,
+    invite_only: bool,
+) -> Result<Vec<u8>, DmKeyRecordError> {
+    use prost::Message as _;
+    Ok(build(signing, kem_ek, version, invite_only)?.encode_to_vec())
+}
+
+/// Decode a fetched key record and verify it against `identity_pubkey` in one
+/// step — the read counterpart of [`build_encoded`], so a caller handling raw DHT
+/// bytes never needs prost either. A record that does not decode is rejected the
+/// same way a record that does not verify is: fail closed.
+pub fn decode_and_verify(
+    bytes: &[u8],
+    identity_pubkey: &[u8; ml_dsa::PK_LEN],
+) -> Result<VerifiedKeyRecord, DmKeyRecordError> {
+    use prost::Message as _;
+    let record = wire::DmKeyRecord::decode(bytes).map_err(|_| DmKeyRecordError::Malformed)?;
+    verify(&record, identity_pubkey)
 }
 
 /// Verify a fetched key record against `identity_pubkey` — the SAME pubkey the
@@ -802,5 +901,107 @@ mod tests {
             &b.kem.encapsulation_key()[..],
             "the cache tracks versions, not identities — one cache per correspondent"
         );
+    }
+
+    /// The re-seed cadence must sit in its band and must actually vary — a fixed
+    /// period would give the record a recognisable signature (WB-1.2 / M7).
+    #[test]
+    fn reseed_interval_is_in_band_and_jittered() {
+        let draws: Vec<_> = (0..64).map(|_| next_reseed_interval()).collect();
+        for d in &draws {
+            assert!(
+                *d >= RESEED_INTERVAL_MIN && *d <= RESEED_INTERVAL_MAX,
+                "{d:?} outside [{RESEED_INTERVAL_MIN:?}, {RESEED_INTERVAL_MAX:?}]"
+            );
+        }
+        let distinct: std::collections::BTreeSet<_> = draws.iter().collect();
+        assert!(
+            distinct.len() > 1,
+            "64 draws collapsed to one value — the cadence is not jittered"
+        );
+    }
+
+    /// The budgeted rate the frozen design assumes: ~0.02 writes/min against the
+    /// WB-2 ceiling of 4/min. Pinned so widening the band silently is caught.
+    #[test]
+    fn reseed_cadence_matches_the_budgeted_rate() {
+        let mean_secs =
+            (RESEED_INTERVAL_MIN.as_secs() + RESEED_INTERVAL_MAX.as_secs()) as f64 / 2.0;
+        let writes_per_min = 60.0 / mean_secs;
+        assert!(
+            (writes_per_min - 0.02).abs() < 0.005,
+            "key-record keep-alive is {writes_per_min:.4}/min, design budgets ~0.02/min"
+        );
+    }
+
+    /// The alpha publish constants, pinned. Not tautologies: they assert the
+    /// values a running client actually puts on the wire, so changing either
+    /// becomes a deliberate, reviewed act rather than an edit nobody notices.
+    #[test]
+    fn alpha_publishes_version_one_and_no_invite_policy() {
+        const _: () = assert!(DM_KEY_RECORD_VERSION == 1);
+        const _: () = assert!(!DM_KEY_RECORD_INVITE_ONLY);
+        // Also exercise them through the real build path, so the constants are
+        // pinned where they are USED, not only where they are declared.
+        let a = alice();
+        let rec = build(
+            &a.signing,
+            a.kem.encapsulation_key(),
+            DM_KEY_RECORD_VERSION,
+            DM_KEY_RECORD_INVITE_ONLY,
+        )
+        .unwrap();
+        let v = verify(&rec, a.signing.public_key()).unwrap();
+        assert_eq!(v.version, 1);
+        assert!(!v.invite_only);
+    }
+
+    /// The encode/decode pair frontends actually use, so neither needs prost.
+    #[test]
+    fn build_encoded_and_decode_and_verify_round_trip() {
+        let a = alice();
+        let bytes = build_encoded(&a.signing, a.kem.encapsulation_key(), 5, true).unwrap();
+        let v = decode_and_verify(&bytes, a.signing.public_key()).unwrap();
+        assert_eq!(v.version, 5);
+        assert!(v.invite_only);
+        assert_eq!(&v.kem_ek[..], &a.kem.encapsulation_key()[..]);
+    }
+
+    /// The wrapper must not weaken the checks it wraps: a record decoded from
+    /// bytes still has to verify against the right identity.
+    #[test]
+    fn decode_and_verify_still_rejects_another_identity() {
+        let a = alice();
+        let b = bob();
+        let bytes = build_encoded(&a.signing, a.kem.encapsulation_key(), 1, false).unwrap();
+        assert_eq!(
+            decode_and_verify(&bytes, b.signing.public_key()),
+            Err(DmKeyRecordError::Signature)
+        );
+    }
+
+    /// The record slot is world-writable, so arbitrary bytes are an EXPECTED
+    /// input. Garbage must fail closed as `Malformed`, and — the case that
+    /// matters — must never panic, whatever an attacker writes there.
+    #[test]
+    fn decode_and_verify_fails_closed_on_arbitrary_bytes() {
+        let a = alice();
+        let pk = a.signing.public_key();
+        for junk in [
+            b"".as_slice(),
+            b"\x00".as_slice(),
+            b"not a protobuf at all".as_slice(),
+            &[0xffu8; 64],
+        ] {
+            let got = decode_and_verify(junk, pk);
+            assert!(
+                got.is_err(),
+                "arbitrary bytes must never verify: {junk:?} -> {got:?}"
+            );
+        }
+        // Truncating a VALID encoding is the realistic corruption, and must also
+        // fail closed rather than half-decode into something trusted.
+        let good = build_encoded(&a.signing, a.kem.encapsulation_key(), 1, false).unwrap();
+        assert!(decode_and_verify(&good[..good.len() / 2], pk).is_err());
     }
 }

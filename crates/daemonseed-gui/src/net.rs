@@ -31,6 +31,7 @@ use std::path::{Path, PathBuf};
 
 use crate::state::AnnouncementsView;
 use daemonseed_core::cot::AssetAddr;
+use daemonseed_core::dm::keyrec::KemEncapsulationKey;
 use daemonseed_core::handle::{DisplayMode, Handle};
 use daemonseed_core::identity::keys::{ShareRootIkm, SignKeypair};
 use daemonseed_core::presence::{LiveMember, PresenceChange};
@@ -98,6 +99,16 @@ pub enum NetCommand {
         /// receiver-verifiable `share_id`. `None` on the ephemeral / no-profile
         /// path (no publish under a stable identity).
         stable_share_root_ikm: Option<ShareRootIkm>,
+        /// (#232) the unlocked profile's STABLE ML-KEM-1024 **encapsulation** key
+        /// (`Profile::stable_kem_encapsulation_key`) — the public half of the
+        /// identity KEM keypair, derived from the SAME `derive_identity_keys` as
+        /// `stable_signing_key`. The veilid actor holds it so it can publish the DM
+        /// key record (ISC-C40) that makes this identity reachable for direct
+        /// messages. Public material only: the decapsulation key never leaves the
+        /// profile. `None` on the ephemeral / no-profile path — that session is not
+        /// DM-reachable, which is the honest state for an identity with no
+        /// persistent key.
+        stable_kem_encapsulation_key: Option<KemEncapsulationKey>,
         /// (download-subsystem redesign, step 8b / DL-ISC-20) the unlocked profile's
         /// on-disk ROOT — the client's own trusted state dir. The actor holds it so a
         /// verified resume can anchor each fetch's confirmed-manifest digest in

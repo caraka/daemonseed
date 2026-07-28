@@ -84,6 +84,7 @@ use daemonseed_core::circle::key::{CircleKey, derive_circle_veilid_owner_seed, d
 use daemonseed_core::circle::message::{open_message, seal_message};
 use daemonseed_core::cot::{AssetAddr, asset_address};
 use daemonseed_core::crypto::suite::CNSA_2_0;
+use daemonseed_core::dm::keyrec::{self as dm_keyrec, KemEncapsulationKey};
 use daemonseed_core::handle::{DisplayMode, Handle};
 use daemonseed_core::heartbeat::{HeartbeatFields, open_heartbeat, seal_public_heartbeat};
 use daemonseed_core::identity::keys::{Identity, ShareRootIkm, SignKeypair, derive_identity_keys};
@@ -220,6 +221,11 @@ struct ShareState {
     /// (#156) The stable identity's share-root IKM, behind an `Arc` (secret bytes),
     /// so a publish derives a receiver-verifiable `share_id`. `None` until Connect.
     share_root_ikm: Option<Arc<ShareRootIkm>>,
+    /// (#232) The stable identity's ML-KEM-1024 ENCAPSULATION key — the public half
+    /// published in the DM key record (ISC-C40). `None` until Connect, and `None`
+    /// for the session on the ephemeral / no-profile path: an identity with no
+    /// persistent key is genuinely not DM-reachable.
+    kem_ek: Option<Arc<KemEncapsulationKey>>,
     lobby: Option<LobbyRendezvous>,
     catalog: ShareCatalog,
     discovered: HashMap<String, DiscoveredRoute>,
@@ -281,6 +287,7 @@ impl ShareState {
         Self {
             signing: None,
             share_root_ikm: None,
+            kem_ek: None,
             lobby: None,
             catalog: ShareCatalog::new(SHARE_CATALOG_TTL),
             discovered: HashMap::new(),
@@ -354,6 +361,13 @@ pub async fn veilid_net_actor(
     // jittered deadline — no fixed period, no activity coupling (WB-0).
     let heartbeat = tokio::time::sleep(veilid_keepalive_interval());
     tokio::pin!(heartbeat);
+    // (#232) Re-seed the DM key record against eviction. Veilid has no TTL, so the
+    // record lives exactly as long as its owner re-writes it. A jittered sleep, not
+    // a fixed `interval`: the delay is redrawn per emission (WB-1.2), so the record
+    // carries no recognisable cadence signature and no stable phase relationship
+    // with this client's other records (WB-3 I6).
+    let dm_key_reseed = tokio::time::sleep(dm_keyrec::next_reseed_interval());
+    tokio::pin!(dm_key_reseed);
     // #157 (generalized): steady-state resweep clock — round-robins ONE subscribed
     // chat/discovery record per tick once the Connect hand-off window closes.
     let mut steady_resweep = tokio::time::interval(STEADY_RESWEEP_TICK);
@@ -522,6 +536,23 @@ pub async fn veilid_net_actor(
             // lossy DHT watch. Presence records are excluded (self-heal via keepalive
             // re-writes, WB-4). Spawned off the loop so its record-open await never
             // stalls commands/chat; the cursor advance is synchronous.
+            // (#232) DM key-record re-seed. Eviction is the only way this record
+            // disappears, and losing it blocks NEW first contacts to this identity
+            // until it returns (established correspondents cache the key). Re-arm
+            // with a freshly drawn delay every time.
+            () = dm_key_reseed.as_mut() => {
+                if let Some(handle) = net.as_ref() {
+                    daemonseed_veilid_net::spawn_dm_key_record_publish(
+                        handle,
+                        "tui",
+                        shares.signing.as_deref(),
+                        shares.kem_ek.as_deref(),
+                    );
+                }
+                dm_key_reseed
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + dm_keyrec::next_reseed_interval());
+            }
             _ = steady_resweep.tick() => {
                 // (#180 §RS-1.4, CRSH-ISC-6/15) Dispatch parked browse retries on the
                 // consumer's own cursor tick (decorrelated from the sharer's re-announce),
@@ -648,6 +679,7 @@ async fn handle_command(
         NetCommand::Connect {
             stable_signing_key,
             stable_share_root_ikm,
+            stable_kem_encapsulation_key,
             profile_root,
             self_handle,
             ..
@@ -660,6 +692,10 @@ async fn handle_command(
             // (#156) Capture the share-root IKM (Arc — it holds secret bytes) so a
             // publish derives a receiver-verifiable share_id from the same identity.
             shares.share_root_ikm = stable_share_root_ikm.map(Arc::new);
+            // (#232) Capture the KEM encapsulation key so this session can publish
+            // its DM key record. Public material — the decapsulation key never
+            // reaches the net actor.
+            shares.kem_ek = stable_kem_encapsulation_key.map(|k| k.0);
             // (step 8b-2 / DL-ISC-20) Hold the profile root for the session so a
             // verified resume anchors each fetch's manifest digest in the client's
             // own trusted state (a `ManifestDigestStore` under this dir).
@@ -680,6 +716,18 @@ async fn handle_command(
                 // into the catalog as they arrive (Phase 3 discovery) and so lobby
                 // chat can flow (emits PublicRoomJoined).
                 subscribe_lobby(shares, net, evt_tx, my_handle.as_deref().unwrap_or("guest")).await;
+                // (#232, ISC-C40) Publish this identity's DM key record once the
+                // session is live, so peers can reach it for direct messages
+                // without waiting a full re-seed interval. Spawned, so it adds no
+                // latency to the connect window.
+                if let Some(handle) = net.as_ref() {
+                    daemonseed_veilid_net::spawn_dm_key_record_publish(
+                        handle,
+                        "tui",
+                        shares.signing.as_deref(),
+                        shares.kem_ek.as_deref(),
+                    );
+                }
             }
         }
         NetCommand::JoinCircle { phrase } => {

@@ -31,6 +31,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use daemonseed_core::backoff::CloseCause;
+use daemonseed_core::dm::keyrec::KemEncapsulationKey;
 use daemonseed_core::identity::keys::{ShareRootIkm, SignKeypair};
 use daemonseed_core::share_catalog::ShareListing;
 use daemonseed_core::storage::fetched::FetchedShare;
@@ -52,6 +53,24 @@ pub struct StableSigningKey(pub Arc<SignKeypair>);
 impl std::fmt::Debug for StableSigningKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("StableSigningKey(<redacted>)")
+    }
+}
+
+/// The stable identity's PUBLIC ML-KEM-1024 encapsulation key (#232), wrapped for
+/// the `Debug + Clone` [`NetCommand`] enum.
+///
+/// The `Arc` is the point: a bare `[u8; 1568]` would `Clone` by copying 1568
+/// bytes every time the command enum is cloned. (Arrays of any length do derive
+/// `Debug` and `Clone` — the wrapper is for cost and log noise, not because the
+/// derives are missing.) `Debug` prints a placeholder because 1568 bytes of hex
+/// in a log is noise, NOT because the value is secret — this half is published to
+/// the DHT by design. The DECAPSULATION key never appears here.
+#[derive(Clone)]
+pub struct StableKemEncapsulationKey(pub Arc<KemEncapsulationKey>);
+
+impl std::fmt::Debug for StableKemEncapsulationKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StableKemEncapsulationKey(<1568-byte public key>)")
     }
 }
 
@@ -80,6 +99,13 @@ pub enum NetCommand {
         /// is `Clone` + redacted `Debug`, so it rides the enum directly — no
         /// wrapper needed.)
         stable_share_root_ikm: Option<ShareRootIkm>,
+        /// (#232) the unlocked profile's STABLE ML-KEM-1024 encapsulation key — the
+        /// public half of the identity KEM keypair, from the same
+        /// `derive_identity_keys` as `stable_signing_key`. The veilid actor holds it
+        /// so it can publish the DM key record (ISC-C40) that makes this identity
+        /// reachable for direct messages. `None` on the ephemeral / no-profile path:
+        /// no persistent key means genuinely not DM-reachable.
+        stable_kem_encapsulation_key: Option<StableKemEncapsulationKey>,
         /// (download-subsystem redesign, step 8b-2 / DL-ISC-20) the unlocked
         /// profile's on-disk ROOT — the client's own trusted state dir (where
         /// `seeds.blob` / `share-index.redb` live). The actor holds it so a verified

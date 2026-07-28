@@ -126,6 +126,7 @@ pub mod aimd;
 pub mod config;
 pub mod dht_gate;
 pub mod discovery;
+pub mod dm;
 pub mod download;
 pub mod error;
 pub mod event;
@@ -146,6 +147,7 @@ pub use dht_gate::{
 pub use discovery::{
     route_provenance_input, verify_route_advert, DiscoveryEnvelope, RouteAdvertSigner,
 };
+pub use dm::spawn_dm_key_record_publish;
 pub use error::{FetchErrorClass, Result, VeilidNetError};
 pub use event::VeilidNetEvent;
 pub use rendezvous::SweepOutcome;

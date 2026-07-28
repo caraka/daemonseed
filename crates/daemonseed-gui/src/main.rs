@@ -1548,6 +1548,7 @@ fn connect_now(
                 republish_roots,
                 stable_signing_key,
                 stable_share_root_ikm,
+                stable_kem_encapsulation_key,
                 profile_root,
             ) = {
                 let st = state.borrow();
@@ -1564,6 +1565,10 @@ fn connect_now(
                     // (#156) Derive the share-root IKM ONCE per connect (same
                     // derivation) so a publish yields a receiver-verifiable share_id.
                     st.stable_share_root_ikm(),
+                    // (#232) Derive the stable KEM encapsulation key ONCE per connect
+                    // so the actor can publish the DM key record that makes this
+                    // identity reachable for direct messages. Public half only.
+                    st.stable_kem_encapsulation_key(),
                     // (step 8b / DL-ISC-20) Hand the profile root to the actor so a
                     // verified resume anchors each fetch's manifest digest in the
                     // client's own trusted state (not the co-resident downloads root).
@@ -1576,6 +1581,7 @@ fn connect_now(
                 republish_roots,
                 stable_signing_key,
                 stable_share_root_ikm,
+                stable_kem_encapsulation_key,
                 profile_root,
             });
             // #144: raise the "assembling network" startup mask for the cold-start

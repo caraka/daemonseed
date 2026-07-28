@@ -62,6 +62,7 @@ use daemonseed_core::circle::key::{
 use daemonseed_core::circle::message::{open_message, seal_message};
 use daemonseed_core::cot::{AssetAddr, asset_address};
 use daemonseed_core::crypto::suite::CNSA_2_0;
+use daemonseed_core::dm::keyrec::{self as dm_keyrec, KemEncapsulationKey};
 use daemonseed_core::handle::{DisplayMode, Handle};
 use daemonseed_core::heartbeat::{
     HeartbeatFields, open_heartbeat, seal_circle_heartbeat, seal_public_heartbeat,
@@ -344,6 +345,11 @@ struct ShareState {
     /// secret bytes), so a publish derives a receiver-verifiable `share_id` from
     /// the same identity that seals the announcement. `None` until Connect.
     share_root_ikm: Option<Arc<ShareRootIkm>>,
+    /// (#232) The stable identity's ML-KEM-1024 ENCAPSULATION key — the public
+    /// half published in the DM key record (ISC-C40). `None` until Connect, and
+    /// `None` for the whole session on the ephemeral / no-profile path, which is
+    /// the honest state: an identity with no persistent key is not DM-reachable.
+    kem_ek: Option<Arc<KemEncapsulationKey>>,
     lobby: Option<LobbyRendezvous>,
     catalog: ShareCatalog,
     discovered: HashMap<String, DiscoveredRoute>,
@@ -409,6 +415,7 @@ impl ShareState {
         Self {
             signing: None,
             share_root_ikm: None,
+            kem_ek: None,
             lobby: None,
             catalog: ShareCatalog::new(SHARE_CATALOG_TTL),
             discovered: HashMap::new(),
@@ -491,6 +498,13 @@ pub async fn veilid_net_actor(
     // #141: re-publish operator MOTD/announcements on a slow cadence so their DHT
     // values do not expire (operator content is otherwise written only on post).
     let mut operator_keepalive = tokio::time::interval(OPERATOR_KEEPALIVE_INTERVAL);
+    // (#232) Re-seed the DM key record against eviction. Veilid has no TTL, so the
+    // record survives exactly as long as its owner re-writes it. A jittered sleep
+    // rather than a fixed `interval`: the delay is redrawn per emission (WB-1.2),
+    // so the record has no recognisable cadence signature and no stable phase
+    // relationship with this client's other records (WB-3 I6).
+    let dm_key_reseed = tokio::time::sleep(dm_keyrec::next_reseed_interval());
+    tokio::pin!(dm_key_reseed);
     // Presence keepalive + reap clock (WB-1.2): a jittered [180,220]s keepalive into
     // each joined room's presence record that also reaps the roster on each fire. A
     // self-rescheduling `Sleep` (not a fixed `interval`) so each tick draws a fresh
@@ -761,6 +775,23 @@ pub async fn veilid_net_actor(
             // re-writes (WB-4). The sweep is spawned off the loop (its record-open await
             // must not stall commands/chat, #128 class); the cursor advance is
             // synchronous so the round-robin stays deterministic.
+            // (#232) DM key-record re-seed. Eviction is the only way this record
+            // disappears, and losing it blocks NEW first contacts to this identity
+            // until it returns (established correspondents cache the key). Re-arm
+            // with a freshly drawn delay every time.
+            () = dm_key_reseed.as_mut() => {
+                if let Some(handle) = net.as_ref() {
+                    daemonseed_veilid_net::spawn_dm_key_record_publish(
+                        handle,
+                        "gui",
+                        shares.signing.as_deref(),
+                        shares.kem_ek.as_deref(),
+                    );
+                }
+                dm_key_reseed
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + dm_keyrec::next_reseed_interval());
+            }
             _ = steady_resweep.tick() => {
                 // (#180 §RS-1.4, CRSH-ISC-6/15) Dispatch parked browse retries on the
                 // consumer's own cursor tick (decorrelated from the sharer's re-announce).
@@ -1274,6 +1305,7 @@ async fn handle_command(
             republish_roots,
             stable_signing_key,
             stable_share_root_ikm,
+            stable_kem_encapsulation_key,
             profile_root,
             ..
         } => {
@@ -1291,6 +1323,10 @@ async fn handle_command(
             // (#156) Capture the share-root IKM (Arc — it holds secret bytes) so a
             // publish derives a receiver-verifiable share_id from the same identity.
             shares.share_root_ikm = stable_share_root_ikm.map(Arc::new);
+            // (#232) Capture the KEM encapsulation key so this session can publish
+            // its DM key record. Public material — the decapsulation key never
+            // reaches the net actor.
+            shares.kem_ek = stable_kem_encapsulation_key.map(Arc::new);
             // #188: a STABLE per-profile veilid namespace discriminator from the
             // unlocked identity pubkey — distinct across profiles (co-resident store
             // isolation), stable across a profile's launches (store reuse). `None` on
@@ -1307,6 +1343,18 @@ async fn handle_command(
                 // Subscribe the operator announce/MOTD record (Phase 4 A-c) so MOTD +
                 // announcement items fold in as they arrive.
                 subscribe_operator_space(shares, net).await;
+                // (#232, ISC-C40) Publish this identity's DM key record once the
+                // session is live, so peers can reach it for direct messages
+                // without waiting a full re-seed interval. Spawned, so it never
+                // adds latency to the rest of the connect window.
+                if let Some(handle) = net.as_ref() {
+                    daemonseed_veilid_net::spawn_dm_key_record_publish(
+                        handle,
+                        "gui",
+                        shares.signing.as_deref(),
+                        shares.kem_ek.as_deref(),
+                    );
+                }
                 // Operator content (MOTD/announcements) folds in ASYNC via the
                 // post-connect sweep + watch; each verified fold emits a
                 // `PublicSpaceSnapshot` that drives the #142 unread dot, and the warmup

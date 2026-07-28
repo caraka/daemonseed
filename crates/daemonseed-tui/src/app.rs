@@ -2169,6 +2169,24 @@ impl App {
         .map(|k| k.share_root_ikm)
     }
 
+    /// (#232) The unlocked profile's STABLE ML-KEM-1024 **encapsulation** key — the
+    /// public half of the identity KEM keypair, the same `derive_identity_keys`
+    /// expansion behind [`Self::stable_signing_key`]. The net actor holds it so it
+    /// can publish the DM key record (ISC-C40) that makes this identity reachable
+    /// for direct messages. Only the public half is returned; the decapsulation key
+    /// is dropped here, because nothing in the publish path needs it.
+    pub fn stable_kem_encapsulation_key(
+        &self,
+    ) -> Option<daemonseed_core::dm::keyrec::KemEncapsulationKey> {
+        let seeds = self.seeds.as_ref()?;
+        daemonseed_core::identity::keys::derive_identity_keys(
+            &seeds.mnemonic,
+            daemonseed_core::identity::keys::Identity::Primary,
+        )
+        .ok()
+        .map(|k| Box::new(*k.kem.encapsulation_key()))
+    }
+
     /// Latest deprecation-warning rows (ISC-C25), for the Deprecation view. One
     /// row per in-use suite the verified policy schedules for retirement.
     pub fn deprecation_warnings(&self) -> &[DeprecationWarningRow] {

@@ -36,6 +36,13 @@ work lives in the project lead's vault manifest, not here.
 
 ### Added
 
+- DM key records are published and re-seeded by both clients (ISC-C40). Each
+  publishes its static ML-KEM-1024 encapsulation key once the session is live and
+  re-seeds it against eviction on a jittered ~50-minute cadence (Veilid has no
+  TTL, so a record survives only while its owner re-writes it). An ephemeral /
+  no-profile session publishes nothing — with no persistent key it is genuinely
+  not DM-reachable. (#232, ISC-C40)
+
 - DM key-record transport: `VeilidNetHandle::publish_dm_key_record` enqueues the
   signed record on the WB-3 funnel as a coalescible `Keepalive` write to subkey 0
   of its `dflt(1)` record; `fetch_dm_key_record` reads it back off the actor loop,
