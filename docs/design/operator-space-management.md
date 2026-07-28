@@ -222,18 +222,36 @@ empirical DHT saturation point in testing, ~2/min ran healthy.
      DHT sweep with no persistence, so content overwritten while the operator is offline
      is never re-learned and never re-seeded. Fleet re-publication used to restore it.
      The decision to drop fleet hosting priced capacity eviction; it did not price
-     adversarial overwrite. **A local persisted copy of the operator's own published
-     posts would close this far better than fleet hosting did** — worth its own issue.
+     adversarial overwrite. **Candidate remedy for the pass: persist the operator's own
+     published posts locally**, so an operator can re-seed what it published regardless of
+     what the record currently holds. That closes the hole far better than fleet hosting
+     did — it restores content from the one party with the authority to publish it,
+     instead of from whichever bystander happened to be online.
   3. **The damping was not required by WB-2.** The gate plus one-slot-per-emission at the
      old 120 s period already lands on WB-2's 0.5/min operator allocation. The further
      ~30x came from the measured >24 h retention, not from the budget. Both are
      defensible; they are separate decisions and should be re-priced separately.
   4. **The record leaks operator liveness, and the first emission marks session start.**
-     Under operator-only every write on the record is by definition the operator's, so
-     write timing is an online/offline signal to any observer. The 2-5 min first band is
-     disjoint from the 45-75 min steady band, so any short gap identifies a session
-     start. Collapsing to a single wide band (e.g. `[2, 75] min`) removes the marker but
-     gives up the guarantee that a short session refreshes anything.
+     Under operator-only, every write on the record is by definition the operator's, so
+     write *timing* is an online/offline signal to any observer — inherent to the
+     authority decision, not to the cadence. The cadence adds a sharper second signal:
+     the first-emission band `[2, 5]` min and the steady band `[45, 75]` min do not
+     overlap, so **any observed gap under 45 minutes is necessarily a first emission**,
+     and session start is pinned to a 3-minute window once per session. Jitter fuzzes the
+     marker; only overlapping bands would remove it. This is the shape WB-1.4/1.6 forbid
+     for presence records.
+
+     **The trade, for the pass to settle.** Two bands exist to guarantee that a session
+     shorter than 45 minutes still refreshes something — which matters precisely because
+     operator sessions are expected to be short and bursty. Collapsing to one wide band
+     drawn per emission (e.g. `[2, 75]` min) makes a short gap unremarkable and removes
+     the marker, but a first emission is then uniform over 2-75 min, so a 30-minute
+     session refreshes something only ~38% of the time. **Privacy of the session boundary
+     versus retention on short sessions; there is no option that gets both.** Neither is
+     obviously right, and the choice should be made against the finished custody and
+     limits design rather than in isolation — a per-operator-record design (below) changes
+     who is exposed by the signal, and a persistence design (cost 2) changes how much a
+     missed refresh costs.
 - **Operator uptime is now load-bearing**, which is new. Announcement retention is a
   function of how often an operator actually runs the client: a session of roughly `N`
   hours cycles all `N` slots once. This is the intended consequence of rejecting fleet
@@ -337,7 +355,12 @@ different reasons; announcements would want the secret-derived variant.
 7. **Retention under congestion (#166).** The WB-3 I6b deadline override is dead in
    production, so MOTD can expire under congestion. Does the damped #238 cadence make this
    better or worse, and does the keep-alive need a congestion-aware floor?
-8. **Should fleet hosting ever return?** If it does, Trickle-style suppression (RFC 6206 —
+8. **One band or two?** Settle cost 4's trade — the session-start marker versus the
+   short-session refresh guarantee — once custody and limits are decided, not before.
+9. **Persist the operator's own posts?** Cost 2's candidate remedy. Decides how much a
+   missed refresh or an adversarial overwrite actually costs, which in turn changes how
+   much the cadence question matters.
+10. **Should fleet hosting ever return?** If it does, Trickle-style suppression (RFC 6206 —
    listen for others' refreshes, restart your own countdown, total load flat in fleet size)
    is the principled mechanism, and it requires plumbing `ValueData.seq` through the sweep.
    Recorded as the upgrade path; not proposed.
