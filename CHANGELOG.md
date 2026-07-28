@@ -90,8 +90,11 @@ work lives in the project lead's vault manifest, not here.
   addressing are not wired yet. (#234, ISC-C38)
 
 - DM channel page addressing — `daemonseed_core::dm::paging` (`derive_owner_seed`,
-  `position_of`, `first_seq_of_page`, `PagePosition`, `PAGE_SLOTS`,
-  `DmPageOwnerSeed`). A page's Veilid owner seed is
+  `position_of`, `PagePosition`, `PAGE_SLOTS`, `DmPageOwnerSeed`). A
+  `PagePosition` is built only through the checked `PagePosition::new`, which
+  rejects a slot at or past `PAGE_SLOTS` and a page whose first sequence number
+  would overflow, so `position_of` and `PagePosition::seq` are inverses in both
+  directions. A page's Veilid owner seed is
   `HKDF(salt = daemonseed/dm/page/salt/v1, ikm = AR, info = daemonseed/dm/page/addr/v4 || lp(dir) || lp(page_be))`,
   so only the two parties can derive the address and therefore only they can
   write it; the ongoing channel needs no admission control against strangers.
@@ -100,8 +103,26 @@ work lives in the project lead's vault manifest, not here.
   is the record's `o_cnt` and part of its address; a writer must build its
   `RecordShape` from it. `position_of` maps a per-direction sequence number to
   one page and slot, total and injective, so a message is written once and never
-  wrapped or overwritten. The page record, its transport and the wire frame are
-  not wired yet. (#234, ISC-C42, ISC-A-C24)
+  wrapped or overwritten. The page record and its transport are not wired yet.
+  (#234, ISC-C42, ISC-A-C24)
+
+- DM ongoing-channel wire frame — `daemonseed_core::dm::frame` (`seal`, `parse`,
+  `ParsedFrame`, `VerifiedFrame`, `frame_sig_input`, `FRAME_KIND_CHANNEL`,
+  `PAD_BUCKETS`, `MAX_FRAME_LEN`, `DmFrameError`) and the `DmChannelFrame` /
+  `DmChannelBody` wire messages. The frame carries the ratchet header
+  (`ratchet_gen`, `chain_base`, `seq`), the sender's current ephemeral and the
+  generation ciphertext in the clear — everything a receiver needs before it can
+  derive a key — and seals the rest under the ratchet message key. No identity,
+  pseudonym key or signature appears in the clear. Every clear field is bound in
+  the AAD and again in `msg_sig`, which extends the shared `/v6` preimage under
+  the `msg` frame kind with the generation, the chain base and the generation
+  ciphertext, an absent ciphertext binding as a zero-length component.
+  `ParsedFrame::open` takes a message key rather than a ratchet, so it composes
+  as the closure of `Ratchet::receive` and no ratchet state moves for a frame
+  that fails to authenticate; it verifies `msg_sig` unconditionally, since page
+  owner-write authority is symmetric and nothing else establishes authorship. The
+  plaintext is padded to one of two buckets before sealing. (#234, ISC-C42,
+  ISC-A-C20, ISC-A-C21, ISC-A-C22)
 
 - Domain labels `DM_PAGE_SALT`, `DM_PAGE_ADDR`, `DM_RATCHET_ROOT`, `DM_RATCHET_STEP`, `DM_CHAIN_SALT`,
   `DM_CHAIN_A2B`, `DM_CHAIN_B2A`, `DM_CHAIN_STEP_SALT`, `DM_MK`, `DM_CK`. (#234)

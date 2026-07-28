@@ -34,9 +34,39 @@ pub(crate) fn push_lp(buf: &mut Vec<u8>, bytes: &[u8]) {
     buf.extend_from_slice(bytes);
 }
 
+/// Bytes of length prefix a padded plaintext carries, so the real length is
+/// recoverable from a buffer padded out with zeros.
+pub(crate) const LEN_PREFIX: usize = 4;
+
+/// Pad an encoded body to the smallest bucket that holds it:
+/// `len(4, LE) ‖ protobuf ‖ zero-pad`, matching [`crate::heartbeat`]'s scheme.
+///
+/// `None` means no bucket is large enough — the caller reports that with its own
+/// error, since only the caller knows which record shape the ladder was sized
+/// against. Shared by every DM frame kind so the two ladders cannot drift into
+/// two incompatible paddings of the same shape.
+pub(crate) fn pad_to_bucket(encoded: &[u8], buckets: &[usize]) -> Option<Vec<u8>> {
+    let needed = LEN_PREFIX.checked_add(encoded.len())?;
+    let bucket = buckets.iter().copied().find(|b| needed <= *b)?;
+    let mut buf = vec![0u8; bucket];
+    buf[..LEN_PREFIX].copy_from_slice(&(encoded.len() as u32).to_le_bytes());
+    buf[LEN_PREFIX..needed].copy_from_slice(encoded);
+    Some(buf)
+}
+
+/// Recover the encoded body from a padded plaintext. `None` on a corrupt or
+/// oversized length rather than slicing past the buffer.
+pub(crate) fn unpad(padded: &[u8]) -> Option<&[u8]> {
+    let prefix = padded.get(..LEN_PREFIX)?;
+    let len = u32::from_le_bytes(prefix.try_into().expect("checked length")) as usize;
+    let end = LEN_PREFIX.checked_add(len)?;
+    padded.get(LEN_PREFIX..end)
+}
+
 pub mod domain;
 pub mod doorbell;
 pub mod firstcontact;
+pub mod frame;
 pub mod keyrec;
 pub mod paging;
 pub mod ratchet;

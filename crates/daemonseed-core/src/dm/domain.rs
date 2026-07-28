@@ -85,6 +85,21 @@ pub const DM_BIND_LT: &[u8] = b"daemonseed/dm/bind/lt/v1";
 /// folded into it), so it binds both public keys as well as the message. FROZEN.
 pub const DM_MSG_SIG: &[u8] = b"daemonseed/dm/msg/sig/v6";
 
+/// AAD prefix for an ongoing-channel frame's seal. Every clear field of the frame
+/// follows it, length-prefixed, so a header edited in flight fails the AEAD open
+/// rather than reaching the ratchet as an authenticated position. Distinct from
+/// [`DM_FC_AAD`] so a first-contact entry and a channel frame can never open as
+/// each other.
+///
+/// **`/v4`, past the frozen text's three earlier spellings.** The design names
+/// this AAD three times and means something different each time: `/v1` binds
+/// `chan_id ‖ epoch`, `/v2` drops the epoch, `/v3` adds `dir`. What the build
+/// binds is broader than all of them — the whole clear header and both pieces of
+/// ephemeral material — so reusing any of those strings would let two
+/// implementations disagree about what a signature of that name covers, which is
+/// the exact failure the `msg/sig/v6` bump exists to prevent. FROZEN.
+pub const DM_MSG_AAD: &[u8] = b"daemonseed/dm/msg/aad/v4";
+
 /// HKDF-Extract salt for the two roots derived from `ss0`. FROZEN.
 pub const DM_ROOT_SALT: &[u8] = b"daemonseed/dm/root/salt/v1";
 
@@ -163,6 +178,7 @@ const ALL: &[&[u8]] = &[
     DM_FC_AAD,
     DM_BIND_LT,
     DM_MSG_SIG,
+    DM_MSG_AAD,
     DM_ROOT_SALT,
     DM_ADDR_ROOT,
     DM_CHAN_ID,
@@ -198,6 +214,7 @@ mod tests {
         assert_eq!(DM_FC_AAD, b"daemonseed/dm/fc/aad/v1");
         assert_eq!(DM_BIND_LT, b"daemonseed/dm/bind/lt/v1");
         assert_eq!(DM_MSG_SIG, b"daemonseed/dm/msg/sig/v6");
+        assert_eq!(DM_MSG_AAD, b"daemonseed/dm/msg/aad/v4");
         assert_eq!(DM_ROOT_SALT, b"daemonseed/dm/root/salt/v1");
         assert_eq!(DM_ADDR_ROOT, b"daemonseed/dm/addr/root/v3");
         assert_eq!(DM_CHAN_ID, b"daemonseed/dm/chanid/v2");
@@ -243,6 +260,41 @@ mod tests {
                 label.starts_with(b"daemonseed/dm/"),
                 "{} escapes the dm namespace",
                 String::from_utf8_lossy(label)
+            );
+        }
+    }
+
+    /// `labels_are_byte_pinned` is hand-maintained too, and it is the tripwire —
+    /// so a label that is registered in `ALL` but never pinned can be edited to
+    /// anything with the whole suite still green, which is exactly what happened
+    /// to `DM_MSG_AAD` when it was added. Registry membership is enforced by the
+    /// test below; this one enforces that the tripwire actually covers it.
+    #[test]
+    fn every_declared_label_is_byte_pinned() {
+        let source = include_str!("domain.rs");
+        // Scoped to the tripwire's own body. An earlier version of this test
+        // scanned the whole file for `DM_…` tokens, which the `ALL` registry
+        // array satisfies on its own — so it passed while `DM_MSG_AAD` was
+        // registered and unpinned, i.e. it tested nothing. Mutation-confirmed.
+        let body = source
+            .split_once("fn labels_are_byte_pinned() {")
+            .expect("the tripwire test exists")
+            .1
+            .split_once("\n    }")
+            .expect("the tripwire test is a normal block")
+            .0;
+
+        for line in source.lines() {
+            let Some(rest) = line.trim().strip_prefix("pub const DM_") else {
+                continue;
+            };
+            let Some((name, _)) = rest.split_once(':') else {
+                continue;
+            };
+            assert!(
+                body.contains(&format!("DM_{name}")),
+                "DM_{name} is declared but never byte-pinned, so its wire value \
+                 can change with the suite still green"
             );
         }
     }

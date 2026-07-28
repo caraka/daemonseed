@@ -823,6 +823,89 @@ pub struct FirstContactBody {
     #[prost(bytes = "vec", tag = "11")]
     pub token: ::prost::alloc::vec::Vec<u8>,
 }
+/// One message on the established channel: a clear ratchet header and a sealed
+/// body, written to one slot of a `dflt(16)` page record (ISC-C42).
+///
+/// **Everything in the clear is here because the receiver needs it BEFORE it can
+/// derive the key** — the ratchet position to look up, and the ML-KEM material to
+/// take the generation step with. Nothing else is: no identity, no pseudonym, no
+/// signature. The two parties learned each other's keys at first contact and hold
+/// them in the contact cache, so a channel frame never re-states them and a page
+/// co-host sees only opaque bytes at a bucketed size class (ISC-A-C20).
+///
+/// Every clear field is bound in the seal's AAD, so tampering with the header
+/// fails the AEAD open before any signature is checked, and again in `msg_sig`
+/// inside the seal, so a party that opens a frame can prove who wrote it.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DmChannelFrame {
+    /// Which root this message's chain hangs from. `uint32` deliberately matches
+    /// the width the ratchet counts generations in: a `uint64` here would need a
+    /// narrowing cast at this boundary, and generation 0 and generation 2^32 would
+    /// then collide on one skipped-key slot.
+    #[prost(uint32, tag = "1")]
+    pub ratchet_gen: u32,
+    /// The sequence number at which this message's chain begins — the frozen
+    /// design's `PN` stated absolutely rather than as a count, because sequence
+    /// numbers here are monotonic per direction across the whole conversation
+    /// (they address the page a message lives in) instead of restarting per chain.
+    /// The receiver runs the previous chain out to `chain_base - 1` before
+    /// switching, and the value stays unambiguous when the message that would have
+    /// anchored a relative count is lost.
+    #[prost(uint64, tag = "2")]
+    pub chain_base: u64,
+    /// This message's sequence number, monotonic per direction across the whole
+    /// conversation. It is also what the page address encodes, so a collector MUST
+    /// check it against the position the frame was read from once the sweep yields
+    /// subkey indices — otherwise the write-once mapping between a sequence number
+    /// and its slot is asserted by the writer and checked by nobody.
+    #[prost(uint64, tag = "3")]
+    pub seq: u64,
+    /// The sender's current ratchet ephemeral ML-KEM-1024 encapsulation key,
+    /// exactly 1568 bytes. The far end encapsulates to it to take the next
+    /// generation step, which is where a compromise of this sender heals. Signed,
+    /// because an unauthenticated ephemeral would let an active attacker
+    /// substitute their own and defeat exactly that healing.
+    #[prost(bytes = "vec", tag = "4")]
+    pub eph_ek: ::prost::alloc::vec::Vec<u8>,
+    /// The ML-KEM-1024 ciphertext that created this generation, exactly 1568
+    /// bytes, repeated on EVERY message of the generation rather than only the one
+    /// that opened it. Without the repetition, losing that single message would
+    /// make the whole rest of the conversation undecryptable instead of costing
+    /// one message. Absent only in the initiator's opening burst, whose chain
+    /// hangs off the first-contact secret directly.
+    #[prost(bytes = "vec", tag = "5")]
+    pub eph_ct: ::prost::alloc::vec::Vec<u8>,
+    /// `nonce(12) ‖ ciphertext ‖ tag(16)` over a padded `DmChannelBody`,
+    /// AES-256-GCM under the ratchet message key for this position, binding every
+    /// clear field above as AAD. The plaintext is padded to a bucket before
+    /// sealing, so the length reveals only a coarse size class.
+    #[prost(bytes = "vec", tag = "6")]
+    pub sealed: ::prost::alloc::vec::Vec<u8>,
+}
+/// The sealed contents of a `DmChannelFrame`.
+///
+/// Small on purpose: the conversation's identities, keys and channel material
+/// were all established at first contact, so an ongoing message carries only what
+/// changes per message.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DmChannelBody {
+    /// Unix milliseconds, sender-asserted and signed. Display only — never trusted
+    /// for ordering or freshness against an adversary.
+    #[prost(int64, tag = "1")]
+    pub sent_unix_ms: i64,
+    /// The message.
+    #[prost(string, tag = "2")]
+    pub body: ::prost::alloc::string::String,
+    /// ML-DSA-87 signature, exactly 4627 bytes, under the sender's PSEUDONYM key —
+    /// the same key and the same preimage builder as the first-contact entry, under
+    /// a distinct frame-kind label, extended to bind the ratchet header and the
+    /// generation ciphertext. Mandatory and always verified: owner-write authority
+    /// on a page is SYMMETRIC (both parties derive the owner seed for both
+    /// directions), so finding a frame in the `a2b` pages does not establish that A
+    /// wrote it. This signature is the only thing that does.
+    #[prost(bytes = "vec", tag = "3")]
+    pub msg_sig: ::prost::alloc::vec::Vec<u8>,
+}
 /// Which key an initiator encapsulated `ss0` to when opening a conversation.
 ///
 /// Alpha always writes `KEY_SELECTOR_STATIC`. The enum exists so that

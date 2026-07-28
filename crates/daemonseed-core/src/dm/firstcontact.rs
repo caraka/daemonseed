@@ -65,6 +65,7 @@ use zeroize::Zeroize;
 use daemonseed_proto::v1 as wire;
 
 use crate::aead_envelope::{EnvelopeError, open_envelope, seal_envelope};
+use crate::dm::LEN_PREFIX;
 use crate::dm::domain;
 use crate::dm::keyrec;
 use crate::dm::ratchet;
@@ -81,10 +82,6 @@ pub const RECIPIENT_HASH_LEN: usize = 48;
 
 /// Length of the derived roots (`AR`, `chan_id`).
 pub const ROOT_LEN: usize = 32;
-
-/// The `u32` little-endian length prefix on a padded plaintext, matching
-/// [`crate::heartbeat`]'s convention so the two padding schemes read alike.
-const LEN_PREFIX: usize = 4;
 
 /// Largest first-message body, in bytes.
 ///
@@ -355,36 +352,20 @@ pub fn recipient_hash(
     Ok(out)
 }
 
-/// Pad an encoded body to the smallest bucket that holds it:
-/// `len(4, LE) ‖ protobuf ‖ zero-pad`, matching [`crate::heartbeat`]'s scheme.
+/// Pad an encoded body to the smallest bucket that holds it. See
+/// [`crate::dm::pad_to_bucket`] — the ladder is this module's, the scheme is
+/// shared with every other DM frame kind.
 fn pad_plaintext(encoded: &[u8]) -> Result<Vec<u8>, FirstContactError> {
-    let needed = LEN_PREFIX + encoded.len();
-    let bucket =
-        PAD_BUCKETS
-            .iter()
-            .copied()
-            .find(|b| needed <= *b)
-            .ok_or(FirstContactError::TooLarge {
-                got: needed,
-                max: *PAD_BUCKETS.last().expect("ladder is never empty"),
-            })?;
-    let mut buf = vec![0u8; bucket];
-    buf[..LEN_PREFIX].copy_from_slice(&(encoded.len() as u32).to_le_bytes());
-    buf[LEN_PREFIX..LEN_PREFIX + encoded.len()].copy_from_slice(encoded);
-    Ok(buf)
+    crate::dm::pad_to_bucket(encoded, PAD_BUCKETS).ok_or(FirstContactError::TooLarge {
+        got: LEN_PREFIX.saturating_add(encoded.len()),
+        max: *PAD_BUCKETS.last().expect("ladder is never empty"),
+    })
 }
 
 /// Recover the encoded body from a padded plaintext. Fails closed on a corrupt or
 /// oversized length rather than slicing past the buffer.
 fn unpad_plaintext(padded: &[u8]) -> Result<&[u8], FirstContactError> {
-    if padded.len() < LEN_PREFIX {
-        return Err(FirstContactError::Malformed);
-    }
-    let len = u32::from_le_bytes(padded[..LEN_PREFIX].try_into().expect("checked length")) as usize;
-    LEN_PREFIX
-        .checked_add(len)
-        .and_then(|end| padded.get(LEN_PREFIX..end))
-        .ok_or(FirstContactError::Malformed)
+    crate::dm::unpad(padded).ok_or(FirstContactError::Malformed)
 }
 
 fn exact<const N: usize>(field: &'static str, bytes: &[u8]) -> Result<[u8; N], FirstContactError> {

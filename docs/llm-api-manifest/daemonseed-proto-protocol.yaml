@@ -1297,6 +1297,82 @@ functions:
           (admission option C). Inside the seal, because it names the sender. Not
           yet populated.
 
+  - name: DmChannelFrame
+    module: dm
+    kind: message
+    description: >-
+      One message on the established channel, written to one slot of a dflt(16)
+      page record. The clear fields are exactly what a receiver needs before it
+      can derive a key; everything else is sealed, so no identity, pseudonym key
+      or signature appears in the clear. Every clear field is bound in the seal's
+      AAD, daemonseed/dm/msg/aad/v4||lp(chan_id)||lp(dir)||lp(gen_be)||
+      lp(chain_base_be)||lp(seq_be)||lp(eph_ek)||lp(eph_ct), so an edited header
+      fails the AEAD open before the ratchet is asked to move.
+    fields:
+      - name: ratchet_gen
+        type: uint32
+        tag: 1
+        description: >-
+          Which root this message's chain hangs from. uint32 matches the width the
+          ratchet counts generations in, so the boundary needs no narrowing cast.
+      - name: chain_base
+        type: uint64
+        tag: 2
+        description: >-
+          The sequence number at which this message's chain begins — the frozen
+          design's PN stated absolutely, since sequence numbers here address pages
+          and do not restart per chain.
+      - name: seq
+        type: uint64
+        tag: 3
+        description: >-
+          This message's sequence number, monotonic per direction. A collector
+          must check it against the slot the frame was read from.
+      - name: eph_ek
+        type: bytes
+        tag: 4
+        description: >-
+          The sender's current ratchet ephemeral ML-KEM-1024 encapsulation key,
+          exactly 1568 bytes. Signed, so an active attacker cannot substitute one.
+      - name: eph_ct
+        type: bytes
+        tag: 5
+        description: >-
+          The ML-KEM-1024 ciphertext that created this generation, exactly 1568
+          bytes, repeated on every message of the generation. Absent only in the
+          initiator's opening burst.
+      - name: sealed
+        type: bytes
+        tag: 6
+        description: >-
+          nonce(12) || ciphertext || tag(16) over a padded DmChannelBody,
+          AES-256-GCM under the ratchet message key for this position.
+
+  - name: DmChannelBody
+    module: dm
+    kind: message
+    description: >-
+      The sealed contents of a DmChannelFrame. Small because the identities, keys
+      and channel material were all established at first contact.
+    fields:
+      - name: sent_unix_ms
+        type: int64
+        tag: 1
+        description: Sender-asserted, signed. Display only.
+      - name: body
+        type: string
+        tag: 2
+        description: The message, capped at DM_BODY_CAP (8192 bytes) on both sides.
+      - name: msg_sig
+        type: bytes
+        tag: 3
+        description: >-
+          ML-DSA-87 signature, exactly 4627 bytes, under the pseudonym key over the
+          FirstContactBody.msg_sig preimage under frame kind "msg", extended with
+          lp(gen_be)||lp(chain_base_be)||lp(eph_ct); an absent eph_ct binds as
+          lp(&[]). Mandatory and always verified: page owner-write authority is
+          symmetric, so the address does not establish authorship.
+
   - name: KeySelector
     module: dm
     kind: enum
