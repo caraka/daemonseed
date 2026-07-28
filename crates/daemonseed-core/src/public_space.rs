@@ -25,6 +25,7 @@
 use core::fmt;
 use core::str::FromStr;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use oxicrypt_kdf::HkdfSha384;
 use oxicrypt_ml_dsa as ml_dsa;
@@ -290,6 +291,128 @@ pub fn dev_project_announce_veilid_owner_seed()
     derive_project_announce_veilid_owner_seed(&PROJECT_RELEASE_SEED)
 }
 
+/// A uniformly random starting point in the announce record's slot key space (#238).
+///
+/// The keep-alive rotates a cursor over content-address slots in key order. Starting
+/// every session at "no cursor" — i.e. at the numerically lowest slot — would walk the
+/// SAME prefix on every launch, so an operator whose sessions are shorter than `N`
+/// emissions would refresh the first few announcements forever and never reach the tail:
+/// precisely the silent expiry the keep-alive exists to prevent, and worse for being
+/// deterministic. Seeding from a random point makes each session start somewhere
+/// different, so coverage is uniform across sessions instead of prefix-biased.
+///
+/// The value is compared lexicographically against `hex(content_address)` slot ids, so
+/// only the leading characters decide placement and 16 hex digits is ample. An entropy
+/// failure yields an empty string, which starts at the first slot — degraded to the
+/// unseeded behaviour, never a failure.
+pub fn random_announce_slot_cursor() -> String {
+    let mut buf = [0u8; 8];
+    match getrandom::fill(&mut buf) {
+        Ok(()) => hex::encode(buf),
+        Err(_) => String::new(),
+    }
+}
+
+/// Lower bound of the jittered operator keep-alive band (#238).
+///
+/// Veilid has no TTL — retention is capacity-eviction only — so an announcement
+/// survives exactly as long as someone re-seeds it (#141). The band is deliberately
+/// slow, against measured evidence: in early felt testing announcement values survived
+/// **more than 24 hours with nobody re-seeding them at all**, so eviction pressure on
+/// this record is far lower than the original fixed 120 s cadence assumed.
+///
+/// Paired with one-slot-per-emission at the caller, this puts an operator's write rate
+/// onto the announce record at roughly **one write per hour**, with each individual slot
+/// refreshed every `N` hours for `N` standing announcements — an ~8x margin over the
+/// observed survival floor at `N = 3`, still 4x at `N = 6`.
+///
+/// That is also the whole *fleet's* rate in a RELEASE build, where only an operator
+/// instance re-seeds. It is not the fleet rate in a debug build:
+/// `operator_write_enabled()` is unconditionally true under `cfg!(debug_assertions)`, so
+/// a debug fleet still writes once per client per hour. A felt-test that wants to observe
+/// the operator-only behaviour must therefore use release builds.
+///
+/// **Tunable, and expected to be tuned.** The 24 h observation is a property of how
+/// loaded the DHT was during that test, not a constant: eviction is capacity-driven, so
+/// a busier network evicts sooner. Widen or narrow the band if announcements start
+/// vanishing. What must NOT come back is a fast *fixed* period — see
+/// [`next_operator_keepalive_interval`] for why.
+pub const OPERATOR_KEEPALIVE_INTERVAL_MIN: Duration = Duration::from_secs(45 * 60);
+
+/// Upper bound of the jittered operator keep-alive band (#238). See
+/// [`OPERATOR_KEEPALIVE_INTERVAL_MIN`] for how the band was chosen.
+pub const OPERATOR_KEEPALIVE_INTERVAL_MAX: Duration = Duration::from_secs(75 * 60);
+
+/// Lower bound of the jittered delay before an operator's FIRST keep-alive emission of a
+/// session (#238).
+///
+/// The steady band is deliberately slow, but applying it to the first emission too would
+/// mean a session shorter than [`OPERATOR_KEEPALIVE_INTERVAL_MIN`] refreshes **nothing at
+/// all** — and an operator that runs the client in short bursts would silently never
+/// re-seed, which under operator-only keep-alive means the announcements age out with no
+/// indication why. Emitting soon after start makes any session past a few minutes refresh
+/// at least one slot, and a session of roughly `N` hours cycles all `N` of them.
+///
+/// **Known leak, not concealed by the jitter.** This band is disjoint from — and far
+/// below — the steady band, so an observer watching the record sees any inter-write gap
+/// under [`OPERATOR_KEEPALIVE_INTERVAL_MIN`] and knows it was a first emission, pinning
+/// session start to this window. Jitter fuzzes the marker; concealment would need the
+/// two bands to OVERLAP. Under operator-only keep-alive the record already leaks
+/// operator liveness (every write on it is the operator's), so this sharpens an accepted
+/// signal rather than opening a new class — but it IS a session-boundary marker of the
+/// shape WB-1.4/1.6 forbid for presence records, and it is the price of guaranteeing a
+/// short session refreshes something. Collapsing to one wide band, e.g. `[2, 75] min`,
+/// removes the marker at the cost of that guarantee. Tracked in
+/// `docs/design/operator-space-management.md`.
+pub const OPERATOR_KEEPALIVE_FIRST_MIN: Duration = Duration::from_secs(2 * 60);
+
+/// Upper bound of the jittered delay before an operator's first keep-alive emission. See
+/// [`OPERATOR_KEEPALIVE_FIRST_MIN`].
+pub const OPERATOR_KEEPALIVE_FIRST_MAX: Duration = Duration::from_secs(5 * 60);
+
+/// Draw the jittered delay before the FIRST operator keep-alive emission of a session,
+/// uniformly random in `[OPERATOR_KEEPALIVE_FIRST_MIN, OPERATOR_KEEPALIVE_FIRST_MAX]`.
+/// Every emission after the first uses [`next_operator_keepalive_interval`].
+pub fn first_operator_keepalive_interval() -> Duration {
+    jittered(OPERATOR_KEEPALIVE_FIRST_MIN, OPERATOR_KEEPALIVE_FIRST_MAX)
+}
+
+/// Draw the next jittered operator keep-alive interval, uniformly random in
+/// `[OPERATOR_KEEPALIVE_INTERVAL_MIN, OPERATOR_KEEPALIVE_INTERVAL_MAX]`.
+///
+/// Jitter is drawn **per emission**, never once per session — the WB-1.2 pattern, and
+/// the same shape as [`crate::presence::next_keepalive_interval`]. A fixed period (the
+/// `tokio::time::interval` this replaced) gives the record a recognisable cadence
+/// signature and phase-locks every client that holds it into a thundering herd, which
+/// WB-3 I6 forbids for exactly this kind of keepalive.
+///
+/// Drawn from the OS CSPRNG; an entropy failure falls back to the band midpoint — a
+/// keep-alive is liveness, not a key, and the next draw recovers.
+pub fn next_operator_keepalive_interval() -> Duration {
+    jittered(
+        OPERATOR_KEEPALIVE_INTERVAL_MIN,
+        OPERATOR_KEEPALIVE_INTERVAL_MAX,
+    )
+}
+
+/// A duration drawn uniformly at random from `[min, max]`, inclusive.
+///
+/// Drawn from the OS CSPRNG; an entropy failure falls back to the band midpoint — these
+/// bands schedule keep-alives, which are liveness and not keys, so a predictable interval
+/// on an entropy failure costs a cadence signature and nothing more, and the next draw
+/// recovers. Callers must pass `min <= max`.
+fn jittered(min: Duration, max: Duration) -> Duration {
+    let min_ms = min.as_millis() as u64;
+    let max_ms = max.as_millis() as u64;
+    let span = max_ms.saturating_sub(min_ms); // inclusive upper bound below
+    let mut buf = [0u8; 8];
+    let offset = match getrandom::fill(&mut buf) {
+        Ok(()) => u64::from_le_bytes(buf) % (span + 1),
+        Err(_) => span / 2,
+    };
+    Duration::from_millis(min_ms + offset)
+}
+
 /// A monotonic freshness / rollback guard for an operator announce/MOTD record —
 /// the **#78 replay guard applied to the operator record** (A1, "gaps closed").
 /// Live-only DHT has no store-and-forward, so a client reading a stale subkey sees
@@ -509,6 +632,91 @@ fn is_motd_forbidden_char(c: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #238: both keep-alive bands draw in range and actually vary. A constant interval
+    /// would restore the exact fixed-period cadence signature the band exists to remove
+    /// (WB-1.2 / WB-3 I6), and nothing else in the tree would notice.
+    #[test]
+    fn operator_keepalive_intervals_are_in_band_and_jittered() {
+        let mut steady = std::collections::HashSet::new();
+        let mut first = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let d = next_operator_keepalive_interval();
+            assert!(
+                d >= OPERATOR_KEEPALIVE_INTERVAL_MIN && d <= OPERATOR_KEEPALIVE_INTERVAL_MAX,
+                "steady interval {d:?} outside the band"
+            );
+            steady.insert(d.as_millis());
+
+            let f = first_operator_keepalive_interval();
+            assert!(
+                f >= OPERATOR_KEEPALIVE_FIRST_MIN && f <= OPERATOR_KEEPALIVE_FIRST_MAX,
+                "first interval {f:?} outside the band"
+            );
+            first.insert(f.as_millis());
+        }
+        assert!(steady.len() > 1, "steady band produced a constant interval");
+        assert!(first.len() > 1, "first band produced a constant interval");
+    }
+
+    /// #238: the bands are well-formed and correctly ordered. `jittered` uses
+    /// `saturating_sub`, so an inverted band would NOT panic — it would silently return
+    /// the longer bound forever with no jitter at all. And the first band exists only
+    /// because it is shorter than the steady one; if that stops being true the short
+    /// first emission is pointless and its rustdoc becomes false.
+    #[test]
+    fn operator_keepalive_bands_are_well_formed() {
+        assert!(OPERATOR_KEEPALIVE_INTERVAL_MIN <= OPERATOR_KEEPALIVE_INTERVAL_MAX);
+        assert!(OPERATOR_KEEPALIVE_FIRST_MIN <= OPERATOR_KEEPALIVE_FIRST_MAX);
+        assert!(
+            OPERATOR_KEEPALIVE_FIRST_MAX < OPERATOR_KEEPALIVE_INTERVAL_MIN,
+            "the first emission must be sooner than any steady one"
+        );
+    }
+
+    /// #238: pin the documented write rate. The band's mean sets the operator's write
+    /// rate onto the announce record, and that figure is asserted in the rustdoc, the
+    /// CHANGELOG, the ISA Decisions entry and `docs/design/operator-space-management.md`
+    /// (~1 write/hour, each slot refreshed every `N` hours). Widening or narrowing the
+    /// band silently falsifies all four; this fails first. Mirrors
+    /// `dm::keyrec::reseed_cadence_matches_the_budgeted_rate`.
+    #[test]
+    fn operator_keepalive_cadence_matches_the_documented_rate() {
+        let mean_secs = (OPERATOR_KEEPALIVE_INTERVAL_MIN.as_secs()
+            + OPERATOR_KEEPALIVE_INTERVAL_MAX.as_secs()) as f64
+            / 2.0;
+        let writes_per_hour = 3600.0 / mean_secs;
+        assert!(
+            (0.8..=1.3).contains(&writes_per_hour),
+            "documented as ~1 write/hour, band gives {writes_per_hour:.2}/hour — update \
+             the rustdoc, CHANGELOG, ISA Decisions and the operator-space design doc"
+        );
+        // The margin claim: at N announcements each slot waits N × mean. Against the
+        // measured >24 h retention floor, N=3 must keep a >=8x margin.
+        let margin_at_3 = 24.0 * 3600.0 / (3.0 * mean_secs);
+        assert!(
+            margin_at_3 >= 7.5,
+            "documented ~8x margin at N=3, band gives {margin_at_3:.1}x"
+        );
+    }
+
+    /// #238: the random cursor seed lands in the slot key space and varies. A constant
+    /// seed would put every session's rotation back at the same starting slot, which is
+    /// the prefix-bias this function exists to remove.
+    #[test]
+    fn random_announce_slot_cursor_varies_and_is_hex() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..32 {
+            let c = random_announce_slot_cursor();
+            assert!(
+                c.chars()
+                    .all(|ch| ch.is_ascii_hexdigit() && !ch.is_uppercase()),
+                "cursor {c} must compare against lowercase-hex slot ids"
+            );
+            seen.insert(c);
+        }
+        assert!(seen.len() > 1, "cursor seed produced a constant value");
+    }
 
     /// ISC-S9: a normal single line is accepted; any control character
     /// (newline / CR / tab) is rejected.

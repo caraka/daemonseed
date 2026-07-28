@@ -78,7 +78,9 @@ use daemonseed_core::public_room::{
     seal_room_message,
 };
 use daemonseed_core::public_space::{
-    Whitelist, content_address, dev_project_announce_veilid_owner_seed, dev_project_release_keypair,
+    Whitelist, content_address, dev_project_announce_veilid_owner_seed,
+    dev_project_release_keypair, first_operator_keepalive_interval,
+    next_operator_keepalive_interval, random_announce_slot_cursor,
 };
 use daemonseed_core::route_guard::ImportedRouteGuard;
 use daemonseed_core::session_health::{
@@ -206,15 +208,14 @@ const OPERATOR_ITEM_MOTD: u8 = 0x00;
 /// KIND tag for an announcement value: the payload is a [`wire::Post`].
 const OPERATOR_ITEM_ANNOUNCEMENT: u8 = 0x01;
 
-/// #141: how often a writer re-publishes its known operator MOTD + announcements so
-/// their DHT subkey values do not expire. Operator content is otherwise written only
-/// on post, and Veilid DHT values age out without owner refresh — so an announcement
-/// silently vanished across sessions (felt-test 2026-07-08). Gated on holding the
-/// announce owner seed, so only a writer (dev: any client; prod: the operator) keeps
-/// content alive; the record is low-volume, so re-publishing a handful of already-signed
-/// items on this cadence is cheap. Felt-tunable; set safely under Veilid's default DHT
-/// value TTL (to confirm).
-const OPERATOR_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(120);
+/// (owner seed, `slot_id`, encoded value) — ONE #141 keep-alive re-publish.
+///
+/// #238 writes a single slot per emission rather than the whole record: the previous
+/// batch wrote every announcement on every tick, so the write cost scaled linearly with
+/// the number of standing announcements and arrived as one burst. One slot per emission
+/// bounds the fleet's rate on this record independently of how many announcements exist
+/// (each slot is simply refreshed every `N` emissions instead).
+type OperatorKeepaliveItem = ([u8; 32], String, Vec<u8>);
 
 /// Prepend the 1-byte KIND tag to a prost-encoded operator artifact.
 fn encode_operator_item(kind: u8, bytes: &[u8]) -> Vec<u8> {
@@ -490,7 +491,20 @@ pub async fn veilid_net_actor(
     let mut prune_timer = tokio::time::interval(SHARE_CATALOG_PRUNE_INTERVAL);
     // #141: re-publish operator MOTD/announcements on a slow cadence so their DHT
     // values do not expire (operator content is otherwise written only on post).
-    let mut operator_keepalive = tokio::time::interval(OPERATOR_KEEPALIVE_INTERVAL);
+    // #141/#238: operator announce keep-alive clock. A self-rescheduling `Sleep` (not a
+    // fixed `interval`) so every emission draws a fresh jittered deadline — no
+    // fixed-period signature and no cross-client phase-lock (WB-1.2 / WB-3 I6), the same
+    // shape the presence heartbeat below uses. `operator_keepalive_cursor` is the
+    // key-based round-robin position over the announcement slots; ONE slot is refreshed
+    // per emission. The FIRST emission uses a short band so a brief operator session
+    // still refreshes something (see `first_operator_keepalive_interval`).
+    // Seeded RANDOMLY, not at the first slot: the actor is spawned once per process, so
+    // an unseeded cursor would restart the rotation at the lowest slot on every launch
+    // and an operator with short sessions would re-publish the same prefix forever while
+    // the tail expired (see `random_announce_slot_cursor`).
+    let operator_keepalive = tokio::time::sleep(first_operator_keepalive_interval());
+    tokio::pin!(operator_keepalive);
+    let mut operator_keepalive_cursor: Option<String> = Some(random_announce_slot_cursor());
     // Presence keepalive + reap clock (WB-1.2): a jittered [180,220]s keepalive into
     // each joined room's presence record that also reaps the roster on each fire. A
     // self-rescheduling `Sleep` (not a fixed `interval`) so each tick draws a fresh
@@ -718,33 +732,62 @@ pub async fn veilid_net_actor(
                     let _ = evt_tx.send(NetEvent::SharesSnapshot { shares: shares.listings() });
                 }
             }
-            // #141: keep operator content alive in the DHT — re-publish the known MOTD +
-            // announcements OFF the actor loop (their DHT values age out without owner
-            // refresh, else they silently expire). Collect synchronously, spawn the
-            // writes so a many-item record never stalls chat/commands (#128 class).
-            _ = operator_keepalive.tick() => {
-                if let (Some(handle), Some((owner_seed, items))) =
-                    (net.as_ref(), collect_operator_keepalive_items(&shares))
-                {
+            // #141: keep operator content alive in the DHT — an announcement's DHT value
+            // ages out without an owner refresh and silently vanishes. #238: ONE slot per
+            // emission, operator-only, on a jittered band. Pick synchronously (so the
+            // cursor advance stays deterministic), spawn the write so a slow DHT never
+            // stalls chat/commands (#128 class), then re-arm with a fresh jittered
+            // deadline.
+            () = operator_keepalive.as_mut() => {
+                let is_operator = operator_write_enabled();
+                // Not connected → pick nothing and leave the cursor where it is, so the
+                // slot that would have been refreshed is the one picked next time rather
+                // than being skipped for a whole cycle.
+                let dispatched = if let Some((handle, (owner_seed, slot, value))) = net
+                    .as_ref()
+                    .zip(next_operator_keepalive_item(
+                        &shares,
+                        is_operator,
+                        operator_keepalive_cursor.as_deref(),
+                    )) {
+                    operator_keepalive_cursor = Some(slot.clone());
                     let handle = handle.clone();
                     tokio::spawn(async move {
-                        let mut n = 0usize;
-                        for (slot, value) in items {
-                            if handle
-                                .publish_current_state(owner_seed, &slot, value)
-                                .await
-                                .is_ok()
-                            {
-                                n += 1;
-                            }
-                        }
-                        if n > 0 {
-                            daemonseed_veilid_net::vtrace!(
-                                "gui operator: keep-alive re-published {n} item(s)"
-                            );
+                        // A FAILED emission is traced, not swallowed. One slot per
+                        // emission means a lost write is not retried for a full rotation
+                        // (`N` × the band), so a silently-shed write is a slot that
+                        // quietly stops being refreshed — the #141 failure, re-entered
+                        // through the fix for it. This write also carries no WB-3
+                        // deadline, so I6b's override does not rescue it under congestion
+                        // (#166).
+                        match handle.publish_current_state(owner_seed, &slot, value).await {
+                            Ok(()) => daemonseed_veilid_net::vtrace!(
+                                "gui operator: keep-alive re-published slot {slot}"
+                            ),
+                            Err(e) => daemonseed_veilid_net::vtrace!(
+                                "gui operator: keep-alive FAILED for slot {slot}: {e} \
+                                 — not retried until the rotation returns to it"
+                            ),
                         }
                     });
-                }
+                    true
+                } else {
+                    false
+                };
+                // An operator emission that found nothing to publish retries on the SHORT
+                // band, never the steady one. This actor is spawned at window construction,
+                // long before Connect (and before any announcement has folded in), so the
+                // first deadline routinely lands with no record, no posts, or no network —
+                // and charging that miss a full steady band would put the next attempt an
+                // hour away, re-opening the short-session hole the first band exists to
+                // close. A non-operator has nothing to retry, so it stays on the steady
+                // band rather than waking every few minutes to do nothing.
+                let next = if dispatched || !is_operator {
+                    next_operator_keepalive_interval()
+                } else {
+                    first_operator_keepalive_interval()
+                };
+                operator_keepalive.as_mut().reset(tokio::time::Instant::now() + next);
             }
             // Emit one presence keepalive per joined room + reap the rosters, then
             // re-arm the timer with a fresh jittered deadline (WB-1.2).
@@ -1997,7 +2040,18 @@ async fn subscribe_operator_space(shares: &mut ShareState, net: &Option<VeilidNe
         daemonseed_veilid_net::vtrace!("gui operator: subscribe failed: {e}");
         return;
     }
-    daemonseed_veilid_net::vtrace!("gui operator: announce/MOTD record subscribed");
+    // #238: state the write role explicitly. Under operator-only keep-alive this
+    // instance is the ONLY thing refreshing the record, and the role comes from an
+    // environment variable — a launch that forgot `DAEMONSEED_OPERATOR=1` would
+    // otherwise silently stop re-seeding with nothing anywhere to say so.
+    daemonseed_veilid_net::vtrace!(
+        "gui operator: announce/MOTD record subscribed (write role: {})",
+        if operator_write_enabled() {
+            "OPERATOR — this instance re-seeds announcements"
+        } else {
+            "reader — this instance never writes the announce record"
+        }
+    );
     shares.operator = Some(OperatorSpace {
         announce_owner_seed,
         motd: None,
@@ -2207,13 +2261,34 @@ async fn upload_announcement(
     }
 }
 
-/// (owner seed, `[(slot_id, encoded-value)]`) — one #141 keep-alive re-publish batch.
-type OperatorKeepaliveBatch = ([u8; 32], Vec<(String, Vec<u8>)>);
-
-/// #141: collect the operator record's re-publishable items as `(slot_id,
-/// encoded-value)` pairs for a keep-alive, with the owner seed to write them. `None`
-/// when there is no operator record or nothing to re-publish. Pure (no I/O) so the
-/// caller can spawn the DHT writes off the actor loop.
+/// #141/#238: pick the ONE announcement slot to re-publish this emission, with the owner
+/// seed to write it. `None` when this instance is not an operator, when there is no
+/// operator record, or when there is nothing to re-publish. Pure (no I/O, no environment
+/// read — the caller passes `is_operator`) so it stays unit-testable and the caller can
+/// spawn the DHT write off the actor loop.
+///
+/// **Only an operator re-seeds (#238).** `shares.operator` means "subscribed to the
+/// announce record", NOT "is the operator" — [`subscribe_operator_space`] sets it for
+/// every client at connect. Gating the keep-alive on the subscription therefore had EVERY
+/// client re-writing the operator's announcements, so the write load against this ONE
+/// record scaled with the size of the fleet: byte-identical writes into the same
+/// content-addressed slots, carrying no new information, getting worse precisely as
+/// adoption grew. The announce record's owner seed is a well-known derivation every
+/// client can compute, so possession of the write key never implied authority to use it;
+/// the caller passes [`operator_write_enabled`], the same predicate that gates the
+/// composer, so writes are consistently operator-only.
+///
+/// Integrity was never the issue — [`apply_operator_item`] verifies the F17 signature and
+/// the content address before folding, so a non-operator could not have injected forged
+/// content. This is about write volume and authority, not authenticity.
+///
+/// **One slot per emission.** `cursor` is the slot refreshed last time; this returns the
+/// next one in `BTreeMap` order, wrapping at the end. The cursor is **key-based, not an
+/// index**: the announcement set changes as posts arrive, and an index into a set that
+/// grew or shrank between emissions silently skips entries (the same trap WB-ISC-14
+/// documents for the steady-resweep cursor). A cursor naming a slot that has since
+/// disappeared simply resumes at the next slot after it in key order, so a deleted
+/// announcement costs nothing.
 ///
 /// ONLY the announcements are kept alive, NOT the MOTD. Announcements live in
 /// content-addressed slots (`hex(content_address)`), so re-publishing their exact
@@ -2223,22 +2298,44 @@ type OperatorKeepaliveBatch = ([u8; 32], Vec<(String, Vec<u8>)>);
 /// stale MOTD would let peers adopt + rebroadcast it and revert a newer/cleared MOTD
 /// network-wide. MOTD keep-alive waits for the #136 monotonic version that makes the
 /// mutable slot safe to refresh.
-fn collect_operator_keepalive_items(shares: &ShareState) -> Option<OperatorKeepaliveBatch> {
+///
+/// **That exclusion is exact for the LOGICAL slot and not guaranteed for the physical
+/// one.** `"motd"` cannot enter this rotation — it is a separate field, and its slot id
+/// is not hex — but logical slot ids are hashed onto only `SUBKEY_COUNT` (64) physical
+/// subkeys by `rendezvous::current_state_subkey`, and `"motd"` lands on subkey 21. An
+/// announcement whose content address hashes to 21 (p ≈ 1/64) therefore shares the MOTD's
+/// physical subkey, and re-publishing it overwrites the MOTD's DHT value outright. That
+/// collision is pre-existing and not specific to the keep-alive — `set_motd` clobbers the
+/// announcement just as readily, and the same birthday curve applies between
+/// announcements. It is filed as a mechanism in #134 (scoped there to presence) and
+/// carried for the operator record in `docs/design/operator-space-management.md`. Do not
+/// read the paragraph above as a wire-level guarantee.
+fn next_operator_keepalive_item(
+    shares: &ShareState,
+    is_operator: bool,
+    cursor: Option<&str>,
+) -> Option<OperatorKeepaliveItem> {
+    if !is_operator {
+        return None;
+    }
     let op = shares.operator.as_ref()?;
-    let mut items: Vec<(String, Vec<u8>)> = Vec::new();
     // Announcements only — content-addressed slots are idempotent under re-publish. The
     // mutable MOTD slot is deliberately excluded (see the fn doc: reverts without #136).
-    for (slot, post) in op.posts.iter() {
-        items.push((
-            slot.clone(),
-            encode_operator_item(OPERATOR_ITEM_ANNOUNCEMENT, &post.encode_to_vec()),
-        ));
-    }
-    if items.is_empty() {
-        None
-    } else {
-        Some((op.announce_owner_seed, items))
-    }
+    // Round-robin: the first slot strictly after the cursor, else wrap to the first.
+    let next = match cursor {
+        Some(c) => op
+            .posts
+            .range::<str, _>((std::ops::Bound::Excluded(c), std::ops::Bound::Unbounded))
+            .next()
+            .or_else(|| op.posts.iter().next()),
+        None => op.posts.iter().next(),
+    };
+    let (slot, post) = next?;
+    Some((
+        op.announce_owner_seed,
+        slot.clone(),
+        encode_operator_item(OPERATOR_ITEM_ANNOUNCEMENT, &post.encode_to_vec()),
+    ))
 }
 
 /// Try inbound bytes as an operator announce-record item (A-c). Returns `true` only
@@ -5724,15 +5821,130 @@ mod tests {
         }
     }
 
+    /// Fold one signed announcement into a subscribed operator record, returning the
+    /// slot it landed in. This is the state EVERY ordinary client reaches at connect —
+    /// and the state that used to make a mere subscriber re-publish (#238).
+    fn push_announcement(shares: &mut ShareState, topic: &str, body: &str, ts: i64) -> String {
+        let kp = dev_project_release_keypair().unwrap();
+        let (evt_tx, _rx) = unbounded_channel();
+        let artifact = sign_post(&kp, topic, body, ts).unwrap();
+        let addr = content_address(&artifact.signed_payload).unwrap();
+        let post = wire::Post {
+            artifact: Some(artifact),
+            content_address: addr.as_bytes().to_vec(),
+        };
+        let bytes = encode_operator_item(OPERATOR_ITEM_ANNOUNCEMENT, &post.encode_to_vec());
+        assert!(apply_operator_item(shares, &evt_tx, &bytes));
+        hex::encode(&post.content_address)
+    }
+
+    /// #238: subscription is not authority. Every client subscribes to the operator
+    /// record at connect (`subscribe_operator_space`), so gating the keep-alive on the
+    /// subscription made the whole fleet re-write one record. Only an operator instance
+    /// re-seeds — however much operator content the client holds, and even though it can
+    /// derive the record's well-known owner seed.
     #[test]
-    fn collect_operator_keepalive_items_excludes_the_mutable_motd() {
+    fn a_subscriber_never_keeps_the_operator_record_alive() {
+        let _ = oxicrypt_module::initialize();
+        let mut shares = ShareState::new();
+        shares.operator = Some(operator_space());
+        push_announcement(&mut shares, "release", "v0.33.0 is out", 200);
+        assert!(
+            next_operator_keepalive_item(&shares, false, None).is_none(),
+            "a non-operator holding operator content must have nothing to re-publish"
+        );
+        // The SAME state, as an operator, DOES re-publish — so the `None` above is the
+        // gate talking, not an empty-state artifact.
+        assert!(
+            next_operator_keepalive_item(&shares, true, None).is_some(),
+            "an operator with an announcement must still refresh it"
+        );
+    }
+
+    /// #238: one slot per emission, round-robin in key order, wrapping at the end — so
+    /// the write rate on the record is independent of how many announcements stand.
+    #[test]
+    fn the_keepalive_round_robins_one_slot_per_emission() {
+        let _ = oxicrypt_module::initialize();
+        let mut shares = ShareState::new();
+        shares.operator = Some(operator_space());
+        let mut slots = vec![
+            push_announcement(&mut shares, "a", "first", 100),
+            push_announcement(&mut shares, "b", "second", 200),
+            push_announcement(&mut shares, "c", "third", 300),
+        ];
+        // Content-addressed slots are hashes, so their BTreeMap order is not insertion
+        // order — compare against the record's own key order.
+        slots.sort();
+        slots.dedup();
+        assert_eq!(slots.len(), 3, "three DISTINCT content-addressed slots");
+
+        // Walking the cursor visits each slot exactly once, in key order...
+        let mut cursor: Option<String> = None;
+        let mut visited = Vec::new();
+        for _ in 0..slots.len() {
+            let (_, slot, _) = next_operator_keepalive_item(&shares, true, cursor.as_deref())
+                .expect("an operator with announcements always has one to refresh");
+            visited.push(slot.clone());
+            cursor = Some(slot);
+        }
+        assert_eq!(visited, slots, "one slot per emission, in key order");
+
+        // ...and the next emission wraps to the first rather than stopping.
+        let (_, wrapped, _) = next_operator_keepalive_item(&shares, true, cursor.as_deref())
+            .expect("the cursor must wrap, not run out");
+        assert_eq!(
+            wrapped, slots[0],
+            "the cursor wraps at the end of the record"
+        );
+    }
+
+    /// #238: the cursor is key-based, not an index, so a slot that disappears between
+    /// emissions (a deleted announcement) resumes at the **next key in order** rather
+    /// than restarting the rotation — the WB-ISC-14 trap that bit the steady-resweep
+    /// cursor, and the reason `resweep.rs` pins the same property.
+    ///
+    /// The cursor here must sort strictly BETWEEN two present slots. A cursor that sorts
+    /// below the whole set (`""`, the first cut of this test) cannot discriminate:
+    /// resume-at-next-key and a restart-from-the-beginning bug both return the first
+    /// slot, so the assertion held for the bug it was written to catch.
+    #[test]
+    fn a_vanished_cursor_slot_resumes_at_the_next_key() {
+        let _ = oxicrypt_module::initialize();
+        let mut shares = ShareState::new();
+        shares.operator = Some(operator_space());
+        let mut slots = [
+            push_announcement(&mut shares, "a", "first", 100),
+            push_announcement(&mut shares, "b", "second", 200),
+            push_announcement(&mut shares, "c", "third", 300),
+        ];
+        slots.sort();
+        // A key strictly between slots[0] and slots[1], present in neither: appending a
+        // character to slots[0] extends it (so it sorts after slots[0]) while leaving the
+        // first differing position against slots[1] unchanged (so it sorts before it).
+        let vanished = format!("{}0", slots[0]);
+        assert!(
+            vanished > slots[0] && vanished < slots[1],
+            "cursor is between"
+        );
+        let (_, slot, _) = next_operator_keepalive_item(&shares, true, Some(&vanished))
+            .expect("an absent cursor slot must not stall the rotation");
+        assert_eq!(
+            slot, slots[1],
+            "resume at the next key — NOT slots[0], which is what a restart-from-the-\
+             beginning implementation would return"
+        );
+    }
+
+    #[test]
+    fn the_keepalive_excludes_the_mutable_motd() {
         let _ = oxicrypt_module::initialize();
         // No operator record → nothing to re-publish.
-        assert!(collect_operator_keepalive_items(&ShareState::new()).is_none());
+        assert!(next_operator_keepalive_item(&ShareState::new(), true, None).is_none());
         // Operator subscribed but empty → still None.
         let mut shares = ShareState::new();
         shares.operator = Some(operator_space());
-        assert!(collect_operator_keepalive_items(&shares).is_none());
+        assert!(next_operator_keepalive_item(&shares, true, None).is_none());
         let kp = dev_project_release_keypair().unwrap();
         let (evt_tx, _rx) = unbounded_channel();
         // #141: a MOTD alone is NOT kept alive — the mutable "motd" slot has no
@@ -5742,27 +5954,25 @@ mod tests {
         let motd_bytes = encode_operator_item(OPERATOR_ITEM_MOTD, &motd.encode_to_vec());
         assert!(apply_operator_item(&mut shares, &evt_tx, &motd_bytes));
         assert!(
-            collect_operator_keepalive_items(&shares).is_none(),
+            next_operator_keepalive_item(&shares, true, None).is_none(),
             "a MOTD-only operator has nothing safe to keep alive"
         );
         // An announcement (content-addressed → idempotent under re-publish) IS kept alive.
-        let post_artifact = sign_post(&kp, "release", "v0.33.0 is out", 200).unwrap();
-        let addr = content_address(&post_artifact.signed_payload).unwrap();
-        let post = wire::Post {
-            artifact: Some(post_artifact),
-            content_address: addr.as_bytes().to_vec(),
-        };
-        let post_bytes = encode_operator_item(OPERATOR_ITEM_ANNOUNCEMENT, &post.encode_to_vec());
-        assert!(apply_operator_item(&mut shares, &evt_tx, &post_bytes));
-        let (seed, items) = collect_operator_keepalive_items(&shares)
-            .expect("the announcement should be collected");
+        let slot = push_announcement(&mut shares, "release", "v0.33.0 is out", 200);
+        let (seed, picked, value) = next_operator_keepalive_item(&shares, true, None)
+            .expect("the announcement should be picked");
         assert_eq!(seed, shares.operator.as_ref().unwrap().announce_owner_seed);
-        assert_eq!(items.len(), 1, "only the announcement, never the MOTD");
-        assert_eq!(items[0].0, hex::encode(&post.content_address));
+        assert_eq!(picked, slot, "the announcement slot, never the MOTD");
         assert_eq!(
-            decode_operator_item(&items[0].1).unwrap().0,
+            decode_operator_item(&value).unwrap().0,
             OPERATOR_ITEM_ANNOUNCEMENT
         );
+        // The MOTD is still held locally — it is excluded from the keep-alive, not absent.
+        // NOTE: this asserts the in-memory exclusion only. It cannot observe the physical
+        // subkey collision described in the fn rustdoc (an announcement hashing onto
+        // `"motd"`'s subkey 21), which happens below this layer — do not read a green
+        // test here as a wire-level guarantee that the MOTD is safe.
+        assert!(shares.operator.as_ref().unwrap().motd.is_some());
     }
 
     /// `refresh_public_space` re-renders the current operator content as a plain
