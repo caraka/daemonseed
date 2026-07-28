@@ -5803,6 +5803,46 @@ functions:
     preconditions:
       - description: The oxicrypt module must be operational.
 
+  - name: random_announce_slot_cursor
+    module: daemonseed_core::public_space
+    description: >-
+      A uniformly random starting point in the announce record's slot key space, as a hex
+      string compared lexicographically against hex(content_address) slot ids. Seeds the
+      keep-alive rotation so a session starts at a random slot rather than the lowest.
+      An entropy failure yields an empty string, which starts at the first slot.
+    signature: "pub fn random_announce_slot_cursor() -> String"
+    parameters: []
+    returns:
+      type: String
+      description: A random cursor position in the slot key space.
+
+  - name: first_operator_keepalive_interval
+    module: daemonseed_core::public_space
+    description: >-
+      The jittered delay before an operator's FIRST announce keep-alive emission of a
+      session, uniformly random in [OPERATOR_KEEPALIVE_FIRST_MIN,
+      OPERATOR_KEEPALIVE_FIRST_MAX]. Short so a brief session still refreshes a slot;
+      every later emission uses next_operator_keepalive_interval.
+    signature: "pub fn first_operator_keepalive_interval() -> Duration"
+    parameters: []
+    returns:
+      type: Duration
+      description: The delay until the session's first announce keep-alive emission.
+
+  - name: next_operator_keepalive_interval
+    module: daemonseed_core::public_space
+    description: >-
+      A fresh operator announce keep-alive delay, uniformly random in
+      [OPERATOR_KEEPALIVE_INTERVAL_MIN, OPERATOR_KEEPALIVE_INTERVAL_MAX]. Drawn per
+      emission, so the record carries no fixed-period cadence signature and holders do
+      not phase-lock (WB-1.2 / WB-3 I6). An entropy failure falls back to the band
+      midpoint.
+    signature: "pub fn next_operator_keepalive_interval() -> Duration"
+    parameters: []
+    returns:
+      type: Duration
+      description: The delay until the next announce keep-alive emission.
+
   - name: project_release_pubkey
     module: daemonseed_core::public_space
     description: >-
@@ -6973,6 +7013,30 @@ constants:
     type: usize
     value: "48"
     description: SHA-384 content-address length in bytes.
+
+  - name: OPERATOR_KEEPALIVE_INTERVAL_MIN
+    module: daemonseed_core::public_space
+    type: Duration
+    value: "45m"
+    description: Lower bound of the jittered operator announce keep-alive band.
+
+  - name: OPERATOR_KEEPALIVE_INTERVAL_MAX
+    module: daemonseed_core::public_space
+    type: Duration
+    value: "75m"
+    description: Upper bound of the jittered operator announce keep-alive band.
+
+  - name: OPERATOR_KEEPALIVE_FIRST_MIN
+    module: daemonseed_core::public_space
+    type: Duration
+    value: "2m"
+    description: Lower bound of the jittered delay before a session's first announce keep-alive.
+
+  - name: OPERATOR_KEEPALIVE_FIRST_MAX
+    module: daemonseed_core::public_space
+    type: Duration
+    value: "5m"
+    description: Upper bound of the jittered delay before a session's first announce keep-alive.
 
   - name: CACHE_TTL
     module: daemonseed_core::crypto::deprecation

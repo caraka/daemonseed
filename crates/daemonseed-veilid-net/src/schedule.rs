@@ -1151,6 +1151,11 @@ mod tests {
         {
             let h = h.clone();
             tokio::spawn(async move {
+                // #238 note: production no longer emits the operator announce keepalive at
+                // 120 s — it is operator-only, one slot per emission, on a jittered 45-75
+                // min band. This model is therefore CONSERVATIVE (it over-models real
+                // load), which keeps WB-ISC-9's bound sound, so it is left as-is rather
+                // than re-cut against a frozen criterion.
                 let mut tick = tokio::time::interval(Duration::from_secs(120));
                 tick.tick().await;
                 loop {

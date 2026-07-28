@@ -179,6 +179,14 @@ work lives in the project lead's vault manifest, not here.
   `ISA.md` to v6; build slices are tracked as GitHub issues (forces #177).
   Design + criteria only; the build carries the strictly-additive wire delta.
 
+### Fixed
+
+- Operator announcement keep-alive re-seeds from the operator instance only, one
+  slot per emission, on a jittered 45–75 minute band after a jittered 2–5 minute
+  first emission (#238). Previously every subscribed client re-published every
+  announcement every 120 seconds, so write load on the single announce record
+  scaled with both the fleet size and the number of standing announcements.
+
 ## [0.36.2] — 2026-07-27
 
 ### Fixed
