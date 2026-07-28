@@ -331,9 +331,9 @@ Corrects the round-2 overclaim that "reliable collection confirmation is impossi
 - **Deferred: a daemonseed replication *overlay*** (clients store + re-serve sealed blobs outside the owner-write DHT) — it could both refresh and echo, but it is a new subsystem ("distributed relay reborn") with its own reduced-but-real surface. Only if the retention window proves too short in practice.
 - **Not obtained: decorrelation cover from the swarm.** The owner-write rule that makes the ack unforgeable also blocks third parties from injecting write-timing cover on a channel they don't own — so F1 decorrelation must come from endpoint cover traffic (expensive) or stay an accepted cap. This stays under the unlinkability posture (decision #1's residual), NOT solved here.
 
-### The residual ambition call still open
+### Residual ambition call — DECIDED (caraka, 2026-07-27): accept for alpha
 
-- **Unlinkability vs the lobby (F1).** Still capped: activity-timed DM writes are rhythm-correlatable to lobby-published online windows. Options remain: accept-and-document for alpha (recommended given the ongoing channel is otherwise pseudonymous), endpoint constant-cadence cover traffic (expensive, WB-budget hit), or reduce lobby co-residence. **Not yet decided.**
+- **Unlinkability vs the lobby (F1).** **Accepted-and-documented for alpha** (caraka): activity-timed DM writes are rhythm-correlatable to lobby-published online windows; the ongoing channel is otherwise pseudonymous, so the residual is the lobby co-residence rhythm only. Endpoint constant-cadence cover traffic (expensive, WB-budget hit) and reduced lobby co-residence are post-alpha levers, not built now. This is a documented limit in the shipped posture, not a hidden gap.
 
 ## Concrete crypto construction (DRAFT v1 — 2026-07-27, for the third panel; NOT frozen)
 
@@ -362,7 +362,7 @@ DmKeyRecord {
 }
 ```
 - Address owner seed = `HKDF("daemonseed/dm/keyrec/owner/v1", ikm = PK_lt)`. Readers cache highest verified `version`, never regress (rollback M1 = a cold reader accepts an old authentic record; residual accepted for alpha, or ‹OPEN› pin a floor via a second channel).
-- **UKS fix (F4) is at the message layer, not here:** rather than prove DK possession (hard for KEM non-interactively), the first-contact body binds the *intended recipient* (below), so a misdirected ciphertext is rejected by the wrong recipient.
+- **UKS fix (F4) is at the message layer, not here — DECIDED (caraka): NO DK-PoP for alpha, likely never.** Rather than prove DK possession (hard for KEM non-interactively, and caraka's call is to keep it simple), the first-contact body binds the *intended recipient* (below), so a misdirected ciphertext is rejected by the wrong recipient. This is the committed and probably-permanent approach.
 
 ### First-contact entry (self-contained — option A; `dflt(64)`, 16 KB; world-writable)
 
@@ -395,16 +395,17 @@ FirstContactBody {
 
 - `ss0` (from first contact) seeds two independent roots: **`AR = HKDF("daemonseed/dm/addr/root/v1", ss0 ‖ ar_seed_A ‖ ar_seed_B)`** (retained) and the **send-chain root `RK0 = HKDF("daemonseed/dm/ratchet/root/v1", ss0)`** (ratcheted + deleted forward).
 - **Address per epoch:** `chan_addr(epoch) = HKDF("daemonseed/dm/addr/v1", AR ‖ LE64(epoch))` → Veilid owner keypair for a `dflt(N)` shared record. Both parties derive it; both are owners (owner-write ⇒ third parties can't forge/erase — the banked win). `chan_id = HKDF("daemonseed/dm/chanid/v1", AR)`.
-- **‹OPEN› epoch driver.** Wall-clock (`epoch = floor(now/period)`) → resync after any offline gap but a global synchronized reshuffle (metadata F3/F4) and a permanent-loss risk beyond the retained window (E9); interaction-counter → desync/no-passive-advance. Leaning wall-clock with a **wide window + several concurrent live epochs** for the store-and-forward tolerance, and accept the synchronized-reshuffle metadata cost. Needs a panel.
+- **Epoch driver — DECIDED (caraka, 2026-07-27): wall-clock** (`epoch = floor(now/period)`) with a **wide window + several concurrent live epochs** for store-and-forward tolerance, accepting the synchronized-reshuffle metadata cost over interaction-counter's desync/no-passive-advance failure. The R3 metadata panel is tasked to weigh in specifically on the reshuffle-linkability (F3) — that input can still tune `period`/window depth, but wall-clock is the committed shape.
 - **Message:** per message advance the symmetric chain (`CK_{n+1}=HKDF("daemonseed/dm/chain/v1",CK_n)`, `MK_n=HKDF("daemonseed/dm/mk/v1",CK_n)`, delete). Optionally carry `eph_ek` to advance the KEM ratchet on a reply. Seal under `MK_n`, explicit nonce, AAD `"daemonseed/dm/msg/aad/v1" ‖ chan_id ‖ LE64(epoch)`; `msg_sig` as above (binds `chan_id‖epoch‖seq` — kills carrier/cross-epoch replay B2/F2).
 - **Ack (high-water):** `AckMarker { high_water: u64, sig = ML-DSA_{S_pc}("daemonseed/dm/ack/v1" ‖ chan_id ‖ LE64(epoch) ‖ LE64(high_water)) }`, sealed on the channel. Sender advances a message to *confirmed* only on a verified `high_water ≥ seq` (monotonic; a stale lower marker never regresses — F2). Epoch advance is not an ack.
 
 ### What this construction still does NOT resolve (for the panel)
 
-- **Metadata F1** (lobby rhythm-intersection) — architectural, not a crypto-spec fix; stays the open unlinkability call.
-- **Rollback M1** (cold reader accepts an old authentic key record) — accepted for alpha or needs a second-channel version floor ‹OPEN›.
-- **Recovery M11** — pseudonym/`ss`/spent-token state is at-rest-only, lost on restore; `ss ∉ f(mnemonic)` by design, so only a re-bootstrap or re-first-contact restores reachability. Accepted-for-alpha or needs a re-bootstrap signal ‹OPEN›.
-- **Epoch driver ‹OPEN›** and the **wide-window metadata cost** (F3) — panel input wanted.
-- **Budget** — the two-sided ack handshake + KEM-ratchet kilobytes + generous hosting must be re-derived against WB-2/WB-5.1 (decision #4).
+All `‹OPEN›` items below are now DECIDED (caraka, 2026-07-27) — accepted-for-alpha:
+- **Metadata F1** (lobby rhythm-intersection) — **accepted for alpha** (architectural, documented limit; see § Residual ambition call).
+- **Rollback M1** (cold reader accepts an old authentic key record) — **accepted for alpha** (no second-channel version floor built).
+- **Recovery M11** — pseudonym/`ss`/spent-token state is at-rest-only, lost on restore; `ss ∉ f(mnemonic)` by design → recovery restores identity but not reachability (only re-first-contact does). **Accepted for alpha** (no re-bootstrap signal built).
+- **Epoch driver** — **DECIDED wall-clock + wide window**; the R3 panel weighs in on reshuffle-linkability and may tune `period`/window depth.
+- **Budget (decision #4, still to run)** — the two-sided ack handshake + KEM-ratchet kilobytes + generous hosting must be re-derived against WB-2/WB-5.1. This is the one remaining *mechanical* gate before freeze (it is arithmetic, not an ambition call).
 
-**Status: DRAFT — not frozen.** Next: caraka's calls on the `‹OPEN›` items + the unlinkability residual, then a third 3-lens panel against this construction, then (if it survives) the WB budget arithmetic, then freeze.
+**Status: DRAFT — not frozen.** All scope/ambition calls are now made. Remaining path to freeze: the running 3-lens panel against this construction → fold any spec bugs → converge to a clean panel round → run the WB budget arithmetic (decision #4) → caraka's freeze ratification. No further caraka input is *required* to converge the construction (only the final freeze sign-off).
