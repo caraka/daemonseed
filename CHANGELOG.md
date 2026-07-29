@@ -65,7 +65,9 @@ work lives in the project lead's vault manifest, not here.
   a frame, and a successful write proves nothing about authorship, since both
   parties can derive the owner seed for both directions. Write-once and
   partial-sweep recovery are caller obligations, not properties this layer
-  enforces. (#234)
+  enforces. A page's record open is warmed off the chat lane before the write is
+  enqueued, so the cold open a conversation pays on every page rollover does not
+  hold one of the two chat permits for its duration. (#234)
 
 - `publish_at_subkey` rejects a subkey outside the record's schema locally,
   naming the slot and the bound, instead of letting veilid reject it after the

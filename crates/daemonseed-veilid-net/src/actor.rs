@@ -1206,7 +1206,65 @@ async fn actor_loop(
                 // inline, because every field of it fails SILENTLY and a funnel
                 // request constructed on the command loop is reachable from no test.
                 // See that function for why each field is what it is.
-                sched.enqueue(dm_page_write_request(owner_seed, slot, frame, reply));
+                //
+                // WARM THE RECORD OPEN FIRST, off the chat lane. A chat-class dispatch
+                // holds one of only CHAT_PERMITS (2) permits across the WHOLE write,
+                // and for a page nobody has opened yet that write begins with a cold
+                // `open_or_create` — measured ~6-10 s, and worst case open→create→open.
+                // A conversation crosses into a new page every PAGE_SLOTS messages,
+                // forever, so without this the chat lane eats that stall on a recurring
+                // schedule; two conversations rolling over together would hold both
+                // permits and stall every circle and lobby message in the app behind
+                // them.
+                //
+                // **This is a latency argument, not a rule violation.** Opening a record
+                // while holding a pool permit is explicitly sanctioned — `dht_gate`'s
+                // margin doc names the publish path opening under its write permit as
+                // the normal case — and WB-ISC-24 is about permit ACQUISITION (a chat
+                // acquire never waits on a non-chat pool), not about what work runs
+                // under a held one. The old arrangement broke no contract; it was just
+                // a recurring multi-second occupancy of a 2-permit lane.
+                //
+                // Nor is the open made cheaper: it still costs an un-gated-limiter
+                // permit, exactly as it did before, and that limiter is the margin(2)
+                // shared with watches, consumer-route repair and Refresh. What changes
+                // is only that it no longer ALSO holds a chat permit for its duration.
+                //
+                // Pre-opening populates the shared open cache, so the dispatch's own
+                // `dm_page_open` is a map hit and the chat permit covers only the
+                // `set_dht_value`. A pre-open FAILURE is not fatal and not swallowed:
+                // it is traced, and the write is enqueued regardless, so the dispatch
+                // retries the open under the permit exactly as it would have anyway.
+                // Spawned so the command loop never waits on the open (D-0b / #128).
+                let sched = sched.clone();
+                let gate = dht_gate.clone();
+                let api = api.clone();
+                let rc = rc.clone();
+                let opened = opened.clone();
+                let record_locks = record_locks.clone();
+                tokio::spawn(async move {
+                    match identity::rendezvous_owner_keypair(&owner_seed) {
+                        Ok(owner) => {
+                            // Single-flight against a concurrent op on this record, as
+                            // the dispatch itself does. The guard is dropped before the
+                            // enqueue so the write never queues holding a record lock.
+                            let record_lock = rendezvous::record_lock(&record_locks, &owner);
+                            let _open_guard = record_lock.lock().await;
+                            if let Err(e) = dm_page_open(&gate, &api, &rc, &opened, &owner).await {
+                                crate::vtrace!(
+                                    "publish_dm_page: pre-open failed ({e}); enqueuing anyway, \
+                                     the dispatch will retry the open under the chat permit"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            // The dispatch derives the same keypair and will fail the
+                            // same way, reporting it through the caller's `reply`.
+                            crate::vtrace!("publish_dm_page: owner keypair failed ({e})");
+                        }
+                    }
+                    sched.enqueue(dm_page_write_request(owner_seed, slot, frame, reply));
+                });
             }
             Command::SweepDmPage { owner_seed, reply } => {
                 // A read, so it never touches the write funnel (I9: no read-triggered
@@ -3039,13 +3097,22 @@ mod tests {
              address different records"
         );
 
+        // The shape count above is the load-bearing guard: an inline open must name a
+        // shape, so a fourth naming IS a second open site. This is the positive half —
+        // the opener is defined once and reached from the three places that open a
+        // page: `publish_dm_page`, `sweep_dm_page`, and the pre-warm in the
+        // `PublishDmPage` arm that keeps the cold open off the chat lane.
+        //
+        // An exact count is deliberate, and so is its brittleness: a fourth caller has
+        // to come and edit this number, which is the moment to ask whether it should
+        // be going through the opener at all. Bump it only after answering that.
         let opener: String = ["dm_page", "_open("].concat();
         assert_eq!(
             prod.matches(opener.as_str()).count(),
-            3,
-            "the opener must be defined once and called exactly twice — from \
-             `publish_dm_page` and from `sweep_dm_page`. A page path that opened its \
-             own record would be free to open a different one"
+            4,
+            "the opener must be defined once and called exactly three times — from \
+             `publish_dm_page`, `sweep_dm_page`, and the publish pre-warm. A page path \
+             that opened its own record would be free to open a different one"
         );
     }
 }
