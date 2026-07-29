@@ -68,6 +68,25 @@ work lives in the project lead's vault manifest, not here.
 
 ### Added
 
+- `daemonseed_core::dm::collect` holds the pure DM collection state machine.
+  `Collection` carries the probe frontier — the highest page observed holding any
+  populated slot — and an `AckState` for the contiguous cursor. `observe_page`
+  folds a swept page into `PageObservation` (unsettled positions ascending and
+  deduplicated, plus whether the frontier moved) and records nothing on either
+  `CollectError::SlotOutsideRecord` or `CollectError::PageBeyondSequenceSpace`,
+  the second naming a page above `paging::MAX_PAGE`. `collected(PagePosition)`
+  and `abandoned(seq)` settle a position and lift the frontier to the cursor's
+  page when the cursor has run past it; a `TooManyRuns` refusal from either is
+  dropped rather than queued. `watched()` gives the current and next page;
+  `probe_plan(now_ms)` gives that pair plus up to `MAX_BACKFILL_PAGES` (2) pages
+  holding a hole — those `outstanding()` witnesses, then those between the cursor
+  and the frontier — or `None` inside `PROBE_INTERVAL_MS` (30 s).
+  `contiguous_through()`, `frontier_page()`, `outstanding()` and `view()` read
+  the state; `ack()` reads the acknowledgement. `AckState::beyond_runs` returns
+  the settled runs beyond the prefix as ascending inclusive ranges.
+  `paging::MAX_PAGE` is the highest page a sequence number lives on, which
+  `PagePosition::new` enforces. (#236)
+
 - `redacted_secret_newtype!`'s zeroize-on-drop and redacted `Debug` are under
   test. `crates/daemonseed-core/src/secret_seed.rs` asserts the `ZeroizeOnDrop`
   bound on all seventeen generated secret types and pins both arms' `Debug`

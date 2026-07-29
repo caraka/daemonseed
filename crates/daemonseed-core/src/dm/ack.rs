@@ -178,6 +178,8 @@
 //! record it derived; serializing it would collapse the address scatter the whole
 //! channel rests on.
 
+use std::ops::RangeInclusive;
+
 use oxicrypt_kdf::HkdfSha384;
 
 use crate::dm::domain;
@@ -443,6 +445,18 @@ impl AckState {
     /// [`MAX_ACK_RUNS`].
     pub fn runs(&self) -> usize {
         self.beyond.len()
+    }
+
+    /// Those runs themselves, ascending, each inclusive and separated from its
+    /// neighbours by at least one unsettled position.
+    ///
+    /// Read-only, and it reports **settled** positions on the same terms as
+    /// [`Self::is_settled`] — [`Self::abandon`] puts a position here that was
+    /// never collected. Its holder is [`crate::dm::collect::Collection`], which
+    /// reads the gaps between these runs as what is still outstanding rather
+    /// than keeping a second copy of the same set.
+    pub fn beyond_runs(&self) -> impl Iterator<Item = RangeInclusive<u64>> + '_ {
+        self.beyond.iter().map(|r| r.start..=r.end)
     }
 
     /// Record that this sequence number was **collected**: the message arrived,
@@ -1045,6 +1059,17 @@ mod tests {
 
         assert_eq!(state.high_water(), Some(5));
         assert_eq!(state.runs(), 0, "the absorbed run must leave the set");
+    }
+
+    /// The runs are readable, not only countable — a collector reads the gaps
+    /// *between* them as what is still outstanding, and a count cannot say where
+    /// a hole is.
+    #[test]
+    fn the_runs_are_readable_as_inclusive_ranges() {
+        let state = settled(&[0, 1, 4, 5, 6, 9]);
+        let runs: Vec<_> = state.beyond_runs().collect();
+        assert_eq!(runs, vec![4..=6, 9..=9]);
+        assert_eq!(runs.len(), state.runs());
     }
 
     #[test]

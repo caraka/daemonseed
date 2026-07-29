@@ -871,8 +871,10 @@ modules:
       authors — AR is symmetric — so authorship rests on msg_sig, never on the
       address. position_of(seq) -> PagePosition is total and injective (page = seq /
       PAGE_SLOTS, slot = seq % PAGE_SLOTS); PagePosition::new(page, slot) is the
-      checked slot-to-sequence direction and returns None outside the record or on
-      overflow; page(), slot(), seq() read it. PAGE_SLOTS (16) is the record's o_cnt
+      checked slot-to-sequence direction and returns None for a slot at or above
+      PAGE_SLOTS or a page above MAX_PAGE; page(), slot(), seq() read it. MAX_PAGE
+      (u64::MAX / PAGE_SLOTS) is the highest page a sequence number lives on.
+      PAGE_SLOTS (16) is the record's o_cnt
       and part of its address — a writer builds its RecordShape from it (ISC-C100).
       A collector must verify a frame's declared seq against the slot it was found
       in. Addressing is not forward-secret: AR is retained for the conversation's
@@ -930,10 +932,47 @@ modules:
       passes through merge_peer_ack. ack_sig_input(chan_id, dir, state) binds
       daemonseed/dm/ack/sig/v3 || lp(chan_id) || lp(dir) || lp(high_water_be) ||
       lp(encoded runs); an absent prefix binds as a zero-length component.
+      beyond_runs() yields those runs as ascending inclusive RangeInclusive<u64>,
+      settled on the same terms as is_settled.
       AckState carries no chan_id, and neither encode_beyond nor
       decode_unvalidated takes one. NOT YET AVAILABLE: the ack record, its seal,
       its jittered standalone cadence, the piggyback path and the persisted outbox
       (#235 transport half).
+      Sub-module dm::collect is the pure collection state machine for one
+      direction of one conversation. Collection::new() holds two pointers:
+      frontier_page() -> Option<u64> is the highest page observed holding any
+      populated slot, and contiguous_through() -> Option<u64> is the
+      acknowledgement's contiguous prefix, settled rather than collected.
+      observe_page(page, populated: &[u16]) -> Result<PageObservation,
+      CollectError> folds one swept page; populated may be unordered and may
+      repeat. PageObservation.unsettled lists the populated positions not yet
+      settled, ascending and deduplicated, as PagePosition; frontier_advanced
+      reports whether the page moved the frontier, which it does when the page
+      holds any populated slot and sits above the frontier. The frontier does not
+      regress. A page above paging::MAX_PAGE returns
+      CollectError::PageBeyondSequenceSpace { page }, checked before any slot; a
+      slot outside the record returns CollectError::SlotOutsideRecord { page,
+      slot }. Either leaves the collection unchanged. collected(at: PagePosition)
+      -> Result<(), AckError> records a position as collected and abandoned(seq:
+      u64) -> Result<(), AckError> records one the sender gave up on; both
+      delegate to the owned AckState, which ack() -> &AckState reads, and both
+      lift the frontier to the settled position's page when the cursor has run
+      past it. An AckError::TooManyRuns refusal from collected is dropped, not
+      retained: the position stays unsettled and observe_page offers it again,
+      and the caller retains it and calls collected again once capacity frees.
+      watched() -> [u64; 2] is the current and next page. probe_plan(now_ms: u64)
+      -> Option<Vec<u64>> is that pair followed by up to MAX_BACKFILL_PAGES (2)
+      pages holding a hole, oldest first, deduplicated — the pages outstanding()
+      witnesses, then the pages from the cursor to the frontier; the bound counts
+      backfill entries alone. It returns None until PROBE_INTERVAL_MS (30000) has
+      elapsed since the last plan, and treats a now_ms below the last one as due.
+      Nothing here reads a clock. outstanding() -> Vec<RangeInclusive<u64>> is
+      the unsettled positions below the highest settled one; view() ->
+      CollectionView returns contiguous_through, frontier_page and outstanding as
+      owned data. The frame's declared-sequence check is ParsedFrame::open's
+      found_at, one layer above. NOT YET AVAILABLE: persistence and restore, the
+      doorbell sweep, the accept/decline/block flow, the contact cache, the block
+      list, the transport wiring and the UI (#236, #243).
       Sub-module dm::domain
       declares the daemonseed/dm/… label namespace, one distinct prefix-free label
       per purpose.

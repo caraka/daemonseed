@@ -153,6 +153,15 @@ impl std::fmt::Display for DmPageError {
 
 impl std::error::Error for DmPageError {}
 
+/// The highest page a sequence number can live on: `u64::MAX / PAGE_SLOTS`.
+///
+/// Above it `page * PAGE_SLOTS + slot` leaves the sequence space, so the page
+/// holds no position at all — whatever slot is named. [`PagePosition::new`]
+/// refuses such a page, and it refuses it for the **page**, not for the slot; a
+/// caller that reports which of the two was at fault compares against this
+/// rather than restating the arithmetic, so there is one home for the bound.
+pub const MAX_PAGE: u64 = u64::MAX / PAGE_SLOTS as u64;
+
 /// Where a sequence number lives: which page, and which slot of it.
 ///
 /// **Fields are private, and that is load-bearing.** A position is only valid
@@ -171,14 +180,15 @@ pub struct PagePosition {
 }
 
 impl PagePosition {
-    /// A position, if `slot` is inside the record and `page` cannot overflow.
+    /// A position, if `slot` is inside the record and `page` is at most
+    /// [`MAX_PAGE`].
     ///
     /// This is the entry point for the **slot-to-sequence** direction — turning
     /// "I found bytes in subkey 9 of page 3" into a sequence number. Use it
     /// rather than arithmetic, so a slot that could not have come from
     /// [`position_of`] is rejected instead of aliasing another page's position.
     pub fn new(page: u64, slot: u16) -> Option<Self> {
-        if slot >= PAGE_SLOTS || page > u64::MAX / PAGE_SLOTS as u64 {
+        if slot >= PAGE_SLOTS || page > MAX_PAGE {
             return None;
         }
         Some(Self { page, slot })
@@ -369,7 +379,26 @@ mod tests {
         assert_eq!(PagePosition::new(3, PAGE_SLOTS), None, "slot past the end");
         assert_eq!(PagePosition::new(3, 31), None, "a doorbell-shaped slot");
         assert_eq!(PagePosition::new(u64::MAX, 0), None, "page would overflow");
-        assert!(PagePosition::new(u64::MAX / PAGE_SLOTS as u64, 0).is_some());
+        assert!(PagePosition::new(MAX_PAGE, 0).is_some());
+        assert_eq!(PagePosition::new(MAX_PAGE + 1, 0), None, "one past the top");
+    }
+
+    /// The page bound has one home, and a caller reporting which of page or slot
+    /// was at fault reads it from there — see [`crate::dm::collect::CollectError`].
+    ///
+    /// There is deliberately no assertion that `MAX_PAGE == u64::MAX /
+    /// PAGE_SLOTS`: that compares the constant to its own definition and cannot
+    /// fail. What is pinned instead is the constant's relationship to the
+    /// mapping — the top of the sequence space lands on it — which a wrong value
+    /// breaks.
+    #[test]
+    fn the_highest_page_is_where_the_sequence_space_ends() {
+        assert_eq!(position_of(u64::MAX).page(), MAX_PAGE, "the top position");
+        assert_ne!(
+            MAX_PAGE,
+            u64::MAX,
+            "a legal slot on page u64::MAX holds no sequence number"
+        );
     }
 
     /// The two directions are exact inverses across the whole space, including
