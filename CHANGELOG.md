@@ -24,6 +24,12 @@ next release this block is renamed to its version + date and a fresh
 `[Unreleased]` is opened (see `AGENTS.md` doc-sync). Planning for *unstarted*
 work lives in the project lead's vault manifest, not here.
 
+### Fixed
+
+- The GUI announcements pane orders posts newest first by `sent_unix_ms`, ties
+  broken by content-address slot key (#237). Posts previously rendered in
+  content-address order, placing a newer announcement below an older one.
+
 ## [0.36.3] — 2026-07-28
 
 ### Added
