@@ -14,6 +14,7 @@ use veilid_core::{
     VeilidAPI, VeilidConfig, VeilidUpdate,
 };
 
+use daemonseed_core::dm::paging::DmPageOwnerSeed;
 use daemonseed_core::public_room::PublicRoomKey;
 use daemonseed_core::share_envelope::ManifestEntry;
 use daemonseed_core::share_serve::ShareContent;
@@ -257,8 +258,17 @@ enum Command {
     /// already-delivered message and gets `Ok(())`. Re-deriving a ratchet from
     /// generation zero after a restart is exactly how that happens (#243), which is
     /// part of why #243 is alpha-blocking.
+    ///
+    /// The seed is the typed [`DmPageOwnerSeed`], not `[u8; 32]`, and that is the
+    /// one command in this enum where it matters (#244). Every other `owner_seed`
+    /// here is world-derivable by design; a page's derives from the conversation
+    /// secret, and under Veilid a derivable owner seed IS write access to the
+    /// conversation. `[u8; 32]` is `Copy`, so a bare array would be duplicated into
+    /// the command channel, the actor stack, the scheduler's pending queue and the
+    /// dispatch frame, none of which zeroize. One boxed, redacted,
+    /// zeroize-on-drop value travels the whole path instead.
     PublishDmPage {
-        owner_seed: [u8; 32],
+        owner_seed: DmPageOwnerSeed,
         slot: u32,
         frame: Vec<u8>,
         reply: oneshot::Sender<Result<()>>,
@@ -271,8 +281,11 @@ enum Command {
     /// `daemonseed_core::dm::paging::PagePosition::new` is the checked way to make
     /// that comparison, and it needs the slot. An empty result is the ordinary state
     /// of a page nobody has written to yet, distinct from a transport error.
+    ///
+    /// Carries the typed [`DmPageOwnerSeed`] for the reason
+    /// [`Command::PublishDmPage`] gives (#244).
     SweepDmPage {
-        owner_seed: [u8; 32],
+        owner_seed: DmPageOwnerSeed,
         reply: oneshot::Sender<Result<DmPageSweep>>,
     },
     // ── Public-share content (Phase 3) ──
@@ -564,9 +577,19 @@ impl VeilidNetHandle {
     ///
     /// Enqueued as a non-coalescible chat-lane write: every call reaches the
     /// network, because every slot holds a different message.
+    ///
+    /// **Takes the seed BY VALUE, and the alternative is not available.** A page's
+    /// owner seed is the conversation's write capability (#244), so it travels as
+    /// the boxed, redacted, zeroize-on-drop [`DmPageOwnerSeed`] rather than a
+    /// `Copy` array. That value must be *moved* into the command that crosses the
+    /// channel, and `DmPageOwnerSeed` is deliberately neither `Clone` nor
+    /// constructible from bytes outside `daemonseed_core::dm::paging` — so a
+    /// `&DmPageOwnerSeed` parameter could only be honoured by copying the secret
+    /// out into a fresh non-zeroizing buffer, which is precisely the copy this
+    /// signature exists to remove. Derive one per call; derivation is pure.
     pub async fn publish_dm_page(
         &self,
-        owner_seed: [u8; 32],
+        owner_seed: DmPageOwnerSeed,
         slot: u32,
         frame: Vec<u8>,
     ) -> Result<()> {
@@ -587,7 +610,11 @@ impl VeilidNetHandle {
     /// `daemonseed_core::dm::frame::parse` followed by the ratchet's own checks may
     /// decide a frame is genuine, and the collector must confirm the frame's
     /// sequence number agrees with the slot it came back in.
-    pub async fn sweep_dm_page(&self, owner_seed: [u8; 32]) -> Result<DmPageSweep> {
+    ///
+    /// Takes the seed by value for the same reason [`Self::publish_dm_page`] does:
+    /// it must be moved into the command, and the type cannot be cloned or rebuilt
+    /// from borrowed bytes without reintroducing the copy (#244).
+    pub async fn sweep_dm_page(&self, owner_seed: DmPageOwnerSeed) -> Result<DmPageSweep> {
         self.send(|reply| Command::SweepDmPage { owner_seed, reply })
             .await?
     }
@@ -1243,7 +1270,10 @@ async fn actor_loop(
                 let opened = opened.clone();
                 let record_locks = record_locks.clone();
                 tokio::spawn(async move {
-                    match identity::rendezvous_owner_keypair(&owner_seed) {
+                    // Borrowed for the pre-open; ownership passes to the request
+                    // below, so exactly one zeroizing copy of the conversation
+                    // secret exists on this path (#244).
+                    match identity::rendezvous_owner_keypair(owner_seed.as_bytes()) {
                         Ok(owner) => {
                             // Single-flight against a concurrent op on this record, as
                             // the dispatch itself does. The guard is dropped before the
@@ -1281,7 +1311,7 @@ async fn actor_loop(
                 let record_locks = record_locks.clone();
                 tokio::spawn(async move {
                     let r =
-                        sweep_dm_page(&gate, &api, &rc, &opened, &record_locks, owner_seed).await;
+                        sweep_dm_page(&gate, &api, &rc, &opened, &record_locks, &owner_seed).await;
                     // A dropped receiver (caller gave up / shutting down) is benign.
                     let _ = reply.send(r);
                 });
@@ -1843,8 +1873,15 @@ enum ProdWrite {
     /// again, and shape is part of the record address — plus a second one: the slot
     /// is derived from the message's sequence number, so unlike a current-state
     /// write it is neither a fixed slot nor a hashed one.
+    ///
+    /// The only variant carrying a typed seed: a page's owner seed is the
+    /// conversation secret, so it rides as the zeroizing [`DmPageOwnerSeed`] and
+    /// not as a `Copy` array duplicated through the pending queue (#244). The
+    /// scheduler's `D: Send + 'static` bound is satisfied structurally —
+    /// `DmPageOwnerSeed` is a `Box<[u8; 32]>`, which is both — and is enforced by
+    /// the compiler at `WriteScheduler::spawn_with_probe::<ProdWrite>`.
     DmPage {
-        owner_seed: [u8; 32],
+        owner_seed: DmPageOwnerSeed,
         slot: u32,
         frame: Vec<u8>,
     },
@@ -1945,13 +1982,16 @@ impl WriteSink for ProductionSink {
                     slot,
                     frame,
                 } => {
+                    // Borrowed, not moved: the binding is dropped — and therefore
+                    // zeroized — at the end of this arm, so the conversation secret
+                    // lives no longer than the write it authorises (#244).
                     publish_dm_page(
                         &gate,
                         &api,
                         &rc,
                         &opened,
                         &record_locks,
-                        owner_seed,
+                        &owner_seed,
                         slot,
                         frame,
                     )
@@ -2089,15 +2129,30 @@ const DM_PAGE_SHAPE: rendezvous::RecordShape = rendezvous::RecordShape::DM_PAGE;
 /// that classification is reachable from a unit test. That is not tidiness: a
 /// request built on the command loop can only be observed by a live two-node round
 /// trip, and every mistake available here — a coalescible kind, the wrong lane, a
-/// slot mutated on the way to dispatch — reports `Ok(())` on every local surface.
+/// slot mutated on the way to dispatch, a `record` set from the SEED rather than
+/// the owner's public key — reports `Ok(())` on every local surface. The record id
+/// is derived *inside* this function for exactly that reason: passing it in would
+/// move the one decision worth pinning back out to the untestable call site.
 fn dm_page_write_request(
-    owner_seed: [u8; 32],
+    owner_seed: DmPageOwnerSeed,
     slot: u32,
     frame: Vec<u8>,
     reply: oneshot::Sender<Result<()>>,
 ) -> WriteRequest<ProdWrite> {
+    // The FIFO/coalescing scope is the owner's PUBLIC key, never the seed (#244) —
+    // the same substitution the open cache and the record locks already made. The
+    // scope needs INJECTIVITY, not the secret, and the public key supplies it at
+    // least as precisely: it is what the record's DHT address derives from, so two
+    // seeds sharing a public key would be one record and belong in one queue
+    // anyway. It is public by construction, being the record's identity on the
+    // network, and it is a total 32-byte function of the seed — VLD0 is Ed25519 —
+    // so it fits `schedule::RecordId` with no fallible step on the enqueue path.
+    //
+    // Nothing else in the funnel needs changing for that: `RecordId` is opaque to
+    // the scheduler, which only ever compares and hashes it.
+    let record = identity::rendezvous_owner_public_bytes(owner_seed.as_bytes());
     WriteRequest {
-        record: owner_seed,
+        record,
         class: WriteClass::Chat,
         kind: WriteKind::Ring,
         deadline: None,
@@ -2159,11 +2214,18 @@ async fn publish_dm_page(
     rc: &RoutingContext,
     opened: &rendezvous::OpenCache,
     record_locks: &rendezvous::RecordLocks,
-    owner_seed: [u8; 32],
+    owner_seed: &DmPageOwnerSeed,
     slot: u32,
     frame: Vec<u8>,
 ) -> Result<()> {
-    let owner = identity::rendezvous_owner_keypair(&owner_seed)?;
+    // Borrowed: this needs to READ the seed once, to derive the signing keypair, and
+    // has no reason to take ownership of a conversation secret (#244). The keypair
+    // it produces DOES contain the seed — that is what a VLD0 secret is — and this
+    // binding drops with the call. That does NOT bound the secret's lifetime:
+    // handing the keypair to the open below makes veilid retain a clone in
+    // `OpenedRecord.writer` for as long as the record stays open, which here is the
+    // process (#252). See `identity::vld0_keypair`'s residual note.
+    let owner = identity::rendezvous_owner_keypair(owner_seed.as_bytes())?;
     // Single-flight the open and serialize against any concurrent op on this record,
     // exactly as the rendezvous and key-record write paths do (CRSH-ISC-3). Two
     // messages landing in two slots of the same page is the ordinary case, so this
@@ -2203,9 +2265,10 @@ async fn sweep_dm_page(
     rc: &RoutingContext,
     opened: &rendezvous::OpenCache,
     record_locks: &rendezvous::RecordLocks,
-    owner_seed: [u8; 32],
+    owner_seed: &DmPageOwnerSeed,
 ) -> Result<DmPageSweep> {
-    let owner = identity::rendezvous_owner_keypair(&owner_seed)?;
+    // Borrowed, for the reason `publish_dm_page` gives (#244).
+    let owner = identity::rendezvous_owner_keypair(owner_seed.as_bytes())?;
     // The open is serialized under the record lock; the GETs are NOT, so a slow
     // page read never blocks a concurrent write to the same page. The guard drops
     // before any read permit is acquired, keeping the single-permit rule
@@ -3011,7 +3074,29 @@ mod tests {
     /// pinned at the point of construction rather than left to the live oracle.
     #[test]
     fn a_dm_page_write_is_a_chat_lane_write_that_never_coalesces() {
-        let seed = [0xa7u8; 32];
+        use daemonseed_core::dm::paging;
+        use daemonseed_core::dm::ratchet::Direction;
+
+        // The seed derivation is an HKDF, so the crypto module must be past its
+        // power-up self-tests. Idempotent and racy-safe by design: a loser of the
+        // `PowerOff → SelfTest` CAS gets `AlreadyInitialized`, which is why the
+        // result is discarded here exactly as `daemonseed-core`'s tests discard it.
+        let _ = oxicrypt_module::initialize();
+
+        // A real derived seed, not a hand-made array: the seed's TYPE is the point
+        // after #244, and `DmPageOwnerSeed` has no constructor outside `paging`.
+        // The address root is byte-distinct so a derivation that mis-sliced its
+        // input would not pass.
+        let mut address_root = [0u8; paging::ADDRESS_ROOT_LEN];
+        for (i, b) in address_root.iter_mut().enumerate() {
+            *b = 0xa7u8 ^ (i as u8).wrapping_mul(17).wrapping_add(0x2b);
+        }
+        let seed = paging::derive_owner_seed(&address_root, Direction::AToB, 0)
+            .expect("derive a page owner seed");
+        // A plain copy, deliberately: `seed` is MOVED into the request below, and the
+        // assertions afterwards are about what the request did with it. Test-only —
+        // this is the one place a non-zeroizing copy is the point rather than the bug.
+        let seed_bytes = *seed.as_bytes();
         let frame = vec![0xde, 0xad, 0xbe, 0xef];
         let (reply, _rx) = oneshot::channel();
 
@@ -3032,9 +3117,22 @@ mod tests {
             WriteKind::Ring,
             "a page slot is written once and must never be coalesced away"
         );
+        // **The record id is the owner's PUBLIC key, and is NOT the seed (#244).**
+        // Both are `[u8; 32]`, so putting the secret back where the identity belongs
+        // type-checks everywhere and shows up on no surface — which is why both
+        // halves are asserted. The positive pins WHICH value it is (a hash, or the
+        // wrong key, fails it); the negative is the direct regression guard.
         assert_eq!(
-            req.record, seed,
-            "the funnel's FIFO + coalescing scope is the page record itself"
+            req.record,
+            identity::rendezvous_owner_public_bytes(&seed_bytes),
+            "the funnel's FIFO + coalescing scope is the page record's PUBLIC \
+             identity — what the DHT address derives from"
+        );
+        assert_ne!(
+            req.record, seed_bytes,
+            "the record id must never carry the owner SEED: it is the conversation's \
+             write capability, and the scheduler holds this value in a pending-queue \
+             key that does not zeroize"
         );
         assert!(
             req.deadline.is_none(),
@@ -3052,7 +3150,12 @@ mod tests {
                 slot,
                 frame: dispatched,
             } => {
-                assert_eq!(owner_seed, seed);
+                assert_eq!(
+                    *owner_seed.as_bytes(),
+                    seed_bytes,
+                    "the dispatch token carries the seed itself — the write cannot \
+                     be signed without it — and must reach dispatch unchanged"
+                );
                 assert_eq!(
                     slot, 9,
                     "the slot must reach dispatch UNCHANGED — the caller derived it \

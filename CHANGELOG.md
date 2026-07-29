@@ -26,6 +26,21 @@ work lives in the project lead's vault manifest, not here.
 
 ### Fixed
 
+- DM page transport carries the page owner seed as
+  `daemonseed_core::dm::paging::DmPageOwnerSeed` — the boxed, redacted,
+  zeroize-on-drop newtype — through `VeilidNetHandle::publish_dm_page` and
+  `sweep_dm_page`, the two commands behind them, and the scheduler's dispatch
+  token. It was a `Copy` `[u8; 32]`, duplicated into the command channel, the
+  actor stack, the pending queue and the dispatch frame, none of which zeroize.
+  A page's owner seed is the conversation secret; every other owner seed in the
+  crate is world-derivable. This bounds daemonseed's own copies, not the secret:
+  veilid retains the signing keypair in an opened record for as long as that
+  record stays open, and records are opened once per session. (#244, #252, #254)
+
+- A DM page write's funnel `record` — its FIFO and coalescing scope — is the
+  owner's PUBLIC key rather than the owner seed. `identity::rendezvous_owner_public_bytes`
+  is the total 32-byte derivation it uses. (#244, #254)
+
 - The rendezvous open-cache and per-record locks key on the owner's PUBLIC key
   rather than the owner seed. Every record that existed when those caches were
   written had a world-derivable seed, so holding one cost nothing; a DM channel

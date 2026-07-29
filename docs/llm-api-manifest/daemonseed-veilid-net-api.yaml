@@ -488,12 +488,12 @@ functions:
   - name: VeilidNetHandle::publish_dm_page
     module: daemonseed_veilid_net::actor
     description: Publish one sealed DM channel frame into one slot of its dflt(16) page record (ISC-C42). Bytes are opaque here — this layer neither parses nor verifies the frame, and a successful write proves nothing about authorship, since both parties can derive the owner seed for both directions. Derive owner_seed with daemonseed_core::dm::paging::derive_owner_seed over the conversation's address root, the SENDING direction, and position_of(seq).page(); take slot from the same position_of(seq).slot(). Enqueued on the WB-3 funnel as a Chat-class, Ring-kind write — non-coalescible, because two queued writes to one page are two different messages in two different slots. Write-once is a CALLER OBLIGATION: this is an unconditional last-writer-wins set_dht_value with no read-before-write, so a reissued sequence number overwrites an already-delivered message and returns Ok (see #243). The page record is not world-writable: its owner seed derives from the first-contact secret, so a third party cannot compute the address at all.
-    signature: "pub async fn publish_dm_page(&self, owner_seed: [u8; 32], slot: u32, frame: Vec<u8>) -> Result<()>"
+    signature: "pub async fn publish_dm_page(&self, owner_seed: DmPageOwnerSeed, slot: u32, frame: Vec<u8>) -> Result<()>"
     parameters:
       - name: owner_seed
-        type: "[u8; 32]"
+        type: DmPageOwnerSeed
         direction: in
-        description: The page's owner seed, from daemonseed_core::dm::paging::derive_owner_seed(address_root, direction, page).
+        description: The page's owner seed, from daemonseed_core::dm::paging::derive_owner_seed(address_root, direction, page). Taken by value — the type is a boxed, redacted, zeroize-on-drop newtype that is neither Clone nor constructible outside daemonseed_core::dm::paging, so it is moved into the command rather than copied. Derive one per call; derivation is pure. The funnel's record id is the owner's PUBLIC key derived from this seed, never the seed.
       - name: slot
         type: u32
         direction: in
@@ -508,12 +508,12 @@ functions:
   - name: VeilidNetHandle::sweep_dm_page
     module: daemonseed_veilid_net::actor
     description: Sweep every slot of one DM channel page, returning (slot, bytes) per populated slot together with the sweep's SweepOutcome. The slot index travels back with the bytes because the collector must check the frame's declared sequence number against the position it was found in, via daemonseed_core::dm::paging::PagePosition::new. The outcome travels back because an empty Vec alone cannot distinguish an unwritten page from one whose every GET errored, and those demand opposite responses. A partial sweep returns what it read, which makes recovery a CALLER OBLIGATION: the collector must hold probe frontier and contiguous cursor as separate pointers and treat failed > 0 as a record-health signal. No such collector exists yet (#236). Bounded by the handle's own shape; PAGE_SLOTS gated GETs on the read lane, no write funnel involvement (WB-3 I9). Spawned off the command loop (D-0b / #128, CRSH-ISC-22). Opens via open_or_create, so probing a page nobody has written CREATES it.
-    signature: "pub async fn sweep_dm_page(&self, owner_seed: [u8; 32]) -> Result<DmPageSweep>"
+    signature: "pub async fn sweep_dm_page(&self, owner_seed: DmPageOwnerSeed) -> Result<DmPageSweep>"
     parameters:
       - name: owner_seed
-        type: "[u8; 32]"
+        type: DmPageOwnerSeed
         direction: in
-        description: The page's owner seed. Use the RECEIVING direction to collect a correspondent's messages.
+        description: The page's owner seed. Use the RECEIVING direction to collect a correspondent's messages. Taken by value for the reason publish_dm_page gives; derive one per call.
     returns:
       type: "Result<DmPageSweep>"
       description: The populated slots as (subkey, unverified bytes) pairs, paired with the sweep outcome (attempted / found / failed).
@@ -1022,7 +1022,19 @@ functions:
         description: The circle/room rendezvous-owner seed.
     returns:
       type: "Result<KeyPair>"
-      description: The rendezvous-owner keypair.
+      description: The rendezvous-owner keypair. The KeyPair contains the seed (it is the VLD0 secret) in a non-zeroizing veilid Bytes. Deriving per operation bounds only this binding, NOT the secret: passing the keypair to open_dht_record / create_dht_record makes veilid retain a clone in OpenedRecord.writer for as long as the record stays open, and daemonseed opens records once per session and never closes them (#252). Use rendezvous_owner_public_bytes where only a record identity is needed.
+  - name: identity::rendezvous_owner_public_bytes
+    module: daemonseed_veilid_net::identity
+    description: The 32-byte Ed25519 public key of a rendezvous-owner keypair — the same value rendezvous_owner_keypair puts in KeyPair::key(), as raw bytes. Total, because a VLD0 public key is 32 bytes for every seed. Identifies a record without carrying the secret: the DHT address derives from this key, so it separates records at least as precisely as the seed does.
+    signature: "pub fn rendezvous_owner_public_bytes(owner_seed: &[u8; 32]) -> [u8; 32]"
+    parameters:
+      - name: owner_seed
+        type: "&[u8; 32]"
+        direction: in
+        description: The rendezvous-owner seed.
+    returns:
+      type: "[u8; 32]"
+      description: The owner's raw Ed25519 public key.
 
 # ─────────────────────────────────────────────────────────────────────
 # Error types

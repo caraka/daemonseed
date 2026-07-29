@@ -274,9 +274,8 @@ async fn sealed_channel_messages_round_trip_through_a_page_and_open_out_of_order
         // The page and the slot come from ONE `PagePosition`, as the handle's docs
         // require: a page from one sequence number and a slot from another writes a
         // frame nobody will find at the sequence it claims.
-        let owner_seed = *paging::derive_owner_seed(&roots_a.ar, dir_a, at.page())
-            .expect("A derives the page owner seed")
-            .as_bytes();
+        let owner_seed = paging::derive_owner_seed(&roots_a.ar, dir_a, at.page())
+            .expect("A derives the page owner seed");
         node_a
             .publish_dm_page(owner_seed, u32::from(at.slot()), frame_bytes)
             .await
@@ -303,14 +302,18 @@ async fn sealed_channel_messages_round_trip_through_a_page_and_open_out_of_order
     // ── B sweeps the page it derived for itself ──────────────────────────────
     // B computes the address from the address root and its own receiving
     // direction. Nothing about it came from A over the wire.
-    let owner_seed_b = *paging::derive_owner_seed(&roots_b.ar, dir_b, page)
-        .expect("B derives the page owner seed")
-        .as_bytes();
+    //
+    // Re-derived per use rather than held: `DmPageOwnerSeed` is the conversation's
+    // write capability, so it is deliberately not `Clone` and the transport takes it
+    // by value (#244). Derivation is pure, so this is the intended usage.
+    let page_seed_b = || {
+        paging::derive_owner_seed(&roots_b.ar, dir_b, page).expect("B derives the page owner seed")
+    };
     assert_eq!(
-        *paging::derive_owner_seed(&roots_a.ar, dir_a, page)
+        paging::derive_owner_seed(&roots_a.ar, dir_a, page)
             .expect("A derives the page owner seed")
             .as_bytes(),
-        owner_seed_b,
+        page_seed_b().as_bytes(),
         "both ends must derive the same page record from the address root alone"
     );
 
@@ -319,7 +322,7 @@ async fn sealed_channel_messages_round_trip_through_a_page_and_open_out_of_order
     // below untested, which is the whole of this file's fourth property.
     let mut swept = Vec::new();
     for attempt in 0..30 {
-        match node_b.sweep_dm_page(owner_seed_b).await {
+        match node_b.sweep_dm_page(page_seed_b()).await {
             Ok((slots, outcome)) => {
                 eprintln!(
                     "attempt {attempt}: {} slot(s) back, outcome {outcome:?}",

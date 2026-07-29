@@ -20,7 +20,11 @@ veilid-core = { version = "0.5.7", default-features = false, features = ["defaul
 daemonseed-core = { path = "../daemonseed-core" }
 
 # Seed (Ed25519) → VLD0 keypair. Pinned to veilid-core's ed25519-dalek major.
-ed25519-dalek = "2.1"
+# `zeroize` is declared rather than inherited from defaults: `SigningKey`
+# zeroizes on drop only under that feature, and `identity::vld0_keypair`'s
+# residual note documents that as a security property. A `default-features =
+# false` elsewhere would otherwise switch it off silently, with no test failing.
+ed25519-dalek = { version = "2.1", features = ["zeroize"] }
 base64 = "0.22"
 
 tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }

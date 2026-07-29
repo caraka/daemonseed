@@ -107,15 +107,19 @@ async fn frames_published_to_page_slots_sweep_back_in_the_slots_they_were_writte
     // address is transmitted — the derivation is the whole discovery mechanism, so
     // two seeds computed independently must be byte-identical or nothing that
     // follows means anything.
+    //
+    // Each use derives its own seed rather than reusing one: `DmPageOwnerSeed` is
+    // the conversation's write capability, so it is deliberately not `Clone` and
+    // the transport takes it by value (#244). The derivation is pure, which is what
+    // makes re-deriving the right answer rather than a workaround.
     const PAGE: u64 = 0;
-    let owner_seed_a = *paging::derive_owner_seed(&address_root, Direction::AToB, PAGE)
-        .expect("A derives the page owner seed")
-        .as_bytes();
-    let owner_seed_b = *paging::derive_owner_seed(&address_root, Direction::AToB, PAGE)
-        .expect("B derives the page owner seed")
-        .as_bytes();
+    let page_seed = |who: &str| {
+        paging::derive_owner_seed(&address_root, Direction::AToB, PAGE)
+            .unwrap_or_else(|e| panic!("{who} derives the page owner seed: {e}"))
+    };
     assert_eq!(
-        owner_seed_a, owner_seed_b,
+        page_seed("A").as_bytes(),
+        page_seed("B").as_bytes(),
         "both ends must derive the same page record from the address root alone"
     );
 
@@ -146,8 +150,12 @@ async fn frames_published_to_page_slots_sweep_back_in_the_slots_they_were_writte
     // time, and the anti-coalescing property — the one whose failure mode is a
     // message silently missing from the wire under an `Ok(())` — would go untested.
     let (published_first, published_second) = tokio::join!(
-        node_a.publish_dm_page(owner_seed_a, u32::from(first.slot()), frame_first.clone()),
-        node_a.publish_dm_page(owner_seed_a, u32::from(second.slot()), frame_second.clone()),
+        node_a.publish_dm_page(page_seed("A"), u32::from(first.slot()), frame_first.clone()),
+        node_a.publish_dm_page(
+            page_seed("A"),
+            u32::from(second.slot()),
+            frame_second.clone()
+        ),
     );
     published_first.expect("A publishes the first frame");
     published_second.expect("A publishes the second frame");
@@ -158,7 +166,7 @@ async fn frames_published_to_page_slots_sweep_back_in_the_slots_they_were_writte
     // bug this test exists to catch.
     let mut swept = Vec::new();
     for attempt in 0..30 {
-        match node_b.sweep_dm_page(owner_seed_b).await {
+        match node_b.sweep_dm_page(page_seed("B")).await {
             Ok((slots, outcome)) => {
                 eprintln!(
                     "attempt {attempt}: {} slot(s) back, outcome {outcome:?}",
@@ -221,9 +229,8 @@ async fn frames_published_to_page_slots_sweep_back_in_the_slots_they_were_writte
     // the ordinary steady state, not a failure. A page far past anything either end
     // has touched, in the opposite direction for good measure.
     const UNWRITTEN_PAGE: u64 = 4_096;
-    let unwritten = *paging::derive_owner_seed(&address_root, Direction::BToA, UNWRITTEN_PAGE)
-        .expect("derive an unwritten page's owner seed")
-        .as_bytes();
+    let unwritten = paging::derive_owner_seed(&address_root, Direction::BToA, UNWRITTEN_PAGE)
+        .expect("derive an unwritten page's owner seed");
     let (empty, outcome) = node_b
         .sweep_dm_page(unwritten)
         .await
