@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 use veilid_core::{
-    api_startup, OperationId, RecordKey, RouteBlob, RouteId, RoutingContext, Target, VeilidAPI,
-    VeilidConfig, VeilidUpdate,
+    api_startup, KeyPair, OperationId, RecordKey, RouteBlob, RouteId, RoutingContext, Target,
+    VeilidAPI, VeilidConfig, VeilidUpdate,
 };
 
 use daemonseed_core::public_room::PublicRoomKey;
@@ -1202,29 +1202,11 @@ async fn actor_loop(
                 frame,
                 reply,
             } => {
-                // Class-1 Chat, `Ring` kind — never coalesced, never dropped
-                // (WB-ISC-11). A DM is a circle with one other person, so its writes
-                // belong in the same lane as any other typed message rather than
-                // behind the keepalives. `Ring` is the funnel's name for "never
-                // coalesce", which is what a write-once page slot needs; the dispatch
-                // token is its own variant, so nothing touches a ring-sequence cursor.
-                //
-                // Coalescing would be actively wrong here, not merely wasteful: two
-                // queued writes to the same page are two *different messages* in two
-                // different slots, and a last-writer-wins collapse would silently drop
-                // one of them off the wire with its `reply` reporting success.
-                sched.enqueue(WriteRequest {
-                    record: owner_seed,
-                    class: WriteClass::Chat,
-                    kind: WriteKind::Ring,
-                    deadline: None,
-                    item: ProdWrite::DmPage {
-                        owner_seed,
-                        slot,
-                        frame,
-                    },
-                    reply: Some(reply),
-                });
+                // The classification is built by `dm_page_write_request` rather than
+                // inline, because every field of it fails SILENTLY and a funnel
+                // request constructed on the command loop is reachable from no test.
+                // See that function for why each field is what it is.
+                sched.enqueue(dm_page_write_request(owner_seed, slot, frame, reply));
             }
             Command::SweepDmPage { owner_seed, reply } => {
                 // A read, so it never touches the write funnel (I9: no read-triggered
@@ -2031,6 +2013,75 @@ async fn fetch_dm_key_record(
 /// (`ISA.md` ISC-C100; sizing in `docs/design/direct-messaging.md` DRAFT v6).
 const DM_PAGE_SHAPE: rendezvous::RecordShape = rendezvous::RecordShape::DM_PAGE;
 
+/// Build the funnel request for one channel-frame publish.
+///
+/// Class-1 `Chat`, `Ring` kind — never coalesced, never dropped (WB-ISC-11). A DM
+/// is a circle with one other person, so its writes belong in the same lane as any
+/// other typed message rather than behind the keepalives. `Ring` is the funnel's
+/// name for "never coalesce", which is what a write-once page slot needs; the
+/// dispatch token is its own [`ProdWrite`] variant, so nothing touches a
+/// ring-sequence cursor despite the kind's name.
+///
+/// Coalescing would be actively wrong here, not merely wasteful: two queued writes
+/// to the same page are two *different messages* in two different slots, and a
+/// last-writer-wins collapse would silently drop one of them off the wire with its
+/// `reply` reporting success.
+///
+/// Constructed here rather than inline in the [`Command::PublishDmPage`] arm so
+/// that classification is reachable from a unit test. That is not tidiness: a
+/// request built on the command loop can only be observed by a live two-node round
+/// trip, and every mistake available here — a coalescible kind, the wrong lane, a
+/// slot mutated on the way to dispatch — reports `Ok(())` on every local surface.
+fn dm_page_write_request(
+    owner_seed: [u8; 32],
+    slot: u32,
+    frame: Vec<u8>,
+    reply: oneshot::Sender<Result<()>>,
+) -> WriteRequest<ProdWrite> {
+    WriteRequest {
+        record: owner_seed,
+        class: WriteClass::Chat,
+        kind: WriteKind::Ring,
+        deadline: None,
+        item: ProdWrite::DmPage {
+            owner_seed,
+            slot,
+            frame,
+        },
+        reply: Some(reply),
+    }
+}
+
+/// Open (or create) one channel page's record — the single opener both page
+/// operations go through.
+///
+/// **One call site for the shape, and that is the whole point.** `o_cnt` is part of
+/// the record ADDRESS, so a publish and a sweep naming different shapes would run
+/// against two different records: the write succeeds, the sweep comes back empty,
+/// and no surface anywhere reports an error (the ISC-C100 failure mode, reached by
+/// a different door than a mistyped constant). Two independent opens is all it
+/// takes for one bad edit to reintroduce that; with one, the disagreement is
+/// unrepresentable rather than merely tested-against.
+///
+/// Locking is deliberately NOT folded in. [`publish_dm_page`] holds the record lock
+/// across the open *and* the write, while [`sweep_dm_page`] drops it the moment the
+/// open returns so its GETs never block a concurrent write to the same page
+/// (CRSH-ISC-17). Only the open itself is common, so only the open is shared.
+async fn dm_page_open(
+    gate: &Arc<DhtGate>,
+    api: &VeilidAPI,
+    rc: &RoutingContext,
+    opened: &rendezvous::OpenCache,
+    owner: &KeyPair,
+) -> Result<rendezvous::RendezvousHandle> {
+    rendezvous::open_cached(
+        opened,
+        &rendezvous::cached_record_id(owner, DM_PAGE_SHAPE),
+        rendezvous::open_or_create(gate, api, rc, owner, DM_PAGE_SHAPE),
+    )
+    .await
+}
+
 /// Publish one sealed channel frame into one slot of one page (part of ISC-C42).
 ///
 /// `frame` is opaque here, exactly as the key record is: this layer neither parses
@@ -2061,12 +2112,7 @@ async fn publish_dm_page(
     // lock is contended by design and must not be skipped.
     let record_lock = rendezvous::record_lock(record_locks, &owner);
     let _write_guard = record_lock.lock().await;
-    let handle = rendezvous::open_cached(
-        opened,
-        &rendezvous::cached_record_id(&owner, DM_PAGE_SHAPE),
-        rendezvous::open_or_create(gate, api, rc, &owner, DM_PAGE_SHAPE),
-    )
-    .await?;
+    let handle = dm_page_open(gate, api, rc, opened, &owner).await?;
     crate::vtrace!(
         "publish_dm_page: key={:?} slot={} bytes={}",
         handle.key(),
@@ -2109,12 +2155,7 @@ async fn sweep_dm_page(
     let handle = {
         let record_lock = rendezvous::record_lock(record_locks, &owner);
         let _open_guard = record_lock.lock().await;
-        rendezvous::open_cached(
-            opened,
-            &rendezvous::cached_record_id(&owner, DM_PAGE_SHAPE),
-            rendezvous::open_or_create(gate, api, rc, &owner, DM_PAGE_SHAPE),
-        )
-        .await?
+        dm_page_open(gate, api, rc, opened, &owner).await?
     };
     let key = handle.key().clone();
     let mut found: DmPageSlots = Vec::new();
@@ -2900,6 +2941,111 @@ mod tests {
             DM_PAGE_SHAPE.o_cnt(),
             daemonseed_core::dm::paging::PAGE_SLOTS,
             "the page record's subkey count must BE the slot arithmetic's modulus"
+        );
+    }
+
+    /// **How a DM page write is classified in the funnel.** Every field asserted
+    /// here fails silently if it is wrong, and the kind fails worst: `Ring` is the
+    /// funnel's name for "never coalesce", and a `CurrentState` kind in its place
+    /// would let two queued writes to one page — two DIFFERENT messages, in two
+    /// different slots — collapse last-writer-wins, dropping one off the wire while
+    /// its `reply` still reports `Ok(())`. Nothing downstream can see that, so it is
+    /// pinned at the point of construction rather than left to the live oracle.
+    #[test]
+    fn a_dm_page_write_is_a_chat_lane_write_that_never_coalesces() {
+        let seed = [0xa7u8; 32];
+        let frame = vec![0xde, 0xad, 0xbe, 0xef];
+        let (reply, _rx) = oneshot::channel();
+
+        // Slot 9 is chosen, not arbitrary: it is non-zero (so a request that
+        // hard-wired subkey 0 differs), it is not 8 or 16 (so a second modulus
+        // applied on the way to dispatch differs), and 9+1 is still inside the
+        // record (so an off-by-one shows up as a wrong slot rather than as an
+        // out-of-range error some other check would catch first).
+        let req = dm_page_write_request(seed, 9, frame.clone(), reply);
+
+        assert_eq!(
+            req.class,
+            WriteClass::Chat,
+            "a DM is chat: its writes take the chat lane, never the keepalive one"
+        );
+        assert_eq!(
+            req.kind,
+            WriteKind::Ring,
+            "a page slot is written once and must never be coalesced away"
+        );
+        assert_eq!(
+            req.record, seed,
+            "the funnel's FIFO + coalescing scope is the page record itself"
+        );
+        assert!(
+            req.deadline.is_none(),
+            "a chat-class write is already the highest class; a deadline would only \
+             reorder it against its own lane"
+        );
+        assert!(
+            req.reply.is_some(),
+            "the caller awaits this write — a dropped reply hangs `publish_dm_page`"
+        );
+
+        match req.item {
+            ProdWrite::DmPage {
+                owner_seed,
+                slot,
+                frame: dispatched,
+            } => {
+                assert_eq!(owner_seed, seed);
+                assert_eq!(
+                    slot, 9,
+                    "the slot must reach dispatch UNCHANGED — the caller derived it \
+                     from a sequence number, so any arithmetic here writes the frame \
+                     where the other party never looks for it"
+                );
+                assert_eq!(
+                    dispatched, frame,
+                    "the frame is opaque at this layer and must arrive byte-identical"
+                );
+            }
+            _ => panic!("a DM page write must dispatch as its own ProdWrite variant"),
+        }
+    }
+
+    /// **Publish and sweep cannot disagree about the page record's shape.** `o_cnt`
+    /// is part of the record address, so two shapes means two records: the write
+    /// succeeds, the sweep returns empty, and nothing errors anywhere. The
+    /// structural guard is that both paths open through one function; what this
+    /// test pins is the two facts that guard rests on, neither of which is
+    /// observable without a live DHT — the single opener names the page shape, and
+    /// both transport fns route through it.
+    ///
+    /// Needles are assembled from fragments so this test's own source text does not
+    /// self-match, as `release_private_route_only_called_through_release_tolerant`
+    /// does above.
+    #[test]
+    fn both_page_paths_open_the_record_through_one_shape() {
+        let src = include_str!("actor.rs");
+        // Production half only — this module names both symbols freely.
+        let (prod, _) = src
+            .split_once("#[cfg(test)]")
+            .expect("the tests-module marker moved");
+
+        let shape: String = ["DM_PAGE", "_SHAPE"].concat();
+        assert_eq!(
+            prod.matches(shape.as_str()).count(),
+            3,
+            "the page shape must be named exactly three times outside the tests: its \
+             own definition, and the two references inside the one opener. A fourth \
+             naming is a second open site, which is how publish and sweep come to \
+             address different records"
+        );
+
+        let opener: String = ["dm_page", "_open("].concat();
+        assert_eq!(
+            prod.matches(opener.as_str()).count(),
+            3,
+            "the opener must be defined once and called exactly twice — from \
+             `publish_dm_page` and from `sweep_dm_page`. A page path that opened its \
+             own record would be free to open a different one"
         );
     }
 }
