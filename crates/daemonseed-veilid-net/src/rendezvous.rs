@@ -109,6 +109,16 @@ impl RecordShape {
     /// Direct messaging's key record: `dflt(1)`.
     pub const DM_KEY_RECORD: Self = Self::new(daemonseed_core::dm::keyrec::KEY_RECORD_SLOTS);
 
+    /// Direct messaging's channel page: `dflt(16)`, one subkey per message slot.
+    ///
+    /// Derived from [`PAGE_SLOTS`](daemonseed_core::dm::paging::PAGE_SLOTS) rather
+    /// than a literal, because that constant is simultaneously the slot arithmetic
+    /// (`seq % PAGE_SLOTS`) and part of the record address. A `16` typed here that
+    /// later disagreed with the arithmetic would address a record the other party
+    /// never sweeps, with no error on any surface — the exact ISC-C100 failure the
+    /// paging module's own doc comment warns writers about.
+    pub const DM_PAGE: Self = Self::new(daemonseed_core::dm::paging::PAGE_SLOTS);
+
     /// A DFLT shape with `o_cnt` subkeys. **Panics** outside Veilid's accepted
     /// `1..=MAX_SUBKEY_COUNT` range.
     ///
@@ -474,6 +484,26 @@ fn check_write_cap(sealed_len: usize, shape: RecordShape) -> Result<()> {
     Ok(())
 }
 
+/// Reject a subkey outside the record's schema, naming the slot and the bound.
+///
+/// Veilid rejects an out-of-range subkey itself, so this changes a *loud* failure
+/// into a loud failure — but it moves it from after `open_or_create` (a record
+/// created or opened on the network before anything is validated) to before, and
+/// from a generic "failed schema validation" to an error that names the offending
+/// slot and the shape it escaped. Every pre-DM caller derives its slot from a hash
+/// reduced mod the shape and cannot trip this; the DM page is the first to take a
+/// slot from arithmetic a caller supplies, which is what makes the check worth its
+/// line count.
+fn check_subkey_range(subkey: u32, shape: RecordShape) -> Result<()> {
+    let o_cnt = u32::from(shape.o_cnt());
+    if subkey >= o_cnt {
+        return Err(VeilidNetError::Send(format!(
+            "subkey {subkey} is outside dflt({o_cnt}) — valid slots are 0..{o_cnt}"
+        )));
+    }
+    Ok(())
+}
+
 /// Write `sealed` to a SPECIFIC subkey (owner-signed), last-writer-wins — the
 /// current-state counterpart to [`publish`]'s append-ring write. The caller picks the
 /// slot from a stable identity via [`current_state_subkey`], so re-publishing the same
@@ -495,6 +525,7 @@ pub async fn publish_at_subkey(
     sealed: Vec<u8>,
 ) -> Result<()> {
     check_write_cap(sealed.len(), handle.shape())?;
+    check_subkey_range(subkey, handle.shape())?;
     rc.set_dht_value(
         handle.key().clone(),
         subkey,

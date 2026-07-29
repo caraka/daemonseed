@@ -53,6 +53,26 @@ work lives in the project lead's vault manifest, not here.
 
 ### Added
 
+- DM channel-page transport — `VeilidNetHandle::publish_dm_page` and
+  `sweep_dm_page`, over a third record shape, `RecordShape::DM_PAGE` (`dflt(16)`).
+  A publish writes one sealed frame into one slot and rides the write funnel as a
+  non-coalescible chat-class write, because two queued writes to one page are two
+  different messages. A sweep returns `(slot, bytes)` per populated slot plus the
+  sweep outcome, so the collector can check a frame's declared sequence number
+  against the position it was found in and can tell an unwritten page from one
+  whose every read failed; the shape comes off the record handle rather than a
+  call-site constant. Both move opaque bytes — this layer never parses or verifies
+  a frame, and a successful write proves nothing about authorship, since both
+  parties can derive the owner seed for both directions. Write-once and
+  partial-sweep recovery are caller obligations, not properties this layer
+  enforces. (#234)
+
+- `publish_at_subkey` rejects a subkey outside the record's schema locally,
+  naming the slot and the bound, instead of letting veilid reject it after the
+  record has already been opened or created. Every pre-DM caller reduces its slot
+  mod the shape and cannot trip it; the DM page is the first to take a slot from
+  caller-supplied arithmetic.
+
 - DM ratchet key schedule — `daemonseed_core::dm::ratchet` (`derive_root`,
   `advance_root`, `chain_key`, `chain_step`, `skip`, `SkippedKeys`, `KeySlot`,
   `Direction`, `Role`, and the `RootKey` / `ChainKey` / `MessageKey` newtypes).

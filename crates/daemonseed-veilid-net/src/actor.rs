@@ -114,6 +114,28 @@ const SERVE_QUEUE_CAP: usize = 256;
 /// still bounding a pathological multi-fetcher burst.
 const MAX_CONCURRENT_SERVE_REPLIES: usize = 128;
 
+/// What one sweep of a DM channel page yields: the populated slots, each paired
+/// with the subkey index it came back in.
+///
+/// The pairing is the point, not a convenience. A frame declares its own sequence
+/// number, and the slot it was found in implies one; the collector must check that
+/// the two agree, via `daemonseed_core::dm::paging::PagePosition::new`. Returning
+/// bare bytes would unbind a frame from its position and leave the write-once
+/// property this scheme rests on checked by nothing.
+pub type DmPageSlots = Vec<(u32, Vec<u8>)>;
+
+/// One page sweep's full result: the populated slots, and the health of the sweep
+/// that produced them.
+///
+/// The [`rendezvous::SweepOutcome`] is not decoration. Without it an empty `Vec`
+/// means both "nobody has written to this page" and "all sixteen GETs errored",
+/// and those demand opposite responses — the first is the ordinary state of a page
+/// the probe frontier has run ahead to, the second is a record session that needs
+/// healing. `rendezvous.rs` names surfacing `failed` separately as the enabling
+/// signal for consumer-side session-health tracking (CRSH-ISC-1); a DM page that
+/// swallowed it would be the one record family invisible to that tracker.
+pub type DmPageSweep = (DmPageSlots, rendezvous::SweepOutcome);
+
 /// Commands the [`VeilidNetHandle`] sends to the actor task. Each carries a
 /// `oneshot` reply so the caller awaits the result.
 enum Command {
@@ -215,6 +237,43 @@ enum Command {
     FetchDmKeyRecord {
         owner_seed: [u8; 32],
         reply: oneshot::Sender<Result<Option<Vec<u8>>>>,
+    },
+    // ── Direct messaging (#234) ──
+    /// Publish one channel frame into `slot` of the `dflt(16)` page record at
+    /// `owner_seed` (`daemonseed_core::dm::paging::derive_owner_seed`). `frame` is
+    /// the already-sealed, already-signed channel frame; this layer moves opaque
+    /// bytes and never inspects them.
+    ///
+    /// Rides the WB-3 funnel as a **`Chat`-class, `Ring`-kind** write. A DM is chat,
+    /// so it draws the chat lane and never queues behind a keepalive; and the page
+    /// slot is *intended* to be written exactly once, so the write must never be
+    /// coalesced — which is what `Ring` means to the scheduler, whatever its name
+    /// suggests about append-rings. Dispatch is its own [`ProdWrite`] variant, so no
+    /// ring-sequence cursor is touched.
+    ///
+    /// **Write-once is a caller obligation, not an enforced property.** This is an
+    /// unconditional last-writer-wins `set_dht_value` with no read-before-write: a
+    /// caller that reissues a sequence number overwrites the peer's copy of an
+    /// already-delivered message and gets `Ok(())`. Re-deriving a ratchet from
+    /// generation zero after a restart is exactly how that happens (#243), which is
+    /// part of why #243 is alpha-blocking.
+    PublishDmPage {
+        owner_seed: [u8; 32],
+        slot: u32,
+        frame: Vec<u8>,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    /// Sweep every slot of one channel page, returning `(slot, bytes)` for each
+    /// populated one.
+    ///
+    /// The slot index travels back with the bytes because the collector must check
+    /// the frame's declared sequence number against the position it was found in —
+    /// `daemonseed_core::dm::paging::PagePosition::new` is the checked way to make
+    /// that comparison, and it needs the slot. An empty result is the ordinary state
+    /// of a page nobody has written to yet, distinct from a transport error.
+    SweepDmPage {
+        owner_seed: [u8; 32],
+        reply: oneshot::Sender<Result<DmPageSweep>>,
     },
     // ── Public-share content (Phase 3) ──
     /// Register an indexed share to serve owner-on-demand (`share_id` → content
@@ -488,6 +547,48 @@ impl VeilidNetHandle {
     /// was derived from before trusting anything in them.
     pub async fn fetch_dm_key_record(&self, owner_seed: [u8; 32]) -> Result<Option<Vec<u8>>> {
         self.send(|reply| Command::FetchDmKeyRecord { owner_seed, reply })
+            .await?
+    }
+
+    // ── Direct messaging (#234) ──
+
+    /// Publish one sealed channel frame into `slot` of its page — the transport
+    /// half of ISC-C42, which also needs collection (#236) before it can close.
+    ///
+    /// Derive `owner_seed` with `daemonseed_core::dm::paging::derive_owner_seed`
+    /// from the conversation's address root, the *sending* direction, and
+    /// `position_of(seq).page()`; take `slot` from the same
+    /// `position_of(seq).slot()`. Deriving the two from one `PagePosition` is what
+    /// keeps them consistent — a page from one sequence number and a slot from
+    /// another writes a frame nobody will find at the sequence it claims.
+    ///
+    /// Enqueued as a non-coalescible chat-lane write: every call reaches the
+    /// network, because every slot holds a different message.
+    pub async fn publish_dm_page(
+        &self,
+        owner_seed: [u8; 32],
+        slot: u32,
+        frame: Vec<u8>,
+    ) -> Result<()> {
+        self.send(|reply| Command::PublishDmPage {
+            owner_seed,
+            slot,
+            frame,
+            reply,
+        })
+        .await?
+    }
+
+    /// Sweep one channel page, returning `(slot, bytes)` per populated slot.
+    ///
+    /// An empty `Vec` is the ordinary state of an unwritten page — the probe
+    /// frontier is meant to run ahead of what exists — and is deliberately distinct
+    /// from `Err`, a transport failure. The bytes are UNVERIFIED: only
+    /// `daemonseed_core::dm::frame::parse` followed by the ratchet's own checks may
+    /// decide a frame is genuine, and the collector must confirm the frame's
+    /// sequence number agrees with the slot it came back in.
+    pub async fn sweep_dm_page(&self, owner_seed: [u8; 32]) -> Result<DmPageSweep> {
+        self.send(|reply| Command::SweepDmPage { owner_seed, reply })
             .await?
     }
 
@@ -1095,6 +1196,56 @@ async fn actor_loop(
                     let _ = reply.send(r);
                 });
             }
+            Command::PublishDmPage {
+                owner_seed,
+                slot,
+                frame,
+                reply,
+            } => {
+                // Class-1 Chat, `Ring` kind — never coalesced, never dropped
+                // (WB-ISC-11). A DM is a circle with one other person, so its writes
+                // belong in the same lane as any other typed message rather than
+                // behind the keepalives. `Ring` is the funnel's name for "never
+                // coalesce", which is what a write-once page slot needs; the dispatch
+                // token is its own variant, so nothing touches a ring-sequence cursor.
+                //
+                // Coalescing would be actively wrong here, not merely wasteful: two
+                // queued writes to the same page are two *different messages* in two
+                // different slots, and a last-writer-wins collapse would silently drop
+                // one of them off the wire with its `reply` reporting success.
+                sched.enqueue(WriteRequest {
+                    record: owner_seed,
+                    class: WriteClass::Chat,
+                    kind: WriteKind::Ring,
+                    deadline: None,
+                    item: ProdWrite::DmPage {
+                        owner_seed,
+                        slot,
+                        frame,
+                    },
+                    reply: Some(reply),
+                });
+            }
+            Command::SweepDmPage { owner_seed, reply } => {
+                // A read, so it never touches the write funnel (I9: no read-triggered
+                // writes). SPAWNED, never awaited inline (D-0b / #128, CRSH-ISC-22):
+                // the sweep is PAGE_SLOTS gated GETs behind an `open_or_create` that
+                // costs ~6-10 s on a cold cache, and collection probes the frontier
+                // page ahead of the one being filled — so a live conversation issues
+                // these continuously. Awaiting one on the command loop would park every
+                // other command behind it, the #154 failure mode exactly.
+                let gate = dht_gate.clone();
+                let api = api.clone();
+                let rc = rc.clone();
+                let opened = opened.clone();
+                let record_locks = record_locks.clone();
+                tokio::spawn(async move {
+                    let r =
+                        sweep_dm_page(&gate, &api, &rc, &opened, &record_locks, owner_seed).await;
+                    // A dropped receiver (caller gave up / shutting down) is benign.
+                    let _ = reply.send(r);
+                });
+            }
             Command::SubscribeRendezvous { owner_seed, reply } => {
                 let _ = reply.send(
                     subscribe_rendezvous(
@@ -1647,6 +1798,16 @@ enum ProdWrite {
         owner_seed: [u8; 32],
         record: Vec<u8>,
     },
+    /// A DM channel-page write → [`publish_dm_page`]. Its own variant for the same
+    /// reason as [`ProdWrite::DmKeyRecord`] — the page is `dflt(16)`, a third shape
+    /// again, and shape is part of the record address — plus a second one: the slot
+    /// is derived from the message's sequence number, so unlike a current-state
+    /// write it is neither a fixed slot nor a hashed one.
+    DmPage {
+        owner_seed: [u8; 32],
+        slot: u32,
+        frame: Vec<u8>,
+    },
 }
 
 /// The production [`WriteSink`] (WB-3.I1): the funnel's dispatch end. Holds the same
@@ -1736,6 +1897,23 @@ impl WriteSink for ProductionSink {
                         &record_locks,
                         owner_seed,
                         record,
+                    )
+                    .await
+                }
+                ProdWrite::DmPage {
+                    owner_seed,
+                    slot,
+                    frame,
+                } => {
+                    publish_dm_page(
+                        &gate,
+                        &api,
+                        &rc,
+                        &opened,
+                        &record_locks,
+                        owner_seed,
+                        slot,
+                        frame,
                     )
                     .await
                 }
@@ -1845,6 +2023,135 @@ async fn fetch_dm_key_record(
         }
         Err(e) => Err(VeilidNetError::Routing(e.to_string())),
     }
+}
+
+/// The DM channel page's schema: `dflt(16)`, one subkey per message slot.
+/// Part of the record ADDRESS, and simultaneously the modulus of the slot
+/// arithmetic — hence derived from `paging::PAGE_SLOTS` rather than typed here
+/// (`ISA.md` ISC-C100; sizing in `docs/design/direct-messaging.md` DRAFT v6).
+const DM_PAGE_SHAPE: rendezvous::RecordShape = rendezvous::RecordShape::DM_PAGE;
+
+/// Publish one sealed channel frame into one slot of one page (part of ISC-C42).
+///
+/// `frame` is opaque here, exactly as the key record is: this layer neither parses
+/// nor verifies it. Authorship inside the pair comes from the frame's own
+/// signature, checked by the collector — never from the fact that a write
+/// succeeded. Both parties can derive the owner seed for *both* directions, so
+/// reaching this function proves nothing about who wrote the bytes.
+///
+/// Unlike the key record, the page record is **not** world-writable: its owner seed
+/// derives from the conversation's address root, which comes from the secret
+/// encapsulated at first contact. A third party cannot compute the address at all,
+/// which is why the ongoing channel needs no admission control.
+#[allow(clippy::too_many_arguments)]
+async fn publish_dm_page(
+    gate: &Arc<DhtGate>,
+    api: &VeilidAPI,
+    rc: &RoutingContext,
+    opened: &rendezvous::OpenCache,
+    record_locks: &rendezvous::RecordLocks,
+    owner_seed: [u8; 32],
+    slot: u32,
+    frame: Vec<u8>,
+) -> Result<()> {
+    let owner = identity::rendezvous_owner_keypair(&owner_seed)?;
+    // Single-flight the open and serialize against any concurrent op on this record,
+    // exactly as the rendezvous and key-record write paths do (CRSH-ISC-3). Two
+    // messages landing in two slots of the same page is the ordinary case, so this
+    // lock is contended by design and must not be skipped.
+    let record_lock = rendezvous::record_lock(record_locks, &owner);
+    let _write_guard = record_lock.lock().await;
+    let handle = rendezvous::open_cached(
+        opened,
+        &rendezvous::cached_record_id(&owner, DM_PAGE_SHAPE),
+        rendezvous::open_or_create(gate, api, rc, &owner, DM_PAGE_SHAPE),
+    )
+    .await?;
+    crate::vtrace!(
+        "publish_dm_page: key={:?} slot={} bytes={}",
+        handle.key(),
+        slot,
+        frame.len()
+    );
+    rendezvous::publish_at_subkey(rc, &handle, &owner, slot, frame).await
+}
+
+/// Sweep one channel page, returning `(slot, bytes)` per populated slot together
+/// with the sweep's [`rendezvous::SweepOutcome`].
+///
+/// A **partial** sweep — some slots read, some GETs failed — returns the slots it
+/// did read rather than an error, which makes the outcome a **caller obligation**
+/// rather than a property this function provides. Two rules the collector must
+/// satisfy, neither of which exists in the tree yet (collection is #236):
+///
+/// 1. Hold the probe frontier and the contiguous cursor as separate pointers, per
+///    `daemonseed_core::dm::paging`'s module docs. The cursor may only advance
+///    across an unbroken prefix, so a slot missed by a failed GET holds it in place
+///    and is re-probed rather than skipped.
+/// 2. Treat `outcome.failed > 0` as a record-health signal, not as an empty page.
+///
+/// Until a collector honouring both exists, an `Ok` carrying an empty `Vec` and a
+/// non-zero `failed` is unguarded — which is precisely why the outcome is returned
+/// instead of being traced and dropped.
+async fn sweep_dm_page(
+    gate: &Arc<DhtGate>,
+    api: &VeilidAPI,
+    rc: &RoutingContext,
+    opened: &rendezvous::OpenCache,
+    record_locks: &rendezvous::RecordLocks,
+    owner_seed: [u8; 32],
+) -> Result<DmPageSweep> {
+    let owner = identity::rendezvous_owner_keypair(&owner_seed)?;
+    // The open is serialized under the record lock; the GETs are NOT, so a slow
+    // page read never blocks a concurrent write to the same page. The guard drops
+    // before any read permit is acquired, keeping the single-permit rule
+    // (CRSH-ISC-17).
+    let handle = {
+        let record_lock = rendezvous::record_lock(record_locks, &owner);
+        let _open_guard = record_lock.lock().await;
+        rendezvous::open_cached(
+            opened,
+            &rendezvous::cached_record_id(&owner, DM_PAGE_SHAPE),
+            rendezvous::open_or_create(gate, api, rc, &owner, DM_PAGE_SHAPE),
+        )
+        .await?
+    };
+    let key = handle.key().clone();
+    let mut found: DmPageSlots = Vec::new();
+    // The slot bound comes off the handle's own shape, never from a constant at
+    // this call site: a sweep wider than the record the address was derived under
+    // is the mistake `RendezvousHandle` binds key and shape together to prevent.
+    let outcome = rendezvous::sweep_gated(
+        gate,
+        handle.shape().o_cnt(),
+        |subkey, bytes| {
+            found.push((subkey, bytes));
+            true
+        },
+        |subkey| {
+            let rc = rc.clone();
+            let key = key.clone();
+            async move {
+                match rc.get_dht_value(key, subkey, true).await {
+                    Ok(Some(v)) => Ok(Some(v.data().to_vec())),
+                    Ok(None) => Ok(None),
+                    Err(e) => {
+                        crate::vtrace!("sweep_dm_page: get error on slot {subkey}: {e}");
+                        Err(())
+                    }
+                }
+            }
+        },
+    )
+    .await;
+    crate::vtrace!(
+        "sweep_dm_page: key={:?} attempted={} found={} failed={}",
+        handle.key(),
+        outcome.attempted,
+        outcome.found,
+        outcome.failed
+    );
+    Ok((found, outcome))
 }
 
 /// Open/create the rendezvous record, register a watch, and kick off a one-shot
@@ -2553,16 +2860,46 @@ mod tests {
         assert_eq!(DM_KEY_RECORD_SUBKEY, 0);
         assert!(DM_KEY_RECORD_SUBKEY < u32::from(DM_KEY_RECORD_SHAPE.o_cnt()));
 
-        // The two shapes must stay distinct: sharing an owner seed across them
+        // The DM channel page: sixteen slots, 32 KiB each (1 MiB / 16 = 64 KiB is
+        // above the per-subkey ceiling, so the full 32 KiB survives).
+        assert_eq!(DM_PAGE_SHAPE.o_cnt(), 16);
+        assert_eq!(DM_PAGE_SHAPE.max_value_len(), 32768);
+
+        // The three shapes must stay distinct: sharing an owner seed across them
         // would otherwise collapse in the open-cache.
-        assert_ne!(
-            rendezvous::RecordShape::RENDEZVOUS.o_cnt(),
-            DM_KEY_RECORD_SHAPE.o_cnt()
-        );
         let owner = crate::identity::rendezvous_owner_keypair(&[3u8; 32]).unwrap();
-        assert_ne!(
+        let ids = [
             rendezvous::cached_record_id(&owner, rendezvous::RecordShape::RENDEZVOUS),
-            rendezvous::cached_record_id(&owner, DM_KEY_RECORD_SHAPE)
+            rendezvous::cached_record_id(&owner, DM_KEY_RECORD_SHAPE),
+            rendezvous::cached_record_id(&owner, DM_PAGE_SHAPE),
+        ];
+        let distinct: std::collections::BTreeSet<_> = ids.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            ids.len(),
+            "two record kinds share a cached-record id under one owner"
+        );
+    }
+
+    /// **The page shape and the page arithmetic are the same number.** `o_cnt` is
+    /// part of the record address AND the modulus of `position_of`, so a shape
+    /// typed independently of `PAGE_SLOTS` would keep every test in `paging` green
+    /// while addressing a record the other party never sweeps — silently, with no
+    /// error on any surface (ISC-C100). Pinned here because this crate is where the
+    /// two facts finally meet.
+    #[test]
+    fn the_page_record_shape_is_the_page_slot_count() {
+        // The ONE load-bearing assertion. A "does every `position_of` slot fit
+        // inside the record" loop was deliberately REMOVED from here: after this
+        // equality it reduces to `seq % PAGE_SLOTS < PAGE_SLOTS`, total by
+        // construction and already covered verbatim by
+        // `paging::a_slot_is_always_within_the_record`. It read as a second oracle
+        // without being one, and a test that cannot fail is worse than no test —
+        // it buys false confidence in review.
+        assert_eq!(
+            DM_PAGE_SHAPE.o_cnt(),
+            daemonseed_core::dm::paging::PAGE_SLOTS,
+            "the page record's subkey count must BE the slot arithmetic's modulus"
         );
     }
 }
