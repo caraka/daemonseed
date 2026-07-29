@@ -856,6 +856,45 @@ modules:
       msg_sig unconditionally. Plaintext pads to PAD_BUCKETS (8192, 16384) before
       sealing; MAX_FRAME_LEN (32768) is the dflt(16) subkey cap, held as an
       invariant by the body cap and the ladder rather than a runtime check.
+      Sub-module dm::ack is the delivery acknowledgement's pure half.
+      derive_seal_key(AR, dir) -> Result<DmAckSealKey, AckError> is HKDF-SHA-384(
+      salt=daemonseed/dm/ack/salt/v1, ikm=AR, info=daemonseed/dm/ack/seal/v3||
+      lp(dir)); dir is the direction of the messages being acknowledged. A
+      collector of a2b derives the a2b key. Take it from Ratchet::recv_direction
+      when building an ack and Ratchet::send_direction when opening the peer's.
+      DmAckSealKey is a boxed, redacting, zeroize-on-drop newtype. AckState holds
+      a contiguous prefix — high_water() -> Option<u64>, the highest sequence
+      number with every position from zero settled, None when none is — plus a set
+      of settled positions beyond it; runs() reports how many runs that set holds.
+      collect(seq) and abandon(seq) both settle the position and are both
+      idempotent; abandon additionally advances the prefix past it. After
+      abandon(seq), is_settled(seq) is true. is_settled(seq) is true inside the
+      prefix or inside a run and false otherwise, including for unknown positions;
+      it reports settled, not collected. merge_own_ack(other) is a monotonic union
+      for an ack this party itself published: the prefix never regresses and no
+      settled position is cleared. merge_peer_ack(other, highest_sent: Option<u64>)
+      -> Result<PeerAckOutcome, AckError> is that union with the peer's claim first
+      clipped to highest_sent, the highest sequence number this party has sent on
+      that direction; None clips the claim to empty. Only the peer's copy is
+      clipped. PeerAckOutcome is WithinCeiling or ClippedToCeiling { claimed,
+      ceiling }. Call it after verifying the ack's signature, not before. An insert
+      or merge that would exceed MAX_ACK_RUNS (64) returns AckError::TooManyRuns
+      and leaves the state unchanged; it never truncates. encode_beyond() is the
+      canonical RLE of the runs: u16 count, then per run a big-endian u64 gap
+      measured from two past the previous run's end and a big-endian u64 extent
+      (end - start); touching, overlapping and out-of-order runs are
+      unspellable. decode_unvalidated(high_water, bytes) rejects a count over the
+      cap before allocating, a body length that is not exactly count x 16,
+      arithmetic leaving the sequence space (RunOutOfRange), and any run at or
+      below the prefix (RunInPrefix); a declared run extent never drives an
+      allocation, and the result is bounded by nothing the caller has sent until it
+      passes through merge_peer_ack. ack_sig_input(chan_id, dir, state) binds
+      daemonseed/dm/ack/sig/v3 || lp(chan_id) || lp(dir) || lp(high_water_be) ||
+      lp(encoded runs); an absent prefix binds as a zero-length component.
+      AckState carries no chan_id, and neither encode_beyond nor
+      decode_unvalidated takes one. NOT YET AVAILABLE: the ack record, its seal,
+      its jittered standalone cadence, the piggyback path and the persisted outbox
+      (#235 transport half).
       Sub-module dm::domain
       declares the daemonseed/dm/… label namespace, one distinct prefix-free label
       per purpose.
@@ -864,6 +903,7 @@ modules:
       - daemonseed_core::identity::keys
       - daemonseed_core::secret_seed
     iscs:
+      - C39
       - C40
       - C41
       - C42

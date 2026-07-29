@@ -68,21 +68,37 @@ work lives in the project lead's vault manifest, not here.
 
 ### Added
 
+- DM delivery-acknowledgement core — `daemonseed_core::dm::ack`
+  (`derive_seal_key`, `ack_sig_input`, `AckState`, `PeerAckOutcome`,
+  `DmAckSealKey`, `AckError`, `MAX_ACK_RUNS`). `derive_seal_key(AR, dir)` is
+  HKDF-SHA-384 under salt `daemonseed/dm/ack/salt/v1` and info
+  `daemonseed/dm/ack/seal/v3 ‖ lp(dir)`. `AckState` holds a contiguous prefix
+  (`high_water() -> Option<u64>`) plus a set of settled positions beyond it,
+  encoded as canonical RLE runs. `collect(seq)` and `abandon(seq)` both settle;
+  `abandon` advances the prefix past the position. `is_settled(seq)` answers from
+  the prefix or a run and is false otherwise. `merge_own_ack(other)` is a
+  monotonic union. `merge_peer_ack(other, highest_sent)` is that union with the
+  peer's claim first clipped to `highest_sent`, returning `PeerAckOutcome`.
+  Beyond `MAX_ACK_RUNS` (64) an insert or merge returns `TooManyRuns` and leaves
+  the state unchanged. `encode_beyond()` emits a `u16` run count then a
+  big-endian `(gap, extent)` pair per run. `decode_unvalidated(high_water, bytes)`
+  rejects a count over the cap before allocating, a body length that is not
+  exactly `count × 16`, arithmetic leaving the sequence space, and any run at or
+  below the prefix. `ack_sig_input(chan_id, dir, state)` binds
+  `daemonseed/dm/ack/sig/v3 ‖ lp(chan_id) ‖ lp(dir) ‖ lp(high_water) ‖
+  lp(encoded runs)`, with an absent prefix as a zero-length component. `AckState`
+  carries no `chan_id`. Not included: the ack record, its seal, its jittered
+  standalone cadence, the piggyback path, the persisted outbox. (#235)
+
 - DM channel-page transport — `VeilidNetHandle::publish_dm_page` and
   `sweep_dm_page`, over a third record shape, `RecordShape::DM_PAGE` (`dflt(16)`).
-  A publish writes one sealed frame into one slot and rides the write funnel as a
-  non-coalescible chat-class write, because two queued writes to one page are two
-  different messages. A sweep returns `(slot, bytes)` per populated slot plus the
-  sweep outcome, so the collector can check a frame's declared sequence number
-  against the position it was found in and can tell an unwritten page from one
-  whose every read failed; the shape comes off the record handle rather than a
-  call-site constant. Both move opaque bytes — this layer never parses or verifies
-  a frame, and a successful write proves nothing about authorship, since both
-  parties can derive the owner seed for both directions. Write-once and
-  partial-sweep recovery are caller obligations, not properties this layer
-  enforces. A page's record open is warmed off the chat lane before the write is
-  enqueued, so the cold open a conversation pays on every page rollover does not
-  hold one of the two chat permits for its duration. (#234)
+  A publish writes one sealed frame into one slot as a non-coalescible chat-class
+  funnel write; the record open is warmed off the chat lane before the write is
+  enqueued. A sweep returns `(slot, bytes)` per populated slot plus the sweep
+  outcome, bounded by the shape on the record handle. Both move opaque bytes: this
+  layer never parses or verifies a frame. Write-once and partial-sweep recovery
+  are caller obligations, not properties this layer enforces. Rationale in
+  `docs/design/direct-messaging.md` and `ISA.md`. (#234)
 
 - `publish_at_subkey` rejects a subkey outside the record's schema locally,
   naming the slot and the bound, instead of letting veilid reject it after the

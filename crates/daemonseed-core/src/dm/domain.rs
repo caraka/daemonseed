@@ -125,6 +125,36 @@ pub const DM_PAGE_SALT: &[u8] = b"daemonseed/dm/page/salt/v1";
 /// unforgeable and un-erasable by a third party. FROZEN.
 pub const DM_PAGE_ADDR: &[u8] = b"daemonseed/dm/page/addr/v4";
 
+/// HKDF-Extract salt for a direction's delivery-acknowledgement seal key, rooted
+/// in the conversation's retained address root `AR`. Distinct from
+/// [`DM_PAGE_SALT`] so the two derivations over that same secret cannot collide.
+/// FROZEN.
+pub const DM_ACK_SALT: &[u8] = b"daemonseed/dm/ack/salt/v1";
+
+/// HKDF-Expand `info` prefix for a direction's delivery-acknowledgement seal key.
+/// The direction follows it, length-prefixed.
+///
+/// **Rooted in `AR`, not in the ratchet root**, which is what the `/v3` in the
+/// frozen name records: a ratchet-rooted ack key desyncs the moment the two
+/// parties sit at different generations (crypto F-3), and the acknowledgement
+/// would go dark exactly when a conversation is busiest. Per-direction for F-6.
+/// FROZEN.
+pub const DM_ACK_SEAL: &[u8] = b"daemonseed/dm/ack/seal/v3";
+
+/// Signature domain for a delivery acknowledgement, signed under the PSEUDONYM
+/// key.
+///
+/// **`/v3`, past the frozen text's `…/ack/sig/v2`.** That name was pinned in
+/// § DRAFT v2 for a preimage covering `chan_id ‖ high_water` alone — written while
+/// the gap bitmap was dropped. v6 restored the bitmap and made it decide
+/// confirmation, so a preimage of that shape leaves the deciding half unsigned.
+/// What this domain covers is `chan_id ‖ dir ‖ high_water ‖ the canonical run
+/// encoding`; reusing `/v2` for materially broader content would let two
+/// implementations disagree about what a signature of that name covers, which is
+/// the same failure the `msg/sig/v6` and `msg/aad/v4` bumps exist to prevent.
+/// FROZEN.
+pub const DM_ACK_SIG: &[u8] = b"daemonseed/dm/ack/sig/v3";
+
 /// HKDF-Expand `info` for the ratchet root `RK0` — the third sibling of the same
 /// extraction that yields [`DM_ADDR_ROOT`] and [`DM_CHAN_ID`]. Unlike those two,
 /// this one is ratcheted forward and deleted, which is the whole of DM's forward
@@ -165,6 +195,9 @@ pub const DM_CK: &[u8] = b"daemonseed/dm/ck/v2";
 const ALL: &[&[u8]] = &[
     DM_PAGE_SALT,
     DM_PAGE_ADDR,
+    DM_ACK_SALT,
+    DM_ACK_SEAL,
+    DM_ACK_SIG,
     DM_RATCHET_ROOT,
     DM_RATCHET_STEP,
     DM_CHAIN_SALT,
@@ -220,6 +253,9 @@ mod tests {
         assert_eq!(DM_CHAN_ID, b"daemonseed/dm/chanid/v2");
         assert_eq!(DM_PAGE_SALT, b"daemonseed/dm/page/salt/v1");
         assert_eq!(DM_PAGE_ADDR, b"daemonseed/dm/page/addr/v4");
+        assert_eq!(DM_ACK_SALT, b"daemonseed/dm/ack/salt/v1");
+        assert_eq!(DM_ACK_SEAL, b"daemonseed/dm/ack/seal/v3");
+        assert_eq!(DM_ACK_SIG, b"daemonseed/dm/ack/sig/v3");
         assert_eq!(DM_RATCHET_ROOT, b"daemonseed/dm/ratchet/root/v2");
         assert_eq!(DM_RATCHET_STEP, b"daemonseed/dm/ratchet/step/v2");
         assert_eq!(DM_CHAIN_SALT, b"daemonseed/dm/chain/salt/v1");
