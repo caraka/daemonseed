@@ -68,6 +68,16 @@ work lives in the project lead's vault manifest, not here.
 
 ### Added
 
+- `redacted_secret_newtype!`'s zeroize-on-drop and redacted `Debug` are under
+  test. `crates/daemonseed-core/src/secret_seed.rs` asserts the `ZeroizeOnDrop`
+  bound on all seventeen generated secret types and pins both arms' `Debug`
+  rendering; `crates/daemonseed-core/tests/secret_zeroize_on_drop.rs` installs a
+  witness global allocator that reads each secret's block inside
+  `GlobalAlloc::dealloc` and requires it to be zero, over three boxed-arm
+  rendezvous-owner seeds plus the ratchet's ephemeral decapsulation key, and the
+  three inline-arm identity-rooted secrets.
+  (#242)
+
 - DM ratchet state survives a restart — `daemonseed_core::dm::ratchet`
   (`Ratchet::snapshot`, `Ratchet::restore`, `RatchetSnapshot`,
   `RatchetSnapshotError`, `RATCHET_SNAPSHOT_MAGIC`). `snapshot()` captures the

@@ -115,3 +115,141 @@ pub(crate) fn derive_boxed_seed<const N: usize>(
     seed.zeroize();
     Ok(boxed)
 }
+
+/// Tests for the shared hygiene contract (#242).
+///
+/// The contract has two halves and they are tested in two places, because this
+/// crate is `#![forbid(unsafe_code)]` and one of them cannot be observed without
+/// raw pointers. Here: the trait bound on every generated type, and the redacted
+/// `Debug` — both reachable in safe code. In `tests/secret_zeroize_on_drop.rs`:
+/// the behavioural half, that the bytes actually reach zero before their storage
+/// is released, observed from inside a witness allocator in a separate crate
+/// where `unsafe` is permitted.
+#[cfg(test)]
+mod tests {
+    use zeroize::ZeroizeOnDrop;
+
+    // Two secrets of the macro's own making, one per storage shape. They exist so
+    // the macro can be exercised directly rather than through whichever caller
+    // happens to be cheapest to construct, and so the field is reachable — every
+    // real user declares its newtype in its own module, where the tuple field is
+    // private to that module.
+    redacted_secret_newtype! {
+        /// Inline-arm probe: a 32-byte secret held as `[u8; 32]`.
+        inline struct TestInlineSecret([u8; 32]);
+    }
+
+    redacted_secret_newtype! {
+        /// Boxed-arm probe: a 32-byte secret held as `Box<[u8; 32]>`.
+        boxed struct TestBoxedSecret([u8; 32]);
+    }
+
+    /// The byte every probe secret is filled with. Distinctive in both hex and
+    /// decimal so a leaked rendering is recognisable either way.
+    const FILL: u8 = 0xA5;
+
+    /// Every secret newtype the macro generates carries `ZeroizeOnDrop`.
+    ///
+    /// This is a compile-time bound, so it proves the trait is implemented on all
+    /// seventeen key classes — and nothing more. A hand-written `impl
+    /// ZeroizeOnDrop for T {}` with no `Drop` would satisfy it while wiping
+    /// nothing; closing that gap is what `tests/secret_zeroize_on_drop.rs` is
+    /// for. The value here is breadth: it fails on the arm-level derive AND on
+    /// any single type that later drifts to a hand-rolled shape without the
+    /// property, including the ones with no public constructor to build a
+    /// behavioural test around.
+    #[test]
+    #[allow(clippy::extra_unused_type_parameters)]
+    fn every_macro_generated_secret_is_zeroize_on_drop() {
+        fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+
+        // The macro's own probes.
+        assert_zeroize_on_drop::<TestInlineSecret>();
+        assert_zeroize_on_drop::<TestBoxedSecret>();
+
+        // inline arm — identity-rooted secrets.
+        assert_zeroize_on_drop::<crate::identity::keys::ShareRootIkm>();
+        assert_zeroize_on_drop::<crate::identity::keys::VeilidNodeSeed>();
+        assert_zeroize_on_drop::<crate::identity::keys::DmDoorbellSlotSecret>();
+
+        // inline arm — the DM ratchet key schedule.
+        assert_zeroize_on_drop::<crate::dm::ratchet::RootKey>();
+        assert_zeroize_on_drop::<crate::dm::ratchet::ChainKey>();
+        assert_zeroize_on_drop::<crate::dm::ratchet::MessageKey>();
+
+        // boxed arm — rendezvous-owner seeds.
+        assert_zeroize_on_drop::<crate::circle::key::CircleVeilidOwnerSeed>();
+        assert_zeroize_on_drop::<crate::circle::key::CirclePresenceVeilidOwnerSeed>();
+        assert_zeroize_on_drop::<crate::public_room::RoomVeilidOwnerSeed>();
+        assert_zeroize_on_drop::<crate::public_room::RoomPresenceVeilidOwnerSeed>();
+        assert_zeroize_on_drop::<crate::public_room::RoomShareVeilidOwnerSeed>();
+        assert_zeroize_on_drop::<crate::public_space::ProjectAnnounceVeilidOwnerSeed>();
+
+        // boxed arm — DM.
+        assert_zeroize_on_drop::<crate::dm::ack::DmAckSealKey>();
+        assert_zeroize_on_drop::<crate::dm::doorbell::DmDoorbellOwnerSeed>();
+        assert_zeroize_on_drop::<crate::dm::keyrec::DmKeyRecordOwnerSeed>();
+        assert_zeroize_on_drop::<crate::dm::paging::DmPageOwnerSeed>();
+        assert_zeroize_on_drop::<crate::dm::ratchet::EphemeralDecapKey>();
+    }
+
+    /// Both arms render a redacted `Debug`.
+    ///
+    /// Exact-string equality, not a `contains("<redacted>")` check: a `Debug` that
+    /// printed `Name { inner: <redacted>, bytes: [..] }` would pass a substring
+    /// test. The second half then pins the failure mode a derived `Debug` would
+    /// actually produce — a tuple struct over `[u8; 32]` renders its bytes in
+    /// decimal — so the assertion is tied to the leak, not only to the wording.
+    #[test]
+    fn both_arms_render_a_redacted_debug() {
+        let inline = TestInlineSecret([FILL; 32]);
+        let boxed = TestBoxedSecret(Box::new([FILL; 32]));
+
+        let inline_dbg = format!("{inline:?}");
+        let boxed_dbg = format!("{boxed:?}");
+
+        assert_eq!(inline_dbg, "TestInlineSecret(<redacted>)");
+        assert_eq!(boxed_dbg, "TestBoxedSecret(<redacted>)");
+
+        for rendered in [&inline_dbg, &boxed_dbg] {
+            assert!(
+                !rendered.contains("165"),
+                "decimal byte rendering leaked: {rendered}"
+            );
+            assert!(
+                !rendered.contains("a5"),
+                "hex byte rendering leaked: {rendered}"
+            );
+        }
+    }
+
+    /// `as_bytes` is the single accessor, and it hands back the stored secret
+    /// unchanged on both arms — the property the zeroize tests above depend on to
+    /// locate the bytes at all.
+    #[test]
+    fn both_arms_expose_their_bytes_through_as_bytes() {
+        assert_eq!(TestInlineSecret([FILL; 32]).as_bytes(), &[FILL; 32]);
+        assert_eq!(
+            TestBoxedSecret(Box::new([FILL; 32])).as_bytes(),
+            &[FILL; 32]
+        );
+    }
+
+    /// The shared boxed-seed derivation returns the expansion it was asked for and
+    /// is deterministic for a given PRK and label — the input side of the boxed
+    /// arm, whose output hygiene the allocator-witness test in
+    /// `tests/secret_zeroize_on_drop.rs` covers.
+    #[test]
+    fn derive_boxed_seed_is_deterministic_per_label() {
+        let _ = oxicrypt_module::initialize();
+        let hkdf = super::HkdfSha384::extract(Some(b"salt"), b"ikm").unwrap();
+
+        let a = super::derive_boxed_seed::<32>(&hkdf, b"label-one").unwrap();
+        let b = super::derive_boxed_seed::<32>(&hkdf, b"label-one").unwrap();
+        let c = super::derive_boxed_seed::<32>(&hkdf, b"label-two").unwrap();
+
+        assert_eq!(a, b, "same PRK and label expand to the same seed");
+        assert_ne!(a, c, "a distinct label is a distinct seed");
+        assert_ne!(*a, [0u8; 32], "the expansion is not all-zero");
+    }
+}
