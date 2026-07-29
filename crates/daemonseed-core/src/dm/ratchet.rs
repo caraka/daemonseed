@@ -86,12 +86,29 @@
 //! Beyond the cache bound the oldest entry is evicted and its message becomes
 //! permanently unreadable — a real, bounded loss, not a hypothetical one, and the
 //! honest cost of refusing to let a peer make us allocate without limit.
+//!
+//! ## Surviving a restart
+//!
+//! `ss0` does not rebuild a running conversation. It yields generation zero's
+//! root and nothing else — not the generations since, not the ephemerals a peer's
+//! next step will encapsulate to, not where either chain has reached. A party
+//! rebuilt from it comes back at generation zero while its peer carries on: every
+//! frame then takes the advancing path, looks for an ephemeral that party no
+//! longer holds, and fails with [`RatchetError::UnknownEphemeral`] — in both
+//! directions, permanently, with nothing on either end reporting it.
+//!
+//! [`Ratchet::snapshot`] and [`Ratchet::restore`] are the way across a restart,
+//! and [`RatchetSnapshot::encode`] / [`RatchetSnapshot::decode`] are its at-rest
+//! form. **The encoding is the plaintext of a record, not the record**: it is a
+//! complete set of live keys in the clear and must be sealed by whatever store
+//! holds it, exactly as `ss0` is. `chan_id` is never part of it — see
+//! [`RatchetSnapshot`].
 
 use std::collections::VecDeque;
 
 use oxicrypt_kdf::HkdfSha384;
 use oxicrypt_ml_kem as ml_kem;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::dm::domain;
 use crate::secret_seed::redacted_secret_newtype;
@@ -299,6 +316,12 @@ pub enum RatchetError {
     /// the protocol — reaching it needs 2^32 round trips — but the alternative is
     /// a wrapping counter that collides two roots on one generation number.
     GenerationExhausted,
+    /// The chain cursor would step past the last sequence number there is.
+    /// Unreachable by any peer following the protocol, and refused rather than
+    /// left to the arithmetic: this crate's release profile sets no
+    /// `overflow-checks`, so the wrap is silent there, and a cursor wrapping to
+    /// zero rewrites the write-once page slot sequence zero already owns.
+    SequenceExhausted { seq: u64 },
     /// A frame sits further ahead on its chain than [`MAX_CATCH_UP`] — further
     /// than a receiver will walk in one step. Not recoverable by retrying the
     /// same frame; the conversation re-anchors at the peer's next ratchet step.
@@ -343,6 +366,10 @@ impl std::fmt::Display for RatchetError {
                 "sequence {seq} is before its own chain, which begins at {chain_base}"
             ),
             Self::GenerationExhausted => write!(f, "the ratchet generation counter is exhausted"),
+            Self::SequenceExhausted { seq } => write!(
+                f,
+                "sequence {seq} is the last there is, and the chain cannot step past it"
+            ),
             Self::BacklogTooWide { gap, max } => write!(
                 f,
                 "a frame sits {gap} positions ahead, beyond the {max} one catch-up walks"
@@ -602,6 +629,48 @@ impl SkippedKeys {
     pub fn contains(&self, slot: &KeySlot) -> bool {
         self.entries.iter().any(|(s, _)| s == slot)
     }
+
+    /// Rebuild a cache from a snapshot's entries and its eviction count.
+    ///
+    /// Takes the entries in the order they were held, because that order is what
+    /// decides which key eviction destroys next; rebuilding it as a set would
+    /// make a restart quietly re-pick the victim.
+    ///
+    /// **Takes the whole deque by value and never copies out of it.** Moving keys
+    /// between two collections would leave a copy of every message key in the
+    /// abandoned buffer, which is freed without being zeroized — the exact leak
+    /// [`Self::new`]'s pre-allocation exists to avoid. The decoder builds this
+    /// deque at full capacity and it is adopted unchanged.
+    ///
+    /// Refuses more entries than [`SKIPPED_KEY_CAPACITY`] rather than dropping
+    /// the excess, which would silently destroy keys from a record we ourselves
+    /// wrote and leave `evicted` understating the loss.
+    ///
+    /// Refuses a repeated [`KeySlot`] for the same reason: [`Self::insert`]
+    /// maintains one entry per slot, so a second is capacity that no lookup can
+    /// ever reach — [`Self::peek`] and [`Self::take`] both stop at the first
+    /// match — while still counting toward the bound and toward
+    /// [`DeliveryLosses::pending`], which reports it as a message still
+    /// recoverable.
+    fn restore(
+        entries: VecDeque<(KeySlot, MessageKey)>,
+        evicted: u64,
+    ) -> Result<Self, RatchetSnapshotError> {
+        if entries.len() > SKIPPED_KEY_CAPACITY {
+            return Err(RatchetSnapshotError::TooManySkippedKeys {
+                count: entries.len(),
+                max: SKIPPED_KEY_CAPACITY,
+            });
+        }
+        // Quadratic over a deque bounded at `SKIPPED_KEY_CAPACITY`, run once per
+        // restore. A hash set would need a copy of every slot to build.
+        for (at, (slot, _)) in entries.iter().enumerate() {
+            if entries.iter().skip(at + 1).any(|(later, _)| later == slot) {
+                return Err(RatchetSnapshotError::DuplicateSkippedKey { slot: *slot });
+            }
+        }
+        Ok(Self { entries, evicted })
+    }
 }
 
 /// How many of our own ephemeral secrets to keep, indexed by the generation that
@@ -717,6 +786,12 @@ impl Chain {
     /// to look alive from both ends. The frozen design's residual is bounded
     /// per-message loss, never unbounded-downstream loss — so the oldest keys past
     /// the retention bound are dropped, counted, and the arriving message opens.
+    ///
+    /// **The successor cursor is computed with `checked_add`, not `+ 1`.** The
+    /// workspace defines no `[profile.release]`, so `overflow-checks` is off in
+    /// release and a target at [`u64::MAX`] would wrap the cursor to zero rather
+    /// than panic — silently rewriting the write-once page slot sequence zero
+    /// already owns.
     fn advance_to(
         self,
         target: u64,
@@ -727,6 +802,9 @@ impl Chain {
                 seq: target,
             });
         }
+        let after = target
+            .checked_add(1)
+            .ok_or(RatchetError::SequenceExhausted { seq: target })?;
         let Self {
             generation,
             direction,
@@ -755,7 +833,7 @@ impl Chain {
             message_key,
             Self {
                 key: next_key,
-                next: target + 1,
+                next: after,
                 base,
                 generation,
                 direction,
@@ -1264,6 +1342,929 @@ impl Ratchet {
         self.recv = Some(chain);
         self.peer_eph = Some((header.generation, Box::new(*peer_eph_ek)));
         Ok(outcome)
+    }
+
+    /// Everything this conversation needs to come back exactly where it is.
+    ///
+    /// Infallible and non-destructive: the live ratchet is untouched and keeps
+    /// working, so a client may snapshot on a cadence rather than only at
+    /// shutdown. The cost is not merely a duplicate of every key the conversation
+    /// holds: each snapshot a cadence leaves behind on the medium is a
+    /// forward-secrecy rollback point for as long as it survives there. See
+    /// [`RatchetSnapshot`] for the erasure that obliges of the caller.
+    pub fn snapshot(&self) -> RatchetSnapshot {
+        // Two separately-persisted numbers that are always equal, checked where
+        // they are read rather than only where they are written back — see
+        // `RatchetSnapshotError::SendCursorMismatch`.
+        debug_assert!(
+            self.send
+                .as_ref()
+                .is_none_or(|c| c.next == self.next_send_seq),
+            "the sending chain's cursor and next_send_seq have diverged"
+        );
+        // Likewise: the sending chain and our newest ephemeral are created in one
+        // operation at both sites that create either, so their generations are
+        // one fact recorded twice — see `RatchetSnapshotError::
+        // EphemeralGenerationMismatch`, which is where it is read back.
+        debug_assert_eq!(
+            self.send.as_ref().map(|c| c.generation),
+            self.ephemerals.back().map(|e| e.generation),
+            "the sending chain and the newest ephemeral name different generations"
+        );
+
+        let mut skipped = VecDeque::with_capacity(SKIPPED_KEY_CAPACITY);
+        for (slot, key) in &self.skipped.entries {
+            skipped.push_back((*slot, key.clone()));
+        }
+
+        RatchetSnapshot {
+            role: self.role,
+            generation: self.generation,
+            root: self.root.clone(),
+            send: self.send.as_ref().map(ChainSnapshot::of),
+            recv: self.recv.as_ref().map(ChainSnapshot::of),
+            ephemerals: self.ephemerals.iter().map(EphemeralSnapshot::of).collect(),
+            peer_eph: self
+                .peer_eph
+                .as_ref()
+                .map(|(generation, ek)| (*generation, ek.clone())),
+            consumed_peer_generation: self.consumed_peer_generation,
+            gen_ct: self.gen_ct.clone(),
+            next_send_seq: self.next_send_seq,
+            skipped,
+            evicted: self.skipped.evicted(),
+            abandoned: self.abandoned,
+        }
+    }
+
+    /// Rebuild a conversation from its snapshot.
+    ///
+    /// Every check here is an integrity check on a record **we** wrote, and which
+    /// its store is expected to seal — not a parse of anything a peer supplied.
+    /// Each exists because the alternative is a ratchet that runs on and derives
+    /// wrong keys. ML-KEM decapsulation never fails, so a restored state that is
+    /// subtly wrong does not announce itself: it rejects every message the peer
+    /// sends, forever, exactly as tampering would.
+    ///
+    /// **What these catch is corruption and *partial* rollback** — one field
+    /// older or otherwise inconsistent with the rest. A rollback to a wholly
+    /// consistent *earlier* snapshot passes every check here, because such a
+    /// record is indistinguishable from the state it once was; the one rollback
+    /// that matters is therefore not detected in this module, and closing it
+    /// needs a monotonic counter outside it. See [`RatchetSnapshot`] for the
+    /// erasure obligation that keeps such a record from existing.
+    pub fn restore(snapshot: RatchetSnapshot) -> Result<Self, RatchetSnapshotError> {
+        let RatchetSnapshot {
+            role,
+            generation,
+            root,
+            send,
+            recv,
+            ephemerals,
+            peer_eph,
+            consumed_peer_generation,
+            gen_ct,
+            next_send_seq,
+            skipped,
+            evicted,
+            abandoned,
+        } = snapshot;
+
+        // The direction of each chain is not stored: it is a function of the
+        // role, and a second copy could disagree with it. Disagreeing here means
+        // deriving one chain for both directions, which is the deletion wedge
+        // `Role` exists to prevent.
+        let send = send.map(|c| c.into_chain(role.send_dir()));
+        let recv = recv.map(|c| c.into_chain(role.recv_dir()));
+
+        // An initiator has had a sending chain since it was constructed and a
+        // recipient a receiving one; neither is ever removed. A snapshot missing
+        // its role's chain is not a state this module can produce.
+        let established = match role {
+            Role::Initiator => send.is_some(),
+            Role::Recipient => recv.is_some(),
+        };
+        if !established {
+            return Err(RatchetSnapshotError::MissingChain { role });
+        }
+
+        for chain in [send.as_ref(), recv.as_ref()].into_iter().flatten() {
+            if chain.next < chain.base {
+                return Err(RatchetSnapshotError::ChainCursorBeforeBase {
+                    base: chain.base,
+                    next: chain.next,
+                });
+            }
+            // One step short of wrapping. `Chain::advance_to` refuses the step
+            // rather than wrapping, so accepting this restores a conversation
+            // that is permanently unable to move in that direction; refusing
+            // here fails at the record instead of at the first message.
+            if chain.next == u64::MAX {
+                return Err(RatchetSnapshotError::ChainCursorExhausted {
+                    direction: chain.direction,
+                });
+            }
+            // A chain is created at the generation the conversation is at or
+            // moves to, and the conversation's own counter never goes back — so
+            // a chain ahead of it is corruption. Accepting one is silent in the
+            // worst direction: the sending chain's generation is what every
+            // outbound header announces, so a chain restored ahead would state a
+            // root the key it carries was not derived from. Loud at the peer,
+            // silent here, and that direction never recovers.
+            if chain.generation > generation {
+                return Err(RatchetSnapshotError::ChainGenerationAhead {
+                    direction: chain.direction,
+                    chain: chain.generation,
+                    generation,
+                });
+            }
+        }
+
+        // The two numbers are separately persisted and always equal, so a
+        // disagreement is corruption. Accepting one would seal messages under
+        // keys at positions their own headers do not claim — a silent
+        // wrong-key failure indistinguishable from tampering at the far end.
+        //
+        // The chainless case is checked too, not skipped: a recipient that has
+        // not yet sent is the one state with no chain to compare against, and it
+        // has exactly one legal sequence number. Leaving it unchecked would let
+        // the only value that can be wrong there be the only one nothing looks
+        // at — and a sequence number restored too high writes a frame into a
+        // page slot no reader will look in, while one restored too low reuses a
+        // position the write-once mapping assumes is untouched.
+        let expected = match send.as_ref() {
+            Some(chain) => chain.next,
+            None => FIRST_RECIPIENT_CHANNEL_SEQ,
+        };
+        if next_send_seq != expected {
+            return Err(RatchetSnapshotError::SendCursorMismatch {
+                expected,
+                next_send_seq,
+            });
+        }
+
+        if ephemerals.len() > EPHEMERAL_WINDOW {
+            return Err(RatchetSnapshotError::TooManyEphemerals {
+                count: ephemerals.len(),
+                max: EPHEMERAL_WINDOW,
+            });
+        }
+
+        // A sending chain and an ephemeral of our own are created together, at
+        // both sites that create either — the initiator's constructor and
+        // `step_forward` — and the window is trimmed from the front only once it
+        // is over-full, so neither outlives the other. Restoring a sending chain
+        // without one leaves a conversation that is established and permanently
+        // unable to send, reporting itself as `NotYetEstablished` — the one error
+        // name that describes the opposite of what happened. (A recipient
+        // legitimately holds neither until it first sends, which is why this is
+        // keyed on the chain rather than the role.)
+        if send.is_some() && ephemerals.is_empty() {
+            return Err(RatchetSnapshotError::MissingOpeningEphemeral);
+        }
+
+        // The mirror on the peer's side. A recipient is handed the initiator's
+        // opening ephemeral at construction and only ever replaces it, so a
+        // recipient holding none is a state this module cannot produce — and one
+        // that restores clean, then reports its first send as `NotYetEstablished`
+        // for want of the chain the step it skipped would have created. The same
+        // error name describing the opposite of what happened, again. (An
+        // initiator legitimately holds none until the first reply, which is why
+        // this is not symmetric.)
+        if role == Role::Recipient && peer_eph.is_none() {
+            return Err(RatchetSnapshotError::MissingPeerEphemeral);
+        }
+
+        let mut held: VecDeque<Ephemeral> = VecDeque::with_capacity(EPHEMERAL_WINDOW);
+        for eph in ephemerals {
+            // The newest is taken from the back, so the order is load-bearing:
+            // restored out of order, our next send would publish an ephemeral
+            // the peer has already stepped past.
+            if let Some(previous) = held.back()
+                && previous.generation >= eph.generation
+            {
+                return Err(RatchetSnapshotError::EphemeralsOutOfOrder {
+                    previous: previous.generation,
+                    next: eph.generation,
+                });
+            }
+            // The same check the initiator's constructor makes, for the same
+            // reason: two halves of different keypairs decapsulate silently to a
+            // pseudorandom secret rather than reporting anything.
+            if !eph.dk.matches(&eph.ek) {
+                return Err(RatchetSnapshotError::MismatchedEphemeral {
+                    generation: eph.generation,
+                });
+            }
+            held.push_back(Ephemeral {
+                generation: eph.generation,
+                ek: eph.ek,
+                dk: eph.dk,
+            });
+        }
+
+        // The generation tags are what an advancing frame is looked up by, and
+        // nothing else in this record relates them to the conversation's own
+        // counter. A tag that drifted restores clean and then rejects every
+        // advancing frame with `UnknownEphemeral`, forever, while outbound keeps
+        // working — so it is bracketed here, on two derivable facts.
+        //
+        // The range: the only thing that lifts `generation` past our newest
+        // ephemeral is a step against that ephemeral, which lifts it by exactly
+        // one, and nothing lowers it. So the conversation sits at the newest
+        // ephemeral's generation or one past it, and nowhere else.
+        if let Some(newest) = held.back().map(|e| e.generation)
+            && (generation < newest || generation > newest.saturating_add(1))
+        {
+            return Err(RatchetSnapshotError::EphemeralGenerationOutOfRange { newest, generation });
+        }
+
+        // The pairing: both sites that mint an ephemeral start a sending chain
+        // at the same generation in the same operation, so the two numbers are
+        // one fact recorded twice — checked here rather than only where it is
+        // written, exactly as `next_send_seq` is. This is what catches a newest
+        // tag one *below* the truth, which the range above cannot: such a tag
+        // still brackets `generation` legally while naming an ephemeral no
+        // advancing frame will ever ask for.
+        if let (Some(send), Some(newest)) = (send.as_ref(), held.back())
+            && send.generation != newest.generation
+        {
+            return Err(RatchetSnapshotError::EphemeralGenerationMismatch {
+                send: send.generation,
+                newest: newest.generation,
+            });
+        }
+
+        Ok(Self {
+            role,
+            generation,
+            root,
+            send,
+            recv,
+            ephemerals: held,
+            peer_eph,
+            consumed_peer_generation,
+            gen_ct,
+            next_send_seq,
+            skipped: SkippedKeys::restore(skipped, evicted)?,
+            abandoned,
+        })
+    }
+}
+
+// ---- persistence (#243) -----------------------------------------------------
+
+/// Magic and format version of an encoded [`RatchetSnapshot`].
+///
+/// **The version is inside the magic, not a field beside it.** A decoder then
+/// has exactly one thing to compare and no way to read a v1 body under a v2
+/// header — a format that cannot say what it is does not survive its first
+/// change, and one that says it twice can contradict itself.
+pub const RATCHET_SNAPSHOT_MAGIC: &[u8] = b"daemonseed/dm/ratchet-state/v1\0";
+
+/// Encoded length of one chain: generation, key, base, cursor.
+const CHAIN_ENTRY_LEN: usize = 4 + CHAIN_KEY_LEN + 8 + 8;
+
+/// Encoded length of one retained ephemeral: generation, and both halves.
+const EPHEMERAL_ENTRY_LEN: usize = 4 + ml_kem::EK_LEN + ml_kem::DK_LEN;
+
+/// Encoded length of one skipped key: its slot's three parts, and the key.
+const SKIPPED_ENTRY_LEN: usize = 4 + 1 + 8 + MESSAGE_KEY_LEN;
+
+/// Encoded length of everything that is present unconditionally: the role, the
+/// generation, the root, and the three counters.
+const FIXED_BODY_LEN: usize = 1 + 4 + ROOT_KEY_LEN + 8 + 8 + 8;
+
+// Discriminants start at one, so a zeroed or truncated-then-padded buffer names
+// no valid role, direction, or presence rather than decoding as the first
+// variant of each.
+const TAG_ABSENT: u8 = 1;
+const TAG_PRESENT: u8 = 2;
+const ROLE_INITIATOR: u8 = 1;
+const ROLE_RECIPIENT: u8 = 2;
+const DIR_A2B: u8 = 1;
+const DIR_B2A: u8 = 2;
+
+/// Why a snapshot could not be decoded or restored.
+///
+/// Separate from [`RatchetError`], whose documented property is that nothing in
+/// it parses bytes. These variants all do. The bytes come from a record this
+/// client wrote, and which its store is expected to seal, so none of them is an
+/// authentication failure and there is no reason to make them uniform — each
+/// names the specific corruption or partial rollback it caught, which is what a
+/// diagnosis needs. None detects a rollback to a wholly consistent earlier
+/// record; see [`Ratchet::restore`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum RatchetSnapshotError {
+    /// The bytes do not begin with [`RATCHET_SNAPSHOT_MAGIC`].
+    BadMagic,
+    /// A field ran off the end of the buffer.
+    Truncated,
+    /// The buffer holds bytes past the end of the snapshot.
+    TrailingBytes { extra: usize },
+    /// A role byte that is neither initiator nor recipient.
+    InvalidRole { value: u8 },
+    /// A direction byte that is neither `a2b` nor `b2a`.
+    InvalidDirection { value: u8 },
+    /// A presence byte that is neither absent nor present.
+    InvalidPresence { value: u8 },
+    /// More retained ephemerals than [`EPHEMERAL_WINDOW`].
+    TooManyEphemerals { count: usize, max: usize },
+    /// More skipped keys than [`SKIPPED_KEY_CAPACITY`].
+    TooManySkippedKeys { count: usize, max: usize },
+    /// Two entries in the skipped-key cache claim one [`KeySlot`].
+    DuplicateSkippedKey { slot: KeySlot },
+    /// The snapshot has no chain in the direction its role always sends or
+    /// receives on.
+    MissingChain { role: Role },
+    /// A snapshot with a sending chain retains no ephemeral of its own. The two
+    /// are created together, and without the ephemeral every send fails —
+    /// reported as a conversation that was never established, which such a
+    /// snapshot is not.
+    MissingOpeningEphemeral,
+    /// A recipient's snapshot holds no ephemeral of the peer's. It has held the
+    /// initiator's opening one since construction, and without it the generation
+    /// step every reply owes is never taken.
+    MissingPeerEphemeral,
+    /// A chain's cursor sits before its own first message.
+    ChainCursorBeforeBase { base: u64, next: u64 },
+    /// A chain's cursor sits at the last sequence number there is, one step from
+    /// wrapping to zero.
+    ChainCursorExhausted { direction: Direction },
+    /// A chain hangs from a generation ahead of the conversation's own. Its
+    /// frames would announce a root the key they carry does not come from.
+    ChainGenerationAhead {
+        direction: Direction,
+        chain: u32,
+        generation: u32,
+    },
+    /// The newest retained ephemeral's generation does not bracket the
+    /// conversation's own: a step can only lift the generation to one past the
+    /// newest ephemeral, and never leaves it behind.
+    EphemeralGenerationOutOfRange { newest: u32, generation: u32 },
+    /// The newest retained ephemeral was not published by the generation the
+    /// sending chain hangs from. The two are created together at every site that
+    /// creates either, so a disagreement names an ephemeral no advancing frame
+    /// can ask for.
+    EphemeralGenerationMismatch { send: u32, newest: u32 },
+    /// The next outbound sequence number disagrees with the sending chain's
+    /// cursor — or, for a recipient that has not sent, with the one sequence
+    /// number it is allowed to start from. No state this module produces can.
+    SendCursorMismatch { expected: u64, next_send_seq: u64 },
+    /// Retained ephemerals are not in ascending generation order, so the newest
+    /// is not the one at the back.
+    EphemeralsOutOfOrder { previous: u32, next: u32 },
+    /// A retained ephemeral's two halves are not a keypair.
+    MismatchedEphemeral { generation: u32 },
+}
+
+impl std::fmt::Display for RatchetSnapshotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BadMagic => write!(f, "not a daemonseed DM ratchet snapshot"),
+            Self::Truncated => write!(f, "the snapshot ends mid-field"),
+            Self::TrailingBytes { extra } => {
+                write!(f, "{extra} bytes follow the end of the snapshot")
+            }
+            Self::InvalidRole { value } => write!(f, "{value} is not a conversation role"),
+            Self::InvalidDirection { value } => write!(f, "{value} is not a message direction"),
+            Self::InvalidPresence { value } => write!(f, "{value} is not a presence marker"),
+            Self::TooManyEphemerals { count, max } => write!(
+                f,
+                "the snapshot holds {count} ephemerals, more than the {max} retained"
+            ),
+            Self::TooManySkippedKeys { count, max } => write!(
+                f,
+                "the snapshot holds {count} skipped keys, more than the cache's {max}"
+            ),
+            Self::DuplicateSkippedKey { slot } => write!(
+                f,
+                "two skipped keys claim generation {} {:?} sequence {}",
+                slot.generation, slot.direction, slot.seq
+            ),
+            Self::MissingChain { role } => {
+                write!(f, "a {role:?} snapshot carries no chain of its own")
+            }
+            Self::MissingOpeningEphemeral => write!(
+                f,
+                "a snapshot that can send retains no ephemeral of its own"
+            ),
+            Self::MissingPeerEphemeral => {
+                write!(f, "a recipient snapshot holds no ephemeral of the peer's")
+            }
+            Self::ChainCursorBeforeBase { base, next } => write!(
+                f,
+                "a chain beginning at {base} has its cursor at {next}, before itself"
+            ),
+            Self::ChainCursorExhausted { direction } => write!(
+                f,
+                "the {direction:?} chain's cursor is at the last sequence number there is"
+            ),
+            Self::ChainGenerationAhead {
+                direction,
+                chain,
+                generation,
+            } => write!(
+                f,
+                "the {direction:?} chain hangs from generation {chain}, ahead of the conversation's {generation}"
+            ),
+            Self::EphemeralGenerationOutOfRange { newest, generation } => write!(
+                f,
+                "generation {generation} is not reachable from a newest ephemeral at {newest}"
+            ),
+            Self::EphemeralGenerationMismatch { send, newest } => write!(
+                f,
+                "the sending chain hangs from generation {send} while the newest ephemeral is {newest}'s"
+            ),
+            Self::SendCursorMismatch {
+                expected,
+                next_send_seq,
+            } => write!(
+                f,
+                "the next sequence is {next_send_seq} where the sending chain says {expected}"
+            ),
+            Self::EphemeralsOutOfOrder { previous, next } => write!(
+                f,
+                "ephemeral generation {next} follows {previous}, so the newest is not last"
+            ),
+            Self::MismatchedEphemeral { generation } => write!(
+                f,
+                "generation {generation}'s ephemeral halves are not a keypair"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RatchetSnapshotError {}
+
+/// One direction's chain as it stands, in a form that can be written down.
+///
+/// Carries no direction: that is a function of the [`Role`], which the snapshot
+/// holds once. Two copies of one fact can disagree, and the disagreement here
+/// derives a single chain for both directions.
+///
+/// **`base` is read on the sending side only.** A sender puts it in every frame
+/// header; a receiver sets it from the header it was given and never looks at it
+/// again, so dropping it from a *receiving* chain's snapshot breaks no test —
+/// verified by mutation, and the one field here with no oracle behind it. It is
+/// persisted anyway, because a `Chain` has a base and a snapshot that silently
+/// invented one would be the kind of divergence between the live and restored
+/// shapes this whole module refuses to have.
+struct ChainSnapshot {
+    generation: u32,
+    key: ChainKey,
+    base: u64,
+    next: u64,
+}
+
+impl ChainSnapshot {
+    fn of(chain: &Chain) -> Self {
+        Self {
+            generation: chain.generation,
+            key: chain.key.clone(),
+            base: chain.base,
+            next: chain.next,
+        }
+    }
+
+    fn into_chain(self, direction: Direction) -> Chain {
+        Chain {
+            generation: self.generation,
+            direction,
+            key: self.key,
+            base: self.base,
+            next: self.next,
+        }
+    }
+}
+
+/// One of our ephemeral keypairs, in a form that can be written down.
+struct EphemeralSnapshot {
+    generation: u32,
+    ek: Box<[u8; ml_kem::EK_LEN]>,
+    dk: EphemeralDecapKey,
+}
+
+impl EphemeralSnapshot {
+    fn of(eph: &Ephemeral) -> Self {
+        Self {
+            generation: eph.generation,
+            ek: eph.ek.clone(),
+            // Copied through a heap buffer rather than `Box::new(*bytes)`, which
+            // would materialise the whole decapsulation key in this stack frame
+            // on the way to the allocation and leave it there.
+            dk: EphemeralDecapKey::new(boxed_copy(eph.dk.as_bytes())),
+        }
+    }
+}
+
+/// Copy `bytes` into a fresh heap allocation without a stack-sized temporary.
+///
+/// `Box::new(*array)` builds the array as a value first, so a secret copied that
+/// way lives in the caller's frame until something overwrites it — the same
+/// hazard [`expand_secret`] exists for. A zeroed `Vec` is allocated on the heap
+/// directly and written in place.
+fn boxed_copy<const N: usize>(bytes: &[u8; N]) -> Box<[u8; N]> {
+    let mut buf = vec![0u8; N].into_boxed_slice();
+    buf.copy_from_slice(bytes);
+    match buf.try_into() {
+        Ok(exact) => exact,
+        // Unreachable: the buffer was allocated at exactly `N`. Not `expect`,
+        // whose message would render the bytes it failed to convert.
+        Err(_) => unreachable!("a buffer allocated at N is N long"),
+    }
+}
+
+/// Everything a conversation needs to resume, and nothing it can rebuild.
+///
+/// ## What is in it, and what deliberately is not
+///
+/// The [`Role`] (which decides both chain directions), the generation, the
+/// current root, both chains with their keys and cursors, our retained
+/// ephemerals, the peer's latest ephemeral and the generation we last stepped
+/// against, the next outbound sequence number, the skipped-key cache in its
+/// eviction order, and the two permanent loss counters.
+///
+/// **Not `ss0`**, which the root already descends from. **Not `AR` or
+/// `chan_id`**: `chan_id` is never serialized anywhere — the AAD carries it and
+/// a receiver recomputes it from the record it opened, and writing it down
+/// collapses the address scatter the whole channel rests on. A caller storing
+/// one snapshot per conversation therefore needs its own local identifier for
+/// the record; `chan_id` is not it.
+///
+/// ## This is key material in the clear
+///
+/// A snapshot holds the root, both chain keys, every skipped message key, and
+/// every retained decapsulation key. Every one of those fields is a zeroize-on-
+/// drop newtype, so dropping the snapshot destroys them — there is deliberately
+/// no `Drop` on the container itself, because that would forbid moving the keys
+/// *out* of it and force [`Ratchet::restore`] to clone every one at the moment
+/// it is trying not to duplicate them.
+///
+/// It is **not [`Clone`]**, for the same reason: a snapshot is already a
+/// complete duplicate of a conversation's live keys, and the one use for a
+/// second copy — encoding it twice — is served by [`Self::encode`] taking
+/// `&self`.
+///
+/// [`Self::encode`] produces the **plaintext** of an at-rest record. It is not
+/// sealed, not authenticated, and not integrity-protected; whatever stores it
+/// must do to it what the profile store does to the mnemonic.
+///
+/// ## A superseded snapshot must be erased, not merely replaced
+///
+/// **A store writes each new snapshot *over* the last one; it does not leave the
+/// last one behind.** A superseded snapshot is not a stale copy of secrets that
+/// are still current — it is a live decryption capability for a generation the
+/// conversation has already left. It carries the root of that generation *and*
+/// the decapsulation keys of the ephemerals published in it, and the ciphertexts
+/// that generation's frames were sealed under are already on the wire and
+/// already recorded by anyone watching. So one recovered superseded snapshot
+/// yields the plaintext of every message from its generation forward, up to our
+/// next self-generated step — which is precisely the forward secrecy the whole
+/// ratchet exists to provide.
+///
+/// That makes erasure-in-place a **requirement on the store**, not a tidiness
+/// preference, and it is the property a naive cadence gets wrong: appending,
+/// journaling, or copy-on-write leaves every past snapshot recoverable, and a
+/// higher cadence then makes the exposure worse rather than better. This module
+/// cannot enforce it — the obligation is stated here because whoever builds the
+/// store is the only one who can meet it.
+pub struct RatchetSnapshot {
+    role: Role,
+    generation: u32,
+    root: RootKey,
+    send: Option<ChainSnapshot>,
+    recv: Option<ChainSnapshot>,
+    ephemerals: Vec<EphemeralSnapshot>,
+    peer_eph: Option<(u32, Box<[u8; ml_kem::EK_LEN]>)>,
+    consumed_peer_generation: Option<u32>,
+    gen_ct: Option<Box<[u8; ml_kem::CT_LEN]>>,
+    next_send_seq: u64,
+    skipped: VecDeque<(KeySlot, MessageKey)>,
+    evicted: u64,
+    abandoned: u64,
+}
+
+impl std::fmt::Debug for RatchetSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RatchetSnapshot")
+            .field("role", &self.role)
+            .field("generation", &self.generation)
+            .field("next_send_seq", &self.next_send_seq)
+            .field("ephemerals", &self.ephemerals.len())
+            .field("skipped", &self.skipped.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl RatchetSnapshot {
+    /// Exact encoded length, so the buffer is allocated once.
+    ///
+    /// A growing `Vec` reallocates and copies, leaving key bytes in freed memory
+    /// that nothing zeroizes — the same reason [`SkippedKeys::new`] pre-allocates.
+    fn encoded_len(&self) -> usize {
+        RATCHET_SNAPSHOT_MAGIC.len()
+            + FIXED_BODY_LEN
+            + 1
+            + self.send.as_ref().map_or(0, |_| CHAIN_ENTRY_LEN)
+            + 1
+            + self.recv.as_ref().map_or(0, |_| CHAIN_ENTRY_LEN)
+            + 1
+            + self.peer_eph.as_ref().map_or(0, |_| 4 + ml_kem::EK_LEN)
+            + 1
+            + self.consumed_peer_generation.map_or(0, |_| 4)
+            + 1
+            + self.gen_ct.as_ref().map_or(0, |_| ml_kem::CT_LEN)
+            + 2
+            + self.ephemerals.len() * EPHEMERAL_ENTRY_LEN
+            + 2
+            + self.skipped.len() * SKIPPED_ENTRY_LEN
+    }
+
+    /// The at-rest encoding: `MAGIC ‖ body`, every integer big-endian, every
+    /// optional field led by a presence marker, every repeated field led by a
+    /// `u16` count.
+    ///
+    /// Fixed-width throughout — a chain key is thirty-two bytes because a chain
+    /// key is thirty-two bytes — so there are no interior length prefixes to
+    /// disagree with the values they describe.
+    ///
+    /// The result is [`Zeroizing`] because it is a set of live keys in the
+    /// clear: a caller that seals it and drops the plaintext leaves nothing
+    /// behind.
+    pub fn encode(&self) -> Zeroizing<Vec<u8>> {
+        let mut out = Vec::with_capacity(self.encoded_len());
+        out.extend_from_slice(RATCHET_SNAPSHOT_MAGIC);
+        out.push(match self.role {
+            Role::Initiator => ROLE_INITIATOR,
+            Role::Recipient => ROLE_RECIPIENT,
+        });
+        out.extend_from_slice(&self.generation.to_be_bytes());
+        out.extend_from_slice(self.root.as_bytes());
+        out.extend_from_slice(&self.next_send_seq.to_be_bytes());
+        out.extend_from_slice(&self.evicted.to_be_bytes());
+        out.extend_from_slice(&self.abandoned.to_be_bytes());
+
+        for chain in [self.send.as_ref(), self.recv.as_ref()] {
+            match chain {
+                None => out.push(TAG_ABSENT),
+                Some(chain) => {
+                    out.push(TAG_PRESENT);
+                    out.extend_from_slice(&chain.generation.to_be_bytes());
+                    out.extend_from_slice(chain.key.as_bytes());
+                    out.extend_from_slice(&chain.base.to_be_bytes());
+                    out.extend_from_slice(&chain.next.to_be_bytes());
+                }
+            }
+        }
+
+        match self.peer_eph.as_ref() {
+            None => out.push(TAG_ABSENT),
+            Some((generation, ek)) => {
+                out.push(TAG_PRESENT);
+                out.extend_from_slice(&generation.to_be_bytes());
+                out.extend_from_slice(ek.as_slice());
+            }
+        }
+
+        match self.consumed_peer_generation {
+            None => out.push(TAG_ABSENT),
+            Some(generation) => {
+                out.push(TAG_PRESENT);
+                out.extend_from_slice(&generation.to_be_bytes());
+            }
+        }
+
+        match self.gen_ct.as_ref() {
+            None => out.push(TAG_ABSENT),
+            Some(ct) => {
+                out.push(TAG_PRESENT);
+                out.extend_from_slice(ct.as_slice());
+            }
+        }
+
+        // Both counts fit a `u16` by construction: one is bounded by
+        // `EPHEMERAL_WINDOW` and the other by `SKIPPED_KEY_CAPACITY`, and the
+        // decoder refuses anything larger before it allocates.
+        out.extend_from_slice(&(self.ephemerals.len() as u16).to_be_bytes());
+        for eph in &self.ephemerals {
+            out.extend_from_slice(&eph.generation.to_be_bytes());
+            out.extend_from_slice(eph.ek.as_slice());
+            out.extend_from_slice(eph.dk.as_bytes());
+        }
+
+        out.extend_from_slice(&(self.skipped.len() as u16).to_be_bytes());
+        for (slot, key) in &self.skipped {
+            out.extend_from_slice(&slot.generation.to_be_bytes());
+            out.push(match slot.direction {
+                Direction::AToB => DIR_A2B,
+                Direction::BToA => DIR_B2A,
+            });
+            out.extend_from_slice(&slot.seq.to_be_bytes());
+            out.extend_from_slice(key.as_bytes());
+        }
+
+        debug_assert_eq!(out.len(), self.encoded_len(), "encoded length drifted");
+        Zeroizing::new(out)
+    }
+
+    /// Read an encoded snapshot back.
+    ///
+    /// Rejects a foreign magic, a field that runs off the end, a count past its
+    /// bound *before* allocating for it, and bytes trailing the end. What it does
+    /// **not** do is check that the state makes sense as a conversation — that is
+    /// [`Ratchet::restore`]'s job, which is why the two are separate calls.
+    ///
+    /// `bytes` still holds every key after this returns; a caller that read them
+    /// from a sealed record should keep them in a buffer it zeroizes.
+    pub fn decode(bytes: &[u8]) -> Result<Self, RatchetSnapshotError> {
+        let mut r = Reader::new(bytes);
+        if r.take(RATCHET_SNAPSHOT_MAGIC.len())? != RATCHET_SNAPSHOT_MAGIC {
+            return Err(RatchetSnapshotError::BadMagic);
+        }
+
+        let role = match r.u8()? {
+            ROLE_INITIATOR => Role::Initiator,
+            ROLE_RECIPIENT => Role::Recipient,
+            value => return Err(RatchetSnapshotError::InvalidRole { value }),
+        };
+        let generation = r.u32()?;
+        let root = r.secret(RootKey)?;
+        let next_send_seq = r.u64()?;
+        let evicted = r.u64()?;
+        let abandoned = r.u64()?;
+
+        let mut chains = [None, None];
+        for slot in &mut chains {
+            *slot = match r.presence()? {
+                false => None,
+                true => Some(ChainSnapshot {
+                    generation: r.u32()?,
+                    key: r.secret(ChainKey)?,
+                    base: r.u64()?,
+                    next: r.u64()?,
+                }),
+            };
+        }
+        let [send, recv] = chains;
+
+        let peer_eph = match r.presence()? {
+            false => None,
+            true => Some((r.u32()?, r.boxed::<{ ml_kem::EK_LEN }>()?)),
+        };
+        let consumed_peer_generation = match r.presence()? {
+            false => None,
+            true => Some(r.u32()?),
+        };
+        let gen_ct = match r.presence()? {
+            false => None,
+            true => Some(r.boxed::<{ ml_kem::CT_LEN }>()?),
+        };
+
+        let count = r.bounded_count(EPHEMERAL_WINDOW, |count, max| {
+            RatchetSnapshotError::TooManyEphemerals { count, max }
+        })?;
+        let mut ephemerals = Vec::with_capacity(count);
+        for _ in 0..count {
+            ephemerals.push(EphemeralSnapshot {
+                generation: r.u32()?,
+                ek: r.boxed::<{ ml_kem::EK_LEN }>()?,
+                dk: EphemeralDecapKey::new(r.boxed::<{ ml_kem::DK_LEN }>()?),
+            });
+        }
+
+        let count = r.bounded_count(SKIPPED_KEY_CAPACITY, |count, max| {
+            RatchetSnapshotError::TooManySkippedKeys { count, max }
+        })?;
+        // At the cache's full capacity, so the deque `restore` adopts never
+        // reallocates and no message key is ever copied between buffers.
+        let mut skipped = VecDeque::with_capacity(SKIPPED_KEY_CAPACITY);
+        for _ in 0..count {
+            let slot = KeySlot {
+                generation: r.u32()?,
+                direction: match r.u8()? {
+                    DIR_A2B => Direction::AToB,
+                    DIR_B2A => Direction::BToA,
+                    value => return Err(RatchetSnapshotError::InvalidDirection { value }),
+                },
+                seq: r.u64()?,
+            };
+            skipped.push_back((slot, r.secret(MessageKey)?));
+        }
+
+        r.finish()?;
+        Ok(Self {
+            role,
+            generation,
+            root,
+            send,
+            recv,
+            ephemerals,
+            peer_eph,
+            consumed_peer_generation,
+            gen_ct,
+            next_send_seq,
+            skipped,
+            evicted,
+            abandoned,
+        })
+    }
+}
+
+/// A bounds-checked forward cursor over an encoded snapshot.
+///
+/// Every read goes through [`Self::take`], so there is one place a length is
+/// checked and no call site does its own slicing.
+struct Reader<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, at: 0 }
+    }
+
+    fn take(&mut self, n: usize) -> Result<&'a [u8], RatchetSnapshotError> {
+        let end = self
+            .at
+            .checked_add(n)
+            .ok_or(RatchetSnapshotError::Truncated)?;
+        let out = self
+            .bytes
+            .get(self.at..end)
+            .ok_or(RatchetSnapshotError::Truncated)?;
+        self.at = end;
+        Ok(out)
+    }
+
+    fn u8(&mut self) -> Result<u8, RatchetSnapshotError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u32(&mut self) -> Result<u32, RatchetSnapshotError> {
+        Ok(u32::from_be_bytes(
+            self.take(4)?.try_into().expect("checked length"),
+        ))
+    }
+
+    fn u64(&mut self) -> Result<u64, RatchetSnapshotError> {
+        Ok(u64::from_be_bytes(
+            self.take(8)?.try_into().expect("checked length"),
+        ))
+    }
+
+    fn presence(&mut self) -> Result<bool, RatchetSnapshotError> {
+        match self.u8()? {
+            TAG_ABSENT => Ok(false),
+            TAG_PRESENT => Ok(true),
+            value => Err(RatchetSnapshotError::InvalidPresence { value }),
+        }
+    }
+
+    /// A count, refused past `max` **before** anything is reserved for it.
+    fn bounded_count(
+        &mut self,
+        max: usize,
+        err: impl FnOnce(usize, usize) -> RatchetSnapshotError,
+    ) -> Result<usize, RatchetSnapshotError> {
+        let count = u16::from_be_bytes(self.take(2)?.try_into().expect("checked length")) as usize;
+        if count > max {
+            return Err(err(count, max));
+        }
+        Ok(count)
+    }
+
+    /// Read `N` bytes into a key class, zeroizing the transient stack buffer —
+    /// the same shape as [`expand_secret`], and for the same reason.
+    fn secret<const N: usize, T>(
+        &mut self,
+        wrap: impl FnOnce([u8; N]) -> T,
+    ) -> Result<T, RatchetSnapshotError> {
+        let read = self.take(N)?;
+        let mut buf = [0u8; N];
+        buf.copy_from_slice(read);
+        let out = wrap(buf);
+        buf.zeroize();
+        Ok(out)
+    }
+
+    /// Read `N` bytes straight into a heap allocation, with no stack copy at all.
+    fn boxed<const N: usize>(&mut self) -> Result<Box<[u8; N]>, RatchetSnapshotError> {
+        let read = self.take(N)?;
+        let mut buf = vec![0u8; N].into_boxed_slice();
+        buf.copy_from_slice(read);
+        match buf.try_into() {
+            Ok(exact) => Ok(exact),
+            Err(_) => unreachable!("a buffer allocated at N is N long"),
+        }
+    }
+
+    fn finish(self) -> Result<(), RatchetSnapshotError> {
+        match self.bytes.len().checked_sub(self.at) {
+            Some(0) | None => Ok(()),
+            Some(extra) => Err(RatchetSnapshotError::TrailingBytes { extra }),
+        }
     }
 }
 
@@ -2346,5 +3347,704 @@ mod tests {
         assert!(!skipped.is_empty());
         skipped.take(&slot(0, 0));
         assert!(skipped.is_empty());
+    }
+
+    // ---- surviving a restart (#243) ------------------------------------------
+
+    /// The pair, plus the material a client holds *without* a snapshot: the
+    /// first-contact secret and the initiator's opening ephemeral, which § v5
+    /// (V4-2) already requires persisting. Everything the restart tests do to
+    /// rebuild from that alone is therefore the best case, not a strawman.
+    #[allow(clippy::type_complexity)]
+    fn pair_and_opening_material() -> (
+        Ratchet,
+        Ratchet,
+        [u8; 32],
+        [u8; ml_kem::EK_LEN],
+        [u8; ml_kem::DK_LEN],
+    ) {
+        let ss0 = ss(0x11);
+        let (ek, dk) = opening_ephemeral();
+        let initiator =
+            Ratchet::initiator(&ss0, Box::new(ek), EphemeralDecapKey::new(Box::new(dk))).unwrap();
+        let recipient = Ratchet::recipient(&ss0, Box::new(ek)).unwrap();
+        (initiator, recipient, ss0, ek, dk)
+    }
+
+    /// Take a conversation across a restart the way a client would: snapshot,
+    /// encode, drop everything, decode, restore. The encoding is on the path
+    /// deliberately — a round trip that skipped it would prove the shape and not
+    /// the format.
+    fn through_a_restart(live: &Ratchet) -> Ratchet {
+        let encoded = live.snapshot().encode();
+        let decoded = RatchetSnapshot::decode(&encoded).expect("the snapshot decodes");
+        Ratchet::restore(decoded).expect("the snapshot restores")
+    }
+
+    /// Drive the pair to the state a restart actually has to survive: two
+    /// generation steps behind it, one of B's messages sitting unread in A's
+    /// skipped-key cache, and one more from B in flight that A has not seen.
+    ///
+    /// Returns the straggler and the in-flight frame, both undelivered.
+    fn conversation_mid_flight(a: &mut Ratchet, b: &mut Ratchet) -> (Outbound, Outbound) {
+        deliver_ok(b, &a.send_next().unwrap()); // generation 0, sequence 1
+        let straggler = b.send_next().unwrap(); // generation 1, sequence 0
+        let after_it = b.send_next().unwrap(); // generation 1, sequence 1
+        deliver_ok(a, &after_it); // out of order: the straggler's key is kept
+        deliver_ok(b, &a.send_next().unwrap()); // A steps to generation 2
+        deliver_ok(b, &a.send_next().unwrap()); // generation 2, sequence 3
+        let in_flight = b.send_next().unwrap(); // B steps to generation 3
+        (straggler, in_flight)
+    }
+
+    /// **The oracle for #243.** A restarts; B does not, and never learns that A
+    /// did. Everything that made the conversation live has to survive the round
+    /// trip: the root and both chains, the ephemeral B's next step encapsulates
+    /// to, the key for a message that arrived out of order before the restart,
+    /// and the sequence numbering.
+    #[test]
+    fn a_restored_ratchet_keeps_talking_to_a_peer_that_never_restarted() {
+        let (mut a, mut b) = pair();
+        let (straggler, in_flight) = conversation_mid_flight(&mut a, &mut b);
+
+        let before = a.snapshot();
+        assert_eq!(before.generation, 2);
+        assert_eq!(a.losses().pending, 1, "a key is held for the straggler");
+
+        let restored = through_a_restart(&a);
+        drop(a);
+        let mut a = restored;
+
+        // A frame from B that steps a generation, decapsulated with an ephemeral
+        // A published before the restart.
+        deliver_ok(&mut a, &in_flight);
+        assert_eq!(a.generation(), 3);
+
+        // And the message that was already skipped past, out of the restored
+        // cache.
+        deliver_ok(&mut a, &straggler);
+        assert_eq!(a.losses().pending, 0, "the restored cache was drained");
+
+        // A sends again: the sequence continues rather than restarting, the
+        // generation step lands, and B — which never restarted — opens it.
+        let after = a.send_next().unwrap();
+        assert_eq!(after.header.seq, 4, "the sequence restarted");
+        assert_eq!(after.header.generation, 4);
+        deliver_ok(&mut b, &after);
+
+        // And B's reply still opens at A, so the channel is live both ways.
+        deliver_ok(&mut a, &b.send_next().unwrap());
+    }
+
+    /// The state of the world **before** the fix, pinned so the defect cannot
+    /// quietly come back as a "simplification". A client that kept only what the
+    /// frozen design already asks it to keep — `ss0` and its opening ephemeral —
+    /// cannot rebuild a running conversation from them.
+    ///
+    /// The failure is doubly silent: the rebuilt ratchet reports no losses at
+    /// all, so nothing on either end distinguishes it from a healthy channel.
+    #[test]
+    fn rebuilding_from_ss0_alone_leaves_the_conversation_permanently_dead() {
+        let (mut a, mut b, ss0, ek, dk) = pair_and_opening_material();
+        let (_straggler, in_flight) = conversation_mid_flight(&mut a, &mut b);
+        drop(a);
+
+        // The best a client can do without a snapshot.
+        let mut rebuilt =
+            Ratchet::initiator(&ss0, Box::new(ek), EphemeralDecapKey::new(Box::new(dk))).unwrap();
+
+        // Inbound: B's next frame needs the ephemeral A published at generation
+        // 2, and the rebuilt state holds only the opening one.
+        let err = deliver(&mut rebuilt, &in_flight).unwrap_err();
+        assert!(
+            matches!(err, RatchetError::UnknownEphemeral { generation: 3 }),
+            "got {err:?}"
+        );
+
+        // Outbound: the sequence restarts at the opening message's, at a
+        // generation B has long since moved past.
+        let out = rebuilt.send_next().unwrap();
+        assert_eq!(out.header.seq, FIRST_INITIATOR_CHANNEL_SEQ);
+        assert_eq!(out.header.generation, 0);
+        let err = deliver(&mut b, &out).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RatchetError::GenerationTooOld {
+                    frame: 0,
+                    current: 2
+                }
+            ),
+            "got {err:?}"
+        );
+
+        // And nothing anywhere says so.
+        assert_eq!(
+            rebuilt.losses(),
+            DeliveryLosses {
+                pending: 0,
+                evicted: 0,
+                abandoned: 0
+            },
+            "a dead conversation reported itself healthy"
+        );
+    }
+
+    /// The peer's ephemeral is what a generation step encapsulates to, and
+    /// losing it costs no message — it costs the *heal*. A restored ratchet that
+    /// dropped it would keep sending happily on the old root, so nothing but the
+    /// generation number reports the loss.
+    #[test]
+    fn a_restored_ratchet_still_takes_the_generation_step_it_owed() {
+        let (mut a, mut b) = pair();
+        deliver_ok(&mut b, &a.send_next().unwrap());
+        deliver_ok(&mut a, &b.send_next().unwrap());
+
+        let mut a = through_a_restart(&a);
+
+        let out = a.send_next().unwrap();
+        assert_eq!(out.header.generation, 2, "the owed step was not taken");
+        assert!(out.eph_ct.is_some(), "a step must carry its ciphertext");
+        deliver_ok(&mut b, &out);
+    }
+
+    /// The mirror image: a step already taken must not be taken again. A peer
+    /// repeats one ephemeral on every message of its generation, so a restored
+    /// ratchet that forgot which one it had consumed would encapsulate to a key
+    /// the peer has moved past — and the peer cannot derive that step at all.
+    #[test]
+    fn a_restored_ratchet_does_not_re_step_against_an_ephemeral_it_already_used() {
+        let (mut a, mut b) = pair();
+        deliver_ok(&mut b, &a.send_next().unwrap());
+        deliver_ok(&mut a, &b.send_next().unwrap());
+        deliver_ok(&mut b, &a.send_next().unwrap()); // A steps to generation 2
+
+        let mut a = through_a_restart(&a);
+
+        let out = a.send_next().unwrap();
+        assert_eq!(out.header.generation, 2, "the ratchet stepped twice");
+        assert_eq!(out.header.seq, 3);
+        deliver_ok(&mut b, &out);
+    }
+
+    /// Every message of a generation repeats the ciphertext that created it, so
+    /// that losing the one message which opened the generation costs only that
+    /// message. A restart must not break the repetition: here B never receives
+    /// the message that opened generation 2, and the first message A sends
+    /// *after* restoring has to establish it on its own.
+    ///
+    /// The chain base rides the same path — B has to be told where the new chain
+    /// starts, or it walks the chain from the wrong position and derives a key
+    /// that does not open anything.
+    #[test]
+    fn a_restored_ratchet_still_repeats_its_generation_ciphertext() {
+        let (mut a, mut b) = pair();
+        deliver_ok(&mut b, &a.send_next().unwrap());
+        deliver_ok(&mut a, &b.send_next().unwrap());
+        let _lost = a.send_next().unwrap(); // opens generation 2; B never sees it
+
+        let mut a = through_a_restart(&a);
+
+        let out = a.send_next().unwrap();
+        assert_eq!(out.header.generation, 2);
+        assert_eq!(out.header.chain_base, 2, "the chain's start was forgotten");
+        assert!(
+            out.eph_ct.is_some(),
+            "the generation ciphertext was not repeated"
+        );
+        deliver_ok(&mut b, &out);
+    }
+
+    /// The two permanent loss counts are what stand between a user and a
+    /// conversation that quietly ate two hundred messages. A restart that reset
+    /// them would make the damage unreportable — and this is the receiving side,
+    /// so it also covers restoring a recipient, whose sending chain does not
+    /// exist yet.
+    #[test]
+    fn a_restored_ratchet_reports_the_losses_it_inherited() {
+        let (mut a, mut b) = pair();
+
+        // Three rounds of "A runs ahead, B collects only the newest": the first
+        // fills half the cache, the second fills it, the third starts evicting.
+        for _ in 0..3 {
+            let sent: Vec<_> = (0..(MAX_SKIP + 20))
+                .map(|_| a.send_next().unwrap())
+                .collect();
+            deliver_ok(&mut b, sent.last().unwrap());
+        }
+
+        let before = b.losses();
+        assert!(before.pending > 0 && before.evicted > 0 && before.abandoned > 0);
+
+        let b = through_a_restart(&b);
+        assert_eq!(b.losses(), before, "the inherited losses were not carried");
+        assert_eq!(b.role(), Role::Recipient);
+
+        // And it is a working conversation, not just a working report.
+        let mut b = b;
+        deliver_ok(&mut a, &b.send_next().unwrap());
+        deliver_ok(&mut b, &a.send_next().unwrap());
+    }
+
+    // ---- the at-rest encoding -------------------------------------------------
+
+    /// The format says what it is, and a decoder handed a version it does not
+    /// know says so rather than reading the next field's bytes as this one's.
+    #[test]
+    fn the_snapshot_encoding_is_versioned() {
+        assert_eq!(RATCHET_SNAPSHOT_MAGIC, b"daemonseed/dm/ratchet-state/v1\0");
+
+        let (mut a, mut b) = pair();
+        conversation_mid_flight(&mut a, &mut b);
+        let mut bytes = a.snapshot().encode().to_vec();
+
+        assert!(RatchetSnapshot::decode(&bytes).is_ok());
+        bytes[..RATCHET_SNAPSHOT_MAGIC.len()].copy_from_slice(b"daemonseed/dm/ratchet-state/v2\0");
+        assert_eq!(
+            RatchetSnapshot::decode(&bytes).unwrap_err(),
+            RatchetSnapshotError::BadMagic
+        );
+    }
+
+    /// The length is computed, not discovered, so the buffer is allocated once
+    /// and never reallocated — a growing `Vec` leaves key bytes in freed memory
+    /// that nothing zeroizes.
+    #[test]
+    fn the_encoded_length_is_exact() {
+        let (mut a, mut b) = pair();
+        conversation_mid_flight(&mut a, &mut b);
+        let snapshot = a.snapshot();
+        assert_eq!(snapshot.encode().len(), snapshot.encoded_len());
+
+        // And on the sparsest state there is, where every optional field really
+        // is absent: a recipient before it has sent or received anything, so no
+        // sending chain, no peer ephemeral, no consumed generation, no
+        // generation ciphertext, no retained ephemerals and an empty cache.
+        let sparse = pair().1.snapshot();
+        assert!(
+            sparse.send.is_none()
+                && sparse.consumed_peer_generation.is_none()
+                && sparse.gen_ct.is_none()
+                && sparse.ephemerals.is_empty()
+                && sparse.skipped.is_empty(),
+            "this is meant to be the all-absent case: {sparse:?}"
+        );
+        assert_eq!(sparse.encode().len(), sparse.encoded_len());
+        assert!(RatchetSnapshot::decode(&sparse.encode()).is_ok());
+    }
+
+    /// One byte short and one byte long are different failures, and neither is
+    /// allowed to be silent: a short record would read the next field off the
+    /// end, and a long one is a record this code did not write.
+    #[test]
+    fn a_truncated_or_padded_snapshot_is_refused() {
+        let (mut a, mut b) = pair();
+        conversation_mid_flight(&mut a, &mut b);
+        let bytes = a.snapshot().encode();
+
+        assert_eq!(
+            RatchetSnapshot::decode(&bytes[..bytes.len() - 1]).unwrap_err(),
+            RatchetSnapshotError::Truncated
+        );
+        assert_eq!(
+            RatchetSnapshot::decode(&[]).unwrap_err(),
+            RatchetSnapshotError::Truncated
+        );
+
+        let mut padded = bytes.to_vec();
+        padded.push(0);
+        assert_eq!(
+            RatchetSnapshot::decode(&padded).unwrap_err(),
+            RatchetSnapshotError::TrailingBytes { extra: 1 }
+        );
+    }
+
+    /// A count is checked against its bound **before** anything is reserved for
+    /// it, so a corrupt record cannot make this process allocate.
+    #[test]
+    fn an_oversized_count_is_refused_before_it_is_reserved() {
+        let (mut a, mut b) = pair();
+        conversation_mid_flight(&mut a, &mut b);
+        let snapshot = a.snapshot();
+        let (ephemerals, skipped) = (snapshot.ephemerals.len(), snapshot.skipped.len());
+        let bytes = snapshot.encode();
+
+        let skipped_count_at = bytes.len() - 2 - skipped * SKIPPED_ENTRY_LEN;
+        let mut broken = bytes.to_vec();
+        broken[skipped_count_at..skipped_count_at + 2].copy_from_slice(&u16::MAX.to_be_bytes());
+        assert_eq!(
+            RatchetSnapshot::decode(&broken).unwrap_err(),
+            RatchetSnapshotError::TooManySkippedKeys {
+                count: u16::MAX as usize,
+                max: SKIPPED_KEY_CAPACITY,
+            }
+        );
+
+        let eph_count_at = skipped_count_at - 2 - ephemerals * EPHEMERAL_ENTRY_LEN;
+        let mut broken = bytes.to_vec();
+        broken[eph_count_at..eph_count_at + 2].copy_from_slice(&u16::MAX.to_be_bytes());
+        assert_eq!(
+            RatchetSnapshot::decode(&broken).unwrap_err(),
+            RatchetSnapshotError::TooManyEphemerals {
+                count: u16::MAX as usize,
+                max: EPHEMERAL_WINDOW,
+            }
+        );
+    }
+
+    /// Every discriminant starts at one, so a zeroed byte names no valid variant
+    /// rather than decoding as the first of each.
+    #[test]
+    fn a_corrupt_discriminant_is_refused() {
+        let (mut a, mut b) = pair();
+        conversation_mid_flight(&mut a, &mut b);
+        let bytes = a.snapshot().encode();
+
+        let mut broken = bytes.to_vec();
+        broken[RATCHET_SNAPSHOT_MAGIC.len()] = 0;
+        assert_eq!(
+            RatchetSnapshot::decode(&broken).unwrap_err(),
+            RatchetSnapshotError::InvalidRole { value: 0 }
+        );
+
+        let mut broken = bytes.to_vec();
+        broken[RATCHET_SNAPSHOT_MAGIC.len() + FIXED_BODY_LEN] = 0;
+        assert_eq!(
+            RatchetSnapshot::decode(&broken).unwrap_err(),
+            RatchetSnapshotError::InvalidPresence { value: 0 }
+        );
+    }
+
+    /// The conversation's address root and channel identifier must not be
+    /// derivable from a stored snapshot: `chan_id` is never serialized anywhere,
+    /// and writing `AR` down beside the keys would put the whole address graph
+    /// in one record.
+    #[test]
+    fn a_snapshot_carries_no_channel_identifier() {
+        let (mut a, mut b) = pair();
+        conversation_mid_flight(&mut a, &mut b);
+        let bytes = a.snapshot().encode();
+
+        let roots = crate::dm::firstcontact::derive_channel_roots(&ss(0x11)).unwrap();
+        assert!(
+            !bytes
+                .windows(roots.chan_id.len())
+                .any(|w| w == roots.chan_id),
+            "chan_id must never be serialized"
+        );
+        assert!(
+            !bytes.windows(roots.ar.len()).any(|w| w == roots.ar),
+            "the address root does not belong in the key record"
+        );
+    }
+
+    /// A snapshot is one `debug!` away from a log file, exactly as the keys
+    /// inside it are.
+    #[test]
+    fn a_snapshot_does_not_render_its_secrets() {
+        let (mut a, mut b) = pair();
+        conversation_mid_flight(&mut a, &mut b);
+        let snapshot = a.snapshot();
+        let rendered = format!("{snapshot:?}");
+
+        assert!(!rendered.contains(&hex::encode(snapshot.root.as_bytes())));
+        for (_, key) in &snapshot.skipped {
+            assert!(!rendered.contains(&hex::encode(key.as_bytes())));
+        }
+        assert!(rendered.contains("Initiator"));
+    }
+
+    // ---- integrity checks on our own record ----------------------------------
+
+    /// ML-KEM never reports a mismatch, so a snapshot whose ephemeral halves
+    /// drifted apart would restore cleanly and then reject every reply forever.
+    /// It is caught at the point of the mistake instead, as at construction.
+    #[test]
+    fn a_snapshot_whose_ephemeral_halves_disagree_is_refused() {
+        let (mut a, mut b) = pair();
+        conversation_mid_flight(&mut a, &mut b);
+        let mut snapshot = a.snapshot();
+
+        // A whole decapsulation key from a different keypair, which is the shape
+        // the mistake actually takes — a record assembled from two sources, or
+        // an index off by one.
+        let (_other_ek, other_dk) = opening_ephemeral();
+        let generation = snapshot.ephemerals[0].generation;
+        snapshot.ephemerals[0].dk = EphemeralDecapKey::new(Box::new(other_dk));
+
+        assert_eq!(
+            Ratchet::restore(snapshot).unwrap_err(),
+            RatchetSnapshotError::MismatchedEphemeral { generation }
+        );
+    }
+
+    /// The newest ephemeral is taken from the back of the queue, so restoring
+    /// them out of order would publish one the peer has already stepped past.
+    #[test]
+    fn ephemerals_restored_out_of_order_are_refused() {
+        let (mut a, mut b) = pair();
+        conversation_mid_flight(&mut a, &mut b);
+        let mut snapshot = a.snapshot();
+        assert!(snapshot.ephemerals.len() >= 2, "the test needs two");
+
+        let (previous, next) = (
+            snapshot.ephemerals[1].generation,
+            snapshot.ephemerals[0].generation,
+        );
+        snapshot.ephemerals.reverse();
+        assert_eq!(
+            Ratchet::restore(snapshot).unwrap_err(),
+            RatchetSnapshotError::EphemeralsOutOfOrder { previous, next }
+        );
+    }
+
+    /// An initiator has had a sending chain since it was constructed; a snapshot
+    /// without one is not a state this module produces.
+    #[test]
+    fn a_snapshot_missing_its_own_chain_is_refused() {
+        let (mut a, mut b) = pair();
+        conversation_mid_flight(&mut a, &mut b);
+        let mut snapshot = a.snapshot();
+        snapshot.send = None;
+
+        assert_eq!(
+            Ratchet::restore(snapshot).unwrap_err(),
+            RatchetSnapshotError::MissingChain {
+                role: Role::Initiator
+            }
+        );
+    }
+
+    /// The sending chain's cursor and the next outbound sequence number are two
+    /// recordings of one fact. Accepting a disagreement would seal messages under
+    /// keys at positions their own headers do not claim.
+    #[test]
+    fn a_send_cursor_disagreeing_with_the_sequence_is_refused() {
+        let (mut a, mut b) = pair();
+        conversation_mid_flight(&mut a, &mut b);
+        let mut snapshot = a.snapshot();
+        let expected = snapshot.send.as_ref().unwrap().next;
+        snapshot.next_send_seq += 1;
+
+        assert_eq!(
+            Ratchet::restore(snapshot).unwrap_err(),
+            RatchetSnapshotError::SendCursorMismatch {
+                expected,
+                next_send_seq: expected + 1,
+            }
+        );
+    }
+
+    /// The one state with no sending chain to compare against — a recipient that
+    /// has not sent — is checked against the only sequence number it may hold,
+    /// rather than skipped for want of something to compare to.
+    #[test]
+    fn a_recipient_that_has_not_sent_may_hold_only_its_first_sequence() {
+        let (_a, b) = pair();
+        let mut snapshot = b.snapshot();
+        assert!(
+            snapshot.send.is_none(),
+            "the test needs a recipient pre-send"
+        );
+        snapshot.next_send_seq = 9999;
+
+        assert_eq!(
+            Ratchet::restore(snapshot).unwrap_err(),
+            RatchetSnapshotError::SendCursorMismatch {
+                expected: FIRST_RECIPIENT_CHANNEL_SEQ,
+                next_send_seq: 9999,
+            }
+        );
+    }
+
+    /// An initiator has retained an ephemeral since construction, so a snapshot
+    /// without one is a state this module cannot produce — and one that would
+    /// otherwise restore cleanly and then report every failed send as a
+    /// conversation that was never established.
+    #[test]
+    fn an_initiator_snapshot_without_its_ephemeral_is_refused() {
+        let (mut a, mut b) = pair();
+        conversation_mid_flight(&mut a, &mut b);
+        let mut snapshot = a.snapshot();
+        snapshot.ephemerals.clear();
+
+        assert_eq!(
+            Ratchet::restore(snapshot).unwrap_err(),
+            RatchetSnapshotError::MissingOpeningEphemeral
+        );
+    }
+
+    /// A chain cannot have reached a position before its own first message.
+    #[test]
+    fn a_chain_cursor_before_its_base_is_refused() {
+        let (mut a, mut b) = pair();
+        conversation_mid_flight(&mut a, &mut b);
+        let mut snapshot = a.snapshot();
+        let chain = snapshot.recv.as_mut().unwrap();
+        chain.base = chain.next + 1;
+        let (base, next) = (chain.base, chain.next);
+
+        assert_eq!(
+            Ratchet::restore(snapshot).unwrap_err(),
+            RatchetSnapshotError::ChainCursorBeforeBase { base, next }
+        );
+    }
+
+    /// A chain's generation is what its frames announce. Restored ahead of the
+    /// conversation's own, every outbound header claims a root the key it carries
+    /// was not derived from: loud at the peer, silent at us, and that direction
+    /// never recovers.
+    #[test]
+    fn a_chain_ahead_of_the_conversations_generation_is_refused() {
+        let (mut a, mut b) = pair();
+        conversation_mid_flight(&mut a, &mut b);
+        let generation = a.generation();
+        let mut snapshot = a.snapshot();
+        snapshot.send.as_mut().unwrap().generation = 4242;
+
+        assert_eq!(
+            Ratchet::restore(snapshot).unwrap_err(),
+            RatchetSnapshotError::ChainGenerationAhead {
+                direction: Role::Initiator.send_dir(),
+                chain: 4242,
+                generation,
+            }
+        );
+    }
+
+    /// Nothing else in the record relates an ephemeral's generation tag to the
+    /// conversation's own. A drifted tag restores clean and then answers every
+    /// advancing frame with `UnknownEphemeral`, forever, while outbound carries
+    /// on working — the failure that looks exactly like a peer gone quiet.
+    #[test]
+    fn an_ephemeral_tagged_past_the_conversations_generation_is_refused() {
+        let (mut a, mut b) = pair();
+        conversation_mid_flight(&mut a, &mut b);
+        let generation = a.generation();
+        let mut snapshot = a.snapshot();
+        let newest = generation + 2;
+        snapshot.ephemerals.last_mut().unwrap().generation = newest;
+
+        assert_eq!(
+            Ratchet::restore(snapshot).unwrap_err(),
+            RatchetSnapshotError::EphemeralGenerationOutOfRange { newest, generation }
+        );
+    }
+
+    /// The same drift one generation **low**, which the range check above cannot
+    /// see: a newest tag at `generation - 1` still brackets the conversation
+    /// legally, because that is exactly where a party sits between receiving a
+    /// step and taking its own. Only the sending chain contradicts it — the two
+    /// are minted in one operation — and that is what this catches.
+    #[test]
+    fn an_ephemeral_tagged_below_its_sending_chain_is_refused() {
+        let (mut a, mut b) = pair();
+        conversation_mid_flight(&mut a, &mut b);
+        let mut snapshot = a.snapshot();
+        let send = snapshot.send.as_ref().unwrap().generation;
+        let newest = send - 1;
+        snapshot.ephemerals.last_mut().unwrap().generation = newest;
+
+        // The range check passes this: it is a legal bracket.
+        assert!(snapshot.generation >= newest && snapshot.generation <= newest + 1);
+        assert_eq!(
+            Ratchet::restore(snapshot).unwrap_err(),
+            RatchetSnapshotError::EphemeralGenerationMismatch { send, newest }
+        );
+    }
+
+    /// The mirror of the initiator's own opening ephemeral: a recipient is handed
+    /// the peer's at construction and only ever replaces it. Without it the first
+    /// send takes no generation step, so it finds no sending chain and reports a
+    /// conversation that was never established — which this one was.
+    #[test]
+    fn a_recipient_snapshot_without_the_peers_ephemeral_is_refused() {
+        let (_a, b) = pair();
+        let mut snapshot = b.snapshot();
+        assert!(snapshot.peer_eph.is_some(), "the test needs one to remove");
+        snapshot.peer_eph = None;
+
+        assert_eq!(
+            Ratchet::restore(snapshot).unwrap_err(),
+            RatchetSnapshotError::MissingPeerEphemeral
+        );
+    }
+
+    /// A cursor one step from the end of the sequence space. `advance_to` refuses
+    /// the step rather than wrapping it, so restoring this would rebuild a
+    /// conversation permanently unable to send — caught at the record instead.
+    #[test]
+    fn a_chain_cursor_at_the_last_sequence_number_is_refused() {
+        let (mut a, mut b) = pair();
+        conversation_mid_flight(&mut a, &mut b);
+        let mut snapshot = a.snapshot();
+        snapshot.send.as_mut().unwrap().next = u64::MAX;
+        snapshot.next_send_seq = u64::MAX;
+
+        assert_eq!(
+            Ratchet::restore(snapshot).unwrap_err(),
+            RatchetSnapshotError::ChainCursorExhausted {
+                direction: Role::Initiator.send_dir(),
+            }
+        );
+    }
+
+    /// **This crate's release profile sets no `overflow-checks`**, so a wrapping
+    /// cursor is not a debug panic there — it is a silent return to sequence
+    /// zero, whose write-once page slot is already spoken for. The step is
+    /// refused instead.
+    #[test]
+    fn advancing_to_the_last_sequence_number_is_refused_rather_than_wrapping() {
+        let last = Chain {
+            generation: 0,
+            direction: Direction::AToB,
+            key: a2b_chain(0x11),
+            base: 0,
+            next: u64::MAX - 1,
+        };
+
+        // The position before it is ordinary, and lands the cursor on the last.
+        let (_, _, _, at_the_end) = last.clone().advance_to(u64::MAX - 1).unwrap();
+        assert_eq!(at_the_end.next, u64::MAX);
+
+        let err = at_the_end.advance_to(u64::MAX).unwrap_err();
+        assert!(
+            matches!(err, RatchetError::SequenceExhausted { seq } if seq == u64::MAX),
+            "expected a refusal naming the position, got {err:?}"
+        );
+    }
+
+    /// `insert` keeps one entry per slot, and `peek` / `take` stop at the first
+    /// match — so a second entry for one slot is capacity nothing can reach,
+    /// counted by `losses().pending` as a message still recoverable.
+    #[test]
+    fn a_cache_holding_two_keys_for_one_slot_is_refused() {
+        let mut entries = VecDeque::new();
+        entries.push_back((slot(0, 7), mk_key(1)));
+        entries.push_back((slot(0, 8), mk_key(2)));
+        entries.push_back((slot(0, 7), mk_key(3)));
+
+        assert_eq!(
+            SkippedKeys::restore(entries, 0).unwrap_err(),
+            RatchetSnapshotError::DuplicateSkippedKey { slot: slot(0, 7) }
+        );
+    }
+
+    /// The cache is bounded, and a record claiming more entries than it holds is
+    /// refused rather than silently evicting keys we ourselves wrote.
+    #[test]
+    fn a_cache_larger_than_its_bound_is_refused() {
+        let mut entries = VecDeque::new();
+        for n in 0..=SKIPPED_KEY_CAPACITY as u64 {
+            entries.push_back((slot(0, n), mk_key(n)));
+        }
+        let count = entries.len();
+        assert_eq!(
+            SkippedKeys::restore(entries, 0).unwrap_err(),
+            RatchetSnapshotError::TooManySkippedKeys {
+                count,
+                max: SKIPPED_KEY_CAPACITY,
+            }
+        );
     }
 }

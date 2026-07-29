@@ -68,6 +68,28 @@ work lives in the project lead's vault manifest, not here.
 
 ### Added
 
+- DM ratchet state survives a restart — `daemonseed_core::dm::ratchet`
+  (`Ratchet::snapshot`, `Ratchet::restore`, `RatchetSnapshot`,
+  `RatchetSnapshotError`, `RATCHET_SNAPSHOT_MAGIC`). `snapshot()` captures the
+  role, generation, root, both chains with their keys and cursors, the retained
+  ephemerals, the peer ephemeral and last-consumed generation, the next outbound
+  sequence number, the skipped-key cache in eviction order, and the evicted and
+  abandoned counts. `RatchetSnapshot::encode() -> Zeroizing<Vec<u8>>` and
+  `decode(&[u8])` are the at-rest form: `RATCHET_SNAPSHOT_MAGIC` then a
+  fixed-width big-endian body, optional fields led by a presence marker and
+  repeated fields by a `u16` count refused past its bound before allocation.
+  The encoding is plaintext key material and carries no `chan_id` and no `AR`;
+  a store seals it and erases each superseded snapshot in place. `restore()`
+  rejects a snapshot missing its role's chain, a sending chain with no ephemeral
+  of its own, a recipient with no peer ephemeral, a chain cursor before its base
+  or at `u64::MAX`, a chain hanging from a generation ahead of the
+  conversation's, a next sequence number disagreeing with the sending chain's
+  cursor — or, with no sending chain, with `FIRST_RECIPIENT_CHANNEL_SEQ` —
+  ephemerals out of ascending order or past `EPHEMERAL_WINDOW`, an ephemeral
+  whose halves are not a keypair, a newest ephemeral whose generation neither
+  brackets the conversation's nor matches the sending chain's, a cache past
+  `SKIPPED_KEY_CAPACITY`, and two cache entries claiming one `KeySlot`. (#243)
+
 - DM delivery-acknowledgement core — `daemonseed_core::dm::ack`
   (`derive_seal_key`, `ack_sig_input`, `AckState`, `PeerAckOutcome`,
   `DmAckSealKey`, `AckError`, `MAX_ACK_RUNS`). `derive_seal_key(AR, dir)` is
@@ -147,8 +169,10 @@ work lives in the project lead's vault manifest, not here.
   an opening ephemeral whose halves are not a keypair. `RatchetError`
   distinguishes `AlreadyConsumed`, `GenerationTooOld`, `SeqBeforeChainBase`,
   `BacklogTooWide`, `MissingCiphertext`, `UnknownEphemeral`, `MismatchedEphemeral`,
-  `GenerationExhausted` and `NotYetEstablished`. The wire frame and page
-  addressing are not wired yet. (#234, ISC-C38)
+  `GenerationExhausted`, `SequenceExhausted` and `NotYetEstablished`. A chain
+  refuses to step past the last sequence number rather than wrapping its cursor
+  to zero. The wire frame and page addressing are not wired yet.
+  (#234, #243, ISC-C38)
 
 - DM channel page addressing — `daemonseed_core::dm::paging` (`derive_owner_seed`,
   `position_of`, `PagePosition`, `PAGE_SLOTS`, `DmPageOwnerSeed`). A
