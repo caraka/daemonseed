@@ -137,7 +137,10 @@ pub mod route_budget;
 pub mod schedule;
 pub mod share;
 
-pub use actor::{PresenceBoundary, VeilidNet, VeilidNetHandle};
+pub use actor::{
+    PresenceBoundary, VeilidNet, VeilidNetHandle, CLOSE_FLUSH_FLOOR, CLOSE_LEAVE_RESERVE,
+    CLOSE_PREFLUSH_BUDGET, GRACEFUL_CLOSE_BUDGET, TEARDOWN_CAP,
+};
 pub use aimd::AimdWindow;
 pub use config::VeilidNetConfig;
 pub use dht_gate::{

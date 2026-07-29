@@ -306,6 +306,21 @@ pub enum NetCommand {
     /// address only. A read-only operation against an already-shipped gRPC
     /// service — no new wire protocol.
     RefreshIntroducer,
+    /// Graceful close (business-as-usual on quit, #161), in two steps inside one
+    /// [`daemonseed_veilid_net::GRACEFUL_CLOSE_BUDGET`]: publish a LEAVE tombstone for
+    /// the lobby, then run the WB-3.I7 scheduler flush and tear the transport down.
+    /// `ack` fires last. The `PRESENCE_TTL` backstop covers whatever the budget cut
+    /// short. Unlike the others, this is NOT fire-and-forget — the binary waits on
+    /// `ack` after leaving raw mode. Terminal: the transport is gone afterwards and no
+    /// further command reaches the network.
+    ///
+    /// `ack` is a `std::sync::mpsc` sender, not a `oneshot`: the waiter is the plain
+    /// (non-async) main thread, and `recv_timeout` is what bounds the wait there
+    /// without a runtime handle. A `SyncSender` is also `Clone + Debug`, which this
+    /// enum requires.
+    GracefulClose {
+        ack: std::sync::mpsc::SyncSender<()>,
+    },
     /// Publish a defined share to the connected relay and serve its content
     /// from disk (D, M15 → serve-from-disk, M16; ISC-S27 / ISC-S29 / F25).
     /// Hashes `root` into a manifest on a dedicated blocking thread —

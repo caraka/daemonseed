@@ -89,11 +89,51 @@ impl PresenceBoundary {
     }
 }
 
-/// Close-flush budget handed to the write scheduler on graceful shutdown (WB-3.I7):
-/// pending chat writes + leave tombstones + share withdraws flush within this,
-/// class-3/4/5 current-state writes are shed. Same close-budget class as the share
-/// `WithdrawAllOwned` flush; an overrun abandons to the TTL backstop.
-const SHUTDOWN_FLUSH_BUDGET: Duration = Duration::from_secs(8);
+/// Total a frontend waits on a graceful close (#161) — the whole user-visible quit.
+/// Value carried over from the gui close path (2s→8s at #121, 8s→12s at the #161 gui
+/// half); the work below is carved OUT of it rather than added to it, so a quit never
+/// takes longer than it did before.
+///
+/// The carve-up, which must stay consistent:
+/// `CLOSE_PREFLUSH_BUDGET` (6s, withdraws + leaves) + `CLOSE_FLUSH_FLOOR` (2s, the I7
+/// flush) = 8s of actor work, leaving 4s for the transport teardown (itself capped at
+/// `TEARDOWN_CAP`) and the command/reply hops. A close that spends its whole budget
+/// therefore acks at ~11s, inside the 12s the frontend waits — so the frontend's wait
+/// stays a backstop against an ack that never comes and cannot pre-empt a close that is
+/// still within its budget.
+pub const GRACEFUL_CLOSE_BUDGET: Duration = Duration::from_secs(12);
+
+/// What a close arm may spend on its pre-flush steps — share withdraws and LEAVE
+/// tombstones — before the I7 flush must get its turn.
+///
+/// A step cut off here is NOT lost: the write is already enqueued on the scheduler, so
+/// abandoning the await hands it to the flush rather than cancelling it. That is what
+/// makes a hard bound here safe.
+pub const CLOSE_PREFLUSH_BUDGET: Duration = Duration::from_secs(6);
+
+/// The floor the WB-3.I7 flush always gets, however long the pre-flush steps took. It
+/// also receives whatever `CLOSE_PREFLUSH_BUDGET` went unspent, so a fast close spends
+/// its slack on flushing rather than idling.
+pub const CLOSE_FLUSH_FLOOR: Duration = Duration::from_secs(2);
+
+/// The slice of `CLOSE_PREFLUSH_BUDGET` the withdraws may not take, so the LEAVE
+/// tombstone always has a budget to run in. Without it step 1 takes the whole remaining
+/// preflush on every iteration, so one slow withdraw leaves step 2 running under a zero
+/// timeout — which happens to work only because tokio polls the inner future once and the
+/// enqueue completes on that poll. That is correctness by luck; this makes it structural.
+pub const CLOSE_LEAVE_RESERVE: Duration = Duration::from_secs(2);
+
+/// Cap on veilid's own teardown. `flush_budget` bounds the scheduler flush only;
+/// `api.shutdown()` is a separate unbounded await on the same path, so without this the
+/// close has no bound at all past the flush. An overrun is abandoned — the process is
+/// exiting and the OS reclaims the node either way.
+///
+/// Public because it is half of the caller's bound, not an actor-private detail:
+/// `flush_budget` starts counting when the actor *dequeues* `Command::Shutdown`, and
+/// `actor_loop` is serial, so a caller that awaits `shutdown` without a timeout is
+/// unbounded no matter what budget it passed. `flush_budget + TEARDOWN_CAP` is the
+/// actor's own ceiling once dequeued and is therefore what a caller caps at.
+pub const TEARDOWN_CAP: Duration = Duration::from_secs(3);
 
 /// Veilid's `app_message` / `app_call` payload cap (bytes). Sealed envelopes
 /// must fit; file-share chunks re-chunk to this in Phase 3.
@@ -410,16 +450,12 @@ enum Command {
     /// re-publish releases its previous route) in the same update, and reacting to
     /// those re-armed an endless refresh→release→RouteChange→refresh storm.
     /// Coalesced against bursts; fire-and-forget.
-    RouteMaintenance {
-        dead_routes: Vec<RouteId>,
-    },
+    RouteMaintenance { dead_routes: Vec<RouteId> },
     /// Release a private route this node imported for a discovered share (the
     /// consumer-side counterpart to the sharer's advert-route release — §RS-3,
     /// CRSH-ISC-10). Fire-and-forget: the actor releases through `release_tolerant`,
     /// so an id veilid already evicted is a benign no-op, no reply is awaited.
-    ReleaseRoute {
-        route_id: RouteId,
-    },
+    ReleaseRoute { route_id: RouteId },
     /// Periodic slow-cadence advert refresh (the #124 watchdog). Unlike
     /// [`Command::RouteMaintenance`], which fires only on an OBSERVED route death,
     /// this fires on a timer and refreshes every advert unconditionally — the sole
@@ -428,6 +464,8 @@ enum Command {
     /// coalesce window so it cannot recreate the refresh storm. Fire-and-forget.
     AdvertWatchdog,
     Shutdown {
+        /// Budget for the WB-3.I7 scheduler flush before the node is torn down.
+        flush_budget: Duration,
         reply: oneshot::Sender<()>,
     },
 }
@@ -500,9 +538,19 @@ impl VeilidNetHandle {
         .await?
     }
 
-    /// Shut the node down cleanly.
-    pub async fn shutdown(&self) {
-        let _ = self.send(|reply| Command::Shutdown { reply }).await;
+    /// Shut the node down cleanly: run the WB-3.I7 scheduler flush within
+    /// `flush_budget`, then tear the transport down. `flush_budget` is the caller's
+    /// REMAINING graceful-close budget (see [`GRACEFUL_CLOSE_BUDGET`]) — a caller that
+    /// has already spent part of its close on withdraws and leaves passes what is left,
+    /// so the whole close stays inside one bound. Terminal: the actor task returns, so
+    /// every later command on this handle fails.
+    pub async fn shutdown(&self, flush_budget: Duration) {
+        let _ = self
+            .send(|reply| Command::Shutdown {
+                flush_budget,
+                reply,
+            })
+            .await;
     }
 
     /// The scheduler's most-recent non-chat enqueue-to-ack latency in millis (WB-1.10
@@ -1740,13 +1788,18 @@ async fn actor_loop(
                     crate::vtrace!("advert_watchdog: refreshing {} idle advert(s)", idle.len());
                 }
             }
-            Command::Shutdown { reply } => {
+            Command::Shutdown {
+                flush_budget,
+                reply,
+            } => {
                 // I7: flush pending chat writes + leave tombstones + share withdraws
-                // within the close budget, shed class-3/4/5 current-state writes, THEN
-                // tear the node down — a locally-echoed chat silently dropped at close
-                // is data loss the sender already saw as sent.
-                sched.shutdown(SHUTDOWN_FLUSH_BUDGET).await;
-                api.shutdown().await;
+                // within the caller's remaining close budget, shed class-3/4/5
+                // current-state writes, THEN tear the node down — a locally-echoed chat
+                // silently dropped at close is data loss the sender already saw as sent.
+                sched.shutdown(flush_budget).await;
+                // Capped: the caller is blocking a UI thread on the reply below, and
+                // veilid's teardown is otherwise an unbounded await past every budget.
+                let _ = tokio::time::timeout(TEARDOWN_CAP, api.shutdown()).await;
                 let _ = reply.send(());
                 return;
             }
@@ -3241,6 +3294,87 @@ mod tests {
     use super::*;
 
     use daemonseed_core::dm::paging;
+
+    // #161: the graceful-close budgets must compose. The whole no-hang argument is
+    // arithmetic — a front-end blocks a UI thread for GRACEFUL_CLOSE_BUDGET, and the
+    // actor's own steps must finish inside it with room for the transport teardown, or
+    // the front-end's wait stops being a backstop and starts truncating closes that were
+    // still within budget (which is how the flush silently stops running). Nothing else
+    // checks these four numbers against each other, and each is edited independently.
+    #[test]
+    fn graceful_close_budgets_compose_inside_the_frontend_wait() {
+        let actor_work = CLOSE_PREFLUSH_BUDGET + CLOSE_FLUSH_FLOOR;
+        assert!(
+            actor_work + TEARDOWN_CAP < GRACEFUL_CLOSE_BUDGET,
+            "pre-flush ({CLOSE_PREFLUSH_BUDGET:?}) + flush floor ({CLOSE_FLUSH_FLOOR:?}) \
+             + teardown ({TEARDOWN_CAP:?}) must leave headroom inside the front-end's \
+             {GRACEFUL_CLOSE_BUDGET:?} wait, or a close still within budget is cut off"
+        );
+        assert!(
+            !CLOSE_FLUSH_FLOOR.is_zero(),
+            "the I7 flush must always get a non-zero floor — a zero-budget flush \
+             dispatches writes and then tears the transport down under them"
+        );
+        // The LEAVE's guaranteed slice must be a real slice OF the preflush, not equal to
+        // it and not zero: at zero one slow withdraw leaves the leave running under a
+        // zero timeout (the defect this reserve exists to remove), and at the full
+        // preflush the withdraws get nothing and a stale advert outlives the sharer.
+        assert!(
+            !CLOSE_LEAVE_RESERVE.is_zero() && CLOSE_LEAVE_RESERVE < CLOSE_PREFLUSH_BUDGET,
+            "the leave reserve ({CLOSE_LEAVE_RESERVE:?}) must be a non-zero proper slice \
+             of the pre-flush budget ({CLOSE_PREFLUSH_BUDGET:?}) — both ends starve a step"
+        );
+        // A caller caps its `shutdown` await at `flush_budget + TEARDOWN_CAP`, and
+        // `flush_budget` is at most `CLOSE_FLUSH_FLOOR + CLOSE_PREFLUSH_BUDGET` (the
+        // whole preflush unspent). That worst case still has to fit the front-end wait,
+        // or the cap that exists to bound a head-of-line Shutdown would itself be the
+        // thing that truncates a flush already running.
+        let widest_caller_cap = CLOSE_FLUSH_FLOOR + CLOSE_PREFLUSH_BUDGET + TEARDOWN_CAP;
+        assert!(
+            widest_caller_cap < GRACEFUL_CLOSE_BUDGET,
+            "the widest caller cap ({widest_caller_cap:?}) must fit inside the front-end's \
+             {GRACEFUL_CLOSE_BUDGET:?} wait — an unspent pre-flush is the widest case"
+        );
+    }
+
+    // #161: a graceful-close LEAVE must reach the funnel as a TOMBSTONE, which is what
+    // buys it I3/WB-ISC-12 dominance over a queued or in-flight same-member keepalive and
+    // what keeps it in the I7 close flush instead of being shed with the class-4 writes.
+    // Classified as a plain current-state write it would be silently coalescible and
+    // silently shed at close — the member would resurrect or never depart, with nothing
+    // failing anywhere.
+    #[test]
+    fn presence_leave_classifies_as_a_session_boundary_tombstone() {
+        let id = "member-slot".to_owned();
+        assert_eq!(
+            PresenceBoundary::Leave.classify(id.clone()),
+            (
+                WriteClass::SessionBoundary,
+                WriteKind::Tombstone {
+                    logical_id: id.clone()
+                }
+            ),
+            "a leave must be a session-boundary TOMBSTONE"
+        );
+        assert_eq!(
+            PresenceBoundary::Join.classify(id.clone()),
+            (
+                WriteClass::SessionBoundary,
+                WriteKind::CurrentState {
+                    logical_id: id.clone()
+                }
+            ),
+            "a join must stay a session-boundary current-state write"
+        );
+        assert_eq!(
+            PresenceBoundary::Keepalive.classify(id.clone()),
+            (
+                WriteClass::Keepalive,
+                WriteKind::CurrentState { logical_id: id }
+            ),
+            "a keepalive must stay a class-4 current-state write"
+        );
+    }
 
     // CRSH-ISC-10c: every private-route release routes through `release_tolerant`. Build
     // the needle from fragments so this assertion's own source text does not self-match.

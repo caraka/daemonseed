@@ -26,6 +26,12 @@ use ratatui::crossterm::event::{self, Event};
 /// indexer-progress ticks) without busy-spinning.
 const TICK: Duration = Duration::from_millis(100);
 
+/// How long the graceful close (#161) waits before announcing itself. A close with no
+/// network work to do finishes inside this and exits without a word; anything slower is
+/// a real DHT write the user is better off seeing than guessing at. Two render ticks —
+/// long enough to cover a no-op close, short enough not to feel like a pause.
+const QUIET_CLOSE_WINDOW: Duration = Duration::from_millis(200);
+
 fn main() -> io::Result<()> {
     // Bring the oxicrypt module Operational before touching the terminal — a
     // failure here should print plainly, not corrupt a raw-mode screen.
@@ -59,7 +65,7 @@ fn main() -> io::Result<()> {
 
     // The network actor (tokio runtime + connect driver) is built before raw
     // mode so a runtime-build failure prints plainly.
-    let net = match NetHandle::new() {
+    let mut net = match NetHandle::new() {
         Ok(n) => n,
         Err(e) => {
             eprintln!("daemonseed-tui: network runtime build failed: {e}");
@@ -78,9 +84,48 @@ fn main() -> io::Result<()> {
     };
 
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, net, profile_root, downloads_root, existing);
+    let result = run(
+        &mut terminal,
+        &mut net,
+        profile_root,
+        downloads_root,
+        existing,
+    );
     ratatui::restore();
+    // Graceful close AFTER the terminal is restored (#161): the wait can run to the
+    // full close budget, and a frozen alternate-screen frame for that long reads as a
+    // hang. On a plain terminal a slow close can say so and be watched finish.
+    graceful_close(&net);
     result
+}
+
+/// Publish the LEAVE tombstone + flush pending writes before the process exits (#161),
+/// bounded by `GRACEFUL_CLOSE_BUDGET`. Without it a departed member lingers on peers'
+/// rosters for the full `PRESENCE_TTL`, making a graceful quit indistinguishable from
+/// a crash.
+///
+/// Bounded on BOTH sides: the actor stops its own work at the budget, and this
+/// `recv_timeout` is the backstop for an actor that never acks at all (a wedged or
+/// already-dead net thread). A session that never connected acks immediately, so
+/// quitting from the unlock screen stays instant.
+fn graceful_close(net: &NetHandle) {
+    let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
+    if net.send(NetCommand::GracefulClose { ack: ack_tx }).is_err() {
+        return; // the net thread is already gone — nothing to flush
+    }
+    let budget = daemonseed_veilid_net::GRACEFUL_CLOSE_BUDGET;
+    // A session with nothing to publish (never connected, no lobby) acks well inside
+    // this, so quitting from the unlock screen stays silent and instant. Announce only
+    // once it is clear there is real network work to wait on — otherwise the notice
+    // would claim a departure that never happened.
+    if ack_rx.recv_timeout(QUIET_CLOSE_WINDOW).is_ok() {
+        return;
+    }
+    // Deliberately says what is being waited on, not what is being published: the actor
+    // may be finishing an earlier command rather than the leave, so "leaving the lobby"
+    // would not always be true.
+    eprintln!("daemonseed-tui: closing network session…");
+    let _ = ack_rx.recv_timeout(budget.saturating_sub(QUIET_CLOSE_WINDOW));
 }
 
 /// The OS default Downloads directory (ISC-C68 / A3). Resolved per-platform via
@@ -136,7 +181,7 @@ fn parse_portable_flag() -> bool {
 
 fn run(
     terminal: &mut ratatui::DefaultTerminal,
-    mut net: NetHandle,
+    net: &mut NetHandle,
     profile_root: PathBuf,
     downloads_root: PathBuf,
     existing_profile: bool,

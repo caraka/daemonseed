@@ -1321,6 +1321,95 @@ mod tests {
         }
     }
 
+    // ── #161 close flush ──────────────────────────────────────────────────────
+    /// The close flush carries a queued LEAVE tombstone to the sink and sheds a queued
+    /// class-4 keepalive: a graceful departure lands, a keepalive that would have
+    /// resurrected the member does not.
+    ///
+    /// All three writes sit on ONE record so the tombstone and the keepalive are
+    /// genuinely still QUEUED when the shutdown arrives (a record dispatches one write
+    /// at a time), and they carry DISTINCT logical ids so the shed is the I7 predicate's
+    /// doing and not enqueue-time tombstone dominance (WB-ISC-12 below).
+    #[tokio::test(start_paused = true)]
+    async fn issue_161_close_flush_carries_tombstone_and_sheds_keepalive() {
+        let sink = MockSink::new(Duration::from_millis(50));
+        let h = WriteScheduler::spawn(sink.clone(), SchedulerConfig::default());
+
+        // Occupies the record, so everything after it queues.
+        let (blocker, _b_rx) = req(
+            rec_id(0),
+            WriteClass::Keepalive,
+            WriteKind::CurrentState {
+                logical_id: "blocker".to_owned(),
+            },
+            "blocker",
+        );
+        h.enqueue(blocker);
+        tokio::time::sleep(Duration::from_millis(10)).await; // let it dispatch
+
+        let (leave, _l_rx) = req(
+            rec_id(0),
+            WriteClass::SessionBoundary,
+            WriteKind::Tombstone {
+                logical_id: "departing-member".to_owned(),
+            },
+            "leave",
+        );
+        h.enqueue(leave);
+        let (keepalive, _k_rx) = req(
+            rec_id(0),
+            WriteClass::Keepalive,
+            WriteKind::CurrentState {
+                logical_id: "other-member".to_owned(),
+            },
+            "keepalive",
+        );
+        h.enqueue(keepalive);
+
+        h.shutdown(Duration::from_secs(30)).await;
+
+        let labels: Vec<String> = sink.log().into_iter().map(|r| r.label).collect();
+        assert!(
+            labels.iter().any(|l| l == "leave"),
+            "the queued leave tombstone must flush at close, got {labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|l| l == "keepalive"),
+            "a queued class-4 keepalive must be shed at close, got {labels:?}"
+        );
+    }
+
+    /// The close flush is BOUNDED by its budget: a sink that cannot finish inside the
+    /// budget does not hold the close open. Both frontends await this on their shutdown
+    /// path, so an unbounded flush is a hung quit — worse than the linger it fixes.
+    #[tokio::test(start_paused = true)]
+    async fn issue_161_close_flush_returns_within_its_budget() {
+        // One write, far slower than the budget it will be flushed under.
+        let sink = MockSink::new(Duration::from_secs(60));
+        let h = WriteScheduler::spawn(sink.clone(), SchedulerConfig::default());
+        let (chat, _rx) = req(rec_id(0), WriteClass::Chat, WriteKind::Ring, "slow-chat");
+        h.enqueue(chat);
+        tokio::time::sleep(Duration::from_millis(10)).await; // let it dispatch
+
+        let budget = Duration::from_secs(2);
+        let started = Instant::now();
+        h.shutdown(budget).await;
+        let elapsed = started.elapsed();
+
+        // Bounded on both sides — the flush returns AT the budget: it spends the whole
+        // budget (it does not give up early on work that might still land) and not a
+        // second more (it does not run on at the sink's 60s pace).
+        assert!(
+            elapsed >= budget,
+            "the flush must spend its whole budget before abandoning (took {elapsed:?})"
+        );
+        assert!(
+            elapsed < budget + Duration::from_secs(1),
+            "the flush must return at its budget, not at the pace of the unfinished \
+             write (budget {budget:?}, took {elapsed:?})"
+        );
+    }
+
     // ── WB-ISC-12 (Anti) ──────────────────────────────────────────────────────
     /// A queued withdraw/leave is never coalesced away by a same-id current-state
     /// write: withdraw enqueued, then a watchdog refresh enqueued → withdraw

@@ -133,6 +133,15 @@ work lives in the project lead's vault manifest, not here.
 
 ### Fixed
 
+- Corrected the graceful close in both front ends, which never ran the WB-3 I7 write-scheduler
+  flush — `VeilidNetHandle::shutdown` had no caller anywhere in the tree — and never emitted a
+  leave at all from the TUI. A departed member dropped off peers' rosters only at the ~600s
+  `PRESENCE_TTL`, making a clean quit indistinguishable from a crash. Both front ends now
+  withdraw owned shares, publish per-room LEAVE tombstones concurrently, then flush; the TUI
+  closes after restoring the terminal. An unpublish posts its withdraw before de-registering
+  from the serve registry, so a close-path timeout can no longer clear the share locally and
+  tell the UI it stopped while every listener carries it to the prune TTL. (#161)
+
 - Corrected three reference-doc descriptions that named things the Veilid cutover removed.
   `lama.yaml`'s integration-tests entry names the per-milestone and per-feature ISC-coverage
   files it holds; its xtask entry lists the seven subcommands that exist; and
@@ -178,6 +187,15 @@ work lives in the project lead's vault manifest, not here.
   path-dependency, so a build needs only `../oxicrypt` checked out.
 
 ### Changed
+
+- `VeilidNetHandle::shutdown` takes a `flush_budget` and caps the transport teardown, and
+  `GRACEFUL_CLOSE_BUDGET` (12s), `CLOSE_PREFLUSH_BUDGET` (6s), `CLOSE_FLUSH_FLOOR` (2s),
+  `CLOSE_LEAVE_RESERVE` (2s) and `TEARDOWN_CAP` (3s) are public. A front end's close is carved
+  out of the existing budget rather than added to it, so every step is bounded, including the
+  node shutdown, which was an unbounded await on a path a UI thread blocks on. `flush_budget`
+  counts only from the moment the actor dequeues the command and `actor_loop` is serial, so a
+  caller bounds its own await at `flush_budget + TEARDOWN_CAP`; the withdraws are bounded by a
+  deadline that leaves `CLOSE_LEAVE_RESERVE` for the tombstone. (#161)
 
 - Advert-route release has two named entry points, `release_own_advert_route` and
   `release_any_advert_route`, in place of the remove-and-release idiom open-coded at three

@@ -99,6 +99,9 @@ async fn presence_roster_converges_on_a_second_node() {
         let seed = presence_owner_seed;
         let pubkey = a_pubkey.clone();
         let key_bytes = *room_key.as_bytes();
+        // Its own copy: the task is `async move`, and the #161 oracle at the foot of this
+        // test still needs the room name to seal A's leave.
+        let room_name = room.clone();
         tokio::spawn(async move {
             let room_key = daemonseed_core::public_room::PublicRoomKey::from_bytes(key_bytes);
             loop {
@@ -107,7 +110,7 @@ async fn presence_roster_converges_on_a_second_node() {
                     .unwrap()
                     .as_millis() as i64;
                 let fields = HeartbeatFields {
-                    room: &room,
+                    room: &room_name,
                     sender_handle: a_handle,
                     sent_unix_ms: now_ms,
                     live_share_ids: &[],
@@ -178,6 +181,89 @@ async fn presence_roster_converges_on_a_second_node() {
     assert_eq!(members.len(), 1, "roster holds exactly the one live member");
     assert_eq!(members[0].pubkey, a_pubkey, "the live member is A");
 
-    node_a.shutdown().await;
-    node_b.shutdown().await;
+    // ── #161 oracle: a graceful close DEPARTS the member, it does not leave it to the
+    // TTL ──────────────────────────────────────────────────────────────────────────
+    //
+    // Everything above this point proves A appears. #161 is about A *disappearing*, and
+    // until now nothing in the tree observed that over a real network: both front-end
+    // unit tests run with no transport, so every line behind `if let Some(handle)` — the
+    // leave, the flush, `shutdown` itself — is skipped, which is the same blind spot that
+    // let the bug ship green in the first place.
+    //
+    // A publishes its LEAVE exactly as the front ends' close does (sealed with
+    // `is_leave`, boundary `Leave` so the funnel classifies it as a session-boundary
+    // tombstone), then shuts down. The publisher loop is already aborted, so no keepalive
+    // can race it.
+    //
+    // Why a `Departed` here cannot be A merely ageing out: this test never calls
+    // `PresenceTracker::reap`, which is the only path that expires a member on time.
+    // `apply` returns `Departed` from one place only — `hb.is_leave` — so the assertion
+    // is satisfiable by a delivered tombstone and by nothing else. The 120s window is
+    // fivefold inside `PRESENCE_TTL`, so a pass is a real departure rather than a clock.
+    let leave_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    // Rebuilt from the same deterministic seed: `SignKeypair` is `ZeroizeOnDrop` and not
+    // `Clone`, and the publisher task above owns the original.
+    let member_a = SignKeypair::from_ml_dsa_seed(&[7u8; 32]).expect("member A keypair (leave)");
+    let leave_fields = HeartbeatFields {
+        room: &room,
+        sender_handle: a_handle,
+        sent_unix_ms: leave_ms,
+        live_share_ids: &[],
+        is_leave: true,
+    };
+    let sealed_leave =
+        seal_public_heartbeat(&room_key, &member_a, &leave_fields).expect("seal A's leave");
+    node_a
+        .publish_presence(
+            presence_owner_seed,
+            &a_pubkey,
+            sealed_leave,
+            PresenceBoundary::Leave,
+        )
+        .await
+        .expect("A publishes its leave tombstone");
+    node_a
+        .shutdown(daemonseed_veilid_net::GRACEFUL_CLOSE_BUDGET)
+        .await;
+
+    let departed = tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            match rx_b.recv().await {
+                Some(VeilidNetEvent::Inbound { bytes }) => {
+                    match open_heartbeat(&room_key, &bytes) {
+                        Ok(hb) if hb.sender_pubkey == a_pubkey => {
+                            if tracker.apply(&hb, Instant::now()) == PresenceChange::Departed {
+                                eprintln!("[oracle] A's leave tombstone folded — roster departed");
+                                return true;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(_) => {}
+                    }
+                }
+                Some(_) => continue,
+                None => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+
+    assert!(
+        departed,
+        "B must see A depart from a graceful-close LEAVE tombstone within 120s — a miss \
+         here is #161: the member lingers on the roster to the 600s PRESENCE_TTL and a \
+         clean quit is indistinguishable from a crash"
+    );
+    assert!(
+        tracker.members().is_empty(),
+        "the departed member must be off the roster, not merely marked"
+    );
+
+    node_b
+        .shutdown(daemonseed_veilid_net::GRACEFUL_CLOSE_BUDGET)
+        .await;
 }

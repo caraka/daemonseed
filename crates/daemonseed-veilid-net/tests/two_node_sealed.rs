@@ -133,6 +133,10 @@ async fn sealed_circle_message_crosses_a_private_route() {
         "an outsider key must fail to open the same bytes"
     );
 
-    node_a.shutdown().await;
-    node_b.shutdown().await;
+    node_a
+        .shutdown(daemonseed_veilid_net::GRACEFUL_CLOSE_BUDGET)
+        .await;
+    node_b
+        .shutdown(daemonseed_veilid_net::GRACEFUL_CLOSE_BUDGET)
+        .await;
 }

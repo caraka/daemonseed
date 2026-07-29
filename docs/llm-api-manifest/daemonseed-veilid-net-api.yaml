@@ -761,12 +761,16 @@ functions:
       description: Ok once de-registered.
   - name: VeilidNetHandle::shutdown
     module: daemonseed_veilid_net::actor
-    description: Shut the node down cleanly.
-    signature: "pub async fn shutdown(&self)"
-    parameters: []
+    description: Runs the I7 write-scheduler flush within flush_budget, then shuts the node down. Terminal — every later command on this handle fails.
+    signature: "pub async fn shutdown(&self, flush_budget: Duration)"
+    parameters:
+      - name: flush_budget
+        type: Duration
+        direction: in
+        description: Bound on the flush. The caller's remaining GRACEFUL_CLOSE_BUDGET; pending chat and tombstones dispatch inside it, class-3/4/5 current-state writes are shed, and an overrun abandons to the TTL backstop.
     returns:
       type: "()"
-      description: Returns once the node has shut down.
+      description: Returns once the flush has completed or expired and the node has shut down.
 
   # ── config ───────────────────────────────────────────────────────────
   - name: VeilidNetConfig::new
@@ -1133,6 +1137,31 @@ error_types:
 # ─────────────────────────────────────────────────────────────────────
 
 constants:
+  - name: GRACEFUL_CLOSE_BUDGET
+    module: daemonseed_veilid_net::actor
+    type: Duration
+    value: "Duration::from_secs(12)"
+    description: Total a front-end waits on a graceful close. CLOSE_PREFLUSH_BUDGET and CLOSE_FLUSH_FLOOR are carved out of it, and the remainder covers transport teardown and the command/reply hops.
+  - name: CLOSE_PREFLUSH_BUDGET
+    module: daemonseed_veilid_net::actor
+    type: Duration
+    value: "Duration::from_secs(6)"
+    description: What a close arm may spend on share withdraws and LEAVE tombstones before the I7 flush runs. A step cut off here stays enqueued on the scheduler and is dispatched by the flush.
+  - name: CLOSE_FLUSH_FLOOR
+    module: daemonseed_veilid_net::actor
+    type: Duration
+    value: "Duration::from_secs(2)"
+    description: Minimum budget the I7 flush receives, plus any unspent CLOSE_PREFLUSH_BUDGET.
+  - name: CLOSE_LEAVE_RESERVE
+    module: daemonseed_veilid_net::actor
+    type: Duration
+    value: "Duration::from_secs(2)"
+    description: The slice of CLOSE_PREFLUSH_BUDGET the share withdraws may not take, so the LEAVE tombstone always has a budget to run in.
+  - name: TEARDOWN_CAP
+    module: daemonseed_veilid_net::actor
+    type: Duration
+    value: "Duration::from_secs(3)"
+    description: Cap on veilid's own teardown, and half a caller's bound on shutdown. flush_budget counts from the moment the actor dequeues Command::Shutdown, so a caller caps its await at flush_budget + TEARDOWN_CAP.
   - name: APP_MESSAGE_CAP
     module: daemonseed_veilid_net::actor
     type: usize

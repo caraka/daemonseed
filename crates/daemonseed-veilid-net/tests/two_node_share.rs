@@ -157,6 +157,10 @@ async fn public_share_content_crosses_app_call() {
         "an outsider room key must fail to open the manifest"
     );
 
-    sharer.shutdown().await;
-    fetcher.shutdown().await;
+    sharer
+        .shutdown(daemonseed_veilid_net::GRACEFUL_CLOSE_BUDGET)
+        .await;
+    fetcher
+        .shutdown(daemonseed_veilid_net::GRACEFUL_CLOSE_BUDGET)
+        .await;
 }

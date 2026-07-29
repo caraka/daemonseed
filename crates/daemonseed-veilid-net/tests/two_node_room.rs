@@ -187,6 +187,10 @@ async fn sealed_share_announcement_reaches_a_second_node() {
         "an outsider room key must fail to open the announcement"
     );
 
-    node_a.shutdown().await;
-    node_b.shutdown().await;
+    node_a
+        .shutdown(daemonseed_veilid_net::GRACEFUL_CLOSE_BUDGET)
+        .await;
+    node_b
+        .shutdown(daemonseed_veilid_net::GRACEFUL_CLOSE_BUDGET)
+        .await;
 }

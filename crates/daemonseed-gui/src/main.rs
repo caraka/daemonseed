@@ -2774,28 +2774,30 @@ fn main() {
                         // does not re-trip the unread dot for already-seen backlog.
                         state_close.borrow_mut().persist_all_circle_seen();
                         // Business-as-usual on a graceful quit: withdraw owned shares so
-                        // they drop from peers' lists immediately AND publish a LEAVE
-                        // tombstone per joined room (#161), then block the close (bounded)
-                        // until they reach the network. The actor acks WithdrawAllOwned
-                        // only AFTER each withdraw + leave `set_dht_value` returns (i.e.
-                        // after it is written to the DHT's responsible nodes), so the ack
-                        // means the departure has actually landed — the block returns the
-                        // instant it arrives, keeping a healthy close fast. The cap is
-                        // generous (a Veilid DHT set under load can take several seconds,
-                        // and the leaves ride the same budget after the withdraws; the old
-                        // 2 s exited mid-set and aborted the withdraw, leaving a peer to
-                        // wait out the ~600 s TTL backstop — #121); the TTL still covers a
-                        // set that overruns even this. Safe: the net actor runs off the
+                        // they drop from peers' lists immediately, publish a LEAVE
+                        // tombstone per joined room, and run the WB-3.I7 scheduler flush
+                        // (#161), then block the close until the actor acks. The actor
+                        // acks only AFTER each withdraw + leave `set_dht_value` returns
+                        // (i.e. after it is written to the DHT's responsible nodes) and
+                        // the flush has run, so the ack means the departure has actually
+                        // landed — the block returns the instant it arrives, keeping a
+                        // healthy close fast. The actor bounds the work itself with
+                        // GRACEFUL_CLOSE_BUDGET; this timeout is the backstop for an ack
+                        // that never comes at all, not the bound. The TTL still covers
+                        // whatever the budget cut short. Safe: the net actor runs off the
                         // main thread, so blocking here never starves it.
                         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
                         let sent = net_close
                             .borrow()
-                            .send(NetCommand::WithdrawAllOwned { ack: ack_tx })
+                            .send(NetCommand::GracefulClose { ack: ack_tx })
                             .is_ok();
                         if sent && let Some(rt) = PICKER_RT.get() {
                             let _ = rt.block_on(async {
-                                tokio::time::timeout(std::time::Duration::from_secs(12), ack_rx)
-                                    .await
+                                tokio::time::timeout(
+                                    daemonseed_veilid_net::GRACEFUL_CLOSE_BUDGET,
+                                    ack_rx,
+                                )
+                                .await
                             });
                         }
                     }

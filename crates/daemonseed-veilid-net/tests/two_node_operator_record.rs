@@ -132,6 +132,10 @@ async fn operator_record_slots_reach_a_second_node() {
         "B must read the operator announcement slot back byte-identical"
     );
 
-    node_a.shutdown().await;
-    node_b.shutdown().await;
+    node_a
+        .shutdown(daemonseed_veilid_net::GRACEFUL_CLOSE_BUDGET)
+        .await;
+    node_b
+        .shutdown(daemonseed_veilid_net::GRACEFUL_CLOSE_BUDGET)
+        .await;
 }

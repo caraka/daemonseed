@@ -104,9 +104,10 @@ use daemonseed_core::storage::manifest_digest::ManifestDigestStore;
 use daemonseed_proto::v1 as wire;
 use daemonseed_veilid_net::download::{DownloadOutcome, PlannedFile, run_download};
 use daemonseed_veilid_net::{
-    DiscoveryEnvelope, FetchErrorClass, PresenceBoundary, RecordKey, RouteBudget, RouteId,
-    SharerKey, VeilidNet, VeilidNetConfig, VeilidNetError, VeilidNetEvent, VeilidNetHandle,
-    next_resweep_seed, verify_route_advert,
+    CLOSE_FLUSH_FLOOR, CLOSE_LEAVE_RESERVE, CLOSE_PREFLUSH_BUDGET, DiscoveryEnvelope,
+    FetchErrorClass, PresenceBoundary, RecordKey, RouteBudget, RouteId, SharerKey, TEARDOWN_CAP,
+    VeilidNet, VeilidNetConfig, VeilidNetError, VeilidNetEvent, VeilidNetHandle, next_resweep_seed,
+    verify_route_advert,
 };
 use prost::Message as _;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -1103,6 +1104,9 @@ fn spawn_repair(
 /// record post-#153, so the veilid presence beacon carries no `live_share_ids` (its
 /// removal also keeps the padded payload well inside the constant length). A seal /
 /// transport failure is non-fatal — presence self-heals on the next cadence.
+///
+/// Join / keepalive ONLY. A leave is awaited on the close path via
+/// [`publish_public_leave`], never spawned (#161).
 fn spawn_public_beacon(
     handle: &VeilidNetHandle,
     signing: &SignKeypair,
@@ -1111,11 +1115,22 @@ fn spawn_public_beacon(
     my_handle: &str,
     boundary: PresenceBoundary,
 ) {
+    debug_assert!(
+        !matches!(boundary, PresenceBoundary::Leave),
+        "a leave must be awaited (publish_public_leave), not spawned — a spawned task is \
+         aborted at process exit and the member lingers to the TTL (#161)"
+    );
     let fields = HeartbeatFields {
         room: DEFAULT_ROOM,
         sender_handle: my_handle,
         sent_unix_ms: now_unix_ms(),
         live_share_ids: &[],
+        // Derived, never hardcoded: the sealed payload's leave marker and the `boundary`
+        // forwarded to `publish_presence` are two copies of one fact, and a second copy is
+        // the thing that can disagree. The `debug_assert!` above is the guard that this
+        // helper is never handed a leave — but it compiles out in release, so a release
+        // caller passing `Leave` would otherwise enqueue a `Tombstone`-class write
+        // carrying a non-leave payload, silently.
         is_leave: matches!(boundary, PresenceBoundary::Leave),
     };
     if let Ok(sealed) = seal_public_heartbeat(room_key, signing, &fields) {
@@ -1135,6 +1150,9 @@ fn spawn_public_beacon(
 /// Seal and publish ONE presence beacon for a CIRCLE (WB-1) — as
 /// [`spawn_public_beacon`] but sealed under the circle `cot_key` and posted to the
 /// circle's presence sibling record.
+///
+/// Join / keepalive ONLY. A leave is awaited on the close path via
+/// [`publish_circle_leave`], never spawned (#161).
 fn spawn_circle_beacon(
     handle: &VeilidNetHandle,
     signing: &SignKeypair,
@@ -1142,12 +1160,23 @@ fn spawn_circle_beacon(
     my_handle: &str,
     boundary: PresenceBoundary,
 ) {
+    debug_assert!(
+        !matches!(boundary, PresenceBoundary::Leave),
+        "a leave must be awaited (publish_circle_leave), not spawned — a spawned task is \
+         aborted at process exit and the member lingers to the TTL (#161)"
+    );
     let label = default_circle_label(&circle_fingerprint(&circle.cot_key));
     let fields = HeartbeatFields {
         room: &label,
         sender_handle: my_handle,
         sent_unix_ms: now_unix_ms(),
         live_share_ids: &[],
+        // Derived, never hardcoded: the sealed payload's leave marker and the `boundary`
+        // forwarded to `publish_presence` are two copies of one fact, and a second copy is
+        // the thing that can disagree. The `debug_assert!` above is the guard that this
+        // helper is never handed a leave — but it compiles out in release, so a release
+        // caller passing `Leave` would otherwise enqueue a `Tombstone`-class write
+        // carrying a non-leave payload, silently.
         is_leave: matches!(boundary, PresenceBoundary::Leave),
     };
     if let Ok(sealed) = seal_circle_heartbeat(&circle.cot_key, signing, &fields) {
@@ -1539,23 +1568,51 @@ async fn handle_command(
         NetCommand::UnpublishShare { share_id } => {
             unpublish_share(shares, evt_tx, net, &share_id).await;
         }
-        NetCommand::WithdrawAllOwned { ack } => {
-            // Business-as-usual on a graceful quit: withdraw every owned share so it
-            // drops from peers' lists at once (not via the TTL backstop), then ack so
-            // the close path can briefly wait for these to reach the network.
+        NetCommand::GracefulClose { ack } => {
+            // Every step below is bounded, and the bounds compose inside
+            // GRACEFUL_CLOSE_BUDGET (see its carve-up). Nothing here may await a DHT
+            // write unbounded: `main.rs` blocks the UI thread on this ack, so a stalled
+            // step would freeze the window AND skip the I7 flush entirely.
+            let preflush_deadline = Instant::now() + CLOSE_PREFLUSH_BUDGET;
+            // Step 1 — withdraws FIRST. A stale share advert outlives the sharer as a
+            // fetch that a peer can click and that then fails against a dead route;
+            // a stale roster entry is inert until its TTL. Under budget pressure the
+            // actively-broken one is the one worth landing. Sequential: each
+            // `unpublish_share` takes `&mut shares`.
+            //
+            // Bounded by its OWN deadline, not the preflush one: taking the whole
+            // remaining preflush per iteration lets one slow withdraw leave step 2 with a
+            // zero timeout. `CLOSE_LEAVE_RESERVE` is what step 2 is guaranteed.
+            let withdraw_deadline =
+                preflush_deadline - CLOSE_LEAVE_RESERVE.min(CLOSE_PREFLUSH_BUDGET);
             for s in shares.own.clone() {
-                unpublish_share(shares, evt_tx, net, &s.share_id).await;
+                let left = withdraw_deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                // A timed-out withdraw is handed to the flush, not cancelled — once
+                // `unpublish_share` has posted it the write is on the scheduler and only
+                // the await is abandoned. That is why the withdraw is posted before the
+                // serve-registry de-registration inside it: cancellation before the post
+                // would drop the write entirely, which is the one outcome step 1 exists
+                // to prevent.
+                let _ =
+                    tokio::time::timeout(left, unpublish_share(shares, evt_tx, net, &s.share_id))
+                        .await;
             }
-            // WB-1.3: publish one LEAVE tombstone per joined room inside the same
-            // close budget (the #121 pattern). AWAIT each (not fire-and-forget spawn,
-            // #161) so the leave actually reaches the DHT before the process exits —
-            // a spawned task is aborted at exit and the member ages out at the ~600s
-            // TTL instead of departing immediately. The funnel's I3 dominance keeps a
-            // queued keepalive from superseding it (now closed on the in-flight window
-            // too, #164). The tombstone is byte-identical to a keepalive on the wire
-            // (WB-ISC-6); only in-room members decrypt the leave marker.
+            // Step 2 — WB-1.3: one LEAVE tombstone per joined room. AWAITED, not
+            // fire-and-forget (#161): a spawned task is aborted at process exit and the
+            // member ages out at the ~600s TTL instead of departing immediately;
+            // `publish_presence` resolves after the scheduler's `set_dht_value` returns,
+            // so the await is what bounds delivery. CONCURRENT across rooms — sequential
+            // leaves let a member in many rooms exhaust the budget before the later
+            // rooms are told, and each room is a distinct record the scheduler can
+            // dispatch in parallel. The funnel's I3 dominance keeps a queued keepalive
+            // from superseding a leave (closed on the in-flight window too, #164). The
+            // tombstone is byte-identical to a keepalive on the wire (WB-ISC-6); only
+            // in-room members decrypt the leave marker.
             if let (Some(handle), Some(signing)) = (net.as_ref(), shares.signing.clone()) {
-                if let Some(lobby) = shares.lobby.as_ref() {
+                let lobby_leave = shares.lobby.as_ref().map(|lobby| {
                     publish_public_leave(
                         handle,
                         &signing,
@@ -1563,12 +1620,49 @@ async fn handle_command(
                         lobby.presence_owner_seed,
                         my_handle,
                     )
-                    .await;
-                }
-                for circle in circles.iter() {
-                    publish_circle_leave(handle, &signing, circle, my_handle).await;
-                }
+                });
+                let circle_leaves = circles
+                    .iter()
+                    .map(|circle| publish_circle_leave(handle, &signing, circle, my_handle));
+                // Bounded as one group: same reasoning as the withdraws — a leave the
+                // timeout abandons is still queued on the scheduler for the flush.
+                let _ = tokio::time::timeout(
+                    preflush_deadline.saturating_duration_since(Instant::now()),
+                    futures_util::future::join(
+                        futures_util::future::OptionFuture::from(lobby_leave),
+                        futures_util::future::join_all(circle_leaves),
+                    ),
+                )
+                .await;
             }
+            // Step 3 — the WB-3.I7 flush: its floor plus whatever the steps above left
+            // unspent. It dispatches pending chat (a locally-echoed message the sender
+            // already saw as sent) plus any write the timeouts above handed on, sheds
+            // class-3/4/5 current-state, then tears the transport down. Terminal, so it
+            // must run last.
+            if let Some(handle) = net.as_ref() {
+                let flush_budget =
+                    CLOSE_FLUSH_FLOOR + preflush_deadline.saturating_duration_since(Instant::now());
+                // CAPPED, not a bare await. `flush_budget` bounds the flush only from the
+                // moment the actor DEQUEUES `Command::Shutdown`, and `actor_loop` is
+                // serial with arms that await DHT work inline, so Shutdown can sit
+                // head-of-line for an unbounded time. Uncapped, the front end's own wait
+                // in `main.rs` becomes the only bound — and when that fires, the I7 flush
+                // never ran, which is exactly the pending-chat loss the flush exists to
+                // prevent, reached by the path meant to fix it.
+                // `flush_budget + TEARDOWN_CAP` is the actor's own ceiling once dequeued,
+                // so this cap never truncates a flush that is actually running.
+                let _ = tokio::time::timeout(
+                    flush_budget + TEARDOWN_CAP,
+                    handle.shutdown(flush_budget),
+                )
+                .await;
+            }
+            // The transport actor has returned and its event stream is closed, so both
+            // handles are dead state — drop them rather than leave the actor loop holding
+            // an exhausted receiver and a handle whose every command now fails.
+            *net = None;
+            *ev_rx = None;
             let _ = ack.send(());
         }
         NetCommand::RefreshShares => {
@@ -2724,17 +2818,41 @@ async fn unpublish_share(
         share_id: share_id.to_owned(),
     });
 
+    // Best-effort withdraw so listeners drop it (discovery self-heals via TTL even
+    // if this fails).
+    //
+    // POSTED BEFORE the serve-registry de-registration below, and the order is
+    // load-bearing on the graceful-close path (#161): that caller wraps this whole
+    // function in a timeout, and `stop_serve` is a command+reply round trip that a busy
+    // actor can make slow. With the round trip first, a timeout landing in it dropped the
+    // future with the withdraw never posted — so the share stayed in every listener's
+    // catalog to its TTL while this function had already cleared it locally and told the
+    // UI it stopped. The withdraw is the only step here whose loss outlives the process;
+    // `stop_serve` de-registers a registry that dies with it.
+    post_share_withdraw(shares, net, share_id, own).await;
+
     // Teeth of unpublish: stop SERVING the bytes. Fires whenever connected,
-    // independent of whether the withdraw below can be signed — the withdraw only
+    // independent of whether the withdraw above could be signed — the withdraw only
     // removes the share from listeners' discovery catalogs, while this de-registers
     // it from the serve registry so the owner no longer answers fetch app_calls
     // (a holder of a stale route gets a not-found, never bytes).
     if let Some(handle) = net.as_ref() {
         let _ = handle.stop_serve(share_id.to_owned()).await;
     }
+}
 
-    // Best-effort withdraw so listeners drop it (discovery self-heals via TTL even
-    // if this fails).
+/// Seal and post the withdraw announcement for `share_id`, so listeners drop it from
+/// their discovery catalogs rather than carrying it to the prune TTL.
+///
+/// Split out of [`unpublish_share`] so its several give-up paths cannot skip that
+/// function's serve-registry de-registration: every `return` here is "no withdraw to
+/// post", never "stop unpublishing".
+async fn post_share_withdraw(
+    shares: &ShareState,
+    net: &Option<VeilidNetHandle>,
+    share_id: &str,
+    own: Option<OwnShare>,
+) {
     let (Some(handle), Some(signing)) = (net.as_ref(), shares.signing.clone()) else {
         return;
     };
@@ -5805,6 +5923,64 @@ mod tests {
             }
             other => panic!("expected PublishError, got {other:?}"),
         }
+    }
+
+    /// (#161) The close command is ANSWERED, and answered promptly, on a session that
+    /// never connected. The window close handler blocks on this ack, so a path through
+    /// the arm that returns without acking turns every quit-before-connect into a full
+    /// close-budget stall with the window still on screen. Also pins that the arm drops
+    /// the transport handles it just tore down, rather than leaving the actor loop
+    /// holding an exhausted receiver and a handle whose every command now fails.
+    #[tokio::test]
+    async fn issue_161_graceful_close_acks_without_a_transport() {
+        let mut net: Option<VeilidNetHandle> = None;
+        // ONLY `ev_rx` is seeded Some, so only `*ev_rx = None` is actually pinned below:
+        // a `VeilidNetHandle` cannot be built without a node, so `net` starts None and
+        // `net.is_none()` is true on entry and cannot fail. It is asserted anyway because
+        // the arm clears both on the same unconditional path — but the load-bearing half
+        // of that assertion is `ev_rx`, and a reader must not take the `net` half for
+        // coverage it does not provide.
+        //
+        // What this test kills, precisely: an early `return` out of the arm without
+        // acking, and the arm being dropped so `_ => {}` swallows the command. It says
+        // NOTHING about leaves, ordering, budgets or the flush — every one of those sits
+        // behind `if let Some(handle) = net.as_ref()`, which this fixture never enters.
+        // The oracle for those is `two_node_presence`, over a real network.
+        let (_ev_tx, ev_stream) = unbounded_channel::<VeilidNetEvent>();
+        let mut ev_rx: Option<UnboundedReceiver<VeilidNetEvent>> = Some(ev_stream);
+        let mut circles: Vec<VeilidCircle> = Vec::new();
+        let mut my_handle = "guest".to_owned();
+        let mut shares = ShareState::new();
+        let (evt_tx, _evt_rx) = unbounded_channel();
+        let (cmd_tx, _cmd_rx) = unbounded_channel::<NetCommand>();
+        let (fetch_outcome_tx, _fetch_rx) = unbounded_channel();
+        let (confirm_outcome_tx, _confirm_rx) = unbounded_channel::<ConfirmOutcome>();
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+        handle_command(
+            NetCommand::GracefulClose { ack: ack_tx },
+            &evt_tx,
+            &cmd_tx,
+            &mut net,
+            &mut ev_rx,
+            &mut circles,
+            &mut my_handle,
+            &mut shares,
+            &fetch_outcome_tx,
+            &confirm_outcome_tx,
+            // (#274) The operator write-gate; this command's arm never reads it.
+            false,
+        )
+        .await;
+
+        assert!(
+            ack_rx.await.is_ok(),
+            "GracefulClose must ack even with no transport — the close handler blocks on it"
+        );
+        assert!(
+            net.is_none() && ev_rx.is_none(),
+            "the close must drop the transport handles it tore down"
+        );
     }
 
     /// #195 (CRSH-ISC-28): a mid-session re-index republishes a root under its SAME

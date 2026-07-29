@@ -165,15 +165,17 @@ pub enum NetCommand {
     /// listeners drop the share from their [`daemonseed_core::share_catalog::ShareCatalog`] (unified share model).
     #[cfg_attr(not(test), allow(dead_code))]
     UnpublishShare { share_id: String },
-    /// Graceful-close (business-as-usual on quit): withdraw EVERY owned share, then
-    /// signal `ack` once the withdraws are posted, so the UI can briefly block the
-    /// close until they reach the network. The TTL backstop covers any miss. Unlike
-    /// the others, this is NOT fire-and-forget — the close path waits on `ack` with a
-    /// short timeout.
+    /// Graceful close (business-as-usual on quit), in three steps inside one
+    /// [`daemonseed_veilid_net::GRACEFUL_CLOSE_BUDGET`]: withdraw EVERY owned share,
+    /// publish one LEAVE tombstone per joined room, then run the WB-3.I7 scheduler
+    /// flush and tear the transport down. `ack` fires last. The `PRESENCE_TTL` backstop
+    /// covers whatever the budget cut short. Unlike the others, this is NOT
+    /// fire-and-forget — the close path waits on `ack`. Terminal: the transport is gone
+    /// afterwards and no further command reaches the network.
     // Constructed only by the windowed close handler (`desktop`); the base
     // offscreen build never builds that path, so the variant reads as dead there.
     #[cfg_attr(not(feature = "desktop"), allow(dead_code))]
-    WithdrawAllOwned {
+    GracefulClose {
         ack: tokio::sync::oneshot::Sender<()>,
     },
     /// The single late-join hook (unified share model): post a sealed

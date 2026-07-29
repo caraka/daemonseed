@@ -117,9 +117,9 @@ use daemonseed_core::storage::fetched::{
 use daemonseed_core::storage::manifest_digest::ManifestDigestStore;
 use daemonseed_veilid_net::download::{DownloadOutcome, PlannedFile, run_download};
 use daemonseed_veilid_net::{
-    DiscoveryEnvelope, FetchErrorClass, PresenceBoundary, RecordKey, RouteBudget, RouteId,
-    SharerKey, VeilidNet, VeilidNetConfig, VeilidNetError, VeilidNetEvent, VeilidNetHandle,
-    next_resweep_seed, verify_route_advert,
+    CLOSE_FLUSH_FLOOR, CLOSE_PREFLUSH_BUDGET, DiscoveryEnvelope, FetchErrorClass, PresenceBoundary,
+    RecordKey, RouteBudget, RouteId, SharerKey, TEARDOWN_CAP, VeilidNet, VeilidNetConfig,
+    VeilidNetError, VeilidNetEvent, VeilidNetHandle, next_resweep_seed, verify_route_advert,
 };
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
@@ -840,6 +840,69 @@ async fn handle_command(
             let _ = evt_tx.send(NetEvent::IntroducerError {
                 message: NOT_YET.to_owned(),
             });
+        }
+        NetCommand::GracefulClose { ack } => {
+            // Every step below is bounded, and the bounds compose inside
+            // GRACEFUL_CLOSE_BUDGET (see its carve-up). Nothing here may await a DHT
+            // write unbounded: the binary blocks on this ack, so a stalled leave would
+            // hold the quit open AND skip the I7 flush entirely.
+            let preflush_deadline = Instant::now() + CLOSE_PREFLUSH_BUDGET;
+            // WB-1.3: the lobby LEAVE tombstone. AWAITED, not fire-and-forget (#161) —
+            // a spawned task is aborted at process exit and the member ages out at the
+            // ~600s TTL instead of departing immediately; `publish_presence` resolves
+            // after the scheduler's `set_dht_value` returns, so the await is what bounds
+            // delivery. The funnel's I3 dominance keeps a queued keepalive from
+            // superseding it (#164). The lobby is the TUI's only presence surface — it
+            // publishes no circle presence — and it withdraws no shares here, so a
+            // TUI-owned share still ages out at its own TTL.
+            if let (Some(handle), Some(signing), Some(lobby)) =
+                (net.as_ref(), shares.signing.clone(), shares.lobby.as_ref())
+            {
+                // A timed-out leave is handed to the flush, not cancelled — the tombstone
+                // is already on the scheduler; only the await is abandoned.
+                let _ = tokio::time::timeout(
+                    preflush_deadline.saturating_duration_since(Instant::now()),
+                    publish_public_leave(
+                        handle,
+                        &signing,
+                        &lobby.room_key,
+                        lobby.presence_owner_seed,
+                        my_handle.as_deref().unwrap_or("guest"),
+                    ),
+                )
+                .await;
+            }
+            // The WB-3.I7 flush: its floor plus whatever the leave left unspent. It
+            // dispatches pending chat (a locally-echoed message the sender already saw
+            // as sent) plus a tombstone the timeout above handed on, sheds class-3/4/5
+            // current-state, then tears the transport down. Terminal, so it runs last.
+            if let Some(handle) = net.as_ref() {
+                let flush_budget =
+                    CLOSE_FLUSH_FLOOR + preflush_deadline.saturating_duration_since(Instant::now());
+                // CAPPED, not a bare await. `flush_budget` bounds the flush only from the
+                // moment the actor DEQUEUES `Command::Shutdown`, and `actor_loop` is
+                // serial with arms that await DHT work inline, so Shutdown can sit
+                // head-of-line for an unbounded time. Uncapped, the binary's own wait
+                // becomes the only bound — and when that fires, the I7 flush never ran,
+                // which is exactly the pending-chat loss the flush exists to prevent,
+                // reached by the path meant to fix it.
+                // `flush_budget + TEARDOWN_CAP` is the actor's own ceiling once dequeued,
+                // so this cap never truncates a flush that is actually running.
+                let _ = tokio::time::timeout(
+                    flush_budget + TEARDOWN_CAP,
+                    handle.shutdown(flush_budget),
+                )
+                .await;
+            }
+            // The transport actor has returned and its event stream is closed, so both
+            // handles are dead state — drop them rather than leave the actor loop holding
+            // an exhausted receiver and a handle whose every command now fails.
+            *net = None;
+            *ev_rx = None;
+            // Always ack, on every path above — the binary is blocked on this, and a
+            // dropped sender is the difference between a fast close and a full
+            // close-budget stall on a client that never connected.
+            let _ = ack.try_send(());
         }
 
         // No-op commands: the relay actor's internal/timer-driven self-sends
@@ -2787,9 +2850,12 @@ fn spawn_repair(
     });
 }
 
-/// Seal and publish ONE lobby presence beacon (WB-1 join / keepalive / leave, per
-/// `boundary`), spawning the DHT write off the actor loop. Fixed-length (WB-ISC-6)
-/// with an EMPTY digest — share liveness rides the share record post-#153.
+/// Seal and publish ONE lobby presence beacon (WB-1 join / keepalive), spawning the
+/// DHT write off the actor loop. Fixed-length (WB-ISC-6) with an EMPTY digest — share
+/// liveness rides the share record post-#153.
+///
+/// Join / keepalive ONLY. A leave is awaited on the close path via
+/// [`publish_public_leave`], never spawned (#161).
 fn spawn_public_beacon(
     handle: &VeilidNetHandle,
     signing: &SignKeypair,
@@ -2798,11 +2864,22 @@ fn spawn_public_beacon(
     my_handle: &str,
     boundary: PresenceBoundary,
 ) {
+    debug_assert!(
+        !matches!(boundary, PresenceBoundary::Leave),
+        "a leave must be awaited (publish_public_leave), not spawned — a spawned task is \
+         aborted at process exit and the member lingers to the TTL (#161)"
+    );
     let fields = HeartbeatFields {
         room: DEFAULT_ROOM,
         sender_handle: my_handle,
         sent_unix_ms: now_unix_ms(),
         live_share_ids: &[],
+        // Derived, never hardcoded: the sealed payload's leave marker and the `boundary`
+        // forwarded to `publish_presence` are two copies of one fact, and a second copy is
+        // the thing that can disagree. The `debug_assert!` above is the guard that this
+        // helper is never handed a leave — but it compiles out in release, so a release
+        // caller passing `Leave` would otherwise enqueue a `Tombstone`-class write
+        // carrying a non-leave payload, silently.
         is_leave: matches!(boundary, PresenceBoundary::Leave),
     };
     if let Ok(sealed) = seal_public_heartbeat(room_key, signing, &fields) {
@@ -2816,6 +2893,37 @@ fn spawn_public_beacon(
                 daemonseed_veilid_net::vtrace!("tui presence: {boundary:?} emit failed: {e}");
             }
         });
+    }
+}
+
+/// Seal and AWAIT one LEAVE tombstone for the lobby — the close-path counterpart of
+/// [`spawn_public_beacon`]. The write is *awaited*, not spawned, so the leave reaches
+/// the DHT before the process exits (#161): a spawned task is aborted at exit and the
+/// member ages out at the ~600s `PRESENCE_TTL` instead of departing immediately.
+/// `publish_presence` resolves after the scheduler's `set_dht_value` returns, so the
+/// await bounds delivery. Non-fatal on seal/transport failure (the TTL backstops it).
+async fn publish_public_leave(
+    handle: &VeilidNetHandle,
+    signing: &SignKeypair,
+    room_key: &PublicRoomKey,
+    presence_seed: [u8; 32],
+    my_handle: &str,
+) {
+    let fields = HeartbeatFields {
+        room: DEFAULT_ROOM,
+        sender_handle: my_handle,
+        sent_unix_ms: now_unix_ms(),
+        live_share_ids: &[],
+        is_leave: true,
+    };
+    if let Ok(sealed) = seal_public_heartbeat(room_key, signing, &fields) {
+        let pubkey = signing.public_key().to_vec();
+        if let Err(e) = handle
+            .publish_presence(presence_seed, &pubkey, sealed, PresenceBoundary::Leave)
+            .await
+        {
+            daemonseed_veilid_net::vtrace!("tui presence: Leave emit failed: {e}");
+        }
     }
 }
 
@@ -3043,6 +3151,39 @@ mod tests {
             .expect("event channel closed");
         drop(cmd_tx);
         ev
+    }
+
+    /// (#161) The close command is ANSWERED, and answered promptly, on a session that
+    /// never connected. Three ways this regresses silently: the arm is dropped and the
+    /// catch-all `_ => {}` swallows the command, a path through the arm returns without
+    /// acking, or a step awaits a DHT write unbounded. Each leaves the binary — which
+    /// blocks on this ack after leaving raw mode — sitting out the full close budget on
+    /// every quit from the unlock screen.
+    #[tokio::test]
+    async fn issue_161_graceful_close_acks_without_a_transport() {
+        let (cmd_tx, cmd_rx) = unbounded_channel();
+        let (self_tx, _self_rx) = unbounded_channel();
+        let (evt_tx, _evt_rx) = unbounded_channel();
+        tokio::spawn(veilid_net_actor(cmd_rx, self_tx, evt_tx));
+
+        let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
+        cmd_tx
+            .send(NetCommand::GracefulClose { ack: ack_tx })
+            .expect("actor is alive");
+
+        // Generous relative to the work (there is none — no transport, no lobby), but
+        // far below GRACEFUL_CLOSE_BUDGET, so a close that silently falls through to the
+        // budget fails here rather than passing slowly.
+        let waited = tokio::task::spawn_blocking(move || {
+            ack_rx.recv_timeout(Duration::from_secs(2)).is_ok()
+        })
+        .await
+        .expect("ack waiter panicked");
+        assert!(
+            waited,
+            "GracefulClose must ack even with no transport — the binary blocks on it"
+        );
+        drop(cmd_tx);
     }
 
     #[tokio::test]
