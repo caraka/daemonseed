@@ -134,7 +134,7 @@ const H: u32 = 680;
 /// Released build version shown in-app (auth-screen readout, issue #59 surface).
 /// Stamped at release from the git tag — like `lama.yaml` `version` and the README
 /// Status line — NOT Cargo's tag-driven `0.1.0`.
-const APP_VERSION: &str = "v0.36.2";
+const APP_VERSION: &str = "v0.36.3";
 
 /// Run `f` on the next event-loop tick instead of synchronously. Used to move
 /// `.focus()` calls OUT of key-event handlers: focusing an element while Slint is
@@ -912,10 +912,10 @@ fn build_ui() -> BuiltUi {
             // local-only RefreshShares (see start_drain) — never ResweepShares.
             let _ = net.borrow().send(NetCommand::ResweepShares);
             // #195: the manual Refresh also RE-INDEXES our own published shares. The
-            // Veilid publish path hashes a root once at publish (`ShareContent::index_dir`),
-            // so a file added to a shared folder mid-session is invisible to peers until
+            // Veilid publish path hashes a root once at publish (`hash_share`), so a
+            // file added to a shared folder mid-session is invisible to peers until
             // the next launch's auto-republish. Re-send `PublishShare` per persisted root:
-            // `publish_share` re-runs `index_dir` and re-announces under the SAME
+            // `publish_share` re-runs the hash pass and re-announces under the SAME
             // deterministic `share_id` (#156), so peers fold the fresh manifest onto the
             // existing catalog entry (no duplicate / dead second copy). Gated on Connected
             // to avoid a spurious "not connected" toast per root, and it rides only the

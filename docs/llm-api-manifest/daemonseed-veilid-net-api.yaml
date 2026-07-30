@@ -251,7 +251,7 @@ types:
   - name: ServedShare
     module: daemonseed_veilid_net::share
     kind: struct
-    description: A registered share served owner-on-demand; answers fragment requests from an LRU-bounded seal cache so all fragments of one response come from a single seal.
+    description: A registered share served owner-on-demand from any ChunkSource; answers fragment requests from an LRU-bounded seal cache so all fragments of one response come from a single seal.
   - name: FetchTarget
     module: daemonseed_veilid_net::share
     kind: enum
@@ -593,17 +593,17 @@ functions:
       description: The lowercase-hex slot id.
   - name: VeilidNetHandle::serve_share
     module: daemonseed_veilid_net::actor
-    description: Register an indexed share to serve owner-on-demand; the actor answers inbound fragment app_calls for share_id from content, sealing each response under room_key. The sharer must stay online to serve (ISC-A-S21).
-    signature: "pub async fn serve_share(&self, share_id: String, content: Arc<ShareContent>, room_key: [u8; 32]) -> Result<()>"
+    description: Register a share to serve owner-on-demand; the actor answers inbound fragment app_calls for share_id from content, sealing each response under room_key. The sharer must stay online to serve (ISC-A-S21).
+    signature: "pub async fn serve_share(&self, share_id: String, content: Arc<dyn ChunkSource + Send + Sync>, room_key: [u8; 32]) -> Result<()>"
     parameters:
       - name: share_id
         type: String
         direction: in
         description: The share's stable id (daemonseed_core::share_announce::derive_share_id_v2).
       - name: content
-        type: "Arc<ShareContent>"
+        type: "Arc<dyn ChunkSource + Send + Sync>"
         direction: in
-        description: The indexed share content (manifest + content-addressed chunks).
+        description: The share's content source — DiskShareContent to serve from disk at O(CHUNK_SIZE) memory, ShareContent to serve from RAM.
       - name: room_key
         type: "[u8; 32]"
         direction: in
@@ -972,12 +972,12 @@ functions:
   - name: ServedShare::new
     module: daemonseed_veilid_net::share
     description: Register a share's content + room key for owner-on-demand serving.
-    signature: "pub fn new(content: Arc<ShareContent>, room_key: PublicRoomKey) -> Self"
+    signature: "pub fn new(content: Arc<dyn ChunkSource + Send + Sync>, room_key: PublicRoomKey) -> Self"
     parameters:
       - name: content
-        type: "Arc<ShareContent>"
+        type: "Arc<dyn ChunkSource + Send + Sync>"
         direction: in
-        description: The indexed share content.
+        description: The share's content source.
       - name: room_key
         type: PublicRoomKey
         direction: in

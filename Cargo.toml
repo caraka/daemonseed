@@ -30,6 +30,23 @@ opt-level = 3
 [profile.dev.package.oxicrypt-module]
 opt-level = 3
 
+# Integer overflow panics in release as well as dev (#258). Release wraps silently
+# by default, and much of this codebase's arithmetic is over quantities where a wrap
+# is a security event rather than a rounding error — it yields a value
+# indistinguishable from a correct one, so nothing downstream can tell. Concretely,
+# on this tree: the ring slot a message is written to is derived arithmetically from
+# its sequence number (daemonseed-veilid-net rendezvous, `base + (seq %
+# RING_DEPTH)`), so a wrapped sequence writes over a live slot; and byte and retry
+# budgets are computed by addition (daemonseed-core `share_serve::manifest_frame_len`,
+# `backoff`), so a wrapped budget admits the wrong amount of work. A panic is the
+# cheaper failure in both.
+#
+# Workspace-wide rather than per-crate because that arithmetic is spread across
+# crates — daemonseed-core needs the guarantee as much as the transport does, so
+# scoping it to any one member would leave the rest wrapping.
+[profile.release]
+overflow-checks = true
+
 [workspace.package]
 version = "0.1.0"
 edition = "2024"

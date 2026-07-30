@@ -322,9 +322,12 @@ pub enum RatchetError {
     GenerationExhausted,
     /// The chain cursor would step past the last sequence number there is.
     /// Unreachable by any peer following the protocol, and refused rather than
-    /// left to the arithmetic: this crate's release profile sets no
-    /// `overflow-checks`, so the wrap is silent there, and a cursor wrapping to
-    /// zero rewrites the write-once page slot sequence zero already owns.
+    /// left to the arithmetic: the release profile panics on overflow (#258), so
+    /// the alternative is an abort rather than a silent wrap — and neither is
+    /// acceptable mid-conversation, where a typed refusal is observable and
+    /// handleable. The explicit check also holds independently of a profile
+    /// setting a downstream build could turn off. A cursor wrapping to zero would
+    /// rewrite the write-once page slot sequence zero already owns.
     SequenceExhausted { seq: u64 },
     /// A frame sits further ahead on its chain than [`MAX_CATCH_UP`] — further
     /// than a receiver will walk in one step. Not recoverable by retrying the
@@ -750,10 +753,12 @@ impl Chain {
     /// the retention bound are dropped, counted, and the arriving message opens.
     ///
     /// **The successor cursor is computed with `checked_add`, not `+ 1`.** The
-    /// workspace defines no `[profile.release]`, so `overflow-checks` is off in
-    /// release and a target at [`u64::MAX`] would wrap the cursor to zero rather
-    /// than panic — silently rewriting the write-once page slot sequence zero
-    /// already owns.
+    /// workspace's `[profile.release]` sets `overflow-checks` (#258), so a target
+    /// at [`u64::MAX`] panics rather than wrapping — but an abort mid-conversation
+    /// is no better an outcome than a typed error, and the check does not depend
+    /// on a profile setting a downstream build could turn off. Either way the
+    /// cursor never returns to zero, whose write-once page slot is already spoken
+    /// for.
     fn advance_to(
         self,
         target: u64,
@@ -2488,10 +2493,10 @@ mod tests {
         );
     }
 
-    /// **This crate's release profile sets no `overflow-checks`**, so a wrapping
-    /// cursor is not a debug panic there — it is a silent return to sequence
-    /// zero, whose write-once page slot is already spoken for. The step is
-    /// refused instead.
+    /// A wrapping cursor would return to sequence zero, whose write-once page slot
+    /// is already spoken for. The release profile panics on overflow (#258) rather
+    /// than wrapping, but the step is refused explicitly so the outcome is a typed
+    /// error on every profile instead of an abort.
     #[test]
     fn advancing_to_the_last_sequence_number_is_refused_rather_than_wrapping() {
         let last = Chain {

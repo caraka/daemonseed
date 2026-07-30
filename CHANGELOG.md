@@ -46,6 +46,9 @@ work lives in the project lead's vault manifest, not here.
   the sweep outcome; `DmPageSlots` is removed. Page addresses and the wire format
   are unchanged. (#254)
 
+- The release profile panics on integer overflow (`[profile.release]
+  overflow-checks = true`), workspace-wide. (#258)
+
 ### Fixed
 
 - `daemonseed_core::storage::seeds::PersistedCircle` holds `entropy` privately as a
@@ -380,6 +383,10 @@ work lives in the project lead's vault manifest, not here.
   `daemonseed/dm/…` domain-label namespace. Wire: `DmKeyRecord` and the reserved
   `KeySelector` enum (additive MINOR). (#232, ISC-C40)
 
+## [0.36.3] — 2026-07-28
+
+### Added
+
 - Direct-messaging design-of-record **FROZEN** (`docs/design/direct-messaging.md`,
   DRAFT v6): hardened over 8 adversarial panel rounds (crypto/metadata/erasure)
   to a post-quantum double-ratchet DM over per-page scattered DHT records, a
@@ -395,6 +402,14 @@ work lives in the project lead's vault manifest, not here.
   first emission (#238). Previously every subscribed client re-published every
   announcement every 120 seconds, so write load on the single announce record
   scaled with both the fleet size and the number of standing announcements.
+- The GUI and TUI serve a published share from disk, reading one `CHUNK_SIZE`
+  range per request, instead of holding every published byte in memory for the
+  session (#246). Publishing a multi-gigabyte folder no longer costs comparable
+  resident memory. Share ids, chunk addresses, and the wire form are unchanged.
+  A published file that is moved, deleted, truncated, or grown after publish now
+  stops serving instead of serving a publish-time copy; a same-length in-place
+  edit is served and rejected by the fetcher's per-chunk hash check. Re-publish
+  to serve changed content.
 
 ## [0.36.2] — 2026-07-27
 

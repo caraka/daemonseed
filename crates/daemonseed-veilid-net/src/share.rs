@@ -29,7 +29,7 @@ use futures_util::stream::{self, StreamExt, TryStreamExt};
 use daemonseed_core::public_room::PublicRoomKey;
 use daemonseed_core::share_envelope::{ManifestEntry, ShareFrame};
 use daemonseed_core::share_seal::{open_share_frame, seal_public_share_frame};
-use daemonseed_core::share_serve::{ShareContent, MANIFEST_FRAME_BUDGET};
+use daemonseed_core::share_serve::{ChunkSource, MANIFEST_FRAME_BUDGET};
 use daemonseed_core::storage::cas::{chunk_addr, ChunkAddr, CHUNK_ADDR_LEN};
 
 use crate::error::{FetchErrorClass, Result, VeilidNetError};
@@ -199,7 +199,7 @@ fn encode_response_ok(total: u32, fragment: &[u8]) -> Vec<u8> {
     buf
 }
 
-fn encode_response_not_found() -> Vec<u8> {
+pub(crate) fn encode_response_not_found() -> Vec<u8> {
     vec![RESP_NOT_FOUND]
 }
 
@@ -233,11 +233,16 @@ pub fn decode_response(bytes: &[u8]) -> Result<Option<(u32, Vec<u8>)>> {
 /// bytes), not corruption.
 const SEAL_CACHE_CAPACITY: usize = 16;
 
-/// A share registered for serving: its indexed content + the public room key it
+/// A share registered for serving: its content source + the public room key it
 /// seals responses under, plus a bounded-LRU per-target sealed-response cache so
 /// every fragment of one response comes from the SAME seal (AEAD nonce consistency).
+///
+/// The content is any [`ChunkSource`], so a caller chooses where the bytes live:
+/// the disk-backed source reads one `CHUNK_SIZE` range per request (the publish
+/// path both front-ends use), the in-RAM source holds the whole share (tests and
+/// the CLI's small shares). The serve loop is identical either way.
 pub struct ServedShare {
-    content: Arc<ShareContent>,
+    content: Arc<dyn ChunkSource + Send + Sync>,
     room_key: PublicRoomKey,
     cache: HashMap<String, Vec<u8>>,
     /// LRU recency, oldest at the front — bounds `cache` to [`SEAL_CACHE_CAPACITY`].
@@ -249,7 +254,7 @@ pub struct ServedShare {
 }
 
 impl ServedShare {
-    pub fn new(content: Arc<ShareContent>, room_key: PublicRoomKey) -> Self {
+    pub fn new(content: Arc<dyn ChunkSource + Send + Sync>, room_key: PublicRoomKey) -> Self {
         Self {
             content,
             room_key,
@@ -297,6 +302,19 @@ impl ServedShare {
             self.touch(&key);
         } else {
             let Some(resp) = self.content.answer(&target.share_frame()) else {
+                // A disk-backed source answers `None` for a chunk it can no
+                // longer read — the file was moved, deleted, or resized since
+                // publish (#246). That is a first-class outcome of ordinary
+                // operator behaviour now, not the impossible-in-practice case it
+                // was when the source held publish-time bytes, and the sharer
+                // would otherwise learn of it only from a peer complaining: the
+                // reply is a bare NOT_FOUND either way. Trace it so the sharer's
+                // own log names the share and target that stopped serving.
+                crate::vtrace!(
+                    "serve: no answer for target {} — unknown chunk, or its file is \
+                     unreadable/changed since publish",
+                    target.cache_key()
+                );
                 return encode_response_not_found();
             };
             let Ok(sealed) = seal_public_share_frame(&self.room_key, &resp) else {
@@ -710,6 +728,7 @@ mod tests {
     use super::*;
     use daemonseed_core::crypto::suite::CNSA_2_0;
     use daemonseed_core::public_room::derive_room_key;
+    use daemonseed_core::share_serve::{hash_share, DiskShareContent, ShareContent};
 
     fn room_key() -> PublicRoomKey {
         let _ = oxicrypt_module::initialize();
@@ -980,5 +999,66 @@ mod tests {
             "a route death collapses ONCE: learned ceiling is half the killing width, not floor"
         );
         assert_eq!(budget.route_width(&1), W_FLOOR, "window collapsed to floor");
+    }
+
+    /// #246: a served share reads its bytes from disk at answer time, it does not
+    /// hold them from publish time. The observable difference is what happens when
+    /// the backing file changes underneath a live share: the disk-backed source
+    /// fails closed (`ChunkModified` → no frame → `NOT_FOUND`), while an in-RAM
+    /// source keeps serving the bytes it captured. Asserting BOTH is what makes
+    /// this a falsifier rather than a tautology — it fails on the pre-#246 code,
+    /// where the publish path built the in-RAM source.
+    #[test]
+    fn a_served_share_reads_from_disk_not_from_a_publish_time_copy() {
+        let _ = oxicrypt_module::initialize();
+        let dir = std::env::temp_dir().join(format!("ds-share-disk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("f.bin");
+        std::fs::write(&file, [7u8; 64]).unwrap();
+
+        // Same root, both source kinds, manifests built independently.
+        let manifest = hash_share(
+            &dir,
+            &std::sync::atomic::AtomicBool::new(false),
+            &mut |_, _| {},
+        )
+        .unwrap();
+        let addr = manifest.entries[0].chunks[0];
+        let ram = Arc::new(ShareContent::index_dir(&dir).unwrap());
+        let disk = Arc::new(DiskShareContent::new(dir.clone(), manifest));
+
+        let share_id = "dddddddddddddddddddddddddddddddd".to_owned();
+        let target = FetchTarget::Chunk(addr);
+        let req = encode_request(&share_id, &target, 0).unwrap();
+        let serve_one = |content: Arc<dyn ChunkSource + Send + Sync>| {
+            let mut shares = HashMap::new();
+            shares.insert(share_id.clone(), ServedShare::new(content, room_key()));
+            decode_response(&serve(&mut shares, &req)).unwrap()
+        };
+
+        // Both serve the chunk while the file is untouched.
+        assert!(
+            serve_one(disk.clone()).is_some(),
+            "disk-backed source serves the chunk before the file changes"
+        );
+        assert!(
+            serve_one(ram.clone()).is_some(),
+            "in-RAM source serves the chunk before the file changes"
+        );
+
+        // Change the file's length on disk, after both sources were built.
+        std::fs::write(&file, [7u8; 32]).unwrap();
+
+        assert!(
+            serve_one(disk).is_none(),
+            "disk-backed source fails closed once its file no longer matches the manifest"
+        );
+        assert!(
+            serve_one(ram).is_some(),
+            "in-RAM source still serves its publish-time copy — the behaviour #246 removed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

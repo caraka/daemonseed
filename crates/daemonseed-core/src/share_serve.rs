@@ -322,6 +322,14 @@ pub trait ChunkSource {
     /// a disk-backed file that changed since hashing). The serve loop relays
     /// no frame in that case: the source never fabricates content
     /// (ISC-A-S21).
+    ///
+    /// A conforming implementation must never let [`Self::manifest`] advertise
+    /// an address this method would answer with bytes that are not that
+    /// address's content. Answering `None` is always allowed — it degrades to
+    /// the offline-equivalent NOT_FOUND — but answering *wrong* bytes is the
+    /// one thing a source may not do. The bound is stated here because the
+    /// serve registry holds `dyn ChunkSource`, so this contract is no longer
+    /// local to the two implementations in this module.
     fn chunk(&self, addr: &ChunkAddr) -> Option<Vec<u8>>;
 
     /// Pure request → response: given a decoded inbound [`ShareFrame`], return

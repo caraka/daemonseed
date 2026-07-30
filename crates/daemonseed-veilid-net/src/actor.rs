@@ -17,7 +17,7 @@ use veilid_core::{
 use daemonseed_core::dm::paging::{DmPageAddress, PagePosition, Receiving, Sending};
 use daemonseed_core::public_room::PublicRoomKey;
 use daemonseed_core::share_envelope::ManifestEntry;
-use daemonseed_core::share_serve::ShareContent;
+use daemonseed_core::share_serve::ChunkSource;
 use daemonseed_core::storage::cas::ChunkAddr;
 
 use crate::config::VeilidNetConfig;
@@ -311,11 +311,11 @@ enum Command {
         reply: oneshot::Sender<Result<DmPageSweep>>,
     },
     // ── Public-share content (Phase 3) ──
-    /// Register an indexed share to serve owner-on-demand (`share_id` → content
+    /// Register a share to serve owner-on-demand (`share_id` → content source
     /// + the `PublicRoomKey` bytes responses seal under).
     ServeShare {
         share_id: String,
-        content: Arc<ShareContent>,
+        content: Arc<dyn ChunkSource + Send + Sync>,
         room_key: [u8; 32],
         reply: oneshot::Sender<Result<()>>,
     },
@@ -662,15 +662,19 @@ impl VeilidNetHandle {
 
     // ── Public-share CONTENT transfer (Phase 3): owner-on-demand over app_call ──
 
-    /// Register an indexed share to serve owner-on-demand. The actor answers
-    /// inbound fragment `app_call`s for `share_id` from `content`, sealing each
-    /// response under `room_key` (the share's `PublicRoomKey` bytes). The sharer
-    /// must stay online to serve (ISC-A-S21); discovery (`publish_room`) is what
-    /// advertises it.
+    /// Register a share to serve owner-on-demand. The actor answers inbound
+    /// fragment `app_call`s for `share_id` from `content`, sealing each response
+    /// under `room_key` (the share's `PublicRoomKey` bytes). The sharer must stay
+    /// online to serve (ISC-A-S21); discovery (`publish_room`) is what advertises
+    /// it.
+    ///
+    /// `content` is any [`ChunkSource`]: pass a `DiskShareContent` to serve a
+    /// published share at O(CHUNK_SIZE) memory per request (#246), or a
+    /// `ShareContent` to hold it in RAM.
     pub async fn serve_share(
         &self,
         share_id: String,
-        content: Arc<ShareContent>,
+        content: Arc<dyn ChunkSource + Send + Sync>,
         room_key: [u8; 32],
     ) -> Result<()> {
         self.send(|reply| Command::ServeShare {
@@ -1711,8 +1715,14 @@ async fn actor_loop(
 /// (open_or_create + DHT set) parks everything behind it for seconds — so
 /// serve requests bypass it entirely (2026-07-02 root cause; the earlier
 /// reply-spawn fix moved latency off the reply await but not off the queue).
-/// The registry lock is held only for the synchronous serve (map lookup +
-/// in-memory seal), never across the reply await.
+/// The serve step itself runs on a blocking thread, never on this task: since
+/// #246 a served share reads its chunk from disk at answer time
+/// (`DiskShareContent`), so the map lookup + read + seal is real blocking I/O
+/// plus CPU, and ISC-A-C35 requires every per-chunk disk read to run on a
+/// blocking thread. The registry lock is taken and released inside that blocking
+/// step — never held across the reply await, and never held on a runtime worker
+/// during the disk read (which would also stall the actor's own
+/// `ServeShare`/`StopServe` locks and the advert watchdog's `last_served` read).
 async fn serve_loop(
     api: VeilidAPI,
     shares: Arc<Mutex<HashMap<String, share::ServedShare>>>,
@@ -1754,14 +1764,28 @@ async fn serve_loop(
             );
             continue;
         }
-        // Recover the guard if another holder panicked: a poisoned registry
-        // must not cascade into the actor's later ServeShare/StopServe locks.
+        // Serve on a blocking thread (ISC-A-C35): a disk-backed share reads its
+        // chunk from the filesystem here, and that must not run on a runtime
+        // worker. Recover the guard if another holder panicked: a poisoned
+        // registry must not cascade into the actor's later ServeShare/StopServe
+        // locks. A JoinError means the blocking step itself panicked — reply
+        // NOT_FOUND (the offline-equivalent, ISC-A-S21) rather than leaving the
+        // fetcher to burn its answer window on a reply that will never come.
         let seal_started = std::time::Instant::now();
-        let response = {
-            let mut s = shares
+        let serve_shares = shares.clone();
+        let response = match tokio::task::spawn_blocking(move || {
+            let mut s = serve_shares
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             share::serve(&mut s, &message)
+        })
+        .await
+        {
+            Ok(response) => response,
+            Err(e) => {
+                crate::vtrace!("serve: blocking serve step failed ({e}); replying NOT_FOUND");
+                share::encode_response_not_found()
+            }
         };
         let seal_ms = seal_started.elapsed().as_millis();
         // Reply on a spawned task: awaiting `app_call_reply` inline serializes
