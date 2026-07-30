@@ -24,6 +24,11 @@ next release this block is renamed to its version + date and a fresh
 `[Unreleased]` is opened (see `AGENTS.md` doc-sync). Planning for *unstarted*
 work lives in the project lead's vault manifest, not here.
 
+### Changed
+
+- The release profile panics on integer overflow (`[profile.release]
+  overflow-checks = true`), workspace-wide. (#258)
+
 ## [0.36.3] — 2026-07-28
 
 ### Added
