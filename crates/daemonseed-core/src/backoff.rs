@@ -71,10 +71,22 @@ impl BackoffPolicy {
     /// point in the jitter band; result = `delay * (1 + jitter_frac * unit)`,
     /// clamped to ≥ 0.
     pub fn jitter(&self, delay: Duration, unit: f64) -> Duration {
-        let unit = unit.clamp(-1.0, 1.0);
-        let factor = (1.0 + self.jitter_frac * unit).max(0.0);
-        delay.mul_f64(factor)
+        apply_jitter(delay, self.jitter_frac, unit)
     }
+}
+
+/// Apply ±`frac` jitter to `delay`. `unit` ∈ [-1.0, 1.0] selects the point in
+/// the band; result = `delay * (1 + frac * unit)`, clamped to ≥ 0.
+///
+/// **The one definition of jitter in the workspace**, free of any policy so a
+/// caller with its own curve can reach it — [`crate::dm::outbox`] has an explicit
+/// rung ladder rather than an exponential one, and a second copy of this
+/// arithmetic beside it would be drift in the shape the DM design's own build
+/// notes keep recording.
+pub fn apply_jitter(delay: Duration, frac: f64, unit: f64) -> Duration {
+    let unit = unit.clamp(-1.0, 1.0);
+    let factor = (1.0 + frac * unit).max(0.0);
+    delay.mul_f64(factor)
 }
 
 /// Per-server-id, per-session reconnect state (ISC-C26).
@@ -228,6 +240,39 @@ mod tests {
         assert_eq!(p.jitter(secs(4), -1.0), Duration::from_millis(3000));
         assert_eq!(p.jitter(secs(4), 1.0), Duration::from_millis(5000));
         assert_eq!(p.jitter(secs(4), 0.0), Duration::from_millis(4000));
+    }
+
+    /// **The `unit` clamp is a bound on the caller, and nothing tested it.**
+    ///
+    /// `apply_jitter` is the workspace's one definition of jitter and is reached
+    /// by [`crate::dm::outbox::ReseedSchedule::schedule_next`] as well as by
+    /// [`BackoffPolicy::jitter`]. Removing `unit.clamp(-1.0, 1.0)` lets a caller
+    /// passing an out-of-band unit push the resulting delay arbitrarily far out
+    /// — for the outbox that is a `next_due_ms` a caller can place past its own
+    /// give-up, i.e. a message that stops being re-seeded on nothing but a bad
+    /// argument.
+    #[test]
+    fn jitter_clamps_a_unit_outside_the_band() {
+        let frac = DEFAULT_JITTER_FRAC;
+        // Past the top of the band, the result stops moving.
+        assert_eq!(
+            apply_jitter(secs(4), frac, 5.0),
+            apply_jitter(secs(4), frac, 1.0)
+        );
+        assert_eq!(apply_jitter(secs(4), frac, 1e9), secs(5));
+        // And past the bottom.
+        assert_eq!(
+            apply_jitter(secs(4), frac, -5.0),
+            apply_jitter(secs(4), frac, -1.0)
+        );
+        assert_eq!(apply_jitter(secs(4), frac, -1e9), secs(3));
+        // Positive control: inside the band the unit still moves the result, so
+        // these assertions are not passing because jitter does nothing at all.
+        assert_ne!(
+            apply_jitter(secs(4), frac, 1.0),
+            apply_jitter(secs(4), frac, 0.0),
+            "jitter is inert, so the clamp assertions above prove nothing"
+        );
     }
 
     #[test]

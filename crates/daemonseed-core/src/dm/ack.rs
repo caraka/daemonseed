@@ -654,7 +654,7 @@ impl AckState {
     ///
     /// It does **not** carry the high-water. That travels as its own field, is
     /// bound as its own component of the signature preimage, and is an argument to
-    /// [`Self::decode`], because a run set is meaningless without knowing where
+    /// [`Self::decode_unvalidated`], because a run set is meaningless without knowing where
     /// the prefix it sits beyond ends.
     pub fn encode_beyond(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(COUNT_LEN + self.beyond.len() * RUN_LEN);

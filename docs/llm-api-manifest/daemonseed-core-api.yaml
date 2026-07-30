@@ -979,8 +979,8 @@ modules:
       settled on the same terms as is_settled.
       AckState carries no chan_id, and neither encode_beyond nor
       decode_unvalidated takes one. NOT YET AVAILABLE: the ack record, its seal,
-      its jittered standalone cadence, the piggyback path and the persisted outbox
-      (#235 transport half).
+      its jittered standalone cadence and the piggyback path (#235 transport
+      half).
       Sub-module dm::collect is the pure collection state machine for one
       direction of one conversation. Collection::new() holds two pointers:
       frontier_page() -> Option<u64> is the highest page observed holding any
@@ -1016,6 +1016,67 @@ modules:
       found_at, one layer above. NOT YET AVAILABLE: persistence and restore, the
       doorbell sweep, the accept/decline/block flow, the contact cache, the block
       list, the transport wiring and the UI (#236, #243).
+      Sub-module dm::outbox is the persisted sender-side outbox for one
+      direction of one correspondence. Outbox::new(direction: Direction) keys
+      OutboxEntry by sequence number over one monotonic space covering the
+      doorbell knock at sequence 0 and every channel message after it;
+      direction() reads it and there is no Default, because a sequence number
+      means nothing without a direction and an acknowledgement is per-direction.
+      enqueue_sealed(seq, target, now_ms, frame) and
+      enqueue_awaiting_key(seq, target, now_ms) -> Result<&mut
+      OutboxEntry, OutboxError> add one, taking the caller's clock as the compose
+      time; a repeat is OutboxError::DuplicateSequence. OutboxTarget is Doorbell { slot },
+      validated against DOORBELL_SLOTS, or ChannelPage; the record key is not
+      carried and OutboxEntry::position() derives the page slot from the sequence
+      number. Lifecycle is AwaitingKey,
+      AwaitingCollection(SealedFrame), ConfirmedCollected or Undelivered, and
+      is_pending() is the first two. SealedFrame::new(Vec<u8>) wraps sealed bytes
+      and exposes as_bytes/len/is_empty only; there is no mutating accessor.
+      OutboxEntry::publish(now_ms, frame) is the only edge that installs a frame
+      and accepts only AwaitingKey, returning OutboxError::AlreadyPublished
+      otherwise. emit(now_ms, unit) -> Result<&[u8], OutboxError> returns the
+      stored bytes borrowed and advances the schedule; retry_key_fetch(now_ms,
+      unit) advances it for an unsealed entry. All three return
+      OutboxError::NothingToEmit in an inapplicable or terminal state and
+      OutboxError::GaveUp when the entry is live but past its give-up window —
+      two distinct answers, because the second names a message the caller still
+      owes a surfacing. is_due(now_ms) is false past the window too, so the
+      window bounds emission whether or not sweep_give_ups has run. delivery_state() maps the lifecycle
+      to DeliveryState (Composed, OnDht, ConfirmedCollected, Undelivered); a
+      sealed entry that has never been emitted is Composed, and OnDht means
+      handed to the transport, not accepted by the DHT (M2 — no write-outcome
+      state exists yet). ReseedSchedule::new(now_ms) starts due immediately;
+      schedule_next(now_ms, unit) consumes one rung of RESEED_LADDER (1, 2, 4, 8,
+      16, 32, 64 minutes, then 60, then 86400 seconds repeating), jittered by
+      RESEED_JITTER_FRAC through backoff::apply_jitter, and
+      schedule_next_jittered(now_ms) draws the unit from the OS CSPRNG;
+      delay_for_rung(rung) is the un-jittered rung. due(now_ms) -> Vec<u64> lists
+      entries due; sweep_give_ups(now_ms) -> Vec<u64> moves pending entries at or
+      past GIVE_UP_MS (604800000) from composed_at_ms to Undelivered and returns
+      them once. settle_from_ack(ack: &AckState, now_ms) -> Vec<u64> confirms
+      only entries that are AwaitingCollection and inside their give-up window;
+      the ack must already be verified. Both are #[must_use]: each return value
+      is the sole notification of its transition and nothing re-offers it.
+      channel_torn_down(&TeardownCause, now_ms) -> TeardownOutcome { retained,
+      surfaced } surfaces any pending entry past its give-up window whatever the
+      cause, then retains published entries with their bytes, surfaces AwaitingKey
+      entries as Undelivered, and changes nothing further on
+      TeardownCause::StoreUnreadable. TeardownOutcome is #[must_use] as a type,
+      so the obligation travels with the value rather than only binding at the
+      call. encode() / decode(bytes, now_ms) ->
+      Result<Outbox, OutboxError> are the at-rest form under OUTBOX_MAGIC
+      (daemonseed/dm/outbox/v1\0), plaintext, carrying no key material and no
+      message text; decode rejects a wrong magic, a truncation, an unknown tag, a
+      doorbell slot outside the record, a duplicate sequence and trailing bytes.
+      A stored composed_at_ms ahead of now_ms is REFUSED as
+      OutboxError::ComposedInFuture { seq, ahead_ms } and never rewritten: the
+      file is unsealed, and a future compose time disables the give-up
+      permanently, while clamping it would make one bad boot clock a durable
+      corruption that gives up on every live message. next_due_ms is taken
+      verbatim and needs no bound — the give-up reads composed_at_ms, so a
+      far-future due time still sweeps and still surfaces. NOT YET AVAILABLE:
+      any store that writes or reads an outbox, and the transport that emits from
+      one (#235 transport half).
       Sub-module dm::domain
       declares the daemonseed/dm/… label namespace, one distinct prefix-free label
       per purpose.
@@ -1352,7 +1413,10 @@ modules:
       Client reconnect backoff curve + close-cause categorization (M9, ISC-C26).
       Exponential 1s->60s x2 with +/-25% jitter and an 8-retry per-server-id
       budget; a uniform close-cause layering that never names which rate-limit
-      was hit (A-S12).
+      was hit (A-S12). apply_jitter(delay, frac, unit) is the free function
+      applying +/-frac jitter at unit in [-1, 1], clamped to >= 0 — the one
+      definition of jitter in the workspace, called by BackoffPolicy::jitter and
+      by dm::outbox's rung ladder.
     no_std: false
     depends_on:
       - daemonseed_core::trust_events
@@ -2961,7 +3025,7 @@ types:
   - name: BackoffPolicy
     module: daemonseed_core::backoff
     kind: struct
-    description: "delay_for_attempt(attempt) (saturating, no overflow); jitter(delay, unit)."
+    description: "delay_for_attempt(attempt) (saturating, no overflow); jitter(delay, unit), which delegates to backoff::apply_jitter."
 
   - name: Backoff
     module: daemonseed_core::backoff

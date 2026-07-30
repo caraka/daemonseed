@@ -106,6 +106,43 @@ work lives in the project lead's vault manifest, not here.
 
 ### Added
 
+- `daemonseed_core::dm::outbox` holds the persisted DM outbox (#235).
+  `Outbox::new(Direction)` keys `OutboxEntry` by sequence number over one
+  direction of one correspondence, covering the doorbell knock at sequence 0 and
+  every channel message after it; `direction()` reads it and there is no
+  `Default`. An entry carries an `OutboxTarget` (`Doorbell { slot }` /
+  `ChannelPage`), the compose timestamp, a `ReseedSchedule` and a `Lifecycle`.
+  `Lifecycle` is `AwaitingKey`, `AwaitingCollection(SealedFrame)`,
+  `ConfirmedCollected` or `Undelivered`; `OutboxEntry::delivery_state` maps it to
+  `DeliveryState` (`Composed` / `OnDht` / `ConfirmedCollected` / `Undelivered`),
+  with a sealed-but-never-emitted entry reading `Composed`. `SealedFrame` has no
+  mutating API, and `OutboxEntry::publish(now_ms, frame)` is the only edge that
+  installs one. `emit(now_ms, unit)` returns the stored bytes borrowed and
+  advances the schedule; `retry_key_fetch(now_ms, unit)` advances it for an
+  unsealed entry. All three take the clock and refuse an entry past its give-up
+  window with `OutboxError::GaveUp`, which is distinct from
+  `OutboxError::NothingToEmit`: the first is a live message owed a surfacing, the
+  second a terminal or inapplicable state needing nothing. `is_due` is false past
+  the window too. `RESEED_LADDER` is 1/2/4/8/16/32/64 minutes, hourly, then daily
+  repeating, jittered per emission by `RESEED_JITTER_FRAC` through
+  `backoff::apply_jitter`. `Outbox::due` lists entries due at a clock value,
+  `sweep_give_ups` moves entries past `GIVE_UP` (7 days from compose) to
+  `Undelivered`, and `settle_from_ack(ack, now_ms)` confirms only entries that
+  are `AwaitingCollection` and inside that window; both return the sequences they
+  moved and both are `#[must_use]`.
+  `channel_torn_down(&TeardownCause, now_ms)` returns a `TeardownOutcome`
+  (`#[must_use]` on the type): entries past the give-up window surfaced as
+  `Undelivered` whatever the cause, published entries retained with their bytes,
+  unsealed entries surfaced, and nothing else changed on
+  `TeardownCause::StoreUnreadable`.
+  `enqueue_sealed` / `enqueue_awaiting_key` take the caller's clock as the
+  compose time, so an entry composed outside the give-up window has no spelling.
+  `encode` / `decode(bytes, now_ms)` are the at-rest form under `OUTBOX_MAGIC`;
+  `decode` refuses an entry whose stored compose time is ahead of `now_ms` with
+  `OutboxError::ComposedInFuture` and rewrites no stored value. No caller writes
+  or reads one.
+- `daemonseed_core::backoff::apply_jitter(delay, frac, unit)` applies `±frac`
+  jitter to a delay. `BackoffPolicy::jitter` calls it.
 - `daemonseed_core::dm::collect` holds the pure DM collection state machine.
   `Collection` carries the probe frontier — the highest page observed holding any
   populated slot — and an `AckState` for the contiguous cursor. `observe_page`
