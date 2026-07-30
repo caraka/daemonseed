@@ -695,4 +695,84 @@ Corrections found while building, recorded here rather than by editing the froze
 
 - **2026-07-30 — the give-up clock is the one number in the outbox an unsealed file must not be believed about, and the fix is to refuse the record rather than repair it.** The give-up is what makes *"marked undelivered in the UI, never silently abandoned"* true, and it is computed from a single stored timestamp. A `composed_at_ms` in the future switches it off permanently and invisibly — `is_given_up` answers false at every clock the user will ever see, so the entry never gives up, never sweeps, never surfaces, and re-seeds until something else stops it. The reflex fix, clamping to the caller's clock, is the more dangerous of the two: it rewrites persisted state from one unverified reading, so a boot with a dead RTC ten days slow rewrites every live entry, the next write persists it, and the moment the clock corrects the whole file is past its window and given up — every pending message reported failed, from a fault that had already passed. **Refusal is the only non-destructive option**, and the "but refusing discards the other pending messages" objection does not apply to it: nothing is written, the caller keeps the bytes, and a later decode with a good clock returns the record intact. The asymmetry is worth naming for anything else that persists a clock here: **a value we cannot verify may bound what we do, but must never overwrite what we were told.** `next_due_ms` needs no such guard, because the give-up does not read it — a corrupt one costs emissions, not the guarantee.
 
+## Amendment A1 — channel re-establishment after a restart (2026-07-30; PENDING caraka ratification)
+
+**This is a construction amendment, not a build note.** The build-notes section above is explicitly notation-and-wording only; this changes the construction, so it is recorded separately per the status footer's "any change now is a deliberate, reviewed amendment." It is **not in force until caraka ratifies.** Panel-validated 2026-07-30 by a 3-lens round (crypto/replay · correlation/metadata · erasure/availability) run as adversarial *validation across competing options*, not as an attack on one proposal.
+
+### The gap this closes
+
+`ss0` is deleted at establishment (the F1 fix, § D-PFS) and — per the #243 scope decision — the steady-state ratchet is not persisted either. So a restart tears down every open channel and **v6 defines no resumption path.** #262 surfaced the conflict from the other side: build slice #236's scope text has the contact cache retaining `ss0`, which `§ D-PFS` forbids ("only `AR` is retained"). #236's scope line is the error; the design is not open on that point, and retaining `ss0` is not a live option — it regenerates `RK0` and with it every message key the ratchet believes it deleted.
+
+### What is retained at rest, exactly
+
+Per correspondent, under the profile seal: **`AR`** (already retained by v6), **`RS_n`** (new, below), the **`reconnect_gen` counter `n`**, a non-secret **`previously_established`** marker, and the correspondent's long-term public key plus cached EK. **Deleted:** `ss0`, `chan_id`, and all ratchet state.
+
+### The construction
+
+**A fourth sibling.** At establishment, alongside `AR` and `chan_id` from `HKDF-Extract(DM_ROOT_SALT, ss0)` and `RK0` from the same PRK, derive `RS_0 = HKDF-Expand(PRK, DM_REESTAB_ROOT)` — a fourth Expand sibling under a new label, at `ROOT_LEN`. It is a sibling and not a chain for the same reason the other three are: the retained value must never yield the deleted one.
+
+**The re-establish frame rides the existing channel plane.** It is written to the next page slot of the initiator's sending direction on the `AR`-derived paging plane — the record whose write authority only the two parties hold. **No doorbell write, no key-record fetch, no admission interaction, no proof-of-work.** The peer finds it by the sweep it already performs on cached channel records; v6's "the doorbell is not consulted after first contact" is preserved rather than weakened.
+
+**Sealing.** `reestab_prk = HKDF-Extract(DM_REESTAB_SALT, RS_n)`; seal key `K = HKDF-Expand(reestab_prk, DM_REESTAB_SEAL ‖ lp(u64-BE(n+1)))`. The AAD follows `firstcontact::seal_aad`'s prefix-then-`push_lp` shape and binds the recipient's key-record address, a commitment to `AR` (a hash, never `AR` itself), the direction, and `n+1`. Nonce per the global rule — fresh random per seal, never derived from the counter.
+
+**The new root.** The responder encapsulates to the fresh ephemeral ML-KEM-1024 key carried in the frame, yielding `ss_new`, and both parties compute `RK_0' = advance_root(RS_n, ss_new)` using the existing function unchanged — previous root as extraction salt, fresh secret as IKM. This is what makes a holder of `RS_n` alone unable to read the resumed channel: `advance_root`'s own contract is that "one who holds the old root cannot compute it without the new secret."
+
+### Clause 1 (MANDATORY) — `RS` ratchets on every successful reconnect
+
+`RS_{n+1} = HKDF-Expand(HKDF-Extract(DM_REESTAB_SALT, RS_n ‖ ss_new), DM_REESTAB_NEXT)`, computed by both parties (both hold `RS_n`; the initiator decapsulates `ss_new`, the responder encapsulated it), with `RS_n` zeroized and its at-rest slot overwritten in place.
+
+Without this clause `RS` is a **static, immortal at-rest credential** granting channel-resume authority for the life of the relationship, which nullifies D-PFS's post-compromise healing against a single profile-seal compromise — and a static `RS` cannot be rotated from a deleted `ss0`, so there would be no later opportunity to fix it. The erasure lens judged the amendment refuted without this clause; it is not optional.
+
+### Clause 2 (MANDATORY) — a strictly-increasing `reconnect_gen`, bound and checked
+
+`n` is bound into both the seal-key derivation info and the frame AAD (above), and a frame carrying `gen ≤ n_stored` is **rejected**, not merely ignored. Without it, a fixed `RS` reused as extraction salt lets a replayed re-establish frame re-derive an already-consumed root — message-key reuse and a ratchet rollback.
+
+Clause 1 largely subsumes this: a ratcheting `RS` is monotonic by construction, so a replayed frame's key no longer derives at all. The counter is retained as the **explicit, checkable** form, because "the derivation happens to fail" is not an enforcement a reviewer can verify and a future refactor could restore a static salt without tripping anything.
+
+### Clause 3 (MANDATORY) — a re-establish implies immediate-Undelivered for the dead chain
+
+A peer's restart deletes their receive chain, so frames already published under the previous chain are **permanently undecryptable** even though `AR` keeps their addresses valid. On a successful re-establish, every outbox entry sealed under the previous chain is marked **Undelivered immediately**, re-seeding stops, and the UI surfaces them. They are **not** re-sealed: § m7 forbids a second distinct ciphertext for one logical message, and the outbox has one frame-installing edge with no edge back.
+
+Without this rule the sender re-seeds dead frames for the full seven days and reports them as in flight — the same misinformed-UI defect #261 exists to prevent, reached by a different road. The amendment's advantage over #261's situation is that its teardown signal is **authenticated**, where a doorbell knock is a world-writable one.
+
+### Simultaneous mutual re-establish
+
+Both parties may restart before either reconnects, and each then mints its own ephemeral, so the two candidate `ss_new` values differ. Deterministic tiebreak, no extra round trip: on observing a competing re-establish at the same `gen`, **the frame whose `eph_ek` has the lexicographically smaller SHA-384 digest wins**; the loser adopts the winner's `RK_0'` and `RS_{n+1}` and discards its own. Both parties compute the same answer from data both hold. The tiebreak is on the *frames*, not on identity roles, because whichever party restarted must be able to initiate.
+
+### Cold start is unchanged, deliberately
+
+A reinstall from mnemonic loses `RS`, so genuine cold start and device recovery (M11) still go through the doorbell exactly as v6 specifies. The doorbell therefore remains a **once-per-relationship** surface, which preserves the basis on which its `dflt(32)` / 32-slot sizing was accepted ("established contacts leave the doorbell").
+
+### The honest security property — what changes and what does not
+
+§ D-PFS's statement stands unchanged: **content forward secrecy holds; address-linkability is not forward-secret.** This amendment adds one clause and no more: a compromise of at-rest state additionally yields **channel-resume authority until the next successful reconnect ratchets `RS`**. It does not yield past message keys (`RS` is an Expand sibling of the PRK, not the PRK) and does not passively yield the resumed channel's content (the resumed root requires the fresh KEM secret). Active impersonation is available to an at-rest compromise regardless, because the long-term identity key is also at rest. State exactly this — no overclaim.
+
+### Why the alternatives were refused
+
+Both were refuted on all three axes; full findings in `PAI/MEMORY/WORK/20260730-dm-reestablishment-amendment/ISA.md`.
+
+- **Reconnect via a fresh doorbell knock, with a previously-established marker bypassing admission** — refuted three times. It collides with the frozen verifier rule at § Crypto MINOR invariants (b): keep that rule and the reconnect is rejected as an idempotent re-accept, drop it and any doorbell reader replays a captured entry for up to two `FC_PERIOD`s to force ratchet resets on demand. **Both branches deny.** It also converts the doorbell — world-writable from the recipient's public key alone, and by design "best-effort under attack" — from a first-contact nuisance into the routine continuation path, so a wipe loop denies *all* DM to a target permanently rather than only new relationships, regressing the closed E9/e7-D7 finding. And it leaks a recurring per-correspondent restart-and-cadence beacon plus a contact count on the one world-readable record, where v6 pays that once per relationship ever. Finally it discards the retained `AR` on every reconnect (a fresh knock mints a fresh `ss0`), so two parties restarting before either reconnects split-brain with nothing to tie-break them.
+- **No reconnect at all — a restart means a new conversation.** Viable and unchanged in cost, and it remains the honest fallback if this amendment is not ratified. Rejected on the ambition call (caraka, 2026-07-30): a resumption requiring the correspondent to act is not acceptable, and under invite-only admission it requires a fresh one-time token issued out of band on every restart.
+
+### Preconditions before this can be claimed, not merely built
+
+- **#282** — the four sibling roots need known-answer tests pinning their bytes. The existing `the_three_roots_from_ss0_are_independent` asserts only pairwise distinctness: it passes for any distinct labels and would pass if `AR` were chained from `RK0`, so it cannot support this amendment's independence claim. The defect that matters is a copy-paste passing `DM_RATCHET_ROOT` into the `RS` expand, making `RS == RK0` and silently voiding the whole `ss0`-deletion story; only a KAT catches it.
+- **#281** — there is no writer anywhere under `dm/`, so `ss0` erasure, `RS` retention and `RS` rotation are all unrealized until the store lands. Shared with the frozen design rather than introduced here, but Clause 1 is unenforceable without it.
+- The new labels (`DM_REESTAB_ROOT`, `DM_REESTAB_SALT`, `DM_REESTAB_SEAL`, `DM_REESTAB_NEXT`) join `domain.rs`'s `ALL` for the enforced prefix-freeness test and `labels_are_byte_pinned`.
+
+### Verification obligations the build owes
+
+Each must be shown able to **fail**, not merely to pass.
+
+1. KATs pinning all four sibling roots for a fixed `ss0` — proven by refactoring the fan-out into a chain and observing red.
+2. `RS_{n+1}` differs from `RS_n` **and** depends on both `RS_n` and `ss_new`, two-sided, in the shape of the existing `advance_depends_on_both_inputs`.
+3. A re-establish frame at `gen ≤ n_stored` is rejected.
+4. After a reconnect, `RS_n`'s bytes are absent from the store's at-rest form and from the freed allocation (the existing zeroize-witness harness).
+5. A re-establish marks every prior-chain outbox entry Undelivered immediately, and re-seeds none of them.
+6. Two simultaneous re-establishes converge: both parties compute the same `RS_{n+1}`, the same `RK_0'`, and the same next address.
+
+### On ratification
+
+The ISC-C38–C46 / A-C20–A-C25 family in `ISA.md` gains criteria for the three clauses and the six obligations above, and #262 closes citing this section. Until then #262 stays open and #236's contact-cache scope line stands corrected but unamended.
+
 **Status: FROZEN 2026-07-28 (caraka ratified).** DRAFT v6 is the design-of-record. The ISC-C38–C46 / A-C20–A-C25 family in `ISA.md` is re-cut to v6, the build-slice issues are open (#177 forced), and this doc is the frozen reference for the build. Any change now is a deliberate, reviewed amendment — not a redraft.
