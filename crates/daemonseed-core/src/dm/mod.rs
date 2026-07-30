@@ -71,4 +71,5 @@ pub mod firstcontact;
 pub mod frame;
 pub mod keyrec;
 pub mod paging;
+pub mod provisional;
 pub mod ratchet;

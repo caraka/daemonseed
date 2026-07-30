@@ -135,27 +135,47 @@ work lives in the project lead's vault manifest, not here.
   three inline-arm identity-rooted secrets.
   (#242)
 
-- DM ratchet state survives a restart — `daemonseed_core::dm::ratchet`
-  (`Ratchet::snapshot`, `Ratchet::restore`, `RatchetSnapshot`,
-  `RatchetSnapshotError`, `RATCHET_SNAPSHOT_MAGIC`). `snapshot()` captures the
-  role, generation, root, both chains with their keys and cursors, the retained
-  ephemerals, the peer ephemeral and last-consumed generation, the next outbound
-  sequence number, the skipped-key cache in eviction order, and the evicted and
-  abandoned counts. `RatchetSnapshot::encode() -> Zeroizing<Vec<u8>>` and
-  `decode(&[u8])` are the at-rest form: `RATCHET_SNAPSHOT_MAGIC` then a
-  fixed-width big-endian body, optional fields led by a presence marker and
-  repeated fields by a `u16` count refused past its bound before allocation.
-  The encoding is plaintext key material and carries no `chan_id` and no `AR`;
-  a store seals it and erases each superseded snapshot in place. `restore()`
-  rejects a snapshot missing its role's chain, a sending chain with no ephemeral
-  of its own, a recipient with no peer ephemeral, a chain cursor before its base
-  or at `u64::MAX`, a chain hanging from a generation ahead of the
-  conversation's, a next sequence number disagreeing with the sending chain's
-  cursor — or, with no sending chain, with `FIRST_RECIPIENT_CHANNEL_SEQ` —
-  ephemerals out of ascending order or past `EPHEMERAL_WINDOW`, an ephemeral
-  whose halves are not a keypair, a newest ephemeral whose generation neither
-  brackets the conversation's nor matches the sending chain's, a cache past
-  `SKIPPED_KEY_CAPACITY`, and two cache entries claiming one `KeySlot`. (#243)
+- DM restart handling — `daemonseed_core::dm::provisional` (`ProvisionalRecord`,
+  `ProvisionalError`, `ChannelRestart`, `Teardown`, `TeardownCause`,
+  `ReceiveCursor`, `RecordContext`, `derive_seal_key`,
+  `PROVISIONAL_RECORD_VERSION`, `PROVISIONAL_PLAINTEXT_LEN`,
+  `PROVISIONAL_RECORD_LEN`, `BINDING_TAG_LEN`). The steady-state ratchet is not
+  persisted. `ProvisionalRecord` holds `{ss0, eph_ek, eph_dk}` for a
+  pre-establishment channel and recomputes `AR`, `chan_id` and the ratchet root
+  from `ss0`; `address_root()`, `eph_ek()` and the consuming `into_ratchet()`
+  read it. `seal(&Aes256Key, &RecordContext)` / `open(&Aes256Key, &[u8],
+  &RecordContext)` are the at-rest form — one fixed `PROVISIONAL_RECORD_LEN`,
+  `nonce ‖ AES-256-GCM(version ‖ binding ‖ ss0 ‖ eph_ek ‖ eph_dk) ‖ tag` under
+  AAD `daemonseed/dm/provisional/aad/v1 ‖ lp(recipient_keyrec_addr) ‖
+  lp(fc_epoch)`, written to a fixed-size file overwritten in place on
+  establishment. `RecordContext` is `{recipient_keyrec_addr, fc_epoch}`. The
+  `BINDING_TAG_LEN`-byte binding tag is HKDF-SHA-384 over `ss0` under salt
+  `daemonseed/dm/provisional/bind-salt/v1` and info
+  `daemonseed/dm/provisional/bind/v1 ‖ lp(eph_ek)`. `open()` rejects a record
+  that is not `PROVISIONAL_RECORD_LEN` bytes, one that does not authenticate
+  under the given `RecordContext`, one naming another
+  `PROVISIONAL_RECORD_VERSION`, one whose binding tag does not match its
+  contents, and one whose ephemeral halves are not a keypair.
+  `derive_seal_key(&[u8; AEAD_KEY_LEN])` is HKDF-SHA-384 under salt
+  `daemonseed/dm/provisional/salt/v1` and info
+  `daemonseed/dm/provisional/seal/v1`. `restart(Result<Option<&[u8]>, E>,
+  &Aes256Key, &RecordContext)` returns `ChannelRestart::HandshakeResumes` or
+  `ChannelRestart::TornDown`; a `Teardown` carries its `TeardownCause` and the
+  `TrustEventKey` it surfaces as. `ReceiveCursor` is a page number bounded by
+  `paging::MAX_PAGE`; `advance_to(page, read_through)` and
+  `from_be_bytes(bytes, read_through)` refuse a page past what the caller has
+  read. (#243)
+
+- `daemonseed_core::trust_events::TrustEventKey` gains
+  `DmChannelTornDownOnRestart` (`dm-channel-torn-down-on-restart`),
+  `DmProvisionalHandshakeLost` (`dm-provisional-handshake-lost`) and
+  `DmProvisionalRecordUnreadable` (`dm-provisional-record-unreadable`), all
+  `PersistentNonBlocking`. (#243)
+
+- `daemonseed_core::dm::firstcontact::FirstContactState` carries `eph_ek` and
+  holds `ss0` as `Zeroizing<[u8; SS0_LEN]>` with no `Drop` impl, so its fields
+  move out; the fields are private, read through `roots()` and `eph_ek()`, and
+  `into_provisional()` consumes it into a `ProvisionalRecord`. (#255)
 
 - DM delivery-acknowledgement core — `daemonseed_core::dm::ack`
   (`derive_seal_key`, `ack_sig_input`, `AckState`, `PeerAckOutcome`,

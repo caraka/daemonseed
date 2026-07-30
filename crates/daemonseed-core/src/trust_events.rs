@@ -115,6 +115,32 @@ pub enum TrustEventKey {
     FederationPeerKeyDivergence,
     /// A federated server advertised no AGPL §13 source URL (finding F32).
     ServerSourceUnverified,
+    /// An established DM channel did not survive a restart and was torn down
+    /// (ISC-C44 / #243).
+    ///
+    /// Not an anomaly — the design persists no steady-state ratchet, because a
+    /// chain written down is a chain that was not deleted. The event exists
+    /// because the *user* must be told: without it a conversation that can no
+    /// longer send or receive still renders as an open thread, which is the
+    /// silent death #243 opened on.
+    DmChannelTornDownOnRestart,
+    /// A DM channel's provisional handshake record did not open or did not
+    /// validate, so a handshake in progress is stranded (#243).
+    ///
+    /// Distinct from the key above because the condition and the remedy differ —
+    /// an introduction to re-send rather than a conversation to re-establish —
+    /// and because this one can also mean tampering or a partial rollback of the
+    /// record, which deserves its own audit-log line.
+    DmProvisionalHandshakeLost,
+    /// A DM channel's provisional record could not be READ from the store at
+    /// startup -- an I/O or permission failure, not a cryptographic one (#243).
+    ///
+    /// Deliberately not [`Self::DmProvisionalHandshakeLost`]. That key means the
+    /// introduction is gone and must be sent again; this one means the record is
+    /// most likely still on disk and untouched, and the next start may resume it.
+    /// Collapsing the two would tell a user to re-introduce themselves over a
+    /// transient `EIO`, destroying a handshake that was recoverable.
+    DmProvisionalRecordUnreadable,
 }
 
 /// Every key, in declaration order. Used by exhaustiveness tests and any caller
@@ -138,6 +164,9 @@ pub const ALL_EVENT_KEYS: &[TrustEventKey] = &[
     TrustEventKey::ServerDeprecationPolicyExpiredOffline,
     TrustEventKey::FederationPeerKeyDivergence,
     TrustEventKey::ServerSourceUnverified,
+    TrustEventKey::DmChannelTornDownOnRestart,
+    TrustEventKey::DmProvisionalHandshakeLost,
+    TrustEventKey::DmProvisionalRecordUnreadable,
 ];
 
 /// The affordance class for a key (ISC-C28 per-event assignment table). Total
@@ -165,6 +194,19 @@ pub const fn class_of(key: TrustEventKey) -> TrustEventClass {
         ServerDeprecationPolicyExpiredOffline => PersistentNonBlocking,
         FederationPeerKeyDivergence => PersistentNonBlocking,
         ServerSourceUnverified => LogOnly,
+        // Both surface at every start until acted on, and neither blocks: the
+        // affected path is already gone, so there is nothing for a blocking
+        // affordance to hold back and no decision for the user to make. Not
+        // `Transient` either — a transient event is not written to the audit
+        // log, and a conversation ending unannounced in the log is the defect
+        // these keys exist to close.
+        DmChannelTornDownOnRestart => PersistentNonBlocking,
+        DmProvisionalHandshakeLost => PersistentNonBlocking,
+        // Recurs at every start until the store is readable again, and must be
+        // audited: a channel that could not be read is a channel that did not
+        // resume, and an unexplained non-resumption is the #243 defect wearing
+        // an operational hat.
+        DmProvisionalRecordUnreadable => PersistentNonBlocking,
     }
 }
 
@@ -192,6 +234,9 @@ pub const fn event_key_string(key: TrustEventKey) -> &'static str {
         ServerDeprecationPolicyExpiredOffline => "server-deprecation-policy-expired-offline",
         FederationPeerKeyDivergence => "federation-peer-key-divergence",
         ServerSourceUnverified => "server-source-unverified",
+        DmChannelTornDownOnRestart => "dm-channel-torn-down-on-restart",
+        DmProvisionalHandshakeLost => "dm-provisional-handshake-lost",
+        DmProvisionalRecordUnreadable => "dm-provisional-record-unreadable",
     }
 }
 
@@ -701,10 +746,11 @@ mod tests {
     }
 
     /// Every key maps to exactly one class, and the count matches the C28 table
-    /// plus the two M7 additions (F31, F32) = 18.
+    /// plus the two M7 additions (F31, F32) and the three DM restart keys
+    /// (#243) = 21.
     #[test]
     fn every_key_has_a_class() {
-        assert_eq!(ALL_EVENT_KEYS.len(), 18);
+        assert_eq!(ALL_EVENT_KEYS.len(), 21);
         for &k in ALL_EVENT_KEYS {
             // `class_of` is total; this just exercises every arm.
             let _ = class_of(k);
@@ -743,6 +789,34 @@ mod tests {
         );
         assert_eq!(class_of(FederationPeerKeyDivergence), PersistentNonBlocking);
         assert_eq!(class_of(ServerSourceUnverified), LogOnly);
+        assert_eq!(class_of(DmChannelTornDownOnRestart), PersistentNonBlocking);
+        assert_eq!(class_of(DmProvisionalHandshakeLost), PersistentNonBlocking);
+        assert_eq!(
+            class_of(DmProvisionalRecordUnreadable),
+            PersistentNonBlocking
+        );
+    }
+
+    /// A teardown must reach the audit log, which is what makes it loud rather
+    /// than merely returned (ISC-A-C12). `append` drops `Transient` events, so a
+    /// key mis-classed as transient would leave a conversation ending with no
+    /// record anywhere — the #243 failure mode wearing a different hat.
+    #[test]
+    fn a_dm_teardown_reaches_the_audit_log() {
+        for key in [
+            TrustEventKey::DmChannelTornDownOnRestart,
+            TrustEventKey::DmProvisionalHandshakeLost,
+            TrustEventKey::DmProvisionalRecordUnreadable,
+        ] {
+            let mut log = TrustEventLog::new(DEFAULT_LOG_CAP);
+            log.append(TrustEvent::observed(1_000, key, None, None));
+            assert_eq!(
+                log.entries().len(),
+                1,
+                "{} was dropped by the log",
+                event_key_string(key)
+            );
+        }
     }
 
     /// Stable strings round-trip and are all distinct (no two keys collide).

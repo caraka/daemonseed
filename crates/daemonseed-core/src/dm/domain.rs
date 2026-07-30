@@ -76,6 +76,53 @@ pub const DM_FC_SEAL: &[u8] = b"daemonseed/dm/fc/seal/v1";
 /// un-openable at a different recipient or outside its epoch window. FROZEN.
 pub const DM_FC_AAD: &[u8] = b"daemonseed/dm/fc/aad/v1";
 
+/// HKDF-Extract salt for the provisional handshake record's at-rest seal key,
+/// rooted in the profile's at-rest key material — **never** in `ss0`, which is
+/// what the record holds. Pairs with [`DM_PROVISIONAL_SEAL`] exactly as
+/// [`DM_FC_SALT`] pairs with [`DM_FC_SEAL`]. FROZEN.
+pub const DM_PROVISIONAL_SALT: &[u8] = b"daemonseed/dm/provisional/salt/v1";
+
+/// HKDF-Expand `info` for the provisional handshake record's AES-256-GCM seal
+/// key ([`crate::dm::provisional`]).
+///
+/// **Its own label rather than the first-contact seal's.** That one is keyed on
+/// `ss0` and protects an entry on the wire; this one is keyed on local at-rest
+/// material and protects a record on the medium. Deriving both from one label
+/// would mean a first-contact entry and a provisional record could open as each
+/// other wherever the two key inputs ever coincided. FROZEN.
+pub const DM_PROVISIONAL_SEAL: &[u8] = b"daemonseed/dm/provisional/seal/v1";
+
+/// AAD prefix for the provisional handshake record's at-rest seal. The
+/// correspondent's key-record address and the first-contact epoch follow it,
+/// length-prefixed — the same two fields [`DM_FC_AAD`] binds, for the same
+/// reason.
+///
+/// **Per-record, where the key is only per-profile.** [`DM_PROVISIONAL_SEAL`]
+/// derives ONE key for a whole profile, so without a per-record binding every
+/// provisional record in a profile is an interchangeable ciphertext: copy one
+/// channel's record over another's and it opens cleanly, the version matches and
+/// the halves pair, so the channel silently resumes as the wrong correspondent.
+/// Binding what the caller *expects* the record to be is what makes that splice
+/// fail to authenticate. FROZEN.
+pub const DM_PROVISIONAL_AAD: &[u8] = b"daemonseed/dm/provisional/aad/v1";
+
+/// HKDF-Extract salt for the provisional record's internal binding tag, rooted in
+/// `ss0`. Distinct from [`DM_PROVISIONAL_SALT`], which is rooted in the profile's
+/// at-rest material: the two extractions must not share a salt. FROZEN.
+pub const DM_PROVISIONAL_BIND_SALT: &[u8] = b"daemonseed/dm/provisional/bind-salt/v1";
+
+/// HKDF-Expand `info` for the provisional record's binding tag. The opening
+/// ephemeral's public half follows it, length-prefixed.
+///
+/// **The edge nothing else carried.** The AEAD authenticates the record's bytes
+/// and `EphemeralDecapKey::matches` binds the two ephemeral halves to each other,
+/// but nothing bound either of them to `ss0` — so a record splicing one channel's
+/// `ss0` onto another's ephemeral passed construction, the open and the ratchet
+/// handover, then failed every reply forever with `UnknownEphemeral`: the silent
+/// death #243 exists to abolish, reintroduced by the record meant to prevent it.
+/// FROZEN.
+pub const DM_PROVISIONAL_BIND: &[u8] = b"daemonseed/dm/provisional/bind/v1";
+
 /// Signature domain binding a per-contact pseudonym key to the long-term identity
 /// that vouches for it, signed under the LONG-TERM key. FROZEN.
 pub const DM_BIND_LT: &[u8] = b"daemonseed/dm/bind/lt/v1";
@@ -209,6 +256,11 @@ const ALL: &[&[u8]] = &[
     DM_FC_SALT,
     DM_FC_SEAL,
     DM_FC_AAD,
+    DM_PROVISIONAL_SALT,
+    DM_PROVISIONAL_SEAL,
+    DM_PROVISIONAL_AAD,
+    DM_PROVISIONAL_BIND_SALT,
+    DM_PROVISIONAL_BIND,
     DM_BIND_LT,
     DM_MSG_SIG,
     DM_MSG_AAD,
@@ -245,6 +297,14 @@ mod tests {
         assert_eq!(DM_FC_SALT, b"daemonseed/dm/fc/salt/v1");
         assert_eq!(DM_FC_SEAL, b"daemonseed/dm/fc/seal/v1");
         assert_eq!(DM_FC_AAD, b"daemonseed/dm/fc/aad/v1");
+        assert_eq!(DM_PROVISIONAL_SALT, b"daemonseed/dm/provisional/salt/v1");
+        assert_eq!(DM_PROVISIONAL_SEAL, b"daemonseed/dm/provisional/seal/v1");
+        assert_eq!(DM_PROVISIONAL_AAD, b"daemonseed/dm/provisional/aad/v1");
+        assert_eq!(
+            DM_PROVISIONAL_BIND_SALT,
+            b"daemonseed/dm/provisional/bind-salt/v1"
+        );
+        assert_eq!(DM_PROVISIONAL_BIND, b"daemonseed/dm/provisional/bind/v1");
         assert_eq!(DM_BIND_LT, b"daemonseed/dm/bind/lt/v1");
         assert_eq!(DM_MSG_SIG, b"daemonseed/dm/msg/sig/v6");
         assert_eq!(DM_MSG_AAD, b"daemonseed/dm/msg/aad/v4");

@@ -754,7 +754,10 @@ modules:
       static key, generates the opening ratchet ephemeral itself, signs bind_lt
       under the long-term key and msg_sig under the pseudonym, pads the encoded
       body to a PAD_BUCKETS entry, and seals it; it returns the entry bytes and a
-      FirstContactState { ss0, eph_dk, roots } the sender persists.
+      FirstContactState the sender keeps. That struct has no Drop impl — ss0 is
+      Zeroizing — so its fields move out; the fields are private, roots() and
+      eph_ek() borrow the non-secret ones, and into_provisional() is the sole exit,
+      consuming it into a dm::provisional::ProvisionalRecord.
       open(entry, recipient_dk, recipient_pk_lt, current_fc_epoch) decapsulates,
       opens against the current then previous epoch, exact-length gates every
       field, rejects a foreign intended_recipient_hash, and verifies bind_lt then
@@ -824,45 +827,72 @@ modules:
       UnknownEphemeral, MismatchedEphemeral, GenerationExhausted, NotYetEstablished,
       SkipTooLarge, SequenceExhausted, Module and EntropySource. A chain refuses
       to step past sequence u64::MAX rather than wrapping its cursor to zero.
-      snapshot() -> RatchetSnapshot
-      captures everything a conversation resumes from — role, generation, root,
-      both chains with their keys, bases and cursors, the retained ephemerals,
-      the peer ephemeral and last-consumed generation, next_send_seq, the
-      skipped-key cache in eviction order, and the evicted and abandoned counts.
-      It is infallible and leaves the live ratchet usable.
-      restore(RatchetSnapshot) -> Result<Ratchet, RatchetSnapshotError> rebuilds
-      it; each chain's direction is derived from the role. RatchetSnapshot is not
-      Clone, renders no bytes in Debug, and has no Drop of its own; every secret
-      field is a zeroize-on-drop newtype. encode() -> Zeroizing<Vec<u8>> is the
-      at-rest plaintext:
-      RATCHET_SNAPSHOT_MAGIC (daemonseed/dm/ratchet-state/v1\0) then a
-      fixed-width big-endian body, each optional field led by a presence marker
-      and each repeated field by a u16 count. decode(&[u8]) rejects a foreign
-      magic, a field running off the end, a count past its bound before
-      reserving for it, a discriminant outside its variants, and trailing bytes.
-      Neither chan_id nor AR appears in the encoding. restore additionally
-      rejects MissingChain, MissingOpeningEphemeral, MissingPeerEphemeral,
-      ChainCursorBeforeBase, ChainCursorExhausted, ChainGenerationAhead,
-      SendCursorMismatch, EphemeralsOutOfOrder, EphemeralGenerationOutOfRange,
-      EphemeralGenerationMismatch, TooManyEphemerals, TooManySkippedKeys,
-      DuplicateSkippedKey and MismatchedEphemeral. SendCursorMismatch compares
-      next_send_seq against the sending chain's cursor, or against
-      FIRST_RECIPIENT_CHANNEL_SEQ when there is no sending chain yet.
-      MissingOpeningEphemeral fires when a sending chain is present and no
-      ephemeral of our own is; MissingPeerEphemeral when a recipient holds none
-      of the peer's. ChainCursorExhausted rejects a cursor at u64::MAX;
-      ChainGenerationAhead a chain whose generation exceeds the conversation's.
-      EphemeralGenerationOutOfRange requires the conversation's generation to be
-      the newest ephemeral's or one past it; EphemeralGenerationMismatch requires
-      the newest ephemeral's generation to equal the sending chain's.
-      DuplicateSkippedKey rejects two cache entries claiming one KeySlot. These
-      catch corruption and partial rollback; a rollback to a wholly consistent
-      earlier snapshot passes all of them. The encoding is not sealed,
-      authenticated, or integrity-protected: a store seals it under its own
-      at-rest encryption, keys it by a local conversation identifier, never
-      chan_id, and erases each superseded snapshot in place — a surviving
-      superseded snapshot carries the root and ephemeral decapsulation keys of a
-      generation whose ciphertexts are already on the wire.
+      A running ratchet has NO serialization surface: the chains delete on use,
+      so a chain written down at rest is a chain that was not deleted. A restart
+      therefore tears an established channel down rather than resuming it — see
+      dm::provisional.
+      Sub-module dm::provisional holds what does survive a restart.
+      ProvisionalRecord is the pre-establishment handshake record, the initiator's
+      {ss0, eph_ek, eph_dk}; new(Zeroizing<[u8; SS0_LEN]>, eph_ek, eph_dk) refuses
+      halves that are not a keypair. address_root() recomputes AR from ss0 and
+      into_ratchet() consumes the record into Ratchet::initiator, which re-derives
+      the root — so neither AR nor RK nor chan_id is stored, and no byte
+      constructor for RootKey exists at any visibility. chan_id is not returned
+      with AR; a caller needing it calls firstcontact::derive_channel_roots.
+      eph_ek() borrows the public half. The record is not Clone, renders no bytes
+      in Debug, and has no Drop of its own so both ephemeral halves move out.
+      RecordContext { recipient_keyrec_addr: &[u8; DM_KEYREC_OWNER_SEED_LEN],
+      fc_epoch: u64 } is what a caller expects a record to be; the seal key is
+      per-profile, so without it every record in a profile is an interchangeable
+      ciphertext.
+      seal(&Aes256Key, &RecordContext) -> Vec<u8> and open(&Aes256Key, &[u8],
+      &RecordContext) -> ProvisionalRecord are the at-rest form, always
+      PROVISIONAL_RECORD_LEN bytes: nonce(12) ||
+      AES-256-GCM(PROVISIONAL_RECORD_VERSION || binding_tag || ss0 || eph_ek ||
+      eph_dk) || tag(16), AAD daemonseed/dm/provisional/aad/v1 ||
+      lp(recipient_keyrec_addr) || lp(fc_epoch_be). The BINDING_TAG_LEN (16) byte
+      binding tag is HKDF-SHA-384(salt=daemonseed/dm/provisional/bind-salt/v1,
+      ikm=ss0, info=daemonseed/dm/provisional/bind/v1||lp(eph_ek)), compared in
+      constant time on open; it ties ss0 to the ephemeral, which the AEAD and
+      EphemeralDecapKey::matches together do not. The version byte is in the
+      plaintext, not the AAD, so a version this build does not read reports
+      UnsupportedVersion instead of collapsing into the uniform authentication
+      failure. open() rejects WrongLength before the open — over-long as well as
+      short — then Aead, then UnsupportedVersion, then MismatchedBinding, then
+      MismatchedEphemeral; there is no AR/RK cross-check because both are
+      recomputed. ProvisionalError also carries Kdf, Module and EntropySource;
+      Module is where a non-authentication AES mode error and every seal-path
+      failure land, so a crypto module that has not passed self-test is retryable
+      rather than reported as a bad record.
+      derive_seal_key(&[u8; AEAD_KEY_LEN]) is
+      HKDF-SHA-384(salt=daemonseed/dm/provisional/salt/v1,
+      info=daemonseed/dm/provisional/seal/v1) over the profile's at-rest key
+      material, never over ss0 — the record contains ss0. A store writes the record
+      to one fixed-size file and overwrites it in place on establishment; physical
+      residue below the filesystem API (SSD FTL remapping, copy-on-write extents)
+      is outside what that can promise.
+      restart(Result<Option<&[u8]>, E>, &Aes256Key, &RecordContext) ->
+      ChannelRestart is the one place the startup decision is taken, for E: Display:
+      HandshakeResumes(ProvisionalRecord) when a record opens, TornDown(Teardown)
+      otherwise. Teardown::cause() is TeardownCause::NoProvisionalRecord (the
+      ordinary case for an established channel, and for a record the store lost),
+      RecordUnusable(ProvisionalError), or StoreUnreadable(String) when the store
+      itself could not be read; Teardown::event() maps those to
+      TrustEventKey::DmChannelTornDownOnRestart, DmProvisionalHandshakeLost and
+      DmProvisionalRecordUnreadable, and Display renders the user-facing statement —
+      StoreUnreadable's says nothing is known lost. All three keys are
+      PersistentNonBlocking, so each reappears at every start and is written to the
+      trust-event audit log. restart, ChannelRestart, Teardown and
+      ReceiveCursor::advance_to are #[must_use].
+      ReceiveCursor is the receive high-water page number, not secret and not
+      sealed: START is page zero, new(page) refuses a page above paging::MAX_PAGE,
+      to_be_bytes is the at-rest form, and advance_to(page, read_through) ->
+      bool refuses to move backwards AND refuses a page past read_through, the
+      caller's own knowledge of what it has read. from_be_bytes(bytes,
+      read_through) applies the same ceiling, because the at-rest form is unsealed:
+      forwards past the truth skips pages permanently, where backwards only costs a
+      rescan. It is a sweep starting point, never a correctness input, and is
+      distinct from the acknowledgement's contiguous cursor.
       Sub-module dm::paging addresses the ongoing channel: derive_owner_seed(AR,
       dir, page) is HKDF-SHA-384(salt=daemonseed/dm/page/salt/v1, ikm=AR,
       info=daemonseed/dm/page/addr/v4||lp(dir)||lp(page_be)). Only the two parties

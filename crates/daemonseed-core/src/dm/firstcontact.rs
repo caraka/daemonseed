@@ -60,7 +60,7 @@ use oxicrypt_ml_dsa as ml_dsa;
 use oxicrypt_ml_kem as ml_kem;
 use oxicrypt_sha::sha384;
 use prost::Message;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use daemonseed_proto::v1 as wire;
 
@@ -378,27 +378,85 @@ fn exact<const N: usize>(field: &'static str, bytes: &[u8]) -> Result<[u8; N], F
         })
 }
 
-/// What a sender must persist to make its knock idempotent and to complete the
-/// first ratchet step when the recipient replies.
+/// What a sender must keep to make its knock idempotent and to complete the first
+/// ratchet step when the recipient replies.
 ///
-/// **Both fields are required, and the second is easy to miss.** `ss0` alone
-/// re-derives the channel, so a retry re-lands on the same conversation instead of
-/// forking a second one. But without the opening ephemeral DECAPSULATION key the
-/// sender cannot decapsulate the recipient's reply, so it would lose the first
-/// ratchet step — and with it the forward secrecy that the reply is supposed to
-/// establish.
+/// **Every field is required, and two are easy to miss.** `ss0` alone re-derives
+/// the channel, so a retry re-lands on the same conversation instead of forking a
+/// second one. But without the opening ephemeral DECAPSULATION key the sender
+/// cannot decapsulate the recipient's reply, so it would lose the first ratchet
+/// step — and with it the forward secrecy that the reply is supposed to establish.
+/// And [`ratchet::Ratchet::initiator`] needs the ENCAPSULATION key too, to check
+/// the two halves are a pair before a silent mismatch costs the conversation; it
+/// is carried here because [`build`] generates the keypair internally, so nowhere
+/// else has it (#255).
+///
+/// **No `Drop` impl, deliberately.** `ss0` is [`Zeroizing`] instead. A container
+/// `Drop` forbids moving fields *out*, so a caller could not hand `eph_dk` to a
+/// ratchet without copying the bytes back out — manufacturing a second live copy
+/// of exactly the secret the newtype exists to keep down to one (#255). With the
+/// zeroizing wrapper the field destroys itself, ordinary partial moves work, and
+/// [`Self::into_provisional`] moves both halves straight through.
+///
+/// **What that trade buys, stated precisely.** The old container `Drop` wiped
+/// `ss0`'s slot on *every* path, because forbidding partial moves left no path
+/// where the slot was not still the owner. [`Zeroizing`] wipes only whichever
+/// slot still owns the value at drop, so after [`Self::into_provisional`] the
+/// source slot is a moved-from `[u8; N]` — `Copy`, no destructor — whose bytes
+/// stay in that frame until it is reused. The trade is still right, and what it
+/// buys is **aliasing, not residue**: one live copy with a moved-from shadow
+/// beats two live copies each wiped at its own end, because a second live copy is
+/// a second thing to lose.
+///
+/// **Fields are private, and [`Self::into_provisional`] is the sole exit.** With
+/// the container `Drop` gone, a public `ss0` means `let ss0 = *state.ss0;` — a
+/// deref to a bare `Copy` array with no zeroize on it — which is precisely the
+/// second live copy the whole `Drop`-to-`Zeroizing` change was made to avoid.
+/// [`build`] is the only constructor, so nothing outside this module ever needed
+/// the fields.
 pub struct FirstContactState {
-    pub ss0: [u8; SS0_LEN],
-    pub eph_dk: ratchet::EphemeralDecapKey,
-    pub roots: ChannelRoots,
+    ss0: Zeroizing<[u8; SS0_LEN]>,
+    eph_ek: Box<[u8; ml_kem::EK_LEN]>,
+    eph_dk: ratchet::EphemeralDecapKey,
+    roots: ChannelRoots,
 }
 
-impl Drop for FirstContactState {
-    /// `ss0` is a bare array, so it has no `Drop` of its own and would otherwise
-    /// outlive this struct in whatever stack or heap slot held it. The other two
-    /// fields zeroize themselves. (#135)
-    fn drop(&mut self) {
-        self.ss0.zeroize();
+impl FirstContactState {
+    /// The channel's address root and conversation identifier, computed at
+    /// [`build`] time.
+    ///
+    /// By value: [`ChannelRoots`] is two public-in-effect derivations the caller
+    /// needs to address and sign with, and `chan_id` must stay in memory rather
+    /// than be written down (§ v4 minor invariant).
+    pub fn roots(&self) -> &ChannelRoots {
+        &self.roots
+    }
+
+    /// The opening ephemeral's public half — what the recipient encapsulates to.
+    ///
+    /// No accessor for the *secret* half, and none for `ss0`: the only way either
+    /// leaves this type is [`Self::into_provisional`], which moves them.
+    pub fn eph_ek(&self) -> &[u8; ml_kem::EK_LEN] {
+        &self.eph_ek
+    }
+
+    /// Hand the state to the record that persists it across a restart (#243,
+    /// #255).
+    ///
+    /// Consuming, so neither half of the ephemeral is ever duplicated. `roots` is
+    /// dropped here rather than carried on: the record recomputes `ar` and
+    /// `chan_id` from `ss0`, and `chan_id` must never be serialized at all.
+    pub fn into_provisional(
+        self,
+    ) -> Result<crate::dm::provisional::ProvisionalRecord, crate::dm::provisional::ProvisionalError>
+    {
+        let Self {
+            ss0,
+            eph_ek,
+            eph_dk,
+            roots: _,
+        } = self;
+        crate::dm::provisional::ProvisionalRecord::new(ss0, eph_ek, eph_dk)
     }
 }
 
@@ -522,7 +580,8 @@ pub fn build(
     Ok((
         entry,
         FirstContactState {
-            ss0,
+            ss0: Zeroizing::new(ss0),
+            eph_ek: Box::new(eph_ek_arr),
             eph_dk: ratchet::EphemeralDecapKey::new(Box::new(eph_dk_arr)),
             roots,
         },
@@ -895,6 +954,85 @@ mod tests {
         );
     }
 
+    /// **#255.** The state carries the ephemeral's PUBLIC half too. `build`
+    /// generates the keypair internally, so nowhere else holds it, and
+    /// `Ratchet::initiator` needs it to check the two halves are a pair before a
+    /// silent mismatch costs the conversation. Without this field a caller had to
+    /// slice it back out of the decapsulation key at the FIPS 203 offset.
+    #[test]
+    fn build_returns_both_halves_of_the_opening_ephemeral() {
+        let k = knock("hi", EPOCH);
+        let v = open_at(&k, EPOCH).unwrap();
+        assert_eq!(
+            k.state.eph_ek(),
+            v.eph_ek.as_ref(),
+            "the state's eph_ek is not the one the entry published"
+        );
+        assert!(
+            k.state.eph_dk.matches(k.state.eph_ek()),
+            "the state's two halves are not a keypair"
+        );
+    }
+
+    /// **#255.** The state hands both halves to the record that persists them,
+    /// consuming itself — so there is no moment at which a second copy of the
+    /// decapsulation key exists. A `Drop` impl on `FirstContactState` would make
+    /// this not compile, which is what the issue was about; the test therefore
+    /// pins the ergonomic property as much as the values.
+    #[test]
+    fn the_state_moves_into_a_provisional_record() {
+        let k = knock("hi", EPOCH);
+        // Deliberately NOT `let ss0 = *k.state.ss0;`. That deref yields a bare
+        // `[u8; N]` -- `Copy`, no destructor -- which is the second live copy of
+        // the channel's opening secret that #255 exists to prevent, and it is why
+        // the fields are private. `ar` is a derived, non-secret root, so copying
+        // it is fine.
+        let ar = k.state.roots().ar;
+
+        let record = k.state.into_provisional().expect("a matched pair");
+
+        // Same conversation on the far side of the move: `ar` is recomputed from
+        // `ss0` rather than carried, so this also pins that recomputation.
+        assert_eq!(record.address_root().unwrap(), ar);
+
+        // And the ratchet it opens is the one `ss0` roots.
+        let ratchet = record.into_ratchet().expect("opens a ratchet");
+        assert_eq!(ratchet.role(), ratchet::Role::Initiator);
+        assert_eq!(ratchet.generation(), 0);
+    }
+
+    /// `into_provisional`'s `Err` arm, which nothing exercised. It forwards
+    /// `ProvisionalRecord::new`'s pairing check, and a state whose halves do not
+    /// pair must be refused HERE rather than becoming a record that rejects every
+    /// reply forever.
+    ///
+    /// `build` cannot produce such a state -- it generates the keypair itself --
+    /// so the state is assembled by hand, which the private fields permit only
+    /// inside this module. That is the point: the failure is unreachable through
+    /// the public surface, and this pins that it is still refused if it is ever
+    /// reached.
+    #[test]
+    fn a_state_whose_ephemeral_halves_disagree_does_not_become_a_record() {
+        let k = knock("hi", EPOCH);
+        let (other_ek, _) = ml_kem::keygen(&[0x5Eu8; 32], &[0x7Du8; 32]).unwrap();
+
+        // Positive control: the state as built DOES convert, so the refusal below
+        // is the mismatch and not something else about the hand-built state.
+        let good = knock("hi", EPOCH);
+        assert!(good.state.into_provisional().is_ok());
+
+        let spliced = FirstContactState {
+            ss0: k.state.ss0.clone(),
+            eph_ek: Box::new(other_ek),
+            eph_dk: k.state.eph_dk,
+            roots: k.state.roots,
+        };
+        assert_eq!(
+            spliced.into_provisional().unwrap_err(),
+            crate::dm::provisional::ProvisionalError::MismatchedEphemeral
+        );
+    }
+
     /// Both parties must reach the same conversation independently — the sender at
     /// compose time, the recipient after decapsulating. If these diverged they
     /// would address different channels and never meet.
@@ -902,7 +1040,7 @@ mod tests {
     fn both_ends_derive_the_same_channel_roots() {
         let k = knock("hi", EPOCH);
         let v = open_at(&k, EPOCH).unwrap();
-        assert_eq!(v.ss0, k.state.ss0);
+        assert_eq!(v.ss0, *k.state.ss0);
         assert_eq!(v.roots.ar, k.state.roots.ar);
         assert_eq!(v.roots.chan_id, k.state.roots.chan_id);
         assert_ne!(
