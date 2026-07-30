@@ -695,7 +695,9 @@ Corrections found while building, recorded here rather than by editing the froze
 
 - **2026-07-30 — the give-up clock is the one number in the outbox an unsealed file must not be believed about, and the fix is to refuse the record rather than repair it.** The give-up is what makes *"marked undelivered in the UI, never silently abandoned"* true, and it is computed from a single stored timestamp. A `composed_at_ms` in the future switches it off permanently and invisibly — `is_given_up` answers false at every clock the user will ever see, so the entry never gives up, never sweeps, never surfaces, and re-seeds until something else stops it. The reflex fix, clamping to the caller's clock, is the more dangerous of the two: it rewrites persisted state from one unverified reading, so a boot with a dead RTC ten days slow rewrites every live entry, the next write persists it, and the moment the clock corrects the whole file is past its window and given up — every pending message reported failed, from a fault that had already passed. **Refusal is the only non-destructive option**, and the "but refusing discards the other pending messages" objection does not apply to it: nothing is written, the caller keeps the bytes, and a later decode with a good clock returns the record intact. The asymmetry is worth naming for anything else that persists a clock here: **a value we cannot verify may bound what we do, but must never overwrite what we were told.** `next_due_ms` needs no such guard, because the give-up does not read it — a corrupt one costs emissions, not the guarantee.
 
-## Amendment A1 — channel re-establishment after a restart (2026-07-30; PENDING caraka ratification)
+## Amendment A1 — channel re-establishment after a restart (2026-07-30; ~~PENDING ratification~~ **SUPERSEDED by A2, refuted on all three axes**)
+
+> **Withdrawn 2026-07-30, before ratification.** A confirming 3-lens round refuted this construction on all three axes: it omits `msg_sig` from a new frame kind against the doctrine at `dm/frame.rs:36-42` (a frame sealed under a shared key proves *one of the two parties* wrote it, never which) and then decides a tiebreak and triggers a teardown on that frame; Clause 1's healing claim is false, because an at-rest compromise can reconnect first, self-renew its own authority, and lock the rightful holder out permanently; the responder→initiator leg is never specified at all, which would put request and response under one key (F9's shape); Clause 1 has no commit point, so ordinary frame loss desynchronizes `RS` terminally and silently; and the frame is a clear length-visible restart marker (fresh `eph_ek`, absent `eph_ct` — the opening-burst shape the code documents as distinguishable regardless of padding bucket) whose startup burst links N unlinkable records to one device with no jitter. **Kept as the record A2 builds on, not deleted.** Full findings: `PAI/MEMORY/WORK/20260730-dm-reestablishment-amendment/ISA.md`.
 
 **This is a construction amendment, not a build note.** The build-notes section above is explicitly notation-and-wording only; this changes the construction, so it is recorded separately per the status footer's "any change now is a deliberate, reviewed amendment." It is **not in force until caraka ratifies.** Panel-validated 2026-07-30 by a 3-lens round (crypto/replay · correlation/metadata · erasure/availability) run as adversarial *validation across competing options*, not as an attack on one proposal.
 
@@ -774,5 +776,93 @@ Each must be shown able to **fail**, not merely to pass.
 ### On ratification
 
 The ISC-C38–C46 / A-C20–A-C25 family in `ISA.md` gains criteria for the three clauses and the six obligations above, and #262 closes citing this section. Until then #262 stays open and #236's contact-cache scope line stands corrected but unamended.
+
+## Amendment A2 — channel re-establishment: the high-level map (2026-07-30; supersedes A1; PENDING caraka ratification)
+
+**Deliberately a map, not a wire specification.** A1 failed partly by specifying byte-level detail — a seal key, an AAD shape, a tiebreak — for a protocol whose *decisions* were unmade, and partly by resting on store semantics that do not exist. A2 settles the decisions that shape the store and **explicitly defers** the wire detail to A2-final, to be written once the store's commit semantics are real. The two are chicken-and-egg (caraka, 2026-07-30): a store built without the end goal straightjackets the protocol, and a protocol written without the store invents storage semantics inside a crypto amendment. The map breaks the cycle in the right place.
+
+The option A1 embodied — a fourth retained sibling of the `ss0` extraction, reconnect on the `AR`-derived plane rather than the doorbell — was validated at the option level against two alternatives and is **not reopened here**. Everything below is a construction decision.
+
+### M1 — every re-establish frame carries `msg_sig`
+
+Non-negotiable, and A1's central omission. Page owner-write authority is **symmetric**: both parties derive the owner seed for both directions, so a frame's presence in a direction's pages proves only that one of the two parties wrote it. `msg_sig` under the sender's pseudonym key is the sole authorship proof in the feature (`dm/frame.rs:36-42`). A re-establish frame decides a tiebreak and triggers a teardown; both are authorship-sensitive, so both legs are signed. This does **not** defend against an at-rest compromise (see M11) — it defends against anyone holding only the shared re-establish secret.
+
+### M2 — the handshake is two legs, both named
+
+`RE-EST` (initiator → peer, carrying a fresh ephemeral) and `RE-ACK` (peer → initiator, carrying the encapsulation to it). A1 named only the first, which left the initiator unable to reach the new root and would have put two plaintexts under one key. **Each leg gets its own domain label and its own derived key**; neither reuses the other's. The initiator's retry of `RE-EST` at a fixed generation must not produce a second plaintext under the first's key — so the derived key takes a retry-independent input and the seal takes a fresh nonce, per the global rule, whose key-uniqueness premise (`§ Nonce rule`) A2-final must show is actually met rather than cited.
+
+### M3 — `RS` commits in two slots, never in place
+
+The store holds `RS_n` **and** `RS_{n+1}` through the window between sending `RE-ACK` and observing traffic authenticated under the new root. `RS_n` is retired only on that observation. A1's immediate in-place erasure made ordinary frame loss terminal: the responder could accept only `n+1` while the initiator could produce only `n`, with no event and no clock.
+
+**The honest price, stated rather than hidden:** one generation of resume authority persists longer than the ideal. That is the correct trade — a recoverable relationship beats a marginally smaller compromise window, and the alternative is a channel that dies silently on a dropped packet.
+
+**This is the amendment's principal store requirement**, and it is why the map precedes the store: "hold two generations of a secret and atomically retire one on a confirming observation" is a storage capability, not a crypto detail.
+
+### M4 — routine restart is silent; an unfollowable state is loud
+
+The split A1 lacked. A reconnect that completes needs no user involvement — that is the whole point of the ambition call. But a party that observes a generation it cannot follow (a `gen` above its own `RS` can produce, an `RE-ACK` it cannot open, an `RS` absent or unreadable while `previously_established` is set) must **surface it**, with a `TrustEvent`, and offer an explicit recovery path. Silence in that state is the defect #243 exists to prevent, and A1 reintroduced it.
+
+Recovery is a fresh first contact — which *does* need the correspondent to act, and that is acceptable here precisely because it is an anomaly path rather than the routine one. The ambition call rejected correspondent action on every restart, not on a genuine loss of state.
+
+### M5 — a re-establish frame is shaped exactly like an ordinary frame
+
+A1's frame carried a fresh `eph_ek` and no `eph_ct`, which is the opening-burst shape the code documents as "about 1571 bytes shorter than every later frame, so it is distinguishable **regardless of padding bucket**" (`dm/frame.rs:13-29`) — and those are clear fields outside the sealed, padded body. A recurring, timestamped, co-host-readable "this party restarted" is not acceptable on a plane whose whole premise is that pages are unlinkable.
+
+**Decision: no clear discriminator exists.** The `eph_ct`-shaped field carries uniform filler (an ML-KEM ciphertext is indistinguishable from random of its length), and a receiver identifies a re-establish by **trial decryption** — it attempts the `RE-EST` key on a frame its chain cannot open. The cost is one AEAD attempt per otherwise-unopenable frame, which is bounded, and the benefit is that a reconnect is invisible to a page co-host. A2-final must state where the filler comes from and confirm it is not distinguishable by any other field.
+
+### M6 — the reconnect burst is jittered
+
+A device resuming N channels writes to N deliberately-unlinkable records; without spreading, co-hosting any two links them to one device and dates the restart. WB-3 I6 forbids stable cross-record phase relationships, and v6 already jitters the weaker `fc_epoch`-boundary analogue. The window is A2-final's; that there is one is settled here. Pre-A1 the baseline was zero — a restart put nothing on this plane — so this channel is created by the amendment and must be paid for by it.
+
+### M7 — the tiebreak orders on long-term identity, not on grindable material
+
+A1 ordered simultaneous reconnects on `SHA-384(eph_ek)`, which the initiator chooses freely and can regenerate cheaply: ~n keygens buys the 1/n-quantile digest, so the party willing to spend always wins and thereby chooses whose ephemeral roots the resumed channel.
+
+**Decision: order on the two long-term identity public keys** — fixed, ungrindable, and known to both parties from first contact. The lower key's `RE-EST` wins; the higher party adopts it and abandons its own. This is only ever consulted when both parties restarted before either reconnected; a single restart has no contest.
+
+### M8 — the re-establish root step gets its own domain label
+
+A1 reached the new root through `advance_root`, which expands under `DM_RATCHET_STEP`. Reusing that label for a different purpose leaves domain separation resting on an argument about values (`RS_n` is not any `RK_n`) rather than on labels, against the module's own "one distinct label per purpose". The function may still be reused; the label must not be.
+
+### M9 — the outbox needs three things this amendment obliges
+
+A1's Clause 3 was not expressible in the record it governed. Settled here as record-format requirements:
+
+1. **Each entry records the chain it was sealed under**, so "entries sealed under the previous chain" is a question an entry can answer, and entries composed *during* a reconnect are not swept spuriously.
+2. **A distinct teardown cause for a re-established channel.** `channel_torn_down` currently *retains* `AwaitingCollection` entries under the existing causes, and its match is deliberately wildcard-free so a new cause fails to compile — so the amendment owes that variant explicitly.
+3. **The give-up clock does not run while no channel exists.** It is wall-clock from compose and indifferent to channel state, so reconnect latency would otherwise be charged against a message's seven-day insurance window.
+
+The disposition itself stands as A1 had it: on a completed re-establish, entries sealed under the dead chain are marked **Undelivered immediately** and are never re-sealed — a peer's restart destroyed their receive chain, so those frames are undecryptable however long they are re-seeded, and § m7 forbids a second ciphertext for one logical message.
+
+### M10 — the re-establish frame re-seeds on the ordinary ladder
+
+A single write into an eviction-only store with no TTL is the failure the keep-alive schedule exists to prevent; A1 wrote the frame once. `RE-EST` and `RE-ACK` re-seed like any other DM write, and the state machine advances on **received** frames only, never on an assumption that the peer has seen ours. A reconnect that never completes reaches a terminal, surfaced state (M4) rather than waiting forever.
+
+### M11 — the honest security property, rewritten
+
+A1 claimed at-rest compromise yields resume authority "until the next successful reconnect ratchets `RS`". **That is false and it is withdrawn.** An attacker holding at-rest state can reconnect first, and because it holds `RS_n` it computes `RS_{n+1}` too — its authority renews itself, and M1's signature does not help, because the pseudonym signing key is at rest as well.
+
+State instead: **an at-rest compromise is total for the relationship and the ratchet does not heal it.** What `RS` rotation genuinely buys is narrower and still worth having — a *stale* copy is useless, so an old backup, a discarded device, or a snapshot from before the last reconnect confers nothing. Content forward secrecy for past messages is unaffected: `RS` is an Expand sibling of the PRK, not the PRK, and cannot regenerate `RK0`.
+
+The new harm A1 introduced and A2 must answer is the **silent lockout** of the rightful holder by an attacker who reconnects first. M3 keeps the rightful holder alive through the window and M4 makes the unfollowable state loud with a recovery path. That is a mitigation, not a cure: a determined at-rest attacker still evicts the owner, and the owner then recovers by re-doing first contact. State exactly this — no overclaim.
+
+### Requirements this map hands the store (Track 2's brief inherits these)
+
+1. Two-generation retention of a secret with atomic retirement on a confirming observation (M3).
+2. Atomic co-commit of `RS_{n+1}` with `reconnect_gen` — a torn update between them is the terminal desync M3 exists to prevent.
+3. Crash-safe replacement, not in-place overwrite. "Overwritten in place" is the claim #281 records as resting on a property nothing provides.
+4. `unreadable` distinguishable from `absent`, since M4 branches on it and lowering a read error to "no record" reads as "start a new conversation".
+5. Per-entry sealing-chain provenance in the outbox, plus the new teardown cause and the pausable give-up clock (M9).
+6. Retention of the peer's long-term identity key for M7's ordering, and of `previously_established` and `reconnect_gen`.
+7. Erasure that is real: `RS_n` gone from the at-rest form *and* from freed allocations on retirement.
+
+### Deferred to A2-final, after the store
+
+Byte values for every new label; the two legs' exact AAD composition and whether it is reconstructed or carried; the nonce derivation and the argument that the global rule's key-uniqueness premise is met; the filler's provenance in M5 and a check that no other field distinguishes; the pad bucket; M6's jitter window; the retry ladder's parameters; and the wire form of the sealing-chain provenance in M9.
+
+### What a stress test of this map should attack
+
+Not byte layouts — decisions. Whether M3's two-slot window is the right length and whether "a confirming observation" is well-defined enough to be implementable; whether M4's loud state can be *induced* by an attacker as a denial or a social-engineering prompt; whether M5's trial decryption is a usable oracle for an attacker probing which key a client holds, and whether the filler is genuinely indistinguishable; whether M7's identity ordering leaks or biases anything; whether M9's give-up pause can be abused to hold a message alive indefinitely; whether M11's honest property is now complete or still undercounts; and whether the seven store requirements are together satisfiable without inventing a database.
 
 **Status: FROZEN 2026-07-28 (caraka ratified).** DRAFT v6 is the design-of-record. The ISC-C38–C46 / A-C20–A-C25 family in `ISA.md` is re-cut to v6, the build-slice issues are open (#177 forced), and this doc is the frozen reference for the build. Any change now is a deliberate, reviewed amendment — not a redraft.
