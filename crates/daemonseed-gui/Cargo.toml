@@ -32,6 +32,11 @@ daemonseed-cli = { path = "../daemonseed-cli" }
 daemonseed-core = { path = "../daemonseed-core" }
 daemonseed-proto = { path = "../daemonseed-proto" }
 
+# The GUI's own copy of a persisted circle phrase is held in `Zeroizing` so it wipes
+# on drop like the core type it came from (`profile::PersistedCircle`, #259). Already
+# in the lockfile via daemonseed-core.
+zeroize = { workspace = true }
+
 # Veilid transport (#98) — the only transport. Backs the net actor
 # (`src/veilid_net.rs`) that `net::NetHandle::new` spawns.
 daemonseed-veilid-net = { path = "../daemonseed-veilid-net" }

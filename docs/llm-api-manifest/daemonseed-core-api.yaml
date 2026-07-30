@@ -1743,13 +1743,15 @@ types:
       entropy (the cot_key IKM, ISC-C8/C9) and the client-local label (ISC-C62).
       Neither field ever leaves the encrypted blob — no wire message carries them
       (ISC-A-C3). `entropy` is the canonicalized phrase, not the derived key, so a
-      later cross-family suite change re-derives correctly.
+      later cross-family suite change re-derives correctly. `entropy` is PRIVATE and
+      held as Zeroizing<String>, so it wipes on drop and cannot be moved out: read it
+      with entropy() -> &str, construct with new(entropy: impl Into<String>, label:
+      impl Into<String>) -> PersistedCircle. Clone; Debug renders
+      `PersistedCircle { entropy: "<redacted>", label: … }`. No PartialEq / Eq.
+    security:
+      contains_secret: true
+      zeroize_on_drop: true
     fields:
-      - name: entropy
-        type: String
-        description: >-
-          Canonicalized circle entropy (NFKC + whitespace-folded, ISC-C9) — the IKM
-          the cot_key derivation (ISC-C8) re-runs on rejoin.
       - name: label
         type: String
         description: >-

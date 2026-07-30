@@ -26,6 +26,22 @@ work lives in the project lead's vault manifest, not here.
 
 ### Fixed
 
+- `daemonseed_core::storage::seeds::PersistedCircle` holds `entropy` privately as a
+  `Zeroizing<String>`, read through `entropy()` and built through `new()`. `Debug`
+  redacts it; `PartialEq` / `Eq` are gone. (#259)
+
+- `daemonseed_gui::profile::PersistedCircle` carries the circle phrase as a
+  `Zeroizing<String>`. (#259)
+
+- `daemonseed_core::storage::seeds::seal_with_key` holds the serialized plaintext
+  buffer in `Zeroizing`, wiping it on every path out including an unwind. (#259)
+
+- `daemonseed_core::storage::recovery_file::seal_under` holds the derived AEAD key
+  and the mnemonic phrase in `Zeroizing`, wiping each on every path out. (#259)
+
+- `daemonseed_core::dm::firstcontact::VerifiedFirstContact` zeroizes `ss0` on
+  drop. (#259)
+
 - DM page transport carries the page owner seed as
   `daemonseed_core::dm::paging::DmPageOwnerSeed` — the boxed, redacted,
   zeroize-on-drop newtype — through `VeilidNetHandle::publish_dm_page` and

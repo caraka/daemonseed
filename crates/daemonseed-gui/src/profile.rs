@@ -28,6 +28,7 @@ use daemonseed_core::identity::keys::{
 };
 use daemonseed_core::profile::persist::{load_for_unlock, write_seeds_blob};
 use daemonseed_core::storage::seeds::{self, SealingKey, Seeds};
+use zeroize::Zeroizing;
 
 /// An unlocked identity + its on-disk profile root, with the write-through path.
 pub struct Profile {
@@ -46,7 +47,12 @@ pub struct Profile {
 
 /// A persisted circle to silently re-join: its canonicalized phrase + client-local
 /// label, as stored in the at-rest blob.
-pub type PersistedCircle = (String, String);
+///
+/// The phrase is a [`Zeroizing`] `String`, not a bare one: it is the `cot_key` IKM
+/// (ISC-C8), so the GUI's copy must wipe itself on drop exactly as the core's
+/// [`seeds::PersistedCircle`] does. A bare `String` here would void that guarantee
+/// one crate over from the type that provides it. (#259)
+pub type PersistedCircle = (Zeroizing<String>, String);
 
 impl Profile {
     /// Adopt the materials a first-start or Unlock produced. The display handle is
@@ -120,7 +126,7 @@ impl Profile {
         self.seeds
             .circles()
             .iter()
-            .map(|c| (c.entropy.clone(), c.label.clone()))
+            .map(|c| (Zeroizing::new(c.entropy().to_owned()), c.label.clone()))
             .collect()
     }
 

@@ -60,29 +60,22 @@ pub const COT_KEY_LEN: usize = 32;
 /// ```
 pub const EXAMPLE_ENTROPY: &str = "correct horse battery staple";
 
-/// A derived circle-of-trust symmetric key. Zeroes on drop; `Debug` is
-/// redacted so it never lands in a log surface (ISC-A-C1).
-#[derive(zeroize::ZeroizeOnDrop)]
-pub struct CircleKey(Box<[u8; COT_KEY_LEN]>);
+redacted_secret_newtype! {
+    /// A derived circle-of-trust symmetric key. Zeroes on drop; `Debug` is
+    /// redacted so it never lands in a log surface (ISC-A-C1).
+    boxed pub struct CircleKey([u8; COT_KEY_LEN]);
+}
 
 impl CircleKey {
-    /// Borrow the raw key bytes for AEAD use. Callers must not copy these
-    /// into a non-zeroizing buffer.
-    pub fn as_bytes(&self) -> &[u8; COT_KEY_LEN] {
-        &self.0
-    }
-
     /// Wrap raw key bytes into a zeroizing [`CircleKey`] (e.g. reconstructing a
     /// circle key from at-rest storage). The caller zeroes its own copy of
     /// `bytes` after this call (the boxed copy here zeroes on drop).
+    ///
+    /// Kept out of the `redacted_secret_newtype!` invocation deliberately: the macro grants
+    /// only `as_bytes`, and most secrets it covers have no raw-bytes constructor
+    /// at all.
     pub fn from_bytes(bytes: [u8; COT_KEY_LEN]) -> Self {
         CircleKey(Box::new(bytes))
-    }
-}
-
-impl core::fmt::Debug for CircleKey {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("CircleKey(<redacted>)")
     }
 }
 

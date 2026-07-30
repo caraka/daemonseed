@@ -292,14 +292,56 @@ pub struct PublishedShare {
 /// label (ISC-C62). Neither field ever leaves the encrypted blob — no wire
 /// message carries them (ISC-A-C3). `entropy` is the canonicalized phrase, not
 /// the derived key, so a later cross-family suite change re-derives correctly.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `entropy` is secret material, so it is **private** and held in a
+/// [`Zeroizing`] `String`: the wipe is carried by the type, so it happens on
+/// every path out of every scope the value reaches, including an unwind, and no
+/// caller can lift the raw phrase into a container that has no `Drop` of its
+/// own. Read it through [`Self::entropy`], build one with [`Self::new`].
+/// `Debug` is hand-written so the phrase never reaches a log surface (ISC-A-C1).
+/// `PartialEq` / `Eq` are not implemented: nothing compares whole
+/// `PersistedCircle`s, and deriving equality onto a secret-bearing type invites
+/// copies of the secret into comparison sites for no benefit. (#259)
+#[derive(Clone)]
 pub struct PersistedCircle {
     /// Canonicalized circle entropy (NFKC + whitespace-folded, ISC-C9). This is
     /// the IKM the `cot_key` derivation (ISC-C8) re-runs on rejoin.
-    pub entropy: String,
+    entropy: Zeroizing<String>,
     /// Client-local circle label (ISC-C62). Never transmitted, never derived
     /// from members.
     pub label: String,
+}
+
+impl PersistedCircle {
+    /// Remember a circle. `entropy` MUST already be canonicalized (ISC-C9) — this
+    /// only stores what the caller normalized.
+    pub fn new(entropy: impl Into<String>, label: impl Into<String>) -> Self {
+        Self {
+            entropy: Zeroizing::new(entropy.into()),
+            label: label.into(),
+        }
+    }
+
+    /// Borrow the canonicalized entropy — the `cot_key` IKM (ISC-C8). A borrow,
+    /// never a copy: an owned `String` taken from here has escaped the zeroizing
+    /// wrapper and will release its buffer with the phrase still in it.
+    pub fn entropy(&self) -> &str {
+        &self.entropy
+    }
+}
+
+impl core::fmt::Debug for PersistedCircle {
+    /// Hand-written, never derived: `entropy` is the `cot_key` IKM (ISC-C8) and
+    /// [`Zeroizing`]'s own `Debug` forwards to the value it wraps, so a derived
+    /// one would print the circle secret verbatim and walk straight around the
+    /// redacted [`Debug for Seeds`](Seeds) below. The label is client-local
+    /// display text, and is what a reader actually wants (#259).
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PersistedCircle")
+            .field("entropy", &"<redacted>")
+            .field("label", &self.label)
+            .finish()
+    }
 }
 
 impl core::fmt::Debug for Seeds {
@@ -421,13 +463,10 @@ impl Seeds {
     /// (idempotent — re-joining a known circle does not duplicate it).
     pub fn add_circle(&mut self, entropy: impl Into<String>, label: impl Into<String>) -> bool {
         let entropy = entropy.into();
-        if self.circles.iter().any(|c| c.entropy == entropy) {
+        if self.circles.iter().any(|c| c.entropy() == entropy) {
             return false;
         }
-        self.circles.push(PersistedCircle {
-            entropy,
-            label: label.into(),
-        });
+        self.circles.push(PersistedCircle::new(entropy, label));
         true
     }
 
@@ -435,7 +474,7 @@ impl Seeds {
     /// Returns `true` if one was removed.
     pub fn remove_circle(&mut self, entropy: &str) -> bool {
         let before = self.circles.len();
-        self.circles.retain(|c| c.entropy != entropy);
+        self.circles.retain(|c| c.entropy() != entropy);
         self.circles.len() != before
     }
 
@@ -444,7 +483,7 @@ impl Seeds {
     pub fn rename_circle(&mut self, entropy: &str, new_label: impl Into<String>) -> bool {
         let new_label = new_label.into();
         for c in &mut self.circles {
-            if c.entropy == entropy {
+            if c.entropy() == entropy {
                 if c.label == new_label {
                     return false;
                 }
@@ -599,7 +638,7 @@ impl Seeds {
         for c in &self.circles {
             s.push_str(&format!(
                 "\ncircle {} {}",
-                hex::encode(c.entropy.as_bytes()),
+                hex::encode(c.entropy().as_bytes()),
                 hex::encode(c.label.as_bytes()),
             ));
         }
@@ -688,7 +727,7 @@ impl Seeds {
                     .ok()
                     .and_then(|b| String::from_utf8(b).ok())
                     .ok_or(BlobError::InvalidPlaintext)?;
-                circles.push(PersistedCircle { entropy, label });
+                circles.push(PersistedCircle::new(entropy, label));
                 continue;
             }
             // Share (ISC-C21 persistence, M14): `share <hex(root)> <hex(label)>`.
@@ -993,6 +1032,13 @@ pub fn seal_under(
 /// [`SealingKey`], and re-seals on every persist-worthy mutation without paying
 /// Argon2id again. The registry MUST contain `suite_id` and it MUST be
 /// write-eligible. Layout and AAD binding are identical to [`seal_under`].
+///
+/// The final serialized plaintext buffer is held in [`Zeroizing`], so it is wiped
+/// on every path out of this function — the success path, the AEAD error path, and
+/// an unwind out of either. The *transient* buffers `to_plaintext` allocates while
+/// building it are not: it grows one `String` by `push_str`, so each reallocation
+/// frees a buffer still holding the accumulated secret, and each circle spends two
+/// short-lived `String`s on `hex::encode` + `format!` (#263).
 pub fn seal_with_key(
     seeds: &Seeds,
     key: &[u8; AEAD_KEY_LEN],
@@ -1005,7 +1051,12 @@ pub fn seal_with_key(
 
     let aes = Aes256Key::new(key).map_err(BlobError::AesKeyInit)?;
 
-    let plaintext_str = seeds.to_plaintext();
+    // The serialized payload is the 24-word mnemonic plus every circle entropy in
+    // one `String`. `Zeroizing` carries the wipe rather than a positional
+    // `zeroize()` call, so it also covers an unwind out of the window below —
+    // `vec![0u8; len]` can panic on capacity overflow, and `gcm_encrypt` asserts
+    // on its own buffer lengths. (#259)
+    let plaintext_str = Zeroizing::new(seeds.to_plaintext());
     let plaintext = plaintext_str.as_bytes();
 
     let suite_bytes = suite_id.get().to_be_bytes();
@@ -1463,9 +1514,9 @@ mod tests {
         let recovered = open(&blob, pp, pid, test_params()).unwrap().seeds;
         let circles = recovered.circles();
         assert_eq!(circles.len(), 2);
-        assert_eq!(circles[0].entropy, "correct horse battery staple");
+        assert_eq!(circles[0].entropy(), "correct horse battery staple");
         assert_eq!(circles[0].label, "Book Club");
-        assert_eq!(circles[1].entropy, "another shared secret phrase");
+        assert_eq!(circles[1].entropy(), "another shared secret phrase");
         assert_eq!(circles[1].label, "Ops Room");
     }
 
@@ -1712,7 +1763,7 @@ mod tests {
         assert!(seeds.remove_circle("phrase a"));
         assert!(!seeds.remove_circle("phrase a")); // already gone
         assert_eq!(seeds.circles().len(), 1);
-        assert_eq!(seeds.circles()[0].entropy, "phrase b");
+        assert_eq!(seeds.circles()[0].entropy(), "phrase b");
     }
 
     #[test]
@@ -1923,6 +1974,48 @@ mod tests {
         let s = fresh_seeds();
         let dbg = format!("{s:?}");
         assert!(dbg.contains("<redacted>"));
+    }
+
+    /// `PersistedCircle`'s `Debug` is hand-written, so pin the exact rendering the
+    /// way `circle::key::CircleKey` and `dm::ack` pin theirs. `debug_redacts_seeds`
+    /// above does not reach here: `Debug for Seeds` prints only a circle COUNT, so
+    /// it would stay green if this rendering leaked the phrase.
+    #[test]
+    fn debug_redacts_persisted_circle_entropy_and_keeps_the_label() {
+        let c = PersistedCircle::new("correct horse battery staple", "Book Club");
+        let dbg = format!("{c:?}");
+        assert_eq!(
+            dbg,
+            r#"PersistedCircle { entropy: "<redacted>", label: "Book Club" }"#
+        );
+        assert!(
+            !dbg.contains("correct horse"),
+            "the circle phrase reached a Debug surface: {dbg}"
+        );
+        assert!(
+            dbg.contains("Book Club"),
+            "the label is not a secret: {dbg}"
+        );
+    }
+
+    /// `Seeds` derives `Clone` and is cloned on the TUI's session-adopt path, so a
+    /// clone that dropped or blanked `entropy` would silently blank every circle
+    /// secret in the held copy — compiling, and invisible to every other test.
+    /// `PersistedCircle`'s `Clone` is derived (over a `Zeroizing<String>` field,
+    /// which is itself `Clone`) precisely so that slip is unavailable; this holds
+    /// the behaviour regardless of how the impl is spelled.
+    #[test]
+    fn cloning_a_persisted_circle_preserves_both_fields() {
+        let c = PersistedCircle::new("correct horse battery staple", "Book Club");
+        let copy = c.clone();
+        assert_eq!(copy.entropy(), "correct horse battery staple");
+        assert_eq!(copy.label, "Book Club");
+        // Independent storage, so the clone's own wipe cannot reach the original.
+        assert_ne!(
+            copy.entropy().as_ptr(),
+            c.entropy().as_ptr(),
+            "the clone shares the original's buffer"
+        );
     }
 
     #[test]

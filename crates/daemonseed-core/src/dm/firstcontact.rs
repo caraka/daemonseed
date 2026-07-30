@@ -547,6 +547,16 @@ pub struct VerifiedFirstContact {
     pub roots: ChannelRoots,
 }
 
+impl Drop for VerifiedFirstContact {
+    /// `ss0` is a bare array, so it has no `Drop` of its own and would otherwise
+    /// outlive this struct in whatever stack or heap slot held it — and it is the
+    /// secret the seal key, `AR`, `chan_id` and the whole ratchet root on. The
+    /// boxed public halves need no wiping. (#259)
+    fn drop(&mut self) {
+        self.ss0.zeroize();
+    }
+}
+
 impl std::fmt::Debug for VerifiedFirstContact {
     /// Hand-written, never derived: `ss0` is the root of the seal key, `AR`,
     /// `chan_id` and the ratchet, so one `debug!(?verified)` would put the whole

@@ -1366,7 +1366,7 @@ impl App {
         // The runtime set is NOT pre-populated — the `CircleJoined` events restore
         // `self.circles` with the persisted labels (the rejoin branch above).
         for entry in session.seeds.circles() {
-            self.pending_joins.push_back(entry.entropy.clone());
+            self.pending_joins.push_back(entry.entropy().to_owned());
         }
         if !self.pending_joins.is_empty() {
             self.circle_status = CircleStatus::Joining;
@@ -1568,7 +1568,7 @@ impl App {
                 } else if let Some(persisted) = self
                     .seeds
                     .as_ref()
-                    .and_then(|s| s.circles().iter().find(|c| c.entropy == entropy))
+                    .and_then(|s| s.circles().iter().find(|c| c.entropy() == entropy))
                 {
                     // A rejoin (M13, ISC-C59): this circle is already remembered.
                     // The user's persisted label (ISC-C62) wins over the
@@ -5877,7 +5877,7 @@ mod tests {
         // Live seeds carries the remembered circle.
         let live = app.seeds.as_ref().expect("seeds present");
         assert_eq!(live.circles().len(), 1);
-        assert_eq!(live.circles()[0].entropy, "shared phrase one");
+        assert_eq!(live.circles()[0].entropy(), "shared phrase one");
         assert_eq!(live.circles()[0].label, "Book Club");
 
         // And the join queued a write-through that persists it.
@@ -5888,7 +5888,7 @@ mod tests {
             .expect("re-sealed blob opens")
             .seeds;
         assert_eq!(recovered.circles().len(), 1);
-        assert_eq!(recovered.circles()[0].entropy, "shared phrase one");
+        assert_eq!(recovered.circles()[0].entropy(), "shared phrase one");
     }
 
     /// On Unlock, every remembered circle is queued for rejoin; the resulting

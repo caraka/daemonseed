@@ -74,34 +74,26 @@ pub const ROOM_MESSAGE_AAD: &[u8] = b"daemonseed/public-room/message/v1";
 /// any other ML-DSA-87 signature daemonseed produces.
 pub const ROOM_PROVENANCE_DOMAIN: &[u8] = b"daemonseed/public-room/message/v1";
 
-/// A derived public-room key — the global, server-readable AEAD key for a public
-/// room (ISC-S22). A **distinct type** from [`crate::circle::key::CircleKey`] so
-/// the two can never be substituted at a seal site (the key-class guard): a
-/// public payload can only be sealed with a `PublicRoomKey` and a circle payload
-/// only with a `CircleKey` — the wrong one is a compile error. Both implement
-/// [`AeadKey256`], so a tier-agnostic *open* path can still accept either (a
-/// wrong key merely fails AEAD authentication, no confidentiality loss). Zeroes
-/// on drop; `Debug` is redacted (ISC-A-C1).
-#[derive(zeroize::ZeroizeOnDrop)]
-pub struct PublicRoomKey(Box<[u8; COT_KEY_LEN]>);
-
-impl PublicRoomKey {
-    /// Borrow the raw key bytes for AEAD use. Callers must not copy these into a
-    /// non-zeroizing buffer.
-    pub fn as_bytes(&self) -> &[u8; COT_KEY_LEN] {
-        &self.0
-    }
-
-    /// Wrap raw key bytes into a zeroizing `PublicRoomKey`. The caller zeroes its
-    /// own copy of `bytes` after this call (the boxed copy here zeroes on drop).
-    pub fn from_bytes(bytes: [u8; COT_KEY_LEN]) -> Self {
-        PublicRoomKey(Box::new(bytes))
-    }
+redacted_secret_newtype! {
+    /// A derived public-room key — the global, server-readable AEAD key for a public
+    /// room (ISC-S22). A **distinct type** from [`crate::circle::key::CircleKey`] so
+    /// the two can never be substituted at a seal site (the key-class guard): a
+    /// public payload can only be sealed with a `PublicRoomKey` and a circle payload
+    /// only with a `CircleKey` — the wrong one is a compile error. Both implement
+    /// [`AeadKey256`], so a tier-agnostic *open* path can still accept either (a
+    /// wrong key merely fails AEAD authentication, no confidentiality loss). Zeroes
+    /// on drop; `Debug` is redacted (ISC-A-C1).
+    boxed pub struct PublicRoomKey([u8; COT_KEY_LEN]);
 }
 
-impl core::fmt::Debug for PublicRoomKey {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("PublicRoomKey(<redacted>)")
+impl PublicRoomKey {
+    /// Wrap raw key bytes into a zeroizing `PublicRoomKey`. The caller zeroes its
+    /// own copy of `bytes` after this call (the boxed copy here zeroes on drop).
+    ///
+    /// Kept out of the `redacted_secret_newtype!` invocation deliberately: the macro grants only
+    /// `as_bytes`, and most secrets it covers have no raw-bytes constructor at all.
+    pub fn from_bytes(bytes: [u8; COT_KEY_LEN]) -> Self {
+        PublicRoomKey(Box::new(bytes))
     }
 }
 

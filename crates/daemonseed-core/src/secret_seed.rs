@@ -3,7 +3,12 @@
 //! Several distinct secrets in this crate share one hygiene contract: a 32-byte
 //! newtype that (a) zeroizes its bytes on drop, (b) renders `Debug` as
 //! `"<Name>(<redacted>)"` so raw bytes never reach a log surface (ISC-A-C1), and
-//! (c) exposes exactly one `as_bytes()` accessor. Two families use it:
+//! (c) exposes exactly one `as_bytes()` accessor. Three families use it:
+//!
+//! - **AEAD content keys** — [`crate::circle::key::CircleKey`] and
+//!   [`crate::public_room::PublicRoomKey`], held in a `Box<[u8; 32]>` (the `boxed`
+//!   macro arm) and constructed in their own modules, each additionally exposing a
+//!   `from_bytes` in a separate `impl` block.
 //!
 //! - **World-/maintainer-derivable Veilid rendezvous-owner seeds** — the six
 //!   `*VeilidOwnerSeed` newtypes across [`crate::circle::key`],
@@ -37,7 +42,8 @@ use zeroize::Zeroize;
 ///
 /// Two storage shapes:
 ///
-/// - `boxed` — `Box<[u8; N]>`, `ZeroizeOnDrop`. The rendezvous-owner seeds, built
+/// - `boxed` — `Box<[u8; N]>`, `ZeroizeOnDrop`. Two families: the AEAD content
+///   keys, constructed in their own modules, and the rendezvous-owner seeds, built
 ///   by [`derive_boxed_seed`].
 /// - `inline` — `[u8; N]`, `Clone + Zeroize + ZeroizeOnDrop`. The identity-rooted
 ///   secrets, copied out of a transient buffer at their (distinct) derivation
@@ -151,7 +157,7 @@ mod tests {
     /// Every secret newtype the macro generates carries `ZeroizeOnDrop`.
     ///
     /// This is a compile-time bound, so it proves the trait is implemented on all
-    /// seventeen key classes — and nothing more. A hand-written `impl
+    /// nineteen key classes — and nothing more. A hand-written `impl
     /// ZeroizeOnDrop for T {}` with no `Drop` would satisfy it while wiping
     /// nothing; closing that gap is what `tests/secret_zeroize_on_drop.rs` is
     /// for. The value here is breadth: it fails on the arm-level derive AND on
@@ -176,6 +182,10 @@ mod tests {
         assert_zeroize_on_drop::<crate::dm::ratchet::RootKey>();
         assert_zeroize_on_drop::<crate::dm::ratchet::ChainKey>();
         assert_zeroize_on_drop::<crate::dm::ratchet::MessageKey>();
+
+        // boxed arm — AEAD content keys.
+        assert_zeroize_on_drop::<crate::circle::key::CircleKey>();
+        assert_zeroize_on_drop::<crate::public_room::PublicRoomKey>();
 
         // boxed arm — rendezvous-owner seeds.
         assert_zeroize_on_drop::<crate::circle::key::CircleVeilidOwnerSeed>();

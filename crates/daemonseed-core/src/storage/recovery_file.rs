@@ -56,7 +56,7 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use oxicrypt_aes::{Aes256Key, gcm_decrypt, gcm_encrypt};
 use oxicrypt_kdf::HkdfSha384;
 use uuid::Uuid;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::suite::{Registry, SuiteId, SuiteIdError, WriteRefusal};
 use crate::identity::mnemonic::{Mnemonic, MnemonicError};
@@ -183,6 +183,11 @@ pub fn seal(
 /// Encrypt a mnemonic into the v2 `.dseed` layout under an explicit
 /// `suite_id`. Used by tests that need to write a non-default suite. The
 /// registry MUST contain `suite_id` and it MUST be write-eligible.
+///
+/// Both the derived AEAD key and the mnemonic phrase are held in [`Zeroizing`], so
+/// each is wiped on every path out — including the two fallible steps that sit
+/// between the key's derivation and its last use (the CSPRNG nonce draw and the AES
+/// key schedule), and an unwind out of any of it.
 pub fn seal_under(
     mnemonic: &Mnemonic,
     passphrase: &str,
@@ -192,15 +197,19 @@ pub fn seal_under(
 ) -> Result<Vec<u8>, RecoveryFileError> {
     Registry::resolve_for_write(suite_id).map_err(RecoveryFileError::WriteRefused)?;
 
-    let mut key = derive_aead_key(passphrase, profile_id, argon2)?;
+    // Both secrets let the type carry the wipe rather than a positional
+    // `zeroize()` call. For the key that closes a real gap: two `?` returns sit
+    // between its derivation and its last use, and a positional wipe after
+    // `Aes256Key::new` is skipped by either of them. (#259)
+    let key = Zeroizing::new(derive_aead_key(passphrase, profile_id, argon2)?);
 
     let mut nonce = [0u8; NONCE_LEN];
     getrandom::fill(&mut nonce).map_err(RecoveryFileError::EntropySource)?;
 
     let aes = Aes256Key::new(&key).map_err(RecoveryFileError::AesKeyInit)?;
-    key.zeroize();
 
-    let phrase = mnemonic.to_phrase();
+    // The phrase is the whole recovery secret.
+    let phrase = Zeroizing::new(mnemonic.to_phrase());
     let plaintext = phrase.as_bytes();
     let suite_bytes = suite_id.get().to_be_bytes();
     let mut ciphertext = vec![0u8; plaintext.len()];
