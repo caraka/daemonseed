@@ -75,6 +75,25 @@
 //! for the cursor; it is the wrong tool for the frontier, which is not a function
 //! of any sequence number.
 //!
+//! ## An address is a checked value, not three loose primitives
+//!
+//! [`DmPageAddress`] binds the owner seed, the page number, and the stream into one
+//! value, and it is what a transport takes. The seed alone is not enough: it
+//! carries neither the page it belongs to — so a slot from a different page can be
+//! named alongside it — nor the direction it was derived for, and both parties can
+//! derive both streams, so the wrong one is a *valid* address for the wrong record.
+//! The stream rides in the type parameter ([`Sending`] / [`Receiving`]) so a sweep
+//! handed a sending address does not compile, and the direction itself is taken
+//! from the ratchet's own accessors rather than from an argument.
+//!
+//! **The guarantee is relative to the ratchet passed in, and stops there.** The
+//! address root and the ratchet are two unbound arguments; nothing checks that the
+//! ratchet belongs to the conversation the root came from, so a caller holding two
+//! channels whose local roles differ can resolve one conversation's root against
+//! the other's ratchet and get a valid, wrongly-directed address — silently. See
+//! [`DmPageAddress`] for the shape of that mistake and where the structural fix is
+//! tracked.
+//!
 //! ## The collector must check where a message was found
 //!
 //! A frame declares its own sequence number, and the slot it was found in also
@@ -97,10 +116,12 @@
 //! deliberate: it is what lets a party who has been offline for a month still
 //! find its way back.
 
+use std::marker::PhantomData;
+
 use oxicrypt_kdf::HkdfSha384;
 
 use crate::dm::domain;
-use crate::dm::ratchet::Direction;
+use crate::dm::ratchet::{Direction, Ratchet};
 use crate::secret_seed::{derive_boxed_seed, redacted_secret_newtype};
 
 /// Byte length of the Veilid owner seed this module derives.
@@ -141,12 +162,27 @@ redacted_secret_newtype! {
 pub enum DmPageError {
     /// HKDF failed — an unrecoverable crypto-module condition.
     Kdf(oxicrypt_kdf::KdfError),
+    /// The page is above [`MAX_PAGE`], so it holds no position whatever slot is
+    /// named — `page * PAGE_SLOTS + slot` leaves the sequence space.
+    ///
+    /// Named as the sibling of [`crate::dm::collect::CollectError::PageBeyondSequenceSpace`]
+    /// because it is the same fault seen from the addressing end rather than the
+    /// collecting end. [`DmPageAddress`] refuses such a page, which is what lets a
+    /// sweep of an address assume every in-record slot places.
+    PageBeyondSequenceSpace {
+        /// The page that was asked for.
+        page: u64,
+    },
 }
 
 impl std::fmt::Display for DmPageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Kdf(e) => write!(f, "page address derivation failed: {e}"),
+            Self::PageBeyondSequenceSpace { page } => write!(
+                f,
+                "page {page} is above the highest page a sequence number can live on ({MAX_PAGE})"
+            ),
         }
     }
 }
@@ -234,11 +270,21 @@ pub fn position_of(seq: u64) -> PagePosition {
 /// reach the same record from the same conversation, and a party returning after
 /// a month recomputes an address it never stored.
 ///
+/// **This is the raw primitive; [`DmPageAddress`] is what a transport takes.** A
+/// seed on its own carries neither the page it belongs to nor the stream it was
+/// derived for, so the two mistakes below are available to anyone holding one.
+/// Reach for this directly only to pin the derivation itself.
+///
 /// Take the direction from [`crate::dm::ratchet::Ratchet::send_direction`] or
 /// [`recv_direction`](crate::dm::ratchet::Ratchet::recv_direction) rather than
 /// mapping a role onto one by hand. Passing the sending direction where the
 /// receiving one was meant derives a perfectly valid seed — for your own pages —
-/// and then sweeps your own writes forever, which nothing here can catch.
+/// and then sweeps your own writes forever, which nothing in *this* function's
+/// signature can catch. [`DmPageAddress`] is what catches it: the stream lives in
+/// its type parameter, so naming the wrong direction *for a given ratchet* does not
+/// compile. That is the reason to prefer it over this primitive — and the limit of
+/// what it buys, since pairing a root with the wrong conversation's ratchet reaches
+/// the same place (see that type's docs, and #270).
 ///
 /// The direction is bound so the two halves of a conversation never collide: A's
 /// page 3 and B's page 3 are unrelated records, which is what stops one party's
@@ -262,6 +308,209 @@ pub fn derive_owner_seed(
     let seed =
         derive_boxed_seed::<DM_PAGE_OWNER_SEED_LEN>(&hkdf, &info).map_err(DmPageError::Kdf)?;
     Ok(DmPageOwnerSeed(seed))
+}
+
+/// Which of a conversation's two streams a page belongs to, **as a type**.
+///
+/// Both implementors are uninhabited, so the only thing either can ever do is
+/// parameterise [`DmPageAddress`]. That is the point: the stream is carried in the
+/// type, so a publish handed a receiving address — or a sweep handed a sending one —
+/// does not compile. Before it was a type it was a comment, and
+/// [`derive_owner_seed`]'s own docs record what the comment bought: the wrong
+/// direction derives a perfectly valid seed for *your own* pages, and a sweep then
+/// reads your own writes back forever while the correspondent's stream sits
+/// untouched. Nothing at runtime can see that.
+///
+/// **What the marker fixes is the mapping, not the pairing.** It resolves "which
+/// stream" against *the ratchet it is given*, so no call site writes a
+/// role-to-direction mapping by hand. It cannot see whether that ratchet is the
+/// right one for the address root beside it — see [`DmPageAddress`].
+///
+/// **Sealed.** The two mappings are the ratchet's own accessors and nothing else;
+/// a third implementation could only be a role-to-direction mapping written by
+/// hand, which is exactly what [`crate::dm::ratchet::Role`] exists to prevent.
+pub trait PageDirection: sealed::Sealed {
+    /// The absolute [`Direction`] this marker names for `ratchet`.
+    fn of(ratchet: &Ratchet) -> Direction;
+}
+
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for super::Sending {}
+    impl Sealed for super::Receiving {}
+}
+
+/// The stream this end **sends** on — [`Ratchet::send_direction`].
+///
+/// Uninhabited: a marker, never a value.
+pub enum Sending {}
+
+/// The stream this end **receives** on — [`Ratchet::recv_direction`].
+///
+/// Uninhabited: a marker, never a value.
+pub enum Receiving {}
+
+impl PageDirection for Sending {
+    fn of(ratchet: &Ratchet) -> Direction {
+        ratchet.send_direction()
+    }
+}
+
+impl PageDirection for Receiving {
+    fn of(ratchet: &Ratchet) -> Direction {
+        ratchet.recv_direction()
+    }
+}
+
+/// One page of one stream of one conversation: its owner seed, its page number,
+/// and the direction it was derived for, bound together and checked.
+///
+/// **Why the three travel as one value.** They are three facts about a single
+/// record, and every way of pulling them apart fails silently:
+///
+/// - A seed beside a loose slot lets a caller derive the seed for page A and name
+///   a slot belonging to page B. The write succeeds, the frame lands where nobody
+///   looks, and the sequence number it declares is one no reader will ever
+///   associate with that slot. [`PagePosition`] was given private fields and a
+///   validating constructor to stop exactly this arithmetic escaping; a transport
+///   taking a seed and a bare `u32` re-opens the hole one layer up.
+/// - A seed with no direction attached is the [`derive_owner_seed`] hazard above:
+///   both streams are derivable by both parties, so the wrong one is a valid
+///   address for the wrong record.
+///
+/// **The direction is never passed in** — it comes from the ratchet's own
+/// [`send_direction`](Ratchet::send_direction) /
+/// [`recv_direction`](Ratchet::recv_direction) via the [`PageDirection`] marker,
+/// so the role-to-direction mapping happens once, inside [`crate::dm::ratchet`],
+/// and a call site has no direction argument to get wrong.
+///
+/// **The guarantee is stated relative to the ratchet argument, and it is worth
+/// being exact about that rather than claiming the mistake is impossible.**
+/// `address_root` and `ratchet` arrive as two unbound arguments, and nothing here
+/// checks that the ratchet belongs to the conversation the root came from. An
+/// application holding two channels whose local roles differ can resolve one
+/// conversation's root against the other's ratchet: the marker then reads the
+/// *other* ratchet's directions, so a [`DmPageAddress<Receiving>`](DmPageAddress)
+/// can name the first conversation's *sending* page. That address is valid, its
+/// sweep returns `Ok` with `found > 0`, and this end reads its own writes back
+/// forever — the failure the marker eliminates *within* a ratchet, reached by
+/// mispairing the two arguments instead. A root fingerprint carried in
+/// [`Ratchet`], which would let this constructor refuse the pair, is tracked as
+/// **#270** and deliberately not built here. Until then: take the root and the
+/// ratchet from the same conversation record, never from two lookups.
+///
+/// **Moved, not borrowed, and that is a constraint rather than a taste (#244).**
+/// The owner seed is the conversation's write *capability*: under Veilid a
+/// derivable owner seed is write access, which is why it is a boxed, redacted,
+/// zeroize-on-drop [`DmPageOwnerSeed`] and deliberately neither `Clone` nor
+/// constructible from bytes outside this module. A transport must *move* it into
+/// the command that crosses its channel, so the address moves too — a `&`
+/// parameter could only be honoured by copying the secret into a fresh
+/// non-zeroizing buffer, which is the copy the type exists to remove. So the
+/// address is single-use: **derive one per call**, and read the seed through
+/// [`owner_seed`](Self::owner_seed) — a borrow, for the one thing that needs it, a
+/// keypair derivation — rather than taking it out. Derivation is pure (no clock,
+/// no randomness, no network), which is what makes re-deriving the right answer
+/// rather than a workaround.
+pub struct DmPageAddress<D: PageDirection> {
+    owner_seed: DmPageOwnerSeed,
+    page: u64,
+    direction: Direction,
+    stream: PhantomData<D>,
+}
+
+impl DmPageAddress<Sending> {
+    /// The address of one page of the stream this ratchet **sends** on — where our
+    /// own outbound frames are published.
+    ///
+    /// Fails with [`DmPageError::PageBeyondSequenceSpace`] for a page above
+    /// [`MAX_PAGE`], which no position can live on.
+    pub fn sending(
+        address_root: &[u8; ADDRESS_ROOT_LEN],
+        ratchet: &Ratchet,
+        page: u64,
+    ) -> Result<Self, DmPageError> {
+        Self::derive(address_root, ratchet, page)
+    }
+}
+
+impl DmPageAddress<Receiving> {
+    /// The address of one page of the stream this ratchet **receives** on — where
+    /// the correspondent's frames are swept from.
+    ///
+    /// Fails with [`DmPageError::PageBeyondSequenceSpace`] for a page above
+    /// [`MAX_PAGE`], which no position can live on.
+    pub fn receiving(
+        address_root: &[u8; ADDRESS_ROOT_LEN],
+        ratchet: &Ratchet,
+        page: u64,
+    ) -> Result<Self, DmPageError> {
+        Self::derive(address_root, ratchet, page)
+    }
+}
+
+impl<D: PageDirection> DmPageAddress<D> {
+    /// The shared body of both constructors — one derivation, so the two named
+    /// entry points differ in nothing but which of the ratchet's directions they
+    /// ask for.
+    fn derive(
+        address_root: &[u8; ADDRESS_ROOT_LEN],
+        ratchet: &Ratchet,
+        page: u64,
+    ) -> Result<Self, DmPageError> {
+        // Refused BEFORE the derivation, so an address never names a page that
+        // holds no position: it is what lets a sweep of this address treat a
+        // `PagePosition::new` failure as the record shape's fault alone
+        // (ISC-C100) rather than as an ambiguity between shape and page.
+        if page > MAX_PAGE {
+            return Err(DmPageError::PageBeyondSequenceSpace { page });
+        }
+        let direction = D::of(ratchet);
+        Ok(Self {
+            owner_seed: derive_owner_seed(address_root, direction, page)?,
+            page,
+            direction,
+            stream: PhantomData,
+        })
+    }
+
+    /// Which page this address names. At most [`MAX_PAGE`], by construction.
+    pub fn page(&self) -> u64 {
+        self.page
+    }
+
+    /// The absolute direction this address was derived for.
+    ///
+    /// Exposed because a frame needs its direction at three places per message —
+    /// the authorship signature, the page address, and the receive-side signature
+    /// reconstruction — and this address already resolved it from the ratchet. A
+    /// caller reading it here does not map a role onto a direction a second time.
+    pub fn direction(&self) -> Direction {
+        self.direction
+    }
+
+    /// Borrow the record-owner seed, to derive the Veilid owner keypair from.
+    ///
+    /// A borrow because that derivation only reads it, and because the seed has no
+    /// second home to go to: see the type's docs on why the address is moved
+    /// rather than borrowed. Callers must not copy these bytes into a
+    /// non-zeroizing buffer.
+    pub fn owner_seed(&self) -> &DmPageOwnerSeed {
+        &self.owner_seed
+    }
+}
+
+/// Hand-written rather than derived: `#[derive(Debug)]` on a generic would demand
+/// `D: Debug`, which an uninhabited marker cannot satisfy. The seed renders through
+/// its own redacted `Debug`, so this leaks nothing (ISC-A-C1).
+impl<D: PageDirection> std::fmt::Debug for DmPageAddress<D> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DmPageAddress")
+            .field("direction", &self.direction)
+            .field("page", &self.page)
+            .field("owner_seed", &self.owner_seed)
+            .finish()
+    }
 }
 
 #[cfg(test)]
@@ -478,5 +727,219 @@ mod tests {
         let _ = oxicrypt_module::initialize();
         let s = derive_owner_seed(&ar(0x41), Direction::AToB, 0).unwrap();
         assert_eq!(format!("{s:?}"), "DmPageOwnerSeed(<redacted>)");
+    }
+
+    // ---- the checked address -------------------------------------------------
+
+    /// A recipient's ratchet, which is the cheap one to build: it takes only the
+    /// PUBLIC half of the opening ephemeral, so no keygen is needed and the bytes
+    /// are never inspected. Its role fixes both directions —
+    /// `send_direction() == BToA`, `recv_direction() == AToB` — so one ratchet
+    /// exercises both markers.
+    fn recipient_ratchet() -> Ratchet {
+        let _ = oxicrypt_module::initialize();
+        Ratchet::recipient(&[0x5c; 32], Box::new([0x11; oxicrypt_ml_kem::EK_LEN]))
+            .expect("open a recipient ratchet")
+    }
+
+    /// **The refactor did not move a single address.** Every assertion carries the
+    /// hex from `page_addresses_are_pinned` above — the same known-answer vectors,
+    /// reached through [`DmPageAddress`] instead of the raw derivation.
+    ///
+    /// This is the assertion that matters most in this file. A checked address type
+    /// that quietly changed what it derives would move every conversation to
+    /// records no other client writes to, and every structural test here would stay
+    /// green: the seeds would still be distinct per page, distinct per direction,
+    /// distinct per root, and redacted in `Debug`. Only a pinned byte string
+    /// notices.
+    ///
+    /// It doubles as the direction wiring's oracle. This is a RECIPIENT ratchet, so
+    /// `sending` must resolve to `BToA` and `receiving` to `AToB`; a `Sending`
+    /// marker wired to `recv_direction` swaps the two vectors and fails both halves
+    /// at once.
+    ///
+    /// **And it pins the PAGE ARGUMENT, which is why page 1 is here.** On page 0
+    /// alone a `derive` that dropped its page and passed a hardcoded zero to
+    /// [`derive_owner_seed`] is byte-identical to the correct one, so every vector
+    /// matches and nothing in this file notices — while in production every page of
+    /// a conversation would alias page 0's sixteen slots, message sixteen
+    /// overwriting message zero with both ends agreeing and no error anywhere. The
+    /// page-1 vector is independently derived, so it is the value a lost page
+    /// argument cannot produce.
+    #[test]
+    fn the_address_type_derives_the_pinned_seed_for_its_stream() {
+        let r = recipient_ratchet();
+
+        let sending = DmPageAddress::sending(&ar(0x41), &r, 0).expect("sending address");
+        let receiving = DmPageAddress::receiving(&ar(0x41), &r, 0).expect("receiving address");
+
+        assert_eq!(
+            hex::encode(sending.owner_seed().as_bytes()),
+            "66b769ad77905d91ce4bc28618d0aa04231407af11930cf22119f24fef6eb47a",
+            "a recipient SENDS on b2a — this is `page_addresses_are_pinned`'s BToA \
+             vector, and a different value means the address graph moved"
+        );
+        assert_eq!(
+            hex::encode(receiving.owner_seed().as_bytes()),
+            "f7188b50d26697b05a47ff6e8fa8f166a7a4af31397ccc5c46d0b393e5fca75b",
+            "a recipient RECEIVES on a2b — this is `page_addresses_are_pinned`'s \
+             AToB vector"
+        );
+
+        // Page ONE, through the same type: `page_addresses_are_pinned`'s AToB page-1
+        // vector, which is what the address must reach when it is asked for page 1
+        // rather than what page 0 happens to derive.
+        let page_one = DmPageAddress::receiving(&ar(0x41), &r, 1).expect("page-1 address");
+        assert_eq!(
+            hex::encode(page_one.owner_seed().as_bytes()),
+            "c39002df0dfb6a6c65f8d9d0d7023743f0ac593c82516e4403b07fc1d3ec06fa",
+            "the address must carry its PAGE into the derivation — this is \
+             `page_addresses_are_pinned`'s AToB page-1 vector, and a page argument \
+             dropped on the way to `derive_owner_seed` yields page 0's instead"
+        );
+        assert_ne!(
+            page_one.owner_seed().as_bytes(),
+            receiving.owner_seed().as_bytes(),
+            "page 1 and page 0 of one stream must be different records"
+        );
+
+        assert_eq!(sending.direction(), Direction::BToA);
+        assert_eq!(receiving.direction(), Direction::AToB);
+        assert_eq!(sending.page(), 0);
+        assert_eq!(receiving.page(), 0);
+        assert_eq!(page_one.page(), 1);
+    }
+
+    /// The two streams of one conversation must address different records at the
+    /// same page number, or one party's writes land in the other's slots.
+    ///
+    /// Distinct from `the_two_directions_address_different_records` above, which
+    /// pins the same property of the raw derivation: what is checked here is that
+    /// the two MARKERS reach the two directions, which a pair of constructors both
+    /// calling `send_direction` would break while leaving that test green.
+    #[test]
+    fn sending_and_receiving_address_different_records() {
+        let r = recipient_ratchet();
+        for page in [0u64, 1, 4_096] {
+            let s = DmPageAddress::sending(&ar(0x41), &r, page).unwrap();
+            let v = DmPageAddress::receiving(&ar(0x41), &r, page).unwrap();
+            assert_ne!(
+                s.owner_seed().as_bytes(),
+                v.owner_seed().as_bytes(),
+                "page {page} of the two streams shares a record"
+            );
+            assert_ne!(s.direction(), v.direction());
+            // The page each address REPORTS is the page it was asked for. Without
+            // this the loop compares two addresses at one page and never observes
+            // the page at all, so an address that stored some other page number —
+            // and derived under it — passes every assertion above.
+            assert_eq!(s.page(), page, "the sending address forgot its page");
+            assert_eq!(v.page(), page, "the receiving address forgot its page");
+        }
+    }
+
+    /// **A swept slot plus the page it was swept from rebuilds the sender's
+    /// sequence number.** This is the runnable twin of the reconstruction the
+    /// two-node tests make on the far side of a real sweep: a collector holds a
+    /// subkey index and the page it addressed, and nothing else, so this arithmetic
+    /// is the only thing that can tell it which message it is looking at.
+    ///
+    /// Every page here is NON-ZERO and every slot differs from its own sequence
+    /// number, which is the degeneracy that let an earlier mutation survive: on page
+    /// 0 a position is numerically indistinguishable from its slot, so a
+    /// reconstruction that dropped the page entirely still produced the right answer.
+    #[test]
+    fn a_swept_slot_and_its_page_rebuild_the_senders_sequence() {
+        for (page, slot, seq) in [
+            (3u64, 9u16, 57u64),
+            (1, 0, 16),
+            (1, PAGE_SLOTS - 1, 31),
+            (256, 5, 4_101),
+        ] {
+            // What the sender derived, from a sequence number alone.
+            let sent = position_of(seq);
+            assert_eq!((sent.page(), sent.slot()), (page, slot));
+            // What the collector rebuilds, from the swept slot and the swept page.
+            let rebuilt = PagePosition::new(page, slot).expect("a slot inside the record");
+            assert_eq!(
+                rebuilt.seq(),
+                seq,
+                "page {page} slot {slot} must rebuild sequence {seq} — a \
+                 reconstruction that dropped the page yields {slot} instead"
+            );
+            assert_eq!(
+                rebuilt, sent,
+                "the two directions must agree on the position"
+            );
+            assert_ne!(
+                rebuilt.seq(),
+                u64::from(slot),
+                "the vector is blind if the sequence number equals the slot"
+            );
+        }
+    }
+
+    /// A page above [`MAX_PAGE`] holds no position at all, so an address for it is
+    /// refused rather than derived — which is what lets a sweep of an address blame
+    /// the record shape, and only the record shape, for a slot that will not place.
+    ///
+    /// Checked on both constructors: they share a body, and a page bound that lived
+    /// in only one of them would leave the other deriving unusable addresses.
+    #[test]
+    fn an_address_above_the_top_page_is_refused() {
+        let r = recipient_ratchet();
+        for page in [MAX_PAGE + 1, u64::MAX] {
+            assert_eq!(
+                DmPageAddress::sending(&ar(0x41), &r, page).unwrap_err(),
+                DmPageError::PageBeyondSequenceSpace { page },
+            );
+            assert_eq!(
+                DmPageAddress::receiving(&ar(0x41), &r, page).unwrap_err(),
+                DmPageError::PageBeyondSequenceSpace { page },
+            );
+        }
+        assert!(DmPageAddress::sending(&ar(0x41), &r, MAX_PAGE).is_ok());
+        assert!(DmPageAddress::receiving(&ar(0x41), &r, MAX_PAGE).is_ok());
+    }
+
+    /// The address wraps the conversation's write capability, so it must not render
+    /// it — the same obligation `the_page_seed_does_not_render_its_bytes` puts on
+    /// the seed, re-checked on the wrapper because a derived `Debug` on a struct
+    /// holding it would be the obvious way to lose the property.
+    ///
+    /// The exact-string assertion is the primary check; the two below survive a
+    /// change to the struct's field names or ordering, which the exact string does
+    /// not. Both are matched against MULTI-BYTE renderings on purpose: a
+    /// single-byte decimal is one to three digits, and the rendering's own page
+    /// number is digits, so `contains(byte.to_string())` fires on a seed whose first
+    /// byte happens to read like part of the page — 1 in 256 for a one-digit page.
+    /// A flaky security test is worse than none, so the needles here are long enough
+    /// that no page number can supply them.
+    #[test]
+    fn an_address_does_not_render_its_seed() {
+        let r = recipient_ratchet();
+        let addr = DmPageAddress::receiving(&ar(0x41), &r, 7).unwrap();
+        let rendered = format!("{addr:?}");
+        assert_eq!(
+            rendered,
+            "DmPageAddress { direction: AToB, page: 7, owner_seed: DmPageOwnerSeed(<redacted>) }"
+        );
+
+        let seed = addr.owner_seed().as_bytes();
+        // A derived `Debug` on the array or on a tuple newtype renders the bytes in
+        // decimal, comma-separated. Three bytes of that is 5–11 characters of digits
+        // and separators, which nothing else in this rendering can produce.
+        let as_decimals = format!("{}, {}, {}", seed[0], seed[1], seed[2]);
+        assert!(
+            !rendered.contains(&as_decimals),
+            "seed bytes leaked in decimal: {rendered}"
+        );
+        // And a hex rendering: sixteen hex characters, likewise unreachable by
+        // accident.
+        let as_hex = hex::encode(&seed[..8]);
+        assert!(
+            !rendered.contains(&as_hex),
+            "seed bytes leaked in hex: {rendered}"
+        );
     }
 }

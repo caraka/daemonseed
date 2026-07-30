@@ -23,11 +23,12 @@
 //!    [`derive_channel_roots`]. A build that took the page address from one root
 //!    and the AAD from another would publish and sweep perfectly and then fail
 //!    every open with the error the module reserves for tampering.
-//! 2. **The two ends must agree on the direction.** A derives the page from its
-//!    *sending* direction and B from its *receiving* one, taken from the ratchets
-//!    rather than mapped by hand. Passing the wrong one derives a perfectly valid
-//!    seed for the wrong stream and then sweeps forever in silence — the exact
-//!    failure `paging::derive_owner_seed`'s docs warn about.
+//! 2. **The two ends must agree on the direction.** A addresses its *sending*
+//!    stream and B its *receiving* one, both taken from their own ratchets by
+//!    `DmPageAddress`. The wrong one derives a perfectly valid seed for the wrong
+//!    stream and then sweeps forever in silence — the failure
+//!    `paging::derive_owner_seed`'s docs warn about, and the reason the stream now
+//!    rides in the address's type.
 //! 3. **The slot a frame was found in must reach `open`.** `found_at` is the
 //!    collector's own knowledge, and it can only be reconstructed on the far side
 //!    of a real sweep — locally the caller already has the `PagePosition` it wrote
@@ -59,6 +60,17 @@
 //! that finds which pages exist — arrives with collection (#236); B is told which
 //! page to sweep here.
 //!
+//! **The run therefore sits on page 0, and that bounds property 3.** The positions
+//! reaching `open` are rebuilt from the swept slot against the page B addressed,
+//! which is the reconstruction a collector performs — but on page 0 a sequence
+//! number equals its slot, so a reconstruction that dropped the page entirely would
+//! produce the same values here. Reaching a non-zero page means advancing A's send
+//! chain past `PAGE_SLOTS` and carrying B's skipped-key cache across the gap, which
+//! changes what property 4 exercises; `two_node_dm_page` runs the same
+//! reconstruction on page 3, and `paging`'s own
+//! `a_swept_slot_and_its_page_rebuild_the_senders_sequence` pins the arithmetic on
+//! four non-degenerate pages where it can actually run.
+//!
 //! The whole run also sits in **generation zero**. Only the initiator speaks, so it
 //! never has a peer ephemeral to step against, and every frame therefore carries no
 //! `eph_ct`. Nothing here reaches `receive`'s advancing branch, its
@@ -78,14 +90,14 @@
 //! It drives the productized `VeilidNetHandle` surface the app drives, and reuses
 //! the REAL daemonseed crypto and addressing (`dm::firstcontact::{
 //! derive_channel_roots, recipient_hash}`, `dm::ratchet::Ratchet`,
-//! `dm::frame::{seal, parse, ParsedFrame::open}`, `dm::paging::{derive_owner_seed,
+//! `dm::frame::{seal, parse, ParsedFrame::open}`, `dm::paging::{DmPageAddress,
 //! position_of, PagePosition}`) — nothing is reimplemented here.
 
 use std::collections::BTreeMap;
 
 use daemonseed_core::dm::firstcontact::{derive_channel_roots, recipient_hash};
 use daemonseed_core::dm::frame::{self, AuthorKeys, DmFrameError, ParsedFrame};
-use daemonseed_core::dm::paging::{self, PagePosition};
+use daemonseed_core::dm::paging::{self, DmPageAddress, PagePosition};
 use daemonseed_core::dm::ratchet::{DeliveryLosses, EphemeralDecapKey, Ratchet, Role};
 use daemonseed_core::identity::keys::{derive_identity_keys, Identity, IdentityKeys};
 use daemonseed_core::identity::mnemonic::Mnemonic;
@@ -129,18 +141,6 @@ fn identity() -> IdentityKeys {
 /// saves pulling an RNG into the dev-deps.
 fn fresh_ss0() -> [u8; 32] {
     *identity().veilid_node_seed.as_bytes()
-}
-
-/// Rebuild the position a swept frame occupies — the collector's half of the
-/// write-once mapping, and the only fact `open` cannot get from the frame itself.
-///
-/// Through the checked constructor, never arithmetic: a sweep's subkey indices are
-/// bounded by the record shape the caller opened with, not by `PAGE_SLOTS`, so an
-/// unchecked `page * PAGE_SLOTS + slot` would map an out-of-shape slot into the
-/// NEXT page's sequence numbers without a word.
-fn position_found_at(page: u64, slot: u32) -> PagePosition {
-    let slot = u16::try_from(slot).expect("a swept slot index fits the record shape");
-    PagePosition::new(page, slot).expect("a swept slot is a valid page position")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -271,13 +271,14 @@ async fn sealed_channel_messages_round_trip_through_a_page_and_open_out_of_order
         )
         .expect("A seals the channel frame");
 
-        // The page and the slot come from ONE `PagePosition`, as the handle's docs
-        // require: a page from one sequence number and a slot from another writes a
-        // frame nobody will find at the sequence it claims.
-        let owner_seed = paging::derive_owner_seed(&roots_a.ar, dir_a, at.page())
-            .expect("A derives the page owner seed");
+        // The address's page and the position come from ONE sequence number, which
+        // the transport re-checks: a page from one sequence number and a slot from
+        // another is refused rather than writing a frame nobody will find at the
+        // sequence it claims (#254).
+        let address = DmPageAddress::sending(&roots_a.ar, &ratchet_a, at.page())
+            .expect("A derives its sending page address");
         node_a
-            .publish_dm_page(owner_seed, u32::from(at.slot()), frame_bytes)
+            .publish_dm_page(address, at, frame_bytes)
             .await
             .expect("A publishes the sealed frame into its slot");
 
@@ -303,17 +304,21 @@ async fn sealed_channel_messages_round_trip_through_a_page_and_open_out_of_order
     // B computes the address from the address root and its own receiving
     // direction. Nothing about it came from A over the wire.
     //
-    // Re-derived per use rather than held: `DmPageOwnerSeed` is the conversation's
-    // write capability, so it is deliberately not `Clone` and the transport takes it
-    // by value (#244). Derivation is pure, so this is the intended usage.
-    let page_seed_b = || {
-        paging::derive_owner_seed(&roots_b.ar, dir_b, page).expect("B derives the page owner seed")
+    // Re-derived per use rather than held: the owner seed inside is the
+    // conversation's write capability, so the address is deliberately not `Clone`
+    // and the transport takes it by value (#244/#254). Derivation is pure, so this
+    // is the intended usage. B can only pass a RECEIVING address to a sweep, which
+    // is the direction it wants — the type refuses the other one.
+    let addr_b = || {
+        DmPageAddress::receiving(&roots_b.ar, &ratchet_b, page)
+            .expect("B derives its receiving page address")
     };
     assert_eq!(
-        paging::derive_owner_seed(&roots_a.ar, dir_a, page)
-            .expect("A derives the page owner seed")
+        DmPageAddress::sending(&roots_a.ar, &ratchet_a, page)
+            .expect("A derives its sending page address")
+            .owner_seed()
             .as_bytes(),
-        page_seed_b().as_bytes(),
+        addr_b().owner_seed().as_bytes(),
         "both ends must derive the same page record from the address root alone"
     );
 
@@ -322,7 +327,7 @@ async fn sealed_channel_messages_round_trip_through_a_page_and_open_out_of_order
     // below untested, which is the whole of this file's fourth property.
     let mut swept = Vec::new();
     for attempt in 0..30 {
-        match node_b.sweep_dm_page(page_seed_b()).await {
+        match node_b.sweep_dm_page(addr_b()).await {
             Ok((slots, outcome)) => {
                 eprintln!(
                     "attempt {attempt}: {} slot(s) back, outcome {outcome:?}",
@@ -344,20 +349,34 @@ async fn sealed_channel_messages_round_trip_through_a_page_and_open_out_of_order
          convergence window"
     );
 
-    let by_slot: BTreeMap<u32, Vec<u8>> = swept.into_iter().collect();
-    let first_bytes = by_slot
-        .get(&u32::from(first_at.slot()))
-        .expect("the first frame must come back from the slot it was written to")
-        .clone();
-    let second_bytes = by_slot
-        .get(&u32::from(second_at.slot()))
-        .expect("the second frame must come back from the slot it was written to")
-        .clone();
-
-    // Positions rebuilt from the SWEPT slots, not from what A wrote — that is the
-    // collector's own knowledge, and it is the only value `open` will accept.
-    let first_found_at = position_found_at(page, u32::from(first_at.slot()));
-    let second_found_at = position_found_at(page, u32::from(second_at.slot()));
+    // **Positions REBUILT from the sweep, not taken from what A wrote.** This file's
+    // third property is that `found_at` can only be reconstructed on the far side of a
+    // real sweep, and a lookup cannot establish it: `PagePosition` derives `Eq`/`Ord`
+    // over `(page, slot)`, so the key `get_key_value` hands back is field-identical to
+    // the probe by construction, and feeding that to `open` passes A's own knowledge
+    // through under the appearance of sweep-side reconstruction.
+    //
+    // So each swept slot is put back through `PagePosition::new` against the page B
+    // ADDRESSED — the two facts a collector genuinely holds — and it is the rebuilt
+    // position that reaches `open` below. A reconstruction that lost the page (or took
+    // the wrong one) no longer matches what A wrote, so the lookups here fail rather
+    // than silently agreeing.
+    let by_position: BTreeMap<PagePosition, Vec<u8>> = swept
+        .into_iter()
+        .map(|(swept_at, bytes)| {
+            let rebuilt = PagePosition::new(page, swept_at.slot())
+                .expect("a swept slot must be inside the addressed page's record");
+            (rebuilt, bytes)
+        })
+        .collect();
+    let (first_found_at, first_bytes) = by_position
+        .get_key_value(&first_at)
+        .map(|(at, bytes)| (*at, bytes.clone()))
+        .expect("the first frame must come back from the position it was written to");
+    let (second_found_at, second_bytes) = by_position
+        .get_key_value(&second_at)
+        .map(|(at, bytes)| (*at, bytes.clone()))
+        .expect("the second frame must come back from the position it was written to");
 
     let first = frame::parse(&first_bytes).expect("the first swept bytes are a decodable frame");
     let second = frame::parse(&second_bytes).expect("the second swept bytes are a decodable frame");

@@ -24,6 +24,28 @@ next release this block is renamed to its version + date and a fresh
 `[Unreleased]` is opened (see `AGENTS.md` doc-sync). Planning for *unstarted*
 work lives in the project lead's vault manifest, not here.
 
+### Changed
+
+- The DM page transport takes a checked address. `daemonseed_core::dm::paging`
+  gains `DmPageAddress<D>`, binding the page owner seed, the page number and the
+  stream, built by `DmPageAddress::sending` / `receiving` from the ratchet's own
+  `send_direction` / `recv_direction`; `page()`, `direction()` and `owner_seed()`
+  read it. The stream rides in the type parameter (`Sending` / `Receiving` under
+  the sealed `PageDirection`), and a page above `MAX_PAGE` is refused as
+  `DmPageError::PageBeyondSequenceSpace`.
+  `VeilidNetHandle::publish_dm_page(DmPageAddress<Sending>, PagePosition, Vec<u8>)`
+  rejects a position whose page disagrees with the address as
+  `VeilidNetError::DmPageWrongPage`, before the write is enqueued; that error
+  carries the whole refused position, so its message names the page, the slot and
+  the sequence number.
+  `sweep_dm_page(DmPageAddress<Receiving>)` returns `(PagePosition, Vec<u8>)`
+  pairs built against the swept page, refuses a record whose `o_cnt` is not
+  `PAGE_SLOTS` as `VeilidNetError::DmPageShapeMismatch` before reading any slot,
+  and reports a slot the record cannot hold as
+  `VeilidNetError::DmPageSlotOutsideRecord`. `DmPageSweep` is that pair list plus
+  the sweep outcome; `DmPageSlots` is removed. Page addresses and the wire format
+  are unchanged. (#254)
+
 ### Fixed
 
 - `daemonseed_core::storage::seeds::PersistedCircle` holds `entropy` privately as a

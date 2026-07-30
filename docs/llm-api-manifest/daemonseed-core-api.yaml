@@ -879,6 +879,19 @@ modules:
       A collector must verify a frame's declared seq against the slot it was found
       in. Addressing is not forward-secret: AR is retained for the conversation's
       life.
+      DmPageAddress<D> is the checked address a transport takes: it binds the owner
+      seed, the page, and the stream. DmPageAddress::sending(AR, &Ratchet, page) and
+      ::receiving(AR, &Ratchet, page) take the direction from the ratchet's own
+      send_direction / recv_direction, so no call site names one; both refuse a page
+      above MAX_PAGE with DmPageError::PageBeyondSequenceSpace. page(), direction()
+      and owner_seed() read it; owner_seed() borrows, and the address itself is moved
+      into a transport call, so derive one per call. The stream is the type parameter
+      Sending or Receiving, implementors of the sealed PageDirection trait and
+      uninhabited, so a receiving address cannot be published and a sending address
+      cannot be swept. The guarantee is relative to the ratchet argument: AR and the
+      ratchet are unbound, and nothing checks the ratchet belongs to the conversation
+      AR came from, so pairing one conversation's AR with another's ratchet yields a
+      valid address for the wrong stream (#270). Debug renders the seed redacted.
       Sub-module dm::frame carries one message on that channel: seal(outbound,
       chan_id, signing_pc, pk_lt, recipient_hash, sent_unix_ms, body) -> encoded
       DmChannelFrame, and parse(bytes) -> ParsedFrame, whose open(key, chan_id,

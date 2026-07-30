@@ -269,21 +269,14 @@ types:
     module: daemonseed_veilid_net::actor
     kind: type alias
     description: >-
-      `(DmPageSlots, SweepOutcome)` — one page sweep's full result. The outcome is
-      required, not decoration: an empty slot list alone means both "nobody has
-      written to this page" and "all sixteen GETs errored", and `rendezvous.rs`
-      names surfacing `failed` separately as the enabling signal for consumer-side
-      session-health tracking (CRSH-ISC-1).
-  - name: DmPageSlots
-    module: daemonseed_veilid_net::actor
-    kind: type alias
-    description: >-
-      `Vec<(u32, Vec<u8>)>` — one sweep of a DM channel page: the populated slots,
-      each paired with the subkey index it came back in. The pairing is required,
-      not convenient: the collector checks the frame's declared sequence number
-      against the position it was found in via
-      `daemonseed_core::dm::paging::PagePosition::new`, and bare bytes would leave
-      the write-once property unchecked.
+      `(Vec<(PagePosition, Vec<u8>)>, SweepOutcome)` — one page sweep's full result.
+      Each populated slot arrives as a checked
+      `daemonseed_core::dm::paging::PagePosition` on the swept page, so the collector
+      compares the frame's declared sequence number against a position it did not
+      have to compute. The outcome is required, not decoration: an empty slot list
+      alone means both "nobody has written to this page" and "all sixteen GETs
+      errored", and `rendezvous.rs` names surfacing `failed` separately as the
+      enabling signal for consumer-side session-health tracking (CRSH-ISC-1).
 
 # ─────────────────────────────────────────────────────────────────────
 # Functions
@@ -487,36 +480,65 @@ functions:
       description: The unverified prost-encoded DmKeyRecord bytes, or None for an empty slot.
   - name: VeilidNetHandle::publish_dm_page
     module: daemonseed_veilid_net::actor
-    description: Publish one sealed DM channel frame into one slot of its dflt(16) page record (ISC-C42). Bytes are opaque here — this layer neither parses nor verifies the frame, and a successful write proves nothing about authorship, since both parties can derive the owner seed for both directions. Derive owner_seed with daemonseed_core::dm::paging::derive_owner_seed over the conversation's address root, the SENDING direction, and position_of(seq).page(); take slot from the same position_of(seq).slot(). Enqueued on the WB-3 funnel as a Chat-class, Ring-kind write — non-coalescible, because two queued writes to one page are two different messages in two different slots. Write-once is a CALLER OBLIGATION: this is an unconditional last-writer-wins set_dht_value with no read-before-write, so a reissued sequence number overwrites an already-delivered message and returns Ok (see #243). The page record is not world-writable: its owner seed derives from the first-contact secret, so a third party cannot compute the address at all.
-    signature: "pub async fn publish_dm_page(&self, owner_seed: DmPageOwnerSeed, slot: u32, frame: Vec<u8>) -> Result<()>"
+    description: >-
+      Publish one sealed DM channel frame at a position on its dflt(16) page record
+      (ISC-C42). Bytes are opaque here — this layer neither parses nor verifies the
+      frame, and a successful write proves nothing about authorship, since both parties
+      can derive the owner seed for both directions. Rejects a position whose page
+      disagrees with the address as VeilidNetError::DmPageWrongPage, before the write is
+      enqueued. Enqueued on the WB-3 funnel as a Chat-class, Ring-kind write —
+      non-coalescible, because two queued writes to one page are two different messages
+      in two different slots. Write-once is a CALLER OBLIGATION: this is an
+      unconditional last-writer-wins set_dht_value with no read-before-write, so a
+      reissued sequence number overwrites an already-delivered message and returns Ok
+      (see #243). The page record is not world-writable: its owner seed derives from the
+      first-contact secret, so a third party cannot compute the address at all.
+    signature: "pub async fn publish_dm_page(&self, address: DmPageAddress<Sending>, at: PagePosition, frame: Vec<u8>) -> Result<()>"
     parameters:
-      - name: owner_seed
-        type: DmPageOwnerSeed
+      - name: address
+        type: "DmPageAddress<Sending>"
         direction: in
-        description: The page's owner seed, from daemonseed_core::dm::paging::derive_owner_seed(address_root, direction, page). Taken by value — the type is a boxed, redacted, zeroize-on-drop newtype that is neither Clone nor constructible outside daemonseed_core::dm::paging, so it is moved into the command rather than copied. Derive one per call; derivation is pure. The funnel's record id is the owner's PUBLIC key derived from this seed, never the seed.
-      - name: slot
-        type: u32
+        description: The page's address, from daemonseed_core::dm::paging::DmPageAddress::sending(address_root, ratchet, page). Typed to Sending, so an address for the stream this end receives on is a compile error. Taken by value — it holds a boxed, redacted, zeroize-on-drop owner seed that is neither Clone nor constructible outside daemonseed_core::dm::paging, so it is moved into the command rather than copied. Derive one per call; derivation is pure. The funnel's record id is the owner's PUBLIC key derived from the seed, never the seed.
+      - name: at
+        type: PagePosition
         direction: in
-        description: The subkey to write, from position_of(seq).slot(). Must be under PAGE_SLOTS or the write is rejected by the record's schema.
+        description: Where the frame goes, from paging::position_of(seq). Its page() must equal address.page() — take both from the one position — or the call returns DmPageWrongPage and nothing is enqueued. The subkey is read off it at dispatch.
       - name: frame
         type: "Vec<u8>"
         direction: in
         description: The already-sealed, already-signed channel frame.
     returns:
       type: "Result<()>"
-      description: Ok once the scheduler has dispatched the write.
+      description: Ok once the scheduler has dispatched the write; DmPageWrongPage if the position is on another page.
   - name: VeilidNetHandle::sweep_dm_page
     module: daemonseed_veilid_net::actor
-    description: Sweep every slot of one DM channel page, returning (slot, bytes) per populated slot together with the sweep's SweepOutcome. The slot index travels back with the bytes because the collector must check the frame's declared sequence number against the position it was found in, via daemonseed_core::dm::paging::PagePosition::new. The outcome travels back because an empty Vec alone cannot distinguish an unwritten page from one whose every GET errored, and those demand opposite responses. A partial sweep returns what it read, which makes recovery a CALLER OBLIGATION: the collector must hold probe frontier and contiguous cursor as separate pointers and treat failed > 0 as a record-health signal. No such collector exists yet (#236). Bounded by the handle's own shape; PAGE_SLOTS gated GETs on the read lane, no write funnel involvement (WB-3 I9). Spawned off the command loop (D-0b / #128, CRSH-ISC-22). Opens via open_or_create, so probing a page nobody has written CREATES it.
-    signature: "pub async fn sweep_dm_page(&self, owner_seed: DmPageOwnerSeed) -> Result<DmPageSweep>"
+    description: >-
+      Sweep every slot of one DM channel page, returning (PagePosition, bytes) per
+      populated slot together with the sweep's SweepOutcome. Each subkey is placed on
+      the addressed page through PagePosition::new at the boundary, so the collector
+      checks the frame's declared sequence number against a position rather than
+      recomputing one; a slot the record cannot hold returns
+      VeilidNetError::DmPageSlotOutsideRecord rather than being skipped. Refuses a
+      record whose o_cnt is not paging::PAGE_SLOTS as
+      VeilidNetError::DmPageShapeMismatch before any slot is read, so a shape
+      disagreement is loud in both directions rather than truncating the page. The outcome
+      travels back because an empty Vec alone cannot distinguish an unwritten page from
+      one whose every GET errored, and those demand opposite responses. A partial sweep
+      returns what it read, which makes recovery a CALLER OBLIGATION: the collector must
+      hold probe frontier and contiguous cursor as separate pointers and treat failed >
+      0 as a record-health signal. No such collector exists yet (#236). Bounded by the
+      handle's own shape; PAGE_SLOTS gated GETs on the read lane, no write funnel
+      involvement (WB-3 I9). Spawned off the command loop (D-0b / #128, CRSH-ISC-22).
+      Opens via open_or_create, so probing a page nobody has written CREATES it.
+    signature: "pub async fn sweep_dm_page(&self, address: DmPageAddress<Receiving>) -> Result<DmPageSweep>"
     parameters:
-      - name: owner_seed
-        type: DmPageOwnerSeed
+      - name: address
+        type: "DmPageAddress<Receiving>"
         direction: in
-        description: The page's owner seed. Use the RECEIVING direction to collect a correspondent's messages. Taken by value for the reason publish_dm_page gives; derive one per call.
+        description: The page's address, from daemonseed_core::dm::paging::DmPageAddress::receiving(address_root, ratchet, page). Typed to Receiving, so sweeping the stream this end sends on is a compile error — that address is valid and would read this end's own writes back forever. Taken by value for the reason publish_dm_page gives; derive one per call.
     returns:
       type: "Result<DmPageSweep>"
-      description: The populated slots as (subkey, unverified bytes) pairs, paired with the sweep outcome (attempted / found / failed).
+      description: The populated slots as (PagePosition, unverified bytes) pairs, paired with the sweep outcome (attempted / found / failed).
   - name: VeilidNetHandle::publish_presence
     module: daemonseed_veilid_net::actor
     description: Publish a sealed member-presence beacon to a per-member current-state slot on the presence sibling rendezvous record; a re-beacon overwrites the same slot (last-writer-wins). The presence record is distinct from the chat rendezvous, so a beacon never evicts chat backlog. member_pubkey owns the stable-slot-id encoding (member_slot_id, hex) so all callers agree. The slot count is bounded (SUBKEY_COUNT), so at unbounded membership two members can slot-share (a bounded, self-healing degradation). The app net actor holds the keys and runs the emit/ingest/reap loop; a receiver subscribes via subscribe_room on the same presence owner seed.
@@ -1022,10 +1044,22 @@ functions:
         description: The circle/room rendezvous-owner seed.
     returns:
       type: "Result<KeyPair>"
-      description: The rendezvous-owner keypair. The KeyPair contains the seed (it is the VLD0 secret) in a non-zeroizing veilid Bytes. Deriving per operation bounds only this binding, NOT the secret: passing the keypair to open_dht_record / create_dht_record makes veilid retain a clone in OpenedRecord.writer for as long as the record stays open, and daemonseed opens records once per session and never closes them (#252). Use rendezvous_owner_public_bytes where only a record identity is needed.
+      description: >-
+        The rendezvous-owner keypair. The KeyPair contains the seed (it is the VLD0
+        secret) in a non-zeroizing veilid Bytes. Deriving per operation bounds only this
+        binding, NOT the secret: passing the keypair to open_dht_record /
+        create_dht_record makes veilid retain a clone in OpenedRecord.writer for as long
+        as the record stays open, and daemonseed opens records once per session and
+        never closes them (#252). Use rendezvous_owner_public_bytes where only a record
+        identity is needed.
   - name: identity::rendezvous_owner_public_bytes
     module: daemonseed_veilid_net::identity
-    description: The 32-byte Ed25519 public key of a rendezvous-owner keypair — the same value rendezvous_owner_keypair puts in KeyPair::key(), as raw bytes. Total, because a VLD0 public key is 32 bytes for every seed. Identifies a record without carrying the secret: the DHT address derives from this key, so it separates records at least as precisely as the seed does.
+    description: >-
+      The 32-byte Ed25519 public key of a rendezvous-owner keypair — the same value
+      rendezvous_owner_keypair puts in KeyPair::key(), as raw bytes. Total, because a
+      VLD0 public key is 32 bytes for every seed. Identifies a record without carrying
+      the secret: the DHT address derives from this key, so it separates records at
+      least as precisely as the seed does.
     signature: "pub fn rendezvous_owner_public_bytes(owner_seed: &[u8; 32]) -> [u8; 32]"
     parameters:
       - name: owner_seed
@@ -1062,6 +1096,12 @@ error_types:
         condition: Invalid node identity.
       - name: Actor
         condition: The actor task is gone or dropped a reply.
+      - name: DmPageWrongPage
+        condition: A DM page publish named a PagePosition belonging to a different page than its address. Carries the address's page and the whole refused position, so the message renders the page, the slot and the sequence number the caller meant. Caught before the write is enqueued.
+      - name: DmPageShapeMismatch
+        condition: A DM page's record carries an o_cnt other than paging::PAGE_SLOTS, checked before any slot is read (ISC-C100). Carries the page and the o_cnt found. An o_cnt below PAGE_SLOTS yields no unplaceable slot, so without this check the sweep returns Ok with a silently truncated page.
+      - name: DmPageSlotOutsideRecord
+        condition: A DM page sweep returned a slot the addressed page cannot hold — an o_cnt above paging::PAGE_SLOTS (ISC-C100). Carries the page and the subkey. Backstop behind DmPageShapeMismatch, which rejects the shape first.
       - name: Unimplemented
         condition: A Phase 4 surface (presence / announcements) not yet implemented.
   - name: FetchErrorClass

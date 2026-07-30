@@ -1,7 +1,7 @@
 //! Integration test (#234, ISC-C42): node A publishes sealed channel frames into
 //! slots of a DM channel page, and node B — deriving the same page address from the
-//! conversation's address root alone — sweeps them back paired with the slot each
-//! was written to.
+//! conversation's address root alone — sweeps them back paired with the checked
+//! position each was written to.
 //!
 //! This is the live oracle for the transport half of the channel. The unit tests
 //! prove the arithmetic and the funnel classification; only two independent nodes
@@ -11,7 +11,8 @@
 //!
 //! 1. **The slot is honoured.** A publish that ignored its argument and wrote
 //!    subkey 0 would round-trip a single message perfectly. So the frames go to
-//!    NON-ZERO slots, and the sweep must hand back the slots they were written to.
+//!    NON-ZERO slots, and the sweep must hand back the positions they were written
+//!    to.
 //! 2. **Two writes to one page both survive.** The page is the funnel's coalescing
 //!    scope, so a coalescible write kind would collapse two concurrent publishes
 //!    last-writer-wins — dropping one message off the wire while its `publish_dm_page`
@@ -34,13 +35,15 @@
 //!     cargo test --test two_node_dm_page -- --ignored --nocapture
 //!
 //! It drives the productized `VeilidNetHandle` surface the app drives, and reuses
-//! the REAL daemonseed page arithmetic (`dm::paging::{derive_owner_seed,
-//! position_of, PagePosition}`) — no addressing is reimplemented here.
+//! the REAL daemonseed page arithmetic (`dm::paging::{DmPageAddress, position_of,
+//! PagePosition}`) — no addressing is reimplemented here. The addresses come from
+//! real ratchets, so the direction each end uses is the ratchet's own and never a
+//! role mapped onto one by hand (#254).
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use daemonseed_core::dm::paging::{self, PagePosition};
-use daemonseed_core::dm::ratchet::Direction;
+use daemonseed_core::dm::paging::{self, DmPageAddress, PagePosition};
+use daemonseed_core::dm::ratchet::{EphemeralDecapKey, Ratchet, Role};
 use daemonseed_core::identity::keys::{derive_identity_keys, Identity};
 use daemonseed_core::identity::mnemonic::Mnemonic;
 use daemonseed_veilid_net::{VeilidNet, VeilidNetConfig};
@@ -85,6 +88,31 @@ async fn frames_published_to_page_slots_sweep_back_in_the_slots_they_were_writte
 
     let address_root = fresh_address_root();
 
+    // The two parties' ratchets over one first-contact secret: A knocked, B was
+    // knocked at. They exist here only to supply the *direction* each end addresses
+    // with — `DmPageAddress` takes it from `send_direction` / `recv_direction`, which
+    // is what makes A's sending stream and B's receiving stream provably the same
+    // one rather than two hand-written constants that happen to match.
+    let ss0 = [0x3b; 32];
+    let opening_eph =
+        derive_identity_keys(&Mnemonic::generate().unwrap(), Identity::Primary).unwrap();
+    let ratchet_a = Ratchet::initiator(
+        &ss0,
+        Box::new(*opening_eph.kem.encapsulation_key()),
+        EphemeralDecapKey::new(Box::new(*opening_eph.kem.decapsulation_key())),
+    )
+    .expect("A opens the ratchet as initiator");
+    let ratchet_b = Ratchet::recipient(&ss0, Box::new(*opening_eph.kem.encapsulation_key()))
+        .expect("B opens the ratchet as recipient");
+    assert_eq!(ratchet_a.role(), Role::Initiator);
+    assert_eq!(ratchet_b.role(), Role::Recipient);
+    assert_eq!(
+        ratchet_a.send_direction(),
+        ratchet_b.recv_direction(),
+        "A's sending stream and B's receiving stream must be the same one, or \
+         nothing below is a round trip"
+    );
+
     let (node_a, _rx_a) = VeilidNet::start(node_config(":5174", &base.join("A")))
         .await
         .expect("start A");
@@ -102,24 +130,35 @@ async fn frames_published_to_page_slots_sweep_back_in_the_slots_they_were_writte
         .expect("B public-internet-ready");
 
     // ── both ends derive the same page ───────────────────────────────────────
-    // A is the initiator speaking, so its stream is the A→B direction; B derives
-    // the same direction because it is *receiving* that stream. Nothing about the
-    // address is transmitted — the derivation is the whole discovery mechanism, so
-    // two seeds computed independently must be byte-identical or nothing that
-    // follows means anything.
+    // A addresses its SENDING stream, B its RECEIVING one, and those are the same
+    // stream. Nothing about the address is transmitted — the derivation is the whole
+    // discovery mechanism, so two addresses computed independently must be
+    // byte-identical or nothing that follows means anything.
     //
-    // Each use derives its own seed rather than reusing one: `DmPageOwnerSeed` is
-    // the conversation's write capability, so it is deliberately not `Clone` and
-    // the transport takes it by value (#244). The derivation is pure, which is what
-    // makes re-deriving the right answer rather than a workaround.
-    const PAGE: u64 = 0;
-    let page_seed = |who: &str| {
-        paging::derive_owner_seed(&address_root, Direction::AToB, PAGE)
-            .unwrap_or_else(|e| panic!("{who} derives the page owner seed: {e}"))
+    // Each use derives its own address rather than reusing one: the owner seed
+    // inside is the conversation's write capability, so it is deliberately not
+    // `Clone` and the transport takes the address by value (#244/#254). The
+    // derivation is pure, which is what makes re-deriving the right answer rather
+    // than a workaround.
+    // A NON-ZERO page, and that is load-bearing rather than arbitrary. On page 0 a
+    // position is numerically indistinguishable from its own slot and the addressed
+    // page is indistinguishable from a hardcoded zero, so `assert_eq!(at.page(),
+    // PAGE)` is dead, the sequence numbers below equal their slots, and a transport
+    // that placed every swept slot on page 0 regardless would round-trip this test
+    // perfectly. Page 3 makes the page, the slot and the sequence three different
+    // numbers at every assertion.
+    const PAGE: u64 = 3;
+    let addr_a = || {
+        DmPageAddress::sending(&address_root, &ratchet_a, PAGE)
+            .expect("A derives its sending page address")
+    };
+    let addr_b = || {
+        DmPageAddress::receiving(&address_root, &ratchet_b, PAGE)
+            .expect("B derives its receiving page address")
     };
     assert_eq!(
-        page_seed("A").as_bytes(),
-        page_seed("B").as_bytes(),
+        addr_a().owner_seed().as_bytes(),
+        addr_b().owner_seed().as_bytes(),
         "both ends must derive the same page record from the address root alone"
     );
 
@@ -128,20 +167,34 @@ async fn frames_published_to_page_slots_sweep_back_in_the_slots_they_were_writte
     // Both are on the same page, which is what makes them a coalescing pair; both
     // are non-zero, so a transport that ignored the slot and always wrote subkey 0
     // cannot round-trip them.
-    let first = paging::position_of(9);
-    let second = paging::position_of(3);
-    assert_eq!(first.page(), PAGE, "seq 9 must live on the page under test");
+    // Sequences 57 and 51 — slots 9 and 3 of page 3. Derived from the page rather
+    // than typed, so the pair moves with `PAGE` and cannot silently drift onto
+    // another page.
+    const SLOTS: u64 = paging::PAGE_SLOTS as u64;
+    const FIRST_SEQ: u64 = PAGE * SLOTS + 9;
+    const SECOND_SEQ: u64 = PAGE * SLOTS + 3;
+    let first = paging::position_of(FIRST_SEQ);
+    let second = paging::position_of(SECOND_SEQ);
+    assert_eq!(
+        first.page(),
+        PAGE,
+        "sequence {FIRST_SEQ} must live on the page under test"
+    );
     assert_eq!(
         second.page(),
         PAGE,
-        "seq 3 must live on the page under test"
+        "sequence {SECOND_SEQ} must live on the page under test"
     );
     assert_ne!(first.slot(), 0, "the test is blind if the slot is 0");
     assert_ne!(second.slot(), 0, "the test is blind if the slot is 0");
     assert_ne!(first.slot(), second.slot());
+    // The three numbers must be three numbers, or the assertions downstream cannot
+    // tell a page from a slot from a sequence.
+    assert_ne!(first.seq(), u64::from(first.slot()));
+    assert_ne!(second.seq(), u64::from(second.slot()));
 
-    let frame_first = b"channel frame at sequence nine".to_vec();
-    let frame_second = b"channel frame at sequence three".to_vec();
+    let frame_first = format!("channel frame at sequence {FIRST_SEQ}").into_bytes();
+    let frame_second = format!("channel frame at sequence {SECOND_SEQ}").into_bytes();
 
     // Issued CONCURRENTLY, deliberately. Both commands reach the write funnel
     // before either dispatches, which is the only arrangement in which a coalescing
@@ -150,12 +203,8 @@ async fn frames_published_to_page_slots_sweep_back_in_the_slots_they_were_writte
     // time, and the anti-coalescing property — the one whose failure mode is a
     // message silently missing from the wire under an `Ok(())` — would go untested.
     let (published_first, published_second) = tokio::join!(
-        node_a.publish_dm_page(page_seed("A"), u32::from(first.slot()), frame_first.clone()),
-        node_a.publish_dm_page(
-            page_seed("A"),
-            u32::from(second.slot()),
-            frame_second.clone()
-        ),
+        node_a.publish_dm_page(addr_a(), first, frame_first.clone()),
+        node_a.publish_dm_page(addr_a(), second, frame_second.clone()),
     );
     published_first.expect("A publishes the first frame");
     published_second.expect("A publishes the second frame");
@@ -166,7 +215,7 @@ async fn frames_published_to_page_slots_sweep_back_in_the_slots_they_were_writte
     // bug this test exists to catch.
     let mut swept = Vec::new();
     for attempt in 0..30 {
-        match node_b.sweep_dm_page(page_seed("B")).await {
+        match node_b.sweep_dm_page(addr_b()).await {
             Ok((slots, outcome)) => {
                 eprintln!(
                     "attempt {attempt}: {} slot(s) back, outcome {outcome:?}",
@@ -188,39 +237,69 @@ async fn frames_published_to_page_slots_sweep_back_in_the_slots_they_were_writte
          one page collapsed, which is a message lost under a successful publish"
     );
 
-    // The slots must be the ones written to, not positional indices and not zero.
-    let slots: BTreeSet<u32> = swept.iter().map(|(slot, _)| *slot).collect();
+    // The positions must be the ones written to, not positional indices and not
+    // slot zero. They come back as checked `PagePosition`s built against the
+    // ADDRESSED page, so a sweep that placed its slots on some other page — or on
+    // page zero regardless — fails here rather than handing a collector positions
+    // nothing confirmed.
+    let positions: BTreeSet<PagePosition> = swept.iter().map(|(at, _)| *at).collect();
     assert_eq!(
-        slots,
-        BTreeSet::from([u32::from(first.slot()), u32::from(second.slot())]),
-        "the sweep must return the subkeys the frames were written to"
+        positions,
+        BTreeSet::from([first, second]),
+        "the sweep must return the positions the frames were written to"
     );
-
-    // ...and each slot must carry ITS OWN frame. Two frames in the right two slots
-    // but swapped would pass a slot-set check and then hand the collector a frame
-    // whose declared sequence number disagrees with where it was found.
-    let by_slot: BTreeMap<u32, Vec<u8>> = swept.into_iter().collect();
-    assert_eq!(
-        by_slot.get(&u32::from(first.slot())),
-        Some(&frame_first),
-        "the frame for sequence 9 must come back from sequence 9's slot"
-    );
-    assert_eq!(
-        by_slot.get(&u32::from(second.slot())),
-        Some(&frame_second),
-        "the frame for sequence 3 must come back from sequence 3's slot"
-    );
-
-    // The swept slot is the input to the checked slot→sequence direction, so it must
-    // survive `PagePosition::new` and land back on the sequence number that produced
-    // it. This is the check a collector will make; failing it here means a collector
-    // could not be written against this transport at all.
-    for (slot, expected_seq) in [(first.slot(), first.seq()), (second.slot(), second.seq())] {
-        let at = PagePosition::new(PAGE, slot).expect("a swept slot is a valid page position");
+    for at in &positions {
         assert_eq!(
-            at.seq(),
+            at.page(),
+            PAGE,
+            "a swept position must be on the page swept"
+        );
+    }
+
+    // ...and each position must carry ITS OWN frame. Two frames in the right two
+    // slots but swapped would pass a position-set check and then hand the collector
+    // a frame whose declared sequence number disagrees with where it was found.
+    let by_position: BTreeMap<PagePosition, Vec<u8>> = swept.into_iter().collect();
+    assert_eq!(
+        by_position.get(&first),
+        Some(&frame_first),
+        "the frame for sequence {FIRST_SEQ} must come back from its own position"
+    );
+    assert_eq!(
+        by_position.get(&second),
+        Some(&frame_second),
+        "the frame for sequence {SECOND_SEQ} must come back from its own position"
+    );
+
+    // ── slot + swept page → the sender's sequence number ─────────────────────
+    // The collector's own arithmetic, and the thing this loop is here to exercise:
+    // it holds a SUBKEY INDEX and the page it addressed, and from those two facts
+    // alone must recover which message it is looking at.
+    //
+    // It is rebuilt through `PagePosition::new(PAGE, slot)` rather than read off the
+    // returned key. `PagePosition` derives `Eq` and `Ord` over `(page, slot)` and
+    // `seq()` is a pure function of those, so `by_position.get_key_value(&at).0` is
+    // field-identical to the probe by construction — asserting on its `seq()` compares
+    // the probe to itself and cannot fail, which is what this assertion had degenerated
+    // into. Reconstructing from the swept slot puts the arithmetic back under test.
+    for (probe, expected_seq) in [(first, FIRST_SEQ), (second, SECOND_SEQ)] {
+        let swept_at = *by_position
+            .get_key_value(&probe)
+            .expect("the position came back")
+            .0;
+        let rebuilt = PagePosition::new(PAGE, swept_at.slot())
+            .expect("a swept slot must be inside the page's record");
+        assert_eq!(
+            rebuilt.seq(),
             expected_seq,
-            "slot {slot} of page {PAGE} must resolve back to the sequence it was derived from"
+            "slot {} on page {PAGE} must rebuild sequence {expected_seq} — a \
+             reconstruction that lost the page yields {} instead",
+            swept_at.slot(),
+            swept_at.slot()
+        );
+        assert_eq!(
+            rebuilt, swept_at,
+            "the rebuilt position must be the one the sweep handed back"
         );
     }
 
@@ -228,9 +307,17 @@ async fn frames_published_to_page_slots_sweep_back_in_the_slots_they_were_writte
     // Collection probes the frontier page ahead of the one being filled, so this is
     // the ordinary steady state, not a failure. A page far past anything either end
     // has touched, in the opposite direction for good measure.
+    // Addressed off A's ratchet, whose RECEIVING stream is the other one — a sweep
+    // only ever takes a receiving address, so the opposite stream is reached by
+    // asking the other party's ratchet rather than by naming a direction.
     const UNWRITTEN_PAGE: u64 = 4_096;
-    let unwritten = paging::derive_owner_seed(&address_root, Direction::BToA, UNWRITTEN_PAGE)
-        .expect("derive an unwritten page's owner seed");
+    let unwritten = DmPageAddress::receiving(&address_root, &ratchet_a, UNWRITTEN_PAGE)
+        .expect("derive an unwritten page's address");
+    assert_ne!(
+        unwritten.direction(),
+        addr_b().direction(),
+        "the unwritten page must be on the OTHER stream"
+    );
     let (empty, outcome) = node_b
         .sweep_dm_page(unwritten)
         .await
