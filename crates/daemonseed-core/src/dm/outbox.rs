@@ -172,6 +172,53 @@
 //! and `merge_peer_ack`'s ceiling already bounds the claim to sequences actually
 //! sent. The liar is the intended recipient, so the lie costs only itself.
 //!
+//! ## A transition nobody saw is re-offered, because it is written down
+//!
+//! Three calls move an entry to a terminal state and return the list of what
+//! moved: [`Outbox::sweep_give_ups`], [`Outbox::settle_from_ack`], and
+//! [`Outbox::channel_torn_down`]'s `surfaced` half. That return value used to be
+//! the **only** notification, and every later call skips an entry whose state
+//! has already moved — so a crash between the call returning and the record
+//! reaching the disk lost the notification permanently. The entry came back from
+//! the restart as `Undelivered` or `ConfirmedCollected` and nothing would ever
+//! report it again: silent abandonment, arriving by exactly the restart this
+//! record exists to survive (#279).
+//!
+//! So each of those transitions also writes [`Surfacing::Owed`] onto the entry,
+//! and that persists. The notification becomes derivable from the state rather
+//! than only from the return value of the call that caused it —
+//! [`Outbox::owed_surfacings`] asks which transitions are still owed, and
+//! [`Outbox::record_surfaced`] is how a caller says they arrived.
+//!
+//! **The order is the whole of it:**
+//!
+//! ```text
+//!   transition ─▶ persist ─▶ owed_surfacings() ─▶ show the user
+//!                                              ─▶ record_surfaced() ─▶ persist
+//! ```
+//!
+//! The flag is cleared only *after* the UI's consumption has itself been
+//! persisted, which is what makes every crash point in that sequence re-offer
+//! rather than drop. Telling a user twice that a message stopped is a far better
+//! failure than never telling them once, and it is the same fail-safe direction
+//! § D-DELIV takes everywhere else here.
+//!
+//! The returned lists stay. They are the fast path, and a caller that never
+//! crashes never reads the flag; what the flag adds is that dropping one of
+//! those lists is recoverable instead of final.
+//!
+//! **Only a transition into a terminal state owes a surfacing.** Every edge that
+//! sets the flag also ends the entry, and they are the same private call, so
+//! `Owed` on a live entry is not a state this module can produce.
+//! [`Outbox::decode`] refuses a file claiming otherwise
+//! ([`OutboxError::SurfacingOwedOnLiveEntry`]) rather than loading a
+//! notification for a transition that never happened — the mirror of the loss
+//! this flag exists to prevent.
+//!
+//! [`OutboxEntry::publish`] is deliberately **not** one of those edges: it is a
+//! step *inside* a message's life, not the end of one, and the UI already reads
+//! it through [`OutboxEntry::delivery_state`] whenever it draws the outbox.
+//!
 //! ## A teardown does not discard the outbox
 //!
 //! [`crate::dm::provisional::restart`] can end a channel
@@ -181,13 +228,20 @@
 //!
 //! ## What is not wired
 //!
-//! **Nothing stores this.** [`Outbox::encode`] and [`Outbox::decode`] exist and
-//! are covered, and no caller anywhere writes, reads or deletes an outbox — the
-//! same state [`crate::dm::provisional`] is in, for the same reason: the store is
-//! its own decision and its own slice. Until one lands, "persisted outbox" is a
-//! shape this module can produce and nothing keeps. Said plainly rather than
-//! implied, because a mechanism with no wiring that reads as a feature is worse
-//! than an absent one.
+//! **Nothing stores this yet.** The store itself now exists —
+//! [`crate::storage::dm_store`] names this record
+//! ([`RecordKind::Outbox`](crate::storage::dm_store::RecordKind::Outbox)), seals
+//! whatever bytes it is handed, and pads them out to a fixed bucket — but no
+//! caller anywhere writes, reads or deletes an outbox through it, the same state
+//! [`crate::dm::provisional`] is in. So "persisted outbox" is still a shape this
+//! module can produce and nothing keeps. Said plainly rather than implied,
+//! because a mechanism with no wiring that reads as a feature is worse than an
+//! absent one.
+//!
+//! That is also why [`Outbox::encode`] stays **plaintext and
+//! variable-length**: the sealing, the fixed size and the padding are the
+//! store's, done once for every DM record kind, and a second layer of either
+//! here would be a second answer free to disagree with the first.
 //!
 //! **This record holds no plaintext.** An `AwaitingKey` entry reserves its
 //! sequence number and carries its schedule; the message *text* lives in
@@ -201,6 +255,7 @@
 use core::time::Duration;
 
 use crate::backoff::apply_jitter;
+use crate::crypto::suite::{Registry, SuiteId, SuiteIdError};
 use crate::dm::ack::AckState;
 use crate::dm::doorbell::DOORBELL_SLOTS;
 use crate::dm::paging::{PagePosition, position_of};
@@ -258,7 +313,27 @@ pub const GIVE_UP_MS: i64 = GIVE_UP.as_secs() as i64 * 1_000;
 /// At-rest magic. The version is **inside** it, so a decoder compares one thing
 /// and cannot read a v1 body under a v2 header — the shape
 /// [`crate::dm::provisional`] uses.
-pub const OUTBOX_MAGIC: &[u8] = b"daemonseed/dm/outbox/v1\0";
+pub const OUTBOX_MAGIC: &[u8] = b"daemonseed/dm/outbox/v2\0";
+
+/// The v1 magic, which [`Outbox::decode`] **refuses** — and which nothing has
+/// ever written.
+///
+/// v1 carried no suite id and no [`Surfacing`] byte. It is named here rather
+/// than falling through to [`OutboxError::BadMagic`] so the refusal says which
+/// problem it is, and it is a refusal rather than a dual-read for one reason
+/// that outranks the rest: **a v1 file cannot supply a surfacing value, and both
+/// available defaults are wrong.** `Clear` would silently drop the notification
+/// for every terminal entry in the file, which is the exact loss #279 is about;
+/// `Owed` would re-offer every message that ever ended. The sibling formats that
+/// do dual-read ([`crate::storage::seeds`], [`crate::storage::recovery_file`])
+/// carry compatibility for blobs that reached real disks and can name the suite
+/// those writers used; there is no such historical fact here, because
+/// [`Outbox::encode`] has never had a caller that stored its output.
+pub const OUTBOX_MAGIC_V1: &[u8] = b"daemonseed/dm/outbox/v1\0";
+
+/// Width of the suite-id field, big-endian, immediately after the magic — the
+/// layout [`crate::storage::seeds`] and [`crate::storage::recovery_file`] use.
+pub const SUITE_ID_LEN: usize = 2;
 
 /// What can go wrong driving or decoding an outbox.
 #[derive(Debug, PartialEq, Eq)]
@@ -303,6 +378,22 @@ pub enum OutboxError {
     /// `ahead_ms` milliseconds. See [`Outbox::decode`] for why this is refused
     /// rather than clamped.
     ComposedInFuture { seq: u64, ahead_ms: i64 },
+    /// The bytes are an outbox record of a version this build does not read.
+    /// Today that is only [`OUTBOX_MAGIC_V1`], whose own docs carry the
+    /// reasoning; the variant is separate from [`Self::BadMagic`] so "this is
+    /// not an outbox" and "this is an outbox I will not read" are different
+    /// answers.
+    UnsupportedVersion,
+    /// The suite id in the header is one of the registry's reserved sentinels.
+    SuiteIdSentinel(SuiteIdError),
+    /// The suite id in the header names no entry in this build's registry, so
+    /// the record was written by a build whose primitives this one does not
+    /// implement.
+    UnknownSuite(SuiteId),
+    /// A decoded entry claims a surfacing is owed on an entry that is still
+    /// live. Only a transition into a terminal state owes one, so no sequence
+    /// of calls produces this — see [`Surfacing`].
+    SurfacingOwedOnLiveEntry(u64),
 }
 
 impl std::fmt::Display for OutboxError {
@@ -330,6 +421,16 @@ impl std::fmt::Display for OutboxError {
             Self::TrailingBytes(n) => write!(f, "{n} bytes after the last entry"),
             Self::ComposedInFuture { seq, ahead_ms } => {
                 write!(f, "sequence {seq} was composed {ahead_ms} ms in the future")
+            }
+            Self::UnsupportedVersion => {
+                write!(f, "an outbox record of a version this build does not read")
+            }
+            Self::SuiteIdSentinel(e) => write!(f, "outbox suite_id: {e}"),
+            Self::UnknownSuite(id) => {
+                write!(f, "outbox suite {id} is not in this build's registry")
+            }
+            Self::SurfacingOwedOnLiveEntry(seq) => {
+                write!(f, "sequence {seq} owes a surfacing but has not ended")
             }
         }
     }
@@ -502,6 +603,42 @@ pub enum DeliveryState {
     Undelivered,
 }
 
+/// Whether a state change on an entry is still owed to the user.
+///
+/// **This is the durable half of a notification**, and it exists because the
+/// other half is not durable at all: [`Outbox::sweep_give_ups`],
+/// [`Outbox::settle_from_ack`] and [`Outbox::channel_torn_down`] each return
+/// what they moved, and that list is gone the moment its caller is (#279). The
+/// module docs carry the argument and the call sequence; the short version is
+/// that a transition writes [`Self::Owed`] here, the caller clears it with
+/// [`Outbox::record_surfaced`] once the user has been told **and that clearing
+/// has itself been persisted**, and every crash in between re-offers.
+///
+/// **A two-variant enum rather than a `bool`, because the name is the
+/// documentation.** `surfaced: false` on a fresh entry reads as "the user has
+/// not been told", which is untrue and would be alarming; what is actually true
+/// of a fresh entry is that nothing is outstanding, which is what [`Self::Clear`]
+/// says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Surfacing {
+    /// Nothing is outstanding: either the entry has never changed state, or a
+    /// caller has recorded that the change it made reached the user.
+    Clear,
+    /// A transition happened here and nothing has recorded it reaching the
+    /// user. Persisted, so a restart re-offers it.
+    Owed,
+}
+
+impl Surfacing {
+    /// The at-rest tag byte.
+    fn tag(self) -> u8 {
+        match self {
+            Self::Clear => 0,
+            Self::Owed => 1,
+        }
+    }
+}
+
 /// A rung index and the clock value the next emission is due at.
 ///
 /// Both persist, because § Task 2 requires *"pending DMs **and their backoff
@@ -577,6 +714,7 @@ pub struct OutboxEntry {
     composed_at_ms: i64,
     schedule: ReseedSchedule,
     lifecycle: Lifecycle,
+    surfacing: Surfacing,
 }
 
 impl OutboxEntry {
@@ -605,6 +743,32 @@ impl OutboxEntry {
     /// Where the entry is in its life.
     pub fn lifecycle(&self) -> &Lifecycle {
         &self.lifecycle
+    }
+
+    /// Whether this entry's ending is still owed to the user.
+    ///
+    /// [`Surfacing::Owed`] here implies [`Lifecycle::is_pending`] is `false`:
+    /// the only edges that set it are the ones that end an entry, and they are
+    /// the same call.
+    pub fn surfacing(&self) -> Surfacing {
+        self.surfacing
+    }
+
+    /// End this entry, owing the user a surfacing for it.
+    ///
+    /// **The one edge into a terminal state, and it is one call on purpose.**
+    /// The transition and the notification were separable before #279 — three
+    /// methods each moved an entry and returned the fact separately — and a
+    /// crash between the two lost the notification for good. Written as one
+    /// call, a future transition cannot do the first half without the second:
+    /// there is no way to spell "end this entry" that leaves the user unowed.
+    ///
+    /// It is private because nothing outside this module has a reason to end an
+    /// entry; the four callers are the give-up sweep, the ack, and the
+    /// teardown's two surfacing arms.
+    fn end(&mut self, lifecycle: Lifecycle) {
+        self.lifecycle = lifecycle;
+        self.surfacing = Surfacing::Owed;
     }
 
     /// What a UI may say about it.
@@ -775,8 +939,18 @@ pub struct TeardownOutcome {
     /// Not "still re-seeding": an `AwaitingKey` entry retained under
     /// [`TeardownCause::StoreUnreadable`] has no bytes and emits nothing. What
     /// this list means is that the teardown took no decision about them.
+    ///
+    /// **These carry no [`Surfacing`] flag, and deliberately so.** #279's loss
+    /// is a transition whose only record was a return value; nothing here
+    /// transitioned, so the next teardown, sweep or ack reports these entries
+    /// again on their own merits. A flag would be durable state for a
+    /// notification that is already re-derivable.
     pub retained: Vec<u64>,
     /// Sequences moved to [`Lifecycle::Undelivered`] and owed a surfacing.
+    ///
+    /// These **did** transition, so each also carries [`Surfacing::Owed`] and
+    /// is re-offered by [`Outbox::owed_surfacings`] until a caller records it
+    /// shown. Dropping this list is recoverable; it was not before #279.
     pub surfaced: Vec<u64>,
 }
 
@@ -898,6 +1072,8 @@ impl Outbox {
             composed_at_ms: now_ms,
             schedule: ReseedSchedule::new(now_ms),
             lifecycle,
+            // A new entry has not changed state, so nothing is outstanding.
+            surfacing: Surfacing::Clear,
         };
         Ok(self.entries.entry(seq).or_insert(entry))
     }
@@ -921,13 +1097,17 @@ impl Outbox {
     /// *"`awaiting-key` gives up at 7 days"*.
     ///
     /// The returned list is what a caller owes the user. § Task 2: *"marked
-    /// undelivered in the UI, **never silently abandoned**"*.
+    /// undelivered in the UI, **never silently abandoned**"*. Dropping it is
+    /// **recoverable** rather than final: every entry here also carries
+    /// [`Surfacing::Owed`] until a caller records that it was shown, so
+    /// [`Self::owed_surfacings`] re-offers what this list carried across any
+    /// number of restarts (#279).
     #[must_use = "a discarded give-up list is the silent abandonment the design forbids"]
     pub fn sweep_give_ups(&mut self, now_ms: i64) -> Vec<u64> {
         let mut fired = Vec::new();
         for entry in self.entries.values_mut() {
             if entry.lifecycle.is_pending() && entry.is_given_up(now_ms) {
-                entry.lifecycle = Lifecycle::Undelivered;
+                entry.end(Lifecycle::Undelivered);
                 fired.push(entry.seq);
             }
         }
@@ -975,13 +1155,15 @@ impl Outbox {
     /// does not pretend to: [`crate::dm::ack`] owns that, and an unverified ack
     /// reaching here is a caller error the type system cannot catch.
     ///
-    /// **The returned list is the only notification of a `ConfirmedCollected`
-    /// transition, and dropping it is unrecoverable.** Every later call skips a
-    /// non-`AwaitingCollection` entry, so a confirmation this `Vec` carried is
-    /// never re-offered by anything: the entry is confirmed in the record and
-    /// the UI never leaves `OnDht`. That is the same class of silent loss
+    /// **The returned list is the fast path, and losing it is recoverable.**
+    /// Every later call skips a non-`AwaitingCollection` entry, so nothing in
+    /// the *state machine* re-offers a confirmation this `Vec` carried — which
+    /// is why each confirmed entry also takes [`Surfacing::Owed`], and why
+    /// [`Self::owed_surfacings`] can re-offer it after a crash that ate the
+    /// list (#279). Dropping it without reading the flag leaves the UI on
+    /// `OnDht` for ever, which is the same class of silent loss
     /// [`Self::sweep_give_ups`] is marked against, in the opposite direction.
-    #[must_use = "a discarded confirmation list leaves the UI on OnDht for ever; nothing re-offers it"]
+    #[must_use = "a discarded confirmation list leaves the UI on OnDht until something reads owed_surfacings"]
     pub fn settle_from_ack(&mut self, ack: &AckState, now_ms: i64) -> Vec<u64> {
         let mut confirmed = Vec::new();
         for entry in self.entries.values_mut() {
@@ -992,11 +1174,53 @@ impl Outbox {
                 continue;
             }
             if ack.is_settled(entry.seq) {
-                entry.lifecycle = Lifecycle::ConfirmedCollected;
+                entry.end(Lifecycle::ConfirmedCollected);
                 confirmed.push(entry.seq);
             }
         }
         confirmed
+    }
+
+    /// Sequences whose ending has not been recorded as shown to the user, in
+    /// sequence order.
+    ///
+    /// **This is the recoverable form of what the three transition calls
+    /// return.** They hand back what they just moved; this asks the record
+    /// itself, so it answers the same question after a restart, and after any
+    /// number of restarts, until [`Self::record_surfaced`] says the user was
+    /// told and *that* has been persisted in turn. The module docs carry the
+    /// call sequence and why the clear comes last.
+    ///
+    /// Every sequence here is terminal — an entry owes a surfacing only by
+    /// ending — so a caller can render one straight from
+    /// [`OutboxEntry::delivery_state`] without consulting anything else.
+    #[must_use = "the owed list is what the user has not been told; asking and dropping it is the abandonment #279 is about"]
+    pub fn owed_surfacings(&self) -> Vec<u64> {
+        self.entries
+            .values()
+            .filter(|e| e.surfacing == Surfacing::Owed)
+            .map(|e| e.seq)
+            .collect()
+    }
+
+    /// Record that the user has been shown these endings, clearing what
+    /// [`Self::owed_surfacings`] reports for them.
+    ///
+    /// **Call this after the UI has consumed them, and persist afterwards.**
+    /// Clearing first would restore the #279 defect exactly: the flag would be
+    /// gone from the record while the notification was still only in a `Vec`
+    /// somebody was carrying. Re-offering an ending the user already saw is the
+    /// cost of that ordering, and it is the cheaper failure by a wide margin.
+    ///
+    /// Idempotent, and a sequence with no entry here is a no-op — there is no
+    /// flag on an absent entry to be wrong about, so this needs no error and
+    /// stays infallible for its one real caller.
+    pub fn record_surfaced(&mut self, seqs: &[u64]) {
+        for seq in seqs {
+            if let Some(entry) = self.entries.get_mut(seq) {
+                entry.surfacing = Surfacing::Clear;
+            }
+        }
     }
 
     /// What a channel teardown does here — and the short answer is that it does
@@ -1058,7 +1282,7 @@ impl Outbox {
             // "nothing is declared lost" is about what the *store* failed to
             // say, and says nothing about a window that has already closed.
             if entry.is_given_up(now_ms) {
-                entry.lifecycle = Lifecycle::Undelivered;
+                entry.end(Lifecycle::Undelivered);
                 surfaced.push(entry.seq);
                 continue;
             }
@@ -1069,7 +1293,7 @@ impl Outbox {
                     match entry.lifecycle {
                         Lifecycle::AwaitingCollection(_) => retained.push(entry.seq),
                         Lifecycle::AwaitingKey => {
-                            entry.lifecycle = Lifecycle::Undelivered;
+                            entry.end(Lifecycle::Undelivered);
                             surfaced.push(entry.seq);
                         }
                         Lifecycle::ConfirmedCollected | Lifecycle::Undelivered => {
@@ -1082,18 +1306,31 @@ impl Outbox {
         TeardownOutcome { retained, surfaced }
     }
 
-    /// The at-rest form: [`OUTBOX_MAGIC`], a `u32` entry count, then each entry
-    /// in sequence order.
+    /// The at-rest form: [`OUTBOX_MAGIC`], the suite id, the direction, a `u32`
+    /// entry count, then each entry in sequence order.
     ///
     /// **Plaintext**, like [`crate::dm::provisional::ProvisionalRecord`]'s body
-    /// before it is sealed — to be sealed by whatever store holds it. It carries
-    /// no key material and no message text (see the module docs), so what a
-    /// reader of the raw file learns is a correspondence's sequence numbers,
-    /// their sizes and their schedule. That is metadata worth sealing and not
-    /// worth pretending is harmless.
+    /// before it is sealed — to be sealed by whatever store holds it, which is
+    /// now [`crate::storage::dm_store`] and is where the fixed size and the
+    /// padding live too. It carries no key material and no message text (see the
+    /// module docs), so what a reader of the raw file learns is a
+    /// correspondence's sequence numbers, their sizes and their schedule. That
+    /// is metadata worth sealing and not worth pretending is harmless.
+    ///
+    /// **The suite id names the registry entry this record was written under
+    /// (ISC-C24), and deliberately says nothing about the frames it carries.**
+    /// This module performs no cryptography: the frames were sealed elsewhere,
+    /// by the ratchet, and nothing here can see which primitives did it. So the
+    /// field carries the narrow claim it can support — [`Self::decode`] refuses
+    /// a record whose suite this build has no registry entry for, rather than
+    /// interpreting bytes a build with different primitives wrote. A record read
+    /// under an older, still-present suite re-encodes under the current default
+    /// write suite, which is ISC-C24's read-old-write-new and loses nothing,
+    /// precisely because the field describes the writer and not the payload.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(OUTBOX_MAGIC);
+        out.extend_from_slice(&Registry::default_write_suite().get().to_be_bytes());
         out.push(match self.direction {
             Direction::AToB => 0,
             Direction::BToA => 1,
@@ -1111,6 +1348,9 @@ impl Outbox {
             out.extend_from_slice(&entry.composed_at_ms.to_be_bytes());
             out.extend_from_slice(&entry.schedule.rung.to_be_bytes());
             out.extend_from_slice(&entry.schedule.next_due_ms.to_be_bytes());
+            // Before the lifecycle, so the one variable-length field stays last
+            // in the entry.
+            out.push(entry.surfacing.tag());
             out.push(entry.lifecycle.tag());
             if let Lifecycle::AwaitingCollection(frame) = &entry.lifecycle {
                 push_lp(&mut out, frame.as_bytes());
@@ -1121,11 +1361,13 @@ impl Outbox {
 
     /// Read the at-rest form back.
     ///
-    /// Rejects a wrong magic, a body that ends inside a field, a tag this build
-    /// assigns no meaning to, a doorbell slot outside the record, a duplicate
-    /// sequence, and trailing bytes. A frame length is checked against what
-    /// remains **before** anything is reserved, so a corrupt length cannot drive
-    /// an allocation.
+    /// Rejects a wrong magic, a v1 record ([`OutboxError::UnsupportedVersion`]),
+    /// a suite id that is a reserved sentinel or absent from this build's
+    /// registry, a body that ends inside a field, a tag this build assigns no
+    /// meaning to, a doorbell slot outside the record, a duplicate sequence, a
+    /// surfacing owed by an entry that has not ended, and trailing bytes. A
+    /// frame length is checked against what remains **before** anything is
+    /// reserved, so a corrupt length cannot drive an allocation.
     ///
     /// **`now_ms` bounds `composed_at_ms`, and an entry composed in the caller's
     /// future is REFUSED rather than rewritten** —
@@ -1145,8 +1387,20 @@ impl Outbox {
     /// see the body.
     pub fn decode(bytes: &[u8], now_ms: i64) -> Result<Self, OutboxError> {
         let mut r = Reader::new(bytes);
-        if r.take(OUTBOX_MAGIC.len())? != OUTBOX_MAGIC {
+        // The two magics are the same length, so one read answers both
+        // questions: is this an outbox at all, and is it a version this build
+        // reads. v1 is refused rather than dual-read — see `OUTBOX_MAGIC_V1`.
+        let magic = r.take(OUTBOX_MAGIC.len())?;
+        if magic != OUTBOX_MAGIC {
+            if magic == OUTBOX_MAGIC_V1 {
+                return Err(OutboxError::UnsupportedVersion);
+            }
             return Err(OutboxError::BadMagic);
+        }
+        let suite_raw = u16::from_be_bytes(r.array()?);
+        let suite_id = SuiteId::try_new(suite_raw).map_err(OutboxError::SuiteIdSentinel)?;
+        if Registry::lookup(suite_id).is_none() {
+            return Err(OutboxError::UnknownSuite(suite_id));
         }
         let direction = match r.byte()? {
             0 => Direction::AToB,
@@ -1221,6 +1475,16 @@ impl Outbox {
             // emission landed near it, so the old clamp to that boundary
             // rewrote correct records as readily as corrupt ones.
             let next_due_ms = i64::from_be_bytes(r.array()?);
+            let surfacing = match r.byte()? {
+                0 => Surfacing::Clear,
+                1 => Surfacing::Owed,
+                tag => {
+                    return Err(OutboxError::UnknownTag {
+                        field: "surfacing",
+                        tag,
+                    });
+                }
+            };
             let lifecycle = match r.byte()? {
                 0 => Lifecycle::AwaitingKey,
                 1 => {
@@ -1241,6 +1505,17 @@ impl Outbox {
             if out.entries.contains_key(&seq) {
                 return Err(OutboxError::DuplicateSequence(seq));
             }
+            // A surfacing is owed only by an ending, and `OutboxEntry::end` is
+            // the one call that produces either — so this pair is unreachable
+            // through the API and the file is corrupt or foreign. Refusing it
+            // keeps that invariant true of every decoded record, which is what
+            // lets a caller render an owed sequence as a finished message
+            // without re-checking. Loading it instead would raise a
+            // notification for a transition that never happened: the mirror of
+            // the loss the flag exists to prevent.
+            if surfacing == Surfacing::Owed && lifecycle.is_pending() {
+                return Err(OutboxError::SurfacingOwedOnLiveEntry(seq));
+            }
             out.entries.insert(
                 seq,
                 OutboxEntry {
@@ -1249,6 +1524,7 @@ impl Outbox {
                     composed_at_ms,
                     schedule: ReseedSchedule { rung, next_due_ms },
                     lifecycle,
+                    surfacing,
                 },
             );
         }
@@ -1367,6 +1643,19 @@ mod tests {
     fn frame(seed: u8) -> SealedFrame {
         SealedFrame::new(frame_bytes(seed))
     }
+
+    /// Byte offset of the first entry's surfacing tag, named from the layout
+    /// rather than searched for — so a field inserted ahead of it breaks the
+    /// tests that use it loudly instead of poking at the wrong byte.
+    const SURFACING_AT: usize = OUTBOX_MAGIC.len()
+        + SUITE_ID_LEN
+        + 1 /* direction */
+        + 4 /* count */
+        + 8 /* seq */
+        + 1 /* a ChannelPage target tag */
+        + 8 /* composed_at_ms */
+        + 4 /* rung */
+        + 8 /* next_due_ms */;
 
     const CHANNEL: OutboxTarget = OutboxTarget::ChannelPage;
 
@@ -2254,6 +2543,7 @@ mod tests {
                 composed_at_ms: T0,
                 schedule,
                 lifecycle: lifecycle.clone(),
+                surfacing: Surfacing::Clear,
             };
             assert_eq!(entry.delivery_state(), *expected);
         }
@@ -2723,14 +3013,16 @@ mod tests {
         // Offsets named from the layout rather than counted back from the end,
         // so a field added in the middle breaks this test loudly instead of
         // silently poking at the wrong byte.
-        const DIR_TAG: usize = OUTBOX_MAGIC.len();
+        const SUITE: usize = OUTBOX_MAGIC.len();
+        const DIR_TAG: usize = SUITE + SUITE_ID_LEN;
         const COUNT: usize = DIR_TAG + 1;
         const SEQ: usize = COUNT + 4;
         const TARGET_TAG: usize = SEQ + 8;
         const COMPOSED: usize = TARGET_TAG + 1; // a ChannelPage target is one byte
         const RUNG: usize = COMPOSED + 8;
         const DUE: usize = RUNG + 4;
-        const LIFE_TAG: usize = DUE + 8;
+        const SURFACING: usize = DUE + 8;
+        const LIFE_TAG: usize = SURFACING + 1;
         const FRAME_LEN: usize = LIFE_TAG + 1;
 
         let good = sealed_outbox().encode();
@@ -2769,6 +3061,7 @@ mod tests {
         for (at, field) in [
             (DIR_TAG, "direction"),
             (TARGET_TAG, "target"),
+            (SURFACING, "surfacing"),
             (LIFE_TAG, "lifecycle"),
         ] {
             let mut bad = good.clone();
@@ -2823,14 +3116,361 @@ mod tests {
         let encoded = ob.encode();
         // Every byte accounted for, named: nothing is left over to be anything
         // else — in particular there is nowhere a message body could be hiding.
-        let header = OUTBOX_MAGIC.len() + 1 /* direction */ + 4 /* count */;
+        let header = OUTBOX_MAGIC.len() + 2 /* suite id */ + 1 /* direction */ + 4 /* count */;
         let entry = 8 /* seq */
             + 1 /* target tag */
             + 8 /* composed_at_ms */
             + 4 /* rung */
             + 8 /* next_due_ms */
+            + 1 /* surfacing tag */
             + 1 /* lifecycle tag */
             + 8 /* frame length prefix */;
         assert_eq!(encoded.len(), header + entry + 512);
+    }
+
+    // ---------------------------------------------------------------- the surfacing flag (#279)
+
+    /// **The defect, walked end to end.** A transition used to be reported only
+    /// by the `Vec` the call returned, so a crash between that call returning
+    /// and the record landing on disk lost the notification for ever: every
+    /// later call skips an entry whose state has already moved.
+    ///
+    /// The `drop` below is the crash. What the restart has to show is that the
+    /// user is still owed the news — and the two assertions after it are the
+    /// positive control that nothing *else* re-offers it, so the flag is
+    /// carrying the property rather than sharing the credit.
+    #[test]
+    fn a_transition_lost_with_its_return_value_is_re_offered_after_a_restart() {
+        let mut ob = sealed_outbox();
+        ob.enqueue_sealed(2, channel(), T0, frame(0x22)).unwrap();
+        let mut ack = AckState::new();
+        ack.collect(1).unwrap();
+
+        // The transition happens, and the process dies with the list still in
+        // its hands: nothing was shown to anyone.
+        let confirmed = ob.settle_from_ack(&ack, T0);
+        assert_eq!(confirmed, vec![1], "fixture confirmed nothing");
+        drop(confirmed);
+
+        // The record reaches the disk. The notification did not reach the user.
+        let mut restored = Outbox::decode(&ob.encode(), T0 + 1).unwrap();
+        assert_eq!(
+            restored.owed_surfacings(),
+            vec![1],
+            "the restart lost the confirmation entirely"
+        );
+
+        // Positive control: the state machine really is silent about it now.
+        // Both re-offering paths return nothing, which is the whole reason the
+        // flag has to exist.
+        assert!(
+            restored.settle_from_ack(&ack, T0 + 1).is_empty(),
+            "the ack path re-offered it, so this test proves nothing"
+        );
+        assert!(
+            restored.sweep_give_ups(T0 + 1).is_empty(),
+            "the sweep re-offered it, so this test proves nothing"
+        );
+        assert_eq!(restored.owed_surfacings(), vec![1], "the flag was consumed");
+
+        // Shown at last, and the clearing itself persisted — only then does it
+        // stop being offered.
+        restored.record_surfaced(&[1]);
+        let settled = Outbox::decode(&restored.encode(), T0 + 2).unwrap();
+        assert!(
+            settled.owed_surfacings().is_empty(),
+            "a surfacing the caller recorded came back after a restart"
+        );
+    }
+
+    /// **Every edge that ends an entry owes a surfacing, and nothing else
+    /// does.** Four separate transitions reach a terminal state — the sweep,
+    /// the ack, the teardown's unsealed arm and the teardown's past-window arm
+    /// — and each is asserted on its own, so removing the marking from any one
+    /// of them fails here.
+    #[test]
+    fn every_ending_owes_a_surfacing_and_only_an_ending_does() {
+        // 1. the give-up sweep
+        let mut sweep = sealed_outbox();
+        assert_eq!(sweep.sweep_give_ups(T0 + GIVE_UP_MS), vec![1]);
+        assert_eq!(
+            sweep.owed_surfacings(),
+            vec![1],
+            "the give-up sweep ended an entry without owing the user anything"
+        );
+
+        // 2. the ack
+        let mut settled = sealed_outbox();
+        let mut ack = AckState::new();
+        ack.collect(1).unwrap();
+        assert_eq!(settled.settle_from_ack(&ack, T0), vec![1]);
+        assert_eq!(
+            settled.owed_surfacings(),
+            vec![1],
+            "a confirmation left the UI nothing to learn from the record"
+        );
+
+        // 3. the teardown, on the entry it can never seal
+        let mut torn = empty();
+        torn.enqueue_awaiting_key(1, channel(), T0).unwrap();
+        let outcome = torn.channel_torn_down(&TeardownCause::NoProvisionalRecord, T0);
+        assert_eq!(outcome.surfaced, vec![1]);
+        assert_eq!(
+            torn.owed_surfacings(),
+            vec![1],
+            "the teardown surfaced an entry the record does not remember surfacing"
+        );
+
+        // 4. the teardown, on an entry the window already closed on — the other
+        // arm, and a different `end` call site.
+        let mut late = sealed_outbox();
+        let outcome = late.channel_torn_down(
+            &TeardownCause::StoreUnreadable("EIO".into()),
+            T0 + GIVE_UP_MS,
+        );
+        assert_eq!(outcome.surfaced, vec![1]);
+        assert_eq!(
+            late.owed_surfacings(),
+            vec![1],
+            "the past-window teardown arm owed the user nothing"
+        );
+
+        // And the converse: a live entry owes nothing, however it is driven.
+        let mut live = empty();
+        live.enqueue_awaiting_key(1, channel(), T0).unwrap();
+        live.enqueue_sealed(2, channel(), T0, frame(0x22)).unwrap();
+        live.entry_mut(1).unwrap().retry_key_fetch(T0, 0.0).unwrap();
+        live.entry_mut(1).unwrap().publish(T0, frame(0x11)).unwrap();
+        live.entry_mut(2).unwrap().emit(T0, 0.0).unwrap();
+        let retained = live.channel_torn_down(&TeardownCause::StoreUnreadable("EIO".into()), T0);
+        assert_eq!(retained.retained, vec![1, 2], "fixture ended an entry");
+        assert!(
+            live.owed_surfacings().is_empty(),
+            "an entry that is still live owes the user an ending it has not had"
+        );
+        // Positive control for that emptiness: the same assertion fails once
+        // something genuinely ends.
+        assert_eq!(live.sweep_give_ups(T0 + GIVE_UP_MS), vec![1, 2]);
+        assert_eq!(live.owed_surfacings(), vec![1, 2]);
+    }
+
+    /// Recording a surfacing clears it, is idempotent, and touches only the
+    /// sequences it was given.
+    #[test]
+    fn record_surfaced_clears_only_what_it_was_given() {
+        let mut ob = empty();
+        ob.enqueue_sealed(1, channel(), T0, frame(0x11)).unwrap();
+        ob.enqueue_sealed(2, channel(), T0, frame(0x22)).unwrap();
+        assert_eq!(ob.sweep_give_ups(T0 + GIVE_UP_MS), vec![1, 2]);
+        assert_eq!(ob.owed_surfacings(), vec![1, 2]);
+
+        ob.record_surfaced(&[1]);
+        assert_eq!(
+            ob.owed_surfacings(),
+            vec![2],
+            "recording one surfacing cleared the other"
+        );
+        // Idempotent, and a sequence with no entry is a no-op rather than a
+        // panic or a clear of something else.
+        ob.record_surfaced(&[1, 1, 99]);
+        assert_eq!(ob.owed_surfacings(), vec![2]);
+
+        ob.record_surfaced(&[2]);
+        assert!(ob.owed_surfacings().is_empty());
+        // Clearing does not revive: the entries are still terminal, and still
+        // report as such.
+        for seq in [1, 2] {
+            assert_eq!(
+                ob.entry(seq).unwrap().delivery_state(),
+                DeliveryState::Undelivered
+            );
+        }
+    }
+
+    /// **The flag is written where the layout says, and it is the entry's own
+    /// value.**
+    ///
+    /// The expected bytes are literals rather than [`Surfacing::tag`], so an
+    /// encoder that wrote a constant, or that wrote the flag inverted, fails
+    /// here — a round-trip test alone cannot catch either, because an inversion
+    /// on both sides of it passes vacuously.
+    #[test]
+    fn the_surfacing_byte_is_written_where_the_layout_says() {
+        let clear = sealed_outbox().encode();
+        assert_eq!(
+            clear.len(),
+            SURFACING_AT + 1 /* surfacing */ + 1 /* lifecycle */ + 8 + 512,
+            "the layout constant no longer describes the encoding"
+        );
+        assert_eq!(
+            clear[SURFACING_AT], 0,
+            "a live entry was encoded as owing a surfacing"
+        );
+
+        let mut owed = sealed_outbox();
+        assert_eq!(owed.sweep_give_ups(T0 + GIVE_UP_MS), vec![1]);
+        let owed = owed.encode();
+        assert_eq!(
+            owed[SURFACING_AT], 1,
+            "an ended entry was encoded as owing nothing"
+        );
+        // The two encodings differ *only* there, so the byte is carrying the
+        // flag and not standing in for something else that moved.
+        let differing: Vec<usize> = clear
+            .iter()
+            .zip(owed.iter())
+            .enumerate()
+            .filter(|(_, (a, b))| a != b)
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            differing.contains(&SURFACING_AT),
+            "the surfacing byte did not change with the flag"
+        );
+    }
+
+    /// **The decoder reads that byte rather than assuming a value.**
+    ///
+    /// Both directions are hand-crafted, so neither assertion can be satisfied
+    /// by an encoder: the owed case is decoded from bytes no encoder in this
+    /// test ever wrote a `1` into, and the clear case likewise.
+    #[test]
+    fn the_decoder_reads_the_surfacing_byte_rather_than_assuming_it() {
+        // A terminal entry whose surfacing has already been recorded, so the
+        // encoder wrote a 0 — then flip the byte by hand.
+        let mut ob = sealed_outbox();
+        assert_eq!(ob.sweep_give_ups(T0 + GIVE_UP_MS), vec![1]);
+        ob.record_surfaced(&[1]);
+        let mut bytes = ob.encode();
+        assert_eq!(bytes[SURFACING_AT], 0, "fixture is degenerate");
+        bytes[SURFACING_AT] = 1;
+        assert_eq!(
+            Outbox::decode(&bytes, T0 + GIVE_UP_MS)
+                .unwrap()
+                .owed_surfacings(),
+            vec![1],
+            "the decoder ignored an owed surfacing in the file"
+        );
+
+        // And the other way: an encoder-written 1, cleared by hand.
+        let mut ob = sealed_outbox();
+        assert_eq!(ob.sweep_give_ups(T0 + GIVE_UP_MS), vec![1]);
+        let mut bytes = ob.encode();
+        assert_eq!(bytes[SURFACING_AT], 1, "fixture is degenerate");
+        bytes[SURFACING_AT] = 0;
+        assert!(
+            Outbox::decode(&bytes, T0 + GIVE_UP_MS)
+                .unwrap()
+                .owed_surfacings()
+                .is_empty(),
+            "the decoder invented an owed surfacing the file does not carry"
+        );
+    }
+
+    /// A file claiming a live entry owes a surfacing is refused: only an ending
+    /// owes one, so the pair is unreachable through the API and loading it
+    /// would raise a notification for a transition that never happened.
+    #[test]
+    fn a_surfacing_owed_on_a_live_entry_is_refused() {
+        let mut bytes = sealed_outbox().encode();
+        assert_eq!(bytes[SURFACING_AT], 0, "fixture already owed a surfacing");
+        bytes[SURFACING_AT] = 1;
+        assert_eq!(
+            Outbox::decode(&bytes, T0).err().unwrap(),
+            OutboxError::SurfacingOwedOnLiveEntry(1)
+        );
+
+        // Positive control, twice over: the same byte value on an entry that
+        // *has* ended decodes, and the untouched live record decodes too — so
+        // the refusal is the pairing and not the byte or the record.
+        let mut ended = sealed_outbox();
+        assert_eq!(ended.sweep_give_ups(T0 + GIVE_UP_MS), vec![1]);
+        let ended = ended.encode();
+        assert_eq!(ended[SURFACING_AT], 1);
+        assert!(Outbox::decode(&ended, T0 + GIVE_UP_MS).is_ok());
+        assert!(Outbox::decode(&sealed_outbox().encode(), T0).is_ok());
+    }
+
+    /// **v1 is refused, not dual-read**, and it is told apart from bytes that
+    /// are not an outbox at all.
+    ///
+    /// Nothing ever wrote a v1 record — `encode`/`decode` have never had a
+    /// caller that stored anything — so there is no migration to perform. A
+    /// dual-read would also have to invent a surfacing value for every entry in
+    /// the file, and both choices are wrong: `Clear` drops the notification for
+    /// every ended entry, which is the loss the flag exists to prevent, and
+    /// `Owed` re-offers every message that ever finished.
+    #[test]
+    fn a_v1_record_is_refused_rather_than_read() {
+        assert_eq!(
+            OUTBOX_MAGIC.len(),
+            OUTBOX_MAGIC_V1.len(),
+            "one read can only answer both questions if the magics are the same length"
+        );
+        assert_ne!(OUTBOX_MAGIC, OUTBOX_MAGIC_V1);
+
+        let good = sealed_outbox().encode();
+        let mut v1 = good.clone();
+        v1[..OUTBOX_MAGIC_V1.len()].copy_from_slice(OUTBOX_MAGIC_V1);
+        assert_eq!(
+            Outbox::decode(&v1, T0).err().unwrap(),
+            OutboxError::UnsupportedVersion,
+            "a v1 record was read under the v2 layout"
+        );
+
+        // A magic that is neither is still "not an outbox", so the version
+        // answer is recognition rather than a catch-all.
+        let mut alien = good.clone();
+        alien[0] ^= 1;
+        assert_eq!(
+            Outbox::decode(&alien, T0).err().unwrap(),
+            OutboxError::BadMagic
+        );
+        // Positive control: the unmodified bytes decode.
+        assert!(Outbox::decode(&good, T0).is_ok());
+    }
+
+    /// The suite id is written after the magic and checked on the way back in —
+    /// the house layout [`crate::storage::seeds`] and
+    /// [`crate::storage::recovery_file`] use.
+    #[test]
+    fn the_suite_id_is_written_and_checked_on_the_way_back_in() {
+        let good = sealed_outbox().encode();
+        let at = OUTBOX_MAGIC.len();
+        // Literal, not `default_write_suite()`: a test that reads the value it
+        // is checking moves both sides of its own comparison. 0x0001 is
+        // CNSA 2.0, the registry's only entry.
+        assert_eq!(
+            &good[at..at + SUITE_ID_LEN],
+            &[0x00, 0x01],
+            "the record was not written under the default write suite"
+        );
+
+        for sentinel in [0x0000u16, 0xFFFF] {
+            let mut bad = good.clone();
+            bad[at..at + SUITE_ID_LEN].copy_from_slice(&sentinel.to_be_bytes());
+            assert_eq!(
+                Outbox::decode(&bad, T0).err().unwrap(),
+                OutboxError::SuiteIdSentinel(SuiteIdError::Sentinel(sentinel)),
+                "a reserved suite id was accepted"
+            );
+        }
+
+        // Well-formed, absent from this build's registry: the writer had
+        // primitives this build does not implement.
+        let unknown = SuiteId::try_new(0x0002).unwrap();
+        assert!(
+            Registry::lookup(unknown).is_none(),
+            "0x0002 joined the registry; pick another absent id"
+        );
+        let mut foreign = good.clone();
+        foreign[at..at + SUITE_ID_LEN].copy_from_slice(&unknown.get().to_be_bytes());
+        assert_eq!(
+            Outbox::decode(&foreign, T0).err().unwrap(),
+            OutboxError::UnknownSuite(unknown)
+        );
+
+        // Positive control: the untouched header decodes.
+        assert!(Outbox::decode(&good, T0).is_ok());
     }
 }

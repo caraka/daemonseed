@@ -1073,7 +1073,20 @@ modules:
       carried and OutboxEntry::position() derives the page slot from the sequence
       number. Lifecycle is AwaitingKey,
       AwaitingCollection(SealedFrame), ConfirmedCollected or Undelivered, and
-      is_pending() is the first two. SealedFrame::new(Vec<u8>) wraps sealed bytes
+      is_pending() is the first two. OutboxEntry::surfacing() is
+      Surfacing::Owed when a terminal transition has not yet been reported to the
+      user and Clear otherwise; one private edge into a terminal lifecycle sets
+      both, so sweep_give_ups, settle_from_ack and channel_torn_down's surfacing
+      arms cannot move an entry without owing the notification.
+      owed_surfacings() -> Vec<u64> reads the outstanding set,
+      record_surfaced(&[u64]) clears it, and the clear is persisted after the
+      consumption it records. channel_torn_down's retained set is not flagged:
+      those entries are unchanged and are re-reported on their own merits.
+      encode/decode carry the flag; the at-rest form is
+      daemonseed/dm/outbox/v2\0 plus a 2-byte suite id, and v1 (OUTBOX_MAGIC_V1)
+      is refused rather than dual-read, because it cannot supply a surfacing
+      value. Sealing, padding and the fixed on-disk size belong to
+      storage::dm_store (#279). SealedFrame::new(Vec<u8>) wraps sealed bytes
       and exposes as_bytes/len/is_empty only; there is no mutating accessor.
       OutboxEntry::publish(now_ms, frame) is the only edge that installs a frame
       and accepts only AwaitingKey, returning OutboxError::AlreadyPublished

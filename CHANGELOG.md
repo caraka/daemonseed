@@ -57,6 +57,23 @@ work lives in the project lead's vault manifest, not here.
 
 ### Changed
 
+- The DM outbox records whether a terminal transition still owes the user a
+  notification. `OutboxEntry` gains `Surfacing` (`Clear` / `Owed`), set by the
+  single private edge into a terminal lifecycle, so `sweep_give_ups`,
+  `settle_from_ack` and `channel_torn_down`'s surfacing arms cannot move an
+  entry without owing the notification. `Outbox::owed_surfacings` reads the
+  outstanding set and `record_surfaced` clears it, only once the consumption has
+  itself been persisted — the returned lists remain the fast path, and the flag
+  is what makes them survive a crash between the call returning and the store
+  write. `channel_torn_down`'s `retained` set is deliberately not flagged: those
+  entries are unchanged and are re-reported on their own merits. The at-rest
+  form is `daemonseed/dm/outbox/v2\0` with a 2-byte suite id after the magic;
+  v1 is refused rather than dual-read, because a v1 file cannot supply a
+  surfacing value and both defaults are wrong — `Clear` drops exactly the
+  notification this closes, `Owed` re-offers every message that ever finished.
+  Sealing, padding and the fixed on-disk size are `storage::dm_store`'s and are
+  deliberately not duplicated here. (#279)
+
 - The DM page transport takes a checked address. `daemonseed_core::dm::paging`
   gains `DmPageAddress<D>`, binding the page owner seed, the page number and the
   stream, built by `DmPageAddress::sending` / `receiving` from the ratchet's own
