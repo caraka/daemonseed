@@ -116,6 +116,29 @@ work lives in the project lead's vault manifest, not here.
 
 ### Fixed
 
+- `dm::domain`'s label guards no longer parse their own source line by line, so
+  a `rustfmt`-wrapped declaration cannot escape them. The parser joins each
+  declaration to its terminating `;`, panics on a `pub const DM_` whose shape it
+  cannot read rather than skipping it, and asserts its own parse is non-empty —
+  a probe whose input goes empty previously reported success. The registry and
+  prefix-freeness checks were genuinely blind to a wrapped declaration, and the
+  `declared.len() == ALL.len()` cross-check did not catch it because the label
+  went missing from both sides; `no_label_is_a_prefix_of_another` now also runs
+  over the declared set, which is the one that can silently shrink. Six fixture
+  tests drive the parser over wrapped-declaration strings so each check is
+  proved able to fail. (#283)
+
+- `derive_root`'s doc-comment named `the_three_roots_from_ss0_are_independent`
+  as holding the roots' non-derivability. That test asserts distinctness, which
+  passes for any three distinct labels and would pass unchanged if the roots
+  were refactored into a chain — the shape the sibling structure exists to
+  prevent, and the one the comment cited it for. The comment now separates the
+  assumption (HKDF-Expand does not yield its PRK) from the tested property
+  (still siblings of one extraction), and a known-answer test pins all three
+  roots under one `ss0` so any change to the derivation structure fails.
+  Verified: chaining `chan_id` off `ar` fails the new test and passes the old
+  one. (#282)
+
 - Two claims in `dm::provisional`'s docs outran what any store here does, and
   one of them was load-bearing. The record was described as "overwritten in
   place on establishment", and `ProvisionalRecord::open`'s rollback argument

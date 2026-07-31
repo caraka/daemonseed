@@ -398,8 +398,28 @@ impl std::error::Error for RatchetError {}
 /// A third sibling of the extraction that produces `AR` and `chan_id` in
 /// [`super::firstcontact::derive_channel_roots`] — same PRK, distinct label. The
 /// three are siblings rather than a chain so that no one of them is derivable
-/// from another: the retained addressing root must never yield the ratchet root
-/// it outlives. `the_three_roots_from_ss0_are_independent` is what holds that.
+/// from another: `AR` is retained for the life of the conversation and outlives
+/// both the ratchet root and `ss0`, which establishment deletes, so a chain would
+/// make the retained value regenerate the deleted ones and cost the forward
+/// secrecy that deletion buys.
+///
+/// That claim rests on two things, and only one of them is a test.
+///
+/// **Assumed, not tested.** That an HKDF-Expand output does not yield the PRK it
+/// was expanded from. This is HMAC-SHA-384's one-wayness — a cryptographic
+/// assumption, which no unit test in this crate can establish; a test can only
+/// ever fail to refute it.
+///
+/// **Tested.** That the code still derives the three as siblings of ONE
+/// extraction rather than as a chain — the structure the assumption is applied
+/// to. `roots_from_one_ss0_are_pinned_siblings` pins all three outputs for a
+/// fixed `ss0`, so re-plumbing the derivation (chaining `AR` off `RK0`, changing
+/// an extraction's salt or IKM, changing a label) changes those bytes and fails.
+///
+/// `the_three_roots_from_ss0_are_independent` sits alongside as a cheap
+/// label-collision guard. It asserts distinctness only: it passes for any three
+/// distinct labels, including a chained derivation, so it never held the
+/// structural property this comment previously cited it for (#282).
 pub(crate) fn derive_root(ss0: &[u8; 32]) -> Result<RootKey, RatchetError> {
     let hkdf = HkdfSha384::extract(Some(domain::DM_ROOT_SALT), ss0).map_err(RatchetError::Kdf)?;
     expand_secret::<ROOT_KEY_LEN, _>(|b| hkdf.expand(domain::DM_RATCHET_ROOT, b), RootKey)
@@ -1365,6 +1385,41 @@ mod tests {
     // cannot see. The vectors are the only thing standing between that and a
     // silent incompatibility.
 
+    /// The sibling structure of [`derive_root`]'s doc-comment, pinned rather than
+    /// asserted. `RK0`, `AR` and `chan_id` are three expands of ONE extraction over
+    /// one `ss0`; chaining any off another — the refactor the sibling structure
+    /// exists to prevent, and the one that would let the retained `AR` regenerate
+    /// the deleted `RK0` — changes these bytes. `assert_ne!` cannot see that, which
+    /// is why the distinctness test below was never the oracle the comment cited it
+    /// as (#282).
+    ///
+    /// `RK0`'s vector is deliberately the same one `root_derivation_is_pinned`
+    /// carries: the point here is the three sitting together under a single `ss0`,
+    /// which neither that test nor `firstcontact`'s own vectors (pinned under a
+    /// different `ss0`, in another file) put in one place.
+    ///
+    /// **Generated from this implementation on 2026-07-31**, not from an external
+    /// reference. These are change-detection vectors, not third-party validation.
+    #[test]
+    fn roots_from_one_ss0_are_pinned_siblings() {
+        let _ = oxicrypt_module::initialize();
+        let ss0 = ss(0x11);
+        let roots = crate::dm::firstcontact::derive_channel_roots(&ss0).unwrap();
+
+        assert_eq!(
+            hex::encode(derive_root(&ss0).unwrap().as_bytes()),
+            "a8042dbc77f2303ad708b1131d05e05a8382822ce9845c4285e5593d1b7e26dc"
+        );
+        assert_eq!(
+            hex::encode(roots.ar),
+            "b3542adb99810ee17a4470e760a78c9a009a46c4ecf6122af21119d1fdd84673"
+        );
+        assert_eq!(
+            hex::encode(roots.chan_id),
+            "2698f400a59d484ac4f123fc0219c174913f7eb18078890aba8096e0e193eeed"
+        );
+    }
+
     #[test]
     fn root_derivation_is_pinned() {
         assert_eq!(
@@ -1467,10 +1522,15 @@ mod tests {
         );
     }
 
-    /// The three-sibling property both this module and `dm::domain` assert in
-    /// prose, tested rather than claimed: one `ss0`, three outputs, pairwise
-    /// distinct. Without this, a label chosen wrongly from birth would be pinned
-    /// by the KATs as if it were correct.
+    /// One `ss0`, three outputs, pairwise DISTINCT — and no more than that. This
+    /// is the label-collision guard: without it, two purposes accidentally sharing
+    /// a label would be pinned by the KATs as if that were correct, since a KAT
+    /// pins whatever the implementation does.
+    ///
+    /// It says nothing about the three being siblings rather than a chain — it
+    /// passes for any three distinct labels, chained or not. That property is
+    /// `roots_from_one_ss0_are_pinned_siblings`, above; this test was cited for it
+    /// until #282.
     #[test]
     fn the_three_roots_from_ss0_are_independent() {
         let _ = oxicrypt_module::initialize();

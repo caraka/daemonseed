@@ -361,24 +361,183 @@ mod tests {
         assert_eq!(DM_CK, b"daemonseed/dm/ck/v2");
     }
 
-    /// The frozen design's F11 requirement: no label may be a prefix of another.
-    /// If one were, a derivation for the shorter purpose could be confused with a
-    /// truncated derivation for the longer one.
-    #[test]
-    fn no_label_is_a_prefix_of_another() {
-        for (i, a) in ALL.iter().enumerate() {
-            for (j, b) in ALL.iter().enumerate() {
+    // ---- reading this module's own declarations ------------------------------
+    //
+    // Three of the guards below hold the hand-maintained registry and the
+    // hand-maintained byte pins against the declarations themselves, which means
+    // reading this file as text. That parse is a probe, and #283 was the probe
+    // going blind: it required a declaration's name and its literal to land on
+    // ONE line, so a declaration `rustfmt` had wrapped matched neither half,
+    // dropped out of the parsed set, and became silently exempt from the registry
+    // check, the byte-pin check and prefix-freeness at once — the registry's
+    // `declared.len() == ALL.len()` cross-check included, because the label was
+    // then missing from both sides. Nothing enforces the one-line form and the
+    // names here are already long, so that was one added label away.
+    //
+    // The parse now joins each declaration's continuation lines before matching,
+    // refuses to skip a `pub const DM_` it cannot read, and is loud when it reads
+    // nothing at all. It is also factored out so the fixture tests at the end of
+    // this module can drive it over wrapped declarations and prove each guard
+    // fails on one — a guard about formatting cannot be trusted on the strength
+    // of the formatting that happens to be in the file today.
+
+    /// One `pub const DM_… = b"…";` declaration, as read out of source text.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Declared {
+        name: String,
+        value: Vec<u8>,
+    }
+
+    /// Read every DM label declaration out of `source`, whatever line it is
+    /// wrapped across.
+    ///
+    /// Anchored at the start of a line, so the `"pub const DM_"` literal that
+    /// appears inside this test module's own text is not itself read as a
+    /// declaration. A declaration is then taken to run to its terminating `;` —
+    /// no DM label contains one, so no literal can end the scan early.
+    ///
+    /// Panics on a `pub const DM_` whose shape it cannot read rather than
+    /// skipping it: skipping is precisely how #283 stayed invisible.
+    fn parse_declarations(source: &str) -> Vec<Declared> {
+        let mut out = Vec::new();
+        let mut lines = source.lines();
+
+        while let Some(line) = lines.next() {
+            if !line.trim_start().starts_with("pub const DM_") {
+                continue;
+            }
+            let mut decl = line.trim_start().to_string();
+            while !decl.contains(';') {
+                let Some(next) = lines.next() else { break };
+                decl.push(' ');
+                decl.push_str(next.trim());
+            }
+
+            let rest = decl
+                .strip_prefix("pub const DM_")
+                .expect("the line was checked for this prefix");
+            let Some((name, tail)) = rest.split_once(':') else {
+                panic!("a DM declaration carries no type annotation, so it cannot be read: {decl}");
+            };
+            let name = format!("DM_{}", name.trim());
+            let Some((_, literal)) = tail.split_once("= b\"") else {
+                panic!("{name} is declared in a shape this parser cannot read: {decl}");
+            };
+            let Some((value, _)) = literal.split_once('"') else {
+                panic!("{name}'s byte-string literal is unterminated: {decl}");
+            };
+
+            out.push(Declared {
+                name,
+                value: value.as_bytes().to_vec(),
+            });
+        }
+
+        out
+    }
+
+    /// [`parse_declarations`], made loud when it finds nothing.
+    ///
+    /// A probe whose input goes empty reports success, and every guard built on
+    /// this one would then pass vacuously. This is the assertion that turns that
+    /// from a pass into a failure.
+    fn checked_parse(source: &str) -> Vec<Declared> {
+        let declared = parse_declarations(source);
+        assert!(
+            !declared.is_empty(),
+            "the declaration parser read no `pub const DM_…` at all, so every \
+             guard built on it would pass while checking nothing"
+        );
+        declared
+    }
+
+    /// This module's own declarations.
+    fn declarations() -> Vec<Declared> {
+        checked_parse(include_str!("domain.rs"))
+    }
+
+    /// The body of the byte-pin tripwire, which the byte-pin guard checks each
+    /// declaration appears in.
+    fn byte_pin_body(source: &str) -> &str {
+        source
+            .split_once("fn labels_are_byte_pinned() {")
+            .expect("the tripwire test exists")
+            .1
+            .split_once("\n    }")
+            .expect("the tripwire test is a normal block")
+            .0
+    }
+
+    /// Every declared label is in the registry, and the registry holds nothing
+    /// else. Returned rather than asserted so the fixture tests can prove it
+    /// fails.
+    fn check_registered(declared: &[Declared], registry: &[&[u8]]) -> Result<(), String> {
+        for label in declared {
+            if !registry.contains(&label.value.as_slice()) {
+                return Err(format!(
+                    "{} is declared but missing from ALL, so nothing prefix-checks it",
+                    String::from_utf8_lossy(&label.value)
+                ));
+            }
+        }
+        if declared.len() != registry.len() {
+            return Err(format!(
+                "ALL holds {} entries but {} labels are declared",
+                registry.len(),
+                declared.len()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Every declared label appears in the byte-pin tripwire's body.
+    fn check_byte_pinned(declared: &[Declared], pin_body: &str) -> Result<(), String> {
+        for label in declared {
+            if !pin_body.contains(&label.name) {
+                return Err(format!(
+                    "{} is declared but never byte-pinned, so its wire value can \
+                     change with the suite still green",
+                    label.name
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// No label is a prefix of another.
+    fn check_prefix_free(labels: &[&[u8]]) -> Result<(), String> {
+        for (i, a) in labels.iter().enumerate() {
+            for (j, b) in labels.iter().enumerate() {
                 if i == j {
                     continue;
                 }
-                assert!(
-                    !b.starts_with(a),
-                    "{} is a prefix of {}",
-                    String::from_utf8_lossy(a),
-                    String::from_utf8_lossy(b)
-                );
+                if b.starts_with(a) {
+                    return Err(format!(
+                        "{} is a prefix of {}",
+                        String::from_utf8_lossy(a),
+                        String::from_utf8_lossy(b)
+                    ));
+                }
             }
         }
+        Ok(())
+    }
+
+    /// The frozen design's F11 requirement: no label may be a prefix of another.
+    /// If one were, a derivation for the shorter purpose could be confused with a
+    /// truncated derivation for the longer one.
+    ///
+    /// Run over the declarations as well as over `ALL`. The registry guard makes
+    /// the two sets equal, but only while it can see every declaration — so this
+    /// checks the labels as *declared*, which is what #283 showed is the set that
+    /// can silently shrink.
+    #[test]
+    fn no_label_is_a_prefix_of_another() {
+        check_prefix_free(ALL).unwrap();
+
+        let declared = declarations();
+        let values: Vec<&[u8]> = declared.iter().map(|d| d.value.as_slice()).collect();
+        check_prefix_free(&values).unwrap();
     }
 
     /// Every DM label sits under the feature's own namespace, so it shares no
@@ -402,32 +561,12 @@ mod tests {
     /// test below; this one enforces that the tripwire actually covers it.
     #[test]
     fn every_declared_label_is_byte_pinned() {
-        let source = include_str!("domain.rs");
         // Scoped to the tripwire's own body. An earlier version of this test
         // scanned the whole file for `DM_…` tokens, which the `ALL` registry
         // array satisfies on its own — so it passed while `DM_MSG_AAD` was
         // registered and unpinned, i.e. it tested nothing. Mutation-confirmed.
-        let body = source
-            .split_once("fn labels_are_byte_pinned() {")
-            .expect("the tripwire test exists")
-            .1
-            .split_once("\n    }")
-            .expect("the tripwire test is a normal block")
-            .0;
-
-        for line in source.lines() {
-            let Some(rest) = line.trim().strip_prefix("pub const DM_") else {
-                continue;
-            };
-            let Some((name, _)) = rest.split_once(':') else {
-                continue;
-            };
-            assert!(
-                body.contains(&format!("DM_{name}")),
-                "DM_{name} is declared but never byte-pinned, so its wire value \
-                 can change with the suite still green"
-            );
-        }
+        let body = byte_pin_body(include_str!("domain.rs"));
+        check_byte_pinned(&declarations(), body).unwrap();
     }
 
     /// `ALL` is hand-maintained, and the two checks above only ever see what is
@@ -437,37 +576,88 @@ mod tests {
     /// every declared label appears in `ALL`, and `ALL` contains nothing else.
     #[test]
     fn every_declared_label_is_registered_for_the_prefix_check() {
-        let source = include_str!("domain.rs");
-        let mut declared = Vec::new();
+        check_registered(&declarations(), ALL).unwrap();
+    }
 
-        for line in source.lines() {
-            let Some(rest) = line.trim().strip_prefix("pub const DM_") else {
-                continue;
-            };
-            let Some((_, literal)) = rest.split_once("= b\"") else {
-                continue;
-            };
-            let value = literal
-                .trim_end()
-                .trim_end_matches(';')
-                .trim_end_matches('"')
-                .as_bytes()
-                .to_vec();
-            assert!(
-                ALL.contains(&value.as_slice()),
-                "{} is declared but missing from ALL, so nothing prefix-checks it",
-                String::from_utf8_lossy(&value)
-            );
-            declared.push(value);
-        }
+    // ---- positive controls for the guards themselves -------------------------
+    //
+    // #283's defect was that all three guards reported success on a declaration
+    // none of them could see. Proving the fix therefore means proving each guard
+    // FAILS on the shape that used to escape it: a guard never observed to fail
+    // is indistinguishable from one that cannot.
+    //
+    // A wrapped label cannot be added to the module just to fail a test, so the
+    // fixtures drive the extracted parser and checks over source text instead.
+    // They are built with `concat!` and escaped newlines rather than as raw
+    // multi-line strings on purpose — a raw string would put a real
+    // `pub const DM_…` at the start of a line in THIS file, where the shipped
+    // guards would read it as one of this module's own declarations.
 
+    /// A declaration in the shape `rustfmt` produces when the one-line form
+    /// exceeds the width. Before #283 it matched neither half of the line-scoped
+    /// parse: the first line carries the name but no literal, the second the
+    /// literal but no name.
+    const WRAPPED: &str = concat!(
+        "pub const DM_WRAPPED_LABEL_WITH_A_NAME_LONG_ENOUGH_TO_WRAP: &[u8] =\n",
+        "    b\"daemonseed/dm/wrapped/v1\";\n",
+    );
+
+    #[test]
+    fn the_parser_reads_a_wrapped_declaration() {
+        let declared = checked_parse(WRAPPED);
+        assert_eq!(declared.len(), 1);
         assert_eq!(
-            declared.len(),
-            ALL.len(),
-            "ALL holds {} entries but {} labels are declared here",
-            ALL.len(),
-            declared.len()
+            declared[0].name,
+            "DM_WRAPPED_LABEL_WITH_A_NAME_LONG_ENOUGH_TO_WRAP"
         );
+        assert_eq!(declared[0].value, b"daemonseed/dm/wrapped/v1".to_vec());
+    }
+
+    /// The root of #283 restated as a test: an empty parse must be a failure, not
+    /// a silent pass.
+    #[test]
+    #[should_panic(expected = "read no `pub const DM_")]
+    fn a_parse_that_finds_nothing_is_loud() {
+        checked_parse("// a source carrying no label declarations at all\n");
+    }
+
+    #[test]
+    fn a_wrapped_declaration_missing_from_the_registry_is_caught() {
+        let err = check_registered(&checked_parse(WRAPPED), ALL).unwrap_err();
+        assert!(err.contains("daemonseed/dm/wrapped/v1"), "{err}");
+    }
+
+    #[test]
+    fn a_wrapped_declaration_without_a_byte_pin_is_caught() {
+        let body = "assert_eq!(DM_SOMETHING_ELSE, b\"daemonseed/dm/other/v1\");";
+        let err = check_byte_pinned(&checked_parse(WRAPPED), body).unwrap_err();
+        assert!(
+            err.contains("DM_WRAPPED_LABEL_WITH_A_NAME_LONG_ENOUGH_TO_WRAP"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_wrapped_declaration_that_breaks_prefix_freeness_is_caught() {
+        const PAIR: &str = concat!(
+            "pub const DM_WRAPPED_LABEL_PREFIXING_THE_ONE_BELOW: &[u8] =\n",
+            "    b\"daemonseed/dm/wrapped/v1\";\n",
+            "pub const DM_WRAPPED_LABEL_EXTENDING_THE_ONE_ABOVE: &[u8] =\n",
+            "    b\"daemonseed/dm/wrapped/v1/more\";\n",
+        );
+        let declared = checked_parse(PAIR);
+        assert_eq!(declared.len(), 2, "both wrapped declarations must be read");
+        let values: Vec<&[u8]> = declared.iter().map(|d| d.value.as_slice()).collect();
+        let err = check_prefix_free(&values).unwrap_err();
+        assert!(err.contains("is a prefix of"), "{err}");
+    }
+
+    /// A `pub const DM_` the parser cannot read is a parse failure, not something
+    /// to skip past — skipping is how #283 stayed invisible for as long as it did.
+    #[test]
+    #[should_panic(expected = "cannot read")]
+    fn a_declaration_in_an_unreadable_shape_is_loud() {
+        parse_declarations("pub const DM_ODD_ONE: &[u8] = SOMETHING_ELSE;\n");
     }
 
     #[test]
