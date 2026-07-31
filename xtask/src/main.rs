@@ -19,7 +19,9 @@
 //!   Idempotent; overwrites a previously-installed hook in-place.
 //! - `release-gate` — run the full Definition-of-Done gate and refuse a
 //!   non-zero exit if any check is red, so a release tag is never cut on a
-//!   red tree. Run before `git tag`.
+//!   red tree. Runs the test suite in BOTH the dev and release profiles (#274),
+//!   then deletes the binaries those steps linked into `target/` (see
+//!   `remove_linked_bins`). Run before `git tag`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -450,6 +452,38 @@ fn workspace_root_from_xtask() -> Result<PathBuf> {
         .context("xtask manifest dir has no parent")
 }
 
+/// Runnable binaries this workspace links, relative to a profile directory under
+/// `target/`. Kept as a list rather than globbed so a new bin target is a deliberate
+/// addition here.
+const WORKSPACE_BINS: &[&str] = &["daemonseed-tui", "daemonseed-gui", "xtask"];
+
+/// Delete the binaries the gate's `cargo test`/`clippy --all-targets` steps linked into
+/// `target/{debug,release}/`.
+///
+/// **This is not tidiness — it prevents a cross-machine miscompile.** This repo's
+/// `target/` is shared (virtiofs) with another machine whose glibc is older than the one
+/// linking here. A binary linked on the newer host fails to load on the older one
+/// (`version 'GLIBC_2.xx' not found`), and because the artifact's timestamp then looks
+/// fresh, that machine's own `cargo build` no-ops instead of relinking — so it keeps
+/// running the unusable binary with nothing to say why. Removing the linked bins forces
+/// a genuine relink wherever they are next built. Missing files are not an error: most
+/// gate runs never link most of these.
+fn remove_linked_bins(repo: &Path) -> Result<()> {
+    for profile in ["debug", "release"] {
+        for bin in WORKSPACE_BINS {
+            let path = repo.join("target").join(profile).join(bin);
+            match fs::remove_file(&path) {
+                Ok(()) => println!("release-gate: removed linked binary {}", path.display()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(e).with_context(|| format!("remove {}", path.display()));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Cargo binary the operator's `cargo xtask` invocation ran through. Cargo
 /// sets `CARGO` for subcommands; falling back to plain `"cargo"` keeps the
 /// path manual-invoke-friendly.
@@ -501,6 +535,16 @@ const RELEASE_GATE_STEPS: &[GateStep] = &[
         name: "test --workspace",
         args: &["test", "--workspace"],
     },
+    // #274: the suite in the RELEASE profile as well as dev. Three `daemonseed-gui`
+    // tests were red in release for as long as the release profile existed, and this
+    // gate never saw them because it only ever ran dev. Since #258 put
+    // `overflow-checks = true` on the release profile, the two profiles differ in
+    // BEHAVIOUR and not merely in optimization level, so a green dev suite is no longer
+    // evidence about the artifact that actually ships.
+    GateStep {
+        name: "test --workspace --release",
+        args: &["test", "--workspace", "--release"],
+    },
     GateStep {
         name: "xtask check-proto",
         args: &["xtask", "check-proto"],
@@ -545,6 +589,9 @@ fn release_gate() -> Result<()> {
             .with_context(|| format!("spawn cargo {}", step.name))?;
         results.push((step.name, status.success()));
     }
+    // After every step, red or green: the verdict below can `bail!`, and the linked
+    // binaries must not survive that path either.
+    remove_linked_bins(&repo)?;
     match release_gate_verdict(&results) {
         Ok(()) => {
             println!("release-gate: GREEN — every DoD check passed; safe to cut the signed tag.");
@@ -581,6 +628,65 @@ mod tests {
             release_gate_verdict(&results),
             Err(vec!["test --workspace"])
         );
+    }
+
+    /// #274: the gate must run the suite in the RELEASE profile, not only dev. Three
+    /// `daemonseed-gui` tests were red in release and this gate never saw them. Asserted
+    /// on the step table so deleting the step is a test failure, not a silent
+    /// regression back to dev-only coverage.
+    #[test]
+    fn the_gate_runs_the_suite_in_the_release_profile() {
+        let release_step = RELEASE_GATE_STEPS
+            .iter()
+            .find(|s| s.args.first() == Some(&"test") && s.args.contains(&"--release"))
+            .expect("the release-profile test step must be in the gate");
+        assert!(release_step.args.contains(&"--workspace"));
+        // …and the dev step is still there: release must be an ADDITION, since dev is
+        // what every contributor runs locally and what `debug_assertions` covers.
+        assert!(
+            RELEASE_GATE_STEPS
+                .iter()
+                .any(|s| s.args == ["test", "--workspace"]),
+            "the dev-profile test step must not be replaced"
+        );
+    }
+
+    /// The linked-binary sweep removes what a `cargo test`/`clippy --all-targets` step
+    /// left in `target/{debug,release}/`, and tolerates the (usual) case where a bin was
+    /// never linked at all. Planted files stand in for real binaries — the sweep is pure
+    /// filesystem work with nothing cargo-specific about it.
+    #[test]
+    fn the_linked_binary_sweep_removes_what_a_gate_step_linked() {
+        let repo = std::env::temp_dir().join(format!(
+            "ds-xtask-bin-sweep-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let debug = repo.join("target/debug");
+        let release = repo.join("target/release");
+        fs::create_dir_all(&debug).unwrap();
+        fs::create_dir_all(&release).unwrap();
+        // Plant one bin per profile; deliberately leave the others absent so the
+        // NotFound arm is exercised on the same run.
+        let planted = [debug.join("daemonseed-gui"), release.join("daemonseed-tui")];
+        for f in &planted {
+            fs::write(f, b"not really an elf").unwrap();
+            assert!(f.exists(), "positive control: the plant must exist first");
+        }
+        // A non-binary sibling must survive — the sweep is a named list, not a wipe.
+        let bystander = release.join("libdaemonseed_core.rlib");
+        fs::write(&bystander, b"keep me").unwrap();
+
+        remove_linked_bins(&repo).expect("the sweep must tolerate absent binaries");
+
+        for f in &planted {
+            assert!(!f.exists(), "{} must be gone", f.display());
+        }
+        assert!(
+            bystander.exists(),
+            "the sweep must not touch non-bin artifacts"
+        );
+        fs::remove_dir_all(&repo).ok();
     }
 
     #[test]

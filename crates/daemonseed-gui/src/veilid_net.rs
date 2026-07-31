@@ -596,9 +596,13 @@ pub async fn veilid_net_actor(
                         &mut record_key_owners, &mut resolved_seeds, &mut refresh_armed,
                     ).await;
                 } else {
+                    // (#274) The ambient boundary for the command path: the write-gate is
+                    // read from the environment HERE, once, and every operator handler
+                    // below takes it as a value.
                     handle_command(
                         cmd, &evt_tx, &cmd_tx, &mut net, &mut ev_rx, &mut circles, &mut my_handle,
                         &mut shares, &fetch_outcome_tx, &confirm_outcome_tx,
+                        operator_write_enabled(),
                     ).await;
                 }
             }
@@ -1340,6 +1344,11 @@ async fn handle_command(
     // (#197, CRSH-ISC-29) Where a spawned `ConfirmFetch` download reports its terminal
     // outcome for on-loop folding — the download never blocks this command loop either.
     confirm_outcome_tx: &UnboundedSender<ConfirmOutcome>,
+    // (#274) The interim operator write-gate, read ONCE at the actor loop (the ambient
+    // boundary) and passed down. Read inside the operator command handlers it was
+    // `cfg!(debug_assertions) || …`, which made those handlers take a different branch in
+    // release than in debug and left three tests covering a path that release never runs.
+    operator_write: bool,
 ) {
     match cmd {
         NetCommand::Connect {
@@ -1612,10 +1621,14 @@ async fn handle_command(
         }
 
         // ── Operator announcements / MOTD (Phase 4 A-c) ──
-        NetCommand::RefreshPublicSpace => refresh_public_space(shares, evt_tx, net).await,
-        NetCommand::SetMotd { text } => set_motd(shares, evt_tx, net, &text).await,
+        NetCommand::RefreshPublicSpace => {
+            refresh_public_space(shares, evt_tx, net, operator_write).await;
+        }
+        NetCommand::SetMotd { text } => {
+            set_motd(shares, evt_tx, net, operator_write, &text).await;
+        }
         NetCommand::UploadAnnouncement { topic, body } => {
-            upload_announcement(shares, evt_tx, net, &topic, &body).await;
+            upload_announcement(shares, evt_tx, net, operator_write, &topic, &body).await;
         }
     }
 }
@@ -2115,9 +2128,12 @@ async fn subscribe_operator_space(shares: &mut ShareState, net: &Option<VeilidNe
 /// `build_announcements_view` uses, minus the re-verification. Building the view
 /// through `build_announcements_view` here would re-run the ML-DSA-87 signature check
 /// on every stored post on every inbound item — O(N²) post-quantum work on the event
-/// path during a backlog sweep (review finding). `can_compose` follows
-/// [`operator_write_enabled`] — the interim write-gate (dev possession in debug;
-/// operator-only in release).
+/// path during a backlog sweep (review finding). `can_compose` is passed in rather than
+/// read here — production callers hand it [`operator_write_enabled`], the interim
+/// write-gate (dev possession in debug; operator-only in release). Reading the gate
+/// inside this projection made the emitted `can_compose` a function of the *build
+/// profile*, so a test asserting on it passed in debug and failed in release (#274); as a
+/// parameter, the pane's read-only vs composable projection is testable in both profiles.
 ///
 /// **Ordering: newest announcement first, by `sent_unix_ms` (#237).** `posts` is keyed
 /// by content-address hex, so iterating it yields *hash* order — arbitrary with respect
@@ -2141,7 +2157,7 @@ async fn subscribe_operator_space(shares: &mut ShareState, net: &Option<VeilidNe
 /// content-hash order, which is precisely the defect being fixed. What is left
 /// unaddressed is an operator whose own clock is wrong mis-ordering its own pane; each
 /// row renders its UTC timestamp, so that is visible rather than silent.
-fn public_space_snapshot_event(op: &OperatorSpace) -> NetEvent {
+fn public_space_snapshot_event(op: &OperatorSpace, can_compose: bool) -> NetEvent {
     let motd = op.motd.as_ref().map(render_motd);
     // Decode ONCE per post (`post_render_fields` is a protobuf decode — doing it inside
     // the comparator would repeat it O(n log n) times), carrying each row's slot key
@@ -2183,7 +2199,7 @@ fn public_space_snapshot_event(op: &OperatorSpace) -> NetEvent {
         // Interim write-gate (ISC-15 precursor): the composer shows in debug (dev
         // possession) and, in release, ONLY for an operator instance
         // (`DAEMONSEED_OPERATOR=1`). Non-operator release clients get a read-only pane.
-        can_compose: operator_write_enabled(),
+        can_compose,
     }
 }
 
@@ -2207,11 +2223,13 @@ async fn refresh_public_space(
     shares: &mut ShareState,
     evt_tx: &UnboundedSender<NetEvent>,
     net: &Option<VeilidNetHandle>,
+    // The interim write-gate state, passed in (#274) — see [`public_space_snapshot_event`].
+    operator_write: bool,
 ) {
     subscribe_operator_space(shares, net).await;
     match shares.operator.as_mut() {
         Some(op) => {
-            let _ = evt_tx.send(public_space_snapshot_event(op));
+            let _ = evt_tx.send(public_space_snapshot_event(op, operator_write));
         }
         None => {
             let _ = evt_tx.send(NetEvent::PublicSpaceError {
@@ -2257,6 +2275,11 @@ async fn set_motd(
     shares: &mut ShareState,
     evt_tx: &UnboundedSender<NetEvent>,
     net: &Option<VeilidNetHandle>,
+    // The interim write-gate state, passed in rather than read here (#274). Read
+    // ambiently, this guard was unconditionally open under `cfg!(debug_assertions)`, so
+    // the not-connected path below was only ever reachable in a debug build and the test
+    // covering it silently stopped covering anything in release.
+    operator_write: bool,
     text: &str,
 ) {
     // Lazily (re-)subscribe first so a transient Connect-time subscribe failure doesn't
@@ -2266,7 +2289,7 @@ async fn set_motd(
         let _ = evt_tx.send(NetEvent::PublicSpaceError { message });
     };
     // Interim write-gate: read-only in release except an operator instance.
-    if !operator_write_enabled() {
+    if !operator_write {
         return err("the MOTD is read-only in this build".to_owned());
     }
     let Some(owner_seed) = shares.operator.as_ref().map(|o| o.announce_owner_seed) else {
@@ -2297,7 +2320,7 @@ async fn set_motd(
         op.motd = Some(artifact);
     }
     if let Some(op) = shares.operator.as_ref() {
-        let _ = evt_tx.send(public_space_snapshot_event(op));
+        let _ = evt_tx.send(public_space_snapshot_event(op, operator_write));
     }
 }
 
@@ -2308,6 +2331,9 @@ async fn upload_announcement(
     shares: &mut ShareState,
     evt_tx: &UnboundedSender<NetEvent>,
     net: &Option<VeilidNetHandle>,
+    // The interim write-gate state, passed in rather than read here (#274) — same
+    // reasoning as [`set_motd`].
+    operator_write: bool,
     topic: &str,
     body: &str,
 ) {
@@ -2316,7 +2342,7 @@ async fn upload_announcement(
         let _ = evt_tx.send(NetEvent::PublicSpaceError { message });
     };
     // Interim write-gate: read-only in release except an operator instance.
-    if !operator_write_enabled() {
+    if !operator_write {
         return err("announcements are read-only in this build".to_owned());
     }
     let Some(owner_seed) = shares.operator.as_ref().map(|o| o.announce_owner_seed) else {
@@ -2351,7 +2377,7 @@ async fn upload_announcement(
         op.posts.insert(slot, post);
     }
     if let Some(op) = shares.operator.as_ref() {
-        let _ = evt_tx.send(public_space_snapshot_event(op));
+        let _ = evt_tx.send(public_space_snapshot_event(op, operator_write));
     }
 }
 
@@ -2448,6 +2474,10 @@ fn apply_operator_item(
     shares: &mut ShareState,
     evt_tx: &UnboundedSender<NetEvent>,
     bytes: &[u8],
+    // The interim write-gate state, carried only so the snapshot this fold emits can
+    // report `can_compose` (#274). It gates nothing here — folding VERIFIED operator
+    // content is a read, and a non-operator client must still see the MOTD.
+    operator_write: bool,
 ) -> bool {
     // Only fold when the operator record is subscribed (else these bytes aren't ours).
     if shares.operator.is_none() {
@@ -2485,7 +2515,7 @@ fn apply_operator_item(
         _ => return false, // unknown tag → not an operator item
     }
     if let Some(op) = shares.operator.as_ref() {
-        let _ = evt_tx.send(public_space_snapshot_event(op));
+        let _ = evt_tx.send(public_space_snapshot_event(op, operator_write));
     }
     true
 }
@@ -4149,7 +4179,10 @@ fn handle_inbound(
     }
     // Not a discovery item — try it as an operator announce/MOTD record item (A-c). A
     // verified item folds into OperatorSpace and pushes a fresh PublicSpaceSnapshot.
-    if apply_operator_item(shares, evt_tx, &bytes) {
+    // This is the ambient boundary for the fold path: the inbound demux is where the
+    // write-gate is read from the environment, so everything below it takes the gate as
+    // a value and stays profile-independent under test (#274).
+    if apply_operator_item(shares, evt_tx, &bytes, operator_write_enabled()) {
         return;
     }
     daemonseed_veilid_net::vtrace!(
@@ -5773,6 +5806,8 @@ mod tests {
             &mut shares,
             &fetch_outcome_tx,
             &confirm_outcome_tx,
+            // (#274) The operator write-gate; this command's arm never reads it.
+            false,
         )
         .await;
 
@@ -5839,6 +5874,10 @@ mod tests {
             &mut shares,
             &fetch_outcome_tx,
             &confirm_outcome_tx,
+            // (#274) The write-gate as a value, not as `cfg!(debug_assertions)`. This
+            // test's subject lies BEYOND the gate, so it needs the gate open — and now
+            // gets it identically in debug and release.
+            true,
         )
         .await;
 
@@ -5876,6 +5915,10 @@ mod tests {
             &mut shares,
             &fetch_outcome_tx,
             &confirm_outcome_tx,
+            // (#274) The write-gate as a value, not as `cfg!(debug_assertions)`. This
+            // test's subject lies BEYOND the gate, so it needs the gate open — and now
+            // gets it identically in debug and release.
+            true,
         )
         .await;
         assert!(matches!(
@@ -5911,6 +5954,10 @@ mod tests {
             &mut shares,
             &fetch_outcome_tx,
             &confirm_outcome_tx,
+            // (#274) The write-gate as a value, not as `cfg!(debug_assertions)`. This
+            // test's subject lies BEYOND the gate, so it needs the gate open — and now
+            // gets it identically in debug and release.
+            true,
         )
         .await;
         assert!(matches!(
@@ -5942,7 +5989,9 @@ mod tests {
             content_address: addr.as_bytes().to_vec(),
         };
         let bytes = encode_operator_item(OPERATOR_ITEM_ANNOUNCEMENT, &post.encode_to_vec());
-        assert!(apply_operator_item(shares, &evt_tx, &bytes));
+        // (#274) The snapshot this fold emits is discarded here — this helper only
+        // seeds state — so the write-gate value is not the subject.
+        assert!(apply_operator_item(shares, &evt_tx, &bytes, false));
         hex::encode(&post.content_address)
     }
 
@@ -6060,7 +6109,12 @@ mod tests {
         // network-wide. A MOTD-only operator therefore has nothing safe to refresh.
         let motd = sign_motd(&kp, "hello", 100).unwrap();
         let motd_bytes = encode_operator_item(OPERATOR_ITEM_MOTD, &motd.encode_to_vec());
-        assert!(apply_operator_item(&mut shares, &evt_tx, &motd_bytes));
+        assert!(apply_operator_item(
+            &mut shares,
+            &evt_tx,
+            &motd_bytes,
+            false
+        ));
         assert!(
             next_operator_keepalive_item(&shares, true, None).is_none(),
             "a MOTD-only operator has nothing safe to keep alive"
@@ -6094,7 +6148,7 @@ mod tests {
         let net: Option<VeilidNetHandle> = None; // already subscribed → no re-subscribe
         let (evt_tx, mut evt_rx) = unbounded_channel();
 
-        refresh_public_space(&mut shares, &evt_tx, &net).await;
+        refresh_public_space(&mut shares, &evt_tx, &net, true).await;
         assert!(matches!(
             evt_rx.try_recv(),
             Ok(NetEvent::PublicSpaceSnapshot { .. })
@@ -6170,7 +6224,11 @@ mod tests {
 
     /// A verified F17-signed MOTD folds into `OperatorSpace` and pushes a
     /// `PublicSpaceSnapshot`; an EMPTY whitelist authorizes the F17 signer (A0), so no
-    /// whitelist distribution is needed, and `can_compose` is the dev possession gate.
+    /// whitelist distribution is needed, and the fold relays the write-gate it was
+    /// handed into the snapshot's `can_compose`. The gate is a PARAMETER (#274), so this
+    /// test's subject — the fold — is asserted identically in debug and release; before
+    /// that it read `cfg!(debug_assertions)` and the assertion below was simply false in
+    /// a release build.
     #[test]
     fn apply_operator_item_folds_a_verified_f17_motd() {
         let _ = oxicrypt_module::initialize();
@@ -6181,14 +6239,33 @@ mod tests {
         let mut shares = ShareState::new();
         shares.operator = Some(operator_space());
         let (evt_tx, mut evt_rx) = unbounded_channel();
-        assert!(apply_operator_item(&mut shares, &evt_tx, &bytes));
+        assert!(apply_operator_item(&mut shares, &evt_tx, &bytes, true));
         assert!(shares.operator.as_ref().unwrap().motd.is_some());
         match evt_rx.try_recv() {
             Ok(NetEvent::PublicSpaceSnapshot { view, can_compose }) => {
                 assert_eq!(view.motd.as_deref(), Some("Welcome to daemonseed"));
-                assert!(can_compose, "dev-possession gate is open");
+                assert!(can_compose, "the gate handed to the fold is relayed");
             }
             other => panic!("expected a PublicSpaceSnapshot, got {other:?}"),
+        }
+    }
+
+    /// #274: the pane's read-only vs composable projection, in BOTH gate states. The
+    /// gate itself (`operator_write_enabled`) is still profile-dependent by design — dev
+    /// possession in debug, `DAEMONSEED_OPERATOR` in release — but what the projection
+    /// DOES with it no longer is, so a release build exercises both arms here. The
+    /// release branch of the gate's own predicate is covered separately by
+    /// [`operator_flag_requires_a_truthy_value`].
+    #[test]
+    fn the_snapshot_reports_the_write_gate_it_was_given() {
+        let op = operator_space();
+        for given in [true, false] {
+            match public_space_snapshot_event(&op, given) {
+                NetEvent::PublicSpaceSnapshot { can_compose, .. } => {
+                    assert_eq!(can_compose, given, "can_compose must follow the gate");
+                }
+                other => panic!("expected a PublicSpaceSnapshot, got {other:?}"),
+            }
         }
     }
 
@@ -6209,7 +6286,7 @@ mod tests {
         let mut shares = ShareState::new();
         shares.operator = Some(operator_space());
         let (evt_tx, mut evt_rx) = unbounded_channel();
-        assert!(apply_operator_item(&mut shares, &evt_tx, &bytes));
+        assert!(apply_operator_item(&mut shares, &evt_tx, &bytes, true));
         assert_eq!(shares.operator.as_ref().unwrap().posts.len(), 1);
         assert!(matches!(
             evt_rx.try_recv(),
@@ -6269,7 +6346,8 @@ mod tests {
             "stored (hash) order must be the inverse of time order for this test to bite"
         );
 
-        let NetEvent::PublicSpaceSnapshot { view, .. } = public_space_snapshot_event(&op) else {
+        let NetEvent::PublicSpaceSnapshot { view, .. } = public_space_snapshot_event(&op, true)
+        else {
             panic!("public_space_snapshot_event must emit a snapshot");
         };
         assert_eq!(
@@ -6315,7 +6393,8 @@ mod tests {
         by_slot.sort();
         let expected: Vec<String> = by_slot.into_iter().map(|(_, body)| body).collect();
 
-        let NetEvent::PublicSpaceSnapshot { view, .. } = public_space_snapshot_event(&op) else {
+        let NetEvent::PublicSpaceSnapshot { view, .. } = public_space_snapshot_event(&op, true)
+        else {
             panic!("public_space_snapshot_event must emit a snapshot");
         };
         let rendered: Vec<String> = view.posts.iter().map(|p| p.body.clone()).collect();
@@ -6326,7 +6405,8 @@ mod tests {
 
         // Same input, rendered again: byte-identical. A non-total order is free to
         // disagree with itself here.
-        let NetEvent::PublicSpaceSnapshot { view: again, .. } = public_space_snapshot_event(&op)
+        let NetEvent::PublicSpaceSnapshot { view: again, .. } =
+            public_space_snapshot_event(&op, true)
         else {
             panic!("public_space_snapshot_event must emit a snapshot");
         };
@@ -6339,7 +6419,12 @@ mod tests {
     fn apply_operator_item_ignores_bytes_when_operator_unsubscribed() {
         let mut shares = ShareState::new(); // operator = None
         let (evt_tx, _rx) = unbounded_channel();
-        assert!(!apply_operator_item(&mut shares, &evt_tx, b"\x00garbage"));
+        assert!(!apply_operator_item(
+            &mut shares,
+            &evt_tx,
+            b"\x00garbage",
+            false
+        ));
     }
 
     /// A verified inbound lobby chat message (sealed under the public room key by a
@@ -6579,6 +6664,8 @@ mod tests {
             &mut shares,
             &fetch_outcome_tx,
             &confirm_outcome_tx,
+            // (#274) The operator write-gate; this command's arm never reads it.
+            false,
         )
         .await;
         match evt_rx.try_recv() {

@@ -116,6 +116,21 @@ work lives in the project lead's vault manifest, not here.
 
 ### Fixed
 
+- The operator write-gate travels as a value instead of being read from ambient
+  state, so three GUI tests no longer assert debug-only behaviour and the suite
+  is green under `cargo test --workspace --release`. `operator_write_enabled()`
+  is `cfg!(debug_assertions) || <env>`, so in release the gate closed and two
+  "reports a clean error" tests never reached the error they assert — their
+  subject is the error path, with the gate an unexamined precondition. The
+  projection, the two write guards and the command dispatch now take the gate as
+  a parameter; the actor loop and the inbound handler remain the single ambient
+  boundaries where the environment is read. A new test asserts the projection in
+  both gate states, which is the coverage release was silently missing.
+  `cargo xtask release-gate` gained a release-profile test step — it ran the
+  suite in dev only, which is why this went unseen — and now sweeps linked
+  binaries from `target/{debug,release}` afterwards, including on a red run.
+  (#274)
+
 - `VerifiedFirstContact` and `PersistedCircle` derive `Zeroize` +
   `ZeroizeOnDrop` instead of naming fields in a hand-written `Drop`, with **no**
   `#[zeroize(skip)]` on either. A field added later is now covered by
