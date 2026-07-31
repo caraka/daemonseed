@@ -200,6 +200,27 @@ pub const MAX_PAGE: u64 = u64::MAX / PAGE_SLOTS as u64;
 
 /// Where a sequence number lives: which page, and which slot of it.
 ///
+/// # A page-0 fixture cannot tell a slot from a sequence
+///
+/// **Never test anything that converts between a slot and a sequence number
+/// using a position on page 0.** On page 0 [`Self::seq`] reduces to
+/// `0 * PAGE_SLOTS + slot`, so a position's slot and its sequence number are the
+/// *same integer* — and a fixture built there cannot distinguish an
+/// implementation that returns one from an implementation that returns the
+/// other. Neither can it distinguish a derivation that carries its page argument
+/// from one that hardcoded zero.
+///
+/// This is not hypothetical: two such mutants survived the entire workspace
+/// suite, one of them aliasing every page of a conversation onto page 0's sixteen
+/// slots so that message sixteen would overwrite message zero with both ends
+/// agreeing (#272, found closing #254).
+///
+/// Use **page 3, slot 9 — sequence 57**, or any position whose three numbers
+/// differ, so substituting any one of them for another is caught. Where page 0 is
+/// genuinely the subject — a first-message path, the initiator's permanently
+/// empty first slot, a cold probe — keep the page-0 fixture *and* add a non-zero
+/// sibling rather than moving it.
+///
 /// **Fields are private, and that is load-bearing.** A position is only valid
 /// when its slot is inside the record and its page cannot overflow a sequence
 /// number — and the place invalid ones come from is a *sweep*: subkey indices

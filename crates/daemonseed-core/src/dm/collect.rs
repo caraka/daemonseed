@@ -753,25 +753,38 @@ mod tests {
     /// A page's slots arrive from a sweep that fans out its GETs, so order is
     /// not guaranteed and a re-read can repeat one. The caller opens frames in
     /// sequence order, so this hands them back that way.
+    ///
+    /// On page 3 rather than page 0, because this and its neighbour below are the
+    /// only tests of the fold's slot-to-sequence lift. On page 0 a slot index *is*
+    /// its own sequence number, so the expected values would be the slot numbers
+    /// themselves and a fold that handed back raw slots — or that hardcoded page
+    /// zero — would pass unchallenged (#272). Here the two are distinct: slots
+    /// 1, 3, 5 lift to sequences 49, 51, 53.
     #[test]
     fn positions_come_back_ascending_and_deduplicated() {
         let mut c = Collection::new();
-        let seen = c.observe_page(0, &[5, 1, 5, 3]).unwrap();
+        let seen = c.observe_page(3, &[5, 1, 5, 3]).unwrap();
         let seqs: Vec<u64> = seen.unsettled.iter().map(|p| p.seq()).collect();
-        assert_eq!(seqs, vec![1, 3, 5]);
+        assert_eq!(seqs, vec![49, 51, 53]);
     }
 
     /// Re-seeding makes a page return bytes for messages already collected. A
     /// message key is used once, so offering those again would hand the ratchet
     /// frames it can only reject.
+    ///
+    /// On page 3 for the reason its neighbour above is: the settled-set lookup is
+    /// keyed by sequence number, and on page 0 the sequence it is keyed by cannot
+    /// be told apart from the slot it came from (#272). Slot 1 lifts to sequence
+    /// 49 and slot 2 to sequence 50, so a fold that compared raw slots against
+    /// settled sequences is caught.
     #[test]
     fn a_settled_position_is_not_offered_again() {
         let mut c = Collection::new();
-        reach(&mut c, 0, &[1]);
-        collect(&mut c, 1);
-        let seen = c.observe_page(0, &[1, 2]).unwrap();
+        reach(&mut c, 3, &[1]);
+        collect(&mut c, 49);
+        let seen = c.observe_page(3, &[1, 2]).unwrap();
         let seqs: Vec<u64> = seen.unsettled.iter().map(|p| p.seq()).collect();
-        assert_eq!(seqs, vec![2]);
+        assert_eq!(seqs, vec![50]);
     }
 
     // ---- the cadence ---------------------------------------------------------

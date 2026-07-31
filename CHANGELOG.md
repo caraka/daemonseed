@@ -116,6 +116,19 @@ work lives in the project lead's vault manifest, not here.
 
 ### Fixed
 
+- DM test fixtures no longer sit on page 0, where a `PagePosition`'s slot
+  **equals** its sequence number and no test can tell the two apart. The
+  crate's only coverage of slot misfiling —
+  `a_frame_written_to_the_wrong_slot_is_rejected` — was at `(page 0, slot 1)`,
+  so a mutant reading `found_at.slot()` where `open` reads `found_at.seq()` had
+  nothing standing in its way, and it survives on the unfixed tree. It is now
+  at `(page 3, slot 9, seq 57)` with a fixture control asserting those values,
+  so a drift back to page 0 fails loudly rather than silently proving less.
+  `dm::collect`'s two fold tests moved likewise, and `dm::outbox`'s
+  `position()` — a site the issue did not list — gained a non-zero sibling.
+  Tests whose actual subject is sequence 0 keep it and gained non-zero
+  siblings. (#272)
+
 - `VerifiedFirstContact` now enforces the invariant its doc comment claims. All
   eight fields were `pub`, so the type advertised "only constructible via
   `open`, so holding one IS the proof" while any caller could forge one with no

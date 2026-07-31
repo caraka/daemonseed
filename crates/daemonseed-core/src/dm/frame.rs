@@ -608,7 +608,7 @@ pub struct VerifiedFrame {
 mod tests {
     use super::*;
     use crate::dm::firstcontact::{FRAME_KIND_FIRST_CONTACT, recipient_hash};
-    use crate::dm::paging::position_of;
+    use crate::dm::paging::{PAGE_SLOTS, position_of};
     use crate::dm::ratchet::{EphemeralDecapKey, Ratchet, Role};
     use crate::identity::keys::{Identity, IdentityKeys, derive_identity_keys};
     use crate::identity::mnemonic::Mnemonic;
@@ -675,6 +675,39 @@ mod tests {
             a_pc: keys(PHRASE_B),
             init,
             recip,
+        }
+    }
+
+    /// A sequence number whose page, slot and sequence are three DIFFERENT
+    /// numbers: page 3, slot 9, sequence 57.
+    ///
+    /// On page 0 a slot index *is* its own sequence number, so a page-0 fixture
+    /// cannot tell the two apart: a mutant that reads `found_at.slot()` where
+    /// [`ParsedFrame::open`] reads `found_at.seq()` passes it, and since the
+    /// misfiling check below is the only coverage of that binding anywhere, such a
+    /// mutant would have nothing standing in its way (#272). Every fixture here
+    /// that exercises the slot-to-sequence binding uses this sequence instead, so
+    /// substituting any one of the three numbers for another is caught.
+    const DISTINCT_SEQ: u64 = 3 * PAGE_SLOTS as u64 + 9;
+
+    /// Burn frames from `r` until the next one it seals will carry `seq`.
+    ///
+    /// A ratchet has no "what sequence number comes next" accessor, so the frames
+    /// in between are produced and dropped rather than inspected. That is only
+    /// sound for a receiver that tolerates the resulting gap: the skip stays under
+    /// [`crate::dm::ratchet::MAX_SKIP`], which is what lets the far end catch up in
+    /// one `receive`.
+    fn advance_send_to(r: &mut Ratchet, seq: u64) {
+        loop {
+            let out = r.send_next().expect("the chain advances");
+            assert!(
+                out.header.seq < seq,
+                "the ratchet is already at or past sequence {seq}, so this fixture \
+                 cannot reach it"
+            );
+            if out.header.seq + 1 == seq {
+                return;
+            }
         }
     }
 
@@ -1181,6 +1214,78 @@ mod tests {
         );
     }
 
+    /// The reply direction again, at a position where page, slot and sequence are
+    /// three different numbers.
+    ///
+    /// Its sibling above stays at sequence zero on purpose — that the recipient's
+    /// channel starts there is the property it exists to pin, so moving it would
+    /// lose that. But `(page 0, slot 0, sequence 0)` is triply degenerate: the
+    /// three numbers and the asserted literal are all the same integer, so nothing
+    /// in it can witness `open` binding a frame to its SEQUENCE rather than to its
+    /// slot or its page (#272). This one is the same round trip at page 3, slot 9,
+    /// sequence 57, where those three answers differ and a substitution shows.
+    #[test]
+    fn the_reply_direction_round_trips_at_a_position_that_is_not_page_zero() {
+        let mut p = pair();
+        let first = p.send("hello");
+        p.recv(&first).unwrap();
+
+        // The step happens on the recipient's first send, so the burn covers it and
+        // the frame that comes back is well inside the generation.
+        advance_send_to(&mut p.recip, DISTINCT_SEQ);
+        let out = p.recip.send_next().unwrap();
+        assert_eq!(out.header.generation, 1, "the reply took the first step");
+        assert!(
+            out.eph_ct.is_some(),
+            "the generation carries its ciphertext"
+        );
+
+        let rcpt_a = recipient_hash(p.a.signing.public_key()).unwrap();
+        let at = position_of(out.header.seq);
+        assert_eq!(
+            (at.page(), at.slot(), at.seq()),
+            (3, 9, DISTINCT_SEQ),
+            "this fixture must sit where page, slot and sequence are three different \
+             numbers, or it adds nothing its sibling does not already cover"
+        );
+
+        let bytes = seal(
+            out,
+            &[1u8; ROOT_LEN],
+            &p.b.signing,
+            p.b.signing.public_key(),
+            &rcpt_a,
+            SENT,
+            "hi back",
+        )
+        .unwrap();
+
+        let parsed = parse(&bytes).unwrap();
+        let dir = p.init.recv_direction();
+        let pk_b = *p.b.signing.public_key();
+        // The initiator never saw sequences 0..57, so this also exercises the
+        // catch-up path — the skip stays under `MAX_SKIP`.
+        let opened = p
+            .init
+            .receive(parsed.header(), parsed.eph_ct(), parsed.eph_ek(), |mk| {
+                parsed.open(
+                    mk,
+                    &[1u8; ROOT_LEN],
+                    dir,
+                    at,
+                    &rcpt_a,
+                    AuthorKeys {
+                        pc: &pk_b,
+                        lt: &pk_b,
+                    },
+                )
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(opened.body, "hi back");
+        assert_eq!(opened.seq, DISTINCT_SEQ);
+    }
+
     /// Every clear field is bound in the AAD, so an edited header fails the AEAD
     /// open rather than reaching the ratchet as an authenticated position. Each
     /// mutation below is applied to the encoded frame and must fail.
@@ -1512,9 +1617,17 @@ mod tests {
     /// A peer that signs one sequence number and writes the bytes into another
     /// slot is caught, and caught BEFORE the seal is opened — only the collector
     /// holds both facts, so nothing else in the system could notice.
+    ///
+    /// Deliberately sealed at [`DISTINCT_SEQ`] rather than at the conversation's
+    /// first sequence number. This is the *only* test of slot misfiling in the
+    /// crate, and on page 0 it could not do its job: slot and sequence are the same
+    /// integer there, so `open` reading the slot where it should read the sequence
+    /// would satisfy both halves below (#272). At page 3, slot 9, sequence 57 the
+    /// honest half fails under that mutant, because slot 9 is not sequence 57.
     #[test]
     fn a_frame_written_to_the_wrong_slot_is_rejected() {
         let mut p = pair();
+        advance_send_to(&mut p.init, DISTINCT_SEQ);
         let (bytes, key) = p.send_keyed("misfiled");
         let parsed = parse(&bytes).unwrap();
         let rcpt = recipient_hash(p.b.signing.public_key()).unwrap();
@@ -1524,23 +1637,30 @@ mod tests {
         };
         let dir = p.recip.recv_direction();
 
+        // The control on the fixture itself. Everything below is only a test of the
+        // slot-to-sequence binding while these three numbers differ; if this
+        // position ever drifts back onto page 0 the assertions keep passing while
+        // proving strictly less, which is the exact failure #272 records.
+        let honest = position_of(parsed.header().seq);
+        assert_eq!(
+            (honest.page(), honest.slot(), honest.seq()),
+            (3, 9, DISTINCT_SEQ),
+            "this fixture must sit where page, slot and sequence are three different \
+             numbers, or it cannot tell a slot from a sequence"
+        );
+
         let elsewhere = position_of(parsed.header().seq + 100);
         assert!(matches!(
             parsed.open(&key, &[1u8; ROOT_LEN], dir, elsewhere, &rcpt, author),
             Err(DmFrameError::Misplaced { .. })
         ));
         // And the honest position still opens, so the check is not simply refusing
-        // everything.
+        // everything. This is the half that the page-0 fixture used to let a
+        // slot-for-sequence mutant through: at page 3 slot 9, reading the slot
+        // yields 9 against a declared sequence of 57, so the mutant fails here.
         assert!(
             parsed
-                .open(
-                    &key,
-                    &[1u8; ROOT_LEN],
-                    dir,
-                    position_of(parsed.header().seq),
-                    &rcpt,
-                    author
-                )
+                .open(&key, &[1u8; ROOT_LEN], dir, honest, &rcpt, author)
                 .is_ok()
         );
     }

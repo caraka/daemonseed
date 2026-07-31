@@ -2932,6 +2932,27 @@ mod tests {
         );
     }
 
+    /// A channel entry's position carries its whole sequence number, not merely
+    /// the slot it occupies within a page.
+    ///
+    /// Asserted at sequence 57 — page 3, slot 9 — because the neighbour above can
+    /// only speak about sequences 0 and 1, and on page 0 a slot index *is* its own
+    /// sequence number. An entry that reported its slot alone, or that dropped the
+    /// page, is indistinguishable from a correct one there (#272). That test keeps
+    /// its low sequences, since the knock-versus-channel distinction it exists for
+    /// is exactly what lives at 0 and 1.
+    #[test]
+    fn a_channel_entrys_position_carries_its_page_and_not_only_its_slot() {
+        let mut ob = empty();
+        ob.enqueue_sealed(57, channel(), T0, frame(0x03)).unwrap();
+        let at = ob
+            .entry(57)
+            .unwrap()
+            .position()
+            .expect("a channel entry is paged");
+        assert_eq!((at.page(), at.slot(), at.seq()), (3, 9, 57));
+    }
+
     /// A sequence number is enqueued once. Re-enqueueing would reset a give-up
     /// clock or replace a frame, which are both silent losses.
     #[test]
