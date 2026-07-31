@@ -2118,20 +2118,66 @@ async fn subscribe_operator_space(shares: &mut ShareState, net: &Option<VeilidNe
 /// path during a backlog sweep (review finding). `can_compose` follows
 /// [`operator_write_enabled`] — the interim write-gate (dev possession in debug;
 /// operator-only in release).
+///
+/// **Ordering: newest announcement first, by `sent_unix_ms` (#237).** `posts` is keyed
+/// by content-address hex, so iterating it yields *hash* order — arbitrary with respect
+/// to time, and stable, so an older announcement sat above a newer one identically on
+/// every restart. Newest-first (rather than the chat transcript's oldest-first) because
+/// the pane is a top-anchored `Flickable` that never auto-scrolls: whatever is first in
+/// the model is what a reader sees without scrolling, and for a broadcast pane that
+/// should be the latest notice.
+///
+/// **The timestamp is not clamped**, unlike the chat transcript's advisory
+/// `sent_unix_ms` ([`daemonseed_core::transcript::clamp_order_ms`], #131), on two
+/// independent grounds. *Trust model:* a row exists here only after `verify_served_post`
+/// accepted an ML-DSA-87 signature against the published operator whitelist, so this
+/// value is not world-writable the way a lobby message's is — an unauthorized peer
+/// cannot place a post here at all, and a holder of the operator signing key can already
+/// say anything on this pane, so pinning one of its own posts to the top is not an
+/// escalation over what it may write. *The window is the wrong shape anyway:*
+/// announcements are long-lived by design (#141/#238 re-seed a standing announcement for
+/// as long as it stands), while the transcript window trusts only the last 24 h — every
+/// announcement older than a day would clamp onto the same edge, tie, and fall back to
+/// content-hash order, which is precisely the defect being fixed. What is left
+/// unaddressed is an operator whose own clock is wrong mis-ordering its own pane; each
+/// row renders its UTC timestamp, so that is visible rather than silent.
 fn public_space_snapshot_event(op: &OperatorSpace) -> NetEvent {
     let motd = op.motd.as_ref().map(render_motd);
-    let posts = op
+    // Decode ONCE per post (`post_render_fields` is a protobuf decode — doing it inside
+    // the comparator would repeat it O(n log n) times), carrying each row's slot key
+    // alongside so the tie-break below can use it.
+    let mut rows: Vec<(&str, AnnouncementRow)> = op
         .posts
-        .values()
-        .map(|p| {
+        .iter()
+        .map(|(slot, p)| {
             let (topic, body, sent_unix_ms) = post_render_fields(p);
-            AnnouncementRow {
-                topic,
-                body,
-                sent_unix_ms,
-            }
+            (
+                slot.as_str(),
+                AnnouncementRow {
+                    topic,
+                    body,
+                    sent_unix_ms,
+                },
+            )
         })
         .collect();
+    // Newest first, ties broken by the content-address slot key. The tie-break is not
+    // decoration: two announcements can genuinely carry the same `sent_unix_ms` (an
+    // operator posting twice inside the same millisecond, or two posts stamped from the
+    // same second-granularity clock), and an ordering that leaves them merely equal is
+    // not a total order — their relative position would then be an artifact of the
+    // sort's internals and could differ between two renders of the same set, flickering
+    // the pane. The slot key is unique per post by construction (it IS the map key, a
+    // content address), so appending it makes the order total and byte-identical on
+    // every render. A post whose payload fails to decode reports `sent_unix_ms == 0`
+    // (`post_render_fields` is infallible-by-default) and sorts to the bottom, where its
+    // empty topic/body is least intrusive.
+    rows.sort_by(|(a_slot, a), (b_slot, b)| {
+        b.sent_unix_ms
+            .cmp(&a.sent_unix_ms)
+            .then_with(|| a_slot.cmp(b_slot))
+    });
+    let posts = rows.into_iter().map(|(_, row)| row).collect();
     NetEvent::PublicSpaceSnapshot {
         view: AnnouncementsView { motd, posts },
         // Interim write-gate (ISC-15 precursor): the composer shows in debug (dev
@@ -6169,6 +6215,122 @@ mod tests {
             evt_rx.try_recv(),
             Ok(NetEvent::PublicSpaceSnapshot { view, .. }) if view.posts.len() == 1
         ));
+    }
+
+    /// A real F17-signed announcement paired with the content-address hex slot it is
+    /// stored under — the same `(key, value)` pairing `apply_operator_item` inserts,
+    /// built directly so an ordering test can choose exactly which posts exist.
+    fn signed_post_in_slot(
+        kp: &SignKeypair,
+        topic: &str,
+        body: &str,
+        sent_unix_ms: i64,
+    ) -> (String, wire::Post) {
+        let artifact = sign_post(kp, topic, body, sent_unix_ms).unwrap();
+        let addr = content_address(&artifact.signed_payload).unwrap();
+        let post = wire::Post {
+            artifact: Some(artifact),
+            content_address: addr.as_bytes().to_vec(),
+        };
+        (hex::encode(&post.content_address), post)
+    }
+
+    /// #237: the pane orders by TIME, not by the content-address slot the post happens
+    /// to be stored under. `OperatorSpace.posts` is a `BTreeMap` keyed by content-address
+    /// hex, so projecting it directly emitted *hash* order — arbitrary with respect to
+    /// time, and stable, so a newer announcement sat below an older one identically on
+    /// every restart.
+    ///
+    /// The adversarial pairing is DERIVED, not hard-coded: which of two real content
+    /// addresses sorts first is not ours to choose (the address is a hash of the signed
+    /// payload), so the test searches a small family of payloads for one whose slot sorts
+    /// strictly AFTER the older post's, and gives that one the NEWER timestamp. Stored
+    /// order is then exactly the inverse of time order — an unsorted projection returns
+    /// oldest-first and fails the assertion. Deterministic: the payloads are fixed, so
+    /// the search lands on the same post on every run.
+    #[test]
+    fn announcements_render_newest_first_not_in_content_hash_order() {
+        let _ = oxicrypt_module::initialize();
+        let kp = dev_project_release_keypair().unwrap();
+        let (older_slot, older) = signed_post_in_slot(&kp, "maintenance", "posted first", 1_000);
+        let (newer_slot, newer) = (0..64)
+            .map(|i| signed_post_in_slot(&kp, "release", &format!("posted second #{i}"), 2_000))
+            .find(|(slot, _)| *slot > older_slot)
+            .expect("some payload's content address sorts after the older post's");
+
+        let mut op = operator_space();
+        op.posts.insert(older_slot.clone(), older);
+        op.posts.insert(newer_slot.clone(), newer);
+        // The trap must actually be armed: the map has to yield the OLDER post first,
+        // or a projection that never sorts would satisfy the assertion below by luck.
+        assert_eq!(
+            op.posts.keys().collect::<Vec<_>>(),
+            vec![&older_slot, &newer_slot],
+            "stored (hash) order must be the inverse of time order for this test to bite"
+        );
+
+        let NetEvent::PublicSpaceSnapshot { view, .. } = public_space_snapshot_event(&op) else {
+            panic!("public_space_snapshot_event must emit a snapshot");
+        };
+        assert_eq!(
+            view.posts
+                .iter()
+                .map(|p| p.sent_unix_ms)
+                .collect::<Vec<_>>(),
+            vec![2_000, 1_000],
+            "the newest announcement renders first, whatever its content address"
+        );
+    }
+
+    /// #237: the ordering is a TOTAL order. Announcements can genuinely share a
+    /// `sent_unix_ms` — an operator posting twice in one millisecond, or two posts
+    /// stamped from the same coarse clock — and equal-comparing rows whose relative
+    /// position is left to the sort's internals could render in one order now and
+    /// another later, flickering the pane. The content-address slot key breaks the tie,
+    /// ascending, and is unique per post by construction.
+    ///
+    /// What this test does and does not catch, measured rather than assumed. It FAILS if
+    /// the tie-break's direction is reversed (verified by mutation). It does NOT fail if
+    /// the sort is deleted outright — with every timestamp equal, an unsorted projection
+    /// yields slot order too, and
+    /// `announcements_render_newest_first_not_in_content_hash_order` is the test that
+    /// covers that. Nor does it fail if the tie-break is merely dropped in favour of
+    /// `sort_unstable_by` on the timestamp alone: also verified by mutation, and it
+    /// passes because `sort_unstable_by` insertion-sorts a slice this short and happens
+    /// to leave equal elements in place. That is an implementation detail of the current
+    /// standard library, not a guarantee — which is the whole reason the comparator makes
+    /// the order total explicitly instead of resting on it.
+    #[test]
+    fn announcements_with_equal_timestamps_order_by_slot_key() {
+        let _ = oxicrypt_module::initialize();
+        let kp = dev_project_release_keypair().unwrap();
+        let mut op = operator_space();
+        let mut by_slot: Vec<(String, String)> = Vec::new();
+        for i in 0..6 {
+            let body = format!("same instant #{i}");
+            let (slot, post) = signed_post_in_slot(&kp, "notice", &body, 7_000);
+            by_slot.push((slot.clone(), body));
+            op.posts.insert(slot, post);
+        }
+        by_slot.sort();
+        let expected: Vec<String> = by_slot.into_iter().map(|(_, body)| body).collect();
+
+        let NetEvent::PublicSpaceSnapshot { view, .. } = public_space_snapshot_event(&op) else {
+            panic!("public_space_snapshot_event must emit a snapshot");
+        };
+        let rendered: Vec<String> = view.posts.iter().map(|p| p.body.clone()).collect();
+        assert_eq!(
+            rendered, expected,
+            "equal timestamps order by content-address slot, ascending"
+        );
+
+        // Same input, rendered again: byte-identical. A non-total order is free to
+        // disagree with itself here.
+        let NetEvent::PublicSpaceSnapshot { view: again, .. } = public_space_snapshot_event(&op)
+        else {
+            panic!("public_space_snapshot_event must emit a snapshot");
+        };
+        assert_eq!(again.posts, view.posts, "the same set renders identically");
     }
 
     /// Bytes arriving with no operator record subscribed are not consumed (they fall

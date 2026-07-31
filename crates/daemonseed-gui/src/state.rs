@@ -55,8 +55,10 @@ pub struct AnnouncementRow {
 /// The verified display model for the announcements/MOTD pane (#91). `motd` is the
 /// connected relay's inert verbatim MOTD ([`daemonseed_cli::public_space::render_motd`]) and is `None` both when
 /// the relay serves no MOTD AND when a served MOTD fails re-verification (display
-/// only what verifies, ISC-A-S3). `posts` are the verified announcement rows, in
-/// served order.
+/// only what verifies, ISC-A-S3). `posts` are the verified announcement rows, ordered
+/// newest `sent_unix_ms` first with ties broken by content-address slot key (#237) —
+/// the pane renders the model in order, and the ordering is applied where the view is
+/// built (`veilid_net::public_space_snapshot_event`), not here.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AnnouncementsView {
     pub motd: Option<String>,

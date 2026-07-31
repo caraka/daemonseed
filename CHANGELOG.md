@@ -480,6 +480,9 @@ work lives in the project lead's vault manifest, not here.
   rollback guard, the clock-derived first-contact epoch, and the
   `daemonseed/dm/…` domain-label namespace. Wire: `DmKeyRecord` and the reserved
   `KeySelector` enum (additive MINOR). (#232, ISC-C40)
+- The GUI announcements pane orders posts newest first by `sent_unix_ms`, ties
+  broken by content-address slot key (#237). Posts previously rendered in
+  content-address order, placing a newer announcement below an older one.
 
 ## [0.36.3] — 2026-07-28
 
