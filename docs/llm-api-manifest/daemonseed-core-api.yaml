@@ -235,7 +235,12 @@ modules:
       for cross-process exclusion across a read-modify-write critical section;
       it is not taken by replace_atomically. On Windows the destination is
       removed before the rename and the directory barrier is a no-op, so the
-      durable-directory-entry guarantee does not hold there.
+      durable-directory-entry guarantee does not hold there (#285). Errors name
+      the destination's state: NotLanded (untouched, safe to retry),
+      Indeterminate (rename failed; may hold the old bytes or be absent, re-read
+      before emitting), LandedNotDurable (new bytes readable, may revert on
+      power loss), NoParent, Entropy. Orphaned temp siblings after a SIGKILL are
+      not swept (#286).
     no_std: false
     depends_on: []
     iscs: []

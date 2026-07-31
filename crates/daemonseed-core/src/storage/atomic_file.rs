@@ -22,7 +22,8 @@
 //! So [`replace_atomically`] adds the two missing barriers:
 //!
 //! ```text
-//!   create tmp sibling (O_CREAT|O_EXCL)
+//!   create each missing ancestor, fsync(its parent)  <- the directory is durable
+//!   create tmp sibling (O_CREAT|O_EXCL, mode 0600)
 //!   write bytes
 //!   fsync(tmp)            <- the data is durable
 //!   close tmp
@@ -32,7 +33,17 @@
 //!
 //! Both barriers are load-bearing and neither implies the other. Omit the file
 //! fsync and the rename can expose a name with unwritten data behind it; omit
-//! the directory fsync and the rename itself can vanish.
+//! the directory fsync and the rename itself can vanish. The same argument
+//! applies one level up: a freshly created *directory* is an entry in its own
+//! parent, buffered like any other, so the first write into a new
+//! correspondence directory must make those entries durable too — otherwise
+//! `dm/corr-01/` itself is what the power cut takes.
+//!
+//! On Unix a crash or power loss at any point therefore leaves `path` holding
+//! either its previous contents or `bytes` — never a mixture, never a
+//! truncation, and never a name whose data was lost. **On non-Unix that is not
+//! true**: the destination is removed before the rename, so there is a window
+//! in which it is absent outright. See the Windows section below.
 //!
 //! ## Cross-process exclusion
 //!
@@ -45,56 +56,123 @@
 //! taking it there would serialize the write while leaving the far more
 //! dangerous read-then-write window wide open, and would read as safe.
 //!
+//! ## Orphaned temp siblings
+//!
+//! The temp sibling is removed on every path that *returns* an error from a
+//! live process. It is **not** removed when the process does not live to return
+//! one: a SIGKILL, an OOM kill or a power cut between the `create_new` and the
+//! `rename` leaves the sibling on disk permanently, and nothing in this tree
+//! sweeps it. A startup sweep of `*.tmp.*` is an obligation on the store built
+//! over this module, not a service this module provides.
+//!
+//! That bounds what the record directory's shape can be claimed to prove. Its
+//! fixed-size, fixed-count shape — the privacy argument that stops it leaking
+//! pending volume — holds across *clean* runs only. Orphan count grows
+//! monotonically with abnormal terminations, so until the store sweeps them the
+//! entry count is itself a coarse signal of how often the writer died mid-write.
+//! Recording that is better than pretending the shape is invariant.
+//!
 //! ## Windows
 //!
 //! `rename` is not atomic-over-an-existing-file on Windows, and a directory
 //! cannot be opened as a file to be fsynced. [`replace_atomically`] therefore
 //! removes the destination before renaming there, and skips the directory
-//! barrier. The Windows build is consequently *crash-atomic with durable file
-//! data* but without the durable-directory-entry guarantee; this is recorded
-//! rather than silently papered over, because the DM store's atomicity contract
-//! is weaker on that platform.
+//! barrier. Two consequences, both weaker than the Unix contract:
+//!
+//! - The directory entry is not durable, so a power cut can lose an otherwise
+//!   successful replacement.
+//! - Between the `remove_file` and the `rename` the destination **does not
+//!   exist**. A crash there — or a `rename` that merely fails — leaves it gone
+//!   outright, rather than holding its previous contents. This is not only a
+//!   power-loss corner: an antivirus scanner or a search indexer holding the
+//!   temp file open fails the `rename` with `ERROR_SHARING_VIOLATION` in
+//!   ordinary operation, after the destination has already been removed. That
+//!   surfaces as [`AtomicReplaceError::Indeterminate`], which is precisely why
+//!   the caller must re-read the destination rather than assume a generation.
+//!
+//! This is recorded rather than silently papered over, because the DM store's
+//! atomicity contract is weaker on that platform.
 
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Failure modes of a durable replacement.
+///
+/// The variants discriminate on the one thing a *commit-then-emit* caller can
+/// act on: **what state the destination is in**. A single `Io` variant collapses
+/// exactly that distinction — most sharply for a durability barrier that runs
+/// *after* the rename, whose failure would otherwise report "the write failed"
+/// for a write that landed.
 #[derive(Debug)]
 pub enum AtomicReplaceError {
-    /// An underlying filesystem operation failed. The destination is unchanged
-    /// unless the failure was the `rename` itself, which is atomic — so the
-    /// destination holds either its previous contents or the new ones, never a
-    /// mixture.
-    Io(std::io::Error),
+    /// The failure happened **before** the rename: creating a missing ancestor
+    /// directory, opening the temp sibling, writing it, or its data barrier.
+    ///
+    /// The destination is untouched — it holds its previous contents, or is
+    /// still absent if it never existed. Nothing was committed, so the caller
+    /// must not emit, and retrying is safe.
+    NotLanded(std::io::Error),
+
+    /// The rename itself failed — or, on non-Unix, the pre-rename
+    /// `remove_file` succeeded and the rename then failed.
+    ///
+    /// The destination state is unknown to this function. On Unix a failed
+    /// `rename` leaves the previous contents in place; on non-Unix the
+    /// destination may already have been removed, so it may be **absent**. The
+    /// caller must re-read the destination before emitting anything and must
+    /// not assume either generation.
+    Indeterminate(std::io::Error),
+
+    /// The rename succeeded but a durability barrier after it failed.
+    ///
+    /// The new bytes **are readable now** — any concurrent reader already sees
+    /// them — but the directory entry naming them has not reached stable
+    /// storage and can revert on power loss. Emitting is not safe: the emission
+    /// would outlive a record that can still disappear. A caller that
+    /// re-attempts the same write and succeeds has re-established durability.
+    LandedNotDurable(std::io::Error),
 
     /// The target has no parent directory, so no sibling temp file can be
     /// placed on the same filesystem — and a cross-filesystem `rename` is not
-    /// atomic.
+    /// atomic. Nothing was written; the destination is untouched.
     NoParent(PathBuf),
 
-    /// A path that must be a regular file (or absent) is a symlink. Following
-    /// it would let a co-resident attacker redirect the write, or — at the lock
-    /// path — point two processes at different inodes so they lock different
-    /// files and the exclusion silently does nothing.
-    UnsafePath(PathBuf),
+    /// The CSPRNG that names the temp sibling was unavailable.
+    ///
+    /// Nothing was written; the destination is untouched. This is kept distinct
+    /// from an I/O failure because in a crypto application an unavailable
+    /// CSPRNG is an alarm in its own right, and must never be indistinguishable
+    /// from a transient disk error.
+    Entropy(getrandom::Error),
 }
 
 impl core::fmt::Display for AtomicReplaceError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            AtomicReplaceError::Io(e) => write!(f, "durable replace I/O failed: {e}"),
+            AtomicReplaceError::NotLanded(e) => {
+                write!(
+                    f,
+                    "durable replace failed before the rename, destination unchanged: {e}"
+                )
+            }
+            AtomicReplaceError::Indeterminate(e) => write!(
+                f,
+                "durable replace failed at the rename, destination state unknown — re-read before emitting: {e}"
+            ),
+            AtomicReplaceError::LandedNotDurable(e) => write!(
+                f,
+                "durable replace landed but its name barrier failed — the new bytes are readable and may revert on power loss: {e}"
+            ),
             AtomicReplaceError::NoParent(p) => write!(
                 f,
                 "{} has no parent directory to place a sibling temp file in",
                 p.display()
             ),
-            AtomicReplaceError::UnsafePath(p) => {
-                write!(
-                    f,
-                    "{} is a symlink; refusing to write through it",
-                    p.display()
-                )
+            AtomicReplaceError::Entropy(e) => {
+                write!(f, "csprng unavailable for the temp-file suffix: {e}")
             }
         }
     }
@@ -103,15 +181,67 @@ impl core::fmt::Display for AtomicReplaceError {
 impl core::error::Error for AtomicReplaceError {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
-            AtomicReplaceError::Io(e) => Some(e),
-            AtomicReplaceError::NoParent(_) | AtomicReplaceError::UnsafePath(_) => None,
+            AtomicReplaceError::NotLanded(e)
+            | AtomicReplaceError::Indeterminate(e)
+            | AtomicReplaceError::LandedNotDurable(e) => Some(e),
+            // `getrandom::Error` only implements `Error` under getrandom's
+            // `std` feature, which this build does not enable, so the cause is
+            // carried in `Display` rather than dropped.
+            AtomicReplaceError::NoParent(_) | AtomicReplaceError::Entropy(_) => None,
         }
     }
 }
 
-impl From<std::io::Error> for AtomicReplaceError {
+// Deliberately no `impl From<std::io::Error> for AtomicReplaceError`: the whole
+// point of the variants above is which side of the rename the failure fell on,
+// and a blanket conversion cannot know that. Every I/O failure is mapped at its
+// call site instead.
+
+/// Why acquiring a [`FileLock`] failed.
+///
+/// Kept separate from [`AtomicReplaceError`] because the two entry points have
+/// genuinely different ranges: acquiring a lock can never fail the way a rename
+/// can, and a replacement can never hit the symlink refusal. A shared type
+/// would make each signature claim failures it cannot produce.
+#[derive(Debug)]
+pub enum LockError {
+    /// Creating the lock file's directory, opening the lock file, or blocking
+    /// for the lock failed.
+    Io(std::io::Error),
+
+    /// The lock path is a symlink. Following it would let a co-resident
+    /// attacker point two processes at different inodes, so they lock different
+    /// files and the exclusion silently does nothing.
+    UnsafePath(PathBuf),
+}
+
+impl core::fmt::Display for LockError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            LockError::Io(e) => write!(f, "acquiring the store lock failed: {e}"),
+            LockError::UnsafePath(p) => {
+                write!(
+                    f,
+                    "{} is a symlink; refusing to lock through it",
+                    p.display()
+                )
+            }
+        }
+    }
+}
+
+impl core::error::Error for LockError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            LockError::Io(e) => Some(e),
+            LockError::UnsafePath(_) => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for LockError {
     fn from(e: std::io::Error) -> Self {
-        AtomicReplaceError::Io(e)
+        LockError::Io(e)
     }
 }
 
@@ -130,13 +260,28 @@ pub(crate) trait Durability {
 /// The real barriers.
 pub(crate) struct RealDurability;
 
+/// Test-only proof that the public entry point drives the *real* barriers.
+///
+/// The seam above is only as good as the argument the public function passes
+/// through it: swapping [`RealDurability`] for a no-op implementation would
+/// leave no filesystem trace and pass every other test in this module. These
+/// counters are the positive control for that substitution.
+#[cfg(test)]
+pub(crate) static REAL_FILE_SYNCS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+pub(crate) static REAL_DIR_SYNCS: AtomicUsize = AtomicUsize::new(0);
+
 impl Durability for RealDurability {
     fn sync_file(&self, file: &File) -> std::io::Result<()> {
+        #[cfg(test)]
+        REAL_FILE_SYNCS.fetch_add(1, Ordering::Relaxed);
         file.sync_all()
     }
 
     #[cfg(unix)]
     fn sync_dir(&self, dir: &Path) -> std::io::Result<()> {
+        #[cfg(test)]
+        REAL_DIR_SYNCS.fetch_add(1, Ordering::Relaxed);
         // Opening a directory read-only and fsyncing it is the portable-POSIX
         // way to make a rename durable.
         File::open(dir)?.sync_all()
@@ -144,6 +289,8 @@ impl Durability for RealDurability {
 
     #[cfg(not(unix))]
     fn sync_dir(&self, _dir: &Path) -> std::io::Result<()> {
+        #[cfg(test)]
+        REAL_DIR_SYNCS.fetch_add(1, Ordering::Relaxed);
         // Windows cannot open a directory as a file. See the module docs: the
         // durable-directory-entry guarantee does not hold on this platform.
         Ok(())
@@ -153,14 +300,23 @@ impl Durability for RealDurability {
 /// Replace `path`'s contents with `bytes` atomically **and durably**.
 ///
 /// On return, `path` names a file whose contents are exactly `bytes` and whose
-/// data and directory entry have both reached stable storage. A crash or power
-/// loss at any point leaves `path` holding either its previous contents or
-/// `bytes` — never a mixture, never a truncation, and (on Unix) never a name
-/// whose data was lost.
+/// data and directory entry have both reached stable storage — as have the
+/// entries naming any ancestor directories this call had to create. On Unix a
+/// crash or power loss at any point leaves `path` holding either its previous
+/// contents or `bytes`, never a mixture and never a truncation; on non-Unix
+/// there is additionally a window in which `path` is absent (module docs).
 ///
 /// The temp sibling is created with `O_CREAT|O_EXCL` under a random suffix, so
 /// an existing symlink at the temp path cannot be followed and two concurrent
-/// callers cannot collide on it. It is removed on every failure path.
+/// callers cannot collide on it. It is removed on every path that returns an
+/// `Err`, but a process killed mid-write orphans it permanently — sweeping
+/// `*.tmp.*` is the store's obligation, not this module's.
+///
+/// The **destination** is not checked for being a symlink, and does not need to
+/// be: POSIX `rename(2)` does not dereference the final path component, so a
+/// symlinked destination is *replaced* by the renamed temp file rather than
+/// written through. The symlink refusal in [`FileLock::acquire`] exists because
+/// the lock path is `open`ed, which does follow. There is no such check here.
 ///
 /// This does **not** take the [`FileLock`] — see the module docs for why a
 /// read-modify-write caller must hold it across both halves itself.
@@ -173,58 +329,125 @@ pub(crate) fn replace_atomically_with<D: Durability>(
     bytes: &[u8],
     durability: &D,
 ) -> Result<(), AtomicReplaceError> {
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .ok_or_else(|| AtomicReplaceError::NoParent(path.to_path_buf()))?;
-    std::fs::create_dir_all(parent)?;
+    let parent = parent_dir(path)?;
+    create_dir_all_durable(parent, durability).map_err(AtomicReplaceError::NotLanded)?;
 
-    let tmp = unique_tmp_sibling(path)?;
+    let tmp = unique_tmp_sibling(path, parent)?;
 
     // Everything from here on must clean up `tmp` before returning an error,
     // or a crash-looping caller litters the directory — which for the DM store
-    // is not merely untidy: the record directory's fixed-size, fixed-count
-    // shape is the privacy argument that stops it leaking pending volume.
-    let result = write_and_commit(&tmp, path, bytes, durability);
+    // is not merely untidy: the record directory's shape is the privacy
+    // argument that stops it leaking pending volume (bounded as the module docs
+    // record — this covers returned errors, not killed processes).
+    //
+    // On a `LandedNotDurable` the sibling has already been renamed away, so the
+    // removal is a harmless no-op; it never touches the destination.
+    let result = write_and_commit(&tmp, path, parent, bytes, durability);
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
     result
 }
 
+/// The directory a sibling temp file can be placed in, or [`AtomicReplaceError::NoParent`].
+fn parent_dir(path: &Path) -> Result<&Path, AtomicReplaceError> {
+    path.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| AtomicReplaceError::NoParent(path.to_path_buf()))
+}
+
+/// `create_dir_all`, but with the directory entries it creates made durable.
+///
+/// [`std::fs::create_dir_all`] returns as soon as the directories are visible
+/// to this process. The entry naming a newly created directory inside *its own*
+/// parent is buffered like any other write, so a power cut can lose the whole
+/// directory — and with it a record whose write already returned `Ok` and whose
+/// emission the caller therefore treated as proven. That is exactly the first
+/// write into a new correspondence directory (`dm/corr-01/resume.bin`), where
+/// commit-then-emit is at its most load-bearing.
+///
+/// So each missing ancestor is created on its own and its parent fsynced before
+/// descending. The walk runs shallowest-first, so more than one missing level
+/// (`dm/` and `dm/corr-01/` both absent) is covered, not just the last one.
+fn create_dir_all_durable<D: Durability>(dir: &Path, durability: &D) -> std::io::Result<()> {
+    // Walk up from the target to the deepest ancestor that already exists,
+    // collecting what is missing (deepest-first).
+    let mut missing: Vec<&Path> = Vec::new();
+    let mut cursor = dir;
+    while !cursor.exists() {
+        missing.push(cursor);
+        match cursor.parent().filter(|p| !p.as_os_str().is_empty()) {
+            Some(parent) => cursor = parent,
+            None => break,
+        }
+    }
+
+    for created in missing.iter().rev() {
+        match std::fs::create_dir(created) {
+            Ok(()) => {}
+            // A concurrent writer won the race. The entry is that writer's to
+            // make durable, not ours — fsyncing here would be harmless but the
+            // barrier belongs with the create that actually happened.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+        // A relative first component has no named parent; the working directory
+        // is the one that gained the entry.
+        let entry_holder = created
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        durability.sync_dir(entry_holder)?;
+    }
+    Ok(())
+}
+
 fn write_and_commit<D: Durability>(
     tmp: &Path,
     path: &Path,
+    parent: &Path,
     bytes: &[u8],
     durability: &D,
 ) -> Result<(), AtomicReplaceError> {
-    let mut file = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(tmp)?;
-    file.write_all(bytes)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    // `create_new` alone yields 0666 & ~umask — typically 0644 — and the rename
+    // carries the TEMP file's mode onto the destination, discarding the old
+    // inode's entirely. Without this line the first replacement of a record
+    // hardened to 0600 would silently widen it back to world-readable.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(tmp).map_err(AtomicReplaceError::NotLanded)?;
+    file.write_all(bytes)
+        .map_err(AtomicReplaceError::NotLanded)?;
 
     // Barrier 1: the data is durable before any name points at it.
-    durability.sync_file(&file)?;
+    durability
+        .sync_file(&file)
+        .map_err(AtomicReplaceError::NotLanded)?;
     drop(file);
 
     // Windows cannot rename onto an existing file. This opens a window in
     // which `path` does not exist — the reason the module docs record the
-    // Windows guarantee as weaker.
+    // Windows guarantee as weaker. A failure of the removal itself is still
+    // `NotLanded`: the destination keeps its previous contents.
     #[cfg(not(unix))]
     if path.exists() {
-        std::fs::remove_file(path)?;
+        std::fs::remove_file(path).map_err(AtomicReplaceError::NotLanded)?;
     }
 
-    std::fs::rename(tmp, path)?;
+    // Past this point the destination may already hold the new bytes, so no
+    // later failure may be reported as "nothing happened".
+    std::fs::rename(tmp, path).map_err(AtomicReplaceError::Indeterminate)?;
 
     // Barrier 2: the *name* is durable. Only reachable on Unix in any
     // meaningful sense; see `RealDurability::sync_dir`.
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .ok_or_else(|| AtomicReplaceError::NoParent(path.to_path_buf()))?;
-    durability.sync_dir(parent)?;
+    durability
+        .sync_dir(parent)
+        .map_err(AtomicReplaceError::LandedNotDurable)?;
 
     Ok(())
 }
@@ -234,13 +457,9 @@ fn write_and_commit<D: Durability>(
 /// The suffix is drawn from the CSPRNG rather than a counter or a pid so that
 /// two processes — or one process crash-looping — cannot collide, and so an
 /// attacker cannot pre-create the path to make `O_EXCL` fail in a loop.
-fn unique_tmp_sibling(path: &Path) -> Result<PathBuf, AtomicReplaceError> {
+fn unique_tmp_sibling(path: &Path, parent: &Path) -> Result<PathBuf, AtomicReplaceError> {
     let mut suffix = [0u8; 12];
-    getrandom::fill(&mut suffix).map_err(|e| {
-        AtomicReplaceError::Io(std::io::Error::other(format!(
-            "csprng unavailable for temp-file suffix: {e}"
-        )))
-    })?;
+    getrandom::fill(&mut suffix).map_err(AtomicReplaceError::Entropy)?;
 
     let mut name = path
         .file_name()
@@ -248,10 +467,6 @@ fn unique_tmp_sibling(path: &Path) -> Result<PathBuf, AtomicReplaceError> {
         .to_os_string();
     name.push(format!(".tmp.{}", hex::encode(suffix)));
 
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .ok_or_else(|| AtomicReplaceError::NoParent(path.to_path_buf()))?;
     Ok(parent.join(name))
 }
 
@@ -276,11 +491,11 @@ impl FileLock {
     /// close the residual check-then-open window without a platform-specific
     /// dependency; that hardening is tracked alongside the same check in
     /// [`super::fetched`].)
-    pub fn acquire(lock_path: &Path) -> Result<Self, AtomicReplaceError> {
+    pub fn acquire(lock_path: &Path) -> Result<Self, LockError> {
         use fs4::fs_std::FileExt;
 
         if std::fs::symlink_metadata(lock_path).is_ok_and(|m| m.file_type().is_symlink()) {
-            return Err(AtomicReplaceError::UnsafePath(lock_path.to_path_buf()));
+            return Err(LockError::UnsafePath(lock_path.to_path_buf()));
         }
         if let Some(parent) = lock_path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)?;
@@ -303,51 +518,149 @@ mod tests {
     /// What a durability barrier was asked to do, in the order it was asked.
     #[derive(Debug, PartialEq, Eq)]
     enum Barrier {
-        File,
+        /// The data barrier, carrying the length the synced handle held — proof
+        /// the barrier saw the *new* bytes and not an empty file.
+        File {
+            synced_len: u64,
+        },
         Dir(PathBuf),
     }
 
-    #[derive(Default)]
+    /// What the destination must look like when each barrier runs.
+    struct Witness {
+        dest: PathBuf,
+        /// The destination's contents before the replacement, or `None` if it
+        /// did not exist.
+        before: Option<Vec<u8>>,
+        after: Vec<u8>,
+    }
+
+    /// Records the barriers *and observes the filesystem at each one*.
+    ///
+    /// Recording the order alone proves nothing about the ordering that matters:
+    /// the two barriers must straddle the rename, and a recorder that sees only
+    /// its own calls is satisfied identically if `sync_file` moves after the
+    /// rename or `sync_dir` moves before it — the exact two defects the module
+    /// docs call load-bearing. So the recorder asserts the destination state it
+    /// must be able to see from each side of the rename.
     struct Recorder {
         seen: Mutex<Vec<Barrier>>,
+        witness: Witness,
+    }
+
+    impl Recorder {
+        fn new(dest: &Path, before: Option<&[u8]>, after: &[u8]) -> Self {
+            Self {
+                seen: Mutex::new(Vec::new()),
+                witness: Witness {
+                    dest: dest.to_path_buf(),
+                    before: before.map(<[u8]>::to_vec),
+                    after: after.to_vec(),
+                },
+            }
+        }
+
+        fn barriers(&self) -> Vec<Barrier> {
+            std::mem::take(&mut *self.seen.lock().unwrap())
+        }
     }
 
     impl Durability for Recorder {
-        fn sync_file(&self, _file: &File) -> std::io::Result<()> {
-            self.seen.lock().unwrap().push(Barrier::File);
+        fn sync_file(&self, file: &File) -> std::io::Result<()> {
+            let synced_len = file.metadata()?.len();
+            self.seen.lock().unwrap().push(Barrier::File { synced_len });
+
+            // Pre-rename: the destination must still be exactly as it was.
+            match &self.witness.before {
+                Some(previous) => assert_eq!(
+                    &std::fs::read(&self.witness.dest).unwrap(),
+                    previous,
+                    "the data barrier must run BEFORE the rename — the destination \
+                     already holds the new bytes here"
+                ),
+                None => assert!(
+                    !self.witness.dest.exists(),
+                    "the data barrier must run BEFORE the rename — the destination \
+                     already exists here"
+                ),
+            }
             Ok(())
         }
+
         fn sync_dir(&self, dir: &Path) -> std::io::Result<()> {
             self.seen
                 .lock()
                 .unwrap()
                 .push(Barrier::Dir(dir.to_path_buf()));
+
+            // Only the destination's own parent is fsynced after the rename;
+            // barriers for freshly created ancestors run before anything is
+            // written, so they are not evidence either way.
+            if Some(dir) == self.witness.dest.parent() {
+                assert_eq!(
+                    std::fs::read(&self.witness.dest).unwrap(),
+                    self.witness.after,
+                    "the name barrier must run AFTER the rename — the destination \
+                     does not hold the new bytes yet"
+                );
+            }
             Ok(())
         }
     }
 
     /// The positive control for the whole module: both barriers are performed,
-    /// in the order file-then-directory, against the target's own parent.
+    /// in the order file-then-directory, against the target's own parent, and —
+    /// the part that actually matters — one on each side of the rename.
     ///
     /// An fsync leaves no filesystem trace, so without this assertion every
     /// other test here would pass just as happily with both `sync_all` calls
-    /// deleted — a broken probe that reads exactly like a passing one. Deleting
-    /// either barrier from `RealDurability` is invisible; deleting either call
-    /// site fails *this* test.
+    /// deleted, or with either call site moved across the rename — a broken
+    /// probe that reads exactly like a passing one.
     #[test]
     fn both_durability_barriers_are_performed_in_order() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("record.bin");
-        let recorder = Recorder::default();
+        std::fs::write(&path, b"a much longer previous value").unwrap();
+        let recorder = Recorder::new(&path, Some(b"a much longer previous value"), b"committed");
 
         replace_atomically_with(&path, b"committed", &recorder).unwrap();
 
-        let seen = recorder.seen.lock().unwrap();
         assert_eq!(
-            *seen,
-            vec![Barrier::File, Barrier::Dir(dir.path().to_path_buf())],
+            recorder.barriers(),
+            vec![
+                Barrier::File {
+                    synced_len: b"committed".len() as u64
+                },
+                Barrier::Dir(dir.path().to_path_buf()),
+            ],
             "the data barrier must precede the name barrier, and the name \
              barrier must target the destination's own parent directory"
+        );
+    }
+
+    /// The seam is only as honest as the argument the public entry point passes
+    /// through it. Swapping `RealDurability` for a no-op leaves no filesystem
+    /// trace, so nothing else in this module would notice.
+    #[test]
+    fn the_public_entry_point_drives_the_real_barriers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("record.bin");
+
+        let files_before = REAL_FILE_SYNCS.load(Ordering::Relaxed);
+        let dirs_before = REAL_DIR_SYNCS.load(Ordering::Relaxed);
+
+        replace_atomically(&path, b"real").unwrap();
+
+        // Other tests in this binary run concurrently and can only inflate the
+        // counters, never hold them back — so a strict increase is the whole
+        // claim: the public path performed real barriers.
+        assert!(
+            REAL_FILE_SYNCS.load(Ordering::Relaxed) > files_before,
+            "replace_atomically must drive RealDurability's data barrier"
+        );
+        assert!(
+            REAL_DIR_SYNCS.load(Ordering::Relaxed) > dirs_before,
+            "replace_atomically must drive RealDurability's name barrier"
         );
     }
 
@@ -384,6 +697,39 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"resume");
     }
 
+    /// A directory is an entry in its own parent. Creating `dm/corr-01/` and
+    /// fsyncing only `corr-01` leaves the entries naming `dm` and `corr-01`
+    /// buffered, so a power cut takes the whole correspondence directory while
+    /// the write has already returned `Ok` and the caller has emitted.
+    #[test]
+    fn each_newly_created_ancestor_directory_is_made_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let dm = dir.path().join("dm");
+        let corr = dm.join("corr-01");
+        let path = corr.join("resume.bin");
+        let recorder = Recorder::new(&path, None, b"resume");
+
+        replace_atomically_with(&path, b"resume", &recorder).unwrap();
+
+        assert_eq!(
+            recorder.barriers(),
+            vec![
+                // the entry naming `dm`, in the tempdir
+                Barrier::Dir(dir.path().to_path_buf()),
+                // the entry naming `corr-01`, in `dm`
+                Barrier::Dir(dm.clone()),
+                Barrier::File {
+                    synced_len: b"resume".len() as u64
+                },
+                // the entry naming the record itself
+                Barrier::Dir(corr.clone()),
+            ],
+            "every ancestor this call created must have its own parent fsynced, \
+             shallowest first, before the record is written"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"resume");
+    }
+
     /// The record directory's shape is a privacy argument — a directory whose
     /// entry count tracks pending volume leaks it. Temp siblings must never
     /// survive a successful write.
@@ -404,7 +750,7 @@ mod tests {
     }
 
     /// A failure after the temp file exists must not litter, and must leave the
-    /// destination exactly as it was.
+    /// destination exactly as it was — which is what `NotLanded` promises.
     #[test]
     fn a_failed_commit_cleans_up_and_leaves_the_destination_untouched() {
         struct FailingFileBarrier;
@@ -422,7 +768,7 @@ mod tests {
         std::fs::write(&path, b"previous").unwrap();
 
         let err = replace_atomically_with(&path, b"never lands", &FailingFileBarrier).unwrap_err();
-        assert!(matches!(err, AtomicReplaceError::Io(_)));
+        assert!(matches!(err, AtomicReplaceError::NotLanded(_)));
 
         assert_eq!(
             std::fs::read(&path).unwrap(),
@@ -440,6 +786,105 @@ mod tests {
         );
     }
 
+    /// The case a single `Io` variant got exactly backwards: the rename has
+    /// already succeeded, so the new bytes are readable by every concurrent
+    /// reader. Reporting this as a plain failure would leave the caller holding
+    /// generation n and emitting nothing while the disk holds n+1.
+    #[test]
+    fn a_failed_name_barrier_reports_that_the_bytes_already_landed() {
+        struct FailingDirBarrier;
+        impl Durability for FailingDirBarrier {
+            fn sync_file(&self, _file: &File) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn sync_dir(&self, _dir: &Path) -> std::io::Result<()> {
+                Err(std::io::Error::other("simulated directory fsync failure"))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("record.bin");
+        std::fs::write(&path, b"previous").unwrap();
+
+        let err = replace_atomically_with(&path, b"landed", &FailingDirBarrier).unwrap_err();
+        assert!(
+            matches!(err, AtomicReplaceError::LandedNotDurable(_)),
+            "a barrier that runs after the rename cannot report the write as not landed"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"landed",
+            "the rename succeeded before the barrier failed, so the new bytes are readable"
+        );
+
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![std::ffi::OsString::from("record.bin")],
+            "the sibling was renamed away; the cleanup must not litter or delete the destination"
+        );
+    }
+
+    /// `Indeterminate` is the variant whose whole purpose is telling the caller
+    /// to re-read before emitting, and it is the one the `Durability` seam
+    /// cannot reach — the seam wraps the two barriers, not `rename(2)`. A real
+    /// rename failure is inducible without it: `rename` refuses to replace a
+    /// directory with a file, so a destination that is a non-empty directory
+    /// drives the genuine syscall error rather than a simulated one.
+    #[test]
+    fn a_rename_that_cannot_complete_is_reported_as_indeterminate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("record.bin");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("occupant"), b"in the way").unwrap();
+
+        let err = replace_atomically(&path, b"never lands").unwrap_err();
+        assert!(
+            matches!(err, AtomicReplaceError::Indeterminate(_)),
+            "a failed rename must tell the caller the destination state is unknown, got {err:?}"
+        );
+
+        assert!(
+            path.join("occupant").exists(),
+            "the failed rename must not have disturbed the destination"
+        );
+        let siblings: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            siblings,
+            vec![std::ffi::OsString::from("record.bin")],
+            "the temp sibling must still be cleaned up on the indeterminate path"
+        );
+    }
+
+    /// The rename carries the TEMP file's mode onto the destination, discarding
+    /// the old inode's. A default-mode temp file therefore *widens* a hardened
+    /// record on its next replacement — silently, and only once someone bothers
+    /// to harden it.
+    #[cfg(unix)]
+    #[test]
+    fn a_replacement_does_not_widen_the_destinations_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("record.bin");
+        std::fs::write(&path, b"previous").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        replace_atomically(&path, b"next").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the replacement must not hand the destination a wider mode than it had"
+        );
+    }
+
     #[test]
     fn a_path_without_a_parent_is_rejected_rather_than_written_somewhere() {
         let err = replace_atomically(Path::new("bare-name"), b"x").unwrap_err();
@@ -450,9 +895,10 @@ mod tests {
     fn temp_siblings_are_unique_across_calls() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("record.bin");
+        let parent = path.parent().unwrap();
 
-        let a = unique_tmp_sibling(&path).unwrap();
-        let b = unique_tmp_sibling(&path).unwrap();
+        let a = unique_tmp_sibling(&path, parent).unwrap();
+        let b = unique_tmp_sibling(&path, parent).unwrap();
 
         assert_ne!(a, b, "a collision would make O_EXCL fail spuriously");
         assert_eq!(
@@ -516,6 +962,6 @@ mod tests {
         }
 
         let err = FileLock::acquire(&link).unwrap_err();
-        assert!(matches!(err, AtomicReplaceError::UnsafePath(_)));
+        assert!(matches!(err, LockError::UnsafePath(_)));
     }
 }
