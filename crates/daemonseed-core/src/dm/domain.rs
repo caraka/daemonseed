@@ -123,6 +123,35 @@ pub const DM_PROVISIONAL_BIND_SALT: &[u8] = b"daemonseed/dm/provisional/bind-sal
 /// FROZEN.
 pub const DM_PROVISIONAL_BIND: &[u8] = b"daemonseed/dm/provisional/bind/v1";
 
+/// HKDF-Extract salt for the DM record store's at-rest seal key, rooted in the
+/// profile's at-rest key material — the same root [`DM_PROVISIONAL_SALT`] uses,
+/// under its own salt so the two extractions over that one input cannot collide.
+/// FROZEN.
+pub const DM_STORE_SALT: &[u8] = b"daemonseed/dm/store/salt/v1";
+
+/// HKDF-Expand `info` for the DM record store's AES-256-GCM seal key
+/// ([`crate::storage::dm_store`]).
+///
+/// **Its own label rather than [`DM_PROVISIONAL_SEAL`]'s.** That key protects one
+/// record kind's contents; this one protects every record's slot in the store,
+/// including a provisional record the other key already sealed. One label for
+/// both would mean a store blob and a provisional record could open as each other
+/// wherever the two key inputs coincided — which, both being derived from the
+/// same profile at-rest material, is always. FROZEN.
+pub const DM_STORE_SEAL: &[u8] = b"daemonseed/dm/store/seal/v1";
+
+/// AAD prefix for a DM store record's at-rest seal. The correspondence label and
+/// the record-kind tag follow it, length-prefixed.
+///
+/// **Per-slot, where the key is only per-profile.** [`DM_STORE_SEAL`] derives ONE
+/// key for a whole profile, so without this binding every file in the store is an
+/// interchangeable ciphertext: copy one correspondence's resume record over
+/// another's and it opens cleanly, or drop an outbox into a resume slot of the
+/// same size and it opens as state. Binding what the store *expects* the file to
+/// be is what makes both splices fail to authenticate. The same construction as
+/// [`DM_PROVISIONAL_AAD`], for the same reason. FROZEN.
+pub const DM_STORE_AAD: &[u8] = b"daemonseed/dm/store/aad/v1";
+
 /// Signature domain binding a per-contact pseudonym key to the long-term identity
 /// that vouches for it, signed under the LONG-TERM key. FROZEN.
 pub const DM_BIND_LT: &[u8] = b"daemonseed/dm/bind/lt/v1";
@@ -261,6 +290,9 @@ const ALL: &[&[u8]] = &[
     DM_PROVISIONAL_AAD,
     DM_PROVISIONAL_BIND_SALT,
     DM_PROVISIONAL_BIND,
+    DM_STORE_SALT,
+    DM_STORE_SEAL,
+    DM_STORE_AAD,
     DM_BIND_LT,
     DM_MSG_SIG,
     DM_MSG_AAD,
@@ -305,6 +337,9 @@ mod tests {
             b"daemonseed/dm/provisional/bind-salt/v1"
         );
         assert_eq!(DM_PROVISIONAL_BIND, b"daemonseed/dm/provisional/bind/v1");
+        assert_eq!(DM_STORE_SALT, b"daemonseed/dm/store/salt/v1");
+        assert_eq!(DM_STORE_SEAL, b"daemonseed/dm/store/seal/v1");
+        assert_eq!(DM_STORE_AAD, b"daemonseed/dm/store/aad/v1");
         assert_eq!(DM_BIND_LT, b"daemonseed/dm/bind/lt/v1");
         assert_eq!(DM_MSG_SIG, b"daemonseed/dm/msg/sig/v6");
         assert_eq!(DM_MSG_AAD, b"daemonseed/dm/msg/aad/v4");

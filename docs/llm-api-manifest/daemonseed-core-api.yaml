@@ -226,6 +226,30 @@ modules:
     iscs:
       - C35
 
+  - name: daemonseed_core::storage::dm_store
+    description: >-
+      The DM at-rest store: one directory per correspondence, one fixed-size
+      file per RecordKind (Resume, Provisional, Outbox, ReceiveCursor) inside
+      it. DmStore::open derives the seal key from the profile at-rest key
+      (HKDF-SHA384 under DM_STORE_SALT/DM_STORE_SEAL) and sweeps orphaned temp
+      siblings. critical_section holds an flock across the whole closure and
+      yields a Locked guard carrying read/replace/delete/present, so a
+      read-modify-write cannot be written without the lock; entering one
+      establishes the correspondence on disk. read_unlocked and present_unlocked
+      answer without the lock and create nothing. A nested critical_section on
+      one label from one thread returns DmStoreError::Reentrant instead of
+      deadlocking. replace pads to the kind's bucket with CSPRNG filler behind a
+      length prefix carried inside the seal, and refuses an oversized payload;
+      ReceiveCursor is unsealed and must be exactly 8 bytes. AAD binds the
+      correspondence label and the record kind. Errors preserve atomic_file's
+      landed/not-landed distinction. CorrespondenceLabel is an opaque 32-byte
+      caller-supplied value; its derivation is unsettled (#288). One key per
+      profile, random nonces, no rotation (#289).
+    no_std: false
+    depends_on:
+      - daemonseed_core::storage::atomic_file
+    iscs: []
+
   - name: daemonseed_core::storage::atomic_file
     description: >-
       Durable atomic file replacement: temp sibling (O_CREAT|O_EXCL, CSPRNG

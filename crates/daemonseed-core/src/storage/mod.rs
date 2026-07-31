@@ -5,6 +5,10 @@
 //!   plus the `flock` used for cross-process exclusion. Distinct from the
 //!   tmp+rename idiom elsewhere in this module, which is crash-atomic but not
 //!   power-loss-durable.
+//! - [`dm_store`] (#286, Amendment A9) — the DM record store built over
+//!   [`atomic_file`]: one directory per correspondence, one fixed-size sealed
+//!   file per record kind, and a lock that brackets the whole read-modify-write
+//!   because both halves live on the guard it hands out.
 //! - [`seeds`] (M1, ISC-C3) — the AEAD-protected mnemonic + per-circle state
 //!   blob.
 //! - [`recovery_file`] (M2, ISC-C32) — the same KDF chain with a distinct
@@ -29,6 +33,7 @@
 
 pub mod atomic_file;
 pub mod cas;
+pub mod dm_store;
 pub mod fetched;
 pub mod manifest_digest;
 pub mod recovery_file;

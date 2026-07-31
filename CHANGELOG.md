@@ -26,6 +26,23 @@ work lives in the project lead's vault manifest, not here.
 
 ### Added
 
+- `daemonseed_core::storage::dm_store` — the DM at-rest store. `DmStore::open`
+  derives one seal key from the profile at-rest key (HKDF-SHA384 under the new
+  `DM_STORE_SALT` / `DM_STORE_SEAL` / `DM_STORE_AAD` labels) and sweeps orphaned
+  temp siblings (#286). `critical_section` holds an `flock` for the whole
+  closure and hands out a `Locked` guard carrying `read` / `replace` / `delete` /
+  `present`, so a read-modify-write cannot be spelled without the lock; entering
+  one establishes the correspondence. `read_unlocked` / `present_unlocked` ask
+  after a correspondence without taking the lock and without creating anything.
+  A nested `critical_section` on one label from one thread is
+  `DmStoreError::Reentrant` rather than a deadlock. Each `RecordKind` has a
+  fixed on-disk size and a payload capacity; `replace` pads to the bucket with
+  CSPRNG filler behind a length prefix inside the seal and refuses an oversized
+  payload rather than truncating. `ReceiveCursor` is unsealed and must be
+  exactly its 8 bytes. Errors preserve `atomic_file`'s landed/not-landed
+  distinction. One key per profile with random nonces and no rotation (#289).
+  (Amendment A9 build obligation, #281)
+
 - `daemonseed_core::storage::atomic_file` — durable atomic file replacement.
   `replace_atomically` writes a CSPRNG-suffixed temp sibling (`O_CREAT|O_EXCL`,
   mode 0600), fsyncs it, renames over the destination, and fsyncs the parent

@@ -96,6 +96,15 @@
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+
+/// The infix every temp sibling's name carries, between the target's name and
+/// the random suffix.
+///
+/// Shared with the store that sweeps them ([`super::dm_store::DmStore::open`]),
+/// so the writer and the sweeper cannot disagree about the name — a sweeper
+/// keyed on a string this module later changed would silently stop finding
+/// anything, and would read exactly like a directory with no orphans in it.
+pub(crate) const TMP_INFIX: &str = ".tmp.";
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -320,7 +329,16 @@ impl Durability for RealDurability {
 ///
 /// This does **not** take the [`FileLock`] — see the module docs for why a
 /// read-modify-write caller must hold it across both halves itself.
-pub fn replace_atomically(path: &Path, bytes: &[u8]) -> Result<(), AtomicReplaceError> {
+///
+/// **`pub(crate)`, deliberately.** It takes a path, and the DM record store's
+/// first invariant is that a record's path is *derived* from its kind and its
+/// correspondence rather than passed — so a write to the wrong record is
+/// unrepresentable. Left public with this signature it is a second door into the
+/// same directory with none of that on it, and none of the store's lock,
+/// fixed-size or sealing discipline either. In-crate callers outside the store
+/// still reach it; [`FileLock`] stays public because holding a lock is the
+/// caller's business wherever it happens.
+pub(crate) fn replace_atomically(path: &Path, bytes: &[u8]) -> Result<(), AtomicReplaceError> {
     replace_atomically_with(path, bytes, &RealDurability)
 }
 
@@ -465,7 +483,7 @@ fn unique_tmp_sibling(path: &Path, parent: &Path) -> Result<PathBuf, AtomicRepla
         .file_name()
         .ok_or_else(|| AtomicReplaceError::NoParent(path.to_path_buf()))?
         .to_os_string();
-    name.push(format!(".tmp.{}", hex::encode(suffix)));
+    name.push(format!("{TMP_INFIX}{}", hex::encode(suffix)));
 
     Ok(parent.join(name))
 }
