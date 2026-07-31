@@ -63,7 +63,7 @@ use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::suite::{Registry, SuiteId, SuiteIdError, WriteRefusal};
-use crate::identity::mnemonic::{Mnemonic, MnemonicError};
+use crate::identity::mnemonic::{MAX_PHRASE_LEN, Mnemonic, MnemonicError};
 use crate::kdf::info;
 use crate::profile::config::ArgonParams;
 
@@ -285,6 +285,49 @@ pub struct PublishedShare {
     pub name: Option<String>,
 }
 
+/// The at-rest payload's line prefixes, including the leading newline.
+///
+/// Named because each is used twice — once by [`Seeds::plaintext_capacity`] to
+/// size the buffer and once by [`Seeds::to_plaintext`] to write the line — and a
+/// prefix that grew in the writer without growing in the sizer is exactly the
+/// under-reservation that brings back the reallocation residue #263 is about.
+/// Sharing the constant makes that particular drift impossible rather than
+/// merely unlikely.
+///
+/// The reader in [`Seeds::from_plaintext`] does NOT share these: it matches
+/// against a `&str` already split on newlines, so its prefixes have no leading
+/// `\n` and are a different set of strings. The round-trip tests are what hold
+/// the two halves together.
+mod line {
+    pub const SEND_COUNTER: &str = "\nsend-counter ";
+    pub const SEEN: &str = "\nseen ";
+    pub const MUTE: &str = "\nmute ";
+    pub const HIDE: &str = "\nhide ";
+    pub const NAME: &str = "\nname ";
+    pub const CIRCLE: &str = "\ncircle ";
+    pub const SHARE: &str = "\nshare ";
+    pub const PUBLISH: &str = "\npublish ";
+    pub const ANNOUNCE_SEEN: &str = "\nannounce-seen ";
+    pub const CIRCLE_SEEN: &str = "\ncircle-seen ";
+}
+
+/// Append `bytes` to `out` as lowercase hex, allocating nothing.
+///
+/// Replaces `hex::encode` at every site in [`Seeds::to_plaintext`], secret or
+/// not. `hex::encode` returns an owned `String` which is then copied into the
+/// payload and dropped with its contents intact — for a circle entropy that is a
+/// freed buffer holding the hex of the `cot_key` IKM (#263). Writing into the
+/// caller's buffer produces no such transient. Byte-for-byte identical to
+/// `hex::encode` for the same input, which is what lets `from_plaintext`'s
+/// `hex::decode` keep reading it.
+fn push_hex(out: &mut String, bytes: &[u8]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for &b in bytes {
+        out.push(char::from(HEX[usize::from(b >> 4)]));
+        out.push(char::from(HEX[usize::from(b & 0x0f)]));
+    }
+}
+
 /// One remembered circle in the at-rest blob (ISC-C59 persistence, M13).
 ///
 /// Holds the minimum needed to rejoin without re-typing: the canonicalized
@@ -302,7 +345,24 @@ pub struct PublishedShare {
 /// `PartialEq` / `Eq` are not implemented: nothing compares whole
 /// `PersistedCircle`s, and deriving equality onto a secret-bearing type invites
 /// copies of the secret into comparison sites for no benefit. (#259)
-#[derive(Clone)]
+///
+/// **`Zeroize`/`ZeroizeOnDrop` are derived, and that is a different property from
+/// the one `Zeroizing<String>` on `entropy` already gives (#267).** The field type
+/// covers `entropy` and only `entropy`; a secret field added later as a bare
+/// `String` would be released unwiped, and nothing would say so. The derive makes
+/// the wipe the default for every field: the generated `Drop` destructures `Self`
+/// with all fields bound and calls `zeroize()` on each, so a new field is wiped
+/// unless someone writes an explicit `#[zeroize(skip)]` on it. There are no such
+/// lines here — `label` is display text rather than a secret, but wiping it costs
+/// one memset and leaving it unskipped is one less line for a future author to
+/// copy onto a field that did need wiping.
+///
+/// The precise limit, since it is easy to overstate: a field is wiped if its type
+/// has a `Zeroize` impl reachable by method resolution — `String`, `Vec<u8>`,
+/// `[u8; N]`, and `Box<[u8; N]>` (no impl of its own, but it derefs to one) all
+/// qualify. A field whose type has none does not compile. See the same note on
+/// [`crate::dm::firstcontact::VerifiedFirstContact`].
+#[derive(Clone, Zeroize, zeroize::ZeroizeOnDrop)]
 pub struct PersistedCircle {
     /// Canonicalized circle entropy (NFKC + whitespace-folded, ISC-C9). This is
     /// the IKM the `cot_key` derivation (ISC-C8) re-runs on rejoin.
@@ -613,77 +673,207 @@ impl Seeds {
         true
     }
 
-    fn to_plaintext(&self) -> String {
-        let mut s = self.mnemonic.to_phrase();
+    /// An upper bound on the byte length of [`Self::to_plaintext`]'s output.
+    ///
+    /// An upper bound, not the exact length: integers are sized at their widest
+    /// decimal form and the mnemonic at [`MAX_PHRASE_LEN`], so a real payload is
+    /// shorter by a few hundred bytes at most. That is the right trade — the
+    /// reservation only has to be large enough that the buffer never grows, and
+    /// computing exact decimal widths would add arithmetic that could itself be
+    /// wrong in the under-counting direction.
+    ///
+    /// Every line's own prefix is measured from the same [`line`] constant the
+    /// writer uses, so a prefix that changes length cannot leave the reservation
+    /// behind. What this function does NOT protect against is a *new* line kind
+    /// added to the writer and not to this function; the reallocation assertion in
+    /// `to_plaintext` is what catches that, and it is why the assertion is there
+    /// rather than being left as a comment.
+    fn plaintext_capacity(&self) -> usize {
+        // Widest decimal renderings: `u64::MAX` is 20 digits, and `i64::MIN` is 19
+        // digits plus a sign, also 20.
+        const MAX_U64_DIGITS: usize = 20;
+        const MAX_I64_DIGITS: usize = 20;
+
+        let mut cap = MAX_PHRASE_LEN;
         if self.counters.send_counter != 0 {
-            s.push_str(&format!("\nsend-counter {}", self.counters.send_counter));
+            cap += line::SEND_COUNTER.len() + MAX_U64_DIGITS;
         }
-        for (target, counter) in &self.counters.seen {
-            s.push_str(&format!("\nseen {target} {counter}"));
+        for target in self.counters.seen.keys() {
+            cap += line::SEEN.len() + target.len() + 1 + MAX_U64_DIGITS;
         }
         for handle in &self.muted {
-            s.push_str(&format!("\nmute {handle}"));
+            cap += line::MUTE.len() + handle.len();
         }
         for handle in &self.hidden_shares {
-            s.push_str(&format!("\nhide {handle}"));
+            cap += line::HIDE.len() + handle.len();
         }
-        // Display name (ISC-C4b, M13): rest-of-line value; newlines are refused
-        // at the setter so this never injects a spurious directive.
         if let Some(name) = &self.display_name {
-            s.push_str(&format!("\nname {name}"));
+            cap += line::NAME.len() + name.len();
         }
-        // Circles (ISC-C59 persistence, M13): both fields are hex-encoded so a
-        // space- or newline-containing entropy/label can never split the line
-        // or inject a directive. Layout: `circle <hex(entropy)> <hex(label)>`.
         for c in &self.circles {
-            s.push_str(&format!(
-                "\ncircle {} {}",
-                hex::encode(c.entropy().as_bytes()),
-                hex::encode(c.label.as_bytes()),
-            ));
+            cap += line::CIRCLE.len() + 2 * c.entropy().len() + 1 + 2 * c.label.len();
         }
-        // Shares (ISC-C21 persistence, M14): both fields hex-encoded so a path
-        // or label with spaces/newlines never splits the line. A `None` label
-        // serializes as empty hex. Layout: `share <hex(root)> <hex(label)>`.
         for sh in &self.shares {
-            s.push_str(&format!(
-                "\nshare {} {}",
-                hex::encode(sh.root.as_bytes()),
-                hex::encode(sh.label.as_deref().unwrap_or("").as_bytes()),
-            ));
+            cap += line::SHARE.len()
+                + 2 * sh.root.len()
+                + 1
+                + 2 * sh.label.as_deref().unwrap_or("").len();
         }
-        // Published shares (publish-intent persistence): hex-encoded path so a
-        // path with spaces/newlines never splits the line. Layout is additive —
-        // `publish <hex(root)>` when there is no wire-facing name (legacy form),
-        // `publish <hex(root)> <hex(name)>` when there is. A reader of either form
-        // round-trips (see `from_plaintext`).
         for ps in &self.published {
-            match &ps.name {
-                Some(name) => s.push_str(&format!(
-                    "\npublish {} {}",
-                    hex::encode(ps.root.as_bytes()),
-                    hex::encode(name.as_bytes()),
-                )),
-                None => s.push_str(&format!("\npublish {}", hex::encode(ps.root.as_bytes()))),
+            cap += line::PUBLISH.len() + 2 * ps.root.len();
+            if let Some(name) = &ps.name {
+                cap += 1 + 2 * name.len();
             }
         }
-        // Per-relay announcements/MOTD seen marker (#93): one line per entry,
-        // `announce-seen <server_id> <marker>`. Both tokens are whitespace-free
-        // (guarded at the setter), so a two-token split round-trips; the BTreeMap
-        // iterates in deterministic key order. Client-local only (ISC-A-C3).
         for (server_id, marker) in &self.announce_seen {
-            s.push_str(&format!("\nannounce-seen {server_id} {marker}"));
+            cap += line::ANNOUNCE_SEEN.len() + server_id.len() + 1 + marker.len();
         }
-        // Per-circle read high-water (#107): `circle-seen <hex(entropy)> <ms>`. The
-        // entropy is hex-encoded (it is a phrase with spaces); `ms` is a plain i64.
-        // Additive — an older blob with no such line parses to an empty map.
-        for (entropy, ms) in &self.circle_seen {
-            s.push_str(&format!(
-                "\ncircle-seen {} {ms}",
-                hex::encode(entropy.as_bytes())
-            ));
+        for entropy in self.circle_seen.keys() {
+            cap += line::CIRCLE_SEEN.len() + 2 * entropy.len() + 1 + MAX_I64_DIGITS;
         }
-        s
+        cap
+    }
+
+    /// Serialize the whole at-rest payload into one buffer that is reserved once
+    /// and wipes itself.
+    ///
+    /// **What the shape of this function is for (#263).** The payload is the
+    /// 24-word mnemonic plus every circle entropy — secret from its first line
+    /// onward. The earlier version grew a `String` by `push_str`, so each
+    /// reallocation `memcpy`d the accumulated secret into a new block and released
+    /// the old one untouched, and each hex-encoded field spent two short-lived
+    /// `String`s (`hex::encode`, then `format!`) that were also dropped with
+    /// secret bytes in them. A final `zeroize()` reaches none of that; it reaches
+    /// the last buffer only. So: the capacity is computed first and reserved once
+    /// so the buffer never moves, the phrase is written straight in rather than
+    /// built and copied, integers go through `fmt::Write` (which writes into the
+    /// buffer and allocates nothing), and hex goes through [`push_hex`] instead of
+    /// `hex::encode` + `format!`.
+    ///
+    /// **What that does and does not achieve.** It removes the copies *this
+    /// function* would otherwise leave in freed heap. It does not make the
+    /// operation copy-free in any absolute sense, and nothing here should be read
+    /// as claiming so: the returned buffer is still handed to the AEAD and lives
+    /// as long as the caller keeps it, the allocator may hand a freed block to an
+    /// unrelated caller that only partly overwrites it, the page may be swapped,
+    /// and an SSD's FTL can remap a block out of reach of any process. Registers
+    /// and stack spills are outside safe Rust's reach entirely. The achievable bar
+    /// is that our own code leaves no un-zeroized copy on the normal path, and
+    /// that is the bar this meets.
+    ///
+    /// The return type carries the wipe rather than leaving it to a call the
+    /// caller might skip on an early return, and it covers an unwind out of the
+    /// assembly below.
+    fn to_plaintext(&self) -> Zeroizing<String> {
+        use core::fmt::Write as _;
+
+        let cap = self.plaintext_capacity();
+        let mut buf = Zeroizing::new(String::with_capacity(cap));
+        {
+            let s: &mut String = &mut buf;
+            // The address of the reservation. If any write below overruns `cap`,
+            // `String` reallocates and this pointer stops matching — which is the
+            // one observable difference between the fixed code and the bug.
+            let reserved = s.as_ptr();
+
+            self.mnemonic.write_phrase_into(s);
+            if self.counters.send_counter != 0 {
+                s.push_str(line::SEND_COUNTER);
+                let _ = write!(s, "{}", self.counters.send_counter);
+            }
+            for (target, counter) in &self.counters.seen {
+                s.push_str(line::SEEN);
+                s.push_str(target);
+                s.push(' ');
+                let _ = write!(s, "{counter}");
+            }
+            for handle in &self.muted {
+                s.push_str(line::MUTE);
+                s.push_str(handle);
+            }
+            for handle in &self.hidden_shares {
+                s.push_str(line::HIDE);
+                s.push_str(handle);
+            }
+            // Display name (ISC-C4b, M13): rest-of-line value; newlines are refused
+            // at the setter so this never injects a spurious directive.
+            if let Some(name) = &self.display_name {
+                s.push_str(line::NAME);
+                s.push_str(name);
+            }
+            // Circles (ISC-C59 persistence, M13): both fields are hex-encoded so a
+            // space- or newline-containing entropy/label can never split the line
+            // or inject a directive. Layout: `circle <hex(entropy)> <hex(label)>`.
+            for c in &self.circles {
+                s.push_str(line::CIRCLE);
+                push_hex(s, c.entropy().as_bytes());
+                s.push(' ');
+                push_hex(s, c.label.as_bytes());
+            }
+            // Shares (ISC-C21 persistence, M14): both fields hex-encoded so a path
+            // or label with spaces/newlines never splits the line. A `None` label
+            // serializes as empty hex. Layout: `share <hex(root)> <hex(label)>`.
+            for sh in &self.shares {
+                s.push_str(line::SHARE);
+                push_hex(s, sh.root.as_bytes());
+                s.push(' ');
+                push_hex(s, sh.label.as_deref().unwrap_or("").as_bytes());
+            }
+            // Published shares (publish-intent persistence): hex-encoded path so a
+            // path with spaces/newlines never splits the line. Layout is additive —
+            // `publish <hex(root)>` when there is no wire-facing name (legacy form),
+            // `publish <hex(root)> <hex(name)>` when there is. A reader of either form
+            // round-trips (see `from_plaintext`).
+            for ps in &self.published {
+                s.push_str(line::PUBLISH);
+                push_hex(s, ps.root.as_bytes());
+                if let Some(name) = &ps.name {
+                    s.push(' ');
+                    push_hex(s, name.as_bytes());
+                }
+            }
+            // Per-relay announcements/MOTD seen marker (#93): one line per entry,
+            // `announce-seen <server_id> <marker>`. Both tokens are whitespace-free
+            // (guarded at the setter), so a two-token split round-trips; the BTreeMap
+            // iterates in deterministic key order. Client-local only (ISC-A-C3).
+            for (server_id, marker) in &self.announce_seen {
+                s.push_str(line::ANNOUNCE_SEEN);
+                s.push_str(server_id);
+                s.push(' ');
+                s.push_str(marker);
+            }
+            // Per-circle read high-water (#107): `circle-seen <hex(entropy)> <ms>`. The
+            // entropy is hex-encoded (it is a phrase with spaces); `ms` is a plain i64.
+            // Additive — an older blob with no such line parses to an empty map.
+            for (entropy, ms) in &self.circle_seen {
+                s.push_str(line::CIRCLE_SEEN);
+                push_hex(s, entropy.as_bytes());
+                s.push(' ');
+                let _ = write!(s, "{ms}");
+            }
+
+            // `debug_assert`, not `assert`: an under-reservation is a hygiene
+            // failure, not a correctness one — the payload is still right and still
+            // seals — so panicking here in release would turn a residue into a lost
+            // persist, which is the worse outcome. Debug is where it needs to fire,
+            // because that is where the tests run: `to_plaintext_reserves_once…`
+            // exercises every line kind, so a new line kind added without a matching
+            // term in `plaintext_capacity` trips this rather than silently
+            // reintroducing the reallocation. The capacity assertion in that test is
+            // the half that still holds in a release build.
+            debug_assert_eq!(
+                s.as_ptr(),
+                reserved,
+                "the payload buffer was reallocated, so `plaintext_capacity` \
+                 under-counted and the secret was copied into freed heap (#263)"
+            );
+            debug_assert!(
+                s.len() <= cap,
+                "payload of {} bytes exceeds the reserved {cap}",
+                s.len()
+            );
+        }
+        buf
     }
 
     fn from_plaintext(s: &str) -> Result<Self, BlobError> {
@@ -1033,12 +1223,15 @@ pub fn seal_under(
 /// Argon2id again. The registry MUST contain `suite_id` and it MUST be
 /// write-eligible. Layout and AAD binding are identical to [`seal_under`].
 ///
-/// The final serialized plaintext buffer is held in [`Zeroizing`], so it is wiped
-/// on every path out of this function — the success path, the AEAD error path, and
-/// an unwind out of either. The *transient* buffers `to_plaintext` allocates while
-/// building it are not: it grows one `String` by `push_str`, so each reallocation
-/// frees a buffer still holding the accumulated secret, and each circle spends two
-/// short-lived `String`s on `hex::encode` + `format!` (#263).
+/// The serialized plaintext buffer is held in [`Zeroizing`], so it is wiped on
+/// every path out of this function — the success path, the AEAD error path, and an
+/// unwind out of either. That wipe now covers the whole buffer's history rather
+/// than only its final state: [`Seeds::to_plaintext`] reserves its capacity up
+/// front and writes into it, so the payload is never copied to a second block and
+/// the per-field `hex::encode` + `format!` transients are gone (#263). What
+/// remains outside its reach is stated on `to_plaintext` itself — the ciphertext
+/// and tag buffers below are not secret, but pages, the allocator's reuse of freed
+/// blocks, and register spills are beyond any of this.
 pub fn seal_with_key(
     seeds: &Seeds,
     key: &[u8; AEAD_KEY_LEN],
@@ -1052,11 +1245,12 @@ pub fn seal_with_key(
     let aes = Aes256Key::new(key).map_err(BlobError::AesKeyInit)?;
 
     // The serialized payload is the 24-word mnemonic plus every circle entropy in
-    // one `String`. `Zeroizing` carries the wipe rather than a positional
-    // `zeroize()` call, so it also covers an unwind out of the window below —
-    // `vec![0u8; len]` can panic on capacity overflow, and `gcm_encrypt` asserts
-    // on its own buffer lengths. (#259)
-    let plaintext_str = Zeroizing::new(seeds.to_plaintext());
+    // one `String`. `to_plaintext` hands it back already in `Zeroizing`, so the
+    // wipe is carried by the type rather than by a positional `zeroize()` call and
+    // covers an unwind out of the window below — `vec![0u8; len]` can panic on
+    // capacity overflow, and `gcm_encrypt` asserts on its own buffer lengths.
+    // (#259, #263)
+    let plaintext_str = seeds.to_plaintext();
     let plaintext = plaintext_str.as_bytes();
 
     let suite_bytes = suite_id.get().to_be_bytes();
@@ -1487,7 +1681,7 @@ mod tests {
         assert_eq!(seeds.display_name(), None);
         assert!(seeds.circles().is_empty());
         // Default state still serializes to the bare phrase (no directive lines).
-        assert_eq!(seeds.to_plaintext(), seeds.mnemonic.to_phrase());
+        assert_eq!(*seeds.to_plaintext(), seeds.mnemonic.to_phrase());
     }
 
     #[test]
@@ -1883,6 +2077,148 @@ mod tests {
         ) {
             Err(BlobError::AuthenticationFailed) => {}
             other => panic!("expected AuthenticationFailed, got {other:?}"),
+        }
+    }
+
+    /// A `Seeds` carrying at least one of every line kind `to_plaintext` writes.
+    ///
+    /// Exercising every kind is what makes the reservation tests mean anything: a
+    /// capacity term can only be caught missing by a payload that contains the line
+    /// it was supposed to size. Two of each, and values with awkward shapes
+    /// (spaces, a `None` label, an unnamed publish, a negative timestamp), because
+    /// the hex-encoded fields double in length and the legacy `publish` form takes
+    /// a different branch.
+    fn seeds_with_every_line_kind() -> Seeds {
+        let mut seeds = fresh_seeds();
+        seeds.counters.next_send();
+        seeds.counters.record_seen("alpha#aabbccddeeff", u64::MAX);
+        seeds.counters.record_seen("beta#001122334455", 7);
+        seeds.add_mute("two words#aabbccddeeff");
+        seeds.add_mute("gamma#665544332211");
+        seeds.add_hidden_share("delta#001122334455");
+        seeds.add_hidden_share("epsilon#ffeeddccbbaa");
+        seeds.set_display_name(Some("A Display Name".to_owned()));
+        seeds.add_circle("correct horse battery staple", "Book Club");
+        seeds.add_circle("another shared secret phrase", "Ops Room");
+        seeds.add_share("/srv/holiday pics", Some("Summer 2026".to_owned()));
+        seeds.add_share("/srv/docs", None);
+        seeds.add_published("/srv/holiday pics", Some("Summer 2026".to_owned()));
+        seeds.add_published("/srv/docs", None);
+        assert!(seeds.set_announce_seen("relay-one", "marker-one"));
+        assert!(seeds.set_announce_seen("relay-two", "marker-two"));
+        seeds.set_circle_seen("correct horse battery staple", i64::MAX);
+        seeds.set_circle_seen("another shared secret phrase", -1);
+        seeds
+    }
+
+    /// The payload buffer is reserved once and never grows (#263).
+    ///
+    /// The property is that the secret is assembled in ONE allocation, so no freed
+    /// block is left holding a partial copy of it. Two independent halves:
+    ///
+    /// - `to_plaintext`'s own `debug_assert` compares the buffer's address before
+    ///   and after assembly, so it fires on any reallocation. Removing the
+    ///   `String::with_capacity` reservation, or under-counting a term in
+    ///   `plaintext_capacity`, makes this test panic there.
+    /// - the returned buffer's capacity is still the reserved one, asserted here.
+    ///   This is the half that survives a release build, where `debug_assert` is
+    ///   compiled out — verified by running this test under `--release` against a
+    ///   build with the reservation removed, where it fails on `left: 1024` (a
+    ///   grown buffer) against `right: 1057` (the reservation).
+    ///
+    /// Both halves need a payload that actually contains every line kind, which is
+    /// what `seeds_with_every_line_kind` is for — a fresh `Seeds` serializes to the
+    /// bare phrase and would exercise one term out of ten.
+    ///
+    /// What this does NOT assert: that no allocation happens anywhere during the
+    /// call. It asserts that the buffer holding the secret is not among them.
+    #[test]
+    fn to_plaintext_reserves_once_and_never_reallocates() {
+        let seeds = seeds_with_every_line_kind();
+        let cap = seeds.plaintext_capacity();
+        let plain = seeds.to_plaintext();
+
+        // Control. If the payload were the bare phrase — or empty — the capacity
+        // assertions below would hold while proving nothing about the line kinds.
+        assert!(
+            plain.len() > MAX_PHRASE_LEN,
+            "the payload is no longer than a bare phrase, so no directive line was \
+             written and this test proves nothing: {} bytes",
+            plain.len()
+        );
+        for prefix in [
+            line::SEND_COUNTER,
+            line::SEEN,
+            line::MUTE,
+            line::HIDE,
+            line::NAME,
+            line::CIRCLE,
+            line::SHARE,
+            line::PUBLISH,
+            line::ANNOUNCE_SEEN,
+            line::CIRCLE_SEEN,
+        ] {
+            assert!(
+                plain.contains(prefix),
+                "no {prefix:?} line in the payload, so its capacity term is untested"
+            );
+        }
+
+        assert!(
+            plain.len() <= cap,
+            "payload of {} bytes overran the {cap}-byte reservation",
+            plain.len()
+        );
+        assert_eq!(
+            plain.capacity(),
+            cap,
+            "the payload buffer is not the one that was reserved — it either grew \
+             or was never reserved (#263)"
+        );
+    }
+
+    /// The reservation is an upper bound with real slack, not an accident of the
+    /// values this suite happens to use.
+    ///
+    /// `to_plaintext_reserves_once_and_never_reallocates` would still pass if
+    /// `plaintext_capacity` returned exactly the payload length by luck. This pins
+    /// the intent: integers are sized at their widest form and the mnemonic at
+    /// `MAX_PHRASE_LEN`, so the bound sits above the payload rather than on it.
+    #[test]
+    fn plaintext_capacity_is_an_upper_bound_not_an_exact_length() {
+        let seeds = seeds_with_every_line_kind();
+        let cap = seeds.plaintext_capacity();
+        let len = seeds.to_plaintext().len();
+
+        assert!(len < cap, "capacity {cap} is not above the payload {len}");
+        // And not absurdly above it — a bound that over-reserved by kilobytes per
+        // circle would pass the line above while wasting the buffer.
+        assert!(
+            cap - len < 512,
+            "capacity {cap} overshoots the payload {len} by {} bytes",
+            cap - len
+        );
+    }
+
+    /// `push_hex` is byte-identical to `hex::encode`, which is what lets
+    /// `from_plaintext`'s `hex::decode` keep reading what it writes (#263).
+    ///
+    /// Round-trip tests elsewhere would catch a mismatch, but only through a seal
+    /// and an open; this states the property directly and fails at the one line
+    /// that is wrong. The empty input matters — an unlabelled share serializes as
+    /// empty hex.
+    #[test]
+    fn push_hex_matches_hex_encode() {
+        for input in [
+            b"".as_slice(),
+            b"\x00".as_slice(),
+            b"\xff".as_slice(),
+            b"correct horse battery staple".as_slice(),
+            b"\x00\x01\x0f\x10\x7f\x80\xfe\xff".as_slice(),
+        ] {
+            let mut out = String::new();
+            push_hex(&mut out, input);
+            assert_eq!(out, hex::encode(input), "diverged on {input:?}");
         }
     }
 

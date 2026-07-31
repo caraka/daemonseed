@@ -23,13 +23,27 @@
 //! second benefit: the allocator hook applies only here, never to the crate's
 //! ~970 unit tests.
 //!
-//! The witness also covers the secrets the macro does not generate a wipe for:
-//! `PersistedCircle::entropy`, a `Zeroizing<String>` cleared before its buffer is
-//! released, and both of `VerifiedFirstContact`'s — `ss0`, a bare `[u8; SS0_LEN]`,
-//! and `body`, the decrypted message — each wiped by that struct's hand-written
-//! `Drop`. None is reachable from the compile-time `ZeroizeOnDrop` bound in
-//! `secret_seed.rs` — they are multi-field structs, not macro-generated newtypes —
-//! so this file is the only thing holding them to the property at all.
+//! The witness also covers the two secret-bearing structs the macro does not
+//! generate: `PersistedCircle` and `VerifiedFirstContact`. Both are now on
+//! `#[derive(Zeroize, ZeroizeOnDrop)]` rather than a hand-written `Drop` (#267),
+//! so the cases below watch every field either struct stores on the heap, not the
+//! one field a hand-written `Drop` happened to name — `PersistedCircle`'s
+//! `entropy` AND `label`, and `VerifiedFirstContact`'s `ss0` AND `body`.
+//!
+//! That widening is the point of the change, and it is why `label` is watched at
+//! all despite not being a secret. Under a hand-written `Drop` the test enumerated
+//! the same field names the code did, so the two shared one assumption and a field
+//! added to either struct was uncovered in both places at once. Under the derive
+//! the default is a wipe, and `label` is the case that holds the default: it is
+//! the field no author would think to add a `zeroize()` call for, and it is wiped.
+//!
+//! Neither struct carries a single `#[zeroize(skip)]`, so every field is wiped and
+//! there is no opt-out to review. Four of the six heap-resident ones are watched
+//! here (`entropy`, `label`, `ss0`, `body`) plus `pk_lt` as the `Box<[u8; N]>`
+//! shape; `pk_pc` and `eph_ek` are the same shape as `pk_lt` and are held by the
+//! same derive, and `seq`/`sent_unix_ms` are scalars this allocator hook cannot
+//! see. The compile-time bound in `secret_seed.rs` now names both structs; before
+//! this change it could not reach them at all.
 //!
 //! `VerifiedFirstContact`'s fields are private, because holding one is meant to be
 //! the proof that its seal opened and its signatures verified (#265). This file
@@ -85,6 +99,12 @@ const SEED_LEN: usize = 32;
 const CIRCLE_PHRASE_LEN: usize = 57;
 const CIRCLE_PHRASE_CAP: usize = 96;
 
+/// The circle label, and the capacity its buffer is built with. Slack again, and
+/// a capacity distinct from every other watched block here so the structural
+/// block-size control cannot be satisfied by the wrong allocation.
+const CIRCLE_LABEL_TEXT: &str = "the label is not a secret";
+const CIRCLE_LABEL_CAP: usize = 72;
+
 /// The decrypted message the `VerifiedFirstContact::body` case builds, and the
 /// length and capacity of its buffer. They differ for the same reason the circle
 /// phrase's do: the production body is decoded out of a padded plaintext and can
@@ -112,6 +132,9 @@ static CAPTURED: AtomicBool = AtomicBool::new(false);
 /// there, so nothing is ever captured afterwards; this records *why*, so the
 /// missing capture is not misread as a leak or a wrong accessor.
 static REALLOCATED: AtomicBool = AtomicBool::new(false);
+/// The `Box<[u8; PK_LEN]>` block behind `VerifiedFirstContact::pk_lt` — the
+/// public key's own heap allocation, exactly the array's size.
+const ML_DSA_PK_BLOCK: usize = PK_LEN;
 /// The bytes the watched block held at the moment it was freed.
 static SNAPSHOT: [AtomicU8; SNAPSHOT_CAP] = [const { AtomicU8::new(0) }; SNAPSHOT_CAP];
 /// The watch is one global slot, so the tests take turns.
@@ -408,25 +431,35 @@ fn inline_arm_secrets_are_zeroed_before_their_memory_is_released() {
     );
 }
 
-/// The two secrets the macro does not cover wipe themselves before their storage
-/// is released.
+/// Every heap-resident field of the two multi-field secret structs is zeroed
+/// before its storage is released.
 ///
-/// These are the sites the compile-time `ZeroizeOnDrop` bound in `secret_seed.rs`
-/// cannot reach: both are multi-field structs carrying one secret field beside
-/// plaintext ones, so neither is a macro-generated newtype and neither can carry
-/// the trait. They get there by different routes, and each case is the only thing
-/// holding its route:
+/// The sites the macro does not generate. Both structs now carry
+/// `#[derive(Zeroize, ZeroizeOnDrop)]` (#267), so the case list is driven by what
+/// the structs actually store rather than by which fields a hand-written `Drop`
+/// remembered:
 ///
-/// - `PersistedCircle::entropy` is a private [`Zeroizing`] `String`, so the wipe is
-///   the field type's. Widening it back to a bare `String` leaves the whole suite
-///   green but for this case.
-/// - `VerifiedFirstContact::ss0` is a bare `[u8; SS0_LEN]` wiped by a hand-written
-///   `Drop`. Deleting that `zeroize()` call leaves the whole suite green but for
-///   this case.
+/// - `PersistedCircle::entropy` is a private [`Zeroizing`] `String`. It has two
+///   independent wipes now — the field type's and the derive's — so this case no
+///   longer goes red on the loss of either alone. That is a strictly better state
+///   for the code and a weaker mutation signal for the test, which is why `label`
+///   below exists.
+/// - `PersistedCircle::label` is a plain `String` and is not a secret. It is here
+///   as the load-bearing case for the derive: nothing but the derive wipes it, so
+///   removing `Zeroize, ZeroizeOnDrop` from the struct leaves the whole suite green
+///   but for this case. It stands in for the secret field somebody adds next.
+/// - `VerifiedFirstContact::ss0` is a bare `[u8; SS0_LEN]`, wiped only by the
+///   derive. Removing the derive, or marking the field `#[zeroize(skip)]`, leaves
+///   the whole suite green but for this case.
 /// - `VerifiedFirstContact::body` is the decrypted message, wiped by the same
-///   hand-written `Drop`. It is a `String`, so it is watched as its own heap block
-///   rather than as a range inside the struct — the two secrets on one struct take
-///   two different routes through this witness (#266).
+///   derive. It is a `String`, so it is watched as its own heap block rather than
+///   as a range inside the struct — the two secrets on one struct take two
+///   different routes through this witness (#266).
+/// - `VerifiedFirstContact::pk_lt` is a public key, not a secret, and is the
+///   `Box<[u8; N]>` shape. It is `label`'s counterpart for boxed fields, and it
+///   pins the non-obvious half of the derive's reach: `Box<[u8; N]>` has no
+///   `Zeroize` impl of its own, and is covered anyway because the call derefs.
+///   Marking it `#[zeroize(skip)]` leaves the whole suite green but for this case.
 #[test]
 fn secrets_outside_the_macro_zero_themselves_before_their_memory_is_released() {
     init();
@@ -437,16 +470,38 @@ fn secrets_outside_the_macro_zero_themselves_before_their_memory_is_released() {
     // accessor yields the live bytes only, so the assertion covers
     // `CIRCLE_PHRASE_LEN` of the buffer; the block-size assertion is what proves
     // the buffer genuinely carried slack, i.e. that this is the production shape.
+    //
+    // Two wipes now stand behind this case — `Zeroizing<String>` on the field and
+    // the struct's derive — so it goes red only if BOTH are removed. `label` below
+    // is what holds the derive on its own.
     assert_zeroed_when_freed(
-        "PersistedCircle",
+        "PersistedCircle::entropy",
         (0, CIRCLE_PHRASE_CAP),
         || {
             let mut phrase = String::with_capacity(CIRCLE_PHRASE_CAP);
             phrase.push_str("correct horse battery staple correct horse battery staple");
             assert_eq!(phrase.len(), CIRCLE_PHRASE_LEN);
-            PersistedCircle::new(phrase, "the label is not a secret")
+            PersistedCircle::new(phrase, circle_label())
         },
         |c| c.entropy().as_bytes(),
+    );
+
+    // The same struct's other field, and the only case here whose subject is not a
+    // secret. It is watched precisely because nothing about it says "wipe me": it
+    // is public, it is display text, and no hand-written `Drop` would ever have
+    // named it. If it comes back zeroed, the wipe is the struct's default rather
+    // than a per-field decision — which is the whole property #267 asked for, and
+    // the one a future secret field will inherit. Watched the same way `entropy`
+    // is, as its own heap block at offset 0 with the capacity as the block size.
+    assert_zeroed_when_freed(
+        "PersistedCircle::label",
+        (0, CIRCLE_LABEL_CAP),
+        || {
+            let mut phrase = String::with_capacity(CIRCLE_PHRASE_CAP);
+            phrase.push_str("correct horse battery staple correct horse battery staple");
+            PersistedCircle::new(phrase, circle_label())
+        },
+        |c| c.label.as_bytes(),
     );
 
     // `ss0` is an inline `[u8; SS0_LEN]` field, so it is watched as a range at a
@@ -499,6 +554,40 @@ fn secrets_outside_the_macro_zero_themselves_before_their_memory_is_released() {
         },
         |v| v.body().as_bytes(),
     );
+
+    // The sender's long-term public key, which is not a secret and is the one
+    // case here whose subject is a `Box<[u8; N]>`. It earns its place twice over.
+    //
+    // First, it is the boxed counterpart of the `label` case: nothing but the
+    // struct's derive wipes it, so it holds the derive against a field shape a
+    // secret is very likely to arrive in — an ML-KEM decapsulation key or a
+    // sealed-frame buffer added to this struct later would be exactly this shape.
+    //
+    // Second, it pins a claim in the struct's own doc comment that is easy to get
+    // backwards, and that this file's author did get backwards once: zeroize 1.8
+    // has no `Zeroize for Box<[u8; N]>`, only `Box<[Z]>` and `Box<str>`, so the
+    // derive appears not to cover it — but `field.zeroize()` auto-derefs to the
+    // `[u8; N]` inside, which is covered, and the heap block is cleared in place.
+    // "Appears not to be covered, is covered" is exactly the kind of claim that
+    // wants a test rather than a comment.
+    //
+    // The `Box` owns its whole block, so this is offset 0 of a `PK_LEN` block,
+    // and the struct is left on the stack — the watched allocation is the box's,
+    // not the struct's.
+    assert_zeroed_when_freed(
+        "VerifiedFirstContact::pk_lt",
+        (0, ML_DSA_PK_BLOCK),
+        || verified_first_contact("the body is not a secret".to_owned()),
+        |v| v.pk_lt().as_slice(),
+    );
+}
+
+/// The circle label, in a buffer with deliberate slack so its block size is
+/// `CIRCLE_LABEL_CAP` rather than whatever an exact fit would give.
+fn circle_label() -> String {
+    let mut label = String::with_capacity(CIRCLE_LABEL_CAP);
+    label.push_str(CIRCLE_LABEL_TEXT);
+    label
 }
 
 /// One fully-populated witness, with the filler bytes the `ss0` case's structural

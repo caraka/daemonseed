@@ -116,6 +116,34 @@ work lives in the project lead's vault manifest, not here.
 
 ### Fixed
 
+- `VerifiedFirstContact` and `PersistedCircle` derive `Zeroize` +
+  `ZeroizeOnDrop` instead of naming fields in a hand-written `Drop`, with **no**
+  `#[zeroize(skip)]` on either. A field added later is now covered by
+  construction rather than by whoever remembers to extend the `Drop` — the old
+  arrangement had the test enumerating the same single field the code did, so
+  it looked like coverage while sharing the code's blind spot. The three boxed
+  public keys needed no exclusion: `Box<[u8; N]>` has no `Zeroize` impl, but the
+  derive's `field.zeroize()` auto-derefs to the array and clears the heap block
+  in place. The compile-time bound test now names both structs. **The
+  fail-closed property is honestly half:** a field with no reachable `Zeroize`
+  (`PathBuf`, `Uuid`, this crate's `boxed`-arm newtypes) is an `E0599` build
+  failure, while `String` / `Vec<u8>` / `[u8; N]` / `Box<[u8; N]>` silently
+  become wiped — the wanted outcome, but not a compile error. Both doc comments
+  say exactly that. (#267)
+
+- `Seeds::to_plaintext` assembles the at-rest payload into a single reservation
+  and returns `Zeroizing<String>`. It previously grew the buffer from the
+  mnemonic onward across ~10 `push_str` sites, each `format!` allocating a
+  secret-bearing transient, so every reallocation copied the bytes to a new
+  allocation and freed the old one untouched — beyond the reach of any later
+  `zeroize()`. Capacity is computed up front with line prefixes single-sourced
+  between the sizer and the writer, `push_hex` replaces every `hex::encode` +
+  `format!` pair, and `Mnemonic::write_phrase_into` means the phrase never
+  exists as its own `String`. A `debug_assert` compares the buffer pointer
+  across assembly. The comments state plainly that this removes *our own*
+  reallocation copies and nothing more: the buffer still outlives the call, and
+  allocator reuse, swap and FTL remap remain out of reach. (#263)
+
 - DM test fixtures no longer sit on page 0, where a `PagePosition`'s slot
   **equals** its sequence number and no test can tell the two apart. The
   crate's only coverage of slot misfiling —

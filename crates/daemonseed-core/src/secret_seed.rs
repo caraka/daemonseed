@@ -203,6 +203,31 @@ mod tests {
         assert_zeroize_on_drop::<crate::dm::ratchet::EphemeralDecapKey>();
     }
 
+    /// The two secret-bearing structs the macro does not generate also carry
+    /// `ZeroizeOnDrop` — now by derive rather than by a hand-written `Drop`
+    /// (#267).
+    ///
+    /// Kept separate from the sweep above because it asserts a different thing.
+    /// That one says every macro expansion still has the property. This one says
+    /// two multi-field structs, which the macro cannot reach, are on the derive at
+    /// all — and the derive is what makes a *newly added* secret field wiped by
+    /// default instead of silently unwiped. Losing the derive would leave both
+    /// types compiling and their existing secrets partly covered (`entropy` by
+    /// `Zeroizing`, `ss0` and `body` by nothing), which is why the loss needs
+    /// stating somewhere that fails.
+    ///
+    /// The bound is breadth only, exactly as above: it says the trait is there,
+    /// not that any byte reaches zero. `tests/secret_zeroize_on_drop.rs` is the
+    /// depth half for both types.
+    #[test]
+    #[allow(clippy::extra_unused_type_parameters)]
+    fn the_multi_field_secret_structs_are_zeroize_on_drop() {
+        fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+
+        assert_zeroize_on_drop::<crate::storage::seeds::PersistedCircle>();
+        assert_zeroize_on_drop::<crate::dm::firstcontact::VerifiedFirstContact>();
+    }
+
     /// Both arms render a redacted `Debug`.
     ///
     /// Exact-string equality, not a `contains("<redacted>")` check: a `Debug` that

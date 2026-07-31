@@ -31,6 +31,25 @@ const ENTROPY_BYTES: usize = 32;
 /// ISC-C2: word count is fixed at 24.
 pub const WORD_COUNT: usize = 24;
 
+/// The longest word in the BIP-39 English list, in bytes.
+///
+/// The list is a fixed, versioned artifact of BIP-39, so this is a property of
+/// the standard rather than of any release — but it is asserted against the
+/// actual list in this module's tests rather than trusted, because a wrong value
+/// here silently under-reserves [`MAX_PHRASE_LEN`]. Every English word is ASCII,
+/// so bytes and characters are the same count.
+pub const MAX_WORD_LEN: usize = 8;
+
+/// Upper bound on the byte length of a phrase from [`Mnemonic::to_phrase`] or
+/// [`Mnemonic::write_phrase_into`]: 24 words at up to 8 bytes each, plus the 23
+/// separating spaces.
+///
+/// An upper bound, not the exact length — words vary from 3 to 8 bytes, so a real
+/// phrase is shorter. It exists so a caller assembling a secret payload can
+/// reserve its buffer before the phrase goes into it, without first building the
+/// phrase to measure it (#263).
+pub const MAX_PHRASE_LEN: usize = WORD_COUNT * (MAX_WORD_LEN + 1) - 1;
+
 /// A 24-word BIP-39 English mnemonic.
 ///
 /// Construct via [`Mnemonic::generate`] (first-start) or
@@ -123,6 +142,27 @@ impl Mnemonic {
         self.0.to_string()
     }
 
+    /// Append the 24-word phrase to `out`, allocating nothing of its own.
+    ///
+    /// The same secret as [`Self::to_phrase`], reaching the caller's buffer
+    /// without a `String` in between. `bip39`'s `Display` writes each word
+    /// straight to the formatter, so the words land in `out` and nowhere else —
+    /// whereas `to_phrase` builds an owned `String` that the caller then copies
+    /// out of and drops, leaving the phrase in a freed buffer (#263). Callers
+    /// assembling a secret payload should prefer this; callers that genuinely
+    /// want an owned phrase should hold `to_phrase`'s result in `Zeroizing`.
+    ///
+    /// This removes one transient. It says nothing about `out` itself: if `out`
+    /// reallocates while growing, its own earlier buffers are freed with the
+    /// phrase in them. Reserving [`MAX_PHRASE_LEN`] before the first call is what
+    /// closes that half.
+    pub fn write_phrase_into(&self, out: &mut String) {
+        use core::fmt::Write as _;
+        // `String`'s `fmt::Write` is infallible — it returns `Err` only if the
+        // underlying writer can fail, and this one cannot.
+        let _ = write!(out, "{}", self.0);
+    }
+
     /// BIP-39 PBKDF2-HMAC-SHA512 derivation. Returns the 64-byte seed that
     /// HKDF then expands into ML-DSA-87 + ML-KEM-1024 keypairs (commit 5).
     ///
@@ -168,6 +208,63 @@ mod tests {
     // we use the all-zero entropy → "abandon ... art" vector).
     const ALL_ZEROS_PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
     const ALL_ZEROS_SEED_HEX: &str = "408b285c123836004f4b8842c89324c1f01382450c0d439af345ba7fc49acf705489c6fc77dbd4e3dc1dd8cc6bc9f043db8ada1e243c4a0eafb290d399480840";
+
+    // ── phrase-length bounds ─────────────────────────────────────────────
+
+    /// `MAX_WORD_LEN` is checked against the wordlist, not trusted.
+    ///
+    /// It is the load-bearing term in `MAX_PHRASE_LEN`, which `Seeds` reserves
+    /// against before writing the phrase into its payload buffer (#263). Too small
+    /// and that reservation is short, the buffer reallocates, and the residue the
+    /// reservation exists to prevent comes back — quietly, because the payload
+    /// would still be correct. The positive half of the assertion (some word is
+    /// exactly this long) is what stops a generously-rounded-up value from passing.
+    #[test]
+    fn max_word_len_matches_the_english_wordlist() {
+        let longest = bip39::Language::English
+            .word_list()
+            .iter()
+            .map(|w| w.len())
+            .max()
+            .expect("the BIP-39 English wordlist is not empty");
+        assert_eq!(
+            longest, MAX_WORD_LEN,
+            "MAX_WORD_LEN does not match the wordlist, so MAX_PHRASE_LEN is wrong"
+        );
+    }
+
+    /// `MAX_PHRASE_LEN` bounds a real phrase, and is reached by writing rather
+    /// than assumed.
+    #[test]
+    fn max_phrase_len_bounds_a_generated_phrase() {
+        let m = Mnemonic::generate().unwrap();
+
+        let mut written = String::new();
+        m.write_phrase_into(&mut written);
+
+        // The two phrase paths must agree, or reserving for one and writing the
+        // other proves nothing.
+        assert_eq!(written, m.to_phrase());
+        assert!(
+            written.len() <= MAX_PHRASE_LEN,
+            "phrase of {} bytes exceeds MAX_PHRASE_LEN of {MAX_PHRASE_LEN}",
+            written.len()
+        );
+        // Control: a bound far above any real phrase would pass the line above
+        // while making every reservation wasteful. 24 three-letter words plus 23
+        // spaces is the shortest phrase BIP-39 can produce.
+        assert!(written.len() >= WORD_COUNT * 4 - 1);
+    }
+
+    /// `write_phrase_into` appends rather than replacing — the payload builder in
+    /// `Seeds::to_plaintext` relies on it writing into a buffer it does not own.
+    #[test]
+    fn write_phrase_into_appends_to_existing_content() {
+        let m = Mnemonic::generate().unwrap();
+        let mut out = String::from("prefix\n");
+        m.write_phrase_into(&mut out);
+        assert_eq!(out, format!("prefix\n{}", m.to_phrase()));
+    }
 
     // ── generate ─────────────────────────────────────────────────────────
 

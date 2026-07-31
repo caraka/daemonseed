@@ -615,19 +615,75 @@ pub fn build(
 /// `Clone` is deliberately absent. It was derived while the fields were public
 /// and nothing used it; on a witness type a clone is a second copy of `ss0` and
 /// of the decrypted `body`, each needing its own wipe, for no caller's benefit.
+///
+/// **The wipe is a derive, not a hand-written `Drop` (#267).** The hand-written
+/// one enumerated the secret fields by name, so a secret field added later was
+/// unwiped unless its author remembered to extend it — and nothing would have
+/// said otherwise, because the behavioural harness enumerated the same names and
+/// so shared the omission. `#[derive(Zeroize, ZeroizeOnDrop)]` inverts the
+/// default: the generated `Drop` destructures `Self` with every field bound and
+/// calls `zeroize()` on each, so a field added here is wiped unless someone
+/// writes an explicit `#[zeroize(skip)]` on it — a visible line in a diff rather
+/// than an omission nobody sees. There are no such lines on this struct.
+///
+/// What that does and does not guarantee, stated precisely because it is easy to
+/// overstate: a field whose type has a `Zeroize` impl *reachable by method
+/// resolution* is wiped, and that includes `Box<[u8; N]>`, which has no impl of
+/// its own but derefs to one. A field whose type has no such impl — a `PathBuf`,
+/// a `Uuid`, or one of this crate's own `boxed`-arm secret newtypes, which carry
+/// `ZeroizeOnDrop` without `Zeroize` — is a compile error, and the author has to
+/// decide. So the derive does NOT force a decision on every possible new field;
+/// it makes the wipe the default for the types a secret is usually held in, and
+/// refuses to build for the rest. `#[derive]` generating the `Drop` is also why
+/// the reasoning that used to live on `drop` now lives on the fields.
+#[derive(Zeroize, zeroize::ZeroizeOnDrop)]
 pub struct VerifiedFirstContact {
     /// The sender's long-term identity key — what to display, accept, or block.
+    ///
+    /// Public, and not secret. It is wiped anyway, because there are no
+    /// `#[zeroize(skip)]` attributes on this struct at all: every opt-out is a
+    /// line a future author can copy onto a field that did need wiping, and a
+    /// 2.5 KB memset on a type that is constructed once per accepted knock is not
+    /// worth buying that risk with. `Box<[u8; N]>` has no `Zeroize` impl of its
+    /// own in zeroize 1.8, but the derive's `field.zeroize()` auto-derefs to the
+    /// `[u8; N]` behind it, which does — so the heap block is cleared in place.
     pk_lt: Box<[u8; ml_dsa::PK_LEN]>,
-    /// The pseudonym that will sign this conversation.
+    /// The pseudonym that will sign this conversation. Public, wiped for the same
+    /// reason as `pk_lt`.
     pk_pc: Box<[u8; ml_dsa::PK_LEN]>,
     /// The sender's opening ratchet ephemeral, to encapsulate to in the reply.
+    /// This is the sender's *public* encapsulation key, not a decapsulation key.
+    /// Wiped for the same reason as `pk_lt`.
     eph_ek: Box<[u8; ml_kem::EK_LEN]>,
+    /// Not secret. Wiped anyway — one store, and no opt-out to review.
     seq: u64,
+    /// Not secret — same reasoning as `seq`.
     sent_unix_ms: i64,
-    /// The decrypted message. Secret — see [`Drop`] and [`Debug`] below.
+    /// The decrypted message, wiped because `String`'s own `Drop` releases the
+    /// buffer without touching the bytes in it. Wiping the key material while
+    /// leaving the message that key material protects in freed memory gets the
+    /// priority exactly backwards: the ratchet's delete-on-use chains exist so
+    /// that message *content* is not recoverable after the fact, and content left
+    /// in a freed buffer is recoverable however carefully the keys were wiped
+    /// (#266).
+    ///
+    /// **The ownership question is open and is not settled here.** Whether this
+    /// type should hold the plaintext at all, or hand it to the UI layer and keep
+    /// only what the ratchet needs, is adjacent to whether `ss0` is retained at
+    /// all and wants deciding with it (#262). Until then the plaintext is here and
+    /// is wiped here.
+    ///
+    /// `Zeroize for String` wipes the live bytes and truncates; it cannot reach
+    /// buffers this `String` already outgrew, which is the residue #263 is about.
     body: String,
     /// The encapsulated secret, to persist as provisional handshake state.
+    ///
+    /// A bare array, so it has no `Drop` of its own and would otherwise outlive
+    /// this struct in whatever stack or heap slot held it — and it is the secret
+    /// the seal key, `AR`, `chan_id` and the whole ratchet root hang on (#259).
     ss0: [u8; SS0_LEN],
+    /// Carries its own `ZeroizeOnDrop`; the derive wipes it here as well, which
+    /// is a redundant store and not a correctness claim.
     roots: ChannelRoots,
 }
 
@@ -733,35 +789,6 @@ impl VerifiedFirstContact {
     /// control, and `offset_of!` cannot see a private field from outside the crate.
     pub const fn ss0_offset_for_test() -> usize {
         core::mem::offset_of!(Self, ss0)
-    }
-}
-
-impl Drop for VerifiedFirstContact {
-    /// Two fields are secret, and neither clears itself.
-    ///
-    /// `ss0` is a bare array, so it has no `Drop` of its own and would otherwise
-    /// outlive this struct in whatever stack or heap slot held it — and it is the
-    /// secret the seal key, `AR`, `chan_id` and the whole ratchet root on (#259).
-    ///
-    /// `body` is the decrypted message, and `String`'s own `Drop` releases the
-    /// buffer without touching the bytes in it. Wiping the key material while
-    /// leaving the message that key material protects in freed memory gets the
-    /// priority exactly backwards: the ratchet's delete-on-use chains exist so
-    /// that message *content* is not recoverable after the fact, and content left
-    /// in a freed buffer is recoverable however carefully the keys were wiped
-    /// (#266).
-    ///
-    /// **The ownership question is open and is not settled here.** Whether this
-    /// type should hold the plaintext at all, or hand it to the UI layer and keep
-    /// only what the ratchet needs, is adjacent to whether `ss0` is retained at
-    /// all and wants deciding with it (#262). Until then the plaintext is here and
-    /// is wiped here.
-    ///
-    /// The boxed public halves need no wiping, and `roots` carries its own
-    /// `ZeroizeOnDrop`.
-    fn drop(&mut self) {
-        self.ss0.zeroize();
-        self.body.zeroize();
     }
 }
 
