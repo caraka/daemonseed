@@ -26,6 +26,23 @@ work lives in the project lead's vault manifest, not here.
 
 ### Added
 
+- `daemonseed_core::dm::persist` — the wiring between the DM types and the
+  store, so DM state is finally written. `DmPersist` derives both the store key
+  and the provisional record's key from one at-rest key. `restart_channel`
+  returns `StoredChannelRestart::HandshakeResumes(PendingHandshake)` or a loud
+  `Teardown`; `PendingHandshake` owns the record and its one consuming method,
+  `establish`, builds the ratchet **and** deletes the record — so `ss0` is
+  actually erased on establishment rather than documented as erased.
+  `ProvisionalRecord::into_ratchet` is now `pub(crate)`, so outside the crate
+  `establish` is the only path from a record to a ratchet. `update_outbox` and
+  `advance_cursor` are read-modify-write inside one critical section; there is
+  no load-then-save pair to lose an update. `read_outbox` / `read_cursor` are
+  lock-free and create nothing. The provisional record is sealed by its own
+  path and again by the store: the two bind different facts — `RecordContext`
+  refuses a record lifted from another channel, the store's AAD refuses a blob
+  moved between slots — and neither layer can check the other's. Erasure is
+  `unlink`, not an overwrite (#293). (#281, #243)
+
 - `daemonseed_core::storage::dm_store` — the DM at-rest store. `DmStore::open`
   derives one seal key from the profile at-rest key (HKDF-SHA384 under the new
   `DM_STORE_SALT` / `DM_STORE_SEAL` / `DM_STORE_AAD` labels) and sweeps orphaned
@@ -98,6 +115,16 @@ work lives in the project lead's vault manifest, not here.
   overflow-checks = true`), workspace-wide. (#258)
 
 ### Fixed
+
+- Two claims in `dm::provisional`'s docs outran what any store here does, and
+  one of them was load-bearing. The record was described as "overwritten in
+  place on establishment", and `ProvisionalRecord::open`'s rollback argument
+  rested on that phrase. The store commits a replacement with `rename(2)` and a
+  deletion with `unlink(2)`, so neither overwrites the bytes it supersedes. The
+  rollback argument survives on a different fact — there is only ever one
+  record, replaced in a single slot and deleted on establishment, so no earlier
+  record is *referenced* to roll back to — and the limit is now stated as what
+  it is: the superseded bytes are unreferenced, not scrubbed (#293).
 
 - `daemonseed_core::storage::seeds::PersistedCircle` holds `entropy` privately as a
   `Zeroizing<String>`, read through `entropy()` and built through `new()`. `Debug`

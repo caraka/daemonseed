@@ -72,5 +72,6 @@ pub mod frame;
 pub mod keyrec;
 pub mod outbox;
 pub mod paging;
+pub mod persist;
 pub mod provisional;
 pub mod ratchet;

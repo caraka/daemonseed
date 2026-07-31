@@ -226,17 +226,19 @@
 //! ratchet is gone; the outbox is not, and [`Outbox::channel_torn_down`] is the
 //! decision. The reasoning and the asymmetry are on that method.
 //!
-//! ## What is not wired
+//! ## Where this is stored
 //!
-//! **Nothing stores this yet.** The store itself now exists —
-//! [`crate::storage::dm_store`] names this record
-//! ([`RecordKind::Outbox`](crate::storage::dm_store::RecordKind::Outbox)), seals
-//! whatever bytes it is handed, and pads them out to a fixed bucket — but no
-//! caller anywhere writes, reads or deletes an outbox through it, the same state
-//! [`crate::dm::provisional`] is in. So "persisted outbox" is still a shape this
-//! module can produce and nothing keeps. Said plainly rather than implied,
-//! because a mechanism with no wiring that reads as a feature is worse than an
-//! absent one.
+//! [`crate::dm::persist`] is the writer (#281). It reads and replaces
+//! [`RecordKind::Outbox`](crate::storage::dm_store::RecordKind::Outbox) through
+//! [`crate::storage::dm_store`], which seals what it is handed and pads it out to
+//! a fixed bucket.
+//!
+//! **The read-modify-write is the persistence layer's shape, not this module's.**
+//! A sweep, an acknowledgement merge or an enqueue reads the record, decides from
+//! it, and writes the result, and those three steps have to be inside one
+//! critical section or two processes silently lose one of the two decisions. So
+//! `persist` offers a closure that brackets the whole of it rather than a
+//! load/save pair, and this module needs to know nothing about it.
 //!
 //! That is also why [`Outbox::encode`] stays **plaintext and
 //! variable-length**: the sealing, the fixed size and the padding are the
@@ -248,9 +250,9 @@
 //! [`crate::transcript`], where a client's own sent messages already live. The
 //! consequence is stated rather than hidden: a draft blocked on a key fetch does
 //! not survive a restart in this record — the sequence number and the give-up
-//! clock do. The alternative was putting user plaintext into an at-rest structure
-//! that has no store and therefore no sealing today, which is a wider blast
-//! radius for a copy of something the transcript already holds.
+//! clock do. The alternative was putting user plaintext into a second at-rest
+//! structure — a wider blast radius for a copy of something the transcript
+//! already holds, and one more place to have to erase.
 
 use core::time::Duration;
 
@@ -327,8 +329,9 @@ pub const OUTBOX_MAGIC: &[u8] = b"daemonseed/dm/outbox/v2\0";
 /// `Owed` would re-offer every message that ever ended. The sibling formats that
 /// do dual-read ([`crate::storage::seeds`], [`crate::storage::recovery_file`])
 /// carry compatibility for blobs that reached real disks and can name the suite
-/// those writers used; there is no such historical fact here, because
-/// [`Outbox::encode`] has never had a caller that stored its output.
+/// those writers used; there is no such historical fact here. No v1 record was
+/// ever written anywhere: [`Outbox::encode`] had no caller that stored its
+/// output until [`crate::dm::persist`], and by then the magic was already v2.
 pub const OUTBOX_MAGIC_V1: &[u8] = b"daemonseed/dm/outbox/v1\0";
 
 /// Width of the suite-id field, big-endian, immediately after the magic — the

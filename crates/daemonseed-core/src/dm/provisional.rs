@@ -103,13 +103,23 @@
 //! **`ss0` genuinely wants erasing.** It roots `RK0`, so a recovered `ss0`
 //! reopens the early chain — the harvest-now-decrypt-later exposure § v5 exists
 //! to bound. The record is therefore written to one small fixed-size file and
-//! **overwritten in place on establishment**, never appended or journaled. There
-//! is no slot pair: with a loud teardown, *losing* this record is tolerable — the
-//! handshake strands and we say so — so the crash-safety argument for alternating
-//! slots does not apply. What this can honestly promise stops at the filesystem
-//! API: an SSD's FTL remaps an overwrite to a fresh block, and a copy-on-write
-//! filesystem writes a new extent by design, so an adversary with the raw flash
-//! is outside what any store here can deliver.
+//! **deleted when the channel establishes**, never appended or journaled —
+//! [`crate::dm::persist`] is the wiring that does both, and the deletion cannot
+//! be separated from the establishment it belongs to. There is no slot pair:
+//! with a loud teardown, *losing* this record is tolerable — the handshake
+//! strands and we say so — so the crash-safety argument for alternating slots
+//! does not apply.
+//!
+//! What this can honestly promise stops at the filesystem API, and the shape of
+//! that limit is worth stating exactly rather than by analogy. The store commits
+//! a replacement with `rename(2)` and a deletion with `unlink(2)` plus a
+//! directory fsync, so **neither one overwrites the bytes it supersedes**: the
+//! old record's blocks are unreferenced, not scrubbed. Nor would writing over
+//! them in place reach the medium — an SSD's FTL remaps an overwrite to a fresh
+//! block and a copy-on-write filesystem writes a new extent by design. So an
+//! adversary with the raw flash is outside what any store here can deliver, and
+//! what erasure buys is that `ss0` is gone from the filesystem's view and from
+//! every subsequent read.
 
 use oxicrypt_aes::{Aes256Key, ModeError};
 use oxicrypt_kdf::HkdfSha384;
@@ -152,7 +162,9 @@ pub const PROVISIONAL_PLAINTEXT_LEN: usize =
     1 + BINDING_TAG_LEN + SS0_LEN + ml_kem::EK_LEN + ml_kem::DK_LEN;
 
 /// Sealed length: `nonce ‖ ciphertext ‖ tag`. One number for every record, which
-/// is what a store needs to size a fixed-size file it overwrites in place.
+/// is what lets the store give this kind a fixed-size bucket —
+/// [`RecordKind::Provisional`](crate::storage::dm_store::RecordKind::Provisional)
+/// takes it verbatim as its capacity.
 pub const PROVISIONAL_RECORD_LEN: usize = NONCE_LEN + PROVISIONAL_PLAINTEXT_LEN + TAG_LEN;
 
 /// Why a provisional record could not be built, sealed, or opened.
@@ -465,7 +477,17 @@ impl ProvisionalRecord {
     /// The ratchet root is re-derived inside [`Ratchet::initiator`] from `ss0`, so
     /// nothing in this crate ever needs a byte constructor for `RootKey` — the
     /// key surface that a stored root would have had to widen.
-    pub fn into_ratchet(self) -> Result<Ratchet, RatchetError> {
+    ///
+    /// **`pub(crate)`, and that is load-bearing rather than tidiness.**
+    /// Establishing a channel is the moment the stored record must stop
+    /// existing, because `ss0` roots `RK0` and its erasure is the whole
+    /// forward-secrecy premise for trimming the ratchet. That pairing is
+    /// enforced by [`crate::dm::persist::PendingHandshake::establish`], which
+    /// owns the record and performs both. Leaving this public would leave a
+    /// second door: anyone holding the sealed bytes and the key could build a
+    /// ratchet and never delete, and the invariant would be a convention rather
+    /// than a property. Outside this crate, `establish` is the only way in.
+    pub(crate) fn into_ratchet(self) -> Result<Ratchet, RatchetError> {
         // `ss0` is borrowed while the other two fields move out. That is only
         // legal because this type has no container `Drop` — the exact restriction
         // #255 was about.
@@ -524,9 +546,13 @@ impl ProvisionalRecord {
     /// class out is strictly better than detecting it.
     ///
     /// What none of this catches is a rollback to a wholly consistent *earlier*
-    /// record, which is indistinguishable from the state it once was. Overwriting
-    /// in place is what keeps such a record from existing; see the module docs for
-    /// the limits of that promise.
+    /// record, which is indistinguishable from the state it once was. What keeps
+    /// such a record from existing is that there is only ever one of them: the
+    /// store replaces the single slot and [`crate::dm::persist`] deletes it on
+    /// establishment, so no earlier record is retained anywhere to roll back to.
+    /// That is a statement about what is *referenced*, not about what is on the
+    /// medium — the superseded bytes are unlinked rather than scrubbed; see the
+    /// module docs for the limits of that promise.
     pub fn open(
         key: &Aes256Key,
         sealed: &[u8],

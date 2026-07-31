@@ -878,7 +878,10 @@ modules:
       ProvisionalRecord is the pre-establishment handshake record, the initiator's
       {ss0, eph_ek, eph_dk}; new(Zeroizing<[u8; SS0_LEN]>, eph_ek, eph_dk) refuses
       halves that are not a keypair. address_root() recomputes AR from ss0 and
-      into_ratchet() consumes the record into Ratchet::initiator, which re-derives
+      into_ratchet() is pub(crate) — outside the crate, dm::persist's
+      PendingHandshake::establish is the only path from a record to a ratchet,
+      because establishing is the moment the record must be deleted. It consumes
+      the record into Ratchet::initiator, which re-derives
       the root — so neither AR nor RK nor chan_id is stored, and no byte
       constructor for RootKey exists at any visibility. chan_id is not returned
       with AR; a caller needing it calls firstcontact::derive_channel_roots.
@@ -1059,6 +1062,26 @@ modules:
       found_at, one layer above. NOT YET AVAILABLE: persistence and restore, the
       doorbell sweep, the accept/decline/block flow, the contact cache, the block
       list, the transport wiring and the UI (#236, #243).
+      Sub-module dm::persist is the wiring between these types and
+      storage::dm_store, and is what makes any of this reach a disk. DmPersist
+      derives both the store key and the provisional record's key from one
+      at_rest_key. restart_channel(label, ctx) -> StoredChannelRestart is
+      HandshakeResumes(PendingHandshake) or TornDown(Teardown), and asks through
+      the store's lock-free read so probing an unknown channel creates nothing.
+      PendingHandshake owns the record, lends eph_ek/address_root, and its one
+      consuming method establish() builds the ratchet AND deletes the record —
+      the pairing that makes ss0 actually erased; the ratchet is built first so
+      a failed delete returns an error rather than a ratchet, leaving the call a
+      safe retry. update_outbox(label, direction, now_ms, f) and
+      advance_cursor(label, page, read_through) are read-modify-write inside one
+      critical_section; there is no load-then-save pair to lose an update.
+      read_outbox/read_cursor are lock-free. The provisional record is sealed by
+      its own path and again by the store: the record's seal binds RecordContext
+      and refuses one lifted from another channel, the store's AAD binds label
+      and kind and refuses a blob moved between slots, and neither layer can
+      check the other's fact. Erasure is unlink, not overwrite (#293).
+      CorrespondenceLabel is taken as a parameter, never derived here (#288).
+
       Sub-module dm::outbox is the persisted sender-side outbox for one
       direction of one correspondence. Outbox::new(direction: Direction) keys
       OutboxEntry by sequence number over one monotonic space covering the
