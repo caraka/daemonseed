@@ -1,5 +1,10 @@
 //! At-rest storage — the three-layer split.
 //!
+//! - [`atomic_file`] (Amendment A9) — the durable atomic replacement every DM
+//!   record write goes through: tmp sibling → fsync → rename → fsync parent,
+//!   plus the `flock` used for cross-process exclusion. Distinct from the
+//!   tmp+rename idiom elsewhere in this module, which is crash-atomic but not
+//!   power-loss-durable.
 //! - [`seeds`] (M1, ISC-C3) — the AEAD-protected mnemonic + per-circle state
 //!   blob.
 //! - [`recovery_file`] (M2, ISC-C32) — the same KDF chain with a distinct
@@ -22,6 +27,7 @@
 //!   trusted anchor a verified resume checks the staging manifest against
 //!   (DL-ISC-20).
 
+pub mod atomic_file;
 pub mod cas;
 pub mod fetched;
 pub mod manifest_digest;

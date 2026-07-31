@@ -24,6 +24,28 @@ next release this block is renamed to its version + date and a fresh
 `[Unreleased]` is opened (see `AGENTS.md` doc-sync). Planning for *unstarted*
 work lives in the project lead's vault manifest, not here.
 
+### Added
+
+- `daemonseed_core::storage::atomic_file` — a durable atomic file replacement,
+  the primitive every DM record write goes through. `replace_atomically` writes
+  a CSPRNG-suffixed temp sibling opened `O_CREAT|O_EXCL`, fsyncs it, renames
+  over the destination, then fsyncs the parent directory, so a power loss
+  leaves the destination holding either its previous contents or the new ones —
+  never a name whose data was lost. The tmp+rename idiom already in `storage`
+  is crash-atomic but not power-loss-durable, which is sufficient for a
+  re-fetchable manifest and not for a record whose purpose is making
+  commit-then-emit one provable act. `FileLock` provides the `flock`
+  cross-process exclusion for a read-modify-write critical section; it is
+  deliberately not taken inside `replace_atomically`, which would serialize the
+  write while leaving the read-then-write window open and read as safe. Both
+  fsync barriers go through an internal seam so the tests assert they were
+  performed, in order, against the destination's own parent — an fsync leaves
+  no filesystem trace, so without that the suite would pass just as happily
+  with both barriers deleted. On Windows the destination is removed before the
+  rename and the directory barrier is a no-op; the weaker guarantee is recorded
+  in the module docs rather than papered over. (Amendment A9 build obligation,
+  #281)
+
 ### Changed
 
 - The DM page transport takes a checked address. `daemonseed_core::dm::paging`

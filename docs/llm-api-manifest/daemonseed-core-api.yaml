@@ -226,6 +226,20 @@ modules:
     iscs:
       - C35
 
+  - name: daemonseed_core::storage::atomic_file
+    description: >-
+      Durable atomic file replacement: temp sibling (O_CREAT|O_EXCL, CSPRNG
+      suffix) -> write -> fsync file -> rename -> fsync parent directory, so a
+      crash or power loss leaves the destination holding either its previous
+      contents or the new ones. FileLock wraps an fs4 exclusive advisory lock
+      for cross-process exclusion across a read-modify-write critical section;
+      it is not taken by replace_atomically. On Windows the destination is
+      removed before the rename and the directory barrier is a no-op, so the
+      durable-directory-entry guarantee does not hold there.
+    no_std: false
+    depends_on: []
+    iscs: []
+
   - name: daemonseed_core::storage::seeds
     description: >-
       Encrypted at-rest seeds blob (ISC-C3). Format v2 as of M3 with
