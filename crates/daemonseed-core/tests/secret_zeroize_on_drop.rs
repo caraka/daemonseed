@@ -23,12 +23,19 @@
 //! second benefit: the allocator hook applies only here, never to the crate's
 //! ~970 unit tests.
 //!
-//! The witness also covers the two secrets the macro does not generate a wipe for:
+//! The witness also covers the secrets the macro does not generate a wipe for:
 //! `PersistedCircle::entropy`, a `Zeroizing<String>` cleared before its buffer is
-//! released, and `VerifiedFirstContact::ss0`, a bare `[u8; SS0_LEN]` wiped by a
-//! hand-written `Drop`. Neither is reachable from the compile-time `ZeroizeOnDrop`
-//! bound in `secret_seed.rs` — they are multi-field structs, not macro-generated
-//! newtypes — so this file is the only thing holding them to the property at all.
+//! released, and both of `VerifiedFirstContact`'s — `ss0`, a bare `[u8; SS0_LEN]`,
+//! and `body`, the decrypted message — each wiped by that struct's hand-written
+//! `Drop`. None is reachable from the compile-time `ZeroizeOnDrop` bound in
+//! `secret_seed.rs` — they are multi-field structs, not macro-generated newtypes —
+//! so this file is the only thing holding them to the property at all.
+//!
+//! `VerifiedFirstContact`'s fields are private, because holding one is meant to be
+//! the proof that its seal opened and its signatures verified (#265). This file
+//! reaches them through the `testing`-gated constructor and accessors described
+//! there, which this crate's own dev-dependency on itself switches on and nothing
+//! else does.
 //!
 //! `ss0` is what made the watch a *range inside* a block rather than a whole block:
 //! it sits at a non-zero offset in a larger struct, so the witness fires on any
@@ -77,6 +84,14 @@ const SEED_LEN: usize = 32;
 /// than being the exact-fit buffer `to_owned()` would give.
 const CIRCLE_PHRASE_LEN: usize = 57;
 const CIRCLE_PHRASE_CAP: usize = 96;
+
+/// The decrypted message the `VerifiedFirstContact::body` case builds, and the
+/// length and capacity of its buffer. They differ for the same reason the circle
+/// phrase's do: the production body is decoded out of a padded plaintext and can
+/// carry slack, so the watched buffer carries slack too.
+const DM_BODY_TEXT: &str = "meet me at the usual place, half past eight";
+const DM_BODY_LEN: usize = DM_BODY_TEXT.len();
+const DM_BODY_CAP: usize = 128;
 
 /// Address of the watched bytes, or 0 when disarmed. A live allocation is never
 /// at address 0, so 0 is an unambiguous "off". This is the start of the secret,
@@ -408,6 +423,10 @@ fn inline_arm_secrets_are_zeroed_before_their_memory_is_released() {
 /// - `VerifiedFirstContact::ss0` is a bare `[u8; SS0_LEN]` wiped by a hand-written
 ///   `Drop`. Deleting that `zeroize()` call leaves the whole suite green but for
 ///   this case.
+/// - `VerifiedFirstContact::body` is the decrypted message, wiped by the same
+///   hand-written `Drop`. It is a `String`, so it is watched as its own heap block
+///   rather than as a range inside the struct — the two secrets on one struct take
+///   two different routes through this witness (#266).
 #[test]
 fn secrets_outside_the_macro_zero_themselves_before_their_memory_is_released() {
     init();
@@ -432,9 +451,11 @@ fn secrets_outside_the_macro_zero_themselves_before_their_memory_is_released() {
 
     // `ss0` is an inline `[u8; SS0_LEN]` field, so it is watched as a range at a
     // non-zero offset inside the boxed struct's own block — the case the witness was
-    // generalised for. `offset_of!` / `size_of` state that structurally: offset 64
-    // of 160 on the current layout, and an accessor that drifted to any other field
-    // fails on the offset.
+    // generalised for. `ss0_offset_for_test` / `size_of` state that structurally:
+    // offset 64 of 160 on the current layout, and an accessor that drifted to any
+    // other field fails on the offset. The offset comes from a `testing`-gated
+    // accessor rather than `offset_of!` because the field is private (#265) and
+    // `offset_of!` cannot see a private field from out here.
     //
     // The distinct filler bytes are a WEAKER control than they look, which is why
     // the offset assertion above carries the load. They catch only a HIGH-side slip
@@ -443,28 +464,65 @@ fn secrets_outside_the_macro_zero_themselves_before_their_memory_is_released() {
     // zeros plus a zeroized `ss0` and pass vacuously. What the fillers guarantee is
     // narrow: no neighbouring field is all-zero *above* `ss0`.
     assert_zeroed_when_freed(
-        "VerifiedFirstContact",
+        "VerifiedFirstContact::ss0",
         (
-            core::mem::offset_of!(VerifiedFirstContact, ss0),
+            VerifiedFirstContact::ss0_offset_for_test(),
             size_of::<VerifiedFirstContact>(),
         ),
         || {
-            Box::new(VerifiedFirstContact {
-                pk_lt: Box::new([0x11u8; PK_LEN]),
-                pk_pc: Box::new([0x22u8; PK_LEN]),
-                eph_ek: Box::new([0x33u8; EK_LEN]),
-                seq: 7,
-                sent_unix_ms: 1_700_000_000_000,
-                body: "the body is not a secret".to_owned(),
-                ss0: [0xA5u8; SS0_LEN],
-                roots: ChannelRoots {
-                    ar: [0x44u8; ROOT_LEN],
-                    chan_id: [0x55u8; ROOT_LEN],
-                },
-            })
+            Box::new(verified_first_contact(
+                "the body is not a secret".to_owned(),
+            ))
         },
-        |v| v.ss0.as_slice(),
+        |v| v.ss0_for_test().as_slice(),
     );
+
+    // The decrypted message on the same struct. Unlike `ss0` it is a `String`, so
+    // it is watched exactly as `PersistedCircle::entropy` is — its own heap block,
+    // offset 0, block size the CAPACITY — and the struct it hangs off is left on
+    // the stack, since the watched block is the string buffer rather than the
+    // struct. Built with slack for the same reason as the circle phrase: the
+    // production body is decoded out of a padded plaintext and carries slack, so an
+    // exact-fit buffer would not be the production shape.
+    //
+    // What this case holds: `body` is wiped by the same hand-written `Drop` that
+    // wipes `ss0`. Deleting `self.body.zeroize()` leaves the whole suite green but
+    // for this case (#266).
+    assert_zeroed_when_freed(
+        "VerifiedFirstContact::body",
+        (0, DM_BODY_CAP),
+        || {
+            let mut body = String::with_capacity(DM_BODY_CAP);
+            body.push_str(DM_BODY_TEXT);
+            assert_eq!(body.len(), DM_BODY_LEN);
+            verified_first_contact(body)
+        },
+        |v| v.body().as_bytes(),
+    );
+}
+
+/// One fully-populated witness, with the filler bytes the `ss0` case's structural
+/// control depends on.
+///
+/// Built through the `testing`-gated constructor: the fields are private so that
+/// holding a `VerifiedFirstContact` really is the proof of verification its doc
+/// comment claims (#265), and `open` is no substitute here — it controls neither
+/// the neighbouring byte patterns nor `body`'s capacity, which are exactly the two
+/// structural controls these cases pin.
+fn verified_first_contact(body: String) -> VerifiedFirstContact {
+    VerifiedFirstContact::new_for_test(
+        Box::new([0x11u8; PK_LEN]),
+        Box::new([0x22u8; PK_LEN]),
+        Box::new([0x33u8; EK_LEN]),
+        7,
+        1_700_000_000_000,
+        body,
+        [0xA5u8; SS0_LEN],
+        ChannelRoots {
+            ar: [0x44u8; ROOT_LEN],
+            chan_id: [0x55u8; ROOT_LEN],
+        },
+    )
 }
 
 /// The `realloc` disarm is itself a control, so hold it to being live.

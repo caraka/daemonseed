@@ -589,38 +589,198 @@ pub fn build(
 }
 
 /// A first-contact entry whose seal opened and whose every signature verified.
-/// Only constructible via [`open`], so holding one IS the proof.
-#[derive(Clone)]
+///
+/// **The fields are private and [`open`] is the only constructor, which is what
+/// makes the sentence above a guarantee rather than a claim.** This type is a
+/// witness: holding one is the proof that the seal opened under the recipient's
+/// own decapsulation key, that `bind_lt` vouched for the pseudonym, and that the
+/// pseudonym signed the frame — so a call site accepting one is entitled to skip
+/// re-checking provenance. While the fields were `pub` that entitlement had
+/// nothing behind it: anyone could assemble one from invented key material with
+/// no seal opened and no signature checked, and the comment inviting callers to
+/// rely on it was the dangerous half. That was not a hypothetical — the zeroize
+/// coverage added by #259 did exactly that from an integration test, which is how
+/// it was found (#265).
+///
+/// Read the verified halves through the accessors. `ss0` leaves only via
+/// [`Self::into_ss0`], which moves it into a zeroizing wrapper: there is no
+/// borrowing accessor for it, because `&[u8; N]` is one `*` away from a bare
+/// `Copy` of the array into a slot with no wipe on it — the same reasoning that
+/// keeps [`FirstContactState`] from having one.
+///
+/// The single construction path that is not [`open`] is `new_for_test`, compiled
+/// only under this crate's `testing` feature; see its own comment for why it
+/// exists and what enables it.
+///
+/// `Clone` is deliberately absent. It was derived while the fields were public
+/// and nothing used it; on a witness type a clone is a second copy of `ss0` and
+/// of the decrypted `body`, each needing its own wipe, for no caller's benefit.
 pub struct VerifiedFirstContact {
     /// The sender's long-term identity key — what to display, accept, or block.
-    pub pk_lt: Box<[u8; ml_dsa::PK_LEN]>,
+    pk_lt: Box<[u8; ml_dsa::PK_LEN]>,
     /// The pseudonym that will sign this conversation.
-    pub pk_pc: Box<[u8; ml_dsa::PK_LEN]>,
+    pk_pc: Box<[u8; ml_dsa::PK_LEN]>,
     /// The sender's opening ratchet ephemeral, to encapsulate to in the reply.
-    pub eph_ek: Box<[u8; ml_kem::EK_LEN]>,
-    pub seq: u64,
-    pub sent_unix_ms: i64,
-    pub body: String,
+    eph_ek: Box<[u8; ml_kem::EK_LEN]>,
+    seq: u64,
+    sent_unix_ms: i64,
+    /// The decrypted message. Secret — see [`Drop`] and [`Debug`] below.
+    body: String,
     /// The encapsulated secret, to persist as provisional handshake state.
-    pub ss0: [u8; SS0_LEN],
-    pub roots: ChannelRoots,
+    ss0: [u8; SS0_LEN],
+    roots: ChannelRoots,
+}
+
+impl VerifiedFirstContact {
+    /// The sender's long-term identity key — what to display, accept, or block.
+    pub fn pk_lt(&self) -> &[u8; ml_dsa::PK_LEN] {
+        &self.pk_lt
+    }
+
+    /// The pseudonym that signed this frame and will sign this conversation.
+    pub fn pk_pc(&self) -> &[u8; ml_dsa::PK_LEN] {
+        &self.pk_pc
+    }
+
+    /// The sender's opening ratchet ephemeral — what the reply encapsulates to.
+    pub fn eph_ek(&self) -> &[u8; ml_kem::EK_LEN] {
+        &self.eph_ek
+    }
+
+    /// The frame's sequence number, which [`open`] has already held to `0`.
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// The sender's claimed compose time, in Unix milliseconds. Signed, so it is
+    /// authentic to the sender — which is not the same as true.
+    pub fn sent_unix_ms(&self) -> i64 {
+        self.sent_unix_ms
+    }
+
+    /// Borrow the decrypted message.
+    ///
+    /// A borrow, never a copy: an owned `String` taken from here has escaped this
+    /// type's `Drop` and will release its buffer with the plaintext still in it.
+    pub fn body(&self) -> &str {
+        &self.body
+    }
+
+    /// The channel's address root and conversation identifier, derived from `ss0`.
+    pub fn roots(&self) -> &ChannelRoots {
+        &self.roots
+    }
+
+    /// Take the encapsulated secret, to persist as provisional handshake state.
+    ///
+    /// Consuming, and it hands back a [`Zeroizing`] rather than the bare array, so
+    /// the value the caller now holds wipes itself at the end of its own scope.
+    /// The source is cleared here rather than left to this type's `Drop`, so that
+    /// even within this function there is only ever one live copy.
+    pub fn into_ss0(mut self) -> Zeroizing<[u8; SS0_LEN]> {
+        let taken = Zeroizing::new(self.ss0);
+        self.ss0.zeroize();
+        taken
+    }
+}
+
+/// Assemble one **without** opening a seal or verifying anything, for tests only.
+///
+/// This is a deliberate, greppable hole in the invariant the type advertises, and
+/// it is compiled only under this crate's `testing` feature — which nothing but
+/// this crate's own test targets enables (`daemonseed-core` names itself in its
+/// `[dev-dependencies]` with the feature on). No ordinary consumer of the crate
+/// can reach it; `cargo check -p daemonseed-tui` will not compile it.
+///
+/// It exists because the behavioural zeroize witness needs a `GlobalAlloc` hook,
+/// this crate is `#![forbid(unsafe_code)]`, and so that harness has to be an
+/// integration test outside the crate — where sealing the fields would otherwise
+/// put the type out of reach entirely (#265). `open` is not a substitute: the
+/// witness's structural controls are the byte patterns of the neighbouring fields
+/// and the `String` capacity of `body`, and a real `open` controls neither.
+#[cfg(any(test, feature = "testing"))]
+impl VerifiedFirstContact {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_for_test(
+        pk_lt: Box<[u8; ml_dsa::PK_LEN]>,
+        pk_pc: Box<[u8; ml_dsa::PK_LEN]>,
+        eph_ek: Box<[u8; ml_kem::EK_LEN]>,
+        seq: u64,
+        sent_unix_ms: i64,
+        body: String,
+        ss0: [u8; SS0_LEN],
+        roots: ChannelRoots,
+    ) -> Self {
+        Self {
+            pk_lt,
+            pk_pc,
+            eph_ek,
+            seq,
+            sent_unix_ms,
+            body,
+            ss0,
+            roots,
+        }
+    }
+
+    /// Borrow `ss0` in place, so the witness can watch the bytes where they live.
+    /// Deliberately not part of the ordinary surface — see [`Self::into_ss0`].
+    pub fn ss0_for_test(&self) -> &[u8; SS0_LEN] {
+        &self.ss0
+    }
+
+    /// Where `ss0` sits inside the struct. The witness pins this as its structural
+    /// control, and `offset_of!` cannot see a private field from outside the crate.
+    pub const fn ss0_offset_for_test() -> usize {
+        core::mem::offset_of!(Self, ss0)
+    }
 }
 
 impl Drop for VerifiedFirstContact {
+    /// Two fields are secret, and neither clears itself.
+    ///
     /// `ss0` is a bare array, so it has no `Drop` of its own and would otherwise
     /// outlive this struct in whatever stack or heap slot held it — and it is the
-    /// secret the seal key, `AR`, `chan_id` and the whole ratchet root on. The
-    /// boxed public halves need no wiping. (#259)
+    /// secret the seal key, `AR`, `chan_id` and the whole ratchet root on (#259).
+    ///
+    /// `body` is the decrypted message, and `String`'s own `Drop` releases the
+    /// buffer without touching the bytes in it. Wiping the key material while
+    /// leaving the message that key material protects in freed memory gets the
+    /// priority exactly backwards: the ratchet's delete-on-use chains exist so
+    /// that message *content* is not recoverable after the fact, and content left
+    /// in a freed buffer is recoverable however carefully the keys were wiped
+    /// (#266).
+    ///
+    /// **The ownership question is open and is not settled here.** Whether this
+    /// type should hold the plaintext at all, or hand it to the UI layer and keep
+    /// only what the ratchet needs, is adjacent to whether `ss0` is retained at
+    /// all and wants deciding with it (#262). Until then the plaintext is here and
+    /// is wiped here.
+    ///
+    /// The boxed public halves need no wiping, and `roots` carries its own
+    /// `ZeroizeOnDrop`.
     fn drop(&mut self) {
         self.ss0.zeroize();
+        self.body.zeroize();
     }
 }
 
 impl std::fmt::Debug for VerifiedFirstContact {
-    /// Hand-written, never derived: `ss0` is the root of the seal key, `AR`,
-    /// `chan_id` and the ratchet, so one `debug!(?verified)` would put the whole
-    /// conversation in a log. The public halves are safe to show and are what a
-    /// reader actually wants.
+    /// Hand-written, never derived, and two fields are redacted for two different
+    /// reasons.
+    ///
+    /// `ss0` is the root of the seal key, `AR`, `chan_id` and the ratchet, so one
+    /// `debug!(?verified)` would put the whole conversation in a log.
+    ///
+    /// `body` is the decrypted message itself. An earlier version of this impl
+    /// printed it verbatim under a comment calling the public halves "safe to
+    /// show" — which silently classified the message as one of them. A sender's
+    /// long-term public key is public; the message they sent is the thing the
+    /// entry exists to protect, and one `debug!(?verified)` was all it took to put
+    /// it on a log surface (#266).
+    ///
+    /// What is left is the public halves and the frame's own metadata, which is
+    /// what a reader of a log actually wants.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VerifiedFirstContact")
             .field("pk_lt", &"<ML-DSA-87 pubkey>")
@@ -628,7 +788,7 @@ impl std::fmt::Debug for VerifiedFirstContact {
             .field("eph_ek", &"<ML-KEM-1024 ek>")
             .field("seq", &self.seq)
             .field("sent_unix_ms", &self.sent_unix_ms)
-            .field("body", &self.body)
+            .field("body", &"<redacted>")
             .field("ss0", &"<redacted>")
             .field("roots", &self.roots)
             .finish()
@@ -1066,6 +1226,45 @@ mod tests {
         assert!(rendered.contains("<redacted>"));
         assert!(!format!("{:?}", k.state).contains(&hex::encode(v.ss0)));
         assert!(!format!("{:?}", v.roots).contains(&hex::encode(v.roots.ar)));
+    }
+
+    /// The decrypted message is a secret too, and for a longer stretch than `ss0`:
+    /// `ss0` means nothing to a human reading a log, the message means everything.
+    /// An earlier `Debug` printed it verbatim, so one `debug!(?verified)` put the
+    /// plaintext of a first-contact DM on a log surface (#266).
+    #[test]
+    fn a_verified_knock_never_debug_prints_the_message_body() {
+        const SECRET_BODY: &str = "the drop is behind the third bench";
+        let k = knock(SECRET_BODY, EPOCH);
+        let v = open_at(&k, EPOCH).unwrap();
+
+        // Control: the body really is present on the value being rendered, so a
+        // rendering that omits it is doing so by redaction and not because the
+        // struct never held the text this test is looking for.
+        assert_eq!(v.body(), SECRET_BODY);
+
+        let rendered = format!("{v:?}");
+        assert!(
+            !rendered.contains(SECRET_BODY),
+            "the decrypted body must never appear in Debug output: {rendered}"
+        );
+        // A substring, so a partial leak (a truncated or reformatted body) fails too.
+        assert!(
+            !rendered.contains("third bench"),
+            "no fragment of the decrypted body may appear in Debug output: {rendered}"
+        );
+    }
+
+    /// `ss0` leaves only by being moved into a wrapper that wipes itself, and the
+    /// slot it came from is cleared on the way out — so the exit cannot quietly
+    /// become the second live copy the private field exists to prevent.
+    #[test]
+    fn taking_ss0_hands_back_a_zeroizing_copy_of_the_same_secret() {
+        let k = knock("hi", EPOCH);
+        let v = open_at(&k, EPOCH).unwrap();
+        let expected = v.ss0;
+        assert_ne!(expected, [0u8; SS0_LEN], "a real ss0 is not all-zero");
+        assert_eq!(*v.into_ss0(), expected);
     }
 
     // ── Authenticity ────────────────────────────────────────────────────────

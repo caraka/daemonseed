@@ -16,6 +16,7 @@ use daemonseed_core::trust_events::{
     DismissalScope, TrustEvent, TrustEventClass, TrustEventKey, TrustEventLog, class_of,
 };
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
+use zeroize::Zeroizing;
 
 use crate::net::{NetEvent, ShareManifestEntry};
 use crate::screens::first_start::{FirstStartOutcome, FirstStartUi};
@@ -624,7 +625,24 @@ pub enum CircleStatus {
 /// session (circle entropy is re-entered, ISC-A-C2).
 ///
 /// [`Seeds`]: daemonseed_core::storage::seeds::Seeds
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `entropy` is secret material — it is the `cot_key` IKM (ISC-C8) — so it is
+/// **private** and held in a [`Zeroizing`] `String`, exactly as its at-rest
+/// counterpart [`PersistedCircle`] is. The wipe is carried by the field type, so
+/// it happens on every path out of every scope the value reaches including an
+/// unwind, and no caller can lift the raw phrase into a container with no `Drop`
+/// of its own. Read it through [`Self::entropy`], build one with [`Self::new`].
+/// `Debug` is hand-written so the phrase never reaches a log surface (ISC-A-C1).
+/// `PartialEq` / `Eq` are not implemented: nothing compares whole
+/// `JoinedCircle`s, and deriving equality onto a secret-bearing type invites
+/// copies of the secret into comparison sites for no benefit.
+///
+/// #259 made all of this true of the core and the GUI and named only those two
+/// sites, so this one kept the defect it fixed: the session-long copy of the
+/// phrase sat here in a bare `String` with no wipe and a derived `Debug` that
+/// would print it (#268).
+///
+/// [`PersistedCircle`]: daemonseed_core::storage::seeds::PersistedCircle
+#[derive(Clone)]
 pub struct JoinedCircle {
     /// Stable per-session id assigned by the net actor at join. Keys the
     /// active-surface selection, the [`Surface::Circle`] tag on inbound lines,
@@ -637,10 +655,41 @@ pub struct JoinedCircle {
     /// copy of the persisted seed (M13, ISC-C59). The at-rest form is
     /// [`daemonseed_core::storage::seeds::PersistedCircle`]; this lets the
     /// `CircleJoined` handler map a runtime circle back to its persisted entry.
-    pub entropy: String,
+    entropy: Zeroizing<String>,
+}
+
+impl core::fmt::Debug for JoinedCircle {
+    /// Hand-written, never derived: `entropy` is the `cot_key` IKM (ISC-C8) and
+    /// [`Zeroizing`]'s own `Debug` forwards to the value it wraps, so a derived
+    /// one would print the circle secret verbatim. The id and the client-local
+    /// label are what a reader actually wants (#268).
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("JoinedCircle")
+            .field("id", &self.id)
+            .field("label", &self.label)
+            .field("entropy", &"<redacted>")
+            .finish()
+    }
 }
 
 impl JoinedCircle {
+    /// Remember a circle for this session. `entropy` MUST already be canonicalized
+    /// (ISC-C9) — this only stores what the join path normalized.
+    pub fn new(id: u64, label: impl Into<String>, entropy: impl Into<String>) -> Self {
+        Self {
+            id,
+            label: label.into(),
+            entropy: Zeroizing::new(entropy.into()),
+        }
+    }
+
+    /// Borrow the canonicalized circle phrase — the `cot_key` IKM (ISC-C8). A
+    /// borrow, never a copy: an owned `String` taken from here has escaped the
+    /// zeroizing wrapper and will release its buffer with the phrase still in it.
+    pub fn entropy(&self) -> &str {
+        &self.entropy
+    }
+
     /// The relay-independent `#<hash-of-entropy>` fingerprint (ISC-C62), a pure
     /// function of this circle's entropy.
     ///
@@ -1573,20 +1622,17 @@ impl App {
                     // A rejoin (M13, ISC-C59): this circle is already remembered.
                     // The user's persisted label (ISC-C62) wins over the
                     // actor-supplied one, and we must NOT persist again.
-                    self.circles.push(JoinedCircle {
-                        id: circle_id,
-                        label: persisted.label.clone(),
+                    self.circles.push(JoinedCircle::new(
+                        circle_id,
+                        persisted.label.clone(),
                         entropy,
-                    });
+                    ));
                     self.active_circle = Some(self.circles.len() - 1);
                 } else {
                     // A fresh join: remember it (M13 write-through, ISC-C59) so
                     // it is silently rejoined next launch.
-                    self.circles.push(JoinedCircle {
-                        id: circle_id,
-                        label: label.clone(),
-                        entropy: entropy.clone(),
-                    });
+                    self.circles
+                        .push(JoinedCircle::new(circle_id, label.clone(), entropy.clone()));
                     self.active_circle = Some(self.circles.len() - 1);
                     if let Some(seeds) = self.seeds.as_mut() {
                         seeds.add_circle(entropy, label);

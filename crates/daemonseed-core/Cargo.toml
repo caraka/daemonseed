@@ -43,7 +43,24 @@ redb = { workspace = true }
 walkdir = { workspace = true }
 notify = { workspace = true }
 
+[features]
+# Test-only escape hatches, off by default and never enabled by a consumer of
+# this crate. It gates `VerifiedFirstContact::new_for_test` and its two
+# companions: that type is a verification witness whose fields are private so
+# that holding one really is the proof its doc comment claims (#265), but the
+# behavioural zeroize witness in `tests/secret_zeroize_on_drop.rs` needs a
+# `GlobalAlloc` hook and this crate is `#![forbid(unsafe_code)]`, so that harness
+# must live outside the crate — where sealed fields would put the type out of its
+# reach. The dev-dependency below is what turns the feature on for this crate's
+# own test targets, and nothing else.
+testing = []
+
 [dev-dependencies]
+# This crate, named by itself, purely to switch its `testing` feature on while
+# building its own tests. A dev-dependency cycle is allowed and is the only way a
+# crate can enable one of its own features for integration tests without exposing
+# it to consumers. Mirrors how `oxitls-rustls-provider` is consumed below.
+daemonseed-core = { path = ".", features = ["testing"] }
 tempfile = { workspace = true }
 # Test-only: oxitls's module-init shim for the `tls::install_provider` test.
 oxitls-rustls-provider = { workspace = true, features = ["testing"] }

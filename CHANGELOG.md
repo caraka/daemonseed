@@ -116,6 +116,32 @@ work lives in the project lead's vault manifest, not here.
 
 ### Fixed
 
+- `VerifiedFirstContact` now enforces the invariant its doc comment claims. All
+  eight fields were `pub`, so the type advertised "only constructible via
+  `open`, so holding one IS the proof" while any caller could forge one with no
+  seal opened and no signature verified — the reasoning that lets a call site
+  skip re-checking provenance, resting on nothing. Fields are private with
+  accessors for the public halves, and `into_ss0` is the only exit for the
+  secret: consuming, returning a `Zeroizing`, following `FirstContactState`,
+  which refuses a borrowing `ss0` accessor for the same reason. `Clone` is
+  removed — a clone of a witness is a second `ss0` and a second plaintext.
+  (#265)
+
+- `VerifiedFirstContact.body` is the decrypted first-contact message, and it was
+  printed verbatim by `Debug` and never wiped. One `debug!(?verified)` put a DM's
+  plaintext on a log surface, and the `Drop` added by #259 reasoned field by
+  field without mentioning it — so the struct wiped the key material and left
+  the message it protects in a freed buffer. `Debug` redacts it and `Drop` wipes
+  it. Whether the type should own the plaintext at all is open and tracked with
+  #262. (#266)
+
+- `daemonseed-tui`'s `JoinedCircle.entropy` held the canonicalized circle phrase
+  — the `cot_key` IKM — in a bare `pub String` for the whole session: no wipe on
+  drop, no redacted `Debug`, freely copyable out. #259 fixed this shape in the
+  core and the GUI and named only the GUI site. It now mirrors `PersistedCircle`
+  exactly: private `Zeroizing<String>`, `new()`, a borrowing accessor, a
+  redacted `Debug`, and no derived equality. (#268)
+
 - `dm::domain`'s label guards no longer parse their own source line by line, so
   a `rustfmt`-wrapped declaration cannot escape them. The parser joins each
   declaration to its terminating `;`, panics on a `pub const DM_` whose shape it

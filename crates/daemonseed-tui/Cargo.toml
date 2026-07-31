@@ -55,6 +55,11 @@ tonic = { workspace = true }
 
 anyhow = { workspace = true }
 
+# The session copy of a circle phrase is the `cot_key` IKM (ISC-C8), so
+# `JoinedCircle::entropy` is a `Zeroizing<String>` rather than a bare one —
+# the same shape the core and the GUI took in #259 (#268).
+zeroize = { workspace = true }
+
 # Per-platform Downloads directory resolver for the fetch download destination
 # (ISC-C68 / A3). Replaces the hand-rolled `$XDG_DOWNLOAD_DIR` / `$HOME/Downloads`
 # probe in `main::os_downloads_dir`.
