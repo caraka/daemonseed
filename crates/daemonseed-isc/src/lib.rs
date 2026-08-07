@@ -56,7 +56,7 @@
 //!   C40 DM static key record (publish + verify + rollback guard), #232;
 //!   WB-ISC-9/10/13 pos + WB-ISC-11/12 neg — the WB-3 write scheduler, #159;
 //!   WB-ISC-3/4/5/6/7 pos + WB-ISC-1/2/8 neg — the WB-1 presence model, #159.)
-//! - 241 total = 39 server + 126 client + 76 build-family
+//! - 243 total = 39 server + 128 client + 76 build-family
 //!   (WB-ISC 26, CRSH-ISC 28, DL-ISC 22). The per-family tallies above are the
 //!   authoritative breakdown; [`TOTAL`] is the compile-time-asserted sum.
 //!
