@@ -169,7 +169,7 @@ impl<T: Transport> Connection<Versioned, T> {
 // this state IS an application byte stream (ISC-S19 step 5 / ISC-C23).
 // `Negotiating` and `Versioned` deliberately do NOT impl these traits
 // — pre-auth application traffic is therefore a compile error, not a
-// runtime check (ISC-A6). The transport is `Unpin` (a `Transport`
+// runtime check (ISC-C23). The transport is `Unpin` (a `Transport`
 // supertrait bound), so the projections below are infallible.
 
 impl<T: Transport> Connection<Authenticated, T> {

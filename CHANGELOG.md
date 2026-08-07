@@ -24,6 +24,13 @@ next release this block is renamed to its version + date and a fresh
 `[Unreleased]` is opened (see `AGENTS.md` doc-sync). Planning for *unstarted*
 work lives in the project lead's vault manifest, not here.
 
+### Added
+
+- ISC-A-C43: no daemonseed-authored protocol message or sealed envelope falls
+  below CNSA 2.0, independently of the transport carrying it. Riding a
+  pre-CNSA-2.0 transport is permitted; emitting a pre-CNSA-2.0 envelope over it
+  is not.
+
 ### Removed
 
 - `daemonseed_core::tls` and the TLS dependency stack it existed for:
