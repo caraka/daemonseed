@@ -15,16 +15,13 @@ oxicrypt-kdf = { workspace = true }
 oxicrypt-aes = { workspace = true }
 oxicrypt-ml-dsa = { workspace = true }
 oxicrypt-ml-kem = { workspace = true }
-# oxicrypt primitives the CNSA 2.0 TLS provider exercises but daemonseed
-# doesn't call directly — declared so `kats` can assemble the complete
-# KATS slice for `oxicrypt_module::initialize_with_profile`.
+# oxicrypt primitives daemonseed does not call directly — declared so `kats`
+# can assemble the complete KATS slice for
+# `oxicrypt_module::initialize_with_profile`. ECDH is reached by no call path
+# at all; see the `kats` module header.
 oxicrypt-hmac = { workspace = true }
 oxicrypt-drbg = { workspace = true }
 oxicrypt-ecdh = { workspace = true }
-# TLS provider — `tls::install_provider` registers the CNSA 2.0 hybrid
-# `CryptoProvider`. rustls is pinned at workspace level.
-oxitls-rustls-provider = { workspace = true }
-rustls = { workspace = true }
 bip39 = { workspace = true }
 zeroize = { workspace = true }
 uuid = { workspace = true }
@@ -45,8 +42,6 @@ notify = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-# Test-only: oxitls's module-init shim for the `tls::install_provider` test.
-oxitls-rustls-provider = { workspace = true, features = ["testing"] }
 # Test-only: paused-time (`start_paused`) for the session-health cursor-tick oracles
 # (CRSH-ISC-2/9), as the WB scheduler oracles use it. Merges additively with the
 # non-dev tokio features.

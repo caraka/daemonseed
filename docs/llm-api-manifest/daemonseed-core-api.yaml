@@ -612,7 +612,7 @@ modules:
       Type-state Connection<S, T> machine (Invariant 3). ISC-C23
       mandates compile-time prevention of pre-APP_HELLO application
       traffic; this module's marker types + consuming transitions
-      enforce that without runtime checks. Concrete TLS streams plug
+      enforce that without runtime checks. A concrete stream plugs
       in via the Transport trait's blanket impl over
       `AsyncRead + AsyncWrite + Send + Unpin + 'static`.
       Negotiating -> Versioned (M4a) -> Authenticated (M4b). Only
@@ -2315,7 +2315,7 @@ types:
     fields:
       - name: transport
         type: T
-        description: The underlying TLS-handshaked transport.
+        description: The underlying transport.
       - name: _state
         type: "PhantomData<fn() -> S>"
         description: Zero-sized type-state marker.
@@ -2325,7 +2325,7 @@ types:
     kind: trait
     description: >-
       Marker trait. Blanket impl for any T: AsyncRead + AsyncWrite + Send +
-      Unpin + 'static. No daemonseed-side glue needed for concrete TLS streams.
+      Unpin + 'static. No daemonseed-side glue needed for a concrete stream.
 
   - name: ConnState
     module: daemonseed_core::connection
@@ -5253,8 +5253,8 @@ functions:
   - name: "Connection::<Negotiating, T>::from_handshaked_transport"
     module: daemonseed_core::connection
     description: >-
-      Wraps a freshly-TLS-handshaked transport. Constructor does not drive the
-      TLS handshake itself.
+      Wraps a freshly-established transport. Constructor does not drive any
+      handshake itself.
     signature: "pub fn from_handshaked_transport(transport: T) -> Self"
     parameters:
       - name: transport

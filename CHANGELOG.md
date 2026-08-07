@@ -24,6 +24,14 @@ next release this block is renamed to its version + date and a fresh
 `[Unreleased]` is opened (see `AGENTS.md` doc-sync). Planning for *unstarted*
 work lives in the project lead's vault manifest, not here.
 
+### Removed
+
+- `daemonseed_core::tls` and the TLS dependency stack it existed for:
+  the `oxitls-rustls-provider` and `oxitls-webpki-mldsa` path-dependencies,
+  and `rustls`, `rustls-pki-types`, `tokio-rustls`. Veilid supplies transport
+  security; daemonseed terminates no TLS. `oxicrypt` is now the only sibling
+  path-dependency, so a build needs only `../oxicrypt` checked out.
+
 ### Changed
 
 - The release profile panics on integer overflow (`[profile.release]

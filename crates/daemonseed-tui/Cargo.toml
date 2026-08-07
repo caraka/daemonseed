@@ -36,10 +36,8 @@ daemonseed-proto = { path = "../daemonseed-proto" }
 # (`src/veilid_net.rs`) that `net::NetHandle::new` spawns.
 daemonseed-veilid-net = { path = "../daemonseed-veilid-net" }
 
-# Process-wide CryptoProvider install — symmetric with cli/server. The TUI
-# initializes the same oxicrypt module + rustls provider before connecting.
+# Startup crypto-module init — symmetric with the GUI.
 oxicrypt-module = { workspace = true }
-oxitls-rustls-provider = { workspace = true }
 
 # Async runtime for the network side. The render loop stays on the main thread
 # (blocking crossterm event poll); network operations run on this runtime and
@@ -61,7 +59,6 @@ anyhow = { workspace = true }
 dirs = { workspace = true }
 
 [dev-dependencies]
-oxitls-rustls-provider = { workspace = true, features = ["testing"] }
 # Throwaway dirs for the M16 streaming-fetch persistence tests (the
 # downloads.idx round-trip and the abort-time partial-file cleanup).
 tempfile = { workspace = true }

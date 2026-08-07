@@ -1,22 +1,29 @@
 //! CNSA 2.0 KATS slice for production module initialization.
 //!
-//! `oxitls_rustls_provider::cnsa_2_0_hybrid_provider` requires
-//! `oxicrypt-module` to be in the `Operational` state. The caller drives
-//! that with `oxicrypt_module::initialize_with_profile(&kats,
+//! Every module-gated oxicrypt primitive requires `oxicrypt-module` to be
+//! in the `Operational` state before it can be called. Each front-end
+//! drives that at startup with
+//! `oxicrypt_module::initialize_with_profile(&kats,
 //! AlgorithmProfile::Cnsa2)`, passing a slice that union-covers every
-//! module-gated primitive the provider touches.
+//! gated primitive daemonseed touches.
 //!
-//! For the CNSA 2.0 transitional provider, the gated primitives are:
+//! The gated primitives are:
 //!
-//! - **SHA** — used by HMAC, KDF, transcript hashing, and the
-//!   server-id derivation.
-//! - **HMAC** — record-protection KDF salt path (HKDF inside oxicrypt-kdf).
-//! - **AES** — `TLS_AES_256_GCM_SHA384` record protection.
-//! - **KDF** — HKDF-SHA-384 expand/extract for TLS 1.3 key schedule.
-//! - **DRBG** — random source for ECDH/ML-KEM keygen + ML-DSA nonce path.
-//! - **ECDH** — SecP384r1 half of the hybrid key exchange.
-//! - **ML-KEM** — ML-KEM-1024 post-quantum half of the hybrid kx.
-//! - **ML-DSA** — ML-DSA-87 server identity + handshake signature.
+//! - **SHA** — SHA-384 for content addressing, transcript hashing, HMAC
+//!   and KDF.
+//! - **HMAC** — the HKDF salt path inside oxicrypt-kdf.
+//! - **AES** — AES-256-GCM AEAD sealing for shares, envelopes and DMs.
+//! - **KDF** — HKDF-SHA-384 expand/extract for the derivation root.
+//! - **DRBG** — random source for ML-KEM keygen and the ML-DSA nonce path.
+//! - **ECDH** — SecP384r1. **No longer reached by any daemonseed call
+//!   path**: it was the classical half of the TLS 1.3 hybrid key
+//!   exchange, retired with the TLS stack. Its KATs stay in the slice
+//!   because dropping a primitive from module init changes what the
+//!   power-up self-test covers, which is a crypto-boundary decision that
+//!   belongs in its own reviewed change rather than riding along with a
+//!   dependency removal.
+//! - **ML-KEM** — ML-KEM-1024 for DM key establishment.
+//! - **ML-DSA** — ML-DSA-87 identity and provenance signatures.
 //!
 //! Listing the union here (rather than pulling each crate's KATS at the
 //! call site in `main()`) keeps the production init shape in one place
@@ -24,10 +31,8 @@
 //! review. The slice is `pub const` so callers consume it without an
 //! extra allocation.
 //!
-//! Tests use the lighter-weight `oxitls_rustls_provider::testing::
-//! ensure_module_operational()` shim (DRBG-only KATs) — production
-//! must use this full slice because the module init is one-shot per
-//! process.
+//! Module init is one-shot per process, so production must use this
+//! full slice rather than a narrower per-test one.
 
 use oxicrypt_module::KatEntry;
 

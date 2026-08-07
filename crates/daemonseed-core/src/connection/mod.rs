@@ -50,30 +50,29 @@ pub use state::{Authenticated, ConnState, Negotiating, Versioned};
 // ── Transport trait ──────────────────────────────────────────────
 
 /// Abstract bidirectional byte-stream the [`Connection`] type-state
-/// wraps. Concrete TLS implementations live in `daemonseed-server`
-/// (server-side `tokio_rustls::server::TlsStream`) and
-/// `daemonseed-cli` (client-side equivalent). The trait is a marker —
-/// it carries no methods of its own; the supertrait bounds are what
-/// callers actually use.
+/// wraps. The trait is a marker — it carries no methods of its own;
+/// the supertrait bounds are what callers actually use.
 ///
 /// Implementations are free (any type satisfying the bounds gets the
-/// blanket impl), so concrete TLS streams need no daemonseed-side
-/// glue.
+/// blanket impl), so a concrete stream needs no daemonseed-side glue.
+///
+/// The type-state machine has no production implementor since the
+/// v0.33.0 Veilid cutover retired the TLS-terminated relay transport;
+/// it is exercised by the type-state spike test.
 pub trait Transport: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
 
 impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> Transport for T {}
 
 // ── Connection<S, T> ─────────────────────────────────────────────
 
-/// Type-state wrapper around a TLS-terminated transport. The state
-/// parameter `S` advances through [`Negotiating`] → [`Versioned`] →
-/// [`Authenticated`] via consuming transitions, dropping the prior
+/// Type-state wrapper around an authenticated-transport handshake. The
+/// state parameter `S` advances through [`Negotiating`] → [`Versioned`]
+/// → [`Authenticated`] via consuming transitions, dropping the prior
 /// state's value at the type level on each step. See module-level
 /// docs for the transition diagram.
 ///
-/// `T` is the underlying transport. For daemonseed-server,
-/// `T = tokio_rustls::server::TlsStream<tokio::net::TcpStream>`.
-/// For daemonseed-cli, the client-side equivalent.
+/// `T` is the underlying transport — any type meeting the [`Transport`]
+/// bounds.
 #[derive(Debug)]
 pub struct Connection<S: ConnState, T: Transport> {
     transport: T,

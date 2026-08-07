@@ -435,10 +435,11 @@ impl NetHandle {
     /// Spawn the dedicated network thread (current-thread tokio runtime inside a
     /// [`tokio::task::LocalSet`]) and the actor loop.
     ///
-    /// Caller contract: the process-wide CryptoProvider + oxicrypt module must be
-    /// installed before a `Connect` is sent (the binary does this at startup; the
-    /// in-process test drives it too). Building the channels + thread itself has
-    /// no such dependency, so `new` is infallible beyond the OS thread spawn.
+    /// Caller contract: the oxicrypt module must be `Operational` before a
+    /// `Connect` is sent (the binary drives `initialize_with_profile` at
+    /// startup; the in-process test drives it too). Building the channels +
+    /// thread itself has no such dependency, so `new` is infallible beyond the
+    /// OS thread spawn.
     pub fn new() -> std::io::Result<Self> {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (evt_tx, evt_rx) = mpsc::unbounded_channel();

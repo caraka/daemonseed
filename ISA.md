@@ -116,8 +116,8 @@ Immovable architectural mandates. These bind the *solution space*.
 - **Crypto: CNSA 2.0** — ML-DSA-87 (signature), ML-KEM-1024 (KEM), AES-256-GCM (AEAD), SHA-384 (hash) —
   via the oxicrypt crate. The architecture absorbs CNSA 2.1 via additive MINOR bumps (per-artifact
   suite-id agility; BIP-39 + HKDF derivation root).
-- **Transport: rustls + TLS 1.3 on :443**, ALPN `h2` (benign cover). Application-protocol identification
-  happens after the handshake (APP_HELLO), never in the TLS fingerprint.
+- **Transport: Veilid** (unconditional since the v0.33.0 cutover) — encrypted DHT and private routes
+  supply channel security and hide network location; daemonseed terminates no TLS of its own.
 - **Wire: gRPC over h2 (prost / tonic)**, proto3, checked-in codegen verified by `cargo xtask check-proto`.
 - **Storage: three-layer split** — passphrase-encrypted seeds file + redb indexed state + content-addressed
   chunk filesystem.
