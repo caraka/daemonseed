@@ -93,11 +93,16 @@
 //!
 //! Two things this store does **not** do, stated so no one reads them into it:
 //!
-//! - **It does not erase.** [`Locked::delete`] unlinks the name and makes the
-//!   unlink durable. The blocks behind it are not overwritten, and on an SSD or
-//!   a copy-on-write filesystem they could not usefully be — the same bound
-//!   [`crate::dm::provisional`] records for `ss0`. What deletion buys is that
-//!   the record is gone from the filesystem's view, not from the medium.
+//! - **It does not erase from the medium.** [`Locked::delete`] overwrites the
+//!   record in place before unlinking the name — two fsynced phases, every
+//!   [`RecordKind`] — so the payload is gone from every subsequent read and from
+//!   the blocks the filesystem believes it wrote. What it cannot reach is the
+//!   hardware beneath: an SSD's FTL remaps an overwrite onto a fresh block and a
+//!   copy-on-write filesystem writes a new extent by design, so an adversary
+//!   holding the raw flash is outside what any store here delivers. The same
+//!   bound [`crate::dm::provisional`] records for `ss0`. Note the asymmetry with
+//!   *replacement*, which is `rename(2)` and scrubs nothing — deliberate, and
+//!   argued where the trade is taken.
 //! - **It does not make the directory's shape invariant.** Fixed sizes hold
 //!   across clean runs. A process killed between a temp sibling's creation and
 //!   its rename leaves that sibling behind, so the entry count still tracks how
@@ -122,6 +127,52 @@ use crate::storage::atomic_file::{
     replace_atomically,
 };
 use crate::storage::seeds::AEAD_KEY_LEN;
+
+/// Marks a record whose erasure began and did not finish (#293).
+///
+/// Written and fsynced as the first phase of [`Locked::delete`], so a crash
+/// during a scrub leaves a record a reader can *name* rather than one that
+/// merely fails to open. Without it an interrupted erase is byte-indistinguishable
+/// from a truncated or tampered record, and a power cut would surface to the
+/// user as a possible attack — the false alarm that teaches people to ignore
+/// real ones.
+///
+/// It cannot collide with a live record. Every sealed kind begins with a random
+/// nonce, and the one unsealed kind ([`RecordKind::ReceiveCursor`]) begins with
+/// a length prefix whose first byte is bounded by that kind's small payload.
+/// `pub(crate)` so a sibling module's tests can synthesise the exact crash state
+/// — sentinel written, unlink not reached — rather than approximating it. Never
+/// used directly by the write or read paths: both go through
+/// [`erasure_sentinel`], which is the only place the length bound is expressed.
+pub(crate) const ERASURE_SENTINEL: &[u8; 32] = b"daemonseed/dm/store/erased/v1\0\0\0";
+
+/// The sentinel prefix for `kind`, bounded by that kind's own record length.
+///
+/// **One definition, because two would be a bug that no test could see.** The
+/// writer ([`scrub_in_place`]) and the reader ([`DmStore::read_record`]) must
+/// agree byte for byte: a writer that stamps more than the reader matches leaves
+/// an erase that reads as an ordinary record, and one that stamps less leaves it
+/// reading as `WrongFileLen` — the truncation shape the sentinel exists to
+/// displace. Expressing the bound twice made that agreement a convention held by
+/// nothing; expressing it here makes disagreement unconstructible.
+///
+/// The bound only ever bites for [`RecordKind::ReceiveCursor`]. Every sealed kind
+/// is `NONCE_LEN + LEN_PREFIX + capacity + TAG_LEN` ≥ 33 bytes, so its prefix is
+/// the whole 32; the unsealed cursor is [`RECEIVE_CURSOR_LEN`] = 8.
+///
+/// **Two floors this must not cross, and both are load-bearing rather than
+/// tidiness** — `record_kinds_admit_a_usable_sentinel` holds them:
+///
+/// 1. **At least [`NONCE_LEN`] for a sealed kind.** Phase 1's durability barrier
+///    is what makes the crash window safe, and it is safe *because* those bytes
+///    overwrite the AEAD nonce. Shortening the prefix below the nonce would leave
+///    an openable record across the window with nothing failing anywhere.
+/// 2. **Never empty.** `raw.starts_with(&[])` is unconditionally true, so a kind
+///    with a zero-length record would read every record it has as an interrupted
+///    erase.
+fn erasure_sentinel(kind: RecordKind) -> &'static [u8] {
+    &ERASURE_SENTINEL[..ERASURE_SENTINEL.len().min(kind.on_disk_len())]
+}
 
 /// Bytes in a [`CorrespondenceLabel`].
 pub const CORRESPONDENCE_LABEL_LEN: usize = 32;
@@ -612,6 +663,23 @@ impl DmStore {
                 actual: raw.len(),
             });
         }
+
+        // An erase that began and did not finish. Named rather than left to
+        // fail as a seal-open error, so a power cut mid-`delete` cannot present
+        // as a tampered record (#293).
+        //
+        // Through `erasure_sentinel`, which is also what the writer uses — the
+        // two cannot drift, because there is only one of them.
+        //
+        // No legitimate record can match. The sealed kinds open with a random
+        // nonce. The unsealed cursor is a big-endian page number bounded by
+        // `MAX_PAGE` (`u64::MAX / PAGE_SLOTS`), while the sentinel's first eight
+        // bytes decode to 7_233_173_997_229_077_349 — over six times MAX_PAGE,
+        // so `ReceiveCursor::new` cannot construct a colliding value at all.
+        // That is a bound, not an improbability.
+        if raw.starts_with(erasure_sentinel(kind)) {
+            return Err(DmStoreError::ErasureInterrupted { kind });
+        }
         if !kind.is_sealed() {
             return Ok(Some(raw));
         }
@@ -664,6 +732,23 @@ impl DmStore {
             for candidate in inner {
                 let candidate = candidate.map_err(|e| DmStoreError::io(&dir, e))?;
                 if !is_temp_sibling(&candidate.file_name()) {
+                    continue;
+                }
+                // Scrubbed first, for the same reason `delete` scrubs: the
+                // sibling may hold a whole sealed record, so unlinking it bare
+                // leaves recoverable ciphertext in unallocated blocks.
+                //
+                // **A sibling that cannot be scrubbed is skipped, not fatal, and
+                // the asymmetry with `delete` is deliberate.** This runs inside
+                // `DmStore::open`, so returning an error here makes the whole
+                // store unopenable — and a mode-0444 sibling, or a directory
+                // whose name happens to match, would brick it permanently for
+                // every correspondence. Skipping costs nothing that matters:
+                // the file stays exactly where it already was, unscrubbed, which
+                // is the state before this sweep existed. Unlinking it anyway is
+                // the one option that would be worse than both, since it
+                // launders the ciphertext out of reach while reporting success.
+                if scrub_orphan(&candidate.path()).is_err() {
                     continue;
                 }
                 match std::fs::remove_file(candidate.path()) {
@@ -908,19 +993,50 @@ impl Locked<'_> {
     /// Deleting a record that is not there is `Ok(())`: the postcondition is
     /// "this record does not exist", and it already holds.
     ///
-    /// **What "durable" means here, exactly.** The name is unlinked and the
-    /// parent directory is fsynced, so the removal survives a power cut rather
-    /// than reverting to a directory entry still naming the record. It does
-    /// **not** overwrite the blocks the record occupied, and on an SSD's FTL or a
-    /// copy-on-write filesystem it could not usefully — the bound
-    /// [`crate::dm::provisional`] already records for `ss0`. An adversary with
-    /// the raw flash is outside what this can deliver, and nothing here should be
-    /// read as claiming otherwise.
+    /// **The record is scrubbed before it is unlinked** (#293). Unlinking alone
+    /// leaves the record's blocks unreferenced but intact, so an adversary who
+    /// reads unallocated blocks and later obtains the profile key recovers the
+    /// sealed record and opens it — for the provisional record that is `ss0`,
+    /// which roots `RK0` and reopens the early chain. Every kind is scrubbed,
+    /// not only that one: the resume record holds A9.2's key material under the
+    /// same later-compromise threat.
+    ///
+    /// Two phases, and the order is the point. An erasure sentinel is written
+    /// and **fsynced first**, so a crash from that moment on leaves something a
+    /// reader can identify as an interrupted erase
+    /// ([`DmStoreError::ErasureInterrupted`]) rather than as a truncated or
+    /// tampered record. The body is then overwritten and fsynced, and only then
+    /// is the name unlinked and the directory fsynced.
+    ///
+    /// **The fsync between the scrub and the unlink is load-bearing, not
+    /// hygiene.** Without it the overwrite may still be dirty page cache when
+    /// the name goes away, and a filesystem is free to never write those blocks
+    /// at all — the scrub would be a no-op that looked like a fix.
+    ///
+    /// **The ceiling, stated honestly.** On an SSD the FTL remaps an overwrite
+    /// to a fresh erase block, and a copy-on-write filesystem writes a new
+    /// extent by design; in both cases the original blocks survive untouched.
+    /// This buys real erasure on ext4-over-LUKS on rotating or dm-mapped
+    /// storage and buys nothing against an adversary with the raw flash. It is
+    /// best-effort by construction and no caller should read it as a guarantee.
+    ///
+    /// Deleting a record that is not there is `Ok(())`: the postcondition is
+    /// "this record does not exist", and it already holds.
     pub fn delete(&mut self, kind: RecordKind) -> Result<(), DmStoreError> {
         let path = self.path(kind);
+
+        // Phase 1 + 2: scrub. A record that vanished between the caller's last
+        // look and here is not an error — the postcondition already holds.
+        match std::fs::OpenOptions::new().write(true).open(&path) {
+            Ok(file) => scrub_in_place(&file, &path, kind)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(DmStoreError::io(&path, e)),
+        }
+
+        // Phase 3: unlink, then make the removal itself durable.
         match std::fs::remove_file(&path) {
             Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(DmStoreError::io(&path, e)),
         }
         RealDurability
@@ -941,6 +1057,96 @@ impl Locked<'_> {
     pub fn present(&self) -> Result<Vec<RecordKind>, DmStoreError> {
         self.store.present_unlocked(&self.label)
     }
+}
+
+/// Overwrite `file`'s whole length in two fsynced phases: sentinel, then body.
+///
+/// Split because the phases answer different questions. Phase 1 makes an
+/// interrupted erase *nameable* — after its barrier, any crash leaves the
+/// sentinel on the medium, so a reader reports [`DmStoreError::ErasureInterrupted`]
+/// instead of a corrupt record. Phase 2 destroys the payload. Collapsing them
+/// into one write would leave a torn write looking like tampering, which is the
+/// state phase 1 exists to prevent.
+///
+/// Both barriers are real fsyncs through [`Durability`], not `flush` — a flush
+/// pushes bytes to the kernel and stops there, and the unlink that follows would
+/// be free to discard them still-dirty.
+///
+/// **The sentinel is bounded by the kind's own length, because the shortest kind
+/// is shorter than the sentinel.** [`RecordKind::ReceiveCursor`] is
+/// [`RECEIVE_CURSOR_LEN`] bytes against a 32-byte sentinel, so writing the whole
+/// sentinel would *grow* the file: phase 2's loop would never be entered and a
+/// reader would report [`DmStoreError::WrongFileLen`] — precisely the truncation
+/// shape the sentinel exists to displace. The bound lives in
+/// [`erasure_sentinel`], which [`DmStore::read_record`] also calls, so the writer
+/// and the reader cannot disagree about it.
+///
+/// **The overwrite covers the file's real length, never only its declared one.**
+/// A file longer than its kind is refused on read, but it can exist on disk — and
+/// bounding the loop by `on_disk_len` alone would leave that tail unscrubbed,
+/// which is the one outcome this function exists to prevent.
+fn scrub_in_place(file: &std::fs::File, path: &Path, kind: RecordKind) -> Result<(), DmStoreError> {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let io = |e: std::io::Error| DmStoreError::io(path, e);
+
+    let declared = kind.on_disk_len();
+    let actual = file.metadata().map_err(io)?.len();
+    let len = (declared as u64).max(actual);
+
+    // Phase 1 — the sentinel, made durable before anything else changes.
+    let sentinel = erasure_sentinel(kind);
+    let mut f = file;
+    f.seek(SeekFrom::Start(0)).map_err(io)?;
+    f.write_all(sentinel).map_err(io)?;
+    RealDurability.sync_file(file).map_err(io)?;
+
+    // Phase 2 — the rest of the record.
+    zero_from(file, sentinel.len() as u64, len).map_err(io)?;
+    RealDurability.sync_file(file).map_err(io)?;
+    Ok(())
+}
+
+/// Overwrite `[from, len)` with zeros, in bounded chunks so a large bucket (the
+/// outbox is the biggest) does not allocate a second copy of itself.
+fn zero_from(mut f: &std::fs::File, from: u64, len: u64) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+
+    const CHUNK: usize = 8 * 1024;
+    let zeros = [0u8; CHUNK];
+    f.seek(SeekFrom::Start(from))?;
+    let mut written = from;
+    while written < len {
+        let n = (CHUNK as u64).min(len - written);
+        f.write_all(&zeros[..n as usize])?;
+        written += n;
+    }
+    Ok(())
+}
+
+/// Overwrite an orphaned temp sibling before it is unlinked.
+///
+/// A crashed [`super::atomic_file`] write leaves behind whatever had reached the
+/// file when the process died — which may be the **whole sealed record**, since
+/// the kill can land after `write_all` and before the barrier. So unlinking a
+/// sibling unscrubbed reopens precisely the exposure [`Locked::delete`] exists to
+/// close, by a path that never passes through `delete` at all. The overwrite is
+/// bounded by the file's actual length rather than any kind's declared one, so a
+/// partial sibling is handled by the same code without a special case.
+///
+/// No sentinel is written. A sentinel exists to make an interrupted erase
+/// *nameable* to a reader, and nothing ever reads a temp sibling as a record:
+/// [`Locked::present`] derives the names it looks for rather than listing the
+/// directory. There is no state here to name, only bytes to destroy.
+fn scrub_orphan(path: &Path) -> Result<(), DmStoreError> {
+    let io = |e: std::io::Error| DmStoreError::io(path, e);
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(io)?;
+    let len = file.metadata().map_err(io)?.len();
+    zero_from(&file, 0, len).map_err(io)?;
+    RealDurability.sync_file(&file).map_err(io)
 }
 
 /// Whether `name` is a temp sibling left by [`super::atomic_file`].
@@ -1036,6 +1242,16 @@ pub enum DmStoreError {
         expected: usize,
         actual: usize,
     },
+    /// The record carries the erasure sentinel: a [`Locked::delete`] began and
+    /// was interrupted before the unlink (#293).
+    ///
+    /// **Its own variant because the remedy and the story differ.** The record
+    /// is gone for practical purposes — its payload is scrubbed or being
+    /// scrubbed — but it is gone *because this daemon deleted it*, not because
+    /// anything tampered with it. Folding this into the seal-open failure would
+    /// report a power cut as a possible attack, and a user who is told that
+    /// once too often stops believing it when it is true.
+    ErasureInterrupted { kind: RecordKind },
 
     /// The payload is larger than the kind's bucket. Refused rather than
     /// truncated.
@@ -1117,6 +1333,12 @@ impl core::fmt::Display for DmStoreError {
             DmStoreError::NotAuthentic { kind } => {
                 write!(f, "the {kind:?} record did not open")
             }
+            DmStoreError::ErasureInterrupted { kind } => write!(
+                f,
+                "the {kind:?} record was being erased and the erase did not \
+                 finish; its contents are gone, and this is a deletion that was \
+                 cut short, not a tampered record"
+            ),
             DmStoreError::WrongFileLen {
                 kind,
                 expected,
@@ -1167,6 +1389,7 @@ impl core::error::Error for DmStoreError {
             | DmStoreError::Kdf
             | DmStoreError::Module
             | DmStoreError::NotAuthentic { .. }
+            | DmStoreError::ErasureInterrupted { .. }
             | DmStoreError::WrongFileLen { .. }
             | DmStoreError::PayloadTooLong { .. }
             | DmStoreError::UnsealedPayloadNotExact { .. }
@@ -1707,6 +1930,257 @@ mod tests {
         }
     }
 
+    /// The point of #293: the payload must be *gone from the bytes*, not merely
+    /// unreferenced. Scrub without unlinking so the file survives to be read
+    /// back — a test that deleted first could only observe absence, which an
+    /// unlink alone already produces and which is exactly the thing that was
+    /// not enough.
+    #[test]
+    fn a_scrub_overwrites_the_payload_it_replaces() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let l = label(60);
+        let secret = payload(4096);
+
+        s.critical_section::<_, DmStoreError>(&l, |g| g.replace(RecordKind::Outbox, &secret))
+            .unwrap();
+
+        let path = tmp
+            .path()
+            .join("dm")
+            .join(l.dir_name())
+            .join(RecordKind::Outbox.file_name());
+
+        // Positive control: the sealed record is on disk and is NOT the sentinel
+        // yet, so a scrub that did nothing would be visible below.
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(before.len(), RecordKind::Outbox.on_disk_len());
+        assert!(!before.starts_with(ERASURE_SENTINEL));
+
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        scrub_in_place(&file, &path, RecordKind::Outbox).unwrap();
+        drop(file);
+
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(after.len(), before.len(), "a scrub must not resize");
+        assert!(after.starts_with(ERASURE_SENTINEL), "sentinel not written");
+        assert!(
+            after[ERASURE_SENTINEL.len()..].iter().all(|&b| b == 0),
+            "the body past the sentinel is not scrubbed"
+        );
+        assert_ne!(before, after, "the scrub changed nothing");
+    }
+
+    /// Every other scrub test here calls [`scrub_in_place`] directly, so none of
+    /// them pins that `delete` *reaches* it — measured, not assumed: reverting
+    /// `delete` to a plain unlink passed all of them. `delete` destroys its own
+    /// evidence by unlinking, so the observable is the barrier count: a
+    /// scrubbing delete drives two file barriers and one directory barrier,
+    /// where a plain unlink drives only the directory one.
+    #[test]
+    fn delete_reaches_the_scrub_and_not_only_the_unlink() {
+        use crate::storage::atomic_file::{dir_syncs, file_syncs};
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let l = label(64);
+        s.critical_section::<_, DmStoreError>(&l, |g| g.replace(RecordKind::Provisional, b"ss0"))
+            .unwrap();
+
+        let files_before = file_syncs();
+        let dirs_before = dir_syncs();
+        s.critical_section::<_, DmStoreError>(&l, |g| g.delete(RecordKind::Provisional))
+            .unwrap();
+
+        assert_eq!(
+            file_syncs() - files_before,
+            2,
+            "delete did not drive the scrub's two file barriers — it is unlinking without scrubbing"
+        );
+        assert!(
+            dir_syncs() > dirs_before,
+            "delete did not make the unlink durable"
+        );
+        assert!(
+            s.read_unlocked(&l, RecordKind::Provisional)
+                .unwrap()
+                .is_none(),
+            "the record should be gone"
+        );
+    }
+
+    /// The fsync between the scrub and the unlink is the difference between an
+    /// erasure and a no-op that looks like one: without it the overwrite can sit
+    /// in dirty page cache and be discarded when the name goes away. Nothing
+    /// about the resulting *bytes* would differ in a test, so assert the
+    /// barriers were actually performed.
+    #[test]
+    fn a_scrub_drives_two_real_file_barriers() {
+        use crate::storage::atomic_file::file_syncs;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let l = label(61);
+        s.critical_section::<_, DmStoreError>(&l, |g| g.replace(RecordKind::Resume, b"k"))
+            .unwrap();
+
+        let path = tmp
+            .path()
+            .join("dm")
+            .join(l.dir_name())
+            .join(RecordKind::Resume.file_name());
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+
+        let before = file_syncs();
+        scrub_in_place(&file, &path, RecordKind::Resume).unwrap();
+        let after = file_syncs();
+
+        assert_eq!(
+            after - before,
+            2,
+            "expected one barrier for the sentinel and one for the body"
+        );
+    }
+
+    /// A crash between the two barriers leaves the sentinel and nothing else.
+    /// The reader must name that state rather than reporting the uniform
+    /// authentication failure a tampered record produces.
+    #[test]
+    fn a_half_scrubbed_record_reads_as_an_interrupted_erase() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let l = label(62);
+        s.critical_section::<_, DmStoreError>(&l, |g| g.replace(RecordKind::Resume, b"k"))
+            .unwrap();
+
+        // Simulate the crash window: sentinel present, body untouched.
+        let path = tmp
+            .path()
+            .join("dm")
+            .join(l.dir_name())
+            .join(RecordKind::Resume.file_name());
+        let mut raw = std::fs::read(&path).unwrap();
+        raw[..ERASURE_SENTINEL.len()].copy_from_slice(ERASURE_SENTINEL);
+        std::fs::write(&path, &raw).unwrap();
+
+        let err = s
+            .read_unlocked(&l, RecordKind::Resume)
+            .expect_err("a sentinel-bearing record must not read as a record");
+        assert!(
+            matches!(err, DmStoreError::ErasureInterrupted { kind } if kind == RecordKind::Resume),
+            "wrong error for an interrupted erase: {err}"
+        );
+        // The distinction is the whole point — it must not read as tampering.
+        assert!(!matches!(err, DmStoreError::NotAuthentic { .. }));
+    }
+
+    /// Every kind is scrubbed, not only the provisional record that #293 named,
+    /// and the postcondition is stated over the **whole** file so no assertion
+    /// here can go vacuous.
+    ///
+    /// The version this replaces asserted `after[ERASURE_SENTINEL.len()..]` was
+    /// all zero. On [`RecordKind::ReceiveCursor`] — 8 bytes against a 32-byte
+    /// sentinel — that is an empty slice and trivially true, so the test passed
+    /// while the cursor was not scrubbed at all. It also never called `delete`,
+    /// despite its name; that half is now
+    /// `delete_reaches_the_scrub_for_every_kind`.
+    #[test]
+    fn scrub_erases_every_record_kind_without_resizing() {
+        for kind in RecordKind::ALL {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = store(tmp.path());
+            let l = label(63);
+            // `ReceiveCursor` is unsealed and takes an exact-width payload; the
+            // sealed kinds take any length up to their capacity.
+            let body: &[u8] = if kind == RecordKind::ReceiveCursor {
+                &[0xA5; RECEIVE_CURSOR_LEN]
+            } else {
+                b"secret"
+            };
+            s.critical_section::<_, DmStoreError>(&l, |g| g.replace(kind, body))
+                .unwrap();
+
+            let path = tmp
+                .path()
+                .join("dm")
+                .join(l.dir_name())
+                .join(kind.file_name());
+            let sentinel = &ERASURE_SENTINEL[..ERASURE_SENTINEL.len().min(kind.on_disk_len())];
+
+            // Positive control: a real record of the right width is there and is
+            // not already scrubbed, so a scrub that did nothing fails below.
+            let before = std::fs::read(&path).unwrap();
+            assert_eq!(before.len(), kind.on_disk_len(), "{kind:?}: wrong width");
+            assert!(!before.starts_with(sentinel), "{kind:?}: already scrubbed");
+
+            let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            scrub_in_place(&file, &path, kind).unwrap();
+            drop(file);
+
+            let after = std::fs::read(&path).unwrap();
+
+            // Kills the unbounded-sentinel defect directly: writing all 32 bytes
+            // grew the cursor 8 -> 32, which a reader reports as `WrongFileLen`
+            // — the truncation shape the sentinel exists to displace.
+            assert_eq!(
+                after.len(),
+                before.len(),
+                "{kind:?}: a scrub must not resize the record"
+            );
+
+            // Stated over every byte, so it covers the cursor — where the
+            // sentinel spans the entire record and there is no tail — exactly as
+            // it covers the sealed kinds, where there is.
+            assert!(
+                after
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &b)| if i < sentinel.len() {
+                        b == sentinel[i]
+                    } else {
+                        b == 0
+                    }),
+                "{kind:?}: the scrubbed record is not the sentinel followed by zeros"
+            );
+            assert_ne!(before, after, "{kind:?}: the scrub changed nothing");
+        }
+    }
+
+    /// `delete` must reach the scrub for **every** kind, not just the provisional
+    /// record the barrier test above pins. `delete` unlinks and so destroys its
+    /// own byte-level evidence; the observable is the barrier count, which the
+    /// seam already exposes.
+    #[test]
+    fn delete_reaches_the_scrub_for_every_kind() {
+        use crate::storage::atomic_file::file_syncs;
+        for kind in RecordKind::ALL {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = store(tmp.path());
+            let l = label(65);
+            let body: &[u8] = if kind == RecordKind::ReceiveCursor {
+                &[0xA5; RECEIVE_CURSOR_LEN]
+            } else {
+                b"secret"
+            };
+            s.critical_section::<_, DmStoreError>(&l, |g| g.replace(kind, body))
+                .unwrap();
+
+            let files_before = file_syncs();
+            s.critical_section::<_, DmStoreError>(&l, |g| g.delete(kind))
+                .unwrap();
+
+            assert_eq!(
+                file_syncs() - files_before,
+                2,
+                "{kind:?}: delete did not drive the scrub's two file barriers — \
+                 it is unlinking without scrubbing"
+            );
+            assert!(
+                s.read_unlocked(&l, kind).unwrap().is_none(),
+                "{kind:?}: the record should be gone"
+            );
+        }
+    }
+
     #[test]
     fn delete_removes_one_record_and_leaves_the_others() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1859,6 +2333,220 @@ mod tests {
     }
 
     // ---- invariant 4: the orphan sweep -------------------------------------
+
+    /// An orphan is a **complete sealed record**, not a fragment, so the sweep
+    /// must scrub it before unlinking — otherwise ciphertext the store promises
+    /// to erase leaves by a path that never passes through `delete`.
+    ///
+    /// The sweep destroys its own byte-level evidence by unlinking, so the
+    /// observable is the barrier count — and it is measured **differentially**
+    /// against an otherwise identical open with no orphans present. An absolute
+    /// threshold would pass vacuously if `open` happened to drive enough barriers
+    /// of its own; the delta cannot. `scrub_orphan_zeroes_the_whole_file` holds
+    /// the byte-level half.
+    #[test]
+    fn the_sweep_scrubs_orphans_before_unlinking_them() {
+        use crate::storage::atomic_file::file_syncs;
+
+        /// One populated correspondence, optionally with two orphans beside it.
+        fn setup(with_orphans: bool) -> (tempfile::TempDir, Vec<std::path::PathBuf>) {
+            let tmp = tempfile::tempdir().unwrap();
+            let l = label(17);
+            let dir = tmp.path().join("dm").join(l.dir_name());
+            {
+                let s = store(tmp.path());
+                s.critical_section::<_, DmStoreError>(&l, |g| {
+                    g.replace(RecordKind::Resume, b"alive")
+                })
+                .unwrap();
+            }
+            let orphans = if with_orphans {
+                let paths = vec![
+                    dir.join("resume.bin.tmp.00112233445566778899aabb"),
+                    dir.join("outbox.bin.tmp.ffeeddccbbaa998877665544"),
+                ];
+                for p in &paths {
+                    std::fs::write(p, [0xC3u8; 512]).unwrap();
+                }
+                paths
+            } else {
+                Vec::new()
+            };
+            (tmp, orphans)
+        }
+
+        // Control: the same open, same record, no orphans. Whatever `open` costs
+        // in barriers on its own is measured here rather than guessed at.
+        let (control_tmp, _) = setup(false);
+        let before = file_syncs();
+        let control_store = store(control_tmp.path());
+        let baseline = file_syncs() - before;
+        drop(control_store);
+
+        let (tmp, orphans) = setup(true);
+        assert!(
+            orphans.iter().all(|o| o.exists()),
+            "positive control: the orphans must be there before the sweep"
+        );
+        let before = file_syncs();
+        let swept = store(tmp.path());
+        let measured = file_syncs() - before;
+
+        assert_eq!(
+            measured - baseline,
+            2,
+            "the sweep drove no extra file barrier per orphan — it is unlinking \
+             complete sealed records without scrubbing them"
+        );
+        assert!(
+            orphans.iter().all(|o| !o.exists()),
+            "the sweep must still remove the orphans"
+        );
+        drop(swept);
+    }
+
+    /// A scrubbed **cursor** must read back as an interrupted erase.
+    ///
+    /// This is the probe the read-side bound had none of, and the gap was not
+    /// cosmetic. `min(32, on_disk_len)` differs from 32 for exactly one kind —
+    /// every sealed kind is `NONCE_LEN + LEN_PREFIX + capacity + TAG_LEN` ≥ 33 —
+    /// so `ReceiveCursor` is the *only* input that can tell a bounded read from
+    /// an unbounded one. Every other `ErasureInterrupted` assertion in the tree
+    /// is on a ≥32-byte kind, which is why reverting `read_record` to
+    /// `raw.starts_with(ERASURE_SENTINEL)` left the whole suite green: an 8-byte
+    /// file cannot start with 32 bytes, so it fell through to the unsealed arm
+    /// and came back as `Ok(Some(..))` — a **valid-looking cursor made of
+    /// sentinel bytes**.
+    #[test]
+    fn a_scrubbed_cursor_reads_as_an_interrupted_erase() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let l = label(66);
+        s.critical_section::<_, DmStoreError>(&l, |g| {
+            g.replace(RecordKind::ReceiveCursor, &[0xA5; RECEIVE_CURSOR_LEN])
+        })
+        .unwrap();
+
+        // Positive control: it reads as a record before the scrub.
+        assert!(
+            s.read_unlocked(&l, RecordKind::ReceiveCursor)
+                .unwrap()
+                .is_some(),
+            "the cursor must be readable before it is scrubbed"
+        );
+
+        let path = tmp
+            .path()
+            .join("dm")
+            .join(l.dir_name())
+            .join(RecordKind::ReceiveCursor.file_name());
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        scrub_in_place(&file, &path, RecordKind::ReceiveCursor).unwrap();
+        drop(file);
+
+        let err = s
+            .read_unlocked(&l, RecordKind::ReceiveCursor)
+            .expect_err("a scrubbed cursor must not read as a cursor");
+        assert!(
+            matches!(
+                err,
+                DmStoreError::ErasureInterrupted { kind } if kind == RecordKind::ReceiveCursor
+            ),
+            "wrong error for a scrubbed cursor: {err}"
+        );
+    }
+
+    /// The two floors the bounded sentinel must not cross, named in
+    /// [`erasure_sentinel`]'s docs and held here.
+    ///
+    /// The nonce floor is the load-bearing one: phase 1's barrier makes the crash
+    /// window safe *because* those bytes land on the AEAD nonce. Shortening the
+    /// prefix below `NONCE_LEN` would leave a still-openable record across the
+    /// window with nothing anywhere failing.
+    #[test]
+    fn record_kinds_admit_a_usable_sentinel() {
+        for kind in RecordKind::ALL {
+            let sentinel = erasure_sentinel(kind);
+            assert!(
+                !sentinel.is_empty(),
+                "{kind:?}: an empty sentinel makes `starts_with` always true, so \
+                 every record of this kind would read as an interrupted erase"
+            );
+            if kind.is_sealed() {
+                assert!(
+                    sentinel.len() >= NONCE_LEN,
+                    "{kind:?}: the sentinel must cover the AEAD nonce, else a \
+                     crash mid-erase leaves an openable record"
+                );
+            }
+        }
+    }
+
+    /// A file longer than its kind keeps no unscrubbed tail.
+    ///
+    /// The `max(declared, actual)` branch had no coverage at all: every other
+    /// fixture is exact-width, so `let len = declared` survived the suite — on the
+    /// very line whose doc calls the unscrubbed tail the one outcome the function
+    /// exists to prevent.
+    #[test]
+    fn a_longer_than_declared_file_is_scrubbed_to_its_real_length() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let l = label(67);
+        s.critical_section::<_, DmStoreError>(&l, |g| g.replace(RecordKind::Resume, b"k"))
+            .unwrap();
+
+        let path = tmp
+            .path()
+            .join("dm")
+            .join(l.dir_name())
+            .join(RecordKind::Resume.file_name());
+
+        // Append a tail past the declared width, as a truncated-then-regrown file
+        // or a partial overwrite could leave.
+        let declared = RecordKind::Resume.on_disk_len();
+        let mut raw = std::fs::read(&path).unwrap();
+        raw.extend_from_slice(&[0xD7; 1024]);
+        std::fs::write(&path, &raw).unwrap();
+        assert_eq!(raw.len(), declared + 1024, "fixture is not over-long");
+
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        scrub_in_place(&file, &path, RecordKind::Resume).unwrap();
+        drop(file);
+
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(after.len(), declared + 1024, "a scrub must not resize");
+        assert!(
+            after[declared..].iter().all(|&b| b == 0),
+            "the tail past the declared length was left unscrubbed"
+        );
+        // And the tail assertion is not vacuous.
+        assert_eq!(after[declared..].len(), 1024);
+    }
+
+    /// The byte-level half of the orphan claim: zeroed end to end, and no
+    /// sentinel — a sentinel names an interrupted erase *to a reader*, and
+    /// nothing ever reads a temp sibling as a record.
+    #[test]
+    fn scrub_orphan_zeroes_the_whole_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("resume.bin.tmp.0123456789abcdef01234567");
+        let secret = [0xC3u8; 4096];
+        std::fs::write(&path, secret).unwrap();
+
+        // Positive control: the payload is genuinely there first.
+        let before = std::fs::read(&path).unwrap();
+        assert!(before.contains(&0xC3), "nothing to scrub");
+
+        scrub_orphan(&path).unwrap();
+
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(after.len(), before.len(), "a scrub must not resize");
+        assert!(
+            after.iter().all(|&b| b == 0),
+            "the orphan kept payload bytes"
+        );
+    }
 
     #[test]
     fn open_sweeps_orphans_and_leaves_real_records_alone() {

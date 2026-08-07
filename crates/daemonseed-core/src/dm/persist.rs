@@ -76,11 +76,17 @@
 //! ## What erasure means here
 //!
 //! [`PendingHandshake::establish`] deletes the provisional record, and
-//! [`Locked::delete`](crate::storage::dm_store::Locked::delete) unlinks the name
-//! and fsyncs the directory. The blocks are **not** overwritten — the same bound
-//! [`crate::dm::provisional`] records for `ss0` and the store repeats for every
-//! kind. So what establishment buys is that `ss0` is gone from the filesystem's
-//! view and from every subsequent read, not that it is gone from the medium.
+//! [`Locked::delete`](crate::storage::dm_store::Locked::delete) overwrites it in
+//! place — two fsynced phases — before unlinking the name and fsyncing the
+//! directory. So `ss0` is gone from the filesystem's view, from every subsequent
+//! read, and from the blocks the filesystem believes it wrote. What it is **not**
+//! gone from is the medium: the FTL and copy-on-write bound that
+//! [`crate::dm::provisional`] records and the store repeats for every kind.
+//!
+//! The erase is not free of consequence. A crash inside it destroys a handshake
+//! that a pre-scrub crash would have left resumable; [`PendingHandshake::establish`]
+//! carries the argument for accepting that, and an interrupted erase is reported
+//! as a lost record rather than an unreadable store.
 
 use std::path::PathBuf;
 
@@ -304,9 +310,26 @@ impl DmPersist {
         correspondence: &CorrespondenceLabel,
         ctx: &RecordContext<'_>,
     ) -> StoredChannelRestart<'_> {
-        let read = self
+        // An interrupted erase is a record the store **lost**, not a store it
+        // could not read, and the difference is load-bearing rather than
+        // cosmetic. `StoreUnreadable`'s whole contract is that "nothing is
+        // declared lost and nothing is asked of the user", and it makes the
+        // outbox retain what it has queued — correct for an `EIO` over a record
+        // still sitting on disk, wrong here, where the payload is destroyed and
+        // is not coming back. Reporting it that way would leave the caller
+        // waiting on a handshake that no longer exists.
+        //
+        // `NoProvisionalRecord` already documents itself as covering "a record
+        // the store lost", where the remedy is to start the conversation again —
+        // which is exactly the remedy here. See `PendingHandshake::establish` for
+        // why this window exists at all and why it was accepted.
+        let read = match self
             .store
-            .read_unlocked(correspondence, RecordKind::Provisional);
+            .read_unlocked(correspondence, RecordKind::Provisional)
+        {
+            Err(DmStoreError::ErasureInterrupted { .. }) => Ok(None),
+            other => other,
+        };
         // Borrowed rather than moved so the store's error survives as itself:
         // `restart` needs only `Display`, and lowering the error to `None` here
         // is precisely the collapse its `Result` argument exists to refuse.
@@ -559,16 +582,34 @@ impl PendingHandshake<'_> {
     /// **The ratchet is built first, and a failed deletion returns an error
     /// rather than the ratchet.** Both orderings can fail; they fail
     /// differently. Deleting first and then failing to open the ratchet would
-    /// destroy a handshake that was still recoverable, over what is most
-    /// plausibly a transient module fault. Opening first and then failing to
-    /// delete leaves the record on disk — but the caller is told, does not get a
-    /// ratchet, and finds the record again on the next
-    /// [`DmPersist::restart_channel`], so the whole call is a safe retry. The
-    /// direction to fail in is the one where nothing is lost and nothing is
-    /// silently kept.
+    /// destroy a handshake over what is most plausibly a transient module fault.
+    /// Opening first and then failing to delete leaves the record on disk — the
+    /// caller is told, does not get a ratchet, and finds the record again on the
+    /// next [`DmPersist::restart_channel`].
     ///
-    /// The deletion is durable — the name is unlinked and the directory
-    /// fsynced — but the blocks are not overwritten; see the module docs.
+    /// **A crash inside the erase itself is not recoverable, and that is the
+    /// accepted trade.** The deletion scrubs before it unlinks
+    /// ([`Locked::delete`](crate::storage::dm_store::Locked::delete)), so a crash
+    /// after the scrub's first barrier leaves a record that no longer opens: a
+    /// handshake that a pre-scrub crash would have left resumable is destroyed.
+    /// Three things settle it that way. The trade is **forced by the design** —
+    /// the steady-state ratchet is deliberately never persisted, which is what
+    /// makes erasing `ss0` worth anything, so there is nothing to durably commit
+    /// before the delete and no restructuring survives the crash without
+    /// persisting exactly what the design refuses. The two losses **differ in
+    /// kind** — a destroyed provisional record costs the availability of one
+    /// in-progress handshake, recoverable by redoing first contact; leaving the
+    /// blocks intact costs the confidentiality of `ss0`, which roots `RK0` and
+    /// reopens the early chain, permanently, against a later key compromise. And
+    /// the **frequencies are asymmetric** — the scrub protects every
+    /// establishment, while this window is bounded by two fsyncs on one small
+    /// file inside a single critical section.
+    ///
+    /// The failure stays legible rather than silent: an interrupted erase reads
+    /// as [`DmStoreError::ErasureInterrupted`](crate::storage::dm_store::DmStoreError::ErasureInterrupted)
+    /// and never as tampering, and [`DmPersist::restart_channel`] maps it to a
+    /// lost record rather than an unreadable store, so the caller is told the
+    /// handshake is gone instead of being told to keep waiting for it.
     pub fn establish(self) -> Result<Ratchet, DmPersistError> {
         let Self {
             persist,
@@ -804,6 +845,47 @@ mod tests {
             !p.store().root().join(hex::encode(l.as_bytes())).exists(),
             "asking about a channel brought its correspondence into existence"
         );
+    }
+
+    /// An interrupted erase is a record the store **lost**, never a store it
+    /// could not read.
+    ///
+    /// The distinction drives behaviour rather than wording: `StoreUnreadable`
+    /// promises "nothing is declared lost" and makes the outbox retain what it
+    /// has queued, so reporting a destroyed handshake that way leaves the caller
+    /// waiting on one that cannot come back.
+    ///
+    /// [`a_record_moved_between_correspondences_does_not_resume`] is this one's
+    /// positive control: it pins that a store error which is *not* an interrupted
+    /// erase still produces `StoreUnreadable`. Neither test can pass by
+    /// collapsing every error to one answer, which is the failure mode a
+    /// single-sided assertion here would hide.
+    #[test]
+    fn an_interrupted_erase_reads_as_a_lost_record_not_an_unreadable_store() {
+        use crate::storage::dm_store::ERASURE_SENTINEL;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let p = persist(tmp.path());
+        let l = label(9);
+        p.save_provisional(&l, &ctx(), &record()).expect("saves");
+
+        // The crash window: the scrub's first barrier landed, the unlink did not.
+        let path = record_path(&p, &l, "provisional.bin");
+        let mut raw = std::fs::read(&path).expect("reads");
+        let sentinel_len = ERASURE_SENTINEL.len().min(raw.len());
+        raw[..sentinel_len].copy_from_slice(&ERASURE_SENTINEL[..sentinel_len]);
+        std::fs::write(&path, &raw).expect("writes");
+
+        match p.restart_channel(&l, &ctx()) {
+            StoredChannelRestart::TornDown(t) => assert_eq!(
+                t.cause(),
+                &TeardownCause::NoProvisionalRecord,
+                "an interrupted erase must report the record as lost, not the store as unreadable"
+            ),
+            StoredChannelRestart::HandshakeResumes(_) => {
+                panic!("resumed from a record that was mid-erase")
+            }
+        }
     }
 
     /// A record saved for one channel does not resume another. The record's own

@@ -24,7 +24,9 @@
 //!   share ones re-scoped to the Veilid DHT. S31 added the #89 UploadMotd
 //!   in-band signer-set MOTD; #156 added ISC-S32/S33/S34 pos + ISC-A-S24/A-S25/
 //!   A-S26 neg — the receiver-verifiable share_id binding)
-//! - 128 client-side: 90 positive (`ISC-C*`) + 38 negative (`ISC-A-C*`)
+//! - 129 client-side: 90 positive (`ISC-C*`) + 39 negative (`ISC-A-C*`)
+//!   (A-C45 added with the #293 decision: the DM store scrubs a record before
+//!   unlinking it, every kind, with a barrier before the unlink)
 //!   (A-C44 added with the #288 decision: a correspondence directory name is
 //!   minted from the CSPRNG, never derived from a harvestable value)
 //!   (A-C43 added with the TLS-stack removal: daemonseed's own envelopes never
@@ -56,7 +58,7 @@
 //!   C40 DM static key record (publish + verify + rollback guard), #232;
 //!   WB-ISC-9/10/13 pos + WB-ISC-11/12 neg — the WB-3 write scheduler, #159;
 //!   WB-ISC-3/4/5/6/7 pos + WB-ISC-1/2/8 neg — the WB-1 presence model, #159.)
-//! - 243 total = 39 server + 128 client + 76 build-family
+//! - 244 total = 39 server + 129 client + 76 build-family
 //!   (WB-ISC 26, CRSH-ISC 28, DL-ISC 22). The per-family tallies above are the
 //!   authoritative breakdown; [`TOTAL`] is the compile-time-asserted sum.
 //!
@@ -309,6 +311,8 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-A-C43", IscClass::Negative),
     // ── the correspondence directory name is minted, never derived (#288) ──
     ("ISC-A-C44", IscClass::Negative),
+    // ── the DM store scrubs before it unlinks, every record kind (#293) ──
+    ("ISC-A-C45", IscClass::Negative),
     // ── write budget scheduler (#159 WB-3 funnel — docs/design/veilid-write-budget.md) ──
     // WB-ISC-9/10/13 positive; WB-ISC-11/12 anti (no-chat-drop / tombstone-dominance).
     ("WB-ISC-9", IscClass::Positive),
@@ -425,7 +429,7 @@ pub const ISCS: &[(&str, IscClass)] = &[
 /// of truth for the coverage denominator, read live by `xtask isc-coverage`.
 /// Recount on every ISC add/remove (the `const _` assert below guards it
 /// against [`ISCS`]).
-pub const TOTAL: usize = 243;
+pub const TOTAL: usize = 244;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -661,13 +665,13 @@ mod tests {
         //                                  verify, highest-version-wins rollback
         //                                  guard) — the rest of the DM family
         //                                  registers per build slice.
-        //   total   160 pos + 83 neg = 243
+        //   total   160 pos + 84 neg = 244
         //   (the v0.33.0 Veilid cutover retired 14 server-positive + 10
         //    server-negative relay/TLS/federation/rate-limit ISCs. A-C43 was
         //    added with the TLS-stack removal: daemonseed's own envelopes never
         //    fall below CNSA 2.0 even though the transport under them is not.)
         assert_eq!(pos, 160, "positive count drift");
-        assert_eq!(neg, 83, "negative count drift");
+        assert_eq!(neg, 84, "negative count drift");
     }
 
     /// COVERED is single-sourced and must agree with the per-milestone

@@ -111,15 +111,23 @@
 //! does not apply.
 //!
 //! What this can honestly promise stops at the filesystem API, and the shape of
-//! that limit is worth stating exactly rather than by analogy. The store commits
-//! a replacement with `rename(2)` and a deletion with `unlink(2)` plus a
-//! directory fsync, so **neither one overwrites the bytes it supersedes**: the
-//! old record's blocks are unreferenced, not scrubbed. Nor would writing over
-//! them in place reach the medium — an SSD's FTL remaps an overwrite to a fresh
-//! block and a copy-on-write filesystem writes a new extent by design. So an
-//! adversary with the raw flash is outside what any store here can deliver, and
-//! what erasure buys is that `ss0` is gone from the filesystem's view and from
-//! every subsequent read.
+//! that limit is worth stating exactly rather than by analogy — including where
+//! the two write paths differ, because they do.
+//!
+//! A **replacement** is committed with `rename(2)`, which does *not* overwrite
+//! the bytes it supersedes: the old record's blocks are unreferenced, not
+//! scrubbed. That is accepted deliberately — crash-atomic replacement and
+//! in-place erasure are opposed, and a torn replacement is neither the old value
+//! nor the new one. A **deletion** does overwrite: it scrubs the record in
+//! place, in two fsynced phases, before unlinking. Deletion can afford it
+//! because losing a record mid-delete costs nothing that losing it any other way
+//! does not.
+//!
+//! Neither reaches the medium. An SSD's FTL remaps an overwrite onto a fresh
+//! block and a copy-on-write filesystem writes a new extent by design, so an
+//! adversary with the raw flash is outside what any store here can deliver. What
+//! erasure buys is that `ss0` is gone from the filesystem's view, from every
+//! subsequent read, and from the blocks the filesystem believes it wrote.
 
 use oxicrypt_aes::{Aes256Key, ModeError};
 use oxicrypt_kdf::HkdfSha384;

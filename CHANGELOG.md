@@ -76,6 +76,21 @@ work lives in the project lead's vault manifest, not here.
   pre-CNSA-2.0 transport is permitted; emitting a pre-CNSA-2.0 envelope over it
   is not.
 
+- The DM store scrubs a record before unlinking it: an erasure sentinel and
+  then the body, each forced to the medium, for every `RecordKind`.
+  `DmStoreError::ErasureInterrupted` names a record whose erase was cut short,
+  so a crash mid-delete is never reported as tampering. Best-effort by
+  construction — an SSD's FTL or a copy-on-write filesystem leaves the original
+  blocks untouched. ISC-A-C45. (#293)
+
+- The startup sweep scrubs an orphaned temp sibling before unlinking it, and
+  skips one it cannot scrub rather than failing `DmStore::open`. (#293)
+
+- **Behaviour change:** a crash inside the erase destroys the provisional
+  record, where one before it left a resumable handshake.
+  `PendingHandshake::establish` is no longer a safe retry. An interrupted erase
+  reports as `TeardownCause::NoProvisionalRecord`, not `StoreUnreadable`. (#293)
+
 - `CorrespondenceLabel::mint` — a correspondence's on-disk directory name is
   minted from the CSPRNG and recorded in the contact cache, never derived from
   `chan_id`, the recipient's key-record address, or a salted derivation over

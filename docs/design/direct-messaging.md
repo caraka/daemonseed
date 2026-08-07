@@ -1410,3 +1410,57 @@ Note also that `CorrespondenceLabel::from_bytes` remains public and unconstraine
 ### Accepted residual: correspondent count
 
 **No naming scheme conceals cardinality.** Anyone with read access counts the directories. Hiding the count would need cover directories indistinguishable from real ones — and indistinguishable now means forged mtimes and a plausibly-evolving plaintext cursor, not merely a plausible name. It would also not work: each correspondence occupies fixed buckets totalling roughly 328 KB, so **total profile size reports the correspondent count even if every name were hidden**. (The first draft justified this by saying write rhythm leaks the count anyway; that was weaker than it sounded, since a dormant correspondence emits no rhythm but still occupies a directory. The size argument is the one that holds.) Accepted, and recorded as accepted.
+
+## Decision — scrub every record before unlinking it (2026-08-07; ratified by caraka; closes #293)
+
+`Locked::delete` unlinked a record and fsynced the directory. The name went away; the blocks did not. An adversary who reads unallocated blocks and **later** obtains the profile key recovers the sealed record and opens it — for the provisional record that is `ss0`, which roots `RK0` and reopens the early chain. That is precisely the harvest-now-decrypt-later exposure the erasure was introduced to bound, so the property was weakened rather than absent.
+
+**The decision: overwrite the record in two fsynced phases, then unlink. Every record kind, not only the provisional one.**
+
+### Why the delete path and not the replace path
+
+A7 named the tension and A9 accepted it: crash-safe replacement and real erasure are opposed, because tmp-plus-rename leaves the superseded blob's blocks intact and merely unlinked. That trade stands for `replace_atomically` and is untouched here.
+
+The *delete* path is different, and the difference is what makes this affordable. Replacement must be crash-atomic because a torn replacement leaves a record that is neither the old value nor the new one. Deletion has no such requirement: the postcondition is "this record does not exist", and `TeardownCause` already treats an absent record and an unusable one identically — *"the outcome and the remedy are the same"*. Losing a record mid-delete costs nothing that losing it any other way does not already cost.
+
+### Why every kind, not just the provisional record
+
+#293 was raised about `ss0`. But `Locked::delete` is generic over `RecordKind`, and the resume record holds A9.2's complete field set — keys, generation, sequence numbers — under exactly the same later-compromise threat. Scrubbing only the record that prompted the issue would have left the larger secret behind. Scoped to the general delete, so a kind added later is covered without anyone remembering to.
+
+### The two phases, and why they are two
+
+An erasure sentinel is written and **fsynced first**; the body is overwritten and fsynced second; only then is the name unlinked and the directory fsynced.
+
+The split buys a distinguishable crash window. Collapsed into one write, a torn scrub leaves a record that fails to open — byte-indistinguishable from truncation or tampering, so a power cut would surface to the user as a possible attack. With the sentinel durable first, any crash from that point leaves a record a reader can *name*: `DmStoreError::ErasureInterrupted`, whose own variant exists so a deletion cut short is never reported as tampering. A user told "possible tampering" once too often stops believing it when it is true.
+
+**The barrier between the scrub and the unlink is load-bearing, not hygiene.** Without it the overwrite may still be dirty page cache when the name goes away, and a filesystem is free to never write those blocks at all — a no-op that looks exactly like a fix, and that no test of the resulting *bytes* could tell apart. It is asserted by barrier count, not by inspection.
+
+### The ceiling, stated rather than implied
+
+On an SSD the FTL remaps an overwrite to a fresh erase block; a copy-on-write filesystem writes a new extent by design. In both cases the original blocks survive untouched and this buys nothing. It buys real erasure on ext4-over-LUKS on rotating or dm-mapped storage, which is the ordinary deployment, and it is best-effort by construction everywhere else. The code says so and no caller should read it as a guarantee. Filesystem-level secure deletion is not portable and not something the application can assert on the user's behalf.
+
+### What this firms up elsewhere
+
+The #288 decision (a minted, non-derived correspondence directory name) rests its surviving argument on deletion: *one erased contact-cache row kills that correspondent's linkage forever*. That argument was explicitly recorded as partly self-undercut, because an unlinked cache row may itself be recoverable from unallocated blocks. Scrubbing on delete narrows that gap — not to zero, subject to the ceiling above, but the two decisions now point the same way instead of one quietly weakening the other.
+
+### What it costs: `establish` is no longer a safe retry (2026-08-13; ratified by caraka)
+
+`PendingHandshake::establish` builds the ratchet and then deletes the provisional record, in that order, so that a failed deletion leaves the record on disk and the whole call can be retried. **The scrub ends that.** A crash after the sentinel's barrier leaves a record that no longer opens, so a handshake a pre-scrub crash would have left resumable is destroyed.
+
+Accepted, on three grounds.
+
+The trade is **forced by the design**. The steady-state ratchet is deliberately never persisted — that is what makes erasing `ss0` worth anything — so there is nothing to durably commit before the delete, and no ordering survives the crash without persisting exactly what the design refuses.
+
+The two losses **differ in kind**. A destroyed provisional record costs the availability of one in-progress handshake, recoverable by redoing first contact. Leaving the blocks intact costs the confidentiality of `ss0` permanently, against a later key compromise. Under this threat model availability yields to confidentiality.
+
+The **frequencies are asymmetric**. The scrub protects every establishment; this window is two fsyncs on one small file inside a single critical section.
+
+The failure stays legible. An interrupted erase surfaces as `ErasureInterrupted`, and `restart_channel` maps it to `TeardownCause::NoProvisionalRecord` — the record is *lost*, not the store *unreadable*. The distinction is behavioural: `StoreUnreadable` promises nothing was lost and makes the outbox retain queued messages, which would leave the caller waiting on a handshake that cannot come back.
+
+### The sweep scrubs too, and fails soft where `delete` fails hard
+
+A crashed `replace_atomically` leaves a temp sibling that may hold a whole sealed record, so the startup sweep scrubs before unlinking — otherwise ciphertext leaves by a path that never passes through `delete`.
+
+**A sibling that cannot be scrubbed is skipped, not fatal.** The sweep runs inside `DmStore::open`, so returning an error there makes the store unopenable for every correspondence — a mode-0444 sibling, or a directory whose name matches the temp infix, would brick it permanently. Skipping leaves the file exactly where it already was, unscrubbed, which is the state before the sweep existed. Unlinking it anyway is the one option worse than both: it launders the ciphertext out of reach while reporting success.
+
+`Locked::delete` keeps the opposite disposition and fails closed, because there the postcondition *is* the erasure.

@@ -103,8 +103,6 @@ use std::path::{Path, PathBuf};
 /// keyed on a string this module later changed would silently stop finding
 /// anything, and would read exactly like a directory with no orphans in it.
 pub(crate) const TMP_INFIX: &str = ".tmp.";
-#[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Failure modes of a durable replacement.
 ///
@@ -271,22 +269,59 @@ pub(crate) struct RealDurability;
 /// through it: swapping [`RealDurability`] for a no-op implementation would
 /// leave no filesystem trace and pass every other test in this module. These
 /// counters are the positive control for that substitution.
+///
+/// **Per thread, not per process, and that is the whole point.** `cargo test`
+/// runs the ~1160 tests in this binary on parallel threads and many of them
+/// drive real barriers through `replace_atomically` or `DmStore::open`. Against
+/// a process-global counter every exact-count assertion is a latent flake, and
+/// every *strict-increase* assertion is worse — a neighbour's fsync satisfies it
+/// even when the function under test drove none, so it passes for the wrong
+/// reason. A mutex over the readers cannot fix either: the polluters are the
+/// tests that never take it. libtest gives each test its own thread and every
+/// barrier on these paths is driven synchronously on the caller's, so a
+/// thread-local counter observes exactly the work the test itself caused.
 #[cfg(test)]
-pub(crate) static REAL_FILE_SYNCS: AtomicUsize = AtomicUsize::new(0);
+mod barriers {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FILE_SYNCS: Cell<usize> = const { Cell::new(0) };
+        static DIR_SYNCS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn note_file_sync() {
+        FILE_SYNCS.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(crate) fn note_dir_sync() {
+        DIR_SYNCS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Barriers driven on **this thread** so far.
+    pub(crate) fn file_syncs() -> usize {
+        FILE_SYNCS.with(Cell::get)
+    }
+
+    /// Directory barriers driven on **this thread** so far.
+    pub(crate) fn dir_syncs() -> usize {
+        DIR_SYNCS.with(Cell::get)
+    }
+}
+
 #[cfg(test)]
-pub(crate) static REAL_DIR_SYNCS: AtomicUsize = AtomicUsize::new(0);
+pub(crate) use barriers::{dir_syncs, file_syncs};
 
 impl Durability for RealDurability {
     fn sync_file(&self, file: &File) -> std::io::Result<()> {
         #[cfg(test)]
-        REAL_FILE_SYNCS.fetch_add(1, Ordering::Relaxed);
+        barriers::note_file_sync();
         file.sync_all()
     }
 
     #[cfg(unix)]
     fn sync_dir(&self, dir: &Path) -> std::io::Result<()> {
         #[cfg(test)]
-        REAL_DIR_SYNCS.fetch_add(1, Ordering::Relaxed);
+        barriers::note_dir_sync();
         // Opening a directory read-only and fsyncing it is the portable-POSIX
         // way to make a rename durable.
         File::open(dir)?.sync_all()
@@ -297,11 +332,11 @@ impl Durability for RealDurability {
         // Windows cannot open a directory as a file. See the module docs: the
         // durable-directory-entry guarantee does not hold on this platform.
         //
-        // Deliberately does NOT touch `REAL_DIR_SYNCS`. That counter is the
-        // positive control for a no-op substitution, so a no-op incrementing it
-        // would defeat the one test written to catch exactly that. The test
-        // asserts this counter stays put on non-Unix, pinning the weaker
-        // guarantee rather than concealing it.
+        // Deliberately does NOT call `barriers::note_dir_sync`. That counter is
+        // the positive control for a no-op substitution, so a no-op incrementing
+        // it would defeat the one test written to catch exactly that. The test
+        // asserts `barriers::dir_syncs()` stays put on non-Unix, pinning the
+        // weaker guarantee rather than concealing it.
         Ok(())
     }
 }
@@ -666,8 +701,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("record.bin");
 
-        let files_before = REAL_FILE_SYNCS.load(Ordering::Relaxed);
-        let dirs_before = REAL_DIR_SYNCS.load(Ordering::Relaxed);
+        let files_before = file_syncs();
+        let dirs_before = dir_syncs();
 
         replace_atomically(&path, b"real").unwrap();
 
@@ -675,7 +710,7 @@ mod tests {
         // counters, never hold them back — so a strict increase is the whole
         // claim: the public path performed real barriers.
         assert!(
-            REAL_FILE_SYNCS.load(Ordering::Relaxed) > files_before,
+            file_syncs() > files_before,
             "replace_atomically must drive RealDurability's data barrier"
         );
 
@@ -685,7 +720,7 @@ mod tests {
         // exists to prevent.
         #[cfg(unix)]
         assert!(
-            REAL_DIR_SYNCS.load(Ordering::Relaxed) > dirs_before,
+            dir_syncs() > dirs_before,
             "replace_atomically must drive RealDurability's name barrier"
         );
 
@@ -693,12 +728,12 @@ mod tests {
         // (`MOVEFILE_WRITE_THROUGH`), not through this barrier, so `sync_dir`
         // is a no-op there and must not appear to have run. Equality is exact
         // rather than best-effort: no arm of `sync_dir` compiled on this
-        // platform touches the counter, so concurrent tests cannot inflate it
-        // either. Should a real barrier ever be added here, this fails and
-        // says so. Do not delete it to make that green.
+        // platform touches the counter, and the counter is per-thread besides,
+        // so nothing can inflate it. Should a real barrier ever be added here,
+        // this fails and says so. Do not delete it to make that green.
         #[cfg(not(unix))]
         assert_eq!(
-            REAL_DIR_SYNCS.load(Ordering::Relaxed),
+            dir_syncs(),
             dirs_before,
             "non-Unix has no durable-name barrier; if one is added, assert it \
              here rather than removing this check"
