@@ -284,21 +284,53 @@ impl RecordKind {
 /// Which correspondence a record belongs to — an opaque 32-byte name supplied by
 /// the caller.
 ///
-/// **How this value is derived is NOT decided, and is deliberately not decided
-/// here.** It is a privacy-relevant choice that belongs to the collection slice,
-/// not to a storage module: it must not be `chan_id`, which
-/// [`crate::dm::provisional`] states must never be serialized anywhere, and this
-/// module declines to derive it from the key-record address on its own
-/// initiative either, because that address is world-derivable and would make the
-/// directory listing a list of who the user talks to. Until that decision is
-/// made, this type is a name the caller chooses and the store only ever compares
-/// and hex-encodes; nothing in the store depends on any property of it beyond
-/// distinctness.
+/// **A label is minted from the CSPRNG, never derived** ([`Self::mint`]; decided
+/// 2026-08-07, `docs/design/direct-messaging.md` § *What names a correspondence
+/// directory on disk*, #288). It must not be `chan_id`, which
+/// [`crate::dm::provisional`] states must never be serialized anywhere; and it
+/// must not be the key-record address, which is world-derivable from a harvested
+/// public key, so a derived name would let anyone who can read the directory
+/// test membership over any candidate pubkey with no key at all.
+///
+/// **What minting buys over a *salted* derivation is narrower than "unlinkable",
+/// and worth stating precisely.** The mapping has to be persisted somewhere —
+/// the contact cache — and that cache lives on the same disk under the same
+/// profile key, so an attacker who obtains the key obtains the mapping either
+/// way. The real differential is against the attacker who has the *disk* and a
+/// set of candidate pubkeys: a salt is a standing oracle that answers "is this
+/// pubkey a correspondent?" for every directory, **including orphaned ones whose
+/// cache entry is long gone**, whereas a minted label reveals only what the
+/// cache still holds. Deleting a contact deletes its linkage; under a derived
+/// scheme the linkage outlives the contact for as long as the salt does.
+///
+/// The cost is that a label cannot be recomputed: minting, recording and
+/// directory creation must be ordered so a crash leaves either nothing or
+/// something a sweep can identify (the obligation on the collection slice,
+/// #236).
+///
+/// The store depends on no property of a label beyond distinctness — it only
+/// ever compares and hex-encodes — so it remains correct for any caller-supplied
+/// value.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CorrespondenceLabel([u8; CORRESPONDENCE_LABEL_LEN]);
 
 impl CorrespondenceLabel {
-    /// A label over the caller's bytes.
+    /// Mint a fresh label from the CSPRNG — the only way a *new* correspondence
+    /// should acquire one.
+    ///
+    /// 32 bytes of `getrandom`, so two correspondences collide with probability
+    /// negligible against any number of them a profile will hold, and no
+    /// observer can predict or recognise a label without the contact cache that
+    /// records it. The caller persists the result; there is no second chance to
+    /// derive it (see the type docs).
+    pub fn mint() -> Result<Self, DmStoreError> {
+        let mut bytes = [0u8; CORRESPONDENCE_LABEL_LEN];
+        getrandom::fill(&mut bytes).map_err(DmStoreError::EntropySource)?;
+        Ok(Self(bytes))
+    }
+
+    /// A label over the caller's bytes — for a correspondence whose label was
+    /// already minted and persisted. [`Self::mint`] is what creates one.
     pub const fn from_bytes(bytes: [u8; CORRESPONDENCE_LABEL_LEN]) -> Self {
         Self(bytes)
     }
@@ -1058,8 +1090,18 @@ impl DmStoreError {
 impl core::fmt::Display for DmStoreError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            // The path embeds the correspondence's hex directory name, so
+            // rendering it here would undo [`CorrespondenceLabel`]'s `Debug`
+            // redaction by the back door: an I/O error reaching a log line, a
+            // crash report or a GUI toast would carry a stable
+            // per-correspondence identifier. Name the file within the
+            // correspondence — which is one of four fixed names and identifies
+            // nobody — and drop the directory.
             DmStoreError::Io { path, source } => {
-                write!(f, "dm store I/O failed at {}: {source}", path.display())
+                let leaf = path
+                    .file_name()
+                    .map_or_else(|| "<unnamed>".into(), |n| n.to_string_lossy());
+                write!(f, "dm store I/O failed on {leaf}: {source}")
             }
             DmStoreError::Lock(e) => write!(f, "dm store lock: {e}"),
             DmStoreError::Reentrant => write!(
@@ -1149,6 +1191,122 @@ mod tests {
     fn store(dir: &Path) -> DmStore {
         let _ = oxicrypt_module::initialize();
         DmStore::open(dir.join("dm"), &AT_REST).unwrap()
+    }
+
+    /// A mint that never wrote to the buffer returns all-zeros and every other
+    /// property here still holds for it — distinctness would fail, but only
+    /// after two calls, and a partial fill (a short read into a zeroed tail)
+    /// would pass distinctness outright. This is the probe for "the CSPRNG
+    /// actually filled all 32 bytes".
+    #[test]
+    fn a_minted_label_is_not_the_zero_label_nor_zero_tailed() {
+        let l = CorrespondenceLabel::mint().unwrap();
+        assert_ne!(
+            l.as_bytes(),
+            &[0u8; CORRESPONDENCE_LABEL_LEN],
+            "mint returned an unfilled buffer"
+        );
+        // A short fill leaves a zeroed tail that whole-value distinctness cannot
+        // see. Every 8-byte window carrying at least one non-zero byte is a
+        // ~2^-64 false alarm per window and catches a truncated fill.
+        for (i, window) in l.as_bytes().chunks(8).enumerate() {
+            assert!(
+                window.iter().any(|&b| b != 0),
+                "byte window {i} is all-zero — the fill looks truncated"
+            );
+        }
+    }
+
+    #[test]
+    fn minted_labels_are_distinct() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..256 {
+            assert!(
+                seen.insert(*CorrespondenceLabel::mint().unwrap().as_bytes()),
+                "mint produced a duplicate within 256 draws"
+            );
+        }
+        assert_eq!(seen.len(), 256, "the probe itself collected nothing");
+    }
+
+    /// A counter derives a *different* value every draw and at every byte
+    /// position, so it survives distinctness, the zero-tail probe and the
+    /// per-position variance probe — measured, not assumed. What it cannot hide
+    /// is that its output is an affine function of a monotone counter: the
+    /// byte-wise difference between successive draws is the *same* difference
+    /// every time. Real CSPRNG output has no such invariant.
+    ///
+    /// This kills the whole affine-of-a-counter class, not one hand-picked
+    /// mutation. It is still not proof of randomness — no unit test is; a mint
+    /// seeded from a low-entropy source would pass everything here. That
+    /// guarantee rests on `mint`'s body being one auditable call to
+    /// `getrandom::fill` over the whole buffer, and these probes exist to keep
+    /// it that way.
+    #[test]
+    fn successive_minted_labels_do_not_differ_by_a_fixed_step() {
+        let draws: Vec<_> = (0..4)
+            .map(|_| *CorrespondenceLabel::mint().unwrap().as_bytes())
+            .collect();
+        assert_eq!(draws.len(), 4, "the probe itself collected nothing");
+
+        let delta = |a: &[u8; CORRESPONDENCE_LABEL_LEN], b: &[u8; CORRESPONDENCE_LABEL_LEN]| {
+            let mut d = [0u8; CORRESPONDENCE_LABEL_LEN];
+            for i in 0..CORRESPONDENCE_LABEL_LEN {
+                d[i] = b[i].wrapping_sub(a[i]);
+            }
+            d
+        };
+        let d0 = delta(&draws[0], &draws[1]);
+        let d1 = delta(&draws[1], &draws[2]);
+        let d2 = delta(&draws[2], &draws[3]);
+        assert!(
+            !(d0 == d1 && d1 == d2),
+            "three successive draws differ by an identical byte-wise step — \
+             mint looks like a counter, not a CSPRNG"
+        );
+    }
+
+    /// The label's whole job on disk is to be a directory name, so pin the shape
+    /// that reaches the filesystem rather than only the bytes behind it.
+    #[test]
+    fn a_minted_labels_dir_name_is_64_lowercase_hex_chars() {
+        let name = CorrespondenceLabel::mint().unwrap().dir_name();
+        assert_eq!(name.len(), CORRESPONDENCE_LABEL_LEN * 2);
+        assert!(
+            name.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "dir name is not lowercase hex: {name}"
+        );
+    }
+
+    /// Distinctness and a non-zero tail are satisfied by things that are not
+    /// random — measured, not assumed: a mint of 4 CSPRNG bytes followed by 28
+    /// constant ones passes both. It dies here, because a constant filler pins
+    /// its byte positions across draws.
+    ///
+    /// With 32 draws a truly random position repeats one value throughout with
+    /// probability 256 * (1/256)^32, which is nil; the assertion is effectively
+    /// flake-free while still catching any position that never varies.
+    ///
+    /// **This does not establish randomness** — see
+    /// `successive_minted_labels_do_not_differ_by_a_fixed_step` for the counter
+    /// case, which varies at every position and survives this one.
+    #[test]
+    fn every_byte_position_of_a_minted_label_varies_across_draws() {
+        const DRAWS: usize = 32;
+        let labels: Vec<_> = (0..DRAWS)
+            .map(|_| *CorrespondenceLabel::mint().unwrap().as_bytes())
+            .collect();
+        assert_eq!(labels.len(), DRAWS, "the probe itself collected nothing");
+
+        for pos in 0..CORRESPONDENCE_LABEL_LEN {
+            let first = labels[0][pos];
+            assert!(
+                labels.iter().any(|l| l[pos] != first),
+                "byte position {pos} held {first:#04x} across all {DRAWS} draws — \
+                 that position is not random"
+            );
+        }
     }
 
     /// A payload of `len` with recognisable, position-dependent content, so a

@@ -1372,3 +1372,41 @@ The ISC family gains criteria for A9.1–A9.4, superseding the A8 criteria where
 **Status: FROZEN 2026-07-28 (caraka ratified).** DRAFT v6 is the design-of-record. The ISC-C38–C46 / A-C20–A-C25 family in `ISA.md` is re-cut to v6, the build-slice issues are open (#177 forced), and this doc is the frozen reference for the build. Any change now is a deliberate, reviewed amendment — not a redraft.
 
 **Channel re-establishment: RATIFIED at Amendment A9 (caraka, 2026-07-30).** The A1→A9 amendment chain designs channel re-establishment after a restart; A9 is its design-of-record. Reconnection is accepted (metadata-preferable to the doorbell fallback); `C` is accepted as a tunable middle-default dial. The ISC family gains criteria for A9.1–A9.4 (superseding earlier amendments' criteria where revised) at the build-slice cut. #262 is answered and closed citing A9. Amendments A1–A8 above are superseded and retained only as the refutation trail. Lands via PR #284.
+
+## Decision — what names a correspondence directory on disk (2026-08-07; ratified by caraka; closes #288)
+
+The A1–A9 chain settles what a correspondence *stores* and never settles what its directory is *called*. This decision fixes it. It is not an amendment — A9's mechanisms are untouched — but it is a boundary, so it is recorded here with the rest of the re-establishment design.
+
+**The decision: a random per-correspondence label, minted from the CSPRNG at first contact and stored in the contact cache.** 32 bytes, hex-encoded as the directory name. `storage::dm_store` already takes an opaque `CorrespondenceLabel` and depends on no property of it beyond distinctness, so nothing in the store changes.
+
+### What is actually keyless, which is more than the name
+
+An earlier draft of this section claimed the directory name was "the one part of the record layout readable without any key" and that the correspondent count was the only residual. **Both were wrong**, and the corrected picture is the honest input to the decision:
+
+- **`cursor.bin` is plaintext.** `ReceiveCursor` is the one unsealed `RecordKind`; its eight bytes are a big-endian page number, so an observer with no key reads a monotone proxy for received volume per correspondence.
+- **Record *presence* reveals handshake state.** The four filenames are fixed, so `provisional.bin` present means an unconfirmed handshake and `resume.bin` means an established one.
+- **mtimes are never normalized**, so each directory carries a timestamp series.
+
+Two disk snapshots therefore yield a per-directory cursor-delta and activity timeline that joins to a candidate correspondent's observed online windows — which is A9's F1 cross-plane join, already priced and accepted. **A name cannot fix any of this.** What a name can decide is whether the directory is linkable to an identity *without observation*, from a listing alone, and that is the question this decision answers.
+
+### Why not the two derived options
+
+**A hash of the recipient's key-record address** is ruled out outright. The address is world-derivable from a harvested public key, so anyone who can read the profile directory and holds a candidate pubkey can test membership over any candidate set, from a single listing, with no observation and no key. That is a strictly stronger attack than the behavioural join above, and it is the one a name can prevent.
+
+**Salting that derivation with a stored per-profile secret** is rejected — but on a narrower argument than the first draft made. That draft said a salt falls to the later key compromise of #293 while a random label "has no preimage to surrender". That reasoning does not survive contact with the layout: `DmStore::open` takes the profile at-rest key, **the same material that protects the contact cache**, so the compromise that surrenders a salt also surrenders the cache — a direct label→identity table needing no candidate set at all. Under key compromise the two options are equivalent, and if anything the cache is the more informative artefact.
+
+The differential that does hold is against the attacker with the **disk but not the key**, and it is about *lifetime*:
+
+> A salt is a standing oracle. It answers "is this candidate pubkey a correspondent?" for every directory it ever named — **including orphaned directories whose contact-cache entry was deleted long ago** — because the salt must outlive every correspondence in order to name any of them. A minted label reveals only what the cache still holds, so deleting a contact deletes its linkage.
+
+That is a real and permanent asymmetry, and it is the reason for the decision. It is also partly self-undercut and the doc should say so: #293 records that erasure is `unlink` rather than overwrite, so a deleted cache row may itself be recoverable from unallocated blocks. The asymmetry is therefore strong against a live-filesystem read and weaker against forensic recovery — still favouring the minted label, but not absolutely.
+
+### The obligation this places on the collection slice (#236)
+
+A random label cannot be recomputed, so **there is no recovering from a half-completed first contact.** Minting the label, writing the contact-cache entry, and creating the directory must be ordered so a crash at any point leaves either nothing or something a sweep can identify and remove — the same discipline A9 applies as commit-then-emit, and the same family as the orphaned `.tmp.*` siblings of #286. A directory with no cache entry naming it is unreachable forever and must be sweepable; a cache entry naming a directory that was never created must be re-mintable.
+
+Note also that `CorrespondenceLabel::from_bytes` remains public and unconstrained, so nothing in the type system prevents #236 from writing `from_bytes(hash(address))` and reintroducing exactly the forbidden state. ISC-A-C44 is the contract; there is no mechanical enforcement of it, and the collection slice's review is where that gets checked.
+
+### Accepted residual: correspondent count
+
+**No naming scheme conceals cardinality.** Anyone with read access counts the directories. Hiding the count would need cover directories indistinguishable from real ones — and indistinguishable now means forged mtimes and a plausibly-evolving plaintext cursor, not merely a plausible name. It would also not work: each correspondence occupies fixed buckets totalling roughly 328 KB, so **total profile size reports the correspondent count even if every name were hidden**. (The first draft justified this by saying write rhythm leaks the count anyway; that was weaker than it sounded, since a dormant correspondence emits no rhythm but still occupies a directory. The size argument is the one that holds.) Accepted, and recorded as accepted.

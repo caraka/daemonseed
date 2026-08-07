@@ -76,6 +76,11 @@ work lives in the project lead's vault manifest, not here.
   pre-CNSA-2.0 transport is permitted; emitting a pre-CNSA-2.0 envelope over it
   is not.
 
+- `CorrespondenceLabel::mint` — a correspondence's on-disk directory name is
+  minted from the CSPRNG and recorded in the contact cache, never derived from
+  `chan_id`, the recipient's key-record address, or a salted derivation over
+  either. ISC-A-C44. (#288)
+
 ### Removed
 
 - `daemonseed_core::tls` and the TLS dependency stack it existed for:
@@ -127,6 +132,11 @@ work lives in the project lead's vault manifest, not here.
   overflow-checks = true`), workspace-wide. (#258)
 
 ### Fixed
+
+- `DmStoreError::Io`'s `Display` no longer renders the full path, which
+  embedded the correspondence's directory name and put a stable
+  per-correspondence identifier into any log line, crash report or toast
+  carrying the error. It names the record file only.
 
 - The operator write-gate travels as a value instead of being read from ambient
   state, so three GUI tests no longer assert debug-only behaviour and the suite
