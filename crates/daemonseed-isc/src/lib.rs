@@ -24,7 +24,9 @@
 //!   share ones re-scoped to the Veilid DHT. S31 added the #89 UploadMotd
 //!   in-band signer-set MOTD; #156 added ISC-S32/S33/S34 pos + ISC-A-S24/A-S25/
 //!   A-S26 neg — the receiver-verifiable share_id binding)
-//! - 126 client-side: 90 positive (`ISC-C*`) + 36 negative (`ISC-A-C*`)
+//! - 127 client-side: 90 positive (`ISC-C*`) + 37 negative (`ISC-A-C*`)
+//!   (A-C43 added with the TLS-stack removal: daemonseed's own envelopes never
+//!   fall below CNSA 2.0 even though the Veilid transport under them is not)
 //!   (M16 A1 added C66 manifest-preview + A-C33 no-blind-download, A2 added C67 selective-fetch,
 //!   A3 added C68 choose-download-dir, A4 added C72 collapsible-folder-tree preview, C1 added C69
 //!   multi-share-publish, C2 added C70 status-auto-clear, C3 added C71 generate-circle-phrase;
@@ -301,6 +303,8 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-A-C41", IscClass::Negative),
     // ── client negative (#75: the roster shows only the live set, no decorators/persistence) ──
     ("ISC-A-C42", IscClass::Negative),
+    // ── no sub-CNSA-2.0 envelope, whatever the transport under it ──
+    ("ISC-A-C43", IscClass::Negative),
     // ── write budget scheduler (#159 WB-3 funnel — docs/design/veilid-write-budget.md) ──
     // WB-ISC-9/10/13 positive; WB-ISC-11/12 anti (no-chat-drop / tombstone-dominance).
     ("WB-ISC-9", IscClass::Positive),
@@ -417,7 +421,7 @@ pub const ISCS: &[(&str, IscClass)] = &[
 /// of truth for the coverage denominator, read live by `xtask isc-coverage`.
 /// Recount on every ISC add/remove (the `const _` assert below guards it
 /// against [`ISCS`]).
-pub const TOTAL: usize = 241;
+pub const TOTAL: usize = 242;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -653,11 +657,13 @@ mod tests {
         //                                  verify, highest-version-wins rollback
         //                                  guard) — the rest of the DM family
         //                                  registers per build slice.
-        //   total   160 pos + 81 neg = 241
+        //   total   160 pos + 82 neg = 242
         //   (the v0.33.0 Veilid cutover retired 14 server-positive + 10
-        //    server-negative relay/TLS/federation/rate-limit ISCs.)
+        //    server-negative relay/TLS/federation/rate-limit ISCs. A-C43 was
+        //    added with the TLS-stack removal: daemonseed's own envelopes never
+        //    fall below CNSA 2.0 even though the transport under them is not.)
         assert_eq!(pos, 160, "positive count drift");
-        assert_eq!(neg, 81, "negative count drift");
+        assert_eq!(neg, 82, "negative count drift");
     }
 
     /// COVERED is single-sourced and must agree with the per-milestone

@@ -46,10 +46,8 @@ daemonseed-veilid-net = { path = "../daemonseed-veilid-net" }
 # pipeline (#109) uses.
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
-# Process-wide CryptoProvider install — symmetric with cli/tui/server. The GUI
-# initializes the same oxicrypt module + rustls provider before connecting.
+# Startup crypto-module init — symmetric with the TUI.
 oxicrypt-module = { workspace = true }
-oxitls-rustls-provider = { workspace = true }
 
 # Async runtime for the network side. The render loop stays on the main (UI)
 # thread; the net actor runs a current-thread runtime on a dedicated thread and

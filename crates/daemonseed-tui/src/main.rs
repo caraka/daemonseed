@@ -18,7 +18,6 @@ use daemonseed_core::profile::{
     write_first_start, write_seeds_blob,
 };
 use daemonseed_core::storage::seeds;
-use daemonseed_core::tls::install_provider;
 use daemonseed_tui::app::App;
 use daemonseed_tui::net::{NetCommand, NetHandle, RootKind};
 use daemonseed_tui::ui;
@@ -30,16 +29,11 @@ use ratatui::crossterm::event::{self, Event};
 const TICK: Duration = Duration::from_millis(100);
 
 fn main() -> io::Result<()> {
-    // Bring up the same process-wide CryptoProvider the cli/server use, before
-    // touching the terminal — a failure here should print plainly, not corrupt
-    // a raw-mode screen. First-start sealing needs the module Operational;
-    // connect (later workstream) needs the rustls provider installed.
+    // Bring the oxicrypt module Operational before touching the terminal — a
+    // failure here should print plainly, not corrupt a raw-mode screen.
+    // First-start sealing needs the module Operational.
     if let Err(e) = initialize_with_profile(CNSA_2_0_KATS, AlgorithmProfile::Cnsa2) {
         eprintln!("daemonseed-tui: crypto module init failed: {e}");
-        return Err(io::Error::other(e.to_string()));
-    }
-    if let Err(e) = install_provider() {
-        eprintln!("daemonseed-tui: TLS provider install failed: {e}");
         return Err(io::Error::other(e.to_string()));
     }
 

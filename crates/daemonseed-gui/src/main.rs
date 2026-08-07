@@ -96,17 +96,15 @@ fn relay_target() -> (String, String) {
     (id, addr)
 }
 
-/// Bring up the process-wide CryptoProvider + oxicrypt module the cli/tui/server
-/// share. Needed before any `Connect` AND before any `derive_cot_key`
-/// (materialization), so the offscreen + self-check paths init it too. Returns
-/// `Ok(())` or a human-readable reason.
+/// Bring the oxicrypt module Operational — the same init the tui does. Needed
+/// before any `Connect` AND before any `derive_cot_key` (materialization), so
+/// the offscreen + self-check paths init it too. Returns `Ok(())` or a
+/// human-readable reason.
 fn init_crypto() -> Result<(), String> {
     use daemonseed_core::kats::CNSA_2_0_KATS;
-    use daemonseed_core::tls::install_provider;
     use oxicrypt_module::{AlgorithmProfile, initialize_with_profile};
     initialize_with_profile(CNSA_2_0_KATS, AlgorithmProfile::Cnsa2)
         .map_err(|e| format!("crypto module init failed: {e}"))?;
-    install_provider().map_err(|e| format!("TLS provider install failed: {e}"))?;
     Ok(())
 }
 

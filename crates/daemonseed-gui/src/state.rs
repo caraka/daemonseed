@@ -78,7 +78,9 @@ const ITEM_KIND_POST: u8 = 1;
 
 /// Separator between item hashes in the persisted marker. The seeds blob stores
 /// `announce-seen <server_id> <value>` as a single two-token line, so the separator
-/// MUST NOT be whitespace ([`Seeds::set_announce_seen`] rejects that outright).
+/// MUST NOT be whitespace
+/// ([`Seeds::set_announce_seen`](daemonseed_core::storage::seeds::Seeds::set_announce_seen)
+/// rejects that outright).
 const SEEN_SEPARATOR: char = ',';
 
 /// The content hash of every item in a verified announcements/MOTD view (#217) —

@@ -660,8 +660,8 @@ impl NetHandle {
     /// task holds an `Rc` of the circle key. Driving everything on one thread
     /// via `block_on` + `spawn_local` sidesteps both `Send` bounds.
     ///
-    /// Caller contract: the process-wide CryptoProvider must already be
-    /// installed (the binary does this at startup).
+    /// Caller contract: the oxicrypt module must already be `Operational`
+    /// (the binary drives `initialize_with_profile` at startup).
     pub fn new() -> std::io::Result<Self> {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (evt_tx, evt_rx) = mpsc::unbounded_channel();

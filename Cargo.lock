@@ -1675,10 +1675,8 @@ dependencies = [
  "oxicrypt-ml-kem",
  "oxicrypt-module",
  "oxicrypt-sha",
- "oxitls-rustls-provider",
  "prost",
  "redb",
- "rustls",
  "serde",
  "tempfile",
  "tokio",
@@ -1705,7 +1703,6 @@ dependencies = [
  "i-slint-backend-winit",
  "image",
  "oxicrypt-module",
- "oxitls-rustls-provider",
  "prost",
  "rfd",
  "slint",
@@ -1759,7 +1756,6 @@ dependencies = [
  "daemonseed-veilid-net",
  "dirs",
  "oxicrypt-module",
- "oxitls-rustls-provider",
  "ratatui",
  "tempfile",
  "tokio",
@@ -5320,7 +5316,7 @@ dependencies = [
 
 [[package]]
 name = "oxicrypt-aes"
-version = "0.20.0"
+version = "0.22.0"
 dependencies = [
  "oxicrypt-aes-accel",
  "oxicrypt-module",
@@ -5329,11 +5325,11 @@ dependencies = [
 
 [[package]]
 name = "oxicrypt-aes-accel"
-version = "0.20.0"
+version = "0.22.0"
 
 [[package]]
 name = "oxicrypt-drbg"
-version = "0.20.0"
+version = "0.22.0"
 dependencies = [
  "oxicrypt-aes",
  "oxicrypt-hmac",
@@ -5344,7 +5340,7 @@ dependencies = [
 
 [[package]]
 name = "oxicrypt-ecdh"
-version = "0.20.0"
+version = "0.22.0"
 dependencies = [
  "oxicrypt-drbg",
  "oxicrypt-ecdsa",
@@ -5353,7 +5349,7 @@ dependencies = [
 
 [[package]]
 name = "oxicrypt-ecdsa"
-version = "0.20.0"
+version = "0.22.0"
 dependencies = [
  "oxicrypt-drbg",
  "oxicrypt-module",
@@ -5363,7 +5359,7 @@ dependencies = [
 
 [[package]]
 name = "oxicrypt-hmac"
-version = "0.20.0"
+version = "0.22.0"
 dependencies = [
  "oxicrypt-module",
  "oxicrypt-sha",
@@ -5373,7 +5369,7 @@ dependencies = [
 
 [[package]]
 name = "oxicrypt-kdf"
-version = "0.20.0"
+version = "0.22.0"
 dependencies = [
  "oxicrypt-hmac",
  "oxicrypt-module",
@@ -5384,7 +5380,7 @@ dependencies = [
 
 [[package]]
 name = "oxicrypt-ml-dsa"
-version = "0.20.0"
+version = "0.22.0"
 dependencies = [
  "oxicrypt-module",
  "oxicrypt-sha",
@@ -5394,7 +5390,7 @@ dependencies = [
 
 [[package]]
 name = "oxicrypt-ml-kem"
-version = "0.20.0"
+version = "0.22.0"
 dependencies = [
  "oxicrypt-module",
  "oxicrypt-sha",
@@ -5404,11 +5400,11 @@ dependencies = [
 
 [[package]]
 name = "oxicrypt-module"
-version = "0.20.0"
+version = "0.22.0"
 
 [[package]]
 name = "oxicrypt-sha"
-version = "0.20.0"
+version = "0.22.0"
 dependencies = [
  "oxicrypt-module",
  "oxicrypt-test-vectors",
@@ -5417,11 +5413,11 @@ dependencies = [
 
 [[package]]
 name = "oxicrypt-test-vectors"
-version = "0.20.0"
+version = "0.22.0"
 
 [[package]]
 name = "oxicrypt-xof"
-version = "0.20.0"
+version = "0.22.0"
 dependencies = [
  "oxicrypt-module",
  "oxicrypt-sha",
@@ -5430,39 +5426,7 @@ dependencies = [
 
 [[package]]
 name = "oxicrypt-zeroize"
-version = "0.20.0"
-
-[[package]]
-name = "oxitls-rustls-provider"
-version = "0.1.1"
-dependencies = [
- "der 0.7.10",
- "getrandom 0.2.17",
- "oxicrypt-aes",
- "oxicrypt-drbg",
- "oxicrypt-ecdh",
- "oxicrypt-ecdsa",
- "oxicrypt-hmac",
- "oxicrypt-kdf",
- "oxicrypt-ml-dsa",
- "oxicrypt-ml-kem",
- "oxicrypt-module",
- "oxicrypt-sha",
- "oxitls-webpki-mldsa",
- "pkcs8 0.10.2",
- "rustls",
- "rustls-pki-types",
- "spki 0.7.3",
-]
-
-[[package]]
-name = "oxitls-webpki-mldsa"
-version = "0.1.1"
-dependencies = [
- "oxicrypt-ml-dsa",
- "rustls-pki-types",
- "rustls-webpki",
-]
+version = "0.22.0"
 
 [[package]]
 name = "parking"

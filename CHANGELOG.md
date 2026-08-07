@@ -71,6 +71,18 @@ work lives in the project lead's vault manifest, not here.
   destination is removed before the rename and the directory barrier is a
   no-op (#285). Orphaned temp siblings after a `SIGKILL` are not swept (#286).
   (Amendment A9 build obligation, #281)
+- ISC-A-C43: no daemonseed-authored protocol message or sealed envelope falls
+  below CNSA 2.0, independently of the transport carrying it. Riding a
+  pre-CNSA-2.0 transport is permitted; emitting a pre-CNSA-2.0 envelope over it
+  is not.
+
+### Removed
+
+- `daemonseed_core::tls` and the TLS dependency stack it existed for:
+  the `oxitls-rustls-provider` and `oxitls-webpki-mldsa` path-dependencies,
+  and `rustls`, `rustls-pki-types`, `tokio-rustls`. Veilid supplies transport
+  security; daemonseed terminates no TLS. `oxicrypt` is now the only sibling
+  path-dependency, so a build needs only `../oxicrypt` checked out.
 
 ### Changed
 

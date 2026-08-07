@@ -42,8 +42,7 @@
 //!
 //! Startup crypto-init shared with the frontends lives here too:
 //! [`kats`] assembles the CNSA 2.0 KATS slice for
-//! `oxicrypt_module::initialize_with_profile`, and [`tls`] installs the
-//! process-wide rustls `CryptoProvider` (`tls::install_provider`).
+//! `oxicrypt_module::initialize_with_profile`.
 
 #![forbid(unsafe_code)]
 
@@ -86,7 +85,6 @@ pub mod share_rollcall;
 pub mod share_seal;
 pub mod share_serve;
 pub mod storage;
-pub mod tls;
 pub mod transcript;
 pub mod trust_events;
 pub mod version;

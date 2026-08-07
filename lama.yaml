@@ -76,7 +76,7 @@ crates:
     manifest: "docs/llm-api-manifest/daemonseed-proto-protocol.yaml"
 
   - name: daemonseed-cli
-    purpose: "Non-interactive scriptable client binary + library. `connect <server-id>` does TLS-1.3 + APP_HELLO + (M4b) client-side identity-proof, returning only after Authenticated. M12 adds the user-publish share subcommands `publish` / `unpublish` / `list-shares` over the PublicSpace RPCs (gate step 5); `publish` holds the connection open until Ctrl-C (you-must-be-online-to-share), and the share is RAM-only — reaped on disconnect (ISC-A-S1). The library side also carries the M6 public-space client plumbing and the M12 introducer refresh."
+    purpose: "Non-interactive scriptable client binary + library. `connect <server-id>` does APP_HELLO + (M4b) client-side identity-proof over the Veilid transport, returning only after Authenticated. M12 adds the user-publish share subcommands `publish` / `unpublish` / `list-shares` over the PublicSpace RPCs (gate step 5); `publish` holds the connection open until Ctrl-C (you-must-be-online-to-share), and the share is RAM-only — reaped on disconnect (ISC-A-S1). The library side also carries the M6 public-space client plumbing and the M12 introducer refresh."
     license: AGPL-3.0-or-later
     status: active
     manifest: "docs/llm-api-manifest/daemonseed-cli-api.yaml"
