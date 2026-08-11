@@ -1662,6 +1662,7 @@ dependencies = [
  "bip39",
  "daemonseed-core",
  "daemonseed-proto",
+ "daemonseed-sys",
  "fs4",
  "getrandom 0.3.4",
  "hex",
@@ -1743,6 +1744,14 @@ dependencies = [
  "prost-types",
  "tonic",
  "tonic-build",
+]
+
+[[package]]
+name = "daemonseed-sys"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5316,7 +5325,7 @@ dependencies = [
 
 [[package]]
 name = "oxicrypt-aes"
-version = "0.22.0"
+version = "0.23.1"
 dependencies = [
  "oxicrypt-aes-accel",
  "oxicrypt-module",
@@ -5325,11 +5334,11 @@ dependencies = [
 
 [[package]]
 name = "oxicrypt-aes-accel"
-version = "0.22.0"
+version = "0.23.1"
 
 [[package]]
 name = "oxicrypt-drbg"
-version = "0.22.0"
+version = "0.23.1"
 dependencies = [
  "oxicrypt-aes",
  "oxicrypt-hmac",
@@ -5340,7 +5349,7 @@ dependencies = [
 
 [[package]]
 name = "oxicrypt-ecdh"
-version = "0.22.0"
+version = "0.23.1"
 dependencies = [
  "oxicrypt-drbg",
  "oxicrypt-ecdsa",
@@ -5349,7 +5358,7 @@ dependencies = [
 
 [[package]]
 name = "oxicrypt-ecdsa"
-version = "0.22.0"
+version = "0.23.1"
 dependencies = [
  "oxicrypt-drbg",
  "oxicrypt-module",
@@ -5359,7 +5368,7 @@ dependencies = [
 
 [[package]]
 name = "oxicrypt-hmac"
-version = "0.22.0"
+version = "0.23.1"
 dependencies = [
  "oxicrypt-module",
  "oxicrypt-sha",
@@ -5369,7 +5378,7 @@ dependencies = [
 
 [[package]]
 name = "oxicrypt-kdf"
-version = "0.22.0"
+version = "0.23.1"
 dependencies = [
  "oxicrypt-hmac",
  "oxicrypt-module",
@@ -5380,7 +5389,7 @@ dependencies = [
 
 [[package]]
 name = "oxicrypt-ml-dsa"
-version = "0.22.0"
+version = "0.23.1"
 dependencies = [
  "oxicrypt-module",
  "oxicrypt-sha",
@@ -5390,7 +5399,7 @@ dependencies = [
 
 [[package]]
 name = "oxicrypt-ml-kem"
-version = "0.22.0"
+version = "0.23.1"
 dependencies = [
  "oxicrypt-module",
  "oxicrypt-sha",
@@ -5400,11 +5409,11 @@ dependencies = [
 
 [[package]]
 name = "oxicrypt-module"
-version = "0.22.0"
+version = "0.23.1"
 
 [[package]]
 name = "oxicrypt-sha"
-version = "0.22.0"
+version = "0.23.1"
 dependencies = [
  "oxicrypt-module",
  "oxicrypt-test-vectors",
@@ -5413,11 +5422,11 @@ dependencies = [
 
 [[package]]
 name = "oxicrypt-test-vectors"
-version = "0.22.0"
+version = "0.23.1"
 
 [[package]]
 name = "oxicrypt-xof"
-version = "0.22.0"
+version = "0.23.1"
 dependencies = [
  "oxicrypt-module",
  "oxicrypt-sha",
@@ -5426,7 +5435,7 @@ dependencies = [
 
 [[package]]
 name = "oxicrypt-zeroize"
-version = "0.22.0"
+version = "0.23.1"
 
 [[package]]
 name = "parking"

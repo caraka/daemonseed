@@ -36,6 +36,10 @@ argon2.workspace = true
 tokio = { workspace = true }
 prost = { workspace = true }
 daemonseed-proto = { path = "../daemonseed-proto" }
+# The one crate permitted to use `unsafe`, holding the single Win32 call that
+# makes a rename's directory entry durable. Depended on precisely so this crate
+# can keep `#![forbid(unsafe_code)]`.
+daemonseed-sys = { path = "../daemonseed-sys" }
 redb = { workspace = true }
 walkdir = { workspace = true }
 notify = { workspace = true }

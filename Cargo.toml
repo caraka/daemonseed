@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/daemonseed-isc",
+    "crates/daemonseed-sys",
     "crates/daemonseed-core",
     "crates/daemonseed-proto",
     "crates/daemonseed-cli",

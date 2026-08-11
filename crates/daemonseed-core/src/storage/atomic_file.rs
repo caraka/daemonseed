@@ -39,11 +39,12 @@
 //! correspondence directory must make those entries durable too — otherwise
 //! `dm/corr-01/` itself is what the power cut takes.
 //!
-//! On Unix a crash or power loss at any point therefore leaves `path` holding
-//! either its previous contents or `bytes` — never a mixture, never a
-//! truncation, and never a name whose data was lost. **On non-Unix that is not
-//! true**: the destination is removed before the rename, so there is a window
-//! in which it is absent outright. See the Windows section below.
+//! A crash or power loss at any point therefore leaves `path` holding either
+//! its previous contents or `bytes` — never a mixture, never a truncation, and
+//! never a name whose data was lost. That holds on every supported platform.
+//! What differs is only *how* the name is made durable: Unix fsyncs the parent
+//! directory as barrier 2, Windows requests it as part of the replacement. See
+//! the Windows section below.
 //!
 //! ## Cross-process exclusion
 //!
@@ -74,24 +75,21 @@
 //!
 //! ## Windows
 //!
-//! `rename` is not atomic-over-an-existing-file on Windows, and a directory
-//! cannot be opened as a file to be fsynced. [`replace_atomically`] therefore
-//! removes the destination before renaming there, and skips the directory
-//! barrier. Two consequences, both weaker than the Unix contract:
+//! The guarantee is the same as on Unix, reached by a different route. A
+//! directory cannot be opened as a file there, so barrier 2 has nothing to
+//! `fsync` and [`RealDurability::sync_dir`] is a no-op. The durability is
+//! instead requested as part of the replacement itself:
+//! [`daemonseed_sys::replace_durably`] passes `MOVEFILE_WRITE_THROUGH`
+//! alongside `MOVEFILE_REPLACE_EXISTING`, so the directory entry has reached
+//! stable storage by the time the call returns.
 //!
-//! - The directory entry is not durable, so a power cut can lose an otherwise
-//!   successful replacement.
-//! - Between the `remove_file` and the `rename` the destination **does not
-//!   exist**. A crash there — or a `rename` that merely fails — leaves it gone
-//!   outright, rather than holding its previous contents. This is not only a
-//!   power-loss corner: an antivirus scanner or a search indexer holding the
-//!   temp file open fails the `rename` with `ERROR_SHARING_VIOLATION` in
-//!   ordinary operation, after the destination has already been removed. That
-//!   surfaces as [`AtomicReplaceError::Indeterminate`], which is precisely why
-//!   the caller must re-read the destination rather than assume a generation.
+//! That call is the workspace's only `unsafe`, quarantined in its own crate so
+//! this one keeps `#![forbid(unsafe_code)]`.
 //!
-//! This is recorded rather than silently papered over, because the DM store's
-//! atomicity contract is weaker on that platform.
+//! A replacement that fails — an antivirus scanner or search indexer holding
+//! the temp file open yields `ERROR_SHARING_VIOLATION` in ordinary operation —
+//! surfaces as [`AtomicReplaceError::Indeterminate`]; the caller must re-read
+//! the destination rather than assume a generation.
 
 use std::fs::File;
 use std::io::Write;
@@ -125,14 +123,12 @@ pub enum AtomicReplaceError {
     /// must not emit, and retrying is safe.
     NotLanded(std::io::Error),
 
-    /// The rename itself failed — or, on non-Unix, the pre-rename
-    /// `remove_file` succeeded and the rename then failed.
+    /// The rename itself failed.
     ///
-    /// The destination state is unknown to this function. On Unix a failed
-    /// `rename` leaves the previous contents in place; on non-Unix the
-    /// destination may already have been removed, so it may be **absent**. The
-    /// caller must re-read the destination before emitting anything and must
-    /// not assume either generation.
+    /// The destination state is unknown to this function: a failed `rename`
+    /// ordinarily leaves the previous contents in place, but this function does
+    /// not re-read to confirm it, so the caller must. Re-read the destination
+    /// before emitting anything and do not assume either generation.
     Indeterminate(std::io::Error),
 
     /// The rename succeeded but a durability barrier after it failed.
@@ -298,10 +294,14 @@ impl Durability for RealDurability {
 
     #[cfg(not(unix))]
     fn sync_dir(&self, _dir: &Path) -> std::io::Result<()> {
-        #[cfg(test)]
-        REAL_DIR_SYNCS.fetch_add(1, Ordering::Relaxed);
         // Windows cannot open a directory as a file. See the module docs: the
         // durable-directory-entry guarantee does not hold on this platform.
+        //
+        // Deliberately does NOT touch `REAL_DIR_SYNCS`. That counter is the
+        // positive control for a no-op substitution, so a no-op incrementing it
+        // would defeat the one test written to catch exactly that. The test
+        // asserts this counter stays put on non-Unix, pinning the weaker
+        // guarantee rather than concealing it.
         Ok(())
     }
 }
@@ -448,18 +448,20 @@ fn write_and_commit<D: Durability>(
         .map_err(AtomicReplaceError::NotLanded)?;
     drop(file);
 
-    // Windows cannot rename onto an existing file. This opens a window in
-    // which `path` does not exist — the reason the module docs record the
-    // Windows guarantee as weaker. A failure of the removal itself is still
-    // `NotLanded`: the destination keeps its previous contents.
-    #[cfg(not(unix))]
-    if path.exists() {
-        std::fs::remove_file(path).map_err(AtomicReplaceError::NotLanded)?;
-    }
-
     // Past this point the destination may already hold the new bytes, so no
     // later failure may be reported as "nothing happened".
-    std::fs::rename(tmp, path).map_err(AtomicReplaceError::Indeterminate)?;
+    //
+    // Nothing may be inserted between the temp file's data barrier and this
+    // call. The replacement is atomic on every supported platform, and removing
+    // the destination first is never required — doing so would open a window in
+    // which the file is absent outright rather than holding one generation or
+    // the other.
+    //
+    // On Windows this also carries `MOVEFILE_WRITE_THROUGH`, which is the only
+    // way to make the resulting directory entry durable on that platform; see
+    // [`daemonseed_sys`]. On Unix it is a plain `rename(2)` and barrier 2
+    // below supplies the durability.
+    daemonseed_sys::replace_durably(tmp, path).map_err(AtomicReplaceError::Indeterminate)?;
 
     // Barrier 2: the *name* is durable. Only reachable on Unix in any
     // meaningful sense; see `RealDurability::sync_dir`.
@@ -676,9 +678,30 @@ mod tests {
             REAL_FILE_SYNCS.load(Ordering::Relaxed) > files_before,
             "replace_atomically must drive RealDurability's data barrier"
         );
+
+        // The name barrier is real only on Unix, so each platform asserts what
+        // is true there. A single claim across both would pass on non-Unix
+        // without the barrier having run, which is the failure this split
+        // exists to prevent.
+        #[cfg(unix)]
         assert!(
             REAL_DIR_SYNCS.load(Ordering::Relaxed) > dirs_before,
             "replace_atomically must drive RealDurability's name barrier"
+        );
+
+        // Non-Unix reaches name durability through the replacement itself
+        // (`MOVEFILE_WRITE_THROUGH`), not through this barrier, so `sync_dir`
+        // is a no-op there and must not appear to have run. Equality is exact
+        // rather than best-effort: no arm of `sync_dir` compiled on this
+        // platform touches the counter, so concurrent tests cannot inflate it
+        // either. Should a real barrier ever be added here, this fails and
+        // says so. Do not delete it to make that green.
+        #[cfg(not(unix))]
+        assert_eq!(
+            REAL_DIR_SYNCS.load(Ordering::Relaxed),
+            dirs_before,
+            "non-Unix has no durable-name barrier; if one is added, assert it \
+             here rather than removing this check"
         );
     }
 

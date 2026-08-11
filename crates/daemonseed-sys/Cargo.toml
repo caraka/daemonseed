@@ -1,0 +1,32 @@
+[package]
+name = "daemonseed-sys"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "AGPL-3.0-or-later"
+publish = false
+description = "daemonseed OS-level calls that have no safe equivalent in std — the one crate in the workspace permitted to use `unsafe`, so every other crate can forbid it"
+
+# Deliberately a LEAF crate: std plus, per platform, the raw bindings for the
+# handful of OS entry points std does not wrap. It exists so that
+# `daemonseed-core` — which holds the storage and key-handling paths — can keep
+# `#![forbid(unsafe_code)]` while still reaching calls that have no safe
+# equivalent. A crate boundary is the price; the alternative was relaxing
+# `forbid` on the crate where it is worth the most.
+[dependencies]
+
+[target.'cfg(windows)'.dependencies]
+# `Win32_Storage_FileSystem` carries `MoveFileExW` and its `MOVEFILE_*` flags;
+# `Win32_Foundation` carries the `BOOL` its signature returns. windows-sys only
+# emits a function when every type in its signature is enabled, so both are
+# required. Pinned to 0.61 to match the version already dominant in the lock
+# tree (`daemonseed-gui` pins the same).
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
