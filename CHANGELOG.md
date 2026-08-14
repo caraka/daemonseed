@@ -26,6 +26,15 @@ work lives in the project lead's vault manifest, not here.
 
 ### Added
 
+- `daemonseed_core::dm::resume` — the A9.2 re-establishment resume record.
+  `ResumeRecord` carries `S_pc`/`PK_pc`, the committed re-establishment root,
+  the `attempt` counter, the sealed RE-EST frame bytes, the send-side floor, the
+  window anchor and the toward-`C` count in one blob. `SendFloor` is
+  `(generation, seq)` and orders lexicographically, so a generation bump is not
+  a rollback. `DmPersist::commit_resume` writes the record and returns the
+  sealed bytes to emit; `read_resume` reads it back. `RESUME_CAPACITY` is now
+  checked against a computed worst case rather than estimated.
+
 - `daemonseed_core::dm::persist` — the wiring between the DM types and the
   store, so DM state is finally written. `DmPersist` derives both the store key
   and the provisional record's key from one at-rest key. `restart_channel`

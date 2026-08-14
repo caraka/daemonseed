@@ -92,6 +92,7 @@ use std::path::PathBuf;
 
 use oxicrypt_aes::Aes256Key;
 use oxicrypt_ml_kem as ml_kem;
+use zeroize::Zeroizing;
 
 use crate::dm::firstcontact::{FirstContactError, ROOT_LEN};
 use crate::dm::outbox::{Outbox, OutboxError};
@@ -100,6 +101,7 @@ use crate::dm::provisional::{
     derive_seal_key, restart,
 };
 use crate::dm::ratchet::{Direction, Ratchet, RatchetError};
+use crate::dm::resume::{ResumeError, ResumeRecord};
 use crate::storage::dm_store::{
     CorrespondenceLabel, DmStore, DmStoreError, RECEIVE_CURSOR_LEN, RecordKind,
 };
@@ -121,6 +123,8 @@ pub enum DmPersistError {
     /// The outbox record could not be decoded, or a caller's own outbox call
     /// inside [`DmPersist::update_outbox`] failed.
     Outbox(OutboxError),
+    /// A resume record would not encode, decode, or replace the stored one.
+    Resume(ResumeError),
     /// The record's ratchet could not be opened, so the channel did not
     /// establish. The provisional record is **still on disk**: see
     /// [`PendingHandshake::establish`] for why that is the safe direction.
@@ -154,6 +158,7 @@ impl std::fmt::Display for DmPersistError {
             Self::Store(e) => write!(f, "dm store: {e}"),
             Self::Record(e) => write!(f, "provisional record: {e}"),
             Self::Outbox(e) => write!(f, "outbox: {e}"),
+            Self::Resume(e) => write!(f, "resume record: {e}"),
             Self::Ratchet(e) => write!(f, "ratchet: {e}"),
             Self::OutboxDirectionMismatch { stored, requested } => write!(
                 f,
@@ -176,6 +181,7 @@ impl std::error::Error for DmPersistError {
             Self::Store(e) => Some(e),
             Self::Record(e) => Some(e),
             Self::Outbox(e) => Some(e),
+            Self::Resume(e) => Some(e),
             Self::Ratchet(e) => Some(e),
             Self::OutboxDirectionMismatch { .. } | Self::CursorNotCorroborated { .. } => None,
         }
@@ -191,6 +197,12 @@ impl From<DmStoreError> for DmPersistError {
 impl From<ProvisionalError> for DmPersistError {
     fn from(e: ProvisionalError) -> Self {
         Self::Record(e)
+    }
+}
+
+impl From<ResumeError> for DmPersistError {
+    fn from(e: ResumeError) -> Self {
+        Self::Resume(e)
     }
 }
 
@@ -427,6 +439,108 @@ impl DmPersist {
             })
     }
 
+    /// Commit a re-establishment resume record and hand back the sealed RE-EST
+    /// bytes to emit (A9.2).
+    ///
+    /// **The whole record replaces the stored one in a single
+    /// `replace_atomically`**, so no crash can pair a committed root with a
+    /// stale attempt. There is no call here that writes part of a record.
+    ///
+    /// **Returning the sealed bytes is ergonomics, not proof, and an earlier
+    /// version of this comment overclaimed it.** It said the ordering was "a
+    /// property of the signature" because the frame was unreachable without a
+    /// completed write. That is false: the caller built the record and therefore
+    /// already holds those bytes, and
+    /// [`ResumeRecord::sealed_re_est`](crate::dm::resume::ResumeRecord::sealed_re_est)
+    /// is public on an unpersisted record — emit-then-crash-before-commit is
+    /// perfectly spellable. It cannot be made structural at this layer, because
+    /// the bytes originate above it. What this shape does buy is that the
+    /// *convenient* path is the correct one.
+    ///
+    /// **An attempt may not be re-sealed, and may not regress.** A9.1 makes a
+    /// re-emit of a persisted attempt the byte-identical persisted seal, and the
+    /// peer dedups on `attempt` (A9.4) — so committing different sealed bytes
+    /// under an attempt the peer has already seen leaves this party holding a
+    /// secret the peer will never confirm, the permanent `UnknownEphemeral`
+    /// divergence. This is the only layer that can see both the offered record
+    /// and the stored one, so it is the only place the invariant can be
+    /// enforced.
+    ///
+    /// **A stored record that will not decode wedges this call** — every future
+    /// commit for that correspondence fails rather than overwriting it. That is
+    /// deliberate and it is the fail-closed direction: the stored record holds
+    /// the anti-rollback bounds, and silently replacing an unreadable one
+    /// discards them. It is the same trade
+    /// [`Outbox::decode`](crate::dm::outbox::Outbox::decode) makes in refusing
+    /// rather than repairing, and the same disposition question `Locked::delete`
+    /// carries.
+    ///
+    /// **The send-side floor may not regress.** A stored record whose floor is
+    /// ahead of the offered one is [`ResumeError::FloorWouldRollBack`], refused
+    /// rather than overwritten: the floor is the anti-rollback bound for this
+    /// party's own sequence numbers, and a write that moved it backwards would
+    /// re-authorise sequences already spent. An *unmoved* floor is admitted —
+    /// see [`SendFloor::admits`](crate::dm::resume::SendFloor::admits) for why
+    /// the guard here is weaker than advancing the floor itself.
+    pub fn commit_resume(
+        &self,
+        correspondence: &CorrespondenceLabel,
+        record: &ResumeRecord,
+    ) -> Result<Vec<u8>, DmPersistError> {
+        let encoded = record.encode();
+        self.store
+            .critical_section(correspondence, |guard| -> Result<Vec<u8>, DmPersistError> {
+                if let Some(bytes) = guard.read(RecordKind::Resume)? {
+                    let stored = ResumeRecord::decode(&Zeroizing::new(bytes))?;
+                    if record.attempt() < stored.attempt() {
+                        return Err(ResumeError::AttemptWouldRollBack {
+                            stored: stored.attempt(),
+                            offered: record.attempt(),
+                        }
+                        .into());
+                    }
+                    if record.attempt() == stored.attempt()
+                        && record.sealed_re_est() != stored.sealed_re_est()
+                    {
+                        return Err(ResumeError::AttemptResealed {
+                            attempt: record.attempt(),
+                        }
+                        .into());
+                    }
+                    if !stored.send_floor().admits(record.send_floor()) {
+                        return Err(ResumeError::FloorWouldRollBack {
+                            stored: stored.send_floor(),
+                            offered: record.send_floor(),
+                        }
+                        .into());
+                    }
+                }
+                guard.replace(RecordKind::Resume, &encoded)?;
+                Ok(record.sealed_re_est().to_vec())
+            })
+    }
+
+    /// Read the persisted resume record, or `Ok(None)` if none was written.
+    ///
+    /// **No clock argument**, unlike [`Self::read_outbox`]: nothing in this
+    /// record drives a terminal transition, so there is no stored timestamp
+    /// whose corruption could switch a guarantee off — the reasoning is on
+    /// [`ResumeRecord::decode`].
+    pub fn read_resume(
+        &self,
+        correspondence: &CorrespondenceLabel,
+    ) -> Result<Option<ResumeRecord>, DmPersistError> {
+        self.store
+            .critical_section(correspondence, |guard| -> Result<_, DmPersistError> {
+                match guard.read(RecordKind::Resume)? {
+                    // `Zeroizing`: this plaintext holds a signing key, and the
+                    // store zeroizes only its own copy.
+                    Some(bytes) => Ok(Some(ResumeRecord::decode(&Zeroizing::new(bytes))?)),
+                    None => Ok(None),
+                }
+            })
+    }
+
     /// Read the persisted receive cursor, bounded by what the caller has
     /// genuinely read.
     ///
@@ -641,6 +755,7 @@ mod tests {
     use crate::dm::paging::MAX_PAGE;
     use crate::dm::provisional::{PROVISIONAL_RECORD_LEN, TeardownCause};
     use crate::dm::ratchet::EphemeralDecapKey;
+    use crate::dm::resume::SendFloor;
     use crate::storage::dm_store::CORRESPONDENCE_LABEL_LEN;
 
     const AT_REST: [u8; AEAD_KEY_LEN] = [0x7Eu8; AEAD_KEY_LEN];
@@ -1265,6 +1380,236 @@ mod tests {
             raw,
             258u64.to_be_bytes(),
             "the page number is not on disk verbatim"
+        );
+    }
+    // ------------------------------------------------------------ the resume record (A9.2)
+
+    fn resume_record(attempt: u32, floor: SendFloor) -> ResumeRecord {
+        resume_record_sealed(attempt, floor, 0xA5)
+    }
+
+    fn resume_record_sealed(attempt: u32, floor: SendFloor, seal: u8) -> ResumeRecord {
+        ResumeRecord::new(
+            Box::new([0x11u8; oxicrypt_ml_dsa::SK_LEN]),
+            Box::new([0x22u8; oxicrypt_ml_dsa::PK_LEN]),
+            crate::dm::resume::CommittedRoot::from_bytes(
+                [0x33u8; crate::dm::ratchet::ROOT_KEY_LEN],
+            ),
+            attempt,
+            floor,
+            1_700_000_000_000,
+            2,
+            vec![seal; 256].into_boxed_slice(),
+        )
+        .expect("within MAX_FRAME_LEN")
+    }
+
+    /// The commit returns the bytes to emit, and only after the record is on
+    /// disk — so there is no ordering in which an emitted attempt is not also a
+    /// persisted one.
+    #[test]
+    fn a_commit_persists_the_record_and_hands_back_the_frame() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0x51);
+
+        assert!(
+            p.read_resume(&l).expect("reads").is_none(),
+            "fixture is not empty"
+        );
+
+        let record = resume_record(1, SendFloor::new(4, 100));
+        let emitted = p.commit_resume(&l, &record).expect("commits");
+        assert_eq!(
+            emitted,
+            record.sealed_re_est(),
+            "the caller was handed something other than the persisted seal"
+        );
+
+        let stored = p
+            .read_resume(&l)
+            .expect("reads")
+            .expect("a record was committed");
+        assert_eq!(stored.attempt(), 1);
+        assert_eq!(stored.send_floor(), SendFloor::new(4, 100));
+        assert_eq!(
+            stored.sealed_re_est(),
+            record.sealed_re_est(),
+            "A9.1's byte-identical re-emit is unavailable after a restart"
+        );
+        assert_eq!(stored.s_pc(), record.s_pc());
+    }
+
+    /// The send-side floor is an anti-rollback bound, so a write carrying an
+    /// earlier one is refused rather than overwriting it.
+    #[test]
+    fn a_commit_may_not_move_the_send_floor_backwards() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0x52);
+
+        p.commit_resume(&l, &resume_record(1, SendFloor::new(4, 100)))
+            .expect("first commit");
+
+        let err = p
+            .commit_resume(&l, &resume_record(2, SendFloor::new(4, 99)))
+            .expect_err("a regressing floor was accepted");
+        assert!(
+            matches!(
+                err,
+                DmPersistError::Resume(ResumeError::FloorWouldRollBack { .. })
+            ),
+            "wrong error: {err:?}"
+        );
+
+        // And the refusal wrote nothing: the stored record is untouched, which
+        // a refusal that had already replaced the file would not leave.
+        let stored = p.read_resume(&l).expect("reads").expect("still there");
+        assert_eq!(stored.attempt(), 1);
+        assert_eq!(stored.send_floor(), SendFloor::new(4, 100));
+    }
+
+    /// An unmoved floor is admitted, because a resume record is rewritten for
+    /// reasons the send side knows nothing about — a new attempt, here.
+    #[test]
+    fn a_commit_with_an_unmoved_floor_is_admitted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0x53);
+        let floor = SendFloor::new(4, 100);
+
+        p.commit_resume(&l, &resume_record(1, floor))
+            .expect("first commit");
+        p.commit_resume(&l, &resume_record(2, floor))
+            .expect("an unmoved floor was refused on a new attempt");
+
+        assert_eq!(
+            p.read_resume(&l).expect("reads").expect("there").attempt(),
+            2
+        );
+    }
+
+    /// A generation bump that carries the sequence forward is admitted — the
+    /// bump itself is never the rollback.
+    #[test]
+    fn a_commit_under_a_new_generation_is_admitted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0x54);
+
+        p.commit_resume(&l, &resume_record(1, SendFloor::new(4, 100)))
+            .expect("first commit");
+        p.commit_resume(&l, &resume_record(2, SendFloor::new(5, 100)))
+            .expect("a generation bump was read as a rollback");
+    }
+
+    /// **But it may not carry the sequence backwards.** Lexicographically
+    /// `(5, 0)` outranks `(4, 100)`, so a write guard deferring to `Ord` would
+    /// admit this — and against the ratchet as built, where send `seq` never
+    /// restarts, it discards 100 spent sequences. See `SendFloor::admits`.
+    #[test]
+    fn a_generation_bump_may_not_carry_the_sequence_backwards() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0x57);
+
+        p.commit_resume(&l, &resume_record(1, SendFloor::new(4, 100)))
+            .expect("first commit");
+        let err = p
+            .commit_resume(&l, &resume_record(2, SendFloor::new(5, 0)))
+            .expect_err("a sequence rollback rode in on a generation bump");
+        assert!(
+            matches!(
+                err,
+                DmPersistError::Resume(ResumeError::FloorWouldRollBack { .. })
+            ),
+            "wrong error: {err:?}"
+        );
+    }
+
+    /// A9.1: a persisted attempt is re-emitted as the byte-identical persisted
+    /// seal, so committing **different** bytes under one is refused.
+    ///
+    /// Without this the peer, which dedups on `attempt`, has already seen the
+    /// first seal and drops the second as a duplicate — leaving this party
+    /// holding a secret the peer will never confirm, which is the permanent
+    /// `UnknownEphemeral` divergence.
+    #[test]
+    fn a_persisted_attempt_may_not_be_resealed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0x58);
+        let floor = SendFloor::new(4, 100);
+
+        p.commit_resume(&l, &resume_record_sealed(1, floor, 0xA5))
+            .expect("first commit");
+
+        // Re-committing the SAME attempt with the SAME bytes is the ordinary
+        // idempotent case and must still work.
+        p.commit_resume(&l, &resume_record_sealed(1, floor, 0xA5))
+            .expect("an identical re-commit of one attempt was refused");
+
+        let err = p
+            .commit_resume(&l, &resume_record_sealed(1, floor, 0x5A))
+            .expect_err("a persisted attempt was re-sealed");
+        assert!(
+            matches!(
+                err,
+                DmPersistError::Resume(ResumeError::AttemptResealed { attempt: 1 })
+            ),
+            "wrong error: {err:?}"
+        );
+
+        // The refusal wrote nothing: the first seal is still the stored one, so
+        // recovery still re-emits the bytes the peer actually saw.
+        let stored = p.read_resume(&l).expect("reads").expect("there");
+        assert_eq!(stored.sealed_re_est(), &[0xA5u8; 256]);
+
+        // And a NEW attempt may carry fresh bytes — that is A9.1's other half.
+        p.commit_resume(&l, &resume_record_sealed(2, floor, 0x5A))
+            .expect("a new attempt was refused fresh bytes");
+    }
+
+    /// The attempt counter is monotone, for the same reason the floor is.
+    #[test]
+    fn a_commit_may_not_move_the_attempt_backwards() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0x59);
+        let floor = SendFloor::new(4, 100);
+
+        p.commit_resume(&l, &resume_record(5, floor))
+            .expect("first commit");
+        let err = p
+            .commit_resume(&l, &resume_record(4, floor))
+            .expect_err("an attempt regression was accepted");
+        assert!(
+            matches!(
+                err,
+                DmPersistError::Resume(ResumeError::AttemptWouldRollBack {
+                    stored: 5,
+                    offered: 4
+                })
+            ),
+            "wrong error: {err:?}"
+        );
+        assert_eq!(
+            p.read_resume(&l).expect("reads").expect("there").attempt(),
+            5
+        );
+    }
+
+    /// Two correspondences do not share a resume record.
+    #[test]
+    fn a_resume_record_is_per_correspondence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+
+        p.commit_resume(&label(0x55), &resume_record(1, SendFloor::new(1, 1)))
+            .expect("commits");
+        assert!(
+            p.read_resume(&label(0x56)).expect("reads").is_none(),
+            "one correspondence's resume record was visible to another"
         );
     }
 }

@@ -1075,6 +1075,19 @@ modules:
       safe retry. update_outbox(label, direction, now_ms, f) and
       advance_cursor(label, page, read_through) are read-modify-write inside one
       critical_section; there is no load-then-save pair to lose an update.
+      commit_resume(&CorrespondenceLabel, &ResumeRecord) -> Result<Vec<u8>,
+      DmPersistError> writes the resume record inside one critical section and
+      returns its sealed RE-EST bytes, so the frame is unreachable without a
+      completed write; it refuses with DmPersistError::Resume(
+      ResumeError::FloorWouldRollBack) when the stored send floor is ahead of
+      the offered one, ResumeError::AttemptWouldRollBack { stored, offered } on
+      an attempt regression, and ResumeError::AttemptResealed { attempt } when a
+      persisted attempt is offered with different sealed bytes; it writes nothing
+      in any of those cases. A stored record that will not decode makes every
+      further commit for that correspondence fail, which is the fail-closed
+      direction. read_resume(
+      &CorrespondenceLabel) -> Result<Option<ResumeRecord>, DmPersistError>
+      reads it back. DmPersistError::Resume(ResumeError) carries both.
       read_outbox/read_cursor are lock-free. The provisional record is sealed by
       its own path and again by the store: the record's seal binds RecordContext
       and refuses one lifted from another channel, the store's AAD binds label
@@ -1165,6 +1178,34 @@ modules:
       far-future due time still sweeps and still surfaces. NOT YET AVAILABLE:
       any store that writes or reads an outbox, and the transport that emits from
       one (#235 transport half).
+      Sub-module dm::resume is the A9.2 re-establishment resume record.
+      ResumeRecord::new(s_pc: Box<[u8; ml_dsa::SK_LEN]>, pk_pc: Box<[u8;
+      ml_dsa::PK_LEN]>, committed_root: CommittedRoot, attempt: u32, send_floor:
+      SendFloor, window_anchor_ms: i64, toward_c: u32, sealed_re_est: Box<[u8]>)
+      -> Result<ResumeRecord, ResumeError> takes every field at once; there is no
+      builder and no field setter. It returns ResumeError::FrameTooLong { len }
+      above dm::frame::MAX_FRAME_LEN. Accessors s_pc/pk_pc/committed_root/
+      attempt/send_floor/window_anchor_ms/toward_c/sealed_re_est borrow;
+      sealed_re_est returns the same bytes every call. s_pc and committed_root
+      zero on drop and Debug renders both redacted. CommittedRoot::from_bytes([u8;
+      ROOT_KEY_LEN]) is a redacted secret newtype distinct from
+      ratchet::RootKey. SendFloor::new(generation: u32, seq: u64) orders
+      lexicographically by generation then seq; advance_to(offered) ->
+      Result<SendFloor, ResumeError> requires a strict advance and returns
+      ResumeError::FloorWouldRollBack { stored, offered }. admits(offered) ->
+      bool is the write-time guard and requires BOTH components non-decreasing,
+      which is stricter than Ord: lexicographically (5,0) outranks (4,u64::MAX),
+      and admitting that would discard spent sequences. encode() ->
+      Zeroizing<Vec<u8>> and decode(bytes) -> Result<ResumeRecord, ResumeError>
+      are the
+      at-rest form under RESUME_MAGIC (daemonseed/dm/resume/v1\0) plus a 2-byte
+      suite id, plaintext; storage::dm_store seals and pads it. decode takes no
+      clock: no stored value here drives a terminal transition. It rejects a
+      wrong magic, a truncation, a frame length above MAX_FRAME_LEN checked
+      before any allocation, a sentinel or unknown suite id, and trailing bytes.
+      MAX_ENCODED_LEN is the computed worst case and bounds
+      dm_store::RESUME_CAPACITY. The record carries no receive-side peer
+      high-water; that stays ratchet-resident.
       Sub-module dm::domain
       declares the daemonseed/dm/… label namespace, one distinct prefix-free label
       per purpose.

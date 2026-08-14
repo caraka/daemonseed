@@ -121,6 +121,7 @@ use zeroize::Zeroize;
 use crate::aead_envelope::{EnvelopeError, open_envelope, seal_envelope};
 use crate::circle::message::{NONCE_LEN, TAG_LEN};
 use crate::dm::provisional::PROVISIONAL_RECORD_LEN;
+use crate::dm::resume::MAX_ENCODED_LEN;
 use crate::dm::{LEN_PREFIX, domain, push_lp, unpad};
 use crate::storage::atomic_file::{
     AtomicReplaceError, Durability, FileLock, LockError, RealDurability, TMP_INFIX,
@@ -187,14 +188,21 @@ const LOCK_FILE_NAME: &str = ".lock";
 
 /// Largest payload a [`RecordKind::Resume`] record may carry.
 ///
-/// A9.2's field set is the sealed `RE-EST` frame bytes, `S_pc` and `PK_pc`, the
-/// committed generation and attempt counters, the two handshake slots and the
-/// dedup memory. A sealed frame alone is bounded by
-/// [`crate::dm::frame::MAX_FRAME_LEN`] (32 KiB), so 64 KiB leaves the rest of
-/// that set roughly as much room again.
+/// **No longer a guess: the format exists and its worst case is computed.**
+/// [`crate::dm::resume::MAX_ENCODED_LEN`] is the arithmetic sum of every fixed
+/// field plus [`crate::dm::frame::MAX_FRAME_LEN`], which
+/// [`crate::dm::resume::ResumeRecord::new`] refuses to exceed — so it is a real
+/// ceiling rather than a typical case, and this constant is checked against it
+/// by the `const` assertion immediately below — not by a test, because both
+/// sides are `const` and a runtime assertion over two constants is a probe that
+/// cannot fire (`clippy::assertions_on_constants` says so). A field added to the
+/// record that outgrows this bucket fails the **build**.
 ///
-/// **This number is a guess against a record format that is not built yet.** If
-/// a resume record outgrows it, [`Locked::replace`] refuses the write with
+/// The headroom left over is deliberate. A9.2's field set is closed today, but
+/// the re-establishment protocol that produces it is not built, and a record
+/// that grows after records exist needs a migration — see below.
+///
+/// If a resume record outgrows this, [`Locked::replace`] refuses the write with
 /// [`DmStoreError::PayloadTooLong`] — loudly, at the moment of the write, with
 /// both numbers in the message. It never truncates, and it never silently grows
 /// the file: growing it is a deliberate edit here, and because the bucket is the
@@ -202,6 +210,19 @@ const LOCK_FILE_NAME: &str = ".lock";
 /// therefore needs a migration. Sizing it generously now is much cheaper than
 /// resizing it later.
 pub const RESUME_CAPACITY: usize = 65_536;
+
+/// The bucket holds the worst case, checked at **compile time**.
+///
+/// A runtime test of this would be a probe that cannot fire: both sides are
+/// `const`, so the comparison is settled before any test runs — which is what
+/// `clippy::assertions_on_constants` says when it refuses one. A `const`
+/// assertion states the same fact where it is actually decided, and a field
+/// added to [`crate::dm::resume::ResumeRecord`] that outgrows this bucket then
+/// fails the **build** rather than a test somebody might not run.
+const _: () = assert!(
+    MAX_ENCODED_LEN <= RESUME_CAPACITY,
+    "the worst-case resume record exceeds RESUME_CAPACITY"
+);
 
 /// Largest payload a [`RecordKind::Outbox`] record may carry.
 ///

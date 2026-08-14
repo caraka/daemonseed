@@ -75,3 +75,4 @@ pub mod paging;
 pub mod persist;
 pub mod provisional;
 pub mod ratchet;
+pub mod resume;
