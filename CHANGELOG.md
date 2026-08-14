@@ -148,6 +148,14 @@ work lives in the project lead's vault manifest, not here.
 
 ### Fixed
 
+- Corrected the DM outbox's delivery state, which inferred *on the DHT* from the
+  re-seed rung and so reported a message as published after writes that errored
+  and after a key-fetch retry on an entry that had never been emitted. A
+  persisted `Acceptance` carries the fact, `OutboxEntry::confirm_written` is the
+  transport's report that sets it, and `emit` alone claims nothing. The at-rest
+  format is `daemonseed/dm/outbox/v3\0`; v2 records are read, every entry
+  defaulting to `Unconfirmed`. (#278)
+
 - `DmStoreError::Io`'s `Display` no longer renders the full path, which
   embedded the correspondence's directory name and put a stable
   per-correspondence identifier into any log line, crash report or toast

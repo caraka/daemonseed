@@ -1106,9 +1106,10 @@ modules:
       consumption it records. channel_torn_down's retained set is not flagged:
       those entries are unchanged and are re-reported on their own merits.
       encode/decode carry the flag; the at-rest form is
-      daemonseed/dm/outbox/v2\0 plus a 2-byte suite id, and v1 (OUTBOX_MAGIC_V1)
-      is refused rather than dual-read, because it cannot supply a surfacing
-      value. Sealing, padding and the fixed on-disk size belong to
+      daemonseed/dm/outbox/v3\0 plus a 2-byte suite id. v2 (OUTBOX_MAGIC_V2) is
+      read, with every entry defaulting to Acceptance::Unconfirmed; v1
+      (OUTBOX_MAGIC_V1) is refused as OutboxError::UnsupportedVersion. Sealing,
+      padding and the fixed on-disk size belong to
       storage::dm_store (#279). SealedFrame::new(Vec<u8>) wraps sealed bytes
       and exposes as_bytes/len/is_empty only; there is no mutating accessor.
       OutboxEntry::publish(now_ms, frame) is the only edge that installs a frame
@@ -1120,11 +1121,18 @@ modules:
       OutboxError::GaveUp when the entry is live but past its give-up window —
       two distinct answers, because the second names a message the caller still
       owes a surfacing. is_due(now_ms) is false past the window too, so the
-      window bounds emission whether or not sweep_give_ups has run. delivery_state() maps the lifecycle
-      to DeliveryState (Composed, OnDht, ConfirmedCollected, Undelivered); a
-      sealed entry that has never been emitted is Composed, and OnDht means
-      handed to the transport, not accepted by the DHT (M2 — no write-outcome
-      state exists yet). ReseedSchedule::new(now_ms) starts due immediately;
+      window bounds emission whether or not sweep_give_ups has run.
+      confirm_written(now_ms) -> Result<(), OutboxError> records that the
+      transport confirmed a write; it is idempotent, one-way, leaves the schedule
+      untouched, and returns OutboxError::NothingToConfirm on an entry with no
+      published frame or OutboxError::GaveUp past the window. acceptance() ->
+      Acceptance is the persisted fact it sets (Unconfirmed, Confirmed);
+      emit alone never sets it. delivery_state() maps the lifecycle
+      to DeliveryState (Composed, OnDht, ConfirmedCollected, Undelivered); an
+      AwaitingCollection entry is OnDht only while acceptance() is Confirmed,
+      and OnDht means the transport confirmed a write, not that the DHT holds
+      the value (M2 — a losing set_dht_value also returns success).
+      ReseedSchedule::new(now_ms) starts due immediately;
       schedule_next(now_ms, unit) consumes one rung of RESEED_LADDER (1, 2, 4, 8,
       16, 32, 64 minutes, then 60, then 86400 seconds repeating), jittered by
       RESEED_JITTER_FRAC through backoff::apply_jitter, and
@@ -1144,9 +1152,10 @@ modules:
       so the obligation travels with the value rather than only binding at the
       call. encode() / decode(bytes, now_ms) ->
       Result<Outbox, OutboxError> are the at-rest form under OUTBOX_MAGIC
-      (daemonseed/dm/outbox/v1\0), plaintext, carrying no key material and no
-      message text; decode rejects a wrong magic, a truncation, an unknown tag, a
-      doorbell slot outside the record, a duplicate sequence and trailing bytes.
+      (daemonseed/dm/outbox/v3\0), plaintext, carrying no key material and no
+      message text; encode always writes the current version. decode rejects a
+      wrong magic, a truncation, an unknown tag, a doorbell slot outside the
+      record, a duplicate sequence and trailing bytes.
       A stored composed_at_ms ahead of now_ms is REFUSED as
       OutboxError::ComposedInFuture { seq, ahead_ms } and never rewritten: the
       file is unsealed, and a future compose time disables the give-up

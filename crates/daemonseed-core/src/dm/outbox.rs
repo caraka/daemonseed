@@ -104,17 +104,33 @@
 //! | [`Lifecycle`] (this record) | [`DeliveryState`] (what a UI may say) |
 //! |---|---|
 //! | `AwaitingKey` | `Composed` — nothing is on the DHT yet |
-//! | `AwaitingCollection`, never emitted | `Composed` — sealing is not publishing |
-//! | `AwaitingCollection`, emitted | `OnDht`, which a UI may annotate *peer-reachable* from the presence layer |
+//! | `AwaitingCollection`, no write confirmed | `Composed` — sealing is not publishing, and neither is attempting |
+//! | `AwaitingCollection`, a write confirmed | `OnDht`, which a UI may annotate *peer-reachable* from the presence layer |
 //! | `ConfirmedCollected` | `ConfirmedCollected` |
 //! | `Undelivered` | `Undelivered` |
 //!
-//! `OnDht` is the weakest of the four and says less than its name: it means the
-//! bytes were handed to the transport, not that the DHT took them. **M2** is why
+//! **The `OnDht` row turns on [`Acceptance`], and it used to turn on the rung
+//! index — which was a proxy for "has been emitted", not for "was accepted"
+//! (#278).** Under that proxy a transport outage read as success: seven
+//! [`OutboxEntry::emit`] calls, seven failed `set_dht_value`s, and the entry
+//! reported `OnDht` while nothing had ever left the machine. It was wrong on a
+//! second path too, which is worth stating because it was never about failed
+//! writes as such — [`OutboxEntry::retry_key_fetch`] also advances the rung, so
+//! an `AwaitingKey` entry that retried its key fetch and then published reported
+//! `OnDht` immediately, with no emission at all. A rung index answers *how far
+//! down the backoff ladder are we*, and no arrangement of it answers *did the
+//! transport take the bytes*. [`OutboxEntry::confirm_written`] is now the only
+//! thing that answers the second question, and it is the caller's to call.
+//!
+//! `OnDht` is still the weakest of the four and still says less than its name.
+//! It now means the transport confirmed a write, which is strictly more than
+//! *handed over* and strictly less than *the DHT holds our value*. **M2** is why
 //! it cannot yet say more — a losing `set_dht_value` re-propagates the winner's
-//! value and returns success, and the design records that "the outbox state
+//! value and **returns success**, and the design records that "the outbox state
 //! machine has no *my write lost the race* state and consumes no return value".
-//! Closing that needs the write outcome, which only the transport slice holds.
+//! A confirmation is the transport's `Ok`, so a write that loses the race is
+//! confirmed here exactly as a write that wins. Closing that needs a *value*
+//! read back rather than a return code, which only the transport slice holds.
 //!
 //! Two of those need their reasoning stated rather than assumed.
 //!
@@ -315,7 +331,32 @@ pub const GIVE_UP_MS: i64 = GIVE_UP.as_secs() as i64 * 1_000;
 /// At-rest magic. The version is **inside** it, so a decoder compares one thing
 /// and cannot read a v1 body under a v2 header — the shape
 /// [`crate::dm::provisional`] uses.
-pub const OUTBOX_MAGIC: &[u8] = b"daemonseed/dm/outbox/v2\0";
+pub const OUTBOX_MAGIC: &[u8] = b"daemonseed/dm/outbox/v3\0";
+
+/// The v2 magic, which [`Outbox::decode`] **reads**, defaulting every entry to
+/// [`Acceptance::Unconfirmed`].
+///
+/// v2 carried no acceptance byte: it inferred *on the DHT* from a non-zero rung,
+/// which is the defect #278 names. So a v2 file cannot supply this field and a
+/// default has to be chosen — and unlike the v1 case below, **one of the two
+/// defaults is right rather than both being wrong.**
+///
+/// `Unconfirmed` understates: a message genuinely on the DHT reads `Composed`
+/// until its next emission is confirmed, which is at most one rung away and
+/// costs a UI row that is too cautious for one interval. `Confirmed` would
+/// overstate, and would do it by **reconstructing the very proxy this version
+/// removes** — `rung > 0` is exactly what v2 believed, including for the
+/// key-fetch-retry entries it was wrong about. Understating is also the module's
+/// standing posture (§ D-DELIV, *"default not-delivered"*), so the migration
+/// direction is the one the design already picked for every other ambiguity
+/// here.
+///
+/// **Why this is read at all, when v1 is refused.** The v1 argument turns on
+/// there being no historical fact to be compatible with — nothing ever wrote a
+/// v1 record. That does not hold for v2: [`crate::dm::persist`] writes v2
+/// records today, so a profile that has run the DM slice has them on disk.
+/// Refusing would make this change a wipe.
+pub const OUTBOX_MAGIC_V2: &[u8] = b"daemonseed/dm/outbox/v2\0";
 
 /// The v1 magic, which [`Outbox::decode`] **refuses** — and which nothing has
 /// ever written.
@@ -332,6 +373,11 @@ pub const OUTBOX_MAGIC: &[u8] = b"daemonseed/dm/outbox/v2\0";
 /// those writers used; there is no such historical fact here. No v1 record was
 /// ever written anywhere: [`Outbox::encode`] had no caller that stored its
 /// output until [`crate::dm::persist`], and by then the magic was already v2.
+///
+/// **[`OUTBOX_MAGIC_V2`] is dual-read, and the contrast is the whole test.**
+/// Age is not what decides it: v2 records reached real disks, and the field a
+/// v2 body cannot supply has one default that is merely cautious rather than two
+/// that are both wrong. Neither is true of v1.
 pub const OUTBOX_MAGIC_V1: &[u8] = b"daemonseed/dm/outbox/v1\0";
 
 /// Width of the suite-id field, big-endian, immediately after the magic — the
@@ -359,6 +405,18 @@ pub enum OutboxError {
     /// One name for both states makes the difference invisible at exactly the
     /// point a caller has to act on it.
     NothingToEmit(u64),
+    /// A write outcome was reported for an entry that has no published frame —
+    /// [`OutboxEntry::confirm_written`] on anything but
+    /// [`Lifecycle::AwaitingCollection`].
+    ///
+    /// A separate name from [`Self::NothingToEmit`] rather than a shared
+    /// wrong-state variant, because the two are reported to different callers
+    /// about different mistakes: that one answers a driver asking for bytes,
+    /// this one answers a transport reporting what it did with bytes it was
+    /// already given. A shared `Display` string would tell the transport its
+    /// message "has nothing to emit", which is an answer to a question it did
+    /// not ask.
+    NothingToConfirm(u64),
     /// The entry is still live but past its seven-day give-up window, so the
     /// call was refused. **The caller owes this message a surfacing** —
     /// [`Outbox::sweep_give_ups`] is what turns it into
@@ -369,7 +427,8 @@ pub enum OutboxError {
     GaveUp(u64),
     /// A doorbell slot at or above [`DOORBELL_SLOTS`].
     SlotOutsideDoorbell(u16),
-    /// The at-rest bytes did not start with [`OUTBOX_MAGIC`].
+    /// The at-rest bytes started with no magic this build recognises — neither
+    /// [`OUTBOX_MAGIC`] nor either older one.
     BadMagic,
     /// The at-rest bytes ended inside a field.
     Truncated,
@@ -407,6 +466,12 @@ impl std::fmt::Display for OutboxError {
                 write!(f, "sequence {s} already carries a sealed frame")
             }
             Self::NothingToEmit(s) => write!(f, "sequence {s} has nothing to emit"),
+            Self::NothingToConfirm(s) => {
+                write!(
+                    f,
+                    "sequence {s} has no published frame to confirm a write of"
+                )
+            }
             Self::GaveUp(s) => {
                 write!(
                     f,
@@ -642,6 +707,51 @@ impl Surfacing {
     }
 }
 
+/// Whether the transport has ever confirmed accepting this entry's frame.
+///
+/// **This is the only thing that may drive [`DeliveryState::OnDht`]** (#278).
+/// The rung index cannot: it counts emission *attempts*, so it is non-zero after
+/// a write that errored, and non-zero after a key-fetch retry on an entry that
+/// has never had a frame at all. Both of those reported the message as being on
+/// the DHT.
+///
+/// **A two-variant enum rather than a `bool`, for the reason [`Surfacing`]
+/// gives** — the name is the documentation. `written: false` reads as *we have
+/// not written it*, which is not what this knows; what it knows is that no
+/// write has been **confirmed**, which is a statement about the reports received
+/// and not about what happened on the network.
+///
+/// It is a one-way transition and there is no call that clears it. A later
+/// failed write does not un-publish the bytes that landed: the DHT holds a value
+/// until it is evicted or overwritten, so *this message reached the network at
+/// least once* stays true for the rest of the entry's life. That also keeps the
+/// flag monotonic across a restart, which is what stops a UI oscillating between
+/// `Composed` and `OnDht` on a flapping transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Acceptance {
+    /// No write of this frame has been confirmed. Emissions may well have been
+    /// attempted — this says nothing about how many.
+    Unconfirmed,
+    /// The transport confirmed at least one write.
+    ///
+    /// **Confirmed is not *the DHT holds our value*.** It is the transport's
+    /// `Ok`, and **M2** records that a `set_dht_value` losing a race against
+    /// another writer re-propagates the winner's value and returns exactly that
+    /// `Ok`. Distinguishing the two needs a value read back, which is the
+    /// transport slice's to give and is not this module's to infer.
+    Confirmed,
+}
+
+impl Acceptance {
+    /// The at-rest tag byte.
+    fn tag(self) -> u8 {
+        match self {
+            Self::Unconfirmed => 0,
+            Self::Confirmed => 1,
+        }
+    }
+}
+
 /// A rung index and the clock value the next emission is due at.
 ///
 /// Both persist, because § Task 2 requires *"pending DMs **and their backoff
@@ -718,6 +828,7 @@ pub struct OutboxEntry {
     schedule: ReseedSchedule,
     lifecycle: Lifecycle,
     surfacing: Surfacing,
+    acceptance: Acceptance,
 }
 
 impl OutboxEntry {
@@ -776,25 +887,32 @@ impl OutboxEntry {
 
     /// What a UI may say about it.
     ///
-    /// **A sealed entry that has never been emitted is still `Composed`**, not
-    /// `OnDht`: sealing is not publishing, and a state that said otherwise would
-    /// claim bytes were on the network the instant they were composed. The rung
-    /// index is what distinguishes them — it is non-zero once [`Self::emit`] has
-    /// handed the bytes over at least once.
+    /// **A sealed entry no write has been confirmed for is still `Composed`**,
+    /// not `OnDht`: sealing is not publishing, and neither is *attempting* to
+    /// publish. [`Acceptance`] is what distinguishes them, and
+    /// [`Self::confirm_written`] is the only thing that sets it.
     ///
-    /// That is still the strongest honest reading at this layer, and it is
-    /// weaker than the name suggests: **handed to the transport is not accepted
-    /// by the DHT.** The design names why in **M2** — a losing `set_dht_value`
-    /// re-propagates the winner's value and returns success, and "the outbox
-    /// state machine has no *my write lost the race* state and consumes no
-    /// return value". Giving it one needs the write outcome, which only the
-    /// transport slice holds; until then this state means *emitted*, and the
-    /// fail-safe posture is carried by `ConfirmedCollected` being ack-gated
-    /// rather than by this.
+    /// **The rung index used to distinguish them, and that was #278.** It
+    /// counts emission attempts, so it is non-zero after a write that errored —
+    /// a transport outage read as seven successful publications — and non-zero
+    /// after a key-fetch retry on an entry that has never held a frame, which
+    /// then reported `OnDht` the instant [`Self::publish`] installed one. No
+    /// arrangement of an attempt counter answers *did the transport take the
+    /// bytes*, so the fact is carried separately and reported by the caller that
+    /// holds it.
+    ///
+    /// This is stronger than the reading it replaces and still weaker than the
+    /// name suggests: **accepted by the transport is not held by the DHT.** The
+    /// design names why in **M2** — a losing `set_dht_value` re-propagates the
+    /// winner's value and returns success, so a confirmation cannot tell a write
+    /// that won from a write that lost. Closing *that* needs a value read back
+    /// rather than a return code, which only the transport slice holds; until
+    /// then the fail-safe posture is carried by `ConfirmedCollected` being
+    /// ack-gated rather than by this.
     pub fn delivery_state(&self) -> DeliveryState {
         match self.lifecycle {
             Lifecycle::AwaitingKey => DeliveryState::Composed,
-            Lifecycle::AwaitingCollection(_) if self.schedule.rung() == 0 => {
+            Lifecycle::AwaitingCollection(_) if self.acceptance == Acceptance::Unconfirmed => {
                 DeliveryState::Composed
             }
             Lifecycle::AwaitingCollection(_) => DeliveryState::OnDht,
@@ -883,6 +1001,27 @@ impl OutboxEntry {
     ///
     /// `unit` ∈ [-1, 1] is this emission's jitter, drawn fresh; see
     /// [`ReseedSchedule::schedule_next`].
+    ///
+    /// **This call claims nothing about delivery, and the caller owes a second
+    /// one** — [`Self::confirm_written`] — once the transport reports the write
+    /// succeeded. Emitting alone leaves [`Self::delivery_state`] on `Composed`
+    /// however many times it is called (#278).
+    ///
+    /// **The schedule advances here rather than on the confirmation, and that
+    /// is deliberate.** The rung is a backoff position, and a failing transport
+    /// has to back off exactly as a succeeding one does: holding the rung until
+    /// a write is confirmed would retry a message at whatever rung it was stuck
+    /// on, and a stuck rung 0 is a sixty-second cadence for the length of the
+    /// outage — 10,080 writes over a week, twice the operator's flat-120 s
+    /// figure of 5,040 that § Task 2 prices [`RESEED_LADDER`] against. Attempts
+    /// drive the ladder; only the *delivery claim* waits for the transport.
+    ///
+    /// **A forgotten confirmation understates, never overstates.** The entry
+    /// keeps reporting `Composed`, keeps re-seeding on its ladder, and keeps its
+    /// give-up window — so the failure mode of a caller that never calls
+    /// [`Self::confirm_written`] is a UI too cautious about its own message,
+    /// which is the direction § D-DELIV ("default not-delivered") already picks
+    /// everywhere else here.
     pub fn emit(&mut self, now_ms: i64, unit: f64) -> Result<&[u8], OutboxError> {
         // The two refusals are told apart, and the state is checked first so a
         // terminal entry past its window reports as terminal rather than as one
@@ -898,6 +1037,80 @@ impl OutboxEntry {
             Lifecycle::AwaitingCollection(frame) => Ok(frame.as_bytes()),
             _ => unreachable!("checked immediately above"),
         }
+    }
+
+    /// Record that the transport confirmed a write of this entry's frame.
+    ///
+    /// This is the missing input #278 names: `emit` hands bytes over and cannot
+    /// be told what became of them, so every surface inferred delivery from the
+    /// attempt. The inference is gone; this is the report that replaces it, and
+    /// the transport is the only thing that can make it.
+    ///
+    /// **Success is what gets reported, not failure, and the asymmetry is the
+    /// safety property.** A caller that reports nothing leaves the entry
+    /// `Composed` — understating a message that may well be on the DHT. The
+    /// mirror API, where a failure had to be reported to *avoid* claiming
+    /// delivery, makes silence mean *delivered*: a transport that panics, is
+    /// killed, or simply has an unhandled path then publishes a claim nobody
+    /// made. One of those two failure modes is a cautious UI and the other is a
+    /// message reported as sent that never left, so the direction is not a
+    /// matter of taste.
+    ///
+    /// **Idempotent, and one-way.** A second confirmation changes nothing and is
+    /// not an error — a re-seed of an already-published message is the ordinary
+    /// case, not a mistake. There is no call that un-confirms; see
+    /// [`Acceptance`] for why a later failure does not retract an earlier
+    /// success.
+    ///
+    /// **It does not touch the schedule.** The rung advanced when the bytes were
+    /// emitted; advancing it again here would double-count one emission and
+    /// skip a rung of the ladder per successful write.
+    ///
+    /// Refuses on the two states every other lifecycle-mutating call on this
+    /// type refuses on, for the same reasons: an entry with no published frame
+    /// ([`OutboxError::NothingToConfirm`] — there is nothing a write could have
+    /// carried), and an entry past its give-up window
+    /// ([`OutboxError::GaveUp`]). The second is the same ordering guard
+    /// [`Outbox::settle_from_ack`] carries: past the window a message is owed a
+    /// surfacing as *undelivered*, and a late confirmation arriving before the
+    /// sweep must not move it back onto `OnDht`.
+    ///
+    /// **Two caller obligations the refusals cannot enforce, named because the
+    /// transport slice will meet both.**
+    ///
+    /// A confirmation is not ordered against the rest of the module, so one
+    /// arriving after [`Outbox::settle_from_ack`] or a sweep has already ended
+    /// the entry returns [`OutboxError::NothingToConfirm`] — the same variant as
+    /// a genuine caller mistake, for what is an ordinary race between a slow
+    /// transport and a fast ack. A driver should treat it as nothing to do
+    /// rather than as a fault; the entry's state is already stronger than the
+    /// confirmation would have made it.
+    ///
+    /// And the refusals are keyed on the *lifecycle*, not on whether these bytes
+    /// were ever handed over, so confirming an entry that was never emitted
+    /// marks it `OnDht` for a write that never happened. Only the caller knows
+    /// which sequence it wrote, so only the caller can get this right — confirm
+    /// the entry you emitted. Deriving it here from a non-zero rung is exactly
+    /// the coupling #278 removed, and would re-import the defect on the
+    /// [`Self::retry_key_fetch`] path.
+    pub fn confirm_written(&mut self, now_ms: i64) -> Result<(), OutboxError> {
+        if !matches!(self.lifecycle, Lifecycle::AwaitingCollection(_)) {
+            return Err(OutboxError::NothingToConfirm(self.seq));
+        }
+        if self.is_given_up(now_ms) {
+            return Err(OutboxError::GaveUp(self.seq));
+        }
+        self.acceptance = Acceptance::Confirmed;
+        Ok(())
+    }
+
+    /// Whether a write of this entry's frame has ever been confirmed.
+    ///
+    /// The fact [`Self::delivery_state`] reads. Exposed because a caller
+    /// deciding whether a message is worth re-seeding at all wants it directly,
+    /// without going through a `DeliveryState` that folds in the lifecycle too.
+    pub fn acceptance(&self) -> Acceptance {
+        self.acceptance
     }
 
     /// Advance the schedule for an `AwaitingKey` entry's key-fetch retry.
@@ -1077,6 +1290,10 @@ impl Outbox {
             lifecycle,
             // A new entry has not changed state, so nothing is outstanding.
             surfacing: Surfacing::Clear,
+            // Nothing has been written yet on either path: an `AwaitingKey`
+            // entry has no frame, and an `AwaitingCollection` one has a frame
+            // that has never been offered to the transport.
+            acceptance: Acceptance::Unconfirmed,
         };
         Ok(self.entries.entry(seq).or_insert(entry))
     }
@@ -1310,7 +1527,13 @@ impl Outbox {
     }
 
     /// The at-rest form: [`OUTBOX_MAGIC`], the suite id, the direction, a `u32`
-    /// entry count, then each entry in sequence order.
+    /// entry count, then each entry in sequence order — sequence, target,
+    /// compose time, rung, next-due, [`Acceptance`], [`Surfacing`], lifecycle,
+    /// and the frame last where the only variable-length field belongs.
+    ///
+    /// **Always written at the current version**, so a record read from a v2
+    /// file is re-encoded as v3 the next time its store writes it, the same
+    /// read-old-write-new the suite id gets below.
     ///
     /// **Plaintext**, like [`crate::dm::provisional::ProvisionalRecord`]'s body
     /// before it is sealed — to be sealed by whatever store holds it, which is
@@ -1353,6 +1576,7 @@ impl Outbox {
             out.extend_from_slice(&entry.schedule.next_due_ms.to_be_bytes());
             // Before the lifecycle, so the one variable-length field stays last
             // in the entry.
+            out.push(entry.acceptance.tag());
             out.push(entry.surfacing.tag());
             out.push(entry.lifecycle.tag());
             if let Lifecycle::AwaitingCollection(frame) = &entry.lifecycle {
@@ -1390,16 +1614,23 @@ impl Outbox {
     /// see the body.
     pub fn decode(bytes: &[u8], now_ms: i64) -> Result<Self, OutboxError> {
         let mut r = Reader::new(bytes);
-        // The two magics are the same length, so one read answers both
-        // questions: is this an outbox at all, and is it a version this build
-        // reads. v1 is refused rather than dual-read — see `OUTBOX_MAGIC_V1`.
+        // All three magics are the same length, so one read answers every
+        // question: is this an outbox at all, is it a version this build reads,
+        // and which entry layout follows. v2 is dual-read and v1 is refused —
+        // each constant's own docs carry the reasoning, and they differ.
         let magic = r.take(OUTBOX_MAGIC.len())?;
-        if magic != OUTBOX_MAGIC {
-            if magic == OUTBOX_MAGIC_V1 {
-                return Err(OutboxError::UnsupportedVersion);
-            }
+        // v3 carries an acceptance byte per entry and v2 does not, so the
+        // version has to survive the header read rather than being checked and
+        // dropped.
+        let has_acceptance = if magic == OUTBOX_MAGIC {
+            true
+        } else if magic == OUTBOX_MAGIC_V2 {
+            false
+        } else if magic == OUTBOX_MAGIC_V1 {
+            return Err(OutboxError::UnsupportedVersion);
+        } else {
             return Err(OutboxError::BadMagic);
-        }
+        };
         let suite_raw = u16::from_be_bytes(r.array()?);
         let suite_id = SuiteId::try_new(suite_raw).map_err(OutboxError::SuiteIdSentinel)?;
         if Registry::lookup(suite_id).is_none() {
@@ -1478,6 +1709,24 @@ impl Outbox {
             // emission landed near it, so the old clamp to that boundary
             // rewrote correct records as readily as corrupt ones.
             let next_due_ms = i64::from_be_bytes(r.array()?);
+            // A v2 body has no byte here, and every entry in one defaults to
+            // `Unconfirmed` — the understating direction. `OUTBOX_MAGIC_V2`
+            // carries why that is the right default rather than reconstructing
+            // v2's `rung > 0` belief, which is the defect this field replaces.
+            let acceptance = if has_acceptance {
+                match r.byte()? {
+                    0 => Acceptance::Unconfirmed,
+                    1 => Acceptance::Confirmed,
+                    tag => {
+                        return Err(OutboxError::UnknownTag {
+                            field: "acceptance",
+                            tag,
+                        });
+                    }
+                }
+            } else {
+                Acceptance::Unconfirmed
+            };
             let surfacing = match r.byte()? {
                 0 => Surfacing::Clear,
                 1 => Surfacing::Owed,
@@ -1528,6 +1777,7 @@ impl Outbox {
                     schedule: ReseedSchedule { rung, next_due_ms },
                     lifecycle,
                     surfacing,
+                    acceptance,
                 },
             );
         }
@@ -1658,7 +1908,8 @@ mod tests {
         + 1 /* a ChannelPage target tag */
         + 8 /* composed_at_ms */
         + 4 /* rung */
-        + 8 /* next_due_ms */;
+        + 8 /* next_due_ms */
+        + 1 /* acceptance */;
 
     const CHANNEL: OutboxTarget = OutboxTarget::ChannelPage;
 
@@ -2258,8 +2509,11 @@ mod tests {
         let mut ob = empty();
         ob.enqueue_sealed(1, channel(), T0, frame(0x11)).unwrap();
         ob.enqueue_sealed(2, channel(), T0, frame(0x22)).unwrap();
-        ob.entry_mut(1).unwrap().emit(T0, 0.0).unwrap();
-        ob.entry_mut(2).unwrap().emit(T0, 0.0).unwrap();
+        for seq in [1, 2] {
+            let entry = ob.entry_mut(seq).unwrap();
+            entry.emit(T0, 0.0).unwrap();
+            entry.confirm_written(T0).unwrap();
+        }
 
         let mut ack = AckState::new();
         ack.abandon(1).unwrap();
@@ -2386,7 +2640,9 @@ mod tests {
         let mut ob = empty();
         ob.enqueue_awaiting_key(1, channel(), T0).unwrap();
         ob.enqueue_sealed(2, channel(), T0, frame(0x22)).unwrap();
-        ob.entry_mut(2).unwrap().emit(T0, 0.0).unwrap();
+        let entry = ob.entry_mut(2).unwrap();
+        entry.emit(T0, 0.0).unwrap();
+        entry.confirm_written(T0).unwrap();
 
         let outcome = ob.channel_torn_down(&TeardownCause::NoProvisionalRecord, T0);
         assert_eq!(
@@ -2537,8 +2793,16 @@ mod tests {
         ];
         for (lifecycle, expected) in &cases {
             let mut schedule = ReseedSchedule::new(T0);
-            // Past rung 0, so a sealed entry counts as emitted — an unemitted
-            // one is deliberately `Composed`, which its own test covers.
+            // Past rung 0, which under #278's proxy was what made a sealed entry
+            // count as emitted. **This table does not detect a revival of that
+            // proxy and must not be read as if it does**: at a high rung with
+            // `Confirmed` below, the old `rung == 0` reading produces `OnDht`
+            // for the `AwaitingCollection` row and this case passes unchanged.
+            // The rung is advanced only so the fixture is not sitting on the one
+            // value both readings agree about. The revival is caught by
+            // `a_sealed_message_is_not_on_the_dht_until_a_write_is_confirmed`
+            // and `seven_failed_writes_never_claim_the_message_reached_the_dht`,
+            // which hold acceptance and the rung apart on purpose.
             schedule.schedule_next(T0, 0.0);
             let entry = OutboxEntry {
                 seq: 1,
@@ -2547,6 +2811,9 @@ mod tests {
                 schedule,
                 lifecycle: lifecycle.clone(),
                 surfacing: Surfacing::Clear,
+                // A confirmed write — the `Unconfirmed` sealed entry is
+                // deliberately `Composed`, which its own test covers.
+                acceptance: Acceptance::Confirmed,
             };
             assert_eq!(entry.delivery_state(), *expected);
         }
@@ -2628,10 +2895,14 @@ mod tests {
         assert_eq!(round_trip(&a).direction(), Direction::AToB);
     }
 
-    /// A sealed message is not on the DHT until it has been emitted at least
-    /// once. Sealing is not publishing.
+    /// A sealed message is not on the DHT until a write of it has been
+    /// **confirmed**. Sealing is not publishing, and neither is attempting.
+    ///
+    /// The middle assertion is #278's whole subject: under the rung proxy this
+    /// read `OnDht`, so a transport outage — every emission erroring — reported
+    /// the message as published.
     #[test]
-    fn a_sealed_but_unemitted_message_is_not_yet_on_the_dht() {
+    fn a_sealed_message_is_not_on_the_dht_until_a_write_is_confirmed() {
         let mut ob = sealed_outbox();
         assert_eq!(
             ob.entry(1).unwrap().delivery_state(),
@@ -2639,7 +2910,190 @@ mod tests {
             "a message claimed to be on the DHT before anything was written"
         );
         ob.entry_mut(1).unwrap().emit(T0, 0.0).unwrap();
+        assert_eq!(
+            ob.entry(1).unwrap().delivery_state(),
+            DeliveryState::Composed,
+            "an emission nobody confirmed claimed the message was on the DHT"
+        );
+        ob.entry_mut(1).unwrap().confirm_written(T0).unwrap();
         assert_eq!(ob.entry(1).unwrap().delivery_state(), DeliveryState::OnDht);
+    }
+
+    /// The failed-transport scenario #278 opens with, end to end: seven
+    /// emissions, none confirmed, and every surface still honest.
+    ///
+    /// **The rung is asserted non-zero deliberately.** That is the proxy the old
+    /// reading used, so the test would pass vacuously if the emissions had not
+    /// actually advanced it — the state has to be one the old code got wrong.
+    #[test]
+    fn seven_failed_writes_never_claim_the_message_reached_the_dht() {
+        let mut ob = sealed_outbox();
+        let mut now = T0;
+        for _ in 0..7 {
+            let entry = ob.entry_mut(1).unwrap();
+            // The bytes go to the transport; the transport errors; nothing is
+            // confirmed. That is the whole of a caller's outage path.
+            entry.emit(now, 0.0).unwrap();
+            now = entry.schedule().next_due_ms();
+        }
+        let entry = ob.entry(1).unwrap();
+        assert!(
+            entry.schedule().rung() >= 7,
+            "the emissions did not advance the rung, so this proves nothing"
+        );
+        assert_eq!(entry.acceptance(), Acceptance::Unconfirmed);
+        assert_eq!(
+            entry.delivery_state(),
+            DeliveryState::Composed,
+            "seven errored writes reported the message as on the DHT"
+        );
+    }
+
+    /// A key-fetch retry advances the rung too, so the old proxy claimed
+    /// `OnDht` for an entry that had never been emitted at all — the second
+    /// path #278's defect reached, and the one no failed write is involved in.
+    #[test]
+    fn a_key_fetch_retry_does_not_make_a_later_publish_look_published() {
+        let mut ob = empty();
+        ob.enqueue_awaiting_key(1, channel(), T0).unwrap();
+        let entry = ob.entry_mut(1).unwrap();
+        entry.retry_key_fetch(T0, 0.0).unwrap();
+        assert!(
+            entry.schedule().rung() > 0,
+            "the retry did not advance the rung, so this proves nothing"
+        );
+        entry.publish(T0, frame(0x11)).unwrap();
+        assert_eq!(
+            entry.delivery_state(),
+            DeliveryState::Composed,
+            "a key-fetch retry published a message nothing had emitted"
+        );
+    }
+
+    /// Confirming twice is the ordinary re-seed case, not a mistake.
+    #[test]
+    fn a_second_confirmation_is_not_an_error_and_changes_nothing() {
+        let mut ob = sealed_outbox();
+        let entry = ob.entry_mut(1).unwrap();
+        entry.emit(T0, 0.0).unwrap();
+        entry.confirm_written(T0).unwrap();
+        let after_first = entry.schedule();
+        entry.confirm_written(T0).unwrap();
+        assert_eq!(entry.acceptance(), Acceptance::Confirmed);
+        assert_eq!(
+            entry.schedule(),
+            after_first,
+            "a confirmation moved the backoff, double-counting one emission"
+        );
+    }
+
+    /// The two refusals, told apart the way [`OutboxEntry::emit`]'s are.
+    #[test]
+    fn a_confirmation_is_refused_with_no_frame_and_past_the_window() {
+        let mut ob = empty();
+        ob.enqueue_awaiting_key(1, channel(), T0).unwrap();
+        assert_eq!(
+            ob.entry_mut(1).unwrap().confirm_written(T0),
+            Err(OutboxError::NothingToConfirm(1)),
+            "a write was confirmed for an entry that has no frame"
+        );
+        // **The return value alone is not the property.** A refusal that still
+        // latched the flag would restore #278's own failure mode by a longer
+        // route: `AwaitingKey` renders `Composed` whatever the flag says, so the
+        // latch is invisible until `publish` installs a frame — at which point
+        // the entry reports `OnDht` for bytes nothing ever emitted. The refusal
+        // has to leave no trace, and the only way to see that is to publish
+        // afterwards and look.
+        let entry = ob.entry_mut(1).unwrap();
+        assert_eq!(entry.acceptance(), Acceptance::Unconfirmed);
+        entry.publish(T0, frame(0x11)).unwrap();
+        assert_eq!(
+            entry.delivery_state(),
+            DeliveryState::Composed,
+            "a refused confirmation latched, and publishing revealed it"
+        );
+
+        let mut ob = sealed_outbox();
+        ob.entry_mut(1).unwrap().emit(T0, 0.0).unwrap();
+        assert_eq!(
+            ob.entry_mut(1).unwrap().confirm_written(T0 + GIVE_UP_MS),
+            Err(OutboxError::GaveUp(1)),
+            "a late confirmation moved an overdue message back onto OnDht"
+        );
+        assert_eq!(
+            ob.entry(1).unwrap().delivery_state(),
+            DeliveryState::Composed,
+            "the refused confirmation still took effect"
+        );
+    }
+
+    /// `Acceptance` is one-way: an emission after a confirmation does not
+    /// retract it. The doc rests a UI property on this — no oscillating between
+    /// `Composed` and `OnDht` on a flapping transport — so it needs a probe.
+    #[test]
+    fn a_later_emission_does_not_retract_a_confirmation() {
+        let mut ob = sealed_outbox();
+        let entry = ob.entry_mut(1).unwrap();
+        entry.emit(T0, 0.0).unwrap();
+        entry.confirm_written(T0).unwrap();
+        assert_eq!(entry.delivery_state(), DeliveryState::OnDht);
+
+        // The next re-seed errors at the transport, so nothing confirms it.
+        let now = entry.schedule().next_due_ms();
+        entry.emit(now, 0.0).unwrap();
+        assert_eq!(
+            entry.acceptance(),
+            Acceptance::Confirmed,
+            "an unconfirmed re-seed cleared a confirmation that had already landed"
+        );
+        assert_eq!(entry.delivery_state(), DeliveryState::OnDht);
+    }
+
+    /// The refusals are the two `emit` carries, on every state — including the
+    /// terminal ones, which the doc claims and which `AwaitingKey` alone does
+    /// not witness.
+    #[test]
+    fn a_terminal_entry_cannot_be_confirmed() {
+        for lifecycle in [Lifecycle::ConfirmedCollected, Lifecycle::Undelivered] {
+            let mut ob = sealed_outbox();
+            let entry = ob.entry_mut(1).unwrap();
+            entry.emit(T0, 0.0).unwrap();
+            entry.end(lifecycle.clone());
+            let before = entry.delivery_state();
+            assert_eq!(
+                entry.confirm_written(T0),
+                Err(OutboxError::NothingToConfirm(1)),
+                "a finished message accepted a write confirmation"
+            );
+            assert_eq!(entry.acceptance(), Acceptance::Unconfirmed);
+            assert_eq!(
+                entry.delivery_state(),
+                before,
+                "the refusal moved the entry"
+            );
+        }
+    }
+
+    /// State is checked before the window, so an entry that is both frameless
+    /// and overdue reports the permanent answer rather than the overdue one —
+    /// the ordering [`OutboxEntry::emit`] documents and this call copies.
+    ///
+    /// The distinction is not cosmetic: `GaveUp` tells a driver the message is
+    /// owed a surfacing, and an entry that never had a frame is not owed one on
+    /// this call's account.
+    #[test]
+    fn a_frameless_overdue_entry_reports_the_permanent_refusal() {
+        let mut ob = empty();
+        ob.enqueue_awaiting_key(1, channel(), T0).unwrap();
+        let entry = ob.entry_mut(1).unwrap();
+        assert!(
+            entry.is_given_up(T0 + GIVE_UP_MS),
+            "the fixture is not past its window, so this pins nothing"
+        );
+        assert_eq!(
+            entry.confirm_written(T0 + GIVE_UP_MS),
+            Err(OutboxError::NothingToConfirm(1))
+        );
     }
 
     /// A message past its give-up window stops being emitted immediately, even
@@ -3045,7 +3499,8 @@ mod tests {
         const COMPOSED: usize = TARGET_TAG + 1; // a ChannelPage target is one byte
         const RUNG: usize = COMPOSED + 8;
         const DUE: usize = RUNG + 4;
-        const SURFACING: usize = DUE + 8;
+        const ACCEPTANCE: usize = DUE + 8;
+        const SURFACING: usize = ACCEPTANCE + 1;
         const LIFE_TAG: usize = SURFACING + 1;
         const FRAME_LEN: usize = LIFE_TAG + 1;
 
@@ -3146,6 +3601,7 @@ mod tests {
             + 8 /* composed_at_ms */
             + 4 /* rung */
             + 8 /* next_due_ms */
+            + 1 /* acceptance tag */
             + 1 /* surfacing tag */
             + 1 /* lifecycle tag */
             + 8 /* frame length prefix */;
@@ -3439,7 +3895,7 @@ mod tests {
         assert_eq!(
             Outbox::decode(&v1, T0).err().unwrap(),
             OutboxError::UnsupportedVersion,
-            "a v1 record was read under the v2 layout"
+            "a v1 record was read under a later layout"
         );
 
         // A magic that is neither is still "not an outbox", so the version
@@ -3452,6 +3908,160 @@ mod tests {
         );
         // Positive control: the unmodified bytes decode.
         assert!(Outbox::decode(&good, T0).is_ok());
+    }
+
+    /// A v2 record is **read**, and every entry in it comes back
+    /// `Unconfirmed` — the understating direction, never a reconstruction of
+    /// v2's `rung > 0` belief.
+    ///
+    /// The fixture is a real v2 body, built by deleting the byte v3 added from
+    /// a v3 encoding rather than by hand-assembling one — so it stays a v2 body
+    /// if any earlier field ever changes width, and `SURFACING_AT` is the
+    /// layout constant that would fail loudly if it did not.
+    #[test]
+    fn a_v2_record_is_read_and_defaults_to_unconfirmed() {
+        let mut ob = sealed_outbox();
+        // Confirmed, so the fixture is the case that could be got wrong: if the
+        // decoder reconstructed acceptance from the rung, this entry would come
+        // back `Confirmed` and the test would pass for the wrong reason.
+        let entry = ob.entry_mut(1).unwrap();
+        entry.emit(T0, 0.0).unwrap();
+        entry.confirm_written(T0).unwrap();
+        assert_eq!(entry.delivery_state(), DeliveryState::OnDht);
+
+        let v3 = ob.encode();
+        assert_eq!(
+            v3[SURFACING_AT - 1],
+            Acceptance::Confirmed.tag(),
+            "the acceptance byte is not where the layout says it is"
+        );
+
+        let mut v2 = v3.clone();
+        v2.remove(SURFACING_AT - 1);
+        v2[..OUTBOX_MAGIC_V2.len()].copy_from_slice(OUTBOX_MAGIC_V2);
+        assert_eq!(
+            OUTBOX_MAGIC.len(),
+            OUTBOX_MAGIC_V2.len(),
+            "one read can only answer every question if the magics are the same length"
+        );
+
+        let decoded = Outbox::decode(&v2, T0).expect("a v2 record must still be readable");
+        let entry = decoded.entry(1).expect("the entry was lost in migration");
+        assert_eq!(entry.acceptance(), Acceptance::Unconfirmed);
+        assert_eq!(
+            entry.delivery_state(),
+            DeliveryState::Composed,
+            "a v2 record claimed a delivery its bytes could not support"
+        );
+        // Everything else survives — the migration is one field, not a reset.
+        assert_eq!(entry.schedule(), ob.entry(1).unwrap().schedule());
+        assert_eq!(entry.frame(), ob.entry(1).unwrap().frame());
+        assert_eq!(entry.composed_at_ms(), T0);
+
+        // And it is re-encoded at the current version, so the file is v3 after
+        // one write rather than staying v2 for ever.
+        assert_eq!(&decoded.encode()[..OUTBOX_MAGIC.len()], OUTBOX_MAGIC);
+    }
+
+    /// The same migration over **two** entries, because the byte v3 added is
+    /// per-entry and the single-entry fixture cannot tell a per-entry read from
+    /// a per-record one — a decoder that consumed the acceptance byte once for
+    /// the whole file passes that test and desynchronises here.
+    ///
+    /// The stride is derived from the encoding rather than hardcoded, so a field
+    /// added anywhere in an entry does not silently point this at the wrong
+    /// byte; the equal-frame assertion is what makes the division valid.
+    #[test]
+    fn a_multi_entry_v2_record_is_read_entry_by_entry() {
+        let mut ob = empty();
+        ob.enqueue_sealed(1, channel(), T0, frame(0x11)).unwrap();
+        ob.enqueue_sealed(2, channel(), T0, frame(0x22)).unwrap();
+        for seq in [1, 2] {
+            let entry = ob.entry_mut(seq).unwrap();
+            entry.emit(T0, 0.0).unwrap();
+            entry.confirm_written(T0).unwrap();
+        }
+        assert_eq!(
+            ob.entry(1).unwrap().frame().map(<[u8]>::len),
+            ob.entry(2).unwrap().frame().map(<[u8]>::len),
+            "the entries are different sizes, so a fixed stride is meaningless"
+        );
+
+        let v3 = ob.encode();
+        let header = OUTBOX_MAGIC.len() + SUITE_ID_LEN + 1 /* direction */ + 4 /* count */;
+        let stride = (v3.len() - header) / 2;
+        let first = SURFACING_AT - 1;
+        let second = first + stride;
+        for at in [first, second] {
+            assert_eq!(
+                v3[at],
+                Acceptance::Confirmed.tag(),
+                "the acceptance byte is not where the derived stride says it is"
+            );
+        }
+
+        let mut v2 = v3.clone();
+        // Later byte first, so removing it does not move the earlier offset.
+        v2.remove(second);
+        v2.remove(first);
+        v2[..OUTBOX_MAGIC_V2.len()].copy_from_slice(OUTBOX_MAGIC_V2);
+
+        let decoded =
+            Outbox::decode(&v2, T0).expect("a two-entry v2 record must still be readable");
+        assert_eq!(decoded.len(), 2, "an entry was lost in migration");
+        for seq in [1, 2] {
+            let entry = decoded.entry(seq).expect("the entry was lost in migration");
+            assert_eq!(entry.acceptance(), Acceptance::Unconfirmed);
+            // The frame is the field a desynchronised read corrupts first, and
+            // it is the one field that cannot be right by coincidence.
+            assert_eq!(entry.frame(), ob.entry(seq).unwrap().frame());
+            assert_eq!(entry.schedule(), ob.entry(seq).unwrap().schedule());
+        }
+    }
+
+    /// Acceptance survives the round trip in both directions, so a restart
+    /// neither invents a publication nor forgets one.
+    #[test]
+    fn acceptance_round_trips_in_both_states() {
+        for confirm in [false, true] {
+            let mut ob = sealed_outbox();
+            let entry = ob.entry_mut(1).unwrap();
+            entry.emit(T0, 0.0).unwrap();
+            if confirm {
+                entry.confirm_written(T0).unwrap();
+            }
+            let expected = ob.entry(1).unwrap().acceptance();
+            assert_eq!(
+                expected,
+                if confirm {
+                    Acceptance::Confirmed
+                } else {
+                    Acceptance::Unconfirmed
+                },
+                "the fixture did not reach the state it is named for"
+            );
+            assert_eq!(round_trip(&ob).entry(1).unwrap().acceptance(), expected);
+        }
+    }
+
+    /// An acceptance tag this build assigns no meaning to is refused, like every
+    /// other tag in the record.
+    #[test]
+    fn an_unknown_acceptance_tag_is_refused() {
+        let mut bytes = sealed_outbox().encode();
+        assert_eq!(
+            bytes[SURFACING_AT - 1],
+            0,
+            "fixture is degenerate — the byte already reads as something else"
+        );
+        bytes[SURFACING_AT - 1] = 2;
+        assert_eq!(
+            Outbox::decode(&bytes, T0).err().unwrap(),
+            OutboxError::UnknownTag {
+                field: "acceptance",
+                tag: 2
+            }
+        );
     }
 
     /// The suite id is written after the magic and checked on the way back in —
