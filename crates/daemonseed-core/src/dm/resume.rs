@@ -195,31 +195,31 @@ impl CommittedRoot {
 /// wrong — and no way to write a comparison that disagrees with the encoding,
 /// since the encoder walks the same order.
 ///
-/// **Why the generation is carried at all.** A9.2's stated reason is that a
-/// committed re-establishment root starts a new generation "under which send
-/// `seq` legitimately restarts at 0", so an unqualified floor would read the
-/// restart as a rollback. **That premise does not hold against the ratchet as
-/// built**: `Ratchet::step_send` starts a new generation's chain at the current
-/// `next_send_seq` and never resets it, so send `seq` is monotone for the life
-/// of the conversation. The qualification is kept anyway, and the reasoning is
-/// recorded here rather than left to be rediscovered:
+/// **Why the generation is carried at all — settled by caraka 2026-08-14,
+/// closing #313.** Send `seq` does **not** restart at a new generation:
+/// `Ratchet::step_send` starts a new chain at the current `next_send_seq` and
+/// never resets it, so `seq` is monotone per direction for the life of the
+/// conversation. Three surfaces make that continuity load-bearing — `seq` is
+/// the DHT page address, the outbox's only key, and the acknowledgement's
+/// position, none of them namespaced by generation.
 ///
-/// 1. A9.2 ratifies the lexicographic ordering, and it is the ordering a
-///    re-establishment path that *does* restart `seq` would need. Building the
-///    weaker thing now would have to be found and undone later, by someone who
-///    no longer has this paragraph.
-/// 2. The ordering being lexicographic does **not** make it a safe write guard
-///    on its own — `(5, 0)` outranks `(4, u64::MAX)`, so a bare `>=` admits a
-///    sequence rollback across a generation bump. That is why
-///    [`Self::admits`] requires both components to be non-decreasing rather
-///    than deferring to [`Ord`]. An earlier draft of this comment claimed
-///    lexicographic ordering "contains plain `seq` ordering — every rollback a
-///    bare counter catches, this catches"; that is **false**, it was caught in
-///    review, and it is recorded here because it is the exact reasoning error
-///    that would justify deleting the guard.
+/// So the generation is **not** here to absorb a sequence restart. It is here
+/// because with a bare counter, *"re-established and nothing sent yet"* and
+/// *"a replayed stale resume blob"* are the same value; the pair tells them
+/// apart.
 ///
-/// So do not "simplify" the generation away on the grounds that the stated
-/// justification does not hold. The justification is wrong; the field is right.
+/// **A9.2 originally justified the qualification by a restart at 0. That
+/// premise was false, and the design text is amended** (§ build note
+/// 2026-08-14). It is recorded here because a false *reason* is more dangerous
+/// than a missing one: a reader who checks it, finds it untrue, and concludes
+/// the field is unnecessary would delete a guard that is doing real work.
+///
+/// **Lexicographic ordering is not by itself a safe write guard.** `(5, 0)`
+/// outranks `(4, u64::MAX)`, so a bare `>=` admits a sequence rollback riding on
+/// a generation bump — which is why [`Self::admits`] requires both components to
+/// be non-decreasing rather than deferring to [`Ord`]. An earlier draft of this
+/// comment claimed lexicographic ordering "contains plain `seq` ordering"; that
+/// is false and was caught in review.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SendFloor {
     generation: u32,
