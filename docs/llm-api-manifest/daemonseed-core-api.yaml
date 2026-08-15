@@ -959,9 +959,15 @@ modules:
       seed, the page, and the stream. DmPageAddress::sending(AR, &Ratchet, page) and
       ::receiving(AR, &Ratchet, page) take the direction from the ratchet's own
       send_direction / recv_direction, so no call site names one; both refuse a page
-      above MAX_PAGE with DmPageError::PageBeyondSequenceSpace. page(), direction()
-      and owner_seed() read it; owner_seed() borrows, and the address itself is moved
-      into a transport call, so derive one per call. The stream is the type parameter
+      above MAX_PAGE with DmPageError::PageBeyondSequenceSpace. page() and
+      direction() read it; the owner seed is reached only through
+      with_owner_seed(f), which runs f against the seed's bytes for the duration of
+      that one call and returns f's value. The address itself is moved into a
+      transport call, so derive one per call. with_owner_seed does not prevent
+      copying — a closure may return the array — it requires the copy to be
+      written rather than taken in a deref. derive_owner_seed is pub and its
+      result's as_bytes() is pub, so the seed remains derivable outside the module
+      given AR. The stream is the type parameter
       Sending or Receiving, implementors of the sealed PageDirection trait and
       uninhabited, so a receiving address cannot be published and a sending address
       cannot be swept. The guarantee is relative to the ratchet argument: AR and the

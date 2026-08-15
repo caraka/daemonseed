@@ -157,8 +157,8 @@ async fn frames_published_to_page_slots_sweep_back_in_the_slots_they_were_writte
             .expect("B derives its receiving page address")
     };
     assert_eq!(
-        addr_a().owner_seed().as_bytes(),
-        addr_b().owner_seed().as_bytes(),
+        addr_a().with_owner_seed(|b| *b),
+        addr_b().with_owner_seed(|b| *b),
         "both ends must derive the same page record from the address root alone"
     );
 

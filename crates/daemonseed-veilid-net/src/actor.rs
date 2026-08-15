@@ -1318,7 +1318,7 @@ async fn actor_loop(
                     // Borrowed for the pre-open; ownership passes to the request
                     // below, so exactly one zeroizing copy of the conversation
                     // secret exists on this path (#244).
-                    match identity::rendezvous_owner_keypair(address.owner_seed().as_bytes()) {
+                    match address.with_owner_seed(identity::rendezvous_owner_keypair) {
                         Ok(owner) => {
                             // Single-flight against a concurrent op on this record, as
                             // the dispatch itself does. The guard is dropped before the
@@ -2286,7 +2286,7 @@ fn dm_page_write_request(
     //
     // Nothing else in the funnel needs changing for that: `RecordId` is opaque to
     // the scheduler, which only ever compares and hashes it.
-    let record = identity::rendezvous_owner_public_bytes(address.owner_seed().as_bytes());
+    let record = address.with_owner_seed(identity::rendezvous_owner_public_bytes);
     WriteRequest {
         record,
         class: WriteClass::Chat,
@@ -2357,7 +2357,7 @@ async fn publish_dm_page(
     // handing the keypair to the open below makes veilid retain a clone in
     // `OpenedRecord.writer` for as long as the record stays open, which here is the
     // process (#252). See `identity::vld0_keypair`'s residual note.
-    let owner = identity::rendezvous_owner_keypair(address.owner_seed().as_bytes())?;
+    let owner = address.with_owner_seed(identity::rendezvous_owner_keypair)?;
     // Single-flight the open and serialize against any concurrent op on this record,
     // exactly as the rendezvous and key-record write paths do (CRSH-ISC-3). Two
     // messages landing in two slots of the same page is the ordinary case, so this
@@ -2405,7 +2405,7 @@ async fn sweep_dm_page(
     address: &DmPageAddress<Receiving>,
 ) -> Result<DmPageSweep> {
     // Borrowed, for the reason `publish_dm_page` gives (#244).
-    let owner = identity::rendezvous_owner_keypair(address.owner_seed().as_bytes())?;
+    let owner = address.with_owner_seed(identity::rendezvous_owner_keypair)?;
     // The open is serialized under the record lock; the GETs are NOT, so a slow
     // page read never blocks a concurrent write to the same page. The guard drops
     // before any read permit is acquired, keeping the single-permit rule
@@ -3561,7 +3561,7 @@ mod tests {
     async fn a_dm_page_sweep_passes_its_address_to_the_actor_unchanged() {
         let (handle, mut cmd_rx) = detached_handle();
         const PAGE: u64 = 3;
-        let expected_seed = *receiving_address(PAGE).owner_seed().as_bytes();
+        let expected_seed = receiving_address(PAGE).with_owner_seed(|b| *b);
         let expected_direction = receiving_address(PAGE).direction();
 
         let observed = tokio::spawn(async move {
@@ -3570,7 +3570,7 @@ mod tests {
                     let seen = (
                         address.page(),
                         address.direction(),
-                        *address.owner_seed().as_bytes(),
+                        address.with_owner_seed(|b| *b),
                     );
                     let _ = reply.send(Ok((Vec::new(), rendezvous::SweepOutcome::default())));
                     seen
@@ -3627,7 +3627,7 @@ mod tests {
         // A plain copy, deliberately: `address` is MOVED into the request below, and
         // the assertions afterwards are about what the request did with it. Test-only
         // — this is the one place a non-zeroizing copy is the point, not the bug.
-        let seed_bytes = *address.owner_seed().as_bytes();
+        let seed_bytes = address.with_owner_seed(|b| *b);
 
         let req = dm_page_write_request(address, at, frame.clone(), reply);
 
@@ -3675,7 +3675,7 @@ mod tests {
                 frame: dispatched,
             } => {
                 assert_eq!(
-                    *address.owner_seed().as_bytes(),
+                    address.with_owner_seed(|b| *b),
                     seed_bytes,
                     "the dispatch token carries the seed itself — the write cannot \
                      be signed without it — and must reach dispatch unchanged"

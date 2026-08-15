@@ -316,9 +316,8 @@ async fn sealed_channel_messages_round_trip_through_a_page_and_open_out_of_order
     assert_eq!(
         DmPageAddress::sending(&roots_a.ar, &ratchet_a, page)
             .expect("A derives its sending page address")
-            .owner_seed()
-            .as_bytes(),
-        addr_b().owner_seed().as_bytes(),
+            .with_owner_seed(|b| *b),
+        addr_b().with_owner_seed(|b| *b),
         "both ends must derive the same page record from the address root alone"
     );
 

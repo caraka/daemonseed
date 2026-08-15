@@ -429,10 +429,10 @@ impl PageDirection for Receiving {
 /// parameter could only be honoured by copying the secret into a fresh
 /// non-zeroizing buffer, which is the copy the type exists to remove. So the
 /// address is single-use: **derive one per call**, and read the seed through
-/// [`owner_seed`](Self::owner_seed) — a borrow, for the one thing that needs it, a
-/// keypair derivation — rather than taking it out. Derivation is pure (no clock,
-/// no randomness, no network), which is what makes re-deriving the right answer
-/// rather than a workaround.
+/// [`with_owner_seed`](Self::with_owner_seed) — scoped to the one operation that
+/// needs it, a keypair derivation — rather than taking it out. Derivation is pure
+/// (no clock, no randomness, no network), which is what makes re-deriving the
+/// right answer rather than a workaround.
 pub struct DmPageAddress<D: PageDirection> {
     owner_seed: DmPageOwnerSeed,
     page: u64,
@@ -510,14 +510,56 @@ impl<D: PageDirection> DmPageAddress<D> {
         self.direction
     }
 
-    /// Borrow the record-owner seed, to derive the Veilid owner keypair from.
+    /// Run one operation against the record-owner seed's bytes.
     ///
-    /// A borrow because that derivation only reads it, and because the seed has no
-    /// second home to go to: see the type's docs on why the address is moved
-    /// rather than borrowed. Callers must not copy these bytes into a
-    /// non-zeroizing buffer.
-    pub fn owner_seed(&self) -> &DmPageOwnerSeed {
-        &self.owner_seed
+    /// **Scoped rather than borrowing, because under Veilid this seed *is* write
+    /// access to the conversation** — not a content key. The type is boxed,
+    /// redacted, zeroize-on-drop, non-`Clone` and unconstructible from bytes
+    /// outside this module for that reason. Handing back a
+    /// `&DmPageOwnerSeed` returns all of it: the seed's own `as_bytes` is
+    /// public, so one deref copies the write capability into a plain
+    /// non-zeroizing array.
+    ///
+    /// **This does not make copying impossible, and it is not claimed to.** The
+    /// closure may return the array — `with_owner_seed(|b| *b)` is exactly the
+    /// old escape, and this module's own tests use it. What changes is that the
+    /// copy has to be *written*, as a closure whose return type is the secret,
+    /// instead of happening invisibly in a deref chain. It moves the rule from a
+    /// doc comment a reader must remember to a shape a reviewer can see.
+    ///
+    /// **It narrows the escape on the address, not on the module, and the
+    /// difference matters.** [`derive_owner_seed`] is `pub` and returns a
+    /// [`DmPageOwnerSeed`] whose `as_bytes` is `pub`, so
+    /// `*derive_owner_seed(&ar, dir, page)?.as_bytes()` still copies the
+    /// capability from any crate — needing only `AR`, which every caller of
+    /// [`DmPageAddress::sending`] / [`DmPageAddress::receiving`] already holds.
+    /// "Not constructible from bytes outside this module" is true and beside the
+    /// point: it is freely *derivable* outside. Closing that is a separate
+    /// change to the module's surface, not to this accessor.
+    ///
+    /// **Two further limits, so the scope is not read wider than it is.** The
+    /// borrow lives only as long as this call, but the *product* need not — the
+    /// keypair `identity::rendezvous_owner_keypair` derives from it is retained
+    /// by veilid for the process lifetime, and that is out of this type's reach.
+    /// And because `T` cannot borrow from the closure's argument, a future
+    /// caller needing an `.await` while holding the bytes cannot express it and
+    /// would be pushed to `|b| *b`; every call site today is synchronous.
+    ///
+    /// Nothing here prevents a later change reintroducing a borrowing accessor:
+    /// no test covers the shape, and the guarantee rests on review.
+    ///
+    /// Deliberately **not** applied to every secret `redacted_secret_newtype!`
+    /// generates. The DM siblings in [`crate::dm::doorbell`] and
+    /// [`crate::dm::keyrec`] are world-derivable by design, and the circle seeds
+    /// derive from material their trust set already holds, so a copy of any of
+    /// them opens no boundary. The one that genuinely warrants the same
+    /// treatment is **`identity::VeilidNodeSeed`** — a strictly larger
+    /// capability than one page's write access, and on the macro's `inline` arm,
+    /// so it is additionally `Clone`: a cheaper copy path than the deref this
+    /// replaced. Tracked on #271; not bundled here, because it is the node
+    /// identity and its blast radius is the whole process.
+    pub fn with_owner_seed<T>(&self, f: impl FnOnce(&[u8; DM_PAGE_OWNER_SEED_LEN]) -> T) -> T {
+        f(self.owner_seed.as_bytes())
     }
 }
 
@@ -795,13 +837,13 @@ mod tests {
         let receiving = DmPageAddress::receiving(&ar(0x41), &r, 0).expect("receiving address");
 
         assert_eq!(
-            hex::encode(sending.owner_seed().as_bytes()),
+            sending.with_owner_seed(|b| hex::encode(b)),
             "66b769ad77905d91ce4bc28618d0aa04231407af11930cf22119f24fef6eb47a",
             "a recipient SENDS on b2a — this is `page_addresses_are_pinned`'s BToA \
              vector, and a different value means the address graph moved"
         );
         assert_eq!(
-            hex::encode(receiving.owner_seed().as_bytes()),
+            receiving.with_owner_seed(|b| hex::encode(b)),
             "f7188b50d26697b05a47ff6e8fa8f166a7a4af31397ccc5c46d0b393e5fca75b",
             "a recipient RECEIVES on a2b — this is `page_addresses_are_pinned`'s \
              AToB vector"
@@ -812,15 +854,15 @@ mod tests {
         // rather than what page 0 happens to derive.
         let page_one = DmPageAddress::receiving(&ar(0x41), &r, 1).expect("page-1 address");
         assert_eq!(
-            hex::encode(page_one.owner_seed().as_bytes()),
+            page_one.with_owner_seed(|b| hex::encode(b)),
             "c39002df0dfb6a6c65f8d9d0d7023743f0ac593c82516e4403b07fc1d3ec06fa",
             "the address must carry its PAGE into the derivation — this is \
              `page_addresses_are_pinned`'s AToB page-1 vector, and a page argument \
              dropped on the way to `derive_owner_seed` yields page 0's instead"
         );
         assert_ne!(
-            page_one.owner_seed().as_bytes(),
-            receiving.owner_seed().as_bytes(),
+            page_one.with_owner_seed(|b| *b),
+            receiving.with_owner_seed(|b| *b),
             "page 1 and page 0 of one stream must be different records"
         );
 
@@ -845,8 +887,8 @@ mod tests {
             let s = DmPageAddress::sending(&ar(0x41), &r, page).unwrap();
             let v = DmPageAddress::receiving(&ar(0x41), &r, page).unwrap();
             assert_ne!(
-                s.owner_seed().as_bytes(),
-                v.owner_seed().as_bytes(),
+                s.with_owner_seed(|b| *b),
+                v.with_owner_seed(|b| *b),
                 "page {page} of the two streams shares a record"
             );
             assert_ne!(s.direction(), v.direction());
@@ -946,18 +988,26 @@ mod tests {
             "DmPageAddress { direction: AToB, page: 7, owner_seed: DmPageOwnerSeed(<redacted>) }"
         );
 
-        let seed = addr.owner_seed().as_bytes();
-        // A derived `Debug` on the array or on a tuple newtype renders the bytes in
-        // decimal, comma-separated. Three bytes of that is 5–11 characters of digits
-        // and separators, which nothing else in this rendering can produce.
-        let as_decimals = format!("{}, {}, {}", seed[0], seed[1], seed[2]);
+        // **Both needles are built inside the scope, so this test does not itself
+        // hold a plain copy of the seed.** `with_owner_seed(|b| *b)` would be the
+        // escape the accessor's own docs name — worth avoiding in the one test
+        // whose subject is that the seed does not leak.
+        //
+        // Decimal because a derived `Debug` on the array or on a tuple newtype
+        // renders the bytes comma-separated; three bytes of that is 5–11
+        // characters of digits and separators, which nothing else in this
+        // rendering can produce. Hex because that is the other plausible
+        // rendering: sixteen characters, likewise unreachable by accident.
+        let (as_decimals, as_hex) = addr.with_owner_seed(|b| {
+            (
+                format!("{}, {}, {}", b[0], b[1], b[2]),
+                hex::encode(&b[..8]),
+            )
+        });
         assert!(
             !rendered.contains(&as_decimals),
             "seed bytes leaked in decimal: {rendered}"
         );
-        // And a hex rendering: sixteen hex characters, likewise unreachable by
-        // accident.
-        let as_hex = hex::encode(&seed[..8]);
         assert!(
             !rendered.contains(&as_hex),
             "seed bytes leaked in hex: {rendered}"
