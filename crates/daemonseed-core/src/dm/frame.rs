@@ -112,6 +112,22 @@ pub const PAD_BUCKETS: &[usize] = &[8192, 16384];
 /// raising either constant without re-checking the fit fails the build.
 pub const MAX_FRAME_LEN: usize = 32768;
 
+/// The largest frame [`seal`] can actually produce, measured rather than derived.
+///
+/// **[`MAX_FRAME_LEN`] is the wrong number to size storage against**, and that is
+/// not a subtlety — it is the schema's subkey cap, which the doc above says
+/// `seal` can never reach. Sizing a bucket against it undercounts how many real
+/// frames fit by a third, and sizing against a guessed "typical" frame overcounts
+/// wildly in the other direction, because [`PAD_BUCKETS`] means **no frame is
+/// ever small**: the floor is the lower rung plus overhead, not a few hundred
+/// bytes.
+///
+/// `worst_case_frame_fits_a_page_subkey` pins this exactly, so a change to
+/// [`PAD_BUCKETS`], [`DM_BODY_CAP`], the signature suite or the header fails that
+/// test rather than silently shifting every capacity derived from it —
+/// [`crate::storage::dm_store::OUTBOX_CAPACITY`] being the one that matters.
+pub const WORST_CASE_SEALED_FRAME_LEN: usize = 19_560;
+
 /// Anything that can go wrong sealing or opening a channel frame.
 #[derive(Debug)]
 pub enum DmFrameError {
@@ -1492,6 +1508,15 @@ mod tests {
             worst.len() <= MAX_FRAME_LEN,
             "worst case is {} bytes against a {MAX_FRAME_LEN}-byte cap",
             worst.len()
+        );
+        // Storage capacities are sized against this, not against MAX_FRAME_LEN,
+        // which `seal` cannot reach. Pinned exactly so a change to PAD_BUCKETS,
+        // DM_BODY_CAP, the signature suite or the header lands here rather than
+        // silently moving how many frames an outbox record holds.
+        assert_eq!(
+            worst.len(),
+            WORST_CASE_SEALED_FRAME_LEN,
+            "the measured worst-case frame moved; re-check OUTBOX_CAPACITY's headroom"
         );
     }
 

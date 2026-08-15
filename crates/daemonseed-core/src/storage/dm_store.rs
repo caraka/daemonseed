@@ -228,18 +228,42 @@ const _: () = assert!(
 /// Largest payload a [`RecordKind::Outbox`] record may carry.
 ///
 /// [`crate::dm::outbox::Outbox::encode`] is variable-length by nature: a header,
-/// then one entry per message still owed, each carrying its sealed frame. At
-/// [`crate::dm::frame::MAX_FRAME_LEN`] this holds seven worst-case frames and
-/// far more typical ones.
+/// then one entry per message, each *owed* entry carrying its sealed frame. Per
+/// entry the fixed fields cost about forty bytes.
+///
+/// **Two counts matter and they differ by two orders of magnitude.**
+///
+/// *Owed* messages — those still carrying a frame — are the binding one:
+/// **106 at [`crate::dm::frame::WORST_CASE_SEALED_FRAME_LEN`], 213 at the
+/// smallest frame a padding rung permits** (both measured 2026-08-15; the first
+/// is pinned by `the_bucket_holds_its_claimed_owed_message_count`).
+///
+/// *Lifetime* messages are the second: a terminal entry sheds its frame but
+/// keeps its forty bytes for ever, and **nothing prunes**, so a record also dies
+/// at ~52 000 messages ever sent. That ceiling is far away and is tracked
+/// separately; the owed count is what ordinary use reaches.
+///
+/// **Do not size this against [`crate::dm::frame::MAX_FRAME_LEN`], and do not
+/// assume a small typical frame.** Both errors were made here before the frame
+/// was measured (#291): the cap is a subkey bound `seal` cannot reach, and
+/// [`crate::dm::frame::PAD_BUCKETS`] means no frame is ever small. Sizing
+/// against either produces a number off by a third in one direction or an order
+/// of magnitude in the other.
+///
+/// **The consequence, stated because the arithmetic does not flatter this
+/// design:** the give-up window is seven days, and 106–213 owed messages is well
+/// under a day of chatty sending. No affordable fixed size closes that gap —
+/// covering a thousand owed messages costs ~20 MB *per correspondence* — because
+/// frame padding multiplies against the fixed bucket. So the send-path refusal
+/// #291 tracks is **the mechanism, not a backstop**: it is expected to fire in
+/// ordinary use, and it is not built here.
 ///
 /// **The trade is disk against the leak.** Every correspondence pays this in
 /// full whether it owes one message or none, which is the price of the file
 /// size not tracking the queue depth. The overflow behaviour is
 /// [`RESUME_CAPACITY`]'s: refused at the write with
-/// [`DmStoreError::PayloadTooLong`], never truncated. A sender that can queue
-/// more than this owes the design a decision about what to do when the outbox
-/// is full — a refusal to persist is not, on its own, an answer.
-pub const OUTBOX_CAPACITY: usize = 262_144;
+/// [`DmStoreError::PayloadTooLong`], never truncated.
+pub const OUTBOX_CAPACITY: usize = 2_097_152;
 
 /// Bytes in a persisted [`crate::dm::provisional::ReceiveCursor`] — its
 /// `to_be_bytes` form, verbatim.
@@ -1615,7 +1639,7 @@ mod tests {
         assert_eq!(RecordKind::Provisional.capacity(), PROVISIONAL_RECORD_LEN);
         assert_eq!(PROVISIONAL_RECORD_LEN, 4813, "the sealed record's size");
         assert_eq!(RecordKind::Resume.capacity(), 65_536);
-        assert_eq!(RecordKind::Outbox.capacity(), 262_144);
+        assert_eq!(RecordKind::Outbox.capacity(), 2_097_152);
         assert_eq!(RecordKind::ReceiveCursor.capacity(), 8);
 
         assert_eq!(RecordKind::ReceiveCursor.on_disk_len(), 8, "unsealed");

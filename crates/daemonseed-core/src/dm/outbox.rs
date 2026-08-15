@@ -1917,6 +1917,73 @@ mod tests {
         CHANNEL
     }
 
+    /// How many *owed* messages an outbox record actually holds, bounded from
+    /// **both** sides at the largest and smallest frames [`crate::dm::frame::seal`]
+    /// can really produce.
+    ///
+    /// **The frame size is the whole difficulty, and the obvious choices are both
+    /// wrong.** Sizing against `MAX_FRAME_LEN` measures a frame `seal` cannot
+    /// reach and undercounts by a third; assuming a small "typical" frame
+    /// overcounts by an order of magnitude, because [`crate::dm::frame::PAD_BUCKETS`]
+    /// means no frame is ever small. Both errors were made against this bucket
+    /// before it was measured (#291). So the bounds come from
+    /// [`WORST_CASE_SEALED_FRAME_LEN`], which `worst_case_frame_fits_a_page_subkey`
+    /// pins against the real sealer, and from the lower padding rung.
+    ///
+    /// **Each bound is two-sided because a one-sided one is vacuous:** an upper
+    /// assertion alone passes for any capacity at or above the claim, so a bucket
+    /// set to a wrong number, or a per-entry field that ate the margin, would keep
+    /// it green.
+    ///
+    /// **What this deliberately does NOT bound:** total entries. A terminal entry
+    /// sheds its frame and keeps 40 bytes for ever — nothing prunes — so a record
+    /// also dies at ~52k *lifetime* messages. `fill` starts from an empty outbox
+    /// and cannot see that; it is tracked separately.
+    #[test]
+    fn the_bucket_holds_its_claimed_owed_message_count() {
+        use crate::dm::frame::WORST_CASE_SEALED_FRAME_LEN;
+        use crate::storage::dm_store::OUTBOX_CAPACITY;
+
+        // Measured 2026-08-15 against the real sealer. The smallest frame a
+        // padding rung permits was measured at 9 798 B, giving 213 — not pinned
+        // here, because no constant names it and inventing one would assert a
+        // floor the format does not promise.
+        const AT_WORST: u64 = 106;
+
+        // Doorbell carries a `u16` slot the channel target does not, so it is the
+        // genuinely worst entry. Slot 0 is always inside `DOORBELL_SLOTS`, and
+        // dedup is on `seq`, so one slot serves every entry.
+        let worst_target = OutboxTarget::Doorbell { slot: 0 };
+
+        let fill = |n: u64| {
+            let mut ob = empty();
+            for seq in 1..=n {
+                ob.enqueue_sealed(
+                    seq,
+                    worst_target,
+                    T0,
+                    SealedFrame::new(vec![0xA5; WORST_CASE_SEALED_FRAME_LEN]),
+                )
+                .unwrap();
+            }
+            ob.encode().len()
+        };
+
+        let at = fill(AT_WORST);
+        assert!(
+            at <= OUTBOX_CAPACITY,
+            "{AT_WORST} worst-case frames encode to {at}, over the {OUTBOX_CAPACITY} bucket"
+        );
+
+        let over = fill(AT_WORST + 1);
+        assert!(
+            over > OUTBOX_CAPACITY,
+            "{} worst-case frames encode to {over}, still inside {OUTBOX_CAPACITY} — \
+             the claimed count understates the real headroom",
+            AT_WORST + 1
+        );
+    }
+
     fn empty() -> Outbox {
         Outbox::new(Direction::AToB)
     }
