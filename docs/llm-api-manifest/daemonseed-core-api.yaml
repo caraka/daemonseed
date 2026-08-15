@@ -1180,14 +1180,28 @@ modules:
       one (#235 transport half).
       Sub-module dm::resume is the A9.2 re-establishment resume record.
       ResumeRecord::new(s_pc: Box<[u8; ml_dsa::SK_LEN]>, pk_pc: Box<[u8;
-      ml_dsa::PK_LEN]>, committed_root: CommittedRoot, attempt: u32, send_floor:
-      SendFloor, window_anchor_ms: i64, toward_c: u32, sealed_re_est: Box<[u8]>)
-      -> Result<ResumeRecord, ResumeError> takes every field at once; there is no
-      builder and no field setter. It returns ResumeError::FrameTooLong { len }
-      above dm::frame::MAX_FRAME_LEN. Accessors s_pc/pk_pc/committed_root/
-      attempt/send_floor/window_anchor_ms/toward_c/sealed_re_est borrow;
-      sealed_re_est returns the same bytes every call. s_pc and committed_root
-      zero on drop and Debug renders both redacted. CommittedRoot::from_bytes([u8;
+      ml_dsa::PK_LEN]>, committed_root: CommittedRoot, sealed: SealedReEst,
+      send_floor: SendFloor, window_anchor_ms: i64, toward_c: u32) ->
+      ResumeRecord takes every field at once; there is no builder and no field
+      setter, and it is infallible because SealedReEst carries the frame-length
+      invariant. Attempt is a u32 newtype ordered numerically: Attempt::FIRST,
+      get() -> u32, advance() -> Option<FreshAttempt> yielding the successor and
+      None at u32::MAX. FreshAttempt is the authority to seal a fresh RE-EST,
+      minted only by FreshAttempt::first() and Attempt::advance(), and is
+      neither Clone nor Copy. SealedReEst::seal(fresh: FreshAttempt, bytes:
+      Box<[u8]>) -> Result<SealedReEst, ResumeError> consumes the token and
+      returns ResumeError::FrameTooLong { len } above dm::frame::MAX_FRAME_LEN;
+      attempt() -> Attempt and bytes() -> &[u8] borrow. seal cannot be called
+      with an already-held Attempt (A9.1) — that call does not compile. It bounds
+      seals per token, not per attempt: Attempt is Copy, so advance may mint
+      several tokens for one successor. decode rebuilds a SealedReEst from
+      at-rest bytes with no token, so holding one is not proof a token authorised
+      it. DmPersist::commit_resume is the enforcement point in all cases.
+      Accessors s_pc/pk_pc/
+      committed_root/attempt/send_floor/window_anchor_ms/toward_c/sealed/
+      sealed_re_est borrow; sealed_re_est returns the same bytes every call and
+      attempt() returns Attempt. s_pc and committed_root zero on drop and Debug
+      renders both redacted. CommittedRoot::from_bytes([u8;
       ROOT_KEY_LEN]) is a redacted secret newtype distinct from
       ratchet::RootKey. SendFloor::new(generation: u32, seq: u64) orders
       lexicographically by generation then seq; advance_to(offered) ->

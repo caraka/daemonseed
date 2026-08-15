@@ -31,7 +31,12 @@ work lives in the project lead's vault manifest, not here.
   the `attempt` counter, the sealed RE-EST frame bytes, the send-side floor, the
   window anchor and the toward-`C` count in one blob. `SendFloor` is
   `(generation, seq)` and orders lexicographically, so a generation bump is not
-  a rollback. `DmPersist::commit_resume` writes the record and returns the
+  a rollback. `SealedReEst` binds the sealed frame to the `Attempt` it was
+  sealed under; `SealedReEst::seal` consumes a `FreshAttempt`, minted solely by
+  `Attempt::advance` and `FreshAttempt::first`, so it cannot be called with an
+  attempt already in hand (A9.1). `ResumeRecord::decode` rebuilds the pairing
+  from at-rest bytes without a token, so the store remains the enforcement
+  point. `DmPersist::commit_resume` writes the record and returns the
   sealed bytes to emit; `read_resume` reads it back. `RESUME_CAPACITY` is now
   checked against a computed worst case rather than estimated.
 

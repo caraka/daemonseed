@@ -82,9 +82,10 @@ const FIXED_LEN: usize = RESUME_MAGIC.len()
 /// The largest [`ResumeRecord::encode`] output this build can produce.
 ///
 /// **Computed, not estimated.** Every field but one is fixed-width, and the one
-/// that is not is bounded by [`MAX_FRAME_LEN`] — which
-/// [`ResumeRecord::new`] refuses to exceed, so this is a real ceiling rather
-/// than a typical case. [`crate::storage::dm_store::RESUME_CAPACITY`] is sized
+/// that is not is bounded by [`MAX_FRAME_LEN`] — which [`SealedReEst::seal`]
+/// refuses to exceed and [`ResumeRecord::decode`] re-checks before allocating,
+/// so this is a real ceiling rather than a typical case.
+/// [`crate::storage::dm_store::RESUME_CAPACITY`] is sized
 /// against it, and `the_capacity_holds_the_worst_case` pins the relationship in
 /// the direction that matters: if a field is added here and the constant is not
 /// revisited, that test fails rather than a write failing on a user's disk.
@@ -292,6 +293,222 @@ impl SendFloor {
     }
 }
 
+/// Which re-establishment attempt a record describes.
+///
+/// A newtype rather than a bare `u32` because A9.1 attaches an invariant to this
+/// number that arithmetic does not carry: **a fresh encapsulation is permitted
+/// only under a new attempt.** Authority to seal one comes only from
+/// [`Self::advance`], which yields a [`FreshAttempt`] for the *successor*, and
+/// from [`FreshAttempt::first`] — so [`SealedReEst::seal`] cannot be called with
+/// an attempt already in hand. See [`FreshAttempt`] for what that does and does
+/// not close.
+///
+/// Ordering is the ordinary numeric one, which is what
+/// [`crate::dm::persist::DmPersist::commit_resume`] compares to refuse a
+/// regression.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Attempt(u32);
+
+impl std::fmt::Debug for Attempt {
+    /// The bare number, not `Attempt(7)`. This value is read in log lines beside
+    /// a correspondence label, where the wrapper name is noise and the reader
+    /// wants the counter the peer dedups on.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl Attempt {
+    /// The first attempt of a correspondence.
+    pub const FIRST: Self = Self(1);
+
+    /// The number, for encoding and for error reporting.
+    pub fn get(self) -> u32 {
+        self.0
+    }
+
+    /// Advance to the next attempt, yielding the one token that authorises a
+    /// **fresh** encapsulation under it (A9.1(b)).
+    ///
+    /// `None` at `u32::MAX` rather than wrapping: a wrapped attempt would
+    /// re-enter numbers the peer has already deduped, which is the divergence
+    /// A9.1 forbids arriving by arithmetic instead of by a bad call.
+    pub fn advance(self) -> Option<FreshAttempt> {
+        self.0.checked_add(1).map(|n| FreshAttempt(Self(n)))
+    }
+}
+
+/// Authority to seal a **fresh** RE-EST under an attempt other than one already
+/// in hand.
+///
+/// A9.1's forbidden act — a fresh `eph_ct` under an unchanged key — is spelled by
+/// sealing fresh bytes under an attempt that is already persisted, and requiring
+/// a capability that only [`Attempt::advance`] and [`FreshAttempt::first`] can
+/// mint is what removes that spelling: there is no token for an attempt you are
+/// holding, so [`SealedReEst::seal`] cannot be called with one.
+///
+/// **Three limits, stated because the tempting reading is that this closes more
+/// than it does.**
+///
+/// 1. **It bounds seals per token, not per attempt.** [`Attempt`] is `Copy`, so
+///    `advance()` may be called repeatedly on one value and hand back several
+///    independent tokens for the *same* successor. Each seals once; nothing here
+///    stops two of them sealing different frames under one attempt. Whichever
+///    commits second is refused by `AttemptResealed`, on disk, not here.
+/// 2. **It does not constrain [`ResumeRecord::decode`].** That path rebuilds a
+///    [`SealedReEst`] from at-rest bytes, pairing an attempt and a frame read
+///    from two independent byte ranges with no token involved — necessarily, as
+///    the bytes come from a file rather than from a caller. So a
+///    [`SealedReEst`] in hand is **not** proof a token authorised it.
+/// 3. **It is blind across processes and restarts.** The token proves an attempt
+///    is the successor of one held *in this process*; it cannot know what
+///    another process, or this one before a restart, already persisted.
+///
+/// All three land in the same place: `commit_resume`'s `AttemptResealed` and
+/// `AttemptWouldRollBack` guards are what stop a wrong pairing reaching the
+/// wire, and they are **not** superseded by this type. The type removes the
+/// caller's mistake at compile time; the store remains the enforcement point.
+/// Deliberately **not `Clone` and not `Copy`**, which is what makes limit 1 a
+/// bound at all rather than no bound.
+pub struct FreshAttempt(Attempt);
+
+impl FreshAttempt {
+    /// Authority to seal the **first** attempt of a correspondence.
+    ///
+    /// Necessary rather than convenient: [`Attempt::advance`] is the only other
+    /// mint and it yields a successor, so without this there is no way to seal
+    /// [`Attempt::FIRST`] at all and a correspondence could never emit its first
+    /// RE-EST. It is safe for the same reason `advance` is — a first attempt has
+    /// no predecessor to re-seal — and `commit_resume` still refuses it against
+    /// anything already on disk.
+    pub fn first() -> Self {
+        Self(Attempt::FIRST)
+    }
+
+    /// The attempt this token authorises.
+    pub fn attempt(&self) -> Attempt {
+        self.0
+    }
+}
+
+/// A sealed RE-EST frame, bound to the attempt it was sealed under.
+///
+/// The binding is the point: the pairing is fixed at the moment of sealing and
+/// no later call can restate it. Carried as two independent values, a caller
+/// could pair a fresh encapsulation with any attempt number it liked, and the
+/// mistake would surface — if at all — one layer down at the store.
+///
+/// A9.1(a)'s byte-identical re-emit falls out of the same shape: a record read
+/// back from disk yields this type with the stored bytes already inside it, and
+/// there is no constructor that re-seals it.
+///
+/// # The correct call
+///
+/// ```
+/// use daemonseed_core::dm::resume::{Attempt, SealedReEst};
+///
+/// // A fresh secret under a NEW attempt — A9.1(b), permitted.
+/// let fresh = Attempt::FIRST.advance().expect("attempt space remains");
+/// let sealed = SealedReEst::seal(fresh, vec![0u8; 32].into_boxed_slice())
+///     .expect("32 bytes is within MAX_FRAME_LEN");
+/// assert_eq!(sealed.attempt().get(), 2);
+/// ```
+///
+/// # The forbidden call does not compile
+///
+/// A fresh seal under an attempt already in hand — the act A9.1 forbids, and the
+/// one that reaches AEAD nonce-reuse forgery or permanent `UnknownEphemeral`
+/// divergence. There is no `FreshAttempt` for it, so it is a type error:
+///
+/// ```compile_fail,E0308
+/// use daemonseed_core::dm::resume::{Attempt, SealedReEst};
+///
+/// let persisted = Attempt::FIRST;
+/// // error[E0308]: expected `FreshAttempt`, found `Attempt`
+/// let sealed = SealedReEst::seal(persisted, vec![0u8; 32].into_boxed_slice());
+/// ```
+///
+/// **The `E0308` annotation records the expected error but does NOT enforce it
+/// on this toolchain** — measured, not assumed: replacing it with an unrelated
+/// code (`E0369`) leaves the doctest passing. Treat it as documentation of
+/// intent. What actually protects this probe is the paired control above: a
+/// `compile_fail` block passes on *any* compilation failure, including a typo or
+/// a renamed import, and the control shares its imports and call so that failure
+/// mode surfaces there instead of being scored as a success here.
+///
+/// **The two blocks above are a probe and its control, and the pairing is
+/// load-bearing rather than decorative.** A `compile_fail` block passes for *any*
+/// compilation failure, including a typo or a stale import path — so on its own
+/// it cannot distinguish "the wrong call is rejected" from "this doctest is
+/// broken". The first block carries the same imports and the corrected call, so
+/// a path that stopped resolving fails there, loudly, instead of being scored as
+/// a success here.
+///
+/// # One token, one seal
+///
+/// ```compile_fail,E0382
+/// use daemonseed_core::dm::resume::{Attempt, SealedReEst};
+///
+/// let fresh = Attempt::FIRST.advance().expect("attempt space remains");
+/// let first = SealedReEst::seal(fresh, vec![0u8; 32].into_boxed_slice());
+/// // error[E0382]: use of moved value — `FreshAttempt` is not `Clone`.
+/// let second = SealedReEst::seal(fresh, vec![1u8; 32].into_boxed_slice());
+/// ```
+pub struct SealedReEst {
+    attempt: Attempt,
+    bytes: Box<[u8]>,
+}
+
+impl SealedReEst {
+    /// Seal a fresh RE-EST under a newly advanced attempt.
+    ///
+    /// Refuses a frame past [`MAX_FRAME_LEN`], which is where that ceiling now
+    /// lives: it is a property of a sealed frame, so holding one of these is
+    /// proof the length was checked and [`ResumeRecord::new`] no longer has to
+    /// be fallible to say so.
+    pub fn seal(fresh: FreshAttempt, bytes: Box<[u8]>) -> Result<Self, ResumeError> {
+        Self::bind(fresh.attempt(), bytes)
+    }
+
+    /// Rebuild from the at-rest form. **Crate-private, and only
+    /// [`ResumeRecord::decode`] calls it** — a public version would be a
+    /// re-seal by another name, since it takes an arbitrary attempt beside
+    /// arbitrary bytes.
+    fn from_stored(attempt: Attempt, bytes: Box<[u8]>) -> Result<Self, ResumeError> {
+        Self::bind(attempt, bytes)
+    }
+
+    fn bind(attempt: Attempt, bytes: Box<[u8]>) -> Result<Self, ResumeError> {
+        if bytes.len() > MAX_FRAME_LEN {
+            return Err(ResumeError::FrameTooLong { len: bytes.len() });
+        }
+        Ok(Self { attempt, bytes })
+    }
+
+    /// The attempt these bytes were sealed under.
+    pub fn attempt(&self) -> Attempt {
+        self.attempt
+    }
+
+    /// The sealed frame, borrowed — the same bytes every call, which is A9.1(a)'s
+    /// byte-identical re-emit at this layer.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl std::fmt::Debug for SealedReEst {
+    /// The frame is ciphertext rather than a secret, but its length is the only
+    /// part worth reading and printing it whole would bury every log line it
+    /// appears in — the same judgement [`ResumeRecord`]'s own `Debug` makes.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SealedReEst")
+            .field("attempt", &self.attempt)
+            .field("bytes_len", &self.bytes.len())
+            .finish()
+    }
+}
+
 /// Everything a re-establishment needs to survive a restart, in one blob.
 ///
 /// **Every field here is one A9.2 enumerates**, and the list is closed: the
@@ -315,10 +532,21 @@ pub struct ResumeRecord {
     pk_pc: Box<[u8; ml_dsa::PK_LEN]>,
     /// The re-establishment root this party has committed to.
     committed_root: CommittedRoot,
-    /// Which attempt this record describes. The peer dedups a re-emit on it
-    /// (A9.4), and A9.1 permits a fresh secret only under a **new** one.
+    /// **The sealed RE-EST frame and the attempt it was sealed under, as one
+    /// value.** The peer dedups a re-emit on the attempt (A9.4), and A9.1 permits
+    /// a fresh secret only under a **new** one — so the two facts are carried
+    /// bound together rather than as fields a caller could pair wrongly. See
+    /// [`SealedReEst`] for the construction rule that enforces it.
+    ///
+    /// The bytes are load-bearing in this blob (A9.2): ML-KEM encapsulation is
+    /// randomized and `ss → eph_ct` is not invertible, so A9.1(a)'s
+    /// byte-identical re-emit cannot be rebuilt from the key inputs. Recovery
+    /// re-emits *these*, not a fresh encapsulation.
+    ///
+    /// `zeroize(skip)` matches what the two fields it replaces both carried: an
+    /// attempt counter and a sealed frame are neither of them secrets.
     #[zeroize(skip)]
-    attempt: u32,
+    sealed: SealedReEst,
     /// The durable send-side floor. See [`SendFloor`].
     #[zeroize(skip)]
     send_floor: SendFloor,
@@ -328,13 +556,6 @@ pub struct ResumeRecord {
     /// How far this correspondence has progressed toward `C`.
     #[zeroize(skip)]
     toward_c: u32,
-    /// **The sealed RE-EST frame, verbatim.** A9.1(a) requires a re-emit of a
-    /// persisted attempt to be the byte-identical persisted seal, and A9.2 makes
-    /// this field load-bearing for it: ML-KEM encapsulation is randomized and
-    /// `ss → eph_ct` is not invertible, so these bytes cannot be rebuilt from
-    /// the key inputs. Recovery re-emits *this*, not a fresh encapsulation.
-    #[zeroize(skip)]
-    sealed_re_est: Box<[u8]>,
 }
 
 impl std::fmt::Debug for ResumeRecord {
@@ -346,47 +567,47 @@ impl std::fmt::Debug for ResumeRecord {
             .field("s_pc", &"<redacted>")
             .field("pk_pc", &"<peer verifying key>")
             .field("committed_root", &self.committed_root)
-            .field("attempt", &self.attempt)
             .field("send_floor", &self.send_floor)
             .field("window_anchor_ms", &self.window_anchor_ms)
             .field("toward_c", &self.toward_c)
-            .field("sealed_re_est_len", &self.sealed_re_est.len())
+            // Renders the attempt and the frame's length; `SealedReEst`'s own
+            // `Debug` makes the same redaction decision this impl does.
+            .field("sealed", &self.sealed)
             .finish()
     }
 }
 
 impl ResumeRecord {
-    /// Build a record. Refuses a sealed frame past [`MAX_FRAME_LEN`].
+    /// Build a record.
     ///
     /// **All of it or none of it.** There is no builder and no field setter:
     /// the fields have to agree with each other, so the only way to have a
     /// record is to have supplied every part of one at the same moment.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// **Infallible, where it used to return a `Result`.** Its one failure mode
+    /// was a sealed frame past [`MAX_FRAME_LEN`], and that ceiling now belongs to
+    /// [`SealedReEst`] — holding one is already proof the length was checked, so
+    /// there is nothing left here to refuse. The attempt arrives inside the same
+    /// value for the reason [`SealedReEst`] gives: the pairing is fixed at
+    /// sealing time and this call cannot restate it.
     pub fn new(
         s_pc: Box<[u8; ml_dsa::SK_LEN]>,
         pk_pc: Box<[u8; ml_dsa::PK_LEN]>,
         committed_root: CommittedRoot,
-        attempt: u32,
+        sealed: SealedReEst,
         send_floor: SendFloor,
         window_anchor_ms: i64,
         toward_c: u32,
-        sealed_re_est: Box<[u8]>,
-    ) -> Result<Self, ResumeError> {
-        if sealed_re_est.len() > MAX_FRAME_LEN {
-            return Err(ResumeError::FrameTooLong {
-                len: sealed_re_est.len(),
-            });
-        }
-        Ok(Self {
+    ) -> Self {
+        Self {
             s_pc,
             pk_pc,
             committed_root,
-            attempt,
+            sealed,
             send_floor,
             window_anchor_ms,
             toward_c,
-            sealed_re_est,
-        })
+        }
     }
 
     /// Our per-correspondent signing key.
@@ -405,8 +626,17 @@ impl ResumeRecord {
     }
 
     /// Which attempt this record describes.
-    pub fn attempt(&self) -> u32 {
-        self.attempt
+    pub fn attempt(&self) -> Attempt {
+        self.sealed.attempt()
+    }
+
+    /// The sealed frame bound to its attempt — what a re-emit sends.
+    ///
+    /// A re-emit path wants *this*, not the loose bytes: it carries the attempt
+    /// the peer will dedup on (A9.4) alongside the frame, and there is no
+    /// constructor on it that would re-seal either.
+    pub fn sealed(&self) -> &SealedReEst {
+        &self.sealed
     }
 
     /// The durable send-side floor.
@@ -426,8 +656,12 @@ impl ResumeRecord {
 
     /// The sealed RE-EST frame, borrowed — the same bytes every call, which is
     /// A9.1(a)'s byte-identical re-emit at this layer.
+    ///
+    /// Retained beside [`Self::sealed`] for the callers that genuinely want only
+    /// the bytes — the store's encode path and the persist layer's
+    /// byte-comparison guard.
     pub fn sealed_re_est(&self) -> &[u8] {
-        &self.sealed_re_est
+        self.sealed.bytes()
     }
 
     /// The at-rest form, plaintext. `dm_store` seals it.
@@ -447,19 +681,19 @@ impl ResumeRecord {
     /// [`crate::dm::outbox`] does it, and it loses nothing because the field
     /// describes the writer rather than the payload.
     pub fn encode(&self) -> Zeroizing<Vec<u8>> {
-        let mut out = Zeroizing::new(Vec::with_capacity(FIXED_LEN + self.sealed_re_est.len()));
+        let mut out = Zeroizing::new(Vec::with_capacity(FIXED_LEN + self.sealed.bytes().len()));
         out.extend_from_slice(RESUME_MAGIC);
         out.extend_from_slice(&Registry::default_write_suite().get().to_be_bytes());
         out.extend_from_slice(self.s_pc.as_ref());
         out.extend_from_slice(self.pk_pc.as_ref());
         out.extend_from_slice(self.committed_root.as_bytes());
-        out.extend_from_slice(&self.attempt.to_be_bytes());
+        out.extend_from_slice(&self.sealed.attempt().get().to_be_bytes());
         out.extend_from_slice(&self.send_floor.generation.to_be_bytes());
         out.extend_from_slice(&self.send_floor.seq.to_be_bytes());
         out.extend_from_slice(&self.window_anchor_ms.to_be_bytes());
         out.extend_from_slice(&self.toward_c.to_be_bytes());
-        out.extend_from_slice(&(self.sealed_re_est.len() as u64).to_be_bytes());
-        out.extend_from_slice(&self.sealed_re_est);
+        out.extend_from_slice(&(self.sealed.bytes().len() as u64).to_be_bytes());
+        out.extend_from_slice(self.sealed.bytes());
         out
     }
 
@@ -518,15 +752,18 @@ impl ResumeRecord {
         if rest != 0 {
             return Err(ResumeError::TrailingBytes(rest));
         }
+        // The at-rest form is the one place an attempt and a frame are paired
+        // from separate bytes rather than at sealing time — which is why
+        // `from_stored` is private to this module and this is its only caller.
+        let sealed = SealedReEst::from_stored(Attempt(attempt), sealed_re_est)?;
         Ok(Self {
             s_pc,
             pk_pc,
             committed_root,
-            attempt,
+            sealed,
             send_floor: SendFloor { generation, seq },
             window_anchor_ms,
             toward_c,
-            sealed_re_est,
         })
     }
 }
@@ -591,18 +828,31 @@ mod tests {
 
     /// Every field set to a value distinct from every other field's, so a
     /// decoder that crossed two of them fails rather than passing.
+    /// Walk to `attempt` the way a real caller must — there is no back door, by
+    /// design. See the twin in [`crate::dm::persist`]'s tests.
+    fn fresh(attempt: u32) -> FreshAttempt {
+        let mut token = FreshAttempt::first();
+        while token.attempt().get() < attempt {
+            token = token
+                .attempt()
+                .advance()
+                .expect("the fixture stays far below u32::MAX");
+        }
+        assert_eq!(token.attempt().get(), attempt, "the walk overshot");
+        token
+    }
+
     fn populated() -> ResumeRecord {
         ResumeRecord::new(
             s_pc(0x11),
             pk_pc(0x22),
             root(0x33),
-            7,
+            SealedReEst::seal(fresh(7), pattern(0x44, 512).into_boxed_slice())
+                .expect("the fixture is within MAX_FRAME_LEN"),
             SendFloor::new(4, 100),
             ANCHOR,
             3,
-            pattern(0x44, 512).into_boxed_slice(),
         )
-        .expect("the fixture is within MAX_FRAME_LEN")
     }
 
     #[test]
@@ -631,7 +881,7 @@ mod tests {
         // hollow this test by making two of them equal. The earlier guard
         // covered three pairs and left the rest distinct only by accident.
         let scalars: [(&str, u64); 5] = [
-            ("attempt", u64::from(before.attempt())),
+            ("attempt", u64::from(before.attempt().get())),
             ("generation", u64::from(before.send_floor().generation())),
             ("seq", before.send_floor().seq()),
             ("toward_c", u64::from(before.toward_c())),
@@ -669,6 +919,96 @@ mod tests {
             "a field is present that nothing names"
         );
         assert_eq!(encoded.len(), FIXED_LEN + record.sealed_re_est().len());
+    }
+
+    /// **The at-rest layout is pinned against an independently assembled
+    /// buffer**, so a record written by an older build still decodes here.
+    ///
+    /// This exists because binding the attempt to the sealed frame changed which
+    /// expressions `encode` reads those two fields from. Nothing else in this
+    /// module could have caught a reordering: the round-trip test encodes and
+    /// decodes with the *same* field order, so it passes just as happily if two
+    /// fields swap, and the length test only counts bytes. Both compare the code
+    /// to itself. The expected buffer below is built from the fixture's own
+    /// values in the order the module docs specify, which is a second opinion
+    /// rather than an echo.
+    #[test]
+    fn the_at_rest_layout_is_byte_for_byte_what_it_was() {
+        let record = populated();
+
+        let mut expected: Vec<u8> = Vec::new();
+        expected.extend_from_slice(RESUME_MAGIC);
+        // **Named constant, NOT `Registry::default_write_suite()`** — that is the
+        // expression `encode` itself calls, so using it here would move both
+        // sides together and pass through exactly the cross-build event this
+        // test's failure message claims to catch. Which suite is `ActiveWrite`
+        // is pinned separately by `default_write_suite_is_cnsa_2_0`; if that
+        // moves, the at-rest bytes really have changed and this test should say
+        // so rather than follow along.
+        expected.extend_from_slice(&crate::crypto::suite::CNSA_2_0.id.get().to_be_bytes());
+        expected.extend_from_slice(&pattern(0x11, ml_dsa::SK_LEN));
+        expected.extend_from_slice(&pattern(0x22, ml_dsa::PK_LEN));
+        expected.extend_from_slice(&pattern(0x33, ROOT_KEY_LEN));
+        expected.extend_from_slice(&7u32.to_be_bytes()); // attempt
+        expected.extend_from_slice(&4u32.to_be_bytes()); // floor generation
+        expected.extend_from_slice(&100u64.to_be_bytes()); // floor seq
+        expected.extend_from_slice(&ANCHOR.to_be_bytes()); // window anchor
+        expected.extend_from_slice(&3u32.to_be_bytes()); // toward_c
+        expected.extend_from_slice(&512u64.to_be_bytes()); // frame length prefix
+        expected.extend_from_slice(&pattern(0x44, 512)); // the sealed frame
+
+        assert_eq!(
+            &record.encode()[..],
+            &expected[..],
+            "the at-rest layout moved — a record written by an earlier build no longer decodes"
+        );
+    }
+
+    /// The overflow branch, which nothing else reaches.
+    ///
+    /// `advance`'s own docs make this the security-relevant half — a wrapped
+    /// attempt re-enters numbers the peer has already deduped — and the `fresh`
+    /// helpers only ever exercise the `Some` arm. Reachable here because the
+    /// test module is a child of the one that owns the private field; a caller
+    /// outside the module cannot build this value, which is the point.
+    #[test]
+    fn an_attempt_at_the_ceiling_refuses_to_advance() {
+        assert!(
+            Attempt(u32::MAX).advance().is_none(),
+            "a wrapped attempt would re-enter numbers the peer has already deduped"
+        );
+        // Positive control: one below the ceiling still advances, so the
+        // assertion above is not passing because `advance` refuses everything.
+        let below = Attempt(u32::MAX - 1).advance().expect("must still advance");
+        assert_eq!(below.attempt().get(), u32::MAX);
+    }
+
+    /// `FreshAttempt::first()` must mint authority for `Attempt::FIRST` and not
+    /// for some other number.
+    ///
+    /// Nothing else pins this: the `fresh` helpers walk `while get() < n`, so
+    /// they arrive at `n` whether `first()` starts at 0 or 1, and the error-path
+    /// tests assert only variants. Mutating `first()` to `Attempt(0)` passed the
+    /// whole suite before this test existed.
+    #[test]
+    fn the_first_attempt_is_the_first_attempt() {
+        assert_eq!(FreshAttempt::first().attempt(), Attempt::FIRST);
+        assert_eq!(Attempt::FIRST.get(), 1, "FIRST is 1, not 0");
+    }
+
+    /// The two frame accessors describe one value and may not drift apart.
+    ///
+    /// `sealed()` is new public API with no production caller yet — the re-emit
+    /// path it exists for is unbuilt — so without this it is untested surface,
+    /// the same complaint #280 records against an unreferenced function.
+    #[test]
+    fn the_bound_frame_and_the_loose_bytes_agree() {
+        let record = populated();
+        assert_eq!(record.sealed().attempt(), record.attempt());
+        assert_eq!(record.sealed().bytes(), record.sealed_re_est());
+        // Non-degenerate: the fixture's frame is neither empty nor uniform with
+        // anything else asserted here.
+        assert_eq!(record.sealed().bytes().len(), 512);
     }
 
     /// A9.2's lexicographic rule, in the direction that matters: a generation
@@ -780,32 +1120,44 @@ mod tests {
             s_pc(0x11),
             pk_pc(0x22),
             root(0x33),
-            1,
+            SealedReEst::seal(
+                FreshAttempt::first(),
+                pattern(0x44, MAX_FRAME_LEN).into_boxed_slice(),
+            )
+            .expect("a frame of exactly MAX_FRAME_LEN is allowed"),
             SendFloor::new(0, 0),
             ANCHOR,
             0,
-            pattern(0x44, MAX_FRAME_LEN).into_boxed_slice(),
-        )
-        .expect("a frame of exactly MAX_FRAME_LEN is allowed");
+        );
         assert_eq!(at_ceiling.encode().len(), MAX_ENCODED_LEN);
     }
 
+    /// The ceiling moved from `ResumeRecord::new` to `SealedReEst::seal` when the
+    /// frame and its attempt became one value — so a sealed frame is now proof
+    /// the length was checked, and the record constructor has nothing left to
+    /// refuse. Same invariant, enforced one layer earlier.
     #[test]
-    fn an_oversized_frame_is_refused_at_construction_and_at_decode() {
+    fn an_oversized_frame_is_refused_at_sealing_and_at_decode() {
         let too_long = MAX_FRAME_LEN + 1;
         assert_eq!(
-            ResumeRecord::new(
-                s_pc(0x11),
-                pk_pc(0x22),
-                root(0x33),
-                1,
-                SendFloor::new(0, 0),
-                ANCHOR,
-                0,
+            SealedReEst::seal(
+                FreshAttempt::first(),
                 pattern(0x44, too_long).into_boxed_slice(),
             )
             .err(),
             Some(ResumeError::FrameTooLong { len: too_long })
+        );
+
+        // And a frame of exactly the ceiling still seals — without this the
+        // assertion above would pass just as well against an off-by-one that
+        // refused everything.
+        assert!(
+            SealedReEst::seal(
+                FreshAttempt::first(),
+                pattern(0x44, MAX_FRAME_LEN).into_boxed_slice(),
+            )
+            .is_ok(),
+            "positive control: the ceiling itself must still be sealable"
         );
 
         // The decoder cannot lean on the constructor, because the bytes it reads
@@ -871,7 +1223,23 @@ mod tests {
         // Positive control: the non-secret fields ARE shown, so the assertions
         // above are not passing because `Debug` prints nothing useful.
         assert!(shown.contains("attempt: 7"), "Debug shows nothing at all");
-        assert!(shown.contains("sealed_re_est_len: 512"));
+        // `sealed_re_est_len` became `bytes_len` when the frame and its attempt
+        // became one value — the field this names moved, the control it provides
+        // did not. It still fails if `Debug` stops rendering the frame's length.
+        assert!(
+            shown.contains("bytes_len: 512"),
+            "the sealed frame's length is not shown: {shown}"
+        );
+        // **The two assertions above now render out of ONE nested field**, where
+        // they used to be two independent ones — so on their own they no longer
+        // notice `ResumeRecord::Debug` dropping the rest of the record. The
+        // remaining non-secret fields are named explicitly to restore that span.
+        for field in ["toward_c: 3", "window_anchor_ms:", "send_floor:"] {
+            assert!(
+                shown.contains(field),
+                "Debug stopped rendering {field}: {shown}"
+            );
+        }
 
         // **The byte backstop is format-agnostic, because the previous one was
         // not.** It matched lowercase hex only, while Rust's derived `Debug` for

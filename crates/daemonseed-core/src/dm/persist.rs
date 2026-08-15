@@ -464,7 +464,19 @@ impl DmPersist {
     /// secret the peer will never confirm, the permanent `UnknownEphemeral`
     /// divergence. This is the only layer that can see both the offered record
     /// and the stored one, so it is the only place the invariant can be
-    /// enforced.
+    /// enforced **against what is on disk**.
+    ///
+    /// **These guards are not superseded by
+    /// [`SealedReEst`](crate::dm::resume::SealedReEst), and the division is worth
+    /// stating.** That type stops `SealedReEst::seal` being *called* with an
+    /// attempt already in hand, which removes the caller's mistake at compile
+    /// time. It does no more than that: it cannot know what another process, or
+    /// this one before a restart, already persisted — a `FreshAttempt` minted
+    /// from a stale in-memory attempt is perfectly well-typed and perfectly
+    /// wrong — and it does not constrain `ResumeRecord::decode`, which rebuilds
+    /// the pairing from at-rest bytes with no token at all. So the type closes
+    /// one spelling and this call closes the invariant; neither is redundant and
+    /// removing either reopens a real path.
     ///
     /// **A stored record that will not decode wedges this call** — every future
     /// commit for that correspondence fails rather than overwriting it. That is
@@ -494,8 +506,8 @@ impl DmPersist {
                     let stored = ResumeRecord::decode(&Zeroizing::new(bytes))?;
                     if record.attempt() < stored.attempt() {
                         return Err(ResumeError::AttemptWouldRollBack {
-                            stored: stored.attempt(),
-                            offered: record.attempt(),
+                            stored: stored.attempt().get(),
+                            offered: record.attempt().get(),
                         }
                         .into());
                     }
@@ -503,7 +515,7 @@ impl DmPersist {
                         && record.sealed_re_est() != stored.sealed_re_est()
                     {
                         return Err(ResumeError::AttemptResealed {
-                            attempt: record.attempt(),
+                            attempt: record.attempt().get(),
                         }
                         .into());
                     }
@@ -1388,6 +1400,28 @@ mod tests {
         resume_record_sealed(attempt, floor, 0xA5)
     }
 
+    /// Walk to `attempt` the way a real caller must.
+    ///
+    /// There is no shortcut on purpose: `FreshAttempt` is mintable only by
+    /// [`FreshAttempt::first`] and [`Attempt::advance`], so a fixture that wants
+    /// attempt N walks there. That keeps these tests exercising the API a
+    /// production caller is actually given rather than a test-only back door.
+    fn fresh(attempt: u32) -> crate::dm::resume::FreshAttempt {
+        let mut token = crate::dm::resume::FreshAttempt::first();
+        while token.attempt().get() < attempt {
+            token = token
+                .attempt()
+                .advance()
+                .expect("the fixture stays far below u32::MAX");
+        }
+        assert_eq!(
+            token.attempt().get(),
+            attempt,
+            "the walk overshot — every fixture attempt must be reachable from FIRST"
+        );
+        token
+    }
+
     fn resume_record_sealed(attempt: u32, floor: SendFloor, seal: u8) -> ResumeRecord {
         ResumeRecord::new(
             Box::new([0x11u8; oxicrypt_ml_dsa::SK_LEN]),
@@ -1395,13 +1429,15 @@ mod tests {
             crate::dm::resume::CommittedRoot::from_bytes(
                 [0x33u8; crate::dm::ratchet::ROOT_KEY_LEN],
             ),
-            attempt,
+            crate::dm::resume::SealedReEst::seal(
+                fresh(attempt),
+                vec![seal; 256].into_boxed_slice(),
+            )
+            .expect("within MAX_FRAME_LEN"),
             floor,
             1_700_000_000_000,
             2,
-            vec![seal; 256].into_boxed_slice(),
         )
-        .expect("within MAX_FRAME_LEN")
     }
 
     /// The commit returns the bytes to emit, and only after the record is on
@@ -1430,7 +1466,7 @@ mod tests {
             .read_resume(&l)
             .expect("reads")
             .expect("a record was committed");
-        assert_eq!(stored.attempt(), 1);
+        assert_eq!(stored.attempt().get(), 1);
         assert_eq!(stored.send_floor(), SendFloor::new(4, 100));
         assert_eq!(
             stored.sealed_re_est(),
@@ -1465,7 +1501,7 @@ mod tests {
         // And the refusal wrote nothing: the stored record is untouched, which
         // a refusal that had already replaced the file would not leave.
         let stored = p.read_resume(&l).expect("reads").expect("still there");
-        assert_eq!(stored.attempt(), 1);
+        assert_eq!(stored.attempt().get(), 1);
         assert_eq!(stored.send_floor(), SendFloor::new(4, 100));
     }
 
@@ -1484,7 +1520,11 @@ mod tests {
             .expect("an unmoved floor was refused on a new attempt");
 
         assert_eq!(
-            p.read_resume(&l).expect("reads").expect("there").attempt(),
+            p.read_resume(&l)
+                .expect("reads")
+                .expect("there")
+                .attempt()
+                .get(),
             2
         );
     }
@@ -1594,7 +1634,11 @@ mod tests {
             "wrong error: {err:?}"
         );
         assert_eq!(
-            p.read_resume(&l).expect("reads").expect("there").attempt(),
+            p.read_resume(&l)
+                .expect("reads")
+                .expect("there")
+                .attempt()
+                .get(),
             5
         );
     }

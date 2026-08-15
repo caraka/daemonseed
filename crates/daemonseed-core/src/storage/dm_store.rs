@@ -191,8 +191,9 @@ const LOCK_FILE_NAME: &str = ".lock";
 /// **No longer a guess: the format exists and its worst case is computed.**
 /// [`crate::dm::resume::MAX_ENCODED_LEN`] is the arithmetic sum of every fixed
 /// field plus [`crate::dm::frame::MAX_FRAME_LEN`], which
-/// [`crate::dm::resume::ResumeRecord::new`] refuses to exceed — so it is a real
-/// ceiling rather than a typical case, and this constant is checked against it
+/// [`crate::dm::resume::SealedReEst::seal`] refuses to exceed and
+/// [`crate::dm::resume::ResumeRecord::decode`] re-checks before allocating — so
+/// it is a real ceiling rather than a typical case, and this constant is checked against it
 /// by the `const` assertion immediately below — not by a test, because both
 /// sides are `const` and a runtime assertion over two constants is a probe that
 /// cannot fire (`clippy::assertions_on_constants` says so). A field added to the
