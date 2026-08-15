@@ -809,7 +809,14 @@ modules:
       frame_kind || chan_id || dir || seq || eph_ek || intended_recipient_hash ||
       pk_pc || pk_lt || sent_unix_ms || body under daemonseed/dm/msg/sig/v6.
       derive_channel_roots(ss0) yields AR and chan_id; chan_id is never
-      serialized. DM_BODY_CAP caps a body at 8192 bytes; MAX_ENTRY_LEN is the
+      serialized. ar_fingerprint(AR) -> Result<[u8; AR_FINGERPRINT_LEN],
+      oxicrypt_module::Error> is SHA-384 of AR truncated to 32 bytes — a
+      non-secret conversation identifier, narrow error type so a caller can tell a
+      module fault from a mismatch. conversation_binding(ss0) derives AR and
+      fingerprints it in one call; a Ratchet carries the result and exposes it as
+      ar_fingerprint(). Taking ss0 rather than a fingerprint is deliberate: a
+      constructor accepting the fingerprint could be handed one from another
+      conversation, which is the defect (#270). DM_BODY_CAP caps a body at 8192 bytes; MAX_ENTRY_LEN is the
       dflt(32) subkey cap the PAD_BUCKETS ladder and POW_RESERVE are sized
       against. Sub-module dm::ratchet is the conversation key schedule:
       derive_root(ss0) expands daemonseed/dm/ratchet/root/v2 from the same
@@ -959,7 +966,11 @@ modules:
       seed, the page, and the stream. DmPageAddress::sending(AR, &Ratchet, page) and
       ::receiving(AR, &Ratchet, page) take the direction from the ratchet's own
       send_direction / recv_direction, so no call site names one; both refuse a page
-      above MAX_PAGE with DmPageError::PageBeyondSequenceSpace. page() and
+      above MAX_PAGE with DmPageError::PageBeyondSequenceSpace, and both refuse a
+      root whose conversation is not the ratchet's with
+      DmPageError::ConversationMismatch — the root is checked against
+      Ratchet::ar_fingerprint(). DmPageError::Module is kept distinct from
+      ConversationMismatch so a SHA fault is not reported as a crossed pair. page() and
       direction() read it; the owner seed is reached only through
       with_owner_seed(f), which runs f against the seed's bytes for the duration of
       that one call and returns f's value. The address itself is moved into a

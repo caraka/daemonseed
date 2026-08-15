@@ -3240,20 +3240,29 @@ mod tests {
         )
         .expect("derive identity keys");
         daemonseed_core::dm::ratchet::Ratchet::recipient(
-            &[0x5c; 32],
+            &PAGE_FIXTURE_SS0,
             Box::new(*eph.kem.encapsulation_key()),
         )
         .expect("open a recipient ratchet")
     }
 
+    /// The `ss0` the page fixtures share — the ratchet and the address root must
+    /// come from the same one, or the derivation refuses them (#270).
+    const PAGE_FIXTURE_SS0: [u8; 32] = [0x5c; 32];
+
     /// A byte-distinct address root, so a derivation that mis-sliced its input
     /// would not pass.
     fn page_address_root() -> [u8; paging::ADDRESS_ROOT_LEN] {
-        let mut root = [0u8; paging::ADDRESS_ROOT_LEN];
-        for (i, b) in root.iter_mut().enumerate() {
-            *b = 0xa7u8 ^ (i as u8).wrapping_mul(17).wrapping_add(0x2b);
-        }
-        root
+        // **Derived from the same `ss0` as `page_ratchet`, not invented (#270).**
+        // An address derivation refuses a root whose conversation is not the
+        // ratchet's, so a hand-made root beside a real ratchet is precisely the
+        // crossed pair that check exists to catch — it would fail here as a test
+        // failure rather than in production as a silent stall. `AR` is not
+        // invertible from a chosen value, so the fixture derives it.
+        let _ = oxicrypt_module::initialize();
+        daemonseed_core::dm::firstcontact::derive_channel_roots(&PAGE_FIXTURE_SS0)
+            .expect("derive the fixture conversation's roots")
+            .ar
     }
 
     /// A real derived sending address for `page`. Never hand-made: the seed inside

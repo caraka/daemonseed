@@ -42,6 +42,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use daemonseed_core::dm::firstcontact::derive_channel_roots;
 use daemonseed_core::dm::paging::{self, DmPageAddress, PagePosition};
 use daemonseed_core::dm::ratchet::{EphemeralDecapKey, Ratchet, Role};
 use daemonseed_core::identity::keys::{derive_identity_keys, Identity};
@@ -60,22 +61,28 @@ fn node_config(port: &str, dir: &std::path::Path) -> VeilidNetConfig {
     cfg
 }
 
-/// A fresh address root for this run.
+/// A fresh conversation secret for this run.
 ///
 /// Random per run, and that is load-bearing rather than hygiene: the page address
-/// is deterministic in the root and the record PERSISTS on the public DHT, so a
-/// fixed root would sweep a previous run's frames back and pass on stale bytes.
+/// is deterministic in `AR` and the record PERSISTS on the public DHT, so a fixed
+/// secret would sweep a previous run's frames back and pass on stale bytes.
 /// Entropy comes from a throwaway mnemonic-derived node seed — the crate already
 /// depends on that, and it saves pulling an RNG into the dev-deps.
-fn fresh_address_root() -> [u8; paging::ADDRESS_ROOT_LEN] {
+///
+/// **The randomness lives here rather than on the address root since #270.** The
+/// root and the ratchets must now descend from the same `ss0`, so randomising the
+/// root alone would produce exactly the crossed pair the derivation refuses; both
+/// are taken from this one value instead, which keeps per-run freshness and
+/// satisfies the binding.
+fn fresh_ss0() -> [u8; 32] {
     let throwaway =
         derive_identity_keys(&Mnemonic::generate().unwrap(), Identity::Primary).unwrap();
     let entropy = throwaway.veilid_node_seed.as_bytes();
-    let mut root = [0u8; paging::ADDRESS_ROOT_LEN];
-    for (dst, src) in root.iter_mut().zip(entropy.iter().cycle()) {
+    let mut ss0 = [0u8; 32];
+    for (dst, src) in ss0.iter_mut().zip(entropy.iter().cycle()) {
         *dst = *src;
     }
-    root
+    ss0
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -86,14 +93,18 @@ async fn frames_published_to_page_slots_sweep_back_in_the_slots_they_were_writte
     let base = std::env::temp_dir().join("daemonseed-veilid-net-dm-page-it");
     let _ = std::fs::remove_dir_all(&base);
 
-    let address_root = fresh_address_root();
+    // One conversation secret, from which BOTH the ratchets and the address root
+    // descend — the pairing #270 now enforces.
+    let ss0 = fresh_ss0();
+    let address_root = derive_channel_roots(&ss0)
+        .expect("derive this run's channel roots")
+        .ar;
 
     // The two parties' ratchets over one first-contact secret: A knocked, B was
     // knocked at. They exist here only to supply the *direction* each end addresses
     // with — `DmPageAddress` takes it from `send_direction` / `recv_direction`, which
     // is what makes A's sending stream and B's receiving stream provably the same
     // one rather than two hand-written constants that happen to match.
-    let ss0 = [0x3b; 32];
     let opening_eph =
         derive_identity_keys(&Mnemonic::generate().unwrap(), Identity::Primary).unwrap();
     let ratchet_a = Ratchet::initiator(

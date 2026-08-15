@@ -83,6 +83,10 @@ pub const RECIPIENT_HASH_LEN: usize = 48;
 /// Length of the derived roots (`AR`, `chan_id`).
 pub const ROOT_LEN: usize = 32;
 
+/// Width of the address-root fingerprint a ratchet carries as its conversation
+/// binding. See [`ar_fingerprint`].
+pub const AR_FINGERPRINT_LEN: usize = 32;
+
 /// Largest first-message body, in bytes.
 ///
 /// Deliberately far below the padding headroom: the entry has ~16 KB of fixed
@@ -350,6 +354,54 @@ pub fn recipient_hash(
     let mut out = [0u8; RECIPIENT_HASH_LEN];
     out.copy_from_slice(&digest[..RECIPIENT_HASH_LEN]);
     Ok(out)
+}
+
+/// A non-secret fingerprint of a conversation's address root `AR`.
+///
+/// **What it is for (#270).** [`crate::dm::paging::DmPageAddress`] takes an
+/// address root and a ratchet as two unbound arguments. Without something tying
+/// them together, a caller holding two channels whose local roles differ can
+/// resolve one conversation's root against the other's ratchet and get a valid,
+/// wrongly-directed address. Every frame is
+/// individually authenticated, so nothing is forged; the conversation simply
+/// stops progressing while every layer reports success, which is the expensive
+/// kind of silent. A ratchet carries this fingerprint so the address derivation
+/// can refuse the mismatch.
+///
+/// **A fingerprint rather than `AR` itself, deliberately.** `AR` derives page
+/// owner seeds, and under Veilid a derivable owner seed *is* write access to the
+/// conversation ([`crate::dm::paging`]). Storing `AR` on the ratchet would give
+/// that capability a second home; a hash compares just as well and is useless to
+/// anyone who obtains it.
+///
+/// Truncated exactly as [`recipient_hash`] truncates, and for the same reason:
+/// the full digest buys nothing here, and 32 bytes of SHA-384 is far past any
+/// collision concern for a value only ever compared for equality.
+/// Returns [`oxicrypt_module::Error`] rather than [`FirstContactError`] because
+/// SHA-384 is its only fallible step. A caller that must distinguish a module
+/// fault from a conversation mismatch — [`crate::dm::paging`] does — would
+/// otherwise have to destructure a wide enum and invent a branch for variants
+/// this function cannot return.
+pub fn ar_fingerprint(
+    address_root: &[u8; ROOT_LEN],
+) -> Result<[u8; AR_FINGERPRINT_LEN], oxicrypt_module::Error> {
+    let digest = sha384(address_root)?;
+    let mut out = [0u8; AR_FINGERPRINT_LEN];
+    out.copy_from_slice(&digest[..AR_FINGERPRINT_LEN]);
+    Ok(out)
+}
+
+/// The conversation binding a ratchet carries, derived from `ss0` in one call.
+///
+/// Takes `ss0` rather than `AR` on purpose: `ss0` **is** the conversation, so a
+/// ratchet built from it cannot be handed a binding belonging to a different
+/// one. Accepting a fingerprint as a constructor argument would reintroduce the
+/// unbound-arguments problem one level up, which is the whole defect.
+pub fn conversation_binding(
+    ss0: &[u8; SS0_LEN],
+) -> Result<[u8; AR_FINGERPRINT_LEN], FirstContactError> {
+    let roots = derive_channel_roots(ss0)?;
+    ar_fingerprint(&roots.ar).map_err(FirstContactError::Module)
 }
 
 /// Pad an encoded body to the smallest bucket that holds it. See

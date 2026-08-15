@@ -40,6 +40,16 @@ work lives in the project lead's vault manifest, not here.
   sealed bytes to emit; `read_resume` reads it back. `RESUME_CAPACITY` is now
   checked against a computed worst case rather than estimated.
 
+- `daemonseed_core::dm::paging` — a page address is checked against the ratchet's
+  conversation. `Ratchet` carries `ar_fingerprint()`, derived at construction from
+  the `ss0` it already takes, and `DmPageAddress::sending` / `::receiving` refuse a
+  root that does not match it with `DmPageError::ConversationMismatch`. Previously a
+  caller holding two channels could resolve one conversation's root against the
+  other's ratchet and receive a valid, wrongly-directed address; frames are
+  individually authenticated, so the conversation stopped progressing in silence
+  rather than anything being forged. `firstcontact::ar_fingerprint` and
+  `conversation_binding` are the derivation. (#270)
+
 - `daemonseed_core::dm::persist` — the wiring between the DM types and the
   store, so DM state is finally written. `DmPersist` derives both the store key
   and the provisional record's key from one at-rest key. `restart_channel`

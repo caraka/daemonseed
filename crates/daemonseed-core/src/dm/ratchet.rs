@@ -288,6 +288,14 @@ pub enum RatchetError {
     SkipTooLarge { requested: u64, max: usize },
     /// An ML-KEM or crypto-module operation failed at the module boundary.
     Module(oxicrypt_module::Error),
+    /// The conversation binding could not be derived from `ss0` (#270).
+    ///
+    /// Carries the first-contact error verbatim rather than flattening it: the
+    /// two failures reachable here are an HKDF fault deriving `AR` and a SHA
+    /// fault fingerprinting it, and collapsing them would hide which module is
+    /// unhealthy. Boxed to keep this enum small — every other variant is a word
+    /// or two, and `FirstContactError` is not.
+    ConversationBinding(Box<crate::dm::firstcontact::FirstContactError>),
     /// The OS entropy source failed while minting an ephemeral or an
     /// encapsulation.
     EntropySource,
@@ -351,6 +359,9 @@ impl std::fmt::Display for RatchetError {
                 "message skips {requested} keys ahead, more than the {max} one catch-up will derive"
             ),
             Self::Module(e) => write!(f, "crypto module unavailable: {e:?}"),
+            Self::ConversationBinding(e) => {
+                write!(f, "the conversation binding could not be derived: {e}")
+            }
             Self::EntropySource => write!(f, "the entropy source failed"),
             Self::MissingCiphertext { generation } => write!(
                 f,
@@ -964,6 +975,19 @@ pub struct Ratchet {
     /// from the skipped-key cache and that path returns before any ephemeral is
     /// recorded.
     consumed_peer_generation: Option<u32>,
+    /// This conversation's identity, as a non-secret fingerprint of `AR` (#270).
+    ///
+    /// `AR` and this ratchet's own `RK0` are two expands of one extraction over
+    /// `ss0`, so the ratchet computes this at construction without being handed
+    /// anything new — and, more to the point, without being handed anything it
+    /// could be handed *wrongly*. It exists so
+    /// [`crate::dm::paging::DmPageAddress`] can refuse an address root that
+    /// belongs to a different conversation, which it previously accepted in
+    /// silence.
+    ///
+    /// See [`crate::dm::firstcontact::ar_fingerprint`] for why it is a
+    /// fingerprint and not `AR`.
+    ar_fingerprint: [u8; crate::dm::firstcontact::AR_FINGERPRINT_LEN],
     gen_ct: Option<Box<[u8; ml_kem::CT_LEN]>>,
     next_send_seq: u64,
     skipped: SkippedKeys,
@@ -1013,6 +1037,8 @@ impl Ratchet {
             return Err(RatchetError::MismatchedEphemeral);
         }
         let root = derive_root(ss0)?;
+        let ar_fingerprint = crate::dm::firstcontact::conversation_binding(ss0)
+            .map_err(|e| RatchetError::ConversationBinding(Box::new(e)))?;
         let send = Chain {
             generation: 0,
             direction: Direction::AToB,
@@ -1035,6 +1061,7 @@ impl Ratchet {
             ephemerals,
             peer_eph: None,
             consumed_peer_generation: None,
+            ar_fingerprint,
             gen_ct: None,
             next_send_seq: FIRST_INITIATOR_CHANNEL_SEQ,
             skipped: SkippedKeys::new(),
@@ -1051,6 +1078,8 @@ impl Ratchet {
         peer_eph_ek: Box<[u8; ml_kem::EK_LEN]>,
     ) -> Result<Self, RatchetError> {
         let root = derive_root(ss0)?;
+        let ar_fingerprint = crate::dm::firstcontact::conversation_binding(ss0)
+            .map_err(|e| RatchetError::ConversationBinding(Box::new(e)))?;
         let recv = Chain {
             generation: 0,
             direction: Direction::AToB,
@@ -1067,11 +1096,27 @@ impl Ratchet {
             ephemerals: VecDeque::with_capacity(EPHEMERAL_WINDOW),
             peer_eph: Some((0, peer_eph_ek)),
             consumed_peer_generation: None,
+            ar_fingerprint,
             gen_ct: None,
             next_send_seq: FIRST_RECIPIENT_CHANNEL_SEQ,
             skipped: SkippedKeys::new(),
             abandoned: 0,
         })
+    }
+
+    /// This conversation's binding — the fingerprint of its address root `AR`.
+    ///
+    /// Exposed so [`crate::dm::paging::DmPageAddress`] can refuse a root from a
+    /// different conversation (#270). It is a hash, not a capability: see
+    /// [`crate::dm::firstcontact::ar_fingerprint`].
+    ///
+    /// Returned as raw bytes because its only use is an equality comparison. It
+    /// is not wrapped in a redacted newtype, and the honest reading of that is
+    /// that this value is *not serialized by us* rather than unreachable — a
+    /// caller holding a `&Ratchet` already holds the conversation's keys, so the
+    /// fingerprint escalates nothing, but nothing here stops it reaching a log.
+    pub fn ar_fingerprint(&self) -> &[u8; crate::dm::firstcontact::AR_FINGERPRINT_LEN] {
+        &self.ar_fingerprint
     }
 
     /// Which end of the conversation this is.
@@ -1400,6 +1445,69 @@ mod tests {
     ///
     /// **Generated from this implementation on 2026-07-31**, not from an external
     /// reference. These are change-detection vectors, not third-party validation.
+    /// The conversation binding is pinned to a byte string, and to the ratchet
+    /// that carries it.
+    ///
+    /// **The one derivation in this family that had no vector.** A review lens
+    /// found that switching `ar_fingerprint` from SHA-384 to SHA-256, changing the
+    /// truncation, or salting it left every test green — the value is never
+    /// serialized and only ever compared for equality, so nothing noticed. It is
+    /// in-memory and off the wire, so a change is not a compatibility break; it
+    /// would simply mean the two ends of a conversation could stop agreeing, which
+    /// is worth a pin of its own.
+    ///
+    /// The vectors are computed independently, from the spec rather than from this
+    /// code: HKDF-SHA384 extract under `daemonseed/dm/root/salt/v1`, expand
+    /// `daemonseed/dm/addr/root/v3` to 32 bytes, then SHA-384 truncated to 32.
+    #[test]
+    fn the_conversation_binding_is_pinned() {
+        let _ = oxicrypt_module::initialize();
+
+        for (ss0_tag, ar_hex, fp_hex) in [
+            (
+                0x5cu8,
+                "a09274ed70b9c17fb54e01ed0a550c677696c21fc034a60ea9e4235401e4324b",
+                "a279cc40dd623f9bebfa101d37a60119e2a81a11c2f78d87725e8715e8c041ce",
+            ),
+            (
+                0xa3,
+                "1272a771de7573b80f97f89f23796bfecb4a76aa6030e85c79bf160dada3f781",
+                "35e341d931c87152baff43c2cc71e58147701bc18fd43aabc47871cf5675bac9",
+            ),
+        ] {
+            let ss0 = [ss0_tag; 32];
+            let roots = crate::dm::firstcontact::derive_channel_roots(&ss0).unwrap();
+            assert_eq!(hex::encode(roots.ar), ar_hex, "AR moved for {ss0_tag:#04x}");
+            assert_eq!(
+                hex::encode(crate::dm::firstcontact::ar_fingerprint(&roots.ar).unwrap()),
+                fp_hex,
+                "the fingerprint of AR moved for {ss0_tag:#04x}"
+            );
+            assert_eq!(
+                hex::encode(crate::dm::firstcontact::conversation_binding(&ss0).unwrap()),
+                fp_hex,
+                "conversation_binding must agree with ar_fingerprint(derive_channel_roots(ss0).ar)"
+            );
+        }
+
+        // And the ratchet must actually carry it — both roles, since they set the
+        // field at two separate sites.
+        let ss0 = [0x5c; 32];
+        let expected = crate::dm::firstcontact::conversation_binding(&ss0).unwrap();
+        let recipient = Ratchet::recipient(&ss0, Box::new([0x11; ml_kem::EK_LEN])).unwrap();
+        assert_eq!(recipient.ar_fingerprint(), &expected);
+
+        let (ek, dk) = opening_ephemeral();
+        let initiator =
+            Ratchet::initiator(&ss0, Box::new(ek), EphemeralDecapKey::new(Box::new(dk))).unwrap();
+        assert_eq!(
+            initiator.ar_fingerprint(),
+            &expected,
+            "both roles of one conversation must bind identically, or a real \
+             conversation breaks"
+        );
+    }
+
     #[test]
     fn roots_from_one_ss0_are_pinned_siblings() {
         let _ = oxicrypt_module::initialize();

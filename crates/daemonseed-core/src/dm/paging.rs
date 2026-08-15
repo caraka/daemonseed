@@ -86,13 +86,22 @@
 //! handed a sending address does not compile, and the direction itself is taken
 //! from the ratchet's own accessors rather than from an argument.
 //!
-//! **The guarantee is relative to the ratchet passed in, and stops there.** The
-//! address root and the ratchet are two unbound arguments; nothing checks that the
-//! ratchet belongs to the conversation the root came from, so a caller holding two
-//! channels whose local roles differ can resolve one conversation's root against
-//! the other's ratchet and get a valid, wrongly-directed address — silently. See
-//! [`DmPageAddress`] for the shape of that mistake and where the structural fix is
-//! tracked.
+//! **The root and the ratchet must name the same conversation, and that is
+//! checked (#270).** They still arrive as two arguments, so the pairing is not
+//! structural — but a ratchet carries a fingerprint of its own address root
+//! ([`crate::dm::firstcontact::ar_fingerprint`]), and the derivation refuses a
+//! root that does not match it with [`DmPageError::ConversationMismatch`].
+//! Without that, a caller holding two channels whose local roles differ could
+//! resolve one conversation's root against the other's ratchet and receive a
+//! valid, wrongly-directed address — and every frame is individually
+//! authenticated, so nothing would be forged: the ratchet would simply never
+//! open them, and the conversation would stop progressing while every layer
+//! reported success. Silence is what made it worth a check.
+//!
+//! What remains open is the *result* side: a sweep returns positions carrying no
+//! conversation tag, so a caller fanning out over several correspondents still
+//! distinguishes results only by what it remembered about dispatch order. That
+//! shape belongs with the collector that consumes it (#236, #270).
 //!
 //! ## The collector must check where a message was found
 //!
@@ -173,6 +182,27 @@ pub enum DmPageError {
         /// The page that was asked for.
         page: u64,
     },
+    /// The address root and the ratchet name **different conversations** (#270).
+    ///
+    /// A caller holding two channels resolved one conversation's root against
+    /// the other's ratchet. Refused rather than served, because the address it
+    /// would produce is valid, wrongly directed, and silent: frames are
+    /// individually authenticated, so nothing is forged — the ratchet simply
+    /// never opens them and the conversation stops progressing while every layer
+    /// reports success.
+    ///
+    /// Carries nothing. Both fingerprints identify conversations, and putting
+    /// either in an error message would hand a log line a conversation
+    /// identifier that is deliberately never serialized.
+    ConversationMismatch,
+    /// SHA-384 failed while fingerprinting the address root — a crypto-module
+    /// condition, **not** a mismatch.
+    ///
+    /// Kept distinct from [`Self::ConversationMismatch`] on purpose: collapsing a
+    /// module fault into "wrong conversation" would report a healthy pair as
+    /// mismatched and send a reader hunting for a bookkeeping bug that does not
+    /// exist. The same conflation the DM store's open path is filed for (#253).
+    Module(oxicrypt_module::Error),
 }
 
 impl std::fmt::Display for DmPageError {
@@ -183,6 +213,11 @@ impl std::fmt::Display for DmPageError {
                 f,
                 "page {page} is above the highest page a sequence number can live on ({MAX_PAGE})"
             ),
+            Self::ConversationMismatch => write!(
+                f,
+                "the address root and the ratchet name different conversations"
+            ),
+            Self::Module(e) => write!(f, "fingerprinting the address root failed: {e}"),
         }
     }
 }
@@ -405,20 +440,27 @@ impl PageDirection for Receiving {
 /// so the role-to-direction mapping happens once, inside [`crate::dm::ratchet`],
 /// and a call site has no direction argument to get wrong.
 ///
-/// **The guarantee is stated relative to the ratchet argument, and it is worth
-/// being exact about that rather than claiming the mistake is impossible.**
-/// `address_root` and `ratchet` arrive as two unbound arguments, and nothing here
-/// checks that the ratchet belongs to the conversation the root came from. An
-/// application holding two channels whose local roles differ can resolve one
-/// conversation's root against the other's ratchet: the marker then reads the
-/// *other* ratchet's directions, so a [`DmPageAddress<Receiving>`](DmPageAddress)
-/// can name the first conversation's *sending* page. That address is valid, its
-/// sweep returns `Ok` with `found > 0`, and this end reads its own writes back
-/// forever — the failure the marker eliminates *within* a ratchet, reached by
-/// mispairing the two arguments instead. A root fingerprint carried in
-/// [`Ratchet`], which would let this constructor refuse the pair, is tracked as
-/// **#270** and deliberately not built here. Until then: take the root and the
-/// ratchet from the same conversation record, never from two lookups.
+/// **The root and the ratchet must name the same conversation, and this
+/// constructor now refuses the pair when they do not (#270).** They still arrive
+/// as two arguments, so the pairing is checked rather than structural — but a
+/// [`Ratchet`] carries a fingerprint of its own address root, and a root that
+/// does not match it is [`DmPageError::ConversationMismatch`].
+///
+/// Without that check, an application holding two channels whose local roles
+/// differ could resolve one conversation's root against the other's ratchet: the
+/// marker would read the *other* ratchet's directions, so a
+/// [`DmPageAddress<Receiving>`](DmPageAddress) could name the first
+/// conversation's *sending* page. That address is valid, its sweep returns `Ok`
+/// with `found > 0`, and this end reads its own writes back forever — the failure
+/// the marker eliminates *within* a ratchet, reached by mispairing the two
+/// arguments instead. Nothing is forged, because frames are individually
+/// authenticated; the conversation simply stops progressing in silence, which is
+/// what made it worth refusing rather than documenting.
+///
+/// **What is still open is the result side**, not this one: a sweep returns
+/// positions carrying no conversation tag, so a caller fanning out over several
+/// correspondents distinguishes results only by what it remembered about dispatch
+/// order. That shape belongs with the collector that consumes it (#236, #270).
 ///
 /// **Moved, not borrowed, and that is a constraint rather than a taste (#244).**
 /// The owner seed is the conversation's write *capability*: under Veilid a
@@ -485,6 +527,19 @@ impl<D: PageDirection> DmPageAddress<D> {
         // (ISC-C100) rather than as an ambiguity between shape and page.
         if page > MAX_PAGE {
             return Err(DmPageError::PageBeyondSequenceSpace { page });
+        }
+        // **The root and the ratchet must name the same conversation (#270).**
+        // They arrive as two unbound arguments, so without this a caller holding
+        // two channels whose local roles differ could resolve one conversation's
+        // root against the other's ratchet and receive a valid, wrongly-directed
+        // address. Frames are individually authenticated, so nothing is forged —
+        // the ratchet simply fails to open them, and the conversation stops
+        // progressing while every layer reports success. That silence is what
+        // makes it worth a check rather than a comment.
+        let offered =
+            crate::dm::firstcontact::ar_fingerprint(address_root).map_err(DmPageError::Module)?;
+        if &offered != ratchet.ar_fingerprint() {
+            return Err(DmPageError::ConversationMismatch);
         }
         let direction = D::of(ratchet);
         Ok(Self {
@@ -794,6 +849,9 @@ mod tests {
 
     // ---- the checked address -------------------------------------------------
 
+    /// The `ss0` every ratchet fixture in this module opens from.
+    const FIXTURE_SS0: [u8; 32] = [0x5c; 32];
+
     /// A recipient's ratchet, which is the cheap one to build: it takes only the
     /// PUBLIC half of the opening ephemeral, so no keygen is needed and the bytes
     /// are never inspected. Its role fixes both directions —
@@ -801,13 +859,116 @@ mod tests {
     /// exercises both markers.
     fn recipient_ratchet() -> Ratchet {
         let _ = oxicrypt_module::initialize();
-        Ratchet::recipient(&[0x5c; 32], Box::new([0x11; oxicrypt_ml_kem::EK_LEN]))
+        Ratchet::recipient(&FIXTURE_SS0, Box::new([0x11; oxicrypt_ml_kem::EK_LEN]))
             .expect("open a recipient ratchet")
     }
 
-    /// **The refactor did not move a single address.** Every assertion carries the
-    /// hex from `page_addresses_are_pinned` above — the same known-answer vectors,
-    /// reached through [`DmPageAddress`] instead of the raw derivation.
+    /// The binding works from an **initiator** ratchet too.
+    ///
+    /// Not redundant with the recipient cases: `Ratchet::initiator` and
+    /// `::recipient` set `ar_fingerprint` at two separate sites, and every
+    /// runnable address test in the workspace used a recipient — the only
+    /// initiator-paired ones are the `#[ignore]`d two-node tests. So zeroing the
+    /// initiator's assignment was caught by nothing that executes here. Found by
+    /// a review lens enumerating both constructors against all address call sites.
+    #[test]
+    fn an_initiator_ratchet_binds_its_conversation_too() {
+        let _ = oxicrypt_module::initialize();
+        // A real keypair: `initiator` refuses a mismatched opening ephemeral, and
+        // ML-KEM never reports a mismatch at decapsulation, which is why that
+        // check exists at all.
+        let mut d = [0u8; oxicrypt_ml_kem::SEED_LEN];
+        let mut z = [0u8; oxicrypt_ml_kem::SEED_LEN];
+        getrandom::fill(&mut d).expect("seed d");
+        getrandom::fill(&mut z).expect("seed z");
+        let (ek, dk) = oxicrypt_ml_kem::keygen(&d, &z).expect("opening ephemeral");
+        let init = Ratchet::initiator(
+            &FIXTURE_SS0,
+            Box::new(ek),
+            crate::dm::ratchet::EphemeralDecapKey::new(Box::new(dk)),
+        )
+        .expect("open an initiator ratchet");
+
+        assert!(
+            DmPageAddress::sending(&conversation_ar(), &init, 0).is_ok(),
+            "an initiator's own root must derive"
+        );
+        let other = crate::dm::firstcontact::derive_channel_roots(&[0xa3; 32])
+            .expect("derive another conversation's roots")
+            .ar;
+        assert!(
+            matches!(
+                DmPageAddress::sending(&other, &init, 0).unwrap_err(),
+                DmPageError::ConversationMismatch
+            ),
+            "an initiator must refuse a foreign root exactly as a recipient does"
+        );
+    }
+
+    /// A root from a *different* conversation, and the ratchet that owns it —
+    /// crossed, which is the mistake #270 is about.
+    #[test]
+    fn an_address_refuses_a_root_from_another_conversation() {
+        let r = recipient_ratchet();
+
+        // Positive control FIRST, so a blanket refusal cannot masquerade as the
+        // check working: the conversation's own root still derives an address.
+        assert!(
+            DmPageAddress::sending(&conversation_ar(), &r, 0).is_ok(),
+            "the ratchet's own root must still derive — otherwise the assertion \
+             below proves nothing but that everything is refused"
+        );
+
+        // A genuinely different conversation, derived rather than invented, so
+        // its root is a real `AR` and not merely 32 bytes that fail to match.
+        let other = crate::dm::firstcontact::derive_channel_roots(&[0xa3; 32])
+            .expect("derive another conversation's roots")
+            .ar;
+        assert_ne!(
+            other,
+            conversation_ar(),
+            "the fixture is degenerate: the two conversations share a root"
+        );
+
+        for crossed in [
+            DmPageAddress::<Sending>::sending(&other, &r, 0).unwrap_err(),
+            DmPageAddress::<Receiving>::receiving(&other, &r, 0).unwrap_err(),
+        ] {
+            assert!(
+                matches!(crossed, DmPageError::ConversationMismatch),
+                "a crossed root must be refused as a mismatch, not as {crossed:?}"
+            );
+        }
+    }
+
+    /// The address root of the conversation `recipient_ratchet` belongs to.
+    ///
+    /// **Necessary since #270**, and the reason is the point of that change: an
+    /// address derivation now refuses a root whose conversation is not the
+    /// ratchet's, so a fixture pairing an arbitrary `ar(tag)` with this ratchet
+    /// is exactly the mistake the check exists to catch. `AR` is not invertible
+    /// from a chosen value, so the fixture derives it from the same `ss0`.
+    fn conversation_ar() -> [u8; ADDRESS_ROOT_LEN] {
+        let _ = oxicrypt_module::initialize();
+        crate::dm::firstcontact::derive_channel_roots(&FIXTURE_SS0)
+            .expect("derive the fixture conversation's roots")
+            .ar
+    }
+
+    /// **Two independent paths must agree, and both are pinned.** Each assertion
+    /// checks the address type against a literal hex vector AND against
+    /// [`derive_owner_seed`] applied to the same root — so this catches both a
+    /// changed derivation and [`DmPageAddress::derive`] drifting away from the raw
+    /// function.
+    ///
+    /// The literals are **not** `page_addresses_are_pinned`'s. That test pins
+    /// `ar(0x41)`, an arbitrary root, and since #270 an address derivation refuses
+    /// a root that is not the ratchet's conversation — so the typed path can only
+    /// be exercised at this fixture's real `AR`. `page_addresses_are_pinned` is
+    /// untouched and remains the independent pin on the derivation itself; these
+    /// vectors were generated from that same derivation at the conversation's root,
+    /// which is why the equality against `derive_owner_seed` below is here rather
+    /// than the literals standing alone.
     ///
     /// This is the assertion that matters most in this file. A checked address type
     /// that quietly changed what it derives would move every conversation to
@@ -827,37 +988,34 @@ mod tests {
     /// matches and nothing in this file notices — while in production every page of
     /// a conversation would alias page 0's sixteen slots, message sixteen
     /// overwriting message zero with both ends agreeing and no error anywhere. The
-    /// page-1 vector is independently derived, so it is the value a lost page
+    /// page-1 vector is a different value from page 0's, so it is what a lost page
     /// argument cannot produce.
     #[test]
     fn the_address_type_derives_the_pinned_seed_for_its_stream() {
         let r = recipient_ratchet();
 
-        let sending = DmPageAddress::sending(&ar(0x41), &r, 0).expect("sending address");
-        let receiving = DmPageAddress::receiving(&ar(0x41), &r, 0).expect("receiving address");
+        let sending = DmPageAddress::sending(&conversation_ar(), &r, 0).expect("sending address");
+        let receiving =
+            DmPageAddress::receiving(&conversation_ar(), &r, 0).expect("receiving address");
 
         assert_eq!(
             sending.with_owner_seed(|b| hex::encode(b)),
-            "66b769ad77905d91ce4bc28618d0aa04231407af11930cf22119f24fef6eb47a",
-            "a recipient SENDS on b2a — this is `page_addresses_are_pinned`'s BToA \
-             vector, and a different value means the address graph moved"
+            "04cda3ed05b5f1122dc6ee42e8e12525e50079a8f52ed909c8cd986c37b7dcc0",
+            "a recipient SENDS on b2a — a different value means the address graph moved"
         );
         assert_eq!(
             receiving.with_owner_seed(|b| hex::encode(b)),
-            "f7188b50d26697b05a47ff6e8fa8f166a7a4af31397ccc5c46d0b393e5fca75b",
-            "a recipient RECEIVES on a2b — this is `page_addresses_are_pinned`'s \
-             AToB vector"
+            "8351d6b5f03a8e2d2034cbc3d937f05a1599f0c2c579452729419e141115cece",
+            "a recipient RECEIVES on a2b"
         );
 
-        // Page ONE, through the same type: `page_addresses_are_pinned`'s AToB page-1
-        // vector, which is what the address must reach when it is asked for page 1
-        // rather than what page 0 happens to derive.
-        let page_one = DmPageAddress::receiving(&ar(0x41), &r, 1).expect("page-1 address");
+        // Page ONE, through the same type: what the address must reach when it is
+        // asked for page 1 rather than what page 0 happens to derive.
+        let page_one = DmPageAddress::receiving(&conversation_ar(), &r, 1).expect("page-1 address");
         assert_eq!(
             page_one.with_owner_seed(|b| hex::encode(b)),
-            "c39002df0dfb6a6c65f8d9d0d7023743f0ac593c82516e4403b07fc1d3ec06fa",
-            "the address must carry its PAGE into the derivation — this is \
-             `page_addresses_are_pinned`'s AToB page-1 vector, and a page argument \
+            "4729e1190f0c03eff611394d05348a7e0fd806f13460425def3f1bdf8a1b5b7b",
+            "the address must carry its PAGE into the derivation — a page argument \
              dropped on the way to `derive_owner_seed` yields page 0's instead"
         );
         assert_ne!(
@@ -865,6 +1023,45 @@ mod tests {
             receiving.with_owner_seed(|b| *b),
             "page 1 and page 0 of one stream must be different records"
         );
+
+        // **The second path.** The literals above pin the derivation; these pin
+        // that the TYPE still reaches it. Both reviews of #270 found that moving
+        // this fixture to the conversation's own `AR` had silently cost the
+        // two-path agreement — the constants stopped matching
+        // `page_addresses_are_pinned`, so the test compared the address type only
+        // to values generated from the address type. Asserting against
+        // `derive_owner_seed` directly restores what was lost: a `derive` that
+        // drifted from the raw function now fails here even if someone
+        // regenerated the literals to match it.
+        let ar = conversation_ar();
+        for (label, addr_hex, dir, page) in [
+            (
+                "sending/BToA/0",
+                sending.with_owner_seed(|b| hex::encode(b)),
+                Direction::BToA,
+                0u64,
+            ),
+            (
+                "receiving/AToB/0",
+                receiving.with_owner_seed(|b| hex::encode(b)),
+                Direction::AToB,
+                0,
+            ),
+            (
+                "receiving/AToB/1",
+                page_one.with_owner_seed(|b| hex::encode(b)),
+                Direction::AToB,
+                1,
+            ),
+        ] {
+            let raw = derive_owner_seed(&ar, dir, page)
+                .expect("the raw derivation must succeed for the fixture root");
+            assert_eq!(
+                addr_hex,
+                hex::encode(raw.as_bytes()),
+                "{label}: the address type diverged from `derive_owner_seed`"
+            );
+        }
 
         assert_eq!(sending.direction(), Direction::BToA);
         assert_eq!(receiving.direction(), Direction::AToB);
@@ -884,8 +1081,8 @@ mod tests {
     fn sending_and_receiving_address_different_records() {
         let r = recipient_ratchet();
         for page in [0u64, 1, 4_096] {
-            let s = DmPageAddress::sending(&ar(0x41), &r, page).unwrap();
-            let v = DmPageAddress::receiving(&ar(0x41), &r, page).unwrap();
+            let s = DmPageAddress::sending(&conversation_ar(), &r, page).unwrap();
+            let v = DmPageAddress::receiving(&conversation_ar(), &r, page).unwrap();
             assert_ne!(
                 s.with_owner_seed(|b| *b),
                 v.with_owner_seed(|b| *b),
@@ -953,16 +1150,16 @@ mod tests {
         let r = recipient_ratchet();
         for page in [MAX_PAGE + 1, u64::MAX] {
             assert_eq!(
-                DmPageAddress::sending(&ar(0x41), &r, page).unwrap_err(),
+                DmPageAddress::sending(&conversation_ar(), &r, page).unwrap_err(),
                 DmPageError::PageBeyondSequenceSpace { page },
             );
             assert_eq!(
-                DmPageAddress::receiving(&ar(0x41), &r, page).unwrap_err(),
+                DmPageAddress::receiving(&conversation_ar(), &r, page).unwrap_err(),
                 DmPageError::PageBeyondSequenceSpace { page },
             );
         }
-        assert!(DmPageAddress::sending(&ar(0x41), &r, MAX_PAGE).is_ok());
-        assert!(DmPageAddress::receiving(&ar(0x41), &r, MAX_PAGE).is_ok());
+        assert!(DmPageAddress::sending(&conversation_ar(), &r, MAX_PAGE).is_ok());
+        assert!(DmPageAddress::receiving(&conversation_ar(), &r, MAX_PAGE).is_ok());
     }
 
     /// The address wraps the conversation's write capability, so it must not render
@@ -981,7 +1178,7 @@ mod tests {
     #[test]
     fn an_address_does_not_render_its_seed() {
         let r = recipient_ratchet();
-        let addr = DmPageAddress::receiving(&ar(0x41), &r, 7).unwrap();
+        let addr = DmPageAddress::receiving(&conversation_ar(), &r, 7).unwrap();
         let rendered = format!("{addr:?}");
         assert_eq!(
             rendered,
