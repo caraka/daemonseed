@@ -4,7 +4,7 @@
 //! ## Why this is not `write` + `rename`
 //!
 //! The tmp-sibling-plus-rename idiom already in this tree — see
-//! [`super::fetched::FetchedStore::persist_manifest`] — is **crash-atomic but not
+//! [`super::fetched::StagingArea::persist_manifest`] — is **crash-atomic but not
 //! power-loss-durable**. `rename(2)` is atomic with respect to a concurrent
 //! reader, so a crash can never expose a half-written file; but neither the
 //! file's data nor the directory entry that names it is guaranteed to have
@@ -19,7 +19,7 @@
 //! bytes to land together, so that a crash can never pair a committed root with
 //! a stale attempt. A lost or zero-filled record breaks exactly that pairing.
 //!
-//! So [`replace_atomically`] adds the two missing barriers:
+//! So `replace_atomically` adds the two missing barriers:
 //!
 //! ```text
 //!   create each missing ancestor, fsync(its parent)  <- the directory is durable
@@ -53,7 +53,7 @@
 //! state. A9 names `flock` as the cross-process exclusion, and [`FileLock`]
 //! provides it. The lock is advisory and separate from the replacement itself —
 //! a caller performing a read-modify-write critical section must hold it across
-//! *both* halves, which is why it is not taken inside [`replace_atomically`]:
+//! *both* halves, which is why it is not taken inside `replace_atomically`:
 //! taking it there would serialize the write while leaving the far more
 //! dangerous read-then-write window wide open, and would read as safe.
 //!
@@ -77,7 +77,7 @@
 //!
 //! The guarantee is the same as on Unix, reached by a different route. A
 //! directory cannot be opened as a file there, so barrier 2 has nothing to
-//! `fsync` and [`RealDurability::sync_dir`] is a no-op. The durability is
+//! `fsync` and `RealDurability::sync_dir` is a no-op. The durability is
 //! instead requested as part of the replacement itself:
 //! [`daemonseed_sys::replace_durably`] passes `MOVEFILE_WRITE_THROUGH`
 //! alongside `MOVEFILE_REPLACE_EXISTING`, so the directory entry has reached

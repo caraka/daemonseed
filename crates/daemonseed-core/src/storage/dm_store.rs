@@ -13,7 +13,7 @@
 //! so two processes that both read a record, both decide, and both write,
 //! silently lose one decision — the cardinal silent-send-loss the single-writer
 //! discipline exists to prevent. Taking the lock inside
-//! [`super::atomic_file::replace_atomically`] would serialize the write half and
+//! `super::atomic_file::replace_atomically` would serialize the write half and
 //! leave that read-then-write window wide open, while *reading* as safe; its own
 //! module docs say so and decline to take it. So the lock is taken here, and
 //! every mutation lives on the guard it hands out:
@@ -48,14 +48,14 @@
 //! kind, [`Locked::replace`] pads every payload out to it and refuses anything
 //! that will not fit, and [`Locked::read`] strips the padding again. The true
 //! length travels in a length prefix *inside* the sealed plaintext (the
-//! [`crate::dm::LEN_PREFIX`] convention, shared with the frame paddings) — put
+//! `crate::dm::LEN_PREFIX` convention, shared with the frame paddings) — put
 //! outside it, the prefix would hand back the exact length the padding was
 //! there to hide.
 //!
 //! ## What the store does and does not protect
 //!
 //! Every kind except [`RecordKind::ReceiveCursor`] is sealed with
-//! [`seal_envelope`] before it reaches the disk, so the store holds opaque bytes
+//! `seal_envelope` before it reaches the disk, so the store holds opaque bytes
 //! (ISC-A-C6). The AAD binds the record kind and the correspondence label, so a
 //! blob lifted from one slot cannot be replayed into another — the key is
 //! per-*profile*, exactly as [`crate::dm::provisional::derive_seal_key`]'s is,
@@ -63,8 +63,8 @@
 //! interchangeable ciphertext.
 //!
 //! **One key, random nonces, and no bound on the number of seals.**
-//! [`derive_store_key`] produces a single AES-256-GCM key per profile, and
-//! [`seal_envelope`] draws a fresh random 96-bit nonce for every record it
+//! `derive_store_key` produces a single AES-256-GCM key per profile, and
+//! `seal_envelope` draws a fresh random 96-bit nonce for every record it
 //! writes. That key covers every correspondence and every record kind for the
 //! whole life of the profile, and nothing anywhere counts the seals. Random
 //! 96-bit nonces collide on the birthday bound, so the standard guidance is to
@@ -581,7 +581,7 @@ impl DmStore {
     /// with a lifetime of its own.
     ///
     /// **The sweep is not under any lock, and does not need to be.** It removes
-    /// only names containing [`TMP_INFIX`], and a live writer's sibling has a
+    /// only names containing `TMP_INFIX`, and a live writer's sibling has a
     /// CSPRNG suffix no other process can predict; removing one under a
     /// concurrent writer would cost that writer its in-flight write, reported as
     /// [`AtomicReplaceError::NotLanded`] or `Indeterminate`, never a committed
@@ -630,7 +630,7 @@ impl DmStore {
     /// without any key, and it is supposed to name established correspondences
     /// rather than every label that was ever looked up.
     ///
-    /// **Why no lock is needed.** [`super::atomic_file::replace_atomically`]
+    /// **Why no lock is needed.** `super::atomic_file::replace_atomically`
     /// commits with `rename(2)`, which is atomic: a concurrent writer swaps one
     /// whole file for another, so this read returns either the complete old
     /// record or the complete new one. There is no interleaving to exclude, and

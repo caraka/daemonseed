@@ -50,7 +50,7 @@
 //! ## Whose record this is
 //!
 //! The initiator's. § v5 (V4-2) names it verbatim — `{ss0, A's opening ephemeral
-//! DK}` — and [`ProvisionalRecord::into_ratchet`] is the one construction path
+//! DK}` — and `ProvisionalRecord::into_ratchet` is the one construction path
 //! from it. The recipient's half of § v4 4.1 (`PK_pc_A`, the peer pseudonym it
 //! must verify frames against) is **not** here and is not recomputable from
 //! `ss0`; its home is the ISC-C44 contact cache, which holds "long-term +
@@ -85,7 +85,7 @@
 //! halves to each other, and nothing bound either of them to `ss0`. A record
 //! splicing one channel's `ss0` onto another's ephemeral therefore passed
 //! [`ProvisionalRecord::new`], [`ProvisionalRecord::open`] and
-//! [`ProvisionalRecord::into_ratchet`], and then failed every reply forever with
+//! `ProvisionalRecord::into_ratchet`, and then failed every reply forever with
 //! `UnknownEphemeral` — the silent death this module exists to abolish,
 //! reintroduced by the record meant to prevent it. The tag is a short HKDF output
 //! over `ss0` and the opening ephemeral under [`domain::DM_PROVISIONAL_BIND`],
@@ -398,13 +398,13 @@ fn tags_match(a: &[u8; BINDING_TAG_LEN], b: &[u8; BINDING_TAG_LEN]) -> bool {
 /// a second live copy of the one secret the newtype exists to keep down to one.
 /// Every field here destroys itself — `ss0` is [`Zeroizing`], `eph_dk` is a
 /// zeroize-on-drop newtype — so the container needs none, and
-/// [`Self::into_ratchet`] moves both halves straight through.
+/// `Self::into_ratchet` moves both halves straight through.
 ///
 /// **What that trade actually buys, stated precisely.** The old container `Drop`
 /// wiped `ss0`'s slot on *every* path, because it forbade partial moves and so
 /// there was no path where the slot was not still the owner. [`Zeroizing`] wipes
 /// only whichever slot still owns the value when it drops, so after
-/// [`Self::into_ratchet`] the source slot is a moved-from `[u8; N]` — `Copy`,
+/// `Self::into_ratchet` the source slot is a moved-from `[u8; N]` — `Copy`,
 /// no destructor — whose bytes remain in that frame until it is reused. The trade
 /// is still right, and the reason is **aliasing, not residue**: one live copy
 /// that leaves a moved-from shadow is better than two live copies each wiped at

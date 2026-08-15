@@ -44,7 +44,7 @@
 //! store's API refuses to let anyone spell, re-offered one layer up.
 //!
 //! None of the calls here nests inside another, so
-//! [`DmStoreError::Reentrant`](crate::storage::dm_store::DmStoreError::Reentrant)
+//! [`DmStoreError::Reentrant`]
 //! is not reachable through this module's own composition — the restart path
 //! reads without the lock and [`PendingHandshake::establish`] takes it afterwards,
 //! rather than inside it.
@@ -732,7 +732,7 @@ impl PendingHandshake<'_> {
     /// file inside a single critical section.
     ///
     /// The failure stays legible rather than silent: an interrupted erase reads
-    /// as [`DmStoreError::ErasureInterrupted`](crate::storage::dm_store::DmStoreError::ErasureInterrupted)
+    /// as [`DmStoreError::ErasureInterrupted`]
     /// and never as tampering, and [`DmPersist::restart_channel`] maps it to a
     /// lost record rather than an unreadable store, so the caller is told the
     /// handshake is gone instead of being told to keep waiting for it.

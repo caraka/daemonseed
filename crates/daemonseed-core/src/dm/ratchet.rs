@@ -55,7 +55,7 @@
 //! kept. [`SkippedKeys`] keeps them, bounded.
 //!
 //! **Two separate bounds, and conflating them is a real defect.** [`MAX_SKIP`] is
-//! how far a *single* [`skip`] call will reach — the frozen design's per-direction
+//! how far a *single* `skip` call will reach — the frozen design's per-direction
 //! limit. [`SKIPPED_KEY_CAPACITY`] is how many keys the cache holds at once, and
 //! it is deliberately **twice** `MAX_SKIP`, because processing one message across
 //! a ratchet generation change is *two* skip batches: first to the end of the
@@ -151,7 +151,7 @@ pub const CHAIN_KEY_LEN: usize = 32;
 /// Length of a message key — an AES-256 key.
 pub const MESSAGE_KEY_LEN: usize = 32;
 
-/// How far a single [`skip`] call will reach along one chain.
+/// How far a single `skip` call will reach along one chain.
 ///
 /// A frozen-design contract, not a tuning knob: the design builds its accepted
 /// residual around exactly this number ("a burst of more than 64 out-of-order
@@ -639,7 +639,7 @@ impl SkippedKeys {
         self.entries.push_back((slot, key));
     }
 
-    /// Store a batch of keys, as returned by [`skip`].
+    /// Store a batch of keys, as returned by `skip`.
     pub fn insert_all(&mut self, keys: impl IntoIterator<Item = (KeySlot, MessageKey)>) {
         for (slot, key) in keys {
             self.insert(slot, key);

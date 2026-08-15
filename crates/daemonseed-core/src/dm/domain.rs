@@ -41,7 +41,7 @@ pub const DM_KEYREC_SALT: &[u8] = b"daemonseed/dm/keyrec/salt/v1";
 /// holding the pubkey computes the address. FROZEN.
 pub const DM_KEYREC_OWNER: &[u8] = b"daemonseed/dm/keyrec/owner/v1";
 
-/// Signature domain for [`crate::dm::keyrec::DmKeyRecord`]'s inner ML-DSA-87
+/// Signature domain for the [`crate::dm::keyrec`] record's inner ML-DSA-87
 /// signature. FROZEN.
 pub const DM_KEYREC_SIG: &[u8] = b"daemonseed/dm/keyrec/sig/v1";
 

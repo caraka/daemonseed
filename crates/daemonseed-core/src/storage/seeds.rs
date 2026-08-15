@@ -1226,7 +1226,7 @@ pub fn seal_under(
 /// The serialized plaintext buffer is held in [`Zeroizing`], so it is wiped on
 /// every path out of this function — the success path, the AEAD error path, and an
 /// unwind out of either. That wipe now covers the whole buffer's history rather
-/// than only its final state: [`Seeds::to_plaintext`] reserves its capacity up
+/// than only its final state: `Seeds::to_plaintext` reserves its capacity up
 /// front and writes into it, so the payload is never copied to a second block and
 /// the per-field `hex::encode` + `format!` transients are gone (#263). What
 /// remains outside its reach is stated on `to_plaintext` itself — the ciphertext

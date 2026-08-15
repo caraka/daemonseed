@@ -289,7 +289,7 @@ pub fn derive_owner_seed(
 /// Build the domain-separated signing preimage.
 ///
 /// Every variable-length field is length-prefixed (`u64` big-endian length ‖
-/// bytes), matching [`crate::room_message::provenance_input`] and
+/// bytes), matching `crate::room_message::provenance_input` and
 /// `share_announce::push_lp`, so the concatenation is unambiguous and no pair of
 /// adjacent fields can be re-split to forge a different tuple. Integers are
 /// big-endian for the same consistency.
