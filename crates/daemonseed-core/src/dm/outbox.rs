@@ -2462,6 +2462,58 @@ mod tests {
 
     // ---------------------------------------------------------------- the ack
 
+    /// A teardown must not downgrade a **confirmed collection** to undelivered.
+    ///
+    /// **The existing terminal-entry test cannot see this.**
+    /// `a_teardown_does_not_re_report_a_terminal_entry` reaches its terminal state
+    /// through the give-up sweep, so both `Undelivered` and `ConfirmedCollected`
+    /// are "not pending" but only the first is ever exercised. A guard narrowed
+    /// from `!is_pending()` to `matches!(.., Undelivered)` therefore passes the
+    /// whole suite while re-ending a proven collection as undelivered — telling
+    /// the user a message failed that the peer demonstrably received, and
+    /// unrecoverably, since `settle_from_ack` only revisits `AwaitingCollection`.
+    ///
+    /// Found by a review lens on the #261 work; the gap predates it and outlives
+    /// its revert, so it is closed on its own.
+    #[test]
+    fn a_teardown_does_not_downgrade_a_confirmed_collection() {
+        let mut ob = sealed_outbox();
+        let mut ack = AckState::new();
+        ack.collect(1).unwrap();
+        assert_eq!(
+            ob.settle_from_ack(&ack, T0),
+            vec![1],
+            "the fixture must actually reach ConfirmedCollected, or this proves nothing"
+        );
+        // The ack owes the user a notice; consume it, so that a re-surfacing by
+        // the teardown shows up as a fresh one rather than hiding behind the flag
+        // the ack already set. `owed_surfacings` only reports — `record_surfaced`
+        // is what clears.
+        assert_eq!(ob.owed_surfacings(), vec![1]);
+        ob.record_surfaced(&[1]);
+        assert!(
+            ob.owed_surfacings().is_empty(),
+            "the fixture must start the teardown owing nothing, or the final \
+             assertion cannot tell a re-owed notice from the ack's own"
+        );
+
+        let outcome = ob.channel_torn_down(&TeardownCause::NoProvisionalRecord, T0);
+        assert!(
+            outcome.surfaced.is_empty() && outcome.retained.is_empty(),
+            "a teardown touched an entry that was already confirmed collected"
+        );
+        assert_eq!(
+            ob.entry(1).unwrap().delivery_state(),
+            DeliveryState::ConfirmedCollected,
+            "a proven collection was downgraded — the user would be told a message \
+             failed that the peer demonstrably received"
+        );
+        assert!(
+            ob.owed_surfacings().is_empty(),
+            "the teardown re-owed a notice for an entry it should not have touched"
+        );
+    }
+
     /// A live entry the ack settles is confirmed collected.
     #[test]
     fn a_verified_ack_confirms_a_live_entry() {
