@@ -40,6 +40,12 @@ work lives in the project lead's vault manifest, not here.
   sealed bytes to emit; `read_resume` reads it back. `RESUME_CAPACITY` is now
   checked against a computed worst case rather than estimated.
 
+- Re-keyed the write funnel's FIFO and coalescing scope onto the owner's public
+  key at every enqueue site, through one `funnel_record_key` helper; four sites
+  still passed the raw owner seed while the DM page site used the public key. The
+  mapping is injective and all four moved together, so no coalescing group
+  changes. (#256)
+
 - `daemonseed_core::dm::paging` — a page address is checked against the ratchet's
   conversation. `Ratchet` carries `ar_fingerprint()`, derived at construction from
   the `ss0` it already takes, and `DmPageAddress::sending` / `::receiving` refuse a

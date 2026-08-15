@@ -1210,7 +1210,7 @@ async fn actor_loop(
                 // Per-record FIFO in the funnel + the receiver's sent_unix_ms sort
                 // (#105/#126) preserve ordering.
                 sched.enqueue(WriteRequest {
-                    record: owner_seed,
+                    record: funnel_record_key(&owner_seed),
                     class: WriteClass::Chat,
                     kind: WriteKind::Ring,
                     deadline: None,
@@ -1232,7 +1232,7 @@ async fn actor_loop(
                 // key record per owner seed, so the coalescing key `(record, id)`
                 // collapses to the record — which is the intended behaviour.
                 sched.enqueue(WriteRequest {
-                    record: owner_seed,
+                    record: funnel_record_key(&owner_seed),
                     class: WriteClass::Keepalive,
                     kind: WriteKind::CurrentState {
                         logical_id: "dm-keyrec".to_string(),
@@ -1390,7 +1390,7 @@ async fn actor_loop(
                 // it never blocks chat, and dispatches through the record's `record_lock`.
                 let (class, kind) = boundary.classify(stable_id.clone());
                 sched.enqueue(WriteRequest {
-                    record: owner_seed,
+                    record: funnel_record_key(&owner_seed),
                     class,
                     kind,
                     deadline: None,
@@ -2247,6 +2247,44 @@ fn dm_page_place_swept(
         .collect()
 }
 
+/// The funnel's FIFO and coalescing scope for a record: the owner's **public
+/// key**, never the seed (#244, #256).
+///
+/// **One function so the keyspace cannot go heterogeneous by copy-paste.** The
+/// scope needs *injectivity*, not the secret. The public key supplies it at least
+/// as precisely — it is what the record's DHT address derives from, so two seeds
+/// sharing a public key would be one record and belong in one queue anyway — and
+/// it is a total 32-byte function of the seed (VLD0 is Ed25519), so it fits
+/// `schedule::RecordId` with no fallible step on the enqueue path.
+///
+/// The mapping is **injective** — not bijective, since Ed25519 derivation clamps
+/// and the image is not all of `[u8; 32]`, but surjectivity is never what the
+/// argument uses — so re-keying an existing class changes no coalescing group:
+/// every request that shared a key still shares one, and every request that did
+/// not still does not. That is what makes this safe to apply to the live chat,
+/// presence and advert paths rather than only to new ones.
+///
+/// **Injectivity alone is not the whole safety argument, and the missing premise
+/// is the one a future enqueue site could break.** It preserves partitions
+/// *within* a set that moves together, which is why all four seed-keyed sites had
+/// to move in one change rather than one at a time. It says nothing about whether
+/// the moved set now collides with the site that was already keyed on a public
+/// key. It does not: DM page owner seeds derive under their own HKDF domain, so a
+/// merge would require a page seed's public key to equal another class's raw
+/// seed — a preimage coincidence, strictly harder than the seed equality the
+/// pre-change keyspace needed. The change therefore cannot create a merge. A new
+/// site keyed on a seed would reopen exactly that gap, which is what the
+/// source-level probe in this module's tests is for.
+///
+/// The hazard it removes is specific. `WriteRequest.record` is both the FIFO
+/// ordering scope and the coalescing scope, so a new enqueue site keyed on the
+/// seed while its neighbour keys on the public key would **split one record's
+/// FIFO into two queues** — per-record single-flight and write ordering both
+/// lost, with `Ok(())` on every surface.
+fn funnel_record_key(owner_seed: &[u8; 32]) -> [u8; 32] {
+    identity::rendezvous_owner_public_bytes(owner_seed)
+}
+
 /// Build the funnel request for one channel-frame publish.
 ///
 /// Class-1 `Chat`, `Ring` kind — never coalesced, never dropped (WB-ISC-11). A DM
@@ -2275,18 +2313,9 @@ fn dm_page_write_request(
     frame: Vec<u8>,
     reply: oneshot::Sender<Result<()>>,
 ) -> WriteRequest<ProdWrite> {
-    // The FIFO/coalescing scope is the owner's PUBLIC key, never the seed (#244) —
-    // the same substitution the open cache and the record locks already made. The
-    // scope needs INJECTIVITY, not the secret, and the public key supplies it at
-    // least as precisely: it is what the record's DHT address derives from, so two
-    // seeds sharing a public key would be one record and belong in one queue
-    // anyway. It is public by construction, being the record's identity on the
-    // network, and it is a total 32-byte function of the seed — VLD0 is Ed25519 —
-    // so it fits `schedule::RecordId` with no fallible step on the enqueue path.
-    //
-    // Nothing else in the funnel needs changing for that: `RecordId` is opaque to
-    // the scheduler, which only ever compares and hashes it.
-    let record = address.with_owner_seed(identity::rendezvous_owner_public_bytes);
+    // Scope rationale lives on `funnel_record_key`; `RecordId` is opaque to the
+    // scheduler, which only ever compares and hashes it.
+    let record = address.with_owner_seed(funnel_record_key);
     WriteRequest {
         record,
         class: WriteClass::Chat,
@@ -2725,7 +2754,7 @@ async fn publish_one_advert(
     // still runs on failure.
     let (reply_tx, reply_rx) = oneshot::channel();
     sched.enqueue(WriteRequest {
-        record: advert.owner_seed,
+        record: funnel_record_key(&advert.owner_seed),
         class: WriteClass::AdvertRefresh,
         kind: WriteKind::CurrentState {
             logical_id: share_id.to_owned(),
@@ -3605,6 +3634,90 @@ mod tests {
             seed, expected_seed,
             "the record the actor opens must be the record the address named"
         );
+    }
+
+    /// Every funnel enqueue keys on the helper, and none on a raw seed (#256).
+    ///
+    /// **A source-level probe, because the behavioural one cannot reach here.**
+    /// The four re-keyed enqueue sites are inside `actor_loop`, so no unit test
+    /// constructs them; the sibling test below pins the helper's contract and is
+    /// blind to a single site reverted to `record: owner_seed`. That reversion is
+    /// the exact failure this change exists to prevent — it splits one record's
+    /// FIFO into two queues, with `Ok(())` on every surface — so it needs a probe
+    /// that can see it.
+    ///
+    /// The instrument is the one this file already uses for
+    /// `both_page_paths_open_the_record_through_one_shape`: read the production
+    /// half of the source and count. Brittle on purpose — a new enqueue site is
+    /// supposed to make someone look at this number and decide, which is the
+    /// review moment the copy-paste hazard needs.
+    #[test]
+    fn every_funnel_enqueue_keys_on_the_helper() {
+        let src = include_str!("actor.rs");
+        let (prod, _) = src
+            .split_once("#[cfg(test)]")
+            .expect("the tests-module marker moved");
+
+        // Assembled from fragments so this test's own source does not count as a
+        // match — the same trick the shape probe uses.
+        let keyed: String = ["record: funnel_record", "_key("].concat();
+        assert_eq!(
+            prod.matches(keyed.as_str()).count(),
+            4,
+            "exactly four enqueue sites set `record:` through the helper. A different \
+             count means an enqueue site was added, removed, or keyed another way — \
+             decide which, then update this number"
+        );
+
+        // The negative half: no raw-seed key survives anywhere in production.
+        for raw in [
+            ["record: owner", "_seed"].concat(),
+            ["record: advert.owner", "_seed"].concat(),
+        ] {
+            assert_eq!(
+                prod.matches(raw.as_str()).count(),
+                0,
+                "a funnel enqueue keys on the raw seed again ({raw}) — that splits one \
+                 record's FIFO into two queues and reports Ok() on every surface"
+            );
+        }
+
+        // Positive control: the needles are real. If the fragments ever stop
+        // matching anything at all, the assertions above pass vacuously.
+        assert!(
+            prod.contains(["funnel_record", "_key"].concat().as_str()),
+            "the helper's name is not in the production source — this probe is \
+             matching nothing and its zero-counts prove nothing"
+        );
+    }
+
+    /// The funnel key is the public key, and the mapping is injective (#256).
+    ///
+    /// **Honest scope: this pins the helper, not the call sites.** The four
+    /// re-keyed enqueue sites live inside the actor loop and no unit test reaches
+    /// them; what makes them consistent is that they all call `funnel_record_key`,
+    /// which is a structural property a reader checks, not one this test proves.
+    /// What it does prove is the contract every one of them depends on — that the
+    /// key is not the seed, and that distinct seeds stay distinct, which is what
+    /// keeps each record's FIFO a single queue.
+    #[test]
+    fn the_funnel_key_is_the_public_key_and_stays_injective() {
+        let a = [0x11u8; 32];
+        let b = [0x12u8; 32];
+
+        assert_ne!(
+            funnel_record_key(&a),
+            a,
+            "the funnel key must not be the seed — keying on the secret is what #244 removed"
+        );
+        assert_eq!(
+            funnel_record_key(&a),
+            identity::rendezvous_owner_public_bytes(&a),
+            "the funnel key must be exactly the record's own owner public key"
+        );
+        // Injective on distinct seeds: two records must not collapse into one
+        // FIFO, and one record must not split into two.
+        assert_ne!(funnel_record_key(&a), funnel_record_key(&b));
     }
 
     /// **How a DM page write is classified in the funnel.** Every field asserted
