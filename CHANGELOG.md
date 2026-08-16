@@ -176,6 +176,15 @@ work lives in the project lead's vault manifest, not here.
 - The release profile panics on integer overflow (`[profile.release]
   overflow-checks = true`), workspace-wide. (#258)
 
+### Changed
+
+- `dm::domain`'s labels and their registry come from one `dm_labels!` invocation,
+  so `ALL` cannot omit a label it declares and a byte value cannot drift from its
+  declaration. Three tests that read the module's own source as text are retired
+  with the parser they fed. A known-answer test pins all 37 labels to their
+  pre-migration values, and one narrow source check remains, because a label
+  declared outside the macro is still possible. (#296)
+
 ### Fixed
 
 - `Locked::delete` repairs a record whose mode lost owner-write, then fails
