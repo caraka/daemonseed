@@ -176,6 +176,16 @@ work lives in the project lead's vault manifest, not here.
 - The release profile panics on integer overflow (`[profile.release]
   overflow-checks = true`), workspace-wide. (#258)
 
+### Fixed
+
+- `Locked::delete` repairs a record whose mode lost owner-write, then fails
+  loudly instead of wedging. The delete stays fail-closed — erasing the record
+  is the forward-secrecy premise — but `EACCES` is permanent, so every retry
+  took the same branch and a correspondence could never establish. One
+  `set_permissions` repair is attempted; on continued failure, or when the
+  directory refuses the unlink, `DmStoreError::ErasureBlocked` carries the
+  `DmRecordErasureBlocked` trust event rather than a generic I/O error.
+
 ### Added
 
 - `ResumeRecord`'s secret halves are covered by the out-of-crate zeroize witness.

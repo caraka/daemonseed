@@ -141,6 +141,16 @@ pub enum TrustEventKey {
     /// Collapsing the two would tell a user to re-introduce themselves over a
     /// transient `EIO`, destroying a handshake that was recoverable.
     DmProvisionalRecordUnreadable,
+    /// A DM record could not be erased: it would not open for writing and
+    /// restoring owner-write did not help.
+    ///
+    /// Surfaced rather than retried because the condition is **permanent**. The
+    /// delete is deliberately fail-closed — erasing the record is the
+    /// forward-secrecy premise, and for the provisional record it is `ss0`, which
+    /// roots `RK0` — so the daemon will refuse for ever rather than report a
+    /// success that leaves the secret readable. That makes it a state only a human
+    /// can clear, and a correspondence stuck in it cannot complete establishment.
+    DmRecordErasureBlocked,
 }
 
 /// Every key, in declaration order. Used by exhaustiveness tests and any caller
@@ -167,6 +177,7 @@ pub const ALL_EVENT_KEYS: &[TrustEventKey] = &[
     TrustEventKey::DmChannelTornDownOnRestart,
     TrustEventKey::DmProvisionalHandshakeLost,
     TrustEventKey::DmProvisionalRecordUnreadable,
+    TrustEventKey::DmRecordErasureBlocked,
 ];
 
 /// The affordance class for a key (ISC-C28 per-event assignment table). Total
@@ -207,6 +218,12 @@ pub const fn class_of(key: TrustEventKey) -> TrustEventClass {
         // resume, and an unexplained non-resumption is the #243 defect wearing
         // an operational hat.
         DmProvisionalRecordUnreadable => PersistentNonBlocking,
+        // Recurs at every start until a human fixes the record's mode, and must be
+        // audited: the daemon is refusing to proceed, so a user who is not told
+        // sees a correspondence that simply never establishes. Not `Blocking` —
+        // there is no decision for the user to make here and nothing to hold back
+        // that the refusal has not already stopped.
+        DmRecordErasureBlocked => PersistentNonBlocking,
     }
 }
 
@@ -237,6 +254,7 @@ pub const fn event_key_string(key: TrustEventKey) -> &'static str {
         DmChannelTornDownOnRestart => "dm-channel-torn-down-on-restart",
         DmProvisionalHandshakeLost => "dm-provisional-handshake-lost",
         DmProvisionalRecordUnreadable => "dm-provisional-record-unreadable",
+        DmRecordErasureBlocked => "dm-record-erasure-blocked",
     }
 }
 
@@ -746,11 +764,31 @@ mod tests {
     }
 
     /// Every key maps to exactly one class, and the count matches the C28 table
-    /// plus the two M7 additions (F31, F32) and the three DM restart keys
-    /// (#243) = 21.
+    /// plus the two M7 additions (F31, F32), the three DM restart keys (#243) and
+    /// the erasure-blocked key (#296 work, added with `Locked::delete`'s repair)
+    /// = 22.
+    ///
+    /// **Adding a key touches SEVEN sites, and the two that bite are the two no
+    /// grep for the key's name can reach.** Six of the seven name the key — the
+    /// enum, `ALL_EVENT_KEYS`, `class_of`, the frozen string table,
+    /// `a_dm_teardown_reaches_the_audit_log` and `class_assignments_match_c28_table`
+    /// — so a name search finds them *once they are written*. This bare count is the
+    /// seventh and names nothing, but the compiler fails on it, so it cannot be
+    /// forgotten quietly.
+    ///
+    /// `class_assignments_match_c28_table` is the genuinely dangerous one. It
+    /// hand-lists `class_of` assertions, so omitting a key leaves it **passing on a
+    /// shorter list** — no compiler error, and a name grep run before writing it
+    /// reports the site as simply not existing. It was missed when
+    /// `DmRecordErasureBlocked` was added and found only by review.
+    ///
+    /// The durable lesson is not the number, which will go stale: **a hand-listed
+    /// table is invisible to both the compiler and a name grep, so enumerate the
+    /// class by reading the module rather than by trusting any list — including
+    /// this one.**
     #[test]
     fn every_key_has_a_class() {
-        assert_eq!(ALL_EVENT_KEYS.len(), 21);
+        assert_eq!(ALL_EVENT_KEYS.len(), 22);
         for &k in ALL_EVENT_KEYS {
             // `class_of` is total; this just exercises every arm.
             let _ = class_of(k);
@@ -795,6 +833,7 @@ mod tests {
             class_of(DmProvisionalRecordUnreadable),
             PersistentNonBlocking
         );
+        assert_eq!(class_of(DmRecordErasureBlocked), PersistentNonBlocking);
     }
 
     /// A teardown must reach the audit log, which is what makes it loud rather
@@ -807,6 +846,7 @@ mod tests {
             TrustEventKey::DmChannelTornDownOnRestart,
             TrustEventKey::DmProvisionalHandshakeLost,
             TrustEventKey::DmProvisionalRecordUnreadable,
+            TrustEventKey::DmRecordErasureBlocked,
         ] {
             let mut log = TrustEventLog::new(DEFAULT_LOG_CAP);
             log.append(TrustEvent::observed(1_000, key, None, None));

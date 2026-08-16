@@ -1084,6 +1084,57 @@ impl Locked<'_> {
         match std::fs::OpenOptions::new().write(true).open(&path) {
             Ok(file) => scrub_in_place(&file, &path, kind)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            // A record whose mode lost owner-write cannot be scrubbed, and this
+            // stays FAIL-CLOSED: erasing the record is the forward-secrecy premise
+            // — for the provisional record it is `ss0`, which roots `RK0` — so a
+            // delete that reported success while leaving the secret on disk would
+            // be the worst possible answer. The orphan sweep's fail-soft is not the
+            // precedent for this one; it removes temp files, not secrets.
+            //
+            // What was wrong was narrower than the refusal. The design reasoned
+            // about *transient* faults, and `EACCES` on a read-only record is
+            // permanent: every retry takes the same branch, so
+            // `PendingHandshake::establish` — which builds the ratchet AND deletes
+            // — wedges that correspondence for ever, reporting a generic I/O error
+            // indistinguishable from a slow disk.
+            //
+            // So: one repair attempt, then a loud, distinct failure. Restoring
+            // owner-write is the whole repair — the file is ours and the mode is
+            // the only thing in the way — and if the retry still fails, the caller
+            // gets a variant that names the condition and carries the trust event
+            // it must be surfaced as, rather than a generic error it will retry
+            // against for ever.
+            Err(e) if is_permanent_write_refusal(&e) => {
+                match repair_owner_write(&path) {
+                    Ok(()) => match std::fs::OpenOptions::new().write(true).open(&path) {
+                        Ok(file) => scrub_in_place(&file, &path, kind)?,
+                        Err(again) if again.kind() == std::io::ErrorKind::NotFound => {
+                            return Ok(());
+                        }
+                        // Only a still-permanent refusal is the wedge. A transient
+                        // fault on the retry — EIO, EMFILE, EINTR — is an ordinary
+                        // error and must stay retryable, or the repair would convert
+                        // a bad second into a state that "recurs at every start until
+                        // a human clears it". That is the mirror of the bug being
+                        // fixed here and would be no better.
+                        Err(again) if is_permanent_write_refusal(&again) => {
+                            return Err(DmStoreError::ErasureBlocked {
+                                kind,
+                                scrubbed: false,
+                                source: again,
+                            });
+                        }
+                        Err(again) => return Err(DmStoreError::io(&path, again)),
+                    },
+                    Err(_) => {
+                        return Err(DmStoreError::ErasureBlocked {
+                            kind,
+                            scrubbed: false,
+                            source: e,
+                        });
+                    }
+                }
+            }
             Err(e) => return Err(DmStoreError::io(&path, e)),
         }
 
@@ -1091,6 +1142,23 @@ impl Locked<'_> {
         match std::fs::remove_file(&path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            // The same permanent class as the open above, one step later and with
+            // a different cause: unlinking needs write on the *directory*, which no
+            // repair of the file's own mode reaches. Found by this change's own
+            // probe — the first version covered only the open, and a read-only
+            // parent directory wedged exactly as before while looking retryable.
+            //
+            // The consequence is milder and the variant's doc says so: the scrub
+            // has already run, so the secret is gone and only an empty record
+            // lingers. Forward secrecy is intact; what is not is the caller's
+            // ability to make progress, and that is what the loud variant restores.
+            Err(e) if is_permanent_write_refusal(&e) => {
+                return Err(DmStoreError::ErasureBlocked {
+                    kind,
+                    scrubbed: true,
+                    source: e,
+                });
+            }
             Err(e) => return Err(DmStoreError::io(&path, e)),
         }
         RealDurability
@@ -1111,6 +1179,57 @@ impl Locked<'_> {
     pub fn present(&self) -> Result<Vec<RecordKind>, DmStoreError> {
         self.store.present_unlocked(&self.label)
     }
+}
+
+/// Whether an I/O error is a write refusal that will still be there next time.
+///
+/// **The distinction the whole repair rests on.** A permanent refusal wedges the
+/// correspondence and must be reported as its own condition; a transient one is an
+/// ordinary error a caller should retry. Getting the set wrong is harmful in both
+/// directions — too narrow and a permanent fault keeps looking retryable (a
+/// read-only mount was missed exactly this way, because EROFS is
+/// `ReadOnlyFilesystem` and not `PermissionDenied`), too wide and a bad second
+/// becomes a trust event that recurs at every start until a human clears it.
+///
+/// `PermissionDenied` covers both EACCES and EPERM, so a lost mode bit, an
+/// immutable attribute and a missing search bit on the parent all land here.
+fn is_permanent_write_refusal(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+    )
+}
+
+/// Restore owner-write on a record whose mode lost it, so it can be scrubbed.
+///
+/// **One attempt, and only the mode.** The file is ours — it lives under the
+/// profile directory this process owns — so a lost owner-write bit is the entire
+/// class of permission fault this can fix, and fixing it is what turns a permanent
+/// wedge back into an ordinary delete. Anything else denying the open (an immutable
+/// attribute, a read-only mount, a MAC policy) is outside what a mode change
+/// reaches, and the caller reports it rather than looping.
+///
+/// The existing permissions are read and only the owner-write bit is added, so a
+/// deliberately restrictive mode is not widened beyond what the scrub needs — this
+/// never makes a record more readable than it was.
+#[cfg(unix)]
+fn repair_owner_write(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(path)?.permissions();
+    let mode = perms.mode();
+    perms.set_mode(mode | 0o200);
+    std::fs::set_permissions(path, perms)
+}
+
+/// Non-unix builds have no mode bit to restore, so the repair is a no-op that
+/// reports failure — the caller then returns the same loud, distinct error it
+/// would have on a failed repair, rather than pretending it tried something.
+#[cfg(not(unix))]
+fn repair_owner_write(_path: &std::path::Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "no owner-write repair on this platform",
+    ))
 }
 
 /// Overwrite `file`'s whole length in two fsynced phases: sentinel, then body.
@@ -1307,6 +1426,41 @@ pub enum DmStoreError {
     /// once too often stops believing it when it is true.
     ErasureInterrupted { kind: RecordKind },
 
+    /// The record could not be opened for writing, so it could not be scrubbed,
+    /// and a repair of its mode did not help.
+    ///
+    /// **Its own variant because the condition is PERMANENT and a generic I/O
+    /// error is not.** Every other write failure here is something a caller may
+    /// sensibly retry; this one takes the same branch every time. A correspondence
+    /// whose record cannot be erased cannot complete `establish` — which builds the
+    /// ratchet *and* deletes — so it wedges silently, and reported as
+    /// [`DmStoreError::Io`] it is indistinguishable from a slow disk that will
+    /// eventually come good.
+    ///
+    /// **The refusal itself is correct and is not what this variant changes.**
+    /// Erasing the record is the forward-secrecy premise; a delete that reported
+    /// success while leaving the secret readable would be worse than any error.
+    /// What this adds is that the failure is *nameable*: see [`Self::event`] for
+    /// the trust event it must be surfaced as.
+    ///
+    /// **Two causes, and they differ in how much is at stake.** If the *record*
+    /// would not open, nothing was scrubbed and the sealed secret is still on
+    /// disk. If the record scrubbed but its *directory* refused the unlink, the
+    /// secret is already gone and only an empty file remains — forward secrecy
+    /// holds, and what is blocked is only the caller's progress. Both are reported
+    /// the same way because both wedge the correspondence permanently, and the
+    /// remedy is the same human act.
+    ErasureBlocked {
+        kind: RecordKind,
+        /// Whether the record's payload was successfully overwritten before the
+        /// failure. **This is a disclosure fact, not a detail:** `false` means the
+        /// sealed secret is still readable on disk, `true` means it is already gone
+        /// and only an empty file could not be unlinked. Reporting the second as
+        /// the first would tell an operator a secret is exposed when it is not.
+        scrubbed: bool,
+        source: std::io::Error,
+    },
+
     /// The payload is larger than the kind's bucket. Refused rather than
     /// truncated.
     PayloadTooLong {
@@ -1387,6 +1541,28 @@ impl core::fmt::Display for DmStoreError {
             DmStoreError::NotAuthentic { kind } => {
                 write!(f, "the {kind:?} record did not open")
             }
+            DmStoreError::ErasureBlocked {
+                kind,
+                scrubbed: false,
+                source,
+            } => write!(
+                f,
+                "the {kind:?} record could not be opened for writing, so it could \
+                 not be erased, and restoring owner-write did not help ({source}); \
+                 the record still holds its sealed contents and this correspondence \
+                 cannot proceed until that is fixed"
+            ),
+            DmStoreError::ErasureBlocked {
+                kind,
+                scrubbed: true,
+                source,
+            } => write!(
+                f,
+                "the {kind:?} record was erased but could not be removed ({source}); \
+                 its contents are already overwritten, so nothing sealed remains \
+                 readable, but the empty record cannot be unlinked and this \
+                 correspondence cannot proceed until that is fixed"
+            ),
             DmStoreError::ErasureInterrupted { kind } => write!(
                 f,
                 "the {kind:?} record was being erased and the erase did not \
@@ -1429,12 +1605,36 @@ impl core::fmt::Display for DmStoreError {
     }
 }
 
+impl DmStoreError {
+    /// The trust event this failure must be surfaced as, if any.
+    ///
+    /// Same shape as `dm::provisional::Teardown::event`, and for the same reason:
+    /// a returned value a caller could ignore would not be a fix, while a classed
+    /// event it is forbidden to down-class is. Only the permanent conditions get
+    /// one — a retryable I/O error is not a trust event, it is a bad minute.
+    ///
+    /// [`Self::ErasureBlocked`] is
+    /// [`PersistentNonBlocking`](crate::trust_events::TrustEventClass::PersistentNonBlocking):
+    /// it recurs at every start until a human fixes the record's mode, and it is
+    /// written to the audit log, because a correspondence that silently never
+    /// establishes is the failure this exists to make visible.
+    pub fn event(&self) -> Option<crate::trust_events::TrustEventKey> {
+        match self {
+            Self::ErasureBlocked { .. } => {
+                Some(crate::trust_events::TrustEventKey::DmRecordErasureBlocked)
+            }
+            _ => None,
+        }
+    }
+}
+
 impl core::error::Error for DmStoreError {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             DmStoreError::Io { source, .. } => Some(source),
             DmStoreError::Lock(e) => Some(e),
             DmStoreError::Write { source, .. } => Some(source),
+            DmStoreError::ErasureBlocked { source, .. } => Some(source),
             // `getrandom::Error` only implements `Error` under getrandom's `std`
             // feature, which this build does not enable, so the cause is carried
             // in `Display` rather than dropped.
@@ -1721,6 +1921,251 @@ mod tests {
             sizes.windows(2).all(|w| w[0] == w[1]),
             "an empty outbox and a full one must be the same size on disk: {sizes:?}"
         );
+    }
+
+    /// **A read-only record is repaired and erased, not wedged for ever.**
+    ///
+    /// `establish` builds the ratchet AND deletes, so a delete that can never
+    /// succeed takes the whole correspondence with it — and before this the failure
+    /// was a generic I/O error, indistinguishable from a slow disk a caller would
+    /// keep retrying against.
+    ///
+    /// **Guarded on not being root, and that guard is the whole validity of the
+    /// test.** Root ignores the write bit, so as root the `open` succeeds, the
+    /// repair path is never entered, and every assertion below passes while
+    /// exercising nothing. A vacuous pass on a forward-secrecy path is exactly the
+    /// shape worth refusing to ship, so this fails loudly rather than skipping
+    /// silently if the CI user ever changes.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_record_is_repaired_and_erased_rather_than_wedging() {
+        use std::os::unix::fs::PermissionsExt;
+
+        assert!(
+            write_bit_is_enforced(),
+            "this case is vacuous where the write bit does not constrain the \
+             process (root, or a permissive mount): the open would succeed, the \
+             repair path would never be reached, and every assertion below would \
+             pass while exercising nothing"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let l = label(9);
+        let path = tmp.path().join("dm").join(l.dir_name()).join("outbox.bin");
+
+        s.critical_section::<_, DmStoreError>(&l, |g| {
+            g.replace(RecordKind::Outbox, &payload(4_096))
+        })
+        .unwrap();
+
+        // Take owner-write away, which is the permanent fault: every retry of the
+        // old code took the same branch.
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o400);
+        std::fs::set_permissions(&path, perms).unwrap();
+        // Control: the open really is refused in this state, so the repair below is
+        // doing something rather than papering over a file that was writable anyway.
+        assert_eq!(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "the fixture did not actually make the record unwritable"
+        );
+
+        s.critical_section::<_, DmStoreError>(&l, |g| g.delete(RecordKind::Outbox))
+            .expect("a read-only record must be repaired and erased, not refused");
+        assert!(
+            !path.exists(),
+            "the record survived a delete that reported success"
+        );
+    }
+
+    /// The **unlink** site: the record's directory is unwritable, so the file's mode
+    /// is repaired, the scrub runs, and `remove_file` is refused.
+    ///
+    /// **What actually happens here, corrected after review.** An earlier version of
+    /// this comment claimed the *repair* failed because `set_permissions` needs to
+    /// modify within the directory. It does not — chmod needs only the search bit on
+    /// the parent, which `0o500` grants — so the repair succeeds (mode 000 → 200),
+    /// the payload IS overwritten, and only the unlink is refused. The assertion
+    /// below was inverted on the same misreading: it called a surviving file
+    /// "the secret is not reported as erased when it is not", when the secret was in
+    /// fact already erased.
+    ///
+    /// So this is the `scrubbed: true` case, and it is the milder one: forward
+    /// secrecy holds and what is blocked is progress. The `scrubbed: false` case is
+    /// covered separately below.
+    #[cfg(unix)]
+    #[test]
+    fn an_unrepairable_erasure_is_a_distinct_error_carrying_its_trust_event() {
+        use std::os::unix::fs::PermissionsExt;
+
+        assert!(
+            write_bit_is_enforced(),
+            "vacuous where the write bit does not constrain the process"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let l = label(11);
+        let dir = tmp.path().join("dm").join(l.dir_name());
+        let path = dir.join("outbox.bin");
+
+        s.critical_section::<_, DmStoreError>(&l, |g| {
+            g.replace(RecordKind::Outbox, &payload(4_096))
+        })
+        .unwrap();
+
+        // Mode 000 on the FILE and a read-only DIRECTORY: `set_permissions` needs
+        // to traverse and modify within the directory, so the repair itself fails
+        // and the caller must report rather than loop.
+        let mut fp = std::fs::metadata(&path).unwrap().permissions();
+        fp.set_mode(0o000);
+        std::fs::set_permissions(&path, fp).unwrap();
+        let mut dp = std::fs::metadata(&dir).unwrap().permissions();
+        dp.set_mode(0o500);
+        std::fs::set_permissions(&dir, dp).unwrap();
+
+        let err = s
+            .critical_section::<_, DmStoreError>(&l, |g| g.delete(RecordKind::Outbox))
+            .expect_err("an unrepairable record must not report a successful delete");
+
+        // Restore before asserting, so a failing assertion cannot leave the
+        // temp dir undeletable.
+        let mut dp = std::fs::metadata(&dir).unwrap().permissions();
+        dp.set_mode(0o700);
+        std::fs::set_permissions(&dir, dp).unwrap();
+
+        assert!(
+            matches!(
+                err,
+                DmStoreError::ErasureBlocked {
+                    kind: RecordKind::Outbox,
+                    scrubbed: true,
+                    ..
+                }
+            ),
+            "the failure must be its own variant AND report that the payload was \
+             already overwritten — telling an operator a secret is still readable \
+             when it is not is its own harm: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("nothing sealed remains readable"),
+            "the message must not claim the record still holds its contents: {err}"
+        );
+        assert_eq!(
+            err.event(),
+            Some(crate::trust_events::TrustEventKey::DmRecordErasureBlocked),
+            "the failure must carry the trust event it is surfaced as"
+        );
+        assert_eq!(
+            crate::trust_events::class_of(err.event().unwrap()),
+            crate::trust_events::TrustEventClass::PersistentNonBlocking,
+            "a wedged correspondence must recur at every start until a human fixes it"
+        );
+        // The file is still there — the unlink was refused — but its payload is
+        // gone. Assert the erasure actually happened rather than inferring it: a
+        // file surviving with its sealed contents intact would be the
+        // `scrubbed: false` case, and reporting it as this one is the defect the
+        // split field exists to prevent.
+        assert!(path.exists(), "the unlink was refused, so the file remains");
+        // The repair left the file mode 200 (write-only), so read has to be restored
+        // before it can be inspected — the file being unreadable is an artefact of
+        // the fixture, not of the code under test.
+        let mut fp = std::fs::metadata(&path).unwrap().permissions();
+        fp.set_mode(0o600);
+        std::fs::set_permissions(&path, fp).unwrap();
+        let after = std::fs::read(&path).expect("the file is readable again");
+        assert!(
+            !after.is_empty(),
+            "the scrubbed record should still occupy its bucket"
+        );
+    }
+
+    /// Whether the write bit actually constrains this process.
+    ///
+    /// **Behavioural, not an identity check, and deliberately so.** The property
+    /// the cases below depend on is "a mode without owner-write refuses an open for
+    /// writing" — root is merely the usual reason it would not hold, and a uid
+    /// comparison is a proxy for it. Proxies read wrong: the first version of this
+    /// asked `/proc/self`'s owner, which on this very host disagrees with `id -u`,
+    /// so the guard could have reported root while the tests ran as a normal user
+    /// or the reverse.
+    ///
+    /// This asks the filesystem the same question the code under test asks, in the
+    /// same temp directory, one line before it matters.
+    #[cfg(unix)]
+    fn write_bit_is_enforced() -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let probe = tmp.path().join("probe");
+        std::fs::write(&probe, b"x").expect("write probe");
+        let mut perms = std::fs::metadata(&probe).expect("stat probe").permissions();
+        perms.set_mode(0o400);
+        std::fs::set_permissions(&probe, perms).expect("chmod probe");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&probe)
+            .is_err()
+    }
+
+    /// The **open** site's decision logic, probed directly because the scenario
+    /// cannot be staged as a normal user.
+    ///
+    /// Review found that site — the one the whole change is about — completely
+    /// unprobed: reverting either of its `ErasureBlocked` returns to a generic `Io`
+    /// was caught by nothing, while the milder unlink site had two tests. Staging it
+    /// end-to-end needs an open that is refused AND a repair that cannot help, and
+    /// as a normal user owning the file there is no such arrangement: chmod succeeds
+    /// whenever the parent is searchable, and removing the search bit refuses the
+    /// **lock** before `delete` is ever reached (verified — the attempt failed with
+    /// `Lock(Io(PermissionDenied))`).
+    ///
+    /// The real instances are a read-only mount, an immutable attribute, or a MAC
+    /// policy, none of which a unit test can arrange here. So this probes the
+    /// predicate that decides the branch, which is what blocker-class bug it was:
+    /// **EROFS is `ReadOnlyFilesystem`, not `PermissionDenied`**, and the first
+    /// version of the guard matched only the latter — so a read-only mount, the
+    /// classic permanent write refusal, still reported as retryable.
+    ///
+    /// What remains uncovered is stated rather than implied: no test drives a real
+    /// unopenable-and-unrepairable record through `delete`.
+    #[test]
+    fn only_a_permanent_write_refusal_takes_the_erasure_blocked_branch() {
+        // EACCES and EPERM both map to PermissionDenied; EROFS is its own kind and
+        // was the one originally missed.
+        for code in [
+            13, /* EACCES */
+            1,  /* EPERM */
+            30, /* EROFS */
+        ] {
+            let e = std::io::Error::from_raw_os_error(code);
+            assert!(
+                is_permanent_write_refusal(&e),
+                "errno {code} ({:?}) must be treated as permanent",
+                e.kind()
+            );
+        }
+        // Transient faults must stay retryable: classing one as permanent turns a
+        // bad second into a trust event that recurs at every start until a human
+        // clears it, which is the mirror of the bug being fixed.
+        for code in [
+            5,  /* EIO */
+            4,  /* EINTR */
+            28, /* ENOSPC */
+            24, /* EMFILE */
+        ] {
+            let e = std::io::Error::from_raw_os_error(code);
+            assert!(
+                !is_permanent_write_refusal(&e),
+                "errno {code} ({:?}) is transient and must stay retryable",
+                e.kind()
+            );
+        }
     }
 
     #[test]
