@@ -76,7 +76,7 @@
 //! (WB-1.2 pattern — kills M7 cross-record phase-lock)."* M7 is why: a
 //! deterministic ladder phase-locks two records to one `t0` and turns a timing
 //! observation into an address derivation, which is also what WB-3 I6 forbids.
-//! So [`ReseedSchedule::schedule_next`] takes a jitter unit per call rather than
+//! So `ReseedSchedule::schedule_next_with_unit` takes a jitter unit per call rather than
 //! seeding a generator once, and the math is
 //! [`crate::backoff::apply_jitter`] — the repo's one definition of it.
 //!
@@ -879,13 +879,23 @@ impl ReseedSchedule {
     /// one generator at compose and get a deterministic sequence out of it —
     /// which is exactly the phase relationship M7 names. The runtime path is
     /// [`Self::schedule_next_jittered`].
-    pub fn schedule_next(&mut self, now_ms: i64, unit: f64) {
+    /// **The deterministic door, and it is no longer the public one (#280).**
+    ///
+    /// Taking the jitter unit from the caller is what makes a band edge assertable,
+    /// so it has to exist — but it also means the *caller* decides the jitter, and a
+    /// caller that passes a constant reconstitutes exactly the M7 cross-record
+    /// phase-lock the jitter was added to prevent. While this was the public entry
+    /// point and [`Self::schedule_next_jittered`] had no call sites at all, the
+    /// module was exposing the unsafe path as its API and keeping the safe one as
+    /// dead code. Production now goes through the jittered door; this one is private,
+    /// with a `testing`-gated re-export below for out-of-crate harnesses.
+    fn schedule_next_with_unit(&mut self, now_ms: i64, unit: f64) {
         let delay = apply_jitter(Self::delay_for_rung(self.rung), RESEED_JITTER_FRAC, unit);
         self.next_due_ms = now_ms.saturating_add(delay.as_millis() as i64);
         self.rung = self.rung.saturating_add(1);
     }
 
-    /// [`Self::schedule_next`] with the jitter unit drawn from the OS CSPRNG.
+    /// `Self::schedule_next_with_unit` with the jitter unit drawn from the OS CSPRNG.
     ///
     /// A CSPRNG read failure degrades to the un-jittered rung rather than failing
     /// the emission — the same trade [`crate::backoff::Backoff::next_jittered`]
@@ -897,7 +907,7 @@ impl ReseedSchedule {
             Ok(()) => (u64::from_le_bytes(buf) as f64 / u64::MAX as f64) * 2.0 - 1.0,
             Err(_) => 0.0,
         };
-        self.schedule_next(now_ms, unit);
+        self.schedule_next_with_unit(now_ms, unit);
     }
 }
 
@@ -1091,7 +1101,7 @@ impl OutboxEntry {
     /// whole of the byte-identical re-seed invariant at this layer.
     ///
     /// `unit` ∈ [-1, 1] is this emission's jitter, drawn fresh; see
-    /// [`ReseedSchedule::schedule_next`].
+    /// `ReseedSchedule::schedule_next_with_unit`.
     ///
     /// **This call claims nothing about delivery, and the caller owes a second
     /// one** — [`Self::confirm_written`] — once the transport reports the write
@@ -1113,7 +1123,7 @@ impl OutboxEntry {
     /// [`Self::confirm_written`] is a UI too cautious about its own message,
     /// which is the direction § D-DELIV ("default not-delivered") already picks
     /// everywhere else here.
-    pub fn emit(&mut self, now_ms: i64, unit: f64) -> Result<&[u8], OutboxError> {
+    pub fn emit(&mut self, now_ms: i64) -> Result<&[u8], OutboxError> {
         // The two refusals are told apart, and the state is checked first so a
         // terminal entry past its window reports as terminal rather than as one
         // owed a surfacing it already had. See `OutboxError::GaveUp`.
@@ -1123,7 +1133,7 @@ impl OutboxEntry {
         if self.is_given_up(now_ms) {
             return Err(OutboxError::GaveUp(self.seq));
         }
-        self.schedule.schedule_next(now_ms, unit);
+        self.schedule.schedule_next_jittered(now_ms);
         match &self.lifecycle {
             Lifecycle::AwaitingCollection(frame) => Ok(frame.as_bytes()),
             _ => unreachable!("checked immediately above"),
@@ -1217,14 +1227,14 @@ impl OutboxEntry {
     /// loop against the WB-2 4/min ceiling — which is precisely the write storm
     /// the ladder exists to avoid. `a_key_fetch_retry_advances_the_backoff`
     /// pins it.
-    pub fn retry_key_fetch(&mut self, now_ms: i64, unit: f64) -> Result<(), OutboxError> {
+    pub fn retry_key_fetch(&mut self, now_ms: i64) -> Result<(), OutboxError> {
         if !matches!(self.lifecycle, Lifecycle::AwaitingKey) {
             return Err(OutboxError::NothingToEmit(self.seq));
         }
         if self.is_given_up(now_ms) {
             return Err(OutboxError::GaveUp(self.seq));
         }
-        self.schedule.schedule_next(now_ms, unit);
+        self.schedule.schedule_next_jittered(now_ms);
         Ok(())
     }
 }
@@ -2377,7 +2387,7 @@ mod tests {
     #[test]
     fn reseed_is_byte_identical_across_the_whole_ladder() {
         let mut ob = sealed_outbox();
-        let first = ob.entry_mut(1).unwrap().emit(T0, 0.0).unwrap().to_vec();
+        let first = ob.entry_mut(1).unwrap().emit(T0).unwrap().to_vec();
         // The fixture must not be trivially equal to something else: a test where
         // the compared values coincide proves nothing.
         assert_ne!(first, frame_bytes(0x12), "fixture is degenerate");
@@ -2385,9 +2395,8 @@ mod tests {
 
         let mut now = T0;
         for i in 0..100 {
-            let unit = (i as f64 / 50.0) - 1.0;
             now += 1;
-            let emitted = ob.entry_mut(1).unwrap().emit(now, unit).unwrap().to_vec();
+            let emitted = ob.entry_mut(1).unwrap().emit(now).unwrap().to_vec();
             assert_eq!(emitted, first, "emission {i} differed from the first");
 
             // Round-trip through the at-rest form every few emissions: a frame
@@ -2409,9 +2418,9 @@ mod tests {
     #[test]
     fn every_emission_borrows_the_one_stored_frame() {
         let mut ob = sealed_outbox();
-        let first_ptr = ob.entry_mut(1).unwrap().emit(T0, 0.0).unwrap().as_ptr();
+        let first_ptr = ob.entry_mut(1).unwrap().emit(T0).unwrap().as_ptr();
         for i in 0..20 {
-            let ptr = ob.entry_mut(1).unwrap().emit(T0 + i, 0.5).unwrap().as_ptr();
+            let ptr = ob.entry_mut(1).unwrap().emit(T0 + i).unwrap().as_ptr();
             assert_eq!(ptr, first_ptr, "emission {i} returned different memory");
         }
     }
@@ -2503,13 +2512,13 @@ mod tests {
                         let _ = ob.channel_torn_down(&TeardownCause::NoProvisionalRecord, T0);
                     }
                     Drive::Emit => {
-                        let _ = ob.entry_mut(1).unwrap().emit(T0, 0.0);
+                        let _ = ob.entry_mut(1).unwrap().emit(T0);
                     }
                     Drive::Publish => {
                         let _ = ob.entry_mut(1).unwrap().publish(T0, frame(0x22));
                     }
                     Drive::RetryKeyFetch => {
-                        let _ = ob.entry_mut(1).unwrap().retry_key_fetch(T0, 0.0);
+                        let _ = ob.entry_mut(1).unwrap().retry_key_fetch(T0);
                     }
                 }
 
@@ -2546,7 +2555,7 @@ mod tests {
         // retry_key_fetch: stays AwaitingKey, advances the schedule.
         let mut ob = empty();
         ob.enqueue_awaiting_key(1, channel(), T0).unwrap();
-        ob.entry_mut(1).unwrap().retry_key_fetch(T0, 0.0).unwrap();
+        ob.entry_mut(1).unwrap().retry_key_fetch(T0).unwrap();
         assert_eq!(*ob.entry(1).unwrap().lifecycle(), Lifecycle::AwaitingKey);
 
         // teardown: AwaitingKey -> Undelivered, surfaced.
@@ -2570,7 +2579,7 @@ mod tests {
         let mut ob = sealed_outbox();
         let _ = ob.sweep_give_ups(T0 + GIVE_UP_MS);
         assert_eq!(
-            ob.entry_mut(1).unwrap().emit(T0 + GIVE_UP_MS, 0.0),
+            ob.entry_mut(1).unwrap().emit(T0 + GIVE_UP_MS),
             Err(OutboxError::NothingToEmit(1))
         );
     }
@@ -2618,7 +2627,7 @@ mod tests {
         let mut now = T0;
         for (i, step) in EXPECTED_MS.iter().enumerate() {
             assert_eq!(s.rung(), i as u32, "rung index before step {i}");
-            s.schedule_next(now, 0.0);
+            s.schedule_next_with_unit(now, 0.0);
             assert_eq!(
                 s.next_due_ms(),
                 now + step,
@@ -2629,7 +2638,7 @@ mod tests {
         // Past the end the last rung repeats, twice over, so an off-by-one that
         // wrapped to rung 0 would show.
         for i in 0..2 {
-            s.schedule_next(now, 0.0);
+            s.schedule_next_with_unit(now, 0.0);
             assert_eq!(
                 s.next_due_ms(),
                 now + 86_400_000,
@@ -2645,7 +2654,7 @@ mod tests {
     fn jitter_is_drawn_per_emission_and_moves_the_due_time() {
         let due = |unit: f64| {
             let mut s = ReseedSchedule::new(T0);
-            s.schedule_next(T0, unit);
+            s.schedule_next_with_unit(T0, unit);
             s.next_due_ms()
         };
         let (low, mid, high) = (due(-1.0), due(0.0), due(1.0));
@@ -2655,50 +2664,64 @@ mod tests {
         assert!(low < mid && mid < high, "the band collapsed");
     }
 
-    /// **The jitter unit reaches the schedule *through `emit`*.**
-    ///
-    /// `ReseedSchedule::schedule_next` is well covered on its own, but nothing
-    /// asserted that `emit`'s `unit` parameter arrives there: every other test
-    /// passes `0.0`, so replacing the argument with `0.0` inside `emit` passed
-    /// the whole suite. What that deletes is per-emission jitter on the re-seed
-    /// path — the M7 cross-record phase-lock defence the module docs name as the
-    /// parameter's entire reason for existing, and which WB-3 I6 forbids
-    /// dropping. A deterministic ladder phase-locks two records to one `t0` and
-    /// turns a timing observation into an address derivation.
     #[test]
-    fn the_emission_jitter_unit_reaches_the_schedule() {
-        let due_after_emit = |unit: f64| {
+    fn emit_jitters_from_the_csprng_without_being_told_a_unit() {
+        // The property that replaced the old one at the `emit` boundary, and the
+        // one #280 is actually about: `schedule_next_jittered` is now the runtime
+        // path, and it previously had NO call site and NO test — the code that
+        // would really run was the untested one.
+        //
+        // The exact instant is not assertable once the unit comes from the CSPRNG,
+        // but the two things worth asserting survive: every emission lands inside
+        // the band, and the emissions do not all land on the same instant. A build
+        // that dropped the jitter would pin every draw to the bare rung; a build
+        // that mis-scaled it would leave the band. Both are what M7 cross-record
+        // phase-lock looks like from in here.
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..64 {
             let mut ob = sealed_outbox();
-            ob.entry_mut(1).unwrap().emit(T0, unit).unwrap();
-            ob.entry(1).unwrap().schedule().next_due_ms()
-        };
-        // The un-jittered rung, and both edges of the ±25% band around it.
-        assert_eq!(due_after_emit(0.0), T0 + 60_000, "the un-jittered rung");
-        assert_eq!(
-            due_after_emit(-1.0),
-            T0 + 45_000,
-            "emit dropped the low end of the jitter band"
+            ob.entry_mut(1).unwrap().emit(T0).unwrap();
+            let due = ob.entry(1).unwrap().schedule().next_due_ms();
+            assert!(
+                (T0 + 45_000..=T0 + 75_000).contains(&due),
+                "draw {i} landed at {due}, outside the ±25% band around T0 + 60_000"
+            );
+            seen.insert(due);
+        }
+        // `seen.len() > 1` separates SOME spread from NO spread and cannot see band
+        // WIDTH — a review lens proved it by scaling the drawn unit to a tenth,
+        // collapsing the band to ±2.5% while every draw still sat inside the ±25%
+        // window and every test still passed. A collapsed-but-nonzero band is
+        // phase-lock in practice, so the width needs its own assertion.
+        let (lo, hi) = (
+            *seen.iter().min().expect("64 draws"),
+            *seen.iter().max().expect("64 draws"),
         );
-        assert_eq!(
-            due_after_emit(1.0),
-            T0 + 75_000,
-            "emit dropped the high end of the jitter band"
-        );
-        // The band has not collapsed: a build passing a constant would make
-        // these three equal.
         assert!(
-            due_after_emit(-1.0) < due_after_emit(0.0) && due_after_emit(0.0) < due_after_emit(1.0),
-            "emit is not passing its jitter unit through"
+            hi - lo > 10_000,
+            "64 draws spanned only {} ms of the 30 000 ms band — the jitter is \
+             scaled down, not absent, which no `is it moving at all` check can see",
+            hi - lo
         );
-        // And it keeps arriving on later rungs, not just the first.
+        // And the band is centred, not merely wide: a unit left in [0, 1] rather
+        // than [-1, 1] keeps half the width AND drifts every re-seed later, which a
+        // spread floor alone would pass.
+        assert!(
+            lo < T0 + 60_000 && hi > T0 + 60_000,
+            "every draw fell on one side of the un-jittered rung: [{lo}, {hi}] \
+             against T0 + 60 000 — the unit is not centred on zero"
+        );
+
+        // And it keeps arriving on later rungs, not just the first: the second rung
+        // is 2 min, so its band is ±25% of 120 s around the emission time.
         let mut ob = sealed_outbox();
-        ob.entry_mut(1).unwrap().emit(T0, 0.0).unwrap();
+        ob.entry_mut(1).unwrap().emit(T0).unwrap();
         let now = ob.entry(1).unwrap().schedule().next_due_ms();
-        ob.entry_mut(1).unwrap().emit(now, 1.0).unwrap();
-        assert_eq!(
-            ob.entry(1).unwrap().schedule().next_due_ms(),
-            now + 150_000,
-            "the second rung (2 min) lost its jitter"
+        ob.entry_mut(1).unwrap().emit(now).unwrap();
+        let second = ob.entry(1).unwrap().schedule().next_due_ms();
+        assert!(
+            (now + 90_000..=now + 150_000).contains(&second),
+            "the second rung landed at {second}, outside the band around {now} + 2 min"
         );
     }
 
@@ -2723,40 +2746,70 @@ mod tests {
             "an awaiting-key entry never appears in due(), so nothing retries it"
         );
 
-        ob.entry_mut(1).unwrap().retry_key_fetch(T0, 0.0).unwrap();
-        let s = ob.entry(1).unwrap().schedule();
-        assert_eq!(s.rung(), 1, "the retry consumed no rung");
-        assert_eq!(
-            s.next_due_ms(),
-            T0 + 60_000,
-            "the retry did not push the next fetch out"
-        );
+        ob.entry_mut(1).unwrap().retry_key_fetch(T0).unwrap();
+        let (rung, due) = {
+            let s = ob.entry(1).unwrap().schedule();
+            (s.rung(), s.next_due_ms())
+        };
+        assert_eq!(rung, 1, "the retry consumed no rung");
+        // The retry pushes the next fetch out by the first rung, jittered — since
+        // #280 the unit comes from the CSPRNG, so the band is what is assertable
+        // and the exact instant is not.
         assert!(
-            ob.due(T0 + 59_999).is_empty(),
+            (T0 + 45_000..=T0 + 75_000).contains(&due),
+            "the retry did not push the next fetch out by a jittered first rung: {due}"
+        );
+        // And `due` gates on whatever was actually scheduled — read back rather
+        // than assumed, which is the invariant this was always testing.
+        assert!(
+            ob.due(due - 1).is_empty(),
             "the entry was due again immediately — a hot key-fetch loop"
         );
-        assert_eq!(ob.due(T0 + 60_000), vec![1], "the entry never came back");
+        assert_eq!(ob.due(due), vec![1], "the entry never came back");
 
-        // The jitter unit reaches the schedule here too, on the same backoff.
-        let mut ob = empty();
-        ob.enqueue_awaiting_key(1, channel(), T0).unwrap();
-        ob.entry_mut(1).unwrap().retry_key_fetch(T0, 1.0).unwrap();
-        assert_eq!(
-            ob.entry(1).unwrap().schedule().next_due_ms(),
-            T0 + 75_000,
-            "the key-fetch retry dropped its jitter"
+        // The jitter reaches the schedule on the key-fetch path too, and since #280
+        // it is drawn rather than supplied — so the band is the assertion, and a
+        // spread across draws is what shows the unit is not being ignored.
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..64 {
+            let mut ob = empty();
+            ob.enqueue_awaiting_key(1, channel(), T0).unwrap();
+            ob.entry_mut(1).unwrap().retry_key_fetch(T0).unwrap();
+            let due = ob.entry(1).unwrap().schedule().next_due_ms();
+            assert!(
+                (T0 + 45_000..=T0 + 75_000).contains(&due),
+                "key-fetch retry {i} landed at {due}, outside the first rung's band"
+            );
+            seen.insert(due);
+        }
+        // Width and centring, for the reason given on the emit path: a scaled-down
+        // band passes a "did anything move" check while phase-locking in practice.
+        let (lo, hi) = (
+            *seen.iter().min().expect("64 draws"),
+            *seen.iter().max().expect("64 draws"),
+        );
+        assert!(
+            hi - lo > 10_000,
+            "64 key-fetch retries spanned only {} ms of the 30 000 ms band",
+            hi - lo
+        );
+        assert!(
+            lo < T0 + 60_000 && hi > T0 + 60_000,
+            "every key-fetch retry fell on one side of the un-jittered rung: \
+             [{lo}, {hi}] — the unit is not centred on zero"
         );
 
         // And the rungs keep climbing, so a second retry is not a second minute.
         let mut ob = empty();
         ob.enqueue_awaiting_key(1, channel(), T0).unwrap();
-        ob.entry_mut(1).unwrap().retry_key_fetch(T0, 0.0).unwrap();
+        ob.entry_mut(1).unwrap().retry_key_fetch(T0).unwrap();
         let now = ob.entry(1).unwrap().schedule().next_due_ms();
-        ob.entry_mut(1).unwrap().retry_key_fetch(now, 0.0).unwrap();
-        assert_eq!(
-            ob.entry(1).unwrap().schedule().next_due_ms(),
-            now + 120_000,
-            "the key fetch is not climbing the ladder"
+        ob.entry_mut(1).unwrap().retry_key_fetch(now).unwrap();
+        let second = ob.entry(1).unwrap().schedule().next_due_ms();
+        assert!(
+            (now + 90_000..=now + 150_000).contains(&second),
+            "the key fetch is not climbing the ladder: {second} is outside the \
+             second rung's band around {now} + 2 min"
         );
     }
 
@@ -2768,7 +2821,7 @@ mod tests {
         let mut now = T0;
         for _ in 0..5 {
             let e = ob.entry_mut(1).unwrap();
-            e.emit(now, 0.0).unwrap();
+            e.emit(now).unwrap();
             now = e.schedule().next_due_ms();
         }
         let before = ob.entry(1).unwrap().schedule();
@@ -2782,9 +2835,13 @@ mod tests {
     fn due_tracks_the_schedule_and_skips_terminal_entries() {
         let mut ob = sealed_outbox();
         assert_eq!(ob.due(T0), vec![1], "the first emission is due at compose");
-        ob.entry_mut(1).unwrap().emit(T0, 0.0).unwrap();
-        assert!(ob.due(T0 + 59_999).is_empty(), "due one ms early");
-        assert_eq!(ob.due(T0 + 60_000), vec![1], "not due on the rung boundary");
+        ob.entry_mut(1).unwrap().emit(T0).unwrap();
+        // Read the scheduled instant back rather than assuming it: the emission is
+        // jittered from the CSPRNG since #280, and what this test is really about
+        // is that `due` gates on whatever was scheduled, not on a constant.
+        let due = ob.entry(1).unwrap().schedule().next_due_ms();
+        assert!(ob.due(due - 1).is_empty(), "due one ms early");
+        assert_eq!(ob.due(due), vec![1], "not due on the rung boundary");
         let _ = ob.sweep_give_ups(T0 + GIVE_UP_MS);
         assert!(
             ob.due(T0 + GIVE_UP_MS + 60_000).is_empty(),
@@ -2841,7 +2898,7 @@ mod tests {
         let mut now = T0;
         for _ in 0..8 {
             let e = ob.entry_mut(1).unwrap();
-            e.emit(now, 0.0).unwrap();
+            e.emit(now).unwrap();
             now = e.schedule().next_due_ms();
         }
         assert!(now > T0, "fixture did not advance the clock");
@@ -2960,7 +3017,7 @@ mod tests {
         ob.enqueue_sealed(2, channel(), T0, frame(0x22)).unwrap();
         for seq in [1, 2] {
             let entry = ob.entry_mut(seq).unwrap();
-            entry.emit(T0, 0.0).unwrap();
+            entry.emit(T0).unwrap();
             entry.confirm_written(T0).unwrap();
         }
 
@@ -3059,7 +3116,7 @@ mod tests {
     fn a_teardown_leaves_the_published_outbox_intact() {
         let mut ob = sealed_outbox();
         ob.enqueue_sealed(2, channel(), T0, frame(0x22)).unwrap();
-        ob.entry_mut(1).unwrap().emit(T0, 0.0).unwrap();
+        ob.entry_mut(1).unwrap().emit(T0).unwrap();
         let before = ob.clone();
 
         let outcome = ob.channel_torn_down(&TeardownCause::NoProvisionalRecord, T0);
@@ -3073,11 +3130,7 @@ mod tests {
         );
         // Still re-seedable, and still byte-identical.
         assert_eq!(
-            ob.entry_mut(1)
-                .unwrap()
-                .emit(T0 + 60_000, 0.0)
-                .unwrap()
-                .to_vec(),
+            ob.entry_mut(1).unwrap().emit(T0 + 60_000).unwrap().to_vec(),
             frame_bytes(0x11)
         );
     }
@@ -3090,7 +3143,7 @@ mod tests {
         ob.enqueue_awaiting_key(1, channel(), T0).unwrap();
         ob.enqueue_sealed(2, channel(), T0, frame(0x22)).unwrap();
         let entry = ob.entry_mut(2).unwrap();
-        entry.emit(T0, 0.0).unwrap();
+        entry.emit(T0).unwrap();
         entry.confirm_written(T0).unwrap();
 
         let outcome = ob.channel_torn_down(&TeardownCause::NoProvisionalRecord, T0);
@@ -3189,7 +3242,7 @@ mod tests {
         ] {
             let mut ob = empty();
             ob.enqueue_sealed(1, channel(), T0, frame(0x11)).unwrap();
-            ob.entry_mut(1).unwrap().emit(T0, 0.0).unwrap();
+            ob.entry_mut(1).unwrap().emit(T0).unwrap();
 
             // Inside the window the same call retains it, so the clock is what
             // moved and not the cause.
@@ -3252,7 +3305,7 @@ mod tests {
             // `a_sealed_message_is_not_on_the_dht_until_a_write_is_confirmed`
             // and `seven_failed_writes_never_claim_the_message_reached_the_dht`,
             // which hold acceptance and the rung apart on purpose.
-            schedule.schedule_next(T0, 0.0);
+            schedule.schedule_next_with_unit(T0, 0.0);
             let entry = OutboxEntry {
                 seq: 1,
                 target: channel(),
@@ -3358,7 +3411,7 @@ mod tests {
             DeliveryState::Composed,
             "a message claimed to be on the DHT before anything was written"
         );
-        ob.entry_mut(1).unwrap().emit(T0, 0.0).unwrap();
+        ob.entry_mut(1).unwrap().emit(T0).unwrap();
         assert_eq!(
             ob.entry(1).unwrap().delivery_state(),
             DeliveryState::Composed,
@@ -3382,7 +3435,7 @@ mod tests {
             let entry = ob.entry_mut(1).unwrap();
             // The bytes go to the transport; the transport errors; nothing is
             // confirmed. That is the whole of a caller's outage path.
-            entry.emit(now, 0.0).unwrap();
+            entry.emit(now).unwrap();
             now = entry.schedule().next_due_ms();
         }
         let entry = ob.entry(1).unwrap();
@@ -3406,7 +3459,7 @@ mod tests {
         let mut ob = empty();
         ob.enqueue_awaiting_key(1, channel(), T0).unwrap();
         let entry = ob.entry_mut(1).unwrap();
-        entry.retry_key_fetch(T0, 0.0).unwrap();
+        entry.retry_key_fetch(T0).unwrap();
         assert!(
             entry.schedule().rung() > 0,
             "the retry did not advance the rung, so this proves nothing"
@@ -3424,7 +3477,7 @@ mod tests {
     fn a_second_confirmation_is_not_an_error_and_changes_nothing() {
         let mut ob = sealed_outbox();
         let entry = ob.entry_mut(1).unwrap();
-        entry.emit(T0, 0.0).unwrap();
+        entry.emit(T0).unwrap();
         entry.confirm_written(T0).unwrap();
         let after_first = entry.schedule();
         entry.confirm_written(T0).unwrap();
@@ -3463,7 +3516,7 @@ mod tests {
         );
 
         let mut ob = sealed_outbox();
-        ob.entry_mut(1).unwrap().emit(T0, 0.0).unwrap();
+        ob.entry_mut(1).unwrap().emit(T0).unwrap();
         assert_eq!(
             ob.entry_mut(1).unwrap().confirm_written(T0 + GIVE_UP_MS),
             Err(OutboxError::GaveUp(1)),
@@ -3483,13 +3536,13 @@ mod tests {
     fn a_later_emission_does_not_retract_a_confirmation() {
         let mut ob = sealed_outbox();
         let entry = ob.entry_mut(1).unwrap();
-        entry.emit(T0, 0.0).unwrap();
+        entry.emit(T0).unwrap();
         entry.confirm_written(T0).unwrap();
         assert_eq!(entry.delivery_state(), DeliveryState::OnDht);
 
         // The next re-seed errors at the transport, so nothing confirms it.
         let now = entry.schedule().next_due_ms();
-        entry.emit(now, 0.0).unwrap();
+        entry.emit(now).unwrap();
         assert_eq!(
             entry.acceptance(),
             Acceptance::Confirmed,
@@ -3506,7 +3559,7 @@ mod tests {
         for lifecycle in [Lifecycle::ConfirmedCollected, Lifecycle::Undelivered] {
             let mut ob = sealed_outbox();
             let entry = ob.entry_mut(1).unwrap();
-            entry.emit(T0, 0.0).unwrap();
+            entry.emit(T0).unwrap();
             entry.end(lifecycle.clone());
             let before = entry.delivery_state();
             assert_eq!(
@@ -3560,7 +3613,7 @@ mod tests {
         );
         assert!(ob.due(late).is_empty(), "a past-window entry was still due");
         assert_eq!(
-            ob.entry_mut(1).unwrap().emit(late, 0.0),
+            ob.entry_mut(1).unwrap().emit(late),
             Err(OutboxError::GaveUp(1)),
             "a past-window entry was still emitted"
         );
@@ -3571,11 +3624,9 @@ mod tests {
     fn a_key_fetch_retry_stops_at_the_give_up() {
         let mut ob = empty();
         ob.enqueue_awaiting_key(1, channel(), T0).unwrap();
-        assert!(ob.entry_mut(1).unwrap().retry_key_fetch(T0, 0.0).is_ok());
+        assert!(ob.entry_mut(1).unwrap().retry_key_fetch(T0).is_ok());
         assert_eq!(
-            ob.entry_mut(1)
-                .unwrap()
-                .retry_key_fetch(T0 + GIVE_UP_MS, 0.0),
+            ob.entry_mut(1).unwrap().retry_key_fetch(T0 + GIVE_UP_MS),
             Err(OutboxError::GaveUp(1))
         );
     }
@@ -3630,7 +3681,7 @@ mod tests {
         // Live, past the window: the caller owes this message a surfacing.
         let mut live = sealed_outbox();
         assert_eq!(
-            live.entry_mut(1).unwrap().emit(T0 + GIVE_UP_MS, 0.0),
+            live.entry_mut(1).unwrap().emit(T0 + GIVE_UP_MS),
             Err(OutboxError::GaveUp(1)),
             "a live past-window entry did not report as overdue"
         );
@@ -3640,7 +3691,7 @@ mod tests {
         let mut terminal = sealed_outbox();
         assert_eq!(terminal.sweep_give_ups(T0 + GIVE_UP_MS), vec![1]);
         assert_eq!(
-            terminal.entry_mut(1).unwrap().emit(T0 + GIVE_UP_MS, 0.0),
+            terminal.entry_mut(1).unwrap().emit(T0 + GIVE_UP_MS),
             Err(OutboxError::NothingToEmit(1)),
             "a swept entry still reported as owed a surfacing"
         );
@@ -3652,16 +3703,12 @@ mod tests {
         let mut key = empty();
         key.enqueue_awaiting_key(1, channel(), T0).unwrap();
         assert_eq!(
-            key.entry_mut(1)
-                .unwrap()
-                .retry_key_fetch(T0 + GIVE_UP_MS, 0.0),
+            key.entry_mut(1).unwrap().retry_key_fetch(T0 + GIVE_UP_MS),
             Err(OutboxError::GaveUp(1))
         );
         assert_eq!(key.sweep_give_ups(T0 + GIVE_UP_MS), vec![1]);
         assert_eq!(
-            key.entry_mut(1)
-                .unwrap()
-                .retry_key_fetch(T0 + GIVE_UP_MS, 0.0),
+            key.entry_mut(1).unwrap().retry_key_fetch(T0 + GIVE_UP_MS),
             Err(OutboxError::NothingToEmit(1))
         );
     }
@@ -3787,7 +3834,7 @@ mod tests {
     #[test]
     fn a_far_future_due_time_is_left_alone_and_the_give_up_still_fires() {
         let mut ob = sealed_outbox();
-        ob.entry_mut(1).unwrap().emit(T0, 0.0).unwrap();
+        ob.entry_mut(1).unwrap().emit(T0).unwrap();
         let mut bytes = ob.encode();
         let due = ob.entry(1).unwrap().schedule().next_due_ms();
         let at = bytes
@@ -3916,7 +3963,7 @@ mod tests {
             .unwrap();
         ob.enqueue_sealed(4, channel(), T0 + 4, frame(0x05))
             .unwrap();
-        ob.entry_mut(3).unwrap().emit(T0, 0.0).unwrap();
+        ob.entry_mut(3).unwrap().emit(T0).unwrap();
         let mut ack = AckState::new();
         ack.collect(4).unwrap();
         assert_eq!(ob.settle_from_ack(&ack, T0), vec![4]);
@@ -4168,9 +4215,9 @@ mod tests {
         let mut live = empty();
         live.enqueue_awaiting_key(1, channel(), T0).unwrap();
         live.enqueue_sealed(2, channel(), T0, frame(0x22)).unwrap();
-        live.entry_mut(1).unwrap().retry_key_fetch(T0, 0.0).unwrap();
+        live.entry_mut(1).unwrap().retry_key_fetch(T0).unwrap();
         live.entry_mut(1).unwrap().publish(T0, frame(0x11)).unwrap();
-        live.entry_mut(2).unwrap().emit(T0, 0.0).unwrap();
+        live.entry_mut(2).unwrap().emit(T0).unwrap();
         let retained = live.channel_torn_down(&TeardownCause::StoreUnreadable("EIO".into()), T0);
         assert_eq!(retained.retained, vec![1, 2], "fixture ended an entry");
         assert!(
@@ -4374,7 +4421,7 @@ mod tests {
         // decoder reconstructed acceptance from the rung, this entry would come
         // back `Confirmed` and the test would pass for the wrong reason.
         let entry = ob.entry_mut(1).unwrap();
-        entry.emit(T0, 0.0).unwrap();
+        entry.emit(T0).unwrap();
         entry.confirm_written(T0).unwrap();
         assert_eq!(entry.delivery_state(), DeliveryState::OnDht);
 
@@ -4427,7 +4474,7 @@ mod tests {
         ob.enqueue_sealed(2, channel(), T0, frame(0x22)).unwrap();
         for seq in [1, 2] {
             let entry = ob.entry_mut(seq).unwrap();
-            entry.emit(T0, 0.0).unwrap();
+            entry.emit(T0).unwrap();
             entry.confirm_written(T0).unwrap();
         }
         assert_eq!(
@@ -4475,7 +4522,7 @@ mod tests {
         for confirm in [false, true] {
             let mut ob = sealed_outbox();
             let entry = ob.entry_mut(1).unwrap();
-            entry.emit(T0, 0.0).unwrap();
+            entry.emit(T0).unwrap();
             if confirm {
                 entry.confirm_written(T0).unwrap();
             }

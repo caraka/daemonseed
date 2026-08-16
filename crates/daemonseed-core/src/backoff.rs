@@ -245,7 +245,7 @@ mod tests {
     /// **The `unit` clamp is a bound on the caller, and nothing tested it.**
     ///
     /// `apply_jitter` is the workspace's one definition of jitter and is reached
-    /// by [`crate::dm::outbox::ReseedSchedule::schedule_next`] as well as by
+    /// by `crate::dm::outbox::ReseedSchedule::schedule_next_with_unit` as well as by
     /// [`BackoffPolicy::jitter`]. Removing `unit.clamp(-1.0, 1.0)` lets a caller
     /// passing an out-of-band unit push the resulting delay arbitrarily far out
     /// — for the outbox that is a `next_due_ms` a caller can place past its own

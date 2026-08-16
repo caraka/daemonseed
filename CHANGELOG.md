@@ -176,6 +176,15 @@ work lives in the project lead's vault manifest, not here.
 - The release profile panics on integer overflow (`[profile.release]
   overflow-checks = true`), workspace-wide. (#258)
 
+### Changed
+
+- Re-seed jitter is drawn from the CSPRNG on every emission. `OutboxEntry::emit`
+  and `retry_key_fetch` no longer take a caller-supplied jitter unit; they call
+  `ReseedSchedule::schedule_next_jittered`, which had no call site. The
+  unit-taking door is private, re-exported only under the `testing` feature. A
+  caller passing a constant reconstitutes the M7 cross-record phase-lock the
+  jitter exists to prevent, so it is no longer reachable from production. (#280)
+
 ### Added
 
 - `Outbox` refuses a message it cannot persist, at enqueue rather than at the

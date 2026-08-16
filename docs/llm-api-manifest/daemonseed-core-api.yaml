@@ -1151,11 +1151,18 @@ modules:
       padding and the fixed on-disk size belong to
       storage::dm_store (#279). SealedFrame::new(Vec<u8>) wraps sealed bytes
       and exposes as_bytes/len/is_empty only; there is no mutating accessor.
-      OutboxEntry::publish(now_ms, frame) is the only edge that installs a frame
+      Outbox::publish(seq, now_ms, frame) is the only edge that installs a frame
       and accepts only AwaitingKey, returning OutboxError::AlreadyPublished
-      otherwise. emit(now_ms, unit) -> Result<&[u8], OutboxError> returns the
-      stored bytes borrowed and advances the schedule; retry_key_fetch(now_ms,
-      unit) advances it for an unsealed entry. All three return
+      otherwise; OutboxEntry::publish is pub(crate) so the frame install cannot
+      bypass the capacity check. emit(now_ms) -> Result<&[u8], OutboxError>
+      returns the stored bytes borrowed and advances the schedule;
+      retry_key_fetch(now_ms) advances it for an unsealed entry. Neither takes a
+      jitter unit: both call ReseedSchedule::schedule_next_jittered, which draws
+      from the CSPRNG per call, and the unit-taking door is private with no
+      public re-export — a caller-supplied constant would reconstitute the M7
+      cross-record phase-lock the jitter prevents. A
+      CSPRNG read failure degrades to the un-jittered rung rather than failing the
+      emission, and that degrade is currently silent. All three return
       OutboxError::NothingToEmit in an inapplicable or terminal state and
       OutboxError::GaveUp when the entry is live but past its give-up window —
       two distinct answers, because the second names a message the caller still
