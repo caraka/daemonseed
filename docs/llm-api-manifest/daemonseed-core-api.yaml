@@ -1130,7 +1130,17 @@ modules:
       same way; an unknown seq is OutboxError::UnknownSequence. Both gates price
       the candidate before mutating, so a refusal leaves the outbox byte-identical.
       encoded_len() -> usize is the exact length encode() would produce and is
-      what both gates consult. OutboxTarget is Doorbell { slot },
+      what both gates consult. prune() -> usize removes entries that are terminal
+      AND already Surfacing::Clear, returning how many went, and is the only thing
+      that shrinks the record: without it the record grows with lifetime rather
+      than owed messages and every persist fails permanently past capacity.
+      Because both gates price from the entry set, a prune can let a previously
+      refused send succeed. pruned_high_water() -> u64 is one past the highest
+      pruned sequence, zero when nothing has been pruned; it takes over the
+      sequence dedup the pruned entries provided, so insert refuses a seq below it
+      with the same DuplicateSequence a still-present entry would give. It is
+      persisted, which is why the at-rest format is v4; v3 and v2 records are read
+      with it defaulting to zero. OutboxTarget is Doorbell { slot },
       validated against DOORBELL_SLOTS, or ChannelPage; the record key is not
       carried and OutboxEntry::position() derives the page slot from the sequence
       number. Lifecycle is AwaitingKey,

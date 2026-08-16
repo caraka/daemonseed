@@ -1141,7 +1141,8 @@ mod tests {
     /// field by field and handed straight to the store, so a decoder that agreed
     /// with a wrong encoder would fail rather than pass: this pins the magic, the
     /// big-endian suite id, the direction tag and the big-endian entry count
-    /// against literals.
+    /// against literals, and since #323 the big-endian pruned high-water that sits
+    /// between the direction and the count.
     #[test]
     fn a_hand_written_outbox_header_decodes() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1152,6 +1153,7 @@ mod tests {
         raw.extend_from_slice(OUTBOX_MAGIC);
         raw.extend_from_slice(&Registry::default_write_suite().get().to_be_bytes());
         raw.push(1); // direction tag: BToA
+        raw.extend_from_slice(&0u64.to_be_bytes()); // pruned high-water: nothing pruned
         raw.extend_from_slice(&0u32.to_be_bytes()); // no entries
         p.store()
             .critical_section::<_, DmStoreError>(&l, |g| g.replace(RecordKind::Outbox, &raw))

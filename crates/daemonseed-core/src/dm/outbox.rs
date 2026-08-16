@@ -332,7 +332,13 @@ pub const GIVE_UP_MS: i64 = GIVE_UP.as_secs() as i64 * 1_000;
 /// At-rest magic. The version is **inside** it, so a decoder compares one thing
 /// and cannot read a v1 body under a v2 header — the shape
 /// [`crate::dm::provisional`] uses.
-pub const OUTBOX_MAGIC: &[u8] = b"daemonseed/dm/outbox/v3\0";
+pub const OUTBOX_MAGIC: &[u8] = b"daemonseed/dm/outbox/v4\0";
+
+/// The v3 magic, which [`Outbox::decode`] **reads**, defaulting
+/// [`Outbox::pruned_high_water`] to zero — a v3 record pruned nothing, so every
+/// sequence it never held is still admissible. Written records are always v4
+/// (read-old-write-new, as v2 already was).
+pub const OUTBOX_MAGIC_V3: &[u8] = b"daemonseed/dm/outbox/v3\0";
 
 /// The v2 magic, which [`Outbox::decode`] **reads**, defaulting every entry to
 /// [`Acceptance::Unconfirmed`].
@@ -386,10 +392,14 @@ pub const OUTBOX_MAGIC_V1: &[u8] = b"daemonseed/dm/outbox/v1\0";
 pub const SUITE_ID_LEN: usize = 2;
 
 /// Bytes [`Outbox::encode`] writes before the first entry: magic, suite id,
-/// direction tag, entry count. The count is a fixed-width `u32`, so adding an entry
-/// never changes the header's size — which is what lets [`Outbox::insert`] price a
-/// candidate entry on its own.
-const OUTBOX_HEADER_LEN: usize = OUTBOX_MAGIC.len() + SUITE_ID_LEN + 1 + 4;
+/// direction tag, pruned high-water, entry count. The count is a fixed-width `u32`
+/// and the high-water a fixed-width `u64`, so adding an entry never changes the
+/// header's size — which is what lets [`Outbox::insert`] price a candidate entry on
+/// its own.
+///
+/// The high-water is v4's addition (#323); a v3 record has 8 fewer header bytes and
+/// is read with the field defaulted to zero.
+const OUTBOX_HEADER_LEN: usize = OUTBOX_MAGIC.len() + SUITE_ID_LEN + 1 + 8 + 4;
 
 /// Bytes an entry costs regardless of its target or lifecycle: sequence (8),
 /// composed-at (8), rung (4), next-due (8), and the acceptance, surfacing and
@@ -427,6 +437,16 @@ pub enum OutboxError {
     /// replace a sealed frame or reset a give-up clock; both are silent data
     /// loss, so neither is offered.
     DuplicateSequence(u64),
+    /// The last representable sequence number. Refused because the outbox's
+    /// pruned high-water is *one past* the highest pruned sequence, and
+    /// `u64::MAX + 1` has no spelling — so accepting it would leave the mark
+    /// unable to exclude the very sequence it had reclaimed, and the entry could
+    /// be enqueued a second time (#323).
+    ///
+    /// Nothing legitimate reaches this: a direction's sequence space is one
+    /// monotonic counter per conversation. It is refused rather than assumed
+    /// unreachable because `enqueue_sealed` is public and takes any `u64`.
+    SequenceExhausted,
     /// The outbox cannot take another message: encoding it would exceed
     /// [`crate::storage::dm_store::OUTBOX_CAPACITY`], the fixed size of the
     /// correspondence's on-disk record.
@@ -529,6 +549,11 @@ impl std::fmt::Display for OutboxError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::DuplicateSequence(s) => write!(f, "sequence {s} is already in the outbox"),
+            Self::SequenceExhausted => write!(
+                f,
+                "sequence {} is the last representable one and cannot be used",
+                u64::MAX
+            ),
             // Names the overshoot rather than the raw total: "over by 12 KiB" is
             // what a sender or an operator can act on, where two seven-digit byte
             // counts are something to subtract first. The sequence number is the
@@ -1281,6 +1306,19 @@ pub struct TeardownOutcome {
 pub struct Outbox {
     direction: Direction,
     entries: std::collections::BTreeMap<u64, OutboxEntry>,
+    /// One past the highest sequence [`Self::prune`] has removed; zero when
+    /// nothing has been pruned (#323).
+    ///
+    /// **Durable, and that is why the at-rest format went to v4.** Pruning removes
+    /// the entry that provided sequence dedup — `Outbox::insert` refuses a repeat by
+    /// looking in `entries` — so without this a pruned sequence could be enqueued
+    /// again, which is a second ciphertext at a write-once slot.
+    ///
+    /// **Not "the highest pruned sequence".** Sequence 0 is a real message — the
+    /// responder's opening reply is `b2a` 0 — so a zero sentinel would be
+    /// indistinguishable from having pruned it. Reading this as an exclusive lower
+    /// bound makes the empty case honest: 0 admits everything.
+    pruned_high_water: u64,
 }
 
 impl Outbox {
@@ -1295,6 +1333,7 @@ impl Outbox {
         Self {
             direction,
             entries: std::collections::BTreeMap::new(),
+            pruned_high_water: 0,
         }
     }
 
@@ -1432,7 +1471,17 @@ impl Outbox {
         lifecycle: Lifecycle,
     ) -> Result<&mut OutboxEntry, OutboxError> {
         validate_target(target)?;
-        if self.entries.contains_key(&seq) {
+        // Below the high-water the entry is GONE rather than absent, so
+        // `contains_key` cannot answer this and would admit a repeat (#323). Both
+        // answers are `DuplicateSequence` because both mean the same thing to a
+        // caller — this sequence has already been used on this correspondence — and
+        // a second variant would invite a caller to treat one as recoverable.
+        // Before the dedup, because the dedup depends on it: see
+        // `OutboxError::SequenceExhausted`.
+        if seq == u64::MAX {
+            return Err(OutboxError::SequenceExhausted);
+        }
+        if seq < self.pruned_high_water || self.entries.contains_key(&seq) {
             return Err(OutboxError::DuplicateSequence(seq));
         }
         // The capacity gate, and it lives here rather than at either public door
@@ -1476,6 +1525,91 @@ impl Outbox {
             acceptance: Acceptance::Unconfirmed,
         };
         Ok(self.entries.entry(seq).or_insert(entry))
+    }
+
+    /// Drop every entry that is finished and owes nothing, and return how many
+    /// went (#323).
+    ///
+    /// **Why the record needs this at all.** [`Self::encode`] writes every entry
+    /// ever inserted. A terminal entry sheds its sealed frame but keeps its fixed
+    /// fields for ever, so the record grows with *lifetime* messages rather than
+    /// owed ones, and at [`crate::storage::dm_store::OUTBOX_CAPACITY`] that wall is
+    /// around 52 000. It is permanent rather than a hiccup: the persist path is
+    /// read-modify-write and always writes, so past the wall every future write
+    /// fails — no enqueue, no sweep, no settle — for the life of the correspondence,
+    /// and nothing would ever shrink the map again.
+    ///
+    /// **The predicate is deliberately narrow, and the narrowness is the whole
+    /// argument.** An entry qualifies only when it is terminal —
+    /// [`Lifecycle::is_pending`] is false — **and** its [`Surfacing`] is already
+    /// `Clear`. #291 rejected eviction because the obvious candidate, a given-up
+    /// entry, is exactly the one owing a surfacing, and discarding it would
+    /// reintroduce the silent loss #279 closed. An entry that is finished *and*
+    /// already surfaced owes nothing to anyone: no frame, no notification, no
+    /// acknowledgement.
+    ///
+    /// **What is lost with the entry, and what replaces it.** The map was the
+    /// sequence-dedup mechanism: `Outbox::insert` refuses a repeat by looking for
+    /// it. A pruned sequence is no longer there to be found, so
+    /// [`Self::pruned_high_water`] takes that job at constant cost, and `insert`
+    /// consults both.
+    ///
+    /// **Pruning never re-opens capacity that was refused for the right reason.**
+    /// It shrinks the encoded record, so a send the capacity gate refused may
+    /// succeed afterwards — that is the point rather than a surprise, because the
+    /// bytes freed belonged to messages that are finished and acknowledged. It
+    /// cannot free an *owed* frame, which is what fills the bucket in ordinary use.
+    ///
+    /// **Three things a caller must decide before wiring this, none of which this
+    /// module can answer.** They are why nothing calls it yet.
+    ///
+    /// 1. **Pruning erases delivery history from the drawing surface.**
+    ///    `DmPersist::read_outbox` exists "for drawing the outbox", and
+    ///    `Self::entry` returns `None` for a pruned sequence — so every past
+    ///    `ConfirmedCollected` message becomes indistinguishable from one never
+    ///    sent. [`Self::pruned_high_water`] says *below this it is gone*, never *in
+    ///    which state it went*. "Owes nothing to anyone" is true of the protocol and
+    ///    false of a UI that wanted to render a delivered tick.
+    /// 2. **A live entry below the high-water is reachable, and it burns sequence
+    ///    numbers permanently.** Settle and prune a high sequence while a lower one
+    ///    is still owed, and every unused sequence below the mark is refused for
+    ///    ever. Harmless under a monotonic allocator, silent and unrecoverable under
+    ///    anything else.
+    /// 3. **Anything deriving a ceiling from `entries.keys().max()` must stop.**
+    ///    Pruning regresses that maximum without a restart and permanently; after a
+    ///    prune, `pruned_high_water - 1` is the only surviving record of the high
+    ///    sequences. An acknowledgement path that clipped to a regressed ceiling
+    ///    would report delivered messages as undelivered.
+    pub fn prune(&mut self) -> usize {
+        let doomed: Vec<u64> = self
+            .entries
+            .iter()
+            .filter(|(_, e)| !e.lifecycle.is_pending() && e.surfacing == Surfacing::Clear)
+            .map(|(seq, _)| *seq)
+            .collect();
+        for seq in &doomed {
+            self.entries.remove(seq);
+            // One past the pruned sequence, and monotone: a later prune of a lower
+            // sequence must not lower the bound. `u64::MAX` is refused at enqueue
+            // (`OutboxError::SequenceExhausted`) precisely so this successor is
+            // always exact — a saturating one would leave the mark unable to
+            // exclude the sequence it had just reclaimed.
+            let past = seq
+                .checked_add(1)
+                .expect("u64::MAX is refused at enqueue, so a stored seq has a successor");
+            self.pruned_high_water = self.pruned_high_water.max(past);
+        }
+        doomed.len()
+    }
+
+    /// One past the highest sequence [`Self::prune`] has removed; zero when nothing
+    /// has been pruned.
+    ///
+    /// Exposed so a caller can tell "this sequence was never used" from "this
+    /// sequence is finished and its entry has been reclaimed" — the map alone can no
+    /// longer answer that.
+    pub fn pruned_high_water(&self) -> u64 {
+        self.pruned_high_water
     }
 
     /// Sequences whose next emission is due at `now_ms`, in sequence order.
@@ -1755,6 +1889,9 @@ impl Outbox {
             Direction::AToB => 0,
             Direction::BToA => 1,
         });
+        // Before the count, so the header stays fixed-width and `encoded_len` can
+        // price a candidate entry without knowing how many are already stored.
+        out.extend_from_slice(&self.pruned_high_water.to_be_bytes());
         out.extend_from_slice(&(self.entries.len() as u32).to_be_bytes());
         for entry in self.entries.values() {
             out.extend_from_slice(&entry.seq.to_be_bytes());
@@ -1816,10 +1953,15 @@ impl Outbox {
         // v3 carries an acceptance byte per entry and v2 does not, so the
         // version has to survive the header read rather than being checked and
         // dropped.
-        let has_acceptance = if magic == OUTBOX_MAGIC {
-            true
+        // v3 and v4 carry an acceptance byte per entry and v2 does not; v4 alone
+        // carries the pruned high-water. Both facts have to survive the header read
+        // rather than being checked and dropped.
+        let (has_acceptance, has_high_water) = if magic == OUTBOX_MAGIC {
+            (true, true)
+        } else if magic == OUTBOX_MAGIC_V3 {
+            (true, false)
         } else if magic == OUTBOX_MAGIC_V2 {
-            false
+            (false, false)
         } else if magic == OUTBOX_MAGIC_V1 {
             return Err(OutboxError::UnsupportedVersion);
         } else {
@@ -1840,8 +1982,17 @@ impl Outbox {
                 });
             }
         };
+        // v4 only. A v3 or v2 record pruned nothing, so zero is the truthful
+        // default rather than a fallback: every sequence it never held is still
+        // admissible, which is exactly what the field means.
+        let pruned_high_water = if has_high_water {
+            u64::from_be_bytes(r.array()?)
+        } else {
+            0
+        };
         let count = u32::from_be_bytes(r.array()?);
         let mut out = Self::new(direction);
+        out.pruned_high_water = pruned_high_water;
         for _ in 0..count {
             let seq = u64::from_be_bytes(r.array()?);
             let target = match r.byte()? {
@@ -2091,12 +2242,32 @@ mod tests {
         SealedFrame::new(frame_bytes(seed))
     }
 
+    /// Turn a freshly-encoded v4 record into the v2 bytes a pre-#278 build wrote.
+    ///
+    /// Two fields have to come back out, and naming them here rather than at each
+    /// call site is why this exists: v4's 8-byte pruned high-water (#323) and v3's
+    /// per-entry acceptance byte (#278). An earlier version of these fixtures
+    /// removed only the acceptance byte, so when v4 arrived they produced a record
+    /// that was neither version and failed with `TrailingBytes` — a fixture wrong in
+    /// a way that looks like a decoder bug.
+    fn downgrade_v4_to_v2(v4: &[u8]) -> Vec<u8> {
+        let mut out = v4.to_vec();
+        // The acceptance byte first: it sits after the high-water, so removing the
+        // earlier field would shift it.
+        out.remove(SURFACING_AT - 1);
+        let hw = OUTBOX_MAGIC.len() + SUITE_ID_LEN + 1;
+        out.drain(hw..hw + 8);
+        out[..OUTBOX_MAGIC_V2.len()].copy_from_slice(OUTBOX_MAGIC_V2);
+        out
+    }
+
     /// Byte offset of the first entry's surfacing tag, named from the layout
     /// rather than searched for — so a field inserted ahead of it breaks the
     /// tests that use it loudly instead of poking at the wrong byte.
     const SURFACING_AT: usize = OUTBOX_MAGIC.len()
         + SUITE_ID_LEN
         + 1 /* direction */
+        + 8 /* pruned high-water, v4 (#323) */
         + 4 /* count */
         + 8 /* seq */
         + 1 /* a ChannelPage target tag */
@@ -2265,6 +2436,204 @@ mod tests {
         assert!(
             entry.frame().is_none(),
             "a refused publish must not install the frame"
+        );
+    }
+
+    /// **Pruning removes finished, surfaced entries and NOTHING else (#323).**
+    ///
+    /// Both halves of the predicate are pinned here, and the terminality half is
+    /// the one that matters most: a freshly enqueued entry is `Surfacing::Clear`
+    /// **and** pending, so a predicate that checked only the surfacing would delete
+    /// a live sealed frame the sender was told was queued — the #279/#291 silent
+    /// loss, arriving through the fix for #323.
+    ///
+    /// **The first version of this test could not see that.** Its comment said
+    /// "3: still pending" while composing all three entries at `T0` and sweeping
+    /// past the give-up, so every one of them was terminal and the terminality half
+    /// was untested: dropping it passed the entire 1 211-test suite. The live entry
+    /// is now composed late enough that the sweep genuinely cannot reach it, and
+    /// that is asserted rather than described.
+    #[test]
+    fn prune_takes_only_entries_that_are_finished_and_already_surfaced() {
+        let mut ob = empty();
+        // 1: terminal and surfaced — the only shape that may go.
+        ob.enqueue_sealed(1, channel(), T0, frame(0x11)).unwrap();
+        // 2: terminal but still OWES a surfacing.
+        ob.enqueue_sealed(2, channel(), T0, frame(0x22)).unwrap();
+        // 3: composed one millisecond before the sweep, so it is inside its window
+        // and genuinely live — this is the entry the terminality half protects.
+        ob.enqueue_sealed(3, channel(), T0 + GIVE_UP_MS, frame(0x33))
+            .unwrap();
+
+        let given_up = ob.sweep_give_ups(T0 + GIVE_UP_MS + 1);
+        assert!(
+            given_up.contains(&1) && given_up.contains(&2),
+            "the fixture did not end the entries it needs terminal"
+        );
+        assert!(
+            !given_up.contains(&3),
+            "the fixture's live entry was swept, so the terminality half is untested \
+             — which is exactly how the first version of this test passed while the \
+             predicate was broken"
+        );
+        // Fresh entries are `Clear`, which is what makes a surfacing-only predicate
+        // dangerous rather than merely wrong.
+        assert_eq!(ob.entry(3).unwrap().surfacing(), Surfacing::Clear);
+
+        // Only 1 is told it reached the user.
+        ob.record_surfaced(&[1]);
+
+        let removed = ob.prune();
+        assert_eq!(removed, 1, "only the finished-and-surfaced entry may go");
+        assert!(
+            ob.entry(1).is_none(),
+            "the finished, surfaced entry survived"
+        );
+        assert!(
+            ob.entry(2).is_some(),
+            "an entry owing a surfacing was pruned — that is the silent loss #279 closed"
+        );
+        assert!(
+            ob.entry(3).is_some(),
+            "a LIVE entry was pruned, destroying a sealed frame the sender was told \
+             was queued"
+        );
+        assert!(
+            ob.entry(3).unwrap().frame().is_some(),
+            "the live entry lost its frame"
+        );
+    }
+
+    /// **The last representable sequence is refused, because the high-water cannot
+    /// exclude it otherwise (#323).**
+    ///
+    /// Found by review, and it is the dedup replacement failing in exactly the place
+    /// it was added to protect. The mark is *one past* the highest pruned sequence;
+    /// `u64::MAX + 1` has no spelling, so a saturating successor left the mark at
+    /// `u64::MAX` while the guard `seq < mark` is false for `seq == u64::MAX` — the
+    /// pruned sequence was re-admitted, a second ciphertext at a write-once slot.
+    /// Refusing it at enqueue makes every stored sequence's successor exact.
+    #[test]
+    fn the_last_representable_sequence_is_refused() {
+        let mut ob = empty();
+        assert_eq!(
+            ob.enqueue_sealed(u64::MAX, channel(), T0, frame(0x11)),
+            Err(OutboxError::SequenceExhausted),
+            "accepting u64::MAX leaves the pruned high-water unable to exclude it"
+        );
+        // The neighbour is fine, so this is a boundary rather than a range refusal.
+        assert!(
+            ob.enqueue_sealed(u64::MAX - 1, channel(), T0, frame(0x22))
+                .is_ok()
+        );
+        // And the successor of the largest ACCEPTED sequence is representable, which
+        // is the property the refusal exists to guarantee.
+        let _ = ob.sweep_give_ups(T0 + GIVE_UP_MS + 1);
+        ob.record_surfaced(&[u64::MAX - 1]);
+        assert_eq!(ob.prune(), 1);
+        assert_eq!(ob.pruned_high_water(), u64::MAX);
+        assert_eq!(
+            ob.enqueue_sealed(u64::MAX - 1, channel(), T0, frame(0x33)),
+            Err(OutboxError::DuplicateSequence(u64::MAX - 1)),
+            "the reclaimed sequence must still be excluded at the very top of the space"
+        );
+    }
+
+    /// **A pruned sequence cannot be enqueued again.**
+    ///
+    /// Pruning removes the entry that provided sequence dedup, so without the
+    /// high-water this is a second ciphertext at a write-once slot. The two answers
+    /// are deliberately the same error: to a caller both mean "this sequence is
+    /// already used".
+    #[test]
+    fn a_pruned_sequence_is_still_refused_as_a_duplicate() {
+        let mut ob = empty();
+        ob.enqueue_sealed(7, channel(), T0, frame(0x11)).unwrap();
+        let _ = ob.sweep_give_ups(T0 + GIVE_UP_MS + 1);
+        ob.record_surfaced(&[7]);
+        assert_eq!(ob.prune(), 1);
+        assert!(ob.entry(7).is_none(), "the fixture did not prune");
+        assert_eq!(ob.pruned_high_water(), 8, "one past the pruned sequence");
+
+        assert_eq!(
+            ob.enqueue_sealed(7, channel(), T0, frame(0x22)),
+            Err(OutboxError::DuplicateSequence(7)),
+            "a pruned sequence was accepted again — a second ciphertext at a \
+             write-once slot"
+        );
+        // And everything at or above the mark is still admissible.
+        assert!(ob.enqueue_sealed(8, channel(), T0, frame(0x33)).is_ok());
+    }
+
+    /// **The high-water survives the at-rest round trip, and a v3 record reads as
+    /// having pruned nothing.**
+    ///
+    /// A high-water that reset on decode would be worse than none: the record would
+    /// come back admitting every sequence it had already reclaimed.
+    #[test]
+    fn the_pruned_high_water_is_durable_and_v3_defaults_to_zero() {
+        let mut ob = empty();
+        ob.enqueue_sealed(4, channel(), T0, frame(0x11)).unwrap();
+        let _ = ob.sweep_give_ups(T0 + GIVE_UP_MS + 1);
+        ob.record_surfaced(&[4]);
+        ob.prune();
+        assert_eq!(ob.pruned_high_water(), 5);
+
+        let back = round_trip(&ob);
+        assert_eq!(
+            back.pruned_high_water(),
+            5,
+            "the high-water did not survive persistence, so a restart would re-admit \
+             a reclaimed sequence"
+        );
+        assert_eq!(back, ob, "the round trip changed the outbox");
+
+        // A v3 record carries no such field. Zero is the truthful reading — it
+        // pruned nothing — and it must not be mistaken for a corrupt one.
+        let v4 = ob.encode();
+        let mut v3 = v4.clone();
+        let hw = OUTBOX_MAGIC.len() + SUITE_ID_LEN + 1;
+        v3.drain(hw..hw + 8);
+        v3[..OUTBOX_MAGIC_V3.len()].copy_from_slice(OUTBOX_MAGIC_V3);
+        let decoded =
+            Outbox::decode(&v3, T0 + 10 * GIVE_UP_MS).expect("a v3 record must still be readable");
+        assert_eq!(
+            decoded.pruned_high_water(),
+            0,
+            "a v3 record must read as having pruned nothing"
+        );
+    }
+
+    /// **Pruning is priced by the capacity gates, which is the interaction with
+    /// #291 worth pinning.**
+    ///
+    /// `encoded_len` and both gates compute from the entry set, so pruning shrinks
+    /// what they price and a send the gate refused can succeed afterwards. That is
+    /// the intended behaviour — the bytes freed belonged to finished, acknowledged
+    /// messages — but it is behaviour a reader would not guess from either change
+    /// alone, so it is asserted rather than left implied.
+    #[test]
+    fn pruning_shrinks_what_the_capacity_gates_price() {
+        let mut ob = empty();
+        for seq in 1..=20 {
+            ob.enqueue_sealed(seq, channel(), T0, frame(seq as u8))
+                .unwrap();
+        }
+        let before = ob.encoded_len();
+        assert_eq!(before, ob.encode().len(), "the predictor must agree first");
+
+        let given_up = ob.sweep_give_ups(T0 + GIVE_UP_MS + 1);
+        ob.record_surfaced(&given_up);
+        let removed = ob.prune();
+        assert!(removed > 0, "the fixture pruned nothing");
+
+        let after = ob.encoded_len();
+        assert!(after < before, "pruning did not shrink the priced size");
+        assert_eq!(
+            after,
+            ob.encode().len(),
+            "the predictor and the encoder disagree after a prune, so the capacity \
+             gates would price a record that does not exist"
         );
     }
 
@@ -3989,7 +4358,8 @@ mod tests {
         // silently poking at the wrong byte.
         const SUITE: usize = OUTBOX_MAGIC.len();
         const DIR_TAG: usize = SUITE + SUITE_ID_LEN;
-        const COUNT: usize = DIR_TAG + 1;
+        const HIGH_WATER: usize = DIR_TAG + 1;
+        const COUNT: usize = HIGH_WATER + 8;
         const SEQ: usize = COUNT + 4;
         const TARGET_TAG: usize = SEQ + 8;
         const COMPOSED: usize = TARGET_TAG + 1; // a ChannelPage target is one byte
@@ -4091,7 +4461,8 @@ mod tests {
         let encoded = ob.encode();
         // Every byte accounted for, named: nothing is left over to be anything
         // else — in particular there is nowhere a message body could be hiding.
-        let header = OUTBOX_MAGIC.len() + 2 /* suite id */ + 1 /* direction */ + 4 /* count */;
+        let header =
+            OUTBOX_MAGIC.len() + 2 /* suite id */ + 1 /* direction */ + 8 /* high-water */ + 4 /* count */;
         let entry = 8 /* seq */
             + 1 /* target tag */
             + 8 /* composed_at_ms */
@@ -4432,9 +4803,7 @@ mod tests {
             "the acceptance byte is not where the layout says it is"
         );
 
-        let mut v2 = v3.clone();
-        v2.remove(SURFACING_AT - 1);
-        v2[..OUTBOX_MAGIC_V2.len()].copy_from_slice(OUTBOX_MAGIC_V2);
+        let v2 = downgrade_v4_to_v2(&v3);
         assert_eq!(
             OUTBOX_MAGIC.len(),
             OUTBOX_MAGIC_V2.len(),
@@ -4484,7 +4853,11 @@ mod tests {
         );
 
         let v3 = ob.encode();
-        let header = OUTBOX_MAGIC.len() + SUITE_ID_LEN + 1 /* direction */ + 4 /* count */;
+        let header = OUTBOX_MAGIC.len()
+            + SUITE_ID_LEN
+            + 1 /* direction */
+            + 8 /* high-water */
+            + 4 /* count */;
         let stride = (v3.len() - header) / 2;
         let first = SURFACING_AT - 1;
         let second = first + stride;
@@ -4500,6 +4873,9 @@ mod tests {
         // Later byte first, so removing it does not move the earlier offset.
         v2.remove(second);
         v2.remove(first);
+        // And v4's pruned high-water, which this record's version never carried.
+        let hw = OUTBOX_MAGIC.len() + SUITE_ID_LEN + 1;
+        v2.drain(hw..hw + 8);
         v2[..OUTBOX_MAGIC_V2.len()].copy_from_slice(OUTBOX_MAGIC_V2);
 
         let decoded =

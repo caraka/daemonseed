@@ -178,6 +178,14 @@ work lives in the project lead's vault manifest, not here.
 
 ### Changed
 
+- The DM outbox's at-rest format is `v4`, adding a pruned high-water mark. `v3`
+  and `v2` records are read, with the field defaulting to zero. `Outbox::prune`
+  removes entries that are terminal **and** already surfaced, which nothing did
+  before. The high-water takes over the sequence dedup the pruned entries
+  provided, and `u64::MAX` is refused at enqueue so its successor is always
+  representable. Nothing calls `prune` yet, so the growth the issue describes is
+  still reachable in any build that wires this module. (#323)
+
 - `dm::domain`'s labels and their registry come from one `dm_labels!` invocation,
   so `ALL` cannot omit a label it declares and a byte value cannot drift from its
   declaration. Three tests that read the module's own source as text are retired
