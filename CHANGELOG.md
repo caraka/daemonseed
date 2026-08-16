@@ -195,6 +195,10 @@ work lives in the project lead's vault manifest, not here.
 
 ### Fixed
 
+- Corrected two `NOT YET AVAILABLE` notes in the core API manifest that named
+  capabilities the tree ships: persistence and restore, and a store that reads
+  and writes an outbox. Both are `dm::persist` over `storage::dm_store`.
+
 - `Locked::delete` repairs a record whose mode lost owner-write, then fails
   loudly instead of wedging. The delete stays fail-closed — erasing the record
   is the forward-secrecy premise — but `EACCES` is permanent, so every retry

@@ -1076,9 +1076,9 @@ modules:
       the unsettled positions below the highest settled one; view() ->
       CollectionView returns contiguous_through, frontier_page and outstanding as
       owned data. The frame's declared-sequence check is ParsedFrame::open's
-      found_at, one layer above. NOT YET AVAILABLE: persistence and restore, the
-      doorbell sweep, the accept/decline/block flow, the contact cache, the block
-      list, the transport wiring and the UI (#236, #243).
+      found_at, one layer above. NOT YET AVAILABLE: the doorbell sweep, the
+      accept/decline/block flow, the contact cache, the block list, the transport
+      wiring and the UI (#236, #243).
       Sub-module dm::persist is the wiring between these types and
       storage::dm_store, and is what makes any of this reach a disk. DmPersist
       derives both the store key and the provisional record's key from one
@@ -1218,9 +1218,8 @@ modules:
       permanently, while clamping it would make one bad boot clock a durable
       corruption that gives up on every live message. next_due_ms is taken
       verbatim and needs no bound — the give-up reads composed_at_ms, so a
-      far-future due time still sweeps and still surfaces. NOT YET AVAILABLE:
-      any store that writes or reads an outbox, and the transport that emits from
-      one (#235 transport half).
+      far-future due time still sweeps and still surfaces. NOT YET AVAILABLE: the
+      transport that emits from an outbox (#235 transport half).
       Sub-module dm::resume is the A9.2 re-establishment resume record.
       ResumeRecord::new(s_pc: Box<[u8; ml_dsa::SK_LEN]>, pk_pc: Box<[u8;
       ml_dsa::PK_LEN]>, committed_root: CommittedRoot, sealed: SealedReEst,
