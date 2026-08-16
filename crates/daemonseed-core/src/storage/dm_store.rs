@@ -256,7 +256,15 @@ const _: () = assert!(
 /// covering a thousand owed messages costs ~20 MB *per correspondence* — because
 /// frame padding multiplies against the fixed bucket. So the send-path refusal
 /// #291 tracks is **the mechanism, not a backstop**: it is expected to fire in
-/// ordinary use, and it is not built here.
+/// ordinary use.
+///
+/// **That refusal is built.** [`crate::dm::outbox::Outbox`] prices a candidate
+/// entry against this constant before accepting it and answers
+/// [`crate::dm::outbox::OutboxError::Full`], so a sender is told at enqueue rather
+/// than discovering it at the write — the gate sits inside the private `insert`
+/// that both public enqueue doors funnel through, so nothing can enqueue around
+/// it. What it does NOT decide is what the user is shown; that surface is still
+/// open.
 ///
 /// **The trade is disk against the leak.** Every correspondence pays this in
 /// full whether it owes one message or none, which is the price of the file

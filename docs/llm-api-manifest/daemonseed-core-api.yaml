@@ -1121,7 +1121,16 @@ modules:
       enqueue_sealed(seq, target, now_ms, frame) and
       enqueue_awaiting_key(seq, target, now_ms) -> Result<&mut
       OutboxEntry, OutboxError> add one, taking the caller's clock as the compose
-      time; a repeat is OutboxError::DuplicateSequence. OutboxTarget is Doorbell { slot },
+      time; a repeat is OutboxError::DuplicateSequence, and a message the record
+      could not then hold is OutboxError::Full { seq, needed, capacity } with
+      needed the would-be total and Display rendering the excess. publish(seq,
+      now_ms, frame) installs the sealed frame on an AwaitingKey entry and is the
+      only public way to do so — OutboxEntry::publish is pub(crate) — because
+      installing a frame is the other edge that grows the record and is gated the
+      same way; an unknown seq is OutboxError::UnknownSequence. Both gates price
+      the candidate before mutating, so a refusal leaves the outbox byte-identical.
+      encoded_len() -> usize is the exact length encode() would produce and is
+      what both gates consult. OutboxTarget is Doorbell { slot },
       validated against DOORBELL_SLOTS, or ChannelPage; the record key is not
       carried and OutboxEntry::position() derives the page slot from the sequence
       number. Lifecycle is AwaitingKey,

@@ -48,7 +48,7 @@
 //!    `DerefMut`, no public field. `&mut OutboxEntry` cannot reach the bytes,
 //!    only `&[u8]` through [`OutboxEntry::frame`] and [`OutboxEntry::emit`].
 //! 3. The lifecycle is a state machine with **one frame-installing edge**
-//!    ([`OutboxEntry::publish`], `AwaitingKey → AwaitingCollection`) and no edge
+//!    (`OutboxEntry::publish`, `AwaitingKey → AwaitingCollection`) and no edge
 //!    anywhere back into `AwaitingKey`. So a frame enters an entry at most once
 //!    over the entry's whole life, whatever order a caller drives it in.
 //!
@@ -231,7 +231,7 @@
 //! notification for a transition that never happened — the mirror of the loss
 //! this flag exists to prevent.
 //!
-//! [`OutboxEntry::publish`] is deliberately **not** one of those edges: it is a
+//! `OutboxEntry::publish` is deliberately **not** one of those edges: it is a
 //! step *inside* a message's life, not the end of one, and the UI already reads
 //! it through [`OutboxEntry::delivery_state`] whenever it draws the outbox.
 //!
@@ -280,6 +280,7 @@ use crate::dm::paging::{PagePosition, position_of};
 use crate::dm::provisional::TeardownCause;
 use crate::dm::push_lp;
 use crate::dm::ratchet::Direction;
+use crate::storage::dm_store::OUTBOX_CAPACITY;
 
 /// The re-seed ladder, one rung per emission, the last rung repeating.
 ///
@@ -384,6 +385,41 @@ pub const OUTBOX_MAGIC_V1: &[u8] = b"daemonseed/dm/outbox/v1\0";
 /// layout [`crate::storage::seeds`] and [`crate::storage::recovery_file`] use.
 pub const SUITE_ID_LEN: usize = 2;
 
+/// Bytes [`Outbox::encode`] writes before the first entry: magic, suite id,
+/// direction tag, entry count. The count is a fixed-width `u32`, so adding an entry
+/// never changes the header's size — which is what lets [`Outbox::insert`] price a
+/// candidate entry on its own.
+const OUTBOX_HEADER_LEN: usize = OUTBOX_MAGIC.len() + SUITE_ID_LEN + 1 + 4;
+
+/// Bytes an entry costs regardless of its target or lifecycle: sequence (8),
+/// composed-at (8), rung (4), next-due (8), and the acceptance, surfacing and
+/// lifecycle tags (1 each).
+const ENTRY_FIXED_LEN: usize = 8 + 8 + 4 + 8 + 1 + 1 + 1;
+
+/// Bytes the target costs: the tag, plus a `u16` slot for a doorbell.
+const fn target_encoded_len(target: OutboxTarget) -> usize {
+    match target {
+        OutboxTarget::Doorbell { .. } => 1 + 2,
+        OutboxTarget::ChannelPage => 1,
+    }
+}
+
+/// Bytes the lifecycle costs *beyond* its tag: a length-prefixed frame while the
+/// entry still owes one, and nothing once it is terminal. This is the only
+/// variable-length field in an entry, and the reason a full outbox is a function of
+/// how many messages are OWED rather than how many were ever sent.
+fn lifecycle_payload_len(lifecycle: &Lifecycle) -> usize {
+    match lifecycle {
+        Lifecycle::AwaitingCollection(frame) => 8 + frame.len(),
+        _ => 0,
+    }
+}
+
+/// The exact bytes one entry contributes to [`Outbox::encode`]'s output.
+fn entry_encoded_len(entry: &OutboxEntry) -> usize {
+    ENTRY_FIXED_LEN + target_encoded_len(entry.target) + lifecycle_payload_len(&entry.lifecycle)
+}
+
 /// What can go wrong driving or decoding an outbox.
 #[derive(Debug, PartialEq, Eq)]
 pub enum OutboxError {
@@ -391,6 +427,37 @@ pub enum OutboxError {
     /// replace a sealed frame or reset a give-up clock; both are silent data
     /// loss, so neither is offered.
     DuplicateSequence(u64),
+    /// The outbox cannot take another message: encoding it would exceed
+    /// [`crate::storage::dm_store::OUTBOX_CAPACITY`], the fixed size of the
+    /// correspondence's on-disk record.
+    ///
+    /// **This is an answer to the sender, and it is expected to fire in ordinary
+    /// use** (#291). The bucket holds 106–213 *owed* messages against a seven-day
+    /// give-up window, and no affordable fixed size closes that gap, because the
+    /// size is fixed precisely so the file does not track queue depth. Refusing
+    /// here rather than at persist is the point: the alternative is accepting a
+    /// message into an in-memory outbox that the record cannot hold, so the user is
+    /// told it is queued and a crash before the next successful write loses it with
+    /// nothing on any surface.
+    ///
+    /// `needed` is what the encoded outbox WOULD occupy with this entry added, so
+    /// `needed - capacity` is the overshoot rather than the total.
+    Full {
+        /// The sequence number that was refused. Nothing was stored or installed
+        /// for it, and any entry it names is unchanged.
+        seq: u64,
+        /// Bytes the outbox would have encoded to had this been accepted — the
+        /// **total**, not the excess. [`std::fmt::Display`] renders the excess
+        /// (`needed - capacity`) because that is the actionable number; a surface
+        /// formatting these fields directly should do the subtraction rather than
+        /// showing a reader a seven-digit total.
+        needed: usize,
+        /// Bytes the record can hold.
+        capacity: usize,
+    },
+    /// No entry carries this sequence number. Distinct from an entry that exists
+    /// and cannot do what was asked.
+    UnknownSequence(u64),
     /// A frame was offered to an entry that is not [`Lifecycle::AwaitingKey`].
     /// The single frame-installing edge, refusing to be a second one.
     AlreadyPublished(u64),
@@ -462,6 +529,21 @@ impl std::fmt::Display for OutboxError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::DuplicateSequence(s) => write!(f, "sequence {s} is already in the outbox"),
+            // Names the overshoot rather than the raw total: "over by 12 KiB" is
+            // what a sender or an operator can act on, where two seven-digit byte
+            // counts are something to subtract first. The sequence number is the
+            // handle this end and the correspondent share.
+            Self::Full {
+                seq,
+                needed,
+                capacity,
+            } => write!(
+                f,
+                "the outbox is full: sequence {seq} would need {} byte(s) more than the \
+                 {capacity}-byte record holds",
+                needed.saturating_sub(*capacity)
+            ),
+            Self::UnknownSequence(s) => write!(f, "sequence {s} is not in the outbox"),
             Self::AlreadyPublished(s) => {
                 write!(f, "sequence {s} already carries a sealed frame")
             }
@@ -593,7 +675,7 @@ pub enum OutboxTarget {
 /// Where an entry is in its life.
 ///
 /// **The one frame-installing edge is `AwaitingKey → AwaitingCollection`**
-/// ([`OutboxEntry::publish`]), and there is no edge back. Both terminal states
+/// (`OutboxEntry::publish`), and there is no edge back. Both terminal states
 /// drop the frame, because nothing re-emits a settled message and a retained
 /// ciphertext would only be a longer-lived copy of something already public.
 ///
@@ -896,7 +978,7 @@ impl OutboxEntry {
     /// counts emission attempts, so it is non-zero after a write that errored —
     /// a transport outage read as seven successful publications — and non-zero
     /// after a key-fetch retry on an entry that has never held a frame, which
-    /// then reported `OnDht` the instant [`Self::publish`] installed one. No
+    /// then reported `OnDht` the instant `OutboxEntry::publish` installed one. No
     /// arrangement of an attempt counter answers *did the transport take the
     /// bytes*, so the fact is carried separately and reported by the caller that
     /// holds it.
@@ -958,7 +1040,16 @@ impl OutboxEntry {
     /// `Composed`: a message that will never be sent, reported as one still
     /// being prepared. Refusing before the install makes the wasted seal
     /// visible at the moment it happens.
-    pub fn publish(&mut self, now_ms: i64, frame: SealedFrame) -> Result<(), OutboxError> {
+    ///
+    /// **`pub(crate)`, and that is load-bearing (#291).** Installing a frame is the
+    /// only edge that GROWS an entry, so it is the only other place the outbox can
+    /// cross [`crate::storage::dm_store::OUTBOX_CAPACITY`]. An entry admitted cheaply
+    /// as [`Lifecycle::AwaitingKey`] costs nothing beyond its fixed fields; the frame
+    /// that arrives later is the expensive part, and it does not pass through
+    /// [`Outbox::insert`] where the enqueue gate lives. Reaching this through
+    /// [`Outbox::entry_mut`] would therefore walk straight past the capacity check —
+    /// so the public door is [`Outbox::publish`], which prices the growth first.
+    pub(crate) fn publish(&mut self, now_ms: i64, frame: SealedFrame) -> Result<(), OutboxError> {
         if !matches!(self.lifecycle, Lifecycle::AwaitingKey) {
             return Err(OutboxError::AlreadyPublished(self.seq));
         }
@@ -1223,9 +1314,61 @@ impl Outbox {
     }
 
     /// One entry, mutably. It still cannot reach the frame bytes to change
-    /// them — [`SealedFrame`] offers nothing that would.
+    /// them — [`SealedFrame`] offers nothing that would — and since #291 it cannot
+    /// install a frame either: `OutboxEntry::publish` is `pub(crate)`, so the only
+    /// edge that grows an entry goes through [`Self::publish`] and its capacity
+    /// check. Everything reachable from here writes fixed-width fields or sheds a
+    /// frame, so no sequence of calls on the returned entry can enlarge the record.
     pub fn entry_mut(&mut self, seq: u64) -> Option<&mut OutboxEntry> {
         self.entries.get_mut(&seq)
+    }
+
+    /// Install the sealed frame on an entry that was enqueued awaiting its
+    /// recipient's key, refusing if the record could not then hold it.
+    ///
+    /// **The second capacity gate, and the reason one was not enough (#291).** The
+    /// enqueue gate in `Outbox::insert` prices an entry as it arrives, which is the
+    /// whole story for [`Self::enqueue_sealed`] — the frame is present at that
+    /// moment. It is emphatically not the story for [`Self::enqueue_awaiting_key`]:
+    /// that entry is admitted carrying **no frame at all**, costing only its fixed
+    /// fields, and the expensive part arrives here, later. Gating enqueue alone lets
+    /// a caller admit hundreds of cheap entries — every one of them correctly
+    /// accepted — and then install a frame on each, walking the record far past its
+    /// capacity with every call returning `Ok`. That is the #291 failure shape
+    /// exactly: the sender is told the message is queued, and the record is
+    /// unwritable by the time the store sees it, with the frames now *sealed*, so a
+    /// ratchet position and a nonce have been spent unrecoverably.
+    ///
+    /// The growth is priced as the difference between what the entry's lifecycle
+    /// costs now and what it would cost carrying the frame, so this stays correct if
+    /// a future lifecycle also carries bytes. As with the enqueue gate, the price is
+    /// computed before anything is mutated, so a refusal leaves the entry exactly as
+    /// it was — the frame is handed back to the caller by being dropped un-installed,
+    /// and the entry remains `AwaitingKey` with its give-up clock still running.
+    pub fn publish(
+        &mut self,
+        seq: u64,
+        now_ms: i64,
+        frame: SealedFrame,
+    ) -> Result<(), OutboxError> {
+        let entry = self
+            .entries
+            .get(&seq)
+            .ok_or(OutboxError::UnknownSequence(seq))?;
+        let current = lifecycle_payload_len(&entry.lifecycle);
+        let after = 8 + frame.len();
+        let needed = self.encoded_len() + after.saturating_sub(current);
+        if needed > OUTBOX_CAPACITY {
+            return Err(OutboxError::Full {
+                seq,
+                needed,
+                capacity: OUTBOX_CAPACITY,
+            });
+        }
+        self.entries
+            .get_mut(&seq)
+            .ok_or(OutboxError::UnknownSequence(seq))?
+            .publish(now_ms, frame)
     }
 
     /// Enqueue a message whose recipient's key record could not be fetched:
@@ -1281,6 +1424,33 @@ impl Outbox {
         validate_target(target)?;
         if self.entries.contains_key(&seq) {
             return Err(OutboxError::DuplicateSequence(seq));
+        }
+        // The capacity gate, and it lives here rather than at either public door
+        // deliberately: `insert` is private and both `enqueue_awaiting_key` and
+        // `enqueue_sealed` funnel through it, so one check covers the whole surface
+        // and no future caller can enqueue around it (#291).
+        //
+        // Refusing at ENQUEUE is the point. `Locked::replace` already refuses an
+        // oversized payload at the write, and refusing there is right — a truncated
+        // outbox parses to fewer messages than it had and is wrong in a way nothing
+        // downstream detects. But that fires after this outbox has accepted the
+        // message, i.e. after the sender has been told it is queued, and a crash
+        // before the next successful write then loses it silently. A refusal the
+        // sender can act on has to come first.
+        //
+        // Priced from the candidate's own fields rather than by inserting and
+        // measuring, so a refusal leaves the outbox exactly as it found it — there is
+        // no partially-applied state to unwind.
+        let needed = self.encoded_len()
+            + ENTRY_FIXED_LEN
+            + target_encoded_len(target)
+            + lifecycle_payload_len(&lifecycle);
+        if needed > OUTBOX_CAPACITY {
+            return Err(OutboxError::Full {
+                seq,
+                needed,
+                capacity: OUTBOX_CAPACITY,
+            });
         }
         let entry = OutboxEntry {
             seq,
@@ -1524,6 +1694,20 @@ impl Outbox {
             }
         }
         TeardownOutcome { retained, surfaced }
+    }
+
+    /// The exact byte length [`Self::encode`] would produce, without building it.
+    ///
+    /// **Exactness is the whole contract, not an optimisation.** This is what the
+    /// capacity gates consult before accepting a message, so a predictor that
+    /// drifts from the encoder does one of two harmful things: refuses sends that
+    /// would have fit, or — worse — accepts one the record cannot persist, which is
+    /// precisely the failure the check exists to prevent. The two are pinned
+    /// together by `encoded_len_is_exactly_what_encode_produces`, which walks
+    /// entry shapes rather than asserting on one hand-built outbox; a field added to
+    /// [`Self::encode`] and not mirrored here fails it.
+    pub fn encoded_len(&self) -> usize {
+        OUTBOX_HEADER_LEN + self.entries.values().map(entry_encoded_len).sum::<usize>()
     }
 
     /// The at-rest form: [`OUTBOX_MAGIC`], the suite id, the direction, a `u32`
@@ -1955,32 +2139,178 @@ mod tests {
         // dedup is on `seq`, so one slot serves every entry.
         let worst_target = OutboxTarget::Doorbell { slot: 0 };
 
-        let fill = |n: u64| {
-            let mut ob = empty();
-            for seq in 1..=n {
-                ob.enqueue_sealed(
-                    seq,
-                    worst_target,
-                    T0,
-                    SealedFrame::new(vec![0xA5; WORST_CASE_SEALED_FRAME_LEN]),
-                )
-                .unwrap();
-            }
-            ob.encode().len()
-        };
+        let worst_frame = || SealedFrame::new(vec![0xA5; WORST_CASE_SEALED_FRAME_LEN]);
 
-        let at = fill(AT_WORST);
+        let mut ob = empty();
+        for seq in 1..=AT_WORST {
+            ob.enqueue_sealed(seq, worst_target, T0, worst_frame())
+                .unwrap_or_else(|e| panic!("entry {seq} of {AT_WORST} must still fit: {e}"));
+        }
+        let at = ob.encode().len();
         assert!(
             at <= OUTBOX_CAPACITY,
             "{AT_WORST} worst-case frames encode to {at}, over the {OUTBOX_CAPACITY} bucket"
         );
 
-        let over = fill(AT_WORST + 1);
+        // The other side of the same boundary, and since #291 it is measured through
+        // the gate rather than by encoding an outbox that can no longer exist: the
+        // 107th entry is REFUSED, so "what would 107 encode to" has no spelling on
+        // the public API any more. This is the stronger pin of the two, because it
+        // ties `encoded_len` — which the gate consults — to `encode` at exactly the
+        // count where being one byte out changes the answer.
+        let err = ob
+            .enqueue_sealed(AT_WORST + 1, worst_target, T0, worst_frame())
+            .expect_err("the entry past the claimed count must be refused, not accepted");
         assert!(
-            over > OUTBOX_CAPACITY,
-            "{} worst-case frames encode to {over}, still inside {OUTBOX_CAPACITY} — \
-             the claimed count understates the real headroom",
-            AT_WORST + 1
+            matches!(
+                err,
+                OutboxError::Full { seq, needed, capacity }
+                    if seq == AT_WORST + 1
+                        && needed > OUTBOX_CAPACITY
+                        && capacity == OUTBOX_CAPACITY
+            ),
+            "the refusal must name the sequence and the real capacity: {err:?}"
+        );
+
+        // A refusal changes nothing. Priced from the candidate's own fields rather
+        // than by inserting and measuring, so there is no half-applied state — and
+        // an outbox that quietly grew on a refused send would be the silent loss the
+        // gate exists to prevent, wearing an error message.
+        assert_eq!(
+            ob.len() as u64,
+            AT_WORST,
+            "a refused enqueue must not be stored"
+        );
+        assert_eq!(
+            ob.encode().len(),
+            at,
+            "a refused enqueue must not change the encoding by even a byte"
+        );
+    }
+
+    #[test]
+    fn cheap_entries_cannot_be_fattened_past_the_bucket_by_publishing() {
+        use crate::dm::frame::WORST_CASE_SEALED_FRAME_LEN;
+        use crate::storage::dm_store::OUTBOX_CAPACITY;
+
+        // The hole a single enqueue-time gate leaves, and it is the design's own
+        // dominant path rather than an exotic one: `enqueue_awaiting_key` exists
+        // precisely for a recipient whose key record could not be fetched, and
+        // `publish` is the documented edge that resolves it. Those entries are
+        // admitted carrying NO frame, so hundreds fit trivially — and every frame
+        // arrives afterwards.
+        let target = OutboxTarget::Doorbell { slot: 0 };
+        let mut ob = empty();
+        for seq in 1..=500 {
+            ob.enqueue_awaiting_key(seq, target, T0)
+                .unwrap_or_else(|e| panic!("frameless entry {seq} must fit: {e}"));
+        }
+        assert!(
+            ob.encoded_len() < OUTBOX_CAPACITY,
+            "500 frameless entries must sit well inside the bucket — that is what \
+             makes this the interesting case"
+        );
+
+        // Now the frames arrive. Without the second gate every one of these returns
+        // Ok and the record ends multiples over capacity, unwritable, with each
+        // frame's ratchet position and nonce already spent.
+        let mut refused_at = None;
+        for seq in 1..=500 {
+            let frame = SealedFrame::new(vec![0xA5; WORST_CASE_SEALED_FRAME_LEN]);
+            if let Err(e) = ob.publish(seq, T0, frame) {
+                assert!(
+                    matches!(e, OutboxError::Full { seq: s, .. } if s == seq),
+                    "the refusal must be Full and name the sequence: {e:?}"
+                );
+                refused_at = Some(seq);
+                break;
+            }
+        }
+        let refused_at = refused_at.expect(
+            "publishing 500 worst-case frames onto frameless entries must be refused \
+             before the bucket overflows",
+        );
+        assert!(
+            refused_at > 1,
+            "the gate must not refuse the very first frame — that would mean it is \
+             mispricing rather than protecting"
+        );
+        assert!(
+            ob.encoded_len() <= OUTBOX_CAPACITY,
+            "the outbox must never be left over capacity: {} > {OUTBOX_CAPACITY}",
+            ob.encoded_len()
+        );
+        assert_eq!(
+            ob.encoded_len(),
+            ob.encode().len(),
+            "the predictor must still agree with the encoder at the boundary"
+        );
+
+        // A refused publish leaves the entry alone: still awaiting its key, so a
+        // later attempt with a smaller frame is a live option rather than a
+        // half-published entry that can never be emitted.
+        let entry = ob
+            .entry(refused_at)
+            .expect("the refused entry still exists");
+        assert!(
+            entry.frame().is_none(),
+            "a refused publish must not install the frame"
+        );
+    }
+
+    #[test]
+    fn encoded_len_is_exactly_what_encode_produces() {
+        // The contract the capacity gate rests on. `encoded_len` is a hand-written
+        // mirror of `encode`, so the two can drift — and drift is not cosmetic here:
+        // predicting LOW admits a message the record cannot persist, which is the
+        // silent loss #291 exists to stop, and predicting HIGH refuses sends that
+        // would have fit. Walking the entry shapes rather than asserting on one
+        // hand-built outbox is what makes a field added to `encode` and not mirrored
+        // here fail this.
+        let doorbell = OutboxTarget::Doorbell { slot: 3 };
+        let channel = OutboxTarget::ChannelPage;
+
+        // Empty: the header alone, and the one case with no entry to average over.
+        let ob = empty();
+        assert_eq!(ob.encoded_len(), ob.encode().len(), "empty outbox");
+
+        // Every combination of target and lifecycle that reaches `encode`, plus a
+        // terminal entry, whose shed frame is the difference the two counts in
+        // OUTBOX_CAPACITY's doc are about.
+        let mut ob = empty();
+        ob.enqueue_awaiting_key(1, doorbell, T0).unwrap();
+        assert_eq!(ob.encoded_len(), ob.encode().len(), "awaiting-key doorbell");
+
+        ob.enqueue_awaiting_key(2, channel, T0).unwrap();
+        assert_eq!(ob.encoded_len(), ob.encode().len(), "awaiting-key channel");
+
+        ob.enqueue_sealed(3, doorbell, T0, frame(0x11)).unwrap();
+        assert_eq!(ob.encoded_len(), ob.encode().len(), "sealed doorbell");
+
+        ob.enqueue_sealed(4, channel, T0, frame(0x22)).unwrap();
+        assert_eq!(ob.encoded_len(), ob.encode().len(), "sealed channel");
+
+        // A frame of a different length must move both counts by the same amount —
+        // the check that the length prefix is accounted for and not just the bytes.
+        ob.enqueue_sealed(5, channel, T0, SealedFrame::new(vec![0x33; 4_096]))
+            .unwrap();
+        assert_eq!(ob.encoded_len(), ob.encode().len(), "sealed, longer frame");
+
+        // Terminal: the entry survives, its frame does not.
+        let before = ob.encoded_len();
+        let given_up = ob.sweep_give_ups(T0 + GIVE_UP_MS + 1);
+        assert!(
+            !given_up.is_empty(),
+            "the sweep must actually end some entries"
+        );
+        assert_eq!(
+            ob.encoded_len(),
+            ob.encode().len(),
+            "after entries went terminal"
+        );
+        assert!(
+            ob.encoded_len() < before,
+            "a terminal entry sheds its frame, so the encoding must shrink"
         );
     }
 

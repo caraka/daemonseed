@@ -176,6 +176,22 @@ work lives in the project lead's vault manifest, not here.
 - The release profile panics on integer overflow (`[profile.release]
   overflow-checks = true`), workspace-wide. (#258)
 
+### Added
+
+- `Outbox` refuses a message it cannot persist, at enqueue rather than at the
+  write. A send that would push the correspondence's outbox past
+  `OUTBOX_CAPACITY` returns `OutboxError::Full` carrying the sequence number and
+  the overshoot, and nothing is stored. The bucket holds 106–213 owed messages
+  against a seven-day give-up window, so this is expected to fire in ordinary
+  use. What the sender is shown is not decided here. (#291)
+
+- `Outbox::publish` installs a sealed frame on an entry awaiting its recipient's
+  key, under the same capacity refusal. `OutboxEntry::publish` is now
+  `pub(crate)`: installing a frame is the other edge that grows the record, and
+  an entry enqueued without one is admitted cheaply, so gating enqueue alone
+  allowed hundreds of frameless entries to be fattened past capacity afterwards.
+  A refused publish leaves the entry awaiting its key. (#291)
+
 ### Fixed
 
 - Sweeping a DM page no longer creates it. `sweep_dm_page` opens through a new
