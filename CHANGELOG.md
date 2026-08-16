@@ -193,6 +193,12 @@ work lives in the project lead's vault manifest, not here.
   pre-migration values, and one narrow source check remains, because a label
   declared outside the macro is still possible. (#296)
 
+### Changed
+
+- **Breaking:** `storage::atomic_file` is now crate-internal. `AtomicReplaceError`,
+  `FileLock` and `LockError` are re-exported from `storage` — `DmStoreError` embeds
+  the first two, so a caller must still be able to name what it caught.
+
 ### Fixed
 
 - Corrected two `NOT YET AVAILABLE` notes in the core API manifest that named

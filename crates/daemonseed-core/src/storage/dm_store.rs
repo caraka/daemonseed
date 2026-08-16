@@ -2,7 +2,7 @@
 //! disk, and the place the lock becomes impossible to forget (#286, Amendment
 //! A9's build-obligation list, `docs/design/direct-messaging.md`).
 //!
-//! ## Why a store at all, when [`super::atomic_file`] already writes durably
+//! ## Why a store at all, when `super::atomic_file` already writes durably
 //!
 //! Three invariants have had no enforcement point anywhere in this tree, and
 //! none of them is expressible in a free function that takes a path and some

@@ -1,12 +1,12 @@
 //! At-rest storage — the three-layer split.
 //!
-//! - [`atomic_file`] (Amendment A9) — the durable atomic replacement every DM
+//! - `atomic_file` (Amendment A9) — the durable atomic replacement every DM
 //!   record write goes through: tmp sibling → fsync → rename → fsync parent,
 //!   plus the `flock` used for cross-process exclusion. Distinct from the
 //!   tmp+rename idiom elsewhere in this module, which is crash-atomic but not
 //!   power-loss-durable.
 //! - [`dm_store`] (#286, Amendment A9) — the DM record store built over
-//!   [`atomic_file`]: one directory per correspondence, one fixed-size sealed
+//!   `atomic_file`: one directory per correspondence, one fixed-size sealed
 //!   file per record kind, and a lock that brackets the whole read-modify-write
 //!   because both halves live on the guard it hands out.
 //! - [`seeds`] (M1, ISC-C3) — the AEAD-protected mnemonic + per-circle state
@@ -31,7 +31,14 @@
 //!   trusted anchor a verified resume checks the staging manifest against
 //!   (DL-ISC-20).
 
-pub mod atomic_file;
+// The module is crate-internal — a second door onto a correspondence's directory
+// with none of the store's path-derivation, lock, fixed-size or sealing discipline
+// on it. The three types below are re-exported because [`dm_store::DmStoreError`]
+// embeds them: a caller that receives `Write { source }` or `Lock(_)` must be able
+// to name what it caught, and `FileLock` is public for the reason its own doc gives.
+pub(crate) mod atomic_file;
+pub use atomic_file::{AtomicReplaceError, FileLock, LockError};
+
 pub mod cas;
 pub mod dm_store;
 pub mod fetched;
