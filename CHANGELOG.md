@@ -178,6 +178,17 @@ work lives in the project lead's vault manifest, not here.
 
 ### Fixed
 
+- Sweeping a DM page no longer creates it. `sweep_dm_page` opens through a new
+  `rendezvous::open_only`, which reports an absent record as `Ok(None)` instead of
+  creating one, so an unwritten page returns an empty sweep with `attempted: 0` and
+  is distinguishable from a present page whose slots are all empty. An absence is
+  never cached, so a page written later becomes visible, and each probe of a
+  still-unwritten page pays a fresh open rather than a one-off create. (#253)
+
+- `rendezvous::open_or_create` creates only on `KeyNotFound`. Any other open error
+  now skips the create and goes straight to the reopen, so a transport fault no
+  longer manufactures a DHT record. (#253)
+
 - Removed a duplicate `security:` key from `IndexKey`'s entry in
   `docs/llm-api-manifest/daemonseed-core-api.yaml`. YAML has no duplicate-key
   semantics, so the first block was discarded on every parse. (#264)

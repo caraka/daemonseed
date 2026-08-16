@@ -19,9 +19,12 @@
 //!    still returns `Ok(())`. The two publishes below are issued CONCURRENTLY for
 //!    exactly this reason; serialised, the funnel never holds two pending writes to
 //!    one record and the property goes untested.
-//! 3. **An unwritten page is empty, not an error.** Collection probes the frontier
-//!    page ahead of the one being filled, so a sweep of a page nobody has written is
-//!    the ordinary steady state and must be `Ok` with no slots.
+//! 3. **An unwritten page is empty, not an error — and is not created by being
+//!    probed.** Collection probes the frontier page ahead of the one being filled, so
+//!    a sweep of a page nobody has written is the ordinary steady state and must be
+//!    `Ok` with no slots. Since #253 it must also leave the network alone: the sweep
+//!    opens through `open_only`, so the outcome reports `attempted: 0` rather than a
+//!    full slot count over a record the sweep itself brought into being.
 //! 4. **Publish and sweep address the same record.** The record shape is part of the
 //!    address; driving the round trip from opposite ends is the only oracle that
 //!    fails when the two halves disagree about it.
@@ -342,10 +345,21 @@ async fn frames_published_to_page_slots_sweep_back_in_the_slots_they_were_writte
         outcome.found, 0,
         "no slot of an unwritten page is populated"
     );
+    // `attempted: 0` is the point, not an accident of an empty record: since #253 the
+    // sweep opens through `open_only`, so a page nobody has written is never created
+    // and therefore never read. Before that, reaching the empty case REQUIRED having
+    // just created the record, which is why this assertion used to read
+    // `PAGE_SLOTS` — the sweep had manufactured a record and then dutifully attempted
+    // every slot of it. A present page whose slots are all empty still reports
+    // `attempted: PAGE_SLOTS, found: 0`, and the collector's `failed > 0` health rule
+    // depends on those two being distinguishable.
     assert_eq!(
-        outcome.attempted,
-        u32::from(paging::PAGE_SLOTS),
-        "a sweep must attempt every slot of the record, bounded by the page shape"
+        outcome.attempted, 0,
+        "an unwritten page must not be created, so no slot of it is ever attempted"
+    );
+    assert_eq!(
+        outcome.failed, 0,
+        "nothing was attempted, so nothing can have failed"
     );
 
     eprintln!(

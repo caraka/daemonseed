@@ -305,23 +305,42 @@ pub async fn open_or_create(
         let _ungated = gate.acquire_ungated().await;
         rc.open_dht_record(key.clone(), Some(owner.clone())).await
     };
-    match open1 {
+    // Only a genuine absence justifies creating. Every other error — `Timeout`,
+    // `TryAgain`, `NoConnection` — is a transport fault on a record that may well
+    // already exist, and creating on one manufactures a network record nobody asked
+    // for (#253). The reopen below runs either way: `create` is the harmful step,
+    // while the reopen is the recovery that makes a transient open failure
+    // survivable, and every caller of this function depends on that tolerance.
+    let absent = match open1 {
         Ok(_) => {
             crate::vtrace!("open_or_create: open#1 ok (record already on net) -> Ok");
             return Ok(handle);
         }
-        Err(e) => crate::vtrace!("open_or_create: open#1 failed ({e}); creating record"),
-    }
-    // Not present — create the network record. Ignore the result: on success
-    // the handle carries create's random encryption key; on a lost create race
-    // a peer already created it. Either way the reopen below (with our
-    // no-encryption-key record key) resets the handle to verbatim storage.
-    match rc
-        .create_dht_record(CRYPTO_KIND_VLD0, schema(shape)?, Some(owner.clone()))
-        .await
-    {
-        Ok(_) => crate::vtrace!("open_or_create: create ok"),
-        Err(e) => crate::vtrace!("open_or_create: create failed ({e}) (lost race? reopen anyway)"),
+        Err(veilid_core::VeilidAPIError::KeyNotFound { .. }) => {
+            crate::vtrace!("open_or_create: open#1 KeyNotFound (absent); creating record");
+            true
+        }
+        Err(e) => {
+            crate::vtrace!(
+                "open_or_create: open#1 failed ({e}) — not an absence, NOT creating; reopening"
+            );
+            false
+        }
+    };
+    // Create the network record. Ignore the result: on success the handle carries
+    // create's random encryption key; on a lost create race a peer already created
+    // it. Either way the reopen below (with our no-encryption-key record key)
+    // resets the handle to verbatim storage.
+    if absent {
+        match rc
+            .create_dht_record(CRYPTO_KIND_VLD0, schema(shape)?, Some(owner.clone()))
+            .await
+        {
+            Ok(_) => crate::vtrace!("open_or_create: create ok"),
+            Err(e) => {
+                crate::vtrace!("open_or_create: create failed ({e}) (lost race? reopen anyway)")
+            }
+        }
     }
     let r = {
         let _ungated = gate.acquire_ungated().await;
@@ -334,6 +353,77 @@ pub async fn open_or_create(
         if r.is_ok() { "ok -> Ok" } else { "ERR" }
     );
     r
+}
+
+/// Open a record that must already exist, reporting absence as `Ok(None)` rather
+/// than creating it (#253).
+///
+/// [`open_or_create`] is right for a record this side legitimately brings into
+/// being — a rendezvous, a key record, a page we are about to write. It is wrong
+/// for a **read**. The DM paging design has the probe frontier deliberately running
+/// ahead of what exists, so sweeping through `open_or_create` *materializes* every
+/// page probed past the end of the conversation: one create plus two un-gated opens
+/// (~6–10 s each) spent to manufacture an empty record on the network, and — worse
+/// — "no such page" and "empty page" collapse into the same `Ok`, because the only
+/// way to reach the empty case is to have just created the record.
+///
+/// **`Ok(None)` is an answer, not a failure.** An unwritten page is the ordinary
+/// state of the frontier, exactly as an empty sweep is, and is deliberately
+/// distinct from `Err`, a transport failure.
+///
+/// **The absence test is `KeyNotFound` alone, and `Ok(None)` means "this node did not
+/// find it just now" — NOT "it does not exist".** The distinction is load-bearing for
+/// any consumer and is deliberately spelled out here rather than left to be inferred.
+///
+/// `RoutingContext::open_dht_record` documents `KeyNotFound` as *"the record does not
+/// exist on the network"*, and measured against a live node a never-created key did
+/// return it twice (~10.0 s each) with an existing record opening cleanly as the
+/// control. But the raise site is weaker than that wording: `open_record.rs` performs
+/// a network inspect of subkey 0 and raises `KeyNotFound` whenever the result carries
+/// **no descriptor** — a test its own comment calls "a bit of a hack" — and the
+/// underlying fanout reports `Incomplete` (its default), `Timeout` and `Exhausted` as
+/// ordinary non-error outcomes. So a record that exists but that this node reached
+/// nobody for can plausibly surface as `KeyNotFound` too. That path is **untested**;
+/// what is established is the genuinely-absent case, not the unfetchable one.
+///
+/// **The obligation this puts on the collector (#236, unwritten):** an `Ok(None)` must
+/// not be treated as authoritative absence. It is safe as a reason to read no slots
+/// and to leave the page alone; it is NOT evidence the correspondent has written
+/// nothing, and it must not clear a health or repair latch on its own. The sweep
+/// reports it as `attempted: 0`, which is distinguishable from both a populated page
+/// and a present-but-empty one precisely so that decision stays with the collector.
+pub async fn open_only(
+    gate: &Arc<DhtGate>,
+    api: &VeilidAPI,
+    rc: &RoutingContext,
+    owner: &KeyPair,
+    shape: RecordShape,
+) -> Result<Option<RendezvousHandle>> {
+    let handle = rendezvous_key(api, owner, shape).await?;
+    let key = handle.key().clone();
+    crate::vtrace!("open_only: rendezvous key={key:?}; trying open (no create)");
+    // §RS-2 margin limiter, for the reason `open_or_create` gives: the raw open is an
+    // un-gated DHT op and holds an un-gated-op permit across the call, acquired at
+    // raw-call granularity. This function issues no gated GET, so the single-permit
+    // rule (CRSH-ISC-17) is respected.
+    let opened = {
+        let _ungated = gate.acquire_ungated().await;
+        rc.open_dht_record(key, Some(owner.clone())).await
+    };
+    match opened {
+        Ok(_) => {
+            crate::vtrace!("open_only: open ok -> Some");
+            Ok(Some(handle))
+        }
+        Err(veilid_core::VeilidAPIError::KeyNotFound { .. }) => {
+            crate::vtrace!("open_only: KeyNotFound -> None (absent, not created)");
+            Ok(None)
+        }
+        Err(e) => {
+            crate::vtrace!("open_only: open failed ({e}) -> Err");
+            Err(VeilidNetError::Routing(e.to_string()))
+        }
+    }
 }
 
 /// A session cache of rendezvous records already opened, keyed by
@@ -384,6 +474,47 @@ pub async fn open_cached<I: Eq + std::hash::Hash + Clone, K: Clone>(
         .unwrap_or_else(|e| e.into_inner())
         .insert(id.clone(), k.clone());
     Ok(k)
+}
+
+/// [`open_cached`] for an open that may legitimately find nothing, i.e. one built on
+/// [`open_only`].
+///
+/// **An absence is never cached, and that is the whole reason this exists.** A hit
+/// is served and a successful open is memoized exactly as [`open_cached`] does, but
+/// `Ok(None)` returns without touching the map. Caching it would turn "this page is
+/// not written *yet*" into "this page does not exist" for the remainder of the
+/// session: the correspondent writes the page, every later sweep still answers from
+/// the cached absence, and that half of the conversation goes silently dead with no
+/// error on any surface — the same shape of un-noticeable failure that the direction
+/// typing in `DmPageAddress` exists to prevent. A record that is absent now can be
+/// created by the other party at any moment, so absence is a fact about an instant
+/// and not about the record.
+///
+/// The cost of not caching is one open per probe of a still-unwritten page, which is
+/// what the probe frontier is already paying and is bounded by the frontier's own
+/// advance rule.
+pub async fn open_cached_optional<I: Eq + std::hash::Hash + Clone, K: Clone>(
+    cache: &Mutex<HashMap<I, K>>,
+    id: &I,
+    open: impl std::future::Future<Output = Result<Option<K>>>,
+) -> Result<Option<K>> {
+    // Same poison-recovery idiom as `open_cached`, for the same reason.
+    if let Some(k) = cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(id)
+        .cloned()
+    {
+        return Ok(Some(k));
+    }
+    let Some(k) = open.await? else {
+        return Ok(None);
+    };
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(id.clone(), k.clone());
+    Ok(Some(k))
 }
 
 /// Per-rendezvous-record serialization lock: one async mutex per record, keyed by
@@ -789,6 +920,83 @@ mod tests {
     async fn counting_open(opens: &AtomicU32, ret: u32) -> Result<u32> {
         opens.fetch_add(1, Ordering::SeqCst);
         Ok(ret)
+    }
+
+    /// [`counting_open`] for the optional path: counts every actual open and answers
+    /// `ret`, where `None` stands for the record being absent from the network.
+    async fn counting_open_optional(opens: &AtomicU32, ret: Option<u32>) -> Result<Option<u32>> {
+        opens.fetch_add(1, Ordering::SeqCst);
+        Ok(ret)
+    }
+
+    #[tokio::test]
+    async fn an_absent_record_is_never_cached_so_a_later_write_becomes_visible() {
+        // The #253 invariant, and the one whose failure is silent: `open_cached`
+        // memoizes what it opens, so an optional open that cached its `None` would
+        // answer "absent" for the rest of the session — the correspondent writes the
+        // page, every later sweep still sees nothing, and that half of the
+        // conversation dies with no error on any surface.
+        let cache: Mutex<HashMap<[u8; 32], u32>> = Mutex::new(HashMap::new());
+        let opens = AtomicU32::new(0);
+        let seed = [9u8; 32];
+
+        // Three probes of a page nobody has written yet.
+        for _ in 0..3 {
+            assert_eq!(
+                open_cached_optional(&cache, &seed, counting_open_optional(&opens, None))
+                    .await
+                    .unwrap(),
+                None,
+                "an unwritten page reports absent"
+            );
+        }
+        assert_eq!(
+            opens.load(Ordering::SeqCst),
+            3,
+            "each probe of an absent record must re-open: caching the absence is the bug"
+        );
+        assert!(
+            cache.lock().unwrap().is_empty(),
+            "an absence must leave no entry behind"
+        );
+
+        // The correspondent writes the page; the very next probe must see it.
+        assert_eq!(
+            open_cached_optional(&cache, &seed, counting_open_optional(&opens, Some(77)))
+                .await
+                .unwrap(),
+            Some(77),
+            "a page written after an absent probe must become visible"
+        );
+        assert_eq!(opens.load(Ordering::SeqCst), 4);
+
+        // And from there it memoizes exactly as `open_cached` does: this call would
+        // answer 999 if it ran, so returning 77 proves the future was dropped
+        // un-awaited on the hit.
+        assert_eq!(
+            open_cached_optional(&cache, &seed, counting_open_optional(&opens, Some(999)))
+                .await
+                .unwrap(),
+            Some(77),
+            "a present record is cached on the same terms as open_cached"
+        );
+        assert_eq!(opens.load(Ordering::SeqCst), 4, "the hit must not re-open");
+    }
+
+    #[tokio::test]
+    async fn an_optional_open_that_errors_caches_nothing() {
+        // A transport failure is not an absence and not a handle. `open_only` maps
+        // only `KeyNotFound` to `None` and propagates everything else, so the cache
+        // must come out of an error exactly as it went in — otherwise a single
+        // timeout would poison the entry.
+        let cache: Mutex<HashMap<[u8; 32], u32>> = Mutex::new(HashMap::new());
+        let seed = [3u8; 32];
+        let failing = async { Err(VeilidNetError::Routing("transport".to_string())) };
+        assert!(open_cached_optional(&cache, &seed, failing).await.is_err());
+        assert!(
+            cache.lock().unwrap().is_empty(),
+            "an error must leave no entry behind"
+        );
     }
 
     /// The per-subkey cap is `min(MAX_SUBKEY_SIZE, MAX_RECORD_DATA_SIZE / o_cnt)`

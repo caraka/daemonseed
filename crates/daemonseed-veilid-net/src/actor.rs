@@ -1325,7 +1325,10 @@ async fn actor_loop(
                             // enqueue so the write never queues holding a record lock.
                             let record_lock = rendezvous::record_lock(&record_locks, &owner);
                             let _open_guard = record_lock.lock().await;
-                            if let Err(e) = dm_page_open(&gate, &api, &rc, &opened, &owner).await {
+                            if let Err(e) =
+                                dm_page_open(&gate, &api, &rc, &opened, &owner, IfAbsent::Create)
+                                    .await
+                            {
                                 crate::vtrace!(
                                     "publish_dm_page: pre-open failed ({e}); enqueuing anyway, \
                                      the dispatch will retry the open under the chat permit"
@@ -2326,6 +2329,22 @@ fn dm_page_write_request(
     }
 }
 
+/// What [`dm_page_open`] does when the page record is not on the network.
+///
+/// The distinction is the whole of #253: a publish is about to write the page, so
+/// bringing it into being is the point; a sweep is a **read**, and the probe
+/// frontier deliberately runs ahead of what exists, so creating there manufactures
+/// empty records at the frontier and destroys the difference between "no such page"
+/// and "page with nothing in it".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum IfAbsent {
+    /// Create the record and return it. The publish path, and the pre-open that
+    /// warms the cache for it.
+    Create,
+    /// Leave the network alone and answer `Ok(None)`. The sweep path.
+    ReportAbsent,
+}
+
 /// Open (or create) one channel page's record — the single opener both page
 /// operations go through.
 ///
@@ -2341,19 +2360,46 @@ fn dm_page_write_request(
 /// across the open *and* the write, while [`sweep_dm_page`] drops it the moment the
 /// open returns so its GETs never block a concurrent write to the same page
 /// (CRSH-ISC-17). Only the open itself is common, so only the open is shared.
+///
+/// Whether an absent page record may be brought into being is the caller's to say,
+/// and is the ONE thing that differs between the two paths (#253). It is a parameter
+/// rather than a second function precisely so the shape argument above stays true:
+/// splitting this into an open-for-publish and an open-for-sweep would give the page
+/// shape constant two independent uses again, which is the arrangement the paragraph
+/// above exists to rule out. (Named in prose rather than in code deliberately — the
+/// guard test counts textual occurrences and cannot tell a mention from a use, and
+/// that conservatism is worth keeping.)
 async fn dm_page_open(
     gate: &Arc<DhtGate>,
     api: &VeilidAPI,
     rc: &RoutingContext,
     opened: &rendezvous::OpenCache,
     owner: &KeyPair,
-) -> Result<rendezvous::RendezvousHandle> {
-    rendezvous::open_cached(
-        opened,
-        &rendezvous::cached_record_id(owner, DM_PAGE_SHAPE),
-        rendezvous::open_or_create(gate, api, rc, owner, DM_PAGE_SHAPE),
-    )
-    .await
+    if_absent: IfAbsent,
+) -> Result<Option<rendezvous::RendezvousHandle>> {
+    // Bound ONCE, and every use below goes through this binding. The two modes must
+    // address the same record or they are two open sites wearing one name, and a
+    // local makes that unrepresentable rather than merely reviewed — the cache id and
+    // both opens cannot drift apart without editing this line.
+    let shape = DM_PAGE_SHAPE;
+    let id = rendezvous::cached_record_id(owner, shape);
+    match if_absent {
+        IfAbsent::Create => rendezvous::open_cached(
+            opened,
+            &id,
+            rendezvous::open_or_create(gate, api, rc, owner, shape),
+        )
+        .await
+        .map(Some),
+        IfAbsent::ReportAbsent => {
+            rendezvous::open_cached_optional(
+                opened,
+                &id,
+                rendezvous::open_only(gate, api, rc, owner, shape),
+            )
+            .await
+        }
+    }
 }
 
 /// Publish one sealed channel frame into one slot of one page (part of ISC-C42).
@@ -2393,7 +2439,20 @@ async fn publish_dm_page(
     // lock is contended by design and must not be skipped.
     let record_lock = rendezvous::record_lock(record_locks, &owner);
     let _write_guard = record_lock.lock().await;
-    let handle = dm_page_open(gate, api, rc, opened, &owner).await?;
+    // `IfAbsent::Create` cannot answer `None` — it either opens, creates and
+    // reopens, or fails — so the `ok_or_else` is unreachable rather than a fallback
+    // with a behaviour. It is written as a hard error instead of an `expect` so a
+    // future change to `dm_page_open` surfaces here as a reported failure on the
+    // publish path rather than as a panic inside the actor loop.
+    let handle = dm_page_open(gate, api, rc, opened, &owner, IfAbsent::Create)
+        .await?
+        .ok_or_else(|| {
+            VeilidNetError::Actor(
+                "the page opener, in IfAbsent::Create mode, reported the page absent \
+                 instead of creating it"
+                    .to_string(),
+            )
+        })?;
     // The subkey is read off the position at the very last step, so the page it
     // belongs to travels bound to the slot for the whole path from the public
     // handle to here (#254).
@@ -2439,10 +2498,31 @@ async fn sweep_dm_page(
     // page read never blocks a concurrent write to the same page. The guard drops
     // before any read permit is acquired, keeping the single-permit rule
     // (CRSH-ISC-17).
-    let handle = {
+    let opened_handle = {
         let record_lock = rendezvous::record_lock(record_locks, &owner);
         let _open_guard = record_lock.lock().await;
-        dm_page_open(gate, api, rc, opened, &owner).await?
+        dm_page_open(gate, api, rc, opened, &owner, IfAbsent::ReportAbsent).await?
+    };
+    // An unwritten page is the probe frontier's ordinary state. Nothing was created,
+    // so nothing was read, and the outcome reports `attempted: 0` rather than the
+    // full slot count with nothing found — the two are different facts and the
+    // collector's `outcome.failed > 0` health rule depends on being able to tell
+    // them apart. Before #253 the only way to reach the empty case at all was to
+    // have just created the record, which is what made "no such page" and "empty
+    // page" the same answer.
+    let Some(handle) = opened_handle else {
+        crate::vtrace!(
+            "sweep_dm_page: page={} absent, not created -> empty sweep",
+            address.page()
+        );
+        return Ok((
+            Vec::new(),
+            rendezvous::SweepOutcome {
+                attempted: 0,
+                failed: 0,
+                found: 0,
+            },
+        ));
     };
     // Before a single GET: the record we opened must have exactly as many subkeys as
     // a page has slots. The sweep below is bounded by this same number, so a record
@@ -3846,15 +3926,51 @@ mod tests {
         let shape: String = ["DM_PAGE", "_SHAPE"].concat();
         assert_eq!(
             prod.matches(shape.as_str()).count(),
-            3,
-            "the page shape must be named exactly three times outside the tests: its \
-             own definition, and the two references inside the one opener. A fourth \
-             naming is a second open site, which is how publish and sweep come to \
-             address different records"
+            2,
+            "the page shape must be named exactly twice outside the tests: its own \
+             definition, and the single binding inside the one opener that the cache \
+             id and both open modes are all built from. A third naming is a second \
+             open site, which is how publish and sweep come to address different \
+             records"
         );
 
+        // The count was 3 until #253 gave the opener a second mode (create for the
+        // publish path, report-absent for the sweep), and dropping it to 2 by binding
+        // the shape to a local was NOT sufficient on its own — it removed the very
+        // check it appeared to strengthen. Under the old arrangement the single
+        // open's shape argument was one of the three counted namings, so retargeting
+        // it at another record's shape dropped the count to 2 and failed this test.
+        // With both modes reading a local, retargeting ONE of them names a different
+        // constant and leaves this count at 2 untouched: publish and sweep address
+        // different records, the write succeeds, the sweep is permanently empty, and
+        // nothing errors — precisely the ISC-C100 failure this guard exists for. The
+        // count above therefore no longer stands alone; the assertion below is what
+        // actually closes that hole, by pinning that the opener's body names a shape
+        // constant exactly once.
+        //
+        // (Found by an independent review lens, which ran the mutation — retargeting
+        // the report-absent mode at the key-record shape — and got a clean 123-pass
+        // run. Recorded because the reasoning that produced the weaker guard was
+        // confident and wrong.)
+        let opener_start = prod
+            .find("async fn dm_page_open(")
+            .expect("the opener's definition moved");
+        let opener_body = &prod[opener_start..];
+        let opener_body = &opener_body[..opener_body
+            .find("\n}\n")
+            .expect("the opener's closing brace moved")];
+        let shape_suffix: String = ["_", "SHAPE"].concat();
+        assert_eq!(
+            opener_body.matches(shape_suffix.as_str()).count(),
+            1,
+            "the opener's body must name a shape constant exactly ONCE — the single \
+             binding both open modes and the cache id are built from. A second naming \
+             is one mode addressing a different record from the other, which is the \
+             shape disagreement this test exists to make unrepresentable"
+        );
+        //
         // The shape count above is the load-bearing guard: an inline open must name a
-        // shape, so a fourth naming IS a second open site. This is the positive half —
+        // shape, so an extra naming IS a second open site. This is the positive half —
         // the opener is defined once and reached from the three places that open a
         // page: `publish_dm_page`, `sweep_dm_page`, and the pre-warm in the
         // `PublishDmPage` arm that keeps the cold open off the chat lane.

@@ -529,7 +529,15 @@ functions:
       0 as a record-health signal. No such collector exists yet (#236). Bounded by the
       handle's own shape; PAGE_SLOTS gated GETs on the read lane, no write funnel
       involvement (WB-3 I9). Spawned off the command loop (D-0b / #128, CRSH-ISC-22).
-      Opens via open_or_create, so probing a page nobody has written CREATES it.
+      Opens via open_only, so probing a page nobody has written does NOT create it: an
+      absent page returns an empty Vec with SweepOutcome attempted 0, distinct from a
+      present page whose slots were all read and empty (attempted PAGE_SLOTS, found 0).
+      attempted 0 means the record was not found by this node on this pass, NOT that it
+      does not exist: veilid raises KeyNotFound on an inspect that returns no
+      descriptor, and a fanout reaching nobody is a non-error outcome. A caller must
+      not treat it as authoritative absence or clear a health / repair latch on it.
+      An absence is never cached, so each probe of a still-unwritten page pays a fresh
+      open (~6-10s) rather than the one-off cost of creating and caching a record.
     signature: "pub async fn sweep_dm_page(&self, address: DmPageAddress<Receiving>) -> Result<DmPageSweep>"
     parameters:
       - name: address
