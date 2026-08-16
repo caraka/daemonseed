@@ -178,6 +178,10 @@ work lives in the project lead's vault manifest, not here.
 
 ### Fixed
 
+- Removed a duplicate `security:` key from `IndexKey`'s entry in
+  `docs/llm-api-manifest/daemonseed-core-api.yaml`. YAML has no duplicate-key
+  semantics, so the first block was discarded on every parse. (#264)
+
 - Corrected the DM outbox's delivery state, which inferred *on the DHT* from the
   re-seed rung and so reported a message as published after writes that errored
   and after a key-fetch retry on an entry that had never been emitted. A

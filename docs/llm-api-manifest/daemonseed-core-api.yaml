@@ -2060,9 +2060,6 @@ types:
     security:
       contains_secret: true
       zeroize_on_drop: true
-    security:
-      contains_secret: true
-      zeroize_on_drop: true
 
   - name: BlobError
     module: daemonseed_core::storage::seeds
