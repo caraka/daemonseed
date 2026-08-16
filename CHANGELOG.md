@@ -176,6 +176,14 @@ work lives in the project lead's vault manifest, not here.
 - The release profile panics on integer overflow (`[profile.release]
   overflow-checks = true`), workspace-wide. (#258)
 
+### Added
+
+- `ResumeRecord`'s secret halves are covered by the out-of-crate zeroize witness.
+  `s_pc` and `committed_root` are asserted wiped before their memory is released,
+  with the skipped public field as the control. `#[zeroize(skip)]` on `s_pc` is a
+  silent leak of a per-correspondent ML-DSA-87 signing key and is now caught;
+  on `committed_root` it is inert, because the newtype zeroizes itself. (#314)
+
 ### Changed
 
 - Re-seed jitter is drawn from the CSPRNG on every emission. `OutboxEntry::emit`

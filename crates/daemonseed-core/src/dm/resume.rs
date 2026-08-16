@@ -615,6 +615,22 @@ impl ResumeRecord {
         &self.s_pc
     }
 
+    /// Where `committed_root` sits inside the struct (#314).
+    ///
+    /// The out-of-crate zeroize witness pins this as its structural control, and
+    /// `offset_of!` cannot see a private field from out there — the same reason
+    /// `VerifiedFirstContact::ss0_offset_for_test` exists. Without it the witness's
+    /// containment match would accept the secret being freed at *any* offset in the
+    /// record, which is precisely the drift the control is for: an accessor
+    /// silently pointing at a neighbouring field would still pass.
+    ///
+    /// `s_pc` needs no equivalent because it is `Box`ed and therefore owns its
+    /// allocation outright, so its offset is zero by construction.
+    #[cfg(any(test, feature = "testing"))]
+    pub const fn committed_root_offset_for_test() -> usize {
+        core::mem::offset_of!(Self, committed_root)
+    }
+
     /// The peer's per-correspondent verifying key.
     pub fn pk_pc(&self) -> &[u8; ml_dsa::PK_LEN] {
         &self.pk_pc

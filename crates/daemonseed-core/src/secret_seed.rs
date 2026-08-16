@@ -183,6 +183,17 @@ mod tests {
         assert_zeroize_on_drop::<crate::dm::ratchet::ChainKey>();
         assert_zeroize_on_drop::<crate::dm::ratchet::MessageKey>();
 
+        // inline arm — the re-establishment root. Added with #314: it was the ONE
+        // macro-generated newtype of twenty missing from this sweep, and its absence
+        // was load-bearing rather than cosmetic. `CommittedRoot::from_bytes` is
+        // `pub` and the type is dropped STANDALONE on `ResumeRecord::decode`'s error
+        // paths and at `dm/persist.rs`'s construction site — so on those paths
+        // nothing else wipes it. A hand-rolled replacement deriving only `Zeroize`
+        // passed every test in the tree, including the behavioural witness, because
+        // that witness only ever observes the root inside a `ResumeRecord` whose own
+        // derive wipes it in place.
+        assert_zeroize_on_drop::<crate::dm::resume::CommittedRoot>();
+
         // boxed arm — AEAD content keys.
         assert_zeroize_on_drop::<crate::circle::key::CircleKey>();
         assert_zeroize_on_drop::<crate::public_room::PublicRoomKey>();

@@ -76,17 +76,36 @@ use daemonseed_core::circle::key::{
 use daemonseed_core::crypto::suite::CNSA_2_0;
 use daemonseed_core::dm::firstcontact::{ChannelRoots, ROOT_LEN, SS0_LEN, VerifiedFirstContact};
 use daemonseed_core::dm::ratchet::EphemeralDecapKey;
+use daemonseed_core::dm::ratchet::ROOT_KEY_LEN;
+use daemonseed_core::dm::resume::{
+    CommittedRoot, FreshAttempt, ResumeRecord, SealedReEst, SendFloor,
+};
 use daemonseed_core::identity::keys::{Identity, derive_identity_keys};
 use daemonseed_core::identity::mnemonic::Mnemonic;
 use daemonseed_core::public_room::derive_room_veilid_owner_seed;
 use daemonseed_core::storage::seeds::PersistedCircle;
-use oxicrypt_ml_dsa::PK_LEN;
+use oxicrypt_ml_dsa::{PK_LEN, SK_LEN as ML_DSA_SK_LEN};
 use oxicrypt_ml_kem::{DK_LEN, EK_LEN};
 use zeroize::Zeroizing;
 
-/// Large enough for the biggest secret watched here, the ML-KEM decapsulation
-/// key behind `EphemeralDecapKey`.
-const SNAPSHOT_CAP: usize = 4096;
+/// Large enough for the biggest secret watched here, which since #314 is the
+/// ML-DSA-87 signing key behind `ResumeRecord::s_pc` at 4 896 bytes — larger than
+/// the ML-KEM decapsulation key that previously set this bound.
+///
+/// Derived from the constant rather than written as a literal, so a suite change
+/// that grows the ML-DSA key cannot silently outrun the buffer. It tracks that key
+/// only: a decapsulation key grown past it is caught by the length refusal below
+/// instead — loudly, and at the case that needs it, but not by this derivation.
+///
+/// `assert_zeroed_when_freed` refuses a secret longer than this rather than
+/// truncating it, which is what caught the 4 096 figure when the first #314 case
+/// was added — a truncating snapshot would have compared only the first 4 096 bytes
+/// and passed while the tail went unexamined.
+const SNAPSHOT_CAP: usize = if ML_DSA_SK_LEN > 4096 {
+    ML_DSA_SK_LEN
+} else {
+    4096
+};
 
 /// The size every 32-byte secret newtype watched here occupies — the block size
 /// each such case expects the allocator to hand back.
@@ -687,4 +706,121 @@ fn a_watched_buffer_that_is_reallocated_disarms_the_watch() {
 
     WATCH_ADDR.store(0, Ordering::SeqCst);
     REALLOCATED.store(false, Ordering::SeqCst);
+}
+
+/// One record, filled with distinct non-zero patterns so a slip into a
+/// neighbouring field is visible rather than reading as an incidental zero.
+///
+/// Every input is reachable from out here without a `testing` gate: `ResumeRecord`
+/// already exposes `new`, `s_pc` and `committed_root` publicly. Only the *offset*
+/// of the inline field needed gating (#314), because `offset_of!` cannot see a
+/// private field from outside the crate.
+fn resume_record() -> ResumeRecord {
+    ResumeRecord::new(
+        Box::new([0xA7; ML_DSA_SK_LEN]),
+        Box::new([0xB3; PK_LEN]),
+        CommittedRoot::from_bytes([0xC5; ROOT_KEY_LEN]),
+        SealedReEst::seal(FreshAttempt::first(), vec![0xD1; 64].into_boxed_slice())
+            .expect("a 64-byte frame is inside MAX_FRAME_LEN"),
+        SendFloor::new(7, 11),
+        1_700_000_000_000,
+        3,
+    )
+}
+
+/// **The two secret halves of `ResumeRecord` are wiped before their memory is
+/// released (#314).**
+///
+/// `s_pc` is a per-correspondent ML-DSA-87 signing key that is at-rest only and
+/// **not mnemonic-derivable**: there is no re-derivation path, which is why the key
+/// is in the record rather than fetched on resume. A `#[zeroize(skip)]` added to it
+/// by mistake compiles, passes the whole suite, and silently stops wiping it. That
+/// is the hole this closes.
+///
+/// The two fields exercise the two arms for different reasons. `s_pc` is `Box`ed,
+/// so it owns its allocation and is watched at offset 0 of its own block.
+/// `committed_root` is inline, so it is watched as a range inside the record's own
+/// block at a declared offset — the case where the offset assertion carries the
+/// load, because containment matching alone would accept any enclosing block.
+///
+/// **The distinct fillers are a weaker control than they look**, exactly as the
+/// `ss0` case above says of its own: a slip off `committed_root` inside the record
+/// lands in `window_anchor_ms` (`1_700_000_000_000`, five zero high bytes) or
+/// `toward_c` (`3`), and both snapshot as zeros. What refuses a mispointed accessor
+/// is the offset assertion, not the fillers.
+///
+/// **They are not equally exposed, and #314's premise was half right.** Measured by
+/// mutation while writing this:
+///
+/// - Adding `#[zeroize(skip)]` to `s_pc` **is** a silent leak, and this test catches
+///   it — the freed block came back full of the filler byte. `Box<[u8; SK_LEN]>`
+///   is a plain array with no `Drop` of its own, so the record's derive is the only
+///   thing wiping it.
+/// - Adding `#[zeroize(skip)]` to `committed_root` changes **nothing**, and the same
+///   mutation passes. `CommittedRoot` comes from `redacted_secret_newtype`'s inline
+///   arm, which derives `ZeroizeOnDrop` on the newtype itself, so it wipes on its own
+///   drop whatever the outer derive says.
+///
+/// That second measurement is why `CommittedRoot` was added to `secret_seed.rs`'s
+/// compile-time bound sweep in this same change: it was the ONE macro-generated
+/// newtype of twenty missing from it, and this case cannot stand in for it. A
+/// hand-rolled `CommittedRoot` deriving only `Zeroize` passes everything here,
+/// because this witness only ever sees the root inside a `ResumeRecord` whose own
+/// derive wipes it in place — while `CommittedRoot::from_bytes` is `pub` and the
+/// type is dropped standalone on `decode`'s error paths. The behavioural case and
+/// the compile-time bound cover different halves and neither substitutes.
+///
+/// So the `committed_root` case here is a behavioural confirmation rather than a
+/// guard against a reachable defect: the surviving mutation is the correct answer,
+/// not a gap. Recorded because a future reader who mutates it and sees it pass
+/// should reach that conclusion in one step instead of hunting a hole that is not
+/// there.
+#[test]
+fn resume_record_secret_halves_are_zeroed_before_their_memory_is_released() {
+    init();
+
+    assert_zeroed_when_freed(
+        "ResumeRecord::s_pc",
+        (0, ML_DSA_SK_LEN),
+        resume_record,
+        |r| r.s_pc().as_slice(),
+    );
+
+    assert_zeroed_when_freed(
+        "ResumeRecord::committed_root",
+        (
+            ResumeRecord::committed_root_offset_for_test(),
+            size_of::<ResumeRecord>(),
+        ),
+        || Box::new(resume_record()),
+        |r| r.committed_root().as_bytes().as_slice(),
+    );
+}
+
+/// **The controls: the `#[zeroize(skip)]` neighbours must still be readable right
+/// up to the drop.**
+///
+/// Without this the test above proves less than it appears to. If `ResumeRecord`
+/// wiped *everything* — or if the record were somehow never populated — the zero
+/// assertions would pass while telling us nothing about which fields the derive
+/// actually covers. `pk_pc` is the peer's PUBLIC verifying key and is deliberately
+/// skipped; its bytes must survive, and reading them back distinguishes "the
+/// secret was wiped" from "the whole record was blank".
+#[test]
+fn the_record_is_populated_before_any_drop_so_the_wipe_cases_have_a_control() {
+    init();
+    let r = resume_record();
+    assert!(
+        r.pk_pc().iter().all(|&b| b == 0xB3),
+        "the skipped public field did not survive construction, so the zeroize \
+         cases above have no control"
+    );
+    assert!(
+        r.s_pc().iter().any(|&b| b != 0),
+        "the signing key is all-zero before any drop, so wiping it proves nothing"
+    );
+    assert!(
+        r.committed_root().as_bytes().iter().any(|&b| b != 0),
+        "the committed root is all-zero before any drop, so wiping it proves nothing"
+    );
 }
