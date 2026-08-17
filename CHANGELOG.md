@@ -131,6 +131,14 @@ work lives in the project lead's vault manifest, not here.
   `chan_id`, the recipient's key-record address, or a salted derivation over
   either. ISC-A-C44. (#288)
 
+### Fixed
+
+- Corrected the TUI's whole-share download to a user-chosen destination, which placed
+  files at their share-root-relative paths and so dropped the share's own folder name —
+  a single-depth share landed as loose files in the chosen folder. It now wraps them
+  under the share name via core `no_scatter`, matching the GUI. A nested share is
+  unchanged. (#216)
+
 ### Removed
 
 - `daemonseed_core::tls` and the TLS dependency stack it existed for:
