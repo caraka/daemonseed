@@ -1189,10 +1189,10 @@ modules:
       and OnDht means the transport confirmed a write, not that the DHT holds
       the value (M2 — a losing set_dht_value also returns success).
       ReseedSchedule::new(now_ms) starts due immediately;
-      schedule_next(now_ms, unit) consumes one rung of RESEED_LADDER (1, 2, 4, 8,
-      16, 32, 64 minutes, then 60, then 86400 seconds repeating), jittered by
-      RESEED_JITTER_FRAC through backoff::apply_jitter, and
-      schedule_next_jittered(now_ms) draws the unit from the OS CSPRNG;
+      schedule_next_jittered(now_ms) consumes one rung of RESEED_LADDER (1, 2, 4,
+      8, 16, 32, 64 minutes, then 60, then 86400 seconds repeating), jittered by
+      RESEED_JITTER_FRAC through backoff::apply_jitter with the unit drawn from
+      the OS CSPRNG, and is the only door;
       delay_for_rung(rung) is the un-jittered rung. due(now_ms) -> Vec<u64> lists
       entries due; sweep_give_ups(now_ms) -> Vec<u64> moves pending entries at or
       past GIVE_UP_MS (604800000) from composed_at_ms to Undelivered and returns

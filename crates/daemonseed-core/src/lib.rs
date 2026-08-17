@@ -65,6 +65,7 @@ pub mod heartbeat;
 pub mod identity;
 pub mod identity_proof;
 pub mod indexer;
+pub(crate) mod jitter;
 pub mod kats;
 pub mod kdf;
 pub mod mention;

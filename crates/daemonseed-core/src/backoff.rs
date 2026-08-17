@@ -148,12 +148,7 @@ impl Backoff {
     /// the OS CSPRNG. A CSPRNG read failure degrades to no jitter (the
     /// deterministic curve) rather than failing the retry.
     pub fn next_jittered(&mut self) -> Option<Duration> {
-        let mut buf = [0u8; 8];
-        let unit = match getrandom::fill(&mut buf) {
-            Ok(()) => (u64::from_le_bytes(buf) as f64 / u64::MAX as f64) * 2.0 - 1.0,
-            Err(_) => 0.0,
-        };
-        self.next(unit)
+        self.next(crate::jitter::unit())
     }
 
     /// The trust event to emit on a connection refusal in the current state

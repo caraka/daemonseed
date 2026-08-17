@@ -136,6 +136,16 @@ work lives in the project lead's vault manifest, not here.
 
 ### Changed
 
+- Extracted the runtime jitter draw into `daemonseed_core::jitter`. The byte-to-band
+  mapping and the degrade-to-no-jitter on entropy failure were written inline and
+  identically in `Backoff::next_jittered` and `ReseedSchedule::schedule_next_jittered`;
+  both now call one seam that takes the entropy read as a parameter, so the degrade is
+  reachable from a test. No behaviour change. (#280)
+
+- Corrected `ReseedSchedule`'s documentation, which described a `testing`-gated
+  re-export of the unit-taking method that does not exist, and the API manifest, which
+  described a `schedule_next(now_ms, unit)` entry point removed in `1b232e3`.
+
 - `VeilidNodeSeed` is reached through `with_bytes` and is no longer `Clone`. A new
   `inline_scoped` arm on `redacted_secret_newtype!` emits the scoped accessor in
   place of `as_bytes`; the other secret newtypes are unchanged. (#271)

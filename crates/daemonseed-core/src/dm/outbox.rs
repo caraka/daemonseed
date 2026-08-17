@@ -913,7 +913,9 @@ impl ReseedSchedule {
     /// point and [`Self::schedule_next_jittered`] had no call sites at all, the
     /// module was exposing the unsafe path as its API and keeping the safe one as
     /// dead code. Production now goes through the jittered door; this one is private,
-    /// with a `testing`-gated re-export below for out-of-crate harnesses.
+    /// and deliberately has no `testing`-gated re-export — every caller is an
+    /// in-crate test, and handing a consumer that enables the feature a
+    /// caller-supplied-unit door would restore exactly the path #280 removed.
     fn schedule_next_with_unit(&mut self, now_ms: i64, unit: f64) {
         let delay = apply_jitter(Self::delay_for_rung(self.rung), RESEED_JITTER_FRAC, unit);
         self.next_due_ms = now_ms.saturating_add(delay.as_millis() as i64);
@@ -927,12 +929,7 @@ impl ReseedSchedule {
     /// makes, and the same reason: a message that stops being re-seeded is lost,
     /// while a message re-seeded on an unjittered cadence is only correlatable.
     pub fn schedule_next_jittered(&mut self, now_ms: i64) {
-        let mut buf = [0u8; 8];
-        let unit = match getrandom::fill(&mut buf) {
-            Ok(()) => (u64::from_le_bytes(buf) as f64 / u64::MAX as f64) * 2.0 - 1.0,
-            Err(_) => 0.0,
-        };
-        self.schedule_next_with_unit(now_ms, unit);
+        self.schedule_next_with_unit(now_ms, crate::jitter::unit());
     }
 }
 
