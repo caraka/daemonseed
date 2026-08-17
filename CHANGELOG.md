@@ -26,6 +26,11 @@ work lives in the project lead's vault manifest, not here.
 
 ### Added
 
+- `cargo xtask check-manifests` parses every LAMA manifest with duplicate-key detection at
+  the YAML event level and fails on a repeat, which an ordinary loader discards silently.
+  Covers `docs/llm-api-manifest/*.yaml` and the root `lama.yaml`, and runs as part of
+  `release-gate`. (#326)
+
 - `daemonseed_core::dm::resume` — the A9.2 re-establishment resume record.
   `ResumeRecord` carries `S_pc`/`PK_pc`, the committed re-establishment root,
   the `attempt` counter, the sealed RE-EST frame bytes, the send-side floor, the

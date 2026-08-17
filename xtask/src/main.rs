@@ -17,11 +17,17 @@
 //! - `install-hooks` — install the workspace's git pre-push hook into the
 //!   active checkout's `.git/hooks/` (or into a `--target` directory).
 //!   Idempotent; overwrites a previously-installed hook in-place.
+//! - `check-manifests` — parse every `docs/llm-api-manifest/*.yaml` with
+//!   duplicate-key detection at the event level and fail on any repeat. YAML
+//!   discards a repeated mapping key silently, so nothing else in the repo
+//!   would notice (#326).
 //! - `release-gate` — run the full Definition-of-Done gate and refuse a
 //!   non-zero exit if any check is red, so a release tag is never cut on a
 //!   red tree. Runs the test suite in BOTH the dev and release profiles (#274),
 //!   then deletes the binaries those steps linked into `target/` (see
 //!   `remove_linked_bins`). Run before `git tag`.
+
+mod manifests;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -40,6 +46,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Parse every `docs/llm-api-manifest/*.yaml` and fail on a duplicate
+    /// mapping key, which YAML would otherwise discard silently (#326).
+    CheckManifests,
     /// Regenerate `crates/daemonseed-proto/src/generated/` from .proto files.
     GenProto,
     /// Verify that the committed snapshot matches what tonic-build emits.
@@ -80,6 +89,7 @@ enum Cmd {
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
+        Cmd::CheckManifests => manifests::check_manifests(&workspace_root_from_xtask()?),
         Cmd::GenProto => gen_proto(),
         Cmd::CheckProto => check_proto(),
         Cmd::IscCoverage { min } => isc_coverage(min),
@@ -552,6 +562,12 @@ const RELEASE_GATE_STEPS: &[GateStep] = &[
     GateStep {
         name: "xtask isc-coverage",
         args: &["xtask", "isc-coverage"],
+    },
+    // #326: a parse of seven small files, so it joins the gate that already runs
+    // rather than becoming a push-time cost of its own.
+    GateStep {
+        name: "xtask check-manifests",
+        args: &["xtask", "check-manifests"],
     },
 ];
 
