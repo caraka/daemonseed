@@ -80,7 +80,7 @@ fn node_config(port: &str, dir: &std::path::Path) -> VeilidNetConfig {
 fn fresh_ss0() -> [u8; 32] {
     let throwaway =
         derive_identity_keys(&Mnemonic::generate().unwrap(), Identity::Primary).unwrap();
-    let entropy = throwaway.veilid_node_seed.as_bytes();
+    let entropy = throwaway.veilid_node_seed.with_bytes(|b| *b);
     let mut ss0 = [0u8; 32];
     for (dst, src) in ss0.iter_mut().zip(entropy.iter().cycle()) {
         *dst = *src;

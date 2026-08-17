@@ -136,6 +136,10 @@ work lives in the project lead's vault manifest, not here.
 
 ### Changed
 
+- `VeilidNodeSeed` is reached through `with_bytes` and is no longer `Clone`. A new
+  `inline_scoped` arm on `redacted_secret_newtype!` emits the scoped accessor in
+  place of `as_bytes`; the other secret newtypes are unchanged. (#271)
+
 - The DM outbox records whether a terminal transition still owes the user a
   notification. `OutboxEntry` gains `Surfacing` (`Clear` / `Owed`), set by the
   single private edge into a terminal lifecycle, so `sweep_give_ups`,

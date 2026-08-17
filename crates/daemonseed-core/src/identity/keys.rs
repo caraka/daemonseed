@@ -255,10 +255,68 @@ redacted_secret_newtype! {
     /// across both the content layer and the Veilid transport layer while sharing
     /// no key material with the content/identity keys. Zeroizes on drop.
     ///
-    /// Shares the `redacted_secret_newtype!` `inline` newtype hygiene with
-    /// [`ShareRootIkm`]; its derivation (the node-seed expansion in
-    /// [`derive_identity_keys`]) is its own.
-    inline pub struct VeilidNodeSeed([u8; VEILID_NODE_SEED_LEN]);
+    /// On the `inline_scoped` arm rather than `inline`, so the bytes are reached
+    /// through `with_bytes` and the type is not `Clone` (#271). This seed is the
+    /// **node identity** — a strictly larger capability than any one record's write
+    /// access, with the whole process as its blast radius — and the borrowing
+    /// accessor plus `Clone` were two cheap paths to a plain non-zeroizing copy.
+    /// [`ShareRootIkm`] stays on `inline`: it is a content-key root, not a
+    /// capability.
+    ///
+    /// # The surface, pinned at the type
+    ///
+    /// The macro arm's shape is checked in `secret_seed.rs`, but that check reads
+    /// the arm's *text* and cannot see this declaration — a call-site derive lands
+    /// on the generated struct through `$(#[$meta])*`, and an inherent `impl` in
+    /// this module reaches the private field. So the properties that matter are
+    /// asserted here, against the type, where a compile is the oracle.
+    ///
+    /// **Positive control first.** Every case below is `compile_fail`, and a
+    /// `compile_fail` block passes when the code is broken *for any reason* — a
+    /// misspelt path would make all of them pass while proving nothing. This one
+    /// must compile, so the path is known good:
+    ///
+    /// ```
+    /// fn reachable(s: &daemonseed_core::identity::keys::VeilidNodeSeed) -> usize {
+    ///     s.with_bytes(|b| b.len())
+    /// }
+    /// ```
+    ///
+    /// Not `Clone` — a clone is a plain non-zeroizing copy of the node identity:
+    ///
+    /// ```compile_fail
+    /// fn needs_clone<T: Clone>() {}
+    /// needs_clone::<daemonseed_core::identity::keys::VeilidNodeSeed>();
+    /// ```
+    ///
+    /// No borrowing accessor, under this name:
+    ///
+    /// ```compile_fail
+    /// fn borrows(s: &daemonseed_core::identity::keys::VeilidNodeSeed) {
+    ///     let _ = s.as_bytes();
+    /// }
+    /// ```
+    ///
+    /// No `Deref` — the escape the scoped accessor exists to close:
+    ///
+    /// ```compile_fail
+    /// fn needs_deref<T: core::ops::Deref>() {}
+    /// needs_deref::<daemonseed_core::identity::keys::VeilidNodeSeed>();
+    /// ```
+    ///
+    /// And no `AsRef<[u8]>`, which would hand back the same borrow by another door:
+    ///
+    /// ```compile_fail
+    /// fn needs_as_ref<T: AsRef<[u8]>>() {}
+    /// needs_as_ref::<daemonseed_core::identity::keys::VeilidNodeSeed>();
+    /// ```
+    ///
+    /// **What this does not reach:** a borrowing accessor added under some *other*
+    /// name, or a blanket impl in a third crate. Neither is expressible as a
+    /// bound over a name that does not yet exist. The arm-text check in
+    /// `secret_seed.rs` catches the first when it is added to the macro; added
+    /// directly to this type, it is caught by review alone.
+    inline_scoped pub struct VeilidNodeSeed([u8; VEILID_NODE_SEED_LEN]);
 }
 
 redacted_secret_newtype! {
@@ -596,7 +654,10 @@ mod tests {
         let m = Mnemonic::from_phrase(ALL_ZEROS_PHRASE).unwrap();
         let a = derive_identity_keys(&m, Identity::Primary).unwrap();
         let b = derive_identity_keys(&m, Identity::Primary).unwrap();
-        assert_eq!(a.veilid_node_seed.as_bytes(), b.veilid_node_seed.as_bytes());
+        assert_eq!(
+            a.veilid_node_seed.with_bytes(|b| *b),
+            b.veilid_node_seed.with_bytes(|b| *b)
+        );
     }
 
     #[test]
@@ -606,8 +667,8 @@ mod tests {
         let m = Mnemonic::from_phrase(ALL_ZEROS_PHRASE).unwrap();
         let keys = derive_identity_keys(&m, Identity::Primary).unwrap();
         assert_ne!(
-            keys.veilid_node_seed.as_bytes(),
-            &[0u8; VEILID_NODE_SEED_LEN]
+            keys.veilid_node_seed.with_bytes(|b| *b),
+            [0u8; VEILID_NODE_SEED_LEN]
         );
     }
 
@@ -622,8 +683,8 @@ mod tests {
         let primary = derive_identity_keys(&m, Identity::Primary).unwrap();
         let device = derive_identity_keys(&m, Identity::Device { uuid: Uuid::nil() }).unwrap();
         assert_ne!(
-            primary.veilid_node_seed.as_bytes(),
-            device.veilid_node_seed.as_bytes()
+            primary.veilid_node_seed.with_bytes(|b| *b),
+            device.veilid_node_seed.with_bytes(|b| *b)
         );
     }
 
@@ -634,7 +695,10 @@ mod tests {
         let m2 = Mnemonic::generate().unwrap();
         let a = derive_identity_keys(&m1, Identity::Primary).unwrap();
         let b = derive_identity_keys(&m2, Identity::Primary).unwrap();
-        assert_ne!(a.veilid_node_seed.as_bytes(), b.veilid_node_seed.as_bytes());
+        assert_ne!(
+            a.veilid_node_seed.with_bytes(|b| *b),
+            b.veilid_node_seed.with_bytes(|b| *b)
+        );
     }
 
     /// #156: the share-root IKM is deterministic for a given (mnemonic, identity)
@@ -652,7 +716,7 @@ mod tests {
         // Domain separation: the share-root IKM is NOT the node seed.
         assert_ne!(
             a.share_root_ikm.as_bytes().as_slice(),
-            a.veilid_node_seed.as_bytes().as_slice()
+            a.veilid_node_seed.with_bytes(|b| *b).as_slice()
         );
     }
 
@@ -699,7 +763,7 @@ mod tests {
         );
         assert_ne!(
             first.dm_doorbell_slot_secret.as_bytes(),
-            first.veilid_node_seed.as_bytes()
+            &first.veilid_node_seed.with_bytes(|b| *b)
         );
     }
 
@@ -758,7 +822,7 @@ mod tests {
         let m = Mnemonic::from_phrase(ALL_ZEROS_PHRASE).unwrap();
         let keys = derive_identity_keys(&m, Identity::Primary).unwrap();
         assert_eq!(
-            hex::encode(keys.veilid_node_seed.as_bytes()),
+            hex::encode(keys.veilid_node_seed.with_bytes(|b| *b)),
             "0c874e8deb6413ba9f6f8457fdcb89a57741812a8936dde45f23e7b64e5ec837",
         );
         assert_eq!(

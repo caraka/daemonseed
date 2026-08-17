@@ -3021,6 +3021,19 @@ types:
       - name: Hkdf
         description: "Hkdf(oxicrypt_kdf::KdfError) — HKDF derivation failed."
 
+  - name: VeilidNodeSeed
+    module: daemonseed_core::identity::keys
+    kind: struct
+    description: >-
+      The Veilid node identity seed (D3), 32 bytes held inline. Derived from the
+      identity mnemonic under a domain-separated HKDF label, so one recovery
+      phrase yields one identity across the content and transport layers. Not
+      Clone; ZeroizeOnDrop; Debug redacted to `VeilidNodeSeed(<redacted>)`. The
+      bytes are reached only through with_bytes.
+    security:
+      contains_secret: true
+      zeroize_on_drop: true
+
   - name: CircleVeilidOwnerSeed
     module: daemonseed_core::circle::key
     kind: struct
@@ -3786,6 +3799,21 @@ functions:
           condition: HKDF, oxicrypt-module, or KEM keygen failed.
     preconditions:
       - description: The oxicrypt module must be operational.
+
+  - name: VeilidNodeSeed::with_bytes
+    module: daemonseed_core::identity::keys
+    description: >-
+      Run a closure over the raw 32-byte node seed and return its value. The only
+      accessor; there is no borrowing accessor and the type is not Clone.
+    signature: "pub fn with_bytes<T>(&self, f: impl FnOnce(&[u8; VEILID_NODE_SEED_LEN]) -> T) -> T"
+    parameters:
+      - name: f
+        type: "impl FnOnce(&[u8; VEILID_NODE_SEED_LEN]) -> T"
+        direction: in
+        description: Receives a borrow of the raw seed for the duration of the call.
+    returns:
+      type: "T"
+      description: Whatever the closure returns. T cannot borrow from the argument.
 
   - name: SignKeypair::from_ml_dsa_seed
     module: daemonseed_core::identity::keys

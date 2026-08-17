@@ -140,7 +140,7 @@ fn identity() -> IdentityKeys {
 /// mnemonic-derived node seed, which is already 32 bytes of the right shape and
 /// saves pulling an RNG into the dev-deps.
 fn fresh_ss0() -> [u8; 32] {
-    *identity().veilid_node_seed.as_bytes()
+    identity().veilid_node_seed.with_bytes(|b| *b)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

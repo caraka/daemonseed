@@ -240,14 +240,32 @@ unsafe impl GlobalAlloc for FreeWitness {
 #[global_allocator]
 static ALLOCATOR: FreeWitness = FreeWitness;
 
+/// The address of a secret's bytes plus a zeroizing copy of them, which is all
+/// [`assert_zeroed_when_freed`] needs from a `locate` closure.
+///
+/// It takes the two facts out by value rather than handing back a borrow, so a
+/// secret reached through a scoped `with_bytes` accessor — where the return type
+/// cannot borrow from the closure's argument, by design (#271) — can be witnessed
+/// on the same harness as one reached through `as_bytes`. Returning a borrow was
+/// the only thing tying this harness to the borrowing accessor shape.
+///
+/// **Every `locate` closure must go through this function**, and that is a
+/// convention rather than a type: the tuple does not force the address and the
+/// bytes to come from the same object, where the old `&[u8]` return did. A future
+/// `locate` that hand-rolls the pair could watch one allocation and snapshot
+/// another, and the harness would not notice.
+fn at(bytes: &[u8]) -> (usize, Zeroizing<Vec<u8>>) {
+    (bytes.as_ptr() as usize, Zeroizing::new(bytes.to_vec()))
+}
+
 /// Build a secret, watch the bytes it stores its key material in, drop it, and
 /// require that those bytes were all zeros when the allocator got their block
 /// back.
 ///
-/// `locate` points at the secret's bytes *through the public accessor*, so the
-/// watched range is the one the type actually stores its key material in. It may
-/// be a whole heap block or a field inside a larger one; the witness accepts
-/// either.
+/// `locate` reaches the secret's bytes *through the public accessor* and hands
+/// back [`at`]'s pair, so the watched range is the one the type actually stores
+/// its key material in. It may be a whole heap block or a field inside a larger
+/// one; the witness accepts either.
 ///
 /// `expect` is `(offset, block_size)`: where the located bytes must sit inside the
 /// block that gets freed, and how big that block must be. This is the structural
@@ -260,7 +278,7 @@ fn assert_zeroed_when_freed<T>(
     name: &str,
     expect: (usize, usize),
     make: impl FnOnce() -> T,
-    locate: impl Fn(&T) -> &[u8],
+    locate: impl Fn(&T) -> (usize, Zeroizing<Vec<u8>>),
 ) {
     let _gate = GATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
@@ -277,14 +295,8 @@ fn assert_zeroed_when_freed<T>(
     // A copy of the secret, so it can be compared against what the allocator saw.
     // It is a duplicate of live key material, so it zeroizes on its own drop —
     // this test has no business leaking what it exists to prove gets wiped.
-    let (addr, len, before) = {
-        let bytes = locate(&secret);
-        (
-            bytes.as_ptr() as usize,
-            bytes.len(),
-            Zeroizing::new(bytes.to_vec()),
-        )
-    };
+    let (addr, before) = locate(&secret);
+    let len = before.len();
 
     assert!(
         len <= SNAPSHOT_CAP,
@@ -370,7 +382,7 @@ fn boxed_arm_secrets_are_zeroed_before_their_memory_is_released() {
         "CircleVeilidOwnerSeed",
         (0, SEED_LEN),
         || derive_circle_veilid_owner_seed("correct horse battery staple", &CNSA_2_0).unwrap(),
-        |s| s.as_bytes().as_slice(),
+        |s| at(s.as_bytes()),
     );
 
     assert_zeroed_when_freed(
@@ -380,14 +392,14 @@ fn boxed_arm_secrets_are_zeroed_before_their_memory_is_released() {
             derive_circle_presence_veilid_owner_seed("correct horse battery staple", &CNSA_2_0)
                 .unwrap()
         },
-        |s| s.as_bytes().as_slice(),
+        |s| at(s.as_bytes()),
     );
 
     assert_zeroed_when_freed(
         "RoomVeilidOwnerSeed",
         (0, SEED_LEN),
         || derive_room_veilid_owner_seed("general", &CNSA_2_0).unwrap(),
-        |s| s.as_bytes().as_slice(),
+        |s| at(s.as_bytes()),
     );
 
     // The DM ratchet's own boxed secret, and the only watched block that is not
@@ -398,7 +410,7 @@ fn boxed_arm_secrets_are_zeroed_before_their_memory_is_released() {
         "EphemeralDecapKey",
         (0, DK_LEN),
         || EphemeralDecapKey::new(Box::new([0xA5u8; DK_LEN])),
-        |s| s.as_bytes().as_slice(),
+        |s| at(s.as_bytes()),
     );
 }
 
@@ -408,11 +420,15 @@ fn boxed_arm_secrets_are_zeroed_before_their_memory_is_released() {
 /// wipes the array in place, and only then is the block released.
 ///
 /// All three identity-rooted secrets come from one derivation, so this covers
-/// the whole inline family that has a public constructor. The inline ratchet
-/// keys (`RootKey`, `ChainKey`, `MessageKey`) are built only inside their own
-/// module and are reachable here only by the compile-time bound in
-/// `secret_seed.rs`; they share this exact macro arm, so the arm-level property
-/// proved here is the one they rely on.
+/// every inline-family secret that has a public constructor — with one caveat
+/// since #271: `VeilidNodeSeed` is on the `inline_scoped` arm rather than
+/// `inline`, so its case here proves the *scoped* arm's expansion, not this one's.
+/// The two arms share their storage, `Zeroize` and `ZeroizeOnDrop` derives, which
+/// is why they are witnessed together, but a change to one does not move the
+/// other. The inline ratchet keys (`RootKey`, `ChainKey`, `MessageKey`) are built
+/// only inside their own module and are reachable here only by the compile-time
+/// bound in `secret_seed.rs`; they share the `inline` arm, so the arm-level
+/// property proved by the two remaining cases is the one they rely on.
 #[test]
 fn inline_arm_secrets_are_zeroed_before_their_memory_is_released() {
     init();
@@ -434,19 +450,19 @@ fn inline_arm_secrets_are_zeroed_before_their_memory_is_released() {
         "VeilidNodeSeed",
         (0, SEED_LEN),
         || Box::new(keys.veilid_node_seed),
-        |s| s.as_bytes().as_slice(),
+        |s| s.with_bytes(|b| at(b)),
     );
     assert_zeroed_when_freed(
         "ShareRootIkm",
         (0, SEED_LEN),
         || Box::new(keys.share_root_ikm),
-        |s| s.as_bytes().as_slice(),
+        |s| at(s.as_bytes()),
     );
     assert_zeroed_when_freed(
         "DmDoorbellSlotSecret",
         (0, SEED_LEN),
         || Box::new(keys.dm_doorbell_slot_secret),
-        |s| s.as_bytes().as_slice(),
+        |s| at(s.as_bytes()),
     );
 }
 
@@ -502,7 +518,7 @@ fn secrets_outside_the_macro_zero_themselves_before_their_memory_is_released() {
             assert_eq!(phrase.len(), CIRCLE_PHRASE_LEN);
             PersistedCircle::new(phrase, circle_label())
         },
-        |c| c.entropy().as_bytes(),
+        |c| at(c.entropy().as_bytes()),
     );
 
     // The same struct's other field, and the only case here whose subject is not a
@@ -520,7 +536,7 @@ fn secrets_outside_the_macro_zero_themselves_before_their_memory_is_released() {
             phrase.push_str("correct horse battery staple correct horse battery staple");
             PersistedCircle::new(phrase, circle_label())
         },
-        |c| c.label.as_bytes(),
+        |c| at(c.label.as_bytes()),
     );
 
     // `ss0` is an inline `[u8; SS0_LEN]` field, so it is watched as a range at a
@@ -548,7 +564,7 @@ fn secrets_outside_the_macro_zero_themselves_before_their_memory_is_released() {
                 "the body is not a secret".to_owned(),
             ))
         },
-        |v| v.ss0_for_test().as_slice(),
+        |v| at(v.ss0_for_test()),
     );
 
     // The decrypted message on the same struct. Unlike `ss0` it is a `String`, so
@@ -571,7 +587,7 @@ fn secrets_outside_the_macro_zero_themselves_before_their_memory_is_released() {
             assert_eq!(body.len(), DM_BODY_LEN);
             verified_first_contact(body)
         },
-        |v| v.body().as_bytes(),
+        |v| at(v.body().as_bytes()),
     );
 
     // The sender's long-term public key, which is not a secret and is the one
@@ -597,7 +613,7 @@ fn secrets_outside_the_macro_zero_themselves_before_their_memory_is_released() {
         "VerifiedFirstContact::pk_lt",
         (0, ML_DSA_PK_BLOCK),
         || verified_first_contact("the body is not a secret".to_owned()),
-        |v| v.pk_lt().as_slice(),
+        |v| at(v.pk_lt()),
     );
 }
 
@@ -783,7 +799,7 @@ fn resume_record_secret_halves_are_zeroed_before_their_memory_is_released() {
         "ResumeRecord::s_pc",
         (0, ML_DSA_SK_LEN),
         resume_record,
-        |r| r.s_pc().as_slice(),
+        |r| at(r.s_pc()),
     );
 
     assert_zeroed_when_freed(
@@ -793,7 +809,7 @@ fn resume_record_secret_halves_are_zeroed_before_their_memory_is_released() {
             size_of::<ResumeRecord>(),
         ),
         || Box::new(resume_record()),
-        |r| r.committed_root().as_bytes().as_slice(),
+        |r| at(r.committed_root().as_bytes()),
     );
 }
 

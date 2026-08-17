@@ -59,7 +59,7 @@ fn vld0_keypair(seed: &[u8; 32]) -> Result<KeyPair> {
 
 /// Build the VLD0 node keypair from a daemonseed Veilid node seed (D3).
 pub fn node_keypair(seed: &VeilidNodeSeed) -> Result<KeyPair> {
-    vld0_keypair(seed.as_bytes())
+    seed.with_bytes(vld0_keypair)
 }
 
 /// Build the VLD0 **rendezvous-owner** keypair from a deterministic owner seed
@@ -96,9 +96,7 @@ pub fn rendezvous_owner_public_bytes(owner_seed: &[u8; 32]) -> [u8; 32] {
 /// This node's 32-byte Ed25519 public key — a pure function of the node seed,
 /// used to spread members across the circle record's subkey regions.
 pub fn node_public_bytes(seed: &VeilidNodeSeed) -> [u8; 32] {
-    SigningKey::from_bytes(seed.as_bytes())
-        .verifying_key()
-        .to_bytes()
+    seed.with_bytes(|b| SigningKey::from_bytes(b).verifying_key().to_bytes())
 }
 
 /// Build the `(public_keys, secret_keys)` groups to pin this identity in the
