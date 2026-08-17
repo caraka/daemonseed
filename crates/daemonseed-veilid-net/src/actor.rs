@@ -1726,6 +1726,30 @@ async fn actor_loop(
 /// step — never held across the reply await, and never held on a runtime worker
 /// during the disk read (which would also stall the actor's own
 /// `ServeShare`/`StopServe` locks and the advert watchdog's `last_served` read).
+/// The bytes to reply with once the blocking serve step has completed or failed.
+///
+/// A [`tokio::task::JoinError`] means the step itself panicked, and the answer is
+/// `NOT_FOUND` — the offline-equivalent (ISC-A-S21) — rather than leaving the
+/// fetcher to burn its five-second answer window on a reply that will never come.
+///
+/// **Factored out of [`serve_loop`] so the panic arm is reachable (#248).** In the
+/// loop it sits behind a live `VeilidAPI`, so nothing could drive it; as a
+/// function taking the join result, a test hands it a real `JoinError` from a
+/// genuinely panicking task. That arm is the actor's only defence against a
+/// panicking serve step, and a regression in it strands fetchers rather than
+/// failing anything loudly.
+fn serve_response_or_not_found(
+    outcome: std::result::Result<Vec<u8>, tokio::task::JoinError>,
+) -> Vec<u8> {
+    match outcome {
+        Ok(response) => response,
+        Err(e) => {
+            crate::vtrace!("serve: blocking serve step failed ({e}); replying NOT_FOUND");
+            share::encode_response_not_found()
+        }
+    }
+}
+
 async fn serve_loop(
     api: VeilidAPI,
     shares: Arc<Mutex<HashMap<String, share::ServedShare>>>,
@@ -1776,20 +1800,15 @@ async fn serve_loop(
         // fetcher to burn its answer window on a reply that will never come.
         let seal_started = std::time::Instant::now();
         let serve_shares = shares.clone();
-        let response = match tokio::task::spawn_blocking(move || {
-            let mut s = serve_shares
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            share::serve(&mut s, &message)
-        })
-        .await
-        {
-            Ok(response) => response,
-            Err(e) => {
-                crate::vtrace!("serve: blocking serve step failed ({e}); replying NOT_FOUND");
-                share::encode_response_not_found()
-            }
-        };
+        let response = serve_response_or_not_found(
+            tokio::task::spawn_blocking(move || {
+                let mut s = serve_shares
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                share::serve(&mut s, &message)
+            })
+            .await,
+        );
         let seal_ms = seal_started.elapsed().as_millis();
         // Reply on a spawned task: awaiting `app_call_reply` inline serializes
         // the lane at whatever per-reply latency the network imposes (observed
@@ -3714,6 +3733,41 @@ mod tests {
             seed, expected_seed,
             "the record the actor opens must be the record the address named"
         );
+    }
+
+    /// A panicking blocking serve step answers NOT_FOUND rather than nothing.
+    ///
+    /// The `JoinError` is a real one — produced by actually panicking a
+    /// `spawn_blocking` task — not a constructed stand-in, because the point of the
+    /// arm is what happens when tokio reports a panic and a hand-rolled error would
+    /// only prove the `match` compiles.
+    ///
+    /// Both controls matter. The Ok path must pass its payload through unchanged,
+    /// or an implementation that answered NOT_FOUND unconditionally would satisfy
+    /// the panic assertion. And NOT_FOUND must differ from that payload, or the two
+    /// assertions could both hold on a function that returned one constant.
+    #[tokio::test]
+    async fn a_panicking_serve_step_answers_not_found() {
+        let served = b"a served response".to_vec();
+        assert_eq!(
+            super::serve_response_or_not_found(Ok(served.clone())),
+            served,
+            "the Ok path must pass its payload through, or the assertion below is \
+             satisfied by a function that always answers NOT_FOUND"
+        );
+
+        let join_err = tokio::task::spawn_blocking(|| panic!("serve step panicked"))
+            .await
+            .expect_err("the task panicked, so joining it must fail");
+        assert!(join_err.is_panic(), "expected a panic, not a cancellation");
+
+        let not_found = share::encode_response_not_found();
+        assert_ne!(
+            not_found, served,
+            "NOT_FOUND is indistinguishable from the served payload, so neither \
+             assertion here proves anything"
+        );
+        assert_eq!(super::serve_response_or_not_found(Err(join_err)), not_found);
     }
 
     /// Every funnel enqueue keys on the helper, and none on a raw seed (#256).

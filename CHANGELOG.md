@@ -141,6 +141,11 @@ work lives in the project lead's vault manifest, not here.
 
 ### Changed
 
+- The serve loop's panic arm is reachable by a test. `serve_response_or_not_found` is
+  factored out of `serve_loop`, which sits behind a live `VeilidAPI` and could not be
+  driven, so the NOT_FOUND answer to a panicking blocking serve step is now pinned by a
+  real `JoinError`. No behaviour change. (#248)
+
 - The managed-download folder policy has one home. `resolve_share_folder` and
   `safe_folder_name` were implemented three times each — both front ends and
   `daemonseed_core::storage::fetched` — so a change to the collision-suffix format or the
