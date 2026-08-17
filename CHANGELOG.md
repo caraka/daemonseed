@@ -136,6 +136,14 @@ work lives in the project lead's vault manifest, not here.
 
 ### Changed
 
+- Corrected the DM store's nonce-budget documentation, which said the 2^32 birthday bound was
+  "unreachable at any realistic volume". The dominant cost is the unconditional write in
+  `update_outbox`: one seal per correspondence per sweep tick, reaching 61% of the bound in
+  ten years at 500 correspondences and a 60-second tick with no messages sent. The sweep
+  cadence is therefore a cryptographic parameter and is not yet set. A test recomputes the
+  re-seed count from `RESEED_LADDER` and `GIVE_UP` so the figures cannot go stale unnoticed.
+  The key construction is unchanged. (#289)
+
 - `concat_kats` asserts it filled every slot, so an under-filled CNSA 2.0 KATS slice is a
   build error rather than a slice of placeholders the power-up self-test counts as passing.
   Coverage is now checked by requiring every upstream KAT name to appear, in place of the

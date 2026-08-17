@@ -2207,6 +2207,69 @@ impl<'a> Reader<'a> {
 
 #[cfg(test)]
 mod tests {
+    /// The re-seed count a never-acknowledged message costs, computed from the two
+    /// constants that determine it.
+    ///
+    /// **Re-seeds, not emissions, and the difference is one.** `ReseedSchedule::new`
+    /// sets `next_due_ms = now_ms`, so an entry is due the moment it is composed and
+    /// emits *before* consuming rung 0 — matching [`RESEED_LADDER`]'s own wording,
+    /// "plus the first send". Emissions are therefore re-seeds + 1 = 15, which is
+    /// the figure `storage::dm_store` uses.
+    ///
+    /// `storage::dm_store`'s module docs put the store key's nonce budget against
+    /// the 2^32 birthday bound, and **14** is one of its terms — the re-seeds one
+    /// unacknowledged message makes before [`GIVE_UP`]. A change to
+    /// [`RESEED_LADDER`] or to [`GIVE_UP`] moves that number and silently
+    /// invalidates the budget without touching the file it lives in. This fails
+    /// instead (#289).
+    ///
+    /// It is not the *dominant* term: that is the unconditional write in
+    /// [`crate::dm::persist::DmPersist::update_outbox`], which spends a seal per
+    /// correspondence per sweep tick whether or not anything changed. Nothing here
+    /// pins that, because the sweep cadence is not set anywhere yet.
+    ///
+    /// It recomputes rather than restates: asserting `14 == 14` against a literal
+    /// would be the same expression twice, which is the defect #305 was about.
+    #[test]
+    fn reseeds_before_give_up_is_the_documented_figure() {
+        let give_up = super::GIVE_UP.as_secs();
+        let mut elapsed = 0u64;
+        let mut reseeds = 0u32;
+
+        for rung in super::RESEED_LADDER {
+            let d = rung.as_secs();
+            if elapsed + d > give_up {
+                break;
+            }
+            elapsed += d;
+            reseeds += 1;
+        }
+        // The terminal rung repeats until the give-up.
+        let terminal = super::RESEED_LADDER
+            .last()
+            .expect("the ladder is not empty")
+            .as_secs();
+        assert!(terminal > 0, "a zero terminal rung would loop forever");
+        while elapsed + terminal <= give_up {
+            elapsed += terminal;
+            reseeds += 1;
+        }
+
+        assert_eq!(
+            reseeds,
+            14,
+            "a never-acked message now costs {reseeds} re-seeds rather than 14 — so \
+             {} emissions, not 15 — and the store-key nonce budget in \
+             storage::dm_store's module docs is stale. Recompute it before changing \
+             this number",
+            reseeds + 1
+        );
+        assert!(
+            elapsed <= give_up,
+            "the schedule overran the give-up, so the count is not a bound"
+        );
+    }
+
     use super::*;
 
     const T0: i64 = 1_700_000_000_000;

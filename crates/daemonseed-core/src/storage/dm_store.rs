@@ -74,15 +74,55 @@
 //! key. Every [`Locked::replace`] is one encryption, so the budget is spent by
 //! record *writes*, not by bytes or by correspondences.
 //!
-//! At any realistic volume this is unreachable: 2^32 writes is billions of
-//! record updates against a store whose records are per-correspondence
-//! handshake and queue state. It is recorded here because **nothing warns as the
-//! count grows** — there is no counter, no rotation, and no re-key, so if a
-//! future caller ever writes in a loop the first symptom would be a silent loss
-//! of the guarantee rather than an error. Rotation is deliberately not
-//! implemented: it needs a key epoch in every record's AAD and a migration for
-//! records already on disk, which is a record-format decision that belongs with
-//! the format, not with this module.
+//! **The arithmetic, because "unreachable at any realistic volume" was asserted
+//! here and is wrong (#289).** The budget is spent by record writes, and the term
+//! that dominates is not messages at all.
+//!
+//! **Polling is the governing cost.** [`crate::dm::persist::DmPersist::update_outbox`]
+//! writes unconditionally — "a successful call always writes, even if `f` changed
+//! nothing" — so every `sweep_give_ups`, `settle_from_ack` and `channel_torn_down`
+//! poll spends one seal per correspondence per tick, whether or not anything
+//! happened. Over ten years, with no messages sent at all:
+//!
+//! | correspondences | sweep tick | seals | of 2^32 |
+//! |---|---|---|---|
+//! | 500 | 60 s | 2.63 G | **61%** |
+//! | 500 | 10 min | 263 M | 6.1% |
+//! | 500 | 1 h | 43.8 M | 1.0% |
+//! | 50 | 1 h | 4.4 M | 0.1% |
+//!
+//! **So the sweep cadence is a cryptographic parameter, not only a latency knob**,
+//! and it is not yet set — there is no transport driver to set it. Whoever writes
+//! one is choosing a row of that table.
+//!
+//! Messages are the smaller term. An ordinary message costs 4 seals (enqueue,
+//! first emission rewriting outbox and resume, ack settlement) and one never
+//! acknowledged costs 32 — it rides [`crate::dm::outbox::RESEED_LADDER`] to
+//! [`crate::dm::outbox::GIVE_UP`] for **15 emissions**, being due immediately on
+//! compose and then after each rung. At 4 seals it takes a billion messages to
+//! reach the bound alone.
+//!
+//! ⚠️ **The "rewriting outbox and resume" half is not established.**
+//! [`crate::dm::persist::DmPersist::commit_resume`] has **zero production
+//! callers** — every call in the tree is a test — so nothing yet shows that an
+//! emission touches the resume record. If it does not, the costs are 3 and 17
+//! rather than 4 and 32. The figures above take the higher reading deliberately,
+//! so the driver cannot make this analysis optimistic by arriving.
+//!
+//! Not counted: `RecordKind::Provisional` writes (per-correspondence, first
+//! contact only), and the per-message accounting over-counts because one
+//! correspondence has one outbox, so several due entries settle in one seal.
+//! Both are small against the poll term.
+//!
+//! `reseeds_before_give_up_is_the_documented_figure` pins the ladder arithmetic to
+//! the constants it is computed from, so a cadence change fails rather than
+//! silently invalidating this.
+//!
+//! **Nothing warns as the count grows** — no counter, no rotation, no re-key — so
+//! the first symptom of crossing it would be a silent loss of the guarantee rather
+//! than an error. Rotation is deliberately not implemented: it needs a key epoch
+//! in every record's AAD and a migration for records already on disk, which is a
+//! record-format decision that belongs with the format, not with this module.
 //!
 //! The cursor is **not** sealed, deliberately:
 //! [`crate::dm::provisional::ReceiveCursor`] documents it as not secret, and its
