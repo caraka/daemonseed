@@ -1204,28 +1204,56 @@ fn pread_exact(f: &std::fs::File, offset: u64, buf: &mut [u8]) -> std::io::Resul
 
 /// Read the exact `[offset, offset+len)` region from `path`, or `Err` if the file
 /// is shorter than the region (a sparse/truncated tail) or unreadable.
-fn read_region(path: &Path, offset: u64, len: u64) -> std::io::Result<Vec<u8>> {
-    let f = std::fs::File::open(path)?;
-    let file_len = f.metadata()?.len();
-    if offset.checked_add(len).is_none_or(|end| end > file_len) {
+/// A candidate file opened once for a whole resume scan, with its length read
+/// once alongside.
+///
+/// Resume re-hashes every chunk of every candidate location, which is
+/// unavoidable. What was avoidable was doing `File::open` + `metadata` *per
+/// chunk*: a multi-GB file is thousands of 1 MiB chunks, and the old
+/// `read_region(path, ..)` paid two syscalls per chunk per location on top of
+/// the hashing, every time a download was re-initiated (#212). The pread helpers
+/// already took `&File`, so the handle only ever needed hoisting.
+struct Candidate {
+    file: std::fs::File,
+    len: u64,
+}
+
+/// Open a candidate location, or `None` if it cannot be opened or measured.
+///
+/// A missing or unreadable file is not an error here: every caller treats an
+/// absent candidate as "nothing to resume from", which is the same answer the
+/// per-chunk open used to give one chunk at a time.
+fn open_candidate(path: &Path) -> Option<Candidate> {
+    let file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    Some(Candidate { file, len })
+}
+
+/// Read one chunk region from an already-open candidate.
+///
+/// The bounds check is kept rather than left to `pread_exact`'s short read: it
+/// names the condition, and it is now one comparison against a length read once
+/// instead of a `metadata` call per chunk.
+fn read_region_at(c: &Candidate, offset: u64, len: u64) -> std::io::Result<Vec<u8>> {
+    if offset.checked_add(len).is_none_or(|end| end > c.len) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "chunk region past end of file",
         ));
     }
     let mut buf = vec![0u8; len as usize];
-    pread_exact(&f, offset, &mut buf)?;
+    pread_exact(&c.file, offset, &mut buf)?;
     Ok(buf)
 }
 
-/// Whether the bytes of chunk `(offset, len)` at `path` re-hash to `addr`. A
-/// missing path, a short/sparse region, an unreadable file, or a hash mismatch
-/// all read as "does not verify" — never as verified.
-fn chunk_verifies(path: Option<&Path>, offset: u64, len: u64, addr: &ChunkAddr) -> bool {
-    let Some(path) = path else {
+/// Whether the bytes of chunk `(offset, len)` in an open candidate re-hash to
+/// `addr`. An absent candidate, a short/sparse region, an unreadable file, or a
+/// hash mismatch all read as "does not verify" — never as verified.
+fn chunk_verifies_in(c: Option<&Candidate>, offset: u64, len: u64, addr: &ChunkAddr) -> bool {
+    let Some(c) = c else {
         return false;
     };
-    let Ok(bytes) = read_region(path, offset, len) else {
+    let Ok(bytes) = read_region_at(c, offset, len) else {
         return false;
     };
     chunk_addr(&bytes).is_ok_and(|a| &a == addr)
@@ -1323,7 +1351,9 @@ pub fn derive_resume_state(
     dest_root: &Path,
     staging: &StagingArea,
 ) -> ResumePlan {
-    let file_len = |p: &Path| std::fs::metadata(p).ok().map(|m| m.len());
+    // No `file_len` helper: the exact-length gate now reads the length from the
+    // handle each candidate is opened with, so the separate `metadata` call is
+    // gone along with the per-chunk ones (#212).
     let files = manifest
         .iter()
         .map(|entry| {
@@ -1355,15 +1385,17 @@ pub fn derive_resume_state(
             // staging. A chunk present only at the promoted dest is `missing` and
             // re-fetched — skipping it would promote a sparse zero-hole (xhigh review,
             // 8b-1 location-mismatch finding).
+            // Opened ONCE for the whole chunk loop below (#212).
             let staged = staging
                 .staging_path(&entry.rel_path)
                 .ok()
-                .filter(|p| file_len(p) == Some(entry.size));
+                .and_then(|p| open_candidate(&p))
+                .filter(|c| c.len == entry.size);
             let mut verified = Vec::new();
             let mut missing = Vec::new();
             for (i, addr) in entry.chunks.iter().enumerate() {
                 let (offset, len) = chunk_region(i, entry.size);
-                if chunk_verifies(staged.as_deref(), offset, len, addr) {
+                if chunk_verifies_in(staged.as_ref(), offset, len, addr) {
                     verified.push(i);
                 } else {
                     missing.push(i);
@@ -1373,14 +1405,16 @@ pub fn derive_resume_state(
             // already complete at its dest path iff it exists at exact size AND every
             // chunk re-verifies there. Separate from staging — a partially-good promoted
             // file is not trusted here (its chunks re-fetch into staging).
+            // Opened ONCE for the whole `all` below, same as staging (#212).
             let promoted_complete = sanitize_rel_path(&entry.rel_path)
                 .ok()
                 .map(|rel| dest_root.join(rel))
-                .filter(|p| file_len(p) == Some(entry.size))
-                .is_some_and(|p| {
+                .and_then(|p| open_candidate(&p))
+                .filter(|c| c.len == entry.size)
+                .is_some_and(|c| {
                     entry.chunks.iter().enumerate().all(|(i, addr)| {
                         let (offset, len) = chunk_region(i, entry.size);
-                        chunk_verifies(Some(&p), offset, len, addr)
+                        chunk_verifies_in(Some(&c), offset, len, addr)
                     })
                 });
             FileResume {

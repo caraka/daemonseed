@@ -141,6 +141,12 @@ work lives in the project lead's vault manifest, not here.
 
 ### Changed
 
+- `derive_resume_state` opens each candidate file once instead of once per chunk. The old
+  helper did `File::open` plus `metadata` on every call and was called per chunk per
+  location, so resuming a multi-GB folder issued thousands of redundant syscalls on top of
+  the re-hashing. Measured on a two-chunk fixture: two staged read-opens before, one after.
+  (#212)
+
 - Corrected the DM store's nonce-budget documentation, which said the 2^32 birthday bound was
   "unreachable at any realistic volume". The dominant cost is the unconditional write in
   `update_outbox`: one seal per correspondence per sweep tick, reaching 61% of the bound in
