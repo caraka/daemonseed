@@ -141,6 +141,13 @@ work lives in the project lead's vault manifest, not here.
 
 ### Changed
 
+- The managed-download folder policy has one home. `resolve_share_folder` and
+  `safe_folder_name` were implemented three times each — both front ends and
+  `daemonseed_core::storage::fetched` — so a change to the collision-suffix format or the
+  name derivation applied to some copies would make a front end's staging target disagree
+  with its `downloads.idx` entry. Both are now `pub` in core and the copies are gone. The
+  bodies were byte-identical, so behaviour is unchanged. (#211)
+
 - `derive_resume_state` opens each candidate file once instead of once per chunk. The old
   helper did `File::open` plus `metadata` on every call and was called per chunk per
   location, so resuming a multi-GB folder issued thousands of redundant syscalls on top of

@@ -18,7 +18,8 @@
 //!   and the Veilid actor (`crate::veilid_net`).
 //! - The transport-agnostic helpers the Veilid actor and the app reuse:
 //!   `now_unix_ms`, and the managed-download folder resolver
-//!   `resolve_share_folder` (the download write/placement path now lives in the
+//!   `resolve_share_folder`, re-exported from core since #211 (the download
+//!   write/placement path now lives in the
 //!   shared `daemonseed_veilid_net::download` engine + core `StagingArea`).
 //!
 //! ## Transport
@@ -738,46 +739,13 @@ pub(crate) fn now_unix_ms() -> i64 {
 /// (`register_share` reserving the folder as part of the same locked RMW that
 /// writes the entry), a non-trivial addition deliberately deferred — a
 /// half-baked reservation scheme is worse than the narrow, non-destructive race.
-pub(crate) fn resolve_share_folder(
-    existing: &[FetchedShare],
-    share_id: &str,
-    name: &str,
-) -> String {
-    if let Some(s) = existing.iter().find(|s| s.share_id == share_id) {
-        return s.folder.clone();
-    }
-    let base = safe_folder_name(name);
-    let taken = existing.iter().any(|s| s.folder == base);
-    if taken {
-        let suffix: String = share_id.chars().take(6).collect();
-        format!("{base}-{suffix}")
-    } else {
-        base
-    }
-}
-
-/// Derive a safe single-component folder name from an untrusted share name
-/// (mirror of core's `fetched::safe_folder_name`, ISC-A-C32): separators and
-/// control chars become `_`, leading/trailing dots and whitespace trimmed,
-/// empty falls back to `"share"`.
-fn safe_folder_name(name: &str) -> String {
-    let cleaned: String = name
-        .chars()
-        .map(|c| {
-            if c == '/' || c == '\\' || c.is_control() {
-                '_'
-            } else {
-                c
-            }
-        })
-        .collect();
-    let trimmed = cleaned.trim().trim_matches('.').trim();
-    if trimmed.is_empty() {
-        "share".to_owned()
-    } else {
-        trimmed.to_owned()
-    }
-}
+/// The managed-download folder resolver, re-exported from core (#211).
+///
+/// This crate carried a byte-identical copy of both this and `safe_folder_name`
+/// until the policy was consolidated: a change applied to one front end and not
+/// the other would make its staging target disagree with `downloads.idx`, and
+/// nothing would fail loudly.
+pub(crate) use daemonseed_core::storage::fetched::resolve_share_folder;
 
 #[cfg(test)]
 mod tests {
@@ -851,6 +819,7 @@ mod tests {
     /// TUI no longer carries its own copy.)
     #[test]
     fn fetch_path_hygiene_mirrors_fail_closed() {
+        use daemonseed_core::storage::fetched::safe_folder_name;
         assert_eq!(safe_folder_name(""), "share");
         assert_eq!(safe_folder_name("a/b\\c"), "a_b_c");
         for n in ["..", "../../etc", "/", ".", ""] {

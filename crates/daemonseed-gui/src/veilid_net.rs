@@ -112,9 +112,12 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::net::{
     NetCommand, NetEvent, ShareManifestEntry, beacon_is_own, is_unsafe_publish_root,
-    roster_from_members, roster_render_changed, safe_folder_name,
+    roster_from_members, roster_render_changed,
 };
+// The managed-download folder policy lives in core since #211 — this crate had a
+// byte-identical copy, as did the TUI.
 use crate::state::{AnnouncementRow, AnnouncementsView};
+use daemonseed_core::storage::fetched::resolve_share_folder;
 
 /// How long a discovered share lives in the catalog without a fresh announce —
 /// Generous TTL — a backstop for a sharer that vanished WITHOUT a withdraw (a hard
@@ -3400,28 +3403,6 @@ fn selection_roots(root_kind: &crate::net::RootKind, selected_rels: &[&str]) -> 
             None => vec![SelectionRoot::Dir(String::new())],
         },
         crate::net::RootKind::Dir(path) => vec![SelectionRoot::Dir(path.clone())],
-    }
-}
-
-/// (download-subsystem redesign, step 5) Resolve the managed downloads-dir folder for a share,
-/// mirroring core `FetchedStore::record_share` / `daemonseed_tui::net::resolve_share_folder`:
-/// reuse the share's existing folder on a re-fetch; otherwise derive a safe name from the listing
-/// name, collision-suffixed by `share_id` if another share already claimed it. Replicated in the
-/// GUI (the tui helper is `pub(crate)`), so the staging promote target and the idx entry agree.
-fn resolve_share_folder(
-    existing: &[daemonseed_core::storage::fetched::FetchedShare],
-    share_id: &str,
-    name: &str,
-) -> String {
-    if let Some(s) = existing.iter().find(|s| s.share_id == share_id) {
-        return s.folder.clone();
-    }
-    let base = safe_folder_name(name);
-    if existing.iter().any(|s| s.folder == base) {
-        let suffix: String = share_id.chars().take(6).collect();
-        format!("{base}-{suffix}")
-    } else {
-        base
     }
 }
 

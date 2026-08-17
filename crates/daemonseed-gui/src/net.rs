@@ -18,7 +18,8 @@
 //!   building ([`roster_from_members`], [`roster_render_changed`],
 //!   [`member_fingerprint`], [`beacon_is_own`]), handle canonicalization
 //!   ([`canonical_wire_handle`], [`republish_name`]), and share-path path hygiene
-//!   ([`safe_folder_name`], [`is_unsafe_publish_root`]).
+//!   ([`is_unsafe_publish_root`]). Folder-name derivation moved to core with the
+//!   folder policy (#211).
 //!
 //! ## Transport
 //!
@@ -527,28 +528,6 @@ pub(crate) fn is_unsafe_publish_root(root: &std::path::Path) -> bool {
         }
     }
     false
-}
-
-/// A safe single-component folder name derived from a share's display name: path
-/// separators and control chars become `_`, leading/trailing dots+space trimmed,
-/// empty falls back to `share`.
-pub(crate) fn safe_folder_name(name: &str) -> String {
-    let cleaned: String = name
-        .chars()
-        .map(|c| {
-            if c == '/' || c == '\\' || c.is_control() {
-                '_'
-            } else {
-                c
-            }
-        })
-        .collect();
-    let trimmed = cleaned.trim().trim_matches('.').trim();
-    if trimmed.is_empty() {
-        "share".to_owned()
-    } else {
-        trimmed.to_owned()
-    }
 }
 
 /// Wall-clock now in unix milliseconds (advisory message timestamp). Mirrors the

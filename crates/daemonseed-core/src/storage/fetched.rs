@@ -249,20 +249,7 @@ impl FetchedStore {
 
         // Reuse this share's existing folder on a re-fetch; otherwise derive a
         // unique folder name from the share name (collision-suffixed by share_id).
-        let folder = match shares.iter().find(|s| s.share_id == share_id) {
-            Some(existing) => existing.folder.clone(),
-            None => {
-                let base = safe_folder_name(name);
-                let taken: std::collections::BTreeSet<&str> =
-                    shares.iter().map(|s| s.folder.as_str()).collect();
-                if taken.contains(base.as_str()) {
-                    let suffix: String = share_id.chars().take(6).collect();
-                    format!("{base}-{suffix}")
-                } else {
-                    base
-                }
-            }
-        };
+        let folder = resolve_share_folder(&shares, share_id, name);
 
         let share_dir = self.root.join(&folder);
         let mut recs = Vec::with_capacity(files.len());
@@ -364,7 +351,41 @@ impl FetchedStore {
 /// Path separators and control chars become `_`; leading/trailing dots and
 /// whitespace are trimmed; an empty or all-trimmed result falls back to
 /// `"share"`. The result is always a single safe path component (ISC-A-C32).
-fn safe_folder_name(name: &str) -> String {
+/// Resolve the managed-download folder for a share: reuse this share's existing
+/// folder on a re-fetch, else the derived name, else that name plus a
+/// share-id-derived collision suffix.
+///
+/// **One home, because divergence here is silent and expensive (#211).** This
+/// policy was implemented three times — both front-end net actors and inline in
+/// [`FetchedStore::record_share`] — with [`safe_folder_name`] itself triplicated
+/// underneath it, the TUI copy even documenting itself as a "mirror of core's".
+/// A change to the suffix format or the name derivation applied to two of the
+/// three would make a front end's staging/promote target disagree with the
+/// `downloads.idx` entry: a re-fetch lands in, or is indexed under, a different
+/// folder than it was written to, and the browse pane points at a directory that
+/// is wrong or absent. Nothing would fail loudly.
+///
+/// The suffix is the first six characters of the share id, which is enough to
+/// separate two shares whose names collide without making the folder unreadable.
+pub fn resolve_share_folder(existing: &[FetchedShare], share_id: &str, name: &str) -> String {
+    if let Some(s) = existing.iter().find(|s| s.share_id == share_id) {
+        return s.folder.clone();
+    }
+    let base = safe_folder_name(name);
+    if existing.iter().any(|s| s.folder == base) {
+        let suffix: String = share_id.chars().take(6).collect();
+        format!("{base}-{suffix}")
+    } else {
+        base
+    }
+}
+
+/// Derive a safe single-component folder name from an untrusted share name
+/// (ISC-A-C32): separators and control chars become `_`, leading/trailing dots
+/// and whitespace are trimmed, and an empty result becomes `share`.
+///
+/// `pub` since #211: both front ends had byte-identical private copies.
+pub fn safe_folder_name(name: &str) -> String {
     let cleaned: String = name
         .chars()
         .map(|c| {

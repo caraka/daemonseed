@@ -5113,6 +5113,48 @@ functions:
         - name: Io
           condition: create_dir_all failed.
 
+  - name: resolve_share_folder
+    module: daemonseed_core::storage::fetched
+    description: >-
+      Resolve a managed download's folder: the share's existing folder on a
+      re-fetch, else safe_folder_name(name), else that name plus the first six
+      characters of share_id. The single home of the policy — both front ends
+      called their own copies until #211.
+    signature: "pub fn resolve_share_folder(existing: &[FetchedShare], share_id: &str, name: &str) -> String"
+    parameters:
+      - name: existing
+        type: "&[FetchedShare]"
+        direction: in
+        description: The shares already recorded, read for reuse and collision.
+      - name: share_id
+        type: "&str"
+        direction: in
+        description: The share being placed; also the source of the collision suffix.
+      - name: name
+        type: "&str"
+        direction: in
+        description: The untrusted share name the folder is derived from.
+    returns:
+      type: String
+      description: A single-component folder name, unique among `existing`.
+
+  - name: safe_folder_name
+    module: daemonseed_core::storage::fetched
+    description: >-
+      Derive a safe single-component folder name from an untrusted share name
+      (ISC-A-C32). Separators and control characters become `_`, leading and
+      trailing dots and whitespace are trimmed, and an empty result becomes
+      `share`.
+    signature: "pub fn safe_folder_name(name: &str) -> String"
+    parameters:
+      - name: name
+        type: "&str"
+        direction: in
+        description: The untrusted share name.
+    returns:
+      type: String
+      description: A single path component, never empty.
+
   - name: FetchedStore::record_share
     module: daemonseed_core::storage::fetched
     description: >-
