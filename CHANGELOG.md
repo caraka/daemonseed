@@ -136,6 +136,11 @@ work lives in the project lead's vault manifest, not here.
 
 ### Changed
 
+- `concat_kats` asserts it filled every slot, so an under-filled CNSA 2.0 KATS slice is a
+  build error rather than a slice of placeholders the power-up self-test counts as passing.
+  Coverage is now checked by requiring every upstream KAT name to appear, in place of the
+  length comparison that could not fail against `concat_kats`. (#305)
+
 - Extracted the runtime jitter draw into `daemonseed_core::jitter`. The byte-to-band
   mapping and the degrade-to-no-jitter on entropy failure were written inline and
   identically in `Backoff::next_jittered` and `ReseedSchedule::schedule_next_jittered`;

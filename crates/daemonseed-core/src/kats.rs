@@ -107,6 +107,14 @@ const fn concat_kats() -> [KatEntry; LEN] {
         j += 1;
     }
 
+    // Every slot was written. This is a `const fn`, so a deleted or short-bounded
+    // copy-loop is a build failure — on every build including release, with no
+    // test run — rather than a slice with placeholder tails that
+    // `initialize_with_profile` counts as passing self-tests (#305). The overrun
+    // direction is already a const-eval bounds error, so the two together make the
+    // whole under/over-fill class unrepresentable rather than merely tested.
+    assert!(i == LEN);
+
     out
 }
 
@@ -131,16 +139,80 @@ mod tests {
         );
     }
 
+    /// The published slice covers the whole array.
+    ///
+    /// **Not the tautology this replaced, and the difference is the `&`.** The
+    /// removed `cnsa_2_0_kats_length_matches_constituents` compared
+    /// `CNSA_2_0_KATS.len()` against a re-derivation of `LEN`, which is the array's
+    /// own length — the same expression twice, w.r.t. [`concat_kats`]. But
+    /// `CNSA_2_0_KATS` is a `&[KatEntry]` *view*, and a view can be narrower than
+    /// what it views. Publish `FULL.split_last().unwrap().1` and the slice silently
+    /// loses its last entry — ML-DSA-87, the identity and provenance signature —
+    /// while every population check below still passes. That class is real and this
+    /// is the only test that sees it.
     #[test]
-    fn cnsa_2_0_kats_length_matches_constituents() {
-        let expected = oxicrypt_sha::KATS.len()
-            + oxicrypt_hmac::KATS.len()
-            + oxicrypt_aes::KATS.len()
-            + oxicrypt_kdf::KATS.len()
-            + oxicrypt_drbg::KATS.len()
-            + oxicrypt_ecdh::KATS.len()
-            + oxicrypt_ml_kem::KATS.len()
-            + oxicrypt_ml_dsa::KATS.len();
-        assert_eq!(CNSA_2_0_KATS.len(), expected);
+    fn the_published_slice_covers_the_whole_array() {
+        assert_eq!(
+            CNSA_2_0_KATS.len(),
+            LEN,
+            "the published view is narrower than the array it views, so {} \
+             self-test(s) never run at power-up",
+            LEN - CNSA_2_0_KATS.len()
+        );
+    }
+
+    /// Every upstream KAT reaches the slice — all of them, not one per crate.
+    ///
+    /// Checking a single entry per source leaves a loop that reads a fixed index
+    /// invisible: `out[i] = oxicrypt_aes::KATS[0]` copies entry zero twenty-three
+    /// times, so the count is `LEN`, no placeholder survives, the crate is
+    /// "represented" — and twenty-two AES KATs including AES-256-GCM, the AEAD used
+    /// for share, envelope and DM sealing, never run. Requiring every name closes
+    /// that, and subsumes the placeholder scan and the one-per-crate check it
+    /// replaces: a missing loop, an off-by-one bound, a stalled index and a
+    /// wrong-crate copy all drop at least one name.
+    ///
+    /// [`concat_kats`]'s `assert!(i == LEN)` makes the under-fill class a build
+    /// failure, so this test's remaining job is the shapes that fill every slot
+    /// with the wrong thing.
+    #[test]
+    fn every_upstream_kat_reaches_the_slice() {
+        let sources: [(&str, &[KatEntry]); 8] = [
+            ("sha", oxicrypt_sha::KATS),
+            ("hmac", oxicrypt_hmac::KATS),
+            ("aes", oxicrypt_aes::KATS),
+            ("kdf", oxicrypt_kdf::KATS),
+            ("drbg", oxicrypt_drbg::KATS),
+            ("ecdh", oxicrypt_ecdh::KATS),
+            ("ml-kem", oxicrypt_ml_kem::KATS),
+            ("ml-dsa", oxicrypt_ml_dsa::KATS),
+        ];
+
+        // The list above duplicates knowledge `concat_kats` and `LEN` already hold,
+        // and nothing links the three. Tying its total to `LEN` is that link: add a
+        // ninth crate to the loops and to `LEN` but not here, and this fails rather
+        // than silently leaving the new primitive unverified.
+        let counted: usize = sources.iter().map(|(_, k)| k.len()).sum();
+        assert_eq!(
+            counted, LEN,
+            "the sources list totals {counted} against LEN {LEN}, so it has drifted \
+             from concat_kats and the coverage check below is incomplete"
+        );
+
+        for (crate_name, kats) in sources {
+            assert!(
+                !kats.is_empty(),
+                "{crate_name} publishes no KATs at all, so its coverage check is \
+                 unreachable rather than satisfied"
+            );
+            for want in kats {
+                assert!(
+                    CNSA_2_0_KATS.iter().any(|e| e.name == want.name),
+                    "{crate_name}'s KAT {:?} never reached CNSA_2_0_KATS, so that \
+                     primitive is not fully covered by the power-up self-test",
+                    want.name
+                );
+            }
+        }
     }
 }
