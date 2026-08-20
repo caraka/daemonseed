@@ -158,6 +158,12 @@ work lives in the project lead's vault manifest, not here.
 
 ### Changed
 
+- Aligned the crypto stack on published oxicrypt: every `oxicrypt-*` dependency is pinned to
+  `0.24.0` from crates.io instead of path-depending on a sibling checkout, and the packaging
+  scripts fetch the integrity signer at that same pin through `packaging/lib/sign.sh`. A
+  daemonseed clone now builds on its own. A commented `[patch.crates-io]` block redirects to a
+  local `../oxicrypt` for cross-repo work.
+
 - Corrected the DM channel-page address so a publish cannot name a slot its address does not
   hold: `DmPageAddress<Sending>` carries the `PagePosition` it writes, and `publish_dm_page`
   takes no separate position. **Breaking (crate API):** `publish_dm_page` loses an argument,

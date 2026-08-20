@@ -5344,6 +5344,8 @@ dependencies = [
 [[package]]
 name = "oxicrypt-aes"
 version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1bff4bfdb5433e8fd1de7e5e76852be2dcd47335a380146b49e12a01158b07c7"
 dependencies = [
  "oxicrypt-aes-accel",
  "oxicrypt-module",
@@ -5353,10 +5355,14 @@ dependencies = [
 [[package]]
 name = "oxicrypt-aes-accel"
 version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "505a2ce2bba45c73e0a380f12dfd5a1618e88afc420e2dc82e97af6eb1fd12de"
 
 [[package]]
 name = "oxicrypt-drbg"
 version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "369f08ab080e0183876a37106d34b3d9d0c0304b40daa948e51d5a06afd9d8b4"
 dependencies = [
  "oxicrypt-aes",
  "oxicrypt-hmac",
@@ -5368,6 +5374,8 @@ dependencies = [
 [[package]]
 name = "oxicrypt-ecdh"
 version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5bfcc9a3bca1ebc07a100e92a60bfef7c82051114a78e7daf28ab7a884ffce5"
 dependencies = [
  "oxicrypt-drbg",
  "oxicrypt-ecdsa",
@@ -5378,6 +5386,8 @@ dependencies = [
 [[package]]
 name = "oxicrypt-ecdsa"
 version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2870ed8a0a72a76c9bac038da2a4724947219985fdaff7188c0716298798b65a"
 dependencies = [
  "oxicrypt-drbg",
  "oxicrypt-module",
@@ -5388,6 +5398,8 @@ dependencies = [
 [[package]]
 name = "oxicrypt-hmac"
 version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7206b494ff4c7de4a1fb6c041e4cb183bc048a6c2ccfa5253abaa35cafb4c702"
 dependencies = [
  "oxicrypt-module",
  "oxicrypt-sha",
@@ -5398,10 +5410,14 @@ dependencies = [
 [[package]]
 name = "oxicrypt-imageread"
 version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2555efeabcdfdd68b2a940c338021da4b7bab32a92c602378260797998fe5e89"
 
 [[package]]
 name = "oxicrypt-integrity"
 version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8301c37349de348055bc598a2200fda7d0af6850ecf1a1b0e17a964b7462db2a"
 dependencies = [
  "oxicrypt-hmac",
  "oxicrypt-imageread",
@@ -5411,6 +5427,8 @@ dependencies = [
 [[package]]
 name = "oxicrypt-integrity-sign"
 version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7f73450eebf191536bad719cd58083f1f7548668a4fac271d39e21b4f41fc74"
 dependencies = [
  "oxicrypt-integrity",
 ]
@@ -5418,6 +5436,8 @@ dependencies = [
 [[package]]
 name = "oxicrypt-kdf"
 version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "25e14858aca653ba5b54b5fb186cb7f0384101f21893537b7093ac9acd8df0a0"
 dependencies = [
  "oxicrypt-hmac",
  "oxicrypt-module",
@@ -5429,6 +5449,8 @@ dependencies = [
 [[package]]
 name = "oxicrypt-ml-dsa"
 version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fca2527b308b2492a16e9c7756f8530a21b269248e7e243085571613d52f1f3a"
 dependencies = [
  "oxicrypt-module",
  "oxicrypt-sha",
@@ -5439,6 +5461,8 @@ dependencies = [
 [[package]]
 name = "oxicrypt-ml-kem"
 version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e28d5de618282cce710e1d8a0d08c4d1863e76550bdc93ddec5d168cc12d395"
 dependencies = [
  "oxicrypt-module",
  "oxicrypt-sha",
@@ -5449,10 +5473,14 @@ dependencies = [
 [[package]]
 name = "oxicrypt-module"
 version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "24a99ba6675896ff81df4dc897a2ad62579763a1bb2e3384f06c6c0fb29e48e6"
 
 [[package]]
 name = "oxicrypt-sha"
 version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93b54b75fe68fc666ef9717c6344c0c6576abd1825f54bbda2b46afba15827b9"
 dependencies = [
  "oxicrypt-module",
  "oxicrypt-test-vectors",
@@ -5462,10 +5490,14 @@ dependencies = [
 [[package]]
 name = "oxicrypt-test-vectors"
 version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "40aa8b85a902b8d9bb6906ac5955f04cd09e5ef5786c0d28b1a35d9eeb54e141"
 
 [[package]]
 name = "oxicrypt-xof"
 version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96cb2551ef155acd2c68008e59ca24caf0c2307dbd77000840514a223b8daa13"
 dependencies = [
  "oxicrypt-module",
  "oxicrypt-sha",
@@ -5475,6 +5507,8 @@ dependencies = [
 [[package]]
 name = "oxicrypt-zeroize"
 version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8bebbb8c7d2008b31c4a0186751bc972201447c6fadfccc8f7b346437db843c8"
 
 [[package]]
 name = "parking"

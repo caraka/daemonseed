@@ -27,16 +27,16 @@ binary exits at startup with `Module image integrity`. The script runs
 artifact after signing invalidates the MAC. `appimagetool` stores the ELF verbatim,
 so the slot survives into the AppImage.
 
-This is why the sibling `../oxicrypt` checkout is a build requirement: the signer is
-built from it. It is a build tool, outside the cryptographic boundary, and is linked
-into nothing that ships.
+The signer is fetched from crates.io at the version this workspace pins, so the tool
+that writes the slot and the runtime that reads it cannot drift. It is a build tool,
+outside the cryptographic boundary, and is linked into nothing that ships.
 
 ## Requirements (already present on the build VM)
 
 - `rustup` with the `x86_64-unknown-linux-gnu` target
 - `cargo-zigbuild` + `zig` (the cross-linker that pins the glibc floor)
 - `appimagetool` on `PATH`
-- the `../oxicrypt` sibling checkout (the integrity signer builds from it)
+- network access on the first build, to fetch the pinned integrity signer (cached after)
 
 No imagemagick is needed — the app icon is a scalable SVG.
 

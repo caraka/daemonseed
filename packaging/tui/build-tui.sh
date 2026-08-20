@@ -15,7 +15,8 @@
 # Requirements:
 #   - rustup with the x86_64-unknown-linux-gnu target
 #   - cargo-zigbuild + zig   (the cross-linker that pins the glibc floor)
-#   - the oxicrypt sibling checkout at ../oxicrypt (the signer builds from it)
+#   - network access on the first build, to fetch the pinned integrity signer
+#     (cached under target/signer/ afterwards)
 #
 # Usage:
 #   packaging/tui/build-tui.sh [OUTPUT_DIR]
@@ -69,19 +70,14 @@ log "glibc floor ok (max symbol GLIBC_${MAX_GLIBC} <= ${GLIBC_FLOOR})"
 # the artifact's loader-invariant extent and anything that rewrites the file
 # invalidates the slot. The signer is a build tool from oxicrypt's own tree,
 # outside the cryptographic boundary; nothing here links it.
-SIGNER_DIR="${REPO_ROOT}/../oxicrypt/tools/oxicrypt-integrity-sign"
-[ -f "${SIGNER_DIR}/Cargo.toml" ] || die "integrity signer not found at ${SIGNER_DIR}"
-log "building the integrity signer"
-cargo build --release --locked --manifest-path "${SIGNER_DIR}/Cargo.toml"
-SIGNER_BIN="${REPO_ROOT}/../oxicrypt/target/release/oxicrypt-integrity-sign"
-[ -x "${SIGNER_BIN}" ] || die "integrity signer not built at ${SIGNER_BIN}"
+# The signer is resolved from the registry at the version this workspace pins,
+# so the tool that writes the slot and the runtime that reads it cannot drift.
+# shellcheck source=../lib/sign.sh
+. "${HERE}/../lib/sign.sh"
+SIGNER_BIN="$(resolve_signer "${REPO_ROOT}")" || die "could not resolve the integrity signer"
 
 log "signing the module image"
-"${SIGNER_BIN}" --sign "${OUT_BIN}" || die "integrity signing failed"
-# Read the slot back rather than trusting the signer's exit: a signer that wrote
-# nothing exits the same way as one that worked, and the only symptom would be a
-# tester reporting that the app refuses to start.
-"${SIGNER_BIN}" --verify "${OUT_BIN}" || die "integrity slot did not verify after signing"
+sign_artifact "${SIGNER_BIN}" "${OUT_BIN}" || die "integrity signing failed or the slot did not verify"
 
 log "done: ${OUT_BIN}"
 file "${OUT_BIN}"

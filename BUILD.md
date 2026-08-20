@@ -5,21 +5,18 @@ How to produce every artifact — dev binaries, the Linux AppImage, the Windows
 separate and lives in [AGENTS.md → Definition of done](AGENTS.md#definition-of-done);
 this file is about producing runnable and distributable binaries.
 
-## Repository layout — clone the sibling first
+## Repository layout — a daemonseed clone is enough
 
-During the pre-1.0 private phase daemonseed **path-depends** on one sibling repo,
-so it must be checked out **next to** the daemonseed directory (`../oxicrypt`):
+daemonseed takes its crypto from **oxicrypt, pinned to a published version on
+crates.io**. A plain `git clone` of this repo builds; no sibling checkout is
+needed, and the packaging scripts fetch the integrity signer from the registry at
+the same pin.
 
-```
-somedir/
-├── oxicrypt/     # CNSA 2.0 primitives, AEAD, KDF
-└── daemonseed/
-```
-
-`Cargo.toml` references it as `../oxicrypt/crates/...`, so a daemonseed-only clone
-fails at the first `cargo build`. **It is required to build any crate — the GUI
-included** — because `daemonseed-core` (which every crate depends on) hard-depends
-on it.
+To work across both repos at once, uncomment the `[patch.crates-io]` block at the
+foot of the workspace `Cargo.toml`, which redirects every oxicrypt dependency to a
+local `../oxicrypt` without changing a version. **Re-comment it before pushing** —
+a patched build is not the build anyone else gets, so a green gate under a patch
+says nothing about the pinned version.
 
 ## Toolchain
 
@@ -57,9 +54,13 @@ HMAC-SHA-256 over the artifact's loader-invariant extent and writes the range
 table and MAC into a reserved slot inside the file:
 
 ```sh
-cargo build --release --manifest-path ../oxicrypt/tools/oxicrypt-integrity-sign/Cargo.toml
-../oxicrypt/target/release/oxicrypt-integrity-sign --sign <artifact>
-../oxicrypt/target/release/oxicrypt-integrity-sign --verify <artifact>
+# Resolve the signer the same way the packaging scripts do, then use it. Sourcing
+# the helper is the point: it picks the signer matching this workspace's pin, and
+# under `[patch.crates-io]` it builds from the patched checkout rather than
+# installing a same-numbered release.
+. packaging/lib/sign.sh
+SIGNER="$(resolve_signer "$PWD")"
+sign_artifact "$SIGNER" <artifact>
 ```
 
 **Sign last.** Anything that rewrites the artifact afterwards invalidates the

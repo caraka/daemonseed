@@ -50,5 +50,5 @@ daemonseed-core = { path = "../daemonseed-core", features = ["testing"] }
 # `test-util` drives the WB-3 scheduler oracles in paused virtual time
 # (`#[tokio::test(start_paused = true)]`) — the WB-2 paused-time write-budget oracle.
 daemonseed-proto = { path = "../daemonseed-proto" }
-oxicrypt-module = { path = "../../../oxicrypt/crates/oxicrypt-module" }
+oxicrypt-module = { workspace = true }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "test-util"] }
