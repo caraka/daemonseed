@@ -23,6 +23,14 @@ daemonseed-core = { path = "../daemonseed-core" }
 daemonseed-proto = { path = "../daemonseed-proto" }
 
 [dev-dependencies]
+# Named again here purely to switch daemonseed-core's `testing` feature on while
+# building this crate's test targets, so `kats::initialize_module_unsigned_test_binary`
+# is reachable from test targets. The release command carries no dev-dependency
+# edge (`cargo zigbuild --release --locked -p <crate>`), so the shipped artifact
+# never links a `testing`-enabled core. Note the narrower true statement: under
+# `--all-targets` cargo does enable the feature for this crate's bin target too,
+# so "off in every build" would be false — it is off in the build that ships.
+daemonseed-core = { path = "../daemonseed-core", features = ["testing"] }
 # M0 type-state ↔ tonic spike (closes R2 — see tests/spike_type_state.rs).
 # Throwaway compile-prove only; not used at M0 by integration code.
 tonic = { workspace = true }

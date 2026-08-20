@@ -268,7 +268,7 @@ mod tests {
     use oxicrypt_aes::gcm_encrypt;
 
     fn requester(seed: u8) -> SignKeypair {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         SignKeypair::from_ml_dsa_seed(&[seed; 32]).unwrap()
     }
 
@@ -283,7 +283,7 @@ mod tests {
     /// Derive a public room key, initializing the crypto module first so each
     /// test stands alone (no cross-test ordering dependency).
     fn room_key(room: &str) -> PublicRoomKey {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         derive_room_key(room, &CNSA_2_0).unwrap()
     }
 
@@ -304,7 +304,7 @@ mod tests {
     /// tier-agnostic; only the key (and thus who can open) differs.
     #[test]
     fn seal_open_round_trip_under_circle_key() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let key = derive_cot_key(EXAMPLE_ENTROPY, &CNSA_2_0).unwrap();
         let me = requester(8);
         let sealed = seal_circle_rollcall(&key, &me, &fields("a circle")).unwrap();

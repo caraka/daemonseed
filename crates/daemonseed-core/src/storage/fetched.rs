@@ -2377,7 +2377,7 @@ mod tests {
     /// `size` deterministic content bytes plus the REAL per-chunk addresses over
     /// [`CHUNK_SIZE`] windows — the fixtures the re-derivation oracles hash against.
     fn real_content(size: u64) -> (Vec<u8>, Vec<ChunkAddr>) {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let mut bytes = vec![0u8; size as usize];
         for (i, b) in bytes.iter_mut().enumerate() {
             *b = (i as u8).wrapping_mul(31).wrapping_add(7);
@@ -2396,7 +2396,7 @@ mod tests {
     /// stable, and the digest is reproducible (the DL-ISC-20 anchor).
     #[test]
     fn stored_manifest_serialization_is_deterministic_and_round_trips() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let manifest = vec![
             fake_entry("a/b.txt", 3, 0x11, 2),
             fake_entry("c.bin", 1_048_577, 0x22, 3),
@@ -2528,7 +2528,7 @@ mod tests {
     /// staging copy's digest matches the profile-anchored digest.
     #[test]
     fn verify_stored_manifest_accepts_the_matching_digest() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let dir = tempfile::TempDir::new().unwrap();
         let staging = StagingArea::open(dir.path(), "s").unwrap();
         let manifest = vec![fake_entry("a.txt", 5, 1, 2)];
@@ -2542,7 +2542,7 @@ mod tests {
     /// proceed on an unverified stored manifest.
     #[test]
     fn verify_stored_manifest_rejects_a_tampered_staging_manifest() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let dir = tempfile::TempDir::new().unwrap();
         let staging = StagingArea::open(dir.path(), "s").unwrap();
         let manifest = vec![fake_entry("a.txt", 5, 1, 2)];
@@ -2561,7 +2561,7 @@ mod tests {
     /// digest compare against the original's anchored digest.
     #[test]
     fn verify_stored_manifest_rejects_a_swapped_manifest() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let dir = tempfile::TempDir::new().unwrap();
         let staging = StagingArea::open(dir.path(), "s").unwrap();
         let original = vec![fake_entry("a.txt", 5, 1, 2)];

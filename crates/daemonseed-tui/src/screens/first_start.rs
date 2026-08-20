@@ -602,7 +602,7 @@ mod tests {
     }
 
     fn ui() -> FirstStartUi {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         FirstStartUi::new(fast_argon())
     }
 
@@ -793,14 +793,14 @@ mod tests {
 
     #[test]
     fn new_recovery_starts_on_recover_choose() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let ui = FirstStartUi::new_recovery(fast_argon());
         assert_eq!(ui.step(), FsStep::RecoverChoose);
     }
 
     #[test]
     fn recover_choose_routes_to_both_inputs() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let mut ui = FirstStartUi::new_recovery(fast_argon());
         ui.on_key(press(KeyCode::Char('m')));
         assert_eq!(ui.step(), FsStep::RecoverMnemonic);
@@ -811,7 +811,7 @@ mod tests {
 
     #[test]
     fn recover_typed_invalid_mnemonic_stays() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let mut ui = FirstStartUi::new_recovery(fast_argon());
         ui.on_key(press(KeyCode::Char('m')));
         type_str(&mut ui, "abandon abandon abandon"); // bad word count / checksum

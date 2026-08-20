@@ -273,7 +273,7 @@ mod tests {
     const MSG: &[u8] = b"daemonseed v0.12.0 manifest digest";
 
     fn kp(seed: u8) -> SignKeypair {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         SignKeypair::from_ml_dsa_seed(&[seed; 32]).unwrap()
     }
 

@@ -37,6 +37,14 @@ thiserror = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 [dev-dependencies]
+# Named again here purely to switch daemonseed-core's `testing` feature on while
+# building this crate's test targets, so `kats::initialize_module_unsigned_test_binary`
+# is reachable from test targets. The release command carries no dev-dependency
+# edge (`cargo zigbuild --release --locked -p <crate>`), so the shipped artifact
+# never links a `testing`-enabled core. Note the narrower true statement: under
+# `--all-targets` cargo does enable the feature for this crate's bin target too,
+# so "off in every build" would be false — it is off in the build that ships.
+daemonseed-core = { path = "../daemonseed-core", features = ["testing"] }
 # Integration test (#97): the 2-node send_sealed-over-private-route oracle.
 # Runs on a real-network host (`--ignored`); this VM's NAT blocks public attach.
 # `test-util` drives the WB-3 scheduler oracles in paused virtual time

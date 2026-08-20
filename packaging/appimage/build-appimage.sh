@@ -56,6 +56,42 @@ mkdir -p "${APPDIR}/usr/bin" \
          "${APPDIR}/usr/share/icons/hicolor/scalable/apps"
 
 install -m 0755 "${BIN_PATH}"                       "${APPDIR}/usr/bin/${BIN}"
+
+# The oxicrypt module verifies its own image before it will do any work, so an
+# unsigned binary never reaches `Operational` and the app dies at init with
+# "crypto module init failed". `oxicrypt-integrity-sign` computes HMAC-SHA-256
+# over the artifact's loader-invariant extent and writes the range table and MAC
+# into a reserved slot inside it.
+#
+# **Signed here, on the AppDir copy, and nowhere earlier.** Anything that
+# rewrites the file after signing invalidates the slot — a strip, a compressor,
+# a platform signing tool. `install` above copies bytes verbatim and
+# appimagetool below embeds this ELF without rewriting it, so this is the last
+# point at which the shipped bytes exist as a file. The binary left in
+# `target/` stays unsigned on purpose: it is the dev-run artifact, and tests
+# initialize the module through the unsigned-test-binary path instead.
+#
+# The signer is a build tool from oxicrypt's own tree, outside the
+# cryptographic boundary — it is a dev-dependency of `daemonseed-gui` purely so
+# `Cargo.lock` pins it against the `oxicrypt-integrity` it must agree with, and
+# nothing links it. The relative path matches the one the workspace manifest
+# uses, so it resolves through the `<worktree-parent>/oxicrypt` symlink too.
+SIGNER_DIR="${REPO_ROOT}/../oxicrypt/tools/oxicrypt-integrity-sign"
+[ -f "${SIGNER_DIR}/Cargo.toml" ] || die "integrity signer not found at ${SIGNER_DIR}"
+log "building the integrity signer"
+cargo build --release --locked --manifest-path "${SIGNER_DIR}/Cargo.toml"
+SIGNER_BIN="${REPO_ROOT}/../oxicrypt/target/release/oxicrypt-integrity-sign"
+[ -x "${SIGNER_BIN}" ] || die "integrity signer not built at ${SIGNER_BIN}"
+
+log "signing the module image"
+"${SIGNER_BIN}" --sign "${APPDIR}/usr/bin/${BIN}" \
+  || die "integrity signing failed"
+# Read the slot back rather than trusting the signer's exit: --verify recomputes
+# the MAC over the artifact as it now stands and names the defect on a
+# mismatch. Without this, a signer that wrote nothing would look identical to
+# one that worked, and the failure would only surface as a refusing app.
+"${SIGNER_BIN}" --verify "${APPDIR}/usr/bin/${BIN}" \
+  || die "integrity slot did not verify after signing"
 install -m 0755 "${HERE}/AppRun"                    "${APPDIR}/AppRun"
 install -m 0644 "${HERE}/${BIN}.desktop"            "${APPDIR}/${BIN}.desktop"
 install -m 0644 "${HERE}/${BIN}.desktop"            "${APPDIR}/usr/share/applications/${BIN}.desktop"

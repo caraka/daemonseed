@@ -848,7 +848,7 @@ mod tests {
     use crate::dm::ratchet::Role;
 
     fn key() -> Aes256Key {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         derive_seal_key(&[0x5Au8; AEAD_KEY_LEN]).unwrap()
     }
 

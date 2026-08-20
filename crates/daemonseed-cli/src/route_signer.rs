@@ -64,7 +64,7 @@ mod tests {
     use daemonseed_veilid_net::verify_route_advert;
 
     fn keypair(seed: u8) -> SignKeypair {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         SignKeypair::from_ml_dsa_seed(&[seed; 32]).unwrap()
     }
 

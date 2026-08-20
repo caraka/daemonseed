@@ -103,7 +103,26 @@ oxicrypt-ml-kem = { path = "../oxicrypt/crates/oxicrypt-ml-kem" }
 oxicrypt-aes = { path = "../oxicrypt/crates/oxicrypt-aes", features = ["accel-aes"] }
 oxicrypt-kdf = { path = "../oxicrypt/crates/oxicrypt-kdf" }
 oxicrypt-sha = { path = "../oxicrypt/crates/oxicrypt-sha" }
-oxicrypt-zeroize = { path = "../oxicrypt/crates/oxicrypt-zeroize" }
+# The pre-operational software integrity self-test. `initialize_with_profile`
+# takes its inventory as the first argument, and a module initialized with an
+# empty group latches `IntegrityUnverified` instead of reaching `Operational`,
+# so this is a required dependency of the boot path rather than an option.
+oxicrypt-integrity = { path = "../oxicrypt/crates/oxicrypt-integrity" }
+# The signer that writes the integrity slot into a built artifact. A BUILD TOOL,
+# outside the cryptographic boundary and never linked into anything daemonseed
+# ships. Invoked as a binary against the artifact, last, after anything that
+# rewrites the file.
+#
+# Declared as a dev-dependency of the crates that produce signable artifacts so
+# the relationship is in the manifest rather than only in a shell script. Be
+# precise about what that buys TODAY, which is less than it looks: it is a path
+# dependency into the same tree the packaging scripts build from, and those
+# scripts run `cargo build --locked --manifest-path ../oxicrypt/...`, which
+# resolves against oxicrypt's own lockfile — so nothing here pins the signer
+# that actually executes. It becomes a real pin when the oxicrypt path
+# dependencies move to registry deps, where the signer and the
+# `oxicrypt-integrity` it must agree with would otherwise be free to drift.
+oxicrypt-integrity-sign = { path = "../oxicrypt/tools/oxicrypt-integrity-sign" }
 # Additional oxicrypt primitives reached by daemonseed-core for assembling the
 # production KATS slice that drives `oxicrypt_module::initialize_with_profile`.
 oxicrypt-hmac = { path = "../oxicrypt/crates/oxicrypt-hmac" }

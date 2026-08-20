@@ -11,7 +11,6 @@ use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use daemonseed_core::kats::CNSA_2_0_KATS;
 use daemonseed_core::profile::resolve::resolve;
 use daemonseed_core::profile::{
     ResolveArgs, ResolvedProfileRoot, load_for_unlock, session_materials_from_unlock,
@@ -21,7 +20,6 @@ use daemonseed_core::storage::seeds;
 use daemonseed_tui::app::App;
 use daemonseed_tui::net::{NetCommand, NetHandle, RootKind};
 use daemonseed_tui::ui;
-use oxicrypt_module::{AlgorithmProfile, initialize_with_profile};
 use ratatui::crossterm::event::{self, Event};
 
 /// Event-loop poll interval. Bounds redraw latency for time-driven UI (toasts,
@@ -32,7 +30,7 @@ fn main() -> io::Result<()> {
     // Bring the oxicrypt module Operational before touching the terminal — a
     // failure here should print plainly, not corrupt a raw-mode screen.
     // First-start sealing needs the module Operational.
-    if let Err(e) = initialize_with_profile(CNSA_2_0_KATS, AlgorithmProfile::Cnsa2) {
+    if let Err(e) = daemonseed_core::kats::initialize_module() {
         eprintln!("daemonseed-tui: crypto module init failed: {e}");
         return Err(io::Error::other(e.to_string()));
     }

@@ -101,9 +101,7 @@ fn relay_target() -> (String, String) {
 /// the offscreen + self-check paths init it too. Returns `Ok(())` or a
 /// human-readable reason.
 fn init_crypto() -> Result<(), String> {
-    use daemonseed_core::kats::CNSA_2_0_KATS;
-    use oxicrypt_module::{AlgorithmProfile, initialize_with_profile};
-    initialize_with_profile(CNSA_2_0_KATS, AlgorithmProfile::Cnsa2)
+    daemonseed_core::kats::initialize_module()
         .map_err(|e| format!("crypto module init failed: {e}"))?;
     Ok(())
 }

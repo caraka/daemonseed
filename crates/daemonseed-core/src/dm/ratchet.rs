@@ -1395,7 +1395,7 @@ mod tests {
     /// Every derivation runs through the crypto module, which refuses to operate
     /// until its self-tests have passed.
     fn root(tag: u8) -> RootKey {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         derive_root(&ss(tag)).unwrap()
     }
 
@@ -1461,7 +1461,7 @@ mod tests {
     /// `daemonseed/dm/addr/root/v3` to 32 bytes, then SHA-384 truncated to 32.
     #[test]
     fn the_conversation_binding_is_pinned() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
 
         for (ss0_tag, ar_hex, fp_hex) in [
             (
@@ -1510,7 +1510,7 @@ mod tests {
 
     #[test]
     fn roots_from_one_ss0_are_pinned_siblings() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let ss0 = ss(0x11);
         let roots = crate::dm::firstcontact::derive_channel_roots(&ss0).unwrap();
 
@@ -1641,7 +1641,7 @@ mod tests {
     /// until #282.
     #[test]
     fn the_three_roots_from_ss0_are_independent() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let ss0 = ss(0x11);
         let rk = derive_root(&ss0).unwrap();
         let roots = crate::dm::firstcontact::derive_channel_roots(&ss0).unwrap();
@@ -1896,7 +1896,7 @@ mod tests {
 
     /// A fresh ML-KEM keypair for the initiator's opening ephemeral.
     fn opening_ephemeral() -> ([u8; ml_kem::EK_LEN], [u8; ml_kem::DK_LEN]) {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let mut d = [0u8; ml_kem::SEED_LEN];
         let mut z = [0u8; ml_kem::SEED_LEN];
         getrandom::fill(&mut d).unwrap();

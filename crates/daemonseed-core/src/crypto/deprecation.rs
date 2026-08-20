@@ -379,7 +379,7 @@ mod tests {
     const HOUR_MS: i64 = 3_600_000;
 
     fn keypair() -> SignKeypair {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         SignKeypair::from_ml_dsa_seed(&[7u8; 32]).unwrap()
     }
 

@@ -175,7 +175,7 @@ mod tests {
     }
 
     fn a_keypair(seed_byte: u8) -> SignKeypair {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         SignKeypair::from_ml_dsa_seed(&[seed_byte; 32]).unwrap()
     }
 

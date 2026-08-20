@@ -103,6 +103,18 @@ windows-sys = { version = "0.61", features = [
 slint-build = { workspace = true }
 
 [dev-dependencies]
+# The integrity signer, pinned here so the tool that writes the slot and the
+# runtime test that reads it move together. Built and run as a binary against
+# the packaged artifact; nothing in this crate links it.
+oxicrypt-integrity-sign = { workspace = true }
+# Named again here purely to switch daemonseed-core's `testing` feature on while
+# building this crate's test targets, so `kats::initialize_module_unsigned_test_binary`
+# is reachable from test targets. The release command carries no dev-dependency
+# edge (`cargo zigbuild --release --locked -p <crate>`), so the shipped artifact
+# never links a `testing`-enabled core. Note the narrower true statement: under
+# `--all-targets` cargo does enable the feature for this crate's bin target too,
+# so "off in every build" would be false — it is off in the build that ships.
+daemonseed-core = { path = "../daemonseed-core", features = ["testing"] }
 # Share publish→fetch round-trip oracle (veilid_net tests): a temp share directory
 # + a temp fetch root.
 tempfile = { workspace = true }

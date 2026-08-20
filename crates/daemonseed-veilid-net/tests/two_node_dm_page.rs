@@ -91,7 +91,7 @@ fn fresh_ss0() -> [u8; 32] {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs public Veilid attach; run on a real-network host with --ignored"]
 async fn frames_published_to_page_slots_sweep_back_in_the_slots_they_were_written_to() {
-    oxicrypt_module::initialize().expect("oxicrypt init");
+    daemonseed_core::kats::initialize_module_unsigned_test_binary().expect("oxicrypt init");
 
     let base = std::env::temp_dir().join("daemonseed-veilid-net-dm-page-it");
     let _ = std::fs::remove_dir_all(&base);

@@ -781,7 +781,7 @@ mod tests {
     const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 
     fn persist(dir: &Path) -> DmPersist {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         DmPersist::open(dir.join("dm"), &AT_REST).expect("opens")
     }
 

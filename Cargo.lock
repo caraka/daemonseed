@@ -1677,6 +1677,7 @@ dependencies = [
  "oxicrypt-drbg",
  "oxicrypt-ecdh",
  "oxicrypt-hmac",
+ "oxicrypt-integrity",
  "oxicrypt-kdf",
  "oxicrypt-ml-dsa",
  "oxicrypt-ml-kem",
@@ -1709,6 +1710,7 @@ dependencies = [
  "hex",
  "i-slint-backend-winit",
  "image",
+ "oxicrypt-integrity-sign",
  "oxicrypt-module",
  "prost",
  "rfd",
@@ -1770,6 +1772,7 @@ dependencies = [
  "daemonseed-proto",
  "daemonseed-veilid-net",
  "dirs",
+ "oxicrypt-integrity-sign",
  "oxicrypt-module",
  "ratatui",
  "tempfile",
@@ -5340,7 +5343,7 @@ dependencies = [
 
 [[package]]
 name = "oxicrypt-aes"
-version = "0.23.2"
+version = "0.24.0"
 dependencies = [
  "oxicrypt-aes-accel",
  "oxicrypt-module",
@@ -5349,11 +5352,11 @@ dependencies = [
 
 [[package]]
 name = "oxicrypt-aes-accel"
-version = "0.23.2"
+version = "0.24.0"
 
 [[package]]
 name = "oxicrypt-drbg"
-version = "0.23.2"
+version = "0.24.0"
 dependencies = [
  "oxicrypt-aes",
  "oxicrypt-hmac",
@@ -5364,7 +5367,7 @@ dependencies = [
 
 [[package]]
 name = "oxicrypt-ecdh"
-version = "0.23.2"
+version = "0.24.0"
 dependencies = [
  "oxicrypt-drbg",
  "oxicrypt-ecdsa",
@@ -5374,7 +5377,7 @@ dependencies = [
 
 [[package]]
 name = "oxicrypt-ecdsa"
-version = "0.23.2"
+version = "0.24.0"
 dependencies = [
  "oxicrypt-drbg",
  "oxicrypt-module",
@@ -5384,7 +5387,7 @@ dependencies = [
 
 [[package]]
 name = "oxicrypt-hmac"
-version = "0.23.2"
+version = "0.24.0"
 dependencies = [
  "oxicrypt-module",
  "oxicrypt-sha",
@@ -5393,8 +5396,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "oxicrypt-imageread"
+version = "0.24.0"
+
+[[package]]
+name = "oxicrypt-integrity"
+version = "0.24.0"
+dependencies = [
+ "oxicrypt-hmac",
+ "oxicrypt-imageread",
+ "oxicrypt-module",
+]
+
+[[package]]
+name = "oxicrypt-integrity-sign"
+version = "0.24.0"
+dependencies = [
+ "oxicrypt-integrity",
+]
+
+[[package]]
 name = "oxicrypt-kdf"
-version = "0.23.2"
+version = "0.24.0"
 dependencies = [
  "oxicrypt-hmac",
  "oxicrypt-module",
@@ -5405,7 +5428,7 @@ dependencies = [
 
 [[package]]
 name = "oxicrypt-ml-dsa"
-version = "0.23.2"
+version = "0.24.0"
 dependencies = [
  "oxicrypt-module",
  "oxicrypt-sha",
@@ -5415,7 +5438,7 @@ dependencies = [
 
 [[package]]
 name = "oxicrypt-ml-kem"
-version = "0.23.2"
+version = "0.24.0"
 dependencies = [
  "oxicrypt-module",
  "oxicrypt-sha",
@@ -5425,11 +5448,11 @@ dependencies = [
 
 [[package]]
 name = "oxicrypt-module"
-version = "0.23.2"
+version = "0.24.0"
 
 [[package]]
 name = "oxicrypt-sha"
-version = "0.23.2"
+version = "0.24.0"
 dependencies = [
  "oxicrypt-module",
  "oxicrypt-test-vectors",
@@ -5438,11 +5461,11 @@ dependencies = [
 
 [[package]]
 name = "oxicrypt-test-vectors"
-version = "0.23.2"
+version = "0.24.0"
 
 [[package]]
 name = "oxicrypt-xof"
-version = "0.23.2"
+version = "0.24.0"
 dependencies = [
  "oxicrypt-module",
  "oxicrypt-sha",
@@ -5451,7 +5474,7 @@ dependencies = [
 
 [[package]]
 name = "oxicrypt-zeroize"
-version = "0.23.2"
+version = "0.24.0"
 
 [[package]]
 name = "parking"

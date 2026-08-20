@@ -978,7 +978,7 @@ mod tests {
     /// A log round-trips through seal → open under the right passphrase.
     #[test]
     fn seal_then_open_round_trips() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let profile_id = Uuid::from_bytes([3u8; 16]);
         let mut log = TrustEventLog::new(DEFAULT_LOG_CAP);
         log.append(TrustEvent::observed(
@@ -1008,7 +1008,7 @@ mod tests {
     /// The wrong passphrase fails authentication (does not silently return junk).
     #[test]
     fn open_rejects_wrong_passphrase() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let profile_id = Uuid::from_bytes([4u8; 16]);
         let mut log = TrustEventLog::new(DEFAULT_LOG_CAP);
         log.append(TrustEvent::observed(
@@ -1079,7 +1079,7 @@ mod tests {
     /// Tampering with the ciphertext fails authentication (AAD + AEAD).
     #[test]
     fn open_rejects_tampered_bytes() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let profile_id = Uuid::from_bytes([5u8; 16]);
         let mut log = TrustEventLog::new(DEFAULT_LOG_CAP);
         log.append(TrustEvent::observed(

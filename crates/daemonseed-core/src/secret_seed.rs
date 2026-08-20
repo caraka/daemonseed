@@ -487,7 +487,7 @@ mod tests {
     /// `tests/secret_zeroize_on_drop.rs` covers.
     #[test]
     fn derive_boxed_seed_is_deterministic_per_label() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let hkdf = super::HkdfSha384::extract(Some(b"salt"), b"ikm").unwrap();
 
         let a = super::derive_boxed_seed::<32>(&hkdf, b"label-one").unwrap();

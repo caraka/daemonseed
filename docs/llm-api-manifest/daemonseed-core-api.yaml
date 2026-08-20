@@ -612,6 +612,22 @@ modules:
       - C22
       - C37
 
+  - name: daemonseed_core::kats
+    description: >-
+      Module initialization. initialize_module brings oxicrypt
+      Operational under AlgorithmProfile::Cnsa2, passing the
+      pre-operational integrity group and CNSA_2_0_KATS, the
+      union-covering algorithm inventory for every module-gated
+      primitive daemonseed reaches. The calling artifact must carry an
+      integrity slot written by oxicrypt-integrity-sign; an unsigned
+      one does not reach Operational.
+      initialize_module_unsigned_test_binary, behind the testing
+      feature, is the entry point for test targets, which are never
+      signed.
+    no_std: false
+    depends_on: []
+    iscs: []
+
   - name: daemonseed_core::crypto::suite
     description: >-
       Suite registry — the authoritative list of crypto bundles
@@ -3728,6 +3744,55 @@ types:
 # ─────────────────────────────────────────────────────────────────────
 
 functions:
+  # ── kats ────────────────────────────────────────────────────────────
+  - name: initialize_module
+    module: daemonseed_core::kats
+    description: >-
+      Bring the oxicrypt module Operational under the CNSA 2.0 profile.
+      Call before any cryptographic call. Safe to call unconditionally
+      and more than once: module init is one-shot per process and the
+      losing caller receives AlreadyInitialized, which this function maps
+      to Ok. The calling artifact must be signed with
+      oxicrypt-integrity-sign.
+    signature: "pub fn initialize_module() -> Result<(), oxicrypt_module::Error>"
+    parameters: []
+    returns:
+      type: "Result<(), oxicrypt_module::Error>"
+      description: >-
+        Operational, or the terminal state the module latched into. Never
+        AlreadyInitialized — that case returns Ok.
+      error_variants:
+        - name: "oxicrypt_module::Error::SelfTestFailed"
+          condition: A power-up known-answer test failed. The module is in the error state.
+        - name: "oxicrypt_module::Error::IntegrityUnverified"
+          condition: >-
+            The artifact carries no valid integrity slot, so its image
+            could not be verified. Sign it with oxicrypt-integrity-sign.
+        - name: "oxicrypt_module::Error::ConditionalTestFailed"
+          condition: A conditional self-test failed. The module is in the error state.
+
+  - name: initialize_module_unsigned_test_binary
+    module: daemonseed_core::kats
+    description: >-
+      Bring the module Operational inside a cargo test binary, which
+      carries no integrity slot. Behind the `testing` feature, reached
+      only through a dev-dependency edge, which the release command does
+      not carry — so no shipped artifact links it. Safe to call
+      unconditionally and more than once, on the same terms as
+      initialize_module.
+    signature: "pub fn initialize_module_unsigned_test_binary() -> Result<(), oxicrypt_module::Error>"
+    parameters: []
+    returns:
+      type: "Result<(), oxicrypt_module::Error>"
+      description: >-
+        Operational, or the terminal state the module latched into. Never
+        AlreadyInitialized — that case returns Ok.
+      error_variants:
+        - name: "oxicrypt_module::Error::SelfTestFailed"
+          condition: A power-up known-answer test failed. The module is in the error state.
+        - name: "oxicrypt_module::Error::ConditionalTestFailed"
+          condition: A conditional self-test failed. The module is in the error state.
+
   # ── identity::mnemonic ──────────────────────────────────────────────
   - name: Mnemonic::generate
     module: daemonseed_core::identity::mnemonic

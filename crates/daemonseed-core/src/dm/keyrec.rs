@@ -502,7 +502,7 @@ mod tests {
                             zoo zoo zoo zoo zoo zoo zoo vote";
 
     fn keys(phrase: &str) -> IdentityKeys {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         derive_identity_keys(&Mnemonic::from_phrase(phrase).unwrap(), Identity::Primary).unwrap()
     }
 

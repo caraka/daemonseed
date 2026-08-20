@@ -50,7 +50,7 @@ fn loadavg() -> String {
 #[test]
 #[ignore = "civility benchmark — run on target hardware with --ignored"]
 fn indexer_civility_bench() {
-    let _ = oxicrypt_module::initialize();
+    let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
     let n = bench_file_count();
 
     let dir = tempfile::TempDir::new().unwrap();

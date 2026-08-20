@@ -1494,7 +1494,7 @@ mod tests {
     use super::*;
 
     fn ensure_oxicrypt_initialized() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
     }
 
     fn test_params() -> ArgonParams {

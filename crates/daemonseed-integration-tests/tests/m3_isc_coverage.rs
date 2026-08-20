@@ -19,7 +19,7 @@ use daemonseed_proto::v1::SuiteId as WireSuiteId;
 use uuid::Uuid;
 
 fn init_oxicrypt() {
-    let _ = oxicrypt_module::initialize();
+    let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
 }
 
 fn fast_params() -> ArgonParams {

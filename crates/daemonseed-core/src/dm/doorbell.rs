@@ -191,7 +191,7 @@ mod tests {
                             zoo zoo zoo zoo zoo zoo zoo vote";
 
     fn keys(phrase: &str) -> crate::identity::keys::IdentityKeys {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         derive_identity_keys(&Mnemonic::from_phrase(phrase).unwrap(), Identity::Primary).unwrap()
     }
 
@@ -209,7 +209,7 @@ mod tests {
     /// inequality spuriously pass, but it makes an intermittent failure
     /// unreplayable from the source.
     fn random_identity() -> crate::identity::keys::IdentityKeys {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         derive_identity_keys(&Mnemonic::generate().unwrap(), Identity::Primary).unwrap()
     }
 

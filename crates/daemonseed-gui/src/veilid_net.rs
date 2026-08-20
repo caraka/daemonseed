@@ -4438,7 +4438,7 @@ mod tests {
     }
 
     fn announcer(seed: u8) -> SignKeypair {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         SignKeypair::from_ml_dsa_seed(&[seed; 32]).unwrap()
     }
 
@@ -5983,7 +5983,7 @@ mod tests {
     /// derive the record's well-known owner seed.
     #[test]
     fn a_subscriber_never_keeps_the_operator_record_alive() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let mut shares = ShareState::new();
         shares.operator = Some(operator_space());
         push_announcement(&mut shares, "release", "v0.33.0 is out", 200);
@@ -6003,7 +6003,7 @@ mod tests {
     /// the write rate on the record is independent of how many announcements stand.
     #[test]
     fn the_keepalive_round_robins_one_slot_per_emission() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let mut shares = ShareState::new();
         shares.operator = Some(operator_space());
         let mut slots = vec![
@@ -6048,7 +6048,7 @@ mod tests {
     /// slot, so the assertion held for the bug it was written to catch.
     #[test]
     fn a_vanished_cursor_slot_resumes_at_the_next_key() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let mut shares = ShareState::new();
         shares.operator = Some(operator_space());
         let mut slots = [
@@ -6076,7 +6076,7 @@ mod tests {
 
     #[test]
     fn the_keepalive_excludes_the_mutable_motd() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         // No operator record → nothing to re-publish.
         assert!(next_operator_keepalive_item(&ShareState::new(), true, None).is_none());
         // Operator subscribed but empty → still None.
@@ -6141,7 +6141,7 @@ mod tests {
     /// its `circle_id` — the per-circle mirror of the lobby presence path.
     #[test]
     fn circle_heartbeat_folds_into_the_owning_circles_roster() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let phrase = "a shared circle passphrase for presence #77";
         let cot_key = derive_cot_key(phrase, &CNSA_2_0).unwrap();
         // A DISTINCT member (not us): shares.signing is None below, so the own-filter
@@ -6212,7 +6212,7 @@ mod tests {
     /// a release build.
     #[test]
     fn apply_operator_item_folds_a_verified_f17_motd() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let kp = dev_project_release_keypair().unwrap();
         let artifact = sign_motd(&kp, "Welcome to daemonseed", 100).unwrap();
         let bytes = encode_operator_item(OPERATOR_ITEM_MOTD, &artifact.encode_to_vec());
@@ -6254,7 +6254,7 @@ mod tests {
     /// and appears in the projected view's posts.
     #[test]
     fn apply_operator_item_folds_a_verified_f17_announcement() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let kp = dev_project_release_keypair().unwrap();
         let artifact = sign_post(&kp, "release", "v0.33.0 is out", 200).unwrap();
         let addr = content_address(&artifact.signed_payload).unwrap();
@@ -6308,7 +6308,7 @@ mod tests {
     /// the search lands on the same post on every run.
     #[test]
     fn announcements_render_newest_first_not_in_content_hash_order() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let kp = dev_project_release_keypair().unwrap();
         let (older_slot, older) = signed_post_in_slot(&kp, "maintenance", "posted first", 1_000);
         let (newer_slot, newer) = (0..64)
@@ -6361,7 +6361,7 @@ mod tests {
     /// the order total explicitly instead of resting on it.
     #[test]
     fn announcements_with_equal_timestamps_order_by_slot_key() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let kp = dev_project_release_keypair().unwrap();
         let mut op = operator_space();
         let mut by_slot: Vec<(String, String)> = Vec::new();

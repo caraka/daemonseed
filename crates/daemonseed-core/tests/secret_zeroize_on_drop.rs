@@ -361,7 +361,7 @@ fn assert_zeroed_when_freed<T>(
 }
 
 fn init() {
-    let _ = oxicrypt_module::initialize();
+    let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
 }
 
 /// The boxed arm, across three modules that use it, clears its heap buffer

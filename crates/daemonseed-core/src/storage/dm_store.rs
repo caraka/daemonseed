@@ -1706,7 +1706,7 @@ mod tests {
     }
 
     fn store(dir: &Path) -> DmStore {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         DmStore::open(dir.join("dm"), &AT_REST).unwrap()
     }
 
@@ -2830,7 +2830,7 @@ mod tests {
         let root = tmp.path().join("dm");
         let l = label(14);
 
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let ours = DmStore::open(&root, &AT_REST).unwrap();
         ours.critical_section::<_, DmStoreError>(&l, |g| g.replace(RecordKind::Resume, b"ours"))
             .unwrap();
@@ -3173,7 +3173,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("dm");
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let l = label(18);
         let start = std::sync::Barrier::new(2);
 
@@ -3210,7 +3210,7 @@ mod tests {
     fn different_correspondences_do_not_serialize() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("dm");
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
 
         let (tx_a, rx_a) = mpsc::channel();
         let (tx_b, rx_b) = mpsc::channel();

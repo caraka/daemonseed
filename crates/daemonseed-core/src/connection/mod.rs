@@ -273,7 +273,7 @@ mod tests {
         use crate::identity_proof::{build_envelope, verify_envelope};
         use daemonseed_proto::v1 as wire;
 
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
         let keys = derive_identity_keys(&Mnemonic::from_phrase(phrase).unwrap(), Identity::Primary)
             .unwrap();

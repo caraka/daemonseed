@@ -24,7 +24,7 @@ use daemonseed_integration_tests::isc_coverage::Coverage;
 /// different rendezvous yields a different label; the fingerprint is unchanged.
 #[test]
 fn circle_detail_vectors_diverge_label_relay_scoped_fingerprint_universal() {
-    let _ = oxicrypt_module::initialize();
+    let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
     let phrase =
         "abandon ability able about above absent absorb abstract absurd abuse access accident";
 

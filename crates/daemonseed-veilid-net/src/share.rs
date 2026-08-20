@@ -731,7 +731,7 @@ mod tests {
     use daemonseed_core::share_serve::{hash_share, DiskShareContent, ShareContent};
 
     fn room_key() -> PublicRoomKey {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         derive_room_key("lobby", &CNSA_2_0).unwrap()
     }
 
@@ -763,7 +763,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_unknown_share_is_not_found() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let shares: std::sync::Mutex<HashMap<String, ServedShare>> =
             std::sync::Mutex::new(HashMap::new());
         let call = |req: Vec<u8>| {
@@ -814,7 +814,7 @@ mod tests {
     /// is rejected before the reassembly loop (bounds the fetch-side DoS).
     #[tokio::test]
     async fn oversized_fragment_total_is_rejected() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let rk = room_key();
         let call = |_req: Vec<u8>| {
             let reply = encode_response_ok(MAX_FRAGMENTS + 1, &[0u8; 16]);
@@ -831,7 +831,7 @@ mod tests {
     /// mid-stream on the running cumulative total.
     #[tokio::test]
     async fn oversized_fragment_is_rejected() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let rk = room_key();
         // total=2: fragment 0 ok-sized, fragment 1 one byte over the cap.
         let call = |req: Vec<u8>| {
@@ -854,7 +854,7 @@ mod tests {
     /// touched (recently-used) entry survives further inserts.
     #[test]
     fn seal_cache_is_lru_bounded() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let dir = std::env::temp_dir().join(format!("ds-share-lru-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -892,7 +892,7 @@ mod tests {
     async fn budgeted_fetch_reassembles_and_admits_through_the_route_budget() {
         use crate::route_budget::{RouteBudget, SharerKey, W_CEIL, W_FLOOR};
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let dir = std::env::temp_dir().join(format!("ds-share-budget-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -961,7 +961,7 @@ mod tests {
     #[tokio::test]
     async fn a_route_death_collapses_the_window_once_not_per_fragment() {
         use crate::route_budget::{RouteBudget, SharerKey, W_CEIL, W_FLOOR};
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let budget = Arc::new(RouteBudget::<u32>::with_default_ceiling(W_CEIL));
         let lease = budget.lease(1, SharerKey(vec![1]));
         // Climb the window to the ceiling so the killing width is W_CEIL.
@@ -1010,7 +1010,7 @@ mod tests {
     /// where the publish path built the in-RAM source.
     #[test]
     fn a_served_share_reads_from_disk_not_from_a_publish_time_copy() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let dir = std::env::temp_dir().join(format!("ds-share-disk-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

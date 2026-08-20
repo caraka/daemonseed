@@ -125,7 +125,7 @@ mod tests {
     use super::*;
 
     fn key() -> Aes256Key {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         Aes256Key::new(&[7u8; 32]).unwrap()
     }
 

@@ -433,7 +433,7 @@ mod tests {
     use super::*;
 
     fn init_oxicrypt() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
     }
 
     fn fast_params() -> ArgonParams {

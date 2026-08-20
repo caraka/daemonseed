@@ -564,7 +564,7 @@ mod tests {
 
     /// Build an indexer over a fresh temp share root + temp index file.
     fn fixture() -> (tempfile::TempDir, Indexer) {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path().join("share");
         std::fs::create_dir_all(&root).unwrap();
@@ -601,7 +601,7 @@ mod tests {
     /// owning `Indexer::cold_scan`.
     #[test]
     fn scan_into_indexes_a_shared_arc_index() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path().join("share");
         std::fs::create_dir_all(&root).unwrap();
@@ -942,7 +942,7 @@ mod tests {
     /// manifest on the same tree.
     #[test]
     fn cached_or_hash_without_index_equals_hash_share() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path().join("share");
         std::fs::create_dir_all(&root).unwrap();
@@ -1024,7 +1024,7 @@ mod tests {
     /// a cache HIT return the ORIGINAL chunks; a re-hash would return the new bytes'.
     #[test]
     fn cached_or_hash_survives_drop_and_reopen() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path().join("share");
         std::fs::create_dir_all(&root).unwrap();

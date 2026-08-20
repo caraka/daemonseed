@@ -115,3 +115,17 @@ It cross-compiles `daemonseed-gui --release --features desktop` for
 `x86_64-pc-windows-gnu` via `cargo-zigbuild`; zig static-links the mingw runtime, so the
 `.exe` depends only on stock Windows 10+ system DLLs (nothing to ship alongside it).
 Requires the target: `rustup target add x86_64-pc-windows-gnu`.
+
+A portable Linux TUI build lives in [`packaging/tui/`](packaging/tui/):
+
+```bash
+packaging/tui/build-tui.sh                  # → dist/daemonseed-tui-x86_64
+```
+
+**Every packaging script signs the artifact's integrity slot as its final step.**
+The crypto module verifies its own image before doing any work, so an unsigned
+binary — including anything from a plain `cargo build` — exits at startup with
+`Module image integrity`. All three scripts therefore need the sibling
+`../oxicrypt` checkout, which the signer is built from. See
+[`BUILD.md`](BUILD.md#signing-a-build-you-intend-to-run-must-carry-an-integrity-slot)
+for signing a hand-built binary.

@@ -183,12 +183,12 @@ mod tests {
     use crate::share_envelope::{ManifestEntry, ShareFrame};
 
     fn room_key() -> PublicRoomKey {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         derive_room_key(DEFAULT_ROOM, &CNSA_2_0).unwrap()
     }
 
     fn circle_key() -> CircleKey {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         derive_cot_key("a shared circle phrase for sealing", &CNSA_2_0).unwrap()
     }
 
@@ -245,7 +245,7 @@ mod tests {
     fn wrong_key_fails_authentication() {
         let lobby = derive_room_key("lobby", &CNSA_2_0).unwrap();
         let other = derive_room_key("a-different-room", &CNSA_2_0).unwrap();
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let sealed = seal_public_share_frame(&lobby, &manifest_frame("f.txt")).unwrap();
         match open_share_frame(&other, &sealed) {
             Err(ShareSealError::Authentication) => {}
@@ -294,7 +294,7 @@ mod tests {
     /// frame.
     #[test]
     fn announcement_cannot_open_as_content_frame() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let key = room_key();
         let announcer = crate::identity::keys::SignKeypair::from_ml_dsa_seed(&[5u8; 32]).unwrap();
         let sealed = seal_public_announcement(

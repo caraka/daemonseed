@@ -36,7 +36,7 @@ fn test_params() -> ArgonParams {
 /// auto-republish path reads to re-assert each share under the chosen name.
 #[test]
 fn published_share_name_persists_across_seal_open() {
-    let _ = oxicrypt_module::initialize();
+    let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
     let pid = Uuid::new_v4();
     let pp = "correct horse battery staple table mountain";
     let mut seeds = Seeds::new(Mnemonic::generate().unwrap());

@@ -544,7 +544,7 @@ mod tests {
     // ── store behaviour (ISC-18 / ISC-A-C6 / ISC-A-C7) ─────────────────────
 
     fn open_temp(key: [u8; INDEX_KEY_LEN]) -> (tempfile::TempDir, ShareIndex) {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let dir = tempfile::TempDir::new().unwrap();
         let idx = ShareIndex::open(dir.path().join("index.redb"), key).unwrap();
         (dir, idx)
@@ -598,7 +598,7 @@ mod tests {
     /// reading the same file), so the indexer reuses rather than cold-rescans.
     #[test]
     fn persists_across_reopen() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("index.redb");
         {
@@ -648,7 +648,7 @@ mod tests {
     /// gets garbage back.
     #[test]
     fn wrong_key_cannot_read_entries() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("index.redb");
         {
@@ -690,7 +690,7 @@ mod tests {
     /// key).
     #[test]
     fn opaque_key_is_keyed() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let dir = tempfile::TempDir::new().unwrap();
         let a = ShareIndex::open(dir.path().join("a.redb"), [0x01; INDEX_KEY_LEN]).unwrap();
         let b = ShareIndex::open(dir.path().join("b.redb"), [0x02; INDEX_KEY_LEN]).unwrap();

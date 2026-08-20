@@ -646,7 +646,7 @@ mod tests {
     }
 
     fn seed(tag: u8, dir: Direction, page: u64) -> String {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         hex::encode(derive_owner_seed(&ar(tag), dir, page).unwrap().as_bytes())
     }
 
@@ -842,7 +842,7 @@ mod tests {
     /// record's or the doorbell's — so it must not render itself.
     #[test]
     fn the_page_seed_does_not_render_its_bytes() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let s = derive_owner_seed(&ar(0x41), Direction::AToB, 0).unwrap();
         assert_eq!(format!("{s:?}"), "DmPageOwnerSeed(<redacted>)");
     }
@@ -858,7 +858,7 @@ mod tests {
     /// `send_direction() == BToA`, `recv_direction() == AToB` — so one ratchet
     /// exercises both markers.
     fn recipient_ratchet() -> Ratchet {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         Ratchet::recipient(&FIXTURE_SS0, Box::new([0x11; oxicrypt_ml_kem::EK_LEN]))
             .expect("open a recipient ratchet")
     }
@@ -873,7 +873,7 @@ mod tests {
     /// a review lens enumerating both constructors against all address call sites.
     #[test]
     fn an_initiator_ratchet_binds_its_conversation_too() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         // A real keypair: `initiator` refuses a mismatched opening ephemeral, and
         // ML-KEM never reports a mismatch at decapsulation, which is why that
         // check exists at all.
@@ -949,7 +949,7 @@ mod tests {
     /// is exactly the mistake the check exists to catch. `AR` is not invertible
     /// from a chosen value, so the fixture derives it from the same `ss0`.
     fn conversation_ar() -> [u8; ADDRESS_ROOT_LEN] {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         crate::dm::firstcontact::derive_channel_roots(&FIXTURE_SS0)
             .expect("derive the fixture conversation's roots")
             .ar

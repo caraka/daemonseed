@@ -639,7 +639,7 @@ mod tests {
     const SS0: [u8; 32] = [7u8; 32];
 
     fn keys(phrase: &str) -> IdentityKeys {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         derive_identity_keys(&Mnemonic::from_phrase(phrase).unwrap(), Identity::Primary).unwrap()
     }
 
@@ -663,7 +663,7 @@ mod tests {
     }
 
     fn eph_keypair(d: u8, z: u8) -> (Box<[u8; ml_kem::EK_LEN]>, EphemeralDecapKey) {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let (ek, dk) = ml_kem::keygen(&[d; 32], &[z; 32]).unwrap();
         (Box::new(ek), EphemeralDecapKey::new(Box::new(dk)))
     }

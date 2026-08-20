@@ -141,6 +141,10 @@ work lives in the project lead's vault manifest, not here.
 
 ### Removed
 
+- The `oxicrypt-zeroize` workspace dependency, which no member crate consumed. daemonseed
+  zeroizes through the RustCrypto `zeroize` crate's `Zeroizing` and `ZeroizeOnDrop`;
+  oxicrypt's is an in-boundary FIPS SSP zeroizer exposing free functions over byte slices.
+
 - `daemonseed_core::tls` and the TLS dependency stack it existed for:
   the `oxitls-rustls-provider` and `oxitls-webpki-mldsa` path-dependencies,
   and `rustls`, `rustls-pki-types`, `tokio-rustls`. Veilid supplies transport
@@ -148,6 +152,15 @@ work lives in the project lead's vault manifest, not here.
   path-dependency, so a build needs only `../oxicrypt` checked out.
 
 ### Changed
+
+- Aligned module initialization on oxicrypt 0.24.0, which requires the pre-operational
+  integrity group. `daemonseed_core::kats::initialize_module` is the one production entry
+  point and passes `oxicrypt_integrity::KATS` with `CNSA_2_0_KATS` under
+  `AlgorithmProfile::Cnsa2`; `initialize_module_unsigned_test_binary`, behind the `testing`
+  feature, is the test-target entry point. **The shipped artifact must be signed:
+  `build-appimage.sh` runs `oxicrypt-integrity-sign --sign` on the AppDir binary and
+  verifies the slot, last, after every step that rewrites the file.** An unsigned binary
+  does not reach `Operational`.
 
 - The serve loop's panic arm is reachable by a test. `serve_response_or_not_found` is
   factored out of `serve_loop`, which sits behind a live `VeilidAPI` and could not be

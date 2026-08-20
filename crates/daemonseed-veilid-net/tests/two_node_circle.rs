@@ -43,7 +43,7 @@ fn node_config(port: &str, dir: &std::path::Path) -> VeilidNetConfig {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs public Veilid attach; run on a real-network host with --ignored"]
 async fn sealed_circle_message_reaches_a_second_member() {
-    oxicrypt_module::initialize().expect("oxicrypt init");
+    daemonseed_core::kats::initialize_module_unsigned_test_binary().expect("oxicrypt init");
 
     let base = std::env::temp_dir().join("daemonseed-veilid-net-circle-it");
     let _ = std::fs::remove_dir_all(&base);

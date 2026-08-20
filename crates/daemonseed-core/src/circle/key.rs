@@ -297,7 +297,7 @@ mod tests {
     /// byte-identical key on every call (and so on every member's machine).
     #[test]
     fn derivation_is_deterministic() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let a = derive_cot_key(EXAMPLE_ENTROPY, &CNSA_2_0).unwrap();
         let b = derive_cot_key(EXAMPLE_ENTROPY, &CNSA_2_0).unwrap();
         assert_eq!(a.as_bytes(), b.as_bytes());
@@ -307,7 +307,7 @@ mod tests {
     /// whitespace / form differences between members collapse to the same key.
     #[test]
     fn canonicalizes_entropy_before_derivation() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let plain = derive_cot_key(EXAMPLE_ENTROPY, &CNSA_2_0).unwrap();
         let messy = derive_cot_key("  correct   horse battery staple  ", &CNSA_2_0).unwrap();
         assert_eq!(plain.as_bytes(), messy.as_bytes());
@@ -317,7 +317,7 @@ mod tests {
     /// distinguisher).
     #[test]
     fn distinct_entropy_yields_distinct_keys() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let a = derive_cot_key("phrase alpha", &CNSA_2_0).unwrap();
         let b = derive_cot_key("phrase bravo", &CNSA_2_0).unwrap();
         assert_ne!(a.as_bytes(), b.as_bytes());
@@ -328,7 +328,7 @@ mod tests {
     /// members collapse to the same fingerprint (the GUI-era verification check).
     #[test]
     fn fingerprint_is_deterministic_and_canonical() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let a = circle_fingerprint(EXAMPLE_ENTROPY);
         let b = circle_fingerprint("  correct   horse battery staple  ");
         assert_eq!(a, b);
@@ -340,7 +340,7 @@ mod tests {
     /// sole distinguisher, ISC-C8).
     #[test]
     fn distinct_entropy_yields_distinct_fingerprints() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         assert_ne!(
             circle_fingerprint("phrase alpha"),
             circle_fingerprint("phrase bravo")
@@ -352,7 +352,7 @@ mod tests {
     /// `circle_fingerprint` (it hashes the derived cot_key, not the phrase).
     #[test]
     fn circle_room_id_is_deterministic_hex_and_key_derived() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let k = derive_cot_key(EXAMPLE_ENTROPY, &CNSA_2_0).unwrap();
         let a = circle_room_id(&k);
         let b = circle_room_id(&k);
@@ -374,7 +374,7 @@ mod tests {
     /// `server_id`. (Same entropy in, same fingerprint out, no address input.)
     #[test]
     fn fingerprint_takes_only_entropy() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         // Two calls with the same phrase agree with no other input in play.
         assert_eq!(
             circle_fingerprint("a shared circle passphrase"),
@@ -385,7 +385,7 @@ mod tests {
     /// `Debug` never leaks key bytes (ISC-A-C1 log-surface hygiene).
     #[test]
     fn debug_is_redacted() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let k = derive_cot_key("some entropy phrase here", &CNSA_2_0).unwrap();
         assert_eq!(format!("{k:?}"), "CircleKey(<redacted>)");
     }
@@ -395,7 +395,7 @@ mod tests {
     /// rendezvous address.
     #[test]
     fn veilid_owner_seed_is_deterministic() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let a = derive_circle_veilid_owner_seed(EXAMPLE_ENTROPY, &CNSA_2_0).unwrap();
         let b = derive_circle_veilid_owner_seed(EXAMPLE_ENTROPY, &CNSA_2_0).unwrap();
         assert_eq!(a.as_bytes(), b.as_bytes());
@@ -405,7 +405,7 @@ mod tests {
     /// whitespace / form differences between members collapse to the same seed.
     #[test]
     fn veilid_owner_seed_canonicalizes_entropy() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let plain = derive_circle_veilid_owner_seed(EXAMPLE_ENTROPY, &CNSA_2_0).unwrap();
         let messy =
             derive_circle_veilid_owner_seed("  correct   horse battery staple  ", &CNSA_2_0)
@@ -417,7 +417,7 @@ mod tests {
     /// phrase is the sole distinguisher, mirroring ISC-C8).
     #[test]
     fn veilid_owner_seed_diverges_by_entropy() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let a = derive_circle_veilid_owner_seed("phrase alpha", &CNSA_2_0).unwrap();
         let b = derive_circle_veilid_owner_seed("phrase bravo", &CNSA_2_0).unwrap();
         assert_ne!(a.as_bytes(), b.as_bytes());
@@ -429,7 +429,7 @@ mod tests {
     /// of the content key.
     #[test]
     fn veilid_owner_seed_differs_from_cot_key() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let owner = derive_circle_veilid_owner_seed(EXAMPLE_ENTROPY, &CNSA_2_0).unwrap();
         let cot = derive_cot_key(EXAMPLE_ENTROPY, &CNSA_2_0).unwrap();
         assert_ne!(owner.as_bytes(), cot.as_bytes());
@@ -438,7 +438,7 @@ mod tests {
     /// `Debug` never leaks the rendezvous-owner seed (ISC-A-C1).
     #[test]
     fn veilid_owner_seed_debug_is_redacted() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let s = derive_circle_veilid_owner_seed("some entropy phrase here", &CNSA_2_0).unwrap();
         assert_eq!(format!("{s:?}"), "CircleVeilidOwnerSeed(<redacted>)");
     }
@@ -449,7 +449,7 @@ mod tests {
     /// rendezvous.
     #[test]
     fn presence_owner_seed_is_deterministic_and_canonical() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let a = derive_circle_presence_veilid_owner_seed(EXAMPLE_ENTROPY, &CNSA_2_0).unwrap();
         let b = derive_circle_presence_veilid_owner_seed(
             "  correct   horse battery staple  ",
@@ -467,7 +467,7 @@ mod tests {
     /// append-ring).
     #[test]
     fn presence_owner_seed_disjoint_from_cot_key_and_chat_owner() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let presence =
             derive_circle_presence_veilid_owner_seed(EXAMPLE_ENTROPY, &CNSA_2_0).unwrap();
         let cot = derive_cot_key(EXAMPLE_ENTROPY, &CNSA_2_0).unwrap();
@@ -483,7 +483,7 @@ mod tests {
     /// `Debug` never leaks the presence rendezvous-owner seed (ISC-A-C1).
     #[test]
     fn presence_owner_seed_debug_is_redacted() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let s = derive_circle_presence_veilid_owner_seed("some entropy phrase here", &CNSA_2_0)
             .unwrap();
         assert_eq!(
@@ -498,7 +498,7 @@ mod tests {
     /// path (or the info label) changes these bytes and fails the test.
     #[test]
     fn owner_seed_kat_byte_identity() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         assert_eq!(
             hex::encode(
                 derive_circle_veilid_owner_seed(EXAMPLE_ENTROPY, &CNSA_2_0)

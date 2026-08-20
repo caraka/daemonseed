@@ -1005,7 +1005,7 @@ mod tests {
     const SENT: i64 = 1_700_000_000_000;
 
     fn keys(phrase: &str) -> IdentityKeys {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         derive_identity_keys(&Mnemonic::from_phrase(phrase).unwrap(), Identity::Primary).unwrap()
     }
 
@@ -1021,7 +1021,7 @@ mod tests {
     /// Real pseudonyms are random per correspondent — never mnemonic-derived —
     /// which is what makes them unlinkable across conversations.
     fn pseudonym() -> IdentityKeys {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         derive_identity_keys(&Mnemonic::generate().unwrap(), Identity::Primary).unwrap()
     }
 

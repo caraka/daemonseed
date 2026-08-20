@@ -38,7 +38,7 @@ fn test_params() -> ArgonParams {
 }
 
 fn init_oxicrypt() {
-    let _ = oxicrypt_module::initialize();
+    let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
 }
 
 #[test]

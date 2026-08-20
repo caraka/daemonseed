@@ -396,7 +396,7 @@ mod tests {
     use oxicrypt_aes::gcm_encrypt;
 
     fn member(seed: u8) -> SignKeypair {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         SignKeypair::from_ml_dsa_seed(&[seed; 32]).unwrap()
     }
 
@@ -411,7 +411,7 @@ mod tests {
     }
 
     fn room_key(room: &str) -> PublicRoomKey {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         derive_room_key(room, &CNSA_2_0).unwrap()
     }
 
@@ -433,7 +433,7 @@ mod tests {
     /// only the key (and thus who can open) differs.
     #[test]
     fn seal_open_round_trip_under_circle_key() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let key = derive_cot_key(EXAMPLE_ENTROPY, &CNSA_2_0).unwrap();
         let me = member(8);
         let sealed = seal_circle_heartbeat(&key, &me, &fields("a#000000000000")).unwrap();
@@ -591,7 +591,7 @@ mod tests {
     /// distinct `seal_public_*` / `seal_circle_*` entry points).
     #[test]
     fn circle_sealed_does_not_open_as_public() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let circle = derive_cot_key(EXAMPLE_ENTROPY, &CNSA_2_0).unwrap();
         let public = room_key(DEFAULT_ROOM);
         let me = member(14);

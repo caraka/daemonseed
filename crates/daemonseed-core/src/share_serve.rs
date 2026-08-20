@@ -657,7 +657,7 @@ mod tests {
     /// from the store under those addresses.
     #[test]
     fn index_dir_builds_manifest_and_stores_chunks() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let dir = tempfile::TempDir::new().unwrap();
         write(dir.path(), "a.txt", b"alpha");
         write(dir.path(), "sub/b.txt", b"bravo bravo");
@@ -683,7 +683,7 @@ mod tests {
     /// chunk short; an empty file indexes to zero chunks.
     #[test]
     fn index_dir_chunks_large_files_at_fixed_boundaries() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let dir = tempfile::TempDir::new().unwrap();
         let big: Vec<u8> = (0..CHUNK_SIZE + 4096).map(|i| (i % 251) as u8).collect();
         write(dir.path(), "big.bin", &big);
@@ -708,7 +708,7 @@ mod tests {
     /// ISC-S27 — `answer(ManifestRequest)` returns the full manifest.
     #[test]
     fn answer_manifest_request_returns_manifest() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let dir = tempfile::TempDir::new().unwrap();
         write(dir.path(), "only.txt", b"the only file");
         let content = ShareContent::index_dir(dir.path()).unwrap();
@@ -727,7 +727,7 @@ mod tests {
     /// re-derived-hash verification passes on a faithful serve.
     #[test]
     fn answer_chunk_request_is_content_addressed() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let dir = tempfile::TempDir::new().unwrap();
         write(dir.path(), "f.bin", b"some bytes to address");
         let content = ShareContent::index_dir(dir.path()).unwrap();
@@ -757,7 +757,7 @@ mod tests {
     /// serve side (the live-only relay supplies the other half).
     #[test]
     fn answer_unknown_chunk_yields_no_frame() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let dir = tempfile::TempDir::new().unwrap();
         write(dir.path(), "present.txt", b"i exist");
         let content = ShareContent::index_dir(dir.path()).unwrap();
@@ -775,7 +775,7 @@ mod tests {
     /// party's traffic or an echo of our own response).
     #[test]
     fn answer_ignores_response_frames() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let dir = tempfile::TempDir::new().unwrap();
         write(dir.path(), "x", b"x");
         let content = ShareContent::index_dir(dir.path()).unwrap();
@@ -802,7 +802,7 @@ mod tests {
     /// with zero entries rather than failing.
     #[test]
     fn index_empty_dir_is_empty_manifest() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let dir = tempfile::TempDir::new().unwrap();
         let content = ShareContent::index_dir(dir.path()).unwrap();
         assert_eq!(content.file_count(), 0);
@@ -822,7 +822,7 @@ mod tests {
     /// guard trust the arithmetic instead of building a probe buffer.
     #[test]
     fn manifest_frame_len_matches_real_encoding() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let a = |b: &[u8]| chunk_addr(b).unwrap();
         let manifest = ShareManifest {
             entries: vec![
@@ -860,7 +860,7 @@ mod tests {
     /// under, and the budget itself sits under tonic's 4 MiB decode cap.
     #[test]
     fn manifest_frame_budget_threshold_logic() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let addr = chunk_addr(b"x").unwrap();
         let entry = |i: usize| ManifestEntry {
             rel_path: format!("library/track-{i:06}.mp3"),
@@ -906,7 +906,7 @@ mod tests {
     /// across the seams).
     #[test]
     fn hash_share_matches_index_dir() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let dir = tempfile::TempDir::new().unwrap();
         write(dir.path(), "empty.bin", b"");
         write(dir.path(), "a.txt", b"alpha"); // sub-1MiB
@@ -945,7 +945,7 @@ mod tests {
     /// fixed from the first callback (the count pass ran first).
     #[test]
     fn hash_share_reports_progress_per_file() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let dir = tempfile::TempDir::new().unwrap();
         write(dir.path(), "a.txt", b"a");
         write(dir.path(), "b.txt", b"b");
@@ -963,7 +963,7 @@ mod tests {
     /// hashed — no partial manifest escapes.
     #[test]
     fn hash_share_cancel_aborts() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let dir = tempfile::TempDir::new().unwrap();
         write(dir.path(), "a.txt", b"a");
 
@@ -978,7 +978,7 @@ mod tests {
 
     /// Build a `DiskShareContent` over a fresh fixture tree.
     fn disk_fixture() -> (tempfile::TempDir, DiskShareContent) {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let dir = tempfile::TempDir::new().unwrap();
         write(dir.path(), "a.txt", b"alpha");
         write(dir.path(), "sub/b.txt", b"bravo bravo");
@@ -1023,7 +1023,7 @@ mod tests {
     /// size))` slice of the source bytes, hashing to the advertised address.
     #[test]
     fn disk_content_serves_first_middle_and_short_last_chunks() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let dir = tempfile::TempDir::new().unwrap();
         let big: Vec<u8> = (0..2 * CHUNK_SIZE + 12345)
             .map(|i| (i % 251) as u8)
@@ -1061,7 +1061,7 @@ mod tests {
     /// ISC-S28), while untampered chunks still verify.
     #[test]
     fn disk_content_single_tampered_chunk_fails_only_its_own_addr() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let dir = tempfile::TempDir::new().unwrap();
         let big: Vec<u8> = (0..2 * CHUNK_SIZE + 999).map(|i| (i % 251) as u8).collect();
         write(dir.path(), "big.bin", &big);
@@ -1179,7 +1179,7 @@ mod tests {
     /// same logic: both serve sides agree frame-for-frame on the same tree.
     #[test]
     fn ram_and_disk_sources_answer_identically() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let dir = tempfile::TempDir::new().unwrap();
         write(dir.path(), "x.txt", b"same bytes either way");
 

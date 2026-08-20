@@ -1262,7 +1262,7 @@ mod tests {
 
     #[test]
     fn announcements_unread_covers_all_cases() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let empty = ann_view(None, &[]);
         let empty_items = item_content_hashes(&empty);
         let content = ann_view(Some("relay is up"), &[("a", "x", 1)]);
@@ -1294,7 +1294,7 @@ mod tests {
         // Mirrors the GUI write-through: a first arrival is unread; once the displayed
         // items are stored (the "viewing marks it seen" step), the SAME content is no
         // longer unread (the dot clears).
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let view = ann_view(Some("relay is up"), &[("announcements", "v2", 5)]);
         let current = item_content_hashes(&view);
 
@@ -1320,7 +1320,7 @@ mod tests {
     /// snapshot earlier, no matter that the post itself had been read.
     #[test]
     fn reading_a_partially_converged_view_is_not_re_flagged_by_the_rest_of_the_burst() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let mut seeds = daemonseed_core::storage::seeds::Seeds::new(
             daemonseed_core::identity::mnemonic::Mnemonic::generate().unwrap(),
         );
@@ -1378,7 +1378,7 @@ mod tests {
     /// them when they fold back in.
     #[test]
     fn persisting_a_partial_view_keeps_items_read_earlier() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let full = ann_view(Some("motd"), &[("a", "x", 1)]);
         let stored = merge_seen(&item_content_hashes(&full), None).unwrap();
 
@@ -1399,7 +1399,7 @@ mod tests {
     /// crypto failure degenerates every item hash to `""`.
     #[test]
     fn an_empty_view_never_overwrites_the_stored_marker() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let view = ann_view(Some("motd"), &[("a", "x", 1)]);
         let stored = merge_seen(&item_content_hashes(&view), None).unwrap();
 
@@ -1420,7 +1420,7 @@ mod tests {
     /// that simply had not folded in yet, re-flagging them when they arrived.
     #[test]
     fn a_read_never_drops_an_already_seen_item() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
 
         // A large stored set plus a small converged view: everything survives.
         let carried: Vec<String> = (0..600).map(|i| format!("{i:096x}")).collect();
@@ -1479,7 +1479,7 @@ mod tests {
     /// blob on every tick.
     #[test]
     fn merging_the_same_view_twice_is_idempotent() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let view = ann_view(Some("motd"), &[("a", "x", 1), ("b", "y", 2)]);
         let items = item_content_hashes(&view);
         let first = merge_seen(&items, None).unwrap();
@@ -1499,7 +1499,7 @@ mod tests {
     /// stale hash forward as one inert entry rather than losing the new marker.
     #[test]
     fn a_pre_217_marker_reads_unread_once_then_migrates_itself() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let view = ann_view(Some("motd"), &[("a", "x", 1)]);
         let items = item_content_hashes(&view);
         let stale = "0".repeat(96);
@@ -1519,7 +1519,7 @@ mod tests {
     /// raise the dot for content nothing displays.
     #[test]
     fn an_empty_motd_is_not_an_unread_item() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let blank = ann_view(Some(""), &[]);
         assert!(item_content_hashes(&blank).is_empty());
         assert!(!announcements_unread(&blank, &[], None));
@@ -1532,7 +1532,7 @@ mod tests {
     /// Markers are per relay and must not bleed across `server_id`s.
     #[test]
     fn seen_markers_are_independent_per_server_id() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let view = ann_view(Some("motd"), &[("a", "x", 1)]);
         let items = item_content_hashes(&view);
         let mut seeds = daemonseed_core::storage::seeds::Seeds::new(
@@ -1554,7 +1554,7 @@ mod tests {
     /// A malformed marker must degrade to "unread", never to "read".
     #[test]
     fn a_malformed_marker_reads_as_unread() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let view = ann_view(Some("motd"), &[("a", "x", 1)]);
         let items = item_content_hashes(&view);
         for junk in [",", ",,", "not-hex", &format!(",{},", items[0])] {
@@ -1570,7 +1570,7 @@ mod tests {
     /// set.
     #[test]
     fn re_delivered_already_read_content_does_not_re_fire_unread() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let view = ann_view(Some("relay is up"), &[("a", "x", 1), ("b", "y", 2)]);
         let seen = encode_seen(&item_content_hashes(&view));
         // The re-sweep rebuilds the view from scratch, and in the relay's own order.
@@ -1584,7 +1584,7 @@ mod tests {
 
     #[test]
     fn item_hashes_are_stable_order_independent_and_change_sensitive() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let base = ann_view(Some("relay is up"), &[("a", "x", 1)]);
         let h0 = item_content_hashes(&base);
         // Same content (rebuilt) → identical items.
@@ -1635,7 +1635,7 @@ mod tests {
     /// the separator is not whitespace, so a multi-item marker is accepted, not rejected.
     #[test]
     fn a_multi_item_seen_marker_round_trips_through_seeds() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let view = ann_view(Some("relay is up"), &[("a", "x", 1), ("b", "y", 2)]);
         let items = item_content_hashes(&view);
         let marker = encode_seen(&items);
@@ -1664,7 +1664,7 @@ mod tests {
     /// them, so reading one does not silently mark the other seen.
     #[test]
     fn a_motd_and_a_post_with_the_same_text_do_not_alias() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let motd_only = ann_view(Some("same words"), &[]);
         let post_only = ann_view(None, &[("same words", "", 0)]);
         assert_ne!(
@@ -2089,7 +2089,7 @@ mod tests {
 
     #[test]
     fn materialize_adds_circle_with_net_contract() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let mut st = GuiState::lobby_only();
         let idx = st.materialize_from_phrase(STRONG).expect("materialize");
         assert_eq!(idx, 1);
@@ -2135,7 +2135,7 @@ mod tests {
 
     #[test]
     fn distinct_materialized_circles_get_distinct_ids() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let mut st = GuiState::lobby_only();
         let a = st.materialize_from_phrase(STRONG).unwrap();
         let b = st
@@ -2152,7 +2152,7 @@ mod tests {
 
     #[test]
     fn materialized_cot_key_matches_independent_derivation() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let mut st = GuiState::lobby_only();
         let idx = st.materialize_from_phrase(STRONG).unwrap();
         let stored = st.metas()[idx].net.as_ref().unwrap().cot_key.as_bytes();
@@ -2166,7 +2166,7 @@ mod tests {
 
     #[test]
     fn distinct_phrases_yield_distinct_cot_keys() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let mut st = GuiState::lobby_only();
         let a = st.materialize_from_phrase(STRONG).unwrap();
         let b = st
@@ -2184,7 +2184,7 @@ mod tests {
 
     #[test]
     fn same_phrase_yields_same_cot_key() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let mut st = GuiState::lobby_only();
         let a = st.materialize_from_phrase(STRONG).unwrap();
         let b = st.materialize_from_phrase(STRONG).unwrap();
@@ -2198,7 +2198,7 @@ mod tests {
 
     #[test]
     fn materialized_circle_has_independent_draft_state() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let mut st = GuiState::lobby_only();
         let idx = st.materialize_from_phrase(STRONG).unwrap();
         // Switch Lobby -> circle, type into the circle, switch away and back.
@@ -2215,7 +2215,7 @@ mod tests {
 
     #[test]
     fn generated_new_phrase_is_green_and_materializes() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         // The new-circle flow uses `generate_circle_phrase` — rejection-sampled to
         // clear the floor DETERMINISTICALLY (a bare `generate_diceware(12)` is ~3%
         // flaky: a duplicate word drops the distinct-word estimate below 128 bits).
@@ -2241,7 +2241,7 @@ mod tests {
 
     #[test]
     fn set_circle_rendezvous_swaps_to_friendly_label_and_keeps_fingerprint() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let mut st = GuiState::lobby_only();
         let phrase = generate_circle_phrase().expect("generate");
         let idx = st.materialize_from_phrase(&phrase).expect("materialize");
@@ -2272,7 +2272,7 @@ mod tests {
         // #36: the deterministic-label compare vector is derived from the net
         // contract (rendezvous → adj-noun label, else fingerprint), independent of
         // `circle.name` — so it survives a future chosen-name override (#66).
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let mut st = GuiState::lobby_only();
         let phrase = generate_circle_phrase().expect("generate");
         let idx = st.materialize_from_phrase(&phrase).expect("materialize");
@@ -2307,7 +2307,7 @@ mod tests {
 
     #[test]
     fn set_circle_rendezvous_is_noop_for_unknown_circle() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let mut st = GuiState::lobby_only();
         let addr = AssetAddr::from_bytes([1u8; daemonseed_core::cot::ASSET_ADDR_LEN]);
         assert!(st.set_circle_rendezvous(999, addr).is_none());
@@ -2319,7 +2319,7 @@ mod tests {
     fn materialized_switch_perf_budget() {
         // The <100ms switch op covers a RUNTIME-ADDED circle too (ISC-48): seed
         // Lobby, materialize one circle, then hammer switches between them.
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let mut st = GuiState::lobby_only();
         st.materialize_from_phrase(STRONG).unwrap();
         let start = Instant::now();
@@ -2335,7 +2335,7 @@ mod tests {
 
     #[test]
     fn net_contract_debug_redacts_the_phrase() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let mut st = GuiState::lobby_only();
         let idx = st.materialize_from_phrase(STRONG).unwrap();
         let net = st.metas()[idx].net.as_ref().unwrap();
@@ -2372,7 +2372,7 @@ mod tests {
         };
         use daemonseed_core::storage::seeds;
 
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
 
         // A unique temp profile root (no uuid dep — pid + nanos).
         let nonce = std::time::SystemTime::now()
@@ -2468,7 +2468,7 @@ mod tests {
         };
         use daemonseed_core::storage::seeds;
 
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -2562,7 +2562,7 @@ mod tests {
         };
         use daemonseed_core::storage::seeds;
 
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -2665,7 +2665,7 @@ mod tests {
         };
         use daemonseed_core::storage::seeds;
 
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -2743,7 +2743,7 @@ mod tests {
         };
         use daemonseed_core::storage::seeds;
 
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -2821,7 +2821,7 @@ mod tests {
         };
         use daemonseed_core::storage::seeds;
 
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -2924,7 +2924,7 @@ mod tests {
         use daemonseed_core::profile::config::ArgonParams;
         use daemonseed_core::profile::persist::write_first_start;
 
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -2998,7 +2998,7 @@ mod tests {
     /// in RAM, `persist_circle` is a clean no-op, and there is nothing to rejoin.
     #[test]
     fn no_profile_means_no_persistence() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let mut st = GuiState::lobby_only();
         assert_eq!(st.display_handle(), None);
         let idx = st.materialize_from_phrase(STRONG).unwrap();
@@ -3024,7 +3024,7 @@ mod tests {
 
     #[test]
     fn set_room_roster_routes_to_the_matching_circle_not_the_lobby() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let mut st = GuiState::lobby_only();
         let idx = st.materialize_from_phrase(STRONG).expect("materialize");
         st.switch_to(idx, String::new(), 0.0);

@@ -22,6 +22,7 @@ oxicrypt-ml-kem = { workspace = true }
 oxicrypt-hmac = { workspace = true }
 oxicrypt-drbg = { workspace = true }
 oxicrypt-ecdh = { workspace = true }
+oxicrypt-integrity = { workspace = true }
 bip39 = { workspace = true }
 zeroize = { workspace = true }
 uuid = { workspace = true }

@@ -25,7 +25,7 @@ use daemonseed_integration_tests::isc_coverage::Coverage;
 use std::time::{Duration, Instant};
 
 fn keypair(seed: u8) -> SignKeypair {
-    let _ = oxicrypt_module::initialize();
+    let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
     SignKeypair::from_ml_dsa_seed(&[seed; 32]).unwrap()
 }
 
@@ -36,7 +36,7 @@ fn keypair(seed: u8) -> SignKeypair {
 /// beacon is self-filtered by pubkey equality so a daemon never lists itself.
 #[test]
 fn circle_presence_seal_open_track_round_trip() {
-    let _ = oxicrypt_module::initialize();
+    let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
     let circle_a = derive_cot_key("alpha circle phrase one", &CNSA_2_0).unwrap();
     let circle_b = derive_cot_key("beta circle phrase two", &CNSA_2_0).unwrap();
     let member = keypair(5);

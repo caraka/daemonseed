@@ -70,7 +70,7 @@ fn name_after_unlock(root: &std::path::Path) -> Option<String> {
 /// Enroll a profile named `initial`, then re-seal it with `renamed` (the rename
 /// write-through), and return the name read back from a fresh unlock.
 fn rename_round_trip(initial: Option<&str>, renamed: &str) -> Option<String> {
-    let _ = oxicrypt_module::initialize();
+    let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
     let root = temp_root(if initial.is_some() {
         "named"
     } else {

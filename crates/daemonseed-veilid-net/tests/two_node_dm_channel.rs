@@ -146,7 +146,7 @@ fn fresh_ss0() -> [u8; 32] {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs public Veilid attach; run on a real-network host with --ignored"]
 async fn sealed_channel_messages_round_trip_through_a_page_and_open_out_of_order() {
-    oxicrypt_module::initialize().expect("oxicrypt init");
+    daemonseed_core::kats::initialize_module_unsigned_test_binary().expect("oxicrypt init");
 
     let base = std::env::temp_dir().join("daemonseed-veilid-net-dm-channel-it");
     let _ = std::fs::remove_dir_all(&base);

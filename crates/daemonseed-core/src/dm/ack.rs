@@ -884,7 +884,7 @@ mod tests {
     }
 
     fn key(tag: u8, dir: Direction) -> String {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         hex::encode(derive_seal_key(&ar(tag), dir).unwrap().as_bytes())
     }
 
@@ -935,7 +935,7 @@ mod tests {
     /// The ack key is a conversation secret, so it must not render itself.
     #[test]
     fn the_ack_key_does_not_render_its_bytes() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let k = derive_seal_key(&ar(0x41), Direction::AToB).unwrap();
         assert_eq!(format!("{k:?}"), "DmAckSealKey(<redacted>)");
     }

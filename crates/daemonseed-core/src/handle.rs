@@ -317,7 +317,7 @@ mod tests {
     /// `initialize` is idempotent — after the first call it returns
     /// `AlreadyInitialized`, which we deliberately ignore.
     fn ensure_oxicrypt_initialized() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
     }
 
     fn alice() -> Handle {

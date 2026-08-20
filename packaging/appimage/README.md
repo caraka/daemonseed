@@ -16,13 +16,27 @@ The script builds `daemonseed-gui --release --features desktop` with
 [`cargo-zigbuild`](https://github.com/rust-cross/cargo-zigbuild), targeting
 `x86_64-unknown-linux-gnu.2.35` so the binary links against the **glibc 2.35**
 floor (Ubuntu 22.04 "Jammy"). It then assembles an AppDir from the templates in
-this directory and runs `appimagetool`.
+this directory, **signs the binary's integrity slot**, and runs `appimagetool`.
+
+## Signing
+
+The oxicrypt module verifies its own image before doing any work, so an unsigned
+binary exits at startup with `Module image integrity`. The script runs
+`oxicrypt-integrity-sign --sign` on the AppDir binary and reads the slot back with
+`--verify`, as its **last** step before packaging — anything that rewrites the
+artifact after signing invalidates the MAC. `appimagetool` stores the ELF verbatim,
+so the slot survives into the AppImage.
+
+This is why the sibling `../oxicrypt` checkout is a build requirement: the signer is
+built from it. It is a build tool, outside the cryptographic boundary, and is linked
+into nothing that ships.
 
 ## Requirements (already present on the build VM)
 
 - `rustup` with the `x86_64-unknown-linux-gnu` target
 - `cargo-zigbuild` + `zig` (the cross-linker that pins the glibc floor)
 - `appimagetool` on `PATH`
+- the `../oxicrypt` sibling checkout (the integrity signer builds from it)
 
 No imagemagick is needed — the app icon is a scalable SVG.
 

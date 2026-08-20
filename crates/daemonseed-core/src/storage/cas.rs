@@ -395,7 +395,7 @@ mod tests {
     /// ISC-2 — the address is exactly `SHA-384(chunk)` over the chunk bytes.
     #[test]
     fn chunk_addr_is_sha384_of_bytes() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let addr = chunk_addr(CHUNK_A).unwrap();
         let expected = sha384(CHUNK_A).unwrap();
         assert_eq!(addr.as_bytes(), &expected);
@@ -406,7 +406,7 @@ mod tests {
     /// dedup invariant).
     #[test]
     fn addressing_is_content_deterministic() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         assert_eq!(chunk_addr(CHUNK_A).unwrap(), chunk_addr(CHUNK_A).unwrap());
         assert_ne!(chunk_addr(CHUNK_A).unwrap(), chunk_addr(CHUNK_B).unwrap());
     }
@@ -435,7 +435,7 @@ mod tests {
     /// ISC-1 — put/get round-trips a chunk through the in-memory store.
     #[test]
     fn memory_put_get_roundtrip() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let mut store = MemoryChunkStore::new();
         let addr = store.put(CHUNK_A).unwrap();
         assert_eq!(store.get(&addr).unwrap().as_deref(), Some(CHUNK_A));
@@ -445,7 +445,7 @@ mod tests {
     /// absent address.
     #[test]
     fn memory_has_present_and_absent() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let mut store = MemoryChunkStore::new();
         let present = store.put(CHUNK_A).unwrap();
         let absent = chunk_addr(CHUNK_B).unwrap();
@@ -456,7 +456,7 @@ mod tests {
     /// ISC-3 — `has` on an empty store never short-circuits to a wrong answer.
     #[test]
     fn memory_has_on_empty_store_is_false() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let store = MemoryChunkStore::new();
         assert!(!store.has(&chunk_addr(CHUNK_A).unwrap()).unwrap());
     }
@@ -465,7 +465,7 @@ mod tests {
     /// zero; the chunk is gone afterward (the server-blind teardown mechanism).
     #[test]
     fn memory_unref_decrements_then_drops() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let mut store = MemoryChunkStore::new();
         let addr = store.put(CHUNK_A).unwrap();
         let addr2 = store.put(CHUNK_A).unwrap(); // dedups, refs == 2
@@ -484,7 +484,7 @@ mod tests {
     /// count, it does not double-store.
     #[test]
     fn memory_dedup_single_copy() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let mut store = MemoryChunkStore::new();
         store.put(CHUNK_A).unwrap();
         store.put(CHUNK_A).unwrap();
@@ -495,7 +495,7 @@ mod tests {
     /// Unref-ing an absent chunk is a no-op reporting Dropped.
     #[test]
     fn memory_unref_absent_is_dropped() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let mut store = MemoryChunkStore::new();
         assert_eq!(
             store.unref(&chunk_addr(CHUNK_A).unwrap()).unwrap(),
@@ -510,7 +510,7 @@ mod tests {
     /// root (simulating a restart).
     #[test]
     fn file_persists_across_reopen() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let dir = tempfile::TempDir::new().unwrap();
         let addr = {
             let mut store = FileChunkStore::open(dir.path()).unwrap();
@@ -525,7 +525,7 @@ mod tests {
     /// ISC-4 — on disk, unref drops the chunk (and its sidecar) at zero refs.
     #[test]
     fn file_unref_drops_at_zero() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let dir = tempfile::TempDir::new().unwrap();
         let mut store = FileChunkStore::open(dir.path()).unwrap();
         let addr = store.put(CHUNK_A).unwrap();
@@ -538,7 +538,7 @@ mod tests {
     /// still need two unrefs to drop.
     #[test]
     fn file_refcount_persists_across_reopen() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let dir = tempfile::TempDir::new().unwrap();
         let addr = {
             let mut store = FileChunkStore::open(dir.path()).unwrap();
@@ -558,7 +558,7 @@ mod tests {
     /// fetch request names a chunk by).
     #[test]
     fn chunk_addr_bytes_roundtrip() {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let addr = chunk_addr(CHUNK_A).unwrap();
         assert_eq!(ChunkAddr::from_bytes(*addr.as_bytes()), addr);
     }

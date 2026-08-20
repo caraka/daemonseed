@@ -3355,13 +3355,13 @@ mod tests {
     /// irrelevant to the transport, and `daemonseed_core::dm::paging`'s own tests
     /// are where the role-to-direction mapping is pinned.
     ///
-    /// The `oxicrypt_module::initialize()` is required because the derivations below
+    /// The `daemonseed_core::kats::initialize_module_unsigned_test_binary()` is required because the derivations below
     /// are HKDF: the crypto module must be past its power-up self-tests. Idempotent
     /// and race-safe by design — a loser of the `PowerOff → SelfTest` CAS gets
     /// `AlreadyInitialized`, which is why the result is discarded here exactly as
     /// `daemonseed-core`'s tests discard it.
     fn page_ratchet() -> daemonseed_core::dm::ratchet::Ratchet {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let eph = daemonseed_core::identity::keys::derive_identity_keys(
             &daemonseed_core::identity::mnemonic::Mnemonic::generate().expect("mnemonic"),
             daemonseed_core::identity::keys::Identity::Primary,
@@ -3387,7 +3387,7 @@ mod tests {
         // crossed pair that check exists to catch — it would fail here as a test
         // failure rather than in production as a silent stall. `AR` is not
         // invertible from a chosen value, so the fixture derives it.
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         daemonseed_core::dm::firstcontact::derive_channel_roots(&PAGE_FIXTURE_SS0)
             .expect("derive the fixture conversation's roots")
             .ar

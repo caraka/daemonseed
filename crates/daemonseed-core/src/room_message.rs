@@ -266,12 +266,12 @@ mod tests {
     const CIRCLE_DOMAIN: &[u8] = crate::circle::message::CIRCLE_PROVENANCE_DOMAIN;
 
     fn cot(phrase: &str) -> CircleKey {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         derive_cot_key(phrase, &CNSA_2_0).unwrap()
     }
 
     fn keypair(seed: u8) -> SignKeypair {
-        let _ = oxicrypt_module::initialize();
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         SignKeypair::from_ml_dsa_seed(&[seed; 32]).unwrap()
     }
 

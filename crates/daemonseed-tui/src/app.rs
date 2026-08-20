@@ -3666,7 +3666,7 @@ mod tests {
 
     #[test]
     fn r_on_welcome_starts_recovery_branch() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let mut app = App::new();
         app.on_key(press(KeyCode::Char('r')));
         assert_eq!(app.screen(), &Screen::FirstStart);
@@ -3709,7 +3709,7 @@ mod tests {
 
     #[test]
     fn full_first_start_flow_reaches_main_with_session() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let fast = daemonseed_core::profile::config::ArgonParams {
             memory_kib: 8,
             iterations: 1,
@@ -3810,7 +3810,7 @@ mod tests {
     /// session materials, so chat-behaviour tests start from a connected-style
     /// state. Mirrors `full_first_start_flow_reaches_main_with_session`.
     fn drive_to_main() -> App {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let fast = daemonseed_core::profile::config::ArgonParams {
             memory_kib: 8,
             iterations: 1,
@@ -4663,7 +4663,7 @@ mod tests {
     /// ISC-C69) — not just the last — each re-emitted for re-indexing.
     #[test]
     fn unlock_restores_all_persisted_roots_into_defined_shares() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let mut materials = drive_to_main().session_take_for_test();
         materials
             .seeds
@@ -5834,7 +5834,7 @@ mod tests {
     /// and the replay rides the queue, so it does NOT re-persist.
     #[test]
     fn unlock_reemits_define_share_per_persisted_root() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let mut materials = drive_to_main().session_take_for_test();
         materials
             .seeds
@@ -5869,7 +5869,7 @@ mod tests {
     /// decrypted blob, not started empty (ISC-C15 / C16 restore).
     #[test]
     fn unlock_restores_mute_and_hide_from_seeds() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         // Build a SessionMaterials carrying a mute + hide, as Unlock would yield.
         let mut materials = {
             let mut app = drive_to_main();
@@ -5942,7 +5942,7 @@ mod tests {
     /// wins over the actor-supplied one) and does NOT re-persist (M13, ISC-C59).
     #[test]
     fn unlock_queues_rejoins_and_persisted_label_wins() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let mut materials = {
             let mut app = drive_to_main();
             app.session_take_for_test()
@@ -7717,7 +7717,7 @@ mod tests {
     /// successful unlock reaches Main and queues a connect to the bootstrap.
     #[test]
     fn unlock_failure_then_success_routes_correctly() {
-        let _ = oxicrypt_module::initialize();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let mut app = App::for_existing_profile();
         app.on_unlock_failure("wrong passphrase");
         assert_eq!(app.screen(), &Screen::Unlock, "failure stays on Unlock");
