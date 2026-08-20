@@ -150,7 +150,54 @@ const MAX_CONCURRENT_SERVE_REPLIES: usize = 128;
 ///
 /// (This deliberately does not name the shape constant: a test counts its textual
 /// occurrences to catch a second open site, and prose naming it would read as one.)
-pub type DmPageSweep = (Vec<(PagePosition, Vec<u8>)>, rendezvous::SweepOutcome);
+/// One page's sweep, tagged with the conversation it came from (#270).
+///
+/// A named struct rather than a wider tuple, and the reason is the tag. A caller
+/// fanning out over several correspondents — a join set, a `FuturesUnordered`,
+/// any concurrent dispatch — used to distinguish results only by what it
+/// remembered about the order it sent them in. Attributing B's frames to A's
+/// ratchet was then an ordinary bookkeeping slip with no type to object: frames
+/// are individually authenticated, so nothing is forged and nothing errors, but
+/// the ratchet fails to open them and that conversation stops progressing while
+/// every layer reports success.
+///
+/// Adding a third anonymous member to a two-wide tuple destructured at five call
+/// sites is how a caller comes to bind the tag to the wrong name, which would be
+/// the same class of slip one layer up. Named fields cannot be positionally
+/// mismatched.
+pub struct DmPageSweep {
+    /// Which conversation these frames belong to — the `AR` fingerprint carried
+    /// by the address that was swept. A hash, not a capability, and never
+    /// serialized.
+    pub conversation: [u8; daemonseed_core::dm::firstcontact::AR_FINGERPRINT_LEN],
+    /// The populated slots, as `(position, bytes)`.
+    pub slots: Vec<(PagePosition, Vec<u8>)>,
+    /// Whether the sweep saw the whole page.
+    pub outcome: rendezvous::SweepOutcome,
+}
+
+impl DmPageSweep {
+    /// Build a result tagged with the address that was swept.
+    ///
+    /// **A function rather than a struct literal at the call site, because the
+    /// call site is untestable.** `sweep_dm_page` needs a live DHT, so a tag
+    /// written there is a line no runnable test reaches — and a mutation proving
+    /// exactly that survived the whole suite: replacing the tag with a constant
+    /// left everything green. Taking the address here puts the tagging inside a
+    /// function a unit test can call, which is the cheapest way to turn an
+    /// untested argument into an oracle.
+    fn for_address(
+        address: &DmPageAddress<Receiving>,
+        slots: Vec<(PagePosition, Vec<u8>)>,
+        outcome: rendezvous::SweepOutcome,
+    ) -> Self {
+        Self {
+            conversation: *address.conversation(),
+            slots,
+            outcome,
+        }
+    }
+}
 
 /// Commands the [`VeilidNetHandle`] sends to the actor task. Each carries a
 /// `oneshot` reply so the caller awaits the result.
@@ -284,17 +331,20 @@ enum Command {
     /// carries its page and its stream with it, so the seed cannot come apart from
     /// the page whose slots `at` indexes (#254).
     ///
-    /// `at` is the whole [`PagePosition`], not its slot: the page half is what
-    /// [`VeilidNetHandle::publish_dm_page`] checked against the address, and keeping
-    /// it means no layer between here and dispatch can be handed a naked subkey.
+    /// The position is **not** a field: the address carries it (#269). Keeping a
+    /// second copy beside the address is the very thing that could disagree with
+    /// it, which is what this change removed at the public surface — carrying one
+    /// across an internal seam would put it straight back. Dispatch reads the
+    /// subkey through `address.at()`, so no layer is ever handed a naked subkey
+    /// either.
     PublishDmPage {
         address: DmPageAddress<Sending>,
-        at: PagePosition,
         frame: Vec<u8>,
         reply: oneshot::Sender<Result<()>>,
     },
-    /// Sweep every slot of one channel page, returning `(position, bytes)` for each
-    /// populated one.
+    /// Sweep every slot of one channel page, returning a [`DmPageSweep`] — the
+    /// populated `(position, bytes)` pairs, the outcome, and the conversation the
+    /// swept address named (#270).
     ///
     /// The position travels back with the bytes because the collector must check the
     /// frame's declared sequence number against where it was found; it is built
@@ -587,23 +637,17 @@ impl VeilidNetHandle {
 
     // ── Direct messaging (#234) ──
 
-    /// Publish one sealed channel frame at `at` on the page `address` names — the
+    /// Publish one sealed channel frame into the slot `address` names — the
     /// transport half of ISC-C42, which also needs collection (#236) before it can
     /// close.
     ///
-    /// Build `address` with `DmPageAddress::sending(&address_root, &ratchet, page)`
-    /// and take `at` from `paging::position_of(seq)`, with `page` from that same
-    /// position. Both facts then come from one sequence number, which is the
-    /// invariant this signature checks rather than documents: **`at.page()` must
-    /// equal `address.page()`, or the call is rejected with
-    /// [`VeilidNetError::DmPageWrongPage`] and nothing is enqueued.** Without that
-    /// check a page derived for sequence *a* and a slot belonging to sequence *b*
-    /// publish successfully into a slot no reader associates with either. The error
-    /// carries the whole refused position, so its log line names the sequence number
-    /// the caller meant rather than only the pages that disagreed.
-    ///
-    /// The check is here rather than at dispatch so it fails in the caller's own
-    /// context, synchronously, before the write joins the funnel.
+    /// Build `address` with
+    /// `DmPageAddress::sending(&address_root, &ratchet, paging::position_of(seq))`.
+    /// The page and the slot then come from one sequence number **by
+    /// construction** (#269): the address is a placed slot, so there is no second
+    /// position to supply and nothing for this call to compare. A page derived for
+    /// sequence *a* paired with a slot belonging to sequence *b* used to be a
+    /// runtime refusal; it is now a pair that cannot be built.
     ///
     /// The *direction* needs no check: `address` is typed `DmPageAddress<Sending>`,
     /// so an address for the stream we receive on will not compile.
@@ -624,13 +668,14 @@ impl VeilidNetHandle {
     pub async fn publish_dm_page(
         &self,
         address: DmPageAddress<Sending>,
-        at: PagePosition,
         frame: Vec<u8>,
     ) -> Result<()> {
-        check_position_is_on_page(address.page(), at)?;
+        // No position argument and nothing to check: a sending address carries
+        // the slot it writes (#269), so the pair cannot disagree. The comparison
+        // that used to stand here, and the error it raised, are gone because the
+        // state they guarded is no longer constructible.
         self.send(|reply| Command::PublishDmPage {
             address,
-            at,
             frame,
             reply,
         })
@@ -1270,7 +1315,6 @@ async fn actor_loop(
             }
             Command::PublishDmPage {
                 address,
-                at,
                 frame,
                 reply,
             } => {
@@ -1341,7 +1385,7 @@ async fn actor_loop(
                             crate::vtrace!("publish_dm_page: owner keypair failed ({e})");
                         }
                     }
-                    sched.enqueue(dm_page_write_request(address, at, frame, reply));
+                    sched.enqueue(dm_page_write_request(address, frame, reply));
                 });
             }
             Command::SweepDmPage { address, reply } => {
@@ -1963,15 +2007,14 @@ enum ProdWrite {
     /// The only variant carrying a typed address: a page's owner seed is the
     /// conversation secret, so it rides inside the zeroizing [`DmPageAddress`] and
     /// not as a `Copy` array duplicated through the pending queue (#244). The
-    /// address also keeps the seed bound to its page and its stream for the length
-    /// of the queue, so the position below cannot drift onto another page's record
-    /// (#254). The scheduler's `D: Send + 'static` bound is satisfied structurally —
+    /// address also keeps the seed bound to its page, its slot and its stream for
+    /// the length of the queue, so nothing in flight can drift onto another page's
+    /// record (#254, #269). The scheduler's `D: Send + 'static` bound is satisfied structurally —
     /// the address is a `Box<[u8; 32]>`, a `u64`, a `Direction` and a zero-sized
     /// marker, all of which are both — and is enforced by the compiler at
     /// `WriteScheduler::spawn_with_probe::<ProdWrite>`.
     DmPage {
         address: DmPageAddress<Sending>,
-        at: PagePosition,
         frame: Vec<u8>,
     },
 }
@@ -2066,21 +2109,11 @@ impl WriteSink for ProductionSink {
                     )
                     .await
                 }
-                ProdWrite::DmPage { address, at, frame } => {
+                ProdWrite::DmPage { address, frame } => {
                     // Borrowed, not moved: the binding is dropped — and therefore
                     // zeroized — at the end of this arm, so the conversation secret
                     // lives no longer than the write it authorises (#244).
-                    publish_dm_page(
-                        &gate,
-                        &api,
-                        &rc,
-                        &opened,
-                        &record_locks,
-                        &address,
-                        at,
-                        frame,
-                    )
-                    .await
+                    publish_dm_page(&gate, &api, &rc, &opened, &record_locks, &address, frame).await
                 }
             };
             drop(permit);
@@ -2195,24 +2228,6 @@ async fn fetch_dm_key_record(
 /// arithmetic — hence derived from `paging::PAGE_SLOTS` rather than typed here
 /// (`ISA.md` ISC-C100; sizing in `docs/design/direct-messaging.md` DRAFT v6).
 const DM_PAGE_SHAPE: rendezvous::RecordShape = rendezvous::RecordShape::DM_PAGE;
-
-/// Reject a [`PagePosition`] that belongs to a page other than the addressed one
-/// (#254) — the runtime half of binding page and slot together.
-///
-/// The type system carries the direction and the seed; it cannot carry the page,
-/// which is a runtime value, so this comparison is the only thing standing between
-/// a mismatched pair and a write into a slot no reader will look in. Split out of
-/// [`VeilidNetHandle::publish_dm_page`] so it is reachable from a unit test without
-/// a live actor — the same reason [`dm_page_write_request`] is a function.
-fn check_position_is_on_page(address_page: u64, at: PagePosition) -> Result<()> {
-    if at.page() != address_page {
-        return Err(VeilidNetError::DmPageWrongPage {
-            address_page,
-            position: at,
-        });
-    }
-    Ok(())
-}
 
 /// Refuse a page record whose subkey count is not the page slot count, **in both
 /// directions** (#254).
@@ -2331,7 +2346,6 @@ fn funnel_record_key(owner_seed: &[u8; 32]) -> [u8; 32] {
 /// move the one decision worth pinning back out to the untestable call site.
 fn dm_page_write_request(
     address: DmPageAddress<Sending>,
-    at: PagePosition,
     frame: Vec<u8>,
     reply: oneshot::Sender<Result<()>>,
 ) -> WriteRequest<ProdWrite> {
@@ -2343,7 +2357,7 @@ fn dm_page_write_request(
         class: WriteClass::Chat,
         kind: WriteKind::Ring,
         deadline: None,
-        item: ProdWrite::DmPage { address, at, frame },
+        item: ProdWrite::DmPage { address, frame },
         reply: Some(reply),
     }
 }
@@ -2441,7 +2455,6 @@ async fn publish_dm_page(
     opened: &rendezvous::OpenCache,
     record_locks: &rendezvous::RecordLocks,
     address: &DmPageAddress<Sending>,
-    at: PagePosition,
     frame: Vec<u8>,
 ) -> Result<()> {
     // Borrowed: this needs to READ the seed once, to derive the signing keypair, and
@@ -2472,9 +2485,11 @@ async fn publish_dm_page(
                     .to_string(),
             )
         })?;
-    // The subkey is read off the position at the very last step, so the page it
-    // belongs to travels bound to the slot for the whole path from the public
-    // handle to here (#254).
+    // The subkey is read off the address's own position at the very last step, so
+    // the page it belongs to travels bound to the slot for the whole path from the
+    // public handle to here — and, since #269, in one value rather than two that
+    // could drift apart.
+    let at = address.at();
     let slot = u32::from(at.slot());
     crate::vtrace!(
         "publish_dm_page: key={:?} page={} slot={} bytes={}",
@@ -2534,7 +2549,8 @@ async fn sweep_dm_page(
             "sweep_dm_page: page={} absent, not created -> empty sweep",
             address.page()
         );
-        return Ok((
+        return Ok(DmPageSweep::for_address(
+            address,
             Vec::new(),
             rendezvous::SweepOutcome {
                 attempted: 0,
@@ -2594,7 +2610,7 @@ async fn sweep_dm_page(
     // slots came from. The address goes in whole rather than its page number, so the
     // placement is unit-testable — see `dm_page_place_swept`.
     let found = dm_page_place_swept(address, raw)?;
-    Ok((found, outcome))
+    Ok(DmPageSweep::for_address(address, found, outcome))
 }
 
 /// Open/create the rendezvous record, register a watch, and kick off a one-shot
@@ -3378,6 +3394,11 @@ mod tests {
     /// come from the same one, or the derivation refuses them (#270).
     const PAGE_FIXTURE_SS0: [u8; 32] = [0x5c; 32];
 
+    /// A non-zero page for the address fixtures: on page 0 a position is
+    /// numerically indistinguishable from its own slot, which is the degeneracy
+    /// this file's other page tests were deliberately moved off.
+    const PAGE_FIXTURE_PAGE: u64 = 3;
+
     /// A byte-distinct address root, so a derivation that mis-sliced its input
     /// would not pass.
     fn page_address_root() -> [u8; paging::ADDRESS_ROOT_LEN] {
@@ -3396,8 +3417,8 @@ mod tests {
     /// A real derived sending address for `page`. Never hand-made: the seed inside
     /// has no constructor outside `daemonseed_core::dm::paging` (#244), and the
     /// address's TYPE is what #254 is about.
-    fn sending_address(page: u64) -> DmPageAddress<Sending> {
-        DmPageAddress::sending(&page_address_root(), &page_ratchet(), page)
+    fn sending_address(at: PagePosition) -> DmPageAddress<Sending> {
+        DmPageAddress::sending(&page_address_root(), &page_ratchet(), at)
             .expect("derive a sending page address")
     }
 
@@ -3427,83 +3448,87 @@ mod tests {
         )
     }
 
-    /// **A position from another page is refused, and nothing is enqueued (#254).**
-    /// This is the runtime half of binding page and slot together: the direction and
-    /// the seed are carried by the type, but the page is a runtime value, so this
-    /// comparison is the only thing standing between a mismatched pair and a
-    /// `set_dht_value` into a slot no reader will ever look in — which returns
-    /// `Ok(())` and shows up on no surface.
+    /// **A sweep result is tagged from the address that was swept, and two
+    /// conversations do not share a tag.**
     ///
-    /// The two positions share a SLOT and differ only in page, which is the pairing
-    /// the issue's own example builds: a check that compared slots, or compared
-    /// sequence numbers loosely, would pass a same-slot mismatch.
+    /// `sweep_dm_page` needs a live DHT, so its tagging line is unreachable from
+    /// any runnable test — and a mutation replacing it with a constant survived
+    /// the whole suite. `DmPageSweep::for_address` exists so the tagging happens
+    /// somewhere a unit test can call, and this is that test.
     ///
-    /// **Neither page is zero, deliberately.** With the address on page 0 a guard
-    /// written `if at.page() != 0` passes this test and rejects nothing else, and the
-    /// error-field assertion cannot tell a correct pair from a hardcoded reference —
-    /// the same degeneracy that let a mutation survive in
-    /// `a_dm_page_write_is_a_chat_lane_write_that_never_coalesces` until its page was
-    /// moved off zero.
-    #[tokio::test]
-    async fn a_dm_page_publish_with_a_position_from_another_page_is_refused() {
-        let (handle, mut cmd_rx) = detached_handle();
-        // Replies to anything that arrives, so a write that WRONGLY got through
-        // returns `Ok(())` and fails the assertion below rather than hanging.
-        let serviced = tokio::spawn(async move {
-            let mut seen = 0usize;
-            while let Some(cmd) = cmd_rx.recv().await {
-                seen += 1;
-                if let Command::PublishDmPage { reply, .. } = cmd {
-                    let _ = reply.send(Ok(()));
-                }
-            }
-            seen
-        });
-
-        // Sequence 57 is page 3 slot 9 — three different numbers — and `theirs` is one
-        // page further on at the same slot. Both pages are non-zero, so a guard
-        // comparing against a literal 0 fails here.
-        let ours = paging::position_of(57);
-        let theirs = paging::position_of(57 + u64::from(paging::PAGE_SLOTS));
-        assert_eq!((ours.page(), ours.slot()), (3, 9));
-        assert_eq!(ours.slot(), theirs.slot(), "the two differ only in page");
-        assert_ne!(ours.page(), theirs.page());
-        assert_ne!(ours.page(), 0, "a page-0 address cannot see a hardcoded 0");
-        assert_ne!(theirs.page(), 0);
-
-        let err = handle
-            .publish_dm_page(sending_address(ours.page()), theirs, vec![0xaa])
-            .await
-            .expect_err("a position from another page must be refused");
-        assert!(
-            matches!(
-                err,
-                VeilidNetError::DmPageWrongPage {
-                    address_page,
-                    position,
-                } if address_page == ours.page() && position == theirs
-            ),
-            "the error must name the ADDRESS's page as the reference and carry the \
-             whole refused position: {err:?}"
-        );
-        // The rendering must identify the MESSAGE, not just the mismatch: the
-        // sequence number is the only handle the sender and the correspondent share.
-        let rendered = err.to_string();
-        assert!(
-            rendered.contains(&theirs.seq().to_string()),
-            "the refused position's sequence number must be in the message: {rendered}"
-        );
-        assert!(
-            rendered.contains(&format!("slot {}", theirs.slot())),
-            "the refused position's slot must be in the message: {rendered}"
-        );
-
-        drop(handle);
+    /// The second assertion is what makes the first mean anything: comparing a
+    /// result's tag against the address it came from passes for any value, a
+    /// constant included, since both sides move together.
+    #[test]
+    fn a_sweep_result_carries_the_conversation_of_the_address_it_swept() {
+        let outcome = rendezvous::SweepOutcome::default();
+        let addr = receiving_address(PAGE_FIXTURE_PAGE);
+        let swept = DmPageSweep::for_address(&addr, Vec::new(), outcome);
         assert_eq!(
-            serviced.await.expect("the servicing task"),
-            0,
-            "the rejected write must never reach the actor — a command on the \
-             channel is a write the funnel will dispatch"
+            swept.conversation,
+            *addr.conversation(),
+            "the tag must come from the swept address"
+        );
+
+        // A different conversation, so a constant cannot satisfy this.
+        let other_ss0 = [0xa7u8; 32];
+        assert_ne!(
+            other_ss0, PAGE_FIXTURE_SS0,
+            "the two conversations must differ"
+        );
+        let other_roots = daemonseed_core::dm::firstcontact::derive_channel_roots(&other_ss0)
+            .expect("the second conversation's roots");
+        // Built the way `page_ratchet` builds its own, since this crate does not
+        // depend on the ML-KEM crate directly and has no business naming its
+        // key length.
+        let eph = daemonseed_core::identity::keys::derive_identity_keys(
+            &daemonseed_core::identity::mnemonic::Mnemonic::generate().expect("mnemonic"),
+            daemonseed_core::identity::keys::Identity::Primary,
+        )
+        .expect("derive identity keys");
+        let other_ratchet = daemonseed_core::dm::ratchet::Ratchet::recipient(
+            &other_ss0,
+            Box::new(*eph.kem.encapsulation_key()),
+        )
+        .expect("the second conversation's ratchet");
+        let other_addr =
+            DmPageAddress::receiving(&other_roots.ar, &other_ratchet, PAGE_FIXTURE_PAGE)
+                .expect("the second conversation's address");
+        let other_swept = DmPageSweep::for_address(&other_addr, Vec::new(), outcome);
+        assert_ne!(
+            other_swept.conversation, swept.conversation,
+            "two conversations must not produce the same tag, or the tag \
+             distinguishes nothing and a fan-out can still misattribute"
+        );
+    }
+
+    /// **The refusal this replaces is now a thing that cannot be said.**
+    ///
+    /// A test used to stand here publishing to an address for one page while
+    /// handing `publish_dm_page` a position from another, and asserting the
+    /// mismatch came back as `DmPageWrongPage`. That call no longer type-checks:
+    /// a sending address carries the position it writes (#269), so there is no
+    /// second position to disagree with it and no error variant left to name.
+    ///
+    /// Recorded rather than silently dropped, because a deleted negative test
+    /// reads the same whether its subject was fixed or forgotten. The state it
+    /// guarded is refused by the type; the state `PagePosition::new` guards —
+    /// a page above `MAX_PAGE`, or a slot outside the record — is asserted in
+    /// `daemonseed_core::dm::paging`'s own tests, which is where the bound now
+    /// lives.
+    #[test]
+    fn a_publish_address_carries_its_own_position_so_a_mismatch_is_unconstructible() {
+        let at = paging::position_of(57);
+        let address = sending_address(at);
+        assert_eq!(
+            address.at(),
+            at,
+            "the address must write the position it was derived for"
+        );
+        assert_eq!(
+            address.page(),
+            at.page(),
+            "and its page must be that position's page, with nothing to compare at publish time"
         );
     }
 
@@ -3527,19 +3552,20 @@ mod tests {
             match cmd_rx.recv().await.expect("a command reached the actor") {
                 Command::PublishDmPage {
                     address,
-                    at,
                     frame,
                     reply,
                 } => {
                     let _ = reply.send(Ok(()));
-                    (address.page(), at, frame)
+                    // The position rides inside the address now, so what crosses
+                    // the channel is read back off it rather than beside it.
+                    (address.page(), address.at(), frame)
                 }
                 _ => panic!("expected a PublishDmPage command"),
             }
         });
 
         handle
-            .publish_dm_page(sending_address(at.page()), at, frame.clone())
+            .publish_dm_page(sending_address(at), frame.clone())
             .await
             .expect("a matching position must publish");
 
@@ -3709,18 +3735,30 @@ mod tests {
                         address.direction(),
                         address.with_owner_seed(|b| *b),
                     );
-                    let _ = reply.send(Ok((Vec::new(), rendezvous::SweepOutcome::default())));
+                    let _ = reply.send(Ok(DmPageSweep {
+                        conversation: *address.conversation(),
+                        slots: Vec::new(),
+                        outcome: rendezvous::SweepOutcome::default(),
+                    }));
                     seen
                 }
                 _ => panic!("expected a SweepDmPage command"),
             }
         });
 
-        let (slots, _outcome) = handle
+        let swept = handle
             .sweep_dm_page(receiving_address(PAGE))
             .await
             .expect("the sweep reaches the actor");
-        assert!(slots.is_empty(), "the stub actor returns no slots");
+        assert!(swept.slots.is_empty(), "the stub actor returns no slots");
+        // The tag rides back with the frames (#270): a caller fanning out over
+        // several conversations reads it off the result rather than matching on
+        // the order it dispatched in.
+        assert_eq!(
+            swept.conversation,
+            *receiving_address(PAGE).conversation(),
+            "the sweep must name the conversation it was asked for"
+        );
 
         let (page, direction, seed) = observed.await.expect("the observing task");
         assert_eq!(page, PAGE, "the actor must sweep the page the caller named");
@@ -3879,13 +3917,13 @@ mod tests {
         // slot, the sequence number and the page three different values.
         let at = paging::position_of(3 * u64::from(paging::PAGE_SLOTS) + 9);
         assert_eq!((at.page(), at.slot(), at.seq()), (3, 9, 57));
-        let address = sending_address(at.page());
+        let address = sending_address(at);
         // A plain copy, deliberately: `address` is MOVED into the request below, and
         // the assertions afterwards are about what the request did with it. Test-only
         // — this is the one place a non-zeroizing copy is the point, not the bug.
         let seed_bytes = address.with_owner_seed(|b| *b);
 
-        let req = dm_page_write_request(address, at, frame.clone(), reply);
+        let req = dm_page_write_request(address, frame.clone(), reply);
 
         assert_eq!(
             req.class,
@@ -3927,20 +3965,25 @@ mod tests {
         match req.item {
             ProdWrite::DmPage {
                 address,
-                at: dispatched_at,
                 frame: dispatched,
             } => {
+                let dispatched_at = address.at();
                 assert_eq!(
                     address.with_owner_seed(|b| *b),
                     seed_bytes,
                     "the dispatch token carries the seed itself — the write cannot \
                      be signed without it — and must reach dispatch unchanged"
                 );
+                // Weaker than it was, and honestly so. There is no longer a
+                // separate position for the request to mangle — this reads the
+                // one the address carries — so what it still catches is the
+                // address itself being swapped or re-derived on the way to
+                // dispatch, not arithmetic applied to a loose value. The
+                // arithmetic it used to guard cannot be performed any more.
                 assert_eq!(
                     dispatched_at, at,
-                    "the POSITION must reach dispatch UNCHANGED — the caller derived \
-                     it from a sequence number, so any arithmetic here writes the \
-                     frame where the other party never looks for it"
+                    "the address that reaches dispatch must be the one the caller \
+                     derived, still naming the position it was built for"
                 );
                 assert_eq!(
                     dispatched_at.page(),

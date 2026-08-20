@@ -1,7 +1,5 @@
 //! Error surface for the Veilid transport layer.
 
-use daemonseed_core::dm::paging::PagePosition;
-
 /// Errors from bringing up or operating the daemonseed Veilid node.
 #[derive(Debug, thiserror::Error)]
 pub enum VeilidNetError {
@@ -41,39 +39,6 @@ pub enum VeilidNetError {
     /// The actor task is gone or dropped a reply before answering a command.
     #[error("actor channel error: {0}")]
     Actor(String),
-
-    /// A DM channel-page publish named a position belonging to a different page
-    /// than the address it was published under (#254).
-    ///
-    /// A caller fault at the API boundary, caught before the write is enqueued, so
-    /// nothing reaches the network. Without the check the write succeeds: the frame
-    /// lands in a slot of the addressed page that belongs to some other sequence
-    /// number, and the reader that eventually sweeps it rejects it as misplaced —
-    /// while the message it was meant to be sits nowhere at all.
-    ///
-    /// **The page is the fault, and the slot is not** — the slot was valid for the
-    /// page it came from. Sibling of
-    /// `daemonseed_core::dm::collect::CollectError::SlotOutsideRecord` in reporting
-    /// the culprit rather than the symptom.
-    ///
-    /// **The whole position is carried, not just its page, because a log line has to
-    /// identify the MESSAGE.** Two page numbers alone say a mismatch happened and
-    /// leave the reader unable to name which message went missing or what sequence
-    /// number the caller meant — and the sequence number is the only handle the
-    /// sender, the acknowledgement and the correspondent all share. Carrying the
-    /// `PagePosition` gives page, slot and sequence with nothing derivable
-    /// duplicated, which is the same reason the transport takes a position rather
-    /// than a loose page and slot.
-    #[error(
-        "dm page position (page {}, slot {}, sequence {}) is not on its address's page {address_page}",
-        .position.page(), .position.slot(), .position.seq()
-    )]
-    DmPageWrongPage {
-        /// The page the address names.
-        address_page: u64,
-        /// The position that was offered — its page is the one that disagrees.
-        position: PagePosition,
-    },
 
     /// A DM channel page's record was opened under a shape whose `o_cnt` is not
     /// `daemonseed_core::dm::paging::PAGE_SLOTS`, so it is not a page and is not
@@ -182,7 +147,6 @@ impl VeilidNetError {
             | VeilidNetError::NotReady
             | VeilidNetError::Startup(_)
             | VeilidNetError::Identity(_)
-            | VeilidNetError::DmPageWrongPage { .. }
             | VeilidNetError::DmPageSlotOutsideRecord { .. }
             | VeilidNetError::DmPageShapeMismatch { .. }
             | VeilidNetError::Unimplemented(_) => FetchErrorClass::Transient,
@@ -193,38 +157,6 @@ impl VeilidNetError {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A position on `page`, for the error fixtures below. Slot 9 on page 3 makes
-    /// page, slot and sequence three different numbers, so a message that rendered
-    /// the wrong one of the three is visible.
-    fn at(page: u64) -> PagePosition {
-        PagePosition::new(page, 9).expect("slot 9 is inside a page's record")
-    }
-
-    /// **A wrong-page log line names the message, not just the mismatch.** Two page
-    /// numbers alone leave a reader unable to say which message was lost or what
-    /// sequence number the caller meant; the sequence number is the handle the
-    /// sender, the acknowledgement and the correspondent share.
-    #[test]
-    fn the_wrong_page_error_renders_the_position_it_refused() {
-        let rendered = VeilidNetError::DmPageWrongPage {
-            address_page: 3,
-            position: at(4),
-        }
-        .to_string();
-        // Page, slot and sequence are three distinct values here (4, 9, 73), so each
-        // is pinned on its own and a swapped pair cannot pass.
-        assert!(rendered.contains("page 4"), "{rendered}");
-        assert!(rendered.contains("slot 9"), "{rendered}");
-        assert!(
-            rendered.contains("sequence 73"),
-            "the sequence number the caller meant must be in the line: {rendered}"
-        );
-        assert!(
-            rendered.contains("page 3"),
-            "the addressed page is the reference and must be named too: {rendered}"
-        );
-    }
 
     /// **A page record whose shape is not the page shape is refused in BOTH
     /// directions**, and the rendering says what it found against what a page holds —
@@ -266,10 +198,6 @@ mod tests {
             VeilidNetError::NotReady,
             VeilidNetError::Startup("boot".into()),
             VeilidNetError::Identity("bad identity".into()),
-            VeilidNetError::DmPageWrongPage {
-                address_page: 3,
-                position: at(4),
-            },
             VeilidNetError::DmPageSlotOutsideRecord { page: 3, slot: 31 },
             VeilidNetError::DmPageShapeMismatch { page: 3, o_cnt: 1 },
             VeilidNetError::Unimplemented("phase-2"),
@@ -290,10 +218,6 @@ mod tests {
             VeilidNetError::NotReady,
             VeilidNetError::Startup("x".into()),
             VeilidNetError::Identity("x".into()),
-            VeilidNetError::DmPageWrongPage {
-                address_page: 1,
-                position: at(2),
-            },
             VeilidNetError::DmPageSlotOutsideRecord { page: 1, slot: 16 },
             VeilidNetError::DmPageShapeMismatch { page: 1, o_cnt: 32 },
             VeilidNetError::Unimplemented("x"),

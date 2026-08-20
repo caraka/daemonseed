@@ -158,6 +158,17 @@ work lives in the project lead's vault manifest, not here.
 
 ### Changed
 
+- Corrected the DM channel-page address so a publish cannot name a slot its address does not
+  hold: `DmPageAddress<Sending>` carries the `PagePosition` it writes, and `publish_dm_page`
+  takes no separate position. **Breaking (crate API):** `publish_dm_page` loses an argument,
+  `DmPageAddress::sending` takes a `PagePosition` rather than a page, and
+  `VeilidNetError::DmPageWrongPage` is removed. Nothing on the wire moves. (#269)
+
+- Added the conversation to a page sweep's result. `DmPageSweep` is a struct carrying the `AR`
+  fingerprint alongside the slots and the outcome, so a caller sweeping several correspondents
+  attributes frames by a value it was handed. **Breaking (crate API):** the sweep result is no
+  longer a tuple. (#270)
+
 - Aligned module initialization on oxicrypt 0.24.0, which requires the pre-operational
   integrity group. `daemonseed_core::kats::initialize_module` is the one production entry
   point and passes `oxicrypt_integrity::KATS` with `CNSA_2_0_KATS` under

@@ -267,10 +267,15 @@ types:
     description: A bounded additive-increase/multiplicative-decrease concurrency window (floor..ceiling).
   - name: DmPageSweep
     module: daemonseed_veilid_net::actor
-    kind: type alias
+    kind: struct
     description: >-
-      `(Vec<(PagePosition, Vec<u8>)>, SweepOutcome)` — one page sweep's full result.
-      Each populated slot arrives as a checked
+      One page sweep's full result: `conversation` (the AR fingerprint naming which
+      correspondence the frames came from), `slots`, and `outcome`. The tag means a
+      caller sweeping several correspondents concurrently matches results to
+      conversations by a value it was handed rather than by the order it dispatched
+      in; a misattribution forges nothing, because frames are individually
+      authenticated, but the ratchet fails to open them and that conversation stalls
+      while every layer reports success. Each populated slot arrives as a checked
       `daemonseed_core::dm::paging::PagePosition` on the swept page, so the collector
       compares the frame's declared sequence number against a position it did not
       have to compute. The outcome is required, not decoration: an empty slot list
@@ -481,40 +486,39 @@ functions:
   - name: VeilidNetHandle::publish_dm_page
     module: daemonseed_veilid_net::actor
     description: >-
-      Publish one sealed DM channel frame at a position on its dflt(16) page record
+      Publish one sealed DM channel frame into the slot its address names
       (ISC-C42). Bytes are opaque here — this layer neither parses nor verifies the
       frame, and a successful write proves nothing about authorship, since both parties
-      can derive the owner seed for both directions. Rejects a position whose page
-      disagrees with the address as VeilidNetError::DmPageWrongPage, before the write is
-      enqueued. Enqueued on the WB-3 funnel as a Chat-class, Ring-kind write —
+      can derive the owner seed for both directions. The address carries the position
+      it writes, so page and slot cannot disagree and there is nothing to reject.
+      Enqueued on the WB-3 funnel as a Chat-class, Ring-kind write —
       non-coalescible, because two queued writes to one page are two different messages
       in two different slots. Write-once is a CALLER OBLIGATION: this is an
       unconditional last-writer-wins set_dht_value with no read-before-write, so a
       reissued sequence number overwrites an already-delivered message and returns Ok
       (see #243). The page record is not world-writable: its owner seed derives from the
       first-contact secret, so a third party cannot compute the address at all.
-    signature: "pub async fn publish_dm_page(&self, address: DmPageAddress<Sending>, at: PagePosition, frame: Vec<u8>) -> Result<()>"
+    signature: "pub async fn publish_dm_page(&self, address: DmPageAddress<Sending>, frame: Vec<u8>) -> Result<()>"
     parameters:
       - name: address
         type: "DmPageAddress<Sending>"
         direction: in
-        description: The page's address, from daemonseed_core::dm::paging::DmPageAddress::sending(address_root, ratchet, page). Typed to Sending, so an address for the stream this end receives on is a compile error. Taken by value — it holds a boxed, redacted, zeroize-on-drop owner seed that is neither Clone nor constructible outside daemonseed_core::dm::paging, so it is moved into the command rather than copied. Derive one per call; derivation is pure. The funnel's record id is the owner's PUBLIC key derived from the seed, never the seed.
-      - name: at
-        type: PagePosition
-        direction: in
-        description: Where the frame goes, from paging::position_of(seq). Its page() must equal address.page() — take both from the one position — or the call returns DmPageWrongPage and nothing is enqueued. The subkey is read off it at dispatch.
+        description: The placed slot to write, from daemonseed_core::dm::paging::DmPageAddress::sending(address_root, ratchet, paging::position_of(seq)). The address IS the position, so page and slot come from one sequence number by construction. Typed to Sending, so an address for the stream this end receives on is a compile error. Taken by value — it holds a boxed, redacted, zeroize-on-drop owner seed that is neither Clone nor constructible outside daemonseed_core::dm::paging, so it is moved into the command rather than copied. Derive one per call; derivation is pure. The funnel's record id is the owner's PUBLIC key derived from the seed, never the seed.
       - name: frame
         type: "Vec<u8>"
         direction: in
         description: The already-sealed, already-signed channel frame.
     returns:
       type: "Result<()>"
-      description: Ok once the scheduler has dispatched the write; DmPageWrongPage if the position is on another page.
+      description: Ok once the scheduler has dispatched the write.
   - name: VeilidNetHandle::sweep_dm_page
     module: daemonseed_veilid_net::actor
     description: >-
-      Sweep every slot of one DM channel page, returning (PagePosition, bytes) per
-      populated slot together with the sweep's SweepOutcome. Each subkey is placed on
+      Sweep every slot of one DM channel page, returning a DmPageSweep: the
+      conversation the swept address named, the populated (PagePosition, bytes)
+      slots, and the sweep's SweepOutcome. The conversation tag means a caller
+      sweeping several correspondents concurrently attributes frames by a value it
+      was handed rather than by dispatch order. Each subkey is placed on
       the addressed page through PagePosition::new at the boundary, so the collector
       checks the frame's declared sequence number against a position rather than
       recomputing one; a slot the record cannot hold returns
@@ -546,7 +550,7 @@ functions:
         description: The page's address, from daemonseed_core::dm::paging::DmPageAddress::receiving(address_root, ratchet, page). Typed to Receiving, so sweeping the stream this end sends on is a compile error — that address is valid and would read this end's own writes back forever. Taken by value for the reason publish_dm_page gives; derive one per call.
     returns:
       type: "Result<DmPageSweep>"
-      description: The populated slots as (PagePosition, unverified bytes) pairs, paired with the sweep outcome (attempted / found / failed).
+      description: DmPageSweep { conversation, slots, outcome } — the AR fingerprint naming the correspondence, the populated slots as (PagePosition, unverified bytes) pairs, and the sweep outcome (attempted / found / failed).
   - name: VeilidNetHandle::publish_presence
     module: daemonseed_veilid_net::actor
     description: Publish a sealed member-presence beacon to a per-member current-state slot on the presence sibling rendezvous record; a re-beacon overwrites the same slot (last-writer-wins). The presence record is distinct from the chat rendezvous, so a beacon never evicts chat backlog. member_pubkey owns the stable-slot-id encoding (member_slot_id, hex) so all callers agree. The slot count is bounded (SUBKEY_COUNT), so at unbounded membership two members can slot-share (a bounded, self-healing degradation). The app net actor holds the keys and runs the emit/ingest/reap loop; a receiver subscribes via subscribe_room on the same presence owner seed.
@@ -1104,8 +1108,6 @@ error_types:
         condition: Invalid node identity.
       - name: Actor
         condition: The actor task is gone or dropped a reply.
-      - name: DmPageWrongPage
-        condition: A DM page publish named a PagePosition belonging to a different page than its address. Carries the address's page and the whole refused position, so the message renders the page, the slot and the sequence number the caller meant. Caught before the write is enqueued.
       - name: DmPageShapeMismatch
         condition: A DM page's record carries an o_cnt other than paging::PAGE_SLOTS, checked before any slot is read (ISC-C100). Carries the page and the o_cnt found. An o_cnt below PAGE_SLOTS yields no unplaceable slot, so without this check the sweep returns Ok with a silently truncated page.
       - name: DmPageSlotOutsideRecord

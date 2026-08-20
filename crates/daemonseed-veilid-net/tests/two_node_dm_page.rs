@@ -162,16 +162,23 @@ async fn frames_published_to_page_slots_sweep_back_in_the_slots_they_were_writte
     // perfectly. Page 3 makes the page, the slot and the sequence three different
     // numbers at every assertion.
     const PAGE: u64 = 3;
-    let addr_a = || {
-        DmPageAddress::sending(&address_root, &ratchet_a, PAGE)
+    // Takes the position it will write (#269): a sending address IS a placed
+    // slot, so the two publishes below derive one address each rather than
+    // sharing a page-level address and passing the slot alongside.
+    let addr_a = |at: PagePosition| {
+        DmPageAddress::sending(&address_root, &ratchet_a, at)
             .expect("A derives its sending page address")
     };
     let addr_b = || {
         DmPageAddress::receiving(&address_root, &ratchet_b, PAGE)
             .expect("B derives its receiving page address")
     };
+    // Any position on the page will do: the owner seed descends from the address
+    // root, the direction and the PAGE — never the slot — which is exactly the
+    // property being asserted.
+    let any_slot_on_page = PagePosition::new(PAGE, 0).expect("slot 0 is inside a page's record");
     assert_eq!(
-        addr_a().with_owner_seed(|b| *b),
+        addr_a(any_slot_on_page).with_owner_seed(|b| *b),
         addr_b().with_owner_seed(|b| *b),
         "both ends must derive the same page record from the address root alone"
     );
@@ -217,8 +224,8 @@ async fn frames_published_to_page_slots_sweep_back_in_the_slots_they_were_writte
     // time, and the anti-coalescing property — the one whose failure mode is a
     // message silently missing from the wire under an `Ok(())` — would go untested.
     let (published_first, published_second) = tokio::join!(
-        node_a.publish_dm_page(addr_a(), first, frame_first.clone()),
-        node_a.publish_dm_page(addr_a(), second, frame_second.clone()),
+        node_a.publish_dm_page(addr_a(first), frame_first.clone()),
+        node_a.publish_dm_page(addr_a(second), frame_second.clone()),
     );
     published_first.expect("A publishes the first frame");
     published_second.expect("A publishes the second frame");
@@ -230,13 +237,22 @@ async fn frames_published_to_page_slots_sweep_back_in_the_slots_they_were_writte
     let mut swept = Vec::new();
     for attempt in 0..30 {
         match node_b.sweep_dm_page(addr_b()).await {
-            Ok((slots, outcome)) => {
+            Ok(sweep) => {
                 eprintln!(
-                    "attempt {attempt}: {} slot(s) back, outcome {outcome:?}",
-                    slots.len()
+                    "attempt {attempt}: {} slot(s) back, outcome {:?}",
+                    sweep.slots.len(),
+                    sweep.outcome
                 );
-                if slots.len() == 2 {
-                    swept = slots;
+                // The result names its own conversation (#270), so a caller
+                // sweeping several correspondents at once matches on a value it
+                // was handed rather than on dispatch order.
+                assert_eq!(
+                    sweep.conversation,
+                    *addr_b().conversation(),
+                    "the sweep must come back tagged with the conversation it addressed"
+                );
+                if sweep.slots.len() == 2 {
+                    swept = sweep.slots;
                     break;
                 }
             }
@@ -332,17 +348,20 @@ async fn frames_published_to_page_slots_sweep_back_in_the_slots_they_were_writte
         addr_b().direction(),
         "the unwritten page must be on the OTHER stream"
     );
-    let (empty, outcome) = node_b
+    let unwritten_sweep = node_b
         .sweep_dm_page(unwritten)
         .await
         .expect("sweeping a page nobody has written must be Ok, not Err");
-    eprintln!("unwritten page sweep: outcome {outcome:?}");
+    eprintln!(
+        "unwritten page sweep: outcome {:?}",
+        unwritten_sweep.outcome
+    );
     assert!(
-        empty.is_empty(),
+        unwritten_sweep.slots.is_empty(),
         "a page nobody has written must come back with no slots"
     );
     assert_eq!(
-        outcome.found, 0,
+        unwritten_sweep.outcome.found, 0,
         "no slot of an unwritten page is populated"
     );
     // `attempted: 0` is the point, not an accident of an empty record: since #253 the
@@ -354,11 +373,11 @@ async fn frames_published_to_page_slots_sweep_back_in_the_slots_they_were_writte
     // `attempted: PAGE_SLOTS, found: 0`, and the collector's `failed > 0` health rule
     // depends on those two being distinguishable.
     assert_eq!(
-        outcome.attempted, 0,
+        unwritten_sweep.outcome.attempted, 0,
         "an unwritten page must not be created, so no slot of it is ever attempted"
     );
     assert_eq!(
-        outcome.failed, 0,
+        unwritten_sweep.outcome.failed, 0,
         "nothing was attempted, so nothing can have failed"
     );
 

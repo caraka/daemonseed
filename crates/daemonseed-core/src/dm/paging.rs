@@ -98,10 +98,11 @@
 //! open them, and the conversation would stop progressing while every layer
 //! reported success. Silence is what made it worth a check.
 //!
-//! What remains open is the *result* side: a sweep returns positions carrying no
-//! conversation tag, so a caller fanning out over several correspondents still
-//! distinguishes results only by what it remembered about dispatch order. That
-//! shape belongs with the collector that consumes it (#236, #270).
+//! The *result* side is closed on the same fingerprint (#270): an address keeps
+//! the value the check compared, and a transport returns it with the swept
+//! frames, so a caller fanning out over several correspondents attributes results
+//! by a value it was handed rather than by what it remembered about dispatch
+//! order.
 //!
 //! ## The collector must check where a message was found
 //!
@@ -388,6 +389,21 @@ pub fn derive_owner_seed(
 pub trait PageDirection: sealed::Sealed {
     /// The absolute [`Direction`] this marker names for `ratchet`.
     fn of(ratchet: &Ratchet) -> Direction;
+
+    /// What this direction pins about *where within the page* the address acts.
+    ///
+    /// The asymmetry is the whole point (#269). A publish acts on one slot, so a
+    /// sending address carries the [`PagePosition`] it will write and the pairing
+    /// cannot come apart. A sweep addresses all sixteen slots at once and has no
+    /// single position to carry, so a receiving address pins `()`.
+    ///
+    /// Putting it here rather than in a second type or an enum variant works
+    /// because the marker already partitions the type along exactly this line:
+    /// `publish_dm_page` only ever takes `Sending`, `sweep_dm_page` only ever
+    /// takes `Receiving`. What used to be a runtime comparison between an
+    /// address's page and a separately-supplied position becomes a thing that
+    /// cannot be said.
+    type Placement: Copy + core::fmt::Debug + PartialEq;
 }
 
 mod sealed {
@@ -410,12 +426,18 @@ impl PageDirection for Sending {
     fn of(ratchet: &Ratchet) -> Direction {
         ratchet.send_direction()
     }
+
+    /// A publish is to one slot, and the address is that placed slot.
+    type Placement = PagePosition;
 }
 
 impl PageDirection for Receiving {
     fn of(ratchet: &Ratchet) -> Direction {
         ratchet.recv_direction()
     }
+
+    /// A sweep reads the whole page, so there is no single position to pin.
+    type Placement = ();
 }
 
 /// One page of one stream of one conversation: its owner seed, its page number,
@@ -457,10 +479,11 @@ impl PageDirection for Receiving {
 /// authenticated; the conversation simply stops progressing in silence, which is
 /// what made it worth refusing rather than documenting.
 ///
-/// **What is still open is the result side**, not this one: a sweep returns
-/// positions carrying no conversation tag, so a caller fanning out over several
-/// correspondents distinguishes results only by what it remembered about dispatch
-/// order. That shape belongs with the collector that consumes it (#236, #270).
+/// **The result side is closed too (#270).** The fingerprint checked above is kept
+/// on the address and readable through [`Self::conversation`], and a transport
+/// returns it with a sweep's frames — so a caller fanning out over several
+/// correspondents attributes results by a value it was handed rather than by what
+/// it remembered about dispatch order.
 ///
 /// **Moved, not borrowed, and that is a constraint rather than a taste (#244).**
 /// The owner seed is the conversation's write *capability*: under Veilid a
@@ -479,6 +502,22 @@ pub struct DmPageAddress<D: PageDirection> {
     owner_seed: DmPageOwnerSeed,
     page: u64,
     direction: Direction,
+    /// Which conversation this address belongs to (#270).
+    ///
+    /// Not a new derivation: [`Self::derive`] already computes this fingerprint
+    /// to refuse a root and a ratchet that name different conversations, and
+    /// used to drop it on the floor. Keeping it is what lets a transport hand a
+    /// sweep's frames back tagged, so a caller fanning out over several
+    /// correspondents cannot attribute one conversation's frames to another's
+    /// ratchet — the failure that costs nothing in confidentiality and stalls a
+    /// conversation in silence.
+    ///
+    /// A hash, not a capability: see [`crate::dm::firstcontact::ar_fingerprint`].
+    /// It is never serialized.
+    conversation: [u8; crate::dm::firstcontact::AR_FINGERPRINT_LEN],
+    /// Where within the page this address acts — a [`PagePosition`] when
+    /// sending, `()` when receiving. See [`PageDirection::Placement`].
+    placement: D::Placement,
     stream: PhantomData<D>,
 }
 
@@ -486,14 +525,35 @@ impl DmPageAddress<Sending> {
     /// The address of one page of the stream this ratchet **sends** on — where our
     /// own outbound frames are published.
     ///
-    /// Fails with [`DmPageError::PageBeyondSequenceSpace`] for a page above
-    /// [`MAX_PAGE`], which no position can live on.
+    /// Takes the [`PagePosition`] it will write, not a page number: the address
+    /// **is** the placed slot (#269), so a publish cannot be handed an address
+    /// and a position that disagree.
+    ///
+    /// Note what this removes rather than catches. `PagePosition::new` already
+    /// refuses a page above [`MAX_PAGE`], so a sending address can no longer
+    /// name a page that holds no position, and
+    /// [`DmPageError::PageBeyondSequenceSpace`] is unreachable from here — the
+    /// bound is enforced one type earlier. [`Self::receiving`] still takes a bare
+    /// page and still returns it.
     pub fn sending(
         address_root: &[u8; ADDRESS_ROOT_LEN],
         ratchet: &Ratchet,
-        page: u64,
+        at: PagePosition,
     ) -> Result<Self, DmPageError> {
-        Self::derive(address_root, ratchet, page)
+        Self::derive(address_root, ratchet, at.page(), at)
+    }
+}
+
+impl DmPageAddress<Sending> {
+    /// The position this address writes.
+    ///
+    /// Available only on the sending half, because only a publish has one. It is
+    /// the value handed to [`Self::sending`], so a caller reading it back gets
+    /// what the address was derived for rather than a second opinion about it —
+    /// which is what makes `publish_dm_page` a two-argument call with nothing
+    /// left to compare.
+    pub fn at(&self) -> PagePosition {
+        self.placement
     }
 }
 
@@ -508,7 +568,7 @@ impl DmPageAddress<Receiving> {
         ratchet: &Ratchet,
         page: u64,
     ) -> Result<Self, DmPageError> {
-        Self::derive(address_root, ratchet, page)
+        Self::derive(address_root, ratchet, page, ())
     }
 }
 
@@ -520,6 +580,7 @@ impl<D: PageDirection> DmPageAddress<D> {
         address_root: &[u8; ADDRESS_ROOT_LEN],
         ratchet: &Ratchet,
         page: u64,
+        placement: D::Placement,
     ) -> Result<Self, DmPageError> {
         // Refused BEFORE the derivation, so an address never names a page that
         // holds no position: it is what lets a sweep of this address treat a
@@ -546,8 +607,26 @@ impl<D: PageDirection> DmPageAddress<D> {
             owner_seed: derive_owner_seed(address_root, direction, page)?,
             page,
             direction,
+            // The fingerprint just checked, kept rather than dropped (#270). One
+            // derivation feeds both the refusal above and the tag a sweep hands
+            // back, so the tag on a result cannot disagree with the check that
+            // let the address exist.
+            conversation: offered,
+            placement,
             stream: PhantomData,
         })
+    }
+
+    /// Which conversation this address belongs to (#270).
+    ///
+    /// The `AR` fingerprint the ratchet carries and the derivation checks. A
+    /// transport returns this alongside a sweep's frames so the caller matches
+    /// results to conversations by a value it was given, not by remembering the
+    /// order it dispatched them in.
+    ///
+    /// A hash, not a capability — it grants nothing and is never serialized.
+    pub fn conversation(&self) -> &[u8; crate::dm::firstcontact::AR_FINGERPRINT_LEN] {
+        &self.conversation
     }
 
     /// Which page this address names. At most [`MAX_PAGE`], by construction.
@@ -626,8 +705,9 @@ impl<D: PageDirection> std::fmt::Debug for DmPageAddress<D> {
         f.debug_struct("DmPageAddress")
             .field("direction", &self.direction)
             .field("page", &self.page)
+            .field("placement", &self.placement)
             .field("owner_seed", &self.owner_seed)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -852,6 +932,16 @@ mod tests {
     /// The `ss0` every ratchet fixture in this module opens from.
     const FIXTURE_SS0: [u8; 32] = [0x5c; 32];
 
+    /// Slot 0 of `page`, for the address fixtures below.
+    ///
+    /// `sending` takes a position rather than a page (#269), and every case here
+    /// is about the address, not about which slot it names — so one helper keeps
+    /// the slot out of the way instead of repeating `PagePosition::new(..).unwrap()`
+    /// at each site.
+    fn slot0(page: u64) -> PagePosition {
+        PagePosition::new(page, 0).expect("slot 0 is inside every valid page's record")
+    }
+
     /// A recipient's ratchet, which is the cheap one to build: it takes only the
     /// PUBLIC half of the opening ephemeral, so no keygen is needed and the bytes
     /// are never inspected. Its role fixes both directions —
@@ -890,7 +980,7 @@ mod tests {
         .expect("open an initiator ratchet");
 
         assert!(
-            DmPageAddress::sending(&conversation_ar(), &init, 0).is_ok(),
+            DmPageAddress::sending(&conversation_ar(), &init, slot0(0)).is_ok(),
             "an initiator's own root must derive"
         );
         let other = crate::dm::firstcontact::derive_channel_roots(&[0xa3; 32])
@@ -898,7 +988,7 @@ mod tests {
             .ar;
         assert!(
             matches!(
-                DmPageAddress::sending(&other, &init, 0).unwrap_err(),
+                DmPageAddress::sending(&other, &init, slot0(0)).unwrap_err(),
                 DmPageError::ConversationMismatch
             ),
             "an initiator must refuse a foreign root exactly as a recipient does"
@@ -914,7 +1004,7 @@ mod tests {
         // Positive control FIRST, so a blanket refusal cannot masquerade as the
         // check working: the conversation's own root still derives an address.
         assert!(
-            DmPageAddress::sending(&conversation_ar(), &r, 0).is_ok(),
+            DmPageAddress::sending(&conversation_ar(), &r, slot0(0)).is_ok(),
             "the ratchet's own root must still derive — otherwise the assertion \
              below proves nothing but that everything is refused"
         );
@@ -931,7 +1021,7 @@ mod tests {
         );
 
         for crossed in [
-            DmPageAddress::<Sending>::sending(&other, &r, 0).unwrap_err(),
+            DmPageAddress::<Sending>::sending(&other, &r, slot0(0)).unwrap_err(),
             DmPageAddress::<Receiving>::receiving(&other, &r, 0).unwrap_err(),
         ] {
             assert!(
@@ -994,7 +1084,8 @@ mod tests {
     fn the_address_type_derives_the_pinned_seed_for_its_stream() {
         let r = recipient_ratchet();
 
-        let sending = DmPageAddress::sending(&conversation_ar(), &r, 0).expect("sending address");
+        let sending =
+            DmPageAddress::sending(&conversation_ar(), &r, slot0(0)).expect("sending address");
         let receiving =
             DmPageAddress::receiving(&conversation_ar(), &r, 0).expect("receiving address");
 
@@ -1081,7 +1172,7 @@ mod tests {
     fn sending_and_receiving_address_different_records() {
         let r = recipient_ratchet();
         for page in [0u64, 1, 4_096] {
-            let s = DmPageAddress::sending(&conversation_ar(), &r, page).unwrap();
+            let s = DmPageAddress::sending(&conversation_ar(), &r, slot0(page)).unwrap();
             let v = DmPageAddress::receiving(&conversation_ar(), &r, page).unwrap();
             assert_ne!(
                 s.with_owner_seed(|b| *b),
@@ -1145,20 +1236,86 @@ mod tests {
     ///
     /// Checked on both constructors: they share a body, and a page bound that lived
     /// in only one of them would leave the other deriving unusable addresses.
+    /// **The sending half no longer participates, and that is the change (#269).**
+    /// `sending` takes a [`PagePosition`], and `PagePosition::new` already refuses
+    /// a page above [`MAX_PAGE`], so the sending side cannot be handed an
+    /// out-of-range page to refuse — the bound moved one type earlier rather than
+    /// disappearing. The first assertion below is where that coverage now lives;
+    /// `receiving` still takes a bare page and still returns the error.
+    /// **The tag an address carries is the fingerprint of ITS OWN root, and a
+    /// different conversation yields a different one.**
+    ///
+    /// Both halves are load-bearing and the first one alone is not enough. A test
+    /// that only compares an address's tag against another address built from the
+    /// same root passes for any value the field might hold — including a constant
+    /// — because both sides move together. That is exactly the shape a mutation
+    /// survived: replacing `conversation: offered` in `derive` with an all-zero
+    /// array left every suite green, and the tag is the whole of #270's remedy.
+    ///
+    /// So this pins the tag against a value computed OUTSIDE the type, and then
+    /// pins that two roots do not share it.
+    #[test]
+    fn an_address_tags_itself_with_its_own_conversation() {
+        let r = recipient_ratchet();
+        let root = conversation_ar();
+
+        // Computed independently of `DmPageAddress`, so a stored constant, a
+        // zeroed field or a fingerprint of something else all fail here.
+        let expected =
+            crate::dm::firstcontact::ar_fingerprint(&root).expect("the fixture root fingerprints");
+        assert_eq!(
+            DmPageAddress::sending(&root, &r, slot0(0))
+                .expect("sending address")
+                .conversation(),
+            &expected,
+            "a sending address must carry the fingerprint of the root it was derived \
+             from, not merely something stable"
+        );
+        assert_eq!(
+            DmPageAddress::receiving(&root, &r, 0)
+                .expect("receiving address")
+                .conversation(),
+            &expected,
+            "and the receiving half must agree — one derivation, both directions"
+        );
+
+        // A second conversation, with its own ratchet, must not share the tag.
+        // Without this a constant would satisfy every assertion above.
+        let other_ss0 = [0xa7u8; 32];
+        assert_ne!(
+            other_ss0, FIXTURE_SS0,
+            "the two conversations must actually differ, or this proves nothing"
+        );
+        let other_roots = crate::dm::firstcontact::derive_channel_roots(&other_ss0)
+            .expect("the second conversation's roots");
+        let other_ratchet =
+            Ratchet::recipient(&other_ss0, Box::new([0x11; oxicrypt_ml_kem::EK_LEN]))
+                .expect("the second conversation's ratchet");
+        let other = DmPageAddress::receiving(&other_roots.ar, &other_ratchet, 0)
+            .expect("the second conversation's address");
+        assert_ne!(
+            other.conversation(),
+            &expected,
+            "two conversations must not carry the same tag, or the tag distinguishes \
+             nothing and a fan-out can still misattribute"
+        );
+    }
+
     #[test]
     fn an_address_above_the_top_page_is_refused() {
         let r = recipient_ratchet();
         for page in [MAX_PAGE + 1, u64::MAX] {
-            assert_eq!(
-                DmPageAddress::sending(&conversation_ar(), &r, page).unwrap_err(),
-                DmPageError::PageBeyondSequenceSpace { page },
+            assert!(
+                PagePosition::new(page, 0).is_none(),
+                "page {page} holds no position, so no sending address for it can even be asked for"
             );
             assert_eq!(
                 DmPageAddress::receiving(&conversation_ar(), &r, page).unwrap_err(),
                 DmPageError::PageBeyondSequenceSpace { page },
             );
         }
-        assert!(DmPageAddress::sending(&conversation_ar(), &r, MAX_PAGE).is_ok());
+        let top = PagePosition::new(MAX_PAGE, 0).expect("MAX_PAGE holds positions");
+        assert!(DmPageAddress::sending(&conversation_ar(), &r, top).is_ok());
         assert!(DmPageAddress::receiving(&conversation_ar(), &r, MAX_PAGE).is_ok());
     }
 
@@ -1182,7 +1339,8 @@ mod tests {
         let rendered = format!("{addr:?}");
         assert_eq!(
             rendered,
-            "DmPageAddress { direction: AToB, page: 7, owner_seed: DmPageOwnerSeed(<redacted>) }"
+            "DmPageAddress { direction: AToB, page: 7, placement: (), \
+             owner_seed: DmPageOwnerSeed(<redacted>), .. }"
         );
 
         // **Both needles are built inside the scope, so this test does not itself

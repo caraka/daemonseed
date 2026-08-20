@@ -251,7 +251,7 @@ async fn sealed_channel_messages_round_trip_through_a_page_and_open_out_of_order
         // The initiator's first channel sequence is ONE, not zero — sequence zero
         // was the first-contact entry, which travelled by doorbell — so even the
         // very first frame lands in a non-zero slot. That is what keeps this test
-        // from being blind: a `publish_dm_page` that ignored its slot argument and
+        // from being blind: a `publish_dm_page` that ignored the slot in its address and
         // always wrote subkey 0 would round-trip a slot-0 message perfectly, and
         // fails here.
         assert_ne!(
@@ -271,14 +271,14 @@ async fn sealed_channel_messages_round_trip_through_a_page_and_open_out_of_order
         )
         .expect("A seals the channel frame");
 
-        // The address's page and the position come from ONE sequence number, which
-        // the transport re-checks: a page from one sequence number and a slot from
-        // another is refused rather than writing a frame nobody will find at the
-        // sequence it claims (#254).
-        let address = DmPageAddress::sending(&roots_a.ar, &ratchet_a, at.page())
+        // The address IS the placed slot, so page and slot come from ONE sequence
+        // number by construction (#269). There is nothing left for the transport
+        // to re-check: a page from one sequence number and a slot from another is
+        // no longer a pair that can be built.
+        let address = DmPageAddress::sending(&roots_a.ar, &ratchet_a, at)
             .expect("A derives its sending page address");
         node_a
-            .publish_dm_page(address, at, frame_bytes)
+            .publish_dm_page(address, frame_bytes)
             .await
             .expect("A publishes the sealed frame into its slot");
 
@@ -314,9 +314,15 @@ async fn sealed_channel_messages_round_trip_through_a_page_and_open_out_of_order
             .expect("B derives its receiving page address")
     };
     assert_eq!(
-        DmPageAddress::sending(&roots_a.ar, &ratchet_a, page)
-            .expect("A derives its sending page address")
-            .with_owner_seed(|b| *b),
+        DmPageAddress::sending(
+            &roots_a.ar,
+            &ratchet_a,
+            // Any slot on the page: the owner seed descends from the root, the
+            // direction and the page, never the slot.
+            PagePosition::new(page, 0).expect("slot 0 is inside a page's record"),
+        )
+        .expect("A derives its sending page address")
+        .with_owner_seed(|b| *b),
         addr_b().with_owner_seed(|b| *b),
         "both ends must derive the same page record from the address root alone"
     );
@@ -327,11 +333,18 @@ async fn sealed_channel_messages_round_trip_through_a_page_and_open_out_of_order
     let mut swept = Vec::new();
     for attempt in 0..30 {
         match node_b.sweep_dm_page(addr_b()).await {
-            Ok((slots, outcome)) => {
+            Ok(sweep) => {
                 eprintln!(
-                    "attempt {attempt}: {} slot(s) back, outcome {outcome:?}",
-                    slots.len()
+                    "attempt {attempt}: {} slot(s) back, outcome {:?}",
+                    sweep.slots.len(),
+                    sweep.outcome
                 );
+                assert_eq!(
+                    sweep.conversation,
+                    *addr_b().conversation(),
+                    "the sweep must name the conversation it addressed (#270)"
+                );
+                let slots = sweep.slots;
                 if slots.len() == 2 {
                     swept = slots;
                     break;
