@@ -133,6 +133,11 @@ work lives in the project lead's vault manifest, not here.
 
 ### Fixed
 
+- Corrected the at-rest read path, which left decoded secrets in freed memory on its error
+  paths: a circle's entropy in `Seeds::from_plaintext` and `Seeds::add_circle`, and the whole
+  decrypted payload in `open_v2` and `open_v1`. Every one is now held in `Zeroizing` from the
+  byte it exists. (#343)
+
 - Corrected the TUI's whole-share download to a user-chosen destination, which placed
   files at their share-root-relative paths and so dropped the share's own folder name —
   a single-depth share landed as loose files in the chosen folder. It now wraps them

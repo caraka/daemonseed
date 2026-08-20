@@ -328,6 +328,58 @@ fn push_hex(out: &mut String, bytes: &[u8]) {
     }
 }
 
+/// Decode one hex-encoded **secret** field of the payload, wrapped from the
+/// moment its bytes exist (#343).
+///
+/// The read-side counterpart of [`push_hex`], and it exists for the same reason:
+/// the obvious call leaves the secret in a buffer nothing wipes. `hex::decode`
+/// hands back a bare `Vec<u8>` that is already the plaintext secret, and
+/// `String::from_utf8` moves that same allocation into a bare `String` — so
+/// between the decode and whatever finally takes ownership, every `?` in the
+/// parser drops key material intact. That window is not hypothetical: it is the
+/// recovery path, reached exactly when a blob is corrupt or truncated and some
+/// *later* field fails to parse.
+///
+/// [`hex::decode_to_slice`] writes into a buffer this function owns, so no
+/// allocation is ever made outside the [`Zeroizing`] wrapper — including on
+/// `hex`'s own error return, where `hex::decode`'s partially-filled buffer would
+/// otherwise be dropped by a crate we do not control.
+///
+/// **That buys more than one buffer, which is the part worth stating.**
+/// `hex::decode` collects through a `Result` adapter whose `size_hint` lower
+/// bound is 0, so it does not reserve once — it grows the buffer geometrically.
+/// Measured: 137 bytes decode into a 256-byte allocation, 3 001 into a 4 096-byte
+/// one. Every one of those growth steps copies the partially-decoded secret into
+/// a new block and releases the old one **with the secret still in it**, so the
+/// residue was a ladder of stranded copies rather than the single final buffer
+/// the issue described. Decoding into a right-sized buffer removes the ladder
+/// along with its last rung.
+///
+/// The one copy — `str::to_owned` after the UTF-8 check — is deliberate and is
+/// not residue. Taking the `Vec<u8>` back out of `Zeroizing` to hand it to
+/// `String::from_utf8` is the thing being avoided, and validating on a borrow
+/// keeps every early return covered by a wrapper rather than by an author
+/// remembering to wipe. The source buffer is zeroized when it drops at the end
+/// of this function.
+///
+/// **Secrets only.** Share roots and published-share names are ordinary
+/// filesystem paths and wire-facing names, held in plain `String` fields
+/// everywhere else in the crate; decoding those through here would claim a
+/// secrecy the rest of the code does not honour.
+fn decode_hex_secret(src: &str) -> Result<Zeroizing<String>, BlobError> {
+    // Checked here as well as by `decode_to_slice` because it is what sizes the
+    // buffer: integer division would silently under-allocate on an odd length,
+    // and `decode_to_slice` would then report a length mismatch rather than the
+    // odd input that caused it.
+    if !src.len().is_multiple_of(2) {
+        return Err(BlobError::InvalidPlaintext);
+    }
+    let mut bytes = Zeroizing::new(vec![0u8; src.len() / 2]);
+    hex::decode_to_slice(src, bytes.as_mut_slice()).map_err(|_| BlobError::InvalidPlaintext)?;
+    let text = core::str::from_utf8(&bytes).map_err(|_| BlobError::InvalidPlaintext)?;
+    Ok(Zeroizing::new(text.to_owned()))
+}
+
 /// One remembered circle in the at-rest blob (ISC-C59 persistence, M13).
 ///
 /// Holds the minimum needed to rejoin without re-typing: the canonicalized
@@ -375,9 +427,18 @@ pub struct PersistedCircle {
 impl PersistedCircle {
     /// Remember a circle. `entropy` MUST already be canonicalized (ISC-C9) — this
     /// only stores what the caller normalized.
-    pub fn new(entropy: impl Into<String>, label: impl Into<String>) -> Self {
+    ///
+    /// Takes `impl Into<Zeroizing<String>>` rather than `impl Into<String>` so a
+    /// caller that already holds the entropy inside the wrapper — which
+    /// `Seeds::from_plaintext` does, from the moment it decodes (#343) — can
+    /// move it in rather than copying it back out. `zeroize`'s blanket
+    /// `From<Z> for Zeroizing<Z>` keeps a plain `String` accepted, so this
+    /// narrows nothing for existing callers; it only stops the round trip
+    /// through an unprotected `String` that a `Zeroizing` caller would otherwise
+    /// have to make.
+    pub fn new(entropy: impl Into<Zeroizing<String>>, label: impl Into<String>) -> Self {
         Self {
-            entropy: Zeroizing::new(entropy.into()),
+            entropy: entropy.into(),
             label: label.into(),
         }
     }
@@ -522,8 +583,17 @@ impl Seeds {
     /// `false` if a circle with the same entropy is already remembered
     /// (idempotent — re-joining a known circle does not duplicate it).
     pub fn add_circle(&mut self, entropy: impl Into<String>, label: impl Into<String>) -> bool {
-        let entropy = entropy.into();
-        if self.circles.iter().any(|c| c.entropy() == entropy) {
+        // Wrapped before the duplicate check, not after it (#343). That check
+        // has an early return, and on it a bare `String` holding a circle's
+        // entropy — the `cot_key` IKM, ISC-C8 — would drop with the secret still
+        // in it. Re-joining a circle already remembered is the ordinary case.
+        //
+        // The parameter stays `impl Into<String>`: what a caller held before the
+        // call is the caller's business, and narrowing it would force every one
+        // of them to build a wrapper for a value this function takes ownership
+        // of anyway.
+        let entropy = Zeroizing::new(entropy.into());
+        if self.circles.iter().any(|c| c.entropy() == entropy.as_str()) {
             return false;
         }
         self.circles.push(PersistedCircle::new(entropy, label));
@@ -876,6 +946,26 @@ impl Seeds {
         buf
     }
 
+    /// Parse a decrypted payload directly, for the zeroization witness only.
+    ///
+    /// [`Self::from_plaintext`] is private and there is no public route to it
+    /// carrying a *malformed* payload: sealing takes a `Seeds`, so a bad line
+    /// cannot be constructed through [`open`], and corrupting the ciphertext
+    /// fails the GCM tag long before the parser runs. The error paths this
+    /// exists to observe are therefore unreachable from outside the crate — and
+    /// they are exactly the paths that run when an at-rest blob is corrupt,
+    /// which is when recovery happens.
+    ///
+    /// The observation needs the pass-through allocator in
+    /// `tests/secret_zeroize_on_drop.rs`, which is its own binary, so a unit
+    /// test cannot substitute. Gated behind `testing`, enabled only by this
+    /// crate's dev-dependency on itself, exactly as
+    /// [`crate::dm::firstcontact::VerifiedFirstContact`]'s accessors are.
+    #[cfg(feature = "testing")]
+    pub fn parse_plaintext_for_witness(s: &str) -> Result<Self, BlobError> {
+        Self::from_plaintext(s)
+    }
+
     fn from_plaintext(s: &str) -> Result<Self, BlobError> {
         let mut lines = s.lines();
         let phrase = lines.next().ok_or(BlobError::InvalidPlaintext)?;
@@ -909,10 +999,14 @@ impl Seeds {
             if let Some(rest) = line.strip_prefix("circle ") {
                 let (entropy_hex, label_hex) =
                     rest.split_once(' ').ok_or(BlobError::InvalidPlaintext)?;
-                let entropy = hex::decode(entropy_hex)
-                    .ok()
-                    .and_then(|b| String::from_utf8(b).ok())
-                    .ok_or(BlobError::InvalidPlaintext)?;
+                // The entropy goes through `decode_hex_secret` and the label does
+                // not: the entropy is the `cot_key` IKM (ISC-C8) and the label is
+                // client-local display text, held in a plain `String` on
+                // `PersistedCircle` itself. Note the ordering hazard the helper
+                // closes — a malformed *label* returns below while the entropy is
+                // still live, so before #343 the secret was dropped intact by the
+                // `?` on the next line.
+                let entropy = decode_hex_secret(entropy_hex)?;
                 let label = hex::decode(label_hex)
                     .ok()
                     .and_then(|b| String::from_utf8(b).ok())
@@ -973,11 +1067,22 @@ impl Seeds {
             // malformed line is SKIPPED, not fatal (additive tolerance); an older blob
             // with no such line parses to an empty map.
             if let Some(rest) = line.strip_prefix("circle-seen ") {
+                // Same secret as the `circle` arm — this key IS a circle's
+                // entropy — so it decodes through the same helper (#343). The
+                // two fallible steps that follow the decode each dropped a bare
+                // `Vec<u8>` of the `cot_key` IKM before that.
+                //
+                // What this does NOT fix: on the success path the value becomes
+                // a plain `String` key in `circle_seen`, and `Seeds` carries no
+                // `ZeroizeOnDrop`, so the map holds the IKM in the clear for the
+                // struct's lifetime. That is a type-level change to the at-rest
+                // struct with a far wider blast radius than an error path, and
+                // it is tracked separately rather than smuggled in here (#358).
                 if let Some((entropy_hex, ms_str)) = rest.split_once(' ')
-                    && let (Ok(bytes), Ok(ms)) = (hex::decode(entropy_hex), ms_str.parse::<i64>())
-                    && let Ok(entropy) = String::from_utf8(bytes)
+                    && let (Ok(entropy), Ok(ms)) =
+                        (decode_hex_secret(entropy_hex), ms_str.parse::<i64>())
                 {
-                    circle_seen.insert(entropy, ms);
+                    circle_seen.insert(entropy.to_string(), ms);
                 }
                 continue;
             }
@@ -1338,7 +1443,14 @@ fn open_v2(
     key_bytes.zeroize();
     index_bytes.zeroize();
 
-    let mut plaintext = vec![0u8; ciphertext.len()];
+    // `Zeroizing` rather than a `plaintext.zeroize()` at the end (#343): this
+    // buffer holds the ENTIRE decrypted profile — mnemonic, every circle
+    // entropy, every share root — and two fallible steps stand between the
+    // decryption and that call. A trailing wipe runs on the success path only,
+    // so a corrupt blob (the case this path exists to survive) returned with
+    // the whole plaintext intact in freed heap. Carrying the wipe on the type
+    // covers both returns and every one added later.
+    let mut plaintext = Zeroizing::new(vec![0u8; ciphertext.len()]);
     gcm_decrypt(&aes, nonce, &suite_bytes, ciphertext, tag, &mut plaintext).map_err(
         |e| match e {
             oxicrypt_aes::ModeError::TagMismatch => BlobError::AuthenticationFailed,
@@ -1348,7 +1460,6 @@ fn open_v2(
 
     let plaintext_str = core::str::from_utf8(&plaintext).map_err(BlobError::Utf8)?;
     let seeds = Seeds::from_plaintext(plaintext_str)?;
-    plaintext.zeroize();
     Ok(Opened {
         seeds,
         suite_id,
@@ -1382,7 +1493,14 @@ fn open_v1(
     key_bytes.zeroize();
     index_bytes.zeroize();
 
-    let mut plaintext = vec![0u8; ciphertext.len()];
+    // `Zeroizing` rather than a `plaintext.zeroize()` at the end (#343): this
+    // buffer holds the ENTIRE decrypted profile — mnemonic, every circle
+    // entropy, every share root — and two fallible steps stand between the
+    // decryption and that call. A trailing wipe runs on the success path only,
+    // so a corrupt blob (the case this path exists to survive) returned with
+    // the whole plaintext intact in freed heap. Carrying the wipe on the type
+    // covers both returns and every one added later.
+    let mut plaintext = Zeroizing::new(vec![0u8; ciphertext.len()]);
     // v1 used empty AAD — preserve that contract or M2 blobs fail to open.
     gcm_decrypt(&aes, nonce, b"", ciphertext, tag, &mut plaintext).map_err(|e| match e {
         oxicrypt_aes::ModeError::TagMismatch => BlobError::AuthenticationFailed,
@@ -1391,7 +1509,6 @@ fn open_v1(
 
     let plaintext_str = core::str::from_utf8(&plaintext).map_err(BlobError::Utf8)?;
     let seeds = Seeds::from_plaintext(plaintext_str)?;
-    plaintext.zeroize();
     // V1 predates the registry; the only suite that existed is 0x0001.
     let implicit = SuiteId::try_new(V1_IMPLICIT_SUITE_RAW)
         .expect("V1_IMPLICIT_SUITE_RAW is a valid non-sentinel id");
@@ -2318,7 +2435,7 @@ mod tests {
     /// it would stay green if this rendering leaked the phrase.
     #[test]
     fn debug_redacts_persisted_circle_entropy_and_keeps_the_label() {
-        let c = PersistedCircle::new("correct horse battery staple", "Book Club");
+        let c = PersistedCircle::new("correct horse battery staple".to_string(), "Book Club");
         let dbg = format!("{c:?}");
         assert_eq!(
             dbg,
@@ -2342,7 +2459,7 @@ mod tests {
     /// the behaviour regardless of how the impl is spelled.
     #[test]
     fn cloning_a_persisted_circle_preserves_both_fields() {
-        let c = PersistedCircle::new("correct horse battery staple", "Book Club");
+        let c = PersistedCircle::new("correct horse battery staple".to_string(), "Book Club");
         let copy = c.clone();
         assert_eq!(copy.entropy(), "correct horse battery staple");
         assert_eq!(copy.label, "Book Club");
