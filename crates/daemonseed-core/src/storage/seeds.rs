@@ -54,6 +54,7 @@
 //! the receiver cannot be tricked into running a v2 blob under the wrong
 //! suite's primitives without the AEAD detecting it.
 
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -252,7 +253,114 @@ pub struct Seeds {
     /// (a genuinely newer message still does). Advanced via [`Self::set_circle_seen`]
     /// (monotonic) / read via [`Self::circle_seen`]. Client-local only (ISC-A-C3) —
     /// persistence of read-state, not of message content.
-    pub circle_seen: BTreeMap<String, i64>,
+    ///
+    /// Private, and keyed on [`CircleSeenKey`] rather than `String`, because the
+    /// key IS a secret — see that type. Privacy is what makes the wrapper
+    /// load-bearing instead of decorative: a `pub` map would let any caller lift
+    /// an owned `String` copy of the phrase straight back out of a key, and
+    /// bypass [`Self::set_circle_seen`]'s monotonic guard on the way.
+    circle_seen: BTreeMap<CircleSeenKey, i64>,
+}
+
+/// The key of [`Seeds::circle_seen`] — a circle's canonicalized entropy, which is
+/// the very same `cot_key` IKM (ISC-C8) that [`PersistedCircle`] holds in a
+/// private [`Zeroizing`] `String`.
+///
+/// A newtype because **the key of a map is a place a secret can hide**. Before
+/// this type the identical value was protected in one field of [`Seeds`] and held
+/// in the clear in another, released unwiped on every drop and copied unwiped by
+/// every `Clone` (#358).
+///
+/// ## Why not a struct-level derive, or a `Zeroizing` key
+///
+/// Both are the obvious shapes, and neither compiles against `zeroize` 1.8:
+///
+/// - `#[derive(Zeroize, ZeroizeOnDrop)]` on [`Seeds`] cannot reach a map at all,
+///   and does not stop there: **eight of that struct's ten fields have no
+///   `Zeroize` impl**, and the crate defines no manual ones. Four are the
+///   collection shapes the crate has no impl for (`muted`, `hidden_shares`,
+///   `announce_seen`, `circle_seen`); the other four are types that simply do not
+///   derive it — `mnemonic` (`Clone` only), `counters`, and `shares` / `published`
+///   whose element structs derive `Debug, Clone, PartialEq, Eq`. Only
+///   `display_name` and `circles` would satisfy a derive. Making it build would
+///   take `#[zeroize(skip)]` on eight of ten, which manufactures exactly the false
+///   safety the derive exists to prevent: the next secret-bearing field would land
+///   in a struct where skipping is already the house habit. [`PersistedCircle`]'s
+///   derive works because both of its fields are `Zeroize`-able; [`Seeds`] is not
+///   that shape.
+/// - `BTreeMap<Zeroizing<String>, i64>` cannot compile either: a `BTreeMap` key
+///   must be `Ord`, and `Zeroizing` does not implement it. (It implements plenty
+///   else — `Clone`, `Deref`, `AsRef`, `Zeroize`, `ZeroizeOnDrop`, `Drop`, and
+///   derives `Debug`, `Default`, `Eq`, `PartialEq` — but `Ord` is not among them.)
+///
+/// ## What wipes it
+///
+/// The `Drop` on the inner [`Zeroizing`], not a derive on any struct. Dropping the
+/// map drops each key, which wipes the phrase — so the guarantee covers the
+/// ordinary drop of a [`Seeds`], every early return of [`Seeds::from_plaintext`]
+/// taken after a `circle-seen` line was read, and every clone, without [`Seeds`]
+/// needing a derive it cannot have. `ZeroizeOnDrop` is derived alongside so the
+/// property is legible to a reader and to the compile-time bound assertion in
+/// [`crate::secret_seed`], and so a containing struct that later grows a derive
+/// finds this field already satisfying it.
+///
+/// ## Why `Ord` and `Debug` are written out
+///
+/// `Ord`/`PartialOrd` cannot be derived through [`Zeroizing`], which implements
+/// neither; delegating to the inner `str` is also what makes the `Borrow<str>`
+/// impl below sound, since `Borrow` requires the borrowed and owned orderings to
+/// agree. That impl is what lets [`Seeds::circle_seen`] look up by `&str` without
+/// allocating a key to throw away.
+///
+/// `Debug` is written out because the derived one would print the phrase:
+/// [`Zeroizing`] derives `Debug` and forwards to the inner value, so a secret
+/// newtype that derives `Debug` publishes its secret to every log line and panic
+/// message that touches it.
+#[derive(Clone, PartialEq, Eq, Zeroize, zeroize::ZeroizeOnDrop)]
+pub(crate) struct CircleSeenKey(Zeroizing<String>);
+
+impl CircleSeenKey {
+    /// Wrap a canonicalized circle entropy.
+    ///
+    /// Takes the [`Zeroizing`] wrapper rather than a bare `String` so a caller
+    /// that already holds one — which [`Seeds::from_plaintext`] does, from the
+    /// moment `decode_hex_secret` returns (#343) — moves it in instead of copying
+    /// the phrase back out into an unprotected buffer first. That copy was the
+    /// escape this type closes, and it is easier to not write than to remember.
+    fn new(entropy: Zeroizing<String>) -> Self {
+        Self(entropy)
+    }
+
+    /// Borrow the phrase. A borrow, never a copy: an owned `String` taken from
+    /// here has escaped the wrapper and will release its buffer with the phrase
+    /// still in it.
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Borrow<str> for CircleSeenKey {
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl Ord for CircleSeenKey {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.as_str().cmp(other.as_str())
+    }
+}
+
+impl PartialOrd for CircleSeenKey {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl core::fmt::Debug for CircleSeenKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("CircleSeenKey(<redacted>)")
+    }
 }
 
 /// One remembered local share root in the at-rest blob (ISC-C21 persistence,
@@ -727,19 +835,54 @@ impl Seeds {
     /// The persisted read high-water (#107) for the circle keyed by canonicalized
     /// `entropy` — the newest `sent_unix_ms` the user has seen there, or `None` if
     /// the circle has no recorded mark yet.
+    ///
+    /// Takes `&str` and allocates nothing: the key type's `Borrow<str>` is what
+    /// lets the map be queried without building a key to discard.
     pub fn circle_seen(&self, entropy: &str) -> Option<i64> {
         self.circle_seen.get(entropy).copied()
+    }
+
+    /// The live bytes of the first `circle_seen` key, for the behavioural zeroize
+    /// witness in `tests/secret_zeroize_on_drop.rs`.
+    ///
+    /// The map is private (#358) and that harness must live outside this crate —
+    /// it installs a `GlobalAlloc` hook and `daemonseed-core` is
+    /// `#![forbid(unsafe_code)]` — so the witness needs a way in, exactly as
+    /// `VerifiedFirstContact` does for the same reason (#265). Gated so no
+    /// consumer of the crate can reach it.
+    ///
+    /// A borrow of the key's own buffer, which is what makes it usable as a watch
+    /// address: a copy would be a different allocation and would prove nothing
+    /// about the one the map releases.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn circle_seen_first_key_bytes_for_test(&self) -> &[u8] {
+        self.circle_seen
+            .keys()
+            .next()
+            .expect("the caller inserts one entry before watching it")
+            .as_str()
+            .as_bytes()
     }
 
     /// Advance the circle read high-water (#107) for `entropy` to `ms`. Monotonic —
     /// only moves forward, so an out-of-order/older write never lowers the mark.
     /// Returns `true` if the stored value advanced, `false` if unchanged.
+    ///
+    /// The phrase is wrapped before anything else happens to it, and the lookup
+    /// borrows rather than building a key to throw away — see the key type.
+    /// `Zeroizing::new` moves the `String`, so no second copy of the buffer is
+    /// made; the caller's own `&str`, if that is what it passed, remains the
+    /// caller's to manage.
     pub fn set_circle_seen(&mut self, entropy: impl Into<String>, ms: i64) -> bool {
-        let entropy = entropy.into();
-        if self.circle_seen.get(&entropy).is_some_and(|cur| *cur >= ms) {
+        let entropy = Zeroizing::new(entropy.into());
+        if self
+            .circle_seen
+            .get(entropy.as_str())
+            .is_some_and(|cur| *cur >= ms)
+        {
             return false;
         }
-        self.circle_seen.insert(entropy, ms);
+        self.circle_seen.insert(CircleSeenKey::new(entropy), ms);
         true
     }
 
@@ -799,7 +942,7 @@ impl Seeds {
             cap += line::ANNOUNCE_SEEN.len() + server_id.len() + 1 + marker.len();
         }
         for entropy in self.circle_seen.keys() {
-            cap += line::CIRCLE_SEEN.len() + 2 * entropy.len() + 1 + MAX_I64_DIGITS;
+            cap += line::CIRCLE_SEEN.len() + 2 * entropy.as_str().len() + 1 + MAX_I64_DIGITS;
         }
         cap
     }
@@ -917,7 +1060,7 @@ impl Seeds {
             // Additive — an older blob with no such line parses to an empty map.
             for (entropy, ms) in &self.circle_seen {
                 s.push_str(line::CIRCLE_SEEN);
-                push_hex(s, entropy.as_bytes());
+                push_hex(s, entropy.as_str().as_bytes());
                 s.push(' ');
                 let _ = write!(s, "{ms}");
             }
@@ -978,7 +1121,7 @@ impl Seeds {
         let mut shares: Vec<PersistedShare> = Vec::new();
         let mut published: Vec<PublishedShare> = Vec::new();
         let mut announce_seen: BTreeMap<String, String> = BTreeMap::new();
-        let mut circle_seen: BTreeMap<String, i64> = BTreeMap::new();
+        let mut circle_seen: BTreeMap<CircleSeenKey, i64> = BTreeMap::new();
         for line in lines {
             // Mute / hide directives take the entire rest of the line as the
             // handle so a display name containing spaces is never truncated.
@@ -1072,17 +1215,16 @@ impl Seeds {
                 // two fallible steps that follow the decode each dropped a bare
                 // `Vec<u8>` of the `cot_key` IKM before that.
                 //
-                // What this does NOT fix: on the success path the value becomes
-                // a plain `String` key in `circle_seen`, and `Seeds` carries no
-                // `ZeroizeOnDrop`, so the map holds the IKM in the clear for the
-                // struct's lifetime. That is a type-level change to the at-rest
-                // struct with a far wider blast radius than an error path, and
-                // it is tracked separately rather than smuggled in here (#358).
+                // The success path is closed too (#358): the decoded value moves
+                // into a `CircleSeenKey` still inside the `Zeroizing` wrapper
+                // `decode_hex_secret` returned it in, so the phrase is never
+                // copied back out into an unprotected buffer and the map holds no
+                // cleartext IKM for the struct's lifetime.
                 if let Some((entropy_hex, ms_str)) = rest.split_once(' ')
                     && let (Ok(entropy), Ok(ms)) =
                         (decode_hex_secret(entropy_hex), ms_str.parse::<i64>())
                 {
-                    circle_seen.insert(entropy.to_string(), ms);
+                    circle_seen.insert(CircleSeenKey::new(entropy), ms);
                 }
                 continue;
             }
@@ -1980,6 +2122,93 @@ mod tests {
             Some("feedface")
         );
         assert_eq!(recovered.announce_seen("unknown#relay"), None);
+    }
+
+    /// The `circle_seen` map key renders a redacted `Debug`.
+    ///
+    /// `CircleSeenKey`'s `Debug` is hand-written, and this is what stops it being
+    /// "simplified" back to a derive. The failure that would cause is total:
+    /// `Zeroizing` derives `Debug` and forwards to the inner value, so a derived
+    /// `Debug` on the newtype prints the circle phrase — the `cot_key` IKM (ISC-C8)
+    /// — into every log line and panic message that formats a key.
+    ///
+    /// Exact-string equality plus an explicit control that the phrase is absent,
+    /// matching the house pattern in `secret_seed.rs`: a substring check for
+    /// `<redacted>` alone would pass on `CircleSeenKey(<redacted>, "correct …")`.
+    #[test]
+    fn circle_seen_key_renders_a_redacted_debug() {
+        const PHRASE: &str = "correct horse battery staple";
+        let key = CircleSeenKey::new(Zeroizing::new(PHRASE.to_owned()));
+
+        let rendered = format!("{key:?}");
+        assert_eq!(rendered, "CircleSeenKey(<redacted>)");
+        assert!(
+            !rendered.contains(PHRASE),
+            "the map key's Debug leaks the circle phrase: {rendered}"
+        );
+    }
+
+    /// The key orders and compares by its phrase, which is what `Borrow<str>`
+    /// requires and what the `&str` lookup on [`Seeds::circle_seen`] relies on.
+    ///
+    /// `Borrow`'s contract is that the borrowed and owned forms agree on `Eq` and
+    /// `Ord`. Nothing enforces that at compile time, so a hand-written `Ord` that
+    /// drifted — comparing by length, say — would leave every lookup silently
+    /// missing while the whole suite stayed green. This is the assertion that
+    /// fails instead.
+    #[test]
+    fn circle_seen_key_orders_and_borrows_as_its_phrase() {
+        fn key(s: &str) -> CircleSeenKey {
+            CircleSeenKey::new(Zeroizing::new(s.to_owned()))
+        }
+
+        // Every pair that must agree with `str`'s own ordering, chosen so that no
+        // single shortcut survives all of them. `alpha`/`alphax` share a prefix
+        // and differ only past byte 4, which is what kills a first-byte compare;
+        // `Alpha`/`alpha` differ only in case, which kills a case-folding one;
+        // `alphabet`/`beta` is longer-but-earlier, which kills a length compare.
+        let pairs = [
+            ("alpha", "beta"),
+            ("alpha", "alphax"),
+            ("alphax", "alpha"),
+            ("Alpha", "alpha"),
+            ("alphabet", "beta"),
+            ("alpha", "alpha"),
+            ("", "alpha"),
+        ];
+        for (l, r) in pairs {
+            assert_eq!(
+                key(l).cmp(&key(r)),
+                l.cmp(r),
+                "ordering of {l:?} vs {r:?} disagrees with str"
+            );
+            // `Borrow`'s actual contract: `Eq` and `Ord` must agree. `PartialEq` is
+            // derived through `Zeroizing` while `Ord` is hand-written, so nothing
+            // but this assertion holds the two together.
+            assert_eq!(
+                key(l).cmp(&key(r)) == core::cmp::Ordering::Equal,
+                key(l) == key(r),
+                "Eq and Ord disagree on {l:?} vs {r:?}, which breaks Borrow<str>"
+            );
+        }
+
+        // The `Borrow` view is the same string the `Ord` compares.
+        assert_eq!(
+            <CircleSeenKey as Borrow<str>>::borrow(&key("alpha")),
+            "alpha"
+        );
+
+        // And the property that actually matters, exercised through the real map:
+        // two prefix-sharing keys must be distinct entries, each retrievable by
+        // `&str`. A first-byte or case-folding `Ord` collides them here.
+        let mut seeds = Seeds::new(Mnemonic::generate().unwrap());
+        assert!(seeds.set_circle_seen("alpha", 1));
+        assert!(seeds.set_circle_seen("alphax", 2));
+        assert!(seeds.set_circle_seen("Alpha", 3));
+        assert_eq!(seeds.circle_seen("alpha"), Some(1));
+        assert_eq!(seeds.circle_seen("alphax"), Some(2));
+        assert_eq!(seeds.circle_seen("Alpha"), Some(3));
+        assert_eq!(seeds.circle_seen("alph"), None);
     }
 
     #[test]

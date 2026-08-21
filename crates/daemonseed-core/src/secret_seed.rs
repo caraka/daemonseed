@@ -432,6 +432,13 @@ mod tests {
 
         assert_zeroize_on_drop::<crate::storage::seeds::PersistedCircle>();
         assert_zeroize_on_drop::<crate::dm::firstcontact::VerifiedFirstContact>();
+        // Not a struct with secret *fields* but a secret used as a map KEY, which
+        // is the shape neither the macro nor a containing derive can reach: no
+        // `Zeroize` impl exists for `BTreeMap`, so `Seeds` cannot carry a derive
+        // that would cover it (#358). Its wipe is the inner `Zeroizing`'s own
+        // `Drop`, and this bound is what states the property survives a future
+        // author swapping the wrapper out.
+        assert_zeroize_on_drop::<crate::storage::seeds::CircleSeenKey>();
     }
 
     /// Every arm renders a redacted `Debug`.

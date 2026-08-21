@@ -83,7 +83,7 @@ use daemonseed_core::dm::resume::{
 use daemonseed_core::identity::keys::{Identity, derive_identity_keys};
 use daemonseed_core::identity::mnemonic::Mnemonic;
 use daemonseed_core::public_room::derive_room_veilid_owner_seed;
-use daemonseed_core::storage::seeds::PersistedCircle;
+use daemonseed_core::storage::seeds::{PersistedCircle, Seeds};
 use oxicrypt_ml_dsa::{PK_LEN, SK_LEN as ML_DSA_SK_LEN};
 use oxicrypt_ml_kem::{DK_LEN, EK_LEN};
 use zeroize::Zeroizing;
@@ -123,6 +123,23 @@ const CIRCLE_PHRASE_CAP: usize = 96;
 /// block-size control cannot be satisfied by the wrong allocation.
 const CIRCLE_LABEL_TEXT: &str = "the label is not a secret";
 const CIRCLE_LABEL_CAP: usize = 72;
+
+/// The circle phrase the `Seeds::circle_seen` key case stores, and the capacity
+/// its buffer is built with.
+///
+/// The capacity carries deliberate slack so the block-size control has something
+/// to assert: a production copy or reallocation collapses it to an exact fit and
+/// the case notices. It is **not** here for distinctness from the other watched
+/// capacities (96, 72, 128) — that reasoning belongs to the `ARM_SIZE`-armed cases
+/// and this one is armed by address, so a same-sized allocation elsewhere cannot
+/// be mistaken for it.
+///
+/// The phrase text differs from `PersistedCircle`'s because both hold the same
+/// *kind* of secret, and a snapshot matching the wrong one would otherwise read as
+/// a pass.
+const CIRCLE_SEEN_PHRASE: &str = "a different phrase for the read high-water key";
+const CIRCLE_SEEN_PHRASE_LEN: usize = 46;
+const CIRCLE_SEEN_KEY_CAP: usize = 80;
 
 /// The decrypted message the `VerifiedFirstContact::body` case builds, and the
 /// length and capacity of its buffer. They differ for the same reason the circle
@@ -884,6 +901,78 @@ fn secrets_outside_the_macro_zero_themselves_before_their_memory_is_released() {
         (0, ML_DSA_PK_BLOCK),
         || verified_first_contact("the body is not a secret".to_owned()),
         |v| at(v.pk_lt()),
+    );
+}
+
+/// A secret held as a map **key** clears itself before its storage is released.
+///
+/// The shape neither the macro nor a containing derive can reach, and the reason
+/// it needs its own case rather than a line in the sweep above: `zeroize` 1.8 has
+/// no `Zeroize` impl for `BTreeMap`, so `Seeds` cannot carry a
+/// `#[derive(ZeroizeOnDrop)]` that would cover this the way `PersistedCircle`'s
+/// covers `entropy` and `label`. The wipe here comes from the key newtype's own
+/// inner `Zeroizing`, reached when the map drops its keys (#358).
+///
+/// **What this case proves, stated narrowly, because the obvious stronger claim
+/// is false.** It proves that a secret held as a map *key* holds zeros at the
+/// instant its storage is released. It does **not** isolate the `Zeroizing`
+/// wrapper as the cause.
+///
+/// The wrapper is the second of two independent wipes: `CircleSeenKey`'s own
+/// `#[derive(Zeroize, ZeroizeOnDrop)]` clears a plain `String` field over its full
+/// capacity without any help. The `PersistedCircle::label` case is the in-repo
+/// control for that — a plain `String`, watched by this same witness, asserted
+/// zeroed. So swapping this key's `Zeroizing<String>` for a `String` leaves the
+/// wipe intact.
+///
+/// Mutating the wrapper away *does* turn this case red, but by the block-size
+/// control rather than by an unwiped byte: copying out of `Zeroizing` goes through
+/// `Vec::to_vec`, which allocates exact-fit, so the capacity collapses from
+/// `CIRCLE_SEEN_KEY_CAP` to the phrase length and the freed block is the wrong
+/// size. That red is a capacity artifact, not a wipe signal — worth knowing before
+/// anyone reads it as one.
+///
+/// The mutation that *would* isolate the wipe — dropping the derives while moving
+/// the `String` in, so capacity survives and nothing clears it — is already killed
+/// at compile time by `assert_zeroize_on_drop::<CircleSeenKey>()` in
+/// `secret_seed.rs`. Breadth there, depth here, exactly as the file header says.
+///
+/// Watched as its own heap block at offset 0, sized by the string's CAPACITY, the
+/// same route `PersistedCircle::entropy` takes. Note the construction below hands
+/// `set_circle_seen` an owned `String`, while production reaches it from the GUI
+/// with a `&str` — that branch allocates exact-fit, so it would give this case no
+/// capacity slack to assert on. The wipe is identical either way, because it is
+/// the key's own drop that performs it; the owned form is used here only so the
+/// block-size control has something to say.
+///
+/// Two further limits, since this file's header asks for them to be explicit: only
+/// the live `len` bytes are snapshotted, so spare capacity past the phrase is never
+/// read; and nothing here reaches copies made before the drop, or registers and
+/// stack spills. The `Clone` half of #358 is covered by construction rather than
+/// by this case — a clone's key is another `Zeroizing` with its own wiping drop.
+#[test]
+fn a_secret_used_as_a_map_key_zeroes_itself_before_its_memory_is_released() {
+    init();
+
+    assert_zeroed_when_freed(
+        "Seeds::circle_seen key",
+        (0, CIRCLE_SEEN_KEY_CAP),
+        || {
+            let mut phrase = String::with_capacity(CIRCLE_SEEN_KEY_CAP);
+            phrase.push_str(CIRCLE_SEEN_PHRASE);
+            assert_eq!(
+                phrase.len(),
+                CIRCLE_SEEN_PHRASE_LEN,
+                "the phrase constant and its length have drifted apart"
+            );
+            let mut seeds = Seeds::new(Mnemonic::generate().expect("generate a mnemonic"));
+            assert!(
+                seeds.set_circle_seen(phrase, 1),
+                "the entry must actually be inserted, or the watch has no subject"
+            );
+            seeds
+        },
+        |s| at(s.circle_seen_first_key_bytes_for_test()),
     );
 }
 

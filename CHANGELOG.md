@@ -133,6 +133,12 @@ work lives in the project lead's vault manifest, not here.
 
 ### Fixed
 
+- Corrected the at-rest circle read high-water map, which held a circle's `cot_key` IKM in the
+  clear as a `BTreeMap` key while `PersistedCircle` protected the identical value. The key is
+  `CircleSeenKey`, a newtype over `Zeroizing<String>`, so the phrase is wiped on an ordinary
+  drop, on every early return of `from_plaintext` taken after a `circle-seen` line was read,
+  and on every clone. (#358)
+
 - Corrected the at-rest read path, which left decoded secrets in freed memory on its error
   paths: a circle's entropy in `Seeds::from_plaintext` and `Seeds::add_circle`, and the whole
   decrypted payload in `open_v2` and `open_v1`. Every one is now held in `Zeroizing` from the
