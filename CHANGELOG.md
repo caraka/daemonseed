@@ -133,6 +133,11 @@ work lives in the project lead's vault manifest, not here.
 
 ### Fixed
 
+- Corrected the keepalive and heartbeat interval coverage, which asserted band membership and
+  variation but not band width, so a draw collapsed to a tenth of its span passed.
+  `interval_in_band` is the single definition for both and takes its entropy source as a
+  parameter. (#364)
+
 - Corrected the graceful close in both front ends, which never ran the WB-3 I7 write-scheduler
   flush — `VeilidNetHandle::shutdown` had no caller anywhere in the tree — and never emitted a
   leave at all from the TUI. A departed member dropped off peers' rosters only at the ~600s

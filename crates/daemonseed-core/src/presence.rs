@@ -110,13 +110,44 @@ pub const REAP_RESUME_GRACE: Duration = Duration::from_secs(220);
 /// relationship (WB-3.I6). Drawn from the OS CSPRNG; an entropy failure falls back
 /// to the midpoint (a keepalive is liveness, not a key — the next draw recovers).
 pub fn next_keepalive_interval() -> Duration {
-    let min_ms = KEEPALIVE_INTERVAL_MIN.as_millis() as u64;
-    let max_ms = KEEPALIVE_INTERVAL_MAX.as_millis() as u64;
+    interval_in_band(
+        KEEPALIVE_INTERVAL_MIN,
+        KEEPALIVE_INTERVAL_MAX,
+        crate::jitter::os_fill,
+    )
+}
+
+/// Draw uniformly in `[min, max]` from `fill`, degrading to the band **midpoint**
+/// if the source fails.
+///
+/// One definition for both interval draws. They were byte-identical apart from
+/// their constants, and a second copy of jitter arithmetic is drift waiting to
+/// happen — the same argument [`crate::jitter::apply_jitter`] makes for the
+/// exponential path.
+///
+/// `fill` is a parameter rather than a direct `getrandom` call for the reason
+/// [`crate::jitter::unit_or_zero`] takes one: the degrade is the single branch here
+/// that cannot be provoked in production on demand, and it is the branch whose
+/// consequence is a timing signature. With the seam a fixture pins the midpoint,
+/// both band ends, and — the assertion this function exists to make possible — that
+/// the full span is reachable rather than some fraction of it (#364).
+pub(crate) fn interval_in_band(
+    min: Duration,
+    max: Duration,
+    fill: impl FnOnce(&mut [u8; 8]) -> Result<(), ()>,
+) -> Duration {
+    debug_assert!(
+        max >= min,
+        "interval band {min:?}..{max:?} is inverted — the subtraction below would wrap \
+         in release and hand the caller an interval far outside any band it declared"
+    );
+    let min_ms = min.as_millis() as u64;
+    let max_ms = max.as_millis() as u64;
     let span = max_ms - min_ms; // inclusive upper bound below
     let mut buf = [0u8; 8];
-    let offset = match getrandom::fill(&mut buf) {
+    let offset = match fill(&mut buf) {
         Ok(()) => u64::from_le_bytes(buf) % (span + 1),
-        Err(_) => span / 2,
+        Err(()) => span / 2,
     };
     Duration::from_millis(min_ms + offset)
 }
@@ -161,15 +192,11 @@ pub fn beacon_is_fresh(sent_unix_ms: i64, now_unix_ms: i64) -> bool {
 /// panicking (a heartbeat is liveness, not a key — a non-random interval leaks
 /// nothing and the next draw recovers).
 pub fn next_heartbeat_interval() -> Duration {
-    let min_ms = HEARTBEAT_INTERVAL_MIN.as_millis() as u64;
-    let max_ms = HEARTBEAT_INTERVAL_MAX.as_millis() as u64;
-    let span = max_ms - min_ms; // inclusive upper bound below
-    let mut buf = [0u8; 8];
-    let offset = match getrandom::fill(&mut buf) {
-        Ok(()) => u64::from_le_bytes(buf) % (span + 1),
-        Err(_) => span / 2,
-    };
-    Duration::from_millis(min_ms + offset)
+    interval_in_band(
+        HEARTBEAT_INTERVAL_MIN,
+        HEARTBEAT_INTERVAL_MAX,
+        crate::jitter::os_fill,
+    )
 }
 
 /// One live member — a roster row built from a verified
@@ -741,6 +768,185 @@ mod tests {
         assert!(
             seen.len() > 1,
             "keepalive jitter produced a constant interval"
+        );
+    }
+
+    /// The band's FULL span is reachable at both ends, pinned exactly (#364).
+    ///
+    /// The test above cannot see band width: it asserts membership of
+    /// `[MIN, MAX]` and that more than one value occurred, and a draw collapsed to
+    /// `% (span / 10 + 1)` satisfies both — every interval lands in the first tenth,
+    /// still inside the band, still varying, suite still green. A narrowed band is a
+    /// tighter timing signature and a tighter cross-client phase relationship, which
+    /// is the exact property WB-3.I6 jitter exists to destroy.
+    ///
+    /// Deterministic rather than statistical: a fill of `span` must map to exactly
+    /// `MAX`. Under the tenth-collapse it maps to `span % (span / 10 + 1)`, a value
+    /// nowhere near the top of the band, so the mutation fails here on every run
+    /// rather than with some probability.
+    #[test]
+    fn interval_band_ends_are_exactly_reachable() {
+        for (min, max, name) in [
+            (KEEPALIVE_INTERVAL_MIN, KEEPALIVE_INTERVAL_MAX, "keepalive"),
+            (HEARTBEAT_INTERVAL_MIN, HEARTBEAT_INTERVAL_MAX, "heartbeat"),
+        ] {
+            let span = (max.as_millis() - min.as_millis()) as u64;
+            let at = |v: u64| {
+                interval_in_band(min, max, move |buf| {
+                    *buf = v.to_le_bytes();
+                    Ok(())
+                })
+            };
+            assert_eq!(
+                at(0),
+                min,
+                "{name}: a zero draw must land on the band floor"
+            );
+            assert_eq!(
+                at(span),
+                max,
+                "{name}: a draw of the full span must reach the band ceiling — if it \
+                 does not, the reachable band is narrower than the declared one and \
+                 the emission carries a tighter timing signature than intended"
+            );
+            assert_eq!(
+                at(span / 2),
+                min + Duration::from_millis(span / 2),
+                "{name}: the midpoint draw must land on the midpoint"
+            );
+        }
+    }
+
+    /// The entropy-failure degrade lands on the band midpoint, not on an end (#364).
+    ///
+    /// Unreachable before the draw took its fill as a parameter — the same state
+    /// `jitter.rs` was in before `839dc90`. A degrade to a band END would put every
+    /// client that lost entropy onto the same extreme period, which is a stronger
+    /// correlation signal than the fixed period the jitter replaced.
+    #[test]
+    fn an_entropy_failure_degrades_to_the_band_midpoint() {
+        for (min, max, name) in [
+            (KEEPALIVE_INTERVAL_MIN, KEEPALIVE_INTERVAL_MAX, "keepalive"),
+            (HEARTBEAT_INTERVAL_MIN, HEARTBEAT_INTERVAL_MAX, "heartbeat"),
+        ] {
+            let span = (max.as_millis() - min.as_millis()) as u64;
+            let d = interval_in_band(min, max, |_| Err(()));
+            assert_eq!(
+                d,
+                min + Duration::from_millis(span / 2),
+                "{name}: an entropy failure must degrade to the midpoint"
+            );
+            assert!(
+                d > min && d < max,
+                "{name}: the degrade must not sit on an end"
+            );
+        }
+    }
+
+    /// Each public draw is wired to its OWN constants (#364).
+    ///
+    /// Both functions now route through one helper, so nothing else in the suite
+    /// would notice if they were handed the same pair. The bands do not overlap —
+    /// keepalive is `[180, 220] s`, heartbeat `[10, 15] s` — so membership alone
+    /// separates them.
+    #[test]
+    fn each_interval_draw_uses_its_own_band() {
+        for _ in 0..32 {
+            let k = next_keepalive_interval();
+            assert!(
+                k >= KEEPALIVE_INTERVAL_MIN && k <= KEEPALIVE_INTERVAL_MAX,
+                "keepalive draw {k:?} outside its own band"
+            );
+            let h = next_heartbeat_interval();
+            assert!(
+                h >= HEARTBEAT_INTERVAL_MIN && h <= HEARTBEAT_INTERVAL_MAX,
+                "heartbeat draw {h:?} outside its own band"
+            );
+        }
+    }
+
+    /// The PRODUCTION source spans the band, in both halves and with real
+    /// population (#364).
+    ///
+    /// The deterministic tests above pin the arithmetic and would still pass if
+    /// `os_fill` were replaced by something that returned a narrow range. This one
+    /// covers the source. The floors are stated against the band's real scale rather
+    /// than against zero: `seen.len() > 1` "separates SOME spread from NO spread and
+    /// cannot see band WIDTH" (`dm/outbox.rs`), and a modulo draw quantised to a
+    /// handful of values would clear a spread floor alone, which is why population is
+    /// asserted too.
+    ///
+    /// Every floor here is derived from the band rather than picked. Over `DRAWS`
+    /// samples on a 40001 ms band: the chance of missing a half is `2·2^-255`; the
+    /// chance the observed range covers under three quarters is `≈ 1e-30`; and the
+    /// expected number of distinct values is `≈ 1023` against a floor of 800, since
+    /// the expected collisions are `C(1024,2)/40001 ≈ 13`.
+    ///
+    /// **Range and cardinality together are still not uniformity**, which is why the
+    /// upper-third share is asserted separately below — a draw can span the whole
+    /// band with a thousand distinct values and still be twice as dense in its lower
+    /// half.
+    #[test]
+    fn the_production_keepalive_draw_spans_its_band() {
+        const DRAWS: usize = 1024;
+        let span_ms =
+            (KEEPALIVE_INTERVAL_MAX.as_millis() - KEEPALIVE_INTERVAL_MIN.as_millis()) as u64;
+        let mid = KEEPALIVE_INTERVAL_MIN + Duration::from_millis(span_ms / 2);
+
+        let top_third = KEEPALIVE_INTERVAL_MIN + Duration::from_millis(span_ms * 2 / 3);
+
+        let mut seen = std::collections::HashSet::new();
+        let (mut lower, mut upper, mut in_top_third) = (0usize, 0usize, 0usize);
+        let (mut lo, mut hi) = (KEEPALIVE_INTERVAL_MAX, KEEPALIVE_INTERVAL_MIN);
+        for _ in 0..DRAWS {
+            let d = next_keepalive_interval();
+            seen.insert(d.as_millis());
+            if d < mid {
+                lower += 1;
+            } else {
+                upper += 1;
+            }
+            if d >= top_third {
+                in_top_third += 1;
+            }
+            lo = lo.min(d);
+            hi = hi.max(d);
+        }
+
+        assert!(
+            lower > 0 && upper > 0,
+            "every one of {DRAWS} draws fell in one half of the band \
+             (lower={lower}, upper={upper}) — the draw is confined, not uniform"
+        );
+        // Three quarters of the span is the floor: a uniform draw covers ~99.8% over
+        // 1024 samples, and the tenth-collapse mutation leaves 10%.
+        let observed = (hi - lo).as_millis() as u64;
+        assert!(
+            observed * 4 >= span_ms * 3,
+            "observed spread {observed} ms covers less than three quarters of the \
+             {span_ms} ms band — the reachable band is narrower than the declared one"
+        );
+        // UNIFORMITY, which range and cardinality cannot see. A modulo over a source
+        // narrower than the band folds twice onto the bottom and once onto the top, so
+        // the band is fully spanned and richly populated while the lower part carries
+        // double the density. Truncating the entropy read to `u16` does exactly this:
+        // the top third's share falls from 33.3% to 20.3%, while the two assertions
+        // above stay green. Floor at 27% is ~4σ under uniform and ~4σ over that
+        // mutation, taking σ ≈ 1.5% at this sample size.
+        assert!(
+            in_top_third * 100 >= DRAWS * 27,
+            "only {in_top_third} of {DRAWS} draws landed in the band's upper third \
+             ({:.1}%, uniform is 33.3%) — the draw spans its band but is denser at the \
+             bottom, which is a cadence signature even though every value is in range",
+            in_top_third as f64 * 100.0 / DRAWS as f64
+        );
+        assert!(
+            seen.len() >= 800,
+            "only {} distinct values in {DRAWS} draws — a uniform draw over {} values \
+             yields ~1023, so this is quantised onto a grid, which neither the spread \
+             floor nor the density check above can see",
+            seen.len(),
+            span_ms + 1
         );
     }
 
