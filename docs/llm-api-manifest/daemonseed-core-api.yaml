@@ -115,7 +115,7 @@ modules:
       `kdf::info::IDENTITY_PROOF_V1`, context = negotiated APP_HELLO
       version), build the canonical signed input, and sign the envelope.
       The exporter call is injected via `ChannelBindingSource` so core
-      stays rustls-free; the label + context byte-layout live HERE (one
+      stays TLS-free; the label + context byte-layout live HERE (one
       definition, both peers) to defeat the channel-binding asymmetry bug.
       Verification (`verify_envelope`) runs every check and collapses all
       failures to one opaque `VerifyRejection` (uniform close-shape,
@@ -1777,9 +1777,9 @@ types:
     module: daemonseed_core::identity_proof
     kind: trait
     description: >-
-      export_keying_material(label, context, out). Implemented by the
-      TLS-holding layer (server/cli) over rustls; MUST NOT substitute a
-      constant (A-S14/A-C18).
+      export_keying_material(label, context, out). The seam a
+      transport-terminating layer would implement; no implementor exists outside
+      the module's test fake. MUST NOT substitute a constant (A-S14/A-C18).
 
   - name: ChannelBindingError
     module: daemonseed_core::identity_proof
@@ -3969,7 +3969,7 @@ functions:
       - name: source
         type: "&impl ChannelBindingSource"
         direction: in
-        description: The TLS-holding exporter (MUST NOT substitute a constant).
+        description: The TLS exporter seam (MUST NOT substitute a constant).
       - name: negotiated_version
         type: ProtocolVersion
         direction: in

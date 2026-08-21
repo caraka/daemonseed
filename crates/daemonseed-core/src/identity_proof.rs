@@ -11,10 +11,10 @@
 //!
 //! Both peers derive a 32-byte value from the TLS 1.3 exporter (RFC 8446
 //! §7.5) with a fixed label and the negotiated APP_HELLO version as context.
-//! The exporter call needs the live rustls connection, which lives in the
-//! server / cli crates — so this module defines the [`ChannelBindingSource`]
-//! trait that the TLS-holding layer implements, while keeping the **label and
-//! context byte-layout here in core**. Centralizing the inputs is the
+//! The exporter call needs a live TLS connection, which no crate in this
+//! workspace holds — so this module defines the [`ChannelBindingSource`] trait
+//! as the seam a transport-terminating layer would implement, while keeping the
+//! **label and context byte-layout here in core**. Centralizing the inputs is the
 //! load-bearing defense against the channel-binding asymmetry bug: if client
 //! and server constructed the label/context independently, a one-byte
 //! encoding difference would silently make every cross-peer proof fail (or,
@@ -52,10 +52,12 @@ pub const CHANNEL_BINDING_LEN: usize = 32;
 
 /// A source of TLS 1.3 exporter output (RFC 8446 §7.5).
 ///
-/// Implemented by the TLS-holding layer (server / cli) over the live rustls
-/// connection (`rustls`'s `export_keying_material`). Core stays rustls-free
-/// and testable: tests supply a recording fake to assert the label + context
-/// without a real handshake.
+/// The seam a transport-terminating layer would implement over a live TLS
+/// connection (`export_keying_material`). **It has no implementor outside this
+/// module's test fake**: the v0.33.0 Veilid cutover removed the TLS stack, and
+/// no crate here holds a connection to export from. Core stays TLS-free and
+/// testable: tests supply a recording fake to assert the label + context without
+/// a real handshake.
 pub trait ChannelBindingSource {
     /// Run the TLS exporter with `label` and `context`, filling `out`
     /// completely. Implementations MUST NOT substitute a constant for the

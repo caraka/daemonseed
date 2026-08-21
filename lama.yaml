@@ -114,13 +114,13 @@ crates:
     manifest: null
 
   - name: daemonseed-integration-tests
-    purpose: "Cross-crate integration tests; re-exports the daemonseed-isc registry as isc_coverage. Per-milestone ISC-coverage exercise files under tests/m{N}_isc_coverage.rs. Subprocess-driven end-to-end gate: tests/common/gate.rs (ServerProcess + PtyTui + Gate driver with vt100-emulated screen text + BIP-39-validated mnemonic extractor + lockstep keystroke broadcast) consumed by tests/subprocess_gate.rs (4-daemon end-to-end scenario gated by `cargo xtask mvp-gate`). Wu et al. USENIX'23 GFW negative-allowlist classifier: tests/common/wire_shape.rs consumed by tests/usenix_wire_shape.rs (real TLS 1.3 handshake observation, gated by `cargo xtask wire-shape`)."
+    purpose: "Cross-crate integration tests; re-exports the daemonseed-isc registry as isc_coverage. Per-milestone ISC-coverage exercise files under tests/m{N}_isc_coverage.rs, plus per-feature ones for alpha2 client identity, portability and share download, circle detail, presence, identity rename and share-name persistence, and tests/spike_type_state.rs."
     license: AGPL-3.0-or-later
     status: active
     manifest: null
 
   - name: xtask
-    purpose: "Workspace task runner. Subcommands: gen-proto, check-proto, isc-coverage, findings-resolved, install-hooks, mvp-gate (builds release server+tui binaries then runs the 4-daemon PTY harness, propagating its pass/fail bit — 10/10 at M12 with steps 5 & 6 added), wire-shape (Wu et al. GFW classifier over a real handshake)."
+    purpose: "Workspace task runner. Subcommands: check-manifests, gen-proto, check-proto, isc-coverage, findings-resolved, install-hooks, release-gate (runs the full DoD gate — fmt, clippy across the workspace and the desktop-featured GUI, test, check-proto, isc-coverage, check-manifests — and exits non-zero naming any red step, so a tag is never cut on a red tree)."
     license: AGPL-3.0-or-later
     status: active
     manifest: null

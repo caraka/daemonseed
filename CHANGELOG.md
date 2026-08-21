@@ -133,12 +133,17 @@ work lives in the project lead's vault manifest, not here.
 
 ### Fixed
 
+- Corrected three reference-doc descriptions that named things the Veilid cutover removed.
+  `lama.yaml`'s integration-tests entry names the per-milestone and per-feature ISC-coverage
+  files it holds; its xtask entry lists the seven subcommands that exist; and
+  `ChannelBindingSource` is described as the seam a transport-terminating layer would
+  implement, with no implementor outside the module's test fake. (#307, #306)
+
 - Corrected whole-share placement into a chosen destination, which keyed the wrapper folder on
   the share's display name, so a share re-announced under a new name no longer resolved to the
   bytes an interrupted download had staged. `wrapper_folder` reuses the folder the download
   actually staged under, keeps the name of a download that has already staged bytes, and
   collision-suffixes a fresh one against the destination. (#355)
-
 - The backoff jitter band is pinned by tests that can fail. Four probes assert its width, its
   centring on the base delay, its population across the band and its shape at the saturated
   rung, in place of a range check that a collapsed draw satisfied. Tests only; no production
