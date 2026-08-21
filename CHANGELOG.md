@@ -133,6 +133,11 @@ work lives in the project lead's vault manifest, not here.
 
 ### Fixed
 
+- The backoff jitter band is pinned by tests that can fail. Four probes assert its width, its
+  centring on the base delay, its population across the band and its shape at the saturated
+  rung, in place of a range check that a collapsed draw satisfied. Tests only; no production
+  code changes. (#332)
+
 - Corrected the at-rest circle read high-water map, which held a circle's `cot_key` IKM in the
   clear as a `BTreeMap` key while `PersistedCircle` protected the identical value. The key is
   `CircleSeenKey`, a newtype over `Zeroizing<String>`, so the phrase is wiped on an ordinary
