@@ -666,19 +666,123 @@ fn all_under_one_top_folder(dest_rels: &[String]) -> bool {
 /// top-level folder name is NOT part of its file rel_paths (they are relative to
 /// the share root), so placing them verbatim drops that name — and a single-depth
 /// share then lands as loose files in the dest. If the placed dest-rels do not all
-/// sit under one common top-level folder, re-root them under a folder named after
-/// the share (`share_name`, sanitized to a safe single component). A placement
-/// already under one top-level folder (a nested share) is returned unchanged.
-/// (DL-ISC-8.)
-pub fn no_scatter(dest_rels: Vec<String>, share_name: &str) -> Vec<String> {
+/// sit under one common top-level folder, re-root them under `wrapper`. A
+/// placement already under one top-level folder (a nested share) is returned
+/// unchanged. (DL-ISC-8.)
+///
+/// `wrapper` is a decided, already-safe single component — [`wrapper_folder`]
+/// is what decides it. Splitting the decision out is what lets a resume reuse the
+/// folder an interrupted download actually staged under, which naming it from the
+/// display name here could not do (#355).
+pub fn no_scatter(dest_rels: Vec<String>, wrapper: &str) -> Vec<String> {
     if all_under_one_top_folder(&dest_rels) {
         return dest_rels;
     }
-    let wrapper = safe_folder_name(share_name);
     dest_rels
         .into_iter()
         .map(|r| format!("{wrapper}/{r}"))
         .collect()
+}
+
+/// The wrapper folder an interrupted download already staged under, if one is
+/// recoverable.
+///
+/// **Why this exists rather than a name pinned in the stored manifest.** The pin
+/// is already on disk implicitly: staging lives at `.dspart/<share_id>/`, keyed on
+/// the share id and not on the name, and every staged file sits at its
+/// *destination-relative* path inside it — so a wrapped download's staging holds
+/// the wrapper as a top-level directory, and that directory's name IS the wrapper
+/// the earlier attempt used. Reading it back needs no new persisted state, and the
+/// stored manifest could not have carried it anyway: `verify_stored_manifest`
+/// checks that manifest against a profile-anchored digest, so adding a field would
+/// break the anchor.
+///
+/// **The area's own `.dspart` sidecar is skipped, and that is load-bearing rather
+/// than tidiness.** A real staging area holds the housekeeping directory
+/// `<root>/.dspart/<share_id>/.dspart/` — [`StagingArea::persist_manifest`] writes
+/// `manifest` into it before any chunk is fetched, and `mark_progress` writes
+/// `progress` beside that once one lands. So production always has a second
+/// top-level entry, and a scan that counted it would refuse every recovery and
+/// leave this whole path inert while a test that only preallocates still passed.
+/// Skipping it is safe against a hostile manifest: `sanitize_rel_path` refuses a
+/// `.dspart` segment, so no staged `final_rel` can alias the sidecar.
+///
+/// `None` when there is no single wrapper to recover — an empty staging area, more
+/// than one wrapper-shaped entry, or a top-level file. A top-level file is a
+/// placement that was never wrapped, which is what a non-`Share` root kind
+/// produces and a path this function's caller is not on; a *nested* share is not
+/// that shape, since every one of its rels sits under one folder, so it stages a
+/// top-level directory and is recovered like any other. In each case the caller
+/// derives a fresh name.
+pub fn staged_wrapper(staging: &StagingArea) -> Option<String> {
+    let mut found: Option<String> = None;
+    for entry in std::fs::read_dir(staging.dir()).ok()? {
+        let entry = entry.ok()?;
+        let name = entry.file_name();
+        if name == STAGING_DIR {
+            continue;
+        }
+        // A top-level FILE means the placement was not wrapped; a second entry of
+        // any kind means there is no single wrapper. Either way, recover nothing
+        // rather than guess.
+        if !entry.file_type().ok()?.is_dir() || found.is_some() {
+            return None;
+        }
+        // A name that is not UTF-8 cannot be reproduced as a `String` wrapper —
+        // `to_string_lossy` would yield U+FFFD and name a directory that does not
+        // exist, which is a silent resume miss dressed as a recovery.
+        found = Some(name.into_string().ok()?);
+    }
+    found
+}
+
+/// Decide the wrapper folder for a whole-share download into a chosen
+/// destination.
+///
+/// **A resume reuses the staged wrapper exactly, and is never suffixed.** That is
+/// the whole point: placement was a function of the display name, nothing pinned
+/// that name across a resume, and a re-announced share under a new name re-pathed
+/// every entry — so `derive_resume_state` looked under paths no staged byte
+/// occupied, the share re-downloaded in full, and the earlier files stayed beside
+/// the new wrapper as duplicates (#355). Suffixing a recovered wrapper would
+/// reintroduce exactly that miss.
+///
+/// **A fresh download is suffixed against the destination**, which
+/// [`place_at_dest`] already does for its own placement roots and this path did
+/// not. `uniquify` there dedupes only *within* one placement, so it cannot see a
+/// folder a different share left on disk earlier; two shares sharing a display
+/// name and a destination merged into one folder. Promotion is no-clobber and
+/// suffixes per file, so that was never data loss — but it contradicted the policy
+/// applied one function above it.
+///
+/// **A download that has already staged bytes is never given a NEW name, even
+/// when its wrapper cannot be recovered.** This is the clause that keeps the
+/// suffixing from becoming a worse bug than the one it fixes. Once the first file
+/// of a wrapped download promotes, `dest_root/Album` exists — so a resume that
+/// fell through to the fresh path would suffix to `Album-2`, re-path every entry,
+/// find nothing staged, and re-download the share beside the earlier files. That
+/// is #355's exact symptom with no rename involved, and it would cascade on each
+/// interruption. Falling back to the bare name is what the code did before this
+/// change and is never worse than it.
+pub fn wrapper_folder(share_name: &str, dest_root: &Path, staging: &StagingArea) -> String {
+    if let Some(staged) = staged_wrapper(staging) {
+        return staged;
+    }
+    let base = safe_folder_name(share_name);
+    if staging.has_verified_progress() {
+        return base;
+    }
+    if !dest_root.join(&base).exists() {
+        return base;
+    }
+    let mut n = 2usize;
+    loop {
+        let cand = format!("{base}-{n}");
+        if !dest_root.join(&cand).exists() {
+            return cand;
+        }
+        n += 1;
+    }
 }
 
 // ── Stage-then-promote staging writer (download-subsystem redesign, step 4b) ──
@@ -2517,10 +2621,181 @@ mod tests {
             no_scatter(vec!["a.mp3".to_owned(), "CD1/b.mp3".to_owned()], "S"),
             vec!["S/a.mp3".to_owned(), "S/CD1/b.mp3".to_owned()]
         );
-        // An untrusted share name is sanitized to a safe single component.
+        // The wrapper is applied verbatim: sanitizing an untrusted share name is
+        // `wrapper_folder`'s job now, so that a recovered wrapper is reused exactly
+        // rather than re-derived. Covered by
+        // `wrapper_folder_sanitizes_and_suffixes_a_fresh_download`.
         assert_eq!(
-            no_scatter(vec!["a.mp3".to_owned()], "a/b"),
+            no_scatter(vec!["a.mp3".to_owned()], "a_b"),
             vec!["a_b/a.mp3".to_owned()]
+        );
+    }
+
+    /// #355: an interrupted download resumes under the folder it actually staged
+    /// under, even when the share has been re-announced under a different name.
+    ///
+    /// This is the whole defect. Placement was a function of the display name and
+    /// nothing pinned that name, so a rename re-pathed every entry, resume looked
+    /// where no staged byte was, and the share re-downloaded beside the earlier
+    /// files. The staged wrapper is recovered from the staging layout rather than
+    /// from any new persisted state.
+    #[test]
+    fn wrapper_folder_recovers_the_staged_folder_across_a_rename() {
+        let dest = tempfile::tempdir().unwrap();
+        let staging = StagingArea::open(dest.path(), "share-abc").unwrap();
+        staging.persist_manifest(&[]).unwrap();
+
+        // A fresh download picks the display name.
+        let first = wrapper_folder("Album", dest.path(), &staging);
+        assert_eq!(first, "Album");
+
+        // The engine stages under the destination-relative path, so the wrapper
+        // becomes staging's single top-level directory.
+        staging.preallocate("Album/a.mp3", 4).unwrap();
+
+        // The first file has already promoted, so the destination is occupied —
+        // `promote` does `create_dir_all` on the parent. A recovered wrapper must
+        // survive that: suffixing it to `Album-2` here would re-path every entry
+        // and reintroduce the very miss this test exists to catch.
+        std::fs::create_dir_all(dest.path().join("Album")).unwrap();
+
+        // The share is re-announced under a new name. Placement must NOT follow it.
+        let resumed = wrapper_folder("Album (2026 remaster)", dest.path(), &staging);
+        assert_eq!(
+            resumed, "Album",
+            "a resume must reuse the staged wrapper, or every staged chunk is orphaned"
+        );
+
+        // Positive control: with no staged directory the new name IS followed, so
+        // the assertion above is not passing because the function ignores its input.
+        // (`safe_folder_name` neutralises separators and control characters, not
+        // parentheses — the name passes through intact.)
+        let fresh_staging = StagingArea::open(dest.path(), "share-xyz").unwrap();
+        fresh_staging.persist_manifest(&[]).unwrap();
+        assert_eq!(
+            wrapper_folder("Album (2026 remaster)", dest.path(), &fresh_staging),
+            "Album (2026 remaster)"
+        );
+    }
+
+    /// #355: a fresh whole-share download is collision-suffixed against the
+    /// destination, and an untrusted name is sanitized.
+    ///
+    /// `place_at_dest` suffixes its own placement roots via `uniquify`, but that
+    /// set is per-placement and cannot see a folder a different share left on disk,
+    /// so two shares sharing a display name and a destination merged into one
+    /// folder. Not data loss — promotion is no-clobber and suffixes per file — but
+    /// it contradicted the policy applied one function above it.
+    #[test]
+    fn wrapper_folder_sanitizes_and_suffixes_a_fresh_download() {
+        let dest = tempfile::tempdir().unwrap();
+        let staging = StagingArea::open(dest.path(), "sid").unwrap();
+        staging.persist_manifest(&[]).unwrap();
+
+        // Untrusted name → safe single component (separators neutralised).
+        assert_eq!(wrapper_folder("a/b", dest.path(), &staging), "a_b");
+
+        // A different share already occupies the name → suffixed, not merged.
+        std::fs::create_dir(dest.path().join("Album")).unwrap();
+        assert_eq!(wrapper_folder("Album", dest.path(), &staging), "Album-2");
+        std::fs::create_dir(dest.path().join("Album-2")).unwrap();
+        assert_eq!(wrapper_folder("Album", dest.path(), &staging), "Album-3");
+
+        // A FILE of that name collides just as a directory does — the wrapper has
+        // to become a directory there, so `exists` rather than `is_dir` is the
+        // right question. Nothing else in this test would notice the difference.
+        std::fs::write(dest.path().join("Solo"), b"").unwrap();
+        assert_eq!(wrapper_folder("Solo", dest.path(), &staging), "Solo-2");
+    }
+
+    /// #355: a download that has already staged bytes is never given a NEW name,
+    /// even when its wrapper cannot be recovered.
+    ///
+    /// **Without this clause the fix is worse than the bug.** Once the first file
+    /// of a wrapped download promotes, `dest_root/Album` exists — so a resume
+    /// falling through to the fresh path suffixes to `Album-2`, re-paths every
+    /// entry, finds nothing staged and re-downloads the share beside the earlier
+    /// files. That is #355's symptom reached with no rename at all, and it cascades
+    /// on each interruption. The unwrapped shape here is the realistic way to reach
+    /// it: a nested share stages at the top level, so there is no wrapper directory
+    /// to recover.
+    #[test]
+    fn wrapper_folder_never_renames_a_download_that_has_staged_bytes() {
+        let dest = tempfile::tempdir().unwrap();
+        let staging = StagingArea::open(dest.path(), "sid").unwrap();
+        staging.persist_manifest(&[]).unwrap();
+
+        // An unwrapped placement with real progress: nothing to recover, but bytes
+        // are on disk.
+        staging.preallocate("a.mp3", 4).unwrap();
+        staging.write_verified_chunk("a.mp3", 0, b"abcd").unwrap();
+        assert!(
+            staging.has_verified_progress(),
+            "fixture must have progress"
+        );
+        assert_eq!(
+            staged_wrapper(&staging),
+            None,
+            "fixture must be unrecoverable"
+        );
+
+        // The first file has already promoted, so the name is taken.
+        std::fs::create_dir(dest.path().join("Album")).unwrap();
+
+        assert_eq!(
+            wrapper_folder("Album", dest.path(), &staging),
+            "Album",
+            "a resume with staged bytes must keep its name, not suffix away from it"
+        );
+
+        // Positive control: with no progress the same collision DOES suffix, so the
+        // assertion above is not passing because suffixing never happens.
+        let fresh = StagingArea::open(dest.path(), "fresh").unwrap();
+        fresh.persist_manifest(&[]).unwrap();
+        assert!(!fresh.has_verified_progress());
+        assert_eq!(wrapper_folder("Album", dest.path(), &fresh), "Album-2");
+    }
+
+    /// `staged_wrapper` recovers a wrapper only when there is exactly one to
+    /// recover, and says nothing otherwise.
+    ///
+    /// The three `None` cases are each a real placement shape: an untouched staging
+    /// area (fresh download), a top-level file, and more than one entry (no single
+    /// wrapper exists). A top-level file is NOT the nested-share shape — a nested
+    /// share has every rel under one folder, so it stages a top-level *directory*
+    /// and is recovered like any other. It is a placement that was never wrapped,
+    /// which is what a non-`Share` root kind produces, and `no_scatter` is not
+    /// called on that path at all.
+    #[test]
+    fn staged_wrapper_recovers_only_an_unambiguous_single_folder() {
+        let dest = tempfile::tempdir().unwrap();
+
+        let empty = StagingArea::open(dest.path(), "empty").unwrap();
+        empty.persist_manifest(&[]).unwrap();
+        assert_eq!(staged_wrapper(&empty), None, "nothing staged yet");
+
+        let wrapped = StagingArea::open(dest.path(), "wrapped").unwrap();
+        wrapped.persist_manifest(&[]).unwrap();
+        wrapped.preallocate("Album/a.mp3", 4).unwrap();
+        assert_eq!(staged_wrapper(&wrapped), Some("Album".to_owned()));
+
+        let unwrapped = StagingArea::open(dest.path(), "unwrapped").unwrap();
+        unwrapped.persist_manifest(&[]).unwrap();
+        unwrapped.preallocate("a.mp3", 4).unwrap();
+        assert_eq!(
+            staged_wrapper(&unwrapped),
+            None,
+            "a top-level file is an unwrapped placement, not a wrapper"
+        );
+
+        let ambiguous = StagingArea::open(dest.path(), "ambiguous").unwrap();
+        ambiguous.persist_manifest(&[]).unwrap();
+        ambiguous.preallocate("One/a.mp3", 4).unwrap();
+        ambiguous.preallocate("Two/b.mp3", 4).unwrap();
+        assert_eq!(
+            staged_wrapper(&ambiguous),
+            None,
+            "two top-level entries mean there is no single wrapper to recover"
         );
     }
 

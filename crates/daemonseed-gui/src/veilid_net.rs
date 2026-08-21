@@ -98,6 +98,7 @@ use daemonseed_core::storage::cas::ChunkAddr;
 use daemonseed_core::storage::fetched::{
     FetchedFile, FetchedStore, LiveFetchRegistry, SelectionRoot, StagingArea, derive_resume_state,
     manifest_digest, no_scatter, place_at_dest, sweep_staging, verify_stored_manifest,
+    wrapper_folder,
 };
 use daemonseed_core::storage::manifest_digest::ManifestDigestStore;
 use daemonseed_proto::v1 as wire;
@@ -3569,7 +3570,10 @@ async fn run_confirm_download(
             // single-depth share would otherwise land loose). DL-ISC-8.
             let dest_rels: Vec<String> = placed.iter().map(|p| p.dest_rel.clone()).collect();
             let dest_rels = if matches!(root_kind, crate::net::RootKind::Share) {
-                no_scatter(dest_rels, &share_name)
+                no_scatter(
+                    dest_rels,
+                    &wrapper_folder(&share_name, &dest_root, &staging),
+                )
             } else {
                 dest_rels
             };

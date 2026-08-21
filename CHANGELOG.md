@@ -133,11 +133,16 @@ work lives in the project lead's vault manifest, not here.
 
 ### Fixed
 
+- Corrected whole-share placement into a chosen destination, which keyed the wrapper folder on
+  the share's display name, so a share re-announced under a new name no longer resolved to the
+  bytes an interrupted download had staged. `wrapper_folder` reuses the folder the download
+  actually staged under, keeps the name of a download that has already staged bytes, and
+  collision-suffixes a fresh one against the destination. (#355)
+
 - The backoff jitter band is pinned by tests that can fail. Four probes assert its width, its
   centring on the base delay, its population across the band and its shape at the saturated
   rung, in place of a range check that a collapsed draw satisfied. Tests only; no production
   code changes. (#332)
-
 - Corrected the at-rest circle read high-water map, which held a circle's `cot_key` IKM in the
   clear as a `BTreeMap` key while `PersistedCircle` protected the identical value. The key is
   `CircleSeenKey`, a newtype over `Zeroizing<String>`, so the phrase is wiped on an ordinary
