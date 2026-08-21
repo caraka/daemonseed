@@ -1623,9 +1623,12 @@ async fn actor_loop(
                 share_adverts.remove(&share_id);
                 // Release this share's current private route (route-leak fix): once
                 // unpublished it serves nothing, so the route is dead weight.
-                if let Some(route_id) = advert_routes.lock().unwrap().remove(&share_id) {
-                    release_tolerant(&api, route_id, &format!("stop_serve {share_id}"));
-                }
+                release_any_advert_route(
+                    &api,
+                    &advert_routes,
+                    &share_id,
+                    &format!("stop_serve {share_id}"),
+                );
                 let _ = reply.send(Ok(()));
             }
             Command::RouteMaintenance { dead_routes } => {
@@ -2897,16 +2900,13 @@ async fn publish_one_advert(
         // ours as its `prev` already); a bare remove-by-key would tear down the
         // reshare's LIVE route and silently break it (#163 review [0]). Compare-and-
         // remove under the lock so we only ever free the route this call owns.
-        let mut routes = advert_routes.lock().unwrap();
-        if routes.get(share_id) == Some(&route_id) {
-            routes.remove(share_id);
-            drop(routes);
-            release_tolerant(
-                api,
-                route_id,
-                &format!("publish_one_advert withdraw {share_id}"),
-            );
-        }
+        release_own_advert_route(
+            api,
+            advert_routes,
+            share_id,
+            route_id,
+            &format!("publish_one_advert withdraw {share_id}"),
+        );
     }
     res
 }
@@ -2930,15 +2930,115 @@ fn rollback_advert_route(
     share_id: &str,
     route_id: RouteId,
 ) {
+    release_own_advert_route(
+        api,
+        advert_routes,
+        share_id,
+        route_id,
+        &format!("publish_one_advert rollback {share_id}"),
+    );
+}
+
+/// Drop a share's advert route: take it out of `advert_routes` and release it,
+/// as one operation under one lock acquisition (#175).
+///
+/// **`expected` is the guard, and it is a parameter rather than an internal
+/// decision so that each call site states which one it is.** With `Some(id)` the
+/// release happens only if the map still holds exactly that route — a
+/// compare-and-remove. With `None` whatever route is registered for `share_id` is
+/// removed and released.
+///
+/// **Why the guard is load-bearing where it is used.** Both `PublishShare`
+/// handlers run `publish_one_advert` in a spawned task, so a concurrent reshare
+/// (`persist=true`) on the same #156-deterministic `share_id` may already have
+/// overwritten `advert_routes[share_id]` with its OWN live route, releasing ours
+/// as its `prev` in the process. A bare remove-by-key would then wipe the
+/// reshare's live entry — leaking its route and blinding RouteMaintenance to that
+/// route's death — and double-free our already-freed route (#163 review). A path
+/// that owns a specific route only ever frees that one.
+///
+/// `StopServe` is the `None` case and is correct as such: the share is being
+/// unpublished outright, so whatever route currently advertises it is dead weight
+/// regardless of which call installed it.
+///
+/// The lock is dropped before the release, which crosses into the Veilid API —
+/// holding an actor-wide mutex across that call is what the explicit `drop` is
+/// avoiding, and [`release_advert_route_with`] is where a test can see it.
+/// Release the advert route **this call owns**, and only that one.
+///
+/// The guarded entry point. Use it wherever the caller allocated a specific route
+/// and is undoing its own work.
+fn release_own_advert_route(
+    api: &VeilidAPI,
+    advert_routes: &Mutex<HashMap<String, RouteId>>,
+    share_id: &str,
+    route_id: RouteId,
+    context: &str,
+) {
+    release_advert_route_with(advert_routes, share_id, Some(&route_id), |id| {
+        release_tolerant(api, id, context)
+    });
+}
+
+/// Release whatever advert route is registered for `share_id`, whoever installed
+/// it.
+///
+/// The unguarded entry point, and correct only where the share is being
+/// unpublished outright — `StopServe` — so that any route advertising it is dead
+/// weight regardless of provenance.
+fn release_any_advert_route(
+    api: &VeilidAPI,
+    advert_routes: &Mutex<HashMap<String, RouteId>>,
+    share_id: &str,
+    context: &str,
+) {
+    release_advert_route_with(advert_routes, share_id, None, |id| {
+        release_tolerant(api, id, context)
+    });
+}
+
+/// [`release_advert_route`] with the release itself as a closure — the shape that
+/// makes the lock ordering testable.
+///
+/// `release_tolerant` needs a live `VeilidAPI` and no test in this crate can build
+/// one, so with the call inlined the ordering would be verifiable only by reading
+/// it. Here a fixture passes a closure that asserts the map is *unlocked* when it
+/// runs: `std::sync::Mutex` is not reentrant, so a `try_lock` from inside the
+/// closure returns `Err(WouldBlock)` if the guard is still held.
+///
+/// Generic over the value type so a fixture can use a plain `u32`, matching the
+/// shape `drop_dead_advert_routes_removes_only_dead_by_value` already uses.
+fn release_advert_route_with<R: PartialEq>(
+    advert_routes: &Mutex<HashMap<String, R>>,
+    share_id: &str,
+    expected: Option<&R>,
+    release: impl FnOnce(R),
+) {
     let mut routes = advert_routes.lock().unwrap();
-    if routes.get(share_id) == Some(&route_id) {
-        routes.remove(share_id);
-        drop(routes);
-        release_tolerant(
-            api,
-            route_id,
-            &format!("publish_one_advert rollback {share_id}"),
-        );
+    let taken = take_advert_route(&mut routes, share_id, expected);
+    drop(routes);
+    if let Some(route_id) = taken {
+        release(route_id);
+    }
+}
+
+/// The map half of [`release_advert_route`]: decide what, if anything, to release.
+///
+/// Pure and generic over the value type, so a fixture can use a plain `u32` — the
+/// shape `drop_dead_advert_routes_removes_only_dead_by_value` already uses for the
+/// same reason.
+///
+/// Returns the route to release, or `None` when there is nothing to release:
+/// either no entry for `share_id`, or `expected` was given and the entry is a
+/// different route.
+fn take_advert_route<R: PartialEq>(
+    routes: &mut HashMap<String, R>,
+    share_id: &str,
+    expected: Option<&R>,
+) -> Option<R> {
+    match expected {
+        Some(want) if routes.get(share_id) != Some(want) => None,
+        _ => routes.remove(share_id),
     }
 }
 
@@ -3153,6 +3253,122 @@ mod tests {
             count, 1,
             "exactly one raw release_private_route call must remain — inside release_tolerant"
         );
+    }
+
+    /// #175: the lock is released before the release call runs.
+    ///
+    /// `release_tolerant` crosses into the Veilid API, and holding an actor-wide
+    /// mutex across an FFI call is a deadlock waiting for a re-entrant path. The
+    /// closure seam is what makes this observable without a `VeilidAPI`:
+    /// `std::sync::Mutex` is not reentrant, so a `try_lock` from inside the release
+    /// closure fails if the guard is still held.
+    ///
+    /// **This was not previously true at every site.** `StopServe` used
+    /// `if let Some(id) = map.lock().unwrap().remove(&id)`, whose guard temporary
+    /// lives to the end of the `if let` body — so it held the lock across the
+    /// release. Routing it through here changed that, and this test is what states
+    /// the property now holds everywhere.
+    #[test]
+    fn release_advert_route_with_drops_the_lock_before_releasing() {
+        let routes: Mutex<HashMap<String, u32>> =
+            Mutex::new(HashMap::from([("s".to_owned(), 1u32)]));
+        let mut ran = false;
+
+        release_advert_route_with(&routes, "s", None, |id| {
+            ran = true;
+            assert_eq!(id, 1u32);
+            assert!(
+                routes.try_lock().is_ok(),
+                "the advert_routes lock is still held while releasing — an \
+                 actor-wide mutex must not span the Veilid API call"
+            );
+        });
+
+        assert!(
+            ran,
+            "the release closure never ran, so this test asserted nothing"
+        );
+        assert!(routes.lock().unwrap().is_empty());
+    }
+
+    /// #175: a refused take runs no release at all.
+    ///
+    /// The guard's whole point is that a concurrent reshare's live route is left
+    /// alone — which means not merely leaving the map entry, but never handing that
+    /// route to `release_tolerant`. A version that took nothing and released
+    /// anyway would double-free.
+    #[test]
+    fn release_advert_route_with_runs_no_release_when_the_guard_refuses() {
+        let routes: Mutex<HashMap<String, u32>> =
+            Mutex::new(HashMap::from([("s".to_owned(), 1u32)]));
+        let mut ran = false;
+
+        // A different route is registered — the reshare case.
+        release_advert_route_with(&routes, "s", Some(&2u32), |_| ran = true);
+        assert!(!ran, "released a route this call does not own");
+        assert_eq!(routes.lock().unwrap().get("s"), Some(&1u32));
+
+        // Positive control: the owning call DOES release, so the assertion above is
+        // not passing because the closure never runs for any input.
+        release_advert_route_with(&routes, "s", Some(&1u32), |_| ran = true);
+        assert!(ran, "the owning call must release");
+    }
+
+    /// #175: with `expected`, only the route the caller owns is taken.
+    ///
+    /// This is the guard the three call sites used to each carry a copy of, and it
+    /// is load-bearing rather than defensive: both `PublishShare` handlers run
+    /// `publish_one_advert` in a spawned task, so a concurrent reshare on the same
+    /// `share_id` may have replaced the entry with its OWN live route. Taking that
+    /// one would leak the reshare's route, blind RouteMaintenance to its death, and
+    /// double-free the route this call already lost.
+    #[test]
+    fn take_advert_route_guarded_takes_only_its_own_route() {
+        // A SECOND share is registered throughout: a one-entry fixture makes
+        // `routes.is_empty()` a strong claim about the target and a vacuous one
+        // about everything else, so a mutation that cleared the whole map would
+        // pass. Measured, not assumed — that mutant went green on the old fixture.
+        let mut routes: HashMap<String, u32> =
+            HashMap::from([("s".to_owned(), 1u32), ("other".to_owned(), 9u32)]);
+
+        // A different route is registered — the reshare case. Take nothing, and
+        // leave the entry alone.
+        assert_eq!(take_advert_route(&mut routes, "s", Some(&2u32)), None);
+        assert_eq!(routes.get("s"), Some(&1u32), "the live entry must survive");
+
+        // No entry at all.
+        assert_eq!(take_advert_route(&mut routes, "absent", Some(&1u32)), None);
+
+        // Our own route is still registered — take it, and the entry goes.
+        assert_eq!(take_advert_route(&mut routes, "s", Some(&1u32)), Some(1u32));
+        assert_eq!(routes.get("s"), None);
+        assert_eq!(
+            routes.get("other"),
+            Some(&9u32),
+            "another share's route registration must survive untouched"
+        );
+    }
+
+    /// #175: without `expected`, whatever is registered is taken.
+    ///
+    /// `StopServe` is this case and is correct as such — the share is being
+    /// unpublished outright, so any route advertising it is dead weight regardless
+    /// of which call installed it.
+    #[test]
+    fn take_advert_route_unguarded_takes_whatever_is_registered() {
+        let mut routes: HashMap<String, u32> =
+            HashMap::from([("s".to_owned(), 7u32), ("other".to_owned(), 9u32)]);
+
+        assert_eq!(take_advert_route(&mut routes, "s", None), Some(7u32));
+        assert_eq!(routes.get("s"), None);
+        assert_eq!(
+            routes.get("other"),
+            Some(&9u32),
+            "another share's route registration must survive untouched"
+        );
+
+        // And an absent share is not an error, just nothing to release.
+        assert_eq!(take_advert_route(&mut routes, "s", None), None);
     }
 
     // CRSH-ISC-10d: a dead-route sweep drops only the entries whose route is dead, by value,

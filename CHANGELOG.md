@@ -179,6 +179,11 @@ work lives in the project lead's vault manifest, not here.
 
 ### Changed
 
+- Advert-route release has two named entry points, `release_own_advert_route` and
+  `release_any_advert_route`, in place of the remove-and-release idiom open-coded at three
+  route-lifecycle sites. `StopServe` no longer holds the actor-wide mutex across the Veilid
+  release call; the other two sites already dropped it first. (#175)
+
 - Aligned the crypto stack on published oxicrypt: every `oxicrypt-*` dependency is pinned to
   `0.24.0` from crates.io instead of path-depending on a sibling checkout, and the packaging
   scripts fetch the integrity signer at that same pin through `packaging/lib/sign.sh`. A
