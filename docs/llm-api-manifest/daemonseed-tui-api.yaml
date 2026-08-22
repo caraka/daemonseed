@@ -363,7 +363,7 @@ public_types:
     variants: [RequestingManifest, "Preview(Vec<ShareManifestEntry>)", Receiving, Complete, "Failed(String)"]
   - name: daemonseed_tui::app::TrustItem
     kind: struct
-    description: "A surfaced C28 trust event awaiting user attention: key (selects the affordance class via core class_of) + server_id (scopes per-(key,scope) dismissal, ISC-A-C12). ISC-22/23/24."
+    description: "A surfaced C28 trust event awaiting user attention: key (selects the affordance class via core class_of) + server_id + suite_id + record_kind (together scope per-(key,scope) dismissal, ISC-A-C12, and give the badge list one row per record kind). ISC-22/23/24."
   - name: daemonseed_tui::app::ManagedServer
     kind: struct
     description: "One managed federation server (F22 / C22): server_id, address, trusted (slider position — trusted = TOFU-pin on first contact, untrusted = require a pre-imported operator key)."

@@ -262,14 +262,13 @@ pub const fn event_key_string(key: TrustEventKey) -> &'static str {
 /// Parse a key from its stable string form. The inverse of [`event_key_string`];
 /// returns `None` for an unknown string (e.g. a key from a newer build).
 ///
-/// **The audit-log decoder treats that `None` as a malformed body and loses
-/// every entry**, which is the same forward-compatibility exposure the
-/// record-kind field used to have and no longer does. It is not fixed the same
-/// way because it cannot be: a key is not optional, so there is no field to
-/// degrade — the choices are dropping the entry (silent loss from an audit log)
-/// or failing (loud loss of the whole log), and picking between them is a
-/// decision about audit-log semantics, not a repair. Recorded here so the
-/// exposure is visible at the site rather than inferred from the decoder.
+/// **The audit-log decoder steps over an entry whose key returns `None`, and
+/// counts it**, rather than failing the whole body. A key is not optional, so
+/// there is no field to degrade the way the record-kind field degrades: the
+/// choice was between dropping the entry and failing the log. Dropping wins on
+/// audit-log semantics only because the drop is *reported* —
+/// [`TrustEventLog::unreadable_entries`] is the count, and a caller that does
+/// not surface it turns a loud loss back into a silent one.
 pub fn event_key_from_str(s: &str) -> Option<TrustEventKey> {
     ALL_EVENT_KEYS
         .iter()
@@ -384,13 +383,29 @@ impl TrustEventScope {
 
 /// The contextual scope a dismissal applies to (ISC-A-C12: dismissal is per
 /// `(event-key, scope)`, never global). Two events share a scope iff their
-/// `server_id` and `suite_id` both match.
+/// `server_id`, `suite_id` and `record_kind` all match.
+///
+/// **Every field matches by equality, and `None` is a value rather than a
+/// wildcard.** A scope whose `server_id` is `None` dismisses the events that
+/// have no server-id — not every event regardless of server. The record-kind
+/// field is read the same way, deliberately: a caller that leaves it `None`
+/// while the event carries a kind dismisses nothing, which is a visible
+/// no-op, where the opposite reading would silently dismiss all four kinds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DismissalScope {
     /// Server-id the dismissal is scoped to.
     pub server_id: Option<String>,
     /// Suite-id the dismissal is scoped to.
     pub suite_id: Option<SuiteId>,
+    /// Kind of record the dismissal is scoped to.
+    ///
+    /// **This field is why one key can be dismissed four different ways.**
+    /// `DmRecordErasureBlocked` fires for all four [`RecordKind`]s and they do
+    /// not cost the same: a blocked [`RecordKind::Provisional`] erasure leaves
+    /// `ss0` readable, while [`RecordKind::ReceiveCursor`] has no secret behind
+    /// it at all. Without this, acknowledging the harmless one acknowledged the
+    /// dangerous one in the same keystroke.
+    pub record_kind: Option<RecordKind>,
 }
 
 /// A bounded, in-memory trust-event audit log (ISC-C28). Persisted encrypted
@@ -399,6 +414,7 @@ pub struct DismissalScope {
 pub struct TrustEventLog {
     entries: Vec<TrustEvent>,
     cap: usize,
+    unreadable: usize,
 }
 
 impl Default for TrustEventLog {
@@ -413,7 +429,23 @@ impl TrustEventLog {
         Self {
             entries: Vec::new(),
             cap,
+            unreadable: 0,
         }
+    }
+
+    /// How many persisted entries this build could not read, from the
+    /// [`open_log`] that produced this log. Zero for a log this build built.
+    ///
+    /// **An entry lands here when its event key is a word this build does not
+    /// know** — a log written by a newer build that has since added a key, read
+    /// again after a rollback. The entry's framing is intact, so the reader
+    /// steps over it and keeps everything around it; what it cannot do is say
+    /// what the entry *was*, because a key has no neutral value to degrade to
+    /// the way a record kind has. Surfacing the count is the whole point: an
+    /// audit log that silently holds fewer events than were written to it is
+    /// worse than one that says "N entries could not be read by this version".
+    pub fn unreadable_entries(&self) -> usize {
+        self.unreadable
     }
 
     /// Append an event. `Transient`-class events are silently dropped (the
@@ -456,11 +488,17 @@ impl TrustEventLog {
     /// Mark every entry matching `(key, scope)` as dismissed at `at_unix_ms`.
     /// Dismissal never removes an entry (ISC-A-C12: the log records that the
     /// event occurred, distinct from that it was dismissed). Scoped by
-    /// `(event-key, server_id, suite_id)` so dismissing one server's event does
-    /// not dismiss another's (no global dismissal).
+    /// `(event-key, server_id, suite_id, record_kind)` so dismissing one
+    /// server's event does not dismiss another's, and acknowledging a blocked
+    /// erasure of one kind of record does not acknowledge the other three (no
+    /// global dismissal).
     pub fn dismiss(&mut self, key: TrustEventKey, scope: &DismissalScope, at_unix_ms: i64) {
         for e in &mut self.entries {
-            if e.key == key && e.server_id == scope.server_id && e.suite_id == scope.suite_id {
+            if e.key == key
+                && e.server_id == scope.server_id
+                && e.suite_id == scope.suite_id
+                && e.record_kind == scope.record_kind
+            {
                 e.dismissed_at_unix_ms = Some(at_unix_ms);
             }
         }
@@ -678,6 +716,13 @@ pub fn open_log(bytes: &[u8], passphrase: &str) -> Result<TrustEventLog, AuditLo
         iterations,
         parallelism,
     };
+    // Before deriving anything: these came out of the file, and the key has to
+    // be derived before the tag can reject the file. See
+    // `ArgonParams::is_openable` for why authenticating the header is not
+    // enough on its own.
+    if !argon2.is_openable() {
+        return Err(AuditLogError::Malformed("argon parameters out of range"));
+    }
 
     let header = &bytes[..cursor];
     let nonce: [u8; NONCE_LEN] = bytes[cursor..cursor + NONCE_LEN].try_into().unwrap();
@@ -696,9 +741,12 @@ pub fn open_log(bytes: &[u8], passphrase: &str) -> Result<TrustEventLog, AuditLo
         other => AuditLogError::AesMode(other),
     })?;
 
-    let log = decode_log(&plaintext, version).ok_or(AuditLogError::Malformed("bad log body"))?;
+    // Zeroize BEFORE the `?`: a malformed body is an error path, and an error
+    // path that leaves the decrypted buffer behind is the one case where the
+    // wipe matters most.
+    let decoded = decode_log(&plaintext, version);
     plaintext.zeroize();
-    Ok(log)
+    decoded.ok_or(AuditLogError::Malformed("bad log body"))
 }
 
 /// Two-stage Argon2id + HKDF-SHA-384 key derivation for the audit log. Mirrors
@@ -796,15 +844,51 @@ fn encode_log(log: &TrustEventLog) -> Vec<u8> {
     out
 }
 
+/// Smallest number of bytes any entry can occupy: `i64` timestamp, `u16` key
+/// length, at least one key byte, and one presence/among-two byte each for
+/// `server_id`, `suite_id`, `resolution`, `dismissed_at` and (v2) `record_kind`.
+/// Used only to bound a pre-allocation against a count read from the body — the
+/// parse itself still validates every field.
+const MIN_ENTRY_LEN: usize = 8 + 2 + 1 + 5;
+
 fn decode_log(bytes: &[u8], version: BodyVersion) -> Option<TrustEventLog> {
     let mut c = Cursor::new(bytes);
     let count = c.u32()? as usize;
-    let mut entries = Vec::with_capacity(count);
+    // Do NOT pre-allocate `count` — it is a number out of the body, and the
+    // body must be parsed before it can be disbelieved. A count of `u32::MAX`
+    // asks for 240 GB up front and aborts the process, which is the same
+    // obey-the-file-before-you-can-reject-it shape `ArgonParams::is_openable`
+    // exists to close, one field over. The remaining bytes bound the real
+    // count: no entry encodes in fewer than `MIN_ENTRY_LEN`, so anything past
+    // that is a lie and the loop below will run out of input and return `None`
+    // on its own.
+    let ceiling = bytes.len() / MIN_ENTRY_LEN;
+    let mut entries = Vec::with_capacity(count.min(ceiling));
+    let mut unreadable = 0usize;
     for _ in 0..count {
         let timestamp_unix_ms = c.i64()?;
         let key_len = c.u16()? as usize;
         let key_str = c.bytes(key_len)?;
-        let key = event_key_from_str(core::str::from_utf8(key_str).ok()?)?;
+        // **Framing errors fail the body; an unknown key costs one entry.** The
+        // length above is structure — without it the cursor no longer knows
+        // where this entry ends — but the string it delimits is a vocabulary
+        // token, and meeting one this build has never heard of is the ordinary
+        // consequence of reading a log a newer build wrote.
+        //
+        // The record-kind field further down degrades to `None` in the same
+        // situation. A key cannot: it is what the entry IS, and no neutral
+        // value would leave the entry meaning anything. So the entry is stepped
+        // over rather than degraded, and counted — the alternative to counting
+        // is an audit history quietly shorter than the one that was written.
+        // `TrustEventLog::unreadable_entries` is how a caller says so out loud.
+        //
+        // Note what this does NOT do: it does not stop the parse, and it does
+        // not skip ahead. Every remaining field of this entry is still read,
+        // because that is the only way the cursor reaches the next entry's
+        // first byte — the body has no per-entry length and no terminator.
+        let key = core::str::from_utf8(key_str)
+            .ok()
+            .and_then(event_key_from_str);
         let server_id = if c.u8()? == 1 {
             let len = c.u16()? as usize;
             Some(core::str::from_utf8(c.bytes(len)?).ok()?.to_owned())
@@ -864,6 +948,12 @@ fn decode_log(bytes: &[u8], version: BodyVersion) -> Option<TrustEventLog> {
             }
             BodyVersion::V2 => None,
         };
+        // The cursor is at the next entry either way; only whether this one is
+        // kept depends on the key.
+        let Some(key) = key else {
+            unreadable += 1;
+            continue;
+        };
         entries.push(TrustEvent {
             timestamp_unix_ms,
             key,
@@ -877,7 +967,11 @@ fn decode_log(bytes: &[u8], version: BodyVersion) -> Option<TrustEventLog> {
     // The decoded log carries however many entries were persisted; cap is
     // re-applied by the caller's preference, defaulting to the standard bound.
     let cap = entries.len().max(DEFAULT_LOG_CAP);
-    Some(TrustEventLog { entries, cap })
+    Some(TrustEventLog {
+        entries,
+        cap,
+        unreadable,
+    })
 }
 
 /// Minimal forward-only byte cursor for [`decode_log`]. Every read is
@@ -1121,6 +1215,7 @@ mod tests {
             &DismissalScope {
                 server_id: Some("srv-a".into()),
                 suite_id: None,
+                record_kind: None,
             },
             100,
         );
@@ -1130,6 +1225,460 @@ mod tests {
         assert_eq!(a.dismissed_at_unix_ms, Some(100));
         assert_eq!(b.dismissed_at_unix_ms, None, "other server not dismissed");
         assert_eq!(log.len(), 2, "dismissal does not remove entries");
+    }
+
+    /// Dismissal is scoped to the kind of record too, so acknowledging a
+    /// blocked erasure of one kind leaves the other three standing.
+    ///
+    /// **The asymmetry is the reason this exists.** `ReceiveCursor` is the one
+    /// unsealed kind and has nothing secret behind it; `Provisional` failing to
+    /// erase leaves `ss0` readable. Before the scope carried the kind, one
+    /// keystroke on the harmless one silenced the dangerous one.
+    #[test]
+    fn dismiss_is_scoped_to_the_record_kind() {
+        let mut log = TrustEventLog::new(DEFAULT_LOG_CAP);
+        for (i, kind) in RecordKind::ALL.iter().enumerate() {
+            log.append(
+                TrustEventScope::for_record(TrustEventKey::DmRecordErasureBlocked, *kind)
+                    .observed_at(i as i64, None, None),
+            );
+        }
+        assert_eq!(
+            log.len(),
+            RecordKind::ALL.len(),
+            "control: every kind was appended, so a later count of 1 dismissed \
+             is a real result and not an empty log"
+        );
+
+        log.dismiss(
+            TrustEventKey::DmRecordErasureBlocked,
+            &DismissalScope {
+                server_id: None,
+                suite_id: None,
+                record_kind: Some(RecordKind::ReceiveCursor),
+            },
+            100,
+        );
+
+        let dismissed: Vec<RecordKind> = log
+            .entries()
+            .iter()
+            .filter(|e| e.dismissed_at_unix_ms.is_some())
+            .filter_map(|e| e.record_kind)
+            .collect();
+        assert_eq!(
+            dismissed,
+            vec![RecordKind::ReceiveCursor],
+            "exactly the kind named by the scope is dismissed"
+        );
+    }
+
+    /// The scope's fields are independent: same kind on a different server, and
+    /// same server with a different kind, are each left alone.
+    ///
+    /// Exercised together because a predicate that accidentally `||`-ed two
+    /// terms, or dropped one, would still pass a test that varies one field at
+    /// a time.
+    #[test]
+    fn dismiss_matches_on_the_whole_scope_not_one_field() {
+        let mut log = TrustEventLog::new(DEFAULT_LOG_CAP);
+        let mut push = |ts: i64, server: Option<&str>, kind: RecordKind| {
+            log.append(
+                TrustEventScope::for_record(TrustEventKey::DmRecordErasureBlocked, kind)
+                    .observed_at(ts, server.map(str::to_owned), None),
+            );
+        };
+        push(1, Some("srv-a"), RecordKind::Provisional); // the target
+        push(2, Some("srv-b"), RecordKind::Provisional); // same kind, other server
+        push(3, Some("srv-a"), RecordKind::Outbox); // same server, other kind
+        assert_eq!(log.len(), 3, "control: three entries to choose between");
+
+        log.dismiss(
+            TrustEventKey::DmRecordErasureBlocked,
+            &DismissalScope {
+                server_id: Some("srv-a".into()),
+                suite_id: None,
+                record_kind: Some(RecordKind::Provisional),
+            },
+            100,
+        );
+
+        let hit: Vec<i64> = log
+            .entries()
+            .iter()
+            .filter(|e| e.dismissed_at_unix_ms.is_some())
+            .map(|e| e.timestamp_unix_ms)
+            .collect();
+        assert_eq!(hit, vec![1], "only the entry matching every field");
+    }
+
+    /// A scope that names no kind does not match an event that carries one.
+    ///
+    /// `None` is a value, not a wildcard — the same reading `server_id` and
+    /// `suite_id` have always had. The failure this pins is a caller that
+    /// cannot supply the kind: it dismisses nothing, visibly, rather than
+    /// dismissing all four.
+    #[test]
+    fn a_kindless_scope_does_not_match_a_kinded_event() {
+        let mut log = TrustEventLog::new(DEFAULT_LOG_CAP);
+        log.append(
+            TrustEventScope::for_record(
+                TrustEventKey::DmRecordErasureBlocked,
+                RecordKind::Provisional,
+            )
+            .observed_at(1, None, None),
+        );
+
+        log.dismiss(
+            TrustEventKey::DmRecordErasureBlocked,
+            &DismissalScope {
+                server_id: None,
+                suite_id: None,
+                record_kind: None,
+            },
+            100,
+        );
+        assert_eq!(
+            log.entries()[0].dismissed_at_unix_ms,
+            None,
+            "a kindless scope must not silently sweep a kinded event"
+        );
+
+        // Control: the same call WITH the kind does dismiss it, so the
+        // assertion above is about the scope and not about a broken `dismiss`.
+        log.dismiss(
+            TrustEventKey::DmRecordErasureBlocked,
+            &DismissalScope {
+                server_id: None,
+                suite_id: None,
+                record_kind: Some(RecordKind::Provisional),
+            },
+            100,
+        );
+        assert_eq!(log.entries()[0].dismissed_at_unix_ms, Some(100));
+    }
+
+    /// An entry whose event key this build does not know costs that entry and
+    /// nothing else, and the loss is counted rather than swallowed.
+    ///
+    /// The unknown key is produced by patching one key string in an encoded
+    /// body to an equal-length token, so the framing is byte-identical and the
+    /// only thing that changed is a word. A length change would be a framing
+    /// error, which is a different case and must still fail the body.
+    #[test]
+    fn an_unknown_event_key_costs_one_entry_and_is_counted() {
+        let entries = vec![
+            TrustEvent::observed(1, TrustEventKey::ServerKeyRotated, None, None),
+            TrustEvent::observed(2, TrustEventKey::NoCommonVersion, None, None),
+            TrustEvent::observed(3, TrustEventKey::ServerSourceUnverified, None, None),
+        ];
+        let body = encode_log(&log_of(entries));
+
+        // Control: the unpatched body decodes whole. Without this, a patch that
+        // corrupted the framing would produce the same "2 entries" result for
+        // entirely the wrong reason.
+        let clean = decode_log(&body, BodyVersion::V2).expect("the unpatched body decodes");
+        assert_eq!(clean.len(), 3);
+        assert_eq!(clean.unreadable_entries(), 0);
+
+        let needle = event_key_string(TrustEventKey::NoCommonVersion).as_bytes();
+        let hits = body.windows(needle.len()).filter(|w| *w == needle).count();
+        assert_eq!(
+            hits, 1,
+            "control: the key string appears exactly once, so patching it \
+             cannot silently hit some other entry's bytes"
+        );
+        let at = body
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("checked above");
+        let mut patched = body.clone();
+        // Same length, different word — a key from a build that does not exist.
+        patched[at + needle.len() - 1] = b'z';
+        assert_eq!(patched.len(), body.len(), "the patch changed no framing");
+
+        let log = decode_log(&patched, BodyVersion::V2)
+            .expect("an unknown key must not fail the whole body");
+        assert_eq!(log.len(), 2, "the two known entries survive");
+        assert_eq!(log.unreadable_entries(), 1, "and the loss is counted");
+        assert_eq!(
+            log.entries().iter().map(|e| e.key).collect::<Vec<_>>(),
+            vec![
+                TrustEventKey::ServerKeyRotated,
+                TrustEventKey::ServerSourceUnverified
+            ],
+            "the entry AFTER the unknown one is still framed correctly, which \
+             is what proves the parse stepped over it rather than resyncing"
+        );
+    }
+
+    /// An unknown key on an entry that carries EVERY optional field is stepped
+    /// over correctly, in each of the three positions it can occupy.
+    ///
+    /// **The field-less version of this test understates it badly.** With no
+    /// optional fields the skipped entry is a fixed run of flag bytes, so the
+    /// cursor would land correctly even if the skip were sloppy. The realistic
+    /// forward-compatibility case — a newer build's key on an entry carrying a
+    /// server-id, a suite, a dismissal timestamp and a record kind — is the one
+    /// where a wrong skip desynchronises everything after it, and it is
+    /// variable-length precisely where it matters.
+    #[test]
+    fn an_unknown_key_with_a_full_payload_is_stepped_over_in_any_position() {
+        let fat = |ts: i64, key: TrustEventKey| TrustEvent {
+            timestamp_unix_ms: ts,
+            key,
+            server_id: Some("relay#aabbccddeeff".to_owned()),
+            suite_id: Some(SuiteId::try_new(1).unwrap()),
+            record_kind: Some(RecordKind::Provisional),
+            resolution: ResolutionStatus::Resolved,
+            dismissed_at_unix_ms: Some(999),
+        };
+        let victim = TrustEventKey::NoCommonVersion;
+        let others = [
+            TrustEventKey::ServerKeyRotated,
+            TrustEventKey::ServerSourceUnverified,
+        ];
+
+        for position in 0..3usize {
+            let mut entries = Vec::new();
+            let mut other = others.iter().copied();
+            for slot in 0..3usize {
+                let key = if slot == position {
+                    victim
+                } else {
+                    other.next().expect("two others for two non-victim slots")
+                };
+                entries.push(fat(slot as i64, key));
+            }
+            let body = encode_log(&log_of(entries));
+
+            let needle = event_key_string(victim).as_bytes();
+            assert_eq!(
+                body.windows(needle.len()).filter(|w| *w == needle).count(),
+                1,
+                "control (position {position}): the victim key appears once"
+            );
+            let at = body
+                .windows(needle.len())
+                .position(|w| w == needle)
+                .expect("checked above");
+            let mut patched = body.clone();
+            patched[at + needle.len() - 1] = b'z';
+
+            let log = decode_log(&patched, BodyVersion::V2)
+                .unwrap_or_else(|| panic!("position {position}: body must still decode"));
+            assert_eq!(log.len(), 2, "position {position}: two survivors");
+            assert_eq!(log.unreadable_entries(), 1, "position {position}: counted");
+            // Every surviving entry kept its whole payload — the proof that the
+            // cursor landed on an entry boundary and not mid-field.
+            for e in log.entries() {
+                assert_eq!(e.server_id.as_deref(), Some("relay#aabbccddeeff"));
+                assert_eq!(e.record_kind, Some(RecordKind::Provisional));
+                assert_eq!(e.dismissed_at_unix_ms, Some(999));
+                assert_eq!(e.resolution, ResolutionStatus::Resolved);
+            }
+        }
+    }
+
+    /// More than one unknown key in a body: every one is skipped and the count
+    /// is their total, not a flag.
+    #[test]
+    fn several_unknown_keys_are_each_counted() {
+        let entries = vec![
+            TrustEvent::observed(1, TrustEventKey::ServerKeyRotated, None, None),
+            TrustEvent::observed(2, TrustEventKey::NoCommonVersion, None, None),
+            TrustEvent::observed(3, TrustEventKey::ServerSourceUnverified, None, None),
+        ];
+        let mut body = encode_log(&log_of(entries));
+        for key in [
+            TrustEventKey::NoCommonVersion,
+            TrustEventKey::ServerSourceUnverified,
+        ] {
+            let needle = event_key_string(key).as_bytes();
+            let at = body
+                .windows(needle.len())
+                .position(|w| w == needle)
+                .expect("present");
+            body[at + needle.len() - 1] = b'z';
+        }
+        let log = decode_log(&body, BodyVersion::V2).expect("still decodes");
+        assert_eq!(log.len(), 1);
+        assert_eq!(
+            log.unreadable_entries(),
+            2,
+            "the count is a total, not a boolean"
+        );
+    }
+
+    /// The count survives the sealed round trip, which is the only path a
+    /// caller actually uses — `decode_log` is private.
+    #[test]
+    fn the_unreadable_count_survives_seal_and_open() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let entries = vec![
+            TrustEvent::observed(1, TrustEventKey::ServerKeyRotated, None, None),
+            TrustEvent::observed(2, TrustEventKey::NoCommonVersion, None, None),
+        ];
+        let log = log_of(entries);
+        let pid = Uuid::from_bytes([5u8; 16]);
+        let sealed = seal_log(&log, "pass", pid, fast_params()).expect("seals");
+        assert_eq!(
+            open_log(&sealed, "pass")
+                .expect("opens")
+                .unreadable_entries(),
+            0,
+            "control: nothing is unreadable before the patch"
+        );
+
+        // Patch the key INSIDE the plaintext, then re-seal, so the file is
+        // authentic — this is the real scenario, a log a newer build wrote.
+        let mut body = encode_log(&log);
+        let needle = event_key_string(TrustEventKey::NoCommonVersion).as_bytes();
+        let at = body
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("present");
+        body[at + needle.len() - 1] = b'z';
+        let patched_log = decode_log(&body, BodyVersion::V2).expect("decodes");
+        let resealed = seal_log(&patched_log, "pass", pid, fast_params()).expect("seals");
+        let reopened = open_log(&resealed, "pass").expect("opens");
+
+        // ⚠️ The count does NOT survive a re-seal, and that is the honest
+        // result: `encode_log` writes only the entries it still holds, so the
+        // skipped one is gone from the file and the count with it. The loss is
+        // reported for exactly one process lifetime — see the type's docs.
+        assert_eq!(reopened.len(), 1, "the surviving entry re-seals");
+        assert_eq!(
+            reopened.unreadable_entries(),
+            0,
+            "a re-seal drops both the unknown entry and the count of it"
+        );
+        assert_eq!(
+            patched_log.unreadable_entries(),
+            1,
+            "the count was reported on the open that skipped it"
+        );
+    }
+
+    /// Truncation *inside* an unknown-key entry is still a framing error. This
+    /// is the skip × framing interaction — the place the new tolerance could
+    /// most plausibly have widened.
+    #[test]
+    fn truncation_inside_an_unknown_entry_still_fails() {
+        let entries = vec![
+            TrustEvent::observed(1, TrustEventKey::NoCommonVersion, None, None),
+            TrustEvent::observed(2, TrustEventKey::ServerKeyRotated, None, None),
+        ];
+        let mut body = encode_log(&log_of(entries));
+        let needle = event_key_string(TrustEventKey::NoCommonVersion).as_bytes();
+        let at = body
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("present");
+        body[at + needle.len() - 1] = b'z';
+        assert!(
+            decode_log(&body, BodyVersion::V2).is_some(),
+            "control: the untruncated body decodes, so a later None is the truncation"
+        );
+        // Cut inside the unknown entry's own trailing flag bytes.
+        let cut = at + needle.len() + 2;
+        assert!(cut < body.len(), "control: the cut is inside the body");
+        assert!(
+            decode_log(&body[..cut], BodyVersion::V2).is_none(),
+            "a body that ends mid-entry must fail even when that entry was to be skipped"
+        );
+    }
+
+    /// A key string that is not UTF-8 is skipped and counted, exactly as an
+    /// unrecognised one is.
+    ///
+    /// **Stated because it is a widening past "vocabulary" into "corruption".**
+    /// The bytes are AEAD-authenticated, so they are what some build of ours
+    /// wrote; a writer bug is not a reason to destroy a reader's history, which
+    /// is the same argument the record-kind field already makes. Pinned here so
+    /// the choice is visible rather than an accident of `from_utf8().ok()`.
+    #[test]
+    fn a_non_utf8_key_is_skipped_and_counted() {
+        let entries = vec![
+            TrustEvent::observed(1, TrustEventKey::NoCommonVersion, None, None),
+            TrustEvent::observed(2, TrustEventKey::ServerKeyRotated, None, None),
+        ];
+        let mut body = encode_log(&log_of(entries));
+        let needle = event_key_string(TrustEventKey::NoCommonVersion).as_bytes();
+        let at = body
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("present");
+        body[at] = 0xFF; // never valid as a UTF-8 leading byte here
+        let log = decode_log(&body, BodyVersion::V2).expect("must not fail the body");
+        assert_eq!(log.len(), 1);
+        assert_eq!(log.unreadable_entries(), 1);
+    }
+
+    /// A body claiming an impossible entry count does not pre-allocate for it.
+    ///
+    /// The count is a number read out of the body, so it must be parsed before
+    /// it can be disbelieved — the same shape `ArgonParams::is_openable`
+    /// closes. Unbounded, `u32::MAX` here asks for 240 GB and aborts the
+    /// process, which no assertion can catch; the bound makes it an ordinary
+    /// `None`.
+    #[test]
+    fn an_impossible_entry_count_does_not_preallocate() {
+        let mut body = u32::MAX.to_le_bytes().to_vec();
+        body.extend_from_slice(&[0u8; 8]); // a partial first entry
+        assert!(
+            decode_log(&body, BodyVersion::V2).is_none(),
+            "the body runs out of input and fails, rather than allocating for the claim"
+        );
+    }
+
+    /// A framing error still fails the whole body. The skip-and-count above is
+    /// for vocabulary, and must not have widened into tolerance for a cursor
+    /// that no longer knows where it is.
+    #[test]
+    fn a_framing_error_still_fails_the_body() {
+        let entries = vec![TrustEvent::observed(
+            1,
+            TrustEventKey::ServerKeyRotated,
+            None,
+            None,
+        )];
+        let body = encode_log(&log_of(entries));
+        assert!(
+            decode_log(&body, BodyVersion::V2).is_some(),
+            "control: the intact body decodes"
+        );
+        assert!(
+            decode_log(&body[..body.len() - 1], BodyVersion::V2).is_none(),
+            "a truncated body is a framing error, not a vocabulary miss"
+        );
+    }
+
+    /// A trust-log header naming an absurd Argon2 cost is refused before any
+    /// derivation.
+    ///
+    /// The header states the KDF cost in the clear and the key must be derived
+    /// before the tag can reject the file, so an opener handed a forged header
+    /// does the work first and finds out afterwards. Measured: with the guard
+    /// removed, this input aborts the process attempting a 4 TiB allocation.
+    #[test]
+    fn an_absurd_argon_cost_is_refused_before_deriving() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let log = TrustEventLog::new(DEFAULT_LOG_CAP);
+        let bytes =
+            seal_log(&log, "pass", Uuid::from_bytes([3u8; 16]), fast_params()).expect("seals");
+        assert!(
+            open_log(&bytes, "pass").is_ok(),
+            "control: the intact file opens"
+        );
+
+        let at = MAGIC.len() + PROFILE_ID_LEN;
+        let mut absurd = bytes.clone();
+        absurd[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            open_log(&absurd, "pass"),
+            Err(AuditLogError::Malformed("argon parameters out of range"))
+        ));
     }
 
     /// The audit log path is `<root>/trust-events.log` (F24).
@@ -1301,6 +1850,7 @@ mod tests {
         TrustEventLog {
             entries,
             cap: DEFAULT_LOG_CAP,
+            unreadable: 0,
         }
     }
 

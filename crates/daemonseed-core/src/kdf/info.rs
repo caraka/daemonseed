@@ -123,9 +123,22 @@ pub fn share_index(profile_id: &str) -> String {
     SHARE_INDEX_TEMPLATE.replace("{profile_id}", profile_id)
 }
 
+/// HKDF info-string template for the spent-invite-token set (ISC-C28 / #233).
+///
+/// Distinct from every other template here for the usual reason — one
+/// passphrase must not produce one key for two artifacts — and profile-scoped
+/// because the set it protects is profile-scoped: an invite token is redeemed
+/// once against this identity, not once per correspondence.
+const SPENT_TOKENS_TEMPLATE: &str = "daemonseed/dm-spent-tokens/{profile_id}";
+
 /// Build the trust-events HKDF info string for a profile.
 pub fn trust_events(profile_id: &str) -> String {
     TRUST_EVENTS_TEMPLATE.replace("{profile_id}", profile_id)
+}
+
+/// Build the spent-invite-token HKDF info string for a profile.
+pub fn spent_tokens(profile_id: &str) -> String {
+    SPENT_TOKENS_TEMPLATE.replace("{profile_id}", profile_id)
 }
 
 // ── Identity-proof channel binding (ISC-S19) ──────────────────────────────
@@ -356,6 +369,32 @@ mod tests {
     fn auxiliary_info_strings_are_pinned() {
         assert_eq!(share_index("uuid"), "daemonseed/share-index/uuid");
         assert_eq!(trust_events("uuid"), "daemonseed/trust-events/uuid");
+        assert_eq!(spent_tokens("uuid"), "daemonseed/dm-spent-tokens/uuid");
+    }
+
+    /// No auxiliary info string is a prefix of another.
+    ///
+    /// HKDF's info is length-delimited, so a shared prefix is not itself an
+    /// attack — this pins the weaker property that the labels are visibly
+    /// distinct, which is what stops a future one being added by copy-edit and
+    /// silently colliding with an existing key.
+    #[test]
+    fn auxiliary_info_strings_are_mutually_distinct() {
+        let all = [
+            at_rest("uuid"),
+            recovery_file("uuid"),
+            share_index("uuid"),
+            trust_events("uuid"),
+            spent_tokens("uuid"),
+        ];
+        assert_eq!(all.len(), 5, "control: every auxiliary label is listed");
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                if i != j {
+                    assert!(!a.starts_with(b.as_str()), "{a} starts with {b}");
+                }
+            }
+        }
     }
 
     #[test]

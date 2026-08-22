@@ -1683,6 +1683,22 @@ modules:
       - A-C12
     added_in: "v0.9.0 (M7)"
 
+  - name: daemonseed_core::dm::spent_store
+    description: >-
+      Profile-root home for the spent-invite-token set (#233, ISC-C28). The set
+      is profile-global rather than per-correspondence, so it sits beside the
+      trust log rather than inside the DM store, sealed under its own HKDF info
+      string. Its size reveals how many unexpired grants have been burnt and
+      nothing about who held them.
+    no_std: false
+    depends_on:
+      - daemonseed_core::dm::token
+      - daemonseed_core::kdf::info
+      - daemonseed_core::profile::config
+    iscs:
+      - C28
+    added_in: unreleased
+
   - name: daemonseed_core::backoff
     description: >-
       Client reconnect backoff curve + close-cause categorization (M9, ISC-C26).
@@ -1882,7 +1898,13 @@ types:
   - name: ArgonParams
     module: daemonseed_core::profile::config
     kind: struct
-    description: ISC-C14 work-factor knobs. Defaults are OWASP-2024 baselines.
+    description: >-
+      ISC-C14 work-factor knobs. Defaults are OWASP-2024 baselines.
+      is_openable() bounds parameters read from a file before a key is derived
+      from them; MAX_OPENABLE_MEMORY_KIB / _ITERATIONS / _PARALLELISM are the
+      per-field ceilings and MAX_OPENABLE_MEMORY_ITERATION_PRODUCT bounds the
+      work. Applied at open_log, spent_store::open, recovery_file::open and
+      ProfileConfig::from_toml.
     fields:
       - name: memory_kib
         type: u32
@@ -1919,7 +1941,10 @@ types:
   - name: ProfileConfigError
     module: daemonseed_core::profile::config
     kind: enum
-    description: Missing / unparseable / wrong-type field surfaces here.
+    description: >-
+      Missing / unparseable / wrong-type field surfaces here.
+      ArgonParamsOutOfRange carries work factors outside
+      ArgonParams::is_openable.
 
   # ── profile::resolve ────────────────────────────────────────────────
   - name: ResolveArgs
@@ -3314,7 +3339,34 @@ types:
     description: >-
       Bounded (DEFAULT_LOG_CAP) in-memory log. append (drops Transient — the
       A-C12 asymmetry), entries, prune_to, dismiss (per (key, scope), never
-      global).
+      global), unreadable_entries (count of persisted entries whose event key
+      this build does not know; open_log steps over them).
+
+  - name: DismissalScope
+    module: daemonseed_core::trust_events
+    kind: struct
+    description: >-
+      The contextual scope a dismissal applies to (A-C12): server_id, suite_id,
+      record_kind. Every field matches by equality; None is a value, not a
+      wildcard.
+    fields:
+      - name: server_id
+        type: Option<String>
+        description: Server-id the dismissal is scoped to.
+      - name: suite_id
+        type: Option<SuiteId>
+        description: Suite-id the dismissal is scoped to.
+      - name: record_kind
+        type: Option<RecordKind>
+        description: Kind of record the dismissal is scoped to.
+
+  # ── dm::spent_store ─────────────────────────────────────────────────
+  - name: SpentStoreError
+    module: daemonseed_core::dm::spent_store
+    kind: enum
+    description: >-
+      Argon2, Hkdf, AesKeyInit, AesMode, AuthenticationFailed, EntropySource,
+      Malformed.
 
   # ── backoff ─────────────────────────────────────────────────────────
   - name: BackoffPolicy
@@ -4342,6 +4394,76 @@ functions:
     returns:
       type: String
       description: The HKDF info string for the encrypted trust-event log.
+
+  - name: "info::spent_tokens"
+    module: daemonseed_core::kdf::info
+    description: Returns `daemonseed/dm-spent-tokens/<profile_id>`.
+    signature: "pub fn spent_tokens(profile_id: &str) -> String"
+    parameters:
+      - name: profile_id
+        type: "&str"
+        direction: in
+        description: The profile UUID.
+    returns:
+      type: String
+      description: The HKDF info string for the encrypted spent-invite-token set.
+
+  - name: "spent_store::spent_tokens_path"
+    module: daemonseed_core::dm::spent_store
+    description: Returns `<profile-root>/dm-spent-tokens.bin`.
+    signature: "pub fn spent_tokens_path(profile_root: &Path) -> PathBuf"
+    parameters:
+      - name: profile_root
+        type: "&Path"
+        direction: in
+        description: The profile root directory.
+    returns:
+      type: PathBuf
+      description: Path to the sealed spent-invite-token set.
+
+  - name: "spent_store::seal"
+    module: daemonseed_core::dm::spent_store
+    description: Encrypts a SpentTokenSet under the profile's spent-token key.
+    signature: "pub fn seal(set: &SpentTokenSet, passphrase: &str, profile_id: Uuid, argon2: ArgonParams) -> Result<Vec<u8>, SpentStoreError>"
+    parameters:
+      - name: set
+        type: "&SpentTokenSet"
+        direction: in
+        description: The set to persist.
+      - name: passphrase
+        type: "&str"
+        direction: in
+        description: The profile passphrase.
+      - name: profile_id
+        type: Uuid
+        direction: in
+        description: Argon2id salt and HKDF info component.
+      - name: argon2
+        type: ArgonParams
+        direction: in
+        description: Work factors, written to the cleartext header.
+    returns:
+      type: "Vec<u8>"
+      description: Header, nonce, ciphertext, tag.
+
+  - name: "spent_store::open"
+    module: daemonseed_core::dm::spent_store
+    description: >-
+      Decrypts a file written by spent_store::seal. Refuses a header whose
+      Argon2 cost fails ArgonParams::is_openable before deriving a key.
+    signature: "pub fn open(bytes: &[u8], passphrase: &str) -> Result<SpentTokenSet, SpentStoreError>"
+    parameters:
+      - name: bytes
+        type: "&[u8]"
+        direction: in
+        description: The file contents.
+      - name: passphrase
+        type: "&str"
+        direction: in
+        description: The profile passphrase.
+    returns:
+      type: SpentTokenSet
+      description: The recovered set.
 
   # ── passphrase ──────────────────────────────────────────────────────
   - name: "strength::evaluate"

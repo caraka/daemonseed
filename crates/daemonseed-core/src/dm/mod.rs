@@ -78,4 +78,5 @@ pub mod pow;
 pub mod provisional;
 pub mod ratchet;
 pub mod resume;
+pub mod spent_store;
 pub mod token;

@@ -5,15 +5,17 @@
 //! and deterministically driveable by the PTY gate harness.
 
 use daemonseed_core::backoff::CloseCause;
+use daemonseed_core::crypto::suite::SuiteId;
 use daemonseed_core::first_start::SessionMaterials;
 use daemonseed_core::handle::{DisplayMode, Handle};
 use daemonseed_core::identity::keys::SignKeypair;
 use daemonseed_core::passphrase::strength::{self, CircleStrength};
 use daemonseed_core::profile::config::ArgonParams;
 use daemonseed_core::share_catalog::ShareListing;
+use daemonseed_core::storage::dm_store::RecordKind;
 use daemonseed_core::storage::seeds::{SealingKey, Seeds};
 use daemonseed_core::trust_events::{
-    DismissalScope, TrustEvent, TrustEventClass, TrustEventKey, TrustEventLog, class_of,
+    DismissalScope, TrustEventClass, TrustEventKey, TrustEventLog, TrustEventScope, class_of,
 };
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use zeroize::Zeroizing;
@@ -581,11 +583,56 @@ pub enum FetchStatus {
 }
 
 /// A surfaced trust event awaiting user attention (ISC-C28). The `key` selects
-/// the affordance class via [`class_of`]; `server_id` scopes dismissal.
+/// the affordance class via [`class_of`]; `server_id` and `record_kind` scope
+/// dismissal.
+///
+/// **`record_kind` is here so the list can hold four rows for one key.** A
+/// blocked erasure fires the same key for all four [`RecordKind`]s, and this
+/// type is what the persistent list de-duplicates on — so without the kind, all
+/// four collapse into a single row and the user has no way to acknowledge the
+/// harmless one without acknowledging the dangerous one, whatever
+/// [`DismissalScope`] is capable of expressing underneath.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrustItem {
     pub key: TrustEventKey,
     pub server_id: Option<String>,
+    pub suite_id: Option<SuiteId>,
+    pub record_kind: Option<RecordKind>,
+}
+
+impl TrustItem {
+    /// The scope that dismisses exactly this row.
+    ///
+    /// Built here rather than at each key handler so a call site cannot forget
+    /// a field: every dismissal in this file goes through it, and adding a
+    /// scope field later breaks this one function instead of failing silently
+    /// at three separate keystrokes.
+    ///
+    /// **Every field is carried, including `suite_id`.** It used to be
+    /// hardcoded `None` here, which is the identical hazard this commit
+    /// removes for `record_kind`: under equality semantics a hardcoded `None`
+    /// dismisses nothing for any event that carries a suite — and
+    /// `SuiteDeprecationPending` and `SuiteDeprecationCutoffHit` are exactly
+    /// such events. Nothing reaches it today, because the net layer raises
+    /// every key with no suite; that is a reason it was not noticed, not a
+    /// reason it was safe.
+    fn dismissal_scope(&self) -> DismissalScope {
+        DismissalScope {
+            server_id: self.server_id.clone(),
+            suite_id: self.suite_id,
+            record_kind: self.record_kind,
+        }
+    }
+
+    /// Whether this row is the one a dismissal of `scope` acknowledges.
+    ///
+    /// The inverse of [`Self::dismissal_scope`], and it must stay that way: if
+    /// the badge list drops a row on a field the dismissal did not scope on,
+    /// the row disappears while its log entry stays undismissed, and the two
+    /// surfaces then disagree about what the user has acknowledged.
+    fn matches_dismissal(&self, key: TrustEventKey, scope: &DismissalScope) -> bool {
+        self.key == key && self.dismissal_scope() == *scope
+    }
 }
 
 /// One managed federation server in the server-management screen (F22 / C22).
@@ -1684,7 +1731,12 @@ impl App {
                 // is GUI-only for now; the TUI rides #111, like the #131 clamp.)
                 self.push_message(sender, body, sent_unix_ms, Surface::Lobby);
             }
-            NetEvent::TrustEvent { key, server_id } => self.fold_trust_event(key, server_id),
+            // The net layer raises no record-kind-scoped key today, so this is
+            // `bare` rather than a `record_kind` field on `NetEvent` that
+            // nothing could populate.
+            NetEvent::TrustEvent { key, server_id } => {
+                self.fold_trust_event(TrustEventScope::bare(key), server_id)
+            }
             NetEvent::ConnectionClosed { cause } => self.close_cause = Some(cause),
             NetEvent::SharesSnapshot {
                 local,
@@ -1918,14 +1970,18 @@ impl App {
     /// Route a trust event to its ISC-C28 affordance class and record it
     /// (Transient events are dropped from the log by [`TrustEventLog::append`] —
     /// the intentional A-C12 asymmetry — but still drive the toast slot).
-    fn fold_trust_event(&mut self, key: TrustEventKey, server_id: Option<String>) {
-        self.trust_log.append(TrustEvent::observed(
-            now_unix_ms(),
+    fn fold_trust_event(&mut self, scope: TrustEventScope, server_id: Option<String>) {
+        let TrustEventScope { key, record_kind } = scope;
+        self.trust_log
+            .append(scope.observed_at(now_unix_ms(), server_id.clone(), None));
+        let item = TrustItem {
             key,
-            server_id.clone(),
-            None,
-        ));
-        let item = TrustItem { key, server_id };
+            server_id,
+            // The net layer raises no suite-scoped key today; when it does,
+            // this is the one place that has to learn about it.
+            suite_id: None,
+            record_kind,
+        };
         match class_of(key) {
             TrustEventClass::Blocking => self.blocking = Some(item),
             TrustEventClass::PersistentNonBlocking => {
@@ -2334,14 +2390,8 @@ impl App {
         if self.screen == Screen::Main && self.blocking.is_some() {
             if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
                 let item = self.blocking.take().expect("checked is_some");
-                self.trust_log.dismiss(
-                    item.key,
-                    &DismissalScope {
-                        server_id: item.server_id,
-                        suite_id: None,
-                    },
-                    now_unix_ms(),
-                );
+                self.trust_log
+                    .dismiss(item.key, &item.dismissal_scope(), now_unix_ms());
             }
             return;
         }
@@ -3603,12 +3653,16 @@ impl App {
                         DismissalScope {
                             server_id: e.server_id.clone(),
                             suite_id: e.suite_id,
+                            record_kind: e.record_kind,
                         },
                     )
                 };
                 self.trust_log.dismiss(dkey, &scope, now_unix_ms());
+                // Routed through the row's own scope so this cannot drift from
+                // what was actually dismissed — see `matches_dismissal`. Spelt
+                // out field by field, it silently omitted `suite_id`.
                 self.persistent
-                    .retain(|it| !(it.key == dkey && it.server_id == scope.server_id));
+                    .retain(|it| !it.matches_dismissal(dkey, &scope));
             }
             _ => {}
         }
@@ -4744,6 +4798,58 @@ mod tests {
         assert_eq!(app.persistent_trust().len(), 1, "no duplicate badge");
     }
 
+    /// One key, four kinds of record, four rows — and the scope each row
+    /// produces names its own kind.
+    ///
+    /// **This is the row half of the dismissal fix.** `DmRecordErasureBlocked`
+    /// fires for all four [`RecordKind`]s, and the badge list de-duplicates on
+    /// [`TrustItem`]. While that type had no kind, the four were one row, and a
+    /// user could not acknowledge the `ReceiveCursor` erasure — which has no
+    /// secret behind it — without acknowledging the `Provisional` one, which
+    /// leaves `ss0` readable. A scope that can express the difference is no use
+    /// if the list cannot offer it.
+    #[test]
+    fn a_blocked_erasure_badges_once_per_record_kind() {
+        let mut app = drive_to_main();
+        for kind in RecordKind::ALL {
+            app.fold_trust_event(
+                TrustEventScope::for_record(TrustEventKey::DmRecordErasureBlocked, kind),
+                None,
+            );
+        }
+        assert_eq!(
+            app.persistent_trust().len(),
+            RecordKind::ALL.len(),
+            "four kinds are four rows, not one"
+        );
+
+        // Re-folding the same kind still de-duplicates: the row is keyed on the
+        // kind, it is not merely unkeyed.
+        app.fold_trust_event(
+            TrustEventScope::for_record(
+                TrustEventKey::DmRecordErasureBlocked,
+                RecordKind::Provisional,
+            ),
+            None,
+        );
+        assert_eq!(
+            app.persistent_trust().len(),
+            RecordKind::ALL.len(),
+            "a repeat of one kind adds no row"
+        );
+
+        let scoped: Vec<Option<RecordKind>> = app
+            .persistent_trust()
+            .iter()
+            .map(|it| it.dismissal_scope().record_kind)
+            .collect();
+        assert_eq!(
+            scoped,
+            RecordKind::ALL.map(Some).to_vec(),
+            "each row dismisses its own kind and no other"
+        );
+    }
+
     /// A Transient event is a toast that is NOT logged (the A-C12 asymmetry) and
     /// auto-dismisses on the next key press (ISC-24).
     #[test]
@@ -4816,6 +4922,75 @@ mod tests {
             "dismissing clears the badge"
         );
         assert_eq!(app.trust_log().len(), 1, "log entry survives dismissal");
+    }
+
+    /// Dismissing one record kind from the Trust History clears exactly that
+    /// row, and leaves the other three both listed and undismissed.
+    ///
+    /// **This is the case the single-row test above cannot see.** It drives one
+    /// badge with no record kind, so the badge-list `retain` and the log's
+    /// `dismiss` agree no matter which fields either of them compares — delete
+    /// the kind from the retain clause and that test still passes. The failure
+    /// this pins is the two surfaces disagreeing: a row vanishing from the list
+    /// while its log entry stays undismissed, which tells the user they have
+    /// acknowledged something they have not.
+    #[test]
+    fn trust_history_enter_dismisses_only_the_selected_record_kind() {
+        let mut app = drive_to_main();
+        for kind in RecordKind::ALL {
+            app.fold_trust_event(
+                TrustEventScope::for_record(TrustEventKey::DmRecordErasureBlocked, kind),
+                None,
+            );
+        }
+        assert_eq!(
+            app.persistent_trust().len(),
+            RecordKind::ALL.len(),
+            "control: four rows before any dismissal"
+        );
+        assert_eq!(app.trust_log().len(), RecordKind::ALL.len());
+
+        for _ in 0..7 {
+            app.on_key(press(KeyCode::Tab));
+        }
+        assert_eq!(app.main_focus(), MainFocus::TrustHistory);
+        // The history renders newest-first and starts on the newest, which is
+        // the last kind appended.
+        let selected = *RecordKind::ALL.last().expect("non-empty");
+        app.on_key(press(KeyCode::Enter));
+
+        let listed: Vec<Option<RecordKind>> = app
+            .persistent_trust()
+            .iter()
+            .map(|it| it.record_kind)
+            .collect();
+        assert_eq!(
+            listed.len(),
+            RecordKind::ALL.len() - 1,
+            "exactly one row leaves the list"
+        );
+        assert!(
+            !listed.contains(&Some(selected)),
+            "and it is the selected kind"
+        );
+
+        let dismissed: Vec<Option<RecordKind>> = app
+            .trust_log()
+            .entries()
+            .iter()
+            .filter(|e| e.dismissed_at_unix_ms.is_some())
+            .map(|e| e.record_kind)
+            .collect();
+        assert_eq!(
+            dismissed,
+            vec![Some(selected)],
+            "the log agrees with the list about what was acknowledged"
+        );
+        assert_eq!(
+            app.trust_log().len(),
+            RecordKind::ALL.len(),
+            "dismissal removes no log entry"
+        );
     }
 
     // ── C28 render paths (ISC-22..25 / 28), real ui::render via TestBackend ──

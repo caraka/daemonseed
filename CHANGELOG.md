@@ -24,17 +24,6 @@ next release this block is renamed to its version + date and a fresh
 `[Unreleased]` is opened (see `AGENTS.md` doc-sync). Planning for *unstarted*
 work lives in the project lead's vault manifest, not here.
 
-### Changed
-
-- A decoded-but-unmerged peer acknowledgement is a `PeerAck`, which answers no question about
-  settlement; `merge_peer_ack` consumes it, so a peer's claim reaches our state only through the
-  ceiling that bounds it. (#257)
-- A trust event names the kind of record it concerns, so a blocked erasure is distinguishable
-  from another blocked erasure without the audit log naming a correspondent. (#337)
-- The trust-log file carries a version tag; a file written by the previous version still opens. (#337)
-- An unrecognised record kind in a trust log costs that field alone; every other entry and field
-  still reads. (#337)
-
 ### Added
 
 - Direct-message doorbell transport: a first-contact entry publishes into a slot of the
@@ -44,13 +33,12 @@ work lives in the project lead's vault manifest, not here.
   the recipient and the epoch, plus an invite token bound to its grantee and redeemable once.
   A verifier disposes of a doorbell slot cheapest-check-first, admitting an entry to the
   duplicate-suppression set only once its proof of work has been paid. (#233)
-
-### Changed
-
-- A coalesced write's survivor carries the strongest class of the writes it replaced, so a
-  chat-class write already answered `Ok` is flushed at shutdown rather than shed. (#233)
-- Every funnel-write publish method documents that `Ok` means the write left the layer, not that
-  it reached the DHT, and names coalescing and tombstone dominance where they apply. (#233)
+- `daemonseed_core::dm::spent_store` — the spent-invite-token set's home at the profile root,
+  sealed under its own key. (#233)
+- `TrustEventLog::unreadable_entries` reports how many persisted entries this build could not
+  read. (#337)
+- `ArgonParams::is_openable` bounds the Argon2 cost an opener will honour from a file
+  header. (#337)
 - `cargo xtask check-manifests` parses every LAMA manifest with duplicate-key detection at
   the YAML event level and fails on a repeat, which an ordinary loader discards silently.
   Covers `docs/llm-api-manifest/*.yaml` and the root `lama.yaml`, and runs as part of
@@ -217,6 +205,41 @@ work lives in the project lead's vault manifest, not here.
   path-dependency, so a build needs only `../oxicrypt` checked out.
 
 ### Changed
+
+- Scoped trust-event dismissal to the kind of record it concerns, so acknowledging a blocked
+  erasure of one kind leaves the other three standing. (#337)
+- Skipped and counted a trust-log entry whose event key this build does not know, where the
+  whole log previously failed to open. (#337)
+- Refused a stated Argon2 cost outside `ArgonParams::is_openable` before any key is derived
+  from it, at all four readers: the trust log, the spent-token set, the `.dseed` recovery file
+  and `daemonseed.toml`. The bound covers `memory_kib × iterations`, which is what determines
+  the work; the per-field ceilings alone admit a corner costing minutes. (#337)
+- `ProfileConfig::from_toml` returns `ArgonParamsOutOfRange` for work factors outside that
+  bound. (#337)
+- A trust-log body claiming an impossible entry count no longer pre-allocates for the
+  claim. (#337)
+- `open_log` and `spent_store::open` zeroize the decrypted buffer on their malformed-body
+  paths, not only on success. (#337)
+- A terminal-client trust badge carries the suite the event named, so dismissing a
+  suite-scoped event matches it. (#337)
+
+- A decoded-but-unmerged peer acknowledgement is a `PeerAck`, which answers no question about
+  settlement; `merge_peer_ack` consumes it, so a peer's claim reaches our state only through the
+  ceiling that bounds it. (#257)
+
+- A trust event names the kind of record it concerns, so a blocked erasure is distinguishable
+  from another blocked erasure without the audit log naming a correspondent. (#337)
+
+- The trust-log file carries a version tag; a file written by the previous version still opens. (#337)
+
+- An unrecognised record kind in a trust log costs that field alone; every other entry and field
+  still reads. (#337)
+
+- A coalesced write's survivor carries the strongest class of the writes it replaced, so a
+  chat-class write already answered `Ok` is flushed at shutdown rather than shed. (#233)
+
+- Every funnel-write publish method documents that `Ok` means the write left the layer, not that
+  it reached the DHT, and names coalescing and tombstone dominance where they apply. (#233)
 
 - `VeilidNetHandle::shutdown` takes a `flush_budget` and caps the transport teardown, and
   `GRACEFUL_CLOSE_BUDGET` (12s), `CLOSE_PREFLUSH_BUDGET` (6s), `CLOSE_FLUSH_FLOOR` (2s),

@@ -41,6 +41,77 @@ impl ArgonParams {
             parallelism: 1,
         }
     }
+
+    /// Largest memory cost read from a file: 1 GiB.
+    ///
+    /// A floor-hardware device (Raspberry Pi 4, 2 GiB) can still allocate this
+    /// without the allocator aborting, which is the failure the bound exists to
+    /// prevent — a ceiling that cannot be allocated on the smallest supported
+    /// device is not a ceiling, it is the same abort at a smaller number.
+    pub const MAX_OPENABLE_MEMORY_KIB: u32 = 1024 * 1024;
+
+    /// Largest iteration count read from a file.
+    pub const MAX_OPENABLE_ITERATIONS: u32 = 16;
+
+    /// Largest parallelism read from a file.
+    pub const MAX_OPENABLE_PARALLELISM: u32 = 16;
+
+    /// Largest `memory_kib × iterations` read from a file.
+    ///
+    /// **The per-field ceilings do not bound the work; only their product
+    /// does.** Argon2's cost is approximately linear in `m·t`, so a file may
+    /// sit inside every individual limit and still name a corner far beyond
+    /// any of them: 1 GiB at `t = 16` is sixteen times the work of 1 GiB at
+    /// `t = 1`. Measured on a 12-core desktop, release build: `m·t ≈ 4.2e6`
+    /// takes **20.2 s**, and the honest desktop default (`19456 × 2 = 38912`)
+    /// takes **0.19 s** — so cost tracks the product at roughly 4.8 µs per
+    /// unit. This ceiling is `2^21`, about **10 s** at that rate on this
+    /// machine and correspondingly slower on a floor device, which is a bad
+    /// afternoon rather than an unbounded one.
+    ///
+    /// It admits every configuration a cautious user would plausibly choose —
+    /// 1 GiB at `t = 2`, or 256 MiB at `t = 8` — while refusing the corners
+    /// that exist only in a forged file. It is 54× the desktop default's
+    /// product.
+    pub const MAX_OPENABLE_MEMORY_ITERATION_PRODUCT: u64 = 1 << 21;
+
+    /// Whether these parameters are safe to hand to Argon2 when they came from
+    /// a file header rather than from this profile's own config.
+    ///
+    /// **Every sealed-file header states its own KDF cost in the clear, and the
+    /// key must be derived before the tag can be checked.** So an opener runs
+    /// an attacker-chosen Argon2 *before* it can discover the file is forged:
+    /// flipping one bit of `memory_kib` turns a 19 MiB derivation into a 2 TiB
+    /// one, and the open never returns to reject anything. Authenticating the
+    /// header does not help, because the authentication is downstream of the
+    /// work. The only defence is to refuse absurd costs up front, which is what
+    /// this is — and it costs an honest file nothing, since an honest file's
+    /// parameters are a thousandfold below these ceilings.
+    ///
+    /// Zero is refused in every field: Argon2 rejects it anyway, and refusing
+    /// here keeps the answer to "is this header usable" in one place.
+    ///
+    /// **The product check is the one that does the work** — see
+    /// [`Self::MAX_OPENABLE_MEMORY_ITERATION_PRODUCT`]. The per-field ceilings
+    /// bound the allocation; the product bounds the time, and a value can sit
+    /// inside all three fields while costing minutes.
+    ///
+    /// This is applied to four readers, not three: the trust log, the
+    /// spent-invite-token set, the `.dseed` recovery file, and
+    /// [`ProfileConfig::from_toml`]. The last has no authenticator at all and
+    /// is therefore the weakest, which makes it the most important of the four
+    /// and the easiest to overlook — its parameters are TOML, not a binary
+    /// header, so a search for header parsing does not find it.
+    pub const fn is_openable(&self) -> bool {
+        self.memory_kib > 0
+            && self.iterations > 0
+            && self.parallelism > 0
+            && self.memory_kib <= Self::MAX_OPENABLE_MEMORY_KIB
+            && self.iterations <= Self::MAX_OPENABLE_ITERATIONS
+            && self.parallelism <= Self::MAX_OPENABLE_PARALLELISM
+            && (self.memory_kib as u64) * (self.iterations as u64)
+                <= Self::MAX_OPENABLE_MEMORY_ITERATION_PRODUCT
+    }
 }
 
 impl Default for ArgonParams {
@@ -58,6 +129,15 @@ pub enum ProfileConfigError {
     MissingProfileId,
     /// `profile_id` is present but unparseable as a UUID.
     InvalidProfileId(uuid::Error),
+    /// The `argon2` table states a work factor outside
+    /// [`ArgonParams::is_openable`].
+    ///
+    /// `daemonseed.toml` is cleartext with no authenticator of any kind, and
+    /// its parameters go straight into key derivation, so it is the *weakest*
+    /// of the four readers of these numbers and the one that most needs the
+    /// bound. It is also downstream of the other three: a `.dseed` recovery
+    /// writes its header's parameters into this file.
+    ArgonParamsOutOfRange(ArgonParams),
     /// TOML serialization failed.
     Serialize(toml::ser::Error),
 }
@@ -74,6 +154,12 @@ impl core::fmt::Display for ProfileConfigError {
             ProfileConfigError::InvalidProfileId(e) => {
                 write!(f, "daemonseed.toml `profile_id` is not a valid UUID: {e}")
             }
+            ProfileConfigError::ArgonParamsOutOfRange(p) => write!(
+                f,
+                "daemonseed.toml argon2 work factors out of range: \
+                 memory_kib={} iterations={} parallelism={}",
+                p.memory_kib, p.iterations, p.parallelism
+            ),
             ProfileConfigError::Serialize(e) => write!(f, "daemonseed.toml serialize error: {e}"),
         }
     }
@@ -157,6 +243,13 @@ impl ProfileConfig {
         // For the rest (argon2 + future fields) lean on serde so adding a
         // field doesn't require touching this function.
         let mut config: ProfileConfig = toml::from_str(body).map_err(ProfileConfigError::Toml)?;
+        // The work factors are read here and handed to Argon2 by every caller
+        // that unlocks a profile. Nothing authenticates this file, so bounding
+        // them at the parse is the only place it can be done once. See
+        // `ArgonParams::is_openable`.
+        if !config.argon2.is_openable() {
+            return Err(ProfileConfigError::ArgonParamsOutOfRange(config.argon2));
+        }
         config.profile_id = profile_id;
         Ok(config)
     }
@@ -170,6 +263,143 @@ impl ProfileConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn params(memory_kib: u32, iterations: u32, parallelism: u32) -> ArgonParams {
+        ArgonParams {
+            memory_kib,
+            iterations,
+            parallelism,
+        }
+    }
+
+    /// Each ceiling is pinned at its own boundary: the largest accepted value
+    /// and the smallest rejected one, per field.
+    ///
+    /// **Without this, the ceilings are pinned to nothing.** Every call-site
+    /// test uses `u32::MAX`, which passes for any ceiling below about four
+    /// terabytes — so the numbers could be raised a thousandfold and the whole
+    /// suite would stay green. A boundary pair is the only probe that can see
+    /// a ceiling move.
+    /// The ceilings are pinned to their literal values.
+    ///
+    /// **The boundary test below cannot do this job**, because it reads the
+    /// constants to build its own inputs — so it stays green for any value of
+    /// them, and the ceilings could be raised a thousandfold with the whole
+    /// suite passing. These numbers were chosen against a measurement (see
+    /// `MAX_OPENABLE_MEMORY_ITERATION_PRODUCT`); moving one should be a
+    /// deliberate act that edits this test, not a silent one.
+    #[test]
+    fn the_openable_ceilings_are_the_values_that_were_measured() {
+        assert_eq!(ArgonParams::MAX_OPENABLE_MEMORY_KIB, 1024 * 1024, "1 GiB");
+        assert_eq!(ArgonParams::MAX_OPENABLE_ITERATIONS, 16);
+        assert_eq!(ArgonParams::MAX_OPENABLE_PARALLELISM, 16);
+        assert_eq!(
+            ArgonParams::MAX_OPENABLE_MEMORY_ITERATION_PRODUCT,
+            2 * 1024 * 1024,
+            "about ten seconds of Argon2 on a desktop core"
+        );
+    }
+
+    #[test]
+    fn each_openable_ceiling_is_pinned_at_its_boundary() {
+        let m = ArgonParams::MAX_OPENABLE_MEMORY_KIB;
+        let t = ArgonParams::MAX_OPENABLE_ITERATIONS;
+        let p = ArgonParams::MAX_OPENABLE_PARALLELISM;
+
+        // Memory, at t=1 so the product bound is not what answers.
+        assert!(
+            params(m, 1, 1).is_openable(),
+            "the ceiling itself is openable"
+        );
+        assert!(!params(m + 1, 1, 1).is_openable(), "one KiB past it is not");
+
+        // Iterations, at a memory low enough that the product stays inside.
+        assert!(params(1024, t, 1).is_openable());
+        assert!(!params(1024, t + 1, 1).is_openable());
+
+        // Parallelism.
+        assert!(params(1024, 1, p).is_openable());
+        assert!(!params(1024, 1, p + 1).is_openable());
+    }
+
+    /// Zero is refused in every field, not just the first one anybody thought
+    /// to test.
+    #[test]
+    fn zero_is_refused_in_every_field() {
+        assert!(
+            params(1024, 1, 1).is_openable(),
+            "control: the same params with no zero are openable"
+        );
+        assert!(!params(0, 1, 1).is_openable(), "memory_kib");
+        assert!(!params(1024, 0, 1).is_openable(), "iterations");
+        assert!(!params(1024, 1, 0).is_openable(), "parallelism");
+    }
+
+    /// The product ceiling refuses a corner that sits inside every per-field
+    /// ceiling.
+    ///
+    /// This is the case the per-field limits cannot see: Argon2's cost is
+    /// about linear in `memory_kib × iterations`, so max memory at max
+    /// iterations is sixteen times the work of max memory alone while
+    /// violating neither field.
+    #[test]
+    fn the_product_ceiling_refuses_an_in_range_corner() {
+        let m = ArgonParams::MAX_OPENABLE_MEMORY_KIB;
+        let t = ArgonParams::MAX_OPENABLE_ITERATIONS;
+        let corner = params(m, t, 1);
+        assert!(
+            corner.memory_kib <= m && corner.iterations <= t,
+            "control: inside both fields"
+        );
+        assert!(
+            !corner.is_openable(),
+            "max memory at max iterations must be refused by the product bound"
+        );
+
+        let product = ArgonParams::MAX_OPENABLE_MEMORY_ITERATION_PRODUCT;
+        assert!(
+            params((product / 2) as u32, 2, 1).is_openable(),
+            "the product ceiling exactly is openable"
+        );
+        assert!(
+            !params((product / 2) as u32 + 1, 2, 1).is_openable(),
+            "one unit past the product ceiling is not"
+        );
+    }
+
+    /// The shipped default must be comfortably inside every bound — a guard
+    /// that refuses an honest profile is worse than no guard.
+    #[test]
+    fn the_desktop_default_is_openable() {
+        let d = ArgonParams::desktop_default();
+        assert!(d.is_openable());
+        let product = (d.memory_kib as u64) * (d.iterations as u64);
+        assert!(
+            product * 8 <= ArgonParams::MAX_OPENABLE_MEMORY_ITERATION_PRODUCT,
+            "the default should sit well inside the product bound, not at its edge"
+        );
+    }
+
+    /// `from_toml` refuses work factors outside the bound. `daemonseed.toml`
+    /// carries no authenticator, so this is the weakest of the four readers.
+    #[test]
+    fn from_toml_refuses_out_of_range_argon_params() {
+        let ok = "profile_id = \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\"\n\
+                  [argon2]\nmemory_kib = 19456\niterations = 2\nparallelism = 1\n";
+        assert!(
+            ProfileConfig::from_toml(ok).is_ok(),
+            "control: an honest config parses"
+        );
+
+        let absurd = "profile_id = \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\"\n\
+                      [argon2]\nmemory_kib = 4294967295\niterations = 2\nparallelism = 1\n";
+        match ProfileConfig::from_toml(absurd) {
+            Err(ProfileConfigError::ArgonParamsOutOfRange(p)) => {
+                assert_eq!(p.memory_kib, u32::MAX);
+            }
+            other => panic!("expected ArgonParamsOutOfRange, got {other:?}"),
+        }
+    }
 
     #[test]
     fn first_start_generates_random_uuid() {

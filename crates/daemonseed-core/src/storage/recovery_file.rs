@@ -47,6 +47,14 @@
 //! suite tag fails authentication directly rather than via the
 //! derived-key-mismatch path.
 //!
+//! **That argument holds for correctness and not for cost.** Rejecting a
+//! forged header via a wrong key requires deriving the key first, and the
+//! header is what says how expensive the derivation is — so a `.dseed` naming
+//! a four-terabyte Argon2 memory cost is honoured before it can be refused, and
+//! the refusal never arrives. [`ArgonParams::is_openable`] bounds the header's
+//! stated cost before any derivation, which is the only order that works here;
+//! an honest file's parameters are three orders of magnitude below the ceiling.
+//!
 //! Recovery on a clean device per ISC-C36: read header → prompt for
 //! passphrase → derive key (from header's salt + params) → decrypt → on
 //! success the caller persists the embedded profile-id + argon2 params
@@ -375,6 +383,16 @@ fn parse_post_suite_header(
         iterations,
         parallelism,
     };
+    // These came out of the file, and the key has to be derived before the tag
+    // can reject the file — so an absurd cost here is work done on behalf of
+    // whoever wrote the file. This is the surface where that matters most: a
+    // `.dseed` arrives from somewhere else by definition. See
+    // `ArgonParams::is_openable`.
+    if !argon2.is_openable() {
+        return Err(RecoveryFileError::Malformed(
+            "argon parameters out of range",
+        ));
+    }
 
     Ok((profile_id, argon2, &bytes[cursor..]))
 }
@@ -525,6 +543,33 @@ mod tests {
         match open(&file, pp) {
             Err(RecoveryFileError::AuthenticationFailed) => {}
             other => panic!("expected AuthenticationFailed, got {other:?}"),
+        }
+    }
+
+    /// A `.dseed` header naming an absurd Argon2 cost is refused before any
+    /// derivation.
+    ///
+    /// The test above flips the low bit of `memory_kib`, which leaves the cost
+    /// small, so the file reaches the tag and fails authentication — correct,
+    /// and it says nothing about a header that asks for terabytes. This surface
+    /// is where that matters most: a recovery file arrives from somewhere else
+    /// by definition, and the key must be derived before the tag can reject it.
+    /// Measured with the guard removed: a 4 TiB allocation attempt, and the
+    /// process aborts.
+    #[test]
+    fn an_absurd_argon_cost_is_refused_before_deriving() {
+        init_oxicrypt();
+        let pid = Uuid::new_v4();
+        let pp = "passphrase x";
+        let file = seal(&fresh_mnemonic(), pp, pid, fast_params()).unwrap();
+        assert!(open(&file, pp).is_ok(), "control: the intact file opens");
+
+        let mem_kib_offset = MAGIC.len() + SUITE_ID_LEN + PROFILE_ID_LEN;
+        let mut absurd = file.clone();
+        absurd[mem_kib_offset..mem_kib_offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        match open(&absurd, pp) {
+            Err(RecoveryFileError::Malformed("argon parameters out of range")) => {}
+            other => panic!("expected the range refusal, got {other:?}"),
         }
     }
 
