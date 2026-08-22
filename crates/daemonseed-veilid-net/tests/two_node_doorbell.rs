@@ -39,6 +39,8 @@
 //! the REAL daemonseed crypto (`dm::doorbell::{derive_owner_seed, slot_for}` and
 //! `dm::firstcontact::{build, open}`) — no crypto is reimplemented here.
 
+use daemonseed_core::dm::firstcontact::FirstContactRequest;
+use daemonseed_core::dm::pow::PowDifficulty;
 use daemonseed_core::dm::{doorbell, firstcontact};
 use daemonseed_core::identity::keys::{derive_identity_keys, Identity, IdentityKeys};
 use daemonseed_core::identity::mnemonic::Mnemonic;
@@ -149,15 +151,22 @@ async fn a_knock_reaches_the_recipients_doorbell_and_opens_for_them_alone() {
     // ── A knocks ─────────────────────────────────────────────────────────────
     const BODY: &str = "knock knock — this is the first thing alice ever said to bob";
     let sent_unix_ms = 1_700_000_000_000i64;
-    let (entry, _state) = firstcontact::build(
-        &alice.signing,
-        &alice_pseudonym.signing,
-        &bob_pk,
-        &bob_ek,
-        FC_EPOCH,
+    // Production difficulty, not a reduced one. This test runs on a real host against
+    // the public network, so the entry it puts on the wire should be the entry a real
+    // sender puts there — a reduced proof would pass here and be refused by any verifier
+    // that later reads the slot. The couple of seconds it costs to mint is dwarfed by
+    // the DHT propagation this test already waits on.
+    let (entry, _state) = firstcontact::build(FirstContactRequest {
+        signing_lt: &alice.signing,
+        signing_pc: &alice_pseudonym.signing,
+        recipient_pk_lt: &bob_pk,
+        kem_ek_b: &bob_ek,
+        fc_epoch: FC_EPOCH,
         sent_unix_ms,
-        BODY,
-    )
+        body: BODY,
+        token: None,
+        difficulty: PowDifficulty::PRODUCTION,
+    })
     .expect("A builds a first-contact entry");
     assert!(
         entry.len() <= firstcontact::MAX_ENTRY_LEN,
@@ -232,15 +241,17 @@ async fn a_knock_reaches_the_recipients_doorbell_and_opens_for_them_alone() {
     // went. If it scattered, a sender with a flaky link would consume slots out of
     // only 32 and orphan every earlier attempt (#118's bug class, on a record with
     // no room for it).
-    let (retry_entry, _retry_state) = firstcontact::build(
-        &alice.signing,
-        &alice_pseudonym.signing,
-        &bob_pk,
-        &bob_ek,
-        FC_EPOCH,
-        sent_unix_ms + 1,
-        BODY,
-    )
+    let (retry_entry, _retry_state) = firstcontact::build(FirstContactRequest {
+        signing_lt: &alice.signing,
+        signing_pc: &alice_pseudonym.signing,
+        recipient_pk_lt: &bob_pk,
+        kem_ek_b: &bob_ek,
+        fc_epoch: FC_EPOCH,
+        sent_unix_ms: sent_unix_ms + 1,
+        body: BODY,
+        token: None,
+        difficulty: PowDifficulty::PRODUCTION,
+    })
     .expect("A rebuilds its entry for the retry");
     assert_ne!(
         retry_entry, entry,

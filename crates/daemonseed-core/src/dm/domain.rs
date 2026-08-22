@@ -114,6 +114,30 @@ dm_labels! {
     /// un-openable at a different recipient or outside its epoch window. FROZEN.
     DM_FC_AAD = b"daemonseed/dm/fc/aad/v1";
 
+    /// Domain prefix for the first-contact proof-of-work preimage
+    /// ([`crate::dm::pow::pow_input`]). The recipient's key-record address, the
+    /// first-contact epoch, the entry hash and the nonce follow it, each
+    /// length-prefixed.
+    ///
+    /// **The `/v1` is where the difficulty lives.** [`crate::dm::pow::FC_POW_BITS`]
+    /// is a fixed protocol constant rather than an advertised or adaptive one, so
+    /// there is nowhere on the wire that says what difficulty an entry was minted
+    /// at — which means changing it is a change to what this label *means*, and the
+    /// only way to make two clients disagree about that safely is to change the
+    /// label with it. A `/v2` here is what a difficulty change costs. FROZEN.
+    DM_FC_POW = b"daemonseed/dm/fc/pow/v1";
+
+    /// Signature domain for a grantee-bound one-time invite token
+    /// ([`crate::dm::token::TokenV1`]), signed under the ISSUER's long-term key.
+    /// The grantee's long-term public key, the token nonce and the expiry follow
+    /// it, each length-prefixed.
+    ///
+    /// **The grantee's key is inside the preimage and not inside the token.** The
+    /// verifier takes it from `body.pk_lt` and rebuilds these bytes, so a token is
+    /// only ever valid stapled to the identity it names — possession of the bytes
+    /// proves nothing, and an intercepted token is inert. FROZEN.
+    DM_TOKEN = b"daemonseed/dm/token/v1";
+
     /// HKDF-Extract salt for the provisional handshake record's at-rest seal key,
     /// rooted in the profile's at-rest key material — **never** in `ss0`, which is
     /// what the record holds. Pairs with [`DM_PROVISIONAL_SEAL`] exactly as
@@ -326,6 +350,8 @@ mod tests {
         assert_eq!(DM_FC_SALT, b"daemonseed/dm/fc/salt/v1");
         assert_eq!(DM_FC_SEAL, b"daemonseed/dm/fc/seal/v1");
         assert_eq!(DM_FC_AAD, b"daemonseed/dm/fc/aad/v1");
+        assert_eq!(DM_FC_POW, b"daemonseed/dm/fc/pow/v1");
+        assert_eq!(DM_TOKEN, b"daemonseed/dm/token/v1");
         assert_eq!(DM_PROVISIONAL_SALT, b"daemonseed/dm/provisional/salt/v1");
         assert_eq!(DM_PROVISIONAL_SEAL, b"daemonseed/dm/provisional/seal/v1");
         assert_eq!(DM_PROVISIONAL_AAD, b"daemonseed/dm/provisional/aad/v1");
@@ -430,7 +456,7 @@ mod tests {
     /// these strings are on the wire and in derivations shipped to peers.
     #[test]
     fn every_label_matches_its_pre_migration_value() {
-        let pinned: [(&[u8], &[u8]); 37] = [
+        let pinned: [(&[u8], &[u8]); 39] = [
             (DM_ACK_SALT, b"daemonseed/dm/ack/salt/v1".as_slice()),
             (DM_ACK_SEAL, b"daemonseed/dm/ack/seal/v3".as_slice()),
             (DM_ACK_SIG, b"daemonseed/dm/ack/sig/v3".as_slice()),
@@ -462,6 +488,7 @@ mod tests {
                 b"daemonseed/dm/doorbell/slot-salt/v1".as_slice(),
             ),
             (DM_FC_AAD, b"daemonseed/dm/fc/aad/v1".as_slice()),
+            (DM_FC_POW, b"daemonseed/dm/fc/pow/v1".as_slice()),
             (DM_FC_SALT, b"daemonseed/dm/fc/salt/v1".as_slice()),
             (DM_FC_SEAL, b"daemonseed/dm/fc/seal/v1".as_slice()),
             (DM_KEYREC_OWNER, b"daemonseed/dm/keyrec/owner/v1".as_slice()),
@@ -498,6 +525,7 @@ mod tests {
             (DM_STORE_AAD, b"daemonseed/dm/store/aad/v1".as_slice()),
             (DM_STORE_SALT, b"daemonseed/dm/store/salt/v1".as_slice()),
             (DM_STORE_SEAL, b"daemonseed/dm/store/seal/v1".as_slice()),
+            (DM_TOKEN, b"daemonseed/dm/token/v1".as_slice()),
         ];
         assert_eq!(
             pinned.len(),

@@ -808,12 +808,15 @@ modules:
       DmDoorbellSlotSecret is a mnemonic-derived, identity-scoped expansion of
       the identity PRK; a writer builds its RecordShape from DOORBELL_SLOTS.
       Sub-module dm::firstcontact builds and opens the self-contained
-      first-contact entry: build(signing_lt, signing_pc, recipient_pk_lt,
-      kem_ek_b, fc_epoch, sent_unix_ms, body) encapsulates ss0 to the recipient's
+      first-contact entry: build(FirstContactRequest { signing_lt, signing_pc,
+      recipient_pk_lt, kem_ek_b, fc_epoch, sent_unix_ms, body, token, difficulty })
+      encapsulates ss0 to the recipient's
       static key, generates the opening ratchet ephemeral itself, signs bind_lt
       under the long-term key and msg_sig under the pseudonym, pads the encoded
-      body to a PAD_BUCKETS entry, and seals it; it returns the entry bytes and a
-      FirstContactState the sender keeps. That struct has no Drop impl — ss0 is
+      body to a PAD_BUCKETS entry, seals it, and mints the proof of work over the
+      sealed bytes; it returns the entry bytes and a
+      FirstContactState the sender keeps. It BLOCKS for the mint — seconds at
+      production difficulty — so a UI caller moves it off-thread. That struct has no Drop impl — ss0 is
       Zeroizing — so its fields move out; the fields are private, roots() and
       eph_ek() borrow the non-secret ones, and into_provisional() is the sole exit,
       consuming it into a dm::provisional::ProvisionalRecord.
@@ -821,7 +824,13 @@ modules:
       opens against the current then previous epoch, exact-length gates every
       field, rejects a foreign intended_recipient_hash, and verifies bind_lt then
       msg_sig before returning a VerifiedFirstContact, and requires seq == 0 and
-      key_selector == STATIC. msg_sig_input binds, each u64-BE length-prefixed,
+      key_selector == STATIC. It checks NO proof of work and NO invite token —
+      dm::admission is the sweep path. open_at_epochs(entry, recipient_dk,
+      recipient_pk_lt, sealed_epochs, gate) opens at the nominated epochs only and runs
+      `gate` over a BodyGateView { pk_lt, pk_pc, token } after the free body
+      checks and before bind_lt and msg_sig; a gate returning Err aborts the open.
+      VerifiedFirstContact::token_bytes() borrows the entry's unverified invite
+      token in wire form, empty when absent. msg_sig_input binds, each u64-BE length-prefixed,
       frame_kind || chan_id || dir || seq || eph_ek || intended_recipient_hash ||
       pk_pc || pk_lt || sent_unix_ms || body under daemonseed/dm/msg/sig/v6.
       derive_channel_roots(ss0) yields AR and chan_id; chan_id is never
@@ -832,9 +841,52 @@ modules:
       fingerprints it in one call; a Ratchet carries the result and exposes it as
       ar_fingerprint(). Taking ss0 rather than a fingerprint is deliberate: a
       constructor accepting the fingerprint could be handed one from another
-      conversation, which is the defect (#270). DM_BODY_CAP caps a body at 8192 bytes; MAX_ENTRY_LEN is the
-      dflt(32) subkey cap the PAD_BUCKETS ladder and POW_RESERVE are sized
-      against. Sub-module dm::ratchet is the conversation key schedule:
+      conversation, which is the defect (#270). DM_BODY_CAP caps a body at 8192 bytes and
+      DM_BODY_CAP_TOKENED at 4096 when an invite token shares the padded envelope
+      (refused as FirstContactError::TokenedBodyTooLarge, its own variant so the
+      refusal names the token rather than the padding ladder); MAX_ENTRY_LEN is the
+      dflt(32) subkey cap the PAD_BUCKETS ladder is sized
+      against. Sub-module dm::pow is the first-contact proof of work: FC_POW_BITS
+      is 22 leading zero bits and FC_POW_LEN is the 8-byte big-endian nonce field;
+      entry_hash(ct0, sealed) is SHA-384 of the two raw fields concatenated with no
+      framing, so it is unambiguous only because admission pins ct0 to CT0_LEN
+      first; pow_input(recipient_keyrec_addr, fc_epoch, entry_hash, nonce) is
+      daemonseed/dm/fc/pow/v1 || lp(addr) || lp(BE64(epoch)) || lp(H) ||
+      lp(BE64(nonce)); has_leading_zero_bits reads MSB-first; mint searches from an
+      OS-entropy start with wrapping addition; verify(addr, current_fc_epoch, H,
+      pow, difficulty) checks the current then the previous epoch and RETURNS a
+      ValidEpochs of every epoch that validated — those are the only epochs the AEAD
+      is then attempted at. Plural because a nonce clears both thresholds one time
+      in 2^FC_POW_BITS, and trying only the first match would silently drop a
+      legitimate previous-epoch knock at that rate.
+      PowDifficulty::PRODUCTION is the sole value ordinary code can name;
+      reduced_for_test is gated on the crate's `testing` feature. Difficulty is a
+      fixed constant versioned by the /pow/v1 label — never advertised, never
+      adaptive. Sub-module dm::token is the grantee-bound one-time invite token:
+      TokenV1 is nonce_t(32) || BE64(expiry) || ML-DSA-87 sig(4627), TOKEN_LEN
+      4667, signed under daemonseed/dm/token/v1 || lp(grantee_pk_lt) ||
+      lp(nonce_t) || lp(BE64(expiry)) by the ISSUER's long-term key; the grantee
+      key is in the preimage and NOT in the token, so the verifier supplies it from
+      body.pk_lt and a stolen token is inert. mint/mint_default (TOKEN_VALIDITY_SECS
+      30 days), encode/decode (width-gated only), is_current(now), verify(
+      issuer_pk_lt, grantee_pk_lt). SpentTokenSet is the recipient-local consumed
+      set: insert/contains/revoke/prune/encode/decode, pruning at expiry +
+      SPENT_RETENTION_SECS (2 * FC_PERIOD_SECS). Sub-module dm::admission is the
+      ordered sweep verification (D10): Admitter::admit(entry_bytes,
+      previous_bytes, already_known) runs unchanged-slot skip, shape gates, entry
+      hash and SeenSet, proof of work, then decapsulation, AEAD at the proved epoch,
+      free body gates, idempotent re-accept, token gates, signatures token-first,
+      and consumes the nonce only after every verification passes. An entry enters
+      the SeenSet only AFTER its proof passes, so the set's memory is bounded by
+      what the attacker paid for. AdmissionPolicy::Open ignores the token field
+      entirely — never decoded, never verified, never consumed. AdmissionOutcome is
+      Admitted { verified, token_nonce, idempotent } or Dropped(DropReason);
+      drop_reason() reads the step. AdmissionCounters is unconditional and is what
+      makes "the decapsulation was not reached" checkable. SeenSet is per-epoch,
+      bounded at SEEN_SET_CAPACITY (1024), with retire(current_fc_epoch) dropping
+      epochs outside the accept window. NOT YET AVAILABLE: where the SpentTokenSet
+      is persisted — dm_store is correspondence-scoped and has no profile-global
+      record kind. Sub-module dm::ratchet is the conversation key schedule:
       derive_root(ss0) expands daemonseed/dm/ratchet/root/v2 from the same
       Extract(daemonseed/dm/root/salt/v1, ss0) that yields AR and chan_id;
       advance_root(previous, encapsulated) is Extract(salt=previous_root,

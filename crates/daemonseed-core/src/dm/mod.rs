@@ -64,6 +64,7 @@ pub(crate) fn unpad(padded: &[u8]) -> Option<&[u8]> {
 }
 
 pub mod ack;
+pub mod admission;
 pub mod collect;
 pub mod domain;
 pub mod doorbell;
@@ -73,6 +74,8 @@ pub mod keyrec;
 pub mod outbox;
 pub mod paging;
 pub mod persist;
+pub mod pow;
 pub mod provisional;
 pub mod ratchet;
 pub mod resume;
+pub mod token;

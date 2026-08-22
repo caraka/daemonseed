@@ -29,6 +29,10 @@ work lives in the project lead's vault manifest, not here.
 - Direct-message doorbell transport: a first-contact entry publishes into a slot of the
   recipient's world-derivable doorbell record, and a recipient sweeps all 32 slots of its own.
   A user's first send is classified `Chat`; a scheduler re-dispatch is `Keepalive`. (#233)
+- First-contact admission: a knock carries a SHA-384 hashcash proof of work bound to the entry,
+  the recipient and the epoch, plus an invite token bound to its grantee and redeemable once.
+  A verifier disposes of a doorbell slot cheapest-check-first, admitting an entry to the
+  duplicate-suppression set only once its proof of work has been paid. (#233)
 
 ### Changed
 

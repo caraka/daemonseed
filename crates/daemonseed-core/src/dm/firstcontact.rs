@@ -68,6 +68,7 @@ use crate::aead_envelope::{EnvelopeError, open_envelope, seal_envelope};
 use crate::dm::LEN_PREFIX;
 use crate::dm::domain;
 use crate::dm::keyrec;
+use crate::dm::pow;
 use crate::dm::ratchet;
 use crate::identity::keys::{SignKeypair, SignatureError, verify_signature};
 
@@ -102,17 +103,41 @@ pub const DM_BODY_CAP: usize = 8192;
 /// small. The top bucket is chosen so that a padded, token-bearing entry still
 /// fits the 32768-byte subkey (frozen build-contract item (iv)); the test
 /// `a_maximal_entry_fits_the_doorbell_subkey` is what actually holds that line.
+///
+/// # Adding a bucket is a cryptographic change, not a tuning change
+///
+/// The proof-of-work binds an entry through `H = SHA-384(ct0 ‖ sealed)`, which
+/// carries **no internal length framing**. It is injective only because *both*
+/// operands are pinned: `ct0` to its single legal width by the shape gate, and
+/// `sealed` to this ladder. Because this ladder has more than one rung, the
+/// split is already ambiguous by `PAD_BUCKETS[1] - PAD_BUCKETS[0]` — an entry
+/// with `ct0` = 6688 / `sealed` = 20480 + overhead hashes identically to one
+/// with `ct0` = 1568 / `sealed` = 25600 + overhead, and a single nonce would
+/// prove both. Only the `ct0` gate makes that unreachable.
+///
+/// So a third rung does not introduce the hazard, it *widens* it — which is the
+/// kind of change that reads as free and is not. The invariant to preserve is
+/// **both operands pinned**, whatever this ladder becomes. See
+/// [`crate::dm::pow::entry_hash`], whose `# Precondition` states the caller's
+/// half of it.
 pub const PAD_BUCKETS: &[usize] = &[20480, 25600];
 
 /// Hard ceiling on an assembled entry — the `dflt(32)` per-subkey cap.
 pub const MAX_ENTRY_LEN: usize = 32768;
 
-/// Bytes reserved for a proof-of-work the admission slice has yet to define.
+/// Largest first-message body when the entry also carries an invite token.
 ///
-/// The frozen design specifies the PoW preimage but never its encoded size, so
-/// the headroom it will need is budgeted here rather than discovered when a write
-/// is refused. `a_maximal_entry_fits_the_doorbell_subkey` asserts against it.
-pub const POW_RESERVE: usize = 64;
+/// The token's 4671 wire bytes ride **inside** the padded plaintext, so they come
+/// out of the same top bucket the body does. With ~16,084 bytes of fixed
+/// cryptographic material before either of them, a tokened body caps at roughly
+/// 4.8 KB arithmetically; 4096 leaves ~700 bytes of framing margin and is ample
+/// for the hello-grade first message the frozen design intends.
+///
+/// **It exists so the refusal can name its reason.** Without an explicit constant
+/// an over-long tokened body is discovered deep inside `pad_plaintext` as a
+/// `TooLarge` naming the padding ladder — a compose-time failure that tells the
+/// author nothing about the token they attached.
+pub const DM_BODY_CAP_TOKENED: usize = 4096;
 
 /// The direction label bound into `msg_sig`. First contact is always
 /// initiator-to-recipient.
@@ -184,6 +209,17 @@ pub enum FirstContactError {
     /// The body exceeds [`DM_BODY_CAP`], or the padded entry would exceed
     /// [`MAX_ENTRY_LEN`]. A local compose-time refusal, never a network condition.
     TooLarge { got: usize, max: usize },
+    /// The body exceeds [`DM_BODY_CAP_TOKENED`] on an entry that carries an invite
+    /// token.
+    ///
+    /// **Its own variant, not a `TooLarge` with a different number.** The author of
+    /// an over-long tokened body needs to know that attaching the token is what
+    /// moved the cap — a `TooLarge` naming 25600 sends them looking at the padding
+    /// ladder for a limit that has not changed.
+    TokenedBodyTooLarge { got: usize, max: usize },
+    /// A proof of work could not be minted. Compose-path only; a verifier never
+    /// produces this, because a bad proof is a silent drop and not an error.
+    Pow(crate::dm::pow::PowError),
     /// The entry is addressed to a different identity. Read only after
     /// decapsulating — see the module docs.
     WrongRecipient,
@@ -209,6 +245,12 @@ impl std::fmt::Display for FirstContactError {
                 actual,
             } => write!(f, "{field} must be {expected} bytes, got {actual}"),
             Self::TooLarge { got, max } => write!(f, "entry is {got} bytes, cap is {max}"),
+            Self::TokenedBodyTooLarge { got, max } => write!(
+                f,
+                "a token-bearing first message is {got} bytes, cap is {max} — the invite \
+                 token shares the padded envelope with the body"
+            ),
+            Self::Pow(e) => write!(f, "could not mint the first-contact proof of work: {e}"),
             Self::WrongRecipient => write!(f, "the entry is addressed to another identity"),
             Self::StaleEpoch => write!(f, "the entry's first-contact epoch is stale"),
             Self::EntropySource => write!(f, "the entropy source failed"),
@@ -518,23 +560,81 @@ impl std::fmt::Debug for FirstContactState {
     }
 }
 
-/// Build a padded, sealed first-contact entry, plus the state the sender must keep.
+/// Everything [`build`] needs to compose one knock.
 ///
-/// `signing_lt` is the sender's long-term identity key and `signing_pc` the
-/// per-contact pseudonym minted for this correspondent. `kem_ek_b` is the
-/// recipient's published encapsulation key — the caller is responsible for having
-/// verified the key record it came from, because everything here is encapsulated
-/// to it.
+/// **A struct rather than nine positional arguments.** Admission added two —
+/// an optional invite token and the proof-of-work difficulty — to a call that
+/// already stood at seven, and the two easiest mistakes at such a call site are
+/// both silent: `signing_lt` and `signing_pc` are the same type, and so are
+/// `recipient_pk_lt` and the sender's own long-term key. Named fields make each
+/// one visible at the call.
+pub struct FirstContactRequest<'a> {
+    /// The sender's long-term identity key, which signs `bind_lt`.
+    pub signing_lt: &'a SignKeypair,
+    /// The per-contact pseudonym minted for this correspondent, which signs
+    /// `msg_sig` and will sign every message of the conversation.
+    pub signing_pc: &'a SignKeypair,
+    /// The recipient's long-term public key — hashed into the entry and used to
+    /// derive the key-record address the seal and the proof of work both bind.
+    pub recipient_pk_lt: &'a [u8; ml_dsa::PK_LEN],
+    /// The recipient's published static encapsulation key. The caller is
+    /// responsible for having verified the key record it came from, because
+    /// everything here is encapsulated to it.
+    pub kem_ek_b: &'a [u8; ml_kem::EK_LEN],
+    /// The first-contact epoch, bound by the seal's AAD **and** by the proof of
+    /// work — one value, two bindings, no new state.
+    pub fc_epoch: u64,
+    /// The sender's claimed compose time, in Unix milliseconds. Signed, so it is
+    /// authentic to the sender, which is not the same as true.
+    pub sent_unix_ms: i64,
+    /// The first message.
+    pub body: &'a str,
+    /// An invite token, when knocking at an `invite_only` recipient. Its presence
+    /// lowers the body cap to [`DM_BODY_CAP_TOKENED`], because it shares the
+    /// padded envelope with the body.
+    pub token: Option<&'a crate::dm::token::TokenV1>,
+    /// The difficulty to mint at. Production code has only
+    /// [`crate::dm::pow::PowDifficulty::PRODUCTION`] to name.
+    pub difficulty: crate::dm::pow::PowDifficulty,
+}
+
+/// Build a padded, sealed first-contact entry with its proof of work minted, plus
+/// the state the sender must keep.
+///
+/// **This blocks for as long as the proof of work takes** — seconds at production
+/// difficulty. A caller on a UI thread must move it off; thread placement,
+/// cancellation on compose-abandon and progress reporting belong to the composing
+/// layer rather than here.
+///
+/// The proof is minted **after** the seal, because it binds
+/// `SHA-384(ct0 ‖ sealed)`: the work is spent on this exact entry, so it cannot be
+/// precomputed for an entry that does not exist yet, and it cannot be carried to a
+/// second one.
 pub fn build(
-    signing_lt: &SignKeypair,
-    signing_pc: &SignKeypair,
-    recipient_pk_lt: &[u8; ml_dsa::PK_LEN],
-    kem_ek_b: &[u8; ml_kem::EK_LEN],
-    fc_epoch: u64,
-    sent_unix_ms: i64,
-    body: &str,
+    request: FirstContactRequest<'_>,
 ) -> Result<(Vec<u8>, FirstContactState), FirstContactError> {
-    if body.len() > DM_BODY_CAP {
+    let FirstContactRequest {
+        signing_lt,
+        signing_pc,
+        recipient_pk_lt,
+        kem_ek_b,
+        fc_epoch,
+        sent_unix_ms,
+        body,
+        token,
+        difficulty,
+    } = request;
+
+    // The cap depends on whether a token is riding inside the seal, and the
+    // refusal names which cap it hit — see `DM_BODY_CAP_TOKENED`.
+    if let Some(_token) = token {
+        if body.len() > DM_BODY_CAP_TOKENED {
+            return Err(FirstContactError::TokenedBodyTooLarge {
+                got: body.len(),
+                max: DM_BODY_CAP_TOKENED,
+            });
+        }
+    } else if body.len() > DM_BODY_CAP {
         return Err(FirstContactError::TooLarge {
             got: body.len(),
             max: DM_BODY_CAP,
@@ -601,7 +701,7 @@ pub fn build(
         body: body.to_owned(),
         eph_ek: eph_ek.to_vec(),
         msg_sig: msg_sig.to_vec(),
-        token: Vec::new(),
+        token: token.map(|t| t.encode()).unwrap_or_default(),
     };
 
     let mut encoded = body_msg.encode_to_vec();
@@ -616,10 +716,16 @@ pub fn build(
     padded.zeroize();
     let sealed = sealed?;
 
+    // The proof binds the sealed bytes, so it can only be minted now. This is the
+    // slow step.
+    let h = pow::entry_hash(&ct0, &sealed).map_err(FirstContactError::Pow)?;
+    let nonce =
+        pow::mint(addr.as_bytes(), fc_epoch, &h, difficulty).map_err(FirstContactError::Pow)?;
+
     let entry = wire::FirstContactEntry {
         ct0: ct0.to_vec(),
         sealed,
-        pow: Vec::new(),
+        pow: pow::nonce_to_field(nonce),
     }
     .encode_to_vec();
 
@@ -638,6 +744,59 @@ pub fn build(
             roots,
         },
     ))
+}
+
+/// Seal an arbitrary, hand-built body into a valid entry, for tests only.
+///
+/// **What this exists to reach.** `build` can only produce bodies an honest sender
+/// would send, so the checks that only a *malicious* sender can trigger are
+/// unreachable through it — and the ones that matter most are the ordering
+/// properties, where the question is not "is this refused?" but "how far did it get
+/// before it was refused, and what had already been spent by then?".
+///
+/// The attacker this models is not exotic. The doorbell is world-writable and the
+/// writer chose `ss0` itself, so it holds the seal key: anyone can compose a body
+/// with whatever fields they like and seal it correctly. Everything downstream of
+/// the AEAD is therefore reachable by a stranger, which is exactly why the
+/// verification order downstream of the AEAD has to be tested.
+///
+/// `make_body` receives `ss0` because a body's `msg_sig` binds `chan_id`, which is
+/// derived from it — so the body cannot be built until after encapsulation.
+///
+/// `#[cfg(test)]`, so it is compiled into nothing a consumer of this crate can
+/// reach; it is `pub(crate)` only so [`crate::dm::admission`]'s tests can drive the
+/// pipeline with entries `build` would refuse to make.
+#[cfg(test)]
+pub(crate) fn seal_hand_built_for_test<F>(
+    recipient_pk_lt: &[u8; ml_dsa::PK_LEN],
+    kem_ek_b: &[u8; ml_kem::EK_LEN],
+    fc_epoch: u64,
+    difficulty: pow::PowDifficulty,
+    make_body: F,
+) -> Vec<u8>
+where
+    F: FnOnce(&[u8; SS0_LEN]) -> wire::FirstContactBody,
+{
+    let mut m = [0u8; ml_kem::SEED_LEN];
+    getrandom::fill(&mut m).expect("test entropy");
+    let (ss0, ct0) = ml_kem::encapsulate(kem_ek_b, &m).expect("test encapsulation");
+    let body = make_body(&ss0);
+    let padded = pad_plaintext(&body.encode_to_vec()).expect("body fits the ladder");
+    let addr = keyrec::derive_owner_seed(recipient_pk_lt).expect("owner seed");
+    let sealed = seal_envelope(
+        &seal_key(&ss0).expect("seal key"),
+        &seal_aad(addr.as_bytes(), fc_epoch),
+        &padded,
+    )
+    .expect("seal");
+    let h = pow::entry_hash(&ct0, &sealed).expect("entry hash");
+    let nonce = pow::mint(addr.as_bytes(), fc_epoch, &h, difficulty).expect("mint");
+    wire::FirstContactEntry {
+        ct0: ct0.to_vec(),
+        sealed,
+        pow: pow::nonce_to_field(nonce),
+    }
+    .encode_to_vec()
 }
 
 /// A first-contact entry whose seal opened and whose every signature verified.
@@ -728,6 +887,20 @@ pub struct VerifiedFirstContact {
     /// `Zeroize for String` wipes the live bytes and truncates; it cannot reach
     /// buffers this `String` already outgrew, which is the residue #263 is about.
     body: String,
+    /// The invite token the entry carried, still in wire form, empty when it
+    /// carried none.
+    ///
+    /// **Raw bytes rather than a parsed [`crate::dm::token::TokenV1`], and that is
+    /// deliberate.** Admission checks the token's width, expiry and spent-ness
+    /// *before* it spends an ML-DSA verification on it, and it gates all of that
+    /// behind the live local policy — so under an open policy these bytes are
+    /// never looked at at all. Parsing here would move work in front of the checks
+    /// that exist to avoid it, and would imply a validity this type does not
+    /// claim: the witness covers `bind_lt` and `msg_sig`, never the token.
+    ///
+    /// Wiped with everything else. It is not secret, but it names one grant, and
+    /// there are no `#[zeroize(skip)]` attributes on this struct at all.
+    token: Vec<u8>,
     /// The encapsulated secret, to persist as provisional handshake state.
     ///
     /// A bare array, so it has no `Drop` of its own and would otherwise outlive
@@ -779,6 +952,12 @@ impl VerifiedFirstContact {
         &self.roots
     }
 
+    /// The invite token the entry carried, in wire form; empty when it carried
+    /// none. Nothing here has been verified — see the field's own note.
+    pub fn token_bytes(&self) -> &[u8] {
+        &self.token
+    }
+
     /// Take the encapsulated secret, to persist as provisional handshake state.
     ///
     /// Consuming, and it hands back a [`Zeroizing`] rather than the bare array, so
@@ -826,6 +1005,7 @@ impl VerifiedFirstContact {
             seq,
             sent_unix_ms,
             body,
+            token: Vec::new(),
             ss0,
             roots,
         }
@@ -868,10 +1048,28 @@ impl std::fmt::Debug for VerifiedFirstContact {
             .field("seq", &self.seq)
             .field("sent_unix_ms", &self.sent_unix_ms)
             .field("body", &"<redacted>")
+            .field("token", &format_args!("{} bytes", self.token.len()))
             .field("ss0", &"<redacted>")
             .field("roots", &self.roots)
             .finish()
     }
+}
+
+/// What an [`open_at_epochs`] gate sees: the decoded body's public fields, after the
+/// cheap gates and **before** any signature has been verified.
+///
+/// Nothing here is authenticated. It is the view D10 steps 7 and 8 need — the
+/// claimed identity, so a caller can recognise an already-admitted correspondent,
+/// and the raw token bytes, so a caller can run the free checks before anything
+/// spends an ML-DSA verification.
+pub struct BodyGateView<'a> {
+    /// The sender's CLAIMED long-term identity key. `bind_lt` has not been checked
+    /// yet, so this is an assertion, not a fact.
+    pub pk_lt: &'a [u8; ml_dsa::PK_LEN],
+    /// The claimed per-contact pseudonym.
+    pub pk_pc: &'a [u8; ml_dsa::PK_LEN],
+    /// The invite token in wire form, empty when absent. Unverified.
+    pub token: &'a [u8],
 }
 
 /// Open and fully verify an entry from a doorbell slot.
@@ -879,6 +1077,13 @@ impl std::fmt::Debug for VerifiedFirstContact {
 /// `current_fc_epoch` is the recipient's own clock-derived epoch; the current and
 /// previous epoch are both accepted, which is the window that lets an entry
 /// composed while the recipient was offline still be collected.
+///
+/// **This is the crypto core, not the admission path.** It performs no
+/// proof-of-work check and no invite-token check, and it will happily spend a
+/// decapsulation on a proof-less entry — which is exactly what
+/// [`crate::dm::admission`] exists to stop it doing on a world-writable surface.
+/// Production sweeps go through admission; this entry point is for callers that
+/// have already paid, or are not on a sweep at all.
 ///
 /// Everything fails closed, and the failures are deliberately hard to tell apart
 /// from outside: the doorbell is world-writable, so garbage is an ordinary input.
@@ -888,6 +1093,80 @@ pub fn open(
     recipient_pk_lt: &[u8; ml_dsa::PK_LEN],
     current_fc_epoch: u64,
 ) -> Result<VerifiedFirstContact, FirstContactError> {
+    let mut epochs = vec![current_fc_epoch];
+    if let Some(previous) = current_fc_epoch.checked_sub(1) {
+        epochs.push(previous);
+    }
+    let mut sig_attempts = 0u64;
+    open_inner(
+        entry_bytes,
+        recipient_dk,
+        recipient_pk_lt,
+        &epochs,
+        &mut sig_attempts,
+        |_| Ok(()),
+    )
+}
+
+/// Open and fully verify an entry at the given epochs only, running `gate` between
+/// the cheap body checks and the signature verifications.
+///
+/// **The caller nominates the epochs because the proof of work already decided
+/// them.** A proof binds an epoch, so by the time admission reaches the seal it
+/// knows which epochs are worth trying; attempting any other would spend an AEAD
+/// open on a value the attacker has been shown not to have paid for. An entry
+/// whose proof and seal name different epochs therefore fails here, having cost
+/// two short hashes. Almost always a single epoch — see
+/// [`crate::dm::pow::ValidEpochs`] for the rare case that is not.
+///
+/// **The gate is where D10 steps 7 to 9 live.** It runs after the recipient hash,
+/// the sequence, the selector and the body cap — all free — and before `bind_lt`
+/// and `msg_sig`, which are not. That ordering is what makes an invalid-token
+/// flood at an invite-only recipient cost one ML-DSA verification instead of
+/// three. A gate returning `Err` aborts the open with that error; a gate wanting
+/// to record something about an otherwise-valid knock (that it is an idempotent
+/// re-accept, say) returns `Ok` and writes to its own captured state.
+///
+/// **`sig_attempts` counts verifications ATTEMPTED, not passed, and the
+/// distinction is the whole point of the parameter.** A caller measuring its own
+/// sweep cost needs the work it actually did, and a caller asserting that the gate
+/// ran *before* the expensive tier needs a number that moves when it does not: a
+/// success-only count reads zero on every failure path, so "we gated before
+/// verifying" and "we verified before gating and then failed" are
+/// indistinguishable — which makes any test resting on it vacuous. Incremented
+/// immediately before each `verify_signature`, so a failure is counted.
+pub fn open_at_epochs<G>(
+    entry_bytes: &[u8],
+    recipient_dk: &[u8; ml_kem::DK_LEN],
+    recipient_pk_lt: &[u8; ml_dsa::PK_LEN],
+    sealed_epochs: &[u64],
+    sig_attempts: &mut u64,
+    gate: G,
+) -> Result<VerifiedFirstContact, FirstContactError>
+where
+    G: FnOnce(&BodyGateView<'_>) -> Result<(), FirstContactError>,
+{
+    open_inner(
+        entry_bytes,
+        recipient_dk,
+        recipient_pk_lt,
+        sealed_epochs,
+        sig_attempts,
+        gate,
+    )
+}
+
+fn open_inner<G>(
+    entry_bytes: &[u8],
+    recipient_dk: &[u8; ml_kem::DK_LEN],
+    recipient_pk_lt: &[u8; ml_dsa::PK_LEN],
+    epochs: &[u64],
+    sig_attempts: &mut u64,
+    gate: G,
+) -> Result<VerifiedFirstContact, FirstContactError>
+where
+    G: FnOnce(&BodyGateView<'_>) -> Result<(), FirstContactError>,
+{
     let entry =
         wire::FirstContactEntry::decode(entry_bytes).map_err(|_| FirstContactError::Malformed)?;
     let ct0: [u8; CT0_LEN] = exact("ct0", &entry.ct0)?;
@@ -901,16 +1180,13 @@ pub fn open(
     let addr = keyrec::derive_owner_seed(recipient_pk_lt).map_err(owner_seed_err)?;
     let key = seal_key(&ss0)?;
 
-    // Current epoch first, then the previous one. Trying both is what tolerates a
-    // sender who composed just before a boundary; anything older simply will not
-    // open, so staleness needs no persisted seen-set.
-    let mut candidates = vec![current_fc_epoch];
-    if let Some(previous) = current_fc_epoch.checked_sub(1) {
-        candidates.push(previous);
-    }
-    let padded = candidates
-        .into_iter()
-        .find_map(|epoch| {
+    // Whichever epochs the caller nominated, in order. Through `open` that is the
+    // current one and then the previous, which tolerates a sender who composed
+    // just before a boundary; through `open_at_epoch` it is the single epoch the
+    // proof of work already established.
+    let padded = epochs
+        .iter()
+        .find_map(|&epoch| {
             open_envelope(&key, &seal_aad(addr.as_bytes(), epoch), &entry.sealed).ok()
         })
         .ok_or(FirstContactError::Aead)?;
@@ -952,7 +1228,17 @@ pub fn open(
         });
     }
 
+    // Everything above was free. The gate runs here — after the cheap checks, and
+    // before the two ML-DSA verifications below — which is the whole reason it is
+    // a seam rather than something the caller does afterwards.
+    gate(&BodyGateView {
+        pk_lt: &pk_lt,
+        pk_pc: &pk_pc,
+        token: &body.token,
+    })?;
+
     // The pseudonym is only meaningful if the long-term key vouches for it...
+    *sig_attempts += 1;
     verify_signature(&pk_lt, &bind_lt_input(&pk_lt, &pk_pc), &bind_lt)
         .map_err(|_| FirstContactError::Signature)?;
 
@@ -960,6 +1246,7 @@ pub fn open(
     // check is also the sole proof that the sender HOLDS the pseudonym key: without
     // it, anyone could staple someone else's `bind_lt` to their own message.
     let roots = derive_channel_roots(&ss0)?;
+    *sig_attempts += 1;
     verify_signature(
         &pk_pc,
         &msg_sig_input(
@@ -985,6 +1272,7 @@ pub fn open(
         seq: body.seq,
         sent_unix_ms: body.sent_unix_ms,
         body: body.body,
+        token: body.token,
         ss0,
         roots,
     })
@@ -1033,19 +1321,39 @@ mod tests {
         state: FirstContactState,
     }
 
+    /// The difficulty every test in this module mints at.
+    ///
+    /// Four bits — sixteen expected hashes — because `knock` is called dozens of
+    /// times per run and production difficulty is ~2.8 seconds each. The
+    /// production constant has its own test in [`crate::dm::pow`], and one
+    /// `#[ignore]`d round-trip mints at it for real.
+    fn test_bits() -> crate::dm::pow::PowDifficulty {
+        crate::dm::pow::PowDifficulty::reduced_for_test(4)
+    }
+
     fn knock(body: &str, epoch: u64) -> Knock {
+        knock_with_token(body, epoch, None)
+    }
+
+    fn knock_with_token(
+        body: &str,
+        epoch: u64,
+        token: Option<&crate::dm::token::TokenV1>,
+    ) -> Knock {
         let a = alice();
         let b = bob();
         let pc = pseudonym();
-        let (entry, state) = build(
-            &a.signing,
-            &pc.signing,
-            b.signing.public_key(),
-            b.kem.encapsulation_key(),
-            epoch,
-            SENT,
+        let (entry, state) = build(FirstContactRequest {
+            signing_lt: &a.signing,
+            signing_pc: &pc.signing,
+            recipient_pk_lt: b.signing.public_key(),
+            kem_ek_b: b.kem.encapsulation_key(),
+            fc_epoch: epoch,
+            sent_unix_ms: SENT,
             body,
-        )
+            token,
+            difficulty: test_bits(),
+        })
         .unwrap();
         Knock {
             entry,
@@ -1083,11 +1391,17 @@ mod tests {
             &pad_plaintext(&body.encode_to_vec()).unwrap(),
         )
         .unwrap();
+        // A real proof of work, at the reduced test difficulty: these entries go
+        // through `crate::dm::admission` in its own tests, where a `pow` of the
+        // wrong width would be refused at the shape gate and every downstream
+        // assertion would pass for the wrong reason.
+        let h = crate::dm::pow::entry_hash(&ct0, &sealed).unwrap();
+        let nonce = crate::dm::pow::mint(addr.as_bytes(), epoch, &h, test_bits()).unwrap();
         (
             wire::FirstContactEntry {
                 ct0: ct0.to_vec(),
                 sealed,
-                pow: Vec::new(),
+                pow: crate::dm::pow::nonce_to_field(nonce),
             }
             .encode_to_vec(),
             ss0,
@@ -1728,25 +2042,114 @@ mod tests {
         assert!(unpad_plaintext(&[0u8; 3]).is_err());
     }
 
-    /// The frozen build contract requires the top bucket to leave room for a
-    /// token-bearing entry inside the `dflt(32)` subkey. The arithmetic is easy to
-    /// get wrong by a few hundred bytes and the failure mode is a write the
-    /// network refuses, so the constraint is asserted on the reserve — not just on
-    /// today's outcome.
+    /// **The frozen build contract's item (iv), re-pinned with the real
+    /// encodings.** The top padding bucket must leave room for a token-bearing
+    /// entry inside the `dflt(32)` subkey. This supersedes the `POW_RESERVE` form
+    /// of the same test: that one asserted against a 64-byte guess at a proof of
+    /// work whose size the frozen design never fixed, and a guess cannot notice
+    /// that the real encoding is eight bytes or that the token cap is what makes
+    /// the arithmetic close.
+    ///
+    /// Both maximal entries are built for real rather than reasoned about, because
+    /// protobuf framing is exactly the thing an arithmetic argument gets wrong by a
+    /// few hundred bytes — and the failure mode is a write the network refuses.
     #[test]
     fn a_maximal_entry_fits_the_doorbell_subkey() {
-        let k = knock(&"x".repeat(DM_BODY_CAP), EPOCH);
-        let mut decoded = wire::FirstContactEntry::decode(&k.entry[..]).unwrap();
-        decoded.pow = vec![0u8; POW_RESERVE];
-        let with_pow = decoded.encode_to_vec().len();
-        // The token now rides INSIDE the seal, so its cost is already inside the
-        // padded bucket rather than added on top. Reserve it explicitly anyway, so
-        // the admission slice cannot silently spend headroom that is not there.
-        let maximal = with_pow + ml_dsa::SIG_LEN;
-        assert!(
-            maximal <= MAX_ENTRY_LEN,
-            "a maximal entry is {maximal} bytes, over the {MAX_ENTRY_LEN}-byte subkey cap"
+        let issuer = bob();
+        let grantee = alice();
+        let token = crate::dm::token::TokenV1::mint(
+            &issuer.signing,
+            grantee.signing.public_key(),
+            2_000_000_000,
+        )
+        .unwrap();
+
+        // The untokened maximum: a full 8192-byte body.
+        let plain = knock(&"x".repeat(DM_BODY_CAP), EPOCH);
+        // The tokened maximum: a full 4096-byte body plus the 4667-byte token.
+        let tokened = knock_with_token(&"x".repeat(DM_BODY_CAP_TOKENED), EPOCH, Some(&token));
+
+        for (name, entry) in [("untokened", &plain.entry), ("tokened", &tokened.entry)] {
+            let decoded = wire::FirstContactEntry::decode(&entry[..]).unwrap();
+            assert_eq!(
+                decoded.pow.len(),
+                crate::dm::pow::FC_POW_LEN,
+                "{name}: the proof of work is a fixed eight bytes"
+            );
+            // Both must pad to the TOP bucket — if either dropped to the lower
+            // rung, the ladder would be leaking a size class rather than hiding
+            // one, and this test would still pass on the entry-length assertion
+            // alone.
+            assert_eq!(
+                decoded.sealed.len(),
+                crate::circle::message::NONCE_LEN
+                    + PAD_BUCKETS[1]
+                    + crate::circle::message::TAG_LEN,
+                "{name}: a maximal entry must fill the top bucket"
+            );
+            assert!(
+                entry.len() <= MAX_ENTRY_LEN,
+                "{name}: a maximal entry is {} bytes, over the {MAX_ENTRY_LEN}-byte subkey cap",
+                entry.len()
+            );
+        }
+
+        // The two maximal entries are the same size, which is the whole point of
+        // the ladder: a co-host cannot tell a tokened knock from an untokened one.
+        assert_eq!(
+            plain.entry.len(),
+            tokened.entry.len(),
+            "a token must not be visible in the entry's length"
         );
+    }
+
+    /// **D11's compose-time refusal, and it names its own reason.** Without the
+    /// explicit cap, a 5 KB body plus a token overflows the top bucket and surfaces
+    /// as a `TooLarge` from inside `pad_plaintext` citing 25600 — which sends the
+    /// author looking at the padding ladder for a limit that did not change. The
+    /// token is what moved the cap, and the error has to say so.
+    #[test]
+    fn a_tokened_body_past_its_own_cap_is_refused_by_name() {
+        let issuer = bob();
+        let grantee = alice();
+        let pc = pseudonym();
+        let token = crate::dm::token::TokenV1::mint(
+            &issuer.signing,
+            grantee.signing.public_key(),
+            2_000_000_000,
+        )
+        .unwrap();
+
+        let compose = |body: &str, token: Option<&crate::dm::token::TokenV1>| {
+            build(FirstContactRequest {
+                signing_lt: &grantee.signing,
+                signing_pc: &pc.signing,
+                recipient_pk_lt: issuer.signing.public_key(),
+                kem_ek_b: issuer.kem.encapsulation_key(),
+                fc_epoch: EPOCH,
+                sent_unix_ms: SENT,
+                body,
+                token,
+                difficulty: test_bits(),
+            })
+            .map(|_| ())
+        };
+
+        // Control: exactly at the cap, it composes.
+        compose(&"x".repeat(DM_BODY_CAP_TOKENED), Some(&token)).unwrap();
+
+        assert!(
+            matches!(
+                compose(&"x".repeat(DM_BODY_CAP_TOKENED + 1), Some(&token)),
+                Err(FirstContactError::TokenedBodyTooLarge { got, max })
+                    if got == DM_BODY_CAP_TOKENED + 1 && max == DM_BODY_CAP_TOKENED
+            ),
+            "one byte over the tokened cap must be refused by name"
+        );
+
+        // And the SAME body without a token is fine — so the refusal is the token,
+        // not the length on its own.
+        compose(&"x".repeat(DM_BODY_CAP_TOKENED + 1), None).unwrap();
     }
 
     /// A body past the cap is refused locally at compose time, not discovered when
@@ -1757,15 +2160,17 @@ mod tests {
         let b = bob();
         let pc = pseudonym();
         assert!(matches!(
-            build(
-                &a.signing,
-                &pc.signing,
-                b.signing.public_key(),
-                b.kem.encapsulation_key(),
-                EPOCH,
-                SENT,
-                &"x".repeat(DM_BODY_CAP + 1),
-            ),
+            build(FirstContactRequest {
+                signing_lt: &a.signing,
+                signing_pc: &pc.signing,
+                recipient_pk_lt: b.signing.public_key(),
+                kem_ek_b: b.kem.encapsulation_key(),
+                fc_epoch: EPOCH,
+                sent_unix_ms: SENT,
+                body: &"x".repeat(DM_BODY_CAP + 1),
+                token: None,
+                difficulty: test_bits(),
+            }),
             Err(FirstContactError::TooLarge { .. })
         ));
     }
