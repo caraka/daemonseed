@@ -145,6 +145,43 @@ so the nodes don't collide on one machine. `DAEMONSEED_VEILID_TRACE=1` adds tran
 probes to a client's output, and `--x11` forces the software renderer (needed on some
 Wayland setups).
 
+## Two-node network oracles
+
+`crates/daemonseed-veilid-net/tests/` holds eleven `#[ignore]`d two-node tests —
+doorbell, DM channel, presence, room, share and the rest. Each brings up two nodes
+in one process and drives a real exchange between them, so each needs a host that
+can attach to the **public** Veilid network. Where attach is blocked, the wait
+returns `NotReady` after the full 180-second timeout.
+
+Running one from a checkout — `cargo test -p daemonseed-veilid-net --test <name>
+-- --ignored` — needs a full toolchain and a build directory on the machine with
+the network. Where that is inconvenient, build the oracle into a standalone
+binary and copy it across.
+
+```bash
+# Defaults to two_node_doorbell; pass any test file stem to build a different one.
+packaging/oracles/build-oracle.sh [TEST_NAME] [OUTPUT_DIR]
+```
+
+It cross-links against the same glibc 2.35 floor as the other packaging scripts,
+asserts that floor rather than assuming it, checks the binary really contains the
+ignored test, and prints the exact command to run. The output is
+`dist/oracles/<TEST_NAME>-x86_64`; copy it to the network host and run:
+
+```bash
+dist/oracles/two_node_doorbell-x86_64 --ignored --nocapture
+```
+
+No profile, environment or working directory is needed. Expect minutes rather than
+seconds — a first-contact oracle mints a real proof of work at production difficulty
+before anything reaches the network, and both nodes wait on DHT propagation.
+
+**These binaries are deliberately unsigned**, unlike every other packaging output.
+They call the test-only crypto init, which runs the power-up self-tests without the
+image check, because a test binary's bytes are not a shipped module image. Running
+one bare (no `--ignored`) executes whatever non-ignored tests it holds and is a
+quick way to confirm the artifact runs on the host at all.
+
 ## Gate before you commit / tag
 
 Building is not the gate. Before committing, run the

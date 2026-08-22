@@ -33,6 +33,10 @@ work lives in the project lead's vault manifest, not here.
   the recipient and the epoch, plus an invite token bound to its grantee and redeemable once.
   A verifier disposes of a doorbell slot cheapest-check-first, admitting an entry to the
   duplicate-suppression set only once its proof of work has been paid. (#233)
+- `packaging/oracles/build-oracle.sh` cross-builds any of the eleven two-node network oracles
+  into a single portable binary against the glibc 2.35 floor, so the network host runs one
+  executable instead of building the repository. Deliberately unsigned: the oracles use the
+  test-only crypto init.
 - `daemonseed_core::dm::spent_store` — the spent-invite-token set's home at the profile root,
   sealed under its own key. (#233)
 - `TrustEventLog::unreadable_entries` reports how many persisted entries this build could not
