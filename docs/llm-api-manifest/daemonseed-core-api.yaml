@@ -1096,12 +1096,13 @@ modules:
       prefix or inside a run and false otherwise, including for unknown positions;
       it reports settled, not collected. merge_own_ack(other) is a monotonic union
       for an ack this party itself published: the prefix never regresses and no
-      settled position is cleared. merge_peer_ack(other, highest_sent: Option<u64>)
-      -> Result<PeerAckOutcome, AckError> is that union with the peer's claim first
-      clipped to highest_sent, the highest sequence number this party has sent on
-      that direction; None clips the claim to empty. Only the peer's copy is
-      clipped. PeerAckOutcome is WithinCeiling or ClippedToCeiling { claimed,
-      ceiling }. Call it after verifying the ack's signature, not before. An insert
+      settled position is cleared. merge_peer_ack(other: PeerAck, highest_sent:
+      Option<u64>) -> Result<PeerAckOutcome, AckError> is that union with the peer's
+      claim first clipped to highest_sent, the highest sequence number this party
+      has sent on that direction; None clips the claim to empty. Only the peer's
+      copy is clipped. It consumes the PeerAck. PeerAckOutcome is WithinCeiling or
+      ClippedToCeiling { claimed, ceiling }. Call it after verifying the ack's
+      signature, not before. An insert
       or merge that would exceed MAX_ACK_RUNS (64) returns AckError::TooManyRuns
       and leaves the state unchanged; it never truncates. encode_beyond() is the
       canonical RLE of the runs: u16 count, then per run a big-endian u64 gap
@@ -1112,7 +1113,15 @@ modules:
       arithmetic leaving the sequence space (RunOutOfRange), and any run at or
       below the prefix (RunInPrefix); a declared run extent never drives an
       allocation, and the result is bounded by nothing the caller has sent until it
-      passes through merge_peer_ack. ack_sig_input(chan_id, dir, state) binds
+      passes through merge_peer_ack. It returns PeerAck, not AckState. PeerAck is
+      the decoded peer statement with no query methods: no is_settled, no
+      high_water, no runs, no beyond_runs, and an opaque Debug. Its only method is
+      sig_input(chan_id, dir) -> Vec<u8>, the same preimage ack_sig_input builds,
+      for verifying the ack's signature before the merge; it is a pure function of
+      the caller's own chan_id, dir, high_water and bytes. PeerAck is not Clone,
+      Copy or PartialEq and has no Deref, AsRef, Borrow or From conversion back to
+      AckState; merge_peer_ack consumes it, so the ceiling is a required argument
+      on the only path by which a peer's claim enters an AckState. ack_sig_input(chan_id, dir, state) binds
       daemonseed/dm/ack/sig/v3 || lp(chan_id) || lp(dir) || lp(high_water_be) ||
       lp(encoded runs); an absent prefix binds as a zero-length component.
       beyond_runs() yields those runs as ascending inclusive RangeInclusive<u64>,

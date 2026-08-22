@@ -124,6 +124,14 @@
 //! preimage the peer's signature cannot match. The order is decode → verify →
 //! merge under the ceiling.
 //!
+//! That leaves a decoded statement in the caller's hands with nothing bounding it,
+//! so the decoder does not return an [`AckState`]: it returns a [`PeerAck`], which
+//! has no query methods at all and can be spent only on
+//! [`AckState::merge_peer_ack`]. There is no `is_settled` on it, no prefix to be
+//! taken for a checked one, and nothing to query before the ceiling has been
+//! applied — see [`PeerAck`] for the precise bound, which is about what can be
+//! *asked*, not about bytes being unreachable.
+//!
 //! ## Prefix-advance-on-give-up, and the one thing this module cannot enforce
 //!
 //! Without a rule for permanent gaps the run set grows without bound: every
@@ -321,6 +329,179 @@ pub enum PeerAckOutcome {
         /// dropped.
         ceiling: Option<u64>,
     },
+}
+
+/// A peer's acknowledgement as the peer wrote it: well-formed, canonical, and
+/// checked against **nothing we know**.
+///
+/// ## Why this is a separate type with almost no methods
+///
+/// The ceiling that bounds a peer's claim lives on [`AckState::merge_peer_ack`],
+/// and it has to: a verifier rebuilds the signature preimage from the decoded
+/// statement, so a decoder that clipped would rebuild a preimage the peer's
+/// signature cannot match. The decoder therefore hands back an unbounded claim by
+/// design. If that claim came back as an [`AckState`] it would arrive carrying
+/// [`AckState::is_settled`], [`AckState::high_water`], [`AckState::runs`] and
+/// [`AckState::beyond_runs`] — the whole query surface of a state we have
+/// checked, answering from a `high_water` the peer chose. One signed ack claiming
+/// `2^40` would then answer `true` for every position that will ever exist, to any
+/// caller that asked before merging. The name `decode_unvalidated` and the
+/// `#[must_use]` on [`PeerAckOutcome`] discourage that; a type with no such
+/// methods makes it unrepresentable, which is the standard the rest of this module
+/// already holds ([`crate::dm::paging::PagePosition`]'s private fields,
+/// [`crate::dm::paging::DmPageOwnerSeed`]'s absent `Clone`).
+///
+/// The only things this type does are rebuild the preimage it was signed over
+/// ([`Self::sig_input`]) and be consumed by [`AckState::merge_peer_ack`], which
+/// applies the ceiling on the one path by which a peer's statement enters our
+/// state. It is taken **by value** there, and is neither `Clone` nor `Copy`, so
+/// one decoded statement merges once and a re-seeded ack is decoded again from
+/// the bytes that carried it.
+///
+/// `Debug` is deliberately opaque for the same reason: a formatted `high_water`
+/// and run list is the same unvalidated answer read a slower way.
+///
+/// **The property, stated exactly: nothing leaves this type that the caller did
+/// not put into it.** [`Self::sig_input`] is the only output, and it is a pure
+/// function of the `chan_id`, `dir`, `high_water` and bytes the caller itself
+/// supplied — computable outside this crate, from those same four inputs, in
+/// about eight lines. So it is a **convenience, not a disclosure**: it saves a
+/// verifier from re-implementing a wire format, and discloses nothing. What is
+/// gone is the *reading* of a peer's claim as a settlement verdict — no
+/// `is_settled` to be called by accident, and no prefix a caller can mistake for
+/// a checked one.
+///
+/// The sequence is **decode → verify the signature → merge**:
+///
+/// ```
+/// use daemonseed_core::dm::ack::{AckState, PeerAck};
+///
+/// // Two bytes: a run count of zero. The peer claims a contiguous prefix of 4.
+/// let peer: PeerAck = AckState::decode_unvalidated(Some(4), &[0, 0]).unwrap();
+///
+/// // ...verify a signature over `peer.sig_input(chan_id, dir)` here...
+///
+/// let mut ours = AckState::new();
+/// ours.merge_peer_ack(peer, Some(4)).unwrap();
+/// assert!(ours.is_settled(4));
+/// ```
+///
+/// ## What is pinned, and how
+///
+/// Every block below is a **trait-bound probe** (`fn needs_x<T: X>() {}`) or a
+/// function taking `&PeerAck` — deliberately, because **a one-character typo
+/// inside a `compile_fail` block turns it into a permanently-passing test**. A
+/// block that constructs its own fixture can be broken by mistyping `.unwrap()`,
+/// and the running example above would not catch it: that example is a *separate
+/// copy* of those lines, so it fires on a module-path rename and on nothing else.
+/// These blocks have no fixture to mistype. The example above still earns its
+/// place as the proof that the path and the flow compile at all.
+///
+/// No settlement query, under any of the four names [`AckState`] carries:
+///
+/// ```compile_fail
+/// fn q(p: &daemonseed_core::dm::ack::PeerAck) { let _ = p.is_settled(0); }
+/// ```
+/// ```compile_fail
+/// fn q(p: &daemonseed_core::dm::ack::PeerAck) { let _ = p.high_water(); }
+/// ```
+/// ```compile_fail
+/// fn q(p: &daemonseed_core::dm::ack::PeerAck) { let _ = p.runs(); }
+/// ```
+/// ```compile_fail
+/// fn q(p: &daemonseed_core::dm::ack::PeerAck) { let _ = p.beyond_runs(); }
+/// ```
+///
+/// And no conversion back to an [`AckState`], which would hand the whole query
+/// surface back by another door. Each of these is a total escape on its own:
+///
+/// ```compile_fail
+/// fn needs_deref<T: core::ops::Deref>() {}
+/// needs_deref::<daemonseed_core::dm::ack::PeerAck>();
+/// ```
+/// ```compile_fail
+/// fn needs_as_ref<T: AsRef<daemonseed_core::dm::ack::AckState>>() {}
+/// needs_as_ref::<daemonseed_core::dm::ack::PeerAck>();
+/// ```
+/// ```compile_fail
+/// fn needs_borrow<T: core::borrow::Borrow<daemonseed_core::dm::ack::AckState>>() {}
+/// needs_borrow::<daemonseed_core::dm::ack::PeerAck>();
+/// ```
+/// ```compile_fail
+/// fn needs_into<T: Into<daemonseed_core::dm::ack::AckState>>() {}
+/// needs_into::<daemonseed_core::dm::ack::PeerAck>();
+/// ```
+///
+/// Not `Clone`, so the move into [`AckState::merge_peer_ack`] cannot be
+/// sidestepped:
+///
+/// ```compile_fail
+/// fn needs_clone<T: Clone>() {}
+/// needs_clone::<daemonseed_core::dm::ack::PeerAck>();
+/// ```
+///
+/// Not `PartialEq`, which would let a claim be read out by bisection against
+/// states the caller builds itself:
+///
+/// ```compile_fail
+/// fn needs_eq<T: PartialEq>() {}
+/// needs_eq::<daemonseed_core::dm::ack::PeerAck>();
+/// ```
+///
+/// **Absent `Copy` is by construction, not verified.** The probe below passes,
+/// but [`AckState`] owns a `Vec`, so no edit to this file could make `PeerAck`
+/// `Copy` — there is no falsifying mutation, and a rule with no falsifying
+/// mutation is recorded as by-construction rather than counted among the proven
+/// ones.
+///
+/// ```compile_fail
+/// fn needs_copy<T: Copy>() {}
+/// needs_copy::<daemonseed_core::dm::ack::PeerAck>();
+/// ```
+///
+/// **What this does not reach:** a query added under some *other* name, or a
+/// blanket impl in a third crate. Neither is expressible as a bound here.
+pub struct PeerAck(AckState);
+
+impl PeerAck {
+    /// The signature preimage this statement was signed over, for the channel and
+    /// direction it arrived on.
+    ///
+    /// The one thing a holder of an unmerged peer ack legitimately needs, and the
+    /// step that must happen before [`AckState::merge_peer_ack`]. It rebuilds the
+    /// preimage from the decoded statement rather than from the bytes as handed
+    /// over, which is what the canonical encoding buys: one set has exactly one
+    /// spelling, so a signature over these bytes is a signature over the set.
+    ///
+    /// It answers nothing about settlement. What it returns is a function of the
+    /// `high_water` the caller itself passed to
+    /// [`AckState::decode_unvalidated`] and the bytes the caller itself supplied —
+    /// no new fact about the peer's claim leaves the type through here.
+    pub fn sig_input(&self, chan_id: &[u8; ROOT_LEN], dir: Direction) -> Vec<u8> {
+        ack_sig_input(chan_id, dir, &self.0)
+    }
+
+    /// The decoded statement, for this module's own tests only.
+    ///
+    /// It exists so the decoder's own tests can assert on what was decoded
+    /// without routing every one of them through a merge. **What contains the
+    /// query surface is the private tuple field, not this gate** — `mod tests` is
+    /// a descendant of `dm::ack` and could reach `self.0` either way. Private and
+    /// `cfg(test)` so the intent is stated and no production path, in this module
+    /// or any other, can compile a call to it.
+    #[cfg(test)]
+    fn state(&self) -> &AckState {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for PeerAck {
+    /// Opaque on purpose. Printing the prefix and the runs would put the
+    /// unvalidated claim back within reach of any caller willing to read a
+    /// string, which is the surface this type exists to remove.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PeerAck(<unvalidated>)")
+    }
 }
 
 /// Derive one direction's ack seal key:
@@ -572,13 +753,32 @@ impl AckState {
     ///
     /// **Order matters: verify the signature first.** The clip changes the
     /// statement, so a verifier must rebuild the preimage from the state as
-    /// decoded and check it *before* calling this. See
+    /// decoded — [`PeerAck::sig_input`] — and check it *before* calling this. See
     /// [`Self::decode_unvalidated`].
+    ///
+    /// The peer's statement arrives as a [`PeerAck`] and is **consumed** here.
+    /// What that buys is precise, and less than it may look: a [`PeerAck`] answers
+    /// no question about settlement and this is the only thing that can be done
+    /// with one, so **a caller cannot forget the ceiling** — it is a required
+    /// argument on the only road in. It does not make an unbounded read
+    /// impossible. `merge_peer_ack(peer, Some(u64::MAX))` bounds nothing and the
+    /// merged result then answers for anything the peer claimed; the tests below
+    /// use exactly that, named `NO_CLIP`, to exercise the union algebra with the
+    /// clip standing aside. Passing a real ceiling is the caller's obligation, and
+    /// the argument's presence is what makes it a decision rather than an
+    /// omission.
+    ///
+    /// [`PeerAckOutcome::ClippedToCeiling`]'s `claimed` likewise reports the
+    /// peer's raw, unvalidated top under any ceiling. That is deliberate — it is
+    /// the misbehaviour signal, and it is worthless if it reports the clipped
+    /// value — so it is one number about a claim that was rejected, not a query
+    /// surface on a claim that was accepted.
     pub fn merge_peer_ack(
         &mut self,
-        other: &Self,
+        other: PeerAck,
         highest_sent: Option<u64>,
     ) -> Result<PeerAckOutcome, AckError> {
+        let other = &other.0;
         let over = match (other.highest_settled(), highest_sent) {
             (Some(claimed), None) => Some(claimed),
             (Some(claimed), Some(ceiling)) if claimed > ceiling => Some(claimed),
@@ -689,20 +889,23 @@ impl AckState {
     /// prevent and which costs the liar the messages it claims to have. What
     /// matters here is that the lie is cheap to read.
     ///
-    /// **`unvalidated` is the whole name.** What comes back is the peer's
-    /// statement as the peer wrote it — well-formed and canonical, and nothing
-    /// more. In particular neither `high_water` nor any run has been checked
-    /// against what we actually sent, so [`Self::is_settled`] on the result will
-    /// happily answer for a position that was never transmitted. That is
-    /// deliberate and it is the only shape that works: a verifier rebuilds the
-    /// signature preimage from this state, so a decoder that altered it would
-    /// rebuild a preimage the peer's signature cannot match.
+    /// **`unvalidated` is the whole name, and the return type enforces it.** What
+    /// comes back is the peer's statement as the peer wrote it — well-formed and
+    /// canonical, and nothing more. Neither `high_water` nor any run has been
+    /// checked against what we actually sent. That is deliberate and it is the
+    /// only shape that works: a verifier rebuilds the signature preimage from this
+    /// statement, so a decoder that altered it would rebuild a preimage the peer's
+    /// signature cannot match.
     ///
-    /// The sequence is **decode → verify the signature → merge**, and the bound
-    /// arrives at the last step, where [`Self::merge_peer_ack`] requires it. A
-    /// caller that queries this state directly instead of merging it has skipped
-    /// the only check there is; the module docs say why that matters.
-    pub fn decode_unvalidated(high_water: Option<u64>, encoded: &[u8]) -> Result<Self, AckError> {
+    /// So it does not come back as an [`AckState`]. It comes back as a
+    /// [`PeerAck`], which answers no question about settlement and can only be
+    /// spent on [`Self::merge_peer_ack`] — where the ceiling is a required
+    /// argument. The sequence is **decode → verify the signature → merge**, and
+    /// there is now no fourth thing to do with the result.
+    pub fn decode_unvalidated(
+        high_water: Option<u64>,
+        encoded: &[u8],
+    ) -> Result<PeerAck, AckError> {
         let count_bytes: [u8; COUNT_LEN] = encoded
             .get(..COUNT_LEN)
             .ok_or(AckError::Malformed)?
@@ -746,10 +949,10 @@ impl AckState {
             cursor = end.checked_add(2);
         }
 
-        Ok(Self {
+        Ok(PeerAck(Self {
             high_water,
             beyond: runs,
-        })
+        }))
     }
 
     /// Settle one position. The single mutator; [`Self::collect`] and
@@ -895,6 +1098,17 @@ mod tests {
             state.collect(seq).expect("within the cap");
         }
         state
+    }
+
+    /// The same statement as it would arrive from the other party: encoded,
+    /// carried, and decoded back.
+    ///
+    /// A peer's ack reaches us only as bytes, and [`AckState::merge_peer_ack`]
+    /// now takes only what came out of a decode, so these tests go the whole way
+    /// round rather than handing a locally-built state straight to the merge.
+    fn from_peer(state: &AckState) -> PeerAck {
+        AckState::decode_unvalidated(state.high_water(), &state.encode_beyond())
+            .expect("its own encoding")
     }
 
     // ---- K_ack -------------------------------------------------------------
@@ -1210,7 +1424,7 @@ mod tests {
         let before = current.clone();
 
         assert_eq!(
-            current.merge_peer_ack(&stale, NO_CLIP).unwrap(),
+            current.merge_peer_ack(from_peer(&stale), NO_CLIP).unwrap(),
             PeerAckOutcome::WithinCeiling
         );
 
@@ -1222,7 +1436,7 @@ mod tests {
         let mut ahead = settled(&[0, 1, 2, 3]);
         let behind = AckState::new();
         assert_eq!(
-            ahead.merge_peer_ack(&behind, NO_CLIP).unwrap(),
+            ahead.merge_peer_ack(from_peer(&behind), NO_CLIP).unwrap(),
             PeerAckOutcome::WithinCeiling
         );
         assert_eq!(ahead.high_water(), Some(3));
@@ -1237,7 +1451,7 @@ mod tests {
         let theirs = settled(&[0, 1]);
 
         assert_eq!(
-            ours.merge_peer_ack(&theirs, NO_CLIP).unwrap(),
+            ours.merge_peer_ack(from_peer(&theirs), NO_CLIP).unwrap(),
             PeerAckOutcome::WithinCeiling
         );
 
@@ -1255,7 +1469,7 @@ mod tests {
         let theirs = settled(&[0, 1, 2, 3]);
 
         assert_eq!(
-            ours.merge_peer_ack(&theirs, NO_CLIP).unwrap(),
+            ours.merge_peer_ack(from_peer(&theirs), NO_CLIP).unwrap(),
             PeerAckOutcome::WithinCeiling
         );
 
@@ -1291,7 +1505,7 @@ mod tests {
         let before = ours.clone();
 
         assert!(matches!(
-            ours.merge_peer_ack(&theirs, NO_CLIP),
+            ours.merge_peer_ack(from_peer(&theirs), NO_CLIP),
             Err(AckError::TooManyRuns { .. })
         ));
         assert_eq!(ours, before);
@@ -1308,12 +1522,12 @@ mod tests {
     fn a_peer_cannot_settle_a_position_we_never_sent() {
         let absurd = AckState::decode_unvalidated(Some(u64::MAX), &[0, 0]).unwrap();
         assert!(
-            absurd.is_settled(9_000),
+            absurd.state().is_settled(9_000),
             "the decoded claim really does cover everything"
         );
 
         let mut ours = settled(&[0, 1, 2]);
-        let outcome = ours.merge_peer_ack(&absurd, Some(2)).unwrap();
+        let outcome = ours.merge_peer_ack(absurd, Some(2)).unwrap();
 
         assert_eq!(
             outcome,
@@ -1337,7 +1551,7 @@ mod tests {
         theirs.collect(1 << 40).unwrap();
 
         let mut ours = settled(&[0, 1]);
-        let outcome = ours.merge_peer_ack(&theirs, Some(1)).unwrap();
+        let outcome = ours.merge_peer_ack(from_peer(&theirs), Some(1)).unwrap();
 
         assert_eq!(
             outcome,
@@ -1362,7 +1576,7 @@ mod tests {
 
         let mut ours = AckState::new();
         assert_eq!(
-            ours.merge_peer_ack(&theirs, Some(6)).unwrap(),
+            ours.merge_peer_ack(from_peer(&theirs), Some(6)).unwrap(),
             PeerAckOutcome::ClippedToCeiling {
                 claimed: 7,
                 ceiling: Some(6),
@@ -1381,7 +1595,7 @@ mod tests {
         let theirs = settled(&[0, 1, 2, 9]);
         let mut ours = AckState::new();
 
-        let outcome = ours.merge_peer_ack(&theirs, None).unwrap();
+        let outcome = ours.merge_peer_ack(from_peer(&theirs), None).unwrap();
 
         assert_eq!(
             outcome,
@@ -1409,7 +1623,7 @@ mod tests {
         // inside it, so nothing is clipped from them — and nothing may be clipped
         // from us either.
         assert_eq!(
-            ours.merge_peer_ack(&theirs, Some(1)).unwrap(),
+            ours.merge_peer_ack(from_peer(&theirs), Some(1)).unwrap(),
             PeerAckOutcome::WithinCeiling
         );
 
@@ -1427,7 +1641,7 @@ mod tests {
         let mut ours = AckState::new();
 
         assert_eq!(
-            ours.merge_peer_ack(&theirs, Some(1)).unwrap(),
+            ours.merge_peer_ack(from_peer(&theirs), Some(1)).unwrap(),
             PeerAckOutcome::ClippedToCeiling {
                 claimed: 3,
                 ceiling: Some(1),
@@ -1436,7 +1650,7 @@ mod tests {
         assert_eq!(ours.high_water(), Some(1), "the truthful half was kept");
 
         // The same re-seeded ack, once we know we sent the rest.
-        let outcome = ours.merge_peer_ack(&theirs, Some(3)).unwrap();
+        let outcome = ours.merge_peer_ack(from_peer(&theirs), Some(3)).unwrap();
         assert_eq!(outcome, PeerAckOutcome::WithinCeiling);
         assert_eq!(ours.high_water(), Some(3), "and the rest arrived");
     }
@@ -1448,7 +1662,7 @@ mod tests {
         let theirs = settled(&[0, 1, 2]);
         let mut ours = AckState::new();
 
-        let outcome = ours.merge_peer_ack(&theirs, Some(2)).unwrap();
+        let outcome = ours.merge_peer_ack(from_peer(&theirs), Some(2)).unwrap();
 
         assert_eq!(outcome, PeerAckOutcome::WithinCeiling);
         assert_eq!(ours.high_water(), Some(2));
@@ -1493,11 +1707,10 @@ mod tests {
 
     fn round_trip(state: &AckState) {
         let encoded = state.encode_beyond();
-        let back =
-            AckState::decode_unvalidated(state.high_water(), &encoded).expect("its own encoding");
-        assert_eq!(&back, state);
+        let back = from_peer(state);
+        assert_eq!(back.state(), state);
         assert_eq!(
-            back.encode_beyond(),
+            back.state().encode_beyond(),
             encoded,
             "the encoding is not canonical"
         );
@@ -1544,12 +1757,13 @@ mod tests {
         encoded.extend_from_slice(&1u64.to_be_bytes()); // start at 1
         encoded.extend_from_slice(&(u64::MAX - 1).to_be_bytes()); // to the very top
 
-        let state =
+        let decoded =
             AckState::decode_unvalidated(None, &encoded).expect("an absurd claim is still a claim");
-        assert!(state.is_settled(1));
-        assert!(state.is_settled(u64::MAX));
-        assert!(!state.is_settled(0), "position 0 is still outside it");
-        assert_eq!(state.runs(), 1, "sixteen bytes, one run");
+        let claim = decoded.state();
+        assert!(claim.is_settled(1));
+        assert!(claim.is_settled(u64::MAX));
+        assert!(!claim.is_settled(0), "position 0 is still outside it");
+        assert_eq!(claim.runs(), 1, "sixteen bytes, one run");
     }
 
     /// The count is checked against the cap before a single byte is reserved.
@@ -1558,31 +1772,31 @@ mod tests {
         let mut encoded = Vec::new();
         encoded.extend_from_slice(&u16::MAX.to_be_bytes());
         assert_eq!(
-            AckState::decode_unvalidated(None, &encoded),
-            Err(AckError::TooManyRuns {
+            AckState::decode_unvalidated(None, &encoded).unwrap_err(),
+            AckError::TooManyRuns {
                 runs: u16::MAX as usize,
                 max: MAX_ACK_RUNS
-            })
+            }
         );
     }
 
     #[test]
     fn a_decode_rejects_a_truncated_buffer() {
         assert_eq!(
-            AckState::decode_unvalidated(None, &[]),
-            Err(AckError::Malformed)
+            AckState::decode_unvalidated(None, &[]).unwrap_err(),
+            AckError::Malformed
         );
         assert_eq!(
-            AckState::decode_unvalidated(None, &[0]),
-            Err(AckError::Malformed)
+            AckState::decode_unvalidated(None, &[0]).unwrap_err(),
+            AckError::Malformed
         );
 
         let mut short = Vec::new();
         short.extend_from_slice(&1u16.to_be_bytes());
         short.extend_from_slice(&[0u8; RUN_LEN - 1]);
         assert_eq!(
-            AckState::decode_unvalidated(None, &short),
-            Err(AckError::Malformed)
+            AckState::decode_unvalidated(None, &short).unwrap_err(),
+            AckError::Malformed
         );
     }
 
@@ -1591,8 +1805,8 @@ mod tests {
         let mut encoded = settled(&[5]).encode_beyond();
         encoded.push(0);
         assert_eq!(
-            AckState::decode_unvalidated(None, &encoded),
-            Err(AckError::Malformed)
+            AckState::decode_unvalidated(None, &encoded).unwrap_err(),
+            AckError::Malformed
         );
     }
 
@@ -1606,8 +1820,8 @@ mod tests {
         overflowing_extent.extend_from_slice(&1u64.to_be_bytes());
         overflowing_extent.extend_from_slice(&u64::MAX.to_be_bytes());
         assert_eq!(
-            AckState::decode_unvalidated(None, &overflowing_extent),
-            Err(AckError::RunOutOfRange)
+            AckState::decode_unvalidated(None, &overflowing_extent).unwrap_err(),
+            AckError::RunOutOfRange
         );
 
         let mut overflowing_gap = Vec::new();
@@ -1617,8 +1831,8 @@ mod tests {
         overflowing_gap.extend_from_slice(&0u64.to_be_bytes());
         overflowing_gap.extend_from_slice(&0u64.to_be_bytes());
         assert_eq!(
-            AckState::decode_unvalidated(None, &overflowing_gap),
-            Err(AckError::RunOutOfRange)
+            AckState::decode_unvalidated(None, &overflowing_gap).unwrap_err(),
+            AckError::RunOutOfRange
         );
     }
 
@@ -1631,11 +1845,11 @@ mod tests {
         encoded.extend_from_slice(&3u64.to_be_bytes()); // start at 3
         encoded.extend_from_slice(&0u64.to_be_bytes());
         assert_eq!(
-            AckState::decode_unvalidated(Some(5), &encoded),
-            Err(AckError::RunInPrefix {
+            AckState::decode_unvalidated(Some(5), &encoded).unwrap_err(),
+            AckError::RunInPrefix {
                 start: 3,
                 first_free: 6
-            })
+            }
         );
 
         // The boundary: a run starting exactly where the prefix would absorb it.
@@ -1644,11 +1858,11 @@ mod tests {
         adjacent.extend_from_slice(&6u64.to_be_bytes());
         adjacent.extend_from_slice(&0u64.to_be_bytes());
         assert_eq!(
-            AckState::decode_unvalidated(Some(5), &adjacent),
-            Err(AckError::RunInPrefix {
+            AckState::decode_unvalidated(Some(5), &adjacent).unwrap_err(),
+            AckError::RunInPrefix {
                 start: 6,
                 first_free: 6
-            })
+            }
         );
 
         // And with no prefix at all, a run at zero would have been the prefix.
@@ -1657,11 +1871,11 @@ mod tests {
         at_zero.extend_from_slice(&0u64.to_be_bytes());
         at_zero.extend_from_slice(&0u64.to_be_bytes());
         assert_eq!(
-            AckState::decode_unvalidated(None, &at_zero),
-            Err(AckError::RunInPrefix {
+            AckState::decode_unvalidated(None, &at_zero).unwrap_err(),
+            AckError::RunInPrefix {
                 start: 0,
                 first_free: 0
-            })
+            }
         );
     }
 
@@ -1680,11 +1894,12 @@ mod tests {
         touching.extend_from_slice(&0u64.to_be_bytes()); // the closest possible next
         touching.extend_from_slice(&0u64.to_be_bytes());
 
-        let state = AckState::decode_unvalidated(None, &touching).expect("well-formed");
-        assert_eq!(state.runs(), 2);
-        assert!(state.is_settled(1));
-        assert!(!state.is_settled(2), "the mandatory hole");
-        assert!(state.is_settled(3));
+        let decoded = AckState::decode_unvalidated(None, &touching).expect("well-formed");
+        let claim = decoded.state();
+        assert_eq!(claim.runs(), 2);
+        assert!(claim.is_settled(1));
+        assert!(!claim.is_settled(2), "the mandatory hole");
+        assert!(claim.is_settled(3));
     }
 
     /// Round-tripping is the property a verifier depends on: it rebuilds the
@@ -1702,7 +1917,7 @@ mod tests {
             let decoded = AckState::decode_unvalidated(state.high_water(), &encoded).unwrap();
             assert_eq!(
                 sig(Direction::AToB, &state),
-                sig(Direction::AToB, &decoded),
+                hex::encode(decoded.sig_input(&chan(0x51), Direction::AToB)),
                 "a verifier would rebuild a different preimage"
             );
         }

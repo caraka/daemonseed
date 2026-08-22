@@ -24,6 +24,12 @@ next release this block is renamed to its version + date and a fresh
 `[Unreleased]` is opened (see `AGENTS.md` doc-sync). Planning for *unstarted*
 work lives in the project lead's vault manifest, not here.
 
+### Changed
+
+- A decoded-but-unmerged peer acknowledgement is a `PeerAck`, which answers no question about
+  settlement; `merge_peer_ack` consumes it, so a peer's claim reaches our state only through the
+  ceiling that bounds it. (#257)
+
 ### Added
 
 - Direct-message doorbell transport: a first-contact entry publishes into a slot of the
