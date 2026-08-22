@@ -29,6 +29,11 @@ work lives in the project lead's vault manifest, not here.
 - A decoded-but-unmerged peer acknowledgement is a `PeerAck`, which answers no question about
   settlement; `merge_peer_ack` consumes it, so a peer's claim reaches our state only through the
   ceiling that bounds it. (#257)
+- A trust event names the kind of record it concerns, so a blocked erasure is distinguishable
+  from another blocked erasure without the audit log naming a correspondent. (#337)
+- The trust-log file carries a version tag; a file written by the previous version still opens. (#337)
+- An unrecognised record kind in a trust log costs that field alone; every other entry and field
+  still reads. (#337)
 
 ### Added
 

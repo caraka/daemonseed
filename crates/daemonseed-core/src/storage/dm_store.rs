@@ -347,6 +347,37 @@ impl RecordKind {
         RecordKind::ReceiveCursor,
     ];
 
+    /// The stable string form, for local persistence.
+    ///
+    /// **Deliberately not the enum's discriminant and deliberately not
+    /// the record's file name.** A discriminant makes a reordering of the enum
+    /// silently rewrite history, which is the same reason
+    /// [`crate::trust_events`] stores event keys by string; a file name is a
+    /// storage-layout detail that a later layout change would be free to move,
+    /// and a persisted log must not be hostage to that. These four strings are
+    /// frozen once written to a log.
+    pub const fn stable_str(self) -> &'static str {
+        match self {
+            RecordKind::Resume => "resume",
+            RecordKind::Provisional => "provisional",
+            RecordKind::Outbox => "outbox",
+            RecordKind::ReceiveCursor => "receive-cursor",
+        }
+    }
+
+    /// Parse a kind from [`Self::stable_str`]; `None` for an unknown string
+    /// (e.g. a kind from a newer build).
+    ///
+    /// **That `None` is a first-class answer, not a failure**, and the one
+    /// caller honours it: the audit-log decoder degrades the event's
+    /// `record_kind` to absent and keeps the entry. A fifth variant would not
+    /// move the log's layout, so the format's version tag never fires for it
+    /// and a rollback is exactly when this returns `None` — the doc used to
+    /// promise this and the decoder used to discard the whole log instead.
+    pub fn from_stable_str(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| k.stable_str() == s)
+    }
+
     /// The file name inside the correspondence directory.
     ///
     /// Fixed strings, and none of them contains [`TMP_INFIX`] — which is what
@@ -1658,10 +1689,24 @@ impl DmStoreError {
     /// it recurs at every start until a human fixes the record's mode, and it is
     /// written to the audit log, because a correspondence that silently never
     /// establishes is the failure this exists to make visible.
-    pub fn event(&self) -> Option<crate::trust_events::TrustEventKey> {
+    ///
+    /// **It carries the [`RecordKind`], and that is what the scope type is
+    /// for.** One key fires for all four kinds and they do not cost the same:
+    /// a blocked [`RecordKind::Provisional`] erasure leaves `ss0` readable,
+    /// which roots `RK0` — the forward-secrecy premise the fail-closed delete
+    /// exists to protect — while [`RecordKind::ReceiveCursor`] is the one
+    /// unsealed kind and has no secret behind it at all. Returning the key
+    /// alone told a user their record would not erase and left them unable to
+    /// tell those two apart. The kind is a closed-set discriminant naming a
+    /// *type* of record, never an instance, so it says nothing about who the
+    /// correspondence is with (ISC-C28 / ISC-A-C1).
+    pub fn event(&self) -> Option<crate::trust_events::TrustEventScope> {
         match self {
-            Self::ErasureBlocked { .. } => {
-                Some(crate::trust_events::TrustEventKey::DmRecordErasureBlocked)
+            Self::ErasureBlocked { kind, .. } => {
+                Some(crate::trust_events::TrustEventScope::for_record(
+                    crate::trust_events::TrustEventKey::DmRecordErasureBlocked,
+                    *kind,
+                ))
             }
             _ => None,
         }
@@ -2060,9 +2105,14 @@ mod tests {
         })
         .unwrap();
 
-        // Mode 000 on the FILE and a read-only DIRECTORY: `set_permissions` needs
-        // to traverse and modify within the directory, so the repair itself fails
-        // and the caller must report rather than loop.
+        // Mode 000 on the FILE and a read-only DIRECTORY. The repair *succeeds*
+        // — chmod needs ownership, not directory write — so the scrub runs and
+        // it is the unlink, which needs write on the directory, that is refused.
+        // (This comment previously said the repair itself failed, which would
+        // have made this the `scrubbed: false` case; the assertions below have
+        // always said `scrubbed: true`, and they are what is right. Staging a
+        // failed repair needs a read-only mount, an immutable attribute or a
+        // MAC policy — see `only_a_permanent_write_refusal_takes_the_erasure_blocked_branch`.)
         let mut fp = std::fs::metadata(&path).unwrap().permissions();
         fp.set_mode(0o000);
         std::fs::set_permissions(&path, fp).unwrap();
@@ -2099,11 +2149,15 @@ mod tests {
         );
         assert_eq!(
             err.event(),
-            Some(crate::trust_events::TrustEventKey::DmRecordErasureBlocked),
-            "the failure must carry the trust event it is surfaced as"
+            Some(crate::trust_events::TrustEventScope::for_record(
+                crate::trust_events::TrustEventKey::DmRecordErasureBlocked,
+                RecordKind::Outbox,
+            )),
+            "the failure must carry the trust event it is surfaced as, and the \
+             kind of record at stake with it"
         );
         assert_eq!(
-            crate::trust_events::class_of(err.event().unwrap()),
+            crate::trust_events::class_of(err.event().unwrap().key),
             crate::trust_events::TrustEventClass::PersistentNonBlocking,
             "a wedged correspondence must recur at every start until a human fixes it"
         );
@@ -2124,6 +2178,159 @@ mod tests {
             !after.is_empty(),
             "the scrubbed record should still occupy its bucket"
         );
+    }
+
+    /// The stable strings are unique, round-trip, and are not the file names.
+    ///
+    /// The last clause is the one worth pinning: reusing `file_name` would have
+    /// been free today and would have tied a persisted audit log to the storage
+    /// layout, so that renaming a file on disk silently rewrote history.
+    #[test]
+    fn record_kind_stable_strings_round_trip_and_are_their_own() {
+        let mut seen: Vec<&str> = Vec::new();
+        for kind in RecordKind::ALL {
+            let s = kind.stable_str();
+            assert_eq!(RecordKind::from_stable_str(s), Some(kind));
+            assert_ne!(
+                s,
+                kind.file_name(),
+                "the persisted form must not be the storage layout"
+            );
+            assert!(!seen.contains(&s), "stable strings must be unique: {s}");
+            seen.push(s);
+        }
+        assert_eq!(seen.len(), 4);
+        assert_eq!(RecordKind::from_stable_str("resume.bin"), None);
+        assert_eq!(RecordKind::from_stable_str("nope"), None);
+    }
+
+    /// Every kind reaches the trust event as *itself* — end to end, through the
+    /// unlink site, four separate erasures.
+    ///
+    /// **The kinds do not cost the same, which is the whole reason the event
+    /// carries one.** A blocked [`RecordKind::Provisional`] erasure leaves
+    /// `ss0` on disk; [`RecordKind::ReceiveCursor`] is unsealed and has no
+    /// secret behind it. `an_unrepairable_erasure_is_a_distinct_error_carrying_its_trust_event`
+    /// pins one kind, which a hardcoded `RecordKind::Outbox` at the raise site
+    /// would satisfy; this pins all four, so it cannot be.
+    #[cfg(unix)]
+    #[test]
+    fn every_kind_reaches_the_erasure_event_as_itself() {
+        use std::os::unix::fs::PermissionsExt;
+        assert!(
+            write_bit_is_enforced(),
+            "vacuous where the write bit does not constrain the process"
+        );
+
+        // Guards the loop against a future `ALL` that stops covering the enum,
+        // which would make every assertion below vacuously true for the kinds
+        // it dropped.
+        assert_eq!(RecordKind::ALL.len(), 4, "one erasure per kind");
+
+        for (i, kind) in RecordKind::ALL.into_iter().enumerate() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = store(tmp.path());
+            let l = label(80 + i as u8);
+            let dir = tmp.path().join("dm").join(l.dir_name());
+            let path = dir.join(kind.file_name());
+
+            // An unsealed kind is exactly its capacity; a sealed one is padded,
+            // so a short body is legal and keeps the fixture cheap.
+            let body = if kind.is_sealed() {
+                payload(kind.capacity().min(64))
+            } else {
+                payload(kind.capacity())
+            };
+            s.critical_section::<_, DmStoreError>(&l, |g| g.replace(kind, &body))
+                .unwrap();
+
+            // Read-only directory: the scrub succeeds, the unlink cannot.
+            let mut dp = std::fs::metadata(&dir).unwrap().permissions();
+            dp.set_mode(0o500);
+            std::fs::set_permissions(&dir, dp).unwrap();
+
+            let err = s
+                .critical_section::<_, DmStoreError>(&l, |g| g.delete(kind))
+                .expect_err("an unlinkable record must not report a successful delete");
+
+            let mut dp = std::fs::metadata(&dir).unwrap().permissions();
+            dp.set_mode(0o700);
+            std::fs::set_permissions(&dir, dp).unwrap();
+            assert!(path.exists(), "the unlink was refused, so the file remains");
+
+            assert_eq!(
+                err.event(),
+                Some(crate::trust_events::TrustEventScope::for_record(
+                    crate::trust_events::TrustEventKey::DmRecordErasureBlocked,
+                    kind,
+                )),
+                "the event must name the kind actually erased, not a fixed one: {err:?}"
+            );
+        }
+    }
+
+    /// The kind survives the hop from the error to the trust event, for every
+    /// kind and both disclosure states.
+    ///
+    /// **This is the probe for the two raise sites a unit test cannot stage.**
+    /// The open site's two `ErasureBlocked` returns need an open that is refused
+    /// *and* a repair that cannot help — a read-only mount, an immutable
+    /// attribute, or a MAC policy, none of which a normal user can arrange here
+    /// (the reasoning is `only_a_permanent_write_refusal_takes_the_erasure_blocked_branch`'s,
+    /// and unchanged). What all three sites share is this hop: each builds the
+    /// variant from the `kind` it was called with, and `event` reads it back.
+    /// Constructing the variant directly covers the half of the threading that
+    /// is reachable, and this test says plainly that it is only that half.
+    #[test]
+    fn every_kind_survives_the_hop_from_error_to_trust_event() {
+        assert_eq!(RecordKind::ALL.len(), 4, "one case per kind");
+        for kind in RecordKind::ALL {
+            for scrubbed in [false, true] {
+                let err = DmStoreError::ErasureBlocked {
+                    kind,
+                    scrubbed,
+                    source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+                };
+                let scope = err.event().expect("a blocked erasure is a trust event");
+                assert_eq!(
+                    scope.key,
+                    crate::trust_events::TrustEventKey::DmRecordErasureBlocked
+                );
+                assert_eq!(
+                    scope.record_kind,
+                    Some(kind),
+                    "the kind must not be discarded between the error and the event"
+                );
+            }
+        }
+    }
+
+    /// No other `DmStoreError` invents a record kind — or a trust event.
+    ///
+    /// The mirror control for the two tests above: a threading fix that made
+    /// `event` return a kind unconditionally would pass both of them.
+    #[test]
+    fn no_other_store_error_carries_a_trust_event() {
+        let others = [
+            DmStoreError::Reentrant,
+            DmStoreError::Kdf,
+            DmStoreError::Module,
+            DmStoreError::ErasureInterrupted {
+                kind: RecordKind::Provisional,
+            },
+            DmStoreError::WrongFileLen {
+                kind: RecordKind::Resume,
+                expected: 1,
+                actual: 2,
+            },
+        ];
+        for err in others {
+            assert_eq!(
+                err.event(),
+                None,
+                "only a blocked erasure is a trust event: {err:?}"
+            );
+        }
     }
 
     /// Whether the write bit actually constrains this process.

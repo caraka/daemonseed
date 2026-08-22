@@ -241,8 +241,12 @@ modules:
       deadlocking. replace pads to the kind's bucket with CSPRNG filler behind a
       length prefix carried inside the seal, and refuses an oversized payload;
       ReceiveCursor is unsealed and must be exactly 8 bytes. AAD binds the
-      correspondence label and the record kind. Errors preserve atomic_file's
-      landed/not-landed distinction. CorrespondenceLabel is an opaque 32-byte
+      correspondence label and the record kind. RecordKind::stable_str /
+      from_stable_str give the persisted string form (resume, provisional,
+      outbox, receive-cursor), distinct from the on-disk file name; a string the
+      build does not recognise decodes to record_kind: None and leaves the rest
+      of the audit log readable. Errors
+      preserve atomic_file's landed/not-landed distinction. CorrespondenceLabel is an opaque 32-byte
       caller-supplied value; its derivation is unsettled (#288). One key per
       profile, random nonces, no rotation (#289).
     no_std: false
@@ -3293,7 +3297,16 @@ types:
     kind: struct
     description: >-
       One log tuple: timestamp, key, optional server_id, optional suite_id,
-      resolution, dismissed_at. observed() builder.
+      optional record_kind, resolution, dismissed_at. observed() builds one with
+      no record_kind; TrustEventScope::observed_at builds one with.
+
+  - name: TrustEventScope
+    module: daemonseed_core::trust_events
+    kind: struct
+    description: >-
+      A key plus the RecordKind it concerns, if any. bare(key) and
+      for_record(key, kind) construct; observed_at(timestamp, server_id,
+      suite_id) yields the TrustEvent. DmStoreError::event returns one.
 
   - name: TrustEventLog
     module: daemonseed_core::trust_events

@@ -44,6 +44,7 @@ use crate::crypto::deprecation::DeprecationPolicy;
 use crate::crypto::suite::SuiteId;
 use crate::kdf::info;
 use crate::profile::config::ArgonParams;
+use crate::storage::dm_store::RecordKind;
 use crate::storage::seeds::{AEAD_KEY_LEN, ARGON2_OUTPUT_LEN, NONCE_LEN, TAG_LEN};
 
 /// Default audit-log filename at the profile root (finding F24).
@@ -260,6 +261,15 @@ pub const fn event_key_string(key: TrustEventKey) -> &'static str {
 
 /// Parse a key from its stable string form. The inverse of [`event_key_string`];
 /// returns `None` for an unknown string (e.g. a key from a newer build).
+///
+/// **The audit-log decoder treats that `None` as a malformed body and loses
+/// every entry**, which is the same forward-compatibility exposure the
+/// record-kind field used to have and no longer does. It is not fixed the same
+/// way because it cannot be: a key is not optional, so there is no field to
+/// degrade — the choices are dropping the entry (silent loss from an audit log)
+/// or failing (loud loss of the whole log), and picking between them is a
+/// decision about audit-log semantics, not a repair. Recorded here so the
+/// exposure is visible at the site rather than inferred from the decoder.
 pub fn event_key_from_str(s: &str) -> Option<TrustEventKey> {
     ALL_EVENT_KEYS
         .iter()
@@ -289,6 +299,15 @@ pub struct TrustEvent {
     pub server_id: Option<String>,
     /// The suite-id the event concerns, if any (contextual scope).
     pub suite_id: Option<SuiteId>,
+    /// The *kind* of object the event concerns, if the key has one.
+    ///
+    /// A closed-set, non-identifying scope discriminant (ISC-C28). It names a
+    /// type of record, never an instance: [`RecordKind`] carries no path, no
+    /// correspondence label and no correspondent, so a log full of these
+    /// cannot be joined into the recently-contacted set ISC-A-C1 forbids.
+    /// That is exactly why the correspondence itself is *not* here, and will
+    /// not be.
+    pub record_kind: Option<RecordKind>,
     /// Whether the underlying condition has been resolved.
     pub resolution: ResolutionStatus,
     /// When the user dismissed the affordance, if they did. Distinct from
@@ -297,18 +316,66 @@ pub struct TrustEvent {
 }
 
 impl TrustEvent {
-    /// A freshly-observed event: unresolved, undismissed.
+    /// A freshly-observed event with no record-kind scope: unresolved,
+    /// undismissed. Every key but the erasure one is raised this way, and the
+    /// signature is what holds them to `record_kind: None`.
     pub fn observed(
         timestamp_unix_ms: i64,
         key: TrustEventKey,
         server_id: Option<String>,
         suite_id: Option<SuiteId>,
     ) -> Self {
+        TrustEventScope::bare(key).observed_at(timestamp_unix_ms, server_id, suite_id)
+    }
+}
+
+/// What a raising site knows about an event before a clock is read: its stable
+/// key, plus the kind of object at stake where the key has one.
+///
+/// **The pairing is the point.** `DmStoreError::event` used to return the key
+/// alone, so the `RecordKind` its `ErasureBlocked` variant already held was
+/// discarded at the one hop between knowing it and reporting it. Returning the
+/// two together means a caller cannot reach the key without being handed the
+/// kind, and [`Self::observed_at`] is the whole path from here to a log entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrustEventScope {
+    /// The stable event key.
+    pub key: TrustEventKey,
+    /// The kind of object at stake, for keys whose subject is a kind.
+    pub record_kind: Option<RecordKind>,
+}
+
+impl TrustEventScope {
+    /// A key whose subject is not a kind of record.
+    pub const fn bare(key: TrustEventKey) -> Self {
         Self {
-            timestamp_unix_ms,
             key,
+            record_kind: None,
+        }
+    }
+
+    /// A key scoped to the kind of record it concerns.
+    pub const fn for_record(key: TrustEventKey, record_kind: RecordKind) -> Self {
+        Self {
+            key,
+            record_kind: Some(record_kind),
+        }
+    }
+
+    /// Stamp this scope with the moment it was observed: unresolved,
+    /// undismissed.
+    pub fn observed_at(
+        self,
+        timestamp_unix_ms: i64,
+        server_id: Option<String>,
+        suite_id: Option<SuiteId>,
+    ) -> TrustEvent {
+        TrustEvent {
+            timestamp_unix_ms,
+            key: self.key,
             server_id,
             suite_id,
+            record_kind: self.record_kind,
             resolution: ResolutionStatus::Unresolved,
             dismissed_at_unix_ms: None,
         }
@@ -504,8 +571,44 @@ impl core::fmt::Display for AuditLogError {
 
 impl std::error::Error for AuditLogError {}
 
-/// Magic prefix for the v1 encrypted audit-log format.
-const MAGIC: &[u8] = b"DSTRUSTLOG1";
+/// Magic prefix for the **v1** encrypted audit-log body: entries end at
+/// `dismissed_at_unix_ms`, with no record-kind field.
+///
+/// Still read, never written. See [`BodyVersion`] for why the version had to
+/// move here rather than being inferred.
+const MAGIC_V1: &[u8] = b"DSTRUSTLOG1";
+
+/// Magic prefix for the **v2** body: every entry carries a trailing optional
+/// record-kind (ISC-C28). What [`seal_log`] writes.
+const MAGIC_V2: &[u8] = b"DSTRUSTLOG2";
+
+/// The magic [`seal_log`] writes.
+const MAGIC: &[u8] = MAGIC_V2;
+
+/// Which body layout a file's magic declares.
+///
+/// **This exists because the body is not self-describing and adding a field
+/// could not be made backward-compatible without it.** The body is a bare
+/// `u32` count followed by that many entries laid end to end: no per-entry
+/// length, no field tags, no terminator. A reader therefore finds entry *n+1*
+/// only by having consumed entry *n* to exactly the right byte. Appending an
+/// optional field — presence byte and all — moves every subsequent entry, so a
+/// v2 reader handed a v1 body reads the next entry's timestamp as this entry's
+/// record-kind presence byte and desynchronises from there;
+/// `a_v1_body_does_not_parse_as_v2` is the positive control for that claim.
+///
+/// Both magics are the same length, so the header layout, `HEADER_LEN` and the
+/// AAD construction are untouched — and because the magic is inside the AAD,
+/// the version is authenticated: a file downgraded from v2 to v1 by editing
+/// eleven cleartext bytes fails the tag rather than decoding short.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyVersion {
+    /// No record-kind field; every decoded entry gets `record_kind: None`.
+    V1,
+    /// Trailing optional record-kind per entry.
+    V2,
+}
+
 const PROFILE_ID_LEN: usize = 16;
 const HEADER_LEN: usize = MAGIC.len() + PROFILE_ID_LEN + 4 + 4 + 4; // + argon params
 
@@ -555,9 +658,11 @@ pub fn open_log(bytes: &[u8], passphrase: &str) -> Result<TrustEventLog, AuditLo
     if bytes.len() < HEADER_LEN + NONCE_LEN + TAG_LEN {
         return Err(AuditLogError::Malformed("shorter than minimum header"));
     }
-    if &bytes[..MAGIC.len()] != MAGIC {
-        return Err(AuditLogError::Malformed("magic prefix mismatch"));
-    }
+    let version = match &bytes[..MAGIC_V2.len()] {
+        m if m == MAGIC_V2 => BodyVersion::V2,
+        m if m == MAGIC_V1 => BodyVersion::V1,
+        _ => return Err(AuditLogError::Malformed("magic prefix mismatch")),
+    };
     let mut cursor = MAGIC.len();
     let profile_id = Uuid::from_slice(&bytes[cursor..cursor + PROFILE_ID_LEN])
         .map_err(|_| AuditLogError::Malformed("bad profile-id"))?;
@@ -591,7 +696,7 @@ pub fn open_log(bytes: &[u8], passphrase: &str) -> Result<TrustEventLog, AuditLo
         other => AuditLogError::AesMode(other),
     })?;
 
-    let log = decode_log(&plaintext).ok_or(AuditLogError::Malformed("bad log body"))?;
+    let log = decode_log(&plaintext, version).ok_or(AuditLogError::Malformed("bad log body"))?;
     plaintext.zeroize();
     Ok(log)
 }
@@ -634,8 +739,12 @@ fn derive_audit_log_key(
 // ── Log body codec ────────────────────────────────────────────────────────
 //
 // Local-only encoding (never on the wire). Each event-key is stored by its
-// stable string (ISC-C28), so a reordering of the enum cannot corrupt history.
+// stable string (ISC-C28), so a reordering of the enum cannot corrupt history;
+// the record-kind uses `RecordKind::stable_str` for the same reason.
 // Little-endian integers; optionals are a 1-byte presence flag + payload.
+//
+// The body carries no version of its own — it is versioned by the file's magic
+// (see `BodyVersion`), which is inside the AAD and so authenticated.
 
 fn encode_log(log: &TrustEventLog) -> Vec<u8> {
     let mut out = Vec::new();
@@ -671,11 +780,23 @@ fn encode_log(log: &TrustEventLog) -> Vec<u8> {
             }
             None => out.push(0),
         }
+        // v2 only. Last in the entry so a v1 body is a prefix of the v2 form
+        // for its first entry — which is a readability property, not a
+        // compatibility one: see `BodyVersion`.
+        match e.record_kind {
+            Some(k) => {
+                out.push(1);
+                let s = k.stable_str().as_bytes();
+                out.extend_from_slice(&(s.len() as u16).to_le_bytes());
+                out.extend_from_slice(s);
+            }
+            None => out.push(0),
+        }
     }
     out
 }
 
-fn decode_log(bytes: &[u8]) -> Option<TrustEventLog> {
+fn decode_log(bytes: &[u8], version: BodyVersion) -> Option<TrustEventLog> {
     let mut c = Cursor::new(bytes);
     let count = c.u32()? as usize;
     let mut entries = Vec::with_capacity(count);
@@ -701,11 +822,54 @@ fn decode_log(bytes: &[u8]) -> Option<TrustEventLog> {
             _ => return None,
         };
         let dismissed_at_unix_ms = if c.u8()? == 1 { Some(c.i64()?) } else { None };
+        let record_kind = match version {
+            // A v1 entry ends here. Reading a presence byte would consume the
+            // next entry's first timestamp byte.
+            BodyVersion::V1 => None,
+            // **Framing errors fail the body; vocabulary misses degrade the
+            // field.** The presence byte and the length are structure — losing
+            // either means the cursor no longer knows where the next entry
+            // starts, and there is nothing to do but stop. The *string* is a
+            // vocabulary token, and not recognising one is a normal
+            // consequence of reading a log a newer build wrote: the version
+            // tag covers layout growth, and adding a fifth `RecordKind` does
+            // not move the layout, so a newer build keeps writing `MAGIC_V2`
+            // and a rollback meets a kind this build has never heard of.
+            //
+            // Propagating that miss with `?` cost the reader **every entry in
+            // the log** — one unopenable audit history because one event named
+            // a kind. So the miss lands on this field alone; the entry, its
+            // timestamp, its key and its class all survive, which is the state
+            // this build would have recorded anyway before the field existed.
+            //
+            // Non-UTF-8 falls the same way rather than failing: the bytes are
+            // AEAD-authenticated, so they are what some build of ours wrote,
+            // and a writer bug is not a reason to destroy the reader's history.
+            //
+            // **The cost, stated rather than hidden:** a decode-then-reseal on
+            // the older build writes the degraded `None` back, so the
+            // discriminant is lost for good rather than merely unread. That is
+            // the price of `RecordKind` staying closed, and it is the right
+            // side of the trade — an `Unknown(String)` variant would put an
+            // unbounded caller-unvalidated string into the one log ISC-A-C1
+            // governs, and would force `file_name`, `capacity`, `bucket_len`,
+            // `on_disk_len` and `is_sealed` to invent an answer for a kind that
+            // has no record on disk.
+            BodyVersion::V2 if c.u8()? == 1 => {
+                let len = c.u16()? as usize;
+                let raw = c.bytes(len)?;
+                core::str::from_utf8(raw)
+                    .ok()
+                    .and_then(RecordKind::from_stable_str)
+            }
+            BodyVersion::V2 => None,
+        };
         entries.push(TrustEvent {
             timestamp_unix_ms,
             key,
             server_id,
             suite_id,
+            record_kind,
             resolution,
             dismissed_at_unix_ms,
         });
@@ -1074,6 +1238,523 @@ mod tests {
             class_of(unreadable_policy_event()),
             TrustEventClass::PersistentNonBlocking
         );
+    }
+
+    // ── Body codec: the record-kind field and the v1→v2 bridge ────────────
+
+    /// The v2 body of the two-entry fixture below, byte for byte.
+    ///
+    /// **Derived independently of the encoder** — laid out from the format
+    /// comment above `encode_log`, not captured from a run of it. That is the
+    /// whole value: a round-trip test passes under any self-consistent layout,
+    /// including one that swapped two adjacent optional fields, and the
+    /// persisted log has no second implementation to disagree with it.
+    const V2_BODY_KAT: &str = "020000007b68e5cf8b0100001900646d2d7265636f72642d6572617375\
+72652d626c6f636b65640105007372762d610101000001ea16b04c02000000010b0070726f766973696f6e61\
+6cffffffffffffffff13007365727665722d6b65792d6d69736d617463680000010000";
+
+    /// The same two entries in the **v1** layout: identical up to each entry's
+    /// `dismissed_at_unix_ms`, with no record-kind field at all. This is what a
+    /// log written before this change holds.
+    const V1_BODY_KAT: &str = "020000007b68e5cf8b0100001900646d2d7265636f72642d6572617375\
+72652d626c6f636b65640105007372762d610101000001ea16b04c02000000ffffffffffffffff1300736572\
+7665722d6b65792d6d69736d6174636800000100";
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn unhex(s: &str) -> Vec<u8> {
+        assert!(s.len().is_multiple_of(2), "hex must be whole bytes");
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex digit"))
+            .collect()
+    }
+
+    /// The two entries both KATs describe. Built by hand rather than through
+    /// `observed` so `resolution` and `dismissed_at_unix_ms` can be non-default.
+    fn kat_entries() -> Vec<TrustEvent> {
+        vec![
+            TrustEvent {
+                timestamp_unix_ms: 1_700_000_000_123,
+                key: TrustEventKey::DmRecordErasureBlocked,
+                server_id: Some("srv-a".into()),
+                suite_id: Some(sid(1)),
+                record_kind: Some(RecordKind::Provisional),
+                resolution: ResolutionStatus::Unresolved,
+                dismissed_at_unix_ms: Some(9_876_543_210),
+            },
+            TrustEvent {
+                timestamp_unix_ms: -1,
+                key: TrustEventKey::ServerKeyMismatch,
+                server_id: None,
+                suite_id: None,
+                record_kind: None,
+                resolution: ResolutionStatus::Resolved,
+                dismissed_at_unix_ms: None,
+            },
+        ]
+    }
+
+    fn log_of(entries: Vec<TrustEvent>) -> TrustEventLog {
+        TrustEventLog {
+            entries,
+            cap: DEFAULT_LOG_CAP,
+        }
+    }
+
+    /// The v2 body encodes to exactly the pinned bytes.
+    #[test]
+    fn the_v2_body_encoding_is_byte_pinned() {
+        let encoded = encode_log(&log_of(kat_entries()));
+        assert_eq!(
+            hex(&encoded),
+            V2_BODY_KAT,
+            "the persisted layout moved; a shipped log would no longer parse"
+        );
+        // And the bytes mean what they say, rather than merely being stable.
+        let back = decode_log(&encoded, BodyVersion::V2).expect("the KAT decodes");
+        assert_eq!(back.entries(), kat_entries().as_slice());
+    }
+
+    /// **The claim that an appended optional field is backward-compatible on
+    /// its own is false, and this is the positive control for that.**
+    ///
+    /// The body is a count followed by entries laid end to end — no per-entry
+    /// length, no field tags. A v2 reader handed a v1 body reads the next
+    /// entry's first timestamp byte as this entry's record-kind presence byte
+    /// and desynchronises. Here it desynchronises into a length it cannot
+    /// satisfy and reports failure; nothing guarantees that, which is the
+    /// point — a body that desynchronised into *plausible* fields would return
+    /// wrong entries under an `Ok`. The version tag is what removes the
+    /// question.
+    #[test]
+    fn a_v1_body_does_not_parse_as_v2() {
+        let v1 = unhex(V1_BODY_KAT);
+        // Control: the same bytes read correctly when read as what they are.
+        assert!(
+            decode_log(&v1, BodyVersion::V1).is_some(),
+            "the v1 fixture must be a valid v1 body, or the case below is vacuous"
+        );
+        assert!(
+            decode_log(&v1, BodyVersion::V2).is_none(),
+            "a v1 body must not silently parse as v2"
+        );
+    }
+
+    /// A v1 body decodes with `record_kind: None`, every other field intact.
+    #[test]
+    fn a_v1_body_decodes_with_no_record_kind() {
+        let decoded = decode_log(&unhex(V1_BODY_KAT), BodyVersion::V1).expect("v1 decodes");
+        let mut expected = kat_entries();
+        expected[0].record_kind = None;
+        assert_eq!(decoded.entries(), expected.as_slice());
+        assert!(
+            decoded.entries().iter().all(|e| e.record_kind.is_none()),
+            "nothing in a v1 log can name a record kind"
+        );
+    }
+
+    /// End to end: a **file** written by the pre-change build opens today.
+    ///
+    /// The header is rebuilt here with `MAGIC_V1` and the body from the v1 KAT,
+    /// so this is a genuine old file rather than the new encoder with a field
+    /// switched off. It exercises the half `decode_log` cannot: that `open_log`
+    /// reads the version off the magic, and that the magic being inside the AAD
+    /// does not stop a v1 file authenticating.
+    #[test]
+    fn a_v1_file_still_opens_after_the_version_bump() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let profile_id = Uuid::from_bytes([7u8; 16]);
+        let params = fast_params();
+        let sealed = seal_body_as_v1(&unhex(V1_BODY_KAT), "old-pass", profile_id, params);
+
+        let opened = open_log(&sealed, "old-pass").expect("a v1 file must still open");
+        let mut expected = kat_entries();
+        expected[0].record_kind = None;
+        assert_eq!(opened.entries(), expected.as_slice());
+    }
+
+    /// A v1 file whose magic is edited to v2 fails authentication rather than
+    /// decoding short — the magic is AAD, so the version is authenticated.
+    #[test]
+    fn a_v1_file_relabelled_as_v2_fails_the_tag() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let profile_id = Uuid::from_bytes([8u8; 16]);
+        let mut sealed =
+            seal_body_as_v1(&unhex(V1_BODY_KAT), "old-pass", profile_id, fast_params());
+        sealed[..MAGIC_V2.len()].copy_from_slice(MAGIC_V2);
+        assert!(matches!(
+            open_log(&sealed, "old-pass"),
+            Err(AuditLogError::AuthenticationFailed)
+        ));
+    }
+
+    /// The other direction of the same guarantee: a **v2** file relabelled as
+    /// v1 also fails the tag. The lens that reviewed this noticed the pair was
+    /// only pinned one way — a version tag inside the AAD is worth nothing if
+    /// it authenticates only the downgrade.
+    #[test]
+    fn a_v2_file_relabelled_as_v1_fails_the_tag() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let profile_id = Uuid::from_bytes([10u8; 16]);
+        let mut log = TrustEventLog::new(DEFAULT_LOG_CAP);
+        log.append(
+            TrustEventScope::for_record(
+                TrustEventKey::DmRecordErasureBlocked,
+                RecordKind::Provisional,
+            )
+            .observed_at(1, None, None),
+        );
+        let mut sealed = seal_log(&log, "pass", profile_id, fast_params()).unwrap();
+        assert!(open_log(&sealed, "pass").is_ok(), "control");
+        sealed[..MAGIC_V1.len()].copy_from_slice(MAGIC_V1);
+        assert!(matches!(
+            open_log(&sealed, "pass"),
+            Err(AuditLogError::AuthenticationFailed)
+        ));
+    }
+
+    /// Seal a pre-supplied body under the **v1** magic, reproducing what the
+    /// pre-change `seal_log` wrote. Mirrors `seal_log` exactly but for the
+    /// magic and for taking the body rather than encoding one.
+    fn seal_body_as_v1(
+        body: &[u8],
+        passphrase: &str,
+        profile_id: Uuid,
+        argon2: ArgonParams,
+    ) -> Vec<u8> {
+        let mut key = derive_audit_log_key(passphrase, profile_id, argon2).unwrap();
+        let aes = Aes256Key::new(&key).unwrap();
+        key.zeroize();
+        let nonce = [0x5Au8; NONCE_LEN];
+
+        let mut header = Vec::with_capacity(HEADER_LEN);
+        header.extend_from_slice(MAGIC_V1);
+        header.extend_from_slice(profile_id.as_bytes());
+        header.extend_from_slice(&argon2.memory_kib.to_le_bytes());
+        header.extend_from_slice(&argon2.iterations.to_le_bytes());
+        header.extend_from_slice(&argon2.parallelism.to_le_bytes());
+
+        let mut ciphertext = vec![0u8; body.len()];
+        let mut tag = [0u8; TAG_LEN];
+        gcm_encrypt(&aes, &nonce, &header, body, &mut ciphertext, &mut tag).unwrap();
+
+        let mut out = header;
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(&ciphertext);
+        out.extend_from_slice(&tag);
+        out
+    }
+
+    /// A record kind survives a full seal → open.
+    #[test]
+    fn a_record_kind_round_trips_through_seal_and_open() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let profile_id = Uuid::from_bytes([9u8; 16]);
+        let mut log = TrustEventLog::new(DEFAULT_LOG_CAP);
+        for kind in RecordKind::ALL {
+            log.append(
+                TrustEventScope::for_record(TrustEventKey::DmRecordErasureBlocked, kind)
+                    .observed_at(1_000, None, None),
+            );
+        }
+        let sealed = seal_log(&log, "pass", profile_id, fast_params()).unwrap();
+        let opened = open_log(&sealed, "pass").unwrap();
+        assert_eq!(
+            opened
+                .entries()
+                .iter()
+                .map(|e| e.record_kind)
+                .collect::<Vec<_>>(),
+            RecordKind::ALL.map(Some).to_vec(),
+            "each kind must come back as itself, in order"
+        );
+    }
+
+    /// **Every key but the erasure one encodes no record kind.**
+    ///
+    /// `observed` is the only constructor the other twenty-one keys use and it
+    /// cannot set one, so this is a guard against a future careless `Some`
+    /// reaching the log — and against the field being populated by default,
+    /// which the round-trip tests above would not notice.
+    #[test]
+    fn every_other_key_encodes_no_record_kind() {
+        let mut log = TrustEventLog::new(DEFAULT_LOG_CAP);
+        let mut logged = 0usize;
+        for &key in ALL_EVENT_KEYS {
+            let before = log.len();
+            log.append(TrustEvent::observed(
+                1,
+                key,
+                Some("srv".into()),
+                Some(sid(1)),
+            ));
+            logged += log.len() - before;
+        }
+        assert!(
+            logged >= ALL_EVENT_KEYS.len() - 4,
+            "the fixture must actually log most keys, or this is near-vacuous: {logged}"
+        );
+        assert_eq!(log.len(), logged, "cap must not have pruned the fixture");
+        assert!(
+            log.entries().iter().all(|e| e.record_kind.is_none()),
+            "only a raise site with a kind may set one"
+        );
+
+        // And it is absent from the bytes, not merely from the struct: every
+        // entry's trailing presence byte reads 0.
+        let body = encode_log(&log);
+        let decoded = decode_log(&body, BodyVersion::V2).expect("round-trips");
+        assert_eq!(decoded.len(), logged);
+        assert!(decoded.entries().iter().all(|e| e.record_kind.is_none()));
+        assert_eq!(
+            *body.last().unwrap(),
+            0,
+            "the last entry's record-kind presence byte must be absent-0"
+        );
+    }
+
+    /// Replace the first occurrence of `needle` in `hay`; panics if absent, so
+    /// a fixture that stopped substituting cannot pass as one that did.
+    fn substitute(hay: &[u8], needle: &[u8], with: &[u8]) -> Vec<u8> {
+        let at = hay
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("the fixture must contain the token it substitutes");
+        assert!(
+            !hay[at + needle.len()..]
+                .windows(needle.len())
+                .any(|w| w == needle),
+            "the token must occur exactly once, or the substitution is ambiguous"
+        );
+        let mut out = hay[..at].to_vec();
+        out.extend_from_slice(with);
+        out.extend_from_slice(&hay[at + needle.len()..]);
+        out
+    }
+
+    /// A three-entry log whose middle entry names a record kind.
+    fn three_entries_with_a_kind_in_the_middle() -> TrustEventLog {
+        let mut log = TrustEventLog::new(DEFAULT_LOG_CAP);
+        log.append(TrustEvent::observed(
+            1,
+            TrustEventKey::ServerKeyMismatch,
+            Some("srv-a".into()),
+            None,
+        ));
+        log.append(
+            TrustEventScope::for_record(
+                TrustEventKey::DmRecordErasureBlocked,
+                RecordKind::Provisional,
+            )
+            .observed_at(2, None, Some(sid(1))),
+        );
+        log.append(TrustEvent::observed(
+            3,
+            TrustEventKey::ServerKeyRotated,
+            None,
+            None,
+        ));
+        log
+    }
+
+    /// **An unrecognised record kind costs the FIELD, never the log.**
+    ///
+    /// A fifth `RecordKind` would not move the layout, so a newer build keeps
+    /// writing `MAGIC_V2` and the version tag — the mechanism built for format
+    /// evolution — never fires for *vocabulary* growth. Before this, a user who
+    /// rolled a build back after one blocked erasure had their entire
+    /// trust-event history refuse to open.
+    #[test]
+    fn an_unknown_record_kind_costs_the_field_and_not_the_log() {
+        let body = encode_log(&three_entries_with_a_kind_in_the_middle());
+
+        // Control: unsubstituted, all three entries decode and the middle one
+        // still names its kind. Without this the case below is vacuous — a
+        // decoder that always returned three `None`s would satisfy it.
+        let control = decode_log(&body, BodyVersion::V2).expect("the fixture decodes");
+        assert_eq!(control.len(), 3);
+        assert_eq!(
+            control
+                .entries()
+                .iter()
+                .map(|e| e.record_kind)
+                .collect::<Vec<_>>(),
+            vec![None, Some(RecordKind::Provisional), None]
+        );
+
+        // Same length, so nothing about the framing moves — only the token.
+        let unknown = substitute(&body, b"provisional", b"prov1s1onal");
+        assert_eq!(unknown.len(), body.len(), "the framing must be untouched");
+        let decoded = decode_log(&unknown, BodyVersion::V2)
+            .expect("an unknown kind must not destroy the log");
+        assert_eq!(decoded.len(), 3, "every entry must survive");
+        assert!(
+            decoded.entries().iter().all(|e| e.record_kind.is_none()),
+            "the unknown kind degrades to absent"
+        );
+        // The rest of the entry survives with it — not just the count.
+        assert_eq!(
+            decoded
+                .entries()
+                .iter()
+                .map(|e| (e.timestamp_unix_ms, e.key, e.suite_id))
+                .collect::<Vec<_>>(),
+            control
+                .entries()
+                .iter()
+                .map(|e| (e.timestamp_unix_ms, e.key, e.suite_id))
+                .collect::<Vec<_>>(),
+            "only the record-kind field may differ"
+        );
+    }
+
+    /// The same degradation for a kind of a *different* length, and for one
+    /// that is not UTF-8 at all — the string is vocabulary either way.
+    #[test]
+    fn an_unknown_kind_degrades_whatever_its_bytes() {
+        let body = encode_log(&three_entries_with_a_kind_in_the_middle());
+        // Length-prefixed, so a longer token needs its `u16` corrected too.
+        let longer = substitute(
+            &body,
+            &[11u8, 0][..]
+                .iter()
+                .copied()
+                .chain(*b"provisional")
+                .collect::<Vec<_>>(),
+            &[15u8, 0][..]
+                .iter()
+                .copied()
+                .chain(*b"quantum-lockbox")
+                .collect::<Vec<_>>(),
+        );
+        for (label, bytes) in [
+            ("a longer unknown token", longer),
+            (
+                "a non-UTF-8 token",
+                substitute(&body, b"provisional", b"prov\xffs\xfeonal"),
+            ),
+        ] {
+            let decoded = decode_log(&bytes, BodyVersion::V2)
+                .unwrap_or_else(|| panic!("{label} lost the log"));
+            assert_eq!(decoded.len(), 3, "{label} must leave every entry readable");
+            assert!(decoded.entries().iter().all(|e| e.record_kind.is_none()));
+        }
+    }
+
+    /// **The mirror control: framing damage still fails the body.**
+    ///
+    /// Degrading a vocabulary miss must not turn the decoder into one that
+    /// tolerates a cursor it has lost track of. A record-kind length longer
+    /// than the bytes that remain is not a kind this build does not know — it
+    /// means the next entry cannot be found.
+    #[test]
+    fn a_lying_record_kind_length_still_fails_the_body() {
+        let body = encode_log(&three_entries_with_a_kind_in_the_middle());
+        assert!(decode_log(&body, BodyVersion::V2).is_some(), "control");
+        let lying = substitute(
+            &body,
+            &[11u8, 0][..]
+                .iter()
+                .copied()
+                .chain(*b"provisional")
+                .collect::<Vec<_>>(),
+            &[0xffu8, 0xff][..]
+                .iter()
+                .copied()
+                .chain(*b"provisional")
+                .collect::<Vec<_>>(),
+        );
+        assert!(
+            decode_log(&lying, BodyVersion::V2).is_none(),
+            "a length past the end of the body is corruption, not vocabulary"
+        );
+    }
+
+    /// **Every truncation of a body is refused, none is decoded short.**
+    ///
+    /// The mirror control for the degradation above, and it had to be this
+    /// rather than a single lying length: making the record-kind read
+    /// non-structural (`c.bytes(len).unwrap_or(b"")`) still *failed* on a lying
+    /// length inside a three-entry body, because the desynchronised cursor ran
+    /// into trouble further down and the test could not tell the two apart.
+    /// A one-entry body truncated at the record-kind field is where the
+    /// difference is visible: the loop ends, and a decoder that shrugged at the
+    /// short read returns an entry it never finished reading.
+    #[test]
+    fn no_truncation_of_a_body_decodes_short() {
+        let mut log = TrustEventLog::new(DEFAULT_LOG_CAP);
+        log.append(
+            TrustEventScope::for_record(
+                TrustEventKey::DmRecordErasureBlocked,
+                RecordKind::Provisional,
+            )
+            .observed_at(2, Some("srv-a".into()), Some(sid(1))),
+        );
+        let body = encode_log(&log);
+        assert!(
+            decode_log(&body, BodyVersion::V2).is_some(),
+            "the whole body must decode, or the sweep below is vacuous"
+        );
+        assert!(body.len() > 40, "the sweep must have real prefixes to try");
+        for cut in 0..body.len() {
+            assert!(
+                decode_log(&body[..cut], BodyVersion::V2).is_none(),
+                "a body cut at {cut} of {} decoded short",
+                body.len()
+            );
+        }
+    }
+
+    /// The scope pairing: `bare` cannot set a kind, `for_record` always does,
+    /// and `observed` is `bare`.
+    #[test]
+    fn a_bare_scope_never_acquires_a_record_kind() {
+        assert_eq!(
+            TrustEventScope::bare(TrustEventKey::ServerKeyMismatch).record_kind,
+            None
+        );
+        assert_eq!(
+            TrustEvent::observed(1, TrustEventKey::ServerKeyMismatch, None, None).record_kind,
+            None
+        );
+        for kind in RecordKind::ALL {
+            assert_eq!(
+                TrustEventScope::for_record(TrustEventKey::DmRecordErasureBlocked, kind)
+                    .observed_at(1, None, None)
+                    .record_kind,
+                Some(kind)
+            );
+        }
+    }
+
+    /// ISC-C28 / ISC-A-C1: the discriminant is closed and carries no payload,
+    /// so a log full of them cannot become a recently-contacted set.
+    ///
+    /// **The `Debug` check is the redaction half.** `TrustEvent` derives
+    /// `Debug`, so whatever a future `RecordKind` variant carried would be
+    /// rendered wherever an event is. Today each variant renders as its bare
+    /// name; a variant gaining a field — a path, a label, a correspondent —
+    /// would render as `Name(..)` and fail here, which is the point at which
+    /// that redaction question has to be answered rather than inherited.
+    #[test]
+    fn a_record_kind_names_a_type_and_never_an_instance() {
+        for kind in RecordKind::ALL {
+            let rendered = format!("{kind:?}");
+            assert!(
+                rendered.chars().all(|c| c.is_ascii_alphabetic()),
+                "a kind must render as a bare variant name, with no payload: {rendered}"
+            );
+            let event = TrustEventScope::for_record(TrustEventKey::DmRecordErasureBlocked, kind)
+                .observed_at(1, None, None);
+            let debug = format!("{event:?}");
+            assert!(
+                debug.contains(&rendered),
+                "the kind must be visible in the event's Debug: {debug}"
+            );
+        }
     }
 
     /// Tampering with the ciphertext fails authentication (AAD + AEAD).
