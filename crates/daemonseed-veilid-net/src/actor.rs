@@ -239,6 +239,76 @@ impl DmPageSweep {
     }
 }
 
+/// Which dispatch of a doorbell knock this is — the field that decides its funnel
+/// class (`docs/design/direct-messaging.md:127-128`).
+///
+/// An explicit two-variant enum rather than a `bool` or an `Option`: the caller is
+/// the only layer that knows which dispatch it is holding, the two map to different
+/// priority lanes, and a defaulted or positionally-passed flag is exactly the kind of
+/// argument that gets the wrong value silently. There is no `Default` for the same
+/// reason `PresenceBoundary` has none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DoorbellDispatch {
+    /// The first dispatch of a user's first-contact send — the doorbell write that
+    /// rides along with the user action that caused it. `Chat` (rank 1): a user
+    /// action wanting user-action latency, and **one write per action, not a burst**
+    /// (two at first contact, counting the outbox write) — which is what the 2-permit
+    /// chat lane is for.
+    FirstSend,
+    /// A scheduler-driven re-dispatch — the doorbell keep-alive the outbox re-seeds
+    /// on its backoff. `Keepalive` (rank 4), competing in the non-chat window against
+    /// presence and advert refreshes, exactly as the key-record keep-alive does.
+    Reseed,
+}
+
+impl DoorbellDispatch {
+    /// The funnel priority class for this dispatch.
+    ///
+    /// Only the class varies. The coalescing *kind* is `CurrentState` on the slot for
+    /// both, because `:128` fixes the logical id as the message (the slot) so that a
+    /// superseded re-seed of one knock coalesces while distinct knocks never do — and
+    /// that rule is indifferent to which dispatch produced the write.
+    pub fn classify(self) -> WriteClass {
+        match self {
+            DoorbellDispatch::FirstSend => WriteClass::Chat,
+            DoorbellDispatch::Reseed => WriteClass::Keepalive,
+        }
+    }
+}
+
+/// One doorbell sweep's result: the populated slots, and whether the sweep saw
+/// the whole record.
+///
+/// Modelled on [`DmPageSweep`] and deliberately WITHOUT its conversation tag.
+/// A page sweep names one correspondence, so a caller fanning several of them out
+/// concurrently needs the result to say which it belongs to. A doorbell is the
+/// opposite shape of problem: there is exactly one per identity, a caller sweeps
+/// its own and no other, and every populated slot is a knock from a DIFFERENT and
+/// as-yet-unknown sender. There is nothing to tag the result with that this layer
+/// could compute — the slot is derived from a secret only the sender holds, which
+/// is what sender-blindness means — and nothing the caller does not already know.
+pub struct DoorbellSweep {
+    /// The populated slots, as `(slot, bytes)`.
+    ///
+    /// The bytes are UNVERIFIED and still sealed. Only
+    /// `daemonseed_core::dm::firstcontact::open` may decide an entry is genuine,
+    /// and it needs the recipient's ML-KEM decapsulation key, which this layer
+    /// does not hold. The doorbell is world-writable, so garbage in a slot is an
+    /// ordinary input rather than an error condition.
+    ///
+    /// The slot travels back with the bytes because a recipient that accepts a
+    /// knock has to be able to name the slot it came from — a later retry from the
+    /// same sender lands in that same slot and overwrites it, and a block drops it
+    /// there.
+    pub slots: Vec<(u16, Vec<u8>)>,
+    /// Whether the sweep saw the whole record.
+    ///
+    /// Required, not decoration, for the reason [`DmPageSweep::outcome`] is: an
+    /// empty slot list alone means both "nobody has knocked" and "all 32 GETs
+    /// errored", and those demand opposite responses.
+    pub outcome: rendezvous::SweepOutcome,
+}
+
 /// Commands the [`VeilidNetHandle`] sends to the actor task. Each carries a
 /// `oneshot` reply so the caller awaits the result.
 enum Command {
@@ -399,6 +469,55 @@ enum Command {
     SweepDmPage {
         address: DmPageAddress<Receiving>,
         reply: oneshot::Sender<Result<DmPageSweep>>,
+    },
+    // ── Direct messaging (#233) ──
+    /// Write one first-contact entry into `slot` of the `dflt(32)` doorbell record
+    /// at `owner_seed` (`daemonseed_core::dm::doorbell::derive_owner_seed` over the
+    /// RECIPIENT's ML-DSA-87 public key). `entry` is the already-sealed,
+    /// already-signed first-contact entry; this layer moves opaque bytes and never
+    /// inspects them.
+    ///
+    /// **The one record a party writes that it does not own, and the only
+    /// unauthenticated write surface in DM.** Nothing new is needed to express
+    /// that: a world-derivable address implies a world-derivable owner under
+    /// Veilid's DFLT schema, so the sender derives the *recipient's* owner keypair
+    /// from the recipient's public identity key and signs the write with it,
+    /// exactly as [`Command::PublishDmKeyRecord`] does for a key record. The
+    /// difference is whose record it is, and that difference is a fact about the
+    /// design, not about the mechanism — see [`publish_doorbell_entry`].
+    ///
+    /// `slot` comes from `doorbell::slot_for`, which is keyed on a secret only the
+    /// sender holds, so this layer cannot check it against anything: it can only
+    /// check that the record can hold it. Both that and the entry's size are
+    /// refused at [`VeilidNetHandle::publish_doorbell_entry`], before this command
+    /// is built.
+    ///
+    /// Rides the WB-3 funnel as a `CurrentState`-kind write coalescing on the SLOT,
+    /// at the class [`DoorbellDispatch::classify`] gives — see
+    /// [`doorbell_entry_write_request`] for why each of those is what it is.
+    PublishDoorbellEntry {
+        owner_seed: [u8; 32],
+        slot: u16,
+        entry: Vec<u8>,
+        dispatch: DoorbellDispatch,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    /// Sweep all `DOORBELL_SLOTS` slots of OUR OWN doorbell, returning a
+    /// [`DoorbellSweep`] — the populated `(slot, bytes)` pairs and the outcome.
+    ///
+    /// `owner_seed` is derived from OUR public identity key, which is what makes
+    /// this a sweep of our own doorbell rather than someone else's. There is no
+    /// type-level direction to lean on the way [`Command::SweepDmPage`] has one:
+    /// a doorbell owner seed is a plain world-derivable `[u8; 32]`, and sweeping
+    /// another identity's doorbell is a perfectly well-formed operation that
+    /// simply returns entries nothing local can open. The check that it is ours
+    /// lives with the caller, which is the layer that holds the decapsulation key.
+    ///
+    /// An empty result is the ordinary state of a doorbell nobody has knocked on,
+    /// and is distinct from a transport error.
+    SweepDoorbell {
+        owner_seed: [u8; 32],
+        reply: oneshot::Sender<Result<DoorbellSweep>>,
     },
     // ── Public-share content (Phase 3) ──
     /// Register a share to serve owner-on-demand (`share_id` → content source
@@ -750,6 +869,87 @@ impl VeilidNetHandle {
     /// rebuilt from borrowed bytes without reintroducing the copy (#244).
     pub async fn sweep_dm_page(&self, address: DmPageAddress<Receiving>) -> Result<DmPageSweep> {
         self.send(|reply| Command::SweepDmPage { address, reply })
+            .await?
+    }
+
+    // ── Direct messaging (#233) ──
+
+    /// Knock on a recipient's doorbell: write one sealed first-contact entry into
+    /// one slot of the recipient's `dflt(32)` doorbell record (ISC-C41).
+    ///
+    /// Derive `owner_seed` with `daemonseed_core::dm::doorbell::derive_owner_seed`
+    /// over the RECIPIENT's ML-DSA-87 public key, and `slot` with
+    /// `doorbell::slot_for` over this sender's own doorbell slot secret and that
+    /// same recipient key. Both are pure; derive them per call.
+    ///
+    /// **This writes a record this node does not own, and that needs no new
+    /// authority model.** The address is world-derivable from a public key, and
+    /// under Veilid's DFLT schema a world-derivable address implies a
+    /// world-derivable *owner* — so the sender derives the recipient's owner
+    /// keypair and signs the `set` with it, through the same
+    /// `rendezvous::open_or_create` / `publish_at_subkey` pair every other record
+    /// uses. The safety of the doorbell rests entirely on the entry being sealed to
+    /// the recipient and verified by them, never on who could write the slot: any
+    /// third party can overwrite or erase any slot, and that DoS residual is
+    /// accepted and priced by the design rather than mitigated here.
+    ///
+    /// Two things are refused BEFORE the command crosses the channel, so neither
+    /// can reach the network: a `slot` the record cannot hold, and an `entry` above
+    /// the `dflt(32)` per-subkey cap. Both would otherwise fail after an
+    /// `open_or_create` had already created or opened the record on the network.
+    ///
+    /// `entry` is opaque here: this layer neither parses, seals, nor verifies it,
+    /// and a successful write proves nothing about the sender — the doorbell is
+    /// world-writable, so reaching this function is not evidence of anything.
+    ///
+    /// Enqueued as a current-state write coalescing on the slot, at the class
+    /// `dispatch` names. The full classification is stated on
+    /// `doorbell_entry_write_request` (de-linked: it is private, and widening it to
+    /// satisfy a doc link would be the wrong direction).
+    pub async fn publish_doorbell_entry(
+        &self,
+        owner_seed: [u8; 32],
+        slot: u16,
+        entry: Vec<u8>,
+        dispatch: DoorbellDispatch,
+    ) -> Result<()> {
+        // Refused HERE, at the public boundary, and therefore before the command is
+        // even built — the earliest point at which the two facts are both known.
+        // Putting it further in would mean the record had been opened (or CREATED,
+        // on this path) before anything was validated, which is the same
+        // move `rendezvous::check_subkey_range` exists to make for the slot bound.
+        doorbell_write_must_be_addressable(slot, entry.len())?;
+        self.send(|reply| Command::PublishDoorbellEntry {
+            owner_seed,
+            slot,
+            entry,
+            dispatch,
+            reply,
+        })
+        .await?
+    }
+
+    /// Sweep our own doorbell, returning `(slot, bytes)` per populated slot
+    /// together with the sweep's outcome (ISC-C41).
+    ///
+    /// `owner_seed` is `daemonseed_core::dm::doorbell::derive_owner_seed` over
+    /// **our** public identity key. Nothing here checks that: a doorbell owner seed
+    /// is a world-derivable `[u8; 32]`, so sweeping someone else's doorbell is
+    /// well-formed and simply returns entries no local key can open. The caller
+    /// holds the decapsulation key and is the layer that knows whose doorbell this
+    /// is.
+    ///
+    /// An empty `Vec` is the ordinary state of a doorbell nobody has knocked on,
+    /// and is deliberately distinct from `Err`. The bytes are UNVERIFIED and still
+    /// sealed — pass each to `daemonseed_core::dm::firstcontact::open`, which fails
+    /// closed and uniformly, because a world-writable record makes garbage an
+    /// ordinary input rather than an incident.
+    ///
+    /// A partial sweep returns what it read; `outcome.failed > 0` is a
+    /// record-health signal, not an empty doorbell, and conflating the two would
+    /// turn a network fault into "nobody wants to talk to you".
+    pub async fn sweep_doorbell(&self, owner_seed: [u8; 32]) -> Result<DoorbellSweep> {
+        self.send(|reply| Command::SweepDoorbell { owner_seed, reply })
             .await?
     }
 
@@ -1455,6 +1655,128 @@ async fn actor_loop(
                     let _ = reply.send(r);
                 });
             }
+            Command::PublishDoorbellEntry {
+                owner_seed,
+                slot,
+                entry,
+                dispatch,
+                reply,
+            } => {
+                // The classification is built by `doorbell_entry_write_request` rather
+                // than inline, for the reason `dm_page_write_request` gives: every field
+                // of it fails SILENTLY, and a funnel request constructed on the command
+                // loop is reachable from no test.
+                //
+                // **The two dispatches take different paths here, because they are
+                // different writes.** `enqueue` is a synchronous send on an unbounded
+                // channel and can neither block nor yield, so nothing in this arm needs
+                // spawning for the D-0b / #128 / CRSH-ISC-22 reason — that rule is about
+                // not AWAITING the DHT on the loop.
+                match dispatch {
+                    // A re-seed is class-4. Enqueue and return, exactly as
+                    // `PublishDmKeyRecord` does for the sibling keep-alive. A pre-open
+                    // would be actively wrong: the funnel may pace this write minutes
+                    // later, so opening the record NOW moves network work out from under
+                    // the budget the funnel exists to enforce, and decouples the open
+                    // from the write it is meant to be warming.
+                    DoorbellDispatch::Reseed => {
+                        sched.enqueue(doorbell_entry_write_request(
+                            owner_seed, slot, entry, dispatch, reply,
+                        ));
+                    }
+                    // A first send is `Chat`, and that changes the argument completely.
+                    // WARM THE RECORD OPEN FIRST, off the chat lane — the same trade
+                    // `PublishDmPage` makes, and for a sharper reason. A chat-class
+                    // dispatch holds one of only CHAT_PERMITS (2) across the WHOLE write,
+                    // and a first contact's target is a STRANGER's doorbell this node has
+                    // never opened, so that write begins with a cold `open_or_create`
+                    // (~6-10 s live-measured, worst case open->create->open). This is now
+                    // the only Chat-class write in the crate whose record can be cold at
+                    // dispatch: the subscribe-time rendezvous record is already open and
+                    // the page is pre-warmed by the arm above. Two concurrent first
+                    // contacts would otherwise hold both permits for seconds and queue
+                    // every chat message in the app behind them.
+                    //
+                    // A latency argument, not a rule violation: opening under a pool
+                    // permit is sanctioned, and WB-ISC-24 governs permit ACQUISITION, not
+                    // what runs under a held one. Nor is the open made cheaper — it still
+                    // costs an un-gated margin permit. What changes is that it no longer
+                    // ALSO holds a chat permit for its duration.
+                    //
+                    // A pre-open FAILURE is not fatal and not swallowed: it is traced and
+                    // the write enqueued regardless, so the dispatch retries the open
+                    // under the chat permit exactly as it would have anyway. Spawned so
+                    // the command loop never waits on the open (D-0b / #128).
+                    DoorbellDispatch::FirstSend => {
+                        let sched = sched.clone();
+                        let gate = dht_gate.clone();
+                        let api = api.clone();
+                        let rc = rc.clone();
+                        let opened = opened.clone();
+                        let record_locks = record_locks.clone();
+                        tokio::spawn(async move {
+                            match identity::rendezvous_owner_keypair(&owner_seed) {
+                                Ok(owner) => {
+                                    // Single-flight against a concurrent op on this
+                                    // record, as the dispatch itself does. The guard is
+                                    // dropped before the enqueue so the write never
+                                    // queues holding a record lock.
+                                    let record_lock =
+                                        rendezvous::record_lock(&record_locks, &owner);
+                                    let _open_guard = record_lock.lock().await;
+                                    if let Err(e) = doorbell_open(
+                                        &gate,
+                                        &api,
+                                        &rc,
+                                        &opened,
+                                        &owner,
+                                        IfAbsent::Create,
+                                    )
+                                    .await
+                                    {
+                                        crate::vtrace!(
+                                            "publish_doorbell_entry: pre-open failed ({e}); \
+                                             enqueuing anyway, the dispatch will retry the \
+                                             open under the chat permit"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    // The dispatch derives the same keypair and will fail
+                                    // the same way, reporting it through the caller's
+                                    // `reply`.
+                                    crate::vtrace!(
+                                        "publish_doorbell_entry: owner keypair failed ({e})"
+                                    );
+                                }
+                            }
+                            sched.enqueue(doorbell_entry_write_request(
+                                owner_seed, slot, entry, dispatch, reply,
+                            ));
+                        });
+                    }
+                }
+            }
+            Command::SweepDoorbell { owner_seed, reply } => {
+                // A read, so it never touches the write funnel (I9: no read-triggered
+                // writes). SPAWNED, never awaited inline (D-0b / #128, CRSH-ISC-22):
+                // the sweep is DOORBELL_SLOTS (32) gated GETs behind an open that costs
+                // ~6-10 s on a cold cache, and a client re-sweeps its doorbell on a
+                // recurring schedule for as long as it is running. Awaiting one on the
+                // command loop would park every other command behind it for tens of
+                // seconds, the #154 failure mode exactly.
+                let gate = dht_gate.clone();
+                let api = api.clone();
+                let rc = rc.clone();
+                let opened = opened.clone();
+                let record_locks = record_locks.clone();
+                tokio::spawn(async move {
+                    let r =
+                        sweep_doorbell(&gate, &api, &rc, &opened, &record_locks, owner_seed).await;
+                    // A dropped receiver (caller gave up / shutting down) is benign.
+                    let _ = reply.send(r);
+                });
+            }
             Command::SubscribeRendezvous { owner_seed, reply } => {
                 let _ = reply.send(
                     subscribe_rendezvous(
@@ -2073,6 +2395,27 @@ enum ProdWrite {
         address: DmPageAddress<Sending>,
         frame: Vec<u8>,
     },
+    /// A DM doorbell first-contact write -> [`publish_doorbell_entry`]. Its own
+    /// variant for the reason [`ProdWrite::DmKeyRecord`] gives: the doorbell is
+    /// `dflt(32)`, a fourth shape again, and shape is part of the record address,
+    /// so routing it down any of the other three paths would address a different
+    /// record. Plus a second reason, shared with [`ProdWrite::DmPage`]: the slot is
+    /// supplied by the caller (`doorbell::slot_for`), so it is neither a fixed slot
+    /// like the key record's nor a hashed one like a current-state beacon's.
+    ///
+    /// The seed rides as a plain `[u8; 32]` rather than inside a zeroizing type,
+    /// unlike [`ProdWrite::DmPage`]'s address, and that is correct rather than an
+    /// omission. A doorbell owner seed is derived from the recipient's PUBLIC
+    /// identity key: everyone who can address the doorbell can already compute it,
+    /// so it is not a secret and there is nothing for zeroize-on-drop to protect.
+    /// This is exactly the reasoning [`ProdWrite::DmKeyRecord`] rests on, and the
+    /// distinction #244 draws — a page's owner seed IS the conversation's write
+    /// capability, a doorbell's confers only what the world already has.
+    DoorbellEntry {
+        owner_seed: [u8; 32],
+        slot: u16,
+        entry: Vec<u8>,
+    },
 }
 
 /// The production [`WriteSink`] (WB-3.I1): the funnel's dispatch end. Holds the same
@@ -2170,6 +2513,23 @@ impl WriteSink for ProductionSink {
                     // zeroized — at the end of this arm, so the conversation secret
                     // lives no longer than the write it authorises (#244).
                     publish_dm_page(&gate, &api, &rc, &opened, &record_locks, &address, frame).await
+                }
+                ProdWrite::DoorbellEntry {
+                    owner_seed,
+                    slot,
+                    entry,
+                } => {
+                    publish_doorbell_entry(
+                        &gate,
+                        &api,
+                        &rc,
+                        &opened,
+                        &record_locks,
+                        owner_seed,
+                        slot,
+                        entry,
+                    )
+                    .await
                 }
             };
             drop(permit);
@@ -2667,6 +3027,417 @@ async fn sweep_dm_page(
     // placement is unit-testable — see `dm_page_place_swept`.
     let found = dm_page_place_swept(address, raw)?;
     Ok(DmPageSweep::for_address(address, found, outcome))
+}
+
+/// The DM doorbell's schema: `dflt(32)`, one subkey per knock slot.
+///
+/// Part of the record ADDRESS, and simultaneously the modulus of
+/// `daemonseed_core::dm::doorbell::slot_for` — hence derived from
+/// `doorbell::DOORBELL_SLOTS` rather than typed here (ISC-C41), for the reason the
+/// page shape is derived from `paging::PAGE_SLOTS`. It carries a third fact the
+/// page's does not: 32 slots is what makes the per-subkey cap exactly
+/// `firstcontact::MAX_ENTRY_LEN`, so this shape and the entry ceiling are one
+/// number wearing two names.
+const DM_DOORBELL_SHAPE: rendezvous::RecordShape = rendezvous::RecordShape::DM_DOORBELL;
+
+/// Refuse a slot the doorbell record cannot hold.
+///
+/// The slot comes from `doorbell::slot_for`, which reduces mod `DOORBELL_SLOTS` and
+/// therefore cannot produce one — so this guards a caller that computed the slot
+/// some other way, which is the only way a knock can be aimed outside the record.
+/// Veilid would refuse the subkey itself, but only after an `open_or_create` had
+/// already brought the recipient's record into being on the network, and only as a
+/// generic schema-validation failure.
+fn doorbell_slot_must_be_in_record(slot: u16) -> Result<()> {
+    if slot >= daemonseed_core::dm::doorbell::DOORBELL_SLOTS {
+        return Err(VeilidNetError::DmDoorbellSlotOutsideRecord {
+            slot: u32::from(slot),
+        });
+    }
+    Ok(())
+}
+
+/// Refuse a first-contact entry above the doorbell subkey's cap.
+///
+/// The bound is `firstcontact::MAX_ENTRY_LEN`, which is the ceiling the entry's own
+/// padding ladder is built against AND — because the slot count was chosen to make
+/// it so — exactly this shape's [`rendezvous::RecordShape::max_value_len`]. The two
+/// being equal is pinned by a test rather than assumed here; if they ever diverged,
+/// `rendezvous::check_write_cap` is the network-truth backstop underneath, and it
+/// would refuse the write after the open rather than before it.
+///
+/// An entry built by `firstcontact::build` cannot trip this — it is padded into a
+/// bucket that fits. Reaching it means the entry came from somewhere else, or the
+/// ladder and the schema have drifted apart, and both are worth a loud local
+/// failure naming the cap.
+fn doorbell_entry_must_fit(entry_len: usize) -> Result<()> {
+    let max = daemonseed_core::dm::firstcontact::MAX_ENTRY_LEN;
+    if entry_len > max {
+        return Err(VeilidNetError::DmDoorbellEntryTooLarge {
+            len: entry_len,
+            max,
+        });
+    }
+    Ok(())
+}
+
+/// Both write-side doorbell guards, applied together at the public handle before
+/// anything crosses the command channel.
+///
+/// One function so the two cannot come apart: a caller that checked the size and
+/// forgot the slot reaches the network with a subkey the record cannot hold, and a
+/// caller that checked the slot and forgot the size reaches it with a value veilid
+/// will refuse — both after `open_or_create` has already created the recipient's
+/// record. Pairing them also makes the pair unit-testable in one call, which the
+/// command loop's own arm is not.
+fn doorbell_write_must_be_addressable(slot: u16, entry_len: usize) -> Result<()> {
+    doorbell_slot_must_be_in_record(slot)?;
+    doorbell_entry_must_fit(entry_len)
+}
+
+/// Turn one swept subkey into the doorbell slot it holds.
+///
+/// The checked subkey-to-slot direction, applied at the transport boundary so no
+/// caller does the narrowing. A sweep is bounded by the opened record's own `o_cnt`,
+/// and `doorbell_open` binds one shape, so this cannot fail on any path that exists
+/// today — it is the narrowing's total-function form, kept because the alternative
+/// to reporting an unplaceable subkey is skipping it, and a skipped slot is a knock
+/// the recipient never sees under an `Ok`.
+fn doorbell_slot_of_subkey(subkey: u32) -> Result<u16> {
+    u16::try_from(subkey)
+        .ok()
+        .filter(|slot| *slot < daemonseed_core::dm::doorbell::DOORBELL_SLOTS)
+        .ok_or(VeilidNetError::DmDoorbellSlotOutsideRecord { slot: subkey })
+}
+
+/// Place every swept subkey in its slot, so a caller receives slots rather than
+/// raw subkey indices.
+///
+/// A free function rather than an inline `map` inside [`sweep_doorbell`] for the
+/// reason `dm_page_place_swept` is one: the sweep cannot run without a live DHT, so
+/// anything written inline there is a line no runnable test reaches.
+fn doorbell_place_swept(raw: Vec<(u32, Vec<u8>)>) -> Result<Vec<(u16, Vec<u8>)>> {
+    raw.into_iter()
+        .map(|(subkey, bytes)| doorbell_slot_of_subkey(subkey).map(|slot| (slot, bytes)))
+        .collect()
+}
+
+/// Build the funnel request for one doorbell knock.
+///
+/// **`CurrentState` kind coalescing on the SLOT, at the class `dispatch` names.**
+/// Each of the three is a decision that fails silently if it is wrong, so each is
+/// stated. The authority for all of it is
+/// `docs/design/direct-messaging.md:127-128` (§ Fork 4, write classification).
+///
+/// *Class.* Not one class but two, because the design splits the doorbell in two.
+/// `:127`: the FIRST dispatch of a user send is `Chat` (rank 1) — "the outbox
+/// write, plus the doorbell write when the send is a first contact… a user action
+/// wanting user-action latency… **one write (two at first contact) per user
+/// action**". `:128`: every scheduler-driven re-dispatch — "outbox re-seeds,
+/// doorbell keep-alive, key-record keep-alive" — is `Keepalive` (rank 4). The
+/// caller states which through [`DoorbellDispatch`], the way
+/// [`Command::PublishCurrentState`] takes a [`PresenceBoundary`], because the
+/// transport cannot tell them apart and a default would silently pick one.
+///
+/// Neither carries a deadline: there is no hard DHT expiry anywhere in the DM path,
+/// only eviction pressure (`:129`).
+///
+/// **The chat lane does NOT confer never-coalesce, and that is worth stating
+/// because `:127` calls it "never coalesced".** The funnel keys coalescing on the
+/// `kind` alone — `WriteScheduler::enqueue` matches on `req.kind` and never reads
+/// `req.class` — so a `Chat`-class `CurrentState` write is coalescible like any
+/// other. `:127`'s phrase is true of the writes it has in mind (the outbox and page
+/// writes, which are `Ring`), not of the lane itself. The consequence here is
+/// narrow and accepted: if a `Reseed` for the same slot is enqueued while a
+/// `FirstSend` for it is still queued, the elder is dropped and the survivor
+/// carries the *newer* request's class, so the knock lands at rank 4 rather than
+/// rank 1. Nothing is lost — same slot, same entry, and the elder's reply resolves
+/// `Ok` — and it is only reachable when a first send has already sat queued long
+/// enough for its own backoff to fire. Pinned by a test so a change to `schedule.rs`
+/// surfaces here.
+///
+/// *Kind.* `CurrentState`, i.e. coalescible — the opposite of the page write's
+/// `Ring`, and correct for the opposite reason. Two queued writes to one page are
+/// two different messages in two different slots, so collapsing them drops one. Two
+/// queued writes to one doorbell SLOT are the same sender knocking twice at the same
+/// recipient, because the slot is a pure function of `(sender secret, recipient
+/// key)` — a retry is *defined* to overwrite the sender's own previous entry, so a
+/// newer knock superseding a queued older one is exactly the intended behaviour.
+///
+/// *Coalescing key.* The `logical_id` is the SLOT — `:128`, "the logical id is the
+/// *message* (slot), so a superseded re-seed of the same message coalesces and
+/// distinct messages never do". This is the field with the least margin for error. The funnel coalesces on `(record, logical_id)`, and the
+/// record here is one doorbell shared by every sender who ever knocks on it. A
+/// constant id — the shape [`Command::PublishDmKeyRecord`] can afford, because there
+/// is exactly one key record per owner seed — would make two knocks from two local
+/// identities to one recipient collapse into one, and the loser's first contact
+/// would never reach the wire while its `reply` reported `Ok(())`. The slot is what
+/// separates them, and it is the finest scope that is still correct: it is precisely
+/// the granularity at which "the same sender knocking again" is defined.
+///
+/// Constructed out of line, not inline in the [`Command::PublishDoorbellEntry`] arm,
+/// for the reason `dm_page_write_request` gives: a request built on the command loop
+/// can only be observed by a live two-node round trip, and every mistake available
+/// here reports `Ok(())` on every local surface. The record id is derived *inside*
+/// this function for the same reason — passing it in would move the one decision
+/// worth pinning back out to the untestable call site.
+fn doorbell_entry_write_request(
+    owner_seed: [u8; 32],
+    slot: u16,
+    entry: Vec<u8>,
+    dispatch: DoorbellDispatch,
+    reply: oneshot::Sender<Result<()>>,
+) -> WriteRequest<ProdWrite> {
+    WriteRequest {
+        // Scope rationale lives on `funnel_record_key`.
+        record: funnel_record_key(&owner_seed),
+        class: dispatch.classify(),
+        kind: WriteKind::CurrentState {
+            logical_id: doorbell_coalescing_id(slot),
+        },
+        deadline: None,
+        item: ProdWrite::DoorbellEntry {
+            owner_seed,
+            slot,
+            entry,
+        },
+        reply: Some(reply),
+    }
+}
+
+/// The funnel's coalescing id for one doorbell slot.
+///
+/// One function so two enqueue paths cannot spell it differently: the id is a
+/// coalescing scope, so two spellings for one slot silently stop coalescing and two
+/// slots sharing a spelling silently start.
+fn doorbell_coalescing_id(slot: u16) -> String {
+    format!("dm-doorbell-{slot}")
+}
+
+/// Open (or create) one doorbell's record — the single opener both doorbell
+/// operations go through.
+///
+/// **One call site for the shape, and that is the whole point** — the argument
+/// `dm_page_open` makes, verbatim in force here: `o_cnt` is part of the record
+/// ADDRESS, so a knock and a sweep naming different shapes would run against two
+/// different records, the write would succeed, the sweep would come back empty, and
+/// no surface anywhere would report an error.
+///
+/// Whether an absent record may be brought into being is the caller's to say, and
+/// is the one thing that differs between the two paths. A knock uses
+/// [`IfAbsent::Create`], and on this record that means a SENDER creating a record it
+/// does not own — which is not an anomaly but the mechanism of cold first contact:
+/// until somebody knocks, a recipient's doorbell does not exist on the network at
+/// all. A sweep uses [`IfAbsent::ReportAbsent`], for the reason #253 gives on the
+/// page: creating on a read path manufactures an empty record and destroys the
+/// difference between "nobody has knocked" and "the record was not found on this
+/// pass".
+///
+/// Locking is deliberately NOT folded in, exactly as it is not for the page:
+/// [`publish_doorbell_entry`] holds the record lock across the open *and* the write,
+/// while [`sweep_doorbell`] drops it the moment the open returns so its GETs never
+/// block a concurrent write to the same doorbell (CRSH-ISC-17).
+async fn doorbell_open(
+    gate: &Arc<DhtGate>,
+    api: &VeilidAPI,
+    rc: &RoutingContext,
+    opened: &rendezvous::OpenCache,
+    owner: &KeyPair,
+    if_absent: IfAbsent,
+) -> Result<Option<rendezvous::RendezvousHandle>> {
+    // Bound ONCE, and every use below goes through this binding, for the reason
+    // `dm_page_open` binds its own: the cache id and both open modes cannot drift
+    // apart without editing this line.
+    let shape = DM_DOORBELL_SHAPE;
+    let id = rendezvous::cached_record_id(owner, shape);
+    match if_absent {
+        IfAbsent::Create => rendezvous::open_cached(
+            opened,
+            &id,
+            rendezvous::open_or_create(gate, api, rc, owner, shape),
+        )
+        .await
+        .map(Some),
+        IfAbsent::ReportAbsent => {
+            rendezvous::open_cached_optional(
+                opened,
+                &id,
+                rendezvous::open_only(gate, api, rc, owner, shape),
+            )
+            .await
+        }
+    }
+}
+
+/// Write one sealed first-contact entry into one slot of one doorbell (ISC-C41).
+///
+/// `entry` is opaque here, exactly as the key record and the channel frame are: this
+/// layer neither parses, seals, nor verifies it. Authorship is proved by the
+/// signature sealed inside — checked by the recipient's
+/// `firstcontact::open` — never by the fact that a write succeeded.
+///
+/// **This is the one record daemonseed writes that the writer does not own, and it
+/// needs nothing new to express.** The owner keypair is derived from a
+/// world-derivable seed, so the sender holds full write authority over the
+/// recipient's doorbell and signs the `set` with it, through the identical
+/// `open_or_create` / `publish_at_subkey` pair every owned record uses. What differs
+/// from every other write in this crate is not the mechanism but the consequence:
+/// any third party holds that same authority, so any slot can be overwritten or
+/// erased by anyone. That is the accepted, DoS-only residual the design prices —
+/// forgery is impossible, because an entry that does not verify under the
+/// recipient's own decapsulation key simply does not open — and it is why the
+/// sender's outbox re-seeds on a backoff rather than treating one successful write
+/// as delivery.
+///
+/// `IfAbsent::Create` is therefore load-bearing rather than incidental: a recipient
+/// who has never been knocked on has no doorbell record on the network, and the
+/// first sender brings it into being.
+#[allow(clippy::too_many_arguments)]
+async fn publish_doorbell_entry(
+    gate: &Arc<DhtGate>,
+    api: &VeilidAPI,
+    rc: &RoutingContext,
+    opened: &rendezvous::OpenCache,
+    record_locks: &rendezvous::RecordLocks,
+    owner_seed: [u8; 32],
+    slot: u16,
+    entry: Vec<u8>,
+) -> Result<()> {
+    let owner = identity::rendezvous_owner_keypair(&owner_seed)?;
+    // Single-flight the open and serialize against any concurrent op on this record,
+    // exactly as the rendezvous, key-record and page write paths do (CRSH-ISC-3).
+    // Contended by design here in a way the others are not: one doorbell is shared by
+    // every sender in the world, so two knocks from this node to one recipient — and
+    // this node's own sweep of its own doorbell — take the same lock.
+    let record_lock = rendezvous::record_lock(record_locks, &owner);
+    let _write_guard = record_lock.lock().await;
+    // `IfAbsent::Create` cannot answer `None` — it either opens, creates and reopens,
+    // or fails — so this is unreachable rather than a fallback with a behaviour. It is
+    // written as a hard error instead of an `expect` so a future change to
+    // `doorbell_open` surfaces as a reported failure rather than a panic inside a
+    // scheduler dispatch task.
+    let handle = doorbell_open(gate, api, rc, opened, &owner, IfAbsent::Create)
+        .await?
+        .ok_or_else(|| {
+            VeilidNetError::Actor(
+                "the doorbell opener, in IfAbsent::Create mode, reported the record absent \
+                 instead of creating it"
+                    .to_string(),
+            )
+        })?;
+    crate::vtrace!(
+        "publish_doorbell_entry: key={:?} slot={} bytes={}",
+        handle.key(),
+        slot,
+        entry.len()
+    );
+    rendezvous::publish_at_subkey(rc, &handle, &owner, u32::from(slot), entry).await
+}
+
+/// Sweep every slot of one doorbell, returning `(slot, bytes)` per populated slot
+/// together with the sweep's [`rendezvous::SweepOutcome`].
+///
+/// A **partial** sweep — some slots read, some GETs failed — returns the slots it
+/// did read rather than an error, which makes the outcome a **caller obligation**:
+/// `outcome.failed > 0` is a record-health signal and must not be read as an empty
+/// doorbell, or a network fault becomes "nobody has knocked". Unlike the page sweep
+/// there is no cursor to hold in place — every slot is independently meaningful and
+/// a missed one is simply re-read on the next pass — so the obligation is the one
+/// rule rather than two.
+///
+/// The record's shape is an invariant here rather than something checked: the opener
+/// binds one shape and `RendezvousHandle` carries the shape it was derived under, so a
+/// record with a different `o_cnt` is a different address this code never opens.
+///
+/// Opens with [`IfAbsent::ReportAbsent`], so sweeping a doorbell nobody has knocked
+/// on does not create it: an absent record answers `attempted: 0`, which is
+/// deliberately distinct from a present record whose every slot was read and empty
+/// (`attempted: DOORBELL_SLOTS, found: 0`). As on the page path, `attempted: 0` means
+/// the record was not found by this node on this pass, NOT that it cannot exist.
+async fn sweep_doorbell(
+    gate: &Arc<DhtGate>,
+    api: &VeilidAPI,
+    rc: &RoutingContext,
+    opened: &rendezvous::OpenCache,
+    record_locks: &rendezvous::RecordLocks,
+    owner_seed: [u8; 32],
+) -> Result<DoorbellSweep> {
+    let owner = identity::rendezvous_owner_keypair(&owner_seed)?;
+    // The open is serialized under the record lock; the GETs are NOT, so a slow sweep
+    // never blocks a concurrent knock on the same doorbell. The guard drops before any
+    // read permit is acquired, keeping the single-permit rule (CRSH-ISC-17).
+    let opened_handle = {
+        let record_lock = rendezvous::record_lock(record_locks, &owner);
+        let _open_guard = record_lock.lock().await;
+        doorbell_open(gate, api, rc, opened, &owner, IfAbsent::ReportAbsent).await?
+    };
+    let Some(handle) = opened_handle else {
+        crate::vtrace!("sweep_doorbell: record absent, not created -> empty sweep");
+        return Ok(DoorbellSweep {
+            slots: Vec::new(),
+            outcome: rendezvous::SweepOutcome {
+                attempted: 0,
+                failed: 0,
+                found: 0,
+            },
+        });
+    };
+    // **An invariant, not a guard, and the distinction is the point.** `RendezvousHandle`
+    // stamps the shape it was DERIVED under, never a schema observed on the network, and
+    // `doorbell_open` binds one shape constant — so this equality holds by construction.
+    // A record with a different `o_cnt` is a different ADDRESS, one this code never opens
+    // and never sweeps. There is therefore no such thing here as a short doorbell that
+    // silently truncates a sweep; that failure mode belongs to code that derives a shape
+    // and a key independently, which `RendezvousHandle` exists to make unrepresentable.
+    // A `debug_assert!` records the invariant for free in release, where a runtime
+    // refusal (and the error variant, tests and source probe it needed) was pure cost
+    // defending a state that cannot occur.
+    debug_assert_eq!(
+        handle.shape().o_cnt(),
+        daemonseed_core::dm::doorbell::DOORBELL_SLOTS,
+        "the doorbell opener binds one shape, so the handle can carry no other"
+    );
+    let bound = handle.shape().o_cnt();
+    let key = handle.key().clone();
+    // Subkeys are collected raw and placed afterwards, because placing is fallible and
+    // `sweep_gated`'s callback answers only "keep sweeping". A partial sweep must still
+    // report what it read, so the failure cannot be swallowed inside the loop.
+    let mut raw: Vec<(u32, Vec<u8>)> = Vec::new();
+    // The slot bound comes off the handle's own shape, never from a constant at this
+    // call site: a sweep wider than the record the seed was derived under is the mistake
+    // `RendezvousHandle` binds key and shape together to prevent.
+    let outcome = rendezvous::sweep_gated(
+        gate,
+        bound,
+        |subkey, bytes| {
+            raw.push((subkey, bytes));
+            true
+        },
+        |subkey| {
+            let rc = rc.clone();
+            let key = key.clone();
+            async move {
+                match rc.get_dht_value(key, subkey, true).await {
+                    Ok(Some(v)) => Ok(Some(v.data().to_vec())),
+                    Ok(None) => Ok(None),
+                    Err(e) => {
+                        crate::vtrace!("sweep_doorbell: get error on slot {subkey}: {e}");
+                        Err(())
+                    }
+                }
+            }
+        },
+    )
+    .await;
+    crate::vtrace!(
+        "sweep_doorbell: key={:?} attempted={} found={} failed={}",
+        handle.key(),
+        outcome.attempted,
+        outcome.found,
+        outcome.failed
+    );
+    let slots = doorbell_place_swept(raw)?;
+    Ok(DoorbellSweep { slots, outcome })
 }
 
 /// Open/create the rendezvous record, register a watch, and kick off a one-shot
@@ -3676,13 +4447,32 @@ mod tests {
         assert_eq!(DM_PAGE_SHAPE.o_cnt(), 16);
         assert_eq!(DM_PAGE_SHAPE.max_value_len(), 32768);
 
-        // The three shapes must stay distinct: sharing an owner seed across them
+        // The DM doorbell: thirty-two slots, 32 KiB each (1 MiB / 32 = 32 KiB is
+        // exactly the per-subkey ceiling, which is WHY the slot count is 32 — the
+        // top padding bucket of a first-contact entry must fit one subkey).
+        assert_eq!(
+            DM_DOORBELL_SHAPE.o_cnt(),
+            daemonseed_core::dm::doorbell::DOORBELL_SLOTS
+        );
+        assert_eq!(DM_DOORBELL_SHAPE.o_cnt(), 32);
+        assert_eq!(
+            DM_DOORBELL_SHAPE.max_value_len(),
+            daemonseed_core::dm::firstcontact::MAX_ENTRY_LEN,
+            "the doorbell subkey cap and the first-contact entry ceiling are one \
+             number: `doorbell_entry_must_fit` guards on the entry constant while \
+             the network enforces the shape's, so a divergence would admit locally \
+             and be refused on the wire (or the reverse)"
+        );
+        assert_eq!(DM_DOORBELL_SHAPE.max_value_len(), 32768);
+
+        // The four shapes must stay distinct: sharing an owner seed across them
         // would otherwise collapse in the open-cache.
         let owner = crate::identity::rendezvous_owner_keypair(&[3u8; 32]).unwrap();
         let ids = [
             rendezvous::cached_record_id(&owner, rendezvous::RecordShape::RENDEZVOUS),
             rendezvous::cached_record_id(&owner, DM_KEY_RECORD_SHAPE),
             rendezvous::cached_record_id(&owner, DM_PAGE_SHAPE),
+            rendezvous::cached_record_id(&owner, DM_DOORBELL_SHAPE),
         ];
         let distinct: std::collections::BTreeSet<_> = ids.iter().collect();
         assert_eq!(
@@ -4185,8 +4975,8 @@ mod tests {
         let keyed: String = ["record: funnel_record", "_key("].concat();
         assert_eq!(
             prod.matches(keyed.as_str()).count(),
-            4,
-            "exactly four enqueue sites set `record:` through the helper. A different \
+            5,
+            "exactly five enqueue sites set `record:` through the helper. A different \
              count means an enqueue site was added, removed, or keyed another way — \
              decide which, then update this number"
         );
@@ -4432,6 +5222,522 @@ mod tests {
             "the opener must be defined once and called exactly three times — from \
              `publish_dm_page`, `sweep_dm_page`, and the publish pre-warm. A page path \
              that opened its own record would be free to open a different one"
+        );
+    }
+
+    // ── Direct messaging (#233): the doorbell transport ───────────────────
+
+    /// **The doorbell shape and the doorbell slot arithmetic are the same
+    /// number.** `o_cnt` is part of the record address AND the modulus of
+    /// `doorbell::slot_for`, so a shape typed independently of `DOORBELL_SLOTS`
+    /// would keep every test in `doorbell` green while addressing a record no
+    /// sender writes to — silently, with no error on any surface. Pinned here
+    /// because this crate is where the two facts meet.
+    #[test]
+    fn the_doorbell_record_shape_is_the_doorbell_slot_count() {
+        assert_eq!(
+            DM_DOORBELL_SHAPE.o_cnt(),
+            daemonseed_core::dm::doorbell::DOORBELL_SLOTS,
+            "the doorbell record's subkey count must BE the slot arithmetic's modulus"
+        );
+    }
+
+    /// **An entry at the subkey cap is accepted and one byte more is refused.**
+    ///
+    /// The exact-cap case is the load-bearing one, and it is why this is not
+    /// written as a bare "big entries are refused". `firstcontact`'s top padding
+    /// bucket is sized so a token-bearing entry fills the subkey, so an off-by-one
+    /// in the wrong direction here refuses the very entries the padding ladder was
+    /// built to allow — and it would do so only for the largest ones, which is
+    /// precisely the case a hand test is least likely to construct.
+    #[test]
+    fn a_doorbell_entry_at_the_cap_is_accepted_and_one_byte_more_is_refused() {
+        let max = daemonseed_core::dm::firstcontact::MAX_ENTRY_LEN;
+        assert_eq!(max, 32768, "the frozen per-subkey ceiling");
+
+        for len in [0, 1, 18 * 1024, 25600, max - 1, max] {
+            doorbell_entry_must_fit(len).unwrap_or_else(|e| {
+                panic!("{len} bytes is inside the {max}-byte cap and must be admitted: {e:?}")
+            });
+        }
+
+        let err = doorbell_entry_must_fit(max + 1)
+            .expect_err("one byte above the cap must be refused locally");
+        assert!(
+            matches!(
+                err,
+                VeilidNetError::DmDoorbellEntryTooLarge { len, max: m } if len == max + 1 && m == max
+            ),
+            "the refusal must name the length and the true cap: {err:?}"
+        );
+    }
+
+    /// **A slot outside the record is refused, and every slot inside it is not.**
+    ///
+    /// The whole in-range set is checked rather than a sample, because the interesting
+    /// boundary is `DOORBELL_SLOTS - 1` — a `>` written for a `>=` admits exactly one
+    /// value, the last slot, and `doorbell::slot_for` reaches it 1/32 of the time.
+    #[test]
+    fn a_doorbell_slot_outside_the_record_is_refused() {
+        let slots = daemonseed_core::dm::doorbell::DOORBELL_SLOTS;
+
+        for slot in 0..slots {
+            doorbell_slot_must_be_in_record(slot)
+                .unwrap_or_else(|e| panic!("slot {slot} is inside the record: {e:?}"));
+        }
+
+        for slot in [slots, slots + 1, 64, 256, u16::MAX] {
+            let err = doorbell_slot_must_be_in_record(slot)
+                .expect_err("a slot the record cannot hold must be refused");
+            assert!(
+                matches!(
+                    err,
+                    VeilidNetError::DmDoorbellSlotOutsideRecord { slot: s } if s == u32::from(slot)
+                ),
+                "unexpected error for slot {slot}: {err:?}"
+            );
+        }
+    }
+
+    /// **A swept subkey is placed in its slot, and one the record cannot hold is
+    /// reported rather than skipped.** A skipped slot is a knock the recipient
+    /// never sees under an `Ok` — the same reasoning as
+    /// `a_swept_subkey_is_placed_on_the_addressed_page`.
+    #[test]
+    fn a_swept_doorbell_subkey_is_placed_in_its_slot() {
+        let slots = daemonseed_core::dm::doorbell::DOORBELL_SLOTS;
+
+        let placed = doorbell_place_swept(vec![
+            (0, vec![0xa0]),
+            (6, vec![0xa6]),
+            (u32::from(slots) - 1, vec![0xff]),
+        ])
+        .expect("every subkey is inside the record");
+        assert_eq!(
+            placed,
+            vec![(0u16, vec![0xa0]), (6, vec![0xa6]), (slots - 1, vec![0xff])],
+            "the slot must be the subkey it came back in, and the bytes must be untouched"
+        );
+
+        // Reachable only if the record's o_cnt exceeds DOORBELL_SLOTS, which the
+        // shape guard refuses before any GET — so this is the second line, kept
+        // because the alternative to reporting is dropping a knock.
+        let err = doorbell_place_swept(vec![(0, vec![0xa0]), (u32::from(slots), vec![0xbb])])
+            .expect_err("a subkey the doorbell cannot hold must be reported");
+        assert!(
+            matches!(
+                err,
+                VeilidNetError::DmDoorbellSlotOutsideRecord { slot } if slot == u32::from(slots)
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// **How a doorbell knock is classified in the funnel.** Every field asserted
+    /// here fails silently if it is wrong, and the coalescing id fails worst: one
+    /// doorbell record is shared by every sender in the world, so a CONSTANT
+    /// logical id — the shape the key record can afford, having exactly one record
+    /// per owner seed — would collapse two knocks from two local identities to one
+    /// recipient into a single write, and the loser's first contact would never
+    /// reach the wire while its `reply` reported `Ok(())`.
+    #[test]
+    fn a_doorbell_write_takes_its_dispatchs_class_and_coalesces_per_slot() {
+        let owner_seed = [0x5au8; 32];
+        let entry = vec![0xde, 0xad, 0xbe, 0xef];
+        let (reply, _rx) = oneshot::channel();
+
+        // Slot 6 is chosen, not arbitrary: it is the KAT slot `doorbell.rs` pins for
+        // alice→bob, it is non-zero (so a request that hard-wired slot 0 differs) and
+        // it is not a power of two (so a stray second modulus on the way to dispatch
+        // differs).
+        let req = doorbell_entry_write_request(
+            owner_seed,
+            6,
+            entry.clone(),
+            DoorbellDispatch::Reseed,
+            reply,
+        );
+
+        // **Both mappings, and both directions.** `direct-messaging.md:127-128` puts
+        // the first dispatch of a user send in the chat lane and every
+        // scheduler-driven re-dispatch at rank 4. Asserting only one of them would
+        // pass on a `classify` that returned a constant.
+        assert_eq!(
+            req.class,
+            WriteClass::Keepalive,
+            "a scheduler-driven re-seed competes in the non-chat window, exactly as \
+             the key-record keep-alive does (:128)"
+        );
+        let (first_reply, _first_rx) = oneshot::channel();
+        let first = doorbell_entry_write_request(
+            owner_seed,
+            6,
+            entry.clone(),
+            DoorbellDispatch::FirstSend,
+            first_reply,
+        );
+        assert_eq!(
+            first.class,
+            WriteClass::Chat,
+            "the first dispatch of a user's first-contact send is a user action \
+             wanting user-action latency — one write per action, not a burst (:127)"
+        );
+        assert_ne!(
+            first.class, req.class,
+            "the two dispatches must not collapse to one class, or the split :127-128 \
+             draws is not being made at all"
+        );
+        assert_eq!(DoorbellDispatch::FirstSend.classify(), WriteClass::Chat);
+        assert_eq!(DoorbellDispatch::Reseed.classify(), WriteClass::Keepalive);
+
+        // The kind does NOT vary with the dispatch: `:128` fixes the logical id as
+        // the slot for both, so a re-seed supersedes the send it repeats.
+        assert_eq!(
+            first.kind, req.kind,
+            "both dispatches must coalesce on the same key, or a re-seed would not \
+             supersede the send it repeats"
+        );
+        assert_eq!(
+            req.kind,
+            WriteKind::CurrentState {
+                logical_id: doorbell_coalescing_id(6)
+            },
+            "a retry re-lands in the sender's own slot and is DEFINED to overwrite its \
+             previous entry, so a queued older knock must be superseded — the opposite \
+             of the page write's Ring"
+        );
+
+        // The load-bearing half: two slots must not share a coalescing id. Comparing
+        // a request's id against `doorbell_coalescing_id(6)` alone passes for a
+        // constant, since both sides move together.
+        assert_ne!(
+            doorbell_coalescing_id(6),
+            doorbell_coalescing_id(7),
+            "two slots sharing a coalescing id silently drops one sender's knock"
+        );
+        let (other_reply, _other_rx) = oneshot::channel();
+        let other = doorbell_entry_write_request(
+            owner_seed,
+            7,
+            entry.clone(),
+            DoorbellDispatch::Reseed,
+            other_reply,
+        );
+        assert_ne!(
+            req.kind, other.kind,
+            "two knocks in two slots of ONE doorbell must not coalesce — same record, \
+             so the logical id is the only thing separating them"
+        );
+        assert_eq!(
+            req.record, other.record,
+            "and they must still share a record, or the coalescing scope is not the \
+             thing this test claims it is"
+        );
+
+        // The record id is the owner's PUBLIC key, not the seed. Both are `[u8; 32]`,
+        // so the substitution type-checks everywhere and shows on no surface. The
+        // doorbell seed is world-derivable and therefore not a secret, so the #244
+        // capability argument does not apply here — but the FIFO-splitting argument
+        // does, and it is what this pins.
+        assert_eq!(
+            req.record,
+            identity::rendezvous_owner_public_bytes(&owner_seed),
+            "the funnel's FIFO + coalescing scope is the doorbell record's PUBLIC \
+             identity — what the DHT address derives from"
+        );
+        assert_ne!(
+            req.record, owner_seed,
+            "keying on the raw seed splits one record's FIFO into two queues"
+        );
+        assert!(
+            req.deadline.is_none(),
+            "there is no hard DHT expiry anywhere in the DM path, only eviction \
+             pressure, so no DM write carries a deadline"
+        );
+        assert!(
+            req.reply.is_some(),
+            "the caller awaits this write — a dropped reply hangs `publish_doorbell_entry`"
+        );
+
+        match req.item {
+            ProdWrite::DoorbellEntry {
+                owner_seed: dispatched_seed,
+                slot: dispatched_slot,
+                entry: dispatched_entry,
+            } => {
+                assert_eq!(
+                    dispatched_seed, owner_seed,
+                    "the dispatch token carries the seed the write is signed with"
+                );
+                assert_eq!(
+                    dispatched_slot, 6,
+                    "the slot must reach dispatch unchanged — it is the subkey written"
+                );
+                assert_eq!(
+                    dispatched_entry, entry,
+                    "the entry is opaque at this layer and must arrive byte-identical"
+                );
+            }
+            _ => panic!("a doorbell write must dispatch as its own ProdWrite variant"),
+        }
+    }
+
+    /// The publish handle passes the seed, slot and entry to the actor untouched.
+    #[tokio::test]
+    async fn a_doorbell_publish_reaches_the_actor_unchanged() {
+        let (handle, mut cmd_rx) = detached_handle();
+        let owner_seed = [0x5au8; 32];
+        let entry = vec![0xde, 0xad, 0xbe, 0xef];
+
+        let observed = tokio::spawn(async move {
+            match cmd_rx.recv().await.expect("a command reached the actor") {
+                Command::PublishDoorbellEntry {
+                    owner_seed,
+                    slot,
+                    entry,
+                    dispatch,
+                    reply,
+                } => {
+                    let _ = reply.send(Ok(()));
+                    (owner_seed, slot, entry, dispatch)
+                }
+                _ => panic!("expected a PublishDoorbellEntry command"),
+            }
+        });
+
+        handle
+            .publish_doorbell_entry(owner_seed, 6, entry.clone(), DoorbellDispatch::FirstSend)
+            .await
+            .expect("an addressable knock must publish");
+
+        let (seen_seed, seen_slot, seen_entry, seen_dispatch) =
+            observed.await.expect("the observing task");
+        assert_eq!(
+            seen_seed, owner_seed,
+            "the record the actor opens must be the one named"
+        );
+        assert_eq!(seen_slot, 6, "the slot must cross the channel unchanged");
+        assert_eq!(seen_entry, entry);
+        assert_eq!(
+            seen_dispatch,
+            DoorbellDispatch::FirstSend,
+            "the dispatch decides the funnel lane and must cross the channel \
+             unchanged — the transport cannot re-derive it"
+        );
+
+        // **The OTHER dispatch, and it is not symmetry for its own sake.** Asserting
+        // only `FirstSend` passes on a handle that discards the argument and writes a
+        // literal, which is a real mistake shape here — the field was added to a
+        // struct-literal call that already compiled without it. A mutation run
+        // confirmed exactly that: hard-wiring `FirstSend` in the handle survived the
+        // whole suite until this leg existed.
+        let (handle, mut cmd_rx) = detached_handle();
+        let observed = tokio::spawn(async move {
+            match cmd_rx.recv().await.expect("a command reached the actor") {
+                Command::PublishDoorbellEntry {
+                    dispatch, reply, ..
+                } => {
+                    let _ = reply.send(Ok(()));
+                    dispatch
+                }
+                _ => panic!("expected a PublishDoorbellEntry command"),
+            }
+        });
+        handle
+            .publish_doorbell_entry(owner_seed, 6, entry, DoorbellDispatch::Reseed)
+            .await
+            .expect("a re-seed must publish too");
+        assert_eq!(
+            observed.await.expect("the observing task"),
+            DoorbellDispatch::Reseed,
+            "a re-seed must not arrive at the actor as a first send — it would take \
+             the chat lane on every backoff rung, which is the one thing \
+             `direct-messaging.md:128` puts in the non-chat window"
+        );
+    }
+
+    /// **An unaddressable knock is refused before the command channel, so it can
+    /// reach no network call.** The channel is the observable: a command that
+    /// reached it was enqueued, and a call rejected before `send` leaves it empty.
+    ///
+    /// The channel is deliberately NOT serviced here, and that is safe only because
+    /// the guard fires before `send` — which is exactly what is being asserted. If a
+    /// guard ever stopped firing, `VeilidNetHandle::send` would await a `oneshot`
+    /// nobody answers and this test would HANG rather than fail; the `timeout` turns
+    /// that back into a failure, since a hanging test proves nothing to whoever
+    /// removed the guard.
+    #[tokio::test]
+    async fn an_unaddressable_doorbell_knock_never_reaches_the_actor() {
+        let slots = daemonseed_core::dm::doorbell::DOORBELL_SLOTS;
+        let max = daemonseed_core::dm::firstcontact::MAX_ENTRY_LEN;
+
+        for (slot, len, what) in [
+            (slots, 16, "a slot outside the record"),
+            (slots + 1, 16, "a slot well outside the record"),
+            (0, max + 1, "an entry one byte above the cap"),
+            (slots, max + 1, "both at once"),
+        ] {
+            let (handle, mut cmd_rx) = detached_handle();
+            let refused = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                handle.publish_doorbell_entry(
+                    [0x5au8; 32],
+                    slot,
+                    vec![0u8; len],
+                    DoorbellDispatch::FirstSend,
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!("{what}: the guard did not fire and `send` is awaiting a reply")
+            });
+            assert!(refused.is_err(), "{what} must be refused");
+            assert!(
+                cmd_rx.try_recv().is_err(),
+                "{what} must not reach the command channel — past it the write is \
+                 enqueued and the recipient's record is opened or CREATED before \
+                 anything is validated"
+            );
+        }
+
+        // The positive control, and it is what makes the four refusals mean
+        // something: an addressable knock at the same boundaries DOES reach the
+        // channel. Without it a guard that refused everything would pass above.
+        let (handle, mut cmd_rx) = detached_handle();
+        let serviced = tokio::spawn(async move {
+            match cmd_rx.recv().await.expect("a command reached the actor") {
+                Command::PublishDoorbellEntry {
+                    slot, entry, reply, ..
+                } => {
+                    let _ = reply.send(Ok(()));
+                    (slot, entry.len())
+                }
+                _ => panic!("expected a PublishDoorbellEntry command"),
+            }
+        });
+        handle
+            .publish_doorbell_entry(
+                [0x5au8; 32],
+                slots - 1,
+                vec![0u8; max],
+                DoorbellDispatch::FirstSend,
+            )
+            .await
+            .expect("the last slot at the exact cap is addressable and must publish");
+        assert_eq!(
+            serviced.await.expect("the observing task"),
+            (slots - 1, max),
+            "the boundary values must arrive unchanged"
+        );
+    }
+
+    /// The sweep handle passes the owner seed to the actor untouched — the record
+    /// swept must be the record named, since nothing downstream can tell one
+    /// doorbell from another.
+    #[tokio::test]
+    async fn a_doorbell_sweep_passes_its_owner_seed_to_the_actor_unchanged() {
+        let (handle, mut cmd_rx) = detached_handle();
+        let owner_seed = [0x5au8; 32];
+
+        let observed = tokio::spawn(async move {
+            match cmd_rx.recv().await.expect("a command reached the actor") {
+                Command::SweepDoorbell { owner_seed, reply } => {
+                    let _ = reply.send(Ok(DoorbellSweep {
+                        slots: vec![(6, vec![0xa6])],
+                        outcome: rendezvous::SweepOutcome {
+                            attempted: 32,
+                            failed: 0,
+                            found: 1,
+                        },
+                    }));
+                    owner_seed
+                }
+                _ => panic!("expected a SweepDoorbell command"),
+            }
+        });
+
+        let swept = handle
+            .sweep_doorbell(owner_seed)
+            .await
+            .expect("the sweep reaches the actor");
+        assert_eq!(swept.slots, vec![(6u16, vec![0xa6])]);
+        assert_eq!(
+            swept.outcome.attempted, 32,
+            "the outcome must ride back with the slots: an empty list alone cannot \
+             distinguish an unknocked doorbell from one whose every GET errored"
+        );
+
+        assert_eq!(
+            observed.await.expect("the observing task"),
+            owner_seed,
+            "the actor must sweep the doorbell the caller named"
+        );
+    }
+
+    /// **Knock and sweep cannot disagree about the doorbell record's shape.**
+    /// `o_cnt` is part of the record address, so two shapes means two records: the
+    /// knock succeeds, the recipient's sweep returns empty, and nothing errors
+    /// anywhere. The structural guard is that both paths open through one function;
+    /// what this pins is the two facts that guard rests on, neither observable
+    /// without a live DHT.
+    ///
+    /// Needles are assembled from fragments so this test's own source text does not
+    /// self-match, as `both_page_paths_open_the_record_through_one_shape` does.
+    #[test]
+    fn both_doorbell_paths_open_the_record_through_one_shape() {
+        let src = include_str!("actor.rs");
+        let (prod, _) = src
+            .split_once("#[cfg(test)]")
+            .expect("the tests-module marker moved");
+
+        let shape: String = ["DM_DOORBELL", "_SHAPE"].concat();
+        assert_eq!(
+            prod.matches(shape.as_str()).count(),
+            2,
+            "the doorbell shape must be named exactly twice outside the tests: its own \
+             definition, and the single binding inside the one opener that the cache id \
+             and both open modes are built from. A third naming is a second open site"
+        );
+
+        // The count above is not sufficient on its own, for the reason the page
+        // guard records: with both modes reading a local, retargeting ONE of them at
+        // another record's shape names a different constant and leaves this count at
+        // 2 untouched. Pinning that the opener's body names a shape constant exactly
+        // once is what closes that.
+        let opener_start = prod
+            .find("async fn doorbell_open(")
+            .expect("the opener's definition moved");
+        let opener_body = &prod[opener_start..];
+        let opener_body = &opener_body[..opener_body
+            .find("\n}\n")
+            .expect("the opener's closing brace moved")];
+        let shape_suffix: String = ["_", "SHAPE"].concat();
+        assert_eq!(
+            opener_body.matches(shape_suffix.as_str()).count(),
+            1,
+            "the opener's body must name a shape constant exactly ONCE — the single \
+             binding both open modes and the cache id are built from"
+        );
+
+        let opener: String = ["doorbell", "_open("].concat();
+        assert_eq!(
+            prod.matches(opener.as_str()).count(),
+            4,
+            "the opener must be defined once and called exactly three times — from \
+             `publish_doorbell_entry`, `sweep_doorbell`, and the FirstSend pre-warm \
+             that keeps a cold stranger's-doorbell open off the 2-permit chat lane. A \
+             doorbell path that opened its own record would be free to open a \
+             different one. An exact count is deliberately brittle: a fourth caller \
+             has to come and edit this number, which is the moment to ask whether it \
+             should be going through the opener at all"
+        );
+
+        // Positive control: the needles are real. If the fragments ever stop matching
+        // anything at all, the counts above are asserting over nothing.
+        assert!(
+            prod.contains("async fn sweep_doorbell(") && prod.contains(shape.as_str()),
+            "the doorbell transport's own symbols are not in the production source — \
+             this probe is matching nothing"
         );
     }
 }

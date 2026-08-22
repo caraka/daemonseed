@@ -26,6 +26,16 @@ work lives in the project lead's vault manifest, not here.
 
 ### Added
 
+- Direct-message doorbell transport: a first-contact entry publishes into a slot of the
+  recipient's world-derivable doorbell record, and a recipient sweeps all 32 slots of its own.
+  A user's first send is classified `Chat`; a scheduler re-dispatch is `Keepalive`. (#233)
+
+### Changed
+
+- A coalesced write's survivor carries the strongest class of the writes it replaced, so a
+  chat-class write already answered `Ok` is flushed at shutdown rather than shed. (#233)
+- Every funnel-write publish method documents that `Ok` means the write left the layer, not that
+  it reached the DHT, and names coalescing and tombstone dominance where they apply. (#233)
 - `cargo xtask check-manifests` parses every LAMA manifest with duplicate-key detection at
   the YAML event level and fails on a repeat, which an ordinary loader discards silently.
   Covers `docs/llm-api-manifest/*.yaml` and the root `lama.yaml`, and runs as part of

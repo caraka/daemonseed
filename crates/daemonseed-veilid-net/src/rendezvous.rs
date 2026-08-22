@@ -119,6 +119,19 @@ impl RecordShape {
     /// paging module's own doc comment warns writers about.
     pub const DM_PAGE: Self = Self::new(daemonseed_core::dm::paging::PAGE_SLOTS);
 
+    /// Direct messaging's doorbell: `dflt(32)`, one subkey per knock slot.
+    ///
+    /// Derived from [`DOORBELL_SLOTS`](daemonseed_core::dm::doorbell::DOORBELL_SLOTS)
+    /// for the reason [`Self::DM_PAGE`] gives — `o_cnt` is part of the address and
+    /// simultaneously the modulus of `doorbell::slot_for` — plus a second the page
+    /// does not have. 32 is what makes this shape's [`RecordShape::max_value_len`]
+    /// exactly `daemonseed_core::dm::firstcontact::MAX_ENTRY_LEN`: the doorbell's
+    /// slot count was *chosen* by that cap, not the other way round (the top
+    /// padding bucket must fit one subkey), so a literal typed here that drifted
+    /// from the constant would either address a record no sender writes to or
+    /// silently shrink the cap below the size a padded entry needs.
+    pub const DM_DOORBELL: Self = Self::new(daemonseed_core::dm::doorbell::DOORBELL_SLOTS);
+
     /// A DFLT shape with `o_cnt` subkeys. **Panics** outside Veilid's accepted
     /// `1..=MAX_SUBKEY_COUNT` range.
     ///

@@ -282,6 +282,28 @@ types:
       alone means both "nobody has written to this page" and "all sixteen GETs
       errored", and `rendezvous.rs` names surfacing `failed` separately as the
       enabling signal for consumer-side session-health tracking (CRSH-ISC-1).
+  - name: DoorbellDispatch
+    module: daemonseed_veilid_net::actor
+    kind: enum
+    description: Which dispatch of a doorbell knock a write is, deciding its WB-3 funnel priority class.
+    variants:
+      - name: FirstSend
+        description: The first dispatch of a user's first-contact send; classifies WriteClass::Chat (rank 1).
+      - name: Reseed
+        description: A scheduler-driven re-dispatch, the doorbell keep-alive; classifies WriteClass::Keepalive (rank 4).
+  - name: DoorbellSweep
+    module: daemonseed_veilid_net::actor
+    kind: struct
+    description: >-
+      One doorbell sweep's result: `slots`, the populated `(slot, bytes)` pairs, and
+      `outcome`. The bytes are unverified and still sealed — only
+      `daemonseed_core::dm::firstcontact::open` may decide an entry is genuine, and it
+      needs the recipient's ML-KEM decapsulation key. The slot travels back with the
+      bytes because a sender's retry re-lands in that same slot and overwrites its own
+      previous entry. There is no conversation tag: a doorbell holds knocks from
+      distinct and as-yet-unknown senders, and the slot is derived from a secret only
+      the sender holds. The outcome is required, not decoration: an empty slot list
+      alone means both "nobody has knocked" and "all thirty-two GETs errored".
 
 # ─────────────────────────────────────────────────────────────────────
 # Functions
@@ -378,7 +400,9 @@ functions:
         description: The circle-key-sealed message.
     returns:
       type: "Result<()>"
-      description: Ok on write.
+      description: >-
+        Ok means the write left this layer, NOT that it reached the DHT. This is a Ring
+        write and is never coalesced.
   - name: VeilidNetHandle::subscribe_circle
     module: daemonseed_veilid_net::actor
     description: Open + watch + backlog-sweep a circle's rendezvous record; inbound messages arrive as VeilidNetEvent::Inbound.
@@ -406,7 +430,9 @@ functions:
         description: Payload sealed under the room's PublicRoomKey.
     returns:
       type: "Result<()>"
-      description: Ok on write.
+      description: >-
+        Ok means the write left this layer, NOT that it reached the DHT. This is a Ring
+        write and is never coalesced.
   - name: VeilidNetHandle::subscribe_room
     module: daemonseed_veilid_net::actor
     description: Open + watch + backlog-sweep a public room / lobby rendezvous; inbound sealed room messages / share announcements arrive as VeilidNetEvent::Inbound.
@@ -470,7 +496,10 @@ functions:
         description: The prost-encoded, already-signed DmKeyRecord.
     returns:
       type: "Result<()>"
-      description: Ok once the scheduler has dispatched the write.
+      description: >-
+        Ok means the write left this layer, NOT that it reached the DHT. The funnel also
+        answers Ok when the write is coalesced away by a later same-record, same-logical-id
+        write, and when a tombstone dominates it.
   - name: VeilidNetHandle::fetch_dm_key_record
     module: daemonseed_veilid_net::actor
     description: Fetch a correspondent's DM key record from subkey 0 of its dflt(1) record. Ok(None) is an empty slot — evicted, wiped, or never published — and is the caller's awaiting-key state, deliberately distinct from Err (a transport failure); conflating them would make an attacker's wipe indistinguishable from a network problem. The bytes are UNVERIFIED — only daemonseed_core::dm::keyrec::verify may decide a record is genuine, and it needs the identity public key this layer does not hold. One gated GET on the read lane; no write funnel involvement (WB-3 I9).
@@ -510,7 +539,10 @@ functions:
         description: The already-sealed, already-signed channel frame.
     returns:
       type: "Result<()>"
-      description: Ok once the scheduler has dispatched the write.
+      description: >-
+        Ok means the write left this layer, NOT that it reached the DHT. The funnel also
+        answers Ok when the write is coalesced away by a later same-record, same-logical-id
+        write, and when a tombstone dominates it.
   - name: VeilidNetHandle::sweep_dm_page
     module: daemonseed_veilid_net::actor
     description: >-
@@ -551,6 +583,81 @@ functions:
     returns:
       type: "Result<DmPageSweep>"
       description: DmPageSweep { conversation, slots, outcome } — the AR fingerprint naming the correspondence, the populated slots as (PagePosition, unverified bytes) pairs, and the sweep outcome (attempted / found / failed).
+  - name: VeilidNetHandle::publish_doorbell_entry
+    module: daemonseed_veilid_net::actor
+    description: >-
+      Write one sealed first-contact entry into one slot of a recipient's dflt(32)
+      doorbell record (ISC-C41). Bytes are opaque here — this layer neither parses,
+      seals, nor verifies the entry, and a successful write proves nothing about the
+      sender, because the record is world-writable. This is the one record a party
+      writes that it does not own: a world-derivable address implies a world-derivable
+      owner under Veilid's DFLT schema, so the sender derives the recipient's owner
+      keypair from the recipient's public identity key and signs the set with it. Any
+      third party holds that same authority and can overwrite or erase any slot, which
+      is a denial-of-service residual only — forgery is impossible, since an entry that
+      does not verify under the recipient's own decapsulation key does not open. Opens
+      with create, so the first sender brings a recipient's doorbell into being. A slot
+      outside the record and an entry above the per-subkey cap are refused before the
+      command crosses the channel, so neither reaches a network call. Enqueued on the
+      WB-3 funnel as a Keepalive-class CurrentState write coalescing on the slot: a
+      retry re-lands in the sender's own slot and is defined to overwrite its previous
+      entry, while two slots of one doorbell never coalesce. The class comes from
+      `dispatch`. Coalescing is keyed on the kind, not the class, so a FirstSend still
+      queued when its own Reseed is enqueued is superseded, and the survivor inherits the
+      strongest class of the set it subsumed, so a knock already answered Ok is not shed
+      at shutdown. Carries no deadline.
+    signature: "pub async fn publish_doorbell_entry(&self, owner_seed: [u8; 32], slot: u16, entry: Vec<u8>, dispatch: DoorbellDispatch) -> Result<()>"
+    parameters:
+      - name: owner_seed
+        type: "[u8; 32]"
+        direction: in
+        description: The recipient's doorbell owner seed, from daemonseed_core::dm::doorbell::derive_owner_seed over the recipient's ML-DSA-87 public key.
+      - name: slot
+        type: u16
+        direction: in
+        description: The sender's slot in that doorbell, from daemonseed_core::dm::doorbell::slot_for over this sender's own doorbell slot secret and the same recipient key. Must be below daemonseed_core::dm::doorbell::DOORBELL_SLOTS; a slot outside the record returns VeilidNetError::DmDoorbellSlotOutsideRecord.
+      - name: entry
+        type: "Vec<u8>"
+        direction: in
+        description: The already-sealed, already-signed first-contact entry, from daemonseed_core::dm::firstcontact::build. At most daemonseed_core::dm::firstcontact::MAX_ENTRY_LEN bytes; larger returns VeilidNetError::DmDoorbellEntryTooLarge.
+      - name: dispatch
+        type: DoorbellDispatch
+        direction: in
+        description: Whether this is the first dispatch of a user send (WriteClass::Chat) or a scheduler-driven re-seed (WriteClass::Keepalive). The transport cannot tell them apart, so the caller states it; there is no default.
+    returns:
+      type: "Result<()>"
+      description: >-
+        Ok means the write left this layer, NOT that it reached the DHT. The funnel also
+        answers Ok when the write is coalesced away by a newer one for the same slot, and
+        when a tombstone dominates it. A caller needing delivery re-seeds on its own
+        schedule; the #236 outbox owns that decision.
+  - name: VeilidNetHandle::sweep_doorbell
+    module: daemonseed_veilid_net::actor
+    description: >-
+      Sweep every slot of a doorbell, returning a DoorbellSweep: the populated
+      (slot, bytes) pairs and the sweep's SweepOutcome (ISC-C41). The bytes are
+      unverified and still sealed — pass each to daemonseed_core::dm::firstcontact::open,
+      which fails closed and uniformly, because a world-writable record makes garbage an
+      ordinary input. Whether the doorbell is this node's own is the caller's to know:
+      the owner seed is a world-derivable [u8; 32], so sweeping another identity's
+      doorbell is well-formed and returns entries no local key opens. A
+      partial sweep returns what it read, so outcome.failed > 0 is a record-health
+      signal and not an empty doorbell. Bounded by the handle's own shape;
+      DOORBELL_SLOTS gated GETs on the read lane, no write funnel involvement (WB-3 I9).
+      Spawned off the command loop (D-0b / #128, CRSH-ISC-22). Opens via open_only, so
+      sweeping a doorbell nobody has knocked on does not create it: an absent record
+      returns an empty Vec with SweepOutcome attempted 0, distinct from a present record
+      whose slots were all read and empty. attempted 0 means the record was not found by
+      this node on this pass, not that it does not exist.
+    signature: "pub async fn sweep_doorbell(&self, owner_seed: [u8; 32]) -> Result<DoorbellSweep>"
+    parameters:
+      - name: owner_seed
+        type: "[u8; 32]"
+        direction: in
+        description: The doorbell's owner seed, from daemonseed_core::dm::doorbell::derive_owner_seed over the owning identity's ML-DSA-87 public key.
+    returns:
+      type: "Result<DoorbellSweep>"
+      description: DoorbellSweep { slots, outcome } — the populated slots as (slot, unverified sealed bytes) pairs, and the sweep outcome (attempted / found / failed).
   - name: VeilidNetHandle::publish_presence
     module: daemonseed_veilid_net::actor
     description: Publish a sealed member-presence beacon to a per-member current-state slot on the presence sibling rendezvous record; a re-beacon overwrites the same slot (last-writer-wins). The presence record is distinct from the chat rendezvous, so a beacon never evicts chat backlog. member_pubkey owns the stable-slot-id encoding (member_slot_id, hex) so all callers agree. The slot count is bounded (SUBKEY_COUNT), so at unbounded membership two members can slot-share (a bounded, self-healing degradation). The app net actor holds the keys and runs the emit/ingest/reap loop; a receiver subscribes via subscribe_room on the same presence owner seed.
@@ -570,7 +677,10 @@ functions:
         description: The opaque sealed MemberHeartbeat.
     returns:
       type: "Result<()>"
-      description: Ok on write.
+      description: >-
+        Ok means the write left this layer, NOT that it reached the DHT. The funnel also
+        answers Ok when the write is coalesced away by a later same-record, same-logical-id
+        write, and when a tombstone dominates it.
   - name: VeilidNetHandle::publish_current_state
     module: daemonseed_veilid_net::actor
     description: Publish opaque bytes to a named current-state slot (last-writer-wins) on an owner-gated rendezvous record — the Phase-4 A-b operator announcements/MOTD record. The write is owner-signed, so only a holder of owner_seed (the non-derivable project-announce owner from daemonseed_core::derive_project_announce_veilid_owner_seed — the write-gate) can place a value; clients subscribe_room and read/verify but cannot write. slot_id is the stable slot key ("motd", or an announcement's content address); bytes is a public signed SignedArtifact (verified client-side by verify_artifact, not AEAD-sealed). Spawned off-loop, per-record serialized.
@@ -590,7 +700,10 @@ functions:
         description: The opaque payload (a signed SignedArtifact).
     returns:
       type: "Result<()>"
-      description: Ok on write.
+      description: >-
+        Ok means the write left this layer, NOT that it reached the DHT. The funnel also
+        answers Ok when the write is coalesced away by a later same-record, same-logical-id
+        write, and when a tombstone dominates it.
   - name: member_slot_id
     module: daemonseed_veilid_net::actor
     description: The stable presence-slot id for a member — its identity pubkey, hex-encoded. A pure function of the member's stable identity, so a re-beacon overwrites the same current_state_subkey slot and all callers agree byte-for-byte.

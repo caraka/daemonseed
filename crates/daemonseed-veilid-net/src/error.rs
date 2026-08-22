@@ -88,6 +88,37 @@ pub enum VeilidNetError {
         slot: u32,
     },
 
+    /// A doorbell subkey outside the record's slot count — either supplied by a
+    /// caller that did not reduce mod `DOORBELL_SLOTS`, or returned by a sweep of
+    /// a record whose shape exceeds it.
+    ///
+    /// Reported rather than skipped, for the reason
+    /// [`Self::DmPageSlotOutsideRecord`] gives: a skipped slot is a knock the
+    /// recipient never sees, under an `Ok`.
+    #[error(
+        "dm doorbell slot {slot} is outside the {} the record holds",
+        daemonseed_core::dm::doorbell::DOORBELL_SLOTS
+    )]
+    DmDoorbellSlotOutsideRecord {
+        /// The offending slot index.
+        slot: u32,
+    },
+
+    /// A first-contact entry larger than a doorbell subkey can hold.
+    ///
+    /// Refused locally, before any network call, naming the true cap — the same
+    /// bound veilid enforces for `dflt(32)`. `daemonseed_core::dm::firstcontact`
+    /// pads every entry into a bucket that fits, so reaching this means the entry
+    /// was not built by that module, or the padding ladder and the schema have
+    /// drifted apart.
+    #[error("dm doorbell entry is {len} bytes, above the {max}-byte subkey cap")]
+    DmDoorbellEntryTooLarge {
+        /// The entry's length.
+        len: usize,
+        /// The cap it exceeded.
+        max: usize,
+    },
+
     /// A Phase 2+ surface (circles / shares / presence / announcements) that
     /// this crate does not implement yet.
     #[error("not yet implemented: {0}")]
@@ -149,6 +180,8 @@ impl VeilidNetError {
             | VeilidNetError::Identity(_)
             | VeilidNetError::DmPageSlotOutsideRecord { .. }
             | VeilidNetError::DmPageShapeMismatch { .. }
+            | VeilidNetError::DmDoorbellSlotOutsideRecord { .. }
+            | VeilidNetError::DmDoorbellEntryTooLarge { .. }
             | VeilidNetError::Unimplemented(_) => FetchErrorClass::Transient,
         }
     }
@@ -200,6 +233,11 @@ mod tests {
             VeilidNetError::Identity("bad identity".into()),
             VeilidNetError::DmPageSlotOutsideRecord { page: 3, slot: 31 },
             VeilidNetError::DmPageShapeMismatch { page: 3, o_cnt: 1 },
+            VeilidNetError::DmDoorbellSlotOutsideRecord { slot: 32 },
+            VeilidNetError::DmDoorbellEntryTooLarge {
+                len: 32769,
+                max: 32768,
+            },
             VeilidNetError::Unimplemented("phase-2"),
         ] {
             assert_eq!(e.fetch_class(), FetchErrorClass::Transient, "{e:?}");
@@ -220,6 +258,11 @@ mod tests {
             VeilidNetError::Identity("x".into()),
             VeilidNetError::DmPageSlotOutsideRecord { page: 1, slot: 16 },
             VeilidNetError::DmPageShapeMismatch { page: 1, o_cnt: 32 },
+            VeilidNetError::DmDoorbellSlotOutsideRecord { slot: 99 },
+            VeilidNetError::DmDoorbellEntryTooLarge {
+                len: 40000,
+                max: 32768,
+            },
             VeilidNetError::Unimplemented("x"),
         ];
         assert!(all

@@ -444,6 +444,8 @@ impl<D: Send + 'static> State<D> {
         // Starvation clock (WB-5.1 / I5″.5): fresh for a genuinely new write, inherited
         // from the coalesced elder for a refreshed current-state (set below).
         let mut starved_since = now;
+        // Mutable because a coalescing supersession may PROMOTE it (see below).
+        let mut class = req.class;
         // An in-flight tombstone dominates a same-id current-state exactly like a
         // queued one (#164 / WB-ISC-12); capture it before borrowing the record queue.
         let in_flight_tomb = self.in_flight_tombstone.get(&req.record).cloned();
@@ -469,7 +471,11 @@ impl<D: Send + 'static> State<D> {
                 // re-enqueued every cadence still ages to the I8 escalation + floor lane
                 // instead of resetting below the bound forever.
                 if let Some(elder) = drop_same_id_current_state(q, logical_id) {
-                    starved_since = elder;
+                    starved_since = elder.starved_since;
+                    // The survivor carries the strongest class of the set it subsumed —
+                    // see `strongest_class`. Without this, a coalesced `Chat` write is
+                    // shed at shutdown after its caller was already told `Ok(())`.
+                    class = strongest_class(class, elder.strongest);
                 }
             }
             WriteKind::Tombstone { logical_id } => {
@@ -494,7 +500,7 @@ impl<D: Send + 'static> State<D> {
             seq: self.seq,
             enqueued: now,
             starved_since,
-            class: req.class,
+            class,
             kind: req.kind,
             deadline: req.deadline,
             item: req.item,
@@ -862,21 +868,59 @@ fn resolve_ok(reply: Option<oneshot::Sender<Result<()>>>) {
 fn drop_same_id_current_state<D>(
     q: &mut VecDeque<Pending<D>>,
     logical_id: &str,
-) -> Option<Instant> {
-    let mut oldest: Option<Instant> = None;
+) -> Option<Coalesced> {
+    let mut out: Option<Coalesced> = None;
     let mut i = 0;
     while i < q.len() {
         let matches =
             matches!(&q[i].kind, WriteKind::CurrentState { logical_id: id } if id == logical_id);
         if matches {
             let dropped = q.remove(i).expect("index in range");
-            oldest = Some(oldest.map_or(dropped.starved_since, |o| o.min(dropped.starved_since)));
+            out = Some(match out {
+                None => Coalesced {
+                    starved_since: dropped.starved_since,
+                    strongest: dropped.class,
+                },
+                Some(acc) => Coalesced {
+                    starved_since: acc.starved_since.min(dropped.starved_since),
+                    strongest: strongest_class(acc.strongest, dropped.class),
+                },
+            });
             resolve_ok(dropped.reply);
         } else {
             i += 1;
         }
     }
-    oldest
+    out
+}
+
+/// What a coalescing supersession inherits from the writes it dropped.
+struct Coalesced {
+    /// The OLDEST dropped `starved_since`, so a cadence-refreshed write still ages to
+    /// the I8 escalation instead of resetting below the bound for ever.
+    starved_since: Instant,
+    /// The STRONGEST class among the dropped writes.
+    strongest: WriteClass,
+}
+
+/// The higher-priority (lower-rank) of two classes.
+///
+/// **Why a survivor inherits this, and why it is a correctness fix rather than a
+/// priority tweak.** `drop_same_id_current_state` resolves each dropped write's reply
+/// `Ok(())` — the caller is told its intent was carried, deliberately superseded by a
+/// newer write to the same slot. That promise is only true if the survivor actually
+/// reaches the wire. It does not, if the survivor is weaker: `drain_for_shutdown`
+/// sheds every queued non-chat, non-tombstone write, so a `Chat` write coalesced by a
+/// `Keepalive` one leaves NOTHING on the wire while its caller already holds an `Ok`.
+/// Un-coalesced, that same write would have flushed. Taking the strongest class closes
+/// it, and changes nothing about content: last-writer-wins is untouched — same record,
+/// same logical id, the newest payload survives — only the lane it flushes in moves.
+fn strongest_class(a: WriteClass, b: WriteClass) -> WriteClass {
+    if a.rank() <= b.rank() {
+        a
+    } else {
+        b
+    }
 }
 
 async fn run<S: WriteSink>(
@@ -958,11 +1002,25 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
 
-    /// One recorded dispatch: the item label + the virtual instant it fired.
+    /// One recorded dispatch: the item label, the virtual instant it fired, and the
+    /// [`DispatchLane`] the scheduler drew for it.
+    ///
+    /// **The lane is here because it is the only observable that carries the
+    /// dispatched write's CLASS.** `MockItem` holds a label chosen at `req()` time, so
+    /// it reports what a caller asked for and not what the scheduler decided; the lane
+    /// is computed from `q.front().class` at the moment of dispatch, so it is the live
+    /// value. Without it a test can assert WHICH request survived a coalescing
+    /// supersession but never at what priority — and a survivor that inherited the
+    /// coalesced elder's class (the shape of the `starved_since` inheritance sitting
+    /// three lines away in `enqueue`) would land in the wrong lane with every existing
+    /// assertion still green. `Chat` maps to `DispatchLane::Chat`; every other class
+    /// maps to `Window` or `Floor`, which is exactly the distinction the DM doorbell's
+    /// two dispatch classes turn on.
     #[derive(Clone)]
     struct Rec {
         label: String,
         at: Instant,
+        lane: DispatchLane,
     }
 
     /// A counting mock sink (the WB-2 oracle seam): records every dispatched write
@@ -1002,7 +1060,7 @@ mod tests {
 
     impl WriteSink for MockSink {
         type Item = MockItem;
-        fn dispatch(&self, item: MockItem, _lane: DispatchLane) -> DispatchFuture {
+        fn dispatch(&self, item: MockItem, lane: DispatchLane) -> DispatchFuture {
             let log = self.log.clone();
             let latency = self.latency;
             let aw = self.acquire_wait_ms.load(Ordering::SeqCst);
@@ -1011,6 +1069,7 @@ mod tests {
                 log.lock().unwrap().push(Rec {
                     label: item.label,
                     at: Instant::now(),
+                    lane,
                 });
                 tokio::time::sleep(latency).await;
                 let acquire_wait = (aw != AW_NONE).then(|| Duration::from_millis(aw));
@@ -1566,6 +1625,166 @@ mod tests {
         );
     }
 
+    /// **A `Chat`-class `CurrentState` write IS coalescible, and the survivor inherits
+    /// the STRONGEST class of the set it subsumed.**
+    ///
+    /// Coalescing is keyed on `kind` alone — `enqueue` matches on `req.kind` and never
+    /// reads `req.class` — so the chat lane confers priority and a reserved dispatch
+    /// slot, NOT the never-coalesce property. Only `WriteKind::Ring` confers that.
+    /// `docs/design/direct-messaging.md:127` describes the chat lane as "never
+    /// coalesced", which is true of the writes it has in mind (all `Ring`) and not of
+    /// the lane; the DM doorbell is the first `Chat`-class `CurrentState` writer, so it
+    /// is the first place the distinction can bite.
+    ///
+    /// **This test previously pinned the survivor keeping its OWN class, and that was
+    /// wrong.** An authority lens showed the consequence: a queued `Chat` first-contact
+    /// knock coalesced by its own `Keepalive` re-seed produced a `Keepalive` survivor,
+    /// which `drain_for_shutdown` then SHEDS — so on quit nothing reached the wire while
+    /// the coalesced caller already held an `Ok(())` from `drop_same_id_current_state`.
+    /// Un-coalesced, that same knock flushes. Three legs below: the promotion, the
+    /// absence of a spurious one, and the shutdown flush that is the whole reason the
+    /// promotion exists.
+    #[tokio::test(start_paused = true)]
+    async fn a_coalesced_survivor_inherits_the_strongest_class_and_still_flushes() {
+        let cs = |id: &str| WriteKind::CurrentState {
+            logical_id: id.to_string(),
+        };
+
+        // ── Leg 1: Chat + Keepalive on one id → the survivor runs on the CHAT lane ──
+        let sink = MockSink::new(Duration::from_secs(5));
+        let h = WriteScheduler::spawn(sink.clone(), SchedulerConfig::default());
+        let rec = rec_id(31);
+        // Occupy so the next writes queue rather than dispatching immediately.
+        let (occupy, _r0) = req(rec, WriteClass::Chat, WriteKind::Ring, "occupy");
+        h.enqueue(occupy);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let (first, _r1) = req(rec, WriteClass::Chat, cs("dm-doorbell-6"), "first-send");
+        h.enqueue(first);
+        let (reseed, _r2) = req(rec, WriteClass::Keepalive, cs("dm-doorbell-6"), "reseed");
+        h.enqueue(reseed);
+        // A DIFFERENT logical id must NOT coalesce — the control that stops this
+        // passing on a scheduler that simply dropped writes.
+        let (other, _r3) = req(
+            rec,
+            WriteClass::Keepalive,
+            cs("dm-doorbell-7"),
+            "other-slot",
+        );
+        h.enqueue(other);
+
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        let log = sink.log();
+        let landed: Vec<(String, DispatchLane)> = log
+            .iter()
+            .filter(|r| r.label != "occupy")
+            .map(|r| (r.label.clone(), r.lane))
+            .collect();
+        let labels: Vec<&str> = landed.iter().map(|(l, _)| l.as_str()).collect();
+        assert!(
+            !labels.contains(&"first-send"),
+            "the chat-class current-state was NOT coalesced away — if this now holds, \
+             the chat lane has gained never-coalesce semantics: {landed:?}"
+        );
+        assert!(
+            labels.contains(&"reseed"),
+            "the survivor must be the newer write — last-writer-wins on CONTENT is \
+             what :128 requires and the promotion does not touch it: {landed:?}"
+        );
+        assert!(
+            labels.contains(&"other-slot"),
+            "a distinct logical id on the same record must never coalesce: {landed:?}"
+        );
+        let reseed_lane = landed
+            .iter()
+            .find(|(l, _)| l == "reseed")
+            .expect("the re-seed landed")
+            .1;
+        assert_eq!(
+            reseed_lane,
+            DispatchLane::Chat,
+            "the survivor of a supersession that subsumed a Chat write must carry Chat \
+             — the lane is computed from `q.front().class` at dispatch, so it is the \
+             live class and not a copy of what the caller asked for: {landed:?}"
+        );
+
+        // ── Leg 2: no spurious promotion. Keepalive + Keepalive stays Keepalive. ──
+        let other_lane = landed
+            .iter()
+            .find(|(l, _)| l == "other-slot")
+            .expect("the uncoalesced keepalive landed")
+            .1;
+        assert_ne!(
+            other_lane,
+            DispatchLane::Chat,
+            "an uncoalesced Keepalive must not be promoted, or `strongest_class` is \
+             returning Chat unconditionally and leg 1 proves nothing: {landed:?}"
+        );
+
+        let sink2 = MockSink::new(Duration::from_secs(5));
+        let h2 = WriteScheduler::spawn(sink2.clone(), SchedulerConfig::default());
+        let rec2 = rec_id(32);
+        let (occupy2, _s0) = req(rec2, WriteClass::Chat, WriteKind::Ring, "occupy");
+        h2.enqueue(occupy2);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        for i in 0..2 {
+            let (ka, _s) = req(
+                rec2,
+                WriteClass::Keepalive,
+                cs("ka-id"),
+                &format!("ka-only-{i}"),
+            );
+            h2.enqueue(ka);
+        }
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        let ka_lane = sink2
+            .log()
+            .into_iter()
+            .find(|r| r.label == "ka-only-1")
+            .expect("the surviving keepalive landed")
+            .lane;
+        assert_ne!(
+            ka_lane,
+            DispatchLane::Chat,
+            "coalescing two Keepalives must yield a Keepalive — promotion must come \
+             from the SET's strongest member, never from the act of coalescing"
+        );
+
+        // ── Leg 3: the promoted survivor survives the shutdown shed. ──
+        // This is the leg that makes the promotion a correctness fix rather than a
+        // priority tweak. `drain_for_shutdown` retains only Chat and tombstones, so an
+        // unpromoted survivor is dropped here — after `drop_same_id_current_state`
+        // already answered the coalesced caller `Ok(())`.
+        let sink3 = MockSink::new(Duration::from_secs(2));
+        let h3 = WriteScheduler::spawn(sink3.clone(), SchedulerConfig::default());
+        let rec3 = rec_id(33);
+        let (occupy3, _t0) = req(rec3, WriteClass::Chat, WriteKind::Ring, "occupy");
+        h3.enqueue(occupy3);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let (knock, _t1) = req(rec3, WriteClass::Chat, cs("dm-doorbell-6"), "knock");
+        h3.enqueue(knock);
+        let (knock_reseed, _t2) = req(rec3, WriteClass::Keepalive, cs("dm-doorbell-6"), "knock-rs");
+        h3.enqueue(knock_reseed);
+        // A genuinely weak write on the same record, never coalesced with anything:
+        // the control proving the shed still HAPPENS, so leg 3 is not passing because
+        // shutdown began retaining everything.
+        let (weak, _t3) = req(rec3, WriteClass::Keepalive, cs("weak-id"), "weak");
+        h3.enqueue(weak);
+
+        h3.shutdown(Duration::from_secs(60)).await;
+        let flushed: Vec<String> = sink3.log().into_iter().map(|r| r.label).collect();
+        assert!(
+            flushed.contains(&"knock-rs".to_string()),
+            "the promoted survivor must flush at shutdown: its coalesced elder's caller \
+             was told Ok(()), and shedding it means that promise was never kept and \
+             NOTHING reached the wire: {flushed:?}"
+        );
+        assert!(
+            !flushed.contains(&"weak".to_string()),
+            "an uncoalesced class-4 write must still be shed at shutdown, or this leg \
+             passes on a drain that stopped shedding altogether: {flushed:?}"
+        );
+    }
+
     /// I6b deadline override: a class-4 write past its deadline dispatches ahead of
     /// a higher-class (session-boundary) write queued on another record.
     #[tokio::test(start_paused = true)]
@@ -1967,7 +2186,7 @@ mod tests {
         }
         impl WriteSink for LanePanicSink {
             type Item = MockItem;
-            fn dispatch(&self, item: MockItem, _lane: DispatchLane) -> DispatchFuture {
+            fn dispatch(&self, item: MockItem, lane: DispatchLane) -> DispatchFuture {
                 // SYNCHRONOUS construction panic — escapes to the driver thread unless the
                 // fix runs construction inside the supervised inner spawn (WB-ISC-26).
                 assert_ne!(item.label, "boom-sync", "simulated sync construction panic");
@@ -1980,6 +2199,7 @@ mod tests {
                     log.lock().unwrap().push(Rec {
                         label: item.label,
                         at: Instant::now(),
+                        lane,
                     });
                     DispatchOutcome::bare(Ok(()))
                 })
@@ -2097,7 +2317,7 @@ mod tests {
         }
         impl WriteSink for HoldSink {
             type Item = MockItem;
-            fn dispatch(&self, item: MockItem, _lane: DispatchLane) -> DispatchFuture {
+            fn dispatch(&self, item: MockItem, lane: DispatchLane) -> DispatchFuture {
                 let log = self.log.clone();
                 Box::pin(async move {
                     if item.label == "hold" {
@@ -2106,6 +2326,7 @@ mod tests {
                     log.lock().unwrap().push(Rec {
                         label: item.label,
                         at: Instant::now(),
+                        lane,
                     });
                     DispatchOutcome::bare(Ok(()))
                 })
