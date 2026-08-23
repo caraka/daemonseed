@@ -28,12 +28,18 @@
 //!    world-READABLE record safe is that the entry is sealed to B's encapsulation
 //!    key; anyone can read the bytes and nobody else can open them.
 //!
-//! `#[ignore]` — it needs a host that can attach to the PUBLIC Veilid network. This
-//! VM cannot: something in the QEMU bridge eats the Veilid connection, so attach
-//! returns `NotReady` after the full 180 s timeout. Run it on a real-network host:
+//! `#[ignore]` — it needs a host that can attach to the PUBLIC Veilid network.
+//! Where attach is blocked, `attach_and_wait` returns `NotReady` after the full
+//! 180 s timeout. Run it on a host that can attach:
 //!
-//!     cd crates/daemonseed-veilid-net
-//!     cargo test --test two_node_doorbell -- --ignored --nocapture
+//!     cargo test -p daemonseed-veilid-net --test two_node_doorbell -- --ignored --nocapture
+//!
+//! Or build it into a standalone binary and run that on such a host:
+//!
+//!     packaging/oracles/build-oracle.sh two_node_doorbell
+//!
+//! Expect minutes rather than seconds: the knock mints a real proof of work at
+//! production difficulty, and each publish waits on DHT propagation.
 //!
 //! It drives the productized `VeilidNetHandle` surface the app drives, and reuses
 //! the REAL daemonseed crypto (`dm::doorbell::{derive_owner_seed, slot_for}` and
@@ -309,10 +315,36 @@ async fn a_knock_reaches_the_recipients_doorbell_and_opens_for_them_alone() {
         unknocked_seed, owner_seed_b,
         "the control must name a DIFFERENT record, or it is re-sweeping B's"
     );
-    let unknocked = node_b
-        .sweep_doorbell(unknocked_seed)
-        .await
-        .expect("sweeping a never-knocked doorbell is not an error");
+    // Retried, because by this point the run is minutes deep into a live DHT and a
+    // routing layer is entitled to answer "TryAgain: offline" for a while. Every
+    // other network step here already polls; this one did not, and it failed a
+    // whole run on a transient state after every assertion above had passed.
+    //
+    // **A transient error is NOT read as absence.** Doing that would make this
+    // control vacuous — "the record is not there" and "I could not find out" are
+    // the same bytes to a caller and opposite facts to this assertion. So the loop
+    // waits for a definitive answer and fails with the last error if none arrives.
+    let mut unknocked = None;
+    let mut last_err = None;
+    for attempt in 0..30 {
+        match node_b.sweep_doorbell(unknocked_seed).await {
+            Ok(outcome) => {
+                unknocked = Some(outcome);
+                break;
+            }
+            Err(e) => {
+                eprintln!("attempt {attempt}: never-knocked sweep not yet definitive: {e}");
+                last_err = Some(e);
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        }
+    }
+    let unknocked = unknocked.unwrap_or_else(|| {
+        panic!(
+            "sweeping a never-knocked doorbell never returned a definitive answer; \
+             last error: {last_err:?}"
+        )
+    });
     assert!(unknocked.slots.is_empty());
     assert_eq!(
         unknocked.outcome.attempted, 0,
