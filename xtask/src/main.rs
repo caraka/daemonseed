@@ -66,9 +66,8 @@ enum Cmd {
     /// still resolved in `ds-isc-draft.md`. Exits non-zero on the first
     /// missing marker. Closes redteam reservation R4.
     FindingsResolved {
-        /// Path to the working ISC draft. Defaults to the vault location used
-        /// during the private phase. Override for CI on a forked checkout or
-        /// after the draft is promoted in-repo.
+        /// Path to the working ISC draft. Required: the draft is kept outside
+        /// this repository, so there is no default that would resolve here.
         #[arg(long)]
         draft: Option<PathBuf>,
     },
@@ -137,22 +136,12 @@ fn isc_coverage(min: Option<u8>) -> Result<()> {
 /// the surrounding prose doesn't accidentally trip the gate.
 const FINDING_MARKERS: &[&str] = &["per F14", "per F18", "per F19", "per F21"];
 
-/// Default path to the working ISC draft during the private phase. Outside
-/// the repo (`~/carakastan/Projects/DaemonSeed/`). Override via `--draft`.
-fn default_draft_path() -> PathBuf {
-    if let Some(home) = std::env::var_os("HOME") {
-        PathBuf::from(home)
-            .join("carakastan")
-            .join("Projects")
-            .join("DaemonSeed")
-            .join("ds-isc-draft.md")
-    } else {
-        PathBuf::from("ds-isc-draft.md")
-    }
-}
-
 fn findings_resolved(draft: Option<PathBuf>) -> Result<()> {
-    let path = draft.unwrap_or_else(default_draft_path);
+    // The ISC draft is a working document kept outside this repository, so there
+    // is no default path that would mean anything to a reader: `--draft` names it.
+    let path = draft.context(
+        "findings-resolved needs `--draft <path>`: the ISC draft is kept outside this repository",
+    )?;
     let body = fs::read_to_string(&path)
         .with_context(|| format!("read ISC draft at {}", path.display()))?;
 
@@ -470,9 +459,9 @@ const WORKSPACE_BINS: &[&str] = &["daemonseed-tui", "daemonseed-gui", "xtask"];
 /// Delete the binaries the gate's `cargo test`/`clippy --all-targets` steps linked into
 /// `target/{debug,release}/`.
 ///
-/// **This is not tidiness — it prevents a cross-machine miscompile.** This repo's
-/// `target/` is shared (virtiofs) with another machine whose glibc is older than the one
-/// linking here. A binary linked on the newer host fails to load on the older one
+/// **This is not tidiness — it prevents a cross-machine miscompile.** Where a
+/// `target/` directory is shared between two machines whose glibc versions differ,
+/// a binary linked on the newer host fails to load on the older one
 /// (`version 'GLIBC_2.xx' not found`), and because the artifact's timestamp then looks
 /// fresh, that machine's own `cargo build` no-ops instead of relinking — so it keeps
 /// running the unusable binary with nothing to say why. Removing the linked bins forces

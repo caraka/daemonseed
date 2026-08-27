@@ -11,8 +11,8 @@
 //! unchanged.
 //!
 //! Authoritative inventory: the repo-root `ISA.md` `## Criteria` (the ISC
-//! document was promoted in-repo on 2026-05-29; there is no longer a vault
-//! draft). [`ISCS`] tracks the **built, non-deferred** ISCs — it mirrors the
+//! document was promoted in-repo on 2026-05-29 and has no out-of-tree
+//! counterpart). [`ISCS`] tracks the **built, non-deferred** ISCs — it mirrors the
 //! ISA `## Criteria` minus the deferred DM family and the vacant `C5`.
 //!
 //! Count invariants (kept aligned with `ISA.md` `## Criteria`):
@@ -335,13 +335,13 @@ pub const ISCS: &[(&str, IscClass)] = &[
     // mechanism) registers here — satisfied by the steady-state reader resweep in the
     // gui/tui net actors plus the key-based round-robin cursor unit oracle. WB-ISC-15
     // (a late-converging client still discovers a share) is DEFERRED to its two-node
-    // orinoco oracle and is NOT registered until that live probe lands (ISA Criteria).
+    // live oracle and is NOT registered until that probe lands (ISA Criteria).
     ("WB-ISC-14", IscClass::Negative),
     // WB-5.1 per-GET partitioned DHT gate (2026-07-13, docs/design/veilid-write-budget.md
     // §WB-5.1). The read-lane cure: four dedicated permit pools, per-GET read permits, a
     // retired acquire-wait controller, a dedicated floor lane, a median-of-5 weather
     // estimator + ReapGate band/grace, and panic-safety. WB-ISC-15 (late-converging share
-    // discovery) and WB-ISC-19 (single-client orinoco W_max step-up control) stay DEFERRED
+    // discovery) and WB-ISC-19 (single-client W_max step-up control) stay DEFERRED
     // to their live probes and are NOT registered (ISA Criteria `[DEFERRED-VERIFY]`).
     ("WB-ISC-16", IscClass::Positive), // static window, invariant to latency
     ("WB-ISC-17", IscClass::Negative), // anti: combined in-flight ≤ budget; per-pool caps

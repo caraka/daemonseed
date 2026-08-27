@@ -7,7 +7,7 @@
 # (system DLLs + the Universal CRT api-sets) — zig statically links the mingw runtime, so
 # there is NO libwinpthread / libgcc / libstdc++ to ship. No Windows host, no MSVC toolchain.
 #
-# Requirements (all present on the build VM):
+# Requirements (all must be present on the build host):
 #   - rustup with the windows-gnu target:  rustup target add x86_64-pc-windows-gnu
 #   - cargo-zigbuild + zig                  (the same toolchain the AppImage recipe uses)
 #

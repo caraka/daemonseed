@@ -646,7 +646,7 @@ export component AppWindow inherits Window {
     // gated, not `if`-gated), so focusing here is timing-safe.
     changed active-tab => { if (root.active-tab == 0) { root.focus-composer(); } }
     // Focus the Join phrase field when the overlay opens, so typing / Ctrl-V lands
-    // without needing a click (the VM software-render path can drop pointer clicks).
+    // without needing a click (a software-render path can drop pointer clicks).
     callback focus-join-input();
     focus-join-input => { join_phrase_input.focus-input(); }
     // Right-click "paste" into the Join phrase field (#63). Handled in Rust
@@ -1555,13 +1555,13 @@ export component AppWindow inherits Window {
                         Rectangle { }
                         SealedPill { }
                     }
-                    // PLACEHOLDER — caraka security review: the crypto/relay facts on
-                    // this card are a security-reviewed artifact (brief refinement #3,
-                    // D6). Wording is NOT improvised unattended; these lines are
-                    // structural stand-ins to be replaced with verified claims.
+                    // The crypto and relay facts on this card are security claims about
+                    // the product, so their wording is settled by security review rather
+                    // than drafted here. The two lines below are structural stand-ins and
+                    // must be replaced with reviewed claims before they ship.
                     Text { text: "End-to-end encrypted · only people with this phrase can read it."; color: #6fb3a4; font-size: 12px; }
-                    Text { text: "[PLACEHOLDER — caraka security review: relay-exposure sentence]"; color: #5b6472; font-size: 11px; }
-                    Text { text: "[PLACEHOLDER — caraka security review: \"N others\" only on a trusted relay]"; color: #5b6472; font-size: 11px; }
+                    Text { text: "[PENDING SECURITY REVIEW — relay-exposure sentence]"; color: #5b6472; font-size: 11px; }
+                    Text { text: "[PENDING SECURITY REVIEW — \"N others\" only on a trusted relay]"; color: #5b6472; font-size: 11px; }
                 }
             }
 

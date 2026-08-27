@@ -148,7 +148,7 @@ const SHARE_CATALOG_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 /// `SUBKEY_COUNT` (64) force-refresh gets/record, so rounds are few + widening, not a
 /// tight loop; re-swept already-seen items are deduped downstream (`apply_discovery`
 /// self-filter, `push_message` exact-match). **#140 dial-down (felt-test 2026-07-08):**
-/// the original 4-round 12/25/45/75 s schedule spun the host fans up (~900 gets/client)
+/// the original 4-round 12/25/45/75 s schedule cost ~900 DHT gets per client
 /// for marginal benefit — operator content converged (~120 s) past the window, and #142
 /// removed the #93 landing this schedule used to feed — so it is dialled to a LIGHT
 /// 2-round best-effort early-catch that helps only fast-converging content; slower

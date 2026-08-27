@@ -28,9 +28,9 @@
 //!    world-READABLE record safe is that the entry is sealed to B's encapsulation
 //!    key; anyone can read the bytes and nobody else can open them.
 //!
-//! `#[ignore]` — it needs a host that can attach to the PUBLIC Veilid network. This
-//! VM cannot: something in the QEMU bridge eats the Veilid connection, so attach
-//! returns `NotReady` after the full 180 s timeout. Run it on a real-network host:
+//! `#[ignore]` — it needs a host that can attach to the PUBLIC Veilid network.
+//! Where attach is blocked, `attach_and_wait` returns `NotReady` after the full
+//! 180 s timeout. Run it on a host that can attach:
 //!
 //!     cd crates/daemonseed-veilid-net
 //!     cargo test --test two_node_doorbell -- --ignored --nocapture

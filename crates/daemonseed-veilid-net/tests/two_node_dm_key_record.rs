@@ -16,9 +16,8 @@
 //! network until a later slice.
 //!
 //! `#[ignore]` — it needs a host that can attach to the PUBLIC Veilid network.
-//! This VM cannot: something in the QEMU bridge eats the Veilid connection, so
-//! attach returns `NotReady` after the full 180 s timeout (measured 2026-07-28).
-//! Run it on a real-network host:
+//! Where attach is blocked, `attach_and_wait` returns `NotReady` after the full
+//! 180 s timeout. Run it on a host that can attach:
 //!
 //!     cd crates/daemonseed-veilid-net
 //!     cargo test --test two_node_dm_key_record -- --ignored --nocapture

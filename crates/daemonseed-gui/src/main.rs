@@ -1291,10 +1291,10 @@ fn pick_dir_and_fetch(net: &Rc<RefCell<NetHandle>>, target: FetchTarget) {
 /// cancelled pick (or a system with no portal) simply does nothing.
 fn pick_dir_and_publish(net: &Rc<RefCell<NetHandle>>, name: String, sharer_handle: String) {
     let sender = net.borrow().command_sender();
-    // Headless-test escape hatch (private-phase, review before public): this VM's xdg
-    // portal picker drops selection clicks and returns the default dir, so set
-    // DAEMONSEED_PUBLISH_DIR=<path> to publish that folder directly and exercise the
-    // publish→serve→fetch pipeline without the portal. Ignored unless it names a dir.
+    // Headless-test escape hatch. Some xdg portal implementations drop the selection
+    // click and return the default directory, so DAEMONSEED_PUBLISH_DIR=<path>
+    // publishes that folder directly and exercises the publish→serve→fetch pipeline
+    // without the portal. Ignored unless it names a directory.
     if let Ok(dir) = std::env::var("DAEMONSEED_PUBLISH_DIR") {
         let dir = std::path::PathBuf::from(dir.trim());
         if dir.is_dir() {
@@ -1341,7 +1341,7 @@ fn pick_dir_and_publish(net: &Rc<RefCell<NetHandle>>, name: String, sharer_handl
 
 /// Re-focus the active auth field after a FAILED attempt (wrong/weak passphrase,
 /// mismatch, …) so the user can retry by just typing — essential on hosts where the
-/// WM drops pointer clicks (this VM's software-render path), where clicking back into
+/// WM drops pointer clicks (a software-render path does), where clicking back into
 /// the field to recover focus may never register. Deferred: focusing synchronously
 /// from inside the submit callback re-enters the property graph and panics. No-op in
 /// offscreen mode (`defer` doesn't fire without an event loop).

@@ -6,7 +6,7 @@
 # against an old glibc floor (Ubuntu 22.04 "Jammy", glibc 2.35) via cargo-zigbuild
 # so it runs on any reasonably recent Linux desktop without a local Rust toolchain.
 #
-# Requirements (all already present on the build VM):
+# Requirements (all must be present on the build host):
 #   - rustup with the x86_64-unknown-linux-gnu target
 #   - cargo-zigbuild + zig   (the cross-linker that pins the glibc floor)
 #   - appimagetool           (on PATH; assembles the AppDir into the .AppImage)

@@ -144,7 +144,7 @@ fn os_downloads_dir() -> PathBuf {
 
 /// Expand a leading `~` / `~/` in a user-typed destination path to `$HOME`
 /// (ISC-C68). The dest box is a plain text field, not a shell, so without this
-/// a typed `~/carakastan` would create a literal directory named `~`. Only a
+/// a typed `~/Downloads` would create a literal directory named `~`. Only a
 /// leading bare `~` or `~/` is expanded — a `~user` form or a mid-path `~` is
 /// left verbatim. With no `$HOME`, the path is returned unchanged.
 fn expand_tilde(dest: &str) -> PathBuf {

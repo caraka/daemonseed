@@ -8,8 +8,8 @@
 //! circle message, parameterized only by the owner-seed derivation.
 //!
 //! `#[ignore]` — it needs a host that can attach to the PUBLIC Veilid network.
-//! This VM's SLIRP NAT blocks attach, so run it on a real-network host
-//! (e.g. orinoco). This crate is `[workspace] exclude`d, so `-p` won't resolve
+//! Where the network path blocks a public attach, the wait returns `NotReady`
+//! after the full timeout. This crate is `[workspace] exclude`d, so `-p` won't resolve
 //! it from the repo root — build from the crate's own directory:
 //!
 //!     cd crates/daemonseed-veilid-net

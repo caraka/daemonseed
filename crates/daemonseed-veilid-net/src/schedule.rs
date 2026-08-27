@@ -229,7 +229,7 @@ pub struct SchedulerConfig {
     /// `W_max` — the frozen non-chat window ceiling (WB-5.1 / I5″.1 = 2). The window
     /// is the STATIC `min(distinct pending non-chat records, W_max)` — the §I5′.2
     /// acquire-wait controller is retired, so there is no dynamic guard state. A
-    /// step-up is gated on the WB-ISC-19 single-client orinoco control; do NOT raise it
+    /// step-up is gated on the WB-ISC-19 single-client control; do NOT raise it
     /// here.
     pub nonchat_cap: usize,
     /// Per-class starvation age bound (I8), indexed by `rank()-1`. Used for I8 window

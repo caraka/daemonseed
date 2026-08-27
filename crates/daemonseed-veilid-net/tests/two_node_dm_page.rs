@@ -29,10 +29,9 @@
 //!    address; driving the round trip from opposite ends is the only oracle that
 //!    fails when the two halves disagree about it.
 //!
-//! `#[ignore]` — it needs a host that can attach to the PUBLIC Veilid network. This
-//! VM cannot: something in the QEMU bridge eats the Veilid connection, so attach
-//! returns `NotReady` after the full 180 s timeout (measured 2026-07-28). Run it on
-//! a real-network host:
+//! `#[ignore]` — it needs a host that can attach to the PUBLIC Veilid network.
+//! Where attach is blocked, `attach_and_wait` returns `NotReady` after the full
+//! 180 s timeout. Run it on a host that can attach:
 //!
 //!     cd crates/daemonseed-veilid-net
 //!     cargo test --test two_node_dm_page -- --ignored --nocapture

@@ -124,7 +124,7 @@ tokio = { workspace = true, features = ["test-util", "time"] }
 
 [features]
 default = []
-# Real winit window on the Wayland head (the felt-test surface). Forwards Slint's
+# Real winit window on a desktop session. Forwards Slint's
 # winit backend; still software-rendered (no GL dependency). `cargo run -p
 # daemonseed-gui --features desktop` opens a window. Base build (no features) stays
 # offscreen-only so it compiles/verifies from a headless terminal.

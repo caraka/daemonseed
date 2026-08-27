@@ -31,7 +31,7 @@ The signer is fetched from crates.io at the version this workspace pins, so the 
 that writes the slot and the runtime that reads it cannot drift. It is a build tool,
 outside the cryptographic boundary, and is linked into nothing that ships.
 
-## Requirements (already present on the build VM)
+## Requirements (must be present on the build host)
 
 - `rustup` with the `x86_64-unknown-linux-gnu` target
 - `cargo-zigbuild` + `zig` (the cross-linker that pins the glibc floor)

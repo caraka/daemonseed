@@ -91,8 +91,9 @@ pub const CHAT_PERMITS: usize = 2;
 /// `W_max + 1`, never collapsing to 1.
 pub const FLOOR_PERMITS: usize = 1;
 /// `W_max` — the frozen non-chat window ceiling (I5, WB-5.1 / I5″.1). Starts at 2; a
-/// step-up is gated on WB-ISC-19 (attended single-client orinoco control) and is a
-/// static re-construction of the gate at the new `W_max`, never a live re-partition.
+/// step-up is gated on WB-ISC-19 (an attended single-client control on a host that can
+/// attach to the public network) and is a static re-construction of the gate at the new
+/// `W_max`, never a live re-partition.
 pub const W_MAX: usize = 2;
 /// Read lane permits — the elastic residual: `DHT_BUDGET − chat − floor − W_max`. At
 /// the frozen `W_max = 2` this is 9.

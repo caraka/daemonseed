@@ -1363,5 +1363,5 @@ testing:
       serve/fetch, pure codec + AIMD + discovery anti-swap tests). Live two-node
       tests (crates/daemonseed-veilid-net/tests/two_node_*.rs) require a real
       public Veilid attach and are `#[ignore]`d by default — run with
-      `cargo nextest run -- --ignored` on a network-capable host (a NAT'd VM's
-      SLIRP path cannot attach).
+      `cargo nextest run -- --ignored` on a host that can attach to the public
+      network.

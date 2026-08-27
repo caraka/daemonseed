@@ -83,7 +83,7 @@ ratatui = "0.29"
 # (AGPLv3-compatible) — daemonseed-gui is AGPL-3.0-or-later. Base build is
 # software-renderer-only (no GL) so it compiles + offscreen-renders even from a
 # headless terminal; the crate's `desktop` feature forwards `slint/backend-winit`
-# for a real window on the Wayland head (the felt-test surface).
+# for a real window on a desktop session.
 slint = { version = "1.13", default-features = false, features = ["compat-1-2", "renderer-software", "std"] }
 slint-build = "1.13"
 

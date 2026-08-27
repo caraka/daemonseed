@@ -187,11 +187,11 @@ mod tests {
 
     #[test]
     fn desktop_entry_is_wellformed() {
-        let e = desktop_entry("/home/rick/Apps/daemonseed-gui-x86_64.AppImage");
+        let e = desktop_entry("/opt/daemonseed/daemonseed-gui-x86_64.AppImage");
         assert!(e.starts_with("[Desktop Entry]\n"));
         assert!(e.contains("Type=Application\n"));
         assert!(e.contains("Name=Daemonseed\n"));
-        assert!(e.contains("Exec=/home/rick/Apps/daemonseed-gui-x86_64.AppImage %U\n"));
+        assert!(e.contains("Exec=/opt/daemonseed/daemonseed-gui-x86_64.AppImage %U\n"));
         assert!(e.ends_with("Terminal=false\n"));
     }
 

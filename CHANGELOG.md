@@ -12,7 +12,7 @@ signed tag (`git tag --verify vX.Y.Z`). Nothing else in the repository
 duplicates this record: `ISA.md` is the frozen design contract (principles,
 boundaries, criteria — not history), live ISC coverage comes from
 `cargo xtask isc-coverage`, and in-progress / next-milestone planning lives in
-the project lead's vault manifest, never committed here.
+the maintainer's own planning notes, never committed here.
 
 Milestone identifiers (`Mn`) are the internal planning labels; the release tag
 is the durable anchor.
@@ -22,7 +22,7 @@ is the durable anchor.
 Changes that have landed on `main` since the last tag accumulate here; at the
 next release this block is renamed to its version + date and a fresh
 `[Unreleased]` is opened (see `AGENTS.md` doc-sync). Planning for *unstarted*
-work lives in the project lead's vault manifest, not here.
+work lives in the maintainer's own planning notes, not here.
 
 ### Added
 
@@ -194,6 +194,9 @@ work lives in the project lead's vault manifest, not here.
 
 ### Removed
 
+- The default path for `cargo xtask findings-resolved`, which pointed outside the
+  repository. The subcommand now requires `--draft <path>`.
+
 - The `oxicrypt-zeroize` workspace dependency, which no member crate consumed. daemonseed
   zeroizes through the RustCrypto `zeroize` crate's `Zeroizing` and `ZeroizeOnDrop`;
   oxicrypt's is an in-boundary FIPS SSP zeroizer exposing free functions over byte slices.
@@ -206,6 +209,13 @@ work lives in the project lead's vault manifest, not here.
 
 ### Changed
 
+- Tests, manifests and design documents that need a public Veilid attach state what the
+  host must provide instead of naming a machine.
+- `ISA.md` carries the design contract only — problem, boundaries, language, principles,
+  constraints, the criteria under their permanent IDs, the durable design decisions, and
+  how they are verified. Build narrative and per-session verification records are no
+  longer part of it; change history is `CHANGELOG.md` and the signed tags, and the live
+  criterion count comes from `cargo xtask isc-coverage`.
 - Scoped trust-event dismissal to the kind of record it concerns, so acknowledging a blocked
   erasure of one kind leaves the other three standing. (#337)
 - Skipped and counted a trust-log entry whose event key this build does not know, where the
@@ -1119,11 +1129,11 @@ work lives in the project lead's vault manifest, not here.
 - `daemonseed-gui`: the unread-gated announcements landing over Veilid (Phase 4 A-d, #93) — after the operator record's post-connect backlog settles, the net actor fires one connect-time `PublicSpaceSnapshot` so the announcements pane auto-opens iff the content changed since last seen; fires once per connect. Landing timing on the async DHT is best-effort (#137).
 - `daemonseed-gui`: the announcements/MOTD composer over Veilid (Phase 4 A-c, #92) — the GUI net actor wires `SetMotd` / `UploadAnnouncement` / `RefreshPublicSpace` (were "not yet on Veilid") onto the operator announce record: the composer signs content with the F17 project-release key (`dev_project_release_keypair`), publishes a 1-byte-KIND-tagged `SignedArtifact` (MOTD) / `Post` (announcement) via `publish_current_state`, and folds verified inbound items into a `PublicSpaceSnapshot` view (`build_announcements_view` reused). Clients verify against the always-authorized F17 key, so an empty `Whitelist` suffices — no signer-whitelist distribution. Dev-possession gate (`can_compose = true`); the production whitelist-membership gate and the rollback-freshness version (#136) are deferred. GUI only (TUI parity does not gate the cutover).
 - `daemonseed-core`: `dev_project_release_keypair` — the dev-only F17 project-release SIGNING keypair (from the in-source `PROJECT_RELEASE_SEED`), the dev analog of `project_release_pubkey`; the key the dev announce composer signs with. Retired when the seed becomes a baked pubkey with an offline secret.
-- `daemonseed-veilid-net`: `VeilidNetHandle::publish_current_state` (Phase 4 A-b) — the operator announcements/MOTD record write primitive: publish opaque bytes to a NAMED current-state slot (`"motd"`, or an announcement's content address) on the owner-gated project-announce record. The write is owner-signed, so only a holder of the project-announce owner seed (the non-derivable write-gate, A1) can place a value; clients `subscribe_room` and read/verify but cannot write. Content stays a public signed `SignedArtifact` (verified client-side by `verify_artifact`), not AEAD-sealed. Two-node operator-record oracle (`tests/two_node_operator_record.rs`, `#[ignore]`, orinoco). (The signer-gated composer, the app publish wiring, and the rollback-freshness version field are follow-ons — see the design's A1/A2 and #136.)
+- `daemonseed-veilid-net`: `VeilidNetHandle::publish_current_state` (Phase 4 A-b) — the operator announcements/MOTD record write primitive: publish opaque bytes to a NAMED current-state slot (`"motd"`, or an announcement's content address) on the owner-gated project-announce record. The write is owner-signed, so only a holder of the project-announce owner seed (the non-derivable write-gate, A1) can place a value; clients `subscribe_room` and read/verify but cannot write. Content stays a public signed `SignedArtifact` (verified client-side by `verify_artifact`), not AEAD-sealed. Two-node operator-record oracle (`tests/two_node_operator_record.rs`, `#[ignore]`, live network). (The signer-gated composer, the app publish wiring, and the rollback-freshness version field are follow-ons — see the design's A1/A2 and #136.)
 - `daemonseed-core`: project-announce channel core (Phase 4 A0/A1) — `derive_project_announce_veilid_owner_seed` / `ProjectAnnounceVeilidOwnerSeed` (+ `dev_project_announce_veilid_owner_seed`, `PROJECT_ANNOUNCE_OWNER_SALT` / `PROJECT_ANNOUNCE_VEILID_OWNER` HKDF constants): the maintainer-held Veilid DHT owner seed for the single project announcements/MOTD channel — the write-gate — HKDF-derived as a sibling of the F17 project-release seed, domain-disjoint from the content-signing key and every rendezvous owner. Plus `AnnounceFreshness` — the #78 monotonic rollback guard (holds `last_seen` as state so it is transposition-proof; `accepts`/`accept` reject a strictly-older record) so an untrusted transport can't replay a stale operator record to roll back a revocation/MOTD. The version must be a strictly-monotonic operator counter, never a wall clock.
 - `daemonseed-core`: `derive_room_presence_veilid_owner_seed` / `RoomPresenceVeilidOwnerSeed` and `derive_circle_presence_veilid_owner_seed` / `CirclePresenceVeilidOwnerSeed`, plus the `public_room_presence_veilid_owner` / `circle_presence_veilid_owner` HKDF labels — a THIRD sibling of the room key / circle `cot_key`, disjoint from both the content key and the chat rendezvous owner, so member-presence beacons ride their OWN world-derivable DHT record (#74).
 - `daemonseed-veilid-net`: `VeilidNetHandle::publish_presence` + `member_slot_id` — a current-state (last-writer-wins) transport write for sealed member-presence beacons on the presence rendezvous record, keyed to a per-member `current_state_subkey` slot (`member_slot_id` owns the pubkey→slot-id encoding so all callers agree); spawned off the actor loop and serialized per-record. Replaces the `presence()` stub. Slot count is bounded (`SUBKEY_COUNT`), so unbounded membership can slot-share — a bounded, self-healing degradation, not a crash (#74).
-- `daemonseed-{gui,tui}`: Lobby member-presence over Veilid (#74) — the net actor subscribes the presence sibling record, emits a jittered ~15–20s sealed `MemberHeartbeat` (above the ~14.7s DHT watch floor, spawned OFF the actor loop so a slow DHT write never stalls chat) and reaps its `PresenceTracker` on the same timer, and folds verified, `#78`-fresh, non-own inbound beacons into the roster. The GUI emits `NetEvent::Roster`; the TUI maintains the tracker (its roster render is deferred). Two-node roster-converge oracle (`tests/two_node_presence.rs`, `#[ignore]`, orinoco).
+- `daemonseed-{gui,tui}`: Lobby member-presence over Veilid (#74) — the net actor subscribes the presence sibling record, emits a jittered ~15–20s sealed `MemberHeartbeat` (above the ~14.7s DHT watch floor, spawned OFF the actor loop so a slow DHT write never stalls chat) and reaps its `PresenceTracker` on the same timer, and folds verified, `#78`-fresh, non-own inbound beacons into the roster. The GUI emits `NetEvent::Roster`; the TUI maintains the tracker (its roster render is deferred). Two-node roster-converge oracle (`tests/two_node_presence.rs`, `#[ignore]`, live network).
 - `docs/llm-api-manifest/daemonseed-veilid-net-api.yaml`: LAMA API manifest for the Veilid transport crate — modules, the `VeilidNet` / `VeilidNetHandle` surface (attach, routes, sealed send, circle/room publish/subscribe/resweep, share serve/fetch, share-advert publish/stop), the `discovery` (anti-swap route advert) and `share` primitives, `VeilidNetError`, and constants; plus a `lama.yaml` crate entry + manifest pointer. Closes the manifest gap open since the crate's Phase 1 (#127).
 - `daemonseed-veilid-net` crate: Veilid transport layer (Phase 1) — identity-bound node, command-channel actor (`VeilidNet` / `VeilidNetHandle`), sealed 1:1 `app_message` over a private route, per-node `VeilidNetConfig::listen_address`. Workspace-excluded until the v0.33.0 cutover.
 - `daemonseed-core`: `VeilidNodeSeed` + `DOMAIN_VEILID_NODE` — Veilid node identity derived from the identity mnemonic under a domain-separated HKDF label (D3).

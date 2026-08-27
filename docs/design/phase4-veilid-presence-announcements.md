@@ -94,7 +94,7 @@ kept as a documented fallback.
 archived 10–15 s to **~15–20 s** so it sits at/above the ~14.7 s watch floor; keep the 3-miss reap
 (TTL ~45–60 s) and the bias-to-forgiveness. Effective presence resolution ≈ interval + ~14.7 s
 regardless, and beaconing faster than the channel propagates only adds redundant DHT writes. These
-are the values to tune against real orinoco wobble data once the Lobby increment is live (this is
+are the values to tune against real-network wobble data once the Lobby increment is live (this is
 the archived doc's open question #4, now bounded by the measured floor). `presence.rs` currently
 defaults `HEARTBEAT_INTERVAL_MIN/MAX = 10/15 s`; the wiring passes the tuned cadence via
 `PresenceTracker::with_cadence`.
@@ -122,7 +122,7 @@ persistent-handle presence follows for circles (#77), where members already carr
 - **#74 heartbeat primitive** — the pure-core/veilid-net opener (no GUI): the sibling
   `presence_owner_seed` derivation, `VeilidNetHandle::presence()` (emit-on-timer to
   `current_state_subkey` + subscribe/ingest into `PresenceTracker` + reap), oracle-tested with a
-  two-node roster-converges test (`#[ignore]`, orinoco). This is the unattended-night candidate.
+  two-node roster-converges test (`#[ignore]`, live network). This one can run unattended.
 - **#75 Lobby roster UI** — the attended follow-on: render the `PresenceTracker` set in the GUI
   (placement — rail vs room section vs pane — is still the archived doc's open UI question).
 - **#77 circle presence** — the identical mechanism on circle rendezvous, with persistent handles.
@@ -264,8 +264,8 @@ Order within each track is dependency-driven. "Unattended" = oracle-gated core/v
 **Track P — presence (lower risk, mostly re-wiring):**
 1. **P-a (#74, unattended)** — sibling `presence_owner_seed` + `VeilidNetHandle::presence()`
    emit/ingest/reap on a current-state sibling record; cadence via `with_cadence`; two-node
-   roster-converge oracle (`#[ignore]`, orinoco). *Depends on:* nothing new (core is done).
-2. **P-b (#75, attended)** — GUI Lobby roster render; felt-test on orinoco (two clients see each
+   roster-converge oracle (`#[ignore]`, live network). *Depends on:* nothing new (core is done).
+2. **P-b (#75, attended)** — GUI Lobby roster render; felt test on a real-network host (two clients see each
    other appear/disappear). *Depends on:* P-a.
 3. **P-c (#77, attended)** — circle presence (persistent handles) on the same mechanism.
    *Depends on:* P-a, P-b proven.
@@ -274,7 +274,7 @@ Order within each track is dependency-driven. "Unattended" = oracle-gated core/v
 1. **A-a (core, unattended)** — operator owner-seed derivation + monotonic freshness guard; unit
    oracles. *Depends on:* nothing.
 2. **A-b (veilid-net, unattended)** — operator-owned MOTD slot + announcement items publish/subscribe;
-   re-target cli authoring/verify; in-process oracle + two-node (`#[ignore]`, orinoco).
+   re-target cli authoring/verify; in-process oracle + two-node (`#[ignore]`, live network).
    *Depends on:* A-a.
 3. **A-c (#92, attended)** — signer-gated composer on the stable key (#94). *Depends on:* A-b.
 4. **A-d (#93, attended)** — unread-gated landing (hash + `landing_decision` transport-swap).
@@ -308,7 +308,7 @@ whole-branch xhigh review already named as the full cutover gate.
 - **Roster UI placement** — rail vs active-room section vs separate pane (archived doc's open item;
   a UI call, deferred to #75).
 - **Final presence cadence/TTL/jitter** — the ~15–20 s / 3-miss / ~45–60 s starting point tunes
-  against real orinoco wobble once the Lobby increment is live.
+  against real-network wobble once the Lobby increment is live.
 - **Server-wide-key MOTD** — the relay allowed a server-wide key (not just whitelist signers) to set
   MOTD; on Veilid this is subsumed by "operator owns the record" (the operator IS the server-wide
   authority). Confirm no separate affordance is wanted.

@@ -39,7 +39,7 @@ library:
 # Those live in their canonical homes (see AGENTS.md "Canonical homes"):
 #   • milestone / release history → git tags + ../CHANGELOG.md
 #   • live ISC coverage           → `cargo xtask isc-coverage`
-#   • in-progress / next          → the project lead's vault manifest (uncommitted)
+#   • in-progress / next          → GitHub Issues and ../ROADMAP.md
 # ─────────────────────────────────────────────────────────────────────
 
 # ─────────────────────────────────────────────────────────────────────
@@ -396,7 +396,7 @@ capabilities:
 # live OUTSIDE this repository during the private phase and are
 # referenced by ISC number throughout the LAMA manifests.
 # The ISC document has been promoted into this repo as the authoritative
-# `ISA.md` (2026-05-29); the suite-registry doc stays vault-side for now.
+# `ISA.md` (2026-05-29); the suite-registry doc is not yet in this repo.
 # ISC numbers are the spec breadcrumbs throughout these manifests.
 
 # ISC inventory and live coverage are NOT tracked here — the canonical source is
