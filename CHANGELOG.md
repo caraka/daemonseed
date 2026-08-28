@@ -931,6 +931,16 @@ work lives in the maintainer's own planning notes, not here.
   broken by content-address slot key (#237). Posts previously rendered in
   content-address order, placing a newer announcement below an older one.
 
+### Changed
+
+- The closure that `DmPersist::update_outbox` takes returns `Mutation<T>` —
+  `Changed(T)` or `Unchanged(T)`, `must_use` — and the record is written only on
+  `Changed`. An `Unchanged` report for a correspondence with no record writes no
+  record and spends no seal, so `DmPersistError::OutboxDirectionMismatch` arises
+  once an entry has been queued. Debug builds panic when an `Unchanged` report
+  follows a change. A record is re-encoded to the current format and write suite
+  only on a `Changed` write. `DmStore` counts its seals in test builds. (#347)
+
 ## [0.36.3] — 2026-07-28
 
 ### Added

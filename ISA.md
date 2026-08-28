@@ -648,6 +648,24 @@ route taken to reach a decision are not recorded here — the git history and `C
   chain that was not deleted. Losing a conversation to a restart was never the defect; the defect was
   that both ends silently returned to generation zero and reported health while delivering nothing.
 
+- **A record is written only when its mutator says it changed.** Every write to the DM store is an
+  AEAD seal, and every seal draws on a birthday bound for a key that nothing counts, so a poll that
+  decides nothing is not free — it spends the scarcest resource the store has. Making the mutator
+  report turns the sweep cadence back into a latency choice, which is the property that matters:
+  otherwise whoever writes the transport driver picks a cryptographic parameter while believing they
+  are picking a responsiveness one. Two alternatives were rejected. Accepting the unconditional write
+  and documenting the cadence as a cryptographic parameter is cheaper, but leaves the two concerns
+  permanently coupled and every future cadence change a crypto review. A deterministic per-record
+  nonce removes the bound outright, but needs a durable counter whose rollback is catastrophic — a
+  worse failure than the one being avoided. The cost accepted is that a caller must state whether it
+  mutated; the type system, not a convention, is what collects that statement, and debug builds
+  compare the record against its before-image so a report that is not true fails loudly wherever
+  tests run. Two corollaries are deliberate. An unchanged report on a correspondence that has no
+  record writes no record and spends no seal, so an empty record is never materialised as a side
+  effect of being asked about — though taking the lock still creates the correspondence's directory,
+  and "creates nothing" would be the wrong claim. And read-old-write-new migration now rides a
+  *changing* record rather than any poll, so a record nobody writes is a record nobody migrates.
+
 - **The client GUI is Slint.** It is Rust-native with declarative markup, is royalty-free for desktop,
   mobile, and web, and is the only Rust GUI toolkit with official Android support. The terminal client
   is frozen as a protocol and test harness and is explicitly not a substitute for this commitment.

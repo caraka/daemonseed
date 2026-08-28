@@ -227,6 +227,36 @@ fn direction_label(direction: Direction) -> String {
     String::from_utf8_lossy(direction.label()).into_owned()
 }
 
+/// Whether a mutator actually changed the record it was handed.
+///
+/// Returned by the closure [`DmPersist::update_outbox`] takes. The write it
+/// guards is a *seal*, and seals draw from a birthday bound on a single key that
+/// nothing counts (#289, #347) — so "did anything change" is the question that
+/// decides whether a scarce resource is spent, and the caller is the only party
+/// that can answer it.
+///
+/// **It is a return type rather than a convention because a convention is
+/// exactly what fails silently here.** A caller that forgets to report cannot
+/// compile. Both variants carry the closure's own value, so reporting costs the
+/// caller nothing but the word.
+///
+/// `#[must_use]` covers the case the closure position does not: a helper
+/// returning a `Mutation` whose result is discarded as a bare statement. In the
+/// closure position itself the value is the return value, so it cannot be
+/// dropped and still type-check — the attribute is not what makes reporting
+/// mandatory there.
+///
+/// A report of `Unchanged` that is not true would discard the caller's mutation
+/// silently. Debug builds check it; see [`DmPersist::update_outbox`].
+#[must_use = "the record is written, and a seal spent, on the strength of this answer"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mutation<T> {
+    /// The record was changed and must be written back.
+    Changed(T),
+    /// The record is exactly as it was found: no write, and so no seal.
+    Unchanged(T),
+}
+
 /// A profile's DM records on disk, and the keys they are written under.
 ///
 /// Holds the store and the provisional record's seal key together because both
@@ -394,6 +424,9 @@ impl DmPersist {
     /// Load the outbox, let `f` change it, and write it back — all under one
     /// lock.
     ///
+    /// **`f` reports whether it mutated, and a report of
+    /// [`Mutation::Unchanged`] costs no seal** (#347).
+    ///
     /// The closure is the point, for [`DmStore::critical_section`]'s reason: a
     /// sweep, an acknowledgement merge or an enqueue reads the record, decides
     /// from it, and writes the result, and those three steps have to be one
@@ -408,15 +441,74 @@ impl DmPersist {
     ///
     /// **Nothing is written if `f` fails.** The record is replaced only after
     /// `f` returns `Ok`, so a failed call leaves the correspondence exactly as it
-    /// was and the caller may retry. A successful call always writes, even if
-    /// `f` changed nothing — one redundant write against having to trust every
-    /// caller to report whether it mutated.
+    /// was and the caller may retry.
+    ///
+    /// **A successful call writes only when `f` says it changed something.** An
+    /// earlier version of this method always wrote, and said so: *"one redundant
+    /// write against having to trust every caller to report whether it
+    /// mutated"*. That trade was made without knowing the price. #289 measured
+    /// it: the write is a *seal*, seals draw from a 2^32 birthday bound on one
+    /// key, and a sweep spends one per correspondence per tick whether or not
+    /// anything happened — five hundred correspondences on a sixty-second tick
+    /// reach 61% of the bound in ten years having sent nothing at all. That made
+    /// the polling cadence a cryptographic parameter disguised as a latency
+    /// knob. Reporting decouples the two: a no-op tick is free, so the cadence
+    /// can be chosen on responsiveness alone.
+    ///
+    /// The trust the old comment declined to extend is now structural rather
+    /// than conventional — [`Mutation`] is the closure's return type, so a
+    /// caller cannot fail to answer, and `#[must_use]` catches building the
+    /// answer and dropping it.
+    ///
+    /// **A record that does not exist yet is created only if `f` changes it.**
+    /// `Unchanged` on a fresh correspondence writes no outbox record and spends
+    /// no seal — an empty record stores no fact worth one, and
+    /// [`Self::read_outbox`] already distinguishes "nothing queued" from "never
+    /// queued anything".
+    ///
+    /// **It is not true that such a call creates nothing**, and the difference
+    /// matters to anyone testing for absence: taking the lock precedes the
+    /// closure, so [`DmStore::critical_section`] has already made the
+    /// correspondence's directory and its lock file by the time `f` runs. What
+    /// is absent afterwards is the record and the seal, not the directory.
+    ///
+    /// One consequence is deliberate and worth naming: the direction guard
+    /// above engages only once something has actually been queued, because
+    /// until then there is no stored direction for a later caller to
+    /// contradict. `a_no_op_does_not_pin_the_direction` pins that, so a change
+    /// that quietly restores the old materialising behaviour fails a test
+    /// rather than passing one.
+    ///
+    /// **`Unchanged` is a promise the caller can break, and in debug builds it
+    /// is checked.** A closure that mutates and then reports `Unchanged` would
+    /// discard the mutation silently — no error, no seal, no warning — which is
+    /// the one failure this type cannot prevent by construction, because
+    /// `#[must_use]` catches a dropped answer and not a wrong one. Under
+    /// `debug_assertions` the record is re-encoded and compared, so a lying
+    /// closure fails loudly wherever tests run. Release builds take the caller
+    /// at its word. The check costs a second [`Outbox::encode`] per call in
+    /// debug builds, and a third on the `Changed` path; `RecordKind::Outbox`
+    /// caps at 2 MiB, so a debug-build sweep over a large outbox pays for that
+    /// repeatedly. It is deliberate — this is the method whose callers are
+    /// hardest to audit — but it is not free.
+    ///
+    /// **Migration rides a changing record, not a poll.** [`Outbox::encode`]
+    /// always writes the current magic and write suite, so under the old
+    /// unconditional write *any* tick re-encoded a stale record and carried it
+    /// forward (the read-old-write-new half of ISC-C24). Now only a mutating
+    /// tick does, and a correspondence whose outbox never changes keeps the
+    /// magic and suite it was stored under indefinitely. That is safe while
+    /// [`Outbox::decode`] still accepts them and becomes data loss when one is
+    /// retired, as `OUTBOX_MAGIC_V1` already has been — the record would decode
+    /// no longer and its entries would be unreachable through this method.
+    /// Whatever retires a version owes an explicit migration pass; it can no
+    /// longer assume the sweep performed one.
     pub fn update_outbox<T>(
         &self,
         correspondence: &CorrespondenceLabel,
         direction: Direction,
         now_ms: i64,
-        f: impl FnOnce(&mut Outbox) -> Result<T, DmPersistError>,
+        f: impl FnOnce(&mut Outbox) -> Result<Mutation<T>, DmPersistError>,
     ) -> Result<T, DmPersistError> {
         self.store
             .critical_section(correspondence, |guard| -> Result<T, DmPersistError> {
@@ -433,9 +525,32 @@ impl DmPersist {
                     }
                     None => Outbox::new(direction),
                 };
-                let out = f(&mut outbox)?;
-                guard.replace(RecordKind::Outbox, &outbox.encode())?;
-                Ok(out)
+                // Debug builds hold the before-image so an `Unchanged` report
+                // that is not true fails here rather than silently discarding
+                // the caller's mutation. Release builds take the report at its
+                // word; see this method's docs.
+                #[cfg(debug_assertions)]
+                let before = outbox.encode();
+                match f(&mut outbox)? {
+                    Mutation::Changed(out) => {
+                        guard.replace(RecordKind::Outbox, &outbox.encode())?;
+                        Ok(out)
+                    }
+                    Mutation::Unchanged(out) => {
+                        // `#[cfg]`, not `debug_assert_eq!`: that macro's body is
+                        // type-checked in every profile, so it would demand
+                        // `before` in release builds where the capture above does
+                        // not exist. The attribute removes the statement outright.
+                        #[cfg(debug_assertions)]
+                        assert_eq!(
+                            before,
+                            outbox.encode(),
+                            "an update reported Mutation::Unchanged after changing the outbox; \
+                             the change would have been discarded without a trace"
+                        );
+                        Ok(out)
+                    }
+                }
             })
     }
 
@@ -1113,7 +1228,7 @@ mod tests {
                 now,
                 SealedFrame::new(vec![0xAB; 12]),
             )?;
-            Ok(())
+            Ok(Mutation::Changed(()))
         })
         .expect("updates");
 
@@ -1123,6 +1238,175 @@ mod tests {
         let entry = loaded.entry(4).expect("the entry");
         assert_eq!(entry.composed_at_ms(), now);
         assert_eq!(entry.frame(), Some(&[0xABu8; 12][..]));
+    }
+
+    /// #347: a call that changes nothing spends **no seal**.
+    ///
+    /// The seal is the scarce resource, not the write. #289 measured this
+    /// method's unconditional write as the dominant consumer of the store key's
+    /// nonce budget — five hundred correspondences on a sixty-second tick reach
+    /// 61% of 2^32 in ten years having sent nothing at all.
+    ///
+    /// **Two assertions, and the first is what makes the second mean anything.**
+    /// A real mutation has to move the counter, or "zero seals" is
+    /// indistinguishable from an instrument that never counts. The counter is
+    /// asserted rather than the record's bytes: unchanged bytes imply no seal
+    /// only while the write path is the sole reason bytes could stay put, and a
+    /// skipped write is exactly what is being introduced here.
+    #[test]
+    fn a_no_op_update_spends_no_seal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = persist(tmp.path());
+        let l = label(38);
+        let now = 1_700_000_000_000i64;
+
+        let before_seed = p.store().seal_count();
+        p.update_outbox(&l, Direction::AToB, now, |outbox| {
+            outbox.enqueue_sealed(
+                7,
+                OutboxTarget::ChannelPage,
+                now,
+                SealedFrame::new(vec![0xCD; 12]),
+            )?;
+            Ok(Mutation::Changed(()))
+        })
+        .expect("seeds");
+
+        let after_seed = p.store().seal_count();
+        assert_eq!(
+            after_seed - before_seed,
+            1,
+            "a mutating update must spend exactly one seal. The delta, not \
+             `> 0`, is what makes the rest of this test mean anything: a write \
+             re-added to the record-absent arm would spend its extra seal here, \
+             inside the seed, silently inflating the baseline the no-op below is \
+             compared against — and the probe would pass while carrying the very \
+             regression it exists to catch"
+        );
+
+        p.update_outbox(&l, Direction::AToB, now, |_| Ok(Mutation::Unchanged(())))
+            .expect("updates");
+
+        assert_eq!(
+            p.store().seal_count(),
+            after_seed,
+            "an update that changed nothing must not seal"
+        );
+    }
+
+    /// A no-op call does not pin the direction, because it stores no record.
+    ///
+    /// The mirror of `an_outbox_for_the_other_direction_is_refused`: that pins
+    /// the refusal once an entry exists, this pins that there is nothing to
+    /// refuse before one does. Without it, a change that restored the old
+    /// materialising write would restore the refusal with it and no test would
+    /// notice — the behaviour would silently revert to what #347 removed.
+    #[test]
+    fn a_no_op_does_not_pin_the_direction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = persist(tmp.path());
+        let l = label(39);
+        let now = 1_700_000_000_000i64;
+
+        p.update_outbox(&l, Direction::AToB, now, |_| Ok(Mutation::Unchanged(())))
+            .expect("a no-op against an absent record is not an error");
+
+        assert_eq!(
+            p.store().seal_count(),
+            0,
+            "a no-op against an absent record must not seal"
+        );
+        assert!(
+            p.read_outbox(&l, now).expect("reads").is_none(),
+            "no record was written, so there is none to read"
+        );
+
+        p.update_outbox(&l, Direction::BToA, now, |outbox| {
+            outbox.enqueue_sealed(1, OutboxTarget::ChannelPage, now, SealedFrame::new(vec![7]))?;
+            Ok(Mutation::Changed(()))
+        })
+        .expect("the other direction is accepted: nothing recorded the first");
+
+        let loaded = p.read_outbox(&l, now).expect("reads").expect("present");
+        assert_eq!(loaded.direction(), Direction::BToA);
+    }
+
+    /// A closure that changes the outbox and reports `Unchanged` is caught in
+    /// debug builds rather than silently discarding the change.
+    ///
+    /// This is the one error [`Mutation`] cannot refuse by construction: the
+    /// type forces an answer and cannot force a true one. Without this test the
+    /// check has never executed in either direction, and an assertion nothing
+    /// exercises is indistinguishable from one that cannot fire.
+    #[test]
+    #[should_panic(expected = "reported Mutation::Unchanged after changing the outbox")]
+    #[cfg(debug_assertions)]
+    fn a_lying_unchanged_report_is_caught_in_debug_builds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = persist(tmp.path());
+        let l = label(41);
+        let now = 1_700_000_000_000i64;
+
+        let _ = p.update_outbox(&l, Direction::AToB, now, |outbox| {
+            outbox.enqueue_sealed(
+                1,
+                OutboxTarget::ChannelPage,
+                now,
+                SealedFrame::new(vec![0x22; 8]),
+            )?;
+            // The lie: a real mutation reported as no change at all.
+            Ok(Mutation::Unchanged(()))
+        });
+    }
+
+    /// An empty sweep costs no seal — the composition #347 exists for.
+    ///
+    /// `sweep_give_ups` returning nothing and being reported as `Unchanged` must
+    /// not write. The empty return is covered at unit level and the write is
+    /// covered by the counter; nothing covered the two *together*, which is the
+    /// entire claim of the change.
+    #[test]
+    fn a_sweep_that_gives_up_on_nothing_spends_no_seal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = persist(tmp.path());
+        let l = label(40);
+        let now = 1_700_000_000_000i64;
+
+        p.update_outbox(&l, Direction::AToB, now, |outbox| {
+            outbox.enqueue_sealed(
+                1,
+                OutboxTarget::ChannelPage,
+                now,
+                SealedFrame::new(vec![0x11; 8]),
+            )?;
+            Ok(Mutation::Changed(()))
+        })
+        .expect("seeds");
+        let after_seed = p.store().seal_count();
+
+        // The same instant the entry was composed: nothing is anywhere near its
+        // give-up window, so the empty branch is the one under test.
+        let swept = p
+            .update_outbox(&l, Direction::AToB, now, |outbox| {
+                let given_up = outbox.sweep_give_ups(now);
+                Ok(if given_up.is_empty() {
+                    Mutation::Unchanged(given_up)
+                } else {
+                    Mutation::Changed(given_up)
+                })
+            })
+            .expect("sweeps");
+
+        assert!(
+            swept.is_empty(),
+            "the entry is not past its window; a non-empty sweep here would mean \
+             this test exercised the Changed arm and proved nothing"
+        );
+        assert_eq!(
+            p.store().seal_count(),
+            after_seed,
+            "a sweep that gave up on nothing must not seal"
+        );
     }
 
     /// A correspondence with no outbox reads as `None` rather than as an empty
@@ -1177,10 +1461,17 @@ mod tests {
         let l = label(13);
         let now = 1_700_000_000_000i64;
 
-        p.update_outbox(&l, Direction::AToB, now, |_| Ok(()))
-            .expect("updates");
+        // Seeded with a real entry, not an empty no-op call: since #347 an
+        // `Unchanged` report writes nothing, so a no-op seed would leave no
+        // stored direction for the second call to contradict and the refusal
+        // under test could never fire.
+        p.update_outbox(&l, Direction::AToB, now, |outbox| {
+            outbox.enqueue_sealed(1, OutboxTarget::ChannelPage, now, SealedFrame::new(vec![9]))?;
+            Ok(Mutation::Changed(()))
+        })
+        .expect("updates");
         let err = p
-            .update_outbox(&l, Direction::BToA, now, |_| Ok(()))
+            .update_outbox(&l, Direction::BToA, now, |_| Ok(Mutation::Unchanged(())))
             .expect_err("must refuse");
         match err {
             DmPersistError::OutboxDirectionMismatch { stored, requested } => {
@@ -1202,7 +1493,7 @@ mod tests {
 
         p.update_outbox(&l, Direction::AToB, now, |outbox| {
             outbox.enqueue_sealed(1, OutboxTarget::ChannelPage, now, SealedFrame::new(vec![1]))?;
-            Ok(())
+            Ok(Mutation::Changed(()))
         })
         .expect("updates");
         let before = std::fs::read(record_path(&p, &l, "outbox.bin")).expect("reads");
@@ -1212,7 +1503,7 @@ mod tests {
             // A duplicate: the module's own refusal, raised after a change was
             // already made to the in-memory copy.
             outbox.enqueue_sealed(1, OutboxTarget::ChannelPage, now, SealedFrame::new(vec![3]))?;
-            Ok(())
+            Ok(Mutation::Changed(()))
         });
         assert!(matches!(
             err,
@@ -1248,13 +1539,21 @@ mod tests {
                     composed,
                     SealedFrame::new(vec![0x5A; 8]),
                 )?;
-                Ok(())
+                Ok(Mutation::Changed(()))
             })
             .expect("updates");
 
             let swept = p
                 .update_outbox(&l, Direction::AToB, later, |outbox| {
-                    Ok(outbox.sweep_give_ups(later))
+                    // The shape every sweep caller wants: a tick that gave up on
+                    // nothing reports `Unchanged` and costs no seal, which is
+                    // the whole point of #347.
+                    let given_up = outbox.sweep_give_ups(later);
+                    Ok(if given_up.is_empty() {
+                        Mutation::Unchanged(given_up)
+                    } else {
+                        Mutation::Changed(given_up)
+                    })
                 })
                 .expect("sweeps");
             assert_eq!(swept, vec![1], "the entry was not past its window");

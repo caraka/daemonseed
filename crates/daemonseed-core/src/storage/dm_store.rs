@@ -78,11 +78,11 @@
 //! here and is wrong (#289).** The budget is spent by record writes, and the term
 //! that dominates is not messages at all.
 //!
-//! **Polling is the governing cost.** [`crate::dm::persist::DmPersist::update_outbox`]
-//! writes unconditionally — "a successful call always writes, even if `f` changed
-//! nothing" — so every `sweep_give_ups`, `settle_from_ack` and `channel_torn_down`
-//! poll spends one seal per correspondence per tick, whether or not anything
-//! happened. Over ten years, with no messages sent at all:
+//! **Polling was the governing cost.** [`crate::dm::persist::DmPersist::update_outbox`]
+//! wrote on every successful call, so every `sweep_give_ups`, `settle_from_ack`
+//! and `channel_torn_down` poll spent one seal per correspondence per tick
+//! whether or not anything happened. Over ten years, with no messages sent at
+//! all, that is what an idle correspondence cost:
 //!
 //! | correspondences | sweep tick | seals | of 2^32 |
 //! |---|---|---|---|
@@ -91,9 +91,15 @@
 //! | 500 | 1 h | 43.8 M | 1.0% |
 //! | 50 | 1 h | 4.4 M | 0.1% |
 //!
-//! **So the sweep cadence is a cryptographic parameter, not only a latency knob**,
-//! and it is not yet set — there is no transport driver to set it. Whoever writes
-//! one is choosing a row of that table.
+//! **A poll that changes nothing no longer spends a seal** (#347). The closure
+//! reports [`Mutation::Unchanged`](crate::dm::persist::Mutation) and the write is
+//! skipped, so an idle correspondence pays none of that table and the sweep
+//! cadence is a latency choice again rather than a cryptographic one.
+//!
+//! The table still bounds the *active* case: a correspondence that genuinely
+//! changes on every tick pays exactly these rows, so the cadence is not free —
+//! it is merely no longer charged for doing nothing. The cadence is still unset;
+//! there is no transport driver to set it.
 //!
 //! Messages are the smaller term. An ordinary message costs 4 seals (enqueue,
 //! first emission rewriting outbox and resume, ack settlement) and one never
@@ -153,6 +159,8 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use oxicrypt_aes::{Aes256Key, ModeError};
 use oxicrypt_kdf::HkdfSha384;
@@ -640,6 +648,21 @@ pub struct DmStore {
     /// in order to release. Keying on the label alone would refuse the
     /// legitimate case, which is the case a shared `DmStore` produces.
     held: Mutex<HeldSet>,
+
+    /// How many records this store has sealed. **Test builds only.**
+    ///
+    /// The module header's *"nothing anywhere counts the seals"* stays true of
+    /// the shipped store; this exists so a test can assert a seal *budget*
+    /// directly instead of inferring one from whether a record's bytes changed.
+    ///
+    /// Byte-identity is the tempting proxy and it is a weaker instrument for the
+    /// same question. Every seal draws a fresh random nonce, so unchanged bytes
+    /// do imply no seal happened — but only while the write path is the sole
+    /// reason bytes could stay put. The moment a write is skipped for some
+    /// unrelated reason the proxy passes for the wrong reason, and a write being
+    /// skipped is precisely the change this counter is here to police.
+    #[cfg(test)]
+    seals: AtomicU64,
 }
 
 impl core::fmt::Debug for DmStore {
@@ -677,9 +700,19 @@ impl DmStore {
             root,
             key,
             held: Mutex::new(HeldSet::new()),
+            #[cfg(test)]
+            seals: AtomicU64::new(0),
         };
         store.sweep_orphans()?;
         Ok(store)
+    }
+
+    /// How many records this store has sealed since it was opened. **Test
+    /// builds only** — see the `seals` field for why byte-identity is not an
+    /// adequate substitute.
+    #[cfg(test)]
+    pub(crate) fn seal_count(&self) -> u64 {
+        self.seals.load(Ordering::Relaxed)
     }
 
     /// The root directory.
@@ -1092,7 +1125,13 @@ impl Locked<'_> {
             let outcome = seal_envelope(&self.store.key, &aad, &plain)
                 .map_err(|e| DmStoreError::from_envelope(kind, e));
             plain.zeroize();
-            outcome?
+            let sealed = outcome?;
+            // Counted after the seal succeeded, not before it is attempted: a
+            // failure inside `seal_envelope` draws no nonce, so counting the
+            // attempt would model a budget the failed call never spent.
+            #[cfg(test)]
+            self.store.seals.fetch_add(1, Ordering::Relaxed);
+            sealed
         } else {
             if bytes.len() != kind.capacity() {
                 return Err(DmStoreError::UnsealedPayloadNotExact {

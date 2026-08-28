@@ -2223,10 +2223,13 @@ mod tests {
     /// invalidates the budget without touching the file it lives in. This fails
     /// instead (#289).
     ///
-    /// It is not the *dominant* term: that is the unconditional write in
-    /// [`crate::dm::persist::DmPersist::update_outbox`], which spends a seal per
-    /// correspondence per sweep tick whether or not anything changed. Nothing here
-    /// pins that, because the sweep cadence is not set anywhere yet.
+    /// It was not the *dominant* term while
+    /// [`crate::dm::persist::DmPersist::update_outbox`] wrote on every call,
+    /// spending a seal per correspondence per sweep tick whether or not anything
+    /// changed. That term is gone (#347): a poll that changes nothing reports
+    /// [`Mutation::Unchanged`](crate::dm::persist::Mutation) and writes nothing,
+    /// so the ladder below is the message-side cost on its own. Nothing here pins
+    /// the sweep cadence, which is not set anywhere yet.
     ///
     /// It recomputes rather than restates: asserting `14 == 14` against a literal
     /// would be the same expression twice, which is the defect #305 was about.

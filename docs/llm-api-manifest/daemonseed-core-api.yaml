@@ -1181,7 +1181,15 @@ modules:
       a failed delete returns an error rather than a ratchet, leaving the call a
       safe retry. update_outbox(label, direction, now_ms, f) and
       advance_cursor(label, page, read_through) are read-modify-write inside one
-      critical_section; there is no load-then-save pair to lose an update.
+      critical_section; there is no load-then-save pair to lose an update. f
+      returns Mutation<T>, which is Changed(T) or Unchanged(T) and is must_use;
+      update_outbox writes the record only on Changed. An Unchanged report for a
+      correspondence that has no record writes no record and spends no seal,
+      though taking the lock creates the correspondence directory and its lock
+      file; DmPersistError::OutboxDirectionMismatch therefore arises once an
+      entry has been queued. Debug builds panic when an Unchanged report follows
+      a change to the outbox. A stored record is re-encoded to the current
+      format and write suite only on a Changed write.
       commit_resume(&CorrespondenceLabel, &ResumeRecord) -> Result<Vec<u8>,
       DmPersistError> writes the resume record inside one critical section and
       returns its sealed RE-EST bytes, so the frame is unreachable without a
