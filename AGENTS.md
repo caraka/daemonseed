@@ -50,6 +50,8 @@ So: an idea enters `ROADMAP.md`; if it needs design, it gets a `docs/design/` do
 
 **Cross-references are hard-bounded to repo-canonical artifacts.** An issue, `ROADMAP.md` entry, or `docs/design/` doc may freely cite the repo `ISA.md`'s `ISC-N` / `ISC-A-N` IDs and repo paths/docs — they are permanent, shared, and authoritative. It must **never** cite a contributor's own local / working-draft / PRD language or its private ISC numbering: those are personal scratch, may diverge from the repo, and mean nothing (or mislead) to anyone else. The test: **if a reference resolves inside the repo, it belongs; if it only resolves in someone's local notes, it does not.**
 
+**A reference to a pull request or an issue names which it is:** `PR #385`, `issue #385`. GitHub gives both one number space — `#385` resolves to whichever exists and says nothing about which — so the word is the only thing that tells a reader what they are about to open. Write it with a space: `PR#385` does not autolink, because a word character immediately before `#` stops GitHub creating the reference at all.
+
 ## Branch & merge workflow
 
 Every change lands on `main` through a **pull request** — never a direct push or a local fast-forward to `main`, even for a single-author or trivial change.
