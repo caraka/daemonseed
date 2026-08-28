@@ -403,6 +403,15 @@ mod tests {
 
         // boxed arm — DM.
         assert_zeroize_on_drop::<crate::dm::ack::DmAckSealKey>();
+        // Added with the ack record. Its absence would have been the #314 shape
+        // exactly: `DmAckAddress` exists ONLY to keep this seed — a conversation
+        // write capability derived from `AR` — out of the `Copy` arrays that the
+        // command channel, the scheduler queue and the dispatch frame would each
+        // retain unwiped (#244). Without this line, reverting that address type to
+        // a raw `[u8; 32]` breaks exactly one test, and it breaks as a COMPILE
+        // ERROR rather than as a security assertion — so the property the refactor
+        // was for had no witness at all.
+        assert_zeroize_on_drop::<crate::dm::ack_record::DmAckOwnerSeed>();
         assert_zeroize_on_drop::<crate::dm::doorbell::DmDoorbellOwnerSeed>();
         assert_zeroize_on_drop::<crate::dm::keyrec::DmKeyRecordOwnerSeed>();
         assert_zeroize_on_drop::<crate::dm::paging::DmPageOwnerSeed>();

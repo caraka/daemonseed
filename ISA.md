@@ -681,6 +681,27 @@ route taken to reach a decision are not recorded here — the git history and `C
   mobile, and web, and is the only Rust GUI toolkit with official Android support. The terminal client
   is frozen as a protocol and test harness and is explicitly not a substitute for this commitment.
 
+- **A piggybacked acknowledgement must never move a frame into a different padding bucket, whether
+  or not one is actually present.** The alternative — sizing the bucket off the frame's real encoded
+  length — lets a page co-host read "was an ack piggybacked, and roughly how large" straight off the
+  wire size, which is exactly the information the acknowledgement's own fixed-size DHT record
+  (`ack_record`'s single padding bucket) exists to hide. The frame instead always reserves worst-case
+  ack overhead when choosing its rung, so presence and size of a piggybacked ack are unobservable in
+  the sealed frame's length. The measured cost is that some ack-free messages land in a larger bucket
+  than they need to; this is accepted as the same trade `ack_record`'s own single bucket already
+  makes.
+
+- **The standalone-acknowledgement scheduler bounds any single conversation to at most every other
+  round of the client-global write allowance, rather than pure oldest-first.** Oldest-first alone
+  trusts an unauthenticated, peer-asserted timestamp with no cost to lying about it: a hostile contact
+  claiming a timestamp just inside its own give-up window wins every round indefinitely, starving
+  every other conversation's acknowledgements. The scheduler clamps a claimed timestamp to the give-up
+  floor (claiming further back buys nothing) and skips re-picking the immediately-previous winner
+  unless it is the only candidate, capping one conversation's share at roughly half the allowance.
+  Accepted residual, stated rather than solved further here: a two-identity attacker can still
+  alternate between them to win every round. Closing that needs admission control (limiting how many
+  conversations may compete at all), not a sharper ordering rule, and is not decided by this entry.
+
 ## Changelog
 
 How the understanding of the ideal state has changed. Build history lives in `CHANGELOG.md` and the
@@ -728,6 +749,31 @@ git log; this records only shifts in what "done" means.
 
 Evidence that criteria hold, recorded as current state rather than as history. The mechanized
 authority is `cargo xtask isc-coverage`; this section records what that authority does *not* settle.
+
+**The DM acknowledgement record, its piggyback path, and the standalone-ack cadence policy
+(ISC-C39, ISC-A-C21) are built, unit-tested and mutation-tested in isolation; nothing yet calls
+them in production.** No GUI/TUI wiring exists, and no live loop connects the cadence policy's
+decisions to an actual network write — matching how `PublishDmPage`/`SweepDmPage`/
+`PublishDoorbellEntry` already sit in `daemonseed-veilid-net` with zero front-end callers. The
+criteria these pieces support remain open until that integration lands.
+
+**Felt-tested for real, 2026-08-28: `two_node_dm_ack.rs`'s live oracle passed against the public
+Veilid network on an attach-capable host** — `an_acknowledgement_published_by_one_node_merges_at_the_other`,
+39.12s, collect-with-gaps → publish → fetch from the far end → verify → merge under a ceiling, all
+OK. The record's transport half is now proven over a real network, not merely gate-green; what
+remains open is GUI/TUI production wiring, not the transport primitive itself.
+
+**`two_node_dm_ack.rs` is the live oracle for the record's transport half, matching the sibling it
+was missing next to** (`two_node_dm_key_record.rs`, `two_node_dm_page.rs`, `two_node_doorbell.rs`,
+`two_node_dm_channel.rs`) — one node publishes a gapped acknowledgement, the other fetches,
+verifies, and merges it under both a permissive and a clipping ceiling, plus confirms an unwritten
+record reads `Ok(None)`. `#[ignore]`d for the same reason as its siblings (needs a host that can
+attach to the public Veilid network); two non-ignored companions pin its pure claims so a broken
+fixture is caught without attach access. **`fetch_dm_ack`'s use of `open_or_create` (rather than the
+`open_only` issue #253 introduced for the page sweep) was checked against #253's own reasoning and
+left as built** — #253 draws the line at an *advancing frontier* silently manufacturing empty
+records as a side effect of ordinary cadence; the ack record, like the key record, is one fixed
+address per (conversation, direction), the case #253's own text names as fine to leave alone.
 
 **The gate that runs on every commit.** `cargo fmt --all --check`, `cargo clippy --workspace
 --all-targets -- -D warnings`, `cargo test --workspace`, and `cargo xtask check-proto`, plus the

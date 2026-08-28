@@ -74,6 +74,7 @@ use zeroize::Zeroize;
 use daemonseed_proto::v1 as wire;
 
 use crate::aead_envelope::{EnvelopeError, open_envelope, seal_envelope};
+use crate::dm::ack::{AckError, AckState, PeerAck};
 use crate::dm::firstcontact::{DM_BODY_CAP, RECIPIENT_HASH_LEN, ROOT_LEN, msg_sig_input};
 use crate::dm::paging::PagePosition;
 use crate::dm::ratchet::{Direction, FrameHeader, MessageKey, Outbound};
@@ -94,7 +95,41 @@ pub const FRAME_KIND_CHANNEL: &[u8] = b"msg";
 /// signature, and the larger holds a [`DM_BODY_CAP`] body — see
 /// `worst_case_frame_fits_a_page_subkey`, which pins the whole chain of arithmetic
 /// against the record shape rather than leaving it to comment.
+///
+/// **Which rung a frame lands on is computed as though it carried a saturated
+/// piggybacked acknowledgement, whether or not it carries one** — see
+/// [`WORST_CASE_ACK_FIELDS_LEN`]. Selecting on the real encoded length instead
+/// would make the rung a function of the acknowledgement, and a ladder is a
+/// leak the moment anything a co-host cannot otherwise see can move a frame
+/// between its rungs.
 pub const PAD_BUCKETS: &[usize] = &[8192, 16384];
+
+/// The longest [`AckState::encode_beyond`] output that can exist: the two-byte
+/// run count plus [`crate::dm::ack::MAX_ACK_RUNS`] sixteen-byte runs.
+///
+/// Stated here rather than imported because `ack.rs` keeps its run and count
+/// widths private; `the_worst_case_acknowledgement_overhead_is_pinned` measures a
+/// saturated [`AckState`] against it, so a change to either width fails the build
+/// rather than silently shrinking the constant-overhead reservation below.
+pub const MAX_ACK_BEYOND_LEN: usize = 2 + crate::dm::ack::MAX_ACK_RUNS * 16;
+
+/// Bytes the two acknowledgement fields add to an encoded [`wire::DmChannelBody`]
+/// at their largest: an eleven-byte `ack_high_water` (tag plus a ten-byte varint)
+/// and a 1029-byte `ack_beyond` (tag, two-byte length, [`MAX_ACK_BEYOND_LEN`]).
+///
+/// **Every frame reserves this much regardless of what it actually carries**, and
+/// that reservation is the whole mechanism. `ack_record.rs` pads a standalone
+/// acknowledgement to a single fixed rung for the same reason — a ladder still
+/// leaks a size class — and a piggybacked acknowledgement rides a ladder that
+/// already exists, so the equivalent defence has to be to make the *choice of
+/// rung* independent of the acknowledgement rather than to flatten the ladder.
+///
+/// Without it, a body between roughly 2.5 KB and 3.5 KB lands on the 8192 rung
+/// bare and the 16384 rung with a saturated acknowledgement — an 8 KB difference
+/// on the wire that says whether this reply acknowledged anything and roughly how
+/// many gap-runs it carried. **The cost is honest and is paid by every frame:**
+/// bodies in that band always take the larger rung now, acknowledgement or not.
+pub const WORST_CASE_ACK_FIELDS_LEN: usize = 1040;
 
 /// Largest encoded frame a channel page slot accepts.
 ///
@@ -171,6 +206,13 @@ pub enum DmFrameError {
     /// no runtime check, so naming it here would describe a rejection that never
     /// happens — see [`MAX_FRAME_LEN`].
     TooLarge { got: usize, max: usize },
+    /// The piggybacked acknowledgement did not decode. Carries the cause, the
+    /// same way [`Self::Signing`] does, because there is a real diagnosis here
+    /// rather than a uniform authentication verdict: the seal has already opened
+    /// and `msg_sig` has already verified by the time this can fire, so the
+    /// acknowledgement was written by the peer that holds the message key —
+    /// the same non-conforming-peer class as [`Self::TooLarge`].
+    PiggybackedAck(AckError),
     /// The OS entropy source failed while drawing a nonce.
     EntropySource,
 }
@@ -194,6 +236,9 @@ impl std::fmt::Display for DmFrameError {
                 actual,
             } => write!(f, "{field} must be {expected} bytes, got {actual}"),
             Self::TooLarge { got, max } => write!(f, "frame is {got} bytes, cap is {max}"),
+            Self::PiggybackedAck(e) => {
+                write!(f, "the piggybacked acknowledgement did not decode: {e}")
+            }
             Self::EntropySource => write!(f, "the entropy source failed"),
         }
     }
@@ -239,12 +284,13 @@ pub struct AuthorKeys<'a> {
 ///
 /// The first ten components are [`msg_sig_input`]'s, under this module's frame
 /// kind, so the two frame types share one definition of what an authorship
-/// signature covers. Three more follow, each length-prefixed: the generation, the
-/// chain base, and the generation ciphertext.
+/// signature covers. Five more follow, each length-prefixed: the generation, the
+/// chain base, the generation ciphertext, and the two halves of the piggybacked
+/// acknowledgement.
 ///
-/// Those three are the frozen design's `(ratchet_gen, PN)` header plus § v6 minor
-/// invariant (a). They are already bound in the AAD, so binding them again is
-/// belt-and-braces — but the two bindings answer different questions. The AAD
+/// The first three are the frozen design's `(ratchet_gen, PN)` header plus § v6
+/// minor invariant (a). They are already bound in the AAD, so binding them again
+/// is belt-and-braces — but the two bindings answer different questions. The AAD
 /// proves the header was not edited between sealing and opening; the signature
 /// proves the *sender* chose it, which is what stops a party who holds the message
 /// key (there are only two, but a compromised one is the threat) from re-filing an
@@ -252,6 +298,28 @@ pub struct AuthorKeys<'a> {
 ///
 /// An absent `eph_ct` is bound as a zero-length component rather than skipped, so
 /// "no ciphertext" and "empty ciphertext" cannot produce the same preimage.
+///
+/// ## The acknowledgement's two components, and why they need no signature of
+/// their own
+///
+/// `ack_high_water` and `ack_beyond` are the sender's own collection state riding
+/// out on this message rather than on a standalone acknowledgement record
+/// (`docs/design/direct-messaging.md` § v3 *Ack*: "piggybacks on outbound
+/// messages"). A standalone acknowledgement carries its own ML-DSA signature over
+/// [`crate::dm::ack::ack_sig_input`]; a piggybacked one is inside a body `msg_sig`
+/// already covers end to end, so binding it here **is** its authentication step.
+/// There is deliberately no second signature: one would be a distinct preimage
+/// over the same claim, and two authenticating paths for one statement is exactly
+/// how a claim gets read off the path that was not checked.
+///
+/// An absent `ack_high_water` is bound as a zero-length component rather than
+/// skipped, identically to an absent `eph_ct` — `Some(0)` says sequence zero was
+/// collected and `None` says nothing was, and a preimage that could not tell them
+/// apart would let one be replayed as the other. This mirrors
+/// [`crate::dm::ack::ack_sig_input`], which binds the same distinction the same
+/// way one level down. `ack_beyond` is never absent, only possibly empty, and
+/// [`crate::dm::ack::AckState::encode_beyond`] gives one set exactly one
+/// spelling, so it binds directly.
 #[allow(clippy::too_many_arguments)]
 pub fn frame_sig_input(
     chan_id: &[u8; ROOT_LEN],
@@ -263,6 +331,8 @@ pub fn frame_sig_input(
     author: AuthorKeys<'_>,
     sent_unix_ms: i64,
     body: &str,
+    ack_high_water: Option<u64>,
+    ack_beyond: &[u8],
 ) -> Vec<u8> {
     let mut buf = msg_sig_input(
         FRAME_KIND_CHANNEL,
@@ -279,6 +349,11 @@ pub fn frame_sig_input(
     push_lp(&mut buf, &u64::from(header.generation).to_be_bytes());
     push_lp(&mut buf, &header.chain_base.to_be_bytes());
     push_lp(&mut buf, eph_ct.map_or(&[][..], |ct| &ct[..]));
+    match ack_high_water {
+        Some(h) => push_lp(&mut buf, &h.to_be_bytes()),
+        None => push_lp(&mut buf, &[]),
+    }
+    push_lp(&mut buf, ack_beyond);
     buf
 }
 
@@ -311,6 +386,28 @@ fn aes_key(key: &MessageKey) -> Result<Aes256Key, DmFrameError> {
     Aes256Key::new(key.as_bytes()).map_err(DmFrameError::Module)
 }
 
+/// Bytes the two acknowledgement fields contribute to an encoded body.
+///
+/// Measured by encoding a probe whose every other field is at its protobuf
+/// default — prost omits those entirely, so what is left is exactly the two
+/// fields in question. Deliberately measured with prost's own encoder rather
+/// than computed from tag and varint widths by hand: a hand-rolled size that
+/// disagreed with the encoder would move the padding rung by a byte or two and
+/// reintroduce the very leak the reservation exists to close, silently.
+///
+/// The probe never holds plaintext — `body` and `msg_sig` are empty — so this
+/// costs one small allocation and no second copy of the message (#135).
+fn ack_fields_encoded_len(high_water: Option<u64>, beyond: &[u8]) -> usize {
+    wire::DmChannelBody {
+        sent_unix_ms: 0,
+        body: String::new(),
+        msg_sig: Vec::new(),
+        ack_high_water: high_water,
+        ack_beyond: beyond.to_vec(),
+    }
+    .encoded_len()
+}
+
 fn exact<const N: usize>(field: &'static str, bytes: &[u8]) -> Result<[u8; N], DmFrameError> {
     bytes.try_into().map_err(|_| DmFrameError::FieldLength {
         field,
@@ -337,6 +434,54 @@ fn exact<const N: usize>(field: &'static str, bytes: &[u8]) -> Result<[u8; N], D
 /// makes that a compile error, the same way `ratchet::chain_step` consumes the
 /// chain key it steps. **To retry a write, keep the sealed BYTES and re-emit them
 /// unchanged** — which is what the frozen design's re-seed rule requires anyway.
+///
+/// ## `ack`, and the staleness it accepts
+///
+/// `ack` is the sender's own collection state, riding out with this message
+/// instead of costing a standalone acknowledgement record — the frozen design's
+/// "the high-water rides on any outbound message". `None` composes a frame that
+/// acknowledges nothing, which is what the reconnect legs produce: `RE-EST`,
+/// `RE-ACK` and `RE-CONFIRM` carry no content, so they have nothing to piggyback
+/// on and pay the standalone ack instead.
+///
+/// ## ⚠ Which `AckState` — the directions here are OPPOSITE, and nothing checks
+///
+/// **Pass the state tracking what we have COLLECTED from the peer** — the one
+/// [`crate::dm::collect::Collection`] advances, keyed on the *receiving*
+/// direction ([`crate::dm::ratchet::Ratchet::recv_direction`]). Never the state
+/// tracking which of our own sends the peer has confirmed; that one is the
+/// peer's statement about us, and re-emitting it here would claim to have
+/// collected our own messages.
+///
+/// The trap is that this frame is bound under `outbound.direction`, which is the
+/// direction the *frame* travels — the opposite of the direction the messages it
+/// acknowledges travelled. Every other ack surface in this feature takes `dir`
+/// to mean "the direction of the messages being acknowledged"
+/// ([`crate::dm::ack::ack_sig_input`], [`crate::dm::ack::derive_seal_key`]),
+/// so the meaning inverts exactly once, here, and it inverts silently:
+/// [`AckState`] carries no direction, so **the type system cannot tell the two
+/// apart and neither can a signature**. Passing the wrong one produces a
+/// perfectly valid, correctly signed frame carrying a claim about the wrong half
+/// of the conversation, which the peer would merge against its own outbox and
+/// use to mark messages delivered that were never collected.
+///
+/// This is not a live defect — nothing calls `seal` with a real acknowledgement
+/// yet — but it is unguarded, and the guard belongs on whatever wires the two
+/// together, not here.
+///
+/// **A piggybacked acknowledgement is fixed at compose time and a re-seed does
+/// not refresh it.** The two facts above compose: a re-seed re-emits the sealed
+/// bytes unchanged, so a message still pending a week later carries the
+/// high-water its sender held when it was first composed, not the one it holds
+/// now. That is an accepted residual, not a defect. It is fail-safe in the only
+/// direction that matters — a stale high-water is always *lower* than the
+/// current one, because [`crate::dm::ack::AckState`] never regresses, so it
+/// under-claims and the peer keeps re-seeding a message it has in fact
+/// collected. The cost is a delayed confirmation, paid for by the standalone
+/// ack's own cadence; the alternative — re-sealing to refresh it — would mint a
+/// second authentic frame at one ratchet position, which is exactly what taking
+/// `outbound` by value exists to forbid.
+#[allow(clippy::too_many_arguments)]
 pub fn seal(
     outbound: Outbound,
     chan_id: &[u8; ROOT_LEN],
@@ -345,6 +490,7 @@ pub fn seal(
     recipient_hash: &[u8; RECIPIENT_HASH_LEN],
     sent_unix_ms: i64,
     body: &str,
+    ack: Option<&AckState>,
 ) -> Result<Vec<u8>, DmFrameError> {
     if body.len() > DM_BODY_CAP {
         return Err(DmFrameError::TooLarge {
@@ -352,6 +498,13 @@ pub fn seal(
             max: DM_BODY_CAP,
         });
     }
+
+    // Read once, here, so the bytes signed and the bytes carried are the same
+    // bytes rather than two encodings of one state taken a few lines apart.
+    let (ack_high_water, ack_beyond) = match ack {
+        Some(state) => (state.high_water(), state.encode_beyond()),
+        None => (None, Vec::new()),
+    };
 
     let eph_ct = outbound.eph_ct.as_deref();
     // The preimage embeds the plaintext body verbatim, so it is cleared rather
@@ -369,6 +522,8 @@ pub fn seal(
         },
         sent_unix_ms,
         body,
+        ack_high_water,
+        &ack_beyond,
     );
     let signed = signing_pc.sign(&preimage);
     preimage.zeroize();
@@ -382,14 +537,34 @@ pub fn seal(
         sent_unix_ms,
         body: body.to_owned(),
         msg_sig: msg_sig.to_vec(),
+        ack_high_water,
+        ack_beyond,
     };
     let mut encoded = plain.encode_to_vec();
     plain.body.zeroize();
-    let mut padded =
-        crate::dm::pad_to_bucket(&encoded, PAD_BUCKETS).ok_or(DmFrameError::TooLarge {
-            got: LEN_PREFIX.saturating_add(encoded.len()),
-            max: *PAD_BUCKETS.last().expect("ladder is never empty"),
-        })?;
+
+    // The rung is chosen for the frame this WOULD be if it carried a saturated
+    // acknowledgement, then the real bytes are padded out to it. Selecting on
+    // `encoded.len()` instead would let the acknowledgement decide the rung, and
+    // the ladder would then publish whether one rode along — see
+    // [`WORST_CASE_ACK_FIELDS_LEN`]. The notional length is never below the real
+    // one, because the reservation is the maximum of what the two fields can
+    // occupy, so the chosen rung always holds the actual bytes.
+    let notional = encoded
+        .len()
+        .saturating_sub(ack_fields_encoded_len(ack_high_water, &plain.ack_beyond))
+        .saturating_add(WORST_CASE_ACK_FIELDS_LEN);
+    let too_large = DmFrameError::TooLarge {
+        got: LEN_PREFIX.saturating_add(notional),
+        max: *PAD_BUCKETS.last().expect("ladder is never empty"),
+    };
+    let rung = PAD_BUCKETS
+        .iter()
+        .copied()
+        .find(|b| LEN_PREFIX.saturating_add(notional) <= *b)
+        .ok_or(too_large)?;
+    let mut padded = crate::dm::pad_to_bucket(&encoded, &[rung])
+        .expect("the notional length is never below the real one, so the rung holds it");
     encoded.zeroize();
 
     let sealed = seal_envelope(
@@ -534,10 +709,23 @@ impl ParsedFrame {
             verdict?;
         }
 
+        // Decoded only AFTER the signature verified, deliberately: the ack fields
+        // are inside `msg_sig`'s preimage, so until it verifies they are a claim
+        // by nobody. Decoding first would build a `PeerAck` — the type whose whole
+        // job is to be an unmerged claim — out of unauthenticated bytes.
+        let peer_ack = match piggybacked_ack(&body) {
+            Ok(ack) => ack,
+            Err(e) => {
+                body.body.zeroize();
+                return Err(e);
+            }
+        };
+
         Ok(VerifiedFrame {
             seq: self.header.seq,
             sent_unix_ms: body.sent_unix_ms,
             body: body.body,
+            peer_ack,
         })
     }
 
@@ -571,11 +759,41 @@ impl ParsedFrame {
             author,
             body.sent_unix_ms,
             &body.body,
+            body.ack_high_water,
+            &body.ack_beyond,
         );
         let verified = verify_signature(author.pc, &preimage, &msg_sig);
         preimage.zeroize();
         verified.map_err(|_| DmFrameError::Signature)
     }
+}
+
+/// Read the acknowledgement a verified body piggybacked, if it carried one.
+///
+/// **"Carried one" is `ack_high_water.is_some() || !ack_beyond.is_empty()`**, and
+/// the asymmetry between the two is the encoding's, not a choice made here.
+/// [`AckState::encode_beyond`] always emits at least its two-byte run count, so a
+/// piggybacked acknowledgement of zero runs is `[0, 0]` and only a frame that
+/// piggybacked *nothing* leaves `ack_beyond` empty. An absent prefix, by
+/// contrast, is a real state that a real acknowledgement carries — so both fields
+/// have to be consulted, and the all-default pair is the one shape that means "no
+/// acknowledgement here".
+///
+/// A present prefix with empty run bytes therefore reaches
+/// [`AckState::decode_unvalidated`] and is refused there as malformed, which is
+/// correct: it is a spelling [`AckState::encode_beyond`] cannot produce, and this
+/// module does not invent a second one.
+///
+/// What comes back is a [`PeerAck`] — the peer's claim, checked against nothing
+/// we know. Merging it is [`AckState::merge_peer_ack`]'s job and happens
+/// elsewhere; nothing here can read a settlement verdict off it.
+fn piggybacked_ack(body: &wire::DmChannelBody) -> Result<Option<PeerAck>, DmFrameError> {
+    if body.ack_high_water.is_none() && body.ack_beyond.is_empty() {
+        return Ok(None);
+    }
+    AckState::decode_unvalidated(body.ack_high_water, &body.ack_beyond)
+        .map(Some)
+        .map_err(DmFrameError::PiggybackedAck)
 }
 
 /// Decode the clear half of a frame, gating every length-fixed field.
@@ -609,7 +827,14 @@ pub fn parse(encoded: &[u8]) -> Result<ParsedFrame, DmFrameError> {
 
 /// A frame whose seal opened and whose authorship signature verified. Only
 /// constructible via [`ParsedFrame::open`], so holding one IS the proof.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// **Not `Clone`, `PartialEq` or `Eq`, and that follows from [`Self::peer_ack`]
+/// rather than from a decision taken here.** [`PeerAck`] deliberately carries
+/// none of the three: it is moved into [`AckState::merge_peer_ack`] exactly once,
+/// and equality would let an unmerged claim be read out by bisection against
+/// states the caller builds itself. A frame that owns one cannot hand those back
+/// by derive without reopening the surface `ack.rs` closed.
+#[derive(Debug)]
 pub struct VerifiedFrame {
     /// The position it occupies. Taken from the header rather than the body, and
     /// checked against the slot the frame was read from — both facts, not one.
@@ -618,6 +843,21 @@ pub struct VerifiedFrame {
     pub sent_unix_ms: i64,
     /// The message.
     pub body: String,
+    /// The sender's own collection state, if this message piggybacked it —
+    /// `None` when the frame acknowledged nothing.
+    ///
+    /// **A claim, not a verdict.** It is authenticated: the two fields it was
+    /// decoded from are inside `msg_sig`'s preimage, so holding this frame proves
+    /// the sender wrote this acknowledgement, exactly as it proves the sender
+    /// wrote the body. What it is *not* is checked against what we have actually
+    /// sent — [`PeerAck`] has no settlement query surface for precisely that
+    /// reason, and the ceiling lives on [`AckState::merge_peer_ack`], which
+    /// consumes this by value. A piggybacked acknowledgement therefore takes the
+    /// identical decode → verify → merge path a standalone
+    /// [`crate::dm::ack_record`] one takes; only the *verify* step differs, and
+    /// only in what authenticates it — this frame's `msg_sig` rather than a
+    /// second signature of the acknowledgement's own.
+    pub peer_ack: Option<PeerAck>,
 }
 
 #[cfg(test)]
@@ -653,6 +893,62 @@ mod tests {
 
     /// An edit applied to an encoded frame before it is re-parsed and attacked.
     type Mutation = Box<dyn Fn(&mut wire::DmChannelFrame)>;
+
+    /// The same, one layer in: an edit applied to a decoded body before it is
+    /// re-sealed under the honest key, which is the only way to reach a field
+    /// that lives inside the seal.
+    type BodyMutation = Box<dyn Fn(&mut wire::DmChannelBody)>;
+
+    /// An acknowledgement of two collected positions, ten apart, so the encoded
+    /// run set is short but neither half of it is a default value.
+    fn small_ack() -> AckState {
+        let mut ack = AckState::new();
+        ack.collect(0).unwrap();
+        ack.collect(10).unwrap();
+        ack
+    }
+
+    /// An acknowledgement with settled positions but NO contiguous prefix:
+    /// `high_water() == None`, two runs beyond it.
+    ///
+    /// The shape a receiver reaches when the head of the conversation is lost —
+    /// sequences 0..=3 never arrived, 4, 5 and 9 did — which is the case the runs
+    /// encoding exists for. Every other fixture here collects zero first, so
+    /// without this one nothing on the real `seal → parse → open` path ever
+    /// carries an absent prefix, and the `is_some() || !is_empty()` presence test
+    /// is exercised only through the private helper.
+    fn headless_ack() -> AckState {
+        let mut ack = AckState::new();
+        ack.collect(4).unwrap();
+        ack.collect(5).unwrap();
+        ack.collect(9).unwrap();
+        assert_eq!(ack.high_water(), None, "the fixture must have no prefix");
+        assert_eq!(ack.runs(), 2, "4..=5 and 9..=9");
+        ack
+    }
+
+    /// The largest acknowledgement [`AckState`] will carry: a prefix, plus
+    /// [`crate::dm::ack::MAX_ACK_RUNS`] runs beyond it.
+    ///
+    /// Even sequences from 2 upwards, so every run is a single position with one
+    /// unsettled position between it and its neighbour — the shape that packs the
+    /// most runs into the fewest sequence numbers. Sequence 0 is collected first
+    /// so the prefix is `Some(0)` rather than absent, and 1 is left out so the
+    /// prefix cannot swallow the rest.
+    fn maximal_ack() -> AckState {
+        let mut ack = AckState::new();
+        ack.collect(0).unwrap();
+        for i in 0..crate::dm::ack::MAX_ACK_RUNS as u64 {
+            ack.collect(2 + i * 2).unwrap();
+        }
+        assert_eq!(
+            ack.runs(),
+            crate::dm::ack::MAX_ACK_RUNS,
+            "the fixture must be saturated, or it measures a smaller worst case \
+             than the one that can actually be sealed"
+        );
+        ack
+    }
 
     fn header() -> FrameHeader {
         FrameHeader {
@@ -737,6 +1033,12 @@ mod tests {
         /// Attacks on the seal want the honest key in hand, so that "the AAD
         /// rejected it" is not conflated with "the ratchet refused the position".
         fn send_keyed(&mut self, body: &str) -> (Vec<u8>, MessageKey) {
+            self.send_acked(body, None)
+        }
+
+        /// As [`Self::send_keyed`], with an acknowledgement piggybacked on the
+        /// message.
+        fn send_acked(&mut self, body: &str, ack: Option<&AckState>) -> (Vec<u8>, MessageKey) {
             let out = self.init.send_next().unwrap();
             let key = out.key.clone();
             let bytes = seal(
@@ -747,6 +1049,7 @@ mod tests {
                 &recipient_hash(self.b.signing.public_key()).unwrap(),
                 SENT,
                 body,
+                ack,
             )
             .unwrap();
             (bytes, key)
@@ -806,9 +1109,35 @@ mod tests {
             },
             0x0a0b_0c0d_0e0f_1011,
             "ab",
+            Some(KAT_ACK_HIGH_WATER),
+            KAT_ACK_BEYOND,
         ))
         .unwrap();
         assert_eq!(hex::encode(sig_input), SIG_INPUT_KAT);
+
+        // The same preimage with NO acknowledgement piggybacked. Pinned
+        // separately because the vector above cannot witness it: a build that
+        // dropped the two ack components entirely would move that hash, but so
+        // would any other change to them, and the no-ack shape is the one every
+        // frame composed before this field existed produced.
+        let no_ack = sha384(&frame_sig_input(
+            &[1u8; ROOT_LEN],
+            Direction::AToB,
+            &header(),
+            &eph_ek,
+            Some(&ct),
+            &[2u8; RECIPIENT_HASH_LEN],
+            AuthorKeys {
+                pc: a.signing.public_key(),
+                lt: b.signing.public_key(),
+            },
+            0x0a0b_0c0d_0e0f_1011,
+            "ab",
+            None,
+            &[],
+        ))
+        .unwrap();
+        assert_eq!(hex::encode(no_ack), SIG_INPUT_NO_ACK_KAT);
 
         let aad = sha384(&frame_aad(
             &[1u8; ROOT_LEN],
@@ -836,38 +1165,44 @@ mod tests {
         // zero-LENGTH component, not an omitted one. Skipping it entirely would
         // leave both KATs above unchanged (they cover the present case), so
         // without this the documented rule is asserted in prose and nowhere else.
-        let absent = frame_sig_input(
-            &[1u8; ROOT_LEN],
-            Direction::AToB,
-            &header(),
-            &eph_ek,
-            None,
-            &[2u8; RECIPIENT_HASH_LEN],
-            AuthorKeys {
-                pc: a.signing.public_key(),
-                lt: b.signing.public_key(),
-            },
-            0x0a0b_0c0d_0e0f_1011,
-            "ab",
+        //
+        // The ack components deliberately ride along here and are non-empty, so
+        // the ciphertext's own component is no longer the last thing in the
+        // buffer and the tail has to be stripped before it can be examined. That
+        // is the point: an `ends_with` on the whole preimage would now be
+        // satisfied by the acknowledgement's bytes and would pin nothing.
+        let sig_with_ack = |eph_ct| {
+            frame_sig_input(
+                &[1u8; ROOT_LEN],
+                Direction::AToB,
+                &header(),
+                &eph_ek,
+                eph_ct,
+                &[2u8; RECIPIENT_HASH_LEN],
+                AuthorKeys {
+                    pc: a.signing.public_key(),
+                    lt: b.signing.public_key(),
+                },
+                0x0a0b_0c0d_0e0f_1011,
+                "ab",
+                Some(KAT_ACK_HIGH_WATER),
+                KAT_ACK_BEYOND,
+            )
+        };
+        let mut ack_tail = Vec::new();
+        push_lp(&mut ack_tail, &KAT_ACK_HIGH_WATER.to_be_bytes());
+        push_lp(&mut ack_tail, KAT_ACK_BEYOND);
+
+        let absent = sig_with_ack(None);
+        assert!(
+            absent.ends_with(&ack_tail),
+            "the acknowledgement must be the last two components"
         );
         assert!(
-            absent.ends_with(&0u64.to_be_bytes()),
+            absent[..absent.len() - ack_tail.len()].ends_with(&0u64.to_be_bytes()),
             "an absent generation ciphertext must be bound as lp(&[])"
         );
-        let present = frame_sig_input(
-            &[1u8; ROOT_LEN],
-            Direction::AToB,
-            &header(),
-            &eph_ek,
-            Some(&ct),
-            &[2u8; RECIPIENT_HASH_LEN],
-            AuthorKeys {
-                pc: a.signing.public_key(),
-                lt: b.signing.public_key(),
-            },
-            0x0a0b_0c0d_0e0f_1011,
-            "ab",
-        );
+        let present = sig_with_ack(Some(&ct));
         assert_eq!(
             present.len(),
             absent.len() + ml_kem::CT_LEN,
@@ -876,9 +1211,18 @@ mod tests {
         );
     }
 
+    /// A high-water and a run encoding with distinct bytes in every position, so
+    /// the known-answer vector above cannot survive an endianness flip in either.
+    const KAT_ACK_HIGH_WATER: u64 = 0x3132_3334_3536_3738;
+    const KAT_ACK_BEYOND: &[u8] = &[0x41, 0x42, 0x43, 0x44];
+
     const SIG_INPUT_KAT: &str = concat!(
-        "21cbde75de754e9805d2f1d2b344f620ace1269d8d29cc706cb2e439",
-        "9dd3d6d36b7c2bd0d2765eff1a9b9695498a48d3"
+        "49d4909b3af9bdf995742112636baa7cf92956aee7e894e3e2fb0c4f",
+        "0808f3fc9ec9f30e4f9a6e9323580b72facdb2f5"
+    );
+    const SIG_INPUT_NO_ACK_KAT: &str = concat!(
+        "1e2adf8c2d46ebcd63ce48c6e8b8dac21f0ca2988952eec702fef077",
+        "2fe04a78978d130b5f5684bc38143f00e5eddaaf"
     );
     const AAD_KAT: &str = concat!(
         "f91604db3477d2929f2e3107db4a5b65297ff2eb035cd8912a806dfe",
@@ -903,6 +1247,11 @@ mod tests {
         // Keeps `pc` and `lt` as separate parameters here deliberately: this test
         // exists to prove they are NOT interchangeable in the preimage, which
         // `AuthorKeys` would hide behind a field name.
+        //
+        // The piggybacked acknowledgement is held FIXED here and varied by
+        // `sig_ack` below instead: every assertion in this block is about some
+        // other field being bound independently, and a fixed non-empty ack is
+        // what keeps each of them honest about the components that follow it.
         let sig =
             |dir, hdr: &FrameHeader, ek: &[u8; ml_kem::EK_LEN], ct, rcpt, pc, lt, ms, body| {
                 frame_sig_input(
@@ -915,8 +1264,28 @@ mod tests {
                     AuthorKeys { pc, lt },
                     ms,
                     body,
+                    Some(KAT_ACK_HIGH_WATER),
+                    KAT_ACK_BEYOND,
                 )
             };
+        let sig_ack = |hw, beyond: &[u8]| {
+            frame_sig_input(
+                &[1u8; ROOT_LEN],
+                Direction::AToB,
+                &h,
+                &ek1,
+                Some(&ct),
+                &[2u8; RECIPIENT_HASH_LEN],
+                AuthorKeys {
+                    pc: a.signing.public_key(),
+                    lt: b.signing.public_key(),
+                },
+                SENT,
+                "hello",
+                hw,
+                beyond,
+            )
+        };
         let base = sig(
             Direction::AToB,
             &h,
@@ -1100,7 +1469,48 @@ mod tests {
             )
         );
 
-        // The AAD must separate the same way.
+        // The piggybacked acknowledgement, both halves. `base` carries
+        // `(Some(KAT_ACK_HIGH_WATER), KAT_ACK_BEYOND)`, so each of these is one
+        // component moved and nothing else.
+        assert_eq!(
+            base,
+            sig_ack(Some(KAT_ACK_HIGH_WATER), KAT_ACK_BEYOND),
+            "the control: `sig_ack`'s fixed arguments must reproduce `base`, or \
+             every assertion below it is comparing two unrelated preimages"
+        );
+        assert_ne!(
+            base,
+            sig_ack(Some(KAT_ACK_HIGH_WATER + 1), KAT_ACK_BEYOND),
+            "the acknowledged prefix must be bound"
+        );
+        assert_ne!(
+            base,
+            sig_ack(Some(KAT_ACK_HIGH_WATER), &[0x41, 0x42, 0x43, 0x45]),
+            "the acknowledged runs must be bound"
+        );
+        assert_ne!(
+            base,
+            sig_ack(None, KAT_ACK_BEYOND),
+            "an absent prefix must not bind as the prefix it happened to follow"
+        );
+        assert_ne!(
+            sig_ack(None, KAT_ACK_BEYOND),
+            sig_ack(Some(0), KAT_ACK_BEYOND),
+            "`None` says nothing was collected and `Some(0)` says sequence zero \
+             was — a preimage that could not tell them apart would let one be \
+             replayed as the other"
+        );
+        // The two halves must not be able to trade bytes with each other: a
+        // preimage that concatenated them without length prefixes would let a
+        // prefix's trailing byte be read as the run set's leading one.
+        assert_ne!(
+            sig_ack(Some(0x0000_0000_0000_0041), &[0x42, 0x43, 0x44]),
+            sig_ack(Some(0), &[0x41, 0x42, 0x43, 0x44]),
+        );
+
+        // The AAD must separate the same way. The acknowledgement is NOT in it —
+        // it rides inside the sealed body, which the AAD covers wholesale — so
+        // there is deliberately no ack case here.
         let aad = frame_aad(&[1u8; ROOT_LEN], Direction::AToB, &h, &ek1, Some(&ct));
         assert_ne!(
             aad,
@@ -1155,6 +1565,8 @@ mod tests {
             },
             SENT,
             "hi",
+            None,
+            &[],
         );
         assert_ne!(fc, channel);
         assert!(
@@ -1200,6 +1612,7 @@ mod tests {
             &rcpt_a,
             SENT,
             "hi back",
+            None,
         )
         .unwrap();
 
@@ -1273,6 +1686,7 @@ mod tests {
             &rcpt_a,
             SENT,
             "hi back",
+            None,
         )
         .unwrap();
 
@@ -1490,6 +1904,10 @@ mod tests {
             out.eph_ct.is_some(),
             "the worst case must include a generation ciphertext"
         );
+        // ...and a MAXIMAL piggybacked acknowledgement, for the same reason: a
+        // frame that carried none would under-count by the full 1026-byte run
+        // set plus its prefix, and the constant below is what storage capacities
+        // are sized against.
         let worst = seal(
             out,
             &[1u8; ROOT_LEN],
@@ -1498,6 +1916,7 @@ mod tests {
             &recipient_hash(p.a.signing.public_key()).unwrap(),
             SENT,
             &"x".repeat(DM_BODY_CAP),
+            Some(&maximal_ack()),
         )
         .unwrap();
         assert!(
@@ -1554,12 +1973,16 @@ mod tests {
                 },
                 SENT,
                 &body,
+                None,
+                &[],
             ))
             .unwrap();
         let encoded = wire::DmChannelBody {
             sent_unix_ms: SENT,
             body: body.clone(),
             msg_sig: msg_sig.to_vec(),
+            ack_high_water: None,
+            ack_beyond: Vec::new(),
         }
         .encode_to_vec();
         let padded = crate::dm::pad_to_bucket(&encoded, PAD_BUCKETS).unwrap();
@@ -1766,6 +2189,7 @@ mod tests {
             &recipient_hash(p.b.signing.public_key()).unwrap(),
             SENT,
             &"x".repeat(DM_BODY_CAP + 1),
+            None,
         );
         assert!(matches!(err, Err(DmFrameError::TooLarge { .. })));
     }
@@ -1811,5 +2235,468 @@ mod tests {
         assert!(parsed.eph_ct().is_none());
         assert_eq!(parsed.header().generation, 0);
         assert!(p.recv(&bytes).is_ok());
+    }
+
+    /// The piggyback path end to end: an acknowledgement composed into an
+    /// outbound message comes back out of the opened frame as the same claim,
+    /// and the frame's own signature is what authenticated it.
+    ///
+    /// The round trip is asserted through `sig_input` rather than through a
+    /// merge, because a merge would answer from *our* state and could pass on a
+    /// `PeerAck` carrying something else entirely. `sig_input` is a pure function
+    /// of what the peer actually stated, so comparing it against the preimage the
+    /// sender's own state produces pins the statement itself.
+    #[test]
+    fn an_acknowledgement_piggybacked_on_a_message_round_trips() {
+        let mut p = pair();
+        let sent = small_ack();
+        let (bytes, _) = p.send_acked("with an ack", Some(&sent));
+
+        let got = p.recv(&bytes).unwrap();
+        assert_eq!(got.body, "with an ack");
+        let peer = got.peer_ack.expect("the frame carried an acknowledgement");
+        assert_eq!(
+            peer.sig_input(&[1u8; ROOT_LEN], Direction::AToB),
+            crate::dm::ack::ack_sig_input(&[1u8; ROOT_LEN], Direction::AToB, &sent),
+            "the decoded claim must be the state the sender composed"
+        );
+
+        // And it is still only a claim: merging is what bounds it, and that
+        // happens here rather than anywhere inside this module.
+        let mut ours = AckState::new();
+        assert_eq!(
+            ours.merge_peer_ack(peer, Some(10)).unwrap(),
+            crate::dm::ack::PeerAckOutcome::WithinCeiling
+        );
+        assert!(ours.is_settled(0));
+        assert!(ours.is_settled(10));
+        assert!(!ours.is_settled(5));
+    }
+
+    /// A message that piggybacks nothing round-trips with the field absent, and
+    /// the two wire fields stay at their defaults — so a frame composed before
+    /// this feature existed parses identically to one composed after it.
+    #[test]
+    fn a_message_without_an_acknowledgement_round_trips_with_the_field_absent() {
+        let mut p = pair();
+        let (bytes, key) = p.send_keyed("no ack");
+
+        let parsed = parse(&bytes).unwrap();
+        let rcpt = recipient_hash(p.b.signing.public_key()).unwrap();
+        let author = AuthorKeys {
+            pc: p.a_pc.signing.public_key(),
+            lt: p.a.signing.public_key(),
+        };
+        let dir = p.recip.recv_direction();
+        let at = position_of(parsed.header().seq);
+        let got = parsed
+            .open(&key, &[1u8; ROOT_LEN], dir, at, &rcpt, author)
+            .unwrap();
+        assert_eq!(got.body, "no ack");
+        assert!(
+            got.peer_ack.is_none(),
+            "a frame that acknowledged nothing must not manufacture a claim"
+        );
+
+        // The wire fields themselves, read out of the opened body: both at their
+        // protobuf defaults, which is what makes the pair unambiguous as "no
+        // acknowledgement here".
+        let plaintext = open_envelope(
+            &aes_key(&key).unwrap(),
+            &frame_aad(
+                &[1u8; ROOT_LEN],
+                dir,
+                parsed.header(),
+                parsed.eph_ek(),
+                parsed.eph_ct(),
+            ),
+            &parsed.sealed,
+        )
+        .unwrap();
+        let body = wire::DmChannelBody::decode(crate::dm::unpad(&plaintext).unwrap()).unwrap();
+        assert_eq!(body.ack_high_water, None);
+        assert!(body.ack_beyond.is_empty());
+    }
+
+    /// Both acknowledgement fields are inside `msg_sig`'s preimage, so editing
+    /// either one after sealing invalidates the signature.
+    ///
+    /// Attacked from INSIDE the seal, the way `the_authorship_signature_is_...`
+    /// does not need to: these fields live in the sealed body, so an attacker
+    /// without the message key cannot reach them at all. The mutation therefore
+    /// has to be performed by a party that holds the key — which is exactly the
+    /// threat `msg_sig` exists for, a compromised peer re-filing an authentic
+    /// body with a claim it did not sign.
+    #[test]
+    fn editing_a_piggybacked_acknowledgement_breaks_the_signature() {
+        let mut p = pair();
+        let out = p.init.send_next().unwrap();
+        let key = out.key.clone();
+        let dir = out.direction;
+        let header = out.header;
+        let eph_ek = out.eph_ek.clone();
+        let seq = out.header.seq;
+        let rcpt = recipient_hash(p.b.signing.public_key()).unwrap();
+        let author = AuthorKeys {
+            pc: p.a_pc.signing.public_key(),
+            lt: p.a.signing.public_key(),
+        };
+        let sent = small_ack();
+
+        let bytes = seal(
+            out,
+            &[1u8; ROOT_LEN],
+            &p.a_pc.signing,
+            p.a.signing.public_key(),
+            &rcpt,
+            SENT,
+            "signed ack",
+            Some(&sent),
+        )
+        .unwrap();
+
+        // The control: untouched, it opens and verifies.
+        let honest = parse(&bytes).unwrap();
+        assert!(
+            honest
+                .open(&key, &[1u8; ROOT_LEN], dir, position_of(seq), &rcpt, author)
+                .is_ok(),
+            "the honest frame must open, or every mutation below proves nothing"
+        );
+
+        // Re-seal the SAME body with one acknowledgement field edited and the
+        // original signature kept. Everything else — key, AAD, header, padding —
+        // is identical, so only the signature can reject it.
+        //
+        // The first row changes NOTHING and expects `Ok`. It is not decoration:
+        // the two real mutations run through
+        // `open_envelope → decode → mutate → encode → pad_to_bucket →
+        // seal_envelope → parse`, and if that pipeline ever stopped reproducing a
+        // valid frame — a padding change, a re-encode that dropped a field — both
+        // of them would still report `Signature` and this test would pass while
+        // proving nothing. The identity row fails in exactly that case, and only
+        // in that case. The `honest.open` control above cannot do this job: it
+        // reads the ORIGINAL bytes and never enters the pipeline at all.
+        let mutations: Vec<(&str, BodyMutation, bool)> = vec![
+            (
+                "IDENTITY-CONTROL (nothing edited)",
+                Box::new(|_: &mut wire::DmChannelBody| {}),
+                true,
+            ),
+            (
+                "ack_high_water",
+                Box::new(|b: &mut wire::DmChannelBody| {
+                    b.ack_high_water = Some(b.ack_high_water.unwrap() + 1)
+                }),
+                false,
+            ),
+            (
+                "ack_beyond",
+                Box::new(|b: &mut wire::DmChannelBody| {
+                    let last = b.ack_beyond.len() - 1;
+                    b.ack_beyond[last] ^= 0x01;
+                }),
+                false,
+            ),
+        ];
+
+        for (field, mutate, must_open) in mutations {
+            let plaintext = open_envelope(
+                &aes_key(&key).unwrap(),
+                &frame_aad(&[1u8; ROOT_LEN], dir, &header, &eph_ek, None),
+                &honest.sealed,
+            )
+            .unwrap();
+            let mut body =
+                wire::DmChannelBody::decode(crate::dm::unpad(&plaintext).unwrap()).unwrap();
+            mutate(&mut body);
+            let padded = crate::dm::pad_to_bucket(&body.encode_to_vec(), PAD_BUCKETS).unwrap();
+            let sealed = seal_envelope(
+                &aes_key(&key).unwrap(),
+                &frame_aad(&[1u8; ROOT_LEN], dir, &header, &eph_ek, None),
+                &padded,
+            )
+            .unwrap();
+            let tampered = parse(
+                &wire::DmChannelFrame {
+                    ratchet_gen: header.generation,
+                    chain_base: header.chain_base,
+                    seq: header.seq,
+                    eph_ek: eph_ek.to_vec(),
+                    eph_ct: Vec::new(),
+                    sealed,
+                }
+                .encode_to_vec(),
+            )
+            .unwrap();
+
+            let outcome =
+                tampered.open(&key, &[1u8; ROOT_LEN], dir, position_of(seq), &rcpt, author);
+            if must_open {
+                assert!(
+                    outcome.is_ok(),
+                    "{field}: the re-seal pipeline must itself reproduce a VALID \
+                     frame, or the mutations below reject for the wrong reason \
+                     and this test goes vacuous — got {:?}",
+                    outcome.err()
+                );
+            } else {
+                assert!(
+                    matches!(outcome, Err(DmFrameError::Signature)),
+                    "editing {field} must break the authorship signature"
+                );
+            }
+        }
+    }
+
+    /// One level up from `ack.rs`'s own
+    /// `an_absent_prefix_is_distinguishable_from_a_prefix_of_zero`: the frame
+    /// preimage must carry the same distinction, or a message acknowledging
+    /// nothing and a message acknowledging sequence zero sign the same bytes.
+    #[test]
+    fn an_absent_ack_high_water_is_distinguishable_from_a_prefix_of_zero() {
+        let a = alice();
+        let b = bob();
+        let (ek, _) = eph_keypair(5, 6);
+
+        let sig = |hw| {
+            frame_sig_input(
+                &[1u8; ROOT_LEN],
+                Direction::AToB,
+                &header(),
+                &ek,
+                None,
+                &[2u8; RECIPIENT_HASH_LEN],
+                AuthorKeys {
+                    pc: a.signing.public_key(),
+                    lt: b.signing.public_key(),
+                },
+                SENT,
+                "hi",
+                hw,
+                // A real encoding of zero runs, so the two cases differ only in
+                // the prefix — `encode_beyond` never yields empty bytes.
+                &[0, 0],
+            )
+        };
+        assert_ne!(sig(None), sig(Some(0)));
+        // Structurally too: `None` is a zero-LENGTH component, so it is eight
+        // bytes shorter than any present prefix rather than an omitted one.
+        assert_eq!(sig(Some(0)).len(), sig(None).len() + 8);
+    }
+
+    /// The wire pair that means "no acknowledgement" is `(None, empty)` and
+    /// nothing else — and a present prefix with no run bytes is refused rather
+    /// than read as a prefix-only acknowledgement.
+    ///
+    /// This is the one asymmetry in the encoding worth pinning: an absent prefix
+    /// is a real state a real acknowledgement carries, but empty run bytes are
+    /// not — [`AckState::encode_beyond`] always emits its two-byte count. So the
+    /// "is there an ack here" test cannot be either field alone.
+    #[test]
+    fn the_absence_of_a_piggybacked_acknowledgement_is_the_default_pair_only() {
+        let body = |ack_high_water, ack_beyond: &[u8]| wire::DmChannelBody {
+            sent_unix_ms: SENT,
+            body: String::new(),
+            msg_sig: Vec::new(),
+            ack_high_water,
+            ack_beyond: ack_beyond.to_vec(),
+        };
+
+        assert!(piggybacked_ack(&body(None, &[])).unwrap().is_none());
+        // Zero runs and no prefix is a real acknowledgement — it says "nothing
+        // collected yet" — and it is NOT the absent pair.
+        assert!(piggybacked_ack(&body(None, &[0, 0])).unwrap().is_some());
+        assert!(piggybacked_ack(&body(Some(4), &[0, 0])).unwrap().is_some());
+        // A prefix with no run bytes is a spelling `encode_beyond` cannot
+        // produce, so it is refused rather than silently completed.
+        assert!(matches!(
+            piggybacked_ack(&body(Some(4), &[])),
+            Err(DmFrameError::PiggybackedAck(
+                crate::dm::ack::AckError::Malformed
+            ))
+        ));
+    }
+
+    /// [`WORST_CASE_ACK_FIELDS_LEN`] and [`MAX_ACK_BEYOND_LEN`] are measured, not
+    /// asserted: a saturated [`AckState`] is encoded and its two wire fields are
+    /// sized with prost's own encoder.
+    ///
+    /// Both constants size the padding reservation, so a change to `ack.rs`'s run
+    /// width, run count or encoding that shrank either one would silently narrow
+    /// the reservation and reopen the size-class leak. It fails here instead.
+    #[test]
+    fn the_worst_case_acknowledgement_overhead_is_pinned() {
+        assert_eq!(
+            maximal_ack().encode_beyond().len(),
+            MAX_ACK_BEYOND_LEN,
+            "a saturated run set must be exactly the reserved length"
+        );
+        assert_eq!(
+            ack_fields_encoded_len(Some(u64::MAX), &vec![0xff; MAX_ACK_BEYOND_LEN]),
+            WORST_CASE_ACK_FIELDS_LEN,
+            "the reservation must be the largest the two fields can encode to"
+        );
+        // No acknowledgement contributes nothing, which is what makes the probe a
+        // measurement of the two fields rather than of a body.
+        assert_eq!(ack_fields_encoded_len(None, &[]), 0);
+        // And nothing real can exceed the reservation — the property the
+        // `saturating_sub`/`saturating_add` in `seal` relies on.
+        for ack in [small_ack(), headless_ack(), maximal_ack()] {
+            assert!(
+                ack_fields_encoded_len(ack.high_water(), &ack.encode_beyond())
+                    <= WORST_CASE_ACK_FIELDS_LEN
+            );
+        }
+    }
+
+    /// **The padding rung must not depend on the acknowledgement**, swept across
+    /// both bucket boundaries rather than sampled at one convenient length.
+    ///
+    /// A single short body cannot witness this: it sits far below the 8192 rung's
+    /// edge, so a saturated acknowledgement does not push it over and the test
+    /// passes against a build that selects the rung from the real encoded length.
+    /// The band that matters is where the reservation straddles a boundary —
+    /// around 2.5–3.5 KB for the 8192 rung — and the sweep below covers it a byte
+    /// at a time at the crossover, plus the approach to the top rung.
+    ///
+    /// What this defends is the same thing `ack_record.rs`'s single fixed rung
+    /// defends: a ladder publishes a size class, and if an acknowledgement can
+    /// move a frame between rungs then the ladder publishes whether a reply
+    /// acknowledged anything and roughly how many gaps it carried.
+    #[test]
+    fn the_padding_rung_never_depends_on_the_piggybacked_acknowledgement() {
+        let saturated = maximal_ack();
+        // The rungs are classified by the frame lengths actually observed, never
+        // by comparing a FRAME length against a PAD_BUCKETS value: those are
+        // different quantities. A frame carries the padded plaintext plus a
+        // nonce, a tag, a 1568-byte `eph_ek` and the clear header, so every frame
+        // on the lower rung is already longer than `PAD_BUCKETS[0]` and a
+        // threshold test against it silently classifies all of them as upper.
+        let mut observed = std::collections::BTreeSet::new();
+
+        // The band where the reservation straddles the 8192 rung's edge: a bare
+        // body of ~2400 still fits it, one of ~3700 does not once the 1040-byte
+        // reservation is added. That is the whole crossover — a 4627-byte
+        // signature plus [`DM_BODY_CAP`] cannot reach the 16384 rung's own edge,
+        // so there is no second boundary to sweep.
+        //
+        // Every length is sealed from a FRESH pair, so both frames sit at the
+        // same low sequence numbers. Reusing one pair would walk `seq` across a
+        // varint width boundary mid-sweep and change the CLEAR frame's length for
+        // reasons that have nothing to do with padding.
+        let lengths = (2400..=3700)
+            .step_by(16)
+            .chain([1, 2, DM_BODY_CAP - 1, DM_BODY_CAP]);
+
+        for len in lengths {
+            let body = "x".repeat(len);
+            let mut p = pair();
+            let bare = p.send(&body);
+            let (acked, _) = p.send_acked(&body, Some(&saturated));
+            assert_eq!(
+                bare.len(),
+                acked.len(),
+                "a {len}-byte body took a different padding rung depending on \
+                 whether it piggybacked an acknowledgement — the ladder is \
+                 leaking the acknowledgement"
+            );
+            observed.insert(bare.len());
+        }
+
+        // The control on the sweep itself. Inside a single rung the assertion
+        // above holds however the rung is chosen, so a sweep that never crossed a
+        // boundary would pass against the very defect it exists to catch. Two
+        // distinct frame lengths IS the crossing, and there are exactly two
+        // because `PAD_BUCKETS` has two rungs.
+        assert_eq!(
+            observed.len(),
+            2,
+            "the sweep must span a rung boundary — it saw frame lengths {observed:?}, \
+             so it never crossed and proves nothing"
+        );
+    }
+
+    /// The piggyback path with an ABSENT contiguous prefix, over the real
+    /// `seal → parse → open` seam.
+    ///
+    /// `(None, non-empty runs)` is the shape a receiver produces when the head of
+    /// a conversation is lost, and it is the case that separates the presence
+    /// test's `||` from an `&&`: with `&&`, a frame carrying runs but no prefix
+    /// would silently come back as "no acknowledgement" on the public path.
+    #[test]
+    fn an_acknowledgement_with_no_contiguous_prefix_round_trips() {
+        let mut p = pair();
+        let sent = headless_ack();
+        let (bytes, _) = p.send_acked("head of the conversation was lost", Some(&sent));
+
+        let got = p.recv(&bytes).unwrap();
+        let peer = got
+            .peer_ack
+            .expect("runs without a prefix are still an acknowledgement");
+        assert_eq!(
+            peer.sig_input(&[1u8; ROOT_LEN], Direction::AToB),
+            crate::dm::ack::ack_sig_input(&[1u8; ROOT_LEN], Direction::AToB, &sent),
+        );
+
+        let mut ours = AckState::new();
+        assert_eq!(
+            ours.merge_peer_ack(peer, Some(9)).unwrap(),
+            crate::dm::ack::PeerAckOutcome::WithinCeiling
+        );
+        assert_eq!(
+            ours.high_water(),
+            None,
+            "an absent prefix must survive the round trip as absent, not as zero"
+        );
+        for settled in [4, 5, 9] {
+            assert!(ours.is_settled(settled));
+        }
+        for unsettled in [0, 3, 6, 8, 10] {
+            assert!(!ours.is_settled(unsettled));
+        }
+    }
+
+    /// The adversarial outcome the decode → verify → merge sequence exists for,
+    /// driven from real wire bytes rather than a hand-built [`AckState`].
+    ///
+    /// A peer that claims to have collected sequence numbers we never sent is
+    /// either broken or trying to make us report messages delivered before they
+    /// were composed. Nothing in this module can catch it — the decoder must hand
+    /// back the claim intact or the signature would not verify against it — so
+    /// the whole defence is that the claim reaches
+    /// [`AckState::merge_peer_ack`] as a [`PeerAck`] and is clipped there.
+    /// This test drives that path end to end and asserts the clip actually fired.
+    #[test]
+    fn a_piggybacked_claim_above_what_we_sent_is_clipped_on_merge() {
+        let mut p = pair();
+        // The peer claims a prefix of 4 and a run at 9 — we will have sent 6.
+        let sent = headless_ack();
+        let (bytes, _) = p.send_acked("I collected more than you sent", Some(&sent));
+
+        let peer = p
+            .recv(&bytes)
+            .unwrap()
+            .peer_ack
+            .expect("the frame carried an acknowledgement");
+
+        let mut ours = AckState::new();
+        assert_eq!(
+            ours.merge_peer_ack(peer, Some(6)).unwrap(),
+            crate::dm::ack::PeerAckOutcome::ClippedToCeiling {
+                claimed: 9,
+                ceiling: Some(6),
+            },
+            "a claim above the highest sequence we sent must be clipped, and the \
+             clip must be reported rather than absorbed"
+        );
+        // The possible part of the claim still merged...
+        assert!(ours.is_settled(4));
+        assert!(ours.is_settled(5));
+        // ...and the impossible part did not.
+        assert!(
+            !ours.is_settled(9),
+            "a position we never sent must not become settled because a peer said so"
+        );
     }
 }

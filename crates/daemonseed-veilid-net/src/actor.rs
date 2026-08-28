@@ -14,6 +14,7 @@ use veilid_core::{
     VeilidAPI, VeilidConfig, VeilidUpdate,
 };
 
+use daemonseed_core::dm::ack_record::DmAckAddress;
 use daemonseed_core::dm::paging::{DmPageAddress, PagePosition, Receiving, Sending};
 use daemonseed_core::public_room::PublicRoomKey;
 use daemonseed_core::share_envelope::ManifestEntry;
@@ -519,6 +520,63 @@ enum Command {
         owner_seed: [u8; 32],
         reply: oneshot::Sender<Result<DoorbellSweep>>,
     },
+    // ── Direct messaging (#235) ──
+    /// Publish one direction's acknowledgement record to subkey 0 of the `dflt(1)`
+    /// record `address` names
+    /// (`daemonseed_core::dm::ack_record::DmAckAddress::for_direction` over the
+    /// conversation's address root and the direction). `record` is the
+    /// already-sealed, already-signed acknowledgement; this layer moves opaque
+    /// bytes and never inspects them.
+    ///
+    /// Rides the WB-3 funnel as a coalescible `Keepalive` **current-state** write,
+    /// exactly as [`Command::PublishDmKeyRecord`] does and for the same reason: an
+    /// acknowledgement is current state rewritten in place, so a newer one always
+    /// supersedes a queued older one for the same record. That is not merely
+    /// permitted here, it is the point — the statement is monotonic, so coalescing
+    /// can only ever drop a write whose content the surviving one already
+    /// contains. The logical id is a constant, because one address names exactly
+    /// one acknowledgement record.
+    ///
+    /// **The address is the typed [`DmAckAddress`], not a bare owner seed, for the
+    /// reason [`Command::PublishDmPage`] gives (#244).** Every `owner_seed: [u8;
+    /// 32]` elsewhere in this enum is world-derivable by design; an
+    /// acknowledgement record's derives from the conversation's retained address
+    /// root `AR`, and under Veilid a derivable owner seed IS write access to that
+    /// record. A `Copy` array would be duplicated into the command channel, the
+    /// actor stack, the scheduler's pending queue and the dispatch frame, none of
+    /// which zeroize; the address carries one boxed, redacted, zeroize-on-drop
+    /// seed the whole way, and it carries the direction it was derived for beside
+    /// it, so the seed cannot come apart from the half of the conversation it
+    /// addresses.
+    PublishDmAck {
+        address: DmAckAddress,
+        record: Vec<u8>,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    /// Fetch a correspondent's acknowledgement record from subkey 0 of the
+    /// `dflt(1)` record `address` names. `Ok(None)` means the slot is empty —
+    /// evicted, or never written because the peer has settled nothing — which the
+    /// caller treats as "no acknowledgement yet" and retries; it is deliberately
+    /// distinct from a transport error, because a fail-safe delivery state must
+    /// never read a network fault as an absence of confirmation.
+    ///
+    /// **The address is the typed [`DmAckAddress`] on the read side too**, for the
+    /// reason [`Self::PublishDmAck`] gives: an acknowledgement record's owner seed
+    /// derives from `AR` whichever direction it is read or written in, so it is the
+    /// same conversation secret and gets the same zeroizing carrier. The plain type
+    /// covers both directions — unlike `DmPageAddress<D>`, there is nothing here a
+    /// stream marker would prevent, because both parties write their own record and
+    /// read the other's.
+    ///
+    /// The bytes are returned UNVERIFIED, and unverified here means more than it
+    /// does for a key record: `daemonseed_core::dm::ack_record::decode_and_verify`
+    /// is the only thing that may open and authenticate them, and even its result
+    /// is a `PeerAck` that answers no question until it has been merged under the
+    /// caller's own ceiling.
+    FetchDmAck {
+        address: DmAckAddress,
+        reply: oneshot::Sender<Result<Option<Vec<u8>>>>,
+    },
     // ── Public-share content (Phase 3) ──
     /// Register a share to serve owner-on-demand (`share_id` → content source
     /// + the `PublicRoomKey` bytes responses seal under).
@@ -950,6 +1008,53 @@ impl VeilidNetHandle {
     /// turn a network fault into "nobody wants to talk to you".
     pub async fn sweep_doorbell(&self, owner_seed: [u8; 32]) -> Result<DoorbellSweep> {
         self.send(|reply| Command::SweepDoorbell { owner_seed, reply })
+            .await?
+    }
+
+    // ── Direct messaging (#235) ──
+
+    /// Publish one direction's sealed acknowledgement record (ISC-C39). `record`
+    /// is the prost-encoded `DmAck`; the caller builds it with
+    /// `daemonseed_core::dm::ack_record::build_encoded` and builds `address` with
+    /// `DmAckAddress::for_direction` over the same address root and direction.
+    /// Enqueued as a coalescible `Keepalive` current-state write, so re-writing an
+    /// acknowledgement costs at most one queued write per record however often it
+    /// is called.
+    ///
+    /// Takes the address by value for the same reason [`Self::publish_dm_page`]
+    /// does: an acknowledgement record's owner seed is the conversation's write
+    /// capability, so it must be moved into the command rather than copied out of
+    /// a borrow (#244). Derive one per call.
+    pub async fn publish_dm_ack(&self, address: DmAckAddress, record: Vec<u8>) -> Result<()> {
+        self.send(|reply| Command::PublishDmAck {
+            address,
+            record,
+            reply,
+        })
+        .await?
+    }
+
+    /// Fetch a correspondent's acknowledgement record. `Ok(None)` is an empty
+    /// slot — evicted, or never written because the peer has settled nothing — and
+    /// is the caller's *no confirmation yet* state, distinct from a transport
+    /// failure. Conflating the two would let a network fault read as an absence of
+    /// confirmation, which is the direction a fail-safe delivery state must never
+    /// blur.
+    ///
+    /// Build `address` with `DmAckAddress::for_direction` over this conversation's
+    /// address root and the direction whose messages the correspondent is
+    /// acknowledging — for a sender reading its peer's acknowledgement, that is
+    /// `Ratchet::send_direction`. Taken by value for the same reason
+    /// [`Self::publish_dm_ack`] does: the seed is the conversation's capability for
+    /// that record and must be moved, not copied out of a borrow (#244).
+    ///
+    /// The bytes are UNVERIFIED. Pass them to
+    /// `daemonseed_core::dm::ack_record::decode_and_verify` with this
+    /// conversation's `chan_id`, address root and the correspondent's pseudonym
+    /// public key, then merge the resulting `PeerAck` under the highest sequence
+    /// number this end has actually sent, before trusting anything in them.
+    pub async fn fetch_dm_ack(&self, address: DmAckAddress) -> Result<Option<Vec<u8>>> {
+        self.send(|reply| Command::FetchDmAck { address, reply })
             .await?
     }
 
@@ -1777,6 +1882,56 @@ async fn actor_loop(
                     let _ = reply.send(r);
                 });
             }
+            Command::PublishDmAck {
+                address,
+                record,
+                reply,
+            } => {
+                // Class-4 Keepalive, coalescible last-writer-wins, exactly as
+                // `PublishDmKeyRecord` is and for a stronger reason: the statement is
+                // MONOTONIC, so a newer acknowledgement contains everything a queued
+                // older one carried and coalescing can drop nothing. The logical id is
+                // a constant because one address names exactly one acknowledgement
+                // record — the coalescing key `(record, id)` collapses to the record,
+                // which is the intended behaviour.
+                //
+                // The funnel key is derived from the address's own seed and the
+                // address is then MOVED into the item, so the conversation secret is
+                // never copied into a second binding on this loop (#244). Struct
+                // fields initialise in source order, so `record:` reads the seed
+                // before `item:` takes the address.
+                sched.enqueue(WriteRequest {
+                    record: funnel_record_key(address.owner_seed().as_bytes()),
+                    class: WriteClass::Keepalive,
+                    kind: WriteKind::CurrentState {
+                        logical_id: "dm-ack".to_string(),
+                    },
+                    deadline: None,
+                    item: ProdWrite::DmAck { address, record },
+                    reply: Some(reply),
+                });
+            }
+            Command::FetchDmAck { address, reply } => {
+                // A read, so it never touches the write funnel (I9: no read-triggered
+                // writes). SPAWNED, never awaited inline (D-0b / #128, CRSH-ISC-22) for
+                // the reason `FetchDmKeyRecord` gives: the GET is one subkey, but the
+                // `open_or_create` in front of it costs ~6-10 s on a cold cache, and a
+                // sender polls one acknowledgement record PER conversation.
+                //
+                // The address is MOVED into the task and borrowed from there, so the
+                // conversation secret lives exactly as long as the read it authorises
+                // and zeroizes when the task ends (#244).
+                let gate = dht_gate.clone();
+                let api = api.clone();
+                let rc = rc.clone();
+                let opened = opened.clone();
+                let record_locks = record_locks.clone();
+                tokio::spawn(async move {
+                    let r = fetch_dm_ack(&gate, &api, &rc, &opened, &record_locks, &address).await;
+                    // A dropped receiver (caller gave up / shutting down) is benign.
+                    let _ = reply.send(r);
+                });
+            }
             Command::SubscribeRendezvous { owner_seed, reply } => {
                 let _ = reply.send(
                     subscribe_rendezvous(
@@ -2416,6 +2571,27 @@ enum ProdWrite {
         slot: u16,
         entry: Vec<u8>,
     },
+    /// A DM acknowledgement write → [`publish_dm_ack`]. Its own variant for the
+    /// reason [`ProdWrite::DmKeyRecord`] gives: shape is part of the record
+    /// address, so routing it down another surface's path would address a
+    /// different record. It shares the key record's `dflt(1)` today, which is
+    /// exactly why the two must not share a path — the coincidence is in the slot
+    /// count, not in the address.
+    ///
+    /// The second variant carrying a typed address, and for the same reason
+    /// [`ProdWrite::DmPage`] does: an acknowledgement record's owner seed derives
+    /// from `AR`, so under Veilid holding it is write access to the conversation's
+    /// acknowledgement record. It rides inside the zeroizing [`DmAckAddress`]
+    /// rather than as a `Copy` array duplicated through the pending queue (#244),
+    /// and the address keeps the seed bound to the direction it was derived for
+    /// for the length of the queue. The scheduler's `D: Send + 'static` bound is
+    /// satisfied structurally — the address is a `Box<[u8; 32]>` and a
+    /// `Direction`, both of which are — and is enforced by the compiler at
+    /// `WriteScheduler::spawn_with_probe::<ProdWrite>`.
+    DmAck {
+        address: DmAckAddress,
+        record: Vec<u8>,
+    },
 }
 
 /// The production [`WriteSink`] (WB-3.I1): the funnel's dispatch end. Holds the same
@@ -2531,6 +2707,13 @@ impl WriteSink for ProductionSink {
                     )
                     .await
                 }
+                ProdWrite::DmAck { address, record } => {
+                    // Borrowed, not moved, exactly as `DmPage` is: the binding is
+                    // dropped — and therefore zeroized — at the end of this arm, so
+                    // the conversation secret lives no longer than the write it
+                    // authorises (#244).
+                    publish_dm_ack(&gate, &api, &rc, &opened, &record_locks, &address, record).await
+                }
             };
             drop(permit);
             DispatchOutcome {
@@ -2633,6 +2816,106 @@ async fn fetch_dm_key_record(
         Ok(Some(v)) => Ok(Some(v.data().to_vec())),
         Ok(None) => {
             crate::vtrace!("fetch_dm_key_record: slot empty (evicted, wiped, or never published)");
+            Ok(None)
+        }
+        Err(e) => Err(VeilidNetError::Routing(e.to_string())),
+    }
+}
+
+/// The DM acknowledgement record's schema: `dflt(1)`, one current-state slot.
+/// Part of the record ADDRESS — every participant must derive with this shape or
+/// they compute a different record (`docs/design/direct-messaging.md` DRAFT v6).
+const DM_ACK_SHAPE: rendezvous::RecordShape = rendezvous::RecordShape::DM_ACK;
+
+/// The only slot in an acknowledgement record.
+const DM_ACK_SUBKEY: u32 = 0;
+
+/// Publish a sealed acknowledgement to subkey 0 of its `dflt(1)` record
+/// (ISC-C39).
+///
+/// `record` is opaque here: this layer never opens or verifies it. Opening needs
+/// the conversation's address root and verification the correspondent's pseudonym
+/// key, neither of which this layer holds, and a second verification point would
+/// be a second place for the rule to drift.
+///
+/// Unlike the key record and the doorbell, this record is **owner-write-gated**:
+/// the owner seed derives from the conversation's secret address root, so only the
+/// two parties can write here and neither erasure nor forgery by a third party is
+/// available. The residual is the peer itself, and a peer's claim is bounded where
+/// it is merged, not here.
+async fn publish_dm_ack(
+    gate: &Arc<DhtGate>,
+    api: &VeilidAPI,
+    rc: &RoutingContext,
+    opened: &rendezvous::OpenCache,
+    record_locks: &rendezvous::RecordLocks,
+    address: &DmAckAddress,
+    record: Vec<u8>,
+) -> Result<()> {
+    let owner = identity::rendezvous_owner_keypair(address.owner_seed().as_bytes())?;
+    // Single-flight the open and serialize against any concurrent op on this record,
+    // exactly as the key-record and rendezvous write paths do (CRSH-ISC-3).
+    let record_lock = rendezvous::record_lock(record_locks, &owner);
+    let _write_guard = record_lock.lock().await;
+    let handle = rendezvous::open_cached(
+        opened,
+        &rendezvous::cached_record_id(&owner, DM_ACK_SHAPE),
+        rendezvous::open_or_create(gate, api, rc, &owner, DM_ACK_SHAPE),
+    )
+    .await?;
+    crate::vtrace!(
+        "publish_dm_ack: key={:?} bytes={}",
+        handle.key(),
+        record.len()
+    );
+    rendezvous::publish_at_subkey(rc, &handle, &owner, DM_ACK_SUBKEY, record).await
+}
+
+/// Fetch a correspondent's acknowledgement from subkey 0 of its `dflt(1)` record.
+///
+/// Returns `Ok(None)` for an empty slot — evicted, or never written because the
+/// peer has settled nothing — which is a real and expected state and which the
+/// caller treats as *no confirmation yet*. It is deliberately distinct from `Err`,
+/// a transport failure: under a fail-safe delivery posture, conflating the two
+/// would let a network fault be read as an absence of confirmation and vice versa.
+///
+/// The bytes come back UNVERIFIED. Only
+/// `daemonseed_core::dm::ack_record::decode_and_verify` may open them, and even
+/// its result answers nothing until it has been merged under the caller's own
+/// ceiling.
+async fn fetch_dm_ack(
+    gate: &Arc<DhtGate>,
+    api: &VeilidAPI,
+    rc: &RoutingContext,
+    opened: &rendezvous::OpenCache,
+    record_locks: &rendezvous::RecordLocks,
+    address: &DmAckAddress,
+) -> Result<Option<Vec<u8>>> {
+    let owner = identity::rendezvous_owner_keypair(address.owner_seed().as_bytes())?;
+    // The open is serialized under the record lock; the GET is NOT, so a slow read
+    // never blocks a concurrent write to the same record. The lock guard is dropped
+    // before the read permit is acquired, which also keeps the single-permit rule
+    // (CRSH-ISC-17): no un-gated-op permit is held while acquiring a read permit.
+    let handle = {
+        let record_lock = rendezvous::record_lock(record_locks, &owner);
+        let _open_guard = record_lock.lock().await;
+        rendezvous::open_cached(
+            opened,
+            &rendezvous::cached_record_id(&owner, DM_ACK_SHAPE),
+            rendezvous::open_or_create(gate, api, rc, &owner, DM_ACK_SHAPE),
+        )
+        .await?
+    };
+    // Read lane (WB-5.1 / I5″.2): one read permit around the one GET.
+    let got = {
+        let _read_permit = gate.acquire_read().await;
+        rc.get_dht_value(handle.key().clone(), DM_ACK_SUBKEY, true)
+            .await
+    };
+    match got {
+        Ok(Some(v)) => Ok(Some(v.data().to_vec())),
+        Ok(None) => {
+            crate::vtrace!("fetch_dm_ack: slot empty (evicted or never written)");
             Ok(None)
         }
         Err(e) => Err(VeilidNetError::Routing(e.to_string())),
@@ -4465,8 +4748,31 @@ mod tests {
         );
         assert_eq!(DM_DOORBELL_SHAPE.max_value_len(), 32768);
 
-        // The four shapes must stay distinct: sharing an owner seed across them
-        // would otherwise collapse in the open-cache.
+        // The DM acknowledgement record: one current-state slot, full 32 KiB cap.
+        // A maximal sealed acknowledgement is ~6.2 KiB, so the headroom is ample —
+        // and `ack_record::a_maximal_record_fits_one_subkey` is what pins that from
+        // the producing side.
+        assert_eq!(
+            DM_ACK_SHAPE.o_cnt(),
+            daemonseed_core::dm::ack_record::ACK_RECORD_SLOTS
+        );
+        assert_eq!(DM_ACK_SHAPE.o_cnt(), 1);
+        assert_eq!(DM_ACK_SHAPE.max_value_len(), 32768);
+        assert_eq!(DM_ACK_SUBKEY, 0);
+        assert!(DM_ACK_SUBKEY < u32::from(DM_ACK_SHAPE.o_cnt()));
+
+        // The five kinds must stay distinct under one owner seed, or they would
+        // collapse in the open-cache. **The key record and the acknowledgement
+        // record share a shape**, so this pair is the one the set below cannot
+        // separate — they are distinct records because their owner seeds derive
+        // differently, never because their shapes do, and nothing here or in
+        // `RecordShape` can enforce that. Asserted explicitly so a reader is not
+        // left thinking the shape table separates them.
+        assert_eq!(
+            DM_ACK_SHAPE.o_cnt(),
+            DM_KEY_RECORD_SHAPE.o_cnt(),
+            "these two shapes are equal by design; separation is the owner seed's job"
+        );
         let owner = crate::identity::rendezvous_owner_keypair(&[3u8; 32]).unwrap();
         let ids = [
             rendezvous::cached_record_id(&owner, rendezvous::RecordShape::RENDEZVOUS),
@@ -4975,8 +5281,8 @@ mod tests {
         let keyed: String = ["record: funnel_record", "_key("].concat();
         assert_eq!(
             prod.matches(keyed.as_str()).count(),
-            5,
-            "exactly five enqueue sites set `record:` through the helper. A different \
+            6,
+            "exactly six enqueue sites set `record:` through the helper. A different \
              count means an enqueue site was added, removed, or keyed another way — \
              decide which, then update this number"
         );
@@ -5672,6 +5978,182 @@ mod tests {
             owner_seed,
             "the actor must sweep the doorbell the caller named"
         );
+    }
+
+    /// The acknowledgement handle passes the address and the record bytes to the
+    /// actor untouched. Nothing downstream can tell one ack record from another —
+    /// the bytes are opaque and the address is the only thing naming a record — so
+    /// a handle that altered either would write a well-formed acknowledgement
+    /// somewhere the correspondent never reads, with no error on any surface. The
+    /// direction is asserted alongside the seed because the address exists to keep
+    /// the two together.
+    #[tokio::test]
+    async fn publishing_an_acknowledgement_passes_the_address_and_bytes_through_unchanged() {
+        use daemonseed_core::dm::ack_record;
+        use daemonseed_core::dm::ratchet::Direction;
+
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let ar = [0x71u8; 32];
+        let dir = Direction::BToA;
+        let record = vec![0xacu8; 96];
+        let (handle, mut cmd_rx) = detached_handle();
+
+        let observed = tokio::spawn(async move {
+            match cmd_rx.recv().await.expect("a command reached the actor") {
+                Command::PublishDmAck {
+                    address,
+                    record,
+                    reply,
+                } => {
+                    let _ = reply.send(Ok(()));
+                    (
+                        *address.owner_seed().as_bytes(),
+                        address.direction(),
+                        record,
+                    )
+                }
+                _ => panic!("expected a PublishDmAck command"),
+            }
+        });
+
+        handle
+            .publish_dm_ack(
+                ack_record::DmAckAddress::for_direction(&ar, dir).unwrap(),
+                record.clone(),
+            )
+            .await
+            .expect("the publish reaches the actor");
+        assert_eq!(
+            observed.await.expect("the observing task"),
+            (
+                *ack_record::derive_owner_seed(&ar, dir).unwrap().as_bytes(),
+                dir,
+                record
+            )
+        );
+    }
+
+    /// An empty slot comes back as `Ok(None)`, not as an error. The distinction is
+    /// load-bearing under a fail-safe delivery posture: a transport fault read as
+    /// "no acknowledgement" and an absent acknowledgement read as a fault are the
+    /// two ways a sender's delivery state goes wrong, and only the handle's own
+    /// contract keeps them apart.
+    /// The address is asserted through as well, seed and direction both: the read
+    /// side names a record exactly as the write side does, and reading the wrong
+    /// direction's returns a valid acknowledgement about the wrong half of the
+    /// conversation rather than an error.
+    #[tokio::test]
+    async fn fetching_an_absent_acknowledgement_is_ok_none_not_an_error() {
+        use daemonseed_core::dm::ack_record;
+        use daemonseed_core::dm::ratchet::Direction;
+
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let ar = [0x72u8; 32];
+        let dir = Direction::AToB;
+        let (handle, mut cmd_rx) = detached_handle();
+
+        let observed = tokio::spawn(async move {
+            match cmd_rx.recv().await.expect("a command reached the actor") {
+                Command::FetchDmAck { address, reply } => {
+                    let _ = reply.send(Ok(None));
+                    (*address.owner_seed().as_bytes(), address.direction())
+                }
+                _ => panic!("expected a FetchDmAck command"),
+            }
+        });
+
+        assert_eq!(
+            handle
+                .fetch_dm_ack(ack_record::DmAckAddress::for_direction(&ar, dir).unwrap())
+                .await
+                .expect("an empty slot is not a transport error"),
+            None
+        );
+        assert_eq!(
+            observed.await.expect("the observing task"),
+            (
+                *ack_record::derive_owner_seed(&ar, dir).unwrap().as_bytes(),
+                dir
+            )
+        );
+    }
+
+    /// **The spawn helper reaches the actor with the address it derived, and the
+    /// bytes it produced verify.**
+    ///
+    /// The helper is the only production shape of this write, and every part of it
+    /// fails silently: a wrong direction derives a valid seed for the record the
+    /// peer never reads, and a wrong key or `chan_id` seals bytes the peer cannot
+    /// open. So the test does not merely observe that a command arrived — it
+    /// re-derives the address independently and opens the bytes, which is what
+    /// makes a mutation to either argument visible.
+    #[tokio::test]
+    async fn the_ack_spawn_helper_publishes_a_verifiable_record_at_the_derived_address() {
+        use daemonseed_core::dm::ack::AckState;
+        use daemonseed_core::dm::ack_record;
+        use daemonseed_core::dm::ratchet::Direction;
+        use daemonseed_core::identity::keys::{derive_identity_keys, Identity};
+        use daemonseed_core::identity::mnemonic::Mnemonic;
+
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let keys = derive_identity_keys(
+            &Mnemonic::from_phrase(
+                "abandon abandon abandon abandon abandon abandon abandon abandon abandon \
+                 abandon abandon abandon abandon abandon abandon abandon abandon abandon \
+                 abandon abandon abandon abandon abandon art",
+            )
+            .unwrap(),
+            Identity::Primary,
+        )
+        .unwrap();
+
+        let ar = [0x31u8; 32];
+        let chan_id = [0x32u8; 32];
+        let dir = Direction::BToA;
+        let mut state = AckState::new();
+        state.collect(0).unwrap();
+        state.collect(1).unwrap();
+        state.collect(7).unwrap();
+
+        let (handle, mut cmd_rx) = detached_handle();
+        let observed = tokio::spawn(async move {
+            match cmd_rx.recv().await.expect("a command reached the actor") {
+                Command::PublishDmAck {
+                    address,
+                    record,
+                    reply,
+                } => {
+                    let _ = reply.send(Ok(()));
+                    (
+                        *address.owner_seed().as_bytes(),
+                        address.direction(),
+                        record,
+                    )
+                }
+                _ => panic!("expected a PublishDmAck command"),
+            }
+        });
+
+        crate::dm::spawn_dm_ack_publish(&handle, "test", &state, &chan_id, dir, &ar, &keys.signing);
+        let (owner_seed, published_dir, record) = observed.await.expect("the observing task");
+
+        assert_eq!(
+            owner_seed,
+            *ack_record::derive_owner_seed(&ar, dir).unwrap().as_bytes(),
+            "the helper must publish at the address this conversation and direction \
+             derive — any other is a valid record the peer never reads"
+        );
+        assert_eq!(
+            published_dir, dir,
+            "the address must carry the direction the helper was asked for"
+        );
+        let peer =
+            ack_record::decode_and_verify(&record, &chan_id, dir, &ar, keys.signing.public_key())
+                .expect("the published bytes must open and verify at the far end");
+        let mut theirs = AckState::new();
+        let _ = theirs.merge_peer_ack(peer, Some(u64::MAX)).unwrap();
+        assert_eq!(theirs.high_water(), Some(1));
+        assert!(theirs.is_settled(7));
     }
 
     /// **Knock and sweep cannot disagree about the doorbell record's shape.**

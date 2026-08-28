@@ -8,13 +8,14 @@
 //! secret, and publishes; the recipient decapsulates whenever they next come
 //! online. No handshake round-trip, no session, no new transport.
 //!
-//! Three record kinds carry it, and the shape of each is part of its address:
+//! Four record kinds carry it, and the shape of each is part of its address:
 //!
 //! | Record | Schema | Role |
 //! |---|---|---|
 //! | key record ([`keyrec`]) | `dflt(1)` | the identity's published static KEM key — all of DM discovery |
 //! | doorbell | `dflt(32)` | sender-blind first-contact entries, the only unauthenticated write surface |
 //! | channel page | `dflt(16)` | the established conversation, owner-write-gated so no third party can forge or erase it |
+//! | ack record ([`ack_record`]) | `dflt(1)` | one direction's settled state, sealed and owner-write-gated, rewritten in place |
 //!
 //! Only the doorbell is world-writable, and it carries no conversation content.
 //!
@@ -65,6 +66,8 @@ pub(crate) fn unpad(padded: &[u8]) -> Option<&[u8]> {
 
 pub mod ack;
 pub mod ack_budget;
+pub mod ack_cadence;
+pub mod ack_record;
 pub mod admission;
 pub mod block_list;
 pub mod collect;

@@ -267,6 +267,7 @@ async fn sealed_channel_messages_round_trip_through_a_page_and_open_out_of_order
             &rcpt_hash,
             SENT,
             body,
+            None,
         )
         .expect("A seals the channel frame");
 

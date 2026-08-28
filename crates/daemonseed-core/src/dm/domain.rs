@@ -279,6 +279,40 @@ dm_labels! {
     /// FROZEN.
     DM_ACK_SEAL = b"daemonseed/dm/ack/seal/v3";
 
+    /// HKDF-Extract salt for a direction's ACKNOWLEDGEMENT-RECORD owner-seed
+    /// derivation, rooted in the conversation's retained address root `AR`.
+    ///
+    /// **Distinct from [`DM_ACK_SALT`], which extracts the seal KEY from the same
+    /// input.** One salt for both would mean the record's address and the key its
+    /// contents are sealed under descend from one extraction over one secret, so
+    /// anyone who learned the address would be one HKDF-Expand from the key. It is
+    /// distinct from [`DM_PAGE_SALT`] for the same reason those two are. FROZEN.
+    DM_ACK_ADDR_SALT = b"daemonseed/dm/ack/addr/salt/v1";
+
+    /// HKDF-Expand `info` prefix for a direction's acknowledgement-record Veilid
+    /// owner seed. The direction follows it, length-prefixed.
+    ///
+    /// **Not world-derivable**, like [`DM_PAGE_ADDR`] and unlike every other DM
+    /// address: it is rooted in `AR`, a secret only the two parties hold, which is
+    /// what makes the ack record owner-write-gated and therefore unforgeable and
+    /// un-erasable by a third party. There is no page number — one record per
+    /// direction, for the life of the conversation. FROZEN.
+    DM_ACK_ADDR = b"daemonseed/dm/ack/addr/v1";
+
+    /// AAD prefix for a delivery acknowledgement's seal. The conversation
+    /// identifier and the direction follow it, length-prefixed — the same two
+    /// fields [`DM_ACK_SIG`] binds first, so the AEAD refuses a cross-conversation
+    /// or cross-direction splice before any signature is checked.
+    ///
+    /// **`/v3`, past the frozen text's `…/ack/aad/v2`.** That name was pinned in
+    /// § DRAFT v2 beside a seal key rooted in `RK_current` and an AAD binding
+    /// `chan_id` alone; v3 re-rooted the key in `AR` and made the ack per-direction
+    /// (crypto F-3 / F-6), so what this domain covers is `chan_id ‖ dir`. Reusing
+    /// `/v2` for different content would let two implementations disagree about
+    /// what an AAD of that name binds, which is the failure the `ack/seal/v3` and
+    /// `ack/sig/v3` bumps exist to prevent. FROZEN.
+    DM_ACK_AAD = b"daemonseed/dm/ack/aad/v3";
+
     /// Signature domain for a delivery acknowledgement, signed under the PSEUDONYM
     /// key.
     ///
@@ -373,6 +407,9 @@ mod tests {
         assert_eq!(DM_PAGE_ADDR, b"daemonseed/dm/page/addr/v4");
         assert_eq!(DM_ACK_SALT, b"daemonseed/dm/ack/salt/v1");
         assert_eq!(DM_ACK_SEAL, b"daemonseed/dm/ack/seal/v3");
+        assert_eq!(DM_ACK_ADDR_SALT, b"daemonseed/dm/ack/addr/salt/v1");
+        assert_eq!(DM_ACK_ADDR, b"daemonseed/dm/ack/addr/v1");
+        assert_eq!(DM_ACK_AAD, b"daemonseed/dm/ack/aad/v3");
         assert_eq!(DM_ACK_SIG, b"daemonseed/dm/ack/sig/v3");
         assert_eq!(DM_RATCHET_ROOT, b"daemonseed/dm/ratchet/root/v2");
         assert_eq!(DM_RATCHET_STEP, b"daemonseed/dm/ratchet/step/v2");
@@ -451,12 +488,21 @@ mod tests {
     /// from the pre-migration source by the parser being retired, and is the
     /// independent anchor the migration is verified against.
     ///
-    /// It stays afterwards as the change-detector for a FROZEN label set. Editing a
-    /// value here to make a test pass is the one thing this must never be used for —
-    /// these strings are on the wire and in derivations shipped to peers.
+    /// It stays afterwards as the change-detector for a FROZEN label set, and a
+    /// label declared AFTER the migration is pinned here too — the length assertion
+    /// below requires it, and a new label is exactly as frozen as an old one once it
+    /// ships. Editing a value here to make a test pass is the one thing this must
+    /// never be used for — these strings are on the wire and in derivations shipped
+    /// to peers.
     #[test]
     fn every_label_matches_its_pre_migration_value() {
-        let pinned: [(&[u8], &[u8]); 39] = [
+        let pinned: [(&[u8], &[u8]); 42] = [
+            (DM_ACK_AAD, b"daemonseed/dm/ack/aad/v3".as_slice()),
+            (DM_ACK_ADDR, b"daemonseed/dm/ack/addr/v1".as_slice()),
+            (
+                DM_ACK_ADDR_SALT,
+                b"daemonseed/dm/ack/addr/salt/v1".as_slice(),
+            ),
             (DM_ACK_SALT, b"daemonseed/dm/ack/salt/v1".as_slice()),
             (DM_ACK_SEAL, b"daemonseed/dm/ack/seal/v3".as_slice()),
             (DM_ACK_SIG, b"daemonseed/dm/ack/sig/v3".as_slice()),

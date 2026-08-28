@@ -717,6 +717,64 @@ pub struct DmKeyRecord {
     #[prost(bytes = "vec", tag = "4")]
     pub signature: ::prost::alloc::vec::Vec<u8>,
 }
+/// What one party has settled on one direction of one conversation, sealed
+/// (ISC-C39).
+///
+/// Lives alone in subkey 0 of a `dflt(1)` record whose owner is derived from the
+/// conversation's retained address root `AR` and the direction. Unlike the key
+/// record's `dflt(1)`, that address is NOT world-derivable: only the two parties
+/// hold `AR`, so the record is owner-write-gated and no third party can forge or
+/// erase it.
+///
+/// **Everything is inside the seal, and nothing is in the clear.** A reader
+/// derives the key from `AR` and the direction alone, both of which it already
+/// holds before it fetches, so there is no field it needs before it can decrypt —
+/// and a collection high-water plus a gap pattern is exactly the metadata the
+/// record exists to keep off a storage node. The plaintext is padded to a single
+/// constant bucket before sealing, so the record's length is fixed and carries no
+/// signal about how many gaps a conversation has accumulated.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DmAck {
+    /// `nonce(12) ‖ ciphertext ‖ tag(16)` over a padded `DmAckBody`, AES-256-GCM
+    /// under `K_ack(dir)`, binding the conversation identifier and the direction as
+    /// AAD. An acknowledgement replayed onto the other direction's record, or onto
+    /// another conversation's, fails to open.
+    #[prost(bytes = "vec", tag = "1")]
+    pub sealed: ::prost::alloc::vec::Vec<u8>,
+}
+/// The sealed contents of a `DmAck` — the statement itself and the signature over
+/// it.
+///
+/// The statement is monotonic: a reader unions it into what it already holds and
+/// never regresses, so a replayed older acknowledgement is a no-op rather than a
+/// rollback. Nothing here is trusted until the reader has also clipped it to the
+/// highest sequence number it has actually sent on this direction.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DmAckBody {
+    /// The contiguous prefix: every sequence number from zero up to and including
+    /// this one is settled. Absent when none is — a real state, distinct from a
+    /// prefix of zero, because sequence zero is a live position on both directions.
+    /// Optional rather than sentinel-encoded for exactly that reason.
+    #[prost(uint64, optional, tag = "1")]
+    pub high_water: ::core::option::Option<u64>,
+    /// The canonical run-length encoding of the settled positions BEYOND the
+    /// prefix: a big-endian `uint16` run count, then per run a big-endian `uint64`
+    /// gap measured from two past the previous run's end and a big-endian `uint64`
+    /// extent. Bounded at 64 runs, so at most 1026 bytes. One set has exactly one
+    /// spelling, which is what lets a verifier rebuild the signature preimage from
+    /// the decoded statement rather than from the bytes it was handed.
+    #[prost(bytes = "vec", tag = "2")]
+    pub beyond: ::prost::alloc::vec::Vec<u8>,
+    /// ML-DSA-87 signature, exactly 4627 bytes, under the sender's PSEUDONYM key,
+    /// over the domain-separated preimage of (chan_id, direction, high_water, the
+    /// encoded runs). Mandatory and always verified: owner-write authority on the
+    /// record is symmetric, so finding an acknowledgement at the `a2b` address does
+    /// not establish who wrote it. This signature is the only thing that does. It
+    /// covers the runs as well as the prefix, because the runs decide confirmation
+    /// just as the prefix does.
+    #[prost(bytes = "vec", tag = "3")]
+    pub msg_sig: ::prost::alloc::vec::Vec<u8>,
+}
 /// A knock: everything the recipient needs to decide whether to accept a stranger
 /// and, on accept, to start the conversation (ISC-C41).
 ///
@@ -905,6 +963,25 @@ pub struct DmChannelBody {
     /// wrote it. This signature is the only thing that does.
     #[prost(bytes = "vec", tag = "3")]
     pub msg_sig: ::prost::alloc::vec::Vec<u8>,
+    /// The sender's own collection prefix, riding out on this message instead of a
+    /// standalone acknowledgement record. Absent when the message carries no
+    /// acknowledgement, and absent-versus-zero is a real distinction — sequence
+    /// zero is a live position on both directions — so this is optional rather
+    /// than sentinel-encoded, exactly as `DmAckBody.high_water` is.
+    #[prost(uint64, optional, tag = "4")]
+    pub ack_high_water: ::core::option::Option<u64>,
+    /// The canonical run-length encoding of the sender's settled positions BEYOND
+    /// that prefix, in the same spelling `DmAckBody.beyond` carries: a big-endian
+    /// `uint16` run count, then per run a big-endian `uint64` gap and a big-endian
+    /// `uint64` extent. Empty when this message carries no acknowledgement at all;
+    /// a piggybacked acknowledgement of zero runs is the two zero bytes of a run
+    /// count, not an empty field.
+    ///
+    /// Both fields are bound in `msg_sig` alongside every other signed field, so
+    /// the frame's own authorship signature authenticates the acknowledgement and
+    /// no second signature rides with it.
+    #[prost(bytes = "vec", tag = "5")]
+    pub ack_beyond: ::prost::alloc::vec::Vec<u8>,
 }
 /// Which key an initiator encapsulated `ss0` to when opening a conversation.
 ///

@@ -26,6 +26,17 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Added
 
+- Two-node integration test for the direct-message acknowledgement record: one node publishes
+  a state with gaps, the other derives the same record, fetches it, verifies it and merges it
+  under its own ceiling. (#235)
+- Direct-message acknowledgement piggyback: `DmChannelBody` carries `ack_high_water` and
+  `ack_beyond`, bound in `msg_sig` and surfaced as `VerifiedFrame::peer_ack`. A channel
+  frame reserves `WORST_CASE_ACK_FIELDS_LEN` when choosing its padding rung, so the rung
+  does not vary with whether an acknowledgement rode along. **BREAKING (MAJOR wire):** the
+  channel frame's signature preimage now binds these two fields, so a frame sealed by a
+  build without them does not verify against one with them, in either direction.
+  **Breaking (crate API):** `frame::seal` and `frame::frame_sig_input` take the
+  acknowledgement as a new argument, and `DmFrameError` gains a `PiggybackedAck` variant.
 - `cargo xtask check-ui-strings` refuses placeholder text in any string a user can read,
   and runs as a `release-gate` step.
 - Direct-message doorbell transport: a first-contact entry publishes into a slot of the
@@ -943,6 +954,33 @@ work lives in the maintainer's own planning notes, not here.
   `AckPermit::Refused { retry_after_ms }` against `STANDALONE_ACK_MIN_INTERVAL_MS` (60 s),
   shared across every conversation rather than held per channel. The clock is an argument, and
   one that goes backwards refuses. (#235)
+- `daemonseed_core::dm::ack_cadence` — when a receiver writes a standalone acknowledgement.
+  `oldest_live_pending_ms` drops every pending message past its own give-up and returns the
+  oldest that remains; `standalone_interval_ms` interpolates linearly from `MAX_INTERVAL_MS`
+  (24 h) to `MIN_INTERVAL_MS` (60 s) across that message's remaining window, and is `None`
+  when nothing is left. `StandaloneAckCadence::on_collected` makes the next acknowledgement
+  due wherever the curve has reached; `on_acked` clears it. `pick_next` takes the candidate
+  whose oldest pending message was sent first, with the sort key clamped to one give-up
+  window and the previous winner skipped unless it is the only candidate. The clock and the
+  window are arguments, and a clock that goes backwards is not due. (#391)
+- `daemonseed_core::dm::ack_record` — the DHT record an `AckState` is published in.
+  `derive_owner_seed(AR, dir)` is `HKDF-SHA-384(salt=daemonseed/dm/ack/addr/salt/v1, ikm=AR,
+  info=daemonseed/dm/ack/addr/v1 || lp(dir))`, and `DmAckAddress::for_direction` pairs that
+  seed with its direction. `build` / `build_encoded` sign an `AckState` under the pseudonym
+  key, pad the body to `ACK_PAD_BUCKETS` and seal it under `K_ack(dir)` binding
+  `daemonseed/dm/ack/aad/v3 || lp(chan_id) || lp(dir)`; `decode_and_verify` / `verify` open
+  and authenticate one, returning `PeerAck`. `ACK_RECORD_SLOTS` is 1. (#235)
+- `DmAck` and `DmAckBody` wire messages — a sealed acknowledgement envelope and its
+  contents: an optional `high_water`, the canonical run encoding, and the ML-DSA-87
+  signature over both. (#235)
+- `daemonseed/dm/ack/addr/salt/v1`, `daemonseed/dm/ack/addr/v1` and
+  `daemonseed/dm/ack/aad/v3` domain labels. (#235)
+- `VeilidNetHandle::publish_dm_ack` and `fetch_dm_ack` write and read subkey 0 of a
+  conversation's `dflt(1)` acknowledgement record; the publish is a coalescible `Keepalive`
+  current-state write, and an empty slot fetches as `Ok(None)`. `RecordShape::DM_ACK` is that
+  record's shape. (#235)
+- `daemonseed_veilid_net::dm::spawn_dm_ack_publish` builds, addresses and publishes one
+  direction's acknowledgement off the caller's loop. (#235)
 
 ### Changed
 

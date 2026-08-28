@@ -132,6 +132,22 @@ impl RecordShape {
     /// silently shrink the cap below the size a padded entry needs.
     pub const DM_DOORBELL: Self = Self::new(daemonseed_core::dm::doorbell::DOORBELL_SLOTS);
 
+    /// Direct messaging's acknowledgement record: `dflt(1)`, one current-state
+    /// slot per direction.
+    ///
+    /// Derived from
+    /// [`ACK_RECORD_SLOTS`](daemonseed_core::dm::ack_record::ACK_RECORD_SLOTS) for
+    /// the reason [`Self::DM_PAGE`] gives — `o_cnt` is part of the address, so a
+    /// `1` typed here that later disagreed with the deriving module would address
+    /// a record the peer never reads, with no error on any surface (ISC-C100).
+    ///
+    /// It shares [`Self::DM_KEY_RECORD`]'s shape and is deliberately a separate
+    /// constant: the two are the same `o_cnt` today by coincidence of both holding
+    /// a single value, and folding them into one name would tie two unrelated
+    /// records' addresses together, so changing either would silently move the
+    /// other.
+    pub const DM_ACK: Self = Self::new(daemonseed_core::dm::ack_record::ACK_RECORD_SLOTS);
+
     /// A DFLT shape with `o_cnt` subkeys. **Panics** outside Veilid's accepted
     /// `1..=MAX_SUBKEY_COUNT` range.
     ///

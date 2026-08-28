@@ -1069,22 +1069,39 @@ modules:
       them by a value it was handed rather than by dispatch order. It is a hash, not
       a capability, and is never serialized. Debug renders the seed redacted.
       Sub-module dm::frame carries one message on that channel: seal(outbound,
-      chan_id, signing_pc, pk_lt, recipient_hash, sent_unix_ms, body) -> encoded
-      DmChannelFrame, and parse(bytes) -> ParsedFrame, whose open(key, chan_id,
+      chan_id, signing_pc, pk_lt, recipient_hash, sent_unix_ms, body, ack:
+      Option<&AckState>) -> encoded DmChannelFrame, and parse(bytes) ->
+      ParsedFrame, whose open(key, chan_id,
       dir, found_at, recipient_hash, AuthorKeys) -> VerifiedFrame. seal takes its
       Outbound BY VALUE, so a single-use message key cannot be spent twice; retry
       a failed write by re-emitting the sealed bytes unchanged. open takes the
       PagePosition the bytes were read from and returns Misplaced if it disagrees
       with the declared seq — the collector is the only holder of both facts. Clear on the wire:
       ratchet_gen, chain_base, seq, eph_ek, eph_ct — what a receiver needs before
-      it can derive a key. Sealed: sent_unix_ms, body, msg_sig. Every clear field
+      it can derive a key. Sealed: sent_unix_ms, body, msg_sig, ack_high_water,
+      ack_beyond. Every clear field
       is bound in the AAD (daemonseed/dm/msg/aad/v4 || lp of each) and again in
-      msg_sig, which is frame_sig_input: the shared /v6 preimage under frame kind
-      "msg", extended with lp(gen_be) || lp(chain_base_be) || lp(eph_ct), an
-      absent ciphertext binding as lp(&[]). open takes a message key rather than a
+      msg_sig, which is frame_sig_input(chan_id, dir, header, eph_ek, eph_ct,
+      recipient_hash, AuthorKeys, sent_unix_ms, body, ack_high_water,
+      ack_beyond): the shared /v6 preimage under frame kind
+      "msg", extended with lp(gen_be) || lp(chain_base_be) || lp(eph_ct) ||
+      lp(ack_high_water_be) || lp(ack_beyond), an
+      absent ciphertext and an absent ack_high_water each binding as lp(&[]). open takes a message key rather than a
       Ratchet so it composes as the closure of Ratchet::receive, and it verifies
-      msg_sig unconditionally. Plaintext pads to PAD_BUCKETS (8192, 16384) before
-      sealing; MAX_FRAME_LEN (32768) is the dflt(16) subkey cap, held as an
+      msg_sig unconditionally. seal's ack is the sender's own AckState riding out
+      with the message instead of a standalone ack record; None carries none, and
+      a re-seed re-emits the acknowledgement fixed at compose time.
+      VerifiedFrame is { seq, sent_unix_ms, body, peer_ack: Option<PeerAck> } and
+      is not Clone / PartialEq / Eq, because PeerAck is not; peer_ack is decoded
+      after msg_sig verifies, via AckState::decode_unvalidated, and is present
+      whenever ack_high_water is Some or ack_beyond is non-empty. A pair that
+      decodes to neither returns DmFrameError::PiggybackedAck(AckError). Plaintext pads to PAD_BUCKETS (8192, 16384) before
+      sealing; the rung is selected from the encoded length with the frame's real
+      acknowledgement overhead swapped for WORST_CASE_ACK_FIELDS_LEN (1040 =
+      an 11-byte ack_high_water plus a 1029-byte ack_beyond over
+      MAX_ACK_BEYOND_LEN), so every frame reserves the same acknowledgement space
+      and the rung never varies with whether one is piggybacked.
+      MAX_FRAME_LEN (32768) is the dflt(16) subkey cap, held as an
       invariant by the body cap and the ladder rather than a runtime check.
       Sub-module dm::contact_cache is the per-correspondence contact record,
       stored as RecordKind::ContactCache. ContactRecord holds the
@@ -1118,6 +1135,37 @@ modules:
       is held per client and shared across every conversation; a per-conversation
       instance permits N writes per interval. A refusal spends nothing, and a
       now_ms earlier than the last grant refuses.
+      Sub-module dm::ack_cadence decides when a receiver writes a standalone
+      acknowledgement and which conversation takes the allowance next.
+      pending_sent_ms is the declared send time of every message collected and
+      not yet covered by a written acknowledgement, passed whole; give_up_ms is
+      outbox::GIVE_UP_MS in production.
+      oldest_live_pending_ms(now_ms, pending_sent_ms: impl IntoIterator<Item =
+      i64>, give_up_ms) -> Option<i64> drops every entry for which now_ms -
+      sent_ms >= give_up_ms and returns the smallest that remains; None for an
+      empty set, a wholly given-up set, or a give_up_ms of zero or less.
+      standalone_interval_ms(now_ms, pending_sent_ms, give_up_ms) -> Option<i64>
+      interpolates linearly on the fraction of give_up_ms remaining for that
+      message, from MAX_INTERVAL_MS (86400000, the terminal rung of
+      outbox::RESEED_LADDER) down to MIN_INTERVAL_MS
+      (ack_budget::STANDALONE_ACK_MIN_INTERVAL_MS, 60000); None exactly when
+      oldest_live_pending_ms is None, and a send time in the future clamps to
+      MAX_INTERVAL_MS. StandaloneAckCadence::new() has never written one and is
+      due at once; on_collected() marks new messages collected, on_acked(now_ms)
+      records a write and clears that mark, and is_due(now_ms, pending_sent_ms,
+      give_up_ms) -> bool is false when terminated, true when collected since the
+      last write, otherwise true once the interval at now_ms has elapsed since
+      the last write. is_due is must_use and a now_ms earlier than the last write
+      is not due. StandaloneAckCadence is neither Copy nor Clone; one is held per
+      conversation, alongside the one per-client StandaloneAckBudget.
+      pick_next(candidates: impl IntoIterator<Item = (T, i64)>, now_ms,
+      give_up_ms, last_picked: Option<&T>) -> Option<T> where T: PartialEq
+      returns the candidate with the smallest sort key, where the key is the
+      supplied send time raised to a floor of now_ms - give_up_ms; ties to the
+      earlier item in iteration order, None on an empty set. When the winner
+      equals last_picked the next-smallest key takes the round instead, unless no
+      other candidate exists, in which case last_picked wins again. Build each
+      candidate's key with oldest_live_pending_ms.
       Sub-module dm::ack is the delivery acknowledgement's pure half.
       derive_seal_key(AR, dir) -> Result<DmAckSealKey, AckError> is HKDF-SHA-384(
       salt=daemonseed/dm/ack/salt/v1, ikm=AR, info=daemonseed/dm/ack/seal/v3||
@@ -1165,9 +1213,35 @@ modules:
       beyond_runs() yields those runs as ascending inclusive RangeInclusive<u64>,
       settled on the same terms as is_settled.
       AckState carries no chan_id, and neither encode_beyond nor
-      decode_unvalidated takes one. NOT YET AVAILABLE: the ack record, its seal,
-      its jittered standalone cadence and the piggyback path (#235 transport
-      half).
+      decode_unvalidated takes one.
+      Sub-module dm::ack_record is the DHT record an AckState is published in.
+      derive_owner_seed(AR, dir) is HKDF-SHA-384(salt=
+      daemonseed/dm/ack/addr/salt/v1, ikm=AR, info=daemonseed/dm/ack/addr/v1||
+      lp(dir)); there is no page argument, because one direction has exactly one
+      record, rewritten in place. Only the two parties can derive it, so
+      DmAckOwnerSeed is a genuine secret and the record is owner-write-gated. The
+      salt is distinct from dm::ack's DM_ACK_SALT, so the address and the seal key
+      do not share one extraction. DmAckAddress::for_direction(AR, dir) pairs the
+      seed with the direction it was derived for; owner_seed() and direction() read
+      it, and Debug renders the seed redacted. ACK_RECORD_SLOTS (1) is the record's
+      o_cnt and part of its address — a writer builds its RecordShape from it
+      (ISC-C100). build(state, chan_id, dir, AR, signing_pc) -> DmAck signs the
+      state under the PSEUDONYM key over ack::ack_sig_input, pads the encoded
+      DmAckBody to the single bucket ACK_PAD_BUCKETS (6144) and seals it under
+      ack::derive_seal_key(AR, dir), binding daemonseed/dm/ack/aad/v3||lp(chan_id)
+      ||lp(dir) as AAD; build_encoded is the same returning wire bytes, so a
+      frontend needs no prost. Every record is ACK_SEALED_LEN bytes sealed whatever
+      it carries, so the length reveals no gap count. decode_and_verify(bytes,
+      chan_id, dir, AR, peer_pk_pc) and verify(&DmAck, ...) open the seal, unpad,
+      decode, length-gate msg_sig at ml_dsa::SIG_LEN, decode the statement, then
+      verify the signature — in that order — and return PeerAck, never AckState, so
+      the ceiling on merge_peer_ack remains the only path in. AckRecordError is
+      Kdf, Module, Signing, Sealing, EntropySource, Aead, Malformed, FieldLength
+      { field, expected, actual }, Signature, Ack(AckError) and TooLarge
+      { got, max }; Aead is the uniform open-path authentication failure and covers
+      a wrong direction, a wrong conversation and a wrong chan_id alike. dir is the
+      direction of the messages being acknowledged, as in dm::ack. NOT YET
+      AVAILABLE: the piggyback path (#235).
       Sub-module dm::collect is the pure collection state machine for one
       direction of one conversation. Collection::new() holds two pointers:
       frontier_page() -> Option<u64> is the highest page observed holding any

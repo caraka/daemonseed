@@ -512,6 +512,37 @@ functions:
     returns:
       type: "Result<Option<Vec<u8>>>"
       description: The unverified prost-encoded DmKeyRecord bytes, or None for an empty slot.
+  - name: VeilidNetHandle::publish_dm_ack
+    module: daemonseed_veilid_net::actor
+    description: Publish one direction's sealed acknowledgement to subkey 0 of its dflt(1) record (ISC-C39). Bytes are opaque here — the caller builds them with daemonseed_core::dm::ack_record::build_encoded and the address with DmAckAddress::for_direction over the same address root and direction. Enqueued on the WB-3 funnel as a Keepalive-class coalescible current-state write under the logical id dm-ack; the statement is monotonic, so a coalesced write carries nothing the surviving one lacks. The record is owner-write-gated — the owner seed derives from the conversation's secret address root — so a third party can neither forge nor erase it, and that seed rides inside the zeroizing DmAckAddress rather than as a copyable array.
+    signature: "pub async fn publish_dm_ack(&self, address: DmAckAddress, record: Vec<u8>) -> Result<()>"
+    parameters:
+      - name: address
+        type: "DmAckAddress"
+        direction: in
+        description: The acknowledgement record's address, from daemonseed_core::dm::ack_record::DmAckAddress::for_direction over the conversation's address root and the direction of the messages being acknowledged. Taken by value; derive one per call.
+      - name: record
+        type: "Vec<u8>"
+        direction: in
+        description: The prost-encoded, already-sealed and already-signed DmAck.
+    returns:
+      type: "Result<()>"
+      description: >-
+        Ok means the write left this layer, NOT that it reached the DHT. The funnel also
+        answers Ok when the write is coalesced away by a later same-record, same-logical-id
+        write, and when a tombstone dominates it.
+  - name: VeilidNetHandle::fetch_dm_ack
+    module: daemonseed_veilid_net::actor
+    description: Fetch a correspondent's acknowledgement record from subkey 0 of its dflt(1) record. Ok(None) is an empty slot — evicted, or never written because the peer has settled nothing — and is the caller's no-confirmation-yet state, deliberately distinct from Err (a transport failure); under a fail-safe delivery posture, conflating them would let a network fault read as an absence of confirmation. The bytes are UNVERIFIED — only daemonseed_core::dm::ack_record::decode_and_verify may open them, and its PeerAck answers nothing until merged under the caller's own ceiling. One gated GET on the read lane; no write funnel involvement (WB-3 I9).
+    signature: "pub async fn fetch_dm_ack(&self, address: DmAckAddress) -> Result<Option<Vec<u8>>>"
+    parameters:
+      - name: address
+        type: "DmAckAddress"
+        direction: in
+        description: The correspondent's acknowledgement-record address, from DmAckAddress::for_direction over the conversation's address root and the direction of the messages being acknowledged — Ratchet::send_direction for a sender reading its peer's acknowledgement. Taken by value; derive one per call.
+    returns:
+      type: "Result<Option<Vec<u8>>>"
+      description: The unverified prost-encoded DmAck bytes, or None for an empty slot.
   - name: VeilidNetHandle::publish_dm_page
     module: daemonseed_veilid_net::actor
     description: >-
