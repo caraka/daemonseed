@@ -26,6 +26,8 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Added
 
+- `cargo xtask check-ui-strings` refuses placeholder text in any string a user can read,
+  and runs as a `release-gate` step.
 - Direct-message doorbell transport: a first-contact entry publishes into a slot of the
   recipient's world-derivable doorbell record, and a recipient sweeps all 32 slots of its own.
   A user's first send is classified `Chat`; a scheduler re-dispatch is `Keepalive`. (#233)
@@ -196,6 +198,9 @@ work lives in the maintainer's own planning notes, not here.
 
 - The default path for `cargo xtask findings-resolved`, which pointed outside the
   repository. The subcommand now requires `--draft <path>`.
+
+- The two placeholder strings on the join-a-circle assurance card, which rendered
+  literally to any user opening the overlay. The end-to-end-encryption line remains.
 
 - The `oxicrypt-zeroize` workspace dependency, which no member crate consumed. daemonseed
   zeroizes through the RustCrypto `zeroize` crate's `Zeroizing` and `ZeroizeOnDrop`;

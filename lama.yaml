@@ -120,7 +120,7 @@ crates:
     manifest: null
 
   - name: xtask
-    purpose: "Workspace task runner. Subcommands: check-manifests, gen-proto, check-proto, isc-coverage, findings-resolved, install-hooks, release-gate (runs the full DoD gate — fmt, clippy across the workspace and the desktop-featured GUI, test, check-proto, isc-coverage, check-manifests — and exits non-zero naming any red step, so a tag is never cut on a red tree)."
+    purpose: "Workspace task runner. Subcommands: check-manifests, gen-proto, check-proto, check-ui-strings (refuses placeholder text in any string a user can read), isc-coverage, findings-resolved, install-hooks, release-gate (runs the full DoD gate — fmt, clippy across the workspace and the desktop-featured GUI, test, check-proto, isc-coverage, check-manifests, check-ui-strings — and exits non-zero naming any red step, so a tag is never cut on a red tree)."
     license: AGPL-3.0-or-later
     status: active
     manifest: null

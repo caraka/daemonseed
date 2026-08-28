@@ -1555,13 +1555,9 @@ export component AppWindow inherits Window {
                         Rectangle { }
                         SealedPill { }
                     }
-                    // The crypto and relay facts on this card are security claims about
-                    // the product, so their wording is settled by security review rather
-                    // than drafted here. The two lines below are structural stand-ins and
-                    // must be replaced with reviewed claims before they ship.
+                    // Any further claim on this card -- what a relay can observe, what
+                    // "N others" means -- is added only once it can be stated accurately.
                     Text { text: "End-to-end encrypted · only people with this phrase can read it."; color: #6fb3a4; font-size: 12px; }
-                    Text { text: "[PENDING SECURITY REVIEW — relay-exposure sentence]"; color: #5b6472; font-size: 11px; }
-                    Text { text: "[PENDING SECURITY REVIEW — \"N others\" only on a trusted relay]"; color: #5b6472; font-size: 11px; }
                 }
             }
 

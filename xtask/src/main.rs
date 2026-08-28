@@ -28,6 +28,7 @@
 //!   `remove_linked_bins`). Run before `git tag`.
 
 mod manifests;
+mod ui_strings;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -53,6 +54,9 @@ enum Cmd {
     GenProto,
     /// Verify that the committed snapshot matches what tonic-build emits.
     CheckProto,
+    /// Refuse placeholder text in any string a user can read (.slint, and the
+    /// gui/tui Rust sources). A placeholder is not shippable by definition.
+    CheckUiStrings,
     /// Report ISC coverage from `daemonseed-integration-tests`. Exits non-zero
     /// if the covered percentage is below `--min` (when supplied).
     IscCoverage {
@@ -91,6 +95,7 @@ fn main() -> Result<()> {
         Cmd::CheckManifests => manifests::check_manifests(&workspace_root_from_xtask()?),
         Cmd::GenProto => gen_proto(),
         Cmd::CheckProto => check_proto(),
+        Cmd::CheckUiStrings => ui_strings::check_ui_strings(&workspace_root_from_xtask()?),
         Cmd::IscCoverage { min } => isc_coverage(min),
         Cmd::FindingsResolved { draft } => findings_resolved(draft),
         Cmd::InstallHooks { target } => install_hooks(target),
@@ -557,6 +562,12 @@ const RELEASE_GATE_STEPS: &[GateStep] = &[
     GateStep {
         name: "xtask check-manifests",
         args: &["xtask", "check-manifests"],
+    },
+    // No other step reads a user-visible string. Cheap: a scan of the .slint
+    // files and the two front-end src trees.
+    GateStep {
+        name: "xtask check-ui-strings",
+        args: &["xtask", "check-ui-strings"],
     },
 ];
 
