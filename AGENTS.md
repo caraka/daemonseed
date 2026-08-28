@@ -42,7 +42,7 @@ Every kind of project fact has exactly **one** canonical home. Do not duplicate 
 
 Three surfaces, one direction of flow — speculative → designed → actionable:
 
-- **GitHub Issues** hold every *concrete, scoped deliverable* (bugs, enhancements, tasks). Type label (`bug`/`enhancement`/`documentation`) + tier label (`tier:punchlist` hot → `tier:candidate` warm → `tier:backlog` cold; **unlabeled tier = needs triage**). A PR closes its issue the ordinary way — `Closes #N` / `Fixes #N` in the PR or commit, auto-closing on merge to `main`.
+- **GitHub Issues** hold every *concrete, scoped deliverable* (bugs, enhancements, tasks). Type label (`bug`/`enhancement`/`documentation`) + tier label (`tier:punchlist` hot → `tier:candidate` warm → `tier:backlog` cold; **unlabeled tier = needs triage**). A PR closes its issue the ordinary way — `Closes #N` / `Fixes #N` in the PR or commit, auto-closing on merge to `main`. A PR that delivers only part of an issue names the part instead, on its own line: `Covers ISC-N of #M`, or `Covers <the part> of #M` where the issue has no criterion IDs. Say what the change contains, never what it leaves out.
 - **`ROADMAP.md`** (root) holds *forward-looking work that is not yet a deliverable*: `Ideas` (speculative), `Designs` (design-first epics, one-line pointers to `docs/design/`), `Features` (wanted-but-deferred). Forward-only, no status/history. When an item is decomposed into actionable work it **becomes GitHub issue(s) and is removed** from `ROADMAP.md`.
 - **`docs/design/*.md`** hold the *design-of-record* for design-first epics (RFC-lite: problem → constraints/ISC invariants → approach → open questions). An accepted design spawns issues; the doc **persists** as rationale.
 
