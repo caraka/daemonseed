@@ -390,7 +390,7 @@ impl TrustEventScope {
 /// have no server-id — not every event regardless of server. The record-kind
 /// field is read the same way, deliberately: a caller that leaves it `None`
 /// while the event carries a kind dismisses nothing, which is a visible
-/// no-op, where the opposite reading would silently dismiss all four kinds.
+/// no-op, where the opposite reading would silently dismiss every kind.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DismissalScope {
     /// Server-id the dismissal is scoped to.
@@ -399,8 +399,8 @@ pub struct DismissalScope {
     pub suite_id: Option<SuiteId>,
     /// Kind of record the dismissal is scoped to.
     ///
-    /// **This field is why one key can be dismissed four different ways.**
-    /// `DmRecordErasureBlocked` fires for all four [`RecordKind`]s and they do
+    /// **This field is why one key can be dismissed once per kind.**
+    /// `DmRecordErasureBlocked` fires for every [`RecordKind`] and they do
     /// not cost the same: a blocked [`RecordKind::Provisional`] erasure leaves
     /// `ss0` readable, while [`RecordKind::ReceiveCursor`] has no secret behind
     /// it at all. Without this, acknowledging the harmless one acknowledged the
@@ -1317,7 +1317,7 @@ mod tests {
     /// `None` is a value, not a wildcard — the same reading `server_id` and
     /// `suite_id` have always had. The failure this pins is a caller that
     /// cannot supply the kind: it dismisses nothing, visibly, rather than
-    /// dismissing all four.
+    /// dismissing every kind.
     #[test]
     fn a_kindless_scope_does_not_match_a_kinded_event() {
         let mut log = TrustEventLog::new(DEFAULT_LOG_CAP);

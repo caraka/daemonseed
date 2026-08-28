@@ -229,7 +229,8 @@ modules:
   - name: daemonseed_core::storage::dm_store
     description: >-
       The DM at-rest store: one directory per correspondence, one fixed-size
-      file per RecordKind (Resume, Provisional, Outbox, ReceiveCursor) inside
+      file per RecordKind (Resume, Provisional, Outbox, ReceiveCursor,
+      ContactCache) inside
       it. DmStore::open derives the seal key from the profile at-rest key
       (HKDF-SHA384 under DM_STORE_SALT/DM_STORE_SEAL) and sweeps orphaned temp
       siblings. critical_section holds an flock across the whole closure and
@@ -243,7 +244,8 @@ modules:
       ReceiveCursor is unsealed and must be exactly 8 bytes. AAD binds the
       correspondence label and the record kind. RecordKind::stable_str /
       from_stable_str give the persisted string form (resume, provisional,
-      outbox, receive-cursor), distinct from the on-disk file name; a string the
+      outbox, receive-cursor, contact-cache), distinct from the on-disk file
+      name; a string the
       build does not recognise decodes to record_kind: None and leaves the rest
       of the audit log readable. Errors
       preserve atomic_file's landed/not-landed distinction. CorrespondenceLabel is an opaque 32-byte
@@ -1084,6 +1086,20 @@ modules:
       msg_sig unconditionally. Plaintext pads to PAD_BUCKETS (8192, 16384) before
       sealing; MAX_FRAME_LEN (32768) is the dflt(16) subkey cap, held as an
       invariant by the body cap and the ladder rather than a runtime check.
+      Sub-module dm::contact_cache is the per-correspondence contact record,
+      stored as RecordKind::ContactCache. ContactRecord holds the
+      correspondent's long-term public key, its pseudonym public key, ss0, and
+      first/last-seen timestamps, in a fixed CONTACT_RECORD_LEN layout;
+      encode() -> Zeroizing<Vec<u8>> and decode(&Zeroizing<Vec<u8>>) are the
+      at-rest form; the record carries no seal of its own and the store seals it.
+      address_root() -> Result<[u8; ROOT_LEN], FirstContactError> derives the
+      channel root from ss0; chan_id is not exposed. new and decode refuse a
+      record whose last_seen_ms precedes its first_seen_ms with
+      ContactCacheError::TimestampsOutOfOrder; decode also gives
+      WrongLength { expected, actual } for any payload that is not
+      CONTACT_RECORD_LEN bytes, and UnsupportedVersion for an unrecognised
+      version byte at a matching length. observed_at(at_ms) -> bool is must_use
+      and refuses any time earlier than last_seen_ms. Debug is redacted.
       Sub-module dm::ack is the delivery acknowledgement's pure half.
       derive_seal_key(AR, dir) -> Result<DmAckSealKey, AckError> is HKDF-SHA-384(
       salt=daemonseed/dm/ack/salt/v1, ikm=AR, info=daemonseed/dm/ack/seal/v3||

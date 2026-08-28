@@ -168,6 +168,7 @@ use zeroize::Zeroize;
 
 use crate::aead_envelope::{EnvelopeError, open_envelope, seal_envelope};
 use crate::circle::message::{NONCE_LEN, TAG_LEN};
+use crate::dm::contact_cache::CONTACT_RECORD_LEN;
 use crate::dm::provisional::PROVISIONAL_RECORD_LEN;
 use crate::dm::resume::MAX_ENCODED_LEN;
 use crate::dm::{LEN_PREFIX, domain, push_lp, unpad};
@@ -343,16 +344,30 @@ pub enum RecordKind {
     /// How far the receiver has read ([`crate::dm::provisional::ReceiveCursor`]).
     /// The one unsealed kind.
     ReceiveCursor,
+    /// What is known about the correspondent themselves
+    /// ([`crate::dm::contact_cache::ContactRecord`]) — their long-term and
+    /// pseudonym public keys, the correspondence's `ss0`, and when they were
+    /// first and last seen.
+    ///
+    /// **Arrives as plaintext**, unlike [`RecordKind::Provisional`]. This record
+    /// carries no seal of its own, so this store's seal and its AAD are the
+    /// whole of its protection, and `ss0` is live in the payload until
+    /// [`Locked::replace`] seals it. Weakening either for this kind is therefore
+    /// not the defence-in-depth trade it would be for a pre-sealed kind — there
+    /// is no second layer behind it. `crate::dm::contact_cache` argues why the
+    /// record has no seal of its own.
+    ContactCache,
 }
 
 impl RecordKind {
     /// Every kind, for enumeration. Hand-maintained, and held to the enum by
     /// `record_kind_all_is_complete`.
-    pub const ALL: [RecordKind; 4] = [
+    pub const ALL: [RecordKind; 5] = [
         RecordKind::Resume,
         RecordKind::Provisional,
         RecordKind::Outbox,
         RecordKind::ReceiveCursor,
+        RecordKind::ContactCache,
     ];
 
     /// The stable string form, for local persistence.
@@ -362,7 +377,7 @@ impl RecordKind {
     /// silently rewrite history, which is the same reason
     /// [`crate::trust_events`] stores event keys by string; a file name is a
     /// storage-layout detail that a later layout change would be free to move,
-    /// and a persisted log must not be hostage to that. These four strings are
+    /// and a persisted log must not be hostage to that. These five strings are
     /// frozen once written to a log.
     pub const fn stable_str(self) -> &'static str {
         match self {
@@ -370,6 +385,7 @@ impl RecordKind {
             RecordKind::Provisional => "provisional",
             RecordKind::Outbox => "outbox",
             RecordKind::ReceiveCursor => "receive-cursor",
+            RecordKind::ContactCache => "contact-cache",
         }
     }
 
@@ -398,6 +414,7 @@ impl RecordKind {
             RecordKind::Provisional => "provisional.bin",
             RecordKind::Outbox => "outbox.bin",
             RecordKind::ReceiveCursor => "cursor.bin",
+            RecordKind::ContactCache => "contact-cache.bin",
         }
     }
 
@@ -413,6 +430,9 @@ impl RecordKind {
             RecordKind::Provisional => PROVISIONAL_RECORD_LEN,
             RecordKind::Outbox => OUTBOX_CAPACITY,
             RecordKind::ReceiveCursor => RECEIVE_CURSOR_LEN,
+            // As with `Provisional`: the record is already one fixed size by
+            // construction, so the store's bucket is exactly it.
+            RecordKind::ContactCache => CONTACT_RECORD_LEN,
         }
     }
 
@@ -461,6 +481,7 @@ impl RecordKind {
             // AAD. It is here so the mapping stays total and a later decision to
             // seal it does not have to invent a value that might collide.
             RecordKind::ReceiveCursor => 4,
+            RecordKind::ContactCache => 5,
         }
     }
 }
@@ -1730,7 +1751,7 @@ impl DmStoreError {
     /// establishes is the failure this exists to make visible.
     ///
     /// **It carries the [`RecordKind`], and that is what the scope type is
-    /// for.** One key fires for all four kinds and they do not cost the same:
+    /// for.** One key fires for every kind and they do not cost the same:
     /// a blocked [`RecordKind::Provisional`] erasure leaves `ss0` readable,
     /// which roots `RK0` — the forward-secrecy premise the fail-closed delete
     /// exists to protect — while [`RecordKind::ReceiveCursor`] is the one
@@ -1927,7 +1948,8 @@ mod tests {
                 RecordKind::Resume
                 | RecordKind::Provisional
                 | RecordKind::Outbox
-                | RecordKind::ReceiveCursor => {}
+                | RecordKind::ReceiveCursor
+                | RecordKind::ContactCache => {}
             }
         }
         let mut names: Vec<_> = RecordKind::ALL.iter().map(|k| k.file_name()).collect();
@@ -1973,6 +1995,12 @@ mod tests {
         assert_eq!(RecordKind::Resume.capacity(), 65_536);
         assert_eq!(RecordKind::Outbox.capacity(), 2_097_152);
         assert_eq!(RecordKind::ReceiveCursor.capacity(), 8);
+        // The contact record's size is the module's, not a copy of it.
+        assert_eq!(RecordKind::ContactCache.capacity(), CONTACT_RECORD_LEN);
+        assert_eq!(
+            CONTACT_RECORD_LEN, 5233,
+            "the encoded contact record's size"
+        );
 
         assert_eq!(RecordKind::ReceiveCursor.on_disk_len(), 8, "unsealed");
         for kind in RecordKind::ALL.iter().filter(|k| k.is_sealed()) {
@@ -1989,6 +2017,7 @@ mod tests {
         assert_eq!(RecordKind::Provisional.aad_tag(), 2);
         assert_eq!(RecordKind::Outbox.aad_tag(), 3);
         assert_eq!(RecordKind::ReceiveCursor.aad_tag(), 4);
+        assert_eq!(RecordKind::ContactCache.aad_tag(), 5);
         let mut tags: Vec<_> = RecordKind::ALL.iter().map(|k| k.aad_tag()).collect();
         tags.sort_unstable();
         tags.dedup();
@@ -2006,6 +2035,7 @@ mod tests {
             g.replace(RecordKind::Resume, &payload(0))?;
             g.replace(RecordKind::Provisional, &payload(PROVISIONAL_RECORD_LEN))?;
             g.replace(RecordKind::Outbox, &payload(9))?;
+            g.replace(RecordKind::ContactCache, &payload(CONTACT_RECORD_LEN))?;
             g.replace(RecordKind::ReceiveCursor, &7u64.to_be_bytes())
         })
         .unwrap();
@@ -2238,20 +2268,25 @@ mod tests {
             assert!(!seen.contains(&s), "stable strings must be unique: {s}");
             seen.push(s);
         }
-        assert_eq!(seen.len(), 4);
+        // A literal, deliberately, and not `RecordKind::ALL.len()`. The loop
+        // pushes once per member of `ALL`, so comparing against `ALL.len()` is a
+        // tautology that holds for any set of kinds — it would keep passing if a
+        // member were silently replaced by another. The literal is the only part
+        // of this test that notices the enum changing shape.
+        assert_eq!(seen.len(), 5, "five kinds, five distinct stable strings");
         assert_eq!(RecordKind::from_stable_str("resume.bin"), None);
         assert_eq!(RecordKind::from_stable_str("nope"), None);
     }
 
     /// Every kind reaches the trust event as *itself* — end to end, through the
-    /// unlink site, four separate erasures.
+    /// unlink site, one separate erasure per kind.
     ///
     /// **The kinds do not cost the same, which is the whole reason the event
     /// carries one.** A blocked [`RecordKind::Provisional`] erasure leaves
     /// `ss0` on disk; [`RecordKind::ReceiveCursor`] is unsealed and has no
     /// secret behind it. `an_unrepairable_erasure_is_a_distinct_error_carrying_its_trust_event`
     /// pins one kind, which a hardcoded `RecordKind::Outbox` at the raise site
-    /// would satisfy; this pins all four, so it cannot be.
+    /// would satisfy; this pins every kind, so it cannot be.
     #[cfg(unix)]
     #[test]
     fn every_kind_reaches_the_erasure_event_as_itself() {
@@ -2264,7 +2299,7 @@ mod tests {
         // Guards the loop against a future `ALL` that stops covering the enum,
         // which would make every assertion below vacuously true for the kinds
         // it dropped.
-        assert_eq!(RecordKind::ALL.len(), 4, "one erasure per kind");
+        assert_eq!(RecordKind::ALL.len(), 5, "one erasure per kind");
 
         for (i, kind) in RecordKind::ALL.into_iter().enumerate() {
             let tmp = tempfile::tempdir().unwrap();
@@ -2322,7 +2357,7 @@ mod tests {
     /// is reachable, and this test says plainly that it is only that half.
     #[test]
     fn every_kind_survives_the_hop_from_error_to_trust_event() {
-        assert_eq!(RecordKind::ALL.len(), 4, "one case per kind");
+        assert_eq!(RecordKind::ALL.len(), 5, "one case per kind");
         for kind in RecordKind::ALL {
             for scrubbed in [false, true] {
                 let err = DmStoreError::ErasureBlocked {
@@ -3838,6 +3873,157 @@ mod tests {
         assert!(
             matches!(err, DmStoreError::NotAuthentic { .. }),
             "the store key and the provisional record's key must be different keys, got {err:?}"
+        );
+    }
+
+    /// A contact record survives the whole path — encoded by its own module,
+    /// padded and sealed by the store, written, read, unpadded and decoded —
+    /// with every stored field intact and the file at the kind's fixed size.
+    ///
+    /// Compared field by field rather than as bytes, because the fields are what
+    /// a caller uses. `ss0` has no accessor by design, so it is checked through
+    /// the value it derives.
+    #[test]
+    fn a_contact_record_round_trips_through_the_store() {
+        use crate::dm::contact_cache::ContactRecord;
+        use crate::dm::firstcontact::{SS0_LEN, derive_channel_roots};
+        use oxicrypt_ml_dsa as ml_dsa;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let l = label(31);
+        let kind = RecordKind::ContactCache;
+
+        let pk_lt: Box<[u8; ml_dsa::PK_LEN]> = Box::new([0x11u8; ml_dsa::PK_LEN]);
+        let pk_pc: Box<[u8; ml_dsa::PK_LEN]> = Box::new([0x22u8; ml_dsa::PK_LEN]);
+        assert_ne!(pk_lt, pk_pc, "the fixture's two keys are the same key");
+        let ss0 = [0x33u8; SS0_LEN];
+        const FIRST: i64 = 1_700_000_000_000;
+        const LAST: i64 = 1_700_000_999_999;
+        assert_ne!(FIRST, LAST, "the two timestamps are the same value");
+
+        let encoded = ContactRecord::new(
+            pk_lt.clone(),
+            pk_pc.clone(),
+            zeroize::Zeroizing::new(ss0),
+            FIRST,
+            LAST,
+        )
+        .unwrap()
+        .encode();
+        assert_eq!(encoded.len(), kind.capacity(), "the bucket is the record");
+
+        s.critical_section::<_, DmStoreError>(&l, |g| g.replace(kind, &encoded))
+            .unwrap();
+
+        let path = tmp
+            .path()
+            .join("dm")
+            .join(l.dir_name())
+            .join("contact-cache.bin");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len() as usize,
+            kind.on_disk_len(),
+            "a contact record must be one fixed size on disk"
+        );
+
+        // `Locked::read` hands back a plain `Vec<u8>`, and for this kind that
+        // payload is cleartext `ss0`. `decode` takes a `Zeroizing` buffer so the
+        // wrapping cannot be forgotten; this is what that looks like at a call site.
+        let read = zeroize::Zeroizing::new(
+            s.critical_section::<_, DmStoreError>(&l, |g| g.read(kind))
+                .unwrap()
+                .expect("the record is there"),
+        );
+        assert_eq!(*read, *encoded, "the store handed back other bytes");
+
+        let reopened = ContactRecord::decode(&read).expect("decodes");
+        assert_eq!(reopened.pk_lt(), pk_lt.as_ref());
+        assert_eq!(reopened.pk_pc(), pk_pc.as_ref());
+        assert_eq!(reopened.first_seen_ms(), FIRST);
+        assert_eq!(reopened.last_seen_ms(), LAST);
+        assert_eq!(
+            reopened.address_root().unwrap(),
+            derive_channel_roots(&ss0).unwrap().ar,
+            "the derived AR does not match an independent derivation over ss0"
+        );
+    }
+
+    /// **The oracle for what protects a contact record.** The record carries no
+    /// seal of its own, so the store's AAD is the whole of its binding: without
+    /// it, copying one correspondence's contact record over another's would open
+    /// cleanly and hand a signature check the wrong pseudonym key.
+    ///
+    /// `a_record_from_another_correspondence_does_not_open` makes this point for
+    /// `Resume`. It is made again here rather than assumed, because this kind is
+    /// the one with nothing behind the store to catch a splice.
+    #[test]
+    fn a_contact_record_from_another_correspondence_does_not_open() {
+        use crate::dm::contact_cache::ContactRecord;
+        use crate::dm::firstcontact::SS0_LEN;
+        use oxicrypt_ml_dsa as ml_dsa;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let (a, b) = (label(32), label(33));
+        let kind = RecordKind::ContactCache;
+
+        let encode = |tag: u8| {
+            ContactRecord::new(
+                Box::new([tag; ml_dsa::PK_LEN]),
+                Box::new([tag ^ 0xFF; ml_dsa::PK_LEN]),
+                zeroize::Zeroizing::new([tag; SS0_LEN]),
+                1_700_000_000_000,
+                1_700_000_000_001,
+            )
+            .unwrap()
+            .encode()
+        };
+
+        s.critical_section::<_, DmStoreError>(&a, |g| g.replace(kind, &encode(0xA1)))
+            .unwrap();
+        s.critical_section::<_, DmStoreError>(&b, |g| g.replace(kind, &encode(0xB2)))
+            .unwrap();
+
+        let root = tmp.path().join("dm");
+        let a_path = root.join(a.dir_name()).join("contact-cache.bin");
+        let b_path = root.join(b.dir_name()).join("contact-cache.bin");
+        let a_bytes = std::fs::read(&a_path).unwrap();
+
+        // Positive control: A's own bytes back in A's slot still open, so the
+        // failure below is the AAD binding and not the copy itself.
+        std::fs::write(&a_path, &a_bytes).unwrap();
+        let back = zeroize::Zeroizing::new(
+            s.critical_section::<_, DmStoreError>(&a, |g| g.read(kind))
+                .unwrap()
+                .expect("A's record is there"),
+        );
+        assert_eq!(
+            ContactRecord::decode(&back).unwrap().pk_lt(),
+            &[0xA1u8; ml_dsa::PK_LEN],
+            "the control read back a different correspondence's record"
+        );
+
+        std::fs::write(&b_path, &a_bytes).unwrap();
+        let err = s
+            .critical_section::<_, DmStoreError>(&b, |g| g.read(kind))
+            .unwrap_err();
+        assert!(
+            matches!(err, DmStoreError::NotAuthentic { .. }),
+            "a contact record spliced from another correspondence must fail to \
+             open, got {err:?}"
+        );
+
+        // And the same record under another profile's key: the second half of
+        // what the store is doing for a kind that seals nothing itself.
+        std::fs::write(&a_path, &a_bytes).unwrap();
+        let theirs = DmStore::open(&root, &OTHER_AT_REST).unwrap();
+        let err = theirs
+            .critical_section::<_, DmStoreError>(&a, |g| g.read(kind))
+            .unwrap_err();
+        assert!(
+            matches!(err, DmStoreError::NotAuthentic { .. }),
+            "another profile's key opened a contact record, got {err:?}"
         );
     }
 

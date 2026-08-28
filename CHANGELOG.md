@@ -222,7 +222,7 @@ work lives in the maintainer's own planning notes, not here.
   longer part of it; change history is `CHANGELOG.md` and the signed tags, and the live
   criterion count comes from `cargo xtask isc-coverage`.
 - Scoped trust-event dismissal to the kind of record it concerns, so acknowledging a blocked
-  erasure of one kind leaves the other three standing. (#337)
+  erasure of one kind leaves the others standing. (#337)
 - Skipped and counted a trust-log entry whose event key this build does not know, where the
   whole log previously failed to open. (#337)
 - Refused a stated Argon2 cost outside `ArgonParams::is_openable` before any key is derived
@@ -930,6 +930,10 @@ work lives in the maintainer's own planning notes, not here.
 - The GUI announcements pane orders posts newest first by `sent_unix_ms`, ties
   broken by content-address slot key (#237). Posts previously rendered in
   content-address order, placing a newer announcement below an older one.
+- `daemonseed_core::dm::contact_cache::ContactRecord` and `RecordKind::ContactCache`,
+  the DM store's fifth record kind: the correspondent's long-term and pseudonym
+  public keys, `ss0`, and first/last-seen timestamps, in a fixed
+  `CONTACT_RECORD_LEN` layout sealed by the store. (#236)
 
 ### Changed
 

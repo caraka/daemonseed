@@ -586,8 +586,8 @@ pub enum FetchStatus {
 /// the affordance class via [`class_of`]; `server_id` and `record_kind` scope
 /// dismissal.
 ///
-/// **`record_kind` is here so the list can hold four rows for one key.** A
-/// blocked erasure fires the same key for all four [`RecordKind`]s, and this
+/// **`record_kind` is here so the list can hold one row per kind for one key.** A
+/// blocked erasure fires the same key for every [`RecordKind`], and this
 /// type is what the persistent list de-duplicates on — so without the kind, all
 /// four collapse into a single row and the user has no way to acknowledge the
 /// harmless one without acknowledging the dangerous one, whatever
@@ -4798,12 +4798,12 @@ mod tests {
         assert_eq!(app.persistent_trust().len(), 1, "no duplicate badge");
     }
 
-    /// One key, four kinds of record, four rows — and the scope each row
-    /// produces names its own kind.
+    /// One key, one row per kind of record — and the scope each row produces
+    /// names its own kind.
     ///
     /// **This is the row half of the dismissal fix.** `DmRecordErasureBlocked`
-    /// fires for all four [`RecordKind`]s, and the badge list de-duplicates on
-    /// [`TrustItem`]. While that type had no kind, the four were one row, and a
+    /// fires for every [`RecordKind`], and the badge list de-duplicates on
+    /// [`TrustItem`]. While that type had no kind, they were one row, and a
     /// user could not acknowledge the `ReceiveCursor` erasure — which has no
     /// secret behind it — without acknowledging the `Provisional` one, which
     /// leaves `ss0` readable. A scope that can express the difference is no use
@@ -4820,7 +4820,7 @@ mod tests {
         assert_eq!(
             app.persistent_trust().len(),
             RecordKind::ALL.len(),
-            "four kinds are four rows, not one"
+            "each kind is its own row, not one row for all of them"
         );
 
         // Re-folding the same kind still de-duplicates: the row is keyed on the
@@ -4946,7 +4946,7 @@ mod tests {
         assert_eq!(
             app.persistent_trust().len(),
             RecordKind::ALL.len(),
-            "control: four rows before any dismissal"
+            "control: one row per kind before any dismissal"
         );
         assert_eq!(app.trust_log().len(), RecordKind::ALL.len());
 
