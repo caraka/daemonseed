@@ -9,7 +9,11 @@
 //! under, the preimage it is signed over, and the state machine that decides what
 //! "collected up to here" means. It publishes nothing, reads nothing, and knows
 //! about no record — the transport slice owns the ack record, its jittered
-//! standalone cadence, and the piggyback path.
+//! standalone cadence, and the piggyback path. The part of that cadence which is
+//! decidable without a record — the client-global allowance governing how often a
+//! standalone acknowledgement may be written at all — is
+//! [`ack_budget`](crate::dm::ack_budget); what remains with the transport slice is
+//! the record, the jitter within a window, and the piggyback.
 //!
 //! ## Why an acknowledgement exists at all
 //!

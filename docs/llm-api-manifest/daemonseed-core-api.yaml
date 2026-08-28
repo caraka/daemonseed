@@ -1110,6 +1110,14 @@ modules:
       rule. BlockList is neither Copy nor Clone. It is in-memory only: there is
       no encode, no RecordKind and no store, so a block does not survive a
       restart.
+      Sub-module dm::ack_budget holds the client-global allowance for standalone
+      acknowledgements. StandaloneAckBudget::new() is unspent and grants its
+      first request; request(now_ms) -> AckPermit returns Granted, spending the
+      allowance, or Refused { retry_after_ms } with the remainder of
+      STANDALONE_ACK_MIN_INTERVAL_MS (60000). AckPermit is must_use. One budget
+      is held per client and shared across every conversation; a per-conversation
+      instance permits N writes per interval. A refusal spends nothing, and a
+      now_ms earlier than the last grant refuses.
       Sub-module dm::ack is the delivery acknowledgement's pure half.
       derive_seal_key(AR, dir) -> Result<DmAckSealKey, AckError> is HKDF-SHA-384(
       salt=daemonseed/dm/ack/salt/v1, ikm=AR, info=daemonseed/dm/ack/seal/v3||

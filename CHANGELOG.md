@@ -938,6 +938,11 @@ work lives in the maintainer's own planning notes, not here.
   public keys with `block`, `unblock`, `is_blocked`, and the two suppression
   predicates `suppresses_knock` (over an opened first-contact entry) and
   `suppresses_channel`. In memory only; not persisted. (#236)
+- `daemonseed_core::dm::ack_budget` — the client-global allowance for standalone
+  acknowledgements. `StandaloneAckBudget::request(now_ms)` returns `AckPermit::Granted` or
+  `AckPermit::Refused { retry_after_ms }` against `STANDALONE_ACK_MIN_INTERVAL_MS` (60 s),
+  shared across every conversation rather than held per channel. The clock is an argument, and
+  one that goes backwards refuses. (#235)
 
 ### Changed
 
