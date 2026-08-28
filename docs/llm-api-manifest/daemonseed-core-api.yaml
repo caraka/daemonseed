@@ -1100,6 +1100,16 @@ modules:
       CONTACT_RECORD_LEN bytes, and UnsupportedVersion for an unrecognised
       version byte at a matching length. observed_at(at_ms) -> bool is must_use
       and refuses any time earlier than last_seen_ms. Debug is redacted.
+      Sub-module dm::block_list holds the DM revocation set. BlockList is keyed
+      on the long-term identity public key ([u8; ml_dsa::PK_LEN]);
+      block(pk_lt) -> bool and unblock(pk_lt) -> bool report whether the list
+      changed, is_blocked(pk_lt) -> bool is the rule, and len / is_empty report
+      size. suppresses_knock(&VerifiedFirstContact) -> bool is the doorbell
+      plane and reads the entry's pk_lt, not its pk_pc;
+      suppresses_channel(pk_lt) -> bool is the channel plane. Both are the same
+      rule. BlockList is neither Copy nor Clone. It is in-memory only: there is
+      no encode, no RecordKind and no store, so a block does not survive a
+      restart.
       Sub-module dm::ack is the delivery acknowledgement's pure half.
       derive_seal_key(AR, dir) -> Result<DmAckSealKey, AckError> is HKDF-SHA-384(
       salt=daemonseed/dm/ack/salt/v1, ikm=AR, info=daemonseed/dm/ack/seal/v3||

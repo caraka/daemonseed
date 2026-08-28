@@ -934,6 +934,10 @@ work lives in the maintainer's own planning notes, not here.
   the DM store's fifth record kind: the correspondent's long-term and pseudonym
   public keys, `ss0`, and first/last-seen timestamps, in a fixed
   `CONTACT_RECORD_LEN` layout sealed by the store. (#236)
+- `daemonseed_core::dm::block_list::BlockList` — a set of long-term identity
+  public keys with `block`, `unblock`, `is_blocked`, and the two suppression
+  predicates `suppresses_knock` (over an opened first-contact entry) and
+  `suppresses_channel`. In memory only; not persisted. (#236)
 
 ### Changed
 
