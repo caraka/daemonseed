@@ -80,8 +80,13 @@
 //!
 //! No persistence, no restore path, no transport, no contact cache, no block
 //! list, and no notion of a conversation identity — a [`Collection`] is about one
-//! direction of one conversation and knows nothing that would name it. The store
-//! that would persist it is an open decision (#243).
+//! direction of one conversation and knows nothing that would name it.
+//!
+//! **The store is no longer an open question, only an unconnected one.**
+//! [`crate::storage::dm_store`] exists, and a collection's cursor has a record
+//! kind waiting for it — [`RecordKind::ReceiveCursor`](crate::storage::dm_store::RecordKind::ReceiveCursor),
+//! written through [`DmPersist::advance_cursor`](crate::dm::persist::DmPersist::advance_cursor).
+//! Nothing here calls it: what is missing is the wiring, not the decision.
 
 use std::ops::RangeInclusive;
 
