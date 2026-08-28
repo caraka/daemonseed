@@ -52,6 +52,8 @@ So: an idea enters `ROADMAP.md`; if it needs design, it gets a `docs/design/` do
 
 **A reference to a pull request or an issue names which it is:** `PR #385`, `issue #385`. GitHub gives both one number space — `#385` resolves to whichever exists and says nothing about which — so the word is the only thing that tells a reader what they are about to open. Write it with a space: `PR#385` does not autolink, because a word character immediately before `#` stops GitHub creating the reference at all.
 
+**In a commit message, never start a line with the reference.** Git treats a line beginning with `#` as a comment and deletes it when it cleans a message up, so a bare `#385` alone on the last line survives the commit that writes it and is silently dropped by the first rebase or amend — the reference is gone from the landed history and nothing reports it. Keep a word in front of it, on the same line: `Closes #385`, `Covers ISC-N of issue #385`.
+
 ## Branch & merge workflow
 
 Every change lands on `main` through a **pull request** — never a direct push or a local fast-forward to `main`, even for a single-author or trivial change.
