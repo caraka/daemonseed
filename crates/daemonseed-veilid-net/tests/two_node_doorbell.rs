@@ -310,10 +310,34 @@ async fn a_knock_reaches_the_recipients_doorbell_and_opens_for_them_alone() {
         unknocked_seed, owner_seed_b,
         "the control must name a DIFFERENT record, or it is re-sweeping B's"
     );
-    let unknocked = node_b
-        .sweep_doorbell(unknocked_seed)
-        .await
-        .expect("sweeping a never-knocked doorbell is not an error");
+    // Retried, like every other network step here: propagation on the DHT takes
+    // minutes, and this sweep runs at the end of a session already minutes old.
+    //
+    // **A transient error is NOT read as absence.** That would make this control
+    // vacuous — "the record is not there" and "I could not find out" are the same
+    // thing to a caller and opposite facts to this assertion. So the loop waits for
+    // a definitive answer and fails with the last error if none arrives.
+    let mut unknocked = None;
+    let mut last_err = None;
+    for attempt in 0..30 {
+        match node_b.sweep_doorbell(unknocked_seed).await {
+            Ok(outcome) => {
+                unknocked = Some(outcome);
+                break;
+            }
+            Err(e) => {
+                eprintln!("attempt {attempt}: never-knocked sweep not yet definitive: {e}");
+                last_err = Some(e);
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        }
+    }
+    let unknocked = unknocked.unwrap_or_else(|| {
+        panic!(
+            "sweeping a never-knocked doorbell never returned a definitive answer; \
+             last error: {last_err:?}"
+        )
+    });
     assert!(unknocked.slots.is_empty());
     assert_eq!(
         unknocked.outcome.attempted, 0,

@@ -227,6 +227,8 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Changed
 
+- The two-node doorbell oracle's closing control waits for a definitive answer and never
+  reads a transient error as an absent record. (#233)
 - Tests, manifests and design documents that need a public Veilid attach describe what the
   test does and how to opt into it, naming no machine, host or network topology.
 - `ISA.md` carries the design contract only — problem, boundaries, language, principles,
