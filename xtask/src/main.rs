@@ -23,9 +23,10 @@
 //!   would notice (#326).
 //! - `release-gate` — run the full Definition-of-Done gate and refuse a
 //!   non-zero exit if any check is red, so a release tag is never cut on a
-//!   red tree. Runs the test suite in BOTH the dev and release profiles (#274),
-//!   then deletes the binaries those steps linked into `target/` (see
-//!   `remove_linked_bins`). Run before `git tag`.
+//!   red tree. Type-checks the workspace in the release profile (#381) and runs
+//!   the test suite in BOTH the dev and release profiles (#274), then deletes
+//!   the binaries those steps linked into `target/` (see `remove_linked_bins`).
+//!   Run before `git tag`.
 
 mod manifests;
 mod ui_strings;
@@ -84,9 +85,10 @@ enum Cmd {
         target: Option<PathBuf>,
     },
     /// Run the full Definition-of-Done gate (fmt, clippy workspace +
-    /// gui/desktop, test --workspace, check-proto, isc-coverage) and refuse
-    /// (non-zero exit) if any check is red — so a release tag is never cut on a
-    /// red tree (#62). Run before `git tag`.
+    /// gui/desktop, check --release, test --workspace, test --workspace
+    /// --release, check-proto, isc-coverage, check-manifests,
+    /// check-ui-strings) and refuse (non-zero exit) if any check is red — so
+    /// a release tag is never cut on a red tree (#62). Run before `git tag`.
     ReleaseGate,
 }
 
@@ -535,6 +537,15 @@ const RELEASE_GATE_STEPS: &[GateStep] = &[
             "warnings",
         ],
     },
+    // #381: a type-check of the workspace in the profile that ships. `debug_assert!`
+    // expands its arguments in every profile, so a binding introduced under
+    // `#[cfg(debug_assertions)]` and read only by a `debug_assert_eq!` compiles in dev
+    // and fails to compile in release (E0425). `check` rather than `build`: it does not
+    // link, and reuses the release cache the release-profile test step below fills.
+    GateStep {
+        name: "check --workspace --release",
+        args: &["check", "--workspace", "--release"],
+    },
     GateStep {
         name: "test --workspace",
         args: &["test", "--workspace"],
@@ -665,6 +676,20 @@ mod tests {
                 .any(|s| s.args == ["test", "--workspace"]),
             "the dev-profile test step must not be replaced"
         );
+    }
+
+    /// #381: the gate must type-check the workspace in the release profile. Every other
+    /// compile step runs with `debug_assertions` on, and `debug_assert!` expands its
+    /// arguments in every profile, so a binding under `#[cfg(debug_assertions)]` read
+    /// only by a `debug_assert_eq!` compiles in dev and fails in release. Asserted on
+    /// the step table so deleting the step is a test failure.
+    #[test]
+    fn the_gate_type_checks_the_workspace_in_the_release_profile() {
+        let step = RELEASE_GATE_STEPS
+            .iter()
+            .find(|s| s.args.first() == Some(&"check"))
+            .expect("the release-profile check step must be in the gate");
+        assert_eq!(step.args, ["check", "--workspace", "--release"]);
     }
 
     /// The linked-binary sweep removes what a `cargo test`/`clippy --all-targets` step

@@ -37,6 +37,8 @@ work lives in the maintainer's own planning notes, not here.
   build without them does not verify against one with them, in either direction.
   **Breaking (crate API):** `frame::seal` and `frame::frame_sig_input` take the
   acknowledgement as a new argument, and `DmFrameError` gains a `PiggybackedAck` variant.
+- `cargo check --workspace --release` runs as a `pre-push` gate and a `release-gate` step,
+  covering code that compiles under `debug_assertions` and not in the release profile. (#381)
 - `cargo xtask check-ui-strings` refuses placeholder text in any string a user can read,
   and runs as a `release-gate` step.
 - Direct-message doorbell transport: a first-contact entry publishes into a slot of the

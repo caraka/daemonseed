@@ -52,6 +52,8 @@ So: an idea enters `ROADMAP.md`; if it needs design, it gets a `docs/design/` do
 
 **A reference to a pull request or an issue names which it is:** `PR #385`, `issue #385`. GitHub gives both one number space — `#385` resolves to whichever exists and says nothing about which — so the word is the only thing that tells a reader what they are about to open. Write it with a space: `PR#385` does not autolink, because a word character immediately before `#` stops GitHub creating the reference at all.
 
+**This naming convention does NOT extend to an actual closing keyword.** `Closes`/`Fixes`/`Resolves` (any case) must sit directly against the bare `#N` — `Closes #385`, never `Closes issue #385`. GitHub's auto-close parser does not recognize a noun between the keyword and the number: a PR body and commit both carrying `Closes issue #391` produced an empty `closingIssuesReferences`, verified via `gh api graphql`. Reserve the `PR #N` / `issue #N` form for a plain citation that closes nothing; a line that closes something drops the noun.
+
 **In a commit message, never start a line with the reference.** Git treats a line beginning with `#` as a comment and deletes it when it cleans a message up, so a bare `#385` alone on the last line survives the commit that writes it and is silently dropped by the first rebase or amend — the reference is gone from the landed history and nothing reports it. Keep a word in front of it, on the same line: `Closes #385`, `Covers ISC-N of issue #385`.
 
 ## Branch & merge workflow
@@ -69,13 +71,14 @@ Every task is incomplete until all of these pass:
 
 1. `cargo fmt --all --check` — no unformatted code
 2. `cargo clippy --workspace --all-targets -- -D warnings` — no warnings
-3. `cargo test --workspace` — all tests pass
-4. `cargo xtask check-proto` — generated protobuf code matches the committed snapshot (per the hybrid codegen decision: `build.rs` regenerates each build; CI verifies the committed snapshot)
-5. **Doc-sync** — the commit is the gate: every commit that changed tracked state landed with its documentation already true (see **Doc-sync reconciliation**). This is the judgment gate alongside the four mechanical checks.
+3. `cargo check --workspace --release` — the workspace type-checks in the profile that ships. Every other check compiles the dev profile, where `debug_assertions` is on; `debug_assert!` expands its arguments in every profile, so a binding introduced under `#[cfg(debug_assertions)]` and read only by a `debug_assert_eq!` compiles in dev and fails to compile in release
+4. `cargo test --workspace` — all tests pass
+5. `cargo xtask check-proto` — generated protobuf code matches the committed snapshot (per the hybrid codegen decision: `build.rs` regenerates each build; CI verifies the committed snapshot)
+6. **Doc-sync** — the commit is the gate: every commit that changed tracked state landed with its documentation already true (see **Doc-sync reconciliation**). This is the judgment gate alongside the five mechanical checks.
 
-Run checks 1–4 as the last step before handing control back to the user, and re-run after any post-review fix-ups; check 5 (doc-sync) is applied per-commit as you go, not deferred to handback. If `cargo fmt --all --check` reports diffs, run `cargo fmt --all` to fix them before the clippy step — clippy output is easier to read on formatted code.
+Run checks 1–5 as the last step before handing control back to the user, and re-run after any post-review fix-ups; check 6 (doc-sync) is applied per-commit as you go, not deferred to handback. If `cargo fmt --all --check` reports diffs, run `cargo fmt --all` to fix them before the clippy step — clippy output is easier to read on formatted code.
 
-**Cutting a release tag:** run `cargo xtask release-gate` before `git tag`. It runs the full DoD gate (fmt · clippy workspace + `daemonseed-gui --features desktop` · `test --workspace` · check-proto · isc-coverage · check-manifests) and exits non-zero naming any red step, so a tag is never created on a red tree — the v0.29.0 slip, where a tag was cut while `test --workspace` was red. The pre-push hook is the backstop on push; the release-gate stops the tag being created in the first place.
+**Cutting a release tag:** run `cargo xtask release-gate` before `git tag`. It runs the full DoD gate (fmt · clippy workspace + `daemonseed-gui --features desktop` · `check --workspace --release` · `test --workspace` · `test --workspace --release` · check-proto · isc-coverage · check-manifests · check-ui-strings) and exits non-zero naming any red step, so a tag is never created on a red tree — the v0.29.0 slip, where a tag was cut while `test --workspace` was red. The pre-push hook is the backstop on push; the release-gate stops the tag being created in the first place.
 
 ## Documentation sync at every commit point
 
