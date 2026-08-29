@@ -227,8 +227,8 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Changed
 
-- Tests, manifests and design documents that need a public Veilid attach state what the
-  host must provide instead of naming a machine.
+- Tests, manifests and design documents that need a public Veilid attach describe what the
+  test does and how to opt into it, naming no machine, host or network topology.
 - `ISA.md` carries the design contract only — problem, boundaries, language, principles,
   constraints, the criteria under their permanent IDs, the durable design decisions, and
   how they are verified. Build narrative and per-session verification records are no

@@ -177,7 +177,7 @@ fn assert_merged_as_collected(merged: &AckState) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs public Veilid attach; run on a real-network host with --ignored"]
+#[ignore = "attaches to the public Veilid network; opt-in, run with --ignored"]
 async fn an_acknowledgement_published_by_one_node_merges_at_the_other() {
     daemonseed_core::kats::initialize_module_unsigned_test_binary().expect("oxicrypt init");
 

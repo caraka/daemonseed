@@ -254,7 +254,7 @@ fn median(mut v: Vec<u128>) -> Option<u128> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs public Veilid attach; run on a real-network host with --ignored --nocapture"]
+#[ignore = "attaches to the public Veilid network; opt-in, run with --ignored --nocapture"]
 async fn private_route_transit_matrix() {
     let base = std::env::temp_dir().join("daemonseed-transit-exp");
     let _ = std::fs::remove_dir_all(&base);

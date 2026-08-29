@@ -28,12 +28,13 @@
 //!    world-READABLE record safe is that the entry is sealed to B's encapsulation
 //!    key; anyone can read the bytes and nobody else can open them.
 //!
-//! `#[ignore]` — it needs a host that can attach to the PUBLIC Veilid network.
-//! Where attach is blocked, `attach_and_wait` returns `NotReady` after the full
-//! 180 s timeout. Run it on a host that can attach:
+//! `#[ignore]` — it attaches to the public Veilid network and takes minutes, so it
+//! is opt-in rather than part of an ordinary test run:
 //!
-//!     cd crates/daemonseed-veilid-net
-//!     cargo test --test two_node_doorbell -- --ignored --nocapture
+//!     cargo test -p daemonseed-veilid-net --test two_node_doorbell -- --ignored --nocapture
+//!
+//! The knock mints a real proof of work at production difficulty, and each publish
+//! waits for the DHT to propagate.
 //!
 //! It drives the productized `VeilidNetHandle` surface the app drives, and reuses
 //! the REAL daemonseed crypto (`dm::doorbell::{derive_owner_seed, slot_for}` and
@@ -71,7 +72,7 @@ fn identity() -> IdentityKeys {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs public Veilid attach; run on a real-network host with --ignored"]
+#[ignore = "attaches to the public Veilid network; opt-in, run with --ignored"]
 async fn a_knock_reaches_the_recipients_doorbell_and_opens_for_them_alone() {
     daemonseed_core::kats::initialize_module_unsigned_test_binary().expect("oxicrypt init");
 
@@ -389,9 +390,10 @@ async fn poll_for_slot(
 /// The live test's wire-fidelity claim ("a transport writing a hard-wired subkey 0
 /// fails") is only deterministic because `bob` is drawn until A's slot at B is
 /// non-zero. That constraint is pure crypto and needs no DHT, so it is verified on
-/// every ordinary `cargo test` run rather than resting on the `#[ignore]`d body
-/// nobody executes on this host. Without it the draw loop could be deleted and the
-/// live test would silently go back to passing-for-the-wrong-reason 1 run in 32.
+/// every ordinary `cargo test` run rather than resting on the `#[ignore]`d body,
+/// which an ordinary run does not execute. Without it the draw loop could be deleted
+/// and the live test would silently go back to passing-for-the-wrong-reason 1 run
+/// in 32.
 #[test]
 fn the_recipient_draw_always_yields_a_non_zero_slot() {
     daemonseed_core::kats::initialize_module_unsigned_test_binary().expect("oxicrypt init");

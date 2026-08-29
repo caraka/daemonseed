@@ -17,10 +17,10 @@
 //! In production the seed stays offline and only the owner PUBKEY is baked into
 //! clients, which read but cannot write.
 //!
-//! `#[ignore]` — needs public Veilid attach; run on a real-network host:
+//! `#[ignore]` — it attaches to the public Veilid network and takes minutes, so it
+//! is opt-in rather than part of an ordinary test run:
 //!
-//!     cd crates/daemonseed-veilid-net
-//!     cargo test --test two_node_operator_record -- --ignored --nocapture
+//!     cargo test -p daemonseed-veilid-net --test two_node_operator_record -- --ignored --nocapture
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -38,7 +38,7 @@ fn node_config(port: &str, dir: &std::path::Path) -> VeilidNetConfig {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs public Veilid attach; run on a real-network host with --ignored"]
+#[ignore = "attaches to the public Veilid network; opt-in, run with --ignored"]
 async fn operator_record_slots_reach_a_second_node() {
     daemonseed_core::kats::initialize_module_unsigned_test_binary().expect("oxicrypt init");
 

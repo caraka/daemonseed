@@ -88,7 +88,7 @@ fn fresh_ss0() -> [u8; 32] {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs public Veilid attach; run on a real-network host with --ignored"]
+#[ignore = "attaches to the public Veilid network; opt-in, run with --ignored"]
 async fn frames_published_to_page_slots_sweep_back_in_the_slots_they_were_written_to() {
     daemonseed_core::kats::initialize_module_unsigned_test_binary().expect("oxicrypt init");
 
