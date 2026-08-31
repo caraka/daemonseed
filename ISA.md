@@ -437,7 +437,7 @@ The write-budget family takes permanent `WB-ISC-N` IDs from the FROZEN 2026-07-0
 - [x] WB-ISC-11: Anti — no chat ring write is ever coalesced or dropped by the scheduler, and pending chat flushes at graceful close (probe: property test — every enqueued chat write reaches the write-sink exactly once, in per-record order, across a close).
 - [x] WB-ISC-12: Anti — a queued withdraw/leave tombstone is never coalesced away, superseded, or reordered behind by a same-id current-state write; a same-id current-state enqueued while a withdraw is pending is dropped (probe: unit test — withdraw then watchdog refresh → withdraw dispatches, refresh dropped; the #121/#118 resurrection guard).
 - [x] WB-ISC-13: Slot/seq assignment for ring writes occurs inside the record lock at dispatch — the scheduler's per-record single-flight never lets two same-record writes overlap in the sink (probe: code inspection + a serial-dispatch interleaving oracle, complementing the `rendezvous::record_lock` oracle).
-- [x] WB-ISC-14: Anti — no discovery-class surface relies on warmup-only sweeps plus a passive watch; every subscribed chat/discovery record (lobby chat, share-advert, circle chat, operator) has a declared steady-state re-surfacing mechanism (probe: code inspection of the gui/tui net-actor `steady_resweep` arm — a post-warmup round-robin reader resweep over the current subscribed set, presence excluded as it self-heals via keepalive re-writes — plus `next_resweep_seed_is_key_based_and_survives_set_changes`, the key-based round-robin cursor oracle proving a join/leave never skips a record).
+- [x] WB-ISC-14: Anti — no discovery-class surface relies on warmup-only sweeps plus a passive watch; every subscribed chat/discovery record (lobby chat, share-advert, circle chat, operator) has a declared steady-state re-surfacing mechanism (probe: code inspection of the gui/tui net-actor `steady_resweep` arm — a post-warmup round-robin reader resweep over the current subscribed set, presence excluded as it self-heals via keepalive re-writes — plus `next_resweep_record_is_key_based_and_survives_set_changes`, the key-based round-robin cursor oracle proving a join/leave never skips a record).
 - [DEFERRED-VERIFY] WB-ISC-15: Share adverts (and lobby/circle chat) are discoverable by a client that holds only the room secret and converged AFTER the write, with no prior knowledge of any `share_id` and no reliance on warmup timing (probe: a two-node live oracle — B joins and settles first, A publishes or sends after B's warmup window closes, B still discovers or receives. The probe needs two hosts that can each attach to the public Veilid network, which a network-address-translated build environment cannot do; until it runs, the criterion is unverified and is registered nowhere).
 
 - [x] CRSH-ISC-1: The steady resweep's GET accounting surfaces per-record attempted/failed/found counts — a failed GET is distinct from an empty slot (no longer swallowed by `.ok().flatten()`), the enabling observability for consumer-side session-health tracking (#180 §RS-1.1) (probe: `rendezvous::crsh_isc_1_sweep_outcome_accounts_failed_empty_and_found_separately`; existing #157 resweep behavior regression-guarded).
@@ -545,6 +545,32 @@ moment it is hand-maintained in two places, so it lives only where it cannot dri
 
 Decisions in force, with the reasoning that makes each hard to vary. Superseded amendments and the
 route taken to reach a decision are not recorded here — the git history and `CHANGELOG.md` hold those.
+
+- **A rendezvous record's owner is modelled by possession, not by record class.** `RendezvousOwner`
+  has two arms — `Held`, carrying the owner seed, and `PublicOnly`, carrying only the owner's public
+  key — and a party's arm says what that party can do, not what kind of record it is. Record-class
+  naming was rejected because it misdescribes the announce/MOTD record: the instance that writes it
+  holds its seed while every client holds only its public key, so one record would have to be two
+  classes. Possession is also the property the engine branches on, since the seed is what produces
+  the owner keypair every write needs. A second rejected alternative, an optional seed beside the
+  public key, makes the absent case a value to test rather than a state to match, and leaves nothing
+  naming what a party that holds no seed may still do. The cost is that the type alone does not say
+  which records are shared and which are operator-owned, so the documentation must; and a process
+  that both reads and writes one record must hold it as `Held`, because the open cache and the
+  record locks are keyed on the owner's public key alone and would otherwise serve a writerless
+  handle to a write.
+
+- **A rendezvous record a reader cannot find is a clean result on subscribe, and an error on
+  repair.** A `PublicOnly` party cannot create the record it reads, so its absence is a state of
+  whichever party writes it and nothing the reader can act on. Failing the subscribe was rejected:
+  it would make a client's startup fail on a condition it can do nothing about, and the frontend
+  re-subscribes on every refresh anyway, so the watch registers on the first pass that finds the
+  record present. The absence is deliberately never cached, so that pass sees the record the moment
+  it exists. Repair is the opposite case and takes the opposite answer: it re-establishes a session
+  that was working, so a record that has become unreachable is a failure to report, and it
+  classifies transient — the frontend clears the record's tracker at dispatch and re-detects on its
+  next cycle. The cost of the subscribe half is that watch registration is lazy, bounded by the
+  resweep and re-subscribe cadence rather than by the subscribe call.
 
 - **There is no server: every client is a Veilid node.** The alternative on the table was the original
   operator-run relay, which put a single machine in the path of every conversation — a censorship

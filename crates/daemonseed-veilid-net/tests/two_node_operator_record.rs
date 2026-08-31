@@ -2,8 +2,9 @@
 //! announce record. A maintainer (node A, holding the project-announce owner seed)
 //! publishes an operator payload to a NAMED current-state slot (`"motd"`, and a
 //! content-addressed announcement item) on the owner-gated rendezvous record; a
-//! client (node B) subscribes to the same record — via the same owner seed — and
-//! reads each slot's bytes back byte-identical. This is the A-b transport oracle:
+//! client (node B) subscribes to the same record from the baked owner PUBLIC key
+//! alone and reads each slot's bytes back byte-identical. This is the A-b transport
+//! oracle:
 //! it proves the operator record carries opaque payloads to stable, named
 //! last-writer-wins slots.
 //!
@@ -12,10 +13,10 @@
 //! against the operator whitelist) is a core concern, tested there — the app packs
 //! a `SignedArtifact` into these bytes. The **write-gate** (only a holder of the
 //! owner seed may place an owner-signed subkey) is the Veilid single-owner DFLT
-//! property; it is NOT exercised here because in the dev phase the owner seed is
-//! in-source, so both nodes derive it (A derives it to write, B derives it to read).
-//! In production the seed stays offline and only the owner PUBKEY is baked into
-//! clients, which read but cannot write.
+//! property; it is NOT exercised here, as node B never attempts a write. Node B does
+//! subscribe the way a shipped client does — `RendezvousOwner::PublicOnly` over the
+//! baked `PROJECT_ANNOUNCE_OWNER_PUBKEY`, holding no owner seed — so what this test
+//! proves is that a writerless reader reads the writer's published values.
 //!
 //! `#[ignore]` — it attaches to the public Veilid network and takes minutes, so it
 //! is opt-in rather than part of an ordinary test run:
@@ -27,7 +28,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use daemonseed_core::identity::keys::{derive_identity_keys, Identity};
 use daemonseed_core::identity::mnemonic::Mnemonic;
 use daemonseed_core::public_space::dev_project_announce_veilid_owner_seed;
-use daemonseed_veilid_net::{VeilidNet, VeilidNetConfig, VeilidNetEvent};
+use daemonseed_veilid_net::identity::PROJECT_ANNOUNCE_OWNER_PUBKEY;
+use daemonseed_veilid_net::{
+    OwnerPublic, RendezvousOwner, VeilidNet, VeilidNetConfig, VeilidNetEvent,
+};
 
 fn node_config(port: &str, dir: &std::path::Path) -> VeilidNetConfig {
     let id = derive_identity_keys(&Mnemonic::generate().unwrap(), Identity::Primary).unwrap();
@@ -45,8 +49,10 @@ async fn operator_record_slots_reach_a_second_node() {
     let base = std::env::temp_dir().join("daemonseed-veilid-net-op-record-it");
     let _ = std::fs::remove_dir_all(&base);
 
-    // The operator/announce record's owner seed (A1 write-gate). In the dev phase
-    // it derives from the in-source PROJECT_RELEASE_SEED, so both nodes compute it.
+    // The operator/announce record's owner seed (A1 write-gate), held by node A only.
+    // Node B addresses the same record from PROJECT_ANNOUNCE_OWNER_PUBKEY, which
+    // `baked_project_announce_owner_pubkey_matches_seed_derivation` pins to this seed's
+    // derived owner key.
     let owner_seed = *dev_project_announce_veilid_owner_seed()
         .expect("dev announce owner seed")
         .as_bytes();
@@ -92,7 +98,9 @@ async fn operator_record_slots_reach_a_second_node() {
 
     tokio::time::sleep(Duration::from_secs(5)).await;
     node_b
-        .subscribe_room(owner_seed)
+        .subscribe_room(RendezvousOwner::PublicOnly(OwnerPublic::baked(
+            PROJECT_ANNOUNCE_OWNER_PUBKEY,
+        )))
         .await
         .expect("B subscribe to operator record");
 

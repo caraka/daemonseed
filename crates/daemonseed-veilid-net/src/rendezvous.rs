@@ -227,42 +227,43 @@ impl RendezvousHandle {
     }
 }
 
-/// The cache/lock identity of a record: its owner seed **and** its shape's
+/// The cache/lock identity of a record: its owner's **public key** and its shape's
 /// `o_cnt`.
 ///
 /// Both dimensions are load-bearing. Before shapes were parameterized, every
-/// rendezvous record shared one schema, so `owner_seed` alone was a record's full
+/// rendezvous record shared one schema, so the owner alone was a record's full
 /// identity and the caches keyed on it (ISA Decisions 2026-07-07, #128 D-0a).
 /// That premise no longer holds: `o_cnt` is part of the derived address, so the
-/// same seed under two shapes is two different records. Keying the open-cache on
-/// the seed alone would let a lookup under one shape return a [`RecordKey`]
+/// same owner under two shapes is two different records. Keying the open-cache on
+/// the owner alone would let a lookup under one shape return a [`RecordKey`]
 /// derived for another — a wrong-record write that no compiler or test would
 /// catch. The pairing is not reachable today (every DM surface derives its owner
 /// seed under a distinct HKDF domain), which is precisely why it is worth closing
 /// now, while it is still theoretical.
-/// The seed half is a **digest of** the owner seed, never the seed itself (#244).
+///
+/// The owner half is the **public** key, never the seed it was derived from (#244).
 /// Every record that existed when these caches were written had a world-derivable
 /// owner seed, so holding one cost nothing. A DM channel page is the first
 /// exception: its seed derives from the conversation secret `AR`, and under Veilid
 /// a derivable owner seed **is** write access to the conversation. Copying that
 /// into a process-lifetime, `Debug`-printable map key is exactly what
 /// `redacted_secret_newtype::as_bytes` forbids, and it would undo the
-/// zeroize-on-drop hygiene `DmPageOwnerSeed` carries. Hashing costs one SHA-384
-/// per open — nothing against a DHT round trip — and removes the class outright
-/// rather than threading a zeroizing type through every caller of the engine.
+/// zeroize-on-drop hygiene `DmPageOwnerSeed` carries. The public key removes the
+/// class outright rather than threading a zeroizing type through every caller of
+/// the engine — and it is what a reader of a record it cannot write has anyway, so
+/// one record is one entry however the party opening it holds the owner.
 pub type CachedRecordId = (PublicKey, u16);
 
-/// The cache/lock id for a record owned by `owner`, at `shape`.
+/// The cache/lock id for the record owned by `owner`, at `shape`.
 ///
-/// Keyed on the owner's PUBLIC key, not the seed it was derived from. The public
-/// key identifies the record at least as precisely — it is what
-/// [`rendezvous_key`] derives the DHT address from, so two seeds sharing a public
-/// key would be one record anyway — and it is public by nature, being the
+/// The public key identifies the record at least as precisely as its seed would —
+/// it is what [`rendezvous_key`] derives the DHT address from, so two seeds sharing
+/// a public key would be one record anyway — and it is public by nature, being the
 /// record's identity on the network. It is also already a one-way function of the
 /// seed, so no hashing step is needed and there is no fallible crypto call on the
 /// open path.
-pub fn cached_record_id(owner: &KeyPair, shape: RecordShape) -> CachedRecordId {
-    (owner.key().clone(), shape.o_cnt())
+pub fn cached_record_id(owner: &PublicKey, shape: RecordShape) -> CachedRecordId {
+    (owner.clone(), shape.o_cnt())
 }
 
 /// Distinct member regions; a member maps to one by hashing its node pubkey.
@@ -290,8 +291,48 @@ pub async fn rendezvous_key(
     owner: &KeyPair,
     shape: RecordShape,
 ) -> Result<RendezvousHandle> {
+    rendezvous_key_for(api, owner.key(), shape).await
+}
+
+/// Compute a rendezvous record's deterministic record key from the owner's raw
+/// 32-byte **public** key — [`rendezvous_key`]'s reader-side twin, which needs no
+/// owner secret. Local crypto only, as [`rendezvous_key`] is.
+///
+/// The addressing consumes the owner's public half alone, so a caller with only a
+/// record to *read* needs no keypair; [`rendezvous_key`] serves the callers that
+/// already hold one. The project announce/MOTD record is the case
+/// that matters: its owner secret is maintainer-held, so a client deriving it holds
+/// a write credential it must never have. Circles and public rooms are deliberately
+/// not this — every member there holds the owner secret because every member writes
+/// — and must keep using [`rendezvous_key`].
+///
+/// Both derivations run [`rendezvous_key_for`] over the same `PublicKey`, so they
+/// cannot drift to different addresses; `identity::owner_public_key` is pinned equal
+/// to `KeyPair::key()` by a unit test, which is what closes the gap this body cannot
+/// reach on its own.
+pub async fn rendezvous_key_from_owner_public(
+    api: &VeilidAPI,
+    owner_public: &[u8; 32],
+    shape: RecordShape,
+) -> Result<RendezvousHandle> {
+    rendezvous_key_for(api, crate::identity::owner_public_key(owner_public), shape).await
+}
+
+/// The single derivation body behind [`rendezvous_key`] and
+/// [`rendezvous_key_from_owner_public`].
+///
+/// `get_dht_record_key` consumes the owner's public half and nothing else, so the
+/// two entry points differ only in how they reach that `PublicKey`. Deriving here
+/// once rather than in each is what makes "the keypair path and the pubkey-only
+/// path name the same record" a structural fact instead of a claim about two
+/// bodies staying in step.
+async fn rendezvous_key_for(
+    api: &VeilidAPI,
+    owner_key: PublicKey,
+    shape: RecordShape,
+) -> Result<RendezvousHandle> {
     let key = api
-        .get_dht_record_key(schema(shape)?, owner.key(), None)
+        .get_dht_record_key(schema(shape)?, owner_key, None)
         .await
         .map_err(|e| VeilidNetError::Routing(e.to_string()))?;
     Ok(RendezvousHandle::new(key, shape))
@@ -455,6 +496,71 @@ pub async fn open_only(
     }
 }
 
+/// Open a record that must already exist, addressing it by the owner's raw 32-byte
+/// **public** key and opening it with **no writer** — [`open_only`]'s reader-side
+/// twin. Absence is `Ok(None)`; it never creates.
+///
+/// Everything [`open_only`] documents about `Ok(None)` applies here unchanged: the
+/// absence test is `KeyNotFound` alone, `Ok(None)` means "this node did not find it
+/// just now" and NOT "it does not exist", and a collector must not treat it as
+/// authoritative absence or let it clear a health or repair latch.
+///
+/// **What differs is the writer, and it is the point.** [`open_only`] passes
+/// `Some(owner)`, which requires the caller to hold the owner secret and leaves
+/// veilid retaining a clone of it in `OpenedRecord.writer` for as long as the
+/// record stays open (see `identity::vld0_keypair`'s residual note). A reader of a
+/// record it will never write needs neither. Passing `None` opens read-only, so no
+/// secret is derived, carried, or retained — the project announce/MOTD record being
+/// the case that motivates it, since its owner secret is maintainer-held and a
+/// client has no business reconstructing it merely to read the MOTD.
+///
+/// **The writerless handle is not itself a write barrier**, and nothing should be
+/// built on the assumption that it is. `set_dht_value` resolves the writer as the
+/// call's explicit `SetDHTValueOptions::writer` **or** the handle's, in that order
+/// (`veilid-core-0.5.7 src/storage_manager/set_value.rs:82-85`), so a caller holding
+/// the owner keypair writes this record through a handle opened here exactly as it
+/// would through one opened with a writer. What opening read-only buys is the secret
+/// it never derives, carries or retains — not a refusal it enforces.
+///
+/// The boundary that does hold is about what a caller can obtain rather than what a
+/// handle permits: writing needs the owner keypair, and the derivation from seed to
+/// public key runs one way, so a caller holding only the owner's public key has no
+/// route to one. A caller that needs to write wants [`open_only`] or
+/// [`open_or_create`] and the owner keypair that goes with them.
+pub async fn open_read_only(
+    gate: &Arc<DhtGate>,
+    api: &VeilidAPI,
+    rc: &RoutingContext,
+    owner_public: &[u8; 32],
+    shape: RecordShape,
+) -> Result<Option<RendezvousHandle>> {
+    let handle = rendezvous_key_from_owner_public(api, owner_public, shape).await?;
+    let key = handle.key().clone();
+    crate::vtrace!("open_read_only: rendezvous key={key:?}; trying open (no writer, no create)");
+    // §RS-2 margin limiter, for the reason `open_or_create` gives: the raw open is an
+    // un-gated DHT op and holds an un-gated-op permit across the call, acquired at
+    // raw-call granularity. This function issues no gated GET, so the single-permit
+    // rule (CRSH-ISC-17) is respected.
+    let opened = {
+        let _ungated = gate.acquire_ungated().await;
+        rc.open_dht_record(key, None).await
+    };
+    match opened {
+        Ok(_) => {
+            crate::vtrace!("open_read_only: open ok -> Some");
+            Ok(Some(handle))
+        }
+        Err(veilid_core::VeilidAPIError::KeyNotFound { .. }) => {
+            crate::vtrace!("open_read_only: KeyNotFound -> None (absent, not created)");
+            Ok(None)
+        }
+        Err(e) => {
+            crate::vtrace!("open_read_only: open failed ({e}) -> Err");
+            Err(VeilidNetError::Routing(e.to_string()))
+        }
+    }
+}
+
 /// A session cache of rendezvous records already opened, keyed by
 /// [`CachedRecordId`] → the post-reopen [`RendezvousHandle`]. [`open_or_create`]
 /// pays a fresh open (~6–10 s live-measured) on every publish/subscribe; once a
@@ -463,8 +569,8 @@ pub async fn open_only(
 /// (no-encryption) handle semantics — never a raw `create` handle with a random
 /// encryption key.
 ///
-/// The id is `(owner_seed, o_cnt)`, not the seed alone — see [`CachedRecordId`]
-/// for why the shape is part of a record's identity.
+/// The id is `(owner public key, o_cnt)`, not the owner alone — see
+/// [`CachedRecordId`] for why the shape is part of a record's identity.
 pub type OpenCache = Mutex<HashMap<CachedRecordId, RendezvousHandle>>;
 
 /// Return the cached open handle for `id`, else run `open` once, cache its
@@ -547,7 +653,7 @@ pub async fn open_cached_optional<I: Eq + std::hash::Hash + Clone, K: Clone>(
 }
 
 /// Per-rendezvous-record serialization lock: one async mutex per record, keyed by
-/// owner seed. Two operations on the SAME record must not run concurrently —
+/// the owner's public key. Two operations on the SAME record must not run concurrently —
 /// spawned append-ring [`publish`]es (the off-loop publish path) would otherwise
 /// race into the shared `base + (seq % RING_DEPTH)` slot, and an older write landing
 /// after a newer one silently DROPS the newer message (not merely reorders it — the
@@ -558,21 +664,21 @@ pub async fn open_cached_optional<I: Eq + std::hash::Hash + Clone, K: Clone>(
 /// to one record never blocks another's traffic or the actor command loop. See ISA
 /// Decisions (2026-07-07, #128 xhigh review).
 ///
-/// **Deliberately keyed on the seed's digest alone, unlike [`OpenCache`].** Where
-/// the open cache MUST distinguish shapes (returning a key derived for the wrong
-/// `o_cnt` would write to the wrong record), this lock only decides what
-/// serializes against what. Two differently-shaped records sharing an owner seed
-/// would share one lock — over-serializing, never under-serializing — so the
-/// seed-only key is the conservative choice and keeps the CRSH-ISC-3/18 lock-span
-/// invariants exactly as they were verified. It holds the owner's PUBLIC key
-/// rather than the seed, for the reason [`CachedRecordId`] gives (#244): a lock
-/// identity needs to tell records apart, not to carry write capability.
+/// **Deliberately keyed on the owner alone, unlike [`OpenCache`].** Where the open
+/// cache MUST distinguish shapes (returning a key derived for the wrong `o_cnt`
+/// would write to the wrong record), this lock only decides what serializes against
+/// what. Two differently-shaped records sharing an owner would share one lock —
+/// over-serializing, never under-serializing — so the owner-only key is the
+/// conservative choice and keeps the CRSH-ISC-3/18 lock-span invariants exactly as
+/// they were verified. It holds the owner's PUBLIC key rather than the seed, for the
+/// reason [`CachedRecordId`] gives (#244): a lock identity needs to tell records
+/// apart, not to carry write capability.
 pub type RecordLocks = Mutex<HashMap<PublicKey, Arc<tokio::sync::Mutex<()>>>>;
 
 /// The serialization lock for the record owned by `owner`, creating it on first use. The returned
 /// `Arc` is `.lock().await`-ed by the caller; the brief `std::sync::Mutex` guard on
 /// the map itself is never held across an await.
-pub fn record_lock(locks: &RecordLocks, owner: &KeyPair) -> Arc<tokio::sync::Mutex<()>> {
+pub fn record_lock(locks: &RecordLocks, owner: &PublicKey) -> Arc<tokio::sync::Mutex<()>> {
     // Poison-recovery idiom (WB-5.1 / I5″.8, mirroring `ring_seq`): the guarded state
     // is a map of per-record lock handles whose invariants survive an unwind; a
     // poisoned-mutex cascade wedging every subsequent record open is the #168 failure
@@ -580,7 +686,7 @@ pub fn record_lock(locks: &RecordLocks, owner: &KeyPair) -> Arc<tokio::sync::Mut
     locks
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .entry(owner.key().clone())
+        .entry(owner.clone())
         .or_default()
         .clone()
 }
@@ -1177,15 +1283,15 @@ mod tests {
     #[test]
     fn cached_record_id_separates_the_same_owner_under_different_shapes() {
         let owner = crate::identity::rendezvous_owner_keypair(&[7u8; 32]).unwrap();
-        let as_rendezvous = cached_record_id(&owner, RecordShape::RENDEZVOUS);
-        let as_doorbell = cached_record_id(&owner, RecordShape::new(32));
+        let as_rendezvous = cached_record_id(&owner.key(), RecordShape::RENDEZVOUS);
+        let as_doorbell = cached_record_id(&owner.key(), RecordShape::new(32));
         assert_ne!(
             as_rendezvous, as_doorbell,
             "one owner under two shapes is two records — the cache must not conflate them"
         );
         assert_eq!(
             as_rendezvous,
-            cached_record_id(&owner, RecordShape::new(64))
+            cached_record_id(&owner.key(), RecordShape::new(64))
         );
     }
 
@@ -1202,7 +1308,7 @@ mod tests {
         let seed = [0xABu8; 32];
         let owner = crate::identity::rendezvous_owner_keypair(&seed).unwrap();
 
-        let id = cached_record_id(&owner, RecordShape::RENDEZVOUS);
+        let id = cached_record_id(&owner.key(), RecordShape::RENDEZVOUS);
         let id_bytes: Vec<u8> = id.0.value().as_ref().to_vec();
         assert_ne!(
             id_bytes.as_slice(),
@@ -1216,17 +1322,57 @@ mod tests {
 
         // And the lock map keys on the same public value.
         let locks = RecordLocks::default();
-        let a = record_lock(&locks, &owner);
-        let b = record_lock(&locks, &owner);
+        let a = record_lock(&locks, &owner.key());
+        let b = record_lock(&locks, &owner.key());
         assert!(
             Arc::ptr_eq(&a, &b),
             "the same owner must resolve to the same lock"
         );
         let other = crate::identity::rendezvous_owner_keypair(&[0xCDu8; 32]).unwrap();
         assert!(
-            !Arc::ptr_eq(&a, &record_lock(&locks, &other)),
+            !Arc::ptr_eq(&a, &record_lock(&locks, &other.key())),
             "distinct owners must not share a lock"
         );
+    }
+
+    /// **A reader and a writer of ONE record share ONE cache entry and ONE lock.**
+    ///
+    /// The identity a caller supplies now comes from
+    /// [`crate::identity::RendezvousOwner::resolve`], whose two arms hold the record
+    /// differently — a keypair, or the public key alone. If they produced different
+    /// ids, the same record would occupy two cache entries and two locks, and the
+    /// serialization the lock exists to give would not apply between them. The
+    /// mirror control is the second half: a DIFFERENT record must still be a
+    /// different id, or the equality above would pass on a constant.
+    #[test]
+    fn a_reader_and_a_writer_of_one_record_share_one_identity() {
+        use crate::identity::{OwnerPublic, OwnerSeed, RendezvousOwner};
+
+        let seed = OwnerSeed::new([0x3Cu8; 32]);
+        let writer = RendezvousOwner::Held(seed.clone()).resolve().unwrap();
+        let reader = RendezvousOwner::PublicOnly(OwnerPublic::of_seed(&seed))
+            .resolve()
+            .unwrap();
+
+        assert_eq!(
+            cached_record_id(&writer.public_key(), RecordShape::RENDEZVOUS),
+            cached_record_id(&reader.public_key(), RecordShape::RENDEZVOUS),
+        );
+        let locks = RecordLocks::default();
+        assert!(Arc::ptr_eq(
+            &record_lock(&locks, &writer.public_key()),
+            &record_lock(&locks, &reader.public_key()),
+        ));
+
+        let elsewhere = RendezvousOwner::held([0x3Du8; 32]).resolve().unwrap();
+        assert_ne!(
+            cached_record_id(&writer.public_key(), RecordShape::RENDEZVOUS),
+            cached_record_id(&elsewhere.public_key(), RecordShape::RENDEZVOUS),
+        );
+        assert!(!Arc::ptr_eq(
+            &record_lock(&locks, &writer.public_key()),
+            &record_lock(&locks, &elsewhere.public_key()),
+        ));
     }
 
     /// The three shapes the frozen DM design names (`docs/design/direct-messaging.md`
@@ -1340,9 +1486,9 @@ mod tests {
         let locks: RecordLocks = Mutex::new(HashMap::new());
         let one = crate::identity::rendezvous_owner_keypair(&[1u8; 32]).unwrap();
         let two = crate::identity::rendezvous_owner_keypair(&[2u8; 32]).unwrap();
-        let a = record_lock(&locks, &one);
-        let a2 = record_lock(&locks, &one);
-        let b = record_lock(&locks, &two);
+        let a = record_lock(&locks, &one.key());
+        let a2 = record_lock(&locks, &one.key());
+        let b = record_lock(&locks, &two.key());
         assert!(Arc::ptr_eq(&a, &a2), "same owner reuses one lock");
         assert!(!Arc::ptr_eq(&a, &b), "distinct owners get distinct locks");
     }
@@ -1363,7 +1509,7 @@ mod tests {
             let log = log.clone();
             let owner = owner.clone();
             handles.push(tokio::spawn(async move {
-                let lock = record_lock(&locks, &owner);
+                let lock = record_lock(&locks, &owner.key());
                 let _guard = lock.lock().await;
                 log.lock().unwrap().push((i, 's'));
                 tokio::task::yield_now().await;

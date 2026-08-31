@@ -30,7 +30,7 @@ use daemonseed_core::share_announce::{
     derive_root_commitment, derive_share_id_v2, derive_share_root_nonce, open_announcement,
     seal_public_announcement, AnnouncementFields,
 };
-use daemonseed_veilid_net::{VeilidNet, VeilidNetConfig, VeilidNetEvent};
+use daemonseed_veilid_net::{RendezvousOwner, VeilidNet, VeilidNetConfig, VeilidNetEvent};
 
 /// A node config with a fresh daemonseed-derived node identity (D3), a distinct
 /// listen port, and its own storage dir — so two can coexist in one process.
@@ -130,7 +130,7 @@ async fn sealed_share_announcement_reaches_a_second_node() {
     // Inbound event via the sweep and/or a watch ValueChange.
     tokio::time::sleep(Duration::from_secs(5)).await;
     node_b
-        .subscribe_room(owner_seed)
+        .subscribe_room(RendezvousOwner::held(owner_seed))
         .await
         .expect("B subscribe to lobby");
 

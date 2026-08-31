@@ -16,11 +16,15 @@
 //!   Veilid's classical transport.
 //!
 //! ## Rendezvous engine (circles + lobby / public rooms)
-//! One shared-owner DFLT DHT `rendezvous` record underlies every group
-//! surface; the only thing that varies is where the owner keypair comes from.
-//! A circle derives it from the shared circle entropy (a sibling of the content
-//! key, Phase 2); a public room / the lobby derives it from the world-derivable
-//! room name+family (a sibling of the room key, Phase 3/4). Every participant
+//! One shared-owner DFLT DHT `rendezvous` record underlies every group surface.
+//! What varies is how a party HOLDS that record's owner, which [`RendezvousOwner`]
+//! states in the type: a circle member or a public-room participant holds the owner
+//! SEED, derived from the shared circle entropy (a sibling of the content key,
+//! Phase 2) or from the world-derivable room name+family (a sibling of the room key,
+//! Phase 3/4), and so may create the record and write to it; a client of the
+//! project-announce/MOTD record holds only the owner's PUBLIC key
+//! ([`identity::PROJECT_ANNOUNCE_OWNER_PUBKEY`]), enough to address, read and watch
+//! it and never enough to write it. Both reach the same address. Every participant
 //! computes the SAME record key — the relay-free rendezvous address — writes
 //! sealed items into per-participant append-rings, and a connecting participant
 //! sweeps the record for a bounded backlog and watches it for new writes:
@@ -153,8 +157,11 @@ pub use discovery::{
 pub use dm::spawn_dm_key_record_publish;
 pub use error::{FetchErrorClass, Result, VeilidNetError};
 pub use event::VeilidNetEvent;
+// The rendezvous-owner types travel in the handle's own signatures, so frontends
+// name them without reaching into the module.
+pub use identity::{OwnerPublic, OwnerSeed, RendezvousOwner};
 pub use rendezvous::SweepOutcome;
-pub use resweep::next_resweep_seed;
+pub use resweep::next_resweep_record;
 pub use route_budget::{
     BudgetPermit, FragmentOutcome, RouteBudget, RouteLease, SharerKey, F_FILES, G_GLOBAL, W_CEIL,
     W_FLOOR,

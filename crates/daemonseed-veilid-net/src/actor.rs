@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 use veilid_core::{
-    api_startup, KeyPair, OperationId, RecordKey, RouteBlob, RouteId, RoutingContext, Target,
-    VeilidAPI, VeilidConfig, VeilidUpdate,
+    api_startup, KeyPair, OperationId, PublicKey, RecordKey, RouteBlob, RouteId, RoutingContext,
+    Target, VeilidAPI, VeilidConfig, VeilidUpdate,
 };
 
 use daemonseed_core::dm::ack_record::DmAckAddress;
@@ -25,6 +25,7 @@ use crate::config::VeilidNetConfig;
 use crate::dht_gate::DhtGate;
 use crate::error::{Result, VeilidNetError};
 use crate::event::VeilidNetEvent;
+use crate::identity::{OwnerSeed, RendezvousOwner};
 use crate::schedule::{
     DispatchFuture, DispatchLane, DispatchOutcome, SchedulerConfig, WriteClass, WriteKind,
     WriteRequest, WriteScheduler, WriteSchedulerHandle, WriteSink,
@@ -34,7 +35,7 @@ use crate::{discovery, identity, rendezvous, share};
 /// RAII guard clearing a record's repair-in-flight marker on Drop (#180 CRSH-ISC-22).
 /// Held by the spawned `RepairRendezvous` task; its Drop runs on BOTH normal
 /// completion AND panic-unwind, so a panic inside `repair_rendezvous` (or the veilid
-/// code it awaits) cannot leave `owner_seed` stuck in the in-flight set — which would
+/// code it awaits) cannot leave the record stuck in the in-flight set — which would
 /// make every future `RepairRendezvous` for that record hit `!set.insert(..)` and be
 /// skipped, permanently disabling that record's self-heal until app restart.
 struct RepairInFlightGuard {
@@ -339,8 +340,10 @@ enum Command {
         reply: oneshot::Sender<Result<()>>,
     },
     SubscribeRendezvous {
-        owner_seed: [u8; 32],
-        reply: oneshot::Sender<Result<()>>,
+        owner: RendezvousOwner,
+        /// `true` when a record was opened and watched, `false` on the read-only arm
+        /// when the record does not exist yet — see [`subscribe_rendezvous`].
+        reply: oneshot::Sender<Result<bool>>,
     },
     /// Write a SEALED payload to a stable-identity slot on a rendezvous record —
     /// the current-state (last-writer-wins) counterpart to [`Command::PublishRendezvous`]'s
@@ -363,29 +366,29 @@ enum Command {
     /// record WITHOUT registering another watch — the recovery primitive for an
     /// item published during the post-(re)connect watch-warmup window (#132/#133).
     ResweepRendezvous {
-        owner_seed: [u8; 32],
+        owner: RendezvousOwner,
         reply: oneshot::Sender<Result<()>>,
     },
     /// **Repair** a dead rendezvous record session (consumer-route self-heal §RS-1.2,
     /// step 3b). Re-establishes the record — invalidate the open-cache entry, (optionally
     /// close), re-open, re-watch, full 0..64 re-sweep — **holding the record's
     /// `record_lock` across the whole sequence** (CRSH-ISC-3/18), so a concurrent
-    /// same-record write can never target a torn-down handle. `owner_seed` is the same
-    /// rendezvous-owner seed as [`Command::SubscribeRendezvous`] /
+    /// same-record write can never target a torn-down handle. `owner` is the same
+    /// rendezvous owner as [`Command::SubscribeRendezvous`] /
     /// [`Command::ResweepRendezvous`]. Re-swept backlog arrives as
     /// [`VeilidNetEvent::Inbound`]; the frontend dispatches this only for a repair-due
     /// record and resets its session-health tracker at dispatch.
     RepairRendezvous {
-        owner_seed: [u8; 32],
+        owner: RendezvousOwner,
         reply: oneshot::Sender<Result<()>>,
     },
-    /// Resolve a rendezvous record's deterministic [`RecordKey`] from its `owner_seed` —
-    /// local crypto only, no network round-trip. Feeds the frontend's
-    /// `RecordKey → owner_seed` map (§RS-1.2) so a repair-due signal (which the tracker
-    /// keys by `RecordKey`) can be dispatched as a [`Command::RepairRendezvous`] on the
-    /// record's owner seed.
+    /// Resolve a rendezvous record's deterministic [`RecordKey`] from its `owner` —
+    /// local crypto only, no network round-trip. Feeds the frontend's map from
+    /// `RecordKey` to the record's owner (§RS-1.2) so a repair-due signal (which the
+    /// tracker keys by `RecordKey`) can be dispatched as a
+    /// [`Command::RepairRendezvous`] on that owner.
     RendezvousKey {
-        owner_seed: [u8; 32],
+        owner: RendezvousOwner,
         reply: oneshot::Sender<Result<RecordKey>>,
     },
     // ── Direct messaging (#232) ──
@@ -763,9 +766,19 @@ impl VeilidNetHandle {
     /// Inbound circle messages arrive as [`VeilidNetEvent::Inbound`] on the
     /// event stream (eventual — watch latency is tens of seconds). `owner_seed`
     /// is the circle's rendezvous-owner seed, as for [`Self::publish_circle`].
-    pub async fn subscribe_circle(&self, owner_seed: [u8; 32]) -> Result<()> {
-        self.send(|reply| Command::SubscribeRendezvous { owner_seed, reply })
-            .await?
+    ///
+    /// The seed alone, not a [`RendezvousOwner`]: every member of a circle derives
+    /// the owner seed because every member writes, so there is no reader-only way
+    /// to hold a circle.
+    pub async fn subscribe_circle(&self, owner_seed: OwnerSeed) -> Result<()> {
+        // A held owner opens-or-creates, so the record is always open on success and
+        // the "was a record opened?" answer carries no information here.
+        self.send(|reply| Command::SubscribeRendezvous {
+            owner: RendezvousOwner::Held(owner_seed),
+            reply,
+        })
+        .await?
+        .map(|_opened| ())
     }
 
     // ── Lobby / public rooms + share discovery (Phase 3/4) ──────────────────
@@ -792,43 +805,70 @@ impl VeilidNetHandle {
 
     /// Subscribe to a public room / lobby (Phase 3/4): open the room's
     /// rendezvous record, watch it, and sweep it for the bounded backlog —
-    /// identical to [`Self::subscribe_circle`] but for a public-room
-    /// `owner_seed`. Inbound sealed room messages / share announcements arrive as
+    /// identical to [`Self::subscribe_circle`] but for a public-room owner.
+    /// Inbound sealed room messages / share announcements arrive as
     /// [`VeilidNetEvent::Inbound`]; the app opens them under the `PublicRoomKey`.
-    pub async fn subscribe_room(&self, owner_seed: [u8; 32]) -> Result<()> {
-        self.send(|reply| Command::SubscribeRendezvous { owner_seed, reply })
+    ///
+    /// A [`RendezvousOwner`] rather than a bare seed because this method also
+    /// carries the project-announce/MOTD record, which one instance writes and
+    /// every other reads.
+    ///
+    /// A [`RendezvousOwner::PublicOnly`] owner opens the record read-only — no
+    /// create, no writer — and a record that is absent is a clean `Ok` with no watch
+    /// registered. Call this again (the frontend already does, on every refresh) to
+    /// pick the record up once it exists.
+    ///
+    /// Returns whether a record was actually opened and watched: `true` on success,
+    /// `false` on that read-only absent path. A caller that remembers "this record is
+    /// subscribed" must remember it only on `true`, or one absent first pass costs it
+    /// push updates for as long as it holds that memory. A [`RendezvousOwner::Held`]
+    /// owner opens-or-creates, so it answers `true` whenever it answers `Ok`.
+    pub async fn subscribe_room(&self, owner: RendezvousOwner) -> Result<bool> {
+        self.send(|reply| Command::SubscribeRendezvous { owner, reply })
             .await?
     }
 
     /// Re-sweep an already-subscribed rendezvous record for backlog missed during
     /// the watch-warmup window, WITHOUT registering another watch — the recovery
-    /// primitive for #132/#133. `owner_seed` is the circle or public-room
-    /// rendezvous-owner seed (same as [`Self::subscribe_circle`] /
-    /// [`Self::subscribe_room`]). Re-swept items arrive as
-    /// [`VeilidNetEvent::Inbound`] and are deduped downstream.
-    pub async fn resweep_rendezvous(&self, owner_seed: [u8; 32]) -> Result<()> {
-        self.send(|reply| Command::ResweepRendezvous { owner_seed, reply })
+    /// primitive for #132/#133. `owner` is the record's rendezvous owner (the same
+    /// one passed to [`Self::subscribe_circle`] / [`Self::subscribe_room`]).
+    /// Re-swept items arrive as [`VeilidNetEvent::Inbound`] and are deduped
+    /// downstream.
+    ///
+    /// A [`RendezvousOwner::PublicOnly`] owner opens the record read-only; an absent
+    /// record is a clean `Ok` with nothing swept.
+    pub async fn resweep_rendezvous(&self, owner: RendezvousOwner) -> Result<()> {
+        self.send(|reply| Command::ResweepRendezvous { owner, reply })
             .await?
     }
 
     /// Repair a dead rendezvous record session (consumer-route self-heal §RS-1.2, step
     /// 3b): re-establish the record under its `record_lock` — invalidate the open-cache
     /// entry, (optionally) close, re-open, re-watch, and full 0..64 re-sweep (CRSH-ISC-3).
-    /// `owner_seed` is the circle or public-room rendezvous-owner seed (same as
+    /// `owner` is the record's rendezvous owner (the same one passed to
     /// [`Self::subscribe_room`] / [`Self::resweep_rendezvous`]). The frontend dispatches
     /// this ONLY for a repair-due record, one at a time (serialized with the steady
     /// resweep). Re-swept backlog arrives as [`VeilidNetEvent::Inbound`].
-    pub async fn repair_rendezvous(&self, owner_seed: [u8; 32]) -> Result<()> {
-        self.send(|reply| Command::RepairRendezvous { owner_seed, reply })
+    ///
+    /// A [`RendezvousOwner::PublicOnly`] owner re-opens the record read-only. Unlike
+    /// the two methods above, a record that cannot be found is an error here: a
+    /// repair re-establishes a session that was working, so its absence is a failure
+    /// to report rather than a state to wait out.
+    pub async fn repair_rendezvous(&self, owner: RendezvousOwner) -> Result<()> {
+        self.send(|reply| Command::RepairRendezvous { owner, reply })
             .await?
     }
 
-    /// Resolve a rendezvous record's deterministic [`RecordKey`] from its `owner_seed` —
-    /// local crypto only (no network round-trip). The frontend feeds this into its
-    /// `RecordKey → owner_seed` map so a repair-due signal (keyed by `RecordKey`) resolves
-    /// to the seed [`Self::repair_rendezvous`] needs (§RS-1.2).
-    pub async fn rendezvous_record_key(&self, owner_seed: [u8; 32]) -> Result<RecordKey> {
-        self.send(|reply| Command::RendezvousKey { owner_seed, reply })
+    /// Resolve a rendezvous record's deterministic [`RecordKey`] from its `owner` —
+    /// local crypto only (no network round-trip). The frontend feeds this into its map
+    /// from `RecordKey` to the record's owner, so a repair-due signal (keyed by
+    /// `RecordKey`) resolves to the owner [`Self::repair_rendezvous`] needs (§RS-1.2).
+    ///
+    /// Both owner variants resolve to the same [`RecordKey`] for one record: the
+    /// address is a function of the owner's public half alone, which a seed and a
+    /// public key reach by the same derivation.
+    pub async fn rendezvous_record_key(&self, owner: RendezvousOwner) -> Result<RecordKey> {
+        self.send(|reply| Command::RendezvousKey { owner, reply })
             .await?
     }
 
@@ -1720,7 +1760,7 @@ async fn actor_loop(
                             // Single-flight against a concurrent op on this record, as
                             // the dispatch itself does. The guard is dropped before the
                             // enqueue so the write never queues holding a record lock.
-                            let record_lock = rendezvous::record_lock(&record_locks, &owner);
+                            let record_lock = rendezvous::record_lock(&record_locks, &owner.key());
                             let _open_guard = record_lock.lock().await;
                             if let Err(e) =
                                 dm_page_open(&gate, &api, &rc, &opened, &owner, IfAbsent::Create)
@@ -1827,7 +1867,7 @@ async fn actor_loop(
                                     // dropped before the enqueue so the write never
                                     // queues holding a record lock.
                                     let record_lock =
-                                        rendezvous::record_lock(&record_locks, &owner);
+                                        rendezvous::record_lock(&record_locks, &owner.key());
                                     let _open_guard = record_lock.lock().await;
                                     if let Err(e) = doorbell_open(
                                         &gate,
@@ -1932,7 +1972,7 @@ async fn actor_loop(
                     let _ = reply.send(r);
                 });
             }
-            Command::SubscribeRendezvous { owner_seed, reply } => {
+            Command::SubscribeRendezvous { owner, reply } => {
                 let _ = reply.send(
                     subscribe_rendezvous(
                         &api,
@@ -1941,7 +1981,7 @@ async fn actor_loop(
                         &opened,
                         &record_locks,
                         &dht_gate,
-                        owner_seed,
+                        &owner,
                     )
                     .await,
                 );
@@ -1974,7 +2014,7 @@ async fn actor_loop(
                     reply: Some(reply),
                 });
             }
-            Command::ResweepRendezvous { owner_seed, reply } => {
+            Command::ResweepRendezvous { owner, reply } => {
                 let _ = reply.send(
                     resweep_rendezvous(
                         &api,
@@ -1983,12 +2023,16 @@ async fn actor_loop(
                         &opened,
                         &record_locks,
                         &dht_gate,
-                        owner_seed,
+                        &owner,
                     )
                     .await,
                 );
             }
-            Command::RepairRendezvous { owner_seed, reply } => {
+            Command::RepairRendezvous { owner, reply } => {
+                // The owner's public key is taken once, up front: it keys the in-flight
+                // guard below as well as the record's open cache and lock, and all three
+                // must name the same thing. Both owner arms yield it.
+                let owner_id = owner.public_bytes();
                 // F1 (#180): dispatch the repair OFF the actor loop. `repair_rendezvous`
                 // awaits a close/open/watch + full 0..64 re-sweep; on a DEAD record each
                 // GET hits the veilid timeout, so awaiting it INLINE (as this arm once did)
@@ -2008,7 +2052,7 @@ async fn actor_loop(
                 // held briefly (insert here, remove in the spawned task), never across an await.
                 {
                     let mut set = repair_in_flight.lock().unwrap_or_else(|e| e.into_inner());
-                    if !set.insert(owner_seed) {
+                    if !set.insert(owner_id) {
                         // A repair for this record is already in flight — skip, don't spawn.
                         let _ = reply.send(Ok(()));
                         continue;
@@ -2028,7 +2072,7 @@ async fn actor_loop(
                     // (disables) this record's future self-heal.
                     let _guard = RepairInFlightGuard {
                         set: repair_in_flight,
-                        key: owner_seed,
+                        key: owner_id,
                     };
                     let res = repair_rendezvous(
                         &api,
@@ -2037,7 +2081,7 @@ async fn actor_loop(
                         &opened,
                         &record_locks,
                         &dht_gate,
-                        owner_seed,
+                        &owner,
                     )
                     .await;
                     let _ = reply.send(res);
@@ -2045,17 +2089,29 @@ async fn actor_loop(
                     // is cleared either way.
                 });
             }
-            Command::RendezvousKey { owner_seed, reply } => {
-                // Local crypto only (no network): derive the owner keypair, compute the
-                // deterministic record key. Feeds the frontend's RecordKey→owner_seed map.
-                let res = match identity::rendezvous_owner_keypair(&owner_seed) {
-                    Ok(owner) => rendezvous::rendezvous_key(
+            Command::RendezvousKey { owner, reply } => {
+                // Local crypto only (no network): resolve the owner, compute the
+                // deterministic record key. Feeds the frontend's RecordKey→owner map.
+                // Both arms address the same record — `rendezvous_key_for` is one body
+                // behind both entry points — so a reader and a writer of one record
+                // resolve to one `RecordKey`.
+                let res = match owner.resolve() {
+                    Ok(identity::ResolvedOwner::Writer(keypair)) => rendezvous::rendezvous_key(
                         &api,
-                        &owner,
+                        &keypair,
                         rendezvous::RecordShape::RENDEZVOUS,
                     )
                     .await
                     .map(rendezvous::RendezvousHandle::into_key),
+                    Ok(identity::ResolvedOwner::ReadOnly(public)) => {
+                        rendezvous::rendezvous_key_from_owner_public(
+                            &api,
+                            public.as_bytes(),
+                            rendezvous::RecordShape::RENDEZVOUS,
+                        )
+                        .await
+                        .map(rendezvous::RendezvousHandle::into_key)
+                    }
                     Err(e) => Err(e),
                 };
                 let _ = reply.send(res);
@@ -2434,11 +2490,11 @@ async fn publish_rendezvous(
     // for a later ring seq must not race an earlier one into the shared 2-slot ring
     // and lose the newer message (#128 xhigh review). Distinct records take distinct
     // locks and stay concurrent, so this never blocks another record or the loop.
-    let record_lock = rendezvous::record_lock(record_locks, &owner);
+    let record_lock = rendezvous::record_lock(record_locks, &owner.key());
     let _write_guard = record_lock.lock().await;
     let handle = rendezvous::open_cached(
         opened,
-        &rendezvous::cached_record_id(&owner, rendezvous::RecordShape::RENDEZVOUS),
+        &rendezvous::cached_record_id(&owner.key(), rendezvous::RecordShape::RENDEZVOUS),
         rendezvous::open_or_create(gate, api, rc, &owner, rendezvous::RecordShape::RENDEZVOUS),
     )
     .await?;
@@ -2490,11 +2546,11 @@ async fn publish_current_state(
     let owner = identity::rendezvous_owner_keypair(&owner_seed)?;
     // Single-flight the record open and serialize the write against concurrent
     // same-record ops (chat publishes, other adverts) — see rendezvous::record_lock.
-    let record_lock = rendezvous::record_lock(record_locks, &owner);
+    let record_lock = rendezvous::record_lock(record_locks, &owner.key());
     let _write_guard = record_lock.lock().await;
     let handle = rendezvous::open_cached(
         opened,
-        &rendezvous::cached_record_id(&owner, rendezvous::RecordShape::RENDEZVOUS),
+        &rendezvous::cached_record_id(&owner.key(), rendezvous::RecordShape::RENDEZVOUS),
         rendezvous::open_or_create(gate, api, rc, &owner, rendezvous::RecordShape::RENDEZVOUS),
     )
     .await?;
@@ -2756,11 +2812,11 @@ async fn publish_dm_key_record(
     let owner = identity::rendezvous_owner_keypair(&owner_seed)?;
     // Single-flight the open and serialize against any concurrent op on this record,
     // exactly as the rendezvous write paths do (CRSH-ISC-3).
-    let record_lock = rendezvous::record_lock(record_locks, &owner);
+    let record_lock = rendezvous::record_lock(record_locks, &owner.key());
     let _write_guard = record_lock.lock().await;
     let handle = rendezvous::open_cached(
         opened,
-        &rendezvous::cached_record_id(&owner, DM_KEY_RECORD_SHAPE),
+        &rendezvous::cached_record_id(&owner.key(), DM_KEY_RECORD_SHAPE),
         rendezvous::open_or_create(gate, api, rc, &owner, DM_KEY_RECORD_SHAPE),
     )
     .await?;
@@ -2797,11 +2853,11 @@ async fn fetch_dm_key_record(
     // before the read permit is acquired, which also keeps the single-permit rule
     // (CRSH-ISC-17): no un-gated-op permit is held while acquiring a read permit.
     let handle = {
-        let record_lock = rendezvous::record_lock(record_locks, &owner);
+        let record_lock = rendezvous::record_lock(record_locks, &owner.key());
         let _open_guard = record_lock.lock().await;
         rendezvous::open_cached(
             opened,
-            &rendezvous::cached_record_id(&owner, DM_KEY_RECORD_SHAPE),
+            &rendezvous::cached_record_id(&owner.key(), DM_KEY_RECORD_SHAPE),
             rendezvous::open_or_create(gate, api, rc, &owner, DM_KEY_RECORD_SHAPE),
         )
         .await?
@@ -2855,11 +2911,11 @@ async fn publish_dm_ack(
     let owner = identity::rendezvous_owner_keypair(address.owner_seed().as_bytes())?;
     // Single-flight the open and serialize against any concurrent op on this record,
     // exactly as the key-record and rendezvous write paths do (CRSH-ISC-3).
-    let record_lock = rendezvous::record_lock(record_locks, &owner);
+    let record_lock = rendezvous::record_lock(record_locks, &owner.key());
     let _write_guard = record_lock.lock().await;
     let handle = rendezvous::open_cached(
         opened,
-        &rendezvous::cached_record_id(&owner, DM_ACK_SHAPE),
+        &rendezvous::cached_record_id(&owner.key(), DM_ACK_SHAPE),
         rendezvous::open_or_create(gate, api, rc, &owner, DM_ACK_SHAPE),
     )
     .await?;
@@ -2897,11 +2953,11 @@ async fn fetch_dm_ack(
     // before the read permit is acquired, which also keeps the single-permit rule
     // (CRSH-ISC-17): no un-gated-op permit is held while acquiring a read permit.
     let handle = {
-        let record_lock = rendezvous::record_lock(record_locks, &owner);
+        let record_lock = rendezvous::record_lock(record_locks, &owner.key());
         let _open_guard = record_lock.lock().await;
         rendezvous::open_cached(
             opened,
-            &rendezvous::cached_record_id(&owner, DM_ACK_SHAPE),
+            &rendezvous::cached_record_id(&owner.key(), DM_ACK_SHAPE),
             rendezvous::open_or_create(gate, api, rc, &owner, DM_ACK_SHAPE),
         )
         .await?
@@ -3114,7 +3170,7 @@ async fn dm_page_open(
     // local makes that unrepresentable rather than merely reviewed — the cache id and
     // both opens cannot drift apart without editing this line.
     let shape = DM_PAGE_SHAPE;
-    let id = rendezvous::cached_record_id(owner, shape);
+    let id = rendezvous::cached_record_id(&owner.key(), shape);
     match if_absent {
         IfAbsent::Create => rendezvous::open_cached(
             opened,
@@ -3168,7 +3224,7 @@ async fn publish_dm_page(
     // exactly as the rendezvous and key-record write paths do (CRSH-ISC-3). Two
     // messages landing in two slots of the same page is the ordinary case, so this
     // lock is contended by design and must not be skipped.
-    let record_lock = rendezvous::record_lock(record_locks, &owner);
+    let record_lock = rendezvous::record_lock(record_locks, &owner.key());
     let _write_guard = record_lock.lock().await;
     // `IfAbsent::Create` cannot answer `None` — it either opens, creates and
     // reopens, or fails — so the `ok_or_else` is unreachable rather than a fallback
@@ -3232,7 +3288,7 @@ async fn sweep_dm_page(
     // before any read permit is acquired, keeping the single-permit rule
     // (CRSH-ISC-17).
     let opened_handle = {
-        let record_lock = rendezvous::record_lock(record_locks, &owner);
+        let record_lock = rendezvous::record_lock(record_locks, &owner.key());
         let _open_guard = record_lock.lock().await;
         dm_page_open(gate, api, rc, opened, &owner, IfAbsent::ReportAbsent).await?
     };
@@ -3532,7 +3588,7 @@ async fn doorbell_open(
     // `dm_page_open` binds its own: the cache id and both open modes cannot drift
     // apart without editing this line.
     let shape = DM_DOORBELL_SHAPE;
-    let id = rendezvous::cached_record_id(owner, shape);
+    let id = rendezvous::cached_record_id(&owner.key(), shape);
     match if_absent {
         IfAbsent::Create => rendezvous::open_cached(
             opened,
@@ -3592,7 +3648,7 @@ async fn publish_doorbell_entry(
     // Contended by design here in a way the others are not: one doorbell is shared by
     // every sender in the world, so two knocks from this node to one recipient — and
     // this node's own sweep of its own doorbell — take the same lock.
-    let record_lock = rendezvous::record_lock(record_locks, &owner);
+    let record_lock = rendezvous::record_lock(record_locks, &owner.key());
     let _write_guard = record_lock.lock().await;
     // `IfAbsent::Create` cannot answer `None` — it either opens, creates and reopens,
     // or fails — so this is unreachable rather than a fallback with a behaviour. It is
@@ -3650,7 +3706,7 @@ async fn sweep_doorbell(
     // never blocks a concurrent knock on the same doorbell. The guard drops before any
     // read permit is acquired, keeping the single-permit rule (CRSH-ISC-17).
     let opened_handle = {
-        let record_lock = rendezvous::record_lock(record_locks, &owner);
+        let record_lock = rendezvous::record_lock(record_locks, &owner.key());
         let _open_guard = record_lock.lock().await;
         doorbell_open(gate, api, rc, opened, &owner, IfAbsent::ReportAbsent).await?
     };
@@ -3723,9 +3779,24 @@ async fn sweep_doorbell(
     Ok(DoorbellSweep { slots, outcome })
 }
 
-/// Open/create the rendezvous record, register a watch, and kick off a one-shot
-/// background sweep for the bounded login backlog. Inbound items flow out as
+/// Open the rendezvous record, register a watch, and kick off a one-shot background
+/// sweep for the bounded login backlog. Inbound items flow out as
 /// [`VeilidNetEvent::Inbound`]. Used for circles and public rooms / lobby alike.
+///
+/// **The two owner arms differ in what an absent record means.** A
+/// [`RendezvousOwner::Held`] owner opens-or-creates: every party that holds the seed
+/// writes the record, so a record nobody has created yet is created here,
+/// deterministically at the same address every other member derives. A
+/// [`RendezvousOwner::PublicOnly`] owner cannot create it and must not pretend to —
+/// it opens read-only, and an absent record is a clean `Ok` with no watch and no
+/// sweep. That is not a silent failure: the record's absence is a provisioning state
+/// of the party that writes it, which this one can do nothing about, and the caller
+/// re-subscribes on its own cadence, so the watch registers on the first pass that
+/// finds the record present.
+///
+/// The `Ok` value distinguishes those two outcomes: `true` when a record was opened
+/// and a watch registered, `false` on the read-only absent path. The caller needs it
+/// to tell "subscribed" from "nothing there yet", which are the same `Ok` otherwise.
 async fn subscribe_rendezvous(
     api: &VeilidAPI,
     rc: &RoutingContext,
@@ -3733,21 +3804,23 @@ async fn subscribe_rendezvous(
     opened: &rendezvous::OpenCache,
     record_locks: &rendezvous::RecordLocks,
     gate: &Arc<DhtGate>,
-    owner_seed: [u8; 32],
-) -> Result<()> {
+    owner: &RendezvousOwner,
+) -> Result<bool> {
     crate::vtrace!("subscribe_rendezvous: open (cached) rendezvous");
-    let owner = identity::rendezvous_owner_keypair(&owner_seed)?;
+    let resolved = owner.resolve()?;
+    let owner_key = resolved.public_key();
     // Single-flight the open against a concurrent same-record publish; the guard is
     // dropped before the watch registers (only the open needs serialization).
-    let handle = {
-        let record_lock = rendezvous::record_lock(record_locks, &owner);
+    let opened_handle = {
+        let record_lock = rendezvous::record_lock(record_locks, &owner_key);
         let _open_guard = record_lock.lock().await;
-        rendezvous::open_cached(
-            opened,
-            &rendezvous::cached_record_id(&owner, rendezvous::RecordShape::RENDEZVOUS),
-            rendezvous::open_or_create(gate, api, rc, &owner, rendezvous::RecordShape::RENDEZVOUS),
-        )
-        .await?
+        open_subscribed_record(gate, api, rc, opened, &resolved, &owner_key).await?
+    };
+    let Some(handle) = opened_handle else {
+        crate::vtrace!(
+            "subscribe_rendezvous: read-only record absent -> Ok(false) (no watch, no sweep, not cached)"
+        );
+        return Ok(false);
     };
     crate::vtrace!(
         "subscribe_rendezvous: record open key={:?}; registering watch",
@@ -3765,12 +3838,50 @@ async fn subscribe_rendezvous(
             .await
             .map_err(|e| VeilidNetError::Routing(e.to_string()))?;
     }
-    crate::vtrace!("subscribe_rendezvous: watch ok; spawning backlog sweep -> Ok");
+    crate::vtrace!("subscribe_rendezvous: watch ok; spawning backlog sweep -> Ok(true)");
     // Read lane (WB-5 / I5′.1): the backlog sweep is a burst of DHT GETs; hold a
     // read permit from the shared accountant for its duration so reads and writes
     // draw on one budget.
     spawn_gated_sweep(gate, rc, handle, ev_tx);
-    Ok(())
+    Ok(true)
+}
+
+/// The record open shared by [`subscribe_rendezvous`] and [`resweep_rendezvous`] —
+/// one arm per way of holding the owner, both onto the SAME open-cache entry, since
+/// [`identity::ResolvedOwner::public_key`] is one value per record.
+///
+/// `Ok(None)` is reachable only from the read-only arm and says the record was not
+/// found on this pass. It is deliberately not cached
+/// ([`rendezvous::open_cached_optional`]), so the next pass sees the record the
+/// moment the party that writes it has created it, rather than answering "absent"
+/// for the rest of the session.
+async fn open_subscribed_record(
+    gate: &Arc<DhtGate>,
+    api: &VeilidAPI,
+    rc: &RoutingContext,
+    opened: &rendezvous::OpenCache,
+    resolved: &identity::ResolvedOwner,
+    owner_key: &PublicKey,
+) -> Result<Option<rendezvous::RendezvousHandle>> {
+    let shape = rendezvous::RecordShape::RENDEZVOUS;
+    let id = rendezvous::cached_record_id(owner_key, shape);
+    match resolved {
+        identity::ResolvedOwner::Writer(keypair) => rendezvous::open_cached(
+            opened,
+            &id,
+            rendezvous::open_or_create(gate, api, rc, keypair, shape),
+        )
+        .await
+        .map(Some),
+        identity::ResolvedOwner::ReadOnly(public) => {
+            rendezvous::open_cached_optional(
+                opened,
+                &id,
+                rendezvous::open_read_only(gate, api, rc, public.as_bytes(), shape),
+            )
+            .await
+        }
+    }
 }
 
 /// Spawn a backlog sweep. The read permits are acquired PER-GET inside
@@ -3795,7 +3906,8 @@ fn spawn_gated_sweep(
 /// Re-open an already-known rendezvous record and kick off a fresh one-shot sweep,
 /// WITHOUT registering a watch — the recovery primitive for a backlog item published
 /// during the post-(re)connect watch-warmup window (#132/#133). The open block is
-/// identical to [`subscribe_rendezvous`]; found items flow out as
+/// identical to [`subscribe_rendezvous`], including its two owner arms and its
+/// clean `Ok` on a read-only record that is absent; found items flow out as
 /// [`VeilidNetEvent::Inbound`] and are deduped downstream.
 async fn resweep_rendezvous(
     api: &VeilidAPI,
@@ -3804,21 +3916,21 @@ async fn resweep_rendezvous(
     opened: &rendezvous::OpenCache,
     record_locks: &rendezvous::RecordLocks,
     gate: &Arc<DhtGate>,
-    owner_seed: [u8; 32],
+    owner: &RendezvousOwner,
 ) -> Result<()> {
     crate::vtrace!("resweep_rendezvous: open (cached) rendezvous");
-    let owner = identity::rendezvous_owner_keypair(&owner_seed)?;
+    let resolved = owner.resolve()?;
+    let owner_key = resolved.public_key();
     // Single-flight the open against a concurrent same-record publish (mirrors
     // subscribe_rendezvous); no watch is registered here.
-    let handle = {
-        let record_lock = rendezvous::record_lock(record_locks, &owner);
+    let opened_handle = {
+        let record_lock = rendezvous::record_lock(record_locks, &owner_key);
         let _open_guard = record_lock.lock().await;
-        rendezvous::open_cached(
-            opened,
-            &rendezvous::cached_record_id(&owner, rendezvous::RecordShape::RENDEZVOUS),
-            rendezvous::open_or_create(gate, api, rc, &owner, rendezvous::RecordShape::RENDEZVOUS),
-        )
-        .await?
+        open_subscribed_record(gate, api, rc, opened, &resolved, &owner_key).await?
+    };
+    let Some(handle) = opened_handle else {
+        crate::vtrace!("resweep_rendezvous: read-only record absent -> Ok (nothing to sweep)");
+        return Ok(());
     };
     crate::vtrace!(
         "resweep_rendezvous: record open key={:?}; spawning backlog sweep -> Ok",
@@ -3840,6 +3952,13 @@ async fn resweep_rendezvous(
 /// re-establishment is atomic against a concurrent same-record write; it emits backlog
 /// [`VeilidNetEvent::Inbound`]s but NOT a [`VeilidNetEvent::SweepHealth`] (the frontend
 /// resets the tracker at dispatch, so a repair-sweep health event would muddy detection).
+///
+/// **A read-only owner repairs too, and an absent record is an error here.** The
+/// re-open goes through `open_read_only` — no create, no writer — but where
+/// [`subscribe_rendezvous`] treats absence as a clean `Ok`, a repair is
+/// re-establishing a session that was working, so a record that is now unreachable
+/// is a failure to report. It classifies transient, which is right: the frontend
+/// clears the record's tracker at dispatch and re-detects on the next cycle.
 async fn repair_rendezvous(
     api: &VeilidAPI,
     rc: &RoutingContext,
@@ -3847,15 +3966,16 @@ async fn repair_rendezvous(
     opened: &rendezvous::OpenCache,
     record_locks: &rendezvous::RecordLocks,
     gate: &Arc<DhtGate>,
-    owner_seed: [u8; 32],
+    owner: &RendezvousOwner,
 ) -> Result<()> {
     crate::vtrace!("repair_rendezvous: re-establishing dead record session");
-    let owner = identity::rendezvous_owner_keypair(&owner_seed)?;
-    let record_lock = rendezvous::record_lock(record_locks, &owner);
+    let resolved = owner.resolve()?;
+    let owner_key = resolved.public_key();
+    let record_lock = rendezvous::record_lock(record_locks, &owner_key);
     let outcome = rendezvous::repair_gated(
         &record_lock,
         opened,
-        &rendezvous::cached_record_id(&owner, rendezvous::RecordShape::RENDEZVOUS),
+        &rendezvous::cached_record_id(&owner_key, rendezvous::RecordShape::RENDEZVOUS),
         rendezvous::REPAIR_CLOSE_FIRST,
         // close (repro-gated): best-effort — a close on a session veilid already GC'd is a
         // benign race (Evidence 3 sibling), so the error is swallowed.
@@ -3864,9 +3984,43 @@ async fn repair_rendezvous(
                 crate::vtrace!("repair_rendezvous: close_dht_record (pre-reopen) failed ({e})");
             }
         },
-        // open: `open_or_create` acquires the un-gated limiter around each raw open
-        // (CRSH-ISC-14/17); no read permit is held across it.
-        || rendezvous::open_or_create(gate, api, rc, &owner, rendezvous::RecordShape::RENDEZVOUS),
+        // open: both arms acquire the un-gated limiter around each raw open
+        // (CRSH-ISC-14/17); no read permit is held across it. The read-only arm's
+        // `Ok(None)` becomes an error because `repair_gated` re-caches what it opens and
+        // there is nothing to cache — see the fn doc.
+        || async {
+            match &resolved {
+                identity::ResolvedOwner::Writer(keypair) => {
+                    rendezvous::open_or_create(
+                        gate,
+                        api,
+                        rc,
+                        keypair,
+                        rendezvous::RecordShape::RENDEZVOUS,
+                    )
+                    .await
+                }
+                identity::ResolvedOwner::ReadOnly(public) => rendezvous::open_read_only(
+                    gate,
+                    api,
+                    rc,
+                    public.as_bytes(),
+                    rendezvous::RecordShape::RENDEZVOUS,
+                )
+                .await?
+                .ok_or_else(|| {
+                    // Traced here because the caller is fire-and-forget: nothing
+                    // downstream reads this error, so without a trace a repair that
+                    // cannot find the record leaves no evidence anywhere.
+                    crate::vtrace!(
+                        "repair_rendezvous: read-only re-open found no record -> Err (transient)"
+                    );
+                    VeilidNetError::Routing(
+                        "the rendezvous record was not found on repair re-open".to_owned(),
+                    )
+                }),
+            }
+        },
         // watch: un-gated limiter around the raw watch; no read permit held (CRSH-ISC-17).
         |handle: rendezvous::RendezvousHandle| async move {
             let _ungated = gate.acquire_ungated().await;
@@ -4775,10 +4929,10 @@ mod tests {
         );
         let owner = crate::identity::rendezvous_owner_keypair(&[3u8; 32]).unwrap();
         let ids = [
-            rendezvous::cached_record_id(&owner, rendezvous::RecordShape::RENDEZVOUS),
-            rendezvous::cached_record_id(&owner, DM_KEY_RECORD_SHAPE),
-            rendezvous::cached_record_id(&owner, DM_PAGE_SHAPE),
-            rendezvous::cached_record_id(&owner, DM_DOORBELL_SHAPE),
+            rendezvous::cached_record_id(&owner.key(), rendezvous::RecordShape::RENDEZVOUS),
+            rendezvous::cached_record_id(&owner.key(), DM_KEY_RECORD_SHAPE),
+            rendezvous::cached_record_id(&owner.key(), DM_PAGE_SHAPE),
+            rendezvous::cached_record_id(&owner.key(), DM_DOORBELL_SHAPE),
         ];
         let distinct: std::collections::BTreeSet<_> = ids.iter().collect();
         assert_eq!(

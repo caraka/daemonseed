@@ -26,6 +26,15 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Added
 
+- `identity::OwnerSeed`, `identity::OwnerPublic` and `identity::RendezvousOwner` in
+  `daemonseed-veilid-net`: how a party holds a rendezvous record's owner, either `Held`
+  (the owner seed) or `PublicOnly` (the owner public key). An `OwnerPublic` is
+  constructible only by the one-way derivation from an `OwnerSeed` or from a key baked
+  into the source — there is no `From<[u8; 32]>` and no public field.
+- `identity::owner_public_key` and `identity::PROJECT_ANNOUNCE_OWNER_PUBKEY`: the VLD0
+  public key naming a rendezvous owner, and the baked owner public key of the
+  project-announce/MOTD record. Together they name that record's DHT address with no
+  owner secret derived or held; they confer no write capability. (ISC-15)
 - Two-node integration test for the direct-message acknowledgement record: one node publishes
   a state with gaps, the other derives the same record, fetches it, verifies it and merges it
   under its own ceiling. (#235)
@@ -227,6 +236,23 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Changed
 
+- `VeilidNetHandle::subscribe_room`, `resweep_rendezvous`, `repair_rendezvous` and
+  `rendezvous_record_key` take a `RendezvousOwner` in place of a raw `[u8; 32]` owner
+  seed, and `subscribe_circle` takes an `OwnerSeed`. **Breaking (crate API)** for callers
+  of those five methods. (#244)
+- `VeilidNetHandle::subscribe_room` returns `Result<bool>`: `true` when a record was opened
+  and watched, `false` when a `PublicOnly` owner found none. A caller that remembers a
+  record as subscribed must remember it only on `true`. **Breaking (crate API)**. (ISC-15)
+- `resweep::next_resweep_seed` is now `resweep::next_resweep_record`. It rotates over a
+  per-record identity the caller chooses, which must be the same choice for every record in
+  one caller's set. **Breaking (crate API)**. (#244)
+- A `PublicOnly` rendezvous owner reaches its record read-only: the engine opens it with no
+  writer and never creates it. An absent record is a clean result on subscribe and re-sweep,
+  and an error on repair. The open cache, the record locks and the repair in-flight set key
+  on the owner's public key. (#244)
+- The project-announce/MOTD reader addresses its record from the baked owner public key and
+  holds no owner seed. The single instance that writes that record derives its owner key at
+  each write and keeps nothing between them. (ISC-15)
 - The two-node doorbell oracle's closing control waits for a definitive answer and never
   reads a transient error as an absent record. (#233)
 - Tests, manifests and design documents that need a public Veilid attach describe what the

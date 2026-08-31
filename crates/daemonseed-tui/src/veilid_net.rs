@@ -117,9 +117,10 @@ use daemonseed_core::storage::fetched::{
 use daemonseed_core::storage::manifest_digest::ManifestDigestStore;
 use daemonseed_veilid_net::download::{DownloadOutcome, PlannedFile, run_download};
 use daemonseed_veilid_net::{
-    CLOSE_FLUSH_FLOOR, CLOSE_PREFLUSH_BUDGET, DiscoveryEnvelope, FetchErrorClass, PresenceBoundary,
-    RecordKey, RouteBudget, RouteId, SharerKey, TEARDOWN_CAP, VeilidNet, VeilidNetConfig,
-    VeilidNetError, VeilidNetEvent, VeilidNetHandle, next_resweep_seed, verify_route_advert,
+    CLOSE_FLUSH_FLOOR, CLOSE_PREFLUSH_BUDGET, DiscoveryEnvelope, FetchErrorClass, OwnerSeed,
+    PresenceBoundary, RecordKey, RendezvousOwner, RouteBudget, RouteId, SharerKey, TEARDOWN_CAP,
+    VeilidNet, VeilidNetConfig, VeilidNetError, VeilidNetEvent, VeilidNetHandle,
+    next_resweep_record, verify_route_advert,
 };
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
@@ -598,13 +599,16 @@ pub async fn veilid_net_actor(
                             seeds.push(lobby.share_owner_seed);
                         }
                         seeds.extend(circles.iter().map(|c| c.owner_seed));
-                        if let Some(seed) = next_resweep_seed(&mut seeds, resweep_cursor) {
+                        if let Some(seed) = next_resweep_record(&mut seeds, resweep_cursor) {
                             resweep_cursor = Some(seed);
                             // Feed the RecordKey→owner_seed map once per seed (§RS-1.2): the
                             // key is deterministic per seed (local crypto), so resolve it the
                             // first time this seed is swept and cache it for repair resolution.
                             if resolved_seeds.insert(seed) {
-                                if let Ok(rk) = handle.rendezvous_record_key(seed).await {
+                                if let Ok(rk) = handle
+                                    .rendezvous_record_key(RendezvousOwner::held(seed))
+                                    .await
+                                {
                                     record_key_owners.insert(rk, seed);
                                 } else {
                                     resolved_seeds.remove(&seed); // retry next round
@@ -618,7 +622,7 @@ pub async fn veilid_net_actor(
                             let handle = handle.clone();
                             let busy = resweep_busy.clone();
                             tokio::spawn(async move {
-                                let _ = handle.resweep_rendezvous(seed).await;
+                                let _ = handle.resweep_rendezvous(RendezvousOwner::held(seed)).await;
                                 busy.store(false, std::sync::atomic::Ordering::Release);
                             });
                         }
@@ -1037,18 +1041,27 @@ async fn subscribe_lobby(
     let presence_owner_seed = derive_room_presence_veilid_owner_seed(DEFAULT_ROOM, &CNSA_2_0)
         .map(|s| *s.as_bytes())
         .unwrap_or([0u8; 32]);
-    if let Err(e) = handle.subscribe_room(owner_seed).await {
+    if let Err(e) = handle
+        .subscribe_room(RendezvousOwner::held(owner_seed))
+        .await
+    {
         daemonseed_veilid_net::vtrace!("tui lobby: subscribe failed: {e}");
         return;
     }
     // Subscribe the share record too so inbound share adverts fold into the catalog
     // (#153). Non-fatal — chat is unaffected if it fails.
-    if let Err(e) = handle.subscribe_room(share_owner_seed).await {
+    if let Err(e) = handle
+        .subscribe_room(RendezvousOwner::held(share_owner_seed))
+        .await
+    {
         daemonseed_veilid_net::vtrace!("tui lobby: share-record subscribe failed: {e}");
     }
     // Subscribe the presence record too so inbound beacons fold into the tracker.
     // Non-fatal — chat is unaffected if it fails.
-    if let Err(e) = handle.subscribe_room(presence_owner_seed).await {
+    if let Err(e) = handle
+        .subscribe_room(RendezvousOwner::held(presence_owner_seed))
+        .await
+    {
         daemonseed_veilid_net::vtrace!("tui lobby: presence subscribe failed: {e}");
     }
     daemonseed_veilid_net::vtrace!("tui lobby: subscribed (chat + shares + presence)");
@@ -1115,7 +1128,7 @@ async fn join_circle(
         });
         return;
     }
-    if let Err(e) = handle.subscribe_circle(owner_seed).await {
+    if let Err(e) = handle.subscribe_circle(OwnerSeed::new(owner_seed)).await {
         return err(format!("subscribe failed: {e}"));
     }
     let circle_id = *next_circle_id;
@@ -2845,7 +2858,9 @@ fn spawn_repair(
     let handle = handle.clone();
     let busy = resweep_busy.clone();
     tokio::spawn(async move {
-        let _ = handle.repair_rendezvous(owner_seed).await;
+        let _ = handle
+            .repair_rendezvous(RendezvousOwner::held(owner_seed))
+            .await;
         busy.store(false, std::sync::atomic::Ordering::Release);
     });
 }

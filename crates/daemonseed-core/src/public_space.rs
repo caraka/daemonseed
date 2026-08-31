@@ -24,7 +24,6 @@
 
 use core::fmt;
 use core::str::FromStr;
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use oxicrypt_kdf::HkdfSha384;
@@ -189,20 +188,30 @@ const PROJECT_RELEASE_SEED: [u8; 32] = [
     0x63, 0x74, 0x96, 0xcb, 0x28, 0xf4, 0x23, 0x04, 0xc4, 0xc7, 0xf3, 0x49, 0x16, 0x93, 0xef, 0x8f,
 ];
 
+/// The baked ML-DSA-87 public key of the project-release signer (F17 / ISC-15).
+///
+/// Held as a separate binary file rather than an array literal because it is
+/// `ml_dsa::PK_LEN` bytes: the file is the artifact a reader diffs and a rotation
+/// replaces, and its length is checked at compile time by this very coercion —
+/// `include_bytes!` yields `&'static [u8; N]` for the file's actual `N`, so a file
+/// of any other length fails to compile rather than producing a wrong key.
+///
+/// Baked, not derived, so that the signing seed can leave the source tree without
+/// the value moving with it: at the offline lockdown `PROJECT_RELEASE_SEED` goes
+/// maintainer-held and this constant is all a client keeps. Pinned equal to the
+/// runtime derivation by `baked_project_release_pubkey_matches_seed_derivation`.
+const PROJECT_RELEASE_PUBKEY: [u8; ml_dsa::PK_LEN] = *include_bytes!("project_release_pubkey.bin");
+
 /// The full ML-DSA-87 public key of the project-release signer (F17 / ISC-15).
 ///
 /// This entry is merged into every [`Whitelist`] regardless of the operator's
 /// whitelist file, and there is no file syntax that removes it — that
 /// non-removability is the whole point of F17 (a self-host operator cannot
-/// silence project release announcements). Derived once per process from
-/// `PROJECT_RELEASE_SEED`; requires the oxicrypt module to be operational.
+/// silence project release announcements). Returns the baked
+/// `PROJECT_RELEASE_PUBKEY`: no derivation runs, so this needs no operational
+/// oxicrypt module and cannot fail.
 pub fn project_release_pubkey() -> &'static [u8; ml_dsa::PK_LEN] {
-    static KEY: OnceLock<Box<[u8; ml_dsa::PK_LEN]>> = OnceLock::new();
-    KEY.get_or_init(|| {
-        let kp = SignKeypair::from_ml_dsa_seed(&PROJECT_RELEASE_SEED)
-            .expect("oxicrypt module operational for project-release key derivation");
-        Box::new(*kp.public_key())
-    })
+    &PROJECT_RELEASE_PUBKEY
 }
 
 /// The in-source project-release SIGNING keypair (F17), derived from
@@ -871,6 +880,27 @@ mod tests {
 
         let stranger = keypair(9);
         assert!(!wl.authorizes(stranger.public_key()).unwrap());
+    }
+
+    /// ISC-15 pin: the BAKED project-release pubkey is byte-identical to the key
+    /// `PROJECT_RELEASE_SEED` derives.
+    ///
+    /// The baked constant is what clients trust and nothing else in a build re-derives
+    /// it, so this test is the only place the two are compared. That makes it the check
+    /// on a seed rotation: the seed and `project_release_pubkey.bin` must be replaced
+    /// together, and a mis-transcribed or half-updated key file fails here instead of
+    /// shipping a whitelist anchor whose signing secret nobody holds. The file's LENGTH
+    /// is already checked at compile time — `include_bytes!` yields an array of the
+    /// file's actual size, and the coercion to `[u8; ml_dsa::PK_LEN]` rejects any other.
+    #[test]
+    fn baked_project_release_pubkey_matches_seed_derivation() {
+        ensure_module();
+        let derived = SignKeypair::from_ml_dsa_seed(&PROJECT_RELEASE_SEED).unwrap();
+        assert_eq!(
+            derived.public_key(),
+            &PROJECT_RELEASE_PUBKEY,
+            "baked project-release pubkey differs from the key PROJECT_RELEASE_SEED derives"
+        );
     }
 
     /// The dev project-release SIGNING keypair yields exactly the F17 pubkey the

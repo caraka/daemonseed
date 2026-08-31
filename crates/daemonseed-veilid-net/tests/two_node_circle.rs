@@ -26,7 +26,7 @@ use daemonseed_core::crypto::suite::CNSA_2_0;
 use daemonseed_core::identity::keys::SignKeypair;
 use daemonseed_core::identity::keys::{derive_identity_keys, Identity};
 use daemonseed_core::identity::mnemonic::Mnemonic;
-use daemonseed_veilid_net::{VeilidNet, VeilidNetConfig, VeilidNetEvent};
+use daemonseed_veilid_net::{OwnerSeed, VeilidNet, VeilidNetConfig, VeilidNetEvent};
 
 /// A node config with a fresh daemonseed-derived node identity (D3), a distinct
 /// listen port, and its own storage dir — so two can coexist in one process.
@@ -109,7 +109,7 @@ async fn sealed_circle_message_reaches_a_second_member() {
     // an Inbound event via the sweep and/or a watch ValueChange.
     tokio::time::sleep(Duration::from_secs(5)).await;
     node_b
-        .subscribe_circle(owner_seed)
+        .subscribe_circle(OwnerSeed::new(owner_seed))
         .await
         .expect("B subscribe to circle");
 

@@ -304,6 +304,73 @@ types:
       distinct and as-yet-unknown senders, and the slot is derived from a secret only
       the sender holds. The outcome is required, not decoration: an empty slot list
       alone means both "nobody has knocked" and "all thirty-two GETs errored".
+  - name: OwnerSeed
+    module: daemonseed_veilid_net::identity
+    kind: struct
+    description: >-
+      A rendezvous record's 32-byte Ed25519 owner seed — the VLD0 secret that signs
+      writes to that record. Constructed by OwnerSeed::new from a seed the caller
+      derived in daemonseed-core; as_bytes yields the raw seed for
+      rendezvous_owner_keypair. Debug is redacted; the type is not zeroize-on-drop.
+  - name: OwnerPublic
+    module: daemonseed_veilid_net::identity
+    kind: struct
+    description: >-
+      A rendezvous owner's 32-byte Ed25519 public key — enough to address, read and
+      watch the record, never enough to write it. Two constructors and no others:
+      OwnerPublic::of_seed runs the one-way derivation from an OwnerSeed, and the const
+      OwnerPublic::baked admits a key already baked into the source. There is no
+      From<[u8; 32]> and no public field. Debug renders the first four bytes as hex
+      followed by "..", never the whole value: baked cannot tell a public key from a
+      seed, so truncating here caps what a mis-wrapped seed could print through any
+      derived Debug that contains one.
+  - name: RendezvousOwner
+    module: daemonseed_veilid_net::identity
+    kind: enum
+    description: >-
+      How this party holds a rendezvous record's owner. subscribe_room,
+      resweep_rendezvous, repair_rendezvous and rendezvous_record_key take it in place of
+      a raw owner seed. One record may be held as either variant, including within a
+      single process: every piece of per-record state the engine keeps — the open cache,
+      the record locks, the repair in-flight set — keys on the owner public key, which
+      both variants yield, so the two name one entry rather than two. Whether the cached
+      handle carries a writer does not decide whether a write succeeds —
+      rendezvous::publish_at_subkey, the crate's only write site, passes its own writer
+      explicitly, and veilid-core prefers the call's writer over the handle's
+      (veilid-core-0.5.7 src/storage_manager/set_value.rs:82-85). That is a dependency,
+      not an incidental: a write site that stopped passing an explicit writer would fall
+      back to the cached handle's writer and fail wherever another path had opened the
+      record read-only first.
+    variants:
+      - name: Held
+        description: >-
+          Carries the OwnerSeed. A circle or public-room member, and the instance that
+          writes the project-announce record. Subscribing may deterministically create a
+          record that does not exist yet. RendezvousOwner::held wraps a raw derived seed
+          in one step; RendezvousOwner::resolve yields ResolvedOwner::Writer.
+      - name: PublicOnly
+        description: >-
+          Carries the OwnerPublic. A client reading the project-announce/MOTD record. It
+          holds no secret, so RendezvousOwner::resolve yields ResolvedOwner::ReadOnly and
+          the engine opens the record with no writer and never creates it.
+  - name: ResolvedOwner
+    module: daemonseed_veilid_net::identity
+    kind: enum
+    description: >-
+      A RendezvousOwner resolved into the veilid key the engine opens the record with.
+      One difference reaches the network: a Writer opens with the owner keypair and may
+      create the record and sign writes to it; a ReadOnly opens with no writer, so the
+      record must already exist — a read-only open never creates it — and no owner secret
+      is derived or held, so a caller that needs to write cannot produce the owner keypair
+      a write to that record takes. Everything else —
+      the DHT address, the open-cache id, the record lock — comes from
+      ResolvedOwner::public_key, which is the same value in both arms for one record. No
+      Debug: veilid's KeyPair renders its secret half.
+    variants:
+      - name: Writer
+        description: The veilid KeyPair — address, read, watch, create and write.
+      - name: ReadOnly
+        description: The OwnerPublic — address, read and watch a record that already exists.
 
 # ─────────────────────────────────────────────────────────────────────
 # Functions
@@ -406,10 +473,10 @@ functions:
   - name: VeilidNetHandle::subscribe_circle
     module: daemonseed_veilid_net::actor
     description: Open + watch + backlog-sweep a circle's rendezvous record; inbound messages arrive as VeilidNetEvent::Inbound.
-    signature: "pub async fn subscribe_circle(&self, owner_seed: [u8; 32]) -> Result<()>"
+    signature: "pub async fn subscribe_circle(&self, owner_seed: OwnerSeed) -> Result<()>"
     parameters:
       - name: owner_seed
-        type: "[u8; 32]"
+        type: OwnerSeed
         direction: in
         description: The circle's rendezvous-owner seed.
     returns:
@@ -436,51 +503,65 @@ functions:
   - name: VeilidNetHandle::subscribe_room
     module: daemonseed_veilid_net::actor
     description: Open + watch + backlog-sweep a public room / lobby rendezvous; inbound sealed room messages / share announcements arrive as VeilidNetEvent::Inbound.
-    signature: "pub async fn subscribe_room(&self, owner_seed: [u8; 32]) -> Result<()>"
+    signature: "pub async fn subscribe_room(&self, owner: RendezvousOwner) -> Result<bool>"
     parameters:
-      - name: owner_seed
-        type: "[u8; 32]"
+      - name: owner
+        type: RendezvousOwner
         direction: in
-        description: The public-room rendezvous-owner seed.
+        description: The record's rendezvous owner. Held carries the owner seed; PublicOnly carries only the owner public key.
     returns:
-      type: "Result<()>"
-      description: Ok once subscribed.
+      type: "Result<bool>"
+      description: >-
+        Whether a record was opened and watched. A PublicOnly owner opens the record
+        read-only; a record that is absent is Ok(false) with no watch registered, and a
+        later call picks it up once it exists. A caller that remembers "this record is
+        subscribed" must remember it only on true, or one absent first pass costs it
+        push updates for as long as it holds that memory. A Held owner opens-or-creates,
+        so it answers true whenever it answers Ok.
   - name: VeilidNetHandle::resweep_rendezvous
     module: daemonseed_veilid_net::actor
     description: Re-run the one-shot backlog sweep on an already-subscribed rendezvous record WITHOUT registering another watch — the recovery primitive for an item published during the post-(re)connect watch-warmup window (#132/#133) and for re-resolving a stale-route share (#118).
-    signature: "pub async fn resweep_rendezvous(&self, owner_seed: [u8; 32]) -> Result<()>"
+    signature: "pub async fn resweep_rendezvous(&self, owner: RendezvousOwner) -> Result<()>"
     parameters:
-      - name: owner_seed
-        type: "[u8; 32]"
+      - name: owner
+        type: RendezvousOwner
         direction: in
-        description: The circle or public-room rendezvous-owner seed.
+        description: The record's rendezvous owner.
     returns:
       type: "Result<()>"
-      description: Ok once the re-sweep is dispatched; re-swept items arrive as Inbound and are deduped downstream.
+      description: >-
+        Ok once the re-sweep is dispatched; re-swept items arrive as Inbound and are
+        deduped downstream. A PublicOnly owner whose record is absent is Ok with nothing
+        swept.
   - name: VeilidNetHandle::repair_rendezvous
     module: daemonseed_veilid_net::actor
     description: Re-establish a rendezvous record's session under its record_lock — invalidate the open-cache entry, re-open, re-watch, and full re-sweep. Re-swept backlog arrives as VeilidNetEvent::Inbound.
-    signature: "pub async fn repair_rendezvous(&self, owner_seed: [u8; 32]) -> Result<()>"
+    signature: "pub async fn repair_rendezvous(&self, owner: RendezvousOwner) -> Result<()>"
     parameters:
-      - name: owner_seed
-        type: "[u8; 32]"
+      - name: owner
+        type: RendezvousOwner
         direction: in
-        description: The circle or public-room rendezvous-owner seed.
+        description: The record's rendezvous owner.
     returns:
       type: "Result<()>"
-      description: Ok once the repair is dispatched.
+      description: >-
+        Ok once the repair is dispatched. A PublicOnly owner re-opens read-only, and a
+        record that cannot be found is an error here rather than a state to wait out — a
+        repair re-establishes a session that was working.
   - name: VeilidNetHandle::rendezvous_record_key
     module: daemonseed_veilid_net::actor
-    description: Derive a rendezvous record's RecordKey from its owner seed locally (no network) — the seed→key resolution the self-heal needs.
-    signature: "pub async fn rendezvous_record_key(&self, owner_seed: [u8; 32]) -> Result<RecordKey>"
+    description: Derive a rendezvous record's RecordKey from its owner locally (no network) — the owner→key resolution the self-heal needs.
+    signature: "pub async fn rendezvous_record_key(&self, owner: RendezvousOwner) -> Result<RecordKey>"
     parameters:
-      - name: owner_seed
-        type: "[u8; 32]"
+      - name: owner
+        type: RendezvousOwner
         direction: in
-        description: The circle or public-room rendezvous-owner seed.
+        description: The record's rendezvous owner.
     returns:
       type: "Result<RecordKey>"
-      description: The record's deterministic key.
+      description: >-
+        The record's deterministic key. Both owner variants resolve to the same key: the
+        address is a function of the owner's public half alone.
   - name: VeilidNetHandle::publish_dm_key_record
     module: daemonseed_veilid_net::actor
     description: Publish an identity's signed DM key record to subkey 0 of its dflt(1) record (ISC-C40). Bytes are opaque here — the caller signs with daemonseed_core::dm::keyrec::build and derives owner_seed with derive_owner_seed. Enqueued on the WB-3 funnel as a Keepalive-class coalescible current-state write, so slow anti-eviction re-seeds collapse to at most one queued write per record. The record is world-writable (a world-derivable address implies a world-derivable owner), so anyone can overwrite or erase it; forgery is impossible because the signature inside is verified against the address's own identity key, leaving erasure and rollback as denial-of-service only.
@@ -1229,6 +1310,23 @@ functions:
     returns:
       type: "[u8; 32]"
       description: The owner's raw Ed25519 public key.
+  - name: identity::owner_public_key
+    module: daemonseed_veilid_net::identity
+    description: >-
+      The VLD0-kinded PublicKey naming a rendezvous owner, built from the raw 32 public
+      bytes alone — exactly the value rendezvous_owner_keypair's KeyPair::key() yields
+      for the same owner, so it addresses the same DHT record with no owner secret
+      derived or held. Total. The kind must be VLD0: get_dht_record_key runs the owner
+      key through check_public_key.
+    signature: "pub fn owner_public_key(owner_public: &[u8; 32]) -> PublicKey"
+    parameters:
+      - name: owner_public
+        type: "&[u8; 32]"
+        direction: in
+        description: The owner's raw Ed25519 public key.
+    returns:
+      type: PublicKey
+      description: The VLD0 public key get_dht_record_key consumes.
 
 # ─────────────────────────────────────────────────────────────────────
 # Error types
@@ -1281,6 +1379,16 @@ error_types:
 # ─────────────────────────────────────────────────────────────────────
 
 constants:
+  - name: PROJECT_ANNOUNCE_OWNER_PUBKEY
+    module: daemonseed_veilid_net::identity
+    type: "[u8; 32]"
+    value: "990ad43dc374822be8c7a9b98455ccd5c685e3e7723039033498d097cf7ec4a7"
+    description: >-
+      The 32-byte Ed25519 public key owning the project-announce/MOTD DHT record
+      (ISC-15). owner_public_key turns it into the VLD0 PublicKey get_dht_record_key
+      consumes, which names the record's DHT address. It confers no write capability —
+      the owner secret gates writes. Pinned equal to the runtime derivation by
+      baked_project_announce_owner_pubkey_matches_seed_derivation.
   - name: GRACEFUL_CLOSE_BUDGET
     module: daemonseed_veilid_net::actor
     type: Duration

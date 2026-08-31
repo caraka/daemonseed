@@ -103,11 +103,12 @@ use daemonseed_core::storage::fetched::{
 use daemonseed_core::storage::manifest_digest::ManifestDigestStore;
 use daemonseed_proto::v1 as wire;
 use daemonseed_veilid_net::download::{DownloadOutcome, PlannedFile, run_download};
+use daemonseed_veilid_net::identity::PROJECT_ANNOUNCE_OWNER_PUBKEY;
 use daemonseed_veilid_net::{
     CLOSE_FLUSH_FLOOR, CLOSE_LEAVE_RESERVE, CLOSE_PREFLUSH_BUDGET, DiscoveryEnvelope,
-    FetchErrorClass, PresenceBoundary, RecordKey, RouteBudget, RouteId, SharerKey, TEARDOWN_CAP,
-    VeilidNet, VeilidNetConfig, VeilidNetError, VeilidNetEvent, VeilidNetHandle, next_resweep_seed,
-    verify_route_advert,
+    FetchErrorClass, OwnerPublic, OwnerSeed, PresenceBoundary, RecordKey, RendezvousOwner,
+    RouteBudget, RouteId, SharerKey, TEARDOWN_CAP, VeilidNet, VeilidNetConfig, VeilidNetError,
+    VeilidNetEvent, VeilidNetHandle, next_resweep_record, verify_route_advert,
 };
 use prost::Message as _;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -195,18 +196,86 @@ const STEADY_RESWEEP_WARMUP_HANDOFF: Duration = Duration::from_secs(70);
 /// the heartbeat emit/reap cycle). Order is issue-order and load-bearing: within a round
 /// each `resweep_rendezvous` awaits its record open before the next is issued, so the
 /// operator sweep is dispatched first (the spawned backlog reads then overlap).
-fn warmup_priority_records(
-    operator: Option<[u8; 32]>,
-    lobby: Option<[u8; 32]>,
-    share: Option<[u8; 32]>,
-) -> Vec<[u8; 32]> {
-    let mut seeds = Vec::with_capacity(3);
-    seeds.extend(operator);
-    seeds.extend(lobby);
+///
+/// Takes the session state and derives the three records itself, rather than taking
+/// them as arguments the caller builds. A test can then assert over the SAME derivation
+/// production runs. Built at the call site instead, a test has to rebuild it, and a
+/// caller that stopped passing its operator record would leave that test green while
+/// the announce record led no warmup round.
+fn warmup_priority_records(shares: &ShareState) -> Vec<RendezvousOwner> {
+    warmup_priority_order(
+        announce_resweep_owner(shares),
+        shares
+            .lobby
+            .as_ref()
+            .map(|l| RendezvousOwner::held(l.owner_seed)),
+        shares
+            .lobby
+            .as_ref()
+            .map(|l| RendezvousOwner::held(l.share_owner_seed)),
+    )
+}
+
+/// The ordering half of [`warmup_priority_records`], over records already chosen —
+/// separate so the order can be asserted on every present/absent combination without
+/// building a [`ShareState`] for each.
+fn warmup_priority_order(
+    operator: Option<RendezvousOwner>,
+    lobby: Option<RendezvousOwner>,
+    share: Option<RendezvousOwner>,
+) -> Vec<RendezvousOwner> {
+    let mut owners = Vec::with_capacity(3);
+    owners.extend(operator);
+    owners.extend(lobby);
     // #153: the share record is a separate rendezvous, so a cold-joiner must
     // re-sweep it too to discover shares announced before it subscribed.
-    seeds.extend(share);
-    seeds
+    owners.extend(share);
+    owners
+}
+
+/// The announce record as a re-sweep takes it: its owner PUBLIC key, which is the one
+/// identity every way of holding the record yields and the identity both re-sweep
+/// sources round-robin on. `None` when no announce record is subscribed.
+///
+/// A named function rather than the mapping written out at each site, so both re-sweep
+/// sources derive the record one way and a test pins that one way.
+fn announce_resweep_owner(shares: &ShareState) -> Option<RendezvousOwner> {
+    shares
+        .operator
+        .as_ref()
+        .map(|op| RendezvousOwner::PublicOnly(op.announce.clone()))
+}
+
+/// One subscribed rendezvous record for the round-robin re-sweeps: the record's stable
+/// identity paired with its owner as this instance holds it.
+///
+/// The identity is the owner's PUBLIC key, which every way of holding a record yields —
+/// so the announce record, which this instance may hold either way, has one identity
+/// either way, and the cursor cannot advance past a record it has not swept.
+type SubscribedRecord = ([u8; 32], RendezvousOwner);
+
+/// Every rendezvous record this instance is subscribed to and re-sweeps: the operator
+/// announce/MOTD record, the lobby's chat and share records, and each joined circle.
+///
+/// The announce record is here on its owner PUBLIC key even in the instance that writes
+/// it. The record is already open with a writer by then — [`subscribe_operator_space`]
+/// runs before `shares.operator` is set, and this list is built from `shares.operator` —
+/// and re-sweeping wants no writer in any case.
+///
+/// Presence records are deliberately absent: they self-heal through the heartbeat
+/// emit/reap cycle and re-sweeping them would be redundant traffic.
+fn subscribed_records(shares: &ShareState, circles: &[VeilidCircle]) -> Vec<SubscribedRecord> {
+    let mut owners: Vec<RendezvousOwner> = Vec::new();
+    owners.extend(announce_resweep_owner(shares));
+    if let Some(lobby) = shares.lobby.as_ref() {
+        owners.push(RendezvousOwner::held(lobby.owner_seed));
+        owners.push(RendezvousOwner::held(lobby.share_owner_seed));
+    }
+    owners.extend(circles.iter().map(|c| RendezvousOwner::held(c.owner_seed)));
+    owners
+        .into_iter()
+        .map(|owner| (owner.public_bytes(), owner))
+        .collect()
 }
 
 /// KIND tag for a MOTD value: the payload is a [`wire::SignedArtifact`].
@@ -214,14 +283,18 @@ const OPERATOR_ITEM_MOTD: u8 = 0x00;
 /// KIND tag for an announcement value: the payload is a [`wire::Post`].
 const OPERATOR_ITEM_ANNOUNCEMENT: u8 = 0x01;
 
-/// (owner seed, `slot_id`, encoded value) — ONE #141 keep-alive re-publish.
+/// (`slot_id`, encoded value) — ONE #141 keep-alive re-publish.
 ///
 /// #238 writes a single slot per emission rather than the whole record: the previous
 /// batch wrote every announcement on every tick, so the write cost scaled linearly with
 /// the number of standing announcements and arrived as one burst. One slot per emission
 /// bounds the fleet's rate on this record independently of how many announcements exist
 /// (each slot is simply refreshed every `N` emissions instead).
-type OperatorKeepaliveItem = ([u8; 32], String, Vec<u8>);
+///
+/// The owner seed the write needs is NOT part of this: the caller derives it at the
+/// write itself ([`announce_write_owner_seed`]), so choosing a slot and being able to
+/// write it stay separate questions.
+type OperatorKeepaliveItem = (String, Vec<u8>);
 
 /// Prepend the 1-byte KIND tag to a prost-encoded operator artifact.
 fn encode_operator_item(kind: u8, bytes: &[u8]) -> Vec<u8> {
@@ -327,11 +400,14 @@ struct OwnShare {
 /// the MOTD for peers. Low-volume here (a project posts few live items), so it bites
 /// far later than lobby presence; the fix is the same #134 dedicated-schema call.
 struct OperatorSpace {
-    /// The project-announce Veilid rendezvous-owner seed — the DHT write-gate. In the
-    /// dev phase this is derivable by everyone from the in-source project seed, so any
-    /// client can compose (A0/A1 dev-possession gate); in production only the offline
-    /// seed-holder can write.
-    announce_owner_seed: [u8; 32],
+    /// The project-announce record's owner PUBLIC key — everything needed to address,
+    /// read and watch that record, and nothing that could write it.
+    ///
+    /// The owner seed is deliberately absent. Every client reaches this struct at
+    /// connect, so a seed stored here would be a seed every client holds; the one
+    /// instance that writes the record derives its seed at each write site instead, and
+    /// nothing carries it between them.
+    announce: OwnerPublic,
     /// The current verified MOTD (F17-signed), or `None` if none verifies yet.
     motd: Option<wire::SignedArtifact>,
     /// Verified announcement posts, keyed by their content-address hex slot.
@@ -550,11 +626,12 @@ pub async fn veilid_net_actor(
     // repair-due. Detection only — step 3b attaches repair execution at the repair-due arm.
     let mut session_health: SessionHealthTracker<RecordKey> = SessionHealthTracker::new();
     // §RS-1.2 repair resolution: the tracker keys by `RecordKey`, but the repair works in
-    // `owner_seed`. This map (fed at resweep dispatch — the key is deterministic per seed)
-    // resolves a repair-due `RecordKey` back to its owner seed. `resolved_seeds` avoids a
-    // redundant resolve round-trip once a seed's key is known.
-    let mut record_key_owners: HashMap<RecordKey, [u8; 32]> = HashMap::new();
-    let mut resolved_seeds: HashSet<[u8; 32]> = HashSet::new();
+    // the record's owner. This map (fed at resweep dispatch — the key is deterministic per
+    // owner) resolves a repair-due `RecordKey` back to the owner as this instance holds it.
+    // `resolved_records` avoids a redundant resolve round-trip once a record's key is
+    // known; it holds the owner public key, the identity the resweep cursor also uses.
+    let mut record_key_owners: HashMap<RecordKey, RendezvousOwner> = HashMap::new();
+    let mut resolved_records: HashSet<[u8; 32]> = HashSet::new();
     // Records detected repair-due while a repair/resweep is already in flight or during
     // warmup: enqueued here (dedup by the tracker's latch) and drained one-at-a-time at
     // the cadence tick. One repair in flight at a time via `resweep_busy` (§RS-1.2).
@@ -598,7 +675,7 @@ pub async fn veilid_net_actor(
                 if matches!(cmd, NetCommand::ResweepShares) {
                     handle_refresh_shares(
                         &evt_tx, &net, &shares, &circles, &resweep_busy,
-                        &mut record_key_owners, &mut resolved_seeds, &mut refresh_armed,
+                        &mut record_key_owners, &mut resolved_records, &mut refresh_armed,
                     ).await;
                 } else {
                     // (#274) The ambient boundary for the command path: the write-gate is
@@ -680,8 +757,8 @@ pub async fn veilid_net_actor(
                             let warmed = connected_at.is_some_and(|t| {
                                 t.elapsed() >= STEADY_RESWEEP_WARMUP_HANDOFF
                             });
-                            match record_key_owners.get(&key).copied() {
-                                Some(owner_seed) => {
+                            match record_key_owners.get(&key).cloned() {
+                                Some(owner) => {
                                     let free = !resweep_busy
                                         .load(std::sync::atomic::Ordering::Acquire);
                                     if let (true, true, Some(handle)) =
@@ -698,7 +775,7 @@ pub async fn veilid_net_actor(
                                         // so the drain would also skip it) — both are cheap;
                                         // keep the queue clean.
                                         pending_repairs.retain(|k| k != &key);
-                                        spawn_repair(handle, &resweep_busy, owner_seed);
+                                        spawn_repair(handle, &resweep_busy, owner);
                                         daemonseed_veilid_net::vtrace!(
                                             "gui session-health: repairing dead record \
                                              ({} failed) — re-establishing session",
@@ -766,13 +843,20 @@ pub async fn veilid_net_actor(
                 // Not connected → pick nothing and leave the cursor where it is, so the
                 // slot that would have been refreshed is the one picked next time rather
                 // than being skipped for a whole cycle.
-                let dispatched = if let Some((handle, (owner_seed, slot, value))) = net
+                // The owner seed is derived HERE, for this one write, behind the same
+                // predicate that chose the item — it is not carried in `OperatorSpace`,
+                // which every client holds.
+                let picked = net
                     .as_ref()
                     .zip(next_operator_keepalive_item(
                         &shares,
                         is_operator,
                         operator_keepalive_cursor.as_deref(),
-                    )) {
+                    ))
+                    // A derivation failure traces from inside `announce_write_owner_seed`,
+                    // so a keep-alive that cannot find a seed leaves a record of why.
+                    .zip(announce_write_owner_seed().seed());
+                let dispatched = if let Some(((handle, (slot, value)), owner_seed)) = picked {
                     operator_keepalive_cursor = Some(slot.clone());
                     let handle = handle.clone();
                     tokio::spawn(async move {
@@ -876,9 +960,9 @@ pub async fn veilid_net_actor(
                         // popped entry is stale — drop it (pop_front already removed it).
                         let armed = refresh_armed.remove(&key);
                         if drain_should_dispatch(session_health.is_repair_due(&key), armed) {
-                            if let Some(&owner_seed) = record_key_owners.get(&key) {
+                            if let Some(owner) = record_key_owners.get(&key).cloned() {
                                 session_health.note_repair_dispatched(&key);
-                                spawn_repair(handle, &resweep_busy, owner_seed);
+                                spawn_repair(handle, &resweep_busy, owner);
                                 daemonseed_veilid_net::vtrace!(
                                     "gui steady-resweep: draining a queued repair"
                                 );
@@ -890,34 +974,51 @@ pub async fn veilid_net_actor(
                             );
                         }
                     } else {
-                        let mut seeds: Vec<[u8; 32]> = Vec::new();
-                        seeds.extend(shares.operator.as_ref().map(|op| op.announce_owner_seed));
-                        if let Some(lobby) = shares.lobby.as_ref() {
-                            seeds.push(lobby.owner_seed);
-                            seeds.push(lobby.share_owner_seed);
-                        }
-                        seeds.extend(circles.iter().map(|c| c.owner_seed));
-                        if let Some(seed) = next_resweep_seed(&mut seeds, resweep_cursor) {
-                            resweep_cursor = Some(seed);
-                            // Feed the RecordKey→owner_seed map once per seed (§RS-1.2): the
-                            // key is deterministic per seed (local crypto), so resolve it the
-                            // first time this seed is swept and cache it for repair resolution.
-                            if resolved_seeds.insert(seed) {
-                                if let Ok(rk) = handle.rendezvous_record_key(seed).await {
-                                    record_key_owners.insert(rk, seed);
+                        let records = subscribed_records(&shares, &circles);
+                        let mut ids: Vec<[u8; 32]> = records.iter().map(|(id, _)| *id).collect();
+                        let picked = next_resweep_record(&mut ids, resweep_cursor).and_then(|id| {
+                            let found = records.iter().find(|(i, _)| *i == id).cloned();
+                            if found.is_none() {
+                                // `ids` is built from `records`, so the picker cannot
+                                // choose a record that is not there. If that ever stops
+                                // holding, this tick is skipped WITHOUT advancing the
+                                // cursor — indistinguishable from not being connected,
+                                // and the same record is missed every round after.
+                                debug_assert!(
+                                    false,
+                                    "the re-sweep picker chose a record that is not subscribed"
+                                );
+                                daemonseed_veilid_net::vtrace!(
+                                    "gui steady-resweep: picked record is not in the \
+                                     subscribed set; skipping this tick"
+                                );
+                            }
+                            found
+                        });
+                        if let Some((id, owner)) = picked {
+                            resweep_cursor = Some(id);
+                            // Feed the RecordKey→owner map once per record (§RS-1.2): the key
+                            // is deterministic per owner (local crypto), so resolve it the
+                            // first time this record is swept and cache it for repair
+                            // resolution.
+                            if resolved_records.insert(id) {
+                                if let Ok(rk) =
+                                    handle.rendezvous_record_key(owner.clone()).await
+                                {
+                                    record_key_owners.insert(rk, owner.clone());
                                 } else {
-                                    resolved_seeds.remove(&seed); // retry next round
+                                    resolved_records.remove(&id); // retry next round
                                 }
                             }
                             resweep_busy.store(true, std::sync::atomic::Ordering::Release);
                             daemonseed_veilid_net::vtrace!(
                                 "gui steady-resweep: re-sweeping 1 of {} record(s)",
-                                seeds.len()
+                                records.len()
                             );
                             let handle = handle.clone();
                             let busy = resweep_busy.clone();
                             tokio::spawn(async move {
-                                let _ = handle.resweep_rendezvous(seed).await;
+                                let _ = handle.resweep_rendezvous(owner).await;
                                 busy.store(false, std::sync::atomic::Ordering::Release);
                             });
                         }
@@ -1002,8 +1103,8 @@ async fn handle_refresh_shares(
     shares: &ShareState,
     circles: &[VeilidCircle],
     resweep_busy: &Arc<std::sync::atomic::AtomicBool>,
-    record_key_owners: &mut HashMap<RecordKey, [u8; 32]>,
-    resolved_seeds: &mut HashSet<[u8; 32]>,
+    record_key_owners: &mut HashMap<RecordKey, RendezvousOwner>,
+    resolved_records: &mut HashSet<[u8; 32]>,
     refresh_armed: &mut HashSet<RecordKey>,
 ) {
     // 1. Immediate local re-render (§RS-4.4).
@@ -1014,31 +1115,25 @@ async fn handle_refresh_shares(
         return;
     };
     // Build the same share-bearing subscribed record set the steady resweep round-robins.
-    let mut seeds: Vec<[u8; 32]> = Vec::new();
-    seeds.extend(shares.operator.as_ref().map(|op| op.announce_owner_seed));
-    if let Some(lobby) = shares.lobby.as_ref() {
-        seeds.push(lobby.owner_seed);
-        seeds.push(lobby.share_owner_seed);
-    }
-    seeds.extend(circles.iter().map(|c| c.owner_seed));
-    if seeds.is_empty() {
+    let records = subscribed_records(shares, circles);
+    if records.is_empty() {
         return;
     }
-    // 2. Arm every record (§RS-4.2). Resolve each seed → RecordKey via the cadence-populated
-    //    reverse map first (no round-trip); else resolve once (local crypto, no network — the
-    //    same call the tick uses) and cache it so the fold arm can map a failed pass back to
-    //    its owner seed.
-    for &seed in &seeds {
+    // 2. Arm every record (§RS-4.2). Resolve each record → RecordKey via the
+    //    cadence-populated reverse map first (no round-trip); else resolve once (local
+    //    crypto, no network — the same call the tick uses) and cache it so the fold arm can
+    //    map a failed pass back to its owner.
+    for (id, owner) in &records {
         let key = match record_key_owners
             .iter()
-            .find(|(_, s)| **s == seed)
+            .find(|(_, o)| o.public_bytes() == *id)
             .map(|(k, _)| k.clone())
         {
             Some(k) => Some(k),
-            None => match handle.rendezvous_record_key(seed).await {
+            None => match handle.rendezvous_record_key(owner.clone()).await {
                 Ok(rk) => {
-                    record_key_owners.insert(rk.clone(), seed);
-                    resolved_seeds.insert(seed);
+                    record_key_owners.insert(rk.clone(), owner.clone());
+                    resolved_records.insert(*id);
                     Some(rk)
                 }
                 Err(_) => None,
@@ -1065,13 +1160,13 @@ async fn handle_refresh_shares(
     }
     daemonseed_veilid_net::vtrace!(
         "gui refresh: sweep-first wave over {} record(s)",
-        seeds.len()
+        records.len()
     );
     let handle = handle.clone();
     let busy = resweep_busy.clone();
     tokio::spawn(async move {
-        for seed in seeds {
-            let _ = handle.resweep_rendezvous(seed).await;
+        for (_, owner) in records {
+            let _ = handle.resweep_rendezvous(owner).await;
         }
         busy.store(false, std::sync::atomic::Ordering::Release);
     });
@@ -1086,13 +1181,13 @@ async fn handle_refresh_shares(
 fn spawn_repair(
     handle: &VeilidNetHandle,
     resweep_busy: &Arc<std::sync::atomic::AtomicBool>,
-    owner_seed: [u8; 32],
+    owner: RendezvousOwner,
 ) {
     resweep_busy.store(true, std::sync::atomic::Ordering::Release);
     let handle = handle.clone();
     let busy = resweep_busy.clone();
     tokio::spawn(async move {
-        let _ = handle.repair_rendezvous(owner_seed).await;
+        let _ = handle.repair_rendezvous(owner).await;
         busy.store(false, std::sync::atomic::Ordering::Release);
     });
 }
@@ -1492,18 +1587,16 @@ async fn handle_command(
                 // heartbeat cycle and are excluded.
                 if let Some(handle) = net.as_ref() {
                     let handle = handle.clone();
-                    let priority = warmup_priority_records(
-                        shares.operator.as_ref().map(|op| op.announce_owner_seed),
-                        shares.lobby.as_ref().map(|l| l.owner_seed),
-                        shares.lobby.as_ref().map(|l| l.share_owner_seed),
-                    );
-                    let circle_seeds: Vec<[u8; 32]> =
-                        circles.iter().map(|c| c.owner_seed).collect();
+                    let priority = warmup_priority_records(shares);
+                    let circle_owners: Vec<RendezvousOwner> = circles
+                        .iter()
+                        .map(|c| RendezvousOwner::held(c.owner_seed))
+                        .collect();
                     daemonseed_veilid_net::vtrace!(
                         "gui connect: scheduling {}-round stepped warmup re-sweep ({} priority + {} circles)",
                         WARMUP_RESWEEP_SCHEDULE.len(),
                         priority.len(),
-                        circle_seeds.len()
+                        circle_owners.len()
                     );
                     tokio::spawn(async move {
                         // Absolute deadlines from connect: `sleep_until` means a round's own
@@ -1513,14 +1606,14 @@ async fn handle_command(
                         for (round, &at) in WARMUP_RESWEEP_SCHEDULE.iter().enumerate() {
                             tokio::time::sleep_until(start + at).await;
                             // Operator + lobby every round (top priority + #93 landing feed).
-                            for seed in &priority {
-                                let _ = handle.resweep_rendezvous(*seed).await;
+                            for owner in &priority {
+                                let _ = handle.resweep_rendezvous(owner.clone()).await;
                             }
                             // Circles only in the early rounds — bounds the fan-out for a
                             // heavily-joined user (#140 review).
                             if round < WARMUP_CIRCLE_RESWEEP_ROUNDS {
-                                for seed in &circle_seeds {
-                                    let _ = handle.resweep_rendezvous(*seed).await;
+                                for owner in &circle_owners {
+                                    let _ = handle.resweep_rendezvous(owner.clone()).await;
                                 }
                             }
                         }
@@ -1899,18 +1992,27 @@ async fn subscribe_lobby(
     let presence_owner_seed = derive_room_presence_veilid_owner_seed(DEFAULT_ROOM, &CNSA_2_0)
         .map(|s| *s.as_bytes())
         .unwrap_or([0u8; 32]);
-    if let Err(e) = handle.subscribe_room(owner_seed).await {
+    if let Err(e) = handle
+        .subscribe_room(RendezvousOwner::held(owner_seed))
+        .await
+    {
         daemonseed_veilid_net::vtrace!("gui lobby: subscribe failed: {e}");
         return;
     }
     // Subscribe the share record too so inbound share adverts fold into the catalog
     // (#153). Non-fatal on failure — discovery stays empty but chat is unaffected.
-    if let Err(e) = handle.subscribe_room(share_owner_seed).await {
+    if let Err(e) = handle
+        .subscribe_room(RendezvousOwner::held(share_owner_seed))
+        .await
+    {
         daemonseed_veilid_net::vtrace!("gui lobby: share-record subscribe failed: {e}");
     }
     // Subscribe the presence record too so inbound beacons fold into the roster.
     // Non-fatal on failure — the roster stays empty but chat is unaffected.
-    if let Err(e) = handle.subscribe_room(presence_owner_seed).await {
+    if let Err(e) = handle
+        .subscribe_room(RendezvousOwner::held(presence_owner_seed))
+        .await
+    {
         daemonseed_veilid_net::vtrace!("gui lobby: presence subscribe failed: {e}");
     }
     daemonseed_veilid_net::vtrace!("gui lobby: subscribed (chat + shares + presence)");
@@ -1982,7 +2084,7 @@ async fn join_circle(
         });
         return;
     }
-    if let Err(e) = handle.subscribe_circle(owner_seed).await {
+    if let Err(e) = handle.subscribe_circle(OwnerSeed::new(owner_seed)).await {
         return err(format!("subscribe failed: {e}"));
     }
     // #77: the circle PRESENCE sibling record (P1) — a distinct rendezvous so circle
@@ -1991,7 +2093,10 @@ async fn join_circle(
     let presence_owner_seed = derive_circle_presence_veilid_owner_seed(phrase, &CNSA_2_0)
         .map(|s| *s.as_bytes())
         .unwrap_or([0u8; 32]);
-    if let Err(e) = handle.subscribe_room(presence_owner_seed).await {
+    if let Err(e) = handle
+        .subscribe_room(RendezvousOwner::held(presence_owner_seed))
+        .await
+    {
         daemonseed_veilid_net::vtrace!("gui join_circle: presence subscribe failed: {e}");
     }
     daemonseed_veilid_net::vtrace!("gui join_circle: subscribed ok -> CircleJoined id={circle_id}");
@@ -2181,6 +2286,12 @@ async fn send_room(
 /// fold in as they arrive, and remember it. Best-effort — a derivation/subscribe
 /// failure is traced and leaves `operator` unset (compose/refresh then surface a clean
 /// not-connected error). Mirrors [`subscribe_lobby`].
+///
+/// **`operator` is set only when a record was actually opened.** The early return at
+/// the top makes this a no-op once set, so whatever it records stands for the session;
+/// a read-only subscribe that found no record registers no watch, and recording it
+/// would cost this instance every push update until it restarts. Leaving the field
+/// unset is what makes the next call retry.
 async fn subscribe_operator_space(shares: &mut ShareState, net: &Option<VeilidNetHandle>) {
     if shares.operator.is_some() {
         return;
@@ -2188,34 +2299,137 @@ async fn subscribe_operator_space(shares: &mut ShareState, net: &Option<VeilidNe
     let Some(handle) = net.as_ref() else {
         return;
     };
-    let announce_owner_seed = match dev_project_announce_veilid_owner_seed() {
-        Ok(s) => *s.as_bytes(),
+    // The instance that writes this record subscribes as its owner, so a record that
+    // does not exist yet is created here — the only party that can create it. Every
+    // other instance subscribes on the baked owner public key: the record is opened
+    // read-only, and if it does not exist yet the subscribe is a clean no-op that a
+    // later call picks up.
+    //
+    // This is also what keeps the record on ONE open-cache entry with a writer where a
+    // writer is needed. The engine keys that cache on the owner public key, which both
+    // ways of holding the record yield, so the first open of the session decides
+    // whether the cached handle carries a writer — and for the writing instance that
+    // first open is this one.
+    // A writer that cannot derive its own seed is not a reader. Subscribing read-only
+    // here would record the space as if all were well and then report this instance as
+    // the operator, so leave it unset and let a later call retry.
+    let write_seed = announce_write_owner_seed();
+    if let AnnounceWriteSeed::Derivation(e) = &write_seed {
+        daemonseed_veilid_net::vtrace!(
+            "gui operator: subscribe skipped, owner-seed derivation failed: {e}"
+        );
+        return;
+    }
+    let opened = match handle
+        .subscribe_room(announce_subscribe_owner(write_seed.seed()))
+        .await
+    {
+        Ok(opened) => opened,
         Err(e) => {
-            daemonseed_veilid_net::vtrace!("gui operator: owner-seed derivation failed: {e}");
+            daemonseed_veilid_net::vtrace!("gui operator: subscribe failed: {e}");
             return;
         }
     };
-    if let Err(e) = handle.subscribe_room(announce_owner_seed).await {
-        daemonseed_veilid_net::vtrace!("gui operator: subscribe failed: {e}");
+    // A read-only subscribe of a record that does not exist yet is a clean `Ok` with
+    // no watch registered. Recording the space on that answer would leave this
+    // instance believing it is subscribed for the rest of the session while nothing
+    // pushes to it, so only a record that was actually opened counts — and a later
+    // call picks the record up once the writing party has created it. The absence is
+    // never proof the record does not exist: it is one node's answer, right now.
+    if !opened {
+        daemonseed_veilid_net::vtrace!(
+            "gui operator: announce/MOTD record not found yet (no watch registered); \
+             a later subscribe picks it up"
+        );
         return;
     }
     // #238: state the write role explicitly. Under operator-only keep-alive this
     // instance is the ONLY thing refreshing the record, and the role comes from an
     // environment variable — a launch that forgot `DAEMONSEED_OPERATOR=1` would
-    // otherwise silently stop re-seeding with nothing anywhere to say so.
+    // otherwise silently stop re-seeding with nothing anywhere to say so. Reported
+    // from the seed this instance actually holds, not from the write gate alone: those
+    // disagree exactly when the derivation has failed, which is when it matters.
     daemonseed_veilid_net::vtrace!(
         "gui operator: announce/MOTD record subscribed (write role: {})",
-        if operator_write_enabled() {
+        if write_seed.is_writer() {
             "OPERATOR — this instance re-seeds announcements"
         } else {
             "reader — this instance never writes the announce record"
         }
     );
     shares.operator = Some(OperatorSpace {
-        announce_owner_seed,
+        announce: OwnerPublic::baked(PROJECT_ANNOUNCE_OWNER_PUBKEY),
         motd: None,
         posts: BTreeMap::new(),
     });
+}
+
+/// The announce record's owner as this instance holds it: the owner seed where this
+/// instance writes the record, the baked owner public key otherwise. Both name the same
+/// record — the address is a function of the owner's public half alone.
+///
+/// Pure over its input rather than reading the write predicate itself, so both arms are
+/// reachable from a test. Read ambiently the predicate is unconditionally true in a debug
+/// build, so a test would only ever exercise one arm (#274).
+fn announce_subscribe_owner(write_owner_seed: Option<[u8; 32]>) -> RendezvousOwner {
+    match write_owner_seed {
+        Some(seed) => RendezvousOwner::held(seed),
+        None => RendezvousOwner::PublicOnly(OwnerPublic::baked(PROJECT_ANNOUNCE_OWNER_PUBKEY)),
+    }
+}
+
+/// How this instance holds the project-announce record's owner seed at a write site.
+///
+/// The two seedless cases are separate and must not be collapsed into one "no seed".
+/// [`Self::NotAWriter`] is an instance behaving exactly as intended; [`Self::Derivation`]
+/// is a fault in an instance that is supposed to write, and telling its user that the
+/// build cannot write is a false cause that hides the real one.
+enum AnnounceWriteSeed {
+    /// This instance writes the record, and here is the seed for one write.
+    Seed([u8; 32]),
+    /// This instance does not write the record — the write gate is closed.
+    NotAWriter,
+    /// This instance is a writer, but deriving the owner seed failed. Carries the
+    /// error text so a caller can put the real cause in front of whoever hit it.
+    Derivation(String),
+}
+
+impl AnnounceWriteSeed {
+    /// The seed, for a call site that only needs to know whether a write can be
+    /// attempted at all. A caller that reports a failure to a user should match on the
+    /// variants instead, so it can name the actual cause.
+    fn seed(&self) -> Option<[u8; 32]> {
+        match self {
+            Self::Seed(seed) => Some(*seed),
+            Self::NotAWriter | Self::Derivation(_) => None,
+        }
+    }
+
+    /// Whether this instance can write the announce record — what it can actually do,
+    /// rather than what the write gate alone says it may do.
+    fn is_writer(&self) -> bool {
+        matches!(self, Self::Seed(_))
+    }
+}
+
+/// The project-announce record's owner seed, for the instance that writes that record.
+///
+/// Derived here at each write site and returned by value, never stored: the seed exists
+/// for the duration of one write and nothing carries it between writes, so no
+/// long-lived structure holds it and no reader path can find it in one.
+fn announce_write_owner_seed() -> AnnounceWriteSeed {
+    if !operator_write_enabled() {
+        return AnnounceWriteSeed::NotAWriter;
+    }
+    match dev_project_announce_veilid_owner_seed() {
+        Ok(seed) => AnnounceWriteSeed::Seed(*seed.as_bytes()),
+        Err(e) => {
+            // Traced as well as returned: the keep-alive path only needs to know that
+            // no write is possible, so the error text would otherwise reach nothing.
+            daemonseed_veilid_net::vtrace!("gui operator: owner-seed derivation failed: {e}");
+            AnnounceWriteSeed::Derivation(e.to_string())
+        }
+    }
 }
 
 /// Project the current verified operator content as a [`NetEvent::PublicSpaceSnapshot`]
@@ -2390,11 +2604,26 @@ async fn set_motd(
     if !operator_write {
         return err("the MOTD is read-only in this build".to_owned());
     }
-    let Some(owner_seed) = shares.operator.as_ref().map(|o| o.announce_owner_seed) else {
+    if shares.operator.is_none() {
         return err(operator_unavailable_message(net));
-    };
+    }
     let Some(handle) = net.as_ref() else {
         return err("not connected to Veilid yet".to_owned());
+    };
+    // Derived here, for this one write, and dropped when it returns. The write gate was
+    // already checked above, so a missing seed here can only be a derivation failure —
+    // reporting it as a build that cannot write would name a cause that is provably not
+    // the one, and send whoever hit it looking at the wrong thing.
+    let owner_seed = match announce_write_owner_seed() {
+        AnnounceWriteSeed::Seed(seed) => seed,
+        AnnounceWriteSeed::Derivation(e) => {
+            return err(format!(
+                "could not derive the announce record's owner key: {e}"
+            ));
+        }
+        AnnounceWriteSeed::NotAWriter => {
+            return err("the MOTD is read-only in this build".to_owned());
+        }
     };
     let kp = match dev_project_release_keypair() {
         Ok(k) => k,
@@ -2443,11 +2672,24 @@ async fn upload_announcement(
     if !operator_write {
         return err("announcements are read-only in this build".to_owned());
     }
-    let Some(owner_seed) = shares.operator.as_ref().map(|o| o.announce_owner_seed) else {
+    if shares.operator.is_none() {
         return err(operator_unavailable_message(net));
-    };
+    }
     let Some(handle) = net.as_ref() else {
         return err("not connected to Veilid yet".to_owned());
+    };
+    // Derived here, for this one write, as [`set_motd`] does — including the same
+    // reason a missing seed cannot be reported as a build that does not write.
+    let owner_seed = match announce_write_owner_seed() {
+        AnnounceWriteSeed::Seed(seed) => seed,
+        AnnounceWriteSeed::Derivation(e) => {
+            return err(format!(
+                "could not derive the announce record's owner key: {e}"
+            ));
+        }
+        AnnounceWriteSeed::NotAWriter => {
+            return err("announcements are read-only in this build".to_owned());
+        }
     };
     let kp = match dev_project_release_keypair() {
         Ok(k) => k,
@@ -2550,7 +2792,6 @@ fn next_operator_keepalive_item(
     };
     let (slot, post) = next?;
     Some((
-        op.announce_owner_seed,
         slot.clone(),
         encode_operator_item(OPERATOR_ITEM_ANNOUNCEMENT, &post.encode_to_vec()),
     ))
@@ -4521,24 +4762,50 @@ mod tests {
 
     #[test]
     fn warmup_priority_records_order_operator_then_lobby_then_share() {
-        let op = [1u8; 32];
-        let lobby = [2u8; 32];
-        let share = [3u8; 32];
+        // The announce record is held on its owner public key, the lobby's two on their
+        // seeds — the way each is actually held, so the ordering is asserted over the
+        // real mixture rather than a uniform one.
+        let op = RendezvousOwner::PublicOnly(OwnerPublic::baked(PROJECT_ANNOUNCE_OWNER_PUBKEY));
+        let lobby = RendezvousOwner::held([2u8; 32]);
+        let share = RendezvousOwner::held([3u8; 32]);
+        // Compared on the owner public key: it is one value per record whichever variant
+        // names it, which is exactly the identity the re-sweep round-robins on.
+        let ids = |owners: Vec<RendezvousOwner>| -> Vec<[u8; 32]> {
+            owners.iter().map(RendezvousOwner::public_bytes).collect()
+        };
+        // The ordering assertions below compare through that projection, so they would
+        // also hold if it collapsed every owner to one value — three equal ids in the
+        // expected order. Pin the three apart first, and the ordering means something.
+        let distinct = ids(vec![op.clone(), lobby.clone(), share.clone()]);
+        assert_ne!(distinct[0], distinct[1]);
+        assert_ne!(distinct[1], distinct[2]);
+        assert_ne!(distinct[0], distinct[2]);
         // #140 priority: operator MOTD/announce before lobby chat; #153: the share
         // record re-sweeps too so a cold-joiner discovers pre-existing shares.
         assert_eq!(
-            warmup_priority_records(Some(op), Some(lobby), Some(share)),
-            vec![op, lobby, share]
+            ids(warmup_priority_order(
+                Some(op.clone()),
+                Some(lobby.clone()),
+                Some(share.clone())
+            )),
+            ids(vec![op.clone(), lobby.clone(), share.clone()])
         );
         // Operator alone.
-        assert_eq!(warmup_priority_records(Some(op), None, None), vec![op]);
+        assert_eq!(
+            ids(warmup_priority_order(Some(op.clone()), None, None)),
+            ids(vec![op])
+        );
         // Lobby + share, no operator.
         assert_eq!(
-            warmup_priority_records(None, Some(lobby), Some(share)),
-            vec![lobby, share]
+            ids(warmup_priority_order(
+                None,
+                Some(lobby.clone()),
+                Some(share.clone())
+            )),
+            ids(vec![lobby, share])
         );
         // Neither joined → empty (the scheduler re-sweeps nothing that round).
-        assert!(warmup_priority_records(None, None, None).is_empty());
+        assert!(warmup_priority_order(None, None, None).is_empty());
     }
 
     #[test]
@@ -6129,9 +6396,86 @@ mod tests {
 
     // ── Operator announcements / MOTD (Phase 4 A-c) ──────────────────────
 
+    /// **The announce record keeps being refreshed.** It must appear in BOTH re-sweep
+    /// sources — the steady round-robin and the warmup priority rounds — or its DHT
+    /// values age out with nothing on any surface to say so, which is the failure the
+    /// keep-alive and the re-sweeps exist to prevent.
+    ///
+    /// Asserted on the record's identity, the owner public key, because that is what
+    /// both sources round-robin on and what a repair resolves back to. The mirror
+    /// control is the second half: with no operator record subscribed, neither source
+    /// names it — so a green first half is evidence the record was added rather than
+    /// evidence the assertion cannot fail.
+    #[test]
+    fn the_announce_record_is_re_swept_by_both_sources() {
+        let announce = PROJECT_ANNOUNCE_OWNER_PUBKEY;
+        let circles = [];
+
+        let mut shares = ShareState::new();
+        shares.operator = Some(operator_space());
+        let steady: Vec<[u8; 32]> = subscribed_records(&shares, &circles)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert!(
+            steady.contains(&announce),
+            "the announce record must be in the steady re-sweep set"
+        );
+
+        // The whole derivation production runs, from the same state — not a list this
+        // test assembles itself. Assembled here, the assertion would go on passing
+        // while the caller quietly stopped handing its operator record over, which is
+        // the failure this test exists to catch.
+        let warmup = warmup_priority_records(&shares);
+        assert_eq!(
+            warmup
+                .iter()
+                .map(RendezvousOwner::public_bytes)
+                .collect::<Vec<_>>(),
+            vec![announce],
+            "the announce record must lead the warmup priority rounds"
+        );
+
+        // Mirror control: nothing subscribed, nothing re-swept.
+        let empty = ShareState::new();
+        assert!(subscribed_records(&empty, &circles).is_empty());
+        assert!(warmup_priority_records(&empty).is_empty());
+    }
+
+    /// **The two ways of holding the announce record name ONE record.**
+    ///
+    /// The instance that writes it subscribes as its owner, so a record that does not
+    /// exist yet is created; every other instance subscribes on the baked public key and
+    /// opens it read-only. If those addressed different records the writer would publish
+    /// where no reader looks, and a reader would sit on a permanently empty record with
+    /// no error anywhere — so the identity is asserted equal across the two arms.
+    #[test]
+    fn a_reader_and_a_writer_subscribe_the_same_announce_record() {
+        // The seed derivation runs through the cryptographic module, which the binary
+        // brings up on its own path; a test binary powers it on itself.
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let reader = announce_subscribe_owner(None);
+        assert!(
+            matches!(reader, RendezvousOwner::PublicOnly(_)),
+            "an instance that does not write the record must carry no seed"
+        );
+        assert_eq!(reader.public_bytes(), PROJECT_ANNOUNCE_OWNER_PUBKEY);
+
+        let seed = *dev_project_announce_veilid_owner_seed()
+            .expect("derive the announce owner seed")
+            .as_bytes();
+        let writer = announce_subscribe_owner(Some(seed));
+        assert!(matches!(writer, RendezvousOwner::Held(_)));
+        assert_eq!(
+            writer.public_bytes(),
+            reader.public_bytes(),
+            "the writer and the reader must address one record"
+        );
+    }
+
     fn operator_space() -> OperatorSpace {
         OperatorSpace {
-            announce_owner_seed: [0u8; 32],
+            announce: OwnerPublic::baked(PROJECT_ANNOUNCE_OWNER_PUBKEY),
             motd: None,
             posts: BTreeMap::new(),
         }
@@ -6201,7 +6545,7 @@ mod tests {
         let mut cursor: Option<String> = None;
         let mut visited = Vec::new();
         for _ in 0..slots.len() {
-            let (_, slot, _) = next_operator_keepalive_item(&shares, true, cursor.as_deref())
+            let (slot, _) = next_operator_keepalive_item(&shares, true, cursor.as_deref())
                 .expect("an operator with announcements always has one to refresh");
             visited.push(slot.clone());
             cursor = Some(slot);
@@ -6209,7 +6553,7 @@ mod tests {
         assert_eq!(visited, slots, "one slot per emission, in key order");
 
         // ...and the next emission wraps to the first rather than stopping.
-        let (_, wrapped, _) = next_operator_keepalive_item(&shares, true, cursor.as_deref())
+        let (wrapped, _) = next_operator_keepalive_item(&shares, true, cursor.as_deref())
             .expect("the cursor must wrap, not run out");
         assert_eq!(
             wrapped, slots[0],
@@ -6245,7 +6589,7 @@ mod tests {
             vanished > slots[0] && vanished < slots[1],
             "cursor is between"
         );
-        let (_, slot, _) = next_operator_keepalive_item(&shares, true, Some(&vanished))
+        let (slot, _) = next_operator_keepalive_item(&shares, true, Some(&vanished))
             .expect("an absent cursor slot must not stall the rotation");
         assert_eq!(
             slot, slots[1],
@@ -6282,9 +6626,8 @@ mod tests {
         );
         // An announcement (content-addressed → idempotent under re-publish) IS kept alive.
         let slot = push_announcement(&mut shares, "release", "v0.33.0 is out", 200);
-        let (seed, picked, value) = next_operator_keepalive_item(&shares, true, None)
+        let (picked, value) = next_operator_keepalive_item(&shares, true, None)
             .expect("the announcement should be picked");
-        assert_eq!(seed, shares.operator.as_ref().unwrap().announce_owner_seed);
         assert_eq!(picked, slot, "the announcement slot, never the MOTD");
         assert_eq!(
             decode_operator_item(&value).unwrap().0,

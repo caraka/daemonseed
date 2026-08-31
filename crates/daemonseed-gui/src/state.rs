@@ -2911,12 +2911,14 @@ mod tests {
     /// delivered, so a read is recorded whether or not any further event arrives.
     ///
     /// This is hardening, not a live fix. The state it guards — a populated pane whose
-    /// refresh answers with an error — is currently unreachable: the operator record is
-    /// subscribed once and never unsubscribed (`subscribe_operator_space` early-returns
-    /// when set, and nothing clears it), and the pane is only ever populated by a
-    /// snapshot, which requires that subscription. It becomes reachable the moment
-    /// anything resets the record on disconnect, and the coupling it removes — read
-    /// state depending on an inbound event — is worth not having regardless.
+    /// refresh answers with an error — is currently unreachable: once the operator
+    /// record is recorded it is never unrecorded (`subscribe_operator_space`
+    /// early-returns when set, and nothing clears it), and the pane is only ever
+    /// populated by a snapshot, which requires that record. A subscribe that opened
+    /// nothing leaves the field unset and so populates no pane, which is the same
+    /// unreachable state by the other route. It becomes reachable the moment anything
+    /// resets the record on disconnect, and the coupling it removes — read state
+    /// depending on an inbound event — is worth not having regardless.
     #[test]
     fn reading_the_pane_records_what_is_on_screen_without_a_snapshot() {
         use daemonseed_core::bootstrap::BootstrapAnchor;
