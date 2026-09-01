@@ -1,5 +1,12 @@
 //! The wiring between the direct-messaging records and the disk (#281).
 //!
+//! The disk here is [`crate::storage::dm_store`], which holds the state a
+//! correspondence needs in order to carry on — reconnect material, a handshake
+//! still in progress, the unsettled outbox, how far reading has got, what is
+//! known about the correspondent — plus the profile's block list. **It is not
+//! where messages are kept:** a received message is never written there, and
+//! sent content lives there only until its outbox entry settles or gives up.
+//!
 //! Every type this module binds already existed and already knew its own at-rest
 //! shape. What did not exist was a **writer**: nothing anywhere under `dm/` ever
 //! handed a byte to [`crate::storage::dm_store`], so `ProvisionalRecord::seal`,

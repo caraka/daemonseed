@@ -8,7 +8,12 @@
 //! - [`dm_store`] (#286, Amendment A9) — the DM record store built over
 //!   `atomic_file`: one directory per correspondence, one fixed-size sealed
 //!   file per record kind, and a lock that brackets the whole read-modify-write
-//!   because both halves live on the guard it hands out.
+//!   because both halves live on the guard it hands out. It holds the state a
+//!   correspondence needs to carry on — reconnect material, a handshake in
+//!   progress, the unsettled outbox, the read cursor, what is known about the
+//!   correspondent — plus the profile's block list. It is **not** where messages
+//!   are kept: a received message is never written, and sent content lives there
+//!   only until its outbox entry settles.
 //! - [`seeds`] (M1, ISC-C3) — the AEAD-protected mnemonic + per-circle state
 //!   blob.
 //! - [`recovery_file`] (M2, ISC-C32) — the same KDF chain with a distinct

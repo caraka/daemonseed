@@ -2,6 +2,21 @@
 //! disk, and the place the lock becomes impossible to forget (#286, Amendment
 //! A9's build-obligation list, `docs/design/direct-messaging.md`).
 //!
+//! **It is not where messages are kept.** The word *store* invites that reading
+//! and it is wrong. What is held is the state a correspondence needs in order to
+//! carry on: [`RecordKind::Resume`], the crypto state a reconnect wants;
+//! [`RecordKind::Provisional`], a handshake still in progress;
+//! [`RecordKind::Outbox`], what has been sent and is not yet settled;
+//! [`RecordKind::ReceiveCursor`], how far reading has got; and
+//! [`RecordKind::ContactCache`], what is known about the correspondent. One
+//! further kind belongs to the profile rather than to any correspondence:
+//! [`RecordKind::BlockList`], the identities the user refuses.
+//!
+//! **Message content is here only while a message is in flight**, inside an
+//! outbox entry awaiting collection. Once that entry settles or gives up the
+//! content is dropped and delivery metadata is all that remains. **A received
+//! message is never written here at all.**
+//!
 //! ## Why a store at all, when `super::atomic_file` already writes durably
 //!
 //! Three invariants have had no enforcement point anywhere in this tree, and

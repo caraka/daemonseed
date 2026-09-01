@@ -3,16 +3,26 @@
 //! [`SpentTokenSet`] knows how to encode itself and how to forget an expired
 //! grant. What it did not have was a home, and the obvious home was wrong.
 //!
-//! **Why not the DM store.** [`crate::storage::dm_store::DmStore`] is strictly
-//! `root/<correspondence>/<kind>`: every record it holds belongs to one
-//! correspondence, and the directory name *is* the correspondence. The spent
-//! set belongs to none of them. An invite token is minted by this profile and
-//! redeemed once against this profile — the whole point of the set is that a
-//! token burnt in one conversation cannot be replayed into another — so filing
-//! it under any single correspondence would be a lie about its scope, and
-//! filing it under a reserved sentinel correspondence would put a directory in
-//! the store that names something that is not a correspondence, in exactly the
-//! place where directory names are load-bearing for privacy.
+//! **Why not the DM store.** [`crate::storage::dm_store::DmStore`] holds the
+//! state a correspondence needs to carry on — reconnect material, a handshake in
+//! progress, the unsettled outbox, the read cursor, the contact record — under
+//! `root/<correspondence>/<kind>`, where the directory name *is* the
+//! correspondence. The spent set belongs to none of them. An invite token is
+//! minted by this profile and redeemed once against this profile — the whole
+//! point of the set is that a token burnt in one conversation cannot be replayed
+//! into another — so filing it under any single correspondence would be a lie
+//! about its scope, and filing it under a reserved sentinel correspondence would
+//! put a directory in the store that names something that is not a
+//! correspondence, in exactly the place where directory names are load-bearing
+//! for privacy.
+//!
+//! **The store has since grown a profile scope, and that does not move this
+//! set.** `RecordKind::BlockList` is profile-scoped, so "every record belongs to
+//! one correspondence" is no longer the reason. The reason is the shape: a
+//! profile record there is one fixed-size file padded to a ceiling chosen so its
+//! length reveals nothing, which suits a bounded set of identities and does not
+//! suit a set that grows and expires with token traffic. Revisit this if that
+//! ever stops being true; do not revisit it because the scope exists.
 //!
 //! So the set is profile-global and sits at the profile root, beside the trust
 //! log, sealed under its own key.

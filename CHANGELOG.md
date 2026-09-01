@@ -218,6 +218,14 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Fixed
 
+- Corrected the rustdoc where the direct-message at-rest store is introduced, which left
+  the word *store* to be read as the place messages are kept. `storage::dm_store`, the
+  `dm_store` entry in `storage`, `dm::persist` and `dm::spent_store` name what it holds:
+  per correspondence the resume, provisional, outbox, receive-cursor and contact records,
+  plus the profile's block list. Message content is present only while an outbox entry is
+  in flight, and a received message is never written. `dm::spent_store`'s argument for
+  keeping the spent-token set outside the store rests on the fixed-size profile record's
+  shape rather than on every record belonging to a correspondence. (#384)
 - Corrected the keepalive and heartbeat interval coverage, which asserted band membership and
   variation but not band width, so a draw collapsed to a tenth of its span passed.
   `interval_in_band` is the single definition for both and takes its entropy source as a
