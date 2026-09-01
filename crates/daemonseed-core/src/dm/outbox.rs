@@ -1531,7 +1531,11 @@ impl Outbox {
     /// ever inserted. A terminal entry sheds its sealed frame but keeps its fixed
     /// fields for ever, so the record grows with *lifetime* messages rather than
     /// owed ones, and at [`crate::storage::dm_store::OUTBOX_CAPACITY`] that wall is
-    /// around 52 000. It is permanent rather than a hiccup: the persist path is
+    /// around 65 500 — `(2 MiB − 39)/32`, for a channel-page entry at the
+    /// crate-private `ENTRY_FIXED_LEN` (31) plus its one target byte; de-linked
+    /// because this doc is public and that constant is not. (It read 52 000 until
+    /// 2026-09-01, which prices a 40-byte entry this format no longer has.) It is
+    /// permanent rather than a hiccup: the persist path is
     /// read-modify-write and always writes, so past the wall every future write
     /// fails — no enqueue, no sweep, no settle — for the life of the correspondence,
     /// and nothing would ever shrink the map again.

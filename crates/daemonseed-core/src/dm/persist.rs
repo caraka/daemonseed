@@ -114,7 +114,7 @@ use crate::dm::provisional::{
 use crate::dm::ratchet::{Direction, Ratchet, RatchetError};
 use crate::dm::resume::{ResumeError, ResumeRecord};
 use crate::storage::dm_store::{
-    CorrespondenceLabel, DmStore, DmStoreError, RECEIVE_CURSOR_LEN, RecordKind,
+    CorrespondenceLabel, DmStore, DmStoreError, OUTBOX_CAPACITY, RECEIVE_CURSOR_LEN, RecordKind,
 };
 use crate::storage::seeds::AEAD_KEY_LEN;
 
@@ -331,6 +331,31 @@ pub enum Mutation<T> {
     Unchanged(T),
 }
 
+/// The encoded size at which [`DmPersist::update_outbox`] starts calling
+/// [`Outbox::prune`] (#323).
+///
+/// **Why there is a threshold at all rather than pruning on every call.**
+/// Pruning is not free to the *product*: it discards the only record of which
+/// terminal state a message reached, and nothing else retains that (see
+/// [`DmPersist::update_outbox`]). Half of
+/// [`OUTBOX_CAPACITY`] is about **32 700** lifetime messages on one
+/// correspondence — a terminal `ChannelPage` entry costs 32 bytes, and about
+/// 30 800 for a 34-byte `Doorbell` one — far beyond what an ordinary conversation
+/// reaches, so under this mark nothing is ever discarded and the full delivery
+/// history stays readable. (`Outbox::prune`'s own docs say "around 52 000" for
+/// the whole 2 MiB bucket; that figure is priced from a 40-byte entry the format
+/// no longer has, and the wall is nearer 65 500.) Above it the record is on its way to the wall the issue is about,
+/// where the alternative to discarding history is a record that can no longer be
+/// written at all and whose history is therefore unreadable anyway.
+///
+/// **Why half, and not nearer the wall.** What fills the bucket in ordinary use
+/// is *owed* frames, which pruning cannot touch — the measured worst case is
+/// around 106 of them. Leaving a whole capacity's worth of headroom means a
+/// record that crosses this mark on terminal entries still has room for every
+/// owed frame it can hold, so the prune is never racing the send path for the
+/// same bytes.
+pub(crate) const OUTBOX_PRUNE_THRESHOLD: usize = OUTBOX_CAPACITY / 2;
+
 /// A profile's DM records on disk, and the keys they are written under.
 ///
 /// Holds the store and the provisional record's seal key together because both
@@ -517,7 +542,13 @@ impl DmPersist {
     /// `f` returns `Ok`, so a failed call leaves the correspondence exactly as it
     /// was and the caller may retry.
     ///
-    /// **A successful call writes only when `f` says it changed something.** An
+    /// **A successful call writes when `f` says it changed something — or when
+    /// the prune below reclaimed entries.** The second clause is the whole of the
+    /// exception and it is stated here rather than only where it is implemented,
+    /// because anyone sizing the #289 seal budget reads this paragraph: an
+    /// over-threshold record whose closure reports `Unchanged` still spends one
+    /// seal if terminal entries were reclaimed, once per backlog rather than once
+    /// per tick. Everything below is otherwise unaffected. An
     /// earlier version of this method always wrote, and said so: *"one redundant
     /// write against having to trust every caller to report whether it
     /// mutated"*. That trade was made without knowing the price. #289 measured
@@ -534,9 +565,11 @@ impl DmPersist {
     /// caller cannot fail to answer, and `#[must_use]` catches building the
     /// answer and dropping it.
     ///
-    /// **A record that does not exist yet is created only if `f` changes it.**
-    /// `Unchanged` on a fresh correspondence writes no outbox record and spends
-    /// no seal — an empty record stores no fact worth one, and
+    /// **A record that does not exist yet is created only if `f` changes it, and
+    /// the prune does not weaken this.** A fresh correspondence has nothing to
+    /// reclaim, so its `encoded_len` is a bare header, the threshold is not met
+    /// and `pruned` is zero: `Unchanged` on a fresh correspondence writes no
+    /// outbox record and spends no seal — an empty record stores no fact worth one, and
     /// [`Self::read_outbox`] already distinguishes "nothing queued" from "never
     /// queued anything".
     ///
@@ -559,9 +592,15 @@ impl DmPersist {
     /// the one failure this type cannot prevent by construction, because
     /// `#[must_use]` catches a dropped answer and not a wrong one. Under
     /// `debug_assertions` the record is re-encoded and compared, so a lying
-    /// closure fails loudly wherever tests run. Release builds take the caller
-    /// at its word. The check costs a second [`Outbox::encode`] per call in
-    /// debug builds, and a third on the `Changed` path; `RecordKind::Outbox`
+    /// closure fails loudly wherever tests run. **Release builds take the caller
+    /// at its word, and since the prune the consequence of a lie is no longer
+    /// uniform:** a mutation reported as `Unchanged` is discarded when nothing was
+    /// pruned and *persisted* when something was, so the same lying closure has
+    /// opposite on-disk outcomes decided only by the record's size. Neither is
+    /// data loss and both are caught in debug; it is stated because the old text
+    /// implied one outcome. The check costs a second [`Outbox::encode`] per call
+    /// in debug builds, and a third on the `Changed` path and on the pruning
+    /// `Unchanged` path alike; `RecordKind::Outbox`
     /// caps at 2 MiB, so a debug-build sweep over a large outbox pays for that
     /// repeatedly. It is deliberate — this is the method whose callers are
     /// hardest to audit — but it is not free.
@@ -577,6 +616,66 @@ impl DmPersist {
     /// no longer and its entries would be unreachable through this method.
     /// Whatever retires a version owes an explicit migration pass; it can no
     /// longer assume the sweep performed one.
+    ///
+    /// # This call prunes, and three things follow for anyone above it (#323)
+    ///
+    /// Once the record reaches half of [`OUTBOX_CAPACITY`] — the crate-private
+    /// `OUTBOX_PRUNE_THRESHOLD`, de-linked because this doc is public and that
+    /// constant is not — this method calls
+    /// [`Outbox::prune`] before running `f`, dropping every entry that is
+    /// terminal and already surfaced. Without it the record grows with *lifetime*
+    /// messages rather than owed ones and dies for good at
+    /// [`OUTBOX_CAPACITY`]; past that wall every write here fails, so no
+    /// enqueue, no sweep and no settle ever succeeds again on that
+    /// correspondence. The reclaim happens ahead of `f` so that an enqueue's
+    /// capacity gate sees the freed bytes.
+    ///
+    /// **1. Delivery history above the threshold is gone, and the acknowledgement
+    /// cannot stand in for it.** After a prune [`Outbox::entry`] answers `None`,
+    /// and [`Outbox::pruned_high_water`] records only *that* a sequence is gone,
+    /// never which terminal state it reached. The obvious substitute is wrong in
+    /// the dangerous direction:
+    /// [`AckState::is_settled`](crate::dm::ack::AckState::is_settled) reports
+    /// `true` for a sequence this sender **gave up on**, because a receiver's
+    /// contiguous prefix advances past a permanently lost message — so a surface
+    /// that fell back to the ack would show *delivered* for a message nobody
+    /// read. Nothing else retains the distinction. What the prune does not
+    /// endanger is the [#279] obligation: an entry is only ever taken once its
+    /// [`Surfacing`](crate::dm::outbox::Surfacing) is `Clear`, meaning the
+    /// outcome already reached the user. A surface that must *re-render* an old
+    /// outcome needs its own message log; this record is a delivery queue with a
+    /// bounded retention, not the history.
+    ///
+    /// **2. Sequence allocation must be monotonic, and pruning is a second place
+    /// that now depends on it.** The invariant is not new — a direction's
+    /// sequence space is one monotonic counter per conversation, and the
+    /// acknowledgement is a contiguous prefix plus ascending runs, so a
+    /// gap-filling allocator was already unrepresentable. Pruning makes it bite
+    /// sooner: settling and pruning a high sequence while a lower one is still
+    /// owed raises the high-water past the unused sequences beneath it, and both
+    /// enqueue doors refuse those for ever. Entries still present below the
+    /// mark stay fully reachable; it is the *unused* numbers that are burnt.
+    ///
+    /// **3. A ceiling must not come from the surviving entries.** Pruning
+    /// regresses the maximum sequence the map holds, permanently and without a
+    /// restart. Anything needing "the highest sequence we have sent" — above all
+    /// [`AckState::merge_peer_ack`](crate::dm::ack::AckState::merge_peer_ack),
+    /// whose ceiling clips a peer's claim — must take the greater of that maximum
+    /// and [`Outbox::pruned_high_water`], never the maximum alone, or it will
+    /// clip a truthful acknowledgement and report delivered messages as
+    /// undelivered.
+    ///
+    /// **The seal cost of the trigger.** A prune that finds nothing costs
+    /// nothing: `Unchanged` still writes nothing, so a no-op tick on an
+    /// over-threshold record stays free and #289's argument is untouched. A prune
+    /// that *does* free entries under an `Unchanged` closure spends one seal, and
+    /// only until the backlog is cleared — the cost tracks message volume, which
+    /// the budget already scales with, rather than polling cadence, which it does
+    /// not. Under a `Changed` closure the prune rides a write that was happening
+    /// anyway and costs nothing at all. Below the threshold not even the scan
+    /// runs.
+    ///
+    /// [#279]: https://github.com/caraka/daemonseed/issues/279
     pub fn update_outbox<T>(
         &self,
         correspondence: &CorrespondenceLabel,
@@ -599,10 +698,29 @@ impl DmPersist {
                     }
                     None => Outbox::new(direction),
                 };
+                // Reclaim *before* the closure, not after (#323).
+                // `Outbox::insert`'s capacity gate prices a candidate against
+                // `Outbox::encoded_len`, so bytes freed after the closure has run
+                // are bytes the enqueue the closure just attempted was already
+                // refused for. A prune that happens after the decision it exists
+                // to inform rescues the write and abandons the send.
+                //
+                // A failing closure discards the prune with everything else, so
+                // "nothing is written if `f` fails" is unaffected: the reclaim is
+                // in memory until one of the two arms below writes it.
+                let pruned = if outbox.encoded_len() >= OUTBOX_PRUNE_THRESHOLD {
+                    outbox.prune()
+                } else {
+                    0
+                };
                 // Debug builds hold the before-image so an `Unchanged` report
                 // that is not true fails here rather than silently discarding
-                // the caller's mutation. Release builds take the report at its
-                // word; see this method's docs.
+                // the caller's mutation. Taken *after* the prune deliberately, so
+                // the check still measures the closure alone — a before-image
+                // taken earlier would differ by the prune on every pruning call
+                // and the check would have to be skipped exactly where the
+                // closure is hardest to audit. Release builds take the report at
+                // its word; see this method's docs.
                 #[cfg(debug_assertions)]
                 let before = outbox.encode();
                 match f(&mut outbox)? {
@@ -622,6 +740,14 @@ impl DmPersist {
                             "an update reported Mutation::Unchanged after changing the outbox; \
                              the change would have been discarded without a trace"
                         );
+                        // The closure changed nothing, but the prune above did.
+                        // Dropping it here would not corrupt anything — the
+                        // stored record is simply left as it was found — but the
+                        // scan would be repeated on every call for ever and the
+                        // record would never actually shrink.
+                        if pruned > 0 {
+                            guard.replace(RecordKind::Outbox, &outbox.encode())?;
+                        }
                         Ok(out)
                     }
                 }
@@ -1292,7 +1418,7 @@ mod tests {
     use crate::dm::contact_cache::{CONTACT_RECORD_LEN, CONTACT_RECORD_VERSION};
     use crate::dm::firstcontact::SS0_LEN;
     use crate::dm::keyrec;
-    use crate::dm::outbox::{OUTBOX_MAGIC, OutboxTarget, SealedFrame, Surfacing};
+    use crate::dm::outbox::{DeliveryState, OUTBOX_MAGIC, OutboxTarget, SealedFrame, Surfacing};
     use crate::dm::paging::MAX_PAGE;
     use crate::dm::provisional::{PROVISIONAL_RECORD_LEN, TeardownCause};
     use crate::dm::ratchet::EphemeralDecapKey;
@@ -1986,6 +2112,669 @@ mod tests {
             loaded.entry(1).expect("the entry").surfacing(),
             Surfacing::Owed
         );
+    }
+
+    // ---- the outbox prune caller (#323) -------------------------------------
+
+    /// Bytes of one terminal channel entry: the fixed fields plus a
+    /// `ChannelPage` tag, with no frame because a terminal entry has shed it.
+    /// Spelled out rather than imported so a change to either constant shows up
+    /// here as a failure instead of being tracked silently.
+    const TERMINAL_ENTRY_LEN: usize = (8 + 8 + 4 + 8 + 1 + 1 + 1) + 1;
+
+    /// How many prunable entries the fixtures below plant.
+    ///
+    /// Sized so the bytes they free comfortably exceed one padded entry, which
+    /// is what `the_reclaim_precedes_the_closure_and_rescues_a_refused_enqueue`
+    /// needs: too few and whether the rescue succeeds depends on where the fill
+    /// loop happened to stop, so the test would pass or fail on arithmetic
+    /// nobody chose.
+    const PRUNABLE: u64 = 200;
+
+    /// Plant `PRUNABLE` terminal, already-surfaced entries at sequences
+    /// `1..=PRUNABLE`, then pad with live frames until the record is over
+    /// [`OUTBOX_PRUNE_THRESHOLD`].
+    ///
+    /// The padding is deliberately made of *owed* frames, which pruning cannot
+    /// touch: it is the only way to cross a 1 MiB threshold without enqueuing
+    /// tens of thousands of entries, and it is also the realistic shape — a large
+    /// outbox is large because of what it still owes.
+    ///
+    /// Returns the first sequence the fixture has not used.
+    fn plant_over_threshold(outbox: &mut Outbox, t0: i64, later: i64) -> u64 {
+        for seq in 1..=PRUNABLE {
+            outbox
+                .enqueue_awaiting_key(seq, OutboxTarget::ChannelPage, t0)
+                .expect("enqueues");
+        }
+        let given_up = outbox.sweep_give_ups(later);
+        assert_eq!(
+            given_up.len(),
+            PRUNABLE as usize,
+            "the fixture depends on every planted entry going terminal"
+        );
+        outbox.record_surfaced(&given_up);
+
+        let mut seq = PRUNABLE + 1;
+        while outbox.encoded_len() < OUTBOX_PRUNE_THRESHOLD {
+            outbox
+                .enqueue_sealed(
+                    seq,
+                    OutboxTarget::ChannelPage,
+                    later,
+                    SealedFrame::new(vec![0xA5; 100_000]),
+                )
+                .expect("enqueues");
+            seq += 1;
+        }
+        seq
+    }
+
+    /// Above the threshold, an update prunes: the finished entries leave the
+    /// record and it gets smaller by exactly their size.
+    ///
+    /// The byte delta is asserted exactly rather than as "smaller". A prune that
+    /// removed one entry and a prune that removed all eight both shrink the
+    /// record, and only the exact figure separates them from a prune whose
+    /// predicate has quietly narrowed.
+    #[test]
+    fn an_over_threshold_update_prunes_and_the_record_shrinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = persist(tmp.path());
+        let l = label(60);
+        let t0 = 1_700_000_000_000i64;
+        let later = t0 + 8 * DAY_MS;
+
+        p.update_outbox(&l, Direction::AToB, t0, |outbox| {
+            plant_over_threshold(outbox, t0, later);
+            Ok(Mutation::Changed(()))
+        })
+        .expect("seeds");
+
+        let seeded = p.read_outbox(&l, later).expect("reads").expect("present");
+        assert!(
+            seeded.encoded_len() >= OUTBOX_PRUNE_THRESHOLD,
+            "the fixture never crossed the threshold, so nothing below tests the trigger"
+        );
+        for seq in 1..=PRUNABLE {
+            assert!(
+                seeded.entry(seq).is_some(),
+                "seeding must not prune: the record was under the threshold when \
+                 that call took its reclaim decision"
+            );
+        }
+        let before = seeded.encoded_len();
+
+        // A call that changes nothing. Everything that happens to the record here
+        // is the prune.
+        p.update_outbox(&l, Direction::AToB, later, |_| Ok(Mutation::Unchanged(())))
+            .expect("updates");
+
+        let after = p.read_outbox(&l, later).expect("reads").expect("present");
+        for seq in 1..=PRUNABLE {
+            assert!(
+                after.entry(seq).is_none(),
+                "sequence {seq} is terminal and surfaced, so the prune owed us its bytes"
+            );
+        }
+        assert_eq!(
+            before - after.encoded_len(),
+            PRUNABLE as usize * TERMINAL_ENTRY_LEN,
+            "the record must shrink by exactly the pruned entries; a different \
+             figure means the prune took the wrong set"
+        );
+        assert_eq!(
+            after.pruned_high_water(),
+            PRUNABLE + 1,
+            "one past the highest sequence reclaimed"
+        );
+    }
+
+    /// Below the threshold nothing is pruned, however prunable it is.
+    ///
+    /// This is the product half of the trigger: an ordinary correspondence keeps
+    /// its full delivery history, because it will never come near the wall the
+    /// prune exists to prevent.
+    #[test]
+    fn a_below_threshold_update_never_prunes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = persist(tmp.path());
+        let l = label(61);
+        let t0 = 1_700_000_000_000i64;
+        let later = t0 + 8 * DAY_MS;
+
+        p.update_outbox(&l, Direction::AToB, t0, |outbox| {
+            for seq in 1..=PRUNABLE {
+                outbox.enqueue_awaiting_key(seq, OutboxTarget::ChannelPage, t0)?;
+            }
+            let given_up = outbox.sweep_give_ups(later);
+            outbox.record_surfaced(&given_up);
+            Ok(Mutation::Changed(()))
+        })
+        .expect("seeds");
+
+        let seeded = p.read_outbox(&l, later).expect("reads").expect("present");
+        assert!(
+            seeded.encoded_len() < OUTBOX_PRUNE_THRESHOLD,
+            "the fixture is meant to be small; it proves nothing if it is not"
+        );
+        // The control: every entry here *would* be taken by a prune, so the
+        // survival below is the threshold's doing and not the predicate's.
+        assert_eq!(
+            seeded.clone().prune(),
+            PRUNABLE as usize,
+            "the fixture must be fully prunable, or it cannot show the threshold holding it back"
+        );
+
+        p.update_outbox(&l, Direction::AToB, later, |_| Ok(Mutation::Unchanged(())))
+            .expect("updates");
+
+        let after = p.read_outbox(&l, later).expect("reads").expect("present");
+        assert_eq!(after.len(), PRUNABLE as usize);
+        assert_eq!(after.pruned_high_water(), 0, "nothing was reclaimed");
+    }
+
+    /// The seal cost of the trigger, both halves.
+    ///
+    /// A prune that frees entries under an `Unchanged` closure spends exactly one
+    /// seal, and the very next identical call spends none — so the cost tracks
+    /// the backlog and not the polling cadence, which is the property #289 bought
+    /// and #347 implemented.
+    #[test]
+    fn the_prune_spends_one_seal_for_the_backlog_and_none_thereafter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = persist(tmp.path());
+        let l = label(62);
+        let t0 = 1_700_000_000_000i64;
+        let later = t0 + 8 * DAY_MS;
+
+        p.update_outbox(&l, Direction::AToB, t0, |outbox| {
+            plant_over_threshold(outbox, t0, later);
+            Ok(Mutation::Changed(()))
+        })
+        .expect("seeds");
+
+        let before = p.store().seal_count();
+        p.update_outbox(&l, Direction::AToB, later, |_| Ok(Mutation::Unchanged(())))
+            .expect("updates");
+        assert_eq!(
+            p.store().seal_count() - before,
+            1,
+            "a prune that actually reclaimed entries has to write them away, and \
+             the write is one seal"
+        );
+
+        // Nothing is prunable now, and the record is still over the threshold, so
+        // the scan runs and finds nothing. That must be free.
+        let settled = p.store().seal_count();
+        p.update_outbox(&l, Direction::AToB, later, |_| Ok(Mutation::Unchanged(())))
+            .expect("updates");
+        p.update_outbox(&l, Direction::AToB, later, |_| Ok(Mutation::Unchanged(())))
+            .expect("updates");
+        assert_eq!(
+            p.store().seal_count(),
+            settled,
+            "a scan that reclaims nothing must not seal; if it does, every tick on \
+             every large correspondence spends a seal for ever"
+        );
+        assert!(
+            p.read_outbox(&l, later)
+                .expect("reads")
+                .expect("present")
+                .encoded_len()
+                >= OUTBOX_PRUNE_THRESHOLD,
+            "the free calls above only mean something while the record is still \
+             over the threshold and the scan is therefore still running"
+        );
+    }
+
+    /// The reclaim happens before the closure, so it frees space the enqueue's
+    /// own capacity gate can see.
+    ///
+    /// The refusal is demonstrated, not assumed: the same enqueue is first run
+    /// against the unpruned record and must fail with
+    /// [`OutboxError::Full`]. Without that control this test would pass just as
+    /// well if the record had never been near capacity at all.
+    #[test]
+    fn the_reclaim_precedes_the_closure_and_rescues_a_refused_enqueue() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = persist(tmp.path());
+        let l = label(63);
+        let t0 = 1_700_000_000_000i64;
+        let later = t0 + 8 * DAY_MS;
+
+        // Fill to the point where one more small frame does not fit, but the
+        // eight prunable entries are worth more than it needs.
+        let admitted = p
+            .update_outbox(&l, Direction::AToB, t0, |outbox| {
+                let mut seq = plant_over_threshold(outbox, t0, later);
+                loop {
+                    let frame = SealedFrame::new(vec![0x5A; 4_096]);
+                    match outbox.enqueue_sealed(seq, OutboxTarget::ChannelPage, later, frame) {
+                        Ok(_) => seq += 1,
+                        Err(OutboxError::Full { .. }) => break,
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                Ok(Mutation::Changed(seq))
+            })
+            .expect("seeds");
+
+        // The control. This copy is what is on disk, unpruned, and it refuses.
+        let mut unpruned = p.read_outbox(&l, later).expect("reads").expect("present");
+        let refused = unpruned.enqueue_sealed(
+            admitted,
+            OutboxTarget::ChannelPage,
+            later,
+            SealedFrame::new(vec![0x5A; 4_096]),
+        );
+        assert!(
+            matches!(refused, Err(OutboxError::Full { .. })),
+            "the record is not actually full, so nothing below is a rescue: {refused:?}"
+        );
+
+        // The same enqueue through the persist path, where the prune runs first.
+        p.update_outbox(&l, Direction::AToB, later, |outbox| {
+            outbox.enqueue_sealed(
+                admitted,
+                OutboxTarget::ChannelPage,
+                later,
+                SealedFrame::new(vec![0x5A; 4_096]),
+            )?;
+            Ok(Mutation::Changed(()))
+        })
+        .expect("the prune ran before the closure, so the gate had the freed bytes");
+
+        let after = p.read_outbox(&l, later).expect("reads").expect("present");
+        assert!(
+            after.entry(admitted).is_some(),
+            "the rescued message must actually be in the record"
+        );
+    }
+
+    /// Pads with live frames at the *low* sequences and plants the prunable
+    /// entries *above* them, which is the shape decision 3 is about: the prune
+    /// then takes the highest sequences the record holds and the surviving
+    /// maximum genuinely regresses.
+    ///
+    /// Returns the highest sequence ever used and the highest that survives.
+    fn plant_prunable_above_the_pads(outbox: &mut Outbox, t0: i64, later: i64) -> (u64, u64) {
+        let mut pad = 1u64;
+        while outbox.encoded_len() < OUTBOX_PRUNE_THRESHOLD {
+            outbox
+                .enqueue_sealed(
+                    pad,
+                    OutboxTarget::ChannelPage,
+                    later,
+                    SealedFrame::new(vec![0xA5; 100_000]),
+                )
+                .expect("enqueues");
+            pad += 1;
+        }
+        let highest_pad = pad - 1;
+        for seq in pad..pad + PRUNABLE {
+            outbox
+                .enqueue_awaiting_key(seq, OutboxTarget::ChannelPage, t0)
+                .expect("enqueues");
+        }
+        let given_up = outbox.sweep_give_ups(later);
+        assert_eq!(
+            given_up.len(),
+            PRUNABLE as usize,
+            "the pads were composed at `later` and must not expire; only the high \
+             entries are meant to go terminal"
+        );
+        outbox.record_surfaced(&given_up);
+        (pad + PRUNABLE - 1, highest_pad)
+    }
+
+    /// Decision 3: after a prune the surviving entries' maximum is genuinely
+    /// lower than the highest sequence sent, and only the high-water recovers it.
+    ///
+    /// A ceiling is what
+    /// [`AckState::merge_peer_ack`](crate::dm::ack::AckState::merge_peer_ack)
+    /// clips a peer's claim to, so a regressed one reports delivered messages as
+    /// undelivered. The two derivations must actually *differ* here, or a
+    /// `merge_peer_ack` rewritten to clip against the map alone would pass.
+    #[test]
+    fn a_ceiling_from_the_surviving_entries_regresses_and_the_high_water_does_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = persist(tmp.path());
+        let l = label(64);
+        let t0 = 1_700_000_000_000i64;
+        let later = t0 + 8 * DAY_MS;
+
+        let (true_ceiling, highest_pad) = p
+            .update_outbox(&l, Direction::AToB, t0, |outbox| {
+                Ok(Mutation::Changed(plant_prunable_above_the_pads(
+                    outbox, t0, later,
+                )))
+            })
+            .expect("seeds");
+        assert_eq!(
+            p.read_outbox(&l, later)
+                .expect("reads")
+                .expect("present")
+                .iter()
+                .map(|e| e.seq())
+                .max(),
+            Some(true_ceiling),
+            "before the prune both derivations agree; the divergence below is the prune's"
+        );
+
+        p.update_outbox(&l, Direction::AToB, later, |_| Ok(Mutation::Unchanged(())))
+            .expect("updates");
+        let after = p.read_outbox(&l, later).expect("reads").expect("present");
+
+        let naive = after
+            .iter()
+            .map(|e| e.seq())
+            .max()
+            .expect("the pads survive");
+        let corrected = naive.max(after.pruned_high_water().saturating_sub(1));
+
+        assert_eq!(naive, highest_pad);
+        assert!(
+            naive < true_ceiling,
+            "the derivations do not differ, so this fixture cannot tell a correct \
+             ceiling from a regressed one: naive {naive}, sent {true_ceiling}"
+        );
+        assert_eq!(
+            true_ceiling - naive,
+            PRUNABLE,
+            "the map is short by exactly the reclaimed range"
+        );
+        assert_eq!(
+            corrected, true_ceiling,
+            "the high-water is the only surviving record of the ceiling, and a \
+             clip against `naive` would report {PRUNABLE} delivered messages as \
+             undelivered"
+        );
+    }
+
+    /// Decision 2: a live entry below the high-water stays reachable, and the
+    /// unused sequences beneath the mark are what is burnt.
+    ///
+    /// Harmless under the monotonic per-direction counter the design already
+    /// requires; this pins which of the two things actually happens, because the
+    /// costly misreading is that pruning loses live entries.
+    #[test]
+    fn a_live_entry_below_the_high_water_survives_and_unused_sequences_do_not() {
+        let t0 = 1_700_000_000_000i64;
+        let later = t0 + 8 * DAY_MS;
+        let mut outbox = Outbox::new(Direction::AToB);
+
+        // 2 is still owed; 5 finishes and is surfaced. 3 and 4 are never used.
+        outbox
+            .enqueue_sealed(
+                5,
+                OutboxTarget::ChannelPage,
+                t0,
+                SealedFrame::new(vec![0x11; 8]),
+            )
+            .expect("enqueues");
+        let gone = outbox.sweep_give_ups(later);
+        outbox.record_surfaced(&gone);
+        outbox
+            .enqueue_sealed(
+                2,
+                OutboxTarget::ChannelPage,
+                later,
+                SealedFrame::new(vec![0x22; 8]),
+            )
+            .expect("enqueues");
+
+        assert_eq!(outbox.prune(), 1, "only sequence 5 qualifies");
+        assert_eq!(outbox.pruned_high_water(), 6);
+        assert!(
+            outbox.entry(2).is_some(),
+            "a live entry below the mark is reachable; pruning does not reach it"
+        );
+        for burnt in [3u64, 4] {
+            assert!(
+                matches!(
+                    outbox.enqueue_sealed(
+                        burnt,
+                        OutboxTarget::ChannelPage,
+                        later,
+                        SealedFrame::new(vec![0x33; 8])
+                    ),
+                    Err(OutboxError::DuplicateSequence(_))
+                ),
+                "sequence {burnt} was never used and is now refused for ever"
+            );
+        }
+        outbox
+            .enqueue_sealed(
+                6,
+                OutboxTarget::ChannelPage,
+                later,
+                SealedFrame::new(vec![0x44; 8]),
+            )
+            .expect("a monotonic allocator's next sequence is at the mark, and is accepted");
+    }
+
+    /// Decision 1: what the prune discards, nothing else retains — and the
+    /// acknowledgement is the wrong place to look for it.
+    ///
+    /// One entry ends collected and one ends abandoned. After the prune the
+    /// record cannot tell them apart, and neither can the ack: its contiguous
+    /// prefix advances past a permanently lost message, so `is_settled` answers
+    /// `true` for both. A surface that fell back to it would show *delivered* for
+    /// a message nobody read.
+    #[test]
+    fn a_pruned_outcome_is_unrecoverable_and_the_ack_cannot_stand_in() {
+        use crate::dm::ack::AckState;
+
+        let t0 = 1_700_000_000_000i64;
+        let later = t0 + 8 * DAY_MS;
+
+        let mut ack = AckState::new();
+        for seq in 0..=2 {
+            ack.collect(seq).expect("collects");
+        }
+
+        let mut outbox = Outbox::new(Direction::AToB);
+        outbox
+            .enqueue_awaiting_key(1, OutboxTarget::ChannelPage, t0)
+            .expect("enqueues");
+        let abandoned = outbox.sweep_give_ups(later);
+        assert_eq!(abandoned, vec![1]);
+        outbox
+            .enqueue_sealed(
+                2,
+                OutboxTarget::ChannelPage,
+                later,
+                SealedFrame::new(vec![0x77; 8]),
+            )
+            .expect("enqueues");
+        let collected = outbox.settle_from_ack(&ack, later);
+        assert_eq!(collected, vec![2]);
+
+        assert_eq!(
+            outbox.entry(1).expect("present").delivery_state(),
+            DeliveryState::Undelivered
+        );
+        assert_eq!(
+            outbox.entry(2).expect("present").delivery_state(),
+            DeliveryState::ConfirmedCollected
+        );
+
+        outbox.record_surfaced(&[1, 2]);
+        assert_eq!(outbox.prune(), 2);
+
+        assert!(outbox.entry(1).is_none());
+        assert!(outbox.entry(2).is_none());
+        assert!(
+            ack.is_settled(1) && ack.is_settled(2),
+            "the ack reports the abandoned message as settled just as it does the \
+             collected one, which is precisely why it cannot rebuild the distinction"
+        );
+    }
+
+    /// A closure that fails after the prune has run writes nothing at all — the
+    /// reclaim is discarded with everything else.
+    ///
+    /// The record is compared byte for byte, so a `guard.replace` moved up to sit
+    /// immediately after the prune is caught here. That mutation compiles, leaves
+    /// every other test in this file passing, and is invisible in release builds
+    /// to the debug-only lying-`Unchanged` assert — this is the test that holds
+    /// it.
+    #[test]
+    fn a_failing_closure_after_a_prune_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = persist(tmp.path());
+        let l = label(65);
+        let t0 = 1_700_000_000_000i64;
+        let later = t0 + 8 * DAY_MS;
+
+        p.update_outbox(&l, Direction::AToB, t0, |outbox| {
+            plant_over_threshold(outbox, t0, later);
+            Ok(Mutation::Changed(()))
+        })
+        .expect("seeds");
+
+        let before_bytes = std::fs::read(record_path(&p, &l, "outbox.bin")).expect("reads");
+        let before_seals = p.store().seal_count();
+
+        // The refusal is a duplicate of a *surviving* pad sequence, so it does not
+        // depend on the prune having happened and cannot pass for the wrong reason.
+        let err = p.update_outbox(&l, Direction::AToB, later, |outbox| {
+            outbox.enqueue_sealed(
+                PRUNABLE + 1,
+                OutboxTarget::ChannelPage,
+                later,
+                SealedFrame::new(vec![0x01; 8]),
+            )?;
+            Ok(Mutation::Changed(()))
+        });
+        assert!(
+            matches!(err, Err(DmPersistError::Outbox(OutboxError::DuplicateSequence(s))) if s == PRUNABLE + 1),
+            "the fixture must actually fail inside the closure: {err:?}"
+        );
+
+        assert_eq!(
+            std::fs::read(record_path(&p, &l, "outbox.bin")).expect("reads"),
+            before_bytes,
+            "a failed update wrote to the record; the prune must not reach the disk \
+             on a path the closure never completed"
+        );
+        assert_eq!(
+            p.store().seal_count(),
+            before_seals,
+            "a failed update spent a seal"
+        );
+        let reloaded = p.read_outbox(&l, later).expect("reads").expect("present");
+        for seq in 1..=PRUNABLE {
+            assert!(
+                reloaded.entry(seq).is_some(),
+                "sequence {seq} was reclaimed in memory and the reclaim was persisted \
+                 despite the closure failing"
+            );
+        }
+    }
+
+    /// A terminal entry costs the fixed length and nothing more, because it has
+    /// shed its frame — which is what `TERMINAL_ENTRY_LEN` above claims and what
+    /// the whole prune is worth.
+    ///
+    /// Every other fixture here plants `AwaitingKey` entries, whose lifecycle
+    /// carries no frame at any point, so none of them measures the shedding.
+    #[test]
+    fn a_terminal_entry_has_shed_its_frame_and_costs_only_the_fixed_length() {
+        let t0 = 1_700_000_000_000i64;
+        let later = t0 + 8 * DAY_MS;
+        let mut outbox = Outbox::new(Direction::AToB);
+        let header = outbox.encoded_len();
+
+        outbox
+            .enqueue_sealed(
+                1,
+                OutboxTarget::ChannelPage,
+                t0,
+                SealedFrame::new(vec![0xEE; 4_096]),
+            )
+            .expect("enqueues");
+        assert_eq!(
+            outbox.encoded_len(),
+            header + TERMINAL_ENTRY_LEN + 8 + 4_096,
+            "while it is owed, the entry costs its length-prefixed frame too"
+        );
+
+        let gone = outbox.sweep_give_ups(later);
+        assert_eq!(gone, vec![1]);
+        assert_eq!(
+            outbox.encoded_len(),
+            header + TERMINAL_ENTRY_LEN,
+            "going terminal sheds the frame, and what is left is what the prune reclaims"
+        );
+
+        outbox.record_surfaced(&gone);
+        assert_eq!(outbox.prune(), 1);
+        assert_eq!(outbox.encoded_len(), header, "the entry is gone entirely");
+    }
+
+    /// The trigger fires *at* the threshold, not only above it.
+    ///
+    /// `>=` and `>` differ on exactly one record size and no padded fixture will
+    /// ever land on it by accident, so this one is built to the byte.
+    #[test]
+    fn a_record_exactly_at_the_threshold_is_pruned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = persist(tmp.path());
+        let l = label(66);
+        let t0 = 1_700_000_000_000i64;
+        let later = t0 + 8 * DAY_MS;
+
+        p.update_outbox(&l, Direction::AToB, t0, |outbox| {
+            for seq in 1..=PRUNABLE {
+                outbox.enqueue_awaiting_key(seq, OutboxTarget::ChannelPage, t0)?;
+            }
+            let given_up = outbox.sweep_give_ups(later);
+            outbox.record_surfaced(&given_up);
+
+            let mut seq = PRUNABLE + 1;
+            while OUTBOX_PRUNE_THRESHOLD - outbox.encoded_len() > 200_000 {
+                outbox.enqueue_sealed(
+                    seq,
+                    OutboxTarget::ChannelPage,
+                    later,
+                    SealedFrame::new(vec![0xA5; 100_000]),
+                )?;
+                seq += 1;
+            }
+            // One last entry sized so the record lands exactly on the mark: a
+            // live entry costs the fixed length, an eight-byte frame prefix, and
+            // the frame.
+            let gap = OUTBOX_PRUNE_THRESHOLD - outbox.encoded_len();
+            outbox.enqueue_sealed(
+                seq,
+                OutboxTarget::ChannelPage,
+                later,
+                SealedFrame::new(vec![0x5A; gap - (TERMINAL_ENTRY_LEN + 8)]),
+            )?;
+            Ok(Mutation::Changed(()))
+        })
+        .expect("seeds");
+
+        let seeded = p.read_outbox(&l, later).expect("reads").expect("present");
+        assert_eq!(
+            seeded.encoded_len(),
+            OUTBOX_PRUNE_THRESHOLD,
+            "the fixture is only a boundary test while it is exactly on the boundary"
+        );
+
+        p.update_outbox(&l, Direction::AToB, later, |_| Ok(Mutation::Unchanged(())))
+            .expect("updates");
+
+        let after = p.read_outbox(&l, later).expect("reads").expect("present");
+        for seq in 1..=PRUNABLE {
+            assert!(
+                after.entry(seq).is_none(),
+                "sequence {seq} survived a record sitting exactly on the threshold, \
+                 so the comparison excludes the boundary"
+            );
+        }
     }
 
     // ---- the receive cursor ------------------------------------------------

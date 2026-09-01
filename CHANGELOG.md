@@ -218,6 +218,15 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Fixed
 
+- Corrected the direct-message outbox record's growth, which retained every entry ever
+  inserted and so grew with lifetime rather than owed messages, reaching a wall past which
+  every persist for that correspondence failed for good. `DmPersist::update_outbox` calls
+  `Outbox::prune` before running the caller's closure once the encoded record reaches half
+  the outbox record's capacity, so an enqueue's capacity gate prices against the reclaimed
+  bytes. Reclaiming an entry discards which terminal state its message reached:
+  `Outbox::pruned_high_water` records only that the sequence is gone, and an acknowledgement
+  reports a given-up sequence as settled. A prune that reclaims nothing spends no seal, and
+  one that reclaims writes once for the backlog. (#323)
 - Corrected the DHT open cache's treatment of DM channel page records, which opened a page
   once per session and never closed it, so open-record cardinality grew with message volume.
   The page subset of the cache is bounded by `DM_PAGE_CACHE_CAPACITY`, and an eviction closes

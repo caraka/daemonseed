@@ -1324,13 +1324,17 @@ modules:
       advance_cursor(label, page, read_through) are read-modify-write inside one
       critical_section; there is no load-then-save pair to lose an update. f
       returns Mutation<T>, which is Changed(T) or Unchanged(T) and is must_use;
-      update_outbox writes the record only on Changed. An Unchanged report for a
+      update_outbox writes the record on Changed, and on Unchanged when the prune
+      below reclaimed entries. Once the encoded record reaches half the outbox
+      record's capacity it calls Outbox::prune before running f, so an enqueue's
+      capacity gate prices against the reclaimed bytes; a prune that reclaims
+      nothing writes nothing. An Unchanged report for a
       correspondence that has no record writes no record and spends no seal,
       though taking the lock creates the correspondence directory and its lock
       file; DmPersistError::OutboxDirectionMismatch therefore arises once an
       entry has been queued. Debug builds panic when an Unchanged report follows
       a change to the outbox. A stored record is re-encoded to the current
-      format and write suite only on a Changed write.
+      format and write suite on any write.
       commit_resume(&CorrespondenceLabel, &ResumeRecord) -> Result<Vec<u8>,
       DmPersistError> writes the resume record inside one critical section and
       returns its sealed RE-EST bytes, so the frame is unreachable without a
