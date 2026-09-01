@@ -39,11 +39,18 @@ use crate::error::{Result, VeilidNetError};
 /// or that opens one it may later write, does — makes veilid retain a clone in
 /// `OpenedRecord.writer` (`veilid-core-0.5.7`, `storage_manager/record_store/
 /// opened_record.rs`), a struct that derives `Debug` over that secret and lives as
-/// long as the record stays open. daemonseed opens records once per session and
-/// never closes them (see `rendezvous::open_cached`), so for a DM page that copy is
-/// effectively process-lifetime and is NOT under a caller's control. The only lever
-/// on it is closing the record / evicting the open cache, which is #252's subject —
-/// so #252 is a key-hygiene fix as much as a resource one.
+/// long as the record stays open. daemonseed opens a record once per session and,
+/// for every family whose cardinality is bounded by peers rather than by traffic,
+/// never closes it (see `rendezvous::open_cached`), so for those the copy is
+/// effectively process-lifetime and is NOT under a caller's control. **DM channel
+/// pages are the exception, and a bound is what makes them one:** they are held in a
+/// `rendezvous::DM_PAGE_CACHE_CAPACITY` LRU whose eviction closes the record
+/// (`rendezvous::open_page_bounded`, #252), so a page's retained writer clone lives
+/// to its eviction — **and still to process exit in any session that never exceeds
+/// the bound**, which is the ordinary case for a handful of conversations. The
+/// residual is bounded under sustained traffic, not converted into something
+/// short-lived. Closing the record is the only lever on that clone, which is why
+/// #252 is a key-hygiene fix as much as a resource one.
 ///
 /// What a caller CAN control is everything on this side of that boundary: derive
 /// per operation, never cache a keypair yourself, and never key a long-lived map on

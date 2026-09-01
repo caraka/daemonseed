@@ -1551,6 +1551,14 @@ async fn actor_loop(
     // rendezvous::open_cached); a transient set/get failure is surfaced to the
     // caller, not treated as a dead local handle.
     let opened: Arc<rendezvous::OpenCache> = Arc::new(Mutex::new(HashMap::new()));
+    // LRU recency over the DM channel-page subset of `opened` (#252). Pages are the
+    // one record family whose count grows with traffic rather than with peers — a new
+    // owner seed every PAGE_SLOTS messages, per direction, per conversation — so the
+    // open-once contract above would hold DHT records open for the life of the
+    // process. Only the page opener records into this ring, so only pages are ever
+    // evicted and the shared entries keep the open-once behaviour exactly.
+    let page_recency: Arc<rendezvous::DmPageRecency> =
+        Arc::new(Mutex::new(rendezvous::BoundedRing::new()));
     // Per-rendezvous-record serialization lock (owner seed → async mutex). Two ops
     // on the SAME record must not race: spawned append-ring publishes would clobber
     // each other in the 2-slot ring (an older seq landing after a newer one loses
@@ -1601,6 +1609,7 @@ async fn actor_loop(
             node_pub,
             ring_seq: Arc::new(Mutex::new(HashMap::new())),
             opened: opened.clone(),
+            page_recency: page_recency.clone(),
             record_locks: record_locks.clone(),
             gate: dht_gate.clone(),
         }),
@@ -1750,6 +1759,7 @@ async fn actor_loop(
                 let api = api.clone();
                 let rc = rc.clone();
                 let opened = opened.clone();
+                let page_recency = page_recency.clone();
                 let record_locks = record_locks.clone();
                 tokio::spawn(async move {
                     // Borrowed for the pre-open; ownership passes to the request
@@ -1762,9 +1772,17 @@ async fn actor_loop(
                             // enqueue so the write never queues holding a record lock.
                             let record_lock = rendezvous::record_lock(&record_locks, &owner.key());
                             let _open_guard = record_lock.lock().await;
-                            if let Err(e) =
-                                dm_page_open(&gate, &api, &rc, &opened, &owner, IfAbsent::Create)
-                                    .await
+                            if let Err(e) = dm_page_open(
+                                &gate,
+                                &api,
+                                &rc,
+                                &opened,
+                                &page_recency,
+                                &record_locks,
+                                &owner,
+                                IfAbsent::Create,
+                            )
+                            .await
                             {
                                 crate::vtrace!(
                                     "publish_dm_page: pre-open failed ({e}); enqueuing anyway, \
@@ -1793,9 +1811,19 @@ async fn actor_loop(
                 let api = api.clone();
                 let rc = rc.clone();
                 let opened = opened.clone();
+                let page_recency = page_recency.clone();
                 let record_locks = record_locks.clone();
                 tokio::spawn(async move {
-                    let r = sweep_dm_page(&gate, &api, &rc, &opened, &record_locks, &address).await;
+                    let r = sweep_dm_page(
+                        &gate,
+                        &api,
+                        &rc,
+                        &opened,
+                        &page_recency,
+                        &record_locks,
+                        &address,
+                    )
+                    .await;
                     // A dropped receiver (caller gave up / shutting down) is benign.
                     let _ = reply.send(r);
                 });
@@ -2663,6 +2691,11 @@ struct ProductionSink {
     // dispatch (`publish_rendezvous`), never at enqueue (#131 / I2 / I13 untouched).
     ring_seq: Arc<Mutex<HashMap<RecordKey, u32>>>,
     opened: Arc<rendezvous::OpenCache>,
+    // LRU recency over the DM-page subset of `opened` (#252). Shared with the read
+    // paths for the same reason `opened` is: the page a sweep opened and the page a
+    // write reuses must be one entry in one ring, or the bound counts each path's
+    // opens separately and neither closes the other's.
+    page_recency: Arc<rendezvous::DmPageRecency>,
     record_locks: Arc<rendezvous::RecordLocks>,
     // The shared four-pool DHT permit accountant (WB-5.1 / I5″.1). Every write acquires
     // a permit from its lane's pool here before touching the DHT; the read lane draws
@@ -2681,6 +2714,7 @@ impl WriteSink for ProductionSink {
         let node_pub = self.node_pub;
         let ring_seq = self.ring_seq.clone();
         let opened = self.opened.clone();
+        let page_recency = self.page_recency.clone();
         let record_locks = self.record_locks.clone();
         let gate = self.gate.clone();
         Box::pin(async move {
@@ -2744,7 +2778,17 @@ impl WriteSink for ProductionSink {
                     // Borrowed, not moved: the binding is dropped — and therefore
                     // zeroized — at the end of this arm, so the conversation secret
                     // lives no longer than the write it authorises (#244).
-                    publish_dm_page(&gate, &api, &rc, &opened, &record_locks, &address, frame).await
+                    publish_dm_page(
+                        &gate,
+                        &api,
+                        &rc,
+                        &opened,
+                        &page_recency,
+                        &record_locks,
+                        &address,
+                        frame,
+                    )
+                    .await
                 }
                 ProdWrite::DoorbellEntry {
                     owner_seed,
@@ -3117,6 +3161,15 @@ fn dm_page_write_request(
     }
 }
 
+/// An open page record and the lease that keeps it open. **The lease is not
+/// optional bookkeeping:** it is what stops a concurrent page open evicting and
+/// closing this record while the handle is still in use, so every caller binds it
+/// for at least as long as it touches the handle. Dropping it says "done".
+type OpenPage<'r> = (
+    rendezvous::RendezvousHandle,
+    rendezvous::PageLease<'r, rendezvous::CachedRecordId>,
+);
+
 /// What [`dm_page_open`] does when the page record is not on the network.
 ///
 /// The distinction is the whole of #253: a publish is about to write the page, so
@@ -3157,37 +3210,67 @@ enum IfAbsent {
 /// above exists to rule out. (Named in prose rather than in code deliberately — the
 /// guard test counts textual occurrences and cannot tell a mention from a use, and
 /// that conservatism is worth keeping.)
-async fn dm_page_open(
+///
+/// **The page family is the one this engine bounds (#252).** Every other record it
+/// serves has cardinality per circle or per correspondent; a page owner seed is new
+/// every `PAGE_SLOTS` messages, per direction, per conversation, so an open-once
+/// cache over pages grows with message count and never gives a record back. Because
+/// this is the only path that opens one, recording the page id in `page_recency`
+/// here bounds exactly the page subset and nothing else — the cache's shared entries
+/// are never offered to the LRU, so their open-once behaviour is unchanged. See
+/// `rendezvous::open_page_bounded`.
+#[allow(clippy::too_many_arguments)]
+async fn dm_page_open<'r>(
     gate: &Arc<DhtGate>,
     api: &VeilidAPI,
     rc: &RoutingContext,
     opened: &rendezvous::OpenCache,
+    page_recency: &'r rendezvous::DmPageRecency,
+    record_locks: &rendezvous::RecordLocks,
     owner: &KeyPair,
     if_absent: IfAbsent,
-) -> Result<Option<rendezvous::RendezvousHandle>> {
+) -> Result<Option<OpenPage<'r>>> {
     // Bound ONCE, and every use below goes through this binding. The two modes must
     // address the same record or they are two open sites wearing one name, and a
     // local makes that unrepresentable rather than merely reviewed — the cache id and
     // both opens cannot drift apart without editing this line.
     let shape = DM_PAGE_SHAPE;
     let id = rendezvous::cached_record_id(&owner.key(), shape);
-    match if_absent {
-        IfAbsent::Create => rendezvous::open_cached(
-            opened,
-            &id,
-            rendezvous::open_or_create(gate, api, rc, owner, shape),
-        )
-        .await
-        .map(Some),
-        IfAbsent::ReportAbsent => {
-            rendezvous::open_cached_optional(
-                opened,
-                &id,
-                rendezvous::open_only(gate, api, rc, owner, shape),
-            )
-            .await
-        }
-    }
+    rendezvous::open_page_bounded(
+        opened,
+        page_recency,
+        &id,
+        rendezvous::DM_PAGE_CACHE_CAPACITY,
+        // One future, both modes: an `async` block rather than two calls, so the
+        // single-open-site property above survives the mode split.
+        async {
+            match if_absent {
+                // `open_or_create` cannot answer "absent" — it opens, or creates and
+                // reopens, or fails — so this is a widening to the common type, not a
+                // fallback with a behaviour.
+                IfAbsent::Create => rendezvous::open_or_create(gate, api, rc, owner, shape)
+                    .await
+                    .map(Some),
+                IfAbsent::ReportAbsent => rendezvous::open_only(gate, api, rc, owner, shape).await,
+            }
+        },
+        // The victim's own serialization lock. Every page open holds this same lock
+        // across its open — all three callers take it before reaching here — so
+        // holding it across the close is what stops an eviction killing a session a
+        // concurrent opener has just established for the same record. `.0` is the
+        // owner public key, which is what `record_lock` keys on.
+        |evicted: rendezvous::CachedRecordId| rendezvous::record_lock(record_locks, &evicted.0),
+        // Best-effort, exactly as the repair arm's close is: releasing a session
+        // veilid has already GC'd is a benign race, and the eviction has dropped the
+        // local entry either way. The key comes off the evicted handle itself, which
+        // is what binds the close to the record that was actually removed.
+        |evicted: rendezvous::RendezvousHandle| async move {
+            if let Err(e) = rc.close_dht_record(evicted.into_key()).await {
+                crate::vtrace!("dm page eviction: close_dht_record failed ({e})");
+            }
+        },
+    )
+    .await
 }
 
 /// Publish one sealed channel frame into one slot of one page (part of ISC-C42).
@@ -3208,6 +3291,7 @@ async fn publish_dm_page(
     api: &VeilidAPI,
     rc: &RoutingContext,
     opened: &rendezvous::OpenCache,
+    page_recency: &rendezvous::DmPageRecency,
     record_locks: &rendezvous::RecordLocks,
     address: &DmPageAddress<Sending>,
     frame: Vec<u8>,
@@ -3217,8 +3301,9 @@ async fn publish_dm_page(
     // it produces DOES contain the seed — that is what a VLD0 secret is — and this
     // binding drops with the call. That does NOT bound the secret's lifetime:
     // handing the keypair to the open below makes veilid retain a clone in
-    // `OpenedRecord.writer` for as long as the record stays open, which here is the
-    // process (#252). See `identity::vld0_keypair`'s residual note.
+    // `OpenedRecord.writer` for as long as the record stays open — which for a page
+    // is until the open cache's page LRU evicts and closes it (#252). See
+    // `identity::vld0_keypair`'s residual note.
     let owner = address.with_owner_seed(identity::rendezvous_owner_keypair)?;
     // Single-flight the open and serialize against any concurrent op on this record,
     // exactly as the rendezvous and key-record write paths do (CRSH-ISC-3). Two
@@ -3231,15 +3316,28 @@ async fn publish_dm_page(
     // with a behaviour. It is written as a hard error instead of an `expect` so a
     // future change to `dm_page_open` surfaces here as a reported failure on the
     // publish path rather than as a panic inside the actor loop.
-    let handle = dm_page_open(gate, api, rc, opened, &owner, IfAbsent::Create)
-        .await?
-        .ok_or_else(|| {
-            VeilidNetError::Actor(
-                "the page opener, in IfAbsent::Create mode, reported the page absent \
+    // `_lease` is held to the end of this function, which is what keeps a concurrent
+    // page open from closing this record between here and the write below — the
+    // record lock cannot do it, because it is taken on THIS page's owner key while an
+    // eviction is triggered by a different page's.
+    let (handle, _lease) = dm_page_open(
+        gate,
+        api,
+        rc,
+        opened,
+        page_recency,
+        record_locks,
+        &owner,
+        IfAbsent::Create,
+    )
+    .await?
+    .ok_or_else(|| {
+        VeilidNetError::Actor(
+            "the page opener, in IfAbsent::Create mode, reported the page absent \
                  instead of creating it"
-                    .to_string(),
-            )
-        })?;
+                .to_string(),
+        )
+    })?;
     // The subkey is read off the address's own position at the very last step, so
     // the page it belongs to travels bound to the slot for the whole path from the
     // public handle to here — and, since #269, in one value rather than two that
@@ -3273,11 +3371,13 @@ async fn publish_dm_page(
 /// Until a collector honouring both exists, an `Ok` carrying an empty `Vec` and a
 /// non-zero `failed` is unguarded — which is precisely why the outcome is returned
 /// instead of being traced and dropped.
+#[allow(clippy::too_many_arguments)]
 async fn sweep_dm_page(
     gate: &Arc<DhtGate>,
     api: &VeilidAPI,
     rc: &RoutingContext,
     opened: &rendezvous::OpenCache,
+    page_recency: &rendezvous::DmPageRecency,
     record_locks: &rendezvous::RecordLocks,
     address: &DmPageAddress<Receiving>,
 ) -> Result<DmPageSweep> {
@@ -3290,7 +3390,17 @@ async fn sweep_dm_page(
     let opened_handle = {
         let record_lock = rendezvous::record_lock(record_locks, &owner.key());
         let _open_guard = record_lock.lock().await;
-        dm_page_open(gate, api, rc, opened, &owner, IfAbsent::ReportAbsent).await?
+        dm_page_open(
+            gate,
+            api,
+            rc,
+            opened,
+            page_recency,
+            record_locks,
+            &owner,
+            IfAbsent::ReportAbsent,
+        )
+        .await?
     };
     // An unwritten page is the probe frontier's ordinary state. Nothing was created,
     // so nothing was read, and the outcome reports `attempted: 0` rather than the
@@ -3299,7 +3409,14 @@ async fn sweep_dm_page(
     // them apart. Before #253 the only way to reach the empty case at all was to
     // have just created the record, which is what made "no such page" and "empty
     // page" the same answer.
-    let Some(handle) = opened_handle else {
+    //
+    // Destructured, and `_lease` deliberately outlives the GETs below: the record
+    // lock was dropped above so the reads never block a writer, which leaves the
+    // sweeper holding a live handle and — between two subkey GETs — zero permits. The
+    // lease is the only thing standing between that window and an eviction closing
+    // the record mid-sweep, which would surface as a partial sweep and be read as
+    // record ill-health.
+    let Some((handle, _lease)) = opened_handle else {
         crate::vtrace!(
             "sweep_dm_page: page={} absent, not created -> empty sweep",
             address.page()
@@ -5650,7 +5767,7 @@ mod tests {
         // run. Recorded because the reasoning that produced the weaker guard was
         // confident and wrong.)
         let opener_start = prod
-            .find("async fn dm_page_open(")
+            .find("async fn dm_page_open")
             .expect("the opener's definition moved");
         let opener_body = &prod[opener_start..];
         let opener_body = &opener_body[..opener_body
@@ -5675,14 +5792,131 @@ mod tests {
         // An exact count is deliberate, and so is its brittleness: a fourth caller has
         // to come and edit this number, which is the moment to ask whether it should
         // be going through the opener at all. Bump it only after answering that.
-        let opener: String = ["dm_page", "_open("].concat();
+        // The opener is DEFINED once (the definition is generic over the lease
+        // lifetime, so the needle stops before the parameter list) and CALLED exactly
+        // three times: `publish_dm_page`, `sweep_dm_page`, and the publish pre-warm.
+        //
+        // An exact count is deliberate, and so is its brittleness: a fourth caller has
+        // to come and edit this number, which is the moment to ask whether it should
+        // be going through the opener at all. Bump it only after answering that.
+        let opener: String = ["dm_page", "_open"].concat();
+        let defined: String = ["async fn ", opener.as_str()].concat();
         assert_eq!(
-            prod.matches(opener.as_str()).count(),
-            4,
-            "the opener must be defined once and called exactly three times — from \
-             `publish_dm_page`, `sweep_dm_page`, and the publish pre-warm. A page path \
-             that opened its own record would be free to open a different one"
+            prod.matches(defined.as_str()).count(),
+            1,
+            "the opener is defined exactly once"
         );
+        assert_eq!(
+            prod.matches([opener.as_str(), "("].concat().as_str())
+                .count(),
+            3,
+            "the opener must be called exactly three times — from `publish_dm_page`, \
+             `sweep_dm_page`, and the publish pre-warm. A page path that opened its \
+             own record would be free to open a different one"
+        );
+    }
+
+    /// **Only the page opener may bound the open cache (#252), and only one ring
+    /// may exist — together those are the safety property of the whole bound.**
+    ///
+    /// `rendezvous::open_page_bounded` evicts from the ring, never from the cache, so
+    /// an entry that never enters a ring cannot be chosen — which is what lets the
+    /// shared entries keep the open-once contract #128 D-0a settled. The lobby record
+    /// is the one that matters: every share advert and the lobby subscription derive
+    /// the SAME owner seed, so closing it takes a live handle from callers still using
+    /// it. `BoundedRing`'s fields are private and this crate exposes no way to write
+    /// one except through the opener, so a second *writer* is unrepresentable; what is
+    /// still representable, and what this test pins, is a second call site, a second
+    /// ring, or an opener that stopped closing what it evicts.
+    ///
+    /// The ring count is the sharpest of the three. Replacing any `page_recency`
+    /// clone with a fresh `Arc` gives each spawned publish and sweep a private ring,
+    /// nothing ever reaches the bound, and the leak is total and silent — every other
+    /// test in this crate still passes.
+    ///
+    /// Needles assembled from fragments so this test's own source does not
+    /// self-match, as the tests above do.
+    #[test]
+    fn only_the_page_opener_bounds_the_open_cache() {
+        let src = include_str!("actor.rs");
+        let (prod, _) = src
+            .split_once("#[cfg(test)]")
+            .expect("the tests-module marker moved");
+
+        let ring: String = ["Bounded", "Ring::new("].concat();
+        assert_eq!(
+            prod.matches(ring.as_str()).count(),
+            1,
+            "exactly ONE page ring exists, built once in the actor and shared by \
+             clone with every spawned publish and sweep. A second construction is a \
+             per-task private ring: each bounds only its own opens, the shared cache \
+             is never held at the bound, and nothing is ever closed"
+        );
+
+        let bound: String = ["open_page", "_bounded("].concat();
+        assert_eq!(
+            prod.matches(bound.as_str()).count(),
+            1,
+            "the open cache is bounded from exactly ONE place. A second call site \
+             puts ids from another record family into a ring, and those ids then \
+             become evictable — including the shared lobby record, which several \
+             callers hold open at once"
+        );
+
+        // And that call belongs to the page opener rather than merely to this file —
+        // a call in a sibling function would satisfy the count above while bounding a
+        // family that has no business being bounded. Checked together with the two
+        // things the opener supplies that no unit test can reach: the capacity, and a
+        // close that actually releases the evicted record on the network.
+        let opener_start = prod
+            .find("async fn dm_page_open")
+            .expect("the opener's definition moved");
+        let opener_body = &prod[opener_start..];
+        let opener_body = &opener_body[..opener_body
+            .find("\n}\n")
+            .expect("the opener's closing brace moved")];
+        for (needle, why) in [
+            (
+                bound.clone(),
+                "the single bounding call belongs to the page opener, the only path \
+                 that opens a page record",
+            ),
+            (
+                ["DM_PAGE_CACHE", "_CAPACITY"].concat(),
+                "and it passes the shared capacity constant, not a number typed here \
+                 — a local literal drifts from the constant the doc reasons about",
+            ),
+            (
+                ["cached_record", "_id("].concat(),
+                "the cache id is derived ONCE and that one binding is what both the \
+                 cache and the ring are keyed on. A second derivation is free to name \
+                 another shape — the ISC-C100 failure by a third door, and one the \
+                 shape count cannot see because a different family's constant does \
+                 not carry this one's suffix",
+            ),
+            (
+                ["record", "_lock("].concat(),
+                "and the close runs under the EVICTED record's own serialization \
+                 lock, which every page open already holds across its open. Without \
+                 it the close can kill a session a concurrent opener of that same \
+                 record has just established — the lease cannot cover this, because \
+                 the victim is by definition unleased",
+            ),
+            (
+                ["close_dht", "_record("].concat(),
+                "and its eviction closes the record. Dropping the map entry alone \
+                 leaves the record open on the network, which is the cardinality the \
+                 bound exists to reclaim — a stand-in closure in a unit test proves \
+                 only that SOME closure ran",
+            ),
+            (
+                ["evicted.into", "_key()"].concat(),
+                "closing the key of the handle that was actually evicted, not one \
+                 computed at the call site, is what binds the close to the removal",
+            ),
+        ] {
+            assert_eq!(opener_body.matches(needle.as_str()).count(), 1, "{why}");
+        }
     }
 
     // ── Direct messaging (#233): the doorbell transport ───────────────────

@@ -27,7 +27,7 @@
 //! share discovery) → open; operator-only owner (announcements/MOTD) → the
 //! non-derivable owner keypair is the write-gate.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
@@ -579,13 +579,18 @@ pub type OpenCache = Mutex<HashMap<CachedRecordId, RendezvousHandle>>;
 /// the caller: on a cache hit it is dropped un-awaited (an `async fn` future runs
 /// no body until polled), so a hit costs nothing beyond the map lookup.
 ///
-/// The record is opened once per session and never closed, so the cached handle
-/// stays valid — there is deliberately no error-path invalidation. A `set`/`get`
-/// failure is a transient network condition the caller surfaces (and may retry),
-/// not a dead local handle; dropping the entry would only force a redundant
-/// re-open, and on the shared lobby record (every share advert + the lobby
-/// subscription derive the SAME `owner_seed`) it would evict an entry other
+/// **This function never evicts, and that is a decision rather than an omission.**
+/// A `set`/`get` failure is a transient network condition the caller surfaces (and
+/// may retry), not a dead local handle; dropping the entry on error would only force
+/// a redundant re-open, and on the shared lobby record (every share advert + the
+/// lobby subscription derive the SAME `owner_seed`) it would evict an entry other
 /// callers are actively using. See ISA Decisions (2026-07-06, #128 D-0a).
+///
+/// So a cached handle is held for the session and stays valid. The one family that
+/// cannot live on those terms is the DM channel page, whose count grows with message
+/// volume rather than with peers; it is bounded from OUTSIDE this function by
+/// [`open_page_bounded`], which evicts and closes only the ids the page opener
+/// recorded and leaves every other entry here on exactly these terms.
 pub async fn open_cached<I: Eq + std::hash::Hash + Clone, K: Clone>(
     cache: &Mutex<HashMap<I, K>>,
     id: &I,
@@ -650,6 +655,313 @@ pub async fn open_cached_optional<I: Eq + std::hash::Hash + Clone, K: Clone>(
         .unwrap_or_else(|e| e.into_inner())
         .insert(id.clone(), k.clone());
     Ok(Some(k))
+}
+
+/// How many DM channel-page records one session keeps open at once — the capacity
+/// [`open_page_bounded`] enforces on the page path (#252).
+///
+/// Every other record family this engine serves has cardinality bounded by peers —
+/// one rendezvous record per circle, one key record and one doorbell per
+/// correspondent — so "open once, never close" is a constant per peer. Channel pages
+/// are the exception: a new page owner seed appears every `PAGE_SLOTS` messages, per
+/// direction, per conversation, plus every page a sweep probes ahead of the
+/// frontier. Left unbounded that is a monotonic count of open DHT records for the
+/// life of the process, and the DHT-side cost is the point — the local map entry is
+/// the cheap half.
+///
+/// **The number does not carry the safety property.** No capacity could: a bound
+/// chosen against a concurrency ceiling is a probability, not an invariant, because
+/// what would have to be bounded is not simultaneous DHT operations but distinct
+/// page opens completing while some holder is parked between permits. Not closing a
+/// record someone is using is instead guaranteed by the [`PageLease`] refcount, and
+/// this constant only decides how much *idle* cache is kept.
+///
+/// So it is sized for hit rate: 64 covers roughly twenty conversations' live
+/// send/receive/probe pages, so the steady state of ordinary use is still
+/// open-once, and it is deliberately kept above [`DHT_BUDGET`](crate::dht_gate::DHT_BUDGET)
+/// — a capacity at or below the number of operations that can be in flight would
+/// spend the cache thrashing pages that are all still busy, evicting nothing (every
+/// candidate leased) while paying the scan on every open. That relation is asserted
+/// below rather than left in prose.
+pub const DM_PAGE_CACHE_CAPACITY: usize = 64;
+
+// The capacity/throughput relation the doc above states, made unbreakable: raising
+// the in-flight budget past the cache capacity would leave every eviction candidate
+// leased, and would otherwise compile and pass the whole suite.
+const _: () = assert!(
+    DM_PAGE_CACHE_CAPACITY > crate::dht_gate::DHT_BUDGET,
+    "the page cache must hold more pages than can be in flight at once, or it \
+     thrashes: every open evicts a page a still-running operation re-opens moments \
+     later. This pins a HIT-RATE floor and nothing else. It is not the safety \
+     property (the lease is) and not a liveness one (a fully-leased ring evicts \
+     nothing and is fine). In particular it does NOT bound the live-lease count — a \
+     lease is held across permit waits, so a holder can be parked with zero permits"
+);
+
+/// Recency + live-borrow bookkeeping over **one record family's** entries in an
+/// [`OpenCache`], oldest at the front.
+///
+/// Two facts are tracked per id and they answer different questions. `order` is the
+/// LRU membership: which ids this family has opened, most-recently-used last, and
+/// therefore which ids are eligible to be evicted at all. `live` is a borrow count:
+/// how many callers currently hold a handle for that id, which decides whether an
+/// eligible id may be closed *now*.
+///
+/// **The fields are private and this module exposes no way to write them except
+/// through [`open_page_bounded`].** That is the structural half of the safety
+/// property: a caller cannot record an id of some other family into the ring, so it
+/// cannot widen the set of records this bound is allowed to close. The set is not
+/// merely "what a reviewer saw a call site do" — it is unreachable from outside.
+pub struct BoundedRing<I> {
+    order: VecDeque<I>,
+    live: HashMap<I, usize>,
+}
+
+impl<I: Eq + std::hash::Hash + Clone> BoundedRing<I> {
+    pub fn new() -> Self {
+        Self {
+            order: VecDeque::new(),
+            live: HashMap::new(),
+        }
+    }
+
+    /// Take a borrow on `id`. Held until the matching [`PageLease`] drops.
+    fn borrow_id(&mut self, id: &I) {
+        *self.live.entry(id.clone()).or_insert(0) += 1;
+    }
+
+    /// Release one borrow, dropping the entry entirely at zero so `live` holds only
+    /// ids that actually have a holder.
+    fn release_id(&mut self, id: &I) {
+        if let Some(n) = self.live.get_mut(id) {
+            *n -= 1;
+            if *n == 0 {
+                self.live.remove(id);
+            }
+        }
+    }
+
+    /// Mark `id` most-recently-used, moving it to the back rather than duplicating
+    /// it — the same id is opened repeatedly, which is the ordinary case for a page
+    /// being written slot by slot.
+    fn record(&mut self, id: &I) {
+        if let Some(pos) = self.order.iter().position(|held| held == id) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(id.clone());
+    }
+
+    /// The id to close, if the ring is over `capacity`: the oldest one **nobody is
+    /// holding**. A leased id is skipped rather than closed, which is what keeps an
+    /// in-flight sweep's remaining GETs from failing into `outcome.failed` — the
+    /// signal a collector is told to read as record ill-health.
+    ///
+    /// Skipping means the cache can sit above `capacity` by the number of live
+    /// borrows. That excess is bounded by the count of page operations in flight, and
+    /// since publishes and sweeps are `tokio::spawn`ed per command with no hard cap,
+    /// that is a SOFT bound rather than an invariant. Nor does it drain merely because
+    /// leases release: a stream of NEW page ids holds the length at its high-water
+    /// mark indefinitely, each open recording one id and evicting one. It falls back
+    /// to `capacity` on re-opens of ids already in the ring — the common case for a
+    /// conversation writing one page slot by slot. Sitting above the bound is the
+    /// price of never closing a record in use, which would be a silent,
+    /// traffic-dependent fault.
+    fn evictable(&mut self, capacity: usize) -> Option<I> {
+        if self.order.len() <= capacity {
+            return None;
+        }
+        let pos = self
+            .order
+            .iter()
+            .position(|id| !self.live.contains_key(id))?;
+        self.order.remove(pos)
+    }
+
+    /// How many ids the ring holds. Test-only: production reads the ring exclusively
+    /// through [`open_page_bounded`], and a size accessor is exactly the sort of
+    /// handle that lets a caller start making its own eviction decisions.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.order.len()
+    }
+}
+
+impl<I: Eq + std::hash::Hash + Clone> Default for BoundedRing<I> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A live borrow on one cached page record. **Hold it for exactly as long as the
+/// handle is used** — dropping it says the caller is done and the record may be
+/// closed.
+///
+/// This is the whole of the safety argument, and it is needed because neither lock
+/// in this crate covers the window. `sweep_dm_page` drops the record lock before its
+/// GETs on purpose, so between two subkey reads a sweeper holds a live handle and
+/// zero permits; `publish_dm_page` holds the record lock for *its own* owner key,
+/// which is no exclusion against an eviction triggered by a different page. A
+/// refcount is what those two have in common: it does not care which lock, which
+/// permit, or which task the holder is parked in.
+pub struct PageLease<'r, I: Eq + std::hash::Hash + Clone> {
+    ring: &'r Mutex<BoundedRing<I>>,
+    id: I,
+}
+
+impl<I: Eq + std::hash::Hash + Clone> Drop for PageLease<'_, I> {
+    fn drop(&mut self) {
+        // Poison-recovered, mirroring `open_cached`: a panicked holder elsewhere must
+        // not wedge every later page open, and a lease that failed to release would
+        // pin its record open for the session — the leak this bound exists to fix.
+        self.ring
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .release_id(&self.id);
+    }
+}
+
+/// LRU recency over the **DM-page subset** of an [`OpenCache`].
+pub type DmPageRecency = Mutex<BoundedRing<CachedRecordId>>;
+
+/// Open one page record through `cache`, bounded: take a borrow on `id`, memoize the
+/// open exactly as [`open_cached_optional`] does, then — if the ring is over
+/// `capacity` — drop the oldest unleased page from the cache and `close` its record.
+/// Returns the handle together with the [`PageLease`] the caller must hold while
+/// using it.
+///
+/// **[`open_cached`] is deliberately untouched, and its no-eviction property is a
+/// decision rather than an oversight** (ISA Decisions 2026-07-06, #128 D-0a): its
+/// entries include the shared lobby record, which every share advert and the lobby
+/// subscription derive the SAME `owner_seed` for, so an entry evicted by one caller
+/// is an entry taken from under several others.
+///
+/// What makes bounding safe here is that **eviction candidates come from the ring,
+/// never from the cache.** An id that never reaches a ring cannot be chosen, so a
+/// family whose cardinality is already bounded keeps exactly today's behaviour by
+/// not being opened through this function — no reasoning about which map keys are
+/// shared is required, and [`BoundedRing`]'s private fields mean no caller can add
+/// one.
+///
+/// **Ordering is load-bearing twice over.** The borrow is taken *before* the cache
+/// is consulted, so a concurrent eviction sees the id as live and skips it rather
+/// than closing a record this call is about to return. And the eviction's cache
+/// removal happens inside the same ring-lock section that chose the candidate, so
+/// the two are one atomic decision: a concurrent opener either takes its borrow
+/// first (and the candidate is skipped) or finds the entry already gone (and opens
+/// afresh). Neither can be handed a handle that is about to be closed.
+///
+/// An absent page — the probe frontier's ordinary state — is never recorded in the
+/// ring, for the reason [`open_cached_optional`] does not cache it: nothing was
+/// opened, so there is nothing to bound, and ringing it would let probes ahead of
+/// the frontier evict live pages.
+///
+/// **The close runs under the EVICTED record's own serialization lock, which
+/// `lock_for` supplies.** Removing the entry and closing the record cannot be one
+/// critical section — the close is an await and the ring guard is a `std::sync`
+/// one — so between them there is a window in which the id is absent from the cache
+/// and its record is still open. A concurrent opener of that same id would miss the
+/// cache, open a FRESH session, and have it killed by a close that was issued for
+/// the session before it. The lease cannot cover this: the victim is by definition
+/// unleased. What does cover it is that every production page open already holds the
+/// record's lock across the open (`publish_dm_page`, `sweep_dm_page`, and the publish
+/// pre-warm all take it before calling the opener), so taking that same lock around
+/// the close makes open-this-record and close-this-record mutually exclusive. It is
+/// also the crate's existing answer to this question — [`repair_gated`] holds the
+/// record lock across its whole tear-down-and-reopen for the identical reason.
+///
+/// **No lock cycle, and the lease is what rules one out.** A caller can hold its own
+/// record's lock while this function takes the victim's, so hold-and-wait exists;
+/// a cycle would additionally need some task waiting on the FIRST caller's record
+/// while holding the victim's. That task could only be another evictor, and it cannot
+/// select the first caller's record because the first caller holds a lease on it. The
+/// victim is likewise never the id being opened — that one was just recorded and is
+/// leased — so this never waits on a lock it already holds.
+///
+/// `close` is the caller's, so the veilid `close_dht_record` stays out of this
+/// module and the ordering, the removal and the close are all unit-testable with
+/// stand-ins. Closing is the entire point: dropping the map entry alone would leave
+/// the record open on the network, which is the cardinality the bound reclaims.
+/// The lock to hold across an eviction's close: the victim's own, **unless the
+/// victim is the id being opened**, in which case there is no lock to take.
+///
+/// That degenerate case is unreachable today and this is not a fallback for it — it
+/// is a refusal to hang. The caller already holds a lock into
+/// [`open_page_bounded`], so locking the id it is opening would self-deadlock: a
+/// permanent, silent stall with no error on any surface. The property that rules it
+/// out is real but structural — the lease is taken before anything else and
+/// [`BoundedRing::evictable`] skips every leased id — and a structural property is
+/// exactly the kind that a later reordering breaks without anyone noticing. A
+/// `debug_assert` would not have caught it either: this workspace's release profile
+/// sets `overflow-checks` and NOT `debug-assertions`, so an assert-only invariant
+/// does not exist in the profile that ships. Skipping costs one comparison on every
+/// real eviction and converts the worst available failure shape — a release hang —
+/// into a close that runs unlocked in a situation that cannot arise.
+fn victim_lock<I: Eq>(
+    evicted_id: I,
+    opening: &I,
+    lock_for: impl FnOnce(I) -> Arc<tokio::sync::Mutex<()>>,
+) -> Option<Arc<tokio::sync::Mutex<()>>> {
+    if &evicted_id == opening {
+        return None;
+    }
+    Some(lock_for(evicted_id))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn open_page_bounded<'r, I, K, CloseFut>(
+    cache: &Mutex<HashMap<I, K>>,
+    ring: &'r Mutex<BoundedRing<I>>,
+    id: &I,
+    capacity: usize,
+    open: impl std::future::Future<Output = Result<Option<K>>>,
+    lock_for: impl FnOnce(I) -> Arc<tokio::sync::Mutex<()>>,
+    close: impl FnOnce(K) -> CloseFut,
+) -> Result<Option<(K, PageLease<'r, I>)>>
+where
+    I: Eq + std::hash::Hash + Clone,
+    K: Clone,
+    CloseFut: std::future::Future<Output = ()>,
+{
+    // A capacity of zero would make the id this call is opening its own eviction
+    // candidate the moment its lease drops, so the floor is one entry.
+    let capacity = capacity.max(1);
+    // The borrow comes first — see the ordering paragraph above. The lease releases
+    // it on drop, including on the `?` below.
+    ring.lock().unwrap_or_else(|e| e.into_inner()).borrow_id(id);
+    let lease = PageLease {
+        ring,
+        id: id.clone(),
+    };
+    let Some(handle) = open_cached_optional(cache, id, open).await? else {
+        return Ok(None);
+    };
+    // Choosing the victim and removing it from the cache are ONE critical section:
+    // split, a concurrent opener could be served the entry between the two. The
+    // cache lock nests inside the ring lock here and nowhere takes them the other
+    // way round, so the order is total. No await is held across either guard.
+    let stale = {
+        let mut ring = ring.lock().unwrap_or_else(|e| e.into_inner());
+        ring.record(id);
+        ring.evictable(capacity).and_then(|evicted| {
+            cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&evicted)
+                .map(|handle| (evicted, handle))
+        })
+    };
+    if let Some((evicted_id, evicted)) = stale {
+        // Exclude a concurrent open of the record being closed. Held across the close
+        // and released immediately after; the opener that was waiting then misses the
+        // cache and opens a genuinely fresh session.
+        let closing = victim_lock(evicted_id, id, lock_for);
+        let _closing_guard = match &closing {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        close(evicted).await;
+    }
+    Ok(Some((handle, lease)))
 }
 
 /// Per-rendezvous-record serialization lock: one async mutex per record, keyed by
@@ -1476,6 +1788,430 @@ mod tests {
             opens.load(Ordering::SeqCst),
             2,
             "one open per distinct seed; hits reuse the cached key"
+        );
+    }
+    /// One page open through the real bounded path, with stand-ins for the two
+    /// veilid pieces: the open (a counter) and the close (a recorder). Handles are
+    /// `id * 100`, so a closed handle names the page it belonged to.
+    ///
+    /// The close recorder asserts, from INSIDE the closure, that the cache entry is
+    /// already gone. That ordering is a race fix — a concurrent opener must miss
+    /// rather than be handed a handle about to be closed — and swapping the two
+    /// statements is otherwise invisible to a test that only looks at the end state.
+    async fn open_page<'r>(
+        cache: &Mutex<HashMap<u32, u32>>,
+        ring: &'r Mutex<BoundedRing<u32>>,
+        locks: &TestRecordLocks,
+        id: u32,
+        capacity: usize,
+        opens: &AtomicU32,
+        closed: &Mutex<Vec<u32>>,
+    ) -> Option<(u32, PageLease<'r, u32>)> {
+        let got = open_page_bounded(
+            cache,
+            ring,
+            &id,
+            capacity,
+            counting_open_optional(opens, Some(id * 100)),
+            |evicted: u32| test_lock(locks, evicted),
+            |evicted: u32| async move {
+                assert!(
+                    !cache
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .values()
+                        .any(|h| *h == evicted),
+                    "the cache entry is dropped BEFORE the close, so a concurrent \
+                     opener misses instead of being handed a dying handle"
+                );
+                closed
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(evicted);
+            },
+        )
+        .await
+        .unwrap();
+        // Unconditional, unlike an `.inspect` on the evicted id: this must hold on
+        // every open, not only on the ones that happened to evict something.
+        if let Some((handle, _)) = &got {
+            assert_eq!(*handle, id * 100, "the opener returns its own page");
+        }
+        got
+    }
+
+    /// [`open_page`] for a caller that is done the moment it returns — the shape of
+    /// the publish path's pre-warm, and of every test line that only wants the side
+    /// effect. Dropping the lease here is the point, not an oversight.
+    async fn open_page_and_release(
+        cache: &Mutex<HashMap<u32, u32>>,
+        ring: &Mutex<BoundedRing<u32>>,
+        locks: &TestRecordLocks,
+        id: u32,
+        capacity: usize,
+        opens: &AtomicU32,
+        closed: &Mutex<Vec<u32>>,
+    ) {
+        drop(open_page(cache, ring, locks, id, capacity, opens, closed).await);
+    }
+
+    /// The four stand-ins one bounded-cache test drives: the open cache, the page
+    /// ring, a count of real opens, and the log of handles actually closed.
+    type PageFixture = (
+        Mutex<HashMap<u32, u32>>,
+        Mutex<BoundedRing<u32>>,
+        AtomicU32,
+        Mutex<Vec<u32>>,
+        TestRecordLocks,
+    );
+
+    /// Stand-in for [`RecordLocks`], keyed on the test's `u32` id rather than an
+    /// owner public key. Same shape and same discipline: one async mutex per record,
+    /// created on first use.
+    type TestRecordLocks = Mutex<HashMap<u32, Arc<tokio::sync::Mutex<()>>>>;
+
+    fn test_lock(locks: &TestRecordLocks, id: u32) -> Arc<tokio::sync::Mutex<()>> {
+        locks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(id)
+            .or_default()
+            .clone()
+    }
+
+    /// A fresh fixture for one bounded-cache test.
+    fn page_fixture() -> PageFixture {
+        (
+            Mutex::new(HashMap::new()),
+            Mutex::new(BoundedRing::new()),
+            AtomicU32::new(0),
+            Mutex::new(Vec::new()),
+            Mutex::new(HashMap::new()),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_page_open_past_the_bound_closes_the_least_recently_used_page() {
+        // The #252 mechanism: pages accumulate until the bound, and the (bound+1)th
+        // open closes exactly one — the oldest — and drops it from the cache.
+        let (cache, ring, opens, closed, locks) = page_fixture();
+        const CAP: usize = 3;
+
+        for id in 1..=CAP as u32 {
+            open_page_and_release(&cache, &ring, &locks, id, CAP, &opens, &closed).await;
+        }
+        assert!(
+            closed.lock().unwrap().is_empty(),
+            "nothing is closed while the ring is under the bound"
+        );
+
+        open_page_and_release(&cache, &ring, &locks, 4, CAP, &opens, &closed).await;
+        assert_eq!(
+            *closed.lock().unwrap(),
+            vec![100],
+            "the fourth open CLOSES the first page's record — dropping the map entry \
+             alone would leave it open on the network, which is the cardinality #252 \
+             is about"
+        );
+        assert_eq!(
+            cache.lock().unwrap().len(),
+            CAP,
+            "the cache holds at the bound rather than growing with message count"
+        );
+        assert!(!cache.lock().unwrap().contains_key(&1));
+        assert_eq!(ring.lock().unwrap().len(), CAP);
+
+        // The evicted page is genuinely gone, not merely unreachable: re-opening it
+        // is a fresh open, not a hit serving the handle that was just closed.
+        let before = opens.load(Ordering::SeqCst);
+        open_page_and_release(&cache, &ring, &locks, 1, CAP, &opens, &closed).await;
+        assert_eq!(
+            opens.load(Ordering::SeqCst),
+            before + 1,
+            "a re-open of an evicted page opens; a hit here would serve a closed record"
+        );
+    }
+
+    #[tokio::test]
+    async fn eviction_follows_use_order_not_insertion_order() {
+        // The ordering is what makes the bound cheap on a live conversation: the page
+        // being written is re-opened on every publish, so it sits at the back of the
+        // ring and the page that leaves is one nothing has referenced in a while.
+        let (cache, ring, opens, closed, locks) = page_fixture();
+        const CAP: usize = 3;
+
+        for id in 1..=3 {
+            open_page_and_release(&cache, &ring, &locks, id, CAP, &opens, &closed).await;
+        }
+        // Re-use page 1 — a cache hit, which still re-records it as most-recent.
+        open_page_and_release(&cache, &ring, &locks, 1, CAP, &opens, &closed).await;
+        assert_eq!(
+            opens.load(Ordering::SeqCst),
+            3,
+            "the re-use was a cache hit"
+        );
+        assert!(
+            closed.lock().unwrap().is_empty(),
+            "a hit at the bound evicts nothing: the id was already in the ring"
+        );
+        // And again, consecutively — the ordinary case for a page written slot by
+        // slot. A ring that appended instead of moving would now hold 1 three times,
+        // be over the bound, and start closing live pages.
+        open_page_and_release(&cache, &ring, &locks, 1, CAP, &opens, &closed).await;
+        assert!(closed.lock().unwrap().is_empty());
+        assert_eq!(ring.lock().unwrap().len(), 3, "no duplicate ring entries");
+
+        open_page_and_release(&cache, &ring, &locks, 4, CAP, &opens, &closed).await;
+        assert_eq!(
+            *closed.lock().unwrap(),
+            vec![200],
+            "page 2 is now the least recently used — page 1 was refreshed by its re-use"
+        );
+        assert!(
+            cache.lock().unwrap().contains_key(&1),
+            "the re-used page survives, which insertion order would not have given"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_leased_page_is_skipped_rather_than_closed_and_returns_when_released() {
+        // The safety property #252's first cut got wrong. A sweeper drops the record
+        // lock before its GETs and holds no permit between two of them, so no lock and
+        // no permit ceiling covers the window in which it is holding a live handle.
+        // The lease does: an id someone is holding is skipped as an eviction
+        // candidate, however far down the ring it has fallen.
+        let (cache, ring, opens, closed, locks) = page_fixture();
+        const CAP: usize = 2;
+
+        // Page 1 is the oldest AND held — the shape of a long sweep.
+        let held = open_page(&cache, &ring, &locks, 1, CAP, &opens, &closed).await;
+        open_page_and_release(&cache, &ring, &locks, 2, CAP, &opens, &closed).await;
+        open_page_and_release(&cache, &ring, &locks, 3, CAP, &opens, &closed).await;
+
+        assert_eq!(
+            *closed.lock().unwrap(),
+            vec![200],
+            "the oldest UNLEASED page is closed; the leased one is passed over"
+        );
+        assert!(
+            cache.lock().unwrap().contains_key(&1),
+            "closing a leased record would fail the holder's remaining GETs into \
+             `outcome.failed`, which a collector reads as record ill-health"
+        );
+        assert_eq!(
+            cache.lock().unwrap().len(),
+            CAP,
+            "skipping it costs nothing here — an unleased candidate existed further \
+             along the ring and was closed instead"
+        );
+
+        // When EVERY ring entry is leased there is no candidate at all, so the cache
+        // sits above capacity rather than closing a record in use.
+        let five = open_page(&cache, &ring, &locks, 5, CAP, &opens, &closed).await;
+        let six = open_page(&cache, &ring, &locks, 6, CAP, &opens, &closed).await;
+        assert_eq!(
+            *closed.lock().unwrap(),
+            vec![200, 300],
+            "page 5's open closed the unleased page 3; page 6's found nothing to close"
+        );
+        assert_eq!(
+            cache.lock().unwrap().len(),
+            3,
+            "1, 5 and 6 are all held, so the cache exceeds the bound by the live \
+             borrows — an excess bounded by concurrency, where closing a live record \
+             would be a silent traffic-dependent fault"
+        );
+
+        // Releasing makes them ordinary candidates again. The excess drains at one
+        // page per subsequent open — eviction closes at most one record per call, so
+        // this is a decay back to the bound rather than a burst of closes.
+        drop((held, five, six));
+        open_page_and_release(&cache, &ring, &locks, 4, CAP, &opens, &closed).await;
+        assert_eq!(
+            *closed.lock().unwrap(),
+            vec![200, 300, 100],
+            "once released, the page that was skipped is the next one closed"
+        );
+        assert_eq!(cache.lock().unwrap().len(), CAP + 1, "one closed per open");
+        open_page_and_release(&cache, &ring, &locks, 5, CAP, &opens, &closed).await;
+        assert_eq!(*closed.lock().unwrap(), vec![200, 300, 100, 600]);
+        assert_eq!(
+            cache.lock().unwrap().len(),
+            CAP,
+            "drained back to the bound"
+        );
+    }
+
+    #[test]
+    fn a_victim_that_is_the_id_being_opened_takes_no_lock_at_all() {
+        // Driven directly rather than trusted to be unreachable. The caller already
+        // holds a lock into `open_page_bounded`, so taking the opened id's lock would
+        // self-deadlock — a permanent release hang with no signal anywhere, and the
+        // profile that ships compiles `debug_assert` out. The guard must SKIP.
+        let locks: TestRecordLocks = Mutex::new(HashMap::new());
+
+        // The degenerate case, driven with the id's lock already held: a `None` is the
+        // whole point, because there is no lock here that could ever be awaited.
+        let held = test_lock(&locks, 7);
+        let _guard = held.try_lock().expect("uncontended in this test");
+        assert!(
+            victim_lock(7u32, &7u32, |id| test_lock(&locks, id)).is_none(),
+            "closing the id being opened must take NO lock — the caller holds it"
+        );
+
+        // The ordinary case still locks, and locks the VICTIM: a guard that skipped
+        // everything would satisfy the assertion above and reopen the close race.
+        let chosen = victim_lock(8u32, &7u32, |id| test_lock(&locks, id))
+            .expect("a victim that is not the opened id is locked");
+        assert!(
+            Arc::ptr_eq(&chosen, &test_lock(&locks, 8)),
+            "and it is the evicted record's lock, not the opened one's"
+        );
+        assert!(
+            !Arc::ptr_eq(&chosen, &test_lock(&locks, 7)),
+            "the opened id's lock is never what an eviction waits on"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_eviction_closes_under_the_evicted_records_own_lock() {
+        // The residual race the lease cannot cover, because the victim is by
+        // definition UNLEASED. Removal and close cannot be one critical section — the
+        // close is an await, the ring guard is not — so between them the id is absent
+        // from the cache while its record is still open. A concurrent open of that id
+        // would miss, establish a FRESH session, and have this close kill it; the
+        // symptom is the one the lease exists to prevent, failed GETs read as record
+        // ill-health. Every production page open holds the record's lock across the
+        // open, so the close takes that same lock.
+        //
+        // Driven, not argued: hold the victim's lock and the eviction must not
+        // proceed. Virtual time (`start_paused`) makes the timeout fire the moment
+        // nothing else can run, so this is deterministic rather than timing-based.
+        let (cache, ring, opens, closed, locks) = page_fixture();
+        const CAP: usize = 1;
+
+        open_page_and_release(&cache, &ring, &locks, 1, CAP, &opens, &closed).await;
+        assert!(cache.lock().unwrap().contains_key(&1));
+
+        // Stand in for a concurrent opener of page 1, which takes page 1's record lock
+        // across its own open exactly as `publish_dm_page` and `sweep_dm_page` do.
+        let held = test_lock(&locks, 1);
+        let opener_guard = held.lock().await;
+
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            open_page_and_release(&cache, &ring, &locks, 2, CAP, &opens, &closed),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "the eviction of page 1 must WAIT for page 1's record lock — without that \
+             wait it closes a record another task is in the middle of re-opening"
+        );
+        assert!(
+            closed.lock().unwrap().is_empty(),
+            "and nothing was closed while the lock was held"
+        );
+        drop(opener_guard);
+
+        // Positive control on a fresh fixture: the identical call with the lock free
+        // completes and closes, so the assertion above is about the lock and not about
+        // the eviction being unreachable.
+        let (cache, ring, opens, closed, locks) = page_fixture();
+        open_page_and_release(&cache, &ring, &locks, 1, CAP, &opens, &closed).await;
+        open_page_and_release(&cache, &ring, &locks, 2, CAP, &opens, &closed).await;
+        assert_eq!(*closed.lock().unwrap(), vec![100]);
+        assert!(!cache.lock().unwrap().contains_key(&1));
+    }
+
+    #[tokio::test]
+    async fn an_absent_page_is_neither_cached_nor_ringed() {
+        // The probe frontier runs ahead of what exists, so most probes find nothing.
+        // A miss opened no record, so there is nothing to bound — and ringing it would
+        // let probes ahead of the frontier close pages a conversation is still using.
+        let (cache, ring, opens, closed, locks) = page_fixture();
+        const CAP: usize = 2;
+
+        for id in 1..=CAP as u32 {
+            open_page_and_release(&cache, &ring, &locks, id, CAP, &opens, &closed).await;
+        }
+        let absent = open_page_bounded(
+            &cache,
+            &ring,
+            &99,
+            CAP,
+            counting_open_optional(&opens, None),
+            |_evicted: u32| test_lock(&locks, 0),
+            |_evicted: u32| async { unreachable!("an absent page evicts nothing") },
+        )
+        .await
+        .unwrap();
+
+        assert!(absent.is_none());
+        assert!(closed.lock().unwrap().is_empty());
+        assert_eq!(
+            ring.lock().unwrap().len(),
+            CAP,
+            "the probe is not in the ring"
+        );
+        assert!(!cache.lock().unwrap().contains_key(&99));
+    }
+
+    #[tokio::test]
+    async fn a_capacity_below_one_still_keeps_the_page_it_just_opened() {
+        // A literal zero would make the page this call opened its own eviction
+        // candidate the moment its lease dropped — the caller would be handed a
+        // handle to a record already closed.
+        let (cache, ring, opens, closed, locks) = page_fixture();
+        open_page_and_release(&cache, &ring, &locks, 1, 0, &opens, &closed).await;
+        assert!(closed.lock().unwrap().is_empty());
+        assert_eq!(cache.lock().unwrap().get(&1), Some(&100));
+
+        // And at the floor it behaves as a capacity of one: the next page closes it.
+        open_page_and_release(&cache, &ring, &locks, 2, 0, &opens, &closed).await;
+        assert_eq!(*closed.lock().unwrap(), vec![100]);
+        assert_eq!(cache.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_entry_never_opened_as_a_page_is_never_evicted_or_closed() {
+        // The property the whole shape rests on, and why #128 D-0a survives intact.
+        // The shared lobby record lives in this same cache — every share advert and
+        // the lobby subscription derive the SAME owner seed — so closing it would take
+        // it from callers actively using it. It never enters a ring, and eviction
+        // candidates come from the ring, so it cannot be chosen. `BoundedRing`'s
+        // fields are private, so no caller can put it there either.
+        let (cache, ring, opens, closed, locks) = page_fixture();
+        const CAP: usize = 2;
+        const SHARED: u32 = 999;
+
+        // Cached the way every non-page caller caches: `open_cached` alone.
+        open_cached(&cache, &SHARED, counting_open(&opens, 42))
+            .await
+            .unwrap();
+
+        for id in 1..=20 {
+            open_page_and_release(&cache, &ring, &locks, id, CAP, &opens, &closed).await;
+        }
+
+        assert_eq!(
+            closed.lock().unwrap().len(),
+            18,
+            "every page past the bound was closed"
+        );
+        assert!(
+            !closed.lock().unwrap().contains(&42),
+            "and the shared record was NEVER closed"
+        );
+        assert_eq!(
+            cache.lock().unwrap().get(&SHARED),
+            Some(&42),
+            "the shared entry keeps the open-once behaviour exactly (#128 D-0a)"
+        );
+        assert_eq!(
+            cache.lock().unwrap().len(),
+            CAP + 1,
+            "bounded pages plus the untouched shared entry"
         );
     }
 

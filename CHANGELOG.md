@@ -218,6 +218,13 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Fixed
 
+- Corrected the DHT open cache's treatment of DM channel page records, which opened a page
+  once per session and never closed it, so open-record cardinality grew with message volume.
+  The page subset of the cache is bounded by `DM_PAGE_CACHE_CAPACITY`, and an eviction closes
+  the record it drops. The lobby record and share adverts derive the same owner key and keep
+  the open-once behaviour. An open holds a lease that makes its record id non-evictable, and
+  an eviction closes under the evicted record's own lock, so a record another operation is
+  using is never closed. (#252)
 - Corrected the rustdoc where the direct-message at-rest store is introduced, which left
   the word *store* to be read as the place messages are kept. `storage::dm_store`, the
   `dm_store` entry in `storage`, `dm::persist` and `dm::spent_store` name what it holds:
