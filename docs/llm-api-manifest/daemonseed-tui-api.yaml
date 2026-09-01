@@ -258,7 +258,7 @@ public_types:
       - "fn circles(&self) -> &[JoinedCircle]  # session-scoped circle membership set in join order (ISC-C59)"
       - "fn active_circle_index(&self) -> Option<usize>  # active-circle index into circles(), or None when the lobby is active (ISC-C60)"
       - "fn active_circle_label(&self) -> Option<(u64, &str)>  # active circle's id + client-local label (ISC-C60 / ISC-C62)"
-      - "fn cycle_active_circle(&mut self, forward: bool)  # ←/→ carousel cycle, wraps; no-op on empty set (ISC-C60)"
+      - "fn cycle_active_circle(&mut self, forward: bool)  # ←/→ carousel cycle, wraps; no-op on empty set; a step onto the lobby clears the compose buffer, a step onto a circle leaves it (ISC-C60)"
       - "fn active_chat_surface(&self) -> Option<ChatSurface>  # surface an Enter posts to; active circle > lobby > None (single source of truth for the indicator + handler + seal id, ISC-14 / S22 / C56 / C60 / A-C30)"
       - "fn status(&self) -> Option<&str>"
       - "fn own_chat_handle(&self) -> Option<Handle>   # own full handle, for self-@mention (ISC-11)"

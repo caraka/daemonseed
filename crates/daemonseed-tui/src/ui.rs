@@ -1432,8 +1432,33 @@ fn render_main_input(app: &App, frame: &mut Frame, area: Rect) {
                 // but kept total rather than panicking.
                 None => "no surface".to_owned(),
             };
+            // The way back to the lobby is advertised in the compose block's
+            // title, beside the surface indicator it undoes (#354). This is a
+            // title, with the truncation a title carries: at 80 columns the
+            // hint list does not fit, and an ordinary circle label is enough
+            // to cut it — a nine-character label already loses the end of the
+            // final `[Esc] back`. That is why the deselect sits immediately
+            // after the surface rather than at the end — the hints most likely
+            // to be lost are the ones furthest right, and of these the
+            // deselect is the one a captured user needs. A long enough label
+            // cuts every hint in turn, so this placement does not put the
+            // deselect out of reach; it makes it the last one lost. The
+            // circle pane's own title carries `[←/→] cycle`; this repeats the way
+            // out on the block the user is composing in, which is the one they
+            // are looking at.
+            //
+            // Shown only when there is a lobby to return to AND a circle to
+            // return from: with no public room joined, Home is a no-op
+            // (`App::select_lobby`), and advertising it would promise a surface
+            // switch that cannot happen.
+            let deselect = match (app.active_circle_index(), app.public_room()) {
+                (Some(_), Some(_)) => "  [Home] lobby",
+                _ => "",
+            };
             (
-                format!("compose → {surface}  [Enter] send  [Tab] join-circle  [Esc] back"),
+                format!(
+                    "compose → {surface}{deselect}  [Enter] send  [Tab] join-circle  [Esc] back"
+                ),
                 app.compose().to_owned(),
             )
         }

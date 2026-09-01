@@ -3156,7 +3156,10 @@ impl App {
     /// when no circle is joined (the lobby is then the only surface). Cycling
     /// changes only the active selection — never the membership set — so it can
     /// never evict a circle (ISC-C59) and the next post seals under exactly the
-    /// newly-active surface's key (ISC-A-C30).
+    /// newly-active surface's key (ISC-A-C30). Landing on the lobby drops any
+    /// draft composed against the circle being left, through the same
+    /// `widen_to_lobby` helper the `Home` key uses (de-linked: that helper is
+    /// private, and this doc is public).
     pub fn cycle_active_circle(&mut self, forward: bool) {
         let n = self.circles.len();
         if n == 0 {
@@ -3171,7 +3174,53 @@ impl App {
         } else {
             (cur + total - 1) % total
         };
-        self.active_circle = (next != 0).then(|| next - 1);
+        if next == 0 {
+            self.widen_to_lobby();
+        } else {
+            self.active_circle = Some(next - 1);
+        }
+    }
+
+    /// Move the active selection from a circle to the lobby, DROPPING any draft
+    /// composed while the circle was selected (#354).
+    ///
+    /// The draft has to go. A circle is the private opt-in (ISC-14) and the
+    /// lobby is public (ISC-S22): text typed against a circle-sealed target,
+    /// carried across and posted with one further keystroke, is a disclosure —
+    /// the same asymmetry that decided the launch default, and sharper here
+    /// because the switch is deliberate and immediate. Refusing the switch while
+    /// a draft exists was the alternative; it was rejected because it re-creates
+    /// the trap this issue is about — the user would again be held on the circle,
+    /// now by their own half-typed line. Carrying a draft per surface is a real
+    /// answer but a larger one, and it is not needed to make the switch safe.
+    ///
+    /// Only a switch that WIDENS the audience clears: `active_circle.take()`
+    /// yields `Some` exactly when a circle was selected, so returning to the
+    /// lobby from the lobby leaves a lobby-composed draft alone.
+    fn widen_to_lobby(&mut self) {
+        if self.active_circle.take().is_some() {
+            self.compose.clear();
+        }
+    }
+
+    /// Return the active surface to the lobby in one step, from any carousel
+    /// position (#354: Home in the chat pane). `←/→` reaches the lobby too, but
+    /// only by stepping through the membership set, and it is the stepping that
+    /// made the lobby look unreachable once a circle was joined.
+    ///
+    /// A no-op when no public room is joined. Without one the lobby is not a
+    /// postable surface, so clearing the selection would resolve
+    /// [`Self::active_chat_surface`] to `None` — a state with a live circle in
+    /// the set, a "no surface" indicator and a silently inert Enter. There is no
+    /// lobby to return to, so this returns to nothing rather than manufacturing
+    /// a dead end. Idempotent once the lobby is active, and it changes only the
+    /// active selection — never the membership set (ISC-C59) — so it can never
+    /// evict a circle, and the next post seals under the lobby rather than a
+    /// circle key (ISC-A-C30).
+    fn select_lobby(&mut self) {
+        if self.public_room.is_some() {
+            self.widen_to_lobby();
+        }
     }
 
     /// Chat compose: printable chars append, Backspace deletes, Enter sends a
@@ -3199,6 +3248,11 @@ impl App {
             // the membership set — a no-op when no circle is joined.
             KeyCode::Left => self.cycle_active_circle(false),
             KeyCode::Right => self.cycle_active_circle(true),
+            // Home returns the active surface to the lobby in one step (#354).
+            // It is not a printable key, so the compose buffer keeps every
+            // character the user can type — which is why the deselect could not
+            // be a letter.
+            KeyCode::Home => self.select_lobby(),
             KeyCode::Char(c) => self.compose.push(c),
             KeyCode::Backspace => {
                 self.compose.pop();
@@ -5309,6 +5363,257 @@ mod tests {
             app.active_chat_surface(),
             Some(ChatSurface::Circle { id: 30, .. })
         ));
+    }
+
+    /// #354: Home returns the send target to the lobby from any carousel
+    /// position, in one step. Asserted on the transmitted post, not on the
+    /// indicator — the defect was that a composed message went to a circle when
+    /// the user meant the lobby, so the evidence has to be which queue the post
+    /// lands in.
+    #[test]
+    fn home_returns_the_send_target_to_the_lobby() {
+        let mut app = drive_to_main();
+        app.on_net_event(NetEvent::PublicRoomJoined {
+            room: "lobby".to_owned(),
+        });
+        join_circle(&mut app, 10);
+        join_circle(&mut app, 20);
+        join_circle(&mut app, 30);
+        assert!(
+            matches!(
+                app.active_chat_surface(),
+                Some(ChatSurface::Circle { id: 30, .. })
+            ),
+            "the last join is active, three carousel steps from the lobby"
+        );
+
+        app.on_key(press(KeyCode::Home));
+        assert_eq!(app.active_circle_index(), None, "Home selects the lobby");
+        assert_eq!(
+            app.active_chat_surface(),
+            Some(ChatSurface::PublicRoom("lobby".to_owned())),
+            "one step, not three — from the far end of the carousel"
+        );
+        // ISC-C59: the selection moved, the membership set did not.
+        assert_eq!(app.circles().len(), 3, "Home never evicts a circle");
+
+        // The post itself now leaves on the lobby queue and nothing is sealed
+        // under a circle key (ISC-A-C30).
+        for c in "hi".chars() {
+            app.on_key(press(KeyCode::Char(c)));
+        }
+        app.on_key(press(KeyCode::Enter));
+        assert!(
+            app.take_pending_chat().is_none(),
+            "no circle-sealed post is queued once the lobby is the target"
+        );
+        let (body, _sender) = app
+            .take_pending_public_room()
+            .expect("the post is queued for the lobby");
+        assert_eq!(body, "hi");
+
+        // Idempotent: pressing it again on the lobby changes nothing.
+        app.on_key(press(KeyCode::Home));
+        assert_eq!(app.active_circle_index(), None);
+        assert_eq!(app.circles().len(), 3);
+    }
+
+    /// #354: a draft typed against a circle does NOT ride the switch to the
+    /// public lobby. Home is one keystroke, so a carried draft would put
+    /// circle-composed text one further keystroke from a public post — the
+    /// disclosure direction. Typed BEFORE the switch, deliberately: an assertion
+    /// on an already-empty buffer kills no mutation.
+    #[test]
+    fn home_drops_a_draft_composed_against_the_circle() {
+        let mut app = drive_to_main();
+        app.on_net_event(NetEvent::PublicRoomJoined {
+            room: "lobby".to_owned(),
+        });
+        join_circle(&mut app, 10);
+        for c in "secret".chars() {
+            app.on_key(press(KeyCode::Char(c)));
+        }
+        assert_eq!(
+            app.compose(),
+            "secret",
+            "the draft exists before the switch"
+        );
+
+        app.on_key(press(KeyCode::Home));
+        assert_eq!(
+            app.compose(),
+            "",
+            "the circle-composed draft is dropped, not re-aimed at the lobby"
+        );
+        // Enter now has nothing to send: a non-empty draft is required, so the
+        // secret cannot reach the lobby by a single further keystroke.
+        app.on_key(press(KeyCode::Enter));
+        assert!(
+            app.take_pending_public_room().is_none(),
+            "no lobby post is queued from a dropped draft"
+        );
+        assert!(app.take_pending_chat().is_none(), "and none to a circle");
+
+        // ←/→ lands on the same carousel position and must behave identically —
+        // otherwise the deselect is safe and the step is not.
+        app.on_key(press(KeyCode::Right));
+        assert_eq!(app.active_circle_index(), Some(0), "back on the circle");
+        for c in "again".chars() {
+            app.on_key(press(KeyCode::Char(c)));
+        }
+        app.on_key(press(KeyCode::Left));
+        assert_eq!(app.active_circle_index(), None, "← reaches the lobby too");
+        assert_eq!(app.compose(), "", "and drops the circle-composed draft too");
+
+        // A draft composed ON the lobby survives — only a widening switch clears.
+        for c in "public".chars() {
+            app.on_key(press(KeyCode::Char(c)));
+        }
+        app.on_key(press(KeyCode::Home));
+        assert_eq!(
+            app.compose(),
+            "public",
+            "lobby → lobby is not a widening switch; the draft stands"
+        );
+    }
+
+    /// #354: with circles joined but no public room, there is no lobby to return
+    /// to. Home must not clear the selection into a `no surface` state where the
+    /// indicator names nothing and Enter is silently inert.
+    #[test]
+    fn home_is_inert_when_no_lobby_has_been_joined() {
+        let mut app = drive_to_main();
+        join_circle(&mut app, 10);
+        assert!(app.public_room().is_none(), "no lobby joined");
+        assert!(app.can_chat(), "but chat is live — the circle is joined");
+
+        app.on_key(press(KeyCode::Home));
+        assert_eq!(
+            app.active_circle_index(),
+            Some(0),
+            "the circle stays selected — there is no lobby to move to"
+        );
+        assert!(
+            matches!(
+                app.active_chat_surface(),
+                Some(ChatSurface::Circle { id: 10, .. })
+            ),
+            "the send target never becomes None while a circle is joined"
+        );
+        assert!(
+            !render_text(&app, 100, 24).contains("[Home] lobby"),
+            "and the inert key is not advertised"
+        );
+
+        // Once the lobby arrives, the same keystroke works.
+        app.on_net_event(NetEvent::PublicRoomJoined {
+            room: "lobby".to_owned(),
+        });
+        app.on_key(press(KeyCode::Home));
+        assert_eq!(app.active_circle_index(), None);
+    }
+
+    /// #354 discoverability: the compose footer names the way back to the lobby
+    /// while a circle is active, and stays quiet once the lobby already is. The
+    /// circle pane's block title also carries `[←/→] cycle`, but a title is
+    /// truncated silently on a narrow pane, so the footer is what a composing
+    /// user can rely on.
+    #[test]
+    fn compose_footer_advertises_the_lobby_return_only_while_a_circle_is_active() {
+        let mut app = drive_to_main();
+        app.on_net_event(NetEvent::PublicRoomJoined {
+            room: "lobby".to_owned(),
+        });
+        // Positive control: assert the ENABLED compose arm rendered. Without
+        // this the negative below could pass through the `!can_chat()` arm,
+        // which has no hint list at all and so trivially lacks the string.
+        assert!(app.can_chat(), "chat is live");
+        let lobby_only = render_text(&app, 100, 24);
+        assert!(
+            lobby_only.contains("compose → # lobby (public)"),
+            "the enabled compose title is what rendered"
+        );
+        assert!(
+            !lobby_only.contains("[Home] lobby"),
+            "lobby already active — no deselect is offered"
+        );
+
+        join_circle(&mut app, 1);
+        assert!(
+            render_text(&app, 100, 24).contains("[Home] lobby"),
+            "a circle is active — the footer says how to get back"
+        );
+
+        app.on_key(press(KeyCode::Home));
+        let back = render_text(&app, 100, 24);
+        assert!(
+            back.contains("compose → # lobby (public)"),
+            "still the enabled arm"
+        );
+        assert!(
+            !back.contains("[Home] lobby"),
+            "back on the lobby — the hint goes away with the state it described"
+        );
+    }
+
+    /// #354: the hint survives the width a user actually runs. It lives in a
+    /// block title, which ratatui truncates silently, so its position in the
+    /// hint list is what decides whether it is legible — sitting beside the
+    /// surface indicator it undoes, ahead of the hints that get cut. 80 columns
+    /// is the floor an 80×24 terminal gives; the wide 100-column renders
+    /// elsewhere in this module would hide a regression here.
+    #[test]
+    fn lobby_hint_survives_an_80_column_terminal() {
+        let mut app = drive_to_main();
+        app.on_net_event(NetEvent::PublicRoomJoined {
+            room: "lobby".to_owned(),
+        });
+        join_circle(&mut app, 1);
+        let narrow = render_text(&app, 80, 24);
+        assert!(
+            narrow.contains("[Home] lobby"),
+            "the deselect is still readable at 80 columns:\n{narrow}"
+        );
+
+        // The short label above already kills the obvious mutation: moving the
+        // deselect to the end of the hint list drops it off the title even at
+        // `circle-1`, because the hints to its right do not fit at 80 columns
+        // either. What that case does NOT pin is the property the placement is
+        // actually for — that the deselect survives once the label itself has
+        // eaten the room. A label long enough to cut everything after it is the
+        // case worth holding, because it is the one where a user is furthest
+        // from finding the way back on their own.
+        let mut app = drive_to_main();
+        app.on_net_event(NetEvent::PublicRoomJoined {
+            room: "lobby".to_owned(),
+        });
+        app.on_net_event(NetEvent::CircleJoined {
+            circle_id: 2,
+            label: "circle-with-a-decidedly-long-label".to_owned(),
+            entropy: "entropy-2".to_owned(),
+        });
+        let long = render_text(&app, 80, 24);
+        // Guard that the long case is genuinely a truncating one, counted
+        // rather than spelled: an earlier version asserted a specific hint
+        // string was absent, which a reword of that hint would satisfy without
+        // any truncation happening, leaving the case pinning nothing. Hint
+        // brackets are owned by the production string, so the comparison moves
+        // with it.
+        let hints = |s: &str| {
+            s.lines()
+                .find(|l| l.contains("compose →"))
+                .map(|l| l.matches('[').count())
+                .expect("the compose title is drawn")
+        };
+        assert!(
+            hints(&long) < hints(&narrow),
+            "the label must be long enough to have cut hints, or this case \
+             pins nothing the short one does not:\n{long}"
+        );
+        assert!(
+            long.contains("[Home] lobby"),
+            "the deselect survives a long circle label at 80 columns:\n{long}"
+        );
     }
 
     /// ISC-A-C30: a composed post seals under EXACTLY the active circle's id —

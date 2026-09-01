@@ -289,6 +289,13 @@ work lives in the maintainer's own planning notes, not here.
   along with the indexer status rather than paging with the rows. The public-share selection clamps
   against the visible count rather than the raw listing, so a selection that survives a hide
   no longer sits past the last drawn row with `f` a no-op. (#352)
+- Corrected the move of the chat send target from a circle to the public lobby, which carried
+  the compose buffer across, leaving text composed against a circle one keystroke from a public
+  post. The draft is dropped on every move that widens the audience — `Home` and the `←/→`
+  carousel step alike; a draft composed on the lobby is left alone. `Home` in the chat pane
+  returns the send target to the lobby in one step from any carousel position, and does nothing
+  when no public room is joined. The compose block's title carries `[Home] lobby` while a circle
+  is active and a lobby exists. (#354)
 
 ### Removed
 
