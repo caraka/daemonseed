@@ -26,6 +26,14 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Added
 
+- `daemonseed_core::dm::persist` — `DmPersist::read_contact` and
+  `DmPersist::update_contact`, the contact record's path to and from the DM at-rest
+  store. `read_contact` is lock-free and creates nothing; a stored record that will
+  not decode is `DmPersistError::Contact`, never `Ok(None)`. `update_contact` is
+  read-modify-write inside one critical section, takes a seed closure built only when
+  the correspondence has no record, and writes a stored record back only on
+  `Mutation::Changed`; a seeded record is written whatever the closure reports.
+  **Breaking (crate API):** `DmPersistError` gains a `Contact` variant. (#236)
 - `identity::OwnerSeed`, `identity::OwnerPublic` and `identity::RendezvousOwner` in
   `daemonseed-veilid-net`: how a party holds a rendezvous record's owner, either `Held`
   (the owner seed) or `PublicOnly` (the owner public key). An `OwnerPublic` is

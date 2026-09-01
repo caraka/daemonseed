@@ -1275,8 +1275,8 @@ modules:
       CollectionView returns contiguous_through, frontier_page and outstanding as
       owned data. The frame's declared-sequence check is ParsedFrame::open's
       found_at, one layer above. NOT YET AVAILABLE: the doorbell sweep, the
-      accept/decline/block flow, the contact cache, the block list, the transport
-      wiring and the UI (#236, #243).
+      accept/decline/block flow, any caller that populates the contact cache, the
+      block list, the transport wiring and the UI (#236, #243).
       Sub-module dm::persist is the wiring between these types and
       storage::dm_store, and is what makes any of this reach a disk. DmPersist
       derives both the store key and the provisional record's key from one
@@ -1311,9 +1311,30 @@ modules:
       direction. read_resume(
       &CorrespondenceLabel) -> Result<Option<ResumeRecord>, DmPersistError>
       reads it back. DmPersistError::Resume(ResumeError) carries both.
-      read_outbox/read_cursor are lock-free. The provisional record is sealed by
-      its own path and again by the store: the record's seal binds RecordContext
-      and refuses one lifted from another channel, the store's AAD binds label
+      read_contact(&CorrespondenceLabel) -> Result<Option<ContactRecord>,
+      DmPersistError> reads the stored contact record. A record that exists and
+      will not decode is DmPersistError::Contact(ContactCacheError), never
+      Ok(None); Ok(None) is any NotFound on the path, so it means nothing
+      readable is there rather than an intact store holding no such
+      correspondent. update_contact(label, seed, f) is read-modify-write inside
+      one critical_section. seed: impl FnOnce() -> Result<ContactRecord,
+      DmPersistError> supplies the record when the correspondence has none and
+      is not built when one is stored; f: impl FnOnce(&mut ContactRecord) ->
+      Result<Mutation<T>, DmPersistError> then runs against seed's record or the
+      stored one, and the call yields T. A stored record is written only on
+      Changed; a seeded record is written whatever f reports. Nothing is written
+      if f fails, though taking the lock creates the correspondence directory
+      and its lock file. A stored record that will not decode fails the call and
+      is never re-seeded over. Debug builds panic when an Unchanged report
+      follows a change to a stored record. The keys are write-once through this
+      module: ContactRecord::observed_at is the record's only &mut self method and
+      update_contact ignores its seed once a record exists, so no path here
+      replaces a stored pk_pc. DmPersistError::Contact(ContactCacheError)
+      carries a stored record that will not decode and a caller's own contact
+      error raised inside f.
+      read_outbox/read_cursor/read_contact are lock-free. The provisional
+      record is sealed by its own path and again by the store: the record's seal
+      binds RecordContext and refuses one lifted from another channel, the store's AAD binds label
       and kind and refuses a blob moved between slots, and neither layer can
       check the other's fact. Erasure is unlink, not overwrite (#293).
       CorrespondenceLabel is taken as a parameter, never derived here (#288).

@@ -36,9 +36,10 @@
 //! that reads, decides, and writes back **must**, or two processes lose one of
 //! the two decisions silently.
 //!
-//! So: [`DmPersist::read_outbox`] and [`DmPersist::read_cursor`] are questions
-//! and take no lock; [`DmPersist::update_outbox`] and
-//! [`DmPersist::advance_cursor`] are read-modify-write and hold the lock across
+//! So: [`DmPersist::read_outbox`], [`DmPersist::read_cursor`] and
+//! [`DmPersist::read_contact`] are questions and take no lock;
+//! [`DmPersist::update_outbox`], [`DmPersist::advance_cursor`] and
+//! [`DmPersist::update_contact`] are read-modify-write and hold the lock across
 //! the whole of it. There is deliberately **no** `save_outbox` taking an
 //! [`Outbox`] the caller loaded earlier: that pair is exactly the lost-update the
 //! store's API refuses to let anyone spell, re-offered one layer up.
@@ -94,6 +95,7 @@ use oxicrypt_aes::Aes256Key;
 use oxicrypt_ml_kem as ml_kem;
 use zeroize::Zeroizing;
 
+use crate::dm::contact_cache::{ContactCacheError, ContactRecord};
 use crate::dm::firstcontact::{FirstContactError, ROOT_LEN};
 use crate::dm::outbox::{Outbox, OutboxError};
 use crate::dm::provisional::{
@@ -125,6 +127,9 @@ pub enum DmPersistError {
     Outbox(OutboxError),
     /// A resume record would not encode, decode, or replace the stored one.
     Resume(ResumeError),
+    /// The stored contact record would not decode, or a caller's own contact
+    /// call inside [`DmPersist::update_contact`] failed.
+    Contact(ContactCacheError),
     /// The record's ratchet could not be opened, so the channel did not
     /// establish. The provisional record is **still on disk**: see
     /// [`PendingHandshake::establish`] for why that is the safe direction.
@@ -159,6 +164,7 @@ impl std::fmt::Display for DmPersistError {
             Self::Record(e) => write!(f, "provisional record: {e}"),
             Self::Outbox(e) => write!(f, "outbox: {e}"),
             Self::Resume(e) => write!(f, "resume record: {e}"),
+            Self::Contact(e) => write!(f, "contact record: {e}"),
             Self::Ratchet(e) => write!(f, "ratchet: {e}"),
             Self::OutboxDirectionMismatch { stored, requested } => write!(
                 f,
@@ -182,6 +188,7 @@ impl std::error::Error for DmPersistError {
             Self::Record(e) => Some(e),
             Self::Outbox(e) => Some(e),
             Self::Resume(e) => Some(e),
+            Self::Contact(e) => Some(e),
             Self::Ratchet(e) => Some(e),
             Self::OutboxDirectionMismatch { .. } | Self::CursorNotCorroborated { .. } => None,
         }
@@ -203,6 +210,12 @@ impl From<ProvisionalError> for DmPersistError {
 impl From<ResumeError> for DmPersistError {
     fn from(e: ResumeError) -> Self {
         Self::Resume(e)
+    }
+}
+
+impl From<ContactCacheError> for DmPersistError {
+    fn from(e: ContactCacheError) -> Self {
+        Self::Contact(e)
     }
 }
 
@@ -734,6 +747,203 @@ impl DmPersist {
                 Ok(true)
             })
     }
+
+    /// Read what is known about the correspondent, or `Ok(None)` if nothing has
+    /// been recorded (ISC-C44).
+    ///
+    /// **No lock, like [`Self::read_outbox`] and unlike [`Self::read_resume`].**
+    /// Asking whether a correspondent is known is a question, and entering
+    /// [`DmStore::critical_section`] would answer it by making the
+    /// correspondence exist on disk (#253) — the directory names under the store
+    /// root are the one thing an adversary holding the disk reads without a key,
+    /// so they must name established correspondences and not every label anyone
+    /// looked up.
+    ///
+    /// **Anything that decides from what this returns and then writes must use
+    /// [`Self::update_contact`] instead**, for [`Self::read_outbox`]'s reason:
+    /// two calls in a row straddle a writer, and the sighting one of them was
+    /// recording is then lost.
+    ///
+    /// **A record that will not decode is an error, not `Ok(None)`**, which is
+    /// what [`Self::read_outbox`] and [`Self::read_resume`] do with theirs.
+    /// Absence and unreadability have different remedies: the first means run
+    /// first contact, and the second means a record that holds `pk_pc` — the key
+    /// every frame's authorship is checked against — is on disk and cannot be
+    /// read, which is not a thing to answer by silently starting again.
+    ///
+    /// **That separation is bounded, and the bound is inherited rather than
+    /// chosen here.** The store's read maps `NotFound` on *any* component of the
+    /// path to `Ok(None)`, so a vanished store root, a deleted profile directory
+    /// and a correspondence that was never written are one answer. `Ok(None)`
+    /// therefore means "nothing readable is there", not "this correspondent is
+    /// unknown to a store that is otherwise intact" — a caller that would do
+    /// something drastic on absence, such as re-running first contact for every
+    /// correspondent at once, has to establish that the root is still there
+    /// itself. What this call does separate is a record that exists and will not
+    /// decode, which is never reported as absence.
+    ///
+    /// **Known limitation: the keys are write-once through this module.**
+    /// [`ContactRecord::observed_at`] is the record's only `&mut self` method
+    /// and [`Self::update_contact`] ignores its seed once a record exists, so a
+    /// correspondent who rotates `PK_pc` leaves a record this API cannot repair
+    /// — every later frame fails authorship against the stale key and the only
+    /// remedy is out-of-band. Replacing a stored record is deliberately absent
+    /// rather than overlooked: an unconditional overwrite is the lost update
+    /// this whole shape exists to refuse, so a rotation path has to say what
+    /// authorises the new key, which is a protocol question and not a wiring
+    /// one.
+    pub fn read_contact(
+        &self,
+        correspondence: &CorrespondenceLabel,
+    ) -> Result<Option<ContactRecord>, DmPersistError> {
+        match self
+            .store
+            .read_unlocked(correspondence, RecordKind::ContactCache)?
+        {
+            // `Zeroizing`: this plaintext *is* the correspondence's `ss0` — this
+            // kind carries no seal of its own, so the store hands back the
+            // cleartext record — and the store zeroizes only its own copy.
+            Some(bytes) => Ok(Some(ContactRecord::decode(&Zeroizing::new(bytes))?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Load the contact record, let `f` change it, and write it back — all under
+    /// one lock.
+    ///
+    /// **`f` reports whether it mutated, and a report of
+    /// [`Mutation::Unchanged`] costs no seal** — [`Self::update_outbox`]'s shape,
+    /// for [`Self::update_outbox`]'s two reasons, and both of them apply here.
+    ///
+    /// **Read-modify-write, because the record's own guard is against its
+    /// *current* value.** [`ContactRecord::observed_at`] refuses a sighting
+    /// earlier than the last one recorded; performed as a separate read and
+    /// write, a concurrent sighting landing between the two would be overwritten
+    /// by the older number and `last_seen_ms` would come to understate when the
+    /// contact was last seen — exactly the rewind the in-memory guard exists to
+    /// refuse, arriving through the layer above it. Anything keying eviction or
+    /// staleness on that stamp then discards a live contact. There is
+    /// deliberately no `save_contact` taking a record the caller loaded earlier:
+    /// that pair is the lost update, re-offered one layer up.
+    ///
+    /// **Why the conditional shape, when a contact is only *observed* by an
+    /// event.** The change is event-driven; the **call** is not. `last_seen_ms`
+    /// moves when a frame actually arrives, but the natural call site is the
+    /// receive sweep — poll a correspondent's pages, then record the sighting —
+    /// and most ticks of that sweep find nothing. Under an unconditional write
+    /// this kind would join the outbox in the budget #289 measured and #347
+    /// removed: one seal per correspondence per tick against a 2^32 birthday
+    /// bound on a single per-profile key, spent by clients that sent and
+    /// received nothing. Reporting decouples the polling cadence from the key's
+    /// lifetime, so the cadence stays a latency choice. The refusals cost
+    /// nothing either: a sighting `observed_at` declines, and a re-record of an
+    /// instant already stored, are both `Unchanged`.
+    ///
+    /// **[`ContactRecord::observed_at`]'s bool is not the [`Mutation`] answer**,
+    /// and a sweep that reads it as one gives back the saving above. It reports
+    /// that the record now *reflects* a sighting at `at_ms`, which includes
+    /// re-recording the instant already stored: the guard is `at_ms <
+    /// last_seen_ms`, so the equal case is accepted, returns `true`, and changes
+    /// nothing. Derive the answer from the stamp instead —
+    /// `c.last_seen_ms() < at_ms && c.observed_at(at_ms)` is `true` exactly when
+    /// the record moved, and short-circuits away the call that would not.
+    ///
+    /// `seed` supplies the record when the correspondence has none — first
+    /// contact, where the keys and `ss0` are in hand. **It is a closure so it is
+    /// built only when it is needed:** a seed carries `ss0` in the clear, and a
+    /// sweep that constructs one per tick to discard it makes a live copy of the
+    /// correspondence secret on every call that already has a stored record.
+    /// When a record does exist the seed is not built at all and the stored
+    /// record is what `f` sees — a caller cannot displace `first_seen_ms`, or an
+    /// advanced `last_seen_ms`, with a stale in-memory copy.
+    ///
+    /// **A seeded record is written whatever `f` reports, and this is where the
+    /// shape departs from [`Self::update_outbox`] rather than copying it.**
+    /// There, `Unchanged` on an absent record correctly writes nothing:
+    /// `Outbox::new(direction)` is empty and derivable from the argument, so
+    /// dropping it loses no fact. A seed is the opposite — `pk_lt`, `pk_pc` and
+    /// `ss0` have no other home — and the losing call is the ordinary one: seed
+    /// at the local clock, then record a sighting stamped earlier (a
+    /// sender-supplied time, or a clock read taken before the seed's).
+    /// `observed_at` refuses it, `f` honestly reports `Unchanged`, and under
+    /// `update_outbox`'s rule the correspondent would stay unknown while every
+    /// later tick re-seeded and lost it again — no error, no seal, no trace.
+    /// Relative to the empty slot it was found in, a seeded record **is** the
+    /// change, so `f`'s report is consulted only for a record that was already
+    /// there. The seal that costs is one per correspondence for its whole life,
+    /// not one per tick.
+    ///
+    /// **Nothing is written if `f` fails.** The record is replaced only after
+    /// `f` returns `Ok`, so a failed call leaves the correspondence exactly as
+    /// it was and the caller may retry. Taking the lock still establishes the
+    /// correspondence's directory before `f` runs; what a refusal leaves absent
+    /// is the record and the seal.
+    ///
+    /// **A stored record that will not decode wedges this call**, exactly as it
+    /// does [`Self::commit_resume`], and for the same reason: the decode is
+    /// `?`-propagated and never falls through to `seed`. Recovering by
+    /// re-seeding would overwrite `first_seen_ms` and — where the stored bytes
+    /// are merely unreadable to *this* build — a live `ss0`, silently, on a path
+    /// no caller asked to be destructive. Fail closed and let the caller decide.
+    ///
+    /// **`Unchanged` is a promise the caller can break, and in debug builds it
+    /// is checked** — again as [`Self::update_outbox`] does, and by comparison
+    /// rather than [`assert_eq!`], because this record's encoding *is* `ss0` and
+    /// `assert_eq!` would render it into the panic message. The check runs only
+    /// on the stored path, which is the only path where a false report can lose
+    /// anything: on the seeded path the write happens regardless, so the case
+    /// the guard structurally cannot see is one that no longer exists.
+    pub fn update_contact<T>(
+        &self,
+        correspondence: &CorrespondenceLabel,
+        seed: impl FnOnce() -> Result<ContactRecord, DmPersistError>,
+        f: impl FnOnce(&mut ContactRecord) -> Result<Mutation<T>, DmPersistError>,
+    ) -> Result<T, DmPersistError> {
+        self.store
+            .critical_section(correspondence, |guard| -> Result<T, DmPersistError> {
+                // `seeded` is not recoverable after the fact — a seed and a
+                // stored record are the same type — and it decides whether `f`'s
+                // report is consulted at all.
+                let (mut contact, seeded) = match guard.read(RecordKind::ContactCache)? {
+                    // `Zeroizing` for `Self::read_contact`'s reason: the store's
+                    // answer for this kind is cleartext `ss0`. Propagated, never
+                    // recovered from by re-seeding — see this method's docs.
+                    Some(bytes) => (ContactRecord::decode(&Zeroizing::new(bytes))?, false),
+                    None => (seed()?, true),
+                };
+                // Debug builds hold the before-image so an `Unchanged` report
+                // that is not true fails here rather than silently discarding
+                // the caller's mutation.
+                #[cfg(debug_assertions)]
+                let before = contact.encode();
+                let (out, changed) = match f(&mut contact)? {
+                    Mutation::Changed(out) => (out, true),
+                    Mutation::Unchanged(out) => {
+                        // `#[cfg]`, not `debug_assert!`: that macro's body is
+                        // type-checked in every profile, so it would demand
+                        // `before` in release builds where the capture above
+                        // does not exist.
+                        #[cfg(debug_assertions)]
+                        if !seeded {
+                            assert!(
+                                before.as_slice() == contact.encode().as_slice(),
+                                "an update reported Mutation::Unchanged after changing the \
+                                 contact record; the change would have been discarded without \
+                                 a trace"
+                            );
+                        }
+                        (out, false)
+                    }
+                };
+                // A seeded record is written whatever `f` reported: relative to
+                // the empty slot it was found in, it is itself the change, and
+                // the facts it carries have no other home.
+                if changed || seeded {
+                    guard.replace(RecordKind::ContactCache, &contact.encode())?;
+                }
+                Ok(out)
+            })
+    }
 }
 
 /// Read a cursor's at-rest bytes, bounded by `read_through`.
@@ -876,6 +1086,7 @@ mod tests {
     use zeroize::Zeroizing;
 
     use crate::crypto::suite::Registry;
+    use crate::dm::contact_cache::{CONTACT_RECORD_LEN, CONTACT_RECORD_VERSION};
     use crate::dm::firstcontact::SS0_LEN;
     use crate::dm::keyrec;
     use crate::dm::outbox::{OUTBOX_MAGIC, OutboxTarget, SealedFrame, Surfacing};
@@ -1955,6 +2166,670 @@ mod tests {
         assert!(
             p.read_resume(&label(0x56)).expect("reads").is_none(),
             "one correspondence's resume record was visible to another"
+        );
+    }
+    // ------------------------------------------------------------ the contact cache (ISC-C44)
+
+    const FIRST_SEEN: i64 = 1_700_000_000_000;
+    const LAST_SEEN: i64 = 1_700_000_123_456;
+
+    /// Byte-distinct, so an encoding that transposed its two keys would not pass
+    /// by coincidence.
+    fn pk(tag: u8) -> Box<[u8; oxicrypt_ml_dsa::PK_LEN]> {
+        let mut out = vec![0u8; oxicrypt_ml_dsa::PK_LEN].into_boxed_slice();
+        for (i, b) in out.iter_mut().enumerate() {
+            *b = tag.wrapping_add((i as u8).wrapping_mul(3));
+        }
+        out.try_into().expect("allocated at PK_LEN")
+    }
+
+    /// A record whose every field is a function of `tag`, so two fixtures built
+    /// with different tags disagree in all four stored facts — which is what
+    /// lets an assertion, rather than a `panic!` in a seed, carry the kill.
+    fn contact_tagged(tag: u8, first_seen: i64, last_seen: i64) -> ContactRecord {
+        let mut secret = ss0();
+        secret[0] ^= tag;
+        ContactRecord::new(
+            pk(tag),
+            pk(tag.wrapping_add(0x7F)),
+            Zeroizing::new(secret),
+            first_seen,
+            last_seen,
+        )
+        .expect("ordered timestamps")
+    }
+
+    fn contact(first_seen: i64, last_seen: i64) -> ContactRecord {
+        contact_tagged(0x01, first_seen, last_seen)
+    }
+
+    /// Seed a correspondence with `record`, through the ordinary writer.
+    fn seed_contact(p: &DmPersist, l: &CorrespondenceLabel, record: ContactRecord) {
+        p.update_contact(l, || Ok(record), |_| Ok(Mutation::Changed(())))
+            .expect("seeds");
+    }
+
+    /// The sweep's own idiom, and the only correct one: `observed_at`'s bool
+    /// says the record *reflects* a sighting, which is true of a re-record of
+    /// the stored instant. Only the stamp says whether anything moved.
+    fn observe(c: &mut ContactRecord, at_ms: i64) -> Mutation<bool> {
+        if c.last_seen_ms() < at_ms && c.observed_at(at_ms) {
+            Mutation::Changed(true)
+        } else {
+            Mutation::Unchanged(false)
+        }
+    }
+
+    /// Overwrite the stored contact record with `bytes`, around the reader — the
+    /// only way to put a payload on disk that `ContactRecord::encode` would
+    /// never produce, which is what the refusal tests need.
+    fn write_contact_bytes(p: &DmPersist, l: &CorrespondenceLabel, bytes: &[u8]) {
+        p.store()
+            .critical_section(l, |guard| -> Result<(), DmStoreError> {
+                guard.replace(RecordKind::ContactCache, bytes)
+            })
+            .expect("writes");
+    }
+
+    /// **The oracle for the pair.** Every stored field comes back through the
+    /// store's seal, including `ss0` — which is checked by the root it
+    /// recomputes, since the record never hands the secret out.
+    #[test]
+    fn a_contact_record_round_trips_through_the_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0x61);
+
+        assert!(
+            p.read_contact(&l).expect("reads").is_none(),
+            "fixture is not empty"
+        );
+
+        seed_contact(&p, &l, contact(FIRST_SEEN, LAST_SEEN));
+
+        let stored = p
+            .read_contact(&l)
+            .expect("reads")
+            .expect("a record was written");
+
+        // Control on the fixture: the two keys are distinct, so a write that
+        // stored one of them twice cannot pass the two assertions below.
+        assert_ne!(
+            pk(0x01),
+            pk(0x80),
+            "the fixture's two keys are the same key"
+        );
+        assert_eq!(stored.pk_lt(), pk(0x01).as_ref());
+        assert_eq!(stored.pk_pc(), pk(0x80).as_ref());
+
+        // Likewise: distinct stamps, so a read that took one field twice fails.
+        assert_ne!(
+            FIRST_SEEN, LAST_SEEN,
+            "the two timestamps are the same value"
+        );
+        assert_eq!(stored.first_seen_ms(), FIRST_SEEN);
+        assert_eq!(stored.last_seen_ms(), LAST_SEEN);
+
+        assert_eq!(
+            stored.address_root().expect("derives"),
+            contact(FIRST_SEEN, LAST_SEEN)
+                .address_root()
+                .expect("derives"),
+            "ss0 did not survive the store's seal"
+        );
+    }
+
+    /// The record survives the process that wrote it: a second [`DmPersist`]
+    /// over the same root recovers it, and the store key is re-derived from
+    /// `at_rest_key` rather than being process-lifetime state.
+    #[test]
+    fn a_contact_record_survives_a_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let l = label(0x6B);
+        let root = {
+            let p = persist(dir.path());
+            seed_contact(&p, &l, contact(FIRST_SEEN, LAST_SEEN));
+            p.read_contact(&l)
+                .expect("reads")
+                .expect("there")
+                .address_root()
+                .expect("derives")
+        };
+
+        let p = persist(dir.path());
+        let stored = p
+            .read_contact(&l)
+            .expect("reads")
+            .expect("the record did not survive the process that wrote it");
+        assert_eq!(stored.first_seen_ms(), FIRST_SEEN);
+        assert_eq!(stored.last_seen_ms(), LAST_SEEN);
+        assert_eq!(stored.pk_pc(), pk(0x80).as_ref());
+        assert_eq!(
+            stored.address_root().expect("derives"),
+            root,
+            "ss0 did not survive the restart"
+        );
+    }
+
+    /// A record's file moved into another correspondence's slot does not open:
+    /// the store's seal binds the [`CorrespondenceLabel`] as AAD, and this kind
+    /// has no second seal behind it.
+    #[test]
+    fn a_contact_record_moved_between_correspondences_does_not_open() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let (from, to) = (label(0x6C), label(0x6D));
+
+        seed_contact(&p, &from, contact_tagged(0x01, FIRST_SEEN, LAST_SEEN));
+        // Establish the destination the ordinary way, then overwrite its file
+        // with the source's bytes.
+        seed_contact(&p, &to, contact_tagged(0x02, FIRST_SEEN, LAST_SEEN));
+        let stolen = std::fs::read(record_path(&p, &from, "contact-cache.bin")).expect("reads");
+        assert_ne!(
+            stolen,
+            std::fs::read(record_path(&p, &to, "contact-cache.bin")).expect("reads"),
+            "the two correspondences hold the same bytes, so this test moves nothing"
+        );
+        std::fs::write(record_path(&p, &to, "contact-cache.bin"), &stolen).expect("writes");
+
+        match p
+            .read_contact(&to)
+            .expect_err("a record from another correspondence's slot opened")
+        {
+            DmPersistError::Store(DmStoreError::NotAuthentic {
+                kind: RecordKind::ContactCache,
+            }) => {}
+            other => panic!("wrong error: {other:?}"),
+        }
+    }
+
+    /// A contact update that changes nothing spends **no seal** (#347).
+    ///
+    /// **Two assertions, and the first is what makes the second mean anything.**
+    /// A real mutation has to move the counter, or "zero seals" is
+    /// indistinguishable from an instrument that never counts.
+    #[test]
+    fn a_no_op_contact_update_spends_no_seal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0x62);
+
+        let before_seed = p.store().seal_count();
+        seed_contact(&p, &l, contact(FIRST_SEEN, LAST_SEEN));
+        let after_seed = p.store().seal_count();
+        assert_eq!(
+            after_seed - before_seed,
+            1,
+            "a seeding update must spend exactly one seal — the delta, not \
+             `> 0`, is what makes the rest of this test mean anything"
+        );
+
+        p.update_contact(
+            &l,
+            || panic!("a record exists"),
+            |_| Ok(Mutation::Unchanged(())),
+        )
+        .expect("updates");
+        assert_eq!(
+            p.store().seal_count(),
+            after_seed,
+            "an update that changed nothing must not seal"
+        );
+
+        // The sweep's shape: a sighting `observed_at` refuses outright.
+        p.update_contact(
+            &l,
+            || panic!("a record exists"),
+            |c| Ok(observe(c, FIRST_SEEN + 1)),
+        )
+        .expect("updates");
+        assert_eq!(
+            p.store().seal_count(),
+            after_seed,
+            "a refused sighting must not seal"
+        );
+    }
+
+    /// **A re-record of the instant already stored must not seal**, and it is
+    /// the case the obvious idiom gets wrong: `observed_at` guards
+    /// `at_ms < last_seen_ms`, so the equal case returns `true` while changing
+    /// nothing, and a `Mutation` derived from that bool spends a seal per tick
+    /// per contact — the very cost the conditional shape exists to avoid.
+    #[test]
+    fn an_idempotent_re_record_of_a_contact_spends_no_seal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0x6E);
+
+        seed_contact(&p, &l, contact(FIRST_SEEN, LAST_SEEN));
+        let after_seed = p.store().seal_count();
+
+        // Positive control on the trap: the bool alone says "recorded", so an
+        // idiom keying `Mutation` on it would report `Changed` here.
+        let mut in_memory = contact(FIRST_SEEN, LAST_SEEN);
+        assert!(
+            in_memory.observed_at(LAST_SEEN),
+            "the equal case is refused, so this test guards nothing"
+        );
+
+        let moved = p
+            .update_contact(
+                &l,
+                || panic!("a record exists"),
+                |c| {
+                    assert_eq!(c.last_seen_ms(), LAST_SEEN, "the fixture is not at rest");
+                    Ok(observe(c, LAST_SEEN))
+                },
+            )
+            .expect("updates");
+
+        assert!(!moved, "a re-record of the stored instant moved the stamp");
+        assert_eq!(
+            p.store().seal_count(),
+            after_seed,
+            "re-recording the stored instant spent a seal"
+        );
+    }
+
+    /// Asking whether a correspondent is known must not answer itself into
+    /// existence (#253) — the reason the reader takes no lock.
+    #[test]
+    fn an_absent_contact_is_none_and_the_question_creates_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0x63);
+        let before = p.store().seal_count();
+        let correspondence_dir = p.store().root().join(hex::encode(l.as_bytes()));
+
+        assert!(p.read_contact(&l).expect("reads").is_none());
+        assert!(
+            !correspondence_dir.exists(),
+            "asking whether a correspondent is known established the correspondence"
+        );
+        assert_eq!(
+            p.store().seal_count() - before,
+            0,
+            "a question spent a seal"
+        );
+    }
+
+    /// **A seeded record is written whatever `f` reports.** The seed carries
+    /// `pk_lt`, `pk_pc` and `ss0` — three facts with no other home — and the
+    /// losing call is the ordinary one: seed at the local clock, then record a
+    /// sighting stamped earlier. `observed_at` refuses it and `f` honestly says
+    /// `Unchanged`; under `update_outbox`'s rule the correspondent would stay
+    /// unknown, with no error and no trace, and every later tick would re-seed
+    /// and lose it again.
+    #[test]
+    fn a_seeded_contact_record_is_written_even_when_f_reports_unchanged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0x6F);
+        let before = p.store().seal_count();
+
+        // The frame's stamp is behind the clock the seed was built at, which is
+        // what makes the refusal below the honest report and not a contrivance.
+        let recorded = p
+            .update_contact(
+                &l,
+                || Ok(contact(FIRST_SEEN, LAST_SEEN)),
+                |c| Ok(observe(c, LAST_SEEN - 1)),
+            )
+            .expect("seeds");
+        assert!(
+            !recorded,
+            "the earlier sighting was taken, so this test never reaches the Unchanged arm"
+        );
+
+        let stored = p
+            .read_contact(&l)
+            .expect("reads")
+            .expect("the seeded record was destroyed by an Unchanged report");
+        assert_eq!(stored.first_seen_ms(), FIRST_SEEN);
+        assert_eq!(stored.last_seen_ms(), LAST_SEEN);
+        assert_eq!(stored.pk_pc(), pk(0x80).as_ref());
+        assert_eq!(
+            p.store().seal_count() - before,
+            1,
+            "seeding must spend exactly one seal — and exactly one, so the \
+             write is the seed's and not a second one"
+        );
+
+        // And the seal is per correspondence for its life, not per tick: the
+        // record now exists, so a later no-op takes the stored path and is free.
+        p.update_contact(
+            &l,
+            || panic!("a record exists"),
+            |_| Ok(Mutation::Unchanged(())),
+        )
+        .expect("updates");
+        assert_eq!(
+            p.store().seal_count() - before,
+            1,
+            "a no-op after seeding spent a seal"
+        );
+    }
+
+    /// **The oracle for read-modify-write.** The closure sees what is on disk,
+    /// never the seed — so a caller holding a stale record cannot displace
+    /// `first_seen_ms`, rewind an advanced `last_seen_ms`, or substitute a key.
+    /// The seed disagrees in every stored field, so each assertion kills
+    /// independently of the flag that pins the seed as unbuilt.
+    #[test]
+    fn a_contact_update_sees_the_stored_record_and_never_the_seed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0x64);
+        let seed_built = std::cell::Cell::new(false);
+
+        seed_contact(&p, &l, contact_tagged(0x01, FIRST_SEEN, LAST_SEEN));
+        let stored_root = p
+            .read_contact(&l)
+            .expect("reads")
+            .expect("there")
+            .address_root()
+            .expect("derives");
+
+        p.update_contact(
+            &l,
+            || {
+                seed_built.set(true);
+                Ok(contact_tagged(0x02, FIRST_SEEN + 1, LAST_SEEN + 1))
+            },
+            |c| {
+                assert_eq!(
+                    c.first_seen_ms(),
+                    FIRST_SEEN,
+                    "the seed's first_seen displaced the stored one"
+                );
+                assert_eq!(
+                    c.last_seen_ms(),
+                    LAST_SEEN,
+                    "the seed's last_seen displaced the stored one"
+                );
+                assert_eq!(
+                    c.pk_lt(),
+                    pk(0x01).as_ref(),
+                    "the seed's long-term key displaced the stored one"
+                );
+                assert_eq!(
+                    c.address_root().expect("derives"),
+                    stored_root,
+                    "the seed's ss0 displaced the stored one"
+                );
+                Ok(Mutation::Unchanged(()))
+            },
+        )
+        .expect("updates");
+
+        assert!(
+            !seed_built.get(),
+            "the seed was built for a correspondence that already has a record"
+        );
+    }
+
+    /// The monotonic guard runs against the **stored** stamp, and a refusal
+    /// writes nothing — the whole reason this is one critical section.
+    #[test]
+    fn a_contact_sighting_that_would_rewind_the_stored_stamp_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0x65);
+
+        seed_contact(&p, &l, contact(FIRST_SEEN, LAST_SEEN));
+
+        // Positive control: a later sighting IS taken and IS persisted, so the
+        // refusal below is the guard and not a mutator that stopped working.
+        let moved = p
+            .update_contact(
+                &l,
+                || panic!("a record exists"),
+                |c| Ok(observe(c, LAST_SEEN + 1_000)),
+            )
+            .expect("updates");
+        assert!(moved, "a later sighting was refused");
+        assert_eq!(
+            p.read_contact(&l)
+                .expect("reads")
+                .expect("there")
+                .last_seen_ms(),
+            LAST_SEEN + 1_000
+        );
+
+        // The rewind: after the fixture's own LAST_SEEN, so a guard that only
+        // checked `first_seen_ms` would admit it.
+        const { assert!(FIRST_SEEN < LAST_SEEN, "the fixture straddles no guard") };
+        let moved = p
+            .update_contact(
+                &l,
+                || panic!("a record exists"),
+                |c| Ok(observe(c, LAST_SEEN)),
+            )
+            .expect("updates");
+        assert!(!moved, "an earlier sighting rewound the stored stamp");
+        assert_eq!(
+            p.read_contact(&l)
+                .expect("reads")
+                .expect("there")
+                .last_seen_ms(),
+            LAST_SEEN + 1_000,
+            "a refused sighting moved the stored stamp"
+        );
+    }
+
+    /// A failing closure writes nothing: the record is exactly what it was, so a
+    /// caller may retry without having half-applied anything.
+    #[test]
+    fn a_failed_contact_update_leaves_the_record_untouched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0x70);
+
+        seed_contact(&p, &l, contact(FIRST_SEEN, LAST_SEEN));
+        let before = std::fs::read(record_path(&p, &l, "contact-cache.bin")).expect("reads");
+        let seals = p.store().seal_count();
+
+        // Annotated because the closure only ever takes its `Err` arm, which
+        // leaves `T` with nothing to infer it from.
+        let err: Result<(), DmPersistError> = p.update_contact(
+            &l,
+            || panic!("a record exists"),
+            |c| {
+                // A real change, made before the refusal: the write must not
+                // ride out on it.
+                assert!(c.observed_at(LAST_SEEN + 1), "the fixture did not mutate");
+                Err(DmPersistError::Contact(
+                    ContactCacheError::TimestampsOutOfOrder {
+                        first_seen_ms: FIRST_SEEN,
+                        last_seen_ms: FIRST_SEEN - 1,
+                    },
+                ))
+            },
+        );
+        assert!(
+            matches!(
+                err,
+                Err(DmPersistError::Contact(
+                    ContactCacheError::TimestampsOutOfOrder { .. }
+                ))
+            ),
+            "wrong error: {err:?}"
+        );
+
+        assert_eq!(
+            std::fs::read(record_path(&p, &l, "contact-cache.bin")).expect("reads"),
+            before,
+            "a failed update wrote to the record"
+        );
+        assert_eq!(
+            p.store().seal_count(),
+            seals,
+            "a failed update spent a seal"
+        );
+    }
+
+    /// A payload of the wrong length is refused **by length**, not read as a
+    /// field that landed wrong.
+    ///
+    /// The store's own `WrongFileLen` cannot catch this: a sealed kind is padded
+    /// to its bucket and carries its true length in an interior prefix, so every
+    /// short payload is one file size on disk and the length check that matters
+    /// is the record's own.
+    #[test]
+    fn a_truncated_contact_record_is_refused_by_length() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0x66);
+        let encoded = contact(FIRST_SEEN, LAST_SEEN).encode();
+
+        // Positive control: written whole, through the same path, it reads.
+        write_contact_bytes(&p, &l, &encoded);
+        p.read_contact(&l).expect("reads").expect("present");
+
+        for len in [0, 1, CONTACT_RECORD_LEN - 1] {
+            write_contact_bytes(&p, &l, &encoded[..len]);
+            let err = p
+                .read_contact(&l)
+                .expect_err("a record of the wrong length was accepted");
+            match &err {
+                DmPersistError::Contact(ContactCacheError::WrongLength { expected, actual }) => {
+                    assert_eq!(*expected, CONTACT_RECORD_LEN);
+                    assert_eq!(*actual, len);
+                }
+                other => panic!("wrong error for a {len}-byte record: {other:?}"),
+            }
+            // The rendered form is what a caller surfaces, and it must name the
+            // record rather than reporting a bare number from nowhere.
+            let rendered = err.to_string();
+            assert!(
+                rendered.starts_with("contact record: ") && rendered.contains(&len.to_string()),
+                "unhelpful rendering: {rendered}"
+            );
+        }
+    }
+
+    /// A same-length record this build does not read fails **by name**, so a
+    /// future shape change cannot be mis-parsed as this one — and a corrupt
+    /// record is refused rather than degraded to `Ok(None)`.
+    #[test]
+    fn a_contact_record_with_a_wrong_version_byte_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0x67);
+        let mut bytes = contact(FIRST_SEEN, LAST_SEEN).encode().to_vec();
+
+        bytes[0] = CONTACT_RECORD_VERSION + 1;
+        write_contact_bytes(&p, &l, &bytes);
+        let err = p
+            .read_contact(&l)
+            .expect_err("a record from an unknown version was accepted");
+        match &err {
+            DmPersistError::Contact(ContactCacheError::UnsupportedVersion { found, expected }) => {
+                assert_eq!(*found, CONTACT_RECORD_VERSION + 1);
+                assert_eq!(*expected, CONTACT_RECORD_VERSION);
+            }
+            other => panic!("wrong error: {other:?}"),
+        }
+        assert!(
+            err.to_string().starts_with("contact record: "),
+            "unhelpful rendering: {err}"
+        );
+
+        // Positive control: restored, the same bytes through the same path read.
+        bytes[0] = CONTACT_RECORD_VERSION;
+        write_contact_bytes(&p, &l, &bytes);
+        p.read_contact(&l).expect("reads").expect("present");
+    }
+
+    /// **A stored record that will not decode wedges every later update**, and
+    /// does not fall through to the seed. Re-seeding would overwrite
+    /// `first_seen_ms` and a live `ss0` on a path no caller asked to be
+    /// destructive; `commit_resume` fails closed for the same reason. Without
+    /// this test a "recover by re-seeding" edit passes the whole suite, because
+    /// the corruption tests above only exercise the reader.
+    #[test]
+    fn a_corrupt_contact_record_wedges_every_update() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0x71);
+        let mut bytes = contact(FIRST_SEEN, LAST_SEEN).encode().to_vec();
+        bytes[0] = CONTACT_RECORD_VERSION + 1;
+        write_contact_bytes(&p, &l, &bytes);
+        let seals = p.store().seal_count();
+
+        // Annotated for `a_failed_contact_update_leaves_the_record_untouched`'s
+        // reason: a closure that only diverges infers no `T`.
+        let err: Result<(), DmPersistError> = p.update_contact(
+            &l,
+            || panic!("the update recovered from a corrupt record by re-seeding"),
+            |_| panic!("the closure ran against a record that does not decode"),
+        );
+        assert!(
+            matches!(
+                err,
+                Err(DmPersistError::Contact(
+                    ContactCacheError::UnsupportedVersion { .. }
+                ))
+            ),
+            "wrong error: {err:?}"
+        );
+        assert_eq!(
+            p.store().seal_count(),
+            seals,
+            "a wedged update wrote something"
+        );
+
+        // And the bytes are still there for whatever decides what to do about
+        // them — refusing must not be a slow delete.
+        assert_eq!(
+            std::fs::read(record_path(&p, &l, "contact-cache.bin"))
+                .expect("reads")
+                .len(),
+            RecordKind::ContactCache.on_disk_len()
+        );
+    }
+
+    /// An `Unchanged` report that is not true is caught in debug builds, rather
+    /// than silently discarding the caller's sighting.
+    ///
+    /// This is the one error [`Mutation`] cannot refuse by construction: the
+    /// type forces an answer and cannot force a true one. It is checked on the
+    /// stored path only — on the seeded path the write happens regardless, so
+    /// there is nothing a false report can lose.
+    #[test]
+    #[should_panic(expected = "reported Mutation::Unchanged after changing the")]
+    #[cfg(debug_assertions)]
+    fn a_lying_unchanged_contact_report_is_caught_in_debug_builds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0x68);
+
+        seed_contact(&p, &l, contact(FIRST_SEEN, LAST_SEEN));
+
+        let _ = p.update_contact(
+            &l,
+            || panic!("a record exists"),
+            |c| {
+                assert!(
+                    c.observed_at(LAST_SEEN + 5),
+                    "the fixture's mutation was refused"
+                );
+                // The lie: a real sighting reported as no change at all.
+                Ok(Mutation::Unchanged(()))
+            },
+        );
+    }
+
+    /// Two correspondences do not share a contact record.
+    #[test]
+    fn a_contact_record_is_per_correspondence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+
+        seed_contact(&p, &label(0x69), contact(FIRST_SEEN, LAST_SEEN));
+        assert!(
+            p.read_contact(&label(0x6A)).expect("reads").is_none(),
+            "one correspondence's contact record was visible to another"
         );
     }
 }
