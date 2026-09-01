@@ -62,6 +62,31 @@
 //! and without a per-slot binding every file in a profile would be an
 //! interchangeable ciphertext.
 //!
+//! ## Two scopes: per-correspondence, and per-profile
+//!
+//! Almost every kind is per-correspondence, and everything above is written for
+//! those. [`RecordKind::scope`] names the exception: a **profile-level** record
+//! belongs to the profile itself, lives as a fixed-name file at the store root,
+//! takes the profile's own lock ([`DmStore::profile_critical_section`]), and
+//! seals under [`domain::DM_STORE_PROFILE_AAD`] — which binds the kind and, of
+//! necessity, no label.
+//!
+//! **The scope is forced by the data, not chosen for convenience.**
+//! [`RecordKind::BlockList`] names identities a user refuses, and refusing
+//! somebody does not require ever having corresponded with them — the doorbell
+//! plane exists precisely for the stranger's first contact — so there is no
+//! correspondence whose directory could hold it. Reserving a
+//! [`CorrespondenceLabel`] value for it is not available either:
+//! [`CorrespondenceLabel::from_bytes`] is a `const fn` over any 32 bytes and
+//! [`CorrespondenceLabel::mint`] draws them from the CSPRNG, so every 32-byte
+//! value is a real label and no reserved one is distinguishable from a minted
+//! one.
+//!
+//! Everything else is inherited rather than re-implemented: one padding, one
+//! seal, one atomic replace, one orphan sweep — and the sweep covers root-level
+//! temp siblings for that reason, since a profile record's `replace_atomically`
+//! sibling lands at the root.
+//!
 //! **One key, random nonces, and no bound on the number of seals.**
 //! `derive_store_key` produces a single AES-256-GCM key per profile, and
 //! `seal_envelope` draws a fresh random 96-bit nonce for every record it
@@ -168,6 +193,7 @@ use zeroize::Zeroize;
 
 use crate::aead_envelope::{EnvelopeError, open_envelope, seal_envelope};
 use crate::circle::message::{NONCE_LEN, TAG_LEN};
+use crate::dm::block_list::BLOCK_LIST_CAPACITY;
 use crate::dm::contact_cache::CONTACT_RECORD_LEN;
 use crate::dm::provisional::PROVISIONAL_RECORD_LEN;
 use crate::dm::resume::MAX_ENCODED_LEN;
@@ -357,17 +383,55 @@ pub enum RecordKind {
     /// is no second layer behind it. `crate::dm::contact_cache` argues why the
     /// record has no seal of its own.
     ContactCache,
+    /// The identities this profile refuses ([`crate::dm::block_list::BlockList`])
+    /// — the one kind that belongs to the **profile** rather than to a
+    /// correspondence.
+    ///
+    /// **It has no correspondence label because a block does not have one.** A
+    /// blocked identity is one there need never have been an established
+    /// correspondence with — that is the doorbell plane's whole case — so there
+    /// is no directory it could live in. Its file sits at the store root, its
+    /// AAD binds [`domain::DM_STORE_PROFILE_AAD`] and this kind's tag and
+    /// nothing else, and [`DmStore::profile_critical_section`] is the lock that
+    /// brackets a change to it.
+    ///
+    /// **Created by every [`DmStore::open`]**, so its presence reports only that
+    /// a profile has a DM store, never that anyone has blocked anybody. The
+    /// bucket is [`crate::dm::block_list::BLOCK_LIST_CAPACITY`] — the ratified
+    /// 512-identity ceiling in full — so the file is one size whether it holds
+    /// nobody or all 512.
+    BlockList,
+}
+
+/// Whether a [`RecordKind`] belongs to one correspondence or to the profile.
+///
+/// The two differ in three things that all follow from the same fact: a
+/// profile-level record has no [`CorrespondenceLabel`]. It has no directory (it
+/// sits at the root), no label in its AAD, and its own lock rather than a
+/// correspondence's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RecordScope {
+    /// One record per correspondence, inside that correspondence's directory.
+    Correspondence,
+    /// One record per profile, at the store root.
+    Profile,
 }
 
 impl RecordKind {
     /// Every kind, for enumeration. Hand-maintained, and held to the enum by
     /// `record_kind_all_is_complete`.
-    pub const ALL: [RecordKind; 5] = [
+    ///
+    /// **Spans both scopes**, so a caller enumerating one correspondence's
+    /// records filters on [`RecordKind::scope`] rather than walking this
+    /// directly — [`DmStore::present_unlocked`] is that filter and is the only
+    /// enumeration a caller needs.
+    pub const ALL: [RecordKind; 6] = [
         RecordKind::Resume,
         RecordKind::Provisional,
         RecordKind::Outbox,
         RecordKind::ReceiveCursor,
         RecordKind::ContactCache,
+        RecordKind::BlockList,
     ];
 
     /// The stable string form, for local persistence.
@@ -377,7 +441,7 @@ impl RecordKind {
     /// silently rewrite history, which is the same reason
     /// [`crate::trust_events`] stores event keys by string; a file name is a
     /// storage-layout detail that a later layout change would be free to move,
-    /// and a persisted log must not be hostage to that. These five strings are
+    /// and a persisted log must not be hostage to that. These strings are
     /// frozen once written to a log.
     pub const fn stable_str(self) -> &'static str {
         match self {
@@ -386,6 +450,7 @@ impl RecordKind {
             RecordKind::Outbox => "outbox",
             RecordKind::ReceiveCursor => "receive-cursor",
             RecordKind::ContactCache => "contact-cache",
+            RecordKind::BlockList => "block-list",
         }
     }
 
@@ -408,13 +473,14 @@ impl RecordKind {
     /// makes name-derived enumeration immune to orphaned temp siblings without
     /// having to filter them out. `record_names_cannot_collide_with_a_temp_sibling`
     /// pins that.
-    const fn file_name(self) -> &'static str {
+    pub(crate) const fn file_name(self) -> &'static str {
         match self {
             RecordKind::Resume => "resume.bin",
             RecordKind::Provisional => "provisional.bin",
             RecordKind::Outbox => "outbox.bin",
             RecordKind::ReceiveCursor => "cursor.bin",
             RecordKind::ContactCache => "contact-cache.bin",
+            RecordKind::BlockList => "block-list.bin",
         }
     }
 
@@ -433,6 +499,9 @@ impl RecordKind {
             // As with `Provisional`: the record is already one fixed size by
             // construction, so the store's bucket is exactly it.
             RecordKind::ContactCache => CONTACT_RECORD_LEN,
+            // The ratified 512-identity ceiling in full, so the record's size
+            // never reports how many of those slots are used.
+            RecordKind::BlockList => BLOCK_LIST_CAPACITY,
         }
     }
 
@@ -482,6 +551,38 @@ impl RecordKind {
             // seal it does not have to invent a value that might collide.
             RecordKind::ReceiveCursor => 4,
             RecordKind::ContactCache => 5,
+            RecordKind::BlockList => 6,
+        }
+    }
+
+    /// Refuse this kind if it does not belong to `guard`'s scope.
+    ///
+    /// **A returned error, not a `debug_assert`.** The guards are `pub` over one
+    /// `pub` enum spanning both scopes, so a mismatch is caller-reachable in a
+    /// release build, where an assertion does not exist. See
+    /// [`DmStoreError::WrongScope`] for what each direction would otherwise
+    /// write.
+    fn require_scope(self, guard: RecordScope) -> Result<(), DmStoreError> {
+        if self.scope() == guard {
+            Ok(())
+        } else {
+            Err(DmStoreError::WrongScope { kind: self, guard })
+        }
+    }
+
+    /// Whether this kind belongs to one correspondence or to the profile.
+    ///
+    /// A method rather than a second hand-maintained array: a new variant that
+    /// forgot to say which it is fails to compile here, where a variant missing
+    /// from an array would silently vanish from every enumeration.
+    pub const fn scope(self) -> RecordScope {
+        match self {
+            RecordKind::Resume
+            | RecordKind::Provisional
+            | RecordKind::Outbox
+            | RecordKind::ReceiveCursor
+            | RecordKind::ContactCache => RecordScope::Correspondence,
+            RecordKind::BlockList => RecordScope::Profile,
         }
     }
 }
@@ -600,11 +701,52 @@ fn derive_store_key(at_rest_key: &[u8; AEAD_KEY_LEN]) -> Result<Aes256Key, DmSto
 /// channel resumes as the wrong correspondent. Without the kind, two records of
 /// the same size in one correspondence are interchangeable ciphertexts.
 fn seal_aad(label: &CorrespondenceLabel, kind: RecordKind) -> Vec<u8> {
+    // No scope assertion here, deliberately. The scope is enforced at every
+    // guard door by `RecordKind::require_scope`, which is a returned error and
+    // therefore exists in the build that ships; an assertion here would add
+    // nothing to that and would make the one thing worth proving untestable —
+    // `a_record_sealed_in_one_scope_does_not_open_in_the_other` builds the
+    // *wrong* AAD on purpose and shows the record refuses to open under it.
     let mut aad = Vec::with_capacity(domain::DM_STORE_AAD.len() + CORRESPONDENCE_LABEL_LEN + 32);
     aad.extend_from_slice(domain::DM_STORE_AAD);
     push_lp(&mut aad, label.as_bytes());
     push_lp(&mut aad, &[kind.aad_tag()]);
     aad
+}
+
+/// The AAD a **profile-level** record's seal binds: its own domain label, then
+/// the record-kind tag, length-prefixed.
+///
+/// **One field, because there is only one to bind.** A profile record has no
+/// correspondence — that is what makes it profile-level — so the label
+/// [`seal_aad`] binds has no value here, and binding a placeholder would invent
+/// a correspondence that does not exist. What replaces it is the separate domain
+/// prefix: [`domain::DM_STORE_PROFILE_AAD`] rather than
+/// [`domain::DM_STORE_AAD`], so the two constructions have fixed and different
+/// field lists and neither can be parsed as the other.
+///
+/// The kind tag is still load-bearing and is shared with [`seal_aad`]'s space:
+/// tags are unique across every kind in both scopes, so a second profile kind
+/// can never open as this one.
+fn profile_seal_aad(kind: RecordKind) -> Vec<u8> {
+    // See `seal_aad` for why this deliberately does not assert the scope.
+    let mut aad = Vec::with_capacity(domain::DM_STORE_PROFILE_AAD.len() + 8);
+    aad.extend_from_slice(domain::DM_STORE_PROFILE_AAD);
+    push_lp(&mut aad, &[kind.aad_tag()]);
+    aad
+}
+
+/// The AAD for whichever scope `label` names: `Some` for a correspondence
+/// record, `None` for a profile one.
+///
+/// One dispatch, used by the read and the write alike, so the two cannot come to
+/// disagree about which construction a kind is sealed under — which would
+/// present as every record of that kind failing to authenticate.
+fn aad_for(label: Option<&CorrespondenceLabel>, kind: RecordKind) -> Vec<u8> {
+    match label {
+        Some(label) => seal_aad(label, kind),
+        None => profile_seal_aad(kind),
+    }
 }
 
 /// Pad `payload` out to `kind`'s bucket: `len(4, LE) ‖ payload ‖ CSPRNG filler`.
@@ -644,15 +786,17 @@ fn pad_with_filler(kind: RecordKind, payload: &[u8]) -> Result<Vec<u8>, DmStoreE
     Ok(buf)
 }
 
-/// The root of a profile's DM records: one directory per correspondence, one
-/// fixed-size file per record kind inside it.
+/// The root of a profile's DM records: one directory per correspondence with one
+/// fixed-size file per correspondence record kind inside it, plus one
+/// fixed-size file at the root per profile record kind.
 ///
 /// Holds the derived seal key, so no call site ever passes one and no call site
 /// can pass the wrong one.
 pub struct DmStore {
     root: PathBuf,
     key: Aes256Key,
-    /// Which thread holds a [`Locked`] guard for which label, right now.
+    /// Which thread holds a [`Locked`] or [`LockedProfile`] guard for which
+    /// lock, right now.
     ///
     /// `flock` attaches to the open file description, not to the thread, so a
     /// second [`FileLock::acquire`] on a lock this same thread already holds
@@ -703,13 +847,30 @@ impl DmStore {
     /// passphrase the profile already has, and the store never holds a secret
     /// with a lifetime of its own.
     ///
-    /// **The sweep is not under any lock, and does not need to be.** It removes
-    /// only names containing `TMP_INFIX`, and a live writer's sibling has a
-    /// CSPRNG suffix no other process can predict; removing one under a
-    /// concurrent writer would cost that writer its in-flight write, reported as
-    /// [`AtomicReplaceError::NotLanded`] or `Indeterminate`, never a committed
-    /// record. Two stores opening at once can only race to remove the same dead
-    /// file, and a `NotFound` on removal is not an error.
+    /// **The correspondence sweep is not under any lock, and does not need to
+    /// be.** It removes only names containing `TMP_INFIX`, and a live writer's
+    /// sibling has a CSPRNG suffix no other process can predict; removing one
+    /// under a concurrent writer would cost that writer its in-flight write,
+    /// reported as [`AtomicReplaceError::NotLanded`] or `Indeterminate`, never a
+    /// committed record. Two stores opening at once can only race to remove the
+    /// same dead file, and a `NotFound` on removal is not an error.
+    ///
+    /// **The ROOT sweep is different and does take the lock, because that
+    /// argument does not survive at the root.** A profile record's writer holds
+    /// the profile lock across its whole read-modify-write, so an unlocked sweep
+    /// can land between that writer's scrub-free `rename(2)` and its cleanup:
+    /// scrub the temp file *after* the rename committed it and the live record
+    /// is a zeroed inode that every later read reports as
+    /// [`DmStoreError::ErasureInterrupted`]. That is a committed record lost,
+    /// which is precisely what the paragraph above promises cannot happen — so
+    /// the root branch runs inside [`Self::profile_critical_section`], where no
+    /// writer can be mid-commit.
+    ///
+    /// **Opening a store never blocks on that lock and never fails because of
+    /// it.** The profile housekeeping takes the lock with
+    /// [`FileLock::try_acquire`] and skips its whole body when another holder
+    /// has it; the holder is itself a store that has done, or is doing, exactly
+    /// that work.
     pub fn open(
         root: impl Into<PathBuf>,
         at_rest_key: &[u8; AEAD_KEY_LEN],
@@ -725,7 +886,120 @@ impl DmStore {
             seals: AtomicU64::new(0),
         };
         store.sweep_orphans()?;
+        store.tend_profile_records();
         Ok(store)
+    }
+
+    /// Sweep the root's own temp siblings and bring every profile-level record
+    /// into existence, empty, if it is not already there — **best-effort, under
+    /// the profile lock, and never able to stop a store opening.**
+    ///
+    /// **Why the record is created at open at all.** One created the first time
+    /// someone blocks somebody would make its presence the answer to "does this
+    /// user block anyone", readable from the disk with no key — the same class
+    /// of leak the fixed size exists to close, and enough to make the fixed size
+    /// pointless. Created for every profile, its existence reports only that a
+    /// DM store was opened.
+    ///
+    /// **Returns nothing, and that is deliberate.** The sweep beside it
+    /// ([`Self::sweep_orphans`]) already argues this case: a failure here must
+    /// not make the whole store unopenable, because every correspondence read —
+    /// none of which touches this record — would go with it. A read-only mount,
+    /// a full disk or a lost permission would otherwise brick every profile that
+    /// predates this record, on a path none of them asked for. What is lost by
+    /// failing soft is bounded and lands where it can be seen:
+    /// [`crate::dm::persist::DmPersist::read_block_list`] refuses a missing
+    /// record loudly rather than reading it as "nobody is blocked".
+    ///
+    /// **The lock is taken with [`FileLock::try_acquire`], so `open` cannot
+    /// hang.** [`Self::profile_critical_section`] blocks by design and is held
+    /// across caller-supplied closures of unbounded duration; making a *startup*
+    /// path wait on that would let one process inside `update_block_list` stall
+    /// every other process's `open` with no timeout and no error — and, within
+    /// one process, two `DmStore`s on one root have separate held-sets, so an
+    /// `open` nested inside a profile section would block on the first fd's
+    /// `flock` for ever (`flock(2)` does not pass on a second descriptor). When
+    /// the lock is already held, this skips its whole body: the holder is
+    /// itself a store that has done, or is doing, exactly this work.
+    ///
+    /// **The skip has one transient, and it fails closed.** A second opener can
+    /// find the lock held in the window after the first takes it and before the
+    /// record is written, and so returns with the record still absent. A read
+    /// then refuses with `BlockListMissing` rather than reporting that nobody is
+    /// blocked, and the next open retries because the presence check is re-run
+    /// under the lock every time. The window is real; what it cannot do is
+    /// unblock anyone.
+    ///
+    /// **The check and the write are both inside the lock.** Two opens racing
+    /// would otherwise both find the record absent and both create it, and the
+    /// loser's write would land on top of the winner's — no loss today, when the
+    /// created value is always empty, and a silent reset of a real block list
+    /// the moment anything else is ever created here.
+    ///
+    /// An empty payload is the empty record: it is padded and sealed like any
+    /// other, so the file is its kind's full fixed size from the first open.
+    fn tend_profile_records(&self) {
+        let Ok(claim) = self.claim(LockScope::Profile) else {
+            return;
+        };
+        let lock_path = self.root.join(LOCK_FILE_NAME);
+        let Ok(Some(lock)) = FileLock::try_acquire(&lock_path) else {
+            return;
+        };
+        let mut guard = LockedProfile {
+            store: self,
+            _lock: lock,
+            _claim: claim,
+        };
+
+        // Inside the lock, so no profile writer can be between its `rename(2)`
+        // and its cleanup while this scrubs.
+        let _ = self.sweep_root_orphans();
+
+        for kind in RecordKind::ALL
+            .into_iter()
+            .filter(|k| k.scope() == RecordScope::Profile)
+        {
+            // Presence, not readability. A record that exists and will not open
+            // is a record with something in it, and re-creating it here would
+            // answer an unreadable block list by silently unblocking everybody —
+            // at every start, on a path nobody asked to be destructive. It is
+            // left exactly where it is, to fail loudly at the read that wants it.
+            if matches!(guard.present(kind), Ok(false)) {
+                let _ = guard.replace(kind, &[]);
+            }
+        }
+    }
+
+    /// Remove the root's own orphaned temp siblings, returning how many went.
+    ///
+    /// [`Self::sweep_orphans`]'s body for the one directory that also holds
+    /// records: a profile record's target *is* the root, so
+    /// `replace_atomically` leaves its sibling there and a sweep that only
+    /// descended into correspondence directories would leave it for ever.
+    ///
+    /// **Called only from [`Self::tend_profile_records`], which holds the
+    /// profile lock.** Unlocked it could scrub a temp file whose `rename(2)`
+    /// has already committed it, turning a live record into a zeroed inode.
+    fn sweep_root_orphans(&self) -> Result<usize, DmStoreError> {
+        let mut removed = 0usize;
+        let entries = std::fs::read_dir(&self.root).map_err(|e| DmStoreError::io(&self.root, e))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| DmStoreError::io(&self.root, e))?;
+            // `read_dir`'s file type does not follow symlinks, so this is the
+            // real type of the entry itself.
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() || !is_temp_sibling(&entry.file_name()) {
+                continue;
+            }
+            if !remove_orphan(&entry.path(), file_type) {
+                continue;
+            }
+            removed += 1;
+        }
+        Ok(removed)
     }
 
     /// How many records this store has sealed since it was opened. **Test
@@ -745,9 +1019,81 @@ impl DmStore {
     /// supplied — the one place the two halves of a record's identity become a
     /// path, so [`Locked`] and the lock-free read cannot drift apart.
     fn record_path(&self, correspondence: &CorrespondenceLabel, kind: RecordKind) -> PathBuf {
+        debug_assert_eq!(
+            kind.scope(),
+            RecordScope::Correspondence,
+            "a profile record has no correspondence directory"
+        );
         self.root
             .join(correspondence.dir_name())
             .join(kind.file_name())
+    }
+
+    /// The path of a profile-level record. Derived, never supplied, exactly as
+    /// [`Self::record_path`] is — the difference is only that the profile is the
+    /// whole of the record's identity, so the file sits at the root.
+    ///
+    /// **It cannot collide with a correspondence directory.** Those are named by
+    /// [`CorrespondenceLabel::dir_name`], which is 64 lowercase hex characters
+    /// and contains no `.`; every record file name ends `.bin`.
+    fn profile_record_path(&self, kind: RecordKind) -> PathBuf {
+        debug_assert_eq!(
+            kind.scope(),
+            RecordScope::Profile,
+            "a correspondence record belongs in its correspondence's directory"
+        );
+        self.root.join(kind.file_name())
+    }
+
+    /// Seal `bytes` into `kind`'s bucket and replace the file at `path` with it.
+    ///
+    /// **The one write path, shared by both scopes**, so a profile record is
+    /// padded to its fixed size, sealed under its own AAD and committed by
+    /// `rename(2)` by exactly the code that does it for a correspondence
+    /// record — not by a second implementation that would be free to drift on
+    /// any of the three.
+    ///
+    /// It is private and takes a path, which is safe only because the two guards
+    /// are the only callers and each derives that path from a kind it has
+    /// already scoped. [`Locked::replace`] and [`LockedProfile::replace`] are the
+    /// doors; there is still no way to spell a write outside a lock.
+    fn write_record(
+        &self,
+        path: &Path,
+        label: Option<&CorrespondenceLabel>,
+        kind: RecordKind,
+        bytes: &[u8],
+    ) -> Result<(), DmStoreError> {
+        let sealed = if kind.is_sealed() {
+            let mut plain = pad_with_filler(kind, bytes)?;
+            let aad = aad_for(label, kind);
+            let outcome = seal_envelope(&self.key, &aad, &plain)
+                .map_err(|e| DmStoreError::from_envelope(kind, e));
+            plain.zeroize();
+            let sealed = outcome?;
+            // Counted after the seal succeeded, not before it is attempted: a
+            // failure inside `seal_envelope` draws no nonce, so counting the
+            // attempt would model a budget the failed call never spent.
+            #[cfg(test)]
+            self.seals.fetch_add(1, Ordering::Relaxed);
+            sealed
+        } else {
+            if bytes.len() != kind.capacity() {
+                return Err(DmStoreError::UnsealedPayloadNotExact {
+                    kind,
+                    expected: kind.capacity(),
+                    actual: bytes.len(),
+                });
+            }
+            bytes.to_vec()
+        };
+
+        debug_assert_eq!(
+            sealed.len(),
+            kind.on_disk_len(),
+            "every record of a kind is one size on disk"
+        );
+        replace_atomically(path, &sealed).map_err(|source| DmStoreError::Write { kind, source })
     }
 
     /// Read one record **without taking the lock, and without creating
@@ -781,9 +1127,10 @@ impl DmStore {
         correspondence: &CorrespondenceLabel,
         kind: RecordKind,
     ) -> Result<Option<Vec<u8>>, DmStoreError> {
+        kind.require_scope(RecordScope::Correspondence)?;
         self.read_record(
             &self.record_path(correspondence, kind),
-            correspondence,
+            Some(correspondence),
             kind,
         )
     }
@@ -807,7 +1154,14 @@ impl DmStore {
         correspondence: &CorrespondenceLabel,
     ) -> Result<Vec<RecordKind>, DmStoreError> {
         let mut present = Vec::new();
-        for kind in RecordKind::ALL {
+        // Correspondence kinds only. A profile record lives at the root and
+        // belongs to no correspondence, so asking after it here would report the
+        // same answer for every label and would be a fact about the profile
+        // wearing a correspondence's name.
+        for kind in RecordKind::ALL
+            .into_iter()
+            .filter(|k| k.scope() == RecordScope::Correspondence)
+        {
             let path = self.record_path(correspondence, kind);
             match std::fs::metadata(&path) {
                 Ok(_) => present.push(kind),
@@ -824,7 +1178,7 @@ impl DmStore {
     fn read_record(
         &self,
         path: &Path,
-        label: &CorrespondenceLabel,
+        label: Option<&CorrespondenceLabel>,
         kind: RecordKind,
     ) -> Result<Option<Vec<u8>>, DmStoreError> {
         let raw = match std::fs::read(path) {
@@ -863,7 +1217,7 @@ impl DmStore {
             return Ok(Some(raw));
         }
 
-        let aad = seal_aad(label, kind);
+        let aad = aad_for(label, kind);
         let mut plain = open_envelope(&self.key, &aad, &raw)
             .map_err(|e| DmStoreError::from_envelope(kind, e))?;
         // `unpad` bounds-checks the declared length against the buffer rather
@@ -900,9 +1254,10 @@ impl DmStore {
         let entries = std::fs::read_dir(&self.root).map_err(|e| DmStoreError::io(&self.root, e))?;
         for entry in entries {
             let entry = entry.map_err(|e| DmStoreError::io(&self.root, e))?;
-            // Only correspondence directories are swept. `replace_atomically`
-            // places a sibling next to its target, and every target this store
-            // names is inside one, so a temp file cannot land at the root.
+            // Correspondence directories only. The root's own temp siblings
+            // are swept by `sweep_root_orphans`, which runs under the profile
+            // lock — this sweep is unlocked, and unlocked it could scrub a
+            // profile record's sibling after the `rename(2)` that committed it.
             if !entry.file_type().is_ok_and(|t| t.is_dir()) {
                 continue;
             }
@@ -913,30 +1268,13 @@ impl DmStore {
                 if !is_temp_sibling(&candidate.file_name()) {
                     continue;
                 }
-                // Scrubbed first, for the same reason `delete` scrubs: the
-                // sibling may hold a whole sealed record, so unlinking it bare
-                // leaves recoverable ciphertext in unallocated blocks.
-                //
-                // **A sibling that cannot be scrubbed is skipped, not fatal, and
-                // the asymmetry with `delete` is deliberate.** This runs inside
-                // `DmStore::open`, so returning an error here makes the whole
-                // store unopenable — and a mode-0444 sibling, or a directory
-                // whose name happens to match, would brick it permanently for
-                // every correspondence. Skipping costs nothing that matters:
-                // the file stays exactly where it already was, unscrubbed, which
-                // is the state before this sweep existed. Unlinking it anyway is
-                // the one option that would be worse than both, since it
-                // launders the ciphertext out of reach while reporting success.
-                if scrub_orphan(&candidate.path()).is_err() {
+                let Ok(file_type) = candidate.file_type() else {
+                    continue;
+                };
+                if !remove_orphan(&candidate.path(), file_type) {
                     continue;
                 }
-                match std::fs::remove_file(candidate.path()) {
-                    Ok(()) => removed += 1,
-                    // Another store's sweep won the race; the file is gone
-                    // either way, which is all this cares about.
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(DmStoreError::io(&candidate.path(), e)),
-                }
+                removed += 1;
             }
         }
         Ok(removed)
@@ -994,7 +1332,9 @@ impl DmStore {
         // Claimed BEFORE the `flock` is attempted, which is the whole mechanism:
         // once the blocking acquire has begun there is no thread left to notice
         // that it will never finish.
-        let claim = self.claim(correspondence).map_err(E::from)?;
+        let claim = self
+            .claim(LockScope::Correspondence(*correspondence))
+            .map_err(E::from)?;
 
         let dir = self.root.join(correspondence.dir_name());
         let lock_path = dir.join(LOCK_FILE_NAME);
@@ -1013,18 +1353,93 @@ impl DmStore {
         f(&mut locked)
     }
 
-    /// Mark `correspondence` as held by the calling thread, or refuse if that
-    /// thread already holds it.
+    /// Read one profile-level record **without taking the lock**.
+    ///
+    /// [`DmStore::read_unlocked`]'s call, one scope up, and lock-free for the
+    /// same reason: the commit is `rename(2)`, so a reader sees the whole old
+    /// record or the whole new one and a lock buys it nothing.
+    ///
+    /// **Its second reason does not apply here, and that is worth saying rather
+    /// than inheriting.** A correspondence read avoids the lock partly because
+    /// taking it *establishes* the correspondence on disk; the profile record is
+    /// created by [`DmStore::open`] regardless, so there is nothing this call
+    /// could bring into existence by asking. What remains is the plain one:
+    /// asking whether an identity is blocked is a question with no write behind
+    /// it, and it is asked on the doorbell and channel paths where serialising
+    /// every reader behind an unrelated writer would be a real cost for no
+    /// correctness.
+    ///
+    /// A caller that reads, decides and writes back **must** use
+    /// [`DmStore::profile_critical_section`] instead.
+    pub fn read_profile_unlocked(&self, kind: RecordKind) -> Result<Option<Vec<u8>>, DmStoreError> {
+        kind.require_scope(RecordScope::Profile)?;
+        self.read_record(&self.profile_record_path(kind), None, kind)
+    }
+
+    /// Run `f` holding the profile's exclusive lock for the whole of it.
+    ///
+    /// [`DmStore::critical_section`]'s contract, over the records that belong to
+    /// the profile rather than to a correspondence: the closure is the point,
+    /// the read and the write that follows from it are one critical section, and
+    /// reentering it on the same thread is [`DmStoreError::Reentrant`] rather
+    /// than a hang.
+    ///
+    /// **It establishes nothing.** The lock file sits at the store root, which
+    /// [`DmStore::open`] has already created, so unlike a correspondence section
+    /// entering this brings no new thing into existence and reveals nothing by
+    /// having been entered.
+    pub fn profile_critical_section<T, E>(
+        &self,
+        f: impl FnOnce(&mut LockedProfile<'_>) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<DmStoreError>,
+    {
+        // Claimed before the blocking acquire, for `critical_section`'s reason.
+        let claim = self.claim(LockScope::Profile).map_err(E::from)?;
+        let lock_path = self.root.join(LOCK_FILE_NAME);
+        let lock = FileLock::acquire(&lock_path).map_err(|e| E::from(DmStoreError::Lock(e)))?;
+        let mut locked = LockedProfile {
+            store: self,
+            _lock: lock,
+            _claim: claim,
+        };
+        f(&mut locked)
+    }
+
+    /// Mark `scope` as held by the calling thread, or refuse if that thread
+    /// already holds it.
     ///
     /// The returned guard releases the claim on drop, including on an unwind —
     /// a panicking closure that left the entry behind would convert a panic into
     /// a permanent lockout of that correspondence for the life of the thread.
-    fn claim(
-        &self,
-        correspondence: &CorrespondenceLabel,
-    ) -> Result<ReentryClaim<'_>, DmStoreError> {
-        let key = (std::thread::current().id(), *correspondence);
+    fn claim(&self, scope: LockScope) -> Result<ReentryClaim<'_>, DmStoreError> {
+        let me = std::thread::current().id();
+        let key = (me, scope);
         let mut held = lock_held_set(&self.held);
+        // **The scope ordering: profile before correspondence.** Both closures
+        // are caller-supplied, so a caller taking the two locks in one order
+        // while another takes them in the other deadlocks across processes —
+        // and a cross-process deadlock has nothing to convert it into an error,
+        // because neither thread is waiting on a lock it holds itself. One
+        // forbidden direction is enough to close the cycle, and this is the
+        // direction nothing in the tree takes: a profile section may contain a
+        // correspondence one, never the reverse.
+        //
+        // **The guarantee is per `DmStore` instance, not per root.** `held` is
+        // this store's set, so a thread holding a correspondence lock through
+        // one store and entering another store's profile section on the same
+        // root is not refused here and blocks on the real `flock`. Two stores on
+        // one root is already the caveat `open` carries above; this is the same
+        // limit reached from the other side, and it is stated rather than
+        // implied because the refusal above reads like a total guarantee.
+        if scope == LockScope::Profile
+            && held
+                .iter()
+                .any(|(t, s)| *t == me && matches!(s, LockScope::Correspondence(_)))
+        {
+            return Err(DmStoreError::Reentrant);
+        }
         if !held.insert(key) {
             return Err(DmStoreError::Reentrant);
         }
@@ -1044,7 +1459,22 @@ impl DmStore {
 /// can never be locked again, including inside [`ReentryClaim`]'s `Drop` where a
 /// panic would abort. The set's contents are still exactly correct after a
 /// poisoning, because nothing can leave it half-updated.
-type HeldSet = HashSet<(std::thread::ThreadId, CorrespondenceLabel)>;
+type HeldSet = HashSet<(std::thread::ThreadId, LockScope)>;
+
+/// Which lock a thread holds: one correspondence's, or the profile's.
+///
+/// **The profile lock is a peer of the correspondence locks, not a parent.** It
+/// excludes writers of the profile records and nothing else, so a block-list
+/// change and an outbox write proceed concurrently — which is correct, because
+/// they share no file. Keeping both in one held-set is what makes the
+/// reentrancy check total: a helper that took the profile lock from inside
+/// another profile section would otherwise block on itself for ever, exactly as
+/// a nested correspondence section would.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum LockScope {
+    Profile,
+    Correspondence(CorrespondenceLabel),
+}
 
 fn lock_held_set(held: &Mutex<HeldSet>) -> std::sync::MutexGuard<'_, HeldSet> {
     held.lock().unwrap_or_else(|e| e.into_inner())
@@ -1053,7 +1483,7 @@ fn lock_held_set(held: &Mutex<HeldSet>) -> std::sync::MutexGuard<'_, HeldSet> {
 /// One thread's claim on one correspondence label, released on drop.
 struct ReentryClaim<'a> {
     held: &'a Mutex<HeldSet>,
-    key: (std::thread::ThreadId, CorrespondenceLabel),
+    key: (std::thread::ThreadId, LockScope),
 }
 
 impl Drop for ReentryClaim<'_> {
@@ -1119,7 +1549,9 @@ impl Locked<'_> {
     /// correspondence, corruption and tampering all produce indistinguishably
     /// (ISC-A-C18).
     pub fn read(&self, kind: RecordKind) -> Result<Option<Vec<u8>>, DmStoreError> {
-        self.store.read_record(&self.path(kind), &self.label, kind)
+        kind.require_scope(RecordScope::Correspondence)?;
+        self.store
+            .read_record(&self.path(kind), Some(&self.label), kind)
     }
 
     /// Replace `kind`'s record with `bytes`, padded to the kind's fixed size and
@@ -1140,37 +1572,9 @@ impl Locked<'_> {
     /// distinction is preserved rather than flattened precisely because a
     /// commit-then-emit caller has to act on it.
     pub fn replace(&mut self, kind: RecordKind, bytes: &[u8]) -> Result<(), DmStoreError> {
-        let sealed = if kind.is_sealed() {
-            let mut plain = pad_with_filler(kind, bytes)?;
-            let aad = seal_aad(&self.label, kind);
-            let outcome = seal_envelope(&self.store.key, &aad, &plain)
-                .map_err(|e| DmStoreError::from_envelope(kind, e));
-            plain.zeroize();
-            let sealed = outcome?;
-            // Counted after the seal succeeded, not before it is attempted: a
-            // failure inside `seal_envelope` draws no nonce, so counting the
-            // attempt would model a budget the failed call never spent.
-            #[cfg(test)]
-            self.store.seals.fetch_add(1, Ordering::Relaxed);
-            sealed
-        } else {
-            if bytes.len() != kind.capacity() {
-                return Err(DmStoreError::UnsealedPayloadNotExact {
-                    kind,
-                    expected: kind.capacity(),
-                    actual: bytes.len(),
-                });
-            }
-            bytes.to_vec()
-        };
-
-        debug_assert_eq!(
-            sealed.len(),
-            kind.on_disk_len(),
-            "every record of a kind is one size on disk"
-        );
-        replace_atomically(&self.path(kind), &sealed)
-            .map_err(|source| DmStoreError::Write { kind, source })
+        kind.require_scope(RecordScope::Correspondence)?;
+        self.store
+            .write_record(&self.path(kind), Some(&self.label), kind, bytes)
     }
 
     /// Delete `kind`'s record, and make the deletion durable.
@@ -1208,6 +1612,11 @@ impl Locked<'_> {
     /// Deleting a record that is not there is `Ok(())`: the postcondition is
     /// "this record does not exist", and it already holds.
     pub fn delete(&mut self, kind: RecordKind) -> Result<(), DmStoreError> {
+        // Before anything, and not as a `debug_assert`: a profile kind here
+        // would derive a path that does not exist, find nothing to scrub, and
+        // return `Ok(())` — a delete that reports success having deleted
+        // nothing, which for an erasure path is the worst available answer.
+        kind.require_scope(RecordScope::Correspondence)?;
         let path = self.path(kind);
 
         // Phase 1 + 2: scrub. A record that vanished between the caller's last
@@ -1309,6 +1718,99 @@ impl Locked<'_> {
     /// what counts as a record.
     pub fn present(&self) -> Result<Vec<RecordKind>, DmStoreError> {
         self.store.present_unlocked(&self.label)
+    }
+}
+
+/// The profile's own records, with the profile lock held.
+///
+/// [`Locked`]'s counterpart for the records that belong to no correspondence.
+/// It is a separate type rather than a flag on [`Locked`] because the two differ
+/// in what they can name: everything reachable from here derives its path from a
+/// [`RecordKind`] alone, with no label to supply or to get wrong.
+///
+/// **There is no `delete` door, and this is the pin for that.** A profile record
+/// is created by every [`DmStore::open`] precisely so its presence carries no
+/// information; a door that removed one would put that information back.
+///
+/// ```compile_fail
+/// use daemonseed_core::storage::dm_store::{DmStore, DmStoreError, RecordKind};
+/// fn no_such_door(store: &DmStore) {
+///     let _ = store.profile_critical_section::<_, DmStoreError>(|guard| {
+///         guard.delete(RecordKind::BlockList)
+///     });
+/// }
+/// ```
+///
+/// **That is not the same as the mismatch being unrepresentable, and it was
+/// described here as though it were.** [`RecordKind`] is one `pub` enum spanning
+/// both scopes, so a caller can hand either guard a kind belonging to the other;
+/// every door on both guards refuses it with [`DmStoreError::WrongScope`]. What
+/// the split buys is that the *label* cannot be wrong, not that the kind cannot
+/// be.
+pub struct LockedProfile<'a> {
+    store: &'a DmStore,
+    /// Declared before [`Self::_claim`], for [`Locked`]'s drop-order reason.
+    _lock: FileLock,
+    _claim: ReentryClaim<'a>,
+}
+
+impl core::fmt::Debug for LockedProfile<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LockedProfile")
+            .field("root", &self.store.root)
+            .finish()
+    }
+}
+
+impl LockedProfile<'_> {
+    /// Read `kind`'s record, or `Ok(None)` if it does not exist.
+    ///
+    /// [`Locked::read`]'s semantics exactly, including that absence is not an
+    /// error and that a wrong-sized file is [`DmStoreError::WrongFileLen`] while
+    /// a right-sized one that does not authenticate is
+    /// [`DmStoreError::NotAuthentic`].
+    pub fn read(&self, kind: RecordKind) -> Result<Option<Vec<u8>>, DmStoreError> {
+        kind.require_scope(RecordScope::Profile)?;
+        self.store
+            .read_record(&self.store.profile_record_path(kind), None, kind)
+    }
+
+    /// Whether `kind`'s record exists, without opening it.
+    ///
+    /// The distinction from [`Self::read`] returning `Some` is the whole reason
+    /// this exists: a record that is present and unreadable must not be mistaken
+    /// for an absent one by anything that would react by creating a fresh empty
+    /// one over the top.
+    pub fn present(&self, kind: RecordKind) -> Result<bool, DmStoreError> {
+        kind.require_scope(RecordScope::Profile)?;
+        let path = self.store.profile_record_path(kind);
+        match std::fs::metadata(&path) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(DmStoreError::io(&path, e)),
+        }
+    }
+
+    /// Replace `kind`'s record with `bytes`, padded to the kind's fixed size and
+    /// sealed.
+    ///
+    /// [`Locked::replace`]'s body, reached through the same private write path,
+    /// so the padding, the seal and the atomic commit are one implementation
+    /// across both scopes. Refuses an over-long payload with
+    /// [`DmStoreError::PayloadTooLong`] rather than truncating.
+    ///
+    /// **There is deliberately no `delete`.** A profile record is created by
+    /// every [`DmStore::open`] precisely so that its presence carries no
+    /// information; a door that removes one would put that information back, and
+    /// nothing needs it — an empty block list is written as an empty payload,
+    /// which is a value rather than an absence. The erasure machinery is still
+    /// inherited on the read side: [`DmStoreError::ErasureInterrupted`] is
+    /// recognised here as for any other kind, so a future delete cannot land
+    /// without it.
+    pub fn replace(&mut self, kind: RecordKind, bytes: &[u8]) -> Result<(), DmStoreError> {
+        kind.require_scope(RecordScope::Profile)?;
+        let path = self.store.profile_record_path(kind);
+        self.store.write_record(&path, None, kind, bytes)
     }
 }
 
@@ -1442,6 +1944,46 @@ fn zero_from(mut f: &std::fs::File, from: u64, len: u64) -> std::io::Result<()> 
 /// *nameable* to a reader, and nothing ever reads a temp sibling as a record:
 /// [`Locked::present`] derives the names it looks for rather than listing the
 /// directory. There is no state here to name, only bytes to destroy.
+/// Scrub and unlink one orphaned temp sibling; report whether it went.
+///
+/// **One body for both sweeps.** The root branch and the per-correspondence
+/// branch had begun to state the same policy twice, and two copies of a policy
+/// are a policy that will disagree with itself.
+///
+/// **A symlink is skipped and never opened.** `read_dir`'s file type does not
+/// follow links, so this sees the entry's own type: a co-resident attacker who
+/// drops `x.tmp.y` at the root pointing anywhere writable would otherwise have
+/// that target opened for writing, zeroed and unlinked by the next `open`. The
+/// root is the reachable half — it exists before any correspondence does — but
+/// the check belongs to both, and [`FileLock::acquire`] already refuses a
+/// symlinked lock path for the same reason.
+///
+/// **Everything else is fail-soft, and that is deliberate.** The sweeps run
+/// inside [`DmStore::open`], so an error would make the whole store unopenable:
+/// a mode-0444 sibling, or a directory whose name happens to match, would brick
+/// it permanently for every correspondence. Skipping leaves the file exactly
+/// where it already was, unscrubbed — the state before the sweep existed.
+///
+/// Scrubbed **before** it is unlinked, for the reason [`Locked::delete`] scrubs:
+/// the sibling may hold a whole sealed record, so unlinking it bare leaves
+/// recoverable ciphertext in unallocated blocks. Unlinking without scrubbing is
+/// the one option worse than both, since it launders the ciphertext out of reach
+/// while reporting success.
+fn remove_orphan(path: &Path, file_type: std::fs::FileType) -> bool {
+    if file_type.is_symlink() || file_type.is_dir() {
+        return false;
+    }
+    if scrub_orphan(path).is_err() {
+        return false;
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => true,
+        // Another store's sweep won the race; the file is gone either way,
+        // which is all this cares about.
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
 fn scrub_orphan(path: &Path) -> Result<(), DmStoreError> {
     let io = |e: std::io::Error| DmStoreError::io(path, e);
     let file = std::fs::OpenOptions::new()
@@ -1487,8 +2029,16 @@ pub enum DmStoreError {
     /// written.
     Lock(LockError),
 
-    /// A critical section was requested for a correspondence the calling thread
-    /// already holds one for. Nothing was read or written.
+    /// A critical section was requested that the calling thread would block on
+    /// for ever. Nothing was read or written.
+    ///
+    /// **Two shapes, both deadlocks, both refused here.** The same lock again —
+    /// a correspondence, or the profile, that this thread already holds. And the
+    /// profile lock while holding a correspondence one: that is the forbidden
+    /// half of the scope ordering (profile before correspondence), refused
+    /// because a caller taking the two in one order while another takes them in
+    /// the other deadlocks across processes, where nothing can convert it into
+    /// an error.
     ///
     /// **This is a bug in the caller, reported instead of a deadlock.** `flock`
     /// is per open file description, so the nested acquire would have blocked
@@ -1502,6 +2052,26 @@ pub enum DmStoreError {
     /// by construction about a label the caller already has in hand does not
     /// need to put it in a log line.
     Reentrant,
+
+    /// A record kind was asked for through the guard of the other scope.
+    ///
+    /// **Refused rather than served, because both wrong answers are silent.** A
+    /// profile kind reached through [`Locked`] would write
+    /// `<root>/<label>/block-list.bin` sealed under the *correspondence* AAD —
+    /// a second, per-correspondence block list that
+    /// [`DmStore::read_profile_unlocked`] can never see, so a block would appear
+    /// to be taken and would suppress nothing. A correspondence kind reached
+    /// through [`LockedProfile`] would put that record at the store root under
+    /// the profile AAD, and for the one unsealed kind
+    /// ([`RecordKind::ReceiveCursor`]) it would write **plaintext** there.
+    /// Neither is reachable through any in-tree caller; both are reachable
+    /// through the public guards, which is exactly when a `debug_assert` is the
+    /// wrong instrument — it is compiled out of the build that ships.
+    WrongScope {
+        kind: RecordKind,
+        /// The scope the guard that was asked serves.
+        guard: RecordScope,
+    },
 
     /// A durable replacement failed.
     ///
@@ -1661,7 +2231,13 @@ impl core::fmt::Display for DmStoreError {
             DmStoreError::Lock(e) => write!(f, "dm store lock: {e}"),
             DmStoreError::Reentrant => write!(
                 f,
-                "this thread already holds a critical section for that correspondence"
+                "this thread already holds a critical section that the requested one would \
+                 block on for ever"
+            ),
+            DmStoreError::WrongScope { kind, guard } => write!(
+                f,
+                "the {kind:?} record is {:?}-scoped and was asked for through a {guard:?} guard",
+                kind.scope()
             ),
             DmStoreError::Write { kind, source } => {
                 write!(f, "writing the {kind:?} record: {source}")
@@ -1785,6 +2361,7 @@ impl core::error::Error for DmStoreError {
             // in `Display` rather than dropped.
             DmStoreError::EntropySource(_)
             | DmStoreError::Reentrant
+            | DmStoreError::WrongScope { .. }
             | DmStoreError::Kdf
             | DmStoreError::Module
             | DmStoreError::NotAuthentic { .. }
@@ -1808,6 +2385,45 @@ mod tests {
 
     fn label(seed: u8) -> CorrespondenceLabel {
         CorrespondenceLabel::from_bytes([seed; CORRESPONDENCE_LABEL_LEN])
+    }
+
+    /// Every name at the store root, split into directories and files.
+    ///
+    /// **Both halves are asserted, and asserting only the directories was a real
+    /// weakening.** The count this replaced (`read_dir(root).count() == 0`)
+    /// caught anything appearing at the root at all — including a profile-record
+    /// creation that lost its scope filter and wrote `resume.bin`, `outbox.bin`
+    /// and a plaintext `cursor.bin` there on every open. Counting directories
+    /// alone makes every one of those invisible.
+    fn root_entries(root: &Path) -> (Vec<String>, Vec<String>) {
+        let mut dirs = Vec::new();
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(root).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if entry.file_type().unwrap().is_dir() {
+                dirs.push(name);
+            } else {
+                files.push(name);
+            }
+        }
+        dirs.sort();
+        files.sort();
+        (dirs, files)
+    }
+
+    /// The exact set of files a store's root holds when no correspondence has
+    /// been established: the profile lock, and one record per profile kind.
+    fn expected_root_files() -> Vec<String> {
+        let mut files = vec![LOCK_FILE_NAME.to_string()];
+        files.extend(
+            RecordKind::ALL
+                .into_iter()
+                .filter(|k| k.scope() == RecordScope::Profile)
+                .map(|k| k.file_name().to_string()),
+        );
+        files.sort();
+        files
     }
 
     fn store(dir: &Path) -> DmStore {
@@ -1949,7 +2565,8 @@ mod tests {
                 | RecordKind::Provisional
                 | RecordKind::Outbox
                 | RecordKind::ReceiveCursor
-                | RecordKind::ContactCache => {}
+                | RecordKind::ContactCache
+                | RecordKind::BlockList => {}
             }
         }
         let mut names: Vec<_> = RecordKind::ALL.iter().map(|k| k.file_name()).collect();
@@ -2001,6 +2618,10 @@ mod tests {
             CONTACT_RECORD_LEN, 5233,
             "the encoded contact record's size"
         );
+        // The ratified 512-identity ceiling, in bytes, and its arithmetic
+        // written out so a change to either factor has to be deliberate.
+        assert_eq!(RecordKind::BlockList.capacity(), BLOCK_LIST_CAPACITY);
+        assert_eq!(BLOCK_LIST_CAPACITY, 512 * 2592);
 
         assert_eq!(RecordKind::ReceiveCursor.on_disk_len(), 8, "unsealed");
         for kind in RecordKind::ALL.iter().filter(|k| k.is_sealed()) {
@@ -2018,6 +2639,7 @@ mod tests {
         assert_eq!(RecordKind::Outbox.aad_tag(), 3);
         assert_eq!(RecordKind::ReceiveCursor.aad_tag(), 4);
         assert_eq!(RecordKind::ContactCache.aad_tag(), 5);
+        assert_eq!(RecordKind::BlockList.aad_tag(), 6);
         let mut tags: Vec<_> = RecordKind::ALL.iter().map(|k| k.aad_tag()).collect();
         tags.sort_unstable();
         tags.dedup();
@@ -2041,11 +2663,16 @@ mod tests {
         .unwrap();
 
         for kind in RecordKind::ALL {
-            let path = tmp
-                .path()
-                .join("dm")
-                .join(l.dir_name())
-                .join(kind.file_name());
+            // A profile record has no correspondence directory; it is at the
+            // root, and `DmStore::open` has already created it.
+            let path = match kind.scope() {
+                RecordScope::Correspondence => tmp
+                    .path()
+                    .join("dm")
+                    .join(l.dir_name())
+                    .join(kind.file_name()),
+                RecordScope::Profile => tmp.path().join("dm").join(kind.file_name()),
+            };
             assert_eq!(
                 std::fs::metadata(&path).unwrap().len() as usize,
                 kind.on_disk_len(),
@@ -2075,6 +2702,628 @@ mod tests {
             sizes.windows(2).all(|w| w[0] == w[1]),
             "an empty outbox and a full one must be the same size on disk: {sizes:?}"
         );
+    }
+
+    // ---- the profile scope -------------------------------------------------
+
+    /// The record exists from the first open, at its kind's fixed size, holding
+    /// an empty payload.
+    ///
+    /// All three halves matter and they fail differently. A record created only
+    /// on first use would make its presence report that the feature is in use; a
+    /// record sized to its contents would report how much of it is in use; and a
+    /// record whose empty state is an absence rather than a value would make
+    /// every reader treat "nobody is blocked" as an error.
+    #[test]
+    fn a_profile_record_exists_from_the_first_open_at_its_fixed_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+
+        for kind in RecordKind::ALL
+            .into_iter()
+            .filter(|k| k.scope() == RecordScope::Profile)
+        {
+            let path = tmp.path().join("dm").join(kind.file_name());
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().len() as usize,
+                kind.on_disk_len(),
+                "{kind:?} must be created at its fixed size"
+            );
+            assert_eq!(
+                s.read_profile_unlocked(kind).unwrap(),
+                Some(Vec::new()),
+                "{kind:?} must open to an empty payload, not to an absence"
+            );
+        }
+        // Positive control: the loop above ran over something.
+        assert!(
+            RecordKind::ALL
+                .iter()
+                .any(|k| k.scope() == RecordScope::Profile),
+            "no profile kind exists, so the assertions above tested nothing"
+        );
+    }
+
+    /// A second open does not overwrite what the first one left.
+    ///
+    /// The creation at open is unconditional in *when* it runs and conditional in
+    /// *what* it does; a version that skipped the presence check would pass every
+    /// assertion above and silently reset the list at every start.
+    #[test]
+    fn reopening_the_store_does_not_reset_a_profile_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let payload = payload(64);
+        {
+            let s = store(tmp.path());
+            s.profile_critical_section::<_, DmStoreError>(|g| {
+                g.replace(RecordKind::BlockList, &payload)
+            })
+            .unwrap();
+        }
+
+        let reopened = store(tmp.path());
+        assert_eq!(
+            reopened
+                .read_profile_unlocked(RecordKind::BlockList)
+                .unwrap(),
+            Some(payload),
+            "reopening must not write over an existing profile record"
+        );
+    }
+
+    /// A profile record's temp sibling lands at the **root**, so the sweep has to
+    /// reach root-level files — and must still leave everything else alone.
+    #[test]
+    fn a_root_level_temp_sibling_is_swept_and_an_ordinary_root_file_is_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = {
+            let s = store(tmp.path());
+            s.root().to_path_buf()
+        };
+
+        let orphan = root.join(format!("block-list.bin{TMP_INFIX}0011aabb"));
+        let bystander = root.join("not-a-temp-sibling");
+        std::fs::write(&orphan, vec![7u8; 128]).unwrap();
+        std::fs::write(&bystander, b"left alone").unwrap();
+
+        let _reopened = store(tmp.path());
+
+        assert!(
+            !orphan.exists(),
+            "a root-level temp sibling must be swept at open"
+        );
+        // Both controls: a file the sweep must not touch, and the record itself.
+        assert!(
+            bystander.exists(),
+            "the sweep must remove only temp siblings"
+        );
+        assert!(
+            root.join(RecordKind::BlockList.file_name()).exists(),
+            "the sweep must not remove the record it sits beside"
+        );
+    }
+
+    /// Reentering the profile section on one thread is refused, not hung.
+    ///
+    /// `flock` attaches to the open file description, so the nested acquire would
+    /// block on a lock this same thread holds and never return — the failure the
+    /// held-set exists to convert into an error, here for the scope that was
+    /// added last.
+    #[test]
+    fn a_nested_profile_critical_section_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+
+        let nested = s.profile_critical_section::<_, DmStoreError>(|_| {
+            s.profile_critical_section::<_, DmStoreError>(|_| Ok(()))
+        });
+        assert!(
+            matches!(nested, Err(DmStoreError::Reentrant)),
+            "a nested profile section must be refused: {nested:?}"
+        );
+
+        // Control: the same call outside a section succeeds, so the refusal above
+        // is about nesting and not about the section being broken.
+        s.profile_critical_section::<_, DmStoreError>(|_| Ok(()))
+            .unwrap();
+    }
+
+    /// The two AAD constructions cannot be parsed into each other, and the
+    /// profile one carries no label.
+    #[test]
+    fn the_profile_aad_is_a_separate_construction_carrying_no_label() {
+        let profile = profile_seal_aad(RecordKind::BlockList);
+        assert!(
+            profile.starts_with(domain::DM_STORE_PROFILE_AAD),
+            "a profile record seals under its own domain prefix"
+        );
+        assert!(
+            !profile.starts_with(domain::DM_STORE_AAD),
+            "the two prefixes must not be one a prefix of the other"
+        );
+        // The label is 32 bytes; a construction carrying one cannot be this short.
+        assert!(
+            profile.len() < domain::DM_STORE_PROFILE_AAD.len() + CORRESPONDENCE_LABEL_LEN,
+            "the profile AAD must bind no correspondence label"
+        );
+
+        // Control: the correspondence construction does bind one, and differs.
+        let correspondence = seal_aad(&label(9), RecordKind::ContactCache);
+        assert!(correspondence.starts_with(domain::DM_STORE_AAD));
+        assert_ne!(profile, correspondence);
+    }
+
+    /// **The splice, end to end.** One file, one kind, one length — only the
+    /// AAD differs, and it does not open.
+    ///
+    /// The byte comparison above would pass for two constructions that were
+    /// merely different; this seals through the real write path and reopens
+    /// through the real read path, so it is the AAD's *effect* under the cipher
+    /// that is pinned rather than the shape of a `Vec<u8>`.
+    #[test]
+    fn a_record_sealed_in_one_scope_does_not_open_in_the_other() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let l = label(41);
+
+        // Profile record, read back with the correspondence construction.
+        s.profile_critical_section::<_, DmStoreError>(|g| {
+            g.replace(RecordKind::BlockList, &payload(96))
+        })
+        .unwrap();
+        let profile_path = s.root().join(RecordKind::BlockList.file_name());
+        assert_eq!(
+            s.read_record(&profile_path, None, RecordKind::BlockList)
+                .unwrap(),
+            Some(payload(96)),
+            "control: the record opens under its own AAD"
+        );
+        assert!(
+            matches!(
+                s.read_record(&profile_path, Some(&l), RecordKind::BlockList),
+                Err(DmStoreError::NotAuthentic { .. })
+            ),
+            "a profile record must not open under a correspondence AAD"
+        );
+
+        // And the reverse.
+        s.critical_section::<_, DmStoreError>(&l, |g| {
+            g.replace(RecordKind::ContactCache, &payload(64))
+        })
+        .unwrap();
+        let corr_path = s.record_path(&l, RecordKind::ContactCache);
+        assert_eq!(
+            s.read_record(&corr_path, Some(&l), RecordKind::ContactCache)
+                .unwrap(),
+            Some(payload(64)),
+            "control: the record opens under its own AAD"
+        );
+        assert!(
+            matches!(
+                s.read_record(&corr_path, None, RecordKind::ContactCache),
+                Err(DmStoreError::NotAuthentic { .. })
+            ),
+            "a correspondence record must not open under the profile AAD"
+        );
+    }
+
+    /// A profile kind handed to the correspondence guard is refused, in a
+    /// **release** build as much as a debug one.
+    ///
+    /// What it would otherwise do: write `<root>/<label>/block-list.bin` sealed
+    /// under the correspondence AAD — a second block list no profile read can
+    /// ever see, so a block would appear taken and would suppress nothing.
+    #[test]
+    fn a_profile_kind_is_refused_by_the_correspondence_guard() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let l = label(42);
+
+        let wrong = |r: Result<(), DmStoreError>| {
+            matches!(
+                r,
+                Err(DmStoreError::WrongScope {
+                    kind: RecordKind::BlockList,
+                    guard: RecordScope::Correspondence,
+                })
+            )
+        };
+        s.critical_section::<_, DmStoreError>(&l, |g| {
+            assert!(wrong(g.read(RecordKind::BlockList).map(|_| ())));
+            assert!(wrong(g.replace(RecordKind::BlockList, b"x")));
+            // A delete that found nothing would answer `Ok(())` — an erasure
+            // reporting success having erased nothing.
+            assert!(wrong(g.delete(RecordKind::BlockList)));
+            Ok(())
+        })
+        .unwrap();
+        assert!(wrong(
+            s.read_unlocked(&l, RecordKind::BlockList).map(|_| ())
+        ));
+
+        assert!(
+            !tmp.path()
+                .join("dm")
+                .join(l.dir_name())
+                .join(RecordKind::BlockList.file_name())
+                .exists(),
+            "no second, per-correspondence block list may exist"
+        );
+        // Control: the same guard serves its own kinds.
+        s.critical_section::<_, DmStoreError>(&l, |g| g.replace(RecordKind::Outbox, b"owed"))
+            .unwrap();
+    }
+
+    /// A correspondence kind handed to the profile guard is refused.
+    ///
+    /// The unsealed kind is the sharp end: [`RecordKind::ReceiveCursor`] takes
+    /// `write_record`'s unsealed branch, so without this it would write
+    /// **plaintext** at the store root.
+    #[test]
+    fn a_correspondence_kind_is_refused_by_the_profile_guard() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+
+        s.profile_critical_section::<_, DmStoreError>(|g| {
+            for kind in [
+                RecordKind::Resume,
+                RecordKind::Provisional,
+                RecordKind::Outbox,
+                RecordKind::ReceiveCursor,
+                RecordKind::ContactCache,
+            ] {
+                let body = vec![0u8; kind.capacity().min(8)];
+                assert!(
+                    matches!(
+                        g.replace(kind, &body),
+                        Err(DmStoreError::WrongScope {
+                            guard: RecordScope::Profile,
+                            ..
+                        })
+                    ),
+                    "{kind:?} must be refused by the profile guard"
+                );
+                assert!(matches!(g.read(kind), Err(DmStoreError::WrongScope { .. })));
+                assert!(matches!(
+                    g.present(kind),
+                    Err(DmStoreError::WrongScope { .. })
+                ));
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert!(matches!(
+            s.read_profile_unlocked(RecordKind::Resume),
+            Err(DmStoreError::WrongScope { .. })
+        ));
+
+        // The root holds exactly what it should — no `cursor.bin` in the clear.
+        let (_, files) = root_entries(&tmp.path().join("dm"));
+        assert_eq!(files, expected_root_files());
+    }
+
+    /// Opening a store never waits on the profile lock.
+    ///
+    /// The lock is held across caller-supplied closures of unbounded duration,
+    /// so an `open` that blocked on it would stall in startup for as long as
+    /// some other process chose to stay inside `update_block_list`.
+    #[test]
+    fn opening_a_store_does_not_block_on_a_held_profile_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = store(tmp.path());
+        let held = FileLock::acquire(&first.root().join(LOCK_FILE_NAME)).unwrap();
+
+        // `flock(2)` does not pass on a second descriptor, so a blocking
+        // acquire here would hang this very thread — no second process needed.
+        let second = DmStore::open(tmp.path().join("dm"), &AT_REST);
+        assert!(second.is_ok(), "open must not wait on the profile lock");
+        drop(held);
+
+        // And nested inside a section of another store on the same root, which
+        // has its own held-set and so gets no reentrancy refusal to save it.
+        first
+            .profile_critical_section::<_, DmStoreError>(|_| {
+                DmStore::open(tmp.path().join("dm"), &AT_REST).map(|_| ())
+            })
+            .expect("a nested open must not hang");
+    }
+
+    /// The root sweep runs **inside** the profile lock.
+    ///
+    /// Observable rather than asserted about the source: with the lock held
+    /// elsewhere the housekeeping is skipped whole, so the orphan survives that
+    /// open and is swept by the next one. An unlocked sweep would take it on the
+    /// first — which is the state in which it can scrub a record whose
+    /// `rename(2)` has already committed it.
+    #[test]
+    fn the_root_sweep_is_skipped_while_the_profile_lock_is_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = store(tmp.path()).root().to_path_buf();
+        let orphan = root.join(format!("block-list.bin{TMP_INFIX}deadbeef"));
+
+        std::fs::write(&orphan, vec![3u8; 64]).unwrap();
+        let held = FileLock::acquire(&root.join(LOCK_FILE_NAME)).unwrap();
+        let _blocked = store(tmp.path());
+        assert!(
+            orphan.exists(),
+            "the root sweep must not run while another holder has the profile lock"
+        );
+
+        drop(held);
+        let _free = store(tmp.path());
+        assert!(
+            !orphan.exists(),
+            "control: with the lock free the same open sweeps it"
+        );
+    }
+
+    /// A symlinked temp sibling is skipped, never opened and zeroed.
+    ///
+    /// The root is reachable before any correspondence exists, so a co-resident
+    /// attacker can drop one there and have the next `open` destroy whatever it
+    /// points at. `FileLock::acquire` already refuses a symlinked lock path;
+    /// this is the same guard on the same directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_temp_sibling_is_not_followed_by_the_sweep() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = store(tmp.path()).root().to_path_buf();
+
+        let target = tmp.path().join("precious");
+        std::fs::write(&target, b"do not touch").unwrap();
+        let link = root.join(format!("block-list.bin{TMP_INFIX}00ff"));
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let _reopened = store(tmp.path());
+
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"do not touch",
+            "the sweep followed a symlink and destroyed its target"
+        );
+        // Control: a real temp sibling beside it still goes.
+        let real = root.join(format!("block-list.bin{TMP_INFIX}11ee"));
+        std::fs::write(&real, vec![9u8; 32]).unwrap();
+        let _again = store(tmp.path());
+        assert!(!real.exists(), "a real temp sibling must still be swept");
+    }
+
+    /// Profile-before-correspondence: the forbidden order is refused, the
+    /// permitted one works.
+    ///
+    /// Both closures are caller-supplied, so opposite orders across two
+    /// processes deadlock with nothing able to convert it into an error —
+    /// neither thread is waiting on a lock it holds itself.
+    #[test]
+    fn taking_the_profile_lock_inside_a_correspondence_section_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let l = label(43);
+
+        let out = s.critical_section::<_, DmStoreError>(&l, |_| {
+            s.profile_critical_section::<_, DmStoreError>(|_| Ok(()))
+        });
+        assert!(
+            matches!(out, Err(DmStoreError::Reentrant)),
+            "the forbidden order must be refused: {out:?}"
+        );
+
+        // Control: the permitted order is not refused, and the claim taken by
+        // the refused attempt above did not leak.
+        s.profile_critical_section::<_, DmStoreError>(|_| {
+            s.critical_section::<_, DmStoreError>(&l, |_| Ok(()))
+        })
+        .expect("profile then correspondence is the permitted order");
+    }
+
+    /// Two threads cannot be inside the profile section at once.
+    ///
+    /// Reentrancy is a different property: it is about one thread and is served
+    /// by the held-set. This is the exclusion itself, which is the `flock`'s.
+    #[test]
+    fn two_threads_cannot_hold_the_profile_section_at_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let inside = AtomicBool::new(false);
+        let overlaps = AtomicBool::new(false);
+
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    for _ in 0..20 {
+                        s.profile_critical_section::<_, DmStoreError>(|_| {
+                            if inside.swap(true, Ordering::SeqCst) {
+                                overlaps.store(true, Ordering::SeqCst);
+                            }
+                            std::thread::sleep(std::time::Duration::from_micros(200));
+                            inside.store(false, Ordering::SeqCst);
+                            Ok(())
+                        })
+                        .unwrap();
+                    }
+                });
+            }
+        });
+        assert!(
+            !overlaps.load(Ordering::SeqCst),
+            "two threads were inside the profile section together"
+        );
+    }
+
+    /// A panicking closure strands neither the lock nor the claim.
+    #[test]
+    fn a_panicking_profile_closure_releases_both_guards() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            s.profile_critical_section::<(), DmStoreError>(|_| panic!("closure blew up"))
+        }));
+        assert!(panicked.is_err(), "the panic must propagate");
+
+        // Both halves: the claim (or this is `Reentrant`) and the `flock` (or
+        // this hangs — which the test harness reports as a timeout, not a pass).
+        s.profile_critical_section::<_, DmStoreError>(|g| g.read(RecordKind::BlockList))
+            .expect("the section must be usable again");
+    }
+
+    /// The profile scope inherits the read path's three refusals.
+    ///
+    /// `LockedProfile::replace`'s docs claim the erasure sentinel is inherited;
+    /// nothing pinned it, and a claim nothing pins is a claim that can quietly
+    /// stop being true.
+    #[test]
+    fn a_profile_record_inherits_the_read_paths_refusals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = {
+            let s = store(tmp.path());
+            s.profile_critical_section::<_, DmStoreError>(|g| {
+                g.replace(RecordKind::BlockList, &payload(32))
+            })
+            .unwrap();
+            s.root().join(RecordKind::BlockList.file_name())
+        };
+
+        // Wrong profile key.
+        let other = DmStore::open(tmp.path().join("dm"), &OTHER_AT_REST).unwrap();
+        assert!(matches!(
+            other.read_profile_unlocked(RecordKind::BlockList),
+            Err(DmStoreError::NotAuthentic {
+                kind: RecordKind::BlockList
+            })
+        ));
+
+        // Wrong size.
+        let good = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &good[..good.len() - 1]).unwrap();
+        let s = store(tmp.path());
+        assert!(matches!(
+            s.read_profile_unlocked(RecordKind::BlockList),
+            Err(DmStoreError::WrongFileLen { .. })
+        ));
+
+        // An erase that began and did not finish.
+        let mut half = good.clone();
+        half[..ERASURE_SENTINEL.len()].copy_from_slice(ERASURE_SENTINEL);
+        std::fs::write(&path, &half).unwrap();
+        assert!(matches!(
+            s.read_profile_unlocked(RecordKind::BlockList),
+            Err(DmStoreError::ErasureInterrupted {
+                kind: RecordKind::BlockList
+            })
+        ));
+
+        // Control: restored, it reads.
+        std::fs::write(&path, &good).unwrap();
+        assert_eq!(
+            s.read_profile_unlocked(RecordKind::BlockList).unwrap(),
+            Some(payload(32))
+        );
+    }
+
+    /// The store's own ceiling refusal, which is not `BlockList::encode`'s.
+    #[test]
+    fn the_store_refuses_a_profile_payload_over_its_bucket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let capacity = RecordKind::BlockList.capacity();
+
+        let refused = s.profile_critical_section::<_, DmStoreError>(|g| {
+            g.replace(RecordKind::BlockList, &vec![0u8; capacity + 1])
+        });
+        assert!(
+            matches!(
+                refused,
+                Err(DmStoreError::PayloadTooLong {
+                    kind: RecordKind::BlockList,
+                    ..
+                })
+            ),
+            "{refused:?}"
+        );
+        // Control: exactly the capacity is accepted, so the refusal is the
+        // ceiling and not the write path being broken.
+        s.profile_critical_section::<_, DmStoreError>(|g| {
+            g.replace(RecordKind::BlockList, &vec![0u8; capacity])
+        })
+        .unwrap();
+    }
+
+    /// A profile record that cannot be created does not make the store
+    /// unopenable.
+    ///
+    /// **The branch beside it argues this exact case the other way.**
+    /// `sweep_orphans` fails soft because an error inside `open` takes the whole
+    /// store with it, and every correspondence read — none of which touches the
+    /// profile record — goes with it. A store predating this record, on a
+    /// read-only mount or a full disk, must still open and still serve its
+    /// correspondences.
+    #[cfg(unix)]
+    #[test]
+    fn a_profile_record_that_cannot_be_created_leaves_the_store_openable() {
+        use std::os::unix::fs::PermissionsExt;
+        assert!(
+            write_bit_is_enforced(),
+            "vacuous where the write bit does not constrain the process"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let l = label(44);
+        let root = {
+            let s = store(tmp.path());
+            s.critical_section::<_, DmStoreError>(&l, |g| g.replace(RecordKind::Outbox, b"owed"))
+                .unwrap();
+            s.root().to_path_buf()
+        };
+        // The state a store predating this record is in: no profile record, and
+        // a medium that will not take one.
+        std::fs::remove_file(root.join(RecordKind::BlockList.file_name())).unwrap();
+        std::fs::remove_file(root.join(LOCK_FILE_NAME)).unwrap();
+        let original = std::fs::metadata(&root).unwrap().permissions();
+        let mut readonly = original.clone();
+        readonly.set_mode(0o555);
+        std::fs::set_permissions(&root, readonly).unwrap();
+
+        let reopened = DmStore::open(&root, &AT_REST);
+        let restore = std::fs::set_permissions(&root, original);
+
+        let reopened = reopened.expect("a store must open on a medium it cannot write");
+        assert_eq!(
+            reopened.read_unlocked(&l, RecordKind::Outbox).unwrap(),
+            Some(b"owed".to_vec()),
+            "the correspondence records must still be readable"
+        );
+        // The loss is bounded and lands where it can be seen: the record is
+        // absent, and the read of it refuses loudly rather than answering
+        // "nobody is blocked".
+        assert_eq!(
+            reopened
+                .read_profile_unlocked(RecordKind::BlockList)
+                .unwrap(),
+            None
+        );
+        restore.unwrap();
+
+        // Control: writable again, the next open creates it.
+        let s = store(tmp.path());
+        assert!(
+            s.read_profile_unlocked(RecordKind::BlockList)
+                .unwrap()
+                .is_some(),
+            "the creation must resume once the medium allows it"
+        );
+    }
+
+    /// A record file name can never be the lock file's.
+    #[test]
+    fn no_record_name_collides_with_the_lock_file() {
+        for kind in RecordKind::ALL {
+            assert_ne!(
+                kind.file_name(),
+                LOCK_FILE_NAME,
+                "{kind:?} would be written over the lock file"
+            );
+        }
     }
 
     /// **A read-only record is repaired and erased, not wedged for ever.**
@@ -2273,7 +3522,7 @@ mod tests {
         // tautology that holds for any set of kinds — it would keep passing if a
         // member were silently replaced by another. The literal is the only part
         // of this test that notices the enum changing shape.
-        assert_eq!(seen.len(), 5, "five kinds, five distinct stable strings");
+        assert_eq!(seen.len(), 6, "six kinds, six distinct stable strings");
         assert_eq!(RecordKind::from_stable_str("resume.bin"), None);
         assert_eq!(RecordKind::from_stable_str("nope"), None);
     }
@@ -2299,9 +3548,26 @@ mod tests {
         // Guards the loop against a future `ALL` that stops covering the enum,
         // which would make every assertion below vacuously true for the kinds
         // it dropped.
-        assert_eq!(RecordKind::ALL.len(), 5, "one erasure per kind");
+        // The guard has to count the set the loop actually walks. Guarding
+        // `ALL.len()` instead would trip on a new *profile* kind, which this
+        // loop never touches, while a new *correspondence* kind — the one case
+        // that would silently go uncovered — left it green.
+        assert_eq!(
+            RecordKind::ALL
+                .iter()
+                .filter(|k| k.scope() == RecordScope::Correspondence)
+                .count(),
+            5,
+            "one erasure per correspondence kind"
+        );
 
-        for (i, kind) in RecordKind::ALL.into_iter().enumerate() {
+        // Correspondence kinds only: a profile record has no `delete` door at
+        // all (see `LockedProfile`), so there is no unlink site for it to reach.
+        for (i, kind) in RecordKind::ALL
+            .into_iter()
+            .filter(|k| k.scope() == RecordScope::Correspondence)
+            .enumerate()
+        {
             let tmp = tempfile::tempdir().unwrap();
             let s = store(tmp.path());
             let l = label(80 + i as u8);
@@ -2357,7 +3623,7 @@ mod tests {
     /// is reachable, and this test says plainly that it is only that half.
     #[test]
     fn every_kind_survives_the_hop_from_error_to_trust_event() {
-        assert_eq!(RecordKind::ALL.len(), 5, "one case per kind");
+        assert_eq!(RecordKind::ALL.len(), 6, "one case per kind");
         for kind in RecordKind::ALL {
             for scrubbed in [false, true] {
                 let err = DmStoreError::ErasureBlocked {
@@ -2905,7 +4171,10 @@ mod tests {
     /// `delete_reaches_the_scrub_for_every_kind`.
     #[test]
     fn scrub_erases_every_record_kind_without_resizing() {
-        for kind in RecordKind::ALL {
+        for kind in RecordKind::ALL
+            .into_iter()
+            .filter(|k| k.scope() == RecordScope::Correspondence)
+        {
             let tmp = tempfile::tempdir().unwrap();
             let s = store(tmp.path());
             let l = label(63);
@@ -2972,7 +4241,10 @@ mod tests {
     #[test]
     fn delete_reaches_the_scrub_for_every_kind() {
         use crate::storage::atomic_file::file_syncs;
-        for kind in RecordKind::ALL {
+        for kind in RecordKind::ALL
+            .into_iter()
+            .filter(|k| k.scope() == RecordScope::Correspondence)
+        {
             let tmp = tempfile::tempdir().unwrap();
             let s = store(tmp.path());
             let l = label(65);
@@ -3579,7 +4851,10 @@ mod tests {
         let root = tmp.path().join("dm");
         let unknown = label(23);
 
-        for kind in RecordKind::ALL {
+        for kind in RecordKind::ALL
+            .into_iter()
+            .filter(|k| k.scope() == RecordScope::Correspondence)
+        {
             assert_eq!(
                 s.read_unlocked(&unknown, kind).unwrap(),
                 None,
@@ -3594,11 +4869,22 @@ mod tests {
             !root.join(unknown.dir_name()).exists(),
             "asking about a correspondence must not create it"
         );
+        // Directories, not entries: the root also holds the profile records and
+        // the profile lock, which `DmStore::open` creates for every store and
+        // which say nothing about any correspondence.
+        let probes = RecordKind::ALL
+            .iter()
+            .filter(|k| k.scope() == RecordScope::Correspondence)
+            .count();
+        let (dirs, files) = root_entries(&root);
+        assert!(
+            dirs.is_empty(),
+            "the store root must name no correspondence after {probes} probes: {dirs:?}"
+        );
         assert_eq!(
-            std::fs::read_dir(&root).unwrap().count(),
-            0,
-            "the store root must still be empty after {} probes",
-            RecordKind::ALL.len()
+            files,
+            expected_root_files(),
+            "and must hold exactly the profile lock and the profile records"
         );
 
         // Positive control: an established correspondence reads back through the
@@ -3634,10 +4920,15 @@ mod tests {
             !root.join(unknown.dir_name()).exists(),
             "enumerating a correspondence must not create it"
         );
+        let (dirs, files) = root_entries(&root);
+        assert!(
+            dirs.is_empty(),
+            "the store root must name no correspondence after an enumeration: {dirs:?}"
+        );
         assert_eq!(
-            std::fs::read_dir(&root).unwrap().count(),
-            0,
-            "the store root must still be empty after an enumeration"
+            files,
+            expected_root_files(),
+            "and must hold exactly the profile lock and the profile records"
         );
 
         // Positive control: the same call reports the real records of a

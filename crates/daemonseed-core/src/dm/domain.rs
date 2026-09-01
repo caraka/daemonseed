@@ -214,6 +214,20 @@ dm_labels! {
     /// [`DM_PROVISIONAL_AAD`], for the same reason. FROZEN.
     DM_STORE_AAD = b"daemonseed/dm/store/aad/v1";
 
+    /// AAD prefix for a **profile-level** DM store record's at-rest seal — one that
+    /// belongs to the profile itself rather than to any correspondence. Only the
+    /// record-kind tag follows it, length-prefixed.
+    ///
+    /// **Its own label because there is no correspondence label to bind, and an
+    /// absent field is not a separation.** [`DM_STORE_AAD`]'s two bound fields are
+    /// the label and the kind; a profile record has no label, so reusing that prefix
+    /// would leave the kind tag as the whole of the separation and make the
+    /// construction's field count depend on which kind it is — a shape an
+    /// implementation is free to guess wrong. Separating at the prefix keeps each
+    /// construction's field list fixed, so a profile record and a correspondence
+    /// record can never be parsed into one another. FROZEN.
+    DM_STORE_PROFILE_AAD = b"daemonseed/dm/store/profile/aad/v1";
+
     /// Signature domain binding a per-contact pseudonym key to the long-term identity
     /// that vouches for it, signed under the LONG-TERM key. FROZEN.
     DM_BIND_LT = b"daemonseed/dm/bind/lt/v1";
@@ -397,6 +411,7 @@ mod tests {
         assert_eq!(DM_STORE_SALT, b"daemonseed/dm/store/salt/v1");
         assert_eq!(DM_STORE_SEAL, b"daemonseed/dm/store/seal/v1");
         assert_eq!(DM_STORE_AAD, b"daemonseed/dm/store/aad/v1");
+        assert_eq!(DM_STORE_PROFILE_AAD, b"daemonseed/dm/store/profile/aad/v1");
         assert_eq!(DM_BIND_LT, b"daemonseed/dm/bind/lt/v1");
         assert_eq!(DM_MSG_SIG, b"daemonseed/dm/msg/sig/v6");
         assert_eq!(DM_MSG_AAD, b"daemonseed/dm/msg/aad/v4");
@@ -496,7 +511,7 @@ mod tests {
     /// to peers.
     #[test]
     fn every_label_matches_its_pre_migration_value() {
-        let pinned: [(&[u8], &[u8]); 42] = [
+        let pinned: [(&[u8], &[u8]); 43] = [
             (DM_ACK_AAD, b"daemonseed/dm/ack/aad/v3".as_slice()),
             (DM_ACK_ADDR, b"daemonseed/dm/ack/addr/v1".as_slice()),
             (
@@ -569,6 +584,10 @@ mod tests {
             (DM_RATCHET_STEP, b"daemonseed/dm/ratchet/step/v2".as_slice()),
             (DM_ROOT_SALT, b"daemonseed/dm/root/salt/v1".as_slice()),
             (DM_STORE_AAD, b"daemonseed/dm/store/aad/v1".as_slice()),
+            (
+                DM_STORE_PROFILE_AAD,
+                b"daemonseed/dm/store/profile/aad/v1".as_slice(),
+            ),
             (DM_STORE_SALT, b"daemonseed/dm/store/salt/v1".as_slice()),
             (DM_STORE_SEAL, b"daemonseed/dm/store/seal/v1".as_slice()),
             (DM_TOKEN, b"daemonseed/dm/token/v1".as_slice()),

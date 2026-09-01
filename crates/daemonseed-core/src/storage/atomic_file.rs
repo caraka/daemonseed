@@ -563,6 +563,38 @@ impl FileLock {
         file.lock_exclusive()?;
         Ok(Self { _file: file })
     }
+
+    /// Take the lock if it is free, or report that it is not — never block.
+    ///
+    /// [`Self::acquire`]'s checks and semantics, with the one difference that
+    /// matters: `Ok(None)` means another holder has it *right now*. It exists
+    /// for callers that must make progress rather than wait — a startup path
+    /// doing best-effort housekeeping cannot block on a lock a running process
+    /// may hold across arbitrary caller-supplied work.
+    ///
+    /// **`Ok(None)` is not an error and must not be reported as one.** Nothing
+    /// is wrong when it happens: another process holds the lock and is doing, or
+    /// has done, the work this caller wanted to do.
+    pub fn try_acquire(lock_path: &Path) -> Result<Option<Self>, LockError> {
+        use fs4::fs_std::FileExt;
+
+        if std::fs::symlink_metadata(lock_path).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(LockError::UnsafePath(lock_path.to_path_buf()));
+        }
+        if let Some(parent) = lock_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(lock_path)?;
+        if file.try_lock_exclusive()? {
+            Ok(Some(Self { _file: file }))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 #[cfg(test)]

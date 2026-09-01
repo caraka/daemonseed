@@ -26,6 +26,32 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Added
 
+- `daemonseed_core::dm::block_list` — `BlockList::encode` and `BlockList::decode`, the
+  block list's at-rest form: every blocked long-term identity key concatenated in ascending
+  byte order, with no header, count or occupancy map. `BLOCK_LIST_MAX_ENTRIES` (512) is the
+  ceiling and `BLOCK_LIST_CAPACITY` a full list's payload size. `encode` refuses a list over
+  the ceiling with `BlockListError::Full` before any write; `decode` gives `Full` at the same
+  ceiling, `NotWholeKeys` for a payload that is not a whole number of ML-DSA-87 public keys,
+  and `NotAscending` for keys out of order or repeated. (#390)
+- `daemonseed_core::dm::persist` — `DmPersist::read_block_list` and
+  `DmPersist::update_block_list`, the block list's path to and from the DM at-rest store.
+  `read_block_list` is lock-free; an absent record is `DmPersistError::BlockListMissing`,
+  never an empty list. `update_block_list` is read-modify-write inside one profile critical
+  section and writes on every call, spending one seal whether or not the list changed;
+  nothing is written if the caller's closure fails or the resulting list is over the ceiling.
+  **Breaking (crate API):** `DmPersistError` gains `BlockList` and `BlockListMissing`
+  variants. (#390)
+- `daemonseed_core::storage::dm_store` — profile-scoped records, held at the store root
+  rather than in a correspondence directory. `RecordScope` and `RecordKind::scope` name a
+  kind's scope; `RecordKind::BlockList` is the block list's, sealed under
+  `DM_STORE_PROFILE_AAD`, which binds the record kind and no correspondence label.
+  `DmStore::read_profile_unlocked` reads one without the lock, and
+  `DmStore::profile_critical_section` yields a `LockedProfile` guard carrying `read`,
+  `present` and `replace`, with no `delete`. Both guards refuse a kind of the other scope.
+  **Breaking (crate API):** `DmStoreError` gains a `WrongScope` variant and `RecordKind` a
+  `BlockList` variant. (#390)
+- `daemonseed_core::storage::atomic_file` — `FileLock::try_acquire` takes the lock if it is
+  free and returns `Ok(None)` if another holder has it, never blocking. (#390)
 - `daemonseed_core::dm::persist` — `DmPersist::read_contact` and
   `DmPersist::update_contact`, the contact record's path to and from the DM at-rest
   store. `read_contact` is lock-free and creates nothing; a stored record that will

@@ -95,6 +95,7 @@ use oxicrypt_aes::Aes256Key;
 use oxicrypt_ml_kem as ml_kem;
 use zeroize::Zeroizing;
 
+use crate::dm::block_list::{BlockList, BlockListError};
 use crate::dm::contact_cache::{ContactCacheError, ContactRecord};
 use crate::dm::firstcontact::{FirstContactError, ROOT_LEN};
 use crate::dm::outbox::{Outbox, OutboxError};
@@ -130,6 +131,18 @@ pub enum DmPersistError {
     /// The stored contact record would not decode, or a caller's own contact
     /// call inside [`DmPersist::update_contact`] failed.
     Contact(ContactCacheError),
+    /// The stored block list would not decode, or the caller's own change to it
+    /// pushed it past the ceiling.
+    BlockList(BlockListError),
+    /// The profile has no block-list record.
+    ///
+    /// **Not answered as an empty list, which is the whole point.**
+    /// [`crate::storage::dm_store::DmStore::open`] creates the record on every
+    /// open, so absence means it was removed after that — and the one thing a
+    /// removal wants is for the next read to report that nobody is blocked.
+    /// Every other record can be absent legitimately; this one cannot, so it is
+    /// the one whose absence is an error.
+    BlockListMissing,
     /// The record's ratchet could not be opened, so the channel did not
     /// establish. The provisional record is **still on disk**: see
     /// [`PendingHandshake::establish`] for why that is the safe direction.
@@ -165,6 +178,11 @@ impl std::fmt::Display for DmPersistError {
             Self::Outbox(e) => write!(f, "outbox: {e}"),
             Self::Resume(e) => write!(f, "resume record: {e}"),
             Self::Contact(e) => write!(f, "contact record: {e}"),
+            Self::BlockList(e) => write!(f, "block list: {e}"),
+            Self::BlockListMissing => f.write_str(
+                "the profile's block-list record is missing; it is created at every store open, \
+                 so its absence means it was removed",
+            ),
             Self::Ratchet(e) => write!(f, "ratchet: {e}"),
             Self::OutboxDirectionMismatch { stored, requested } => write!(
                 f,
@@ -189,8 +207,11 @@ impl std::error::Error for DmPersistError {
             Self::Outbox(e) => Some(e),
             Self::Resume(e) => Some(e),
             Self::Contact(e) => Some(e),
+            Self::BlockList(e) => Some(e),
             Self::Ratchet(e) => Some(e),
-            Self::OutboxDirectionMismatch { .. } | Self::CursorNotCorroborated { .. } => None,
+            Self::BlockListMissing
+            | Self::OutboxDirectionMismatch { .. }
+            | Self::CursorNotCorroborated { .. } => None,
         }
     }
 }
@@ -216,6 +237,12 @@ impl From<ResumeError> for DmPersistError {
 impl From<ContactCacheError> for DmPersistError {
     fn from(e: ContactCacheError) -> Self {
         Self::Contact(e)
+    }
+}
+
+impl From<BlockListError> for DmPersistError {
+    fn from(e: BlockListError) -> Self {
+        Self::BlockList(e)
     }
 }
 
@@ -944,6 +971,69 @@ impl DmPersist {
                 Ok(out)
             })
     }
+
+    /// The profile's block list.
+    ///
+    /// **Takes no lock**, like [`Self::read_contact`] and for one of its two
+    /// reasons. The commit is `rename(2)`, so this reads either the whole old
+    /// list or the whole new one and never a mixture; a lock would only serialise
+    /// it behind an unrelated writer. The *other* reason a correspondence read
+    /// avoids the lock — that taking one establishes the correspondence — has no
+    /// force here, since the record exists from the store's first open.
+    ///
+    /// What decides it is the caller: the two suppression predicates are asked on
+    /// the doorbell and channel paths, per knock and per sweep, and neither
+    /// writes anything on the strength of the answer. Anything that reads the
+    /// list and then *changes* it must use [`Self::update_block_list`], which is
+    /// the read and the write in one critical section.
+    ///
+    /// **An absent record is [`DmPersistError::BlockListMissing`], not an empty
+    /// list.** See that variant: this is a revocation list, and the failure mode
+    /// of answering absence with "nobody is blocked" is silent unblocking.
+    pub fn read_block_list(&self) -> Result<BlockList, DmPersistError> {
+        match self.store.read_profile_unlocked(RecordKind::BlockList)? {
+            Some(bytes) => Ok(BlockList::decode(&bytes)?),
+            None => Err(DmPersistError::BlockListMissing),
+        }
+    }
+
+    /// Load the block list, let `f` change it, and write it back — all under the
+    /// profile lock.
+    ///
+    /// **Unconditional: there is no [`Mutation`] here, and the departure from
+    /// [`Self::update_contact`] is deliberate.** That shape exists to protect the
+    /// store's seal budget, which is spent by record *writes* and is dominated by
+    /// polling — an `update_contact` fires on every sweep tick whether or not the
+    /// contact was seen, so most of its calls must cost nothing. This one is
+    /// driven by a person clicking *block* or *unblock*: a handful of writes a
+    /// year, against a budget of 2^32. Asking the caller to classify a write
+    /// that cheap would buy nothing and would add the one failure mode
+    /// `Mutation` carries — a mis-reported `Unchanged` silently discarding a
+    /// revocation, which is the change least tolerable to lose.
+    ///
+    /// So a no-op call costs one seal. That is the whole price, and it is the
+    /// right way round: writing when nothing changed wastes a seal, while not
+    /// writing when something did loses a block.
+    ///
+    /// **Nothing is written if `f` fails**, and nothing is written if the
+    /// resulting list is over the ceiling — [`BlockList::encode`] refuses before
+    /// the replace, so a caller that blocks a 513th identity leaves the stored
+    /// 512 exactly as they were.
+    pub fn update_block_list<T>(
+        &self,
+        f: impl FnOnce(&mut BlockList) -> Result<T, DmPersistError>,
+    ) -> Result<T, DmPersistError> {
+        self.store
+            .profile_critical_section(|guard| -> Result<T, DmPersistError> {
+                let bytes = guard
+                    .read(RecordKind::BlockList)?
+                    .ok_or(DmPersistError::BlockListMissing)?;
+                let mut list = BlockList::decode(&bytes)?;
+                let out = f(&mut list)?;
+                guard.replace(RecordKind::BlockList, &list.encode()?)?;
+                Ok(out)
+            })
+    }
 }
 
 /// Read a cursor's at-rest bytes, bounded by `read_through`.
@@ -1082,6 +1172,8 @@ impl PendingHandshake<'_> {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    use crate::dm::block_list::BLOCK_LIST_MAX_ENTRIES;
 
     use zeroize::Zeroizing;
 
@@ -1519,11 +1611,15 @@ mod tests {
         let l = label(39);
         let now = 1_700_000_000_000i64;
 
+        // Snapshotted after the open, which itself seals the profile records
+        // the store creates. The claim is about this call, so the delta is what
+        // it has to be measured against.
+        let before = p.store().seal_count();
         p.update_outbox(&l, Direction::AToB, now, |_| Ok(Mutation::Unchanged(())))
             .expect("a no-op against an absent record is not an error");
 
         assert_eq!(
-            p.store().seal_count(),
+            p.store().seal_count() - before,
             0,
             "a no-op against an absent record must not seal"
         );
@@ -2831,5 +2927,159 @@ mod tests {
             p.read_contact(&label(0x6A)).expect("reads").is_none(),
             "one correspondence's contact record was visible to another"
         );
+    }
+    // ---- the block list ---------------------------------------------------
+
+    /// A key whose bytes depend on `seed` throughout, so a round trip that
+    /// truncated or shifted could not pass.
+    fn block_key(seed: u16) -> [u8; oxicrypt_ml_dsa::PK_LEN] {
+        let mut k = [0u8; oxicrypt_ml_dsa::PK_LEN];
+        for (i, b) in k.iter_mut().enumerate() {
+            *b = (i as u16).wrapping_mul(31).wrapping_add(seed) as u8;
+        }
+        // Both halves of the seed land in their own byte, so keys are distinct
+        // across the whole `u16` range rather than colliding every 256 seeds —
+        // which at a 512-entry ceiling would silently halve the fixture.
+        k[0] = (seed >> 8) as u8;
+        k[1] = seed as u8;
+        k
+    }
+
+    /// The record's whole reason for existing: a block survives a restart.
+    #[test]
+    fn a_block_survives_reopening_the_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blocked = block_key(11);
+        let stranger = block_key(12);
+
+        {
+            let p = persist(tmp.path());
+            assert!(
+                p.read_block_list().unwrap().is_empty(),
+                "a fresh profile blocks nobody"
+            );
+            p.update_block_list(|list| Ok(list.block(&blocked)))
+                .unwrap();
+        }
+
+        let reopened = persist(tmp.path());
+        let list = reopened.read_block_list().unwrap();
+        assert!(list.is_blocked(&blocked), "the block did not survive");
+        assert!(
+            !list.is_blocked(&stranger),
+            "and it blocked only the identity it named"
+        );
+
+        // Reversal, across another restart.
+        reopened
+            .update_block_list(|list| Ok(list.unblock(&blocked)))
+            .unwrap();
+        assert!(
+            !persist(tmp.path())
+                .read_block_list()
+                .unwrap()
+                .is_blocked(&blocked),
+            "an unblock did not survive"
+        );
+    }
+
+    /// **The privacy claim, as one assertion.** The record is the same number of
+    /// bytes holding nobody, one identity, and the full 512.
+    ///
+    /// The occupancy is read back at each step, so a run where the writes
+    /// silently did nothing — which would also produce three equal sizes — fails
+    /// here rather than passing as the property under test.
+    #[test]
+    fn the_records_size_does_not_track_how_many_identities_are_blocked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = persist(tmp.path());
+        let path = p.store().root().join(RecordKind::BlockList.file_name());
+
+        let mut sizes = Vec::new();
+        let mut occupancies = Vec::new();
+        for count in [0usize, 1, BLOCK_LIST_MAX_ENTRIES] {
+            p.update_block_list(|list| {
+                while list.len() < count {
+                    let seed = list.len() as u16;
+                    assert!(list.block(&block_key(seed)), "duplicate fixture key");
+                }
+                Ok(())
+            })
+            .unwrap();
+            occupancies.push(p.read_block_list().unwrap().len());
+            sizes.push(std::fs::metadata(&path).unwrap().len());
+        }
+
+        assert_eq!(
+            occupancies,
+            vec![0, 1, BLOCK_LIST_MAX_ENTRIES],
+            "the writes must actually have changed the occupancy"
+        );
+        assert!(
+            sizes.windows(2).all(|w| w[0] == w[1]),
+            "blocking nobody and blocking 512 must be the same size on disk: {sizes:?}"
+        );
+        assert_eq!(
+            sizes[0] as usize,
+            RecordKind::BlockList.on_disk_len(),
+            "and that size is the kind's fixed one"
+        );
+    }
+
+    /// The ceiling refuses the write and leaves the stored list intact.
+    #[test]
+    fn blocking_past_the_ceiling_refuses_and_changes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = persist(tmp.path());
+
+        p.update_block_list(|list| {
+            for seed in 0..BLOCK_LIST_MAX_ENTRIES {
+                assert!(list.block(&block_key(seed as u16)));
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        let one_too_many = block_key(BLOCK_LIST_MAX_ENTRIES as u16);
+        let refused = p.update_block_list(|list| Ok(list.block(&one_too_many)));
+        assert!(
+            matches!(
+                refused,
+                Err(DmPersistError::BlockList(BlockListError::Full { .. }))
+            ),
+            "the 513th identity must be refused: {refused:?}"
+        );
+
+        let stored = p.read_block_list().unwrap();
+        assert_eq!(
+            stored.len(),
+            BLOCK_LIST_MAX_ENTRIES,
+            "the refused write must leave the stored list exactly as it was"
+        );
+        assert!(!stored.is_blocked(&one_too_many));
+    }
+
+    /// A removed record is an error, never an empty list.
+    ///
+    /// Answering absence with "nobody is blocked" would make deleting one file
+    /// the whole of a block bypass.
+    #[test]
+    fn a_removed_block_list_record_is_refused_rather_than_read_as_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = persist(tmp.path());
+        let path = p.store().root().join(RecordKind::BlockList.file_name());
+
+        // Control: it reads before the removal.
+        p.read_block_list().unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        assert!(
+            matches!(p.read_block_list(), Err(DmPersistError::BlockListMissing)),
+            "a removed revocation list must not read as an empty one"
+        );
+        assert!(matches!(
+            p.update_block_list(|list| Ok(list.len())),
+            Err(DmPersistError::BlockListMissing)
+        ));
     }
 }

@@ -45,17 +45,25 @@
 //! [`VerifiedFirstContact`], not a slot. A predicate that took raw slot bytes
 //! could not be written honestly.
 //!
-//! ## What this module is not, yet
+//! ## Where it lives at rest
 //!
-//! **It does not persist, so a block does not survive a restart.** There is no
-//! encode, no `RecordKind`, and no store: this is an in-memory set and nothing
-//! more. ISC-C46 calls the block list the DM revocation primitive, and a
-//! revocation that quietly forgets itself on the next start does not meet that.
-//! **Persisting it is not a matter of adding a serializer**, which is why it is
-//! not done here: the design forbids a store shape that reveals how many
-//! entries it holds, so a variable-length list of 2592-byte keys would leak the
-//! size of a user's block list to anyone who can see the file. The shape has to
-//! be chosen before it is written.
+//! **It persists, and a block survives a restart.** [`BlockList::encode`] and
+//! [`BlockList::decode`] are its at-rest form and
+//! [`crate::storage::dm_store::RecordKind::BlockList`] is its slot: **one
+//! fixed-size sealed file at the store root, created at every open**, holding
+//! up to [`BLOCK_LIST_MAX_ENTRIES`] identities.
+//!
+//! Three properties of that placement are the whole of why it is not simply a
+//! serialized set. The record is **profile-level**, because a block names an
+//! identity there is no established correspondence with — which is exactly the
+//! case a per-correspondence record cannot hold. It is **one size whatever it
+//! holds**, because the design forbids a store shape that reveals how many
+//! entries it has and a variable-length list of 2592-byte keys would report the
+//! size of a user's block list to anyone who can read the file. And it is
+//! **created whether or not anyone has blocked anybody**, so its presence says
+//! nothing about whether the feature is in use.
+//!
+//! ## What this module is not, yet
 //!
 //! **Nothing consults it.** No doorbell consumer and no channel-sweep path asks
 //! either predicate; the wiring belongs to a later slice. So the obligations
@@ -178,7 +186,135 @@ impl BlockList {
     pub fn suppresses_channel(&self, correspondent_pk_lt: &[u8; ml_dsa::PK_LEN]) -> bool {
         self.is_blocked(correspondent_pk_lt)
     }
+
+    /// The at-rest form: every blocked key, concatenated, in ascending byte
+    /// order.
+    ///
+    /// **Nothing describes the entries — no header, no count, no occupancy
+    /// map — and that is what keeps the count off the disk.** The store pads
+    /// every payload out to [`RecordKind::capacity`](crate::storage::dm_store::RecordKind::capacity)
+    /// with CSPRNG filler and carries the true length in a prefix *inside* the
+    /// seal, so a file holding no entries and one holding 512 are the same
+    /// number of bytes and differ only in ciphertext. An occupancy bitmap over
+    /// 512 fixed slots would hide the count equally well and would additionally
+    /// have to be kept consistent with the slots it describes; a bare
+    /// concatenation has no second representation to disagree with the first.
+    /// The store's fixed bucket is what does the hiding either way, which is the
+    /// reason to prefer the encoding with less to get wrong.
+    ///
+    /// **Ascending order is canonical, not incidental.** Two lists with the same
+    /// members encode to the same bytes whatever order they were blocked in, so
+    /// a re-encode after an unrelated change produces byte-identical plaintext
+    /// and [`Self::decode`] can reject a duplicate as a violated ordering rather
+    /// than by searching the set it is still building.
+    ///
+    /// **Refused above the ceiling rather than truncated.** A truncated
+    /// revocation list is one that opens, parses to fewer entries than it had,
+    /// and silently unblocks somebody — the store's own argument for
+    /// [`DmStoreError::PayloadTooLong`](crate::storage::dm_store::DmStoreError::PayloadTooLong),
+    /// one layer up. The store's bucket is exactly
+    /// [`BLOCK_LIST_MAX_ENTRIES`] keys, so its refusal is the same refusal; this
+    /// one names the ceiling in the units the user chose entries in.
+    pub fn encode(&self) -> Result<Vec<u8>, BlockListError> {
+        let count = self.blocked.len();
+        if count > BLOCK_LIST_MAX_ENTRIES {
+            return Err(BlockListError::Full { count });
+        }
+        let mut out = Vec::with_capacity(count * ml_dsa::PK_LEN);
+        for key in &self.blocked {
+            out.extend_from_slice(key.as_slice());
+        }
+        Ok(out)
+    }
+
+    /// Read back what [`Self::encode`] wrote.
+    ///
+    /// An empty payload is the empty list, which is what a store that has just
+    /// created the record holds — the record exists from the first open whether
+    /// or not anyone has ever blocked anybody, so "no entries" must be an
+    /// ordinary value and not an absence.
+    ///
+    /// Every departure from the canonical form is refused rather than repaired.
+    /// A length that is not a whole number of keys means the payload is not this
+    /// record; an out-of-order or repeated key means bytes that no [`encode`]
+    /// here produced. Both are reachable only by something holding the profile
+    /// key — the store authenticates before this sees anything — so the refusal
+    /// is a statement that the encoding has exactly one spelling, not a defence.
+    ///
+    /// [`encode`]: Self::encode
+    pub fn decode(bytes: &[u8]) -> Result<Self, BlockListError> {
+        if !bytes.len().is_multiple_of(ml_dsa::PK_LEN) {
+            return Err(BlockListError::NotWholeKeys { len: bytes.len() });
+        }
+        let count = bytes.len() / ml_dsa::PK_LEN;
+        if count > BLOCK_LIST_MAX_ENTRIES {
+            return Err(BlockListError::Full { count });
+        }
+
+        let mut blocked = BTreeSet::new();
+        let mut previous: Option<&[u8]> = None;
+        for chunk in bytes.chunks_exact(ml_dsa::PK_LEN) {
+            if previous.is_some_and(|prev| chunk <= prev) {
+                return Err(BlockListError::NotAscending);
+            }
+            previous = Some(chunk);
+            let mut key = Box::new([0u8; ml_dsa::PK_LEN]);
+            key.copy_from_slice(chunk);
+            blocked.insert(key);
+        }
+        Ok(Self { blocked })
+    }
 }
+
+/// The most identities one profile's block list may hold.
+///
+/// **512 is ratified and is user-visible** (issue #390). Every entry is an
+/// ML-DSA-87 public key, and the store pays for the ceiling in full on every
+/// profile whether it blocks nobody or all 512 — which is the price of the
+/// file's size not reporting how many people a user has blocked. Raising it
+/// later changes the size of a record that already exists, so it needs a
+/// migration pass rather than an edit here: ordinary traffic no longer
+/// re-encodes an unchanged record (#347), so nothing would migrate as a side
+/// effect.
+pub const BLOCK_LIST_MAX_ENTRIES: usize = 512;
+
+/// The payload size of a full block list, and therefore the store bucket's.
+pub const BLOCK_LIST_CAPACITY: usize = BLOCK_LIST_MAX_ENTRIES * ml_dsa::PK_LEN;
+
+/// What can be wrong with a block list's at-rest bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockListError {
+    /// More than [`BLOCK_LIST_MAX_ENTRIES`] identities.
+    ///
+    /// Raised at the encode, so the write never happens and the stored list is
+    /// left exactly as it was. Blocking is what reaches this; unblocking cannot.
+    Full { count: usize },
+    /// The payload is not a whole number of ML-DSA-87 public keys.
+    NotWholeKeys { len: usize },
+    /// The keys are not in strictly ascending order — out of order, or repeated.
+    NotAscending,
+}
+
+impl core::fmt::Display for BlockListError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Full { count } => write!(
+                f,
+                "a block list holds at most {BLOCK_LIST_MAX_ENTRIES} identities, not {count}"
+            ),
+            Self::NotWholeKeys { len } => write!(
+                f,
+                "{len} bytes is not a whole number of {}-byte identity keys",
+                ml_dsa::PK_LEN
+            ),
+            Self::NotAscending => {
+                f.write_str("the stored identity keys are not in strictly ascending order")
+            }
+        }
+    }
+}
+
+impl core::error::Error for BlockListError {}
 
 #[cfg(test)]
 mod tests {
@@ -508,5 +644,151 @@ mod tests {
 
         assert!(list.is_empty());
         assert!(!list.suppresses_knock(&entry));
+    }
+
+    // ---- the at-rest form --------------------------------------------------
+
+    /// A key whose bytes depend on `seed` throughout, so a round trip that
+    /// truncated, shifted or reordered could not pass.
+    fn spread_key(seed: u16) -> [u8; ml_dsa::PK_LEN] {
+        let mut k = [0u8; ml_dsa::PK_LEN];
+        for (i, b) in k.iter_mut().enumerate() {
+            *b = (i as u16).wrapping_mul(31).wrapping_add(seed) as u8;
+        }
+        // Both halves of the seed land in their own byte, so keys are distinct
+        // across the whole `u16` range rather than colliding every 256 seeds —
+        // which at a 512-entry ceiling would silently halve the fixture.
+        k[0] = (seed >> 8) as u8;
+        k[1] = seed as u8;
+        k
+    }
+
+    /// Encode, decode, and get the same membership back.
+    #[test]
+    fn the_at_rest_form_round_trips() {
+        let mut list = BlockList::new();
+        for seed in [7u16, 1, 400, 40_000] {
+            assert!(list.block(&spread_key(seed)));
+        }
+
+        let bytes = list.encode().unwrap();
+        assert_eq!(
+            bytes.len(),
+            4 * ml_dsa::PK_LEN,
+            "one key per entry, no header"
+        );
+
+        let back = BlockList::decode(&bytes).unwrap();
+        assert_eq!(back, list, "the decoded list is the encoded one");
+        for seed in [7u16, 1, 400, 40_000] {
+            assert!(back.is_blocked(&spread_key(seed)));
+        }
+        // Control: a key that was never blocked is not blocked after a round
+        // trip either, so `decode` is not simply answering true.
+        assert!(!back.is_blocked(&spread_key(9)));
+    }
+
+    /// The empty list encodes to nothing and decodes back from nothing.
+    ///
+    /// This is the value the store writes when it creates the record, so "no
+    /// entries" has to be an ordinary round trip rather than a special case.
+    #[test]
+    fn the_empty_list_round_trips_through_an_empty_payload() {
+        let empty = BlockList::new();
+        assert!(empty.encode().unwrap().is_empty());
+        assert_eq!(BlockList::decode(&[]).unwrap(), empty);
+    }
+
+    /// The encoding is canonical: the same members produce the same bytes
+    /// whatever order they were blocked in.
+    #[test]
+    fn the_encoding_does_not_depend_on_the_order_blocks_were_added() {
+        let mut forwards = BlockList::new();
+        let mut backwards = BlockList::new();
+        for seed in 0u16..16 {
+            forwards.block(&spread_key(seed));
+        }
+        for seed in (0u16..16).rev() {
+            backwards.block(&spread_key(seed));
+        }
+        assert_eq!(forwards.encode().unwrap(), backwards.encode().unwrap());
+    }
+
+    /// The ceiling is refused at the encode, and the 512th entry is not.
+    ///
+    /// Both halves: a refusal at 512 would be an off-by-one that silently cost a
+    /// user an entry, and no refusal at all is the truncation the ceiling exists
+    /// to make impossible.
+    #[test]
+    fn the_ceiling_is_enforced_at_the_encode() {
+        let mut list = BlockList::new();
+        for seed in 0..BLOCK_LIST_MAX_ENTRIES {
+            assert!(
+                list.block(&spread_key(seed as u16)),
+                "fixture produced a duplicate key at {seed}"
+            );
+        }
+        assert_eq!(list.len(), BLOCK_LIST_MAX_ENTRIES);
+        assert_eq!(
+            list.encode().unwrap().len(),
+            BLOCK_LIST_CAPACITY,
+            "a full list encodes to exactly the store bucket"
+        );
+
+        assert!(list.block(&spread_key(BLOCK_LIST_MAX_ENTRIES as u16)));
+        assert_eq!(
+            list.encode(),
+            Err(BlockListError::Full {
+                count: BLOCK_LIST_MAX_ENTRIES + 1
+            }),
+            "one identity past the ceiling is refused, not truncated"
+        );
+    }
+
+    /// Every departure from the canonical form is refused.
+    #[test]
+    fn a_non_canonical_payload_is_refused() {
+        let a = spread_key(1);
+        let b = spread_key(2);
+        let (lower, higher) = if a <= b { (a, b) } else { (b, a) };
+
+        let mut ascending = Vec::new();
+        ascending.extend_from_slice(&lower);
+        ascending.extend_from_slice(&higher);
+        // Control: the canonical spelling of these very bytes is accepted, so the
+        // refusals below are about the ordering and not about the fixture.
+        assert_eq!(BlockList::decode(&ascending).unwrap().len(), 2);
+
+        let mut descending = Vec::new();
+        descending.extend_from_slice(&higher);
+        descending.extend_from_slice(&lower);
+        assert_eq!(
+            BlockList::decode(&descending),
+            Err(BlockListError::NotAscending)
+        );
+
+        let mut repeated = Vec::new();
+        repeated.extend_from_slice(&lower);
+        repeated.extend_from_slice(&lower);
+        assert_eq!(
+            BlockList::decode(&repeated),
+            Err(BlockListError::NotAscending),
+            "a repeat is a violated ordering"
+        );
+
+        assert_eq!(
+            BlockList::decode(&ascending[..ascending.len() - 1]),
+            Err(BlockListError::NotWholeKeys {
+                len: 2 * ml_dsa::PK_LEN - 1
+            })
+        );
+
+        let over = vec![0u8; (BLOCK_LIST_MAX_ENTRIES + 1) * ml_dsa::PK_LEN];
+        assert_eq!(
+            BlockList::decode(&over),
+            Err(BlockListError::Full {
+                count: BLOCK_LIST_MAX_ENTRIES + 1
+            })
+        );
     }
 }

@@ -229,9 +229,10 @@ modules:
   - name: daemonseed_core::storage::dm_store
     description: >-
       The DM at-rest store: one directory per correspondence, one fixed-size
-      file per RecordKind (Resume, Provisional, Outbox, ReceiveCursor,
-      ContactCache) inside
-      it. DmStore::open derives the seal key from the profile at-rest key
+      file per correspondence-scoped RecordKind (Resume, Provisional, Outbox,
+      ReceiveCursor, ContactCache) inside it, and one fixed-size file per
+      profile-scoped kind (BlockList) at the store
+      root. DmStore::open derives the seal key from the profile at-rest key
       (HKDF-SHA384 under DM_STORE_SALT/DM_STORE_SEAL) and sweeps orphaned temp
       siblings. critical_section holds an flock across the whole closure and
       yields a Locked guard carrying read/replace/delete/present, so a
@@ -239,13 +240,24 @@ modules:
       establishes the correspondence on disk. read_unlocked and present_unlocked
       answer without the lock and create nothing. A nested critical_section on
       one label from one thread returns DmStoreError::Reentrant instead of
-      deadlocking. replace pads to the kind's bucket with CSPRNG filler behind a
+      deadlocking. RecordScope is Correspondence or Profile, and
+      RecordKind::scope() -> RecordScope says which one a kind belongs to.
+      read_profile_unlocked(kind) answers a profile kind without the lock and
+      creates nothing; profile_critical_section holds the store root's flock
+      across the whole closure and yields a LockedProfile guard carrying
+      read/present/replace. LockedProfile has no delete: a profile record is
+      created by every DmStore::open, and an empty block list is an empty payload
+      rather than an absent file. Both guards refuse a kind of the other scope
+      with DmStoreError::WrongScope { kind, guard }.
+      replace pads to the kind's bucket with CSPRNG filler behind a
       length prefix carried inside the seal, and refuses an oversized payload;
-      ReceiveCursor is unsealed and must be exactly 8 bytes. AAD binds the
-      correspondence label and the record kind. RecordKind::stable_str /
+      ReceiveCursor is unsealed and must be exactly 8 bytes. A correspondence
+      record's AAD binds the correspondence label and the record kind under
+      DM_STORE_AAD; a profile record has no label and binds the kind alone under
+      DM_STORE_PROFILE_AAD. RecordKind::stable_str /
       from_stable_str give the persisted string form (resume, provisional,
-      outbox, receive-cursor, contact-cache), distinct from the on-disk file
-      name; a string the
+      outbox, receive-cursor, contact-cache, block-list), distinct from the
+      on-disk file name; a string the
       build does not recognise decodes to record_kind: None and leaves the rest
       of the audit log readable. Errors
       preserve atomic_file's landed/not-landed distinction. CorrespondenceLabel is an opaque 32-byte
@@ -263,7 +275,11 @@ modules:
       crash or power loss leaves the destination holding either its previous
       contents or the new ones. FileLock wraps an fs4 exclusive advisory lock
       for cross-process exclusion across a read-modify-write critical section;
-      it is not taken by replace_atomically. On Windows the destination is
+      it is not taken by replace_atomically. FileLock::acquire(&Path) waits for
+      the lock; FileLock::try_acquire(&Path) -> Result<Option<Self>, LockError>
+      applies the same checks and never blocks, its Ok(None) meaning another
+      holder has the lock right now — a value, not an error.
+      On Windows the destination is
       removed before the rename and the directory barrier is a no-op, so the
       durable-directory-entry guarantee does not hold there (#285). Errors name
       the destination's state: NotLanded (untouched, safe to retry),
@@ -1124,9 +1140,18 @@ modules:
       size. suppresses_knock(&VerifiedFirstContact) -> bool is the doorbell
       plane and reads the entry's pk_lt, not its pk_pc;
       suppresses_channel(pk_lt) -> bool is the channel plane. Both are the same
-      rule. BlockList is neither Copy nor Clone. It is in-memory only: there is
-      no encode, no RecordKind and no store, so a block does not survive a
-      restart.
+      rule. BlockList is neither Copy nor Clone. encode() -> Result<Vec<u8>,
+      BlockListError> is the at-rest form — every blocked key concatenated in
+      ascending byte order, with no header, count or occupancy map — and
+      decode(&[u8]) -> Result<Self, BlockListError> reads it back, an empty
+      payload being the empty list. encode refuses a list over
+      BLOCK_LIST_MAX_ENTRIES (512) with BlockListError::Full { count } before
+      any write; decode gives Full at the same ceiling, NotWholeKeys { len } for
+      a payload that is not a whole number of ml_dsa::PK_LEN keys, and
+      NotAscending for keys out of order or repeated. BLOCK_LIST_CAPACITY
+      (BLOCK_LIST_MAX_ENTRIES * ml_dsa::PK_LEN) is a full list's payload size and
+      RecordKind::BlockList's store bucket. The list is stored as that kind at
+      the profile root; dm::persist is its read and write path.
       Sub-module dm::ack_budget holds the client-global allowance for standalone
       acknowledgements. StandaloneAckBudget::new() is unspent and grants its
       first request; request(now_ms) -> AckPermit returns Granted, spending the
@@ -1332,7 +1357,20 @@ modules:
       replaces a stored pk_pc. DmPersistError::Contact(ContactCacheError)
       carries a stored record that will not decode and a caller's own contact
       error raised inside f.
-      read_outbox/read_cursor/read_contact are lock-free. The provisional
+      read_block_list() -> Result<BlockList, DmPersistError> reads the profile's
+      block list through the store's lock-free profile read. An absent record is
+      DmPersistError::BlockListMissing, never an empty list: DmStore::open
+      creates the record, so absence means it was removed. update_block_list(f)
+      is read-modify-write inside one profile_critical_section, where f: impl
+      FnOnce(&mut BlockList) -> Result<T, DmPersistError> and the call yields T.
+      There is no Mutation: the list is written back on every call and spends one
+      seal whether or not it changed. Nothing is written if f fails, and nothing
+      is written if the resulting list is over the ceiling — BlockList::encode
+      refuses before the replace, leaving the stored list as it was.
+      DmPersistError::BlockList(BlockListError) carries a stored list that will
+      not decode and a caller's own over-ceiling change.
+      read_outbox/read_cursor/read_contact/read_block_list are lock-free.
+      The provisional
       record is sealed by its own path and again by the store: the record's seal
       binds RecordContext and refuses one lifted from another channel, the store's AAD binds label
       and kind and refuses a blob moved between slots, and neither layer can
